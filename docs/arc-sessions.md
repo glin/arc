@@ -84,7 +84,7 @@ arc CLI <--- local channel ---> Selected ready Arc window
 
 `arc start --arc-dispatch` emits the parent-link receipt for `accepted` and `accepted-with-errors` results that include a session ID. Basic starts require no personal dispatch script. Personal dispatch workflow receipts link sessions. Personal dispatch workflows own durable callback claim/ack outside Arc to track callback ownership and acknowledgement. The receipt does not provide that state. Arc supplies neither detached callbacks nor a cross-provider peer inbox.
 
-Python and shell coordinators both invoke the same CLI. Use `--untagged` for reader-requested work and `--agent-run` for delegated work. [Session management](cli.md#session-management) owns command arguments, delivery outcomes, archive rules, and uncertain-launch handling.
+Python and shell coordinators both invoke the same CLI. Reader-requested starts keep reader ownership by default. Use `--agent-run` for delegated work. Run `arc --help` and `arc COMMAND --help` for command syntax. [Session management](cli.md#session-management) owns command arguments, delivery outcomes, archive rules, and uncertain-launch handling.
 
 Read each result before describing it. Recorded model and effort establish execution settings, while a requested setup only establishes what the caller selected. Keep a session available for reader continuation when that is part of the task.
 
@@ -133,15 +133,15 @@ $arcEncoding = New-Object System.Text.UTF8Encoding($false)
 For each provider, use one launch route. With returned keys, replace the key placeholders below:
 
 ```powershell
-arc start --window $arcWindow --setup 'CLAUDE_SETUP_KEY' --prompt-file $arcPrompt --untagged --name 'Claude session check' --arc-dispatch
-arc start --window $arcWindow --setup 'CODEX_SETUP_KEY' --prompt-file $arcPrompt --untagged --name 'Codex session check' --arc-dispatch
+arc start --window $arcWindow --setup 'CLAUDE_SETUP_KEY' --prompt-file $arcPrompt --name 'Claude session check' --arc-dispatch
+arc start --window $arcWindow --setup 'CODEX_SETUP_KEY' --prompt-file $arcPrompt --name 'Codex session check' --arc-dispatch
 ```
 
 Without a returned key, replace the placeholders below with that provider's offered values. If a selected model, effort, or permission value is empty, omit its corresponding flag to retain the provider default. Do not combine `--setup` with explicit settings.
 
 ```powershell
-arc start --window $arcWindow --provider claude --model 'CLAUDE_MODEL_VALUE' --effort 'CLAUDE_EFFORT_VALUE' --permissions 'CLAUDE_PERMISSION_VALUE' --prompt-file $arcPrompt --untagged --name 'Claude session check' --arc-dispatch
-arc start --window $arcWindow --provider codex --model 'CODEX_MODEL_VALUE' --effort 'CODEX_EFFORT_VALUE' --permissions 'CODEX_PERMISSION_VALUE' --prompt-file $arcPrompt --untagged --name 'Codex session check' --arc-dispatch
+arc start --window $arcWindow --provider claude --model 'CLAUDE_MODEL_VALUE' --effort 'CLAUDE_EFFORT_VALUE' --permissions 'CLAUDE_PERMISSION_VALUE' --prompt-file $arcPrompt --name 'Claude session check' --arc-dispatch
+arc start --window $arcWindow --provider codex --model 'CODEX_MODEL_VALUE' --effort 'CODEX_EFFORT_VALUE' --permissions 'CODEX_PERMISSION_VALUE' --prompt-file $arcPrompt --name 'Codex session check' --arc-dispatch
 ```
 
 Record both accepted session IDs. Inspect each session with the read commands above and confirm its response and recorded provider settings. If delivery is unknown, stop that launch check and preserve its request ID. Do not start a replacement.

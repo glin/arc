@@ -17,21 +17,11 @@ Run `arc setups --window WINDOW_ID` before choosing settings. Use a returned set
 
 ## Select the command
 
-| Reader job | Command |
-| --- | --- |
-| List one page of scoped sessions and attention | `arc sessions --window WINDOW_ID --json`, then add `--cursor NEXT` for each later page |
-| Read recent turns without marking them read | `arc session SESSION_ID --turns 5 --window WINDOW_ID --json` |
-| List offered setups | `arc setups --window WINDOW_ID` |
-| Send a follow-up to a session this session started | `arc send SESSION_ID --prompt-file PROMPT_PATH --observation OBSERVATION --request-id WINDOW_ID:UUID --window WINDOW_ID --json` |
-| Start requested work | `arc start --window WINDOW_ID --setup SETUP_KEY --prompt-file PROMPT_PATH --untagged --name NAME --arc-dispatch --request-id WINDOW_ID:UUID` |
-| Add or remove a reader label | `arc label add SESSION_ID --label LABEL --window WINDOW_ID --request-id WINDOW_ID:UUID` or `arc label remove SESSION_ID --label LABEL --window WINDOW_ID --request-id WINDOW_ID:UUID` |
-| Pin or unpin a session | `arc pin SESSION_ID --window WINDOW_ID --request-id WINDOW_ID:UUID` or `arc unpin SESSION_ID --window WINDOW_ID --request-id WINDOW_ID:UUID` |
-| Archive or unarchive completed work | `arc archive SESSION_ID --window WINDOW_ID --request-id WINDOW_ID:UUID` or `arc unarchive SESSION_ID --window WINDOW_ID --request-id WINDOW_ID:UUID` |
-| Estimate saved session cost | `arc cost SESSION_ID --by-model` |
+Run `arc --help` for command sections. Run `arc COMMAND --help` for syntax, flags, output fields, refusals, and an example. Nested commands accept help too, including `arc label add --help` and `arc compact request --help`.
 
-Start requires a regular UTF-8 prompt file, at most 48 KiB, with nonempty text that does not begin with a slash command. Explicit settings use `--provider claude|codex`, `--model`, `--effort`, and `--permissions` instead of `--setup`. Omitted values retain provider defaults. Repeat `--label` for initial labels. Use `--pinned` for an initial pin.
+Start requires a regular UTF-8 prompt file, at most 48 KiB, with nonempty text that does not begin with a slash command. Choose a returned setup key or explicit supported provider settings. Omitted model, effort, and permissions retain provider defaults.
 
-Choose exactly one classification. `--untagged` marks work the reader asked for and preserves prompt-box continuation. A session that the reader asked you to start is work the reader asked for, even when it coordinates other agents. `--agent-run` marks delegated work under Run by agents. Use it only for a session that you choose to start for part of your own task, such as a worker or a reviewer. A session that the reader asked for stays untagged even when it reports back to you. Attribution alone establishes neither ownership nor authority. `--arc-dispatch` adds a receipt that supplies the parent session's Dispatched link.
+Omitted `--agent-run` or `--agent-run=false` keeps reader ownership and Prompt box continuation. A session the reader asked you to start keeps that ownership, even when it coordinates other agents or reports back. Bare `--agent-run` or `--agent-run=true` marks delegated work under Run by agents. Use it only for a session you choose for your own task, such as a worker or reviewer. Attribution alone establishes neither ownership nor authority. Use `--arc-dispatch` to retain guarded follow-up ownership and the parent session's Dispatched link. Reader-owned dispatch receipts include `owned: true`.
 
 ## Interpret delivery
 

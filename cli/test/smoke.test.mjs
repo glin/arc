@@ -17,6 +17,7 @@ import {
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'vitest';
+import { COMMANDS, checkCommandHelp, renderCommandHelp, renderOverviewHelp } from '../src/commands.ts';
 import { fileURLToPath } from 'node:url';
 
 const fixture = JSON.parse(readFileSync(new URL('./fixtures/warm.json', import.meta.url), 'utf8'));
@@ -76,6 +77,76 @@ test('the bundled windows command reaches authenticated hosts and keeps secrets 
 test('the bundled CLI reports the package version', () => {
   const output = execFileSync(process.execPath, [cli, '--version'], { encoding: 'utf8' });
   assert.equal(output.trim(), packageJson.version);
+});
+
+test('every admitted command renders shared help before stdin, discovery, network, or file changes', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'arc-help-smoke-'));
+  const preload = join(home, 'no-io.cjs');
+  const run = promisify(execFile);
+  writeFileSync(
+    preload,
+    `
+const fs = require('node:fs');
+const net = require('node:net');
+const read = fs.readFileSync;
+const deny = () => { throw new Error('Help performed I/O.'); };
+fs.readFileSync = (file, ...args) => file === ${JSON.stringify(cli)} ? read(file, ...args) : deny();
+fs.readFile = deny;
+fs.promises.readFile = deny;
+fs.promises.opendir = deny;
+for (const name of ['readdirSync', 'statSync', 'lstatSync', 'mkdirSync', 'writeFileSync', 'renameSync', 'unlinkSync', 'rmSync']) fs[name] = deny;
+for (const name of ['readdir', 'stat', 'lstat', 'mkdir', 'writeFile', 'rename', 'unlink', 'rm']) {
+  fs[name] = deny;
+  fs.promises[name] = deny;
+}
+net.connect = deny;
+net.createConnection = deny;
+net.Socket.prototype.connect = deny;
+process.stdin.setEncoding = deny;
+process.stdin[Symbol.asyncIterator] = deny;
+`,
+  );
+  try {
+    const options = {
+      env: { ...process.env, ARC_HOME: home, ARC_WINDOW: 'unavailable' },
+      encoding: 'utf8',
+      timeout: 10_000,
+    };
+    for (const command of COMMANDS) {
+      const result = await run(
+        process.execPath,
+        ['--require', preload, cli, ...command.name.split(' '), '--help'],
+        options,
+      );
+      assert.equal(result.stderr, '');
+      assert.equal(result.stdout, renderCommandHelp(command) + '\n');
+    }
+    for (const args of [[], ['help'], ['--help']]) {
+      assert.equal(
+        (await run(process.execPath, ['--require', preload, cli, ...args], options)).stdout,
+        renderOverviewHelp() + '\n',
+      );
+    }
+    assert.equal(
+      (await run(process.execPath, ['--require', preload, cli, 'start', '--help', '--version'], options)).stdout.trim(),
+      packageJson.version,
+    );
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('command admission requires complete help data', () => {
+  checkCommandHelp(COMMANDS);
+  for (const command of COMMANDS) {
+    assert.throws(() => checkCommandHelp([{ ...command, help: undefined }]), /Missing command help/);
+    for (const field of ['summary', 'synopsis', 'flags', 'output', 'refusals', 'example']) {
+      assert.throws(
+        () => checkCommandHelp([{ ...command, help: { ...command.help, [field]: undefined } }]),
+        /Missing command help/,
+      );
+    }
+  }
 });
 
 test('bundled self compaction uses read-only readiness, one admission and observation without retries', async () => {
@@ -163,7 +234,7 @@ test('bundled self compaction uses read-only readiness, one admission and observ
 });
 
 // This packaged check catches argument routing and unwanted dispatch receipts with one local channel.
-test('bundled management commands carry explicit classification, prompt files and curation without implicit receipts', async () => {
+test('bundled management commands carry reader-default classification, prompt files and curation without implicit receipts', async () => {
   const home = mkdtempSync(join(tmpdir(), 'arc management smoke '));
   const channel = new WindowChannel(home);
   const run = promisify(execFile);
@@ -180,7 +251,12 @@ test('bundled management commands carry explicit classification, prompt files an
     const prompt = join(home, 'initial prompt.txt');
     writeFileSync(prompt, 'Review this project.');
     for (const provider of ['claude', 'codex'])
-      for (const classification of ['--agent-run', '--untagged']) {
+      for (const [classification, agentRun] of [
+        [[], false],
+        [['--agent-run'], true],
+        [['--agent-run=true'], true],
+        [['--agent-run=false'], false],
+      ]) {
         const args = [
           cli,
           'start',
@@ -192,7 +268,7 @@ test('bundled management commands carry explicit classification, prompt files an
           'runtime-effort',
           '--prompt-file',
           prompt,
-          classification,
+          ...classification,
           '--name',
           'Review',
           '--label',
@@ -201,12 +277,12 @@ test('bundled management commands carry explicit classification, prompt files an
         ];
         const output = await run(process.execPath, args, { env, encoding: 'utf8' });
         assert.equal(output.stdout.includes('ARC_DISPATCH_SESSION='), false);
-        assert.equal(requests.at(-1).params.agentRun, classification === '--agent-run');
+        assert.equal(requests.at(-1).params.agentRun, agentRun);
         assert.equal(requests.at(-1).params.prompt, 'Review this project.');
         const tagged = await run(process.execPath, [...args, '--arc-dispatch'], { env, encoding: 'utf8' });
         const receipt = JSON.parse(tagged.stdout.trim().split('\n')[1].slice('ARC_DISPATCH_SESSION='.length));
         assert.equal(receipt.agent, provider);
-        assert.equal(receipt.owned === true, classification === '--untagged');
+        assert.equal(receipt.owned === true, !agentRun);
       }
     await run(process.execPath, [cli, 'label', 'remove', 'accepted', '--label', 'Initial', '--dry-run'], { env });
     assert.equal(requests.at(-1).params.action, 'label-remove');
@@ -214,9 +290,25 @@ test('bundled management commands carry explicit classification, prompt files an
     await run(process.execPath, [cli, 'archive', 'accepted', '--force'], { env });
     assert.equal(requests.at(-1).params.force, true);
     const before = requests.length;
+    for (const flags of [
+      ['--agent-run', '--agent-run'],
+      ['--agent-run', '--agent-run=false'],
+      ['--agent-run=true', '--agent-run'],
+      ['--agent-run=true', '--agent-run=false'],
+      ['--agent-run='],
+      ['--agent-run=yes'],
+      ['--agent-run=True'],
+      ['--agent-run', 'false'],
+      ['--untagged'],
+    ]) {
+      await assert.rejects(
+        run(process.execPath, [cli, 'start', '--provider', 'codex', '--prompt-file', prompt, ...flags], { env }),
+      );
+    }
+    assert.equal(requests.length, before, 'invalid classification never reaches the host');
     writeFileSync(prompt, '/clear');
     await assert.rejects(
-      run(process.execPath, [cli, 'start', '--provider', 'codex', '--prompt-file', prompt, '--untagged'], { env }),
+      run(process.execPath, [cli, 'start', '--provider', 'codex', '--prompt-file', prompt], { env }),
       /prompt-box command/,
     );
     assert.equal(requests.length, before);
@@ -270,7 +362,7 @@ test('bundled send reads Unicode multiline prompt files, requires observations a
       [args.filter((arg) => arg !== '--observation' && arg !== observation), env, /Usage: arc send/],
       [args.slice(0, -2), env, /Usage: arc send/],
       [args.map((arg) => (arg === observation ? 'stale' : arg)), env, /observation is invalid/],
-      [[...args, '--untagged'], env, /unavailable for send/],
+      [[...args, '--agent-run=false'], env, /unavailable for send/],
       [args, { ...env, CODEX_THREAD_ID: 'codex-thread' }, /Both CLAUDE_CODE_SESSION_ID and CODEX_THREAD_ID/],
       [args, { ...env, CLAUDE_CODE_SESSION_ID: '' }, /Run send from/],
     ];
@@ -325,7 +417,7 @@ test('bundled guarded starts refuse ambiguous requesters, and a window without t
     };
     const prompt = join(home, 'prompt.txt');
     writeFileSync(prompt, 'Prepare the worktree.');
-    const start = [cli, 'start', '--provider', 'claude', '--prompt-file', prompt, '--untagged'];
+    const start = [cli, 'start', '--provider', 'claude', '--prompt-file', prompt];
     const dispatched = await run(process.execPath, [...start, '--arc-dispatch'], { env, encoding: 'utf8' });
     assert.match(dispatched.stdout, /ARC_DISPATCH_SESSION=/);
     await run(process.execPath, [cli, 'session', 'worker', '--json'], { env, encoding: 'utf8' });

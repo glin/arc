@@ -32,13 +32,9 @@ arc cost SESSION_ID --by-model
 
 `SESSION_ID` stands for a saved session's identifier. Path examples below require an existing transcript or rollout that you select.
 
-`--version` takes precedence over every other argument. `--help`, the `help` command, and no arguments print usage without reading stdin or transcripts.
+`--version` takes precedence over every other argument. `--help`, the `help` command, and no arguments print the sectioned overview. `arc COMMAND --help` prints command syntax, flags, output fields, refusals, and an example. Nested commands accept help, including `arc label add --help` and `arc compact request --help`. Help reads no stdin and performs no window discovery, network access, or filesystem mutations.
 
 ## Windows
-
-```text
-arc windows [--json]
-```
 
 The command lists live window identifiers, workspace folders, repository scope readiness, panel readiness, and panel visibility. Folderless windows appear with no folders. Human output names the panel as visible, hidden, or not ready. Scope reads ready or loading. JSON contains `version: 1`, a `windows` array, and `complete`. Neither format includes channel addresses or tokens. An empty array means no verified live window. `complete: false` means discovery left entries unvisited or registered hosts unavailable. Human output names incomplete discovery, including when no host answered.
 
@@ -46,12 +42,7 @@ The command lists live window identifiers, workspace folders, repository scope r
 
 ## Sessions
 
-```text
-arc sessions [--query QUERY] [--window ID] [--limit 1-128] [--cursor CURSOR] [--json]
-arc session ID [--turns 1-20] [--window ID] [--json]
-```
-
-Both commands print JSON. `--window` selects the window explicitly and takes precedence over `ARC_WINDOW`. Without either, exactly one live window and complete discovery are required. `session` rejects unknown or ambiguous IDs. File paths never select a session source. The selected window's current repository scope supplies session membership.
+`sessions` and `session` print JSON. `--window` selects the window explicitly and takes precedence over `ARC_WINDOW`. Without either, exactly one live window and complete discovery are required. `session` rejects unknown or ambiguous IDs. File paths never select a session source. The selected window's current repository scope supplies session membership.
 
 `sessions` returns one page with `version`, requester attribution, session rows, `complete`, explanatory `notes`, `next`, `coverage`, and `freshness`. Rows contain `source`, `id`, `provider`, `path`, `ambiguous`, `name`, `setup`, reader labels with their source, `pinned`, `archived`, `runStatus`, `attention`, `lastActivity`, `parent`, `agentRun`, `facts`, and `truncated`. `source` is a fixed-length key for one transcript source. `path` is the exact transcript file that `arc cost PATH --source-only` reads. Two transcripts with the same session ID are two rows with distinct `source` values, and both carry `ambiguous: true`. Setup reports recorded model and effort where accepted facts supply them. Missing values remain `null`. `facts` distinguishes current, stale, and unparsed metadata. Parent relations identify reader-started, dispatched, or subagent relationships. Run status uses `running`, `waiting`, `subagents`, `background`, `done`, `stopped`, `interrupted`, `failed`, `none`, and `unknown`. A done, failed, or interrupted turn reports `subagents` while a background subagent it launched has no close record. It reports `background` while a background command it started has no end record and is under one hour old. A Claude session without a turn reports `background` while accepted metadata retains command evidence without qualified process closure. Subagents take precedence over background. A process end that Arc records or observes after the turn starts reports the turn's own status instead. Without a process end, a done turn whose remaining records are only closed subagents or older background commands reports `unknown`, because a closed subagent can resume work that only its own transcript records. A failed or interrupted turn with only those records reports its own status. Claude sessions report `none` with current whole-file metadata, known empty turn starts, no outcome, and no live, waiting, or background work. Attention uses `input`, `unread`, `running`, `idle`, and `unknown`. Hidden panels report unknown live attention. Requester attribution names this request and establishes no saved session owner.
 
@@ -69,12 +60,6 @@ A forged, modified, or expired cursor fails with an instruction to restart witho
 
 ## Panel filter
 
-```text
-arc filter QUERY [--window ID] [--json]
-arc filter --query QUERY [--window ID] [--json]
-arc filter --clear [--window ID] [--json]
-```
-
 `filter` reveals or creates the existing Arc editor panel and replaces its session list query. `--clear` clears it through an explicit flag that survives PowerShell argument handling. Supply one nonempty positional query, one `--query QUERY`, or `--clear`. Mixing or repeating these forms fails before transport. The command preserves selection, sort, groups, folds, Show settings, and saved filter definitions. A replacement clears retained lens membership and sets the live filter to Custom. Clearing restores All sessions.
 
 Success reports `status: applied` only after the browser applies the query and persistent storage confirms its save. A rejected save reports `failed` even if the panel displays the query. An unconfirmed outcome after application reports `unknown`, including a filter superseded by Reset Panel State. Read the panel before retrying an unknown result. A window without query capability requires a reload. ID shorthand and noncanonical `session:` values of at least eight characters require `sessionQueryShorthandV1`. Older hosts refuse those queries before transport. Quoted literals, short exact `session:` values, and canonical UUID selectors retain legacy compatibility. Unresolved prefix retrieval and application fail during incomplete or unavailable discovery. Refused application preserves the previous query and preferences.
@@ -83,20 +68,9 @@ Assignments run in admission order. Queue time, readiness, application, and pers
 
 ## Session management
 
-```text
-arc setups [--window ID] [--json]
-arc start --prompt-file PATH (--setup KEY | --provider claude|codex [--model MODEL] [--effort EFFORT] [--permissions MODE]) (--agent-run | --untagged) [--name NAME] [--label NAME] [--pinned] [--arc-dispatch] [--window ID] [--request-id ID]
-arc label add|remove ID --label NAME [--dry-run] [--window ID] [--request-id ID]
-arc pin|unpin|archive|unarchive ID [--dry-run] [--window ID] [--request-id ID]
-arc archive ID --force [--window ID] [--request-id ID]
-arc compact request --self --after-turn --request-id WINDOW:UUID --window WINDOW --json
-arc compact status --request-id WINDOW:UUID --window WINDOW --json
-arc send ID --prompt-file PATH --observation OBSERVATION --request-id WINDOW:REQUEST [--window ID] [--json]
-```
-
 `setups` returns the runtime catalog, permissions, and current, pinned, and recent setup keys. Use a returned key or explicit values. Omitted model, effort, and permissions retain provider defaults. Starts require a ready panel, project setup storage, and a loaded catalog for the chosen provider. Unsupported setup values refuse launch.
 
-`start` reads one regular prompt file up to 48 KiB. Empty prompts and slash commands refuse launch. Repeat `--label` to apply initial labels. `--pinned` pins the new session. `--agent-run` files it under Run by agents. `--untagged` retains reader-started ownership and prompt-box continuation. Exactly one classification flag is required. Only `--arc-dispatch` prints the dispatch receipt. Untagged receipts include `owned: true`. The CLI measures the encoded request against the 64 KiB channel limit before it connects, and refuses a larger request before it sends anything.
+`start` reads one regular prompt file up to 48 KiB. Empty prompts and slash commands refuse launch. Repeat `--label` to apply initial labels. `--pinned` pins the new session. Omitted `--agent-run` or `--agent-run=false` retains reader ownership and Prompt box continuation. Bare `--agent-run` or `--agent-run=true` files delegated work under Run by agents. Classification cannot repeat across forms and accepts only literal `true` or `false`. Only `--arc-dispatch` prints the dispatch receipt. Reader-owned receipts include `owned: true`. The CLI measures the encoded request against the 64 KiB channel limit before it connects, and refuses a larger request before it sends anything.
 
 Write results print JSON with `requestId` and a status. Starts report `accepted`, `accepted-with-errors`, or `refused`. Accepted results include `sessionId`, provider, requested setup, classification, attribution, and save errors. Requested settings do not establish observed provider execution. Curation reports `applied`, `dry-run`, or `refused`. Forced archive results also report `evaluatedRunStatus`, captured before membership changes. A missing listing row reports null. A rejected save produces an error. Dry runs perform no writes. Archive refuses running, needs-input, and completed unread sessions unless the request passes `--force`. A session whose run status is `subagents` or `background` refuses archive even with `--force`. Archive also refuses a session with unavailable state or hidden attention unless the request passes `--force`. Arc can miss background work in a session with unavailable state, and a forced archive then admits the session while that work runs. A forced archive keeps the current turn and any open question. [Child ownership and shutdown](agent-protocols.md#child-ownership-and-shutdown) owns when Arc ends the process of a session it hosts. Archive removes the pin. Unarchive preserves reader state and leaves the session unpinned.
 
@@ -116,7 +90,7 @@ The result reports `status`, `requestId`, `payloadSha256`, `nativeTurnId`, and `
 
 ```sh
 arc setups --window WINDOW_ID
-arc start --window WINDOW_ID --provider codex --prompt-file './review prompt.txt' --untagged --name 'Review branch' --label Review --pinned
+arc start --window WINDOW_ID --provider codex --prompt-file './review prompt.txt' --name 'Review branch' --label Review --pinned
 arc label add SESSION_ID --label Followup --window WINDOW_ID
 arc archive SESSION_ID --force --window WINDOW_ID
 arc unarchive SESSION_ID --window WINDOW_ID
@@ -124,23 +98,7 @@ arc unarchive SESSION_ID --window WINDOW_ID
 
 ## Cost arguments
 
-```text
-arc cost TARGET [--since TIME] [--until TIME] [--projects PATH] [--codex-sessions PATH] [--by-model] [--source-only] [--by-tool-kind] [--until-text REGEX] [--window-agent ID] [--json]
-```
-
-| Argument | Behavior |
-| --- | --- |
-| `TARGET` | One existing absolute or relative file path, or one session ID. Existing paths take precedence over ID discovery. |
-| `--since TIME` | Includes requests at or after this instant in the main report. |
-| `--until TIME` | Excludes requests at or after this instant from the main report. |
-| `--projects PATH` | Selects the Claude projects root. |
-| `--codex-sessions PATH` | Selects the Codex sessions root. |
-| `--by-model` | Adds `modelCosts` to each parent and child summary. |
-| `--source-only` | Requires an exact existing file path and skips child discovery. It rejects session IDs and missing paths before searching either store. |
-| `--by-tool-kind` | Adds parent request costs attributed to tool-result kinds. |
-| `--until-text REGEX` | Requires `--by-tool-kind`. Adds a separate tool-kind result before the first matching parent request. |
-| `--window-agent ID` | Adds a separate parent interval from the named Agent launch. |
-| `--json` | Accepts an explicit JSON selection. Cost already prints JSON by default. |
+Run `arc cost --help` for target syntax and options. Cost reads no stdin and prints JSON by default.
 
 Times require ISO 8601 with `Z` or an explicit offset. `--until` must be at or after `--since`. Equal bounds produce an empty main request window.
 
@@ -277,16 +235,7 @@ This excerpt shows selected fields. The main window contains only second 2. It e
 
 ## Status-line arguments
 
-```text
-arc statusline [--json | --next-turn] [--width COLUMNS]
-```
-
-| Argument | Behavior |
-| --- | --- |
-| No output option | Prints text with context, cache, and next-turn starting price. Available workspace, model, session cost, duration, and account limits also appear. |
-| `--json` | Prints a schema version 1 snapshot. It includes `model`, `workspace`, `session`, `context`, `cache`, `nextTurn`, and `limits`. |
-| `--next-turn` | Prints only the next-turn starting-price segment. It cannot combine with `--json`. |
-| `--width COLUMNS` | Controls text detail using a positive column count, rounded down. It takes precedence over the `COLUMNS` environment variable. |
+Run `arc statusline --help` for output options. The default output renders text from one Claude Code JSON object on stdin. JSON includes `schemaVersion`, `source`, `model`, `workspace`, `session`, `context`, `cache`, `nextTurn`, and `limits`.
 
 Without a valid width, text uses unlimited width. Invalid or missing `--width` values also use unlimited width. Width affects only text detail, not JSON or `--next-turn`. The required context, cache, and next-turn segments can exceed the requested width.
 

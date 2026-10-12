@@ -36,7 +36,7 @@ ln -s "$arc_skill" ~/.agents/skills/arc-sessions
 
 A source checkout supplies the same skill under `cli/skills/arc-sessions`. A project-local package supplies it under `node_modules/@glin/arc/skills/arc-sessions`. Use that absolute directory as the link target. Existing links require a separate removal before replacement. Restart the agent session to load the skill.
 
-The [CLI guide](https://github.com/glin/arc/blob/main/docs/cli.md#session-management) owns session command arguments and outcomes.
+Run `arc --help` for command sections and `arc COMMAND --help` for syntax, flags, output fields, refusals, and examples. Starts keep reader ownership by default. Use `--agent-run` for delegated work. The [CLI guide](https://github.com/glin/arc/blob/main/docs/cli.md#session-management) explains delivery and session data.
 
 Filter a selected window with the existing session list query:
 
@@ -113,7 +113,7 @@ Use ISO timestamps with `Z` or a UTC offset. The report includes requests at `--
 
 Pricing covers supported Anthropic and OpenAI models, including supported models through Amazon Bedrock. Estimates use published prices, not your subscription bill. Missing usage or unsupported prices produce partial totals. `costUsd` is `null` when the full cost is unknown. `pricedCostUsd` contains the known subtotal.
 
-Run `arc --help` for all options. The [CLI guide](https://github.com/glin/arc/blob/main/docs/cli.md) explains output fields, custom session folders, and additional reports.
+Run `arc cost --help` for cost options. The [CLI guide](https://github.com/glin/arc/blob/main/docs/cli.md) explains output fields, custom session folders, and additional reports.
 
 ## Running windows
 

@@ -47,18 +47,19 @@ export async function runManagement(command: string, args: string[]): Promise<st
     '--label',
     '--observation',
   ]);
-  const switches = new Set([
-    '--json',
-    '--agent-run',
-    '--untagged',
-    '--pinned',
-    '--arc-dispatch',
-    '--dry-run',
-    '--force',
-  ]);
+  const switches = new Set(['--json', '--pinned', '--arc-dispatch', '--dry-run', '--force']);
+  let agentRun = false;
+  let agentRunSeen = false;
   for (let at = 0; at < args.length; at++) {
     const arg = args[at];
-    if (values.has(arg)) {
+    if (arg === '--agent-run' || arg.startsWith('--agent-run=')) {
+      if (agentRunSeen) throw new Error('Repeated argument: --agent-run');
+      const value = arg === '--agent-run' ? 'true' : arg.slice('--agent-run='.length);
+      if (value !== 'true' && value !== 'false') throw new Error('--agent-run accepts only true or false.');
+      agentRun = value === 'true';
+      agentRunSeen = true;
+      flags.add('--agent-run');
+    } else if (values.has(arg)) {
       const value = args[++at];
       if (value === undefined || value.startsWith('--')) throw new Error(`${arg} requires a value.`);
       if (arg === '--label') labels.push(value);
@@ -87,7 +88,6 @@ export async function runManagement(command: string, args: string[]): Promise<st
               '--label',
               '--json',
               '--agent-run',
-              '--untagged',
               '--pinned',
               '--arc-dispatch',
             ]
@@ -135,7 +135,6 @@ export async function runManagement(command: string, args: string[]): Promise<st
   }
   if (command === 'start') {
     if (sessions.length || !options.has('--prompt-file')) throw new Error('Start requires --prompt-file PATH.');
-    if (flags.has('--agent-run') === flags.has('--untagged')) throw new Error('Choose --agent-run or --untagged.');
     const key = options.get('--setup');
     if (key && ['--provider', '--model', '--effort', '--permissions'].some((arg) => options.has(arg)))
       throw new Error('A setup key cannot combine with explicit setup values.');
@@ -160,7 +159,7 @@ export async function runManagement(command: string, args: string[]): Promise<st
             permissionMode: options.get('--permissions') ?? '',
           },
       prompt,
-      agentRun: flags.has('--agent-run'),
+      agentRun,
       pinned: flags.has('--pinned'),
       labels,
       ...(options.has('--name') ? { name: options.get('--name')! } : {}),

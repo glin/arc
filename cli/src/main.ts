@@ -4,45 +4,12 @@ import { runWindows } from './windows.ts';
 import { runSessions } from './sessions.ts';
 import { runManagement } from './manage.ts';
 import { runCompact } from './compact.ts';
+import { findCommand, renderCommandHelp, renderOverviewHelp } from './commands.ts';
 
 declare const ARC_VERSION: string;
 
 // The build sets `ARC_VERSION` from the package manifest.
 const VERSION = typeof ARC_VERSION === 'string' ? ARC_VERSION : 'unknown';
-
-function help(): string {
-  return [
-    'Usage: arc statusline [--json | --next-turn] [--width COLUMNS]',
-    '       arc windows [--json]',
-    '       arc compact request --self --after-turn --request-id WINDOW:UUID --window WINDOW --json',
-    '       arc compact status --request-id WINDOW:UUID --window WINDOW --json',
-    '       arc sessions [--window ID] [--query QUERY] [--limit 1-128] [--cursor CURSOR] [--json]',
-    '       arc filter QUERY | arc filter --query QUERY | arc filter --clear [--window ID] [--json]',
-    '       arc session ID [--turns 1-20] [--window ID] [--json]',
-    '       arc setups [--window ID] [--json]',
-    '       arc start --prompt-file PATH (--setup KEY | --provider claude|codex [--model MODEL] [--effort EFFORT] [--permissions MODE]) (--agent-run | --untagged) [--name NAME] [--label NAME] [--pinned] [--arc-dispatch] [--window ID] [--request-id ID]',
-    '       arc label add|remove ID --label NAME [--dry-run] [--window ID] [--request-id ID]',
-    '       arc pin|unpin|archive|unarchive ID [--dry-run] [--window ID] [--request-id ID]',
-    '       arc archive ID --force [--window ID] [--request-id ID]',
-    '       arc send ID --prompt-file PATH --observation OBSERVATION --request-id ID [--window ID] [--json]',
-    '       arc cost TARGET [--since TIME] [--until TIME] [--projects PATH] [--codex-sessions PATH] [--by-model] [--source-only] [--by-tool-kind] [--until-text REGEX] [--window-agent ID] [--json]',
-    '',
-    'Reads Claude Code status-line JSON from stdin.',
-    'Text output includes context, prompt-cache state, next-turn starting price, session cost, and account limits.',
-    'Cost reads one transcript and its children. It prints JSON by default.',
-    '--source-only reads an exact transcript file path without discovering children.',
-    '--by-model adds billing subtotals for each model to the parent and child sources.',
-    'Windows lists running Arc windows and their panel and repository readiness.',
-    "Sessions lists one page of the selected window's repository sessions as JSON. Pass its next value to --cursor for the following page.",
-    'Session reads bounded turns without marking them read.',
-    '--window selects an Arc window. Otherwise ARC_WINDOW or one unambiguous live window selects it.',
-    '--request-id accepts a fresh ID prefixed with the selected window hostId and a colon.',
-    'Start and curation accept identical-payload retries in that window activation. Old activation IDs have an unknown outcome after reload.',
-    'Start --untagged keeps work the reader asked for, with prompt-box continuation. --agent-run files delegated work under Run by agents.',
-    'Never retry a compaction request with uncertain admission.',
-    'Send delivers a follow-up to an idle session that the calling session started with --arc-dispatch in that window. The observation comes from arc session --json.',
-  ].join('\n');
-}
 
 async function readStdin(): Promise<string> {
   process.stdin.setEncoding('utf8');
@@ -66,36 +33,37 @@ async function run(): Promise<void> {
     process.stdout.write(`${VERSION}\n`);
     return;
   }
+  const command = findCommand(args);
   if (args.includes('--help') || args[0] === 'help' || args.length === 0) {
-    process.stdout.write(`${help()}\n`);
+    process.stdout.write(`${command ? renderCommandHelp(command) : renderOverviewHelp()}\n`);
     return;
   }
-  if (args[0] === 'cost') {
-    process.stdout.write(`${runCost(args.slice(1))}\n`);
-    return;
-  }
-  if (args[0] === 'windows') {
-    process.stdout.write(`${await runWindows(args.slice(1))}\n`);
-    return;
-  }
-  if (args[0] === 'compact') {
-    process.stdout.write(`${await runCompact(args.slice(1))}\n`);
-    return;
-  }
-  if (args[0] === 'sessions' || args[0] === 'session' || args[0] === 'filter') {
-    process.stdout.write(`${await runSessions(args[0], args.slice(1))}\n`);
-    return;
-  }
-  if (['setups', 'start', 'send', 'pin', 'unpin', 'archive', 'unarchive'].includes(args[0])) {
-    process.stdout.write(`${await runManagement(args[0], args.slice(1))}\n`);
-    return;
-  }
-  if (args[0] === 'label' && ['add', 'remove'].includes(args[1])) {
-    process.stdout.write(`${await runManagement(`label-${args[1]}`, args.slice(2))}\n`);
-    return;
-  }
-  if (args[0] !== 'statusline') {
-    throw new Error(`Unknown command: ${args[0]}`);
+  if (!command) throw new Error(`Unknown command: ${args[0]}`);
+  const commandArgs = args.slice(command.name.split(' ').length);
+  switch (command.route) {
+    case 'cost':
+      process.stdout.write(`${runCost(commandArgs)}\n`);
+      return;
+    case 'windows':
+      process.stdout.write(`${await runWindows(commandArgs)}\n`);
+      return;
+    case 'compact':
+      process.stdout.write(`${await runCompact(args.slice(1))}\n`);
+      return;
+    case 'sessions':
+      process.stdout.write(`${await runSessions(command.name as 'sessions' | 'session' | 'filter', commandArgs)}\n`);
+      return;
+    case 'management':
+      process.stdout.write(`${await runManagement(command.action!, commandArgs)}\n`);
+      return;
+    case 'label':
+      throw new Error(`Unknown command: ${args[0]}`);
+    case 'statusline':
+      break;
+    default: {
+      const unhandled: never = command.route;
+      throw new Error(`Unknown command route: ${unhandled}`);
+    }
   }
 
   const raw = await readStdin();
