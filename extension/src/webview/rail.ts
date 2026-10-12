@@ -3,7 +3,7 @@ import { nativeMenuIcon, pressNativeMenu } from './native-menu.ts';
 import { navigationIndex, plainNavigationKey } from './navigation.ts';
 import type { SessionLauncherView } from '../view/launcher.ts';
 import { newSessionKeyshortcut, newSessionName, UNREADY_LAUNCHER_WORDS } from '../view/launcher.ts';
-import { LABEL_NOTES, labelKey, labelTypedNotes } from '../domain/labels.ts';
+import { LABEL_NOTES, labelKey, labelTabTarget, labelTypedNotes } from '../domain/labels.ts';
 import {
   IS_PREFIX,
   IS_VALUES,
@@ -241,6 +241,9 @@ interface RailWords extends SessionRenameWords, RailHoverWords {
   labelCreate: string;
   labelCreateWhy: string;
   labelCreateKey: string;
+  labelTabKey: string;
+  labelTabSaid: string;
+  labelTabWhy: string;
   labelNone: string;
   hideSession: string;
   unarchiveSession: string;
@@ -929,6 +932,7 @@ function LabelPopover({
   open,
   rows,
   create,
+  tabTarget,
   filter,
   notes,
   options,
@@ -938,6 +942,8 @@ function LabelPopover({
   open: OpenLabels | null;
   rows: LabelEditorRow[];
   create: string;
+  // The row Tab in the box applies, or undefined when Tab keeps its native walk.
+  tabTarget: LabelEditorRow | undefined;
   filter: string;
   notes: readonly (keyof typeof LABEL_NOTES)[];
   options: RailOptions;
@@ -953,6 +959,7 @@ function LabelPopover({
         class: 'labelfind',
         placeholder: options.words.labelFind,
         'aria-label': options.words.labelFind,
+        'aria-describedby': 'labeltabwhy',
         'data-control': 'label-find',
         ref: setInput,
         text: filter,
@@ -968,6 +975,7 @@ function LabelPopover({
           (owner as RailRenderer & { labelInputKeydown(event: KeyboardEvent): void }).labelInputKeydown(event);
         },
       }),
+      h('span', { class: 'sr-only', id: 'labeltabwhy' }, options.words.labelTabWhy),
     ),
     h('div', { class: 'labellist', key: 'list' }, [
       ...notes.map((note) => h('div', { class: 'labelnote', key: `note:${note}` }, LABEL_NOTES[note])),
@@ -997,7 +1005,10 @@ function LabelPopover({
             type: 'checkbox',
             class: 'labelbox',
             checked: row.applied,
-            'aria-label': `${row.name}, ${row.countName}`,
+            'aria-label':
+              row === tabTarget
+                ? `${row.name}, ${row.countName}, ${options.words.labelTabSaid}`
+                : `${row.name}, ${row.countName}`,
             'data-control': `label:${row.name}`,
             onKeyDown: (event: KeyboardEvent) => {
               if (event.isComposing || event.keyCode === 229 || event.key !== 'Enter') {
@@ -1019,6 +1030,7 @@ function LabelPopover({
             },
           }),
           h('span', { class: 'labelname' }, row.name),
+          row === tabTarget ? h('kbd', { class: 'labelkey' }, options.words.labelTabKey) : null,
           h('span', { class: 'labelcount' }, String(row.count)),
         ]),
       ),
@@ -3064,12 +3076,14 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
     }
     const active = document.activeElement as HTMLElement | null;
     const held = active && labelPop.contains(active) ? (active.dataset.control ?? null) : null;
+    const shown = labelShownRows();
     render(
       h(LabelPopover, {
         owner,
         open: labelsOpen,
-        rows: labelShownRows(),
+        rows: shown,
         create: labelCreateName(),
+        tabTarget: labelTabTarget(shown, labelFilter),
         filter: labelFilter,
         notes: labelTypedNotes(labelFilter),
         options,
@@ -4024,10 +4038,7 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
         return;
       }
       if (takeMatch) {
-        if (!labelFilter.trim()) {
-          return;
-        }
-        const row = labelShownRows().find((candidate) => !candidate.applied);
+        const row = labelTabTarget(labelShownRows(), labelFilter);
         if (!row) {
           return;
         }
@@ -4066,6 +4077,8 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
       const row = labelsOpen?.rows.find((candidate) => labelFold(candidate.name) === labelFold(name));
       if (row) {
         row.applied = applied;
+        // The Tab key hint follows the rows that are not applied, so it moves before the host answers.
+        drawLabelPop(null, false);
       }
       postLabels();
     },

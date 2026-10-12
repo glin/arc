@@ -26,6 +26,16 @@ export function labelTypedNotes(raw: string): LabelNote[] {
   return notes;
 }
 
+// The row that Tab in the find box applies: the first shown row the session does not carry yet.
+// Typed text that is blank has no target, and Tab keeps its native walk. The editor draws its Tab
+// key hint on this row and the key handler applies it, so the hint always names what Tab does.
+export function labelTabTarget<Row extends { applied: boolean }>(
+  shown: readonly Row[],
+  typed: string,
+): Row | undefined {
+  return typed.trim() ? shown.find((row) => !row.applied) : undefined;
+}
+
 // A label's count as its checkbox is announced by.
 //
 // The row draws the count as a figure beside the name, and a figure read out after a name

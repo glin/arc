@@ -250,6 +250,12 @@ export const CARD_ACTIONS = {
   // The key that does the same from inside the box, drawn at the row's right-hand end.
   // Named as a word, because a glyph is read out by its Unicode name.
   labelCreateKey: 'Enter',
+  // The key that applies the row it is drawn on, from inside the box. A word for the same reason.
+  labelTabKey: 'Tab',
+  // The row's spoken form of that key. Tab on the checkbox itself moves focus, so the phrase names the box.
+  labelTabSaid: 'Tab in the find box applies this label',
+  // The box's description, read once when the box takes focus. The box is empty then, so it cannot name a row.
+  labelTabWhy: 'After you type, Tab applies the first matching label that is not applied to this session.',
   // An empty label list explains how to create the first label.
   labelNone: 'No label yet. Type a name and press Enter to make one.',
   // Use this clause only when the unread count is known and zero. An unavailable count establishes neither state.

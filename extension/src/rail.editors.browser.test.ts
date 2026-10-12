@@ -652,9 +652,17 @@ test(
       })()`);
       assert.deepEqual(modifiedTabs, { results: [true, true, true, true], value: 'compo', messages: [] });
 
+      // The key hint sits on one row only. 'component system' is checked and comes first, so a hint on
+      // the first shown row would name it instead of the unchecked row that Tab applies.
+      const hinted = () =>
+        page.evaluate(
+          `[...document.querySelectorAll('#labelpop .labelrow:has(.labelkey) .labelname')].map((node) => node.textContent)`,
+        );
       await input.fill('compo');
+      assert.deepEqual(await hinted(), ['component']);
       await page.evaluate(`window.__posted = []`);
       await input.press('Tab');
+      assert.deepEqual(await hinted(), []);
       assert.deepEqual(
         await page.evaluate(`(() => ({
         messages: window.__posted.filter((message) => message.type === 'setLabels'),
@@ -668,6 +676,7 @@ test(
         },
       );
       await input.fill('ser');
+      assert.deepEqual(await hinted(), ['server']);
       await page.evaluate(`window.__posted = []`);
       await input.press('Tab');
       assert.deepEqual(
@@ -681,6 +690,39 @@ test(
           value: '',
           focused: true,
         },
+      );
+      // Every match is applied now, so no row carries the key and Tab keeps its native walk.
+      await input.fill('compo');
+      assert.deepEqual(await hinted(), []);
+      // Pressing Enter on an exact unchecked name applies it locally, so the key leaves before the host replies.
+      await answerLabelEditor(page, 's1', [
+        { name: 'component system', count: 1, countName: '1 session', applied: true },
+        { name: 'component', count: 1, countName: '1 session', applied: false },
+      ]);
+      await input.fill('component');
+      assert.deepEqual(await hinted(), ['component']);
+      await input.press('Enter');
+      assert.deepEqual(await hinted(), []);
+      // Checking a row by its checkbox moves the key to the next unchecked match before the host replies.
+      await answerLabelEditor(page, 's1', [
+        { name: 'alpha one', count: 1, countName: '1 session', applied: false },
+        { name: 'alpha two', count: 1, countName: '1 session', applied: false },
+      ]);
+      await input.fill('alpha');
+      assert.deepEqual(await hinted(), ['alpha one']);
+      await page.locator('[data-control="label:alpha one"]').check();
+      assert.deepEqual(await hinted(), ['alpha two']);
+      // The key's row names the key in the box, and the box describes the key before anything is typed.
+      assert.equal(
+        await page.evaluate(`document.querySelector('[data-control="label:alpha two"]').getAttribute('aria-label')`),
+        `alpha two, 1 session, ${CARD_ACTIONS.labelTabSaid}`,
+      );
+      assert.equal(
+        await page.evaluate(`(() => {
+          const input = document.querySelector('.labelfind');
+          return document.getElementById(input.getAttribute('aria-describedby')).textContent;
+        })()`),
+        CARD_ACTIONS.labelTabWhy,
       );
       await input.fill('no match');
       await page.evaluate(`window.__posted = []`);

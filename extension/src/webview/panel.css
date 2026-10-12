@@ -4727,6 +4727,17 @@ button.sbread:hover {
   font-size: var(--t-body);
   cursor: pointer;
 }
+/* In a check row the row is a flex line, which ignores the float above. The key takes the
+   right-hand end and the count follows it, with a wider gap than the row's so that the key and
+   the figure do not read as one phrase. */
+.labelrow > .labelkey {
+  float: none;
+  flex: none;
+  margin: 0 0.75em 0 auto;
+}
+.labelrow > .labelkey + .labelcount {
+  margin-left: 0;
+}
 .labelrow:hover,
 .labelrow:has(.labelbox:focus-visible) {
   background: var(--vscode-list-hoverBackground, color-mix(in srgb, var(--vscode-foreground) 10%, transparent));

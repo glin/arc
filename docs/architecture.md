@@ -371,7 +371,7 @@ The first column is checked against the shipped extension directory by `architec
 | `domain/commit-sha.ts` | Browser-safe commit identity: two recorded shas name one commit when either is the prefix of the other, and the lower-case hex pattern that tells a commit hash from a ref name | no |
 | `domain/composer-editing.ts` | Browser-safe prompt-history key decisions, the platform send chord, completion token parsing, and command matching | no |
 | `pathcompletion.ts` | Host-safe immediate directory resolution, filtering, ordering, and completion bounds | no |
-| `domain/labels.ts` | Browser-safe label identity, name ceiling, typed-name warning, and label-count wording rules | no |
+| `domain/labels.ts` | Browser-safe label identity, name ceiling, typed-name warning, label-count wording rules, and the choice of the row Tab applies | no |
 | `domain/model-identity.ts` | Model id comparison shared by transcript turns and the Prompt box: window suffix, snapshot date, Bedrock prefix, and deployment suffix | no |
 | `domain/link-path.ts` | Browser-safe local-path versus URI-scheme classification | no |
 | `domain/file-citation.ts` | Bounded assistant-directive grammar, source masking, and native literal file destination admission | no |

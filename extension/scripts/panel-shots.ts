@@ -78,6 +78,7 @@ export interface Shot {
   files?: boolean; // Load the prompt attachment fixture.
   waiting?: boolean; // Show a queued attachment above a running compaction.
   labels?: boolean; // Supply label editor rows after the control requests them.
+  labelTyped?: string; // Text to type into the label editor's find box after its rows arrive.
   details?: boolean; // Open session details through a host message.
   rename?: 'heading' | 'rail'; // Open Rename session from the first session heading or session list card.
   filter?: string; // Text to type into the session list filter box.
@@ -278,13 +279,38 @@ export const SHOTS: Shot[] = [
   { name: 'wide-launcher-codex', click: '#launcher [data-control="launch-agent:codex"]' },
   { name: 'wide-label-editor', escape: 2, click: '.railrow .raillabelact', labels: true },
   { name: 'wide-details', escape: 2, details: true },
-  // Capture session labels and their editor under the session heading.
-  { name: 'wide-session-labels', escape: true, click: '.sessionlabels .sessionlabelact', labels: true },
+  // Capture session labels and their editor under the session heading. The action closes the editor after capture, since Escape alone leaves it open.
+  {
+    name: 'wide-session-labels',
+    escape: true,
+    click: '.sessionlabels .sessionlabelact',
+    labels: true,
+    after: '.sessionlabels .sessionlabelact',
+  },
+  // Typed text shows the Create row with Enter, and the key on the row that Tab applies, past an applied row and a long name.
+  {
+    name: 'wide-label-typed',
+    escape: true,
+    click: '.sessionlabels .sessionlabelact',
+    labels: true,
+    labelTyped: 're',
+    after: '.sessionlabels .sessionlabelact',
+  },
   // Cancel closes Rename session after capture. Capture blurs focus, so Escape alone leaves the editor open.
   { name: 'wide-session-rename', escape: true, rename: 'heading', after: '[data-control="session-rename-cancel"]' },
   { name: 'wide-rail-session-rename', escape: true, rename: 'rail', after: '[data-control="session-rename-cancel"]' },
   // An unfinished `label:` term opens label suggestions without narrowing the session list.
   { name: 'wide-filter-offers', escape: true, filter: 'label:', after: '.filterclear' },
+  // The same typed editor at a narrow width. The next capture sets its own width.
+  {
+    name: 'narrow-label-typed',
+    width: 340,
+    escape: true,
+    click: '.sessionlabels .sessionlabelact',
+    labels: true,
+    labelTyped: 're',
+    after: '.sessionlabels .sessionlabelact',
+  },
   { name: 'mid', width: 640, escape: true },
   { name: 'narrow', width: 340 },
   // Use taller viewports for long turn card captures at wide and intermediate widths.
@@ -1276,6 +1302,11 @@ export async function shoot(
       rows: labelEditorRows(SHOT_LABELS, session),
     };
     await page.evaluate(`window.postMessage(${JSON.stringify(answer)}, '*')`);
+    await page.evaluate(SETTLED);
+  }
+  if (shot.labelTyped) {
+    await page.locator('.labelfind').click();
+    await page.keyboard.type(shot.labelTyped);
     await page.evaluate(SETTLED);
   }
   if (shot.rename) {
