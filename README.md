@@ -140,3 +140,7 @@ Arc estimates costs for supported models using published prices. Subscription es
 ### Commenting
 
 <a href="docs/images/readme-comment-editor.webp"><img src="docs/images/readme-comment-editor.webp" alt="Selected response text with a comment being written beside it" width="970"></a>
+
+## Limitations
+
+Some Claude Code and Codex features, such as starting Remote Control (`/remote-control`), are not implemented in Arc.
