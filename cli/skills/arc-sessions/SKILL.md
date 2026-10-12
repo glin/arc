@@ -19,9 +19,9 @@ Run `arc setups --window WINDOW_ID` before choosing settings. Use a returned set
 
 Run `arc --help` for command sections. Run `arc COMMAND --help` for syntax, flags, output fields, refusals, and an example. Nested commands accept help too, including `arc label add --help` and `arc compact request --help`.
 
-Start requires a regular UTF-8 prompt file, at most 48 KiB, with nonempty text that does not begin with a slash command. Choose a returned setup key or explicit supported provider settings. Omitted model, effort, and permissions retain provider defaults.
+Start requires a regular UTF-8 prompt file, at most 48 KiB, with nonempty text that does not begin with a slash command. Omitted model, effort, and permissions retain provider defaults.
 
-Omitted `--agent-run` or `--agent-run=false` keeps reader ownership and Prompt box continuation. A session the reader asked you to start keeps that ownership, even when it coordinates other agents or reports back. Bare `--agent-run` or `--agent-run=true` marks delegated work under Run by agents. Use it only for a session you choose for your own task, such as a worker or reviewer. Attribution alone establishes neither ownership nor authority. Use `--arc-dispatch` to retain guarded follow-up ownership and the parent session's Dispatched link. Reader-owned dispatch receipts include `owned: true`.
+Omitted `--agent-run` or `--agent-run=false` keeps reader ownership and Prompt box continuation. A session the reader asked you to start keeps that ownership, even when it coordinates other agents or reports back. Bare `--agent-run` or `--agent-run=true` marks delegated work under Run by agents. Use it only for a session you choose for your own task, such as a worker or reviewer. Attribution alone establishes neither ownership nor authority. Use `--arc-dispatch` to record the requester for guarded follow-ups and supply the parent session's Dispatched link. Reader-owned dispatch receipts include `owned: true`.
 
 ## Interpret delivery
 

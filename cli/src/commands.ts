@@ -25,7 +25,8 @@ const requestFlag: Flag = [
 ];
 const dryRunFlag: Flag = ['--dry-run', 'Check admission without changing session metadata.'];
 const windowRefusal = 'Window selection, unavailable capabilities, or repository readiness can refuse the request.';
-const argumentRefusal = 'Unknown, repeated, missing, or invalid arguments refuse before sending.';
+const argumentRefusal =
+  'Unknown flags, repeated scalar flags, and missing flag values refuse before sending. Host validation can refuse request values after sending.';
 const curationOutput = [
   'JSON: version, requestId, status, sessionId, action, requester. Refusals include reason.',
   'Applied results also include labels, pinned, archived. Status is applied, dry-run, refused, or unknown.',

@@ -235,7 +235,7 @@ This excerpt shows selected fields. The main window contains only second 2. It e
 
 ## Status-line arguments
 
-Run `arc statusline --help` for output options. The default output renders text from one Claude Code JSON object on stdin. JSON includes `schemaVersion`, `source`, `model`, `workspace`, `session`, `context`, `cache`, `nextTurn`, and `limits`.
+Run `arc statusline --help` for output options. The default output renders text from one Claude Code JSON object on stdin.
 
 Without a valid width, text uses unlimited width. Invalid or missing `--width` values also use unlimited width. Width affects only text detail, not JSON or `--next-turn`. The required context, cache, and next-turn segments can exceed the requested width.
 
