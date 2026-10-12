@@ -1059,6 +1059,7 @@ export interface SessionStatTurnFacts {
   // context. That context does not include any tool result sent to the failed request.
   error: boolean;
   model: string | null;
+  effort?: string | null;
   provider: string | null;
   usage: TurnUsage;
   usageParts?: TurnUsagePart[];
@@ -1095,6 +1096,7 @@ export function sessionStatFactsOf(read: SessionRead): SessionStatFacts | null {
       finished: turn.finished,
       error: turn.error !== null,
       model: turn.model,
+      ...(turn.effort !== undefined ? { effort: turn.effort } : {}),
       provider: turn.provider ?? null,
       usage: {
         ...turn.usage,
@@ -1872,6 +1874,115 @@ export type ClosedChild = string | { id: string; closedAt: number };
 export interface BackgroundCommand {
   id: string;
   startedAt: number;
+}
+
+// Retirement retains identified launches independently of display windows and expiry.
+export class ClaudeBackgroundWork {
+  private readonly open = new Set<string>();
+  private readonly completed = new Set<string>();
+  private readonly tasks = new Map<string, string>();
+  private readonly toolTasks = new Map<string, string>();
+  private readonly ambiguous = new Set<string>();
+  private readonly launches = new Map<string, string>();
+
+  get pending(): boolean {
+    return this.open.size > 0;
+  }
+
+  retain(commands: readonly BackgroundCommand[], children: readonly string[]): void {
+    for (const key of [...commands.map((command) => `tool:${command.id}`), ...children.map((id) => `child:${id}`)])
+      if (!this.completed.has(key)) this.open.add(key);
+  }
+
+  observe(record: Record<string, unknown>, owner = 'unidentified'): void {
+    const content = (record.message as { content?: unknown } | undefined)?.content;
+    const blocks = Array.isArray(content)
+      ? content.filter(
+          (block): block is Record<string, unknown> => !!block && typeof block === 'object' && !Array.isArray(block),
+        )
+      : [];
+    if (record.type === 'assistant') {
+      let identity: string | undefined;
+      for (const block of blocks) {
+        const input = block.input as { run_in_background?: unknown } | undefined;
+        if (
+          block.type !== 'tool_use' ||
+          !['Bash', 'Agent', 'Task'].includes(String(block.name)) ||
+          input?.run_in_background !== true ||
+          typeof block.id !== 'string' ||
+          !block.id
+        )
+          continue;
+        const key = `tool:${block.id}`;
+        identity ??= owner + ':' + (typeof record.uuid === 'string' ? record.uuid : JSON.stringify(record));
+        if (this.completed.has(key) || (this.open.has(key) && this.launches.get(key) !== identity))
+          this.ambiguous.add(key);
+        this.launches.set(key, identity);
+        this.open.add(key);
+      }
+    }
+    if (record.type === 'user') {
+      const result = (record.tool_use_result ?? record.toolUseResult) as
+        | { status?: unknown; agentId?: unknown; backgroundTaskId?: unknown }
+        | undefined;
+      for (const block of blocks) {
+        if (block.type !== 'tool_result' || typeof block.tool_use_id !== 'string') continue;
+        const key = `tool:${block.tool_use_id}`;
+        const child = result?.status === 'async_launched' || result?.status === 'launched' ? result.agentId : undefined;
+        const task = child ?? result?.backgroundTaskId;
+        if (typeof task === 'string' && task) {
+          const previous = this.tasks.get(task);
+          const previousTask = this.toolTasks.get(key);
+          if (previousTask !== undefined && previousTask !== task) {
+            this.ambiguous.add(key);
+            this.ambiguous.add(`child:${previousTask}`);
+            this.ambiguous.add(`child:${task}`);
+          }
+          if (previous !== undefined && previous !== key) {
+            this.ambiguous.add(previous);
+            this.ambiguous.add(key);
+            this.ambiguous.add(`child:${task}`);
+          }
+          this.tasks.set(task, key);
+          this.toolTasks.set(key, task);
+          if (!this.completed.has(key)) this.open.add(key);
+        }
+      }
+    }
+    const notice = taskNotificationText(record);
+    if (notice === null) return;
+    const tags = (name: string) => {
+      const occurrences = [...notice.matchAll(new RegExp(`</?${name}(?=[^a-zA-Z0-9_-]|$)[^>]*(?:>|$)`, 'g'))];
+      if (occurrences.length !== 2 || occurrences[0][0] !== `<${name}>` || occurrences[1][0] !== `</${name}>`)
+        return [];
+      const value = new RegExp(`<${name}>([^<>]+)</${name}>`).exec(notice)?.[1];
+      return value?.trim() ? [value] : [];
+    };
+    const statuses = tags('status'),
+      tools = tags('tool-use-id'),
+      tasks = tags('task-id');
+    if (
+      statuses.length !== 1 ||
+      !['completed', 'failed', 'killed'].includes(statuses[0]) ||
+      tools.length !== 1 ||
+      tasks.length !== 1 ||
+      !/^\s*<task-notification>[\s\S]*<\/task-notification>\s*$/.test(notice) ||
+      (notice.match(/<task-notification>/g)?.length ?? 0) !== 1 ||
+      (notice.match(/<\/task-notification>/g)?.length ?? 0) !== 1
+    )
+      return;
+    const tool = `tool:${tools[0]}`,
+      child = `child:${tasks[0]}`;
+    const mapped = this.tasks.get(tasks[0]);
+    const mappedTask = this.toolTasks.get(tool);
+    if ((mapped !== undefined && mapped !== tool) || (mappedTask !== undefined && mappedTask !== tasks[0])) return;
+    for (const key of [tool, child]) {
+      if (this.open.has(key) && !this.ambiguous.has(key)) {
+        this.open.delete(key);
+        this.completed.add(key);
+      }
+    }
+  }
 }
 
 function closedChildId(child: ClosedChild): string {

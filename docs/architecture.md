@@ -461,6 +461,8 @@ Claude CLI manual compaction can record a plain command before its boundary, the
 
 Subagent row names contain absolutely positioned accessible text. The clipped name establishes its positioning box so hidden suffixes cannot widen the page.
 
+`transcript.ts` supplies the host's unresolved-work reducer. Root Claude launch results and identified terminal task notifications update it through `claudewire.ts`. Accepted matching session metadata adds holds through `panelhost.ts` and `extension.ts`. [Child ownership and shutdown](agent-protocols.md#child-ownership-and-shutdown) owns background retention and retirement.
+
 The editor boundary is `extension.ts`, `panelhost.ts`, `uris.ts`, and `config.ts`. Other production modules avoid `vscode`, so tests can import their decisions directly. `extension/src/imports.test.ts` enforces package direction and runtime cycles.
 
 The extension build packages the CLI and both shell launchers. VSIX packaging marks the extensionless launcher executable on POSIX, including archives built on Windows. It patches the archive named by VSCE's successful packaging output.

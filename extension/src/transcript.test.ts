@@ -315,6 +315,7 @@ import {
   readSessionMeta,
   sessionOutcomeOf,
   sessionStatFactsOf,
+  ClaudeBackgroundWork,
   shortenTo,
   plainTitle,
   normalizeSessionTitle,
@@ -15997,4 +15998,161 @@ test('an advisor consultation before a compaction leaves the compaction estimate
   const plain = estimate(false);
   assert.equal(plain.length, 1);
   assert.deepEqual(estimate(true), plain);
+});
+
+test('background retirement requires an unambiguous terminal notice for each retained launch', () => {
+  const work = new ClaudeBackgroundWork();
+  work.retain(
+    [
+      { id: 'first', startedAt: 1 },
+      { id: 'second', startedAt: 2 },
+    ],
+    [],
+  );
+  const notice = (tool: string, status: string) => ({
+    type: 'user',
+    origin: { kind: 'task-notification' },
+    message: {
+      content: `<task-notification><task-id>task-${tool}</task-id><tool-use-id>${tool}</tool-use-id><status>${status}</status></task-notification>`,
+    },
+  });
+  for (const status of ['running', 'unknown', '', 'completed</status><status>running']) {
+    const single = new ClaudeBackgroundWork();
+    single.retain([{ id: 'first', startedAt: 1 }], []);
+    single.observe(notice('first', status));
+    assert.equal(single.pending, true, `nonterminal status ${status} released the launch`);
+    work.observe(notice('first', status));
+  }
+  work.observe(notice('unrelated', 'completed'));
+  work.observe({ ...notice('first', 'completed'), origin: undefined });
+  assert.equal(work.pending, true);
+  work.observe(notice('first', 'completed'));
+  assert.equal(work.pending, true);
+  work.observe(notice('second', 'failed'));
+  assert.equal(work.pending, false);
+  work.retain([{ id: 'first', startedAt: 1 }], []);
+  assert.equal(work.pending, false, 'older accepted metadata reopened a completed launch');
+  work.observe({
+    type: 'assistant',
+    message: { content: [{ type: 'tool_use', name: 'Bash', id: 'first', input: { run_in_background: true } }] },
+  });
+  work.observe(notice('first', 'completed'));
+  assert.equal(work.pending, true, 'a reused identity accepted an ambiguous older completion');
+});
+
+test('background retirement retains valid mixed-content launches and requires their associated task', () => {
+  const work = new ClaudeBackgroundWork();
+  const malformed = [null, false, 7, 'text', []];
+  work.observe({
+    type: 'assistant',
+    message: {
+      content: [...malformed, { type: 'tool_use', name: 'Bash', id: 'command', input: { run_in_background: true } }],
+    },
+  });
+  assert.equal(work.pending, true);
+  work.observe({
+    type: 'user',
+    tool_use_result: { backgroundTaskId: 'actual-task' },
+    message: { content: [...malformed, { type: 'tool_result', tool_use_id: 'command' }] },
+  });
+  const notice = (task: string, extra = '') => ({
+    type: 'user',
+    origin: { kind: 'task-notification' },
+    message: {
+      content: `<task-notification><task-id>${task}</task-id><tool-use-id>command</tool-use-id><status>completed</status>${extra}</task-notification>`,
+    },
+  });
+  work.observe(notice('unrelated-task'));
+  assert.equal(work.pending, true, 'an unrelated task released its known tool');
+  for (const field of ['status', 'tool-use-id', 'task-id']) {
+    for (const extra of [
+      `<${field}></${field}>`,
+      `<${field}/>`,
+      `<${field}<nested>>`,
+      `<${field}=broken>`,
+      `<${field} value="x"></${field}>`,
+      `<${field}>`,
+      `</${field}>`,
+      `<${field}><nested>x</nested></${field}>`,
+    ]) {
+      work.observe(notice('actual-task', extra));
+      assert.equal(work.pending, true, `malformed ${field} evidence released work: ${extra}`);
+    }
+    work.observe({
+      ...notice('actual-task'),
+      message: {
+        content: notice('actual-task').message.content.replace(
+          new RegExp(`<${field}>[^<]+</${field}>`),
+          `<${field}><nested>x</nested></${field}>`,
+        ),
+      },
+    });
+    assert.equal(work.pending, true, `a nested ${field} value released work`);
+  }
+  work.observe(notice('actual-task'));
+  assert.equal(work.pending, false);
+});
+
+test('a background launch envelope without a UUID is serialized once', () => {
+  const work = new ClaudeBackgroundWork();
+  const record = {
+    type: 'assistant',
+    message: {
+      content: Array.from({ length: 20 }, (_, index) => ({
+        type: 'tool_use',
+        name: 'Bash',
+        id: `command-${index}`,
+        input: { run_in_background: true },
+      })),
+    },
+  };
+  const stringify = vi.spyOn(JSON, 'stringify');
+  try {
+    work.observe(record);
+    assert.equal(stringify.mock.calls.filter(([value]) => value === record).length, 1);
+    assert.equal(work.pending, true);
+  } finally {
+    stringify.mockRestore();
+  }
+});
+
+test('a mixed-content result retains its task association without a launch record', () => {
+  const work = new ClaudeBackgroundWork();
+  work.observe({
+    type: 'user',
+    tool_use_result: { backgroundTaskId: 'actual-task' },
+    message: { content: [null, false, 7, 'text', [], { type: 'tool_result', tool_use_id: 'command' }] },
+  });
+  assert.equal(work.pending, true);
+  work.observe({
+    type: 'user',
+    origin: { kind: 'task-notification' },
+    message: {
+      content:
+        '<task-notification><task-id>actual-task</task-id><tool-use-id>command</tool-use-id><status>completed</status></task-notification>',
+    },
+  });
+  assert.equal(work.pending, false);
+});
+
+test('a later child or submission cannot release a reused unresolved background launch', () => {
+  for (const nextOwner of ['child-a:2', 'child-b:1']) {
+    const work = new ClaudeBackgroundWork();
+    const launch = {
+      type: 'assistant',
+      message: { content: [{ type: 'tool_use', name: 'Bash', id: 'shared', input: { run_in_background: true } }] },
+    };
+    work.observe(launch, 'child-a:1');
+    work.observe(launch, 'child-a:1');
+    work.observe(launch, nextOwner);
+    work.observe({
+      type: 'user',
+      origin: { kind: 'task-notification' },
+      message: {
+        content:
+          '<task-notification><task-id>old-task</task-id><tool-use-id>shared</tool-use-id><status>completed</status></task-notification>',
+      },
+    });
+    assert.equal(work.pending, true, 'an older completion released the ambiguous later launch');
+  }
 });

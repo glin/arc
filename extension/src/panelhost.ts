@@ -1605,6 +1605,13 @@ export class PanelProvider implements vscode.Disposable {
   public onSessionRowsRefreshed: (() => void) | null = null;
   public onAnswerAsk: ((session: string, id: string, answer: AskAnswer) => boolean) | null = null;
   public onArchivedSessionsChange: ((sessions: ReadonlySet<string>) => void) | null = null;
+  public onBackgroundWorkDetected:
+    | ((
+        session: SessionFile,
+        commands: readonly import('./transcript').BackgroundCommand[],
+        children: readonly string[],
+      ) => void)
+    | null = null;
   public archivedSessions(): ReadonlySet<string> {
     return new Set(this.hidden);
   }
@@ -2003,6 +2010,7 @@ export class PanelProvider implements vscode.Disposable {
       [];
     if (matches.length !== 1) throw new Error('The session ID is unknown or ambiguous in this window.');
     let reason: string | null = null;
+    let evaluatedRunStatus: SessionListingRow['runStatus'] | undefined;
     if (action === 'archive') {
       // The ID filter applies before paging, so the row is on the first page wherever it sorts.
       const listing = this.readSessionRequest({
@@ -2013,10 +2021,17 @@ export class PanelProvider implements vscode.Disposable {
       }) as { sessions: SessionListingRow[] };
       const key = sessionSourceKey(matches[0].agent, matches[0].sessionId, matches[0].file);
       const row = listing.sessions.find((row) => row.source === key);
+      if (force) evaluatedRunStatus = row?.runStatus;
       reason = row ? archiveRefusal(row, force!) : 'The session state is unavailable.';
     }
     if (action === 'pin' && this.hidden.has(session!)) reason = 'Unarchive the session before pinning it.';
-    const result = { version: 1, sessionId: session, action, requester: request.requester };
+    const result = {
+      version: 1,
+      sessionId: session,
+      action,
+      requester: request.requester,
+      ...(action === 'archive' && force ? { evaluatedRunStatus: evaluatedRunStatus ?? null } : {}),
+    };
     if (reason) return { ...result, status: 'refused', reason };
     if (dryRun) return { ...result, status: 'dry-run' };
     if (action === 'label-add' || action === 'label-remove') {
@@ -2296,6 +2311,7 @@ export class PanelProvider implements vscode.Disposable {
             sessionExitMatches(witness, source.file, revision, held?.revision),
           mtimeMs: revision.mtimeMs,
         },
+        sourceCurrent && meta && sameSessionRevision(meta, source) ? meta.backgroundCommands : undefined,
       );
       const latest = current ? meta.stats?.turns.at(-1) : undefined;
       const recorded =
@@ -2324,7 +2340,7 @@ export class PanelProvider implements vscode.Disposable {
         name: this.sessionLabel(source).fullLabel,
         setup: {
           model: recorded?.model ?? latest?.model ?? null,
-          effort: recorded?.effort ?? null,
+          effort: recorded?.effort ?? latest?.effort ?? null,
           source: recorded || latest ? 'recorded' : 'unavailable',
         },
         labels: labelsOf(this.saved.labels, source.sessionId).map((name) => ({ name, source: 'reader' })),
@@ -9879,6 +9895,13 @@ export class PanelProvider implements vscode.Disposable {
 
   // Return accepted rail metadata without reading the transcript. Unread files use neutral facts.
   private metaFor(session: SessionFile): DerivedTitleEntry {
+    const accepted = this.titles.get(session.file);
+    if (session.agent === 'claude' && accepted && sameSessionRevision(accepted, session))
+      this.onBackgroundWorkDetected?.(
+        session,
+        accepted.backgroundCommands ?? accepted.outcome?.backgroundCommands ?? [],
+        accepted.outcome?.openChildren ?? [],
+      );
     return (
       this.titles.get(session.file) ?? {
         size: -1,

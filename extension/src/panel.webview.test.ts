@@ -2307,6 +2307,28 @@ test('current whole-file facts archive a listed session with no turn, refuse una
   assert.deepEqual([row().runStatus, row().attention], ['none', 'idle']);
   source.agent = 'codex';
   assert.equal(row().runStatus, 'unknown');
+  const rollout = path.join(directory, 'observed.jsonl');
+  fs.writeFileSync(
+    rollout,
+    [
+      { type: 'session_meta', payload: { id: 'empty' } },
+      { type: 'event_msg', timestamp: '2026-01-01T00:00:01Z', payload: { type: 'task_started', turn_id: 'turn' } },
+      { type: 'event_msg', timestamp: '2026-01-01T00:00:01Z', payload: { type: 'user_message', message: 'work' } },
+      {
+        type: 'turn_context',
+        timestamp: '2026-01-01T00:00:02Z',
+        payload: { turn_id: 'turn', model: 'gpt-6.1-sol', effort: 'low' },
+      },
+      { type: 'event_msg', timestamp: '2026-01-01T00:00:03Z', payload: { type: 'task_complete', turn_id: 'turn' } },
+    ]
+      .map((record) => JSON.stringify(record))
+      .join('\n') + '\n',
+  );
+  entry.stats = sessionStatFactsOf(readCodexSession(rollout, 'empty'));
+  assert.deepEqual(row().setup, { model: 'gpt-6.1-sol', effort: 'low', source: 'recorded' });
+  entry.stats.turns[0].effort = null;
+  assert.equal(row().setup.effort, null);
+  delete entry.stats;
   source.agent = 'claude';
   assert.equal((await provider.handleSessionRequest(request)).status, 'applied');
   assert.equal(provider.hidden.has('empty'), true);
@@ -2333,8 +2355,16 @@ test('current whole-file facts archive a listed session with no turn, refuse una
   provider.asks = [{ session: 'empty' }];
   await refuse(/running or needs input/);
   provider.asks = [];
-  entry.backgroundCommands = [{ toolUseId: 'background', startedAt: Date.now() }];
-  await refuse(/unavailable/);
+  entry.backgroundCommands = [{ id: 'background', startedAt: Date.now() }];
+  assert.equal(row().runStatus, 'background');
+  await refuse(/background work/);
+  assert.equal(
+    (await provider.handleSessionRequest({ ...request, params: { ...request.params, force: true } })).status,
+    'refused',
+  );
+  visible = false;
+  assert.equal(row().runStatus, 'background');
+  visible = true;
   delete entry.backgroundCommands;
   unread = { count: 1, atLeast: false };
   await refuse(/--force/);
@@ -2365,14 +2395,14 @@ test('current whole-file facts archive a listed session with no turn, refuse una
     assert.deepEqual([row().facts, row().attention], ['stale', active]);
     await refuse(/running or needs input\. Use --force/);
     assert.equal(provider.hidden.has('empty'), false);
-    assert.equal(
-      (await provider.handleSessionRequest({ ...forced, params: { ...forced.params, dryRun: true } })).status,
-      'dry-run',
-    );
+    const dry = await provider.handleSessionRequest({ ...forced, params: { ...forced.params, dryRun: true } });
+    assert.equal(dry.status, 'dry-run');
+    assert.equal(dry.evaluatedRunStatus, active === 'input' ? 'waiting' : 'running');
     assert.equal(provider.hidden.has('empty'), false);
     saves.length = 0;
     const result = await provider.handleSessionRequest(forced);
     assert.deepEqual([result.status, result.archived, result.pinned], ['applied', true, false], result.reason);
+    assert.equal(result.evaluatedRunStatus, active === 'input' ? 'waiting' : 'running');
     assert.deepEqual(saves, [['empty']]);
     assert.equal(provider.pinnedTop.has('empty'), false);
     provider.running.clear();
@@ -2874,6 +2904,7 @@ test('scoped curation awaits saves, rechecks archive at apply, rolls back refusa
       params: { ...request.params, action: 'archive', force: true },
     });
     assert.equal(result.status, 'refused');
+    assert.equal(result.evaluatedRunStatus, runStatus);
     assert.match(result.reason, /^Arc cannot tell whether background work in the session ended/);
     assert.doesNotMatch(result.reason, /--force/);
   }

@@ -207,6 +207,7 @@ export type NativeEvent = {
   | { kind: 'toolStart'; toolId: string; command: string; foreground: boolean }
   | { kind: 'toolEnd'; toolId: string; success: boolean }
   | { kind: 'rootEnd'; success: boolean }
+  | { kind: 'background' }
   | { kind: 'submission'; text: string }
   | {
       kind: 'compact';

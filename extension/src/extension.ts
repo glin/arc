@@ -529,7 +529,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     channel.setCompactRequestHandler((request) => owner.handle(request));
     context.subscriptions.push({ dispose: () => owner.dispose() });
   }
+  panel.onBackgroundWorkDetected = (session, commands, children) =>
+    host.retainBackgroundWork(session.agent, session.sessionId, commands, children);
   panel.onArchivedSessionsChange = (sessions) => host.setArchived(sessions);
+
   host.setArchived(panel.archivedSessions());
   context.subscriptions.push(
     vscode.workspace.onDidChangeConfiguration((change) => {

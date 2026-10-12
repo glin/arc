@@ -21,6 +21,7 @@ import {
   encodeSessionCursor,
   readSessionCursor,
   sessionAttention,
+  sessionReadStatus,
   sessionListingPage,
   sessionPageSources,
   sessionScopeDigest,
@@ -3578,4 +3579,17 @@ test('older hosts refuse shorthand before either query route connects and retain
   } finally {
     await channel.dispose();
   }
+});
+
+test('accepted no-turn commands retain positive status until qualified process closure', () => {
+  const commands = [{ id: 'command', startedAt: 100 }];
+  const status = (running: boolean, waiting: boolean, exited?: number, unchanged = true) =>
+    sessionReadStatus('session', null, running, waiting, undefined, exited, { unchanged, mtimeMs: 150 }, commands);
+  assert.equal(status(false, false), 'background');
+  assert.equal(status(true, false), 'running');
+  assert.equal(status(false, true), 'waiting');
+  assert.equal(status(false, false, 200), 'stopped');
+  assert.equal(status(false, false, 200, false), 'background');
+  assert.equal(status(false, false, 99), 'background');
+  assert.equal(status(false, false, 149), 'background');
 });

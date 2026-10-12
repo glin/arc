@@ -48,7 +48,12 @@ import {
   effortChoices,
 } from './composerview';
 import { confirmClaudeRename, renameInitialCodexSession } from './sessionrename';
-import { readCustomTitleSidecar, readInitialCustomTitle } from './transcript';
+import {
+  readCustomTitleSidecar,
+  readInitialCustomTitle,
+  ClaudeBackgroundWork,
+  type BackgroundCommand,
+} from './transcript';
 import { ARC_IDENTITY } from './identity';
 
 // The child-process methods used by the host. Tests supply these methods without starting a CLI.
@@ -206,6 +211,7 @@ export interface SessionState {
   lastError: string | null;
   ready: boolean;
   exited: boolean;
+  backgroundPending?: boolean;
 }
 
 export interface SessionEvent {
@@ -746,6 +752,14 @@ let nextUsageSource = 0;
 
 // One session and the child running it.
 export class AgentSession {
+  private readonly background = new Map<string, ClaudeBackgroundWork>();
+
+  backgroundWork(sessionId: string): ClaudeBackgroundWork {
+    let work = this.background.get(sessionId);
+    if (!work) this.background.set(sessionId, (work = new ClaudeBackgroundWork()));
+    return work;
+  }
+
   readonly usageSource = ++nextUsageSource;
   readonly key: string;
   readonly agent: AgentName;
@@ -806,12 +820,14 @@ export class AgentSession {
     plan: AgentPlan,
     spawner: Spawner,
     private readonly report: (event: WireEvent, turnId?: number) => void,
-    private readonly changed: () => void,
+    private readonly changed: (backgroundReleased?: boolean) => void,
     private readonly openingDeadlineMs: number = OPENING_DEADLINE_MS,
     private readonly exitGraceMs: number = EXIT_GRACE_MS,
     // Tests inject the clock to control Stop-ending expiry.
     private readonly now: () => number = Date.now,
+    retainedBackground?: ClaudeBackgroundWork,
   ) {
+    if (plan.sessionId && retainedBackground) this.background.set(plan.sessionId, retainedBackground);
     this.key = key;
     this.agent = plan.agent;
     this.cwd = plan.cwd;
@@ -865,6 +881,7 @@ export class AgentSession {
       lastError: this.lastError,
       ready: this.ready,
       exited: this.exited,
+      ...([...this.background.values()].some((work) => work.pending) ? { backgroundPending: true } : {}),
     };
   }
 
@@ -1465,6 +1482,15 @@ export class AgentSession {
     // A native event names its accepted submission only when one owner is identifiable.
     if (event.kind === 'native') {
       const native = event.event;
+      if (native.kind === 'background') {
+        if (native.provider !== 'claude' || native.sessionId !== this.driver.sessionId()) return;
+        let work = this.background.get(native.sessionId);
+        if (!work) this.background.set(native.sessionId, (work = new ClaudeBackgroundWork()));
+        const pending = work.pending;
+        work.observe(native.evidence, `${this.usageSource}:${native.generation}`);
+        if (pending !== work.pending) this.changed(pending && !work.pending);
+        return;
+      }
       if (
         native.kind === 'compact' &&
         (native.stage === 'turnStart' || native.stage === 'itemStart') &&
@@ -2356,6 +2382,23 @@ export function modelChange(
 // Owns children started by this window. Other windows read their work from disk.
 export class AgentHost {
   private readonly sessions = new Map<string, AgentSession>();
+  private readonly backgroundReads = new Map<string, ClaudeBackgroundWork>();
+
+  retainBackgroundWork(
+    agent: AgentName,
+    sessionId: string,
+    commands: readonly BackgroundCommand[],
+    children: readonly string[],
+  ): void {
+    if (agent !== 'claude' || (!commands.length && !children.length)) return;
+    const identity = this.sessionIdentity(agent, sessionId);
+    let held = this.backgroundReads.get(identity);
+    if (!held) {
+      held = this.find(agent, sessionId)?.backgroundWork(sessionId) ?? new ClaudeBackgroundWork();
+      this.backgroundReads.set(identity, held);
+    }
+    held.retain(commands, children);
+  }
   // Opening promises shared by callers for the same host key.
   private readonly starting = new Map<string, Promise<AgentSession>>();
   private readonly startingSessions = new Map<string, Promise<AgentSession>>();
@@ -2484,18 +2527,24 @@ export class AgentHost {
       }
     }
 
+    const retainedBackground = identity
+      ? (this.backgroundReads.get(identity) ?? new ClaudeBackgroundWork())
+      : undefined;
+    if (identity && retainedBackground) this.backgroundReads.set(identity, retainedBackground);
     const session = new AgentSession(
       key,
       plan,
       this.spawner,
       (event, turnId) => this.options.onEvent(turnId === undefined ? { key, event } : { key, event, turnId }),
-      () => {
-        this.applyTargetedRetirementEligibility(key, session);
+      (backgroundReleased) => {
+        if (backgroundReleased) this.applyRetirementEligibility(key, session);
+        else this.applyTargetedRetirementEligibility(key, session);
         this.options.onStateChange(this.sessions.get(key)?.state() ?? session.state());
       },
       this.options.openingDeadlineMs,
       this.options.exitGraceMs,
       this.options.now,
+      retainedBackground,
     );
     this.sessions.set(key, session);
     await session.start();
@@ -2951,7 +3000,7 @@ export class AgentHost {
   }
 
   private eligible(state: SessionState): boolean {
-    return !state.exited && !state.busy && state.asks.length === 0;
+    return !state.exited && !state.busy && !state.backgroundPending && state.asks.length === 0;
   }
 
   private requestRetirement(
@@ -3038,6 +3087,7 @@ export class AgentHost {
       !this.activityLeases.has(session) &&
       !this.openingReservations.has(key) &&
       !state.busy &&
+      !state.backgroundPending &&
       state.asks.length === 0
     ) {
       this.targetedRetirements.delete(key);

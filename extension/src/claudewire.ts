@@ -925,6 +925,19 @@ export class ClaudeWire {
       turnId: null,
       evidence: message,
     };
+    const backgroundResult = obj(message.tool_use_result);
+    const backgroundRecord =
+      arr(obj(message.message)?.content).some((block) => obj(obj(block)?.input)?.run_in_background === true) ||
+      backgroundResult?.status === 'async_launched' ||
+      backgroundResult?.status === 'launched' ||
+      typeof backgroundResult?.backgroundTaskId === 'string' ||
+      obj(message.origin)?.kind === 'task-notification';
+    if (
+      backgroundRecord &&
+      (message.type === 'assistant' || message.type === 'user') &&
+      message.parent_tool_use_id === null
+    )
+      this.emit({ kind: 'native', event: { ...base, kind: 'background' } });
     if (message.type === 'assistant' && message.parent_tool_use_id === null) {
       for (const block of arr(obj(message.message)?.content)) {
         const tool = obj(block);

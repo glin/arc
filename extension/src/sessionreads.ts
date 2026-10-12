@@ -155,8 +155,15 @@ export function sessionReadStatus(
   since: number | undefined,
   exited: number | undefined,
   source: { unchanged: boolean; mtimeMs: number },
+  backgroundCommands?: readonly import('./transcript').BackgroundCommand[],
 ): RailStatus | undefined {
-  const boundary = since ?? outcome?.startedAt;
+  const boundary =
+    since ??
+    outcome?.startedAt ??
+    backgroundCommands?.reduce<number | undefined>(
+      (earliest, command) => (earliest === undefined ? command.startedAt : Math.min(earliest, command.startedAt)),
+      undefined,
+    );
   const ended =
     exited !== undefined &&
     boundary !== undefined &&
@@ -189,6 +196,7 @@ export function sessionReadStatus(
     liveBackgroundCommands(new Map([[id, observedOutcome ?? null]]), new Map(), now),
   );
   const status = statuses.get(id);
+  if (!outcome && !ended && !running && !waiting && backgroundCommands?.length) return 'background';
   if (status === 'running' && !active) return undefined;
   if (
     status === 'done' &&

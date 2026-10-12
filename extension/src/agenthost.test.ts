@@ -1927,6 +1927,184 @@ test('disposing the host ends every child it started', async () => {
   assert.deepEqual(host.states(), []);
 });
 
+test('archive, idle and targeted retirement react to final background completion without another turn', async () => {
+  for (const mode of ['archive', 'idle', 'targeted', 'unarchive']) {
+    vi.useFakeTimers();
+    const timer = new FakeAgentHostTimer();
+    const { host, children } = fakeHost(undefined, Date.now, { timer });
+    const opening = host.session('one', claudePlan(CLAUDE, { cwd: WS, sessionId: 'sess-1' }));
+    children[0].answerHandshake();
+    const session = await opening;
+    const say = (record: object) =>
+      children[0].say(JSON.stringify({ session_id: 'sess-1', parent_tool_use_id: null, ...record }) + '\n');
+    await session.prompt('start both tasks');
+    say({
+      type: 'assistant',
+      message: {
+        content: [
+          null,
+          false,
+          7,
+          'text',
+          [],
+          { type: 'tool_use', name: 'Bash', id: 'command', input: { command: 'npm test', run_in_background: true } },
+          { type: 'tool_use', name: 'Agent', id: 'agent', input: { run_in_background: true } },
+        ],
+      },
+    });
+    say({
+      type: 'user',
+      tool_use_result: { backgroundTaskId: 'task' },
+      message: { content: [null, false, 7, 'text', [], { type: 'tool_result', tool_use_id: 'command' }] },
+    });
+    say({
+      type: 'user',
+      tool_use_result: { status: 'async_launched', agentId: 'child' },
+      message: { content: [null, false, 7, 'text', [], { type: 'tool_result', tool_use_id: 'agent' }] },
+    });
+    children[0].say(COMPLETED_RESULT);
+    settle(host, 'one');
+    let retirement: Promise<void> | undefined;
+    if (mode === 'targeted') retirement = host.retireSession('one');
+    else if (mode !== 'idle') host.setArchived(['sess-1']);
+    assert.strictEqual(host.get('one'), session, 'archive closed an idle child whose background tasks still run');
+    vi.setSystemTime(Date.now() + 48 * 60 * 60 * 1000);
+    host.setIdleDuration(1);
+    for (let index = 0; index < timer.tasks.length; index++) timer.fire(index);
+    const notice = (tool: string, task: string, status: string, extra: object = {}) =>
+      say({
+        type: 'user',
+        origin: { kind: 'task-notification' },
+        message: {
+          content: `<task-notification><task-id>${task}</task-id><tool-use-id>${tool}</tool-use-id><status>${status}</status></task-notification>`,
+        },
+        ...extra,
+      });
+    notice('command', 'task', 'running');
+    notice('command', 'task', 'unknown');
+    notice('command', 'unrelated-task', 'completed');
+    for (const field of ['status', 'tool-use-id', 'task-id']) {
+      for (const extra of [
+        `<${field}></${field}>`,
+        `<${field}/>`,
+        `<${field} value="x"></${field}>`,
+        `<${field}>`,
+        `</${field}>`,
+        `<${field}><nested>x</nested></${field}>`,
+      ]) {
+        say({
+          type: 'user',
+          origin: { kind: 'task-notification' },
+          message: {
+            content: `<task-notification><task-id>task</task-id><tool-use-id>command</tool-use-id><status>completed</status>${extra}</task-notification>`,
+          },
+        });
+        assert.equal(session.state().backgroundPending, true);
+      }
+    }
+    notice('command', 'task', 'completed', { session_id: 'foreign' });
+    say({
+      type: 'assistant',
+      message: { content: [{ type: 'tool_use', name: 'TaskStop', id: 'stop', input: { task_id: 'task' } }] },
+    });
+    assert.strictEqual(host.get('one'), session);
+    assert.equal(children[0].ended, false);
+    await session.prompt('another turn');
+    children[0].say(COMPLETED_RESULT);
+    settle(host, 'one');
+    notice('command', 'task', 'completed');
+    assert.strictEqual(host.get('one'), session, 'one task completion released the other task');
+    if (mode === 'unarchive') host.setArchived([]);
+    notice('agent', 'child', 'completed');
+    if (mode === 'unarchive') {
+      assert.strictEqual(host.get('one'), session, 'completion ignored unarchive');
+      host.setArchived(['sess-1']);
+    } else if (mode === 'idle') {
+      assert.strictEqual(host.get('one'), session);
+      assert.equal(timer.tasks.at(-1)?.delayMs, 1, 'completion did not restart idle retirement');
+      timer.fire(timer.tasks.length - 1);
+    }
+    assert.equal(host.get('one'), null);
+    assert.equal(children[0].ended, true);
+    children[0].exit(0);
+    await retirement;
+    vi.useRealTimers();
+  }
+});
+
+test('unrelated and malformed background completions cannot retire an archived live child', async () => {
+  const qualified = '<task-id>actual-task</task-id><tool-use-id>command</tool-use-id><status>completed</status>';
+  const invalid = [qualified.replace('actual-task', 'unrelated-task')];
+  for (const field of ['status', 'tool-use-id', 'task-id']) {
+    invalid.push(
+      qualified + `<${field}></${field}>`,
+      qualified + `<${field}/>`,
+      qualified + `<${field}<nested>>`,
+      qualified + `<${field}=broken>`,
+      qualified + `<${field} value="x"></${field}>`,
+      qualified + `<${field}>`,
+      qualified + `</${field}>`,
+      qualified.replace(new RegExp(`<${field}>[^<]+</${field}>`), `<${field}><nested>x</nested></${field}>`),
+    );
+  }
+  for (const content of invalid) {
+    const { host, children } = fakeHost();
+    const opening = host.session('one', claudePlan(CLAUDE, { cwd: WS, sessionId: 'sess-1' }));
+    children[0].answerHandshake();
+    const session = await opening;
+    const say = (record: object) =>
+      children[0].say(JSON.stringify({ session_id: 'sess-1', parent_tool_use_id: null, ...record }) + '\n');
+    await session.prompt('start both tasks');
+    say({
+      type: 'assistant',
+      message: {
+        content: ['command', 'second'].map((id) => ({
+          type: 'tool_use',
+          name: 'Bash',
+          id,
+          input: { run_in_background: true },
+        })),
+      },
+    });
+    say({
+      type: 'user',
+      tool_use_result: { backgroundTaskId: 'actual-task' },
+      message: { content: [null, false, 7, 'text', [], { type: 'tool_result', tool_use_id: 'command' }] },
+    });
+    children[0].say(COMPLETED_RESULT);
+    settle(host, 'one');
+    host.setArchived(['sess-1']);
+    const notice = (body: string) =>
+      say({
+        type: 'user',
+        origin: { kind: 'task-notification' },
+        message: { content: `<task-notification>${body}</task-notification>` },
+      });
+    notice('<task-id>second-task</task-id><tool-use-id>second</tool-use-id><status>completed</status>');
+    notice(content);
+    assert.strictEqual(host.get('one'), session, `invalid completion retired the child: ${content}`);
+    assert.equal(children[0].ended, false);
+    notice(qualified);
+    assert.equal(host.get('one'), null);
+    assert.equal(children[0].ended, true);
+    children[0].exit(0);
+  }
+});
+
+test('accepted background metadata survives missing later reads and protects a resumed child', async () => {
+  const { host, children } = fakeHost();
+  host.retainBackgroundWork('claude', 'sess-1', [{ id: 'command', startedAt: 1 }], ['child']);
+  const opening = host.session('one', claudePlan(CLAUDE, { cwd: WS, sessionId: 'sess-1' }));
+  children[0].answerHandshake();
+  const session = await opening;
+  host.retainBackgroundWork('claude', 'sess-1', [], []);
+  host.setArchived(['sess-1']);
+  assert.strictEqual(host.get('one'), session);
+  assert.equal(children[0].ended, false);
+  host.setArchived([]);
+  host.dispose();
+});
+
 test('a settled idle session retires when its timer fires', async () => {
   const timer = new FakeAgentHostTimer();
   const { host, children } = fakeHost(undefined, undefined, { idleDurationMs: 120, timer });

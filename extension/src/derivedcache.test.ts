@@ -390,6 +390,7 @@ import {
   CodexMetaCache,
   codexSessionFiles,
   readCodexSessionMeta,
+  readCodexSessionActivity,
   scanCodexDispatchReferences,
   staleMetas,
 } from './codex.ts';
@@ -475,6 +476,42 @@ const title: DerivedTitleEntry = {
   foldedLabel: 'a session',
 };
 
+test('observed Codex turn effort survives metadata and a derived-cache reload', () => {
+  const source = path.join(folder(), 'effort.jsonl');
+  const cache = path.join(folder(), 'cache.json');
+  fs.writeFileSync(
+    source,
+    [
+      { type: 'session_meta', payload: { id: 'effort' } },
+      { type: 'event_msg', timestamp: '2026-01-01T00:00:01Z', payload: { type: 'task_started', turn_id: 'turn' } },
+      { type: 'event_msg', timestamp: '2026-01-01T00:00:01Z', payload: { type: 'user_message', message: 'work' } },
+      {
+        type: 'turn_context',
+        timestamp: '2026-01-01T00:00:02Z',
+        payload: { turn_id: 'turn', model: 'gpt-6.1-sol', effort: 'low' },
+      },
+      { type: 'event_msg', timestamp: '2026-01-01T00:00:03Z', payload: { type: 'task_complete', turn_id: 'turn' } },
+    ]
+      .map((record) => JSON.stringify(record))
+      .join('\n') + '\n',
+  );
+  const facts = readCodexSessionActivity(source, 256 * 1024, {
+    sessionId: 'effort',
+    meta: readCodexSessionMeta(source),
+  }).stats!;
+  assert.equal(facts.turns[0].effort, 'low');
+  saveDerivedCache(cache, [[source, { ...title, stats: facts }]]);
+  assert.equal(loadDerivedCache(cache).titles.get(source)!.stats!.turns[0].effort, 'low');
+  for (const effort of [null, undefined, 7, '']) {
+    saveDerivedCache(cache, [
+      [source, { ...title, stats: { ...facts, turns: [{ ...facts.turns[0], effort } as any] } }],
+    ]);
+    const restored = loadDerivedCache(cache).titles.get(source);
+    if (effort === null || effort === undefined) assert.ok(restored);
+    else assert.equal(restored, undefined);
+  }
+});
+
 test('per-pass pricing survives a derived-cache reload with both bands and request input averages', () => {
   const directory = folder();
   const source = path.join(directory, 'session.jsonl');
@@ -495,7 +532,7 @@ test('per-pass pricing survives a derived-cache reload with both bands and reque
 });
 
 test('prior derived generations drop saved figures and carry valid names for bounded rereading', () => {
-  for (const version of [35, 36]) {
+  for (const version of [35, 36, 60]) {
     const file = path.join(folder(), 'cache.json');
     fs.writeFileSync(
       file,
