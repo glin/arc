@@ -7,6 +7,7 @@ import {
   normalizeAgentRead,
   OrderedReadOperations,
   ReadPublicationError,
+  ReadPersistenceUnknownError,
   type OrderedReadState,
   type AgentReadRecord,
   type AgentReadSource,
@@ -279,7 +280,12 @@ export class SessionReadObservations {
   }
 }
 
-export async function runSessionRead(
+const retainedSessionReads = new WeakMap<
+  OrderedReadOperations,
+  Map<string, { payload: string; result: Promise<ReadWriteResult> }>
+>();
+
+export function runSessionRead(
   request: {
     requestId: string;
     sessionId: string;
@@ -290,8 +296,43 @@ export async function runSessionRead(
   observations: SessionReadObservations,
   operations: OrderedReadOperations,
   facts: (record: AgentReadRecord) => AgentReadSource | null,
-  persist: (state: OrderedReadState) => Promise<void>,
-  publish: (state: OrderedReadState) => void,
+  persist: (state: OrderedReadState) => Promise<import('./domain/read.ts').ReadStorageSettlement | void>,
+  publish: (state: OrderedReadState) => void | Promise<void>,
+): Promise<ReadWriteResult> {
+  const payload = JSON.stringify(request);
+  const retained = retainedSessionReads.get(operations) ?? new Map();
+  retainedSessionReads.set(operations, retained);
+  const held = retained.get(request.requestId);
+  if (held && held.payload === payload) return held.result;
+  if (held || retained.size >= 256 || payload.length > READ_OBSERVATION_BYTES + 4096)
+    return Promise.resolve({
+      version: 1,
+      requestId: request.requestId,
+      sessionId: request.sessionId,
+      requester: request.requester,
+      marked: [],
+      status: 'refused',
+      reason: held ? 'The request ID names a different read action.' : 'The read request limit was reached.',
+    });
+  const admitted = structuredClone(request);
+  const result = applySessionRead(admitted, observations, operations, facts, persist, publish);
+  retained.set(request.requestId, { payload, result });
+  return result;
+}
+
+async function applySessionRead(
+  request: {
+    requestId: string;
+    sessionId: string;
+    observation: string;
+    requester: RequesterIdentity | null;
+    dryRun: boolean;
+  },
+  observations: SessionReadObservations,
+  operations: OrderedReadOperations,
+  facts: (record: AgentReadRecord) => AgentReadSource | null,
+  persist: (state: OrderedReadState) => Promise<import('./domain/read.ts').ReadStorageSettlement | void>,
+  publish: (state: OrderedReadState) => void | Promise<void>,
 ): Promise<ReadWriteResult> {
   const base = {
     version: 1 as const,
@@ -316,7 +357,13 @@ export async function runSessionRead(
     };
   try {
     const accepted = await operations.run(
-      { id: request.requestId, observedRevision: operations.snapshot().revision, action: 'acknowledge', records },
+      {
+        id: request.requestId,
+        namespace: 'cli',
+        observedRevision: operations.snapshot().revision,
+        action: 'acknowledge',
+        records,
+      },
       facts,
       persist,
       publish,
@@ -330,6 +377,7 @@ export async function runSessionRead(
       reason: 'The delivered completed turns are marked read.',
     };
   } catch (error) {
+    if (error instanceof ReadPersistenceUnknownError) return { ...base, status: 'unknown', reason: error.message };
     if (error instanceof ReadPublicationError)
       return {
         ...base,

@@ -143,6 +143,14 @@ export function normalizeAgentRead(raw: unknown): AgentReadRecord[] {
 }
 
 export function currentAgentRead(record: AgentReadRecord, facts: AgentReadSource | null): boolean {
+  return currentReadIdentity(record, facts, true);
+}
+
+function currentReadIdentity(
+  record: AgentReadRecord,
+  facts: AgentReadSource | null,
+  requireFinished: boolean,
+): boolean {
   if (!validAgentReadRecord(record) || !facts || !facts.identitiesComplete) return false;
   if (
     ['provider', 'sessionId', 'source', 'scope', 'sourceRevision'].some(
@@ -153,7 +161,7 @@ export function currentAgentRead(record: AgentReadRecord, facts: AgentReadSource
   const candidates = facts.turns.filter((turn) => turn.startedAt === record.startedAt);
   return (
     candidates.length === 1 &&
-    candidates[0].finished &&
+    (!requireFinished || candidates[0].finished) &&
     candidates[0].promptId === record.promptId &&
     facts.turns.filter((turn) => turn.promptId === record.promptId).length === 1
   );
@@ -184,26 +192,52 @@ export interface OrderedReadState {
   agentRead: AgentReadRecord[];
 }
 
+export type ReaderReadTarget = { sessionId: string; startedAt: number; promptId?: string };
+
 export type ReadOperation = {
   id: string;
+  namespace?: 'browser' | 'cli' | 'host';
   observedRevision: number;
 } & (
   | { action: 'acknowledge'; records: AgentReadRecord[] }
-  | { action: 'turn'; target: AgentReadRecord; read: boolean }
-  | { action: 'session'; target: AgentReadRecord; read: boolean; newestAt: number }
+  | { action: 'turn'; target: ReaderReadTarget; read: boolean }
+  | { action: 'session'; target: ReaderReadTarget; read: boolean; newestAt: number }
   | { action: 'reset'; since: number }
   | { action: 'invalidate' }
 );
+
+export type ReaderReadAdmission = (operation: Extract<ReadOperation, { action: 'turn' | 'session' }>) => boolean;
+
+function currentReaderRead(
+  target: ReaderReadTarget,
+  facts: (record: AgentReadRecord) => AgentReadSource | null,
+): boolean {
+  if (!validAgentReadRecord(target)) return false;
+  const source = facts(target);
+  if (!source) return false;
+  // Reader actions admit unfinished identities. Agent acknowledgments still require completion.
+  return currentReadIdentity(target, source, false);
+}
+
+function knownAgentReadRemoval(record: AgentReadRecord, source: AgentReadSource | null): boolean {
+  if (!source) return false;
+  const sameBinding = ['provider', 'sessionId', 'source', 'scope', 'sourceRevision'].every(
+    (key) => record[key as 'source'] === source[key as 'source'],
+  );
+  return !sameBinding || (source.identitiesComplete && !currentAgentRead(record, source));
+}
 
 export function reduceReadOperation(
   state: OrderedReadState,
   operation: ReadOperation,
   facts: (record: AgentReadRecord) => AgentReadSource | null,
+  admitReader: ReaderReadAdmission = (operation) => currentReaderRead(operation.target, facts),
 ): OrderedReadState | null {
   if (
     !Number.isSafeInteger(operation.observedRevision) ||
     operation.observedRevision < 0 ||
-    operation.observedRevision > state.revision
+    operation.observedRevision > state.revision ||
+    !Number.isSafeInteger(state.revision + 1)
   )
     return null;
   if (
@@ -213,7 +247,11 @@ export function reduceReadOperation(
     return null;
   if (
     (operation.action === 'turn' || operation.action === 'session') &&
-    !currentAgentRead(operation.target, facts(operation.target))
+    (!Number.isFinite(operation.target.startedAt) ||
+      operation.target.startedAt <= 0 ||
+      !operation.target.sessionId ||
+      typeof operation.read !== 'boolean' ||
+      !admitReader(operation))
   )
     return null;
   const next: OrderedReadState = {
@@ -235,7 +273,15 @@ export function reduceReadOperation(
         const boundary = next.readTo[operation.target.sessionId] ?? next.since;
         if (operation.target.startedAt <= boundary)
           next.readTo[operation.target.sessionId] = operation.target.startedAt - 1;
-        next.agentRead = next.agentRead.filter((one) => agentReadIdentity(one) !== agentReadIdentity(operation.target));
+        next.agentRead = next.agentRead.filter(
+          (one) =>
+            one.sessionId !== operation.target.sessionId ||
+            one.startedAt !== operation.target.startedAt ||
+            one.promptId !== operation.target.promptId ||
+            (validAgentReadRecord(operation.target) &&
+              agentReadIdentity(one) !== agentReadIdentity(operation.target)) ||
+            !currentAgentRead(one, facts(one)),
+        );
       }
       break;
     }
@@ -257,7 +303,7 @@ export function reduceReadOperation(
       next.since = operation.since;
       break;
     case 'invalidate':
-      next.agentRead = next.agentRead.filter((record) => currentAgentRead(record, facts(record)));
+      next.agentRead = next.agentRead.filter((record) => !knownAgentReadRemoval(record, facts(record)));
       break;
   }
   return next;
@@ -266,46 +312,164 @@ export function reduceReadOperation(
 // Storage settles before accepted state changes or publication. Failed writes leave the accepted state intact.
 export class OrderedReadOperations {
   private tail: Promise<unknown> = Promise.resolve();
+  private unsettled = false;
+  private pending = 0;
   private readonly results = new Map<string, { payload: string; result: Promise<{ revision: number } | null> }>();
   constructor(
     private state: OrderedReadState,
     private readonly limit = 256,
+    private readonly current?: () => OrderedReadState,
   ) {
     this.state = structuredClone(state);
     this.state.agentRead = normalizeAgentRead(this.state.agentRead);
   }
   snapshot(): OrderedReadState {
-    return structuredClone(this.state);
+    return structuredClone(this.current?.() ?? this.state);
+  }
+  serialize<T>(operation: () => Promise<T>): Promise<T> {
+    if (this.pending >= this.limit) return Promise.reject(new Error('The read save limit was reached.'));
+    this.pending++;
+    const result = this.tail.then(async () => {
+      try {
+        if (this.unsettled) throw new ReadPersistenceUnknownError();
+        return await operation();
+      } catch (error) {
+        if (error instanceof ReadPersistenceUnknownError) this.unsettled = true;
+        throw error;
+      } finally {
+        this.pending--;
+      }
+    });
+    this.tail = result.catch(() => {});
+    return result;
   }
   run(
     operation: ReadOperation,
     facts: (record: AgentReadRecord) => AgentReadSource | null,
-    persist: (state: OrderedReadState) => Promise<void>,
-    publish: (state: OrderedReadState) => void,
+    persist: (state: OrderedReadState) => Promise<ReadStorageSettlement | void>,
+    publish: (state: OrderedReadState) => void | Promise<void>,
+    admitReader?: ReaderReadAdmission,
   ): Promise<{ revision: number } | null> {
     const payload = JSON.stringify(operation);
-    const held = this.results.get(operation.id);
+    const identity = JSON.stringify([operation.namespace ?? 'host', operation.id]);
+    const held = this.results.get(identity);
     if (held)
       return held.payload === payload
         ? held.result
         : Promise.reject(new Error('The read operation ID names a different action.'));
-    if (!operation.id || this.results.size >= this.limit)
+    if (!operation.id || operation.id.length > 512 || payload.length > 512 * 1024 || this.results.size >= this.limit)
       return Promise.reject(new Error('The read operation limit was reached.'));
-    const result = this.tail.then(async () => {
-      const next = reduceReadOperation(this.state, operation, facts);
+    const admitted = structuredClone(operation);
+    const result = this.serialize(async () => {
+      const next = reduceReadOperation(this.snapshot(), admitted, facts, admitReader);
       if (!next) return null;
-      await persist(structuredClone(next));
+      checkReadStorageSettlement(await persist(structuredClone(next)));
       this.state = next;
       try {
-        publish(this.snapshot());
+        await publish(this.snapshot());
       } catch {
         throw new ReadPublicationError();
       }
       return { revision: this.state.revision };
     });
-    this.results.set(operation.id, { payload, result });
-    this.tail = result.catch(() => {});
+    this.results.set(identity, { payload, result });
     return result;
+  }
+}
+
+export type ReadStorageSettlement = { status: 'saved' | 'failed' | 'unknown' };
+
+export class ReadPersistenceUnknownError extends Error {
+  constructor() {
+    super('The read state save has an unknown outcome. Preserve this request ID.');
+  }
+}
+
+function checkReadStorageSettlement(settlement: ReadStorageSettlement | void): void {
+  if (settlement?.status === 'unknown') throw new ReadPersistenceUnknownError();
+  if (settlement?.status === 'failed') throw new Error('The read state could not be saved.');
+}
+
+export interface HostReadState {
+  read: string[];
+  readTo: Record<string, number>;
+  since: number;
+  agentRead?: AgentReadRecord[];
+  readRevision?: number;
+}
+
+function orderedHostRead(state: HostReadState): OrderedReadState {
+  return {
+    revision: state.readRevision ?? 0,
+    read: state.read,
+    readTo: state.readTo,
+    since: state.since,
+    agentRead: normalizeAgentRead(state.agentRead),
+  };
+}
+
+// All writers share one barrier. Storage receives a copy and acceptance follows settled success.
+export class HostReadPersistence<T extends HostReadState> {
+  readonly operations: OrderedReadOperations;
+  private state: T;
+  constructor(
+    initial: T,
+    private readonly persist: (state: T) => Promise<ReadStorageSettlement | void>,
+    private readonly publish: (state: T) => void | Promise<void>,
+    limit = 256,
+  ) {
+    this.state = structuredClone(initial);
+    this.operations = new OrderedReadOperations(orderedHostRead(this.state), limit, () => orderedHostRead(this.state));
+  }
+  snapshot(): T {
+    return structuredClone(this.state);
+  }
+  read(
+    operation: ReadOperation,
+    facts: (record: AgentReadRecord) => AgentReadSource | null,
+    admitReader?: ReaderReadAdmission,
+  ): Promise<{ revision: number } | null> {
+    return this.operations.run(
+      operation,
+      facts,
+      (read) => this.persistRead(read),
+      () => this.publishAccepted(),
+      admitReader,
+    );
+  }
+  // Supply these callbacks only to this owner's ordered operations.
+  async persistRead(read: OrderedReadState): Promise<void> {
+    const next = {
+      ...this.snapshot(),
+      read: read.read,
+      readTo: read.readTo,
+      since: read.since,
+      agentRead: read.agentRead,
+      readRevision: read.revision,
+    };
+    checkReadStorageSettlement(await this.persist(structuredClone(next)));
+    this.state = structuredClone(next);
+  }
+  publishAccepted(): void | Promise<void> {
+    return this.publish(this.snapshot());
+  }
+  savePreferences(preferences: T): Promise<void> {
+    const admitted = structuredClone(preferences);
+    return this.saveHost((current) => preserveHostRead(current, admitted));
+  }
+  saveHost(update: (current: T) => T): Promise<void> {
+    return this.operations.serialize(async () => {
+      const next = structuredClone(update(this.snapshot()));
+      if (JSON.stringify(orderedHostRead(next)) !== JSON.stringify(orderedHostRead(this.state)))
+        throw new Error('Read changes require a read action.');
+      checkReadStorageSettlement(await this.persist(structuredClone(next)));
+      this.state = structuredClone(next);
+      try {
+        await this.publish(this.snapshot());
+      } catch {
+        throw new ReadPublicationError();
+      }
+    });
   }
 }
 

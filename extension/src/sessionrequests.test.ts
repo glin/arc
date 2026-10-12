@@ -168,6 +168,102 @@ test('read receipts refuse changed or foreign work and dry run preserves later a
   assert.deepEqual(operations.snapshot().agentRead, [record]);
 });
 
+test('read write retries retain settled outcomes after source changes and refuse conflicting payloads', async () => {
+  const record: AgentReadRecord = {
+    provider: 'codex',
+    sessionId: 'worker',
+    source: 'source',
+    scope: 'scope',
+    sourceRevision: 'revision',
+    promptId: 'prompt',
+    startedAt: 10,
+  };
+  const facts = (): AgentReadSource => ({
+    ...record,
+    identitiesComplete: true,
+    turns: [{ promptId: 'prompt', startedAt: 10, finished: true }],
+  });
+  const policy = new SessionReadObservations('activation');
+  const requester = { provider: 'claude' as const, id: 'reader' };
+  const observation = policy.observe(requester, { records: [record], projection: 'bounded' })!;
+  const owner = new OrderedReadOperations({ revision: 0, read: [], readTo: {}, since: 0, agentRead: [] });
+  const request = { requestId: 'retained', sessionId: 'worker', observation, requester, dryRun: false };
+  let writes = 0;
+  const result = await runSessionRead(
+    request,
+    policy,
+    owner,
+    facts,
+    async () => {
+      writes++;
+    },
+    () => {},
+  );
+  assert.equal(result.status, 'applied');
+  await owner.run(
+    { id: 'reader-removal', action: 'reset', observedRevision: 0, since: 0 },
+    facts,
+    async () => {},
+    () => {},
+  );
+  const retried = await runSessionRead(
+    request,
+    policy,
+    owner,
+    () => null,
+    async () => assert.fail('retry persisted'),
+    () => {},
+  );
+  assert.deepEqual(retried, result);
+  assert.equal(writes, 1);
+  assert.deepEqual(owner.snapshot().agentRead, []);
+  const conflict = await runSessionRead(
+    { ...request, dryRun: true },
+    policy,
+    owner,
+    facts,
+    async () => {},
+    () => {},
+  );
+  assert.equal(conflict.status, 'refused');
+});
+
+test('read writes retain unknown storage settlement and prevent later applied outcomes', async () => {
+  const record: AgentReadRecord = {
+    provider: 'codex',
+    sessionId: 'worker',
+    source: 'source',
+    scope: 'scope',
+    sourceRevision: 'revision',
+    promptId: 'prompt',
+    startedAt: 10,
+  };
+  const facts = (): AgentReadSource => ({
+    ...record,
+    identitiesComplete: true,
+    turns: [{ promptId: 'prompt', startedAt: 10, finished: true }],
+  });
+  const policy = new SessionReadObservations('activation');
+  const requester = { provider: 'claude' as const, id: 'reader' };
+  const observation = policy.observe(requester, { records: [record], projection: 'bounded' })!;
+  const owner = new OrderedReadOperations({ revision: 0, read: [], readTo: {}, since: 0, agentRead: [] });
+  const request = { requestId: 'unknown', sessionId: 'worker', observation, requester, dryRun: false };
+  let writes = 0;
+  const persist = async () => {
+    writes++;
+    return { status: 'unknown' as const };
+  };
+  const publish = () => assert.fail('unknown storage published');
+  assert.equal((await runSessionRead(request, policy, owner, facts, persist, publish)).status, 'unknown');
+  assert.equal((await runSessionRead(request, policy, owner, facts, persist, publish)).status, 'unknown');
+  assert.equal(
+    (await runSessionRead({ ...request, requestId: 'later' }, policy, owner, facts, persist, publish)).status,
+    'unknown',
+  );
+  assert.equal(owner.snapshot().revision, 0);
+  assert.equal(writes, 1);
+});
+
 test('read receipts contain only completed turns retained after the bounded response budget', () => {
   const directory = tempDir('read-receipt-budget-');
   const file = path.join(directory, 'session.jsonl');
