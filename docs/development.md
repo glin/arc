@@ -145,7 +145,7 @@ The project defaults to the folder where the caller ran npm. Pass `--project <fo
 
 Name the browser test files for the area you changed and run them directly with `node extension/test.mjs browser <files>`. Each named file narrows the lane to just that file, relative to `extension/` or to the repository root. A name that is not a browser test file fails with a clear message instead of running the whole lane.
 
-After all edits, format your changes and run the tests once before handoff. In an isolated worktree, format the whole repository and run the full suite:
+After all edits, format your changes and run the tests once before handoff. In an isolated worktree, format every covered file and run the full suite:
 
 ```bash
 npm run format
@@ -206,7 +206,7 @@ npm run format:check
 npm run lint
 ```
 
-Oxfmt covers root tooling, plugin hooks, CLI source and tests, extension build scripts, configuration, and current documentation. Under `extension/src` it covers every file except `panel-shots.test.ts`, including `panel.css` and `webview/tsconfig.json`. It leaves generated output, dependencies, screenshots, fixtures, and private agent files unchanged. Root formatting and lint commands disable nested configurations, so saved configurations under private agent directories cannot change their scan scope. Run evidence belongs under its owning plan's `runs/` directory, or `.claude/plans/runs/` for tasks without plans. Git ignores the existing `.claude/plans/` tree. Oxlint checks `extension/src` and every other maintained source tree. Type-aware checks cover every package project.
+Oxfmt covers root tooling, plugin hooks, CLI source and tests, extension build scripts, configuration, and current documentation. The `format` script in `package.json` names each folder and root file that it covers. Other files at the repository root, such as saved diagnostics and exported sessions, are not checked. Under `extension/src` it covers every file except `panel-shots.test.ts`, including `panel.css` and `webview/tsconfig.json`. It leaves generated output, dependencies, screenshots, fixtures, and private agent files unchanged. Root formatting and lint commands disable nested configurations, so saved configurations under private agent directories cannot change their scan scope. Run evidence belongs under its owning plan's `runs/` directory, or `.claude/plans/runs/` for tasks without plans. Git ignores the existing `.claude/plans/` tree. Oxlint checks `extension/src` and every other maintained source tree. Type-aware checks cover every package project.
 
 Run the full test suite:
 

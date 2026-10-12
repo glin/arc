@@ -5,8 +5,8 @@
   "scripts": {
     "eval:review": "node evals/agent-review/run.mjs",
     "prepare": "node scripts/install-git-hooks.js",
-    "format": "oxfmt --disable-nested-config .",
-    "format:check": "oxfmt --disable-nested-config --check .",
+    "format": "oxfmt --disable-nested-config extension cli docs scripts plugins test evals .github .vscode .claude-plugin .codex README.md CHANGELOG.md CLAUDE.md package.json vitest.config.mts .oxfmtrc.json .oxlintrc.jsonc",
+    "format:check": "npm run format -- --check",
     "lint": "oxlint --disable-nested-config --deny-warnings .",
     "lint:fix": "oxlint --disable-nested-config --fix --deny-warnings .",
     "release": "node scripts/release-version.js",
