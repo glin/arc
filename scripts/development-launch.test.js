@@ -16,16 +16,16 @@ test('the documented F5 launch opens the repository with the nested built extens
   assert.deepEqual(configuration.outFiles, ['${workspaceFolder}/extension/dist/**/*.js']);
 });
 
-test('the isolated launcher separates settings and installed extensions', () => {
+test('the isolated launcher builds Arc and opens it through the isolated editor tool', () => {
   const scriptPath = path.join(__dirname, 'launch-isolated-extension.ps1');
   assert.equal(fs.existsSync(scriptPath), true, 'the isolated VS Code launcher is missing');
   const script = fs.readFileSync(scriptPath, 'utf8');
   assert.match(script, /npm --prefix \$extensionPath run build/);
-  assert.match(script, /'--user-data-dir', \$userData/);
-  assert.match(script, /'--extensions-dir', \$extensions/);
-  assert.match(script, /'--extensionDevelopmentPath', \$extensionPath/);
-  assert.match(script, /\[guid\]::NewGuid\(\)/);
+  assert.match(script, /'isolated-editor\.mjs'\),\s*'open'/);
+  assert.match(script, /& node @arguments/);
+  assert.doesNotMatch(script, /--user-data-dir/, 'the profile rules belong to scripts/isolated-editor.mjs');
 
   const development = fs.readFileSync(path.join(__dirname, '..', 'docs', 'development.md'), 'utf8');
   assert.match(development, /launch-isolated-extension\.ps1/);
+  assert.match(development, /scripts\/isolated-editor\.mjs run/);
 });

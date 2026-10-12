@@ -140,7 +140,7 @@ Actions use existing regional button markup and styles. Links serve navigation. 
 
 The build spec is an acceptance contract. Every required visual property must appear in its production mapping. Check appearance through rendered comparison. Add automated guards only for structural or behavioral regressions permitted by the project test rules. Do not leave a required gap, type size, overflow rule, wrapper, or data-state rule only in board CSS or prose.
 
-The fidelity gate runs after the production build and before landing. Put fixture and real-panel shots beside the approved board in every available theme. List every difference. The model that drew the board reviews the built product. An intentional difference needs the author's approval and a spec update.
+The fidelity gate runs after the production build and before landing. Put the fixture shots and screenshots from the isolated editor in `docs/development.md` beside the approved board, in every available theme. List every difference. The model that drew the board reviews the built product. An intentional difference needs the author's approval and a spec update.
 
 Use browser geometry when appearance depends on layout. Read visible spacing with `innerText` and element rectangles, not `textContent`. Compare computed type size, alignment, wrapping, clipping, and peer geometry. A DOM string that contains whitespace does not prove the browser drew it.
 

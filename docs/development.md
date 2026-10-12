@@ -107,7 +107,7 @@ Inspect both providers' context detail, cache expiry, turn history, dispatched-s
 
 ## Panel-mockup link
 
-`.agents/skills/panel-mockup` links to the skill under `.claude/skills/`. The link lets Codex find the same skill.
+`.agents/skills/panel-mockup` and `.agents/skills/isolated-editor` link to the skills of the same names under `.claude/skills/`. The links let Codex find the same skills.
 
 On Windows, enable links before checkout and create them with administrator rights or Developer Mode:
 
@@ -127,7 +127,7 @@ A link changes what an install does. An install through a link changes the depen
 
 Remove a link without following it. Use a command that deletes only the link. Never delete recursively through a link, because that empties the dependencies of the main worktree. Count the files under the link target before and after the removal, and confirm that the link is gone before removing the worktree.
 
-VS Code loads the main worktree for manual testing. Land and build there before real-panel verification. When another checkout is loaded, verify the loaded worktree and bundle before panel validation.
+The owner's VS Code loads the main worktree. A check in the owner's window therefore needs the change landed and built there, and the owner performs it. When the owner's window loads another checkout, the owner confirms the loaded worktree and bundle first. An agent checks a worktree build in the [isolated editor](#isolated-extension-host), which loads the checkout it names.
 
 To compare test results between two commits, run both in checkouts set up the same way, for example two worktrees with the same dependency links. A worktree and the main checkout differ in more than the commit, such as build output and dependency links, so a difference between them does not show that the commit caused it.
 
@@ -142,6 +142,8 @@ npm --prefix extension run check:timeline -- --since 7d
 ```
 
 The project defaults to the folder where the caller ran npm. Pass `--project <folder>` to select another project. Pass `--now <ISO-time>` to replay timestamped records at that time. Historical file write times remain unavailable. Violations exit with status 1. Invalid arguments or command failures exit with status 2.
+
+Check a change with the cheapest method that reaches it, in the order `CLAUDE.md` gives. A change that needs a real VS Code window goes to the [isolated editor](#isolated-extension-host).
 
 Name the browser test files for the area you changed and run them directly with `node extension/test.mjs browser <files>`. Each named file narrows the lane to just that file, relative to `extension/` or to the repository root. A name that is not a browser test file fails with a clear message instead of running the whole lane.
 
@@ -245,8 +247,6 @@ npm --prefix extension run shots
 
 The shots run fails with EPERM when its output directory sits inside a folder that a file sync client watches, and passes with an output directory outside the working tree.
 
-Open the real panel after changing panel host options. Test a restored tab because stored host options are outside browser coverage.
-
 ## Release
 
 `extension/package.json` owns the version. `scripts/release-version.js` copies it into the extension and CLI lockfiles, `cli/package.json`, and the Claude plugin manifest. The extension and CLI builds read it from their manifests. `scripts/release-version.test.js` fails when any holder disagrees.
@@ -292,6 +292,8 @@ Start the extension build watcher and the local Vite server from the repository 
 npm --prefix extension run dev
 ```
 
+This workflow runs in the owner's own VS Code window. An agent uses the [isolated editor](#isolated-extension-host) instead.
+
 Wait for the ready message. Open this checkout in VS Code. Press F5 and select `Run Arc Extension`. The launch opens this checkout in an Extension Development Host and loads the nested `extension` package. Open Arc in that window. A CSS save patches the open panel in place. A Preact component save asks the extension host to replace only the webview document. A full Vite reload and a server reconnect use the same replacement path. The reload restores the selected session, unsent prompt, and scroll position after the initial render lays out. It also replaces the complete browser lifetime, so old handlers, timers, observers, subscriptions, roots, and message listeners do not remain active.
 
 The launch passes the checkout as a positional folder argument on Windows. Do not use `${workspaceFolder}` with `--folder-uri`, because VS Code keeps the Windows path instead of creating a file URI. If F5 reuses a development host without a folder, stop debugging and close that host before starting again.
@@ -306,13 +308,57 @@ Run `npm --prefix extension run build` after development. The production build r
 
 ## Isolated extension host
 
-Run this command from the repository root when a test needs fresh VS Code settings and no installed extensions.
+`scripts/isolated-editor.mjs` launches the installed VS Code with a fresh profile, loads Arc from a checkout, and drives the window through Playwright. Agents use it to check a change in a real editor. It never touches the owner's own VS Code windows.
+
+Build the checkout first with `npm --prefix extension run build`. Then run a check script:
+
+```bash
+node scripts/isolated-editor.mjs run check.mjs --screenshot shot.png
+```
+
+Keep the check script outside the checkout or in an ignored folder. Its default export receives `app`, `page`, `arc`, `createDraft`, and `run`. `app` is the Playwright Electron application. `page` is the workbench window. `arc` is the panel frame that holds `textarea#prompt`. The prompt box stays hidden until a session or draft is selected. `createDraft({ agent })` presses New session, chooses the agent, presses Create draft, and returns the prompt box. `run` names the run's directories. Locate controls by role and accessible name, as `createDraft` does.
+
+```js
+export default async ({ createDraft }) => {
+  const prompt = await createDraft({ agent: 'Claude' });
+  await prompt.fill('Hello');
+  return prompt.inputValue();
+};
+```
+
+The last line of output is one JSON object with `ok`, the `run` directory, the editor's `mainPid`, the script's return `value`, `screenshot`, `errors`, and the `cleanup` report. The command exits with 0 only when the run and its cleanup both succeed. A failed run still writes the requested screenshot when the window exists.
+
+| Option | Effect |
+| --- | --- |
+| `--timeout <seconds>` | Bounds the run once the browser lane lock is held. The default is 300. The wait for the lock has its own ten-minute deadline |
+| `--repository <checkout>` | Loads that checkout's `extension` folder and its `playwright-core`. The default is the checkout that holds the script |
+| `--editor <install directory>` | Selects the VS Code install. `ARC_MEASURE_EDITOR` does the same when the option is absent |
+| `--workspace <folder>` | Opens that folder instead of the empty run workspace |
+| `--scratch <directory>` | Creates the run directory there instead of in the system temporary directory |
+| `--live-data` | Keeps the owner's transcript roots and lets Arc start agents |
+| `--allow-focus` | Keeps the editor's own window focus behavior |
+
+Each run creates its own `arc-isolated-editor-<id>` directory with user data, an extensions directory, an Arc home, transcript roots, and a workspace. The empty extensions directory keeps installed extensions out of the window. The profile settings turn off workspace trust, telemetry, updates, the startup editor, and AI features, so no Restricted Mode banner or sign-in prompt appears.
+
+The editor's environment drops every variable whose name starts with `VSCODE`, `ELECTRON`, `ARC_`, `CLAUDE`, `NODE_OPTIONS`, or `GIT_`, in any letter case. Arc gives the agents it starts `ELECTRON_RUN_AS_NODE=1`, and VS Code started with that variable runs as Node and opens no window. The run then points `ARC_HOME`, `ARC_PROJECTS_ROOT`, `ARC_CODEX_ROOT`, `CLAUDE_CONFIG_DIR`, and `CODEX_HOME` at the run's empty directories. It sets `ARC_MEASURE_BLOCK_AGENTS=1` and points `ARC_MEASURE_STATE` at an empty state file. Arc then opens its panel at activation, shows no real sessions, and starts no agent. Pass `--live-data` only when the task asks for the owner's live sessions. That mode opens the panel through the command palette.
+
+Once VS Code starts, the run replaces each window's `show` with `showInactive` and turns the window and application focus calls into no-ops. The hook runs after the main process starts, and VS Code shows its first window as it creates it. That window can take the foreground until the run ends. A run holds the machine-wide browser lane lock from [Build and host constraints](#build-and-host-constraints). One isolated editor therefore runs at a time, and never beside a browser lane.
+
+The run writes `run.json` in its directory before VS Code starts. The file records the run directory, the profile path, and the driver's process ID. It gains the editor's main process ID and start time once they are known. It also records the process ID, start time, and a digest of the command line of each run process after launch, once the workbench loads, and before VS Code closes. A failed write of that record goes to the cleanup report, and the close and the cleanup still run. After success, an error, a timeout, or a signal, the tool closes VS Code through Playwright. Cleanup then owns each process that passes the profile as its exact `--user-data-dir` value, each process whose process ID, start time, and command line match a record in `run.json`, and their descendants. Unix `ps` start times have one-second precision, so the command line tells apart a process that reuses a recorded PID within that second. On Windows the profile comparison ignores letter case and slash direction. A descendant must start no earlier than its parent. Cleanup stops descendants before ancestors. On Windows, one PowerShell call opens each process, compares its start time with the listing, and stops it through the same handle. The open handle keeps Windows from giving its PID to another process. On macOS and Linux, cleanup lists each process again just before its own stop and compares its start time and command line. A new process that reuses a PID keeps running, and the cleanup report names its PID under `skipped`. Each process listing stops when the cleanup deadline passes, and the final check has at least five seconds. The tool removes the run directory only when no owned process remains. Otherwise it keeps the directory and `run.json` for a later cleanup. It lists the processes again and reports any that remain. A driver that was killed leaves its run directory behind. Clean up every run whose driver no longer runs:
+
+```bash
+node scripts/isolated-editor.mjs cleanup
+```
+
+Pass a run directory or its `run.json` to clean up one run. A run directory that is already gone leaves the command nothing to read, so it reports no run. Pass `--scratch <directory>` when the run used one.
+
+The owner opens a window for manual testing with this command from the repository root:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\launch-isolated-extension.ps1 -Repository .
 ```
 
-The script builds Arc, creates unique user-data and extensions directories under the temporary directory, and opens this checkout in a new window. A separate extensions directory prevents the installed OpenAI extension and other extensions from starting beside Arc. Pass `-SkipBuild` only when `extension/dist` already contains the build under test. The script prints both temporary paths. Close the window before deleting its run directory.
+The script builds Arc and opens this checkout through `scripts/isolated-editor.mjs open`. That command allows focus, takes no lock, and sets no time limit. It returns when the window closes, and it removes the run directory then. A failed launch gets the same cleanup. The last line of output is one JSON object with `ok`, the `run` directory, `errors`, and the `cleanup` report. The command exits with 0 only when the window opened and closed and its cleanup succeeded. `-LiveData` passes `--live-data`. `-Editor` names the VS Code install directory. Pass `-SkipBuild` only when `extension/dist` already contains the build under test.
 
 ## Performance capture
 
@@ -364,7 +410,7 @@ Keep active windows and sessions running during script captures.
 
 Collect additional snapshots or profiles only for an explicit request or a question the system capture cannot answer.
 
-Reload the VS Code window before recording an extension profile. Run `Developer: Show Running Extensions`, start the Extension Host profile from that editor, stop it, and save the profile.
+The owner records the following profiles in their own window. Reload the VS Code window before recording an extension profile. Run `Developer: Show Running Extensions`, start the Extension Host profile from that editor, stop it, and save the profile.
 
 Use `Developer: Open Webview Developer Tools` and record the Performance tab for session list scrolling, typing, and paint. Capture the Extension Host and webview profiles for the same scenario. Capture matching session list-open and session list-closed scenarios. Record the commit, dirty state, pin count, and spend-ledger state beside each capture.
 

@@ -1,10 +1,12 @@
 [CmdletBinding()]
 param(
   [string]$Repository = (Split-Path $PSScriptRoot -Parent),
-  [string]$CodeCommand = 'code',
+  [string]$Editor,
+  [switch]$LiveData,
   [switch]$SkipBuild
 )
 
+# Builds Arc, then opens it through scripts/isolated-editor.mjs, which owns the profile, environment, and cleanup rules.
 $repositoryPath = [System.IO.Path]::GetFullPath($Repository)
 $extensionPath = Join-Path $repositoryPath 'extension'
 $packagePath = Join-Path $extensionPath 'package.json'
@@ -17,20 +19,13 @@ if (-not $SkipBuild) {
   if ($LASTEXITCODE -ne 0) { throw 'Arc extension build failed' }
 }
 
-$runRoot = Join-Path $env:TEMP ("arc-vscode-test-" + [guid]::NewGuid().ToString('N'))
-$userData = Join-Path $runRoot 'user-data'
-$extensions = Join-Path $runRoot 'extensions'
-New-Item -ItemType Directory -Path $userData, $extensions | Out-Null
-
-Write-Output "VS Code user data: $userData"
-Write-Output "VS Code extensions: $extensions"
-
 $arguments = @(
-  '--new-window',
-  '--user-data-dir', $userData,
-  '--extensions-dir', $extensions,
-  '--extensionDevelopmentPath', $extensionPath,
-  $repositoryPath
+  (Join-Path $PSScriptRoot 'isolated-editor.mjs'),
+  'open',
+  '--repository', $repositoryPath,
+  '--workspace', $repositoryPath
 )
-& $CodeCommand @arguments
-if ($LASTEXITCODE -ne 0) { throw "VS Code exited with code $LASTEXITCODE" }
+if ($Editor) { $arguments += @('--editor', $Editor) }
+if ($LiveData) { $arguments += '--live-data' }
+& node @arguments
+if ($LASTEXITCODE -ne 0) { throw "The isolated editor run ended with code $LASTEXITCODE" }

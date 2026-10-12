@@ -1,0 +1,774 @@
+const assert = require('node:assert/strict');
+const { spawn } = require('node:child_process');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const { pathToFileURL } = require('node:url');
+
+let editor;
+const roots = [];
+
+beforeAll(async () => {
+  editor = await import(pathToFileURL(path.join(__dirname, 'isolated-editor.mjs')).href);
+});
+
+afterAll(() => {
+  for (const root of roots) fs.rmSync(root, { recursive: true, force: true });
+});
+
+function scratch() {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'arc isolated editor test '));
+  roots.push(root);
+  return root;
+}
+
+// A clock whose sleep advances time at once, so deadline tests never wait.
+// A wait that ignores its deadline fails here instead of spinning forever.
+function fakeClock() {
+  let now = 0;
+  let sleeps = 0;
+  return {
+    now: () => now,
+    sleep: async (milliseconds) => {
+      if (++sleeps > 10_000) throw new Error('The wait ignored its deadline.');
+      now += milliseconds;
+    },
+  };
+}
+
+const WINDOWS_ROOT = 'C:\\Scratch Dir\\arc-isolated-editor-1';
+const WINDOWS_PROFILE = `${WINDOWS_ROOT}\\user-data`;
+
+function windowsTable() {
+  return [
+    {
+      pid: 100,
+      parentPid: 4,
+      created: '2026-10-12T04:00:00.000Z',
+      commandLine: `"C:\\VS Code\\Code.exe" --user-data-dir "${WINDOWS_PROFILE}"`,
+    },
+    {
+      pid: 101,
+      parentPid: 100,
+      created: '2026-10-12T04:00:01.000Z',
+      commandLine:
+        '"C:\\VS Code\\Code.exe" --type=renderer --user-data-dir="c:\\scratch dir\\arc-isolated-editor-1\\user-data"',
+    },
+    {
+      pid: 102,
+      parentPid: 4,
+      created: '2026-10-12T04:00:01.000Z',
+      commandLine:
+        '"C:\\VS Code\\Code.exe" --type=utility --user-data-dir=C:/Scratch Dir/arc-isolated-editor-1/user-data',
+    },
+    { pid: 103, parentPid: 101, created: '2026-10-12T04:00:02.000Z', commandLine: 'conhost.exe 0x4' },
+    {
+      pid: 200,
+      parentPid: 4,
+      created: '2026-10-11T08:00:00.000Z',
+      commandLine: '"C:\\VS Code\\Code.exe" --user-data-dir C:\\Users\\owner\\AppData\\Roaming\\Code',
+    },
+    {
+      pid: 201,
+      parentPid: 100,
+      created: '2026-10-11T09:00:00.000Z',
+      commandLine: 'older.exe from a reused parent PID',
+    },
+  ];
+}
+
+// Answers the Windows stop command from a table as the PowerShell script does: one target at a time,
+// stopped only while its PID still has the recorded start time.
+function fakePowerShell(table, stop) {
+  return (_command, _args, options) => {
+    const targets = JSON.parse(options.env[editor.STOP_TARGETS_VARIABLE]);
+    const results = targets.map(({ pid, created }) => {
+      const current = table().find((entry) => entry.pid === pid);
+      if (!current) return { pid, outcome: 'gone', detail: null };
+      if (!created) return { pid, outcome: 'unknown', detail: null };
+      if (current.created !== created) return { pid, outcome: 'changed', detail: null };
+      stop(pid);
+      return { pid, outcome: 'stopped', detail: null };
+    });
+    return { status: 0, stdout: JSON.stringify(results) };
+  };
+}
+
+describe('isolated editor environment', () => {
+  test('removes editor, Arc, agent, Git, and Node option variables in any letter case', () => {
+    const layout = editor.runLayout(path.join(scratch(), 'run'));
+    const parent = {
+      PATH: '/bin',
+      ELECTRON_RUN_AS_NODE: '1',
+      electron_run_as_node: '1',
+      VSCODE_PID: '1',
+      vscode_cwd: 'x',
+      Arc_Home: 'owner',
+      ARC_PROJECTS_ROOT: 'owner',
+      CLAUDECODE: '1',
+      claude_config_dir: 'owner',
+      Node_Options: '--inspect',
+      git_dir: 'x',
+      GIT_INDEX_FILE: 'x',
+      CODEX_HOME: 'owner',
+    };
+    const environment = editor.childEnvironment(parent, layout);
+    assert.deepEqual(environment, {
+      PATH: '/bin',
+      ARC_HOME: layout.arcHome,
+      ARC_PROJECTS_ROOT: layout.projects,
+      ARC_CODEX_ROOT: layout.codexSessions,
+      CLAUDE_CONFIG_DIR: layout.claudeConfig,
+      CODEX_HOME: layout.codexHome,
+      ARC_MEASURE_BLOCK_AGENTS: '1',
+      ARC_MEASURE_STATE: layout.state,
+    });
+  });
+
+  test('live data keeps the owner transcript roots and lets agents start only on request', () => {
+    const layout = editor.runLayout(path.join(scratch(), 'run'));
+    const environment = editor.childEnvironment(
+      {
+        PATH: '/bin',
+        CLAUDE_CONFIG_DIR: 'owner config',
+        ARC_PROJECTS_ROOT: 'owner projects',
+        ARC_CODEX_ROOT: 'owner codex',
+        CODEX_HOME: 'owner home',
+        ELECTRON_RUN_AS_NODE: '1',
+        ARC_MEASURE_BLOCK_AGENTS: '1',
+      },
+      layout,
+      { liveData: true },
+    );
+    assert.deepEqual(environment, {
+      PATH: '/bin',
+      CODEX_HOME: 'owner home',
+      ARC_HOME: layout.arcHome,
+      CLAUDE_CONFIG_DIR: 'owner config',
+      ARC_PROJECTS_ROOT: 'owner projects',
+      ARC_CODEX_ROOT: 'owner codex',
+    });
+  });
+
+  test('passes each path with spaces as one argument and turns off workspace trust', () => {
+    const layout = editor.runLayout(path.join(scratch(), 'run with spaces'));
+    const extensionPath = path.join(scratch(), 'my checkout', 'extension');
+    const workspace = path.join(layout.root, 'work space');
+    const args = editor.editorArguments(layout, { extensionPath, workspace });
+    assert.equal(args[args.indexOf('--user-data-dir') + 1], layout.userData);
+    assert.equal(args[args.indexOf('--extensions-dir') + 1], layout.extensions);
+    assert.equal(args[args.indexOf('--extensionDevelopmentPath') + 1], extensionPath);
+    assert.equal(args.at(-1), workspace);
+    assert.ok(args.includes('--disable-workspace-trust'));
+  });
+
+  test('an explicit install directory wins over ARC_MEASURE_EDITOR', () => {
+    const exists = (file) => file.includes('explicit') || file.includes('named');
+    const found = editor.editorExecutable({
+      editor: '/explicit',
+      environment: { ARC_MEASURE_EDITOR: '/named' },
+      platform: 'linux',
+      exists,
+    });
+    assert.equal(found, path.join('/explicit', 'code'));
+    assert.equal(
+      editor.editorExecutable({ environment: { ARC_MEASURE_EDITOR: 'D:\\named' }, platform: 'win32', exists }),
+      path.join('D:\\named', 'Code.exe'),
+    );
+    assert.throws(
+      () => editor.editorExecutable({ environment: {}, platform: 'linux', exists: () => false }),
+      /--editor <install directory> or set ARC_MEASURE_EDITOR/,
+    );
+  });
+});
+
+describe('isolated editor launch', () => {
+  // A fake checkout whose playwright-core records the launch, so no editor starts.
+  function fakeCheckout() {
+    const root = path.join(scratch(), 'check out');
+    const extension = path.join(root, 'extension');
+    const playwright = path.join(extension, 'node_modules', 'playwright-core');
+    fs.mkdirSync(path.join(extension, 'dist'), { recursive: true });
+    fs.mkdirSync(playwright, { recursive: true });
+    fs.writeFileSync(path.join(extension, 'dist', 'extension.js'), '');
+    fs.writeFileSync(path.join(extension, 'package.json'), JSON.stringify({ name: 'arc', publisher: 'glin' }));
+    fs.writeFileSync(
+      path.join(playwright, 'index.js'),
+      'module.exports = { _electron: { launch: (options) => globalThis.__isolatedEditorLaunch(options) } };',
+    );
+    const install = path.join(root, 'editor');
+    for (const file of ['Code.exe', 'code', path.join('Contents', 'MacOS', 'Electron')]) {
+      fs.mkdirSync(path.dirname(path.join(install, file)), { recursive: true });
+      fs.writeFileSync(path.join(install, file), '');
+    }
+    return { root, install };
+  }
+
+  test('writes the manifest before the editor starts and records the main process after', async () => {
+    const checkout = fakeCheckout();
+    const parent = path.join(scratch(), 'scratch parent');
+    let atLaunch = null;
+    let options = null;
+    const page = { waitForSelector: async () => {} };
+    // The main process passes the profile. Its helper passes none and is found through its parent.
+    const list = () => [
+      {
+        pid: 4_000_001,
+        parentPid: 4_000_000,
+        created: '2026-10-12T04:00:00.000Z',
+        commandLine: `Code.exe --user-data-dir "${options.args[1]}"`,
+      },
+      { pid: 4_000_002, parentPid: 4_000_001, created: '2026-10-12T04:00:01.000Z', commandLine: 'conhost.exe' },
+    ];
+    globalThis.__isolatedEditorLaunch = async (launchOptions) => {
+      options = launchOptions;
+      const [name] = fs.readdirSync(parent);
+      atLaunch = JSON.parse(fs.readFileSync(path.join(parent, name, 'run.json'), 'utf8'));
+      return {
+        // The spawned process is a launcher, and the main process answers with its own PID.
+        evaluate: async (callback) => (String(callback).includes('process.pid') ? 4_000_001 : 0),
+        process: () => ({ pid: 4_000_000 }),
+        firstWindow: async () => page,
+        close: async () => {},
+      };
+    };
+    const previous = process.env.ELECTRON_RUN_AS_NODE;
+    process.env.ELECTRON_RUN_AS_NODE = '1';
+    const session = {};
+    try {
+      await editor.launchIsolatedEditor(
+        { repository: checkout.root, editor: checkout.install, scratch: parent, list },
+        session,
+      );
+    } finally {
+      if (previous === undefined) delete process.env.ELECTRON_RUN_AS_NODE;
+      else process.env.ELECTRON_RUN_AS_NODE = previous;
+      delete globalThis.__isolatedEditorLaunch;
+    }
+    assert.ok(atLaunch, 'the editor started before the run manifest existed');
+    assert.equal(atLaunch.mainPid, null);
+    assert.equal(path.isAbsolute(atLaunch.root), true);
+    assert.equal(path.dirname(atLaunch.root), path.resolve(parent));
+    assert.match(path.basename(atLaunch.root), /^arc-isolated-editor-/);
+    assert.equal(atLaunch.profile, path.join(atLaunch.root, 'user-data'));
+    assert.equal(atLaunch.driverPid, process.pid);
+    assert.equal(options.env.ELECTRON_RUN_AS_NODE, undefined);
+    assert.equal(options.args[options.args.indexOf('--user-data-dir') + 1], atLaunch.profile);
+    const recorded = editor.readManifest(session.layout.root);
+    assert.equal(recorded.mainPid, 4_000_001);
+    assert.equal(recorded.launcherPid, 4_000_000);
+    assert.equal(recorded.mainCreated, '2026-10-12T04:00:00.000Z');
+    assert.deepEqual(
+      recorded.processes.map((identity) => identity.pid),
+      [4_000_002, 4_000_001],
+    );
+    assert.equal(session.extensionId, 'glin.arc');
+    session.list = () => [];
+    const report = await editor.closeIsolatedEditor(session, { list: () => [] });
+    assert.equal(report.ok, true, report.errors.join('\n'));
+    assert.equal(fs.existsSync(session.layout.root), false);
+  });
+});
+
+describe('isolated editor cleanup', () => {
+  // A cleanup over a run directory that exists only in the process table records nothing on disk.
+  const fakeRun = () => ({ root: WINDOWS_ROOT, profile: WINDOWS_PROFILE });
+  const quiet = { record: () => {}, platform: 'win32', selfPid: 1 };
+
+  test('owns processes that pass the profile to --user-data-dir in any quoting and slash form, and their descendants', () => {
+    const owned = editor.ownedProcesses(windowsTable(), WINDOWS_PROFILE, { platform: 'win32', selfPid: 1 });
+    assert.deepEqual(owned.map((entry) => entry.pid).sort(), [100, 101, 102, 103]);
+    const quoted = {
+      pid: 5,
+      parentPid: 4,
+      created: 'x',
+      commandLine: `Code.exe "--user-data-dir=${WINDOWS_PROFILE}\\"`,
+    };
+    assert.equal(editor.ownedProcesses([quoted], WINDOWS_PROFILE, { platform: 'win32', selfPid: 1 }).length, 1);
+  });
+
+  test('does not own a process that names the profile as a file or names a longer path', () => {
+    const table = [
+      {
+        pid: 300,
+        parentPid: 4,
+        created: '2026-10-12T04:00:00.000Z',
+        commandLine: `"C:\\VS Code\\Code.exe" --user-data-dir C:\\Users\\owner\\Code "${WINDOWS_PROFILE}\\User\\settings.json"`,
+      },
+      { pid: 301, parentPid: 4, created: 'x', commandLine: `Code.exe --user-data-dir="${WINDOWS_PROFILE}2"` },
+      {
+        pid: 302,
+        parentPid: 4,
+        created: 'x',
+        commandLine: `Code.exe --user-data-dir ${WINDOWS_PROFILE}-old --new-window`,
+      },
+      { pid: 303, parentPid: 4, created: 'x', commandLine: `Code.exe --extensions-dir=${WINDOWS_PROFILE}` },
+      { pid: 304, parentPid: 300, created: '2026-10-12T04:00:01.000Z', commandLine: 'conhost.exe' },
+    ];
+    assert.deepEqual(editor.ownedProcesses(table, WINDOWS_PROFILE, { platform: 'win32', selfPid: 1 }), []);
+    const unix = [
+      { pid: 7, parentPid: 1, created: 'x', commandLine: '/usr/share/code/code /tmp/run/user-data/User/settings.json' },
+      {
+        pid: 8,
+        parentPid: 1,
+        created: 'x',
+        commandLine: '/usr/share/code/code --user-data-dir /tmp/run/user-data-old',
+      },
+      { pid: 9, parentPid: 1, created: 'x', commandLine: '/usr/share/code/code --user-data-dir /TMP/run/user-data' },
+      {
+        pid: 10,
+        parentPid: 1,
+        created: 'x',
+        commandLine: '/usr/share/code/code --user-data-dir=/tmp/run/user-data --x',
+      },
+    ];
+    assert.deepEqual(
+      editor.ownedProcesses(unix, '/tmp/run/user-data', { platform: 'linux', selfPid: 1 }).map((entry) => entry.pid),
+      [10],
+    );
+  });
+
+  test('a recorded identity matches a process only when its command line matches too', () => {
+    const helper = { pid: 9, parentPid: 1, created: '2026-10-12T04:00:02.000Z', commandLine: '/usr/bin/helper --a' };
+    const manifest = {};
+    editor.rememberProcesses(manifest, [helper]);
+    // Unix start times have one-second precision, so a process that reuses the PID in that second has the same start time.
+    const reused = { ...helper, commandLine: '/usr/bin/other' };
+    const options = { platform: 'linux', selfPid: 1, known: manifest.processes };
+    assert.deepEqual(editor.ownedProcesses([reused], '/tmp/run/user-data', options), []);
+    assert.deepEqual(editor.ownedProcesses([helper], '/tmp/run/user-data', options), [helper]);
+  });
+
+  test('stops descendants before ancestors and only run processes, including after unrelated processes appear', async () => {
+    let table = windowsTable();
+    const stopped = [];
+    const removed = [];
+    let present = true;
+    const report = await editor.cleanupRun(fakeRun(), {
+      ...quiet,
+      list: () => table,
+      run: fakePowerShell(
+        () => table,
+        (pid) => {
+          stopped.push(pid);
+          table = table.filter((entry) => entry.pid !== pid);
+          // A new process reuses a stopped PID, and another starts beside it.
+          if (pid === 101) {
+            table.push({ pid: 101, parentPid: 4, created: '2026-10-12T05:00:00.000Z', commandLine: 'notepad.exe' });
+            table.push({ pid: 300, parentPid: 4, created: '2026-10-12T05:00:00.000Z', commandLine: 'Code.exe' });
+          }
+        },
+      ),
+      remove: (root) => {
+        removed.push(root);
+        present = false;
+      },
+      exists: () => present,
+      clock: fakeClock(),
+    });
+    assert.deepEqual([...stopped].sort(), [100, 101, 102, 103]);
+    assert.ok(stopped.indexOf(103) < stopped.indexOf(101) && stopped.indexOf(101) < stopped.indexOf(100), `${stopped}`);
+    assert.deepEqual(removed, [WINDOWS_ROOT]);
+    assert.deepEqual(report.remaining, []);
+    assert.equal(report.ok, true, report.errors.join('\n'));
+    assert.deepEqual(table.map((entry) => entry.pid).sort(), [101, 200, 201, 300]);
+  });
+
+  // The renderer exits once its child stops, and notepad takes its PID before the same pass reaches it.
+  function reuseOnStop(table, notepad) {
+    const state = { table, stopped: [] };
+    state.stop = (pid) => {
+      state.stopped.push(pid);
+      state.table = state.table.filter((entry) => entry.pid !== pid);
+      if (pid === 103) state.table = state.table.map((entry) => (entry.pid === 101 ? notepad : entry));
+    };
+    return state;
+  }
+  const notepad = { pid: 101, parentPid: 4, created: '2026-10-12T05:00:00.000Z', commandLine: 'notepad.exe' };
+
+  test('on Windows, leaves a process alone when its PID is reused while the same pass stops another', async () => {
+    const state = reuseOnStop(windowsTable(), notepad);
+    const report = await editor.cleanupRun(fakeRun(), {
+      ...quiet,
+      list: () => state.table,
+      run: fakePowerShell(() => state.table, state.stop),
+      remove: () => {},
+      exists: () => false,
+      clock: fakeClock(),
+    });
+    assert.equal(state.stopped.includes(101), false, `stopped ${state.stopped}`);
+    assert.deepEqual([...report.stopped].sort(), [100, 102, 103]);
+    assert.deepEqual(report.skipped, [101]);
+    assert.ok(state.table.includes(notepad));
+    assert.equal(report.ok, true, report.errors.join('\n'));
+  });
+
+  test('on other platforms, checks each process again just before its own stop', () => {
+    const entries = editor.ownedProcesses(windowsTable(), WINDOWS_PROFILE, { platform: 'win32', selfPid: 1 });
+    const state = reuseOnStop(windowsTable(), notepad);
+    const report = editor.stopProcesses(entries, {
+      platform: 'linux',
+      list: ({ pids }) => state.table.filter((entry) => pids.includes(entry.pid)),
+      stop: state.stop,
+      clock: fakeClock(),
+    });
+    assert.equal(state.stopped.includes(101), false, `stopped ${state.stopped}`);
+    assert.deepEqual([...report.stopped].sort(), [100, 102, 103]);
+    assert.deepEqual(report.skipped, [101]);
+    assert.ok(state.table.includes(notepad));
+  });
+
+  test.skipIf(process.platform !== 'win32')(
+    'the Windows stop compares the start time through the process handle before it stops the process',
+    async () => {
+      const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
+      const exited = new Promise((resolve) => child.once('exit', resolve));
+      try {
+        const [entry] = editor.listProcesses({ pids: [child.pid] });
+        const changed = { ...entry, created: '2000-01-01T00:00:00.0000000Z' };
+        assert.deepEqual(editor.stopProcesses([changed], { platform: 'win32' }), {
+          stopped: [],
+          skipped: [child.pid],
+          errors: [],
+        });
+        assert.equal(editor.listProcesses({ pids: [child.pid] }).length, 1);
+        assert.deepEqual(editor.stopProcesses([entry], { platform: 'win32' }), {
+          stopped: [child.pid],
+          skipped: [],
+          errors: [],
+        });
+        await exited;
+      } finally {
+        child.kill();
+      }
+    },
+    60_000,
+  );
+
+  test('records each run process and finds a helper from that record after its ancestors exit', async () => {
+    const recorded = [];
+    const first = await editor.cleanupRun(fakeRun(), {
+      ...quiet,
+      record: (manifest) => recorded.push(structuredClone(manifest.processes)),
+      list: () => windowsTable(),
+      run: fakePowerShell(windowsTable, () => {}),
+      remove: () => {},
+      exists: () => true,
+      clock: fakeClock(),
+      deadlineMs: 1_000,
+    });
+    assert.equal(first.ok, false);
+    assert.deepEqual(recorded[0].map((identity) => identity.pid).sort(), [100, 101, 102, 103]);
+
+    // After a crash only the helper remains. It passes no profile and its parent is gone.
+    const helper = { pid: 103, parentPid: 101, created: '2026-10-12T04:00:02.000Z', commandLine: 'conhost.exe 0x4' };
+    const stranger = { pid: 102, parentPid: 4, created: '2026-10-12T06:00:00.000Z', commandLine: 'notepad.exe' };
+    let table = [helper, stranger];
+    const stopped = [];
+    const report = await editor.cleanupRun(
+      { ...fakeRun(), processes: recorded[0] },
+      {
+        ...quiet,
+        list: () => table,
+        run: fakePowerShell(
+          () => table,
+          (pid) => {
+            stopped.push(pid);
+            table = table.filter((entry) => entry.pid !== pid);
+          },
+        ),
+        remove: () => {},
+        exists: () => false,
+        clock: fakeClock(),
+      },
+    );
+    assert.equal(report.ok, true, report.errors.join('\n'));
+    assert.deepEqual(stopped, [103]);
+    assert.deepEqual(table, [stranger]);
+  });
+
+  test('keeps the run directory while processes remain after the deadline', async () => {
+    const removals = [];
+    const report = await editor.cleanupRun(fakeRun(), {
+      ...quiet,
+      list: () => windowsTable(),
+      run: fakePowerShell(windowsTable, () => {}),
+      remove: (root) => removals.push(root),
+      exists: () => true,
+      clock: fakeClock(),
+      deadlineMs: 5_000,
+    });
+    assert.equal(report.ok, false);
+    assert.deepEqual(report.remaining.sort(), [100, 101, 102, 103]);
+    assert.match(report.errors[0], /^Timed out after 5 s waiting for the run processes to exit\./);
+    assert.deepEqual(removals, []);
+    assert.equal(report.removed, false);
+  });
+
+  test('keeps the run directory when processes cannot be listed, and bounds each listing by the deadline', async () => {
+    const removals = [];
+    const timeouts = [];
+    const report = await editor.cleanupRun(fakeRun(), {
+      ...quiet,
+      list: ({ timeoutMs }) => {
+        timeouts.push(timeoutMs);
+        throw new Error('Could not list processes within 5 s.');
+      },
+      remove: (root) => removals.push(root),
+      exists: () => true,
+      clock: fakeClock(),
+      deadlineMs: 5_000,
+    });
+    assert.equal(report.ok, false);
+    assert.deepEqual(removals, []);
+    assert.match(report.errors[0], /Last error: Could not list processes within 5 s\./);
+    assert.equal(timeouts[0], 5_000);
+    assert.ok(
+      timeouts.every((timeout) => timeout >= 0 && timeout <= 5_000),
+      `${timeouts}`,
+    );
+  });
+
+  test('a process listing stops at its timeout', () => {
+    const seen = [];
+    const run = (command, args, options) => {
+      seen.push(options.timeout);
+      return { error: Object.assign(new Error(`spawnSync ${command} ETIMEDOUT`), { code: 'ETIMEDOUT' }), status: null };
+    };
+    for (const platform of ['win32', 'linux']) {
+      assert.throws(
+        () => editor.listProcesses({ platform, run, timeoutMs: 1_500 }),
+        /^Error: Could not list processes within 2 s\.$/,
+      );
+    }
+    assert.deepEqual(seen, [1_500, 1_500]);
+    assert.throws(() => editor.listProcesses({ platform: 'win32', run, timeoutMs: 0 }), /No time was left/);
+    assert.deepEqual(
+      editor.listProcesses({ platform: 'linux', pids: [42], run: () => ({ status: 1, stdout: '' }) }),
+      [],
+    );
+  });
+
+  test('cleans up an interrupted run from its manifest', async () => {
+    const parent = path.join(scratch(), 'interrupted parent');
+    const layout = editor.runLayout(path.join(parent, `${editor.RUN_PREFIX}abc`));
+    fs.mkdirSync(layout.userData, { recursive: true });
+    editor.writeManifest(layout, { root: layout.root, profile: layout.userData, driverPid: 4_000_002 });
+    const live = editor.runLayout(path.join(parent, `${editor.RUN_PREFIX}live`));
+    fs.mkdirSync(live.userData, { recursive: true });
+    editor.writeManifest(live, { root: live.root, profile: live.userData, driverPid: process.pid });
+    fs.mkdirSync(path.join(parent, `${editor.RUN_PREFIX}no-manifest`));
+
+    const runs = editor.abandonedRuns(parent, (pid) => pid === process.pid);
+    assert.deepEqual(
+      runs.map((manifest) => manifest.root),
+      [layout.root],
+    );
+    const owner = {
+      pid: 77,
+      parentPid: 1,
+      created: '2026-10-12T04:00:00.000Z',
+      commandLine: `Code.exe --user-data-dir ${layout.userData}`,
+    };
+    let table = [owner, { pid: 78, parentPid: 1, created: null, commandLine: 'Code.exe' }];
+    const stop = (pid) => (table = table.filter((entry) => entry.pid !== pid));
+    // The run uses this platform's stop, so both the Windows command and the per-process stop are fakes.
+    const report = await editor.cleanupRun(editor.readManifest(layout.root), {
+      list: ({ pids } = {}) => table.filter((entry) => !pids || pids.includes(entry.pid)),
+      stop,
+      run: fakePowerShell(() => table, stop),
+      clock: fakeClock(),
+    });
+    assert.equal(report.ok, true, report.errors.join('\n'));
+    assert.deepEqual(report.stopped, [77]);
+    assert.deepEqual(
+      table.map((entry) => entry.pid),
+      [78],
+    );
+    assert.equal(fs.existsSync(layout.root), false);
+    assert.equal(fs.existsSync(live.root), true);
+  });
+
+  test('refuses a manifest that names a directory other than its own run', () => {
+    const parent = path.join(scratch(), 'foreign');
+    const layout = editor.runLayout(path.join(parent, `${editor.RUN_PREFIX}x`));
+    fs.mkdirSync(layout.root, { recursive: true });
+    editor.writeManifest(layout, { root: parent, profile: path.join(parent, 'user-data'), driverPid: 1 });
+    assert.throws(() => editor.readManifest(layout.manifest), /does not describe an isolated editor run/);
+  });
+
+  test('reads Windows and Unix process lists', () => {
+    assert.deepEqual(
+      editor.parseWindowsProcesses(
+        '{"ProcessId":5,"ParentProcessId":1,"Created":"2026-10-12T04:00:00.0000000Z","CommandLine":null}',
+      ),
+      [{ pid: 5, parentPid: 1, created: '2026-10-12T04:00:00.0000000Z', commandLine: '' }],
+    );
+    const [row] = editor.parseUnixProcesses(
+      '  42     1 Mon Oct 12 04:00:00 2026 /usr/share/code/code --user-data-dir /tmp/a b\n',
+    );
+    assert.equal(row.pid, 42);
+    assert.equal(row.parentPid, 1);
+    assert.equal(row.commandLine, '/usr/share/code/code --user-data-dir /tmp/a b');
+    assert.equal(typeof row.created, 'string');
+  });
+});
+
+describe('isolated editor driver', () => {
+  function frame(url, parent = null, prompts = 0) {
+    return { url: () => url, parentFrame: () => parent, locator: () => ({ count: async () => prompts }) };
+  }
+
+  function frames() {
+    const workbench = frame('vscode-file://vscode-app/c:/VS%20Code/workbench.html');
+    const other = frame('vscode-webview://aaa/index.html?id=1&extensionId=openai.chatgpt&platform=electron', workbench);
+    const otherContent = frame('vscode-webview://aaa/fake.html?id=1', other, 1);
+    const arc = frame('vscode-webview://bbb/index.html?id=2&extensionId=glin.arc&platform=electron', workbench);
+    const arcContent = frame('vscode-webview://bbb/fake.html?id=2', arc, 1);
+    return { list: [workbench, other, otherContent, arc, arcContent], arcContent };
+  }
+
+  test('selects the Arc content frame by extension id, not the first webview', async () => {
+    const { list, arcContent } = frames();
+    assert.deepEqual(editor.arcContentFrames(list, 'glin.arc'), [arcContent]);
+    let calls = 0;
+    const page = { frames: () => (++calls < 3 ? list.slice(0, 3) : list) };
+    assert.equal(await editor.arcFrame(page, { extensionId: 'glin.arc', clock: fakeClock() }), arcContent);
+  });
+
+  test('names what it waited for when the Arc panel never appears', async () => {
+    const { list } = frames();
+    const page = { frames: () => list.slice(0, 3) };
+    await assert.rejects(
+      editor.arcFrame(page, { extensionId: 'glin.arc', deadlineMs: 2_000, clock: fakeClock() }),
+      /^Error: Timed out after 2 s waiting for the glin\.arc panel frame that holds textarea#prompt\.$/,
+    );
+  });
+
+  test('a wait reports the last error from its check', async () => {
+    await assert.rejects(
+      editor.waitFor(
+        'the workbench',
+        () => {
+          throw new Error('Target closed');
+        },
+        { deadlineMs: 1_000, clock: fakeClock() },
+      ),
+      /Timed out after 1 s waiting for the workbench\. Last error: Target closed/,
+    );
+  });
+
+  test('reads the command line', () => {
+    assert.deepEqual(editor.parseArguments(['run', 'check.mjs', '--screenshot', 'a b.png', '--timeout', '60']), {
+      command: 'run',
+      target: 'check.mjs',
+      screenshot: 'a b.png',
+      timeoutSeconds: 60,
+      liveData: false,
+      allowFocus: false,
+    });
+    assert.throws(() => editor.parseArguments(['drive']), /Choose a command/);
+    assert.throws(() => editor.parseArguments(['run', '--timeout', '0']), /positive number/);
+    assert.throws(() => editor.parseArguments(['run', '--focus']), /Unknown option: --focus/);
+  });
+});
+
+describe('isolated editor commands', () => {
+  // A launch that writes a real run directory and manifest, then hands over to the test.
+  function fakeLaunch(parent, then) {
+    return async (_options, session) => {
+      const layout = editor.runLayout(path.join(parent, `${editor.RUN_PREFIX}open`));
+      fs.mkdirSync(layout.userData, { recursive: true });
+      const manifest = { root: layout.root, profile: layout.userData, driverPid: process.pid, processes: [] };
+      editor.writeManifest(layout, manifest);
+      Object.assign(session, { layout, manifest, list: () => [] });
+      await then(session);
+    };
+  }
+
+  function lastJson(lines) {
+    return JSON.parse(lines.join('').trim().split('\n').at(-1));
+  }
+
+  test('open cleans up and fails when the workbench never attaches', async () => {
+    const parent = path.join(scratch(), 'open failure');
+    const lines = [];
+    const code = await editor.openCommand(
+      {},
+      {
+        launch: fakeLaunch(parent, async () => {
+          throw new Error('Timed out after 90 s waiting for .monaco-workbench.');
+        }),
+        cleanupOptions: { list: () => [], clock: fakeClock() },
+        write: (text) => lines.push(text),
+      },
+    );
+    const outcome = lastJson(lines);
+    assert.equal(code, 1);
+    assert.equal(outcome.ok, false);
+    assert.deepEqual(outcome.errors, ['Timed out after 90 s waiting for .monaco-workbench.']);
+    assert.equal(outcome.cleanup.ok, true, outcome.cleanup.errors.join('\n'));
+    assert.equal(fs.existsSync(outcome.run), false);
+  });
+
+  test('open fails when the editor does not close cleanly', async () => {
+    const parent = path.join(scratch(), 'open close error');
+    const lines = [];
+    const code = await editor.openCommand(
+      {},
+      {
+        launch: fakeLaunch(parent, async (session) => {
+          session.app = {
+            once: (_event, listener) => listener(),
+            close: async () => {
+              throw new Error('Target closed');
+            },
+          };
+        }),
+        cleanupOptions: { list: () => [], clock: fakeClock() },
+        write: (text) => lines.push(text),
+      },
+    );
+    const outcome = lastJson(lines);
+    assert.equal(code, 1);
+    assert.equal(outcome.ok, false);
+    assert.equal(outcome.cleanup.ok, false);
+    assert.deepEqual(outcome.cleanup.errors, ['Target closed']);
+    assert.equal(fs.existsSync(outcome.run), false);
+  });
+
+  test('run reports a failed process record, then closes the editor, cleans up and releases the lock', async () => {
+    const parent = path.join(scratch(), 'run record error');
+    const lines = [];
+    let closed = false;
+    let released = false;
+    const code = await editor.runCommand(
+      { timeoutSeconds: 30 },
+      {
+        launch: fakeLaunch(parent, async (session) => {
+          session.app = { close: async () => (closed = true) };
+          // The record write goes to a directory that does not exist, so it fails.
+          session.layout = editor.runLayout(path.join(parent, 'missing', `${editor.RUN_PREFIX}gone`));
+          throw new Error('Timed out after 30 s waiting for .monaco-workbench.');
+        }),
+        acquireLock: async () => ({ release: () => (released = true) }),
+        cleanupOptions: { list: () => [], clock: fakeClock() },
+        write: (text) => lines.push(text),
+      },
+    );
+    const outcome = lastJson(lines);
+    assert.equal(code, 1);
+    assert.equal(released, true);
+    assert.equal(closed, true);
+    assert.match(outcome.cleanup.errors[0], /^Could not record the run processes: /);
+    assert.equal(outcome.cleanup.removed, true);
+    assert.equal(fs.existsSync(path.join(parent, `${editor.RUN_PREFIX}open`)), false);
+  });
+
+  test('cleanup of a run directory that is already gone reports no run', async () => {
+    const lines = [];
+    const missing = path.join(scratch(), `${editor.RUN_PREFIX}gone`);
+    assert.equal(await editor.cleanupCommand({ target: missing }, { write: (text) => lines.push(text) }), 0);
+    assert.deepEqual(lastJson(lines), []);
+  });
+});

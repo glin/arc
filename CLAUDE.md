@@ -61,7 +61,20 @@ Review browser shots before and after changes to panel styles or browser code:
 npm --prefix extension run shots
 ```
 
-Open the real panel after changing panel host options. Verify restored tabs because browser tests cannot read options saved when the editor created a tab.
+After changing panel host options, check a new panel tab in the isolated editor. Browser tests cannot read options saved when the editor created a tab. A tab restored by the owner's editor is an owner check.
+
+Check a change with the cheapest method that reaches it, in this order:
+
+1. Node tests.
+2. Named browser tests.
+3. Panel shots, which render the built panel in a headless browser.
+4. The Arc command line and saved state, limited to your own test sessions and your own isolated window.
+5. The isolated editor: installed VS Code with a fresh profile, launched and driven through Playwright by `scripts/isolated-editor.mjs`.
+6. Computer use, only on an isolated editor, and only for a surface the driver cannot reach, such as a native OS dialog. Name the cheaper methods that cannot answer the check.
+
+A launcher, attach, or selector failure in the isolated editor is a defect. Fix it or report it. It never justifies computer use.
+
+Agents never drive the owner's own VS Code window, with computer use or any other tool. When a check needs state that only the owner's window holds, give the owner the exact steps. The commands are in [Fast iteration](docs/development.md#fast-iteration) and [Isolated extension host](docs/development.md#isolated-extension-host).
 
 ## Tests
 
@@ -103,7 +116,7 @@ A webview helper that performs a full Preact draw must never run inside a loop o
 
 Size text-related elements in `em`. Use `px` for hairlines, radii, and decorative bars.
 
-Use the `panel-mockup` skill for a mockup or panel review. It starts with real panel shots and uses the panel stylesheet.
+Use the `panel-mockup` skill for a mockup or panel review. It starts with headless shots of the built panel and uses the panel stylesheet.
 
 Use the shared relative-age formatter. Show full local time in a native tooltip and accessible name. Show time for today and a short date for earlier days when calendar context matters.
 
