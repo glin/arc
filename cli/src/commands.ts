@@ -43,7 +43,13 @@ function curation(name: string, summary: string, refusal: string, flags: readonl
       summary,
       synopsis: `arc ${name} ID [--dry-run] [--window ID] [--request-id ID] [--json]${flags.length ? ' [--force]' : ''}`,
       flags: [dryRunFlag, windowFlag, requestFlag, jsonFlag, ...flags],
-      output: curationOutput,
+      output:
+        name === 'archive'
+          ? [
+              ...curationOutput,
+              'Forced host replies also include evaluatedRunStatus, captured before membership changes, or null when no listing row exists.',
+            ]
+          : curationOutput,
       refusals: [argumentRefusal, 'One unique scoped session ID is required.', windowRefusal, refusal],
       example: `arc ${name} SESSION_ID --dry-run --window WINDOW_ID`,
     },
