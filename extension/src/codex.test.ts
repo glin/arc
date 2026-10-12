@@ -2909,7 +2909,7 @@ test('stopped Codex model recovery crosses capped records and caches completed i
     ];
     const file = writeRollout(records);
     const options = { tailBytes: 512 };
-    const work = { modelBudget: { maxBytes: kind === 'split' ? 64 : 128 * 1024, maxMilliseconds: 1000 } };
+    const work = { modelBudget: { maxBytes: kind === 'split' ? 64 : 128 * 1024, clock: () => 0 } };
     let result = await readCodexSessionIncrementalAsync(file, 'sess', undefined, options, work);
     assert.ok(result.read);
     assert.equal(result.recoveryPending, true);
@@ -3008,7 +3008,7 @@ test('stopped Codex recovery admits opening settings and blocks newer unproved o
       child,
       undefined,
       { tailBytes: 512 },
-      { modelBudget: { maxMilliseconds: 1000 } },
+      { modelBudget: { maxBytes: 128 * 1024, clock: () => 0 } },
     );
     assert.equal(result.recoveryPending, false);
     assert.equal(result.read?.lastReportedModel, expected, kind);
@@ -3090,7 +3090,7 @@ test('stopped Codex recovery rejects obsolete evidence after rewrites, replaceme
   ]);
   const options = { tailBytes: 512 };
   let result = await readCodexSessionIncrementalAsync(file, 'sess', undefined, options, {
-    modelBudget: { maxBytes: 64 },
+    modelBudget: { maxBytes: 64, clock: () => 0 },
   });
   assert.equal(result.recoveryPending, true);
   const original = fs.readFileSync(file, 'utf8');
@@ -3107,7 +3107,7 @@ test('stopped Codex recovery rejects obsolete evidence after rewrites, replaceme
     } else fs.writeFileSync(file, replacement);
     fs.utimesSync(file, before.atime, new Date(before.mtimeMs + 2000));
     result = await readCodexSessionIncrementalAsync(file, 'sess', result.checkpoint!, options, {
-      modelBudget: { maxMilliseconds: 1000 },
+      modelBudget: { maxBytes: 128 * 1024, clock: () => 0 },
     });
     assert.equal(result.read?.lastReportedModel, change === 'truncate' ? null : 'gpt-6-astra');
   }

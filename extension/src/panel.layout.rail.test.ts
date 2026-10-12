@@ -3,7 +3,7 @@
 
 import { test } from 'vitest';
 import assert from 'node:assert';
-import { browserOrNone, SETTLED } from '../test/browser.ts';
+import { browserOrNone, pauseClock, SETTLED } from '../test/browser.ts';
 import type { Page } from 'playwright-core';
 import { CARD_ACTIONS, RAIL_MIN_WIDTH, RAIL_WIDTH_DEFAULT, RAIL_WIDTH_MIN } from './turnview.ts';
 import { labelEditorRows } from './turnlabels.ts';
@@ -266,7 +266,9 @@ test('the new-session menu stays reachable at wide and narrow widths', { timeout
     await page.click('#rail .railnewmenu');
     await page.evaluate(SETTLED);
     await page.setViewportSize({ width: 340, height: 900 });
-    await page.evaluate(SETTLED);
+    await page.waitForFunction(
+      `document.getElementById('launcher').hidden && document.activeElement.className === 'compactnewmenu'`,
+    );
     assert.deepEqual(
       await page.evaluate(`({
       hidden: document.getElementById('launcher').hidden,
@@ -279,7 +281,9 @@ test('the new-session menu stays reachable at wide and narrow widths', { timeout
     await page.click('.controls .compactnewmenu');
     await page.evaluate(SETTLED);
     await page.setViewportSize({ width: 1350, height: 900 });
-    await page.evaluate(SETTLED);
+    await page.waitForFunction(
+      `document.getElementById('launcher').hidden && document.activeElement.className === 'railnewmenu'`,
+    );
     assert.deepEqual(
       await page.evaluate(`({
       hidden: document.getElementById('launcher').hidden,
@@ -379,7 +383,9 @@ test('the new-session menu stays reachable at wide and narrow widths', { timeout
     await page.click('.controls .compactnewmenu');
     await page.evaluate(SETTLED);
     await page.setViewportSize({ width: 1350, height: 900 });
-    await page.evaluate(SETTLED);
+    await page.waitForFunction(
+      `document.getElementById('launcher').hidden && !document.getElementById('rail').hidden && document.activeElement.className === 'railnewmenu'`,
+    );
     assert.deepEqual(
       await page.evaluate(`({
       hidden: document.getElementById('launcher').hidden,
@@ -2715,23 +2721,14 @@ test(
   },
 );
 
-// Freeze the page time before pausing to prevent clock advancement between calls. Restore system time so runFor advances the paused clock.
-
-async function pauseClock(page: Page): Promise<number> {
-  const time = (await page.evaluate('Date.now()')) as number;
-  await page.clock.setFixedTime(time);
-  await page.clock.pauseAt(time);
-  await page.clock.setSystemTime(time);
-  return time;
-}
-
 // Select Active over a query containing only s1. Its recency expires in 20 seconds, so a 25-second clock advance removes it.
 
 async function pressActiveOverLeavingSession(
   page: Page,
 ): Promise<() => Promise<{ pressed: string | null; drawn: number }>> {
-  await page.setContent(themed(pageHtml()));
   const now = (await page.evaluate('Date.now()')) as number;
+  await page.clock.setFixedTime(now);
+  await page.setContent(themed(pageHtml()));
   const payload = renderPayload() as { rail: { id: string; at: number; cache: unknown }[] };
   const target = payload.rail.find((card) => card.id === 's1');
   assert.ok(target, 'the fixture dropped session s1, so this measures nothing');
@@ -2797,8 +2794,9 @@ test('ending naming refreshes held cache information at the current time', { tim
     const page = await browser.newPage();
     const failures: string[] = [];
     page.on('pageerror', (e) => failures.push(String(e)));
-    await page.setContent(themed(pageHtml()));
     const now = (await page.evaluate('Date.now()')) as number;
+    await page.clock.setFixedTime(now);
+    await page.setContent(themed(pageHtml()));
     const payload = renderPayload() as { rail: { id: string; at: number; cache: unknown }[] };
     const target = payload.rail.find((card) => card.id === 's1');
     assert.ok(target, 'the fixture dropped session s1, so this measures nothing');
@@ -2835,8 +2833,9 @@ test('a tick that empties Active removes its shortcut and focuses the funnel', {
     const page = await browser.newPage();
     const failures: string[] = [];
     page.on('pageerror', (e) => failures.push(String(e)));
-    await page.setContent(themed(pageHtml()));
     const now = (await page.evaluate('Date.now()')) as number;
+    await page.clock.setFixedTime(now);
+    await page.setContent(themed(pageHtml()));
     const payload = renderPayload() as { rail: { id: string; at: number; cache: unknown }[] };
     const target = payload.rail.find((card) => card.id === 's1');
     assert.ok(target, 'the fixture dropped session s1, so this measures nothing');

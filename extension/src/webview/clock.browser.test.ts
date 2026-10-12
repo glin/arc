@@ -1,6 +1,6 @@
 import assert from 'node:assert';
 import { test, type TestContext } from 'vitest';
-import { browserOrNone, SETTLED } from '../../test/browser.ts';
+import { browserOrNone, pauseClock, SETTLED } from '../../test/browser.ts';
 import { FIXTURE_CLOCK, pageHtml, renderPayload } from '../panelfixture.ts';
 
 type Page = import('playwright-core').Page;
@@ -20,28 +20,10 @@ async function post(page: Page, payload: unknown): Promise<void> {
   await page.evaluate(SETTLED);
 }
 
-// Limit retries when the page clock advances between reading and pausing it.
-const MAX_PAUSE_ATTEMPTS = 5;
-
-// Pause at a freshly read instant, then advance the page clock by an exact duration.
-// Retry only Playwright's backward-time error. The synchronous tick needs no animation-frame wait.
+// Advance paused timers by an exact duration. The synchronous tick needs no animation-frame wait.
 async function runFor(page: Page, ms: number): Promise<void> {
-  let lastError: Error | undefined;
-  for (let attempt = 0; attempt < MAX_PAUSE_ATTEMPTS; attempt += 1) {
-    try {
-      await page.clock.pauseAt(await page.evaluate('Date.now()'));
-      await page.clock.runFor(ms);
-      return;
-    } catch (error) {
-      lastError = error as Error;
-      if (!/Cannot fast-forward to the past/.test(lastError.message)) {
-        throw lastError;
-      }
-    }
-  }
-  throw new Error(
-    `pauseAt lost the race against the page clock ${MAX_PAUSE_ATTEMPTS} times in a row: ${lastError?.message}`,
-  );
+  await pauseClock(page);
+  await page.clock.runFor(ms);
 }
 
 async function pageFor(t: TestContext): Promise<{ page: Page; close(): Promise<void> } | null> {

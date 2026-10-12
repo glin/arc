@@ -489,16 +489,16 @@ test('--no-hooks preserves plugin and both legacy settings without requiring Cla
   }
 });
 
-test('prerequisite failures install nothing and hook failures preserve successful editor installation', () => {
-  for (const failure of [
-    'missing',
-    'plugin marketplace list --json',
-    `plugin marketplace add ${catalogUrl}`,
-    'plugin install arc-hooks@arc --scope user',
-    'plugin update arc-hooks@arc --scope user',
-    'plugin list --json',
-    'plugin enable arc-hooks@arc --scope user',
-  ]) {
+for (const failure of [
+  'missing',
+  'plugin marketplace list --json',
+  `plugin marketplace add ${catalogUrl}`,
+  'plugin install arc-hooks@arc --scope user',
+  'plugin update arc-hooks@arc --scope user',
+  'plugin list --json',
+  'plugin enable arc-hooks@arc --scope user',
+])
+  test(`prerequisite failures install nothing and hook failures preserve successful editor installation: ${failure}`, () => {
     const f = installerFixture();
     try {
       if (failure === 'missing') fs.unlinkSync(path.join(f.bin, 'claude'));
@@ -515,8 +515,7 @@ test('prerequisite failures install nothing and hook failures preserve successfu
     } finally {
       f.cleanup();
     }
-  }
-});
+  });
 
 test('hosted catalog override never replaces another marketplace source', () => {
   const f = installerFixture();
@@ -622,16 +621,22 @@ test('stdin installation selects local source without Git and children cannot co
   }
 });
 
-test('the current editor receives the extension while other detected editors remain unselected', () => {
-  const f = installerFixture();
-  try {
-    for (const [product, layout, cliName] of [
-      ['code', 'linux'],
-      ['code-insiders', 'windows'],
-      ['cursor', 'linux'],
-      ['positron', 'macos', 'code'],
-      ['codium', 'macos'],
-    ]) {
+describe('the current editor receives the extension while other detected editors remain unselected', () => {
+  let f;
+  let editor;
+  beforeAll(() => {
+    f = installerFixture();
+    editor = f.editor('positron', 'windows');
+  });
+  afterAll(() => f.cleanup());
+  for (const [product, layout, cliName] of [
+    ['code', 'linux'],
+    ['code-insiders', 'windows'],
+    ['cursor', 'linux'],
+    ['positron', 'macos', 'code'],
+    ['codium', 'macos'],
+  ])
+    test(`${product} on ${layout}`, () => {
       const editor = f.editor(product, layout, cliName);
       const r = f.run(['--local', '--no-hooks'], editor.env, { cwd: f.source });
       assert.equal(r.status, 0, r.stderr);
@@ -644,9 +649,9 @@ test('the current editor receives the extension while other detected editors rem
       assert.equal(bash('test "$1" -ef "$2" && echo same', installed, launcher), 'same');
       assert.match(r.stdout, /==> Current editor:/);
       assert.doesNotMatch(r.stderr, /Choose editors/);
-    }
-    const editor = f.editor('positron', 'windows');
-    if (process.platform === 'win32') {
+    });
+  for (const pathFormat of process.platform === 'win32' ? ['drive'] : [])
+    test(`Windows ${pathFormat} paths`, () => {
       assert.match(editor.env.VSCODE_GIT_ASKPASS_MAIN, /\\/);
       assert.match(editor.env.VSCODE_GIT_ASKPASS_NODE, /\\/);
       const drivePaths = {
@@ -660,7 +665,8 @@ test('the current editor receives the extension while other detected editors rem
         [...drive.commands.matchAll(/editor (\S+) --install-extension/g)].map((match) => match[1]),
         ['positron'],
       );
-    }
+    });
+  test('remote stdin installation', () => {
     const piped = f.run(['--no-hooks'], editor.env, { stdin: true });
     assert.equal(piped.status, 0, piped.stderr);
     assert.match(piped.commands, /curl.*codeload/);
@@ -669,6 +675,8 @@ test('the current editor receives the extension while other detected editors rem
       ['positron'],
     );
     assert.match(piped.stdout, /ARC_INSTALL_SCRIPT_TAIL/);
+  });
+  test('explicit editors override the current editor', () => {
     const explicit = f.run(['--local', '--no-hooks', 'code', 'cursor'], editor.env, { cwd: f.source });
     assert.equal(explicit.status, 0, explicit.stderr);
     assert.deepEqual(
@@ -676,9 +684,7 @@ test('the current editor receives the extension while other detected editors rem
       ['code', 'cursor'],
     );
     assert.doesNotMatch(explicit.stdout, /Current editor/);
-  } finally {
-    f.cleanup();
-  }
+  });
 });
 
 for (const target of ['user', 'system'])
@@ -800,9 +806,11 @@ test('the current editor accepts matching metadata versions and rejects ambiguou
   }
 });
 
-test('unverified current editor hints retain the all-editor menu and default', () => {
-  const f = installerFixture();
-  try {
+describe('unverified current editor hints retain the all-editor menu and default', () => {
+  let f;
+  let hints;
+  beforeAll(() => {
+    f = installerFixture();
     const editor = f.editor('cursor', 'windows');
     const other = f.editor('code', 'linux');
     const unknown = f.editor('unlisted', 'linux');
@@ -812,7 +820,7 @@ test('unverified current editor hints retain the all-editor menu and default', (
     fs.unlinkSync(missingLauncher.launcher);
     const malformed = f.editor('code-insiders', 'linux');
     fs.writeFileSync(malformed.metadata, '{');
-    for (const env of [
+    hints = [
       {},
       { TERM_PROGRAM: 'vscode' },
       { ...editor.env, TERM_PROGRAM: 'other' },
@@ -823,7 +831,23 @@ test('unverified current editor hints retain the all-editor menu and default', (
       missingMetadata.env,
       missingLauncher.env,
       malformed.env,
-    ]) {
+    ];
+  });
+  afterAll(() => f.cleanup());
+  for (const [index, hint] of [
+    'no editor hints',
+    'terminal program alone',
+    'another terminal program',
+    'missing askpass script',
+    'executable from another editor',
+    'missing executable',
+    'unsupported product',
+    'missing product metadata',
+    'missing launcher',
+    'malformed product metadata',
+  ].entries())
+    test(`all editors for ${hint}`, () => {
+      const env = hints[index];
       const r = f.run(['--local', '--no-hooks'], env, { stdin: true, cwd: f.source, terminalInput: '\n' });
       assert.equal(r.status, 0, r.stderr);
       assert.match(r.stderr, /1\) All detected editors \(code, cursor\)/);
@@ -832,10 +856,7 @@ test('unverified current editor hints retain the all-editor menu and default', (
         ['code', 'cursor'],
       );
       assert.doesNotMatch(r.stdout, /Current editor/);
-    }
-  } finally {
-    f.cleanup();
-  }
+    });
 });
 
 test('the editor menu defaults to all and individual choices limit installation', () => {
