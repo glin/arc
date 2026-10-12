@@ -12,6 +12,7 @@ import {
   type SavedRailFilter,
 } from './domain/rail-filters.ts';
 import { READ_LIMIT } from './turnread';
+import { normalizeAgentRead, type AgentReadRecord } from './domain/read.ts';
 import { COMMENT_LIMIT, TurnComment, normalizeComments } from './turncomments';
 import { RAIL_BUCKETS, clampRailWidth } from './turnrail';
 import { clampPromptFloor } from './view/composer-size';
@@ -170,6 +171,8 @@ export interface PanelState {
   // The host retains this reader-owned list separately from webview state saves.
   views: SavedView[];
   read: string[];
+  agentRead?: AgentReadRecord[];
+  readRevision?: number;
   // Session read watermarks keyed by id, using the newest marked turn's start time.
   // They complement per-turn read keys and cover older turns outside the current parse.
   readTo: Record<string, number>;
@@ -315,6 +318,15 @@ export function normalizePanelState(raw: unknown, heldRailFilters?: readonly Sav
     // entry it cannot read.
     views,
     read: ids(src.read, READ_LIMIT),
+    ...(src.agentRead === undefined ? {} : { agentRead: normalizeAgentRead(src.agentRead) }),
+    ...(src.readRevision === undefined
+      ? {}
+      : {
+          readRevision:
+            Number.isSafeInteger(src.readRevision) && (src.readRevision as number) >= 0
+              ? (src.readRevision as number)
+              : 0,
+        }),
     readTo,
     // Accept only a positive finite read boundary. Invalid values disable it.
     since: typeof src.since === 'number' && Number.isFinite(src.since) && src.since > 0 ? src.since : 0,
@@ -373,12 +385,15 @@ export function withSweptDraftLabels(raw: unknown): unknown {
 
 // Projects webview state while excluding host-owned labels, reader parents, and saved filters.
 // Session cards carry the displayed label fields. Other panel-owned fields pass through.
-export function webviewPanelState(state: PanelState): Omit<PanelState, 'labels' | 'railFilters' | 'readerParents'> {
+export function webviewPanelState(
+  state: PanelState,
+): Omit<PanelState, 'labels' | 'railFilters' | 'readerParents' | 'agentRead'> {
   const served: Partial<PanelState> = { ...state };
   delete served.labels;
   delete served.readerParents;
+  delete served.agentRead;
   delete served.railFilters;
-  return served as Omit<PanelState, 'labels' | 'railFilters' | 'readerParents'>;
+  return served as Omit<PanelState, 'labels' | 'railFilters' | 'readerParents' | 'agentRead'>;
 }
 
 // How many folds the record keeps. Saved views have no reader-facing limit, so this ceiling

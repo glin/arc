@@ -2,6 +2,15 @@ import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypt
 import type { LauncherRequest } from './view/launcher';
 import type { SessionListingRow } from './sessionreads';
 import type { GuardedAttempt, GuardedReceipt } from './agentwire';
+import {
+  currentAgentRead,
+  normalizeAgentRead,
+  OrderedReadOperations,
+  ReadPublicationError,
+  type OrderedReadState,
+  type AgentReadRecord,
+  type AgentReadSource,
+} from './domain/read.ts';
 
 export interface SessionWriteParams {
   sessionId?: string;
@@ -25,11 +34,22 @@ export interface SessionWriteParams {
 
 // An opaque observation is base64url text with one dot. The host signs it, and the CLI passes it through unread.
 export const SESSION_OBSERVATION = /^[A-Za-z0-9_-]{1,900}\.[A-Za-z0-9_-]{43}$/;
+export const READ_OBSERVATION_BYTES = 12 * 1024;
+export const READ_OBSERVATION = /^[A-Za-z0-9_-]{1,12200}\.[A-Za-z0-9_-]{43}$/;
 
 export function validSessionWrite(method: string, params: Record<string, unknown>): boolean {
   const text = (value: unknown, limit: number) => typeof value === 'string' && value.length <= limit;
   const labels = (value: unknown) => Array.isArray(value) && value.length <= 20 && value.every((one) => text(one, 200));
   if (method === 'setups') return Object.keys(params).length === 0;
+  if (method === 'read')
+    return (
+      Object.keys(params).sort().join(',') === 'dryRun,observation,sessionId' &&
+      text(params.sessionId, 256) &&
+      !!params.sessionId &&
+      typeof params.dryRun === 'boolean' &&
+      typeof params.observation === 'string' &&
+      READ_OBSERVATION.test(params.observation)
+    );
   if (method === 'send')
     return (
       Object.keys(params).sort().join(',') === 'observation,prompt,sessionId' &&
@@ -175,6 +195,149 @@ export type RequesterProvider = 'claude' | 'codex';
 export interface RequesterIdentity {
   provider: RequesterProvider;
   id: string;
+}
+
+export interface ReadObservationFacts {
+  records: AgentReadRecord[];
+  projection: string;
+}
+
+export interface ReadWriteResult {
+  version: 1;
+  status: 'applied' | 'dry-run' | 'refused' | 'unknown';
+  requestId: string;
+  sessionId: string;
+  requester: RequesterIdentity | null;
+  marked: { promptId: string; startedAt: number }[];
+  reason: string;
+}
+
+// Read receipts authorize delivered completed identities independently of send ownership.
+export class SessionReadObservations {
+  constructor(
+    private readonly activation: string,
+    private readonly secret = randomBytes(32),
+  ) {}
+  observe(requester: RequesterIdentity | null, facts: ReadObservationFacts): string | null {
+    if (
+      !requester ||
+      !facts.records.length ||
+      facts.records.length > 20 ||
+      normalizeAgentRead(facts.records).length !== facts.records.length
+    )
+      return null;
+    const first = facts.records[0];
+    if (
+      facts.records.some((record) =>
+        ['provider', 'sessionId', 'source', 'scope', 'sourceRevision'].some(
+          (key) => record[key as 'source'] !== first[key as 'source'],
+        ),
+      )
+    )
+      return null;
+    const body = Buffer.from(JSON.stringify({ version: 1, activation: this.activation, requester, ...facts })).toString(
+      'base64url',
+    );
+    const token = `${body}.${createHmac('sha256', this.secret).update(body).digest('base64url')}`;
+    return READ_OBSERVATION.test(token) &&
+      Buffer.byteLength(JSON.stringify({ readObservation: token })) <= READ_OBSERVATION_BYTES
+      ? token
+      : null;
+  }
+  admit(
+    observation: string,
+    requester: RequesterIdentity | null,
+    sessionId: string,
+    facts: (record: AgentReadRecord) => AgentReadSource | null,
+  ): AgentReadRecord[] | null {
+    if (!requester || !READ_OBSERVATION.test(observation)) return null;
+    const [body, signature] = observation.split('.');
+    const expected = createHmac('sha256', this.secret).update(body).digest();
+    const supplied = Buffer.from(signature, 'base64url');
+    if (supplied.length !== expected.length || !timingSafeEqual(supplied, expected)) return null;
+    try {
+      const parsed = JSON.parse(Buffer.from(body, 'base64url').toString('utf8'));
+      if (
+        parsed.version !== 1 ||
+        parsed.activation !== this.activation ||
+        parsed.requester?.provider !== requester.provider ||
+        parsed.requester?.id !== requester.id ||
+        typeof parsed.projection !== 'string'
+      )
+        return null;
+      const records = normalizeAgentRead(parsed.records);
+      if (
+        !records.length ||
+        records.length !== parsed.records.length ||
+        records.some((record) => record.sessionId !== sessionId || !currentAgentRead(record, facts(record)))
+      )
+        return null;
+      return records;
+    } catch {
+      return null;
+    }
+  }
+}
+
+export async function runSessionRead(
+  request: {
+    requestId: string;
+    sessionId: string;
+    observation: string;
+    requester: RequesterIdentity | null;
+    dryRun: boolean;
+  },
+  observations: SessionReadObservations,
+  operations: OrderedReadOperations,
+  facts: (record: AgentReadRecord) => AgentReadSource | null,
+  persist: (state: OrderedReadState) => Promise<void>,
+  publish: (state: OrderedReadState) => void,
+): Promise<ReadWriteResult> {
+  const base = {
+    version: 1 as const,
+    requestId: request.requestId,
+    sessionId: request.sessionId,
+    requester: request.requester,
+    marked: [] as { promptId: string; startedAt: number }[],
+  };
+  const records = observations.admit(request.observation, request.requester, request.sessionId, facts);
+  if (!records)
+    return {
+      ...base,
+      status: 'refused',
+      reason: 'The read observation is stale or unavailable. Read the session again.',
+    };
+  if (request.dryRun)
+    return {
+      ...base,
+      status: 'dry-run',
+      marked: records.map(({ promptId, startedAt }) => ({ promptId, startedAt })),
+      reason: 'The completed turns can be marked read. No state was saved.',
+    };
+  try {
+    const accepted = await operations.run(
+      { id: request.requestId, observedRevision: operations.snapshot().revision, action: 'acknowledge', records },
+      facts,
+      persist,
+      publish,
+    );
+    if (!accepted)
+      return { ...base, status: 'refused', reason: 'The session changed before marking read. Read the session again.' };
+    return {
+      ...base,
+      status: 'applied',
+      marked: records.map(({ promptId, startedAt }) => ({ promptId, startedAt })),
+      reason: 'The delivered completed turns are marked read.',
+    };
+  } catch (error) {
+    if (error instanceof ReadPublicationError)
+      return {
+        ...base,
+        status: 'unknown',
+        reason: 'The read state was saved, but its publication is unknown. Preserve this request ID.',
+      };
+    return { ...base, status: 'refused', reason: 'Arc could not save the read state. No read change was published.' };
+  }
 }
 
 export const GUARDED_SEND_REASONS = {

@@ -18,6 +18,7 @@ import { liveBackgroundCommands, sessionStatusOf } from './turnrail.ts';
 import type { SessionStatus } from './domain/session-query.ts';
 import { railStatusRuns } from './domain/session-query.ts';
 import { onlyGrew } from './derivedcache.ts';
+import { READ_OBSERVATION_BYTES, type ReadObservationFacts } from './sessionwrites.ts';
 
 export const SESSION_READ_LIMITS = { turns: 20, bytes: 512 * 1024, outputBytes: 48 * 1024 } as const;
 export type SessionAttention = Extract<SessionStatus, 'input' | 'unread' | 'running'> | 'idle' | 'unknown';
@@ -646,6 +647,7 @@ export function boundedSessionRead(
   requester: string | null,
   roots: readonly string[],
   observe?: (facts: { scope: string; sourceRevision: string; latestTurn: string | null }) => string | null,
+  observeRead?: (facts: ReadObservationFacts) => string | null,
 ) {
   if (!Number.isSafeInteger(turns) || turns < 1 || turns > SESSION_READ_LIMITS.turns)
     throw new Error('Turns must be between 1 and 20.');
@@ -708,7 +710,8 @@ export function boundedSessionRead(
       ? observe({ scope: beforeScope, sourceRevision: before, latestTurn: latest.promptId ?? null })
       : null;
   // The response limit below reserves room for the observation.
-  const reserved = observation ? Buffer.byteLength(JSON.stringify({ observation })) : 0;
+  const reserved =
+    (observation ? Buffer.byteLength(JSON.stringify({ observation })) : 0) + (observeRead ? READ_OBSERVATION_BYTES : 0);
   for (const turn of [...read.turns].reverse()) {
     const { promptId, startedAt, endedAt, prompt, summary, model, effort, finished, interrupted, error } = turn;
     result.turns.push({ promptId, startedAt, endedAt, prompt, summary, model, effort, finished, interrupted, error });
@@ -722,6 +725,25 @@ export function boundedSessionRead(
   // An observation authorizes a continuation only from facts the reply delivers, so it needs the latest turn.
   if (observation && result.turns.length && result.turns[0].promptId === latest!.promptId)
     Object.assign(result, { observation });
+  if (observeRead && result.state === 'current') {
+    const records = result.turns
+      .filter((turn) => turn.finished && Number.isFinite(turn.endedAt) && turn.promptId)
+      .map((turn) => ({
+        provider: source.agent,
+        sessionId: source.sessionId,
+        source: sessionSourceKey(source.agent, source.sessionId, source.file),
+        scope: beforeScope,
+        sourceRevision: before,
+        promptId: turn.promptId,
+        startedAt: turn.startedAt,
+      }));
+    const readObservation = records.length
+      ? observeRead({ records, projection: digest(JSON.stringify(result.turns)) })
+      : null;
+    if (readObservation && Buffer.byteLength(JSON.stringify({ readObservation })) <= READ_OBSERVATION_BYTES)
+      Object.assign(result, { readObservation });
+    else result.notes.push('Acknowledgment is unavailable for this bounded reply.');
+  }
   if (result.partial) result.notes.push('The bounded read does not establish complete session history.');
 
   if (result.state === 'unparsed')

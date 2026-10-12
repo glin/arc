@@ -9,6 +9,8 @@ export interface ReadStateSnapshot {
   read: ReadonlySet<string>;
   readTo: ReadonlyMap<string, number>;
   since: number;
+  revision: number;
+  agentRead: ReadonlyMap<string, string>;
 }
 
 export interface ReadStateOptions {
@@ -21,6 +23,13 @@ export interface ReadStateOptions {
 }
 
 export interface ReadStateOwner {
+  synchronize(state: {
+    revision: number;
+    read: readonly string[];
+    readTo: Readonly<Record<string, number>>;
+    since: number;
+    agentRead: readonly (readonly [string, string])[];
+  }): boolean;
   snapshot(): ReadStateSnapshot;
   subscribe(listener: () => void): () => void;
   isRead(card: ReadCard): boolean;
@@ -49,6 +58,8 @@ export function createReadState(options: ReadStateOptions): ReadStateOwner {
     ),
   );
   let since = typeof options.initial.since === 'number' ? options.initial.since : 0;
+  let revision = -1;
+  const agentRead = new Map<string, string>();
   const listeners = new Set<() => void>();
 
   const notify = () => {
@@ -97,8 +108,21 @@ export function createReadState(options: ReadStateOptions): ReadStateOwner {
   };
 
   const owner: ReadStateOwner = {
+    synchronize(state) {
+      if (!Number.isSafeInteger(state.revision) || state.revision < 0 || state.revision <= revision) return false;
+      read.clear();
+      for (const key of state.read.slice(-READ_LIMIT)) read.add(key);
+      readTo.clear();
+      for (const [id, at] of Object.entries(state.readTo)) readTo.set(id, at);
+      since = state.since;
+      agentRead.clear();
+      for (const [key, promptId] of state.agentRead) agentRead.set(key, promptId);
+      revision = state.revision;
+      notify();
+      return true;
+    },
     snapshot() {
-      return { read, readTo, since };
+      return { read, readTo, since, revision, agentRead };
     },
     subscribe(listener) {
       listeners.add(listener);
@@ -107,7 +131,7 @@ export function createReadState(options: ReadStateOptions): ReadStateOwner {
       };
     },
     isRead(card) {
-      return isTurnRead(card, read, readTo, since);
+      return isTurnRead(card, read, readTo, since, agentRead);
     },
     canMark(card) {
       return canMarkRead(card);

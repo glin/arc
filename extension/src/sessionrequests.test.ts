@@ -36,6 +36,8 @@ import { openReadWindow, closeReadWindow } from './readmeter.ts';
 import { requestWindow, requesterIdentity } from './sessionrequests.ts';
 import {
   GUARDED_SEND_REASONS,
+  SessionReadObservations,
+  runSessionRead,
   GuardedSends,
   SessionWriteRequests,
   archiveRefusal,
@@ -52,6 +54,175 @@ import {
   type GuardedSendRequest,
   type GuardedTargetFacts,
 } from './sessionwrites.ts';
+import { OrderedReadOperations, type AgentReadRecord, type AgentReadSource } from './domain/read.ts';
+
+test('read receipts refuse changed or foreign work and dry run preserves later admission', async () => {
+  const record: AgentReadRecord = {
+    provider: 'codex',
+    sessionId: 'worker',
+    source: 'source',
+    scope: 'scope',
+    sourceRevision: 'revision',
+    promptId: 'prompt',
+    startedAt: 10,
+  };
+  const facts = (): AgentReadSource => ({
+    ...record,
+    identitiesComplete: true,
+    turns: [{ promptId: 'prompt', startedAt: 10, finished: true }],
+  });
+  const requester = { provider: 'claude' as const, id: 'reader' };
+  const secret = Buffer.alloc(32, 7);
+  const policy = new SessionReadObservations('activation', secret);
+  const observation = policy.observe(requester, { records: [record], projection: 'bounded-projection' })!;
+  assert.ok(observation);
+  assert.deepEqual(policy.admit(observation, requester, 'worker', facts), [record]);
+  for (const changed of [
+    { sourceRevision: 'append' },
+    { sourceRevision: 'truncated' },
+    { source: 'replacement' },
+    { scope: 'moved' },
+    { provider: 'claude' as const },
+    { identitiesComplete: false },
+  ])
+    assert.equal(
+      policy.admit(observation, requester, 'worker', () => ({ ...facts(), ...changed })),
+      null,
+    );
+  assert.equal(policy.admit(observation, { ...requester, id: 'foreign' }, 'worker', facts), null);
+  assert.equal(policy.admit(observation, { ...requester, provider: 'codex' }, 'worker', facts), null);
+  assert.equal(policy.admit(observation, requester, 'other', facts), null);
+  assert.equal(new SessionReadObservations('other', secret).admit(observation, requester, 'worker', facts), null);
+  assert.equal(policy.admit('x' + observation.slice(1), requester, 'worker', facts), null);
+  assert.equal(
+    policy.admit(observation, requester, 'worker', () => ({
+      ...facts(),
+      turns: [...facts().turns, { promptId: 'collision', startedAt: 10, finished: true }],
+    })),
+    null,
+  );
+  const operations = new OrderedReadOperations({ revision: 0, read: [], readTo: {}, since: 0, agentRead: [] });
+  let writes = 0;
+  const request = { requestId: 'dry', sessionId: 'worker', observation, requester, dryRun: true };
+  const persist = async () => {
+    writes++;
+  };
+  const dry = await runSessionRead(request, policy, operations, facts, persist, () => {});
+  assert.equal(dry.status, 'dry-run');
+  assert.equal(writes, 0);
+  assert.equal(operations.snapshot().revision, 0);
+  const applied = await runSessionRead(
+    { ...request, requestId: 'apply', dryRun: false },
+    policy,
+    operations,
+    facts,
+    persist,
+    () => {},
+  );
+  assert.equal(applied.status, 'applied');
+  assert.equal(writes, 1);
+  assert.deepEqual(operations.snapshot().read, []);
+  assert.deepEqual(operations.snapshot().readTo, {});
+  const refused = await runSessionRead(
+    { ...request, requestId: 'fail', dryRun: false },
+    policy,
+    operations,
+    facts,
+    async () => {
+      throw new Error('save failed');
+    },
+    () => {
+      assert.fail('failed read published');
+    },
+  );
+  assert.equal(refused.status, 'refused');
+  assert.equal(operations.snapshot().revision, 1);
+  let savedRevision = 0;
+  const uncertain = await runSessionRead(
+    { ...request, requestId: 'publication-failure', dryRun: false },
+    policy,
+    operations,
+    facts,
+    async (state) => {
+      savedRevision = state.revision;
+    },
+    () => {
+      throw new Error('publication failed');
+    },
+  );
+  assert.equal(uncertain.status, 'unknown');
+  assert.equal(savedRevision, 2);
+  assert.equal(operations.snapshot().revision, 2);
+  assert.deepEqual(operations.snapshot().agentRead, [record]);
+});
+
+test('read receipts contain only completed turns retained after the bounded response budget', () => {
+  const directory = tempDir('read-receipt-budget-');
+  const file = path.join(directory, 'session.jsonl');
+  const records: unknown[] = [];
+  for (let index = 1; index <= 3; index++) {
+    const timestamp = `2026-10-08T12:00:0${index}Z`;
+    records.push({
+      type: 'user',
+      promptId: `prompt-${index}`,
+      sessionId: 'known',
+      cwd: directory,
+      timestamp,
+      message: { role: 'user', content: index === 3 ? 'unfinished' : 'p'.repeat(22000) },
+    });
+    if (index < 3)
+      records.push({
+        type: 'assistant',
+        timestamp,
+        message: {
+          id: `reply-${index}`,
+          role: 'assistant',
+          model: 'claude-opus-5-5',
+          content: [{ type: 'text', text: 'answer' }],
+          stop_reason: 'end_turn',
+          usage: { input_tokens: 1, output_tokens: 1 },
+        },
+      });
+  }
+  fs.writeFileSync(file, records.map((record) => JSON.stringify(record)).join('\n') + '\n');
+  const stat = revisionOf(fs.statSync(file, { bigint: true }));
+  const source = { agent: 'claude' as const, sessionId: 'known', file, size: stat.size, mtimeMs: stat.mtimeMs };
+  let delivered: AgentReadRecord[] = [];
+  const read = () =>
+    boundedSessionRead(
+      source,
+      3,
+      () => 'scope',
+      'reader',
+      [directory],
+      undefined,
+      (facts) => {
+        delivered = facts.records;
+        return 'signed';
+      },
+    );
+  const result = read();
+  assert.equal(result.turns.length, 2);
+  assert.equal(
+    delivered.length,
+    1,
+    JSON.stringify(result.turns.map(({ promptId, finished, endedAt }) => ({ promptId, finished, endedAt }))),
+  );
+  assert.equal(delivered[0].promptId, result.turns[1].promptId);
+  assert.equal(result.turns[0].finished, false);
+  assert.equal(delivered[0].sourceRevision, guardedSourceRevision(file));
+  assert.ok(Buffer.byteLength(JSON.stringify(result)) <= SESSION_READ_LIMITS.outputBytes);
+  const overflow = boundedSessionRead(
+    source,
+    3,
+    () => 'scope',
+    'reader',
+    [directory],
+    undefined,
+    () => 'x'.repeat(13000),
+  );
+  assert.equal('readObservation' in overflow, false);
+});
 import {
   CompactHost,
   CompactRequests,

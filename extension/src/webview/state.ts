@@ -87,6 +87,7 @@ export function mergeSubmittedPrompts(...snapshots: unknown[]): SubmittedPrompt[
 }
 
 export interface SavedPanelState {
+  readRevision?: number;
   submittedPrompts?: SubmittedPrompt[];
   open: unknown[];
   showing: string;
@@ -115,6 +116,7 @@ export interface SavedPanelState {
 }
 
 export interface SavedStateValues {
+  readRevision?: number;
   open: Iterable<unknown>;
   showing: string;
   railFilter: string;
@@ -155,6 +157,7 @@ function stateObject(value: unknown): Record<string, unknown> | null {
 
 export function savedPanelState(values: SavedStateValues): SavedPanelState {
   return {
+    ...(values.readRevision === undefined ? {} : { readRevision: values.readRevision }),
     open: [...values.open],
     showing: values.showing,
     railFilter: values.railFilter,

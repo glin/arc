@@ -2,6 +2,7 @@ import * as fs from 'node:fs';
 import { requestWindow, requesterIdentity } from '../../extension/src/sessionrequests.ts';
 import {
   SESSION_OBSERVATION,
+  READ_OBSERVATION,
   guardedPromptRefusal,
   payloadSha256,
   type SessionWriteParams,
@@ -74,6 +75,8 @@ export async function runManagement(command: string, args: string[]): Promise<st
       ? ['--window', '--json']
       : command === 'send'
         ? ['--window', '--request-id', '--prompt-file', '--observation', '--json']
+        : command === 'read'
+          ? ['--window', '--request-id', '--observation', '--dry-run', '--json']
         : command === 'start'
           ? [
               '--window',
@@ -99,6 +102,33 @@ export async function runManagement(command: string, args: string[]): Promise<st
               '--dry-run',
               ...(command === 'archive' ? ['--force'] : []),
             ];
+||||||| parent of d1d8ba61 (feat(read): add observation-bound session acknowledgments)
+        : command === 'start'
+          ? [
+              '--window',
+              '--request-id',
+              '--setup',
+              '--provider',
+              '--model',
+              '--effort',
+              '--permissions',
+              '--prompt-file',
+              '--name',
+              '--label',
+              '--json',
+              '--agent-run',
+              '--untagged',
+              '--pinned',
+              '--arc-dispatch',
+            ]
+          : [
+              '--window',
+              '--request-id',
+              '--label',
+              '--json',
+              '--dry-run',
+              ...(command === 'archive' ? ['--force'] : []),
+            ];
   for (const arg of [...options.keys(), ...flags, ...(labels.length ? ['--label'] : [])]) {
     if (!allowed.includes(arg)) throw new Error(`${arg} is unavailable for ${command}.`);
   }
@@ -107,6 +137,29 @@ export async function runManagement(command: string, args: string[]): Promise<st
   if (command === 'setups') {
     if (sessions.length) throw new Error('Usage: arc setups [--window ID] [--json]');
     return JSON.stringify(await requestWindow('setups', {}, window));
+  }
+  if (command === 'read') {
+    if (sessions.length !== 1 || !options.has('--observation') || !requestId)
+      throw new Error(
+        'Usage: arc read ID --observation TOKEN --request-id WINDOW:REQUEST [--dry-run] [--window WINDOW] [--json]',
+      );
+    if (!READ_OBSERVATION.test(options.get('--observation')!))
+      throw new Error('The read observation is invalid. Copy readObservation from arc session --json.');
+    const identity = requesterIdentity();
+    if (identity.ambiguous || !identity.provider) throw new Error('Run read from one Claude Code or Codex session.');
+    return JSON.stringify(
+      await requestWindow(
+        'read',
+        {
+          sessionId: sessions[0],
+          observation: options.get('--observation')!,
+          dryRun: flags.has('--dry-run'),
+        },
+        window,
+        undefined,
+        requestId,
+      ),
+    );
   }
   if (command === 'send') {
     if (sessions.length !== 1 || !options.has('--prompt-file') || !options.has('--observation') || !requestId)

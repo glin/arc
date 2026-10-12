@@ -46,6 +46,72 @@ import {
   type PromptPosition,
 } from '../view/timeline-layout.ts';
 import type { CardView, RailCardView } from './payload-contracts.ts';
+import { validAgentReadRecord, READ_LIMIT, type ReadOperation } from '../domain/read.ts';
+
+export interface ReadSynchronization {
+  revision: number;
+  read: string[];
+  readTo: Record<string, number>;
+  since: number;
+  agentRead: [string, string][];
+}
+
+export function parseReadSynchronization(value: unknown): ReadSynchronization | null {
+  if (!value || typeof value !== 'object') return null;
+  const state = value as ReadSynchronization;
+  if (!Number.isSafeInteger(state.revision) || state.revision < 0 || !Number.isFinite(state.since) || state.since < 0)
+    return null;
+  if (!Array.isArray(state.read) || state.read.length > READ_LIMIT || state.read.some((key) => typeof key !== 'string'))
+    return null;
+  if (
+    !state.readTo ||
+    typeof state.readTo !== 'object' ||
+    Array.isArray(state.readTo) ||
+    Object.values(state.readTo).some((at) => !Number.isFinite(at) || at < 0)
+  )
+    return null;
+  if (
+    !Array.isArray(state.agentRead) ||
+    state.agentRead.length > READ_LIMIT ||
+    state.agentRead.some(
+      (pair) => !Array.isArray(pair) || pair.length !== 2 || pair.some((text) => typeof text !== 'string' || !text),
+    )
+  )
+    return null;
+  return {
+    revision: state.revision,
+    read: [...state.read],
+    readTo: { ...state.readTo },
+    since: state.since,
+    agentRead: state.agentRead.map(([key, promptId]) => [key, promptId]),
+  };
+}
+
+// Browser operations exclude agent acknowledgments and source invalidation.
+export function parseReaderOperation(value: unknown): ReadOperation | null {
+  if (!value || typeof value !== 'object') return null;
+  const operation = value as ReadOperation;
+  if (
+    typeof operation.id !== 'string' ||
+    !operation.id ||
+    operation.id.length > 128 ||
+    !Number.isSafeInteger(operation.observedRevision) ||
+    operation.observedRevision < 0
+  )
+    return null;
+  if (operation.action === 'reset')
+    return Number.isFinite(operation.since) && operation.since >= 0
+      ? { id: operation.id, observedRevision: operation.observedRevision, action: 'reset', since: operation.since }
+      : null;
+  if (operation.action !== 'turn' && operation.action !== 'session') return null;
+  if (!validAgentReadRecord(operation.target) || typeof operation.read !== 'boolean') return null;
+  if (
+    operation.action === 'session' &&
+    (!Number.isFinite(operation.newestAt) || operation.newestAt < operation.target.startedAt)
+  )
+    return null;
+  return structuredClone(operation);
+}
 
 export interface AskQuestionAnswer {
   labels: string[];

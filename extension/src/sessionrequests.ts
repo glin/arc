@@ -17,6 +17,7 @@ import {
   sessionWriteBinding,
   validSessionWrite,
   type GuardedSendResult,
+  type ReadWriteResult,
   type RequesterProvider,
   type SessionWriteParams,
 } from './sessionwrites.ts';
@@ -57,6 +58,7 @@ export const SESSION_QUERY_SHORTHAND_CAPABILITY = 'sessionQueryShorthandV1';
 export { FILTER_LIMITS } from './sessionfilter.ts';
 
 export const REQUESTER_PROVIDER_CAPABILITY = 'requesterProvider';
+export const SESSION_READ_CAPABILITY = 'sessionRead';
 
 export interface HostRegistration extends WindowInfo {
   address: string;
@@ -85,6 +87,7 @@ export interface SessionRequest {
     | 'start'
     | 'curate'
     | 'send'
+    | 'read'
     | 'compact-ready'
     | 'compact-request'
     | 'compact-status';
@@ -151,7 +154,7 @@ export function parseSessionRequest(value: unknown): SessionRequest | null {
   if (
     value.requesterProvider !== undefined &&
     (!['claude', 'codex'].includes(value.requesterProvider as string) ||
-      !['start', 'send', 'session'].includes(value.method as string) ||
+      !['start', 'send', 'read', 'session'].includes(value.method as string) ||
       value.requester === null)
   )
     return null;
@@ -171,6 +174,7 @@ export function parseSessionRequest(value: unknown): SessionRequest | null {
       'start',
       'curate',
       'send',
+      'read',
       'compact-ready',
       'compact-request',
       'compact-status',
@@ -206,8 +210,9 @@ export function parseSessionRequest(value: unknown): SessionRequest | null {
       (value.params.turns as number) > 20
     )
       return null;
-  } else if (['setups', 'start', 'curate', 'send'].includes(value.method as string)) {
+  } else if (['setups', 'start', 'curate', 'send', 'read'].includes(value.method as string)) {
     if (!validSessionWrite(value.method as string, value.params)) return null;
+    if (value.method === 'read' && (!value.requester || !value.requesterProvider)) return null;
   } else if (value.method === 'filter') {
     if (
       Object.keys(value.params).join(',') !== 'query' ||
@@ -348,6 +353,12 @@ export class WindowChannel {
   private requestHandler: ((request: SessionRequest) => unknown | Promise<unknown>) | null = null;
   private compactHandler: ((request: SessionRequest) => unknown | Promise<unknown>) | null = null;
   private guardedSendHandler: ((request: SessionRequest) => Promise<GuardedSendResult>) | null = null;
+  private guardedReadHandler: ((request: SessionRequest) => Promise<ReadWriteResult>) | null = null;
+
+  setGuardedReadHandler(handler: (request: SessionRequest) => Promise<ReadWriteResult>): void {
+    this.guardedReadHandler = handler;
+    if (this.listening) this.publish();
+  }
 
   setRequestHandler(handler: (request: SessionRequest) => unknown | Promise<unknown>): void {
     this.requestHandler = handler;
@@ -406,7 +417,12 @@ export class WindowChannel {
       hostId: this.hostId,
       pid: process.pid,
       version: SESSION_REQUEST_VERSION,
-      capabilities: [REQUESTER_PROVIDER_CAPABILITY, SESSION_QUERY_CAPABILITY, SESSION_QUERY_SHORTHAND_CAPABILITY],
+      capabilities: [
+        REQUESTER_PROVIDER_CAPABILITY,
+        SESSION_QUERY_CAPABILITY,
+        SESSION_QUERY_SHORTHAND_CAPABILITY,
+        ...(this.guardedReadHandler ? [SESSION_READ_CAPABILITY] : []),
+      ],
     };
   }
 
@@ -531,6 +547,23 @@ export class WindowChannel {
               });
             }
             const write = request.method === 'start' || request.method === 'curate' || request.method === 'send';
+            if (request.method === 'read') {
+              const apply = () =>
+                this.guardedReadHandler
+                  ? this.guardedReadHandler(request)
+                  : Promise.resolve({
+                      version: 1,
+                      status: 'refused',
+                      requestId: request.id,
+                      sessionId: request.params.sessionId,
+                      requester: null,
+                      marked: [],
+                      reason: 'This Arc window does not support marking sessions read.',
+                    });
+              return this.writes
+                .run(request.id, this.binding(request), apply)
+                .then((data) => ({ window: this.info(), data }));
+            }
             if (request.method === 'send') {
               const send = () =>
                 this.guardedSendHandler
@@ -800,6 +833,7 @@ export async function requestWindow(
   requestId?: string,
   guardedStart = false,
 ): Promise<unknown> {
+  if (method === 'read' && !requestId) throw new Error('Marking read requires an explicit request ID.');
   let selected = selector;
   if (!selected) {
     const discovery = await discoverWindows(home);
@@ -831,6 +865,8 @@ export async function requestWindow(
     throw new Error(`Request ${requestId} has an unknown outcome in this activation.`);
   if (method === 'send' && !providerCapable(entry))
     throw new Error('The selected Arc window must reload before it can accept send. No prompt was sent.');
+  if (method === 'read' && (!providerCapable(entry) || !entry.capabilities?.includes(SESSION_READ_CAPABILITY)))
+    throw new Error('The selected Arc window does not support marking sessions read.');
   if (
     (method === 'filter' || (method === 'sessions' && params.query !== undefined)) &&
     !entry.capabilities?.includes(SESSION_QUERY_CAPABILITY)
@@ -843,8 +879,10 @@ export async function requestWindow(
     !entry.capabilities?.includes(SESSION_QUERY_SHORTHAND_CAPABILITY)
   )
     throw new Error('The selected Arc window must reload before it can accept session ID shorthand.');
-  const write = method === 'start' || method === 'curate' || method === 'send' || method === 'compact-request';
-  const attributed = method === 'send' || method === 'session' || (method === 'start' && guardedStart);
+  const write =
+    method === 'start' || method === 'curate' || method === 'send' || method === 'read' || method === 'compact-request';
+  const attributed =
+    method === 'send' || method === 'read' || method === 'session' || (method === 'start' && guardedStart);
   let timedOut = false;
   const result = await exchangeWindow(
     entry,

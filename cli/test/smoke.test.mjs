@@ -318,6 +318,66 @@ test('bundled management commands carry reader-default classification, prompt fi
   }
 });
 
+test('bundled read validates bounded attribution and capability before retaining curation retries', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'arc read smoke '));
+  const channel = new WindowChannel(home);
+  const run = promisify(execFile);
+  const requests = [];
+  const observation = 'a'.repeat(40) + '.' + 'b'.repeat(43);
+  try {
+    await channel.update({ folders: [home], scopeReady: true, panelReady: true, panelVisible: true });
+    const env = {
+      ...process.env,
+      ARC_HOME: home,
+      ARC_WINDOW: channel.hostId,
+      CLAUDE_CODE_SESSION_ID: 'reader',
+      CODEX_THREAD_ID: '',
+    };
+    const args = [
+      cli,
+      'read',
+      'worker',
+      '--observation',
+      observation,
+      '--request-id',
+      `${channel.hostId}:read`,
+      '--json',
+    ];
+    await assert.rejects(run(process.execPath, args, { env }), /does not support marking sessions read/);
+    channel.setGuardedReadHandler(async (request) => {
+      requests.push(request);
+      return {
+        version: 1,
+        status: request.params.dryRun ? 'dry-run' : 'applied',
+        requestId: request.id,
+        sessionId: 'worker',
+        requester: { provider: request.requesterProvider, id: request.requester },
+        marked: [],
+        reason: 'saved',
+      };
+    });
+    const applied = JSON.parse((await run(process.execPath, args, { env })).stdout);
+    assert.equal(applied.status, 'applied');
+    await run(process.execPath, args, { env });
+    assert.equal(requests.length, 1);
+    assert.equal(requests[0].requesterProvider, 'claude');
+    assert.deepEqual(requests[0].params, { sessionId: 'worker', observation, dryRun: false });
+    await assert.rejects(run(process.execPath, [...args, '--dry-run'], { env }), /already names a different request/);
+    for (const [invalid, invalidEnv, pattern] of [
+      [args.slice(0, -3), env, /Usage: arc read/],
+      [args.map((arg) => (arg === observation ? 'bad' : arg)), env, /read observation is invalid/],
+      [[...args, '--force'], env, /unavailable for read/],
+      [args, { ...env, CODEX_THREAD_ID: 'other' }, /Run read from one/],
+      [args, { ...env, CLAUDE_CODE_SESSION_ID: '' }, /Run read from one/],
+    ])
+      await assert.rejects(run(process.execPath, invalid, { env: invalidEnv }), pattern);
+    assert.equal(requests.length, 1);
+  } finally {
+    await channel.dispose();
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test('bundled send reads Unicode multiline prompt files, requires observations and request IDs, and refuses ambiguity before sending', async () => {
   const home = mkdtempSync(join(tmpdir(), 'arc send smoke '));
   const channel = new WindowChannel(home);

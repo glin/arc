@@ -663,6 +663,60 @@ test('newest-turn loading stays visible when a compaction card is already drawn'
   });
 });
 
+test('agent acknowledgments never establish a reader boundary or complete omitted history', () => {
+  const refs = [10, 20].map((startedAt) => ({
+    key: `s:${startedAt}`,
+    sessionId: 's',
+    startedAt,
+    promptId: `p${startedAt}`,
+    kind: 'turn',
+  }));
+  const agent = new Map([['s:20', 'p20']]);
+  for (const whole of [true, false]) {
+    const known = new Map([['s', { starts: [10, 20], whole }]]);
+    assert.deepEqual(newCounts([refs[1]], known, [], new Map(), 0, agent, new Map([['s', refs]])).get('s'), {
+      count: 1,
+      atLeast: !whole,
+    });
+  }
+  assert.deepEqual(newCounts(refs, new Map(), [], new Map(), 0, agent).get('s'), { count: 1, atLeast: false });
+  const windows = new Map([['s', { starts: [20], whole: false }]]);
+  assert.deepEqual(newCounts([refs[1]], windows, [], new Map(), 0, agent).get('s'), { count: 0, atLeast: true });
+  assert.deepEqual(newCounts([], windows, [], new Map(), 0, agent).get('s'), { count: 1, atLeast: true });
+  assert.deepEqual(newCounts([], windows, [], new Map(), 0, agent, new Map([['s', [refs[1]]]])).get('s'), {
+    count: 0,
+    atLeast: true,
+  });
+  const colliding = [refs[1], { ...refs[1], promptId: 'collision' }];
+  assert.deepEqual(
+    newCounts(
+      [],
+      new Map([['s', { starts: [20, 20], whole: true }]]),
+      [],
+      new Map(),
+      0,
+      agent,
+      new Map([['s', colliding]]),
+    ).get('s'),
+    { count: 2, atLeast: false },
+  );
+  const record = {
+    provider: 'codex',
+    sessionId: 's',
+    source: 'identity',
+    scope: 'scope',
+    sourceRevision: 'revision',
+    promptId: 'p20',
+    startedAt: 20,
+  };
+  const restored = normalizePanelState({ agentRead: [record], readRevision: 4 });
+  assert.deepEqual(restored.agentRead, [record]);
+  assert.equal(restored.readRevision, 4);
+  assert.deepEqual(restored.read, []);
+  assert.deepEqual(restored.readTo, {});
+  assert.equal('agentRead' in webviewPanelState(restored), false);
+});
+
 test('the saved panel state is rebuilt rather than trusted', () => {
   // Stored panel state must normalize missing or invalid fields without throwing.
   const empty = {

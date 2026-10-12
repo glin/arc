@@ -1,6 +1,6 @@
 ---
 name: arc-sessions
-description: 'Read and manage scoped Claude Code and Codex sessions through a running Arc window. Use when asked to start sessions in Arc, inspect progress, send a follow-up to a session this session started, label, pin or archive sessions, link to a session in a reply, or compact this session after the turn. Excludes terminal-only launches and automatic supervision.'
+description: 'Read and manage scoped Claude Code and Codex sessions through a running Arc window. Use when asked to start sessions in Arc, inspect progress, mark requested sessions read, send a follow-up to a session this session started, label, pin or archive sessions, link to a session in a reply, or compact this session after the turn. Excludes terminal-only launches and automatic supervision.'
 ---
 
 # Arc sessions
@@ -38,6 +38,22 @@ Send only to a session that this session started with `arc start --arc-dispatch`
 Read the `status` field. `accepted` means the agent received the prompt, not that its work succeeded. `refused` means no prompt was sent, and `reason` says why. Each observation serves one follow-up attempt. It also goes stale when the reader gives that session or this one input through the panel, or when that session ends a turn or takes a follow-up. Read the session again and write the new follow-up from that reply. `unknown` means delivery is uncertain. Report it to the reader. A retry with the same request ID and prompt file returns the first result and sends nothing again. Never retry under a new request ID, start a replacement, or resume the session. Arc refuses later follow-ups to that session until the reader directs it in the panel, for example with a prompt, an answer, or Stop. A setting change alone does not lift that block.
 
 Arc delivers through the session's existing process in that window and never resumes or forks a copy. It cannot prevent an independent resume outside that window. Arc judges idle state from Claude idle reports, Codex root turns, and the panel's queues and status. Work that none of these report stays invisible to that check.
+
+## Mark requested turns read
+
+Mark only sessions the reader explicitly asked you to mark read. Establish that bounded set from the request and exact scoped identities. A listing, an incidental lookup, or a status report grants no marking authority.
+
+Check the selected window's `sessionRead` capability. A window without it does not support read writes. Report that limitation without switching windows or changing reader attention through another command.
+
+For a supporting window, read each authorized session with `arc session SESSION_ID --turns 5 --window WINDOW_ID --json`. Read the delivered completed turns before acknowledging them. Copy `readObservation` unchanged, never the send-only `observation`. A reply without `readObservation` grants no read acknowledgment.
+
+```text
+arc read SESSION_ID --observation READ_OBSERVATION --request-id WINDOW_ID:UUID --window WINDOW_ID --json
+```
+
+Use `--dry-run` to check admission without saving. Use a different request ID for the later applied action. Preserve identical-payload retry rules from Interpret delivery. Report `applied`, `dry-run`, `refused`, or `unknown` exactly. Preserve the selected window and request ID after an unknown outcome.
+
+Acknowledgment covers only the delivered completed projection. It does not establish full transcript consumption or complete history. Omitted and later work stays outside that acknowledgment. A changed source invalidates its acknowledgment, including an append. After a stale refusal, read again and use a fresh request ID for the new receipt. After an unknown outcome, retry only the identical payload with the same request ID. Never change the ID for that uncertainty retry. Marking read sends no prompt and changes no archive membership, label, or pin.
 
 ## Request compaction of this session
 

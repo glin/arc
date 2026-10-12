@@ -6,7 +6,7 @@ import { meterRead } from './readmeter';
 import * as crypto from 'node:crypto';
 import { TurnStarts } from './transcript';
 import type { Compaction, Turn } from './transcript';
-import { isTurnRead, newBySession, turnKey } from './domain/read.ts';
+import { isTurnRead, newBySession, turnKey, type ReadableTurn } from './domain/read.ts';
 
 export { canMarkRead, isTurnRead, newBySession, READ_LIMIT, turnKey } from './domain/read.ts';
 
@@ -74,7 +74,7 @@ export interface NewCount {
   atLeast: boolean;
 }
 
-// Combines parsed unread counts with bounded turn-start windows. Parsed sessions take precedence.
+// Combines parsed unread counts with bounded turn-start windows and complete mapped identities.
 // Window starts use the same read keys as parsed turns.
 // A whole-file window gives a complete count.
 // A partial window with a read turn also gives a complete count if file order follows turn timestamps.
@@ -82,32 +82,65 @@ export interface NewCount {
 // Claude replayed turns can break timestamp order and undercount a resumed session.
 // The window alone cannot detect a replay block outside its bounds.
 export function newCounts(
-  parsed: { key: string; sessionId: string; startedAt: number; kind: string }[],
+  parsed: (ReadableTurn & { kind: string })[],
   windows: ReadonlyMap<string, TurnStarts>,
   read: Iterable<string>,
   readTo: ReadonlyMap<string, number>,
   since = 0,
+  agentRead: ReadonlyMap<string, string> = new Map(),
+  mappedWindows: ReadonlyMap<string, readonly (ReadableTurn & { kind: string })[]> = new Map(),
 ): Map<string, NewCount> {
   const readSet = new Set(read);
   const out = new Map<string, NewCount>();
-  for (const [id, count] of newBySession(parsed, readSet, readTo, since)) {
-    out.set(id, { count, atLeast: false });
+  for (const [id, count] of newBySession(parsed, readSet, readTo, since, agentRead)) {
+    const session = parsed.filter((turn) => turn.sessionId === id && turn.kind === 'turn');
+    const acknowledged = session.some(
+      (turn) => turn.promptId !== undefined && agentRead.get(turn.key) === turn.promptId,
+    );
+    const readerBoundary = session.some((turn) => isTurnRead(turn, readSet, readTo, since));
+    out.set(id, { count, atLeast: acknowledged && windows.get(id)?.whole === false && !readerBoundary });
   }
   for (const [id, window] of windows) {
-    if (out.has(id)) {
-      continue;
-    }
     // No turn starts provide no count. Do not treat an unreadable boundary as zero.
     if (!window.starts.length) {
       continue;
     }
-    const refs = window.starts.map((startedAt) => ({
+    const starts = window.starts.map((startedAt) => ({
       key: turnKey({ sessionId: id, startedAt }),
       sessionId: id,
       startedAt,
       kind: 'turn',
     }));
-    const count = newBySession(refs, readSet, readTo, since).get(id) ?? 0;
+    const mapped = mappedWindows.get(id);
+    const mappedComplete =
+      mapped &&
+      mapped.length === starts.length &&
+      starts.every(
+        (one) =>
+          mapped.filter(
+            (other) =>
+              other.sessionId === id &&
+              other.key === one.key &&
+              other.startedAt === one.startedAt &&
+              other.kind === 'turn',
+          ).length === 1,
+      );
+    const session = parsed.filter((turn) => turn.sessionId === id && turn.kind === 'turn');
+    if (
+      out.has(id) &&
+      (!mappedComplete ||
+        !session.some((turn) => turn.promptId !== undefined && agentRead.get(turn.key) === turn.promptId))
+    )
+      continue;
+    const refs: (ReadableTurn & { kind: string })[] = mappedComplete ? [...mapped] : starts;
+    if (out.has(id)) {
+      for (const turn of session) {
+        const held = refs.findIndex((one) => one.key === turn.key);
+        if (held < 0) refs.push(turn);
+        else if (refs[held].promptId !== turn.promptId) refs[held] = { ...turn, promptId: undefined };
+      }
+    }
+    const count = newBySession(refs, readSet, readTo, since, agentRead).get(id) ?? 0;
     const anyRead = refs.some((r) => isTurnRead(r, readSet, readTo, since));
     out.set(id, { count, atLeast: !window.whole && !anyRead });
   }

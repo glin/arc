@@ -2,6 +2,35 @@ import { test } from 'vitest';
 import assert from 'node:assert';
 import { createReadState, type ReadCard } from './read-state.ts';
 import { READ_LIMIT } from '../domain/read.ts';
+import { parseReadSynchronization, parseReaderOperation } from './protocol.ts';
+
+test('host read synchronization rejects older revisions without saving agent membership as reader marks', () => {
+  let saves = 0;
+  const turn = { ...card('s:10'), promptId: 'p10' };
+  const state = createReadState({
+    initial: {},
+    open: new Set(),
+    cards: () => [turn],
+    newestTurnAt: () => 10,
+    save: () => {
+      saves++;
+    },
+    refreshSelection: () => {},
+  });
+  const update = { revision: 2, read: [], readTo: {}, since: 0, agentRead: [['s:10', 'p10']] as [string, string][] };
+  assert.equal(state.synchronize(parseReadSynchronization(update)!), true);
+  assert.equal(state.isRead(turn), true);
+  assert.equal(state.isRead({ ...turn, promptId: 'different' }), false);
+  assert.equal(state.synchronize({ ...update, revision: 1, agentRead: [] }), false);
+  assert.equal(state.isRead(turn), true);
+  assert.equal(state.synchronize({ ...update, revision: 3, agentRead: [] }), true);
+  assert.equal(state.isRead(turn), false);
+  assert.equal(saves, 0);
+  assert.equal(state.snapshot().read.size, 0);
+  assert.equal(parseReadSynchronization({ ...update, revision: NaN }), null);
+  assert.equal(parseReadSynchronization({ ...update, agentRead: ['s:10'] }), null);
+  assert.equal(parseReaderOperation({ id: 'unsafe', observedRevision: 0, action: 'acknowledge', records: [] }), null);
+});
 
 function card(key: string, sessionId = 's', startedAt = 10): ReadCard {
   return { key, sessionId, startedAt, kind: 'turn' };
