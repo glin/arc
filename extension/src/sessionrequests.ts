@@ -676,6 +676,7 @@ async function exchangeWindow(
   params: SessionRequest['params'] = {},
   requestId?: string,
   attributed = false,
+  onTimeout?: () => void,
 ): Promise<unknown | null> {
   if (process.platform === 'win32' && (!Number.isSafeInteger(entry.transportPid) || entry.transportPid! <= 0))
     return null;
@@ -700,6 +701,7 @@ async function exchangeWindow(
       : net.createConnection(entry.address);
   return new Promise((resolve, reject) => {
     const challenge = crypto.randomBytes(32).toString('hex');
+    let connected = false;
     let authenticated = false;
     let settled = false;
     const finish = (info: unknown | null) => {
@@ -709,7 +711,10 @@ async function exchangeWindow(
       socket.destroy();
       resolve(info);
     };
-    const deadline = setTimeout(() => finish(null), deadlineMs);
+    const deadline = setTimeout(() => {
+      if (connected) onTimeout?.();
+      finish(null);
+    }, deadlineMs);
     socket.on('error', () => finish(null));
     socket.on('close', () => finish(null));
     receiveLines(socket, { ...SESSION_REQUEST_LIMITS, lineDeadlineMs: deadlineMs }, (text) => {
@@ -767,6 +772,7 @@ async function exchangeWindow(
       }
     });
     socket.on('connect', () => {
+      connected = true;
       socket.write(JSON.stringify({ challenge }) + '\n');
     });
   });
@@ -839,14 +845,18 @@ export async function requestWindow(
     throw new Error('The selected Arc window must reload before it can accept session ID shorthand.');
   const write = method === 'start' || method === 'curate' || method === 'send' || method === 'compact-request';
   const attributed = method === 'send' || method === 'session' || (method === 'start' && guardedStart);
+  let timedOut = false;
   const result = await exchangeWindow(
     entry,
-    method === 'filter' ? FILTER_LIMITS.transportMs : write ? 120_000 : 1_000,
+    method === 'filter' ? FILTER_LIMITS.transportMs : write ? 120_000 : 5_000,
     file,
     method,
     params,
     id,
     attributed,
+    () => {
+      timedOut = true;
+    },
   );
   if (result === null) {
     if (method === 'filter')
@@ -871,7 +881,9 @@ export async function requestWindow(
         window: entry.hostId,
         reason: 'Delivery is unknown. Retry only this request ID in this window.',
       };
-    throw new Error('The selected Arc window is unavailable.');
+    throw new Error(
+      timedOut ? 'The selected Arc window did not answer in time.' : 'The selected Arc window is unavailable.',
+    );
   }
   return result;
 }

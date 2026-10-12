@@ -642,6 +642,118 @@ test('session requests reject paths, extra parameters, and invalid turn counts b
   await assert.rejects(requestWindow('sessions', {}, '', home), /Select one Arc window/);
 });
 
+test.each(['sessions', 'session', 'setups', 'compact-ready', 'compact-status'] as const)(
+  'a busy ready window answers %s reads after the discovery deadline',
+  async (method) => {
+    const { home, channel } = await fixture();
+    await channel.update({ ...state, panelReady: true, panelVisible: true });
+    let answer!: (value: unknown) => void;
+    const handler = () =>
+      new Promise((resolve) => {
+        answer = resolve;
+      });
+    channel.setRequestHandler(handler);
+    channel.setCompactRequestHandler(handler);
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    const params =
+      method === 'session'
+        ? { sessionId: 'known', turns: 1 }
+        : method === 'compact-status'
+          ? { requestId: channel.hostId + ':aaaaaaaa-1111-2222-3333-444444444444' }
+          : method === 'compact-ready'
+            ? {
+                ...compactPayload,
+                window: channel.hostId,
+                requestId: channel.hostId + ':aaaaaaaa-1111-2222-3333-444444444444',
+              }
+            : {};
+    const result = requestWindow(method, params, channel.hostId, home);
+    const completed = result.then(
+      (value) => ({ value }),
+      (error: Error) => ({ error: error.message }),
+    );
+    await vi.waitFor(() => assert.equal(typeof answer, 'function'));
+    await vi.advanceTimersByTimeAsync(2_100);
+    answer({ sessionId: 'known', turns: [{ responseSummary: 'Still available.' }] });
+    assert.deepEqual(await completed, {
+      value: { sessionId: 'known', turns: [{ responseSummary: 'Still available.' }] },
+    });
+  },
+);
+
+test.each(['sessions', 'session'] as const)(
+  'a silent ready window bounds %s reads and names the timeout',
+  async (method) => {
+    const { home, channel, file } = await fixture();
+    await channel.update({ ...state, panelReady: true, panelVisible: true });
+    let admitted = false;
+    channel.setRequestHandler(() => {
+      admitted = true;
+      return new Promise(() => {});
+    });
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    const result = requestWindow(
+      method,
+      method === 'session' ? { sessionId: 'known', turns: 1 } : {},
+      channel.hostId,
+      home,
+    );
+    const rejection = assert.rejects(result, /The selected Arc window did not answer in time\./);
+    await vi.waitFor(() => assert.equal(admitted, true));
+    await vi.advanceTimersByTimeAsync(5_000);
+    await rejection;
+    assert.equal(fs.existsSync(file), true);
+  },
+);
+
+test.runIf(process.platform === 'win32')(
+  'a vanished Windows pipe remains unavailable when a session read expires before connecting',
+  async () => {
+    const { home, entry } = await fixture();
+    const hostId = crypto.randomBytes(12).toString('hex');
+    const address = hostAddress(home, hostId);
+    const file = path.join(home, 'hosts', `${hostId}.json`);
+    fs.writeFileSync(file, JSON.stringify({ ...entry, hostId, address }));
+    const connect = WindowsPipeServer.connect;
+    let socket: Duplex | undefined;
+    let connected = false;
+    vi.spyOn(WindowsPipeServer, 'connect').mockImplementation(async (...args) => {
+      socket = await connect(...args);
+      socket.on('connect', () => {
+        connected = true;
+      });
+      return socket;
+    });
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    const result = requestWindow('session', { sessionId: 'known', turns: 1 }, hostId, home);
+    const completed = result.then(
+      (value) => ({ value }),
+      (error: Error) => ({ error: error.message }),
+    );
+    await vi.waitFor(() => assert.ok(socket));
+    await vi.advanceTimersByTimeAsync(5_000);
+    assert.deepEqual(await completed, { error: 'The selected Arc window is unavailable.' });
+    assert.equal(connected, false);
+    assert.equal(fs.existsSync(file), true);
+  },
+);
+
+test('a disconnected or unreadable window remains unavailable for session reads', async () => {
+  const { home, channel, file } = await fixture();
+  let admitted = false;
+  channel.setRequestHandler(() => {
+    admitted = true;
+    return new Promise(() => {});
+  });
+  const result = requestWindow('session', { sessionId: 'known', turns: 1 }, channel.hostId, home);
+  const rejection = assert.rejects(result, /The selected Arc window is unavailable\./);
+  await vi.waitFor(() => assert.equal(admitted, true));
+  await channel.dispose();
+  await rejection;
+  fs.writeFileSync(file, '{}');
+  await assert.rejects(requestWindow('sessions', {}, channel.hostId, home), /The selected Arc window is unavailable\./);
+});
+
 test('bounded session reads preserve native provider turns and reject stale scope and source revisions', () => {
   const directory = tempDir('session-read-');
   for (const agent of ['claude', 'codex'] as const) {
