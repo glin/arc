@@ -48,6 +48,8 @@ export interface DerivedTitleEntry {
   stats: SessionStatFacts | null;
   // Displays earlier facts while current stats lack positive context usage.
   heldStats?: SessionStatFacts;
+  // The transcript revision whose read found `heldStats`.
+  heldRevision?: Pick<FileRevision, 'mtimeMs' | 'size'>;
   expandedStatsRead?: boolean;
   metadataWindow?: { whole: boolean; windowBytes: number; exhausted?: boolean; exhaustedRule?: number };
   sourceIdentity?: Pick<FileRevision, 'dev' | 'ino'>;
@@ -128,11 +130,12 @@ function newestStatTurn(stats: SessionStatFacts | null) {
 }
 
 function released(entry: DerivedTitleEntry): DerivedTitleEntry {
-  if (entry.heldStats === undefined) {
+  if (entry.heldStats === undefined && entry.heldRevision === undefined) {
     return entry;
   }
   const out = { ...entry };
   delete out.heldStats;
+  delete out.heldRevision;
   return out;
 }
 
@@ -154,8 +157,19 @@ export function carryDerivedTitleFacts(
   if (!previous || next.size < previous.size || replacedMetadataSource(previous, next)) {
     return released(carried);
   }
-  const held = statsHaveContext(previous.stats) ? (previous.stats ?? undefined) : previous.heldStats;
-  return held ? { ...carried, heldStats: held } : released(carried);
+  if (previous.stats && statsHaveContext(previous.stats)) {
+    return {
+      ...carried,
+      heldStats: previous.stats,
+      heldRevision: { mtimeMs: previous.mtimeMs, size: previous.size },
+    };
+  }
+  if (!previous.heldStats) {
+    return released(carried);
+  }
+  const out: DerivedTitleEntry = { ...carried, heldStats: previous.heldStats };
+  delete out.heldRevision;
+  return previous.heldRevision ? { ...out, heldRevision: previous.heldRevision } : out;
 }
 
 // Carries the Claude session name through `resolveSessionName`.
@@ -216,6 +230,33 @@ export function derivedTitleCacheStats(entry: DerivedTitleEntry): SessionStatFac
     return current;
   }
   return held;
+}
+
+// Reports whether the entry's own read supplies its cache facts.
+// Current context, a current failure, or a current compaction count. Held facts and a tail without context do not.
+export function derivedTitleCacheCurrent(entry: DerivedTitleEntry): boolean {
+  const current = entry.stats;
+  if (!current) {
+    return false;
+  }
+  if (statsHaveContext(current) || newestStatTurn(current)?.error) {
+    return true;
+  }
+  if (!entry.heldStats) {
+    return current.compactions.length > 0;
+  }
+  return derivedTitleCacheStats(entry) === current;
+}
+
+// Returns the transcript revision whose read found the entry's cache facts.
+// Current facts rest on the entry's own revision and held facts on `heldRevision`.
+// Returns null when no read supplies current or held facts, or when held facts carry no revision.
+export function derivedTitleCacheRevision(entry: DerivedTitleEntry): Pick<FileRevision, 'mtimeMs' | 'size'> | null {
+  if (derivedTitleCacheCurrent(entry)) {
+    return { mtimeMs: entry.mtimeMs, size: entry.size };
+  }
+  const held = entry.heldStats;
+  return held && derivedTitleCacheStats(entry) === held ? (entry.heldRevision ?? null) : null;
 }
 
 // Caches figures by session id and facts-object identity.
@@ -733,6 +774,11 @@ function titleEntry(value: unknown): value is DerivedTitleEntry {
       (Array.isArray(value.backgroundCommands) && value.backgroundCommands.every(backgroundCommand))) &&
     stats(value.stats) &&
     (value.heldStats === undefined || stats(value.heldStats)) &&
+    (value.heldRevision === undefined ||
+      (value.heldStats !== undefined &&
+        record(value.heldRevision) &&
+        finite(value.heldRevision.mtimeMs) &&
+        nonNegative(value.heldRevision.size))) &&
     (value.expandedStatsRead === undefined || typeof value.expandedStatsRead === 'boolean') &&
     (value.metadataWindow === undefined ||
       (record(value.metadataWindow) &&

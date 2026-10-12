@@ -259,6 +259,7 @@ import {
   sessionRunningSince,
   stableRailOrder,
   syntheticDraftRows,
+  type RailCacheRevision,
   type RevisionedRailCacheMark,
 } from './turnrail';
 import {
@@ -516,6 +517,7 @@ import {
   DerivedTitleEntry,
   agentRunScanUnread,
   carryDerivedTitleFacts,
+  derivedTitleCacheRevision,
   derivedTitleCacheStats,
   derivedTitleStats,
   loadDerivedCache,
@@ -1738,7 +1740,8 @@ export class PanelProvider implements vscode.Disposable {
   private readonly metadataCacheFigures = new SessionFactFigures<HeldStatFacts, ReturnType<typeof railCacheMarkOf>>();
   private parsedRailCaches: Record<string, RevisionedRailCacheMark> = {};
   private metadataRailCaches: Readonly<Record<string, ReturnType<typeof railCacheMarkOf>>> = {};
-  private railSourceRevisions: Record<string, Pick<RevisionedRailCacheMark, 'mtimeMs' | 'size'>> = {};
+  // The revision whose read found each session list cache mark, for sessions with a timeline mark.
+  private metadataRailRevisions: Record<string, RailCacheRevision | null> = {};
   // Immutable rows from the last catalog render. Replace the list to update an identity-cached session-list payload.
   private sessionRows: readonly Readonly<{
     id: string;
@@ -7996,9 +7999,14 @@ export class PanelProvider implements vscode.Disposable {
         (facts) => railCacheMarkOf(facts, markNow),
         (mark) => mark === null || mark.expiresAt > markNow,
       );
-      this.railSourceRevisions = Object.fromEntries(
-        all.map((session) => [session.sessionId, { mtimeMs: session.mtimeMs, size: session.size }]),
-      );
+      // Only a session with a timeline mark compares revisions. The other sessions keep their list mark.
+      const railRevisions: Record<string, RailCacheRevision | null> = {};
+      for (const [sessionId, meta] of metadata) {
+        if (Object.hasOwn(this.parsedRailCaches, sessionId)) {
+          railRevisions[sessionId] = derivedTitleCacheRevision(meta);
+        }
+      }
+      this.metadataRailRevisions = railRevisions;
       const railNow = Date.now();
       const { statuses, openChildren } = this.railStatuses(railNow);
       const railInput = this.railInputFor(counts, statuses, openChildren, railNow);
@@ -8751,7 +8759,7 @@ export class PanelProvider implements vscode.Disposable {
       lifetimeCosts: lifetime.costs,
       lifetimeCacheExpiry: lifetime.cacheExpiryCounts,
       labels: this.saved.labels,
-      caches: railCachesOf(this.parsedRailCaches, this.metadataRailCaches, this.railSourceRevisions),
+      caches: railCachesOf(this.parsedRailCaches, this.metadataRailCaches, this.metadataRailRevisions),
       views: this.saved.views,
       railFilters: this.saved.railFilters,
       now,

@@ -6158,6 +6158,7 @@ test('a Codex launch reaches the host card and the dispatched child heading afte
     provider.startedHere = new Set();
     provider.metadataStatFigures = { read: () => ({}) };
     provider.metadataCacheFigures = { read: () => ({}) };
+    provider.parsedRailCaches = {};
     provider.railStatuses = () => ({ statuses: new Map(), openChildren: new Map() });
     provider.railInputFor = (
       counts: Map<string, unknown>,
@@ -6410,6 +6411,7 @@ test.each([
       provider.startedHere = new Set();
       provider.metadataStatFigures = { read: () => ({}) };
       provider.metadataCacheFigures = { read: () => ({}) };
+      provider.parsedRailCaches = {};
       provider.railStatuses = () => ({ statuses: new Map(), openChildren: new Map() });
       provider.railInputFor = (
         counts: Map<string, unknown>,
@@ -6647,6 +6649,7 @@ function dispatchedRefreshFixture(sessions: any[], worker: ProgressiveWorker, tu
     metaFor: () => ({ starts: 1 }),
     metadataStatFigures: { read: () => ({}) },
     metadataCacheFigures: { read: () => ({}) },
+    parsedRailCaches: {},
     railStatuses: () => ({ statuses: new Map(), openChildren: new Map() }),
     lifetimeFigures: new SessionFiguresCache(),
     hidden: new Set(),
@@ -8736,7 +8739,7 @@ test("the host counts a dispatched session in its parent's cost once and files i
       metadataStatsBySession: {},
       parsedRailCaches: {},
       metadataRailCaches: {},
-      railSourceRevisions: {},
+      metadataRailRevisions: {},
     }) as unknown as Drawn;
     const mark = () => rails.at(-1)?.stats.parent?.[0]?.label ?? '';
     if (queued) {
@@ -17530,7 +17533,7 @@ test('a rail card wears the status that needs attention', () => {
     'lifetimeCosts: lifetime.costs',
     'lifetimeCacheExpiry: lifetime.cacheExpiryCounts',
     'labels: this.saved.labels',
-    'caches: railCachesOf(this.parsedRailCaches, this.metadataRailCaches, this.railSourceRevisions)',
+    'caches: railCachesOf(this.parsedRailCaches, this.metadataRailCaches, this.metadataRailRevisions)',
     'views: this.saved.views',
     'railFilters: this.saved.railFilters',
   ]) {
@@ -26871,7 +26874,7 @@ test.each(['subagents', 'background', 'waiting'] as const)(
         windows: new Map(),
         parsedRailCaches: {},
         metadataRailCaches: {},
-        railSourceRevisions: {},
+        metadataRailRevisions: {},
       });
       const host = provider as unknown as {
         titles: Map<string, unknown>;
@@ -27039,7 +27042,7 @@ test('the host counts a background command whose typed prompt lies before the ta
       windows: new Map(),
       parsedRailCaches: {},
       metadataRailCaches: {},
-      railSourceRevisions: {},
+      metadataRailRevisions: {},
     });
     const host = provider as unknown as {
       sessionOutcomes: unknown;
@@ -28023,6 +28026,7 @@ test.each([false, true])('the first reader child selection includes its parent (
     metaFor: () => ({ starts: [] }),
     metadataStatFigures: { read: () => ({}) },
     metadataCacheFigures: { read: () => ({}) },
+    parsedRailCaches: {},
     railStatuses: () => ({ statuses: new Map(), openChildren: new Map() }),
     railInputFor: (
       _counts: unknown,

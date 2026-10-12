@@ -33,6 +33,7 @@ import {
   CLAUDE_CHILD_REFERENCE_PARSER_VERSION,
   agentRunScanUnread,
   carryDerivedTitleFacts,
+  derivedTitleCacheRevision,
   derivedTitleCacheStats,
   derivedTitleStats,
   loadDerivedCache,
@@ -107,10 +108,19 @@ import {
   remapReaderParents,
   orderSessionCatalog,
   refreshWanted,
+  turnBudget,
 } from './turnview';
-import { sessionParentEdgeSet, sessionParentIndex, sessionParentOf, writeTimeOfVersion } from './turnrail';
+import {
+  groupBySession,
+  railCachesOf,
+  sessionParentEdgeSet,
+  sessionParentIndex,
+  sessionParentOf,
+  unsentBySession,
+  writeTimeOfVersion,
+} from './turnrail';
 import { recordedCostBasis } from './pricing';
-import { readMovedOnlyFor } from './domain/read.ts';
+import { readMovedOnlyFor, turnKey } from './domain/read.ts';
 import {
   agentSpendDependencyKey,
   childSpendVersion,
@@ -128,7 +138,7 @@ import {
   type SessionFile,
   type SessionStatFacts,
 } from './transcript';
-import { transcriptReadCacheKey } from './turnread';
+import { currentRecordsBySession, transcriptReadCacheKey } from './turnread';
 import {
   afterHistoryPage,
   afterHistoryRequest,
@@ -1239,7 +1249,7 @@ function completeDiscoveryHarness(
       threadNames = { stamp: '' }; lastSpendSourceSignature = ''; projectSpendLastOfferAt = 0;
       windows = new Map(); newestBySession = new Map(); collectedAt = 0; drawnOpenChildren = ''; lastSignature = ''; cache = new Map();
       cards = []; seenTurns = new Set(); turnMarks = []; sessionRows = []; hidden = []; pinnedTop = []; saved = { comments: [], labels: {} };
-      metadataStatsBySession = {}; metadataRailCaches = {}; railSourceRevisions = {};
+      metadataStatsBySession = {}; metadataRailCaches = {}; metadataRailRevisions = {}; parsedRailCaches = {};
       metadataStatFigures = new SessionFactFigures(); metadataCacheFigures = new SessionFactFigures();
       lastRailMessageType = null; lastRailMessageSerializedBytes = null; lastRailKey = null;
       railRevision = 0; lastRailRevision = -1; lastRailDay = ''; lastRailCountsJson = '';
@@ -1354,6 +1364,7 @@ function completeDiscoveryHarness(
     'serializedMessageBytes',
     'railCacheMark',
     'cacheStats',
+    'derivedTitleCacheRevision',
     'sessionParentEdgeSet',
     'sessionParentIndex',
     'sessionParentOf',
@@ -1399,6 +1410,7 @@ function completeDiscoveryHarness(
     serializedMessageBytes,
     railCacheMark,
     cacheStats,
+    derivedTitleCacheRevision,
     sessionParentEdgeSet,
     sessionParentIndex,
     sessionParentOf,
@@ -9999,6 +10011,188 @@ test('a rail cache mark holds through incomplete metadata and clears current fai
   } finally {
     clock.mockRestore();
   }
+});
+
+function runningCacheTurn(requestAt: number, lifetime: '1h' | '5m') {
+  return {
+    sessionId: 's',
+    agent: 'claude',
+    startedAt: requestAt,
+    endedAt: requestAt,
+    finished: false,
+    error: false,
+    model: 'claude-opus-5',
+    provider: null,
+    usage: { input: 1, cacheWrite1h: 0, cacheWrite5m: 0, cacheRead: 0, output: 0, thinking: 0 },
+    contextTokens: 300_000,
+    contextWindow: 1_000_000,
+    contextRequest: {
+      at: requestAt,
+      lifetime,
+      inferenceClass: null,
+      serviceTier: null,
+      readBack: false,
+      outputTokens: 40,
+    },
+    childSpendPartial: false,
+  };
+}
+
+// Refreshes a host whose selected session has a timeline window at one revision.
+// Each step supplies a session list read and returns the cache marks the session list carried for the session.
+async function selectedCacheMarksSent(
+  now: number,
+  timeline: { turns: unknown[]; revision: { mtimeMs: number; size: number } },
+  steps: { revision: { mtimeMs: number; size: number }; entry: Record<string, unknown> }[],
+): Promise<unknown[][]> {
+  const sent: unknown[] = [];
+  const marks: unknown[][] = [];
+  const clock = vi.spyOn(Date, 'now').mockReturnValue(now);
+  try {
+    const provider = completeDiscoveryHarness(
+      undefined,
+      false,
+      ['collect', 'readFor', 'railInputFor'],
+      {
+        railCachesOf,
+        turnBudget,
+        turnKey,
+        currentRecordsBySession,
+        groupBySession,
+        unsentBySession,
+        sessionRunningSince: () => new Map(),
+        composerRuntimeBySession: () => new Map(),
+        promptsAcross: () => [],
+        prunedSentPrompts: (sent: unknown) => sent,
+        statsBySession: () => ({}),
+      },
+      railCacheMarkOf,
+    );
+    Object.assign(provider, {
+      turnsByKey: new Map(),
+      promptsBySession: new Map(),
+      sentPrompts: {},
+      repositoryCommits: { apply() {} },
+      trimOlderHistory() {},
+      commitRepositoryTurns: (_session: unknown, turns: unknown[]) => turns,
+      applyCommitRepositoryEvidence() {},
+      observeParsedNames() {},
+      headingTitle: () => '',
+      drawTurnCards: () => [],
+      railRows: () => [],
+      newestTurns: () => new Map(),
+    });
+    provider.useRailPayload((input: { caches: Record<string, unknown> }) => {
+      sent.push(input.caches.s);
+      return { rail: [], labels: [], views: [], railFilters: [], stats: {} };
+    });
+    provider.cache.set('s.jsonl', {
+      read: { turns: timeline.turns, compactions: [], readBytes: 1, turnLimitReached: false, lastReportedModel: null },
+      revision: timeline.revision,
+    });
+    provider.discovery = Promise.resolve(true);
+    provider.showing = 's';
+    for (const { revision, entry } of steps) {
+      const session = { file: 's.jsonl', sessionId: 's', agent: 'claude', activity: now, ...revision };
+      provider.partial = [session];
+      provider.catalog = { sessions: [session] };
+      provider.metaFor = () => ({ ...entry, ...revision });
+      sent.length = 0;
+      await provider.refresh(true);
+      marks.push([...sent]);
+    }
+  } finally {
+    clock.mockRestore();
+  }
+  return marks;
+}
+
+test('a selected session keeps its warm cache mark while its transcript grows past the session list read', async () => {
+  const now = 10_000_000;
+  // The timeline window read revision 1 and holds the request of the running turn a minute ago.
+  const running = runningCacheTurn(now - 60_000, '1h');
+  const firstRevision = { mtimeMs: 10, size: 300_000 };
+  const secondRevision = { mtimeMs: 20, size: 400_000 };
+  const thirdRevision = { mtimeMs: 30, size: 410_000 };
+  const warm = railCacheMarkOf({ turns: [running], compactions: [] }, now);
+  assert.ok(warm);
+  // The session list tail lost the prompt of the running turn. It holds an older request whose five-minute cache expired.
+  const older = { turns: [runningCacheTurn(now - 10 * 60_000, '5m')], compactions: [] } as unknown as SessionStatFacts;
+  assert.equal(railCacheMarkOf(older, now), null);
+  const failed = {
+    turns: [{ ...running, startedAt: now - 30_000, error: true, contextTokens: 0, contextRequest: null }],
+    compactions: [],
+  };
+  const steps = [
+    {
+      name: 'the session list read the same revision',
+      revision: firstRevision,
+      entry: { stats: null, heldStats: older, heldRevision: firstRevision },
+      mark: warm,
+    },
+    {
+      name: 'the transcript grew and the session list holds older facts',
+      revision: secondRevision,
+      entry: { stats: null, heldStats: older, heldRevision: firstRevision },
+      mark: warm,
+    },
+    {
+      name: 'the transcript grew and the session list holds no facts',
+      revision: secondRevision,
+      entry: { stats: null },
+      mark: warm,
+    },
+    {
+      name: 'the session list read a failed turn the timeline window has not reached',
+      revision: thirdRevision,
+      entry: { stats: failed },
+      mark: null,
+    },
+  ];
+  const sent = await selectedCacheMarksSent(now, { turns: [running], revision: firstRevision }, steps);
+  steps.forEach(({ name, mark }, index) => {
+    assert.ok(sent[index].length, `no session list was sent after ${name}`);
+    for (const caches of sent[index]) {
+      assert.deepEqual(caches, mark, `the wrong cache mark went out after ${name}`);
+    }
+  });
+});
+
+test('a selected session keeps a warm session list mark when the facts behind it become held', async () => {
+  const now = 10_000_000;
+  // The timeline window read revision 1 and holds only a request whose five-minute cache expired.
+  const expired = runningCacheTurn(now - 10 * 60_000, '5m');
+  const firstRevision = { mtimeMs: 10, size: 300_000 };
+  const secondRevision = { mtimeMs: 20, size: 400_000 };
+  const thirdRevision = { mtimeMs: 30, size: 410_000 };
+  // The session list read revision 2 and found a warm request the timeline window has not reached.
+  const warmFacts = { turns: [runningCacheTurn(now - 60_000, '1h')], compactions: [] } as unknown as SessionStatFacts;
+  const warm = railCacheMarkOf(warmFacts, now);
+  assert.ok(warm);
+  const pending = {
+    turns: [{ ...warmFacts.turns[0], startedAt: now - 30_000, contextTokens: 0, contextRequest: null }],
+    compactions: [],
+  };
+  const steps = [
+    { name: 'the session list read a warm request', revision: secondRevision, entry: { stats: warmFacts } },
+    {
+      name: 'a new prompt moved the warm request into held facts',
+      revision: thirdRevision,
+      entry: { stats: pending, heldStats: warmFacts, heldRevision: secondRevision },
+    },
+    {
+      name: 'the tail lost the new prompt',
+      revision: thirdRevision,
+      entry: { stats: null, heldStats: warmFacts, heldRevision: secondRevision },
+    },
+  ];
+  const sent = await selectedCacheMarksSent(now, { turns: [expired], revision: firstRevision }, steps);
+  steps.forEach(({ name }, index) => {
+    assert.ok(sent[index].length, `no session list was sent after ${name}`);
+    for (const caches of sent[index]) {
+      assert.deepEqual(caches, warm, `the cache mark went out after ${name}`);
+    }
+  });
 });
 
 test('the lifetime figures a pass built from settled files do not outlive the pass', () => {

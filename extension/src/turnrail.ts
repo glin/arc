@@ -83,12 +83,20 @@ export function railCacheMarkOf(facts: RailCacheFacts | null, now: number = Date
   if (!facts?.turns.length) {
     return null;
   }
-  const newest = facts.turns.reduce((latest, turn) => (turn.startedAt > latest.startedAt ? turn : latest));
-  if (newest.error) {
-    return null;
+  // A new turn has no request before its first response, so the mark keeps the previous request until then.
+  // A failed turn ends the walk, because the cache state after a failure is unknown.
+  let newest: RailCacheFacts['turns'][number] | null = null;
+  for (const turn of [...facts.turns].sort((a, b) => b.startedAt - a.startedAt)) {
+    if (turn.error) {
+      return null;
+    }
+    if (turn.contextRequest && turn.contextTokens) {
+      newest = turn;
+      break;
+    }
   }
-  const request = newest.contextRequest;
-  if (!request || !newest.contextTokens) {
+  const request = newest?.contextRequest;
+  if (!newest || !request) {
     return null;
   }
   if (facts.compactions.some((compaction) => compaction.at > request.at)) {
@@ -123,15 +131,30 @@ export function railCacheMarkOf(facts: RailCacheFacts | null, now: number = Date
   };
 }
 
+// The transcript revision whose read found a session list cache mark.
+export type RailCacheRevision = Pick<RevisionedRailCacheMark, 'mtimeMs' | 'size'>;
+
+// Orders revisions by mtime, with size as the tie-break for equal mtimes.
+// A replaced transcript can be shorter than the one it replaced, so size alone cannot order two reads.
+function newerRailCacheRevision(revision: RailCacheRevision, than: RailCacheRevision): boolean {
+  return revision.mtimeMs > than.mtimeMs || (revision.mtimeMs === than.mtimeMs && revision.size > than.size);
+}
+
+// Merges timeline marks over session list marks.
+// The list mark replaces a timeline mark only when the read that found its facts covered a strictly newer revision.
+// `listed` holds that revision for each session, or null when no read with a known revision found the facts.
+// A transcript grows during a turn, so newer bytes add a later request, a failure, or a compaction.
+// A list read that holds older facts never replaces the timeline mark, even when the file grew after the timeline read.
 export function railCachesOf(
   parsed: Readonly<Record<string, RevisionedRailCacheMark>>,
   metadata: Readonly<Record<string, RailCacheMark | null>>,
-  revisions: Readonly<Record<string, Pick<RevisionedRailCacheMark, 'mtimeMs' | 'size'>>>,
+  listed: Readonly<Record<string, RailCacheRevision | null>>,
 ): Record<string, RailCacheMark | null> {
   const caches = { ...metadata };
   for (const [sessionId, snapshot] of Object.entries(parsed)) {
-    const revision = revisions[sessionId];
-    if (revision?.mtimeMs === snapshot.mtimeMs && revision.size === snapshot.size) {
+    const list = listed[sessionId] ?? null;
+    const listNewer = list !== null && newerRailCacheRevision(list, snapshot);
+    if (!listNewer) {
       caches[sessionId] = snapshot.mark;
     }
   }

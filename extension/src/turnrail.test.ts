@@ -1304,11 +1304,67 @@ test('a rail cache mark follows the newest priced request, then disappears at ex
   );
 });
 
+test('a rail cache mark keeps the previous request until a new turn reports one', () => {
+  const requestAt = 1_000_000;
+  const priced: SessionStatFacts['turns'][number] = {
+    startedAt: requestAt,
+    endedAt: requestAt,
+    finished: true,
+    error: false,
+    model: 'claude-opus-5',
+    provider: null,
+    usage: { input: 1, cacheWrite1h: 0, cacheWrite5m: 0, cacheRead: 0, output: 0, thinking: 0 },
+    contextTokens: 300_000,
+    contextWindow: 1_000_000,
+    contextRequest: {
+      at: requestAt,
+      lifetime: '1h',
+      inferenceClass: null,
+      serviceTier: null,
+      readBack: false,
+      outputTokens: 40,
+    },
+    childSpendPartial: false,
+  };
+  const pending = {
+    ...priced,
+    startedAt: requestAt + 60_000,
+    endedAt: requestAt + 60_000,
+    finished: false,
+    contextTokens: 0,
+    contextRequest: null,
+  };
+  const failed = { ...pending, startedAt: requestAt + 1, endedAt: requestAt + 1, finished: true, error: true };
+  const warm = railCacheMarkOf({ turns: [priced], compactions: [] }, requestAt);
+  assert.ok(warm);
+  assert.deepEqual(
+    railCacheMarkOf({ turns: [pending, priced], compactions: [] }, requestAt),
+    warm,
+    'the warm mark left at the new prompt and returned with its first response',
+  );
+  assert.equal(
+    railCacheMarkOf({ turns: [priced, failed, pending], compactions: [] }, requestAt),
+    null,
+    'a failed turn between the priced request and the new prompt kept the mark',
+  );
+  assert.equal(
+    railCacheMarkOf(
+      {
+        turns: [priced, pending],
+        compactions: [{ at: requestAt + 1, contextAfter: 3, trigger: 'manual', model: null }],
+      },
+      requestAt,
+    ),
+    null,
+    'a compaction after the kept request kept the mark',
+  );
+});
+
 test('a parsed cache mark survives when bounded metadata cannot recover a complete turn', () => {
   const warm = { expiresAt: 8_000_000, nearlyGoneAt: 7_000_000 };
   const revision = { mtimeMs: 10, size: 20 };
   assert.deepEqual(
-    railCachesOf({ selected: { mark: warm, ...revision } }, { selected: null, unparsed: warm }, { selected: revision }),
+    railCachesOf({ selected: { mark: warm, ...revision } }, { selected: null, unparsed: warm }, { selected: null }),
     {
       selected: warm,
       unparsed: warm,
@@ -1318,6 +1374,43 @@ test('a parsed cache mark survives when bounded metadata cannot recover a comple
     railCachesOf({ selected: { mark: null, ...revision } }, { selected: warm }, { selected: revision }),
     { selected: null },
     'parsed compaction evidence did not replace a stale metadata mark',
+  );
+  for (const older of [
+    { mtimeMs: 10, size: 20 },
+    { mtimeMs: 9, size: 20 },
+    { mtimeMs: 10, size: 10 },
+  ]) {
+    assert.deepEqual(
+      railCachesOf({ selected: { mark: warm, ...revision } }, { selected: null }, { selected: older }),
+      { selected: warm },
+      'a metadata read no newer than the parsed read replaced its mark',
+    );
+  }
+  for (const newer of [
+    { mtimeMs: 11, size: 20 },
+    { mtimeMs: 10, size: 30 },
+  ]) {
+    assert.deepEqual(
+      railCachesOf({ selected: { mark: warm, ...revision } }, { selected: null }, { selected: newer }),
+      { selected: null },
+      'facts read at a newer revision did not replace the parsed mark',
+    );
+  }
+});
+
+test('a replaced, shorter transcript orders the two cache reads by write time', () => {
+  const warm = { expiresAt: 8_000_000, nearlyGoneAt: 7_000_000 };
+  const replaced = { mtimeMs: 10, size: 300_000 };
+  const replacement = { mtimeMs: 20, size: 10_000 };
+  assert.deepEqual(
+    railCachesOf({ selected: { mark: null, ...replacement } }, { selected: warm }, { selected: replaced }),
+    { selected: null },
+    'a warm mark read from the replaced transcript hid the failed turn of its replacement',
+  );
+  assert.deepEqual(
+    railCachesOf({ selected: { mark: warm, ...replaced } }, { selected: null }, { selected: replacement }),
+    { selected: null },
+    'the parsed mark of the replaced transcript hid a failure read from its replacement',
   );
 });
 

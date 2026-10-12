@@ -163,6 +163,8 @@ import {
   MAX_CLAUDE_CHILD_REFERENCES_PER_FILE,
   DerivedCacheCheckpointState,
   carryDerivedTitleFacts,
+  derivedTitleCacheCurrent,
+  derivedTitleCacheRevision,
   derivedTitleNeedsRailFacts,
   derivedTitleStats,
   enrichDerivedTitleEntry,
@@ -1451,10 +1453,13 @@ test('a metadata read that finds no facts publishes the last ones, and still ask
   assert.equal(carried.stats, null, 'the empty read is filled in, so nothing asks for the whole file');
   assert.deepEqual(derivedTitleStats(carried), stats);
   assert.deepEqual(railEnrichmentNeeds(carried, { mtimeMs: 11, size: 40 }), { starts: false, metadata: true });
+  assert.deepEqual(carried.heldRevision, { mtimeMs: 10, size: 20 }, 'the held facts lost the revision that read them');
   const again = carryDerivedTitleFacts(carried, { ...title, mtimeMs: 12, size: 60, stats: null });
   assert.deepEqual(derivedTitleStats(again), stats, 'the held facts last one read only');
+  assert.deepEqual(again.heldRevision, { mtimeMs: 10, size: 20 }, 'a later read moved the revision of held facts');
   const found = carryDerivedTitleFacts(again, { ...title, mtimeMs: 13, size: 80 });
   assert.equal(found.heldStats, undefined, 'a read of its own keeps a stand-in beside it');
+  assert.equal(found.heldRevision, undefined, 'a read of its own keeps the revision of released facts');
   assert.deepEqual(derivedTitleStats(found), stats);
   const cold = carryDerivedTitleFacts(undefined, grown);
   assert.equal(derivedTitleStats(cold), null);
@@ -1462,18 +1467,22 @@ test('a metadata read that finds no facts publishes the last ones, and still ask
 
 test('held session facts survive a cache round trip and a malformed one is rejected', () => {
   const file = path.join(folder(), 'cache.json');
-  const held: DerivedTitleEntry = { ...title, stats: null, heldStats: stats };
+  const held: DerivedTitleEntry = { ...title, stats: null, heldStats: stats, heldRevision: { mtimeMs: 9, size: 10 } };
   saveDerivedCache(file, [['/session.jsonl', held]]);
   assert.deepEqual(loadDerivedCache(file).titles.get('/session.jsonl'), held);
-  fs.writeFileSync(
-    file,
-    JSON.stringify({
-      version: VERSION,
-      codexMetas: [],
-      titles: [{ file: '/session.jsonl', entry: { ...held, heldStats: { turns: 'none', compactions: [] } } }],
-    }),
-  );
-  assert.equal(loadDerivedCache(file).titles.size, 0);
+  const withoutHeld: Partial<DerivedTitleEntry> = { ...held };
+  delete withoutHeld.heldStats;
+  for (const entry of [
+    { ...held, heldStats: { turns: 'none', compactions: [] } },
+    { ...held, heldRevision: { mtimeMs: 9 } },
+    withoutHeld,
+  ]) {
+    fs.writeFileSync(
+      file,
+      JSON.stringify({ version: VERSION, codexMetas: [], titles: [{ file: '/session.jsonl', entry }] }),
+    );
+    assert.equal(loadDerivedCache(file).titles.size, 0, JSON.stringify(entry));
+  }
 });
 
 test('a hold ends when a read of the whole file proves there are no facts', () => {
@@ -1519,6 +1528,43 @@ test('a turn that has not reported its context draws the figures the session las
   });
   assert.equal(reported.heldStats, undefined, 'the first usage record of a turn does not end the hold');
   assert.equal(derivedTitleStats(reported)?.turns.length, 2);
+});
+
+test('cache facts rest on the revision of the read that found them', () => {
+  const own = { mtimeMs: 12, size: 50 };
+  const heldAt = { mtimeMs: 11, size: 40 };
+  const entry = { ...title, ...own };
+  const pending: SessionStatFacts = {
+    turns: [{ ...stats.turns[0], startedAt: 30, endedAt: 30, contextTokens: 0, contextRequest: null }],
+    compactions: [],
+  };
+  const failed: SessionStatFacts = { ...pending, turns: [{ ...pending.turns[0], error: true }] };
+  const compaction = { at: 40, contextAfter: 3, trigger: 'manual' as const, model: null };
+  const compacted: SessionStatFacts = {
+    turns: [{ ...pending.turns[0], startedAt: 50, endedAt: 50 }],
+    compactions: [compaction],
+  };
+  const held = { heldStats: stats, heldRevision: heldAt };
+  const cases: [name: string, entry: DerivedTitleEntry, revision: typeof own | null][] = [
+    ['current context', entry, own],
+    ['held facts beside a pending turn', { ...entry, stats: pending, ...held }, heldAt],
+    ['held facts without a revision', { ...entry, stats: pending, heldStats: stats }, null],
+    ['held facts beside a tail with no prompt', { ...entry, stats: null, ...held }, heldAt],
+    ['held facts beside a current failure', { ...entry, stats: failed, ...held }, own],
+    ['held facts beside a later compaction', { ...entry, stats: compacted, ...held }, own],
+    [
+      'held facts beside an earlier compaction',
+      { ...entry, stats: { ...pending, compactions: [{ ...compaction, at: 5 }] }, ...held },
+      heldAt,
+    ],
+    ['a compaction without held facts', { ...entry, stats: compacted }, own],
+    ['a pending turn without held facts', { ...entry, stats: pending }, null],
+    ['no facts', { ...entry, stats: null }, null],
+  ];
+  for (const [name, entry, revision] of cases) {
+    assert.deepEqual(derivedTitleCacheRevision(entry), revision, name);
+    assert.equal(derivedTitleCacheCurrent(entry), revision === own, name);
+  }
 });
 
 test('a stored Claude name survives a later metadata read that saw only a lower-ranked source', () => {
