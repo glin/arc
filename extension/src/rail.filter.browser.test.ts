@@ -2018,3 +2018,136 @@ test('a count press over a query at the typed limit cuts none of the reader word
     await browser.close();
   }
 });
+
+test(
+  'reapplying an unchanged external unread query removes departed retained sessions',
+  { timeout: 60_000 },
+  async (t) => {
+    const browser = await browserOrNone();
+    if (!browser) {
+      t.skip('no installed browser');
+      return;
+    }
+    try {
+      const page = await browser.newPage();
+      const initial = payload();
+      const seed = initial.rail[0];
+      initial.rail = [
+        { ...seed, id: 'one', label: 'First', current: true, unread: true },
+        { ...seed, id: 'two', label: 'Second', current: false, unread: true },
+        { ...seed, id: 'other', label: 'Unrelated', current: false, unread: false },
+      ];
+      initial.showing = 'one';
+      initial.views = [];
+      const query = 'is:unread -is:archived -is:agentrun';
+      await openPage(page, initial, FIXTURE_CLOCK, {
+        railFilter: query,
+        railFilterId: 'all',
+        railFolds: { railtoday: true },
+        showing: 'one',
+      });
+      assert.deepEqual(await page.locator('.railcard .railname').allTextContents(), ['First', 'Second']);
+      await postToPage(
+        page,
+        railMessage(
+          initial,
+          initial.rail.map((row) => ({ ...row, unread: row.id === 'two' })),
+        ),
+      );
+      assert.deepEqual(await page.locator('.railcard .railname').allTextContents(), ['First', 'Second']);
+      await postToPage(page, {
+        type: 'applySessionFilter',
+        request: 'same-unread',
+        query,
+        deadline: FIXTURE_CLOCK + 30_000,
+      });
+      await page.waitForFunction(
+        "window.__posted.some(message => message.type === 'sessionFilterApplied' && message.request === 'same-unread')",
+      );
+      assert.deepEqual(await page.locator('.railcard .railname').allTextContents(), ['Second']);
+      assert.equal(
+        await page.evaluate("window.__posted.find(message => message.request === 'same-unread').state.showing"),
+        'one',
+      );
+    } finally {
+      await browser.close();
+    }
+  },
+);
+
+test(
+  'external session filtering replaces retention, preserves selection, and acknowledges saved state',
+  { timeout: 60_000 },
+  async (t) => {
+    const browser = await browserOrNone();
+    if (!browser) {
+      t.skip('no installed browser');
+      return;
+    }
+    try {
+      const page = await browser.newPage();
+      const initial = payload();
+      const seed = initial.rail[0];
+      initial.rail = [
+        { ...seed, id: 'one', agent: 'Claude', label: 'First', current: true, unread: true },
+        { ...seed, id: 'two', agent: 'Codex', label: 'Second', current: false, unread: false },
+        { ...seed, id: 'other', agent: 'Claude', label: 'Unrelated', current: false, unread: false },
+      ];
+      initial.showing = 'one';
+      initial.views = [];
+      const saved = {
+        railFilter: 'is:unread -is:archived -is:agentrun',
+        railFilterId: 'all',
+        railFolds: { railtoday: true },
+        showing: 'one',
+      };
+      await openPage(page, initial, FIXTURE_CLOCK, saved);
+      await postToPage(
+        page,
+        railMessage(
+          initial,
+          initial.rail.map((row) => ({ ...row, unread: false })),
+        ),
+      );
+      const query = 'session:claude:one OR session:codex:two';
+      await postToPage(page, {
+        type: 'applySessionFilter',
+        request: 'external-one',
+        query,
+        deadline: FIXTURE_CLOCK + 30_000,
+      });
+      await page.waitForFunction(
+        "window.__posted.some(message => message.type === 'sessionFilterApplied' && message.request === 'external-one')",
+      );
+      assert.deepEqual(await page.locator('.railcard .railname').allTextContents(), ['First', 'Second']);
+      const ack = (await page.evaluate(
+        "window.__posted.find(message => message.type === 'sessionFilterApplied' && message.request === 'external-one')",
+      )) as any;
+      assert.equal(ack.state.railFilter, query);
+      assert.equal(ack.state.showing, 'one');
+      await postToPage(page, {
+        type: 'applySessionFilter',
+        request: 'expired',
+        query: 'session:other',
+        deadline: FIXTURE_CLOCK - 1,
+      });
+      assert.equal(await page.evaluate("window.__posted.some(message => message.request === 'expired')"), false);
+      await page.close();
+      const restored = await browser.newPage();
+      await openPage(restored, initial, FIXTURE_CLOCK, ack.state);
+      assert.deepEqual(await restored.locator('.railcard .railname').allTextContents(), ['First', 'Second']);
+      await postToPage(restored, {
+        type: 'applySessionFilter',
+        request: 'clear',
+        query: '',
+        deadline: FIXTURE_CLOCK + 30_000,
+      });
+      await restored.waitForFunction(
+        "window.__posted.some(message => message.type === 'sessionFilterApplied' && message.request === 'clear')",
+      );
+      assert.equal(await restored.locator('.railcard').count(), 3);
+    } finally {
+      await browser.close();
+    }
+  },
+);

@@ -2,7 +2,7 @@
 
 The Arc CLI is experimental. npm publication is deferred.
 
-Show context, prompt-cache status, and the next turn's starting price in Claude Code. Read estimated costs for saved Claude Code and Codex sessions. [Session commands](../docs/cli.md#sessions) list a running Arc window's repository sessions and read bounded turns.
+Show context, prompt-cache status, and the next turn's starting price in Claude Code. Read estimated costs for saved Claude Code and Codex sessions. [Session commands](../docs/cli.md#sessions) filter and list a running Arc window's repository sessions and read bounded turns.
 
 ## Install
 
@@ -39,6 +39,16 @@ ln -s "$arc_skill" ~/.agents/skills/arc-sessions
 A source checkout supplies the same skill under `cli/skills/arc-sessions`. A project-local package supplies it under `node_modules/@glin/arc/skills/arc-sessions`. Use that absolute directory as the link target. Existing links require a separate removal before replacement. Restart the agent session to load the skill.
 
 The [CLI guide](https://github.com/glin/arc/blob/main/docs/cli.md#session-management) owns session command arguments and outcomes.
+
+Filter a selected window with the existing session list query:
+
+```sh
+arc sessions --query 'session:claude:one OR session:codex:two' --json
+arc filter 'session:claude:one OR session:codex:two' --json
+arc filter --clear --json
+```
+
+[Session query syntax](../docs/rail-and-navigation.md#session-list) defines full IDs and alternative groups. [Panel filter](../docs/cli.md#panel-filter) defines completion outcomes and persistence.
 
 ## Status-line setup
 

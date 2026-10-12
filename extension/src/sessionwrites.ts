@@ -16,6 +16,7 @@ export interface SessionWriteParams {
   dryRun?: boolean;
   force?: boolean;
   // A sessions listing page. The host signs the cursor, and the CLI passes it through unread.
+  query?: string;
   cursor?: string;
   limit?: number;
   // A guarded follow-up names the observation that its prompt continues.

@@ -4735,7 +4735,7 @@ test('the Composer context action hides and restores an unsent draft', { timeout
   try {
     const page = await browser.newPage();
     await page.setViewportSize({ width: 720, height: 900 });
-    await page.setContent(pageHtml());
+    await page.setContent(recoveryPage({}));
     await post(page, renderPayload());
     const prompt = page.locator('#prompt');
     const contextAt = async (selector: string) =>
@@ -4784,13 +4784,14 @@ test('the Composer context action hides and restores an unsent draft', { timeout
       },
       'hiding the Composer removed its draft or its only restoration target',
     );
+    await page.evaluate(`window.__posted = []`);
     await post(page, { type: 'forgetState', since: 0 });
     const reset = (await page.evaluate(`(() => ({
       composer: document.getElementById('composer')?.classList.contains('composer-hidden'),
       prompt: document.getElementById('prompt')?.checkVisibility(),
       sash: document.getElementById('footsash')?.checkVisibility(),
       context: document.getElementById('footsash')?.dataset.vscodeContext,
-      saved: window.__posted.filter((message) => message.type === 'saveState').at(-1)?.state?.composerHidden,
+      saved: window.__saved.composerHidden,
     }))()`)) as { composer: boolean; prompt: boolean; sash: boolean; context: string; saved: boolean };
     assert.deepEqual(
       reset,
@@ -4802,6 +4803,11 @@ test('the Composer context action hides and restores an unsent draft', { timeout
         saved: false,
       },
       'resetting panel state left the Composer hidden or saved its stale hidden state',
+    );
+    assert.equal(
+      await page.evaluate(`window.__posted.filter((message) => message.type === 'saveState').length`),
+      0,
+      'reset echoed cleared preferences to the host',
     );
     await post(page, { type: 'setComposerHidden', hidden: false });
     assert.equal(await prompt.inputValue(), 'keep this draft', 'restoring the Composer lost the unsent draft');
@@ -5769,7 +5775,7 @@ test('forgetting state restores and saves the default composer floor', { timeout
   try {
     const page = await browser.newPage();
     await page.setViewportSize({ width: 720, height: 900 });
-    await page.setContent(pageHtml());
+    await page.setContent(recoveryPage({}));
     await post(page, renderPayload());
     const sash = page.locator('#footsash');
     const prompt = page.locator('#prompt');
@@ -5789,14 +5795,17 @@ test('forgetting state restores and saves the default composer floor', { timeout
     await page.evaluate(`window.__posted = []`);
     await post(page, { type: 'forgetState', since: 17 });
     const forgottenHeight = await prompt.evaluate((node) => node.getBoundingClientRect().height);
-    const savedFloor = (await page.evaluate(
-      `window.__posted.filter((message) => message.type === 'saveState').at(-1)?.state?.promptFloor`,
-    )) as number;
+    const savedFloor = (await page.evaluate(`window.__saved.promptFloor`)) as number;
     assert.ok(
       Math.abs(forgottenHeight - starting.height) <= 2,
       'forgetting state left the raised Composer floor visible',
     );
     assert.ok(Math.abs(savedFloor - starting.floor) <= 0.1, 'forgetting state saved the raised Composer floor again');
+    assert.equal(
+      await page.evaluate(`window.__posted.filter((message) => message.type === 'saveState').length`),
+      0,
+      'reset echoed cleared preferences to the host',
+    );
   } finally {
     await browser.close();
   }

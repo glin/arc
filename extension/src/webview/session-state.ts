@@ -53,7 +53,7 @@ export interface PanelSessionState {
   readonly initialComposerHidden: boolean;
   readonly initialComments: TurnComment[];
   showing(): string;
-  save(): void;
+  save(filterRequest?: string): void;
   hide(session: string): void;
   unarchive(session: string): void;
   setPinned(session: string, pinned: boolean, openPinned?: boolean): void;
@@ -131,7 +131,7 @@ export function createPanelSessionState(options: SessionStateOptions): PanelSess
     initialComposerHidden: initialRail.composerHidden,
     initialComments,
     showing: () => showing,
-    save() {
+    save(filterRequest) {
       const rail = options.rail() ?? {
         filter: initialRail.filter,
         filterId: initialRail.filterId,
@@ -146,29 +146,32 @@ export function createPanelSessionState(options: SessionStateOptions): PanelSess
         density: initialRail.density,
       };
       const reading = options.reading() ?? { read: initialRead, readTo: initialReadTo, since: initialSince };
-      options.savedState.save({
-        open,
-        showing,
-        railFilter: rail.filter,
-        railFilterId: rail.filterId,
-        railSort: rail.sort,
-        railDefaultSort: rail.defaultSort,
-        railDensity: rail.density,
-        railGroupBy: rail.groupBy,
-        railShowArchived: rail.showArchived,
-        railShowRuns: rail.showRuns,
-        railQuickFilters: rail.headLenses,
-        railWidth: rail.width,
-        composerHidden: options.composerHidden(),
-        promptFloor: options.promptFloor() ?? initialPromptFloor,
-        railFolds: rail.folds,
-        hidden,
-        pinnedTop,
-        read: reading.read,
-        readTo: reading.readTo,
-        since: reading.since,
-        comments: [...(options.comments() ?? initialComments)],
-      });
+      options.savedState.save(
+        {
+          open,
+          showing,
+          railFilter: rail.filter,
+          railFilterId: rail.filterId,
+          railSort: rail.sort,
+          railDefaultSort: rail.defaultSort,
+          railDensity: rail.density,
+          railGroupBy: rail.groupBy,
+          railShowArchived: rail.showArchived,
+          railShowRuns: rail.showRuns,
+          railQuickFilters: rail.headLenses,
+          railWidth: rail.width,
+          composerHidden: options.composerHidden(),
+          promptFloor: options.promptFloor() ?? initialPromptFloor,
+          railFolds: rail.folds,
+          hidden,
+          pinnedTop,
+          read: reading.read,
+          readTo: reading.readTo,
+          since: reading.since,
+          comments: [...(options.comments() ?? initialComments)],
+        },
+        filterRequest,
+      );
     },
     hide(session) {
       if (options.readOnly) return;

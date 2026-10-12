@@ -427,3 +427,9 @@ test('the funnel names each lens, and a typed synonym holds its lens', () => {
   assert.equal(railQueryHeldLens(''), null);
   assert.equal(railQueryHeldLens('is:input is:unread -is:archived -is:agentrun'), null);
 });
+
+test('label and lens edits preserve complete session alternative chains', () => {
+  const chain = 'session:claude:one OR session:codex:two';
+  assert.equal(toggleRailFilterTerm(`${chain} label:arc`, 'labels', 'arc'), chain);
+  assert.equal(toggleRailFilterTerm(chain, 'labels', 'arc'), `${chain} label:arc`);
+});

@@ -1,3 +1,5 @@
+import { SessionFilterRequests, FILTER_LIMITS, type FilterOperation } from './sessionfilter';
+import { listingQueryError, listingTermHolds, parseSessionQuery, sessionQueryError } from './domain/session-query';
 import { MEASUREMENT_ENVIRONMENT, STORED_STATE_KEYS } from './identity';
 import { savedResponseRates, retainResponseRate, responseRateForTurn } from './outputrate';
 import { ContextDemand, unavailableContext, validContextDetail, type ContextIdentity } from './domain/context-detail';
@@ -1871,9 +1873,31 @@ export class PanelProvider implements vscode.Disposable {
   private saved: PanelState = normalizePanelState(null);
   private windowStateHandler: ((state: WindowState) => void) | null = null;
   private sessionWriteQueue: Promise<unknown> = Promise.resolve();
+  private filterRequests?: SessionFilterRequests;
+  private filterReady?: Set<{
+    webview: vscode.Webview | undefined;
+    operation: FilterOperation;
+    resolve(): void;
+    reject(error: Error): void;
+  }>;
+  private filterApplications?: Map<
+    string,
+    {
+      host: PanelHost;
+      saving: boolean;
+      query: string;
+      operation: FilterOperation;
+      resolve(): void;
+      reject(error: Error): void;
+    }
+  >;
+  private preferenceSaveQueue?: Promise<void>;
+  private hostPinnedFoldRevision = 0;
+  private preferenceResetRevision = 0;
   private membershipWrites?: Map<string, { persisted: Promise<void> }>;
 
   public async handleSessionRequest(request: import('./sessionrequests').SessionRequest): Promise<unknown> {
+    if (request.method === 'filter') return this.applySessionFilter(request);
     if (!['start', 'setups', 'curate'].includes(request.method)) return this.readSessionRequest(request);
     if (request.method === 'curate') {
       const run = () => this.curateSessionRequest(request);
@@ -2080,6 +2104,108 @@ export class PanelProvider implements vscode.Disposable {
     };
   }
 
+  private applySessionFilter(request: import('./sessionrequests').SessionRequest): Promise<unknown> {
+    const query = request.params.query!;
+    const error = sessionQueryError(query);
+    if (error) throw new Error(error);
+    const context = request.filterContext ?? {
+      deadline: Date.now() + FILTER_LIMITS.operationMs,
+      signal: new AbortController().signal,
+    };
+    this.filterRequests ??= new SessionFilterRequests();
+    return this.filterRequests.run(
+      context,
+      async (operation) => {
+        if (this.disposed || !operation.current()) throw new Error('The filter was not applied.');
+        this.openInEditor();
+        const ready = () =>
+          this.hosts.find((host) => host.webview === this.editorPanel?.webview && this.readyHosts.has(host));
+        if (ready()) return;
+        await new Promise<void>((resolve, reject) => {
+          this.filterReady ??= new Set();
+          const waiter = { webview: this.editorPanel?.webview, operation, resolve, reject };
+          this.filterReady.add(waiter);
+          const cancelled = () => {
+            this.filterReady?.delete(waiter);
+            reject(new Error('The filter was not applied.'));
+          };
+          const timer = setTimeout(
+            cancelled,
+            Math.max(0, Math.min(FILTER_LIMITS.readyMs, context.deadline - Date.now())),
+          );
+          context.signal.addEventListener('abort', cancelled, { once: true });
+          waiter.resolve = () => {
+            clearTimeout(timer);
+            context.signal.removeEventListener('abort', cancelled);
+            this.filterReady?.delete(waiter);
+            resolve();
+          };
+          waiter.reject = (error) => {
+            clearTimeout(timer);
+            context.signal.removeEventListener('abort', cancelled);
+            this.filterReady?.delete(waiter);
+            reject(error);
+          };
+        });
+      },
+      (operation) => {
+        const host = this.hosts.find((host) => host.webview === this.editorPanel?.webview && this.readyHosts.has(host));
+        if (!host || this.disposed || !operation.current()) throw new Error('The filter was not applied.');
+        return new Promise<void>((resolve, reject) => {
+          this.filterApplications ??= new Map();
+          this.filterApplications.set(request.id, { host, saving: false, query, operation, resolve, reject });
+          const remove = () => {
+            const held = this.filterApplications?.get(request.id);
+            if (held && held.operation === operation && !held.saving) {
+              this.filterApplications!.delete(request.id);
+              reject(new Error('The filter outcome is unknown.'));
+            }
+          };
+          const timer = setTimeout(remove, Math.max(0, context.deadline - Date.now()));
+          const entry = this.filterApplications.get(request.id)!;
+          entry.resolve = () => {
+            clearTimeout(timer);
+            resolve();
+          };
+          entry.reject = (error) => {
+            clearTimeout(timer);
+            reject(error);
+          };
+          void Promise.resolve(
+            this.sendToHost(host, {
+              type: 'applySessionFilter',
+              request: request.id,
+              query,
+              deadline: context.deadline,
+            }),
+          ).then((posted) => {
+            if (!posted) remove();
+          }, remove);
+        });
+      },
+    );
+  }
+
+  private receiveSessionFilter(
+    msg: Extract<import('./webview/protocol').PanelToHost, { type: 'sessionFilterApplied' }>,
+    host: PanelHost,
+  ): void {
+    const pending = this.filterApplications?.get(msg.request);
+    if (!pending || pending.host !== host || pending.saving) return;
+    const state = msg.state as { railFilter?: unknown } | null;
+    if (!state || state.railFilter !== pending.query || !pending.operation.panelApplied()) {
+      this.filterApplications!.delete(msg.request);
+      pending.reject(new Error('The filter outcome is unknown.'));
+      return;
+    }
+    pending.saving = true;
+    void this.saveState(msg.state, pending.operation.current)
+      .then(pending.resolve, () => pending.reject(new Error('The filter was not saved.')))
+      .finally(() => {
+        if (this.filterApplications?.get(msg.request) === pending) this.filterApplications.delete(msg.request);
+      });
+  }
+
   public readSessionRequest(request: import('./sessionrequests').SessionRequest): unknown {
     const scopeKey = (): string | null => this.readScopeKey();
     const before = scopeKey();
@@ -2099,13 +2225,18 @@ export class PanelProvider implements vscode.Disposable {
     }
     // Only the internal archive read sets sessionId. It filters before paging.
     const target = request.params.sessionId;
-    const sources = !index
+    let sources = !index
       ? []
       : target === undefined
         ? index.sources
         : sessionPageSources(index.scoped.filter((source) => source.sessionId === target));
     const secret = (this.sessionCursorSecret ??= crypto.randomBytes(32));
-    const scopeDigest = sessionScopeDigest(before);
+    const query = request.params.query;
+    if (query !== undefined) {
+      const error = listingQueryError(query);
+      if (error) throw new Error(error);
+    }
+    const scopeDigest = sessionScopeDigest(query ? JSON.stringify([before, query]) : before);
     let cursor: SessionCursorBody | null = null;
     if (request.params.cursor !== undefined) {
       const check = readSessionCursor(request.params.cursor, secret, scopeDigest);
@@ -2207,6 +2338,34 @@ export class PanelProvider implements vscode.Disposable {
       };
       return { row, current: sourceCurrent };
     };
+    let unavailableMetadata = false;
+    if (query) {
+      const terms = parseSessionQuery(query).terms;
+      const agentRunTerms = terms.filter((term) => term.field === 'status' && term.needle === 'agentrun');
+      const identityTerms = terms.filter((term) => term.field !== 'status' || term.needle !== 'agentrun');
+      sources = sources.filter((entry) => {
+        const source = entry.session;
+        const metadata = {
+          sessionId: source.sessionId,
+          agent: source.agent,
+          title: this.sessionLabel(source).fullLabel,
+          labels: labelsOf(this.saved.labels, source.sessionId),
+          archived: this.hidden.has(source.sessionId),
+          agentRun: null as boolean | null,
+        };
+        if (!identityTerms.every((term) => listingTermHolds(term, metadata))) return false;
+        if (!agentRunTerms.length) return true;
+        const meta = this.titles.get(source.file);
+        const current =
+          fresh &&
+          meta !== undefined &&
+          sameSessionRevision(meta, source) &&
+          sameProgressiveRevision(this.revisionOf(source), source);
+        metadata.agentRun = current ? this.agentRunFor(source, edges) : source.childTranscript === true ? true : null;
+        if (metadata.agentRun === null) unavailableMetadata = true;
+        return agentRunTerms.every((term) => listingTermHolds(term, metadata));
+      });
+    }
     return sessionListingPage({
       sources,
       cursor,
@@ -2215,11 +2374,13 @@ export class PanelProvider implements vscode.Disposable {
       catalog:
         !accepted || !index
           ? 'unavailable'
-          : !this.dispatchDiscoveryPending &&
-              index.scoped.length === accepted.length &&
-              this.sessionReadDiscoveryRevision === index.discovery
-            ? 'complete'
-            : 'incomplete',
+          : unavailableMetadata
+            ? 'incomplete'
+            : !this.dispatchDiscoveryPending &&
+                index.scoped.length === accepted.length &&
+                this.sessionReadDiscoveryRevision === index.discovery
+              ? 'complete'
+              : 'incomplete',
       fresh,
       scope: scopeDigest,
       secret,
@@ -2365,6 +2526,16 @@ export class PanelProvider implements vscode.Disposable {
 
   dispose(): void {
     if (this.disposed) return;
+    this.filterRequests?.dispose();
+    for (const waiter of this.filterReady ?? [])
+      waiter.reject(new Error('The panel closed before the filter was applied.'));
+    for (const [request, pending] of this.filterApplications ?? []) {
+      pending.operation.cancel();
+      if (!pending.saving) {
+        this.filterApplications!.delete(request);
+        pending.reject(new Error('The panel closed before the filter was confirmed.'));
+      }
+    }
     const shutdown = this.health?.begin('shutdown');
     this.sessionRunWitnesses?.clear();
     const finish = () => {
@@ -3104,6 +3275,19 @@ export class PanelProvider implements vscode.Disposable {
         this.health?.event('disposed', this.healthPanel(host).id);
         this.healthPanels?.delete(host);
         this.readyHosts.delete(host);
+        for (const waiter of this.filterReady ?? []) {
+          if (waiter.webview === host.webview)
+            waiter.reject(new Error('The panel closed before the filter was applied.'));
+        }
+        for (const [request, pending] of this.filterApplications ?? []) {
+          if (pending.host === host) {
+            pending.operation.cancel();
+            if (!pending.saving) {
+              this.filterApplications!.delete(request);
+              pending.reject(new Error('The panel closed before the filter was confirmed.'));
+            }
+          }
+        }
         this.publishWindowState();
         this.panelVisibility?.release(host);
         this.performanceCounters.releasePanel(host);
@@ -3164,6 +3348,13 @@ export class PanelProvider implements vscode.Disposable {
     if (this.readyHosts.has(host)) return;
     this.readyHosts.add(host);
     void this.sendToHost(host, this.panelVisibility.current(host, host.visible()));
+    if (host.webview === this.editorPanel?.webview) {
+      for (const waiter of this.filterReady ?? []) {
+        if (waiter.operation.current()) waiter.resolve();
+        else waiter.reject(new Error('The filter was not applied.'));
+      }
+    }
+
     if (this.pendingAdds?.length && host.visible()) {
       this.flushPendingAdds(host);
     }
@@ -6921,6 +7112,7 @@ export class PanelProvider implements vscode.Disposable {
     this.saved.pinnedTop = [...this.pinnedTop];
     if (pinnedFoldChanged) {
       this.saved.railFolds = { ...this.saved.railFolds, [RAIL_FOLDS.top]: true };
+      this.hostPinnedFoldRevision = (this.hostPinnedFoldRevision ?? 0) + 1;
     }
     const persisted = Promise.resolve(this.memento?.update(STATE_KEY, this.saved));
     if (hiddenChanged) {
@@ -7093,6 +7285,18 @@ export class PanelProvider implements vscode.Disposable {
     const readerParents = this.saved.readerParents;
     const submittedPrompts = this.saved.submittedPrompts;
     const agentRuns = this.saved.agentRuns;
+    this.preferenceResetRevision = (this.preferenceResetRevision ?? 0) + 1;
+    for (const waiter of this.filterReady ?? []) {
+      waiter.operation.cancel();
+      waiter.reject(new Error('The filter was not applied.'));
+    }
+    for (const [request, pending] of this.filterApplications ?? []) {
+      pending.operation.cancel();
+      if (!pending.saving) {
+        this.filterApplications!.delete(request);
+        pending.reject(new Error('The filter outcome is unknown.'));
+      }
+    }
     this.saved = normalizePanelState(null);
     this.saved.readerParents = readerParents;
     this.saved.submittedPrompts = submittedPrompts;
@@ -7120,18 +7324,23 @@ export class PanelProvider implements vscode.Disposable {
     this.hostPreviousSessions.clear();
     // Clear navigation history with the selection.
     this.trail = emptyTrail();
-    await this.memento?.update(STATE_KEY, this.saved);
-    // Invalidate the previous session-list payload before reset state is posted.
-    this.lastRailMessageType = null;
-    this.lastRailMessageSerializedBytes = null;
-    this.lastRailAdoptionsJson = '';
-    this.lastRailKey = null;
-    this.railPendingAnswers = null;
-    this.lastRailRevision = -1;
-    this.lastRailDay = '';
-    this.lastRailCountsJson = '';
-    await this.post({ type: 'forgetState', since: this.saved.since });
-    void this.refresh(true);
+    const resetState = structuredClone(this.saved);
+    const resetSaved = this.saveState(resetState);
+    this.filterRequests ??= new SessionFilterRequests();
+    await this.filterRequests.reset(async () => {
+      await resetSaved;
+      // Invalidate the previous session-list payload before reset state is posted.
+      this.lastRailMessageType = null;
+      this.lastRailMessageSerializedBytes = null;
+      this.lastRailAdoptionsJson = '';
+      this.lastRailKey = null;
+      this.railPendingAnswers = null;
+      this.lastRailRevision = -1;
+      this.lastRailDay = '';
+      this.lastRailCountsJson = '';
+      await this.post({ type: 'forgetState', since: this.saved.since });
+      void this.refresh(true);
+    });
   }
 
   // Walk the panel's navigation trail first. At its boundary, delegate to the editor's navigation command.
@@ -12209,9 +12418,8 @@ export class PanelProvider implements vscode.Disposable {
         exportSession: (msg) => {
           return this.exportSession(msg.session);
         },
-        saveState: (msg) => {
-          this.saveState(msg.state);
-        },
+        sessionFilterApplied: (msg) => this.receiveSessionFilter(msg, host),
+        saveState: (msg) => this.saveState(msg.state).catch(() => {}),
         // Classify typed queries through `isSearch` before reading session content.
         search: (msg) => {
           const query = msg.text;
@@ -12369,7 +12577,7 @@ export class PanelProvider implements vscode.Disposable {
   }
 
   // Persist normalized panel preferences beyond the lifetime of an individual webview.
-  private saveState(state: unknown): void {
+  private saveState(state: unknown, canPersist: () => boolean = () => true): Promise<void> {
     const readBefore = this.readPrint();
     const stateBefore: ReadState = { read: this.saved.read, readTo: this.saved.readTo };
     // Preserve provider-owned draft text. Browser preference saves do not carry current typing.
@@ -12418,10 +12626,60 @@ export class PanelProvider implements vscode.Disposable {
     this.saved.showing = showing ?? '';
     this.saved.assets = assets;
     this.saved.queues = queues;
-    void this.memento?.update(STATE_KEY, this.saved);
+    const snapshot = structuredClone(this.saved);
+    const pinnedFoldRevision = this.hostPinnedFoldRevision ?? 0;
+    const resetRevision = this.preferenceResetRevision ?? 0;
+    const persist = () => {
+      if (!this.memento) throw new Error('Panel preferences are unavailable.');
+      // Host actions can replace these fields while an earlier preference save waits for storage.
+      // Keep each browser query snapshot ordered while carrying the current host-owned state.
+      const current = this.saved;
+      // A reset replaces every older preference snapshot. Later browser saves keep their own choices.
+      const preferences = resetRevision === (this.preferenceResetRevision ?? 0) ? snapshot : current;
+      const railFolds =
+        pinnedFoldRevision === (this.hostPinnedFoldRevision ?? 0)
+          ? preferences.railFolds
+          : { ...preferences.railFolds, [RAIL_FOLDS.top]: current.railFolds[RAIL_FOLDS.top] };
+      const saved = structuredClone({
+        ...preferences,
+        railFolds,
+        hidden: current.hidden,
+        pinnedTop: current.pinnedTop,
+        comments: current.comments,
+        since: current.since,
+        drafts: current.drafts,
+        sentPrompts: current.sentPrompts,
+        submittedPrompts: current.submittedPrompts,
+        draftCommentIds: current.draftCommentIds,
+        started: current.started,
+        agentRuns: current.agentRuns,
+        labels: current.labels,
+        readerParents: current.readerParents,
+        views: current.views,
+        railFilters: current.railFilters,
+        showing: current.showing,
+        assets: current.assets,
+        queues: current.queues,
+      });
+      if (!canPersist()) throw new Error('The filter outcome is unknown.');
+      return Promise.resolve(this.memento.update(STATE_KEY, saved));
+    };
+    const initialSave = () => {
+      try {
+        return persist();
+      } catch (error) {
+        return Promise.reject(error);
+      }
+    };
+    const persisted = this.preferenceSaveQueue ? this.preferenceSaveQueue.then(persist, persist) : initialSave();
+    const barrier = persisted.catch(() => {});
+    this.preferenceSaveQueue = barrier;
+    void barrier.then(() => {
+      if (this.preferenceSaveQueue === barrier) this.preferenceSaveQueue = undefined;
+    });
     // Update unread counts after read-state saves. Defer selection-only changes to the pending render, with a fallback when it settles.
     if (readBefore === this.readPrint()) {
-      return;
+      return persisted;
     }
     const counts = this.unreadCounts();
     const countsChanged = JSON.stringify([...counts]) !== this.lastRailCountsJson;
@@ -12430,9 +12688,10 @@ export class PanelProvider implements vscode.Disposable {
         this.railRevision++;
       }
       this.railSeedSkipped = true;
-      return;
+      return persisted;
     }
     this.postRail(countsChanged, counts);
+    return persisted;
   }
 
   private shell(webview: vscode.Webview): string {

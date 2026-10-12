@@ -16,7 +16,8 @@ function help(): string {
     '       arc windows [--json]',
     '       arc compact request --self --after-turn --request-id WINDOW:UUID --window WINDOW --json',
     '       arc compact status --request-id WINDOW:UUID --window WINDOW --json',
-    '       arc sessions [--window ID] [--limit 1-128] [--cursor CURSOR] [--json]',
+    '       arc sessions [--window ID] [--query QUERY] [--limit 1-128] [--cursor CURSOR] [--json]',
+    '       arc filter QUERY | arc filter --clear [--window ID] [--json]',
     '       arc session ID [--turns 1-20] [--window ID] [--json]',
     '       arc setups [--window ID] [--json]',
     '       arc start --prompt-file PATH (--setup KEY | --provider claude|codex [--model MODEL] [--effort EFFORT] [--permissions MODE]) (--agent-run | --untagged) [--name NAME] [--label NAME] [--pinned] [--arc-dispatch] [--window ID] [--request-id ID]',
@@ -80,7 +81,7 @@ async function run(): Promise<void> {
     process.stdout.write(`${await runCompact(args.slice(1))}\n`);
     return;
   }
-  if (args[0] === 'sessions' || args[0] === 'session') {
+  if (args[0] === 'sessions' || args[0] === 'session' || args[0] === 'filter') {
     process.stdout.write(`${await runSessions(args[0], args.slice(1))}\n`);
     return;
   }

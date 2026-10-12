@@ -5,6 +5,7 @@ import {
   IS_VALUES,
   LABEL_PREFIX,
   parseSessionQuery,
+  sessionQueryError,
   quoteQueryValue,
   type SearchWhere,
   WHERE_PREFIX,
@@ -44,6 +45,8 @@ export function cacheExpiryNote(query: string): string | null {
 }
 
 export function isNote(query: string): string | null {
+  const invalid = sessionQueryError(query);
+  if (invalid) return invalid;
   const unknown = parseSessionQuery(query).unknownIs;
   return unknown.length ? `${unknown[0]} ${IS_UNKNOWN}` : null;
 }

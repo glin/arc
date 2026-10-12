@@ -75,7 +75,13 @@ test('every axis the table holds can actually be asked for', () => {
             needle: value,
             comparison: { operator: '>' as const, threshold: { digits: '1', exponent: 0 } },
           }
-        : { field: axis.field, needle: value };
+        : axis.field === 'session'
+          ? {
+              field: axis.field,
+              needle: value,
+              identities: { any: new Set([value]), claude: new Set(), codex: new Set() },
+            }
+          : { field: axis.field, needle: value };
     assert.deepEqual(
       parseSessionQuery(`${axis.prefix}:${value}`).terms,
       [term],
@@ -653,4 +659,62 @@ test('naming a session and searching it is one question, not two', () => {
   );
   // A term that matches no session leaves nothing, rather than falling back to all.
   assert.deepEqual(searchTurns(entries, 'agent:nobody find: patch'), []);
+});
+
+test('quote-headed session text searches content without selecting its identity', () => {
+  const entries = [
+    {
+      sessionId: 'one',
+      key: 'one:1',
+      sessionTitle: 'Work',
+      agent: 'Claude',
+      startedAt: 1,
+      prompt: 'Unrelated',
+      summary: '',
+    },
+    {
+      sessionId: 'literal',
+      key: 'literal:1',
+      sessionTitle: 'Work',
+      agent: 'Codex',
+      startedAt: 2,
+      prompt: 'Discuss session:one',
+      summary: '',
+    },
+    {
+      sessionId: 'other',
+      key: 'other:1',
+      sessionTitle: 'Work',
+      agent: 'Claude',
+      startedAt: 3,
+      prompt: 'Discuss session:two',
+      summary: '',
+    },
+  ];
+  assert.deepEqual(
+    searchTurns(entries, 'find: "session:one"').map((hit) => hit.sessionId),
+    ['literal'],
+  );
+  assert.deepEqual(
+    searchTurns(entries, 'session:"one" find:Unrelated').map((hit) => hit.sessionId),
+    ['one'],
+  );
+});
+
+test('content search narrows mixed-provider results through native session IDs', () => {
+  const entries = ['one', 'two', 'other'].map((sessionId, index) => ({
+    sessionId,
+    key: sessionId + ':1',
+    sessionTitle: 'Work',
+    agent: index === 1 ? 'Codex' : 'Claude',
+    startedAt: index,
+    prompt: 'needle OR',
+    summary: '',
+  }));
+  assert.deepEqual(
+    searchTurns(entries, 'session:claude:one OR session:codex:two find:needle').map((hit) => hit.sessionId),
+    ['two', 'one'],
+  );
+  assert.deepEqual(searchTurns(entries, 'session:one OR find:needle'), []);
+  assert.equal(searchTurns(entries, 'find: OR').length, 3);
 });

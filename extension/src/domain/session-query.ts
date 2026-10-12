@@ -2,7 +2,7 @@
 
 import { labelKey } from './labels.ts';
 
-export type SessionField = 'agent' | 'title' | 'labels' | 'cost' | 'cache-expiry' | 'status';
+export type SessionField = 'session' | 'agent' | 'title' | 'labels' | 'cost' | 'cache-expiry' | 'status';
 
 export interface DecimalValue {
   digits: string;
@@ -24,6 +24,8 @@ export interface FilterTerm {
   field: SessionField;
   needle: string;
   plain?: boolean;
+  identities?: { any: Set<string>; claude: Set<string>; codex: Set<string> };
+  invalid?: boolean;
   // A leading `-` excludes the sessions the plain term matches.
   negated?: boolean;
   // Present only when a cost or cache-expiry value follows the strict comparison grammar. An
@@ -103,6 +105,7 @@ export const IS_VALUES: SessionStatus[] = [
 ];
 export const IS_SYNONYMS: Record<string, SessionStatus> = { waiting: 'input', blocked: 'input' };
 export const SESSION_AXES: SessionAxis[] = [
+  { prefix: 'session', field: 'session' },
   { prefix: 'agent', field: 'agent' },
   { prefix: 'title', field: 'title' },
   { prefix: LABEL_PREFIX, field: 'labels' },
@@ -228,10 +231,84 @@ function setsSearch(text: string): boolean {
   return prefix === FIND_PREFIX || prefix === WHERE_PREFIX;
 }
 
+function sessionSelector(word: QueryWord): FilterTerm | null {
+  if (word.quotedHead) return null;
+  const negated = !word.quotedHead && word.text.startsWith('-');
+  const raw = negated ? word.text.slice(1) : word.text;
+  if (wordPrefix(raw) !== 'session') return null;
+  const value = raw.slice(raw.indexOf(':') + 1);
+  const qualified = /^(claude|codex):(.+)$/i.exec(value);
+  const provider = qualified ? (qualified[1].toLowerCase() as 'claude' | 'codex') : 'any';
+  const id = qualified ? qualified[2] : value;
+  const identities = { any: new Set<string>(), claude: new Set<string>(), codex: new Set<string>() };
+  const invalid = !id || /[\s:/\\]/.test(id);
+  if (!invalid) identities[provider].add(id);
+  return {
+    field: 'session',
+    needle: value,
+    identities,
+    ...(negated ? { negated: true } : {}),
+    ...(invalid ? { invalid: true } : {}),
+  };
+}
+
+function identityKey(term: FilterTerm): string {
+  return JSON.stringify(
+    ['any', 'claude', 'codex'].map((provider) =>
+      [...(term.identities?.[provider as 'any' | 'claude' | 'codex'] ?? [])].sort(),
+    ),
+  );
+}
+
+export function sessionQueryError(query: string): string | null {
+  return parseSessionQuery(query).terms.some((term) => term.invalid)
+    ? 'Use full session IDs. Join positive session selectors with OR.'
+    : null;
+}
+
 export function parseSessionQuery(query: string): SessionQuery {
   const out: SessionQuery = { terms: [], find: [], where: 'both', unknownWhere: [], unknownIs: [] };
   let searching = false;
-  for (const { text: written, quoted, quotedHead } of queryWords(query)) {
+  const words = queryWords(query);
+  const selectors = words.map(sessionSelector);
+  const consumed = new Set<number>();
+  for (let at = 0; at < words.length; at++) {
+    if (words[at].text !== 'OR' || words[at].quoted) continue;
+    let left = at - 1;
+    let right = at + 1;
+    while (left >= 0 && words[left].text === 'OR' && !words[left].quoted) left--;
+    while (right < words.length && words[right].text === 'OR' && !words[right].quoted) right++;
+    if (!selectors[left] && !selectors[right]) continue;
+    if (
+      left !== at - 1 ||
+      right !== at + 1 ||
+      !selectors[left] ||
+      !selectors[right] ||
+      selectors[left]!.negated ||
+      selectors[right]!.negated ||
+      selectors[left]!.invalid ||
+      selectors[right]!.invalid
+    ) {
+      out.terms.push({ field: 'session', needle: '', invalid: true });
+      consumed.add(at);
+      continue;
+    }
+    const first = selectors[left]!;
+    const next = selectors[right]!;
+    for (const provider of ['any', 'claude', 'codex'] as const) {
+      for (const id of next.identities![provider]) first.identities![provider].add(id);
+    }
+    selectors[right] = first;
+    consumed.add(left);
+    consumed.add(at);
+  }
+  for (let index = 0; index < words.length; index++) {
+    if (consumed.has(index)) continue;
+    if (selectors[index]) {
+      out.terms.push(selectors[index]!);
+      continue;
+    }
+    const { text: written, quoted, quotedHead } = words[index];
     // A lone `-` names no term to exclude, so it adds nothing rather than asking for a title
     // holding a dash.
     if (!written || (!quotedHead && written === NEGATE_MARK)) {
@@ -241,9 +318,8 @@ export function parseSessionQuery(query: string): SessionQuery {
     if (!quotedHead && written.startsWith(NEGATE_MARK + NEGATE_MARK)) {
       continue;
     }
-    // A word the reader opened with a quote is text. `"-fix"` asks for a title holding the
-    // hyphen, and `find: "-name"` searches for it, so any text can be searched for whatever
-    // it starts with. A mark written outside the quotes still negates, so
+    // A quote before a leading `-` keeps the mark as text. `"-fix"` asks for a title holding
+    // the hyphen, and `find: "-name"` searches for it. A mark outside the quotes still negates, so
     // `-label:"release 0.4"` drops that label.
     const negated = !quotedHead && written[0] === NEGATE_MARK && !setsSearch(written.slice(1));
     const raw = negated ? written.slice(1) : written;
@@ -283,7 +359,9 @@ export function parseSessionQuery(query: string): SessionQuery {
       }
       continue;
     }
-    const axis = SESSION_AXES.find((candidate) => candidate.prefix === prefix);
+    const axis = SESSION_AXES.find(
+      (candidate) => candidate.prefix === prefix && !(quotedHead && candidate.field === 'session'),
+    );
     if (axis) {
       if (NUMERIC_FIELDS.includes(axis.field)) {
         const match = quoted ? null : NUMERIC_COMPARISON_VALUE.exec(typed);
@@ -477,7 +555,18 @@ export function sessionTermHolds(
   active = false,
   cacheExpiryCount: number | null = null,
   cacheExpiryAtLeast = false,
+  sessionId = '',
 ): boolean {
+  if (term.invalid) return false;
+  if (term.field === 'session') {
+    const identities = term.identities;
+    const provider = agent.toLowerCase();
+    const held =
+      !!identities &&
+      (identities.any.has(sessionId) ||
+        ((provider === 'claude' || provider === 'codex') && identities[provider].has(sessionId)));
+    return term.negated ? !held : held;
+  }
   const held = plainTermHolds(
     term,
     agent,
@@ -504,7 +593,10 @@ export function sameQueryTerms(left: string, right: string): boolean {
   const key = (query: string): string => {
     const parsed = parseSessionQuery(query);
     const terms = parsed.terms
-      .map((term) => `${term.negated === true ? NEGATE_MARK : ''}${term.field}:${term.needle}`)
+      .map(
+        (term) =>
+          `${term.negated === true ? NEGATE_MARK : ''}${term.field}:${term.field === 'session' ? identityKey(term) + Boolean(term.invalid) : term.needle}`,
+      )
       .sort();
     return JSON.stringify([terms, [...parsed.find].sort(), parsed.where]);
   };
@@ -513,6 +605,8 @@ export function sameQueryTerms(left: string, right: string): boolean {
 
 export function matchSessions<
   T extends {
+    id?: string;
+    sessionId?: string;
     label: string;
     // The card's own drawn name, where it differs from `label`. A free-text term matches
     // this rather than `label` where it is present, because the rail card can draw more of
@@ -547,7 +641,7 @@ export function matchSessions<
 >(sessions: T[], query: string): T[] {
   const { terms } = parseSessionQuery(query);
   // Invalid numeric comparisons match no session.
-  if (terms.some((term) => NUMERIC_FIELDS.includes(term.field) && !term.comparison)) {
+  if (terms.some((term) => (NUMERIC_FIELDS.includes(term.field) && !term.comparison) || term.invalid)) {
     return [];
   }
   if (!terms.length) {
@@ -570,7 +664,59 @@ export function matchSessions<
         session.active === true,
         session.cacheExpiryCount ?? null,
         session.cacheExpiryAtLeast === true,
+        session.sessionId ?? session.id ?? '',
       );
     return terms.every(holds);
   });
+}
+
+// Listing queries read only catalog identity and reader metadata.
+export function listingQueryError(query: string): string | null {
+  const error = sessionQueryError(query);
+  if (error) return error;
+  const parsed = parseSessionQuery(query);
+  if (
+    parsed.find.length ||
+    parsed.unknownWhere.length ||
+    parsed.unknownIs.length ||
+    queryTokens(query).some((token) => ['find', 'in'].includes(token.prefix)) ||
+    parsed.terms.some(
+      (term) =>
+        !['session', 'agent', 'title', 'labels', 'status'].includes(term.field) ||
+        (term.field === 'status' && !['archived', 'agentrun'].includes(term.needle)),
+    )
+  )
+    return 'This query needs the panel filter. Use arc filter QUERY.';
+  return null;
+}
+
+export function listingTermHolds(
+  term: FilterTerm,
+  session: {
+    sessionId: string;
+    agent: string;
+    title: string;
+    labels: readonly string[];
+    archived: boolean;
+    agentRun: boolean | null;
+  },
+): boolean {
+  if (term.field === 'status' && term.needle === 'agentrun' && session.agentRun === null) return false;
+  return sessionTermHolds(
+    term,
+    session.agent,
+    session.title,
+    session.labels,
+    null,
+    false,
+    null,
+    false,
+    false,
+    session.agentRun === true,
+    session.archived,
+    false,
+    null,
+    false,
+    session.sessionId,
+  );
 }

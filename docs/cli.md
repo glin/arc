@@ -45,11 +45,11 @@ The command lists live window identifiers, workspace folders, repository scope r
 ## Sessions
 
 ```text
-arc sessions [--window ID] [--limit 1-128] [--cursor CURSOR] [--json]
+arc sessions [--query QUERY] [--window ID] [--limit 1-128] [--cursor CURSOR] [--json]
 arc session ID [--turns 1-20] [--window ID] [--json]
 ```
 
-Both commands print JSON. `--window` selects the window explicitly and takes precedence over `ARC_WINDOW`. Without either, exactly one live window and complete discovery are required. Unknown or ambiguous session IDs fail. File paths never select a session source. The selected window's current repository scope supplies session membership.
+Both commands print JSON. `--window` selects the window explicitly and takes precedence over `ARC_WINDOW`. Without either, exactly one live window and complete discovery are required. `session` rejects unknown or ambiguous IDs. File paths never select a session source. The selected window's current repository scope supplies session membership.
 
 `sessions` returns one page with `version`, requester attribution, session rows, `complete`, explanatory `notes`, `next`, `coverage`, and `freshness`. Rows contain `source`, `id`, `provider`, `path`, `ambiguous`, `name`, `setup`, reader labels with their source, `pinned`, `archived`, `runStatus`, `attention`, `lastActivity`, `parent`, `agentRun`, `facts`, and `truncated`. `source` is a fixed-length key for one transcript source. `path` is the exact transcript file that `arc cost PATH --source-only` reads. Two transcripts with the same session ID are two rows with distinct `source` values, and both carry `ambiguous: true`. Setup reports recorded model and effort where accepted facts supply them. Missing values remain `null`. `facts` distinguishes current, stale, and unparsed metadata. Parent relations identify reader-started, dispatched, or subagent relationships. Run status uses `running`, `waiting`, `subagents`, `background`, `done`, `stopped`, `interrupted`, `failed`, `none`, and `unknown`. A done, failed, or interrupted turn reports `subagents` while a background subagent it launched has no close record. It reports `background` while a background command it started has no end record and is under one hour old. Subagents take precedence over background. A process end that Arc records or observes after the turn starts reports the turn's own status instead. Without a process end, a done turn whose remaining records are only closed subagents or older background commands reports `unknown`, because a closed subagent can resume work that only its own transcript records. A failed or interrupted turn with only those records reports its own status. Claude sessions report `none` with current whole-file metadata, known empty turn starts, no outcome, and no live, waiting, or background work. Attention uses `input`, `unread`, `running`, `idle`, and `unknown`. Hidden panels report unknown live attention. Requester attribution names this request and establishes no saved session owner.
 
@@ -61,7 +61,22 @@ A forged, modified, or expired cursor fails with an instruction to restart witho
 
 `id`, `name`, `path`, `setup.model`, `setup.effort`, `parent.id`, and the `labels` array each have a cap of 4 KiB of serialized JSON. A longer `name` is shortened. Any other field over its cap becomes `null`. `truncated` lists each shortened or emptied field. A row that still does not fit an empty page keeps only `source`, `provider`, and its fixed-size facts. When window metadata leaves no room for that row, the command fails with an error that names the window metadata.
 
+`sessions --query QUERY` filters catalog sources before row and byte limits. It accepts `session:`, `agent:`, `title:`, `label:`, `is:archived`, and `is:agentrun`. [Session query syntax](rail-and-navigation.md#session-list) defines identities and OR groups. Other search areas, numeric predicates, and live statuses require `arc filter QUERY`. Retrieval reads catalog identity and cached reader metadata without scanning transcripts or marking turns read. Unavailable agent-run identity matches neither positive nor negated predicates and makes coverage incomplete. Repeat the exact query on every page. Changing or omitting it refuses its cursor. Queries accept at most 200 characters. Repeated, missing, malformed, or oversized arguments fail before application.
+
 `session` defaults to five newest turns and accepts one through twenty. Its independent read allows at most 512 KiB, including source-directory checks and Codex opening reads. Open Arc to establish an unavailable session catalog before retrying. Output stops below 48 KiB and names excluded turns. Large turns that exceed the output allowance are excluded. A response exceeding the channel's full reply allowance fails explicitly. `partial` identifies bounded history, and `state` identifies current, stale, or unparsed reads. Stale reads return no turns. An unparsed read does not establish an empty session. Turn fields include prompt, response summary, recorded model and effort, timestamps, and completion state. These reads never mark turns read.
+
+## Panel filter
+
+```text
+arc filter QUERY [--window ID] [--json]
+arc filter --clear [--window ID] [--json]
+```
+
+`filter` reveals or creates the existing Arc editor panel and replaces its session list query. `--clear` clears it through an explicit flag that survives PowerShell argument handling. One nonempty query or `--clear` is required. The command preserves selection, sort, groups, folds, Show settings, and saved filter definitions. A replacement clears retained lens membership and sets the live filter to Custom. Clearing restores All sessions.
+
+Success reports `status: applied` only after the browser applies the query and persistent storage confirms its save. A rejected save reports `failed` even if the panel displays the query. An unconfirmed outcome after application reports `unknown`, including a filter superseded by Reset Panel State. Read the panel before retrying an unknown result. A window without query capability requires a reload.
+
+Assignments run in admission order. Queue time, readiness, application, and persistence share a 30-second operation deadline. Readiness receives at most 15 seconds. Persistence receives at most 10 seconds from browser application, including its storage queue wait. The transport waits 35 seconds. Expired or disconnected queued requests never apply or begin storage later. A save already started can settle after expiry. Its ordering barrier remains until settlement, and the command promises no storage rollback.
 
 ## Session management
 

@@ -1,3 +1,5 @@
+import { RAIL_FILTER_QUERY_LIMIT } from '../domain/rail-filters.ts';
+import { sessionQueryError } from '../domain/session-query.ts';
 import type { FileCitationDestination } from '../domain/file-citation.ts';
 import {
   contextIdentity,
@@ -199,6 +201,7 @@ export interface PanelSessionAdoption {
 }
 
 export type HostToPanel =
+  | { type: 'applySessionFilter'; request: string; query: string; deadline: number }
   | { type: 'health'; sequence: number }
   | { type: 'visibility'; visible: boolean; revision: number }
   | {
@@ -266,6 +269,7 @@ export type HostToPanel =
   | RenderMessage;
 
 const HOST_TO_PANEL_KINDS: Record<HostToPanel['type'], true> = {
+  applySessionFilter: true,
   health: true,
   visibility: true,
   startupProgress: true,
@@ -312,6 +316,7 @@ const HOST_TO_PANEL_KINDS: Record<HostToPanel['type'], true> = {
 };
 
 export type PanelToHost =
+  | { type: 'sessionFilterApplied'; request: string; state: unknown }
   | { type: 'health'; sequence: number }
   | { type: 'contextDetail'; session: string; request: number; generation: number }
   | { type: 'ready' }
@@ -632,6 +637,17 @@ export function parseHostToPanel(raw: unknown): HostToPanel | null {
     return null;
   }
   switch (m.type) {
+    case 'applySessionFilter':
+      return Object.keys(m).sort().join(',') === 'deadline,query,request,type' &&
+        isString(m.request) &&
+        m.request.length > 0 &&
+        m.request.length <= 128 &&
+        isString(m.query) &&
+        m.query.length <= RAIL_FILTER_QUERY_LIMIT &&
+        !sessionQueryError(m.query) &&
+        isFiniteNumber(m.deadline)
+        ? { type: 'applySessionFilter', request: m.request, query: m.query, deadline: m.deadline }
+        : null;
     case 'health':
       return Number.isSafeInteger(m.sequence) && (m.sequence as number) > 0
         ? { type: 'health', sequence: m.sequence as number }
@@ -900,6 +916,14 @@ export function parsePanelToHost(raw: unknown): PanelToHost | null {
     return null;
   }
   switch (m.type) {
+    case 'sessionFilterApplied':
+      return Object.keys(m).sort().join(',') === 'request,state,type' &&
+        isString(m.request) &&
+        m.request.length > 0 &&
+        m.request.length <= 128 &&
+        record(m.state)
+        ? { type: 'sessionFilterApplied', request: m.request, state: m.state }
+        : null;
     case 'health':
       return Number.isSafeInteger(m.sequence) && (m.sequence as number) > 0
         ? { type: 'health', sequence: m.sequence as number }
@@ -1246,6 +1270,8 @@ export type PanelToHostHandlers<R> = Handlers<PanelToHost, R>;
 // The default branch assigns to never, so unhandled variants fail the typecheck.
 export function dispatchHostToPanel(message: HostToPanel, handlers: HostToPanelHandlers): void {
   switch (message.type) {
+    case 'applySessionFilter':
+      return handlers.applySessionFilter(message);
     case 'health':
       return handlers.health(message);
     case 'visibility':
@@ -1341,6 +1367,8 @@ export function dispatchHostToPanel(message: HostToPanel, handlers: HostToPanelH
 
 export function dispatchPanelToHost<R>(message: PanelToHost, handlers: PanelToHostHandlers<R>): R {
   switch (message.type) {
+    case 'sessionFilterApplied':
+      return handlers.sessionFilterApplied(message);
     case 'health':
       return handlers.health(message);
     case 'ready':

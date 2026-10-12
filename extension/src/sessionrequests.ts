@@ -1,3 +1,4 @@
+import { FILTER_LIMITS } from './sessionfilter.ts';
 import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
 import * as net from 'node:net';
@@ -18,6 +19,8 @@ import {
   type RequesterProvider,
   type SessionWriteParams,
 } from './sessionwrites.ts';
+import { RAIL_FILTER_QUERY_LIMIT } from './domain/rail-filters.ts';
+import { listingQueryError, sessionQueryError } from './domain/session-query.ts';
 import { validCompactPayload } from './compactrequest.ts';
 
 export const SESSION_REQUEST_VERSION = 1;
@@ -48,6 +51,9 @@ export interface WindowInfo extends WindowState {
 }
 
 // The window accepts `requesterProvider` on start, send, and session requests.
+export const SESSION_QUERY_CAPABILITY = 'sessionQuery';
+export { FILTER_LIMITS } from './sessionfilter.ts';
+
 export const REQUESTER_PROVIDER_CAPABILITY = 'requesterProvider';
 
 export interface HostRegistration extends WindowInfo {
@@ -70,6 +76,7 @@ export interface SessionRequest {
   token: string;
   method:
     | 'ping'
+    | 'filter'
     | 'sessions'
     | 'session'
     | 'setups'
@@ -86,6 +93,7 @@ export interface SessionRequest {
   params: SessionWriteParams & { requestId?: string; window?: string; self?: true; afterTurn?: true };
   // The channel sets the payload allowance for sessions requests. The wire parser refuses this key.
   replyBytes?: number;
+  filterContext?: { deadline: number; signal: AbortSignal };
 }
 
 export type SessionReply = { id: string | null; result: unknown } | { id: string | null; error: string };
@@ -155,6 +163,7 @@ export function parseSessionRequest(value: unknown): SessionRequest | null {
     ![
       'ping',
       'sessions',
+      'filter',
       'session',
       'setups',
       'start',
@@ -197,10 +206,20 @@ export function parseSessionRequest(value: unknown): SessionRequest | null {
       return null;
   } else if (['setups', 'start', 'curate', 'send'].includes(value.method as string)) {
     if (!validSessionWrite(value.method as string, value.params)) return null;
+  } else if (value.method === 'filter') {
+    if (
+      Object.keys(value.params).join(',') !== 'query' ||
+      typeof value.params.query !== 'string' ||
+      value.params.query.length > RAIL_FILTER_QUERY_LIMIT ||
+      sessionQueryError(value.params.query)
+    )
+      return null;
   } else if (value.method === 'sessions') {
-    const { cursor, limit, ...rest } = value.params;
+    const { cursor, limit, query, ...rest } = value.params;
     if (
       Object.keys(rest).length !== 0 ||
+      (query !== undefined &&
+        (typeof query !== 'string' || query.length > RAIL_FILTER_QUERY_LIMIT || listingQueryError(query))) ||
       (cursor !== undefined && (typeof cursor !== 'string' || !SESSION_CURSOR.test(cursor))) ||
       (limit !== undefined && (!Number.isSafeInteger(limit) || (limit as number) < 1 || (limit as number) > 128))
     )
@@ -385,7 +404,7 @@ export class WindowChannel {
       hostId: this.hostId,
       pid: process.pid,
       version: SESSION_REQUEST_VERSION,
-      capabilities: [REQUESTER_PROVIDER_CAPABILITY],
+      capabilities: [REQUESTER_PROVIDER_CAPABILITY, SESSION_QUERY_CAPABILITY],
     };
   }
 
@@ -485,6 +504,12 @@ export class WindowChannel {
           socket.destroy();
           return;
         }
+        const cancellation = request.method === 'filter' ? new AbortController() : null;
+        const disconnected = () => cancellation?.abort();
+        if (cancellation) {
+          request.filterContext = { deadline: Date.now() + FILTER_LIMITS.operationMs, signal: cancellation.signal };
+          socket.once('close', disconnected);
+        }
         this.inFlight++;
         void Promise.resolve()
           .then<unknown>(() => {
@@ -546,6 +571,7 @@ export class WindowChannel {
               }),
           )
           .finally(() => {
+            socket.removeListener('close', disconnected);
             this.inFlight--;
           });
       },
@@ -797,10 +823,29 @@ export async function requestWindow(
     throw new Error(`Request ${requestId} has an unknown outcome in this activation.`);
   if (method === 'send' && !providerCapable(entry))
     throw new Error('The selected Arc window must reload before it can accept send. No prompt was sent.');
+  if (
+    (method === 'filter' || (method === 'sessions' && params.query !== undefined)) &&
+    !entry.capabilities?.includes(SESSION_QUERY_CAPABILITY)
+  )
+    throw new Error('The selected Arc window must reload before it can accept filter queries.');
   const write = method === 'start' || method === 'curate' || method === 'send' || method === 'compact-request';
   const attributed = method === 'send' || method === 'session' || (method === 'start' && guardedStart);
-  const result = await exchangeWindow(entry, write ? 120_000 : 1_000, file, method, params, id, attributed);
+  const result = await exchangeWindow(
+    entry,
+    method === 'filter' ? FILTER_LIMITS.transportMs : write ? 120_000 : 1_000,
+    file,
+    method,
+    params,
+    id,
+    attributed,
+  );
   if (result === null) {
+    if (method === 'filter')
+      return {
+        version: 1,
+        status: 'unknown',
+        reason: 'The filter outcome is unknown. Read the panel before retrying.',
+      };
     if (method === 'compact-request')
       return {
         version: 1,

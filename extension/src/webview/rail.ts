@@ -10,6 +10,7 @@ import {
   LABEL_PREFIX,
   NEGATE_MARK,
   parseSessionQuery,
+  sessionQueryError,
   queryToken,
   replaceToken,
   SESSION_AXES,
@@ -383,6 +384,7 @@ export interface RailRenderer {
   newMenu(): HTMLElement | null;
   labelOpen(session: string): boolean;
   filterable(): boolean;
+  applyQuery(query: string): void;
   filterByLabel(name: string): void;
   toggleLabelEditor(session: string, anchor?: HTMLElement | null): void;
   receiveLabelEditor(session: string, heading: string, rows: LabelEditorRow[]): void;
@@ -2281,7 +2283,7 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
       focused instanceof HTMLElement && topMount.contains(focused) && focused.dataset.control?.startsWith('railcount:')
         ? focused
         : null;
-    const invalidCost = naming ? null : costNote(filter);
+    const invalidCost = naming ? null : (sessionQueryError(filter) ?? costNote(filter));
     // Invalid cache-expiry values have a separate note and DOM id from invalid cost values.
     const invalidCacheExpiry = naming ? null : cacheExpiryNote(filter);
     const open = boxOpen();
@@ -3535,6 +3537,21 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
     labelOpen: (session) => labelsOpen?.session === current(session),
     // Uses width alone so headings enable label filters before the first session list payload arrives.
     filterable: () => media.matches,
+    // An external full assignment starts retention again, including an unchanged query.
+    applyQuery(query) {
+      railKept = null;
+      filteredFolds.clear();
+      setRailQuery(query);
+      railFilterId = ALL_RAIL_FILTER_ID;
+      if (filterInput) filterInput.value = filter;
+      if (filterFrame !== null) {
+        cancelAnimationFrame(filterFrame);
+        filterFrame = null;
+      }
+      drawTop();
+      drawList();
+      drawFilterPop();
+    },
     // Filter by a session heading's label and focus the filter box. Ignore the action while the session list is hidden.
     filterByLabel(name) {
       if (!visible()) {

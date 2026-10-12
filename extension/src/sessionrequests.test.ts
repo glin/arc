@@ -3447,7 +3447,7 @@ test('session reads and guarded starts carry the requester provider only to a wi
     // A window that predates the field refuses it, so the CLI omits it there and refuses send before connecting.
     const registration = path.join(home, 'hosts', `${channel.hostId}.json`);
     const listed = JSON.parse(fs.readFileSync(registration, 'utf8'));
-    assert.deepEqual(listed.capabilities, ['requesterProvider']);
+    assert.deepEqual(listed.capabilities, ['requesterProvider', 'sessionQuery']);
     delete listed.capabilities;
     fs.writeFileSync(registration, JSON.stringify(listed));
     await requestWindow('start', start, channel.hostId, home, `${channel.hostId}:old`, true);
@@ -3465,4 +3465,73 @@ test('session reads and guarded starts carry the requester provider only to a wi
   } finally {
     vi.unstubAllEnvs();
   }
+});
+
+test('filter wire requests admit only bounded query payloads and the listing subset', () => {
+  const base = { id: 'filter-one', version: 1, token: 'a'.repeat(64), requester: null };
+  for (const request of [
+    { ...base, method: 'filter', params: { query: '' } },
+    { ...base, method: 'filter', params: { query: 'session:one OR session:codex:two' } },
+    { ...base, method: 'sessions', params: { query: 'session:one', limit: 3 } },
+  ])
+    assert.deepEqual(parseSessionRequest(request), request);
+  for (const request of [
+    { ...base, method: 'filter', params: {} },
+    { ...base, method: 'filter', params: { query: '', extra: true } },
+    { ...base, method: 'filter', params: { query: 'session:one OR' } },
+    { ...base, method: 'filter', params: { query: 'x'.repeat(201) } },
+    { ...base, method: 'sessions', params: { query: 'is:unread' } },
+    { ...base, method: 'sessions', params: { query: 'find:needle' } },
+    { ...base, method: 'filter', params: { query: '' }, filterContext: {} },
+  ])
+    assert.equal(parseSessionRequest(request), null);
+});
+
+test('filter channel exchanges wait beyond the read deadline and carry connection cancellation', async () => {
+  const home = tempDir('filter-channel-');
+  const channel = new WindowChannel(home);
+  channels.push(channel);
+  let admitted: any;
+  let finish!: () => void;
+  channel.setRequestHandler((request) => {
+    admitted = request;
+    return new Promise<void>((resolve) => {
+      finish = resolve;
+    });
+  });
+  await channel.update({ folders: [], scopeReady: true, panelReady: false, panelVisible: false });
+  vi.useFakeTimers();
+  try {
+    const result = requestWindow('filter', { query: 'session:one' }, channel.hostId, home);
+    await vi.waitFor(() => assert.equal(admitted?.method, 'filter'));
+    assert.equal(admitted.filterContext.signal.aborted, false);
+    assert.ok(admitted.filterContext.deadline > Date.now() + 25_000);
+    await vi.advanceTimersByTimeAsync(2_000);
+    assert.equal(admitted.filterContext.signal.aborted, false);
+    finish();
+    await result;
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('a disconnected filter transport reports an unknown outcome and cancels host admission', async () => {
+  const home = tempDir('filter-disconnect-');
+  const channel = new WindowChannel(home);
+  channels.push(channel);
+  let admitted: any;
+  let finish!: () => void;
+  channel.setRequestHandler((request) => {
+    admitted = request;
+    return new Promise<void>((resolve) => {
+      finish = resolve;
+    });
+  });
+  await channel.update({ folders: [], scopeReady: true, panelReady: true, panelVisible: true });
+  const result = requestWindow('filter', { query: 'session:one' }, channel.hostId, home);
+  await vi.waitFor(() => assert.ok(admitted));
+  await channel.dispose();
+  assert.equal(((await result) as any).status, 'unknown');
+  await vi.waitFor(() => assert.equal(admitted.filterContext.signal.aborted, true));
+  finish();
 });

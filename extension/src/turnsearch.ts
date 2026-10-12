@@ -63,6 +63,10 @@ function termHolds(term: FilterTerm, entry: SearchEntry): boolean {
     false,
     entry.runByAgent === true,
     entry.archived === true,
+    false,
+    null,
+    false,
+    entry.sessionId,
   );
 }
 
@@ -188,6 +192,7 @@ export function searchScopeName(scope: { scoped: boolean; whole: boolean }): Sea
 // Results sort newest first. The first search word determines the snippet location.
 export function searchTurns(entries: SearchEntry[], query: string, now: number = Date.now()): SearchHit[] {
   const { find, where, terms } = parseSessionQuery(query);
+  if (terms.some((term) => term.invalid)) return [];
   if (!find.length) {
     return [];
   }

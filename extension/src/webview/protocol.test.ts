@@ -214,6 +214,10 @@ const CONTEXT_DETAIL = unavailableContext({
 });
 // Valid host messages and their parsed results cover every variant through the typed handler count.
 const HOST: Array<{ raw: unknown; parsed: HostToPanel }> = [
+  {
+    raw: { type: 'applySessionFilter', request: 'one', query: '', deadline: 1000 },
+    parsed: { type: 'applySessionFilter', request: 'one', query: '', deadline: 1000 },
+  },
   { raw: { type: 'health', sequence: 1 }, parsed: { type: 'health', sequence: 1 } },
   {
     raw: { type: 'visibility', visible: false, revision: 1 },
@@ -366,6 +370,10 @@ const HOST: Array<{ raw: unknown; parsed: HostToPanel }> = [
 ];
 
 const PANEL: Array<{ raw: Record<string, unknown>; parsed: PanelToHost }> = [
+  {
+    raw: { type: 'sessionFilterApplied', request: 'one', state: {} },
+    parsed: { type: 'sessionFilterApplied', request: 'one', state: {} },
+  },
   { raw: { type: 'exportSession', session: 's1' }, parsed: { type: 'exportSession', session: 's1' } },
   { raw: { type: 'health', sequence: 1 }, parsed: { type: 'health', sequence: 1 } },
   {
@@ -623,6 +631,7 @@ function hostRecorder(seen: string[]): HostToPanelHandlers {
     seen.push(name);
   };
   return {
+    applySessionFilter: take('applySessionFilter'),
     visibility: take('visibility'),
     health: take('health'),
     contextDetail: take('contextDetail'),
@@ -674,6 +683,7 @@ function panelRecorder(seen: string[]): PanelToHostHandlers<void> {
     seen.push(name);
   };
   return {
+    sessionFilterApplied: take('sessionFilterApplied'),
     contextDetail: take('contextDetail'),
     health: take('health'),
     ready: take('ready'),
@@ -1292,4 +1302,30 @@ test('an answer to an ask is read down to what the reader picked and what they w
   for (const raw of refused) {
     assert.equal(parsePanelToHost(raw), null, JSON.stringify(raw));
   }
+});
+
+test('external session filter messages require bounded queries and correlation', () => {
+  const apply = {
+    type: 'applySessionFilter',
+    request: 'window:one',
+    query: 'session:one OR session:codex:two',
+    deadline: 1234,
+  };
+  assert.deepEqual(parseHostToPanel(apply), apply);
+  const ack = { type: 'sessionFilterApplied', request: 'window:one', state: { railFilter: apply.query } };
+  assert.deepEqual(parsePanelToHost(ack), ack);
+  for (const bad of [
+    { ...apply, extra: true },
+    { ...apply, query: 'session:one OR' },
+    { ...apply, query: 'x'.repeat(201) },
+    { ...apply, request: '' },
+    { ...apply, deadline: NaN },
+  ])
+    assert.equal(parseHostToPanel(bad), null);
+  for (const bad of [
+    { ...ack, extra: true },
+    { ...ack, request: '' },
+    { ...ack, state: null },
+  ])
+    assert.equal(parsePanelToHost(bad), null);
 });

@@ -5,6 +5,7 @@ import type { Turn } from '../src/transcript.ts';
 
 // Every protocol message needs an explicit demo behavior.
 export const DEMO_HOST_POLICY = {
+  sessionFilterApplied: 'noop',
   health: 'noop',
   contextDetail: 'handled',
   ready: 'handled',

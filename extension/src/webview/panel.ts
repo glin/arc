@@ -1118,6 +1118,7 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
 
   // Parses host messages before dispatch. Unreadable messages produce a warning and no update.
   // The typed dispatch requires a handler for every message kind.
+  const appliedFilters = new Map<string, number>();
   function receiveHostMessage(data: unknown) {
     const startedAt = performance.now();
     const parsed = parseHostToPanel(data);
@@ -1130,6 +1131,15 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
     const message = parsed.type === 'render' || parsed.type === 'rail' ? rowDeltas.expand(parsed) : parsed;
     if (!message) return;
     dispatchHostToPanel(message, {
+      applySessionFilter: (msg) => {
+        if (kernel.readOnly || Date.now() >= msg.deadline || appliedFilters.has(msg.request)) return;
+        for (const [request, deadline] of appliedFilters) {
+          if (Date.now() >= deadline) appliedFilters.delete(request);
+        }
+        appliedFilters.set(msg.request, msg.deadline);
+        railRenderer.applyQuery(msg.query);
+        sessionState.save(msg.request);
+      },
       health: (msg) => vscode.postMessage({ type: 'health', sequence: msg.sequence }),
       visibility: (msg) => visibility.receive(msg),
       startupProgress: function (msg) {
@@ -1358,7 +1368,7 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
       // Clear this panel's state after the host clears its saved copy.
       forgetState: function (msg) {
         // Reset the read-state floor to the host's fresh timestamp.
-        forgetEverything(msg.since);
+        savedState.withoutHostSave(() => forgetEverything(msg.since));
       },
       // Applies the requested session read state and its watermarks through the read owner.
       setSessionRead: function (msg) {

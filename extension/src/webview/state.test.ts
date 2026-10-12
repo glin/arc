@@ -211,6 +211,33 @@ test('a panel saved before the rail row shipped writes no rail-row words', () =>
   assert.equal('railHeadLenses' in empty, false);
 });
 
+test('a delayed reset updates browser state without replacing the newer host query', async () => {
+  const hostWrites: unknown[] = [];
+  const browserWrites: SavedPanelState[] = [];
+  const saved = createSavedState(
+    {},
+    { read: () => ({}), write: (state) => browserWrites.push(state as SavedPanelState) },
+    { send: (message) => hostWrites.push(message) },
+  );
+  saved.save({ ...values(), railFilter: 'pending-old' });
+  const reset = saved.withoutHostSave?.bind(saved) ?? ((action: () => void) => action());
+  reset(() => {
+    saved.save({ ...values(), railFilter: '' });
+    saved.save({ ...values(), railFilter: '' });
+  });
+  await Promise.resolve();
+  assert.deepEqual(hostWrites, []);
+  assert.equal(browserWrites.at(-1)!.railFilter, '');
+  saved.save({ ...values(), railFilter: 'session:new' }, 'new');
+  assert.equal((hostWrites[0] as any).type, 'sessionFilterApplied');
+  reset(() => saved.save({ ...values(), railFilter: '' }));
+  await Promise.resolve();
+  assert.equal(hostWrites.length, 1);
+  saved.save({ ...values(), railFilter: 'reader-choice' });
+  await Promise.resolve();
+  assert.equal((hostWrites[1] as any).state.railFilter, 'reader-choice');
+});
+
 test('the injected host state keeps precedence over restored browser state', () => {
   const browserState: BrowserStatePort = {
     read() {

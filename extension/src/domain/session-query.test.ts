@@ -6,6 +6,9 @@ import {
   IS_VALUES,
   matchSessions,
   parseSessionQuery,
+  sameQueryTerms,
+  listingQueryError,
+  listingTermHolds,
   queryToken,
   queryTokens,
   quoteQueryValue,
@@ -548,4 +551,90 @@ test('every positive term holds when labels and statuses combine', () => {
     matchSessions(rows, 'label:ui label:bug is:running').map((row) => row.id),
     ['both'],
   );
+});
+
+test('full session identities select mixed providers and preserve global predicates', () => {
+  const rows = [
+    { id: 'ef5a03c3-f255-41b6-b57c-c15af453ac8a', agent: 'Claude', label: 'First', labels: ['arc'] },
+    { id: 'codex-native', agent: 'Codex', label: 'Second', labels: ['arc'] },
+    { id: 'unrelated', agent: 'Claude', label: 'Third', labels: ['arc'] },
+    { id: 'codex-native', agent: 'Claude', label: 'Collision', labels: ['other'] },
+    { id: 'codex-native', agent: 'Codex', label: 'Duplicate source', labels: ['arc'], archived: true },
+  ];
+  const union = 'session:claude:ef5a03c3-f255-41b6-b57c-c15af453ac8a OR session:codex:codex-native';
+  assert.deepEqual(matchSessions(rows, union), [rows[0], rows[1], rows[4]]);
+  assert.deepEqual(matchSessions(rows, `label:arc -is:archived ${union}`), [rows[0], rows[1]]);
+  assert.deepEqual(matchSessions(rows, `agent:codex ${union}`), [rows[1], rows[4]]);
+  assert.deepEqual(matchSessions(rows, 'session:codex-native -session:codex:codex-native'), [rows[3]]);
+  assert.deepEqual(matchSessions(rows, 'session:CODEX:codex-native'), [rows[1], rows[4]]);
+  for (const query of [
+    'session:CODEX-NATIVE',
+    'session:codex-nat',
+    'session:unknown',
+    'session:codex-native session:unrelated',
+  ])
+    assert.deepEqual(matchSessions(rows, query), [], query);
+  assert.deepEqual(matchSessions(rows, 'session:codex-native OR session:codex-native'), [rows[1], rows[3], rows[4]]);
+  assert.ok(
+    sameQueryTerms(
+      union,
+      'session:codex:codex-native OR session:claude:ef5a03c3-f255-41b6-b57c-c15af453ac8a OR session:codex:codex-native',
+    ),
+  );
+  assert.ok(!sameQueryTerms('session:claude:codex-native', 'session:codex:codex-native'));
+  assert.ok(!sameQueryTerms('session:codex-native OR session:unrelated', 'session:codex-native session:unrelated'));
+});
+
+test('quote-headed session selectors remain literal title text', () => {
+  const rows = [
+    { id: 'one', agent: 'Claude', label: 'Unrelated' },
+    { id: 'literal', agent: 'Codex', label: 'Discuss session:one' },
+    { id: 'other', agent: 'Claude', label: 'Discuss session:two' },
+  ];
+  assert.deepEqual(matchSessions(rows, '"session:one"'), [rows[1]]);
+  assert.deepEqual(matchSessions(rows, 'session:"one"'), [rows[0]]);
+  assert.deepEqual(parseSessionQuery('find: "session:one"').find, ['session:one']);
+  assert.deepEqual(parseSessionQuery('find: "session:one"').terms, []);
+  assert.deepEqual(parseSessionQuery('"agent:codex"').terms, [{ field: 'agent', needle: 'codex' }]);
+  assert.deepEqual(parseSessionQuery('"title:one"').terms, [{ field: 'title', needle: 'one' }]);
+  assert.deepEqual(parseSessionQuery('"label:Arc"').terms, [{ field: 'labels', needle: 'Arc' }]);
+  assert.deepEqual(parseSessionQuery('"cost:>1"').terms, [{ field: 'cost', needle: '>1' }]);
+  assert.deepEqual(parseSessionQuery('"cache-expiry:<1"').terms, [{ field: 'cache-expiry', needle: '<1' }]);
+  assert.deepEqual(parseSessionQuery('"is:unread"').terms, [{ field: 'status', needle: 'unread' }]);
+  assert.deepEqual(parseSessionQuery('"find:one"').find, ['one']);
+  assert.equal(parseSessionQuery('"in:prompt"').where, 'prompt');
+});
+
+test('malformed selectors and selector OR chains never widen results', () => {
+  for (const query of [
+    'session:',
+    '-session:',
+    'session:claude:',
+    'session:other:id',
+    'session:/path',
+    'session:one OR',
+    'OR session:one',
+    'session:one OR OR session:two',
+    'session:one OR title:Timeline',
+    'title:Timeline OR session:one',
+    '-session:one OR session:two',
+    'session:one OR -session:two',
+    'session:"two words"',
+  ])
+    assert.deepEqual(matchSessions(sessions, query), [], query);
+  assert.deepEqual(matchSessions([{ id: 'a', agent: 'claude', label: 'OR or' }], 'OR'), [
+    { id: 'a', agent: 'claude', label: 'OR or' },
+  ]);
+  assert.deepEqual(parseSessionQuery('find: OR').find, ['or']);
+  assert.equal(parseSessionQuery('session:a OR session:b OR session:c').terms.length, 1);
+  assert.equal(parseSessionQuery('session:a "OR" session:b').terms.length, 3);
+  assert.equal(parseSessionQuery('session:a or session:b').terms.length, 3);
+});
+
+test('listing queries reject unavailable axes and never invert missing agent-run facts', () => {
+  for (const query of ['find:x', 'find:', 'in:both', 'cost:>1', 'cache-expiry:<1', 'is:unread', 'is:running'])
+    assert.match(listingQueryError(query)!, /arc filter/);
+  assert.equal(listingQueryError('label:arc -is:archived session:a OR session:codex:b'), null);
+  const row = { sessionId: 'a', agent: 'claude', title: 'First', labels: [], archived: false, agentRun: null };
+  assert.equal(listingTermHolds(parseSessionQuery('-is:agentrun').terms[0], row), false);
 });

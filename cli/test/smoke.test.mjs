@@ -747,3 +747,57 @@ test('the packed package installs both commands globally, replaces the old packa
     rmSync(root, { recursive: true, force: true });
   }
 }, 60_000);
+
+test('bundled filter commands retrieve selected identities and clear through an explicit launcher flag', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'arc-filter-smoke-'));
+  const channel = new WindowChannel(home);
+  const run = promisify(execFile);
+  const requests = [];
+  channel.setRequestHandler((request) => {
+    requests.push(request);
+    return { method: request.method, params: request.params };
+  });
+  const env = { ...process.env, ARC_HOME: home, ARC_WINDOW: channel.hostId };
+  try {
+    await channel.update({ folders: [], scopeReady: true, panelReady: false, panelVisible: false });
+    const query = 'session:claude:one OR session:codex:two';
+    for (const args of [
+      ['sessions', '--query', query],
+      ['filter', query],
+      ['filter', '--clear'],
+    ]) {
+      const answer = JSON.parse((await run(process.execPath, [cli, ...args, '--json'], { env })).stdout);
+      assert.equal(answer.params.query, args.includes('--clear') ? '' : query);
+    }
+    if (process.platform === 'win32') {
+      const command = `& '${process.execPath.replaceAll("'", "''")}' '${cli.replaceAll("'", "''")}' filter --clear --json`;
+      const answer = JSON.parse((await run('powershell.exe', ['-NoProfile', '-Command', command], { env })).stdout);
+      assert.deepEqual(answer.params, { query: '' });
+    }
+    const before = requests.length;
+    for (const args of [
+      ['filter'],
+      ['filter', ''],
+      ['filter', '--clear', '--clear'],
+      ['filter', query, '--clear'],
+      ['filter', 'session:one OR'],
+      ['filter', 'x'.repeat(201)],
+      ['sessions', '--query'],
+      ['sessions', '--query', query, '--query', query],
+      ['sessions', '--query', 'find:needle'],
+      ['filter', '--unknown'],
+    ])
+      await assert.rejects(run(process.execPath, [cli, ...args], { env }));
+    assert.equal(requests.length, before);
+    const registration = join(home, 'hosts', `${channel.hostId}.json`);
+    const old = JSON.parse(readFileSync(registration, 'utf8'));
+    old.capabilities = ['requesterProvider'];
+    writeFileSync(registration, JSON.stringify(old));
+    await assert.rejects(run(process.execPath, [cli, 'filter', query], { env }), /must reload/);
+    await assert.rejects(run(process.execPath, [cli, 'sessions', '--query', query], { env }), /must reload/);
+    assert.equal(requests.length, before);
+  } finally {
+    await channel.dispose();
+    rmSync(home, { recursive: true, force: true });
+  }
+});

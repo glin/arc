@@ -1,6 +1,8 @@
+import { RAIL_FILTER_QUERY_LIMIT } from '../../extension/src/domain/rail-filters.ts';
+import { listingQueryError, sessionQueryError } from '../../extension/src/domain/session-query.ts';
 import { requestWindow, SESSION_CURSOR } from '../../extension/src/sessionrequests.ts';
 
-export async function runSessions(command: 'sessions' | 'session', args: string[]): Promise<string> {
+export async function runSessions(command: 'sessions' | 'session' | 'filter', args: string[]): Promise<string> {
   let window: string | undefined;
   let sessionId: string | undefined;
   let turns = 5;
@@ -8,9 +10,16 @@ export async function runSessions(command: 'sessions' | 'session', args: string[
   let jsonSeen = false;
   let cursor: string | undefined;
   let limit: number | undefined;
+  let query: string | undefined;
+  let clear = false;
   for (let index = 0; index < args.length; index++) {
     const arg = args[index];
-    if (arg === '--window' && window === undefined) {
+    if (arg === '--clear' && command === 'filter' && !clear) {
+      clear = true;
+    } else if (arg === '--query' && command === 'sessions' && query === undefined) {
+      query = args[++index];
+      if (!query || query.startsWith('--')) throw new Error('--query requires a filter query.');
+    } else if (arg === '--window' && window === undefined) {
       window = args[++index];
       if (!window || window.startsWith('--')) throw new Error('--window requires a window identifier.');
     } else if (arg === '--turns' && command === 'session' && !turnsSeen) {
@@ -30,12 +39,30 @@ export async function runSessions(command: 'sessions' | 'session', args: string[
         throw new Error('The session cursor is invalid or expired. Restart the listing without --cursor.');
     } else if (arg === '--json' && !jsonSeen) {
       jsonSeen = true;
+    } else if (!arg.startsWith('--') && command === 'filter' && query === undefined) {
+      query = arg;
     } else if (!arg.startsWith('-') && command === 'session' && sessionId === undefined) {
       sessionId = arg;
     } else throw new Error(`Unknown or repeated argument: ${arg}`);
   }
   if (command === 'session' && !sessionId)
     throw new Error('Usage: arc session ID [--turns 1-20] [--window ID] [--json]');
-  const params = command === 'session' ? { sessionId, turns } : { ...(cursor && { cursor }), ...(limit && { limit }) };
+  if (command === 'filter') {
+    if ((clear && query !== undefined) || (!clear && !query?.trim()))
+      throw new Error('Usage: arc filter QUERY | arc filter --clear [--window ID] [--json]');
+    if (clear) query = '';
+  }
+  if (query !== undefined) {
+    if (query.length > RAIL_FILTER_QUERY_LIMIT)
+      throw new Error(`Filter queries accept at most ${RAIL_FILTER_QUERY_LIMIT} characters.`);
+    const error = command === 'sessions' ? listingQueryError(query) : sessionQueryError(query);
+    if (error) throw new Error(error);
+  }
+  const params =
+    command === 'filter'
+      ? { query }
+      : command === 'session'
+        ? { sessionId, turns }
+        : { ...(cursor && { cursor }), ...(limit && { limit }), ...(query !== undefined && { query }) };
   return JSON.stringify(await requestWindow(command, params, window));
 }

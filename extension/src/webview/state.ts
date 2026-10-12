@@ -145,7 +145,8 @@ export interface SavedStateService {
   importRecovery(snapshot: unknown): void;
   publishRecovery(): void;
   onRecovery(callback: () => void): void;
-  save(values: SavedStateValues): SavedPanelState;
+  save(values: SavedStateValues, filterRequest?: string): SavedPanelState;
+  withoutHostSave(action: () => void): void;
 }
 
 function stateObject(value: unknown): Record<string, unknown> | null {
@@ -202,6 +203,7 @@ export function createSavedState(
   };
   // Newest complete state awaiting host delivery. It replaces earlier pending states.
   let unsent: SavedPanelState | null = null;
+  let localOnly = false;
   const sendNewest = () => {
     const state = unsent;
     unsent = null;
@@ -239,17 +241,31 @@ export function createSavedState(
     onRecovery(callback) {
       listeners.push(callback);
     },
-    save(values) {
+    withoutHostSave(action) {
+      const previous = localOnly;
+      localOnly = true;
+      unsent = null;
+      try {
+        action();
+      } finally {
+        localOnly = previous;
+      }
+    },
+    save(values, filterRequest) {
       const state = savedPanelState(values);
       if (recovery.length) state.submittedPrompts = recovery;
       // Save browser state synchronously. Send the newest state to the host in one microtask.
       // Multiple saves in the same task share one host update.
       browserState.write(state);
       latest = state as unknown as Record<string, unknown>;
-      if (unsent === null) {
-        queueMicrotask(sendNewest);
+      if (localOnly) return state;
+      if (filterRequest) {
+        unsent = null;
+        host.send({ type: 'sessionFilterApplied', request: filterRequest, state });
+      } else {
+        if (unsent === null) queueMicrotask(sendNewest);
+        unsent = state;
       }
-      unsent = state;
       return state;
     },
   };

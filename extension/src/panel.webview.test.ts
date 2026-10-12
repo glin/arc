@@ -1,3 +1,5 @@
+import { SessionFilterRequests, FILTER_LIMITS } from './sessionfilter.ts';
+import { createSavedState } from './webview/state.ts';
 import type { QueuedSubmission, TurnComment } from './turnview.ts';
 import { resolveResponseSession, pendingResponseSessionAdmitted, sessionLinkContext } from './domain/session-link';
 import { nativeCitationPath } from './domain/file-citation';
@@ -7936,10 +7938,7 @@ test('the record of starting a session outlives the window', () => {
   );
 
   // Browser state saves must preserve the host-owned started-session identities.
-  const save = between(
-    'private saveState(state: unknown): void {',
-    'void this.memento?.update(STATE_KEY, this.saved);',
-  );
+  const save = between('private saveState(', 'const snapshot = structuredClone(this.saved);');
   const held = save.indexOf('const started = this.saved.started;');
   const rebuilt = save.indexOf('this.saved = normalizePanelState(state, railFilters);');
   assert.ok(
@@ -14782,8 +14781,8 @@ test('releasing a rejected or abandoned queued edit resumes eligible delivery', 
   );
 });
 
-test('a delayed panel save keeps the durable selected session after adoption', () => {
-  const source = `function saveState(state: unknown) {\n${methodBody('private saveState(state: unknown)')}\n}`;
+test('a delayed panel save keeps the durable selected session after adoption', async () => {
+  const source = `function saveState(state: unknown, canPersist = () => true) {\n${methodBody('private saveState(')}\n}`;
   const lifted = ts.transpileModule(source, {
     compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None },
   }).outputText;
@@ -14819,7 +14818,7 @@ test('a delayed panel save keeps the durable selected session after adoption', (
     },
   } as any;
 
-  saveState.call(provider, { ...saved, showing: 'provisional' });
+  await saveState.call(provider, { ...saved, showing: 'provisional' });
 
   assert.equal(provider.saved.showing, 'durable');
   assert.equal(
@@ -15015,17 +15014,18 @@ test('overlapping membership operations from two panels preserve and publish bot
   assert.equal(persisted.length, 2, 'one operation caused more than one workspace-state write');
 });
 
-test('a delayed browser save preserves durable provider memberships', () => {
+test('a delayed browser save preserves durable provider memberships', async () => {
   const saveState = new Function(
     'normalizePanelState',
-    `return function (state) {\n${methodBody('private saveState(state: unknown)').replace(': ReadState', '')}\n};`,
-  )(normalizePanelState);
+    'STATE_KEY',
+    `return function (state, canPersist = () => true) {\n${methodBody('private saveState(').replace(': ReadState', '')}\n};`,
+  )(normalizePanelState, 'arc.panelState');
   const provider = {
     saved: normalizePanelState({ hidden: ['durable'], pinnedTop: ['durable'], readerParents: { child: 'durable' } }),
     hidden: new Set(['durable']),
     pinnedTop: new Set(['durable']),
     sessionAliases: new Map(),
-    memento: null,
+    memento: { update: () => Promise.resolve() },
     readPrint() {
       return '';
     },
@@ -15036,7 +15036,7 @@ test('a delayed browser save preserves durable provider memberships', () => {
       return resolveSessionAlias(this.sessionAliases, session);
     },
   };
-  saveState.call(provider, {
+  await saveState.call(provider, {
     hidden: ['provisional'],
     pinnedTop: ['provisional'],
     readerParents: { forged: 'parent' },
@@ -15055,18 +15055,19 @@ test('a delayed browser save preserves durable provider memberships', () => {
 });
 
 // Browser saves preserve the host-owned saved-filter catalog and the selected filter's query and sort.
-test('a browser save on a saved filter keeps its selection and lens words through a reload', () => {
+test('a browser save on a saved filter keeps its selection and lens words through a reload', async () => {
   const saveState = new Function(
     'normalizePanelState',
-    `return function (state) {\n${methodBody('private saveState(state: unknown)').replace(': ReadState', '')}\n};`,
-  )(normalizePanelState);
+    'STATE_KEY',
+    `return function (state, canPersist = () => true) {\n${methodBody('private saveState(').replace(': ReadState', '')}\n};`,
+  )(normalizePanelState, 'arc.panelState');
   const railFilters = [{ id: 'f1', name: 'Costs', query: 'cost:>5', sort: 'cost-desc', lens: 'needs-you' }];
   const provider = {
     saved: normalizePanelState({ railFilters }),
     hidden: new Set<string>(),
     pinnedTop: new Set<string>(),
     sessionAliases: new Map(),
-    memento: null,
+    memento: { update: () => Promise.resolve() },
     readPrint() {
       return '';
     },
@@ -15077,7 +15078,7 @@ test('a browser save on a saved filter keeps its selection and lens words throug
       return resolveSessionAlias(this.sessionAliases, session);
     },
   };
-  saveState.call(provider, {
+  await saveState.call(provider, {
     railFilterId: 'f1',
     railFilter: 'cost:>5',
     railSort: 'cost-desc',
@@ -24389,7 +24390,7 @@ test('the unsent prompts reach storage and come back out of it', () => {
     'a send never reaches storage, so a restart still loses the prompt an agent process never recorded',
   );
 
-  const saveAt = panelHostSource.indexOf('private saveState(state: unknown): void {');
+  const saveAt = panelHostSource.indexOf('private saveState(');
   const stateSave = memberFrom(panelHostSource, saveAt);
   sourceMatch(
     stateSave,
@@ -24405,7 +24406,7 @@ test('the unsent prompts reach storage and come back out of it', () => {
   );
   sourceMatch(
     forget,
-    /this\.saved\.comments = acceptedComments[\s\S]*update\(STATE_KEY, this\.saved\)/,
+    /this\.saved\.comments = acceptedComments[\s\S]*const resetState = structuredClone\(this\.saved\)[\s\S]*const resetSaved = this\.saveState\(resetState\)[\s\S]*await resetSaved/,
     'a comments-only waiting submission disappears when panel preferences are forgotten',
   );
 
@@ -24480,7 +24481,7 @@ test('the unsent prompts reach storage and come back out of it', () => {
   );
 
   // Preserve host-owned drafts across browser state normalization.
-  const body = memberFrom(panelHostSource, panelHostSource.indexOf('private saveState(state: unknown): void {'));
+  const body = memberFrom(panelHostSource, panelHostSource.indexOf('private saveState('));
   const held = body.indexOf('const drafts = this.saved.drafts;');
   const rebuilt = body.indexOf('this.saved = normalizePanelState(state, railFilters);');
   const put = body.indexOf('this.saved.drafts = drafts;');
@@ -31418,4 +31419,910 @@ test('session reads and channel starts reach the follow-up policy through the pa
     hostMember('public async handleSessionRequest('),
     /this\.onSendDraftPrompt\(draft, \{ text, assets: \[\] \}, undefined, guardedStartContext\(request\)\)/,
   );
+});
+
+test('query listings reject nonmatching identities before checking filesystem freshness', () => {
+  const { provider, sources } = pagedListingFixture(1000);
+  const revisionOf = provider.revisionOf;
+  const checked: string[] = [];
+  provider.revisionOf = (source: any) => {
+    checked.push(source.sessionId);
+    return revisionOf.call(provider, source);
+  };
+  for (const query of ['session:unknown', 'session:unknown -is:agentrun']) {
+    const page = provider.readSessionRequest({ method: 'sessions', params: { query, limit: 1 } });
+    assert.deepEqual(page.sessions, []);
+    assert.deepEqual(checked, [], query);
+    assert.equal(page.coverage, 'complete');
+  }
+  const page = provider.readSessionRequest({ method: 'sessions', params: { query: 'session:session-1', limit: 1 } });
+  assert.deepEqual(
+    page.sessions.map((row: any) => row.id),
+    ['session-1'],
+  );
+  assert.deepEqual(checked, ['session-1'], 'the returned row must retain its independent freshness check');
+  checked.length = 0;
+  const source = sources.find((source) => source.sessionId === 'session-1')!;
+  fs.appendFileSync(source.file, 'changed\n');
+  const stale = provider.readSessionRequest({
+    method: 'sessions',
+    params: { query: 'session:session-1 -is:agentrun', limit: 1 },
+  });
+  assert.deepEqual(stale.sessions, []);
+  assert.equal(stale.coverage, 'incomplete');
+  assert.deepEqual(checked, ['session-1']);
+});
+
+test('query listing filters before paging and binds the complete query to its cursor', () => {
+  const { provider, sources } = pagedListingFixture(300);
+  const query = 'agent:codex -is:archived';
+  provider.hidden.add('session-1');
+  const ids: string[] = [];
+  let cursor: string | undefined;
+  let firstCursor: string | undefined;
+  do {
+    const page = provider.readSessionRequest({
+      method: 'sessions',
+      requester: null,
+      params: { query, limit: 3, ...(cursor ? { cursor } : {}) },
+    });
+    ids.push(...page.sessions.map((row: any) => row.id));
+    cursor = page.next ?? undefined;
+    firstCursor ??= cursor;
+  } while (cursor);
+  assert.deepEqual(
+    ids.sort(),
+    sources
+      .filter((source) => source.agent === 'codex' && source.sessionId !== 'session-1')
+      .map((source) => source.sessionId)
+      .sort(),
+  );
+  for (const changed of [undefined, 'agent:claude'])
+    assert.throws(
+      () => provider.readSessionRequest({ method: 'sessions', params: { cursor: firstCursor, query: changed } }),
+      /scope changed/,
+    );
+  provider.agentRunFor = () => null;
+  const unavailable = provider.readSessionRequest({ method: 'sessions', params: { query: '-is:agentrun' } });
+  assert.equal(unavailable.coverage, 'incomplete');
+  assert.deepEqual(unavailable.sessions, []);
+  assert.throws(
+    () => provider.readSessionRequest({ method: 'sessions', params: { query: 'find:needle' } }),
+    /arc filter/,
+  );
+});
+
+function externalFilterFixture() {
+  const messages: any[] = [];
+  const writes: any[] = [];
+  let resolve!: () => void;
+  let reject!: (error: Error) => void;
+  let waiting = new Promise<void>((yes, no) => {
+    resolve = yes;
+    reject = no;
+  });
+  const webview = {};
+  const host = { webview };
+  const provider: any = Object.assign(Object.create(PanelProvider.prototype), {
+    disposed: false,
+    hosts: [host],
+    readyHosts: new Set([host]),
+    editorPanel: { webview },
+    saved: normalizePanelState({
+      showing: 'selected',
+      labels: { selected: ['keep'] },
+      railFilters: [{ id: 'saved', name: 'Saved', query: 'label:keep' }],
+    }),
+    showing: 'selected',
+    hidden: new Set(),
+    pinnedTop: new Set(),
+    readPrint: () => '',
+    openInEditor() {},
+    sendToHost: async (_host: unknown, message: unknown) => {
+      messages.push(message);
+      return true;
+    },
+    memento: {
+      update: (_key: string, state: unknown) => {
+        writes.push(structuredClone(state));
+        return waiting;
+      },
+    },
+  });
+  const request = (id: string, query: string, signal = new AbortController().signal) =>
+    provider.handleSessionRequest({
+      id,
+      method: 'filter',
+      params: { query },
+      filterContext: { deadline: Date.now() + FILTER_LIMITS.operationMs, signal },
+    });
+  const acknowledge = (
+    message = messages.at(-1),
+    state = { ...provider.saved, railFilter: message.query, railFilterId: 'all' },
+  ) => provider.receiveSessionFilter({ type: 'sessionFilterApplied', request: message.request, state }, host);
+  return {
+    provider,
+    host,
+    messages,
+    writes,
+    request,
+    acknowledge,
+    resolve: () => resolve(),
+    reject: () => reject(new Error('store rejected')),
+    nextSave: () => {
+      waiting = Promise.resolve();
+    },
+  };
+}
+
+function externalResetFixture() {
+  const f = externalFilterFixture();
+  const publications: any[] = [];
+  const browserSaves: Promise<void>[] = [];
+  let displayed = 'old';
+  let durable: any;
+  let publish!: () => void;
+  const publication = new Promise<void>((resolve) => {
+    publish = resolve;
+  });
+  const stores: Array<{ resolve(): void; reject(): void }> = [];
+  Object.assign(f.provider, {
+    queues: {},
+    draftCommentIds: {},
+    drafts: {},
+    sentPrompts: {},
+    assets: {},
+    startedHere: new Set(),
+    hostSessions: new Map(),
+    hostPreviousSessions: new Map(),
+    refresh: async () => {},
+    postRail: () => {},
+    unreadCounts: () => new Map(),
+    post: async (message: any) => {
+      publications.push(message);
+      await publication;
+      resetBrowser(message);
+    },
+  });
+  const savedState = createSavedState(
+    {},
+    { read: () => ({}), write() {} },
+    {
+      send(message) {
+        if (message.type === 'saveState') browserSaves.push(f.provider.saveState(message.state));
+      },
+    },
+  );
+  const resetBrowser = (message: any, peer = false) =>
+    new Function('msg', 'savedState', 'forgetEverything', handlerBody(script, 'forgetState'))(
+      message,
+      savedState,
+      () => {
+        if (!peer) displayed = '';
+        savedState.save({
+          open: [],
+          showing: '',
+          railFilter: '',
+          railFilterId: 'all',
+          railWidth: 270,
+          composerHidden: false,
+          promptFloor: 0,
+          railFolds: [],
+          hidden: [],
+          pinnedTop: [],
+          read: [],
+          readTo: [],
+          since: message.since,
+          comments: [],
+        });
+      },
+    );
+  f.provider.memento.update = (_key: string, state: unknown) => {
+    const snapshot = structuredClone(state);
+    f.writes.push(snapshot);
+    return new Promise<void>((resolve, reject) => {
+      stores.push({
+        resolve() {
+          durable = snapshot;
+          resolve();
+        },
+        reject() {
+          reject(new Error('store rejected'));
+        },
+      });
+    });
+  };
+  const send = f.provider.sendToHost;
+  f.provider.sendToHost = async (host: unknown, message: any) => {
+    displayed = message.query;
+    return send(host, message);
+  };
+  return {
+    ...f,
+    publications,
+    browserSaves,
+    stores,
+    publish,
+    resetBrowser,
+    displayed: () => displayed,
+    durable: () => normalizePanelState(durable),
+  };
+}
+
+test.each(['none', 'unacknowledged', 'queued save', 'started save', 'readiness'])(
+  'confirmed reset orders its storage and browser publication before later filters: %s',
+  async (predecessor) => {
+    vi.useFakeTimers();
+    const warning = (vscode.window as any).showWarningMessage;
+    (vscode.window as any).showWarningMessage = async () => 'Reset';
+    const f = externalResetFixture();
+    try {
+      const ordinary =
+        predecessor === 'queued save' ? f.provider.saveState({ ...f.provider.saved, railFilter: 'ordinary' }) : null;
+      if (predecessor === 'readiness') f.provider.readyHosts.clear();
+      let olderResult: any;
+      const older =
+        predecessor === 'none'
+          ? null
+          : f.request('older', 'session:old').then((value: any) => {
+              olderResult = value;
+            });
+      await vi.advanceTimersByTimeAsync(0);
+      if (predecessor === 'queued save' || predecessor === 'started save') f.acknowledge();
+      await vi.advanceTimersByTimeAsync(0);
+      let admittedResult: any;
+      if (predecessor !== 'none')
+        f.request('before-confirmation', 'session:queued').then((value: any) => {
+          admittedResult = value;
+        });
+      const reset = f.provider.forgetState();
+      await vi.advanceTimersByTimeAsync(0);
+      if (predecessor !== 'none') assert.equal(admittedResult?.status, 'failed');
+      if (older) assert.equal(olderResult?.status, predecessor === 'readiness' ? 'failed' : 'unknown');
+      f.provider.readyHosts.add(f.host);
+      const before = f.messages.length;
+      const later = f.request('later', 'session:new');
+      await vi.advanceTimersByTimeAsync(0);
+      assert.equal(f.messages.length, before, 'later filter passed reset storage');
+      if (predecessor === 'queued save' || predecessor === 'started save') {
+        assert.equal(f.writes.length, 1);
+        f.stores[0].resolve();
+        if (ordinary) await ordinary;
+        await vi.advanceTimersByTimeAsync(0);
+      }
+      assert.equal(f.writes.at(-1).railFilter, '');
+      assert.equal(f.publications.length, 0, 'reset published before its storage settled');
+      f.stores.at(-1)!.resolve();
+      await vi.advanceTimersByTimeAsync(0);
+      assert.equal(f.publications.length, 1);
+      assert.equal(f.messages.length, before, 'later filter passed reset publication');
+      f.publish();
+      await reset;
+      await vi.advanceTimersByTimeAsync(0);
+      assert.equal(f.messages.length, before + 1);
+      f.acknowledge();
+      await vi.advanceTimersByTimeAsync(0);
+      f.stores.at(-1)!.resolve();
+      await vi.advanceTimersByTimeAsync(0);
+      assert.equal((await later).status, 'applied');
+      assert.equal(f.displayed(), 'session:new');
+      assert.equal(f.durable().railFilter, 'session:new');
+      // A peer handles its earlier reset after the applying panel confirms the new query.
+      f.resetBrowser(f.publications[0], true);
+      await vi.advanceTimersByTimeAsync(0);
+      assert.equal(f.browserSaves.length, 0, 'a delayed reset echoed cleared preferences to the host');
+      await Promise.all(f.browserSaves);
+      assert.equal(f.durable().railFilter, 'session:new');
+      assert.equal(f.displayed(), 'session:new');
+    } finally {
+      f.publish();
+      for (const store of f.stores) store.resolve();
+      f.provider.filterRequests?.dispose();
+      (vscode.window as any).showWarningMessage = warning;
+      vi.useRealTimers();
+    }
+  },
+);
+
+test.each(
+  ['started save', 'queued save', 'repeated reset'].flatMap((predecessor) =>
+    [false, true].map((foldLater) => [predecessor, foldLater] as const),
+  ),
+)(
+  'confirmed reset preserves later pinned membership and group expansion: %s, browser collapse %s',
+  async (predecessor, foldLater) => {
+    vi.useFakeTimers();
+    const warning = (vscode.window as any).showWarningMessage;
+    (vscode.window as any).showWarningMessage = async () => 'Reset';
+    const f = externalResetFixture();
+    f.provider.panelSession = (session: string) => session;
+    try {
+      const ordinary =
+        predecessor === 'queued save' ? f.provider.saveState({ ...f.provider.saved, railFilter: 'ordinary' }) : null;
+      const older = f.request('older', 'session:old');
+      await vi.advanceTimersByTimeAsync(0);
+      f.acknowledge();
+      await vi.advanceTimersByTimeAsync(0);
+      const resets = [f.provider.forgetState()];
+      await vi.advanceTimersByTimeAsync(0);
+      if (predecessor === 'repeated reset') {
+        resets.push(f.provider.forgetState());
+        await vi.advanceTimersByTimeAsync(0);
+      }
+      const pin = f.provider.updateSessionMembership('pin', 'selected', true);
+      assert.deepEqual([...f.provider.pinnedTop], ['selected']);
+      assert.equal(f.provider.saved.railFolds[RAIL_FOLDS.top], true);
+      const collapse = foldLater
+        ? f.provider.saveState({ ...f.provider.saved, railFolds: { [RAIL_FOLDS.top]: false } })
+        : Promise.resolve();
+      f.publish();
+      for (let index = 0; index < f.stores.length; index++) {
+        f.stores[index].resolve();
+        await vi.advanceTimersByTimeAsync(0);
+      }
+      await ordinary;
+      await older;
+      await Promise.all(resets);
+      await pin;
+      await collapse;
+      assert.deepEqual([...f.provider.pinnedTop], ['selected']);
+      assert.equal(
+        f.provider.saved.railFolds[RAIL_FOLDS.top],
+        !foldLater,
+        'reset replaced the later pinned group choice',
+      );
+      assert.deepEqual(f.durable().pinnedTop, ['selected']);
+      assert.equal(f.durable().railFolds[RAIL_FOLDS.top], !foldLater, 'restored pinned group lost its later choice');
+    } finally {
+      f.publish();
+      for (const store of f.stores) store.resolve();
+      f.provider.filterRequests?.dispose();
+      (vscode.window as any).showWarningMessage = warning;
+      vi.useRealTimers();
+    }
+  },
+);
+
+test.each(['repeated', 'rejected', 'expired', 'disconnected'])(
+  'reset ordering retains fresh filter progress after %s work',
+  async (ending) => {
+    vi.useFakeTimers();
+    const warning = (vscode.window as any).showWarningMessage;
+    (vscode.window as any).showWarningMessage = async () => 'Reset';
+    const f = externalResetFixture();
+    try {
+      const reset = f.provider.forgetState();
+      const failure = reset.catch(() => {});
+      await vi.advanceTimersByTimeAsync(0);
+      const controller = new AbortController();
+      const later = f.request('waiting', 'session:waiting', controller.signal);
+      let second: Promise<void> | undefined;
+      if (ending === 'repeated') second = f.provider.forgetState();
+      if (ending === 'disconnected') controller.abort();
+      if (ending === 'expired') await vi.advanceTimersByTimeAsync(FILTER_LIMITS.operationMs);
+      await vi.advanceTimersByTimeAsync(0);
+      assert.equal(f.messages.length, 0);
+      if (ending === 'rejected') f.stores[0].reject();
+      else f.stores[0].resolve();
+      f.publish();
+      await failure;
+      await vi.advanceTimersByTimeAsync(0);
+      assert.equal(f.browserSaves.length, 0, 'reset browser handling queued a cleared preference save');
+      if (second) {
+        assert.equal(f.writes.length, 2);
+        f.stores[1].resolve();
+        await second;
+      }
+      await vi.advanceTimersByTimeAsync(0);
+      if (ending === 'rejected') {
+        f.acknowledge();
+        await vi.advanceTimersByTimeAsync(0);
+        f.stores.at(-1)!.resolve();
+        assert.equal((await later).status, 'applied');
+      } else {
+        assert.equal((await later).status, 'failed');
+        assert.equal(f.messages.length, 0);
+      }
+      const fresh = f.request('fresh', 'session:fresh');
+      await vi.advanceTimersByTimeAsync(0);
+      f.acknowledge();
+      await vi.advanceTimersByTimeAsync(0);
+      f.stores.at(-1)!.resolve();
+      assert.equal((await fresh).status, 'applied');
+      assert.equal(f.displayed(), 'session:fresh');
+      assert.equal(f.durable().railFilter, 'session:fresh');
+    } finally {
+      f.publish();
+      for (const store of f.stores) store.resolve();
+      f.provider.filterRequests?.dispose();
+      (vscode.window as any).showWarningMessage = warning;
+      vi.useRealTimers();
+    }
+  },
+);
+
+test('queued browser saves preserve later host-owned labels, comments, and drafts', async () => {
+  const f = externalFilterFixture();
+  let durable: any;
+  let writes = 0;
+  let release!: () => void;
+  const waiting = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  f.provider.memento.update = (_key: string, state: unknown) => {
+    const snapshot = structuredClone(state);
+    writes++;
+    if (writes === 1)
+      return waiting.then(() => {
+        durable = snapshot;
+      });
+    durable = snapshot;
+    return Promise.resolve();
+  };
+  Object.assign(f.provider, {
+    post: async () => {},
+    postRail() {},
+    labelEditorReply: () => ({}),
+    usagePayload: () => ({}),
+    drafts: { selected: 'New unsent text' },
+    sentPrompts: {},
+    promptsBySession: {},
+    assets: {},
+    queues: {},
+    draftCommentIds: {},
+  });
+  const first = f.provider.saveState({ ...f.provider.saved, railFilter: 'session:one' });
+  const second = f.provider.saveState({ ...f.provider.saved, railFilter: 'session:two' });
+  await f.provider.changeSessionLabels('selected', ['new label']);
+  new Function('msg', 'applyComment', 'STATE_KEY', handlerBody(panelHostSource, 'note')).call(
+    f.provider,
+    {
+      note: {
+        op: 'write',
+        note: {
+          id: 'new-comment',
+          sessionId: 'selected',
+          turnKey: 'selected:1',
+          part: 'summary',
+          quote: '',
+          note: 'New comment',
+          headline: 'Work',
+          sessionTitle: 'Selected',
+          turnAt: 1,
+          at: 2,
+        },
+      },
+    },
+    applyComment,
+    'arc.panelState',
+  );
+  await f.provider.writeDrafts();
+  release();
+  await first;
+  await second;
+  const restored = normalizePanelState(durable);
+  assert.equal(restored.railFilter, 'session:two');
+  assert.deepEqual(restored.labels.selected, ['new label']);
+  assert.equal(restored.comments[0]?.note, 'New comment');
+  assert.equal(restored.drafts.selected, 'New unsent text');
+});
+
+test.each([false, true])('queued filter saves preserve a later pin and browser fold choice: %s', async (foldLater) => {
+  const f = externalFilterFixture();
+  f.provider.saved.railFolds = { [RAIL_FOLDS.top]: false };
+  f.provider.panelSession = (session: string) => session;
+  f.provider.postRail = () => {};
+  let durable: any;
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let writes = 0;
+  f.provider.memento.update = (_key: string, state: unknown) => {
+    const snapshot = structuredClone(state);
+    if (++writes === 1)
+      return held.then(() => {
+        durable = snapshot;
+      });
+    durable = snapshot;
+    return Promise.resolve();
+  };
+  const first = f.provider.saveState({ ...f.provider.saved, railFilter: 'session:one' });
+  const clear = f.request('clear', '');
+  await vi.waitFor(() => assert.equal(f.messages.length, 1));
+  f.acknowledge();
+  await f.provider.updateSessionMembership('pin', 'selected', true);
+  assert.equal(f.provider.saved.railFolds[RAIL_FOLDS.top], true);
+  const later = foldLater
+    ? f.provider.saveState({ ...f.provider.saved, railFolds: { [RAIL_FOLDS.top]: false } })
+    : Promise.resolve();
+  release();
+  await first;
+  assert.equal((await clear).status, 'applied');
+  await later;
+  assert.equal(f.provider.saved.railFolds[RAIL_FOLDS.top], !foldLater);
+  const restored = normalizePanelState(durable);
+  assert.equal(restored.railFolds[RAIL_FOLDS.top], !foldLater);
+  assert.deepEqual(restored.pinnedTop, ['selected']);
+  assert.equal(restored.railFilter, '');
+});
+
+test('queued browser saves preserve a later preference reset', async () => {
+  const f = externalFilterFixture();
+  Object.assign(f.provider, {
+    queues: {},
+    draftCommentIds: {},
+    drafts: {},
+    sentPrompts: {},
+    assets: {},
+    startedHere: new Set(),
+    hostSessions: new Map(),
+    hostPreviousSessions: new Map(),
+    post: async () => {},
+    refresh: async () => {},
+    postRail: () => {},
+    unreadCounts: () => new Map(),
+  });
+  let durable: any;
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let writes = 0;
+  f.provider.memento.update = (_key: string, state: unknown) => {
+    const snapshot = structuredClone(state);
+    if (++writes === 1)
+      return held.then(() => {
+        durable = snapshot;
+      });
+    durable = snapshot;
+    return Promise.resolve();
+  };
+  const first = f.provider.saveState({ ...f.provider.saved, railFilter: 'session:one' });
+  const second = f.provider.saveState({ ...f.provider.saved, railFilter: 'session:two', read: ['selected'] });
+  const originalWarning = (vscode.window as any).showWarningMessage;
+  (vscode.window as any).showWarningMessage = async () => 'Reset';
+  try {
+    const reset = f.provider.forgetState();
+    await vi.waitFor(() => assert.equal(f.provider.showing, null));
+    release();
+    await first;
+    await second;
+    await reset;
+    const restored = normalizePanelState(durable);
+    assert.equal(restored.railFilter, '');
+    assert.deepEqual(restored.read, []);
+    assert.deepEqual(restored.labels, {});
+    assert.equal(restored.showing, '');
+    assert.deepEqual(restored.railFolds, normalizePanelState(null).railFolds);
+  } finally {
+    (vscode.window as any).showWarningMessage = originalWarning;
+  }
+});
+
+test.each([false, true])(
+  'a preference reset leaves an external filter unconfirmed after storage started: %s',
+  async (started) => {
+    vi.useFakeTimers();
+    const originalWarning = (vscode.window as any).showWarningMessage;
+    const f = externalFilterFixture();
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let durable: any;
+    Object.assign(f.provider, {
+      queues: {},
+      draftCommentIds: {},
+      drafts: {},
+      sentPrompts: {},
+      assets: {},
+      startedHere: new Set(),
+      hostSessions: new Map(),
+      hostPreviousSessions: new Map(),
+      post: async () => {},
+      refresh: async () => {},
+      postRail: () => {},
+      unreadCounts: () => new Map(),
+    });
+    f.provider.memento.update = (_key: string, state: unknown) => {
+      const snapshot = structuredClone(state);
+      f.writes.push(snapshot);
+      if (f.writes.length === 1)
+        return held.then(() => {
+          durable = snapshot;
+        });
+      durable = snapshot;
+      return Promise.resolve();
+    };
+    (vscode.window as any).showWarningMessage = async () => 'Reset';
+    try {
+      const ordinary = started
+        ? Promise.resolve()
+        : f.provider.saveState({ ...f.provider.saved, railFilter: 'ordinary' });
+      const filter = f.request('superseded', 'session:one');
+      await vi.advanceTimersByTimeAsync(0);
+      f.acknowledge();
+      await vi.advanceTimersByTimeAsync(0);
+      assert.equal(f.writes.length, 1);
+      const reset = f.provider.forgetState();
+      await vi.advanceTimersByTimeAsync(0);
+      assert.equal(f.provider.showing, null);
+      const next = f.request('after-reset', 'session:two');
+      await vi.advanceTimersByTimeAsync(0);
+      assert.equal(f.messages.length, 1, 'reset released an unsettled storage barrier');
+      release();
+      await ordinary;
+      await vi.advanceTimersByTimeAsync(0);
+      assert.equal((await filter).status, 'unknown', 'reset confirmed a superseded filter');
+      await reset;
+      assert.deepEqual(
+        f.writes.map((state) => state.railFilter),
+        [started ? 'session:one' : 'ordinary', ''],
+      );
+      assert.equal(f.provider.saved.railFilter, '');
+      const restored = normalizePanelState(durable);
+      assert.equal(restored.railFilter, '');
+      assert.deepEqual(restored.labels, {});
+      assert.equal(restored.showing, '');
+      assert.equal(f.messages.length, 2);
+      f.acknowledge();
+      await vi.advanceTimersByTimeAsync(0);
+      assert.equal((await next).status, 'applied');
+      assert.equal(f.writes.at(-1).railFilter, 'session:two');
+    } finally {
+      release();
+      f.provider.filterRequests?.dispose();
+      (vscode.window as any).showWarningMessage = originalWarning;
+      vi.useRealTimers();
+    }
+  },
+);
+
+test.each(['expiry', 'overall expiry', 'elapsed clock', 'disconnect', 'dispose'])(
+  'queued filter persistence never starts after %s',
+  async (ending) => {
+    vi.useFakeTimers();
+    try {
+      const f = externalFilterFixture();
+      let release!: () => void;
+      const held = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      f.provider.memento.update = (_key: string, state: unknown) => {
+        f.writes.push(structuredClone(state));
+        return f.writes.length === 1 ? held : Promise.resolve();
+      };
+      const first = f.provider.saveState({ ...f.provider.saved, railFilter: 'ordinary' });
+      const signal = new AbortController();
+      const filter = f.request('held-filter', 'session:expired', signal.signal);
+      await vi.advanceTimersByTimeAsync(0);
+      if (ending === 'overall expiry') await vi.advanceTimersByTimeAsync(25_000);
+      f.acknowledge();
+      await vi.advanceTimersByTimeAsync(0);
+      assert.equal(f.writes.length, 1);
+      if (ending === 'disconnect') signal.abort();
+      else if (ending === 'dispose') f.provider.filterRequests.dispose();
+      else if (ending === 'elapsed clock') vi.setSystemTime(Date.now() + FILTER_LIMITS.persistMs);
+      else await vi.advanceTimersByTimeAsync(ending === 'overall expiry' ? 5_000 : FILTER_LIMITS.persistMs);
+      if (ending !== 'elapsed clock') assert.equal((await filter).status, 'unknown');
+      release();
+      await first;
+      await vi.advanceTimersByTimeAsync(0);
+      if (ending === 'elapsed clock') assert.equal((await filter).status, 'unknown');
+      assert.equal(f.writes.length, 1, 'a cancelled filter began storage after its queued wait');
+      if (ending !== 'dispose') {
+        const fresh = f.request('fresh-filter', 'session:fresh');
+        await vi.advanceTimersByTimeAsync(0);
+        assert.equal(f.messages.length, 2);
+        f.acknowledge();
+        await vi.advanceTimersByTimeAsync(0);
+        assert.equal((await fresh).status, 'applied');
+        assert.equal(f.writes.at(-1).railFilter, 'session:fresh');
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  },
+);
+
+test('filter persistence allowance includes queue wait before storage starts', async () => {
+  vi.useFakeTimers();
+  try {
+    const f = externalFilterFixture();
+    let release!: () => void;
+    let settle!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const storing = new Promise<void>((resolve) => {
+      settle = resolve;
+    });
+    f.provider.memento.update = (_key: string, state: unknown) => {
+      f.writes.push(structuredClone(state));
+      return f.writes.length === 1 ? held : storing;
+    };
+    const first = f.provider.saveState({ ...f.provider.saved, railFilter: 'ordinary' });
+    const filter = f.request('held-filter', 'session:one');
+    await vi.advanceTimersByTimeAsync(0);
+    f.acknowledge();
+    await vi.advanceTimersByTimeAsync(FILTER_LIMITS.persistMs - 1_000);
+    release();
+    await first;
+    await vi.advanceTimersByTimeAsync(0);
+    assert.equal(f.writes.length, 2);
+    await vi.advanceTimersByTimeAsync(1_000);
+    assert.equal((await filter).status, 'unknown');
+    const next = f.request('next-filter', 'session:two');
+    await vi.advanceTimersByTimeAsync(0);
+    assert.equal(f.messages.length, 1);
+    settle();
+    await vi.advanceTimersByTimeAsync(0);
+    assert.equal(f.messages.length, 2);
+    f.acknowledge();
+    await vi.advanceTimersByTimeAsync(0);
+    assert.equal((await next).status, 'applied');
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('external filtering confirms persistence and restores the selected session and saved catalog', async () => {
+  const f = externalFilterFixture();
+  let settled = false;
+  const result = f.request('first', 'session:claude:one OR session:codex:two').then((value: any) => {
+    settled = true;
+    return value;
+  });
+  await vi.waitFor(() => assert.equal(f.messages.length, 1));
+  f.acknowledge();
+  await vi.waitFor(() => assert.equal(f.writes.length, 1));
+  assert.equal(settled, false);
+  f.resolve();
+  assert.equal((await result).status, 'applied');
+  const restored = normalizePanelState(f.writes[0]);
+  assert.equal(restored.railFilter, 'session:claude:one OR session:codex:two');
+  assert.equal(restored.showing, 'selected');
+  assert.deepEqual(restored.labels.selected, ['keep']);
+  assert.equal(restored.railFilters[0].query, 'label:keep');
+  f.nextSave();
+  const clear = f.request('clear', '');
+  await vi.waitFor(() => assert.equal(f.messages.length, 2));
+  f.acknowledge();
+  assert.equal((await clear).status, 'applied');
+  assert.equal(f.writes.at(-1).railFilter, '');
+});
+
+test('a rejected filter save fails without claiming to restore the displayed query', async () => {
+  const f = externalFilterFixture();
+  const result = f.request('reject', 'session:one');
+  await vi.waitFor(() => assert.equal(f.messages.length, 1));
+  f.acknowledge();
+  await vi.waitFor(() => assert.equal(f.writes.length, 1));
+  f.reject();
+  assert.equal((await result).status, 'failed');
+  assert.equal(f.provider.saved.railFilter, 'session:one');
+});
+
+test('filter persistence expiry retains ordering and expires queued or disconnected assignments', async () => {
+  vi.useFakeTimers();
+  try {
+    const f = externalFilterFixture();
+    const first = f.request('first', 'session:one');
+    await vi.advanceTimersByTimeAsync(0);
+    f.acknowledge();
+    await vi.advanceTimersByTimeAsync(0);
+    const second = f.request('expired', 'session:two');
+    const disconnected = new AbortController();
+    const third = f.request('disconnected', 'session:three', disconnected.signal);
+    disconnected.abort();
+    await vi.advanceTimersByTimeAsync(FILTER_LIMITS.persistMs);
+    assert.equal((await first).status, 'unknown');
+    assert.equal((await third).status, 'failed');
+    await vi.advanceTimersByTimeAsync(FILTER_LIMITS.operationMs);
+    assert.equal((await second).status, 'failed');
+    assert.equal(f.messages.length, 1);
+    f.resolve();
+    await vi.advanceTimersByTimeAsync(0);
+    assert.equal(f.messages.length, 1);
+    f.nextSave();
+    const fresh = f.request('fresh', 'session:four');
+    await vi.advanceTimersByTimeAsync(0);
+    assert.equal(f.messages.length, 2);
+    f.acknowledge();
+    await vi.advanceTimersByTimeAsync(0);
+    assert.equal((await fresh).status, 'applied');
+    f.acknowledge(f.messages[0]);
+    assert.equal(f.writes.length, 2);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('filter readiness survives one second and never applies after readiness expiry or disposal', async () => {
+  vi.useFakeTimers();
+  try {
+    const queue = new SessionFilterRequests();
+    let ready!: () => void;
+    let applications = 0;
+    const context = () => ({ deadline: Date.now() + FILTER_LIMITS.operationMs, signal: new AbortController().signal });
+    const request = () =>
+      queue.run(
+        context(),
+        () =>
+          new Promise<void>((resolve) => {
+            ready = resolve;
+          }),
+        async () => {
+          applications++;
+        },
+      );
+    const first = request();
+    await vi.advanceTimersByTimeAsync(2_000);
+    ready();
+    await vi.advanceTimersByTimeAsync(0);
+    assert.equal(((await first) as any).status, 'applied');
+    const expired = request();
+    await vi.advanceTimersByTimeAsync(FILTER_LIMITS.readyMs);
+    assert.equal(((await expired) as any).status, 'failed');
+    ready();
+    await vi.advanceTimersByTimeAsync(0);
+    assert.equal(applications, 1);
+    const disposed = request();
+    await vi.advanceTimersByTimeAsync(0);
+    queue.dispose();
+    assert.equal(((await disposed) as any).status, 'failed');
+    ready();
+    await vi.advanceTimersByTimeAsync(0);
+    assert.equal(applications, 1);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('panel cancellation during filter persistence cannot confirm success or release the save barrier', async () => {
+  const f = externalFilterFixture();
+  const first = f.request('disposed-save', 'session:one');
+  await vi.waitFor(() => assert.equal(f.messages.length, 1));
+  f.acknowledge();
+  await vi.waitFor(() => assert.equal(f.writes.length, 1));
+  const pending = f.provider.filterApplications.get('disposed-save');
+  assert.equal(pending.saving, true);
+  pending.operation.cancel();
+  assert.equal((await first).status, 'unknown');
+  const next = f.request('after-dispose', 'session:two');
+  await Promise.resolve();
+  assert.equal(f.messages.length, 1);
+  f.acknowledge(f.messages[0]);
+  assert.equal(f.writes.length, 1);
+  f.resolve();
+  f.nextSave();
+  await vi.waitFor(() => assert.equal(f.messages.length, 2));
+  f.acknowledge();
+  assert.equal((await next).status, 'applied');
+  assert.equal(f.writes.at(-1).railFilter, 'session:two');
+});
+
+test('filter acknowledgment cannot start storage for another request or after disconnect', async () => {
+  const f = externalFilterFixture();
+  const cancelled = new AbortController();
+  const result = f.request('first', 'session:one', cancelled.signal);
+  await vi.waitFor(() => assert.equal(f.messages.length, 1));
+  f.acknowledge({ ...f.messages[0], request: 'different' });
+  assert.equal(f.writes.length, 0);
+  cancelled.abort();
+  assert.equal((await result).status, 'unknown');
+  f.acknowledge();
+  assert.equal(f.writes.length, 0);
+});
+
+test('qualified listing selectors preserve duplicate-source ambiguity across providers', () => {
+  const { provider, sources } = pagedListingFixture(30);
+  sources[1].sessionId = sources[2].sessionId = 'session-0';
+  for (const query of ['session:session-0', 'session:claude:session-0']) {
+    const page = provider.readSessionRequest({ method: 'sessions', params: { query } });
+    assert.equal(page.sessions.length, query.includes('claude') ? 2 : 3);
+    assert.ok(page.sessions.every((row: any) => row.ambiguous && row.id === 'session-0'));
+    assert.equal(new Set(page.sessions.map((row: any) => row.source)).size, page.sessions.length);
+  }
 });
