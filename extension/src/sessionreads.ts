@@ -324,20 +324,22 @@ export function sessionCatalogMembership(
 }
 
 // The membership a complete discovery reply proves for a published catalog, or undefined when the reply did not answer each file
-// at its current device and inode. A file that only grew after the reply is still the file the reply answered.
+// at its current device and inode, or when the reply also answered a removed file. Growth keeps the answered identity.
 export function sessionDiscoveryMembership(
   scope: string,
   catalog: readonly SessionFile[],
   answered: ReadonlyMap<string, SessionFile>,
 ): string | undefined {
-  const proven = catalog.every((source) => {
-    const reply = answered.get(source.file);
-    return (
-      !!reply &&
-      identityText(reply.dev) === identityText(source.dev) &&
-      identityText(reply.ino) === identityText(source.ino)
-    );
-  });
+  const proven =
+    answered.size === new Set(catalog.map((source) => source.file)).size &&
+    catalog.every((source) => {
+      const reply = answered.get(source.file);
+      return (
+        !!reply &&
+        identityText(reply.dev) === identityText(source.dev) &&
+        identityText(reply.ino) === identityText(source.ino)
+      );
+    });
   return proven ? sessionCatalogMembership(scope, catalog) : undefined;
 }
 

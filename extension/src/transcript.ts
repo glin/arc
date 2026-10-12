@@ -900,6 +900,31 @@ function replacedAtPath(held: SessionFile, now: CatalogRevision): boolean {
   );
 }
 
+// Check held identities before catalog publication without blocking the extension host on filesystem reads.
+// Append-only changes retain the catalog. A missing or replaced source requires discovery again.
+export async function replacedCatalogFiles(
+  sessions: readonly SessionFile[],
+  signal: AbortSignal,
+  statOf: (file: string) => Promise<CatalogRevision | null> = async (file) => {
+    try {
+      return revisionOf(await fs.promises.stat(file, { bigint: true }));
+    } catch {
+      return null;
+    }
+  },
+): Promise<string[]> {
+  const changed: string[] = [];
+  for (let at = 0; at < sessions.length && !signal.aborted; at += 32) {
+    await Promise.all(
+      sessions.slice(at, at + 32).map(async (session) => {
+        const current = await statOf(session.file);
+        if (!current || replacedAtPath(session, current)) changed.push(session.file);
+      }),
+    );
+  }
+  return changed;
+}
+
 // Updates one selected session revision in a held catalog without changing its order.
 // The selected tail needs its current size to include new records.
 // Returns null for a missing selection, catalog row, or file, or a file replaced at its path.

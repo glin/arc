@@ -101,6 +101,7 @@ import {
   sameSessionRevision,
   revisionOf as fileRevisionOf,
   revalidatedCatalog,
+  replacedCatalogFiles,
   trustedListedRevisions,
   revalidatedCatalogPaths,
   scanForHumanPrompt,
@@ -3203,6 +3204,7 @@ export class PanelProvider implements vscode.Disposable {
       if (source.cwd) this.scopeSessionDirectories.set(source.sessionId, source.cwd);
     }
     this.authoritativeCatalog = null;
+    this.sessionPageIndex = undefined;
     this.authoritativeCatalogScope = undefined;
     this.completeCatalogScope = undefined;
     this.sessionReadDiscoveryRevision = undefined;
@@ -7662,6 +7664,29 @@ export class PanelProvider implements vscode.Disposable {
       if (!this.repositoryScopeReady) {
         return;
       }
+      if (!selectedOnly) {
+        const checkedPaths = new Set(
+          (targetedRefreshPaths?.length
+            ? targetedRefreshPaths
+            : [all.find((session) => session.sessionId === this.showing)?.file].filter(
+                (file): file is string => file !== undefined,
+              )
+          ).map(normalizeFsPath),
+        );
+        const heldSources = all.filter(
+          (session) =>
+            session.childTranscript === true ||
+            session.agent === 'codex' ||
+            (!this.catalogWalked && !checkedPaths.has(normalizeFsPath(session.file))),
+        );
+        const changed = await replacedCatalogFiles(heldSources, controller.signal);
+        if (controller.signal.aborted || generation !== this.refreshGeneration) return;
+        if (changed.length) {
+          for (const file of changed) this.codexStats.markChanged(path.dirname(file), path.basename(file));
+          all = this.allSessions(false);
+          reuseCatalog = false;
+        }
+      }
       const dispatchCatalog =
         !selectedOnly && this.claudeChildReferences?.length
           ? new Map(all.map((session) => [session.sessionId, session]))
@@ -7713,6 +7738,7 @@ export class PanelProvider implements vscode.Disposable {
               ? sessionDiscoveryMembership(catalogScope, all, revisions)
               : undefined;
           this.sessionQueryDiscoveryPending = !this.sessionReadDiscoveryRevision;
+          if (revisions && !this.sessionReadDiscoveryRevision) this.dispatchDiscoveryPending = true;
         } else if (answered) {
           // The catalog was listed again with a session the complete reply never answered. Discovery runs again before the list
           // completes, and the follow-up refresh this schedules lets the line clear.

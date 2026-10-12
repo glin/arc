@@ -2,6 +2,7 @@ import { test, vi } from 'vitest';
 import { EXPORT_LIMITS, ExportLimitError } from './exportlimits.ts';
 import {
   scanClaudeRelationshipQuantum,
+  replacedCatalogFiles,
   scanClaudeChildSessionReferences,
   type ClaudeRelationshipCursor,
 } from './transcript';
@@ -6180,6 +6181,41 @@ test('Claude child validation rereads cwd when a same-size same-mtime file repla
     "a replacement child reused the old file identity's working directory",
   );
   assert.equal(cwdReads, 2);
+});
+
+test('catalog identity checks bound asynchronous stats and preserve appends', async () => {
+  const sources = Array.from({ length: 10_000 }, (_, n) => ({
+    agent: 'claude' as const,
+    sessionId: String(n),
+    file: String(n),
+    cwd: '/repo',
+    size: 10,
+    mtimeMs: 1,
+    dev: 1,
+    ino: n + 1,
+  }));
+  let active = 0;
+  let peak = 0;
+  let calls = 0;
+  const changed = await replacedCatalogFiles(sources, new AbortController().signal, async (file) => {
+    calls++;
+    peak = Math.max(peak, ++active);
+    await Promise.resolve();
+    active--;
+    const source = sources[Number(file)];
+    return file === '0' ? { ...source, ino: 999 } : file === '1' ? null : { ...source, size: 20, mtimeMs: 2 };
+  });
+  assert.deepEqual(changed.sort(), ['0', '1']);
+  assert.equal(calls, sources.length);
+  assert.equal(peak, 32);
+  const aborted = new AbortController();
+  aborted.abort();
+  assert.deepEqual(
+    await replacedCatalogFiles(sources, aborted.signal, async () => {
+      throw new Error('aborted check started I/O');
+    }),
+    [],
+  );
 });
 
 test('a background subagent stays running until its notification arrives', () => {

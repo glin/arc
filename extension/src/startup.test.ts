@@ -3,7 +3,7 @@ import { pendingResponseSessionAdmitted, resolveResponseSession } from './domain
 import { createPanelVisibility } from './panelvisibility';
 import { outcomesFor } from './timelinestate';
 import { selectedDependencies } from './selectedsource';
-import { projectSlug, isInside } from './transcript';
+import { projectSlug, isInside, replacedCatalogFiles, ClaudeChildSessionCache } from './transcript';
 import { randomUUID } from 'node:crypto';
 import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
@@ -1000,6 +1000,8 @@ function harness(pendingRefresh = false, registerRefreshHandler = true, extraMet
     const serializedMessageBytes = () => 0;
     const isInside = () => true;
     const revalidatedCatalog = (sessions) => sessions;
+    const replacedCatalogFiles = async () => [];
+    const normalizeFsPath = ${normalizeFsPath.toString()};
     const messageByteBudget = () => null;
     const spendFileVersion = () => 'unchanged';
     const codexSessionIndexPath = () => 'index';
@@ -1137,7 +1139,7 @@ function completeDiscoveryHarness(
       ts.isClassDeclaration(statement) && statement.name?.text === 'PanelProvider',
   );
   assert.ok(owner);
-  scope = { sameSessionRevision, outcomesFor, ...scope };
+  scope = { sameSessionRevision, outcomesFor, replacedCatalogFiles: async () => [], ...scope };
   const names = [
     'show',
     'publishWindowState',
@@ -2315,6 +2317,144 @@ test('a refresh stamps the published membership when a source grew after its com
   assert.equal(
     provider.sessionReadDiscoveryRevision,
     sessionCatalogMembership(JSON.stringify(provider.repositoryScopeRoots), published),
+  );
+});
+
+for (const route of ['reused', 'targeted', 'full walk'] as const) {
+  for (const replaced of ['Claude child', 'Codex rollout'] as const) {
+    test(`a ${route} catalog refresh replaces an unselected ${replaced}`, async () => {
+      const directory = tempDir('catalog-held-identities-');
+      const fixed = new Date('2026-08-25T12:00:00Z');
+      const childFile = path.join(directory, 'agent-child.jsonl');
+      const rollout = path.join(directory, 'rollout.jsonl');
+      for (const file of [childFile, rollout]) {
+        fs.writeFileSync(file, 'original\n');
+        fs.utimesSync(file, fixed, fixed);
+      }
+      const children = new ClaudeChildSessionCache(() => directory);
+      const reference = { file: childFile, parentSessionId: 'parent', sessionId: 'child', toolUseIds: [] };
+      const child = children.read(reference, [directory])!;
+      const stats = new CodexStatCache(undefined, () => fixed.getTime() + 24 * 60 * 60_000);
+      const codex = {
+        ...stats.get(rollout)!,
+        file: rollout,
+        sessionId: 'codex',
+        agent: 'codex',
+        cwd: directory,
+        activity: 1,
+      };
+      const parent = { ...codex, file: 'parent.jsonl', sessionId: 'parent', agent: 'claude' };
+      const otherParent = { ...parent, file: 'other-parent.jsonl', sessionId: 'other-parent' };
+      const checked: string[] = [];
+      const stat = async (file: string) => {
+        checked.push(file);
+        return file === parent.file || file === otherParent.file
+          ? parent
+          : revisionOf(await fs.promises.stat(file, { bigint: true }));
+      };
+      const provider = completeDiscoveryHarness(undefined, false, [], {
+        replacedCatalogFiles: (sources: any[], signal: AbortSignal) => replacedCatalogFiles(sources, signal, stat),
+        path,
+      });
+      provider.repositoryScopeRoots = [directory];
+      provider.showing = parent.sessionId;
+      provider.catalogWalked = route === 'full walk';
+      provider.targetedRefreshPaths = route === 'targeted' ? [parent.file] : null;
+      provider.partial = [parent, otherParent, child, codex];
+      provider.catalog = { sessions: provider.partial };
+      provider.authoritativeCatalog = provider.partial;
+      const oldMembership = sessionCatalogMembership(JSON.stringify([directory]), provider.partial);
+      provider.sessionReadDiscoveryRevision = oldMembership;
+      provider.codexStats = stats;
+      let walks = 0;
+      provider.allSessions = (reuse: boolean) => {
+        if (reuse) return provider.catalog.sessions;
+        walks++;
+        provider.catalog = { sessions: [parent, otherParent, child, { ...codex, ...stats.get(rollout)! }] };
+        return provider.catalog.sessions;
+      };
+      let discoveries = 0;
+      provider.prepareClaudeChildren = function (this: any) {
+        discoveries++;
+        const sessions = this.catalog.sessions.map((source: any) =>
+          source.file === childFile ? children.read(reference, [directory])! : source,
+        );
+        this.catalog = { sessions };
+        this.discoveryComplete = {
+          scope: JSON.stringify([directory]),
+          files: new Set(sessions.map((source: any) => source.file)),
+          revisions: new Map(sessions.map((source: any) => [source.file, source])),
+        };
+        return Promise.resolve(true);
+      };
+      const changedFile = replaced === 'Claude child' ? childFile : rollout;
+      for (const file of [changedFile]) {
+        const replacement = file + '.next';
+        fs.writeFileSync(replacement, 'replaced\n');
+        fs.utimesSync(replacement, fixed, fixed);
+        fs.renameSync(replacement, file);
+      }
+      assert.equal(stats.get(rollout)?.ino, codex.ino, 'the inactive cache did not retain the original identity');
+      await provider.refresh(false, route !== 'full walk');
+      for (const held of [child, codex]) {
+        const published = provider.authoritativeCatalog.find((source: any) => source.file === held.file);
+        if (held.file === changedFile) {
+          assert.notEqual(published.ino, held.ino, 'the published catalog retained a replaced identity');
+        } else {
+          assert.equal(published.ino, held.ino, 'the unchanged source lost its identity');
+        }
+        assert.equal(published.size, held.size);
+        assert.equal(published.mtimeMs, held.mtimeMs);
+      }
+      assert.notEqual(provider.sessionReadDiscoveryRevision, oldMembership);
+      assert.ok(checked.includes(childFile), 'the refresh omitted the held child identity');
+      assert.ok(checked.includes(rollout), 'the refresh omitted the cached Codex identity');
+      assert.equal(walks, route === 'full walk' ? 2 : 1);
+      assert.equal(checked.includes(parent.file), false, 'the refresh repeated the checked parent identity');
+      assert.equal(
+        checked.includes(otherParent.file),
+        route !== 'full walk',
+        'the refresh omitted an unchecked parent identity',
+      );
+      assert.equal(discoveries, 1, 'catalog reuse skipped child discovery after replacement');
+    });
+  }
+}
+
+test('a carried discovery reply after removal clears listing coverage while completing the loading line', async () => {
+  const surviving = {
+    file: 'surviving.jsonl',
+    sessionId: 'surviving',
+    agent: 'claude',
+    activity: 1,
+    size: 10,
+    mtimeMs: 1,
+    dev: '7',
+    ino: '9',
+  };
+  const removed = { ...surviving, file: 'removed.jsonl', sessionId: 'removed', ino: '10' };
+  const provider = completeDiscoveryHarness();
+  provider.partial = [surviving];
+  provider.catalog = { sessions: provider.partial };
+  provider.prepareClaudeChildren = function (this: any) {
+    this.discoveryComplete = {
+      scope: JSON.stringify(this.repositoryScopeRoots),
+      files: new Set([surviving.file, removed.file]),
+      revisions: new Map([
+        [surviving.file, surviving],
+        [removed.file, removed],
+      ]),
+    };
+    return Promise.resolve(true);
+  };
+  await provider.refresh(true);
+  assert.equal(provider.completeCatalogScope, JSON.stringify(provider.repositoryScopeRoots));
+  assert.equal(provider.sessionReadDiscoveryRevision, undefined);
+  assert.equal(provider.sessionQueryDiscoveryPending, true);
+  assert.equal(
+    provider.dispatchDiscoveryPending,
+    true,
+    'the missing listing proof did not request another discovery pass',
   );
 });
 
@@ -3775,13 +3915,15 @@ test('restored startup waits for all required metadata before its first payload'
   }));
   provider.catalog = { sessions: provider.partial };
   provider.discovery = Promise.resolve(true);
+  let metadataStarted = false;
   let releaseMetadata: (value: boolean) => void = () => {};
   provider.prepareMetadata = () =>
     new Promise<boolean>((resolve) => {
       releaseMetadata = resolve;
+      metadataStarted = true;
     });
   const startup = provider.refresh(true);
-  await vi.waitFor(() => assert.notEqual(releaseMetadata.toString(), '() => {}'));
+  await vi.waitFor(() => assert.equal(metadataStarted, true));
   assert.deepEqual(provider.messages, [], 'restored startup posted sessions before required metadata completed');
   releaseMetadata(true);
   await startup;

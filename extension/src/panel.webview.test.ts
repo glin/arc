@@ -6823,9 +6823,11 @@ test('completion slices post changed figures once on retained and newest launchi
 });
 
 test('dispatch figure posts retain pending revisions until the captured payload is accepted', async () => {
+  const directory = tempDir('dispatch-post-revisions-');
+  for (const name of ['parent', 'child']) fs.writeFileSync(path.join(directory, name + '.jsonl'), 'x');
   const sessions = [
-    { file: 'parent.jsonl', sessionId: 'parent', agent: 'codex', size: 1, mtimeMs: 1 },
-    { file: 'child.jsonl', sessionId: 'child', agent: 'codex', size: 1, mtimeMs: 1 },
+    { file: path.join(directory, 'parent.jsonl'), sessionId: 'parent', agent: 'codex', size: 1, mtimeMs: 1 },
+    { file: path.join(directory, 'child.jsonl'), sessionId: 'child', agent: 'codex', size: 1, mtimeMs: 1 },
   ];
   let toolUses = 1;
   let artifactRevision = 'first';
@@ -7170,6 +7172,13 @@ test('every reader instruction names a panel message and reports before the pane
 
 // Catches a scope change or a rows refresh that no longer reaches deferred compaction. A lost report lets compaction
 // run in a session that left the window's scope.
+test('workspace catalog invalidation releases the retained session page index', () => {
+  assert.match(
+    declarationSource(panelHostSource, 'workspaceFoldersChanged'),
+    /this\.authoritativeCatalog = null;\s*this\.sessionPageIndex = undefined;/,
+  );
+});
+
 test('repository scope changes, workspace folder changes and rows refreshes report to deferred compaction', () => {
   for (const member of ['private repositoryScopeChanged(', 'private workspaceFoldersChanged(']) {
     const start = panelHostSource.indexOf(member);
@@ -13542,6 +13551,7 @@ test('the live Codex subagent route keeps each panel on the place its shared tra
     refreshGeneration: 0,
     repositoryScopeReady: true,
     authoritativeCatalog: catalog,
+    catalogWalked: true,
     awaitingSessionRecords: {},
     repositoryScopeRoots: [],
     ensureProjectSpendWorkspace() {},
@@ -13670,6 +13680,8 @@ test('the live Codex subagent route keeps each panel on the place its shared tra
     },
   };
   new Function(
+    'replacedCatalogFiles',
+    'normalizeFsPath',
     'module',
     'exports',
     'performance',
@@ -13685,6 +13697,8 @@ test('the live Codex subagent route keeps each panel on the place its shared tra
     'CATALOG_REFRESH_DEADLINE_MS',
     refreshCode,
   )(
+    async () => [],
+    renameTranscripts.normalizeFsPath,
     refreshModule,
     refreshModule.exports,
     performance,
