@@ -14,7 +14,7 @@ import type { CodexSessionMeta } from './codex';
 //
 // This version is independent of VERSION in derivedcache.ts.
 // A bump rereads every stored rollout opening on the machine.
-export const CODEX_META_VERSION = 3;
+export const CODEX_META_VERSION = 4;
 
 // Unversioned opening rows use the derived session cache version below.
 // Versions before 27 lack startedAt and have no supported opening metadata version.

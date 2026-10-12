@@ -519,7 +519,7 @@ function codexStartedAt(
 
 function directPayloadAt(payload: Record<string, unknown>): number | null {
   if (
-    (payload.source !== 'vscode' && payload.source !== 'cli') ||
+    (payload.source !== 'vscode' && payload.source !== 'cli' && payload.source !== 'exec') ||
     (payload.thread_source !== undefined && payload.thread_source !== 'user') ||
     str(payload.parent_thread_id) !== null ||
     str(payload.forked_from_id) !== null
@@ -5123,7 +5123,7 @@ export function discoverCodexNewestTurn(
 }
 
 export interface CodexSessionParserState {
-  version: 20;
+  version: 21;
   responseClock: CodexResponseClock;
   turns: Turn[];
   turnRanges: Array<{ start: number; end: number }>;
@@ -5208,7 +5208,7 @@ function emptyCodexSessionParserState(meta: CodexSessionMeta | null): CodexSessi
   const replayBoundaryAt = meta?.replayBoundaryAt ?? null;
   const openingSessionId = meta?.sessionId ?? null;
   return {
-    version: 20,
+    version: 21,
     responseClock: emptyCodexResponseClock(),
     turns: [],
     turnRanges: [],
@@ -6975,7 +6975,7 @@ export function createCodexSessionReducer(
   restored?: CodexSessionParserState,
 ): CodexSessionReducer {
   const state = restored ? cloneParserState(restored) : emptyCodexSessionParserState(meta);
-  if (state.version !== 20) {
+  if (state.version !== 21) {
     throw new Error('Incompatible Codex parser state');
   }
   applyHiddenParserState(codexHiddenSlots(state), state.hidden, CODEX_HIDDEN_POLICY);

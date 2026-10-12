@@ -511,7 +511,7 @@ export function commitRepositoryTargets(
 
 function codexParserKey(opts: CodexReadOptions): string {
   return JSON.stringify({
-    version: 11,
+    version: 12,
     tailBytes: opts.tailBytes ?? DEFAULT_TAIL_BYTES,
     maxTurns: opts.maxTurns ?? 40,
     sessionTitle: normalizeSessionTitle(opts.sessionTitle),

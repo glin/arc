@@ -11835,7 +11835,7 @@ test('a prior Codex parser state rebuilds child identity and exact compaction us
 
   const reset = readCodexSessionIncremental(file, 'sess', initial.checkpoint, options);
   assert.equal(reset.kind, 'reset');
-  assert.equal(reset.checkpoint?.parserState.version, 20);
+  assert.equal(reset.checkpoint?.parserState.version, 21);
   assert.deepEqual(
     reset.read?.turns[0].agents.map((row) => [row.id, row.description]),
     [[child.threadId, 'astra_implementer']],
@@ -12170,7 +12170,7 @@ test('a delayed direct opening keeps three completed turns after cold reconstruc
   const envelope = '2026-10-03T03:10:22.496Z';
   const starts = ['2026-10-03T03:10:08Z', '2026-10-03T03:12:08Z', '2026-10-03T03:13:08Z'];
   const ids = ['original-turn', 'second-turn', 'third-turn'];
-  for (const source of ['vscode', 'cli']) {
+  for (const source of ['vscode', 'cli', 'exec']) {
     for (const thread_source of [undefined, 'user']) {
       const records = [
         recordedAt(meta({ id: 'sess', timestamp: creation, source, thread_source }), envelope),
@@ -12199,6 +12199,7 @@ test('a delayed direct opening keeps three completed turns after cold reconstruc
         }),
       ];
       const file = writeRollout(records);
+      fs.utimesSync(file, new Date(creation), new Date('2026-10-03T03:15:00Z'));
       const ordinary = readCodexSession(file, 'sess');
       assert.deepEqual(
         ordinary.turns.map((turn) => turn.promptId),
@@ -12223,7 +12224,7 @@ test('a delayed direct opening keeps three completed turns after cold reconstruc
       );
       assert.equal(usageReader.turnCount(), 3);
       assert.deepEqual(Object.keys(usageReader.snapshot().copiedTurnIds), []);
-      assert.equal(scanForCodexPerson(file, fs.statSync(file).size).person, true);
+      assert.equal(scanForCodexPerson(file, fs.statSync(file).size).person, source !== 'exec');
       assert.deepEqual(
         scanCodexDispatchReferences(file, 'sess').references.map((reference) => reference.sessionId),
         [CLAUDE_SESSION],
@@ -12588,6 +12589,76 @@ test('rounded native Claude print usage waits for exact ownership and releases o
   assert.ok(released.every((event) => event.incomplete));
 });
 
+test.each(['root', 'fork', 'parent', 'subagent'])(
+  'exec %s cost excludes copied turns despite a delayed first write',
+  (kind) => {
+    const id = 'exec-delayed';
+    const creation = new Date(ms(4) + 710).toISOString();
+    const envelope = new Date(ms(12) + 398).toISOString();
+    const source = {
+      source: 'exec',
+      originator: 'codex_exec',
+      ...(kind === 'fork' ? { forked_from_id: 'parent' } : {}),
+      ...(kind === 'parent' ? { parent_thread_id: 'parent' } : {}),
+      ...(kind === 'subagent' ? { thread_source: 'subagent' } : {}),
+    };
+    const records = [
+      recordedAt(meta({ id, session_id: id, timestamp: creation, ...source }), envelope),
+      ...[
+        { turnId: 'copied', start: -60, input: 900 },
+        { turnId: 'own', start: kind === 'root' ? 4 : 20, input: 12 },
+      ].flatMap(({ turnId, start, input }) => [
+        recordedAt(event('task_started', 0, { turn_id: turnId, started_at: ms(start) / 1000 }), envelope),
+        recordedAt(turnContext(0, turnId, 'gpt-6.1-sol', 'high'), envelope),
+        recordedAt(event('user_message', 0, { message: `${turnId} prompt` }), envelope),
+        tokens(24, { input_tokens: input, output_tokens: 1 }),
+        {
+          type: 'token_usage_record',
+          timestamp: at(25),
+          payload: {
+            thread_id: id,
+            turn_id: turnId,
+            response_id: `${turnId}-response`,
+            usage: usage({ input_tokens: input, output_tokens: 1 }),
+          },
+        },
+        event('task_complete', 26, { turn_id: turnId, last_agent_message: `${turnId} answer` }),
+      ]),
+    ];
+    const file = writeRollout(records);
+    fs.utimesSync(file, new Date(creation), new Date(ms(30)));
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(ms(60));
+    try {
+      const read = readCodexSession(file, id);
+      assert.deepEqual(
+        read.turns.map((turn) => turn.promptId),
+        ['own'],
+      );
+      const spend = readCodexAgentSpend(file);
+      assert.equal(
+        spend.models.reduce((sum, model) => sum + (model.usage.requests ?? 0), 0),
+        1,
+      );
+      assert.equal(
+        spend.models.reduce((sum, model) => sum + model.usage.input, 0),
+        12,
+      );
+      const indexed = indexSpendFile(undefined, file, 'workspace', createCodexUsageLineReducer, ms(60)).record;
+      assert.equal(indexed.turnCount, 1);
+      assert.equal(
+        (indexed.lifetimeBuckets ?? []).reduce((sum, bucket) => sum + bucket.requests, 0),
+        1,
+      );
+      assert.equal(
+        (indexed.lifetimeBuckets ?? []).reduce((sum, bucket) => sum + bucket.usage.input, 0),
+        12,
+      );
+    } finally {
+      clock.mockRestore();
+    }
+  },
+);
+
 test('only direct opening sources use a valid creation clock', () => {
   const creation = new Date(ms(4) + 531).toISOString();
   const envelope = new Date(ms(22) + 496).toISOString();
@@ -12596,7 +12667,13 @@ test('only direct opening sources use a valid creation clock', () => {
     [{ source: 'cli', thread_source: 'user', parent_thread_id: '', forked_from_id: '' }, true],
     [{ source: 'vscode', parent_thread_id: 'parent' }, false],
     [{ source: 'vscode', forked_from_id: 'parent' }, false],
-    [{ source: 'exec' }, false],
+    [{ source: 'exec' }, true],
+    [{ source: 'exec', thread_source: undefined }, true],
+    [{ source: 'exec', parent_thread_id: '', forked_from_id: '' }, true],
+    [{ source: 'exec', parent_thread_id: 'parent' }, false],
+    [{ source: 'exec', forked_from_id: 'parent' }, false],
+    [{ source: 'exec', thread_source: 'subagent' }, false],
+    [{ source: 'exec', thread_source: 'unknown' }, false],
     [{ source: undefined }, false],
     [{ source: 'unknown' }, false],
     [{ source: { subagent: { thread_spawn: { parent_thread_id: 'parent' } } } }, false],
