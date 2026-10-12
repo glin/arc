@@ -7,6 +7,7 @@ const path = require('node:path');
 const repositoryRoot = path.join(__dirname, '..');
 
 function toolBin(name) {
+  if (name === 'npm') return process.env.npm_execpath;
   const packageFile = require.resolve(`${name}/package.json`);
   const manifest = JSON.parse(fs.readFileSync(packageFile, 'utf8'));
   return path.join(path.dirname(packageFile), manifest.bin[name]);
@@ -31,6 +32,7 @@ test('root formatting and lint commands exclude private run source and configura
   const brokenSource = 'const value={answer:42}; debugger; console.log(value);\n';
   try {
     fs.mkdirSync(path.dirname(maintainedSource), { recursive: true });
+    fs.copyFileSync(path.join(repositoryRoot, 'package.json'), path.join(root, 'package.json'));
     for (const name of ['.oxfmtrc.json', '.oxlintrc.jsonc']) {
       fs.copyFileSync(path.join(repositoryRoot, name), path.join(root, name));
       for (const savedRoot of savedRoots) {
