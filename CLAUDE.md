@@ -61,7 +61,7 @@ Review browser shots before and after changes to panel styles or browser code:
 npm --prefix extension run shots
 ```
 
-After changing panel host options, check a new panel tab in the isolated editor. Browser tests cannot read options saved when the editor created a tab. A tab restored by the owner's editor is an owner check.
+After changing panel host options, check a new panel tab in the isolated editor. Check a restored tab with `node scripts/isolated-editor.mjs restore --baseline-commit <revision>`, where the revision saved the old options. Browser tests cannot read options saved when the editor created a tab. A tab restored by the owner's own editor is an owner check.
 
 Check a change with the cheapest method that reaches it, in this order:
 

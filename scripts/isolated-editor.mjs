@@ -3,10 +3,11 @@
 // Usage:
 //   node scripts/isolated-editor.mjs run [<script.mjs>] [--screenshot <file>] [--timeout <seconds>] [options]
 //   node scripts/isolated-editor.mjs open [options]
+//   node scripts/isolated-editor.mjs restore (--baseline-commit <revision> | --baseline <checkout>) [options]
 //   node scripts/isolated-editor.mjs cleanup [<run directory or run.json>]
 // Options: --repository <checkout>, --editor <install directory>, --workspace <folder>, --scratch <parent directory>,
-// --live-data, --allow-focus.
-import { spawnSync } from 'node:child_process';
+// --live-data, --allow-focus. restore takes no --live-data.
+import { spawn, spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import { createRequire } from 'node:module';
@@ -22,6 +23,15 @@ export const RUN_PREFIX = 'arc-isolated-editor-';
 export const MANIFEST_NAME = 'run.json';
 export const DEFAULT_RUN_SECONDS = 300;
 export const CLEANUP_DEADLINE_MS = 30_000;
+export const BASELINE_DIRECTORY = 'baseline';
+export const BASELINE_LINKS = [
+  'node_modules',
+  path.join('extension', 'node_modules'),
+  path.join('cli', 'node_modules'),
+];
+export const BASELINE_EXCLUDED = ['evals', 'docs', '.claude', '.agents'];
+export const RESTORED_ORIGINS = ['serializer', 'serializer-replaced'];
+export const RESTORE_PROBE_TEXT = 'Restored tab check';
 const LOCK_DEADLINE_MS = 10 * 60_000;
 const CLOSE_DEADLINE_MS = 15_000;
 const SIGNALS = { SIGHUP: 129, SIGINT: 130, SIGTERM: 143 };
@@ -37,6 +47,9 @@ export const PROFILE_SETTINGS = {
   'chat.disableAIFeatures': true,
   'security.workspace.trust.enabled': false,
 };
+
+// The restore check reads Arc's diagnostics log to learn how the second editor adopted the saved tab.
+export const RESTORE_SETTINGS = { 'arc.diagnostics.log': true };
 
 export const realClock = {
   now: () => Date.now(),
@@ -98,7 +111,9 @@ export const LIVE_DATA_VARIABLES = ['CLAUDE_CONFIG_DIR', 'ARC_PROJECTS_ROOT', 'A
 
 // Copies the parent environment without editor, Arc, agent, Git, and Node option variables, in any letter case.
 // Without liveData, transcript roots point at empty run directories and Arc starts no agent.
-export function childEnvironment(parent, layout, { liveData = false } = {}) {
+// Arc opens its own panel at activation only while ARC_MEASURE_STATE is set. Without openPanel, the state variable stays out,
+// agents stay blocked, and a panel tab that the editor restores is the only panel.
+export function childEnvironment(parent, layout, { liveData = false, openPanel = true } = {}) {
   const environment = {};
   for (const [name, value] of Object.entries(parent)) {
     if (value !== undefined && !SCRUBBED_VARIABLES.test(name)) environment[name] = value;
@@ -113,8 +128,8 @@ export function childEnvironment(parent, layout, { liveData = false } = {}) {
       CLAUDE_CONFIG_DIR: layout.claudeConfig,
       CODEX_HOME: layout.codexHome,
       ARC_MEASURE_BLOCK_AGENTS: '1',
-      ARC_MEASURE_STATE: layout.state,
     });
+    if (openPanel) environment.ARC_MEASURE_STATE = layout.state;
   }
   return environment;
 }
@@ -663,7 +678,7 @@ export async function quietWindows(app) {
   });
 }
 
-function prepareRun(layout) {
+function prepareRun(layout, { diagnostics = false } = {}) {
   for (const directory of [
     layout.userData,
     layout.extensions,
@@ -677,7 +692,8 @@ function prepareRun(layout) {
     fs.mkdirSync(directory, { recursive: true });
   }
   fs.mkdirSync(path.join(layout.userData, 'User'), { recursive: true });
-  fs.writeFileSync(path.join(layout.userData, 'User', 'settings.json'), JSON.stringify(PROFILE_SETTINGS, null, 2));
+  const settings = diagnostics ? { ...PROFILE_SETTINGS, ...RESTORE_SETTINGS } : PROFILE_SETTINGS;
+  fs.writeFileSync(path.join(layout.userData, 'User', 'settings.json'), JSON.stringify(settings, null, 2));
   fs.writeFileSync(layout.state, '{}');
 }
 
@@ -686,27 +702,20 @@ export function loadPlaywright(repository) {
   return require('playwright-core');
 }
 
-// Starts an isolated editor and fills session as it goes. The manifest is on disk before the editor starts,
-// so a caller that holds session can clean up after a failure at any later point.
-export async function launchIsolatedEditor(
-  {
-    repository = ownRepository,
-    editor,
-    workspace,
-    scratch = os.tmpdir(),
-    liveData = false,
-    allowFocus = false,
-    deadlineMs = 90_000,
-    list = listProcesses,
-  } = {},
-  session = {},
-) {
-  const repositoryPath = path.resolve(repository);
-  const extensionPath = path.join(repositoryPath, 'extension');
+function requireBuild(repository) {
+  const extensionPath = path.join(path.resolve(repository), 'extension');
   if (!fs.existsSync(path.join(extensionPath, 'dist', 'extension.js'))) {
     throw new Error(`No Arc build in ${extensionPath}. Run npm --prefix extension run build first.`);
   }
-  const executablePath = editorExecutable({ editor });
+  return extensionPath;
+}
+
+// Creates the run directory, its profile, and its manifest, and fills session with them. The manifest is on disk
+// before any editor starts, so a caller that holds session can clean up after a failure at any later point.
+export function createRun(
+  { scratch = os.tmpdir(), workspace, liveData = false, diagnostics = false, list = listProcesses } = {},
+  session = {},
+) {
   const layout = runLayout(path.join(scratch, RUN_PREFIX + randomUUID()));
   fs.mkdirSync(layout.root, { recursive: true });
   const manifest = {
@@ -714,8 +723,8 @@ export async function launchIsolatedEditor(
     profile: layout.userData,
     driverPid: process.pid,
     startedAt: new Date().toISOString(),
-    executablePath,
-    extensionPath,
+    executablePath: null,
+    extensionPath: null,
     liveData,
     launcherPid: null,
     mainPid: null,
@@ -723,13 +732,41 @@ export async function launchIsolatedEditor(
     processes: [],
   };
   writeManifest(layout, manifest);
-  Object.assign(session, { layout, manifest, extensionId: extensionIdOf(extensionPath), app: null, page: null, list });
-  prepareRun(layout);
-  const { _electron } = loadPlaywright(repositoryPath);
+  Object.assign(session, {
+    layout,
+    manifest,
+    extensionId: null,
+    app: null,
+    page: null,
+    list,
+    workspace: path.resolve(workspace ?? layout.workspace),
+    liveData,
+  });
+  prepareRun(layout, { diagnostics });
+  return session;
+}
+
+// Set on session.cancelled when the run ends. Work that was abandoned after a timeout or a signal stops at its next step.
+const CANCELLED_MESSAGE = 'The run ended before this step started.';
+
+// Starts an editor on the session's run directory and fills session.app and session.page. Every start of one run uses the
+// same profile, extensions directory, and workspace, so a second start sees what the first one saved.
+export async function startEditor(
+  session,
+  { repository = ownRepository, editor, allowFocus = false, deadlineMs = 90_000, openPanel = true } = {},
+) {
+  if (session.cancelled) throw new Error(CANCELLED_MESSAGE);
+  const extensionPath = requireBuild(repository);
+  const executablePath = editorExecutable({ editor });
+  const { layout, manifest } = session;
+  Object.assign(manifest, { executablePath, extensionPath, launcherPid: null, mainPid: null, mainCreated: null });
+  writeManifest(layout, manifest);
+  session.extensionId = extensionIdOf(extensionPath);
+  const { _electron } = loadPlaywright(path.resolve(repository));
   session.app = await _electron.launch({
     executablePath,
-    args: editorArguments(layout, { extensionPath, workspace: path.resolve(workspace ?? layout.workspace) }),
-    env: childEnvironment(process.env, layout, { liveData }),
+    args: editorArguments(layout, { extensionPath, workspace: session.workspace }),
+    env: childEnvironment(process.env, layout, { liveData: session.liveData, openPanel }),
     cwd: layout.root,
     timeout: deadlineMs,
   });
@@ -743,6 +780,26 @@ export async function launchIsolatedEditor(
   await session.page.waitForSelector('.monaco-workbench', { timeout: deadlineMs });
   recordRunProcesses(session);
   return session;
+}
+
+// Creates a run and starts an editor on it, and fills session as it goes.
+export async function launchIsolatedEditor(
+  {
+    repository = ownRepository,
+    editor,
+    workspace,
+    scratch = os.tmpdir(),
+    liveData = false,
+    allowFocus = false,
+    deadlineMs = 90_000,
+    list = listProcesses,
+  } = {},
+  session = {},
+) {
+  requireBuild(repository);
+  editorExecutable({ editor });
+  createRun({ scratch, workspace, liveData, list }, session);
+  return startEditor(session, { repository, editor, allowFocus, deadlineMs });
 }
 
 // Writes the PID and start time of each run process to the manifest. A helper that passes no profile is found
@@ -764,6 +821,8 @@ export function recordRunProcesses(session) {
 // Closes the editor through Playwright, then stops whatever the profile still owns and removes the run directory.
 export async function closeIsolatedEditor(session, cleanupOptions = {}) {
   const errors = [];
+  // A baseline build still running holds files in the run directory.
+  session.stopBuild?.();
   if (session.app) {
     // A failed record goes to the report, and the editor still closes and the cleanup still runs.
     try {
@@ -783,10 +842,240 @@ export async function closeIsolatedEditor(session, cleanupOptions = {}) {
   return report;
 }
 
+// Closes the editor through Playwright without cleaning up, then waits until no process of the profile remains.
+// A second editor started on the same profile while the first one exits would hand its window to the first.
+export async function stopEditor(
+  session,
+  {
+    list = (options) => (session.list ?? listProcesses)(options),
+    clock = realClock,
+    deadlineMs = CLEANUP_DEADLINE_MS,
+  } = {},
+) {
+  recordRunProcesses(session);
+  await withDeadline('the editor to close', session.app.close(), CLOSE_DEADLINE_MS);
+  session.app = null;
+  session.page = null;
+  await waitFor(
+    'the editor processes to exit',
+    () =>
+      ownedProcesses(list({ timeoutMs: LIST_DEADLINE_MS }), session.manifest.profile, {
+        known: session.manifest.processes,
+      }).length === 0,
+    { deadlineMs, pollMs: 500, clock },
+  );
+}
+
+const GIT_VARIABLES = /^GIT_/i;
+
+function environmentWithoutGit(extra = {}) {
+  const environment = {};
+  for (const [name, value] of Object.entries(process.env)) if (!GIT_VARIABLES.test(name)) environment[name] = value;
+  return { ...environment, ...extra };
+}
+
+function git(repository, args, env = {}) {
+  const result = spawnSync('git', ['-C', repository, ...args], {
+    encoding: 'utf8',
+    windowsHide: true,
+    env: environmentWithoutGit(env),
+  });
+  if (result.error || result.status !== 0) {
+    throw new Error(`git ${args[0]} failed: ${result.error?.message ?? (result.stderr ?? '').trim()}`);
+  }
+  return result.stdout.trim();
+}
+
+// Stops a process. On Windows it stops the process's children too. Elsewhere the build's own child, esbuild, exits when
+// the build's pipes close.
+function stopTree(pid) {
+  if (!pid) return;
+  if (process.platform === 'win32') {
+    spawnSync('taskkill', ['/pid', String(pid), '/T', '/F'], { windowsHide: true });
+    return;
+  }
+  try {
+    process.kill(pid, 'SIGKILL');
+  } catch {
+    // The build already ended.
+  }
+}
+
+// Runs the extension build in the baseline tree. The run stops the build child when it ends before the build does.
+function buildTree(session, tree) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, ['esbuild.mjs'], {
+      cwd: path.join(tree, 'extension'),
+      env: environmentWithoutGit(),
+      windowsHide: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let output = '';
+    const collect = (chunk) => (output = (output + chunk).slice(-4000));
+    child.stdout.on('data', collect);
+    child.stderr.on('data', collect);
+    session.stopBuild = () => stopTree(child.pid);
+    // Cleanup also finds a build that outlives this process through its recorded identity.
+    try {
+      rememberProcesses(session.manifest, listProcesses({ pids: [child.pid], timeoutMs: 5_000 }));
+      writeManifest(session.layout, session.manifest);
+    } catch {
+      // The build goes on without this record, and stopping the run still stops the child.
+    }
+    child.on('error', reject);
+    child.on('close', (code) => {
+      session.stopBuild = null;
+      if (code === 0) resolve();
+      else reject(new Error(`The baseline build failed with exit code ${code}.\n${output.trim()}`));
+    });
+  });
+}
+
+// Produces the checkout that the first editor loads. A prebuilt checkout is used as it is. A revision is exported from the
+// candidate checkout's repository into the run directory, linked to the candidate's dependency folders, and built there.
+export async function prepareBaseline(session, { repository, baseline, baselineCommit }) {
+  if (baseline) {
+    const checkout = path.resolve(baseline);
+    requireBuild(checkout);
+    return { repository: checkout, label: checkout };
+  }
+  // Git exports the files under its working directory, so every git call runs at the repository's top level.
+  const top = git(repository, ['rev-parse', '--show-toplevel']);
+  const commit = git(top, ['rev-parse', '--verify', `${baselineCommit}^{commit}`]);
+  const tree = path.join(session.layout.root, BASELINE_DIRECTORY);
+  fs.mkdirSync(tree, { recursive: true });
+  // A private index file keeps the export away from the repository's own index and working tree.
+  const index = path.join(session.layout.root, 'baseline.index');
+  const environment = { GIT_INDEX_FILE: index };
+  git(top, ['read-tree', commit], environment);
+  // Review fixtures hold paths too long for a Windows run directory, and the build needs none of them.
+  git(top, ['rm', '--cached', '-r', '-q', '--ignore-unmatch', '--', ...BASELINE_EXCLUDED], environment);
+  git(top, ['checkout-index', '--all', `--prefix=${tree.replaceAll('\\', '/')}/`], environment);
+  fs.rmSync(index, { force: true });
+  for (const name of BASELINE_LINKS) {
+    const target = path.join(repository, name);
+    if (!fs.existsSync(target)) continue;
+    fs.mkdirSync(path.dirname(path.join(tree, name)), { recursive: true });
+    fs.symlinkSync(fs.realpathSync(target), path.join(tree, name), 'junction');
+  }
+  await buildTree(session, tree);
+  requireBuild(tree);
+  return { repository: tree, label: commit };
+}
+
+// The names of Arc's diagnostics logs, one file per editor process.
+export function logFiles(layout) {
+  try {
+    return new Set(fs.readdirSync(path.join(layout.arcHome, 'logs')).filter((name) => /^arc-.*\.jsonl$/.test(name)));
+  } catch {
+    return new Set();
+  }
+}
+
+// The file and origin of each panelAdopted record in the logs that ignore does not name.
+export function panelAdoptions(layout, ignore = new Set()) {
+  const adoptions = [];
+  for (const file of logFiles(layout)) {
+    if (ignore.has(file)) continue;
+    let text = '';
+    try {
+      text = fs.readFileSync(path.join(layout.arcHome, 'logs', file), 'utf8');
+    } catch {
+      continue;
+    }
+    for (const line of text.split('\n')) {
+      if (!line.includes('"panelAdopted"')) continue;
+      try {
+        const record = JSON.parse(line);
+        if (record.event === 'panelAdopted') adoptions.push({ file, origin: record.origin });
+      } catch {
+        // A line still being written is read on the next poll.
+      }
+    }
+  }
+  return adoptions;
+}
+
+// The restore check on the second editor: the saved tab is adopted through the serializer, and the panel it shows works.
+export async function checkRestoredPanel(
+  session,
+  { ignore, deadlineMs = 30_000, clock = realClock, read = panelAdoptions } = {},
+) {
+  const restored = () => read(session.layout, ignore).find((entry) => RESTORED_ORIGINS.includes(entry.origin));
+  let adoption;
+  try {
+    adoption = await waitFor('the restored panel tab to be adopted', restored, { deadlineMs, clock });
+  } catch {
+    const seen = [...new Set(read(session.layout, ignore).map((entry) => entry.origin))];
+    const logged = seen.length
+      ? `the second editor logged only origin ${seen.join(', ')}`
+      : 'the second editor logged no panelAdopted record';
+    throw new Error(
+      `The restored panel tab was not adopted. Expected a panelAdopted record with origin serializer or serializer-replaced, but ${logged}.`,
+    );
+  }
+  const frame = await arcFrame(session.page, { extensionId: session.extensionId, clock });
+  const prompt = await createDraft(frame, { clock });
+  await prompt.fill(RESTORE_PROBE_TEXT);
+  const typed = await prompt.inputValue();
+  if (typed !== RESTORE_PROBE_TEXT) {
+    throw new Error(`The restored panel did not keep the text typed into its prompt box. It shows "${typed}".`);
+  }
+  return { origin: adoption.origin, log: adoption.file };
+}
+
+export const restoreSteps = {
+  createRun,
+  prepareBaseline,
+  startEditor,
+  stopEditor,
+  logFiles,
+  checkRestoredPanel,
+  waitForPanel: (session) => arcFrame(session.page, { extensionId: session.extensionId }),
+};
+
+// Saves a panel tab with the baseline build, closes that editor, and opens the same profile with the candidate build.
+export function restoreWork(steps = restoreSteps) {
+  return async ({ options, session, result }) => {
+    const repository = path.resolve(options.repository ?? ownRepository);
+    const deadlineMs = options.timeoutSeconds * 1000;
+    // Work abandoned by a timeout or a signal keeps running, so each step first checks that the run is still live.
+    const live = () => {
+      if (session.cancelled) throw new Error(CANCELLED_MESSAGE);
+    };
+    requireBuild(repository);
+    editorExecutable({ editor: options.editor });
+    steps.createRun({ scratch: options.scratch, workspace: options.workspace, diagnostics: true }, session);
+    result.run = session.layout.root;
+    live();
+    const baseline = await steps.prepareBaseline(session, {
+      repository,
+      baseline: options.baseline,
+      baselineCommit: options.baselineCommit,
+    });
+    const start = { editor: options.editor, allowFocus: options.allowFocus, deadlineMs };
+    live();
+    await steps.startEditor(session, { ...start, repository: baseline.repository, openPanel: true });
+    live();
+    await steps.waitForPanel(session);
+    live();
+    await steps.stopEditor(session);
+    live();
+    const ignore = steps.logFiles(session.layout);
+    await steps.startEditor(session, { ...start, repository, openPanel: false });
+    live();
+    result.value = { baseline: baseline.label, ...(await steps.checkRestoredPanel(session, { ignore })) };
+    if (options.screenshot) {
+      result.screenshot = path.resolve(options.screenshot);
+      await session.page.screenshot({ path: result.screenshot });
+    }
+  };
+}
+
 export function parseArguments(argv) {
   const [command, ...rest] = argv;
-  if (!['run', 'open', 'cleanup'].includes(command)) {
-    throw new Error('Choose a command: run, open, or cleanup.');
+  if (!['run', 'open', 'restore', 'cleanup'].includes(command)) {
+    throw new Error('Choose a command: run, open, restore, or cleanup.');
   }
   const options = { command, timeoutSeconds: DEFAULT_RUN_SECONDS, liveData: false, allowFocus: false };
   const valued = {
@@ -796,6 +1085,8 @@ export function parseArguments(argv) {
     '--editor': 'editor',
     '--workspace': 'workspace',
     '--scratch': 'scratch',
+    '--baseline': 'baseline',
+    '--baseline-commit': 'baselineCommit',
   };
   for (let index = 0; index < rest.length; index++) {
     const argument = rest[index];
@@ -815,6 +1106,15 @@ export function parseArguments(argv) {
     throw new Error('--timeout needs a positive number of seconds.');
   }
   if (command === 'open' && options.target !== undefined) throw new Error('open takes no script.');
+  if (command === 'restore') {
+    if (options.target !== undefined) throw new Error('restore takes no script.');
+    if ((options.baseline === undefined) === (options.baselineCommit === undefined)) {
+      throw new Error('restore needs one of --baseline <checkout> or --baseline-commit <revision>.');
+    }
+    if (options.liveData) throw new Error('restore blocks agents and takes no --live-data.');
+  } else if (options.baseline !== undefined || options.baselineCommit !== undefined) {
+    throw new Error('--baseline and --baseline-commit apply only to restore.');
+  }
   return options;
 }
 
@@ -835,6 +1135,30 @@ function handleSignals(finish) {
   return () => handlers.forEach(([signal, handler]) => process.off(signal, handler));
 }
 
+// Starts an editor on a fresh run, opens the Arc panel, and hands the panel to the check script.
+async function scriptWork({ options, session, result }, launch) {
+  await launch({ ...options, deadlineMs: options.timeoutSeconds * 1000 }, session);
+  result.run = session.layout.root;
+  if (options.liveData) await openArcPanel(session.page);
+  const arc = await arcFrame(session.page, { extensionId: session.extensionId });
+  if (options.target) {
+    const script = await import(pathToFileURL(path.resolve(options.target)).href);
+    if (typeof script.default !== 'function') throw new Error(`${options.target} has no default export function.`);
+    result.value =
+      (await script.default({
+        app: session.app,
+        page: session.page,
+        arc,
+        createDraft: (draftOptions) => createDraft(arc, draftOptions),
+        run: session.layout,
+      })) ?? null;
+  }
+  if (options.screenshot) {
+    result.screenshot = path.resolve(options.screenshot);
+    await session.page.screenshot({ path: result.screenshot });
+  }
+}
+
 // The browser lane lock is released and the outcome line is written even when cleanup fails.
 export async function runCommand(
   options,
@@ -843,6 +1167,7 @@ export async function runCommand(
     acquireLock,
     cleanupOptions = {},
     write = (text) => process.stdout.write(text),
+    work = (context) => scriptWork(context, launch),
   } = {},
 ) {
   acquireLock ??= (await import(pathToFileURL(path.join(ownRepository, 'extension', 'test', 'browserlock.mjs')).href))
@@ -854,6 +1179,7 @@ export async function runCommand(
   let finished = null;
   const finish = (reason) =>
     (finished ??= (async () => {
+      session.cancelled = true;
       if (reason) result.errors.push(reason);
       try {
         if (session.manifest) result.cleanup = await cleanup();
@@ -866,32 +1192,11 @@ export async function runCommand(
       write(`${JSON.stringify(result)}\n`);
     })());
   const detach = handleSignals(finish);
-  const work = async () => {
-    await launch({ ...options, deadlineMs: options.timeoutSeconds * 1000 }, session);
-    result.run = session.layout.root;
-    if (options.liveData) await openArcPanel(session.page);
-    const arc = await arcFrame(session.page, { extensionId: session.extensionId });
-    if (options.target) {
-      const script = await import(pathToFileURL(path.resolve(options.target)).href);
-      if (typeof script.default !== 'function') throw new Error(`${options.target} has no default export function.`);
-      result.value =
-        (await script.default({
-          app: session.app,
-          page: session.page,
-          arc,
-          createDraft: (draftOptions) => createDraft(arc, draftOptions),
-          run: session.layout,
-        })) ?? null;
-    }
-    if (options.screenshot) {
-      result.screenshot = path.resolve(options.screenshot);
-      await session.page.screenshot({ path: result.screenshot });
-    }
-  };
   try {
     lock = await acquireLock({ deadlineMs: LOCK_DEADLINE_MS });
-    const running = work();
-    // After a timeout, cleanup closes the editor and the abandoned work rejects. Its error is already reported.
+    const running = work({ options, session, result });
+    // After a timeout, cleanup closes the editor and the abandoned work stops at its next step or when its editor closes.
+    // Its error is already reported.
     running.catch(() => {});
     await withDeadline('the run to finish', running, options.timeoutSeconds * 1000);
   } catch (error) {
@@ -912,6 +1217,10 @@ export async function runCommand(
   return result.ok ? 0 : 1;
 }
 
+export function restoreCommand(options, deps = {}) {
+  return runCommand(options, { ...deps, work: deps.work ?? restoreWork() });
+}
+
 // Cleans up after the window closes or the launch fails, and writes the outcome as one JSON line either way.
 export async function openCommand(
   options,
@@ -922,6 +1231,7 @@ export async function openCommand(
   let finished = null;
   const finish = (reason) =>
     (finished ??= (async () => {
+      session.cancelled = true;
       if (reason) result.errors.push(reason);
       result.run = session.manifest?.root ?? null;
       try {
@@ -968,6 +1278,7 @@ export async function main(argv) {
   const options = parseArguments(argv);
   if (options.command === 'run') return runCommand(options);
   if (options.command === 'open') return openCommand(options);
+  if (options.command === 'restore') return restoreCommand(options);
   return cleanupCommand(options);
 }
 

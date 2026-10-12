@@ -1,5 +1,5 @@
 const assert = require('node:assert/strict');
-const { spawn } = require('node:child_process');
+const { spawn, spawnSync } = require('node:child_process');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
@@ -182,28 +182,28 @@ describe('isolated editor environment', () => {
   });
 });
 
-describe('isolated editor launch', () => {
-  // A fake checkout whose playwright-core records the launch, so no editor starts.
-  function fakeCheckout() {
-    const root = path.join(scratch(), 'check out');
-    const extension = path.join(root, 'extension');
-    const playwright = path.join(extension, 'node_modules', 'playwright-core');
-    fs.mkdirSync(path.join(extension, 'dist'), { recursive: true });
-    fs.mkdirSync(playwright, { recursive: true });
-    fs.writeFileSync(path.join(extension, 'dist', 'extension.js'), '');
-    fs.writeFileSync(path.join(extension, 'package.json'), JSON.stringify({ name: 'arc', publisher: 'glin' }));
-    fs.writeFileSync(
-      path.join(playwright, 'index.js'),
-      'module.exports = { _electron: { launch: (options) => globalThis.__isolatedEditorLaunch(options) } };',
-    );
-    const install = path.join(root, 'editor');
-    for (const file of ['Code.exe', 'code', path.join('Contents', 'MacOS', 'Electron')]) {
-      fs.mkdirSync(path.dirname(path.join(install, file)), { recursive: true });
-      fs.writeFileSync(path.join(install, file), '');
-    }
-    return { root, install };
+// A fake checkout whose playwright-core records the launch, so no editor starts.
+function fakeCheckout() {
+  const root = path.join(scratch(), 'check out');
+  const extension = path.join(root, 'extension');
+  const playwright = path.join(extension, 'node_modules', 'playwright-core');
+  fs.mkdirSync(path.join(extension, 'dist'), { recursive: true });
+  fs.mkdirSync(playwright, { recursive: true });
+  fs.writeFileSync(path.join(extension, 'dist', 'extension.js'), '');
+  fs.writeFileSync(path.join(extension, 'package.json'), JSON.stringify({ name: 'arc', publisher: 'glin' }));
+  fs.writeFileSync(
+    path.join(playwright, 'index.js'),
+    'module.exports = { _electron: { launch: (options) => globalThis.__isolatedEditorLaunch(options) } };',
+  );
+  const install = path.join(root, 'editor');
+  for (const file of ['Code.exe', 'code', path.join('Contents', 'MacOS', 'Electron')]) {
+    fs.mkdirSync(path.dirname(path.join(install, file)), { recursive: true });
+    fs.writeFileSync(path.join(install, file), '');
   }
+  return { root, install };
+}
 
+describe('isolated editor launch', () => {
   test('writes the manifest before the editor starts and records the main process after', async () => {
     const checkout = fakeCheckout();
     const parent = path.join(scratch(), 'scratch parent');
@@ -770,5 +770,387 @@ describe('isolated editor commands', () => {
     const missing = path.join(scratch(), `${editor.RUN_PREFIX}gone`);
     assert.equal(await editor.cleanupCommand({ target: missing }, { write: (text) => lines.push(text) }), 0);
     assert.deepEqual(lastJson(lines), []);
+  });
+});
+
+describe('isolated editor restore check', () => {
+  const PROFILE_PROCESS = (profile) => ({
+    pid: 5_000_001,
+    parentPid: 5_000_000,
+    created: '2026-10-12T04:00:00.000Z',
+    commandLine: `Code.exe --user-data-dir "${profile}"`,
+  });
+
+  function fakeEditor(events, state) {
+    return async (options) => {
+      events.push({ launch: options });
+      state.live = true;
+      return {
+        evaluate: async (callback) => (String(callback).includes('process.pid') ? 5_000_001 : 0),
+        process: () => ({ pid: 5_000_000 }),
+        firstWindow: async () => ({ waitForSelector: async () => {} }),
+        close: async () => {
+          events.push('close');
+          state.live = false;
+        },
+      };
+    };
+  }
+
+  function option(args, name) {
+    return args[args.indexOf(name) + 1];
+  }
+
+  test('reads the restore command line', () => {
+    assert.equal(editor.parseArguments(['restore', '--baseline-commit', 'abc123']).baselineCommit, 'abc123');
+    assert.equal(editor.parseArguments(['restore', '--baseline', 'old checkout']).baseline, 'old checkout');
+    assert.throws(() => editor.parseArguments(['restore']), /needs one of --baseline/);
+    assert.throws(
+      () => editor.parseArguments(['restore', '--baseline', 'a', '--baseline-commit', 'b']),
+      /needs one of --baseline/,
+    );
+    assert.throws(() => editor.parseArguments(['restore', 'check.mjs', '--baseline', 'a']), /restore takes no script/);
+    assert.throws(() => editor.parseArguments(['run', '--baseline', 'a']), /apply only to restore/);
+    assert.throws(() => editor.parseArguments(['restore', '--baseline', 'a', '--live-data']), /takes no --live-data/);
+  });
+
+  test('an editor without openPanel gets no state file, so Arc opens no panel of its own and agents stay blocked', () => {
+    const layout = editor.runLayout(path.join(scratch(), `${editor.RUN_PREFIX}env`));
+    const opens = editor.childEnvironment({}, layout);
+    const restores = editor.childEnvironment({}, layout, { openPanel: false });
+    assert.equal(opens.ARC_MEASURE_STATE, layout.state);
+    assert.equal(restores.ARC_MEASURE_STATE, undefined);
+    assert.equal(restores.ARC_MEASURE_BLOCK_AGENTS, '1');
+    assert.equal(restores.ARC_HOME, layout.arcHome);
+  });
+
+  test('two editors on one run share the profile, extensions, and workspace, and the first has exited before the second starts', async () => {
+    const baseline = fakeCheckout();
+    const candidate = fakeCheckout();
+    const events = [];
+    const state = { live: false };
+    const session = {};
+    editor.createRun({ scratch: path.join(scratch(), 'restore parent'), diagnostics: true }, session);
+    session.list = () => (state.live ? [PROFILE_PROCESS(session.layout.userData)] : []);
+    globalThis.__isolatedEditorLaunch = fakeEditor(events, state);
+    try {
+      await editor.startEditor(session, { repository: baseline.root, editor: baseline.install, openPanel: true });
+      fs.writeFileSync(path.join(session.layout.userData, 'saved-by-first-editor'), 'tab');
+      await editor.stopEditor(session, { clock: fakeClock() });
+      await editor.startEditor(session, { repository: candidate.root, editor: candidate.install, openPanel: false });
+    } finally {
+      delete globalThis.__isolatedEditorLaunch;
+    }
+    assert.deepEqual(
+      events.map((event) => (event === 'close' ? event : 'launch')),
+      ['launch', 'close', 'launch'],
+    );
+    const [first, , second] = events.map((event) => event.launch);
+    for (const name of ['--user-data-dir', '--extensions-dir']) {
+      assert.equal(option(second.args, name), option(first.args, name));
+    }
+    assert.equal(second.args.at(-1), first.args.at(-1));
+    assert.equal(option(first.args, '--extensionDevelopmentPath'), path.join(baseline.root, 'extension'));
+    assert.equal(option(second.args, '--extensionDevelopmentPath'), path.join(candidate.root, 'extension'));
+    assert.equal(first.env.ARC_MEASURE_STATE, session.layout.state);
+    assert.equal(second.env.ARC_MEASURE_STATE, undefined);
+    assert.equal(fs.existsSync(path.join(session.layout.userData, 'saved-by-first-editor')), true);
+    const settings = JSON.parse(fs.readFileSync(path.join(session.layout.userData, 'User', 'settings.json'), 'utf8'));
+    assert.equal(settings['arc.diagnostics.log'], true);
+    assert.equal(editor.readManifest(session.layout.root).extensionPath, path.join(candidate.root, 'extension'));
+    const report = await editor.closeIsolatedEditor(session, { list: () => [], clock: fakeClock() });
+    assert.equal(report.ok, true, report.errors.join('\n'));
+  });
+
+  test('stopping an editor waits for its processes to exit and names the wait when they stay', async () => {
+    const session = {};
+    editor.createRun({ scratch: path.join(scratch(), 'stop parent') }, session);
+    let polls = 0;
+    session.app = { close: async () => {} };
+    const list = () => (++polls < 3 ? [PROFILE_PROCESS(session.layout.userData)] : []);
+    await editor.stopEditor(session, { list, clock: fakeClock() });
+    assert.equal(polls, 3);
+    assert.equal(session.app, null);
+    session.app = { close: async () => {} };
+    await assert.rejects(
+      editor.stopEditor(session, { list: () => [PROFILE_PROCESS(session.layout.userData)], clock: fakeClock() }),
+      /waiting for the editor processes to exit/,
+    );
+  });
+
+  test('the check fails when the second editor logs only a panel it created itself', async () => {
+    const session = { layout: {} };
+    const read = () => [{ file: 'arc-2.jsonl', origin: 'created' }];
+    await assert.rejects(
+      editor.checkRestoredPanel(session, { read, clock: fakeClock() }),
+      /restored panel tab was not adopted.*logged only origin created/,
+    );
+    await assert.rejects(
+      editor.checkRestoredPanel(session, { read: () => [], clock: fakeClock() }),
+      /logged no panelAdopted record/,
+    );
+  });
+
+  function restoredPage(typed) {
+    let value = '';
+    const prompt = {
+      count: async () => 1,
+      isVisible: async () => true,
+      fill: async (text) => (value = text),
+      inputValue: async () => typed ?? value,
+    };
+    const url = (extension) => `vscode-webview://id/index.html?id=1&extensionId=${extension}&platform=electron`;
+    const outer = { url: () => url('glin.arc'), parentFrame: () => null };
+    const content = {
+      url: () => 'vscode-webview://id/fake.html?id=1',
+      parentFrame: () => outer,
+      locator: () => prompt,
+    };
+    return { frames: () => [outer, content] };
+  }
+
+  test('the check passes on either restored origin and drives the restored panel', async () => {
+    for (const origin of ['serializer', 'serializer-replaced']) {
+      const session = { layout: {}, extensionId: 'glin.arc', page: restoredPage() };
+      const read = (_layout, ignore) => {
+        assert.deepEqual([...ignore], ['arc-1.jsonl']);
+        return [
+          { file: 'arc-2.jsonl', origin: 'created' },
+          { file: 'arc-2.jsonl', origin },
+        ];
+      };
+      const outcome = await editor.checkRestoredPanel(session, {
+        ignore: new Set(['arc-1.jsonl']),
+        read,
+        clock: fakeClock(),
+      });
+      assert.deepEqual(outcome, { origin, log: 'arc-2.jsonl' });
+    }
+  });
+
+  test('the check fails when the restored panel does not keep typed text', async () => {
+    const session = { layout: {}, extensionId: 'glin.arc', page: restoredPage('') };
+    await assert.rejects(
+      editor.checkRestoredPanel(session, {
+        read: () => [{ file: 'a.jsonl', origin: 'serializer' }],
+        clock: fakeClock(),
+      }),
+      /did not keep the text typed/,
+    );
+  });
+
+  test('reads panelAdopted origins only from logs that the first editor did not write', () => {
+    const layout = editor.runLayout(path.join(scratch(), `${editor.RUN_PREFIX}logs`));
+    const logs = path.join(layout.arcHome, 'logs');
+    fs.mkdirSync(logs, { recursive: true });
+    const line = (event, origin) => `${JSON.stringify({ event, origin })}\n`;
+    fs.writeFileSync(path.join(logs, 'arc-1.jsonl'), line('panelAdopted', 'created'));
+    fs.writeFileSync(
+      path.join(logs, 'arc-2.jsonl'),
+      line('panelRevealed', 'created') + line('panelAdopted', 'serializer') + '{"event":"panelAdopted"',
+    );
+    fs.writeFileSync(path.join(logs, 'health-1.jsonl'), line('panelAdopted', 'created'));
+    assert.deepEqual([...editor.logFiles(layout)].sort(), ['arc-1.jsonl', 'arc-2.jsonl']);
+    assert.deepEqual(editor.panelAdoptions(layout, new Set(['arc-1.jsonl'])), [
+      { file: 'arc-2.jsonl', origin: 'serializer' },
+    ]);
+  });
+
+  test('exports a revision without the repository index or review fixtures, links the dependencies, and builds it', async () => {
+    const repository = path.join(scratch(), 'source repo');
+    const files = {
+      'extension/package.json': '{"name":"arc","publisher":"glin"}',
+      'extension/esbuild.mjs':
+        "import fs from 'node:fs'; fs.mkdirSync('dist'); fs.writeFileSync('dist/extension.js', 'built');",
+      'evals/fixture.txt': 'fixture',
+    };
+    for (const [name, text] of Object.entries(files)) {
+      fs.mkdirSync(path.dirname(path.join(repository, name)), { recursive: true });
+      fs.writeFileSync(path.join(repository, name), text);
+    }
+    fs.mkdirSync(path.join(repository, 'extension', 'node_modules'));
+    fs.writeFileSync(path.join(repository, 'extension', 'node_modules', 'canary.txt'), 'kept');
+    const git = (...args) => {
+      const result = spawnSync('git', ['-C', repository, '-c', 'user.name=t', '-c', 'user.email=t@t', ...args], {
+        encoding: 'utf8',
+      });
+      assert.equal(result.status, 0, result.stderr);
+      return result.stdout.trim();
+    };
+    git('init', '-q');
+    git('add', 'extension/package.json', 'extension/esbuild.mjs', 'evals/fixture.txt');
+    git('commit', '-q', '-m', 'one');
+    const commit = git('rev-parse', 'HEAD');
+    fs.writeFileSync(path.join(repository, 'extension', 'esbuild.mjs'), 'throw new Error("working tree edit");');
+    const session = {};
+    editor.createRun({ scratch: path.join(scratch(), 'export parent') }, session);
+    const baseline = await editor.prepareBaseline(session, {
+      repository,
+      baselineCommit: 'HEAD',
+    });
+    const tree = path.join(session.layout.root, editor.BASELINE_DIRECTORY);
+    assert.deepEqual(baseline, { repository: tree, label: commit });
+    assert.equal(fs.readFileSync(path.join(tree, 'extension', 'dist', 'extension.js'), 'utf8'), 'built');
+    assert.equal(fs.existsSync(path.join(tree, 'evals')), false);
+    assert.equal(fs.readFileSync(path.join(tree, 'extension', 'node_modules', 'canary.txt'), 'utf8'), 'kept');
+    assert.equal(git('status', '--porcelain', '--untracked-files=no'), 'M extension/esbuild.mjs');
+    await editor.closeIsolatedEditor(session, { list: () => [], clock: fakeClock() });
+    assert.equal(fs.readFileSync(path.join(repository, 'extension', 'node_modules', 'canary.txt'), 'utf8'), 'kept');
+  });
+
+  // Steps that record their order and leave the real run directory for the cleanup to remove.
+  function fakeSteps(parent, calls, overrides = {}) {
+    const candidate = fakeCheckout();
+    const baselineRoot = fakeCheckout();
+    return {
+      candidate,
+      baselineRoot,
+      steps: {
+        createRun: (options, session) => {
+          calls.push(['createRun', options.diagnostics]);
+          editor.createRun({ ...options, scratch: parent, list: () => [] }, session);
+        },
+        prepareBaseline: async (_session, options) => {
+          calls.push(['prepareBaseline', options.baselineCommit, options.repository]);
+          return { repository: baselineRoot.root, label: 'baseline-label' };
+        },
+        startEditor: async (session, options) => {
+          calls.push(['startEditor', options.repository, options.openPanel]);
+          session.app = { close: async () => calls.push(['close']) };
+        },
+        waitForPanel: async () => calls.push(['waitForPanel']),
+        stopEditor: async (session) => {
+          calls.push(['stopEditor']);
+          session.app = null;
+        },
+        logFiles: () => new Set(['arc-1.jsonl']),
+        checkRestoredPanel: async (_session, options) => {
+          calls.push(['checkRestoredPanel', [...options.ignore]]);
+          return { origin: 'serializer', log: 'arc-2.jsonl' };
+        },
+        ...overrides,
+      },
+    };
+  }
+
+  function lastJson(lines) {
+    return JSON.parse(lines.join('').trim().split('\n').at(-1));
+  }
+
+  async function runRestore(parent, calls, overrides) {
+    const lines = [];
+    const fake = fakeSteps(parent, calls, overrides);
+    const code = await editor.restoreCommand(
+      { timeoutSeconds: 60, repository: fake.candidate.root, editor: fake.candidate.install, baselineCommit: 'abc' },
+      {
+        work: editor.restoreWork(fake.steps),
+        acquireLock: async () => ({ release: () => calls.push(['release']) }),
+        cleanupOptions: { list: () => [], clock: fakeClock() },
+        write: (text) => lines.push(text),
+      },
+    );
+    return { code, outcome: lastJson(lines), fake };
+  }
+
+  test('restore saves the tab with the baseline build, stops that editor, and checks the candidate build on the same run', async () => {
+    const calls = [];
+    const { code, outcome, fake } = await runRestore(path.join(scratch(), 'restore order'), calls);
+    assert.equal(code, 0, JSON.stringify(outcome));
+    assert.deepEqual(calls, [
+      ['createRun', true],
+      ['prepareBaseline', 'abc', path.resolve(fake.candidate.root)],
+      ['startEditor', fake.baselineRoot.root, true],
+      ['waitForPanel'],
+      ['stopEditor'],
+      ['startEditor', path.resolve(fake.candidate.root), false],
+      ['checkRestoredPanel', ['arc-1.jsonl']],
+      ['close'],
+      ['release'],
+    ]);
+    assert.deepEqual(outcome.value, { baseline: 'baseline-label', origin: 'serializer', log: 'arc-2.jsonl' });
+    assert.equal(fs.existsSync(outcome.run), false);
+  });
+
+  test('a failed check reports its message, closes the editor, removes the run, and releases the lock', async () => {
+    const calls = [];
+    const { code, outcome } = await runRestore(path.join(scratch(), 'restore failure'), calls, {
+      checkRestoredPanel: async () => {
+        throw new Error('The restored panel tab was not adopted.');
+      },
+    });
+    assert.equal(code, 1);
+    assert.deepEqual(outcome.errors, ['The restored panel tab was not adopted.']);
+    assert.equal(outcome.cleanup.ok, true, outcome.cleanup.errors.join('\n'));
+    assert.equal(fs.existsSync(outcome.run), false);
+    assert.deepEqual(calls.slice(-2), [['close'], ['release']]);
+  });
+
+  test('a timeout while the first editor stops does not start the second editor', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      const calls = [];
+      const fake = fakeSteps(path.join(scratch(), 'restore timeout'), calls);
+      let entered;
+      const stopping = new Promise((resolve) => (entered = resolve));
+      let release;
+      const held = new Promise((resolve) => (release = resolve));
+      fake.steps.stopEditor = async (session) => {
+        calls.push(['stopEditor']);
+        entered();
+        await held;
+        session.app = null;
+      };
+      const restore = editor.restoreWork(fake.steps);
+      let abandoned;
+      const lines = [];
+      const running = editor.restoreCommand(
+        { timeoutSeconds: 60, repository: fake.candidate.root, editor: fake.candidate.install, baselineCommit: 'abc' },
+        {
+          work: (context) => (abandoned = restore(context)),
+          acquireLock: async () => ({ release: () => calls.push(['release']) }),
+          cleanupOptions: { list: () => [], clock: fakeClock() },
+          write: (text) => lines.push(text),
+        },
+      );
+      await stopping;
+      await vi.advanceTimersByTimeAsync(60_000);
+      const code = await running;
+      release();
+      await assert.rejects(abandoned, /The run ended before this step started\./);
+      assert.equal(code, 1);
+      assert.match(lastJson(lines).errors[0], /^Timed out after 60 s waiting for the run to finish\./);
+      assert.equal(calls.filter((call) => call[0] === 'startEditor').length, 1);
+      assert.equal(fs.existsSync(lastJson(lines).run), false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test('an editor does not start once its run has ended', async () => {
+    await assert.rejects(editor.startEditor({ cancelled: true }), /The run ended before this step started\./);
+  });
+
+  test('a run that ends during the baseline build stops the build and removes the run directory without following the linked dependencies', async () => {
+    const dependencies = path.join(scratch(), 'dependencies');
+    fs.mkdirSync(dependencies);
+    fs.writeFileSync(path.join(dependencies, 'canary.txt'), 'kept');
+    const calls = [];
+    const { code, outcome } = await runRestore(path.join(scratch(), 'restore build'), calls, {
+      prepareBaseline: async (session) => {
+        const tree = path.join(session.layout.root, editor.BASELINE_DIRECTORY);
+        fs.mkdirSync(path.join(tree, 'extension'), { recursive: true });
+        for (const name of editor.BASELINE_LINKS) {
+          fs.mkdirSync(path.dirname(path.join(tree, name)), { recursive: true });
+          fs.symlinkSync(dependencies, path.join(tree, name), 'junction');
+        }
+        session.stopBuild = () => calls.push(['stopBuild']);
+        throw new Error('The baseline build failed with exit code 1.');
+      },
+    });
+    assert.equal(code, 1);
+    assert.equal(calls.filter((call) => call[0] === 'stopBuild').length, 1);
+    assert.equal(outcome.cleanup.ok, true, outcome.cleanup.errors.join('\n'));
+    assert.equal(fs.existsSync(outcome.run), false);
+    assert.equal(fs.readFileSync(path.join(dependencies, 'canary.txt'), 'utf8'), 'kept');
   });
 });

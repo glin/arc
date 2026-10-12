@@ -352,6 +352,20 @@ node scripts/isolated-editor.mjs cleanup
 
 Pass a run directory or its `run.json` to clean up one run. A run directory that is already gone leaves the command nothing to read, so it reports no run. Pass `--scratch <directory>` when the run used one.
 
+### Restored tab check
+
+The restore command checks that the build under test adopts a panel tab that an older build saved:
+
+```bash
+node scripts/isolated-editor.mjs restore --baseline-commit <revision>
+```
+
+The command exports the revision from the checkout's repository into the run directory. The export leaves out `evals`, whose review fixture paths exceed the Windows path limit. It also leaves out `docs` and the agent folders, which the build does not need. It links the checkout's dependency folders into the export and builds it there. `--baseline <checkout>` names a checkout that already holds a build instead. A baseline whose dependencies differ from the checkout's needs that prebuilt form. The baseline must open the Arc panel at activation from `ARC_MEASURE_BLOCK_AGENTS` and `ARC_MEASURE_STATE`, as the isolated editor environment above describes.
+
+The command starts the editor with the baseline build and waits for the panel. It then closes that editor and waits until no process of the profile remains, so VS Code saves the tab. It starts a second editor on the same profile, extensions directory, and workspace with the checkout under test. The second editor gets no `ARC_MEASURE_STATE`, so Arc opens no panel of its own at activation. A panel that is already open would hide a restored tab with stale options, because Arc disposes that tab with no replacement. Agents stay blocked.
+
+The profile turns on `arc.diagnostics.log` for this command. The check has two conditions. The second editor's log must hold a `panelAdopted` record with origin `serializer` or `serializer-replaced`. The restored panel must also accept text in its prompt box after New session and Create draft. A build whose log holds no such record fails with the origins it logged. The `value` in the JSON line holds the `baseline` revision, or the checkout path for `--baseline`. It also holds the adopted `origin` and the `log` file. The command takes `--timeout`, `--repository`, `--editor`, `--workspace`, `--scratch`, `--screenshot`, and `--allow-focus`. It holds the browser lane lock across both editors and cleans up like `run`. The baseline build lives in the run directory and goes with it. A tab restored by the owner's own editor stays an owner check.
+
 The owner opens a window for manual testing with this command from the repository root:
 
 ```powershell
