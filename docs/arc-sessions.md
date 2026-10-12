@@ -84,7 +84,7 @@ arc CLI <--- local channel ---> Selected ready Arc window
 
 `arc start --arc-dispatch` emits the parent-link receipt for `accepted` and `accepted-with-errors` results that include a session ID. Basic starts require no personal dispatch script. Personal dispatch workflow receipts link sessions. Personal dispatch workflows own durable callback claim/ack outside Arc to track callback ownership and acknowledgement. The receipt does not provide that state. Arc supplies neither detached callbacks nor a cross-provider peer inbox.
 
-Python and shell coordinators both invoke the same CLI. Reader-requested starts keep reader ownership by default. Use `--agent-run` for delegated work. Run `arc --help` and `arc COMMAND --help` for command syntax. [Session management](cli.md#session-management) owns command arguments, delivery outcomes, archive rules, and uncertain-launch handling.
+Python and shell coordinators both invoke the same CLI. Reader-requested starts keep reader ownership by default. Use `--agent-run` for delegated work. Run `arc --help` and `arc COMMAND --help` for command syntax. [Session management](cli.md#session-management) owns delivery outcomes, session data, archive rules, and uncertain-launch handling.
 
 Read each result before describing it. Recorded model and effort establish execution settings, while a requested setup only establishes what the caller selected. Keep a session available for reader continuation when that is part of the task.
 

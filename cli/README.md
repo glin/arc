@@ -36,7 +36,7 @@ ln -s "$arc_skill" ~/.agents/skills/arc-sessions
 
 A source checkout supplies the same skill under `cli/skills/arc-sessions`. A project-local package supplies it under `node_modules/@glin/arc/skills/arc-sessions`. Use that absolute directory as the link target. Existing links require a separate removal before replacement. Restart the agent session to load the skill.
 
-Run `arc --help` for command sections and `arc COMMAND --help` for syntax, flags, output fields, refusals, and examples. Starts keep reader ownership by default. Use `--agent-run` for delegated work. The [CLI guide](https://github.com/glin/arc/blob/main/docs/cli.md#session-management) explains delivery and session data.
+Run `arc --help` for command sections and `arc COMMAND --help` for syntax, flags, output fields, refusals, and examples. The [CLI guide](https://github.com/glin/arc/blob/main/docs/cli.md#session-management) explains delivery and session data.
 
 Filter a selected window with the existing session list query:
 

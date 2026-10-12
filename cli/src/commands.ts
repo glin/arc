@@ -28,8 +28,9 @@ const windowRefusal = 'Window selection, unavailable capabilities, or repository
 const argumentRefusal =
   'Unknown flags, repeated scalar flags, and missing flag values refuse before sending. Host validation can refuse request values after sending.';
 const curationOutput = [
-  'JSON: version, requestId, status, sessionId, action, requester. Refusals include reason.',
-  'Applied results also include labels, pinned, archived. Status is applied, dry-run, refused, or unknown.',
+  'Host JSON: version, requestId, status, sessionId, action, requester. Refusals include reason.',
+  'Applied results also include labels, pinned, archived. Host status is applied, dry-run, or refused.',
+  'Unknown delivery JSON: version, status, requestId, window, reason. It omits requester and curation details.',
 ];
 
 function curation(name: string, summary: string, refusal: string, flags: readonly Flag[] = []): Command {
@@ -219,7 +220,8 @@ export const COMMANDS: readonly Command[] = [
       synopsis: 'arc setups [--window ID] [--json]',
       flags: [windowFlag, jsonFlag],
       output: [
-        'JSON: version, project, primary, inherited, pinned, recent, agents, words. Optional owner identifies the launcher project.',
+        'JSON: version, project, primary, inherited, pinned, recent, agents, words. project identifies the project.',
+        'Optional owner is a setup selection generation token.',
         'Rows supply a key and profile. Agents supply offered model, effort, and permission values.',
       ],
       refusals: [argumentRefusal, 'Positional arguments refuse.', windowRefusal],
@@ -254,8 +256,9 @@ export const COMMANDS: readonly Command[] = [
         jsonFlag,
       ],
       output: [
-        'JSON: version, requestId, status, requester. Accepted results include sessionId, provider, requestedSetup, agentRun, errors. Refusals include reason.',
-        'Status is accepted, accepted-with-errors, refused, or unknown. Requested settings do not establish observed execution.',
+        'Host JSON: version, requestId, status, requester. Accepted results include sessionId, provider, requestedSetup, agentRun, errors. Refusals include reason.',
+        'Host status is accepted, accepted-with-errors, or refused. Requested settings do not establish observed execution.',
+        'Unknown delivery JSON: version, status, requestId, window, reason. It omits requester and accepted-result details.',
         '--arc-dispatch adds ARC_DISPATCH_SESSION after an accepted result with a session ID. Reader-owned receipts include owned: true.',
       ],
       refusals: [
