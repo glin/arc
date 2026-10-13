@@ -478,10 +478,28 @@ function policyCallbacks(host: AgentHost, policies: LaunchPolicyStore) {
       if (policy) policies.write(id, policy);
     },
     failedClearDelivery: (_agent: string, error: Error) => ({ delivered: false, reason: error.message }),
+    launchFor: () => CODEX,
+    askModeFor: () => undefined,
+    askValueFor: () => undefined,
+    modelFor: () => '',
+    effortFor: () => '',
+    sessionSettingsForProfile,
+    codexPlan,
+    CLIENT_INFO: CODEX_CLIENT,
+    ensureSession: async (key: string, plan: AgentPlan) => {
+      const child = await host.session(key, plan);
+      if (child.state().exited && child.state().lastError) throw new Error(child.state().lastError!);
+      return child;
+    },
+    persistSessionSettings: async () => {},
+    publishPicks() {},
   };
   const code = esbuild.transformSync(
     `${statementFrom(source, source.indexOf('panel.onClear ='))};
+    let forkSequence = 0;
+    ${statementFrom(source, source.indexOf('const forkCodexSession ='))};
     return {
+      fork: forkCodexSession,
       event: ({key, event}) => { const agent = host.get(key)?.agent; ${eventCode} },
       state: (state) => { ${stateCode} },
     };`,
@@ -490,6 +508,198 @@ function policyCallbacks(host: AgentHost, policies: LaunchPolicyStore) {
   const callbacks = runInNewContext(`(function() { ${code} })()`, scope);
   return { ...callbacks, panel, moves, modes, errors };
 }
+
+test.each(['clear', 'fork'])(
+  'restricted Codex %s preserves durable refusal after one successor save failure and child replacement',
+  async (operation) => {
+    const root = tempDir('arc-policy-codex-successor-');
+    let callbacks: ReturnType<typeof policyCallbacks>;
+    const { host, children } = fakeHost(undefined, undefined, {
+      onEvent: (event) => callbacks?.event(event),
+      onStateChange: (state) => callbacks?.state(state),
+    });
+    try {
+      const policies = new LaunchPolicyStore(root);
+      callbacks = policyCallbacks(host, policies);
+      const policy = launchPolicy('codex', true)!;
+      policies.write('source', policy);
+      const openSource = () =>
+        host.session('owned', codexPlan(CODEX, { cwd: WS, resume: 'source', policy, clientInfo: CODEX_CLIENT }));
+      const opening = openSource();
+      let child = children[0];
+      child.reply({ userAgent: 'codex' });
+      await vi.waitFor(() => assert.equal(child.sent().at(-1)?.method, 'skills/list'));
+      child.reply({ data: [] });
+      await vi.waitFor(() => assert.equal(child.sent().at(-1)?.method, 'thread/resume'));
+      child.reply({ thread: { id: 'source' } });
+      const source = await opening;
+      const save = vi.spyOn(policies, 'write').mockImplementation((id, value) => {
+        if (id === 'successor') throw new Error('successor save failed');
+        LaunchPolicyStore.prototype.write.call(policies, id, value);
+      });
+      const result =
+        operation === 'clear'
+          ? callbacks.panel.onClear('codex', 'source', WS)
+          : callbacks.fork('source', WS).then(
+              () => assert.fail('fork accepted'),
+              (error: Error) => error,
+            );
+      if (operation === 'fork') {
+        child = children.at(-1)!;
+        child.reply({ userAgent: 'codex' });
+        await vi.waitFor(() => assert.equal(child.sent().at(-1)?.method, 'skills/list'));
+        child.reply({ data: [] });
+      }
+      await vi.waitFor(() =>
+        assert.equal(child.sent().at(-1)?.method, operation === 'clear' ? 'thread/start' : 'thread/fork'),
+      );
+      assert.throws(() => new LaunchPolicyStore(root).read('successor'), /cannot continue/);
+      child.reply({ thread: { id: 'successor' } });
+      const outcome = await result;
+      assert.equal(save.mock.calls.filter(([id]) => id === 'successor').length, 1);
+      assert.equal(policies.readSaved('successor'), undefined);
+      assert.throws(() => new LaunchPolicyStore(root).read('successor'), /cannot continue/);
+      assert.deepEqual(callbacks.moves, []);
+      if (operation === 'clear') {
+        assert.equal(outcome.delivered, false);
+        assert.equal(source.state().exited, false);
+        assert.equal(host.find('codex', 'successor'), source);
+        const prompt = source.prompt('read only');
+        await vi.waitFor(() => assert.equal(child.sent().at(-1)?.method, 'turn/start'));
+        assert.deepEqual((child.sent().at(-1)?.params as any)?.sandboxPolicy, { type: 'readOnly' });
+        child.reply({ turn: { id: 'restricted-turn' } });
+        await prompt;
+      } else {
+        assert.match(outcome.message, /successor save failed/);
+        assert.equal(host.get('codex:fork:source:1')!.state().exited, true);
+        assert.equal(
+          child.sent().some((request) => request.method === 'turn/start'),
+          false,
+        );
+      }
+      save.mockRestore();
+      child.exit(0);
+      const key = operation === 'clear' ? 'owned' : 'codex:fork:source:1';
+      const replacement = host.session(
+        key,
+        codexPlan(CODEX, { cwd: WS, resume: 'replacement', policy, clientInfo: CODEX_CLIENT }),
+      );
+      const next = children.at(-1)!;
+      next.reply({ userAgent: 'codex' });
+      await vi.waitFor(() => assert.equal(next.sent().at(-1)?.method, 'skills/list'));
+      next.reply({ data: [] });
+      await vi.waitFor(() => assert.equal(next.sent().at(-1)?.method, 'thread/resume'));
+      next.reply({ thread: { id: 'replacement' } });
+      await replacement;
+      child.say(JSON.stringify({ method: 'thread/started', params: { thread: { id: 'stale' } } }) + '\n');
+      assert.equal(policies.readSaved('stale'), undefined);
+      assert.deepEqual(policies.readSaved('replacement'), policy);
+      assert.throws(() => new LaunchPolicyStore(root).read('unknown'), /cannot continue/);
+    } finally {
+      vi.restoreAllMocks();
+      host.dispose();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  },
+);
+
+test.each(
+  ['clear', 'fork'].flatMap((operation) =>
+    ['saved', 'reservation failure', 'RPC error', 'unknown write', 'timeout'].map((outcome) => [operation, outcome]),
+  ),
+)('restricted Codex %s preserves admission after %s', async (operation, outcome) => {
+  const root = tempDir('arc-policy-codex-outcome-');
+  let callbacks: ReturnType<typeof policyCallbacks>;
+  const { host, children } = fakeHost(undefined, undefined, {
+    onEvent: (event) => callbacks?.event(event),
+    onStateChange: (state) => callbacks?.state(state),
+  });
+  try {
+    const policies = new LaunchPolicyStore(root);
+    callbacks = policyCallbacks(host, policies);
+    const policy = launchPolicy('codex', true)!;
+    policies.write('source', policy);
+    const opening = host.session(
+      'owned',
+      codexPlan(CODEX, { cwd: WS, resume: 'source', policy, clientInfo: CODEX_CLIENT }),
+    );
+    let child = children[0];
+    child.reply({ userAgent: 'codex' });
+    await vi.waitFor(() => assert.equal(child.sent().at(-1)?.method, 'skills/list'));
+    child.reply({ data: [] });
+    await vi.waitFor(() => assert.equal(child.sent().at(-1)?.method, 'thread/resume'));
+    child.reply({ thread: { id: 'source' } });
+    await opening;
+    if (outcome === 'reservation failure')
+      vi.spyOn(policies, 'prepareClear').mockImplementation(() => {
+        throw new Error('reservation failed');
+      });
+    if (operation === 'clear' && outcome === 'unknown write') failNextWrite(child, 'write uncertain');
+    if (operation === 'clear' && outcome === 'timeout') vi.useFakeTimers();
+    const before = child.written.length;
+    const clearing =
+      operation === 'clear'
+        ? callbacks.panel.onClear('codex', 'source', WS)
+        : callbacks.fork('source', WS).then(
+            () => ({ delivered: true }),
+            () => ({ delivered: false }),
+          );
+    let forkBefore = 0;
+    if (operation === 'fork') {
+      child = children.at(-1)!;
+      child.reply({ userAgent: 'codex' });
+      await vi.waitFor(() => assert.equal(child.sent().at(-1)?.method, 'skills/list'));
+      if (outcome === 'unknown write') failNextWrite(child, 'write uncertain');
+      if (outcome === 'timeout') vi.useFakeTimers();
+      forkBefore = child.written.length;
+      child.reply({ data: [] });
+    }
+    if (outcome === 'saved' || outcome === 'RPC error') {
+      await vi.waitFor(() =>
+        assert.equal(child.sent().at(-1)?.method, operation === 'clear' ? 'thread/start' : 'thread/fork'),
+      );
+      assert.throws(() => new LaunchPolicyStore(root).read('unknown'), /cannot continue/);
+      if (outcome === 'saved') child.reply({ thread: { id: 'successor' } });
+      else child.say(JSON.stringify({ id: child.sent().at(-1)?.id, error: { message: 'generic RPC failure' } }) + '\n');
+    }
+    if (outcome === 'timeout') await vi.advanceTimersByTimeAsync(CODEX_DEADLINE_MS);
+    assert.equal((await clearing).delivered, outcome === 'saved');
+    if (outcome === 'reservation failure' || outcome === 'unknown write')
+      assert.equal(child.written.length, operation === 'clear' ? before : forkBefore);
+    if (outcome === 'saved') assert.deepEqual(new LaunchPolicyStore(root).read('successor'), policy);
+    if (outcome === 'saved' || outcome === 'reservation failure')
+      assert.equal(new LaunchPolicyStore(root).read('unknown'), undefined);
+    else assert.throws(() => new LaunchPolicyStore(root).read('unknown'), /cannot continue/);
+  } finally {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+    host.dispose();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('successor reservations reject replacement owners and ended confirmation tokens', () => {
+  const root = tempDir('arc-policy-owner-');
+  try {
+    const policies = new LaunchPolicyStore(root);
+    const policy = launchPolicy('codex', true)!;
+    policies.write('source', policy);
+    policies.write('successor', policy);
+    const owner = {};
+    const replacement = {};
+    const token = policies.prepareClear('key', 'source', owner);
+    policies.cancelClear('key', token, replacement);
+    assert.throws(() => new LaunchPolicyStore(root).read('unknown'), /cannot continue/);
+    assert.equal(policies.confirmClear('key', 'successor', replacement), false);
+    assert.throws(() => new LaunchPolicyStore(root).read('unknown'), /cannot continue/);
+    policies.forgetClear('key');
+    policies.cancelClear('key', token, owner);
+    assert.equal(policies.confirmClear('key', 'successor', owner), false);
+    assert.throws(() => new LaunchPolicyStore(root).read('unknown'), /cannot continue/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test.each(['same chunk', 'separate chunks'])(
   'pending restricted clear preserves unrestricted Claude output in %s',

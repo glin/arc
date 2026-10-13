@@ -6,7 +6,7 @@ import { launchPolicy, type LaunchPolicy } from './launchpolicy';
 
 // Authoritative restrictions outlive workspaces and have no eviction rule.
 export class LaunchPolicyStore {
-  private readonly clears = new Map<string, string>();
+  private readonly clears = new Map<string, { token: string; owner?: object }>();
 
   constructor(private readonly root: string) {}
 
@@ -14,7 +14,7 @@ export class LaunchPolicyStore {
     return join(this.root, 'pending-clear.json');
   }
 
-  prepareClear(key: string, session: string): string {
+  prepareClear(key: string, session: string, owner?: object): string {
     const token = randomUUID();
     mkdirSync(this.root, { recursive: true });
     let descriptor: number | undefined;
@@ -28,20 +28,24 @@ export class LaunchPolicyStore {
         descriptor = undefined;
         unlinkSync(this.pendingFile);
       }
-      throw new Error('Read-only clearing is unavailable until the previous clear saves its session permissions.', {
-        cause: error,
-      });
+      throw new Error(
+        'Read-only continuation is unavailable until the previous clear or fork saves its session permissions.',
+        {
+          cause: error,
+        },
+      );
     } finally {
       if (descriptor !== undefined) closeSync(descriptor);
     }
-    this.clears.set(key, token);
+    this.clears.set(key, { token, owner });
     return token;
   }
 
-  cancelClear(key: string, token: string): void {
+  cancelClear(key: string, token: string, owner?: object): void {
     const held = this.clears.get(key);
-    if (held && held !== token) return;
-    if (statSync(this.pendingFile).size > 8192) throw new Error('Saved read-only clear permissions are unreadable.');
+    if (!held || held.token !== token || held.owner !== owner) return;
+    if (statSync(this.pendingFile).size > 8192)
+      throw new Error('Saved read-only continuation permissions are unreadable.');
     const pending = JSON.parse(readFileSync(this.pendingFile, 'utf8'));
     if (pending.token !== token) return;
     unlinkSync(this.pendingFile);
@@ -52,17 +56,19 @@ export class LaunchPolicyStore {
     this.clears.delete(key);
   }
 
-  confirmClear(key: string, session: string): boolean {
-    const token = this.clears.get(key);
-    if (!token) return false;
+  confirmClear(key: string, session: string, owner?: object): boolean {
+    const held = this.clears.get(key);
+    if (!held || held.owner !== owner) return false;
+    const { token } = held;
     const successor = this.readSaved(session);
     if (!successor) return false;
-    if (statSync(this.pendingFile).size > 8192) throw new Error('Saved read-only clear permissions are unreadable.');
+    if (statSync(this.pendingFile).size > 8192)
+      throw new Error('Saved read-only continuation permissions are unreadable.');
     const pending = JSON.parse(readFileSync(this.pendingFile, 'utf8'));
     if (pending.token !== token || pending.session === session) return false;
     const original = this.readSaved(pending.session);
     if (!original || JSON.stringify(original) !== JSON.stringify(successor))
-      throw new Error('Read-only clearing did not retain its saved session permissions.');
+      throw new Error('Read-only continuation did not retain its saved session permissions.');
     unlinkSync(this.pendingFile);
     this.clears.delete(key);
     return true;
@@ -81,7 +87,7 @@ export class LaunchPolicyStore {
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
     }
-    throw new Error(`Session ${id} cannot continue until a read-only clear saves its session permissions.`);
+    throw new Error(`Session ${id} cannot continue until a read-only clear or fork saves its session permissions.`);
   }
 
   readSaved(id: string): LaunchPolicy | undefined {

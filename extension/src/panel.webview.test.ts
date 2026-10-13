@@ -13882,6 +13882,7 @@ test.each(['saved', 'lost-child', 'retry'])('delayed Claude clear retains permis
         if (value) policies.write(id, value);
       },
       withExistingSessionActivity: async (_agent: unknown, _session: unknown, _cwd: unknown, work: any) => work(live),
+      host: { get: () => (retired ? null : live) },
       failedClearDelivery: () => assert.fail('clear failed'),
       vscode: { window: { showErrorMessage() {} } },
     };

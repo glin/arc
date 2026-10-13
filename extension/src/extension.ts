@@ -479,6 +479,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         if (policy) {
           try {
             policies.write(event.sessionId, policy);
+            const child = host.get(key);
+            if (agent === 'codex' && child && !child.state().exited) policies.confirmClear(key, event.sessionId, child);
           } catch (error) {
             if (agent !== 'claude') throw error;
             if (event.previous)
@@ -498,7 +500,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         if (policy) {
           try {
             if (!event.changed) policies.write(event.sessionId, policy);
-            if (policies.confirmClear(key, event.sessionId)) {
+            const child = host.get(key);
+            if (child && !child.state().exited && policies.confirmClear(key, event.sessionId, child)) {
               const moved = policyMoves.get(key);
               policyMoves.delete(key);
               if (moved?.successor === event.sessionId) {
@@ -1665,9 +1668,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         try {
           const turnId = await live.clear(
             name,
-            agent === 'claude' && policy
+            policy
               ? () => {
-                  token = policies.prepareClear(live.key, session);
+                  if (host.get(live.key) !== live || live.state().exited)
+                    throw new Error('The session is no longer running.');
+                  token = policies.prepareClear(live.key, session, live);
                 }
               : undefined,
             () => {
@@ -1676,7 +1681,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           );
           return { turnId, session: live.state().sessionId, policy };
         } catch (error) {
-          if (token && !attempted) policies.cancelClear(live.key, token);
+          if (token && !attempted && host.get(live.key) === live && !live.state().exited)
+            policies.cancelClear(live.key, token, live);
           throw error;
         }
       });
@@ -2076,18 +2082,40 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     if (picked === undefined) {
       delete settings.permissionMode;
     }
-    const session = await ensureSession(
-      `codex:fork:${sessionId}:${++forkSequence}`,
-      codexPlan(launch, {
-        cwd,
-        fork: sessionId,
-        policy: policies.read(sessionId),
-        clientInfo: CLIENT_INFO,
-        ...(mode ? codexAskMode(mode) : {}),
-        model,
-        effort,
-      }),
-    );
+    const key = `codex:fork:${sessionId}:${++forkSequence}`;
+    const policy = policies.read(sessionId);
+    let token: string | undefined;
+    let owner: AgentSession | undefined;
+    let attempted = false;
+    let session: AgentSession;
+    try {
+      session = await ensureSession(
+        key,
+        codexPlan(launch, {
+          cwd,
+          fork: sessionId,
+          policy,
+          beforeForkWrite: policy
+            ? () => {
+                owner = host.get(key) ?? undefined;
+                if (!owner || owner.state().exited) throw new Error('The session is no longer running.');
+                token = policies.prepareClear(key, sessionId, owner);
+              }
+            : undefined,
+          forkWriteAttempted: () => {
+            attempted = true;
+          },
+          clientInfo: CLIENT_INFO,
+          ...(mode ? codexAskMode(mode) : {}),
+          model,
+          effort,
+        }),
+      );
+    } catch (error) {
+      if (token && !attempted && owner && host.get(key) === owner && !owner.state().exited)
+        policies.cancelClear(key, token, owner);
+      throw error;
+    }
     const continued = session.state().sessionId;
     if (!continued) {
       throw new Error('Codex did not name the continuation session');

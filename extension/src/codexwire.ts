@@ -531,14 +531,24 @@ export class CodexWire {
     this.skillRefresh = pending;
   }
 
-  async startThread(options: CodexSpawnOptions, name: string = ''): Promise<string> {
-    const result = await this.request('thread/start', {
-      cwd: options.cwd,
-      ...(options.model ? { model: options.model } : {}),
-      ...(options.approvalPolicy ? { approvalPolicy: options.approvalPolicy } : {}),
-      ...(options.approvalsReviewer ? { approvalsReviewer: options.approvalsReviewer } : {}),
-      ...(options.sandbox ? { sandbox: options.sandbox } : {}),
-    });
+  async startThread(
+    options: CodexSpawnOptions,
+    name: string = '',
+    beforeWrite?: () => void,
+    writeAttempted?: () => void,
+  ): Promise<string> {
+    const result = await this.request(
+      'thread/start',
+      {
+        cwd: options.cwd,
+        ...(options.model ? { model: options.model } : {}),
+        ...(options.approvalPolicy ? { approvalPolicy: options.approvalPolicy } : {}),
+        ...(options.approvalsReviewer ? { approvalsReviewer: options.approvalsReviewer } : {}),
+        ...(options.sandbox ? { sandbox: options.sandbox } : {}),
+      },
+      beforeWrite,
+      writeAttempted,
+    );
     const threadId = this.adoptThread(result);
     if (name) {
       try {
@@ -570,21 +580,31 @@ export class CodexWire {
 
   // A session another client still owns cannot be resumed by this app-server process.
   // Forking continues from what that client has saved without taking its writer lock.
-  async forkThread(threadId: string, options: CodexSpawnOptions): Promise<string> {
+  async forkThread(
+    threadId: string,
+    options: CodexSpawnOptions,
+    beforeWrite?: () => void,
+    writeAttempted?: () => void,
+  ): Promise<string> {
     return this.adoptThread(
-      await this.request('thread/fork', {
-        threadId,
-        cwd: options.cwd,
-        ...(options.model ? { model: options.model } : {}),
-        ...(options.approvalPolicy ? { approvalPolicy: options.approvalPolicy } : {}),
-        ...(options.approvalsReviewer ? { approvalsReviewer: options.approvalsReviewer } : {}),
-        ...(options.sandbox ? { sandbox: options.sandbox } : {}),
-        // An inherited goal belongs to the source client until the reader sends this fork its
-        // first prompt. Without this, opening the recovery session can start work by itself.
-        deferGoalContinuation: true,
-        // The caller needs the new id, not a second copy of the inherited turns in the response.
-        excludeTurns: true,
-      }),
+      await this.request(
+        'thread/fork',
+        {
+          threadId,
+          cwd: options.cwd,
+          ...(options.model ? { model: options.model } : {}),
+          ...(options.approvalPolicy ? { approvalPolicy: options.approvalPolicy } : {}),
+          ...(options.approvalsReviewer ? { approvalsReviewer: options.approvalsReviewer } : {}),
+          ...(options.sandbox ? { sandbox: options.sandbox } : {}),
+          // An inherited goal belongs to the source client until the reader sends this fork its
+          // first prompt. Without this, opening the recovery session can start work by itself.
+          deferGoalContinuation: true,
+          // The caller needs the new id, not a second copy of the inherited turns in the response.
+          excludeTurns: true,
+        },
+        beforeWrite,
+        writeAttempted,
+      ),
     );
   }
 
@@ -1909,7 +1929,12 @@ export class CodexWire {
     } else waiting.resolve(obj(message.result) ?? {});
   }
 
-  private request(method: string, params: Json, beforeWrite?: (id: number) => void): Promise<Json> {
+  private request(
+    method: string,
+    params: Json,
+    beforeWrite?: (id: number) => void,
+    writeAttempted?: () => void,
+  ): Promise<Json> {
     if (this.closed) {
       return Promise.reject(new Error('the agent is no longer running'));
     }
@@ -1926,8 +1951,15 @@ export class CodexWire {
         timer.unref();
       }
       this.waiting.set(id, { resolve, reject, timer });
-      beforeWrite?.(id);
-      this.write({ id, method, params });
+      try {
+        beforeWrite?.(id);
+        if (this.closed) throw new Error('the agent is no longer running');
+        writeAttempted?.();
+        if (this.closed) throw new Error('the agent is no longer running');
+        this.write({ id, method, params });
+      } catch (error) {
+        this.take(id)?.reject(error as Error);
+      }
     });
   }
 

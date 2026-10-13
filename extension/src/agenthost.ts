@@ -429,6 +429,8 @@ export function claudeRenamePlan(launch: Launch, options: SpawnOptions & { resum
 // Codex thread-opening settings retain immutable launch restrictions or the reader's selected permission mode.
 export interface CodexPlanOptions {
   policy?: LaunchPolicy;
+  beforeForkWrite?: () => void;
+  forkWriteAttempted?: () => void;
   cwd: string;
   model?: string;
   effort?: string;
@@ -463,7 +465,7 @@ export function codexPlan(launch: Launch, options: CodexPlanOptions): AgentPlan 
           await wire.initialize();
           const commands = await wire.commands();
           if (options.fork) {
-            await wire.forkThread(options.fork, options);
+            await wire.forkThread(options.fork, options, options.beforeForkWrite, options.forkWriteAttempted);
           } else if (options.resume) {
             await wire.resumeThread(options.resume, options.policy ? options : undefined);
           } else await wire.startThread(options);
@@ -478,8 +480,8 @@ export function codexPlan(launch: Launch, options: CodexPlanOptions): AgentPlan 
         prompt: (prompt, guard) => wire.prompt(prompt, guard),
         idleEvidence: () => wire.idleEvidence(),
         compact: (beforeWrite) => wire.compact(beforeWrite),
-        clear: async (name) => {
-          await wire.startThread(options, name);
+        clear: async (name, beforeWrite, writeAttempted) => {
+          await wire.startThread(options, name, beforeWrite, writeAttempted);
         },
         answer: (id, answer) => wire.answer(id, answer),
         interrupt: () => wire.interrupt(),

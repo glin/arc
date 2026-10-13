@@ -114,6 +114,63 @@ function reply(h: ReturnType<typeof harness>, result: unknown): void {
   h.wire.receive(JSON.stringify({ id: last.id, result }));
 }
 
+test.each(['start', 'fork'])(
+  'Codex %s reserves immediately before attempted creation and cleans refused pre-write timers',
+  async (method) => {
+    vi.useFakeTimers();
+    try {
+      const h = harness();
+      const order: string[] = [];
+      const create = (before: () => void, attempted: () => void) =>
+        method === 'start'
+          ? h.wire.startThread({ cwd: 'C:/ws' }, '', before, attempted)
+          : h.wire.forkThread(THREAD, { cwd: 'C:/ws' }, before, attempted);
+      await assert.rejects(
+        create(
+          () => {
+            throw new Error('reservation failed');
+          },
+          () => order.push('attempted'),
+        ),
+        /reservation failed/,
+      );
+      assert.deepEqual(h.sent, []);
+      assert.deepEqual(order, []);
+      assert.equal(vi.getTimerCount(), 0);
+      await assert.rejects(
+        create(
+          () => h.wire.close('closed during reservation'),
+          () => order.push('attempted'),
+        ),
+        /no longer running|closed during reservation/,
+      );
+      assert.deepEqual(h.sent, []);
+      assert.deepEqual(order, []);
+      assert.equal(vi.getTimerCount(), 0);
+      const live = harness();
+      const before = () => {
+        assert.equal(live.sent.length, 0);
+        order.push('reserved');
+      };
+      const attempted = () => {
+        assert.equal(live.sent.length, 0);
+        order.push('attempted');
+      };
+      const pending =
+        method === 'start'
+          ? live.wire.startThread({ cwd: 'C:/ws' }, '', before, attempted)
+          : live.wire.forkThread(THREAD, { cwd: 'C:/ws' }, before, attempted);
+      assert.deepEqual(order, ['reserved', 'attempted']);
+      assert.equal(live.parsed()[0].method, `thread/${method}`);
+      reply(live, { thread: { id: 'successor' } });
+      assert.equal(await pending, 'successor');
+      assert.equal(vi.getTimerCount(), 0);
+    } finally {
+      vi.useRealTimers();
+    }
+  },
+);
+
 test('Codex native evidence requires exact thread fields and separates command exit, compaction acceptance and completion', async () => {
   const h = harness();
   const starting = h.wire.startThread({ cwd: 'C:\\ws' });
