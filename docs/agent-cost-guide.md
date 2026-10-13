@@ -86,7 +86,7 @@ These multipliers describe the exact model rows Arc prices. Provider rates and s
 | [GPT-6 Astra on Amazon Bedrock](https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-openai-gpt-6-astra.html) | 0.1x the route's base input rate | 1.25x the route's base input rate | The rate card prices thirty-minute writes. Fallback cache duration is unknown. |
 | [Other priced direct OpenAI GPT-5.6 and GPT-6 models](https://developers.openai.com/api/docs/guides/prompt-caching) | 0.1x the base input rate | 1.25x the base input rate | The minimum is thirty minutes. |
 
-GPT-5.5 and `gpt-5.5-2026-04-23` support only `24h` retention. The [OpenAI prompt-caching guide](https://developers.openai.com/api/docs/guides/prompt-caching#cache-lifetime) describes typical retention around thirty minutes, with variable retention up to twenty-four hours. Arc uses thirty minutes for estimated cache timing. This estimate establishes no configured TTL, minimum lifetime, or guaranteed expiry deadline.
+GPT-5.5 and `gpt-5.5-2026-04-23` support only `24h` retention. Arc uses thirty minutes for estimated cache timing, from the [OpenAI prompt-caching guide](https://developers.openai.com/api/docs/guides/prompt-caching#cache-lifetime). This estimate establishes no configured TTL, minimum lifetime, or guaranteed expiry deadline.
 
 The OpenAI family label covers only models with explicit rows in `pricing.ts`. It does not price an unlisted future model.
 
@@ -155,22 +155,13 @@ Server tools can run several internal iterations inside one external model reque
 
 ## Use the prompt cache
 
-Prompt caching matches an unchanged prefix at the start of a later prompt. The provider still processes new input after that prefix.
-
-- Keep stable instructions and reference material before changing content.
-- Append new messages instead of rewriting earlier messages.
-- Expect compaction to change the prefix and reduce immediate cache reuse.
-- Compare the smaller post-compaction context with the temporary cache loss.
-- Do not send filler messages only to refresh a cache.
-- Expect a Claude Code effort change on a live session to rewrite the cache unless the model and provider keep it. [Claude Code's prompt caching page](https://code.claude.com/docs/en/prompt-caching#changing-effort-level) lists the models and providers that keep it.
-
-A relevant request before expiry can refresh an eligible cache entry. That request still incurs a cache-read charge and can generate billed output.
+Prompt caching matches an unchanged prefix at the start of a later prompt. The provider still processes new input after that prefix. [Lower agent costs](lowering-agent-costs.md#keep-useful-context) gives the rules for keeping the cache warm.
 
 ### Compact after the cache expires
 
 A Claude Code compaction request reads the whole history once to write its summary. With a warm cache, it reads the history at the cache-read rate. With an expired cache, it sends the history as uncached input at the base input rate. It writes only the shared prefix of system instructions and tools back to the cache, because the summary replaces the history.
 
-The cold next-turn starting price writes the whole history to the cache at the cache-write rate. When the history is much larger than the shared prefix and the summary, a cold compaction costs less than the cold starting price that the prompt box shows before it. For a small history, the summary output can cost more than the write it avoids.
+The cold next-turn starting price that the prompt box shows writes the whole history to the cache at the cache-write rate. [Lower agent costs](lowering-agent-costs.md#choose-a-boundary) gives the rule for when compaction costs less.
 
 For example, take Opus 5.5 at 300,000 tokens with a one-hour cache. Input costs $4 per million tokens, a one-hour cache write costs $8 per million, and output costs $20 per million.
 
@@ -184,15 +175,7 @@ Compacting and continuing costs about $1.55 against $2.40, and the next turns st
 
 Queueing describes where a client holds new input. Steering describes how the agent applies that input to unfinished work. A queued message can become steering when the client delivers it at a safe boundary inside the current turn. A message cannot enter a model request already in flight.
 
-### General advice
-
-| Situation | Action |
-| --- | --- |
-| The active work uses the wrong target or risks an unsafe effect | Interrupt or steer immediately. |
-| One missing constraint changes the current result | Send one complete correction now. |
-| Several small additions express one thought | Hold them briefly and send one combined message. |
-| A self-contained next task can wait | Queue one complete follow-up. |
-| A side question needs no tools or follow-up | Use the client's side-question feature when available. |
+[Lower agent costs](lowering-agent-costs.md#keep-useful-context) lists the action for each situation.
 
 Neither steering nor queueing has a special token price. Cost depends on the model requests, retained context, generated output, and tool work they cause. A rapid burst can become several requests or turns. A warm cache discounts eligible repeated input, but each cache read still costs money.
 
@@ -218,7 +201,7 @@ Claude Code calls all ordinary busy-time messages queued. Queueing is its defaul
 
 Escape interrupts the current turn and sends queued messages immediately. This is interruption followed by another prompt, not same-turn steering. One final response after a mid-turn correction is consistent with same-turn delivery. Two distinct responses show that the correction became a later turn. See [Claude Code's queueing guide](https://code.claude.com/docs/en/interactive-mode#queue-messages-while-claude-works) for its delivery and interruption rules.
 
-Use `/btw` for a quick question that needs no tools or follow-up. It runs independently and never enters the main session history. See the [Claude Code side-question guide](https://code.claude.com/docs/en/interactive-mode#side-questions-with-btw).
+For a quick question that needs no tools, see [Keep useful context](lowering-agent-costs.md#keep-useful-context).
 
 ### Codex
 
