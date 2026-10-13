@@ -30,6 +30,10 @@ export function startBrowserPanel(options: BrowserPanelStartOptions = {}): Brows
   };
 
   const panel = startPanel({
+    readerPageId:
+      typeof SAVED_STATE === 'object' && SAVED_STATE !== null
+        ? (SAVED_STATE as { readerPageId?: string }).readerPageId
+        : undefined,
     dom: panelDom(document),
     readOnly: ports.readOnly,
     events: globalEvents,
@@ -47,7 +51,7 @@ export function startBrowserPanel(options: BrowserPanelStartOptions = {}): Brows
   window.addEventListener('pagehide', () => panel.dispose(), { once: true });
   requestAnimationFrame(() =>
     requestAnimationFrame(() => {
-      ports.host.send({ type: 'ready' });
+      ports.host.send({ type: 'ready', readerPageId: panel.readerPageId });
       savedState.publishRecovery();
     }),
   );

@@ -208,6 +208,10 @@ export type ReadOperation = {
 
 export type ReaderReadAdmission = (operation: Extract<ReadOperation, { action: 'turn' | 'session' }>) => boolean;
 
+export type ReaderReadEvent = Exclude<ReadOperation, { action: 'acknowledge' }> & {
+  namespace?: 'browser' | 'host';
+};
+
 function currentReaderRead(
   target: ReaderReadTarget,
   facts: (record: AgentReadRecord) => AgentReadSource | null,
@@ -326,8 +330,9 @@ export class OrderedReadOperations {
   snapshot(): OrderedReadState {
     return structuredClone(this.current?.() ?? this.state);
   }
-  serialize<T>(operation: () => Promise<T>): Promise<T> {
+  serialize<T>(operation: () => Promise<T>, admitted?: () => void): Promise<T> {
     if (this.pending >= this.limit) return Promise.reject(new Error('The read save limit was reached.'));
+    admitted?.();
     this.pending++;
     const result = this.tail.then(async () => {
       try {
@@ -437,6 +442,30 @@ export class HostReadPersistence<T extends HostReadState> {
       () => this.publishAccepted(),
       admitReader,
     );
+  }
+  // Ordinary host and page events share storage ordering without retaining historical outcomes.
+  readerEvent(
+    operation: ReaderReadEvent,
+    facts: (record: AgentReadRecord) => AgentReadSource | null,
+    admitReader?: ReaderReadAdmission,
+    preferences?: (current: T) => T,
+    admitted?: () => void,
+  ): Promise<{ revision: number } | null> {
+    const payload = JSON.stringify(operation);
+    if (!operation.id || operation.id.length > 512 || payload.length > 512 * 1024)
+      return Promise.reject(new Error('The read operation limit was reached.'));
+    const event = structuredClone(operation);
+    return this.operations.serialize(async () => {
+      const next = reduceReadOperation(this.operations.snapshot(), event, facts, admitReader);
+      if (!next) return null;
+      await this.persistRead(next, preferences);
+      try {
+        await this.publishAccepted();
+      } catch {
+        throw new ReadPublicationError();
+      }
+      return { revision: next.revision };
+    }, admitted);
   }
   // Supply these callbacks only to this owner's ordered operations.
   async persistRead(read: OrderedReadState, preferences?: (current: T) => T): Promise<void> {

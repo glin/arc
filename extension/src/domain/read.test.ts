@@ -440,6 +440,107 @@ test('host persistence suspends preference writes and publishes only settled lat
   assert.deepEqual(owner.snapshot().agentRead, []);
 });
 
+test('ordinary events preserve retained reset and removal outcomes after later work and exhaustion', async () => {
+  const owner = new HostReadPersistence(
+    { read: [] as string[], readTo: {}, since: 0, agentRead: [acknowledgment], readRevision: 0 },
+    async () => {},
+    () => {},
+    2,
+  );
+  const remove = { id: 'remove', action: 'turn' as const, target: acknowledgment, read: false, observedRevision: 0 };
+  const reset = { id: 'reset', action: 'reset' as const, since: 42, observedRevision: 0 };
+  const removed = await owner.read(remove, sourceFacts);
+  const resetResult = await owner.read(reset, sourceFacts);
+  for (let index = 0; index < 300; index++)
+    await owner.readerEvent({ ...remove, id: `ordinary:${index}`, read: true }, sourceFacts);
+  const latest = owner.snapshot();
+  assert.deepEqual(latest.read, ['session:10']);
+  assert.equal(latest.readRevision, 302);
+  assert.deepEqual(await owner.read(remove, sourceFacts), removed);
+  assert.deepEqual(await owner.read(reset, sourceFacts), resetResult);
+  assert.deepEqual(owner.snapshot(), latest);
+  await assert.rejects(owner.read({ ...remove, id: 'new-retained' }, sourceFacts), /operation limit/);
+  await assert.rejects(owner.read({ ...remove, read: true }, sourceFacts), /different action/);
+  await owner.readerEvent({ ...reset, id: 'ordinary-reset' }, sourceFacts);
+  assert.deepEqual(owner.snapshot().read, []);
+  await owner.readerEvent({ id: 'ordinary-invalidation', action: 'invalidate', observedRevision: 0 }, sourceFacts);
+  assert.equal(owner.snapshot().readRevision, 304);
+});
+
+test('ordinary event settlement preserves accepted state and unknown storage blocks every admission route', async () => {
+  let outcome: 'saved' | 'failed' | 'unknown' = 'failed';
+  let writes = 0;
+  const initial = { read: [] as string[], readTo: {}, since: 0, agentRead: [acknowledgment], readRevision: 0 };
+  const owner = new HostReadPersistence(
+    initial,
+    async () => {
+      writes++;
+      return { status: outcome };
+    },
+    () => {},
+  );
+  const reset = { id: 'ordinary-reset', action: 'reset' as const, since: 42, observedRevision: 0 };
+  await assert.rejects(owner.readerEvent(reset, sourceFacts), /could not be saved/);
+  assert.deepEqual(owner.snapshot(), initial);
+  outcome = 'saved';
+  await owner.readerEvent({ ...reset, id: 'later' }, sourceFacts);
+  const accepted = owner.snapshot();
+  outcome = 'unknown';
+  await assert.rejects(owner.readerEvent({ ...reset, id: 'unknown' }, sourceFacts), ReadPersistenceUnknownError);
+  for (const pending of [
+    owner.readerEvent({ ...reset, id: 'ordinary-blocked' }, sourceFacts),
+    owner.read({ ...reset, id: 'retained-blocked' }, sourceFacts),
+    owner.savePreferences(initial),
+  ])
+    await assert.rejects(pending, ReadPersistenceUnknownError);
+  assert.equal(writes, 3);
+  assert.deepEqual(owner.snapshot(), accepted);
+});
+
+test('ordinary publication settles before retained work and publication failure keeps stored acceptance', async () => {
+  let entered!: () => void;
+  let release!: () => void;
+  const started = new Promise<void>((resolve) => {
+    entered = resolve;
+  });
+  const suspended = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let writes = 0;
+  let publications = 0;
+  const owner = new HostReadPersistence(
+    { read: [] as string[], readTo: {}, since: 0, agentRead: [] as AgentReadRecord[], readRevision: 0 },
+    async () => {
+      writes++;
+    },
+    async () => {
+      if (++publications === 1) {
+        entered();
+        await suspended;
+        throw new Error('publication failed');
+      }
+    },
+  );
+  const first = owner.readerEvent(
+    { id: 'ordinary', action: 'turn', target: acknowledgment, read: true, observedRevision: 0 },
+    sourceFacts,
+  );
+  const failed = assert.rejects(first, /could not be published/);
+  const later = owner.read(
+    { id: 'retained', action: 'acknowledge', records: [acknowledgment], observedRevision: 0 },
+    sourceFacts,
+  );
+  await started;
+  assert.equal(writes, 1);
+  assert.deepEqual(owner.snapshot().read, ['session:10']);
+  release();
+  await failed;
+  await later;
+  assert.equal(writes, 2);
+  assert.equal(owner.snapshot().readRevision, 2);
+  assert.deepEqual(owner.snapshot().agentRead, [acknowledgment]);
+});
+
 test('host persistence failure restores accepted state and unknown settlement blocks later writes', async () => {
   const initial = { read: [], readTo: {}, since: 0, agentRead: [acknowledgment], readRevision: 4, filter: 'old' };
   let writes = 0;

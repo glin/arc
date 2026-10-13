@@ -65,6 +65,7 @@ export interface GlobalEventPort {
 }
 
 export interface PanelKernel {
+  readerPageId?: string;
   readOnly?: boolean;
   dom: PanelDom;
   events: GlobalEventPort;
@@ -74,6 +75,7 @@ export interface PanelKernel {
 }
 
 export interface StartedPanel {
+  readonly readerPageId: string;
   receiveHostMessage(data: unknown): void;
   dispose(): void;
 }
@@ -389,6 +391,7 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
   navigation.installRoving();
 
   readState = createReadState({
+    pageId: kernel.readerPageId,
     initial: saved,
     open,
     cards() {
@@ -1473,5 +1476,5 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
   // Draw the empty rail shell before the first host payload arrives.
   railRenderer.update([], [], [], undefined, {});
 
-  return { receiveHostMessage, dispose: visibility.dispose };
+  return { readerPageId: readState.pageId, receiveHostMessage, dispose: visibility.dispose };
 }

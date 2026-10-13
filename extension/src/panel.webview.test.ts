@@ -2017,6 +2017,7 @@ function orderedHostReadFixture() {
   const writes: any[] = [];
   const publications: any[] = [];
   const host = {};
+  const pageId = 'a'.repeat(32);
   const provider: any = Object.assign(Object.create(PanelProvider.prototype), {
     saved: normalizePanelState(null),
     hosts: [host],
@@ -2027,6 +2028,7 @@ function orderedHostReadFixture() {
     cards: [{ kind: 'turn', sessionId: 'worker', startedAt: 10, promptId: 'prompt', key: 'worker:10' }],
     windows: new Map([['worker', { starts: [10], whole: false }]]),
     readSequence: 0,
+    readerPages: new WeakMap([[host, { id: pageId, sequence: 0 }]]),
     agentReadSources: new AgentReadSources(),
     admittedReadSources: new Map(),
     readObservations: new SessionReadObservations('test-activation'),
@@ -2042,7 +2044,7 @@ function orderedHostReadFixture() {
     postRail() {},
     readScopeKey: () => 'scope',
   });
-  return { provider, writes, publications };
+  return { provider, writes, publications, host, pageId };
 }
 
 test('production read publication waits for storage and stale preferences preserve the accepted marks', async () => {
@@ -2062,14 +2064,17 @@ test('production read publication waits for storage and stale preferences preser
       entered();
       await storage;
     };
-    const mark = f.provider.readerRead({
-      id: 'tab:1',
-      namespace: 'browser',
-      observedRevision: 0,
-      action: 'turn',
-      target: { sessionId: 'worker', startedAt: 10, promptId: 'prompt' },
-      read: true,
-    });
+    const mark = f.provider.readerRead(
+      {
+        id: `${f.pageId}:1`,
+        namespace: 'browser',
+        observedRevision: 0,
+        action: 'turn',
+        target: { sessionId: 'worker', startedAt: 10, promptId: 'prompt' },
+        read: true,
+      },
+      f.host,
+    );
     await admitted;
     await vi.advanceTimersByTimeAsync(0);
     const preference = f.provider.saveState({ ...f.provider.saved, railFilter: 'session:worker', read: [] });
@@ -2108,25 +2113,171 @@ test('production stale reader removal applies to unseen acknowledgments and unfi
       () => facts,
     );
   const removal = {
-    id: 'tab:1',
+    id: `${f.pageId}:1`,
     namespace: 'browser' as const,
     observedRevision: 0,
     action: 'turn' as const,
     target: { sessionId: 'worker', startedAt: 10, promptId: 'prompt' },
     read: false,
   };
-  await f.provider.readerRead(removal);
+  await f.provider.readerRead(removal, f.host);
   assert.deepEqual(f.provider.saved.agentRead, []);
-  await f.provider.readerRead({ ...removal, id: 'tab:2', read: true });
-  await f.provider.readerRead(removal);
+  await f.provider.readerRead({ ...removal, id: `${f.pageId}:2`, read: true }, f.host);
+  await f.provider.readerRead(removal, f.host);
   assert.deepEqual(f.provider.saved.read, ['worker:10']);
   assert.equal(f.provider.saved.readRevision, 3);
   f.provider.memento.update = async () => {
     throw new Error('storage failed');
   };
-  await assert.rejects(f.provider.readerRead({ ...removal, id: 'tab:3' }));
+  await assert.rejects(f.provider.readerRead({ ...removal, id: `${f.pageId}:3` }, f.host));
   assert.deepEqual(f.provider.saved.read, ['worker:10']);
   assert.equal(f.provider.saved.readRevision, 3);
+  f.provider.memento.update = async (_key: string, state: unknown) => {
+    f.writes.push(structuredClone(state));
+  };
+  await f.provider.readerRead({ ...removal, id: `${f.pageId}:4`, read: true }, f.host);
+  const writes = f.writes.length;
+  await f.provider.readerRead({ ...removal, id: `${f.pageId}:3` }, f.host);
+  assert.equal(f.writes.length, writes);
+  assert.deepEqual(f.provider.saved.read, ['worker:10']);
+  assert.equal(f.provider.saved.readRevision, 4);
+});
+
+test('ordinary turn and session actions stay available after retained capacity and without agent requests', async () => {
+  for (const fillRetained of [false, true]) {
+    const f = orderedHostReadFixture();
+    if (fillRetained) {
+      for (let index = 0; index < 256; index++)
+        await f.provider
+          .readOwner()
+          .read({ id: `retained:${index}`, action: 'invalidate', observedRevision: 0 }, () => null);
+      await assert.rejects(
+        f.provider.readOwner().read({ id: 'overflow', action: 'invalidate', observedRevision: 0 }, () => null),
+      );
+    }
+    for (let sequence = 1; sequence <= 300; sequence++) {
+      const session = sequence % 2 === 0;
+      await f.provider.readerRead(
+        {
+          id: `${f.pageId}:${sequence}`,
+          observedRevision: 0,
+          action: session ? 'session' : 'turn',
+          target: { sessionId: 'worker', startedAt: 10, promptId: 'prompt' },
+          read: !session,
+          ...(session ? { newestAt: 10 } : {}),
+        },
+        f.host,
+      );
+      assert.deepEqual(f.provider.saved.read, session ? [] : ['worker:10']);
+    }
+    assert.equal(f.provider.saved.readRevision, (fillRetained ? 256 : 0) + 300);
+  }
+});
+
+test('ordinary sequence gaps preserve unseen unread and consumed reset cannot remove later work', async () => {
+  const f = orderedHostReadFixture();
+  const event = {
+    id: `${f.pageId}:1`,
+    observedRevision: 0,
+    action: 'turn',
+    target: { sessionId: 'worker', startedAt: 10, promptId: 'prompt' },
+    read: true,
+  };
+  await f.provider.readerRead(event, f.host);
+  await f.provider.readerRead({ ...event, id: `${f.pageId}:3` }, f.host);
+  assert.equal(f.provider.saved.readRevision, 1);
+  await f.provider.readerRead({ ...event, id: `${f.pageId}:2`, read: false }, f.host);
+  assert.deepEqual(f.provider.saved.read, []);
+  await f.provider.readerRead({ ...event, id: `${f.pageId}:3` }, f.host);
+  await f.provider.readerRead({ ...event, id: `${f.pageId}:2`, read: false }, f.host);
+  assert.deepEqual(f.provider.saved.read, ['worker:10']);
+  const reset = { id: `${f.pageId}:4`, observedRevision: 0, action: 'reset', since: 42 };
+  await f.provider.readerRead(reset, f.host);
+  const record = {
+    provider: 'codex' as const,
+    sessionId: 'worker',
+    source: 'source',
+    scope: 'scope',
+    sourceRevision: 'revision',
+    promptId: 'prompt',
+    startedAt: 10,
+  };
+  const facts = { ...record, identitiesComplete: true, turns: [{ promptId: 'prompt', startedAt: 10, finished: true }] };
+  f.provider.readFacts = () => () => facts;
+  f.provider.projectedReadFacts = () => facts;
+  await f.provider
+    .readOwner()
+    .read({ id: 'later-ack', action: 'acknowledge', observedRevision: 0, records: [record] }, () => facts);
+  await f.provider.readerRead({ ...event, id: `${f.pageId}:5` }, f.host);
+  await f.provider.readerRead(reset, f.host);
+  assert.deepEqual(f.provider.saved.read, ['worker:10']);
+  assert.deepEqual(f.provider.saved.agentRead, [record]);
+  assert.equal(f.provider.saved.readRevision, 6);
+});
+
+test('ordinary page admission follows its actual host shell and rejects closed or replacement pages', async () => {
+  const f = orderedHostReadFixture();
+  const event = { id: `${f.pageId}:1`, observedRevision: 0, action: 'reset', since: 42 };
+  await f.provider.readerRead(event, {});
+  assert.equal(f.writes.length, 0);
+  const webview = { cspSource: 'test' };
+  Object.assign(f.host, { webview });
+  const document = f.provider.shell(webview);
+  const page = f.provider.readerPages.get(f.host);
+  assert.ok(document.includes(page.id));
+  assert.notEqual(page.id, f.pageId);
+  await f.provider.readerRead(event, f.host);
+  await f.provider.onMessage({ type: 'ready', readerPageId: f.pageId }, f.host);
+  assert.equal(f.provider.readerPages.get(f.host), page);
+  assert.equal(f.writes.length, 0);
+  await f.provider.readerRead({ ...event, id: `${page.id}:1` }, f.host);
+  assert.equal(f.provider.saved.readRevision, 1);
+  f.provider.hosts = [];
+  await f.provider.readerRead({ ...event, id: `${page.id}:2` }, f.host);
+  assert.equal(f.writes.length, 1);
+});
+
+test('ordinary pending overflow leaves its event unconsumed and freezes admitted payloads', async () => {
+  const f = orderedHostReadFixture();
+  let entered!: () => void;
+  let release!: () => void;
+  const started = new Promise<void>((resolve) => {
+    entered = resolve;
+  });
+  const suspended = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  f.provider.memento.update = async (_key: string, state: unknown) => {
+    f.writes.push(structuredClone(state));
+    if (f.writes.length === 1) {
+      entered();
+      await suspended;
+    }
+  };
+  const event = {
+    id: `${f.pageId}:1`,
+    observedRevision: 0,
+    action: 'turn',
+    target: { sessionId: 'worker', startedAt: 10, promptId: 'prompt' },
+    read: true,
+  };
+  const pending = [f.provider.readerRead(event, f.host)];
+  await started;
+  for (let sequence = 2; sequence <= 256; sequence++)
+    pending.push(f.provider.readerRead({ ...event, id: `${f.pageId}:${sequence}` }, f.host));
+  const overflow = { ...event, target: { ...event.target }, id: `${f.pageId}:257`, read: false };
+  await assert.rejects(f.provider.readerRead(overflow, f.host), /save limit/);
+  assert.equal(f.provider.readerPages.get(f.host).sequence, 256);
+  event.read = false;
+  event.target.promptId = 'changed';
+  release();
+  await Promise.all(pending);
+  assert.deepEqual(f.provider.saved.read, ['worker:10']);
+  assert.equal(f.provider.saved.readRevision, 256);
+  await f.provider.readerRead(overflow, f.host);
+  assert.equal(f.provider.readerPages.get(f.host).sequence, 257);
+  assert.deepEqual(f.provider.saved.read, []);
+  assert.equal(f.provider.saved.readRevision, 257);
 });
 
 test('production aggregate read projections validate each shared source once', () => {
@@ -2247,6 +2398,10 @@ test('production receipts acknowledge delivered turns and refuse appended source
   assert.equal(f.provider.restoringReadSources, false);
   assert.equal(opened.mock.calls.length, openings);
   assert.equal(f.writes.length, 1);
+  for (let index = 0; index < 255; index++)
+    await f.provider
+      .readOwner()
+      .read({ id: `retained:${index}`, action: 'invalidate', observedRevision: 0 }, () => null);
   fs.appendFileSync(file, JSON.stringify({ type: 'ignored', text: 'append' }) + '\n');
   assert.equal(f.provider.readSynchronization().agentRead.length, 0);
   assert.equal((await f.provider.guardedReadRequest({ ...request, id: 'read:2' })).status, 'refused');
@@ -2254,7 +2409,7 @@ test('production receipts acknowledge delivered turns and refuse appended source
   Object.assign(source, revisionOf(fs.statSync(file, { bigint: true })));
   f.provider.restoreAgentReads();
   await vi.waitFor(() => assert.equal(f.provider.saved.agentRead.length, 0));
-  assert.equal(f.provider.saved.readRevision, 2);
+  assert.equal(f.provider.saved.readRevision, 257);
   fs.unlinkSync(alias);
 });
 
@@ -10089,7 +10244,7 @@ test('the panel prefers the shared state, so a tab opens where the last one left
   // The projection excludes host-owned labels.
   sourceMatch(
     panelHostSource,
-    /savedStateJson: scriptJson\(webviewPanelState\(this\.saved\)\)/,
+    /savedStateJson: scriptJson\(\{ \.\.\.webviewPanelState\(this\.saved\), readerPageId \}\)/,
     'the shared state is not injected into the page, so a new host starts blank',
   );
   sourceMatch(
@@ -24314,7 +24469,12 @@ test('resetting workspace state invalidates every panel selection and preserves 
       assert.equal(provider.startedHere.has(session), !agentRun);
     }
     provider.saved.readerParents = { child: 'parent' };
+    for (let index = 0; index < 256; index++)
+      await provider
+        .readOwner()
+        .read({ id: `retained:${index}`, action: 'invalidate', observedRevision: 0 }, () => null);
     await provider.forgetState();
+    assert.equal(provider.saved.readRevision, 257);
     assert.deepEqual(provider.saved.readerParents, { child: 'parent' });
     assert.deepEqual(provider.saved.agentRuns, ['tagged']);
     assert.deepEqual(provider.saved.started, ['untagged']);
@@ -24996,7 +25156,7 @@ test('the unsent prompts reach storage and come back out of it', () => {
   );
   sourceMatch(
     forget,
-    /this\.saved\.comments = acceptedComments[\s\S]*const resetState = structuredClone\(this\.saved\)[\s\S]*const resetSaved = owner\.read\([\s\S]*await resetSaved/,
+    /this\.saved\.comments = acceptedComments[\s\S]*const resetState = structuredClone\(this\.saved\)[\s\S]*const resetSaved = owner\.readerEvent\([\s\S]*await resetSaved/,
     'a comments-only waiting submission disappears when panel preferences are forgotten',
   );
 
@@ -25843,7 +26003,7 @@ test('a ready host stages worker-backed session data without clearing accepted c
   );
   sourceMatch(
     bootstrapSource,
-    /requestAnimationFrame\(\(\) =>[\s\S]*requestAnimationFrame\(\(\) =>[\s\S]*ports\.host\.send\(\{ type: 'ready' \}\)/,
+    /requestAnimationFrame\(\(\) =>[\s\S]*requestAnimationFrame\(\(\) =>[\s\S]*ports\.host\.send\(\{ type: 'ready', readerPageId: panel\.readerPageId \}\)/,
     'the browser starts catalog work before its shell has painted',
   );
 

@@ -1,4 +1,4 @@
-import { canMarkRead, isTurnRead, READ_LIMIT, type ReadableTurn, type ReadOperation } from '../domain/read.ts';
+import { canMarkRead, isTurnRead, READ_LIMIT, type ReadableTurn, type ReaderReadEvent } from '../domain/read.ts';
 
 export interface ReadCard extends ReadableTurn {
   kind: string;
@@ -14,16 +14,18 @@ export interface ReadStateSnapshot {
 }
 
 export interface ReadStateOptions {
+  pageId?: string;
   initial: { read?: unknown; readTo?: unknown; since?: unknown };
   open: Set<string>;
   cards(): readonly ReadCard[];
   newestTurnAt(sessionId: string): number | null;
   save(): void;
-  operate?(operation: ReadOperation): void;
+  operate?(operation: ReaderReadEvent): void;
   refreshSelection(): void;
 }
 
 export interface ReadStateOwner {
+  readonly pageId: string;
   synchronize(state: {
     revision: number;
     read: readonly string[];
@@ -62,9 +64,11 @@ export function createReadState(options: ReadStateOptions): ReadStateOwner {
   let revision = -1;
   const agentRead = new Map<string, string>();
   const listeners = new Set<() => void>();
-  const tab = Array.from(globalThis.crypto.getRandomValues(new Uint8Array(16)), (byte) =>
-    byte.toString(16).padStart(2, '0'),
-  ).join('');
+  const tab =
+    options.pageId ??
+    Array.from(globalThis.crypto.getRandomValues(new Uint8Array(16)), (byte) =>
+      byte.toString(16).padStart(2, '0'),
+    ).join('');
   let sequence = 0;
   const pendingMarks = new Map<string, ReadCard>();
   const pendingUnread = new Map<string, ReadCard>();
@@ -73,8 +77,8 @@ export function createReadState(options: ReadStateOptions): ReadStateOwner {
   const identity = (card: ReadCard) => JSON.stringify([card.sessionId, card.startedAt, card.promptId]);
   const operate = (
     action:
-      | Omit<Extract<ReadOperation, { action: 'turn' }>, 'id' | 'observedRevision'>
-      | Omit<Extract<ReadOperation, { action: 'session' }>, 'id' | 'observedRevision'>,
+      | Omit<Extract<ReaderReadEvent, { action: 'turn' }>, 'id' | 'observedRevision'>
+      | Omit<Extract<ReaderReadEvent, { action: 'session' }>, 'id' | 'observedRevision'>,
   ) => {
     if (!options.operate || revision < 0) return false;
     options.operate({ ...action, id: `${tab}:${++sequence}`, observedRevision: Math.max(0, revision) });
@@ -161,6 +165,7 @@ export function createReadState(options: ReadStateOptions): ReadStateOwner {
   };
 
   const owner: ReadStateOwner = {
+    pageId: tab,
     synchronize(state) {
       if (!Number.isSafeInteger(state.revision) || state.revision < 0 || state.revision < revision) return false;
       if (

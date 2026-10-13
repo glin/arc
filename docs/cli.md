@@ -102,7 +102,7 @@ arc unarchive SESSION_ID --window WINDOW_ID
 
 Results report `applied`, `dry-run`, `refused`, or `unknown`. Applied confirms saved read state and settled publication to attached ready panels. Dry runs save nothing. Identical retries retain the first outcome. Conflicting payloads refuse. Preserve the request ID after an unknown result. Source changes invalidate agent marks, including append growth. Unavailable source facts project no marks. Reader boundaries remain separate, and partial zero counts remain uncertain. Hidden panels receive accepted state when ready, while their attention remains unknown.
 
-Each extension activation retains at most 256 distinct read operation IDs across agent acknowledgments, reader actions, resets, and source invalidations. New IDs refuse at capacity. Exact retained retries keep their original outcomes. Reloading starts a new activation and invalidates its prior receipts.
+Each extension activation retains at most 256 distinct read operation IDs submitted through retained APIs, including agent acknowledgments. New retained IDs refuse at capacity. Exact retained retries keep their original outcomes. Ordinary panel reader actions, preference resets, and source invalidations remain available after retained capacity fills. All saves share a limit of 256 pending jobs. Reloading starts a new activation and invalidates its prior receipts.
 
 ## Cost arguments
 

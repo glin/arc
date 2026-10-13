@@ -402,7 +402,7 @@ const PANEL: Array<{ raw: Record<string, unknown>; parsed: PanelToHost }> = [
     raw: { type: 'contextDetail', session: 's1', request: 1, generation: 0 },
     parsed: { type: 'contextDetail', session: 's1', request: 1, generation: 0 },
   },
-  { raw: { type: 'ready' }, parsed: { type: 'ready' } },
+  { raw: { type: 'ready', readerPageId: 'a'.repeat(32) }, parsed: { type: 'ready', readerPageId: 'a'.repeat(32) } },
   { raw: { type: 'rowsGap' }, parsed: { type: 'rowsGap' } },
   {
     raw: { type: 'painted', generation: 3, stage: 'firstCard' },
@@ -847,6 +847,8 @@ test('extra fields are dropped, and the render payload is handed back whole', ()
     session: 's1',
   });
   assert.deepEqual(parsePanelToHost({ type: 'refresh', extra: 1 }), { type: 'refresh' });
+  assert.deepEqual(parsePanelToHost({ type: 'ready' }), { type: 'ready' });
+  assert.equal(parsePanelToHost({ type: 'ready', readerPageId: 'invalid' }), null);
   // Render parsing preserves the complete payload, including fields beyond the required contract.
   const render = { ...RENDER, anything: { deep: true } };
   assert.equal(parseHostToPanel(render), render);

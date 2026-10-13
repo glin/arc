@@ -457,7 +457,7 @@ import {
   reduceReadOperation,
   type AgentReadRecord,
   type AgentReadSource,
-  type ReadOperation,
+  type ReaderReadEvent,
 } from './domain/read.ts';
 import { SessionReadObservations, runSessionRead, requesterOf } from './sessionwrites.ts';
 import { RowDeltaSender, type RowLists } from './webview/row-deltas.ts';
@@ -1951,6 +1951,7 @@ export class PanelProvider implements vscode.Disposable {
   private agentReadSources = new AgentReadSources();
   private admittedReadSources = new Map<string, AgentReadSource>();
   private readSequence = 0;
+  private readerPages?: WeakMap<PanelHost, { id: string; sequence: number }>;
   private restoringReadSources = false;
   private restoredReadSources?: string;
 
@@ -2135,7 +2136,7 @@ export class PanelProvider implements vscode.Disposable {
         return;
       }
       void this.readOwner()
-        .read(
+        .readerEvent(
           {
             id: `invalidate:${++this.readSequence}`,
             namespace: 'host',
@@ -2170,20 +2171,38 @@ export class PanelProvider implements vscode.Disposable {
     );
   }
 
-  private readerRead(operation: ReadOperation): Promise<void> {
+  private readerRead(operation: ReaderReadEvent, host: PanelHost): Promise<void> {
+    const page = this.readerPages?.get(host);
+    if (this.disposed || !this.hosts.includes(host) || !this.readyHosts.has(host) || !page) return Promise.resolve();
+    const prefix = `${page.id}:`;
+    const suffix = operation.id.slice(prefix.length);
+    const sequence = Number(suffix);
+    if (!operation.id.startsWith(prefix) || !/^[1-9][0-9]*$/.test(suffix) || !Number.isSafeInteger(sequence))
+      return Promise.resolve();
+    if (sequence <= page.sequence) return Promise.resolve();
+    // The page posts in sequence order. A gap refuses without consuming either event.
+    if (sequence !== page.sequence + 1) return Promise.resolve();
     return this.readOwner()
-      .read(operation, this.readFacts(), (one) => {
-        const target = one.target;
-        if (one.action === 'session')
-          return this.windows.has(target.sessionId) && this.newestTurns().get(target.sessionId) === one.newestAt;
-        return this.cards.some(
-          (card) =>
-            card.kind === 'turn' &&
-            card.sessionId === target.sessionId &&
-            card.startedAt === target.startedAt &&
-            card.promptId === target.promptId,
-        );
-      })
+      .readerEvent(
+        operation,
+        this.readFacts(),
+        (one) => {
+          const target = one.target;
+          if (one.action === 'session')
+            return this.windows.has(target.sessionId) && this.newestTurns().get(target.sessionId) === one.newestAt;
+          return this.cards.some(
+            (card) =>
+              card.kind === 'turn' &&
+              card.sessionId === target.sessionId &&
+              card.startedAt === target.startedAt &&
+              card.promptId === target.promptId,
+          );
+        },
+        undefined,
+        () => {
+          page.sequence = sequence;
+        },
+      )
       .then(() => undefined);
   }
   private hostPinnedFoldRevision = 0;
@@ -2906,6 +2925,7 @@ export class PanelProvider implements vscode.Disposable {
 
   dispose(): void {
     if (this.disposed) return;
+    this.readerPages = undefined;
     this.filterRequests?.dispose();
     for (const waiter of this.filterReady ?? [])
       waiter.reject(new Error('The panel closed before the filter was applied.'));
@@ -3658,6 +3678,7 @@ export class PanelProvider implements vscode.Disposable {
         this.health?.event('disposed', this.healthPanel(host).id);
         this.healthPanels?.delete(host);
         this.readyHosts.delete(host);
+        this.readerPages?.delete(host);
         for (const waiter of this.filterReady ?? []) {
           if (waiter.webview === host.webview)
             waiter.reject(new Error('The panel closed before the filter was applied.'));
@@ -7744,7 +7765,7 @@ export class PanelProvider implements vscode.Disposable {
     this.trail = emptyTrail();
     const resetState = structuredClone(this.saved);
     const owner = this.readOwner();
-    const resetSaved = owner.read(
+    const resetSaved = owner.readerEvent(
       {
         id: `reset:${++this.readSequence}`,
         namespace: 'host',
@@ -12901,6 +12922,12 @@ export class PanelProvider implements vscode.Disposable {
       }
       return;
     }
+    if (
+      message.type === 'ready' &&
+      this.readerPages?.has(host) &&
+      this.readerPages.get(host)!.id !== message.readerPageId
+    )
+      return;
     if (message.type !== 'ready' && message.type !== 'importPromptRecovery' && !this.readyHosts.has(host)) {
       this.health?.event('unready', this.healthPanel(host).id);
       return;
@@ -12920,7 +12947,7 @@ export class PanelProvider implements vscode.Disposable {
     try {
       await dispatchPanelToHost<void | Promise<void>>(message, {
         health: () => {},
-        readerRead: (msg) => this.readerRead({ ...msg.operation, namespace: 'browser' }),
+        readerRead: (msg) => this.readerRead({ ...msg.operation, namespace: 'browser' }, host),
         ready: () => {
           // A loaded page holds no session rows.
           this.rowSenders?.get(host)?.reset();
@@ -12941,6 +12968,7 @@ export class PanelProvider implements vscode.Disposable {
         developmentReload: () => {
           if (PANEL_DEV_SERVER_URL) {
             this.readyHosts.delete(host);
+            this.readerPages?.delete(host);
             this.publishWindowState();
             this.releaseQueuedEditOffer(host);
             if (!this.anyVisible()) {
@@ -13508,10 +13536,13 @@ export class PanelProvider implements vscode.Disposable {
 
   private shell(webview: vscode.Webview): string {
     const nonce = crypto.randomBytes(16).toString('base64');
+    const readerPageId = crypto.randomBytes(16).toString('hex');
+    const host = this.hosts.find((open) => open.webview === webview);
+    if (host) (this.readerPages ??= new WeakMap()).set(host, { id: readerPageId, sequence: 0 });
     return panelShell({
       cspSource: webview.cspSource,
       nonce,
-      savedStateJson: scriptJson(webviewPanelState(this.saved)),
+      savedStateJson: scriptJson({ ...webviewPanelState(this.saved), readerPageId }),
       style: STYLE,
       script: SCRIPT,
       developmentServerUrl: PANEL_DEV_SERVER_URL,

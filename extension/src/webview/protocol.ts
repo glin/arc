@@ -46,7 +46,7 @@ import {
   type PromptPosition,
 } from '../view/timeline-layout.ts';
 import type { CardView, RailCardView } from './payload-contracts.ts';
-import { READ_LIMIT, type ReadOperation } from '../domain/read.ts';
+import { READ_LIMIT, type ReaderReadEvent } from '../domain/read.ts';
 
 export interface ReadSynchronization {
   revision: number;
@@ -88,9 +88,9 @@ export function parseReadSynchronization(value: unknown): ReadSynchronization | 
 }
 
 // Browser operations exclude agent acknowledgments and source invalidation.
-export function parseReaderOperation(value: unknown): ReadOperation | null {
+export function parseReaderOperation(value: unknown): ReaderReadEvent | null {
   if (!value || typeof value !== 'object') return null;
-  const operation = value as ReadOperation;
+  const operation = value as ReaderReadEvent;
   if (
     typeof operation.id !== 'string' ||
     !operation.id ||
@@ -398,11 +398,11 @@ const HOST_TO_PANEL_KINDS: Record<HostToPanel['type'], true> = {
 };
 
 export type PanelToHost =
-  | { type: 'readerRead'; operation: ReadOperation }
+  | { type: 'readerRead'; operation: ReaderReadEvent }
   | { type: 'sessionFilterApplied'; request: string; state: unknown }
   | { type: 'health'; sequence: number }
   | { type: 'contextDetail'; session: string; request: number; generation: number }
-  | { type: 'ready' }
+  | { type: 'ready'; readerPageId?: string }
   // The panel could not apply a session row delta and needs a snapshot.
   | { type: 'rowsGap' }
   | { type: 'painted'; generation: number; stage: 'railReady' | 'firstCard' | 'completeRender'; usableRows?: true }
@@ -1042,7 +1042,11 @@ export function parsePanelToHost(raw: unknown): PanelToHost | null {
         ? { type: 'health', sequence: m.sequence as number }
         : null;
     case 'ready':
-      return { type: 'ready' };
+      return m.readerPageId === undefined
+        ? { type: 'ready' }
+        : typeof m.readerPageId === 'string' && /^[a-f0-9]{32}$/.test(m.readerPageId)
+          ? { type: 'ready', readerPageId: m.readerPageId }
+          : null;
     case 'painted':
       return Number.isSafeInteger(m.generation) &&
         (m.generation as number) >= 0 &&
