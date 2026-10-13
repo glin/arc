@@ -1138,6 +1138,7 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
     const message = parsed.type === 'render' || parsed.type === 'rail' ? rowDeltas.expand(parsed) : parsed;
     if (!message) return;
     dispatchHostToPanel(message, {
+      readerDocument: () => {},
       readerReadAdmission: (msg) => readState.admit(msg.id, msg.admitted),
       readState: (msg) => {
         if (readState.synchronize(msg.state)) {

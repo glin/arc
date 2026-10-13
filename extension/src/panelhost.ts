@@ -1951,7 +1951,10 @@ export class PanelProvider implements vscode.Disposable {
   private agentReadSources = new AgentReadSources();
   private admittedReadSources = new Map<string, AgentReadSource>();
   private readSequence = 0;
-  private readerPages?: WeakMap<PanelHost, { id: string; sequence: number }>;
+  private readerPages?: WeakMap<
+    PanelHost,
+    { id: string; sequence: number; documentId?: string; pending?: { documentId: string; challenge: string } }
+  >;
   private restoringReadSources = false;
   private restoredReadSources?: string;
 
@@ -2168,13 +2171,15 @@ export class PanelProvider implements vscode.Disposable {
       this.readFacts(),
       (state) => owner.persistRead(state),
       () => owner.publishAccepted(),
+      this.readFacts(),
     );
   }
 
   private readerRead(operation: ReaderReadEvent, host: PanelHost): Promise<void> {
     const page = this.readerPages?.get(host);
-    if (this.disposed || !this.hosts.includes(host) || !this.readyHosts.has(host) || !page) return Promise.resolve();
-    const prefix = `${page.id}:`;
+    if (this.disposed || !this.hosts.includes(host) || !this.readyHosts.has(host) || !page?.documentId)
+      return Promise.resolve();
+    const prefix = `${page.documentId}:`;
     const suffix = operation.id.slice(prefix.length);
     const sequence = Number(suffix);
     if (!operation.id.startsWith(prefix) || !/^[1-9][0-9]*$/.test(suffix) || !Number.isSafeInteger(sequence))
@@ -12929,12 +12934,33 @@ export class PanelProvider implements vscode.Disposable {
       }
       return;
     }
-    if (
-      message.type === 'ready' &&
-      this.readerPages?.has(host) &&
-      this.readerPages.get(host)!.id !== message.readerPageId
-    )
-      return;
+    if (message.type === 'ready' && this.readerPages?.has(host)) {
+      const page = this.readerPages.get(host)!;
+      if (page.id !== message.readerPageId || !message.readerDocumentId) return;
+      if (page.documentId === message.readerDocumentId) return;
+      if (
+        !message.readerChallenge ||
+        page.pending?.documentId !== message.readerDocumentId ||
+        page.pending.challenge !== message.readerChallenge
+      ) {
+        const pending =
+          page.pending?.documentId === message.readerDocumentId
+            ? page.pending
+            : { documentId: message.readerDocumentId, challenge: crypto.randomBytes(16).toString('hex') };
+        page.pending = pending;
+        await this.sendToHost(host, {
+          type: 'readerDocument',
+          readerPageId: page.id,
+          documentId: pending.documentId,
+          challenge: pending.challenge,
+        });
+        return;
+      }
+      page.documentId = message.readerDocumentId;
+      page.pending = undefined;
+      page.sequence = 0;
+      this.readyHosts.delete(host);
+    }
     if (message.type !== 'ready' && message.type !== 'importPromptRecovery' && !this.readyHosts.has(host)) {
       this.health?.event('unready', this.healthPanel(host).id);
       return;
@@ -13545,7 +13571,10 @@ export class PanelProvider implements vscode.Disposable {
     const nonce = crypto.randomBytes(16).toString('base64');
     const readerPageId = crypto.randomBytes(16).toString('hex');
     const host = this.hosts.find((open) => open.webview === webview);
-    if (host) (this.readerPages ??= new WeakMap()).set(host, { id: readerPageId, sequence: 0 });
+    if (host) {
+      (this.readerPages ??= new WeakMap()).set(host, { id: readerPageId, sequence: 0 });
+      this.readyHosts.delete(host);
+    }
     return panelShell({
       cspSource: webview.cspSource,
       nonce,

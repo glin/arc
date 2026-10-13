@@ -86,7 +86,8 @@ export function createReadState(options: ReadStateOptions): ReadStateOwner {
   const pendingUnread = new Map<string, ReadCard>();
   const pendingUnreadSessions = new Set<string>();
   const pendingReadSessions = new Map<string, number>();
-  const identity = (card: ReadCard) => JSON.stringify([card.sessionId, card.startedAt, card.promptId]);
+  const identity = (card: Pick<ReadCard, 'sessionId' | 'startedAt' | 'promptId'>) =>
+    JSON.stringify([card.sessionId, card.startedAt, card.promptId]);
   const operate = (
     action:
       | Omit<Extract<ReaderReadEvent, { action: 'turn' }>, 'id' | 'observedRevision'>
@@ -129,7 +130,14 @@ export function createReadState(options: ReadStateOptions): ReadStateOwner {
       const id = identity(card);
       const removing = pendingUnread.has(id) || pendingUnreadSessions.has(card.sessionId);
       if (!explicit && card.startedAt <= (pendingReadSessions.get(card.sessionId) ?? 0)) return false;
-      if ((!explicit && removing) || (isTurnRead(card, read, readTo, since) && !removing) || pendingMarks.has(id))
+      const transporting = events.some(
+        (event) => event.action === 'turn' && event.read && identity(event.target) === id,
+      );
+      if (
+        (!explicit && removing) ||
+        (isTurnRead(card, read, readTo, since) && !removing) ||
+        (pendingMarks.has(id) && (!explicit || transporting))
+      )
         return false;
       if (explicit) {
         pendingUnread.delete(id);

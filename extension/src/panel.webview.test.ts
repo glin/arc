@@ -2029,7 +2029,7 @@ function orderedHostReadFixture() {
     cards: [{ kind: 'turn', sessionId: 'worker', startedAt: 10, promptId: 'prompt', key: 'worker:10' }],
     windows: new Map([['worker', { starts: [10], whole: false }]]),
     readSequence: 0,
-    readerPages: new WeakMap([[host, { id: pageId, sequence: 0 }]]),
+    readerPages: new WeakMap([[host, { id: pageId, documentId: pageId, sequence: 0 }]]),
     agentReadSources: new AgentReadSources(),
     admittedReadSources: new Map(),
     readObservations: new SessionReadObservations('test-activation'),
@@ -2231,6 +2231,8 @@ test('ordinary page admission follows its actual host shell and rejects closed o
   await f.provider.onMessage({ type: 'ready', readerPageId: f.pageId }, f.host);
   assert.equal(f.provider.readerPages.get(f.host), page);
   assert.equal(f.writes.length, 0);
+  page.documentId = page.id;
+  f.provider.readyHosts.add(f.host);
   await f.provider.readerRead({ ...event, id: `${page.id}:1` }, f.host);
   assert.equal(f.provider.saved.readRevision, 1);
   f.provider.hosts = [];
@@ -2351,6 +2353,229 @@ test('ordinary browser delivery recovers pending overflow and lost replies witho
   }
 });
 
+test.each(['storage', 'missing target'])(
+  'explicit browser turn read recovers after consumed %s failure',
+  async (failure) => {
+    const f = orderedHostReadFixture();
+    const turn = f.provider.cards[0];
+    const delivered: any[] = [];
+    const jobs: Promise<void>[] = [];
+    const browser = createReadState({
+      pageId: f.pageId,
+      initial: {},
+      open: new Set(),
+      cards: () => [turn],
+      newestTurnAt: () => 10,
+      save() {},
+      refreshSelection() {},
+      operate(operation) {
+        delivered.push(operation);
+        jobs.push(f.provider.readerRead(operation, f.host).catch(() => {}));
+      },
+    });
+    f.provider.sendToHost = async (_host: unknown, message: any) => {
+      if (message.type === 'readerReadAdmission') browser.admit(message.id, message.admitted);
+      if (message.type === 'readState') browser.synchronize(message.state);
+      return true;
+    };
+    try {
+      browser.synchronize(f.provider.readSynchronization());
+      const update = f.provider.memento.update;
+      if (failure === 'storage')
+        f.provider.memento.update = async () => {
+          throw new Error('storage failed');
+        };
+      else f.provider.cards = [];
+      browser.set(turn.key, true);
+      await Promise.all(jobs);
+      assert.deepEqual(f.provider.saved.read, []);
+      assert.equal(browser.isRead(turn), false);
+      assert.equal(browser.mark(turn.key), false);
+      assert.equal(delivered.length, 1);
+      f.provider.memento.update = update;
+      f.provider.cards = [turn];
+      browser.set(turn.key, true);
+      await Promise.all(jobs);
+      assert.equal(delivered.length, 2);
+      assert.deepEqual(f.provider.saved.read, ['worker:10']);
+      assert.equal(f.provider.saved.readRevision, 1);
+      browser.set(turn.key, false);
+      browser.set(turn.key, true);
+      await Promise.all(jobs);
+      assert.deepEqual(
+        f.writes.slice(-2).map((state) => state.read),
+        [[], ['worker:10']],
+      );
+      assert.equal(f.provider.saved.readRevision, 3);
+    } finally {
+      browser.dispose();
+    }
+  },
+);
+
+test('production bootstrap reload preserves unseen browser unread intent in the same shell', async () => {
+  const f = orderedHostReadFixture();
+  const turn = f.provider.cards[0];
+  const jobs: Promise<void>[] = [];
+  let receive!: (event: { data: any }) => void;
+  let browser!: ReturnType<typeof createReadState>;
+  Object.assign(f.host, { visible: () => false, webview: {} });
+  Object.assign(f.provider, {
+    panelVisibility: { current: () => ({ type: 'visibility', visible: false }) },
+    publishWindowState() {},
+    restoreAgentReads() {},
+    sendToHost: async (_host: unknown, message: any) => {
+      receive({ data: message });
+      return true;
+    },
+  });
+  const [bootstrap] = sourceNodes(
+    bootstrapSource,
+    (node) => ts.isFunctionDeclaration(node) && node.name?.text === 'startBrowserPanel',
+  );
+  const load = () => {
+    const module = { exports: {} as { startBrowserPanel: () => unknown } };
+    new Function(
+      'module',
+      'exports',
+      'createHost',
+      'acquireVsCodeApi',
+      'createSavedState',
+      'startPanel',
+      'panelDom',
+      'document',
+      'window',
+      'requestAnimationFrame',
+      'SAVED_STATE',
+      esbuild.transformSync(bootstrap, { loader: 'ts', format: 'cjs', target: 'esnext' }).code,
+    )(
+      module,
+      module.exports,
+      () => ({
+        host: {
+          send: (message: unknown) => {
+            jobs.push(f.provider.onMessage(message, f.host));
+          },
+        },
+        browserState: {},
+      }),
+      () => ({}),
+      () => ({ publishRecovery() {} }),
+      (options: { readerPageId?: string }) => {
+        browser = createReadState({
+          pageId: options.readerPageId,
+          initial: {},
+          open: new Set(),
+          cards: () => [turn],
+          newestTurnAt: () => 10,
+          save() {},
+          refreshSelection() {},
+          operate: (operation) => {
+            jobs.push(f.provider.onMessage({ type: 'readerRead', operation }, f.host));
+          },
+        });
+        return {
+          readerPageId: browser.pageId,
+          dispose: () => browser.dispose(),
+          receiveHostMessage(message: any) {
+            if (message.type === 'readState') browser.synchronize(message.state);
+            if (message.type === 'readerReadAdmission') browser.admit(message.id, message.admitted);
+          },
+        };
+      },
+      () => ({}),
+      { addEventListener() {} },
+      {
+        addEventListener(type: string, listener: typeof receive) {
+          if (type === 'message') receive = listener;
+        },
+      },
+      (callback: () => void) => callback(),
+      { readerPageId: f.pageId },
+    );
+    module.exports.startBrowserPanel();
+  };
+  load();
+  try {
+    await Promise.all(jobs);
+    browser.synchronize(f.provider.readSynchronization());
+    browser.set(turn.key, true);
+    await Promise.all(jobs);
+    assert.deepEqual(f.provider.saved.read, ['worker:10']);
+    const oldId = browser.pageId;
+    browser.dispose();
+    load();
+    await Promise.all(jobs);
+    browser.synchronize(f.provider.readSynchronization());
+    browser.set(turn.key, false);
+    await Promise.all(jobs);
+    assert.deepEqual(f.provider.saved.read, []);
+    assert.notEqual(browser.pageId, oldId);
+    assert.equal(f.provider.saved.readRevision, 2);
+  } finally {
+    browser.dispose();
+  }
+});
+
+test('same-shell replacement admits unseen unread and rejects delayed document traffic', async () => {
+  const f = orderedHostReadFixture();
+  const shellId = f.pageId;
+  const sent: any[] = [];
+  Object.assign(f.host, { visible: () => false, webview: {} });
+  Object.assign(f.provider, {
+    panelVisibility: { current: () => ({ type: 'visibility', visible: false }) },
+    publishWindowState() {},
+    restoreAgentReads() {},
+    sendToHost: async (_host: unknown, message: any) => {
+      sent.push(message);
+      return true;
+    },
+  });
+  const ready = async (documentId: string) => {
+    await f.provider.onMessage({ type: 'ready', readerPageId: shellId, readerDocumentId: documentId }, f.host);
+    const challenge = sent.at(-1);
+    assert.equal(challenge.type, 'readerDocument');
+    await f.provider.onMessage(
+      { type: 'ready', readerPageId: shellId, readerDocumentId: documentId, readerChallenge: challenge.challenge },
+      f.host,
+    );
+    return challenge.challenge;
+  };
+  const oldId = 'b'.repeat(32);
+  const oldChallenge = await ready(oldId);
+  const event = { id: `${oldId}:1`, observedRevision: 0, action: 'turn', target: f.provider.cards[0], read: true };
+  await f.provider.readerRead(event, f.host);
+  assert.deepEqual(f.provider.saved.read, ['worker:10']);
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const blocker = f.provider.readOwner().operations.serialize(() => held);
+  const admitted = f.provider.readerRead({ ...event, id: `${oldId}:2`, read: false }, f.host);
+  const newId = 'c'.repeat(32);
+  const synchronized = sent.filter((message) => message.type === 'readState').length;
+  await ready(newId);
+  assert.equal(sent.filter((message) => message.type === 'readState').length, synchronized + 1);
+  await f.provider.onMessage({ type: 'ready', readerPageId: shellId }, f.host);
+  await f.provider.onMessage(
+    { type: 'ready', readerPageId: shellId, readerDocumentId: oldId, readerChallenge: oldChallenge },
+    f.host,
+  );
+  release();
+  await Promise.all([blocker, admitted]);
+  assert.deepEqual(f.provider.saved.read, []);
+  await f.provider.readerRead({ ...event, id: `${newId}:1` }, f.host);
+  await f.provider.readerRead({ ...event, id: `${newId}:2`, read: false }, f.host);
+  assert.deepEqual(f.provider.saved.read, []);
+  await f.provider.readerRead({ ...event, id: `${oldId}:3` }, f.host);
+  await f.provider.readerRead({ ...event, id: `${newId}:4` }, f.host);
+  assert.deepEqual(f.provider.saved.read, []);
+  await f.provider.readerRead({ ...event, id: `${newId}:3` }, f.host);
+  await f.provider.readerRead({ ...event, id: `${newId}:2`, read: false }, f.host);
+  assert.deepEqual(f.provider.saved.read, ['worker:10']);
+  assert.equal(f.provider.saved.readRevision, 5);
+});
+
 test('production aggregate read projections validate each shared source once', () => {
   const f = orderedHostReadFixture();
   const record = {
@@ -2389,7 +2614,7 @@ test('production aggregate read projections validate each shared source once', (
   assert.equal(checks, 1);
 });
 
-test('production receipts acknowledge delivered turns and refuse appended source revisions after restoration', async () => {
+function hostReadReceiptFixture() {
   const f = orderedHostReadFixture();
   const directory = tempDir('host-read-source-');
   const file = path.join(directory, 'worker.jsonl');
@@ -2445,6 +2670,60 @@ test('production receipts acknowledge delivered turns and refuse appended source
     requester: 'reader',
     requesterProvider: 'claude',
   };
+  return { ...f, source, file, alias, request };
+}
+
+test.each(['storage', 'publication'])(
+  'queued production receipts refuse bytes appended during earlier %s',
+  async (phase) => {
+    const f = hostReadReceiptFixture();
+    let entered!: () => void;
+    let release!: () => void;
+    const started = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const update = f.provider.memento.update;
+    const publish = f.provider.sendToHost;
+    if (phase === 'storage')
+      f.provider.memento.update = async (...args: any[]) => {
+        entered();
+        await held;
+        return update(...args);
+      };
+    else
+      f.provider.sendToHost = async (...args: any[]) => {
+        if (args[1].type === 'readState') {
+          entered();
+          await held;
+        }
+        return publish(...args);
+      };
+    const previous = f.provider.readerRead(
+      { id: `${f.pageId}:1`, observedRevision: 0, action: 'reset', since: 1 },
+      f.host,
+    );
+    await started;
+    const queued = f.provider.guardedReadRequest(f.request);
+    fs.appendFileSync(f.file, JSON.stringify({ type: 'ignored', text: 'append while queued' }) + '\n');
+    release();
+    await previous;
+    const result = await queued;
+    assert.equal(result.status, 'refused');
+    assert.deepEqual(f.provider.saved.agentRead, []);
+    assert.equal(f.provider.saved.readRevision, 1);
+    assert.equal(f.writes.length, 1);
+    assert.deepEqual(await f.provider.guardedReadRequest(f.request), result);
+    assert.equal(f.writes.length, 1);
+    fs.unlinkSync(f.alias);
+  },
+);
+
+test('production receipts acknowledge delivered turns and refuse appended source revisions after restoration', async () => {
+  const f = hostReadReceiptFixture();
+  const { source, file, alias, request } = f;
   assert.equal((await f.provider.guardedReadRequest(request)).status, 'applied');
   assert.equal(f.provider.saved.agentRead.length, 1);
   assert.equal(f.provider.readSynchronization().agentRead.length, 1);

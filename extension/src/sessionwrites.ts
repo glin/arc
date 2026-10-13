@@ -298,6 +298,7 @@ export function runSessionRead(
   facts: (record: AgentReadRecord) => AgentReadSource | null,
   persist: (state: OrderedReadState) => Promise<import('./domain/read.ts').ReadStorageSettlement | void>,
   publish: (state: OrderedReadState) => void | Promise<void>,
+  orderedFacts: (record: AgentReadRecord) => AgentReadSource | null = facts,
 ): Promise<ReadWriteResult> {
   const payload = JSON.stringify(request);
   const retained = retainedSessionReads.get(operations) ?? new Map();
@@ -315,7 +316,7 @@ export function runSessionRead(
       reason: held ? 'The request ID names a different read action.' : 'The read request limit was reached.',
     });
   const admitted = structuredClone(request);
-  const result = applySessionRead(admitted, observations, operations, facts, persist, publish);
+  const result = applySessionRead(admitted, observations, operations, facts, persist, publish, orderedFacts);
   retained.set(request.requestId, { payload, result });
   return result;
 }
@@ -333,6 +334,7 @@ async function applySessionRead(
   facts: (record: AgentReadRecord) => AgentReadSource | null,
   persist: (state: OrderedReadState) => Promise<import('./domain/read.ts').ReadStorageSettlement | void>,
   publish: (state: OrderedReadState) => void | Promise<void>,
+  orderedFacts: (record: AgentReadRecord) => AgentReadSource | null,
 ): Promise<ReadWriteResult> {
   const base = {
     version: 1 as const,
@@ -364,7 +366,7 @@ async function applySessionRead(
         action: 'acknowledge',
         records,
       },
-      facts,
+      orderedFacts,
       persist,
       publish,
     );

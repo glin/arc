@@ -278,6 +278,7 @@ export interface PanelSessionAdoption {
 }
 
 export type HostToPanel =
+  | { type: 'readerDocument'; readerPageId: string; documentId: string; challenge: string }
   | { type: 'readerReadAdmission'; id: string; admitted: boolean }
   | { type: 'readState'; state: ReadSynchronization }
   | { type: 'applySessionFilter'; request: string; query: string; deadline: number }
@@ -351,6 +352,7 @@ export type HostToPanel =
   | RenderMessage;
 
 const HOST_TO_PANEL_KINDS: Record<HostToPanel['type'], true> = {
+  readerDocument: true,
   readerReadAdmission: true,
   readState: true,
   applySessionFilter: true,
@@ -404,7 +406,7 @@ export type PanelToHost =
   | { type: 'sessionFilterApplied'; request: string; state: unknown }
   | { type: 'health'; sequence: number }
   | { type: 'contextDetail'; session: string; request: number; generation: number }
-  | { type: 'ready'; readerPageId?: string }
+  | { type: 'ready'; readerPageId?: string; readerDocumentId?: string; readerChallenge?: string }
   // The panel could not apply a session row delta and needs a snapshot.
   | { type: 'rowsGap' }
   | { type: 'painted'; generation: number; stage: 'railReady' | 'firstCard' | 'completeRender'; usableRows?: true }
@@ -955,6 +957,12 @@ export function parseHostToPanel(raw: unknown): HostToPanel | null {
       return isString(m.key) && m.key.length > 0 && typeof m.copyLabels === 'boolean'
         ? { type: 'sendSelectedText', key: m.key, copyLabels: m.copyLabels }
         : null;
+    case 'readerDocument':
+      return [m.readerPageId, m.documentId, m.challenge].every(
+        (value) => typeof value === 'string' && /^[a-f0-9]{32}$/.test(value),
+      )
+        ? (m as Extract<HostToPanel, { type: 'readerDocument' }>)
+        : null;
     case 'readerReadAdmission':
       return isString(m.id) && m.id.length <= 128 && typeof m.admitted === 'boolean'
         ? { type: 'readerReadAdmission', id: m.id, admitted: m.admitted }
@@ -1047,12 +1055,17 @@ export function parsePanelToHost(raw: unknown): PanelToHost | null {
       return Number.isSafeInteger(m.sequence) && (m.sequence as number) > 0
         ? { type: 'health', sequence: m.sequence as number }
         : null;
-    case 'ready':
-      return m.readerPageId === undefined
-        ? { type: 'ready' }
-        : typeof m.readerPageId === 'string' && /^[a-f0-9]{32}$/.test(m.readerPageId)
-          ? { type: 'ready', readerPageId: m.readerPageId }
-          : null;
+    case 'ready': {
+      const names = ['readerPageId', 'readerDocumentId', 'readerChallenge'] as const;
+      if (names.some((key) => m[key] !== undefined && (typeof m[key] !== 'string' || !/^[a-f0-9]{32}$/.test(m[key]))))
+        return null;
+      if (m.readerChallenge !== undefined && (m.readerPageId === undefined || m.readerDocumentId === undefined))
+        return null;
+      return {
+        type: 'ready',
+        ...Object.fromEntries(names.filter((key) => m[key] !== undefined).map((key) => [key, m[key]])),
+      };
+    }
     case 'painted':
       return Number.isSafeInteger(m.generation) &&
         (m.generation as number) >= 0 &&
@@ -1393,6 +1406,8 @@ export type PanelToHostHandlers<R> = Handlers<PanelToHost, R>;
 // The default branch assigns to never, so unhandled variants fail the typecheck.
 export function dispatchHostToPanel(message: HostToPanel, handlers: HostToPanelHandlers): void {
   switch (message.type) {
+    case 'readerDocument':
+      return handlers.readerDocument(message);
     case 'readerReadAdmission':
       return handlers.readerReadAdmission(message);
     case 'readState':

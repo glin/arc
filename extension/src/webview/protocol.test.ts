@@ -650,6 +650,7 @@ function hostRecorder(seen: string[]): HostToPanelHandlers {
   };
   return {
     readState: take('readState'),
+    readerDocument: take('readerDocument'),
     readerReadAdmission: take('readerReadAdmission'),
     applySessionFilter: take('applySessionFilter'),
     visibility: take('visibility'),
