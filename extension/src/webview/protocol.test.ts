@@ -292,6 +292,10 @@ const HOST: Array<{ raw: unknown; parsed: HostToPanel }> = [
     parsed: { type: 'live', session: 's1', live: [LIVE] },
   },
   {
+    raw: { type: 'readState', state: { revision: 1, read: ['s1:10'], readTo: { s1: 10 }, since: 0, agentRead: [] } },
+    parsed: { type: 'readState', state: { revision: 1, read: ['s1:10'], readTo: { s1: 10 }, since: 0, agentRead: [] } },
+  },
+  {
     raw: { type: 'activity', session: 's1', card: { key: 's1:1' } },
     parsed: { type: 'activity', session: 's1', card: { key: 's1:1' } } as unknown as HostToPanel,
   },
@@ -370,6 +374,16 @@ const HOST: Array<{ raw: unknown; parsed: HostToPanel }> = [
 ];
 
 const PANEL: Array<{ raw: Record<string, unknown>; parsed: PanelToHost }> = [
+  {
+    raw: {
+      type: 'readerRead',
+      operation: { id: 'tab:1', namespace: 'browser', observedRevision: 0, action: 'reset', since: 10 },
+    },
+    parsed: {
+      type: 'readerRead',
+      operation: { id: 'tab:1', observedRevision: 0, action: 'reset', since: 10 },
+    },
+  },
   {
     raw: { type: 'sessionFilterApplied', request: 'one', state: {} },
     parsed: { type: 'sessionFilterApplied', request: 'one', state: {} },

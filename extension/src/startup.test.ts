@@ -29,6 +29,7 @@ import { tempDir } from './temproot.ts';
 import { buildSync, transformSync } from 'esbuild';
 import { messageByteBudget, PanelPerformanceCounters, serializedMessageBytes } from './performancediagnostics';
 import { SessionLoadingLine } from './sessionloadingline';
+import { HostReadPersistence, preserveHostRead, projectAgentRead } from './domain/read.ts';
 import { sessionCatalogMembership, sessionDiscoveryMembership } from './sessionreads.ts';
 import { REPOSITORY_SCOPE_CONFIRM_MS, REPOSITORY_SCOPE_REFRESH_MS, RepositoryScope } from './repositoryscope';
 import {
@@ -7205,19 +7206,41 @@ function heldLedgerFile(): Error {
 
 // The harness supplies session list payloads and records later posts.
 function railPostHarness(extraMethods: string[], scope: Record<string, unknown> = {}): any {
-  const provider = completeDiscoveryHarness(undefined, false, ['postRail', 'post', 'sendToHost', ...extraMethods], {
-    normalizePanelState,
-    remapReaderParents,
-    readMovedOnlyFor,
-    STATE_KEY: 'arc.panel',
-    pruneSpendFilesWithResult: (files: unknown[]) => ({ files, pruned: false }),
-    ...scope,
-  });
+  const provider = completeDiscoveryHarness(
+    undefined,
+    false,
+    ['postRail', 'post', 'sendToHost', 'readOwner', 'readSynchronization', ...extraMethods],
+    {
+      normalizePanelState,
+      HostReadPersistence,
+      preserveHostRead,
+      projectAgentRead,
+      remapReaderParents,
+      readMovedOnlyFor,
+      STATE_KEY: 'arc.panel',
+      pruneSpendFilesWithResult: (files: unknown[]) => ({ files, pruned: false }),
+      ...scope,
+    },
+  );
   let build = 0;
   provider.useRailPayload(() => ({ rail: [`build ${build++}`] }));
   provider.refresh = () => Promise.resolve();
   provider.completeSelectedWindow = () => Promise.resolve();
   provider.saved = normalizePanelState({});
+  provider.memento = { update: async () => {} };
+  provider.readSession = (sessionId: string, newestAt: number) =>
+    provider.readOwner().read(
+      {
+        id: `${sessionId}:${newestAt}`,
+        observedRevision: provider.saved.readRevision ?? 0,
+        action: 'session',
+        target: { sessionId, startedAt: newestAt },
+        newestAt,
+        read: true,
+      },
+      () => null,
+      () => true,
+    );
   provider.rails = () => provider.messages.filter((message: any) => message.type === 'rail');
   return provider;
 }
@@ -7257,33 +7280,42 @@ function readCounts(provider: any): void {
 test('opening a session leaves the rail to the render that selection asked for', async () => {
   const owed = railPostHarness(['show', 'saveState', 'readPrint', 'settleRailSeed']);
   readCounts(owed);
+  let finishOwed!: () => void;
+  owed.refresh = () =>
+    new Promise<void>((resolve) => {
+      finishOwed = resolve;
+    });
   owed.show('session-a');
-  owed.saveState({ read: ['session-a:10'], readTo: { 'session-a': 10 } });
+  const owedRead = owed.readSession('session-a', 10);
   assert.deepEqual(
     owed.rails(),
     [],
     'the selection words the rail twice, once in its render and once from the read state it saved',
   );
   // A selection refresh that posts no render still owes the session list update.
-
+  await owedRead;
+  finishOwed();
   await vi.waitFor(() => assert.equal(owed.rails().length, 1));
   assert.equal(owed.railSeedSkipped, false);
 
   const provider = railPostHarness(['show', 'saveState', 'readPrint', 'settleRailSeed']);
   readCounts(provider);
+  let finishSelection!: () => void;
+  provider.refresh = () =>
+    new Promise<void>((resolve) => {
+      finishSelection = resolve;
+    });
   provider.show('session-a');
-  provider.saveState({ read: ['session-a:10'], readTo: { 'session-a': 10 } });
-  provider.saveState({ read: ['session-a:10', 'session-b:20'], readTo: { 'session-a': 10, 'session-b': 20 } });
+  await provider.readSession('session-a', 10);
+  await provider.readSession('session-b', 20);
   assert.equal(provider.rails().length, 1, 'a card the reader did not open keeps a count it has lost');
 
   // The second save already posts both read marks, satisfying the pending session list update.
+  finishSelection();
   await vi.waitFor(() => assert.equal(provider.railSeedSkipped, false));
   assert.equal(provider.rails().length, 1, 'the owed rail was worded again over unmoved inputs');
 
-  provider.saveState({
-    read: ['session-a:10', 'session-a:30', 'session-b:20'],
-    readTo: { 'session-a': 30, 'session-b': 20 },
-  });
+  await provider.readSession('session-a', 30);
   assert.equal(provider.rails().length, 2, 'a read mark made once the selection settled never reaches the rail');
 });
 
@@ -10264,7 +10296,7 @@ test('the lifetime figures a pass built from settled files do not outlive the pa
   );
 });
 
-test('read saves and unchanged rail posts skip payload builds', () => {
+test('read saves and unchanged rail posts skip payload builds', async () => {
   const provider = railPostHarness(['saveState', 'readPrint']);
   let wordings = 0;
   provider.useRailPayload(() => ({ rail: [`wording ${wordings++}`] }));
@@ -10314,7 +10346,7 @@ test('read saves and unchanged rail posts skip payload builds', () => {
     provider.postRail(false);
     assert.deepEqual([inputBuilds, wordings, railStrings, provider.rails().length], [1, 1, 1, 1]);
 
-    provider.saveState({ read: ['session-a:10'], readTo: { 'session-a': 10 } });
+    await provider.readSession('session-a', 10);
     assert.deepEqual(
       [inputBuilds, wordings, railStrings],
       [1, 1, 1],

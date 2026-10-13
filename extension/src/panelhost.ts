@@ -450,6 +450,7 @@ import { dispatchPanelToHost, parsePanelToHost } from './webview/protocol.ts';
 import {
   HostReadPersistence,
   preserveHostRead,
+  readMovedOnlyFor,
   projectAgentRead,
   currentAgentRead,
   type AgentReadRecord,
@@ -1951,7 +1952,14 @@ export class PanelProvider implements vscode.Disposable {
   private restoringReadSources = false;
 
   private readOwner(): HostReadPersistence<PanelState> {
-    let previous = JSON.stringify([this.saved.read, this.saved.readTo, this.saved.since, this.saved.readRevision ?? 0]);
+    if (this.readPersistence) return this.readPersistence;
+    let previousState = normalizePanelState(this.saved);
+    let previous = JSON.stringify([
+      previousState.read,
+      previousState.readTo,
+      previousState.since,
+      previousState.readRevision ?? 0,
+    ]);
     return (this.readPersistence ??= new HostReadPersistence(
       normalizePanelState(this.saved),
       async (state) => {
@@ -1976,7 +1984,19 @@ export class PanelProvider implements vscode.Disposable {
           )
             throw new Error('The saved read state could not reach the panel.');
         }
-        this.postRail(true);
+        const counts = this.unreadCounts();
+        const countsChanged = JSON.stringify([...counts]) !== this.lastRailCountsJson;
+        const otherAgentMarks = (one: PanelState) =>
+          JSON.stringify((one.agentRead ?? []).filter((record) => record.sessionId !== this.showing));
+        if (
+          this.railSeedOwedFor === this.selectionGeneration &&
+          readMovedOnlyFor(this.showing, previousState, state) &&
+          otherAgentMarks(previousState) === otherAgentMarks(state)
+        ) {
+          if (countsChanged) this.railRevision++;
+          this.railSeedSkipped = true;
+        } else this.postRail(countsChanged, counts);
+        previousState = state;
         previous = signature;
       },
     ));
@@ -8184,7 +8204,7 @@ export class PanelProvider implements vscode.Disposable {
           this.performanceCounters.recordRefreshStage('unchanged');
         }
         if (!selectedOnly && this.repositoryScopeReady) this.onSessionRowsRefreshed?.();
-        if (!selectedOnly && this.repositoryScopeReady) this.restoreAgentReads();
+        if (!selectedOnly && this.repositoryScopeReady && this.saved.agentRead?.length) this.restoreAgentReads();
         if (!selectedOnly) {
           this.scheduleProjectSpendHydration(generation);
           const enrichment = await this.prepareRailEnrichment(all, generation, controller.signal);
@@ -8261,7 +8281,7 @@ export class PanelProvider implements vscode.Disposable {
         ...this.sessionRows,
       ];
       if (!selectedOnly && this.repositoryScopeReady) this.onSessionRowsRefreshed?.();
-      if (!selectedOnly && this.repositoryScopeReady) this.restoreAgentReads();
+      if (!selectedOnly && this.repositoryScopeReady && this.saved.agentRead?.length) this.restoreAgentReads();
       if (!selectedOnly && this.authoritativeCatalog !== null) {
         this.drainInitialCatalogRefresh();
         this.drainPendingQueues();
@@ -8644,7 +8664,7 @@ export class PanelProvider implements vscode.Disposable {
     return out;
   }
 
-  // Missing metadata stays unknown. Only a completed turn-start read can establish zero unread turns.
+  // Missing metadata stays unknown. Agent acknowledgments never establish complete turn-start coverage.
   // A session listing uses accepted starts because enrichment can update metadata before the retained windows.
   private unreadCounts(sessions?: readonly SessionFile[]): Map<string, NewCount> {
     const windows = sessions

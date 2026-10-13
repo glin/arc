@@ -33,6 +33,7 @@ export const CARD_CONTENT_FIELDS: readonly string[] = [
   'headline',
   'headlineHtml',
   'prompt',
+  'promptId',
   'delegation',
   'promptHeading',
   'promptNotice',
