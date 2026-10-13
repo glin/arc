@@ -2283,17 +2283,15 @@ export class PanelProvider implements vscode.Disposable {
     let counts: Map<string, NewCount> | null | undefined;
     const project = (entry: SessionPageSource) => {
       const source = entry.session;
-      // The page serves a prefix of the limit sources after its first projection, so counts read only their windows.
+      // The page serves a prefix of the limit sources after its first projection, so counts read only their metadata.
       if (counts === undefined) {
         const at = sources.indexOf(entry);
-        counts = visible
-          ? this.unreadCounts(sources.slice(at, at + limit).map(({ session }) => session.sessionId))
-          : null;
+        counts = visible ? this.unreadCounts(sources.slice(at, at + limit).map(({ session }) => session)) : null;
       }
       const meta = this.titles.get(source.file);
       const revision = this.revisionOf(source);
       const sourceCurrent = sameProgressiveRevision(revision, source);
-      const current = fresh && sourceCurrent && meta !== undefined && sameSessionRevision(meta, source);
+      const current = sourceCurrent && meta !== undefined && sameSessionRevision(meta, source);
       const outcome = sourceCurrent && meta && sameSessionRevision(meta, source) ? meta.outcome : undefined;
       const held = this.cache.get(source.file);
       const key = runningKey(source.agent, source.sessionId);
@@ -2392,7 +2390,6 @@ export class PanelProvider implements vscode.Disposable {
         if (!agentRunTerms.length) return true;
         const meta = this.titles.get(source.file);
         const current =
-          fresh &&
           meta !== undefined &&
           sameSessionRevision(meta, source) &&
           sameProgressiveRevision(this.revisionOf(source), source);
@@ -8366,10 +8363,17 @@ export class PanelProvider implements vscode.Disposable {
   }
 
   // Missing metadata stays unknown. Only a completed turn-start read can establish zero unread turns.
-  // A session listing passes the IDs it can serve, so the count reads only those windows.
-  private unreadCounts(sessions?: readonly string[]): Map<string, NewCount> {
+  // A session listing uses accepted starts because enrichment can update metadata before the retained windows.
+  private unreadCounts(sessions?: readonly SessionFile[]): Map<string, NewCount> {
     const windows = sessions
-      ? new Map(sessions.flatMap((id) => (this.windows.has(id) ? [[id, this.windows.get(id)!] as const] : [])))
+      ? new Map(
+          sessions.flatMap((session) => {
+            const meta = this.titles.get(session.file);
+            return meta?.starts && sameSessionRevision(meta, session)
+              ? [[session.sessionId, meta.starts] as const]
+              : [];
+          }),
+        )
       : this.windows;
     return newCounts([], windows, this.saved.read, new Map(Object.entries(this.saved.readTo)), this.saved.since);
   }

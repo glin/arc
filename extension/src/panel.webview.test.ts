@@ -2332,6 +2332,16 @@ test('current whole-file facts archive a listed session with no turn, refuse una
   source.agent = 'claude';
   assert.equal((await provider.handleSessionRequest(request)).status, 'applied');
   assert.equal(provider.hidden.has('empty'), true);
+  for (const pending of ['event', 'refresh']) {
+    await provider.handleSessionRequest({ ...request, params: { ...request.params, action: 'unarchive' } });
+    provider.pendingWatch = { snapshot: () => ({ eventCount: pending === 'event' ? 1 : 0, broadRequired: false }) };
+    provider.refreshController = pending === 'refresh' ? {} : null;
+    assert.deepEqual([row().facts, row().runStatus, row().attention], ['current', 'none', 'idle']);
+    assert.equal((await provider.handleSessionRequest(request)).status, 'applied');
+    assert.equal(provider.hidden.has('empty'), true);
+  }
+  provider.pendingWatch = { snapshot: () => ({ eventCount: 0, broadRequired: false }) };
+  provider.refreshController = null;
   const refuse = async (pattern: RegExp) =>
     assert.match((await provider.handleSessionRequest(request)).reason, pattern);
   entry.metadataWindow = { whole: false, windowBytes: 1 };
@@ -2347,6 +2357,7 @@ test('current whole-file facts archive a listed session with no turn, refuse una
   await refuse(/unavailable/);
   provider.titles.set(file, entry);
   visible = false;
+  assert.deepEqual([row().facts, row().runStatus, row().attention], ['current', 'none', 'unknown']);
   await refuse(/unavailable/);
   visible = true;
   provider.running.add('claude:empty');
@@ -2382,6 +2393,7 @@ test('current whole-file facts archive a listed session with no turn, refuse una
     },
   };
   provider.pendingWatch = { snapshot: () => ({ eventCount: 1, broadRequired: false }) };
+  entry.size = -1;
   for (const [active, live] of [
     ['running', () => provider.running.add('claude:empty')],
     ['input', () => (provider.asks = [{ session: 'empty' }])],
@@ -2446,9 +2458,10 @@ test('current whole-file facts archive a listed session with no turn, refuse una
       () => {
         visible = false;
         provider.pendingWatch = { snapshot: () => ({ eventCount: 0, broadRequired: false }) };
+        entry.size = source.size;
         entry.outcome = finished;
       },
-      ['done', 'unknown', 'stale'],
+      ['done', 'unknown', 'current'],
     ],
   ] as const) {
     assert.equal(
@@ -2947,6 +2960,133 @@ test('scoped curation awaits saves, rechecks archive at apply, rolls back refusa
   );
 });
 
+test.each(['event', 'refresh'])(
+  "window session listings retain accepted finished row facts during another session's %s",
+  async (pending) => {
+    const { sources, child, provider } = pagedListingFixture(2);
+    const finished = sources.filter((source) => source !== child);
+    provider.saved.readTo = {};
+    provider.running.add(`${child.agent}:${child.sessionId}`);
+    const request: any = { method: 'sessions', requester: null, params: {} };
+    assert.equal(provider.readSessionRequest(request).complete, true);
+    if (pending === 'event') provider.pendingWatch = { snapshot: () => ({ eventCount: 1, broadRequired: false }) };
+    else provider.refreshController = {};
+    for (const source of finished) {
+      const page = provider.readSessionRequest({ ...request, params: { query: `session:${source.sessionId}` } });
+      assert.equal(page.coverage, 'complete');
+      assert.equal(page.freshness, 'stale');
+      assert.equal(page.complete, false);
+      assert.equal(page.sessions.length, 1);
+      const row = page.sessions[0];
+      assert.deepEqual(
+        [row.id, row.facts, row.runStatus, row.lastActivity, row.attention],
+        [source.sessionId, 'current', 'done', 1001, 'unread'],
+      );
+      const filtered = provider.readSessionRequest({
+        ...request,
+        params: { query: `session:${source.sessionId} -is:agentrun` },
+      });
+      assert.deepEqual(
+        filtered.sessions.map((row: any) => row.id),
+        [source.sessionId],
+      );
+      assert.equal(filtered.coverage, 'complete');
+    }
+    fs.appendFileSync(child.file, 'active append');
+    const page = provider.readSessionRequest(request);
+    const active = page.sessions.find((row: any) => row.id === child.sessionId);
+    assert.deepEqual([active.facts, active.lastActivity, active.runStatus], ['stale', null, 'running']);
+    for (const source of finished) {
+      const row = page.sessions.find((row: any) => row.id === source.sessionId);
+      assert.deepEqual([row.facts, row.lastActivity, row.attention], ['current', 1001, 'unread']);
+    }
+    const source = finished[0];
+    const meta = provider.titles.get(source.file);
+    provider.titles.set(source.file, { ...meta, size: -1 });
+    const mismatch = provider.readSessionRequest(request).sessions.find((row: any) => row.id === source.sessionId);
+    assert.deepEqual([mismatch.facts, mismatch.lastActivity, mismatch.attention], ['stale', null, 'unknown']);
+    provider.titles.delete(source.file);
+    const unparsed = provider.readSessionRequest(request).sessions.find((row: any) => row.id === source.sessionId);
+    assert.deepEqual([unparsed.facts, unparsed.lastActivity, unparsed.attention], ['unparsed', null, 'unknown']);
+    provider.titles.set(source.file, meta);
+    provider.watching = false;
+    const unwatched = provider.readSessionRequest(request).sessions.find((row: any) => row.id === source.sessionId);
+    assert.deepEqual([unwatched.facts, unwatched.lastActivity, unwatched.attention], ['current', 1001, 'unread']);
+    provider.watching = true;
+    provider.saved.readTo[source.sessionId] = 5000;
+    provider.sessionAliases = new Map();
+    const archive = await provider.handleSessionRequest({
+      method: 'curate',
+      requester: null,
+      params: { sessionId: source.sessionId, action: 'archive', force: false, dryRun: false },
+    });
+    assert.equal(archive.status, 'applied', archive.reason);
+    assert.equal(provider.hidden.has(source.sessionId), true);
+    provider.anyVisible = () => false;
+    const hidden = provider.readSessionRequest(request).sessions.find((row: any) => row.id === source.sessionId);
+    assert.deepEqual([hidden.facts, hidden.lastActivity, hidden.attention], ['current', 1001, 'unknown']);
+  },
+);
+
+test('window session listings refuse ordinary archive of unread work while accepted starts await expanded metadata', async () => {
+  const { sources, child, provider } = pagedListingFixture(2);
+  const source = sources.find((source) => source !== child)!;
+  const entry = provider.titles.get(source.file);
+  provider.titles.set(source.file, { ...entry, starts: undefined });
+  provider.saved.readTo = { [source.sessionId]: 1500 };
+  provider.windows.set(source.sessionId, { starts: [1000], whole: false });
+  provider.refreshController = new AbortController();
+  provider.refreshGeneration = 1;
+  provider.derivedCacheCheckpointState = { markChanged() {} };
+  provider.codexMetas = new Map();
+  provider.observeStoredName = (_source: any, next: any) => next;
+  provider.metadataRecoveryQueue = [];
+  provider.sessionAliases = new Map();
+  let release!: (value: null) => void;
+  const held = new Promise<null>((resolve) => (release = resolve));
+  let awaitingMetadata!: () => void;
+  const metadataRequested = new Promise<void>((resolve) => (awaitingMetadata = resolve));
+  provider.progressiveWorker = {
+    run: (request: any, generation: number) => {
+      if (request.kind === 'starts')
+        return Promise.resolve({
+          generation,
+          revision: source,
+          value: { kind: 'starts', starts: { starts: [1000, 2000], whole: true } },
+        });
+      assert.equal(request.kind, 'metadata');
+      awaitingMetadata();
+      return held;
+    },
+  };
+  const request: any = { method: 'sessions', requester: null, params: { query: `session:${source.sessionId}` } };
+  const before = provider.readSessionRequest(request).sessions[0];
+  assert.deepEqual([before.facts, before.runStatus], ['current', 'done']);
+  const enrichment = provider.prepareRailEnrichment([source], 1, provider.refreshController.signal);
+  try {
+    await metadataRequested;
+    assert.deepEqual(provider.titles.get(source.file).starts, { starts: [1000, 2000], whole: true });
+    assert.deepEqual(provider.windows.get(source.sessionId), { starts: [1000], whole: false });
+    const page = provider.readSessionRequest(request);
+    const row = page.sessions[0];
+    assert.deepEqual([page.freshness, row.facts, row.runStatus], ['stale', 'current', 'done']);
+    const archive = await provider.handleSessionRequest({
+      method: 'curate',
+      requester: null,
+      params: { sessionId: source.sessionId, action: 'archive', force: false, dryRun: false },
+    });
+    assert.equal(archive.status, 'refused', archive.reason);
+    assert.match(archive.reason, /--force/);
+    assert.equal(provider.hidden.has(source.sessionId), false);
+    assert.equal(row.attention, 'unread');
+    provider.titles.set(source.file, { ...entry, starts: { starts: [], whole: false } });
+    assert.equal(provider.readSessionRequest(request).sessions[0].attention, 'unknown');
+  } finally {
+    release(null);
+    await enrichment;
+  }
+});
+
 test('window session listings reject removed children and report pending, hidden, and changed discovery facts', () => {
   const now = Date.parse('2026-10-08T14:30:00Z');
   const clock = vi.spyOn(Date, 'now').mockReturnValue(now);
@@ -3054,14 +3194,14 @@ test('window session listings reject removed children and report pending, hidden
     assert.equal(pendingPermission.complete, false);
     assert.equal(parentRow(pendingPermission).runStatus, 'waiting');
     assert.equal(parentRow(pendingPermission).attention, 'input');
-    assert.equal(parentRow(pendingPermission).facts, 'stale');
+    assert.equal(parentRow(pendingPermission).facts, 'current');
     eventCount = 0;
     provider.refreshController = {};
     const refreshingPermission = provider.readSessionRequest(request);
     assert.equal(refreshingPermission.complete, false);
     assert.equal(parentRow(refreshingPermission).runStatus, 'waiting');
     assert.equal(parentRow(refreshingPermission).attention, 'input');
-    assert.equal(parentRow(refreshingPermission).facts, 'stale');
+    assert.equal(parentRow(refreshingPermission).facts, 'current');
     provider.refreshController = null;
     provider.asks = [];
     provider.running.add('claude:parent');
@@ -3074,7 +3214,7 @@ test('window session listings reject removed children and report pending, hidden
     const hidden = provider.readSessionRequest(request);
     assert.equal(hidden.complete, false);
     assert.equal(parentRow(hidden).runStatus, 'unknown');
-    assert.equal(parentRow(hidden).facts, 'stale');
+    assert.equal(parentRow(hidden).facts, 'current');
     visible = true;
     const retained = {
       ...outcome,
@@ -3179,7 +3319,7 @@ test('window session listings reject removed children and report pending, hidden
     eventCount = 1;
     publishExit();
     const staleExit = provider.readSessionRequest(request);
-    assert.equal(parentRow(staleExit).facts, 'stale');
+    assert.equal(parentRow(staleExit).facts, 'current');
     assert.equal(parentRow(staleExit).runStatus, 'stopped');
     provider.exitedSinceKeys.clear();
     provider.sessionRunWitnesses?.clear();
@@ -3330,7 +3470,12 @@ function pagedListingFixture(count: number) {
     pendingWatch: { snapshot: () => ({ eventCount: 0, broadRequired: false }) },
     windows,
     saved: { ...normalizePanelState(null), readTo: { [target.sessionId]: 5000 } },
-    titles: new Map(sources.map((source) => [source.file, { ...source, outcome, activityMs: 1001 }])),
+    titles: new Map(
+      sources.map((source) => [
+        source.file,
+        { ...source, outcome, activityMs: 1001, starts: windows.get(source.sessionId) },
+      ]),
+    ),
     cache: new Map(),
     pinnedTop: new Set(),
     hidden: new Set(),
