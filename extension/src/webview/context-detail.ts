@@ -80,7 +80,7 @@ export function drawContextDetail(document: Document, host: HTMLElement, value: 
         el(
           'li',
           'context-note',
-          'Unattributed context includes uncounted tool results, hidden inputs, media, and estimation differences.',
+          "Context left after subtracting Arc's category estimates, including uncounted tool results, hidden inputs, and estimation differences.",
         ),
       );
     if (native.measurement === 'local-estimate')

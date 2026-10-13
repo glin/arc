@@ -107,6 +107,8 @@ Claude's full current-file diffs require the optional [hooks](#try-it). See [dif
 
 Arc estimates costs for supported models using published prices. Subscription estimates do not measure your bill or plan limits.
 
+Use [`arc cost`](docs/cli.md#read-a-cost-report) to estimate costs from saved Claude and Codex transcripts.
+
 | Provider       | Models                      |
 | -------------- | --------------------------- |
 | Anthropic      | Claude                      |
@@ -137,9 +139,25 @@ Arc estimates costs for supported models using published prices. Subscription es
 
 <a href="docs/images/readme-usage.webp"><img src="docs/images/readme-usage.webp" alt="Usage bar with Claude and Codex limits, open to each agent's plan, 5h and 7d use, and reset times" width="308"></a>
 
-### Commenting
+### Quality-of-life features
+
+- Save your favorite model setups with effort and permissions per project
+- Find sessions with advanced filters
+- Invoke Codex skills with `/skill`, consistently with Claude
+- Copy responses as Markdown or start a new draft from selected response text
+- Keep unsent drafts across session switches and panel restores
+
+#### Commenting
 
 <a href="docs/images/readme-comment-editor.webp"><img src="docs/images/readme-comment-editor.webp" alt="Selected response text with a comment being written beside it" width="970"></a>
+
+### Control Arc with agents
+
+Use the [`arc-sessions` skill](docs/arc-sessions.md) through a running Arc window:
+
+- Start Claude or Codex sessions and read their results
+- Send follow-ups to sessions the agent started in that window activation
+- Label, pin, or archive sessions at your request
 
 ## Limitations
 
