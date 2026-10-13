@@ -3886,7 +3886,20 @@ export class PanelProvider implements vscode.Disposable {
     measured?: (serializedBytes: number | null) => void,
   ): Thenable<boolean> {
     const type = (message as { type?: unknown })?.type;
-    if (!this.readyHosts.has(host) && type !== 'requestPromptRecovery' && type !== 'health') {
+    let readerDocument = false;
+    if (type === 'readerDocument') {
+      const page = this.readerPages?.get(host);
+      const challenge = message as { readerPageId?: unknown; documentId?: unknown; challenge?: unknown };
+      readerDocument =
+        !this.disposed &&
+        this.hosts.includes(host) &&
+        page?.pending !== undefined &&
+        page.id === challenge.readerPageId &&
+        page.pending.documentId === challenge.documentId &&
+        page.pending.challenge === challenge.challenge;
+      if (!readerDocument) return Promise.resolve(false);
+    }
+    if (!this.readyHosts.has(host) && type !== 'requestPromptRecovery' && type !== 'health' && !readerDocument) {
       return Promise.resolve(false);
     }
     const kind = typeof type === 'string' ? type : 'unknown';
@@ -12934,6 +12947,7 @@ export class PanelProvider implements vscode.Disposable {
       }
       return;
     }
+    if (message.type === 'ready' && (this.disposed || !this.hosts.includes(host))) return;
     if (message.type === 'ready' && this.readerPages?.has(host)) {
       const page = this.readerPages.get(host)!;
       if (page.id !== message.readerPageId || !message.readerDocumentId) return;

@@ -2014,10 +2014,10 @@ beforeAll(async () => {
   ({ PanelProvider } = await import('./panelhost.ts'));
 });
 
-function orderedHostReadFixture() {
+function orderedHostReadFixture(productionSender = false) {
   const writes: any[] = [];
   const publications: any[] = [];
-  const host = {};
+  const host: any = {};
   const pageId = 'a'.repeat(32);
   const provider: any = Object.assign(Object.create(PanelProvider.prototype), {
     saved: normalizePanelState(null),
@@ -2045,6 +2045,27 @@ function orderedHostReadFixture() {
     postRail() {},
     readScopeKey: () => 'scope',
   });
+  if (productionSender) {
+    Object.assign(host, {
+      visible: () => false,
+      webview: {
+        cspSource: 'test-webview',
+        postMessage: async (message: unknown) => {
+          publications.push(message);
+          return true;
+        },
+      },
+    });
+    Object.assign(provider, {
+      disposed: false,
+      panelVisibility: { current: () => ({ type: 'visibility', visible: false }) },
+      healthPanel: () => ({ id: 'test-panel', posting: false }),
+      performanceCounters: { recordMessage() {} },
+      publishWindowState() {},
+      restoreAgentReads() {},
+    });
+    delete provider.sendToHost;
+  }
   return { provider, writes, publications, host, pageId };
 }
 
@@ -2524,20 +2545,90 @@ test('production bootstrap reload preserves unseen browser unread intent in the 
   }
 });
 
+test('production readiness delivers challenges before initial and rewritten shell admission', async () => {
+  const f = orderedHostReadFixture(true);
+  f.provider.shell(f.host.webview);
+  const initialPage = f.provider.readerPages.get(f.host);
+  assert.equal(f.provider.readyHosts.has(f.host), false);
+  const admit = async (documentId: string) => {
+    const page = f.provider.readerPages.get(f.host);
+    const ready = { type: 'ready', readerPageId: page.id, readerDocumentId: documentId };
+    const before = f.publications.length;
+    assert.equal(await f.provider.sendToHost(f.host, { type: 'readState', state: {} }), false);
+    await f.provider.onMessage({ ...ready, readerPageId: 'f'.repeat(32) }, f.host);
+    assert.equal(f.publications.length, before);
+    await f.provider.onMessage(ready, f.host);
+    const challenge = f.publications.at(-1);
+    assert.equal(challenge?.type, 'readerDocument');
+    assert.equal(challenge.readerPageId, page.id);
+    assert.equal(challenge.documentId, documentId);
+    assert.equal(f.provider.readyHosts.has(f.host), false);
+    for (const changed of [
+      { readerPageId: 'f'.repeat(32) },
+      { documentId: 'f'.repeat(32) },
+      { challenge: 'f'.repeat(32) },
+    ]) {
+      assert.equal(await f.provider.sendToHost(f.host, { ...challenge, ...changed }), false);
+    }
+    const pending = page.pending;
+    await f.provider.onMessage({ ...ready, readerChallenge: 'f'.repeat(32) }, f.host);
+    assert.equal(page.pending, pending);
+    assert.equal(page.documentId, undefined);
+    const reply = { ...ready, readerChallenge: challenge.challenge };
+    await f.provider.onMessage(reply, f.host);
+    assert.equal(f.provider.readyHosts.has(f.host), true);
+    assert.equal(page.documentId, documentId);
+    assert.equal(page.pending, undefined);
+    const synchronized = f.publications.filter((message) => message.type === 'readState').length;
+    assert.ok(synchronized > 0);
+    assert.equal(f.publications.at(-2).type, 'visibility');
+    assert.deepEqual(f.publications.at(-1).state, f.provider.readSynchronization());
+    await f.provider.onMessage(reply, f.host);
+    assert.equal(f.publications.filter((message) => message.type === 'readState').length, synchronized);
+    assert.equal(await f.provider.sendToHost(f.host, { type: 'readState', state: {} }), true);
+    return reply;
+  };
+  const oldReply = await admit('b'.repeat(32));
+  f.provider.shell(f.host.webview);
+  const replacement = f.provider.readerPages.get(f.host);
+  assert.notEqual(replacement.id, initialPage.id);
+  assert.equal(f.provider.readyHosts.has(f.host), false);
+  const before = f.publications.length;
+  await f.provider.onMessage(oldReply, f.host);
+  assert.equal(f.publications.length, before);
+  assert.equal(replacement.pending, undefined);
+  await admit('c'.repeat(32));
+});
+
+test.each(['disposed', 'detached'])(
+  'production readiness rejects a %s host before changing its document',
+  async (state) => {
+    const f = orderedHostReadFixture(true);
+    f.provider.shell(f.host.webview);
+    const page = f.provider.readerPages.get(f.host);
+    const ready = { type: 'ready', readerPageId: page.id, readerDocumentId: 'b'.repeat(32) };
+    await f.provider.onMessage(ready, f.host);
+    const challenge = f.publications.at(-1);
+    assert.equal(challenge?.type, 'readerDocument');
+    const pending = page.pending;
+    if (state === 'disposed') f.provider.disposed = true;
+    else f.provider.hosts = [];
+    const before = f.publications.length;
+    await f.provider.onMessage({ ...ready, readerDocumentId: 'c'.repeat(32) }, f.host);
+    assert.equal(page.pending, pending);
+    await f.provider.onMessage({ ...ready, readerChallenge: challenge.challenge }, f.host);
+    assert.equal(page.documentId, undefined);
+    assert.equal(page.pending, pending);
+    assert.equal(f.provider.readyHosts.has(f.host), false);
+    assert.equal(await f.provider.sendToHost(f.host, challenge), false);
+    assert.equal(f.publications.length, before);
+  },
+);
+
 test('same-shell replacement admits unseen unread and rejects delayed document traffic', async () => {
-  const f = orderedHostReadFixture();
+  const f = orderedHostReadFixture(true);
   const shellId = f.pageId;
-  const sent: any[] = [];
-  Object.assign(f.host, { visible: () => false, webview: {} });
-  Object.assign(f.provider, {
-    panelVisibility: { current: () => ({ type: 'visibility', visible: false }) },
-    publishWindowState() {},
-    restoreAgentReads() {},
-    sendToHost: async (_host: unknown, message: any) => {
-      sent.push(message);
-      return true;
-    },
-  });
+  const sent = f.publications;
   const ready = async (documentId: string) => {
     await f.provider.onMessage({ type: 'ready', readerPageId: shellId, readerDocumentId: documentId }, f.host);
     const challenge = sent.at(-1);
@@ -26348,11 +26439,6 @@ test('a ready host stages worker-backed session data without clearing accepted c
     attach,
     /this\.sendToHost\(host, this\.panelVisibility\.current\(host, host\.visible\(\)\)\)/,
     'visibility transitions never reach the retained page',
-  );
-  sourceMatch(
-    panelHostSource,
-    /private sendToHost[\s\S]*?if \(!this\.readyHosts\.has\(host\) && type !== 'requestPromptRecovery' && type !== 'health'\) \{ return Promise\.resolve\(false\); \}/,
-    'a host receives data before its browser reports readiness',
   );
   sourceMatch(
     panelHostSource,
