@@ -6,7 +6,7 @@ The `arc-sessions` skill lets a Claude Code or Codex agent start, inspect, and o
 
 | Component | Job | Installation |
 | --- | --- | --- |
-| Arc extension | Displays sessions and connects to agent CLIs. Includes `arc` launchers for panel-started agents. | Source installer or an available VSIX. |
+| Arc extension | Displays sessions and connects to agent CLIs. Includes `arc` launchers for Arc sessions and new integrated terminals. | Source installer or an available VSIX. |
 | Standalone Arc CLI | Makes `arc` available to ordinary shell commands. | Local npm tarball from the [CLI build instructions](../cli/README.md#build-from-source). |
 | `arc-sessions` skill | Gives an agent instructions for bounded session work through the CLI. | Reader installs or links the skill separately. |
 | `arc-hooks` Claude plugin | Captures first-touch file snapshots for Claude file diffs. | Source installer or Claude plugin marketplace. |
@@ -19,7 +19,7 @@ Bundled files are part of an artifact. An installed skill exists in an agent's s
 
 `install.sh` builds and installs the editor extension. It also sets up the optional Claude plugin unless passed `--no-hooks`. A local source installation uses the checkout's code. A remote source installation resolves the selected ref before downloading it.
 
-A VSIX installs the extension. The separate release downloader requires published VSIX and checksum assets. Claude marketplace installation selects `arc-hooks`, not the CLI or session skill. [Development setup](development.md#dependencies) owns local plugin commands. Session commands use Arc's local window channel without requiring Claude hooks. Codex records come from its rollouts.
+A VSIX installs the extension. Claude marketplace installation selects `arc-hooks`, not the CLI or session skill. [Development setup](development.md#dependencies) owns local plugin commands. Session commands use Arc's local window channel without requiring Claude hooks. Codex records come from its rollouts.
 
 Arc has no editor command named **Arc: Install CLI**. To update the standalone CLI, build a current source checkout and install its tarball. [CLI installation](../cli/README.md#install) owns the commands and Node requirements. npm publication is deferred, so a registry `latest` install is not an available release path.
 
@@ -39,6 +39,28 @@ Arc does not automatically install the session skill or inject its instructions 
 Ordinary `claude -p` loads the same configured context as an interactive session, including available skills unless disabled. By default, `--bare` skips automatic skill discovery. [Claude programmatic guidance](https://code.claude.com/docs/en/headless) owns bare-mode exceptions. Context use depends on listed metadata and activated instructions. Loading the skill does not authorize session starts or create an automatic workflow. The agent must receive a request authorizing the work it starts.
 
 An ordinary CLI session can coordinate work when its shell finds `arc` and the intended Arc window is ready. The extension supplies its own launcher environment to panel-started agents. [Agent runtime](agent-protocols.md#runtime-shape) owns that environment.
+
+## Example requests
+
+Ask an agent to summarize work in the current window:
+
+```text
+Use Arc to summarize the sessions labelled Review in this window. Read their completed turns. Report results, blockers, and decisions needing my input.
+```
+
+Authorize a session with a specific task:
+
+```text
+Use Arc to start a Codex session reviewing this branch. Name it Branch review, apply Review, and pin it. Read its result and summarize its findings.
+```
+
+Request compaction after saving a handoff:
+
+```text
+After saving the handoff, request compaction of this session after your response.
+```
+
+A compaction request does not establish completed compaction. [CLI compaction requests](cli.md#session-management) owns admission and outcome states.
 
 ## A bounded coordinator run
 

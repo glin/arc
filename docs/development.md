@@ -30,7 +30,7 @@ node extension/dist/setup.cjs --commands
 node extension/dist/setup.cjs --snapshots
 ```
 
-The ordinary source installer retains its local marketplace and hosted catalog routes. These alternate routes remain independent of durable VSIX setup.
+The source installer uses the checkout marketplace for local development. Downloaded source uses the built snapshot helper to preserve matching hooks in durable storage. `--remote` forces download for development testing. `--repo` and `--ref` select the downloaded source. `--marketplace-url` explicitly selects an independently published HTTPS catalog. `--no-hooks` skips all Claude setup and legacy cleanup.
 
 ## Panel screenshots
 

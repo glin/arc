@@ -6,7 +6,7 @@ Show context, prompt-cache status, and the next turn's starting price in Claude 
 
 ## Install
 
-The Arc VSIX supplies matching private commands. [Terminal availability](../README.md#terminal-availability) describes integrated terminals and Arc sessions. Standalone installation uses npm.
+The Arc VSIX supplies matching private commands. [Try it](../README.md#try-it) describes integrated terminals and Arc sessions. Standalone installation uses npm.
 
 Requires Node.js 18 or later. [Build from source](#build-from-source) and install the local tarball.
 
@@ -255,3 +255,31 @@ npm exec --offline --no -- arc --version
 ```
 
 The offline command uses the installed package without a registry download.
+
+## Uninstallation
+
+For an npm-installed standalone CLI, run:
+
+```sh
+npm uninstall --global @glin/arc
+```
+
+For a project-local installation, run in that project:
+
+```sh
+npm uninstall @glin/arc
+```
+
+Remove only the `arc-sessions` links you created in your agents' skill directories. Preserve unfamiliar skill directories.
+
+Remove Claude hooks through its plugin manager:
+
+```sh
+claude plugin uninstall arc-hooks@arc --scope user
+```
+
+Remove the `arc` marketplace only when no installed plugin uses it. Local source marketplaces refer to their checkout. Downloaded source and VSIX setup keep owned copies under `${ARC_HOME:-~/.arc}/tools`.
+
+Source command setup writes launchers to the selected Arc home's `bin` directory. Remove its owned `arc`, `arc.cmd`, and `run.cjs` files. Remove that exact directory entry from your shell configuration or Windows user PATH if you added it.
+
+Stop every process using copied releases before removing owned `tools` storage. Confirm its `ownership.json` names the selected Arc home. Preserve unfamiliar files, snapshots, logs, caches, and other user data. Never delete the complete Arc home directory.

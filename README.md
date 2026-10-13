@@ -14,65 +14,35 @@ Arc is a VS Code extension for working with Claude Code and Codex. **Experimenta
 
 ## Try it
 
-Arc is not on the VS Code Marketplace. Obtain a VSIX through one of these routes:
+Install from source with Node.js 22+ and npm. Install [Claude Code](https://code.claude.com/docs/en/setup) and [Codex](https://developers.openai.com/codex/cli/) for the agents you use. On Windows, run the installer in Git Bash.
 
-- For a published version, download `glin.arc-<version>.vsix` from [GitHub Releases](https://github.com/glin/arc/releases).
-- For an unpublished candidate, open its successful [VSIX candidate workflow run](https://github.com/glin/arc/actions/workflows/vsix-candidate.yml). Download the `arc-vsix-candidate-<commit SHA>` artifact and extract `glin.arc-<version>.vsix`.
-- If no package is available, use [source installation](#manual-and-source-installation) below.
+```bash
+curl -fsSL https://raw.githubusercontent.com/glin/arc/main/install.sh | bash
+```
 
-The VSIX includes the prebuilt CLI and optional Claude snapshot plugin. Installing the downloaded package needs no Git, npm, network access, or source build.
+The installer installs Arc in your editor and sets up Claude hooks. It builds a complete local Arc checkout when available. Otherwise, it downloads the `main` branch from `glin/arc`.
 
-Claude hooks require Node.js 18 or later in the editor's launch environment and Claude Code 2.1.268 or later. Install those prerequisites before setup. If you installed them while VS Code was open, restart VS Code first.
+Reload VS Code and open a new integrated terminal to use `arc`. Run **Arc: Open Arc in Editor** from the Command Palette.
 
-Set any intended `ARC_HOME` or `CLAUDE_CONFIG_DIR` before starting VS Code.
+### Claude hooks
 
-1. Open VS Code's Extensions view. Select **Install from VSIX...** from its menu and choose the downloaded `.vsix` file.
-2. Run **Developer: Reload Window** from the Command Palette.
-3. Open your project folder. Trust the project if VS Code requests it and you trust its contents.
-4. Open a new editor terminal to use `arc`. See [Terminal availability](#terminal-availability).
-5. Run **Arc: Set up Claude hooks** and approve the optional plugin installation. Skip this step for an existing source or hosted installation.
-6. Restart Claude or start a fresh Claude session to load the hooks.
+Hooks capture files before Claude edits them for full current-file diffs. Restart Claude after installation. Earlier file baselines stay unavailable.
 
-The `arc` command provides session commands, cost reports, and `arc statusline`. Snapshots supply file baselines for Claude edits after setup. Earlier baselines stay unavailable. Successful setup confirms installation and selected files. It does not confirm snapshot capture.
-
-To open Arc, click the agent icon in the editor's top-right toolbar. Or run **Arc: Open Arc in Editor** from the Command Palette. The shortcut is `Ctrl+K`, then `A` on Windows/Linux, or `Cmd+K`, then `A` on macOS.
-
-### Terminal availability
-
-Arc appends its private launcher folder to PATH for new integrated terminals and supplies the editor runtime. Existing commands, aliases and functions keep precedence. Arc-owned agent children select this extension's matching CLI before inherited commands. Existing terminals need a restart. The extension changes no user PATH or shell configuration.
-
-Private tools use `${ARC_HOME:-~/.arc}` and reject relative roots or redirected installation ancestors. Trusted remote windows prepare commands on their execution host. Untrusted windows receive no private commands and cannot launch Arc-owned agent children. A folder containing the platform PATH separator cannot be added to PATH. Preparation failure leaves terminal contributions empty.
-
-Snapshot setup supports ordinary personal Claude configuration and default plugin storage. Managed setups are unsupported. Claude enforces its native plugin policy. Runtime or storage overrides require [manual setup](#manual-and-source-installation). Disabled plugins and unfamiliar marketplaces stay unchanged.
-
-### Updates
-
-Install a newer VSIX and reload VS Code to prepare its matching private CLI. Previous immutable releases remain available to running processes. Rerun **Arc: Set up Claude hooks** to select this extension's optional hooks, including downgrades. Restart Claude after hook setup. Passive checks do not update installed hooks.
-
-### Manual and source installation
-
-For the CLI without the editor extension, follow [CLI installation](cli/README.md#install).
-
-Build and install the extension from source with Node.js 22.12 or later:
+Run **Arc: Set up Claude hooks** to set them up separately. To install Arc without changing Claude hooks, use:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/glin/arc/main/install.sh | bash -s -- --no-hooks
 ```
 
-Reload the window, then continue at step 3 above. Private CLI preparation remains independent of optional hook setup. On Windows, run the source installer in Git Bash. The installer uses the current editor when its terminal identifies a supported installation. Otherwise, it selects detected editors and offers a menu when several editors and a terminal are available. Append `code`, `cursor`, `positron`, `codium`, `code-insiders`, or a full CLI path to select an editor. `--no-hooks` preserves existing hooks. Omitting it also installs the snapshot plugin through the source installer's separate route. [Development setup](docs/development.md#dependencies) describes checkout builds and individual source helper modes.
+### CLI outside VS Code
 
-To install the optional hooks manually through Claude's plugin manager, run:
+See [CLI installation](cli/README.md#install) to install `arc` for other terminals.
 
-```bash
-claude plugin marketplace add glin/arc
-claude plugin install arc-hooks@arc
-```
+### Uninstall
 
-The hosted plugin requires Claude Code 2.1.224 or later. Review existing marketplace ownership before selecting this route.
+Remove Arc from VS Code's Extensions view. Installed Claude hooks and standalone commands remain available.
 
-### Remove installed tools
-
-Removing the extension clears its terminal contributions and leaves copied releases and optional plugins on disk. Source-installed standalone commands remain available. Remove `arc-hooks@arc` through Claude's plugin manager. Remove the owned `arc` and `arc.cmd` launchers and their `run.cjs` from the selected software root's `bin` directory. Remove that exact directory entry from Windows user PATH or your shell configuration. Remove `tools` only after confirming its `ownership.json` and stopping every process that uses its releases. Preserve unfamiliar files and all snapshots, logs, caches and other user data. Never delete the complete Arc home directory.
+See [uninstallation](cli/README.md#uninstallation) to remove those separately.
 
 ### Sign in
 
@@ -154,11 +124,13 @@ Use [`arc cost`](docs/cli.md#read-a-cost-report) to estimate costs from saved Cl
 
 ### Control Arc with agents
 
-Use the [`arc-sessions` skill](docs/arc-sessions.md) through a running Arc window:
+Use the [`arc-sessions` skill](docs/arc-sessions.md) to:
 
-- Start Claude or Codex sessions and read their results
-- Send follow-ups to sessions the agent started in that window activation
-- Label, pin, or archive sessions at your request
+- Start Claude or Codex sessions with labels and pins
+- Read session results and status, then summarize blockers and decisions needing your attention
+- Send follow-ups to sessions the agent started
+- Estimate session and subagent costs with `arc cost`
+- Request compaction of its own session after the turn when asked
 
 ## Limitations
 

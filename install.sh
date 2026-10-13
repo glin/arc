@@ -91,8 +91,9 @@ NODE
 }
 
 main() {
+  local invocation_cwd="$PWD"
   local setup_hooks=1 mode=auto source_repo=glin/arc source_ref=main
-  local marketplace_url=https://github.com/glin/arc/releases/latest/download/arc-marketplace.json
+  local marketplace_url=''
   local argument candidate seen choice i cli claude_cli version sha ref_encoded failed=0 installed=0
   local REPO='' local_source=0 marketplace_override=0 hook_source='' hook_source_type=url
   local -a CLIS=()
@@ -118,7 +119,10 @@ main() {
       --help|-h)
         echo 'Usage: bash install.sh [--local|--remote] [--repo OWNER/REPO] [--ref REF] [--marketplace-url HTTPS_URL] [--no-hooks] [editor-cli ...]'
         echo 'Build Arc from local or temporary downloaded source and install its Claude plugin.'
-        echo 'Local source uses its plugin directory unless --marketplace-url selects a hosted catalog.'
+        echo 'Auto mode uses a complete local checkout, otherwise downloads glin/arc main.'
+        echo '--remote forces source download for development testing.'
+        echo 'Downloaded source copies matching hooks into durable Arc storage.'
+        echo '--marketplace-url explicitly selects an independently published catalog.'
         echo '--no-hooks preserves all Claude plugin and legacy hook settings.'
         exit 0 ;;
       --) CLIS+=("$@"); break ;;
@@ -134,9 +138,11 @@ main() {
     echo "error: installation needs Node.js 22.12+ (found $(node --version))." >&2
     exit 1
   fi
-  node -e 'try { const u=new URL(process.argv[1]); if(u.protocol!=="https:"||u.username||u.password) process.exit(1); } catch { process.exit(1); }' "$marketplace_url" || {
-    echo 'error: --marketplace-url requires an HTTPS catalog URL without credentials.' >&2; exit 1
-  }
+  if [ "$marketplace_override" -eq 1 ]; then
+    node -e 'try { const u=new URL(process.argv[1]); if(u.protocol!=="https:"||u.username||u.password) process.exit(1); } catch { process.exit(1); }' "$marketplace_url" || {
+      echo 'error: --marketplace-url requires an HTTPS catalog URL without credentials.' >&2; exit 1
+    }
+  fi
   if [ "$setup_hooks" -eq 1 ]; then
     command -v claude >/dev/null 2>&1 || command -v claude.exe >/dev/null 2>&1 || {
       echo 'error: Claude CLI was not found. Install Claude Code or pass --no-hooks for extension-only installation.' >&2; exit 1
@@ -207,9 +213,13 @@ EOF
     done
   fi
   hook_source="$marketplace_url"
-  if [ "$local_source" -eq 1 ] && [ "$marketplace_override" -eq 0 ]; then
-    hook_source="$REPO"
-    hook_source_type=directory
+  if [ "$marketplace_override" -eq 0 ]; then
+    if [ "$local_source" -eq 1 ]; then
+      hook_source="$REPO"
+      hook_source_type=directory
+    else
+      hook_source_type=bundled
+    fi
   fi
   if [ "$setup_hooks" -eq 1 ] && [ "$hook_source_type" = url ]; then
     version="$("$claude_cli" --version)"
@@ -248,7 +258,7 @@ EOF
     CLIS[$i]="$(resolve_editor_cli "${CLIS[$i]}")"
     command -v "${CLIS[$i]}" >/dev/null 2>&1 || { echo "error: editor CLI not found: ${CLIS[$i]}" >&2; exit 1; }
   done
-  if [ "$setup_hooks" -eq 1 ]; then
+  if [ "$setup_hooks" -eq 1 ] && [ "$hook_source_type" != bundled ]; then
     source "$REPO/scripts/install-claude-hooks.sh"
     check_claude_marketplace "$REPO" "$hook_source" "$hook_source_type" >/dev/null || exit 1
   fi
@@ -278,7 +288,13 @@ EOF
   done
   if [ "$installed" -eq 0 ]; then echo 'error: no editor installed Arc. Hooks were not changed.' >&2; exit 1; fi
   if [ "$setup_hooks" -eq 1 ]; then
-    if ! install_claude_hooks "$REPO" "$hook_source" "$hook_source_type"; then
+    if ! {
+      if [ "$hook_source_type" = bundled ]; then
+        (cd "$invocation_cwd" && node "$REPO/extension/dist/setup.cjs" --snapshots)
+      else
+        install_claude_hooks "$REPO" "$hook_source" "$hook_source_type"
+      fi
+    }; then
       echo 'error: Arc extension is installed, but Claude snapshot plugin setup failed. Resolve the error and rerun install.sh.' >&2
       failed=1
     elif [ "$local_source" -eq 1 ]; then

@@ -83,7 +83,7 @@ fs.writeFileSync(process.argv.at(-1), 'fixture VSIX');`,
     fs.writeFileSync(path.join(hostBin, name), `#!${absoluteBash}\nexit 97\n`, { mode: 0o755 });
   write(
     'node',
-    'case "$1" in */register-hooks.js) echo legacy-migration >> "$ARC_TEST_LOG" ;; esac\nexec "$ARC_TEST_REAL_NODE" "$@"',
+    'case "$1" in */dist/setup.cjs) echo source-snapshot-setup >> "$ARC_TEST_LOG" ;; */register-hooks.js) echo legacy-migration >> "$ARC_TEST_LOG" ;; esac\nexec "$ARC_TEST_REAL_NODE" "$@"',
   );
   write(
     'npm',
@@ -122,6 +122,60 @@ echo "editor ${name} $*" >> "$ARC_TEST_LOG"
     },
   );
   assert.equal(built.status, 0, built.stderr);
+  const dist = path.join(source, 'extension', 'dist');
+  fs.mkdirSync(dist);
+  fs.writeFileSync(path.join(dist, 'cli.cjs'), '');
+  fs.writeFileSync(path.join(dist, 'windowpipe.exe'), 'fixture helper');
+  fs.copyFileSync(path.join(__dirname, '..', 'LICENSE'), path.join(source, 'LICENSE'));
+  const setup = require('../extension/node_modules/esbuild').buildSync({
+    stdin: {
+      resolveDir: path.join(__dirname, '..', 'extension'),
+      contents: String.raw`import fs from 'node:fs';
+import path from 'node:path';
+import {spawnSync} from 'node:child_process';
+import {BundledTools, readToolPackage} from './src/bundledtools';
+import {ClaudePluginSetup, pluginTarget} from './src/claudeplugin';
+if (process.argv.slice(2).join(' ') !== '--snapshots') throw Error('Unexpected setup operation');
+const tools = new BundledTools(readToolPackage(__dirname), process.env.ARC_HOME);
+const target = pluginTarget(process.cwd(), process.env.CLAUDE_CONFIG_DIR,
+  {command:process.env.ARC_TEST_REAL_NODE,leadingArgs:[process.env.ARC_TEST_CLAUDE_FIXTURE],env:{},problem:null},'fixture');
+const run = async command => {
+  if(command.args.join(' ') === '--version' && command.command === process.env.ARC_TEST_REAL_NODE && command.args.length === 1) return {stdout:process.version,stderr:''};
+  const result = spawnSync(command.command,command.args,{cwd:command.cwd,env:command.env,input:'',encoding:'utf8'});
+  if(result.status !== 0) throw Error(result.stderr || 'Fixture Claude failed');
+  return result;
+};
+const read = file => {
+  const relative = path.relative(process.env.ARC_TEST_ROOT,file);
+  if(relative === '..' || relative.startsWith('..'+path.sep) || path.isAbsolute(relative)) return undefined;
+  try { return JSON.parse(fs.readFileSync(file,'utf8')); } catch(error) { if(error.code === 'ENOENT') return undefined; throw error; }
+};
+new ClaudePluginSetup(run,undefined,read,tools,()=>process.env.ARC_TEST_REAL_NODE)
+  .install(target,new AbortController().signal).then(console.log).catch(error=>{console.error(error.message);process.exitCode=1});`,
+    },
+    bundle: true,
+    platform: 'node',
+    format: 'cjs',
+    write: false,
+  }).outputFiles[0].contents;
+  fs.writeFileSync(path.join(dist, 'setup.cjs'), setup);
+  const payload = spawnSync(
+    process.execPath,
+    [
+      '--input-type=module',
+      '-e',
+      'import {bundledTools} from ' +
+        JSON.stringify(
+          require('node:url').pathToFileURL(path.join(__dirname, '..', 'extension', 'scripts', 'bundled-tools.mjs'))
+            .href,
+        ) +
+        '; import fs from "node:fs"; const identity=bundledTools(process.argv[1],process.argv[2],{}).identity; fs.writeFileSync(process.argv[1]+"/build-identity.json",JSON.stringify({tools:identity}));',
+      dist,
+      source,
+    ],
+    { encoding: 'utf8' },
+  );
+  assert.equal(payload.status, 0, payload.stderr);
   const zip = path.join(artifact, 'arc-hooks-0.1.0.zip');
   const tar = path.join(dir, 'source.tar.gz');
   const tarResult = spawnSync(
@@ -149,23 +203,27 @@ async function main() {
 const command = process.argv.slice(2).join(' ');
 fs.appendFileSync(process.env.ARC_TEST_LOG, 'claude ' + command + '\n');
 if (fs.readFileSync(0).length) throw new Error('Claude consumed installer input');
-if (command === '--version') { console.log(process.env.ARC_TEST_CLAUDE_VERSION || '2.1.224 (Claude Code)'); return; }
+if (command === '--version') { console.log(process.env.ARC_TEST_CLAUDE_VERSION || '2.1.268 (Claude Code)'); return; }
 if (command === process.env.ARC_TEST_FAIL_COMMAND) { console.error('Claude failed'); process.exit(1); }
 if (command === 'plugin marketplace list --json') process.stdout.write(fs.readFileSync(process.env.ARC_TEST_MARKETPLACES));
 else if (command === 'plugin list --json') process.stdout.write(process.env.ARC_TEST_PLUGIN_LIST ?? fs.readFileSync(process.env.ARC_TEST_PLUGINS));
 else if (command.startsWith('plugin marketplace add ')) {
+  if (process.env.ARC_TEST_NO_RELEASES && process.argv[5].startsWith('https:')) { console.error('Release catalog unavailable'); process.exit(1); }
   const location = process.argv[5];
   fs.writeFileSync(process.env.ARC_TEST_MARKETPLACES, JSON.stringify([{name:'arc',...(location.startsWith('https:') ? {source:'url',url:location} : {source:'directory',path:location})}]));
 }
-else if (command === 'plugin install arc-hooks@arc --scope user' || command === 'plugin enable arc-hooks@arc --scope user') {
+else if (command === 'plugin install arc-hooks@arc --scope user' || command === 'plugin enable arc-hooks@arc --scope user' || /^plugin (install|update) arc-hooks@arc --scope user --json$/.test(command)) {
   const plugins = JSON.parse(fs.readFileSync(process.env.ARC_TEST_PLUGINS));
   let plugin = plugins.find(p => p.id === 'arc-hooks@arc' && p.scope === 'user');
-  if (command.startsWith('plugin install')) {
+  if (command.startsWith('plugin install') || command.startsWith('plugin update')) {
     const marketplace = JSON.parse(fs.readFileSync(process.env.ARC_TEST_MARKETPLACES)).find(entry=>entry.name==='arc');
     const source = typeof marketplace.source === 'object' ? marketplace.source : marketplace;
     if (source.source === 'directory') {
-      const readFromFolder = path.join(source.path, 'plugins', 'arc-hooks');
+      const root = process.platform === 'win32' ? source.path.replace(/^\/([a-z])\//i, '$1:/') : source.path;
+      const catalog = JSON.parse(fs.readFileSync(path.join(root, '.claude-plugin', 'marketplace.json')));
+      const readFromFolder = path.resolve(root, catalog.plugins[0].source);
       if (!plugin) plugins.push({id:'arc-hooks@arc',scope:'user',enabled:true,version:'0.1.0',errors:[],readFromFolder});
+      else plugin.readFromFolder=readFromFolder;
     } else {
     fs.mkdirSync(process.env.ARC_TEST_MANAGED, {recursive:true});
     const zip = await new Promise((resolve,reject)=>yauzl.open(process.env.ARC_TEST_PLUGIN_ZIP,{lazyEntries:true},(err,zip)=>err?reject(err):resolve(zip)));
@@ -188,6 +246,7 @@ else if (command === 'plugin install arc-hooks@arc --scope user' || command === 
     }
   } else { plugin.enabled = process.env.ARC_TEST_STILL_DISABLED !== '1'; }
   fs.writeFileSync(process.env.ARC_TEST_PLUGINS, JSON.stringify(plugins));
+  if (command.endsWith('--json')) console.log(JSON.stringify({command:process.argv[3],outcome:'ok',scope:'user',pluginId:'arc-hooks@arc'}));
 }
 }
 main().catch(error=>{console.error(error);process.exitCode=1;});`,
@@ -301,6 +360,8 @@ else fs.copyFileSync(process.env.ARC_TEST_SOURCE_ARCHIVE,output);
           VSCODE_GIT_ASKPASS_MAIN: '',
           VSCODE_GIT_ASKPASS_NODE: '',
           ARC_TEST_REAL_NODE: process.execPath,
+          ARC_TEST_ROOT: dir,
+          ARC_HOME: path.join(dir, 'arc home'),
           ARC_TEST_LOG: log,
           ARC_TEST_MARKETPLACES: marketplaces,
           ARC_TEST_PLUGINS: plugins,
@@ -478,12 +539,14 @@ test('--no-hooks preserves plugin and both legacy settings without requiring Cla
   const f = installerFixture();
   try {
     fs.unlinkSync(path.join(f.bin, 'claude'));
-    const r = f.run(['--no-hooks', 'code']);
-    assert.equal(r.status, 0, r.stderr);
-    assert.doesNotMatch(r.commands, /claude/);
-    assert.equal(fs.readFileSync(f.settings, 'utf8'), f.legacy);
-    assert.equal(fs.readFileSync(path.join(f.dir, 'codex home', 'hooks.json'), 'utf8'), f.legacy);
-    assert.equal(fs.readFileSync(f.plugins, 'utf8'), '[]');
+    for (const mode of [[], ['--remote']]) {
+      const r = f.run(['--no-hooks', ...mode, 'code']);
+      assert.equal(r.status, 0, r.stderr);
+      assert.doesNotMatch(r.commands, /claude/);
+      assert.equal(fs.readFileSync(f.settings, 'utf8'), f.legacy);
+      assert.equal(fs.readFileSync(path.join(f.dir, 'codex home', 'hooks.json'), 'utf8'), f.legacy);
+      assert.equal(fs.readFileSync(f.plugins, 'utf8'), '[]');
+    }
   } finally {
     f.cleanup();
   }
@@ -605,6 +668,7 @@ test('stdin installation selects local source without Git and children cannot co
     assert.equal(missing.status, 1);
     assert.match(missing.stderr, /--local requires/);
     fs.writeFileSync(f.marketplaces, '[]');
+    fs.writeFileSync(f.plugins, '[]');
     const detected = f.run([], {}, { stdin: true });
     assert.equal(detected.status, 0, detected.stderr);
     assert.match(detected.stderr, /1\) All detected editors \(code, cursor\)/);
@@ -612,6 +676,7 @@ test('stdin installation selects local source without Git and children cannot co
     assert.match(detected.commands, /editor cursor --install-extension/);
     assert.match(detected.stdout, /ARC_INSTALL_SCRIPT_TAIL/);
     fs.writeFileSync(f.marketplaces, '[]');
+    fs.writeFileSync(f.plugins, '[]');
     fs.unlinkSync(path.join(f.bin, 'cursor'));
     const sole = f.run(['--local'], {}, { stdin: true, cwd: f.source });
     assert.equal(sole.status, 0, sole.stderr);
@@ -921,7 +986,7 @@ for (const mode of ['local', 'remote'])
     try {
       const r = f.run(
         mode === 'remote'
-          ? ['--remote', '--repo', 'fixture/arc', '--ref', 'feature/test', 'code']
+          ? ['--remote', '--repo', 'fixture/arc', '--ref', 'feature/test', '--marketplace-url', catalogUrl, 'code']
           : ['--local', '--marketplace-url', catalogUrl, 'code'],
         {},
         { stdin: true, cwd: f.source },
@@ -948,6 +1013,83 @@ for (const mode of ['local', 'remote'])
       assert.doesNotMatch(r.stdout, /Plugin directory/);
       fs.rmSync(f.source, { recursive: true });
       exerciseManagedHooks(f);
+    } finally {
+      f.cleanup();
+    }
+  });
+
+test('source-main hooks survive downloaded source cleanup without GitHub Releases', () => {
+  const f = installerFixture();
+  try {
+    for (const args of [['code'], ['--remote', 'code']]) {
+      const r = f.run(
+        args,
+        { ARC_TEST_NO_RELEASES: '1' },
+        { stdin: true, cwd: args.includes('--remote') ? f.source : f.dir },
+      );
+      assert.equal(r.status, 0, r.stderr);
+      assert.match(r.commands, /api.github.com\/repos\/glin\/arc\/commits\/main/);
+      assert.match(r.commands, /codeload.github.com\/glin\/arc\/tar.gz\/a{40}/);
+      assert.match(r.commands, /source-snapshot-setup/);
+      assert.doesNotMatch(r.commands, /releases\/|legacy-migration/);
+      assert.deepEqual(fs.readdirSync(f.temporary), []);
+      assert.equal(fs.readFileSync(f.settings, 'utf8'), f.legacy);
+    }
+    const [marketplace] = JSON.parse(fs.readFileSync(f.marketplaces));
+    assert.equal(marketplace.source, 'directory');
+    assert.equal(
+      path
+        .relative(fs.realpathSync(path.join(f.dir, 'arc home')), fs.realpathSync(marketplace.path))
+        .split(path.sep)[0],
+      'tools',
+    );
+    const [plugin] = JSON.parse(fs.readFileSync(f.plugins));
+    assert.match(plugin.readFromFolder, /releases[\\/][a-f0-9]{64}[\\/]plugin$/);
+    fs.rmSync(f.source, { recursive: true });
+    exerciseManagedHooks({ ...f, managed: plugin.readFromFolder });
+  } finally {
+    f.cleanup();
+  }
+});
+
+for (const conflict of ['disabled settings', 'project', 'local'])
+  test(`source-main hooks preserve caller ${conflict} without plugin mutation`, () => {
+    const f = installerFixture();
+    try {
+      const caller = path.join(f.dir, 'caller project');
+      const settings = path.join(caller, '.claude', 'settings.local.json');
+      fs.mkdirSync(path.dirname(settings), { recursive: true });
+      fs.writeFileSync(
+        settings,
+        JSON.stringify({ enabledPlugins: { 'arc-hooks@arc': conflict !== 'disabled settings' } }),
+      );
+      if (conflict !== 'disabled settings')
+        fs.writeFileSync(
+          f.plugins,
+          JSON.stringify([
+            {
+              id: 'arc-hooks@arc',
+              scope: conflict,
+              projectPath: caller,
+              enabled: true,
+              version: '0.1.0',
+              readFromFolder: path.join(f.source, 'plugins', 'arc-hooks'),
+            },
+          ]),
+        );
+      const preserved = [settings, f.settings, f.plugins, f.marketplaces].map((file) => fs.readFileSync(file));
+      const r = f.run(['code'], { ARC_TEST_NO_RELEASES: '1' }, { stdin: true, cwd: caller });
+      assert.equal(r.status, 1, r.stderr);
+      assert.match(r.commands, /editor code --install-extension[\s\S]*source-snapshot-setup/);
+      assert.match(r.stderr, /Arc extension is installed, but Claude snapshot plugin setup failed/);
+      assert.match(
+        r.stderr,
+        conflict === 'disabled settings' ? /snapshot plugin is disabled/ : /belongs to another installation or scope/,
+      );
+      assert.doesNotMatch(r.commands, /plugin (?:marketplace (?:add|update|remove)|install|update|enable)/);
+      for (const [index, file] of [settings, f.settings, f.plugins, f.marketplaces].entries())
+        assert.deepEqual(fs.readFileSync(file), preserved[index]);
+      assert.deepEqual(fs.readdirSync(f.temporary), []);
     } finally {
       f.cleanup();
     }
@@ -998,8 +1140,8 @@ test('source installer rejects invalid options, missing tools, and old Claude be
     assert.match(old.stderr, /require Claude Code 2.1.224/);
     const oldRemote = f.run(['--remote', 'code'], { ARC_TEST_CLAUDE_VERSION: '2.1.223' });
     assert.equal(oldRemote.status, 1);
-    assert.match(oldRemote.stderr, /require Claude Code 2.1.224/);
-    assert.doesNotMatch(oldRemote.commands, /curl|npm|editor/);
+    assert.match(oldRemote.stderr, /needs Claude Code 2.1.268/);
+    assert.match(oldRemote.commands, /curl[\s\S]*npm[\s\S]*editor/);
     const local = f.run(['code'], { ARC_TEST_CLAUDE_VERSION: '2.1.223' });
     assert.equal(local.status, 0, local.stderr);
     for (const tool of ['node', 'npm']) {
