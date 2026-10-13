@@ -1138,6 +1138,7 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
     const message = parsed.type === 'render' || parsed.type === 'rail' ? rowDeltas.expand(parsed) : parsed;
     if (!message) return;
     dispatchHostToPanel(message, {
+      readerReadAdmission: (msg) => readState.admit(msg.id, msg.admitted),
       readState: (msg) => {
         if (readState.synchronize(msg.state)) {
           repaint();
@@ -1476,5 +1477,12 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
   // Draw the empty rail shell before the first host payload arrives.
   railRenderer.update([], [], [], undefined, {});
 
-  return { readerPageId: readState.pageId, receiveHostMessage, dispose: visibility.dispose };
+  return {
+    readerPageId: readState.pageId,
+    receiveHostMessage,
+    dispose() {
+      readState.dispose();
+      visibility.dispose();
+    },
+  };
 }

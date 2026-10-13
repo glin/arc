@@ -2179,10 +2179,14 @@ export class PanelProvider implements vscode.Disposable {
     const sequence = Number(suffix);
     if (!operation.id.startsWith(prefix) || !/^[1-9][0-9]*$/.test(suffix) || !Number.isSafeInteger(sequence))
       return Promise.resolve();
-    if (sequence <= page.sequence) return Promise.resolve();
+    const reply = async (admitted: boolean) => {
+      await this.sendToHost(host, { type: 'readerReadAdmission', id: operation.id, admitted });
+    };
+    if (sequence <= page.sequence) return reply(true);
     // The page posts in sequence order. A gap refuses without consuming either event.
-    if (sequence !== page.sequence + 1) return Promise.resolve();
-    return this.readOwner()
+    if (sequence !== page.sequence + 1) return reply(false);
+    let admitted = false;
+    const result = this.readOwner()
       .readerEvent(
         operation,
         this.readFacts(),
@@ -2201,9 +2205,12 @@ export class PanelProvider implements vscode.Disposable {
         undefined,
         () => {
           page.sequence = sequence;
+          admitted = true;
         },
       )
       .then(() => undefined);
+    void reply(admitted).catch(() => {});
+    return result;
   }
   private hostPinnedFoldRevision = 0;
   private preferenceResetRevision = 0;

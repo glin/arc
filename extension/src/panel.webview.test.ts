@@ -2009,6 +2009,7 @@ vi.stubGlobal('PANEL_DEV_SERVER_URL', null);
 let PanelProvider: typeof import('./panelhost.ts').PanelProvider;
 import { SessionReadObservations } from './sessionwrites.ts';
 import { AgentReadSources } from './sessionreads.ts';
+import { createReadState } from './webview/read-state.ts';
 beforeAll(async () => {
   ({ PanelProvider } = await import('./panelhost.ts'));
 });
@@ -2038,7 +2039,7 @@ function orderedHostReadFixture() {
       },
     },
     sendToHost: async (_host: unknown, message: unknown) => {
-      publications.push(message);
+      if ((message as { type: string }).type !== 'readerReadAdmission') publications.push(message);
       return true;
     },
     postRail() {},
@@ -2278,6 +2279,76 @@ test('ordinary pending overflow leaves its event unconsumed and freezes admitted
   assert.equal(f.provider.readerPages.get(f.host).sequence, 257);
   assert.deepEqual(f.provider.saved.read, []);
   assert.equal(f.provider.saved.readRevision, 257);
+});
+
+test('ordinary browser delivery recovers pending overflow and lost replies without skipping unread', async () => {
+  vi.useFakeTimers();
+  const f = orderedHostReadFixture();
+  const turn = f.provider.cards[0];
+  const delivered: any[] = [];
+  const jobs: Promise<void>[] = [];
+  let loseReply = false;
+  const browser = createReadState({
+    pageId: f.pageId,
+    initial: {},
+    open: new Set(),
+    cards: () => [turn],
+    newestTurnAt: () => 10,
+    save() {},
+    refreshSelection() {},
+    operate(operation) {
+      delivered.push(operation);
+      jobs.push(f.provider.readerRead(operation, f.host).catch(() => {}));
+    },
+  });
+  f.provider.sendToHost = async (_host: unknown, message: any) => {
+    if (message.type === 'readerReadAdmission') {
+      if (!loseReply) browser.admit(message.id, message.admitted);
+      loseReply = false;
+    } else f.publications.push(message);
+    return true;
+  };
+  try {
+    await f.provider.readOwner().read(
+      { id: 'initial', observedRevision: 0, action: 'turn', target: turn, read: true },
+      () => null,
+      () => true,
+    );
+    browser.synchronize(f.provider.readSynchronization());
+    let release!: () => void;
+    const suspended = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const blockers = Array.from({ length: 256 }, () => f.provider.readOwner().operations.serialize(() => suspended));
+    browser.set(turn.key, false);
+    browser.set(turn.key, true);
+    assert.equal(delivered.length, 1);
+    assert.equal(f.provider.readerPages.get(f.host).sequence, 0);
+    release();
+    await Promise.all(blockers);
+    loseReply = true;
+    await vi.advanceTimersByTimeAsync(500);
+    assert.equal(f.provider.readerPages.get(f.host).sequence, 1);
+    assert.deepEqual(f.provider.saved.read, []);
+    await vi.advanceTimersByTimeAsync(500);
+    await Promise.all(jobs);
+    assert.deepEqual(f.provider.saved.read, ['worker:10']);
+    assert.equal(f.provider.saved.readRevision, 3);
+    assert.deepEqual(
+      delivered.map((event) => event.id),
+      [`${f.pageId}:1`, `${f.pageId}:1`, `${f.pageId}:1`, `${f.pageId}:2`],
+    );
+    assert.deepEqual(
+      f.writes.slice(-2).map((state) => state.read),
+      [[], ['worker:10']],
+    );
+    browser.dispose();
+    await vi.advanceTimersByTimeAsync(5000);
+    assert.equal(delivered.length, 4);
+  } finally {
+    browser.dispose();
+    vi.useRealTimers();
+  }
 });
 
 test('production aggregate read projections validate each shared source once', () => {

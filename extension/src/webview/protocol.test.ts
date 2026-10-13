@@ -215,6 +215,10 @@ const CONTEXT_DETAIL = unavailableContext({
 // Valid host messages and their parsed results cover every variant through the typed handler count.
 const HOST: Array<{ raw: unknown; parsed: HostToPanel }> = [
   {
+    raw: { type: 'readerReadAdmission', id: 'page:1', admitted: true },
+    parsed: { type: 'readerReadAdmission', id: 'page:1', admitted: true },
+  },
+  {
     raw: { type: 'applySessionFilter', request: 'one', query: '', deadline: 1000 },
     parsed: { type: 'applySessionFilter', request: 'one', query: '', deadline: 1000 },
   },
@@ -646,6 +650,7 @@ function hostRecorder(seen: string[]): HostToPanelHandlers {
   };
   return {
     readState: take('readState'),
+    readerReadAdmission: take('readerReadAdmission'),
     applySessionFilter: take('applySessionFilter'),
     visibility: take('visibility'),
     health: take('health'),

@@ -46,7 +46,10 @@ test('automatic card marks wait for acceptance and stop after subscriber repaint
     newestTurnAt: () => 10,
     save() {},
     refreshSelection() {},
-    operate: (operation) => operations.push(operation),
+    operate: (operation) => {
+      operations.push(operation);
+      state.admit(operation.id, true);
+    },
   });
   state.synchronize({ revision: 0, read: [], readTo: {}, since: 0, agentRead: [] });
   state.subscribe(() => {
@@ -69,6 +72,7 @@ test('automatic card marks wait for acceptance and stop after subscriber repaint
   const submitted = operations.length;
   assert.equal(state.mark(turn.key), false);
   assert.equal(operations.length, submitted);
+  state.dispose();
 });
 
 test('session unread closes and saves disclosure before synchronized cards repaint', () => {
@@ -82,9 +86,10 @@ test('session unread closes and saves disclosure before synchronized cards repai
     newestTurnAt: () => 20,
     save: () => events.push('save'),
     refreshSelection: () => events.push('selection'),
-    operate: () => {
+    operate: (operation) => {
       assert.deepEqual([...open], ['other:10']);
       events.push('operation');
+      state.admit(operation.id, true);
     },
   });
   state.synchronize({ revision: 1, read: [], readTo: { s: 20 }, since: 0, agentRead: [] });
@@ -97,6 +102,7 @@ test('session unread closes and saves disclosure before synchronized cards repai
   assert.equal(state.isRead(turns[0]), false);
   assert.equal(state.isRead(turns[1]), false);
   assert.equal(events.length, 3);
+  state.dispose();
 });
 
 test('opening an agent acknowledged turn still establishes the reader mark', () => {
@@ -109,7 +115,10 @@ test('opening an agent acknowledged turn still establishes the reader mark', () 
     newestTurnAt: () => 10,
     save() {},
     refreshSelection() {},
-    operate: (operation) => operations.push(operation),
+    operate: (operation) => {
+      operations.push(operation);
+      state.admit(operation.id, true);
+    },
   });
   state.synchronize({ revision: 1, read: [], readTo: {}, since: 0, agentRead: [[turn.key, turn.promptId]] });
   assert.equal(state.isRead(turn), true);
@@ -117,6 +126,33 @@ test('opening an agent acknowledged turn still establishes the reader mark', () 
   state.synchronize({ revision: 2, read: [turn.key], readTo: {}, since: 0, agentRead: [[turn.key, turn.promptId]] });
   assert.equal(state.mark(turn.key), false);
   assert.equal(operations.length, 1);
+  state.dispose();
+});
+
+test('ordinary browser delivery bounds queued payloads and preserves the next sequence after overflow', () => {
+  const cards = Array.from({ length: 257 }, (_, index) => card(`s:${index + 1}`, 's', index + 1));
+  const sent: any[] = [];
+  const owner = createReadState({
+    initial: {},
+    open: new Set(),
+    cards: () => cards,
+    newestTurnAt: () => 257,
+    save() {},
+    refreshSelection() {},
+    operate: (event) => sent.push(event),
+  });
+  try {
+    owner.synchronize({ revision: 0, read: [], readTo: {}, since: 0, agentRead: [] });
+    for (const card of cards.slice(0, 256)) assert.equal(owner.mark(card.key), true);
+    assert.equal(owner.mark(cards[256].key), false);
+    assert.equal(sent.length, 1);
+    for (let index = 0; index < 256; index++) owner.admit(sent[index].id, true);
+    assert.equal(sent.length, 256);
+    assert.equal(owner.mark(cards[256].key), true);
+    assert.equal(sent[256].id, `${owner.pageId}:257`);
+  } finally {
+    owner.dispose();
+  }
 });
 
 test('equal accepted revisions update source projection without changing reader state', () => {

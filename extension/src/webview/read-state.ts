@@ -1,5 +1,7 @@
 import { canMarkRead, isTurnRead, READ_LIMIT, type ReadableTurn, type ReaderReadEvent } from '../domain/read.ts';
 
+const READER_PENDING_LIMIT = 256;
+
 export interface ReadCard extends ReadableTurn {
   kind: string;
   live?: boolean;
@@ -26,6 +28,8 @@ export interface ReadStateOptions {
 
 export interface ReadStateOwner {
   readonly pageId: string;
+  admit(id: string, admitted: boolean): void;
+  dispose(): void;
   synchronize(state: {
     revision: number;
     read: readonly string[];
@@ -70,6 +74,14 @@ export function createReadState(options: ReadStateOptions): ReadStateOwner {
       byte.toString(16).padStart(2, '0'),
     ).join('');
   let sequence = 0;
+  const events: ReaderReadEvent[] = [];
+  let retry: ReturnType<typeof setTimeout> | undefined;
+  let disposed = false;
+  const send = () => {
+    if (disposed || !events.length) return;
+    retry = setTimeout(send, 500);
+    options.operate?.(structuredClone(events[0]));
+  };
   const pendingMarks = new Map<string, ReadCard>();
   const pendingUnread = new Map<string, ReadCard>();
   const pendingUnreadSessions = new Set<string>();
@@ -81,7 +93,9 @@ export function createReadState(options: ReadStateOptions): ReadStateOwner {
       | Omit<Extract<ReaderReadEvent, { action: 'session' }>, 'id' | 'observedRevision'>,
   ) => {
     if (!options.operate || revision < 0) return false;
-    options.operate({ ...action, id: `${tab}:${++sequence}`, observedRevision: Math.max(0, revision) });
+    if (events.length >= READER_PENDING_LIMIT || disposed) return true;
+    events.push(structuredClone({ ...action, id: `${tab}:${++sequence}`, observedRevision: Math.max(0, revision) }));
+    if (events.length === 1) send();
     return true;
   };
 
@@ -109,6 +123,7 @@ export function createReadState(options: ReadStateOptions): ReadStateOwner {
   };
 
   const mark = (key: string, explicit = false): boolean => {
+    if (options.operate && revision >= 0 && (events.length >= READER_PENDING_LIMIT || disposed)) return false;
     const card = options.cards().find((one) => one.key === key);
     if (card && options.operate && revision >= 0) {
       const id = identity(card);
@@ -140,6 +155,7 @@ export function createReadState(options: ReadStateOptions): ReadStateOwner {
   };
 
   const unmark = (card: ReadCard) => {
+    if (options.operate && revision >= 0 && (events.length >= READER_PENDING_LIMIT || disposed)) return;
     if (options.operate && revision >= 0) {
       pendingMarks.delete(identity(card));
       pendingUnread.set(identity(card), card);
@@ -166,6 +182,19 @@ export function createReadState(options: ReadStateOptions): ReadStateOwner {
 
   const owner: ReadStateOwner = {
     pageId: tab,
+    admit(id, admitted) {
+      if (!admitted || events[0]?.id !== id || disposed) return;
+      clearTimeout(retry);
+      retry = undefined;
+      events.shift();
+      if (events.length) send();
+    },
+    dispose() {
+      disposed = true;
+      clearTimeout(retry);
+      retry = undefined;
+      events.length = 0;
+    },
     synchronize(state) {
       if (!Number.isSafeInteger(state.revision) || state.revision < 0 || state.revision < revision) return false;
       if (
@@ -256,6 +285,7 @@ export function createReadState(options: ReadStateOptions): ReadStateOwner {
       owner.toggle(card);
     },
     setSession(sessionId, value) {
+      if (options.operate && revision >= 0 && (events.length >= READER_PENDING_LIMIT || disposed)) return;
       const cards = options.cards().filter((card) => card.kind === 'turn' && card.sessionId === sessionId);
       const newest = options.newestTurnAt(sessionId);
       const target = cards.at(0);

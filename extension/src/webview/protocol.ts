@@ -278,6 +278,7 @@ export interface PanelSessionAdoption {
 }
 
 export type HostToPanel =
+  | { type: 'readerReadAdmission'; id: string; admitted: boolean }
   | { type: 'readState'; state: ReadSynchronization }
   | { type: 'applySessionFilter'; request: string; query: string; deadline: number }
   | { type: 'health'; sequence: number }
@@ -350,6 +351,7 @@ export type HostToPanel =
   | RenderMessage;
 
 const HOST_TO_PANEL_KINDS: Record<HostToPanel['type'], true> = {
+  readerReadAdmission: true,
   readState: true,
   applySessionFilter: true,
   health: true,
@@ -953,6 +955,10 @@ export function parseHostToPanel(raw: unknown): HostToPanel | null {
       return isString(m.key) && m.key.length > 0 && typeof m.copyLabels === 'boolean'
         ? { type: 'sendSelectedText', key: m.key, copyLabels: m.copyLabels }
         : null;
+    case 'readerReadAdmission':
+      return isString(m.id) && m.id.length <= 128 && typeof m.admitted === 'boolean'
+        ? { type: 'readerReadAdmission', id: m.id, admitted: m.admitted }
+        : null;
     case 'readState': {
       const state = parseReadSynchronization(m.state);
       return state ? { type: 'readState', state } : null;
@@ -1387,6 +1393,8 @@ export type PanelToHostHandlers<R> = Handlers<PanelToHost, R>;
 // The default branch assigns to never, so unhandled variants fail the typecheck.
 export function dispatchHostToPanel(message: HostToPanel, handlers: HostToPanelHandlers): void {
   switch (message.type) {
+    case 'readerReadAdmission':
+      return handlers.readerReadAdmission(message);
     case 'readState':
       return handlers.readState(message);
     case 'applySessionFilter':
