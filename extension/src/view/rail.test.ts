@@ -1501,7 +1501,7 @@ test('a card under a shut heading is left out of the rows a draw records', () =>
 });
 
 test('status grouping keeps partial zero attention outside the read group', () => {
-  const card = { id: 'partial', label: 'Partial', agent: 'Codex', at: 1_000_000, unread: null };
+  const card = testCard('partial', { unread: null });
   const { sections } = railSections([card], 1_000_000, [], 'latest', RAIL_SHOWN_BUCKETS, { groupBy: 'status' });
   assert.equal(sections.find((section) => section.cards.includes(card))?.label, 'Unread');
 });
