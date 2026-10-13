@@ -106,7 +106,7 @@ const CODEX_COMMANDS: readonly PromptEntry[] = [
   { kind: 'command', name: 'rename', description: 'Rename the session', argumentHint: '<name>' },
 ];
 
-// The server answered a request with an error, so the request had no effect.
+// A server error alone does not establish whether the request took effect.
 class RequestRefused extends Error {}
 
 // The server did not answer a request before the deadline. The request can still have
