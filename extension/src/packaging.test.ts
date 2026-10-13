@@ -689,6 +689,99 @@ test('bare arc launchers preserve arguments, stdin, exit status, and window targ
   }
 });
 
+test.skipIf(process.platform !== 'win32')(
+  'long private Windows launchers preserve terminal commands and matching path arguments',
+  async () => {
+    const root = tempDir('arc-long-terminal-');
+    const software = path.join(root, 'long software '.repeat(8).trim(), 'long software '.repeat(8).trim());
+    const tools = new BundledTools(readToolPackage(path.join(extensionRoot, 'dist')), software);
+    const installed = tools.stage();
+    const bin = path.join(installed, 'launchers');
+    const launcher = path.join(bin, 'arc.cmd');
+    assert.ok(launcher.length > 260);
+    const editor = path.join(root, 'editor with spaces', 'Code.exe');
+    fs.mkdirSync(path.dirname(editor));
+    fs.copyFileSync(process.execPath, editor);
+    const values = new Map<string, string>();
+    const owner = new TerminalTools(
+      {
+        persistent: true,
+        description: undefined,
+        clear: () => values.clear(),
+        append: (key, value) => values.set(key, value),
+        replace: (key, value) => values.set(key, value),
+      },
+      () => ({ root: software, identity: 'fixture' }),
+      async () => bin,
+      editor,
+    );
+    try {
+      await owner.refresh();
+      const commands = owner.current('this-window');
+      const delivered = fs.statSync(commands.directory, { bigint: true });
+      const admitted = fs.statSync(bin, { bigint: true });
+      assert.equal(delivered.dev, admitted.dev);
+      assert.equal(delivered.ino, admitted.ino);
+      const env = childEnv(process.env, { ARC_HOME: path.join(root, 'empty home') }, undefined, undefined, commands);
+      const terminalEnv = { ...env };
+      delete terminalEnv.ARC_WINDOW;
+      const powershell = path.join(
+        process.env.SystemRoot ?? 'C:/Windows',
+        'System32/WindowsPowerShell/v1.0/powershell.exe',
+      );
+      const run = (command: string, input?: string) =>
+        spawnSync(powershell, ['-NoProfile', '-EncodedCommand', Buffer.from(command, 'utf16le').toString('base64')], {
+          cwd: root,
+          env: terminalEnv,
+          input,
+          encoding: 'utf8',
+          timeout: 15_000,
+        });
+      const status = run('arc statusline --json', '{}');
+      assert.equal(status.status, 0, status.stderr);
+      assert.equal(JSON.parse(status.stdout).schemaVersion, 1);
+      const invalid = run('arc statusline --json', '{invalid');
+      assert.equal(invalid.status, 1, invalid.stderr);
+      assert.match(invalid.stderr, /Claude status input is not valid JSON/);
+      const help = run('arc help');
+      assert.equal(help.status, 0, help.stderr);
+      assert.match(help.stdout, /statusline/);
+      for (const first of [
+        launcher,
+        commands.directory + '\\arc.cmd',
+        'argument with spaces',
+        '--arc-launcher-arguments',
+      ]) {
+        const escaped = first.replaceAll("'", "''");
+        for (const command of [`arc '${escaped}'`, `& $env:ComSpec /d /c arc '"${first}"'`]) {
+          const result = run(command);
+          assert.equal(result.status, 1, result.stderr);
+          assert.ok(result.stderr.includes(`Unknown command: ${first}`), result.stderr);
+        }
+        const standalone = spawnSync(process.execPath, [path.join(extensionRoot, 'dist/cli.cjs'), first], {
+          cwd: root,
+          env,
+          encoding: 'utf8',
+          timeout: 15_000,
+        });
+        assert.equal(standalone.status, 1, standalone.stderr);
+        assert.ok(standalone.stderr.includes(`Unknown command: ${first}`), standalone.stderr);
+      }
+      const child = spawnSync(process.env.ComSpec ?? 'cmd.exe', ['/d', '/c', 'arc windows --json'], {
+        cwd: root,
+        env,
+        encoding: 'utf8',
+        timeout: 15_000,
+      });
+      assert.equal(child.status, 0, child.stderr);
+      assert.deepEqual(JSON.parse(child.stdout), { version: 1, windows: [], complete: true });
+      assert.equal(values.get('Path'), ';' + commands.directory);
+    } finally {
+      owner.dispose();
+    }
+  },
+);
+
 test('the package command leaves out its single-bundle size notice', () => {
   const outputDir = tempDir('arc-package-');
   const output = path.join(outputDir, 'arc.vsix');

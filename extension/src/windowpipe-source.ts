@@ -193,7 +193,16 @@ class ArcPipe {
     while((ch = Console.In.Read()) >= 0) { if(ch == 10) return text.ToString(); if(text.Length >= 100000) throw new IOException("Input too large"); text.Append((char)ch); }
     return null;
   }
-  static void Main() {
+  [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern uint GetShortPathName(string input, StringBuilder output, uint size);
+  static void Main(string[] args) {
+    if(args.Length == 2 && args[0] == "--short-path") {
+      var output = new StringBuilder(32768);
+      string input = args[1].StartsWith("\\\\?\\") ? args[1] : args[1].StartsWith("\\\\") ? "\\\\?\\UNC\\" + args[1].Substring(2) : "\\\\?\\" + args[1];
+      uint length = GetShortPathName(input, output, (uint)output.Capacity);
+      if(length == 0 || length >= output.Capacity) Environment.Exit(1);
+      string spelling = output.ToString();
+      Console.WriteLine(spelling.StartsWith("\\\\?\\UNC\\") ? "\\\\" + spelling.Substring(8) : spelling.Substring(4)); return;
+    }
     ThreadPool.SetMinThreads(32, 32);
     try { string line;
       while((line = Line()) != null) {

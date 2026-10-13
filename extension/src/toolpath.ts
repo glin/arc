@@ -1,5 +1,45 @@
 import { ARC_IDENTITY } from './identity';
 import type { ArcCliEnvironment } from './agenthost';
+import { execFile } from 'node:child_process';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+
+export async function terminalCommandDirectory(
+  directory: string,
+  signal: AbortSignal,
+  platform = process.platform,
+): Promise<string> {
+  if (platform !== 'win32' || path.join(directory, 'arc.cmd').length < 260) return directory;
+  const before = fs.statSync(directory, { bigint: true });
+  const canonical = fs.realpathSync(directory);
+  const packagedBridge = path.join(__dirname, 'windowpipe.exe');
+  const bridge = fs.existsSync(packagedBridge) ? packagedBridge : path.join(__dirname, '../dist/windowpipe.exe');
+  const spelling = await new Promise<string>((resolve, reject) => {
+    execFile(
+      bridge,
+      ['--short-path', directory],
+      { encoding: 'utf8', signal, timeout: 10_000, maxBuffer: 65_536, windowsHide: true },
+      (error, stdout) => (error ? reject(error) : resolve(stdout.trim())),
+    );
+  });
+  const after = fs.statSync(directory, { bigint: true });
+  const delivered = fs.statSync(spelling, { bigint: true });
+  if (
+    !spelling ||
+    path.join(spelling, 'arc.cmd').length >= 260 ||
+    !terminalToolPath(spelling, platform) ||
+    !before.isDirectory() ||
+    before.ino === 0n ||
+    before.ino !== after.ino ||
+    before.dev !== after.dev ||
+    before.ino !== delivered.ino ||
+    before.dev !== delivered.dev ||
+    canonical.toLowerCase() !== fs.realpathSync(directory).toLowerCase()
+  ) {
+    throw new Error('Arc cannot run its commands from this installation folder.');
+  }
+  return spelling;
+}
 
 export function terminalToolPath(
   bin: string,
@@ -25,7 +65,7 @@ export interface ToolAdmission {
 export class TerminalTools {
   private generation = 0;
   private controller: AbortController | undefined;
-  private selected: { admission: string; directory: string } | undefined;
+  private selected: { admission: string; directory: string; commandDirectory: string } | undefined;
   private disposed = false;
   private pending: Promise<string> | undefined;
   private preparation: { admission: string; status: 'preparing' | 'failed'; error?: string } | undefined;
@@ -64,7 +104,9 @@ export class TerminalTools {
       this.pending = this.prepare(admission, controller.signal);
       const directory = await this.pending;
       if (this.disposed || generation !== this.generation || identity !== JSON.stringify(this.admission())) return;
-      const entry = terminalToolPath(directory, this.platform);
+      const commandDirectory = await terminalCommandDirectory(directory, controller.signal, this.platform);
+      if (this.disposed || generation !== this.generation || identity !== JSON.stringify(this.admission())) return;
+      const entry = terminalToolPath(commandDirectory, this.platform);
       if (!entry) throw new Error('Arc cannot add this installation folder to the terminal PATH.');
       this.collection.description = 'Arc terminal commands';
       this.collection.append(entry.variable, entry.value);
@@ -72,7 +114,7 @@ export class TerminalTools {
         `${ARC_IDENTITY.environmentPrefix}EDITOR_EXECUTABLE`,
         this.platform === 'win32' ? this.editorExecutable.replaceAll('\\', '/') : this.editorExecutable,
       );
-      this.selected = { admission: identity, directory };
+      this.selected = { admission: identity, directory, commandDirectory };
       this.preparation = undefined;
     } catch (error) {
       if (generation === this.generation) {
@@ -92,7 +134,7 @@ export class TerminalTools {
       admission = this.disposed ? null : this.admission();
       if (admission && this.selected && this.selected.admission === JSON.stringify(admission))
         return {
-          directory: this.selected.directory,
+          directory: this.selected.commandDirectory,
           editorExecutable: this.editorExecutable,
           windowId,
           platform: this.platform,
