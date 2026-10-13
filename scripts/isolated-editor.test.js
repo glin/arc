@@ -17,7 +17,7 @@ afterAll(() => {
 });
 
 function scratch() {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'arc isolated editor test '));
+  const root = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'arc isolated editor test '));
   roots.push(root);
   return root;
 }
@@ -210,7 +210,7 @@ describe('isolated editor environment', () => {
     assert.equal(seen[0].options.cwd, process.platform === 'win32' ? fixture.installation : layout.root);
     assert.equal(seen[0].args[seen[0].args.indexOf('--user-data-dir') + 1], layout.userData);
     assert.equal(seen[0].args[seen[0].args.indexOf('--extensions-dir') + 1], layout.extensions);
-    assert.equal(seen[0].args[seen[0].args.indexOf('--install-extension') + 1], vsix);
+    assert.equal(seen[0].args[seen[0].args.indexOf('--install-extension') + 1], receipt.archive);
     assert.equal(seen[0].options.timeout, 1234);
     assert.equal(seen[0].options.env.ARC_HOME, layout.arcHome);
     assert.equal(seen[0].options.env.ARC_MEASURE_BLOCK_AGENTS, '1');
@@ -257,6 +257,56 @@ describe('isolated editor environment', () => {
 });
 
 describe('installed editor CLI', () => {
+  test('installs and retains the copied archive when the original changes around copying', async () => {
+    const fixture = cliFixture();
+    const session = editor.createRun({ scratch: scratch(), list: () => [] });
+    const candidate = path.join(scratch(), 'changing.vsix');
+    fs.writeFileSync(candidate, 'original archive');
+    const copy = fs.copyFileSync;
+    const replacement = Buffer.from('replacement archive');
+    const expected = '63bbb57cb85520ddcf68e67c55b6af7c9b420d82ce195a756a83bc18d9381302';
+    let copied;
+    let installed;
+    const interception = vi.spyOn(fs, 'copyFileSync').mockImplementation((source, destination, flags) => {
+      assert.equal(source, candidate);
+      assert.equal(flags, fs.constants.COPYFILE_EXCL);
+      fs.writeFileSync(candidate, replacement);
+      copy(source, destination, flags);
+      copied = destination;
+      fs.writeFileSync(candidate, 'original changed after copying');
+    });
+    let receipt;
+    try {
+      receipt = editor.installVsix(fixture.executable, session.layout, candidate, {
+        platform: 'linux',
+        run: (_executable, args) => {
+          installed = args[args.indexOf('--install-extension') + 1];
+          return { status: 0, stdout: 'installed' };
+        },
+      });
+    } finally {
+      interception.mockRestore();
+    }
+    assert.deepEqual(fs.readFileSync(copied), replacement);
+    assert.equal(receipt.sha256, expected);
+    assert.equal(installed, copied);
+    assert.deepEqual(fs.readFileSync(installed), replacement);
+    session.manifest.evidence = `${session.layout.root}-evidence`;
+    roots.push(session.manifest.evidence);
+    const report = await editor.cleanupRun(session.manifest, { list: () => [] });
+    assert.equal(report.ok, true, report.errors.join('\n'));
+    const archive = path.join(report.evidence.directory, path.relative(session.layout.root, copied));
+    assert.deepEqual(fs.readFileSync(archive), replacement);
+    const retained = JSON.parse(
+      fs.readFileSync(path.join(report.evidence.directory, path.relative(session.layout.root, receipt.receipt))),
+    );
+    assert.equal(retained.sha256, expected);
+    assert.equal(
+      JSON.parse(fs.readFileSync(path.join(report.evidence.directory, 'vsix-install.json'))).sha256,
+      expected,
+    );
+  });
+
   test('retains separate Arc and probe installation receipts and digests', () => {
     const fixture = cliFixture();
     const layout = editor.runLayout(scratch());
@@ -359,7 +409,7 @@ describe('installed editor CLI', () => {
       assert.ok(layout.root.length > 260);
       const vsix = path.join(layout.root, 'candidate with spaces.vsix');
       fs.writeFileSync(vsix, 'fixture');
-      editor.installVsix(fixture.executable, layout, vsix, {
+      const receipt = editor.installVsix(fixture.executable, layout, vsix, {
         run: (command, args, options) => {
           assert.equal(command, fixture.executable);
           return spawnSync(process.execPath, args, options);
@@ -370,7 +420,7 @@ describe('installed editor CLI', () => {
       assert.equal(output.cwd, fixture.installation);
       assert.equal(output.args[output.args.indexOf('--user-data-dir') + 1], layout.userData);
       assert.equal(output.args[output.args.indexOf('--extensions-dir') + 1], layout.extensions);
-      assert.equal(output.args[output.args.indexOf('--install-extension') + 1], vsix);
+      assert.equal(output.args[output.args.indexOf('--install-extension') + 1], receipt.archive);
     },
   );
 
@@ -390,6 +440,46 @@ describe('installed editor CLI', () => {
 });
 
 describe('disposable probe packaging and evidence', () => {
+  test('retains evidence and removes runs created beneath a linked scratch ancestor', async () => {
+    const parent = scratch();
+    const target = scratch();
+    const link = path.join(parent, 'scratch-alias');
+    const selected = path.join(link, 'selected scratch');
+    const canary = path.join(target, 'foreign.txt');
+    fs.writeFileSync(canary, 'foreign bytes');
+    fs.symlinkSync(target, link, 'junction');
+    try {
+      const session = editor.createRun({ scratch: selected, list: () => [] });
+      const evidence = (session.manifest.evidence = `${session.layout.root}-evidence`);
+      const relative = path.join('user-data', 'logs', 'exthost.log');
+      const log = path.join(session.layout.root, relative);
+      fs.mkdirSync(path.dirname(log), { recursive: true });
+      fs.writeFileSync(log, 'isolated log bytes');
+      editor.writeManifest(session.layout, session.manifest);
+      const report = await editor.cleanupRun(editor.readManifest(session.layout.root), { list: () => [] });
+      assert.equal(report.ok, true, report.errors.join('\n'));
+      assert.equal(report.removed, true);
+      assert.equal(fs.existsSync(session.layout.root), false);
+      assert.equal(path.dirname(session.layout.root), fs.realpathSync(selected));
+      assert.equal(report.evidence.directory, evidence);
+      assert.equal(fs.readFileSync(path.join(evidence, relative), 'utf8'), 'isolated log bytes');
+      assert.equal(fs.readFileSync(canary, 'utf8'), 'foreign bytes');
+      const manifest = JSON.parse(fs.readFileSync(path.join(evidence, 'run.json')));
+      assert.equal(manifest.root, session.layout.root);
+      assert.equal(manifest.profile, session.layout.userData);
+      const restarted = editor.createRun({ scratch: selected, list: () => [] });
+      const other = scratch();
+      fs.unlinkSync(link);
+      fs.symlinkSync(other, link, 'junction');
+      const settled = await editor.cleanupRun(editor.readManifest(restarted.layout.root), { list: () => [] });
+      assert.equal(settled.ok, true, settled.errors.join('\n'));
+      assert.deepEqual(fs.readdirSync(other), []);
+      assert.equal(fs.readFileSync(canary, 'utf8'), 'foreign bytes');
+    } finally {
+      fs.unlinkSync(link);
+    }
+  });
+
   test('rejects linked probe manifests and source ancestors without changing source bytes', async () => {
     for (const ancestor of [true, false]) {
       const owner = scratch();

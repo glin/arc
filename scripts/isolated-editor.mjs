@@ -225,7 +225,6 @@ export function installVsix(
   }
   const cwd = editorLaunchCwd(executable, layout, platform);
   const cli = editorCli(executable, platform);
-  const digest = createHash('sha256').update(fs.readFileSync(candidate)).digest('hex');
   const history = path.join(layout.root, 'installations');
   fs.mkdirSync(history, { recursive: true });
   const installation = path.join(
@@ -234,6 +233,7 @@ export function installVsix(
   );
   const archive = path.join(installation, 'candidate.vsix');
   fs.copyFileSync(candidate, archive, fs.constants.COPYFILE_EXCL);
+  const digest = createHash('sha256').update(fs.readFileSync(archive)).digest('hex');
   const result = run(
     executable,
     [
@@ -243,7 +243,7 @@ export function installVsix(
       '--extensions-dir',
       layout.extensions,
       '--install-extension',
-      candidate,
+      archive,
       '--force',
     ],
     {
@@ -953,7 +953,9 @@ export function createRun(
   { scratch = os.tmpdir(), workspace, liveData = false, diagnostics = false, list = listProcesses } = {},
   session = {},
 ) {
-  const layout = runLayout(path.join(scratch, RUN_PREFIX + randomUUID()));
+  fs.mkdirSync(scratch, { recursive: true });
+  const parent = fs.realpathSync(scratch);
+  const layout = runLayout(path.join(parent, RUN_PREFIX + randomUUID()));
   fs.mkdirSync(layout.root, { recursive: true });
   const manifest = {
     root: layout.root,
