@@ -2129,6 +2129,44 @@ test('production stale reader removal applies to unseen acknowledgments and unfi
   assert.equal(f.provider.saved.readRevision, 3);
 });
 
+test('production aggregate read projections validate each shared source once', () => {
+  const f = orderedHostReadFixture();
+  const record = {
+    provider: 'codex' as const,
+    sessionId: 'worker',
+    source: 'source',
+    scope: 'scope',
+    sourceRevision: 'revision',
+    promptId: 'p1',
+    startedAt: 10,
+  };
+  const other = { ...record, promptId: 'p2', startedAt: 20 };
+  const facts = {
+    ...record,
+    identitiesComplete: true,
+    turns: [
+      { promptId: 'p1', startedAt: 10, finished: true },
+      { promptId: 'p2', startedAt: 20, finished: true },
+    ],
+  };
+  let checks = 0;
+  f.provider.projectedReadFacts = () => {
+    checks++;
+    return facts;
+  };
+  f.provider.saved.agentRead = [record, other];
+  assert.equal(f.provider.readSynchronization().agentRead.length, 2);
+  assert.equal(checks, 1);
+  checks = 0;
+  f.provider.unreadCounts();
+  assert.equal(checks, 1);
+  checks = 0;
+  const current = f.provider.readFacts();
+  assert.equal(current(record), facts);
+  assert.equal(current(other), facts);
+  assert.equal(checks, 1);
+});
+
 test('production receipts acknowledge delivered turns and refuse appended source revisions after restoration', async () => {
   const f = orderedHostReadFixture();
   const directory = tempDir('host-read-source-');
@@ -2153,6 +2191,8 @@ test('production receipts acknowledge delivered turns and refuse appended source
     );
   }
   fs.writeFileSync(file, records.map((record) => JSON.stringify(record)).join('\n') + '\n');
+  const alias = path.join(directory, 'worker-alias.jsonl');
+  fs.linkSync(file, alias);
   const source = {
     agent: 'codex',
     sessionId: 'worker',
@@ -2186,16 +2226,36 @@ test('production receipts acknowledge delivered turns and refuse appended source
   assert.equal((await f.provider.guardedReadRequest(request)).status, 'applied');
   assert.equal(f.provider.saved.agentRead.length, 1);
   assert.equal(f.provider.readSynchronization().agentRead.length, 1);
+  source.file = alias;
+  assert.equal(f.provider.readSynchronization().agentRead.length, 0);
+  assert.notEqual(
+    f.provider.currentReadSource(f.provider.saved.agentRead[0])?.source,
+    f.provider.saved.agentRead[0].source,
+  );
+  source.file = file;
   f.provider.agentReadSources = new AgentReadSources();
   f.provider.admittedReadSources.clear();
   assert.equal(f.provider.readSynchronization().agentRead.length, 0);
+  const opened = vi.spyOn(f.provider.agentReadSources, 'resolve');
   f.provider.restoreAgentReads();
   await vi.waitFor(() => assert.equal(f.provider.restoringReadSources, false));
   await vi.waitFor(() => assert.equal(f.provider.readSynchronization().agentRead.length, 1));
+  assert.equal(f.provider.saved.readRevision, 1);
+  assert.equal(f.writes.length, 1);
+  const openings = opened.mock.calls.length;
+  f.provider.restoreAgentReads();
+  assert.equal(f.provider.restoringReadSources, false);
+  assert.equal(opened.mock.calls.length, openings);
+  assert.equal(f.writes.length, 1);
   fs.appendFileSync(file, JSON.stringify({ type: 'ignored', text: 'append' }) + '\n');
   assert.equal(f.provider.readSynchronization().agentRead.length, 0);
   assert.equal((await f.provider.guardedReadRequest({ ...request, id: 'read:2' })).status, 'refused');
   assert.equal((await f.provider.guardedReadRequest(request)).status, 'applied');
+  Object.assign(source, revisionOf(fs.statSync(file, { bigint: true })));
+  f.provider.restoreAgentReads();
+  await vi.waitFor(() => assert.equal(f.provider.saved.agentRead.length, 0));
+  assert.equal(f.provider.saved.readRevision, 2);
+  fs.unlinkSync(alias);
 });
 
 test('command-only admission removes pending rows through every catalog path and releases list and search names', () => {

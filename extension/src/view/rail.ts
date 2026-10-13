@@ -557,7 +557,7 @@ export interface RailSectionCard extends RailBucketCard {
   // is.
   cacheExpiryAtLeast?: boolean;
   status?: RailStatus | null;
-  unread?: boolean;
+  unread?: boolean | null;
   // How long this session's prompt cache has left, which the Active lens reads against the
   // clock the caller passes in.
   cache?: RailCacheSpan | null;
@@ -1013,7 +1013,7 @@ function railStatusGroup(card: RailSectionCard): RailStatusGroup {
   if (railStatusRuns(card.status ?? null)) {
     return 'running';
   }
-  return card.unread ? 'unread' : 'read';
+  return card.unread === true || card.unread === null ? 'unread' : 'read';
 }
 
 // Whether a row draws the card's agent word. An agent group's heading already says the agent

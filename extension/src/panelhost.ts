@@ -38,6 +38,7 @@ import {
   boundedSessionRead,
   AgentReadSources,
   guardedSourceRevision,
+  guardedSourceIdentity,
   readSessionCursor,
   sessionCatalogMembership,
   sessionDiscoveryMembership,
@@ -453,6 +454,7 @@ import {
   readMovedOnlyFor,
   projectAgentRead,
   currentAgentRead,
+  reduceReadOperation,
   type AgentReadRecord,
   type AgentReadSource,
   type ReadOperation,
@@ -1950,6 +1952,7 @@ export class PanelProvider implements vscode.Disposable {
   private admittedReadSources = new Map<string, AgentReadSource>();
   private readSequence = 0;
   private restoringReadSources = false;
+  private restoredReadSources?: string;
 
   private readOwner(): HostReadPersistence<PanelState> {
     if (this.readPersistence) return this.readPersistence;
@@ -1959,6 +1962,7 @@ export class PanelProvider implements vscode.Disposable {
       previousState.readTo,
       previousState.since,
       previousState.readRevision ?? 0,
+      [...projectAgentRead(previousState.agentRead ?? [], this.readFacts(false))],
     ]);
     return (this.readPersistence ??= new HostReadPersistence(
       normalizePanelState(this.saved),
@@ -1967,8 +1971,6 @@ export class PanelProvider implements vscode.Disposable {
         await this.memento.update(STATE_KEY, state);
       },
       async (state) => {
-        const signature = JSON.stringify([state.read, state.readTo, state.since, state.readRevision ?? 0]);
-        if (signature === previous) return;
         Object.assign(this.saved, {
           read: state.read,
           readTo: state.readTo,
@@ -1977,6 +1979,14 @@ export class PanelProvider implements vscode.Disposable {
           readRevision: state.readRevision,
         });
         const synchronization = this.readSynchronization();
+        const signature = JSON.stringify([
+          state.read,
+          state.readTo,
+          state.since,
+          state.readRevision ?? 0,
+          synchronization.agentRead,
+        ]);
+        if (signature === previous) return;
         for (const host of this.hosts) {
           if (
             this.readyHosts.has(host) &&
@@ -2008,6 +2018,8 @@ export class PanelProvider implements vscode.Disposable {
   }
 
   private currentReadSource(record: AgentReadRecord): AgentReadSource | null {
+    const held = this.projectedReadFacts(record);
+    if (held) return held;
     const scope = this.readScopeKey();
     if (scope === null) return null;
     const roots = this.repositoryScope.snapshot(this.folders()).roots;
@@ -2031,13 +2043,11 @@ export class PanelProvider implements vscode.Disposable {
     return facts;
   }
 
-  private readFacts(): (record: AgentReadRecord) => AgentReadSource | null {
+  private readFacts(open = true): (record: AgentReadRecord) => AgentReadSource | null {
     const held = new Map<string, AgentReadSource | null>();
     return (record) => {
       const key = `${record.provider}:${record.sessionId}`;
-      const prior = held.get(key);
-      if (!held.has(key) || (prior && this.projectedReadFacts(record) !== prior))
-        held.set(key, this.currentReadSource(record));
+      if (!held.has(key)) held.set(key, open ? this.currentReadSource(record) : this.projectedReadFacts(record));
       return held.get(key)!;
     };
   }
@@ -2052,6 +2062,7 @@ export class PanelProvider implements vscode.Disposable {
         : [];
     return matches.length === 1 &&
       matches[0].agent === facts.provider &&
+      guardedSourceIdentity(matches[0]) === facts.source &&
       guardedSourceRevision(matches[0].file) === facts.sourceRevision
       ? facts
       : null;
@@ -2063,12 +2074,32 @@ export class PanelProvider implements vscode.Disposable {
       read: [...this.saved.read],
       readTo: { ...this.saved.readTo },
       since: this.saved.since,
-      agentRead: [...projectAgentRead(this.saved.agentRead ?? [], (record) => this.projectedReadFacts(record))],
+      agentRead: [...projectAgentRead(this.saved.agentRead ?? [], this.readFacts(false))],
     };
   }
 
   private restoreAgentReads(): void {
     if (this.restoringReadSources || !this.saved.agentRead?.length) return;
+    const sessions = new Set(this.saved.agentRead.map((record) => record.sessionId));
+    const signature = JSON.stringify([
+      this.saved.agentRead,
+      this.readScopeKey(),
+      this.authoritativeCatalogScope,
+      this.authoritativeCatalog
+        ?.filter((source) => sessions.has(source.sessionId))
+        .map((source) => [
+          source.agent,
+          source.sessionId,
+          source.file,
+          source.size,
+          source.mtimeMs,
+          source.dev,
+          source.ino,
+          guardedSourceRevision(source.file),
+          guardedSourceIdentity(source),
+        ]),
+    ]);
+    if (signature === this.restoredReadSources) return;
     this.restoringReadSources = true;
     const records = [
       ...new Map(this.saved.agentRead.map((record) => [`${record.provider}:${record.sessionId}`, record])).values(),
@@ -2085,6 +2116,24 @@ export class PanelProvider implements vscode.Disposable {
         return;
       }
       this.restoringReadSources = false;
+      const facts = this.readFacts(false);
+      const retained = this.saved.agentRead ?? [];
+      const nextState = reduceReadOperation(
+        {
+          revision: this.saved.readRevision ?? 0,
+          read: this.saved.read,
+          readTo: this.saved.readTo,
+          since: this.saved.since,
+          agentRead: retained,
+        },
+        { id: 'restoration-check', observedRevision: this.saved.readRevision ?? 0, action: 'invalidate' },
+        facts,
+      );
+      if (nextState?.agentRead.length === retained.length) {
+        this.restoredReadSources = signature;
+        void Promise.resolve(this.readOwner().publishAccepted()).catch(() => {});
+        return;
+      }
       void this.readOwner()
         .read(
           {
@@ -2093,8 +2142,11 @@ export class PanelProvider implements vscode.Disposable {
             observedRevision: this.saved.readRevision ?? 0,
             action: 'invalidate',
           },
-          (record) => this.projectedReadFacts(record),
+          this.readFacts(false),
         )
+        .then(() => {
+          this.restoredReadSources = undefined;
+        })
         .catch(() => {});
     };
     setImmediate(next);
@@ -8678,8 +8730,9 @@ export class PanelProvider implements vscode.Disposable {
         )
       : this.windows;
     const facts = new Map<string, AgentReadSource>();
+    const currentFacts = this.readFacts(false);
     for (const record of this.saved.agentRead ?? []) {
-      const current = this.projectedReadFacts(record);
+      const current = currentFacts(record);
       if (current?.identitiesComplete) facts.set(record.sessionId, current);
     }
     const mapped = new Map(

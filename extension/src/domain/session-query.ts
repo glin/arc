@@ -662,8 +662,12 @@ export function sessionTermHolds(
   cacheExpiryCount: number | null = null,
   cacheExpiryAtLeast = false,
   sessionId = '',
+  readKnown = true,
 ): boolean {
   if (term.invalid || term.unresolved) return false;
+  if (!readKnown && term.field === 'status' && (term.needle === 'read' || term.needle === 'unread')) return false;
+  if (!readKnown && term.field === 'status' && term.needle === 'needsyou' && active && status !== 'waiting')
+    return false;
   if (term.field === 'session') {
     const identities = term.identities;
     const provider = agent.toLowerCase();
@@ -724,7 +728,7 @@ export function matchSessions<
     costDollars?: number | null;
     costAtLeast?: boolean;
     status?: string | null;
-    unread?: boolean;
+    unread?: boolean | null;
     // The caller supplies prompt-cache status using its own clock. Omission makes is:warm match nothing.
     cacheWarm?: boolean;
     // Whether an agent runs this session, which `is:agentrun` answers. A card's own bucket flag
@@ -771,6 +775,7 @@ export function matchSessions<
         session.cacheExpiryCount ?? null,
         session.cacheExpiryAtLeast === true,
         session.sessionId ?? session.id ?? '',
+        session.unread !== null,
       );
     return terms.every(holds);
   });

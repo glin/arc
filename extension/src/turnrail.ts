@@ -430,8 +430,9 @@ export interface RailCard {
   // Numeric unread count, or null for a known zero or unavailable count.
   // The unread mark follows this value.
   newCount: number | null;
-  // Whether the count identifies unread turns. The leading dot and bold name share this state.
-  unread: boolean;
+  // Null leaves older unread turns unknown after a partial zero.
+  // The leading dot and bold name identify known unread turns.
+  unread: boolean | null;
   // Newest known turn start, or null when no read-action boundary is available.
   // The session read action uses this watermark, including fallback window starts.
   newestTurnAt: number | null;
@@ -1112,7 +1113,7 @@ export function railSessions(
     // The unread marks read the same count the indicator words, so a card cannot show a
     // dot beside a name that says nothing new.
     const newCount = count === undefined || count === 0 ? null : count;
-    const unread = newCount !== null;
+    const unread = count === 0 && entry?.atLeast ? null : newCount !== null;
     const current = s.id === pinned;
     // Archiving takes precedence over pinning, matching the unpinning performed when the panel archives a session.
     // Stored state can contain both flags. A pinned archived card must stay in its folded bucket rather than occupying the list top.
@@ -1183,7 +1184,7 @@ export function railSessions(
     const nameAfterAge = [
       ...statNames,
       current ? 'showing now' : null,
-      indicator ?? (count === 0 ? CARD_ACTIONS.sessionNothingNew : null),
+      indicator ?? (count === 0 ? (unread === null ? 'new turns unknown' : CARD_ACTIONS.sessionNothingNew) : null),
       labelClause,
     ]
       .filter(Boolean)
@@ -1192,7 +1193,11 @@ export function railSessions(
     // No watermark uses the plain section, which still permits label actions.
     const newestTurnAt = newest.get(s.id) ?? null;
     const menuSection =
-      newestTurnAt === null ? RAIL_MENU_SECTIONS.plain : unread ? RAIL_MENU_SECTIONS.unread : RAIL_MENU_SECTIONS.read;
+      newestTurnAt === null
+        ? RAIL_MENU_SECTIONS.plain
+        : unread !== false
+          ? RAIL_MENU_SECTIONS.unread
+          : RAIL_MENU_SECTIONS.read;
     // Pinned agent runs use the agent-run phrase because they sit outside the agent-run heading.
     const agentWord = agentRun && onTop ? CARD_ACTIONS.agentRun : s.agent;
     out.push({

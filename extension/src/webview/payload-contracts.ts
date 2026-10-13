@@ -220,7 +220,7 @@ export interface RailCardView extends Record<string, unknown> {
   labelChips: string[];
   labelsMore: string | null;
   labelsMoreName: string | null;
-  unread: boolean;
+  unread: boolean | null;
   newestTurnAt: number | null;
   menuSection: string;
 }

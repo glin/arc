@@ -1743,6 +1743,32 @@ test('a rail card shows the labels it has room for, counts the rest, and says al
   assert.doesNotMatch(railCardName(rail[2]), /labelled/);
 });
 
+test('partial zero attention retains uncertainty through rail names, menus and queries', () => {
+  const rows = railSessions(
+    [{ id: 'partial', label: 'Partial', agent: 'Codex', when: 'noon', at: 10, relative: 'now' }],
+    new Map([['partial', { count: 0, atLeast: true }]]),
+    new Map([['partial', 10]]),
+    new Map(),
+    new Set(),
+    null,
+    new Set(),
+    new Map(),
+    {},
+    {},
+  );
+  assert.equal(rows[0].indicator, null);
+  assert.equal(rows[0].unread, null);
+  assert.match(railCardName(rows[0]), /new turns unknown/);
+  assert.doesNotMatch(railCardName(rows[0]), /nothing new/);
+  assert.equal(rows[0].menuSection, RAIL_MENU_SECTIONS.unread);
+  for (const query of ['is:read', 'is:unread', '-is:read', '-is:unread'])
+    assert.deepEqual(matchSessions(rows, query), []);
+  for (const query of ['is:needsyou', '-is:needsyou'])
+    assert.deepEqual(matchSessions([{ ...rows[0], active: true }], query), []);
+  rows[0].unread = false;
+  assert.deepEqual(matchSessions(rows, 'is:read'), rows);
+});
+
 test('a rail card names the read entry its session can take, and none where it cannot', () => {
   const s = (id: string) => ({
     id,

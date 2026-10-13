@@ -36,6 +36,106 @@ function card(key: string, sessionId = 's', startedAt = 10): ReadCard {
   return { key, sessionId, startedAt, kind: 'turn' };
 }
 
+test('automatic card marks wait for acceptance and stop after subscriber repaint', () => {
+  const turn = { ...card('s:10'), promptId: 'prompt' };
+  const operations: any[] = [];
+  const state = createReadState({
+    initial: {},
+    open: new Set([turn.key]),
+    cards: () => [turn],
+    newestTurnAt: () => 10,
+    save() {},
+    refreshSelection() {},
+    operate: (operation) => operations.push(operation),
+  });
+  state.synchronize({ revision: 0, read: [], readTo: {}, since: 0, agentRead: [] });
+  state.subscribe(() => {
+    state.mark(turn.key);
+  });
+  assert.equal(state.mark(turn.key), true);
+  assert.equal(state.mark(turn.key), false);
+  assert.equal(state.markMany([turn.key, turn.key]), false);
+  state.synchronize({ revision: 1, read: [turn.key], readTo: {}, since: 0, agentRead: [] });
+  assert.equal(operations.length, 1);
+  state.set(turn.key, false);
+  state.mark(turn.key);
+  assert.equal(operations.length, 2);
+  state.set(turn.key, true);
+  assert.equal(operations.length, 3);
+  assert.equal(operations[1].read, false);
+  assert.equal(operations[2].read, true);
+  state.synchronize({ revision: 2, read: [], readTo: {}, since: 0, agentRead: [] });
+  state.setSession('s', true);
+  const submitted = operations.length;
+  assert.equal(state.mark(turn.key), false);
+  assert.equal(operations.length, submitted);
+});
+
+test('session unread closes and saves disclosure before synchronized cards repaint', () => {
+  const turns = [card('s:10'), card('s:20', 's', 20), card('other:10', 'other')];
+  const open = new Set(turns.map((turn) => turn.key));
+  const events: string[] = [];
+  const state = createReadState({
+    initial: {},
+    open,
+    cards: () => turns,
+    newestTurnAt: () => 20,
+    save: () => events.push('save'),
+    refreshSelection: () => events.push('selection'),
+    operate: () => {
+      assert.deepEqual([...open], ['other:10']);
+      events.push('operation');
+    },
+  });
+  state.synchronize({ revision: 1, read: [], readTo: { s: 20 }, since: 0, agentRead: [] });
+  state.subscribe(() => {
+    for (const turn of turns) if (open.has(turn.key)) state.mark(turn.key);
+  });
+  state.setSession('s', false);
+  assert.deepEqual(events, ['selection', 'save', 'operation']);
+  state.synchronize({ revision: 2, read: [], readTo: { s: 0, other: 10 }, since: 0, agentRead: [] });
+  assert.equal(state.isRead(turns[0]), false);
+  assert.equal(state.isRead(turns[1]), false);
+  assert.equal(events.length, 3);
+});
+
+test('opening an agent acknowledged turn still establishes the reader mark', () => {
+  const turn = { ...card('s:10'), promptId: 'prompt' };
+  const operations: any[] = [];
+  const state = createReadState({
+    initial: {},
+    open: new Set(),
+    cards: () => [turn],
+    newestTurnAt: () => 10,
+    save() {},
+    refreshSelection() {},
+    operate: (operation) => operations.push(operation),
+  });
+  state.synchronize({ revision: 1, read: [], readTo: {}, since: 0, agentRead: [[turn.key, turn.promptId]] });
+  assert.equal(state.isRead(turn), true);
+  assert.equal(state.mark(turn.key), true);
+  state.synchronize({ revision: 2, read: [turn.key], readTo: {}, since: 0, agentRead: [[turn.key, turn.promptId]] });
+  assert.equal(state.mark(turn.key), false);
+  assert.equal(operations.length, 1);
+});
+
+test('equal accepted revisions update source projection without changing reader state', () => {
+  const turn = { ...card('s:10'), promptId: 'prompt' };
+  const state = createReadState({
+    initial: {},
+    open: new Set(),
+    cards: () => [turn],
+    newestTurnAt: () => 10,
+    save() {},
+    refreshSelection() {},
+  });
+  const accepted = { revision: 1, read: [], readTo: {}, since: 0, agentRead: [] as [string, string][] };
+  state.synchronize(accepted);
+  assert.equal(state.synchronize({ ...accepted, agentRead: [[turn.key, turn.promptId]] }), true);
+  assert.equal(state.isRead(turn), true);
+  assert.equal(state.synchronize({ ...accepted, read: [turn.key] }), false);
+});
+
 test('bulk reads save and notify once without changing watermarks or neighbours', () => {
   let saves = 0;
   let notices = 0;

@@ -7209,7 +7209,7 @@ function railPostHarness(extraMethods: string[], scope: Record<string, unknown> 
   const provider = completeDiscoveryHarness(
     undefined,
     false,
-    ['postRail', 'post', 'sendToHost', 'readOwner', 'readSynchronization', ...extraMethods],
+    ['postRail', 'post', 'sendToHost', 'readOwner', 'readSynchronization', 'readFacts', ...extraMethods],
     {
       normalizePanelState,
       HostReadPersistence,

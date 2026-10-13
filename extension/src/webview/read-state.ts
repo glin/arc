@@ -66,6 +66,11 @@ export function createReadState(options: ReadStateOptions): ReadStateOwner {
     byte.toString(16).padStart(2, '0'),
   ).join('');
   let sequence = 0;
+  const pendingMarks = new Map<string, ReadCard>();
+  const pendingUnread = new Map<string, ReadCard>();
+  const pendingUnreadSessions = new Set<string>();
+  const pendingReadSessions = new Map<string, number>();
+  const identity = (card: ReadCard) => JSON.stringify([card.sessionId, card.startedAt, card.promptId]);
   const operate = (
     action:
       | Omit<Extract<ReadOperation, { action: 'turn' }>, 'id' | 'observedRevision'>
@@ -99,8 +104,20 @@ export function createReadState(options: ReadStateOptions): ReadStateOwner {
     readTo.set(sessionId, at);
   };
 
-  const mark = (key: string): boolean => {
+  const mark = (key: string, explicit = false): boolean => {
     const card = options.cards().find((one) => one.key === key);
+    if (card && options.operate && revision >= 0) {
+      const id = identity(card);
+      const removing = pendingUnread.has(id) || pendingUnreadSessions.has(card.sessionId);
+      if (!explicit && card.startedAt <= (pendingReadSessions.get(card.sessionId) ?? 0)) return false;
+      if ((!explicit && removing) || (isTurnRead(card, read, readTo, since) && !removing) || pendingMarks.has(id))
+        return false;
+      if (explicit) {
+        pendingUnread.delete(id);
+        pendingUnreadSessions.delete(card.sessionId);
+      }
+      pendingMarks.set(id, card);
+    }
     if (
       card &&
       operate({
@@ -119,6 +136,10 @@ export function createReadState(options: ReadStateOptions): ReadStateOwner {
   };
 
   const unmark = (card: ReadCard) => {
+    if (options.operate && revision >= 0) {
+      pendingMarks.delete(identity(card));
+      pendingUnread.set(identity(card), card);
+    }
     if (
       operate({
         action: 'turn',
@@ -141,7 +162,16 @@ export function createReadState(options: ReadStateOptions): ReadStateOwner {
 
   const owner: ReadStateOwner = {
     synchronize(state) {
-      if (!Number.isSafeInteger(state.revision) || state.revision < 0 || state.revision <= revision) return false;
+      if (!Number.isSafeInteger(state.revision) || state.revision < 0 || state.revision < revision) return false;
+      if (
+        state.revision === revision &&
+        (JSON.stringify([...read]) !== JSON.stringify(state.read) ||
+          JSON.stringify(Object.fromEntries(readTo)) !== JSON.stringify(state.readTo) ||
+          since !== state.since)
+      )
+        return false;
+      if (state.revision === revision && JSON.stringify([...agentRead]) === JSON.stringify(state.agentRead))
+        return false;
       read.clear();
       for (const key of state.read.slice(-READ_LIMIT)) read.add(key);
       readTo.clear();
@@ -150,6 +180,17 @@ export function createReadState(options: ReadStateOptions): ReadStateOwner {
       agentRead.clear();
       for (const [key, promptId] of state.agentRead) agentRead.set(key, promptId);
       revision = state.revision;
+      for (const [id, card] of pendingMarks) if (isTurnRead(card, read, readTo, since)) pendingMarks.delete(id);
+      for (const [id, card] of pendingUnread) if (!owner.isRead(card)) pendingUnread.delete(id);
+      for (const id of pendingUnreadSessions) {
+        if (
+          readTo.get(id) === 0 &&
+          ![...read].some((key) => key.startsWith(`${id}:`)) &&
+          !options.cards().some((card) => card.sessionId === id && owner.isRead(card))
+        )
+          pendingUnreadSessions.delete(id);
+      }
+      for (const [id, at] of pendingReadSessions) if ((readTo.get(id) ?? since) >= at) pendingReadSessions.delete(id);
       notify();
       return true;
     },
@@ -171,8 +212,9 @@ export function createReadState(options: ReadStateOptions): ReadStateOwner {
     mark,
     markMany(keys) {
       if (options.operate && revision >= 0) {
-        for (const key of keys) mark(key);
-        return keys.length > 0;
+        let changed = false;
+        for (const key of keys) if (mark(key)) changed = true;
+        return changed;
       }
       let changed = false;
       for (const key of keys) {
@@ -192,14 +234,15 @@ export function createReadState(options: ReadStateOptions): ReadStateOwner {
         unmark(card);
         options.refreshSelection();
       } else {
-        mark(card.key);
+        mark(card.key, true);
       }
     },
     set(key, value) {
       const card = options.cards().find((candidate) => candidate.key === key);
       if (card && options.operate && revision >= 0) {
-        if (value) mark(key);
-        else unmark(card);
+        if (value) {
+          mark(key, true);
+        } else unmark(card);
         return;
       }
       if (!card || owner.isRead(card) === value) {
@@ -211,6 +254,26 @@ export function createReadState(options: ReadStateOptions): ReadStateOwner {
       const cards = options.cards().filter((card) => card.kind === 'turn' && card.sessionId === sessionId);
       const newest = options.newestTurnAt(sessionId);
       const target = cards.at(0);
+      if (!value && options.operate && revision >= 0) {
+        pendingReadSessions.delete(sessionId);
+        pendingUnreadSessions.add(sessionId);
+        for (const card of cards) pendingMarks.delete(identity(card));
+        let shut = false;
+        for (const key of [...options.open]) {
+          if (key.startsWith(`${sessionId}:`)) {
+            options.open.delete(key);
+            shut = true;
+          }
+        }
+        if (shut) {
+          options.refreshSelection();
+          options.save();
+        }
+      }
+      if (value) {
+        pendingUnreadSessions.delete(sessionId);
+        if (newest !== null && options.operate && revision >= 0) pendingReadSessions.set(sessionId, newest);
+      }
       if (
         newest !== null &&
         operate({
