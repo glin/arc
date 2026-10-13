@@ -74,6 +74,7 @@ const CLAUDE_STATE_KEYS = {
 } satisfies Record<keyof PersistedClaudeUsageReducerState, true>;
 
 const CODEX_STATE_KEYS = {
+  nativeCacheChild: true,
   provider: true,
   openingTimestamp: true,
   openingSessionId: true,
@@ -464,6 +465,7 @@ function codexState(value: unknown): value is CodexUsageReducerState {
     !(value.openingTimestamp === null || timestamp(value.openingTimestamp)) ||
     !nullableText(value.openingSessionId) ||
     !(value.nativeSpawnedAt === null || timestamp(value.nativeSpawnedAt)) ||
+    !(value.nativeCacheChild === undefined || typeof value.nativeCacheChild === 'boolean') ||
     !trueDictionary(value.pendingOwnership) ||
     typeof value.currentTurnRepeated !== 'boolean' ||
     !nullableText(value.agentPath) ||
@@ -889,6 +891,7 @@ function cacheExpiryCarryCompaction(value: unknown, requestCompactions: number):
 function cacheExpiryReturn(value: unknown): CacheExpiryReturn | null {
   if (
     !record(value) ||
+    !(value.timestamp === undefined || value.timestamp === null || timestamp(value.timestamp)) ||
     !cacheTier(value.lifetime) ||
     !nonNegativeInteger(value.gapMs) ||
     !(value.visibleTurnId === undefined || value.visibleTurnId === null || nonEmptyText(value.visibleTurnId)) ||
@@ -912,6 +915,7 @@ function cacheExpiryReturn(value: unknown): CacheExpiryReturn | null {
   return request
     ? {
         lifetime: value.lifetime,
+        timestamp: value.timestamp ?? null,
         gapMs: value.gapMs,
         request,
         visibleTurnId: value.visibleTurnId ?? null,
@@ -1229,6 +1233,9 @@ function spendRecord(
     ...(value.newestTurnStartedAt === undefined ? {} : { newestTurnStartedAt: value.newestTurnStartedAt }),
     ...(value.outcome === undefined ? {} : { outcome: value.outcome }),
     ...(expiry === undefined ? {} : { cacheExpiry: expiry }),
+    ...(typeof value.cacheExpiryChildPolicy === 'boolean'
+      ? { cacheExpiryChildPolicy: value.cacheExpiryChildPolicy }
+      : {}),
     ...(persistedParserGeneration === undefined ? {} : { parserGeneration: persistedParserGeneration }),
     ...(parserKind === undefined ? {} : { parserKind }),
     indexedAt: value.indexedAt,

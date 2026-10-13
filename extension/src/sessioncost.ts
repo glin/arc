@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import { combineCacheExpirySummaries, combineCacheExpiryAmounts } from './cacheexpirysummary';
 import path from 'node:path';
 import { scanLines } from './agentspend';
 import { createClaudeRepeatedFilter } from './clauderepeated';
@@ -744,38 +745,37 @@ export function sessionCostReport(
       : undefined,
   );
   const expiries = [parentSummary, ...childReports].map((summary) => summary.cacheExpiry!);
+  const combinedExpiry = combineCacheExpirySummaries(
+    expiries.map((expiry) => ({
+      counts: expiry.byLifetime,
+      longestGap: expiry.longestGapSeconds,
+      excluded: expiry.excludedAmbiguous,
+      unavailable: expiry.unavailableLifetime,
+    })),
+  );
+  const inputAfterExpiry = combineCacheExpiryAmounts(
+    expiries.map((expiry) => ({ dollars: expiry.inputCostAfterExpiryUsd, partial: false })),
+    true,
+  ).dollars;
+  const addedAfterExpiry = combineCacheExpiryAmounts(
+    expiries.map((expiry) => ({ dollars: expiry.extraCostAfterExpiryUsd, partial: false })),
+    true,
+  ).dollars;
   combinedSummary.cacheExpiry = {
     coverage: expiries.every((item) => item.coverage === 'complete') ? 'complete' : 'unknown-request-coverage',
     returns: expiries.reduce((sum, item) => sum + item.returns, 0),
-    inputCostAfterExpiryUsd: expiries.every((item) => item.inputCostAfterExpiryUsd !== null)
-      ? round(
-          expiries.reduce((sum, item) => sum + item.inputCostAfterExpiryUsd!, 0),
-          4,
-        )
-      : null,
-    extraCostAfterExpiryUsd: expiries.every((item) => item.extraCostAfterExpiryUsd !== null)
-      ? round(
-          expiries.reduce((sum, item) => sum + item.extraCostAfterExpiryUsd!, 0),
-          4,
-        )
-      : null,
-    byLifetime: { '5m': 0, '30m': 0, '1h': 0 },
+    inputCostAfterExpiryUsd: inputAfterExpiry === null ? null : round(inputAfterExpiry, 4),
+    extraCostAfterExpiryUsd: addedAfterExpiry === null ? null : round(addedAfterExpiry, 4),
+    byLifetime: combinedExpiry.counts,
     byBoundary: { afterAUserTurn: 0, insideOneTurn: 0, turnUnknown: 0 },
-    longestGapSeconds: null,
-    unavailableLifetime: expiries.reduce((sum, item) => sum + item.unavailableLifetime, 0),
-    excludedAmbiguous: expiries.reduce((sum, item) => sum + item.excludedAmbiguous, 0),
+    longestGapSeconds: combinedExpiry.longestGap,
+    unavailableLifetime: combinedExpiry.unavailable,
+    excludedAmbiguous: combinedExpiry.excluded,
     largest: [],
   };
   for (const expiry of expiries) {
-    for (const lifetime of ['5m', '30m', '1h'] as const)
-      combinedSummary.cacheExpiry.byLifetime[lifetime] += expiry.byLifetime[lifetime];
     for (const boundary of ['afterAUserTurn', 'insideOneTurn', 'turnUnknown'] as const)
       combinedSummary.cacheExpiry.byBoundary[boundary] += expiry.byBoundary[boundary];
-    if (expiry.longestGapSeconds !== null)
-      combinedSummary.cacheExpiry.longestGapSeconds = Math.max(
-        combinedSummary.cacheExpiry.longestGapSeconds ?? 0,
-        expiry.longestGapSeconds,
-      );
     combinedSummary.cacheExpiry.largest.push(...expiry.largest);
   }
   combinedSummary.cacheExpiry.largest.sort((a, b) => (b.inputCostUsd ?? -1) - (a.inputCostUsd ?? -1));

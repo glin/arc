@@ -1,4 +1,6 @@
 import { DARK_MODERN_THEME, LIGHT_MODERN_THEME, ONE_DARK_PRO_DARKER_THEME } from './view/static-themes.ts';
+import { ChildCacheExpiryAttribution } from './childcacheexpiry.ts';
+import { turnKey } from './domain/read.ts';
 // Shared panel page and render payload for browser tests and screenshots.
 // Importing a test module registers its tests, so scripts use this separate fixture module.
 // Production modules do not import this file.
@@ -32,7 +34,12 @@ import {
   type SessionStatChip,
   type TurnStatus,
 } from './turncard.ts';
-import type { CacheExpiryFacts, ProjectSpendView } from './projectspend.ts';
+import {
+  emptyCacheExpiryFacts,
+  type CacheExpiryFacts,
+  type ProjectSpendView,
+  type NativeChildCacheFacts,
+} from './projectspend.ts';
 import type { CompleteSetupValues, PinnedSetup } from './domain/session-setups.ts';
 import type { Ask, PermissionAsk, QuestionAsk } from './agentwire.ts';
 import { usageBar } from './usageview.ts';
@@ -1431,6 +1438,34 @@ function costOverheadsParts() {
 export function costOverheadsPayload(): Record<string, unknown> {
   const payload = renderPayload();
   const { usage, part, turn, expiry } = costOverheadsParts();
+  const childTurn = {
+    ...turn,
+    startedAt: turn.startedAt + 20 * 60_000,
+    endedAt: turn.startedAt + 21 * 60_000,
+    promptId: 'child-expiry-parent',
+    responseIds: [],
+    openingResponseId: undefined,
+    prompt: 'Review the subagents after their cache expires.',
+  };
+  const childFacts: CacheExpiryFacts = {
+    ...emptyCacheExpiryFacts(),
+    counts: { '5m': 2, '30m': 0, '1h': 0 },
+    returns: [0, 1].map((at) => ({
+      ...expiry.returns[0],
+      lifetime: '5m',
+      timestamp: childTurn.startedAt + (10 + at) * 60_000,
+      requestKey: `claude:child-only-return-${at}`,
+    })),
+  };
+  const childSource: NativeChildCacheFacts = {
+    source: 'fixture-subagent.jsonl',
+    revision: {} as NativeChildCacheFacts['revision'],
+    facts: childFacts,
+    endedAt: null,
+    outcome: null,
+  };
+  const aggregate: CacheExpiryFacts = { ...expiry, counts: { ...expiry.counts, '5m': 2 }, childSources: [childSource] };
+  const childCosts = new ChildCacheExpiryAttribution().read([turn, childTurn], { [turn.sessionId]: aggregate }, NOW);
   const session = usage({
     requests: 410,
     input: 1_900_000,
@@ -1447,10 +1482,10 @@ export function costOverheadsPayload(): Record<string, unknown> {
           { agent: 'claude', role: 'main', ...part, compactionEstimate: true, usage: compactions },
         ],
         false,
-        { compactionCount: 3, expiry },
+        { compactionCount: 3, expiry: aggregate },
       ).stats,
       ...sessionTurnStats({ turnCount: 22, firstTurnAt: turn.startedAt, lastTurnAt: turn.endedAt, compactionCount: 3 }),
-      ...sessionCacheExpiryStats(expiry),
+      ...sessionCacheExpiryStats(aggregate),
     ],
   };
   const sessions = (payload.sessions as Parameters<typeof railSessions>[0])
@@ -1465,6 +1500,20 @@ export function costOverheadsPayload(): Record<string, unknown> {
       {
         ...toCard(turn, false, NOW, [], null, false, new Set(), [], turnCacheExpiryWarning(turn, expiry)),
         summaryHtml: '<p>Resumed after lunch.</p>',
+      },
+      {
+        ...toCard(
+          childTurn,
+          false,
+          NOW,
+          [],
+          null,
+          false,
+          new Set(),
+          [],
+          turnCacheExpiryWarning(childTurn, aggregate, childCosts.get(turnKey(childTurn))),
+        ),
+        summaryHtml: '<p>Both subagents returned after their caches expired.</p>',
       },
     ],
     rail: railSessions(sessions, new Map(), new Map(), new Map(), new Set(), 's1', new Set(), new Map(), stats, {}),

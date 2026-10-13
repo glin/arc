@@ -31001,6 +31001,193 @@ test('a drawn Claude card redraws with its cache-expiry warning when the session
   assert.ok(seen.includes(dispatched), 'the redraw drew the card without its dispatched costs');
 });
 
+test('a child-only warning survives quiet expiry, exit, completion and saved-source reload', () => {
+  vi.useFakeTimers();
+  try {
+    const { turn: fixtureTurn, expiry } = cacheExpiryReturnTurn();
+    const start = NOW - 20 * 60_000;
+    const turn = {
+      ...fixtureTurn,
+      startedAt: start,
+      endedAt: start + 60_000,
+      responseIds: [],
+      openingResponseId: undefined,
+      finished: true,
+    };
+    let sources = {
+      [turn.sessionId]: { ...expiry, counts: { '5m': 0, '30m': 0, '1h': 0 }, returns: [], childSources: [] },
+    } as Record<string, any>;
+    let live = true;
+    const outcome = {
+      startedAt: start,
+      endedAt: turn.endedAt,
+      finished: true,
+      error: false,
+      interrupted: false,
+      openChildren: ['child'],
+    };
+    const sent: any[] = [];
+    const create = () =>
+      Object.assign(Object.create(PanelProvider.prototype), {
+        live: {},
+        liveActivity: {},
+        turnsByKey: new Map([[turnKey(turn), turn]]),
+        newestBySession: new Map(),
+        sessionNames: new SessionNames(),
+        sessionOutcomes: new Map([[turn.sessionId, outcome]]),
+        hosts: [{ webview: {} }],
+        projectSpendHydrated: true,
+        lifetimeFiguresBySession: () => ({ cacheExpiryFacts: sources }),
+        dispatchedTurnCosts: () => ({}),
+        dispatchedCostsForTurn: () => [],
+        folders: () => [],
+        runningSessions: () => new Set(),
+        liveOpenChildren: () => (live ? new Map([[turn.sessionId, ['child']]]) : new Map()),
+        railStatuses: () => ({ statuses: new Map(), openChildren: new Map() }),
+        themedFor: (cards: unknown[]) => cards,
+        sendToHost: (_host: unknown, message: unknown) => sent.push(message),
+      });
+    vi.setSystemTime(start + 10 * 60_000);
+    let host = create();
+    host.cards = [host.renderTurnCard(turn, false, 'Child cache expiry', Date.now())];
+    const childFacts = {
+      ...expiry,
+      truncated: false,
+      counts: { '5m': 0, '30m': 0, '1h': 1 },
+      returns: expiry.returns.map((item) => ({ ...item, timestamp: start + 10 * 60_000 })),
+    };
+    sources[turn.sessionId] = {
+      ...sources[turn.sessionId],
+      counts: childFacts.counts,
+      childSources: [
+        { source: 'agent-child.jsonl', revision: {}, facts: childFacts, endedAt: start + 10 * 60_000, outcome: null },
+      ],
+    };
+    host.postDispatchedCostsIfMoved();
+    const sign = () =>
+      host.cards[0].chips
+        .find((chip: any) => chip.metric === 'cost')
+        .warnings?.find((warning: any) => warning.scope === 'cache-expiry');
+    assert.ok(sign(), 'appending only child facts did not sign the drawn parent card');
+    const amount = sign().dollars;
+    const label = host.cards[0].chips.find((chip: any) => chip.metric === 'cost').detailList.entries[0].label;
+    assert.match(label, /return from a subagent/);
+    live = false;
+    vi.setSystemTime(NOW + 60 * 60_000);
+    host.cards = [host.renderTurnCard(turn, false, 'Child cache expiry', Date.now())];
+    assert.equal(sign()?.dollars, amount, 'quiet expiry contracted child attribution to main completion');
+    host.exitedSinceKeys = new Map([[turn.sessionId, Date.now()]]);
+    host.cards = [host.renderTurnCard(turn, false, 'Child cache expiry', Date.now())];
+    assert.equal(sign()?.dollars, amount, 'host exit removed recorded child history');
+    Object.assign(outcome, { openChildren: [], closedChildren: [{ id: 'child', closedAt: start + 10 * 60_000 }] });
+    host.cards = [host.renderTurnCard(turn, false, 'Child cache expiry', Date.now())];
+    assert.equal(sign()?.dollars, amount, 'child completion removed its return at closure equality');
+    sources = JSON.parse(JSON.stringify(sources));
+    host = create();
+    host.cards = [host.renderTurnCard(turn, false, 'Child cache expiry', Date.now())];
+    assert.equal(sign()?.dollars, amount, 'reload required remembered live-child state');
+    Object.assign(outcome, { processEndedAt: start + 5 * 60_000 });
+    host.cards = [host.renderTurnCard(turn, false, 'Child cache expiry', Date.now())];
+    assert.equal(sign(), undefined, 'recorded process end admitted a later child return');
+    delete (outcome as { processEndedAt?: number }).processEndedAt;
+    sources[turn.sessionId].childSources = [];
+    host.postDispatchedCostsIfMoved();
+    assert.equal(sign(), undefined, 'source removal retained a child warning');
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('simultaneous live activity scans native child returns once and preserves unchanged prices', async () => {
+  const { ChildCacheExpiryAttribution } = await import('./childcacheexpiry.js');
+  const { publicProjectSpendPrice } = await import('./projectspend.js');
+  vi.useFakeTimers();
+  try {
+    const { turn: fixtureTurn, expiry } = cacheExpiryReturnTurn();
+    const turns = Array.from({ length: 40 }, (_, at) => ({ ...fixtureTurn, sessionId: `parent-${at}` }));
+    const sources: Record<string, any> = Object.fromEntries(
+      turns.map((turn, session) => [
+        turn.sessionId,
+        {
+          ...expiry,
+          returns: [],
+          childSources: Array.from({ length: 25 }, (_, at) => ({
+            source: `agent-${session}-${at}.jsonl`,
+            revision: {},
+            endedAt: null,
+            outcome: null,
+            facts: {
+              ...expiry,
+              truncated: false,
+              counts: { '5m': 32, '30m': 0, '1h': 0 },
+              returns: Array.from({ length: 32 }, () => ({
+                ...expiry.returns[0],
+                timestamp: turn.startedAt + 10_000,
+              })),
+            },
+          })),
+        },
+      ]),
+    );
+    const engine = new ChildCacheExpiryAttribution();
+    const quote = vi.fn<typeof publicProjectSpendPrice>(publicProjectSpendPrice);
+    let inspections = 0;
+    const host = Object.assign(Object.create(PanelProvider.prototype), {
+      live: {},
+      liveActivity: {},
+      activitySessions: new Set(),
+      activityPost: null,
+      turnsByKey: new Map(turns.map((turn) => [turnKey(turn), turn])),
+      newestBySession: new Map(turns.map((turn) => [turn.sessionId, turn])),
+      sessionNames: new SessionNames(),
+      sessionOutcomes: new Map(),
+      hosts: [],
+      cards: turns.map((turn) => ({ kind: 'turn', key: turnKey(turn), sessionTitle: 'Parent' })),
+      projectSpendHydrated: true,
+      lifetimeFiguresBySession: () => ({ cacheExpiryFacts: sources }),
+      dispatchedTurnCosts: () => ({}),
+      dispatchedCostsForTurn: () => [],
+      folders: () => [],
+      runningSessions: () => new Set(),
+      liveOpenChildren: () => new Map(),
+      railStatuses: () => ({ statuses: new Map(), openChildren: new Map() }),
+      childCacheExpiryAttribution: {
+        read: (...args: Parameters<typeof engine.read>) =>
+          engine.read(args[0], args[1], args[2], args[3], args[4], quote, () => inspections++),
+      },
+    });
+    for (const batch of [0, 1, 2]) {
+      if (batch === 2) sources[turns[0].sessionId].childSources[0].revision = {};
+      inspections = 0;
+      quote.mockClear();
+      for (const turn of turns) {
+        host.noteActivity(turn.sessionId, {
+          kind: 'tool',
+          sourceId: `activity-${batch}`,
+          name: 'Bash',
+          headline: '',
+          detail: 'npm test',
+          status: 'running',
+        });
+      }
+      vi.runOnlyPendingTimers();
+      assert.equal(inspections, 32_000, 'simultaneous activity rescanned unrelated child returns');
+      assert.equal(
+        quote.mock.calls.length,
+        batch === 0 ? 64_000 : batch === 1 ? 0 : 64,
+        'activity repriced unchanged native sources',
+      );
+      assert.equal(host.cards.length, 40);
+      assert.ok(
+        host.cards.every((card: any) => card.chips.find((chip: any) => chip.metric === 'cost')?.warnings?.length),
+        'the activity batch lost child warnings',
+      );
+    }
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
 // Post a catalog render of sessions listed newest first, then append to the third newest transcript, redraw, and mark it running.
 // Running sessions are among the newest, so the appended session moves from third place to first.
 async function appendedSessionBytes(count: number): Promise<{ render: number; rail: number }> {

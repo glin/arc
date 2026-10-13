@@ -28,6 +28,10 @@ import { createClaudeRepeatedFilter } from './clauderepeated.ts';
 import { tempDir } from './temproot.ts';
 import { sessionCacheExpiryStats } from './turncard.ts';
 import { readSessionRequests } from './sessioncost.ts';
+import { ChildCacheExpiryAttribution } from './childcacheexpiry.ts';
+import { readSession } from './transcript.ts';
+import { toCard, turnCacheExpiryWarning } from './turncard.ts';
+import { turnKey } from './domain/read.ts';
 
 const dir = () => tempDir('cache-expiry-');
 
@@ -1552,7 +1556,7 @@ test('a saved Codex ledger waiting on a compaction a later one replaced is rebui
 
 // ## The selector beside the turn stats
 
-test('session cache facts come only from one complete primary source', () => {
+test('session cache facts require one complete primary source', () => {
   const ready = indexed(
     [
       claudePrompt(0, 'p1'),
@@ -1585,6 +1589,103 @@ test('session cache facts come only from one complete primary source', () => {
     sessionCacheFactsBySession([legacy], [{ sessionId: 'legacy', file: legacy.file, primary: true }]),
     {},
   );
+});
+
+test('real Claude sidechain returns count on the session and warn on their parent turn', () => {
+  const main = indexed(
+    [claudePrompt(0, 'parent'), claudeResponse(1, { id: 'parent-response', input: 100 })],
+    claudeReducer,
+  );
+  const childReducer: UsageReducerFactory<ClaudeUsageReducerState> = (state) =>
+    createClaudeUsageLineReducer(state, { childTranscript: true });
+  const child = (id: string) =>
+    indexed(
+      [
+        claudePrompt(0, id),
+        claudeResponse(1, { id: `${id}-before`, write5m: 4_000_000 }),
+        claudeResponse(10, { id: `${id}-return`, input: 4_000_000 }),
+      ].map((line) => JSON.stringify({ ...JSON.parse(line), isSidechain: true })),
+      childReducer,
+    );
+  const first = child('child-a'),
+    second = child('child-b');
+  const sources = [
+    { sessionId: 'parent', file: main.file, primary: true },
+    { sessionId: 'parent', file: first.file, primary: false },
+    { sessionId: 'parent', file: first.file, primary: false },
+    { sessionId: 'parent', file: second.file, primary: false },
+  ];
+  const cache = sessionCacheFactsBySession([main, first, second], sources);
+  assert.equal(cache.parent.expiry.counts['5m'], 2, 'two native child returns disappeared from the session count');
+  assert.equal(cache.parent.expiry.returns.length, 0, 'child IDs entered the main return list');
+  const turn = { ...readSession(main.file, 'parent').turns[0], sessionId: 'parent' };
+  const attribution = new ChildCacheExpiryAttribution();
+  const costs = attribution.read([turn], { parent: cache.parent.expiry }, BASE + 20 * MINUTE);
+  const warning = turnCacheExpiryWarning(turn, cache.parent.expiry, costs.get(turnKey(turn)));
+  assert.ok(warning?.children && warning.children.count === 2, 'the parent turn lost its two child returns');
+  assert.ok(warning.dollars! >= 1);
+  assert.ok(
+    toCard(turn, false, BASE + 20 * MINUTE, [], null, false, new Set(), [], warning)
+      .chips.find((chip) => chip.metric === 'cost')
+      ?.warnings?.some((item) => item.scope === 'cache-expiry'),
+    'the parent cost figure has no child expiry sign',
+  );
+  assert.equal(turnCacheExpiryWarning(turn, cache.parent.expiry), null, 'child response IDs matched the main warning');
+  const missing = sessionCacheFactsBySession([main, first], sources).parent.expiry;
+  assert.equal(missing.counts['5m'], 1);
+  assert.equal(missing.incompleteSources, 1);
+  assert.equal(cacheExpiryExtraCost(missing, publicProjectSpendPrice).status, 'atLeast');
+  const dispatched = sessionCacheFactsBySession(
+    [main, first],
+    [sources[0], { ...sources[1], dispatchedFrom: 'separate' }],
+  ).parent.expiry;
+  assert.equal(dispatched.counts['5m'], 0);
+  assert.equal(
+    sessionCacheFactsBySession([main, first], [...sources, { sessionId: 'parent', file: first.file, primary: true }])
+      .parent,
+    undefined,
+  );
+  const storage = dir();
+  saveSpendLedger(storage, 'w', [first]);
+  const restored = loadSpendLedger(storage, 'w').files[0];
+  assert.equal(restored.cacheExpiry?.facts.returns[0].timestamp, BASE + 10 * MINUTE);
+  const rebuilt = indexSpendFile(
+    { ...restored, parserGeneration: PROJECT_SPEND_PARSER_GENERATION - 1 },
+    first.file,
+    'w',
+    childReducer,
+    BASE,
+    stillClock,
+  );
+  assert.equal(rebuilt.rebuilt, true);
+  assert.equal(facts(rebuilt.record).counts['5m'], 1);
+});
+
+test('native Codex same-turn requests qualify while primary requests keep their turn boundary', () => {
+  const lines = [
+    codexMeta(),
+    codexTaskStarted(0, 'one'),
+    codexTurnContext(0, 'one', 'gpt-5.6-sol'),
+    codexTokens(1, { input_tokens: 100_000 }),
+    codexTokens(32, { input_tokens: 100_000 }, { input_tokens: 200_000 }),
+  ];
+  const opening = JSON.parse(lines[0]);
+  const native = [
+    JSON.stringify({
+      ...opening,
+      payload: {
+        ...opening.payload,
+        parent_thread_id: 'parent',
+        source: { subagent: { thread_spawn: { parent_thread_id: 'parent' } } },
+      },
+    }),
+    ...lines.slice(1),
+  ];
+  assert.equal(facts(indexed(lines, codexReducer)).counts['30m'], 0);
+  const child = indexed(native, codexReducer);
+  assert.equal(facts(child).counts['30m'], 1);
+  const own = sessionCacheFactsBySession([child], [{ sessionId: 'child', file: child.file, primary: true }]);
+  assert.equal(own.child.expiry.counts['30m'], 1, 'a native child lost its intrinsic policy as its own primary source');
 });
 
 // ## The classifier on its own

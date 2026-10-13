@@ -1,6 +1,10 @@
 // Turn-card tests keep local builders here. Shared builders live in turnfixtures.ts, and cross-module tests live in turnview.test.ts.
 
 import { test, vi } from 'vitest';
+import { ChildCacheExpiryAttribution } from './childcacheexpiry.ts';
+import { turnKey } from './domain/read.ts';
+import { emptyCacheExpiryFacts, publicProjectSpendPrice, type NativeChildCacheFacts } from './projectspend.ts';
+import { turnCacheExpiryWarning } from './turncard.ts';
 import assert from 'node:assert';
 import * as path from 'node:path';
 import * as fs from 'node:fs';
@@ -592,6 +596,174 @@ test('a turn card finds the cache-expiry return that opened it', () => {
   const codex = turn({ agent: 'codex', promptId: 'turn-b' });
   assert.equal(turnCacheExpiryReturn(codex, oneExpiry().returns)?.visibleTurnId, 'codex-turn:turn-b');
   assert.equal(turnCacheExpiryReturn(turn({ agent: 'codex', promptId: 'turn-c' }), oneExpiry().returns), null);
+});
+
+test('child expiry attribution sums its own threshold and retains disjoint recorded history', () => {
+  const start = NOW - 60_000;
+  const usage = tokenUsage({ input: 10_000 });
+  const parent = turn({
+    startedAt: start,
+    endedAt: start + 1_000,
+    finished: true,
+    model: sonnetPart.model,
+    usage,
+    usageParts: [{ ...sonnetPart, usage }],
+  });
+  const entry = (timestamp: number) => ({ ...oneExpiry().returns[0], timestamp });
+  const source = (returns: ReturnType<typeof entry>[]): NativeChildCacheFacts => ({
+    source: 'agent-child.jsonl',
+    revision: {} as NativeChildCacheFacts['revision'],
+    facts: { ...emptyCacheExpiryFacts(), returns },
+    endedAt: null,
+    outcome: null,
+  });
+  const facts = (returns: ReturnType<typeof entry>[]) => ({
+    [parent.sessionId]: { ...emptyCacheExpiryFacts(), childSources: [source(returns)] },
+  });
+  const quote = (dollars: number) => (bucket: { usage: { cacheRead: number } }) => ({
+    dollars: bucket.usage.cacheRead ? 0 : dollars,
+  });
+  for (const dollars of [0.495, 0.5, 0.6]) {
+    const cache = facts([entry(start), entry(start + 10_000)]);
+    const result = new ChildCacheExpiryAttribution().read(
+      [parent],
+      cache,
+      NOW,
+      new Map(),
+      new Set(),
+      quote(dollars) as never,
+    );
+    const cost = result.get(turnKey(parent))!;
+    assert.equal(cost.count, 2);
+    assert.equal(cost.dollars, dollars * 2);
+    const warning = turnCacheExpiryWarning(parent, cache[parent.sessionId], cost);
+    const card = toCard(parent, false, NOW, [], null, false, new Set(), [], warning);
+    assert.equal(
+      Boolean(
+        card.chips.find((chip) => chip.metric === 'cost')?.warnings?.some((item) => item.scope === 'cache-expiry'),
+      ),
+      dollars >= 0.5,
+    );
+    assert.equal(
+      new ChildCacheExpiryAttribution().read([parent], cache, NOW + 1_000_000).get(turnKey(parent))?.count,
+      2,
+      'quiet expiry contracted recorded child history',
+    );
+  }
+  const cache = facts([entry(start + 10_000), entry(start + 20_000), entry(start + 30_000)]);
+  const next = turn({ startedAt: start + 20_000, endedAt: start + 30_000 });
+  const result = new ChildCacheExpiryAttribution().read([parent, next], cache, NOW);
+  assert.equal(result.get(turnKey(parent))?.count, 1);
+  assert.equal(result.get(turnKey(next))?.count, 2, 'the later prompt must own start equality');
+  const capped = { ...parent, processEndedAt: start + 10_000 };
+  assert.equal(
+    new ChildCacheExpiryAttribution().read([capped], cache, NOW).get(turnKey(parent))?.count,
+    1,
+    'recorded process-end equality must remain included',
+  );
+  const reversed = { ...parent, endedAt: start - 1 };
+  assert.equal(new ChildCacheExpiryAttribution().read([reversed], cache, NOW).size, 0);
+  assert.equal(new ChildCacheExpiryAttribution().read([parent, { ...parent }], cache, NOW).size, 0);
+  const unknown = source([{ ...entry(start), previousInputSide: null }]);
+  assert.equal(
+    new ChildCacheExpiryAttribution()
+      .read([parent], { [parent.sessionId]: { ...emptyCacheExpiryFacts(), childSources: [unknown] } }, NOW)
+      .get(turnKey(parent))?.status,
+    'unknown',
+  );
+});
+
+test('parent warnings respect child closure margins before and after main completion and across prompts', () => {
+  const start = NOW - 60_000;
+  const closedAt = start + 10_000;
+  const usage = tokenUsage({ input: 10_000 });
+  const priced = { model: sonnetPart.model, usage, usageParts: [{ ...sonnetPart, usage }] };
+  for (const endedAt of [closedAt - 1_000, closedAt + 3_000]) {
+    for (const offset of [-500, 0, 500, 1_000, 1_001]) {
+      for (const nextPrompt of [false, true]) {
+        if (nextPrompt && endedAt > closedAt) continue;
+        const parent = turn({ ...priced, startedAt: start, endedAt, finished: true });
+        const next = turn({ ...priced, startedAt: closedAt + 250, endedAt: closedAt + 2_000, finished: true });
+        const timestamp = closedAt + offset;
+        const source: NativeChildCacheFacts = {
+          source: 'agent-child.jsonl',
+          childId: 'child',
+          revision: {} as NativeChildCacheFacts['revision'],
+          facts: { ...emptyCacheExpiryFacts(), returns: [{ ...oneExpiry().returns[0], timestamp }] },
+          endedAt: timestamp,
+          outcome: null,
+        };
+        const facts = { [parent.sessionId]: { ...emptyCacheExpiryFacts(), childSources: [source] } };
+        const outcome = {
+          startedAt: parent.startedAt,
+          endedAt,
+          finished: true,
+          error: false,
+          interrupted: false,
+          closedChildren: [{ id: 'child', closedAt }],
+        };
+        const attribution = new ChildCacheExpiryAttribution().read(
+          nextPrompt ? [parent, next] : [parent],
+          facts,
+          NOW,
+          new Map([[parent.sessionId, outcome]]),
+          new Set(),
+          ((bucket) => ({ dollars: bucket.usage.cacheRead ? 0 : 1.2 })) as typeof publicProjectSpendPrice,
+        );
+        const target = nextPrompt && timestamp >= next.startedAt ? next : parent;
+        const warning = turnCacheExpiryWarning(target, facts[parent.sessionId], attribution.get(turnKey(target)));
+        const card = toCard(target, false, NOW, [], null, false, new Set(), [], warning);
+        const signed = Boolean(card.chips.find((chip) => chip.metric === 'cost')?.warnings?.length);
+        assert.equal(
+          signed,
+          offset <= 0 || offset > 1_000,
+          `child closure +${offset}ms signed the parent with main end ${endedAt - closedAt}ms and next prompt ${nextPrompt}`,
+        );
+      }
+    }
+  }
+});
+
+test('a card batch inspects native child returns once and prices only changed source revisions', () => {
+  for (const count of [100, 1000]) {
+    const cards = Array.from({ length: 40 }, (_, at) =>
+      turn({ startedAt: NOW - (40 - at) * 60_000, endedAt: NOW - (40 - at) * 60_000 + 30_000 }),
+    );
+    const sources: NativeChildCacheFacts[] = Array.from({ length: count }, (_, at) => ({
+      source: `agent-${at}.jsonl`,
+      revision: {} as NativeChildCacheFacts['revision'],
+      endedAt: null,
+      outcome: null,
+      facts: {
+        ...emptyCacheExpiryFacts(),
+        counts: { '5m': 32, '30m': 0, '1h': 0 },
+        returns: Array.from({ length: 32 }, (_, request) => ({
+          ...oneExpiry().returns[0],
+          timestamp: NOW - (request + 1) * 60_000 + 10_000,
+        })),
+      },
+    }));
+    const session = cards[0].sessionId;
+    const facts = { [session]: { ...emptyCacheExpiryFacts(), childSources: sources } };
+    const quote = vi.fn<typeof publicProjectSpendPrice>(publicProjectSpendPrice);
+    let inspections = 0;
+    const inspect = () => {
+      inspections++;
+    };
+    const cache = new ChildCacheExpiryAttribution();
+    cache.read(cards, facts, NOW, new Map(), new Set(), quote, inspect);
+    assert.equal(inspections, count * 32, 'initial cards rescanned child returns');
+    assert.equal(quote.mock.calls.length, count * 32 * 2);
+    inspections = 0;
+    quote.mockClear();
+    cache.read(cards, facts, NOW + 1, new Map(), new Set(), quote, inspect);
+    assert.equal(inspections, count * 32, 'warning-change cards rescanned child returns');
+    assert.equal(quote.mock.calls.length, 0, 'unchanged source revisions repriced child returns');
+    facts[session].childSources[0] = { ...sources[0], revision: {} as NativeChildCacheFacts['revision'] };
+    quote.mockClear();
+    cache.read(cards, facts, NOW, new Map(), new Set(), quote);
+    assert.equal(quote.mock.calls.length, 64, 'one source revision repriced other sources');
+  }
 });
 
 test('a turn that returned to an expired cache warns in its cost popover and signs its figure from $1', () => {

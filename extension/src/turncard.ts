@@ -1,4 +1,5 @@
 import { wholePercent } from './view/tokens.ts';
+import type { ChildExpiryCost } from './childcacheexpiry';
 import { outputRateText, type OutputRate } from './outputrate';
 // Reduces turns to card headlines, status, figures, and control text.
 // `turnview.ts` re-exports these projections for compatibility.
@@ -175,6 +176,9 @@ export interface CacheExpiryWarning {
   gapMs: number;
   // The cost added by that return, or null where it cannot be priced.
   dollars: number | null;
+  status?: CacheExpiryCost['status'];
+  children?: ChildExpiryCost;
+  main?: { gapMs: number; dollars: number | null; status: CacheExpiryCost['status'] };
 }
 
 export type SessionMetric = 'cost' | 'turns' | 'context' | 'cache-expiry' | 'files' | 'commits';
@@ -2878,13 +2882,28 @@ export function turnCacheExpiryReturn(
 export function turnCacheExpiryWarning(
   turn: Pick<Turn, 'agent' | 'promptId' | 'responseIds' | 'openingResponseId'>,
   facts: CacheExpiryFacts | null | undefined,
+  children?: ChildExpiryCost,
 ): CacheExpiryWarning | null {
   const found = facts ? turnCacheExpiryReturn(turn, facts.returns) : null;
-  if (!facts || !found) {
+  if (!found && !children) {
     return null;
   }
-  const priced = cacheExpiryExtraCost({ ...facts, returns: [found], truncated: false }, publicProjectSpendPrice);
-  return { scope: 'cache-expiry', gapMs: found.gapMs, dollars: priced.dollars };
+  const priced =
+    found && facts
+      ? cacheExpiryExtraCost(
+          { ...facts, returns: [found], truncated: false, childSources: undefined, incompleteSources: undefined },
+          publicProjectSpendPrice,
+        )
+      : null;
+  if (!children) return { scope: 'cache-expiry', gapMs: found!.gapMs, dollars: priced!.dollars };
+  return {
+    scope: 'cache-expiry',
+    gapMs: found?.gapMs ?? children.longestGapMs,
+    dollars: children.dollars,
+    status: children.status,
+    children,
+    ...(found && priced ? { main: { gapMs: found.gapMs, ...priced } } : {}),
+  };
 }
 
 // "a 1h 12m gap", "an 8h 0m gap", "an 11m gap": the article follows how the figure is spoken.
@@ -2895,10 +2914,21 @@ function gapPhrase(ms: number): string {
 
 // What a drawn card's cache-expiry warning depends on, so a host redraws the card when it moves.
 export function cacheExpiryWarningPrint(warning: CacheExpiryWarning | null): string {
-  return warning ? JSON.stringify([warning.gapMs, warning.dollars]) : '';
+  return warning ? JSON.stringify(warning) : '';
 }
 
 export function cacheExpiryWarningText(warning: CacheExpiryWarning): string {
+  if (warning.children) {
+    const children = warning.children;
+    const added =
+      children.dollars === null
+        ? ''
+        : ` and added ${children.status === 'atLeast' ? 'at least ' : ''}${formatCost(children.dollars) ?? ZERO_COST}`;
+    const childText = `${children.count} ${children.count === 1 ? 'return from a subagent followed an expired cache' : 'returns from subagents followed expired caches'}${added}`;
+    return warning.main
+      ? `${cacheExpiryWarningText({ scope: 'cache-expiry', ...warning.main })}. ${childText}`
+      : childText;
+  }
   const added = warning.dollars === null ? null : (formatCost(warning.dollars) ?? ZERO_COST);
   return `Cache expired after ${gapPhrase(warning.gapMs)}${added ? ` and added ${added}` : ''}`;
 }
@@ -2913,7 +2943,7 @@ export interface CacheExpiryCountFact {
 export function cacheExpiryReturnCount(facts: CacheExpiryFacts): CacheExpiryCountFact {
   return {
     count: facts.counts['5m'] + facts.counts['30m'] + facts.counts['1h'],
-    atLeast: facts.unavailable > 0,
+    atLeast: facts.unavailable > 0 || Boolean(facts.incompleteSources),
   };
 }
 
@@ -2926,9 +2956,11 @@ export function sessionCacheExpiryStats(facts: CacheExpiryFacts): SessionStatChi
   const lifetimeParts = (['5m', '30m', '1h'] as const)
     .filter((lifetime) => facts.counts[lifetime] > 0)
     .map((lifetime) => `${facts.counts[lifetime]} at ${lifetime}`);
+  const allReturns = (test: (item: CacheExpiryReturn) => boolean) =>
+    facts.returns.some(test) || (facts.childSources ?? []).some((source) => source.facts.returns.some(test));
   const detailList: StatDetailList = {
     layout: 'economics',
-    heading: { label: 'Cache expiry', value: `${count} affected ${count === 1 ? 'turn' : 'turns'}` },
+    heading: { label: 'Cache expiry', value: `${count} return ${count === 1 ? 'request' : 'requests'}` },
     entries: [
       { label: 'Cache lifetimes', value: lifetimeParts.join(' · ') },
       { label: 'Cost added', value: costAddedLabel(facts), valueTitle: CACHE_EXPIRY_COST_ADDED_HINT },
@@ -2938,23 +2970,26 @@ export function sessionCacheExpiryStats(facts: CacheExpiryFacts): SessionStatChi
       ...(facts.excluded > 0 ? [{ label: 'Excluded ambiguous events', value: String(facts.excluded) }] : []),
     ],
     footer: [
-      ...(facts.returns.some((item) => item.request.reportedCost !== null)
+      ...(facts.incompleteSources
+        ? ['Subagent records are incomplete. Cache expiry counts and cost added are lower bounds.']
+        : []),
+      ...(allReturns((item) => item.request.reportedCost !== null)
         ? ['One or more affected requests have only a provider-reported total. Cost added is not available for them.']
         : []),
-      // The scan names the turn of every return it records, so a return without one was saved
-      // by an older ledger that recorded no reusable size.
-      ...(facts.returns.some((item) => item.previousInputSide === null && item.visibleTurnId !== null)
+      ...(allReturns(
+        (item) => item.previousInputSide === null && (item.timestamp != null || item.visibleTurnId !== null),
+      )
         ? [
             'One or more affected requests follow a compaction whose cached size is not recorded. Cost added is not available for them.',
           ]
         : []),
-      ...(facts.returns.some((item) => item.previousInputSide === null && item.visibleTurnId === null)
+      ...(allReturns((item) => item.previousInputSide === null && item.timestamp == null && item.visibleTurnId === null)
         ? [
             'One or more affected requests were recorded before Arc measured cost added. Cost added is not available for them.',
           ]
         : []),
     ],
-    ...(facts.returns.some((item) => item.request.agent === 'codex')
+    ...(allReturns((item) => item.request.agent === 'codex')
       ? { notes: ['The record does not identify every cache-key change.'] }
       : {}),
   };
@@ -3513,7 +3548,13 @@ function chipsOf(
       expiry,
     );
     const warnings: (CacheWriteWarning | CacheExpiryWarning)[] = [
-      ...(expiry && expiry.dollars !== null && expiry.dollars >= CACHE_EXPIRY_SIGN_DOLLARS ? [expiry] : []),
+      ...(expiry &&
+      ((expiry.dollars !== null && expiry.dollars >= CACHE_EXPIRY_SIGN_DOLLARS) ||
+        (expiry.main?.dollars !== null &&
+          expiry.main?.dollars !== undefined &&
+          expiry.main.dollars >= CACHE_EXPIRY_SIGN_DOLLARS))
+        ? [expiry]
+        : []),
       ...writeWarnings,
     ];
     const detail = flatDetailList(detailList).join('\n');

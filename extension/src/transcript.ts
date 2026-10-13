@@ -8460,6 +8460,7 @@ function reduceClaudeUsageLineEvents(
 }
 
 export interface ClaudeUsageLineReducer {
+  nativeChildRequests(): boolean;
   parserKind: 'claude';
   acceptsLine(line: string): boolean;
   pushLine(line: string, end?: number): readonly UsageEvent[];
@@ -8475,6 +8476,7 @@ export interface ClaudeUsageLineReducer {
 
 export interface ClaudeUsageLineReducerOptions {
   childTranscript?: boolean;
+  nativeChildRequests?: boolean;
   // Reconciliation owns this state exclusively. Full retention adopts and checkpoints it without copying its history.
   retainAllRequests?: boolean;
 }
@@ -8616,6 +8618,7 @@ export function createClaudeUsageLineReducer(
         : emptyClaudeUsageReducerState();
   return {
     parserKind: 'claude',
+    nativeChildRequests: () => opts.childTranscript === true || opts.nativeChildRequests === true,
     acceptsLine: acceptsClaudeUsageLine,
     pushLine: (line, end) => {
       state.costState ??= emptyClaudeCostCapture();

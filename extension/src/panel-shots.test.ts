@@ -5,7 +5,7 @@ import { tempDir } from './temproot.ts';
 import * as path from 'node:path';
 import type { Page } from 'playwright-core';
 import { firstProjectPayload, shoot, writeLosslessWebp, runPanelShots, panelShotDestination, loadBoundedPanelCapture } from '../scripts/panel-shots.ts';
-import { RAIL_STATS, renderPayload } from './panelfixture.ts';
+import { RAIL_STATS, renderPayload, costOverheadsPayload } from './panelfixture.ts';
 import { missingUsageLimits, publish } from '../scripts/readme-shots.ts';
 import { DEMO_LABELS, DEMO_SESSION_IDS, README_SCENES, demoPayload, readmePayload } from '../scripts/readme-fixture.ts';
 import { turnCost } from './turncard.ts';
@@ -30,6 +30,14 @@ import type { TurnComment } from './turncomments.ts';
 import { groupCommitRows } from './view/card-presentation.ts';
 
 vi.mock('node:fs', async (importOriginal) => ({ ...await importOriginal<typeof import('node:fs')>() }));
+
+test('cost overheads fixture reaches independent main and child expiry warnings', () => {
+  const payload = costOverheadsPayload() as { cards: TurnCard[]; stats: Record<string, SessionStatChip[]> };
+  const warnings = payload.cards.map((card) => card.chips.find((chip) => chip.metric === 'cost')?.warnings?.find((warning) => warning.scope === 'cache-expiry'));
+  assert.ok(warnings[0]?.scope === 'cache-expiry' && !warnings[0].children);
+  assert.ok(warnings[1]?.scope === 'cache-expiry' && warnings[1].children?.count === 2 && !warnings[1].main);
+  assert.equal(payload.stats.s1.find((chip) => chip.metric === 'cache-expiry')?.label, '6 cache expiries');
+});
 
 test('ordinary shots command awaits the bounded owner capture and preserves its failure', async () => {
   const argv = ['--owner', '2026-10-07-example', '--run', 'one', '--reservation', '1000000', '--shots', 'wide'];

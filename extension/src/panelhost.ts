@@ -241,6 +241,7 @@ import {
 } from './turnplaces';
 import type { DraftOrigin } from './composerview';
 import { ClaudeChildWorkCache, liveTimelineChildren, outcomesFor, timelineRailState } from './timelinestate';
+import { ChildCacheExpiryAttribution, type ChildExpiryCost } from './childcacheexpiry';
 import {
   agentRunAnswer,
   sessionParentEdgeSet,
@@ -1066,7 +1067,7 @@ type LifetimeFigures = Readonly<{
   costs: Readonly<Record<string, Readonly<SessionCostTotal>>>;
   contextDetails: Readonly<Record<string, Readonly<SessionContextDetail>>>;
   cacheExpiryCounts: Readonly<Record<string, Readonly<CacheExpiryCountFact> | null>>;
-  // The cache-expiry facts each turn card reads its own return from, by session.
+  // Main returns and source-tagged native child facts, by session.
   cacheExpiryFacts: Readonly<Record<string, Readonly<CacheExpiryFacts>>>;
   // What each dispatched session adds to each session above it, by receiving session and then by
   // dispatched session. Only turn cards read it. The rail and the heading never do.
@@ -1103,7 +1104,7 @@ interface SessionLifetimeFigures {
   // The exact cache-expiry return count `cache-expiry:` matches on, and whether it is a floor.
   // Null where the session's primary source is not yet a complete, fully scanned single source.
   cacheExpiryCount: CacheExpiryCountFact | null;
-  // The facts the heading figure reads, which turn cards match their own return against.
+  // The heading's aggregate facts and the sources used for turn attribution.
   cacheExpiryFacts: CacheExpiryFacts | null;
 }
 
@@ -1839,6 +1840,7 @@ export class PanelProvider implements vscode.Disposable {
   private dispatchedCardPrints = new Map<string, string>();
   // The cache-expiry warning each drawn turn card shows, by card key.
   private cacheExpiryCardPrints = new Map<string, string>();
+  private childCacheExpiryAttribution = new ChildCacheExpiryAttribution();
   private projectSpendFiles: SpendFileIndex[] = [];
   private projectSpendVisibleFiles: SpendFileIndex[] = [];
   private projectSpendQueue: { file: string; agent: AgentKind; primary?: boolean }[] = [];
@@ -5085,7 +5087,19 @@ export class PanelProvider implements vscode.Disposable {
       this.activityPost = null;
       const sessions = [...this.activitySessions];
       this.activitySessions.clear();
-      const missing = sessions.filter((heldSession) => !this.postActivity(heldSession));
+      const drawn = sessions.some((heldSession) => {
+        const turn = this.newestBySession?.get(heldSession);
+        return turn && this.cards.some((card) => card.kind === 'turn' && card.key === turnKey(turn));
+      });
+      const expiryFacts = drawn ? this.lifetimeFiguresBySession().cacheExpiryFacts : undefined;
+      const childCosts = expiryFacts
+        ? this.childExpiryCosts(
+            [...(this.turnsByKey?.values() ?? []), ...(this.newestBySession?.values() ?? [])],
+            expiryFacts,
+            Date.now(),
+          )
+        : new Map<string, ChildExpiryCost>();
+      const missing = sessions.filter((heldSession) => !this.postActivity(heldSession, childCosts, expiryFacts));
       if (missing.length) {
         this.wakeFromActivityFallback(missing);
       }
@@ -5138,7 +5152,11 @@ export class PanelProvider implements vscode.Disposable {
   }
 
   // Update an existing card with live activity. A missing recorded card wakes the watcher refresh.
-  private postActivity(session: string): boolean {
+  private postActivity(
+    session: string,
+    childCosts?: ReadonlyMap<string, ChildExpiryCost>,
+    expiryFacts?: LifetimeFigures['cacheExpiryFacts'],
+  ): boolean {
     const recorded = this.newestBySession.get(session);
     const index = recorded
       ? this.cards.findIndex((card) => card.kind === 'turn' && card.key === turnKey(recorded))
@@ -5162,6 +5180,10 @@ export class PanelProvider implements vscode.Disposable {
       this.folders(),
       this.runningSessions(),
       this.liveOpenChildren(now),
+      undefined,
+      undefined,
+      expiryFacts ? () => expiryFacts : undefined,
+      childCosts,
     );
     this.cards[index] = card;
     const light = isLightColourTheme();
@@ -8638,6 +8660,12 @@ export class PanelProvider implements vscode.Disposable {
     let held: ReturnType<typeof this.dispatchedTurnCosts> | undefined;
     const costs = () => (held ??= this.dispatchedTurnCosts());
     const expiryFacts = this.lifetimeFiguresBySession().cacheExpiryFacts;
+    const now = Date.now();
+    const childCosts = this.childExpiryCosts(
+      [...this.turnsByKey.values(), ...this.newestBySession.values()],
+      expiryFacts,
+      now,
+    );
     const current = new Map<string, string>();
     const currentExpiry = new Map<string, string>();
     const turns = new Map<string, Turn>();
@@ -8647,7 +8675,10 @@ export class PanelProvider implements vscode.Disposable {
       const recorded = newest && turnKey(newest) === card.key ? newest : this.turnsByKey.get(card.key);
       if (!recorded) continue;
       const turn = newest === recorded ? this.withActivity(recorded) : recorded;
-      currentExpiry.set(card.key, cacheExpiryWarningPrint(turnCacheExpiryWarning(turn, expiryFacts[turn.sessionId])));
+      currentExpiry.set(
+        card.key,
+        cacheExpiryWarningPrint(turnCacheExpiryWarning(turn, expiryFacts[turn.sessionId], childCosts.get(card.key))),
+      );
       turns.set(card.key, recorded);
       if (!dispatchedPrints.has(card.key)) continue;
       const counted = this.dispatchedCostsForTurn(turn, costs);
@@ -8658,7 +8689,6 @@ export class PanelProvider implements vscode.Disposable {
       ...movedDispatchedCards(expiryPrints, currentExpiry),
     ]);
     if (!moved.size) return;
-    const now = Date.now();
     const folders = this.folders();
     const running = this.runningSessions();
     const children = this.liveOpenChildren(now);
@@ -8684,6 +8714,7 @@ export class PanelProvider implements vscode.Disposable {
         statuses,
         costs,
         () => expiryFacts,
+        childCosts,
       );
       this.cards[index] = card;
       changed.push(card);
@@ -8699,10 +8730,38 @@ export class PanelProvider implements vscode.Disposable {
     recordedTurn: Turn,
     turn: Turn,
     facts: () => Readonly<Record<string, Readonly<CacheExpiryFacts>>>,
+    children?: ReadonlyMap<string, ChildExpiryCost>,
+    now = Date.now(),
   ): CacheExpiryWarning | null {
-    const expiry = turnCacheExpiryWarning(turn, facts()[turn.sessionId]);
+    const allFacts = facts();
+    const childCosts =
+      children ??
+      this.childExpiryCosts(
+        [...(this.turnsByKey?.values() ?? []), ...(this.newestBySession?.values() ?? []), recordedTurn],
+        allFacts,
+        now,
+      );
+    const expiry = turnCacheExpiryWarning(turn, allFacts[turn.sessionId], childCosts.get(turnKey(recordedTurn)));
     (this.cacheExpiryCardPrints ??= new Map()).set(turnKey(recordedTurn), cacheExpiryWarningPrint(expiry));
     return expiry;
+  }
+
+  private childExpiryCosts(
+    turns: readonly Turn[],
+    facts: LifetimeFigures['cacheExpiryFacts'],
+    now: number,
+  ): Map<string, ChildExpiryCost> {
+    if (!Object.values(facts).some((fact) => fact.childSources?.length)) return new Map();
+    const unique = new Map(turns.map((turn) => [turnKey(turn), turn]));
+    const ongoing = new Set(this.runningSessions());
+    for (const [sessionId, children] of this.liveOpenChildren(now)) if (children.length) ongoing.add(sessionId);
+    return (this.childCacheExpiryAttribution ??= new ChildCacheExpiryAttribution()).read(
+      [...unique.values()],
+      facts,
+      now,
+      this.sessionOutcomes,
+      ongoing,
+    );
   }
 
   private dispatchedDiscoveryWaiting(): boolean {
@@ -9254,7 +9313,17 @@ export class PanelProvider implements vscode.Disposable {
           revision = null;
         }
       }
-      if (projectSpendOfferDecision(previous, revision, cutoff) !== 'queue') {
+      const childPolicy =
+        agent === 'claude' &&
+        (primary === false ||
+          this.sessionSpendSources.some(
+            (source) => source.nativeParentFile !== undefined && normalizeSpendFile(source.file) === key,
+          ));
+      const decision = projectSpendOfferDecision(previous, revision, cutoff);
+      if (
+        decision === 'skip' ||
+        (decision !== 'queue' && (agent !== 'claude' || (previous?.cacheExpiryChildPolicy ?? false) === childPolicy))
+      ) {
         return;
       }
       this.projectSpendQueued.add(key);
@@ -9316,6 +9385,9 @@ export class PanelProvider implements vscode.Disposable {
         ? (state: unknown) =>
             createClaudeUsageLineReducer(state as Parameters<typeof createClaudeUsageLineReducer>[0], {
               childTranscript: next.primary === false,
+              nativeChildRequests: this.sessionSpendSources.some(
+                (source) => source.nativeParentFile !== undefined && normalizeSpendFile(source.file) === key,
+              ),
             })
         : (state: unknown) => createCodexUsageLineReducer(state as Parameters<typeof createCodexUsageLineReducer>[0]);
     const result = indexSpendFile(previous, next.file, workspace, makeReducer);
@@ -11790,6 +11862,7 @@ export class PanelProvider implements vscode.Disposable {
     // The session cache-expiry facts are also read once for the batch.
     let batchExpiry: ReturnType<typeof this.lifetimeFiguresBySession>['cacheExpiryFacts'] | undefined;
     const cacheExpiryFacts = () => (batchExpiry ??= this.lifetimeFiguresBySession().cacheExpiryFacts);
+    const childCosts = this.childExpiryCosts(listed, cacheExpiryFacts(), now);
     this.drawnOpenChildren = openChildrenKey(liveChildren, this.liveBackgroundCommands(now));
     return listed.map((recordedTurn) => {
       const latest = newestOf.get(recordedTurn.sessionId) === recordedTurn.startedAt;
@@ -11804,6 +11877,7 @@ export class PanelProvider implements vscode.Disposable {
         dispatchStatuses,
         dispatchedCosts,
         cacheExpiryFacts,
+        childCosts,
       );
       return { ...card, at: recordedTurn.startedAt };
     });
@@ -11823,6 +11897,7 @@ export class PanelProvider implements vscode.Disposable {
       this.dispatchedTurnCosts(),
     cacheExpiryFacts: () => Readonly<Record<string, Readonly<CacheExpiryFacts>>> = () =>
       this.lifetimeFiguresBySession().cacheExpiryFacts,
+    childCosts?: ReadonlyMap<string, ChildExpiryCost>,
   ): RenderCard {
     const activeTurn = latest ? this.withActivity(recordedTurn) : recordedTurn;
     const rate =
@@ -11844,7 +11919,7 @@ export class PanelProvider implements vscode.Disposable {
         dispatchedCostPrint(counted, this.projectSpendHydrated, this.dispatchedDiscoveryWaiting()),
       );
     }
-    const expiry = this.cardCacheExpiryWarning(recordedTurn, turn, cacheExpiryFacts);
+    const expiry = this.cardCacheExpiryWarning(recordedTurn, turn, cacheExpiryFacts, childCosts, now);
     // Only prompt activity supplies text under You asked. Compaction activity carries no prompt text.
     const card = toCard(
       turn,

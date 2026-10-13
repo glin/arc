@@ -1133,6 +1133,7 @@ export const CODEX_USAGE_ASSOCIATION_LIMIT = 64;
 
 // JSON data only, so a scanner can persist it together with its file position.
 export interface CodexUsageReducerState {
+  nativeCacheChild?: boolean;
   provider: string | null;
   openingTimestamp: number | null;
   openingSessionId: string | null;
@@ -1698,6 +1699,8 @@ function reduceCodexUsageEventsInner(state: CodexUsageReducerState, record: Code
       state.foreignSessionMeta = sessionId !== state.openingSessionId;
     }
     if (!state.foreignSessionMeta) {
+      const meta = openingRecordOf(JSON.stringify({ type: 'session_meta', payload }));
+      state.nativeCacheChild ||= meta?.parentThreadId !== null && meta?.parentThreadId !== undefined;
       state.agentPath = codexAgentPath(payload) ?? state.agentPath;
       state.nativeSpawnedAt = nativeSpawnPayloadAt(record.timestamp || null, payload) ?? state.nativeSpawnedAt;
     }
@@ -2389,6 +2392,7 @@ export function reduceCodexUsageLineEvents(state: CodexUsageReducerState, line: 
 }
 
 export interface CodexUsageLineReducer {
+  nativeChildRequests(): boolean;
   parserKind: 'codex';
   pushLine(line: string): readonly UsageEvent[];
   snapshot(): CodexUsageReducerState;
@@ -2480,6 +2484,7 @@ export function createCodexUsageLineReducer(restored?: CodexUsageReducerState): 
   const signals: CompactionSignal[] = [];
   return {
     parserKind: 'codex',
+    nativeChildRequests: () => state.nativeCacheChild === true,
     pushLine: (line) => {
       const compactionsBefore = state.compactionCount;
       const events = reduceCodexUsageLineEvents(state, line);

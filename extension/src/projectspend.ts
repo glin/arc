@@ -1,4 +1,5 @@
 import { meterRead } from './readmeter';
+import { combineCacheExpirySummaries, combineCacheExpiryAmounts } from './cacheexpirysummary';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -89,7 +90,7 @@ export interface UsageEvent {
   requestCountExact?: false;
   // Request-order facts do not select daily or lifetime buckets.
   // The visible user turn identifies the prompt under which this request ran.
-  // Null excludes a request whose reducer establishes no visible turn from adjacency comparisons.
+  // Null prevents main-source adjacency comparisons. Native children use their request clocks.
   visibleTurnId?: string | null;
   // The cache lifetime this request's own write bought, where the record names one. Null
   // where the record is silent, and the model's documented lifetime answers instead.
@@ -172,6 +173,7 @@ export interface SpendFileIndex {
   // Null means the reducer supplies no compaction-history method.
   // An absent field requires a source rebuild.
   cacheExpiry?: CacheExpiryLedger | null;
+  cacheExpiryChildPolicy?: boolean;
   // Parser generation that produced this source's buckets and state.
   // A mismatch requires a rebuild even when size and modification time match.
   parserGeneration?: number;
@@ -484,7 +486,7 @@ export function projectSpendSaveRetryDelay(retries: number): number | null {
 }
 // Saved source records require a rebuild when their parser generation differs.
 // Increase this when a stored field changes the conclusions consumers draw from it.
-export const PROJECT_SPEND_PARSER_GENERATION = 59;
+export const PROJECT_SPEND_PARSER_GENERATION = 60;
 
 export function projectSpendSourceOfferDue(listingMoved: boolean, now: number, lastOfferAt: number): boolean {
   return listingMoved || now - lastOfferAt >= PROJECT_SPEND_INTEGRITY_MILLISECONDS;
@@ -531,6 +533,7 @@ export function projectSpendOfferDecision(
 }
 
 export interface UsageLineReducer<State = unknown> {
+  nativeChildRequests?(): boolean;
   acceptsLine?(line: string): boolean;
   parserKind?: 'claude' | 'codex';
   pushLine(line: string, end?: number): readonly UsageEvent[];
@@ -964,6 +967,7 @@ export function aggregateUsageEvents(
 
 // One qualifying return, kept in the shape the cost resolver already quotes.
 export interface CacheExpiryReturn {
+  timestamp?: number | null;
   // The lifetime that had run out on the previous request.
   lifetime: CacheTier;
   // The request-to-request gap that crossed it, in milliseconds.
@@ -985,6 +989,8 @@ export interface CacheExpiryReturn {
 }
 
 export interface CacheExpiryFacts {
+  childSources?: NativeChildCacheFacts[];
+  incompleteSources?: number;
   // Exact qualifying returns, split by the lifetime that ran out. These counts stay exact
   // however many returns the source held.
   counts: Record<CacheTier, number>;
@@ -998,7 +1004,7 @@ export interface CacheExpiryFacts {
   // Expired-cache pairs excluded for changed compaction count, model, provider, service tier, inference region, effort, or tool-list version.
   // Unknown effort or tool-list version does not establish a change.
   excluded: number;
-  // Pairs with unknown lifetime, invalid or out-of-order clocks, incomplete requests, or no visible turn.
+  // Pairs with unknown lifetime, invalid clocks, incomplete requests, or main requests with no visible turn.
   // Delayed requests older than the current carry also count here.
   unavailable: number;
 }
@@ -1125,15 +1131,16 @@ export function classifyCacheExpiry(
   previous: CacheExpiryCarry,
   next: CacheExpiryCarry,
   nextUsage: UsageCounts,
+  nativeChild = false,
 ): CacheExpiryVerdict {
-  if (previous.visibleTurnId === null || next.visibleTurnId === null) {
+  if (!nativeChild && (previous.visibleTurnId === null || next.visibleTurnId === null)) {
     return { kind: 'unavailable' };
   }
   const from = previous.compaction;
   const fromTime = from ? (from.at ?? 0) : previous.timestamp;
   const fromCompactions = from ? from.ordinal : previous.compactionsBefore;
   // Requests under the same visible prompt do not qualify as a return after cache expiry.
-  if (previous.visibleTurnId === next.visibleTurnId) {
+  if (!nativeChild && previous.visibleTurnId === next.visibleTurnId) {
     return { kind: 'none' };
   }
   if (!positiveClock(fromTime) || !positiveClock(next.timestamp) || next.timestamp < fromTime) {
@@ -1273,7 +1280,10 @@ export class CacheExpiryScan {
   private newestReturnKey: string | null;
   private newestCompactionKey: string | null;
 
-  constructor(previous?: CacheExpiryLedger) {
+  constructor(
+    previous?: CacheExpiryLedger,
+    private readonly nativeChild: () => boolean = () => false,
+  ) {
     const restored = previous ?? emptyCacheExpiryLedger();
     this.facts = {
       counts: { ...restored.facts.counts },
@@ -1392,6 +1402,7 @@ export class CacheExpiryScan {
     this.carry = revised;
     const newestReturn = this.facts.returns[this.facts.returns.length - 1];
     if (newestReturn && this.newestReturnKey === event.requestKey) {
+      newestReturn.timestamp = positiveClock(event.timestamp) ? event.timestamp : null;
       newestReturn.request = requestBucket(event);
       newestReturn.firstPassUsage = event.firstPassUsage;
       newestReturn.firstPassContextBand = event.firstPassContextBand;
@@ -1454,7 +1465,7 @@ export class CacheExpiryScan {
   }
 
   private judge(previous: CacheExpiryCarry, next: CacheExpiryCarry, event: UsageEvent): void {
-    const verdict = classifyCacheExpiry(previous, next, event.firstPassUsage ?? event.usage);
+    const verdict = classifyCacheExpiry(previous, next, event.firstPassUsage ?? event.usage, this.nativeChild());
     if (verdict.kind === 'unavailable') {
       this.facts.unavailable++;
       return;
@@ -1470,6 +1481,7 @@ export class CacheExpiryScan {
     this.facts.longestGapMs =
       this.facts.longestGapMs === null ? verdict.gapMs : Math.max(this.facts.longestGapMs, verdict.gapMs);
     this.facts.returns.push({
+      timestamp: positiveClock(event.timestamp) ? event.timestamp : null,
       lifetime: verdict.lifetime,
       gapMs: verdict.gapMs,
       request: requestBucket(event),
@@ -1536,6 +1548,36 @@ export interface CacheExpiryCost {
   status: 'exact' | 'atLeast' | 'unknown';
 }
 
+export interface PricedCacheExpiryReturn {
+  item: CacheExpiryReturn;
+  cost: CacheExpiryCost;
+}
+const childExpiryPrices = new WeakMap<
+  SpendFileIndex,
+  Map<ProjectSpendPricer, { facts: CacheExpiryFacts; returns: PricedCacheExpiryReturn[] }>
+>();
+
+// Pricing depends on accepted record identity, its facts, and the pricing function's context.
+export function pricedNativeCacheReturns(
+  source: NativeChildCacheFacts,
+  pricer: ProjectSpendPricer,
+): readonly PricedCacheExpiryReturn[] {
+  let prices = childExpiryPrices.get(source.revision);
+  if (!prices) childExpiryPrices.set(source.revision, (prices = new Map()));
+  let held = prices.get(pricer);
+  if (!held || held.facts !== source.facts) {
+    held = {
+      facts: source.facts,
+      returns: source.facts.returns.map((item) => ({
+        item,
+        cost: cacheExpiryExtraCost({ ...emptyCacheExpiryFacts(), returns: [item] }, pricer),
+      })),
+    };
+    prices.set(pricer, held);
+  }
+  return held.returns;
+}
+
 // The tokens a return paid to resend context a warm cache could have held, at the rates they
 // paid, and the same tokens as a cache read. The reusable size is the previous input side less
 // what the return still read. The resent part comes from the 1-hour, 30-minute, and 5-minute
@@ -1567,6 +1609,34 @@ export function cacheExpiryRebuiltUsage(
 // with no recorded prefix has no reusable size. The result is unknown when no return is priced,
 // unless the complete return list is empty.
 export function cacheExpiryExtraCost(facts: CacheExpiryFacts, pricer: ProjectSpendPricer): CacheExpiryCost {
+  if (facts.childSources?.length || facts.incompleteSources) {
+    const parts = [
+      cacheExpiryExtraCost({ ...facts, childSources: undefined, incompleteSources: undefined }, pricer),
+      ...(facts.childSources ?? []).map((source): CacheExpiryCost => {
+        const returns = pricedNativeCacheReturns(source, pricer);
+        const known = returns.filter((item) => item.cost.dollars !== null);
+        const partial = source.facts.truncated || returns.some((item) => item.cost.status !== 'exact');
+        return {
+          dollars: known.length
+            ? known.reduce((sum, item) => sum + item.cost.dollars!, 0)
+            : returns.length || partial
+              ? null
+              : 0,
+          status: partial ? (known.length ? 'atLeast' : 'unknown') : 'exact',
+        };
+      }),
+    ];
+    const scopes = [facts, ...(facts.childSources ?? []).map((source) => source.facts)];
+    const eligible = parts.filter((part, at) => scopes[at].returns.length > 0 || part.status !== 'exact');
+    if (facts.incompleteSources) eligible.push({ dollars: null, status: 'unknown' });
+    const combined = combineCacheExpiryAmounts(
+      eligible.map((part) => ({ dollars: part.dollars, partial: part.status !== 'exact' })),
+    );
+    return {
+      dollars: combined.dollars,
+      status: combined.partial ? (combined.dollars === null ? 'unknown' : 'atLeast') : 'exact',
+    };
+  }
   let dollars = 0;
   let priced = 0;
   let partial = facts.truncated;
@@ -1729,7 +1799,9 @@ function readIncremental(
       for (const slice of usageBandEvents(event)) addSliceTo(target, slice);
     };
     // Track request order before bucket aggregation removes adjacency.
-    const ordered = reducer.recentCompactions ? new CacheExpiryScan(cacheExpiry ?? undefined) : null;
+    const ordered = reducer.recentCompactions
+      ? new CacheExpiryScan(cacheExpiry ?? undefined, () => reducer.nativeChildRequests?.() === true)
+      : null;
     // Lifetime buckets include estimated compactions. Dated buckets contain recorded requests.
     const add = (event: UsageEvent) => {
       ordered?.push(event);
@@ -1951,10 +2023,13 @@ export function indexSpendFile<State>(
     previous.workspace === normalizedWorkspace &&
     (parserKind === undefined || previous.parserKind === parserKind);
   const lifetimeReady = reusable && spendRecordHasLifetimeFacts(previous);
+  const policyChanged =
+    parserKind === 'claude' && previous?.cacheExpiryChildPolicy !== (emptyReducer.nativeChildRequests?.() === true);
   const unchanged =
     lifetimeReady &&
     previous.complete !== false &&
     previous.missingAt === undefined &&
+    (parserKind !== 'claude' || previous.cacheExpiryChildPolicy === (emptyReducer.nativeChildRequests?.() === true)) &&
     previous.size === stat.size &&
     previous.mtimeMs === stat.mtimeMs;
   if (unchanged) {
@@ -1977,6 +2052,7 @@ export function indexSpendFile<State>(
   const rebuilt =
     !reusable ||
     !lifetimeReady ||
+    policyChanged ||
     previous.missingAt !== undefined ||
     stat.size < previous.size ||
     (!resuming && stat.size === previous.size);
@@ -2039,6 +2115,7 @@ export function indexSpendFile<State>(
     newestTurnStartedAt: reducer.newestTurnStartedAt?.() ?? null,
     outcome: reducer.newestTurnOutcome?.() ?? null,
     cacheExpiry: scanned.cacheExpiry,
+    cacheExpiryChildPolicy: reducer.nativeChildRequests?.() === true,
     parserGeneration: PROJECT_SPEND_PARSER_GENERATION,
     ...(parserKind === undefined ? {} : { parserKind }),
     indexedAt: now,
@@ -3293,11 +3370,20 @@ export function sessionTurnStatsBySession(
   return out;
 }
 
-// Cache-expiry and compaction facts from one complete primary source with no unfinished line.
-// Omit sessions whose primary source is missing, ambiguous, or lacks a cache-expiry ledger.
+// Cache-expiry facts include distinct native children. Compactions remain primary-source facts.
+// Missing or ambiguous primary evidence withholds both projections.
 export interface SessionCacheFacts {
   expiry: CacheExpiryFacts;
   compactions: CompactionFact[];
+}
+
+export interface NativeChildCacheFacts {
+  source: string;
+  childId?: string;
+  revision: SpendFileIndex;
+  facts: CacheExpiryFacts;
+  endedAt: number | null;
+  outcome: TurnOutcome | null;
 }
 
 export function sessionCacheFactsBySession(
@@ -3322,6 +3408,8 @@ export function sessionCacheFactsBySession(
     const record = records.get([...primaryFiles][0]);
     if (
       !record ||
+      record.missingAt !== undefined ||
+      record.parserGeneration !== PROJECT_SPEND_PARSER_GENERATION ||
       record.complete === false ||
       Boolean(record.trailingBytes || record.trailing) ||
       !record.cacheExpiry
@@ -3331,6 +3419,58 @@ export function sessionCacheFactsBySession(
     out[sessionId] = {
       expiry: record.cacheExpiry.facts,
       compactions: record.cacheExpiry.compactions,
+    };
+    const childSources: NativeChildCacheFacts[] = [];
+    const seen = new Set(primaryFiles);
+    let incompleteSources = 0;
+    for (const source of sources) {
+      if (source.sessionId !== sessionId || source.primary !== false || source.dispatchedFrom !== undefined) continue;
+      const key = spendSourceKey(source.file, records);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const child = records.get(key);
+      if (
+        !child ||
+        child.missingAt !== undefined ||
+        child.complete === false ||
+        child.trailingBytes ||
+        child.trailing ||
+        child.parserGeneration !== PROJECT_SPEND_PARSER_GENERATION ||
+        !child.cacheExpiry
+      ) {
+        incompleteSources++;
+        continue;
+      }
+      childSources.push({
+        source: key,
+        childId:
+          child.parserKind === 'codex'
+            ? (child.parserState as { openingSessionId?: string } | undefined)?.openingSessionId
+            : path
+                .basename(key)
+                .replace(/^agent-/, '')
+                .replace(/\.jsonl$/, ''),
+        revision: child,
+        facts: child.cacheExpiry.facts,
+        endedAt: Math.max(child.lastTurnAt ?? 0, child.cacheExpiry.carry?.timestamp ?? 0) || null,
+        outcome: child.outcome ?? null,
+      });
+    }
+    const main = record.cacheExpiry.facts;
+    const combined = combineCacheExpirySummaries(
+      [main, ...childSources.map((child) => child.facts)].map((facts) => ({
+        ...facts,
+        longestGap: facts.longestGapMs,
+      })),
+    );
+    out[sessionId].expiry = {
+      ...main,
+      counts: combined.counts,
+      longestGapMs: combined.longestGap,
+      excluded: combined.excluded,
+      unavailable: combined.unavailable,
+      childSources,
+      incompleteSources,
     };
   }
   return out;

@@ -4317,10 +4317,11 @@ test('Project spend prices an expired return from final executor context across 
       assert.ok(record.cacheExpiry);
       const extra = cacheExpiryExtraCost(record.cacheExpiry.facts, publicProjectSpendPrice);
       assert.equal(extra.status, 'exact');
-      const expected = childTranscript ? 0 : 0.0046;
+      const expected = 0.0046;
       assert.ok(Math.abs(extra.dollars! - expected) < 1e-12, `expired context cost was ${extra.dollars}`);
-      assert.equal(record.cacheExpiry.facts.counts['5m'], childTranscript ? 0 : 1);
-      if (!childTranscript) assert.equal(record.cacheExpiry.facts.returns[0].previousInputSide, 40_000);
+      assert.equal(record.cacheExpiry.facts.counts['5m'], 1);
+      assert.equal(record.cacheExpiry.facts.returns[0].previousInputSide, 40_000);
+      assert.equal(record.cacheExpiry.facts.returns[0].timestamp, record.cacheExpiry.carry?.timestamp);
       assert.equal(record.cacheExpiry.carry?.requestKey, 'claude:return');
     }
     assert.equal(loaded.cacheExpiry?.carry?.inputTokens, 40_000);
