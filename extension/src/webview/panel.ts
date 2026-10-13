@@ -402,6 +402,9 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
       return row && typeof row.newestTurnAt === 'number' ? row.newestTurnAt : null;
     },
     save: saveOpen,
+    operate(operation) {
+      if (!kernel.readOnly) vscode.postMessage({ type: 'readerRead', operation });
+    },
     refreshSelection() {
       if (commentsRenderer) commentsRenderer.refreshSelection();
     },
@@ -1132,6 +1135,11 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
     const message = parsed.type === 'render' || parsed.type === 'rail' ? rowDeltas.expand(parsed) : parsed;
     if (!message) return;
     dispatchHostToPanel(message, {
+      readState: (msg) => {
+        if (readState.synchronize(msg.state)) {
+          repaint();
+        }
+      },
       applySessionFilter: (msg) => {
         if (kernel.readOnly || Date.now() >= msg.deadline || appliedFilters.has(msg.request)) return;
         for (const [request, deadline] of appliedFilters) {

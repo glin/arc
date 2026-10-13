@@ -631,6 +631,7 @@ function hostRecorder(seen: string[]): HostToPanelHandlers {
     seen.push(name);
   };
   return {
+    readState: take('readState'),
     applySessionFilter: take('applySessionFilter'),
     visibility: take('visibility'),
     health: take('health'),
@@ -683,6 +684,7 @@ function panelRecorder(seen: string[]): PanelToHostHandlers<void> {
     seen.push(name);
   };
   return {
+    readerRead: take('readerRead'),
     sessionFilterApplied: take('sessionFilterApplied'),
     contextDetail: take('contextDetail'),
     health: take('health'),

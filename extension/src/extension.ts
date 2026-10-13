@@ -2093,6 +2093,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // The wrapper never clears the block an unknown delivery left. The panel host's `onReaderDirected` port does.
   interveneOnReaderInput(panel, guardedSends);
   // The channel's send reaches the guarded mode of the wrapped `onSendPrompt`, which skips reader intervention.
+  channel?.setGuardedReadHandler((request) => panel.guardedReadRequest(request));
   channel?.setGuardedSendHandler((request) =>
     guardedChannelSend(guardedSends, request, (...args) => panel.onSendPrompt?.(...args) ?? Promise.resolve({})),
   );

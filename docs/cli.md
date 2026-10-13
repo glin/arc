@@ -96,6 +96,12 @@ arc archive SESSION_ID --force --window WINDOW_ID
 arc unarchive SESSION_ID --window WINDOW_ID
 ```
 
+## Read acknowledgments
+
+`arc read ID --observation TOKEN --request-id WINDOW:REQUEST [--dry-run] [--window WINDOW] [--json]` acknowledges completed turns delivered by `arc session`. Copy its `readObservation` field, separate from the guarded-send `observation`. The selected window requires `sessionRead` capability and one unambiguous Claude Code or Codex requester. The receipt binds that activation, requester, unique scoped target, physical source revision, and delivered projection. A partial reply can acknowledge its included completed turns. Unfinished and omitted turns remain outside the acknowledgment.
+
+Results report `applied`, `dry-run`, `refused`, or `unknown`. Applied confirms saved read state and settled publication to attached ready panels. Dry runs save nothing. Identical retries retain the first outcome. Conflicting payloads refuse. Preserve the request ID after an unknown result. Source changes invalidate agent marks, including append growth. Unavailable source facts project no marks. Reader boundaries remain separate, and partial zero counts remain uncertain. Hidden panels receive accepted state when ready, while their attention remains unknown.
+
 ## Cost arguments
 
 Run `arc cost --help` for target syntax and options. Cost reads no stdin and prints JSON by default.

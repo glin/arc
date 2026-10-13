@@ -43,7 +43,7 @@ Arc delivers through the session's existing process in that window and never res
 
 Mark only sessions the reader explicitly asked you to mark read. Establish that bounded set from the request and exact scoped identities. A listing, an incidental lookup, or a status report grants no marking authority.
 
-Check the selected window's `sessionRead` capability. A window without it does not support read writes. Report that limitation without switching windows or changing reader attention through another command.
+Check the selected window's `sessionRead` capability. Read acknowledgments work without a visible panel. Hidden attention remains unknown. A window without it does not support read writes. Report that limitation without switching windows or changing reader attention through another command.
 
 For a supporting window, read each authorized session with `arc session SESSION_ID --turns 5 --window WINDOW_ID --json`. Read the delivered completed turns before acknowledging them. Copy `readObservation` unchanged, never the send-only `observation`. A reply without `readObservation` grants no read acknowledgment.
 

@@ -391,6 +391,7 @@ export interface ActivitySkill {
 }
 
 export interface TurnCard {
+  promptId?: string;
   kind: 'turn';
   key: string;
   sessionId: string;
@@ -4472,6 +4473,7 @@ export function toCard(
     doingCode: onNow ? stepCode(onNow) : '',
     doingSince: onNow?.at ?? (narration?.status === 'running' ? narration.at : null),
     startedAt: turn.startedAt,
+    promptId: turn.promptId,
     endedAt: turn.endedAt,
     ...(turn.processEndedAt !== undefined ? { processEndedAt: turn.processEndedAt } : {}),
     agent: AGENT_NAMES[turn.agent],

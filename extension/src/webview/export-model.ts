@@ -21,6 +21,7 @@ export interface SiteManifest extends Omit<SessionExport, 'sessions'> {
 
 // The static entry never accepts panel host messages. Every new protocol request requires a decision.
 export const EXPORT_HOST_POLICY = {
+  readerRead: 'blocked',
   sessionFilterApplied: 'blocked',
   health: 'blocked',
   contextDetail: 'blocked',

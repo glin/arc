@@ -428,19 +428,20 @@ export class HostReadPersistence<T extends HostReadState> {
     operation: ReadOperation,
     facts: (record: AgentReadRecord) => AgentReadSource | null,
     admitReader?: ReaderReadAdmission,
+    preferences?: (current: T) => T,
   ): Promise<{ revision: number } | null> {
     return this.operations.run(
       operation,
       facts,
-      (read) => this.persistRead(read),
+      (read) => this.persistRead(read, preferences),
       () => this.publishAccepted(),
       admitReader,
     );
   }
   // Supply these callbacks only to this owner's ordered operations.
-  async persistRead(read: OrderedReadState): Promise<void> {
+  async persistRead(read: OrderedReadState, preferences?: (current: T) => T): Promise<void> {
     const next = {
-      ...this.snapshot(),
+      ...(preferences ? preferences(this.snapshot()) : this.snapshot()),
       read: read.read,
       readTo: read.readTo,
       since: read.since,

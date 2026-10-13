@@ -184,3 +184,7 @@ Labels are the reader's current labels, not the labels a session had during the 
 Arc reports context and prompt-cache evidence. The skill does not manage cache expiry, send keepalive prompts, compact sessions, or create durable handoffs automatically. [Lowering agent costs](lowering-agent-costs.md) owns continuation and handoff decisions.
 
 A coordinator's handoff must retain the selected window, accepted session IDs, results, uncertain request IDs, and remaining reader decisions. Window reload changes the activation, so re-discover the window before new work. Saved session records and CLI reads do not restore a coordinator's own context.
+
+## Read acknowledgments
+
+The session-management skill requires explicit reader authority before marking a bounded set read. Agents read the delivered completed turns and acknowledge only that projection. [CLI read acknowledgments](cli.md#read-acknowledgments) owns receipt, retry, source-change, and publication behavior.

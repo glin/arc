@@ -206,7 +206,7 @@ export const COMMANDS: readonly Command[] = [
       output: [
         'JSON: version, requester, id, provider, state, turns, partial, readByteLimit, notes.',
         'Turns contain promptId, startedAt, endedAt, prompt, summary, model, effort, finished, interrupted, error.',
-        'An eligible owning requester also receives observation for send. Stale reads return no turns.',
+        'An eligible owning requester receives observation for send. Eligible current replies include readObservation for delivered completed turns. Stale reads return no turns.',
       ],
       refusals: [
         argumentRefusal,
@@ -214,6 +214,34 @@ export const COMMANDS: readonly Command[] = [
         windowRefusal,
       ],
       example: 'arc session SESSION_ID --turns 5 --window WINDOW_ID --json',
+    },
+  },
+  {
+    name: 'read',
+    section: 'Reading',
+    route: 'management',
+    action: 'read',
+    help: {
+      summary: "Acknowledge delivered completed turns at the reader's request.",
+      synopsis: 'arc read ID --observation TOKEN --request-id WINDOW:REQUEST [--dry-run] [--window ID] [--json]',
+      flags: [
+        ['--observation TOKEN', 'Copy readObservation from the bounded session reply.'],
+        requestFlag,
+        dryRunFlag,
+        windowFlag,
+        jsonFlag,
+      ],
+      output: [
+        'JSON: version, requestId, status, sessionId, requester, marked, reason.',
+        'Status is applied, dry-run, refused, or unknown. Completed delivered identities alone are acknowledged.',
+      ],
+      refusals: [
+        argumentRefusal,
+        windowRefusal,
+        'An explicit request ID, sessionRead capability, native requester identity, and current receipt are required.',
+      ],
+      example:
+        'arc read SESSION_ID --observation READ_OBSERVATION --request-id WINDOW_ID:read --window WINDOW_ID --json',
     },
   },
   {

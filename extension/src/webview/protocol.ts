@@ -46,7 +46,7 @@ import {
   type PromptPosition,
 } from '../view/timeline-layout.ts';
 import type { CardView, RailCardView } from './payload-contracts.ts';
-import { validAgentReadRecord, READ_LIMIT, type ReadOperation } from '../domain/read.ts';
+import { READ_LIMIT, type ReadOperation } from '../domain/read.ts';
 
 export interface ReadSynchronization {
   revision: number;
@@ -104,7 +104,17 @@ export function parseReaderOperation(value: unknown): ReadOperation | null {
       ? { id: operation.id, observedRevision: operation.observedRevision, action: 'reset', since: operation.since }
       : null;
   if (operation.action !== 'turn' && operation.action !== 'session') return null;
-  if (!validAgentReadRecord(operation.target) || typeof operation.read !== 'boolean') return null;
+  const target = operation.target;
+  if (
+    !target ||
+    typeof target.sessionId !== 'string' ||
+    !target.sessionId ||
+    !Number.isFinite(target.startedAt) ||
+    target.startedAt < 0 ||
+    (target.promptId !== undefined && (typeof target.promptId !== 'string' || !target.promptId)) ||
+    typeof operation.read !== 'boolean'
+  )
+    return null;
   if (
     operation.action === 'session' &&
     (!Number.isFinite(operation.newestAt) || operation.newestAt < operation.target.startedAt)
@@ -268,6 +278,7 @@ export interface PanelSessionAdoption {
 }
 
 export type HostToPanel =
+  | { type: 'readState'; state: ReadSynchronization }
   | { type: 'applySessionFilter'; request: string; query: string; deadline: number }
   | { type: 'health'; sequence: number }
   | { type: 'visibility'; visible: boolean; revision: number }
@@ -339,6 +350,7 @@ export type HostToPanel =
   | RenderMessage;
 
 const HOST_TO_PANEL_KINDS: Record<HostToPanel['type'], true> = {
+  readState: true,
   applySessionFilter: true,
   health: true,
   visibility: true,
@@ -386,6 +398,7 @@ const HOST_TO_PANEL_KINDS: Record<HostToPanel['type'], true> = {
 };
 
 export type PanelToHost =
+  | { type: 'readerRead'; operation: ReadOperation }
   | { type: 'sessionFilterApplied'; request: string; state: unknown }
   | { type: 'health'; sequence: number }
   | { type: 'contextDetail'; session: string; request: number; generation: number }
@@ -940,6 +953,10 @@ export function parseHostToPanel(raw: unknown): HostToPanel | null {
       return isString(m.key) && m.key.length > 0 && typeof m.copyLabels === 'boolean'
         ? { type: 'sendSelectedText', key: m.key, copyLabels: m.copyLabels }
         : null;
+    case 'readState': {
+      const state = parseReadSynchronization(m.state);
+      return state ? { type: 'readState', state } : null;
+    }
     case 'setRead':
       return isString(m.key) ? { type: 'setRead', key: m.key, read: m.read === true } : null;
     case 'forgetState':
@@ -1008,6 +1025,10 @@ export function parsePanelToHost(raw: unknown): PanelToHost | null {
     return null;
   }
   switch (m.type) {
+    case 'readerRead': {
+      const operation = parseReaderOperation(m.operation);
+      return operation ? { type: 'readerRead', operation } : null;
+    }
     case 'sessionFilterApplied':
       return Object.keys(m).sort().join(',') === 'request,state,type' &&
         isString(m.request) &&
@@ -1362,6 +1383,8 @@ export type PanelToHostHandlers<R> = Handlers<PanelToHost, R>;
 // The default branch assigns to never, so unhandled variants fail the typecheck.
 export function dispatchHostToPanel(message: HostToPanel, handlers: HostToPanelHandlers): void {
   switch (message.type) {
+    case 'readState':
+      return handlers.readState(message);
     case 'applySessionFilter':
       return handlers.applySessionFilter(message);
     case 'health':
@@ -1459,6 +1482,8 @@ export function dispatchHostToPanel(message: HostToPanel, handlers: HostToPanelH
 
 export function dispatchPanelToHost<R>(message: PanelToHost, handlers: PanelToHostHandlers<R>): R {
   switch (message.type) {
+    case 'readerRead':
+      return handlers.readerRead(message);
     case 'sessionFilterApplied':
       return handlers.sessionFilterApplied(message);
     case 'health':

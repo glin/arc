@@ -36,6 +36,7 @@ import { resolveResponseSession, pendingResponseSessionAdmitted, parseSessionLin
 import { nativeCitationPath } from './domain/file-citation';
 import {
   boundedSessionRead,
+  AgentReadSources,
   guardedSourceRevision,
   readSessionCursor,
   sessionCatalogMembership,
@@ -240,7 +241,6 @@ import {
 } from './turnlabels';
 import { normalizeSavedViews } from './domain/views.ts';
 import { normalizeSavedRailFilters } from './domain/rail-filters.ts';
-import { readMovedOnlyFor, type ReadState } from './domain/read.ts';
 import {
   Trail,
   emptyTrail,
@@ -447,6 +447,16 @@ import {
 } from './promptassets';
 import { fillPanelText, panelValues } from './paneltext';
 import { dispatchPanelToHost, parsePanelToHost } from './webview/protocol.ts';
+import {
+  HostReadPersistence,
+  preserveHostRead,
+  projectAgentRead,
+  currentAgentRead,
+  type AgentReadRecord,
+  type AgentReadSource,
+  type ReadOperation,
+} from './domain/read.ts';
+import { SessionReadObservations, runSessionRead, requesterOf } from './sessionwrites.ts';
 import { RowDeltaSender, type RowLists } from './webview/row-deltas.ts';
 import { withRecoveredCommits } from './childartifacts.ts';
 import {
@@ -1621,7 +1631,7 @@ export class PanelProvider implements vscode.Disposable {
   // Runs synchronously after the panel accepts directing reader input for a session, before it queues or delivers it.
   // It also clears the unknown-delivery block, so a rejected input never reaches it.
   public onReaderDirected: ((session: string) => void) | null = null;
-  // The facts of each session's latest current read. An equal source revision means the same bytes.
+  // The latest observed session read. Filesystem revision equality cannot detect metadata-preserving rewrites.
   private guardedReads?: Map<string, GuardedObservationFacts>;
   // Runs synchronously when the repository scope or the workspace folders change.
   public onScopeChange: ((outOfScope?: ReadonlySet<string>) => void) | null = null;
@@ -1933,7 +1943,177 @@ export class PanelProvider implements vscode.Disposable {
       reject(error: Error): void;
     }
   >;
-  private preferenceSaveQueue?: Promise<void>;
+  private readPersistence?: HostReadPersistence<PanelState>;
+  private readObservations = new SessionReadObservations(crypto.randomUUID());
+  private agentReadSources = new AgentReadSources();
+  private admittedReadSources = new Map<string, AgentReadSource>();
+  private readSequence = 0;
+  private restoringReadSources = false;
+
+  private readOwner(): HostReadPersistence<PanelState> {
+    let previous = JSON.stringify([this.saved.read, this.saved.readTo, this.saved.since, this.saved.readRevision ?? 0]);
+    return (this.readPersistence ??= new HostReadPersistence(
+      normalizePanelState(this.saved),
+      async (state) => {
+        if (!this.memento) throw new Error('Panel preferences are unavailable.');
+        await this.memento.update(STATE_KEY, state);
+      },
+      async (state) => {
+        const signature = JSON.stringify([state.read, state.readTo, state.since, state.readRevision ?? 0]);
+        if (signature === previous) return;
+        Object.assign(this.saved, {
+          read: state.read,
+          readTo: state.readTo,
+          since: state.since,
+          agentRead: state.agentRead,
+          readRevision: state.readRevision,
+        });
+        const synchronization = this.readSynchronization();
+        for (const host of this.hosts) {
+          if (
+            this.readyHosts.has(host) &&
+            !(await this.sendToHost(host, { type: 'readState', state: synchronization }))
+          )
+            throw new Error('The saved read state could not reach the panel.');
+        }
+        this.postRail(true);
+        previous = signature;
+      },
+    ));
+  }
+
+  private persistHostState(): Promise<void> {
+    const snapshot = structuredClone(this.saved);
+    return this.readOwner().saveHost((current) => preserveHostRead(current, snapshot));
+  }
+
+  private currentReadSource(record: AgentReadRecord): AgentReadSource | null {
+    const scope = this.readScopeKey();
+    if (scope === null) return null;
+    const roots = this.repositoryScope.snapshot(this.folders()).roots;
+    const accepted = this.authoritativeCatalogScope === JSON.stringify(roots) ? this.authoritativeCatalog : null;
+    const matches = accepted
+      ? this.sessionPageIndexFor(accepted, JSON.stringify(roots), roots).scoped.filter(
+          (one) => one.sessionId === record.sessionId,
+        )
+      : [];
+    if (matches.length !== 1 || matches[0].agent !== record.provider) return null;
+    const facts = this.agentReadSources.resolve(matches[0], () => this.readScopeKey(), roots);
+    if (facts) {
+      this.admittedReadSources.delete(record.sessionId);
+      this.admittedReadSources.set(record.sessionId, facts);
+      while (
+        this.admittedReadSources.size > 32 ||
+        [...this.admittedReadSources.values()].reduce((count, source) => count + source.turns.length, 0) > 2000
+      )
+        this.admittedReadSources.delete(this.admittedReadSources.keys().next().value!);
+    }
+    return facts;
+  }
+
+  private readFacts(): (record: AgentReadRecord) => AgentReadSource | null {
+    const held = new Map<string, AgentReadSource | null>();
+    return (record) => {
+      const key = `${record.provider}:${record.sessionId}`;
+      const prior = held.get(key);
+      if (!held.has(key) || (prior && this.projectedReadFacts(record) !== prior))
+        held.set(key, this.currentReadSource(record));
+      return held.get(key)!;
+    };
+  }
+
+  private projectedReadFacts(record: AgentReadRecord): AgentReadSource | null {
+    const facts = this.admittedReadSources.get(record.sessionId);
+    if (!facts || facts.scope !== this.readScopeKey()) return null;
+    const roots = this.repositoryScope.snapshot(this.folders()).roots;
+    const matches =
+      this.authoritativeCatalogScope === JSON.stringify(roots)
+        ? (this.authoritativeCatalog?.filter((one) => one.sessionId === record.sessionId) ?? [])
+        : [];
+    return matches.length === 1 &&
+      matches[0].agent === facts.provider &&
+      guardedSourceRevision(matches[0].file) === facts.sourceRevision
+      ? facts
+      : null;
+  }
+
+  private readSynchronization() {
+    return {
+      revision: this.saved.readRevision ?? 0,
+      read: [...this.saved.read],
+      readTo: { ...this.saved.readTo },
+      since: this.saved.since,
+      agentRead: [...projectAgentRead(this.saved.agentRead ?? [], (record) => this.projectedReadFacts(record))],
+    };
+  }
+
+  private restoreAgentReads(): void {
+    if (this.restoringReadSources || !this.saved.agentRead?.length) return;
+    this.restoringReadSources = true;
+    const records = [
+      ...new Map(this.saved.agentRead.map((record) => [`${record.provider}:${record.sessionId}`, record])).values(),
+    ];
+    const next = () => {
+      if (this.disposed) {
+        this.restoringReadSources = false;
+        return;
+      }
+      const record = records.shift();
+      if (record) {
+        this.currentReadSource(record);
+        setImmediate(next);
+        return;
+      }
+      this.restoringReadSources = false;
+      void this.readOwner()
+        .read(
+          {
+            id: `invalidate:${++this.readSequence}`,
+            namespace: 'host',
+            observedRevision: this.saved.readRevision ?? 0,
+            action: 'invalidate',
+          },
+          (record) => this.projectedReadFacts(record),
+        )
+        .catch(() => {});
+    };
+    setImmediate(next);
+  }
+
+  public guardedReadRequest(request: import('./sessionrequests').SessionRequest) {
+    const owner = this.readOwner();
+    return runSessionRead(
+      {
+        requestId: request.id,
+        sessionId: request.params.sessionId!,
+        observation: request.params.observation!,
+        requester: requesterOf(request),
+        dryRun: request.params.dryRun === true,
+      },
+      this.readObservations,
+      owner.operations,
+      this.readFacts(),
+      (state) => owner.persistRead(state),
+      () => owner.publishAccepted(),
+    );
+  }
+
+  private readerRead(operation: ReadOperation): Promise<void> {
+    return this.readOwner()
+      .read(operation, this.readFacts(), (one) => {
+        const target = one.target;
+        if (one.action === 'session')
+          return this.windows.has(target.sessionId) && this.newestTurns().get(target.sessionId) === one.newestAt;
+        return this.cards.some(
+          (card) =>
+            card.kind === 'turn' &&
+            card.sessionId === target.sessionId &&
+            card.startedAt === target.startedAt &&
+            card.promptId === target.promptId,
+        );
+      })
+      .then(() => undefined);
+  }
   private hostPinnedFoldRevision = 0;
   private preferenceResetRevision = 0;
   private membershipWrites?: Map<string, { persisted: Promise<void> }>;
@@ -2088,7 +2268,7 @@ export class PanelProvider implements vscode.Disposable {
     const next = setSessionLabels(previous, session, names);
     this.saved.labels = next;
     try {
-      await this.memento?.update(STATE_KEY, this.saved);
+      await this.persistHostState();
     } catch (error) {
       if (this.saved.labels === next) this.saved.labels = previous;
       this.postRail(true);
@@ -2273,8 +2453,19 @@ export class PanelProvider implements vscode.Disposable {
       if (!index) throw new Error(SESSION_PAGE_ERRORS.catalog);
       const matches = index.scoped.filter((source) => source.sessionId === request.params.sessionId);
       if (matches.length !== 1) throw new Error('The session ID is unknown or ambiguous in this window.');
-      return boundedSessionRead(matches[0], request.params.turns!, scopeKey, request.requester, scope.roots, (facts) =>
-        this.observeGuardedRead(request, facts),
+      return boundedSessionRead(
+        matches[0],
+        request.params.turns!,
+        scopeKey,
+        request.requester,
+        scope.roots,
+        (facts) => this.observeGuardedRead(request, facts),
+        (facts) => {
+          const current = this.readFacts();
+          return facts.records.every((record) => currentAgentRead(record, current(record)))
+            ? this.readObservations.observe(requesterOf(request), facts)
+            : null;
+        },
       );
     }
     // Only the internal archive read sets sessionId. It filters before paging.
@@ -2620,8 +2811,9 @@ export class PanelProvider implements vscode.Disposable {
     // Save the floor immediately so reopening the window does not mark intervening turns as read.
     if (stored === undefined) {
       this.saved.since = Date.now();
-      void this.memento?.update(STATE_KEY, this.saved);
+      void this.persistHostState().catch(() => {});
     }
+    this.readOwner();
     // Restore rail visibility before the first payload. The panel also posts its saved state on load.
     this.hidden = new Set(this.saved.hidden);
     this.pinnedTop = new Set(this.saved.pinnedTop);
@@ -3467,6 +3659,10 @@ export class PanelProvider implements vscode.Disposable {
     if (this.readyHosts.has(host)) return;
     this.readyHosts.add(host);
     void this.sendToHost(host, this.panelVisibility.current(host, host.visible()));
+    if (this.saved) {
+      void this.sendToHost(host, { type: 'readState', state: this.readSynchronization() });
+      this.restoreAgentReads();
+    }
     if (host.webview === this.editorPanel?.webview) {
       for (const waiter of this.filterReady ?? []) {
         if (waiter.operation.current()) waiter.resolve();
@@ -5523,7 +5719,7 @@ export class PanelProvider implements vscode.Disposable {
     this.saved.assets = normalizePromptAssetBook(this.assets);
     this.saved.queues = normalizeQueuedSubmissions(this.queues);
     this.saved.draftCommentIds = normalizeDraftCommentIds(this.draftCommentIds);
-    void this.memento?.update(STATE_KEY, this.saved);
+    void this.persistHostState().catch(() => {});
     void this.post({ type: 'usage', usage: this.usagePayload() });
     this.postRail(true);
   }
@@ -5910,7 +6106,7 @@ export class PanelProvider implements vscode.Disposable {
   private rememberStarted(session: string): void {
     this.startedHere.add(session);
     this.saved.started = [...this.startedHere].slice(-SESSION_LIMIT);
-    void this.memento?.update(STATE_KEY, this.saved);
+    void this.persistHostState().catch(() => {});
   }
 
   private importPromptRecovery(snapshot: unknown): Promise<void> {
@@ -5920,7 +6116,7 @@ export class PanelProvider implements vscode.Disposable {
     const write = (this.submissionWrites ?? Promise.resolve())
       .catch(() => undefined)
       .then(async () => {
-        await this.memento?.update(STATE_KEY, this.saved);
+        await this.persistHostState();
         await this.post({ type: 'promptRecovery', submittedPrompts: this.saved.submittedPrompts ?? [] });
       });
     this.submissionWrites = write;
@@ -6085,7 +6281,7 @@ export class PanelProvider implements vscode.Disposable {
     this.saved.assets = normalizePromptAssetBook(this.assets);
     this.saved.queues = normalizeQueuedSubmissions(this.queues);
     this.saved.draftCommentIds = normalizeDraftCommentIds(this.draftCommentIds);
-    return Promise.resolve(this.memento?.update(STATE_KEY, this.saved));
+    return this.persistHostState();
   }
 
   // Route Send through the send-or-queue rules in `composerview.ts`.
@@ -6536,7 +6732,7 @@ export class PanelProvider implements vscode.Disposable {
       return;
     }
     this.saved.comments = left;
-    void this.memento?.update(STATE_KEY, this.saved);
+    void this.persistHostState().catch(() => {});
     // Update every attached host's comment copy.
     void this.post({ type: 'notes', comments: this.saved.comments });
     this.postRail(true);
@@ -7264,7 +7460,7 @@ export class PanelProvider implements vscode.Disposable {
       this.saved.railFolds = { ...this.saved.railFolds, [RAIL_FOLDS.top]: true };
       this.hostPinnedFoldRevision = (this.hostPinnedFoldRevision ?? 0) + 1;
     }
-    const persisted = Promise.resolve(this.memento?.update(STATE_KEY, this.saved));
+    const persisted = this.persistHostState();
     if (hiddenChanged) {
       this.onArchivedSessionsChange?.(this.hidden);
     }
@@ -7475,7 +7671,25 @@ export class PanelProvider implements vscode.Disposable {
     // Clear navigation history with the selection.
     this.trail = emptyTrail();
     const resetState = structuredClone(this.saved);
-    const resetSaved = this.saveState(resetState);
+    const owner = this.readOwner();
+    const resetSaved = owner.read(
+      {
+        id: `reset:${++this.readSequence}`,
+        namespace: 'host',
+        observedRevision: owner.operations.snapshot().revision,
+        action: 'reset',
+        since: resetState.since,
+      },
+      this.readFacts(),
+      undefined,
+      (current) =>
+        preserveHostRead(current, {
+          ...resetState,
+          hidden: [...this.hidden],
+          pinnedTop: [...this.pinnedTop],
+          railFolds: this.saved.railFolds,
+        }),
+    );
     this.filterRequests ??= new SessionFilterRequests();
     await this.filterRequests.reset(async () => {
       await resetSaved;
@@ -7970,6 +8184,7 @@ export class PanelProvider implements vscode.Disposable {
           this.performanceCounters.recordRefreshStage('unchanged');
         }
         if (!selectedOnly && this.repositoryScopeReady) this.onSessionRowsRefreshed?.();
+        if (!selectedOnly && this.repositoryScopeReady) this.restoreAgentReads();
         if (!selectedOnly) {
           this.scheduleProjectSpendHydration(generation);
           const enrichment = await this.prepareRailEnrichment(all, generation, controller.signal);
@@ -8046,6 +8261,7 @@ export class PanelProvider implements vscode.Disposable {
         ...this.sessionRows,
       ];
       if (!selectedOnly && this.repositoryScopeReady) this.onSessionRowsRefreshed?.();
+      if (!selectedOnly && this.repositoryScopeReady) this.restoreAgentReads();
       if (!selectedOnly && this.authoritativeCatalog !== null) {
         this.drainInitialCatalogRefresh();
         this.drainPendingQueues();
@@ -8441,7 +8657,31 @@ export class PanelProvider implements vscode.Disposable {
           }),
         )
       : this.windows;
-    return newCounts([], windows, this.saved.read, new Map(Object.entries(this.saved.readTo)), this.saved.since);
+    const facts = new Map<string, AgentReadSource>();
+    for (const record of this.saved.agentRead ?? []) {
+      const current = this.projectedReadFacts(record);
+      if (current?.identitiesComplete) facts.set(record.sessionId, current);
+    }
+    const mapped = new Map(
+      [...facts].map(([sessionId, source]) => [
+        sessionId,
+        source.turns.map((turn) => ({
+          ...turn,
+          key: turnKey({ sessionId, startedAt: turn.startedAt }),
+          sessionId,
+          kind: 'turn',
+        })),
+      ]),
+    );
+    return newCounts(
+      [],
+      windows,
+      this.saved.read,
+      new Map(Object.entries(this.saved.readTo)),
+      this.saved.since,
+      projectAgentRead(this.saved.agentRead ?? [], (record) => facts.get(record.sessionId) ?? null),
+      mapped,
+    );
   }
 
   // Rail read watermarks use the same selection-independent starts as unread counts.
@@ -12607,6 +12847,7 @@ export class PanelProvider implements vscode.Disposable {
     try {
       await dispatchPanelToHost<void | Promise<void>>(message, {
         health: () => {},
+        readerRead: (msg) => this.readerRead({ ...msg.operation, namespace: 'browser' }),
         ready: () => {
           // A loaded page holds no session rows.
           this.rowSenders?.get(host)?.reset();
@@ -12855,7 +13096,7 @@ export class PanelProvider implements vscode.Disposable {
         // Apply one comment change to provider state and broadcast the resulting list, preserving peer-host edits.
         note: (msg) => {
           this.saved.comments = applyComment(this.saved.comments, msg.note);
-          void this.memento?.update(STATE_KEY, this.saved);
+          void this.persistHostState().catch(() => {});
           void this.post({ type: 'notes', comments: this.saved.comments });
           // The composer derives its annotation chip and empty-prompt send state from the same
           // comments. They travel in the usage payload, so publish that view with the card marks.
@@ -12941,12 +13182,12 @@ export class PanelProvider implements vscode.Disposable {
         // Normalize and persist the complete saved-view list. The session-list update publishes it to every host.
         setViews: (msg) => {
           this.saved.views = normalizeSavedViews(msg.views);
-          void this.memento?.update(STATE_KEY, this.saved);
+          void this.persistHostState().catch(() => {});
           this.postRail(true);
         },
         setRailFilters: (msg) => {
           this.saved.railFilters = normalizeSavedRailFilters(msg.railFilters);
-          void this.memento?.update(STATE_KEY, this.saved);
+          void this.persistHostState().catch(() => {});
           this.postRail(true);
         },
         // Apply one operation to the provider-owned sets. A panel can act before it receives a
@@ -13128,120 +13369,68 @@ export class PanelProvider implements vscode.Disposable {
 
   // Persist normalized panel preferences beyond the lifetime of an individual webview.
   private saveState(state: unknown, canPersist: () => boolean = () => true): Promise<void> {
-    const readBefore = this.readPrint();
-    const stateBefore: ReadState = { read: this.saved.read, readTo: this.saved.readTo };
-    // Preserve provider-owned draft text. Browser preference saves do not carry current typing.
-    const drafts = this.saved.drafts;
-    // Preserve sent prompt recall while its recorded copy remains unavailable.
-    const sentPrompts = this.saved.sentPrompts;
-    const submittedPrompts = this.saved.submittedPrompts;
-    const draftCommentIds = this.saved.draftCommentIds;
-    // Browser saves can arrive after a provisional draft has adopted its durable id. The
-    // provider-owned membership sets already made that move, so an older browser copy must
-    // not replace them.
-    const hidden = [...this.hidden];
-    const pinnedTop = [...this.pinnedTop];
-    // Preserve provider-owned attachments and queues during browser preference saves.
-    const assets = this.saved.assets;
-    const queues = this.saved.queues;
-    // Preserve provider-owned comments so a stale browser state save cannot remove peer-host changes.
-    const notes = this.saved.comments;
-    // Preserve the workspace unread baseline. A browser without it cannot reset older activity to unread.
-    const since = this.saved.since;
-    // Preserve reader-started ownership, which browsers do not supply in preference saves.
-    const started = this.saved.started;
-    const agentRuns = this.saved.agentRuns;
-    // Preserve labels updated through their dedicated messages, independent of browser preference saves.
-    const labels = this.saved.labels;
-    const readerParents = this.saved.readerParents;
-    // Preserve provider-owned views and saved filters. Normalize browser filter selection against the retained catalog.
-    const views = this.saved.views;
-    const railFilters = this.saved.railFilters;
-    const showing = this.showing;
-    this.saved = normalizePanelState(state, railFilters);
-    this.saved.hidden = hidden;
-    this.saved.pinnedTop = pinnedTop;
-    this.saved.comments = notes;
-    this.saved.since = since;
-    this.saved.drafts = drafts;
-    this.saved.sentPrompts = sentPrompts;
-    this.saved.submittedPrompts = submittedPrompts;
-    this.saved.draftCommentIds = draftCommentIds;
-    this.saved.started = started;
-    this.saved.agentRuns = agentRuns;
-    this.saved.labels = labels;
-    this.saved.readerParents = readerParents;
-    this.saved.views = views;
-    this.saved.railFilters = railFilters;
-    this.saved.showing = showing ?? '';
-    this.saved.assets = assets;
-    this.saved.queues = queues;
-    const snapshot = structuredClone(this.saved);
+    const preferences = normalizePanelState(state, this.saved.railFilters);
+    const owner = this.readOwner();
+    const current = this.saved;
+    this.saved = preserveHostRead(owner.snapshot(), {
+      ...current,
+      ...preferences,
+      hidden: current.hidden,
+      pinnedTop: current.pinnedTop,
+      comments: current.comments,
+      drafts: current.drafts,
+      sentPrompts: current.sentPrompts,
+      submittedPrompts: current.submittedPrompts,
+      draftCommentIds: current.draftCommentIds,
+      started: current.started,
+      agentRuns: current.agentRuns,
+      labels: current.labels,
+      readerParents: current.readerParents,
+      views: current.views,
+      railFilters: current.railFilters,
+      showing: this.showing ?? '',
+      assets: current.assets,
+      queues: current.queues,
+    });
     const pinnedFoldRevision = this.hostPinnedFoldRevision ?? 0;
     const resetRevision = this.preferenceResetRevision ?? 0;
-    const persist = () => {
-      if (!this.memento) throw new Error('Panel preferences are unavailable.');
-      // Host actions can replace these fields while an earlier preference save waits for storage.
-      // Keep each browser query snapshot ordered while carrying the current host-owned state.
-      const current = this.saved;
-      // A reset replaces every older preference snapshot. Later browser saves keep their own choices.
-      const preferences = resetRevision === (this.preferenceResetRevision ?? 0) ? snapshot : current;
-      const railFolds =
-        pinnedFoldRevision === (this.hostPinnedFoldRevision ?? 0)
-          ? preferences.railFolds
-          : { ...preferences.railFolds, [RAIL_FOLDS.top]: current.railFolds[RAIL_FOLDS.top] };
-      const saved = structuredClone({
-        ...preferences,
-        railFolds,
-        hidden: current.hidden,
-        pinnedTop: current.pinnedTop,
-        comments: current.comments,
-        since: current.since,
-        drafts: current.drafts,
-        sentPrompts: current.sentPrompts,
-        submittedPrompts: current.submittedPrompts,
-        draftCommentIds: current.draftCommentIds,
-        started: current.started,
-        agentRuns: current.agentRuns,
-        labels: current.labels,
-        readerParents: current.readerParents,
-        views: current.views,
-        railFilters: current.railFilters,
-        showing: current.showing,
-        assets: current.assets,
-        queues: current.queues,
-      });
+    return owner.saveHost((accepted) => {
       if (!canPersist()) throw new Error('The filter outcome is unknown.');
-      return Promise.resolve(this.memento.update(STATE_KEY, saved));
-    };
-    const initialSave = () => {
-      try {
-        return persist();
-      } catch (error) {
-        return Promise.reject(error);
-      }
-    };
-    const persisted = this.preferenceSaveQueue ? this.preferenceSaveQueue.then(persist, persist) : initialSave();
-    const barrier = persisted.catch(() => {});
-    this.preferenceSaveQueue = barrier;
-    void barrier.then(() => {
-      if (this.preferenceSaveQueue === barrier) this.preferenceSaveQueue = undefined;
+      const current = this.saved;
+      const snapshot = resetRevision === (this.preferenceResetRevision ?? 0) ? preferences : current;
+      const saved = preserveHostRead(
+        accepted,
+        normalizePanelState(
+          {
+            ...current,
+            ...snapshot,
+            hidden: [...this.hidden],
+            pinnedTop: [...this.pinnedTop],
+            comments: current.comments,
+            drafts: current.drafts,
+            sentPrompts: current.sentPrompts,
+            submittedPrompts: current.submittedPrompts,
+            draftCommentIds: current.draftCommentIds,
+            started: current.started,
+            agentRuns: current.agentRuns,
+            labels: current.labels,
+            readerParents: current.readerParents,
+            views: current.views,
+            railFilters: current.railFilters,
+            showing: this.showing ?? '',
+            assets: current.assets,
+            queues: current.queues,
+            railFolds:
+              pinnedFoldRevision === (this.hostPinnedFoldRevision ?? 0)
+                ? snapshot.railFolds
+                : { ...snapshot.railFolds, [RAIL_FOLDS.top]: current.railFolds[RAIL_FOLDS.top] },
+          },
+          current.railFilters,
+        ),
+      );
+      this.saved = saved;
+      return saved;
     });
-    // Update unread counts after read-state saves. Defer selection-only changes to the pending render, with a fallback when it settles.
-    if (readBefore === this.readPrint()) {
-      return persisted;
-    }
-    const counts = this.unreadCounts();
-    const countsChanged = JSON.stringify([...counts]) !== this.lastRailCountsJson;
-    if (this.railSeedOwedFor === this.selectionGeneration && readMovedOnlyFor(this.showing, stateBefore, this.saved)) {
-      if (countsChanged) {
-        this.railRevision++;
-      }
-      this.railSeedSkipped = true;
-      return persisted;
-    }
-    this.postRail(countsChanged, counts);
-    return persisted;
   }
 
   private shell(webview: vscode.Webview): string {

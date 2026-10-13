@@ -1,4 +1,4 @@
-import { canMarkRead, isTurnRead, READ_LIMIT, type ReadableTurn } from '../domain/read.ts';
+import { canMarkRead, isTurnRead, READ_LIMIT, type ReadableTurn, type ReadOperation } from '../domain/read.ts';
 
 export interface ReadCard extends ReadableTurn {
   kind: string;
@@ -19,6 +19,7 @@ export interface ReadStateOptions {
   cards(): readonly ReadCard[];
   newestTurnAt(sessionId: string): number | null;
   save(): void;
+  operate?(operation: ReadOperation): void;
   refreshSelection(): void;
 }
 
@@ -61,6 +62,19 @@ export function createReadState(options: ReadStateOptions): ReadStateOwner {
   let revision = -1;
   const agentRead = new Map<string, string>();
   const listeners = new Set<() => void>();
+  const tab = Array.from(globalThis.crypto.getRandomValues(new Uint8Array(16)), (byte) =>
+    byte.toString(16).padStart(2, '0'),
+  ).join('');
+  let sequence = 0;
+  const operate = (
+    action:
+      | Omit<Extract<ReadOperation, { action: 'turn' }>, 'id' | 'observedRevision'>
+      | Omit<Extract<ReadOperation, { action: 'session' }>, 'id' | 'observedRevision'>,
+  ) => {
+    if (!options.operate || revision < 0) return false;
+    options.operate({ ...action, id: `${tab}:${++sequence}`, observedRevision: Math.max(0, revision) });
+    return true;
+  };
 
   const notify = () => {
     for (const listener of listeners) {
@@ -86,6 +100,16 @@ export function createReadState(options: ReadStateOptions): ReadStateOwner {
   };
 
   const mark = (key: string): boolean => {
+    const card = options.cards().find((one) => one.key === key);
+    if (
+      card &&
+      operate({
+        action: 'turn',
+        target: { sessionId: card.sessionId, startedAt: card.startedAt, promptId: card.promptId },
+        read: true,
+      })
+    )
+      return true;
     const changed = add(key);
     if (changed) {
       options.save();
@@ -95,6 +119,14 @@ export function createReadState(options: ReadStateOptions): ReadStateOwner {
   };
 
   const unmark = (card: ReadCard) => {
+    if (
+      operate({
+        action: 'turn',
+        target: { sessionId: card.sessionId, startedAt: card.startedAt, promptId: card.promptId },
+        read: false,
+      })
+    )
+      return;
     let changed = read.delete(card.key);
     const boundary = readTo.get(card.sessionId) ?? since;
     if (boundary > 0 && card.startedAt <= boundary) {
@@ -138,6 +170,10 @@ export function createReadState(options: ReadStateOptions): ReadStateOwner {
     },
     mark,
     markMany(keys) {
+      if (options.operate && revision >= 0) {
+        for (const key of keys) mark(key);
+        return keys.length > 0;
+      }
       let changed = false;
       for (const key of keys) {
         if (add(key)) {
@@ -161,6 +197,11 @@ export function createReadState(options: ReadStateOptions): ReadStateOwner {
     },
     set(key, value) {
       const card = options.cards().find((candidate) => candidate.key === key);
+      if (card && options.operate && revision >= 0) {
+        if (value) mark(key);
+        else unmark(card);
+        return;
+      }
       if (!card || owner.isRead(card) === value) {
         return;
       }
@@ -168,6 +209,18 @@ export function createReadState(options: ReadStateOptions): ReadStateOwner {
     },
     setSession(sessionId, value) {
       const cards = options.cards().filter((card) => card.kind === 'turn' && card.sessionId === sessionId);
+      const newest = options.newestTurnAt(sessionId);
+      const target = cards.at(0);
+      if (
+        newest !== null &&
+        operate({
+          action: 'session',
+          target: { sessionId, startedAt: target?.startedAt ?? newest, promptId: target?.promptId },
+          newestAt: newest,
+          read: value,
+        })
+      )
+        return;
       if (value) {
         const newest = options.newestTurnAt(sessionId);
         if (newest === null) {

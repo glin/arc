@@ -1,6 +1,7 @@
 import { sessionPageSources } from './sessionreads';
 import { sessionCoverageMember, reconcileSessionCollisions } from './sessioncoverage';
 import { runningKey } from './composerview';
+import { preserveHostRead } from './domain/read.ts';
 import { SessionFilterRequests, FILTER_LIMITS } from './sessionfilter.ts';
 import { createSavedState } from './webview/state.ts';
 import type { QueuedSubmission, TurnComment } from './turnview.ts';
@@ -2006,8 +2007,195 @@ vi.stubGlobal('PANEL_CSS', '');
 vi.stubGlobal('PANEL_JS', '');
 vi.stubGlobal('PANEL_DEV_SERVER_URL', null);
 let PanelProvider: typeof import('./panelhost.ts').PanelProvider;
+import { SessionReadObservations } from './sessionwrites.ts';
+import { AgentReadSources } from './sessionreads.ts';
 beforeAll(async () => {
   ({ PanelProvider } = await import('./panelhost.ts'));
+});
+
+function orderedHostReadFixture() {
+  const writes: any[] = [];
+  const publications: any[] = [];
+  const host = {};
+  const provider: any = Object.assign(Object.create(PanelProvider.prototype), {
+    saved: normalizePanelState(null),
+    hosts: [host],
+    readyHosts: new Set([host]),
+    hidden: new Set(),
+    pinnedTop: new Set(),
+    showing: '',
+    cards: [{ kind: 'turn', sessionId: 'worker', startedAt: 10, promptId: 'prompt', key: 'worker:10' }],
+    windows: new Map([['worker', { starts: [10], whole: false }]]),
+    readSequence: 0,
+    agentReadSources: new AgentReadSources(),
+    admittedReadSources: new Map(),
+    readObservations: new SessionReadObservations('test-activation'),
+    memento: {
+      update: async (_key: string, state: unknown) => {
+        writes.push(structuredClone(state));
+      },
+    },
+    sendToHost: async (_host: unknown, message: unknown) => {
+      publications.push(message);
+      return true;
+    },
+    postRail() {},
+    readScopeKey: () => 'scope',
+  });
+  return { provider, writes, publications };
+}
+
+test('production read publication waits for storage and stale preferences preserve the accepted marks', async () => {
+  vi.useFakeTimers();
+  try {
+    const f = orderedHostReadFixture();
+    let release!: () => void;
+    let entered!: () => void;
+    const admitted = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const storage = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    f.provider.memento.update = async (_key: string, state: unknown) => {
+      f.writes.push(structuredClone(state));
+      entered();
+      await storage;
+    };
+    const mark = f.provider.readerRead({
+      id: 'tab:1',
+      namespace: 'browser',
+      observedRevision: 0,
+      action: 'turn',
+      target: { sessionId: 'worker', startedAt: 10, promptId: 'prompt' },
+      read: true,
+    });
+    await admitted;
+    await vi.advanceTimersByTimeAsync(0);
+    const preference = f.provider.saveState({ ...f.provider.saved, railFilter: 'session:worker', read: [] });
+    assert.deepEqual(f.provider.saved.read, []);
+    assert.equal(f.publications.length, 0);
+    assert.equal(f.writes.length, 1);
+    release();
+    await Promise.all([mark, preference]);
+    assert.deepEqual(f.writes.at(-1).read, ['worker:10']);
+    assert.equal(f.writes.at(-1).readRevision, 1);
+    assert.equal(f.publications[0].state.revision, 1);
+    assert.deepEqual(f.provider.saved.read, ['worker:10']);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('production stale reader removal applies to unseen acknowledgments and unfinished turns', async () => {
+  const f = orderedHostReadFixture();
+  const record = {
+    provider: 'codex' as const,
+    sessionId: 'worker',
+    source: 'source',
+    scope: 'scope',
+    sourceRevision: 'revision',
+    promptId: 'prompt',
+    startedAt: 10,
+  };
+  const facts = { ...record, identitiesComplete: true, turns: [{ promptId: 'prompt', startedAt: 10, finished: true }] };
+  f.provider.projectedReadFacts = () => facts;
+  f.provider.readFacts = () => () => facts;
+  await f.provider
+    .readOwner()
+    .read(
+      { id: 'agent:1', namespace: 'cli', observedRevision: 0, action: 'acknowledge', records: [record] },
+      () => facts,
+    );
+  const removal = {
+    id: 'tab:1',
+    namespace: 'browser' as const,
+    observedRevision: 0,
+    action: 'turn' as const,
+    target: { sessionId: 'worker', startedAt: 10, promptId: 'prompt' },
+    read: false,
+  };
+  await f.provider.readerRead(removal);
+  assert.deepEqual(f.provider.saved.agentRead, []);
+  await f.provider.readerRead({ ...removal, id: 'tab:2', read: true });
+  await f.provider.readerRead(removal);
+  assert.deepEqual(f.provider.saved.read, ['worker:10']);
+  assert.equal(f.provider.saved.readRevision, 3);
+  f.provider.memento.update = async () => {
+    throw new Error('storage failed');
+  };
+  await assert.rejects(f.provider.readerRead({ ...removal, id: 'tab:3' }));
+  assert.deepEqual(f.provider.saved.read, ['worker:10']);
+  assert.equal(f.provider.saved.readRevision, 3);
+});
+
+test('production receipts acknowledge delivered turns and refuse appended source revisions after restoration', async () => {
+  const f = orderedHostReadFixture();
+  const directory = tempDir('host-read-source-');
+  const file = path.join(directory, 'worker.jsonl');
+  const records: unknown[] = [
+    {
+      type: 'session_meta',
+      timestamp: '2026-10-08T12:00:00Z',
+      payload: { id: 'worker', cwd: directory, source: 'cli' },
+    },
+  ];
+  for (let n = 1; n <= 3; n++) {
+    const timestamp = `2026-10-08T12:00:0${n}Z`;
+    records.push(
+      { type: 'event_msg', timestamp, payload: { type: 'task_started', turn_id: `turn-${n}` } },
+      { type: 'event_msg', timestamp, payload: { type: 'user_message', message: `prompt ${n}` } },
+      {
+        type: 'event_msg',
+        timestamp,
+        payload: { type: 'task_complete', turn_id: `turn-${n}`, last_agent_message: `answer ${n}` },
+      },
+    );
+  }
+  fs.writeFileSync(file, records.map((record) => JSON.stringify(record)).join('\n') + '\n');
+  const source = {
+    agent: 'codex',
+    sessionId: 'worker',
+    cwd: directory,
+    file,
+    ...revisionOf(fs.statSync(file, { bigint: true })),
+  };
+  Object.assign(f.provider, {
+    authoritativeCatalog: [source],
+    authoritativeCatalogScope: JSON.stringify([directory]),
+    folders: () => [directory],
+    repositoryScope: { snapshot: () => ({ roots: [directory], ready: true }) },
+    sessionPageIndexFor: () => ({ scoped: [source] }),
+  });
+  const reply = f.provider.readSessionRequest({
+    id: 'lookup',
+    method: 'session',
+    params: { sessionId: 'worker', turns: 1 },
+    requester: 'reader',
+    requesterProvider: 'claude',
+  });
+  assert.equal(reply.turns.length, 1);
+  assert.equal(reply.partial, true);
+  assert.ok(reply.readObservation);
+  const request = {
+    id: 'read:1',
+    params: { sessionId: 'worker', observation: reply.readObservation },
+    requester: 'reader',
+    requesterProvider: 'claude',
+  };
+  assert.equal((await f.provider.guardedReadRequest(request)).status, 'applied');
+  assert.equal(f.provider.saved.agentRead.length, 1);
+  assert.equal(f.provider.readSynchronization().agentRead.length, 1);
+  f.provider.agentReadSources = new AgentReadSources();
+  f.provider.admittedReadSources.clear();
+  assert.equal(f.provider.readSynchronization().agentRead.length, 0);
+  f.provider.restoreAgentReads();
+  await vi.waitFor(() => assert.equal(f.provider.restoringReadSources, false));
+  await vi.waitFor(() => assert.equal(f.provider.readSynchronization().agentRead.length, 1));
+  fs.appendFileSync(file, JSON.stringify({ type: 'ignored', text: 'append' }) + '\n');
+  assert.equal(f.provider.readSynchronization().agentRead.length, 0);
+  assert.equal((await f.provider.guardedReadRequest({ ...request, id: 'read:2' })).status, 'refused');
+  assert.equal((await f.provider.guardedReadRequest(request)).status, 'applied');
 });
 
 test('command-only admission removes pending rows through every catalog path and releases list and search names', () => {
@@ -6129,7 +6317,7 @@ test('rail counts use metadata windows until the progressive read is accepted', 
   const counts = memberFrom(panelHostSource, panelHostSource.indexOf('private unreadCounts('));
   sourceMatch(
     counts,
-    /: this\.windows;\s*return newCounts\(\s*\[\], windows,/,
+    /: this\.windows;[\s\S]*return newCounts\(\s*\[\], windows,/,
     'the rail count depends on selected turns that have not reached the host',
   );
   const newest = memberFrom(panelHostSource, panelHostSource.indexOf('private newestTurns():'));
@@ -8201,21 +8389,16 @@ test('the record of starting a session outlives the window', () => {
   );
   sourceMatch(
     write,
-    /this\.memento\?\.update\(STATE_KEY, this\.saved\)/,
+    /this\.persistHostState\(\)/,
     'the record is not stored when the session starts, so a window closed before the next save loses it',
   );
 
   // Browser state saves must preserve the host-owned started-session identities.
-  const save = between('private saveState(', 'const snapshot = structuredClone(this.saved);');
-  const held = save.indexOf('const started = this.saved.started;');
-  const rebuilt = save.indexOf('this.saved = normalizePanelState(state, railFilters);');
-  assert.ok(
-    held >= 0 && rebuilt > held,
-    'the panel state is rebuilt before this record is held, so every started session is dropped',
-  );
+  const save = memberFrom(panelHostSource, panelHostSource.indexOf('private saveState('));
+
   sourceMatch(
     save,
-    /this\.saved\.started = started;/,
+    /started: current\.started/,
     'the held record is not put back, so a panel saving its folds files every started session as a run',
   );
 
@@ -15098,8 +15281,9 @@ test('a delayed panel save keeps the durable selected session after adoption', a
     'normalizePanelState',
     'readMovedOnlyFor',
     'STATE_KEY',
+    'preserveHostRead',
     `${lifted}; return saveState;`,
-  )(normalizePanelState, () => false, 'arc.panelState');
+  )(normalizePanelState, () => false, 'arc.panelState', preserveHostRead);
   const persisted: unknown[] = [];
   const saved = normalizePanelState({ showing: 'durable' });
   const provider = {
@@ -15126,6 +15310,15 @@ test('a delayed panel save keeps the durable selected session after adoption', a
     },
   } as any;
 
+  Object.assign(provider, {
+    readOwner: () => ({
+      snapshot: () => structuredClone(provider.saved),
+      saveHost: async (update: (state: any) => any) => {
+        const state = update(provider.saved);
+        await Reflect.apply(provider.memento.update, provider.memento, ['arc.panelState', state]);
+      },
+    }),
+  });
   await saveState.call(provider, { ...saved, showing: 'provisional' });
 
   assert.equal(provider.saved.showing, 'durable');
@@ -15179,6 +15372,9 @@ test('archive and unarchive are bounded membership updates', () => {
   const archiveChanges: string[][] = [];
   const persisted: unknown[] = [];
   const provider = {
+    persistHostState() {
+      return Promise.resolve(Reflect.apply(this.memento.update, this.memento, ['arc.panelState', this.saved]));
+    },
     sessionAliases: new Map(),
     hidden: new Set<string>(),
     pinnedTop: new Set(['durable']),
@@ -15242,6 +15438,9 @@ test('pinning persists the opened pinned section with the membership write', () 
   )('arc.panelState', RAIL_FOLDS);
   const persisted: unknown[] = [];
   const provider = {
+    persistHostState() {
+      return Promise.resolve(Reflect.apply(this.memento.update, this.memento, ['arc.panelState', this.saved]));
+    },
     hidden: new Set<string>(),
     pinnedTop: new Set<string>(),
     saved: normalizePanelState({ railFolds: { [RAIL_FOLDS.top]: false } }),
@@ -15326,8 +15525,9 @@ test('a delayed browser save preserves durable provider memberships', async () =
   const saveState = new Function(
     'normalizePanelState',
     'STATE_KEY',
+    'preserveHostRead',
     `return function (state, canPersist = () => true) {\n${methodBody('private saveState(').replace(': ReadState', '')}\n};`,
-  )(normalizePanelState, 'arc.panelState');
+  )(normalizePanelState, 'arc.panelState', preserveHostRead);
   const provider = {
     saved: normalizePanelState({ hidden: ['durable'], pinnedTop: ['durable'], readerParents: { child: 'durable' } }),
     hidden: new Set(['durable']),
@@ -15344,6 +15544,15 @@ test('a delayed browser save preserves durable provider memberships', async () =
       return resolveSessionAlias(this.sessionAliases, session);
     },
   };
+  Object.assign(provider, {
+    readOwner: () => ({
+      snapshot: () => structuredClone(provider.saved),
+      saveHost: async (update: (state: any) => any) => {
+        const state = update(provider.saved);
+        await Reflect.apply(provider.memento.update, provider.memento, ['arc.panelState', state]);
+      },
+    }),
+  });
   await saveState.call(provider, {
     hidden: ['provisional'],
     pinnedTop: ['provisional'],
@@ -15367,8 +15576,9 @@ test('a browser save on a saved filter keeps its selection and lens words throug
   const saveState = new Function(
     'normalizePanelState',
     'STATE_KEY',
+    'preserveHostRead',
     `return function (state, canPersist = () => true) {\n${methodBody('private saveState(').replace(': ReadState', '')}\n};`,
-  )(normalizePanelState, 'arc.panelState');
+  )(normalizePanelState, 'arc.panelState', preserveHostRead);
   const railFilters = [{ id: 'f1', name: 'Costs', query: 'cost:>5', sort: 'cost-desc', lens: 'needs-you' }];
   const provider = {
     saved: normalizePanelState({ railFilters }),
@@ -15386,6 +15596,14 @@ test('a browser save on a saved filter keeps its selection and lens words throug
       return resolveSessionAlias(this.sessionAliases, session);
     },
   };
+  Object.assign(provider, {
+    readOwner: () => ({
+      snapshot: () => structuredClone(provider.saved),
+      saveHost: async (update: (state: any) => any) => {
+        update(provider.saved);
+      },
+    }),
+  });
   await saveState.call(provider, {
     railFilterId: 'f1',
     railFilter: 'cost:>5',
@@ -20275,7 +20493,7 @@ test('a prompt goes to the session the composer names, and nowhere else', () => 
   // Persist the comments remaining after delivery.
   sourceMatch(
     taken,
-    /void this\.memento\?\.update\(STATE_KEY, this\.saved\);/,
+    /void this\.persistHostState\(\)/,
     'the removal is never written down, so a reload puts every sent comment back',
   );
   // Publish the remaining comments to attached hosts.
@@ -24706,11 +24924,7 @@ test('the unsent prompts reach storage and come back out of it', () => {
 
   const saveAt = panelHostSource.indexOf('private saveState(');
   const stateSave = memberFrom(panelHostSource, saveAt);
-  sourceMatch(
-    stateSave,
-    /const queues = this\.saved\.queues[\s\S]*this\.saved = normalizePanelState\(state, railFilters\)[\s\S]*this\.saved\.queues = queues/,
-    'saving a fold or filter erases the persisted local queue',
-  );
+  sourceMatch(stateSave, /queues: current\.queues/, 'saving a fold or filter erases the persisted local queue');
   const forgetAt = panelHostSource.indexOf('public async forgetState()');
   const forget = memberFrom(panelHostSource, forgetAt);
   sourceMatch(
@@ -24720,7 +24934,7 @@ test('the unsent prompts reach storage and come back out of it', () => {
   );
   sourceMatch(
     forget,
-    /this\.saved\.comments = acceptedComments[\s\S]*const resetState = structuredClone\(this\.saved\)[\s\S]*const resetSaved = this\.saveState\(resetState\)[\s\S]*await resetSaved/,
+    /this\.saved\.comments = acceptedComments[\s\S]*const resetState = structuredClone\(this\.saved\)[\s\S]*const resetSaved = owner\.read\([\s\S]*await resetSaved/,
     'a comments-only waiting submission disappears when panel preferences are forgotten',
   );
 
@@ -24796,29 +25010,8 @@ test('the unsent prompts reach storage and come back out of it', () => {
 
   // Preserve host-owned drafts across browser state normalization.
   const body = memberFrom(panelHostSource, panelHostSource.indexOf('private saveState('));
-  const held = body.indexOf('const drafts = this.saved.drafts;');
-  const rebuilt = body.indexOf('this.saved = normalizePanelState(state, railFilters);');
-  const put = body.indexOf('this.saved.drafts = drafts;');
-  assert.ok(
-    held !== -1 && rebuilt !== -1 && put !== -1,
-    'a save from one host wipes the prompt the reader is typing in the other',
-  );
-  assert.ok(
-    held < rebuilt && rebuilt < put,
-    'the drafts are read or put back on the wrong side of the rebuild, so an empty set is what survives',
-  );
-
-  // Preserve host-owned submitted-prompt recovery across browser state normalization.
-  const sentHeld = body.indexOf('const sentPrompts = this.saved.sentPrompts;');
-  const sentPut = body.indexOf('this.saved.sentPrompts = sentPrompts;');
-  assert.ok(
-    sentHeld !== -1 && sentPut !== -1,
-    'a save from one host wipes the sent prompt no transcript has recorded yet in the other',
-  );
-  assert.ok(
-    sentHeld < rebuilt && rebuilt < sentPut,
-    'the sent prompts are read or put back on the wrong side of the rebuild, so an empty set is what survives',
-  );
+  sourceMatch(body, /drafts: current\.drafts/, 'browser preference saves omit the current host drafts');
+  sourceMatch(body, /sentPrompts: current\.sentPrompts/, 'browser preference saves omit submitted prompt recall');
 });
 
 // Typed facade for the imported prompt-editing history helpers.
@@ -28536,7 +28729,7 @@ test('reader menu keeps a provisional source identity until either end adopts', 
   assert.equal(f.created[0][2], parent);
 });
 
-test('provider reload sweeps provisional reader parents independently of labels and keeps stale-panel saves host-owned', () => {
+test('provider reload sweeps provisional reader parents independently of labels and keeps stale-panel saves host-owned', async () => {
   const listener = vi
     .spyOn(PanelProvider.prototype as unknown as { wireEditorListeners(): void }, 'wireEditorListeners')
     .mockImplementation(() => {});
@@ -28559,7 +28752,7 @@ test('provider reload sweeps provisional reader parents independently of labels 
     const provider = first as unknown as Record<string, any>;
     assert.deepEqual(provider.saved.readerParents, { durableChild: 'undiscovered' });
     provider.readPrint = () => '';
-    provider.saveState({ collapsed: ['another-panel'], readerParents: { forged: 'parent' } });
+    await provider.saveState({ collapsed: ['another-panel'], readerParents: { forged: 'parent' } });
     second = new PanelProvider('', {} as vscode.Uri, memento);
     const reloaded = second as unknown as Record<string, any>;
     assert.deepEqual(reloaded.saved.readerParents, { durableChild: 'undiscovered' });
@@ -30403,15 +30596,12 @@ test.each(['settings-first', 'curation-first'])(
       assert.equal(provider.pinnedTop.has(curated), true, 'adoption removed the pending curation pin');
     } else {
       resumeSettings();
-      assert.equal((await launch!).status, 'accepted');
     }
     rejectCuration(new Error('curation save refused'));
     await rejected;
     assert.equal(provider.pinnedTop.has(curated), false, 'refused curation pin survived real draft adoption');
-    if (ordering === 'curation-first') {
-      resumeSettings();
-      assert.equal((await launch!).status, 'accepted');
-    }
+    if (ordering === 'curation-first') resumeSettings();
+    assert.equal((await launch!).status, 'accepted');
     assert.equal(provider.pinnedTop.has(started), true, 'curation rollback removed the accepted initial pin');
     assert.equal(provider.pinnedTop.has(curated), false);
     await provider.writeDrafts();
@@ -30671,9 +30861,9 @@ test('an older failed CLI pin cannot roll back a newer pending initial pin', asy
   const older = assert.rejects(pin(), /older pin refused/);
   await vi.waitFor(() => assert.equal(saves, 1));
   resumeSettings();
-  await vi.waitFor(() => assert.equal(saves, 2));
   rejectOlder(new Error('older pin refused'));
   await older;
+  await vi.waitFor(() => assert.equal(saves, 2));
   assert.equal(provider.pinnedTop.has(session), true, 'older rollback removed the newer initial pin');
   const membership = vi.spyOn(provider, 'updateSessionMembership');
   let settled = false;
@@ -30802,10 +30992,11 @@ test('a failed pin preserves a newer successful pin after unpinning', async () =
   });
   const first = provider.updateSessionMembership('pin', 'reader');
   const rejected = assert.rejects(first, /first pin refused/);
-  await provider.updateSessionMembership('unpin', 'reader');
-  await provider.updateSessionMembership('pin', 'reader');
+  const unpin = provider.updateSessionMembership('unpin', 'reader');
+  const pin = provider.updateSessionMembership('pin', 'reader');
+  await vi.waitFor(() => assert.equal(typeof rejectFirst, 'function'));
   rejectFirst(new Error('first pin refused'));
-  await rejected;
+  await Promise.all([rejected, unpin, pin]);
   assert.equal(provider.pinnedTop.has('reader'), true, 'an older failed pin removed the newer accepted pin');
   await provider.writeDrafts();
   assert.deepEqual(durable.pinnedTop, ['reader']);
@@ -32174,9 +32365,10 @@ function externalFilterFixture() {
     readPrint: () => '',
     openInEditor() {},
     sendToHost: async (_host: unknown, message: unknown) => {
-      messages.push(message);
+      if ((message as any).type === 'applySessionFilter') messages.push(message);
       return true;
     },
+    readSequence: 0,
     memento: {
       update: (_key: string, state: unknown) => {
         writes.push(structuredClone(state));
@@ -32528,7 +32720,7 @@ test('queued browser saves preserve later host-owned labels, comments, and draft
   });
   const first = f.provider.saveState({ ...f.provider.saved, railFilter: 'session:one' });
   const second = f.provider.saveState({ ...f.provider.saved, railFilter: 'session:two' });
-  await f.provider.changeSessionLabels('selected', ['new label']);
+  const labelsSaved = f.provider.changeSessionLabels('selected', ['new label']);
   new Function('msg', 'applyComment', 'STATE_KEY', handlerBody(panelHostSource, 'note')).call(
     f.provider,
     {
@@ -32551,10 +32743,9 @@ test('queued browser saves preserve later host-owned labels, comments, and draft
     applyComment,
     'arc.panelState',
   );
-  await f.provider.writeDrafts();
+  const draftsSaved = f.provider.writeDrafts();
   release();
-  await first;
-  await second;
+  await Promise.all([first, second, labelsSaved, draftsSaved]);
   const restored = normalizePanelState(durable);
   assert.equal(restored.railFilter, 'session:two');
   assert.deepEqual(restored.labels.selected, ['new label']);
@@ -32586,13 +32777,13 @@ test.each([false, true])('queued filter saves preserve a later pin and browser f
   const clear = f.request('clear', '');
   await vi.waitFor(() => assert.equal(f.messages.length, 1));
   f.acknowledge();
-  await f.provider.updateSessionMembership('pin', 'selected', true);
+  const pinned = f.provider.updateSessionMembership('pin', 'selected', true);
   assert.equal(f.provider.saved.railFolds[RAIL_FOLDS.top], true);
   const later = foldLater
     ? f.provider.saveState({ ...f.provider.saved, railFolds: { [RAIL_FOLDS.top]: false } })
     : Promise.resolve();
   release();
-  await first;
+  await Promise.all([first, pinned]);
   assert.equal((await clear).status, 'applied');
   await later;
   assert.equal(f.provider.saved.railFolds[RAIL_FOLDS.top], !foldLater);
