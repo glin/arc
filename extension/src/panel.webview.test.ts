@@ -2434,6 +2434,8 @@ test('production bootstrap reload preserves unseen browser unread intent in the 
     (node) => ts.isFunctionDeclaration(node) && node.name?.text === 'startBrowserPanel',
   );
   const load = () => {
+    const frames: Array<() => void> = [];
+    const initialJobs = jobs.length;
     const module = { exports: {} as { startBrowserPanel: () => unknown } };
     new Function(
       'module',
@@ -2490,10 +2492,15 @@ test('production bootstrap reload preserves unseen browser unread intent in the 
           if (type === 'message') receive = listener;
         },
       },
-      (callback: () => void) => callback(),
+      (callback: () => void) => frames.push(callback),
       { readerPageId: f.pageId },
     );
     module.exports.startBrowserPanel();
+    assert.equal(jobs.length, initialJobs, 'readiness starts before the first shell frame');
+    frames.shift()!();
+    assert.equal(jobs.length, initialJobs, 'readiness starts before the second shell frame');
+    frames.shift()!();
+    assert.ok(jobs.length > initialJobs, 'the painted shell never reports readiness');
   };
   load();
   try {
@@ -8164,7 +8171,7 @@ const bootstrapSource = fs.readFileSync(path.join(__dirname, 'webview', 'bootstr
 const stateSource = fs.readFileSync(path.join(__dirname, 'webview', 'state.ts'), 'utf8');
 
 // Catches a renamed reader message or a reader-action report moved below an await. Either one lets deferred compaction pass reader input.
-test('every reader instruction names a panel message and reports before the panel awaits or delivers', () => {
+test('every reader instruction names a panel message and reports before the panel awaits or delivers', async () => {
   const set = /const READER_INSTRUCTIONS[^=]*= new Set\(\[([^\]]*)\]\)/.exec(panelHostSource);
   assert.ok(set, 'panelhost.ts no longer declares READER_INSTRUCTIONS');
   const names = [...set[1].matchAll(/'([^']+)'/g)].map((match) => match[1]).concat('answerAsk');
@@ -8174,8 +8181,47 @@ test('every reader instruction names a panel message and reports before the pane
   const start = panelHostSource.indexOf('private async onMessage(');
   const report = panelHostSource.indexOf('this.onReaderAction?.(message.session', start);
   assert.ok(start !== -1 && report !== -1, 'the panel message handler no longer reports reader actions');
-  const code = panelHostSource.slice(start, report).replace(/\/\/.*$/gm, '');
-  assert.ok(!/\bawait\s/.test(code), 'a reader action must be reported before any await');
+  const awaits: ts.AwaitExpression[] = [];
+  sourceNodes(panelHostSource, (node) => {
+    if (ts.isAwaitExpression(node) && node.getStart() >= start && node.getStart() < report) awaits.push(node);
+    return false;
+  });
+  for (const awaited of awaits) {
+    let branch: ts.Node = awaited;
+    while (
+      branch.parent &&
+      !(
+        ts.isIfStatement(branch.parent) &&
+        branch.parent.thenStatement === branch &&
+        /^message\.type === 'ready' &&/.test(branch.parent.expression.getText())
+      )
+    )
+      branch = branch.parent;
+    assert.ok(
+      branch.parent && ts.isIfStatement(branch.parent),
+      'a reader action must be reported before any await on its path',
+    );
+  }
+  const prefix = panelHostSource.slice(
+    panelHostSource.indexOf('{', start) + 1,
+    panelHostSource.indexOf('// Resolve current cards', report),
+  );
+  const compiled = ts.transpileModule(`async function reportReader(raw, host) {${prefix}}`, {
+    compilerOptions: { target: ts.ScriptTarget.ES2022 },
+  }).outputText;
+  const reportReader = new Function('parsePanelToHost', 'READER_INSTRUCTIONS', `${compiled}\nreturn reportReader;`)(
+    (message: unknown) => message,
+    new Set(names),
+  );
+  const f = orderedHostReadFixture();
+  f.provider.panelSession = (session: string) => session;
+  for (const type of names) {
+    const reports: unknown[] = [];
+    f.provider.onReaderAction = (session: string, answer: boolean) => reports.push([session, answer]);
+    const operation = reportReader.call(f.provider, { type, session: 'worker' }, f.host);
+    assert.deepEqual(reports, [['worker', type === 'answerAsk']], `${type} reports after yielding`);
+    await operation;
+  }
   const flush = panelHostSource.indexOf('public flushQueue(');
   const delivered = panelHostSource.indexOf('this.onReaderAction?.(state.sessionId', flush);
   assert.ok(flush !== -1 && delivered !== -1, 'queued delivery no longer reports a reader action');
@@ -26353,7 +26399,7 @@ test('a ready host stages worker-backed session data without clearing accepted c
   );
   sourceMatch(
     bootstrapSource,
-    /requestAnimationFrame\(\(\) =>[\s\S]*requestAnimationFrame\(\(\) =>[\s\S]*ports\.host\.send\(\{ type: 'ready', readerPageId: panel\.readerPageId \}\)/,
+    /requestAnimationFrame\(\(\) =>\s*requestAnimationFrame\(\(\) => \{\s*ports\.host\.send\(\{ type: 'ready', readerPageId: readerShellId, readerDocumentId: panel\.readerPageId \}\)/,
     'the browser starts catalog work before its shell has painted',
   );
 

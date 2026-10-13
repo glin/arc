@@ -215,6 +215,20 @@ const CONTEXT_DETAIL = unavailableContext({
 // Valid host messages and their parsed results cover every variant through the typed handler count.
 const HOST: Array<{ raw: unknown; parsed: HostToPanel }> = [
   {
+    raw: {
+      type: 'readerDocument',
+      readerPageId: 'a'.repeat(32),
+      documentId: 'b'.repeat(32),
+      challenge: 'c'.repeat(32),
+    },
+    parsed: {
+      type: 'readerDocument',
+      readerPageId: 'a'.repeat(32),
+      documentId: 'b'.repeat(32),
+      challenge: 'c'.repeat(32),
+    },
+  },
+  {
     raw: { type: 'readerReadAdmission', id: 'page:1', admitted: true },
     parsed: { type: 'readerReadAdmission', id: 'page:1', admitted: true },
   },
