@@ -3742,6 +3742,127 @@ test('window starts adopt both providers and classifications without changing th
     }
 });
 
+test('window read-only starts deliver both setup providers and exact immutable policies', async () => {
+  for (const agent of ['claude', 'codex'] as const)
+    for (const kind of ['custom', 'row'] as const) {
+      const provider: any = liveProviderFixture(livePress({ sessionId: 'reader', agent })).provider;
+      const profile: SessionProfile = { agent, model: '', effort: '', permissionMode: '', source: 'recent' };
+      const view = sessionLauncherView(null, [profile], {});
+      const setup = kind === 'row' ? { kind, key: view.primary!.key } : { kind, ...profile };
+      assert.equal(launcherProfile(view, setup)?.agent, agent);
+      const readTools = agent === 'claude' ? ['mcp__notes__read', 'mcp__files__list'] : [];
+      const drafts: NewSessionDraft[] = [];
+      Object.assign(provider, {
+        setupProject: 'project',
+        pendingModels: [],
+        folders: () => ['C:/workspace'],
+        repositoryScope: { snapshot: () => ({ ready: true, roots: ['C:/workspace'] }) },
+        launcherFor: () => ({ view }),
+        onSendDraftPrompt: async (draft: NewSessionDraft, prompt: { text: string }) => {
+          drafts.push(draft);
+          assert.equal(prompt.text, 'review');
+          return { delivered: false, reason: 'delivery stopped by fixture' };
+        },
+      });
+      const result = await provider.handleSessionRequest({
+        method: 'start',
+        requester: null,
+        params: { prompt: 'review', setup, readOnly: true, readTools },
+      });
+      assert.equal(result.status, 'refused');
+      assert.equal(drafts.length, 1);
+      assert.equal(drafts[0].profile.agent, agent);
+      assert.deepEqual(drafts[0].policy, { readOnly: true, readTools });
+      assert.equal(Object.isFrozen(drafts[0].policy), true);
+      assert.equal(Object.isFrozen(drafts[0].policy!.readTools), true);
+    }
+});
+
+test('window read-only starts refuse named setup read tools and permission overrides before delivery', async () => {
+  for (const [agent, permissionMode, readTools, refusal] of [
+    ['codex', '', ['mcp__notes__read'], /requires Claude/],
+    ['claude', 'auto', [], /permission override/],
+    ['codex', 'read-only', [], /permission override/],
+  ] as const) {
+    const provider: any = liveProviderFixture(livePress({ sessionId: 'reader', agent })).provider;
+    const view = sessionLauncherView(null, [{ agent, model: '', effort: '', permissionMode, source: 'recent' }], {});
+    const setup = { kind: 'row' as const, key: view.primary!.key };
+    assert.equal(launcherProfile(view, setup)?.permissionMode, permissionMode);
+    assert.equal(launcherProfile(view, setup)?.agent, agent);
+    let calls = 0;
+    Object.assign(provider, {
+      setupProject: 'project',
+      pendingModels: [],
+      folders: () => ['C:/workspace'],
+      repositoryScope: { snapshot: () => ({ ready: true, roots: ['C:/workspace'] }) },
+      launcherFor: () => ({ view }),
+      onSendDraftPrompt: async () => {
+        calls++;
+        return { delivered: false, reason: 'delivery stopped by fixture' };
+      },
+    });
+    await assert.rejects(
+      provider.handleSessionRequest({
+        method: 'start',
+        requester: null,
+        params: { prompt: 'review', setup, readOnly: true, readTools },
+      }),
+      refusal,
+    );
+    assert.equal(calls, 0);
+  }
+});
+
+test('window read-only starts admit canonical registered worktree cwd and refuse foreign or redirected cwd', async () => {
+  const root = tempDir('arc-window-launch-scope-');
+  const project = path.join(root, 'Project');
+  const worktree = path.join(root, 'Worktree');
+  const foreign = path.join(root, 'Project-other');
+  const redirect = path.join(project, 'redirect');
+  try {
+    for (const directory of [project, worktree, foreign]) fs.mkdirSync(directory);
+    const nested = path.join(worktree, 'Nested');
+    fs.mkdirSync(nested);
+    fs.symlinkSync(foreign, redirect, process.platform === 'win32' ? 'junction' : 'dir');
+    const provider: any = liveProviderFixture(livePress({ sessionId: 'reader', agent: 'codex' })).provider;
+    const drafts: NewSessionDraft[] = [];
+    Object.assign(provider, {
+      setupProject: 'project',
+      pendingModels: [],
+      folders: () => [project],
+      repositoryScope: { snapshot: () => ({ ready: true, roots: [project, worktree] }) },
+      launcherFor: () => ({ view: sessionLauncherView(null, [], {}) }),
+      onSendDraftPrompt: async (draft: NewSessionDraft) => {
+        drafts.push(draft);
+        return { delivered: false, reason: 'delivery stopped by fixture' };
+      },
+    });
+    const request = {
+      method: 'start',
+      requester: null,
+      params: {
+        prompt: 'review',
+        readOnly: true,
+        setup: { kind: 'custom', agent: 'codex', model: '', effort: '', permissionMode: '' },
+        cwd: path.join(nested, '..', 'Nested'),
+      },
+    };
+    await provider.handleSessionRequest(request);
+    assert.equal(drafts.length, 1);
+    assert.equal(drafts[0].cwd, fs.realpathSync(nested));
+    for (const cwd of [foreign, redirect]) {
+      await assert.rejects(
+        provider.handleSessionRequest({ ...request, params: { ...request.params, cwd } }),
+        /outside/,
+      );
+      assert.equal(drafts.length, 1);
+    }
+  } finally {
+    if (fs.existsSync(redirect)) fs.unlinkSync(redirect);
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('an initial metadata save failure reports the already accepted identity', async () => {
   const provider: any = liveProviderFixture(livePress({ sessionId: 'reader', agent: 'codex' })).provider;
   Object.assign(provider, {
