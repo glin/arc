@@ -74,16 +74,15 @@ Use either `--next-turn` or `--json`. Width also reads the `COLUMNS` environment
 
 The next-turn price estimates the minimum cost of sending the existing context again, including the latest answer. It excludes your next prompt and the model's next answer. An unknown cache state uses the uncached estimate. Missing cache fields show an unknown state. Session cost comes from Claude Code.
 
-If Claude Code cannot find `arc`, use an absolute path in the command. Quote the path to support folders with spaces. The examples below are shell command strings for the `command` setting.
+If Claude Code cannot find `arc`, use the npm-installed bundle's absolute path or a source build. Use forward slashes on Windows. Quote the path to support folders with spaces. The examples below are shell command strings for the `command` setting.
 
-For the launchers that **Arc: Set up terminal commands** writes, use the path that setup reports, with forward slashes on Windows. [Terminal availability](../README.md#terminal-availability) owns the install folder and the reported path. The commands below show the default folder:
+For a global package installation, find the prefix:
 
-```text
-"C:/Users/NAME/.arc/bin/arc.cmd" statusline
-"$HOME/.arc/bin/arc" statusline
+```sh
+npm prefix --global
 ```
 
-For a global package installation, find the prefix with `npm prefix --global` and call the bundle with Node.js. On Windows:
+Call the bundle with Node.js. On Windows:
 
 ```text
 node "C:/path/to/npm-prefix/node_modules/@glin/arc/dist/arc.cjs" statusline
@@ -95,7 +94,13 @@ On macOS and Linux:
 node "/path/to/npm-prefix/lib/node_modules/@glin/arc/dist/arc.cjs" statusline
 ```
 
-For a source build, follow [Build from source](#build-from-source) through `npm --prefix cli ci`. Run `npm --prefix cli run build` in the checkout. Then call the bundle with Node.js:
+For a source build, install dependencies as described in [Build from source](#build-from-source). Run this command in the checkout:
+
+```sh
+npm --prefix cli run build
+```
+
+Call the bundle with Node.js on Windows, macOS, or Linux:
 
 ```text
 node "/path/to/checkout/cli/dist/arc.cjs" statusline
@@ -107,16 +112,16 @@ Escape each double quote as `\"` inside the JSON command string. For example:
 {
   "statusLine": {
     "type": "command",
-    "command": "\"C:/Users/NAME/.arc/bin/arc.cmd\" statusline",
+    "command": "node \"C:/path/to/npm-prefix/node_modules/@glin/arc/dist/arc.cjs\" statusline",
     "padding": 0
   }
 }
 ```
 
-When running a quoted launcher directly in PowerShell, add the call operator:
+To run the npm-installed bundle directly in PowerShell:
 
 ```powershell
-& "C:/Users/NAME/.arc/bin/arc.cmd" statusline
+node "C:/path/to/npm-prefix/node_modules/@glin/arc/dist/arc.cjs" statusline
 ```
 
 ### Show the next-turn price in another status line
@@ -134,7 +139,7 @@ ccstatusline runs a `custom-command` widget this way. Point Claude Code at ccsta
 }
 ```
 
-Then add the widget to a line in `~/.config/ccstatusline/settings.json`. Use a launcher path or the `node` form from above in `commandPath`:
+Then add the widget to a line in `~/.config/ccstatusline/settings.json`. If ccstatusline cannot find `arc`, use an absolute `node` command from above in `commandPath`:
 
 ```json
 {
