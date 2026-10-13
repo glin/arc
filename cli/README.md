@@ -74,22 +74,56 @@ Use either `--next-turn` or `--json`. Width also reads the `COLUMNS` environment
 
 The next-turn price estimates the minimum cost of sending the existing context again, including the latest answer. It excludes your next prompt and the model's next answer. An unknown cache state uses the uncached estimate. Missing cache fields show an unknown state. Session cost comes from Claude Code.
 
-If Claude Code cannot find `arc`, use the installed bundle's absolute path in the command. Find npm's global prefix with:
+If Claude Code cannot find `arc`, use an absolute path in the command. Three forms work.
 
-```sh
-npm prefix --global
+For the launchers that **Arc: Set up terminal commands** writes, use the path that setup reports, with forward slashes on Windows. [Terminal availability](../README.md#terminal-availability) owns the install folder and the reported path. The commands below show the default folder:
+
+```text
+C:/Users/NAME/.arc/bin/arc.cmd statusline
+$HOME/.arc/bin/arc statusline
 ```
 
-On Windows, the command takes this form. Use forward slashes:
+For a global package installation, find the prefix with `npm prefix --global` and call the bundle with Node.js. On Windows:
 
 ```text
 node C:/path/to/npm-prefix/node_modules/@glin/arc/dist/arc.cjs statusline
 ```
 
-On macOS and Linux, use:
+On macOS and Linux:
 
 ```text
 node /path/to/npm-prefix/lib/node_modules/@glin/arc/dist/arc.cjs statusline
+```
+
+For a source build, follow [Build from source](#build-from-source) through `npm --prefix cli ci`. Then run `npm --prefix cli run build` in the checkout and call the bundle with Node.js:
+
+```text
+node /path/to/checkout/cli/dist/arc.cjs statusline
+```
+
+### Show the next-turn price in another status line
+
+`arc statusline --next-turn` prints one segment, for example `next turn starts at $0.47`. A status line tool that runs a command with Claude Code's JSON on stdin can show it beside its own segments.
+
+ccstatusline runs a `custom-command` widget this way. Point Claude Code at ccstatusline in `~/.claude/settings.json`:
+
+```json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "npx -y ccstatusline@latest"
+  }
+}
+```
+
+Then add the widget to a line in `~/.config/ccstatusline/settings.json`. Use a launcher path or the `node` form from above in `commandPath`:
+
+```json
+{
+  "type": "custom-command",
+  "commandPath": "arc statusline --next-turn",
+  "timeout": 1000
+}
 ```
 
 ## Session costs
@@ -102,6 +136,52 @@ arc cost ./session.jsonl --source-only
 ```
 
 Replace `SESSION_ID` with a saved Claude Code or Codex session ID. The command reads local records and prints JSON. It includes discovered child sessions unless you use `--source-only`, which requires a file path. `--by-model` adds cost subtotals for each model.
+
+The output has this shape for a Claude Code session that used six subagents. The excerpt shows selected fields, substitutes placeholders for IDs and paths, and keeps one of the six children:
+
+```json
+{
+  "schemaVersion": 2,
+  "source": {
+    "kind": "claude",
+    "file": "TRANSCRIPT_PATH",
+    "sessionId": "SESSION_ID"
+  },
+  "parent": {
+    "requests": 56,
+    "costUsd": 3.2912,
+    "uncachedInputTokens": 112,
+    "cachedInputTokens": 6950100,
+    "cacheWriteInputTokens": 143198,
+    "outputTokens": 37758
+  },
+  "children": [
+    {
+      "kind": "claude-subagent",
+      "file": "SUBAGENT_PATH",
+      "sessionId": "SUBAGENT_ID",
+      "requests": 76,
+      "costUsd": 3.4524,
+      "cachedInputTokens": 10513585,
+      "outputTokens": 12266
+    }
+  ],
+  "combined": {
+    "requests": 229,
+    "costUsd": 9.5626,
+    "uncachedInputTokens": 458,
+    "cachedInputTokens": 24421505,
+    "cacheWriteInputTokens": 1650883,
+    "outputTokens": 51739,
+    "cacheExpiry": {
+      "returns": 6,
+      "extraCostAfterExpiryUsd": 2.1224
+    }
+  }
+}
+```
+
+`combined` adds the parent and all six children. The [CLI guide](https://github.com/glin/arc/blob/main/docs/cli.md#read-a-cost-report) defines each field.
 
 Restrict the report to a time window:
 

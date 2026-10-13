@@ -1,8 +1,8 @@
-# Agent cost guide
+# Arc cost figures
 
-Use this guide to read Arc cost estimates and choose the next action. The estimates use recorded usage and supported list prices. They are not invoices or plan-limit meters.
+Use this guide to read the cost figures Arc shows in the panel, the CLI, and the Claude status line. The figures use recorded usage and supported list prices. They are not invoices or plan-limit meters.
 
-For decisions about work boundaries and cache reuse, read [Lower agent costs](lowering-agent-costs.md).
+[Lower agent costs](lowering-agent-costs.md) owns the decisions about work boundaries, cache reuse, and queued messages. Its [How the bill works](lowering-agent-costs.md#how-the-bill-works) section explains requests, the prompt cache, and message delivery for Claude Code and Codex.
 
 ## Supported pricing
 
@@ -127,89 +127,9 @@ Check whether the provider changed cache keys, cache duration, routing, or reque
 
 The warning stays absent until the scope is complete and every required cache-write category has a supported price. A normal high cached-input share does not trigger it.
 
-## What makes a turn expensive
+## Arc message delivery
 
-[Lower agent costs](lowering-agent-costs.md#read-the-cost-before-choosing-an-action) explains how request count and retained context multiply. Delegation changes who pays the cost, not the token categories.
-
-### Model requests and tool calls
-
-A model request and a tool call are different events. The model can return no tool calls, one call, or several calls in one response.
-
-Client tools commonly use this loop:
-
-1. The model requests one or more tools.
-2. The harness runs those tools.
-3. The harness sends their results in the next model request.
-
-Three independent tool calls can share one follow-up request when the harness returns their results together. Three dependent calls often need three follow-up requests because each call needs the previous result.
-
-Each new model request processes the retained context. An eligible matching prefix records cached input reads. Other input can be uncached or written to cache. A tool call does not guarantee a cache read.
-
-For example, assume each continuation reads a 100,000-token cached prefix. Five sequential continuations record 500,000 cached input tokens. One batched continuation records 100,000 cached input tokens.
-
-Server tools can run several internal iterations inside one external model request. Some hosted tools also have separate per-call fees.
-
-## Choose a work boundary
-
-[Lower agent costs](lowering-agent-costs.md#choose-a-boundary) gives the boundary decision and a handoff prompt.
-
-## Use the prompt cache
-
-Prompt caching matches an unchanged prefix at the start of a later prompt. The provider still processes new input after that prefix. [Lower agent costs](lowering-agent-costs.md#keep-useful-context) gives the rules for keeping the cache warm.
-
-### Compact after the cache expires
-
-A Claude Code compaction request reads the whole history once to write its summary. With a warm cache, it reads the history at the cache-read rate. With an expired cache, it sends the history as uncached input at the base input rate. It writes only the shared prefix of system instructions and tools back to the cache, because the summary replaces the history.
-
-The cold next-turn starting price that the prompt box shows writes the whole history to the cache at the cache-write rate. [Lower agent costs](lowering-agent-costs.md#choose-a-boundary) gives the rule for when compaction costs less.
-
-For example, take Opus 5.5 at 300,000 tokens with a one-hour cache. Input costs $4 per million tokens, a one-hour cache write costs $8 per million, and output costs $20 per million.
-
-- Continuing writes all 300,000 tokens to the cache for about $2.40.
-- Compacting sends about 281,000 tokens as uncached input for about $1.12. It writes a prefix of about 19,000 tokens for about $0.10 to $0.15, depending on the write lifetime. A 10,000-token summary adds about $0.20.
-- The first turn after the compaction starts from about 30,000 tokens. It reads the 19,000-token prefix that the compaction wrote and writes about 11,000 tokens, for about $0.09.
-
-Compacting and continuing costs about $1.55 against $2.40, and the next turns start from about 30,000 tokens instead of 300,000. That context grows again as the work continues. The compaction still pays for one cold pass over the history, and the summary keeps less detail than the history it replaces.
-
-## Send messages while the agent works
-
-Queueing describes where a client holds new input. Steering describes how the agent applies that input to unfinished work. A queued message can become steering when the client delivers it at a safe boundary inside the current turn. A message cannot enter a model request already in flight.
-
-[Lower agent costs](lowering-agent-costs.md#keep-useful-context) lists the action for each situation.
-
-Neither steering nor queueing has a special token price. Cost depends on the model requests, retained context, generated output, and tool work they cause. A rapid burst can become several requests or turns. A warm cache discounts eligible repeated input, but each cache read still costs money.
-
-When three separate messages become three later Claude turns, 100,000 cached Sonnet 5 tokens cost $0.06 to read. One combined turn costs $0.02. This example excludes new input, output, cache writes, and tools. If one boundary receives all three messages, the input cost can resemble one combined message. Submission count alone does not establish the bill.
-
-### Worked example
-
-Assume the current request read 100,000 cached tokens, processed 1,000 uncached tokens, and generated 500 output tokens before a tool call. The tool result adds 2,000 tokens, and a correction adds 50 tokens. Those original-request charges apply to every path below.
-
-| Delivery | Requests after the correction | Illustrative next input | Likely effect |
-| --- | --: | --- | --- |
-| Same-turn steering at the tool boundary | 1 | 100,000 cached read + 3,550 new input | The correction joins the continuation that the tool result already required. |
-| Queue until the turn finishes | 2 | Normal continuation, then the retained context + 50 new input | The completed answer and correction create another request boundary. |
-| Interrupt, then send | 1 | Retained completed context + 50 new input | Already generated output remains billed, and unfinished work stops. |
-
-These counts start after the correction. The provider, route, and cache state determine whether eligible prefix tokens become cache writes. The queueing or steering label does not change that classification.
-
-Same-turn steering often costs less because it can reuse an already-required continuation and stop wrong-path work. Sending the message before the turn ends does not create a discount by itself.
-
-### Claude Code
-
-Claude Code calls all ordinary busy-time messages queued. Queueing is its default input behavior while Claude works. If Claude is running tool calls, Claude Code passes queued messages after those calls within the same turn. That delivery steers the unfinished task. If the turn ends first, Claude Code sends the oldest message as the next turn and keeps later messages queued.
-
-Escape interrupts the current turn and sends queued messages immediately. This is interruption followed by another prompt, not same-turn steering. One final response after a mid-turn correction is consistent with same-turn delivery. Two distinct responses show that the correction became a later turn. See [Claude Code's queueing guide](https://code.claude.com/docs/en/interactive-mode#queue-messages-while-claude-works) for its delivery and interruption rules.
-
-For a quick question that needs no tools, see [Keep useful context](lowering-agent-costs.md#keep-useful-context).
-
-### Codex
-
-Codex supports explicit steering during active work. The next safe model boundary can apply the correction before the overall turn finishes. OpenAI calls this behavior steering. Accepted steering input waits for a successor response, and a required tool continuation can carry it. See the [OpenAI steering reference](https://developers.openai.com/api/reference/cli/resources/beta/subresources/responses).
-
-Steering has no special token price. Server-turn grouping does not prove that the provider made only one billed model request.
-
-### Arc behavior
+[Lower agent costs](lowering-agent-costs.md#send-messages-while-the-agent-works) explains queueing and steering. This section describes how Arc forwards messages.
 
 Arc forwards each busy-time message to the selected agent's protocol. It preserves separate submissions and does not combine a rapid burst. For Claude, it writes each message to Claude Code immediately. Claude Code queues the message, then chooses a same-turn tool boundary or a later turn. Arc's Stop action differs from Claude Code's Escape key because Stop clears messages that Claude Code still holds.
 

@@ -25,7 +25,8 @@ Keep stable instructions and reference material before changing content, and app
 | The task is simple | Lower the effort level. Thinking tokens bill as output. |
 | You would send a message only to refresh the cache | Do not. A relevant request before expiry refreshes an eligible cache entry, but it incurs its own read charge and any output. |
 | You will certainly resume a large context before its cache expires | Send one short relevant message. At 200,000 tokens on Opus 5.5, it costs about 0.04 USD plus the reply, and a rebuild at the one-hour write rate costs about 1.6 USD. |
-| You will leave a session idle | Check the cache lifetime of your route. Claude Code requests one hour for the main session on a Claude subscription within plan usage. It requests five minutes on an API key, a cloud provider, or usage credits. Set `promptCacheTtl` to `1h` for a one-hour main session on an API key. Current OpenAI models typically cache for about thirty minutes, and retention can reach twenty-four hours. |
+| You will leave a Claude Code session idle | Check the cache lifetime of your route. Claude Code requests one hour for the main session on a Claude subscription within plan usage. It requests five minutes on an API key, a cloud provider, or usage credits. Set `promptCacheTtl` to `1h` for a one-hour main session on an API key. |
+| You will leave a Codex session idle | Plan for a cold cache after 45 minutes. Codex sends a cache key and no retention setting, so the server decides how long a prefix lives. In one sample of Codex requests, misses stayed at or under 13% below 45 idle minutes and passed half at about 90 minutes across models. A prefix often survives 45 minutes and usually expires within two hours. |
 | The next task does not need the present context | Save the facts needed to resume and start a fresh session. |
 
 ## Choose a boundary
@@ -35,8 +36,8 @@ Keep stable instructions and reference material before changing content, and app
 | The next step needs the current details | Continue in this session. |
 | The same task continues from a short summary | Compact at a completed step. |
 | Auto-compaction would run in the middle of a task | Compact at the nearest completed step first. Pass focus instructions with `/compact <what to keep>` in Claude Code, or set `compact_prompt` in Codex. Compaction changes the prefix and reduces immediate cache reuse. |
-| The cache expired, the history is large, and a short summary is enough | Compact before the next prompt. A cold compaction costs less than the cold next turn when the history is much larger than the summary. For a small history, the summary output can cost more than the write it avoids. [Compact after the cache expires](agent-cost-guide.md#compact-after-the-cache-expires) works through the numbers. |
-| A Codex thread will sit idle past the OpenAI cache lifetime | Compact or hand off before you leave it. |
+| The cache expired, the history is large, and a short summary is enough | Compact before the next prompt. A cold compaction costs less than the cold next turn when the history is much larger than the summary. For a small history, the summary output can cost more than the write it avoids. [Compact after the cache expires](#compact-after-the-cache-expires) works through the numbers. |
+| A Codex thread will sit idle for more than 45 minutes | Compact or hand off before you leave it. |
 | A new task or phase needs little of this context | Write a handoff and start a fresh session. |
 | Context is nearly full | Finish the current step, then compact or hand off. |
 
@@ -65,14 +66,15 @@ Use a separate session when the main session needs only a file or commit as the 
 
 ## Limit spend for an agent run
 
-No client caps spend in an interactive session. Hard caps exist only for non-interactive runs, for one subagent, and on the account. Codex has no per-run turn, token, or dollar cap. `--max-budget-usd` counts subagent spend and can overshoot by one response plus running subagents, so leave headroom.
+No client caps spend in an interactive session. Hard caps exist only for non-interactive runs, for one subagent, and on the account. Codex has no per-run turn, token, or dollar cap, and its goal token budget is a soft limit. `--max-budget-usd` counts subagent spend and can overshoot by one response plus running subagents, so leave headroom.
 
 | Kind | Control |
 | --- | --- |
 | Hard cap | `claude -p --max-budget-usd` and `--max-turns`, which apply to print mode. The Agent SDK options `maxBudgetUsd` and `maxTurns`. A subagent's `maxTurns` frontmatter. Console workspace limits, and Team and Enterprise spend limits. OpenAI project and organization spend limits for API-key billing, which take effect with a short delay. |
+| Soft limit | A Codex goal token budget, which the model's `create_goal` tool accepts. The `/goal` command in the terminal interface takes no budget, and `codex exec` has no goal flag. At the budget, Codex marks the goal `budget_limited` and tells the model to wrap up the turn. The run continues past the budget. |
 | Report only | Claude Code `/usage` and the status line. Codex `/status` and `/usage`. A transcript meter such as AgentsView or `arc cost`. |
 
-Without a hard cap, make the coordinator enforce a ceiling. It needs a transcript meter that prices both clients, because Codex `/status` reports no dollar figure. Check `$CODEX_SESSION_ID` before `$CLAUDE_CODE_SESSION_ID`, because a Codex session started from a Claude Code shell inherits the Claude variable. At 1x the ceiling, the coordinator stops a round that does not converge. At 2x, counting spend carried across stops, it ends the run. The ceiling is an instruction, so it holds only as well as the coordinator obeys it.
+Without a hard cap, make the coordinator enforce a ceiling. It needs a transcript meter that prices both clients, because Codex `/status` reports no dollar figure. Two meters take a session ID: `arc cost SESSION_ID` and `agentsview session usage SESSION_ID --json`. AgentsView includes subagents unless you pass `--own-only`. It can report `has_cost: false`, so read a missing cost as unknown. The first call after an AgentsView upgrade can block for many minutes while it resyncs. Check `$CODEX_SESSION_ID` before `$CLAUDE_CODE_SESSION_ID`, because a Codex session started from a Claude Code shell inherits the Claude variable. At 1x the ceiling, the coordinator stops a round that does not converge. At 2x, counting spend carried across stops, it ends the run. The ceiling is an instruction, so it holds only as well as the coordinator obeys it.
 
 ```text
 Keep this task under <amount> USD and <n> review rounds.
@@ -124,6 +126,49 @@ Claude Code removes transcripts older than `cleanupPeriodDays` at startup. The d
   "cleanupPeriodDays": 36500
 }
 ```
+
+## How the bill works
+
+### Model requests and tool calls
+
+A model request and a tool call are different events. One response can carry no tool calls, one call, or several. The harness runs the tools and sends their results in the next model request. Independent calls can share one follow-up request when the harness returns their results together. Dependent calls often need one follow-up request each.
+
+A matching cached prefix is read at the cache-read rate. A tool call does not guarantee a cache read. For example, five sequential continuations over a cached 100,000-token prefix record 500,000 cached input tokens. One batched continuation records 100,000.
+
+Server tools can run several internal iterations inside one external model request. Some hosted tools also charge per call.
+
+### Compact after the cache expires
+
+A Claude Code compaction request reads the whole history once to write its summary. With a warm cache, it reads the history at the cache-read rate. With an expired cache, it sends the history as uncached input at the base input rate. It writes only the shared prefix of system instructions and tools back to the cache, because the summary replaces the history. A cold next turn without compaction writes the whole history to the cache at the cache-write rate.
+
+For example, take Opus 5.5 at 300,000 tokens with a one-hour cache. Input costs $4 per million tokens, a one-hour cache write costs $8 per million, and output costs $20 per million.
+
+- Continuing writes all 300,000 tokens to the cache for about $2.40.
+- Compacting sends about 281,000 tokens as uncached input for about $1.12. It writes a prefix of about 19,000 tokens for about $0.10 to $0.15, depending on the write lifetime. A 10,000-token summary adds about $0.20.
+- The first turn after the compaction starts from about 30,000 tokens. It reads the 19,000-token prefix that the compaction wrote and writes about 11,000 tokens, for about $0.09.
+
+Compacting and continuing costs about $1.55 against $2.40, and the next turns start from about 30,000 tokens instead of 300,000. The compaction still pays for one cold pass over the history, and the summary keeps less detail than the history it replaces.
+
+### Send messages while the agent works
+
+Queueing is where a client holds new input. Steering is how the agent applies that input to unfinished work. A queued message becomes steering when the client delivers it at a safe boundary inside the current turn. A message cannot enter a model request already in flight.
+
+Neither has a special token price. Cost follows the model requests, retained context, output, and tool work that the messages cause. Submission count alone does not set the bill. Three separate messages that become three later Claude turns read 100,000 cached Sonnet 5 tokens three times for $0.06. One combined turn reads them once for $0.02. This example excludes new input, output, cache writes, and tools.
+
+Assume the current request read 100,000 cached tokens, processed 1,000 uncached tokens, and generated 500 output tokens before a tool call. The tool result adds 2,000 tokens, and a correction adds 50 tokens. The counts below start after the correction.
+
+| Delivery | Requests after the correction | Illustrative next input | Likely effect |
+| --- | --: | --- | --- |
+| Same-turn steering at the tool boundary | 1 | 100,000 cached read + 3,550 new input | The correction joins the continuation that the tool result already required. |
+| Queue until the turn finishes | 2 | Normal continuation, then the retained context + 50 new input | The completed answer and correction create another request boundary. |
+| Interrupt, then send | 1 | Retained completed context + 50 new input | Already generated output remains billed, and unfinished work stops. |
+
+Same-turn steering often costs less because it reuses a continuation the agent already needs and stops wrong-path work. Sending the message before the turn ends does not create a discount by itself.
+
+- **Claude Code.** Queueing is the default while Claude works. During tool calls, Claude Code passes queued messages after those calls within the same turn, which steers the unfinished task. If the turn ends first, it sends the oldest message as the next turn and keeps later messages queued. Escape interrupts the turn and sends queued messages at once. One final response after a mid-turn correction fits same-turn delivery, and two distinct responses mean the correction became a later turn. See [Claude Code's queueing guide](https://code.claude.com/docs/en/interactive-mode#queue-messages-while-claude-works).
+- **Codex.** Codex supports explicit steering during active work. The next safe model boundary can apply the correction before the turn finishes, and a required tool continuation can carry it. Server-turn grouping does not prove that the provider billed only one model request. See the [OpenAI steering reference](https://developers.openai.com/api/reference/cli/resources/beta/subresources/responses).
+
+For a quick question that needs no tools, see [Keep useful context](#keep-useful-context).
 
 ## Arc
 
