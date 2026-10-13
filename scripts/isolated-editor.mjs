@@ -802,6 +802,7 @@ export async function cleanupRun(
 export function abandonedRuns(parent, isAlive) {
   let names;
   try {
+    parent = fs.realpathSync(parent);
     names = fs.readdirSync(parent);
   } catch {
     return [];

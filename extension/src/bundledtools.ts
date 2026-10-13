@@ -150,7 +150,10 @@ export class BundledTools {
     admitToolPath(this.tools);
     if (!fs.existsSync(this.tools)) {
       fs.mkdirSync(this.root, { recursive: true, mode: 0o700 });
-      const staging = fs.mkdtempSync(path.join(this.root, '.arc-tools-'));
+      const staging = path.join(
+        this.root,
+        path.basename(fs.mkdtempSync(path.toNamespacedPath(path.join(this.root, '.arc-tools-')))),
+      );
       const created = fs.lstatSync(staging);
       const ownership = JSON.stringify({ schemaVersion: 1, root: this.root });
       try {

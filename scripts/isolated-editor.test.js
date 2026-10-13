@@ -440,6 +440,53 @@ describe('installed editor CLI', () => {
 });
 
 describe('disposable probe packaging and evidence', () => {
+  test('discovers orphaned physical runs through the scratch alias used for creation', async () => {
+    const parent = scratch();
+    const target = scratch();
+    const link = path.join(parent, 'scratch-alias');
+    fs.symlinkSync(target, link, 'junction');
+    try {
+      const orphan = editor.createRun({ scratch: link, list: () => [] });
+      orphan.manifest.driverPid = 4_000_002;
+      editor.writeManifest(orphan.layout, orphan.manifest);
+      const live = editor.createRun({ scratch: link, list: () => [] });
+      const foreign = path.join(target, `${editor.RUN_PREFIX}foreign`);
+      fs.mkdirSync(foreign);
+      fs.writeFileSync(path.join(foreign, 'keep'), 'foreign bytes');
+      fs.writeFileSync(path.join(foreign, 'run.json'), JSON.stringify({ ...orphan.manifest, root: foreign }));
+      const malformed = path.join(target, `${editor.RUN_PREFIX}malformed`);
+      fs.mkdirSync(malformed);
+      fs.writeFileSync(path.join(malformed, 'run.json'), '{');
+      const aliasRoot = path.join(link, path.basename(orphan.layout.root));
+      assert.throws(() => editor.readManifest(aliasRoot), /does not describe/);
+      const runs = editor.abandonedRuns(link, (pid) => pid === process.pid);
+      assert.deepEqual(
+        runs.map((run) => run.root),
+        [orphan.layout.root],
+      );
+      assert.equal(runs[0].profile, orphan.layout.userData);
+      assert.deepEqual(runs[0].processes, orphan.manifest.processes);
+      const report = await editor.cleanupRun(runs[0], { list: () => [] });
+      assert.equal(report.ok, true, report.errors.join('\n'));
+      assert.equal(fs.existsSync(live.layout.root), true);
+      assert.equal(fs.readFileSync(path.join(foreign, 'keep'), 'utf8'), 'foreign bytes');
+      fs.unlinkSync(link);
+      const replacement = scratch();
+      fs.symlinkSync(replacement, link, 'junction');
+      assert.deepEqual(
+        editor.abandonedRuns(link, () => false),
+        [],
+      );
+      assert.equal(fs.existsSync(live.layout.root), true);
+      assert.deepEqual(
+        editor.abandonedRuns(path.join(parent, 'missing'), () => false),
+        [],
+      );
+    } finally {
+      fs.unlinkSync(link);
+    }
+  });
+
   test('retains evidence and removes runs created beneath a linked scratch ancestor', async () => {
     const parent = scratch();
     const target = scratch();

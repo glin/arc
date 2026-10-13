@@ -1369,6 +1369,39 @@ test('simultaneous first-window preparation publishes ownership before another w
   assert.equal(fs.existsSync(path.join(tools.tools, '.install.lock')), false);
 });
 
+test.skipIf(process.platform !== 'win32')(
+  'private commands publish beneath a long canonical software root',
+  async () => {
+    const parent = tempDir('arc-long-private-');
+    let root = parent;
+    while (root.length < 355) root = path.join(root, 'software-root-' + 'x'.repeat(Math.min(70, 355 - root.length)));
+    fs.mkdirSync(root, { recursive: true });
+    const tools = new BundledTools(readToolPackage(path.join(extensionRoot, 'dist')), root);
+    assert.ok(tools.root.length >= 355);
+    assert.equal(tools.root.startsWith('\\\\?\\'), false);
+    const launchers = await tools.preparePrivateCommands(new AbortController().signal);
+    const release = path.dirname(launchers);
+    assert.equal(launchers, path.join(tools.tools, 'releases', tools.bundle.payload.contentId, 'launchers'));
+    assert.deepEqual(JSON.parse(fs.readFileSync(path.join(tools.tools, 'ownership.json'), 'utf8')), {
+      schemaVersion: 1,
+      root: tools.root,
+    });
+    assert.deepEqual(
+      fs.readFileSync(path.join(release, 'release.json')),
+      Buffer.from(JSON.stringify(tools.bundle.payload)),
+    );
+    for (const name of Object.keys(tools.bundle.payload.files))
+      assert.deepEqual(
+        fs.readFileSync(path.join(release, name)),
+        fs.readFileSync(path.join(tools.bundle.directory, name)),
+      );
+    assert.deepEqual(fs.readdirSync(tools.root), ['tools']);
+    assert.equal(fs.existsSync(path.join(tools.tools, '.install.lock')), false);
+    assert.equal(fs.existsSync(path.join(tools.tools, 'active.json')), false);
+    assert.equal(await tools.preparePrivateCommands(new AbortController().signal), launchers);
+  },
+);
+
 test.each(['empty', 'unfamiliar', 'redirected'] as const)(
   'failed first-window publication preserves only unfamiliar staging contents: %s',
   async (contents) => {
