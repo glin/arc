@@ -4,11 +4,17 @@ Use these goals to decide whether a proposed feature belongs in Arc. [`architect
 
 ## Product job
 
-Arc helps one reader direct several coding agents and review their work in VS Code. It reads the records their CLIs write, and it sends prompts, answers, and comments through each CLI's protocol. It does not choose tasks, assign agents, or require a new workflow.
+Arc helps one reader direct several coding agents and review their work in VS Code. It reads the records their CLIs write, and it sends prompts, answers, and comments through each CLI's protocol. It does not choose tasks or assign agents.
 
 The session list shows which sessions need attention. The timeline shows turns inside the selected session, newest first. A turn card puts the agent's response beside recorded files, diffs, commits, activity, cost, and context. The Prompt box lets the reader act on that review without switching tools.
 
 Arc serves the author's fitted workflow. The CLI status companion also serves teammates who work in terminals. It stays useful without an editor, while the panel remains the reading and driving surface.
+
+## Simple and composable
+
+Arc must stay simple and composable within VS Code. It must fit existing tools without requiring a new workflow. Each feature must remain useful independently.
+
+Arc must not prescribe branching, worktrees, planning, or handoff formats. Features must work without naming conventions for plans, handoffs, or repository files. The reader and agents choose handoff content and workflow. Arc supplies primitives they can combine.
 
 ## First-class agents
 
@@ -40,4 +46,4 @@ Arc has no code-hosting integration for pull requests, issues, reviews, or remot
 
 The panel must remain responsive with many sessions. Reads are bounded, derived caches are rebuildable, and expensive history work waits for an explicit request or a background budget.
 
-A feature must make review or direction easier for this reader. It must work without naming conventions for plans, handoffs, or repository files. It must not make one agent the default or hide uncertainty in a cost or activity figure.
+A feature must make review or direction easier for this reader. It must not make one agent the default or hide uncertainty in a cost or activity figure.
