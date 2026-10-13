@@ -1,3 +1,5 @@
+import { sessionCoverageMember, sessionPresence, reconcileSessionCollisions } from './sessioncoverage';
+import { sessionSourceKey, sessionPageSources } from './sessionreads';
 import { test, vi } from 'vitest';
 import { pendingResponseSessionAdmitted, resolveResponseSession } from './domain/session-link';
 import { createPanelVisibility } from './panelvisibility';
@@ -1018,6 +1020,8 @@ function harness(pendingRefresh = false, registerRefreshHandler = true, extraMet
     const shortenTo = (line, limit, ellipsis) => line.length <= limit ? line : line.slice(0, Math.max(0, limit - ellipsis.length)) + ellipsis;
     const RAIL_NAME_LIMIT = 200;
     export class Harness {
+      membershipOf(session) { return this.sessions?.some((source) => source.sessionId === session) ? 'present' : 'absent'; }
+      acceptSessionCoverage(current) { this.membershipCoverage = { status: 'complete' }; return current; }
       sessionQueryContext() { return undefined; }
       publishSessionQueryContext() {}
       hasHumanPrompt() { return true; }
@@ -1149,7 +1153,20 @@ function completeDiscoveryHarness(
       ts.isClassDeclaration(statement) && statement.name?.text === 'PanelProvider',
   );
   assert.ok(owner);
-  scope = { sameSessionRevision, outcomesFor, replacedCatalogFiles: async () => [], ...scope };
+  scope = {
+    sessionCoverageMember,
+    reconcileSessionCollisions,
+    sessionCatalogMembership,
+    sessionPageSources,
+    sessionPresence,
+    sessionSourceKey,
+    projectsRoot: () => 'projects',
+    codexSessionsRoot: () => 'sessions',
+    sameSessionRevision,
+    outcomesFor,
+    replacedCatalogFiles: async () => [],
+    ...scope,
+  };
   const names = [
     'show',
     'publishWindowState',
@@ -1165,6 +1182,9 @@ function completeDiscoveryHarness(
     'scheduleProjectSpendHydration',
     'sessionParentsOf',
     'sessionParentEdges',
+    'acceptSessionCoverage',
+    'membershipOf',
+    'physicalMembershipOf',
     'parentOfShown',
     'dispatchEdges',
     'storeTitleEntry',
@@ -1235,6 +1255,7 @@ function completeDiscoveryHarness(
       noteSessionRead() {}
       loadingLine = new SessionLoadingLine((event, record) => this.diagnostics.warn(event, record));
       _showing = null; selections = []; messages = []; partial = []; catalog = null; drawnCards = [];
+      coverageRevision = 0; enumeratedAdmissionComplete = true;
       authoritativeCatalog = null; attachmentHandoffs = new Set(); titles = new Map();
       metadataRevision = 0; drawnMetadataRevision = 0; startupProgressAt = 0;
       derivedCacheCheckpointState = { markChanged() {} };
@@ -1424,7 +1445,18 @@ function completeDiscoveryHarness(
     sessionDiscoveryMembership,
     ...Object.values(scope),
   );
-  return new module.exports.Harness();
+  const provider = new module.exports.Harness();
+  if (!extraMethods.includes('allSessions')) {
+    const accept = provider.acceptSessionCoverage.bind(provider);
+    provider.acceptSessionCoverage = (current: any[], scope: string) => {
+      const complete = { status: 'complete', files: current.map((source) => source.file), uncertain: [] };
+      provider.sourceEnumerations = { claude: complete, codex: complete };
+      provider.enumeratedAdmissionComplete = true;
+      provider.enumeratedMembers = new Set(current.map(sessionCoverageMember));
+      return accept(current, scope);
+    };
+  }
+  return provider;
 }
 
 function railEnrichmentHarness(
@@ -1646,6 +1678,8 @@ function selectedWindowHarness(
     `
     const TRANSCRIPT_TURN_LIMIT = 40; const TRANSCRIPT_TAIL_BYTES = 1024;
     export class Harness {
+      membershipOf(session) { return this.authoritativeCatalog.some((source) => source.sessionId === session) ? 'present' : 'absent'; }
+      physicalMembershipOf(file) { return this.authoritativeCatalog.some((source) => source.file === file) ? 'present' : 'absent'; }
       sessionQueryContext() { return undefined; }
       publishSessionQueryContext() {}
       failSessionLoading() {}
@@ -4891,7 +4925,12 @@ function bumpedCatalogHarness() {
     {
       projectsRoot: () => 'projects',
       productionNormalizeFsPath: normalizeFsPath,
-      sessionFilesFor: () => [...claudeWalk],
+      enumerateSessionFilesFor: () => ({
+        sessions: [...claudeWalk],
+        files: claudeWalk.map((source) => source.file),
+        status: 'complete',
+        uncertain: [],
+      }),
       CLAUDE_CHILD_REFERENCE_PARSER_VERSION,
       codexSessionsRoot: () => 'sessions',
       codexSessionFiles: () => ({
@@ -4899,6 +4938,8 @@ function bumpedCatalogHarness() {
         sessions: [...codexWalk],
         subagents: [],
         sources: [],
+        enumeration: { status: 'complete', files: codexWalk.map((source) => source.file), uncertain: [] },
+        admission: 'complete',
       }),
       readRolloutStat: () => null,
       staleMetas: () => [],
@@ -4922,7 +4963,11 @@ function bumpedCatalogHarness() {
     codexOpenings: null,
     subagentDirectories: { sweep() {} },
     derivedCacheCheckpointState: { markChanged() {} },
-    hasHumanPrompt: () => true,
+    humanScans: new Map(),
+    hasHumanPrompt(session: any) {
+      this.humanScans.set(session.file, { found: true });
+      return true;
+    },
     updateSessionSpendSources() {},
     threadNames: { names: new Map(), fullNames: new Map() },
     progressiveWorker: {
@@ -7368,7 +7413,7 @@ test('hidden workspace-folder changes retain known directories until the replace
 test('a full deferred-metadata refresh retains hosted starts until matching authoritative publication', async () => {
   const provider = paintHarness(['railRows', 'rowForSession'], { stableRailOrder });
   const pending = { sessionId: 'accepted-start', createdAt: 1, agent: 'codex', cwd: 'project' };
-  const source = { ...pending, file: 'accepted.jsonl', size: 0, mtimeMs: 1 };
+  const source = { ...pending, file: 'accepted.jsonl', size: 1, mtimeMs: 1, dev: 1, ino: 2 };
   provider.partial = [source];
   provider.authoritativeCatalog = [];
   provider.authoritativeCatalogScope = JSON.stringify(['project']);

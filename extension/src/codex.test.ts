@@ -1,5 +1,63 @@
 import { sessionCostProjection, sessionCostUsageOf } from './turncard';
-import { revisionOf } from './transcript';
+
+test.each(['claude', 'codex'] as const)(
+  'qualified current opening rejects retired descriptor and changing revision for %s',
+  (agent) => {
+    const root = tempDir('qualified-opening-');
+    const file = path.join(root, 'session.jsonl');
+    const opening = (cwd: string) =>
+      JSON.stringify(
+        agent === 'claude'
+          ? { type: 'user', cwd }
+          : {
+              type: 'session_meta',
+              payload: { id: 'opening-id', cwd, source: 'vscode', instructions: 'x'.repeat(20 * 1024) },
+            },
+      ) + '\n';
+    fs.writeFileSync(file, opening('C:/current'));
+    const read = () => (agent === 'claude' ? readQualifiedSessionCwd(file) : readQualifiedCodexOpening(file));
+    const current = read();
+    assert.ok(current);
+    assert.deepEqual(current.revision, revisionOf(fs.statSync(file, { bigint: true })));
+    const mutableFs = createRequire(__filename)('node:fs') as typeof fs;
+    const original = mutableFs.readSync;
+    for (const transition of ['pathname replacement', 'descriptor growth'] as const) {
+      let changed = false;
+      let bytes = 0;
+      const interception = vi.spyOn(mutableFs, 'readSync').mockImplementation((...args: any[]) => {
+        if (!changed) {
+          changed = true;
+          if (transition === 'pathname replacement') {
+            fs.renameSync(file, file + '.retired');
+            fs.writeFileSync(file, opening('C:/replacement'));
+          } else fs.appendFileSync(file, JSON.stringify({ cwd: 'C:/later' }) + '\n');
+        }
+        const count = (original as any)(...args);
+        bytes += count;
+        return count;
+      });
+      syncBuiltinESMExports();
+      try {
+        assert.equal(read(), null, transition + ' qualified stale opening metadata');
+        assert.ok(changed);
+        assert.ok(bytes <= (agent === 'claude' ? 64 : 128) * 1024);
+      } finally {
+        interception.mockRestore();
+        syncBuiltinESMExports();
+      }
+      assert.ok(read(), 'the settled current opening remains unavailable');
+    }
+    fs.writeFileSync(
+      file,
+      agent === 'claude'
+        ? 'x'.repeat(64 * 1024)
+        : opening('C:/oversized').replace('x'.repeat(20 * 1024), 'x'.repeat(128 * 1024)),
+    );
+    assert.equal(read(), null, 'an oversized opening bypassed the byte limit');
+  },
+);
+import { enumerateRolloutFiles } from './codex';
+import { revisionOf, readQualifiedSessionCwd } from './transcript';
 // extension/src/codex.test.ts
 import { test, vi } from 'vitest';
 import assert from 'node:assert';
@@ -40,6 +98,7 @@ import {
   scanForCodexPerson,
   readCodexSession,
   readCodexOpening,
+  readQualifiedCodexOpening,
   readCodexSessionActivity,
   readCodexSessionMeta,
   readCodexSessionMetaAsync,
@@ -14530,6 +14589,22 @@ test('Codex metadata cache revisions move only with persistable entries', () => 
   assert.equal(cache.revision, 1, 'removing a persisted entry changes the snapshot');
   assert.deepEqual(cache.get(valid), readCodexSessionMeta(valid));
   assert.equal(cache.revision, 2, 'reading a new positive entry changes the snapshot');
+  const previous = cache.get(valid)!;
+  const qualified = { ...previous, sessionId: 'replacement', cwd: 'c:\\replacement', nativeSpawnedAt: 1 };
+  cache.install(valid, qualified);
+  assert.equal(cache.revision, 3, 'a qualified replacement notifies the snapshot owner');
+  assert.deepEqual(cache.snapshot(), [[valid, qualified]]);
+  cache.install(valid, { ...qualified });
+  assert.equal(cache.revision, 3, 'unchanged qualified metadata preserves the snapshot revision');
+  const { nativeSpawnedAt: _omitted, ...withoutSpawn } = qualified;
+  cache.install(valid, withoutSpawn);
+  assert.equal(cache.revision, 4, 'removing an optional persisted field notifies the snapshot owner');
+  const reader = new CodexMetaCache(() => assert.fail('qualified installation requested another opening read'));
+  reader.load([[valid, previous]]);
+  reader.install(valid, withoutSpawn);
+  assert.equal(reader.get(valid), withoutSpawn);
+  assert.deepEqual(reader.snapshot(), [[valid, withoutSpawn]]);
+  assert.equal(reader.revision, 1);
 });
 
 test('a cold opening pass reads up to its bound at once and never more', async () => {
@@ -16739,4 +16814,66 @@ test('Codex provisional association eviction preserves partial coverage and boun
   assert.ok(state.recentCompactions.length <= RETAINED_COMPACTIONS);
   const restored = createCodexUsageLineReducer(state);
   assert.deepEqual(restored.snapshot(), state);
+});
+
+test('Codex enumeration retains unread subtree uncertainty and distinguishes missing roots from I/O failure', () => {
+  const root = tempDir('codex-enumeration-');
+  const dir = path.join(root, '2026');
+  fs.mkdirSync(dir);
+  const file = path.join(dir, 'retained.jsonl');
+  fs.writeFileSync(file, '{}\n');
+  const native = createRequire(__filename)('node:fs') as typeof fs;
+  const read = native.readdirSync;
+  const spy = vi.spyOn(native, 'readdirSync').mockImplementation(((target: fs.PathLike, ...args: any[]) => {
+    if (String(target) === dir) throw Object.assign(new Error('unread subtree'), { code: 'EACCES' });
+    return (read as any)(target, ...args);
+  }) as typeof fs.readdirSync);
+  syncBuiltinESMExports();
+  try {
+    const partial = enumerateRolloutFiles(root);
+    assert.equal(partial.status, 'incomplete');
+    assert.deepEqual(partial.files, []);
+    assert.deepEqual(partial.uncertain, [dir]);
+    assert.equal(codexSessionFiles(root, ['C:/work']).admission, 'incomplete');
+  } finally {
+    spy.mockRestore();
+    syncBuiltinESMExports();
+  }
+  fs.unlinkSync(file);
+  assert.equal(enumerateRolloutFiles(root).status, 'complete');
+  assert.equal(enumerateRolloutFiles(path.join(root, 'missing')).missingRoot, true);
+  const failure = vi.spyOn(native, 'readdirSync').mockImplementation(() => {
+    throw Object.assign(new Error('I/O failure'), { code: 'EIO' });
+  });
+  syncBuiltinESMExports();
+  try {
+    assert.equal(enumerateRolloutFiles(root).status, 'unavailable');
+    assert.equal(enumerateRolloutFiles(root).missingRoot, undefined);
+  } finally {
+    failure.mockRestore();
+    syncBuiltinESMExports();
+  }
+});
+
+test('Codex unavailable openings and stats leave admitted membership incomplete', () => {
+  const root = sessionsRoot([{ day: '2026/08/25', name: ROLLOUT(UUID_A), records: [meta({ id: UUID_A })] }]);
+  assert.equal(codexSessionFiles(root, ['c:/repo'], () => null).admission, 'incomplete');
+  assert.equal(codexSessionFiles(root, ['c:/repo'], readCodexSessionMeta, () => null).admission, 'incomplete');
+});
+
+test('failed Codex stat reads retain the held revision until enumeration proves absence', () => {
+  const file = 'C:/isolated/retained.jsonl';
+  const held = { mtimeMs: 1000, size: 1, isFile: true, dev: 1, ino: 2 };
+  let readable = true;
+  const stats = new CodexStatCache(
+    () => (readable ? held : null),
+    () => 1001,
+  );
+  assert.equal(stats.get(file), held);
+  readable = false;
+  assert.equal(stats.get(file), null);
+  assert.deepEqual([...stats.keys()], [file]);
+  for (const missing of staleMetas(stats.keys(), [], { status: 'complete', files: [], uncertain: [] }))
+    stats.delete(missing);
+  assert.deepEqual([...stats.keys()], []);
 });

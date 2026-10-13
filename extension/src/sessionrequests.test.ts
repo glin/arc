@@ -2152,7 +2152,7 @@ function compactHostFixture(agent: 'claude' | 'codex' = 'codex') {
     writes: 0,
     // The last native submission generation. The requesting turn of the Claude cases is generation 1.
     compactions: 1,
-    work: 'none' as 'none' | 'pending' | 'absent',
+    work: 'none' as 'none' | 'pending' | 'absent' | 'unknown',
     beforeWrite: () => {},
     state,
     child: null as unknown as CompactChild,
@@ -3747,4 +3747,33 @@ test('accepted no-turn commands retain positive status until qualified process c
   assert.equal(status(false, false, 200, false), 'background');
   assert.equal(status(false, false, 99), 'background');
   assert.equal(status(false, false, 149), 'background');
+});
+
+test('deferred compaction retains unknown membership and cancels only proven absence', async () => {
+  for (const agent of ['claude', 'codex'] as const) {
+    const { fixture } = compactHostFixture(agent);
+    const { host, child, state } = fixture;
+    const event = (kind: 'toolStart' | 'toolEnd' | 'rootEnd') =>
+      compactEvent(kind, { provider: agent, ...(agent === 'claude' ? { turnId: null, generation: 1 } : {}) });
+    host.submitted(child, 7);
+    host.native(child, event('toolStart'), 7);
+    assert.equal(
+      (host.handle({ method: 'compact-request', params: compactPayload }) as { state: string }).state,
+      'queued',
+    );
+    host.native(child, event('toolEnd'), 7);
+    host.replyRetained(child, 7);
+    host.native(child, event('rootEnd'), 7);
+    state.busy = false;
+    fixture.work = 'unknown';
+    host.sessionsRefreshed();
+    await host.drain('self');
+    assert.equal(fixture.writes, 0, agent);
+    assert.equal(compactState(host), 'queued', agent);
+    fixture.work = 'absent';
+    host.sessionsRefreshed();
+    await host.drain('self');
+    assert.equal(fixture.writes, 0, agent);
+    assert.equal(compactState(host), 'cancelled', agent);
+  }
 });

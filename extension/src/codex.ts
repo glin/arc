@@ -1,9 +1,11 @@
+import type { SourceEnumeration } from './sessioncoverage';
 import * as fs from 'node:fs';
 import { ExportLimitError, type ExportRelationshipLimits } from './exportlimits';
 import { emptyCodexResponseClock, validRate, reduceCodexResponseClock, type CodexResponseClock } from './outputrate';
 import { meterRead, meterReadWork } from './readmeter';
 import * as path from 'node:path';
 import { createHash } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
 
 import {
   BackwardLineCursor,
@@ -47,6 +49,8 @@ import {
   normalizeFsPath,
   sameCommitSha,
   revisionOf,
+  readQualifiedOpening,
+  type FileRevision,
   RelationshipReader,
   RELATIONSHIP_QUANTUM_BYTES,
   relationshipEvidence,
@@ -258,6 +262,14 @@ export class CodexMetaCache {
   get revision(): number {
     return this.changed;
   }
+  // Install an already qualified opening and notify the existing snapshot owner.
+  install(file: string, meta: CodexSessionMeta): void {
+    const previous = this.entries.get(file)?.meta;
+    this.entries.set(file, { meta });
+    if (!isDeepStrictEqual(previous, meta)) {
+      this.changed += 1;
+    }
+  }
   delete(file: string): boolean {
     const hit = this.entries.get(file);
     const deleted = this.entries.delete(file);
@@ -360,19 +372,7 @@ function firstLineOf(file: string): string | null {
   let fd = -1;
   try {
     fd = fs.openSync(file, 'r');
-    const buf = (headBuffer ??= Buffer.allocUnsafe(META_BYTES));
-    let have = 0;
-    let window = FIRST_LINE_WINDOW;
-    for (;;) {
-      const want = window - have;
-      const read = meterRead(file, fs.readSync(fd, buf, have, want, have), have);
-      const line = firstLineStep(buf, have, read, want);
-      if (line !== undefined) {
-        return line;
-      }
-      have += read;
-      window = Math.min(window * 2, META_BYTES);
-    }
+    return firstLineFromDescriptor(file, fd);
   } finally {
     if (fd >= 0) {
       try {
@@ -382,6 +382,27 @@ function firstLineOf(file: string): string | null {
       }
     }
   }
+}
+
+function firstLineFromDescriptor(file: string, fd: number): string | null {
+  const buf = (headBuffer ??= Buffer.allocUnsafe(META_BYTES));
+  let have = 0;
+  let window = FIRST_LINE_WINDOW;
+  for (;;) {
+    const want = window - have;
+    const read = meterRead(file, fs.readSync(fd, buf, have, want, have), have);
+    const line = firstLineStep(buf, have, read, want);
+    if (line !== undefined) return line;
+    have += read;
+    window = Math.min(window * 2, META_BYTES);
+  }
+}
+
+export function readQualifiedCodexOpening(file: string): { value: CodexSessionMeta; revision: FileRevision } | null {
+  return readQualifiedOpening(file, (fd) => {
+    const meta = openingRecordOf(firstLineFromDescriptor(file, fd));
+    return meta?.sessionId && meta.cwd ? meta : null;
+  });
 }
 
 // Read the first line asynchronously. This read owns its `META_BYTES` buffer until settlement.
@@ -582,6 +603,11 @@ const ROLLOUT_NAME = /-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]
 // List every rollout under `root` within `WALK_DEPTH`.
 // Directory dates describe session starts, not their latest activity. Do not prune resumed sessions by those dates.
 export function rolloutFiles(root: string): string[] {
+  return enumerateRolloutFiles(root).files as string[];
+}
+
+export function enumerateRolloutFiles(root: string): SourceEnumeration {
+  const evidence: SourceEnumeration = { status: 'complete', root, directories: [], files: [], uncertain: [] };
   const out: string[] = [];
   // `depth` counts the levels already descended, so the root itself is zero and a directory
   // is entered while that count is still under the limit.
@@ -589,9 +615,15 @@ export function rolloutFiles(root: string): string[] {
     let entries: fs.Dirent[] = [];
     try {
       entries = fs.readdirSync(dir, { withFileTypes: true });
-    } catch {
+    } catch (error) {
+      if (depth === 0 && (error as NodeJS.ErrnoException).code === 'ENOENT') evidence.missingRoot = true;
+      else {
+        evidence.status = depth === 0 ? 'unavailable' : 'incomplete';
+        (evidence.uncertain as string[]).push(dir);
+      }
       return;
     }
+    (evidence.directories as string[]).push(dir);
     for (const entry of entries) {
       const full = path.join(dir, entry.name);
       if (entry.isDirectory()) {
@@ -604,7 +636,7 @@ export function rolloutFiles(root: string): string[] {
     }
   };
   walk(root, 0);
-  return out;
+  return { ...evidence, files: out };
 }
 
 // Workspace sessions and the complete walked rollout list.
@@ -617,6 +649,8 @@ export interface CodexListing {
   // Visible dispatched children also appear in `sessions` with their stat.
   subagents: CodexSubagentFile[];
   walked: string[];
+  enumeration: SourceEnumeration;
+  admission: SourceEnumeration['status'];
 }
 
 export interface CodexSubagentFile {
@@ -679,8 +713,6 @@ export class CodexStatCache {
     const stat = this.statOf(file);
     if (stat) {
       this.entries.set(file, { stat, readAt: at });
-    } else {
-      this.entries.delete(file);
     }
     return stat;
   }
@@ -713,13 +745,15 @@ export class CodexStatCache {
 // row the stored opening records lacked. The walk lists from `walked`, so a startup walks the
 // rollout tree once.
 export interface ColdOpeningPass {
+  enumeration: SourceEnumeration;
   walked: string[];
   read: boolean;
 }
 
 export async function coldOpeningPass(cache: CodexMetaCache, root: string): Promise<ColdOpeningPass> {
-  const walked = rolloutFiles(root);
-  return { walked, read: await cache.prime(walked) };
+  const enumeration = enumerateRolloutFiles(root);
+  const walked = [...enumeration.files];
+  return { walked, enumeration, read: await cache.prime(walked) };
 }
 
 // List workspace sessions by newest activity, using each opening's recorded cwd for membership.
@@ -729,10 +763,15 @@ export function codexSessionFiles(
   folders: string[],
   metaOf: (file: string) => CodexSessionMeta | null = readCodexSessionMeta,
   statOf: (file: string) => RolloutStat | null = readRolloutStat,
-  walked: string[] = rolloutFiles(root),
+  walked?: string[],
+  enumeration: SourceEnumeration = walked
+    ? { status: 'incomplete', files: walked, uncertain: [root] }
+    : enumerateRolloutFiles(root),
 ): CodexListing {
+  walked ??= [...enumeration.files];
+  let admission = enumeration.status;
   if (folders.length === 0) {
-    return { sessions: [], sources: [], subagents: [], walked };
+    return { sessions: [], sources: [], subagents: [], walked, enumeration, admission };
   }
   const out: SessionFile[] = [];
   const sources: { file: string }[] = [];
@@ -742,6 +781,7 @@ export function codexSessionFiles(
     const meta = metaOf(file);
     // No readable opening record means no cwd, and the path holds none either, so there is
     // nothing that puts the session in this workspace.
+    if (!meta || !meta.cwd) admission = 'incomplete';
     if (!meta || !meta.cwd || !isInside(meta.cwd, folders)) {
       continue;
     }
@@ -767,6 +807,7 @@ export function codexSessionFiles(
       continue;
     }
     const stat = statOf(file);
+    if (!stat) admission = 'incomplete';
     if (!stat || !stat.isFile || stat.size === 0) {
       continue;
     }
@@ -784,14 +825,20 @@ export function codexSessionFiles(
       agentRun: isAgentRun(meta),
     });
   }
-  return { sessions: out.sort((a, b) => b.mtimeMs - a.mtimeMs), sources, subagents, walked };
+  return { sessions: out.sort((a, b) => b.mtimeMs - a.mtimeMs), sources, subagents, walked, enumeration, admission };
 }
 
 // Find cached openings absent from the complete walk.
 // Workspace sessions alone omit other projects and cannot establish which rollout files disappeared.
-export function staleMetas(cached: Iterable<string>, walked: Iterable<string>): string[] {
+export function staleMetas(
+  cached: Iterable<string>,
+  walked: Iterable<string>,
+  enumeration?: SourceEnumeration,
+  absent: (file: string) => boolean = () => true,
+): string[] {
+  if (enumeration && enumeration.status !== 'complete') return [];
   const seen = new Set(walked);
-  return [...cached].filter((file) => !seen.has(file));
+  return [...cached].filter((file) => !seen.has(file) && absent(file));
 }
 
 // Read the first typed prompt as a fallback session title.

@@ -46,6 +46,7 @@ export interface ResponseSessionTarget {
   sessionId: string;
   agent: string;
   cwd?: string | null;
+  file?: string;
 }
 
 export type ResponseSessionResolution =
@@ -76,5 +77,6 @@ export function pendingResponseSessionAdmitted(
   pending: ResponseSessionTarget,
   catalog: readonly ResponseSessionTarget[],
 ): boolean {
-  return catalog.some((source) => source.agent === pending.agent && source.sessionId === pending.sessionId);
+  const matches = catalog.filter((source) => source.sessionId === pending.sessionId);
+  return matches.length === 1 && matches[0].agent === pending.agent;
 }

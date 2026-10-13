@@ -1,4 +1,6 @@
 import { test, vi } from 'vitest';
+import { enumerateSessionFiles, enumerateSessionFilesFor } from './transcript';
+import { createRequire, syncBuiltinESMExports } from 'node:module';
 import { EXPORT_LIMITS, ExportLimitError } from './exportlimits.ts';
 import {
   scanClaudeRelationshipQuantum,
@@ -2731,7 +2733,7 @@ test('the human-prompt scan reads each byte once, and a wake file joins when a h
   assert.equal(first.found, false, 'a wake-only file reads as human work');
   assert.equal(first.bytes, size1, 'the scan did not consume the complete lines it read');
   // An unchanged file needs no additional read.
-  assert.deepEqual(scanForHumanPrompt(file, size1, first), { bytes: size1, found: false });
+  assert.deepEqual(scanForHumanPrompt(file, size1, first), { bytes: size1, found: false, complete: true });
   // The next scan finds a human prompt appended after its saved offset.
 
   fs.appendFileSync(
@@ -9930,7 +9932,7 @@ test('command admission withdraws and stays withdrawn after model work across ap
   assert.equal(promptScanLists(scan), true);
   fs.appendFileSync(file, JSON.stringify(answer));
   const partial = scanForHumanPrompt(file, fs.statSync(file).size, scan);
-  assert.deepEqual(partial, scan);
+  assert.deepEqual(partial, { ...scan, complete: false });
   fs.appendFileSync(file, '\n');
   scan = scanForHumanPrompt(file, fs.statSync(file).size, partial);
   assert.equal(scan.command?.withdrawn, true);
@@ -16154,5 +16156,68 @@ test('a later child or submission cannot release a reused unresolved background 
       },
     });
     assert.equal(work.pending, true, 'an older completion released the ambiguous later launch');
+  }
+});
+
+test('Claude enumeration retains unread subtree uncertainty and distinguishes missing roots from I/O failure', () => {
+  const root = tempDir('claude-enumeration-');
+  const cwd = 'C:/work/coverage';
+  const dir = path.join(root, projectSlug(cwd));
+  fs.mkdirSync(dir);
+  const file = path.join(dir, 'retained.jsonl');
+  fs.writeFileSync(file, '{}\n');
+  const native = createRequire(__filename)('node:fs') as typeof fs;
+  const read = native.readdirSync;
+  const spy = vi.spyOn(native, 'readdirSync').mockImplementation(((target: fs.PathLike, ...args: any[]) => {
+    if (String(target) === dir) throw Object.assign(new Error('unread subtree'), { code: 'EACCES' });
+    return (read as any)(target, ...args);
+  }) as typeof fs.readdirSync);
+  syncBuiltinESMExports();
+  try {
+    const partial = enumerateSessionFilesFor(root, [cwd], () => cwd);
+    assert.equal(partial.status, 'incomplete');
+    assert.deepEqual(partial.sessions, []);
+    assert.deepEqual(partial.uncertain, [dir]);
+  } finally {
+    spy.mockRestore();
+    syncBuiltinESMExports();
+  }
+  fs.unlinkSync(file);
+  const complete = enumerateSessionFilesFor(root, [cwd], () => cwd);
+  assert.equal(complete.status, 'complete');
+  assert.deepEqual(complete.sessions, []);
+  assert.equal(enumerateSessionFiles(path.join(root, 'missing')).missingRoot, true);
+  const failure = vi.spyOn(native, 'readdirSync').mockImplementation(() => {
+    throw Object.assign(new Error('I/O failure'), { code: 'EIO' });
+  });
+  syncBuiltinESMExports();
+  try {
+    assert.equal(enumerateSessionFilesFor(root, [cwd]).status, 'unavailable');
+    assert.equal(enumerateSessionFilesFor(root, [cwd]).missingRoot, undefined);
+  } finally {
+    failure.mockRestore();
+    syncBuiltinESMExports();
+  }
+});
+
+test('Claude candidate stat failure remains incomplete instead of successful empty membership', () => {
+  const dir = tempDir('claude-stat-coverage-');
+  const file = path.join(dir, 'retained.jsonl');
+  fs.writeFileSync(file, '{}\n');
+  const native = createRequire(__filename)('node:fs') as typeof fs;
+  const stat = native.statSync;
+  const spy = vi.spyOn(native, 'statSync').mockImplementation(((target: fs.PathLike, ...args: any[]) => {
+    if (String(target) === file) throw Object.assign(new Error('permission denied'), { code: 'EACCES' });
+    return (stat as any)(target, ...args);
+  }) as typeof fs.statSync);
+  syncBuiltinESMExports();
+  try {
+    const listing = enumerateSessionFiles(dir);
+    assert.equal(listing.status, 'incomplete');
+    assert.deepEqual(listing.sessions, []);
+    assert.deepEqual(listing.uncertain, [file]);
+  } finally {
+    spy.mockRestore();
+    syncBuiltinESMExports();
   }
 });

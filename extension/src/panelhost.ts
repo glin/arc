@@ -1,3 +1,12 @@
+import {
+  sessionCoverageMember,
+  reconcileSessionCollisions,
+  sessionPresence,
+  type SessionCollisionEvidence,
+  type SessionCollisionObservation,
+  type SessionCoverage,
+  type SourceEnumeration,
+} from './sessioncoverage';
 import { SessionFilterRequests, FILTER_LIMITS, type FilterOperation } from './sessionfilter';
 import {
   listingQueryError,
@@ -90,9 +99,10 @@ import {
   AgentKind,
   FileRevision,
   projectsRoot,
-  sessionFilesFor,
+  enumerateSessionFilesFor,
   readSession,
-  readSessionCwd,
+  scanSessionCwd,
+  readQualifiedSessionCwd,
   TurnOutcome,
   TurnStarts,
   normalizeFsPath,
@@ -130,10 +140,12 @@ import {
 import { onClaudeRepeatedCoverage } from './clauderepeated';
 import {
   CodexMetaCache,
+  readQualifiedCodexOpening,
   CodexStatCache,
   CodexSubagentFile,
   ThreadNames,
   codexSessionFiles,
+  isHiddenThread,
   coldOpeningPass,
   type ColdOpeningPass,
   codexSessionIndexPath,
@@ -1234,7 +1246,7 @@ export class PanelProvider implements vscode.Disposable {
   private readonly subagentDirectories = new SubagentDirectoryCache();
   private readonly codexStats = new CodexStatCache();
   // Recorded working directories, keyed by transcript path. Missing values retry after the file revision changes.
-  private cwds = new Map<string, { cwd: string | null; mtimeMs: number; size: number }>();
+  private cwds = new Map<string, { cwd: string | null; mtimeMs: number; size: number; unavailable?: boolean }>();
   // Cached Codex opening metadata, including each rollout's working directory.
   private codexMetas = new CodexMetaCache();
   // Saves `codexMetas` into the machine's shared opening records.
@@ -1245,6 +1257,15 @@ export class PanelProvider implements vscode.Disposable {
   private codexPriming: Promise<ColdOpeningPass> | null = null;
   // The cold pass's rollout paths, consumed by the next `allSessions` call.
   private codexWalk: string[] | null = null;
+  private codexWalkEnumeration?: SourceEnumeration;
+  private sourceEnumerations?: { claude: SourceEnumeration; codex: SourceEnumeration };
+  private membershipCoverage?: SessionCoverage;
+  private physicalCoverage?: { claude: SessionCoverage; codex: SessionCoverage };
+  private coverageRevision = 0;
+  private enumeratedMembers?: Set<string>;
+  private enumeratedAmbiguousIds?: Set<string>;
+  private enumeratedCollisions?: SessionCollisionEvidence;
+  private enumeratedAdmissionComplete = false;
   // The latest search query that arrived during the cold pass. Only it is answered after.
   private waitingSearch: string | null = null;
   // Titles and activity times share a revisioned read. Size or mtime changes invalidate the entry.
@@ -2410,7 +2431,8 @@ export class PanelProvider implements vscode.Disposable {
           ? 'unavailable'
           : unavailableMetadata
             ? 'incomplete'
-            : !this.dispatchDiscoveryPending &&
+            : this.membershipCoverage?.status === 'complete' &&
+                !this.dispatchDiscoveryPending &&
                 index.scoped.length === accepted.length &&
                 this.sessionReadDiscoveryRevision === index.discovery
               ? 'complete'
@@ -2467,7 +2489,8 @@ export class PanelProvider implements vscode.Disposable {
     const index = accepted ? this.sessionPageIndexFor(accepted, roots, scope?.roots ?? []) : null;
     const coverage = !index
       ? 'unavailable'
-      : !this.sessionQueryDiscoveryPending &&
+      : this.membershipCoverage?.status === 'complete' &&
+          !this.sessionQueryDiscoveryPending &&
           !this.dispatchDiscoveryPending &&
           index.scoped.length === accepted!.length &&
           this.sessionReadDiscoveryRevision === index.discovery
@@ -3657,6 +3680,15 @@ export class PanelProvider implements vscode.Disposable {
 
   // Build prompt box state for a specified session, including sessions outside the current view.
   private stateFor(session: string): ComposerState | null {
+    if (!this.newDrafts[session] && this.enumeratedAmbiguousIds?.has(session)) return null;
+    if (
+      this.membershipCoverage &&
+      !this.newDrafts[session] &&
+      (!this.awaitingSessionRecords[session] ||
+        this.authoritativeCatalog?.some((source) => source.sessionId === session)) &&
+      this.membershipOf(session) !== 'present'
+    )
+      return null;
     if (!this.repositoryScopeReady) {
       return null;
     }
@@ -5298,11 +5330,13 @@ export class PanelProvider implements vscode.Disposable {
     return state.queued.some((entry) => this.queueHandoffs.has(entry.id));
   }
 
-  // Reports reader work that deferred compaction must not pass. A session the panel does not
-  // hold is absent. Queued prompts and a clear in progress are pending.
-  public readerWork(session: string): 'none' | 'pending' | 'absent' {
+  // Unknown membership holds deferred compaction. Queued prompts and a clear in progress are pending.
+  public readerWork(session: string): 'none' | 'pending' | 'absent' | 'unknown' {
+    const membership =
+      this.newDrafts[session] || this.awaitingSessionRecords[session] ? 'present' : this.membershipOf(session);
+    if (membership === 'unknown') return 'unknown';
     const state = this.stateFor(session);
-    if (!state) return 'absent';
+    if (!state) return membership === 'absent' ? 'absent' : 'unknown';
     return state.clearing || state.queued.length > 0 || this.pendingQueueDrains.has(session) ? 'pending' : 'none';
   }
 
@@ -6810,7 +6844,7 @@ export class PanelProvider implements vscode.Disposable {
   }
 
   private dequeue(id: string, session: string): void {
-    const state = this.stateFor(session);
+    const state = this.composerStateFor(session);
     if (!state) {
       return;
     }
@@ -6847,7 +6881,7 @@ export class PanelProvider implements vscode.Disposable {
     host: PanelHost,
     browserSession: string = session,
   ): void {
-    const state = this.stateFor(session);
+    const state = this.composerStateFor(session);
     if (
       !state ||
       this.queueHandoffs.has(id) ||
@@ -6942,7 +6976,7 @@ export class PanelProvider implements vscode.Disposable {
       this.flushQueue(queueSession);
       return;
     }
-    const state = this.stateFor(queueSession);
+    const state = this.composerStateFor(queueSession);
     if (!state) {
       this.flushQueue(queueSession);
       return;
@@ -7630,6 +7664,7 @@ export class PanelProvider implements vscode.Disposable {
         try {
           const pass = await this.codexPriming;
           primedWalk = pass.walked;
+          this.codexWalkEnumeration = pass.enumeration;
           // Mark cold-pass metadata for persistence because its reads precede the catalog's revision comparison.
           if (pass.read) {
             this.derivedCacheCheckpointState.markChanged(true);
@@ -7764,6 +7799,7 @@ export class PanelProvider implements vscode.Disposable {
       all = orderSessionCatalog(all, (session) => this.activityFor(session));
       if (!selectedOnly && !metadataAfterRender) {
         const catalogScope = JSON.stringify(this.repositoryScopeRoots);
+        all = this.acceptSessionCoverage(all, catalogScope);
         this.authoritativeCatalog = all;
         this.scopeSessionDirectories?.clear();
         this.authoritativeCatalogScope = catalogScope;
@@ -7772,7 +7808,7 @@ export class PanelProvider implements vscode.Disposable {
           this.completeCatalogScope = catalogScope;
           const revisions = this.discoveryComplete?.revisions;
           this.sessionReadDiscoveryRevision =
-            !this.dispatchDiscoveryPending && revisions
+            !this.dispatchDiscoveryPending && this.membershipCoverage?.status === 'complete' && revisions
               ? sessionDiscoveryMembership(catalogScope, all, revisions)
               : undefined;
           this.sessionQueryDiscoveryPending = !this.sessionReadDiscoveryRevision;
@@ -7791,6 +7827,7 @@ export class PanelProvider implements vscode.Disposable {
       for (const session of Object.keys(this.awaitingSessionRecords)) {
         if (
           this.authoritativeCatalogScope === JSON.stringify(this.repositoryScopeRoots) &&
+          this.membershipOf(session, this.awaitingSessionRecords[session].agent) === 'present' &&
           pendingResponseSessionAdmitted(this.awaitingSessionRecords[session], this.authoritativeCatalog ?? [])
         ) {
           delete this.awaitingSessionRecords[session];
@@ -7817,6 +7854,9 @@ export class PanelProvider implements vscode.Disposable {
         ...scopedPendingRecords.map((pending) => pending.sessionId),
         ...all.map((f) => f.sessionId),
       ];
+      for (const session of [this.showing, ...(this.hostSessions?.values() ?? []), ...(this.trail?.places ?? [])]) {
+        if (session && this.membershipOf(session) === 'unknown') reachable.push(session);
+      }
       // A selected-only refresh can settle before the catalog includes a newly discovered
       // child. Keep its selection until the next catalog refresh answers whether it remains.
       if (selectedOnly) {
@@ -7897,7 +7937,11 @@ export class PanelProvider implements vscode.Disposable {
       }
       // Newly enriched metadata can change unread answers without changing transcript revisions.
       const glanced = this.windows.size;
+      const heldWindows = this.windows;
       this.windows = this.glanceAt(all, sessions);
+      for (const [session, window] of heldWindows) {
+        if (!this.windows.has(session) && this.membershipOf(session) === 'unknown') this.windows.set(session, window);
+      }
       const statusFacts = [
         ...this.newestBySession.values(),
         ...[...outcomes]
@@ -8487,23 +8531,31 @@ export class PanelProvider implements vscode.Disposable {
     );
   }
 
-  // Forget the exit of a session that left the listing, since no rail card reads it again.
-  private pruneExits(listed: readonly SessionFile[]): void {
+  // Retain exit evidence until membership proves removal.
+  private pruneExits(_listed: readonly SessionFile[]): void {
     for (const [key, witness] of this.sessionRunWitnesses ?? []) {
-      if (
-        !listed.some(
-          (source) =>
-            runningKey(source.agent, source.sessionId) === key &&
-            (!witness.source || source.file === witness.source.file),
-        )
-      )
+      const separator = key.indexOf(':');
+      const session = key.slice(separator + 1);
+      const agent = key.slice(0, separator) as SessionFile['agent'];
+      const presence = this.membershipOf(session, agent, witness.source?.file);
+      const current = this.authoritativeCatalog?.find(
+        (source) => source.agent === agent && source.sessionId === session && source.file === witness.source?.file,
+      );
+      const replaced =
+        presence === 'present' &&
+        current &&
+        witness.source &&
+        (String(current.dev) !== String(witness.source.revision.dev) ||
+          String(current.ino) !== String(witness.source.revision.ino));
+      if (presence === 'absent' || replaced) {
         this.sessionRunWitnesses.delete(key);
-    }
-    const keys = new Set(listed.map((session) => runningKey(session.agent, session.sessionId)));
-    for (const key of this.exitedSinceKeys.keys()) {
-      if (!keys.has(key)) {
         this.exitedSinceKeys.delete(key);
       }
+    }
+    for (const key of this.exitedSinceKeys.keys()) {
+      const separator = key.indexOf(':');
+      if (this.membershipOf(key.slice(separator + 1), key.slice(0, separator) as SessionFile['agent']) === 'absent')
+        this.exitedSinceKeys.delete(key);
     }
   }
 
@@ -9591,41 +9643,120 @@ export class PanelProvider implements vscode.Disposable {
       }
     }
     const codexRevision = this.codexMetas.revision;
-    const claude = sessionFilesFor(
+    const collisionFiles = new Set(
+      this.enumeratedCollisions?.sources.map((source) => source.agent + '\0' + normalizeFsPath(source.file)),
+    );
+    const physicalContext = {
+      domain: 'physical' as const,
+      scope: JSON.stringify(scope.roots),
+      revision: String(this.coverageRevision),
+    };
+    const sourceObservations: SessionCollisionObservation[] = [];
+    const qualifiedCodexStats = new Map<string, ReturnType<typeof readRolloutStat>>();
+    let claudeOpeningUnavailable = false;
+    const claudeListing = enumerateSessionFilesFor(
       projectsRoot(),
       scope.roots,
       (file, session) => {
+        if (collisionFiles.has('claude\0' + normalizeFsPath(file))) {
+          const opening = readQualifiedSessionCwd(file);
+          if (
+            opening &&
+            sameSessionRevision(session, opening.revision) &&
+            sessionCoverageMember(session) === sessionCoverageMember({ ...session, ...opening.revision })
+          ) {
+            this.cwds.set(file, {
+              cwd: opening.value,
+              mtimeMs: opening.revision.mtimeMs,
+              size: opening.revision.size,
+              unavailable: false,
+            });
+            sourceObservations.push({
+              ...physicalContext,
+              source: { ...session, cwd: opening.value },
+              excluded: !isInside(opening.value, scope.roots),
+            });
+            return opening.value;
+          }
+          claudeOpeningUnavailable = true;
+        }
         const hit = this.cwds.get(file);
         if (hit?.cwd) {
           return hit.cwd;
         }
         if (hit && sameSessionRevision(hit, session)) {
+          claudeOpeningUnavailable ||= hit.unavailable === true;
           return hit.cwd;
         }
-        const cwd = readSessionCwd(file);
-        this.cwds.set(file, { cwd, mtimeMs: session.mtimeMs, size: session.size });
+        let unavailable = false;
+        const cwd = scanSessionCwd(file, () => {
+          unavailable = true;
+          claudeOpeningUnavailable = true;
+        });
+        this.cwds.set(file, { cwd, mtimeMs: session.mtimeMs, size: session.size, unavailable });
         return cwd;
       },
       workspaceFolders,
     );
+    const claude = claudeListing.sessions;
     // A hidden panel ignores watcher events, so a walk then stats every rollout and holds none.
     const listing = codexSessionFiles(
       codexSessionsRoot(),
       scope.roots,
       (file) => {
+        if (collisionFiles.has('codex\0' + normalizeFsPath(file))) {
+          const opening = readQualifiedCodexOpening(file);
+          if (opening) {
+            const source: SessionFile = {
+              agent: 'codex',
+              file,
+              sessionId: opening.value.sessionId!,
+              cwd: opening.value.cwd!,
+              ...opening.revision,
+            };
+            this.codexMetas.install(file, opening.value);
+            this.codexStats.delete(file);
+            sourceObservations.push({
+              ...physicalContext,
+              source,
+              excluded: !isInside(source.cwd!, scope.roots),
+              hidden: isHiddenThread(opening.value),
+            });
+            qualifiedCodexStats.set(file, { ...opening.revision, isFile: true });
+            return opening.value;
+          }
+        }
         return this.codexMetas.get(file);
       },
-      (file) => (this.watching ? this.codexStats.get(file) : readRolloutStat(file)),
+      (file) => qualifiedCodexStats.get(file) ?? (this.watching ? this.codexStats.get(file) : readRolloutStat(file)),
       codexWalk,
+      this.codexWalkEnumeration,
     );
-    for (const file of staleMetas(this.codexStats.keys(), listing.walked)) {
+    this.codexWalkEnumeration = undefined;
+    this.sourceEnumerations = { claude: claudeListing, codex: listing.enumeration };
+    const physical: SessionCoverage = {
+      ...listing.enumeration,
+      ...physicalContext,
+      paths: new Set(listing.enumeration.files.map(normalizeFsPath)),
+      directoryPaths: listing.enumeration.directories
+        ? new Set(listing.enumeration.directories.map((directory) => normalizeFsPath(directory).replace(/\/$/, '')))
+        : undefined,
+    };
+    const absent = (file: string) =>
+      isInside(file, [codexSessionsRoot()]) && sessionPresence(physical, physicalContext, { file }) === 'absent';
+    for (const file of staleMetas(this.codexStats.keys(), listing.walked, listing.enumeration, absent)) {
       this.codexStats.delete(file);
     }
     // Trim opening metadata against every walked rollout, including files excluded from the session list.
-    for (const file of staleMetas(this.codexMetas.keys(), listing.walked)) {
+    for (const file of staleMetas(this.codexMetas.keys(), listing.walked, listing.enumeration, absent)) {
       this.codexMetas.delete(file);
     }
-    this.codexOpenings?.setWalk(listing.walked);
+    // Opening reads can finish before an incomplete walk visits their paths.
+    this.codexOpenings?.setWalk(
+      listing.enumeration.status === 'complete'
+        ? listing.walked
+        : [...new Set([...listing.walked, ...this.codexMetas.keys()])],
+    );
     if (this.codexMetas.revision !== codexRevision) {
       this.derivedCacheCheckpointState.markChanged(true);
     }
@@ -9639,6 +9770,13 @@ export class PanelProvider implements vscode.Disposable {
     this.walkedClaude = claude.map((s) => s.file);
     // Exclude Claude peer wakes and commands answered by the CLI before catalog publication.
     const listed = claude.filter((s) => this.hasHumanPrompt(s, true));
+    this.enumeratedAdmissionComplete =
+      !claudeOpeningUnavailable &&
+      listing.admission === 'complete' &&
+      claude.every((source) => {
+        const scan = this.humanScans.get(source.file);
+        return scan?.found || scan?.complete === true;
+      });
     this.subagentDirectories.sweep();
     // Order the catalog by recorded activity before initializing stable session-list placement.
     const walked = new Set([
@@ -9653,6 +9791,38 @@ export class PanelProvider implements vscode.Disposable {
     const walkedSessions = orderSessionCatalog([...listed, ...this.claudeChildren, ...codex], (session) =>
       this.activityFor(session),
     );
+    this.enumeratedMembers = new Set();
+    const enumeratedSources = sessionPageSources([...claude, ...codex]);
+    this.enumeratedCollisions = reconcileSessionCollisions(
+      enumeratedSources,
+      this.enumeratedCollisions,
+      physicalContext,
+      this.sourceEnumerations,
+      sourceObservations,
+    );
+    this.enumeratedAmbiguousIds = new Set(this.enumeratedCollisions.sources.map((source) => source.sessionId));
+    for (const entry of enumeratedSources) {
+      if (!this.enumeratedAmbiguousIds.has(entry.session.sessionId))
+        this.enumeratedMembers.add(sessionCoverageMember(entry.session));
+    }
+    const acceptedCoverage = this.membershipCoverage;
+    if (acceptedCoverage?.scope === JSON.stringify(scope.roots)) {
+      const unchanged =
+        acceptedCoverage.status === 'complete' &&
+        this.sourceEnumerations.claude.status === 'complete' &&
+        this.sourceEnumerations.codex.status === 'complete' &&
+        this.enumeratedAdmissionComplete &&
+        this.enumeratedAmbiguousIds.size === 0 &&
+        sessionCatalogMembership(acceptedCoverage.scope, walkedSessions) ===
+          sessionCatalogMembership(acceptedCoverage.scope, this.authoritativeCatalog ?? []);
+      this.membershipCoverage = {
+        ...acceptedCoverage,
+        status: unchanged ? 'complete' : 'incomplete',
+        members: unchanged
+          ? acceptedCoverage.members
+          : new Set([...(acceptedCoverage.members ?? [])].filter((member) => this.enumeratedMembers!.has(member))),
+      };
+    }
     this.catalog = { folders: folderPrint, sessions: walkedSessions };
     this.catalogWalked = true;
     return walkedSessions;
@@ -9950,13 +10120,120 @@ export class PanelProvider implements vscode.Disposable {
     return true;
   }
 
-  // Drops the stored entry and the carried name of every session file `listed` does not hold.
+  private acceptSessionCoverage(current: SessionFile[], scope: string): SessionFile[] {
+    const revision = String((this.coverageRevision = (this.coverageRevision ?? 0) + 1));
+    const enumeration = this.sourceEnumerations;
+    let complete =
+      !!enumeration &&
+      enumeration.claude.status === 'complete' &&
+      enumeration.codex.status === 'complete' &&
+      this.enumeratedAdmissionComplete &&
+      !this.dispatchDiscoveryPending;
+    const members = new Set(
+      current
+        .filter(
+          (source) =>
+            this.enumeratedMembers?.has(sessionCoverageMember(source)) ||
+            (source.childTranscript === true && !this.dispatchDiscoveryPending),
+        )
+        .map(sessionCoverageMember),
+    );
+    this.membershipCoverage = {
+      domain: 'admitted',
+      scope,
+      revision,
+      status: complete ? 'complete' : 'incomplete',
+      files: current.map((source) => source.file),
+      uncertain: [],
+      members,
+    };
+    if (enumeration) {
+      this.physicalCoverage = {
+        claude: {
+          ...enumeration.claude,
+          domain: 'physical',
+          scope,
+          revision,
+          files: [...enumeration.claude.files, ...(this.claudeChildren ?? []).map((source) => source.file)],
+          uncertain: [
+            ...enumeration.claude.uncertain,
+            ...(!this.claudeChildrenDiscovered || this.dispatchDiscoveryPending ? [projectsRoot()] : []),
+          ],
+        },
+        codex: { ...enumeration.codex, domain: 'physical', scope, revision },
+      };
+    }
+    if (this.physicalCoverage) {
+      for (const fact of Object.values(this.physicalCoverage)) {
+        fact.paths = new Set(fact.files.map(normalizeFsPath));
+        if (fact.directories)
+          fact.directoryPaths = new Set(
+            fact.directories.map((directory) => normalizeFsPath(directory).replace(/\/$/, '')),
+          );
+      }
+    }
+    const currentMembers = new Set(current.map(sessionCoverageMember));
+    if (
+      complete &&
+      this.authoritativeCatalogScope === scope &&
+      (this.authoritativeCatalog ?? []).some(
+        (source) =>
+          source.childTranscript === true &&
+          !currentMembers.has(sessionCoverageMember(source)) &&
+          this.physicalMembershipOf(source.file) === 'unknown',
+      )
+    ) {
+      complete = false;
+      this.membershipCoverage.status = 'incomplete';
+    }
+    if (complete || this.authoritativeCatalogScope !== scope) return current;
+    return [
+      ...current,
+      ...(this.authoritativeCatalog ?? []).filter(
+        (source) =>
+          !currentMembers.has(sessionCoverageMember(source)) && this.physicalMembershipOf(source.file) !== 'absent',
+      ),
+    ];
+  }
+
+  private membershipOf(
+    sessionId: string,
+    agent?: SessionFile['agent'],
+    file?: string,
+  ): import('./sessioncoverage').SessionPresence {
+    const scope = JSON.stringify(this.repositoryScopeRoots ?? []);
+    if (!this.repositoryScopeReady) return 'unknown';
+    const matches = (this.authoritativeCatalog ?? []).filter(
+      (source) =>
+        source.sessionId === sessionId && (!agent || source.agent === agent) && (!file || source.file === file),
+    );
+    if (matches.length === 1 && matches[0].cwd && !isInside(matches[0].cwd, this.repositoryScopeRoots)) return 'absent';
+    if (this.authoritativeCatalogScope !== scope) return 'unknown';
+    return sessionPresence(
+      this.membershipCoverage,
+      { domain: 'admitted', scope, revision: String(this.coverageRevision) },
+      { sessionId, agent, file },
+      this.authoritativeCatalog ?? [],
+    );
+  }
+
+  private physicalMembershipOf(file: string): import('./sessioncoverage').SessionPresence {
+    const scope = JSON.stringify(this.repositoryScopeRoots ?? []);
+    const context = { domain: 'physical' as const, scope, revision: String(this.coverageRevision) };
+    const facts = this.physicalCoverage;
+    if (!this.repositoryScopeReady || !facts) return 'unknown';
+    if (isInside(file, [projectsRoot()])) return sessionPresence(facts.claude, context, { file });
+    if (isInside(file, [codexSessionsRoot()])) return sessionPresence(facts.codex, context, { file });
+    return 'unknown';
+  }
+
+  // Drop names only when physical coverage proves the source absent.
   // True when anything was dropped, so the caller marks the cache for its next save.
   private pruneDerivedTitles(listed: ReadonlySet<string>): boolean {
     let dropped = false;
     for (const held of [this.titles, this.carriedNames]) {
       for (const file of held.keys()) {
-        if (!listed.has(file)) {
+        if (!listed.has(file) && this.physicalMembershipOf(file) === 'absent') {
           held.delete(file);
           dropped = true;
         }
@@ -11547,16 +11824,19 @@ export class PanelProvider implements vscode.Disposable {
   // Evict absent parsed windows and apply the retained-history budget. Trim small discovery caches against all present files.
   private evictCache(keep: SessionFile[], known: SessionFile[]): void {
     const live = new Set(known.map((s) => s.file));
+    const historySources = [...(this.authoritativeCatalog ?? []), ...known];
     for (const file of [...this.cache.keys()]) {
-      if (!live.has(file)) {
+      if (!live.has(file) && this.physicalMembershipOf(file) === 'absent') {
         this.cache.delete(file);
       }
     }
     const retained = [...this.cache].map(([file, entry]) => ({
-      sessionId: known.find((session) => session.file === file)?.sessionId ?? '',
+      sessionId: historySources.find((session) => session.file === file)?.sessionId ?? '',
       bytes:
         (entry.bytes ?? 0) +
-        historyBytes(this.history.get(known.find((session) => session.file === file)?.sessionId ?? '')?.pages ?? []),
+        historyBytes(
+          this.history.get(historySources.find((session) => session.file === file)?.sessionId ?? '')?.pages ?? [],
+        ),
       usedAt: entry.usedAt ?? 0,
     }));
     for (const sessionId of historyEvictions(
@@ -11564,7 +11844,7 @@ export class PanelProvider implements vscode.Disposable {
       this.protectedHistorySessions(),
       this.sessionCacheBudgetBytes(),
     )) {
-      const session = known.find((candidate) => candidate.sessionId === sessionId);
+      const session = historySources.find((candidate) => candidate.sessionId === sessionId);
       if (session) {
         this.cache.delete(session.file);
       }
@@ -11580,19 +11860,19 @@ export class PanelProvider implements vscode.Disposable {
         this.derivedCacheCheckpointState.markChanged();
       }
       for (const file of [...this.cwds.keys()]) {
-        if (!present.has(file)) {
+        if (!present.has(file) && this.physicalMembershipOf(file) === 'absent') {
           this.cwds.delete(file);
         }
       }
       for (const file of [...this.humanScans.keys()]) {
-        if (!present.has(file)) {
+        if (!present.has(file) && this.physicalMembershipOf(file) === 'absent') {
           this.humanScans.delete(file);
         }
       }
     }
     const presentIds = new Set(known.map((session) => session.sessionId));
     for (const sessionId of [...this.history.keys()]) {
-      if (!presentIds.has(sessionId)) {
+      if (!presentIds.has(sessionId) && this.membershipOf(sessionId) === 'absent') {
         this.dropOlderHistory(sessionId);
       }
     }
@@ -11716,7 +11996,9 @@ export class PanelProvider implements vscode.Disposable {
     const parsedCacheRevisions = new Map<string, Pick<RevisionedRailCacheMark, 'mtimeMs' | 'size'>>();
     const lastReportedModels = new Map<string, string | null>();
     let listedMaxTurns = 0;
-    this.readWindows.clear();
+    for (const session of this.readWindows.keys()) {
+      if (this.membershipOf(session) !== 'unknown') this.readWindows.delete(session);
+    }
     // Update retained-page recency and apply the shared budget before collecting selected windows.
     this.trimOlderHistory(sessions);
     for (const session of sessions) {
@@ -11749,7 +12031,12 @@ export class PanelProvider implements vscode.Disposable {
     // Derive completion markers and each session's newest records from the accepted turns.
     this.turnMarks = turns.map((t) => ({ id: turnKey(t), agent: t.agent, finished: t.finished }));
     const currentRecords = currentRecordsBySession(turns, compactions);
+    const heldNewest = this.newestBySession;
     this.newestBySession = currentRecords.newestTurns;
+    for (const [session, newest] of heldNewest) {
+      if (!this.newestBySession.has(session) && this.membershipOf(session) === 'unknown')
+        this.newestBySession.set(session, newest);
+    }
     this.composerRuntime = composerRuntimeBySession(turns, currentRecords.newestCompactions, lastReportedModels);
     // Build recorded prompt recall in newest-first order, including messages submitted during a turn.
     this.promptsBySession.clear();
@@ -12118,6 +12405,7 @@ export class PanelProvider implements vscode.Disposable {
     }));
     const hits = searchTurns(labelled, query, Date.now(), this.sessionQueryContext());
     void this.post({ type: 'results', query, hits, scope: searchScopeName(scope) });
+    if (!retained && this.membershipCoverage?.status !== 'complete') void this.refresh();
   }
 
   // Populate the bounded search corpus only for an explicit content search, outside polling and rendering.
@@ -12127,7 +12415,7 @@ export class PanelProvider implements vscode.Disposable {
     this.threadNames = readThreadNames(codexSessionIndexPath(), this.threadNames);
     const live = new Set(all.map((f) => f.file));
     for (const file of [...this.corpus.keys()]) {
-      if (!live.has(file)) {
+      if (!live.has(file) && this.physicalMembershipOf(file) === 'absent') {
         this.corpus.delete(file);
       }
     }
@@ -12545,7 +12833,7 @@ export class PanelProvider implements vscode.Disposable {
         },
         stopTurn: (msg) => {
           // Stop the session named by the message, independent of the current panel selection.
-          const aimed = this.stateFor(msg.session);
+          const aimed = this.stateFor(msg.session) ?? this.composerStateFor(msg.session, host.webview);
           if (aimed) {
             this.onReaderDirected?.(aimed.sessionId);
             this.cancelClearSettlement(aimed.sessionId, 'The clear request stopped before a new session opened.');

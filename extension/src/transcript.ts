@@ -1,3 +1,4 @@
+import type { SourceEnumeration } from './sessioncoverage';
 import * as fs from 'node:fs';
 import { ExportLimitError, type ExportRelationshipLimits } from './exportlimits';
 import { meterRead, meterReadWork } from './readmeter';
@@ -1205,25 +1206,11 @@ export function readSessionCwd(file: string): string | null {
   return scanSessionCwd(file);
 }
 
-function scanSessionCwd(file: string, onUnreadable?: () => void): string | null {
+export function scanSessionCwd(file: string, onUnreadable?: () => void): string | null {
   let fd = -1;
   try {
     fd = fs.openSync(file, 'r');
-    const buf = Buffer.allocUnsafe(64 * 1024);
-    const read = meterRead(file, fs.readSync(fd, buf, 0, buf.length, 0));
-    for (const line of buf.subarray(0, read).toString('utf8').split('\n')) {
-      if (line.indexOf('"cwd"') < 0) {
-        continue;
-      }
-      try {
-        const o = JSON.parse(line) as { cwd?: string };
-        if (o.cwd) {
-          return o.cwd;
-        }
-      } catch {
-        /* a partial last line, or a line without one */
-      }
-    }
+    return cwdFromDescriptor(file, fd);
   } catch {
     onUnreadable?.();
   } finally {
@@ -1236,6 +1223,57 @@ function scanSessionCwd(file: string, onUnreadable?: () => void): string | null 
     }
   }
   return null;
+}
+
+function cwdFromDescriptor(file: string, fd: number): string | null {
+  const buf = Buffer.allocUnsafe(64 * 1024);
+  const read = meterRead(file, fs.readSync(fd, buf, 0, buf.length, 0));
+  for (const line of buf.subarray(0, read).toString('utf8').split('\n')) {
+    if (line.indexOf('"cwd"') < 0) continue;
+    try {
+      const o = JSON.parse(line) as { cwd?: unknown };
+      if (typeof o.cwd === 'string' && o.cwd) return o.cwd;
+    } catch {
+      /* a partial last line, or a line without one */
+    }
+  }
+  return null;
+}
+
+export function readQualifiedSessionCwd(file: string): { value: string; revision: FileRevision } | null {
+  return readQualifiedOpening(file, (fd) => cwdFromDescriptor(file, fd));
+}
+
+// Opening metadata belongs to the descriptor and pathname only while their complete revisions agree.
+export function readQualifiedOpening<T>(
+  file: string,
+  read: (fd: number) => T | null,
+): { value: T; revision: FileRevision } | null {
+  let fd = -1;
+  try {
+    fd = fs.openSync(file, 'r');
+    const before = fs.fstatSync(fd, { bigint: true });
+    const revision = revisionOf(before);
+    if (!before.isFile() || revision.size < 0 || !supportedFileIdentity(revision)) return null;
+    const value = read(fd);
+    if (
+      value === null ||
+      !sameFileRevision(fs.fstatSync(fd, { bigint: true }), revision) ||
+      !sameFileRevision(fs.statSync(file, { bigint: true }), revision)
+    )
+      return null;
+    return { value, revision };
+  } catch {
+    return null;
+  } finally {
+    if (fd >= 0) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        /* ignore */
+      }
+    }
+  }
 }
 
 // Typed prompts without a known peer origin admit a session while pending or confirmed.
@@ -1457,6 +1495,7 @@ function sessionTurnStartsIn(lines: string[], childTranscript = false): number[]
 export interface HumanPromptScan {
   bytes: number;
   found: boolean;
+  complete?: boolean;
   command?: ClaudePromptPair;
   prompt?: string;
   queuedPrompt?: string;
@@ -1547,8 +1586,9 @@ export function scanForHumanPrompt(file: string, size: number, prev?: HumanPromp
   const from = prev && prev.bytes <= size ? prev.bytes : 0;
   const scan: HumanPromptScan =
     from && prev ? { ...prev, ...(prev.command ? { command: { ...prev.command } } : {}) } : { bytes: 0, found: false };
-  const { bytes } = readCompleteLines(file, from, size, (text) => scanPromptLines(text, scan));
+  const { bytes, rest } = readCompleteLines(file, from, size, (text) => scanPromptLines(text, scan));
   scan.bytes = bytes;
+  scan.complete = scan.found || (rest !== null && bytes === size);
   return scan;
 }
 
@@ -3433,14 +3473,30 @@ export function sessionFilesFor(
   cwdOf: (file: string, session: SessionFile) => string | null = (file) => readSessionCwd(file),
   missingCwdFolders: string[] = folders,
 ): SessionFile[] {
-  if (folders.length === 0) {
-    return [];
-  }
+  return enumerateSessionFilesFor(root, folders, cwdOf, missingCwdFolders).sessions;
+}
+
+export function enumerateSessionFilesFor(
+  root: string,
+  folders: string[],
+  cwdOf: (file: string, session: SessionFile) => string | null = (file) => readSessionCwd(file),
+  missingCwdFolders: string[] = folders,
+): SourceEnumeration & { sessions: SessionFile[] } {
+  const evidence: SourceEnumeration & { sessions: SessionFile[] } = {
+    status: 'complete',
+    root,
+    directories: [],
+    files: [],
+    uncertain: [],
+    sessions: [],
+  };
+  if (folders.length === 0) return evidence;
   let dirs: string[] = [];
   try {
     dirs = fs.readdirSync(root);
-  } catch {
-    return [];
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { ...evidence, missingRoot: true };
+    return { ...evidence, status: 'unavailable', uncertain: [root] };
   }
   const slugs = folders.map((f) => projectSlug(f).toLowerCase());
   const missingCwdSlugs = missingCwdFolders.map((f) => projectSlug(f).toLowerCase());
@@ -3450,7 +3506,12 @@ export function sessionFilesFor(
     if (!slugs.some((slug) => projectDirectoryMatches(name, slug))) {
       continue;
     }
-    for (const f of listSessionFiles(path.join(root, d))) {
+    const listing = enumerateSessionFiles(path.join(root, d));
+    (evidence.files as string[]).push(...listing.files);
+    (evidence.directories as string[]).push(...(listing.directories ?? []));
+    (evidence.uncertain as string[]).push(...listing.uncertain);
+    if (listing.status !== 'complete') evidence.status = 'incomplete';
+    for (const f of listing.sessions) {
       const cwd = cwdOf(f.file, f);
       // Recorded cwd decides membership. Without it, require an exact allowed fallback slug.
       if (cwd ? isInside(cwd, folders) : missingCwdSlugs.includes(name)) {
@@ -3458,17 +3519,31 @@ export function sessionFilesFor(
       }
     }
   }
-  return out.sort((a, b) => b.mtimeMs - a.mtimeMs);
+  return { ...evidence, sessions: out.sort((a, b) => b.mtimeMs - a.mtimeMs) };
 }
 
 // Session transcripts in a project directory, newest first.
 export function listSessionFiles(dir: string): SessionFile[] {
+  return enumerateSessionFiles(dir).sessions;
+}
+
+export function enumerateSessionFiles(dir: string): SourceEnumeration & { sessions: SessionFile[] } {
+  const evidence: SourceEnumeration & { sessions: SessionFile[] } = {
+    status: 'complete',
+    root: dir,
+    directories: [],
+    files: [],
+    uncertain: [],
+    sessions: [],
+  };
   let names: string[] = [];
   try {
     names = fs.readdirSync(dir);
-  } catch {
-    return [];
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { ...evidence, missingRoot: true };
+    return { ...evidence, status: 'unavailable', uncertain: [dir] };
   }
+  (evidence.directories as string[]).push(dir);
   const out: SessionFile[] = [];
   for (const name of names) {
     if (!name.endsWith('.jsonl')) {
@@ -3477,7 +3552,14 @@ export function listSessionFiles(dir: string): SessionFile[] {
     const file = path.join(dir, name);
     try {
       const stat = fs.statSync(file, { bigint: true });
-      if (!stat.isFile() || stat.size === 0n || stat.size > BigInt(Number.MAX_SAFE_INTEGER)) {
+      if (!stat.isFile()) continue;
+      (evidence.files as string[]).push(file);
+      if (stat.size > BigInt(Number.MAX_SAFE_INTEGER)) {
+        evidence.status = 'incomplete';
+        (evidence.uncertain as string[]).push(file);
+        continue;
+      }
+      if (stat.size === 0n) {
         continue;
       }
       out.push({
@@ -3487,10 +3569,11 @@ export function listSessionFiles(dir: string): SessionFile[] {
         ...revisionOf(stat),
       });
     } catch {
-      /* vanished mid-scan */
+      evidence.status = 'incomplete';
+      (evidence.uncertain as string[]).push(file);
     }
   }
-  return out.sort((a, b) => b.mtimeMs - a.mtimeMs);
+  return { ...evidence, sessions: out.sort((a, b) => b.mtimeMs - a.mtimeMs) };
 }
 
 // Reads the parent-owned identity edge without retaining the parent's turns. The result is

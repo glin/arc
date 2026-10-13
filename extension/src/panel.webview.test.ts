@@ -1,3 +1,6 @@
+import { sessionPageSources } from './sessionreads';
+import { sessionCoverageMember, reconcileSessionCollisions } from './sessioncoverage';
+import { runningKey } from './composerview';
 import { SessionFilterRequests, FILTER_LIMITS } from './sessionfilter.ts';
 import { createSavedState } from './webview/state.ts';
 import type { QueuedSubmission, TurnComment } from './turnview.ts';
@@ -468,6 +471,7 @@ test('response session navigation releases only its invoking clear route and ret
     readyHosts: new Set([first, second]),
     repositoryScope: { snapshot: () => ({ ready: true, roots: ['project'] }) },
     folders: () => ['project'],
+    membershipCoverage: { status: 'complete' },
     authoritativeCatalogScope: JSON.stringify(['project']),
     authoritativeCatalog: [{ sessionId: 'source', agent: 'claude', cwd: 'project' }],
     awaitingSessionRecords: {},
@@ -1570,6 +1574,12 @@ function metadataEnrichmentFixture(sessions: any[], source = progressiveWorkerSo
     observeStoredName: (_session: any, entry: any) => entry,
     allSessions: () => sessions,
     catalog: { sessions },
+    sourceEnumerations: {
+      claude: { status: 'complete', files: sessions.map((source) => source.file), uncertain: [] },
+      codex: { status: 'complete', files: [], uncertain: [] },
+    },
+    enumeratedAdmissionComplete: true,
+    enumeratedMembers: new Set(sessions.map(sessionCoverageMember)),
     authoritativeCatalog: sessions,
     prepareClaudeChildren: async () => true,
     activityFor: (session: any) => session.mtimeMs,
@@ -1735,6 +1745,7 @@ import {
   readSession,
   readSessionMeta,
   revisionOf,
+  supportedFileIdentity,
   ClaudeChildSessionCache,
   sessionOutcomeOf,
   sessionStatFactsOf,
@@ -2059,11 +2070,29 @@ test('command-only admission removes pending rows through every catalog path and
     readThreadNames: () => ({ stamp: '', names: new Map() }),
     projectsRoot: () => directory,
     codexSessionsRoot: () => directory,
-    sessionFilesFor: () => sources,
+    enumerateSessionFilesFor: () => ({
+      sessions: sources,
+      files: sources.map((source) => source.file),
+      status: 'complete',
+      uncertain: [],
+    }),
     readSessionCwd: () => directory,
+    scanSessionCwd: () => directory,
+    sessionSourceKey,
+    sessionCoverageMember,
+    reconcileSessionCollisions,
+    sessionPageSources,
+    normalizeFsPath: renameTranscripts.normalizeFsPath,
     staleMetas: () => [],
     discoverClaudeSessionSpendSources: () => [],
-    codexSessionFiles: () => ({ walked: [], sessions: [], sources: [], subagents: [] }),
+    codexSessionFiles: () => ({
+      walked: [],
+      sessions: [],
+      sources: [],
+      subagents: [],
+      enumeration: { status: 'complete', files: [], uncertain: [] },
+      admission: 'complete',
+    }),
   };
   const compile = (name: string, body: string, parameters: string) => {
     const code = ts.transpileModule(`function ${name}(${parameters}) { ${body} }`, {
@@ -2277,6 +2306,7 @@ test('current whole-file facts archive a listed session with no turn, refuse una
     folders: () => [directory],
     repositoryScope: { snapshot: () => ({ ready: true, roots: [directory], revision: 1 }) },
     authoritativeCatalog: [source],
+    membershipCoverage: { status: 'complete' },
     authoritativeCatalogScope: JSON.stringify([directory]),
     anyVisible: () => visible,
     watching: true,
@@ -2563,6 +2593,7 @@ test('window session reads leave reader state and live capabilities unchanged an
     completeCatalogScope: JSON.stringify([directory]),
     repositoryScope: { snapshot: () => ({ ready: true, roots: [directory], revision: 1 }) },
     authoritativeCatalog: [source],
+    membershipCoverage: { status: 'complete' },
     authoritativeCatalogScope: JSON.stringify([directory]),
     pendingWatch: { snapshot: () => ({ eventCount: 0, broadRequired: false }) },
     exitedSinceKeys: new Map(),
@@ -2806,6 +2837,7 @@ test('scoped curation awaits saves, rechecks archive at apply, rolls back refusa
     sessionWriteQueue: Promise.resolve(),
     folders: () => ['C:/workspace'],
     repositoryScope: { snapshot: () => ({ ready: true, roots: ['C:/workspace'] }) },
+    membershipCoverage: { status: 'complete' },
     authoritativeCatalogScope: JSON.stringify(['C:/workspace']),
     authoritativeCatalog: [
       { sessionId: 'known', cwd: 'C:/workspace', agent: 'codex', file: knownFile },
@@ -3134,6 +3166,7 @@ test('window session listings reject removed children and report pending, hidden
       repositoryScopeRoots: roots,
       repositoryScope: { snapshot: () => ({ ready: true, roots, revision: 1 }) },
       authoritativeCatalog: [parent, child],
+      membershipCoverage: { status: 'complete' },
       authoritativeCatalogScope: scopeKey(),
       completeCatalogScope: scopeKey(),
       sessionReadDiscoveryRevision: sessionCatalogMembership(scopeKey(), [parent, child]),
@@ -3460,7 +3493,14 @@ function pagedListingFixture(count: number) {
     disposed: false,
     folders: () => [directory],
     repositoryScope: { snapshot: () => ({ ready: true, roots, revision: scope.revision }) },
+    sourceEnumerations: {
+      claude: { status: 'complete', files: sources.map((source) => source.file), uncertain: [] },
+      codex: { status: 'complete', files: [], uncertain: [] },
+    },
+    enumeratedAdmissionComplete: true,
+    enumeratedMembers: new Set(sources.map(sessionCoverageMember)),
     authoritativeCatalog: sources,
+    membershipCoverage: { status: 'complete' },
     authoritativeCatalogScope: JSON.stringify(roots),
     sessionReadDiscoveryRevision: sessionCatalogMembership(JSON.stringify(roots), sources),
     anyVisible: () => true,
@@ -3610,12 +3650,29 @@ test('window session pages lose coverage when a served transcript is replaced at
       projectsRoot: () => '',
       codexSessionsRoot: () => '',
       // The full walk stats every source again.
-      sessionFilesFor: () =>
-        sources.map((source) => ({ ...source, ...revisionOf(fs.statSync(source.file, { bigint: true })) })),
+      enumerateSessionFilesFor: () => ({
+        sessions: sources.map((source) => ({ ...source, ...revisionOf(fs.statSync(source.file, { bigint: true })) })),
+        files: sources.map((source) => source.file),
+        status: 'complete',
+        uncertain: [],
+      }),
       readSessionCwd: () => null,
+      scanSessionCwd: () => null,
+      sessionSourceKey,
+      sessionCoverageMember,
+      reconcileSessionCollisions,
+      sessionPageSources,
+      normalizeFsPath: renameTranscripts.normalizeFsPath,
       staleMetas: () => [],
       discoverClaudeSessionSpendSources: () => [],
-      codexSessionFiles: () => ({ walked: [], sessions: [], sources: [], subagents: [] }),
+      codexSessionFiles: () => ({
+        walked: [],
+        sessions: [],
+        sources: [],
+        subagents: [],
+        enumeration: { status: 'complete', files: [], uncertain: [] },
+        admission: 'complete',
+      }),
     };
     const code = ts.transpileModule(
       `function listing(reuseCatalog = false) { ${methodBody('private allSessions(')} }`,
@@ -3636,6 +3693,7 @@ test('window session pages lose coverage when a served transcript is replaced at
       codexStats: { keys: () => [] },
       subagentDirectories: { sweep() {} },
       cwds: new Map(),
+      humanScans: new Map(),
       claudeChildren: [],
       derivedCacheCheckpointState: { markChanged() {} },
     });
@@ -3889,6 +3947,7 @@ test.each(
         repositoryScopeRoots: [directory],
         repositoryScope: { snapshot: () => ({ ready: true, roots: [directory], revision: 1 }) },
         authoritativeCatalog: [source],
+        membershipCoverage: { status: 'complete' },
         authoritativeCatalogScope: scope,
         completeCatalogScope: scope,
         pendingWatch: { snapshot: () => ({ eventCount: 0, broadRequired: false }) },
@@ -4176,6 +4235,18 @@ test.each(
       assert.equal(status(), 'unknown', 'start identity changed before exit');
       clock.mockReturnValue(start + 210);
       publish(10, true, false);
+      provider.authoritativeCatalog = [{ ...source, file: file + '.old' }];
+      provider.repositoryScopeReady = true;
+      provider.coverageRevision = 1;
+      provider.membershipCoverage = {
+        domain: 'admitted',
+        scope,
+        revision: '1',
+        status: 'complete',
+        files: [],
+        uncertain: [],
+        members: new Set(),
+      };
       provider.pruneExits([{ ...source, file: file + '.old' }]);
       assert.equal(provider.sessionRunWitnesses.size, 0, 'removed source prunes witness');
       provider.pruneExits([]);
@@ -6757,6 +6828,12 @@ function dispatchedRefreshFixture(sessions: any[], worker: ProgressiveWorker, tu
     codexSubagents: [],
     claudeChildren: [],
     catalog: { sessions },
+    sourceEnumerations: {
+      claude: { status: 'complete', files: sessions.map((source) => source.file), uncertain: [] },
+      codex: { status: 'complete', files: [], uncertain: [] },
+    },
+    enumeratedAdmissionComplete: true,
+    enumeratedMembers: new Set(sessions.map(sessionCoverageMember)),
     authoritativeCatalog: sessions,
     repositoryScopeRoots: [],
     titles: new Map(),
@@ -8425,7 +8502,7 @@ test('both agents reach one list, and each session is read and named by its own 
   const from = panelHostSource.indexOf(marker);
   assert.notEqual(from, -1, `panelhost.ts no longer contains "${marker}", so this guard cannot see the merge`);
   const merge = memberFrom(panelHostSource, from);
-  sourceMatch(merge, /sessionFilesFor\(projectsRoot\(\)/, 'the list no longer holds Claude Code sessions');
+  sourceMatch(merge, /enumerateSessionFilesFor\(projectsRoot\(\)/, 'the list no longer holds Claude Code sessions');
   sourceMatch(merge, /codexSessionFiles\(codexSessionsRoot\(\)/, 'the list no longer holds Codex sessions');
   sourceMatch(
     merge,
@@ -8434,7 +8511,7 @@ test('both agents reach one list, and each session is read and named by its own 
   );
   sourceMatch(
     merge,
-    /sessionFilesFor\(projectsRoot\(\), scope\.roots,[\s\S]*workspaceFolders\);/,
+    /enumerateSessionFilesFor\(projectsRoot\(\), scope\.roots,[\s\S]*workspaceFolders\);/,
     'Claude discovery either omits worktree roots or trusts a missing cwd outside the open folder',
   );
   sourceMatch(
@@ -8449,7 +8526,7 @@ test('both agents reach one list, and each session is read and named by its own 
   );
   sourceMatch(
     merge,
-    /if \(hit\?\.cwd\) \{ return hit\.cwd; \}[\s\S]*hit && sameSessionRevision\(hit, session\)/,
+    /if \(hit\?\.cwd\) \{[^{}]*return hit\.cwd; \}[\s\S]*hit && sameSessionRevision\(hit, session\)/,
     'a known Claude cwd is read again or replaced when its transcript grows',
   );
   sourceDoesNotMatch(
@@ -8471,7 +8548,7 @@ test('both agents reach one list, and each session is read and named by its own 
   );
   sourceMatch(
     merge,
-    /staleMetas\(this\.codexMetas\.keys\(\), listing\.walked\)/,
+    /staleMetas\(this\.codexMetas\.keys\(\), listing\.walked, listing\.enumeration, absent\)/,
     'the meta cache is trimmed against something other than the walk, which empties it',
   );
   const trims = (panelHostSource.match(/this\.codexMetas\.delete\(/g) ?? []).length;
@@ -9304,7 +9381,7 @@ test('Claude child sessions own lifetime figures while project files stay dedupl
   );
   sourceMatch(
     panelHostSource,
-    /\(file\) => \(this\.watching \? this\.codexStats\.get\(file\) : readRolloutStat\(file\)\)/,
+    /\(file\) => qualifiedCodexStats\.get\(file\) \?\? \(this\.watching \? this\.codexStats\.get\(file\) : readRolloutStat\(file\)\)/,
     'a walk while the panel is hidden reused a rollout stat no watcher kept current',
   );
 });
@@ -13298,6 +13375,7 @@ function searchHandler(): (host: object, text: string) => void {
   const handle = new Function('msg', 'isSearch', handlerBody(panelHostSource, 'search'));
   return (host, text) => {
     Object.assign(host, {
+      membershipCoverage: { status: 'complete' },
       sessionQueryContext() {
         return undefined;
       },
@@ -13732,6 +13810,24 @@ test('the live Codex subagent route keeps each panel on the place its shared tra
     refreshDeadline: null,
     refreshGeneration: 0,
     repositoryScopeReady: true,
+    sourceEnumerations: {
+      claude: { status: 'complete', files: catalog.map((source) => source.file), uncertain: [] },
+      codex: { status: 'complete', files: [], uncertain: [] },
+    },
+    enumeratedAdmissionComplete: true,
+    enumeratedMembers: new Set(
+      catalog.map((source) => sessionCoverageMember({ ...source, agent: 'codex', mtimeMs: 0 })),
+    ),
+    membershipCoverage: {
+      domain: 'admitted',
+      scope: JSON.stringify([]),
+      revision: 'undefined',
+      status: 'complete',
+      files: [],
+      uncertain: [],
+      members: new Set(),
+    },
+    authoritativeCatalogScope: JSON.stringify([]),
     authoritativeCatalog: catalog,
     catalogWalked: true,
     awaitingSessionRecords: {},
@@ -14097,7 +14193,7 @@ test('a fresh session stays selected until its disk record is discoverable', () 
   const refresh = panelHostSource.slice(refreshAt, panelHostSource.indexOf('private glanceAt(', refreshAt));
   const clearAt = layoutIndexOf(
     refresh,
-    'if (this.authoritativeCatalogScope === JSON.stringify(this.repositoryScopeRoots) && pendingResponseSessionAdmitted(this.awaitingSessionRecords[session], this.authoritativeCatalog ?? [])) { delete this.awaitingSessionRecords[session]; }',
+    "if (this.authoritativeCatalogScope === JSON.stringify(this.repositoryScopeRoots) && this.membershipOf(session, this.awaitingSessionRecords[session].agent) === 'present' && pendingResponseSessionAdmitted(this.awaitingSessionRecords[session], this.authoritativeCatalog ?? [])) { delete this.awaitingSessionRecords[session]; }",
   );
   const pendingAt = refresh.indexOf('const scopedPendingRecords =');
   const selectAt = refresh.indexOf('this.showing = pickShowing(');
@@ -14491,6 +14587,9 @@ test('rejected sends and queued edits reply to the retained browser identity', a
     panelSession(session: string) {
       return resolveSessionAlias(this.sessionAliases, session);
     },
+    composerStateFor(session: string) {
+      return this.stateFor(session);
+    },
     stateFor(session: string) {
       const target = this.panelSession(session);
       return {
@@ -14710,6 +14809,9 @@ test('a queued edit keeps a newer draft written from another panel', () => {
     draftCommentIds: {},
     queuedEditOffers: new Map(),
     posted: [] as unknown[],
+    composerStateFor(session: string) {
+      return this.stateFor(session);
+    },
     stateFor(session: string) {
       return {
         sessionId: session,
@@ -14828,6 +14930,9 @@ test('a queued edit retains an attachment that finishes after the offer', () => 
     assets: {} as Record<string, (typeof lateAsset)[]>,
     draftCommentIds: {},
     queuedEditOffers: new Map(),
+    composerStateFor(session: string) {
+      return this.stateFor(session);
+    },
     stateFor(session: string) {
       return {
         sessionId: session,
@@ -14913,6 +15018,9 @@ test('releasing a rejected or abandoned queued edit resumes eligible delivery', 
     attachmentStorageDir: null,
     running: true,
     sessionAliases: new Map(),
+    composerStateFor(session: string) {
+      return this.stateFor(session);
+    },
     stateFor(session: string) {
       session = this.panelSession(session);
       return {
@@ -17609,7 +17717,7 @@ test('older pages survive an append, and go when the file or the budget says so'
   // Drop retained pages when their session leaves the workspace.
   sourceMatch(
     panelHostSource,
-    /for \(const sessionId of \[\.\.\.this\.history\.keys\(\)\]\) \{\s*if \(!presentIds\.has\(sessionId\)\) \{\s*this\.dropOlderHistory\(sessionId\);\s*\}/,
+    /for \(const sessionId of \[\.\.\.this\.history\.keys\(\)\]\) \{\s*if \(!presentIds\.has\(sessionId\) && this\.membershipOf\(sessionId\) === 'absent'\) \{\s*this\.dropOlderHistory\(sessionId\);\s*\}/,
     'a session that left the workspace keeps its retained pages for ever',
   );
   sourceMatch(
@@ -20211,7 +20319,11 @@ test('a prompt goes to the session the composer names, and nowhere else', () => 
     const from = panelHostSource.indexOf(marker);
     assert.notEqual(from, -1, named + ' no longer takes the session it belongs to');
     const body = memberFrom(panelHostSource, from);
-    sourceMatch(body, /this\.stateFor\(session\)/, named + ' is handed a session and works out a different one');
+    sourceMatch(
+      body,
+      /this\.composerStateFor\(session\)/,
+      named + ' is handed a session and works out a different one',
+    );
     sourceDoesNotMatch(
       body,
       /this\.composerState\(\)/,
@@ -22100,7 +22212,7 @@ test('dropping a restored clear releases the prompts it kept off the source sess
     queuedEditReservations: new Set<string>(),
     attachmentStorageDir: null,
     flushed: [],
-    stateFor(session: string) {
+    composerStateFor(session: string) {
       return { agent: 'codex', sessionId: session, queued: this.queues[session] ?? [] };
     },
     writeDrafts() {
@@ -29074,6 +29186,7 @@ function catalogSendProvider(agent: 'claude' | 'codex') {
   const posted: Array<Record<string, unknown>> = [];
   const delivered: Array<{ session: string; cwd: string; text: string }> = [];
   Object.assign(provider, {
+    membershipOf: () => 'present',
     authoritativeCatalog: [source],
     catalog: { sessions: [source] },
     completeCatalogScope: JSON.stringify([workspace, worktree]),
@@ -29101,6 +29214,7 @@ test.each(['archived', 'filtered'] as const)(
     Object.assign(provider, {
       readyHosts: new Set([host]),
       repositoryScope: { snapshot: () => ({ ready: true, roots: [worktree] }) },
+      membershipCoverage: { status: 'complete' },
       authoritativeCatalogScope: JSON.stringify([worktree]),
       repositoryScopeRoots: [worktree],
       hostPreviousSessions: new Map(),
@@ -29134,6 +29248,7 @@ test.each(['claude', 'codex'] as const)(
     Object.assign(provider, {
       readyHosts: new Set([host]),
       repositoryScope: { snapshot: () => ({ ready: true, roots: [worktree] }) },
+      membershipCoverage: { status: 'complete' },
       authoritativeCatalogScope: JSON.stringify([worktree]),
       repositoryScopeRoots: [worktree],
       hostPreviousSessions: new Map(),
@@ -30226,6 +30341,7 @@ test.each(['settings-first', 'curation-first'])(
       models: {},
       folders: () => ['C:/workspace'],
       repositoryScope: { snapshot: () => ({ ready: true, roots: ['C:/workspace'] }) },
+      membershipCoverage: { status: 'complete' },
       authoritativeCatalogScope: JSON.stringify(['C:/workspace']),
       authoritativeCatalog: [{ sessionId: curated, cwd: 'C:/workspace', agent: 'codex' }],
       launcherFor: () => ({ view: sessionLauncherView(null, [], {}) }),
@@ -30322,6 +30438,7 @@ test.each(['resolve', 'reject'])(
       folders: () => [cwd],
       repositoryScope: { snapshot: () => ({ ready: true, roots: [cwd] }) },
       repositoryScopeRoots: [cwd],
+      membershipCoverage: { status: 'complete' },
       authoritativeCatalogScope: JSON.stringify([cwd]),
       authoritativeCatalog: [],
       launcherFor: () => ({ view: sessionLauncherView(null, [], {}) }),
@@ -30500,6 +30617,7 @@ test('an older failed CLI pin cannot roll back a newer pending initial pin', asy
     models: {},
     folders: () => ['C:/workspace'],
     repositoryScope: { snapshot: () => ({ ready: true, roots: ['C:/workspace'] }) },
+    membershipCoverage: { status: 'complete' },
     authoritativeCatalogScope: JSON.stringify(['C:/workspace']),
     authoritativeCatalog: [{ sessionId: session, cwd: 'C:/workspace', agent: 'codex' }],
     launcherFor: () => ({ view: sessionLauncherView(null, [], {}) }),
@@ -30588,6 +30706,7 @@ test.each(['resolve', 'reject'])('CLI pin waits for pending native pin persisten
       pinnedTop: new Set(),
       folders: () => ['C:/workspace'],
       repositoryScope: { snapshot: () => ({ ready: true, roots: ['C:/workspace'] }) },
+      membershipCoverage: { status: 'complete' },
       authoritativeCatalogScope: JSON.stringify(['C:/workspace']),
       authoritativeCatalog: [{ sessionId: 'reader', cwd: 'C:/workspace', agent: 'codex' }],
       memento: {
@@ -31412,6 +31531,7 @@ function guardedPanelFixture() {
   Object.assign(provider, {
     hosts: [host],
     authoritativeCatalog: [source],
+    membershipCoverage: { status: 'complete' },
     authoritativeCatalogScope: JSON.stringify(roots),
     repositoryScope: { snapshot: () => ({ ready: true, roots, revision: 1 }) },
     folders: () => [worktree],
@@ -31420,6 +31540,7 @@ function guardedPanelFixture() {
       ['worker', 'coordinator'].includes(session)
         ? { ...COMPOSER_STATE, sessionId: session, queued: provider.queues[session] ?? [], running: busy.has(session) }
         : null,
+    composerStateFor: (session: string) => provider.stateFor(session),
     railStatuses: () => ({ statuses: new Map([['worker', 'done']]), openChildren: new Map() }),
     send: (_state: unknown, text: string) => readerSent.push(text),
     onSendDraftPrompt: async (...args: unknown[]) => {
@@ -33194,3 +33315,1376 @@ test('mixed ambiguous identity and invalid cost queries retain visible numeric c
   assert.ok(sessionIdentityNote(query, context as any));
   assert.equal(note(query, context, sessionQueryError, costNote, sessionIdentityNote), costNote(query));
 });
+
+async function coverageEnumerationFixture() {
+  const { CodexMetaCache, CodexStatCache } = await import('./codex.js');
+  const root = tempDir('coverage-enumeration-');
+  const workspace = path.join(root, 'workspace');
+  const worktree = path.join(root, 'worktree');
+  const projects = path.join(root, 'projects');
+  const codex = path.join(root, 'codex');
+  fs.mkdirSync(workspace);
+  fs.mkdirSync(worktree);
+  fs.mkdirSync(projects);
+  fs.mkdirSync(codex);
+  vi.stubEnv('ARC_PROJECTS_ROOT', projects);
+  vi.stubEnv('ARC_CODEX_ROOT', codex);
+  const { provider, writes } = queueRecoveryProvider();
+  Object.assign(provider, {
+    folders: () => [workspace],
+    repositoryScope: { snapshot: () => ({ ready: true, roots: [workspace, worktree], revision: 1 }) },
+    repositoryScopeRoots: [workspace, worktree],
+    publishWindowState() {},
+    cwds: new Map(),
+    codexMetas: new CodexMetaCache(),
+    codexStats: new CodexStatCache(),
+    subagentDirectories: { files: () => [], sweep() {} },
+    humanScans: new Map(),
+    hasHumanPrompt(source: any) {
+      this.humanScans.set(source.file, { found: true, complete: true });
+      return true;
+    },
+    activityFor: () => 1,
+    claudeChildren: [],
+    claudeChildrenDiscovered: true,
+    dispatchDiscoveryPending: false,
+    coverageRevision: 0,
+    derivedCacheCheckpointState: { markChanged() {} },
+    titles: new Map(),
+    carriedNames: new Map(),
+    corpus: new Map(),
+    hidden: new Set(),
+    showing: null,
+  });
+  return { provider, writes, root, workspace, worktree, projects, codex };
+}
+
+test.each([false, true])('unchanged Claude opening reuse retains unread worktree admission: %s', async (missingCwd) => {
+  const { provider, workspace, worktree, projects } = await coverageEnumerationFixture();
+  const directory = path.join(projects, renameTranscripts.projectSlug(worktree));
+  fs.mkdirSync(directory);
+  const file = path.join(directory, 'unread.jsonl');
+  fs.writeFileSync(file, JSON.stringify(missingCwd ? { type: 'user' } : { type: 'user', cwd: worktree }) + '\n');
+  const mutableFs = createRequire(__filename)('node:fs') as typeof fs;
+  const original = mutableFs.openSync;
+  const refused = vi.spyOn(mutableFs, 'openSync').mockImplementation((...args: any[]) => {
+    if (!missingCwd && args[0] === file) throw Object.assign(new Error('unread opening'), { code: 'EACCES' });
+    return (original as any)(...args);
+  });
+  syncBuiltinESMExports();
+  try {
+    for (let pass = 0; pass < 2; pass++) {
+      const listed = provider.allSessions();
+      const scope = JSON.stringify([workspace, worktree]);
+      provider.authoritativeCatalog = provider.acceptSessionCoverage(listed, scope);
+      provider.authoritativeCatalogScope = scope;
+      assert.equal(provider.membershipCoverage.status, missingCwd ? 'complete' : 'incomplete');
+      assert.equal(provider.membershipOf('unread'), missingCwd ? 'absent' : 'unknown');
+    }
+  } finally {
+    refused.mockRestore();
+    syncBuiltinESMExports();
+  }
+});
+
+test.each(['addition', 'unread', 'same provider', 'cross provider'] as const)(
+  'explicit content search retains complete prefixes and schedules changed membership discovery: %s',
+  async (change) => {
+    const { provider, workspace, worktree, projects, codex } = await coverageEnumerationFixture();
+    const directory = path.join(projects, renameTranscripts.projectSlug(workspace));
+    fs.mkdirSync(directory);
+    const sessionId = 'abcdefgh-session';
+    const file = path.join(directory, `${sessionId}.jsonl`);
+    fs.writeFileSync(file, JSON.stringify({ type: 'user', cwd: workspace }) + '\n');
+    const scope = JSON.stringify([workspace, worktree]);
+    provider.authoritativeCatalog = provider.acceptSessionCoverage(provider.allSessions(), scope);
+    provider.authoritativeCatalogScope = scope;
+    provider.sessionReadDiscoveryRevision = sessionCatalogMembership(scope, provider.authoritativeCatalog);
+    provider.corpus.set(file, {
+      ...revisionOf(fs.statSync(file, { bigint: true })),
+      entries: [
+        { key: 'matching-turn', sessionId, agent: 'Claude', startedAt: 1, prompt: 'needle', summary: '', whole: true },
+      ],
+    });
+    provider.sessionLabel = () => ({ label: 'Matching session' });
+    provider.sessionParentEdges = () => ({ edges: [] });
+    provider.agentRunFor = () => false;
+    provider.observeParsedNames = () => {};
+    const posted: any[] = [];
+    const refreshes: unknown[][] = [];
+    provider.post = async (message: any) => posted.push(message);
+    provider.refresh = (...args: unknown[]) => {
+      refreshes.push(args);
+      return Promise.resolve();
+    };
+    provider.answerSearch('find: needle session:abcdefgh');
+    assert.deepEqual(
+      posted.at(-1).hits.map((hit: any) => hit.key),
+      ['matching-turn'],
+    );
+    assert.equal(provider.sessionQueryContext().coverage, 'complete');
+    assert.equal(refreshes.length, 0);
+    let refused: ReturnType<typeof vi.spyOn> | undefined;
+    if (change === 'addition') {
+      fs.writeFileSync(
+        path.join(directory, 'new-session.jsonl'),
+        JSON.stringify({ type: 'user', cwd: workspace }) + '\n',
+      );
+    } else if (change === 'cross provider') {
+      const day = path.join(codex, '2026', '10', '13');
+      fs.mkdirSync(day, { recursive: true });
+      fs.writeFileSync(
+        path.join(day, 'rollout-11111111-1111-4111-8111-111111111111.jsonl'),
+        JSON.stringify({ type: 'session_meta', payload: { id: sessionId, cwd: workspace, source: 'vscode' } }) + '\n',
+      );
+    } else {
+      const other = path.join(projects, renameTranscripts.projectSlug(worktree));
+      fs.mkdirSync(other);
+      if (change === 'same provider') {
+        fs.writeFileSync(
+          path.join(other, `${sessionId}.jsonl`),
+          JSON.stringify({ type: 'user', cwd: worktree }) + '\n',
+        );
+      } else {
+        const mutableFs = createRequire(__filename)('node:fs') as typeof fs;
+        const original = mutableFs.readdirSync;
+        refused = vi.spyOn(mutableFs, 'readdirSync').mockImplementation((...args: any[]) => {
+          if (args[0] === other) throw Object.assign(new Error('unread project'), { code: 'EACCES' });
+          return (original as any)(...args);
+        });
+        syncBuiltinESMExports();
+      }
+    }
+    try {
+      provider.answerSearch('find: needle session:abcdefgh');
+      assert.equal(provider.sessionQueryContext().coverage, 'incomplete');
+      assert.equal(refreshes.length, 1);
+      assert.equal(provider.authoritativeCatalog.length, 1);
+      if (change === 'same provider' || change === 'cross provider') {
+        assert.equal(provider.membershipOf(sessionId), 'unknown');
+        assert.equal(provider.stateFor(sessionId), null);
+      }
+    } finally {
+      refused?.mockRestore();
+      syncBuiltinESMExports();
+    }
+  },
+);
+
+test.each(['claude', 'codex'] as const)(
+  'unknown %s membership retains queued Edit acknowledgement and Drop without delivery',
+  async (agent) => {
+    const { provider } = queueRecoveryProvider();
+    const session = 'source';
+    const root = tempDir('queue-unknown-');
+    const source = {
+      agent,
+      sessionId: session,
+      cwd: root,
+      file: path.join(root, 'source.jsonl'),
+      size: 1,
+      mtimeMs: 1,
+      dev: 1,
+      ino: 1,
+    };
+    Object.assign(provider, {
+      repositoryScopeRoots: [root],
+      authoritativeCatalogScope: JSON.stringify([root]),
+      authoritativeCatalog: [source],
+      coverageRevision: 1,
+      membershipCoverage: {
+        domain: 'admitted',
+        scope: JSON.stringify([root]),
+        revision: '1',
+        status: 'incomplete',
+        members: new Set(),
+      },
+      sessionRows: [{ id: session, label: 'Source', agentKey: agent }],
+    });
+    const host = { webview: {} };
+    const posted: any[] = [];
+    const delivered: string[] = [];
+    provider.sendToHost = async (_host: unknown, message: any) => {
+      posted.push(message);
+      return true;
+    };
+    provider.onSendPrompt = async () => {
+      delivered.push(session);
+      return { delivered: true };
+    };
+    provider.queues[session] = queueSubmissionAfter([], 'edit', 'Recover my prompt', [], [], 1, false, {
+      agent,
+      owner: session,
+    });
+    provider.queues[session] = queueSubmissionAfter(
+      provider.queues[session],
+      'drop',
+      'Remove this prompt',
+      [],
+      [],
+      2,
+      false,
+      { agent, owner: session },
+    );
+    assert.equal(provider.stateFor(session), null);
+    provider.queueHandoffs.add('edit');
+    provider.requestQueuedEdit('edit', session, 1, host);
+    assert.equal(posted.length, 0);
+    provider.queueHandoffs.delete('edit');
+    provider.requestQueuedEdit('edit', session, 1, host);
+    assert.equal(posted.at(-1)?.text, 'Recover my prompt');
+    provider.dequeue('edit', session);
+    assert.equal(provider.queues[session].length, 2);
+    provider.acceptQueuedEdit('edit', session, 9, 2, true, host);
+    assert.equal(provider.queuedEditReservations.has('edit'), true);
+    provider.acceptQueuedEdit('edit', session, 1, 2, true, host);
+    assert.equal(provider.drafts[session], 'Recover my prompt');
+    assert.deepEqual(
+      provider.queues[session].map((queued: any) => queued.id),
+      ['drop'],
+    );
+    provider.dequeue('drop', session);
+    await provider.writeDrafts();
+    assert.equal(provider.queues[session], undefined);
+    assert.equal(provider.queuedEditReservations.size, 0);
+    provider.flushQueue(session);
+    assert.deepEqual(delivered, []);
+  },
+);
+
+test('incomplete Codex walks persist newly readable openings through recovered complete enumeration', async () => {
+  const { CodexOpeningsWriter, loadCodexOpenings } = await import('./codexopenings.js');
+  const { provider, codex, root, workspace } = await coverageEnumerationFixture();
+  const day = path.join(codex, '2026', '10', '13');
+  fs.mkdirSync(day, { recursive: true });
+  const write = (id: string) => {
+    const file = path.join(day, `rollout-${id}.jsonl`);
+    fs.writeFileSync(
+      file,
+      JSON.stringify({ type: 'session_meta', payload: { id, cwd: workspace, source: 'vscode' } }) + '\n',
+    );
+    return file;
+  };
+  const first = write('11111111-1111-4111-8111-111111111111');
+  const shared = path.join(root, 'openings.json');
+  const writer = new CodexOpeningsWriter(shared, provider.codexMetas, false);
+  provider.codexOpenings = writer;
+  try {
+    provider.allSessions();
+    assert.equal(writer.write(), true);
+    assert.ok(loadCodexOpenings(shared)?.has(first));
+    const second = write('22222222-2222-4222-8222-222222222222');
+    const unread = path.join(codex, '2025');
+    fs.mkdirSync(unread);
+    const omitted = path.join(unread, 'rollout-33333333-3333-4333-8333-333333333333.jsonl');
+    fs.writeFileSync(
+      omitted,
+      JSON.stringify({
+        type: 'session_meta',
+        payload: {
+          id: '33333333-3333-4333-8333-333333333333',
+          cwd: workspace,
+          source: 'vscode',
+        },
+      }) + '\n',
+    );
+    assert.ok(provider.codexMetas.get(omitted));
+    const mutableFs = createRequire(__filename)('node:fs') as typeof fs;
+    const original = mutableFs.readdirSync;
+    const refused = vi.spyOn(mutableFs, 'readdirSync').mockImplementation((...args: any[]) => {
+      if (args[0] === unread) throw Object.assign(new Error('unread directory'), { code: 'EACCES' });
+      return (original as any)(...args);
+    });
+    syncBuiltinESMExports();
+    try {
+      provider.allSessions();
+      assert.equal(provider.sourceEnumerations.codex.status, 'incomplete');
+      assert.equal(writer.write(), true);
+      assert.ok(loadCodexOpenings(shared)?.has(omitted), 'the incomplete walk omitted its already readable opening');
+    } finally {
+      refused.mockRestore();
+      syncBuiltinESMExports();
+    }
+    const revision = provider.codexMetas.revision;
+    provider.allSessions();
+    assert.equal(provider.sourceEnumerations.codex.status, 'complete');
+    assert.equal(provider.codexMetas.revision, revision);
+    assert.equal(writer.write(), true);
+    assert.ok(loadCodexOpenings(shared)?.has(second), 'the recovered walk never persisted its readable opening');
+    assert.ok(loadCodexOpenings(shared)?.has(omitted));
+  } finally {
+    writer.dispose();
+  }
+});
+
+test('unread membership retains selection navigation derived caches exit corpus and reader input until complete absence', () => {
+  const refresh = methodBody('async refresh(');
+  const selection = ts.transpileModule(
+    `function reconcile(all, scopedDrafts = [], scopedPendingRecords = [], selectedOnly = false) { ${refresh.slice(refresh.indexOf('const reachable = ['), refresh.indexOf('const sessions = this.shownSessions(all);'))} }`,
+    { compilerOptions: { target: ts.ScriptTarget.ES2022 } },
+  ).outputText;
+  const reconcile = new Function('pickShowing', 'visitPlace', 'prunePlaces', selection + '\nreturn reconcile;')(
+    pickShowing,
+    visitPlace,
+    prunePlaces,
+  );
+  const collect = methodBody('private collect(');
+  const retainedWindows = ts.transpileModule(
+    `function refreshDerived(all = [], sessions = [], currentRecords = { newestTurns: new Map() }) { ${refresh.slice(refresh.indexOf('const heldWindows ='), refresh.indexOf('const statusFacts ='))} ${collect.slice(collect.indexOf('for (const session of this.readWindows.keys())'), collect.indexOf('// Update retained-page recency'))} ${collect.slice(collect.indexOf('const heldNewest ='), collect.indexOf('this.composerRuntime ='))} }`,
+    { compilerOptions: { target: ts.ScriptTarget.ES2022 } },
+  ).outputText;
+  const refreshDerived = new Function(retainedWindows + '\nreturn refreshDerived;')();
+  for (const agent of ['claude', 'codex'] as const) {
+    const root = tempDir('retained-membership-');
+    vi.stubEnv('ARC_PROJECTS_ROOT', agent === 'claude' ? root : path.join(root, 'other-claude'));
+    vi.stubEnv('ARC_CODEX_ROOT', agent === 'codex' ? root : path.join(root, 'other-codex'));
+    const file = path.join(root, 'unread', 'retained.jsonl');
+    const source = { agent, sessionId: 'retained', file, cwd: root, size: 1, mtimeMs: 1, dev: 1, ino: 2 };
+    const scope = JSON.stringify([root]);
+    const draft = { text: 'Recoverable prompt', undo: ['earlier text'] };
+    const queued = [{ id: 'queued', text: 'Queued prompt' }];
+    const pending = { sessionId: 'pending', agent, cwd: root };
+    const provider: any = Object.assign(Object.create(PanelProvider.prototype), {
+      repositoryScopeReady: true,
+      repositoryScopeRoots: [root],
+      authoritativeCatalogScope: scope,
+      authoritativeCatalog: [source],
+      claudeChildren: [],
+      claudeChildrenDiscovered: true,
+      dispatchDiscoveryPending: false,
+      enumeratedMembers: new Set(),
+      enumeratedAdmissionComplete: false,
+      showing: source.sessionId,
+      hosts: [],
+      hostSessions: new Map(),
+      trail: visitPlace(emptyTrail(), source.sessionId),
+      newDrafts: {},
+      awaitingSessionRecords: { pending },
+      sessionRows: [{ id: source.sessionId, agentKey: agent, label: 'Retained' }],
+      drafts: { retained: draft },
+      queues: { retained: queued },
+      pendingQueueDrains: new Set(),
+      stateForRow: () => ({ sessionId: 'retained' }),
+      sessionAliases: new Map([['provisional', 'retained']]),
+      saved: { comments: [{ text: 'Reader comment' }] },
+      windows: new Map([['retained', {}]]),
+      readWindows: new Map([['retained', {}]]),
+      newestBySession: new Map([['retained', {}]]),
+      glanceAt: () => new Map(),
+      cache: new Map([[file, { bytes: 1, usedAt: 1 }]]),
+      history: new Map([['retained', { pages: [], usedAt: 1 }]]),
+      historyStructuralKeys: new Map(),
+      titles: new Map([[file, { title: 'Retained name' }]]),
+      carriedNames: new Map([[file, { label: 'Retained name' }]]),
+      cwds: new Map([[file, { cwd: root }]]),
+      humanScans: new Map([[file, { found: true }]]),
+      walkedClaude: [],
+      sessionRunWitnesses: new Map([[runningKey(agent, source.sessionId), { source: { file } }]]),
+      exitedSinceKeys: new Map([[runningKey(agent, source.sessionId), 1]]),
+      corpus: new Map([[file, { entries: [{ key: 'retained-turn' }] }]]),
+      sessionCacheBudgetBytes: () => 1024,
+      derivedCacheCheckpointState: { markChanged() {} },
+      allSessions: () => [],
+    });
+    const enumeration = { status: 'incomplete' as const, files: [], uncertain: [path.dirname(file)] };
+    provider.sourceEnumerations = { claude: enumeration, codex: enumeration };
+    provider.authoritativeCatalog = provider.acceptSessionCoverage([], scope);
+    assert.deepEqual(provider.authoritativeCatalog, [source]);
+    assert.equal(provider.membershipOf('retained'), 'unknown');
+    reconcile.call(provider, []);
+    refreshDerived.call(provider);
+    provider.evictCache([], []);
+    provider.pruneExits([]);
+    provider.searchCorpus();
+    assert.equal(provider.stateFor('retained'), null);
+    provider.flushQueue('retained');
+    assert.equal(provider.readerWork('retained'), 'unknown');
+    assert.equal(provider.showing, 'retained');
+    assert.deepEqual(provider.trail.places, ['retained']);
+    for (const held of [
+      provider.cache,
+      provider.titles,
+      provider.carriedNames,
+      provider.cwds,
+      provider.humanScans,
+      provider.corpus,
+    ])
+      assert.equal(held.has(file), true);
+    for (const windows of [provider.windows, provider.readWindows, provider.newestBySession])
+      assert.equal(windows.has('retained'), true);
+    assert.equal(provider.history.has('retained'), true);
+    assert.equal(provider.sessionRunWitnesses.size, 1);
+    assert.equal(provider.exitedSinceKeys.size, 1);
+    assert.equal(provider.queues.retained, queued);
+    assert.equal(provider.drafts.retained, draft);
+    assert.equal(provider.awaitingSessionRecords.pending, pending);
+    provider.sourceEnumerations = {
+      claude: { status: 'complete', files: [], uncertain: [] },
+      codex: { status: 'complete', files: [], uncertain: [] },
+    };
+    provider.enumeratedAdmissionComplete = true;
+    provider.authoritativeCatalog = provider.acceptSessionCoverage([], scope);
+    reconcile.call(provider, []);
+    refreshDerived.call(provider);
+    provider.evictCache([], []);
+    provider.pruneExits([]);
+    provider.searchCorpus();
+    assert.equal(provider.showing, null);
+    assert.deepEqual(provider.trail.places, []);
+    for (const held of [
+      provider.cache,
+      provider.titles,
+      provider.carriedNames,
+      provider.cwds,
+      provider.humanScans,
+      provider.corpus,
+    ])
+      assert.equal(held.has(file), false);
+    for (const windows of [provider.windows, provider.readWindows, provider.newestBySession])
+      assert.equal(windows.has('retained'), false);
+    assert.equal(provider.history.has('retained'), false);
+    assert.equal(provider.sessionRunWitnesses.size, 0);
+    assert.equal(provider.exitedSinceKeys.size, 0);
+    assert.equal(provider.queues.retained, queued);
+    assert.equal(provider.drafts.retained, draft);
+    assert.equal(provider.awaitingSessionRecords.pending, pending);
+    assert.equal(provider.sessionAliases.get('provisional'), 'retained');
+    assert.deepEqual(provider.saved.comments, [{ text: 'Reader comment' }]);
+  }
+});
+
+test('pending recovery does not acknowledge same-provider or cross-provider colliding source IDs', () => {
+  const pending = { sessionId: 'collision', agent: 'claude' };
+  const source = { ...pending, file: 'one.jsonl' };
+  for (const collision of [
+    { ...source, file: 'two.jsonl' },
+    { ...source, agent: 'codex' },
+  ])
+    assert.equal(pendingResponseSessionAdmitted(pending, [source, collision]), false);
+  assert.equal(pendingResponseSessionAdmitted(pending, [source]), true);
+});
+
+test('completed relationships retain omitted children until physical absence qualifies', () => {
+  const root = tempDir('child-absence-');
+  vi.stubEnv('ARC_PROJECTS_ROOT', root);
+  vi.stubEnv('ARC_CODEX_ROOT', path.join(root, 'other-provider'));
+  const directory = path.join(root, 'project');
+  const parent = {
+    agent: 'claude' as const,
+    sessionId: 'parent',
+    file: path.join(directory, 'parent.jsonl'),
+    cwd: root,
+    size: 1,
+    mtimeMs: 1,
+    dev: 1,
+    ino: 1,
+  };
+  const child = {
+    ...parent,
+    sessionId: 'child',
+    file: path.join(directory, 'parent', 'subagents', 'child.jsonl'),
+    ino: 2,
+    childTranscript: true,
+  };
+  const descendant = {
+    ...child,
+    sessionId: 'descendant',
+    file: path.join(directory, 'parent', 'subagents', 'child', 'subagents', 'descendant.jsonl'),
+    ino: 3,
+  };
+  const scope = JSON.stringify([root]);
+  const provider: any = Object.assign(Object.create(PanelProvider.prototype), {
+    repositoryScopeReady: true,
+    repositoryScopeRoots: [root],
+    authoritativeCatalogScope: scope,
+    authoritativeCatalog: [parent, child, descendant],
+    claudeChildren: [],
+    claudeChildrenDiscovered: true,
+    dispatchDiscoveryPending: false,
+    enumeratedAdmissionComplete: true,
+    enumeratedMembers: new Set([sessionCoverageMember(parent)]),
+    sourceEnumerations: {
+      claude: { status: 'complete', root, directories: [directory], files: [parent.file], uncertain: [] },
+      codex: { status: 'complete', files: [], uncertain: [] },
+    },
+  });
+  provider.authoritativeCatalog = provider.acceptSessionCoverage([parent], scope);
+  assert.equal(provider.membershipCoverage.status, 'incomplete');
+  assert.deepEqual(provider.authoritativeCatalog, [parent, child, descendant]);
+  assert.equal(provider.membershipOf('child'), 'unknown');
+  assert.equal(provider.membershipOf('descendant'), 'unknown');
+  provider.sourceEnumerations.claude = {
+    status: 'complete',
+    root,
+    directories: [],
+    files: [],
+    uncertain: [],
+    missingRoot: true,
+  };
+  provider.enumeratedMembers = new Set();
+  provider.authoritativeCatalog = provider.acceptSessionCoverage([], scope);
+  assert.equal(provider.membershipCoverage.status, 'complete');
+  assert.deepEqual(provider.authoritativeCatalog, []);
+  assert.equal(provider.membershipOf('child'), 'absent');
+});
+
+test('incomplete enumeration cannot supply complete CLI or prefix coverage', () => {
+  const { provider } = pagedListingFixture(30);
+  const request = { method: 'sessions', params: {} };
+  assert.equal(provider.readSessionRequest(request).coverage, 'complete');
+  provider.membershipCoverage = { status: 'incomplete' };
+  assert.equal(provider.readSessionRequest(request).coverage, 'incomplete');
+  assert.equal(provider.sessionQueryContext().coverage, 'incomplete');
+  assert.throws(
+    () => provider.readSessionRequest({ method: 'sessions', params: { query: 'id:session-' } }),
+    /incomplete/,
+  );
+});
+
+test.each(
+  (['claude', 'codex'] as const).flatMap((owner) =>
+    (['claude', 'codex'] as const).flatMap((competitor) =>
+      (['absence', 'scope exclusion'] as const).flatMap((recovery) =>
+        (['directory', 'opening'] as const).map((unread) => ({ owner, competitor, recovery, unread })),
+      ),
+    ),
+  ),
+)(
+  'fresh source collisions survive unread $unread native walks for $owner and $competitor until $recovery',
+  async ({ owner, competitor, recovery, unread }) => {
+    const { provider, root, workspace, worktree, projects, codex } = await coverageEnumerationFixture();
+    const sessionId = 'collision';
+    const write = (agent: 'claude' | 'codex', other: boolean, cwd: string) => {
+      const directory =
+        agent === 'claude'
+          ? path.join(projects, renameTranscripts.projectSlug(other ? worktree : workspace))
+          : path.join(codex, other ? '2025' : '2026', '10', '13');
+      fs.mkdirSync(directory, { recursive: true });
+      const file = path.join(
+        directory,
+        agent === 'claude' ? `${sessionId}.jsonl` : 'rollout-11111111-1111-4111-8111-111111111111.jsonl',
+      );
+      fs.writeFileSync(
+        file,
+        JSON.stringify(
+          agent === 'claude'
+            ? { type: 'user', cwd }
+            : { type: 'session_meta', payload: { id: sessionId, cwd, source: 'vscode' } },
+        ) + '\n',
+      );
+      return file;
+    };
+    const file = write(owner, false, workspace);
+    const competingFile = write(competitor, true, worktree);
+    const scope = JSON.stringify([workspace, worktree]);
+    const pending = { sessionId, agent: owner, cwd: workspace };
+    Object.assign(provider, {
+      authoritativeCatalog: [],
+      authoritativeCatalogScope: scope,
+      membershipCoverage: {
+        domain: 'admitted',
+        scope,
+        revision: '0',
+        status: 'incomplete',
+        files: [],
+        uncertain: [],
+        members: new Set(),
+      },
+      awaitingSessionRecords: { [sessionId]: pending },
+      sessionRows: [{ id: sessionId, label: 'Pending session', agentKey: owner }],
+      promptsBySession: new Map([[sessionId, ['Reader prompt']]]),
+      drafts: { [sessionId]: 'Reader draft' },
+      assets: { [sessionId]: [{ id: 'reader-asset' }] },
+      draftCommentIds: { [sessionId]: ['reader-comment'] },
+    });
+    provider.allSessions();
+    assert.equal(provider.enumeratedAmbiguousIds.has(sessionId), true);
+    assert.equal(provider.stateFor(sessionId), null);
+    const mutableFs = createRequire(__filename)('node:fs') as typeof fs;
+    const operation = unread === 'directory' ? 'readdirSync' : 'openSync';
+    const original = mutableFs[operation];
+    if (unread === 'opening') {
+      if (competitor === 'claude') provider.cwds.delete(competingFile);
+      else provider.codexMetas.delete(competingFile);
+    }
+    const refused = vi.spyOn(mutableFs, operation).mockImplementation((...args: any[]) => {
+      if (args[0] === (unread === 'directory' ? path.dirname(competingFile) : competingFile))
+        throw Object.assign(new Error('unread competitor source'), { code: 'EACCES' });
+      return (original as any)(...args);
+    });
+    syncBuiltinESMExports();
+    try {
+      const observed = provider.allSessions();
+      assert.deepEqual(
+        observed.map((source: any) => source.file),
+        [file],
+      );
+      assert.equal(provider.sourceEnumerations[competitor].status, unread === 'directory' ? 'incomplete' : 'complete');
+      if (unread === 'opening') assert.equal(provider.enumeratedAdmissionComplete, false);
+      assert.equal(provider.membershipOf(sessionId), 'unknown');
+      assert.equal(provider.stateFor(sessionId), null, 'the unread walk restored recorded-source delivery');
+      assert.equal(provider.readerWork(sessionId), 'unknown');
+      assert.equal(provider.awaitingSessionRecords[sessionId], pending);
+      assert.deepEqual(provider.promptsBySession.get(sessionId), ['Reader prompt']);
+      assert.equal(provider.drafts[sessionId], 'Reader draft');
+      assert.deepEqual(provider.assets[sessionId], [{ id: 'reader-asset' }]);
+      assert.deepEqual(provider.draftCommentIds[sessionId], ['reader-comment']);
+    } finally {
+      refused.mockRestore();
+      syncBuiltinESMExports();
+    }
+    if (recovery === 'absence') fs.unlinkSync(competingFile);
+    else {
+      write(competitor, true, path.join(root, 'elsewhere'));
+      if (competitor === 'claude') provider.cwds.delete(competingFile);
+      else provider.codexMetas.delete(competingFile);
+    }
+    const recovered = provider.allSessions();
+    assert.equal(provider.enumeratedAmbiguousIds.size, 0);
+    provider.authoritativeCatalog = provider.acceptSessionCoverage(recovered, scope);
+    assert.equal(provider.membershipOf(sessionId), 'present');
+    assert.ok(provider.stateFor(sessionId));
+  },
+);
+
+test.each(
+  (['claude', 'codex'] as const).flatMap((owner) =>
+    (['claude', 'codex'] as const).flatMap((competitor) =>
+      [false, true].flatMap((beforeCollision) =>
+        (competitor === 'codex' ? ['excluded cwd', 'changed ID'] : ['excluded cwd']).map((recovery) => ({
+          owner,
+          competitor,
+          beforeCollision,
+          recovery,
+        })),
+      ),
+    ),
+  ),
+)(
+  'fresh source collisions require current openings with populated positives for $owner and $competitor: replacement first $beforeCollision, $recovery',
+  async ({ owner, competitor, beforeCollision, recovery }) => {
+    const { provider, workspace, projects, codex } = await coverageEnumerationFixture();
+    const other = workspace + '-other';
+    fs.mkdirSync(other);
+    let roots = [workspace, other];
+    provider.repositoryScope = { snapshot: () => ({ ready: true, roots, revision: roots.length }) };
+    provider.repositoryScopeRoots = roots;
+    const sessionId = 'collision';
+    const write = (agent: 'claude' | 'codex', competing: boolean, cwd: string, id = sessionId) => {
+      const directory =
+        agent === 'claude'
+          ? path.join(projects, renameTranscripts.projectSlug(competing ? other : workspace))
+          : path.join(codex, competing ? '2025' : '2026', '10', '13');
+      fs.mkdirSync(directory, { recursive: true });
+      const file = path.join(
+        directory,
+        agent === 'claude' ? sessionId + '.jsonl' : 'rollout-11111111-1111-4111-8111-111111111111.jsonl',
+      );
+      fs.writeFileSync(
+        file,
+        JSON.stringify(
+          agent === 'claude' ? { type: 'user', cwd } : { type: 'session_meta', payload: { id, cwd, source: 'vscode' } },
+        ) + '\n',
+      );
+      return file;
+    };
+    const file = write(owner, false, workspace);
+    const competingFile = write(competitor, true, other);
+    const pending = { sessionId, agent: owner, cwd: workspace };
+    Object.assign(provider, {
+      authoritativeCatalog: [],
+      authoritativeCatalogScope: JSON.stringify(roots),
+      membershipCoverage: {
+        domain: 'admitted',
+        scope: JSON.stringify(roots),
+        revision: '0',
+        status: 'incomplete',
+        files: [],
+        uncertain: [],
+        members: new Set(),
+      },
+      awaitingSessionRecords: { [sessionId]: pending },
+      sessionRows: [{ id: sessionId, label: 'Pending session', agentKey: owner }],
+      promptsBySession: new Map([[sessionId, ['Reader prompt']]]),
+      drafts: { [sessionId]: 'Reader draft' },
+      assets: { [sessionId]: [{ id: 'reader-asset' }] },
+      draftCommentIds: { [sessionId]: ['reader-comment'] },
+    });
+    if (beforeCollision) {
+      const cwd = renameTranscripts.readSessionCwd(competingFile);
+      if (competitor === 'claude')
+        provider.cwds.set(competingFile, { cwd, ...revisionOf(fs.statSync(competingFile, { bigint: true })) });
+      else provider.codexMetas.get(competingFile);
+    } else {
+      provider.allSessions();
+      assert.equal(provider.stateFor(sessionId), null);
+    }
+    const old = revisionOf(fs.statSync(competingFile, { bigint: true }));
+    fs.renameSync(competingFile, competingFile + '.retired');
+    write(competitor, true, workspace);
+    assert.notEqual(revisionOf(fs.statSync(competingFile, { bigint: true })).ino, old.ino);
+    const positive =
+      competitor === 'claude' ? provider.cwds.get(competingFile) : provider.codexMetas.get(competingFile);
+    assert.equal(positive.cwd, other);
+    const mutableFs = createRequire(__filename)('node:fs') as typeof fs;
+    const original = mutableFs.openSync;
+    const refused = vi.spyOn(mutableFs, 'openSync').mockImplementation((...args: any[]) => {
+      if (args[0] === competingFile) throw Object.assign(new Error('unread replacement'), { code: 'EACCES' });
+      return (original as any)(...args);
+    });
+    syncBuiltinESMExports();
+    try {
+      provider.allSessions();
+      assert.equal(provider.stateFor(sessionId), null, 'unqualified replacement restored recorded access');
+      roots = [workspace];
+      provider.repositoryScopeRoots = roots;
+      provider.allSessions();
+      assert.ok(provider.sourceEnumerations[competitor].files.includes(competingFile));
+      assert.equal(provider.membershipOf(sessionId), 'unknown');
+      assert.equal(provider.stateFor(sessionId), null, 'historical cwd restored recorded access');
+      assert.equal(provider.awaitingSessionRecords[sessionId], pending);
+      assert.deepEqual(provider.promptsBySession.get(sessionId), ['Reader prompt']);
+      assert.equal(provider.drafts[sessionId], 'Reader draft');
+      assert.deepEqual(provider.assets[sessionId], [{ id: 'reader-asset' }]);
+      assert.deepEqual(provider.draftCommentIds[sessionId], ['reader-comment']);
+      assert.equal(
+        competitor === 'claude' ? provider.cwds.get(competingFile) : provider.codexMetas.get(competingFile),
+        positive,
+      );
+    } finally {
+      refused.mockRestore();
+      syncBuiltinESMExports();
+    }
+    provider.allSessions();
+    assert.equal(provider.stateFor(sessionId), null, 'readable same-ID replacement restored recorded access');
+    // The held rollout stat must not hide the replacement's current opening revision.
+    provider.watching = true;
+    fs.utimesSync(competingFile, 1, 1);
+    const heldStat = provider.codexStats.get(competingFile);
+    write(
+      competitor,
+      true,
+      recovery === 'changed ID' ? workspace : other,
+      recovery === 'changed ID' ? 'new-id' : sessionId,
+    );
+    const recovered = provider.allSessions();
+    if (competitor === 'codex')
+      assert.notEqual(
+        provider.codexStats.get(competingFile),
+        heldStat,
+        'qualified recovery retained the old rollout stat',
+      );
+    if (recovery === 'changed ID') {
+      const current = recovered.find((source: any) => source.file === competingFile);
+      assert.equal(current.mtimeMs, revisionOf(fs.statSync(competingFile, { bigint: true })).mtimeMs);
+      assert.notEqual(current.mtimeMs, heldStat.mtimeMs);
+    }
+    assert.equal(provider.enumeratedAmbiguousIds.size, 0);
+    assert.deepEqual(
+      recovered.map((source: any) => source.file).sort(),
+      (recovery === 'changed ID' ? [file, competingFile] : [file]).sort(),
+    );
+    provider.authoritativeCatalog = provider.acceptSessionCoverage(recovered, JSON.stringify(roots));
+    provider.authoritativeCatalogScope = JSON.stringify(roots);
+    assert.equal(provider.membershipOf(sessionId), 'present');
+    const sent: string[] = [];
+    const host = { webview: {} };
+    provider.hosts = [host];
+    provider.hostSessions = new Map([[host, sessionId]]);
+    delete provider.assets[sessionId];
+    delete provider.draftCommentIds[sessionId];
+    provider.onSendPrompt = async (_agent: string, _session: string, _cwd: string, going: any) => {
+      sent.push(going.text);
+      return { delivered: true };
+    };
+    await provider.acceptSubmission('Continue', sessionId, 1, sessionId, host);
+    assert.deepEqual(sent, ['Continue']);
+  },
+);
+
+test.each(
+  (['claude', 'codex'] as const).flatMap((owner) =>
+    (
+      [
+        'Claude exclusion',
+        'Codex exclusion',
+        'visible changed ID',
+        'hidden changed ID',
+        'hidden same ID',
+        'hidden new collision',
+        'cached hidden refusal',
+      ] as const
+    ).map((recovery) => ({ owner, recovery })),
+  ),
+)('fresh source collisions keep stable qualified recovery for $owner: $recovery', async ({ owner, recovery }) => {
+  const codexModule = await import('./codex.js');
+  const { provider, workspace, worktree, projects, codex } = await coverageEnumerationFixture();
+  const roots = [workspace, worktree];
+  const scope = JSON.stringify(roots);
+  provider.cwdForSession = () => workspace;
+  const competitor = recovery === 'Claude exclusion' ? 'claude' : 'codex';
+  const hidden = recovery.startsWith('hidden') || recovery === 'cached hidden refusal';
+  const denied = recovery === 'hidden same ID' || recovery === 'cached hidden refusal';
+  const id = 'collision';
+  const write = (agent: 'claude' | 'codex', competing: boolean, cwd: string, rawId = id, guardian = false) => {
+    const directory =
+      agent === 'claude'
+        ? path.join(projects, renameTranscripts.projectSlug(competing ? worktree : workspace))
+        : path.join(codex, competing ? '2025' : '2026', '10', '13');
+    fs.mkdirSync(directory, { recursive: true });
+    const file = path.join(
+      directory,
+      agent === 'claude' ? id + '.jsonl' : 'rollout-11111111-1111-4111-8111-111111111111.jsonl',
+    );
+    fs.writeFileSync(
+      file,
+      JSON.stringify(
+        agent === 'claude'
+          ? { type: 'user', cwd }
+          : {
+              type: 'session_meta',
+              payload: {
+                id: rawId,
+                cwd,
+                ...(guardian
+                  ? { thread_source: 'guardian_review', source: { subagent: { other: 'guardian' } } }
+                  : { source: 'vscode' }),
+              },
+            },
+      ) + '\n',
+    );
+    fs.utimesSync(file, 1, 1);
+    return file;
+  };
+  const reads = new Map<string, number>();
+  provider.watching = true;
+  provider.codexStats = new codexModule.CodexStatCache(
+    (file) => {
+      reads.set(file, (reads.get(file) ?? 0) + 1);
+      return codexModule.readRolloutStat(file);
+    },
+    () => 86_400_000,
+  );
+  const file = write(owner, false, workspace);
+  const competingFile = write(competitor, true, worktree);
+  const pending = { sessionId: id, agent: owner, cwd: workspace };
+  Object.assign(provider, {
+    authoritativeCatalog: [],
+    authoritativeCatalogScope: scope,
+    membershipCoverage: {
+      domain: 'admitted',
+      scope,
+      revision: '0',
+      status: 'incomplete',
+      files: [],
+      uncertain: [],
+      members: new Set(),
+    },
+    awaitingSessionRecords: { [id]: pending },
+    sessionRows: [{ id, label: 'Pending session', agentKey: owner }],
+    promptsBySession: new Map([[id, ['Reader prompt']]]),
+    drafts: { [id]: 'Reader draft' },
+    assets: { [id]: [{ id: 'reader-asset' }] },
+    draftCommentIds: { [id]: ['reader-comment'] },
+  });
+  const checkReader = () => {
+    assert.equal(provider.awaitingSessionRecords[id], pending);
+    assert.deepEqual(provider.promptsBySession.get(id), ['Reader prompt']);
+    assert.equal(provider.drafts[id], 'Reader draft');
+    assert.deepEqual(provider.assets[id], [{ id: 'reader-asset' }]);
+    assert.deepEqual(provider.draftCommentIds[id], ['reader-comment']);
+  };
+  provider.allSessions();
+  assert.equal(provider.stateFor(id), null);
+  checkReader();
+  const positive = competitor === 'claude' ? provider.cwds.get(competingFile) : provider.codexMetas.get(competingFile);
+  assert.equal(positive.cwd, worktree);
+  if (competitor === 'codex') assert.equal(positive.sessionId, id);
+  const old = revisionOf(fs.statSync(competingFile, { bigint: true }));
+  const heldStat = competitor === 'codex' ? provider.codexStats.get(competingFile) : null;
+  if (heldStat) assert.deepEqual(heldStat, { ...old, isFile: true });
+  const unrelated = path.join(codex, 'unrelated.jsonl');
+  fs.writeFileSync(unrelated, '{}\n');
+  fs.utimesSync(unrelated, 1, 1);
+  const unrelatedStat = provider.codexStats.get(unrelated);
+  fs.renameSync(competingFile, competingFile + '.retired');
+  const nextId =
+    recovery === 'cached hidden refusal'
+      ? 'replacement'
+      : denied
+        ? id
+        : recovery.endsWith('exclusion')
+          ? id
+          : 'replacement';
+  const nextCwd = recovery.endsWith('exclusion') ? workspace + '-outside' : worktree;
+  write(competitor, true, nextCwd, nextId, hidden);
+  const replacement = revisionOf(fs.statSync(competingFile, { bigint: true }));
+  assert.notEqual(replacement.ino, old.ino);
+  let hiddenStats = 0;
+  const listing = codexModule.codexSessionFiles;
+  const listingSpy = vi
+    .spyOn(codexModule, 'codexSessionFiles')
+    .mockImplementation((root, dirs, metaOf, statOf, ...rest) =>
+      listing(
+        root,
+        dirs,
+        metaOf,
+        (listedFile) => {
+          if (listedFile === competingFile && hidden) hiddenStats++;
+          return statOf!(listedFile);
+        },
+        ...rest,
+      ),
+    );
+  if (hidden) {
+    const opening = codexModule.readQualifiedCodexOpening(competingFile);
+    assert.ok(opening);
+    assert.equal(codexModule.isHiddenThread(opening.value), true);
+    assert.deepEqual(opening.revision, replacement);
+    assert.ok(supportedFileIdentity(opening.revision));
+  }
+  if (recovery === 'hidden new collision') {
+    provider.sessionRows.push({ id: 'replacement', label: 'Third session', agentKey: 'claude' });
+    const directory = path.join(projects, renameTranscripts.projectSlug(workspace));
+    fs.mkdirSync(directory, { recursive: true });
+    fs.writeFileSync(
+      path.join(directory, 'replacement.jsonl'),
+      JSON.stringify({ type: 'user', cwd: workspace }) + '\n',
+    );
+  }
+  let refusal: ReturnType<typeof vi.spyOn> | undefined;
+  let hiddenPositive: ReturnType<typeof codexModule.readCodexSessionMeta> = null;
+  if (recovery === 'cached hidden refusal') {
+    // Establish readable hidden metadata without resolving the retained physical collision.
+    provider.codexMetas.load([[competingFile, codexModule.readCodexSessionMeta(competingFile)!]]);
+    hiddenPositive = provider.codexMetas.get(competingFile);
+    fs.renameSync(competingFile, competingFile + '.hidden-retired');
+    write(competitor, true, worktree, id);
+    assert.notEqual(revisionOf(fs.statSync(competingFile, { bigint: true })).ino, replacement.ino);
+    const mutableFs = createRequire(__filename)('node:fs') as typeof fs;
+    const original = mutableFs.openSync;
+    refusal = vi.spyOn(mutableFs, 'openSync').mockImplementation((...args: any[]) => {
+      if (args[0] === competingFile) throw Object.assign(new Error('unread replacement'), { code: 'EACCES' });
+      return (original as any)(...args);
+    });
+    syncBuiltinESMExports();
+  }
+  const currentRevision = revisionOf(fs.statSync(competingFile, { bigint: true }));
+  const positiveAnswers: { cwd: string | null; sessionId?: string | null }[] = [];
+  try {
+    for (let pass = 0; pass < 4; pass++) {
+      const recovered = provider.allSessions();
+      provider.authoritativeCatalog = provider.acceptSessionCoverage(recovered, scope);
+      provider.authoritativeCatalogScope = scope;
+      assert.deepEqual(provider.repositoryScopeRoots, roots);
+      assert.deepEqual(revisionOf(fs.statSync(competingFile, { bigint: true })), currentRevision);
+      assert.equal(provider.enumeratedAmbiguousIds.has(id), denied, `walk ${pass} restored old-ID ambiguity`);
+      assert.equal(provider.membershipOf(id), denied ? 'unknown' : 'present');
+      if (denied) assert.equal(provider.stateFor(id), null, 'hidden competition restored recorded access');
+      else assert.ok(provider.stateFor(id), 'qualified recovery lost recorded access');
+      checkReader();
+      assert.ok(provider.sourceEnumerations[competitor].files.includes(competingFile));
+      assert.ok(
+        recovered.some((source: any) => source.file === file),
+        'the surviving source disappeared',
+      );
+      if (hidden) {
+        assert.equal(
+          recovered.some((source: any) => source.file === competingFile),
+          false,
+        );
+        assert.equal(hiddenStats, 0, 'hidden opening requested a listing stat');
+      }
+      if (recovery === 'hidden new collision') {
+        assert.equal(
+          provider.enumeratedAmbiguousIds.has('replacement'),
+          true,
+          'hidden replacement lost its new-ID competition',
+        );
+        assert.equal(provider.stateFor('replacement'), null);
+        assert.equal(provider.membershipOf('replacement'), 'unknown');
+      }
+      if (recovery === 'cached hidden refusal') {
+        assert.equal(
+          provider.codexMetas.get(competingFile),
+          hiddenPositive,
+          'refused qualification replaced the historical positive',
+        );
+        assert.equal(codexModule.isHiddenThread(provider.codexMetas.get(competingFile)), true);
+      } else {
+        const cached =
+          competitor === 'claude' ? provider.cwds.get(competingFile) : provider.codexMetas.get(competingFile);
+        positiveAnswers.push(cached);
+      }
+      if (recovery === 'visible changed ID') {
+        const row = recovered.find((source: any) => source.file === competingFile);
+        assert.deepEqual(revisionOf(row), currentRevision, 'unchanged replacement reused its retired inode');
+      }
+      assert.equal(provider.codexStats.get(unrelated), unrelatedStat, 'unrelated held stat lost ordinary reuse');
+      assert.equal(reads.get(unrelated), 1);
+    }
+    for (const cached of positiveAnswers) {
+      assert.equal(cached.cwd, nextCwd, 'qualified cwd did not replace the historical positive');
+      if (competitor === 'codex') assert.equal(cached.sessionId, nextId);
+    }
+    if (!denied) {
+      const sent: any[] = [];
+      const host = { webview: {} };
+      provider.hosts = [host];
+      provider.hostSessions = new Map([[host, id]]);
+      delete provider.assets[id];
+      delete provider.draftCommentIds[id];
+      provider.onSendPrompt = async (agent: string, session: string, cwd: string, going: any) => {
+        sent.push({ agent, session, cwd, text: going.text });
+        return { delivered: true };
+      };
+      await provider.acceptSubmission('Continue', id, 1, id, host);
+      assert.deepEqual(sent, [{ agent: owner, session: id, cwd: workspace, text: 'Continue' }]);
+    }
+  } finally {
+    listingSpy.mockRestore();
+    refusal?.mockRestore();
+    syncBuiltinESMExports();
+  }
+});
+
+test.each([false, true])(
+  'fresh source collisions retain pending recovery and block recorded composer access before publication: admitted %s',
+  async (admitted) => {
+    const enumeration = methodBody('private allSessions(');
+    const quarantineSource = ts.transpileModule(
+      `function quarantine(claude, codex, scope, sourceObservations = []) { const physicalContext = { domain: "physical", scope: JSON.stringify(scope.roots), revision: String(this.coverageRevision) }; const walkedSessions = [...claude, ...codex]; ${enumeration.slice(enumeration.indexOf('this.enumeratedMembers ='), enumeration.indexOf('this.catalog = { folders: folderPrint', enumeration.indexOf('this.enumeratedMembers =')))} }`,
+      { compilerOptions: { target: ts.ScriptTarget.ES2022 } },
+    ).outputText;
+    const quarantine = new Function(
+      'sessionPageSources',
+      'sessionCoverageMember',
+      'sessionCatalogMembership',
+      'reconcileSessionCollisions',
+      quarantineSource + '\nreturn quarantine;',
+    )(sessionPageSources, sessionCoverageMember, sessionCatalogMembership, reconcileSessionCollisions);
+    const refresh = methodBody('async refresh(');
+    const acknowledgmentSource = ts.transpileModule(
+      `function acknowledge() { ${refresh.slice(refresh.indexOf('for (const session of Object.keys(this.awaitingSessionRecords))'), refresh.indexOf('const scopedDrafts ='))} }`,
+      { compilerOptions: { target: ts.ScriptTarget.ES2022 } },
+    ).outputText;
+    const acknowledge = new Function('pendingResponseSessionAdmitted', acknowledgmentSource + '\nreturn acknowledge;')(
+      pendingResponseSessionAdmitted,
+    );
+    const root = tempDir('membership-collision-');
+    const initialSource = {
+      agent: 'claude' as const,
+      sessionId: 'collision',
+      file: path.join(root, 'one.jsonl'),
+      cwd: root,
+      size: 1,
+      mtimeMs: 1,
+      dev: 1,
+      ino: 1,
+    };
+    const scope = JSON.stringify([root]);
+    for (const ownerAgent of ['claude', 'codex'] as const)
+      for (const agent of ['claude', 'codex'] as const) {
+        const source = { ...initialSource, agent: ownerAgent };
+        const pending = {
+          sessionId: source.sessionId,
+          agent: source.agent,
+          cwd: root,
+        };
+        const { provider } = queueRecoveryProvider();
+        const host = { webview: {} };
+        Object.assign(provider, {
+          repositoryScopeReady: true,
+          repositoryScopeRoots: [root],
+          authoritativeCatalogScope: scope,
+          authoritativeCatalog: admitted ? [source] : [],
+          sourceEnumerations: {
+            claude: { status: 'complete', root, directories: [root], files: [], uncertain: [] },
+            codex: { status: 'complete', root, directories: [root], files: [], uncertain: [] },
+          },
+          enumeratedAdmissionComplete: true,
+          hosts: [host],
+          hostSessions: new Map([[host, source.sessionId]]),
+          folders: () => [root],
+          coverageRevision: 1,
+          membershipCoverage: {
+            domain: 'admitted',
+            scope,
+            revision: '1',
+            status: 'complete',
+            files: admitted ? [source.file] : [],
+            uncertain: [],
+            members: new Set(admitted ? [sessionCoverageMember(source)] : []),
+          },
+          newDrafts: {},
+          awaitingSessionRecords: { collision: pending },
+          sessionRows: [
+            {
+              id: source.sessionId,
+              label: 'Recorded session',
+              agentKey: source.agent,
+            },
+          ],
+        });
+        assert.equal(provider.membershipOf(source.sessionId), admitted ? 'present' : 'absent');
+        assert.ok(provider.stateFor(source.sessionId));
+        const collision = {
+          ...source,
+          agent,
+          file: path.join(root, 'competitor', 'two.jsonl'),
+          ino: 2,
+        };
+        quarantine.call(
+          provider,
+          [source, collision].filter((entry) => entry.agent === 'claude'),
+          [source, collision].filter((entry) => entry.agent === 'codex'),
+          { roots: [root] },
+        );
+        assert.equal(provider.membershipOf(source.sessionId), 'unknown');
+        assert.equal(provider.stateFor(source.sessionId), null);
+        for (const followup of ['incomplete', 'unavailable', 'unvisited', 'unread opening'] as const) {
+          provider.sourceEnumerations.claude = {
+            status: 'complete',
+            root,
+            directories: [root],
+            files: ownerAgent === 'claude' ? [source.file] : [],
+            uncertain: [],
+          };
+          provider.sourceEnumerations.codex = {
+            status: 'complete',
+            root,
+            directories: [root],
+            files: ownerAgent === 'codex' ? [source.file] : [],
+            uncertain: [],
+          };
+          const enumeration = provider.sourceEnumerations[agent];
+          if (followup === 'incomplete') {
+            enumeration.status = 'incomplete';
+            enumeration.uncertain = [path.dirname(collision.file)];
+          } else if (followup === 'unavailable') enumeration.status = 'unavailable';
+          else if (followup === 'unread opening') {
+            enumeration.files.push(collision.file);
+            enumeration.directories.push(path.dirname(collision.file));
+          }
+          provider.enumeratedAdmissionComplete = followup === 'unvisited';
+          quarantine.call(provider, ownerAgent === 'claude' ? [source] : [], ownerAgent === 'codex' ? [source] : [], {
+            roots: [root],
+          });
+          assert.equal(provider.membershipOf(source.sessionId), 'unknown', followup);
+          assert.equal(provider.stateFor(source.sessionId), null, followup + ' restored recorded delivery');
+          assert.equal(provider.readerWork(source.sessionId), 'unknown', followup + ' released deferred compaction');
+        }
+        const controls: string[] = [];
+        provider.cancelClearSettlement = () => {};
+        provider.onStopTurn = (providerAgent: string, session: string) =>
+          controls.push(`stop:${providerAgent}:${session}`);
+        provider.onAnswerAsk = (session: string) => {
+          controls.push(`answer:${session}`);
+          return true;
+        };
+        new Function('msg', 'host', handlerBody(panelHostSource, 'stopTurn')).call(
+          provider,
+          { session: source.sessionId },
+          { webview: {} },
+        );
+        new Function('msg', handlerBody(panelHostSource, 'answerAsk')).call(provider, {
+          session: source.sessionId,
+          id: 'ask',
+          answer: 'yes',
+        });
+        assert.deepEqual(controls, [`stop:${ownerAgent}:collision`, 'answer:collision']);
+        acknowledge.call(provider);
+        assert.equal(provider.awaitingSessionRecords.collision, pending);
+        assert.deepEqual(provider.authoritativeCatalog, admitted ? [source] : []);
+        provider.running.clear();
+        provider.newestBySession.clear();
+        const sent: string[] = [];
+        provider.onSendPrompt = async () => {
+          sent.push(source.sessionId);
+          return { delivered: true };
+        };
+        const text = 'Continue after the child exits';
+        await provider.acceptSubmission(text, source.sessionId, 1, source.sessionId, host, {
+          id: `collision-${agent}-${admitted}`,
+          order: 1,
+          source: source.sessionId,
+          revision: 1,
+          text,
+        });
+        provider.queues[source.sessionId] = queueSubmissionAfter([], 'collision-queued', text, [], [], 1, false, {
+          agent: source.agent,
+          owner: source.sessionId,
+        });
+        provider.flushQueue(source.sessionId);
+        assert.deepEqual(sent, []);
+        assert.equal(provider.readerWork(source.sessionId), 'unknown');
+        assert.equal(provider.awaitingSessionRecords.collision, pending);
+        provider.sourceEnumerations[agent] = {
+          status: 'complete',
+          root,
+          directories: [root, path.dirname(collision.file)],
+          files: ownerAgent === agent ? [source.file] : [],
+          uncertain: [],
+        };
+        provider.enumeratedAdmissionComplete = true;
+        quarantine.call(
+          provider,
+          ownerAgent === 'claude' ? [{ ...source, ino: 0 }] : [],
+          ownerAgent === 'codex' ? [{ ...source, ino: 0 }] : [],
+          { roots: [root] },
+        );
+        assert.equal(
+          provider.stateFor(source.sessionId),
+          null,
+          'unsupported surviving identity released recorded delivery',
+        );
+        quarantine.call(provider, ownerAgent === 'claude' ? [source] : [], ownerAgent === 'codex' ? [source] : [], {
+          roots: [root],
+        });
+        assert.equal(
+          provider.stateFor(source.sessionId),
+          null,
+          'unqualified surviving source restored recorded access',
+        );
+        quarantine.call(
+          provider,
+          ownerAgent === 'claude' ? [source] : [],
+          ownerAgent === 'codex' ? [source] : [],
+          {
+            roots: [root],
+          },
+          [{ scope, revision: '1', source, excluded: false }],
+        );
+        assert.equal(
+          provider.enumeratedAmbiguousIds.size,
+          0,
+          'visited competitor directory did not establish recovery',
+        );
+        provider.authoritativeCatalog = provider.acceptSessionCoverage([source], scope);
+        assert.equal(provider.membershipOf(source.sessionId), 'present');
+        assert.ok(provider.stateFor(source.sessionId));
+        delete provider.queues[source.sessionId];
+        await provider.acceptSubmission(text, source.sessionId, 2, source.sessionId, host, {
+          id: `healthy-${agent}-${admitted}`,
+          order: 2,
+          source: source.sessionId,
+          revision: 2,
+          text,
+        });
+        assert.deepEqual(sent, [source.sessionId], 'the awaiting fixture never reached ordinary delivery');
+        for (const recovery of ['replacement', 'scope exclusion', 'scope change'] as const) {
+          provider.awaitingSessionRecords[source.sessionId] = pending;
+          quarantine.call(
+            provider,
+            [source, collision].filter((entry) => entry.agent === 'claude'),
+            [source, collision].filter((entry) => entry.agent === 'codex'),
+            { roots: [root] },
+          );
+          assert.equal(provider.stateFor(source.sessionId), null, recovery);
+          provider.sourceEnumerations[agent] = {
+            status: 'incomplete',
+            root,
+            directories: [root],
+            files: [collision.file],
+            uncertain: [],
+          };
+          let observations: any[] = [];
+          let current = [source];
+          let roots = [root];
+          if (recovery === 'replacement') current.push({ ...collision, sessionId: 'replacement', ino: 3 });
+          else if (recovery === 'scope exclusion')
+            observations.push({
+              scope,
+              revision: String(provider.coverageRevision),
+              source: collision,
+              excluded: true,
+            });
+          else {
+            // A changed scope alone leaves the competitor unresolved when its known cwd stays included.
+            roots = [root, path.join(root, 'expanded')];
+            quarantine.call(
+              provider,
+              ownerAgent === 'claude' ? [source] : [],
+              ownerAgent === 'codex' ? [source] : [],
+              { roots },
+              observations,
+            );
+            assert.equal(
+              provider.enumeratedAmbiguousIds.has(source.sessionId),
+              true,
+              'scope change forgot an included competitor',
+            );
+            roots = [path.join(root, 'narrow')];
+            current = [{ ...source, cwd: roots[0] }];
+            quarantine.call(
+              provider,
+              current.filter((entry) => entry.agent === 'claude'),
+              current.filter((entry) => entry.agent === 'codex'),
+              { roots },
+              observations,
+            );
+            assert.equal(provider.enumeratedCollisions.scope, JSON.stringify(roots));
+            assert.equal(
+              provider.enumeratedAmbiguousIds.has(source.sessionId),
+              true,
+              'historical cwd cleared an unread competitor after scope narrowing',
+            );
+            observations.push({
+              scope: JSON.stringify(roots),
+              revision: String(provider.coverageRevision),
+              source: collision,
+              excluded: true,
+            });
+          }
+          quarantine.call(
+            provider,
+            current.filter((entry) => entry.agent === 'claude'),
+            current.filter((entry) => entry.agent === 'codex'),
+            { roots },
+          );
+          assert.equal(provider.stateFor(source.sessionId), null, 'unqualified replacement restored recorded access');
+          if (recovery === 'replacement') {
+            if (!provider.sourceEnumerations[source.agent].files.includes(source.file))
+              provider.sourceEnumerations[source.agent].files.push(source.file);
+            quarantine.call(
+              provider,
+              current.filter((entry) => entry.agent === 'claude'),
+              current.filter((entry) => entry.agent === 'codex'),
+              { roots },
+              [{ scope: JSON.stringify(roots), revision: String(provider.coverageRevision), source, excluded: false }],
+            );
+            assert.equal(
+              provider.enumeratedAmbiguousIds.has(source.sessionId),
+              true,
+              'a cached replacement ID released quarantine',
+            );
+            assert.equal(provider.stateFor(source.sessionId), null, 'a cached replacement ID restored recorded access');
+          }
+          quarantine.call(
+            provider,
+            current.filter((entry) => entry.agent === 'claude'),
+            current.filter((entry) => entry.agent === 'codex'),
+            { roots },
+            [
+              ...observations,
+              ...current.map((source) => {
+                if (!provider.sourceEnumerations[source.agent].files.includes(source.file))
+                  provider.sourceEnumerations[source.agent].files.push(source.file);
+                return {
+                  scope: JSON.stringify(roots),
+                  revision: String(provider.coverageRevision),
+                  source,
+                  excluded: false,
+                };
+              }),
+            ],
+          );
+          assert.equal(
+            provider.enumeratedAmbiguousIds.has(source.sessionId),
+            false,
+            recovery + ' retained qualified collision evidence',
+          );
+        }
+      }
+  },
+);

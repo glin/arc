@@ -515,8 +515,8 @@ export interface CompactHostPort<C extends CompactChild> {
   // Runs work under an activity lease on this exact child. It resolves null without opening a missing child.
   withActivity(child: C, work: (live: C) => Promise<void>): Promise<unknown>;
   // Names queued reader prompts or a clear in progress as pending, and a session outside the panel's scope as absent.
-  // While the repository scope is not ready, every session reads as absent.
-  readerWork(sessionId: string): 'none' | 'pending' | 'absent';
+  // Unavailable membership blocks delivery without cancelling the assignment.
+  readerWork(sessionId: string): 'none' | 'pending' | 'absent' | 'unknown';
 }
 
 interface Submission {
