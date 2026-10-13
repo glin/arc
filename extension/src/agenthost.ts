@@ -1,3 +1,4 @@
+import { refusePolicyChange, claudeAutoMode, type LaunchPolicy } from './launchpolicy';
 import { MEASUREMENT_ENVIRONMENT } from './identity';
 import { unavailableDefaults, type AppliedDefaults } from './view/model-picks';
 import { CONTEXT_FRAME_BYTES, CONTEXT_PREFIX_BYTES, type ContextFrameGate } from './contextframe';
@@ -234,7 +235,7 @@ export interface Driver {
   // Whether the provider positively reported that nothing runs. An absent report is not idle.
   idleEvidence?(): boolean;
   compact(beforeWrite?: () => void): Promise<void>;
-  clear(name?: string): Promise<void>;
+  clear(name?: string, beforeWrite?: () => void, writeAttempted?: () => void): Promise<void>;
   answer(id: string, answer: AskAnswer): boolean;
   interrupt(): Promise<void>;
   sessionId(): string | null;
@@ -286,6 +287,7 @@ export interface Driver {
 
 // What to start, and how to talk to it once it is running.
 export interface AgentPlan {
+  policy?: LaunchPolicy;
   agent: AgentName;
   // The provider session identity supplied by the launch plan. A fresh Codex child receives its identity during opening.
   sessionId: string | null;
@@ -329,14 +331,25 @@ export function codexAskMode(mode: AskMode): {
 
 // Claude Code: one child per session, speaking its stream-json protocol.
 export function claudePlan(launch: Launch, options: SpawnOptions): AgentPlan {
+  options = { ...options };
   return {
+    policy: options.policy,
     agent: 'claude',
     sessionId: options.resume ?? options.sessionId ?? null,
     command: launch.command,
-    args: [...launch.leadingArgs, ...spawnArgs(options)],
+    args: [...launch.leadingArgs, ...spawnArgs(options, { ...process.env, ...launch.env })],
     cwd: options.cwd,
     // The CLI reports when it goes idle only when asked. That report ends prompts that joined a running turn.
-    env: { ...launch.env, CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: '1' },
+    env: {
+      ...launch.env,
+      CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: '1',
+      ...(options.agentRun &&
+      !Object.keys({ ...process.env, ...launch.env }).some(
+        (key) => key.toUpperCase() === 'CLAUDE_CODE_PROMPT_CACHE_TTL',
+      )
+        ? { CLAUDE_CODE_PROMPT_CACHE_TTL: '5m' }
+        : {}),
+    },
     driver(send, emit) {
       // Seed Claude's session identity before the first prompt. A resumed CLI can defer reporting it until output begins.
       const wire = new ClaudeWire({ send, emit, sessionId: options.resume ?? options.sessionId });
@@ -349,7 +362,8 @@ export function claudePlan(launch: Launch, options: SpawnOptions): AgentPlan {
         prompt: async (prompt, guard) => wire.prompt(prompt, guard),
         idleEvidence: () => wire.idleEvidence(),
         compact: async (beforeWrite) => wire.prompt(compactCommand('claude'), undefined, beforeWrite),
-        clear: async () => wire.prompt(clearCommand('claude')),
+        clear: async (_name, beforeWrite, writeAttempted) =>
+          wire.prompt(clearCommand('claude'), undefined, beforeWrite, writeAttempted),
         answer: (id, answer) => wire.answer(id, answer),
         interrupt: () => wire.interrupt(true),
         sessionId: () => wire.sessionId(),
@@ -366,8 +380,17 @@ export function claudePlan(launch: Launch, options: SpawnOptions): AgentPlan {
         async models() {
           return readClaudeModels(await wire.listModels(), Date.now());
         },
-        setAskMode: (mode) => wire.setPermissionMode(claudeAskMode(mode)),
-        setModel: (model) => wire.setModel(model),
+        setAskMode: (mode) =>
+          options.policy
+            ? Promise.reject(new Error('This session keeps its read-only launch permissions.'))
+            : wire.setPermissionMode(claudeAskMode(mode)),
+        setModel: async (model) => {
+          if (options.policy)
+            await wire.setPermissionMode(
+              options.policy.readTools.length || !claudeAutoMode(model) ? 'dontAsk' : 'auto',
+            );
+          await wire.setModel(model);
+        },
         setEffort: (effort) => wire.effortCommand(effort),
         effortStartsTurn: true,
         mcpStatus: () => wire.mcpStatus(),
@@ -403,8 +426,9 @@ export function claudeRenamePlan(launch: Launch, options: SpawnOptions & { resum
   };
 }
 
-// Codex thread-opening settings. Approval policy, approval reviewer, and sandbox must preserve the reader's selected permission mode.
+// Codex thread-opening settings retain immutable launch restrictions or the reader's selected permission mode.
 export interface CodexPlanOptions {
+  policy?: LaunchPolicy;
   cwd: string;
   model?: string;
   effort?: string;
@@ -419,7 +443,12 @@ export interface CodexPlanOptions {
 // Starts one Codex app-server child per session through the resolved launch executable and arguments.
 // Per-session children keep thread ownership in the host's session map.
 export function codexPlan(launch: Launch, options: CodexPlanOptions): AgentPlan {
+  options = {
+    ...options,
+    ...(options.policy ? ({ approvalPolicy: 'never', approvalsReviewer: 'user', sandbox: 'read-only' } as const) : {}),
+  };
   return {
+    policy: options.policy,
     agent: 'codex',
     sessionId: options.resume ?? null,
     command: launch.command,
@@ -436,7 +465,7 @@ export function codexPlan(launch: Launch, options: CodexPlanOptions): AgentPlan 
           if (options.fork) {
             await wire.forkThread(options.fork, options);
           } else if (options.resume) {
-            await wire.resumeThread(options.resume);
+            await wire.resumeThread(options.resume, options.policy ? options : undefined);
           } else await wire.startThread(options);
           // Apply the reader's settings to later turns, including settings for a resumed thread.
           if (options.approvalPolicy && options.approvalsReviewer && options.sandbox) {
@@ -469,6 +498,7 @@ export function codexPlan(launch: Launch, options: CodexPlanOptions): AgentPlan 
         },
         mcpStatus: () => wire.mcpStatus(),
         setAskMode: async (mode) => {
+          if (options.policy) refusePolicyChange();
           const { approvalPolicy, approvalsReviewer, sandbox } = codexAskMode(mode);
           Object.assign(options, { approvalPolicy, approvalsReviewer, sandbox });
           await wire.setApproval(approvalPolicy, sandbox, approvalsReviewer);
@@ -764,6 +794,7 @@ export class AgentSession {
   readonly key: string;
   readonly agent: AgentName;
   readonly cwd: string;
+  readonly policy: LaunchPolicy | undefined;
   readonly driver: Driver;
 
   private readonly child: ChildLike;
@@ -831,6 +862,7 @@ export class AgentSession {
     this.key = key;
     this.agent = plan.agent;
     this.cwd = plan.cwd;
+    this.policy = plan.policy;
     this.driver = plan.driver(
       (line) => this.child.stdin.write(line),
       (event) => this.handle(event),
@@ -1114,7 +1146,7 @@ export class AgentSession {
     }
   }
 
-  async clear(name: string = ''): Promise<number> {
+  async clear(name: string = '', beforeWrite?: () => void, writeAttempted?: () => void): Promise<number> {
     if (this.exited) {
       this.lastError = this.lastError ?? 'the agent is no longer running, so the session was not cleared';
       this.changed();
@@ -1128,7 +1160,7 @@ export class AgentSession {
     this.busy = true;
     this.changed();
     try {
-      await this.driver.clear(name);
+      await this.driver.clear(name, beforeWrite, writeAttempted);
       if (this.agent === 'codex') {
         this.preparingTurns.delete(submitted);
         this.busy = false;
@@ -1158,6 +1190,7 @@ export class AgentSession {
   }
 
   answer(id: string, answer: AskAnswer): boolean {
+    if (this.policy && this.asks.get(id)?.kind === 'permission' && answer.decision === 'allow') return false;
     // Before the ask leaves, so the session never reads idle while the answer is sent.
     const outlived = answer.decision === 'answer' && (this.driver.outlivesTurn?.(id) ?? false);
     if (outlived) {
@@ -1435,6 +1468,7 @@ export class AgentSession {
   }
 
   private handle(event: WireEvent): void {
+    if (this.exited) return;
     if (event.kind === 'responseStarted') {
       if (
         this.agent === 'claude' &&

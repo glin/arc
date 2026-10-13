@@ -1436,7 +1436,11 @@ export function handoffRefusalMessage(refusal: HandoffRefusal, sending: boolean)
   return messages[refusal];
 }
 
+import type { LaunchPolicy } from './launchpolicy';
+
 export interface NewSessionDraft {
+  policy?: LaunchPolicy;
+  agentRun?: boolean;
   draftId: string;
   cwd: string;
   sourceSession: string | null;

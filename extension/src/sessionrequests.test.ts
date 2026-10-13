@@ -4085,9 +4085,22 @@ test('session reads and guarded starts carry the requester provider only to a wi
     // A window that predates the field refuses it, so the CLI omits it there and refuses send before connecting.
     const registration = path.join(home, 'hosts', `${channel.hostId}.json`);
     const listed = JSON.parse(fs.readFileSync(registration, 'utf8'));
-    assert.deepEqual(listed.capabilities, ['requesterProvider', 'sessionQuery', 'sessionQueryShorthandV1']);
+    assert.deepEqual(listed.capabilities, [
+      'requesterProvider',
+      'sessionQuery',
+      'sessionQueryShorthandV1',
+      'launchPolicy',
+    ]);
     delete listed.capabilities;
     fs.writeFileSync(registration, JSON.stringify(listed));
+    for (const extra of [{ readOnly: true }, { cwd: home }, { readOnly: true, readTools: ['mcp__server__read'] }]) {
+      const before = seen.length;
+      await assert.rejects(
+        requestWindow('start', { ...start, ...extra }, channel.hostId, home),
+        /does not support read-only starts/,
+      );
+      assert.equal(seen.length, before, 'unsupported launch permissions reached an older window');
+    }
     await requestWindow('start', start, channel.hostId, home, `${channel.hostId}:old`, true);
     assert.equal('requesterProvider' in seen.at(-1), false);
     await assert.rejects(

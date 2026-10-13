@@ -290,6 +290,34 @@ test('bundled management commands carry reader-default classification, prompt fi
     assert.equal(requests.at(-1).params.dryRun, true);
     await run(process.execPath, [cli, 'archive', 'accepted', '--force'], { env });
     assert.equal(requests.at(-1).params.force, true);
+    for (const cwd of [home, process.cwd()]) {
+      await run(
+        process.execPath,
+        [cli, 'start', '--provider', 'codex', '--prompt-file', prompt, '--read-only', '--cwd', '.'],
+        { env, cwd },
+      );
+      assert.equal(requests.at(-1).params.cwd, cwd);
+      assert.equal(requests.at(-1).params.readOnly, true);
+      assert.equal(requests.at(-1).params.agentRun, false);
+    }
+    await run(
+      process.execPath,
+      [
+        cli,
+        'start',
+        '--provider',
+        'claude',
+        '--prompt-file',
+        prompt,
+        '--read-only',
+        '--read-tool',
+        'mcp__server__read',
+        '--read-tool',
+        'mcp__server__list',
+      ],
+      { env },
+    );
+    assert.deepEqual(requests.at(-1).params.readTools, ['mcp__server__read', 'mcp__server__list']);
     const before = requests.length;
     for (const flags of [
       ['--agent-run', '--agent-run'],
@@ -301,6 +329,9 @@ test('bundled management commands carry reader-default classification, prompt fi
       ['--agent-run=True'],
       ['--agent-run', 'false'],
       ['--untagged'],
+      ['--read-only', '--permissions', 'danger-full-access'],
+      ['--read-only', '--read-tool', 'mcp__server__read'],
+      ['--read-tool', 'mcp__server__read'],
     ]) {
       await assert.rejects(
         run(process.execPath, [cli, 'start', '--provider', 'codex', '--prompt-file', prompt, ...flags], { env }),

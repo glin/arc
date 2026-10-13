@@ -7,6 +7,8 @@ import {
   type SessionCoverage,
   type SourceEnumeration,
 } from './sessioncoverage';
+import { launchPolicy } from './launchpolicy';
+import { scopedLaunchCwd } from './repositoryscope';
 import { SessionFilterRequests, FILTER_LIMITS, type FilterOperation } from './sessionfilter';
 import {
   listingQueryError,
@@ -2271,13 +2273,18 @@ export class PanelProvider implements vscode.Disposable {
     if (!profile || this.pendingModels.includes(profile.agent))
       throw new Error('The requested setup is unavailable or its model catalog is still loading.');
     if (!this.onSendDraftPrompt || !this.memento) throw new Error('Session delivery or saving is unavailable.');
-    const draft = newSessionDraft(
-      `${DRAFT_SESSION_PREFIX}${crypto.randomUUID()}`,
-      folders[0],
-      null,
-      Date.now(),
-      profile,
-    );
+    const policy = launchPolicy(profile.agent, params.readOnly === true, params.readTools, profile.permissionMode);
+    const draft = {
+      ...newSessionDraft(
+        `${DRAFT_SESSION_PREFIX}${crypto.randomUUID()}`,
+        scopedLaunchCwd(params.cwd, folders, scope.roots),
+        null,
+        Date.now(),
+        profile,
+      ),
+      policy,
+      agentRun: params.agentRun,
+    };
     const delivery = await this.onSendDraftPrompt(draft, { text, assets: [] }, undefined, guardedStartContext(request));
     if (!delivery.delivered || !delivery.session)
       return { version: 1, status: 'refused', reason: delivery.reason, requester: request.requester };
@@ -2332,6 +2339,10 @@ export class PanelProvider implements vscode.Disposable {
       requester: request.requester,
       errors,
     };
+  }
+
+  public isAgentRunLaunch(session: string): boolean {
+    return this.saved.agentRuns?.includes(session) === true;
   }
 
   private async curateSessionRequest(request: import('./sessionrequests').SessionRequest): Promise<unknown> {
@@ -5236,6 +5247,11 @@ export class PanelProvider implements vscode.Disposable {
       cwd,
     };
     this.rememberStarted(successor);
+    if (this.isAgentRunLaunch?.(source)) {
+      this.startedHere.delete(successor);
+      this.saved.started = [...this.startedHere].slice(-SESSION_LIMIT);
+      this.saved.agentRuns = [...new Set([...(this.saved.agentRuns ?? []), successor])].slice(-SESSION_LIMIT);
+    }
     // Copy labels to the successor. Refresh the source's insertion order first so capacity eviction does not remove it.
     const labels = labelsOf(this.saved.labels, source);
     if (labels.length) {

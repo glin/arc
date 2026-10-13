@@ -278,6 +278,18 @@ export const COMMANDS: readonly Command[] = [
         ['--effort EFFORT', 'Choose supported effort with --provider. Omission retains the provider default.'],
         ['--permissions MODE', 'Choose supported permissions with --provider. Omission retains the provider default.'],
         [
+          '--read-only',
+          'Keep immutable launch restrictions. Codex denies filesystem writes. Claude restricts tools and git commands but can approve shell writes. See docs/agent-protocols.md#hosted-read-only-launches.',
+        ],
+        [
+          '--cwd DIR',
+          'Use an existing folder in the selected window\u2019s open project or registered worktrees. Default: first window folder.',
+        ],
+        [
+          '--read-tool EXACT_MCP_TOOL',
+          'Allow this exact MCP tool with Claude --read-only. Repeat for more tools. Both shells stay denied.',
+        ],
+        [
           '--agent-run[=true|false]',
           'Omitted or false keeps reader ownership and Prompt box continuation. Bare or true files delegated work under Run by agents.',
         ],
@@ -301,6 +313,7 @@ export const COMMANDS: readonly Command[] = [
         '--setup cannot combine with explicit provider, model, effort, or permissions.',
         'Empty prompts, slash commands, oversized files or encoded requests, and unsupported setups refuse launch.',
         'A guarded start refuses ambiguous native requester identity.',
+        'Read-only starts refuse permission overrides. MCP read tools require Claude read-only and exact names.',
         windowRefusal,
       ],
       example: 'arc start --setup SETUP_KEY --prompt-file prompt.txt --name Review --arc-dispatch --window WINDOW_ID',

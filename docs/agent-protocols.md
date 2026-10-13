@@ -195,7 +195,7 @@ Arc starts each installed CLI as a child process and communicates over its headl
 claude -p --verbose --input-format stream-json --output-format stream-json --permission-prompt-tool stdio --include-partial-messages
 ```
 
-`spawnArgs` in `claudewire.ts` adds `--model`, `--effort`, and `--permission-mode` from the reader's accepted settings. The host adds `--resume <id>` for an existing session or `--session-id <id>` for a new one. It adds `--no-session-persistence` for a temporary child and `--settings <path>` when a launch supplies a settings file.
+`spawnArgs` in `claudewire.ts` adds `--model` and `--effort` from the reader's accepted settings. Unrestricted launches also add the reader-selected `--permission-mode`. The host adds `--resume <id>` for an existing session or `--session-id <id>` for a new one. It adds `--no-session-persistence` for a temporary child. Unrestricted launches add `--settings <path>` when a launch supplies a settings file.
 
 The following flags provide stream framing, permission requests, and partial response text:
 
@@ -228,6 +228,106 @@ codex app-server
 ```
 
 Codex uses JSON-RPC 2.0 over stdio, with one object per line and no `jsonrpc` field. Protocol requests carry operations instead of command-line flags. The official Codex editor extension uses this experimental protocol.
+
+## Hosted read-only launches
+
+`launchpolicy.ts` supplies immutable launch restrictions. `launchpolicystore.ts` retains one policy per session in shared Arc storage, independently of workspace settings. Editor windows using the same Arc home share restrictions. Lookup and atomic writes address one hashed session path without scanning other policies. Restrictions have no eviction rule. Unreadable saved restrictions block continuation. Live child restrictions apply during opening, before persistence. Successor identity events save the policy before moving panel ownership. Clear and fork retain it. Replacement children receive it before input. Agent-wide permission picks refuse before changing defaults or retiring a restricted child, and identify the child that blocks the change.
+
+Codex opens, resumes, and forks threads with approval policy `never`, reviewer `user`, and sandbox `read-only`. Every turn carries the same approval fields and a `readOnly` sandbox policy. Clear opens another restricted thread. Provider rejection prevents input. The sandbox denies filesystem writes. It does not establish denial of external MCP effects.
+
+Claude disables permission prompts and clears user, project, and local setting sources. Launch settings set `disableAllHooks`. MCP configuration stays isolated. Read, Grep, and Glob receive allow rules. Both modes deny these tools:
+
+```text
+Edit
+Write
+NotebookEdit
+MultiEdit
+WebFetch
+WebSearch
+Task
+Agent
+CronCreate
+CronDelete
+DesignSync
+EnterWorktree
+ExitWorktree
+PushNotification
+RemoteTrigger
+ScheduleWakeup
+SendMessage
+ShareOnboardingGuide
+TaskStop
+```
+
+Plain read-only launches also deny PowerShell. Bash uses auto mode for supported models and `dontAsk` for older models. The auto classifier can approve shell writes, so these restrictions do not guarantee filesystem immutability. Bash denies each git verb below, with and without arguments. Each rule also covers an optional `-C` directory.
+
+```text
+add
+am
+apply
+archive
+bisect
+bundle
+checkout
+checkout-index
+cherry-pick
+clean
+clone
+commit
+commit-tree
+config
+credential
+fast-import
+fetch
+filter-branch
+format-patch
+gc
+hash-object
+init
+maintenance
+merge
+merge-file
+mergetool
+mktag
+mktree
+mv
+pack-refs
+prune
+pull
+push
+read-tree
+rebase
+reflog delete
+reflog expire
+repack
+replace
+rerere
+reset
+restore
+revert
+rm
+sparse-checkout
+stash
+submodule
+switch
+symbolic-ref
+update-index
+update-ref
+worktree add
+worktree lock
+worktree move
+worktree prune
+worktree remove
+worktree repair
+worktree unlock
+write-tree
+```
+
+Rules also deny branch, notes, remote, and tag with arguments, including an optional `-C` directory. They deny git commands containing `--output`.
+
+Exact MCP launches use `dontAsk` and deny Bash and PowerShell. Each requested name identifies one tool without wildcards. Arc copies requested server definitions from Claude's user, project, and local MCP configurations into an isolated launch configuration. Local definitions take precedence over project definitions, then user definitions. Arc reads project `.mcp.json` at the enclosing Git root or the launch directory outside Git. User and local definitions come from `~/.claude.json`, or `.claude.json` under `CLAUDE_CONFIG_DIR`. Each selected configuration file has a four MiB limit. An oversized project `.mcp.json` or user/local `.claude.json` prevents launch. Missing requested definitions prevent launch. Inherited user, project, and local permission grants and hooks do not enter this configuration. Plugin servers and claude.ai connectors do not enter it.
+
+Delegated Claude launches default to a five-minute prompt-cache lifetime. Explicit environment values retain precedence. Ordinary reader launches retain the provider cache default.
 
 ## Runtime constraints
 

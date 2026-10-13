@@ -1,3 +1,5 @@
+import { type LaunchPolicy, refusePolicyChange } from './launchpolicy';
+import { LaunchPolicyStore } from './launchpolicystore';
 import { MEASUREMENT_ENVIRONMENT } from './identity';
 import { askIdleDefaults } from './agenthost';
 import type { HostedSessionObservation } from './sessionreads';
@@ -167,6 +169,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       },
     });
   const root = storeRoot();
+  const policies = new LaunchPolicyStore(path.join(arcHome(), 'launch-policies'));
+  const policyMoves = new Map<string, { source: string; successor: string }>();
+  const savePolicy = async (id: string, policy?: LaunchPolicy) => {
+    if (policy) policies.write(id, policy);
+  };
   const workspaceFolders = (vscode.workspace.workspaceFolders ?? []).map((folder) => folder.uri.fsPath);
   const workspaceIdentity = normalizedWorkspaceIdentity(
     workspaceFolders,
@@ -465,11 +472,58 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           panel.setSkills(skillLists);
         }
       }
+      if (event.kind === 'session') {
+        const policy = host.get(key)?.policy ?? (event.previous ? policies.readSaved(event.previous) : undefined);
+        const moved = policyMoves.get(key);
+        if (moved?.successor === event.previous) policyMoves.set(key, { ...moved, successor: event.sessionId });
+        if (policy) {
+          try {
+            policies.write(event.sessionId, policy);
+          } catch (error) {
+            if (agent !== 'claude') throw error;
+            if (event.previous)
+              policyMoves.set(key, {
+                source: moved?.successor === event.previous ? moved.source : event.previous,
+                successor: event.sessionId,
+              });
+            void vscode.window.showErrorMessage(
+              `Arc: Session ${event.sessionId} did not save its read-only permissions. ${(error as Error).message}`,
+            );
+            return;
+          }
+        }
+      }
+      if (event.kind === 'sessionInitialized') {
+        const policy = host.get(key)?.policy;
+        if (policy) {
+          try {
+            if (!event.changed) policies.write(event.sessionId, policy);
+            if (policies.confirmClear(key, event.sessionId)) {
+              const moved = policyMoves.get(key);
+              policyMoves.delete(key);
+              if (moved?.successor === event.sessionId) {
+                compaction?.sessionMoved(moved.source);
+                panel.noteSessionMoved(
+                  moved.source,
+                  event.sessionId,
+                  agent ?? 'claude',
+                  host.get(key)?.state().cwd ?? null,
+                );
+              }
+            }
+          } catch (error) {
+            void vscode.window.showErrorMessage(
+              `Arc: Session ${event.sessionId} did not save its read-only permissions. ${(error as Error).message}`,
+            );
+            return;
+          }
+        }
+      }
       // Publish busy children by session ID. Exclude unnamed children so Stop never targets an unidentified session.
       publishHostedSessions();
       // Move panel ownership when the child reports a successor session. `/clear` leaves the previous transcript on disk.
       // Use the session event's ID. The earlier reset message names a different ID from the successor transcript.
-      if (event.kind === 'session' && event.previous && event.previous !== event.sessionId) {
+      if (event.kind === 'session' && event.previous && event.previous !== event.sessionId && !policyMoves.has(key)) {
         compaction?.sessionMoved(event.previous);
         panel.noteSessionMoved(event.previous, event.sessionId, agent ?? 'claude', host.get(key)?.state().cwd ?? null);
       }
@@ -512,6 +566,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       void panel.refresh();
     },
     onStateChange: (state) => {
+      if (state.exited) {
+        policyMoves.delete(state.key);
+        policies.forgetClear(state.key);
+      }
       if (state.exited) compaction?.childGone(state.key);
       else if (!state.busy && state.sessionId) void compaction?.drain(state.sessionId);
       if (commandStateChanges.delete(state.key)) {
@@ -792,13 +850,20 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // Store each accepted value so a retired session resumes with the same configuration.
   const setAskModeFor = async (agent: AgentName, mode: AskMode, session?: string): Promise<void> => {
     const liveTargets = host.states().filter((state) => state.agent === agent && !state.exited);
-    // The pick changes every live session of this agent, so each one counts as a reader action.
-    // It also changes how each guarded worker runs, so earlier follow-up observations of them go stale.
-    for (const state of liveTargets)
-      if (state.sessionId) {
-        compaction?.readerAction(state.sessionId);
-        guardedSends.invalidate(state.sessionId);
-      }
+    const checkPolicies = () => {
+      if (session && policies.readSaved(session)) refusePolicyChange(session);
+      for (const state of host.states().filter((state) => state.agent === agent && !state.exited))
+        if (host.get(state.key)?.policy || (state.sessionId && policies.readSaved(state.sessionId)))
+          refusePolicyChange(state.sessionId ?? state.key);
+    };
+    checkPolicies();
+    const invalidateTargets = () => {
+      for (const state of liveTargets)
+        if (state.sessionId) {
+          compaction?.readerAction(state.sessionId);
+          guardedSends.invalidate(state.sessionId);
+        }
+    };
     const applyMode = async (sessions: ReadonlyMap<string, AgentSession>): Promise<boolean> => {
       const targets = liveTargets.map((state) => ({
         session: state.sessionId,
@@ -830,6 +895,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       accepted = await host.withRetiringActivities(
         liveTargets.map((state) => state.key),
         async () => {
+          checkPolicies();
+          invalidateTargets();
           const sessionIds = new Set(liveTargets.map((state) => state.sessionId).filter((id) => id !== null));
           if (session) {
             sessionIds.add(session);
@@ -852,6 +919,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       accepted = await host.withActivities(
         liveTargets.map((state) => state.key),
         async (sessions) => {
+          checkPolicies();
+          invalidateTargets();
           await context.workspaceState.update(ASK_MODE_KEY, { ...stored(ASK_MODE_KEY), [agent]: mode.value });
           return await applyMode(sessions);
         },
@@ -1589,13 +1658,32 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   };
   panel.onClear = async (agent, session, cwd, name) => {
     try {
-      const result = await withExistingSessionActivity(agent as AgentName, session, cwd, async (live) => ({
-        turnId: await live.clear(name),
-        session: live.state().sessionId,
-      }));
+      const result = await withExistingSessionActivity(agent as AgentName, session, cwd, async (live) => {
+        const policy = live.policy ?? policies.readSaved(session);
+        let token: string | undefined;
+        let attempted = false;
+        try {
+          const turnId = await live.clear(
+            name,
+            agent === 'claude' && policy
+              ? () => {
+                  token = policies.prepareClear(live.key, session);
+                }
+              : undefined,
+            () => {
+              attempted = true;
+            },
+          );
+          return { turnId, session: live.state().sessionId, policy };
+        } catch (error) {
+          if (token && !attempted) policies.cancelClear(live.key, token);
+          throw error;
+        }
+      });
       if (!result || !result.session) {
         return { delivered: false, reason: 'No agent session could be opened for clearing.' };
       }
+      await savePolicy(result.session, result.policy);
       void panel.refresh();
       return { delivered: true, reason: '', turnId: result.turnId, session: result.session };
     } catch (error) {
@@ -1617,6 +1705,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         liveSession,
         async (live) => {
           prompted = live;
+          const knownId = live.state().sessionId;
+          if (knownId) await savePolicy(knownId, draft.policy);
           const turnId = await live.prompt(prompt, (turnId) => {
             compaction?.submitted(live, turnId);
             const session = live.state().sessionId;
@@ -1638,6 +1728,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       if (!sessionId) {
         return failedPromptDelivery(draft.profile.agent, new Error('the agent did not name its new session'));
       }
+      await savePolicy(sessionId, draft.policy);
       accepted = { session: sessionId, turnId };
       const project = await acceptedProject;
       const entry = await setupStore.accept(project, draft.profile);
@@ -1840,7 +1931,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           return claudeRenamePlan(launch, {
             cwd,
             resume: session,
+            policy: policies.read(session),
             title,
+            agentRun: panel.isAgentRunLaunch?.(session) ?? false,
             ...(mode ? { permissionMode: claudeAskMode(mode) } : {}),
             model: modelFor(agent, session),
             effort: effortFor(agent, session),
@@ -1892,13 +1985,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         ? claudePlan(launch, {
             cwd,
             resume: session,
+            policy: policies.read(session),
             ...(mode ? { permissionMode: claudeAskMode(mode) } : {}),
+            agentRun: panel.isAgentRunLaunch?.(session) ?? false,
             model,
             effort,
           })
         : codexPlan(launch, {
             cwd,
             resume: session,
+            policy: policies.read(session),
             clientInfo: CLIENT_INFO,
             ...(mode ? codexAskMode(mode) : {}),
             model,
@@ -1937,13 +2033,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           ? claudePlan(launch, {
               cwd,
               resume: session,
+              policy: policies.read(session),
               ...(mode ? { permissionMode: claudeAskMode(mode) } : {}),
+              agentRun: panel.isAgentRunLaunch?.(session) ?? false,
               model,
               effort,
             })
           : codexPlan(launch, {
               cwd,
               resume: session,
+              policy: policies.read(session),
               clientInfo: CLIENT_INFO,
               ...(mode ? codexAskMode(mode) : {}),
               model,
@@ -1982,6 +2081,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       codexPlan(launch, {
         cwd,
         fork: sessionId,
+        policy: policies.read(sessionId),
         clientInfo: CLIENT_INFO,
         ...(mode ? codexAskMode(mode) : {}),
         model,
@@ -1992,6 +2092,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     if (!continued) {
       throw new Error('Codex did not name the continuation session');
     }
+    await savePolicy(continued, session.policy ?? policies.readSaved(sessionId));
     await persistSessionSettings(continued, settings);
     publishPicks();
     return session;
@@ -2010,6 +2111,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       draft.profile.agent === 'claude'
         ? claudePlan(launch, {
             cwd: draft.cwd,
+            policy: draft.policy,
+            agentRun: draft.agentRun,
             sessionId: sessionId!,
             ...(mode ? { permissionMode: claudeAskMode(mode) } : {}),
             model: draft.profile.model,
@@ -2018,6 +2121,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           })
         : codexPlan(launch, {
             cwd: draft.cwd,
+            policy: draft.policy,
             clientInfo: CLIENT_INFO,
             ...(mode ? codexAskMode(mode) : {}),
             model: draft.profile.model,
@@ -2040,13 +2144,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         ? claudePlan(launch, {
             cwd: draft.cwd,
             resume: sessionId,
+            policy: draft.policy ?? policies.read(sessionId),
             ...(mode ? { permissionMode: claudeAskMode(mode) } : {}),
+            agentRun: draft.agentRun ?? panel.isAgentRunLaunch?.(sessionId) ?? false,
             model: draft.profile.model,
             effort: draft.profile.effort,
           })
         : codexPlan(launch, {
             cwd: draft.cwd,
             resume: sessionId,
+            policy: draft.policy ?? policies.read(sessionId),
             clientInfo: CLIENT_INFO,
             ...(mode ? codexAskMode(mode) : {}),
             model: draft.profile.model,

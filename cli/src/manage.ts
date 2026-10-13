@@ -1,3 +1,5 @@
+import { resolve } from 'node:path';
+import { launchPolicy } from '../../extension/src/launchpolicy.ts';
 import * as fs from 'node:fs';
 import { requestWindow, requesterIdentity } from '../../extension/src/sessionrequests.ts';
 import {
@@ -35,6 +37,7 @@ export async function runManagement(command: string, args: string[]): Promise<st
   const flags = new Set<string>();
   const sessions: string[] = [];
   const labels: string[] = [];
+  const readTools: string[] = [];
   const values = new Set([
     '--window',
     '--request-id',
@@ -43,12 +46,14 @@ export async function runManagement(command: string, args: string[]): Promise<st
     '--model',
     '--effort',
     '--permissions',
+    '--cwd',
+    '--read-tool',
     '--prompt-file',
     '--name',
     '--label',
     '--observation',
   ]);
-  const switches = new Set(['--json', '--pinned', '--arc-dispatch', '--dry-run', '--force']);
+  const switches = new Set(['--read-only', '--json', '--pinned', '--arc-dispatch', '--dry-run', '--force']);
   let agentRun = false;
   let agentRunSeen = false;
   for (let at = 0; at < args.length; at++) {
@@ -64,6 +69,7 @@ export async function runManagement(command: string, args: string[]): Promise<st
       const value = args[++at];
       if (value === undefined || value.startsWith('--')) throw new Error(`${arg} requires a value.`);
       if (arg === '--label') labels.push(value);
+      else if (arg === '--read-tool') readTools.push(value);
       else if (options.has(arg)) throw new Error(`Repeated argument: ${arg}`);
       else options.set(arg, value);
     } else if (switches.has(arg) && !flags.has(arg)) flags.add(arg);
@@ -86,6 +92,9 @@ export async function runManagement(command: string, args: string[]): Promise<st
                 '--model',
                 '--effort',
                 '--permissions',
+                '--cwd',
+                '--read-only',
+                '--read-tool',
                 '--prompt-file',
                 '--name',
                 '--label',
@@ -102,7 +111,12 @@ export async function runManagement(command: string, args: string[]): Promise<st
                 '--dry-run',
                 ...(command === 'archive' ? ['--force'] : []),
               ];
-  for (const arg of [...options.keys(), ...flags, ...(labels.length ? ['--label'] : [])]) {
+  for (const arg of [
+    ...options.keys(),
+    ...flags,
+    ...(labels.length ? ['--label'] : []),
+    ...(readTools.length ? ['--read-tool'] : []),
+  ]) {
     if (!allowed.includes(arg)) throw new Error(`${arg} is unavailable for ${command}.`);
   }
   const window = options.get('--window');
@@ -166,6 +180,12 @@ export async function runManagement(command: string, args: string[]): Promise<st
       throw new Error('A setup key cannot combine with explicit setup values.');
     if (!key && !['claude', 'codex'].includes(options.get('--provider') ?? ''))
       throw new Error('Choose --provider claude or codex, or --setup KEY.');
+    launchPolicy(
+      options.get('--provider') ?? 'claude',
+      flags.has('--read-only'),
+      readTools,
+      options.get('--permissions'),
+    );
     // `--arc-dispatch` makes a guarded start, which records the requesting session as the worker's owner.
     const guarded = flags.has('--arc-dispatch');
     if (guarded && requesterIdentity().ambiguous)
@@ -186,6 +206,8 @@ export async function runManagement(command: string, args: string[]): Promise<st
           },
       prompt,
       agentRun,
+      ...(options.has('--cwd') ? { cwd: resolve(options.get('--cwd')!) } : {}),
+      ...(flags.has('--read-only') ? { readOnly: true, readTools } : {}),
       pinned: flags.has('--pinned'),
       labels,
       ...(options.has('--name') ? { name: options.get('--name')! } : {}),

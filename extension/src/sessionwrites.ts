@@ -22,6 +22,9 @@ export interface SessionWriteParams {
   labels?: string[];
   pinned?: boolean;
   agentRun?: boolean;
+  cwd?: string;
+  readOnly?: boolean;
+  readTools?: string[];
   action?: 'label-add' | 'label-remove' | 'pin' | 'unpin' | 'archive' | 'unarchive';
   dryRun?: boolean;
   force?: boolean;
@@ -62,11 +65,17 @@ export function validSessionWrite(method: string, params: Record<string, unknown
     );
   if (method === 'start') {
     const setup = params.setup as Record<string, unknown> | undefined;
-    const fields = ['setup', 'prompt', 'name', 'labels', 'pinned', 'agentRun'];
+    const fields = ['setup', 'prompt', 'name', 'labels', 'pinned', 'agentRun', 'cwd', 'readOnly', 'readTools'];
     return (
       Object.keys(params).every((key) => fields.includes(key)) &&
       text(params.prompt, 48 * 1024) &&
       typeof params.agentRun === 'boolean' &&
+      (params.cwd === undefined || (text(params.cwd, 4096) && !!params.cwd)) &&
+      (params.readOnly === undefined || typeof params.readOnly === 'boolean') &&
+      (params.readTools === undefined ||
+        (Array.isArray(params.readTools) &&
+          params.readTools.length <= 20 &&
+          params.readTools.every((one) => text(one, 200)))) &&
       (params.name === undefined || text(params.name, 200)) &&
       (params.labels === undefined || labels(params.labels)) &&
       (params.pinned === undefined || typeof params.pinned === 'boolean') &&

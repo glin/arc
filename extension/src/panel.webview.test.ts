@@ -2,6 +2,7 @@ import { sessionPageSources } from './sessionreads';
 import { sessionCoverageMember, reconcileSessionCollisions } from './sessioncoverage';
 import { runningKey } from './composerview';
 import { preserveHostRead } from './domain/read.ts';
+import { LaunchPolicyStore } from './launchpolicystore';
 import { SessionFilterRequests, FILTER_LIMITS } from './sessionfilter.ts';
 import { createSavedState } from './webview/state.ts';
 import type { QueuedSubmission, TurnComment } from './turnview.ts';
@@ -5290,6 +5291,9 @@ test('channel construction failure leaves panel activation and provider registra
     TerminalTools: function () {
       return { refresh: async () => {} };
     },
+    LaunchPolicyStore,
+    path,
+    arcHome: () => '/Arc',
     storeRoot: () => '/Arc/Store',
     cacheRoot: () => '/Arc/Cache',
     normalizedWorkspaceIdentity: () => 'workspace',
@@ -12521,6 +12525,7 @@ test('removing a permission override stores every session before the agent defau
     { ...sessionSettings({}, 'two'), permissionMode: 'fullAccess' },
   );
   const host = {
+    get: () => undefined,
     states: () => [
       { agent: 'codex', exited: false, key: 'codex:one', sessionId: 'one' },
       { agent: 'codex', exited: false, key: 'codex:two', sessionId: 'two' },
@@ -12558,7 +12563,7 @@ test('removing a permission override stores every session before the agent defau
     'panel',
     'compaction',
     'guardedSends',
-    code,
+    'const policies = { readSaved: () => undefined }; const savePolicy = async () => {};' + code,
   )(
     loaded,
     loaded.exports,
@@ -12590,10 +12595,10 @@ test('removing a permission override stores every session before the agent defau
 
   await loaded.exports.setAskModeFor('codex', { value: '', label: '', description: '' }, 'one');
   assert.deepEqual(events, [
-    'reader one',
-    'reader two',
     'barrier',
     'all barred',
+    'reader one',
+    'reader two',
     'cleared one,two',
     'sessions persisted',
     'agent persisted',
@@ -12620,6 +12625,7 @@ test('an explicit permission pick mutates no state when a default transition own
     releaseBarrier = resolve;
   });
   const host = {
+    get: () => undefined,
     states: () => [{ agent: 'claude', exited: false, key: 'claude:one', sessionId: 'one' }],
     withRetiringActivities: async () => {
       throw new Error('an explicit permission used retirement');
@@ -12645,7 +12651,7 @@ test('an explicit permission pick mutates no state when a default transition own
     'panel',
     'compaction',
     'guardedSends',
-    code,
+    'const policies = { readSaved: () => undefined }; const savePolicy = async () => {};' + code,
   )(
     loaded,
     loaded.exports,
@@ -13496,6 +13502,7 @@ test('draft acceptance survives profile-save and adoption failures until removal
     };
     const live = { key: 'codex:fresh:accepted', prompt: async () => 7, state: () => ({ sessionId: 'actual' }) };
     const scope = {
+      savePolicy: async () => {},
       panel,
       retireDraftProfile,
       freshHostKey,
@@ -13725,6 +13732,283 @@ test('an accepted draft adopts before its settings are published under the real 
   );
 });
 
+test('saved read-only policy survives replacement, draft resume, fork and clear without changing permission settings', async () => {
+  const source = fs.readFileSync(path.join(__dirname, 'extension.ts'), 'utf8');
+  const policy = { readOnly: true as const, readTools: [] };
+  const policyRoot = tempDir('arc-saved-policies-');
+  const durable = new LaunchPolicyStore(path.join(policyRoot, 'launch-policies'));
+  durable.write('original', policy);
+  const panel: any = { refresh() {}, isAgentRunLaunch: () => true };
+  const make = () => {
+    const scope = {
+      LaunchPolicyStore,
+      path,
+      arcHome: () => policyRoot,
+      panel,
+      launchFor: () => ({ command: 'native-cli' }),
+      askModeFor: () => undefined,
+      askValueFor: () => undefined,
+      modelFor: () => 'requested-model',
+      effortFor: () => 'high',
+      claudePlan: (_launch: unknown, options: unknown) => options,
+      codexPlan: (_launch: unknown, options: unknown) => options,
+      codexAskMode: () => ({}),
+      CLIENT_INFO: {},
+      ensureSession: async (_key: string, plan: any) => {
+        assert.deepEqual(plan.policy, policy);
+        return { state: () => ({ sessionId: 'forked' }) };
+      },
+      sessionSettingsForProfile,
+      persistSessionSettings: async () => {},
+      publishPicks() {},
+      withExistingSessionActivity: async () => ({ session: 'cleared', turnId: 1, policy }),
+      failedClearDelivery: () => assert.fail('clear failed'),
+      vscode: { window: { showErrorMessage() {} } },
+    };
+    const declarations = [
+      'const policies =',
+      'const savePolicy =',
+      'const existingSessionPlan =',
+      'const forkCodexSession =',
+      'const resumePlanForDraft =',
+      'panel.onClear =',
+    ]
+      .map((needle) => statementFrom(source, source.indexOf(needle)))
+      .join('\n');
+    const code = esbuild.transformSync(
+      `let forkSequence = 0; ${declarations}; return { existingSessionPlan, forkCodexSession, resumePlanForDraft };`,
+      { loader: 'ts' },
+    ).code;
+    return new Function(...Object.keys(scope), code)(...Object.values(scope));
+  };
+  const runtime = make();
+  for (const agent of ['claude', 'codex']) {
+    assert.deepEqual(runtime.existingSessionPlan(agent, 'original', 'cwd')().policy, policy);
+    if (agent === 'claude') assert.equal(runtime.existingSessionPlan(agent, 'original', 'cwd')().agentRun, true);
+    const draft = { profile: { agent, model: 'requested-model', effort: 'high' }, cwd: 'cwd' };
+    assert.deepEqual(runtime.resumePlanForDraft(draft, () => 'original')().policy, policy);
+  }
+  await runtime.forkCodexSession('original', 'cwd');
+  await panel.onClear('codex', 'original', 'cwd');
+  const restored = make();
+  for (const id of ['forked', 'cleared'])
+    assert.deepEqual(restored.existingSessionPlan('codex', id, 'cwd')().policy, policy);
+  fs.rmSync(policyRoot, { recursive: true, force: true });
+});
+
+test('agent-wide permission picks refuse before changing a live read-only child or a saved read-only target', async () => {
+  const source = fs.readFileSync(path.join(__dirname, 'extension.ts'), 'utf8');
+  const policy = { readOnly: true as const, readTools: [] };
+  for (const states of [[], [{ agent: 'codex', sessionId: 'original', exited: false }]]) {
+    let writes = 0;
+    const scope = {
+      host: { states: () => states, get: () => ({ policy }) },
+      policies: { readSaved: (id: string) => (id === 'original' ? policy : undefined) },
+      refusePolicyChange: () => {
+        throw new Error('read-only');
+      },
+      context: {
+        workspaceState: {
+          update: () => {
+            writes++;
+          },
+        },
+      },
+    };
+    const code = esbuild.transformSync(
+      `${statementFrom(source, source.indexOf('const setAskModeFor ='))}; return setAskModeFor;`,
+      { loader: 'ts' },
+    ).code;
+    const pick = new Function(...Object.keys(scope), code)(...Object.values(scope));
+    await assert.rejects(pick('codex', { value: '' }, states.length ? undefined : 'original'), /read-only/);
+    assert.equal(writes, 0);
+  }
+});
+
+test.each(['saved', 'lost-child', 'retry'])('delayed Claude clear retains permissions after %s', async (caseName) => {
+  const source = fs.readFileSync(path.join(__dirname, 'extension.ts'), 'utf8');
+  const root = tempDir('arc-delayed-policy-');
+  try {
+    const policies = new LaunchPolicyStore(root);
+    const policy = { readOnly: true as const, readTools: ['mcp__notes__read'] };
+    policies.write('original', policy);
+    const nativeFs = (await import('node:fs')).default;
+    const rename = nativeFs.renameSync;
+    let failures = 0;
+    const saving = vi.spyOn(nativeFs, 'renameSync').mockImplementation((temporary, target) => {
+      const value = JSON.parse(fs.readFileSync(temporary, 'utf8'));
+      if (caseName !== 'saved' && value.session === 'cleared') {
+        failures++;
+        throw Object.assign(new Error('successor save failed'), { code: 'EACCES' });
+      }
+      return rename(temporary, target);
+    });
+    let retired = false;
+    const moves: Array<[string, string]> = [];
+    const panel: any = {
+      refresh() {},
+      noteSessionMoved: (source: string, successor: string) => moves.push([source, successor]),
+    };
+    let wire: ClaudeWire;
+    const live = {
+      key: 'owned',
+      policy,
+      state: () => ({ sessionId: wire.sessionId(), cwd: 'cwd' }),
+      clear: async (_name: unknown, beforeWrite: () => void, writeAttempted: () => void) => {
+        await wire.prompt('/clear', undefined, beforeWrite, writeAttempted);
+        return 1;
+      },
+    };
+    const eventAt = source.indexOf("      if (event.kind === 'session') {\n        const policy =");
+    const eventCode =
+      source.slice(eventAt, source.indexOf('      // Publish busy children', eventAt)) +
+      statementFrom(source, source.indexOf("if (event.kind === 'session' && event.previous", eventAt));
+    const receive = new Function(
+      'host',
+      'policies',
+      'panel',
+      'compaction',
+      'vscode',
+      'policyMoves',
+      esbuild.transformSync(`return (event) => { const key = 'owned'; const agent = 'claude'; ${eventCode} };`, {
+        loader: 'ts',
+      }).code,
+    )({ get: () => (retired ? null : live) }, policies, panel, null, { window: { showErrorMessage() {} } }, new Map());
+    wire = new ClaudeWire({ sessionId: 'original', send() {}, emit: receive });
+    const scope = {
+      panel,
+      policies,
+      savePolicy: async (id: string, value: any) => {
+        if (value) policies.write(id, value);
+      },
+      withExistingSessionActivity: async (_agent: unknown, _session: unknown, _cwd: unknown, work: any) => work(live),
+      failedClearDelivery: () => assert.fail('clear failed'),
+      vscode: { window: { showErrorMessage() {} } },
+    };
+    new Function(
+      ...Object.keys(scope),
+      esbuild.transformSync(statementFrom(source, source.indexOf('panel.onClear =')), { loader: 'ts' }).code,
+    )(...Object.values(scope));
+    assert.equal((await panel.onClear('claude', 'original', 'cwd')).session, 'original');
+    const independent = new LaunchPolicyStore(root);
+    assert.deepEqual(independent.read('original'), policy);
+    assert.throws(() => independent.read('cleared'), /cannot continue/);
+    assert.throws(() => independent.prepareClear('other-child', 'original'), /previous clear/);
+    wire.receive(JSON.stringify({ type: 'result', session_id: 'reset', num_turns: 0, subtype: 'success' }));
+    assert.throws(() => independent.read('unrelated'), /cannot continue/);
+    wire.receive(JSON.stringify({ type: 'system', subtype: 'init', session_id: 'cleared', tools: [] }));
+    assert.equal(wire.sessionId(), 'cleared');
+    assert.equal(failures, caseName === 'saved' ? 0 : 1);
+    assert.deepEqual(
+      moves,
+      caseName === 'saved'
+        ? [
+            ['original', 'reset'],
+            ['reset', 'cleared'],
+          ]
+        : [['original', 'reset']],
+    );
+    retired = caseName !== 'retry';
+    const scope2 = {
+      policies: new LaunchPolicyStore(root),
+      panel: { isAgentRunLaunch: () => true },
+      launchFor: () => ({ command: 'native' }),
+      askModeFor: () => undefined,
+      askValueFor: () => undefined,
+      modelFor: () => '',
+      effortFor: () => '',
+      claudePlan: (_launch: unknown, options: any) => options,
+    };
+    const plan = new Function(
+      ...Object.keys(scope2),
+      esbuild.transformSync(
+        `${statementFrom(source, source.indexOf('const existingSessionPlan ='))}; return existingSessionPlan;`,
+        { loader: 'ts' },
+      ).code,
+    )(...Object.values(scope2));
+    if (caseName !== 'saved') {
+      assert.throws(() => plan('claude', 'cleared', 'cwd')(), /cannot continue/);
+      assert.deepEqual(plan('claude', 'original', 'cwd')().policy, policy);
+      saving.mockRestore();
+      policies.confirmClear('owned', 'original');
+      assert.throws(() => independent.read('unrelated'), /cannot continue/);
+      independent.confirmClear('owned', 'reset');
+      assert.throws(() => independent.read('unrelated'), /cannot continue/);
+      if (caseName === 'retry') {
+        wire.receive(JSON.stringify({ type: 'system', subtype: 'init', session_id: 'cleared', tools: [] }));
+        assert.deepEqual(moves, [
+          ['original', 'reset'],
+          ['reset', 'cleared'],
+        ]);
+      } else {
+        // Recovery retains the source's exact policy before removing the unresolved clear.
+        independent.write('cleared', independent.read('original')!);
+        assert.equal(JSON.parse(fs.readFileSync(path.join(root, 'pending-clear.json'), 'utf8')).session, 'original');
+        fs.unlinkSync(path.join(root, 'pending-clear.json'));
+      }
+    }
+    assert.deepEqual(plan('claude', 'cleared', 'cwd')().policy, policy);
+    assert.equal(independent.read('unrelated'), undefined);
+    saving.mockRestore();
+    independent.prepareClear('next-child', 'original');
+    policies.confirmClear('owned', 'cleared');
+    assert.throws(() => independent.read('unrelated'), /cannot continue/);
+  } finally {
+    vi.restoreAllMocks();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test.each(['explicit', 'remove'])(
+  'permission %s refuses an opening read-only child before side effects',
+  async (kind) => {
+    const source = fs.readFileSync(path.join(__dirname, 'extension.ts'), 'utf8');
+    for (const delayed of [false, true]) {
+      const policy = { readOnly: true, readTools: [] };
+      let live: any = { key: 'opening', agent: 'codex', sessionId: null, exited: false };
+      let restricted = !delayed;
+      let writes = 0;
+      let invalidations = 0;
+      const scope = {
+        host: {
+          states: () => [live],
+          get: () => ({ policy: restricted ? policy : undefined }),
+          withActivities: async (_keys: unknown, work: any) => {
+            restricted = true;
+            live.sessionId = 'actual-child';
+            return work(new Map());
+          },
+          withRetiringActivities: async (_keys: unknown, work: any) => {
+            restricted = true;
+            live.sessionId = 'actual-child';
+            return work(new Map());
+          },
+        },
+        policies: { readSaved: () => undefined },
+        refusePolicyChange: (id: string) => {
+          throw new Error(`read-only ${id}`);
+        },
+        compaction: { readerAction: () => invalidations++ },
+        guardedSends: { invalidate: () => invalidations++ },
+        context: { workspaceState: { update: () => writes++ } },
+      };
+      const pick = new Function(
+        ...Object.keys(scope),
+        esbuild.transformSync(
+          `${statementFrom(source, source.indexOf('const setAskModeFor ='))}; return setAskModeFor;`,
+          { loader: 'ts' },
+        ).code,
+      )(...Object.values(scope));
+      await assert.rejects(
+        pick('codex', { value: '', ...(kind === 'explicit' ? { codex: {} } : {}) }, 'unrestricted-selected'),
+        delayed ? /actual-child/ : /opening/,
+      );
+      assert.equal(writes, 0);
+      assert.equal(invalidations, 0);
+    }
+  },
+);
+
 test('agent-default sessions leave permission overrides out of resume and fork plans', async () => {
   const extensionSource = fs.readFileSync(path.join(__dirname, 'extension.ts'), 'utf8');
   const askAt = extensionSource.indexOf('function askModeFor(agent: string, session?: string): AskMode | undefined {');
@@ -13800,7 +14084,7 @@ test('agent-default sessions leave permission overrides out of resume and fork p
     'claudeAskMode',
     'codexPlan',
     'CLIENT_INFO',
-    resumeCode,
+    'const policies = { read: () => undefined }; const panel = {}; const savePolicy = async () => {};' + resumeCode,
   )(
     resumeModule,
     resumeModule.exports,
@@ -13851,7 +14135,8 @@ test('agent-default sessions leave permission overrides out of resume and fork p
     'persistSessionSettings',
     'publishPicks',
     'forkSequence',
-    forkCode,
+    'const policies = { read: () => undefined, readSaved: () => undefined }; const savePolicy = async () => {};' +
+      forkCode,
   )(
     forkModule,
     forkModule.exports,
@@ -13924,7 +14209,7 @@ test('default-selected Claude start, draft resume, and rename plans omit permiss
     'codexPlan',
     'CLIENT_INFO',
     'askModeFor',
-    factoryCode,
+    'const policies = { read: () => undefined }; const panel = {}; const savePolicy = async () => {};' + factoryCode,
   )(
     factories,
     factories.exports,
@@ -13984,7 +14269,7 @@ test('default-selected Claude start, draft resume, and rename plans omit permiss
     'path',
     'codexRenamePlan',
     'CLIENT_INFO',
-    renameCode,
+    'const policies = { read: () => undefined };' + renameCode,
   )(
     panel,
     (_host: unknown, options: { idlePlan: () => Record<string, unknown> }) => {
@@ -16619,12 +16904,12 @@ test('New session keeps the initiating panel host on its provisional draft', () 
   assert.deepEqual(broadcast.at(-1), { type: 'focusComposer', session: `${DRAFT_SESSION_PREFIX}new-draft` });
 });
 
-test('/clear publishes the copied setup', () => {
+test.each([false, true])('/clear publishes the copied setup and preserves delegated launch=%s', (agentRun) => {
   const move = new Function(
     'succeedSession',
     'labelsOf',
     'setSessionLabels',
-    `return function (source, successor, agent, cwd) {\n${methodBody('public noteSessionMoved(')}\n};`,
+    `const SESSION_LIMIT = 1000; return function (source, successor, agent, cwd) {\n${methodBody('public noteSessionMoved(')}\n};`,
   )(succeedSession, labelsOf, setSessionLabels) as (
     this: Record<string, unknown>,
     source: string,
@@ -16650,6 +16935,7 @@ test('/clear publishes the copied setup', () => {
     },
   };
   const saved = normalizePanelState(null);
+  if (agentRun) saved.agentRuns = ['old'];
   saved.labels = setSessionLabels(saved.labels, 'old', ['keep']);
   const queuedAsset: StoredPromptAsset = {
     id: '11111111-1111-4111-8111-111111111111',
@@ -16679,6 +16965,8 @@ test('/clear publishes the copied setup', () => {
     draftCommentIds: {},
     saved,
     memento,
+    startedHere: new Set(['old', 'new']),
+    isAgentRunLaunch: (id: string) => saved.agentRuns?.includes(id) === true,
     rememberStarted() {
       /* Keep started-session persistence inactive to isolate label copying and writeDrafts persistence. */
     },
@@ -16702,6 +16990,8 @@ test('/clear publishes the copied setup', () => {
     finishClearSettlement() {},
   };
   move.call(host, 'old', 'new', 'claude', 'C:\\ws');
+  assert.equal(host.saved.agentRuns?.includes('new') === true, agentRun);
+  assert.equal(host.startedHere.has('new'), !agentRun);
   assert.equal(
     host.hostSessions.get(mappedHost),
     'new',
@@ -22975,7 +23265,7 @@ test('every Codex new invocation routes through the durable reset record', () =>
   const extensionSource = fs.readFileSync(path.join(__dirname, 'extension.ts'), 'utf8');
   sourceMatch(
     extensionSource,
-    /panel\.onClear = async \(agent, session, cwd, name\)[\s\S]*live\.clear\(name\)/,
+    /panel\.onClear = async \(agent, session, cwd, name\)[\s\S]*live\.clear\(\s*name\s*,/,
     'the successor name is dropped before the agent boundary',
   );
 });
@@ -31870,6 +32160,7 @@ function draftDeliveryCallback(panel: any, rejected: boolean): void {
     },
   };
   const scope = {
+    savePolicy: async () => {},
     panel,
     startFreshSession: async () => live,
     compaction: null,

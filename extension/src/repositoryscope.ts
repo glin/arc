@@ -1,4 +1,6 @@
 import type { GitRunner } from './gitcommits';
+import { realpathSync, statSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { isInside, normalizeFsPath } from './transcript';
 
 const WORKTREE_LIST_ARGS = ['worktree', 'list', '--porcelain', '-z'];
@@ -35,6 +37,29 @@ export interface RepositoryScopeDecision {
   // The combined length of the Git output for every open folder, and the number of folders whose Git read failed.
   stdoutLength: number;
   failed: number;
+}
+
+export function scopedLaunchCwd(
+  requested: string | undefined,
+  folders: string[],
+  roots: string[],
+  filesystem = {
+    realpath: (file: string) => realpathSync(file),
+    directory: (file: string) => statSync(file).isDirectory(),
+  },
+): string {
+  if (requested === undefined) return folders[0];
+  const cwd = filesystem.realpath(resolve(requested));
+  const inScope = roots.some((root) => {
+    try {
+      return isInside(cwd, [filesystem.realpath(root)]);
+    } catch {
+      return false;
+    }
+  });
+  if (!filesystem.directory(cwd) || !inScope)
+    throw new Error('The requested folder is outside this window’s open project and registered worktrees.');
+  return cwd;
 }
 
 export interface RepositoryScopeSnapshot {

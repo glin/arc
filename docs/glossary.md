@@ -2,6 +2,8 @@
 
 Use these terms in product copy, documentation, plans, tests, and new code. Keep vendor terms at the protocol boundary. The product term is **session**.
 
+A **read-only launch policy** retains launch restrictions through session continuation. It remains separate from reader ownership and agent-run classification.
+
 ## Interface regions
 
 The panel has a session list beside one selected session view. Use the region names below when describing its controls.

@@ -1,14 +1,64 @@
 import { test, vi } from 'vitest';
 import assert from 'node:assert';
 import type { GitRunner } from './gitcommits.ts';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+import { tempDir } from './temproot';
 import {
   parseWorktreeRoots,
+  scopedLaunchCwd,
   RepositoryScope,
   REPOSITORY_SCOPE_CONFIRM_MS,
   REPOSITORY_SCOPE_FAILED_RECHECKS,
   REPOSITORY_SCOPE_REFRESH_MS,
   type RepositoryScopeDecision,
 } from './repositoryscope.ts';
+
+test('launch folders admit an open project and registered worktree but refuse outsiders and redirected paths', () => {
+  const root = tempDir('arc-launch-scope-');
+  try {
+    const project = path.join(root, 'Project');
+    const worktree = path.join(root, 'Worktree');
+    const foreign = path.join(root, 'Project-other');
+    for (const dir of [project, worktree, foreign]) fs.mkdirSync(dir);
+    const nested = path.join(worktree, 'Nested');
+    fs.mkdirSync(nested);
+    const roots = [project, worktree];
+    assert.equal(scopedLaunchCwd(undefined, [project], roots), project);
+    assert.equal(scopedLaunchCwd(nested, [project], roots), fs.realpathSync(nested));
+    assert.equal(
+      scopedLaunchCwd(project, [project], [path.join(root, 'removed-worktree'), ...roots]),
+      fs.realpathSync(project),
+    );
+    assert.throws(() => scopedLaunchCwd(foreign, [project], roots), /outside/);
+    const redirect = path.join(project, 'redirect');
+    fs.symlinkSync(foreign, redirect, process.platform === 'win32' ? 'junction' : 'dir');
+    assert.throws(() => scopedLaunchCwd(redirect, [project], roots), /outside/);
+    fs.unlinkSync(redirect);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+for (const platform of ['win32', 'darwin', 'linux'] as const) {
+  test(`explicit launch containment follows mixed-case platform rules on ${platform}`, () => {
+    vi.stubGlobal('process', { ...process, platform });
+    try {
+      for (const [cwd, root, accepted] of [
+        ['/Work/Repo/Child', '/Work/Repo', true],
+        ['/Work/Repo/Child', '/work/repo', platform === 'win32'],
+        ['C:/Work/Repo/Child', 'c:/work/repo', true],
+        ['/Work/Repo-other', '/Work/Repo', false],
+      ] as const) {
+        const filesystem = { realpath: (file: string) => (file === 'root' ? root : cwd), directory: () => true };
+        if (accepted) assert.equal(scopedLaunchCwd('requested', [], ['root'], filesystem), cwd);
+        else assert.throws(() => scopedLaunchCwd('requested', [], ['root'], filesystem), /outside/);
+      }
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+}
 
 function deferred<T>() {
   let resolve!: (value: T) => void;

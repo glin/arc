@@ -116,7 +116,11 @@ import { sessionRenameTitle } from './sessionrename';
 // Check the accepted values when updating the CLI. An unsupported mode prevents child startup.
 export type PermissionMode = 'default' | 'acceptEdits' | 'auto' | 'bypassPermissions' | 'manual' | 'dontAsk' | 'plan';
 
+import { claudeReadOnlyArgs, claudeReadOnlyMcp, type LaunchPolicy } from './launchpolicy';
+
 export interface SpawnOptions {
+  policy?: LaunchPolicy;
+  agentRun?: boolean;
   cwd: string;
   model?: string;
   // The initial effort level comes from the model's `list_models` entry.
@@ -136,7 +140,7 @@ export interface SpawnOptions {
 // `--verbose` is required for stream-json output.
 // `--permission-prompt-tool stdio` enables permission asks in headless mode, although the CLI help omits it.
 // `--include-partial-messages` enables response deltas while the model works.
-export function spawnArgs(o: SpawnOptions): string[] {
+export function spawnArgs(o: SpawnOptions, env: NodeJS.ProcessEnv = process.env): string[] {
   const args = [
     '-p',
     '--verbose',
@@ -148,7 +152,15 @@ export function spawnArgs(o: SpawnOptions): string[] {
     'stdio',
     '--include-partial-messages',
   ];
-  if (o.permissionMode) {
+  if (o.policy)
+    args.push(
+      ...claudeReadOnlyArgs(
+        o.policy,
+        o.model,
+        o.policy.readTools.length ? claudeReadOnlyMcp(o.policy, o.cwd, env) : undefined,
+      ),
+    );
+  if (o.permissionMode && !o.policy) {
     args.push('--permission-mode', o.permissionMode);
   }
   if (o.model) {
@@ -166,7 +178,7 @@ export function spawnArgs(o: SpawnOptions): string[] {
   if (o.persistSession === false) {
     args.push('--no-session-persistence');
   }
-  if (o.settings) {
+  if (o.settings && !o.policy) {
     args.push('--settings', o.settings);
   }
   if (o.replayUserMessages) {
@@ -570,7 +582,12 @@ export class ClaudeWire {
 
   // Sends a prompt and rejects delivery if the wire closes or Stop cancels prompts during attachment preparation.
   // Every prompt carries a human origin. The transcript's `agentRunIn` rule uses it to identify reader-owned sessions across windows.
-  prompt(input: AgentPromptInput, guard?: GuardedAttempt, beforeWrite?: () => void): Promise<void> {
+  prompt(
+    input: AgentPromptInput,
+    guard?: GuardedAttempt,
+    beforeWrite?: () => void,
+    writeAttempted?: () => void,
+  ): Promise<void> {
     this.responseClock.reset();
     if (this.closed) {
       throw new Error('the agent is no longer running');
@@ -581,11 +598,14 @@ export class ClaudeWire {
     if (!prompt.assets.length && prompt.text) {
       beforeWrite?.();
       this.nativeSubmission(prompt.text);
-      this.write({
-        type: 'user',
-        message: { role: 'user', content: [{ type: 'text', text: prompt.text }] },
-        origin: HUMAN_ORIGIN,
-      });
+      this.write(
+        {
+          type: 'user',
+          message: { role: 'user', content: [{ type: 'text', text: prompt.text }] },
+          origin: HUMAN_ORIGIN,
+        },
+        writeAttempted,
+      );
       return Promise.resolve();
     }
     const generation = this.promptGeneration;
@@ -598,7 +618,7 @@ export class ClaudeWire {
       }
       beforeWrite?.();
       this.nativeSubmission(prompt.text);
-      this.write({ type: 'user', message: { role: 'user', content }, origin: HUMAN_ORIGIN });
+      this.write({ type: 'user', message: { role: 'user', content }, origin: HUMAN_ORIGIN }, writeAttempted);
     });
   }
 
@@ -824,6 +844,7 @@ export class ClaudeWire {
     }
 
     const session = str(m.session_id);
+    const changed = !!session && session !== this.session;
     if (session && session !== this.session) {
       this.responseClock.reset();
       if (this.session !== null) this.responseTimingBlocked = true;
@@ -864,6 +885,8 @@ export class ClaudeWire {
         return;
       case 'system': {
         const subtype = str(m.subtype);
+        if (subtype === 'init' && this.session)
+          this.emit({ kind: 'sessionInitialized', sessionId: this.session, changed });
         if (subtype === 'thinking_tokens') {
           this.emit({ kind: 'thinking' });
         }
@@ -1284,13 +1307,16 @@ export class ClaudeWire {
   }
 
   // A user frame starts new input, so idle evidence from before it no longer holds.
-  private write(message: Json): void {
+  private write(message: Json, writeAttempted?: () => void): void {
     if (message.type === 'user') this.reportedState = null;
     if (this.closed) {
+      if (writeAttempted) throw new Error('the agent is no longer running');
       return;
     }
 
-    this.send(JSON.stringify(message) + '\n');
+    const line = JSON.stringify(message) + '\n';
+    writeAttempted?.();
+    this.send(line);
   }
 }
 

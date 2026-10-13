@@ -340,6 +340,8 @@ test('CLI watching survives panel rebuilds and ends when the build closes', asyn
   for (const file of [
     'panelhost.ts',
     'turncard.ts',
+    'launchpolicy.ts',
+    'repositoryscope.ts',
     'sessionfilter.ts',
     'domain/session-query.ts',
     'diagnosticslog.ts',

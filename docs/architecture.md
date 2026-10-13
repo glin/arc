@@ -122,6 +122,7 @@ The portable review runner in `evals/agent-review/run.mjs` reads tracked case fi
 | Local git repository | The folder a command changed, and each open workspace folder | Registered worktree roots, commit details whose output printed none, and fast-forward landings from the head log |
 | Browser saved panel state | VS Code webview state | The latest five exact workspace prompt submissions, saved synchronously before dispatch and reconciled with workspace recovery |
 | VS Code workspace state | Extension-managed storage | Exact submitted prompt recovery, saved panel state, reader-started parent relationships and session list filters, queued submissions with delivery ownership and reset barriers, file descriptors, normalized account usage and live reset windows, and the last-reported Claude skill list for each working directory |
+| Hosted launch restrictions | `${ARC_HOME:-~/.arc}/launch-policies` | Immutable restrictions shared across windows, indexed by hashed session identity, plus one exclusive pending Claude clear |
 | Bounded usage history | `~/.arc/usage/bounded-v1/` | Admitted Claude and Codex account limit readings in thirty fixed UTC-day slots |
 | Legacy usage history | `~/.arc/usage/readings.jsonl` | Preserved experimental readings, outside the bounded store's quota |
 | Applied CLI defaults | Prompt-free Claude `get_settings` and Codex `config/read`, `model/list`, and `configRequirements/read` | Applied model and effort for the launch folder and committed model. Codex 0.159.2 and 0.160.0 support these reads. Other versions report unavailable defaults. The host rejects obsolete configuration replies |
@@ -133,6 +134,10 @@ The portable review runner in `evals/agent-review/run.mjs` reads tracked case fi
 | Prompt asset staging | Extension global storage | Generated-id copies of files attached to unsent, locally queued, or in-flight prompts |
 | Local filesystem | The selected session's recorded working directory | Immediate path-completion candidates for the Prompt box, and the file or folder kind of each dropped or added item |
 | Editor drag and Explorer menu | The `dataTransfer` of a drop on the Prompt box, and the resource arguments of `Add to Arc` | File URIs that become path text in the draft or image attachments staged from disk |
+
+Restricted Claude clear creates `launch-policies/pending-clear.json` at the prompt transport's pre-write boundary. Exclusive creation admits one restricted Claude clear per Arc home. Positive refusal before attempted input cancels only that attempt's matching reservation. Attempted input with an unknown outcome retains the marker. While it exists, continuation without saved permissions refuses across windows and restarts. Ordinary live events and permission inspection read saved policies without applying continuation admission. Held children retain their immutable policy. Saved-policy sessions and fresh launches retain their own permissions. Confirmation requires the owning child's token, a successor distinct from the source, and identical saved policies. Claude's `init` confirms the successor. An intermediate reset identity does not release admission. Policy-save or confirmation failure retains the marker without expiry. A later `init` from the same child retries saving and confirmation. Successful recovery replays that child's deferred ownership move through the panel's existing session transition. Child exit discards the deferred move and local confirmation authority while preserving durable refusal. Ended children cannot confirm through stale output or a replacement using the same host key.
+
+After child loss, resume the saved source with its exact immutable policy through existing input behavior, or start a fresh session. Saving the source's exact policy under a successor's identity permits that successor's own continuation. It does not release refusal for unrelated identities without saved policies. The retained marker blocks those continuations and further restricted Claude clears without a timeout takeover. Child exit removes the live token, so later identity or non-delivery evidence cannot confirm that clear. Transcript absence and file timestamps do not establish non-delivery. Ordinary saved-policy lookup reads one bounded file. Continuation admission checks the marker only when no saved policy exists, without scanning other sessions.
 
 Codex retained-context reads admit copied metadata only through the opening's declared fork ancestry. Tool pairs retain separate function, custom-tool, and client-search identities. Local-shell calls use function outputs. Server search outputs require no local call.
 
@@ -298,7 +303,7 @@ The first column is checked against the shipped extension directory by `architec
 | `codexcontext.ts` | Bounded revisioned retained-context reads, text attribution, request reconciliation, and unsupported-history refusal for Codex | no |
 | `gitcommits.ts` | Reads a turn's commits and fast-forward landings back from the repository, with the repository each is in and the branch each landing merged | no |
 | `sessioncoverage.ts` | Binds physical enumeration and admitted membership evidence to scope and revision, and decides source presence | no |
-| `repositoryscope.ts` | Refreshes registered Git worktree roots for session discovery | no |
+| `repositoryscope.ts` | Refreshes registered Git worktree roots for session discovery and checks the real destination of explicit launch folders | no |
 | `parserstate.ts` | Clones resumable parser state without losing hidden associations, counts live retained payload, carries hidden associations as plain snapshots, and supplies shared scan budgets | no |
 | `history.ts` | Exact-revision history cursors, semantic pages, transactional forward checkpoints, and opt-in metadata recovery slices with live source reduction and resumable payload accounting | no |
 | `exportlimits.ts` | Admission limits and typed failures for explicit saved-session captures | no |
@@ -335,7 +340,7 @@ The first column is checked against the shipped extension directory by `architec
 | `sessionfilter.ts` | Ordered panel filter assignments and confirmed resets, operation deadlines, cancellation, and persistence ordering | no |
 | `sessionrequests.ts` | Per-activation window identity, private registry publication, authenticated bounded JSON-lines requests, live window discovery, target selection, query capability, connection cancellation, and channel cleanup | no |
 | `sessionreads.ts` | Paged programmatic session listings with signed cursors, independent transcript reads, and bounded exact source identity mappings | no |
-| `sessionwrites.ts` | Session-write schema, activation-bound request retention, archive refusal decisions, and guarded follow-up ownership, admission, and panel wiring | no |
+| `sessionwrites.ts` | Session-write schema with scoped launch folders and read-only options, activation-bound request retention, archive refusal decisions, and guarded follow-up ownership, admission, and panel wiring | no |
 | `windowpipe.ts` | Host-lifetime Windows pipe bridge, connected-server identity checks, and bounded stdio | no |
 | `windowpipe-source.ts` | Native Windows pipe access rules and overlapped transport source | no |
 | `claudecoststate.ts` | Captures cumulative Claude accounting snapshots, reconciles native child usage under bounded background budgets, and allocates supplemental lifetime and Project cost | no |
@@ -373,7 +378,9 @@ The first column is checked against the shipped extension directory by `architec
 | `compactrequest.ts` | Literal self-compaction payloads, in-memory native call bindings, deferred assignments, reader revisions, delivery to the exact retained child, and native completion evidence | no |
 | `codexwire.ts` | Codex app-server JSON-RPC adapter | no |
 | `codexreply.ts` | Codex async-question ids and the reply envelope that answers them | no |
-| `agenthost.ts` | Child ownership, packaged CLI environment and window targeting, launch environment and Claude attribution selection, line framing, lifecycle, accepted-turn identity, control-read scheduling, explicit usage attempt ownership, and session state after model changes | no |
+| `launchpolicystore.ts` | Shared authoritative session restrictions, bounded per-session reads, atomic policy writes, and exclusive durable clear admission | no |
+| `launchpolicy.ts` | Immutable hosted read-only launch policy, exact MCP read tools, Claude tool and git restrictions, and model permission-mode eligibility | no |
+| `agenthost.ts` | Child ownership, packaged CLI environment and window targeting, launch environment, immutable read-only permissions and Claude attribution selection, line framing, lifecycle, accepted-turn identity, control-read scheduling, explicit usage attempt ownership, and session state after model changes | no |
 | `composerview.ts` | Prompt box, agent-request, and new-session view data, bounded question Markdown reuse, wording, settings, queue behavior, answers, prompt assembly, completion rows, and the walk back through earlier prompts | no |
 | `domain/ask-answer.ts` | Browser-safe completion and answer assembly rules for agent questions | no |
 | `domain/claude-skills.ts` | Browser-safe Claude skill-highlight decision, the per-working-directory skill-list cache reducer, and the safe-folder-name check the host skill-path lookup runs first | no |

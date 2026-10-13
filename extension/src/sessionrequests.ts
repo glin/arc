@@ -421,6 +421,7 @@ export class WindowChannel {
         REQUESTER_PROVIDER_CAPABILITY,
         SESSION_QUERY_CAPABILITY,
         SESSION_QUERY_SHORTHAND_CAPABILITY,
+        'launchPolicy',
         ...(this.guardedReadHandler ? [SESSION_READ_CAPABILITY] : []),
       ],
     };
@@ -714,6 +715,14 @@ async function exchangeWindow(
   if (process.platform === 'win32' && (!Number.isSafeInteger(entry.transportPid) || entry.transportPid! <= 0))
     return null;
   const id = requestId ?? `${entry.hostId}:${crypto.randomBytes(12).toString('hex')}`;
+  if (
+    method === 'start' &&
+    (params.readOnly !== undefined || params.readTools !== undefined || params.cwd !== undefined) &&
+    !entry.capabilities?.includes('launchPolicy')
+  )
+    throw new Error(
+      'The selected Arc window does not support read-only starts or scoped launch folders. No session was started.',
+    );
   const identity = requesterIdentity();
   const request: SessionRequest = {
     id,

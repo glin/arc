@@ -78,12 +78,103 @@ import {
 } from './composerview.ts';
 import { USAGE_FRESH_MS, UsageBook, usageBar } from './usageview.ts';
 import { tempDir } from './temproot.ts';
+import { launchPolicy } from './launchpolicy.ts';
+import { LaunchPolicyStore } from './launchpolicystore.ts';
+import * as esbuild from 'esbuild';
 import { callSources, declarationSource, statementFrom, sourceMatch } from '../test/source-contract.ts';
 
 const CLAUDE = { command: 'C:\\claude.exe', leadingArgs: [], env: {} };
 const CODEX = { command: 'node', leadingArgs: ['C:\\codex.js'], env: {} };
 const WS = 'C:\\ws';
 const CODEX_CLIENT = { name: 'arc', title: 'Arc', version: '0.1.0' };
+
+test.each(['start', 'resume', 'fork'])(
+  'read-only Codex %s keeps thread and turn permissions through clear and rejected setting changes',
+  async (opening) => {
+    const { host, children } = fakeHost();
+    const options = {
+      cwd: WS,
+      clientInfo: CODEX_CLIENT,
+      policy: launchPolicy('codex', true),
+      ...(opening === 'start' ? {} : { [opening]: 'source' }),
+    };
+    const starting = host.session('review', codexPlan(CODEX, options));
+    const child = children[0];
+    child.reply({ userAgent: 'codex' });
+    await vi.waitFor(() => assert.equal(child.sent().at(-1)?.method, 'skills/list'));
+    child.reply({ data: [{ cwd: WS, skills: [] }] });
+    await vi.waitFor(() => assert.equal(child.sent().at(-1)?.method, `thread/${opening}`));
+    const check = (message: any, turn = false) => {
+      assert.equal(message.params.approvalPolicy, 'never');
+      assert.equal(message.params.approvalsReviewer, 'user');
+      assert.deepEqual(
+        turn ? message.params.sandboxPolicy : message.params.sandbox,
+        turn ? { type: 'readOnly' } : 'read-only',
+      );
+    };
+    check(child.sent().at(-1));
+    child.reply({ thread: { id: 'review' } });
+    const session = await starting;
+    await assert.rejects(session.setAskMode(defaultAskMode('codex')), /read-only/);
+    for (let index = 0; index < 2; index++) {
+      const delivery = session.prompt('read the repository');
+      await vi.waitFor(() => assert.equal(child.sent().at(-1)?.method, 'turn/start'));
+      check(child.sent().at(-1), true);
+      child.reply({ turn: { id: `turn-${index}` } });
+      await delivery;
+      child.say(
+        JSON.stringify({
+          method: 'turn/completed',
+          params: { threadId: 'review', turn: { id: `turn-${index}`, status: 'completed' } },
+        }) + '\n',
+      );
+    }
+    const clearing = session.clear();
+    await vi.waitFor(() => assert.equal(child.sent().at(-1)?.method, 'thread/start'));
+    check(child.sent().at(-1));
+    child.reply({ thread: { id: 'review-cleared' } });
+    await clearing;
+    host.dispose();
+  },
+);
+
+test('read-only Claude retains tool restrictions through permission refusal and continuation', async () => {
+  const { host, children, commands } = fakeHost();
+  const starting = host.session(
+    'review',
+    claudePlan(CLAUDE, { cwd: WS, sessionId: 'review', policy: launchPolicy('claude', true) }),
+  );
+  children[0].answerHandshake();
+  const session = await starting;
+  const args = commands[0];
+  for (const rule of ['Write', 'Edit', 'Agent', 'PowerShell', 'Bash(git stash)', 'Bash(git -C * update-ref *)'])
+    assert.ok(args.includes(rule));
+  assert.equal(args[args.indexOf('--setting-sources') + 1], '');
+  assert.ok(args.includes('--strict-mcp-config'));
+  assert.equal(args[args.indexOf('--permission-prompts') + 1], 'none');
+  await assert.rejects(session.setAskMode(defaultAskMode('claude')), /read-only/);
+  children[0].say(
+    JSON.stringify({
+      type: 'control_request',
+      request_id: 'write',
+      request: {
+        subtype: 'can_use_tool',
+        tool_name: 'Write',
+        input: { file_path: 'forbidden' },
+        tool_use_id: 'write-1',
+      },
+    }) + '\n',
+  );
+  assert.equal(session.answer('write', { decision: 'allow' }), false);
+  assert.equal(session.answer('write', { decision: 'deny', reason: 'Read-only session.' }), true);
+  await session.prompt('read this repository');
+  children[0].say(COMPLETED_RESULT);
+  await session.clear();
+  children[0].say(COMPLETED_RESULT);
+  await session.prompt('read again');
+  assert.equal(commands.length, 1);
+  host.dispose();
+});
 
 // Restore real timers after every test, including tests whose assertions throw.
 
@@ -301,7 +392,13 @@ async function answerCodexHandshake(
 function fakeHost(
   openingDeadlineMs?: number,
   now?: () => number,
-  lifecycle: { idleDurationMs?: number; timer?: AgentHostTimer; exitGraceMs?: number } = {},
+  lifecycle: {
+    idleDurationMs?: number;
+    timer?: AgentHostTimer;
+    exitGraceMs?: number;
+    onEvent?: (event: SessionEvent) => void;
+    onStateChange?: (state: SessionState) => void;
+  } = {},
 ): {
   host: AgentHost;
   children: FakeChild[];
@@ -328,8 +425,14 @@ function fakeHost(
       children.push(child);
       return child;
     },
-    onEvent: (event) => events.push(event),
-    onStateChange: (state) => states.push(state),
+    onEvent: (event) => {
+      events.push(event);
+      lifecycle.onEvent?.(event);
+    },
+    onStateChange: (state) => {
+      states.push(state);
+      lifecycle.onStateChange?.(state);
+    },
   });
   return { host, children, events, states, commands, envs };
 }
@@ -337,6 +440,273 @@ function fakeHost(
 function settle(host: AgentHost, key: string): void {
   host.settled(host.beginHousekeeping(key));
 }
+
+// Exercise the extension's policy callbacks with the host's native transport fixtures.
+function policyCallbacks(host: AgentHost, policies: LaunchPolicyStore) {
+  const source = fs.readFileSync(path.join(__dirname, 'extension.ts'), 'utf8');
+  const moves: string[][] = [];
+  const modes: unknown[] = [];
+  const errors: string[] = [];
+  const panel: any = {
+    refresh() {},
+    noteSessionMoved: (source: string, next: string) => moves.push([source, next]),
+    setCodexEffectiveMode: (...args: unknown[]) => modes.push(args),
+  };
+  const at = source.indexOf("      if (event.kind === 'session') {\n        const policy =");
+  const ownership = source.indexOf("if (event.kind === 'session' && event.previous", at);
+  const eventCode =
+    source.slice(at, source.indexOf('      // Publish busy children', at)) +
+    source.slice(ownership, source.indexOf("      if (event.kind === 'permissionMode')", ownership));
+  const stateAt = source.indexOf('    onStateChange: (state) => {');
+  const stateCode = source.slice(
+    stateAt + '    onStateChange: (state) => {'.length,
+    source.indexOf('      if (commandStateChanges', stateAt),
+  );
+  const scope = {
+    host,
+    policies,
+    panel,
+    policyMoves: new Map(),
+    compaction: null,
+    vscode: { window: { showErrorMessage: (message: string) => errors.push(message) } },
+    withExistingSessionActivity: async (agent: any, session: string, _cwd: string, work: any) => {
+      const child = host.find(agent, session);
+      assert.ok(child);
+      return host.withActivity(child.key, work);
+    },
+    savePolicy: async (id: string, policy: any) => {
+      if (policy) policies.write(id, policy);
+    },
+    failedClearDelivery: (_agent: string, error: Error) => ({ delivered: false, reason: error.message }),
+  };
+  const code = esbuild.transformSync(
+    `${statementFrom(source, source.indexOf('panel.onClear ='))};
+    return {
+      event: ({key, event}) => { const agent = host.get(key)?.agent; ${eventCode} },
+      state: (state) => { ${stateCode} },
+    };`,
+    { loader: 'ts' },
+  ).code;
+  const callbacks = runInNewContext(`(function() { ${code} })()`, scope);
+  return { ...callbacks, panel, moves, modes, errors };
+}
+
+test.each(['same chunk', 'separate chunks'])(
+  'pending restricted clear preserves unrestricted Claude output in %s',
+  async (chunks) => {
+    const root = tempDir('arc-policy-output-');
+    let callbacks: ReturnType<typeof policyCallbacks>;
+    const fixture = fakeHost(undefined, undefined, {
+      onEvent: (event) => callbacks?.event(event),
+      onStateChange: (state) => callbacks?.state(state),
+    });
+    const { host, children, events } = fixture;
+    try {
+      const policies = new LaunchPolicyStore(root);
+      callbacks = policyCallbacks(host, policies);
+      const policy = launchPolicy('claude', true)!;
+      policies.write('restricted', policy);
+      for (const id of ['restricted', 'ordinary']) {
+        const opening = host.session(
+          id,
+          claudePlan(CLAUDE, { cwd: WS, sessionId: id, ...(id === 'restricted' ? { policy } : {}) }),
+        );
+        children.at(-1)!.answerHandshake();
+        await opening;
+      }
+      assert.equal((await callbacks.panel.onClear('claude', 'restricted', WS)).delivered, true);
+      const ordinaryClear = await callbacks.panel.onClear('claude', 'ordinary', WS);
+      const result =
+        JSON.stringify({ type: 'result', session_id: 'ordinary-next', num_turns: 1, subtype: 'success' }) + '\n';
+      const later = JSON.stringify({ type: 'system', subtype: 'session_state_changed', state: 'idle' }) + '\n';
+      if (chunks === 'same chunk') children[1].say(result + later);
+      else {
+        children[1].say(result);
+        children[1].say(later);
+      }
+      assert.equal(ordinaryClear.delivered, true);
+      assert.equal(host.get('ordinary')!.state().busy, false);
+      assert.ok(events.some(({ key, event }) => key === 'ordinary' && event.kind === 'turnEnd'));
+      assert.ok(
+        events.some(({ key, event }) => key === 'ordinary' && event.kind === 'sessionState' && event.state === 'idle'),
+      );
+      assert.deepEqual(callbacks.moves, [['ordinary', 'ordinary-next']]);
+      assert.throws(() => new LaunchPolicyStore(root).read('unknown'), /cannot continue/);
+    } finally {
+      host.dispose();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  },
+);
+
+test('pending restricted Claude clear preserves unrestricted Codex clear and reader permission picks', async () => {
+  const root = tempDir('arc-policy-codex-');
+  let callbacks: ReturnType<typeof policyCallbacks>;
+  const { host, children } = fakeHost(undefined, undefined, {
+    onEvent: (event) => callbacks?.event(event),
+    onStateChange: (state) => callbacks?.state(state),
+  });
+  try {
+    const policies = new LaunchPolicyStore(root);
+    callbacks = policyCallbacks(host, policies);
+    policies.write('restricted', launchPolicy('claude', true)!);
+    policies.prepareClear('other-window', 'restricted');
+    const opening = host.session('ordinary', codexPlan(CODEX, { cwd: WS, clientInfo: CODEX_CLIENT }));
+    const child = children[0];
+    child.reply({ userAgent: 'codex' });
+    await vi.waitFor(() => assert.equal(child.sent().at(-1)?.method, 'skills/list'));
+    child.reply({ data: [{ cwd: WS, skills: [] }] });
+    await vi.waitFor(() => assert.equal(child.sent().at(-1)?.method, 'thread/start'));
+    child.reply({
+      thread: { id: 'ordinary' },
+      approvalPolicy: 'on-request',
+      approvalsReviewer: 'user',
+      sandbox: { type: 'workspaceWrite' },
+    });
+    const live = await opening;
+    const clearing = callbacks.panel.onClear('codex', 'ordinary', WS);
+    await vi.waitFor(() => assert.equal(child.sent().at(-1)?.method, 'thread/start'));
+    child.reply({
+      thread: { id: 'ordinary-next' },
+      approvalPolicy: 'on-request',
+      approvalsReviewer: 'user',
+      sandbox: { type: 'workspaceWrite' },
+    });
+    assert.equal((await clearing).delivered, true);
+    assert.equal(live.state().sessionId, 'ordinary-next');
+    assert.equal(live.state().busy, false);
+    assert.deepEqual(callbacks.moves, [['ordinary', 'ordinary-next']]);
+    assert.equal(callbacks.modes.length, 2);
+    const source = fs.readFileSync(path.join(__dirname, 'extension.ts'), 'utf8');
+    let writes = 0;
+    const scope = {
+      host,
+      policies,
+      refusePolicyChange: () => assert.fail('unrestricted permission refused'),
+      compaction: null,
+      guardedSends: { invalidate() {} },
+      panel: { clearEffectiveModes() {} },
+      settingBook: () => ({}),
+      withSessionSettings,
+      sessionSettings,
+      persistSettingBook: async () => {
+        writes++;
+      },
+      publishPicks() {},
+      acceptedPermissionMode,
+      context: {
+        workspaceState: {
+          update: async () => {
+            writes++;
+          },
+        },
+      },
+      stored: () => ({}),
+      ASK_MODE_KEY: 'ask',
+    };
+    const pick = runInNewContext(
+      `(function() { ${
+        esbuild.transformSync(
+          `${statementFrom(source, source.indexOf('const setAskModeFor ='))}; return setAskModeFor;`,
+          { loader: 'ts' },
+        ).code
+      } })()`,
+      scope,
+    );
+    await pick(
+      'codex',
+      { value: 'workspace-write', codex: { approvalPolicy: 'on-request', sandbox: 'workspace-write' } },
+      'ordinary-next',
+    );
+    const end = child.stdin.end;
+    child.stdin.end = () => {
+      end();
+      child.exit(0);
+    };
+    await pick('codex', { value: '' }, 'ordinary-next');
+    await pick('codex', { value: '' });
+    assert.ok(writes >= 2);
+    assert.throws(() => new LaunchPolicyStore(root).read('unknown'), /cannot continue/);
+  } finally {
+    host.dispose();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test.each(['closed wire', 'pre-write refusal', 'unknown write', 'preparation failure', 'other reservation'])(
+  'restricted clear preserves outcome ownership after %s',
+  async (failure) => {
+    const root = tempDir('arc-policy-write-');
+    let callbacks: ReturnType<typeof policyCallbacks>;
+    let refusing = false;
+    const { host, children } = fakeHost(undefined, undefined, {
+      onEvent: (event) => {
+        callbacks?.event(event);
+        if (refusing && event.event.kind === 'native' && event.event.event.kind === 'submission')
+          throw new Error('positive refusal before input write');
+      },
+      onStateChange: (state) => callbacks?.state(state),
+    });
+    try {
+      const policies = new LaunchPolicyStore(root);
+      callbacks = policyCallbacks(host, policies);
+      const policy = launchPolicy('claude', true)!;
+      policies.write('restricted', policy);
+      const opening = host.session('owned', claudePlan(CLAUDE, { cwd: WS, sessionId: 'restricted', policy }));
+      const child = children[0];
+      child.answerHandshake();
+      const live = await opening;
+      const before = child.written.length;
+      if (failure === 'closed wire') live.driver.close('closed before clear');
+      if (failure === 'pre-write refusal') refusing = true;
+      if (failure === 'unknown write') failNextWrite(child, 'write outcome unknown');
+      let previous: Buffer | undefined;
+      if (failure === 'other reservation') {
+        policies.prepareClear('other-child', 'restricted');
+        previous = fs.readFileSync(path.join(root, 'pending-clear.json'));
+      }
+      if (failure === 'preparation failure') {
+        const nativeFs = (await import('node:fs')).default;
+        const write = nativeFs.writeFileSync;
+        vi.spyOn(nativeFs, 'writeFileSync').mockImplementation(((file: any, ...args: any[]) => {
+          if (typeof file === 'number') throw new Error('reservation write refused');
+          return (write as any)(file, ...args);
+        }) as typeof fs.writeFileSync);
+      }
+      assert.equal((await callbacks.panel.onClear('claude', 'restricted', WS)).delivered, false);
+      assert.equal(child.written.length, before);
+      refusing = false;
+      vi.restoreAllMocks();
+      assert.deepEqual(new LaunchPolicyStore(root).read('restricted'), policy);
+      if (failure === 'other reservation') {
+        assert.deepEqual(fs.readFileSync(path.join(root, 'pending-clear.json')), previous);
+      } else if (failure === 'unknown write') {
+        assert.throws(() => new LaunchPolicyStore(root).read('unknown'), /cannot continue/);
+        child.exit(0);
+        const reopening = host.session('owned', claudePlan(CLAUDE, { cwd: WS, sessionId: 'restricted', policy }));
+        children[1].answerHandshake();
+        await reopening;
+        child.say(JSON.stringify({ type: 'system', subtype: 'init', session_id: 'stale-successor', tools: [] }) + '\n');
+        assert.equal(policies.readSaved('stale-successor'), undefined);
+        children[1].say(
+          JSON.stringify({ type: 'system', subtype: 'init', session_id: 'new-successor', tools: [] }) + '\n',
+        );
+        assert.deepEqual(policies.readSaved('new-successor'), policy);
+        assert.throws(() => new LaunchPolicyStore(root).read('unknown'), /cannot continue/);
+      } else {
+        assert.equal(new LaunchPolicyStore(root).read('unknown'), undefined);
+        if (failure === 'pre-write refusal' || failure === 'preparation failure') {
+          assert.equal((await callbacks.panel.onClear('claude', 'restricted', WS)).delivered, true);
+          assert.throws(() => new LaunchPolicyStore(root).read('unknown'), /cannot continue/);
+        }
+      }
+    } finally {
+      vi.restoreAllMocks();
+      host.dispose();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  },
+);
 
 test('Claude response speed requires a sole prompt owner established at response start', async () => {
   const SESSION = 'speed-session';
