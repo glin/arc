@@ -74,31 +74,49 @@ Use either `--next-turn` or `--json`. Width also reads the `COLUMNS` environment
 
 The next-turn price estimates the minimum cost of sending the existing context again, including the latest answer. It excludes your next prompt and the model's next answer. An unknown cache state uses the uncached estimate. Missing cache fields show an unknown state. Session cost comes from Claude Code.
 
-If Claude Code cannot find `arc`, use an absolute path in the command. Three forms work.
+If Claude Code cannot find `arc`, use an absolute path in the command. Quote the path to support folders with spaces. The examples below are shell command strings for the `command` setting.
 
 For the launchers that **Arc: Set up terminal commands** writes, use the path that setup reports, with forward slashes on Windows. [Terminal availability](../README.md#terminal-availability) owns the install folder and the reported path. The commands below show the default folder:
 
 ```text
-C:/Users/NAME/.arc/bin/arc.cmd statusline
-$HOME/.arc/bin/arc statusline
+"C:/Users/NAME/.arc/bin/arc.cmd" statusline
+"$HOME/.arc/bin/arc" statusline
 ```
 
 For a global package installation, find the prefix with `npm prefix --global` and call the bundle with Node.js. On Windows:
 
 ```text
-node C:/path/to/npm-prefix/node_modules/@glin/arc/dist/arc.cjs statusline
+node "C:/path/to/npm-prefix/node_modules/@glin/arc/dist/arc.cjs" statusline
 ```
 
 On macOS and Linux:
 
 ```text
-node /path/to/npm-prefix/lib/node_modules/@glin/arc/dist/arc.cjs statusline
+node "/path/to/npm-prefix/lib/node_modules/@glin/arc/dist/arc.cjs" statusline
 ```
 
-For a source build, follow [Build from source](#build-from-source) through `npm --prefix cli ci`. Then run `npm --prefix cli run build` in the checkout and call the bundle with Node.js:
+For a source build, follow [Build from source](#build-from-source) through `npm --prefix cli ci`. Run `npm --prefix cli run build` in the checkout. Then call the bundle with Node.js:
 
 ```text
-node /path/to/checkout/cli/dist/arc.cjs statusline
+node "/path/to/checkout/cli/dist/arc.cjs" statusline
+```
+
+Escape each double quote as `\"` inside the JSON command string. For example:
+
+```json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "\"C:/Users/NAME/.arc/bin/arc.cmd\" statusline",
+    "padding": 0
+  }
+}
+```
+
+When running a quoted launcher directly in PowerShell, add the call operator:
+
+```powershell
+& "C:/Users/NAME/.arc/bin/arc.cmd" statusline
 ```
 
 ### Show the next-turn price in another status line
@@ -120,6 +138,7 @@ Then add the widget to a line in `~/.config/ccstatusline/settings.json`. Use a l
 
 ```json
 {
+  "id": "arc-next-turn",
   "type": "custom-command",
   "commandPath": "arc statusline --next-turn",
   "timeout": 1000
@@ -211,6 +230,7 @@ The [CLI guide](https://github.com/glin/arc/blob/main/docs/cli.md#windows) expla
 Source builds use Node.js 20.19+ (20.x) or 22.12+. From the [Arc repository](https://github.com/glin/arc), run:
 
 ```sh
+npm --prefix extension ci
 npm --prefix cli ci
 npm --prefix cli test
 npm pack ./cli
