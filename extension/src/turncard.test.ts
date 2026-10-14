@@ -12,6 +12,7 @@ import { readCodexAgentSpend, refreshCodexStructuralAgents } from './codex.ts';
 import { AgentSpendCache, emptyUsage, readChildSpend, spendFileVersion } from './agentspend.ts';
 import { tempDir } from './temproot.ts';
 import * as pricing from './pricing.ts';
+import * as richtext from './richtext.ts';
 import {
   Compaction,
   NARRATION_DETAIL_LIMIT,
@@ -2168,6 +2169,24 @@ test('the headline is the summary, the error, or what the turn ended up doing', 
   assert.equal(headlineFor(turn({ prompt: '' }), 'running'), 'Still working.');
   assert.equal(headlineFor(turn(), 'interrupted'), 'Stopped by you before it answered.');
   assert.equal(headlineFor(turn(), 'stopped'), 'Ended without a closing message.');
+});
+
+// The plain and formatted headlines read one selected source. A second selection would parse the whole response again.
+test('a card parses its response once to select the plain and formatted headlines', () => {
+  const parses = vi.spyOn(richtext, 'markdownCodeBlocks');
+  try {
+    for (const summary of ['**Done.** The `build` passes.\n\n```ts\nconst a = 1;\n```', '## Summary']) {
+      parses.mockClear();
+      toCard(turn({ summary }), false, NOW);
+      assert.equal(
+        parses.mock.calls.length,
+        1,
+        `a card for ${JSON.stringify(summary)} parsed its response ${parses.mock.calls.length} times`,
+      );
+    }
+  } finally {
+    parses.mockRestore();
+  }
 });
 
 test('the collapsed headline keeps an inline-code identifier intact', () => {

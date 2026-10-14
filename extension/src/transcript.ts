@@ -5432,7 +5432,9 @@ function stripMarkdown(line: string): string {
 }
 
 // Selects the first content-bearing summary line and retains its fenced-code context.
-export function headlineSourceOf(summary: string): { text: string; fenced: boolean } | null {
+export type HeadlineSource = { text: string; fenced: boolean };
+
+export function headlineSourceOf(summary: string): HeadlineSource | null {
   const blocks = markdownCodeBlocks(summary);
   let blockIndex = 0;
   let offset = 0;
@@ -5460,9 +5462,9 @@ export function headlineSourceOf(summary: string): { text: string; fenced: boole
 }
 
 // The one line that says what the turn did: the first line of the summary that carries
-// content rather than naming a section.
-export function headlineOf(summary: string): string {
-  const source = headlineSourceOf(summary);
+// content rather than naming a section. A caller that already selected the source from the
+// same summary passes it in, and a selected null is a valid result that skips selecting again.
+export function headlineOf(summary: string, source: HeadlineSource | null = headlineSourceOf(summary)): string {
   return source === null ? '' : source.fenced ? source.text : stripInlineMarkdown(source.text);
 }
 

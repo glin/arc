@@ -66,6 +66,7 @@ import {
   firstLine,
   headlineSourceOf,
   headlineOf,
+  type HeadlineSource,
   isInside,
   normalizeFsPath,
   openingLines,
@@ -3744,13 +3745,14 @@ export function averageContextPerRequest(usage: Turn['usage']): number | null {
 }
 
 // Selects a summary headline, error, running prompt, or stock ending text.
-// Callers share the readable rich-text summary with inline headline rendering.
+// Callers share the readable rich-text summary and its selected headline source with inline headline rendering.
 export function headlineFor(
   turn: Pick<Turn, 'summary' | 'error' | 'prompt'>,
   status: TurnStatus,
   readableSummary: string = readableRichText(turn.summary),
+  source: HeadlineSource | null = headlineSourceOf(readableSummary),
 ): string {
-  const headline = headlineOf(readableSummary);
+  const headline = headlineOf(readableSummary, source);
   if (headline) {
     return headline;
   }
@@ -3769,8 +3771,11 @@ export function headlineFor(
 
 // Renders summary-derived headline Markdown only when its visible text matches the plain headline.
 // A mismatch leaves the plain headline for consistent display, hover, and accessible text.
-function headlineHtmlFor(summaryText: string, headline: string): string | undefined {
-  const source = headlineSourceOf(summaryText);
+function headlineHtmlFor(
+  summaryText: string,
+  headline: string,
+  source: HeadlineSource | null = headlineSourceOf(summaryText),
+): string | undefined {
   if (!source || source.fenced) return undefined;
   const line = withoutLeadingSymbol(source.text.trim());
   if (line === headline) {
@@ -4374,8 +4379,9 @@ export function toCard(
   const lastRelative = formatRelative(turn.endedAt, now);
   const model = shortModel(turn.model);
   const readableSummary = readableRichText(turn.summary);
-  const headline = withoutLeadingSymbol(headlineFor(turn, status, readableSummary));
-  const headlineHtml = headlineHtmlFor(readableSummary, headline);
+  const headlineSource = headlineSourceOf(readableSummary);
+  const headline = withoutLeadingSymbol(headlineFor(turn, status, readableSummary, headlineSource));
+  const headlineHtml = headlineHtmlFor(readableSummary, headline, headlineSource);
   const rows = closingRows(turn.summary);
   // Select current activity only while the turn displays running.
   const onNow = status === 'running' ? doingOf(turn) : null;
