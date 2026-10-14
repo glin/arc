@@ -2729,6 +2729,16 @@ test('accepted response ownership survives Stop and a late interrupted ending', 
   assert.equal(session.state().busy, true);
 });
 
+test('the extension forwards stopped dispatch ownership separately from panel ownership', () => {
+  const activate = declarationSource(fs.readFileSync(path.join(__dirname, 'extension.ts'), 'utf8'), 'activate');
+  const host = statementFrom(activate, activate.indexOf('const host = new AgentHost('));
+  sourceMatch(
+    host,
+    /onEvent: \(\{ key, event, turnId, dispatchTurnId \}\) => \{\s*panel\.onDispatchEvent\?\.\(key, event, dispatchTurnId \?\? turnId\);/,
+    'the stopped dispatch owner must reach the panel dispatch observer',
+  );
+});
+
 test.each(['none', 'later', 'expired', 'idle', 'failed'] as const)(
   'Claude Stop retains dispatch ownership: %s',
   async (mode) => {
@@ -2837,6 +2847,11 @@ test.each(['none', 'later', 'expired', 'idle', 'failed'] as const)(
       );
       assert.equal((interrupted.nativeEnding as { generation: number } | null)?.generation, 1);
       assert.equal(session.state().busy, later);
+      const nativeEnding = events
+        .filter(({ event }) => event.kind === 'native' && event.event.kind === 'rootEnd')
+        .at(-1);
+      assert.equal(nativeEnding?.turnId, undefined, 'the stopped native ending must not own the later panel turn');
+      assert.equal(nativeEnding?.dispatchTurnId, first, 'the stopped native ending must retain its dispatch owner');
       assert.equal(events.filter(({ event }) => event.kind === 'turnEnd').at(-1)?.turnId, undefined);
       saved = {
         text: 'Partial',
