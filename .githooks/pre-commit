@@ -19,12 +19,19 @@ tool() {
 }
 
 files=()
+cssfiles=()
 while IFS= read -r -d '' path; do
   if [ -L "$path" ]; then
     continue
   elif git --literal-pathspecs diff --quiet -- "$path"; then
     # The ./ prefix keeps a name such as --fix or !x from reading as an option or an exclusion.
     files+=("./$path")
+    case "$path" in
+      extension/src/webview/*.css)
+        csspath=${path#extension/src/webview/}
+        [[ "$csspath" != */* ]] && cssfiles+=("./$path")
+        ;;
+    esac
   else
     printf 'pre-commit: %s is partly staged, so its format and lint are not checked.\n' "$path" >&2
   fi
@@ -40,6 +47,18 @@ oxfmt=$(tool oxfmt) && oxlint=$(tool oxlint) || {
 status=0
 "$oxfmt" --disable-nested-config --check --no-error-on-unmatched-pattern "${files[@]}" || status=1
 "$oxlint" --disable-nested-config --deny-warnings --no-error-on-unmatched-pattern "${files[@]}" || status=1
+if [ ${#cssfiles[@]} -ne 0 ]; then
+  if stylelint=$(tool stylelint); then
+    stylelint_base=${stylelint%/node_modules/.bin/stylelint}
+    for file in "${cssfiles[@]}"; do
+      # Standard input preserves literal names that contain glob characters.
+      "$stylelint" --config "$root/.stylelintrc.cjs" --config-basedir "$stylelint_base" --max-warnings 0 --stdin-filename "$file" < "$file" || status=1
+    done
+  else
+    echo 'pre-commit: stylelint is not installed, so the commit stopped. Run npm install in this checkout, then commit again.' >&2
+    status=1
+  fi
+fi
 if [ $status -ne 0 ]; then
   echo 'pre-commit: fix the problems above, stage the fixes, and commit again.' >&2
 fi

@@ -5,10 +5,12 @@
   "scripts": {
     "eval:review": "node evals/agent-review/run.mjs",
     "prepare": "node scripts/install-git-hooks.js",
-    "format": "oxfmt --disable-nested-config extension cli docs scripts plugins test evals .github .vscode .claude-plugin .codex README.md CHANGELOG.md CLAUDE.md package.json vitest.config.mts .oxfmtrc.json .oxlintrc.jsonc",
+    "format": "oxfmt --disable-nested-config extension cli docs scripts plugins test evals .github .vscode .claude-plugin .codex README.md CHANGELOG.md CLAUDE.md package.json vitest.config.mts .oxfmtrc.json .oxlintrc.jsonc .stylelintrc.cjs",
     "format:check": "npm run format -- --check",
-    "lint": "oxlint --disable-nested-config --deny-warnings extension cli scripts plugins test evals .github vitest.config.mts",
-    "lint:fix": "npm run lint -- --fix",
+    "lint": "npm run lint:js && npm run lint:css",
+    "lint:js": "oxlint --disable-nested-config --deny-warnings extension cli scripts plugins test evals .github vitest.config.mts .stylelintrc.cjs",
+    "lint:css": "stylelint --config .stylelintrc.cjs --max-warnings 0 \"extension/src/webview/*.css\"",
+    "lint:fix": "npm run lint:js -- --fix",
     "release": "node scripts/release-version.js",
     "test": "npm run format:check && npm run lint && npm run typecheck && npm run test:unit && npm run test:smoke",
     "test:iterate": "npm run typecheck && npm --prefix extension run test:node",
@@ -22,6 +24,8 @@
     "oxfmt": "0.67.0",
     "oxlint": "1.82.0",
     "oxlint-tsgolint": "7.0.2001",
+    "stylelint": "17.16.0",
+    "stylelint-config-recommended": "18.0.0",
     "vitest": "4.1.11"
   }
 }
