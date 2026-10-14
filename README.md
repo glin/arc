@@ -1,6 +1,6 @@
 # Arc
 
-Arc is a VS Code extension for working with Claude Code and Codex. **Experimental, personal software.**
+Arc is a VS Code extension for working with Claude Code and Codex. (*Personal software, experimental*)
 
 [Web demo](https://glin.github.io/arc/)
 
