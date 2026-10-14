@@ -34564,35 +34564,81 @@ test('catalog prefix resolution suspends through discovery progress failure canc
   assert.equal(read('').coverage, 'unavailable');
 });
 
-test('unchanged refresh generations keep active plain content search without replacement requests', async () => {
-  const { createSearchRenderer } = await import('./webview/search.ts');
-  const { provider } = pagedListingFixture(30);
-  const context = provider.sessionQueryContext();
-  const requests: any[] = [];
-  const body = handlerBody(script, 'startupProgress');
-  const end = body.indexOf('if (msg.queryOnly) return;');
-  const apply = new Function(
-    'msg',
-    'latest',
-    'searchRenderer',
-    'railRenderer',
-    'workspaceCatalogAvailable',
-    body.slice(0, end),
-  );
-  const latest = { queryContext: context };
-  const renderer = createSearchRenderer({
-    document: { createElement: () => ({}) } as any,
-    sendToHost: (message) => requests.push(message),
+for (const count of [100, 1000]) {
+  test(`unchanged refresh generations keep content search and avoid session list updates at ${count} identities`, async () => {
+    const { createSearchRenderer } = await import('./webview/search.ts');
+    const { provider } = pagedListingFixture(30);
+    const retained = provider.sessionQueryContext();
+    const context = {
+      ...retained,
+      identities: Array.from({ length: count }, (_, index) => ({
+        sessionId: `session-${index}`,
+        agent: index % 2 ? 'codex' : 'claude',
+      })),
+    };
+    const requests: any[] = [];
+    const body = handlerBody(script, 'startupProgress');
+    const end = body.indexOf('if (msg.queryOnly) return;');
+    const apply = new Function(
+      'msg',
+      'latest',
+      'searchRenderer',
+      'railRenderer',
+      'workspaceCatalogAvailable',
+      body.slice(0, end),
+    );
+    const latest: any = { queryContext: context };
+    const renderer = createSearchRenderer({
+      document: { createElement: () => ({}) } as any,
+      sendToHost: (message) => requests.push(message),
+    });
+    renderer.start('needle');
+    renderer.accept('find: needle', 'workspace', []);
+    let updates = 0;
+    let refreshes = 0;
+    const railRenderer = {
+      update() {
+        updates++;
+      },
+    };
+    const searchRenderer = {
+      refresh() {
+        refreshes++;
+        renderer.refresh();
+      },
+    };
+    for (let generation = 2; generation < 6; generation++) {
+      provider.refreshGeneration = generation;
+      assert.equal(provider.sessionQueryContext(), retained);
+      const incoming = structuredClone(context);
+      assert.notEqual(incoming, latest.queryContext);
+      assert.notEqual(incoming.identities[0], latest.queryContext.identities[0]);
+      apply({ generation, queryContext: incoming }, latest, searchRenderer, railRenderer, true);
+      assert.equal(updates, 0, 'unchanged startup context updated the session list');
+      assert.equal(refreshes, 0, 'unchanged startup context refreshed search');
+      assert.equal(latest.queryContext, incoming, 'incoming context was not retained');
+    }
+    assert.deepEqual(requests, [{ type: 'search', text: 'find: needle' }]);
+    for (const field of ['scope', 'revision', 'coverage', 'count', 'sessionId', 'agent', 'order', 'first']) {
+      latest.queryContext = field === 'first' ? undefined : context;
+      const incoming = structuredClone(context);
+      if (field === 'scope') incoming.scope += '-changed';
+      if (field === 'revision') incoming.revision += '-changed';
+      if (field === 'coverage') incoming.coverage = 'incomplete';
+      if (field === 'count') incoming.identities.pop();
+      if (field === 'sessionId') incoming.identities[0].sessionId += '-changed';
+      if (field === 'agent') incoming.identities[0].agent = 'codex';
+      if (field === 'order')
+        [incoming.identities[0], incoming.identities[1]] = [incoming.identities[1], incoming.identities[0]];
+      const beforeUpdates = updates;
+      const beforeRefreshes = refreshes;
+      apply({ generation: 1, queryOnly: true, queryContext: incoming }, latest, searchRenderer, railRenderer, true);
+      assert.equal(updates, beforeUpdates + 1, `${field} changed context did not update the session list once`);
+      assert.equal(refreshes, beforeRefreshes + 1, `${field} changed context did not refresh search once`);
+      assert.equal(latest.queryContext, incoming, `${field} changed context was not retained`);
+    }
   });
-  renderer.start('needle');
-  renderer.accept('find: needle', 'workspace', []);
-  for (let generation = 2; generation < 6; generation++) {
-    provider.refreshGeneration = generation;
-    apply({ queryContext: provider.sessionQueryContext() }, latest, renderer, { update() {} }, true);
-  }
-  assert.deepEqual(requests, [{ type: 'search', text: 'find: needle' }]);
-  assert.equal(provider.sessionQueryContext(), context);
-});
+}
 
 test('identity updates search retained content without rereading transcripts', () => {
   const { provider, sources } = pagedListingFixture(30);

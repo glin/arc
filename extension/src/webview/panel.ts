@@ -1158,22 +1158,31 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
       visibility: (msg) => visibility.receive(msg),
       startupProgress: function (msg) {
         if (latest && msg.queryContext) {
-          if (
-            latest.queryContext?.scope !== msg.queryContext.scope ||
-            latest.queryContext?.revision !== msg.queryContext.revision ||
-            latest.queryContext?.coverage !== msg.queryContext.coverage
-          )
-            searchRenderer.refresh();
+          const previous = latest.queryContext;
+          const changed =
+            !previous ||
+            previous.scope !== msg.queryContext.scope ||
+            previous.revision !== msg.queryContext.revision ||
+            previous.coverage !== msg.queryContext.coverage ||
+            previous.identities.length !== msg.queryContext.identities.length ||
+            msg.queryContext.identities.some(
+              (identity, index) =>
+                identity.sessionId !== previous.identities[index].sessionId ||
+                identity.agent !== previous.identities[index].agent,
+            );
           latest.queryContext = msg.queryContext;
-          railRenderer.update(
-            latest.rail,
-            latest.labels,
-            latest.views,
-            latest.railFilters,
-            latest.stats,
-            workspaceCatalogAvailable,
-            msg.queryContext,
-          );
+          if (changed) {
+            searchRenderer.refresh();
+            railRenderer.update(
+              latest.rail,
+              latest.labels,
+              latest.views,
+              latest.railFilters,
+              latest.stats,
+              workspaceCatalogAvailable,
+              msg.queryContext,
+            );
+          }
         }
         if (msg.queryOnly) return;
         if (
