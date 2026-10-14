@@ -80,7 +80,7 @@ The panel has a session list beside one selected session view. Use the region na
 
 ## Cost, context, and caching
 
-[`agent-cost-guide.md`](agent-cost-guide.md) owns Arc's supported pricing and the meaning of its cost figures. [`lowering-agent-costs.md`](lowering-agent-costs.md) owns the decision guidance and the client-neutral explanation of how requests, the prompt cache, and queued messages set the bill. The terms below are the stable project vocabulary.
+[`agent-cost-guide.md`](agent-cost-guide.md) owns Arc's supported pricing and the meaning of its cost figures. [`lowering-agent-costs.md`](lowering-agent-costs.md) owns the decision guidance and the client-neutral explanation of how requests and the prompt cache set the bill. The terms below are the stable project vocabulary.
 
 | Term | Meaning | Usage notes |
 | --- | --- | --- |

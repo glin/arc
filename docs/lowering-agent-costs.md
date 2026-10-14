@@ -2,114 +2,143 @@
 
 ## Live session costs
 
-Seeing live costs helps you understand model differences, caching, and which ways of working cost less. It also helps you catch runaway sessions early.
+Seeing live session costs has been the one most effective thing for understanding agent costs. Very useful for understanding model differences, how caching works, effective orchestration patterns, and identifying runaway sessions early.
+
+Unfortunately most tools either make costs hard to see or aren't granular enough to show breakdown by turn/subagent/etc.
 
 ### Claude Code CLI
 
-[ccstatusline](https://github.com/sirmalloc/ccstatusline) adds a live cost display and other stats to the status line. It does not show individual turn costs, but the session total still helps.
+[ccstatusline](https://github.com/sirmalloc/ccstatusline) adds a live cost display and other stats to the status line. It doesn't show individual turn costs or everything from `/cost`, but it still helps a lot.
 
 ```sh
 npx -y ccstatusline@latest
 ```
 
-Useful widgets: Model, Context Length, Cache Read, Cache Timer, and Session Cost.
+Useful fields to add: Model, Context Length, Cache Read, Cache Timer, and Session Cost.
 
 ```text
 Model: Sonnet 5 | Ctx: 69.1k | Cache Read: 63.5k (91.9%) | Cache: 54:48 | Cost: $0.28
 ```
 
-The cache timer defaults to five minutes. Select the Cache Timer widget and press `t` to choose one hour for Claude subscriptions within plan usage. Match the timer to your billing route, using the cache lifetimes below.
-
-Claude Code's dollar figure is a list-price estimate, not an invoice or a subscription-limit meter.
+ccstatusline's cache timer defaults to 5 minutes, so make sure to bump it to one hour (select the Cache Timer widget in the ccstatusline editor and press `t`) to match the default cache timer on Claude subscriptions / Enterprise plans.
 
 ### Codex CLI
 
-Codex's `/status` and status line show tokens and rate limits, without a dollar figure. Run `/statusline` to select useful fields, or set them in `~/.codex/config.toml`:
+Codex has a very limited status line with only a few preset fields, no custom status lines. On Bedrock, it's not possible to see costs in either `/status` or the status line. Use Posit Assistant or a separate tool like AgentsView instead. `agentsview session usage <session-id> --json` prices one Claude or Codex session, subagents included.
+
+The status line still has useful stats though, so run `/statusline` and select useful fields like: model, context used, context window, used tokens, and rate limits. Or set them in `~/.codex/config.toml`:
 
 ```toml
 [tui]
 status_line = ["model-with-reasoning", "context-used", "context-window-size", "used-tokens", "five-hour-limit", "weekly-limit"]
 ```
 
-See the [Codex configuration reference](https://developers.openai.com/codex/config-reference/).
+### Posit Assistant in Positron
 
-For cost estimates by session ID, use [AgentsView](https://www.agentsview.io/docs/session-intelligence/):
+[Posit Assistant](https://positron.posit.co/assistant.html) shows live costs with turn-level breakdowns and very detailed tables/charts. I also recommend enabling always-shown turn costs in `~/.posit/assistant/settings.json`:
 
-```sh
-agentsview session usage <session-id> --json
+```json
+{
+  "features": {
+    "enablePersonaSelector": true,
+    "showTurnCost": true
+  }
+}
 ```
 
-It includes subagents unless you pass `--own-only`. Treat `has_cost: false` as unknown cost, not zero.
+We can't use Claude Enterprise plan with Posit Assistant, but OpenAI models work just fine with Bedrock.
 
 ## Keep the cache warm
 
-Cached context costs much less than normal input. When the cache expires, the next request pays to process the context again. The bigger the context, the more that costs.
+Reusing cached context costs 1/10 the normal input price or less. Once the cache expires, the next request pays more than full price to cache the whole context again. The bigger the context, the more that costs.
 
-Default cache lifetimes:
+### Default cache TTLs
 
-- Claude Code's main session on a Claude subscription within plan usage: one hour.
-- Claude Code on usage credits, an API key, or a cloud provider: five minutes.
-- Claude Code subagents: five minutes.
-- Codex: no fixed lifetime. The cache often survives 45 minutes and usually expires within two hours.
+| Agent and billing                                          | Cache lifetime                                  |
+| ---------------------------------------------------------- | ----------------------------------------------- |
+| Claude Code main session on a subscription/enterprise plan | 1h                                              |
+| OpenAI models in Codex                                     | No fixed TTL. Often 45m, usually gone within 2h |
+| Claude Code on usage credits, API key, or cloud provider   | 5m                                              |
+| Claude Code subagents                                      | 5m                                              |
 
-Claude Code's [prompt-caching guide](https://code.claude.com/docs/en/prompt-caching#which-ttl-each-request-gets) explains the billing routes and lifetime settings.
+Claude Code's [prompt-caching guide](https://code.claude.com/docs/en/prompt-caching#which-ttl-each-request-gets) lists which requests get which lifetime and how to change it.
 
-- Batch work if you keep returning to expired caches.
-- Choose the model and effort at the start. Switching models or enabling fast mode invalidates Claude Code's cache.
-- Send useful follow-ups while the cache is warm. Skip empty keepalive messages, which still cost money.
-- Before a long break, save a handoff while the cache is warm. Resume from it in a fresh session.
+### Cache timer indicators
 
-Keep stable instructions and reference material before changing content. Append messages instead of rewriting earlier ones, so more of the input stays reusable.
+- `ccstatusline` in the Claude Code CLI
+- Claude Code VS Code extension's cache timer
+- Posit Assistant for OpenAI models (otherwise out of luck for Codex/ChatGPT)
 
-## Compact or hand off at clear boundaries
+### Cache tips
 
-Split long tasks into pieces. Decide at a finished step, before automatic compaction interrupts an investigation.
+- Batch work and limit multitasking if you keep coming back to expired caches
+- Beware of actions that invalidate the cache, like switching models or turning on fast mode: https://code.claude.com/docs/en/prompt-caching#actions-that-invalidate-the-cache
+- Sending empty "keepalive" messages can help extend the cache (to an extent)
+- If you won't be back before the cache expires, have the agent write a handoff note while the cache is still warm. Then start a fresh session from the handoff to resume the task
 
-| Situation                                        | Action                                             |
-| ------------------------------------------------ | -------------------------------------------------- |
-| The remaining work needs the current details     | Continue.                                          |
-| The same task continues, and a summary is enough | Use `/compact`.                                    |
-| The task or phase changes                        | Write a handoff, then start a fresh session.       |
-| The context is nearly full                       | Finish the current step, then compact or hand off. |
+See Anthropic's [prompt-caching guide](https://code.claude.com/docs/en/prompt-caching) and OpenAI's [prompt-caching guide](https://developers.openai.com/api/docs/guides/prompt-caching).
 
-Ask the agent to suggest these boundaries, or ask directly:
+## Compact or hand off at clear boundaries (split up long tasks)
+
+To `/compact` or hand off?
+
+| Situation                                        | Action                                            |
+| ------------------------------------------------ | ------------------------------------------------- |
+| The remaining work needs the current details     | Continue                                          |
+| The same task continues, and a summary is enough | `/compact`                                        |
+| The task or phase changed                        | Write a handoff, then start a fresh session       |
+| The context is nearly full                       | Finish the current step, then compact or hand off |
+
+You can also have the agent suggest when to compact or hand off. Example `CLAUDE.md` snippet:
 
 ```text
-Continue, compact, or hand off? Name anything needed for the next step that exists only in this session.
+Recommend compacting or a fresh session only at a real boundary: a finished piece of work, a large new task ahead, or a nearly full context. Never in the middle of an investigation.
+Compact when the next task shares this session's context. Start fresh when it does not.
+Say the recommendation in one line, and name what exists only in this session.
+Before either one, commit or hand off every changed file, and save findings, exact names, and open decisions to a file.
 ```
 
-Compaction pays for a pass over the history and loses detail. With a large expired Claude Code cache, it can cost less than continuing with the full history. A small history does not guarantee savings.
+Or ask the agent:
+
+```text
+Should we continue, compact, or hand off?
+```
 
 ### Hand off
 
+To hand off to a fresh session, you can ask the agent to write a handoff doc or plan file for the next phase of work:
+
 ```text
-Write a handoff for a fresh session to <project-handoff-file>.
-Include the goal, decisions, current branch and commit, uncommitted files, tests, risks, and the exact next step.
+Write a handoff doc for a fresh session to <project-handoff-file>.
+Include the goal, decisions, current branch and commit, uncommitted files, how to test the work, risks, and the exact next step.
 Link to existing project files instead of copying them.
 Tell me the path, then stop.
 ```
 
-Commit or account for changed files before leaving. Start a new session, or use `/clear`, then ask the agent to read the handoff and continue.
+(maybe write a `/handoff` skill for this)
+
+Then start a new session or `/clear` the old one, and ask the agent to read the handoff doc/plan and continue working.
 
 ## Audit your agent sessions
 
-AgentsView has session stats and health metrics. You can also ask an agent to analyze its transcript, preferably in a fresh session:
+AgentsView has session stats and some session health metrics: https://www.agentsview.io/docs/session-intelligence/
+
+Agents are also good at analyzing their own transcripts and telling you about cost inefficient behaviors. Get your session ID with `/status` or similar, then (probably in a fresh session):
 
 ```text
 Audit session <claude|codex>:<session-id> from its transcript.
-Report estimated total cost, request count, and usage you cannot price.
-Separate uncached input, cache writes, cached input reads, and output.
-Break out each subagent by model.
-Find the three biggest cost causes, with evidence.
-Suggest the smallest workflow change for each and estimate its savings.
+Report the estimated total cost, the number of requests, and any usage you cannot price.
+Separate uncached input, cache writes, cached input reads, output, and reasoning tokens.
+Break out each subagent the same way.
+Claude transcripts omit compaction requests, so treat the transcript total as a lower bound.
+Find the three biggest reasons for the cost, with evidence for each.
+For each one, suggest the smallest change in how I work, and estimate what it would save.
 Do not treat a high cache-read share as waste by itself.
 ```
 
-Claude Code stores transcripts under `~/.claude/projects/`. Codex stores them under `~/.codex/sessions/`. Transcripts can omit billed operations, so ask the audit to state its limits.
-
 ### Keep transcripts long enough to audit
 
-Claude Code deletes old local transcripts at startup, with a default retention period of 30 days. Set a longer period in `~/.claude/settings.json`:
+Claude Code deletes local transcripts after 30 days. To compare spend across longer periods, set in `~/.claude/settings.json`:
 
 ```json
 {
@@ -117,37 +146,38 @@ Claude Code deletes old local transcripts at startup, with a default retention p
 }
 ```
 
-Managed settings take precedence. Codex documents no age-based cleanup of session files.
+There is no way to disable cleanup and `0` doesn't work, so you just have to set a really high value to keep transcripts around forever.
 
-## How the bill works
+Codex transcripts have no default expiry.
 
-A single prompt often leads to many model requests, usually after rounds of tool calls. Each request processes retained context again: instructions, earlier messages, tool results, and attachments. Prompt caching lowers that context's price, not its size.
+## Appendix
 
-Independent tool calls returned together can share one follow-up request. Sequential calls often need one each. Ask the agent to batch independent reads and searches.
+Anthropic's [Manage costs effectively](https://code.claude.com/docs/en/costs) covers Claude Code billing and limits in full.
 
-Uncached input costs the normal input price. Claude cache writes cost more, and cached input reads cost much less. Output, including thinking tokens, bills separately. Each subagent adds its own context and requests.
+### What makes a turn expensive
 
-Exact rates depend on the model. See [Anthropic pricing](https://platform.claude.com/docs/en/about-claude/pricing) and [OpenAI pricing](https://developers.openai.com/api/docs/pricing).
+A single prompt often leads to many model requests, one after each round of tool calls. Each request sends the whole context again: instructions, earlier messages, tool results, and attachments. Prompt caching lowers the price of that context, not its size.
 
-### Send messages while the agent works
+Ten requests that start at 100,000 tokens and grow by 10,000 each process 1.45 million input tokens. Each subagent adds its own context, requests, and cache.
 
-Send a correction as soon as it changes the current work. Stop the agent if it uses the wrong target. Combine small additions that express one thought.
+### Input categories
 
-Claude Code queues messages while it works. During tool calls, it delivers them when those calls finish, within the same turn. Messages still queued at the end become later turns. Codex supports steering at a safe boundary during active work.
+| Category          | Meaning                                      | Price effect                 |
+| ----------------- | -------------------------------------------- | ---------------------------- |
+| Uncached input    | Input that is not in the cache.              | Normal input price.          |
+| Cache write       | Input saved to the cache for later requests. | More than normal input.      |
+| Cached input read | Input read back from the cache.              | Much less than normal input. |
 
-A correction delivered during work can use a tool continuation the agent already needs. A later turn reads the retained context again. Sending early has no special discount, and output generated before an interruption still bills.
+Exact prices depend on the model. See [Anthropic pricing](https://platform.claude.com/docs/en/about-claude/pricing) and [OpenAI pricing](https://developers.openai.com/api/docs/pricing). Output is billed separately, at a higher rate than input for Claude and GPT models.
 
-See [Claude Code's queueing guide](https://code.claude.com/docs/en/interactive-mode#queue-messages-while-claude-works).
+### Other ways to cut cost
 
-## Other ways to cut cost
+- Use a less expensive model that can still complete the task. Delegate mechanical tasks to cheaper models if using subagents. Run A/B tests to learn what models are good at what task.
+- Stop the agent or steer when it heads down the wrong path
+- Claude `/doctor`, audit unnecessary `CLAUDE.md`, MCP servers, repeated tool call failures
+- Ask subagents to keep their reports short. Everything a subagent returns stays in the main session's context, and every later request pays for it again.
+- If the main session does not need a task's details, run the task in a separate session instead of a subagent (or you can have agents launch headless `claude -p` or `codex exec` runs). Give it a self-contained prompt and have it write its result to a file or a commit.
+- Split a huge task into chunks instead of running it all in one session. A coordinating session hands each chunk to a subagent or a separate session and checks the results. Chunks can run in parallel, and each works in a small context. Tightly coupled work splits badly, because each chunk has to rebuild the shared context. Independent reading, separate files, and review work split well. The coordination still costs requests, so watch the coordinator's request count.
+- Cap spend on unattended runs. Claude Code print mode takes `--max-budget-usd` and `--max-turns`. A Codex `/goal` token budget is soft: it asks the model to wrap up but doesn't stop the run.
 
-- Use a less expensive model that completes the task well. Lower the effort for simple work.
-- Keep instructions short. Remove unused tool integrations and fix repeated tool failures.
-- Ask subagents for short reports. Their replies stay in the main session's context, and later requests pay to read them again.
-- Use a separate session when the main session needs only a file or commit. Independent reading, separate files, and reviews split well. Tightly coupled work repeats shared context and adds coordination.
-
-For unattended work, set a dollar ceiling and a review-round limit before the run. Claude Code print mode supports `--max-budget-usd` and `--max-turns`. Leave headroom because a budget can overshoot by one response plus running subagents.
-
-Codex's goal token budget is soft. It asks the model to wrap up and does not stop the run. An instruction to stay under a dollar ceiling depends on the agent following it.
-
-For Arc's cost figures and status line, see [Arc cost figures](agent-cost-guide.md).
+For the cost figures Arc shows, see [Arc cost figures](agent-cost-guide.md).

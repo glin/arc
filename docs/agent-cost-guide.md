@@ -2,7 +2,7 @@
 
 Use this guide to read the cost figures Arc shows in the panel, the CLI, and the Claude status line. The figures use recorded usage and supported list prices. They are not invoices or plan-limit meters.
 
-[Lower agent costs](lowering-agent-costs.md) owns the decisions about work boundaries, cache reuse, and queued messages. Its [How the bill works](lowering-agent-costs.md#how-the-bill-works) section explains requests, the prompt cache, and message delivery for Claude Code and Codex.
+[Lower agent costs](lowering-agent-costs.md) owns the decisions about work boundaries and cache reuse. Its [What makes a turn expensive](lowering-agent-costs.md#what-makes-a-turn-expensive) section explains requests and the prompt cache.
 
 ## Supported pricing
 
@@ -128,8 +128,6 @@ Check whether the provider changed cache keys, cache duration, routing, or reque
 The warning stays absent until the scope is complete and every required cache-write category has a supported price. A normal high cached-input share does not trigger it.
 
 ## Arc message delivery
-
-[Lower agent costs](lowering-agent-costs.md#send-messages-while-the-agent-works) explains queueing and steering. This section describes how Arc forwards messages.
 
 Arc forwards each busy-time message to the selected agent's protocol. It preserves separate submissions and does not combine a rapid burst. For Claude, it writes each message to Claude Code immediately. Claude Code queues the message, then chooses a same-turn tool boundary or a later turn. Arc's Stop action differs from Claude Code's Escape key because Stop clears messages that Claude Code still holds.
 
