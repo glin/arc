@@ -58,17 +58,20 @@ function identity(file: string): FileIdentity {
 function equalIdentity(a: FileIdentity, b: FileIdentity): boolean {
   return a.dev === b.dev && a.ino === b.ino;
 }
-function safePath(file: string): void {
-  let current = path.resolve(file);
+export function safeDispatchPath(file: string, platform = process.platform): void {
+  const paths = platform === 'win32' ? path.win32 : path.posix;
+  let current = paths.resolve(file);
   while (true) {
-    if ([os.homedir(), os.tmpdir()].some((base) => current === path.resolve(base))) break;
+    if ([os.homedir(), os.tmpdir()].some((base) => current === paths.resolve(base))) break;
+    if (platform === 'darwin' && current === '/tmp' && fs.realpathSync.native(current) === '/private/tmp') break;
     const stat = fs.lstatSync(current);
     if (stat.isSymbolicLink()) throw new Error('The dispatch path is redirected.');
-    const parent = path.dirname(current);
+    const parent = paths.dirname(current);
     if (parent === current) break;
     current = parent;
   }
 }
+const safePath = safeDispatchPath;
 export function outsideDispatchStorage(root: string, file: string, platform = process.platform): boolean {
   const paths = platform === 'win32' ? path.win32 : path.posix;
   const relative = paths.relative(root, file);
@@ -204,21 +207,51 @@ export class DispatchReceipts {
       throw new Error('The dispatch worker identity is invalid.');
     const file = this.file(id, 'accepted.json');
     const text = JSON.stringify({ launchId: id, ...binding });
-    if (fs.existsSync(file)) {
-      const witness = JSON.parse(read(path.join(this.root, `${id}.accepted.json`)));
+    const witnessFile = path.join(this.root, `${id}.accepted.json`);
+    const checkWitness = () => {
+      if (!fs.existsSync(witnessFile)) return false;
+      const witness = JSON.parse(read(witnessFile));
       if (
+        witness.launchId !== id ||
         read(file) !== text ||
         witness.sha256 !== payloadSha256(text) ||
         !equalIdentity(witness.identity, identity(file))
       )
         throw new Error('The accepted dispatch turn cannot change.');
-    } else {
-      exclusive(file, text);
-      exclusive(
-        path.join(this.root, `${id}.accepted.json`),
-        JSON.stringify({ launchId: id, identity: identity(file), sha256: payloadSha256(text) }),
-      );
-    }
+      return true;
+    };
+    if (checkWitness()) return;
+    this.lock(id, () => {
+      if (checkWitness()) return;
+      const intentFile = path.join(this.root, `${id}.accepting.json`);
+      if (!fs.existsSync(intentFile)) {
+        if (fs.existsSync(file)) throw new Error('The accepted dispatch turn has no retained identity.');
+        const name = `accepted.${randomUUID()}.pending`;
+        const prepared = this.file(id, name);
+        exclusive(prepared, text);
+        exclusive(
+          intentFile,
+          JSON.stringify({ launchId: id, name, identity: identity(prepared), sha256: payloadSha256(text) }),
+        );
+      }
+      const intent = JSON.parse(read(intentFile));
+      if (
+        intent.launchId !== id ||
+        !/^accepted\.[a-f0-9-]{36}\.pending$/.test(intent.name) ||
+        intent.sha256 !== payloadSha256(text)
+      )
+        throw new Error('The accepted dispatch turn cannot change.');
+      const prepared = this.file(id, intent.name);
+      if (!fs.existsSync(file)) {
+        if (read(prepared) !== text || !equalIdentity(intent.identity, identity(prepared)))
+          throw new Error('The accepted dispatch turn was replaced.');
+        fs.linkSync(prepared, file);
+      }
+      if (read(file) !== text || !equalIdentity(intent.identity, identity(file)))
+        throw new Error('The accepted dispatch turn was replaced.');
+      exclusive(witnessFile, JSON.stringify({ launchId: id, identity: intent.identity, sha256: intent.sha256 }));
+      if (fs.existsSync(prepared)) fs.unlinkSync(prepared);
+    });
   }
   publish(
     id: string,
@@ -498,30 +531,50 @@ export class DispatchReceipts {
     const temporary = this.file(id, `write.${process.pid}.${randomUUID()}.lock`);
     const owner = JSON.stringify({ pid: process.pid, token: randomUUID(), launchId: id });
     exclusive(temporary, owner);
+    let acquired = false;
     try {
+      let target = file;
       if (fs.existsSync(file)) {
-        const before = identity(file);
-        const held = JSON.parse(read(file));
-        if (held.launchId !== id || !Number.isSafeInteger(held.pid) || held.pid < 1 || !DISPATCH_ID.test(held.token))
-          throw new Error('The dispatch write owner is unavailable.');
-        let dead = false;
-        try {
-          process.kill(held.pid, 0);
-        } catch (error) {
-          dead = (error as NodeJS.ErrnoException).code === 'ESRCH';
+        let current = file;
+        for (let steps = 0; ; steps++) {
+          const heldText = read(current);
+          const held = JSON.parse(heldText);
+          if (held.launchId !== id || !Number.isSafeInteger(held.pid) || held.pid < 1 || !DISPATCH_ID.test(held.token))
+            throw new Error('The dispatch write owner is unavailable.');
+          if (steps >= 32) {
+            // Retained successors keep stale readers safe when the bounded walk advances its head.
+            writeFileAtomically(file, heldText, undefined, 0o600, false);
+            throw new Error('The dispatch write changed during recovery. Try again.');
+          }
+          const successor = this.file(id, `write.${held.token}.next.lock`);
+          if (fs.existsSync(successor)) {
+            current = successor;
+            continue;
+          }
+          const released = this.file(id, `write.${held.token}.released`);
+          if (fs.existsSync(released) && read(released) === heldText) {
+            target = successor;
+            break;
+          }
+          let dead = false;
+          try {
+            process.kill(held.pid, 0);
+          } catch (error) {
+            dead = (error as NodeJS.ErrnoException).code === 'ESRCH';
+          }
+          if (!dead) throw new Error('Another process holds this dispatch write.');
+          target = successor;
+          break;
         }
-        if (!dead || !equalIdentity(before, identity(file)) || read(file) !== JSON.stringify(held))
-          throw new Error('Another process holds this dispatch write.');
-        fs.unlinkSync(file);
       }
-      fs.linkSync(temporary, file);
-    } finally {
-      fs.unlinkSync(temporary);
-    }
-    try {
+      // Each immutable predecessor admits one successor, including concurrent dead-owner recovery.
+      fs.linkSync(temporary, target);
+      acquired = true;
+      if (target !== file) writeFileAtomically(file, owner, undefined, 0o600, false);
       return work();
     } finally {
-      if (read(file) === owner) fs.unlinkSync(file);
+      if (acquired) exclusive(this.file(id, `write.${JSON.parse(owner).token}.released`), owner);
+      fs.unlinkSync(temporary);
     }
   }
 }

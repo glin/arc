@@ -11238,6 +11238,7 @@ function reduceClaudeSessionLine(
       } else if (block.type === 'text') {
         const text = String(block.text ?? '');
         if (!text.trim()) {
+          if (opts.dispatchResponse && text) responseBlocks.push(text);
           continue;
         }
         const ordinal = textOrdinal++;

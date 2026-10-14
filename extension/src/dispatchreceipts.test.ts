@@ -1,17 +1,18 @@
 import os from 'node:os';
 import { syncBuiltinESMExports } from 'node:module';
 import assert from 'node:assert/strict';
-import * as fs from 'node:fs';
+import fs from 'node:fs';
 import * as path from 'node:path';
 import { afterEach, test, vi } from 'vitest';
 import { tempDir } from './temproot';
-import { DispatchReceipts, outsideDispatchStorage, type DispatchEvent } from './dispatchreceipts';
+import { DispatchReceipts, outsideDispatchStorage, safeDispatchPath, type DispatchEvent } from './dispatchreceipts';
 import { HostedDispatch, type SavedDispatchResponse } from './dispatchhost';
 import { payloadSha256 } from './sessionwrites';
 import type { NativeEvent } from './agentwire';
 import { spawnSync } from 'node:child_process';
 import { savedDispatchResponse } from './sessionreads';
 import { revisionOf, type SessionFile } from './transcript';
+import { ClaudeWire } from './claudewire';
 
 const origin = 'a'.repeat(24);
 const session = 'aaaaaaaa-1111-2222-3333-444444444444';
@@ -27,6 +28,8 @@ const ending: Extract<NativeEvent, { kind: 'rootEnd' }> = {
 };
 const homes: string[] = [];
 afterEach(() => {
+  vi.restoreAllMocks();
+  syncBuiltinESMExports();
   vi.useRealTimers();
   for (const home of homes.splice(0)) fs.rmSync(home, { recursive: true, force: true });
 });
@@ -75,11 +78,11 @@ test('interrupted claims retain their token and acknowledgments retain exactly o
   assert.equal(retry.token, claim.token);
   assert.throws(() => receipts.claim(launch.launchId, event.eventId, origin, 'foreign'));
   assert.throws(() => receipts.claim(launch.launchId, event.eventId, 'b'.repeat(24), 'owner'));
-  const ack = receipts.ack(launch.launchId, event.eventId, origin, 'owner', claim.token, 'Accepted âœ“');
-  assert.deepEqual(receipts.ack(launch.launchId, event.eventId, origin, 'owner', claim.token, 'Accepted âœ“'), ack);
+  const ack = receipts.ack(launch.launchId, event.eventId, origin, 'owner', claim.token, 'Accepted ✓');
+  assert.deepEqual(receipts.ack(launch.launchId, event.eventId, origin, 'owner', claim.token, 'Accepted ✓'), ack);
   assert.equal(
     fs.readFileSync(path.join(receipts.root, launch.launchId, `${event.eventId}.disposition.md`), 'utf8'),
-    'Accepted âœ“',
+    'Accepted ✓',
   );
   assert.throws(() => receipts.ack(launch.launchId, event.eventId, origin, 'owner', claim.token, 'Rejected'));
 });
@@ -299,9 +302,154 @@ test('dead write owners allow exact claim recovery while live owners remain prot
   ]);
   assert.equal(child.status, 0);
   assert.equal((receipts.claim(launch.launchId, event.eventId, origin, 'owner') as any).token, first.token);
-  fs.writeFileSync(lock, JSON.stringify({ pid: process.pid, token: turn, launchId: launch.launchId }));
+  fs.writeFileSync(
+    lock,
+    JSON.stringify({ pid: process.pid, token: 'dddddddd-1111-2222-3333-444444444444', launchId: launch.launchId }),
+  );
   assert.throws(() => receipts.claim(launch.launchId, event.eventId, origin, 'owner'), /holds/);
   fs.unlinkSync(lock);
+});
+
+test('two stale recoverers cannot remove the newly acquired live owner or change a retained claim', () => {
+  const { receipts, launch } = fixture();
+  const event = report(receipts, launch.launchId);
+  const claim = receipts.claim(launch.launchId, event.eventId, origin, 'owner') as { token: string };
+  const lock = path.join(receipts.root, launch.launchId, 'write.lock');
+  const deadPid = 2147483647;
+  const held = JSON.stringify({ pid: deadPid, token: turn, launchId: launch.launchId });
+  fs.writeFileSync(lock, held);
+  const successor = path.join(receipts.root, launch.launchId, `write.${turn}.next.lock`);
+  const live = JSON.stringify({ pid: process.pid, token: session, launchId: launch.launchId });
+  const link = fs.linkSync;
+  const unlink = fs.unlinkSync;
+  let interleaved = false;
+  const recoverOther = () => {
+    interleaved = true;
+    // The other recoverer has already validated the same dead owner and now holds its successor.
+    fs.writeFileSync(successor, live, { flag: 'wx' });
+    fs.writeFileSync(lock, live);
+  };
+  vi.spyOn(fs, 'linkSync').mockImplementation((from, to) => {
+    if (String(to) === successor && !interleaved) recoverOther();
+    return link(from, to);
+  });
+  vi.spyOn(fs, 'unlinkSync').mockImplementation((file) => {
+    // A stale recoverer reaches removal after its final ownership check.
+    if (String(file) === lock && !interleaved) recoverOther();
+    return unlink(file);
+  });
+  syncBuiltinESMExports();
+  assert.throws(() => receipts.claim(launch.launchId, event.eventId, origin, 'owner'));
+  assert.equal(interleaved, true);
+  assert.equal(fs.readFileSync(lock, 'utf8'), live);
+  assert.equal((receipts.result(launch.launchId, event.eventId) as any).consumption.owner, 'owner');
+  vi.restoreAllMocks();
+  syncBuiltinESMExports();
+  fs.writeFileSync(path.join(receipts.root, launch.launchId, `write.${session}.released`), live);
+  assert.equal((receipts.claim(launch.launchId, event.eventId, origin, 'owner') as any).token, claim.token);
+});
+
+test.each([1, 40])(
+  'death after reserving %s recovery successors remains recoverable and uncertain owners remain protected',
+  (count) => {
+    const { receipts, launch } = fixture();
+    const event = report(receipts, launch.launchId);
+    const claim = receipts.claim(launch.launchId, event.eventId, origin, 'owner') as { token: string };
+    const directory = path.join(receipts.root, launch.launchId);
+    const child = spawnSync(process.execPath, [
+      '-e',
+      "const fs=require('node:fs'),path=require('node:path'); let owner={pid:process.pid,token:process.argv[2],launchId:process.argv[4]}; fs.writeFileSync(path.join(process.argv[1],'write.lock'),JSON.stringify(owner)); for(let i=0;i<Number(process.argv[5]);i++){const next={...owner,token:String(i).padStart(8,'0')+'-1111-2222-3333-444444444444'}; fs.writeFileSync(path.join(process.argv[1],'write.'+owner.token+'.next.lock'),JSON.stringify(next)); owner=next;}",
+      directory,
+      turn,
+      session,
+      launch.launchId,
+      String(count),
+    ]);
+    assert.equal(child.status, 0);
+    if (count > 32) assert.throws(() => receipts.claim(launch.launchId, event.eventId, origin, 'owner'), /Try again/);
+    assert.equal((receipts.claim(launch.launchId, event.eventId, origin, 'owner') as any).token, claim.token);
+    // Use a valid distinct owner token with an inaccessible process.
+    fs.writeFileSync(
+      path.join(directory, 'write.lock'),
+      JSON.stringify({ pid: 2147483646, token: 'dddddddd-1111-2222-3333-444444444444', launchId: launch.launchId }),
+    );
+    vi.spyOn(process, 'kill').mockImplementation(() => {
+      throw Object.assign(new Error('permission denied'), { code: 'EPERM' });
+    });
+    assert.throws(() => receipts.claim(launch.launchId, event.eventId, origin, 'owner'), /holds/);
+  },
+);
+
+test.each(['retry', 'conflict', 'replacement', 'redirect'] as const)(
+  'accepted binding publication recovers only exact retained identity after witness failure: %s',
+  (change) => {
+    const { receipts, launch } = fixture();
+    const binding = { provider: 'codex' as const, sessionId: session, submissionId: 1, nativeTurnId: turn };
+    const accepted = path.join(receipts.root, launch.launchId, 'accepted.json');
+    const witness = path.join(receipts.root, `${launch.launchId}.accepted.json`);
+    const write = fs.writeFileSync;
+    vi.spyOn(fs, 'writeFileSync').mockImplementation((file, ...args) => {
+      if (String(file) === witness) throw new Error('witness storage unavailable');
+      return (write as any)(file, ...args);
+    });
+    syncBuiltinESMExports();
+    assert.throws(() => receipts.bind(launch.launchId, binding), /witness storage/);
+    assert.ok(fs.existsSync(accepted));
+    assert.equal(fs.existsSync(witness), false);
+    vi.restoreAllMocks();
+    syncBuiltinESMExports();
+    if (change === 'replacement' || change === 'redirect') {
+      fs.renameSync(accepted, accepted + '.old');
+      if (change === 'replacement') fs.copyFileSync(accepted + '.old', accepted);
+      else fs.symlinkSync(path.dirname(accepted), accepted, process.platform === 'win32' ? 'junction' : 'dir');
+    }
+    if (change !== 'retry') {
+      assert.throws(() =>
+        receipts.bind(launch.launchId, change === 'conflict' ? { ...binding, nativeTurnId: 'foreign' } : binding),
+      );
+      if (change === 'redirect') fs.unlinkSync(accepted);
+      return;
+    }
+    const reopened = new DispatchReceipts(path.dirname(receipts.root));
+    assert.doesNotThrow(() => reopened.bind(launch.launchId, binding));
+    assert.ok(fs.existsSync(witness));
+    assert.doesNotThrow(() => reopened.bind(launch.launchId, binding));
+  },
+);
+
+test('host reconciliation recovers a witness fault without another submission or worker', () => {
+  const { receipts, launch } = fixture();
+  const host = new HostedDispatch(receipts, () => ({
+    text: 'Final',
+    prompt: 'review',
+    promptId: turn,
+    responseIds: [],
+    finished: true,
+    failed: false,
+  }));
+  const child = { key: 'worker', agent: 'codex', state: () => ({ sessionId: session, exited: false }) };
+  host.register(launch.launchId, child);
+  host.submitted(launch.launchId, 1);
+  const witness = path.join(receipts.root, `${launch.launchId}.accepted.json`);
+  const write = fs.writeFileSync;
+  vi.spyOn(fs, 'writeFileSync').mockImplementation((file, ...args) => {
+    if (String(file) === witness) throw new Error('witness storage unavailable');
+    return (write as any)(file, ...args);
+  });
+  syncBuiltinESMExports();
+  host.accepted(launch.launchId, turn);
+  host.observe(child, { kind: 'text', text: 'Final', sourceId: 'response' }, 1);
+  host.observe(child, { kind: 'native', event: ending }, 1);
+  assert.ok(fs.existsSync(path.join(receipts.root, launch.launchId, 'accepted.json')));
+  assert.equal(fs.existsSync(witness), false);
+  assert.equal(receipts.latest(launch.launchId), null);
+  vi.restoreAllMocks();
+  syncBuiltinESMExports();
+  host.reconcileAll();
+  assert.equal(receipts.latest(launch.launchId)!.availability, 'available');
+  assert.equal((receipts.result(launch.launchId, receipts.latest(launch.launchId)!.eventId) as any).text, 'Final');
+  host.reconcileAll();
+  assert.equal(receipts.status(launch.launchId).events.length, 1);
 });
 
 test('receipt write errors preserve native observation and retry without repeating input', () => {
@@ -374,7 +522,7 @@ test('startup error observation and subsequent child exit publish one unknown ev
 test.each(['claude', 'codex'] as const)(
   'complete large %s evidence retains root identity and full final response',
   (agent) => {
-    const { home } = fixture();
+    const { receipts, launch, home } = fixture();
     const file = path.join(home, 'session.jsonl');
     const at = '2026-01-01T00:00:00Z';
     const rows =
@@ -391,6 +539,7 @@ test.each(['claude', 'codex'] as const)(
                 stop_reason: 'end_turn',
                 content: [
                   { type: 'text', text: 'First' },
+                  { type: 'text', text: ' ' },
                   { type: 'text', text: 'Second' },
                 ],
                 usage: { input_tokens: 1, output_tokens: 2 },
@@ -428,11 +577,110 @@ test.each(['claude', 'codex'] as const)(
     for (let attempts = 0; attempts < 100 && !saved; attempts++)
       saved = savedDispatchResponse(source, agent === 'claude' ? '1' : 'root-turn');
     assert.ok(saved);
-    assert.equal(saved.text, 'First\nSecond');
+    assert.equal(saved.text, agent === 'claude' ? 'First\n \nSecond' : 'First\nSecond');
     assert.equal(saved.prompt, 'review');
     assert.equal(saved.finished, true);
     if (agent === 'claude') assert.deepEqual(saved.responseIds, ['response']);
+    const host = new HostedDispatch(receipts, () => saved);
+    const child = { key: 'worker', agent, state: () => ({ sessionId: session, exited: false }) };
+    host.register(launch.launchId, child);
+    host.submitted(launch.launchId, 1);
+    if (agent === 'claude') {
+      const wire = new ClaudeWire({
+        send: () => {},
+        emit: (event) => host.observe(child, event, 1),
+        sessionId: session,
+      });
+      wire.receive(JSON.stringify({ ...rows.at(-1), session_id: session }));
+    } else host.observe(child, { kind: 'text', text: 'First\nSecond', sourceId: 'response' }, 1);
+    host.observe(
+      child,
+      {
+        kind: 'native',
+        event:
+          agent === 'claude'
+            ? { ...ending, provider: 'claude', turnId: null, generation: 1 }
+            : { ...ending, turnId: 'root-turn' },
+      },
+      1,
+    );
+    assert.equal(receipts.latest(launch.launchId)!.availability, 'available');
+    assert.equal(fs.readFileSync(receipts.latest(launch.launchId)!.report!.path, 'utf8'), saved.text);
     assert.equal(savedDispatchResponse(source, agent === 'claude' ? '2' : 'foreign-turn'), null);
+  },
+);
+
+test.each(['claude', 'codex'] as const)(
+  'escaped %s final response above four MiB survives bounded saved recovery',
+  (agent) => {
+    const { receipts, launch, home } = fixture();
+    const file = path.join(home, 'escaped.jsonl');
+    const text = String.fromCharCode(92).repeat(4 * 1024 * 1024 + 1);
+    const at = '2026-01-01T00:00:00Z';
+    const rows =
+      agent === 'claude'
+        ? [
+            { type: 'user', uuid: 'prompt', timestamp: at, message: { role: 'user', content: 'review' } },
+            {
+              type: 'assistant',
+              timestamp: at,
+              message: {
+                id: 'response',
+                role: 'assistant',
+                stop_reason: 'end_turn',
+                content: [{ type: 'text', text }],
+                usage: { input_tokens: 1, output_tokens: 2 },
+              },
+            },
+          ]
+        : [
+            { type: 'session_meta', payload: { id: session, cwd: home, source: 'vscode' } },
+            { type: 'event_msg', timestamp: at, payload: { type: 'task_started', turn_id: turn } },
+            { type: 'event_msg', timestamp: at, payload: { type: 'user_message', message: 'review' } },
+            {
+              type: 'response_item',
+              timestamp: at,
+              payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text }] },
+            },
+            {
+              type: 'event_msg',
+              timestamp: at,
+              payload: { type: 'task_complete', turn_id: turn, last_agent_message: text },
+            },
+          ];
+    fs.writeFileSync(file, rows.map((row) => JSON.stringify(row)).join('\n') + '\n', 'utf8');
+    const source = {
+      file,
+      agent,
+      sessionId: session,
+      ...revisionOf(fs.statSync(file, { bigint: true })),
+    } as SessionFile;
+    const native = agent === 'claude' ? '1' : turn;
+    let saved: SavedDispatchResponse | null = null;
+    for (let attempts = 0; attempts < 150 && !saved; attempts++) saved = savedDispatchResponse(source, native);
+    assert.ok(saved);
+    assert.equal(saved.text.length, text.length);
+    assert.equal(saved.text, text);
+    assert.equal(saved.finished, true);
+    if (agent === 'claude') assert.deepEqual(saved.responseIds, ['response']);
+    else assert.equal(saved.promptId, turn);
+    const host = new HostedDispatch(receipts, () => saved);
+    const child = { key: 'worker', agent, state: () => ({ sessionId: session, exited: false }) };
+    host.register(launch.launchId, child);
+    host.submitted(launch.launchId, 1);
+    host.observe(child, { kind: 'text', text, sourceId: 'response' }, 1);
+    host.observe(
+      child,
+      {
+        kind: 'native',
+        event: agent === 'claude' ? { ...ending, provider: 'claude', turnId: null, generation: 1 } : ending,
+      },
+      1,
+    );
+    const event = receipts.latest(launch.launchId)!;
+    assert.equal(event.availability, 'available');
+    assert.equal(event.report!.bytes, Buffer.byteLength(text));
+    assert.equal(fs.readFileSync(event.report!.path, 'utf8'), text);
   },
 );
 
@@ -480,3 +728,29 @@ test('trusted system temp roots resolve their physical parents without admitting
     fs.unlinkSync(aliasDirectory);
   }
 });
+
+test.each(['darwin', 'linux', 'win32'] as const)(
+  'canonical /tmp admission retains independent %s expectations with configured temp elsewhere',
+  (platform) => {
+    const stat = fs.lstatSync;
+    const realpath = fs.realpathSync.native;
+    vi.spyOn(os, 'tmpdir').mockReturnValue(platform === 'win32' ? 'C:\\ConfiguredTemp' : '/configured/temp');
+    vi.spyOn(fs, 'lstatSync').mockImplementation(((file: any, options: any) => {
+      if (String(file) === '/tmp') return { isSymbolicLink: () => true };
+      if (String(file).startsWith('/tmp/')) return { isSymbolicLink: () => String(file).includes('redirected') };
+      if (String(file) === 'C:\\tmp') return { isSymbolicLink: () => true };
+      if (String(file) === 'C:\\tmp\\reports') return { isSymbolicLink: () => false };
+      return stat(file, options);
+    }) as typeof fs.lstatSync);
+    vi.spyOn(fs.realpathSync, 'native').mockImplementation((file) =>
+      String(file) === '/tmp' ? '/private/tmp' : realpath(file),
+    );
+    syncBuiltinESMExports();
+    if (platform === 'darwin') {
+      assert.doesNotThrow(() => safeDispatchPath('/tmp/reports', platform));
+      assert.throws(() => safeDispatchPath('/tmp/redirected', platform), /redirected/);
+      vi.spyOn(fs.realpathSync, 'native').mockReturnValue('/mutable/elsewhere');
+      assert.throws(() => safeDispatchPath('/tmp/reports', platform), /redirected/);
+    } else assert.throws(() => safeDispatchPath('/tmp/reports', platform), /redirected/);
+  },
+);

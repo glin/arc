@@ -65,9 +65,10 @@ export function savedDispatchResponse(
       through: 0,
       readBytes: 0,
       retainedCharge: 0,
-      retainedLimit: 64 * 1024 * 1024,
-      recordLimit: 8 * 1024 * 1024,
-      reduceAbove: 8 * 1024 * 1024,
+      // JSON escaping charges up to six source bytes per report byte. Recovery charges raw records separately.
+      retainedLimit: 512 * 1024 * 1024,
+      recordLimit: 49 * 1024 * 1024,
+      reduceAbove: 49 * 1024 * 1024,
       accepts: () => true,
       fragments: [],
       fragmentBytes: 0,
