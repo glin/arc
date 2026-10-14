@@ -1,6 +1,6 @@
 # Arc
 
-Arc is a VS Code extension for working with Claude Code and Codex. (*Personal software, experimental*)
+Arc is a VS Code extension for working with Claude Code and Codex. (_Personal software, experimental_)
 
 [Web demo](https://glin.github.io/arc/)
 
@@ -14,13 +14,17 @@ Arc is a VS Code extension for working with Claude Code and Codex. (*Personal so
 
 ## Try it
 
-Install from source with Node.js 22+ and npm. Install [Claude Code](https://code.claude.com/docs/en/setup) and [Codex](https://developers.openai.com/codex/cli/) for the agents you use. On Windows, run the installer in Git Bash.
+Install the latest source with Node.js 22+ and npm. On Windows, use Git Bash.
+
+Install [Claude Code](https://code.claude.com/docs/en/setup) and [Codex](https://developers.openai.com/codex/cli/) for the agents you use.
+
+Arc is not on the VS Code Marketplace.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/glin/arc/main/install.sh | bash
 ```
 
-The installer installs Arc in your editor and sets up Claude hooks. It builds a complete local Arc checkout when available. Otherwise, it downloads the `main` branch from `glin/arc`.
+The installer installs Arc in your editor and sets up Claude hooks.
 
 Reload VS Code and open a new integrated terminal to use `arc`. Run **Arc: Open Arc in Editor** from the Command Palette.
 
@@ -127,10 +131,28 @@ Use [`arc cost`](docs/cli.md#read-a-cost-report) to estimate costs from saved Cl
 Use the [`arc-sessions` skill](docs/arc-sessions.md) to:
 
 - Start Claude or Codex sessions with labels and pins
-- Read session results and status, then summarize blockers and decisions needing your attention
+- Read session results and status, then summarize work needing your attention
 - Send follow-ups to sessions the agent started
 - Estimate session and subagent costs with `arc cost`
 - Request compaction of its own session after the turn when asked
+
+#### Summarize sessions
+
+```text
+Use Arc to summarize the sessions labelled Review in this window. Read their completed turns. Report results, blockers, and decisions needing my input.
+```
+
+#### Start a branch review
+
+```text
+Use Arc to start a Codex session reviewing this branch. Name it Branch review, apply Review, and pin it. Read its result and summarize its findings.
+```
+
+#### Request compaction
+
+```text
+After saving the handoff, request compaction of this session after your response.
+```
 
 ## Limitations
 
