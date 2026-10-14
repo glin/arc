@@ -14,7 +14,7 @@ Arc is a VS Code extension for working with Claude Code and Codex. (_Personal so
 
 ## Try it
 
-Install the latest source with Node.js 22+ and npm. On Windows, use Git Bash.
+Install from source with Node.js 22+ and npm. On Windows, use Git Bash.
 
 Install [Claude Code](https://code.claude.com/docs/en/setup) and [Codex](https://developers.openai.com/codex/cli/) for the agents you use.
 
