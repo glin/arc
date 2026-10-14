@@ -963,7 +963,7 @@ export class AgentSession {
     await this.driver.rename(sessionId, title);
   }
 
-  // Marks the session busy while the CLI accepts a prompt. The returned id identifies that submission.
+  // Returns the native turn identity for an accepted submission.
   nativeTurnIdentity(submission: number): string | null {
     for (const [native, owner] of this.nativeTurnOwners) if (owner === submission) return native;
     return null;
