@@ -3518,20 +3518,21 @@ export function liveMcpTarget(
 }
 
 export async function askIdleDefaults(plan: AgentPlan, spawner: Spawner): Promise<AppliedDefaults> {
-  const session = new AgentSession(
-    'defaults',
-    plan,
-    spawner,
-    () => {},
-    () => {},
-  );
+  let session: AgentSession | undefined;
   try {
+    session = new AgentSession(
+      'defaults',
+      plan,
+      spawner,
+      () => {},
+      () => {},
+    );
     await session.start();
     if (session.state().lastError) return unavailableDefaults('The agent could not report its settings.');
     return await session.appliedDefaults();
   } catch {
     return unavailableDefaults('The agent could not report its settings.');
   } finally {
-    await session.dispose();
+    await session?.dispose();
   }
 }

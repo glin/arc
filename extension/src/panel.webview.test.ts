@@ -1002,6 +1002,10 @@ test('the host reads closed child work once per file version and never reads ope
   assert.equal(reader.mock.calls.length, 3);
 });
 import { ConfigWatches } from './configwatch.ts';
+import { EventEmitter } from 'node:events';
+import { TerminalTools } from './toolpath';
+import { askIdleDefaults, arcCliSpawner, claudeIdlePlan, type AgentPlan, type ChildLike } from './agenthost';
+import { unavailableDefaults } from './view/model-picks';
 import {
   WorkspaceCachePartition,
   normalizedWorkspaceIdentity,
@@ -12278,17 +12282,36 @@ test('a host takes its own listeners away with it, and the editor ones are wired
   sourceMatch(panelHostSource, /this\.wireEditorListeners\(\);/, 'nothing wires the editor-wide listeners at all');
 });
 
-test('default metadata watches external ancestors and ignores unrelated editor settings', async () => {
+function wireDefaultMetadata(context: any, panel: any, environment: Record<string, unknown>) {
   const source = fs.readFileSync(path.join(__dirname, 'extension.ts'), 'utf8');
   const begin = source.indexOf('let defaultsRevision = 0;');
   const end = source.indexOf('const readFrom = async', begin);
   assert.ok(begin >= 0 && end > begin);
-  const compiled = esbuild.transformSync(`export function wire(context, panel) { ${source.slice(begin, end)} }`, {
-    loader: 'ts',
-    format: 'cjs',
-    target: 'esnext',
-  }).code;
-  const loaded = { exports: {} as { wire: (context: any, panel: any) => void } };
+  const preparation = statementFrom(source, source.indexOf('let privatePreparation ='));
+  const refresh = statementFrom(source, source.indexOf('const refreshSnapshots ='));
+  const trust = source.match(/vscode\.workspace\.onDidGrantWorkspaceTrust\(refreshSnapshots\)/)?.[0];
+  assert.ok(trust);
+  const compiled = esbuild.transformSync(
+    `export function wire(context, panel) {
+    ${preparation}
+    let invalidatePreparedDefaults;
+    ${refresh}
+    context.subscriptions.push(${trust});
+    ${source.slice(begin, end)}
+    return { refreshSnapshots, preparation: () => privatePreparation };
+  }`,
+    { loader: 'ts', format: 'cjs', target: 'esnext' },
+  ).code;
+  const loaded = { exports: {} as { wire: (context: any, panel: any) => any } };
+  new Function('module', 'exports', ...Object.keys(environment), compiled)(
+    loaded,
+    loaded.exports,
+    ...Object.values(environment),
+  );
+  return loaded.exports.wire(context, panel);
+}
+
+test('default metadata watches external ancestors and ignores unrelated editor settings', async () => {
   const watchers: any[] = [];
   const subscriptions: any[] = [];
   let configuration!: (event: any) => void;
@@ -12311,6 +12334,7 @@ test('default metadata watches external ancestors and ignores unrelated editor s
       ) {}
     },
     workspace: {
+      onDidGrantWorkspaceTrust: () => ({ dispose() {} }),
       onDidChangeConfiguration(callback: any) {
         configuration = callback;
         return { dispose() {} };
@@ -12343,49 +12367,28 @@ test('default metadata watches external ancestors and ignores unrelated editor s
       },
     },
   };
-  new Function(
-    'module',
-    'exports',
-    'vscode',
-    'path',
-    'os',
-    'models',
-    'readSetting',
-    'thisMachine',
-    'claudeLaunch',
-    'codexLaunch',
-    'claudeIdlePlan',
-    'codexIdlePlan',
-    'CLIENT_INFO',
-    'askIdleDefaults',
-    'spawner',
-    'unavailableDefaults',
-    'settingName',
-    'fs',
-    'ConfigWatches',
-    compiled,
-  )(
-    loaded,
-    loaded.exports,
+  wireDefaultMetadata({ subscriptions }, panel, {
     vscode,
     path,
-    { homedir: () => 'user' },
-    { get: () => null },
-    () => '',
-    () => ({}),
-    () => ({}),
-    () => ({}),
-    () => ({}),
-    () => ({}),
-    {},
-    () => new Promise((resolve) => readings.push(resolve)),
-    () => {},
-    () => ({}),
-    (key: string) => `arc.${key}`,
-    { promises: { stat: () => Promise.reject(new Error('missing')) } },
+    os: { homedir: () => 'user' },
+    models: { get: () => null },
+    readSetting: () => '',
+    thisMachine: () => ({}),
+    claudeLaunch: () => ({}),
+    codexLaunch: () => ({}),
+    claudeIdlePlan: () => ({}),
+    codexIdlePlan: () => ({}),
+    CLIENT_INFO: {},
+    askIdleDefaults: () => new Promise((resolve) => readings.push(resolve)),
+    spawner: () => {},
+    unavailableDefaults: () => ({}),
+    settingName: (key: string) => `arc.${key}`,
+    fs: { promises: { stat: () => Promise.reject(new Error('missing')) } },
     ConfigWatches,
-  );
-  loaded.exports.wire({ subscriptions }, panel);
+    privateTools: { refresh: () => Promise.resolve() },
+    snapshotOffer: null,
+    snapshotPanelOpened: false,
+  });
   const cwd = path.resolve('external', 'project', 'child');
   panel.onWatchDefaults([cwd]);
   // VS Code watches the base of a pattern that holds `/` or `**` recursively.
@@ -12398,6 +12401,7 @@ test('default metadata watches external ancestors and ignores unrelated editor s
     assert.ok(watchers.some(({ pattern }) => pattern.base === folder && pattern.pattern === '{.claude,.codex}'));
   const change = (key: string) => configuration({ affectsConfiguration: (value: string) => value === key });
   panel.onReadDefaults('claude', cwd, '');
+  await vi.waitFor(() => assert.equal(readings.length, 1));
   change('workbench.colorTheme');
   assert.equal(cleared, 0);
   change('arc.claudePath');
@@ -12419,12 +12423,14 @@ test('default metadata watches external ancestors and ignores unrelated editor s
   assert.equal(cleared, 5);
   assert.equal(settings.disposed, true);
   panel.onReadDefaults('claude', cwd, '');
+  await vi.waitFor(() => assert.equal(readings.length, 2));
   panel.onWatchDefaults([path.resolve('different')]);
   assert.equal(external.disposed, true);
   readings[1]({ status: 'ready', model: 'obsolete-folder', effort: 'high', reason: '' });
   await Promise.resolve();
   assert.deepEqual(accepted, []);
   panel.onReadDefaults('codex', 'different', '');
+  await vi.waitFor(() => assert.equal(readings.length, 3));
   for (const subscription of subscriptions) subscription.dispose();
   readings[2]({ status: 'ready', model: 'late', effort: 'high', reason: '' });
   await Promise.resolve();
@@ -12433,6 +12439,294 @@ test('default metadata watches external ancestors and ignores unrelated editor s
     watchers.every((watcher) => watcher.disposed),
     true,
   );
+});
+
+function activationDefaultsFixture(options: { trusted?: boolean; rejectedRequest?: boolean } = {}) {
+  let trusted = options.trusted ?? true;
+  const preparations: Array<{ resolve: (directory: string) => void; reject: (error: Error) => void }> = [];
+  const children: string[] = [];
+  const launchedFolders: string[] = [];
+  const requests: string[] = [];
+  const publications: any[] = [];
+  const rejections: unknown[] = [];
+  const unhandled = (error: unknown) => rejections.push(error);
+  process.on('unhandledRejection', unhandled);
+  const privateTools = new TerminalTools(
+    { persistent: false, description: '', clear() {}, append() {}, replace() {} },
+    () => (trusted ? { root: '/fixture-tools', identity: 'fixture-window' } : null),
+    () => new Promise<string>((resolve, reject) => preparations.push({ resolve, reject })),
+    '/fixture-editor',
+    'linux',
+  );
+  const spawner = arcCliSpawner(
+    () => privateTools.current('fixture-window'),
+    (_command, _args, directory, _env, agent, cli) => {
+      launchedFolders.push(directory);
+      children.push(`${agent}:${cli?.directory}`);
+      const child = new EventEmitter() as EventEmitter & ChildLike;
+      const stream = () => Object.assign(new EventEmitter(), { setEncoding() {} });
+      child.stdout = stream();
+      child.stderr = stream();
+      child.stdin = {
+        write: () => true,
+        end: () => {
+          child.emit('exit', 0, null);
+        },
+      };
+      child.kill = () => {
+        child.emit('exit', 0, null);
+        return true;
+      };
+      return child;
+    },
+  );
+  const readyPlan = (plan: AgentPlan): AgentPlan => ({
+    ...plan,
+    driver: (send, emit) => ({
+      ...plan.driver(send, emit),
+      open: async () => [],
+      appliedDefaults: async () => ({ status: 'ready', model: `${plan.agent}-default`, effort: 'high', reason: '' }),
+    }),
+  });
+  const cwd = tempDir('activation-defaults-');
+  const panel: any = Object.assign(Object.create(PanelProvider.prototype), {
+    folders: () => [cwd],
+    showing: null,
+    models: {},
+    recentProfiles: [],
+    pinnedSetups: [],
+    pendingModels: [],
+    appliedDefaults: new Map(),
+    appliedDefaultsRevision: 0,
+    usage: [],
+    composerState: () => null,
+    post: async (message: any) => {
+      publications.push(message);
+      return true;
+    },
+  });
+  const subscriptions: any[] = [privateTools];
+  let grantTrust!: () => void;
+  let configuration!: (event: any) => void;
+  const vscode = {
+    RelativePattern: class {
+      constructor(
+        public base: string,
+        public pattern: string,
+      ) {}
+    },
+    workspace: {
+      onDidGrantWorkspaceTrust(callback: () => void) {
+        grantTrust = callback;
+        return { dispose() {} };
+      },
+      onDidChangeConfiguration(callback: any) {
+        configuration = callback;
+        return { dispose() {} };
+      },
+      onDidChangeWorkspaceFolders: () => ({ dispose() {} }),
+      createFileSystemWatcher: () => ({
+        dispose() {},
+        onDidCreate: () => ({ dispose() {} }),
+        onDidChange: () => ({ dispose() {} }),
+        onDidDelete: () => ({ dispose() {} }),
+      }),
+    },
+  };
+  const launch = { command: 'fixture', leadingArgs: [], env: {} };
+  const wiring = wireDefaultMetadata({ subscriptions }, panel, {
+    vscode,
+    path,
+    os: { homedir: () => cwd },
+    models: { get: () => null },
+    readSetting: () => '',
+    thisMachine: () => ({}),
+    claudeLaunch: () => launch,
+    codexLaunch: () => launch,
+    claudeIdlePlan: (...args: Parameters<typeof claudeIdlePlan>) => readyPlan(claudeIdlePlan(...args)),
+    codexIdlePlan: (...args: Parameters<typeof codexIdlePlan>) => readyPlan(codexIdlePlan(...args)),
+    CLIENT_INFO: { name: 'fixture', version: '0' },
+    askIdleDefaults: (plan: AgentPlan, spawn: typeof spawner) => {
+      requests.push(plan.agent);
+      return options.rejectedRequest
+        ? Promise.reject(new Error('independent transport rejection'))
+        : askIdleDefaults(plan, spawn);
+    },
+    spawner,
+    unavailableDefaults,
+    settingName: (key: string) => `arc.${key}`,
+    fs,
+    ConfigWatches,
+    privateTools,
+    snapshotOffer: null,
+    snapshotPanelOpened: false,
+  });
+  const dispose = () => {
+    for (const subscription of subscriptions) subscription.dispose();
+  };
+  return {
+    panel,
+    preparations,
+    children,
+    launchedFolders,
+    requests,
+    publications,
+    rejections,
+    wiring,
+    trust: () => {
+      trusted = true;
+      grantTrust();
+    },
+    invalidate: () => configuration({ affectsConfiguration: (key: string) => key === 'arc.codexPath' }),
+    dispose,
+    close: () => {
+      dispose();
+      process.off('unhandledRejection', unhandled);
+    },
+    values: () => [...panel.appliedDefaults.values()] as Array<{ status: string; model: string }>,
+  };
+}
+
+test('startup settings publication waits for private commands and publishes both providers without reader retry', async () => {
+  const fixture = activationDefaultsFixture();
+  try {
+    fixture.panel.setAskLevels({ claude: 'normal', codex: 'normal' });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.deepEqual(fixture.children, []);
+    assert.deepEqual(fixture.requests, []);
+    assert.deepEqual(fixture.rejections, []);
+    assert.deepEqual(
+      fixture.values().map((value) => value.status),
+      ['loading', 'loading'],
+    );
+    fixture.preparations[0].resolve('/prepared-startup');
+    await vi.waitFor(() =>
+      assert.deepEqual(
+        fixture.values().map((value) => value.model),
+        ['claude-default', 'codex-default'],
+      ),
+    );
+    assert.deepEqual(fixture.children, ['claude:/prepared-startup', 'codex:/prepared-startup']);
+    assert.ok(fixture.publications.length >= 3);
+    assert.deepEqual(fixture.rejections, []);
+  } finally {
+    fixture.close();
+  }
+});
+
+test('replacement preparation publishes defaults only from its current command directory', async () => {
+  const fixture = activationDefaultsFixture();
+  try {
+    fixture.panel.setAskLevels({});
+    await vi.waitFor(() => assert.equal(fixture.preparations.length, 1));
+    fixture.wiring.refreshSnapshots();
+    fixture.preparations[0].resolve('/obsolete-preparation');
+    await vi.waitFor(() => assert.equal(fixture.preparations.length, 2));
+    assert.deepEqual(fixture.children, []);
+    fixture.preparations[1].resolve('/replacement-preparation');
+    await vi.waitFor(() =>
+      assert.deepEqual(
+        fixture.values().map((value) => value.status),
+        ['ready', 'ready'],
+      ),
+    );
+    assert.deepEqual(fixture.children, ['claude:/replacement-preparation', 'codex:/replacement-preparation']);
+  } finally {
+    fixture.close();
+  }
+});
+
+test('trust recovery replaces cached unavailable defaults without a reader retry', async () => {
+  const fixture = activationDefaultsFixture({ trusted: false });
+  try {
+    fixture.panel.setAskLevels({});
+    await vi.waitFor(() =>
+      assert.deepEqual(
+        fixture.values().map((value) => value.status),
+        ['unavailable', 'unavailable'],
+      ),
+    );
+    assert.deepEqual(fixture.children, []);
+    fixture.trust();
+    await vi.waitFor(() => assert.equal(fixture.preparations.length, 1));
+    fixture.preparations[0].resolve('/trusted-preparation');
+    await vi.waitFor(() =>
+      assert.deepEqual(
+        fixture.values().map((value) => value.status),
+        ['ready', 'ready'],
+      ),
+    );
+    assert.deepEqual(fixture.children, ['claude:/trusted-preparation', 'codex:/trusted-preparation']);
+  } finally {
+    fixture.close();
+  }
+});
+
+test.each(['revision', 'folder', 'disposal'] as const)(
+  'a pending defaults request loses launch authority after %s invalidation',
+  async (kind) => {
+    const fixture = activationDefaultsFixture();
+    try {
+      fixture.panel.onReadDefaults('claude', 'original-folder', '');
+      await vi.waitFor(() => assert.equal(fixture.preparations.length, 1));
+      if (kind === 'revision') fixture.invalidate();
+      else if (kind === 'folder') fixture.panel.onWatchDefaults([path.resolve('different-folder')]);
+      else fixture.dispose();
+      const posts = fixture.publications.length;
+      fixture.preparations[0].resolve('/late-preparation');
+      await fixture.wiring.preparation();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.ok(!fixture.launchedFolders.includes('original-folder'));
+      if (kind !== 'revision') assert.deepEqual(fixture.children, []);
+      if (kind !== 'revision') assert.equal(fixture.publications.length, posts);
+    } finally {
+      fixture.close();
+    }
+  },
+);
+
+test('failed preparation publishes unavailable defaults once for each provider', async () => {
+  const fixture = activationDefaultsFixture();
+  try {
+    fixture.panel.setAskLevels({});
+    await vi.waitFor(() => assert.equal(fixture.preparations.length, 1));
+    fixture.preparations[0].reject(new Error('preparation refused'));
+    await vi.waitFor(() =>
+      assert.deepEqual(
+        fixture.values().map((value) => value.status),
+        ['unavailable', 'unavailable'],
+      ),
+    );
+    fixture.panel.setAskLevels({});
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.deepEqual(fixture.children, []);
+    assert.deepEqual(fixture.requests, ['claude', 'codex']);
+    assert.deepEqual(fixture.rejections, []);
+  } finally {
+    fixture.close();
+  }
+});
+
+test('independently rejected defaults requests publish unavailable metadata without same-revision retries', async () => {
+  const fixture = activationDefaultsFixture({ rejectedRequest: true });
+  try {
+    fixture.panel.setAskLevels({});
+    await vi.waitFor(() => assert.equal(fixture.preparations.length, 1));
+    fixture.preparations[0].resolve('/prepared-rejection');
+    await vi.waitFor(() =>
+      assert.deepEqual(
+        fixture.values().map((value) => value.status),
+        ['unavailable', 'unavailable'],
+      ),
+    );
+    fixture.panel.onReadDefaults('claude', fixture.panel.folders()[0], '');
+    fixture.panel.setAskLevels({});
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.deepEqual(fixture.requests, ['claude', 'codex']);
+    assert.deepEqual(fixture.rejections, []);
+  } finally {
+    fixture.close();
+  }
 });
 
 test('launcher initial and refreshed metadata requests follow its committed recent model', () => {

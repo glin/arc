@@ -1903,9 +1903,12 @@ test('the extension removes global setup and refreshes private tools with worksp
     'Set up Claude hooks',
   );
   sourceMatch(source, /if \(!vscode\.workspace\.isTrusted\) return null/);
-  sourceMatch(source, /void privateTools\.refresh\(\)/);
+  sourceMatch(source, /let privatePreparation = privateTools\.refresh\(\)/);
   sourceMatch(source, /context\.extensionMode === vscode\.ExtensionMode\.Development/);
-  sourceMatch(source, /const refreshSnapshots = \(\) => \{\s*void privateTools\.refresh\(\)/);
+  sourceMatch(
+    source,
+    /const refreshSnapshots = \(\) => \{\s*const preparation = \(privatePreparation = privateTools\.refresh\(\)\)/,
+  );
   sourceMatch(source, /onDidGrantWorkspaceTrust\(refreshSnapshots\)/);
   sourceMatch(source, /onDidChangeWorkspaceFolders\(refreshSnapshots\)/);
 });

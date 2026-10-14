@@ -5647,7 +5647,12 @@ test('all idle helper entry points replace foreign window targets with the curre
         await assert.rejects(askIdle(plan, spawner), /captured environment/);
         await assert.rejects(askIdleMcp(plan, spawner), /captured environment/);
         await assert.rejects(askIdleMcpChange(plan, spawner, []), /captured environment/);
-        await assert.rejects(askIdleDefaults(plan, spawner), /captured environment/);
+        assert.deepEqual(await askIdleDefaults(plan, spawner), {
+          status: 'unavailable',
+          model: null,
+          effort: null,
+          reason: 'The agent could not report its settings.',
+        });
       }
     }
     assert.equal(seen.length, 16);
@@ -5659,6 +5664,28 @@ test('all idle helper entry points replace foreign window targets with the curre
     }
   } finally {
     vi.unstubAllEnvs();
+  }
+});
+
+test('idle defaults contain constructor failure for both providers without disposing an absent session', async () => {
+  const dispose = vi.spyOn(AgentSession.prototype, 'dispose');
+  try {
+    for (const plan of [claudeIdlePlan(CLAUDE, WS), codexIdlePlan(CODEX, { cwd: WS, clientInfo: CODEX_CLIENT })]) {
+      assert.deepEqual(
+        await askIdleDefaults(plan, () => {
+          throw new Error('commands unavailable');
+        }),
+        {
+          status: 'unavailable',
+          model: null,
+          effort: null,
+          reason: 'The agent could not report its settings.',
+        },
+      );
+    }
+    assert.equal(dispose.mock.calls.length, 0);
+  } finally {
+    dispose.mockRestore();
   }
 });
 

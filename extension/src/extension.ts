@@ -167,7 +167,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     process.execPath,
   );
   context.subscriptions.push(privateTools);
-  void privateTools.refresh();
+  let privatePreparation = privateTools.refresh();
+  let invalidatePreparedDefaults: (() => void) | undefined;
   const spawner = arcCliSpawner(() => privateTools.current(channel?.windowId ?? null));
   if (channel)
     context.subscriptions.push({
@@ -797,7 +798,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   );
   snapshotSetup = snapshotOffer;
   const refreshSnapshots = () => {
-    void privateTools.refresh();
+    const preparation = (privatePreparation = privateTools.refresh());
+    void preparation.then(() => {
+      if (preparation === privatePreparation) invalidatePreparedDefaults?.();
+    });
     snapshotOffer?.invalidate();
     if (snapshotPanelOpened) void snapshotOffer?.check();
   };
@@ -1179,23 +1183,33 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     },
   });
   panel.onReadDefaults = (agent, cwd, model) => {
+    if (defaultsDisposed) return;
     const revision = defaultsRevision;
     const catalog = models.get(agent)?.models ?? [];
     const concrete = catalog.find((item) => item.value === model)?.resolvedModel || model;
     const key = JSON.stringify([agent, cwd, concrete, revision]);
     let request = defaultRequests.get(key);
     if (!request) {
-      const launch =
-        agent === 'claude'
-          ? claudeLaunch(readSetting('claudePath'), thisMachine())
-          : codexLaunch(readSetting('codexPath'), thisMachine());
-      const plan =
-        agent === 'claude'
-          ? claudeIdlePlan(launch, cwd, model)
-          : codexIdlePlan(launch, { cwd, model, clientInfo: CLIENT_INFO });
-      request = launch.problem
-        ? Promise.resolve(unavailableDefaults('The agent could not report its settings.'))
-        : askIdleDefaults(plan, spawner);
+      request = (async () => {
+        let preparation: Promise<void>;
+        do {
+          preparation = privatePreparation;
+          await preparation;
+        } while (preparation !== privatePreparation);
+        if (defaultsDisposed || revision !== defaultsRevision || defaultRequests.get(key) !== request)
+          return unavailableDefaults('The agent could not report its settings.');
+        const launch =
+          agent === 'claude'
+            ? claudeLaunch(readSetting('claudePath'), thisMachine())
+            : codexLaunch(readSetting('codexPath'), thisMachine());
+        const plan =
+          agent === 'claude'
+            ? claudeIdlePlan(launch, cwd, model)
+            : codexIdlePlan(launch, { cwd, model, clientInfo: CLIENT_INFO });
+        return launch.problem
+          ? Promise.resolve(unavailableDefaults('The agent could not report its settings.'))
+          : askIdleDefaults(plan, spawner);
+      })().catch(() => unavailableDefaults('The agent could not report its settings.'));
       defaultRequests.set(key, request);
     }
     void request.then((defaults) => {
@@ -1207,6 +1221,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     defaultsRevision++;
     defaultRequests.clear();
     panel.clearAppliedDefaults();
+  };
+  invalidatePreparedDefaults = () => {
+    if (!defaultsDisposed) invalidateDefaults();
   };
   context.subscriptions.push(
     vscode.workspace.onDidChangeConfiguration((event) => {
