@@ -26338,7 +26338,7 @@ test('selection and accepted worker results avoid unnecessary catalog walks', ()
   const reusing = [...panelHostSource.matchAll(/this\.refresh\([^)]*\b(?:true|false)\s*,\s*true\)/g)];
   assert.equal(
     reusing.length,
-    14,
+    15,
     `${reusing.length} refresh callers reuse the held catalog. Selection, older-page loading, ` +
       'the accepted selected-worker follow-up and row delta recovery must not repeat catalog enumeration.',
   );

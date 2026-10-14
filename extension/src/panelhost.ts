@@ -189,6 +189,7 @@ import {
   normalizeSentPrompts,
   restoredSentPrompts,
   toCard,
+  commitRowsOf,
   toCompactionCard,
   groupBySession,
   newestPerSession,
@@ -1059,6 +1060,13 @@ interface PanelHost {
   onDidDispose(listener: () => void): vscode.Disposable;
 }
 
+type PanelRowSender = RowDeltaSender & {
+  acceptedCards?: Map<string, unknown>;
+  acceptedWindow?: SessionRead;
+  cardPost?: number;
+  acceptedCardPost?: number;
+};
+
 interface QueuedEditOffer {
   id: string;
   session: string;
@@ -1792,7 +1800,7 @@ export class PanelProvider implements vscode.Disposable {
     agentRun: boolean;
   }>[] = [];
   // The session rows each panel holds from its last render and session list messages. Created on first use.
-  private rowSenders: WeakMap<PanelHost, RowDeltaSender> | undefined;
+  private rowSenders: WeakMap<PanelHost, PanelRowSender> | undefined;
   // Session-list placement order, separate from activity-sorted catalog rows. Reconciliation preserves placement and appends newly discovered sessions.
   private railOrder: string[] = [];
   // The latest delivery that carried the rail, and its largest serialized message across
@@ -8556,6 +8564,7 @@ export class PanelProvider implements vscode.Disposable {
               largestRenderBytes = Math.max(largestRenderBytes ?? 0, serializedBytes);
             }
           },
+          selectedSession ? this.cache.get(selectedSession.file)?.read : undefined,
         ).then(
           (accepted) => {
             if (accepted && !controller?.signal.aborted && generation === this.refreshGeneration) {
@@ -9338,7 +9347,7 @@ export class PanelProvider implements vscode.Disposable {
     return (vscode.workspace.workspaceFolders ?? []).map((f) => f.uri.fsPath);
   }
 
-  private rowSender(host: PanelHost): RowDeltaSender {
+  private rowSender(host: PanelHost): PanelRowSender {
     this.rowSenders ??= new WeakMap();
     let sender = this.rowSenders.get(host);
     if (!sender) {
@@ -9355,11 +9364,17 @@ export class PanelProvider implements vscode.Disposable {
     host: PanelHost,
     message: Record<string, unknown>,
     measured?: (serializedBytes: number | null) => void,
+    selectedWindow?: SessionRead,
   ): Thenable<boolean> {
-    if (message.type !== 'render' && message.type !== 'rail') {
+    if (message.type !== 'render' && message.type !== 'rail' && message.type !== 'selection') {
       return this.sendToHost(host, message, measured);
     }
     const sender = this.rowSender(host);
+    // Accepted card facts share the panel's transport owner. Failed posts retain the last accepted facts.
+    const cards = Array.isArray(message.cards)
+      ? new Map(message.cards.filter((card) => 'commits' in card).map((card) => [card.key, card.commits]))
+      : undefined;
+    const cardPost = cards ? (sender.cardPost = (sender.cardPost ?? 0) + 1) : 0;
     // An unready panel drops the post, so it prints no rows. The panel may hold other rows when it becomes ready.
     if (!this.readyHosts.has(host)) {
       sender.reset();
@@ -9374,12 +9389,17 @@ export class PanelProvider implements vscode.Disposable {
     };
     const posted = this.sendToHost(
       host,
-      sender.encode(message as Record<string, unknown> & RowLists, globals),
+      message.type === 'selection' ? message : sender.encode(message as Record<string, unknown> & RowLists, globals),
       measured,
     );
     void Promise.resolve(posted).then(
       (accepted) => {
         if (!accepted) sender.reset();
+        if (accepted && cards && cardPost > (sender.acceptedCardPost ?? 0)) {
+          sender.acceptedCards = cards;
+          sender.acceptedWindow = selectedWindow;
+          sender.acceptedCardPost = cardPost;
+        }
       },
       () => sender.reset(),
     );
@@ -11750,13 +11770,41 @@ export class PanelProvider implements vscode.Disposable {
       });
       this.selectionFailure = null;
       retryLatestRevision ||= result.value.recoveryPending === true;
+      // Publish accepted turns with incomplete repository navigation cleared before commit discovery waits.
+      this.applyCommitRepositoryEvidence(current, result.value.read.turns);
+      void this.refresh(true, true, true, true);
+      if (retryLatestRevision || !this.commitRepositoryContexts(current, result.value.read.turns).length) return;
       retryLatestRevision ||= await this.hydrateCommitRepositories(
-        session,
+        current,
         result.value.read.turns,
         generation,
         controller.signal,
       );
-      void this.refresh(true, true, true, true);
+      const enriched = this.currentSelectedSession(work);
+      if (
+        !enriched ||
+        !sameProgressiveRevision(result.revision, this.revisionOf(enriched)) ||
+        this.cache.get(current.file)?.read !== result.value.read
+      )
+        return;
+      const turns = this.commitRepositoryTurns(enriched, result.value.read.turns);
+      this.applyCommitRepositoryEvidence(enriched, turns);
+      this.repositoryCommits.apply(turns, this.folders());
+      // Completion requires the owning panel to accept this window and its enriched commit rows.
+      const visible = new Set(this.cards.filter((card) => 'commits' in card).map((card) => card.key));
+      const sender = work.host ? this.rowSenders?.get(work.host) : undefined;
+      const accepted = sender?.acceptedCards;
+      const folders = this.folders();
+      const changed =
+        sender?.acceptedWindow !== result.value.read ||
+        turns.some((turn) => {
+          const key = turnKey(turn);
+          return (
+            visible.has(key) &&
+            !isDeepStrictEqual(accepted?.get(key), commitRowsOf(turn, this.collectedAt, folders).rows)
+          );
+        });
+      if (changed) void this.refresh(true, true, true, true);
     } catch {
       const current = this.currentSelectedSession(work);
       if (current) {
@@ -12997,7 +13045,13 @@ export class PanelProvider implements vscode.Disposable {
         readerRead: (msg) => this.readerRead({ ...msg.operation, namespace: 'browser' }, host),
         ready: () => {
           // A loaded page holds no session rows.
-          this.rowSenders?.get(host)?.reset();
+          const sender = this.rowSenders?.get(host);
+          if (sender) {
+            sender.reset();
+            sender.acceptedCards = undefined;
+            sender.acceptedWindow = undefined;
+            sender.acceptedCardPost = sender.cardPost = (sender.cardPost ?? 0) + 1;
+          }
           this.browserReady(host);
         },
         // The panel lost a delta. Post its rows again from the catalog the host holds, without a new catalog walk.

@@ -82,6 +82,7 @@ import {
   stepFigure,
   stepLine,
   toCard,
+  commitRowsOf,
   toCompactionCard,
   tokenLines,
   toolCategoriesOf,
@@ -1026,6 +1027,32 @@ test('a child commit stays attributed while the turn counts each sha once', () =
   const parentOnly = subagentCommitTurn();
   parentOnly.agents = [];
   assert.equal(toCard(parentOnly, false, NOW).chips.find((chip) => chip.metric === 'commits')?.name, '1 commit');
+});
+
+test('commit-row projection preserves child attribution and landing order without reading response or activity', () => {
+  const subject = subagentCommitTurn();
+  subject.landings = [
+    {
+      id: 'merge:landing',
+      sha: 'bbbb2222',
+      subject: 'Land topic',
+      from: 'topic',
+      head: { kind: 'branch', name: 'main' },
+      at: Math.max(...toCard(subject, false, NOW).commits.map((row) => row.at)) + 1,
+      place: null,
+      dir: 'c:/repo',
+    },
+  ];
+  const expected = toCard(subject, false, NOW, ['c:/repo']).commits;
+  for (const field of ['summary', 'steps', 'files'])
+    Object.defineProperty(subject, field, {
+      get() {
+        throw new Error(`commit projection read ${field}`);
+      },
+    });
+  assert.deepEqual(commitRowsOf(subject, NOW, ['c:/repo']).rows, expected);
+  assert.equal(expected.at(-1)?.kind, 'landing');
+  assert.ok(expected.some((row) => row.madeBy));
 });
 
 test('a native Codex child supplies both commit rows behind its two-commit figure', () => {

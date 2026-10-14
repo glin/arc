@@ -4329,6 +4329,14 @@ export function carriedSubagentCount(
     : 0;
 }
 
+export function commitRowsOf(turn: Turn, now: number = Date.now(), folders: readonly string[] = []) {
+  const commits = attributedCommits(turn).map(({ commit, madeBy, madeBySession }) =>
+    commitCard(commit, now, madeBy, madeBySession, folders),
+  );
+  const landings = (turn.landings ?? []).map((landing) => landingCard(landing, folders, now));
+  return { commits, landings, rows: [...commits, ...landings].sort((a, b) => a.at - b.at) };
+}
+
 export function toCard(
   turn: Turn,
   isLatest: boolean,
@@ -4402,10 +4410,7 @@ export function toCard(
   const agentCards = turn.agents.map((agent) =>
     agentCard(agent, status === 'running', live, launches, rowPaths, now, turn.agent),
   );
-  const commitCards = attributedCommits(turn).map(({ commit, madeBy, madeBySession }) =>
-    commitCard(commit, now, madeBy, madeBySession, folders),
-  );
-  const landingCards = (turn.landings ?? []).map((landing) => landingCard(landing, folders, now));
+  const { commits: commitCards, landings: landingCards, rows: commitRows } = commitRowsOf(turn, now, folders);
   const subagentCommitCount = commitCards.filter((commit) => Boolean(commit.madeBy)).length;
   const subagentFileCount = changed.filter((file) => Boolean(file.madeBy)).length;
   const carried = carriedSubagentCount(turn, isLatest, status, liveChildren);
@@ -4521,7 +4526,7 @@ export function toCard(
       .sort(mostCalledFirst),
     agents: agentCards,
     // List commits and landings together by timestamp. Only commits contribute to the commit count.
-    commits: [...commitCards, ...landingCards].sort((a, b) => a.at - b.at),
+    commits: commitRows,
     errorText: turn.error,
   };
 }

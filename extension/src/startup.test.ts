@@ -90,6 +90,8 @@ import {
 import { RowDeltaReceiver, RowDeltaSender } from './webview/row-deltas.ts';
 import {
   acceptsProgressiveResult,
+  CommitRepositoryReservations,
+  commitRepositorySourceKey,
   INITIAL_RAIL_READ_BYTES,
   metadataReadBudget,
   preservesLoadedHistory,
@@ -123,7 +125,8 @@ import {
   writeTimeOfVersion,
 } from './turnrail';
 import { recordedCostBasis } from './pricing';
-import { readMovedOnlyFor, turnKey } from './domain/read.ts';
+import { isTurnRead, readMovedOnlyFor, turnKey } from './domain/read.ts';
+import { commitRowsOf } from './turncard';
 import {
   agentSpendDependencyKey,
   childSpendVersion,
@@ -174,7 +177,9 @@ import {
   pressOfKind,
   runningSessions,
 } from './composerview';
-import { countedDispatchedCosts, pendingAskPosition, toCard } from './turncard';
+import { countedDispatchedCosts, pendingAskPosition, toCard, TURN_QUIET_MS } from './turncard';
+import { COMMIT_REPOSITORY_PARSER_VERSION, commitRepositoryOccurrence } from './codexhistory';
+import { RepositoryCommits } from './gitcommits';
 import { railCacheMarkOf, sessionStatusOf, stableRailOrder } from './turnrail';
 import { storedAssetsForPrompt } from './promptassets';
 import { emptyTrail, renamePlace, visitPlace } from './turnplaces';
@@ -182,7 +187,7 @@ import { adoptLabelSession, labelsOf } from './turnlabels';
 import { isSearch, searchScope, searchScopeName, searchTurns } from './turnsearch.ts';
 import { dispatchPanelToHost, parsePanelToHost } from './webview/protocol.ts';
 import { BoundedTrailingScheduler, CATALOG_REFRESH_DEADLINE_MS, mergeRefreshRequests } from './scheduler';
-import { compaction, turn, claudeCostState } from './turnfixtures';
+import { compaction, turn, subagent, claudeCostState } from './turnfixtures';
 import {
   selectionCoverage,
   selectionFinished,
@@ -2024,6 +2029,446 @@ test('selected delivery rejects changed host ownership and scope after the worke
     await pending;
     assert.equal(provider.cache.size, 0, `${change} change admitted obsolete content`);
     assert.ok(provider.messages.every((message: any) => !message.cards?.length));
+  }
+});
+
+async function selectedPublicationFixture(
+  evidence: 'changed' | 'unchanged' | 'absent' | 'recovery',
+  scope: Record<string, unknown> = {},
+  oldHasCommits = false,
+) {
+  const directory = tempDir('selected-publication-');
+  const childFile = path.join(directory, 'child.jsonl');
+  fs.writeFileSync(childFile, 'child record');
+  const provider = completeDiscoveryHarness(undefined, true, ['readFor', 'sendToHost'], {
+    codexSpendIndex,
+    codexSubagentFor,
+    commitRepositorySourceKey,
+    COMMIT_REPOSITORY_PARSER_VERSION,
+    commitRepositoryOccurrence,
+    toCard,
+    commitRowsOf,
+    turnKey,
+    ...scope,
+  });
+  const now = Date.now();
+  const session = {
+    file: path.join(directory, 'parent.jsonl'),
+    sessionId: 'selected',
+    agent: 'codex',
+    size: 10,
+    mtimeMs: 1,
+    dev: 1,
+    ino: 2,
+  };
+  fs.writeFileSync(session.file, 'parent record');
+  provider._showing = session.sessionId;
+  provider.hostSessions = new Map([[provider.hosts[0], session.sessionId]]);
+  provider.partial = [
+    session,
+    ...Array.from({ length: 999 }, (_, i) => ({ ...session, file: `other-${i}.jsonl`, sessionId: `other-${i}` })),
+  ];
+  provider.authoritativeCatalog = provider.partial;
+  provider.codexSubagents = [
+    {
+      threadId: 'child',
+      parentThreadId: session.sessionId,
+      file: childFile,
+      agentPath: '/root/child',
+      backgroundReview: false,
+    },
+  ];
+  provider.commitRepositoryReplies = new Map();
+  provider.commitRepositoryReservations = new CommitRepositoryReservations();
+  provider.agentSpendKey = () => '';
+  provider.progressiveCurrent = (source: SessionFile) => provider.cache.get(source.file)?.revision.size === source.size;
+  const repositories = new RepositoryCommits({ run: async () => null }, () => {});
+  provider.repositoryCommits = repositories;
+  const repo = repositories as any;
+  const destination = path.join(directory, 'verified');
+  const key = `candidates|exact|abc1234|${[destination, 'project'].map(normalizeFsPath).sort().join('|')}`;
+  repo.exactAnswers.set(key, { dir: destination });
+  repo.identities.set(normalizeFsPath('project'), { commonDir: null, gitDir: null, root: null });
+  repo.identities.set(normalizeFsPath(destination), { commonDir: destination, gitDir: destination, root: destination });
+  const commit = {
+    sha: 'abc1234',
+    printedSha: 'abc1234',
+    subject: 'Selected work',
+    at: now - 100,
+    dir: 'unproved',
+    place: { kind: 'other', name: 'Unproved' },
+    repository: { key: 'unproved', name: 'Unproved', own: false },
+    repositoryEvidence: { complete: true, at: now - 100, dirs: ['unproved'], turnId: 'selected-turn' },
+  } as any;
+  const old = turn({
+    agent: 'codex',
+    sessionId: session.sessionId,
+    startedAt: now - TURN_QUIET_MS - 2000,
+    endedAt: now - TURN_QUIET_MS - 1000,
+    finished: false,
+    summary: '',
+    promptId: 'same-prompt',
+    contextTokens: 212319,
+    agents: oldHasCommits
+      ? [subagent({ id: 'child', commits: [{ ...commit, dir: null, place: null, repository: null }] })]
+      : [],
+  });
+  const newest = turn({
+    ...old,
+    endedAt: now - 100,
+    contextTokens: 166396,
+    summary: 'Current response '.repeat(16000),
+    agents: evidence === 'absent' ? [] : [subagent({ id: 'child', commits: [commit] })],
+  });
+  const revision = { size: session.size, mtimeMs: session.mtimeMs, dev: session.dev, ino: session.ino };
+  provider.cache.set(session.file, {
+    key: '',
+    structuralKey: '',
+    agentKey: '',
+    revision,
+    read: { turns: [old], compactions: [], readBytes: 10, turnLimitReached: false },
+  });
+  provider.collect = (sources: SessionFile[]) => {
+    provider.collectedAt = now;
+    return sources.flatMap((source) =>
+      provider.readFor(source, 40, 1024).read.turns.map((value: any) => toCard(value, true, now, provider.folders())),
+    );
+  };
+  provider.useRailPayload(railPayload);
+  const bytes: number[] = [];
+  const post = provider.hosts[0].webview.postMessage;
+  provider.hosts[0].webview.postMessage = (message: any) => {
+    const size = serializedMessageBytes(message);
+    assert.notEqual(size, null);
+    bytes.push(size!);
+    if (evidence === 'recovery' && message.cards?.[0]?.status === 'running') provider.anyVisible = () => false;
+    return post(message);
+  };
+  await provider.refresh(true, true, true, true);
+  const first = provider.messages.at(-1).cards[0];
+  assert.equal(first.status, 'stopped');
+  assert.equal(isTurnRead(first, new Set(), new Map()), false);
+  provider.messages.length = 0;
+  bytes.length = 0;
+  session.size += 1;
+  session.mtimeMs += 1;
+  let finish!: () => void;
+  let started!: () => void;
+  const hydrationStarted = new Promise<void>((resolve) => {
+    started = resolve;
+  });
+  let hydrationRequests = 0;
+  provider.progressiveWorker = {
+    run: async (request: ProgressiveRequest, generation: number) => {
+      if (request.kind === 'window') {
+        const result = windowResult(generation, { ...session });
+        if (result.value.kind === 'window') {
+          result.value.read.turns = [newest];
+          result.value.recoveryPending = evidence === 'recovery';
+        }
+        return result;
+      }
+      assert.equal(request.kind, 'commit-repositories');
+      hydrationRequests++;
+      started();
+      return new Promise<ProgressiveResult>((resolve) => {
+        finish = () =>
+          resolve({
+            generation,
+            revision: null,
+            value: {
+              kind: 'commit-repositories',
+              parent: request.parent,
+              child: request.child,
+              parserVersion: request.parserVersion,
+              status: 'complete',
+              readBytes: { parent: 0, child: 0 },
+              covered: { parent: [0, request.parent.revision.size], child: [0, request.child.revision.size] },
+              token: null,
+              targets:
+                evidence === 'changed'
+                  ? [
+                      {
+                        sha: 'abc1234',
+                        occurrence: commitRepositoryOccurrence(request.commits[0]),
+                        dirs: [destination],
+                      },
+                    ]
+                  : [],
+            },
+          });
+      });
+    },
+  };
+  return {
+    provider,
+    first,
+    newest,
+    session,
+    commit,
+    bytes,
+    hydrationStarted,
+    finish: () => finish(),
+    hydrationRequests: () => hydrationRequests,
+  };
+}
+
+test('accepted unread same-turn facts publish before repository hydration', async () => {
+  const fixture = await selectedPublicationFixture('changed');
+  const { provider, first, newest, commit } = fixture;
+  const pending = provider.completeSelectedWindow('selected', 0);
+  await fixture.hydrationStarted;
+  const card = provider.messages.at(-1)?.cards[0];
+  assert.ok(card, 'the accepted unread turn waited for repository hydration');
+  assert.equal(card.status, 'running');
+  assert.equal(card.key, first.key);
+  assert.equal(card.promptId, first.promptId);
+  assert.equal(card.promptId, 'same-prompt');
+  assert.equal(newest.contextTokens, 166396);
+  assert.equal(card.summary, newest.summary);
+  assert.equal(isTurnRead(card, new Set(), new Map()), false);
+  assert.equal(commit.candidates.complete, false);
+  assert.equal(commit.dir, null);
+  assert.equal(commit.place, null);
+  assert.equal(commit.repository, null);
+  assert.equal(card.commits[0].dir, null);
+  assert.equal(provider.messages.length, 1);
+  fixture.finish();
+  await pending;
+  assert.equal(provider.messages.length, 2);
+  assert.ok(provider.messages.at(-1).cards[0].commits[0].dir);
+  assert.equal(fixture.bytes.length, 2);
+  process.stdout.write(`selected publication payload bytes ${JSON.stringify(fixture.bytes)}\n`);
+});
+
+test('selected publication suppresses unchanged and obsolete repository enrichment', async () => {
+  for (const outcome of [
+    'unchanged',
+    'absent',
+    'recovery',
+    'selection',
+    'scope',
+    'hidden',
+    'cancelled',
+    'revision',
+    'published',
+  ] as const) {
+    const evidence = outcome === 'absent' || outcome === 'recovery' || outcome === 'unchanged' ? outcome : 'changed';
+    const fixture = await selectedPublicationFixture(evidence);
+    const { provider } = fixture;
+    const pending = provider.completeSelectedWindow('selected', 0);
+    if (evidence === 'absent' || evidence === 'recovery') {
+      await pending;
+      assert.equal(fixture.hydrationRequests(), 0, outcome);
+    } else {
+      await fixture.hydrationStarted;
+      assert.equal(provider.messages.length, 1, outcome);
+      if (outcome === 'selection') provider.hostSessions.set(provider.hosts[0], 'another');
+      if (outcome === 'scope') provider.repositoryScopeRoots = ['another'];
+      if (outcome === 'hidden') provider.anyVisible = () => false;
+      if (outcome === 'cancelled') provider.selectionWork.controller.abort();
+      if (outcome === 'revision') fixture.session.size++;
+      if (outcome === 'published') {
+        const context = provider.commitRepositoryContexts(fixture.session, [fixture.newest])[0];
+        provider.commitRepositoryReplies.set(context.child.file, {
+          key: context.key,
+          reply: {
+            status: 'complete',
+            targets: [
+              {
+                sha: 'abc1234',
+                occurrence: commitRepositoryOccurrence(context.wanted[0]),
+                dirs: [path.join(path.dirname(fixture.session.file), 'verified')],
+              },
+            ],
+          },
+        });
+        await provider.refresh(true, true, true, true);
+        assert.ok(provider.messages.at(-1).cards[0].commits[0].dir);
+      }
+      fixture.finish();
+      await pending;
+    }
+    assert.equal(
+      provider.messages.length,
+      outcome === 'published' ? 2 : 1,
+      `${outcome} repeated the selected publication`,
+    );
+    assert.equal(fixture.bytes.length, outcome === 'published' ? 2 : 1, outcome);
+    process.stdout.write(`selected publication case ${outcome} ${JSON.stringify(fixture.bytes)}\n`);
+  }
+});
+
+test('selected enrichment retries an owning panel after rejected independent delivery', async () => {
+  for (const failure of ['false', 'rejection'] as const) {
+    for (const peerAccepted of [false, true]) {
+      const fixture = await selectedPublicationFixture('changed');
+      const { provider } = fixture;
+      const owner = provider.hosts[0];
+      const peer = { webview: { postMessage: () => Promise.resolve(true) }, active: () => false, visible: () => true };
+      if (peerAccepted) {
+        provider.hosts.push(peer);
+        provider.readyHosts.add(peer);
+        provider.hostSessions.set(peer, fixture.session.sessionId);
+      }
+      const pending = provider.completeSelectedWindow('selected', 0);
+      await fixture.hydrationStarted;
+      const context = provider.commitRepositoryContexts(fixture.session, [fixture.newest])[0];
+      provider.commitRepositoryReplies.set(context.child.file, {
+        key: context.key,
+        reply: {
+          status: 'complete',
+          targets: [
+            {
+              sha: 'abc1234',
+              occurrence: commitRepositoryOccurrence(context.wanted[0]),
+              dirs: [path.join(path.dirname(fixture.session.file), 'verified')],
+            },
+          ],
+        },
+      });
+      const post = owner.webview.postMessage;
+      let attempts = 0;
+      let reject = true;
+      owner.webview.postMessage = (message: any) => {
+        attempts++;
+        return reject
+          ? failure === 'false'
+            ? Promise.resolve(false)
+            : Promise.reject(new Error('delivery failed'))
+          : post(message);
+      };
+      await provider.refresh(true, true, true, true);
+      await vi.waitFor(() => assert.equal(attempts, 1));
+      assert.equal(provider.messages.at(-1).cards[0].commits[0].dir, null);
+      assert.ok(provider.cards[0].commits[0].dir);
+      if (peerAccepted)
+        await vi.waitFor(() => assert.ok(provider.rowSender(peer).acceptedCards.get(fixture.first.key)[0].dir));
+      reject = false;
+      fixture.finish();
+      await pending;
+      await vi.waitFor(() =>
+        assert.ok(
+          provider.messages.at(-1).cards[0].commits[0].dir,
+          'rejected independent delivery consumed commit navigation',
+        ),
+      );
+      assert.equal(
+        attempts,
+        2,
+        `${failure} consumed the owning panel's enrichment with peer acceptance ${peerAccepted}`,
+      );
+    }
+  }
+});
+
+test.each([
+  ['false', false],
+  ['false', true],
+  ['rejection', false],
+  ['rejection', true],
+] as const)(
+  'selected enrichment retries current same-turn facts after %s early owner delivery with peer %s',
+  async (failure, peerAccepted) => {
+    const fixture = await selectedPublicationFixture('unchanged', {}, true);
+    const { provider, first, newest } = fixture;
+    const owner = provider.hosts[0];
+    const peerMessages: any[] = [];
+    const peer = {
+      webview: {
+        postMessage: (message: any) => {
+          peerMessages.push(message);
+          return Promise.resolve(true);
+        },
+      },
+      active: () => false,
+      visible: () => true,
+    };
+    if (peerAccepted) {
+      provider.hosts.push(peer);
+      provider.readyHosts.add(peer);
+      provider.hostSessions.set(peer, fixture.session.sessionId);
+    }
+    const post = owner.webview.postMessage;
+    let attempts = 0;
+    let reject = true;
+    owner.webview.postMessage = (message: any) => {
+      attempts++;
+      return reject
+        ? failure === 'false'
+          ? Promise.resolve(false)
+          : Promise.reject(new Error('delivery failed'))
+        : post(message);
+    };
+    const pending = provider.completeSelectedWindow('selected', 0);
+    await fixture.hydrationStarted;
+    await vi.waitFor(() => assert.equal(attempts, 1));
+    assert.equal(provider.messages.length, 0, 'the owner accepted the failed early post');
+    assert.deepEqual(provider.rowSender(owner).acceptedCards.get(first.key), provider.cards[0].commits);
+    if (peerAccepted) {
+      await vi.waitFor(() => assert.equal(peerMessages.at(-1)?.cards[0].summary, newest.summary));
+      assert.equal(peerMessages.at(-1).cards[0].status, 'running');
+    }
+    reject = false;
+    fixture.finish();
+    await pending;
+    await vi.waitFor(() =>
+      assert.equal(
+        provider.messages.at(-1)?.cards[0].summary,
+        newest.summary,
+        'failed early delivery lost current same-turn response',
+      ),
+    );
+    const delivered = provider.messages.at(-1).cards[0];
+    assert.equal(delivered.status, 'running');
+    assert.equal(delivered.key, first.key);
+    assert.equal(delivered.promptId, first.promptId);
+    assert.equal(isTurnRead(delivered, new Set(), new Map()), false);
+    assert.deepEqual(delivered.commits, first.commits, 'the fixture changed commit rows');
+    assert.equal(attempts, 2, `${failure} failed to retry owner with peer acceptance ${peerAccepted}`);
+  },
+);
+
+test('unchanged selected enrichment indexes retained history and projects only commit rows', async () => {
+  for (const count of [1000, 10000]) {
+    let keyReads = 0;
+    let projections = 0;
+    let fullCards = 0;
+    const fixture = await selectedPublicationFixture('unchanged', {
+      commitRowsOf: (...args: Parameters<typeof commitRowsOf>) => {
+        projections++;
+        return commitRowsOf(...args);
+      },
+      toCard: (...args: Parameters<typeof toCard>) => {
+        fullCards++;
+        return toCard(...args);
+      },
+    });
+    const { provider } = fixture;
+    const pending = provider.completeSelectedWindow('selected', 0);
+    await fixture.hydrationStarted;
+    const retained = Array.from({ length: count - 1 }, (_, i) =>
+      turn({ sessionId: 'selected', startedAt: i + 1, endedAt: i + 2, promptId: `retained-${i}` }),
+    );
+    provider.history.set('selected', { pages: [{ turns: retained, compactions: [] }] });
+    const all = [fixture.newest, ...retained];
+    const cards = all.map((value) => ({
+      get key() {
+        keyReads++;
+        return turnKey(value);
+      },
+      commits: commitRowsOf(value, provider.collectedAt, provider.folders()).rows,
+    }));
+    provider.collect = () => cards;
+    await provider.refresh(true, true, true, true);
+    keyReads = projections = fullCards = 0;
+    fixture.finish();
+    await pending;
+    assert.equal(provider.messages.length, 2, 'unchanged retained commit rows added a publication');
+    assert.ok(keyReads <= count * 2, `${count} retained turns performed ${keyReads} card key reads`);
+    assert.equal(projections, count, 'retained turns did not use the shared commit-row projection');
+    assert.equal(fullCards, 0, 'commit comparison projected response, activity, and file content');
+    process.stdout.write(`retained publication work ${JSON.stringify({ count, keyReads, projections, fullCards })}\n`);
   }
 });
 
