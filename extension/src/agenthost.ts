@@ -56,6 +56,7 @@ import {
   type BackgroundCommand,
 } from './transcript';
 import { ARC_IDENTITY } from './identity';
+import { QuestionRecovery, questionIdentity, type RecoveredQuestion } from './questionrecovery';
 
 // The child-process methods used by the host. Tests supply these methods without starting a CLI.
 export interface ChildLike {
@@ -646,6 +647,9 @@ export async function renameAgentSession(
 }
 
 export interface HostOptions {
+  recovery?: QuestionRecovery;
+  recoverySource?: (agent: AgentName, session: string) => string | null;
+  onRecoveryFailure?: () => void;
   spawner?: Spawner;
   idleDurationMs: number;
   timer?: AgentHostTimer;
@@ -2417,6 +2421,15 @@ export function modelChange(
 
 // Owns children started by this window. Other windows read their work from disk.
 export class AgentHost {
+  private recovery?: QuestionRecovery;
+  private readonly recoveryAsks = new Map<string, Ask>();
+  private readonly completedLiveQuestions = new Set<string>();
+
+  setRecovery(recovery: QuestionRecovery): void {
+    this.recovery?.release();
+    this.completedLiveQuestions.clear();
+    this.recovery = recovery;
+  }
   private readonly sessions = new Map<string, AgentSession>();
   private readonly backgroundReads = new Map<string, ClaudeBackgroundWork>();
 
@@ -2466,6 +2479,7 @@ export class AgentHost {
   private disposed = false;
 
   constructor(private readonly options: HostOptions) {
+    this.recovery = options.recovery;
     this.spawner = options.spawner ?? spawnCli;
     this.timer = options.timer ?? AGENT_HOST_TIMER;
     this.idleDurationMs = options.idleDurationMs;
@@ -2571,7 +2585,40 @@ export class AgentHost {
       key,
       plan,
       this.spawner,
-      (event, turnId) => this.options.onEvent(turnId === undefined ? { key, event } : { key, event, turnId }),
+      (event, turnId) => {
+        const state = this.sessions.get(key)?.state();
+        if (this.recovery && state?.sessionId) {
+          const askKey = `${key}:${event.kind === 'ask' ? event.ask.id : event.kind === 'askResolved' ? event.id : ''}`;
+          if (event.kind === 'ask') {
+            this.recoveryAsks.set(askKey, event.ask);
+            if (
+              event.ask.kind === 'question' &&
+              !this.recovery.capture(
+                state.agent,
+                state.sessionId,
+                state.cwd,
+                event.ask,
+                this.options.recoverySource?.(state.agent, state.sessionId) ?? null,
+              )
+            )
+              this.options.onRecoveryFailure?.();
+          }
+          if (event.kind === 'askResolved') {
+            const ask = this.recoveryAsks.get(askKey);
+            if (ask?.kind === 'question') {
+              if (event.outcome && event.outcome !== 'failed')
+                this.completedLiveQuestions.add(questionIdentity(state.agent, state.sessionId, state.cwd, ask));
+              try {
+                this.recovery.resolved(state.agent, state.sessionId, state.cwd, ask, event);
+              } catch {
+                this.options.onRecoveryFailure?.();
+              }
+            }
+            this.recoveryAsks.delete(askKey);
+          }
+        }
+        this.options.onEvent(turnId === undefined ? { key, event } : { key, event, turnId });
+      },
       (backgroundReleased) => {
         if (backgroundReleased) this.applyRetirementEligibility(key, session);
         else this.applyTargetedRetirementEligibility(key, session);
@@ -3003,12 +3050,101 @@ export class AgentHost {
   }
 
   // Lists all asks waiting on the reader across this window's sessions.
-  waiting(): { key: string; ask: Ask }[] {
-    const out: { key: string; ask: Ask }[] = [];
+  waiting(): { key: string; session: string | null; ask: Ask; recovered?: RecoveredQuestion }[] {
+    const out: { key: string; session: string | null; ask: Ask; recovered?: RecoveredQuestion }[] = [];
+    const live = new Set<string>();
+    let entries = this.recovery?.entries() ?? [];
+    const owned = entries.length ? this.recovery!.owns() : false;
+    if (owned) entries = this.recovery!.entries();
+    const savedByIdentity = new Map(entries.map((entry) => [entry.identity, entry]));
     for (const session of this.sessions.values()) {
-      for (const ask of session.state().asks) out.push({ key: session.key, ask });
+      const state = session.state();
+      for (const ask of state.asks) {
+        let published = ask;
+        if (ask.kind === 'question' && state.sessionId) {
+          const identity = questionIdentity(state.agent, state.sessionId, state.cwd, ask);
+          live.add(identity);
+          const saved = savedByIdentity.get(identity);
+          if (
+            saved &&
+            saved.activation !== this.recovery?.options.activation &&
+            (saved.disposition === 'unknown' || !owned)
+          )
+            published = {
+              ...ask,
+              recovery: {
+                blocked: true,
+                detail: 'The earlier answer has no confirmed delivery. Decline dismisses this saved question.',
+              },
+            };
+        }
+        out.push({ key: session.key, session: state.sessionId, ask: published });
+      }
+    }
+    for (const entry of entries) {
+      if (live.has(entry.identity)) continue;
+      if (entry.activation === this.recovery?.options.activation && this.completedLiveQuestions.has(entry.identity))
+        continue;
+      const waiting = out.some((open) => !open.recovered && open.session === entry.session);
+      const secret = entry.ask.questions.some((q) => q.secret);
+      const sourceUnavailable = Boolean(
+        this.options.recoverySource &&
+        (!entry.source || this.options.recoverySource(entry.agent, entry.session) !== entry.source),
+      );
+      const blocked = !owned || sourceUnavailable || entry.disposition === 'unknown' || waiting || secret;
+      const detail = !owned
+        ? 'Another window owns this saved question. Read it here or return to that window.'
+        : sourceUnavailable
+          ? 'The saved session cannot be identified yet. You can read this question or Decline it.'
+          : entry.disposition === 'unknown'
+            ? 'The agent did not confirm this answer. Decline dismisses the saved question without sending it again.'
+            : waiting
+              ? 'Answer the current agent request first, or Decline this saved question.'
+              : secret
+                ? 'Ask the agent for a fresh question in the Prompt box. Enter the secret only in that new question.'
+                : 'Answer continues the stopped session. Decline dismisses this saved question without starting the agent.';
+      out.push({
+        key: entry.ask.id,
+        session: entry.session,
+        recovered: entry,
+        ask: { ...entry.ask, recovery: { blocked, detail } },
+      });
     }
     return out;
+  }
+
+  answer(key: string, id: string, answer: AskAnswer, recovered = false): boolean {
+    const session = this.get(key);
+    const state = session?.state();
+    const ask = state?.asks.find((q) => q.id === id);
+    if (!session || !state || !ask) return false;
+    if (this.recovery && state.sessionId && ask.kind === 'question') {
+      const identity = questionIdentity(state.agent, state.sessionId, state.cwd, ask);
+      const saved = this.recovery.entries().find((entry) => entry.identity === identity);
+      if (saved && saved.activation !== this.recovery.options.activation) {
+        if (answer.decision === 'deny') {
+          try {
+            this.recovery.settle(identity, 'declined');
+          } catch {
+            return false;
+          }
+          return session.answer(id, answer);
+        }
+        if (saved.disposition === 'unknown' || !this.recovery.owns()) return false;
+      }
+      if (saved)
+        try {
+          this.recovery.begin(identity, null);
+        } catch {
+          if (recovered) return false;
+          this.options.onRecoveryFailure?.();
+        }
+    }
+    return session.answer(id, answer);
+  }
+
+  questionRecovery(): QuestionRecovery | undefined {
+    return this.recovery;
   }
 
   dispose(): void {
@@ -3016,6 +3152,7 @@ export class AgentHost {
       return;
     }
     this.disposed = true;
+    this.recovery?.release();
     for (const key of [...this.retirementTimers.keys()]) this.cancelRetirement(key);
     for (const session of this.sessions.values()) void session.dispose();
     for (const child of this.renameChildren) void child.dispose();

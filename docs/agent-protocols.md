@@ -12,6 +12,16 @@ Session identity outlives the process. The Panel sends each prompt to its named 
 
 Idle control reads use a child that starts no session. They supply account usage, model catalogs, skills, or MCP state without writing a prompt. `agenthost.ts` reuses a live idle child when it can and closes it after the requested controls settle. A Claude draft is the exception. Opening Servers retains its provisional child for pending status refreshes and the first prompt.
 
+Arc captures question requests in workspace storage independently of the child. Permission requests have no restart recovery. A failed save leaves the live question answerable and reports that restart recovery is unavailable.
+
+The restored panel retains its recovery origin in webview state. Recovery requires VS Code to restore the Arc tab. A restart without a restored tab leaves its saved questions unavailable. Immutable lease successors give one replacement activation exclusive delivery ownership after its predecessor releases ownership or its process ends. Another origin cannot take over through an absent activation. Unknown process liveness blocks recovered delivery. Ordinary live answering does not depend on recovery ownership.
+
+Question recovery preserves source identity and original question indexes separately from transport request IDs. A fresh native request with the same source identity uses its current transport. Repeated wording with a new identity remains a separate request. A current unmatched request blocks contextual continuation of an older question.
+
+A reader answer resumes a stopped session explicitly. Codex async recovery sends its original reply envelope through a new prompt. Other nonsecret questions use an identified contextual answer when no fresh native request exists. Secret answers require a fresh native request and never enter recovery prompts or saved answers.
+
+Recovered delivery persists its attempt before provider input. Confirmed acceptance settles it, while unknown delivery blocks another submission. A completed live answer stays hidden in its capturing activation until replacement exposes any remaining unknown delivery. Exact source evidence reconciles captured identities, including another client's Codex replies. Claude shutdown interruption results leave captured questions unresolved. Transcript-only questions never become actionable. Clear and Codex `/new` durably close predecessor questions before the reset.
+
 ## Shared vocabulary
 
 `agentwire.ts` defines asks, answers, session events, settings, and turn outcomes. `claudewire.ts` and `codexwire.ts` reduce their vendor messages to those values. `activitydetail.ts` assigns known operations an explicit detail policy and reads only safe subject fields from unknown tool inputs. Prompt box and host code must use these shared values.

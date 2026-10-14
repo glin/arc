@@ -9,6 +9,9 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { QuestionRecovery, questionContinuation, questionIdentity } from './questionrecovery';
+import { GuardedAttempt, type AgentPrompt } from './agentwire';
+import { QuestionEvidenceReader } from './questionrecords';
 import {
   arcHome,
   cacheRoot,
@@ -208,6 +211,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   let snapshotOffer: ClaudePluginOffer | undefined;
   let snapshotPanelOpened = false;
   const panel = registerPanel(context, root, workspaceCache, activationAt);
+  const questionEvidence = new QuestionEvidenceReader();
   channel?.setRequestHandler((request) => panel.handleSessionRequest(request));
   panel.setWindowStateHandler((state) => {
     if (state.panelReady && state.panelVisible) {
@@ -381,7 +385,28 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   };
   // One deferred self-compaction owner per window activation. It never opens a missing child.
   let compaction: CompactHost<AgentSession> | null = null;
+  const recoveryPrompts = new WeakMap<AgentPrompt, GuardedAttempt>();
+  const recoveryFailure = () => {
+    void vscode.window.showWarningMessage(
+      'Arc: this question cannot be saved for restart. You can still answer the current question.',
+    );
+  };
+  const recoveryFor = (origin: string): QuestionRecovery | undefined => {
+    try {
+      return new QuestionRecovery({
+        root: path.join(workspaceCache.root, 'question-recovery'),
+        origin,
+        activation: channel?.hostId ?? randomUUID(),
+      });
+    } catch {
+      recoveryFailure();
+      return undefined;
+    }
+  };
   const host = new AgentHost({
+    recovery: recoveryFor(panel.recoveryOrigin),
+    recoverySource: (agent, session) => panel.questionSource(agent, session),
+    onRecoveryFailure: recoveryFailure,
     spawner,
     idleDurationMs: readSetting('agentIdleMinutes') * 60_000,
     onEvent: ({ key, event, turnId }) => {
@@ -633,13 +658,35 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   });
 
   const updateAgentAffordance = () => {
+    const recovery = host.questionRecovery();
+    for (const entry of recovery?.entries() ?? []) {
+      const source = panel.questionSource(entry.agent, entry.session);
+      if (source && !entry.source) {
+        try {
+          recovery?.bindSource(entry.identity, source);
+        } catch {
+          /* Unknown ownership leaves the question readable. */
+        }
+      }
+    }
+    if (recovery) questionEvidence.reconcile(recovery, (agent, session) => panel.questionSource(agent, session));
     const waiting = host.waiting();
     panel.setAsks(
       waiting.flatMap((entry) => {
-        const session = host.get(entry.key)?.state().sessionId;
+        const session = entry.session;
         return session ? [{ session, ask: entry.ask }] : [];
       }),
     );
+  };
+  panel.onRecoveryOrigin = (origin) => {
+    const recovery = recoveryFor(origin);
+    if (recovery) host.setRecovery(recovery);
+    updateAgentAffordance();
+  };
+  const rowsRefreshed = panel.onSessionRowsRefreshed;
+  panel.onSessionRowsRefreshed = () => {
+    rowsRefreshed?.();
+    updateAgentAffordance();
   };
 
   const workspaceCwd = (): string | null => vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? null;
@@ -1588,10 +1635,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       const turnId = await withExistingSessionActivity(agent as AgentName, sessionId, cwd, async (session) => {
         validateResolvedPromptAssets(prompt.assets);
         // Retain prompt text until the child accepts the turn. The returned promise reports protocol refusals to the retained card.
-        return await session.prompt(prompt, (turnId) => {
-          compaction?.submitted(session, turnId);
-          onSubmitted?.(session.state().sessionId ?? sessionId, turnId);
-        });
+        return await session.prompt(
+          prompt,
+          (turnId) => {
+            compaction?.submitted(session, turnId);
+            onSubmitted?.(session.state().sessionId ?? sessionId, turnId);
+          },
+          recoveryPrompts.get(prompt),
+        );
       });
       if (turnId === null) {
         return failedPromptDelivery(agent, new Error('no agent session could be opened'));
@@ -1622,10 +1673,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             const turnId = await withStartedSessionActivity(
               forkedSession,
               (live) =>
-                live.prompt(prompt, (turnId) => {
-                  compaction?.submitted(live, turnId);
-                  onSubmitted?.(continued, turnId);
-                }),
+                live.prompt(
+                  prompt,
+                  (turnId) => {
+                    compaction?.submitted(live, turnId);
+                    onSubmitted?.(continued, turnId);
+                  },
+                  recoveryPrompts.get(prompt),
+                ),
               existingSessionPlan('codex', continued, cwd!),
             );
             void panel.refresh();
@@ -1661,6 +1716,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   };
   panel.onClear = async (agent, session, cwd, name) => {
     try {
+      host.questionRecovery()?.closeSession(session);
       const result = await withExistingSessionActivity(agent as AgentName, session, cwd, async (live) => {
         const policy = live.policy ?? policies.readSaved(session);
         let token: string | undefined;
@@ -1991,6 +2047,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         ? claudePlan(launch, {
             cwd,
             resume: session,
+            replayUserMessages: true,
             policy: policies.read(session),
             ...(mode ? { permissionMode: claudeAskMode(mode) } : {}),
             agentRun: panel.isAgentRunLaunch?.(session) ?? false,
@@ -2204,10 +2261,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }
   };
 
-  panel.onAnswerAsk = (session, id, candidate) => {
+  panel.onAnswerAsk = async (session, id, candidate) => {
     const waiting = host.waiting().find((entry) => {
-      const state = host.get(entry.key)?.state();
-      return state?.sessionId === session && entry.ask.id === id;
+      return entry.session === session && entry.ask.id === id;
     });
     if (!waiting) {
       reportAnswer(false);
@@ -2220,7 +2276,81 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       updateAgentAffordance();
       return false;
     }
-    const answered = host.get(waiting.key)?.answer(id, answer) ?? false;
+    if (waiting.recovered) {
+      const entry = waiting.recovered;
+      const recovery = host.questionRecovery();
+      try {
+        if (!recovery?.owns()) throw new Error('Another window owns this saved question.');
+        if (answer.decision === 'deny') {
+          recovery.settle(entry.identity, 'declined');
+          updateAgentAffordance();
+          return true;
+        }
+        const eligible = () => {
+          if (!recovery.owns() || panel.questionSource(entry.agent, entry.session) !== entry.source || !entry.source)
+            throw new Error('The saved question cannot continue in this window.');
+          if (host.waiting().some((open) => open.session === entry.session && !open.recovered))
+            throw new Error('Answer the current agent request before continuing this saved question.');
+        };
+        eligible();
+        const text = questionContinuation(entry, answer);
+        if (!text || entry.disposition === 'unknown')
+          throw new Error(
+            waiting.ask.kind === 'question' ? waiting.ask.recovery?.detail : 'This question cannot be answered.',
+          );
+        const prompt: AgentPrompt = { text, assets: [] };
+        try {
+          const answeredNative = await withExistingSessionActivity(
+            entry.agent,
+            entry.session,
+            entry.cwd,
+            async (live) => {
+              const state = live.state();
+              const fresh = state.asks.find(
+                (ask) =>
+                  ask.kind === 'question' &&
+                  questionIdentity(state.agent, state.sessionId ?? '', state.cwd, ask) === entry.identity,
+              );
+              if (!fresh) return false;
+              if (!recovery.owns()) throw new Error('Another window owns this saved question.');
+              if (!host.answer(live.key, fresh.id, answer, true))
+                throw new Error('The agent is no longer waiting for this answer.');
+              return true;
+            },
+          );
+          if (answeredNative) {
+            updateAgentAffordance();
+            return true;
+          }
+        } catch (error) {
+          if (!activeWriterFailure(error)) throw error;
+        }
+        let began = false;
+        const guard = new GuardedAttempt(randomUUID(), () => {
+          eligible();
+          recovery.begin(entry.identity, text, guard.clientUuid);
+          began = true;
+        });
+        recoveryPrompts.set(prompt, guard);
+        const delivered = await panel.onSendPrompt?.(entry.agent, entry.session, entry.cwd, prompt);
+        recoveryPrompts.delete(prompt);
+        if (began) {
+          const receipt = guard.settled ?? (delivered?.delivered ? await guard.receipt : null);
+          recovery.settle(
+            entry.identity,
+            receipt?.outcome === 'accepted' ? 'answered' : receipt?.outcome === 'refused' ? 'unresolved' : 'unknown',
+            delivered?.session ?? entry.session,
+          );
+        }
+        updateAgentAffordance();
+        return Boolean(delivered?.delivered);
+      } catch (error) {
+        void vscode.window.showWarningMessage(`Arc: ${(error as Error).message}`);
+        updateAgentAffordance();
+        return false;
+      }
+    }
+    const answered = host.answer(waiting.key, id, answer);
     reportAnswer(answered);
     return answered;
   };
@@ -2232,6 +2362,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   channel?.setGuardedSendHandler((request) =>
     guardedChannelSend(guardedSends, request, (...args) => panel.onSendPrompt?.(...args) ?? Promise.resolve({})),
   );
+  updateAgentAffordance();
 }
 
 // Extract a nonempty path from the command's context object. Invalid arguments copy nothing.

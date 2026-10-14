@@ -990,6 +990,7 @@ export interface AskCardAction {
 // A blocking request with its visible and accessible wording. The browser builds
 // controls and returns their values.
 export interface AskCard {
+  answerBlocked?: boolean;
   id: string;
   kind: Ask['kind'];
   title: string;
@@ -2507,7 +2508,8 @@ export function sendAction(state: ComposerState): SendMeaning {
     state.live.some((press) => (press.kind === 'compact' || press.kind === 'clear') && !press.failed);
   // A running agent takes a prompt mid-turn only when the local queue is empty, so the queue stays first in, first out.
   // A Claude answer to an open request joins the running turn, which comes before any queued record.
-  const answersOpenRequest = state.agent === 'claude' && (state.asks?.length ?? 0) > 0;
+  const answersOpenRequest =
+    state.agent === 'claude' && Boolean(state.asks?.some((ask) => ask.kind !== 'question' || !ask.recovery));
   const takesNow =
     !state.clearing &&
     ((!state.running && !state.queued.length) ||
@@ -4433,9 +4435,10 @@ export function askCard(ask: Ask, agent: string): AskCard {
     kind: ask.kind,
     title,
     // The request state supplies the waiting message.
-    detail: '',
+    detail: ask.recovery?.detail ?? '',
     detailFormat: 'prose',
-    name: `${agent} is waiting for you with ${subject}.`,
+    name: ask.recovery ? `${title}. ${ask.recovery.detail}` : `${agent} is waiting for you with ${subject}.`,
+    answerBlocked: ask.recovery?.blocked ?? false,
     questions: ask.questions.map((question, index) => {
       // Use the supplied short label, or the question number when it is absent.
       const formatted = rendered[index];

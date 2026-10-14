@@ -124,7 +124,9 @@ Send answers the open requests before it delivers the prompt. A reader who wants
 
 Radios and checkboxes are the browser's own controls. The panel keys their colour scheme off the theme class the editor puts on the body, because the editor publishes no colour for them. Only a panel inside VS Code carries that class, so these colours can be confirmed only there. An agent confirms them in the [isolated editor](development.md#isolated-extension-host).
 
-An arriving request is announced in a polite region and does not take focus or scroll the page. Three polite regions stay apart, one for an arriving request, one for the move to the next question, and one for the sentence beside Send, because a region that mixed two subjects would read as one. The controls disable after submission while the host resolves the answer. A successful answer, an agent-side resolution, a stopped turn, or a child exit removes the card from live state.
+An arriving request is announced in a polite region and does not take focus or scroll the page. Three polite regions stay apart, one for an arriving request, one for the move to the next question, and one for the sentence beside Send, because a region that mixed two subjects would read as one. The controls disable after submission while the host resolves the answer. A successful answer, an agent-side resolution, a stopped turn, or a child exit removes the card from live state. Captured unanswered questions remain available through recovery.
+
+Saved question cards retain their complete questions and choices after a restored panel replaces the original host. Their detail explains continuation, unavailable delivery, or secret re-entry. Answer remains disabled for unknown delivery, unavailable ownership or session source, and an unmatched current request. A secret also keeps Answer disabled without a fresh native request. Decline dismisses an ended saved question locally and starts no provider.
 
 ## Text editing
 

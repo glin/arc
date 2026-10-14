@@ -82,6 +82,23 @@ test('a recreated page restores the state written by the previous page', () => {
   assert.deepEqual(recreated.initial, expectedState());
 });
 
+test('a restored page retains its recovery origin through later browser saves', () => {
+  const origin = 'a'.repeat(32);
+  let stored: unknown = { recoveryOrigin: origin };
+  const browser: BrowserStatePort = {
+    read: () => stored,
+    write: (value) => {
+      stored = value;
+    },
+  };
+  const host: PanelHost = { send() {} };
+  const first = createSavedState({ recoveryOrigin: origin }, browser, host);
+  first.save(values());
+  const restored = createSavedState(undefined, browser, host);
+  assert.equal(restored.initial.recoveryOrigin, origin);
+  assert.equal(restored.save(values()).recoveryOrigin, origin);
+});
+
 test('saving keeps the two writers and the persisted asymmetry intact', async () => {
   const browserWrites: unknown[] = [];
   const hostWrites: unknown[] = [];

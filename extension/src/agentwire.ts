@@ -72,6 +72,7 @@ export interface QuestionAsk {
   questions: Question[];
   input: Record<string, unknown>;
   toolUseId: string;
+  recovery?: { blocked: boolean; detail: string };
 }
 
 export type Ask = PermissionAsk | QuestionAsk;
@@ -245,7 +246,7 @@ export type WireEvent =
   | { kind: 'tool'; name: string; input: Record<string, unknown> }
   | { kind: 'activity'; activity: WireActivity }
   | { kind: 'ask'; ask: Ask }
-  | { kind: 'askResolved'; id: string }
+  | { kind: 'askResolved'; id: string; outcome?: 'answered' | 'declined' | 'cancelled' | 'unknown' | 'failed' }
   | { kind: 'turnEnd'; outcome: TurnOutcome; nativeTurnId?: string }
   // Claude's own report that it started work or has nothing left to do. A prompt that joins a
   // running turn gets no `result` of its own, so only `idle` shows that its work is over.
@@ -293,9 +294,16 @@ export class GuardedAttempt {
   private resolveWritten!: () => void;
   private resolveReceipt!: (receipt: GuardedReceipt) => void;
 
-  constructor(readonly clientUuid: string) {
+  constructor(
+    readonly clientUuid: string,
+    private readonly beforeWrite?: () => void,
+  ) {
     this.written = new Promise((resolve) => (this.resolveWritten = resolve));
     this.receipt = new Promise((resolve) => (this.resolveReceipt = resolve));
+  }
+
+  prepareWrite(): void {
+    this.beforeWrite?.();
   }
 
   // The host reads a shared-turn receipt here, because the wire settles it before the prompt call returns.

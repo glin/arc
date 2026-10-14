@@ -147,7 +147,7 @@ function AskCardView(props: {
     props.sendToHost({ type: 'answerAsk', session: view.sessionId, id: card.id, answer: value });
   };
   const takePrimaryAction = () => {
-    if (submitting || !question || !questionAnswered(question.id, picked, written)) {
+    if (submitting || card.answerBlocked || !question || !questionAnswered(question.id, picked, written)) {
       return;
     }
     if (answer) {
@@ -398,7 +398,7 @@ function AskCardView(props: {
           {
             class: 'caskaction caskanswer',
             type: 'button',
-            disabled: !ready || submitting,
+            disabled: !ready || submitting || card.answerBlocked,
             'aria-label': actionName,
             'data-control': `ask:${card.id}:answer`,
             onClick: takePrimaryAction,

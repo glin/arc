@@ -1668,7 +1668,9 @@ export class PanelProvider implements vscode.Disposable {
   public onScopeChange: ((outOfScope?: ReadonlySet<string>) => void) | null = null;
   // Runs after a full refresh rebuilds the session rows under a ready repository scope.
   public onSessionRowsRefreshed: (() => void) | null = null;
-  public onAnswerAsk: ((session: string, id: string, answer: AskAnswer) => boolean) | null = null;
+  public recoveryOrigin = crypto.randomBytes(16).toString('hex');
+  public onRecoveryOrigin: ((origin: string) => void) | null = null;
+  public onAnswerAsk: ((session: string, id: string, answer: AskAnswer) => boolean | Promise<boolean>) | null = null;
   public onArchivedSessionsChange: ((sessions: ReadonlySet<string>) => void) | null = null;
   public onBackgroundWorkDetected:
     | ((
@@ -2472,6 +2474,16 @@ export class PanelProvider implements vscode.Disposable {
       background: status === undefined ? null : ACTIVE_RAIL_STATUSES.has(status),
       writerConflict: false,
     };
+  }
+
+  public questionSource(agent: string, session: string): string | null {
+    const roots = this.repositoryScope.snapshot(this.folders()).roots;
+    const key = JSON.stringify(roots);
+    if (this.authoritativeCatalogScope !== key || !this.authoritativeCatalog) return null;
+    const matches = this.sessionPageIndexFor(this.authoritativeCatalog, key, roots).scoped.filter(
+      (source) => source.agent === agent && source.sessionId === session,
+    );
+    return matches.length === 1 ? matches[0].file : null;
   }
 
   private applySessionFilter(request: import('./sessionrequests').SessionRequest): Promise<unknown> {
@@ -3386,6 +3398,11 @@ export class PanelProvider implements vscode.Disposable {
   // Restore tabs whose saved options match PANEL_OPTIONS. Replace other tabs to apply the current options.
   // Retain submitted prompts in workspace storage before disposing the restored browser.
   async revivePanel(panel: vscode.WebviewPanel, state?: unknown): Promise<void> {
+    const restored = state && typeof state === 'object' && 'recoveryOrigin' in state ? state.recoveryOrigin : null;
+    if (typeof restored === 'string' && /^[a-f0-9]{32}$/.test(restored)) {
+      this.recoveryOrigin = restored;
+      this.onRecoveryOrigin?.(restored);
+    }
     const request = this.health?.begin('serializer');
     let outcome: 'returned' | 'failed' = 'returned';
     try {
@@ -6713,9 +6730,11 @@ export class PanelProvider implements vscode.Disposable {
 
   // Answer this session's blocking requests when `asksAnsweredBySend` permits it. The prompt that follows carries the reader's answer.
   private answerOpenAsks(session: string, meant: PressMeaning): void {
-    const waiting = this.asks.filter((entry) => entry.session === session);
+    const waiting = this.asks.filter(
+      (entry) => entry.session === session && !(entry.ask.kind === 'question' && entry.ask.recovery),
+    );
     for (const open of asksAnsweredBySend(meant, waiting)) {
-      this.onAnswerAsk?.(session, open.ask.id, ANSWERED_IN_PROMPT);
+      void this.onAnswerAsk?.(session, open.ask.id, ANSWERED_IN_PROMPT);
     }
   }
 
@@ -13227,11 +13246,13 @@ export class PanelProvider implements vscode.Disposable {
           });
         },
         answerAsk: (msg) => {
-          const answered = this.onAnswerAsk?.(msg.session, msg.id, msg.answer) ?? false;
-          if (answered) this.onReaderDirected?.(msg.session);
-          else {
-            void this.post({ type: 'askRejected', session: browserSession ?? msg.session, id: msg.id });
-          }
+          const result = this.onAnswerAsk?.(msg.session, msg.id, msg.answer) ?? false;
+          const complete = (answered = false) => {
+            if (answered) this.onReaderDirected?.(msg.session);
+            else void this.post({ type: 'askRejected', session: browserSession ?? msg.session, id: msg.id });
+          };
+          if (typeof result === 'boolean') complete(result);
+          else void result.then(complete).catch(() => complete(false));
         },
         dropUris: async (msg) => {
           await this.addUris(host, browserSession ?? msg.session, urisFromTransfer(msg.values), msg.types);
@@ -13680,7 +13701,11 @@ export class PanelProvider implements vscode.Disposable {
     return panelShell({
       cspSource: webview.cspSource,
       nonce,
-      savedStateJson: scriptJson({ ...webviewPanelState(this.saved), readerPageId }),
+      savedStateJson: scriptJson({
+        ...webviewPanelState(this.saved),
+        readerPageId,
+        recoveryOrigin: this.recoveryOrigin,
+      }),
       style: STYLE,
       script: SCRIPT,
       developmentServerUrl: PANEL_DEV_SERVER_URL,

@@ -78,6 +78,10 @@ import {
 } from './composerview.ts';
 import { USAGE_FRESH_MS, UsageBook, usageBar } from './usageview.ts';
 import { tempDir } from './temproot.ts';
+import { QuestionRecovery, questionContinuation } from './questionrecovery';
+import { QuestionEvidenceReader } from './questionrecords';
+import { askCard } from './composerview';
+import { asyncQuestionId, buildQuestionReply } from './codexreply';
 import { launchPolicy } from './launchpolicy.ts';
 import { LaunchPolicyStore } from './launchpolicystore.ts';
 import * as esbuild from 'esbuild';
@@ -87,6 +91,670 @@ const CLAUDE = { command: 'C:\\claude.exe', leadingArgs: [], env: {} };
 const CODEX = { command: 'node', leadingArgs: ['C:\\codex.js'], env: {} };
 const WS = 'C:\\ws';
 const CODEX_CLIENT = { name: 'arc', title: 'Arc', version: '0.1.0' };
+
+const recoveryOrigin = 'a'.repeat(32);
+function recoveryAt(
+  root: string,
+  activation: string,
+  options: Partial<ConstructorParameters<typeof QuestionRecovery>[0]> = {},
+) {
+  return new QuestionRecovery({ root, origin: recoveryOrigin, activation: activation.repeat(24), ...options });
+}
+function questionRequest(request = 'request', item = 'question') {
+  return (
+    JSON.stringify({
+      type: 'control_request',
+      request_id: request,
+      request: {
+        subtype: 'can_use_tool',
+        tool_name: 'AskUserQuestion',
+        tool_use_id: item,
+        input: {
+          questions: [
+            {
+              question: 'Which option?',
+              header: 'Choice',
+              options: [
+                { label: 'One', description: 'First' },
+                { label: 'Two', description: 'Second' },
+              ],
+              multiSelect: true,
+            },
+          ],
+        },
+      },
+    }) + '\n'
+  );
+}
+async function recoveryHost(recovery: QuestionRecovery) {
+  const fixture = fakeHost(undefined, undefined, { recovery });
+  const opening = fixture.host.session('one', claudePlan(CLAUDE, { cwd: WS, sessionId: 'session' }));
+  fixture.children[0].answerHandshake();
+  await opening;
+  return fixture;
+}
+
+test.each(['sync', 'async'])(
+  'a visible Codex %s question survives fresh-host replacement without resuming a provider',
+  async (kind) => {
+    const root = tempDir('question-recovery-codex-');
+    const before = fakeHost(undefined, undefined, { recovery: recoveryAt(root, '1') });
+    const opening = before.host.session(
+      'codex',
+      codexPlan(CODEX, { cwd: WS, resume: 'session', clientInfo: CODEX_CLIENT }),
+    );
+    const child = before.children[0];
+    child.reply({ userAgent: 'codex' });
+    await vi.waitFor(() => assert.equal(child.sent().at(-1)?.method, 'skills/list'));
+    child.reply({ data: [{ cwd: WS, skills: [] }] });
+    await vi.waitFor(() => assert.equal(child.sent().at(-1)?.method, 'thread/resume'));
+    child.reply({ thread: { id: 'session' } });
+    await opening;
+    child.say(
+      JSON.stringify(
+        kind === 'sync'
+          ? {
+              id: 900,
+              method: 'item/tool/requestUserInput',
+              params: {
+                itemId: 'question',
+                threadId: 'session',
+                turnId: 'turn',
+                questions: [
+                  {
+                    id: 'choice',
+                    question: 'Which option?',
+                    header: 'Choice',
+                    options: [{ label: 'One', description: 'First' }],
+                  },
+                ],
+              },
+            }
+          : {
+              method: 'item/completed',
+              params: {
+                threadId: 'session',
+                turnId: 'turn',
+                item: {
+                  type: 'agentMessage',
+                  id: 'question',
+                  text: '',
+                  phase: 'commentary',
+                  delivery: 'async',
+                  questions: [{ title: 'Which option?', options: ['One'] }],
+                },
+              },
+            },
+      ) + '\n',
+    );
+    assert.equal(before.host.waiting().length, 1);
+    before.host.dispose();
+    const after = fakeHost(undefined, undefined, { recovery: recoveryAt(root, '2') });
+    const restored = after.host.waiting()[0];
+    assert.equal(restored.session, 'session');
+    assert.equal(restored.recovered?.kind, `codex-${kind}`);
+    assert.equal(askCard(restored.ask, 'Codex').questions[0].legend, 'Which option?');
+    assert.equal(after.children.length, 0);
+    after.host.dispose();
+  },
+);
+
+// A fresh host must publish the question that was visible before the original host ended.
+// The fake child reaches the native request and the production card projection without launching a provider.
+test.each(['disposal', 'abrupt replacement'])(
+  'a visible Claude question survives %s in a fresh host',
+  async (ending) => {
+    const root = tempDir('question-recovery-');
+    let ended = false;
+    const store = recoveryAt(root, '1', { pid: 123456, dead: () => ended });
+    const before = await recoveryHost(store);
+    before.children[0].say(questionRequest());
+    assert.equal(askCard(before.host.waiting()[0].ask, 'Claude').questions[0].legend, 'Which option?');
+    if (ending === 'disposal') before.host.dispose();
+    else ended = true;
+    const after = fakeHost(undefined, undefined, { recovery: recoveryAt(root, '2', { dead: () => ended }) });
+    const visible = after.host.waiting();
+    assert.equal(visible.length, 1);
+    assert.equal(visible[0].session, 'session');
+    const card = askCard(visible[0].ask, 'Claude');
+    assert.equal(card.questions[0].legend, 'Which option?');
+    assert.equal(card.questions[0].multiSelect, true);
+    assert.equal(card.questions[0].choices[0].label, 'One');
+    assert.match(card.detail, /continues the stopped session/);
+    assert.equal(after.children.length, 0, 'restoration launched a provider');
+    before.children[0].exit(0);
+    before.host.dispose();
+    after.host.dispose();
+  },
+);
+
+test('failed capture leaves the live question answerable and never restores it', async () => {
+  const root = tempDir('question-recovery-');
+  const store = recoveryAt(root, '1', {
+    write: () => {
+      throw new Error('full disk');
+    },
+  });
+  let failures = 0;
+  const live = fakeHost(undefined, undefined, { recovery: store, onRecoveryFailure: () => failures++ });
+  const opening = live.host.session('one', claudePlan(CLAUDE, { cwd: WS, sessionId: 'session' }));
+  live.children[0].answerHandshake();
+  await opening;
+  live.children[0].say(questionRequest());
+  assert.equal(live.host.waiting().length, 1);
+  assert.equal(
+    live.host.answer('one', 'request', {
+      decision: 'answer',
+      answers: {
+        'Which option?': { labels: ['One', 'Two'], written: '' },
+      },
+    }),
+    true,
+  );
+  assert.deepEqual(live.children[0].sent().at(-1)?.response, {
+    subtype: 'success',
+    request_id: 'request',
+    response: {
+      behavior: 'allow',
+      updatedInput: {
+        questions: [
+          {
+            question: 'Which option?',
+            header: 'Choice',
+            options: [
+              { label: 'One', description: 'First' },
+              { label: 'Two', description: 'Second' },
+            ],
+            multiSelect: true,
+          },
+        ],
+        answers: { 'Which option?': 'One, Two' },
+      },
+    },
+  });
+  live.host.dispose();
+  assert.equal(failures, 1, 'answering the uncaptured question repeated its capture warning');
+  assert.equal(recoveryAt(root, '2').entries().length, 0);
+});
+
+test.each(
+  ['claude', 'codex'].flatMap((agent) =>
+    ['none', 'terminal', 'begin and terminal'].flatMap((persistence) =>
+      ['answer', 'decline', 'failed'].map((outcome) => ({ agent, persistence, outcome })),
+    ),
+  ),
+)(
+  'a captured live $agent $outcome handles $persistence persistence failure across host replacement',
+  async ({ agent, persistence, outcome }) => {
+    const root = tempDir('question-live-answer-');
+    let writes = 0;
+    const store = recoveryAt(root, '1', {
+      write: (file, text) => {
+        writes += 1;
+        if ((persistence === 'terminal' && writes > 2) || (persistence === 'begin and terminal' && writes > 1))
+          throw new Error('Saved questions cannot be written.');
+        fs.writeFileSync(file, text);
+      },
+    });
+    const live = agent === 'claude' ? await recoveryHost(store) : fakeHost(undefined, undefined, { recovery: store });
+    let key = 'one';
+    let id = 'request';
+    let question = 'Which option?';
+    if (agent === 'claude') live.children[0].say(questionRequest());
+    else {
+      key = 'codex';
+      question = 'choice';
+      const opening = live.host.session(
+        key,
+        codexPlan(CODEX, { cwd: WS, resume: 'session', clientInfo: CODEX_CLIENT }),
+      );
+      await answerCodexHandshake(live.children[0]);
+      live.children[0].reply({ thread: { id: 'session' } });
+      await opening;
+      live.children[0].say(
+        JSON.stringify({
+          id: 900,
+          method: 'item/tool/requestUserInput',
+          params: {
+            threadId: 'session',
+            turnId: 'turn',
+            itemId: 'question',
+            questions: [
+              {
+                id: 'choice',
+                header: 'Choice',
+                question: 'Which option?',
+                options: [{ label: 'One', description: 'First' }],
+              },
+            ],
+          },
+        }) + '\n',
+      );
+    }
+    assert.equal(live.host.waiting().length, 1);
+    id = live.host.waiting()[0].ask.id;
+    if (outcome === 'failed') failNextWrite(live.children[0], 'Native answer cannot be written.');
+    assert.equal(
+      live.host.answer(
+        key,
+        id,
+        outcome === 'decline'
+          ? { decision: 'deny', reason: 'No answer.' }
+          : { decision: 'answer', answers: { [question]: { labels: ['One'], written: '' } } },
+      ),
+      outcome !== 'failed',
+      'recovery persistence changed ordinary live delivery',
+    );
+    if (outcome === 'failed') {
+      assert.equal(live.host.waiting().length, 1, 'a failed native answer removed its live question');
+      assert.equal(live.host.waiting()[0].recovered, undefined);
+      live.children[0].exit(1);
+      assert.equal(live.host.waiting().length, 1, 'a failed native answer hid the saved question after child exit');
+      assert.ok(live.host.waiting()[0].recovered);
+    } else assert.equal(live.host.waiting().length, 0, 'the completed live answer reappeared as a recovery card');
+    const settled = outcome === 'decline' && persistence === 'none';
+    const disposition =
+      persistence === 'begin and terminal' || (outcome === 'failed' && persistence === 'none')
+        ? 'unresolved'
+        : 'unknown';
+    if (settled) assert.deepEqual(store.entries(), []);
+    else assert.equal(store.entries()[0].disposition, disposition, 'native delivery changed durable evidence');
+    live.host.dispose();
+    const after = fakeHost(undefined, undefined, { recovery: recoveryAt(root, '2') });
+    assert.equal(after.host.waiting().length, settled ? 0 : 1);
+    if (!settled) {
+      assert.equal(after.host.waiting()[0].ask.kind, 'question');
+      assert.equal(askCard(after.host.waiting()[0].ask, agent).answerBlocked, disposition === 'unknown');
+    }
+    after.host.dispose();
+  },
+);
+
+test('two restored questions remain answerable without a current live request', async () => {
+  const root = tempDir('question-multiple-restored-');
+  const live = await recoveryHost(recoveryAt(root, '1'));
+  live.children[0].say(questionRequest('first', 'first'));
+  live.children[0].say(questionRequest('second', 'second'));
+  live.host.dispose();
+  const after = fakeHost(undefined, undefined, { recovery: recoveryAt(root, '2') });
+  assert.equal(after.host.waiting().length, 2);
+  assert.equal(
+    after.host.waiting().some((entry) => askCard(entry.ask, 'Claude').answerBlocked),
+    false,
+  );
+  after.host.dispose();
+});
+
+test.each([
+  'text choice',
+  'native structured answer',
+  'shutdown interruption',
+  'unrecognized result',
+  'other session',
+  'reader denial',
+])('fresh-host Claude evidence handles %s without losing unresolved questions', async (kind) => {
+  const root = tempDir('question-native-evidence-');
+  const source = path.join(root, 'source.jsonl');
+  const live = await recoveryHost(recoveryAt(root, '1'));
+  const wire = JSON.parse(questionRequest());
+  wire.request.input.questions[0].options[0].label = 'Blue';
+  live.children[0].say(JSON.stringify(wire) + '\n');
+  const entry = live.host.questionRecovery()!.entries()[0];
+  live.host.questionRecovery()!.bindSource(entry.identity, source);
+  live.host.dispose();
+  const store = recoveryAt(root, '2');
+  const after = fakeHost(undefined, undefined, { recovery: store });
+  const answered = kind === 'text choice' || kind === 'native structured answer';
+  fs.writeFileSync(
+    source,
+    JSON.stringify({
+      type: 'user',
+      sessionId: kind === 'other session' ? 'unrelated' : 'session',
+      ...(kind === 'native structured answer'
+        ? { toolUseResult: { questions: wire.request.input.questions, answers: { 'Which option?': 'Blue' } } }
+        : {}),
+      ...(kind === 'shutdown interruption' ? { interruptedByShutdown: true, toolDenialKind: 'user-rejected' } : {}),
+      ...(kind === 'reader denial' ? { toolDenialKind: 'permission-rule' } : {}),
+      message: {
+        role: 'user',
+        content: [
+          {
+            type: 'tool_result',
+            tool_use_id: 'question',
+            content:
+              kind === 'text choice' || kind === 'other session'
+                ? 'Blue'
+                : kind === 'native structured answer'
+                  ? 'Your questions have been answered: "Which option?"="Blue".'
+                  : 'Unknown result',
+            ...(kind === 'shutdown interruption' || kind === 'reader denial' ? { is_error: true } : {}),
+          },
+        ],
+      },
+    }) + '\n',
+  );
+  new QuestionEvidenceReader().reconcile(store, () => source);
+  assert.equal(after.host.waiting().length, answered || kind === 'reader denial' ? 0 : 1);
+  after.host.dispose();
+});
+
+test('waiting publication checks ownership once and empty reconciliation creates no origin lease', async () => {
+  const root = tempDir('question-publication-');
+  const store = recoveryAt(root, '1');
+  new QuestionEvidenceReader().reconcile(store, () => null);
+  assert.equal(fs.existsSync(path.join(root, recoveryOrigin)), false);
+  const emptyHost = fakeHost(undefined, undefined, { recovery: store });
+  assert.equal(emptyHost.host.waiting().length, 0);
+  emptyHost.host.dispose();
+  assert.equal(fs.existsSync(path.join(root, recoveryOrigin)), false);
+  const captured = recoveryAt(root, '3');
+  const live = await recoveryHost(captured);
+  live.children[0].say(questionRequest('first', 'first'));
+  live.children[0].say(questionRequest('second', 'second'));
+  live.host.dispose();
+  const restored = recoveryAt(root, '2');
+  const after = fakeHost(undefined, undefined, { recovery: restored });
+  const owns = vi.spyOn(restored, 'owns');
+  assert.equal(after.host.waiting().length, 2);
+  assert.equal(owns.mock.calls.length, 1);
+  owns.mockRestore();
+  after.host.dispose();
+});
+
+test.each(['answered', 'aborted'])(
+  'fresh-host Codex synchronous %s evidence retains the exact question disposition',
+  (kind) => {
+    const root = tempDir('question-codex-evidence-');
+    const source = path.join(root, 'source.jsonl');
+    const before = recoveryAt(root, '1');
+    before.capture(
+      'codex',
+      'session',
+      WS,
+      {
+        kind: 'question',
+        id: 'old',
+        toolUseId: 'call',
+        input: {},
+        questions: [
+          {
+            id: 'colour',
+            question: 'Which colour?',
+            header: 'Colour',
+            options: [{ label: 'Blue', description: '' }],
+            multiSelect: false,
+            secret: false,
+          },
+        ],
+      },
+      source,
+    );
+    before.release();
+    const store = recoveryAt(root, '2');
+    const after = fakeHost(undefined, undefined, { recovery: store });
+    fs.writeFileSync(
+      source,
+      JSON.stringify({
+        type: 'response_item',
+        payload: {
+          type: 'function_call_output',
+          call_id: 'call',
+          output:
+            kind === 'answered'
+              ? JSON.stringify({ answers: { colour: { answers: ['Blue'] } } })
+              : 'aborted by user after 0.1s',
+        },
+      }) + '\n',
+    );
+    new QuestionEvidenceReader().reconcile(store, () => source);
+    assert.equal(after.host.waiting().length, kind === 'answered' ? 0 : 1);
+    after.host.dispose();
+  },
+);
+
+test('question admission retains every unresolved and unknown item while preserving the overflowing live card', async () => {
+  const root = tempDir('question-recovery-');
+  const store = recoveryAt(root, '1', { outstandingLimit: 1 });
+  const live = await recoveryHost(store);
+  live.children[0].say(questionRequest('first', 'first'));
+  const saved = store.entries()[0];
+  store.begin(saved.identity, null);
+  live.children[0].say(questionRequest('second', 'second'));
+  assert.equal(live.host.waiting().length, 2);
+  assert.equal(store.entries().length, 1);
+  assert.equal(store.entries()[0].disposition, 'unknown');
+  assert.equal(live.host.answer('one', 'second', { decision: 'deny', reason: 'No' }), true);
+  live.host.dispose();
+  assert.equal(recoveryAt(root, '2').entries()[0].disposition, 'unknown');
+});
+
+test('a live recovery owner blocks two replacements and an unrelated origin', async () => {
+  const root = tempDir('question-recovery-');
+  let ended = false;
+  const store = recoveryAt(root, '1', { pid: 123456, dead: () => ended });
+  const live = await recoveryHost(store);
+  live.children[0].say(questionRequest());
+  const second = recoveryAt(root, '2', { pid: 123457, dead: () => ended });
+  const third = recoveryAt(root, '3', { pid: 123458, dead: () => ended });
+  assert.equal(second.owns(), false);
+  assert.equal(third.owns(), false);
+  const unrelated = recoveryAt(root, '4', { origin: 'b'.repeat(32), dead: () => ended });
+  const ask = live.host.waiting()[0].ask;
+  assert.equal(ask.kind, 'question');
+  if (ask.kind !== 'question') throw new Error('Question fixture failed.');
+  assert.equal(unrelated.capture('claude', 'session', WS, ask), false);
+  ended = true;
+  assert.equal(second.owns(), true);
+  ended = false;
+  assert.equal(third.owns(), false);
+  assert.equal(unrelated.capture('claude', 'session', WS, ask), false);
+  second.release();
+  third.release();
+  unrelated.release();
+  live.host.dispose();
+});
+
+test('unknown delivery survives fresh hosts and local Decline releases capacity without a provider', async () => {
+  const root = tempDir('question-recovery-');
+  const store = recoveryAt(root, '1');
+  const before = await recoveryHost(store);
+  before.children[0].say(questionRequest());
+  const entry = store.entries()[0];
+  store.begin(entry.identity, 'Answer');
+  before.host.dispose();
+  const restored = recoveryAt(root, '2', { outstandingLimit: 1 });
+  const after = fakeHost(undefined, undefined, { recovery: restored });
+  const card = askCard(after.host.waiting()[0].ask, 'Claude');
+  assert.equal(card.answerBlocked, true);
+  assert.equal(card.actions[0].label, 'Decline');
+  assert.throws(() => restored.begin(entry.identity, 'Answer'), /already been sent/);
+  restored.settle(entry.identity, 'declined');
+  assert.equal(after.host.waiting().length, 0);
+  assert.equal(after.children.length, 0);
+  assert.equal(restored.capture('claude', 'session', WS, entry.ask), true);
+  assert.equal(restored.entries().length, 0, 'dismissal resurrected during capture');
+  after.host.dispose();
+  assert.equal(recoveryAt(root, '3').entries().length, 0);
+});
+
+test('repeated wording with a new source identity stays distinct and blocks contextual continuation', async () => {
+  const root = tempDir('question-recovery-');
+  const before = await recoveryHost(recoveryAt(root, '1'));
+  before.children[0].say(questionRequest('old', 'old'));
+  before.host.dispose();
+  const after = await recoveryHost(recoveryAt(root, '2'));
+  after.children[0].say(questionRequest('new', 'new'));
+  const cards = after.host.waiting().map((entry) => askCard(entry.ask, 'Claude'));
+  assert.equal(cards.length, 2);
+  assert.equal(cards.filter((card) => card.answerBlocked).length, 1);
+  assert.equal(after.host.answer('one', 'new', { decision: 'deny', reason: 'No' }), true);
+  after.host.dispose();
+});
+
+test('a native request with the exact original tool identity uses its fresh transport request', async () => {
+  const root = tempDir('question-recovery-');
+  const before = await recoveryHost(recoveryAt(root, '1'));
+  before.children[0].say(questionRequest('old', 'same'));
+  before.host.dispose();
+  const after = await recoveryHost(recoveryAt(root, '2'));
+  after.children[0].say(questionRequest('fresh', 'same'));
+  assert.equal(after.host.waiting().length, 1);
+  assert.equal(after.host.waiting()[0].ask.id, 'fresh');
+  assert.equal(
+    after.host.answer(
+      'one',
+      'fresh',
+      {
+        decision: 'answer',
+        answers: {
+          'Which option?': { labels: [], written: 'Use the third option' },
+        },
+      },
+      true,
+    ),
+    true,
+  );
+  const response = after.children[0].sent().at(-1)?.response as any;
+  assert.equal(response.request_id, 'fresh');
+  assert.equal(response.response.updatedInput.answers['Which option?'], 'Use the third option');
+  after.host.dispose();
+});
+
+test('Codex partial async answers retain original indexes and exact source evidence settles another client answer', () => {
+  const root = tempDir('question-recovery-');
+  const source = path.join(root, 'source.jsonl');
+  const store = recoveryAt(root, '1');
+  const questions = [0, 1].map((index) => ({
+    id: asyncQuestionId('item', index),
+    question: 'Repeated wording',
+    header: 'Choice',
+    options: [{ label: 'One', description: '' }],
+    multiSelect: false,
+    secret: false,
+  }));
+  assert.equal(
+    store.capture(
+      'codex',
+      'session',
+      WS,
+      { kind: 'question', id: 'item', toolUseId: 'item', input: {}, questions },
+      source,
+    ),
+    true,
+  );
+  const first = buildQuestionReply([
+    { questionItemId: questions[0].id, question: questions[0].question, answer: 'One' },
+  ]);
+  fs.writeFileSync(
+    source,
+    JSON.stringify({
+      type: 'response_item',
+      payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: first }] },
+    }) + '\n',
+  );
+  const reader = new QuestionEvidenceReader();
+  reader.reconcile(store, () => source);
+  assert.deepEqual(
+    store.entries()[0].ask.questions.map((q) => q.id),
+    [asyncQuestionId('item', 1)],
+  );
+  const entry = store.entries()[0];
+  const text = questionContinuation(entry, {
+    decision: 'answer',
+    answers: { [questions[1].id]: { labels: [], written: 'Another answer' } },
+  });
+  assert.equal(
+    text,
+    buildQuestionReply([
+      { questionItemId: questions[1].id, question: questions[1].question, answer: 'Another answer' },
+    ]),
+  );
+  fs.appendFileSync(
+    source,
+    JSON.stringify({
+      type: 'response_item',
+      payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text }] },
+    }) + '\n',
+  );
+  reader.reconcile(store, () => source);
+  assert.equal(store.entries().length, 0);
+  store.release();
+});
+
+test('secret question recovery saves no answer and allows no contextual secret prompt', () => {
+  const store = recoveryAt(tempDir('question-recovery-'), '1');
+  const ask = {
+    kind: 'question' as const,
+    id: 'secret',
+    toolUseId: 'secret',
+    input: { answers: { key: 'do-not-save' } },
+    questions: [
+      {
+        id: 'key',
+        question: 'Enter the password',
+        header: 'Password',
+        options: [],
+        multiSelect: false,
+        secret: true,
+      },
+    ],
+  };
+  assert.equal(store.capture('codex', 'session', WS, ask), true);
+  const entry = store.entries()[0];
+  assert.equal(
+    questionContinuation(entry, { decision: 'answer', answers: { key: { labels: [], written: 'do-not-save' } } }),
+    null,
+  );
+  store.begin(entry.identity, null);
+  const saved = fs.readFileSync(path.join(store.options.root, recoveryOrigin, 'questions.json'), 'utf8');
+  assert.ok(!saved.includes('do-not-save'));
+  store.release();
+});
+
+test('explicit predecessor closure persists independently of provider reset acceptance', async () => {
+  const root = tempDir('question-recovery-');
+  const store = recoveryAt(root, '1');
+  const before = await recoveryHost(store);
+  before.children[0].say(questionRequest());
+  store.closeSession('session');
+  before.host.dispose();
+  assert.equal(recoveryAt(root, '2').entries().length, 0);
+});
+
+test('local dismissal survives pruning of readable question history', () => {
+  vi.useFakeTimers();
+  const root = tempDir('question-recovery-history-');
+  const store = recoveryAt(root, '1');
+  const ask = {
+    kind: 'question' as const,
+    id: 'original',
+    toolUseId: 'original',
+    input: {},
+    questions: [
+      {
+        id: 'choice',
+        question: 'Which option?',
+        header: '',
+        options: [],
+        multiSelect: false,
+        secret: false,
+      },
+    ],
+  };
+  for (let index = 0; index <= 512; index++) {
+    vi.setSystemTime(index + 1);
+    assert.equal(
+      store.capture('claude', 'session', WS, { ...ask, toolUseId: index ? `item-${index}` : 'original' }),
+      true,
+    );
+    store.settle(store.entries()[0].identity, 'declined');
+  }
+  store.release();
+  const restored = recoveryAt(root, '2');
+  assert.equal(restored.capture('claude', 'session', WS, ask), true);
+  assert.equal(restored.entries().length, 0);
+  restored.release();
+});
 
 test.each(['start', 'resume', 'fork'])(
   'read-only Codex %s keeps thread and turn permissions through clear and rejected setting changes',
@@ -393,6 +1061,8 @@ function fakeHost(
   openingDeadlineMs?: number,
   now?: () => number,
   lifecycle: {
+    recovery?: QuestionRecovery;
+    onRecoveryFailure?: () => void;
     idleDurationMs?: number;
     timer?: AgentHostTimer;
     exitGraceMs?: number;
@@ -415,6 +1085,8 @@ function fakeHost(
   const host = new AgentHost({
     openingDeadlineMs,
     now,
+    recovery: lifecycle.recovery,
+    onRecoveryFailure: lifecycle.onRecoveryFailure,
     idleDurationMs: lifecycle.idleDurationMs ?? 60_000,
     timer: lifecycle.timer,
     exitGraceMs: lifecycle.exitGraceMs,
@@ -4704,7 +5376,7 @@ test('the extension binds its packaged CLI and current window to every child ent
     source,
     /const spawner = arcCliSpawner\(\(\) => privateTools\.current\(channel\?\.windowId \?\? null\)\)/,
   );
-  sourceMatch(source, /const host = new AgentHost\(\{\s*spawner,/);
+  sourceMatch(source, /const host = new AgentHost\(\{[\s\S]*?spawner,/);
   for (const helper of ['askIdle', 'askIdleMcp', 'askIdleMcpChange', 'askIdleDefaults'])
     sourceMatch(source, new RegExp(helper + '\\(plan, spawner(?:[,\\)])'));
 });

@@ -330,7 +330,7 @@ export class CodexWire {
   private readonly waiting = new Map<number, Waiting>();
   // Which server request each pending ask came in on. The answer goes back on that id, in
   // the server's own id space, which is separate from the ids this client hands out.
-  private readonly askIds = new Map<string, { requestId: number; method: string }>();
+  private readonly askIds = new Map<string, { requestId: number; method: string; ask: Ask }>();
   // An async question ask is built from a notification, not a server request, so it never
   // gets an `askIds` entry. No request waits for its answer, so the answer goes into the
   // thread as new input.
@@ -728,6 +728,7 @@ export class CodexWire {
     }
     // A guarded start records how many turns were known when it wrote its input. A response naming one of them is a shared turn.
     const known = guard ? this.seenTurns.size : 0;
+    guard?.prepareWrite();
     const response = this.request('turn/start', {
       threadId,
       input: content,
@@ -982,7 +983,7 @@ export class CodexWire {
       } else {
         // A dismissal sends nothing. No request is waiting on it, so the agent is not left
         // stalled, and the question stays readable in its Activity row.
-        this.emit({ kind: 'askResolved', id });
+        this.emit({ kind: 'askResolved', id, outcome: answer.decision === 'deny' ? 'declined' : 'unknown' });
       }
       return true;
     }
@@ -992,25 +993,32 @@ export class CodexWire {
     }
     this.askIds.delete(id);
     this.approvalRequests.delete(id);
-    if (pending.method === USER_INPUT) {
-      // User-input requests take an answer map. Denial returns an empty map.
-      if (answer.decision === 'deny') {
-        this.write({ id: pending.requestId, result: { answers: {} } });
-      } else {
-        const answers: Record<string, { answers: string[] }> = {};
-        const picked = answer.decision === 'answer' ? answer.answers : {};
-        // An answer the reader wrote themselves rides in the same list as the labels. The
-        // server takes a string it never offered and the model reads it back unchanged.
-        for (const [question, given] of Object.entries(picked)) {
-          answers[question] = { answers: [...given.labels, ...(given.written ? [given.written] : [])] };
+    try {
+      if (pending.method === USER_INPUT) {
+        // User-input requests take an answer map. Denial returns an empty map.
+        if (answer.decision === 'deny') {
+          this.write({ id: pending.requestId, result: { answers: {} } });
+        } else {
+          const answers: Record<string, { answers: string[] }> = {};
+          const picked = answer.decision === 'answer' ? answer.answers : {};
+          // An answer the reader wrote themselves rides in the same list as the labels. The
+          // server takes a string it never offered and the model reads it back unchanged.
+          for (const [question, given] of Object.entries(picked)) {
+            answers[question] = { answers: [...given.labels, ...(given.written ? [given.written] : [])] };
+          }
+          this.write({ id: pending.requestId, result: { answers } });
         }
-        this.write({ id: pending.requestId, result: { answers } });
+      } else {
+        const decision: Decision = answer.decision === 'deny' ? 'decline' : 'accept';
+        this.write({ id: pending.requestId, result: { decision } });
       }
-    } else {
-      const decision: Decision = answer.decision === 'deny' ? 'decline' : 'accept';
-      this.write({ id: pending.requestId, result: { decision } });
+    } catch {
+      this.askIds.set(id, pending);
+      this.emit({ kind: 'askResolved', id, outcome: 'failed' });
+      this.emit({ kind: 'ask', ask: pending.ask });
+      return false;
     }
-    this.emit({ kind: 'askResolved', id });
+    this.emit({ kind: 'askResolved', id, outcome: answer.decision === 'deny' ? 'declined' : 'unknown' });
     return true;
   }
 
@@ -1102,7 +1110,7 @@ export class CodexWire {
     for (const [askId, asked] of [...this.asyncAsks]) {
       if (asked.threadId !== id) {
         this.asyncAsks.delete(askId);
-        this.emit({ kind: 'askResolved', id: askId });
+        this.emit({ kind: 'askResolved', id: askId, outcome: 'cancelled' });
       }
     }
     this.emit({
@@ -1122,7 +1130,7 @@ export class CodexWire {
     }
     const itemId = str(params.itemId) ?? `codex-${requestId}`;
     const ask = method === USER_INPUT ? this.userInputAsk(itemId, params) : this.approvalAsk(itemId, method, params);
-    this.askIds.set(itemId, { requestId, method });
+    this.askIds.set(itemId, { requestId, method, ask });
     if (method === FILE_APPROVAL) {
       this.approvalRequests.set(itemId, { method, params });
     }
@@ -1186,7 +1194,7 @@ export class CodexWire {
         secret: q?.isSecret === true,
       });
     }
-    return { kind: 'question', id: itemId, questions, input: params, toolUseId: itemId };
+    return { kind: 'question', id: itemId, questions, input: params, toolUseId: str(params.itemId) ?? '' };
   }
 
   // Async questions have titles and plain option labels, without individual ids or descriptions.
@@ -1232,7 +1240,7 @@ export class CodexWire {
           input: [{ type: 'text', text }],
           expectedTurnId: asked.turnId,
         });
-        this.emit({ kind: 'askResolved', id });
+        this.emit({ kind: 'askResolved', id, outcome: 'answered' });
         return;
       } catch (error) {
         if (!(error instanceof RequestRefused)) {
@@ -1246,7 +1254,7 @@ export class CodexWire {
         kind: 'error',
         message: 'the session changed before the answer was sent, so it was not sent',
       });
-      this.emit({ kind: 'askResolved', id });
+      this.emit({ kind: 'askResolved', id, outcome: 'cancelled' });
       return;
     }
     try {
@@ -1260,14 +1268,15 @@ export class CodexWire {
       this.emit({ kind: 'error', message: `the answer did not reach the agent: ${(error as Error).message}` });
       if (asked.threadId === null || asked.threadId === this.thread) {
         this.asyncAsks.set(id, { ...asked, turnId: null });
+        this.emit({ kind: 'askResolved', id, outcome: 'failed' });
         this.emit({ kind: 'ask', ask: asked.ask });
       } else {
-        this.emit({ kind: 'askResolved', id });
+        this.emit({ kind: 'askResolved', id, outcome: 'cancelled' });
       }
       return;
     }
     // After the prompt is accepted, so a session that reads this event sees the new turn open.
-    this.emit({ kind: 'askResolved', id });
+    this.emit({ kind: 'askResolved', id, outcome: 'answered' });
   }
 
   // A closed wire says nothing more, so the reason it closed stays the session's last error.
@@ -1280,7 +1289,7 @@ export class CodexWire {
       kind: 'error',
       message: 'the agent did not confirm the answer to its question, so it was not sent again',
     });
-    this.emit({ kind: 'askResolved', id });
+    this.emit({ kind: 'askResolved', id, outcome: 'unknown' });
   }
 
   // An async question outlives its turn, but a steer naming that turn would be refused.
@@ -1320,7 +1329,7 @@ export class CodexWire {
       const open = asked.ask.questions.filter((question) => !questionIds.has(question.id));
       if (!open.length) {
         this.asyncAsks.delete(itemId);
-        this.emit({ kind: 'askResolved', id: itemId });
+        this.emit({ kind: 'askResolved', id: itemId, outcome: 'answered' });
       } else if (open.length < asked.ask.questions.length) {
         asked.ask = { ...asked.ask, questions: open };
         this.emit({ kind: 'ask', ask: asked.ask });

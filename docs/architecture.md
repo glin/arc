@@ -20,6 +20,8 @@ Use this map to find the owner of a change. The topic guides hold behavior, and 
 
 `scripts/isolated-editor.mjs` installs candidate and disposable probe VSIX files into its isolated profile through the selected editor CLI. It pins the selected scratch directory to its physical path before creating run paths and discovering abandoned runs. It retains isolated registration manifests, editor logs, and process receipts before removal. It reads the installed Windows `bin/code.cmd` as data to select its matching CLI. Windows `mkdtemp` calls use namespace paths for long run directories. [Isolated extension host](development.md#isolated-extension-host) owns supported layouts and launch directories.
 
+Question recovery stores captured question payloads, dispositions, settled identity barriers, and immutable activation leases beneath the workspace partition. The webview retains its origin across restored tabs. Recovery reads only captured identities and uses separate transcript cursors. Each publication checks ownership once, and each source scan indexes captured tool identities. Unknown attempts remain outstanding. Claims remain exclusive across windows, and unresolved questions never enter age or history eviction.
+
 ## System shape
 
 Arc reads completed work from files, including sessions started in a terminal or another editor window. A child process carries live prompts, questions, and controls.
@@ -378,9 +380,11 @@ The first column is checked against the shipped extension directory by `architec
 | `compactrequest.ts` | Literal self-compaction payloads, in-memory native call bindings, deferred assignments, reader revisions, delivery to the exact retained child, and native completion evidence | no |
 | `codexwire.ts` | Codex app-server JSON-RPC adapter | no |
 | `codexreply.ts` | Codex async-question ids and the reply envelope that answers them | no |
+| `questionrecovery.ts` | Durable captured questions, exclusive origin leases, local dispositions, admission, and contextual answer construction | no |
+| `questionrecords.ts` | Bounded exact-source reconciliation for captured question identities, with independent read cursors | no |
 | `launchpolicystore.ts` | Shared authoritative session restrictions, bounded per-session reads, atomic policy writes, and exclusive durable clear admission | no |
 | `launchpolicy.ts` | Immutable hosted read-only launch policy, exact MCP read tools, Claude tool and git restrictions, and model permission-mode eligibility | no |
-| `agenthost.ts` | Child ownership, packaged CLI environment and window targeting, launch environment, immutable read-only permissions and Claude attribution selection, line framing, lifecycle, accepted-turn identity, control-read scheduling, explicit usage attempt ownership, and session state after model changes | no |
+| `agenthost.ts` | Child ownership, packaged CLI environment and window targeting, launch environment, immutable read-only permissions and Claude attribution selection, line framing, lifecycle, durable question capture and restoration, accepted-turn identity, control-read scheduling, explicit usage attempt ownership, and session state after model changes | no |
 | `composerview.ts` | Prompt box, agent-request, and new-session view data, bounded question Markdown reuse, wording, settings, queue behavior, answers, prompt assembly, completion rows, and the walk back through earlier prompts | no |
 | `domain/ask-answer.ts` | Browser-safe completion and answer assembly rules for agent questions | no |
 | `domain/claude-skills.ts` | Browser-safe Claude skill-highlight decision, the per-working-directory skill-list cache reducer, and the safe-folder-name check the host skill-path lookup runs first | no |

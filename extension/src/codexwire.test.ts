@@ -2705,7 +2705,7 @@ const PICKED_ENVELOPE =
   '</send_user_message_question_reply>';
 
 function resolved(h: ReturnType<typeof harness>): boolean {
-  return h.events.some((e) => e.kind === 'askResolved' && e.id === ASYNC_QUESTION_ITEM.id);
+  return h.events.some((e) => e.kind === 'askResolved' && e.outcome !== 'failed' && e.id === ASYNC_QUESTION_ITEM.id);
 }
 
 test('dismissing an async question sends Codex nothing and resolves the ask', async () => {

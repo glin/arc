@@ -87,6 +87,7 @@ export function mergeSubmittedPrompts(...snapshots: unknown[]): SubmittedPrompt[
 }
 
 export interface SavedPanelState {
+  recoveryOrigin?: string;
   readRevision?: number;
   submittedPrompts?: SubmittedPrompt[];
   open: unknown[];
@@ -256,6 +257,7 @@ export function createSavedState(
     },
     save(values, filterRequest) {
       const state = savedPanelState(values);
+      if (typeof initial.recoveryOrigin === 'string') state.recoveryOrigin = initial.recoveryOrigin;
       if (recovery.length) state.submittedPrompts = recovery;
       // Save browser state synchronously. Send the newest state to the host in one microtask.
       // Multiple saves in the same task share one host update.

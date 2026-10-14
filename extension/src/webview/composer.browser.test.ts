@@ -185,6 +185,71 @@ async function post(page: Page, message: unknown): Promise<void> {
   await page.evaluate(SETTLED);
 }
 
+test.each(['dark', 'light'] as const)(
+  'saved question delivery blocks Answer and retains keyboard Decline in %s',
+  async (theme) => {
+    const browser = await browserOrNone();
+    if (!browser) return;
+    try {
+      for (const width of [1350, 340]) {
+        const page = await browser.newPage();
+        await page.setViewportSize({ width, height: 900 });
+        await page.setContent(themed(pageHtml(), theme));
+        const payload = renderPayload(
+          [],
+          [],
+          [],
+          [],
+          [
+            {
+              kind: 'question',
+              id: 'saved-question',
+              toolUseId: 'original',
+              input: {},
+              recovery: {
+                blocked: true,
+                detail:
+                  'The answer delivery is unknown. Decline dismisses this saved question without sending it again.',
+              },
+              questions: [
+                {
+                  id: 'choice',
+                  question: 'Which option?',
+                  header: 'Choice',
+                  options: [{ label: 'One', description: 'First option' }],
+                  multiSelect: false,
+                  secret: false,
+                },
+              ],
+            },
+          ],
+        );
+        await post(page, payload);
+        const answer = page.locator('[data-control="ask:saved-question:answer"]');
+        await page.locator('.caskchoice input').first().check();
+        await page.waitForFunction(() => (document.querySelector('.caskanswer') as HTMLButtonElement)?.disabled);
+        assert.equal(await answer.isDisabled(), true);
+        assert.equal(await page.evaluate('window.__posted.filter(m => m.type === "answerAsk").length'), 0);
+        const decline = page.locator('[data-control="ask:saved-question:decline"]');
+        assert.equal(await decline.isEnabled(), true);
+        if (process.env.ARC_QUESTION_SHOTS) {
+          fs.mkdirSync(process.env.ARC_QUESTION_SHOTS, { recursive: true });
+          await page.screenshot({ path: path.join(process.env.ARC_QUESTION_SHOTS, `recovered-${theme}-${width}.png`) });
+        }
+        await decline.focus();
+        await page.keyboard.press('Enter');
+        await page.waitForFunction(() => (window as any).__posted.some((message: any) => message.type === 'answerAsk'));
+        const posted = await page.evaluate<any>('window.__posted.filter(m => m.type === "answerAsk")');
+        assert.equal(posted.length, 1);
+        assert.equal(posted[0].answer.decision, 'deny');
+        await page.close();
+      }
+    } finally {
+      await browser.close();
+    }
+  },
+);
+
 test(
   'a saved Codex session reaches the Context popover through the production source factory and host demand',
   { timeout: 60_000 },

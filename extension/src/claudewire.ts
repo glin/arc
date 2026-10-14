@@ -131,8 +131,8 @@ export interface SpawnOptions {
   sessionId?: string;
   persistSession?: boolean;
   settings?: string;
-  // Echoes each received user message with `isReplay`. Only a fresh start that carries a requester sets it,
-  // because guarded follow-ups use the echo as their receipt.
+  // Echoes received user messages with `isReplay` for requester starts and resumed sessions.
+  // Guarded follow-ups use the echo as their receipt.
   replayUserMessages?: boolean;
 }
 
@@ -634,6 +634,7 @@ export class ClaudeWire {
     if (this.replayWait) throw new Error('another guarded prompt is still unsettled');
     if (!this.session) throw new Error('the session identity is unknown');
     // Like an ordinary prompt, the write starts a native submission, so a deferred compaction it requests binds to it.
+    attempt.prepareWrite();
     this.nativeSubmission(text);
     this.write({
       type: 'user',
@@ -807,8 +808,15 @@ export class ClaudeWire {
     } else {
       response = { behavior: 'allow', updatedInput: ask.input };
     }
-    this.write({ type: 'control_response', response: { subtype: 'success', request_id: id, response } });
-    this.emit({ kind: 'askResolved', id });
+    try {
+      this.write({ type: 'control_response', response: { subtype: 'success', request_id: id, response } });
+    } catch {
+      this.asks.set(id, ask);
+      this.emit({ kind: 'askResolved', id, outcome: 'failed' });
+      this.emit({ kind: 'ask', ask });
+      return false;
+    }
+    this.emit({ kind: 'askResolved', id, outcome: answer.decision === 'deny' ? 'declined' : 'unknown' });
     return true;
   }
 

@@ -5404,6 +5404,9 @@ test('channel construction failure leaves panel activation and provider registra
   const scope = {
     context: { subscriptions: [] as unknown[] },
     performance,
+    QuestionEvidenceReader: function () {
+      return {};
+    },
     WindowChannel: function () {
       throw new Error('The Arc window channel path is too long.');
     },
@@ -10969,7 +10972,7 @@ test('the panel prefers the shared state, so a tab opens where the last one left
   // The projection excludes host-owned labels.
   sourceMatch(
     panelHostSource,
-    /savedStateJson: scriptJson\(\{ \.\.\.webviewPanelState\(this\.saved\), readerPageId \}\)/,
+    /savedStateJson: scriptJson\(\{ \.\.\.webviewPanelState\(this\.saved\), readerPageId, recoveryOrigin: this\.recoveryOrigin \}\)/,
     'the shared state is not injected into the page, so a new host starts blank',
   );
   sourceMatch(
@@ -13882,6 +13885,7 @@ test('saved read-only policy survives replacement, draft resume, fork and clear 
       sessionSettingsForProfile,
       persistSessionSettings: async () => {},
       publishPicks() {},
+      host: { questionRecovery: () => undefined },
       withExistingSessionActivity: async () => ({ session: 'cleared', turnId: 1, policy }),
       failedClearDelivery: () => assert.fail('clear failed'),
       vscode: { window: { showErrorMessage() {} } },
@@ -14003,7 +14007,7 @@ test.each(['saved', 'lost-child', 'retry'])('delayed Claude clear retains permis
         if (value) policies.write(id, value);
       },
       withExistingSessionActivity: async (_agent: unknown, _session: unknown, _cwd: unknown, work: any) => work(live),
-      host: { get: () => (retired ? null : live) },
+      host: { get: () => (retired ? null : live), questionRecovery: () => undefined },
       failedClearDelivery: () => assert.fail('clear failed'),
       vscode: { window: { showErrorMessage() {} } },
     };
