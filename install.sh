@@ -94,6 +94,7 @@ main() {
   local invocation_cwd="$PWD"
   local setup_hooks=1 setup_skills=1 hooks_ready=1 mode=auto source_repo=glin/arc source_ref=main
   local marketplace_url=''
+  ARC_INSTALL_OUTPUT=human
   local argument candidate seen choice i cli claude_cli version sha ref_encoded failed=0 installed=0
   local REPO='' local_source=0 marketplace_override=0 hook_source='' hook_source_type=url
   local -a CLIS=() SKILL_ARGS=()
@@ -134,14 +135,37 @@ main() {
     fi
     local skill_receipt=''
     if [ -n "$ARC_INSTALL_TEMP" ]; then skill_receipt="$ARC_INSTALL_TEMP/skills.json"; fi
-    node - "$ARC_INSTALL_EDITORS" "$ARC_INSTALL_SKILLS" "$ARC_INSTALL_HOOKS" "$ARC_INSTALL_CANCEL" "$skill_receipt" "${SKILL_AGENTS[*]:-}" "${EDITOR_RESULTS[@]}" <<'RECEIPT' || true
+    node - "$ARC_INSTALL_EDITORS" "$ARC_INSTALL_SKILLS" "$ARC_INSTALL_HOOKS" "$ARC_INSTALL_CANCEL" "$skill_receipt" "${SKILL_AGENTS[*]:-}" "$ARC_INSTALL_OUTPUT" "${EDITOR_RESULTS[@]}" <<'RECEIPT' || true
 const fs = require('node:fs');
 process.stdout.on('error', () => {});
 process.stderr.on('error', () => {});
 let skills;
 if (process.argv[6]) { try { skills = JSON.parse(fs.readFileSync(process.argv[6], 'utf8')); } catch {} }
-const editors=[]; for(let i=8;i<process.argv.length;i+=2) editors.push({editor:process.argv[i],status:process.argv[i+1]});
-try { process.stdout.write(JSON.stringify({version:1,editors,selectedAgents:process.argv[7].split(' ').filter(Boolean),components:{editors:process.argv[2],skills:process.argv[3],hooks:process.argv[4]},skills,cancellation:Number(process.argv[5])||null})+'\n'); } catch {}
+const editors=[]; for(let i=9;i<process.argv.length;i+=2) editors.push({editor:process.argv[i],status:process.argv[i+1]});
+const receipt = {version:1,editors,selectedAgents:process.argv[7].split(' ').filter(Boolean),components:{editors:process.argv[2],skills:process.argv[3],hooks:process.argv[4]},skills,cancellation:Number(process.argv[5])||null};
+try {
+  if (process.argv[8] === 'json') process.stdout.write(JSON.stringify(receipt)+'\n');
+  else {
+    const names = {claude:'Claude Code',codex:'Codex'};
+    const state = value => ({completed:'completed',unattempted:'not attempted','skipped-no-detected-provider':'skipped because no supported agent executable was detected','external-match-preserved':'matching personal copy preserved',unchanged:'already installed'}[value] || value);
+    console.log('Arc installation results:');
+    for (const editor of editors) console.log(`  Editor ${editor.editor}: ${editor.status === 'completed' ? 'installed' : state(editor.status)}.`);
+    if (!editors.length) console.log(`  Editors: ${state(receipt.components.editors)}.`);
+    for (const agent of receipt.selectedAgents) {
+      const result = skills?.results?.find(result => result.agent === agent);
+      console.log(`  ${names[agent] || agent} skill: ${state(result?.status || receipt.components.skills)}${result?.destination ? ` at ${result.destination}` : ''}.`);
+      if (result?.publication) console.log(`    The copy was ${result.publication} before the operation stopped.`);
+      if (result?.reason) console.log(`    ${result.reason}`);
+      if (result?.status === 'incomplete' || result?.status === 'failed') {
+        if (result.control) console.log(`    Recovery folder: ${result.control}`);
+        if (result.operation) console.log(`    Recovery files: ${result.operation}`);
+      }
+    }
+    if (!receipt.selectedAgents.length) console.log(`  Skills: ${state(receipt.components.skills)}.`);
+    console.log(`  Claude hooks: ${state(receipt.components.hooks)}.`);
+    if (receipt.cancellation) console.log(`  Installation cancelled with exit status ${receipt.cancellation}.`);
+  }
+} catch {}
 RECEIPT
     if [ -n "$ARC_INSTALL_TEMP" ]; then
       rm -rf -- "$ARC_INSTALL_TEMP"
@@ -155,6 +179,7 @@ RECEIPT
   while [ "$#" -gt 0 ]; do
     argument="$1"; shift
     case "$argument" in
+      --json) ARC_INSTALL_OUTPUT=json ;;
       --no-hooks) setup_hooks=0; ARC_INSTALL_HOOKS=skipped ;;
       --no-skills) setup_skills=0; ARC_INSTALL_SKILLS=skipped ;;
       --skill-agent)
@@ -179,7 +204,7 @@ RECEIPT
         esac
         shift ;;
       --help|-h)
-        echo 'Usage: bash install.sh [--local|--remote] [--repo OWNER/REPO] [--ref REF] [--marketplace-url HTTPS_URL] [--no-hooks] [--no-skills] [--skill-agent claude|codex] [editor-cli ...]'
+        echo 'Usage: bash install.sh [--local|--remote] [--repo OWNER/REPO] [--ref REF] [--marketplace-url HTTPS_URL] [--no-hooks] [--no-skills] [--skill-agent claude|codex] [--json] [editor-cli ...]'
         echo 'Build Arc from local or temporary downloaded source and install its Claude plugin.'
         echo 'Auto mode uses a complete local checkout, otherwise downloads glin/arc main.'
         echo '--remote forces source download for development testing.'
@@ -188,6 +213,8 @@ RECEIPT
         echo '--no-hooks preserves all Claude plugin and legacy hook settings.'
         echo 'Skills default to detected Claude and Codex executables. Repeat --skill-agent to select explicitly.'
         echo '--no-skills skips personal skill installation independently of hooks.'
+        echo '--json uses structured output for installation results, when available.'
+        echo 'Help and early refusals do not print an installation result.'
         exit 0 ;;
       --) CLIS+=("$@"); break ;;
       --*) echo "error: unknown option: $argument" >&2; exit 2 ;;
@@ -404,7 +431,6 @@ EOF
         if [ "$ARC_INSTALL_CANCEL" -eq 0 ]; then ARC_INSTALL_CANCEL="$skill_status"; fi
       fi
     fi
-    cat "$ARC_INSTALL_TEMP/skills.json" || true
   fi
   if [ "$ARC_INSTALL_CANCEL" -ne 0 ]; then
     if [ "$ARC_INSTALL_SKILLS" = unattempted ]; then ARC_INSTALL_SKILLS=cancelled; fi

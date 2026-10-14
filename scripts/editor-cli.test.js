@@ -39,6 +39,110 @@ const skillCLI = require('../extension/node_modules/esbuild').buildSync({
 }).outputFiles[0].contents;
 const catalogUrl = 'https://github.com/glin/arc/releases/latest/download/arc-marketplace.json';
 
+test.each(['installed', 'linked', 'external', 'failed', 'skipped', 'hook-failed', 'cancelled'])(
+  'installer output modes retain component outcomes for %s',
+  (outcome) => {
+    for (const json of [false, true]) {
+      const f = installerFixture();
+      try {
+        const args = ['--skill-agent', 'claude', '--skill-agent', 'codex', 'code'];
+        const env = { CLAUDE_CONFIG_DIR: '' };
+        let status = 0;
+        let skillStatuses = ['installed', 'installed'];
+        if (['linked', 'external'].includes(outcome)) {
+          const destination = path.join(f.dir, '.agents/skills/arc-sessions');
+          fs.mkdirSync(path.dirname(destination), { recursive: true });
+          const payload = path.join(f.source, 'cli/skills/arc-sessions');
+          if (outcome === 'linked')
+            fs.symlinkSync(payload, destination, process.platform === 'win32' ? 'junction' : 'dir');
+          else fs.cpSync(payload, destination, { recursive: true });
+          skillStatuses = ['installed', outcome === 'linked' ? 'incomplete' : 'external-match-preserved'];
+          status = outcome === 'linked' ? 1 : 0;
+          if (outcome === 'external') {
+            // Temporary homes cannot establish stable external storage. Supply that result for presentation coverage.
+            const receipt = {
+              version: 1,
+              action: 'install',
+              results: ['claude', 'codex'].map((agent, index) => ({
+                agent,
+                destination: path.join(f.dir, agent === 'claude' ? '.claude' : '.agents', 'skills/arc-sessions'),
+                status: skillStatuses[index],
+              })),
+              cancellation: null,
+            };
+            fs.writeFileSync(
+              path.join(f.source, 'extension/dist/cli.cjs'),
+              `console.log(${JSON.stringify(JSON.stringify(receipt))});`,
+            );
+          }
+        }
+        if (outcome === 'failed') {
+          env.CLAUDE_CONFIG_DIR = path.dirname(f.settings);
+          skillStatuses = ['failed', 'installed'];
+          status = 1;
+        }
+        if (outcome === 'skipped') args.splice(0, 4, '--no-skills');
+        if (outcome === 'hook-failed') {
+          fs.unlinkSync(path.join(f.bin, 'claude'));
+          status = 1;
+        } else args.unshift('--no-hooks');
+        if (outcome === 'cancelled') {
+          fs.writeFileSync(path.join(f.source, 'extension/dist/cli.cjs'), 'process.exit(130);');
+          status = 130;
+        }
+        const result = f.run(args, env, { skills: true, json });
+        assert.equal(result.status, status, result.stdout + result.stderr);
+        if (json) {
+          const receipt = JSON.parse(result.stdout.trim().split('\n').at(-1));
+          assert.deepEqual(receipt.editors, [{ editor: 'code', status: 'completed' }]);
+          assert.equal(receipt.cancellation, outcome === 'cancelled' ? 130 : null);
+          assert.equal(receipt.components.hooks, outcome === 'hook-failed' ? 'failed' : 'skipped');
+          if (outcome === 'skipped') assert.equal(receipt.components.skills, 'skipped');
+          else if (outcome === 'cancelled') assert.equal(receipt.components.skills, 'cancelled');
+          else
+            assert.deepEqual(
+              receipt.skills.results.map((r) => r.status),
+              skillStatuses,
+            );
+        } else {
+          assert.doesNotMatch(result.stdout, /^\s*\{/m);
+          assert.match(result.stdout, /Editor.*code.*installed/i);
+          assert.match(result.stdout, outcome === 'hook-failed' ? /hooks.*failed/i : /hooks.*skipped/i);
+          if (outcome === 'skipped') assert.match(result.stdout, /skills.*skipped/i);
+          else if (outcome === 'cancelled') {
+            assert.match(result.stdout, /Claude.*cancelled/i);
+            assert.match(result.stdout, /Codex.*cancelled/i);
+            assert.match(result.stdout, /cancelled.*130/i);
+          } else {
+            assert.match(result.stdout, outcome === 'failed' ? /Claude.*failed/i : /Claude.*installed/i);
+            assert.match(
+              result.stdout,
+              outcome === 'linked'
+                ? /Codex.*incomplete/i
+                : outcome === 'external'
+                  ? /Codex.*preserved/i
+                  : /Codex.*installed/i,
+            );
+            for (const agent of ['claude', 'codex']) {
+              assert.ok(
+                result.stdout
+                  .toLowerCase()
+                  .includes(
+                    path.join(f.dir, agent === 'claude' ? '.claude' : '.agents', 'skills/arc-sessions').toLowerCase(),
+                  ),
+                result.stdout,
+              );
+            }
+          }
+        }
+        assert.deepEqual(fs.readdirSync(f.temporary), []);
+      } finally {
+        f.cleanup();
+      }
+    }
+  },
+);
+
 test.each([[['codex']], [['claude']], [['claude', 'codex']]])(
   'downloaded source installs stable selected skills through the real compiled CLI with independent hooks (%j)',
   (agents) => {
@@ -767,7 +871,11 @@ else fs.copyFileSync(process.env.ARC_TEST_SOURCE_ARCHIVE,output);
         root,
       };
     },
-    run(args = ['code'], env = {}, { stdin = false, cwd = unrelated, terminalInput, scriptFile, skills = false } = {}) {
+    run(
+      args = ['code'],
+      env = {},
+      { stdin = false, cwd = unrelated, terminalInput, scriptFile, skills = false, json = true } = {},
+    ) {
       fs.writeFileSync(log, '');
       let input;
       if (stdin) {
@@ -787,6 +895,7 @@ else fs.copyFileSync(process.env.ARC_TEST_SOURCE_ARCHIVE,output);
         bashPath(bin),
         absoluteBash,
         ...(stdin ? ['-s', '--'] : [scriptFile ?? bashPath(source) + '/install.sh']),
+        ...(json ? ['--json'] : []),
         ...(!skills ? ['--no-skills'] : []),
         ...args,
       ];
