@@ -17,7 +17,12 @@ afterAll(() => {
 });
 
 function scratch() {
-  const root = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'arc isolated editor test '));
+  const root = fs.mkdtempSync(
+    path.join(
+      fs.realpathSync(process.platform === 'darwin' ? '/private/tmp' : os.tmpdir()),
+      process.platform === 'darwin' ? 'ait-' : 'arc isolated editor test ',
+    ),
+  );
   roots.push(root);
   return root;
 }
@@ -886,6 +891,165 @@ function fakeCheckout() {
 }
 
 describe('isolated editor launch', () => {
+  test('selects a short physical macOS default and preserves the other platform defaults', () => {
+    assert.equal(
+      editor.defaultScratch({ platform: 'darwin', temporary: '/var/folders/long/path/T', uid: 501 }),
+      path.join('/private/tmp', 'arc-ie-1f5'),
+    );
+    for (const platform of ['win32', 'linux']) {
+      assert.equal(editor.defaultScratch({ platform, temporary: '/configured/temporary' }), '/configured/temporary');
+    }
+    assert.throws(() => editor.defaultScratch({ platform: 'darwin', uid: null }), /Cannot identify/);
+  });
+
+  test('refuses linked, foreign and accessible macOS default scratch directories', () => {
+    const parent = scratch();
+    const original = fs.lstatSync.bind(fs);
+    const uid = original(parent).uid;
+    const stat = original(parent);
+    const listing = vi.spyOn(fs, 'lstatSync');
+    for (const attributes of [
+      { mode: 0o40755, uid },
+      { mode: 0o40700, uid: uid + 1 },
+      { mode: 0o40700, uid, isSymbolicLink: () => true },
+      { mode: 0o100700, uid, isDirectory: () => false },
+    ]) {
+      listing.mockImplementation((location, ...args) =>
+        location === parent ? Object.assign(Object.create(stat), attributes) : original(location, ...args),
+      );
+      assert.throws(() => editor.checkPrivateScratch(parent, uid), /Unsafe isolated editor scratch directory/);
+    }
+    listing.mockImplementation((location, ...args) =>
+      location === parent ? Object.assign(Object.create(stat), { mode: 0o40700, uid }) : original(location, ...args),
+    );
+    assert.doesNotThrow(() => editor.checkPrivateScratch(parent, uid));
+    const canonical = vi.spyOn(fs, 'realpathSync').mockReturnValue(path.join(parent, 'elsewhere'));
+    assert.throws(() => editor.checkPrivateScratch(parent, uid), /linked ancestor/);
+    canonical.mockRestore();
+    listing.mockRestore();
+  });
+
+  test('checks the complete main socket filename in UTF-8 bytes at the macOS boundary', () => {
+    const suffixBytes = Buffer.byteLength(path.join('p', '1.11-main.sock')) - 1;
+    const fits = 'p'.repeat(103 - suffixBytes);
+    assert.doesNotThrow(() => editor.checkProfileSocket(fits, 'darwin'));
+    assert.throws(() => editor.checkProfileSocket(fits + 'p', 'darwin'), /104-byte socket path.*Omit --scratch/);
+    const unicode = fits.slice(0, -1) + 'é';
+    assert.equal(unicode.length, fits.length);
+    assert.throws(() => editor.checkProfileSocket(unicode, 'darwin'), /104-byte socket path/);
+    for (const platform of ['win32', 'linux'])
+      assert.doesNotThrow(() => editor.checkProfileSocket('p'.repeat(300), platform));
+  });
+
+  test('keeps simulated macOS scratch paths physical and run identifiers short independently of host temp paths', () => {
+    const selected = path.resolve('/scratch-alias');
+    const parent = path.resolve('/', 'p'.repeat(35));
+    const mkdir = vi.spyOn(fs, 'mkdirSync').mockImplementation(() => {});
+    const canonical = vi.spyOn(fs, 'realpathSync').mockImplementation((location) => {
+      assert.equal(location, selected);
+      return parent;
+    });
+    const write = vi.spyOn(fs, 'writeFileSync').mockImplementation(() => {});
+    const rename = vi.spyOn(fs, 'renameSync').mockImplementation(() => {});
+    try {
+      const session = editor.createRun({ scratch: selected, platform: 'darwin', list: () => [] });
+      assert.equal(path.dirname(session.layout.root), parent);
+      assert.match(path.basename(session.layout.root), /^arc-isolated-editor-[0-9a-f]{12}$/);
+      assert.ok(Buffer.byteLength(path.join(session.layout.userData, '1.11-main.sock')) <= 103);
+      assert.ok(
+        mkdir.mock.calls.some(([location, options]) => location === session.layout.root && options.mode === 0o700),
+      );
+    } finally {
+      rename.mockRestore();
+      write.mockRestore();
+      canonical.mockRestore();
+      mkdir.mockRestore();
+    }
+  });
+
+  test('keeps explicit scratch physical and preserves run manifests and cleanup', async () => {
+    const parent = scratch();
+    const session = editor.createRun({ scratch: parent, list: () => [] });
+    assert.equal(path.dirname(session.layout.root), fs.realpathSync(parent));
+    assert.deepEqual(editor.readManifest(session.layout.root), session.manifest);
+    session.manifest.evidence = `${session.layout.root}-evidence`;
+    editor.writeManifest(session.layout, session.manifest);
+    const report = await editor.cleanupRun(session.manifest, { list: () => [] });
+    assert.equal(report.ok, true, report.errors.join('\n'));
+    assert.equal(fs.existsSync(session.layout.root), false);
+    assert.equal(
+      JSON.parse(fs.readFileSync(path.join(report.evidence.directory, 'run.json'))).profile,
+      session.layout.userData,
+    );
+  });
+
+  test('refuses oversized explicit macOS scratch before making a run', () => {
+    const parent = path.join(scratch(), 'é'.repeat(40));
+    const session = {};
+    assert.throws(
+      () => editor.createRun({ scratch: parent, platform: 'darwin', list: () => [] }, session),
+      /shorter physical directory/,
+    );
+    assert.deepEqual(fs.readdirSync(parent), []);
+    assert.equal(session.manifest, undefined);
+  });
+
+  test.skipIf(process.platform !== 'darwin')(
+    'creates a private default macOS run independently of system temporary aliases',
+    async () => {
+      const temporary = vi.spyOn(os, 'tmpdir').mockReturnValue('/var/folders/long/temporary/alias/T');
+      const session = editor.createRun({ list: () => [] });
+      roots.push(session.layout.root);
+      assert.equal(path.dirname(session.layout.root), editor.defaultScratch());
+      assert.doesNotThrow(() => editor.checkPrivateScratch(path.dirname(session.layout.root)));
+      assert.ok(Buffer.byteLength(path.join(session.layout.userData, '1.11-main.sock')) <= 103);
+      const report = await editor.cleanupRun(session.manifest, { list: () => [] });
+      assert.equal(report.ok, true, report.errors.join('\n'));
+      temporary.mockRestore();
+    },
+  );
+
+  test('passes absent scratch through launch and restore', () => {
+    const source = fs.readFileSync(path.join(__dirname, 'isolated-editor.mjs'), 'utf8');
+    const launch = source.slice(
+      source.indexOf('export async function launchIsolatedEditor('),
+      source.indexOf('export function recordRunProcesses('),
+    );
+    assert.equal(/scratch\s*=/.test(launch), false);
+    assert.match(launch, /createRun\(\{ scratch, workspace, liveData, list \}/);
+    assert.match(
+      source,
+      /steps\.createRun\(\{ scratch: options\.scratch, workspace: options\.workspace, diagnostics: true \}/,
+    );
+  });
+
+  test('discovers both macOS default cleanup layouts and preserves explicit scratch selection', async () => {
+    const selected = editor.defaultScratch({ platform: 'darwin', uid: 501 });
+    const original = fs.existsSync.bind(fs);
+    vi.spyOn(fs, 'existsSync').mockImplementation((location) => (location === selected ? false : original(location)));
+    const seen = [];
+    const dependencies = {
+      platform: 'darwin',
+      uid: 501,
+      discover: (parent) => {
+        seen.push(parent);
+        return [];
+      },
+      write: () => {},
+    };
+    assert.equal(await editor.cleanupCommand({}, dependencies), 0);
+    assert.deepEqual(seen, [path.resolve(selected), path.resolve(os.tmpdir())]);
+    seen.length = 0;
+    const explicit = scratch();
+    assert.equal(await editor.cleanupCommand({ scratch: explicit }, dependencies), 0);
+    assert.deepEqual(seen, [path.resolve(explicit)]);
+    for (const platform of ['win32', 'linux']) {
+      seen.length = 0;
+      assert.equal(await editor.cleanupCommand({}, { ...dependencies, platform }), 0);
+      assert.deepEqual(seen, [path.resolve(os.tmpdir())]);
+    }
+  });
+
   test.skipIf(process.platform !== 'win32')('starts a native child with a long owned run directory', async () => {
     const checkout = fakeCheckout();
     const parent = path.join(scratch(), ...Array(6).fill('owned editor run directory'));

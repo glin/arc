@@ -29,8 +29,13 @@ import { syncBuiltinESMExports } from 'node:module';
 import { readSkillPayload, skillTemporaryRoots } from '../src/skillfiles.ts';
 import { operateSkill } from '../src/skills.ts';
 
+test('ordinary smoke fixtures create homes beneath physical temporary directories', () => {
+  const source = readFileSync(fileURLToPath(import.meta.url), 'utf8');
+  assert.doesNotMatch(source, /mkdtempSync\(join\(tmpdir\(\),/);
+});
+
 test('owned skill copies publish resources before discovery and survive their payload removal', async () => {
-  const home = mkdtempSync(join(tmpdir(), 'arc-owned-skill-'));
+  const home = mkdtempSync(join(realpathSync(tmpdir()), 'arc-owned-skill-'));
   const source = join(home, 'package');
   fs.mkdirSync(join(source, 'dist'), { recursive: true });
   fs.cpSync(new URL('../skills', import.meta.url), join(source, 'skills'), { recursive: true });
@@ -71,7 +76,7 @@ test('owned skill copies publish resources before discovery and survive their pa
 test('foreign, changed, added and linked skills remain unchanged for explicit operations', async () => {
   const payload = readSkillPayload(cli);
   for (const conflict of ['manual', 'edited', 'added', 'link', 'broken']) {
-    const home = mkdtempSync(join(tmpdir(), 'arc-preserve-skill-'));
+    const home = mkdtempSync(join(realpathSync(tmpdir()), 'arc-preserve-skill-'));
     const destination = join(home, '.agents/skills/arc-sessions');
     const options = { home, signal: new AbortController().signal };
     try {
@@ -108,7 +113,7 @@ test('cancelled replacements restore matching originals and retain conflicting d
   files.set('SKILL.md', Buffer.concat([files.get('SKILL.md'), Buffer.from('\nchanged\n')]));
   const replacement = { ...original, identity: 'replacement', files };
   for (const conflict of [false, true]) {
-    const home = mkdtempSync(join(tmpdir(), 'arc-cancel-skill-'));
+    const home = mkdtempSync(join(realpathSync(tmpdir()), 'arc-cancel-skill-'));
     const destination = join(home, '.agents/skills/arc-sessions');
     try {
       assert.equal(
@@ -146,7 +151,7 @@ test('cancelled replacements restore matching originals and retain conflicting d
 });
 
 test('independent software roots arbitrate one personal skill destination', async () => {
-  const home = mkdtempSync(join(tmpdir(), 'arc-skill-race-'));
+  const home = mkdtempSync(join(realpathSync(tmpdir()), 'arc-skill-race-'));
   const payload = readSkillPayload(cli);
   let release;
   let acknowledge;
@@ -189,7 +194,7 @@ test('independent software roots arbitrate one personal skill destination', asyn
 test.each(['backup', 'stage', 'claim', 'seal', 'cancelled-seal'])(
   'committed replacement survives %s cleanup failure',
   async (boundary) => {
-    const home = mkdtempSync(join(tmpdir(), 'arc-committed-skill-'));
+    const home = mkdtempSync(join(realpathSync(tmpdir()), 'arc-committed-skill-'));
     const original = readSkillPayload(cli);
     const files = new Map(original.files);
     files.set('SKILL.md', Buffer.concat([files.get('SKILL.md'), Buffer.from('\nreplacement\n')]));
@@ -247,7 +252,7 @@ test.each(['backup', 'stage', 'claim', 'seal', 'cancelled-seal'])(
 test.each(['link', 'unlink'])(
   'pre-journal %s refusal retires exact preparation files and permits retry',
   async (boundary) => {
-    const home = mkdtempSync(join(tmpdir(), 'arc-prepared-skill-'));
+    const home = mkdtempSync(join(realpathSync(tmpdir()), 'arc-prepared-skill-'));
     const payload = readSkillPayload(cli);
     const options = { home, signal: new AbortController().signal };
     const method = boundary === 'link' ? 'linkSync' : 'unlinkSync';
@@ -279,7 +284,7 @@ test.each(['link', 'unlink'])(
 );
 
 test('independent software roots reach the same occupied destination lock', async () => {
-  const home = mkdtempSync(join(tmpdir(), 'arc-destination-lock-'));
+  const home = mkdtempSync(join(realpathSync(tmpdir()), 'arc-destination-lock-'));
   const payload = readSkillPayload(cli);
   const options = { home, signal: new AbortController().signal };
   try {
@@ -303,7 +308,7 @@ test('independent software roots reach the same occupied destination lock', asyn
 test.each([false, true])(
   'compiled CLI handlers settle repeated cancellation with output failure %s',
   (outputFailure) => {
-    const home = mkdtempSync(join(tmpdir(), 'arc-handler-skill-'));
+    const home = mkdtempSync(join(realpathSync(tmpdir()), 'arc-handler-skill-'));
     try {
       const receipt = join(home, 'receipt.json');
       const preload = join(home, 'preload.cjs');
@@ -337,7 +342,7 @@ const write=process.stdout.write.bind(process.stdout);process.stdout.write=funct
 test.runIf(process.platform === 'win32').each(['before-backup', 'backup-cleanup'])(
   'Windows open reader preserves the skill at %s sharing boundary',
   async (boundary) => {
-    const home = mkdtempSync(join(tmpdir(), 'arc-sharing-skill-'));
+    const home = mkdtempSync(join(realpathSync(tmpdir()), 'arc-sharing-skill-'));
     const original = readSkillPayload(cli);
     const files = new Map(original.files);
     files.set('SKILL.md', Buffer.concat([files.get('SKILL.md'), Buffer.from('\nreplacement\n')]));
@@ -417,7 +422,7 @@ test.runIf(process.platform === 'win32').each(['before-backup', 'backup-cleanup'
 );
 
 test('manual recovery retires a stopped unsealed replacement and permits a new operation', async () => {
-  const home = mkdtempSync(join(tmpdir(), 'arc-stopped-skill-'));
+  const home = mkdtempSync(join(realpathSync(tmpdir()), 'arc-stopped-skill-'));
   const payload = readSkillPayload(cli);
   const options = { home, signal: new AbortController().signal };
   const destination = canonicalToolPath(join(home, '.agents/skills/arc-sessions'));
@@ -520,7 +525,7 @@ if(phase==='backed-up'){process.stdin.resume(); process.stdout.write('backed-up\
 });
 
 test('edited owned removal preserves the reader bytes', async () => {
-  const home = mkdtempSync(join(tmpdir(), 'arc-edited-removal-'));
+  const home = mkdtempSync(join(realpathSync(tmpdir()), 'arc-edited-removal-'));
   const payload = readSkillPayload(cli);
   const options = { home, signal: new AbortController().signal };
   const definition = join(home, '.agents/skills/arc-sessions/SKILL.md');
@@ -536,7 +541,7 @@ test('edited owned removal preserves the reader bytes', async () => {
 });
 
 test('the compiled skill CLI validates selectors before destination writes and reports independent providers', () => {
-  const home = mkdtempSync(join(tmpdir(), 'arc-skill-cli-'));
+  const home = mkdtempSync(join(realpathSync(tmpdir()), 'arc-skill-cli-'));
   const env = { ...smokeEnv, HOME: home, USERPROFILE: home, CLAUDE_CONFIG_DIR: '', CODEX_HOME: join(home, 'ignored') };
   try {
     for (const args of [[], ['--agent', 'other'], ['--root', home]]) {
@@ -589,7 +594,7 @@ const cli = fileURLToPath(new URL('../dist/arc.cjs', import.meta.url));
 const smokeEnv = { ...process.env, CLAUDE_CODE_SESSION_ID: '', CODEX_THREAD_ID: '' };
 
 test('session skill payload selection follows each executing artifact and rejects caller substitutes', () => {
-  const root = mkdtempSync(join(tmpdir(), 'arc-skill-layout-'));
+  const root = mkdtempSync(join(realpathSync(tmpdir()), 'arc-skill-layout-'));
   const source = fileURLToPath(new URL('../skills/arc-sessions', import.meta.url));
   const copies = [
     ['extension/dist/cli.cjs', 'extension/dist/tools/skills/arc-sessions'],
@@ -618,7 +623,7 @@ test('session skill payload selection follows each executing artifact and reject
 });
 
 test('temporary-root classification resolves linked spellings and retains unresolved configured roots', () => {
-  const root = mkdtempSync(join(tmpdir(), 'arc-skill-temp-'));
+  const root = mkdtempSync(join(realpathSync(tmpdir()), 'arc-skill-temp-'));
   const temporary = join(root, 'physical temporary');
   const alias = join(root, 'linked temporary');
   try {
@@ -706,7 +711,7 @@ test.each(['aliased', 'unresolved'])(
 );
 
 test('ordinary skill refusals omit recovery guidance and retained operations name it once', async () => {
-  const home = mkdtempSync(join(tmpdir(), 'arc-refusal-skill-'));
+  const home = mkdtempSync(join(realpathSync(tmpdir()), 'arc-refusal-skill-'));
   const payload = readSkillPayload(cli);
   const options = { home, signal: new AbortController().signal };
   const destination = join(home, '.agents/skills/arc-sessions');
@@ -752,7 +757,7 @@ test('Windows short temporary-root spellings resolve to their physical directory
     skip();
     return;
   }
-  const root = mkdtempSync(join(tmpdir(), 'arc temporary spaces '));
+  const root = mkdtempSync(join(realpathSync(tmpdir()), 'arc temporary spaces '));
   try {
     const result = spawnSync(process.env.ComSpec ?? 'cmd.exe', ['/d', '/c', 'for %I in (.) do @echo %~fsI'], {
       cwd: root,
@@ -773,7 +778,7 @@ test('Windows short temporary-root spellings resolve to their physical directory
 });
 
 test('bundled dispatch commands preserve exact event claims and readable private reports without a host', async () => {
-  const home = mkdtempSync(join(tmpdir(), 'arc-dispatch-smoke-'));
+  const home = mkdtempSync(join(realpathSync(tmpdir()), 'arc-dispatch-smoke-'));
   const receipts = new DispatchReceipts(home);
   const origin = 'a'.repeat(24);
   const launch = receipts.reserve({
@@ -836,7 +841,7 @@ test('bundled dispatch commands preserve exact event claims and readable private
 });
 
 test('the bundled windows command reaches authenticated hosts and keeps secrets out of both output formats', async () => {
-  const home = mkdtempSync(join(tmpdir(), 'arc-windows-smoke-'));
+  const home = mkdtempSync(join(realpathSync(tmpdir()), 'arc-windows-smoke-'));
   const first = new WindowChannel(home);
   const second = new WindowChannel(home);
   const env = { ...smokeEnv, ARC_HOME: home };
@@ -889,7 +894,7 @@ test('the bundled CLI reports the package version', () => {
 });
 
 test('every admitted command renders shared help before stdin, discovery, network, or file changes', async () => {
-  const home = mkdtempSync(join(tmpdir(), 'arc-help-smoke-'));
+  const home = mkdtempSync(join(realpathSync(tmpdir()), 'arc-help-smoke-'));
   const preload = join(home, 'no-io.cjs');
   const run = promisify(execFile);
   writeFileSync(
@@ -959,7 +964,7 @@ test('command admission requires complete help data', () => {
 });
 
 test('bundled self compaction uses read-only readiness, one admission and observation without retries', async () => {
-  const home = mkdtempSync(join(tmpdir(), 'arc compact smoke '));
+  const home = mkdtempSync(join(realpathSync(tmpdir()), 'arc compact smoke '));
   const channel = new WindowChannel(home);
   const run = promisify(execFile);
   const requests = [];
@@ -1044,7 +1049,7 @@ test('bundled self compaction uses read-only readiness, one admission and observ
 
 // This packaged check catches argument routing and unwanted dispatch receipts with one local channel.
 test('bundled management commands carry reader-default classification, prompt files and curation without implicit receipts', async () => {
-  const home = mkdtempSync(join(tmpdir(), 'arc management smoke '));
+  const home = mkdtempSync(join(realpathSync(tmpdir()), 'arc management smoke '));
   const channel = new WindowChannel(home);
   const run = promisify(execFile);
   const requests = [];
@@ -1105,7 +1110,7 @@ test('bundled management commands carry reader-default classification, prompt fi
         [cli, 'start', '--provider', 'codex', '--prompt-file', prompt, '--read-only', '--cwd', '.'],
         { env, cwd },
       );
-      assert.equal(requests.at(-1).params.cwd, cwd);
+      assert.equal(requests.at(-1).params.cwd, realpathSync(cwd));
       assert.equal(requests.at(-1).params.readOnly, true);
       assert.equal(requests.at(-1).params.agentRun, false);
     }
@@ -1160,7 +1165,7 @@ test('bundled management commands carry reader-default classification, prompt fi
 });
 
 test('bundled read validates bounded attribution and capability before retaining curation retries', async () => {
-  const home = mkdtempSync(join(tmpdir(), 'arc read smoke '));
+  const home = mkdtempSync(join(realpathSync(tmpdir()), 'arc read smoke '));
   const channel = new WindowChannel(home);
   const run = promisify(execFile);
   const requests = [];
@@ -1220,7 +1225,7 @@ test('bundled read validates bounded attribution and capability before retaining
 });
 
 test('bundled send reads Unicode multiline prompt files, requires observations and request IDs, and refuses ambiguity before sending', async () => {
-  const home = mkdtempSync(join(tmpdir(), 'arc send smoke '));
+  const home = mkdtempSync(join(realpathSync(tmpdir()), 'arc send smoke '));
   const channel = new WindowChannel(home);
   const run = promisify(execFile);
   const sends = [];
@@ -1286,7 +1291,7 @@ test('bundled send reads Unicode multiline prompt files, requires observations a
 });
 
 test('bundled guarded starts refuse ambiguous requesters, and a window without the provider capability gets only the base request keys', async () => {
-  const home = mkdtempSync(join(tmpdir(), 'arc guarded start smoke '));
+  const home = mkdtempSync(join(realpathSync(tmpdir()), 'arc guarded start smoke '));
   const channel = new WindowChannel(home);
   // A window from before the provider field publishes no capabilities, and its parser accepts only the base keys.
   const info = channel.info;
@@ -1354,7 +1359,7 @@ test('bundled guarded starts refuse ambiguous requesters, and a window without t
 });
 
 test('bundled session commands select one window, reject unknown IDs, and bound turns before sending', async () => {
-  const home = mkdtempSync(join(tmpdir(), 'arc-session-smoke-'));
+  const home = mkdtempSync(join(realpathSync(tmpdir()), 'arc-session-smoke-'));
   const channel = new WindowChannel(home);
   const second = new WindowChannel(home);
   const run = promisify(execFile);
@@ -1461,7 +1466,7 @@ test('bundled session commands select one window, reject unknown IDs, and bound 
 });
 
 test('bundled session commands attribute child requests only to their native session identity', async () => {
-  const home = mkdtempSync(join(tmpdir(), 'arc-child-requester-smoke-'));
+  const home = mkdtempSync(join(realpathSync(tmpdir()), 'arc-child-requester-smoke-'));
   const channel = new WindowChannel(home);
   const run = promisify(execFile);
   channel.setRequestHandler((request) => ({ requester: request.requester }));
@@ -1537,7 +1542,7 @@ test('the bundled CLI rejects malformed JSON without writing status output', () 
 });
 
 test('the bundled cost command reads isolated roots and reports failures on stderr', () => {
-  const root = mkdtempSync(join(tmpdir(), 'arc-cost-smoke-'));
+  const root = mkdtempSync(join(realpathSync(tmpdir()), 'arc-cost-smoke-'));
   const projects = join(root, 'projects');
   const codex = join(root, 'sessions');
   const file = join(projects, 'sample', 'session-1.jsonl');
@@ -1622,7 +1627,7 @@ test('the bundled cost command reads isolated roots and reports failures on stde
 });
 
 test('the packed package installs only arc globally and runs locally offline', () => {
-  const root = mkdtempSync(join(tmpdir(), 'arc-installed-smoke-'));
+  const root = mkdtempSync(join(realpathSync(tmpdir()), 'arc-installed-smoke-'));
   const packageRoot = fileURLToPath(new URL('../', import.meta.url));
   const consumer = join(root, 'consumer');
   const prefix = join(root, 'global');
@@ -1795,7 +1800,7 @@ test('the packed package installs only arc globally and runs locally offline', (
 }, 60_000);
 
 test('bundled filter commands retrieve selected identities and clear through an explicit launcher flag', async () => {
-  const home = mkdtempSync(join(tmpdir(), 'arc-filter-smoke-'));
+  const home = mkdtempSync(join(realpathSync(tmpdir()), 'arc-filter-smoke-'));
   const channel = new WindowChannel(home);
   const run = promisify(execFile);
   const requests = [];
@@ -1865,7 +1870,7 @@ test('bundled filter commands retrieve selected identities and clear through an 
   }
 });
 test('bundled dispatch wait preserves manual routes, invalid selectors and explicit host refusals', async () => {
-  const home = mkdtempSync(join(tmpdir(), 'arc-dispatch-wait-smoke-'));
+  const home = mkdtempSync(join(realpathSync(tmpdir()), 'arc-dispatch-wait-smoke-'));
   const channel = new WindowChannel(home);
   const receipts = new DispatchReceipts(home);
   const run = promisify(execFile);

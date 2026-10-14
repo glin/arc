@@ -20,6 +20,7 @@ const ownRepository = path.resolve(path.dirname(fileURLToPath(import.meta.url)),
 // The editor inherits none of these. Arc sets ELECTRON_RUN_AS_NODE=1 for the agents it starts, and Code.exe then runs as Node.
 export const SCRUBBED_VARIABLES = /^(VSCODE|ELECTRON|ARC_|CLAUDE|NODE_OPTIONS|GIT_)/i;
 export const RUN_PREFIX = 'arc-isolated-editor-';
+const MAC_SOCKET_BYTES = 103;
 export const MANIFEST_NAME = 'run.json';
 export const DEFAULT_RUN_SECONDS = 300;
 export const CLEANUP_DEADLINE_MS = 30_000;
@@ -104,6 +105,40 @@ export function runLayout(root) {
     workspace: at('workspace'),
     state: at('state.json'),
   };
+}
+
+export function defaultScratch({
+  platform = process.platform,
+  temporary = os.tmpdir(),
+  uid = process.getuid?.(),
+} = {}) {
+  if (platform !== 'darwin') return temporary;
+  if (!Number.isInteger(uid) || uid < 0) throw new Error('Cannot identify the owner of the macOS scratch directory.');
+  return path.join('/private/tmp', `arc-ie-${uid.toString(16)}`);
+}
+
+// The macOS default is shared across runs of the same user, with access limited to that user.
+export function checkPrivateScratch(parent, uid = process.getuid?.()) {
+  const stat = fs.lstatSync(parent);
+  if (!stat.isDirectory() || stat.isSymbolicLink() || stat.uid !== uid || (stat.mode & 0o777) !== 0o700) {
+    throw new Error(`Unsafe isolated editor scratch directory: ${parent}. Choose a private directory with --scratch.`);
+  }
+  if (fs.realpathSync(parent) !== path.resolve(parent)) {
+    throw new Error(
+      `The isolated editor scratch directory has a linked ancestor: ${parent}. Choose a physical directory with --scratch.`,
+    );
+  }
+}
+
+export function checkProfileSocket(profile, platform = process.platform) {
+  if (platform !== 'darwin') return;
+  // VS Code truncates its version to four characters for the profile's main socket filename.
+  const bytes = Buffer.byteLength(path.join(profile, 'xxxx-main.sock'), 'utf8');
+  if (bytes > MAC_SOCKET_BYTES) {
+    throw new Error(
+      `The isolated editor profile needs a ${bytes}-byte socket path on macOS, above ${MAC_SOCKET_BYTES} bytes: ${profile}. Omit --scratch or choose a shorter physical directory.`,
+    );
+  }
 }
 
 // The owner's transcript roots, which live data passes through after the scrub.
@@ -951,13 +986,25 @@ function requireBuild(repository) {
 // Creates the run directory, its profile, and its manifest, and fills session with them. The manifest is on disk
 // before any editor starts, so a caller that holds session can clean up after a failure at any later point.
 export function createRun(
-  { scratch = os.tmpdir(), workspace, liveData = false, diagnostics = false, list = listProcesses } = {},
+  { scratch, workspace, liveData = false, diagnostics = false, list = listProcesses, platform = process.platform } = {},
   session = {},
 ) {
-  fs.mkdirSync(scratch, { recursive: true });
-  const parent = fs.realpathSync(scratch);
-  const layout = runLayout(path.join(parent, RUN_PREFIX + randomUUID()));
-  fs.mkdirSync(layout.root, { recursive: true });
+  const selected = scratch ?? defaultScratch({ platform });
+  if (scratch === undefined && platform === 'darwin') {
+    try {
+      fs.mkdirSync(selected, { mode: 0o700 });
+    } catch (error) {
+      if (error.code !== 'EEXIST') throw error;
+    }
+    checkPrivateScratch(selected);
+  } else fs.mkdirSync(selected, { recursive: true });
+  const parent = fs.realpathSync(selected);
+  const id = randomUUID();
+  const layout = runLayout(
+    path.join(parent, RUN_PREFIX + (platform === 'darwin' ? id.replaceAll('-', '').slice(0, 12) : id)),
+  );
+  checkProfileSocket(layout.userData, platform);
+  fs.mkdirSync(layout.root, { mode: platform === 'darwin' ? 0o700 : 0o777 });
   const manifest = {
     root: layout.root,
     profile: layout.userData,
@@ -1090,7 +1137,7 @@ export async function launchIsolatedEditor(
     probeExtension,
     install = installVsix,
     packageDisposableProbe = packageProbe,
-    scratch = os.tmpdir(),
+    scratch,
     liveData = false,
     allowFocus = false,
     deadlineMs = 90_000,
@@ -1575,7 +1622,15 @@ export async function openCommand(
 }
 
 // A named run directory that is already gone holds nothing to clean up, so it adds no run to the report.
-export async function cleanupCommand(options, { write = (text) => process.stdout.write(text) } = {}) {
+export async function cleanupCommand(
+  options,
+  {
+    write = (text) => process.stdout.write(text),
+    platform = process.platform,
+    uid = process.getuid?.(),
+    discover = abandonedRuns,
+  } = {},
+) {
   let manifests;
   if (options.target !== undefined) {
     manifests = fs.existsSync(path.resolve(options.target)) ? [readManifest(options.target)] : [];
@@ -1583,7 +1638,18 @@ export async function cleanupCommand(options, { write = (text) => process.stdout
     const { processExists } = await import(
       pathToFileURL(path.join(ownRepository, 'extension', 'test', 'browserchannels.mjs')).href
     );
-    manifests = abandonedRuns(path.resolve(options.scratch ?? os.tmpdir()), processExists);
+    const parents = [options.scratch ?? defaultScratch({ platform, uid })];
+    if (options.scratch === undefined && platform === 'darwin') {
+      if (fs.existsSync(parents[0])) checkPrivateScratch(parents[0], uid);
+      parents.push(os.tmpdir());
+    }
+    manifests = [
+      ...new Map(
+        parents
+          .flatMap((parent) => discover(path.resolve(parent), processExists))
+          .map((manifest) => [manifest.root, manifest]),
+      ).values(),
+    ];
   }
   const reports = [];
   for (const manifest of manifests) reports.push({ run: manifest.root, ...(await cleanupRun(manifest)) });
