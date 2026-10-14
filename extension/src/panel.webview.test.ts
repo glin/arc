@@ -54,7 +54,7 @@ test('native Copy Path and Copy Relative Path retain citation filename suffixes'
 });
 
 test('response citation presses open external literal files without workspace or snapshot routing', async () => {
-  const { linkCandidates } = await import('./transcript.js');
+  const { linkCandidates, linkTargetIsVideo } = await import('./transcript.js');
   const opened: Array<{ path: string; options: Record<string, unknown> }> = [];
   const commands: unknown[][] = [];
   const notices: string[] = [];
@@ -72,7 +72,7 @@ test('response citation presses open external literal files without workspace or
       fs: {
         stat: async (file: { fsPath: string }) => {
           checked.push(file.fsPath);
-          if (missing) throw new Error('missing');
+          if (missing) throw Object.assign(new Error('missing'), { code: 'FileNotFound' });
           return { type: kind };
         },
       },
@@ -114,6 +114,7 @@ test('response citation presses open external literal files without workspace or
     'linkTargetIsImage',
     'linkTargetIsHtml',
     'linkTargetIsMarkdown',
+    'linkTargetIsVideo',
     `${source}\nreturn openLink;`,
   )(
     host,
@@ -124,6 +125,7 @@ test('response citation presses open external literal files without workspace or
     (file: string) => file.endsWith('.png'),
     (file: string) => file.endsWith('.html'),
     (file: string) => file.endsWith('.md'),
+    linkTargetIsVideo,
   );
   for (const name of ['one%20.csv', 'one .csv', 'one#L10', 'one:10', 'Case.csv', 'case.csv']) {
     const file = `${outside}/${name}`;
@@ -185,7 +187,7 @@ test('response citation presses open external literal files without workspace or
 });
 
 test('clicked local links open outside workspace folders through their existing editor routes', async () => {
-  const { linkCandidates } = await import('./transcript.js');
+  const { linkCandidates, linkTargetIsVideo } = await import('./transcript.js');
   const source = ts.transpileModule(declarationSource(panelHostSource, 'openLink'), {
     compilerOptions: { target: ts.ScriptTarget.ES2022 },
   }).outputText;
@@ -221,6 +223,8 @@ test('clicked local links open outside workspace folders through their existing 
     const external: string[] = [];
     const existing = new Map<string, number>();
     let previewFails = false;
+    const statErrors = new Map<string, unknown>();
+    const openErrors = new Map<string, unknown>();
     const host = {
       Uri: {
         file: uri,
@@ -233,15 +237,23 @@ test('clicked local links open outside workspace folders through their existing 
         fs: {
           stat: async (file: ReturnType<typeof uri>) => {
             checked.push(file.fsPath);
+            if (statErrors.has(file.fsPath)) throw statErrors.get(file.fsPath);
             const type = existing.get(file.fsPath);
-            if (type === undefined) throw new Error('missing');
+            if (type === undefined) throw Object.assign(new Error('missing'), { code: 'FileNotFound' });
             return { type };
           },
         },
       },
       env: {
-        openExternal: async (href: string) => {
-          external.push(href);
+        openExternal: async (href: string | ReturnType<typeof uri>) => {
+          const target = typeof href === 'string' ? href : href.fsPath;
+          external.push(target);
+          if (openErrors.has(target)) {
+            const error = openErrors.get(target);
+            if (error === false) return false;
+            throw error;
+          }
+          return true;
         },
       },
       commands: {
@@ -262,6 +274,8 @@ test('clicked local links open outside workspace folders through their existing 
         showInformationMessage: (message: string) => notices.push(message),
         showTextDocument: async (file: ReturnType<typeof uri>, options: Record<string, unknown>) => {
           opened.push({ file, options });
+          if (linkTargetIsVideo(file.fsPath)) throw new Error('binary text refused');
+          if (openErrors.has(file.fsPath)) throw openErrors.get(file.fsPath);
         },
       },
     };
@@ -274,17 +288,116 @@ test('clicked local links open outside workspace folders through their existing 
       'linkTargetIsImage',
       'linkTargetIsHtml',
       'linkTargetIsMarkdown',
+      'linkTargetIsVideo',
       `${source}\nreturn openLink;`,
     )(
       host,
       paths,
       (file: string) => file.replace(/\\/g, '/').toLowerCase(),
       (target: string, folders: string[]) => linkCandidates(target, folders, platform),
-      nativeCitationPath,
+      (target: string) => nativeCitationPath(target, platform),
       (file: string) => /\.png$/i.test(file),
       (file: string) => /\.html?$/i.test(file),
       (file: string) => /\.(md|markdown)$/i.test(file),
+      linkTargetIsVideo,
     );
+    const video = paths.join(paths.dirname(text), 'Story 100%.MP4');
+    existing.set(video, 1);
+    const beforeVideo = opened.length;
+    for (const target of [
+      video,
+      video + '#L10',
+      video + ':10',
+      ...(platform === 'win32' ? [video.split(String.fromCharCode(92)).join('/')] : []),
+    ]) {
+      openErrors.delete(video);
+      await open(target, 2);
+      assert.deepEqual(notices, [], 'an existing MP4 reported a failure after successful stat');
+      assert.equal(external.at(-1), video, platform);
+      assert.equal(opened.length, beforeVideo, 'an existing MP4 reached the text editor');
+    }
+    for (const refusal of [
+      false,
+      new Error('default app unavailable'),
+      Object.assign(new Error('opener file missing'), { code: 'FileNotFound' }),
+    ]) {
+      openErrors.set(video, refusal);
+      await open(video, 2);
+      const detail = refusal instanceof Error ? refusal.message : 'The default application did not open the video.';
+      assert.equal(notices.pop(), `Arc: did not open ${video}. ${detail}`);
+      assert.equal(opened.length, beforeVideo);
+    }
+    openErrors.delete(video);
+    const missingVideo = paths.join(paths.dirname(text), 'missing.mp4');
+    await open(missingVideo, 1);
+    assert.equal(notices.pop(), `Arc: no file at ${missingVideo}.`);
+    for (const [code, detail] of [
+      ['NoPermissions', 'permission denied'],
+      ['Unavailable', 'drive unavailable'],
+      ['Unknown', 'unknown access failure'],
+    ]) {
+      statErrors.set(video, Object.assign(new Error(detail), { code }));
+      await open(video, 1);
+      assert.equal(notices.pop(), `Arc: cannot access ${video}. ${detail}`);
+    }
+    statErrors.delete(video);
+    const first = paths.join(roots[0], 'fallback.mp4');
+    const second = paths.join(roots[1], 'fallback.mp4');
+    existing.set(first, 1);
+    openErrors.set(first, new Error('first player failed'));
+    checked.length = 0;
+    await open('fallback.mp4', 2);
+    assert.deepEqual(checked, [first, second]);
+    assert.equal(notices.pop(), `Arc: did not open ${first}. first player failed`);
+    statErrors.set(first, Object.assign(new Error('first drive unavailable'), { code: 'Unavailable' }));
+    await open('fallback.mp4', 2);
+    assert.equal(notices.pop(), `Arc: cannot access ${first}. first drive unavailable`);
+    statErrors.delete(first);
+    existing.set(second, 1);
+    openErrors.set(second, new Error('second player failed'));
+    await open('fallback.mp4', 2);
+    assert.equal(notices.pop(), `Arc: did not open ${first}. first player failed`);
+    openErrors.delete(second);
+    checked.length = 0;
+    await open('fallback.mp4', 2);
+    assert.deepEqual(checked, [first, second]);
+    assert.equal(external.at(-1), second);
+    assert.deepEqual(notices, []);
+    statErrors.set(first, Object.assign(new Error('first drive unavailable'), { code: 'Unavailable' }));
+    await open('fallback.mp4', 2);
+    assert.equal(external.at(-1), second);
+    assert.deepEqual(notices, []);
+    statErrors.delete(first);
+    const failedText = paths.join(paths.dirname(text), 'binary.txt');
+    existing.set(failedText, 1);
+    openErrors.set(failedText, new Error('binary text refused'));
+    await open(failedText, 1);
+    assert.equal(notices.pop(), `Arc: did not open ${failedText}. binary text refused`);
+    for (const suffix of ['#L10', ':10', '%20']) {
+      const literalVideo = paths.join(paths.dirname(text), 'literal.mp4' + suffix);
+      existing.set(literalVideo, 1);
+      await open(literalVideo, 2, true);
+      assert.equal(opened.at(-1)!.file.fsPath, literalVideo);
+    }
+    await open(video, 2, true);
+    assert.equal(external.at(-1), video);
+    const videoFolder = paths.join(paths.dirname(text), 'folder.mp4');
+    for (const type of [2, 66]) {
+      existing.set(videoFolder, type);
+      const beforeFolder = external.length;
+      const beforeCommands = commands.length;
+      await open(videoFolder, 1);
+      assert.equal(commands.length, beforeCommands + 1, `${platform}: directory type ${type} bypassed Explorer`);
+      assert.equal(commands.at(-1)![0], 'revealInExplorer');
+      assert.equal((commands.at(-1)![1] as ReturnType<typeof uri>).fsPath, videoFolder);
+      assert.equal(external.length, beforeFolder, `${platform}: directory type ${type} reached the video opener`);
+      await open(videoFolder, 1, true);
+      assert.equal(notices.pop(), `Arc: ${videoFolder} is a folder.`);
+      assert.equal(external.length, beforeFolder);
+      assert.equal(commands.length, beforeCommands + 1);
+    }
+    external.length = 0;
+    checked.length = 0;
     const skillPath = paths.normalize(skill);
     existing.set(skillPath, 1);
     await open(skill, 2);

@@ -123,6 +123,7 @@ import {
   isInside,
   linkTargetIsHtml,
   linkTargetIsMarkdown,
+  linkTargetIsVideo,
   linkCandidates,
   agentSpendDependencyKey,
   childSpendVersion,
@@ -767,10 +768,20 @@ async function openLink(href: string, column: vscode.ViewColumn, literal = false
           folders.map((f) => f.uri.fsPath),
         )
   ).map((file) => vscode.Uri.file(file));
+  let failure: string | undefined;
   for (const uri of candidates) {
+    let stat: vscode.FileStat;
     try {
-      const stat = await vscode.workspace.fs.stat(uri);
-      if (stat.type === vscode.FileType.Directory || (literal && stat.type & vscode.FileType.Directory)) {
+      stat = await vscode.workspace.fs.stat(uri);
+    } catch (error) {
+      if ((error as { code?: string } | null)?.code !== 'FileNotFound') {
+        const detail = error instanceof Error ? error.message : String(error);
+        failure ??= `Arc: cannot access ${uri.fsPath}. ${detail}`;
+      }
+      continue;
+    }
+    try {
+      if (stat.type & vscode.FileType.Directory) {
         if (literal) {
           void vscode.window.showInformationMessage(`Arc: ${target} is a folder.`);
           return;
@@ -779,7 +790,7 @@ async function openLink(href: string, column: vscode.ViewColumn, literal = false
         return;
       }
       if (literal && !(stat.type & vscode.FileType.File)) {
-        void vscode.window.showInformationMessage(`Arc: no file at ${target}.`);
+        void vscode.window.showInformationMessage(`Arc: ${target} is not a file.`);
         return;
       }
       // Open images in the editor's image viewer because showTextDocument rejects them.
@@ -797,6 +808,12 @@ async function openLink(href: string, column: vscode.ViewColumn, literal = false
         }
         return;
       }
+      if (uri.scheme === 'file' && linkTargetIsVideo(uri.fsPath)) {
+        if (!(await vscode.env.openExternal(uri))) {
+          throw new Error('The default application did not open the video.');
+        }
+        return;
+      }
       if (uri.scheme === 'file' && linkTargetIsMarkdown(uri.fsPath)) {
         try {
           await vscode.commands.executeCommand('vscode.openWith', uri, 'vscode.markdown.preview.editor', column);
@@ -808,11 +825,12 @@ async function openLink(href: string, column: vscode.ViewColumn, literal = false
       const selection = from >= 0 ? new vscode.Range(from, 0, to, 0) : undefined;
       await vscode.window.showTextDocument(uri, { selection, preview: true, viewColumn: column });
       return;
-    } catch {
-      /* Continue to another candidate when this file cannot open. */
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      failure ??= `Arc: did not open ${uri.fsPath}. ${detail}`;
     }
   }
-  void vscode.window.showInformationMessage(`Arc: no file at ${target}.`);
+  void vscode.window.showInformationMessage(failure ?? `Arc: no file at ${target}.`);
 }
 
 // Open a response image in the editor's viewer. imagePathFor checks the path

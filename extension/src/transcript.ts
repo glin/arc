@@ -3401,6 +3401,10 @@ export function linkTargetIsMarkdown(target: string): boolean {
   return /\.(?:md|markdown)$/i.test(target);
 }
 
+export function linkTargetIsVideo(target: string): boolean {
+  return /\.(?:mp4|m4v|mov|webm|avi|mkv)$/i.test(target);
+}
+
 // Local paths in folder order. Parent segments can name files outside the folders.
 export function linkCandidates(
   target: string,

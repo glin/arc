@@ -328,6 +328,7 @@ import {
   linkTarget,
   linkTargetIsHtml,
   linkTargetIsMarkdown,
+  linkTargetIsVideo,
   resolveLink,
   linkCandidates,
   holdsHumanPrompt,
@@ -11733,6 +11734,17 @@ test('a linked Markdown file is recognized by its resolved suffix', () => {
     true,
     'a line anchor prevented a Markdown target from using the Markdown Preview route',
   );
+});
+
+test('a linked video uses only the supported resolved suffixes', () => {
+  for (const suffix of ['mp4', 'm4v', 'mov', 'webm', 'avi', 'mkv']) {
+    assert.equal(linkTargetIsVideo(`outside/story.${suffix}`), true);
+    assert.equal(linkTargetIsVideo(`outside/story.${suffix.toUpperCase()}`), true);
+  }
+  for (const target of ['story.mp4.txt', 'story.mp4#L10', 'story.mp4:10', 'story.svg', 'story.mp3', 'story', '']) {
+    assert.equal(linkTargetIsVideo(target), false, target);
+  }
+  assert.equal(linkTargetIsVideo(linkTarget('story.MP4#L10')!), true);
 });
 
 test('a relative link resolves to the folder that holds it, or the first folder', () => {

@@ -70,7 +70,7 @@ flowchart LR
   channel <--> panelhost
 ```
 
-The extension never writes a file the agent changed. Hooks write only under the snapshot store. The panel opens files and diffs through VS Code. The CLI reads Claude status-line JSON from stdin or one session's Claude or Codex records from disk. Window discovery asks running extension hosts through their local channels.
+The extension never writes a file the agent changed. Hooks write only under the snapshot store. The panel opens files and diffs through VS Code. Video response links use the operating system's default application. The CLI reads Claude status-line JSON from stdin or one session's Claude or Codex records from disk. Window discovery asks running extension hosts through their local channels.
 
 ## Data sources
 
@@ -291,7 +291,7 @@ The first column is checked against the shipped extension directory by `architec
 | `store.ts` | Snapshot manifests, path matching, current-file comparison, expiry, lazy cache partition ownership, and conservative folderless retention | no |
 | `agentpaths.ts` | Resolves the Claude Code and Codex homes from their process environment and home-directory fallbacks | no |
 | `claudeskillpath.ts` | Finds a Claude skill's `SKILL.md` in the session's project skills folder, then the reader's Claude skills folder | no |
-| `transcript.ts` | Shared transcript byte windows, Claude records, consumed-prefix evidence and read accounting, resumable parent-owned relationship reduction, shell receipt validation, and local link candidates for opening and copying paths | no |
+| `transcript.ts` | Shared transcript byte windows, Claude records, consumed-prefix evidence and read accounting, resumable parent-owned relationship reduction, shell receipt validation, local link candidates for opening and copying paths, and local HTML, Markdown, and video classification | no |
 | `readmeter.ts` | Counts the bytes and distinct files that synchronous transcript reads return while one measurement window is open | no |
 | `codex.ts` | Reads Codex rollouts into shared values, indexes descendant ownership by semantic catalog revision for turn cost and revision keys, and scans shell launches with a resumable cursor, and reads dispatched figures with native descendants, and keeps retained-context estimates separate from billed usage | no |
 | `outputrate.ts` | Qualified response clocks, bounded content-free response measurements, per-turn measurements and qualified model identity, and native Codex response boundaries with blocking local tool outputs | no |
