@@ -10,7 +10,7 @@ import { HostedDispatch, type SavedDispatchResponse } from './dispatchhost';
 import { payloadSha256 } from './sessionwrites';
 import type { NativeEvent } from './agentwire';
 import { spawnSync } from 'node:child_process';
-import { savedDispatchResponse } from './sessionreads';
+import { savedDispatchResponse, SESSION_READ_LIMITS } from './sessionreads';
 import { revisionOf, type SessionFile } from './transcript';
 import { ClaudeWire } from './claudewire';
 
@@ -610,12 +610,17 @@ test.each(['claude', 'codex'] as const)(
   },
 );
 
-test.each(['claude', 'codex'] as const)(
-  'escaped %s final response above four MiB survives bounded saved recovery',
-  (agent) => {
+test.each(
+  (['claude', 'codex'] as const).flatMap((agent) => [
+    { agent, escaping: 'backslash', character: 92, bytes: 4 * 1024 * 1024 + 1 },
+    { agent, escaping: 'six-to-one', character: 1, bytes: 8 * 1024 * 1024 },
+  ]),
+)(
+  'escaped $agent $escaping final response above four MiB survives bounded saved recovery',
+  ({ agent, character, bytes }) => {
     const { receipts, launch, home } = fixture();
     const file = path.join(home, 'escaped.jsonl');
-    const text = String.fromCharCode(92).repeat(4 * 1024 * 1024 + 1);
+    const text = String.fromCharCode(character).repeat(bytes);
     const at = '2026-01-01T00:00:00Z';
     const rows =
       agent === 'claude'
@@ -648,7 +653,8 @@ test.each(['claude', 'codex'] as const)(
               payload: { type: 'task_complete', turn_id: turn, last_agent_message: text },
             },
           ];
-    fs.writeFileSync(file, rows.map((row) => JSON.stringify(row)).join('\n') + '\n', 'utf8');
+    const encoded = rows.map((row) => JSON.stringify(row)).join('\n') + '\n';
+    fs.writeFileSync(file, encoded, 'utf8');
     const source = {
       file,
       agent,
@@ -657,7 +663,9 @@ test.each(['claude', 'codex'] as const)(
     } as SessionFile;
     const native = agent === 'claude' ? '1' : turn;
     let saved: SavedDispatchResponse | null = null;
-    for (let attempts = 0; attempts < 150 && !saved; attempts++) saved = savedDispatchResponse(source, native);
+    const readCallBudget = Math.ceil(Buffer.byteLength(encoded) / SESSION_READ_LIMITS.bytes) + rows.length + 1;
+    for (let attempts = 0; attempts < readCallBudget && !saved; attempts++)
+      saved = savedDispatchResponse(source, native);
     assert.ok(saved);
     assert.equal(saved.text.length, text.length);
     assert.equal(saved.text, text);
@@ -751,6 +759,10 @@ test.each(['darwin', 'linux', 'win32'] as const)(
       assert.throws(() => safeDispatchPath('/tmp/redirected', platform), /redirected/);
       vi.spyOn(fs.realpathSync, 'native').mockReturnValue('/mutable/elsewhere');
       assert.throws(() => safeDispatchPath('/tmp/reports', platform), /redirected/);
-    } else assert.throws(() => safeDispatchPath('/tmp/reports', platform), /redirected/);
+    } else
+      assert.throws(
+        () => safeDispatchPath(platform === 'win32' ? 'C:\\tmp\\reports' : '/tmp/reports', platform),
+        /redirected/,
+      );
   },
 );
