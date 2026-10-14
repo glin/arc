@@ -282,8 +282,8 @@ async function capture(page: Page, scene: (typeof README_SCENES)[number], dir: s
       throw new Error('The cache-expiry figure is missing.');
     await metric.click();
     await page.locator('#chippop').waitFor({ state: 'visible' });
-    if (!(await page.locator('#chippop').innerText()).includes('3 affected turns')) {
-      throw new Error('The cache-expiry detail did not name the affected turns.');
+    if (!(await page.locator('#chippop').innerText()).includes('3 affected requests')) {
+      throw new Error('The cache-expiry detail did not name the affected requests.');
     }
   }
   if (scene === 'project-cost') {

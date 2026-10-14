@@ -2962,7 +2962,7 @@ export function sessionCacheExpiryStats(facts: CacheExpiryFacts): SessionStatChi
     facts.returns.some(test) || (facts.childSources ?? []).some((source) => source.facts.returns.some(test));
   const detailList: StatDetailList = {
     layout: 'economics',
-    heading: { label: 'Cache expiry', value: `${count} return ${count === 1 ? 'request' : 'requests'}` },
+    heading: { label: 'Cache expiry', value: `${count} affected ${count === 1 ? 'request' : 'requests'}` },
     entries: [
       { label: 'Cache lifetimes', value: lifetimeParts.join(' · ') },
       { label: 'Cost added', value: costAddedLabel(facts), valueTitle: CACHE_EXPIRY_COST_ADDED_HINT },

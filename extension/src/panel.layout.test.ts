@@ -1220,7 +1220,7 @@ test(
       };
     })()`)) as { economics: boolean; text: string; inside: boolean; stacked: boolean };
       assert.equal(measured.economics, true);
-      assert.match(measured.text, /Cache expiry 3 affected turns/);
+      assert.match(measured.text, /Cache expiry 3 affected requests/);
       assert.equal(measured.inside, true);
       assert.equal(measured.stacked, true);
     } finally {

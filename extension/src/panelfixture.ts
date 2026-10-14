@@ -907,10 +907,10 @@ export const RAIL_STATS: Record<string, SessionStatChip[]> = {
       label: '3 cache expiries',
       focusable: true,
       detail:
-        'Cache expiry: 3 affected turns\n\nCache lifetimes: 1 at 5m · 2 at 30m\nCost added: $2.86\nLongest qualifying gap: 1d 2h\nExcluded ambiguous events: 2\nThe record does not identify every cache-key change.',
+        'Cache expiry: 3 affected requests\n\nCache lifetimes: 1 at 5m · 2 at 30m\nCost added: $2.86\nLongest qualifying gap: 1d 2h\nExcluded ambiguous events: 2\nThe record does not identify every cache-key change.',
       detailList: {
         layout: 'economics',
-        heading: { label: 'Cache expiry', value: '3 affected turns' },
+        heading: { label: 'Cache expiry', value: '3 affected requests' },
         entries: [
           { label: 'Cache lifetimes', value: '1 at 5m · 2 at 30m' },
           { label: 'Cost added', value: '$2.86', valueTitle: CACHE_EXPIRY_COST_ADDED_HINT },
