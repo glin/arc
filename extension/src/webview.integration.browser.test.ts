@@ -816,6 +816,102 @@ test(
 );
 
 test(
+  'manual unread collapses the latest turn through accepted state and unchanged refresh',
+  { timeout: 60_000 },
+  async (t) => {
+    const browser = await browserOrNone();
+    if (!browser) {
+      t.skip('no browser available');
+      return;
+    }
+    try {
+      for (const action of ['turn', 'session']) {
+        const page = await browser.newPage();
+        const payload = scaledPayload(1, 2);
+        const [latest, older] = payload.cards;
+        payload.rail[0].newestTurnAt = latest.startedAt;
+        const keys = payload.cards.map((card) => card.key);
+        await page.setContent(themed(browserStatePageHtml({ open: keys, read: keys })));
+        await page.evaluate(
+          (read) =>
+            window.postMessage(
+              { type: 'readState', state: { revision: 1, read, readTo: {}, since: 0, agentRead: [] } },
+              '*',
+            ),
+          keys,
+        );
+        await page.evaluate(`window.postMessage(${JSON.stringify(payload)}, '*')`);
+        const latestHead = page.locator(`[data-control="card:${latest.key}"]`);
+        await page.waitForFunction(
+          (key) => document.querySelector(`[data-control="card:${key}"]`)?.getAttribute('aria-expanded') === 'true',
+          latest.key,
+        );
+        await page.evaluate(
+          ({ action, key }) =>
+            window.postMessage(
+              action === 'turn'
+                ? { type: 'setRead', key, read: false }
+                : { type: 'setSessionRead', session: 'bulk0', read: false },
+              '*',
+            ),
+          { action, key: latest.key },
+        );
+        await page.waitForFunction(() =>
+          (window as any).__posted.some((message: any) => message.type === 'readerRead' && !message.operation.read),
+        );
+        await page.evaluate(
+          ({ read }) => {
+            const sent = (window as any).__posted.find(
+              (message: any) => message.type === 'readerRead' && !message.operation.read,
+            );
+            window.postMessage({ type: 'readerReadAdmission', id: sent.operation.id, admitted: true }, '*');
+            window.postMessage(
+              { type: 'readState', state: { revision: 2, read, readTo: { bulk0: 0 }, since: 0, agentRead: [] } },
+              '*',
+            );
+          },
+          { read: action === 'turn' ? [older.key] : [] },
+        );
+        await page.evaluate(SETTLED);
+        await page.evaluate(`window.postMessage(${JSON.stringify(payload)}, '*')`);
+        await page.evaluate(SETTLED);
+        const capture = process.env.ARC_UNREAD_CAPTURE_DIR;
+        if (capture) await page.screenshot({ path: `${capture}/${action}.png` });
+        assert.equal(await latestHead.getAttribute('aria-expanded'), 'false');
+        assert.equal(
+          await page
+            .locator(`article.turn[data-key="${latest.key}"]`)
+            .evaluate((node) => node.classList.contains('is-read')),
+          false,
+        );
+        assert.equal(
+          await page.evaluate(
+            () =>
+              (window as any).__posted.filter((message: any) => message.type === 'readerRead' && message.operation.read)
+                .length,
+          ),
+          0,
+        );
+        if (action === 'turn')
+          assert.equal(await page.locator(`[data-control="card:${older.key}"]`).getAttribute('aria-expanded'), 'true');
+        await latestHead.click();
+        await page.waitForFunction(
+          (key) =>
+            (window as any).__posted.some(
+              (message: any) =>
+                message.type === 'readerRead' && message.operation.read && message.operation.target.startedAt === key,
+            ),
+          latest.startedAt,
+        );
+        await page.close();
+      }
+    } finally {
+      await browser.close();
+    }
+  },
+);
+
+test(
   'unread heading expansion stays local for 12 and 24 turns at 100 and 1000 sessions',
   { timeout: 60_000 },
   async (t) => {

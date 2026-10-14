@@ -168,6 +168,9 @@ export function createReadState(options: ReadStateOptions): ReadStateOwner {
       pendingMarks.delete(identity(card));
       pendingUnread.set(identity(card), card);
     }
+    const shut = options.open.delete(card.key);
+    if (shut) options.refreshSelection();
+    if (shut && options.operate && revision >= 0) options.save();
     if (
       operate({
         action: 'turn',
@@ -176,7 +179,7 @@ export function createReadState(options: ReadStateOptions): ReadStateOwner {
       })
     )
       return;
-    let changed = read.delete(card.key);
+    let changed = read.delete(card.key) || shut;
     const boundary = readTo.get(card.sessionId) ?? since;
     if (boundary > 0 && card.startedAt <= boundary) {
       watermark(card.sessionId, card.startedAt - 1);
@@ -272,9 +275,7 @@ export function createReadState(options: ReadStateOptions): ReadStateOwner {
     },
     toggle(card) {
       if (owner.isRead(card)) {
-        options.open.delete(card.key);
         unmark(card);
-        options.refreshSelection();
       } else {
         mark(card.key, true);
       }

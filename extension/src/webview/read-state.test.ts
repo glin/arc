@@ -105,6 +105,47 @@ test('session unread closes and saves disclosure before synchronized cards repai
   state.dispose();
 });
 
+test('turn unread closes the expanded latest turn before host synchronization and automatic repaint', () => {
+  const turns = [card('s:20', 's', 20), card('s:10'), card('other:10', 'other')];
+  const open = new Set(turns.map((turn) => turn.key));
+  const events: string[] = [];
+  const operations: any[] = [];
+  const state = createReadState({
+    initial: {},
+    open,
+    cards: () => turns,
+    newestTurnAt: () => 20,
+    save: () => events.push('save'),
+    refreshSelection: () => events.push('selection'),
+    operate: (operation) => {
+      events.push('operation');
+      operations.push(operation);
+      state.admit(operation.id, true);
+    },
+  });
+  try {
+    state.synchronize({ revision: 1, read: turns.map((turn) => turn.key), readTo: {}, since: 0, agentRead: [] });
+    state.subscribe(() => {
+      for (const turn of turns) if (open.has(turn.key)) state.mark(turn.key);
+    });
+    state.set(turns[0].key, false);
+    assert.deepEqual([...open], ['s:10', 'other:10']);
+    assert.deepEqual(events, ['selection', 'save', 'operation']);
+    const unread = { revision: 2, read: ['s:10', 'other:10'], readTo: {}, since: 0, agentRead: [] };
+    state.synchronize(unread);
+    state.synchronize({ ...unread, revision: 3 });
+    assert.equal(state.isRead(turns[0]), false);
+    assert.equal(operations.length, 1);
+    assert.equal(operations[0].read, false);
+    open.add(turns[0].key);
+    assert.equal(state.mark(turns[0].key), true);
+    assert.equal(operations.length, 2);
+    assert.equal(operations[1].read, true);
+  } finally {
+    state.dispose();
+  }
+});
+
 test('opening an agent acknowledged turn still establishes the reader mark', () => {
   const turn = { ...card('s:10'), promptId: 'prompt' };
   const operations: any[] = [];
