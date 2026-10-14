@@ -30,7 +30,9 @@ node extension/dist/setup.cjs --commands
 node extension/dist/setup.cjs --snapshots
 ```
 
-The source installer uses the checkout marketplace for local development. Downloaded source uses the built snapshot helper to preserve matching hooks in durable storage. `--remote` forces download for development testing. `--repo` and `--ref` select the downloaded source. `--marketplace-url` explicitly selects an independently published HTTPS catalog. `--no-hooks` skips all Claude setup and legacy cleanup.
+The source installer uses the checkout marketplace for local development. Downloaded source uses the built snapshot helper to preserve matching hooks in durable storage. `--remote` forces download for development testing. `--repo` and `--ref` select the downloaded source. `--marketplace-url` explicitly selects an independently published HTTPS catalog. `--no-hooks` skips Claude plugin setup and legacy cleanup. Skill selection is independent and uses the matching built CLI. [Skill installation](arc-sessions.md#install-the-parts-you-need) owns its selectors and destinations.
+
+The installer records per-component outcomes. Hook-only preflight failures preserve admitted editor and skill work. Exit 0 means selected work succeeded or preserved an exact stable external skill. Exit 2 means global argument or prerequisite refusal before installation. Exit 1 means incomplete requested work. Delivered HUP, INT, and TERM preserve statuses 129, 130, and 143. The shell records cancellation and awaits its unreaped skill child before deleting temporary source. No platform/runtime forwarding branch has native graceful-delivery acceptance, so handlers wait without forwarding. Automated disposable-home checks do not establish authenticated native skill discovery.
 
 ## Panel screenshots
 

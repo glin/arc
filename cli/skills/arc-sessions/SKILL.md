@@ -7,6 +7,8 @@ description: 'Read and manage scoped Claude Code and Codex sessions through a ru
 
 Use Arc for session work the reader requested. Start only the authorized work.
 
+Treat tag as a natural-language synonym for label. Keep `arc label`, `--label`, and `label:` syntax.
+
 ## Select a ready window
 
 Run `arc windows --json`. Select the intended window by its folders and `hostId`. Pass that ID through `--window` on every session command. `--window` overrides `ARC_WINDOW`. Without either, Arc requires exactly one live window and complete discovery.

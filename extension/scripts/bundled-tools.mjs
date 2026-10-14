@@ -20,19 +20,21 @@ export function bundledTools(dist, sourceRoot, build) {
   copy(path.join(dist, 'windowpipe.exe'), 'cli/windowpipe.exe');
   copy(path.join(sourceRoot, 'LICENSE'), 'LICENSE');
   const plugin = path.join(sourceRoot, 'plugins/arc-hooks');
-  const visit = (relative) => {
+  const visit = (root, relative, prefix, inputPrefix, excludeTests = false) => {
     for (const entry of fs
-      .readdirSync(path.join(plugin, relative), { withFileTypes: true })
+      .readdirSync(path.join(root, relative), { withFileTypes: true })
       .sort((a, b) => a.name.localeCompare(b.name))) {
-      const file = `${relative}/${entry.name}`;
-      if (entry.isDirectory()) visit(file);
-      else if (entry.isFile() && !entry.name.endsWith('.test.js')) {
-        copy(path.join(plugin, file), `plugin/${file}`);
-        inputs.push(`../plugins/arc-hooks/${file}`);
-      } else if (!entry.isFile()) throw new Error(`Unsupported bundled plugin file ${file}.`);
+      const file = relative ? `${relative}/${entry.name}` : entry.name;
+      if (entry.isDirectory()) visit(root, file, prefix, inputPrefix, excludeTests);
+      else if (entry.isFile() && !(excludeTests && entry.name.endsWith('.test.js'))) {
+        copy(path.join(root, file), `${prefix}/${file}`);
+        inputs.push(`${inputPrefix}/${file}`);
+      } else if (!entry.isFile()) throw new Error(`Unsupported bundled file ${prefix}/${file}.`);
     }
   };
-  for (const folder of ['.claude-plugin', 'hooks', 'scripts']) visit(folder);
+  for (const folder of ['.claude-plugin', 'hooks', 'scripts'])
+    visit(plugin, folder, 'plugin', '../plugins/arc-hooks', true);
+  visit(path.join(sourceRoot, 'cli/skills/arc-sessions'), '', 'skills/arc-sessions', '../cli/skills/arc-sessions');
   copy(path.join(plugin, 'LICENSE'), 'plugin/LICENSE');
   const launchers = {
     arc: '#!/bin/sh\nELECTRON_RUN_AS_NODE=1 exec "$ARC_EDITOR_EXECUTABLE" "${0%/*}/../cli/arc.cjs" "$@"\n',

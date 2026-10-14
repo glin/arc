@@ -5,6 +5,7 @@ import { runSessions } from './sessions.ts';
 import { runManagement } from './manage.ts';
 import { runCompact } from './compact.ts';
 import { findCommand, renderCommandHelp, renderOverviewHelp } from './commands.ts';
+import { runSkills } from './skills.ts';
 
 declare const ARC_VERSION: string;
 
@@ -41,6 +42,9 @@ async function run(): Promise<void> {
   if (!command) throw new Error(`Unknown command: ${args[0]}`);
   const commandArgs = args.slice(command.name.split(' ').length);
   switch (command.route) {
+    case 'skills':
+      await runSkills(command.action!, commandArgs);
+      return;
     case 'cost':
       process.stdout.write(`${runCost(commandArgs)}\n`);
       return;
@@ -93,5 +97,5 @@ async function run(): Promise<void> {
 run().catch((error: unknown) => {
   const message = error instanceof Error ? error.message : String(error);
   process.stderr.write(`arc: ${message}\n`);
-  process.exitCode = 1;
+  process.exitCode ||= 1;
 });

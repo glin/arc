@@ -5,7 +5,7 @@ Arc is a VS Code extension for working with Claude Code and Codex. (_Personal so
 [Web demo](https://glin.github.io/arc/)
 
 - Keep track of all the agents! Vertical tabs, labels, saved views, filters, links to subagent sessions.
-- Read results, not chat. Arc groups the conversation into a timeline of turns, each showing the final response, file edits, commits, subagents, and cost.
+- Read results, not chat. Arc groups the session into a timeline of turns, each showing the final response, file edits, commits, subagents, and cost.
 - See what a session costs with turn-level breakdowns. Save costs with the prompt cache expiry and next-turn starting price hints.
 - Keep your workflow. Stay in VS Code with your editor, diff viewer, themes, and extensions. Use Arc with or without worktrees, or as a viewer for Claude/Codex CLI and desktop sessions.
 
@@ -25,6 +25,8 @@ curl -fsSL https://raw.githubusercontent.com/glin/arc/main/install.sh | bash
 
 The installer installs Arc in your editor and sets up Claude hooks.
 
+It copies the session skill for detected Claude and Codex executables. Repeat `--skill-agent claude` or `--skill-agent codex` to select providers explicitly, including providers absent from PATH. `--no-skills` skips skill setup independently of `--no-hooks`. [Skill installation](docs/arc-sessions.md#install-the-parts-you-need) describes destinations and ownership.
+
 Reload VS Code and open a new integrated terminal to use `arc`. Run **Arc: Open Arc in Editor** from the Command Palette.
 
 ### Claude hooks
@@ -43,7 +45,7 @@ See [CLI installation](cli/README.md#install) to install `arc` for other termina
 
 ### Uninstall
 
-Remove Arc from VS Code's Extensions view. Installed Claude hooks and standalone commands remain available.
+Remove Arc from VS Code's Extensions view. Installed Claude hooks, standalone commands, and personal skills remain available.
 
 See [uninstallation](cli/README.md#uninstallation) to remove those separately.
 

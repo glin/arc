@@ -8,10 +8,10 @@ The `arc-sessions` skill lets a Claude Code or Codex agent start, inspect, and o
 | --- | --- | --- |
 | Arc extension | Displays sessions and connects to agent CLIs. Includes `arc` launchers for Arc sessions and new integrated terminals. | Source installer or an available VSIX. |
 | Standalone Arc CLI | Makes `arc` available to ordinary shell commands. | Local npm tarball from the [CLI build instructions](../cli/README.md#build-from-source). |
-| `arc-sessions` skill | Gives an agent instructions for bounded session work through the CLI. | Reader installs or links the skill separately. |
+| `arc-sessions` skill | Gives an agent instructions for bounded session work through the CLI. | Source installer, explicit CLI setup, or a manual copy or link. |
 | `arc-hooks` Claude plugin | Captures first-touch file snapshots for Claude file diffs. | Source installer or Claude plugin marketplace. |
 
-The skill source is [`cli/skills/arc-sessions/SKILL.md`](../cli/skills/arc-sessions/SKILL.md). The standalone CLI package includes it under `skills/arc-sessions/SKILL.md`. The VSIX and Claude plugin do not include the skill.
+The skill source is [`cli/skills/arc-sessions/SKILL.md`](../cli/skills/arc-sessions/SKILL.md). The standalone CLI package includes it under `skills/arc-sessions/SKILL.md`. The VSIX includes the canonical skill directory under `dist/tools/skills/arc-sessions`, with its paths and digests in the tool identity. The Claude plugin does not include the skill.
 
 Bundled files are part of an artifact. An installed skill exists in an agent's skill directory. A release requires publication of the corresponding artifact. None of these states establishes the others.
 
@@ -23,7 +23,9 @@ A VSIX installs the extension. Claude marketplace installation selects `arc-hook
 
 Arc has no editor command named **Arc: Install CLI**. To update the standalone CLI, build a current source checkout and install its tarball. [CLI installation](../cli/README.md#install) owns the commands and Node requirements. npm publication is deferred, so a registry `latest` install is not an available release path.
 
-The reader chooses which agents receive the skill. [Manual skill installation](../cli/README.md#session-skill) provides Windows junction and macOS/Linux link commands. Claude Code uses `~/.claude/skills/arc-sessions`. Codex uses `~/.agents/skills/arc-sessions`. A source link reads the linked checkout's instructions. Restart the agent session after installation.
+The source installer selects detected Claude and Codex executables by default. Explicit `--skill-agent claude` and `--skill-agent codex` select personal copies without requiring those executables. `--no-skills` skips this invocation's skill setup. `--no-hooks` excludes only hooks. The explicit `arc skills install`, `arc skills update`, and `arc skills remove` commands accept repeatable `--agent claude` or `--agent codex`. Claude Code uses `~/.claude/skills/arc-sessions`. Codex uses `~/.agents/skills/arc-sessions`, independently of `CODEX_HOME`. A nondefault `CLAUDE_CONFIG_DIR` refuses Claude skill setup. Managed and custom discovery setups require a separately maintained manual installation. Installation never changes provider policy or enables disabled skills. Restart the agent session after installation.
+
+Arc copies regular files and publishes `SKILL.md` after resources finish. Existing manual copies and links remain user-owned. Install preserves an exact stable external copy with `external-match-preserved`. Matching links, redirected ancestors, temporary copies, copies inside the executing payload, and unresolved temporary roots produce an incomplete result without takeover. Update and removal require unchanged Arc-owned files. Added files, edited files, unfamiliar ownership, and retained interrupted operations refuse destructive changes. [Manual skill installation](../cli/README.md#session-skill) provides Windows junction and macOS/Linux link commands.
 
 The third-party [Vercel skills CLI](https://github.com/vercel-labs/skills#readme) also supports local paths, named skills, and both agents. From an Arc checkout, these commands list the skill, then install it:
 
@@ -32,9 +34,25 @@ npx skills add ./cli/skills --list
 npx skills add ./cli/skills --skill arc-sessions --global --agent claude-code --agent codex
 ```
 
-These are documented installer forms, not a tested Arc installation route. Use the explicit `cli/skills` directory because the repository nests the skill beneath `cli`. Repository-root discovery requires `--full-depth`. `npx skills` installs skill files. It does not install the Arc CLI, extension, or Claude plugin.
+Use the explicit `cli/skills` directory because the repository nests the skill beneath `cli`. Repository-root discovery requires `--full-depth`. `npx skills` installs skill files. It does not install the Arc CLI, extension, or Claude plugin.
 
-Arc does not automatically install the session skill or inject its instructions into agent prompts. The agent discovers installed skills through its native skill directories. Both providers list skill metadata and load the full instructions when the skill activates. Explicit invocation uses `/arc-sessions` in Claude Code or `$arc-sessions` in Codex. The agent also selects relevant skills from their descriptions, subject to provider configuration. [Claude skill guidance](https://code.claude.com/docs/en/skills) and [Codex skill guidance](https://learn.chatgpt.com/docs/build-skills) own discovery, selection, and context-loading behavior.
+Arc does not inject skill instructions into agent prompts. The agent discovers installed skills through its native skill directories. Both providers list skill metadata and load the full instructions when the skill activates. Explicit invocation uses `/arc-sessions` in Claude Code or `$arc-sessions` in Codex. The agent also selects relevant skills from their descriptions, subject to provider configuration. [Claude skill guidance](https://code.claude.com/docs/en/skills) and [Codex skill guidance](https://learn.chatgpt.com/docs/build-skills) own discovery, selection, and context-loading behavior.
+
+## Manual recovery
+
+A skill result with `publication` names the completed installation, update, or removal. An `incomplete` status still requires cleanup when files or locks remain. Cancellation preserves that publication result and the first signal's exit status.
+
+An interrupted operation retains uncertain files and locks. Arc never takes ownership through a timeout, PID check, or heartbeat. Establish that every participating installer and descendant has stopped before changing retained files. Stop when any participant remains unknown.
+
+Use the canonical `control` and `operation` paths in the CLI result. The Claude control folder is `~/.claude/skills.arc-skill-control`. The Codex control folder is `~/.agents/skills.arc-skill-control`. Each contains `ownership.json`, optional `installed.json`, and matching `software.lock` and `destination.lock` files. An operation folder is `operation-TOKEN`. Its `journal.json` names the exact `destination`, `stage`, `backup`, source digest, complete file digests, and previous directory identity. `claim.json` identifies a replacement directory when present. `seal.json` marks settled work.
+
+Preserve a separate byte copy of every retained file before recovery. Compare the lock tokens, journal token, canonical paths, directory device/inode/birth identities, and complete file sets. Compare each file's SHA256 with the journal. Preserve added files, edits, links, and identities that differ. Never remove a foreign destination to restore a backup.
+
+Preserve a completed publication when `installed.json` matches the journal token, destination identity, and complete new file digests. Cleanup failures retain this publication and its ownership. Never remove that destination to restore a backup whose cleanup has begun. Preserve partially removed backups and uncertain cleanup files for manual review.
+
+For an uncommitted operation, restore `backup` to the journal's `destination` only when the destination is absent and every previous identity and digest matches. A replacement destination requires its exact `claim.json` identity and unchanged published bytes before manual removal. Preserve the backup when either check fails. Restore `installed.json` only from the same operation's verified `previous` entry. When `previous` is absent, remove `installed.json` only if its token and complete destination bytes identify this operation.
+
+Retire the stopped operation only after restoration and every identity and byte check succeeds. Remove its unchanged remaining stage files and empty stage directories. Remove its verified `claim.json`, `journal.json`, and matching `seal.json` when present, then its empty `operation-TOKEN` directory. Remove only the exact `software.lock` and `destination.lock` files whose paths and unchanged tokens match that journal. Keep `ownership.json`, restored `installed.json`, other operations, and the separate recovery copies. Retry the original skill command after retirement. Preserve all records when ownership or participant shutdown remains uncertain. There is no automatic recovery command.
 
 Ordinary `claude -p` loads the same configured context as an interactive session, including available skills unless disabled. By default, `--bare` skips automatic skill discovery. [Claude programmatic guidance](https://code.claude.com/docs/en/headless) owns bare-mode exceptions. Context use depends on listed metadata and activated instructions. Loading the skill does not authorize session starts or create an automatic workflow. The agent must receive a request authorizing the work it starts.
 

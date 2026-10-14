@@ -28,6 +28,7 @@ function overlayStaticSources(source: string): void {
   );
   fs.copyFileSync(path.join(extensionRoot, '../LICENSE'), path.join(source, '../LICENSE'));
   fs.cpSync(path.join(extensionRoot, '../plugins'), path.join(source, '../plugins'), { recursive: true });
+  fs.cpSync(path.join(extensionRoot, '../cli/skills'), path.join(source, '../cli/skills'), { recursive: true });
   for (const file of [
     'extension.ts',
     'bundledsetup.ts',
@@ -133,6 +134,11 @@ test('build identity covers host, browser, worker, and version inputs', () => {
         'scripts/bundled-tools.mjs',
         '../LICENSE',
         '../plugins/arc-hooks/LICENSE',
+        ...fs
+          .readdirSync(path.join(extensionRoot, '../cli/skills/arc-sessions'), { recursive: true })
+          .map(String)
+          .filter((file) => fs.statSync(path.join(extensionRoot, '../cli/skills/arc-sessions', file)).isFile())
+          .map((file) => '../cli/skills/arc-sessions/' + file),
         ...Object.keys(readToolPackage(path.join(extensionRoot, 'dist')).payload.files)
           .filter((file) => file.startsWith('plugin/') && file !== 'plugin/LICENSE')
           .map((file) => '../plugins/arc-hooks/' + file.slice(7)),
@@ -457,6 +463,36 @@ test('CPU profiles stay out of extension packages', () => {
     patterns.includes('**/*.cpuprofile*'),
     'a CPU profile captured in the extension directory would be included in the package',
   );
+});
+
+test('the canonical session skill ships as regular exact files with independent build identity', () => {
+  const source = path.join(extensionRoot, '../cli/skills/arc-sessions');
+  const dist = path.join(extensionRoot, 'dist');
+  const payload = readToolPackage(dist).payload;
+  const expected = fs
+    .readdirSync(source, { recursive: true })
+    .map(String)
+    .filter((file) => fs.lstatSync(path.join(source, file)).isFile())
+    .map((file) => file.split(path.sep).join('/'))
+    .sort();
+  assert.ok(expected.includes('SKILL.md'));
+  assert.deepEqual(
+    Object.keys(payload.files)
+      .filter((file) => file.startsWith('skills/'))
+      .sort(),
+    expected.map((file) => 'skills/arc-sessions/' + file),
+  );
+  for (const relative of expected) {
+    const file = path.join(dist, 'tools/skills/arc-sessions', relative);
+    assert.equal(fs.lstatSync(file).isFile(), true);
+    assert.equal(fs.lstatSync(file).isSymbolicLink(), false);
+    const bytes = fs.readFileSync(path.join(source, relative));
+    assert.deepEqual(fs.readFileSync(file), bytes);
+    assert.equal(
+      payload.files['skills/arc-sessions/' + relative].sha256,
+      createHash('sha256').update(bytes).digest('hex'),
+    );
+  }
 });
 
 test('the extension package contains exactly the intended files', () => {

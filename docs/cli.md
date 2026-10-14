@@ -34,6 +34,10 @@ arc cost SESSION_ID --by-model
 
 `--version` takes precedence over every other argument. `--help`, the `help` command, and no arguments print the sectioned overview. `arc COMMAND --help` prints command syntax, flags, output fields, refusals, and an example. Nested commands accept help, including `arc label add --help` and `arc compact request --help`. Help reads no stdin and performs no window discovery, network access, or filesystem mutations.
 
+## Personal skill setup
+
+`skills install`, `skills update`, and `skills remove` work without an Arc window, network, hooks, or authentication. Each requires repeatable `--agent claude` or `--agent codex`. JSON reports each destination independently. Invalid selectors exit 2 before writes. Failed or incomplete destinations exit 1. Handled HUP, INT, and TERM exit 129, 130, and 143 after filesystem settlement. Repeated signals preserve the first cancellation. [Skill installation and recovery](arc-sessions.md#install-the-parts-you-need) owns destination and preservation rules.
+
 ## Windows
 
 The command lists live window identifiers, workspace folders, repository scope readiness, panel readiness, and panel visibility. Folderless windows appear with no folders. Human output names the panel as visible, hidden, or not ready. Scope reads ready or loading. JSON contains `version: 1`, a `windows` array, and `complete`. Neither format includes channel addresses or tokens. An empty array means no verified live window. `complete: false` means discovery left entries unvisited or registered hosts unavailable. Human output names incomplete discovery, including when no host answered.

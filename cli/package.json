@@ -25,7 +25,7 @@
   "files": [
     "dist/arc.cjs",
     "dist/windowpipe.exe",
-    "skills/arc-sessions/SKILL.md",
+    "skills/arc-sessions/",
     "README.md",
     "LICENSE"
   ],

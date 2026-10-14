@@ -29,7 +29,446 @@ function gitBashExecutable() {
 
 const bashExecutable = gitBashExecutable();
 
+// Compile the actual command once. Every source fixture executes this implementation.
+const skillCLI = require('../extension/node_modules/esbuild').buildSync({
+  entryPoints: [path.join(__dirname, '../cli/src/main.ts')],
+  bundle: true,
+  platform: 'node',
+  format: 'cjs',
+  write: false,
+}).outputFiles[0].contents;
 const catalogUrl = 'https://github.com/glin/arc/releases/latest/download/arc-marketplace.json';
+
+test.each([[['codex']], [['claude']], [['claude', 'codex']]])(
+  'downloaded source installs stable selected skills through the real compiled CLI with independent hooks (%j)',
+  (agents) => {
+    const f = installerFixture();
+    try {
+      const args = ['--remote', '--no-hooks', ...agents.flatMap((agent) => ['--skill-agent', agent]), 'code'];
+      const result = f.run(args, { CLAUDE_CONFIG_DIR: '' }, { skills: true });
+      assert.equal(result.status, 0, result.stdout + result.stderr);
+      assert.deepEqual(fs.readdirSync(f.temporary), []);
+      fs.rmSync(f.source, { recursive: true });
+      for (const agent of agents) {
+        const file = path.join(f.dir, agent === 'claude' ? '.claude' : '.agents', 'skills/arc-sessions/SKILL.md');
+        assert.deepEqual(
+          fs.readFileSync(file),
+          fs.readFileSync(path.join(__dirname, '../cli/skills/arc-sessions/SKILL.md')),
+        );
+        assert.equal(fs.lstatSync(file).isSymbolicLink(), false);
+      }
+      assert.match(result.stdout, /"skills":"completed"/);
+      const receipt = JSON.parse(result.stdout.trim().split('\n').at(-1));
+      assert.deepEqual(receipt.selectedAgents, agents);
+      assert.deepEqual(receipt.editors, [{ editor: 'code', status: 'completed' }]);
+      assert.doesNotMatch(result.commands, /claude plugin/);
+    } finally {
+      f.cleanup();
+    }
+  },
+);
+
+test('Git Bash cancellation after skill child success retains source until exit and preserves completed receipt', () => {
+  const f = installerFixture();
+  try {
+    const script = path.join(f.source, 'install.sh');
+    fs.writeFileSync(
+      script,
+      fs
+        .readFileSync(script, 'utf8')
+        .replaceAll('\r\n', '\n')
+        .replace(
+          '    ARC_INSTALL_CHILD=\'\'\n    return "$status"',
+          () =>
+            '    if [ -f "$ARC_INSTALL_TEMP/skills.json" ]; then\n      kill -TERM "$$"\n      kill -HUP "$$"\n      [ -f "$REPO/extension/dist/cli.cjs" ] || return 98\n      echo child-exit-source-retained >> "$ARC_TEST_LOG"\n    fi\n    ARC_INSTALL_CHILD=\'\'\n    return "$status"',
+        ),
+    );
+    assert.match(fs.readFileSync(script, 'utf8'), /kill -TERM "\$\$"\n      kill -HUP "\$\$"/);
+    const result = f.run(['--no-hooks', '--skill-agent', 'codex', 'code'], { CLAUDE_CONFIG_DIR: '' }, { skills: true });
+    assert.equal(result.status, 143, result.stdout + result.stderr);
+    assert.match(result.commands, /child-exit-source-retained/);
+    assert.match(result.stdout, /"skills":"completed"/);
+    assert.match(result.stdout, /"cancellation":143/);
+    assert.deepEqual(fs.readdirSync(f.temporary), []);
+    assert.deepEqual(
+      fs.readFileSync(path.join(f.dir, '.agents/skills/arc-sessions/SKILL.md')),
+      fs.readFileSync(path.join(__dirname, '../cli/skills/arc-sessions/SKILL.md')),
+    );
+  } finally {
+    f.cleanup();
+  }
+});
+
+for (const mode of ['local', 'remote'])
+  test(`${mode} handled cancellation before temporary allocation stops without a download failure`, () => {
+    for (const [first, second, status] of [
+      ['TERM', 'HUP', 143],
+      ['HUP', 'INT', 129],
+      ['INT', 'TERM', 130],
+    ]) {
+      const f = installerFixture();
+      try {
+        const script = path.join(f.source, 'install.sh');
+        const original = fs.readFileSync(script, 'utf8').replaceAll('\r\n', '\n');
+        const changed = original.replace(
+          '  hook_source="$marketplace_url"',
+          () =>
+            `  hook_source="$marketplace_url"\n  echo acknowledged-before-temp >> "$ARC_TEST_LOG"\n  kill -${first} "$$"\n  kill -${second} "$$"`,
+        );
+        assert.notEqual(changed, original);
+        fs.writeFileSync(script, changed);
+        const allocator = path.join(f.bin, 'mktemp');
+        fs.writeFileSync(
+          allocator,
+          fs.readFileSync(allocator, 'utf8').replace('exec ', 'echo temporary-allocation >> "$ARC_TEST_LOG"\nexec '),
+        );
+        const result = f.run(
+          [`--${mode}`, '--skill-agent', 'claude', '--skill-agent', 'codex', 'code'],
+          { CLAUDE_CONFIG_DIR: '' },
+          { skills: true },
+        );
+        assert.equal(result.status, status, result.stdout + result.stderr);
+        assert.equal(result.commands.trim(), 'acknowledged-before-temp');
+        assert.doesNotMatch(result.stderr, /download failed|extraction failed/);
+        const receipt = JSON.parse(result.stdout.trim().split('\n').at(-1));
+        assert.deepEqual(receipt.selectedAgents, ['claude', 'codex']);
+        assert.deepEqual(receipt.editors, []);
+        assert.deepEqual(receipt.components, { editors: 'unattempted', skills: 'cancelled', hooks: 'cancelled' });
+        assert.equal(receipt.cancellation, status);
+        assert.equal(receipt.skills, undefined);
+        assert.deepEqual(fs.readdirSync(f.temporary), []);
+      } finally {
+        f.cleanup();
+      }
+    }
+  });
+
+test.each([
+  ['revision', '    if ! run_child curl --fail', /curl|tar-attempt|package/],
+  [
+    'archive',
+    '    if ! run_child curl --fail --location --silent --show-error --connect-timeout 15 --max-time 900 "https://codeload',
+    /codeload|tar-attempt|package/,
+  ],
+  ['extraction', '    if ! run_child tar -xzf', /tar-attempt|package/],
+  ['packaging', '  if ! run_child node scripts/package.mjs', /package/],
+  ['version', '  version="$(node -p', /editor|legacy-migration/],
+])('cancelled %s admission reports cancellation without an unattempted child failure', (phase, boundary, forbidden) => {
+  const f = installerFixture();
+  try {
+    const script = path.join(f.source, 'install.sh');
+    const original = fs.readFileSync(script, 'utf8').replaceAll('\r\n', '\n');
+    const changed = original.replace(boundary, () =>
+      phase === 'version'
+        ? `  export ARC_TEST_INSTALLER_PID="$$"\n${boundary}`
+        : `  echo cancelled-at-admission >> "$ARC_TEST_LOG"\n  kill -TERM "$$"\n  kill -HUP "$$"\n${boundary}`,
+    );
+    assert.notEqual(changed, original);
+    fs.writeFileSync(script, changed);
+    if (phase === 'version') {
+      const node = path.join(f.bin, 'node');
+      fs.writeFileSync(
+        node,
+        fs
+          .readFileSync(node, 'utf8')
+          .replace(
+            'exec ',
+            'if [ "$1" = -p ]; then echo cancelled-at-admission >> "$ARC_TEST_LOG"; kill -TERM "$ARC_TEST_INSTALLER_PID"; fi\nexec ',
+          ),
+      );
+    }
+    const tar = path.join(f.bin, 'tar');
+    fs.writeFileSync(tar, fs.readFileSync(tar, 'utf8').replace('exec ', 'echo tar-attempt >> "$ARC_TEST_LOG"\nexec '));
+    const result = f.run(
+      ['--remote', '--skill-agent', 'claude', '--skill-agent', 'codex', 'code'],
+      { CLAUDE_CONFIG_DIR: '' },
+      { skills: true },
+    );
+    assert.equal(result.status, 143, result.stdout + result.stderr);
+    assert.match(result.commands, /cancelled-at-admission/);
+    assert.doesNotMatch(result.commands.split('cancelled-at-admission\n')[1], forbidden);
+    assert.doesNotMatch(result.stderr, /download failed|extraction failed|packaging failed|no editor installed Arc/);
+    const receipt = JSON.parse(result.stdout.trim().split('\n').at(-1));
+    assert.deepEqual(receipt.selectedAgents, ['claude', 'codex']);
+    assert.deepEqual(receipt.editors, []);
+    assert.deepEqual(receipt.components, { editors: 'unattempted', skills: 'cancelled', hooks: 'cancelled' });
+    assert.equal(receipt.cancellation, 143);
+    assert.deepEqual(fs.readdirSync(f.temporary), []);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test.each(['before-version', 'version-child', 'validation-child'])(
+  'marketplace preflight %s cancellation stops probes and preserves the cancellation receipt',
+  (phase) => {
+    const f = installerFixture();
+    try {
+      const script = path.join(f.source, 'install.sh');
+      const original = fs.readFileSync(script, 'utf8').replaceAll('\r\n', '\n');
+      const changed = original.replace(
+        '  hook_source="$marketplace_url"',
+        () =>
+          `  export ARC_TEST_INSTALLER_PID="$$"\n  hook_source="$marketplace_url"${phase === 'before-version' ? '\n  kill -INT "$$"\n  kill -TERM "$$"' : ''}`,
+      );
+      assert.notEqual(changed, original);
+      fs.writeFileSync(script, changed);
+      const claude = path.join(f.bin, 'claude');
+      fs.writeFileSync(
+        claude,
+        fs
+          .readFileSync(claude, 'utf8')
+          .replace(
+            'exec ',
+            phase === 'version-child'
+              ? 'if [ "$1" = --version ]; then echo version-attempt >> "$ARC_TEST_LOG"; kill -INT "$ARC_TEST_INSTALLER_PID"; kill -TERM "$ARC_TEST_INSTALLER_PID"; else exec '
+              : 'echo version-attempt >> "$ARC_TEST_LOG"\nexec ',
+          ) + (phase === 'version-child' ? '\nfi\n' : ''),
+      );
+      const node = path.join(f.bin, 'node');
+      fs.writeFileSync(
+        node,
+        fs
+          .readFileSync(node, 'utf8')
+          .replace(
+            'exec ',
+            `if [[ "$1" = -e && "$2" = *'m=process.argv[1].match'* ]]; then\n  echo validation-attempt >> "$ARC_TEST_LOG"\n${phase === 'validation-child' ? '  kill -INT "$ARC_TEST_INSTALLER_PID"\n  kill -TERM "$ARC_TEST_INSTALLER_PID"\n' : ''}fi\nexec `,
+          ),
+      );
+      const result = f.run(
+        ['--marketplace-url', catalogUrl, '--skill-agent', 'claude', '--skill-agent', 'codex', 'code'],
+        { CLAUDE_CONFIG_DIR: '', ARC_TEST_CLAUDE_VERSION: 'invalid' },
+        { skills: true },
+      );
+      assert.equal(result.status, 130, result.stdout + result.stderr);
+      assert.equal(
+        result.commands.trim(),
+        phase === 'before-version'
+          ? ''
+          : phase === 'version-child'
+            ? 'version-attempt'
+            : 'version-attempt\nclaude --version\nvalidation-attempt',
+      );
+      assert.doesNotMatch(result.stderr, /require Claude Code|download failed|extraction failed/);
+      const receipt = JSON.parse(result.stdout.trim().split('\n').at(-1));
+      assert.deepEqual(receipt.selectedAgents, ['claude', 'codex']);
+      assert.deepEqual(receipt.editors, []);
+      assert.deepEqual(receipt.components, { editors: 'unattempted', skills: 'cancelled', hooks: 'cancelled' });
+      assert.equal(receipt.cancellation, 130);
+      assert.deepEqual(fs.readdirSync(f.temporary), []);
+    } finally {
+      f.cleanup();
+    }
+  },
+);
+
+test('downloaded bundled hook cancellation awaits the acknowledged child before source cleanup', () => {
+  const f = installerFixture();
+  try {
+    const watcher = path.join(f.dir, 'hook-wait.cjs');
+    fs.writeFileSync(
+      watcher,
+      String.raw`const fs = require('node:fs');
+const path = require('node:path');
+const root = process.env.ARC_TEST_ROOT;
+const release = path.join(root, 'hook-release');
+const setup = process.argv[2];
+fs.writeFileSync(path.join(root, 'hook-ready'), process.cwd());
+const observer = fs.watch(path.join(root, 'temporary'), check);
+const control = fs.watch(root, check);
+const deadline = setTimeout(() => finish('hook-deadline', 98), 10000);
+function finish(message, status) {
+  fs.appendFileSync(process.env.ARC_TEST_LOG, message + '\n');
+  observer.close(); control.close(); clearTimeout(deadline); process.exitCode = status;
+}
+function check() {
+  if (!fs.existsSync(setup)) finish('hook-source-lost', 98);
+  else if (fs.existsSync(release)) finish('hook-child-settled', 0);
+}
+check();`,
+    );
+    const node = path.join(f.bin, 'node');
+    const originalNode = fs.readFileSync(node, 'utf8');
+    fs.writeFileSync(
+      node,
+      originalNode.replace(
+        'exec "$ARC_TEST_REAL_NODE" "$@"',
+        'if [[ "$1" == */dist/setup.cjs ]]; then "$ARC_TEST_REAL_NODE" "$ARC_TEST_ROOT/hook-wait.cjs" "$1" || exit $?; fi\nexec "$ARC_TEST_REAL_NODE" "$@"',
+      ),
+    );
+    const script = path.join(f.source, 'install.sh');
+    const original = fs.readFileSync(script, 'utf8').replaceAll('\r\n', '\n');
+    const injection = String.raw`    if [[ "$*" == *'/dist/setup.cjs'* ]]; then
+      boundary_deadline=$((SECONDS + 10))
+      while [ ! -f "$ARC_TEST_ROOT/hook-ready" ]; do
+        if [ "$SECONDS" -ge "$boundary_deadline" ]; then return 98; fi
+      done
+      kill -TERM "$$"
+      kill -HUP "$$"
+      kill -TERM "$BASHPID"
+      [ -f "$REPO/extension/dist/setup.cjs" ] || return 98
+      echo released > "$ARC_TEST_ROOT/hook-release"
+    fi
+`;
+    const changed = original.replace('    ARC_INSTALL_CHILD=$!\n', () => '    ARC_INSTALL_CHILD=$!\n' + injection);
+    assert.notEqual(changed, original);
+    fs.writeFileSync(script, changed);
+    const result = f.run(['--remote', 'code'], { CLAUDE_CONFIG_DIR: '' });
+    assert.match(result.commands, /hook-child-settled/);
+    assert.doesNotMatch(result.commands, /hook-source-lost|hook-deadline/);
+    assert.equal(result.status, 143, result.stdout + result.stderr);
+    const receipt = JSON.parse(result.stdout.trim().split('\n').at(-1));
+    assert.equal(receipt.components.hooks, 'completed');
+    assert.equal(receipt.cancellation, 143);
+    assert.equal(fs.readFileSync(path.join(f.dir, 'hook-ready'), 'utf8'), path.join(f.dir, 'unrelated'));
+    assert.deepEqual(fs.readdirSync(f.temporary), []);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('skill selector conflicts refuse before build or native writes', () => {
+  const f = installerFixture();
+  try {
+    for (const args of [['--skill-agent'], ['--skill-agent', 'other'], ['--no-skills', '--skill-agent', 'codex']]) {
+      const result = f.run([...args, 'code'], {}, { skills: true });
+      assert.equal(result.status, 2, result.stderr);
+      assert.doesNotMatch(result.commands, /npm|editor/);
+      assert.equal(fs.existsSync(path.join(f.dir, '.agents/skills')), false);
+    }
+  } finally {
+    f.cleanup();
+  }
+});
+
+test.each(['none', 'codex', 'claude', 'both', 'missing-hook', 'old-hook', 'bad-marketplace', 'no-skills'])(
+  'detected provider %s retains independent skill and editor outcomes',
+  (mode) => {
+    const f = installerFixture();
+    try {
+      if (['none', 'codex', 'missing-hook'].includes(mode)) fs.unlinkSync(path.join(f.bin, 'claude'));
+      if (['codex', 'both'].includes(mode))
+        fs.writeFileSync(path.join(f.bin, 'codex'), '#!/bin/bash\nexit 0\n', { mode: 0o755 });
+      const hooks = ['missing-hook', 'old-hook', 'bad-marketplace'].includes(mode);
+      const args = hooks
+        ? ['--skill-agent', 'codex', '--marketplace-url', catalogUrl, 'code']
+        : ['--no-hooks', ...(mode === 'no-skills' ? ['--no-skills'] : []), 'code'];
+      const result = f.run(
+        args,
+        {
+          CLAUDE_CONFIG_DIR: '',
+          ...(mode === 'old-hook' ? { ARC_TEST_CLAUDE_VERSION: '2.1.223' } : {}),
+          ...(mode === 'bad-marketplace' ? { ARC_TEST_FAIL_COMMAND: 'plugin marketplace list --json' } : {}),
+        },
+        { skills: true },
+      );
+      assert.equal(result.status, hooks ? 1 : 0, result.stdout + result.stderr);
+      assert.match(result.commands, /editor code/);
+      const expected = hooks
+        ? ['codex']
+        : mode === 'both'
+          ? ['claude', 'codex']
+          : ['none', 'no-skills'].includes(mode)
+            ? []
+            : [mode];
+      for (const agent of ['claude', 'codex'])
+        assert.equal(
+          fs.existsSync(path.join(f.dir, agent === 'claude' ? '.claude' : '.agents', 'skills/arc-sessions/SKILL.md')),
+          expected.includes(agent),
+        );
+      if (hooks) assert.match(result.stdout, /"hooks":"failed"/);
+      const receipt = JSON.parse(result.stdout.trim().split('\n').at(-1));
+      assert.deepEqual(receipt.selectedAgents, expected);
+      assert.deepEqual(receipt.editors, [{ editor: 'code', status: 'completed' }]);
+    } finally {
+      f.cleanup();
+    }
+  },
+);
+
+test.each([
+  'plugin marketplace list --json',
+  'plugin marketplace add',
+  'plugin marketplace update arc',
+  'plugin install arc-hooks@arc --scope user',
+  '--plugin-report',
+])('cancellation refuses later build, hook mutations and legacy cleanup after child settlement (%s)', (command) => {
+  const f = installerFixture();
+  try {
+    const script = path.join(f.source, 'install.sh');
+    const injection = `    if [[ "$*" == *'${command}'* ]]; then\n      kill -TERM "$$"\n      echo cancelled-after-child >> "$ARC_TEST_LOG"\n    fi\n`;
+    const original = fs.readFileSync(script, 'utf8').replaceAll('\r\n', '\n');
+    const changed = original.replace(
+      '    ARC_INSTALL_CHILD=\'\'\n    return "$status"',
+      () => injection + '    ARC_INSTALL_CHILD=\'\'\n    return "$status"',
+    );
+    assert.notEqual(changed, original);
+    fs.writeFileSync(script, changed);
+    if (command === '--plugin-report') {
+      const helper = path.join(f.source, 'scripts/install-claude-hooks.sh');
+      const originalHelper = fs.readFileSync(helper, 'utf8').replaceAll('\r\n', '\n');
+      const report = `  printf '%s' "$plugins" | node "$repo/scripts/check-claude-marketplace.js" --plugin-report "$catalog" "$source_type"`;
+      const changedHelper = originalHelper.replace(
+        report,
+        () => `${report}\n  kill -TERM "$$"\n  echo cancelled-after-child >> "$ARC_TEST_LOG"`,
+      );
+      assert.notEqual(changedHelper, originalHelper);
+      fs.writeFileSync(helper, changedHelper);
+    }
+    const result = f.run(['code']);
+    assert.equal(result.status, 143, result.stdout + result.stderr);
+    assert.match(result.commands, /cancelled-after-child/);
+    assert.doesNotMatch(
+      result.stderr,
+      /snapshot plugin setup failed|legacy hook settings need manual review|Claude rejected|hosted catalog is unavailable/,
+    );
+    const receipt = JSON.parse(result.stdout.trim().split('\n').at(-1));
+    assert.equal(receipt.components.hooks, command === '--plugin-report' ? 'completed' : 'cancelled');
+    assert.equal(receipt.cancellation, 143);
+    assert.doesNotMatch(result.stdout, /==> Installed Arc\./);
+    assert.doesNotMatch(result.commands, /legacy-migration/);
+    if (command.includes('list')) assert.doesNotMatch(result.commands, /npm|editor/);
+    else if (command.includes('marketplace update'))
+      assert.doesNotMatch(result.commands, /plugin (install|update|enable)/);
+    else if (command !== '--plugin-report') assert.doesNotMatch(result.commands, /plugin (update|enable)/);
+    assert.equal(fs.readFileSync(f.settings, 'utf8'), f.legacy);
+    assert.deepEqual(fs.readdirSync(f.temporary), []);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('cancelled skill child reports cancellation and prevents later hooks', () => {
+  const f = installerFixture();
+  try {
+    fs.writeFileSync(path.join(f.source, 'extension/dist/cli.cjs'), 'process.exit(130);');
+    const result = f.run(['--skill-agent', 'codex', 'code'], { CLAUDE_CONFIG_DIR: '' }, { skills: true });
+    assert.equal(result.status, 130, result.stdout + result.stderr);
+    const receipt = JSON.parse(result.stdout.trim().split('\n').at(-1));
+    assert.equal(receipt.components.skills, 'cancelled');
+    assert.equal(receipt.components.editors, 'completed');
+    assert.equal(receipt.cancellation, 130);
+    assert.doesNotMatch(result.commands, /plugin marketplace update|legacy-migration/);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('missing selected editor refuses globally before build', () => {
+  const f = installerFixture();
+  try {
+    fs.appendFileSync(
+      path.join(f.source, 'scripts/editor-cli.sh'),
+      "\nresolve_editor_cli() { printf '%s\\n' 'missing-resolved-editor'; }\n",
+    );
+    const result = f.run(['--no-hooks', 'code']);
+    assert.equal(result.status, 2, result.stdout + result.stderr);
+    assert.match(result.stderr, /editor CLI not found: missing-resolved-editor/);
+    assert.doesNotMatch(result.commands, /npm|editor/);
+  } finally {
+    f.cleanup();
+  }
+});
 
 function installerFixture() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'arc-source-install-'));
@@ -51,6 +490,7 @@ function installerFixture() {
   for (const name of ['editor-cli.sh', 'register-hooks.js', 'install-claude-hooks.sh', 'check-claude-marketplace.js'])
     fs.copyFileSync(path.join(__dirname, name), path.join(source, 'scripts', name));
   fs.cpSync(path.join(__dirname, '..', 'plugins'), path.join(source, 'plugins'), { recursive: true });
+  fs.cpSync(path.join(__dirname, '..', 'cli', 'skills'), path.join(source, 'cli', 'skills'), { recursive: true });
   fs.copyFileSync(
     path.join(__dirname, '..', '.claude-plugin', 'marketplace.json'),
     path.join(source, '.claude-plugin', 'marketplace.json'),
@@ -124,7 +564,7 @@ echo "editor ${name} $*" >> "$ARC_TEST_LOG"
   assert.equal(built.status, 0, built.stderr);
   const dist = path.join(source, 'extension', 'dist');
   fs.mkdirSync(dist);
-  fs.writeFileSync(path.join(dist, 'cli.cjs'), '');
+  fs.writeFileSync(path.join(dist, 'cli.cjs'), skillCLI);
   fs.writeFileSync(path.join(dist, 'windowpipe.exe'), 'fixture helper');
   fs.copyFileSync(path.join(__dirname, '..', 'LICENSE'), path.join(source, 'LICENSE'));
   const setup = require('../extension/node_modules/esbuild').buildSync({
@@ -259,7 +699,7 @@ const url = args.find(a => a.startsWith('https:'));
 fs.appendFileSync(process.env.ARC_TEST_LOG, 'curl ' + args.join(' ') + '\n');
 if (process.env.ARC_TEST_HTTP_FAILURE && url.includes(process.env.ARC_TEST_HTTP_FAILURE)) process.exit(28);
 const output = args[args.indexOf('--output')+1];
-if (url.startsWith('https://api.github.com/')) fs.writeFileSync(output, JSON.stringify({sha:'a'.repeat(40)}));
+if (url.startsWith('https://api.github.com/')) fs.writeFileSync(output, JSON.stringify({sha:process.env.ARC_TEST_BAD_REVISION ? 'invalid' : 'a'.repeat(40)}));
 else if (process.env.ARC_TEST_BAD_ARCHIVE) fs.writeFileSync(output,'invalid archive');
 else fs.copyFileSync(process.env.ARC_TEST_SOURCE_ARCHIVE,output);
 `,
@@ -327,7 +767,7 @@ else fs.copyFileSync(process.env.ARC_TEST_SOURCE_ARCHIVE,output);
         root,
       };
     },
-    run(args = ['code'], env = {}, { stdin = false, cwd = unrelated, terminalInput, scriptFile } = {}) {
+    run(args = ['code'], env = {}, { stdin = false, cwd = unrelated, terminalInput, scriptFile, skills = false } = {}) {
       fs.writeFileSync(log, '');
       let input;
       if (stdin) {
@@ -347,6 +787,7 @@ else fs.copyFileSync(process.env.ARC_TEST_SOURCE_ARCHIVE,output);
         bashPath(bin),
         absoluteBash,
         ...(stdin ? ['-s', '--'] : [scriptFile ?? bashPath(source) + '/install.sh']),
+        ...(!skills ? ['--no-skills'] : []),
         ...args,
       ];
       const result = spawnSync(bashExecutable, command, {
@@ -377,6 +818,7 @@ else fs.copyFileSync(process.env.ARC_TEST_SOURCE_ARCHIVE,output);
           CLAUDE_CONFIG_DIR: path.dirname(settings),
           CODEX_HOME: codex,
           HOME: dir.replaceAll(String.fromCharCode(92), '/'),
+          USERPROFILE: dir,
           TMPDIR: bashPath(temporary),
           ...env,
         },
@@ -388,6 +830,51 @@ else fs.copyFileSync(process.env.ARC_TEST_SOURCE_ARCHIVE,output);
     },
   };
 }
+
+test('source setup refuses an incomplete checkout before building when its canonical session skill is absent', () => {
+  const f = installerFixture();
+  try {
+    fs.unlinkSync(path.join(f.source, 'cli/skills/arc-sessions/SKILL.md'));
+    const result = f.run(['--local', '--no-hooks', 'code']);
+    assert.equal(result.status, 2, result.stderr);
+    assert.match(result.stderr, /--local requires a complete Arc source directory/);
+    assert.doesNotMatch(result.commands, /npm |editor /);
+  } finally {
+    fs.rmSync(f.dir, { recursive: true, force: true });
+  }
+});
+
+test('downloaded incomplete source refuses globally before build or native installation', () => {
+  const f = installerFixture();
+  try {
+    fs.unlinkSync(path.join(f.source, 'cli/skills/arc-sessions/SKILL.md'));
+    const archive = spawnSync(
+      bashExecutable,
+      [
+        '-c',
+        'tar -czf "$1" -C "$2" "$3"',
+        'bash',
+        bashPath(f.dir) + '/source.tar.gz',
+        bashPath(f.dir),
+        path.basename(f.source),
+      ],
+      { encoding: 'utf8' },
+    );
+    assert.equal(archive.status, 0, archive.stderr);
+    const result = f.run(
+      ['--remote', '--no-hooks', '--skill-agent', 'codex', 'code'],
+      { CLAUDE_CONFIG_DIR: '' },
+      { skills: true },
+    );
+    assert.equal(result.status, 2, result.stdout + result.stderr);
+    assert.match(result.stderr, /downloaded archive lacks required Arc source files/);
+    assert.doesNotMatch(result.commands, /npm|editor/);
+    assert.equal(fs.existsSync(path.join(f.dir, '.agents/skills')), false);
+    assert.deepEqual(fs.readdirSync(f.temporary), []);
+  } finally {
+    f.cleanup();
+  }
+});
 
 test('local installation refreshes its directory marketplace and migrates owned legacy hooks after plugin success', () => {
   const f = installerFixture();
@@ -480,7 +967,7 @@ test('local installation accepts its canonical directory in flat and nested Clau
   }
 });
 
-test('local installation rejects unrelated directories and hosted marketplace ownership before building', () => {
+test('local hook ownership failures preserve successful editor installation', () => {
   const f = installerFixture();
   try {
     for (const entry of [
@@ -498,10 +985,7 @@ test('local installation rejects unrelated directories and hosted marketplace ow
       );
       const source = typeof entry.source === 'object' ? entry.source : entry;
       assert.ok(r.stderr.includes(source.path ?? source.url), r.stderr);
-      assert.doesNotMatch(
-        r.commands,
-        /npm|package|editor|plugin (?:marketplace (?:add|update|remove)|install|update|enable)/,
-      );
+      assert.doesNotMatch(r.commands, /plugin (?:marketplace (?:add|update|remove)|install|update|enable)/);
       assert.deepEqual(JSON.parse(fs.readFileSync(f.marketplaces)), [entry]);
       assert.equal(fs.readFileSync(f.settings, 'utf8'), f.legacy);
     }
@@ -561,7 +1045,7 @@ for (const failure of [
   'plugin list --json',
   'plugin enable arc-hooks@arc --scope user',
 ])
-  test(`prerequisite failures install nothing and hook failures preserve successful editor installation: ${failure}`, () => {
+  test(`hook failures preserve successful editor installation: ${failure}`, () => {
     const f = installerFixture();
     try {
       if (failure === 'missing') fs.unlinkSync(path.join(f.bin, 'claude'));
@@ -570,9 +1054,7 @@ for (const failure of [
       const r = f.run(['--marketplace-url', catalogUrl, 'code'], { ARC_TEST_FAIL_COMMAND: failure });
       assert.equal(r.status, 1, r.stderr);
       assert.doesNotMatch(r.stdout, /==> Installed Arc\./);
-      if (failure === 'missing' || failure === 'plugin marketplace list --json')
-        assert.doesNotMatch(r.commands, /npm|editor/);
-      else assert.match(r.commands, /editor code --install-extension/);
+      assert.match(r.commands, /editor code --install-extension/);
       assert.equal(fs.readFileSync(f.settings, 'utf8'), f.legacy);
       assert.deepEqual(fs.readdirSync(f.temporary), []);
     } finally {
@@ -598,7 +1080,7 @@ test('hosted catalog override never replaces another marketplace source', () => 
       assert.ok(r.stderr.includes(source.path ?? source.repo ?? source.url), r.stderr);
       assert.ok(r.stderr.includes(`Expected HTTPS catalog: ${override}`), r.stderr);
       assert.match(r.stderr, /--no-hooks.*preserve the existing Claude setup/);
-      assert.doesNotMatch(r.commands, /npm|package|editor/);
+      assert.match(r.commands, /editor code --install-extension/);
       assert.doesNotMatch(r.commands, /plugin (?:marketplace (?:add|update|remove)|install|update|enable)/);
       assert.equal(fs.readFileSync(f.settings, 'utf8'), f.legacy);
       assert.deepEqual(JSON.parse(fs.readFileSync(f.marketplaces)), [entry]);
@@ -639,6 +1121,12 @@ test('explicit editors retain success and report each failed target without choo
     assert.match(partial.commands, /editor code --install-extension/);
     assert.match(partial.commands, /editor cursor --install-extension/);
     assert.match(partial.stderr, /installation failed in cursor/);
+    const receipt = JSON.parse(partial.stdout.trim().split('\n').at(-1));
+    assert.deepEqual(receipt.editors, [
+      { editor: 'code', status: 'completed' },
+      { editor: 'cursor', status: 'failed' },
+    ]);
+    assert.equal(receipt.components.editors, 'partial');
     const failed = f.run(['code'], { ARC_TEST_FAIL_EDITOR: 'code' });
     assert.equal(failed.status, 1);
     assert.match(failed.commands, /claude plugin marketplace list --json/);
@@ -665,7 +1153,7 @@ test('stdin installation selects local source without Git and children cannot co
     assert.match(r.stdout, /==> Installed Arc\./);
     assert.match(r.stdout, /ARC_INSTALL_SCRIPT_TAIL/);
     const missing = f.run(['--local', 'code'], {}, { stdin: true });
-    assert.equal(missing.status, 1);
+    assert.equal(missing.status, 2);
     assert.match(missing.stderr, /--local requires/);
     fs.writeFileSync(f.marketplaces, '[]');
     fs.writeFileSync(f.plugins, '[]');
@@ -944,7 +1432,7 @@ test('the editor menu defaults to all and individual choices limit installation'
     }
     for (const terminalInput of ['0\n', '4\n', 'invalid\n', '999999999\n']) {
       const r = f.run(['--local'], {}, { stdin: true, cwd: f.source, terminalInput });
-      assert.equal(r.status, 1, r.stderr);
+      assert.equal(r.status, 2, r.stderr);
       assert.match(r.stderr, /select a listed editor number/);
       assert.doesNotMatch(r.commands, /npm|editor|claude plugin/);
     }
@@ -1106,12 +1594,21 @@ test('remote stdin installation from an unrelated directory cleans failures and 
       { ARC_TEST_HTTP_FAILURE: 'api.github' },
       { ARC_TEST_HTTP_FAILURE: 'codeload' },
       { ARC_TEST_BAD_ARCHIVE: '1' },
+      { ARC_TEST_BAD_REVISION: '1' },
       { ARC_TEST_INTERRUPT: '1' },
       { ARC_TEST_NPM_FAILURE: '1' },
       { ARC_TEST_PACKAGE_FAILURE: '1' },
     ]) {
       const r = f.run(['code'], env, { stdin: true });
-      assert.notEqual(r.status, 0, JSON.stringify(env));
+      assert.equal(
+        r.status,
+        env.ARC_TEST_INTERRUPT
+          ? 143
+          : env.ARC_TEST_HTTP_FAILURE || env.ARC_TEST_BAD_ARCHIVE || env.ARC_TEST_BAD_REVISION
+            ? 2
+            : 1,
+        r.stdout + r.stderr,
+      );
       assert.deepEqual(fs.readdirSync(f.temporary), []);
       assert.doesNotMatch(r.commands, /editor/);
     }
@@ -1132,7 +1629,8 @@ test('source installer rejects invalid options, missing tools, and old Claude be
       ['missing-editor'],
     ]) {
       const r = f.run(args);
-      assert.equal(r.status, 1, r.stderr);
+      assert.equal(r.status, 2, r.stderr);
+      assert.doesNotMatch(r.stdout, /^\{/m);
       assert.doesNotMatch(r.commands, /npm|editor|claude plugin|curl/);
     }
     const old = f.run(['--marketplace-url', catalogUrl, 'code'], { ARC_TEST_CLAUDE_VERSION: '2.1.223' });
@@ -1150,10 +1648,51 @@ test('source installer rejects invalid options, missing tools, and old Claude be
       const saved = fs.readFileSync(file);
       fs.unlinkSync(file);
       const r = f.run(['code']);
-      assert.equal(r.status, 1);
+      assert.equal(r.status, 2);
       assert.match(r.stderr, new RegExp(tool + ' is required'));
       fs.writeFileSync(file, saved, { mode: 0o755 });
     }
+  } finally {
+    f.cleanup();
+  }
+});
+
+test.each(['--help', '-h'])('source installer %s omits installation receipts and executable work', (option) => {
+  const f = installerFixture();
+  try {
+    const node = path.join(f.bin, 'node');
+    fs.writeFileSync(
+      node,
+      fs
+        .readFileSync(node, 'utf8')
+        .replace('exec "$ARC_TEST_REAL_NODE"', 'echo node >> "$ARC_TEST_LOG"\nexec "$ARC_TEST_REAL_NODE"'),
+    );
+    const result = f.run([option]);
+    assert.equal(result.status, 0, result.stdout + result.stderr);
+    assert.doesNotMatch(result.stdout, /^\{/m);
+    assert.equal(result.commands, '');
+    assert.deepEqual(fs.readdirSync(f.temporary), []);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('missing Node admission omits installation receipts and never attempts the missing executable', () => {
+  const f = installerFixture();
+  try {
+    fs.unlinkSync(path.join(f.bin, 'node'));
+    const script = path.join(f.source, 'install.sh');
+    fs.writeFileSync(
+      script,
+      'command_not_found_handle() { echo "missing-command $1" >> "$ARC_TEST_LOG"; return 127; }\n' +
+        fs.readFileSync(script, 'utf8'),
+    );
+    const result = f.run(['--no-hooks', 'code']);
+    assert.equal(result.status, 2, result.stdout + result.stderr);
+    assert.match(result.stderr, /node is required/);
+    assert.equal(result.commands, '');
+    assert.doesNotMatch(result.stdout, /^\{/m);
+    assert.deepEqual(fs.readdirSync(f.temporary), []);
   } finally {
     f.cleanup();
   }
@@ -1295,7 +1834,7 @@ exec "$ARC_TEST_REAL_NODE" "$@"
       ['23.0.0', true],
     ]) {
       const r = f.run(['--no-hooks', 'code'], { ARC_TEST_NODE_VERSION: version, ARC_TEST_NPM_FAILURE: '99' });
-      assert.equal(r.status, supported ? 99 : 1, r.stderr);
+      assert.equal(r.status, supported ? 99 : 2, r.stderr);
       if (supported) assert.match(r.commands, /npm install/);
       else {
         assert.match(r.stderr, /installation needs Node.js 22\.12\+/);

@@ -14,7 +14,15 @@ The package installs the `arc` command.
 
 ## Session skill
 
-The package includes `skills/arc-sessions/SKILL.md`. Link its directory into your agent's skill directory after installation. Claude Code uses `~/.claude/skills`. Codex uses `~/.agents/skills`.
+The package includes the canonical `skills/arc-sessions` directory and its resources. npm installation does not write native agent configuration. Install independent copies explicitly:
+
+```sh
+arc skills install --agent claude --agent codex
+arc skills update --agent claude --agent codex
+arc skills remove --agent claude --agent codex
+```
+
+These commands support default personal destinations. [Skill ownership and recovery](../docs/arc-sessions.md#install-the-parts-you-need) defines preserved copies and interruption handling. For a manually maintained custom destination, link the packaged directory. Claude Code uses `~/.claude/skills`. Codex uses `~/.agents/skills`.
 
 For a global Windows installation, run in PowerShell:
 

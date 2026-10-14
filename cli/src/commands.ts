@@ -1,6 +1,6 @@
 type Flag = readonly [syntax: string, description: string];
-type Section = 'Reading' | 'Starting and sending' | 'Curating' | 'Compaction' | 'Cost';
-type Route = 'statusline' | 'windows' | 'sessions' | 'management' | 'compact' | 'label' | 'cost';
+type Section = 'Reading' | 'Starting and sending' | 'Curating' | 'Compaction' | 'Cost' | 'Setup';
+type Route = 'statusline' | 'windows' | 'sessions' | 'management' | 'compact' | 'label' | 'cost' | 'skills';
 
 export interface Command {
   name: string;
@@ -122,6 +122,24 @@ function compact(action: 'request' | 'status'): Command {
 }
 
 export const COMMANDS: readonly Command[] = [
+  ...(['install', 'update', 'remove'] as const).map((action): Command => ({
+    name: `skills ${action}`,
+    section: 'Setup',
+    route: 'skills',
+    action,
+    help: {
+      summary: `${action === 'install' ? 'Install' : action === 'update' ? 'Update' : 'Remove'} the personal Arc session skill.`,
+      synopsis: `arc skills ${action} --agent claude|codex [--agent claude|codex]`,
+      flags: [['--agent claude|codex', 'Select a default personal skill directory. Repeat for both agents.']],
+      output: [
+        'JSON reports each destination independently. Exit 1 means incomplete work. Exit 2 means invalid arguments.',
+      ],
+      refusals: [
+        'Foreign, linked, edited, added, or uncertain owned files remain unchanged. Custom Claude roots are unsupported.',
+      ],
+      example: `arc skills ${action} --agent claude --agent codex`,
+    },
+  })),
   {
     name: 'statusline',
     section: 'Reading',
@@ -503,7 +521,7 @@ export function renderCommandHelp(command: Command): string {
 }
 
 export function renderOverviewHelp(): string {
-  const sections: Section[] = ['Reading', 'Starting and sending', 'Curating', 'Compaction', 'Cost'];
+  const sections: Section[] = ['Reading', 'Starting and sending', 'Curating', 'Compaction', 'Cost', 'Setup'];
   return [
     'Usage: arc COMMAND [OPTIONS]',
     '',

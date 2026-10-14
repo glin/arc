@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { readFile } from 'node:fs/promises';
+import { readFile, readdir } from 'node:fs/promises';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import yauzl from 'yauzl';
@@ -68,6 +68,28 @@ async function readArchive(file) {
 }
 
 const entries = await readArchive(archive);
+const skillSource = resolve(extensionRoot, '../cli/skills/arc-sessions');
+const skillFiles = (await readdir(skillSource, { recursive: true, withFileTypes: true }))
+  .filter((entry) => entry.isFile())
+  .map((entry) =>
+    join(entry.parentPath, entry.name)
+      .slice(skillSource.length + 1)
+      .replaceAll('\\', '/'),
+  )
+  .sort();
+assert.ok(skillFiles.includes('SKILL.md'), 'The canonical session skill lacks SKILL.md');
+assert.deepEqual(
+  [...entries.keys()].filter((file) => file.startsWith('extension/dist/tools/skills/')).sort(),
+  skillFiles.map((file) => `extension/dist/tools/skills/arc-sessions/${file}`),
+  'VSIX session skill paths differ from canonical source',
+);
+for (const file of skillFiles) {
+  assert.deepEqual(
+    entries.get(`extension/dist/tools/skills/arc-sessions/${file}`),
+    await readFile(join(skillSource, file)),
+    `VSIX session skill bytes differ from canonical source: ${file}`,
+  );
+}
 assert.deepEqual([...entries.keys()].sort(), expectedFiles.sort(), 'VSIX contents differ from the release allowlist');
 for (const [file, metadata] of Object.entries(identity.tools.files)) {
   assert.equal(

@@ -95,6 +95,7 @@ export function readToolPackage(dist: string, platform = process.platform): Tool
     'plugin/hooks/hooks.json',
     'LICENSE',
     'plugin/LICENSE',
+    'skills/arc-sessions/SKILL.md',
     `launchers/${ARC_IDENTITY.commandPrefix}`,
     `launchers/${ARC_IDENTITY.commandPrefix}.cmd`,
   ])
