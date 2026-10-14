@@ -155,9 +155,26 @@ export const COMMANDS: readonly Command[] = [
     route: 'dispatch',
     action,
     help: {
-      summary: `Read or consume a retained dispatch event with ${action}.`,
+      summary: (
+        {
+          result: 'Read one frozen dispatch report and its saved disposition.',
+          status: 'List one bounded page of dispatch events.',
+          wait: 'Wait for a dispatch observation until the deadline or disconnect.',
+          claim: 'Claim one dispatch event or recover the same owner token.',
+          ack: 'Save the disposition for one claimed dispatch event.',
+          refresh: 'Publish changed private report observations without sending input.',
+          recover: 'Observe retained hosted delivery without sending input.',
+          monitor: 'Report unavailable standalone monitoring.',
+        } as Record<string, string>
+      )[action],
       synopsis: `arc dispatch ${action} LAUNCH_ID${['result', 'claim', 'ack', 'recover'].includes(action) ? ' --event EVENT_ID' : ''}${['claim', 'ack'].includes(action) ? ' --origin ORIGIN_ID --owner OWNER_ID' : ''}${action === 'ack' ? ' --token TOKEN --outcome-file FILE' : ''} [--json]`,
       flags: [
+        ...(['status', 'refresh'].includes(action)
+          ? ([
+              ['--cursor CURSOR', 'Continue with the previous page next value.'],
+              ['--limit 1-128', 'Maximum events on this page. Default: 32.'],
+            ] as Flag[])
+          : []),
         ...(action === 'wait'
           ? ([
               ['--deadline-ms MILLISECONDS', 'Wait 1 through 110000 milliseconds. The default is 110000.'],

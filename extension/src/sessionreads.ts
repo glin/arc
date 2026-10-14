@@ -29,8 +29,19 @@ import { READ_OBSERVATION_BYTES, type ReadObservationFacts } from './sessionwrit
 import { READ_LIMIT, type AgentReadSource } from './domain/read.ts';
 import { createClaudeRepeatedFilter } from './clauderepeated.ts';
 import { meterRead } from './readmeter.ts';
+import { beginForwardSessionRecovery, type IncrementalSessionResult, type ForwardRecoveryControl } from './history';
 
 export const SESSION_READ_LIMITS = { turns: 20, bytes: 512 * 1024, outputBytes: 48 * 1024 } as const;
+
+const dispatchEvidence = new Map<
+  string,
+  {
+    revision: string;
+    scan: Generator<void, IncrementalSessionResult<unknown>>;
+    control: ForwardRecoveryControl;
+    result?: IncrementalSessionResult<unknown>;
+  }
+>();
 
 export function savedDispatchResponse(
   source: SessionFile | null,
@@ -47,21 +58,72 @@ export function savedDispatchResponse(
     source.ino !== stat.ino
   )
     return null;
-  const options = { tailBytes: SESSION_READ_LIMITS.bytes - 64 * 1024, maxTurns: 20, turnsOnly: true };
-  const read =
-    source.agent === 'codex'
-      ? readCodexSession(source.file, source.sessionId, options)
-      : readSession(source.file, source.sessionId, { ...options, boundedRepeated: true });
+  const key = JSON.stringify([source.agent, source.sessionId, source.file]);
+  let held = dispatchEvidence.get(key);
+  if (!held || held.revision !== before) {
+    const control: ForwardRecoveryControl = {
+      through: 0,
+      readBytes: 0,
+      retainedCharge: 0,
+      retainedLimit: 64 * 1024 * 1024,
+      recordLimit: 8 * 1024 * 1024,
+      reduceAbove: 8 * 1024 * 1024,
+      accepts: () => true,
+      fragments: [],
+      fragmentBytes: 0,
+    };
+    const options = {
+      maxTurns: 20,
+      turnsOnly: true,
+      dispatchResponse: true,
+      childTranscript: source.childTranscript === true,
+    };
+    held = {
+      revision: before,
+      control,
+      scan: beginForwardSessionRecovery<unknown>(
+        source.file,
+        source.agent,
+        source.sessionId,
+        () =>
+          source.agent === 'codex'
+            ? createCodexSessionReducer(source.sessionId, options)
+            : createClaudeSessionReducer(source.sessionId, options),
+        { chunkBytes: 64 * 1024, recovery: control },
+      ),
+    };
+    dispatchEvidence.delete(key);
+    dispatchEvidence.set(key, held);
+    while (dispatchEvidence.size > 32) dispatchEvidence.delete(dispatchEvidence.keys().next().value!);
+  }
+  if (!held.result) {
+    const through = held.control.through;
+    for (let steps = 0; steps < 512 && held.control.through - through < SESSION_READ_LIMITS.bytes; steps++) {
+      const next = held.scan.next();
+      if (next.done) {
+        held.result = next.value;
+        break;
+      }
+    }
+  }
+  const read = held.result?.read;
+  if (!read) return null;
   if (before !== guardedSourceRevision(source.file)) return null;
   const turn = source.agent === 'codex' ? read.turns.find((one) => one.promptId === nativeTurn) : read.turns[0];
-  if (!turn || (source.agent === 'claude' && (nativeTurn !== '1' || read.readBytes < source.size))) return null;
+  if (!turn || (source.agent === 'claude' && nativeTurn !== '1')) return null;
   return {
-    text: turn.summary,
+    text: source.agent === 'claude' ? (turn.finalResponse?.text ?? '') : turn.summary,
     prompt: turn.prompt,
     promptId: turn.promptId,
-    responseIds: turn.responseIds ?? [],
+    responseIds:
+      source.agent === 'claude'
+        ? turn.finalResponse?.sourceId
+          ? [turn.finalResponse.sourceId]
+          : []
+        : (turn.responseIds ?? []),
     finished: turn.finished,
-    failed: !!turn.error || turn.interrupted,
+    failed: !!turn.error,
+    interrupted: turn.interrupted,
   };
 }
 export type SessionAttention = Extract<SessionStatus, 'input' | 'unread' | 'running'> | 'idle' | 'unknown';

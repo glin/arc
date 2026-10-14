@@ -1,11 +1,21 @@
 import * as fs from 'node:fs';
 import { DispatchReceipts, DISPATCH_ID } from '../../extension/src/dispatchreceipts.ts';
-import { requestWindow } from '../../extension/src/sessionrequests.ts';
+import { requestWindow, WindowUnavailableError } from '../../extension/src/sessionrequests.ts';
 
 export async function runDispatch(action: string, args: string[]): Promise<string> {
   const options = new Map<string, string>();
   const ids: string[] = [];
-  const accepted = ['--event', '--origin', '--owner', '--token', '--outcome-file', '--deadline-ms', '--window'];
+  const accepted = [
+    '--event',
+    '--origin',
+    '--owner',
+    '--token',
+    '--outcome-file',
+    '--deadline-ms',
+    '--window',
+    '--cursor',
+    '--limit',
+  ];
   let json = false;
   for (let at = 0; at < args.length; at++) {
     const arg = args[at];
@@ -27,7 +37,9 @@ export async function runDispatch(action: string, args: string[]): Promise<strin
           ? ['--deadline-ms', '--window']
           : action === 'result' || action === 'recover'
             ? ['--event']
-            : [];
+            : action === 'status' || action === 'refresh'
+              ? ['--cursor', '--limit']
+              : [];
   for (const key of options.keys())
     if (!allowed.includes(key)) throw new Error(`${key} is unavailable for dispatch ${action}.`);
   const need = (key: string) => {
@@ -61,6 +73,7 @@ export async function runDispatch(action: string, args: string[]): Promise<strin
     }
     result = receipts.ack(id, need('--event'), need('--origin'), need('--owner'), need('--token'), disposition);
   } else if (action === 'wait') {
+    if (launch.completion !== 'wait') throw new Error('This dispatch launch did not select waited completion.');
     const deadlineMs = Number(options.get('--deadline-ms') ?? '110000');
     if (!Number.isSafeInteger(deadlineMs) || deadlineMs < 1 || deadlineMs > 110_000)
       throw new Error('The wait deadline must be 1 through 110000 milliseconds.');
@@ -70,7 +83,8 @@ export async function runDispatch(action: string, args: string[]): Promise<strin
         { dispatchAction: 'wait', launchId: id, deadlineMs },
         options.get('--window') ?? launch.origin,
       );
-    } catch {
+    } catch (error) {
+      if (!(error instanceof WindowUnavailableError)) throw error;
       result = {
         launchId: id,
         state: 'uncertain',
@@ -99,7 +113,14 @@ export async function runDispatch(action: string, args: string[]): Promise<strin
       /* Saved reports remain available after host shutdown. */
     }
     if (action === 'refresh') receipts.refresh(id);
-    result = action === 'result' ? receipts.result(id, need('--event')) : receipts.status(id);
+    result =
+      action === 'result'
+        ? receipts.result(id, need('--event'))
+        : receipts.status(
+            id,
+            options.get('--cursor'),
+            options.has('--limit') ? Number(options.get('--limit')) : undefined,
+          );
   } else throw new Error(`Unknown dispatch operation: ${action}`);
   const output = JSON.stringify(result);
   if (Buffer.byteLength(output) > 48 * 1024)

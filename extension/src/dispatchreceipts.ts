@@ -1,10 +1,12 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import * as os from 'node:os';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { writeFileAtomically } from './atomicfile';
 import { arcHome } from './store';
 import { payloadSha256, type RequesterIdentity } from './sessionwrites';
 import type { LaunchPolicy } from './launchpolicy';
+import { canonicalToolPath } from './toolownership';
 
 export const DISPATCH_ID = /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/;
 export const DISPATCH_TEXT_LIMIT = 16_000;
@@ -23,6 +25,7 @@ export interface DispatchLaunch {
   promptSha256: string;
   completion: 'manual' | 'wait';
   alias: string | null;
+  aliasParent?: FileIdentity;
 }
 export interface DispatchEvent {
   launchId: string;
@@ -58,12 +61,20 @@ function equalIdentity(a: FileIdentity, b: FileIdentity): boolean {
 function safePath(file: string): void {
   let current = path.resolve(file);
   while (true) {
+    if ([os.homedir(), os.tmpdir()].some((base) => current === path.resolve(base))) break;
     const stat = fs.lstatSync(current);
     if (stat.isSymbolicLink()) throw new Error('The dispatch path is redirected.');
     const parent = path.dirname(current);
     if (parent === current) break;
     current = parent;
   }
+}
+export function outsideDispatchStorage(root: string, file: string, platform = process.platform): boolean {
+  const paths = platform === 'win32' ? path.win32 : path.posix;
+  const relative = paths.relative(root, file);
+  return (
+    paths.isAbsolute(file) && (paths.isAbsolute(relative) || relative === '..' || relative.startsWith(`..${paths.sep}`))
+  );
 }
 function read(file: string, limit = JSON_BYTES): string {
   safePath(file);
@@ -118,20 +129,31 @@ export class DispatchReceipts {
     fs.mkdirSync(this.root, { recursive: true, mode: 0o700 });
     safePath(this.root);
     if (input.alias) {
-      if (!path.isAbsolute(input.alias) || path.relative(this.root, input.alias).split(path.sep)[0] !== '..')
+      if (
+        !path.isAbsolute(input.alias) ||
+        !outsideDispatchStorage(canonicalToolPath(this.root), canonicalToolPath(input.alias))
+      )
         throw new Error('A report alias must stay outside private dispatch storage.');
       safePath(path.dirname(input.alias));
+      for (let parent = fs.realpathSync.native(path.dirname(input.alias)); ; parent = path.dirname(parent)) {
+        if (equalIdentity(identity(parent), identity(this.root)))
+          throw new Error('A report alias must stay outside private dispatch storage.');
+        if (parent === path.dirname(parent)) break;
+      }
       if (fs.existsSync(input.alias)) {
         safePath(input.alias);
         if (!fs.lstatSync(input.alias).isFile()) throw new Error('A report alias must name a regular file.');
       }
     }
-    if (fs.readdirSync(this.root).filter((name) => DISPATCH_ID.test(name)).length >= 256)
-      throw new Error('Arc has reached its retained dispatch launch limit.');
     const launchId = randomUUID();
     const directory = path.join(this.root, launchId);
     fs.mkdirSync(directory, { mode: 0o700 });
-    const launch: DispatchLaunch = { ...input, launchId, transport: 'hosted' };
+    const launch: DispatchLaunch = {
+      ...input,
+      ...(input.alias ? { aliasParent: identity(fs.realpathSync.native(path.dirname(input.alias))) } : {}),
+      launchId,
+      transport: 'hosted',
+    };
     const receipt = JSON.stringify(launch);
     exclusive(path.join(directory, 'receipt.json'), receipt);
     const anchor: Anchor = {
@@ -173,7 +195,10 @@ export class DispatchReceipts {
       binding.submissionId < 1 ||
       (binding.nativeTurnId !== null &&
         !(binding.provider === 'codex'
-          ? DISPATCH_ID.test(binding.nativeTurnId)
+          ? typeof binding.nativeTurnId === 'string' &&
+            binding.nativeTurnId.length > 0 &&
+            binding.nativeTurnId.length <= 4096 &&
+            !/[\u0000-\u001f]/.test(binding.nativeTurnId)
           : /^[1-9][0-9]*$/.test(binding.nativeTurnId)))
     )
       throw new Error('The dispatch worker identity is invalid.');
@@ -201,11 +226,24 @@ export class DispatchReceipts {
     text: string | null,
   ): DispatchEvent {
     const launch = this.launch(id);
-    if (text !== null && (input.availability !== 'available' || Buffer.byteLength(text) > REPORT_BYTES))
+    if (text !== null && input.availability !== 'available')
       throw new Error('The dispatch response exceeds its saved report allowance.');
+    if (text !== null && Buffer.byteLength(text) > REPORT_BYTES) {
+      text = null;
+      input = { ...input, availability: 'unavailable' };
+    }
     return this.lock(id, () => {
       const state = this.state(id);
-      if (state.events.length >= 256) throw new Error('The dispatch has reached its retained event limit.');
+      if (state.events.length >= 256) {
+        const archive = this.file(id, `state.${state.segment ?? 0}.json`);
+        const serializedState = JSON.stringify(state);
+        if (fs.existsSync(archive)) {
+          if (read(archive, 4 * JSON_BYTES) !== serializedState)
+            throw new Error('The retained dispatch events conflict.');
+        } else exclusive(archive, serializedState);
+        state.segment = (state.segment ?? 0) + 1;
+        state.events = [];
+      }
       const eventId = randomUUID();
       const reportFile = this.file(id, `${eventId}.md`);
       const report =
@@ -213,19 +251,40 @@ export class DispatchReceipts {
       if (text !== null) exclusive(reportFile, text);
       const event: DispatchEvent = { ...input, launchId: id, eventId, assignment: 1, report };
       const serialized = JSON.stringify(event);
-      if (Buffer.byteLength(serialized) > JSON_BYTES) throw new Error('The dispatch event exceeds its allowance.');
+      if (Buffer.byteLength(serialized) > JSON_BYTES - 20 * 1024)
+        throw new Error('The dispatch event exceeds its allowance.');
       exclusive(this.file(id, `${eventId}.json`), serialized);
-      state.events.push({
+      const held = {
         id: eventId,
         sha256: payloadSha256(serialized),
         identity: identity(this.file(id, `${eventId}.json`)),
         reportIdentity: report ? identity(reportFile) : null,
-      });
+      };
+      state.events.push(held);
+      exclusive(this.file(id, `${eventId}.anchor.json`), JSON.stringify(held));
       this.save(id, state);
+      if (text !== null) {
+        try {
+          const source = this.file(id, 'current.md');
+          if (fs.existsSync(source)) {
+            const witness = JSON.parse(read(this.file(id, 'source.json')));
+            if (!equalIdentity(witness, identity(source))) throw new Error('The dispatch report source was replaced.');
+          }
+          writeFileAtomically(source, text, undefined, 0o600, false);
+          this.saveSource(id, identity(source));
+        } catch {
+          /* The immutable event remains available. */
+        }
+      }
       if (launch.alias && text !== null) {
         // An alias never supplies authoritative report bytes.
         try {
           safePath(path.dirname(launch.alias));
+          if (
+            !launch.aliasParent ||
+            !equalIdentity(launch.aliasParent, identity(fs.realpathSync.native(path.dirname(launch.alias))))
+          )
+            throw new Error('The report alias folder was replaced.');
           if (fs.existsSync(launch.alias)) safePath(launch.alias);
           writeFileAtomically(launch.alias, text, undefined, 0o600, false);
         } catch {
@@ -238,7 +297,10 @@ export class DispatchReceipts {
   event(id: string, eventId: string): DispatchEvent {
     this.launch(id);
     validId(eventId);
-    const held = this.state(id).events.find((one) => one.id === eventId);
+    const anchor = this.file(id, `${eventId}.anchor.json`);
+    const held = fs.existsSync(anchor)
+      ? JSON.parse(read(anchor))
+      : this.state(id).events.find((one) => one.id === eventId);
     const file = this.file(id, `${eventId}.json`);
     if (!held) throw new Error('The dispatch event is unknown.');
     const text = read(file);
@@ -269,23 +331,68 @@ export class DispatchReceipts {
       (payloadSha256(text) !== event.report!.sha256 || Buffer.byteLength(text) !== event.report!.bytes)
     )
       throw new Error('The frozen dispatch report changed.');
-    const reply = { ...event, text: text !== null && text.length <= DISPATCH_TEXT_LIMIT ? text : null };
+    const consumption = this.consumption(id, eventId);
+    delete consumption.token;
+    const reply = { ...event, consumption, text: text !== null && text.length <= DISPATCH_TEXT_LIMIT ? text : null };
     if (Buffer.byteLength(JSON.stringify(reply)) > JSON_BYTES) reply.text = null;
     return reply;
   }
-  status(id: string): {
+  status(
+    id: string,
+    cursor?: string,
+    limit = 32,
+  ): {
     launch: DispatchLaunch;
-    events: (DispatchEvent & { consumption: EventState; delivery: 'unavailable' })[];
+    version: 1;
+    next: string | null;
+    reportSource: string | null;
+    events: (Omit<DispatchEvent, 'nativeEnding'> & {
+      consumption: Omit<EventState, 'disposition' | 'token'>;
+      delivery: 'unavailable';
+    })[];
   } {
     const launch = this.launch(id);
-    return {
+    const current = this.state(id);
+    const start = cursor === undefined ? 0 : Number(cursor.slice(id.length + 1));
+    const total = (current.segment ?? 0) * 256 + current.events.length;
+    if (
+      !Number.isSafeInteger(limit) ||
+      limit < 1 ||
+      limit > 128 ||
+      !Number.isSafeInteger(start) ||
+      start < 0 ||
+      start > total ||
+      (cursor !== undefined && cursor !== `${id}:${start}`)
+    )
+      throw new Error('The dispatch page is invalid.');
+    const result: ReturnType<DispatchReceipts['status']> = {
+      version: 1,
       launch,
-      events: this.state(id).events.map((one) => {
-        const consumption = this.consumption(id, one.id);
-        delete consumption.token;
-        return { ...this.event(id, one.id), consumption, delivery: 'unavailable' };
-      }),
+      next: null,
+      reportSource: fs.existsSync(this.file(id, 'current.md')) ? this.file(id, 'current.md') : null,
+      events: [],
     };
+    let index = start;
+    for (; index < total && result.events.length < limit; index++) {
+      const segment = Math.floor(index / 256);
+      const state = segment === (current.segment ?? 0) ? current : this.state(id, segment);
+      const event = this.event(id, state.events[index % 256].id);
+      const { token: _token, disposition: _disposition, ...consumption } = this.consumption(id, event.eventId);
+      const { nativeEnding: _ending, ...listed } = event;
+      result.events.push({ ...listed, consumption, delivery: 'unavailable' });
+      result.next = index + 1 < total ? `${id}:${index + 1}` : null;
+      if (Buffer.byteLength(JSON.stringify(result)) > JSON_BYTES - 4096) {
+        result.events.pop();
+        break;
+      }
+    }
+    result.next = index < total ? `${id}:${index}` : null;
+    return result;
+  }
+  latest(id: string): DispatchEvent | null {
+    this.launch(id);
+    const one = this.state(id).events.at(-1);
+    return one ? this.event(id, one.id) : null;
   }
   claim(id: string, eventId: string, origin: string, owner: string): unknown {
     if (this.launch(id).origin !== origin || !OWNER.test(owner))
@@ -313,7 +420,17 @@ export class DispatchReceipts {
     )
       throw new Error('The dispatch acknowledgment is invalid.');
     return this.lock(id, () => {
-      this.event(id, eventId);
+      const event = this.event(id, eventId);
+      if (
+        Buffer.byteLength(
+          JSON.stringify({
+            ...event,
+            consumption: { disposition, owner, dispositionSha256: payloadSha256(disposition) },
+            text: null,
+          }),
+        ) > JSON_BYTES
+      )
+        throw new Error('The dispatch acknowledgment exceeds its JSON allowance.');
       const state = this.consumption(id, eventId);
       const digest = payloadSha256(disposition);
       if (state.owner !== owner || state.token !== token)
@@ -331,10 +448,12 @@ export class DispatchReceipts {
     });
   }
   refresh(id: string): DispatchEvent | null {
-    const status = this.status(id);
-    const last = status.events.at(-1);
-    if (!status.launch.alias || !last?.report) return null;
-    const text = read(status.launch.alias, REPORT_BYTES);
+    const last = this.latest(id);
+    if (!last?.report) return null;
+    const source = this.file(id, 'current.md');
+    const witness = JSON.parse(read(this.file(id, 'source.json')));
+    if (!equalIdentity(witness, identity(source))) throw new Error('The dispatch report source was replaced.');
+    const text = read(source, REPORT_BYTES);
     if (payloadSha256(text) === last.report.sha256) return null;
     return this.publish(
       id,
@@ -345,11 +464,20 @@ export class DispatchReceipts {
   private file(id: string, name: string): string {
     return path.join(this.root, id, name);
   }
-  private state(id: string): {
+  private saveSource(id: string, witness: FileIdentity): void {
+    writeFileAtomically(this.file(id, 'source.json'), JSON.stringify(witness), undefined, 0o600, false);
+  }
+  private state(
+    id: string,
+    segment?: number,
+  ): {
     launchId: string;
+    segment?: number;
     events: { id: string; sha256: string; identity: FileIdentity; reportIdentity: FileIdentity | null }[];
   } {
-    const state = JSON.parse(read(this.file(id, 'state.json'), 4 * JSON_BYTES));
+    const state = JSON.parse(
+      read(this.file(id, segment === undefined ? 'state.json' : `state.${segment}.json`), 4 * JSON_BYTES),
+    );
     if (state.launchId !== id || !Array.isArray(state.events) || state.events.length > 256)
       throw new Error('The dispatch state is invalid.');
     return state;
@@ -367,11 +495,33 @@ export class DispatchReceipts {
   private lock<T>(id: string, work: () => T): T {
     this.launch(id);
     const file = this.file(id, 'write.lock');
-    exclusive(file, '');
+    const temporary = this.file(id, `write.${process.pid}.${randomUUID()}.lock`);
+    const owner = JSON.stringify({ pid: process.pid, token: randomUUID(), launchId: id });
+    exclusive(temporary, owner);
+    try {
+      if (fs.existsSync(file)) {
+        const before = identity(file);
+        const held = JSON.parse(read(file));
+        if (held.launchId !== id || !Number.isSafeInteger(held.pid) || held.pid < 1 || !DISPATCH_ID.test(held.token))
+          throw new Error('The dispatch write owner is unavailable.');
+        let dead = false;
+        try {
+          process.kill(held.pid, 0);
+        } catch (error) {
+          dead = (error as NodeJS.ErrnoException).code === 'ESRCH';
+        }
+        if (!dead || !equalIdentity(before, identity(file)) || read(file) !== JSON.stringify(held))
+          throw new Error('Another process holds this dispatch write.');
+        fs.unlinkSync(file);
+      }
+      fs.linkSync(temporary, file);
+    } finally {
+      fs.unlinkSync(temporary);
+    }
     try {
       return work();
     } finally {
-      fs.unlinkSync(file);
+      if (read(file) === owner) fs.unlinkSync(file);
     }
   }
 }

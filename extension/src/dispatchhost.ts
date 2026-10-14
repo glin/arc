@@ -1,7 +1,7 @@
 import type { WireEvent, NativeEvent } from './agentwire';
 import type { DispatchLaunch, DispatchEvent } from './dispatchreceipts';
 import { DispatchReceipts } from './dispatchreceipts';
-import { payloadSha256 } from './sessionwrites';
+import { payloadSha256, type SessionWriteParams } from './sessionwrites';
 
 export interface DispatchChild {
   key: string;
@@ -16,6 +16,7 @@ export interface SavedDispatchResponse {
   responseIds: string[];
   finished: boolean;
   failed: boolean;
+  interrupted?: boolean;
 }
 interface Assignment {
   launch: DispatchLaunch;
@@ -27,6 +28,12 @@ interface Assignment {
   ending: Extract<NativeEvent, { kind: 'rootEnd' }> | null;
   terminal: boolean;
   observation: string;
+  pending?: {
+    input: Omit<DispatchEvent, 'launchId' | 'eventId' | 'assignment' | 'report'>;
+    text: string | null;
+    terminal: boolean;
+  };
+  outcome?: 'ok' | 'error' | 'interrupted';
 }
 
 // Observes the owning child. No operation starts, resumes, or replaces an agent.
@@ -56,6 +63,16 @@ export class HostedDispatch {
       observation: '',
     });
   }
+  request(origin: string, params: SessionWriteParams, signal: AbortSignal): unknown | Promise<unknown> {
+    const id = params.launchId!;
+    if (this.receipts.launch(id).origin !== origin) throw new Error('This dispatch belongs to another Arc activation.');
+    this.reconcileAll();
+    if (params.dispatchAction === 'wait') return this.wait(id, params.deadlineMs!, signal);
+    if (params.dispatchAction === 'refresh') this.receipts.refresh(id);
+    return params.dispatchAction === 'result'
+      ? this.receipts.result(id, params.eventId!)
+      : this.receipts.status(id, params.cursor, params.limit);
+  }
   submitted(launchId: string, submission: number): void {
     const assignment = this.assignments.get(launchId)!;
     if (assignment.submission !== null && assignment.submission !== submission)
@@ -70,91 +87,146 @@ export class HostedDispatch {
       throw new Error('The dispatch root turn cannot change.');
     assignment.session = session;
     assignment.nativeTurn = nativeTurn;
-    this.receipts.bind(launchId, {
-      provider: assignment.child.agent as 'claude' | 'codex',
-      sessionId: session,
-      submissionId: assignment.submission,
-      nativeTurnId: nativeTurn,
-    });
+    try {
+      this.receipts.bind(launchId, {
+        provider: assignment.child.agent as 'claude' | 'codex',
+        sessionId: session,
+        submissionId: assignment.submission,
+        nativeTurnId: nativeTurn,
+      });
+    } catch {
+      /* Retain the accepted identity for observation retry. */
+    }
   }
   observe(child: DispatchChild, event: WireEvent, submission: number | undefined): void {
     for (const assignment of this.assignments.values()) {
       if (assignment.child !== child || assignment.terminal) continue;
-      if (event.kind === 'ask' && assignment.submission !== null && child.dispatchRootActive?.(assignment.submission)) {
-        this.publish(
-          assignment,
-          { outcome: 'needs-input', availability: 'unavailable', nativeEnding: null, askId: event.ask.id },
-          null,
-        );
-        continue;
-      }
-      if (submission === undefined || submission !== assignment.submission) continue;
-      const session = child.state().sessionId;
-      if (!session || (assignment.session && assignment.session !== session)) continue;
-      assignment.session = session;
-      if (event.kind === 'text') {
-        assignment.blocks.clear();
-        assignment.blocks.set(event.sourceId ?? '', event.text);
-      }
-      if (event.kind === 'native' && event.event.kind === 'rootEnd') {
-        const native = event.event;
-        if (native.sessionId !== session || native.provider !== child.agent) continue;
-        const turn =
-          child.agent === 'codex' ? native.turnId : native.generation === null ? null : String(native.generation);
-        if (!turn || (assignment.nativeTurn && assignment.nativeTurn !== turn)) continue;
-        assignment.nativeTurn = turn;
-        assignment.ending = native;
-        this.receipts.bind(assignment.launch.launchId, {
-          provider: native.provider,
-          sessionId: session,
-          submissionId: submission,
-          nativeTurnId: turn,
-        });
-        this.reconcile(assignment);
-      }
-      if (event.kind === 'turnEnd' && !assignment.ending) {
-        this.publish(
-          assignment,
-          {
-            outcome:
-              event.outcome.status === 'error'
-                ? 'failed'
-                : event.outcome.status === 'interrupted'
-                  ? 'interrupted'
-                  : 'unknown',
-            availability: 'unavailable',
-            nativeEnding: null,
-            askId: null,
-          },
-          null,
-        );
-        assignment.terminal = true;
+      try {
+        if (
+          event.kind === 'ask' &&
+          assignment.submission !== null &&
+          child.dispatchRootActive?.(assignment.submission)
+        ) {
+          this.publish(
+            assignment,
+            { outcome: 'needs-input', availability: 'unavailable', nativeEnding: null, askId: event.ask.id },
+            null,
+          );
+          continue;
+        }
+        if (submission === undefined || submission !== assignment.submission) continue;
+        const session = child.state().sessionId;
+        if (!session || (assignment.session && assignment.session !== session)) continue;
+        assignment.session = session;
+        if (event.kind === 'text') {
+          assignment.blocks.clear();
+          assignment.blocks.set(event.sourceId ?? '', event.text);
+        }
+        if (event.kind === 'native' && event.event.kind === 'rootEnd') {
+          const native = event.event;
+          if (native.sessionId !== session || native.provider !== child.agent) continue;
+          const turn =
+            child.agent === 'codex' ? native.turnId : native.generation === null ? null : String(native.generation);
+          if (!turn || (assignment.nativeTurn && assignment.nativeTurn !== turn)) continue;
+          assignment.nativeTurn = turn;
+          assignment.ending = native;
+          this.reconcile(assignment);
+        }
+        if (event.kind === 'turnEnd' && assignment.ending) {
+          assignment.outcome = event.outcome.status;
+          this.reconcile(assignment);
+        }
+        if (event.kind === 'turnEnd' && !assignment.ending) {
+          this.publish(
+            assignment,
+            {
+              outcome:
+                event.outcome.status === 'error'
+                  ? 'failed'
+                  : event.outcome.status === 'interrupted'
+                    ? 'interrupted'
+                    : 'unknown',
+              availability: 'unavailable',
+              nativeEnding: null,
+              askId: null,
+            },
+            null,
+            true,
+          );
+        }
+      } catch {
+        /* Retain native observations when saved evidence is unavailable. */
       }
     }
   }
   exited(child: DispatchChild): void {
     for (const assignment of this.assignments.values())
       if (assignment.child === child && !assignment.terminal) {
-        if (assignment.ending) this.reconcile(assignment);
-        else {
+        if (assignment.ending) {
+          try {
+            this.reconcile(assignment);
+          } catch {
+            /* Retry saved evidence later. */
+          }
+        } else {
           this.publish(
             assignment,
             { outcome: 'unknown', availability: 'unavailable', nativeEnding: null, askId: null },
             null,
+            true,
           );
-          assignment.terminal = true;
         }
       }
   }
   reconcileAll(): void {
-    for (const assignment of this.assignments.values())
-      if (!assignment.terminal && assignment.ending) this.reconcile(assignment);
+    for (const assignment of this.assignments.values()) {
+      if (assignment.terminal) continue;
+      if (assignment.pending) {
+        const pending = assignment.pending;
+        this.publish(assignment, pending.input, pending.text, pending.terminal);
+      }
+      if (assignment.ending && !assignment.terminal) {
+        try {
+          this.reconcile(assignment);
+        } catch {
+          /* Retry saved evidence later. */
+        }
+      }
+    }
+  }
+  unavailable(launchId: string): void {
+    const assignment = this.assignments.get(launchId);
+    const input = {
+      outcome: 'unknown' as const,
+      availability: 'unavailable' as const,
+      nativeEnding: null,
+      askId: null,
+    };
+    if (assignment) this.publish(assignment, input, null, true);
+    else {
+      try {
+        if (!this.receipts.latest(launchId)) this.receipts.publish(launchId, input, null);
+      } catch {
+        /* The reserved launch remains recoverable. */
+      }
+    }
   }
   private reconcile(assignment: Assignment): void {
     const ending = assignment.ending!;
-    const saved = assignment.session
-      ? this.saved(assignment.child.agent, assignment.session, assignment.nativeTurn)
-      : null;
+    this.receipts.bind(assignment.launch.launchId, {
+      provider: assignment.child.agent as 'claude' | 'codex',
+      sessionId: assignment.session!,
+      submissionId: assignment.submission!,
+      nativeTurnId: assignment.nativeTurn,
+    });
+    // Failed native endings wait for the shared outcome that distinguishes interruption.
+    if (!ending.success && assignment.outcome === undefined) return;
+    let saved: SavedDispatchResponse | null = null;
+    try {
+      if (assignment.session) saved = this.saved(assignment.child.agent, assignment.session, assignment.nativeTurn);
+    } catch {
+      /* Missing saved evidence keeps the observation pending. */
+    }
     const text = [...assignment.blocks.values()].join('\n\n');
     const nativeEnding = {
       provider: ending.provider,
@@ -166,41 +238,64 @@ export class HostedDispatch {
     };
     const consistent =
       saved &&
-      (saved.finished || saved.failed) &&
+      (saved.finished || saved.failed || saved.interrupted) &&
       payloadSha256(saved.prompt) === assignment.launch.promptSha256 &&
       saved.text === text &&
       (assignment.child.agent !== 'codex' || saved.promptId === assignment.nativeTurn) &&
       (assignment.child.agent === 'codex' ||
-        [...assignment.blocks.keys()].every((id) => saved.responseIds.includes(id))) &&
-      (!ending.success || !saved.failed);
+        (assignment.blocks.size > 0 &&
+          [...assignment.blocks.keys()].every((id) => !!id && saved.responseIds.includes(id)))) &&
+      (ending.success
+        ? !saved.failed && !saved.interrupted
+        : assignment.outcome === 'interrupted'
+          ? !!saved.interrupted
+          : saved.failed && !saved.interrupted);
     this.publish(
       assignment,
       {
-        outcome: ending.success ? 'succeeded' : 'failed',
+        outcome: ending.success ? 'succeeded' : assignment.outcome === 'interrupted' ? 'interrupted' : 'failed',
         availability: consistent ? 'available' : 'pending',
         nativeEnding,
         askId: null,
       },
       consistent ? text : null,
+      !!consistent,
     );
-    if (consistent) assignment.terminal = true;
   }
   private publish(
     assignment: Assignment,
     input: Omit<DispatchEvent, 'launchId' | 'eventId' | 'assignment' | 'report'>,
     text: string | null,
+    terminal = false,
   ): void {
     const observation = JSON.stringify([input, text]);
-    if (observation === assignment.observation) return;
-    const event = this.receipts.publish(assignment.launch.launchId, input, text);
+    if (observation === assignment.observation) {
+      if (terminal) assignment.terminal = true;
+      return;
+    }
+    assignment.pending = { input, text, terminal };
+    let event: DispatchEvent;
+    try {
+      event = this.receipts.publish(assignment.launch.launchId, input, text);
+    } catch {
+      return;
+    }
+    assignment.pending = undefined;
     assignment.observation = observation;
-    for (const listener of this.listeners.get(assignment.launch.launchId) ?? []) listener(event);
+    if (terminal) assignment.terminal = true;
+    for (const listener of this.listeners.get(assignment.launch.launchId) ?? []) {
+      try {
+        listener(event);
+      } catch {
+        /* Other observers retain their delivery. */
+      }
+    }
   }
   wait(launchId: string, deadlineMs: number, signal: AbortSignal): Promise<unknown> {
     const launch = this.receipts.launch(launchId);
     if (launch.completion !== 'wait') throw new Error('This dispatch launch did not select waited completion.');
     this.reconcileAll();
-    const last = this.receipts.status(launchId).events.at(-1);
+    const last = this.receipts.latest(launchId);
     if (last && last.availability !== 'pending')
       return Promise.resolve({ launchId, state: 'observed', eventId: last.eventId, outcome: last.outcome });
     return new Promise((resolve) => {

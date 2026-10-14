@@ -197,9 +197,22 @@ export function parseSessionRequest(value: unknown): SessionRequest | null {
         : params.dispatchAction === 'wait'
           ? 'deadlineMs,dispatchAction,launchId'
           : 'dispatchAction,launchId';
-    if (Object.keys(params).sort().join(',') !== fields) return null;
+    const paging = params.dispatchAction === 'status' || params.dispatchAction === 'refresh';
     if (
-      !Object.keys(params).every((key) => ['dispatchAction', 'launchId', 'eventId', 'deadlineMs'].includes(key)) ||
+      Object.keys(params)
+        .filter((key) => !(paging && ['cursor', 'limit'].includes(key)))
+        .sort()
+        .join(',') !== fields
+    )
+      return null;
+    if (
+      !Object.keys(params).every((key) =>
+        ['dispatchAction', 'launchId', 'eventId', 'deadlineMs', ...(paging ? ['cursor', 'limit'] : [])].includes(key),
+      ) ||
+      (params.cursor !== undefined &&
+        (typeof params.cursor !== 'string' || !new RegExp(`^${params.launchId}:[0-9]{1,16}$`).test(params.cursor))) ||
+      (params.limit !== undefined &&
+        (!Number.isSafeInteger(params.limit) || (params.limit as number) < 1 || (params.limit as number) > 128)) ||
       typeof params.launchId !== 'string' ||
       !DISPATCH_ID.test(params.launchId) ||
       !['result', 'status', 'wait', 'refresh'].includes(params.dispatchAction as string) ||
@@ -874,7 +887,9 @@ function providerCapable(entry: WindowInfo): boolean {
   return entry.capabilities?.includes(REQUESTER_PROVIDER_CAPABILITY) ?? false;
 }
 
-// `guardedStart` marks `arc start --arc-dispatch`, the only start that carries the requester's provider.
+// Guarded starts carry requester identity. Dispatch fields require dispatchResults admission.
+export class WindowUnavailableError extends Error {}
+
 export async function requestWindow(
   method: Exclude<SessionRequest['method'], 'ping'>,
   params: SessionRequest['params'],
@@ -908,13 +923,18 @@ export async function requestWindow(
       throw new Error();
     entry = value as unknown as HostRegistration;
   } catch {
-    throw new Error('The selected Arc window is unavailable.');
+    throw new WindowUnavailableError('The selected Arc window is unavailable.');
   }
   const id = requestId ?? `${entry.hostId}:${crypto.randomBytes(12).toString('hex')}`;
   if (requestId && !requestId.startsWith(entry.hostId + ':'))
     throw new Error(`Request ${requestId} has an unknown outcome in this activation.`);
   if (method === 'send' && !providerCapable(entry))
     throw new Error('The selected Arc window must reload before it can accept send. No prompt was sent.');
+  if (
+    (method === 'dispatch' || (method === 'start' && params.dispatch)) &&
+    !entry.capabilities?.includes('dispatchResults')
+  )
+    throw new Error('The selected Arc window must reload before it can accept dispatch results. No prompt was sent.');
   if (method === 'read' && (!providerCapable(entry) || !entry.capabilities?.includes(SESSION_READ_CAPABILITY)))
     throw new Error('The selected Arc window does not support marking sessions read.');
   if (

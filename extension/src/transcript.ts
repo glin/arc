@@ -728,6 +728,7 @@ export interface Turn {
   outputRate?: import('./outputrate').OutputRate;
   outputRateModel?: string;
   responseIds?: string[];
+  finalResponse?: { text: string; sourceId: string | null };
   // The turn's first response id, which the cap on `responseIds` never drops.
   openingResponseId?: string;
   // Request that established `contextTokens`, separate from aggregate usage and the turn end time.
@@ -7276,6 +7277,7 @@ const CLAUDE_HIDDEN_POLICY: HiddenStatePolicy = {
 export interface ReadOptions {
   // Explicit captures retain recorded submissions and Activity steps. Ordinary panel reads stay bounded.
   captureSessionText?: boolean;
+  dispatchResponse?: boolean;
   captureRepeated?: Pick<import('./clauderepeated').ClaudeRepeatedState, 'runs'>;
   exportTurnBytes?: number;
   recoveredModelAttachment?: string | null;
@@ -11056,6 +11058,7 @@ function reduceClaudeSessionLine(
     // Settle awaited steps when subsequent assistant content implies the agent resumed.
     settleClaudeSteps(state);
     let answeredLine = false;
+    const responseBlocks: string[] = [];
     const narrationBase =
       message.stop_reason === 'tool_use'
         ? message.id || (typeof o.uuid === 'string' && o.uuid ? o.uuid : `at-${stamp(o.timestamp)}`)
@@ -11265,6 +11268,7 @@ function reduceClaudeSessionLine(
         }
         if (!notResponse) {
           cur.summary = text;
+          responseBlocks.push(text);
         }
         // A text block with a stop reason closes an answer. Ordinary later blocks replace an answer already closed by this line.
         // A newly marked nonresponse preserves the preceding eligible response as a separate answer.
@@ -11293,6 +11297,8 @@ function reduceClaudeSessionLine(
     if (narrationBase) {
       state.narrationOrdinals.set(narrationBase, textOrdinal);
     }
+    if (opts.dispatchResponse && responseBlocks.length && message.stop_reason && message.stop_reason !== 'tool_use')
+      cur.finalResponse = { text: responseBlocks.join('\n'), sourceId: replyId };
   } else if (typeof content === 'string' && content.trim()) {
     if (message.stop_reason === 'tool_use') {
       const base = message.id || (typeof o.uuid === 'string' && o.uuid ? o.uuid : `at-${stamp(o.timestamp)}`);
@@ -11322,6 +11328,7 @@ function reduceClaudeSessionLine(
       }
       if (!notResponse) {
         cur.summary = content;
+        if (opts.dispatchResponse && message.stop_reason) cur.finalResponse = { text: content, sourceId: replyId };
       }
       if (message.stop_reason && message.stop_reason !== 'tool_use') {
         const answer: TurnAnswer = { text: content, at: stamp(o.timestamp), stepsBefore: cur.stepCount };

@@ -342,6 +342,8 @@ import {
 import type { NativeEvent } from './agentwire';
 import { CodexWire } from './codexwire.ts';
 import { arcCliSpawner, childEnv } from './agenthost.ts';
+import { DispatchReceipts } from './dispatchreceipts';
+import { HostedDispatch } from './dispatchhost';
 import {
   discoverWindows,
   hostAddress,
@@ -4268,4 +4270,109 @@ test('deferred compaction retains unknown membership and cancels only proven abs
     assert.equal(fixture.writes, 0, agent);
     assert.equal(compactState(host), 'cancelled', agent);
   }
+});
+test('dispatch channel schema, capability admission, bounds and explicit refusals remain distinct', async () => {
+  const { channel, home, entry } = await fixture();
+  const launchId = 'aaaaaaaa-1111-2222-3333-444444444444';
+  const params = { dispatchAction: 'wait' as const, launchId, deadlineMs: 1 };
+  const valid = request(entry, { method: 'dispatch', params });
+  assert.deepEqual(parseSessionRequest(valid), valid);
+  for (const changed of [
+    { ...params, deadlineMs: 0 },
+    { ...params, deadlineMs: 110001 },
+    { ...params, launchId: '../unsafe' },
+    { ...params, eventId: launchId },
+    { ...params, dispatchAction: 'callback' },
+  ])
+    assert.equal(parseSessionRequest({ ...valid, params: changed }), null);
+  await assert.rejects(requestWindow('dispatch', params, channel.hostId, home), /must reload/);
+  const start = {
+    setup: { kind: 'custom' as const, agent: 'codex', model: '', effort: '', permissionMode: '' },
+    prompt: 'review',
+    agentRun: false,
+    dispatch: true,
+    completion: 'manual' as const,
+  };
+  const writes = vi.fn<() => { status: string }>(() => ({ status: 'accepted' }));
+  channel.setRequestHandler(writes);
+  await assert.rejects(requestWindow('start', start, channel.hostId, home), /must reload/);
+  assert.equal(writes.mock.calls.length, 0);
+  const receipts = new DispatchReceipts(home);
+  const host = new HostedDispatch(receipts, () => null);
+  const launch = receipts.reserve({
+    origin: 'b'.repeat(24),
+    requester: null,
+    policy: null,
+    promptSha256: 'a'.repeat(64),
+    completion: 'wait',
+    alias: null,
+  });
+  channel.setDispatchHandler((request) => host.request(channel.hostId, request.params, request.filterContext!.signal));
+  await channel.update(state);
+  await assert.rejects(
+    requestWindow('dispatch', { ...params, launchId: launch.launchId }, channel.hostId, home),
+    /another Arc activation/,
+  );
+  channel.setDispatchHandler(() => ({ text: 'x'.repeat(SESSION_REQUEST_LIMITS.lineBytes + 1) }));
+  await assert.rejects(
+    requestWindow('dispatch', { dispatchAction: 'status', launchId }, channel.hostId, home),
+    /allowance/,
+  );
+  const manual = receipts.reserve({ ...launch, origin: channel.hostId, completion: 'manual' });
+  channel.setDispatchHandler((request) => host.request(channel.hostId, request.params, request.filterContext!.signal));
+  await assert.rejects(
+    requestWindow('dispatch', { ...params, launchId: manual.launchId }, channel.hostId, home),
+    /did not select waited/,
+  );
+  const waited = receipts.reserve({ ...launch, origin: channel.hostId });
+  vi.useFakeTimers();
+  let admitted = false;
+  channel.setDispatchHandler((request) => {
+    admitted = true;
+    return host.request(channel.hostId, request.params, request.filterContext!.signal);
+  });
+  const pending = requestWindow(
+    'dispatch',
+    { ...params, launchId: waited.launchId, deadlineMs: 100 },
+    channel.hostId,
+    home,
+  );
+  await vi.waitFor(() => assert.equal(admitted, true));
+  await vi.advanceTimersByTimeAsync(100);
+  assert.equal(((await pending) as any).state, 'deadline');
+  vi.useRealTimers();
+});
+
+test('dispatch wait disconnect cancels the channel subscription and retains its launch identity', async () => {
+  const { channel, home } = await fixture();
+  const receipts = new DispatchReceipts(home);
+  const host = new HostedDispatch(receipts, () => null);
+  const launch = receipts.reserve({
+    origin: channel.hostId,
+    requester: null,
+    policy: null,
+    promptSha256: 'a'.repeat(64),
+    completion: 'wait',
+    alias: null,
+  });
+  let admitted: any;
+  channel.setDispatchHandler((request) => {
+    admitted = request;
+    return host.request(channel.hostId, request.params, request.filterContext!.signal);
+  });
+  await channel.update(state);
+  const launchId = launch.launchId;
+  const pending = requestWindow(
+    'dispatch',
+    { dispatchAction: 'wait', launchId, deadlineMs: 1000 },
+    channel.hostId,
+    home,
+  );
+  await vi.waitFor(() => assert.ok(admitted));
+  await channel.dispose();
+  const result = (await pending) as any;
+  assert.equal(result.state, 'uncertain');
+  assert.equal(result.launchId, launchId);
+  await vi.waitFor(() => assert.equal(admitted.filterContext.signal.aborted, true));
+  assert.equal(receipts.launch(launchId).launchId, launchId);
 });

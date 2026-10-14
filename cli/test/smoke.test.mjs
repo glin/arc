@@ -1048,6 +1048,7 @@ test('bundled management commands carry reader-default classification, prompt fi
   const channel = new WindowChannel(home);
   const run = promisify(execFile);
   const requests = [];
+  channel.setDispatchHandler(() => null);
   channel.setRequestHandler((request) => {
     requests.push(request);
     return request.method === 'start'
@@ -1318,8 +1319,12 @@ test('bundled guarded starts refuse ambiguous requesters, and a window without t
     const prompt = join(home, 'prompt.txt');
     writeFileSync(prompt, 'Prepare the worktree.');
     const start = [cli, 'start', '--provider', 'claude', '--prompt-file', prompt];
-    const dispatched = await run(process.execPath, [...start, '--arc-dispatch'], { env, encoding: 'utf8' });
-    assert.match(dispatched.stdout, /ARC_DISPATCH_SESSION=/);
+    await assert.rejects(
+      run(process.execPath, [...start, '--arc-dispatch'], { env, encoding: 'utf8' }),
+      /must reload.*dispatch/,
+    );
+    assert.equal(requests.length, 0);
+    await run(process.execPath, start, { env, encoding: 'utf8' });
     await run(process.execPath, [cli, 'session', 'worker', '--json'], { env, encoding: 'utf8' });
     const base = 'id,method,params,requester,token,version';
     assert.deepEqual(
@@ -1854,6 +1859,40 @@ test('bundled filter commands retrieve selected identities and clear through an 
     await assert.rejects(run(process.execPath, [cli, 'filter', query], { env }), /must reload/);
     await assert.rejects(run(process.execPath, [cli, 'sessions', '--query', query], { env }), /must reload/);
     assert.equal(requests.length, before);
+  } finally {
+    await channel.dispose();
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+test('bundled dispatch wait preserves manual routes, invalid selectors and explicit host refusals', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'arc-dispatch-wait-smoke-'));
+  const channel = new WindowChannel(home);
+  const receipts = new DispatchReceipts(home);
+  const run = promisify(execFile);
+  channel.setDispatchHandler(() => {
+    throw new Error('This dispatch belongs to another Arc activation.');
+  });
+  try {
+    await channel.update({ folders: [home], scopeReady: true, panelReady: true, panelVisible: true });
+    const input = {
+      origin: channel.hostId,
+      requester: null,
+      policy: null,
+      promptSha256: payloadSha256('review'),
+      alias: null,
+    };
+    const manual = receipts.reserve({ ...input, completion: 'manual' });
+    const waited = receipts.reserve({ ...input, completion: 'wait' });
+    const env = { ...smokeEnv, ARC_HOME: home };
+    const call = (id, extra = []) =>
+      run(process.execPath, [cli, 'dispatch', 'wait', id, '--deadline-ms', '1', ...extra, '--json'], { env });
+    await assert.rejects(call(manual.launchId), /did not select waited/);
+    await assert.rejects(call(waited.launchId, ['--window', 'invalid']), /Invalid Arc window/);
+    await assert.rejects(call(waited.launchId), /another Arc activation/);
+    channel.setDispatchHandler(() => {
+      throw new Error('The selected Arc window is unavailable.');
+    });
+    await assert.rejects(call(waited.launchId), /unavailable/);
   } finally {
     await channel.dispose();
     rmSync(home, { recursive: true, force: true });

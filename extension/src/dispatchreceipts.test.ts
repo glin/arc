@@ -1,12 +1,17 @@
+import os from 'node:os';
+import { syncBuiltinESMExports } from 'node:module';
 import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { afterEach, test, vi } from 'vitest';
 import { tempDir } from './temproot';
-import { DispatchReceipts, type DispatchEvent } from './dispatchreceipts';
+import { DispatchReceipts, outsideDispatchStorage, type DispatchEvent } from './dispatchreceipts';
 import { HostedDispatch, type SavedDispatchResponse } from './dispatchhost';
 import { payloadSha256 } from './sessionwrites';
 import type { NativeEvent } from './agentwire';
+import { spawnSync } from 'node:child_process';
+import { savedDispatchResponse } from './sessionreads';
+import { revisionOf, type SessionFile } from './transcript';
 
 const origin = 'a'.repeat(24);
 const session = 'aaaaaaaa-1111-2222-3333-444444444444';
@@ -57,6 +62,8 @@ test('private reports remain independent when output aliases collide', () => {
   assert.notEqual(first.report!.path, second.report!.path);
   assert.equal((a.receipts.result(a.launch.launchId, first.eventId) as { text: string }).text, 'First');
   assert.equal(fs.readFileSync(alias, 'utf8'), 'Second');
+  assert.equal(a.receipts.refresh(a.launch.launchId), null);
+  assert.equal(a.receipts.status(a.launch.launchId).events.length, 1);
 });
 test('interrupted claims retain their token and acknowledgments retain exactly one disposition', () => {
   const { receipts, launch } = fixture();
@@ -68,11 +75,11 @@ test('interrupted claims retain their token and acknowledgments retain exactly o
   assert.equal(retry.token, claim.token);
   assert.throws(() => receipts.claim(launch.launchId, event.eventId, origin, 'foreign'));
   assert.throws(() => receipts.claim(launch.launchId, event.eventId, 'b'.repeat(24), 'owner'));
-  const ack = receipts.ack(launch.launchId, event.eventId, origin, 'owner', claim.token, 'Accepted ✓');
-  assert.deepEqual(receipts.ack(launch.launchId, event.eventId, origin, 'owner', claim.token, 'Accepted ✓'), ack);
+  const ack = receipts.ack(launch.launchId, event.eventId, origin, 'owner', claim.token, 'Accepted âœ“');
+  assert.deepEqual(receipts.ack(launch.launchId, event.eventId, origin, 'owner', claim.token, 'Accepted âœ“'), ack);
   assert.equal(
     fs.readFileSync(path.join(receipts.root, launch.launchId, `${event.eventId}.disposition.md`), 'utf8'),
-    'Accepted ✓',
+    'Accepted âœ“',
   );
   assert.throws(() => receipts.ack(launch.launchId, event.eventId, origin, 'owner', claim.token, 'Rejected'));
 });
@@ -84,10 +91,10 @@ test('changed report observations remain unread after an older event is consumed
   const first = report(receipts, launch.launchId);
   const claim = receipts.claim(launch.launchId, first.eventId, origin, 'owner') as { token: string };
   receipts.ack(launch.launchId, first.eventId, origin, 'owner', claim.token, 'Accepted');
-  fs.writeFileSync(alias, 'Changed');
+  fs.writeFileSync(receipts.status(launch.launchId).reportSource!, 'Changed');
   const changed = receipts.refresh(launch.launchId)!;
   assert.notEqual(changed.eventId, first.eventId);
-  assert.equal(receipts.status(launch.launchId).events.at(-1)!.consumption.disposition, undefined);
+  assert.equal(receipts.status(launch.launchId).events.at(-1)!.consumption.dispositionSha256, undefined);
   assert.throws(() => receipts.ack(launch.launchId, changed.eventId, origin, 'owner', claim.token, 'Accepted'));
   assert.equal((receipts.result(launch.launchId, first.eventId) as { text: string }).text, 'Report');
   assert.equal(receipts.refresh(launch.launchId), null);
@@ -106,8 +113,14 @@ test('retained reports reach the event limit without exceeding the internal stat
   const { receipts, launch } = fixture();
   let last: DispatchEvent | null = null;
   for (let index = 0; index < 256; index++) last = report(receipts, launch.launchId);
+  assert.equal(receipts.latest(launch.launchId)!.eventId, last!.eventId);
   assert.equal((receipts.result(launch.launchId, last!.eventId) as { text: string }).text, 'Report');
-  assert.throws(() => report(receipts, launch.launchId), /event limit/);
+  fs.copyFileSync(
+    path.join(receipts.root, launch.launchId, 'state.json'),
+    path.join(receipts.root, launch.launchId, 'state.0.json'),
+  );
+  const next = report(receipts, launch.launchId, 'Final after capacity');
+  assert.equal((receipts.result(launch.launchId, next.eventId) as { text: string }).text, 'Final after capacity');
 });
 test('authoritative receipt, report and accepted-turn replacements refuse', () => {
   const { receipts, launch } = fixture();
@@ -196,6 +209,11 @@ test('native failure, input requests and unknown process exit remain distinct', 
     if (mode === 'failed') {
       host.observe(child, { kind: 'text', text: 'Failure', sourceId: 'response' }, 1);
       host.observe(child, { kind: 'native', event: { ...ending, success: false } }, 1);
+      host.observe(
+        child,
+        { kind: 'turnEnd', outcome: { status: 'error', text: '', costUsd: null, turns: null, deniedTools: [] } },
+        1,
+      );
     } else if (mode === 'exit') host.exited(child);
     else
       host.observe(
@@ -238,4 +256,227 @@ test('wait deadline and disconnection retain the exact worker and receipt', asyn
   assert.equal(((await deadline) as { state: string }).state, 'deadline');
   assert.equal(receipts.launch(launch.launchId).launchId, launch.launchId);
   assert.throws(() => host.register(launch.launchId, child));
+});
+test('retained launches continue admission after 256 unconsumed receipts', () => {
+  const { receipts, launch } = fixture();
+  for (let index = 0; index < 256; index++) receipts.reserve(launch);
+  assert.equal(receipts.launch(launch.launchId).launchId, launch.launchId);
+  assert.equal(fs.readdirSync(receipts.root).filter((name) => !name.includes('.')).length, 257);
+});
+
+test('large dispositions never hide later event identities in bounded status pages', () => {
+  const { receipts, launch } = fixture();
+  const ids: string[] = [];
+  for (let index = 0; index < 70; index++) {
+    const event = report(receipts, launch.launchId, String(index));
+    ids.push(event.eventId);
+    const claim = receipts.claim(launch.launchId, event.eventId, origin, 'owner') as { token: string };
+    receipts.ack(launch.launchId, event.eventId, origin, 'owner', claim.token, '\u0001'.repeat(6000));
+  }
+  const found: string[] = [];
+  let cursor: string | undefined;
+  do {
+    const page = receipts.status(launch.launchId, cursor);
+    assert.ok(Buffer.byteLength(JSON.stringify(page)) < 48 * 1024);
+    found.push(...page.events.map((event) => event.eventId));
+    cursor = page.next ?? undefined;
+  } while (cursor);
+  assert.deepEqual(found, ids);
+  assert.equal((receipts.result(launch.launchId, ids[0]) as any).consumption.disposition, '\u0001'.repeat(6000));
+});
+
+test('dead write owners allow exact claim recovery while live owners remain protected', () => {
+  const { receipts, launch } = fixture();
+  const event = report(receipts, launch.launchId);
+  const first = receipts.claim(launch.launchId, event.eventId, origin, 'owner') as { token: string };
+  const lock = path.join(receipts.root, launch.launchId, 'write.lock');
+  const child = spawnSync(process.execPath, [
+    '-e',
+    "require('node:fs').writeFileSync(process.argv[1], JSON.stringify({pid:process.pid,token:process.argv[2],launchId:process.argv[3]}))",
+    lock,
+    turn,
+    launch.launchId,
+  ]);
+  assert.equal(child.status, 0);
+  assert.equal((receipts.claim(launch.launchId, event.eventId, origin, 'owner') as any).token, first.token);
+  fs.writeFileSync(lock, JSON.stringify({ pid: process.pid, token: turn, launchId: launch.launchId }));
+  assert.throws(() => receipts.claim(launch.launchId, event.eventId, origin, 'owner'), /holds/);
+  fs.unlinkSync(lock);
+});
+
+test('receipt write errors preserve native observation and retry without repeating input', () => {
+  const { receipts, launch } = fixture();
+  const saved = {
+    text: 'Final',
+    prompt: 'review',
+    promptId: 'turn-opaque',
+    responseIds: [],
+    finished: true,
+    failed: false,
+  };
+  const host = new HostedDispatch(receipts, () => saved);
+  const child = { key: 'worker', agent: 'codex', state: () => ({ sessionId: session, exited: false }) };
+  host.register(launch.launchId, child);
+  host.submitted(launch.launchId, 1);
+  const bind = vi.spyOn(receipts, 'bind').mockImplementationOnce(() => {
+    throw new Error('storage unavailable');
+  });
+  assert.doesNotThrow(() => host.accepted(launch.launchId, 'turn-opaque'));
+  bind.mockRestore();
+  host.observe(child, { kind: 'text', text: 'Final', sourceId: 'response' }, 1);
+  const publish = vi.spyOn(receipts, 'publish').mockImplementationOnce(() => {
+    throw new Error('storage unavailable');
+  });
+  assert.doesNotThrow(() => host.observe(child, { kind: 'native', event: { ...ending, turnId: 'turn-opaque' } }, 1));
+  assert.equal(receipts.status(launch.launchId).events.length, 0);
+  publish.mockRestore();
+  host.reconcileAll();
+  assert.equal(receipts.latest(launch.launchId)!.availability, 'available');
+  assert.equal(receipts.latest(launch.launchId)!.outcome, 'succeeded');
+});
+
+test('interrupted native endings agree with interrupted saved evidence without becoming failed', () => {
+  const { receipts, launch } = fixture();
+  const host = new HostedDispatch(receipts, () => ({
+    text: 'Partial',
+    prompt: 'review',
+    promptId: turn,
+    responseIds: [],
+    finished: true,
+    failed: false,
+    interrupted: true,
+  }));
+  const child = { key: 'worker', agent: 'codex', state: () => ({ sessionId: session, exited: false }) };
+  host.register(launch.launchId, child);
+  host.submitted(launch.launchId, 1);
+  host.observe(child, { kind: 'text', text: 'Partial', sourceId: 'response' }, 1);
+  host.observe(child, { kind: 'native', event: { ...ending, success: false } }, 1);
+  assert.equal(receipts.latest(launch.launchId), null);
+  host.observe(
+    child,
+    { kind: 'turnEnd', outcome: { status: 'interrupted', text: '', costUsd: null, turns: null, deniedTools: [] } },
+    1,
+  );
+  assert.equal(receipts.latest(launch.launchId)!.outcome, 'interrupted');
+  assert.equal(receipts.latest(launch.launchId)!.availability, 'available');
+});
+
+test('startup error observation and subsequent child exit publish one unknown event', () => {
+  const { receipts, launch } = fixture();
+  const host = new HostedDispatch(receipts, () => null);
+  const child = { key: 'worker', agent: 'codex', state: () => ({ sessionId: session, exited: true }) };
+  host.register(launch.launchId, child);
+  host.unavailable(launch.launchId);
+  host.exited(child);
+  assert.equal(receipts.status(launch.launchId).events.length, 1);
+});
+
+test.each(['claude', 'codex'] as const)(
+  'complete large %s evidence retains root identity and full final response',
+  (agent) => {
+    const { home } = fixture();
+    const file = path.join(home, 'session.jsonl');
+    const at = '2026-01-01T00:00:00Z';
+    const rows =
+      agent === 'claude'
+        ? [
+            { type: 'user', uuid: 'prompt', timestamp: at, message: { role: 'user', content: 'review' } },
+            { type: 'progress', padding: 'x'.repeat(600 * 1024) },
+            {
+              type: 'assistant',
+              timestamp: at,
+              message: {
+                id: 'response',
+                role: 'assistant',
+                stop_reason: 'end_turn',
+                content: [
+                  { type: 'text', text: 'First' },
+                  { type: 'text', text: 'Second' },
+                ],
+                usage: { input_tokens: 1, output_tokens: 2 },
+              },
+            },
+          ]
+        : [
+            { type: 'session_meta', payload: { id: session, cwd: home, source: 'vscode' } },
+            { type: 'event_msg', timestamp: at, payload: { type: 'task_started', turn_id: 'root-turn' } },
+            { type: 'event_msg', timestamp: at, payload: { type: 'user_message', message: 'review' } },
+            { type: 'progress', padding: 'x'.repeat(600 * 1024) },
+            {
+              type: 'response_item',
+              timestamp: at,
+              payload: {
+                type: 'message',
+                role: 'assistant',
+                content: [{ type: 'output_text', text: 'First\nSecond' }],
+              },
+            },
+            {
+              type: 'event_msg',
+              timestamp: at,
+              payload: { type: 'task_complete', turn_id: 'root-turn', last_agent_message: 'First\nSecond' },
+            },
+          ];
+    fs.writeFileSync(file, rows.map((row) => JSON.stringify(row)).join('\n') + '\n');
+    const source = {
+      file,
+      agent,
+      sessionId: session,
+      ...revisionOf(fs.statSync(file, { bigint: true })),
+    } as SessionFile;
+    let saved: SavedDispatchResponse | null = null;
+    for (let attempts = 0; attempts < 100 && !saved; attempts++)
+      saved = savedDispatchResponse(source, agent === 'claude' ? '1' : 'root-turn');
+    assert.ok(saved);
+    assert.equal(saved.text, 'First\nSecond');
+    assert.equal(saved.prompt, 'review');
+    assert.equal(saved.finished, true);
+    if (agent === 'claude') assert.deepEqual(saved.responseIds, ['response']);
+    assert.equal(savedDispatchResponse(source, agent === 'claude' ? '2' : 'foreign-turn'), null);
+  },
+);
+
+test.each([
+  ['win32', 'C:\\Private\\dispatch', 'D:\\Reports\\result.md', true],
+  ['win32', 'C:\\Private\\dispatch', 'c:\\private\\dispatch\\result.md', false],
+  ['darwin', '/private/var/Arc/dispatch', '/private/var/Arc/dispatch/result.md', false],
+  ['darwin', '/private/var/Arc/dispatch', '/Users/Reader/Reports/result.md', true],
+  ['linux', '/home/reader/.arc/dispatch', '/home/reader/.arc/dispatch/result.md', false],
+  ['linux', '/home/reader/.arc/dispatch', '/home/reader/reports/result.md', true],
+] as const)('report aliases retain independent %s admission for %s and %s', (platform, root, alias, expected) => {
+  assert.equal(outsideDispatchStorage(root, alias, platform), expected);
+});
+
+test('physical private parents refuse case variants and replaced private sources refuse refresh', () => {
+  const { receipts, launch } = fixture();
+  const event = report(receipts, launch.launchId);
+  const candidate = path.join(receipts.root.toUpperCase(), 'report.md');
+  if (fs.existsSync(path.dirname(candidate)))
+    assert.throws(() => receipts.reserve({ ...launch, alias: candidate }), /private dispatch/);
+  const source = receipts.status(launch.launchId).reportSource!;
+  fs.renameSync(source, source + '.old');
+  fs.writeFileSync(source, 'Replaced');
+  assert.throws(() => receipts.refresh(launch.launchId), /replaced/);
+  assert.equal((receipts.result(launch.launchId, event.eventId) as any).text, 'Report');
+});
+
+test('trusted system temp roots resolve their physical parents without admitting private aliases', () => {
+  const { receipts, launch, home } = fixture();
+  const aliasHome = tempDir('arc-system-temp-');
+  homes.push(aliasHome);
+  const aliasDirectory = path.join(aliasHome, 'temp');
+  fs.symlinkSync(home, aliasDirectory, process.platform === 'win32' ? 'junction' : 'dir');
+  const temporary = vi.spyOn(os, 'tmpdir').mockReturnValue(aliasDirectory);
+  syncBuiltinESMExports();
+  try {
+    assert.doesNotThrow(() => receipts.reserve({ ...launch, alias: path.join(aliasDirectory, 'report.md') }));
+    assert.throws(
+      () => receipts.reserve({ ...launch, alias: path.join(aliasDirectory, 'dispatch', 'report.md') }),
+      /private dispatch/,
+    );
+  } finally {
+    temporary.mockRestore();
+    syncBuiltinESMExports();
+    fs.unlinkSync(aliasDirectory);
+  }
 });

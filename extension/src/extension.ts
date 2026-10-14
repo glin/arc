@@ -368,18 +368,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       completion: request.params.completion ?? 'manual',
       alias: request.params.reportPath ?? null,
     }).launchId;
-  channel?.setDispatchHandler(async (request) => {
-    dispatch.reconcileAll();
-    const id = request.params.launchId!;
-    if (dispatch.receipts.launch(id).origin !== channel.hostId)
-      throw new Error('This dispatch belongs to another Arc activation.');
-    if (request.params.dispatchAction === 'wait')
-      return dispatch.wait(id, request.params.deadlineMs!, request.filterContext!.signal);
-    if (request.params.dispatchAction === 'refresh') dispatch.receipts.refresh(id);
-    return request.params.dispatchAction === 'result'
-      ? dispatch.receipts.result(id, request.params.eventId!)
-      : dispatch.receipts.status(id);
-  });
+  channel?.setDispatchHandler((request) =>
+    dispatch.request(channel.hostId, request.params, request.filterContext!.signal),
+  );
   const sessionTokens = new WeakMap<AgentSession, number>();
   let nextSessionToken = 1;
   const publishHostedSessions = () => {
@@ -1815,9 +1806,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             const session = live.state().sessionId;
             onSubmitted?.(session ?? '', turnId);
           });
-          if (start?.launchId) dispatch.accepted(start.launchId, live.nativeTurnIdentity(turnId));
           const session = live.state().sessionId;
           if (session) accepted = { session, turnId };
+          if (start?.launchId) dispatch.accepted(start.launchId, live.nativeTurnIdentity(turnId));
           acceptedDrafts.add(live.key);
           return turnId;
         },
@@ -1846,12 +1837,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           reason: `The session accepted its prompt, but its setup was not saved. ${(error as Error).message}`,
           ...accepted,
         };
-      if (start?.launchId)
-        dispatch.receipts.publish(
-          start.launchId,
-          { outcome: 'unknown', availability: 'unavailable', nativeEnding: null, askId: null },
-          null,
-        );
+      if (start?.launchId) dispatch.unavailable(start.launchId);
       void vscode.window.showErrorMessage(`Arc: ${(error as Error).message}`);
       return failedPromptDelivery(draft.profile.agent, error);
     }
