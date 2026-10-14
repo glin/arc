@@ -101,6 +101,14 @@ test('report text and serialized text both respect reply allowances', () => {
     assert.ok(Buffer.byteLength(JSON.stringify(result)) < 48 * 1024);
   }
 });
+
+test('retained reports reach the event limit without exceeding the internal state read allowance', () => {
+  const { receipts, launch } = fixture();
+  let last: DispatchEvent | null = null;
+  for (let index = 0; index < 256; index++) last = report(receipts, launch.launchId);
+  assert.equal((receipts.result(launch.launchId, last!.eventId) as { text: string }).text, 'Report');
+  assert.throws(() => report(receipts, launch.launchId), /event limit/);
+});
 test('authoritative receipt, report and accepted-turn replacements refuse', () => {
   const { receipts, launch } = fixture();
   const event = report(receipts, launch.launchId);

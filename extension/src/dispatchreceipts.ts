@@ -349,7 +349,7 @@ export class DispatchReceipts {
     launchId: string;
     events: { id: string; sha256: string; identity: FileIdentity; reportIdentity: FileIdentity | null }[];
   } {
-    const state = JSON.parse(read(this.file(id, 'state.json')));
+    const state = JSON.parse(read(this.file(id, 'state.json'), 4 * JSON_BYTES));
     if (state.launchId !== id || !Array.isArray(state.events) || state.events.length > 256)
       throw new Error('The dispatch state is invalid.');
     return state;
