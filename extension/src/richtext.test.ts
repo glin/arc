@@ -665,6 +665,26 @@ test('renderInlineMarkdown draws a link as its words with no anchor', () => {
   assert.match(html, /See store\.ts for the rest/);
 });
 
+test('inline session anchors require opt-in and reject ordinary or malformed targets', () => {
+  const session = '[**A\\-B**](arc-session:01a137a5-3d93-71d0-9492-965abeb0fa32)';
+  assert.doesNotMatch(renderInlineMarkdown(session), /<a /);
+  assert.match(
+    renderInlineMarkdown(session, undefined, true),
+    /data-link="arc-session:[^"]+".*<strong>A-B<\/strong><\/a>/,
+  );
+  for (const target of [
+    'https://example.com',
+    'src/file.ts',
+    'arc-session:%zz',
+    'arc-session:bad/id',
+    'arc-visualization:/tmp/chart.html',
+  ]) {
+    assert.doesNotMatch(renderInlineMarkdown(`[label](${target})`, undefined, true), /<a |<button/);
+  }
+  assert.doesNotMatch(renderInlineMarkdown('`' + session + '`', undefined, true), /<a /);
+  assert.doesNotMatch(renderRichMarkdown(session, undefined, true), /<a /);
+});
+
 test('renderInlineMarkdown draws a picture as its alt text with no img', () => {
   assert.equal(renderInlineMarkdown('![a chart](chart.png)'), 'a chart');
   assert.doesNotMatch(renderInlineMarkdown('![](chart.png)'), /<img/);

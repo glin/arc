@@ -39,6 +39,7 @@ function overlayStaticSources(source: string): void {
     'sessionexport.ts',
     'exportdata.ts',
     'transcript.ts',
+    'richtext.ts',
     'codex.ts',
     'domain/export-model.ts',
     'readmeter.ts',

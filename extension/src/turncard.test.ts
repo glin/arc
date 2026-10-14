@@ -107,6 +107,7 @@ import { answerPart, commentAnchorText } from './turncomments.ts';
 import { formatTokens, formatWhen } from './turnformat.ts';
 import {
   COMPACTION_SAMPLES,
+  SESSION_LINK_RESPONSE,
   NOW,
   advisorProbeRecords,
   advisorResponseRecords,
@@ -2247,6 +2248,44 @@ test('a headline with inline markup carries headlineHtml, and a plain one carrie
   const tripled = toCard(turn({ summary: 'a ***bold em*** line' }), false, NOW);
   assert.equal(tripled.headline, 'a bold em line');
   assert.equal(tripled.headlineHtml, 'a <em><strong>bold em</strong></em> line');
+});
+
+test('the reported escaped session response retains a collapsed session anchor', () => {
+  const card = toCard(turn({ summary: SESSION_LINK_RESPONSE }), false, NOW);
+  assert.equal(card.headline, 'Launched code-coordinate-1-native-session-skills-sol, pinned under packaging.');
+  assert.match(card.headlineHtml ?? '', /<a href="#" data-link="arc-session:01a137a5-3d93-71d0-9492-965abeb0fa32"/);
+  assert.match(card.headlineHtml ?? '', />code-coordinate-1-native-session-skills-sol<\/a>/);
+  assert.match(card.headlineHtml ?? '', /<strong>packaging<\/strong>/);
+});
+
+test('collapsed fenced and inline session examples remain literal', () => {
+  const line = String.raw`[code\-example](arc-session:01a137a5-3d93-71d0-9492-965abeb0fa32)`;
+  for (const fence of ['```markdown', '~~~~text']) {
+    const card = toCard(
+      turn({ summary: `${fence}\n${line}\n${fence.slice(0, fence.startsWith('`') ? 3 : 4)}` }),
+      false,
+      NOW,
+    );
+    assert.equal(card.headline, line);
+    assert.equal(card.headlineHtml, undefined);
+  }
+  for (const summary of [
+    `- \`\`\`\n\t${line}\n\t\`\`\``,
+    `1. \`\`\`\n\t${line}\n\t\`\`\``,
+    `- \`\`\`\n  ${line}\n  \`\`\``,
+    `> - \`\`\`\n>   ${line}\n>   \`\`\``,
+    `> 1. > ~~~~text\n>    > ${line}\n>    > ~~~~`,
+    `- \`\`\`\`markdown\n  ${line}\n  \`\`\``,
+  ]) {
+    const card = toCard(turn({ summary }), false, NOW);
+    assert.equal(card.headline, line, summary);
+    assert.equal(card.headlineHtml, undefined, summary);
+  }
+  const inline = toCard(turn({ summary: `Example: \`${line}\`` }), false, NOW);
+  assert.equal(inline.headline, `Example: ${line}`);
+  assert.doesNotMatch(inline.headlineHtml ?? '', /<a /);
+  const after = toCard(turn({ summary: `~~~\n\n~~~\n${SESSION_LINK_RESPONSE}` }), false, NOW);
+  assert.match(after.headlineHtml ?? '', /<a /);
 });
 
 test("a folded headline keeps a file name's underscore and gets headlineHtml", () => {

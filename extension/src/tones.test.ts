@@ -841,6 +841,7 @@ const SUBAGENT_ROW_OTHER_COLOURS = [
   '.effort { color: var(--idle) }',
   '.empty .dim { color: var(--idle) }',
   '.failed .glyph { color: var(--bad) }',
+  '.headline a { color: var(--vscode-textLink-foreground) }',
   '.headline strong { color: var(--vscode-foreground) }',
   '.hintcard .railstats .ctx-filling { color: var(--vscode-editorWidget-foreground, var(--vscode-foreground)) }',
   '.hintcard .railstats .ctx-getting-full { color: var(--vscode-editorWidget-foreground, var(--vscode-foreground)) }',

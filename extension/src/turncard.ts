@@ -64,7 +64,7 @@ import {
   cleanPrompt,
   closingRows,
   firstLine,
-  headlineMarkdownOf,
+  headlineSourceOf,
   headlineOf,
   isInside,
   normalizeFsPath,
@@ -3770,11 +3770,13 @@ export function headlineFor(
 // Renders summary-derived headline Markdown only when its visible text matches the plain headline.
 // A mismatch leaves the plain headline for consistent display, hover, and accessible text.
 function headlineHtmlFor(summaryText: string, headline: string): string | undefined {
-  const line = withoutLeadingSymbol(headlineMarkdownOf(summaryText));
+  const source = headlineSourceOf(summaryText);
+  if (!source || source.fenced) return undefined;
+  const line = withoutLeadingSymbol(source.text.trim());
   if (line === headline) {
     return undefined;
   }
-  const html = renderInlineMarkdown(line);
+  const html = renderInlineMarkdown(line, undefined, true);
   return visibleTextOf(html) === headline ? html : undefined;
 }
 

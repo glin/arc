@@ -12,6 +12,7 @@ import {
 } from './turncard.ts';
 import { createCodexSessionReducer } from './codex.ts';
 import { renderRichMarkdown } from './richtext.ts';
+import { SESSION_LINK_RESPONSE, turn } from './turnfixtures.ts';
 
 test('response citations retain literal destinations through mouse, keyboard and streamed card updates', async (t) => {
   const browser = await browserOrNone();
@@ -3203,6 +3204,62 @@ test('named response session links activate inside Arc by click and Enter, inclu
     await page.setContent(themed(pageHtml()));
     const payload = renderPayload() as Payload;
     const id = '7390194c-8fea-4b6d-80be-e7e8c7684426';
+    const preview = { ...toCard(turn({ summary: SESSION_LINK_RESPONSE }), false, NOW), key: 's1:collapsed-session' };
+    await post(page, { ...payload, cards: [preview] });
+    const headline = page.locator('.headline a[data-link]');
+    const head = page.locator(`[data-control=${JSON.stringify(`card:${preview.key}`)}]`);
+    const entries = manifestMenu(JSON.parse(readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')));
+    const mergedContext = await headline.evaluate((node) => {
+      const ancestors = [];
+      for (let at: Element | null = node; at; at = at.parentElement) {
+        const raw = at.getAttribute('data-vscode-context');
+        if (raw) ancestors.unshift(JSON.parse(raw));
+      }
+      return Object.assign({}, ...ancestors);
+    });
+    assert.deepEqual(menuGroups(entries, mergedContext).flat(), []);
+    await headline.dispatchEvent('contextmenu');
+    await page.evaluate('window.__posted.length = 0');
+    await headline.click();
+    await headline.focus();
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => (window as any).__posted.length === 2);
+    assert.deepEqual(await page.evaluate('window.__posted'), [
+      { type: 'showSession', session: '01a137a5-3d93-71d0-9492-965abeb0fa32', responseLink: true },
+      { type: 'showSession', session: '01a137a5-3d93-71d0-9492-965abeb0fa32', responseLink: true },
+    ]);
+    assert.equal(await head.getAttribute('aria-expanded'), 'false');
+    assert.equal(await page.locator('.turn.is-read').count(), 0);
+    await headline.evaluate((node) => {
+      (window as any).__oldHeadline = node;
+    });
+    await post(page, { type: 'activity', session: preview.sessionId, card: { ...preview, headlineHtml: undefined } });
+    await page.evaluate('window.__posted.length = 0; window.__oldHeadline.click()');
+    assert.deepEqual(
+      await page.evaluate('window.__posted'),
+      [],
+      'the removed headline retained its navigation handler',
+    );
+    const updated = {
+      ...preview,
+      headlineHtml: preview.headlineHtml!.replace('01a137a5-3d93-71d0-9492-965abeb0fa32', id),
+    };
+    await post(page, { type: 'activity', session: preview.sessionId, card: updated });
+    await headline.click();
+    assert.deepEqual(await page.evaluate('window.__posted'), [
+      { type: 'showSession', session: id, responseLink: true },
+    ]);
+    await post(page, {
+      type: 'activity',
+      session: preview.sessionId,
+      card: { ...updated, headlineHtml: updated.headlineHtml.replace(id, 'bad/id') },
+    });
+    await page.evaluate('window.__posted.length = 0');
+    await headline.click();
+    assert.deepEqual(await page.evaluate('window.__posted'), []);
+    await head.focus();
+    await page.keyboard.press('Enter');
+    assert.equal(await head.getAttribute('aria-expanded'), 'true');
     const card = {
       ...payload.cards[0],
       summaryHtml:
@@ -3213,7 +3270,6 @@ test('named response session links activate inside Arc by click and Enter, inclu
     };
     await post(page, { ...payload, cards: [card] });
     await page.locator(`[data-control=${JSON.stringify(`card:${card.key}`)}]`).click();
-    const entries = manifestMenu(JSON.parse(readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')));
     for (const link of await page.locator('a[data-link]').all()) {
       const context = await link.evaluate((node) => {
         const ancestors = [];

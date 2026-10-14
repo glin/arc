@@ -5,6 +5,13 @@ import type { SiteManifest } from './webview/export-model';
 // Keep a builder in its test file until another test file or shared builder needs it.
 import { Compaction, ToolCounts, Turn, TurnAgent, TurnCommit, TurnLanding, TurnSkillUse } from './transcript.ts';
 
+export const SESSION_LINK_RESPONSE =
+  String.raw`Launched [code\-coordinate\-1\-native\-session\-skills\-sol](${ARC_IDENTITY.sessionScheme}01a137a5-3d93-71d0-9492-965abeb0fa32), pinned under **packaging**.` +
+  '\n\n- **Coordinator:** Sol xhigh, verified on OpenAI.' +
+  '\n- **Implementers:** one fresh Sol high writer per round, with fresh Opus high and Sol high reviews.' +
+  '\n- **Budget:** USD250 accumulated hard cap, including prior spend.' +
+  '\n- **Task:** implement, test and land native skill installation into main. Keep **Label**, with `tag` clarified in the skill.';
+
 export function claudeCostState(modelUsage: Record<string, Record<string, number>>, startTime = 1, sessionId = 's') {
   return { type: 'cost-state', sessionId, startTime, totalDuration: 1, modelUsage };
 }

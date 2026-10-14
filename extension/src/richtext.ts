@@ -283,11 +283,32 @@ function visitCitationMarkdown(text: string, consume: (start: number) => number)
   }
 }
 
-function markdownLiteralRanges(text: string): Uint8Array {
+function markdownLiteralRanges(text: string, onCode?: (start: number, end: number, text: string) => void): Uint8Array {
   const literal = new Uint8Array(text.length);
   const pending: { text: string; positions: number[] | null }[] = [{ text, positions: null }];
   while (pending.length) {
-    const { text, positions } = pending.pop()!;
+    let { text, positions } = pending.pop()!;
+    // Marked expands leading tabs before recognizing block containers.
+    // Each expanded space retains the tab's original source position.
+    if (/^ *\t/m.test(text)) {
+      const originalPositions = positions;
+      const normalizedPositions: number[] = [];
+      let offset = 0;
+      const copyUntil = (end: number): void => {
+        for (; offset < end; offset += 1) normalizedPositions.push(originalPositions?.[offset] ?? offset);
+      };
+      const normalized = text.replace(/^( *)(\t+)/gm, (_match, spaces: string, tabs: string, start: number) => {
+        copyUntil(start + spaces.length);
+        for (let tab = 0; tab < tabs.length; tab += 1, offset += 1) {
+          const position = originalPositions?.[offset] ?? offset;
+          normalizedPositions.push(position, position, position, position);
+        }
+        return spaces + '    '.repeat(tabs.length);
+      });
+      copyUntil(text.length);
+      text = normalized;
+      positions = normalizedPositions;
+    }
     const position = (index: number): number => (positions ? positions[index] : index);
     const mark = (start: number, end: number): void => {
       if (!positions) literal.fill(1, start, end);
@@ -307,7 +328,10 @@ function markdownLiteralRanges(text: string): Uint8Array {
         | marked.Tokens.Code
         | undefined;
       if (block) {
-        if (block.type === 'code') mark(offset, offset + block.raw.length);
+        if (block.type === 'code') {
+          mark(offset, offset + block.raw.length);
+          onCode?.(position(offset), position(offset + block.raw.length - 1) + 1, block.text);
+        }
         offset += block.raw.length;
         continue;
       }
@@ -378,6 +402,13 @@ function markdownLiteralRanges(text: string): Uint8Array {
     }
   }
   return literal;
+}
+
+// Code blocks retain their original extents and text without list or blockquote prefixes.
+export function markdownCodeBlocks(text: string): { start: number; end: number; text: string }[] {
+  const blocks: { start: number; end: number; text: string }[] = [];
+  markdownLiteralRanges(text, (start, end, text) => blocks.push({ start, end, text }));
+  return blocks.sort((a, b) => a.start - b.start);
 }
 
 // Match structure before Markdown lexing, which otherwise consumes tight bodies as HTML.
@@ -747,16 +778,20 @@ export function renderRichMarkdown(text: string, resolveImage?: ImageResolver, i
   }
 }
 
-// Renders inline text without raw HTML, link anchors, image elements, or buttons.
-// Images retain alt text or file names so folded headlines add no controls.
-export function renderInlineMarkdown(text: string, links?: marked.TokensList['links']): string {
+// Renders inline text without raw HTML, image elements, or buttons.
+// Session anchors require explicit opt-in. Other links retain only their visible text.
+export function renderInlineMarkdown(text: string, links?: marked.TokensList['links'], sessionLinks = false): string {
   if (!text) {
     return '';
   }
   try {
     const renderer = new marked.Renderer();
     renderer.html = (html: string) => escapeHtml(html);
-    renderer.link = (_href: string | null, _title: string | null | undefined, body: string) => body;
+    renderer.link = (href: string | null, _title: string | null | undefined, body: string) => {
+      if (!sessionLinks || parseSessionLink(href || '').kind !== 'session') return body;
+      const label = insideLink(body);
+      return `<a href="#" data-link="${escapeHtml(href || '')}" aria-label="Open session: ${label.replace(/<[^>]*>/g, '').replace(/"/g, '&quot;')}">${label}</a>`;
+    };
     renderer.image = (href: string | null, _title: string | null, alt: string) => {
       const written = (alt || '').replace(/\s+/g, ' ').trim();
       return written || escapeHtml(imageFileName(href || ''));

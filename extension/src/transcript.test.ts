@@ -282,6 +282,7 @@ import {
 } from './agentspend.ts';
 import { estimateCost, quoteUsage } from './pricing.ts';
 import { renderInlineMarkdown } from './richtext.ts';
+import { SESSION_LINK_RESPONSE } from './turnfixtures.ts';
 import type { BackwardRangeReader, TurnCommit, TurnUsage } from './transcript.ts';
 import {
   projectsRoot,
@@ -6525,11 +6526,33 @@ test('headlineOf agrees with what marked renders for nested, tripled and intrawo
   }
 });
 
+test('headlineOf normalizes escaped punctuation without changing code spans or literal backslashes', () => {
+  assert.equal(
+    headlineOf(SESSION_LINK_RESPONSE),
+    'Launched code-coordinate-1-native-session-skills-sol, pinned under packaging.',
+  );
+  assert.equal(headlineOf(String.raw`**A\-B** and \*literal\* with \q.`), String.raw`A-B and *literal* with \q.`);
+  assert.equal(headlineOf('Run `a\\-b`'), String.raw`Run a\-b`);
+});
+
 test('headlineOf skips a fence line and reads the content it encloses', () => {
   // A fence opener's language tag supplies no headline text.
 
-  assert.equal(headlineOf('```markdown\n**Done** - the report is ready.\n```'), 'Done - the report is ready.');
+  assert.equal(headlineOf('```markdown\n**Done** - the report is ready.\n```'), '**Done** - the report is ready.');
   assert.equal(headlineOf('```\nPlain code line.\n```'), 'Plain code line.');
+  const line = '[example](arc-session:01a137a5-3d93-71d0-9492-965abeb0fa32)';
+  for (const summary of [
+    `1. \`\`\`\n\t${line}\n\t\`\`\``,
+    `- \`\`\`\n\t${line}\n\t\`\`\``,
+    `- \`\`\`markdown\n  ${line}\n  \`\`\``,
+    `> - \`\`\`\n>   ${line}\n>   \`\`\``,
+    `> 1. > ~~~~text\n>    > ${line}\n>    > ~~~~`,
+    `- \`\`\`\`markdown\n  ${line}\n  \`\`\``,
+  ]) {
+    assert.equal(headlineOf(summary), line, summary);
+    assert.equal(headlineMarkdownOf(summary), line, summary);
+  }
+  assert.equal(headlineOf('- ~~~\n  \n  ~~~\n\nThe response follows.'), 'The response follows.');
 });
 
 test('headlineMarkdownOf picks the same line as headlineOf and keeps its markup', () => {

@@ -138,7 +138,19 @@ function stop(event: Event): void {
   event.stopPropagation();
 }
 
-function Summary({ html, card, options }: { html: string; card: CardView; options: CardRenderOptions }) {
+function Summary({
+  html,
+  card,
+  options,
+  headline = false,
+  hidden = false,
+}: {
+  html: string;
+  card: CardView;
+  options: CardRenderOptions;
+  headline?: boolean;
+  hidden?: boolean;
+}) {
   const root = useRef<HTMLDivElement>(null);
   const retained = useRef<DisclosureSnapshot>({ open: new Map(), focus: null });
   if (root.current) retained.current = captureDisclosures(root.current);
@@ -154,7 +166,12 @@ function Summary({ html, card, options }: { html: string; card: CardView; option
     }
     return undefined;
   }, [html, card.kind, card.sessionId, card.key]);
-  return h('div', { class: 'summary', ref: root, dangerouslySetInnerHTML: { __html: html } });
+  return h('div', {
+    class: headline ? 'headline' : 'summary',
+    hidden,
+    ref: root,
+    dangerouslySetInnerHTML: { __html: html },
+  });
 }
 
 function disclosureId(card: CardView, part: string): string {
@@ -1811,11 +1828,13 @@ function Card({
       ),
     ),
     card.headlineHtml
-      ? h('div', {
-          class: 'headline',
+      ? h(Summary, {
+          headline: true,
+          html: card.headlineHtml,
+          card,
+          options,
           hidden: !!card.summaryHtml && expanded,
           key: 'html',
-          dangerouslySetInnerHTML: { __html: card.headlineHtml },
         })
       : h('div', { class: 'headline', hidden: !!card.summaryHtml && expanded, key: 'text' }, card.headline),
     h('div', { class: 'doing', hidden: !card.doing || expanded }, doing),

@@ -57,7 +57,7 @@ import {
   type HiddenParserState,
   type HiddenStatePolicy,
 } from './parserstate';
-import { withoutRichContent } from './richtext';
+import { markdownCodeBlocks, renderInlineMarkdown, visibleTextOf, withoutRichContent } from './richtext';
 import {
   compactionEstimate,
   cacheLapsedBy,
@@ -5403,7 +5403,7 @@ const ORDERED = /^\s*\d+\.\s+/;
 // it. It belongs to that item, so it is not the end of the list it sits in.
 const CONTINUATION = /^\s+\S/;
 
-// Code-fence marker excluded from headline content. Enclosed lines remain eligible.
+// Fence markers are omitted while reading opening-list content.
 const FENCE = /^\s*(```|~~~)/;
 
 // Removes structural Markdown at the raw line start, before splitting code spans.
@@ -5414,10 +5414,11 @@ function stripStructuralMarkdown(line: string): string {
     .replace(/^\s*\d+\.\s+/, ''); // ordered item
 }
 
-// Link text, emphasis marks by the GFM rule `stripEmphasisMarkers` applies, and a stray
-// backtick that never paired into a code span. The structural markers above are already
-// gone by the time this runs.
+// Removes inline markup after structural markers. Escaped lines use the Markdown renderer.
+// Other lines remove emphasis and unmatched backticks while keeping balanced code spans literal.
 function stripInlineMarkdown(line: string): string {
+  // Markdown escapes retain their meaning inside emphasis and link labels. Code spans remain literal.
+  if (line.includes('\\')) return visibleTextOf(renderInlineMarkdown(line)).trim();
   const withLinkText = line.replace(/\[([^\]]+)\]\([^)]*\)/g, '$1'); // link text
   return withCodeSpansPreserved(withLinkText, (piece) => stripEmphasisMarkers(piece).replace(/`/g, '')).trim();
 }
@@ -5426,10 +5427,22 @@ function stripMarkdown(line: string): string {
   return stripInlineMarkdown(stripStructuralMarkdown(line));
 }
 
-// First content-bearing summary line with structural markers removed and inline Markdown retained.
-function headlineLine(summary: string): string | null {
+// Selects the first content-bearing summary line and retains its fenced-code context.
+export function headlineSourceOf(summary: string): { text: string; fenced: boolean } | null {
+  const blocks = markdownCodeBlocks(summary);
+  let blockIndex = 0;
+  let offset = 0;
   for (const raw of summary.split('\n')) {
-    if (FENCE.test(raw)) {
+    const start = offset;
+    offset += raw.length + 1;
+    while (blocks[blockIndex]?.end <= start) blockIndex += 1;
+    const block = blocks[blockIndex];
+    if (block && block.start < offset && block.end > start) {
+      const text = block.text
+        .split('\n')
+        .find((line) => line.trim())
+        ?.trim();
+      if (text) return { text, fenced: true };
       continue;
     }
     const structural = stripStructuralMarkdown(raw);
@@ -5437,7 +5450,7 @@ function headlineLine(summary: string): string | null {
     if (!plain || SECTION_ONLY.test(plain)) {
       continue;
     }
-    return structural;
+    return { text: structural, fenced: false };
   }
   return null;
 }
@@ -5445,14 +5458,13 @@ function headlineLine(summary: string): string | null {
 // The one line that says what the turn did: the first line of the summary that carries
 // content rather than naming a section.
 export function headlineOf(summary: string): string {
-  const line = headlineLine(summary);
-  return line === null ? '' : stripInlineMarkdown(line);
+  const source = headlineSourceOf(summary);
+  return source === null ? '' : source.fenced ? source.text : stripInlineMarkdown(source.text);
 }
 
 // Same headline line with inline Markdown retained for folded-card rendering.
 export function headlineMarkdownOf(summary: string): string {
-  const line = headlineLine(summary);
-  return line === null ? '' : line.trim();
+  return headlineSourceOf(summary)?.text.trim() ?? '';
 }
 
 // Plain-text items in the summary's opening list, ending before its later sections.

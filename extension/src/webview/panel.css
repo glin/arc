@@ -2428,12 +2428,14 @@ button.sha:focus-visible {
 .summary tbody tr:nth-child(2n) {
   background: var(--vscode-textCodeBlock-background);
 }
-.summary a {
+.summary a,
+.headline a {
   color: var(--vscode-textLink-foreground);
   text-decoration: none;
   cursor: pointer;
 }
-.summary a:hover {
+.summary a:hover,
+.headline a:hover {
   text-decoration: underline;
 }
 /* Named so it cannot collide with the card's expanded state. A bare .open selector also
