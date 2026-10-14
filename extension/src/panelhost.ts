@@ -1637,6 +1637,14 @@ export class PanelProvider implements vscode.Disposable {
         start?: GuardedStartContext,
       ) => Promise<PromptDelivery>)
     | null = null;
+  public onReserveDispatch:
+    | ((request: import('./sessionrequests').SessionRequest, draft: NewSessionDraft) => string)
+    | null = null;
+  public onDispatchEvent:
+    | ((key: string, event: import('./agentwire').WireEvent, submission: number | undefined) => void)
+    | null = null;
+  public onDispatchExit: ((key: string) => void) | null = null;
+  public onDispatchEvidence: (() => void) | null = null;
   public setupProject: string | null = null;
   public onSetupRefresh: (() => void) | null = null;
   private setupOwner?: string;
@@ -2287,9 +2295,20 @@ export class PanelProvider implements vscode.Disposable {
       policy,
       agentRun: params.agentRun,
     };
-    const delivery = await this.onSendDraftPrompt(draft, { text, assets: [] }, undefined, guardedStartContext(request));
+    const start = guardedStartContext(request);
+    if (params.dispatch) {
+      if (!this.onReserveDispatch) throw new Error('Dispatch receipt storage is unavailable.');
+      start.launchId = this.onReserveDispatch(request, draft);
+    }
+    const delivery = await this.onSendDraftPrompt(draft, { text, assets: [] }, undefined, start);
     if (!delivery.delivered || !delivery.session)
-      return { version: 1, status: 'refused', reason: delivery.reason, requester: request.requester };
+      return {
+        version: 1,
+        status: 'refused',
+        reason: delivery.reason,
+        requester: request.requester,
+        ...(start.launchId ? { launchId: start.launchId } : {}),
+      };
     const session = delivery.session;
     const errors: string[] = delivery.reason ? [delivery.reason] : [];
     try {
@@ -2340,6 +2359,7 @@ export class PanelProvider implements vscode.Disposable {
       agentRun: params.agentRun,
       requester: request.requester,
       errors,
+      ...(start.launchId ? { launchId: start.launchId } : {}),
     };
   }
 
@@ -2590,6 +2610,17 @@ export class PanelProvider implements vscode.Disposable {
       .finally(() => {
         if (this.filterApplications?.get(msg.request) === pending) this.filterApplications.delete(msg.request);
       });
+  }
+
+  public dispatchSource(provider: string, sessionId: string): SessionFile | null {
+    const scope = this.repositoryScope.snapshot(this.folders());
+    if (!scope.ready || this.authoritativeCatalogScope !== JSON.stringify(scope.roots)) return null;
+    const matches = this.authoritativeCatalog
+      ? this.sessionPageIndexFor(this.authoritativeCatalog, JSON.stringify(scope.roots), scope.roots).scoped.filter(
+          (one) => one.sessionId === sessionId && one.agent === provider,
+        )
+      : [];
+    return matches.length === 1 ? matches[0] : null;
   }
 
   public readSessionRequest(request: import('./sessionrequests').SessionRequest): unknown {
@@ -8363,6 +8394,7 @@ export class PanelProvider implements vscode.Disposable {
           this.performanceCounters.recordRefreshStage('unchanged');
         }
         if (!selectedOnly && this.repositoryScopeReady) this.onSessionRowsRefreshed?.();
+        if (!selectedOnly && this.repositoryScopeReady) this.onDispatchEvidence?.();
         if (!selectedOnly && this.repositoryScopeReady && this.saved.agentRead?.length) this.restoreAgentReads();
         if (!selectedOnly) {
           this.scheduleProjectSpendHydration(generation);
@@ -8440,6 +8472,7 @@ export class PanelProvider implements vscode.Disposable {
         ...this.sessionRows,
       ];
       if (!selectedOnly && this.repositoryScopeReady) this.onSessionRowsRefreshed?.();
+      if (!selectedOnly && this.repositoryScopeReady) this.onDispatchEvidence?.();
       if (!selectedOnly && this.repositoryScopeReady && this.saved.agentRead?.length) this.restoreAgentReads();
       if (!selectedOnly && this.authoritativeCatalog !== null) {
         this.drainInitialCatalogRefresh();

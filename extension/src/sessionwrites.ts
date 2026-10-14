@@ -25,7 +25,14 @@ export interface SessionWriteParams {
   cwd?: string;
   readOnly?: boolean;
   readTools?: string[];
+  dispatch?: boolean;
+  completion?: 'manual' | 'wait';
+  reportPath?: string;
+  launchId?: string;
+  eventId?: string;
+  deadlineMs?: number;
   action?: 'label-add' | 'label-remove' | 'pin' | 'unpin' | 'archive' | 'unarchive';
+  dispatchAction?: 'result' | 'status' | 'wait' | 'refresh';
   dryRun?: boolean;
   force?: boolean;
   // A sessions listing page. The host signs the cursor, and the CLI passes it through unread.
@@ -65,11 +72,29 @@ export function validSessionWrite(method: string, params: Record<string, unknown
     );
   if (method === 'start') {
     const setup = params.setup as Record<string, unknown> | undefined;
-    const fields = ['setup', 'prompt', 'name', 'labels', 'pinned', 'agentRun', 'cwd', 'readOnly', 'readTools'];
+    const fields = [
+      'setup',
+      'prompt',
+      'name',
+      'labels',
+      'pinned',
+      'agentRun',
+      'cwd',
+      'readOnly',
+      'readTools',
+      'dispatch',
+      'completion',
+      'reportPath',
+    ];
     return (
       Object.keys(params).every((key) => fields.includes(key)) &&
       text(params.prompt, 48 * 1024) &&
       typeof params.agentRun === 'boolean' &&
+      (params.dispatch === undefined || params.dispatch === true) &&
+      (params.completion === undefined ||
+        (params.dispatch === true && ['manual', 'wait'].includes(params.completion as string))) &&
+      (params.reportPath === undefined ||
+        (params.dispatch === true && text(params.reportPath, 4096) && !!params.reportPath)) &&
       (params.cwd === undefined || (text(params.cwd, 4096) && !!params.cwd)) &&
       (params.readOnly === undefined || typeof params.readOnly === 'boolean') &&
       (params.readTools === undefined ||
@@ -437,6 +462,7 @@ export interface GuardedOwner<C extends GuardedChild = GuardedChild> {
 export interface GuardedStartContext {
   requestId: string;
   requester: RequesterIdentity | null;
+  launchId?: string;
 }
 
 // The facts a session read binds into an observation.

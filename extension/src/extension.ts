@@ -1,5 +1,9 @@
 import { type LaunchPolicy, refusePolicyChange } from './launchpolicy';
 import { LaunchPolicyStore } from './launchpolicystore';
+import { DispatchReceipts } from './dispatchreceipts';
+import { HostedDispatch } from './dispatchhost';
+import { savedDispatchResponse } from './sessionreads';
+import { payloadSha256, requesterOf } from './sessionwrites';
 import { MEASUREMENT_ENVIRONMENT } from './identity';
 import { askIdleDefaults } from './agenthost';
 import type { HostedSessionObservation } from './sessionreads';
@@ -352,6 +356,30 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   // The commands event publishes the complete catalog. Skip the following state callback's redundant panel update.
   const commandStateChanges = new Set<string>();
+  const dispatch = new HostedDispatch(new DispatchReceipts(), (provider, session, turn) =>
+    savedDispatchResponse(panel.dispatchSource(provider, session), turn),
+  );
+  panel.onReserveDispatch = (request, draft) =>
+    dispatch.receipts.reserve({
+      origin: channel!.hostId,
+      requester: requesterOf(request),
+      policy: draft.policy ?? null,
+      promptSha256: payloadSha256(request.params.prompt!),
+      completion: request.params.completion ?? 'manual',
+      alias: request.params.reportPath ?? null,
+    }).launchId;
+  channel?.setDispatchHandler(async (request) => {
+    dispatch.reconcileAll();
+    const id = request.params.launchId!;
+    if (dispatch.receipts.launch(id).origin !== channel.hostId)
+      throw new Error('This dispatch belongs to another Arc activation.');
+    if (request.params.dispatchAction === 'wait')
+      return dispatch.wait(id, request.params.deadlineMs!, request.filterContext!.signal);
+    if (request.params.dispatchAction === 'refresh') dispatch.receipts.refresh(id);
+    return request.params.dispatchAction === 'result'
+      ? dispatch.receipts.result(id, request.params.eventId!)
+      : dispatch.receipts.status(id);
+  });
   const sessionTokens = new WeakMap<AgentSession, number>();
   let nextSessionToken = 1;
   const publishHostedSessions = () => {
@@ -410,6 +438,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     spawner,
     idleDurationMs: readSetting('agentIdleMinutes') * 60_000,
     onEvent: ({ key, event, turnId }) => {
+      panel.onDispatchEvent?.(key, event, turnId);
       if (event.kind === 'native') {
         const child = host.get(key);
         if (child) compaction?.native(child, event.event, turnId);
@@ -594,6 +623,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       void panel.refresh();
     },
     onStateChange: (state) => {
+      if (state.exited) panel.onDispatchExit?.(state.key);
       if (state.exited) {
         policyMoves.delete(state.key);
         policies.forgetClear(state.key);
@@ -622,6 +652,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       }
     },
   });
+  panel.onDispatchEvent = (key, event, submission) => {
+    const child = host.get(key);
+    if (child) dispatch.observe(child, event, submission);
+  };
+  panel.onDispatchExit = (key) => {
+    const child = host.get(key);
+    if (child) dispatch.exited(child);
+  };
+  panel.onDispatchEvidence = () => dispatch.reconcileAll();
   const activation = channel?.windowId;
   if (channel && activation) {
     const owner = new CompactHost<AgentSession>(activation, {
@@ -1761,6 +1800,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     try {
       // Only a start that carries a requester echoes user messages, because guarded follow-ups use the echo as a receipt.
       const liveSession = await startFreshSession(draft, !!start?.requester);
+      if (start?.launchId) dispatch.register(start.launchId, liveSession);
       validateResolvedPromptAssets(prompt.assets);
       let prompted: AgentSession | null = null;
       const turnId = await withStartedSessionActivity(
@@ -1770,10 +1810,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           const knownId = live.state().sessionId;
           if (knownId) await savePolicy(knownId, draft.policy);
           const turnId = await live.prompt(prompt, (turnId) => {
+            if (start?.launchId) dispatch.submitted(start.launchId, turnId);
             compaction?.submitted(live, turnId);
             const session = live.state().sessionId;
             onSubmitted?.(session ?? '', turnId);
           });
+          if (start?.launchId) dispatch.accepted(start.launchId, live.nativeTurnIdentity(turnId));
           const session = live.state().sessionId;
           if (session) accepted = { session, turnId };
           acceptedDrafts.add(live.key);
@@ -1804,6 +1846,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           reason: `The session accepted its prompt, but its setup was not saved. ${(error as Error).message}`,
           ...accepted,
         };
+      if (start?.launchId)
+        dispatch.receipts.publish(
+          start.launchId,
+          { outcome: 'unknown', availability: 'unavailable', nativeEnding: null, askId: null },
+          null,
+        );
       void vscode.window.showErrorMessage(`Arc: ${(error as Error).message}`);
       return failedPromptDelivery(draft.profile.agent, error);
     }

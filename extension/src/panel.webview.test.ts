@@ -3778,6 +3778,40 @@ test('window read-only starts deliver both setup providers and exact immutable p
     }
 });
 
+test('window dispatch starts reserve a launch receipt before worker delivery and refuse unavailable reservation', async () => {
+  const provider: any = liveProviderFixture(livePress({ sessionId: 'reader', agent: 'codex' })).provider;
+  const profile: SessionProfile = { agent: 'codex', model: '', effort: '', permissionMode: '', source: 'recent' };
+  const view = sessionLauncherView(null, [profile], {});
+  const order: string[] = [];
+  Object.assign(provider, {
+    setupProject: 'project',
+    pendingModels: [],
+    folders: () => ['C:/workspace'],
+    repositoryScope: { snapshot: () => ({ ready: true, roots: ['C:/workspace'] }) },
+    launcherFor: () => ({ view }),
+    onReserveDispatch: () => {
+      order.push('reserved');
+      return 'launch';
+    },
+    onSendDraftPrompt: async (_draft: NewSessionDraft, _prompt: unknown, _submitted: unknown, start: any) => {
+      order.push('delivery');
+      assert.equal(start.launchId, 'launch');
+      return { delivered: false, reason: 'fixture refusal' };
+    },
+  });
+  const request = {
+    method: 'start',
+    requester: null,
+    params: { prompt: 'review', setup: { kind: 'custom', ...profile }, dispatch: true, completion: 'wait' },
+  };
+  const result = await provider.handleSessionRequest(request);
+  assert.deepEqual(order, ['reserved', 'delivery']);
+  assert.equal(result.launchId, 'launch');
+  provider.onReserveDispatch = null;
+  await assert.rejects(provider.handleSessionRequest(request), /receipt storage/);
+  assert.deepEqual(order, ['reserved', 'delivery']);
+});
+
 test('window read-only starts refuse named setup read tools and permission overrides before delivery', async () => {
   for (const [agent, permissionMode, readTools, refusal] of [
     ['codex', '', ['mcp__notes__read'], /requires Claude/],
@@ -33497,7 +33531,7 @@ test('session reads and channel starts reach the follow-up policy through the pa
   );
   sourceMatch(
     hostMember('public async handleSessionRequest('),
-    /this\.onSendDraftPrompt\(draft, \{ text, assets: \[\] \}, undefined, guardedStartContext\(request\)\)/,
+    /const start = guardedStartContext\(request\);[\s\S]*this\.onSendDraftPrompt\(draft, \{ text, assets: \[\] \}, undefined, start\)/,
   );
 });
 

@@ -4,6 +4,7 @@ import { runWindows } from './windows.ts';
 import { runSessions } from './sessions.ts';
 import { runManagement } from './manage.ts';
 import { runCompact } from './compact.ts';
+import { runDispatch } from './dispatch.ts';
 import { findCommand, renderCommandHelp, renderOverviewHelp } from './commands.ts';
 import { runSkills } from './skills.ts';
 
@@ -44,6 +45,9 @@ async function run(): Promise<void> {
   switch (command.route) {
     case 'skills':
       await runSkills(command.action!, commandArgs);
+      return;
+    case 'dispatch':
+      process.stdout.write(`${await runDispatch(command.action!, commandArgs)}\n`);
       return;
     case 'cost':
       process.stdout.write(`${runCost(commandArgs)}\n`);

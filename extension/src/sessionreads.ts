@@ -31,6 +31,39 @@ import { createClaudeRepeatedFilter } from './clauderepeated.ts';
 import { meterRead } from './readmeter.ts';
 
 export const SESSION_READ_LIMITS = { turns: 20, bytes: 512 * 1024, outputBytes: 48 * 1024 } as const;
+
+export function savedDispatchResponse(
+  source: SessionFile | null,
+  nativeTurn: string | null,
+): import('./dispatchhost').SavedDispatchResponse | null {
+  if (!source) return null;
+  const before = guardedSourceRevision(source.file);
+  if (!before) return null;
+  const stat = revisionOf(fs.statSync(source.file, { bigint: true }));
+  if (
+    !sameSessionRevision(source, stat) ||
+    !supportedFileIdentity(stat) ||
+    source.dev !== stat.dev ||
+    source.ino !== stat.ino
+  )
+    return null;
+  const options = { tailBytes: SESSION_READ_LIMITS.bytes - 64 * 1024, maxTurns: 20, turnsOnly: true };
+  const read =
+    source.agent === 'codex'
+      ? readCodexSession(source.file, source.sessionId, options)
+      : readSession(source.file, source.sessionId, { ...options, boundedRepeated: true });
+  if (before !== guardedSourceRevision(source.file)) return null;
+  const turn = source.agent === 'codex' ? read.turns.find((one) => one.promptId === nativeTurn) : read.turns[0];
+  if (!turn || (source.agent === 'claude' && (nativeTurn !== '1' || read.readBytes < source.size))) return null;
+  return {
+    text: turn.summary,
+    prompt: turn.prompt,
+    promptId: turn.promptId,
+    responseIds: turn.responseIds ?? [],
+    finished: turn.finished,
+    failed: !!turn.error || turn.interrupted,
+  };
+}
 export type SessionAttention = Extract<SessionStatus, 'input' | 'unread' | 'running'> | 'idle' | 'unknown';
 
 // A paged row names each field that its cap shortened or emptied.

@@ -104,6 +104,20 @@ arc archive SESSION_ID --force --window WINDOW_ID
 arc unarchive SESSION_ID --window WINDOW_ID
 ```
 
+## Dispatch results
+
+`start --arc-dispatch` reserves a private durable launch receipt before starting its worker. Its accepted JSON includes `launchId`. `--completion manual` is the default. `--completion wait` selects the waited route. `--report-file PATH` copies available reports to an output alias. The alias must name a regular file outside private dispatch storage. These options require `--arc-dispatch`. Neither route sends automatic parent notices.
+
+`arc dispatch status LAUNCH_ID --json` returns launch identity, immutable events, report availability, delivery availability, and consumption state. `arc dispatch result LAUNCH_ID --event EVENT_ID --json` reads one frozen report. Reports remain readable after host shutdown and when full cost is unknown. Text above 16,000 characters returns its private path, digest, and byte size. Serialized replies stay below 48 KiB. Oversized status replies refuse and direct the caller to read one event.
+
+A native root ending establishes its own success or failure. Matching saved transcript evidence establishes report availability. Missing saved evidence leaves the report pending. Failed turns remain failed. Needs-input events identify the ask and contain no fabricated report. A process exit without a native ending reports unknown.
+
+`arc dispatch claim LAUNCH_ID --event EVENT_ID --origin ORIGIN_ID --owner OWNER_ID --json` claims one exact event. A different owner refuses. The same owner receives its retained random token for interrupted processing. `arc dispatch ack LAUNCH_ID --event EVENT_ID --origin ORIGIN_ID --owner OWNER_ID --token TOKEN --outcome-file FILE --json` saves a UTF-8 disposition before reporting consumption. The file must be regular and at most 16 KiB. Identical acknowledgment returns the saved outcome. A conflicting disposition refuses. Tokens for earlier events never consume changed events.
+
+`arc dispatch refresh LAUNCH_ID --json` publishes changed output-alias observations as separate unconsumed events without messaging agents. `arc dispatch recover LAUNCH_ID --event EVENT_ID --json` observes hosted delivery without sending input. Delivery reports unavailable because these launches retain no callback route. `arc dispatch monitor LAUNCH_ID --json` reports standalone monitoring unavailable. Hosted launches use their existing lifecycle observation.
+
+`arc dispatch wait LAUNCH_ID [--deadline-ms MILLISECONDS] [--window WINDOW_ID] --json` requires waited completion. The default deadline is 110,000 milliseconds. Explicit deadlines accept 1 through 110,000 milliseconds. The command waits through the local channel without model polling. Disconnect returns uncertain with the launch ID. Deadline expiration returns deadline with that ID. Read status or recover explicitly afterward. No recovery command starts, resumes, stops, or replaces a worker.
+
 ## Read acknowledgments
 
 `arc read ID --observation TOKEN --request-id WINDOW:REQUEST [--dry-run] [--window WINDOW] [--json]` acknowledges completed turns delivered by `arc session`. Copy its `readObservation` field, separate from the guarded-send `observation`. The selected window requires `sessionRead` capability and one unambiguous Claude Code or Codex requester. The receipt binds that activation, requester, unique scoped target, physical source revision, and delivered projection. A partial reply can acknowledge its included completed turns. Unfinished and omitted turns remain outside the acknowledgment.

@@ -52,6 +52,8 @@ export async function runManagement(command: string, args: string[]): Promise<st
     '--name',
     '--label',
     '--observation',
+    '--completion',
+    '--report-file',
   ]);
   const switches = new Set(['--read-only', '--json', '--pinned', '--arc-dispatch', '--dry-run', '--force']);
   let agentRun = false;
@@ -102,6 +104,8 @@ export async function runManagement(command: string, args: string[]): Promise<st
                 '--agent-run',
                 '--pinned',
                 '--arc-dispatch',
+                '--completion',
+                '--report-file',
               ]
             : [
                 '--window',
@@ -188,6 +192,10 @@ export async function runManagement(command: string, args: string[]): Promise<st
     );
     // `--arc-dispatch` makes a guarded start, which records the requesting session as the worker's owner.
     const guarded = flags.has('--arc-dispatch');
+    if ((options.has('--completion') || options.has('--report-file')) && !guarded)
+      throw new Error('Dispatch completion and report files require --arc-dispatch.');
+    if (options.has('--completion') && !['manual', 'wait'].includes(options.get('--completion')!))
+      throw new Error('Choose --completion manual or wait.');
     if (guarded && requesterIdentity().ambiguous)
       throw new Error(
         'Both CLAUDE_CODE_SESSION_ID and CODEX_THREAD_ID are set, so Arc cannot tell which session is asking. No session was started.',
@@ -206,6 +214,13 @@ export async function runManagement(command: string, args: string[]): Promise<st
           },
       prompt,
       agentRun,
+      ...(guarded
+        ? {
+            dispatch: true,
+            completion: (options.get('--completion') ?? 'manual') as 'manual' | 'wait',
+            ...(options.has('--report-file') ? { reportPath: resolve(options.get('--report-file')!) } : {}),
+          }
+        : {}),
       ...(options.has('--cwd') ? { cwd: resolve(options.get('--cwd')!) } : {}),
       ...(flags.has('--read-only') ? { readOnly: true, readTools } : {}),
       pinned: flags.has('--pinned'),
@@ -216,6 +231,7 @@ export async function runManagement(command: string, args: string[]): Promise<st
       status: string;
       sessionId?: string;
       provider?: string;
+      launchId?: string;
     };
     const json = JSON.stringify(result);
     if (!guarded || !result.sessionId || !result.status.startsWith('accepted')) return json;

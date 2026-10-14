@@ -24,6 +24,7 @@ import {
 import { RAIL_FILTER_QUERY_LIMIT } from './domain/rail-filters.ts';
 import { listingQueryError, sessionQueryError } from './domain/session-query.ts';
 import { validCompactPayload } from './compactrequest.ts';
+import { DISPATCH_ID } from './dispatchreceipts';
 
 export const SESSION_REQUEST_VERSION = 1;
 export const SESSION_REQUEST_LIMITS = {
@@ -90,7 +91,8 @@ export interface SessionRequest {
     | 'read'
     | 'compact-ready'
     | 'compact-request'
-    | 'compact-status';
+    | 'compact-status'
+    | 'dispatch';
   requester: string | null;
   // The requester's provider. The CLI sends it on send, session reads, and `arc start --arc-dispatch`, and only
   // when exactly one provider variable is set and the window lists `REQUESTER_PROVIDER_CAPABILITY`.
@@ -178,6 +180,7 @@ export function parseSessionRequest(value: unknown): SessionRequest | null {
       'compact-ready',
       'compact-request',
       'compact-status',
+      'dispatch',
     ].includes(value.method as string) ||
     !(
       value.requester === null ||
@@ -186,7 +189,29 @@ export function parseSessionRequest(value: unknown): SessionRequest | null {
     !record(value.params)
   )
     return null;
-  if (value.method === 'compact-ready' || value.method === 'compact-request') {
+  if (value.method === 'dispatch') {
+    const params = value.params;
+    const fields =
+      params.dispatchAction === 'result'
+        ? 'dispatchAction,eventId,launchId'
+        : params.dispatchAction === 'wait'
+          ? 'deadlineMs,dispatchAction,launchId'
+          : 'dispatchAction,launchId';
+    if (Object.keys(params).sort().join(',') !== fields) return null;
+    if (
+      !Object.keys(params).every((key) => ['dispatchAction', 'launchId', 'eventId', 'deadlineMs'].includes(key)) ||
+      typeof params.launchId !== 'string' ||
+      !DISPATCH_ID.test(params.launchId) ||
+      !['result', 'status', 'wait', 'refresh'].includes(params.dispatchAction as string) ||
+      (params.dispatchAction === 'result' &&
+        (typeof params.eventId !== 'string' || !DISPATCH_ID.test(params.eventId))) ||
+      (params.dispatchAction === 'wait' &&
+        (!Number.isSafeInteger(params.deadlineMs) ||
+          (params.deadlineMs as number) < 1 ||
+          (params.deadlineMs as number) > 110_000))
+    )
+      return null;
+  } else if (value.method === 'compact-ready' || value.method === 'compact-request') {
     if (
       !validCompactPayload(value.params) ||
       (value.method === 'compact-request' && value.id !== value.params.requestId)
@@ -352,6 +377,11 @@ export class WindowChannel {
   private disposal: Promise<void> | null = null;
   private requestHandler: ((request: SessionRequest) => unknown | Promise<unknown>) | null = null;
   private compactHandler: ((request: SessionRequest) => unknown | Promise<unknown>) | null = null;
+  private dispatchHandler: ((request: SessionRequest) => unknown | Promise<unknown>) | null = null;
+
+  setDispatchHandler(handler: (request: SessionRequest) => unknown | Promise<unknown>): void {
+    this.dispatchHandler = handler;
+  }
   private guardedSendHandler: ((request: SessionRequest) => Promise<GuardedSendResult>) | null = null;
   private guardedReadHandler: ((request: SessionRequest) => Promise<ReadWriteResult>) | null = null;
 
@@ -422,6 +452,7 @@ export class WindowChannel {
         SESSION_QUERY_CAPABILITY,
         SESSION_QUERY_SHORTHAND_CAPABILITY,
         'launchPolicy',
+        ...(this.dispatchHandler ? ['dispatchResults'] : []),
         ...(this.guardedReadHandler ? [SESSION_READ_CAPABILITY] : []),
       ],
     };
@@ -523,7 +554,8 @@ export class WindowChannel {
           socket.destroy();
           return;
         }
-        const cancellation = request.method === 'filter' ? new AbortController() : null;
+        const cancellation =
+          request.method === 'filter' || request.method === 'dispatch' ? new AbortController() : null;
         const disconnected = () => cancellation?.abort();
         if (cancellation) {
           request.filterContext = { deadline: Date.now() + FILTER_LIMITS.operationMs, signal: cancellation.signal };
@@ -534,6 +566,15 @@ export class WindowChannel {
           .then<unknown>(() => {
             if (this.closed) throw new Error('Window unavailable.');
             if (request.method === 'ping') return this.ping(this.info());
+            if (request.method === 'dispatch') {
+              if (!this.dispatchHandler) throw new Error('This Arc window does not support dispatch results.');
+              return Promise.resolve(this.dispatchHandler(request)).then((data) => {
+                const result = { window: this.info(), data };
+                if (Buffer.byteLength(JSON.stringify({ id: request.id, result }) + '\n') > this.limits.lineBytes)
+                  throw new Error('The dispatch reply exceeds this window channel allowance. Read one event.');
+                return result;
+              });
+            }
             if (request.method.startsWith('compact-')) {
               const data = this.compactHandler
                 ? this.compactHandler(request)
@@ -895,7 +936,13 @@ export async function requestWindow(
   let timedOut = false;
   const result = await exchangeWindow(
     entry,
-    method === 'filter' ? FILTER_LIMITS.transportMs : write ? 120_000 : 5_000,
+    method === 'filter'
+      ? FILTER_LIMITS.transportMs
+      : method === 'dispatch' && params.dispatchAction === 'wait'
+        ? (params.deadlineMs ?? 110_000) + 5_000
+        : write
+          ? 120_000
+          : 5_000,
     file,
     method,
     params,
@@ -906,6 +953,12 @@ export async function requestWindow(
     },
   );
   if (result === null) {
+    if (method === 'dispatch' && params.dispatchAction === 'wait')
+      return {
+        launchId: params.launchId,
+        state: 'uncertain',
+        reason: 'The wait disconnected. Read dispatch status or recover this receipt.',
+      };
     if (method === 'filter')
       return {
         version: 1,

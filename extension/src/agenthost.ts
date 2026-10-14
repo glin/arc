@@ -964,6 +964,15 @@ export class AgentSession {
   }
 
   // Marks the session busy while the CLI accepts a prompt. The returned id identifies that submission.
+  nativeTurnIdentity(submission: number): string | null {
+    for (const [native, owner] of this.nativeTurnOwners) if (owner === submission) return native;
+    return null;
+  }
+
+  dispatchRootActive(submission: number): boolean {
+    return this.respondingTurns.size === 1 && this.respondingTurns.has(submission);
+  }
+
   // An exited child rejects the prompt and retains the failure in session state.
   async prompt(
     prompt: AgentPromptInput,
@@ -1548,6 +1557,14 @@ export class AgentSession {
           : undefined;
       // A root event can arrive before the turn start answer names its owner. Hold it the way responses wait.
       const rooted = native.kind === 'toolStart' || native.kind === 'toolEnd' || native.kind === 'rootEnd';
+      if (
+        native.kind === 'submission' &&
+        !this.driver.hasOpenTurns &&
+        native.generation !== null &&
+        this.preparingTurns.size === 1
+      ) {
+        this.nativeTurnOwners.set(String(native.generation), this.preparingTurns.values().next().value!.id);
+      }
       if (owner === undefined && rooted && this.driver.hasOpenTurns && native.turnId && this.acceptingPrompts) {
         this.pendingResponses.push(event);
         return;

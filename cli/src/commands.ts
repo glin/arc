@@ -1,6 +1,15 @@
 type Flag = readonly [syntax: string, description: string];
-type Section = 'Reading' | 'Starting and sending' | 'Curating' | 'Compaction' | 'Cost' | 'Setup';
-type Route = 'statusline' | 'windows' | 'sessions' | 'management' | 'compact' | 'label' | 'cost' | 'skills';
+type Section = 'Reading' | 'Starting and sending' | 'Curating' | 'Compaction' | 'Cost' | 'Setup' | 'Dispatch';
+type Route =
+  | 'statusline'
+  | 'windows'
+  | 'sessions'
+  | 'management'
+  | 'compact'
+  | 'label'
+  | 'cost'
+  | 'skills'
+  | 'dispatch';
 
 export interface Command {
   name: string;
@@ -138,6 +147,49 @@ export const COMMANDS: readonly Command[] = [
         'Foreign, linked, edited, added, or uncertain owned files remain unchanged. Custom Claude roots are unsupported.',
       ],
       example: `arc skills ${action} --agent claude --agent codex`,
+    },
+  })),
+  ...['result', 'status', 'wait', 'claim', 'ack', 'refresh', 'recover', 'monitor'].map((action): Command => ({
+    name: `dispatch ${action}`,
+    section: 'Dispatch',
+    route: 'dispatch',
+    action,
+    help: {
+      summary: `Read or consume a retained dispatch event with ${action}.`,
+      synopsis: `arc dispatch ${action} LAUNCH_ID${['result', 'claim', 'ack', 'recover'].includes(action) ? ' --event EVENT_ID' : ''}${['claim', 'ack'].includes(action) ? ' --origin ORIGIN_ID --owner OWNER_ID' : ''}${action === 'ack' ? ' --token TOKEN --outcome-file FILE' : ''} [--json]`,
+      flags: [
+        ...(action === 'wait'
+          ? ([
+              ['--deadline-ms MILLISECONDS', 'Wait 1 through 110000 milliseconds. The default is 110000.'],
+              windowFlag,
+            ] as Flag[])
+          : []),
+        ...(['result', 'claim', 'ack', 'recover'].includes(action)
+          ? ([['--event EVENT_ID', 'Select this exact immutable event.']] as Flag[])
+          : []),
+        ...(['claim', 'ack'].includes(action)
+          ? ([
+              ['--origin ORIGIN_ID', 'Match the launch activation.'],
+              ['--owner OWNER_ID', 'Retain one processing owner and its claim token.'],
+            ] as Flag[])
+          : []),
+        ...(action === 'ack'
+          ? ([
+              ['--token TOKEN', 'Use the token for this owner and exact event.'],
+              ['--outcome-file FILE', 'Save a UTF-8 disposition from a regular file up to 16 KiB.'],
+            ] as Flag[])
+          : []),
+        jsonFlag,
+      ],
+      output: [
+        'JSON stays below 48 KiB. Result text above 16000 characters returns its private path, digest, and byte size.',
+        'Saved reports remain readable without a host or known cost. Recover sends no input. Hosted monitor and standalone recovery are unavailable.',
+      ],
+      refusals: [
+        'Malformed or replaced identities and conflicting claims or acknowledgments refuse.',
+        'Wait requires a launch created with --completion wait. Disconnect reports uncertain without replacing its worker.',
+      ],
+      example: `arc dispatch ${action} LAUNCH_ID${['result', 'claim', 'ack', 'recover'].includes(action) ? ' --event EVENT_ID' : ''}${['claim', 'ack'].includes(action) ? ' --origin ORIGIN_ID --owner OWNER_ID' : ''}${action === 'ack' ? ' --token TOKEN --outcome-file disposition.md' : ''} --json`,
     },
   })),
   {
@@ -315,12 +367,20 @@ export const COMMANDS: readonly Command[] = [
         ['--label NAME', 'Apply an initial reader label. Repeat for more labels.'],
         ['--pinned', 'Pin the new session.'],
         ['--arc-dispatch', 'Record the requesting session for guarded follow-ups and print its dispatch receipt.'],
+        [
+          '--completion manual|wait',
+          'With --arc-dispatch, select retained retrieval or waited completion. The default is manual.',
+        ],
+        [
+          '--report-file PATH',
+          'With --arc-dispatch, copy reports to this alias. Private reports remain authoritative.',
+        ],
         windowFlag,
         requestFlag,
         jsonFlag,
       ],
       output: [
-        'Host JSON: version, requestId, status, requester. Accepted results include sessionId, provider, requestedSetup, agentRun, errors. Refusals include reason.',
+        'Host JSON: version, requestId, status, requester. Accepted results include sessionId, provider, requestedSetup, agentRun, errors, and launchId for dispatch. Refusals include reason.',
         'Host status is accepted, accepted-with-errors, or refused. Requested settings do not establish observed execution.',
         'Unknown delivery JSON: version, status, requestId, window, reason. It omits requester and accepted-result details.',
         '--arc-dispatch adds ARC_DISPATCH_SESSION after an accepted result with a session ID. Reader-owned receipts include owned: true.',
@@ -521,7 +581,15 @@ export function renderCommandHelp(command: Command): string {
 }
 
 export function renderOverviewHelp(): string {
-  const sections: Section[] = ['Reading', 'Starting and sending', 'Curating', 'Compaction', 'Cost', 'Setup'];
+  const sections: Section[] = [
+    'Reading',
+    'Starting and sending',
+    'Curating',
+    'Compaction',
+    'Cost',
+    'Dispatch',
+    'Setup',
+  ];
   return [
     'Usage: arc COMMAND [OPTIONS]',
     '',
