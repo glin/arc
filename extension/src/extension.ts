@@ -785,7 +785,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       },
       offer: async () =>
         vscode.window.showInformationMessage(
-          "Install the optional Claude snapshot plugin for file baselines? Setup needs Node.js in the editor's launch environment. Arc copies the plugin from this extension. Restart Claude after installation. Earlier baselines stay unavailable.",
+          'Install the optional Claude hooks (plugin) to show file diffs in Arc?',
           'Install',
           'Not now',
         ),

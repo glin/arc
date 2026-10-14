@@ -31,9 +31,9 @@ Reload VS Code and open a new integrated terminal to use `arc`. Run **Arc: Open 
 
 ### Claude hooks
 
-Hooks capture files before Claude edits them for full current-file diffs. Restart Claude after installation. Earlier file baselines stay unavailable.
+The optional Claude hooks (plugin) let Arc show file diffs. Restart Claude after installation.
 
-Run **Arc: Set up Claude hooks** to set them up separately. To install Arc without changing Claude hooks, use:
+Run **Arc: Set up Claude hooks** in the Command Palette to install them separately. To install Arc without changing Claude hooks, use:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/glin/arc/main/install.sh | bash -s -- --no-hooks
