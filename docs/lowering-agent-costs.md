@@ -54,12 +54,12 @@ Reusing cached context costs 1/10 the normal input price or less. Once the cache
 
 ### Default cache TTLs
 
-| Agent and billing                                          | Cache lifetime                                  |
-| ---------------------------------------------------------- | ----------------------------------------------- |
-| Claude Code main session on a subscription/enterprise plan | 1h                                              |
-| OpenAI models in Codex                                     | No fixed TTL. Often 45m, usually gone within 2h |
-| Claude Code on usage credits, API key, or cloud provider   | 5m                                              |
-| Claude Code subagents                                      | 5m                                              |
+| Agent and billing                                          | Cache lifetime                                    |
+| ---------------------------------------------------------- | ------------------------------------------------- |
+| Claude Code main session on a subscription/enterprise plan | 1h                                                |
+| OpenAI models in Codex                                     | At least 30m usually, often over 1h. No fixed TTL |
+| Claude Code on usage credits, API key, or cloud provider   | 5m                                                |
+| Claude Code subagents                                      | 5m                                                |
 
 Claude Code's [prompt-caching guide](https://code.claude.com/docs/en/prompt-caching#which-ttl-each-request-gets) lists which requests get which lifetime and how to change it.
 
