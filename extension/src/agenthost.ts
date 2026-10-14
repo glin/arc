@@ -221,6 +221,8 @@ export interface SessionEvent {
   event: WireEvent;
   // Names the accepted submission that owns this response or ending.
   turnId?: number;
+  // Keeps a stopped dispatch ending separate from live response ownership.
+  dispatchTurnId?: number;
 }
 
 // The shared operations an agent session calls. Each wire adapter implements its provider's operations without a common base class.
@@ -840,6 +842,7 @@ export class AgentSession {
   private turnEndings = 0;
   private readonly openedAtEnding = new WeakMap<{ id: number }, number>();
   private interruptedTurnEnds = 0;
+  private stoppedSubmission: { id: number; generation: number | null } | null = null;
   // When the Stop that owes that ending was accepted, so an ending that never came stops
   // being owed. See STOP_ENDING_GRACE_MS.
   private interruptedTurnEndAt = 0;
@@ -856,7 +859,7 @@ export class AgentSession {
     key: string,
     plan: AgentPlan,
     spawner: Spawner,
-    private readonly report: (event: WireEvent, turnId?: number) => void,
+    private readonly report: (event: WireEvent, turnId?: number, dispatchTurnId?: number) => void,
     private readonly changed: (backgroundReleased?: boolean) => void,
     private readonly openingDeadlineMs: number = OPENING_DEADLINE_MS,
     private readonly exitGraceMs: number = EXIT_GRACE_MS,
@@ -1226,6 +1229,9 @@ export class AgentSession {
     const responses = [...this.respondingTurns];
     const interrupted = this.driver.interruptClearsOpenTurns ? new Set(this.openTurns) : null;
     const preparing = this.driver.interruptClearsOpenTurns ? new Set(this.preparingTurns) : null;
+    const stopped =
+      interrupted?.size === 1 && this.preparingTurns.size === 0 ? interrupted.values().next().value : undefined;
+    const native = stopped ? this.nativeTurnIdentity(stopped.id) : null;
     // A turn Claude started by itself, such as one for a task notification, has no open turn.
     const wasRunning = this.agentRunning;
     const stopping = this.driver.interrupt();
@@ -1249,6 +1255,9 @@ export class AgentSession {
         // or STOP_ENDING_GRACE_MS drops the debt.
         this.interruptedTurnEnds += 1;
         this.interruptedTurnEndAt = this.now();
+        this.stoppedSubmission = stopped
+          ? { id: stopped.id, generation: native === null ? null : Number(native) }
+          : null;
       }
       for (const turn of interrupted) {
         this.openTurns.delete(turn);
@@ -1421,6 +1430,7 @@ export class AgentSession {
     for (const id of settled) this.respondingTurns.delete(id);
     this.agentRunning = false;
     this.interruptedTurnEnds = 0;
+    this.stoppedSubmission = null;
     this.busy = this.countedBusy();
     return settled;
   }
@@ -1548,13 +1558,26 @@ export class AgentSession {
         this.busy = this.driver.hasOpenTurns();
         this.changed();
       }
-      const owner = this.driver.hasOpenTurns
+      let owner = this.driver.hasOpenTurns
         ? native.turnId
           ? this.nativeTurnOwners.get(native.turnId)
           : undefined
         : this.openTurns.size === 1 && this.preparingTurns.size === 0
           ? this.openTurns.values().next().value?.id
           : undefined;
+      let dispatchTurnId: number | undefined;
+      if (
+        !this.driver.hasOpenTurns &&
+        native.kind === 'rootEnd' &&
+        ['aborted_streaming', 'aborted_tools', 'aborted'].includes(String(native.evidence.terminal_reason)) &&
+        this.interruptedTurnEnds > 0 &&
+        this.now() - this.interruptedTurnEndAt <= STOP_ENDING_GRACE_MS
+      ) {
+        owner = undefined;
+        dispatchTurnId = this.stoppedSubmission?.id;
+        if (this.stoppedSubmission)
+          event = { kind: 'native', event: { ...native, generation: this.stoppedSubmission.generation } };
+      }
       // A root event can arrive before the turn start answer names its owner. Hold it the way responses wait.
       const rooted = native.kind === 'toolStart' || native.kind === 'toolEnd' || native.kind === 'rootEnd';
       if (
@@ -1569,10 +1592,11 @@ export class AgentSession {
         this.pendingResponses.push(event);
         return;
       }
-      this.report(event, owner);
+      this.report(event, owner, dispatchTurnId);
       return;
     }
     let endedTurnId: number | undefined;
+    let dispatchTurnId: number | undefined;
     if (event.kind === 'delta' || event.kind === 'text' || event.kind === 'turnEnd') {
       if (this.driver.hasOpenTurns) {
         endedTurnId = event.nativeTurnId ? this.nativeTurnOwners.get(event.nativeTurnId) : undefined;
@@ -1624,11 +1648,14 @@ export class AgentSession {
         // Claude marks a Stop ending `aborted_streaming`, or `aborted_tools` when a tool was running. The wire translates both to `interrupted`.
         // Consume that ending's debt without closing a later prompt's turn.
         this.interruptedTurnEnds -= 1;
+        dispatchTurnId = this.stoppedSubmission?.id;
+        this.stoppedSubmission = null;
         this.busy = this.countedBusy();
       } else {
         // Expire old Stop-ending debt. An unrelated outcome does not establish that the interrupted ending will never arrive.
         if (this.now() - this.interruptedTurnEndAt > STOP_ENDING_GRACE_MS) {
           this.interruptedTurnEnds = 0;
+          this.stoppedSubmission = null;
         }
         this.turnEndings += 1;
         const first = this.openTurns.values().next().value;
@@ -1656,7 +1683,7 @@ export class AgentSession {
       if (endedTurnId !== undefined) this.respondingTurns.delete(endedTurnId);
       this.drainHeldEffort();
     }
-    this.report(event, endedTurnId);
+    this.report(event, endedTurnId, dispatchTurnId);
     this.changed();
   }
 
@@ -1674,6 +1701,7 @@ export class AgentSession {
     this.pendingResponses.length = 0;
     this.agentRunning = false;
     this.interruptedTurnEnds = 0;
+    this.stoppedSubmission = null;
     this.interruptedTurnEndAt = 0;
     this.busy = false;
     this.delivering.clear();
@@ -2602,7 +2630,7 @@ export class AgentHost {
       key,
       plan,
       this.spawner,
-      (event, turnId) => {
+      (event, turnId, dispatchTurnId) => {
         const state = this.sessions.get(key)?.state();
         if (this.recovery && state?.sessionId) {
           const askKey = `${key}:${event.kind === 'ask' ? event.ask.id : event.kind === 'askResolved' ? event.id : ''}`;
@@ -2634,7 +2662,12 @@ export class AgentHost {
             this.recoveryAsks.delete(askKey);
           }
         }
-        this.options.onEvent(turnId === undefined ? { key, event } : { key, event, turnId });
+        this.options.onEvent({
+          key,
+          event,
+          ...(turnId === undefined ? {} : { turnId }),
+          ...(dispatchTurnId === undefined ? {} : { dispatchTurnId }),
+        });
       },
       (backgroundReleased) => {
         if (backgroundReleased) this.applyRetirementEligibility(key, session);

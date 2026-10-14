@@ -4277,6 +4277,16 @@ test('dispatch channel schema, capability admission, bounds and explicit refusal
   const params = { dispatchAction: 'wait' as const, launchId, deadlineMs: 1 };
   const valid = request(entry, { method: 'dispatch', params });
   assert.deepEqual(parseSessionRequest(valid), valid);
+  const status = { dispatchAction: 'status', launchId, cursor: `${launchId}:1`, limit: 128 };
+  assert.deepEqual(parseSessionRequest({ ...valid, params: status })?.params, status);
+  for (const changed of [
+    { ...status, launchId: '(' },
+    { ...status, launchId: null },
+    { ...status, cursor: 'bbbbbbbb-1111-2222-3333-444444444444:1' },
+    { ...status, cursor: `${launchId}:12345678901234567` },
+  ]) {
+    assert.doesNotThrow(() => assert.equal(parseSessionRequest({ ...valid, params: changed }), null));
+  }
   for (const changed of [
     { ...params, deadlineMs: 0 },
     { ...params, deadlineMs: 110001 },

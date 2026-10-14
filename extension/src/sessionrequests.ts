@@ -209,12 +209,12 @@ export function parseSessionRequest(value: unknown): SessionRequest | null {
       !Object.keys(params).every((key) =>
         ['dispatchAction', 'launchId', 'eventId', 'deadlineMs', ...(paging ? ['cursor', 'limit'] : [])].includes(key),
       ) ||
+      typeof params.launchId !== 'string' ||
+      !DISPATCH_ID.test(params.launchId) ||
       (params.cursor !== undefined &&
         (typeof params.cursor !== 'string' || !new RegExp(`^${params.launchId}:[0-9]{1,16}$`).test(params.cursor))) ||
       (params.limit !== undefined &&
         (!Number.isSafeInteger(params.limit) || (params.limit as number) < 1 || (params.limit as number) > 128)) ||
-      typeof params.launchId !== 'string' ||
-      !DISPATCH_ID.test(params.launchId) ||
       !['result', 'status', 'wait', 'refresh'].includes(params.dispatchAction as string) ||
       (params.dispatchAction === 'result' &&
         (typeof params.eventId !== 'string' || !DISPATCH_ID.test(params.eventId))) ||

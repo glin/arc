@@ -83,6 +83,9 @@ import { QuestionEvidenceReader } from './questionrecords';
 import { askCard } from './composerview';
 import { asyncQuestionId, buildQuestionReply } from './codexreply';
 import { launchPolicy } from './launchpolicy.ts';
+import { DispatchReceipts } from './dispatchreceipts';
+import { HostedDispatch, type SavedDispatchResponse } from './dispatchhost';
+import { payloadSha256 } from './sessionwrites';
 import { LaunchPolicyStore } from './launchpolicystore.ts';
 import * as esbuild from 'esbuild';
 import { callSources, declarationSource, statementFrom, sourceMatch } from '../test/source-contract.ts';
@@ -2725,6 +2728,152 @@ test('accepted response ownership survives Stop and a late interrupted ending', 
   assert.equal(events.filter(({ event }) => event.kind === 'turnEnd').at(-1)?.turnId, undefined);
   assert.equal(session.state().busy, true);
 });
+
+test.each(['none', 'later', 'expired', 'idle', 'failed'] as const)(
+  'Claude Stop retains dispatch ownership: %s',
+  async (mode) => {
+    const later = mode !== 'none';
+    let clock = 1000;
+    const home = tempDir('arc-stopped-dispatch-');
+    const origin = 'a'.repeat(24);
+    const nativeSession = 'aaaaaaaa-1111-2222-3333-444444444444';
+    const receipts = new DispatchReceipts(home);
+    const launch = receipts.reserve({
+      origin,
+      requester: null,
+      policy: null,
+      promptSha256: payloadSha256('review'),
+      completion: 'wait',
+      alias: null,
+    });
+    let saved: SavedDispatchResponse | null = null;
+    const dispatch = new HostedDispatch(receipts, () => saved);
+    const { host, children, events } = fakeHost(undefined, () => clock, {
+      onEvent: ({ key, event, turnId, dispatchTurnId }) => {
+        const child = host.get(key);
+        if (child) dispatch.observe(child, event, dispatchTurnId ?? turnId);
+      },
+    });
+    const abort = new AbortController();
+    try {
+      const opening = host.session('one', claudePlan(CLAUDE, { cwd: WS, sessionId: nativeSession }));
+      const child = children[0];
+      child.answerHandshake();
+      const session = await opening;
+      dispatch.register(launch.launchId, session);
+      const first = await session.prompt('review', (id) => dispatch.submitted(launch.launchId, id));
+      dispatch.accepted(launch.launchId, session.nativeTurnIdentity(first));
+      child.say(
+        JSON.stringify({
+          type: 'assistant',
+          session_id: nativeSession,
+          message: {
+            id: 'response-first',
+            role: 'assistant',
+            stop_reason: 'end_turn',
+            content: [{ type: 'text', text: 'Partial' }],
+          },
+        }) + '\n',
+      );
+      const stopping = session.interrupt();
+      child.answerControl('interrupt', {});
+      await stopping;
+      assert.equal(receipts.latest(launch.launchId), null, 'Stop acceptance is not a native ending');
+      if (mode === 'expired') clock += STOP_ENDING_GRACE_MS + 1;
+      if (mode === 'idle')
+        child.say(JSON.stringify({ type: 'system', subtype: 'session_state_changed', state: 'idle' }) + '\n');
+      const second = later ? await session.prompt('second') : undefined;
+      if (mode === 'failed') {
+        child.say(
+          JSON.stringify({
+            type: 'result',
+            session_id: nativeSession,
+            uuid: 'later-failed-result',
+            result_index: 1,
+            num_turns: 1,
+            parent_tool_use_id: null,
+            is_error: true,
+            terminal_reason: 'error',
+            result: '',
+          }) + '\n',
+        );
+        assert.equal(
+          receipts.latest(launch.launchId),
+          null,
+          'an unrelated later failure cannot end the stopped dispatch',
+        );
+        assert.equal(events.filter(({ event }) => event.kind === 'turnEnd').at(-1)?.turnId, second);
+        assert.equal(session.state().busy, false);
+        return;
+      }
+      const waiting = dispatch.request(
+        origin,
+        { dispatchAction: 'wait', launchId: launch.launchId, deadlineMs: 1000 },
+        abort.signal,
+      );
+      child.say(
+        JSON.stringify({
+          ...JSON.parse(ABORTED_RESULT),
+          session_id: nativeSession,
+          uuid: 'stopped-result',
+          result_index: 1,
+          num_turns: 1,
+          parent_tool_use_id: null,
+        }) + '\n',
+      );
+      const interrupted = receipts.latest(launch.launchId);
+      if (mode === 'expired' || mode === 'idle') {
+        assert.equal(interrupted, null, 'expired or settled Stop ownership cannot be reused');
+        assert.equal(events.filter(({ event }) => event.kind === 'turnEnd').at(-1)?.turnId, second);
+        assert.equal(session.state().busy, false);
+        return;
+      }
+      assert.ok(interrupted, 'the actual Claude producer must publish the stopped dispatch ending');
+      assert.equal(interrupted.outcome, 'interrupted');
+      assert.equal(
+        interrupted.availability,
+        'pending',
+        'native interruption does not establish saved report availability',
+      );
+      assert.equal((interrupted.nativeEnding as { generation: number } | null)?.generation, 1);
+      assert.equal(session.state().busy, later);
+      assert.equal(events.filter(({ event }) => event.kind === 'turnEnd').at(-1)?.turnId, undefined);
+      saved = {
+        text: 'Partial',
+        prompt: 'review',
+        promptId: 'prompt-first',
+        responseIds: ['response-first'],
+        finished: false,
+        failed: false,
+        interrupted: true,
+      };
+      dispatch.reconcileAll();
+      assert.deepEqual(await waiting, {
+        launchId: launch.launchId,
+        state: 'observed',
+        eventId: receipts.latest(launch.launchId)!.eventId,
+        outcome: 'interrupted',
+      });
+      if (later) {
+        child.say(
+          JSON.stringify({
+            type: 'stream_event',
+            event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'Second' } },
+          }) + '\n',
+        );
+        assert.equal(events.filter(({ event }) => event.kind === 'delta').at(-1)?.turnId, second);
+        child.say(COMPLETED_RESULT);
+        assert.equal(events.filter(({ event }) => event.kind === 'turnEnd').at(-1)?.turnId, second);
+        assert.equal(session.state().busy, false);
+        assert.equal(receipts.latest(launch.launchId)!.outcome, 'interrupted');
+      }
+    } finally {
+      abort.abort();
+      host.dispose();
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  },
+);
 
 test('Codex native turn identity binds early and obsolete response events to accepted submissions', async () => {
   let emit!: (event: WireEvent) => void;

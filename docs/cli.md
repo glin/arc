@@ -106,7 +106,7 @@ arc unarchive SESSION_ID --window WINDOW_ID
 
 ## Dispatch results
 
-`start --arc-dispatch` reserves a private durable launch receipt before starting its worker. Its accepted JSON includes `launchId`. `--completion manual` is the default. `--completion wait` selects the waited route. `--report-file PATH` copies available reports to an output alias. The alias must name a regular file outside private dispatch storage. These options require `--arc-dispatch` and the selected window's `dispatchResults` capability. Neither route sends automatic parent notices.
+`start --arc-dispatch` reserves a private durable launch receipt before starting its worker. It requires the selected window's `dispatchResults` capability. Its accepted JSON includes `launchId`. `--completion manual` is the default. `--completion wait` selects the waited route. `--report-file PATH` copies available reports to an output alias. The alias must name a regular file outside private dispatch storage. `--completion` and `--report-file` require `--arc-dispatch`. Neither route sends automatic parent notices.
 
 `arc dispatch status LAUNCH_ID [--cursor CURSOR] [--limit 1-128] --json` returns one bounded event page. The default page limit is 32. Follow `next` until null. Each page includes launch identity, outcomes, report availability, delivery availability, and consumption digests. `reportSource` names the launch-private current report. `arc dispatch result LAUNCH_ID --event EVENT_ID --json` reads one frozen report and its full saved disposition. Reports remain readable after host shutdown and when full cost is unknown. Text above 16,000 characters returns its private path, digest, and byte size. Serialized replies stay below 48 KiB.
 

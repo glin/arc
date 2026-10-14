@@ -428,8 +428,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     onRecoveryFailure: recoveryFailure,
     spawner,
     idleDurationMs: readSetting('agentIdleMinutes') * 60_000,
-    onEvent: ({ key, event, turnId }) => {
-      panel.onDispatchEvent?.(key, event, turnId);
+    onEvent: ({ key, event, turnId, dispatchTurnId }) => {
+      panel.onDispatchEvent?.(key, event, dispatchTurnId ?? turnId);
       if (event.kind === 'native') {
         const child = host.get(key);
         if (child) compaction?.native(child, event.event, turnId);
