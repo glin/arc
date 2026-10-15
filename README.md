@@ -61,6 +61,8 @@ claude auth login
 codex login
 ```
 
+Arc runs agents and reads account usage through your installed Claude Code and Codex CLIs, which handle authentication.
+
 ## Features
 
 ### Session links and export
