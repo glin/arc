@@ -155,7 +155,9 @@ arc session SESSION_ID --turns 2 --window WINDOW_ID --json
 arc pin SESSION_ID --dry-run --window WINDOW_ID
 ```
 
-Replace `WINDOW_ID` with the selected window's `hostId`. Confirm `scopeReady` and `panelReady` before proceeding. When the listing returns a `next` cursor, run `arc sessions --window WINDOW_ID --cursor NEXT --json` until `next` is `null`. Replace `SESSION_ID` with a listed session. If the list is empty, skip the session read and pin dry run. Reads leave reader attention unchanged, and the pin dry run writes no state. Preserve incomplete or unknown results when reporting the check.
+Replace `WINDOW_ID` with the selected window's `hostId`. Confirm `scopeReady` and `panelReady` before proceeding. When the listing returns a `next` cursor, run `arc sessions --window WINDOW_ID --cursor NEXT --json` until `next` is `null`. Replace `SESSION_ID` with a complete, nonnull ID from that scoped listing. Never abbreviate the action target. If the list is empty, skip the session read and pin dry run. Reads leave reader attention unchanged, and the pin dry run writes no state. Preserve incomplete or unknown results when reporting the check.
+
+[Window discovery](cli.md#windows) defines capability output and observed access diagnostics. [Session selection](cli.md#sessions) defines stale activation handling. The [skill](../cli/skills/arc-sessions/SKILL.md#select-a-ready-window) applies these limits before agent actions.
 
 An optional launch check sends paid agent requests and requires reader authorization. Choose the cheapest suitable offered settings for one Claude session and one Codex session. In `arc setups`, reusable rows appear in `primary`, `inherited`, `pinned`, and `recent`. Each row supplies a `key` and a `profile.agent`. Use a row for the intended provider, and exclude pinned rows whose `available` is false.
 

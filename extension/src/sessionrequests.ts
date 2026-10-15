@@ -36,7 +36,7 @@ export const SESSION_REQUEST_LIMITS = {
 const HOST_ID = /^[a-f0-9]{24}$/;
 const TOKEN = /^[a-f0-9]{64}$/;
 const REGISTRY_BYTES = 64 * 1024;
-export const WINDOW_DISCOVERY_LIMITS = { directoryEntries: 1024, hosts: 256, concurrency: 8 } as const;
+export const WINDOW_DISCOVERY_LIMITS = { directoryEntries: 1024, hosts: 256, concurrency: 8, diagnostics: 32 } as const;
 
 export interface WindowState {
   folders: string[];
@@ -70,6 +70,13 @@ export interface HostRegistration extends WindowInfo {
 export interface WindowDiscovery {
   windows: WindowInfo[];
   complete: boolean;
+  diagnostics?: WindowDiagnostic[];
+}
+
+export interface WindowDiagnostic {
+  code: 'ENOENT' | 'EACCES' | 'EPERM';
+  stage: 'registry' | 'connection';
+  hostId?: string;
 }
 
 // A sessions cursor is base64url text that the host validates. The wire admits its length and alphabet only.
@@ -107,6 +114,12 @@ export type SessionReply = { id: string | null; result: unknown } | { id: string
 
 function record(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function windowFailureCode(error: unknown): WindowDiagnostic['code'] | undefined {
+  if (record(error) && (error.code === 'ENOENT' || error.code === 'EACCES' || error.code === 'EPERM'))
+    return error.code;
+  return undefined;
 }
 
 function windowInfo(value: unknown): value is WindowInfo {
@@ -765,6 +778,7 @@ async function exchangeWindow(
   requestId?: string,
   attributed = false,
   onTimeout?: () => void,
+  onFailure?: (code: WindowDiagnostic['code']) => void,
 ): Promise<unknown | null> {
   if (process.platform === 'win32' && (!Number.isSafeInteger(entry.transportPid) || entry.transportPid! <= 0))
     return null;
@@ -791,10 +805,17 @@ async function exchangeWindow(
   // A line above the channel bound would close the connection after the write. Refuse it before connecting.
   if (Buffer.byteLength(line) > SESSION_REQUEST_LIMITS.lineBytes)
     throw new Error('The request exceeds the Arc window channel limit. Nothing was sent.');
-  const socket =
-    process.platform === 'win32'
-      ? await WindowsPipeServer.connect(entry.address, entry.pid, entry.transportPid!, registrationFile, deadlineMs)
-      : net.createConnection(entry.address);
+  let socket: Duplex;
+  try {
+    socket =
+      process.platform === 'win32'
+        ? await WindowsPipeServer.connect(entry.address, entry.pid, entry.transportPid!, registrationFile, deadlineMs)
+        : net.createConnection(entry.address);
+  } catch (error) {
+    const code = windowFailureCode(error);
+    if (process.platform !== 'win32' && code) onFailure?.(code);
+    return null;
+  }
   return new Promise((resolve, reject) => {
     const challenge = crypto.randomBytes(32).toString('hex');
     let connected = false;
@@ -811,7 +832,11 @@ async function exchangeWindow(
       if (connected) onTimeout?.();
       finish(null);
     }, deadlineMs);
-    socket.on('error', () => finish(null));
+    socket.on('error', (error: unknown) => {
+      const code = windowFailureCode(error);
+      if (!settled && code) onFailure?.(code);
+      finish(null);
+    });
     socket.on('close', () => finish(null));
     receiveLines(socket, { ...SESSION_REQUEST_LIMITS, lineDeadlineMs: deadlineMs }, (text) => {
       try {
@@ -857,10 +882,19 @@ async function exchangeWindow(
           finish(null);
           return;
         }
-        const { hostId, pid, version, folders, scopeReady, panelReady, panelVisible } = info;
+        const { hostId, pid, version, folders, scopeReady, panelReady, panelVisible, capabilities } = info;
         finish(
           method === 'ping'
-            ? { hostId, pid, version, folders, scopeReady, panelReady, panelVisible }
+            ? {
+                hostId,
+                pid,
+                version,
+                folders,
+                scopeReady,
+                panelReady,
+                panelVisible,
+                ...(capabilities === undefined ? {} : { capabilities: [...capabilities] }),
+              }
             : (reply.result as Record<string, unknown>).data,
         );
       } catch {
@@ -878,8 +912,19 @@ export async function pingWindow(
   entry: HostRegistration,
   deadlineMs = 1_000,
   registrationFile = '',
+  onFailure?: (code: WindowDiagnostic['code']) => void,
 ): Promise<WindowInfo | null> {
-  return (await exchangeWindow(entry, deadlineMs, registrationFile).catch(() => null)) as WindowInfo | null;
+  return (await exchangeWindow(
+    entry,
+    deadlineMs,
+    registrationFile,
+    'ping',
+    {},
+    undefined,
+    false,
+    undefined,
+    onFailure,
+  ).catch(() => null)) as WindowInfo | null;
 }
 
 // A window that predates `requesterProvider` refuses any request that carries it, so the CLI sends it only when listed.
@@ -922,7 +967,16 @@ export async function requestWindow(
     )
       throw new Error();
     entry = value as unknown as HostRegistration;
-  } catch {
+  } catch (error) {
+    const code = windowFailureCode(error);
+    if (code === 'ENOENT')
+      throw new WindowUnavailableError(
+        'The selected Arc window is not registered. Run arc windows and select the intended folders.',
+      );
+    if (code === 'EACCES' || code === 'EPERM')
+      throw new WindowUnavailableError(
+        `Local access to Arc window ${selected} failed (${code}). Check that your current permissions allow reading this window's local details.`,
+      );
     throw new WindowUnavailableError('The selected Arc window is unavailable.');
   }
   const id = requestId ?? `${entry.hostId}:${crypto.randomBytes(12).toString('hex')}`;
@@ -954,6 +1008,7 @@ export async function requestWindow(
   const attributed =
     method === 'send' || method === 'read' || method === 'session' || (method === 'start' && guardedStart);
   let timedOut = false;
+  let failureCode: WindowDiagnostic['code'] | undefined;
   const result = await exchangeWindow(
     entry,
     method === 'filter'
@@ -970,6 +1025,9 @@ export async function requestWindow(
     attributed,
     () => {
       timedOut = true;
+    },
+    (code) => {
+      failureCode = code;
     },
   );
   if (result === null) {
@@ -1001,6 +1059,10 @@ export async function requestWindow(
         window: entry.hostId,
         reason: 'Delivery is unknown. Retry only this request ID in this window.',
       };
+    if (failureCode === 'EACCES' || failureCode === 'EPERM')
+      throw new WindowUnavailableError(
+        `Local access to Arc window ${entry.hostId} failed (${failureCode}). Check that your current permissions allow connecting to this window's local socket.`,
+      );
     throw new Error(
       timedOut ? 'The selected Arc window did not answer in time.' : 'The selected Arc window is unavailable.',
     );
@@ -1027,6 +1089,12 @@ export async function discoverWindows(home = arcHome()): Promise<WindowDiscovery
     throw new Error('Arc windows are unavailable.', { cause: error });
   }
   const live: WindowInfo[] = [];
+  const diagnostics: WindowDiagnostic[] = [];
+  const observe = (error: unknown, stage: WindowDiagnostic['stage'], hostId: string) => {
+    const code = windowFailureCode(error);
+    if (code && diagnostics.length < WINDOW_DISCOVERY_LIMITS.diagnostics) diagnostics.push({ code, stage, hostId });
+    return code;
+  };
   let complete = true;
   let visited = 0;
   let admitted = 0;
@@ -1061,17 +1129,24 @@ export async function discoverWindows(home = arcHome()): Promise<WindowDiscovery
         )
           continue;
         entry = value as unknown as HostRegistration;
-      } catch {
+      } catch (error) {
+        const code = windowFailureCode(error);
+        if (code !== 'ENOENT') observe(error, 'registry', name.slice(0, -5));
+        if (code === 'EACCES' || code === 'EPERM') complete = false;
         continue;
       }
       admitted++;
       batch.push(
         (async () => {
-          const info = await pingWindow(entry, 1_000, file).catch(() => null);
+          let failureCode: WindowDiagnostic['code'] | undefined;
+          const info = await pingWindow(entry, 1_000, file, (code) => {
+            failureCode = code;
+          }).catch(() => null);
           if (info) live.push(info);
-          else if (processIsDead(entry.pid)) {
-            if (!removeOwnedRegistration(file, bytes, entry.address, home, false)) complete = false;
-          } else complete = false;
+          else if (!processIsDead(entry.pid) || !removeOwnedRegistration(file, bytes, entry.address, home, false)) {
+            complete = false;
+            if (failureCode) observe({ code: failureCode }, 'connection', entry.hostId);
+          }
         })(),
       );
       if (batch.length === WINDOW_DISCOVERY_LIMITS.concurrency) {
@@ -1088,5 +1163,16 @@ export async function discoverWindows(home = arcHome()): Promise<WindowDiscovery
       await entries.close();
     }
   }
-  return { windows: live.sort((a, b) => a.hostId.localeCompare(b.hostId)), complete };
+  return {
+    windows: live.sort((a, b) => a.hostId.localeCompare(b.hostId)),
+    complete,
+    ...(diagnostics.length
+      ? {
+          diagnostics: diagnostics.sort(
+            (a, b) =>
+              a.hostId!.localeCompare(b.hostId!) || a.stage.localeCompare(b.stage) || a.code.localeCompare(b.code),
+          ),
+        }
+      : {}),
+  };
 }

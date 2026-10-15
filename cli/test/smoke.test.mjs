@@ -847,6 +847,12 @@ test('the bundled windows command reaches authenticated hosts and keeps secrets 
   const env = { ...smokeEnv, ARC_HOME: home };
   const run = promisify(execFile);
   try {
+    first.setGuardedReadHandler(async () => {
+      throw new Error('Discovery sends no read acknowledgment.');
+    });
+    first.setDispatchHandler(() => {
+      throw new Error('Discovery sends no dispatch action.');
+    });
     await first.update({
       folders: ['C:/Project With Spaces'],
       scopeReady: true,
@@ -861,6 +867,12 @@ test('the bundled windows command reaches authenticated hosts and keeps secrets 
     assert.equal(report.windows.length, 2);
     assert.equal(report.windows.find((window) => window.hostId === first.hostId).panelReady, true);
     assert.equal(report.windows.find((window) => window.hostId === second.hostId).scopeReady, false);
+    assert.ok(report.windows.find((window) => window.hostId === first.hostId).capabilities.includes('sessionRead'));
+    assert.ok(report.windows.find((window) => window.hostId === first.hostId).capabilities.includes('dispatchResults'));
+    assert.equal(
+      report.windows.find((window) => window.hostId === second.hostId).capabilities.includes('sessionRead'),
+      false,
+    );
     assert.equal(json.stdout.includes('token'), false);
     assert.equal(json.stdout.includes('address'), false);
     const human = await run(process.execPath, [cli, 'windows'], { env, encoding: 'utf8' });
@@ -884,6 +896,41 @@ test('the bundled windows command reaches authenticated hosts and keeps secrets 
     await assert.rejects(run(process.execPath, [cli, 'windows', '--unknown'], { env }), /Usage: arc windows/);
   } finally {
     await Promise.all([first.dispose(), second.dispose()]);
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('bundled discovery retains registry access denial without leaking errors or failing partial output', async () => {
+  const home = mkdtempSync(join(realpathSync(tmpdir()), 'arc-window-access-'));
+  const reachable = new WindowChannel(home);
+  const denied = 'f'.repeat(24);
+  const deniedFile = join(home, 'hosts', denied + '.json');
+  const preload = join(home, 'access.cjs');
+  const run = promisify(execFile);
+  try {
+    await reachable.update({ folders: [], scopeReady: true, panelReady: false, panelVisible: false });
+    writeFileSync(deniedFile, '{}');
+    writeFileSync(
+      preload,
+      `const fs = require('node:fs'); const original = fs.lstatSync; fs.lstatSync = function(file, ...args) { if (file === ${JSON.stringify(deniedFile)}) throw Object.assign(new Error('secret-token-address-stack'), { code: 'EACCES' }); return original.call(this, file, ...args); };`,
+    );
+    const options = { env: { ...smokeEnv, ARC_HOME: home }, encoding: 'utf8' };
+    const json = await run(process.execPath, ['--require', preload, cli, 'windows', '--json'], options);
+    const report = JSON.parse(json.stdout);
+    assert.equal(report.version, 1);
+    assert.equal(report.complete, false);
+    assert.deepEqual(
+      report.windows.map((window) => window.hostId),
+      [reachable.hostId],
+    );
+    assert.deepEqual(report.diagnostics, [{ code: 'EACCES', stage: 'registry', hostId: denied }]);
+    assert.doesNotMatch(json.stdout, /secret|token|address|stack/);
+    const human = await run(process.execPath, ['--require', preload, cli, 'windows'], options);
+    assert.match(human.stdout, /discovery is incomplete/);
+    assert.match(human.stdout, /Window details f{24}: EACCES\./);
+    assert.doesNotMatch(human.stdout, /secret|token|address|stack/);
+  } finally {
+    await reachable.dispose();
     rmSync(home, { recursive: true, force: true });
   }
 });

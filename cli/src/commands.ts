@@ -244,7 +244,8 @@ export const COMMANDS: readonly Command[] = [
       synopsis: 'arc windows [--json]',
       flags: [['--json', 'Print JSON instead of a human-readable window listing.']],
       output: [
-        'JSON: version, windows, complete. Each window contains hostId, pid, version, folders, scopeReady, panelReady, panelVisible.',
+        'JSON: version, windows, complete, optional diagnostics. Each window contains hostId, pid, version, folders, scopeReady, panelReady, panelVisible, optional capabilities.',
+        'Diagnostics contain observed ENOENT, EACCES, or EPERM, a registry or connection stage, and an optional hostId.',
         'Incomplete discovery leaves complete false. Output excludes channel addresses and tokens.',
       ],
       refusals: ['Unknown arguments or more than one --json fail.'],

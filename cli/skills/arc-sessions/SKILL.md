@@ -13,6 +13,10 @@ Treat tag as a natural-language synonym for label. Keep `arc label`, `--label`, 
 
 Run `arc windows --json`. Select the intended window by its folders and `hostId`. Pass that ID through `--window` on every session command. `--window` overrides `ARC_WINDOW`. Without either, Arc requires exactly one live window and complete discovery.
 
+After reload or reconnection, refresh discovery before a new operation. Explicitly reselect the intended folders and their current `hostId`. A stale explicit `--window` or inherited `ARC_WINDOW` still selects the old activation. Never transfer an old request ID or follow-up ownership to the new activation. Preserve uncertain outcomes under Interpret delivery before starting new work.
+
+An empty list with `complete: false` does not establish a permission failure. Optional `diagnostics` report only observed `ENOENT`, `EACCES`, or `EPERM`, with a `registry` or `connection` stage. An observed `EACCES` or `EPERM` requires authorized local access to window details or the local socket. Report the limitation when the current permissions deny that access. Never bypass the permission policy or assume an editor restart repairs access.
+
 Check `scopeReady` and `panelReady` before starting. A hidden panel leaves live attention unknown. Ask the reader to show Arc when archive checks need current attention. A folderless window cannot start sessions. New sessions use the window's first folder. Never treat a session from another repository as part of this window's scope.
 
 Run `arc setups --window WINDOW_ID` before choosing settings. Use a returned setup key or explicit supported values. Preserve the requested provider, model, effort, and permissions. A loading catalog or unsupported setup refuses launch. Never substitute settings to bypass refusal.
@@ -31,11 +35,11 @@ Omitted `--agent-run` or `--agent-run=false` keeps reader ownership and Prompt b
 
 `refused` means no accepted launch. A timeout, disconnect, malformed response, or missing acknowledgment leaves delivery unknown. Preserve the window, request ID, prompt, and settings. Never launch a replacement or switch transports after an unknown outcome.
 
-Before each new start or curation action, save a fresh `WINDOW_ID:UUID` request ID. `WINDOW_ID` is the selected window's `hostId`. `UUID` is a fresh lowercase UUID. Pass that ID through `--request-id` on the first attempt. Start and curation accept an explicit identical-payload retry with that ID in the same activation. Arc retains results by ID and refuses conflicting payloads. A reload changes the activation and leaves the old outcome unknown. Never change the ID to retry. Do not retry automatically.
+Save a fresh `WINDOW_ID:UUID` before each new start, curation action, read acknowledgment, or follow-up. `WINDOW_ID` is the selected window's `hostId`. `UUID` is a fresh lowercase UUID. Pass that ID through `--request-id` on the first attempt. Start and curation accept an explicit identical-payload retry with that ID in the same activation. Arc retains results by ID and refuses conflicting payloads. A reload changes the activation and leaves the old outcome unknown. Never change the ID to retry. Do not retry automatically.
 
 ## Send a follow-up
 
-Send only to a session that this session started with `arc start --arc-dispatch` in the same window activation. A reload of the window ends that relationship. Read the session first with `arc session SESSION_ID --turns 5 --window WINDOW_ID --json`. Write the follow-up from that reply's turns. Copy the reply's `observation` string unchanged into `--observation`. A reply without `observation` means Arc accepts no follow-up for that session now. The prompt file follows the start rules. Use a fresh `WINDOW_ID:UUID` request ID for each new follow-up, where `WINDOW_ID` is the window's `hostId`.
+Send only to a session that this session started with `arc start --arc-dispatch` in the same window activation. A reload of the window ends that relationship. Read the session first with `arc session SESSION_ID --turns 5 --window WINDOW_ID --json`. Write the follow-up from that reply's turns. Copy the reply's `observation` string unchanged into `--observation`. A reply without `observation` means Arc accepts no follow-up for that session now. The prompt file follows the start rules. Use the fresh request-ID rule from Interpret delivery.
 
 Read the `status` field. `accepted` means the agent received the prompt, not that its work succeeded. `refused` means no prompt was sent, and `reason` says why. Each observation serves one follow-up attempt. It also goes stale when the reader gives that session or this one input through the panel, or when that session ends a turn or takes a follow-up. Read the session again and write the new follow-up from that reply. `unknown` means delivery is uncertain. Report it to the reader. A retry with the same request ID and prompt file returns the first result and sends nothing again. Never retry under a new request ID, start a replacement, or resume the session. Arc refuses later follow-ups to that session until the reader directs it in the panel, for example with a prompt, an answer, or Stop. A setting change alone does not lift that block.
 
@@ -111,6 +115,8 @@ Backslash-escape every ASCII punctuation character in the label to preserve the 
 These links require Arc's response-link support and open only inside its live extension panel. CLI JSON versions do not establish that support. Exported responses display only the label, without session navigation. Response links complement the existing Dispatched link. Preserve its `ARC_DISPATCH_SESSION` receipt, attribution, and delegated cost accounting.
 
 ## Manage a bounded set
+
+Use complete, nonnull session IDs from the selected window's scoped listing. Never abbreviate an ID for a read, acknowledgment, follow-up, or curation command. Query shorthand does not establish an exact action target. Resolve incomplete or ambiguous listing identities before acting.
 
 1. List every page. Pass each page's `next` unchanged to `--cursor` until `next` is `null`. Report the last page's `coverage` and `freshness`. When Arc refuses the cursor, discard the rows from that listing and restart once without `--cursor`. Listing changes no state, so retry the same cursor once after a timeout or an unavailable catalog. Then rank known Needs input and unread work before idle sessions. Preserve unknown, stale, and incomplete facts.
 2. Read each session you started before describing its result. Bounded reads leave reader attention unchanged.

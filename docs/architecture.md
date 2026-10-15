@@ -342,7 +342,7 @@ The first column is checked against the shipped extension directory by `architec
 | `cacheexpirysummary.ts` | Combines independently classified cache-expiry source summaries for the index and CLI | no |
 | `childcacheexpiry.ts` | Attributes native child return clocks across a card batch, preserving recorded history and reusing source-revision prices | no |
 | `sessionfilter.ts` | Ordered panel filter assignments and confirmed resets, operation deadlines, cancellation, and persistence ordering | no |
-| `sessionrequests.ts` | Per-activation window identity, private registry publication, authenticated bounded JSON-lines requests, live window discovery, target selection, query capability, connection cancellation, and channel cleanup | no |
+| `sessionrequests.ts` | Per-activation window identity, private registry publication, authenticated bounded JSON-lines requests, live window discovery, observed access diagnostics, target selection, query capability, connection cancellation, and channel cleanup | no |
 | `sessionreads.ts` | Paged programmatic session listings with signed cursors, independent transcript reads, and bounded exact source identity mappings | no |
 | `sessionwrites.ts` | Session-write schema with scoped launch folders and read-only options, activation-bound request retention, archive refusal decisions, and guarded follow-up ownership, admission, and panel wiring | no |
 | `dispatchreceipts.ts` | Launch-private receipts, immutable report events, authoritative file identity checks, retained claims, and durable consumption dispositions | no |
