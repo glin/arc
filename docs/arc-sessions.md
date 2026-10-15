@@ -80,6 +80,10 @@ After saving the handoff, request compaction of this session after your response
 
 A compaction request does not establish completed compaction. [CLI compaction requests](cli.md#session-management) owns admission and outcome states.
 
+## Collect data for a report
+
+Use `arc collect` for scoped pagination and optional recent turns. The caller selects the query and interprets the returned observations. [Collection output](cli.md#collect-session-data) defines references, outcomes, recovery, and limits. The command requires an explicit window selection and changes no session state.
+
 ## A bounded coordinator run
 
 A coordinator is an ordinary agent session given an explicit session-management task. The skill supplies instructions rather than a scheduler or separate coordinator process.

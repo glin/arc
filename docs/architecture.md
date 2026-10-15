@@ -22,6 +22,8 @@ Use this map to find the owner of a change. The topic guides hold behavior, and 
 
 Question recovery stores captured question payloads, dispositions, settled identity barriers, and immutable activation leases beneath the workspace partition. The webview retains its origin across restored tabs. Recovery reads only captured identities and uses separate transcript cursors. Each publication checks ownership once, and each source scan indexes captured tool identities. Unknown attempts remain outstanding. Claims remain exclusive across windows, and unresolved questions never enter age or history eviction.
 
+`cli/src/collect.ts` follows production listing pages and optionally reads turns through the selected window channel. It retains raw observations separately from usable row references and turn outcomes. [Collection output](cli.md#collect-session-data) owns recovery, admission limits, and the absence of physical source continuity guarantees.
+
 ## System shape
 
 Arc reads completed work from files, including sessions started in a terminal or another editor window. A child process carries live prompts, questions, and controls.

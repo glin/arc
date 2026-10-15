@@ -1,6 +1,7 @@
 type Flag = readonly [syntax: string, description: string];
 type Section = 'Reading' | 'Starting and sending' | 'Curating' | 'Compaction' | 'Cost' | 'Setup' | 'Dispatch';
 type Route =
+  | 'collect'
   | 'statusline'
   | 'windows'
   | 'sessions'
@@ -131,6 +132,37 @@ function compact(action: 'request' | 'status'): Command {
 }
 
 export const COMMANDS: readonly Command[] = [
+  {
+    name: 'collect',
+    section: 'Reading',
+    route: 'collect',
+    help: {
+      summary: 'Collect scoped listing pages and optional recent turns without changing session state.',
+      synopsis: 'arc collect --window ID [--query QUERY] [--turns 1-20] [OPTIONS]',
+      flags: [
+        ['--window ID', 'Required unless ARC_WINDOW supplies the selected activation. No automatic window discovery.'],
+        ['--query QUERY', 'Use the production sessions query, unchanged on every page.'],
+        ['--turns 1-20', 'Read recent turns for eligible rows. Omission reads listing pages only.'],
+        ['--limit 1-128', 'Maximum rows per listing page. Default: 128.'],
+        ['--max-pages 1-64', 'Maximum listing requests, including retries and restarts. Default: 64.'],
+        ['--max-reads 0-32', 'Maximum turn requests, including retries. Requires --turns. Default: 32.'],
+        ['--deadline-ms 1-60000', 'Stop admitting new requests after this interval. Default: 60000.'],
+        jsonFlag,
+      ],
+      output: [
+        'Version 1 JSON preserves raw pages and reads, usable row references, outcomes, selection, limits, and listing status.',
+        'Traversal end, discovery coverage, freshness, and turn outcomes remain separate. Source order establishes no priority.',
+        'Two concurrent turn requests and eight MiB of output bound collection. Admission expiry permits started requests to settle.',
+        'Turn replies cannot establish physical source continuity with listing rows. Costs and report policy stay with the caller.',
+      ],
+      refusals: [
+        argumentRefusal,
+        'Missing explicit selection fails before requests. No window switching occurs.',
+        'Unknown failures preserve prior observations and stop the affected collection path.',
+      ],
+      example: 'arc collect --window WINDOW_ID --query "-is:archived" --turns 2 --max-reads 2 --json',
+    },
+  },
   ...(['install', 'update', 'remove'] as const).map((action): Command => ({
     name: `skills ${action}`,
     section: 'Setup',
@@ -622,6 +654,6 @@ export function renderOverviewHelp(): string {
     ]),
     '',
     'Session IDs come from arc sessions. Query shorthand session:ID matches either provider. session:claude:ID and session:codex:ID select one provider.',
-    'Window selection: --window, then ARC_WINDOW, then exactly one live window with complete discovery.',
+    'Window selection: --window, then ARC_WINDOW, then exactly one live window with complete discovery. collect requires --window or ARC_WINDOW.',
   ].join('\n');
 }

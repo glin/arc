@@ -114,6 +114,12 @@ Backslash-escape every ASCII punctuation character in the label to preserve the 
 
 These links require Arc's response-link support and open only inside its live extension panel. CLI JSON versions do not establish that support. Exported responses display only the label, without session navigation. Response links complement the existing Dispatched link. Preserve its `ARC_DISPATCH_SESSION` receipt, attribution, and delegated cost accounting.
 
+## Collect data for a report
+
+Use `arc collect --window WINDOW_ID --query QUERY --json` for scoped pages. Add `--turns 1-20` for recent turns. Run `arc collect --help` for lower request and admission limits. Keep report selection and interpretation with the caller. Costs require separate commands.
+
+Use `listing.usablePages` and `rows` for the accepted traversal. `pages` also retain abandoned and unavailable observations. Keep traversal end, coverage, freshness, and turn outcomes separate. A completed outcome preserves the raw reply's partial, stale, or unparsed state. Report skipped and failed rows explicitly. Matching identities establish no physical source continuity. Collection leaves read receipts unacknowledged and changes no session state.
+
 ## Manage a bounded set
 
 Use complete, nonnull session IDs from the selected window's scoped listing. Never abbreviate an ID for a read, acknowledgment, follow-up, or curation command. Query shorthand does not establish an exact action target. Resolve incomplete or ambiguous listing identities before acting.

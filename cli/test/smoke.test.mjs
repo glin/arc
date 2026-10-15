@@ -28,6 +28,381 @@ import mutableFs from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
 import { readSkillPayload, skillTemporaryRoots } from '../src/skillfiles.ts';
 import { operateSkill } from '../src/skills.ts';
+import { runCollect } from '../src/collect.ts';
+import { SESSION_PAGE_ERRORS } from '../../extension/src/sessionreads.ts';
+
+const collectWindow = 'a'.repeat(24);
+const collectRow = (source, id = source, extra = {}) => ({
+  source,
+  id,
+  provider: 'claude',
+  ambiguous: false,
+  truncated: [],
+  attention: 'unknown',
+  ...extra,
+});
+const collectPage = (sessions = [], extra = {}) => ({
+  version: 1,
+  requester: null,
+  sessions,
+  complete: true,
+  notes: [],
+  next: null,
+  coverage: 'complete',
+  freshness: 'current',
+  ...extra,
+});
+const collectTurns = (id, extra = {}) => ({
+  version: 1,
+  requester: null,
+  id,
+  provider: 'claude',
+  state: 'current',
+  turns: [],
+  partial: true,
+  readByteLimit: 524288,
+  notes: ['bounded'],
+  ...extra,
+});
+const collectArgs = ['--window', collectWindow];
+
+test('collector restart excludes abandoned rows and preserves independent observations', async () => {
+  const calls = [];
+  const queue = [
+    collectPage([collectRow('old')], { next: 'cursorA', complete: false }),
+    new Error(SESSION_PAGE_ERRORS.scope),
+    collectPage([collectRow('new')], {
+      coverage: 'incomplete',
+      freshness: 'stale',
+      complete: false,
+      extra: 'preserved',
+    }),
+    collectTurns('new'),
+  ];
+  const output = JSON.parse(
+    await runCollect([...collectArgs, '--turns', '2', '--query', '-is:archived', '--limit', '1'], {
+      now: () => 0,
+      request: async (method, params, window) => {
+        calls.push({ method, params, window });
+        const reply = queue.shift();
+        if (reply instanceof Error) throw reply;
+        return reply;
+      },
+    }),
+  );
+  assert.deepEqual(output.rows, [{ page: 2, row: 0 }]);
+  assert.deepEqual(output.listing.usablePages, [2]);
+  assert.equal(output.pages[0].reply.sessions[0].id, 'old');
+  assert.equal(output.pages[2].reply.extra, 'preserved');
+  assert.equal(output.listing.ended, true);
+  assert.equal(output.listing.coverage, 'incomplete');
+  assert.equal(output.listing.freshness, 'stale');
+  assert.deepEqual(
+    calls.map((one) => one.method),
+    ['sessions', 'sessions', 'sessions', 'session'],
+  );
+  assert.deepEqual(
+    calls.slice(0, 3).map((one) => one.params),
+    [
+      { limit: 1, query: '-is:archived' },
+      { limit: 1, query: '-is:archived', cursor: 'cursorA' },
+      { limit: 1, query: '-is:archived' },
+    ],
+  );
+  assert.ok(calls.every((one) => one.window === collectWindow));
+  // These caller projections answer different questions from the same raw collection.
+  assert.deepEqual(
+    output.rows.map((ref) => output.pages[ref.page].reply.sessions[ref.row].attention),
+    ['unknown'],
+  );
+  assert.deepEqual(
+    output.outcomes
+      .filter((one) => one.status === 'completed')
+      .map((one) => output.reads[one.observations.at(-1)].reply.notes),
+    [['bounded']],
+  );
+});
+
+test('collector recovers unavailable empty first pages and retries the identical continuation', async () => {
+  const cursors = [];
+  const queue = [
+    collectPage([], { coverage: 'unavailable', complete: false }),
+    collectPage([collectRow('one')], { next: 'next', complete: false }),
+    new Error(SESSION_PAGE_ERRORS.catalog),
+    collectPage([collectRow('two')]),
+  ];
+  const output = JSON.parse(
+    await runCollect(collectArgs, {
+      now: () => 0,
+      request: async (_, params) => {
+        cursors.push(params.cursor);
+        const reply = queue.shift();
+        if (reply instanceof Error) throw reply;
+        return reply;
+      },
+    }),
+  );
+  assert.deepEqual(cursors, [undefined, undefined, 'next', 'next']);
+  assert.equal(output.listing.pageRequests, 4);
+  assert.deepEqual(output.listing.usablePages, [1, 3]);
+  assert.equal(output.rows.length, 2);
+  const unavailable = JSON.parse(
+    await runCollect(collectArgs, {
+      now: () => 0,
+      request: async () => collectPage([], { coverage: 'unavailable', complete: false }),
+    }),
+  );
+  assert.equal(unavailable.listing.stop, 'catalog-unavailable');
+  assert.equal(unavailable.listing.ended, false);
+  assert.equal(unavailable.listing.coverage, null);
+  assert.equal(unavailable.pages.length, 2);
+});
+
+test('collector preserves collisions and skips identities outside the turn protocol', async () => {
+  const rows = [
+    collectRow('a', 'same'),
+    collectRow('b', 'same', { provider: 'codex' }),
+    collectRow('c', 'same', { path: 'other' }),
+    collectRow('d', null),
+    collectRow('e', ''),
+    collectRow('f', 'x'.repeat(257)),
+    collectRow('g', 'short', { truncated: ['id'] }),
+    collectRow('h', 'ambiguous', { ambiguous: true }),
+    collectRow('i', '-literal/?#'),
+  ];
+  const calls = [];
+  const result = JSON.parse(
+    await runCollect([...collectArgs, '--turns', '1'], {
+      now: () => 0,
+      request: async (method, params) => {
+        calls.push([method, params]);
+        return method === 'sessions'
+          ? collectPage(rows)
+          : collectTurns(params.sessionId, { readObservation: 'raw-receipt' });
+      },
+    }),
+  );
+  assert.equal(result.rows.length, rows.length);
+  assert.deepEqual(
+    result.outcomes.map((one) => one.reason ?? one.status),
+    [
+      'ambiguous-identity',
+      'ambiguous-identity',
+      'ambiguous-identity',
+      'null-identity',
+      'empty-identity',
+      'long-identity',
+      'truncated-identity',
+      'ambiguous-identity',
+      'completed',
+    ],
+  );
+  assert.deepEqual(
+    calls.map((one) => one[0]),
+    ['sessions', 'session'],
+  );
+  assert.equal(calls[1][1].sessionId, '-literal/?#');
+  assert.equal(result.reads[0].reply.readObservation, 'raw-receipt');
+});
+
+test('collector stops listing failures without erasing earlier valid pages', async () => {
+  for (const [second, expected] of [
+    [{}, 'malformed-listing'],
+    [new Error('unknown refusal'), 'listing-failed'],
+    [collectPage([collectRow('b')], { next: 'next', complete: false }), 'repeated-cursor'],
+    [collectPage([collectRow('a')]), 'duplicate-source'],
+  ]) {
+    const queue = [collectPage([collectRow('a')], { next: 'next', complete: false }), second];
+    const output = JSON.parse(
+      await runCollect(collectArgs, {
+        now: () => 0,
+        request: async () => {
+          const one = queue.shift();
+          if (one instanceof Error) throw one;
+          return one;
+        },
+      }),
+    );
+    assert.equal(output.listing.stop, expected);
+    assert.equal(output.pages.length, 2);
+    assert.equal(output.pages[0].reply.sessions[0].id, 'a');
+    assert.equal(output.listing.ended, false);
+  }
+  let requests = 0;
+  const refused = JSON.parse(
+    await runCollect(collectArgs, {
+      now: () => 0,
+      request: async () => {
+        requests++;
+        throw new Error(SESSION_PAGE_ERRORS.cursor);
+      },
+    }),
+  );
+  assert.equal(requests, 2);
+  assert.equal(refused.listing.generation, 1);
+  assert.equal(refused.rows.length, 0);
+});
+
+test('collector validates turn replies and keeps bounded partial observations', async () => {
+  for (const [reply, reason] of [
+    [collectTurns('other'), 'identity-mismatch'],
+    [collectTurns('one', { provider: 'codex' }), 'identity-mismatch'],
+    [{ version: 1 }, 'malformed-turns'],
+    [collectTurns('one', { state: 'stale', turns: [{}] }), 'malformed-turns'],
+    [collectTurns('one'), undefined],
+  ]) {
+    const output = JSON.parse(
+      await runCollect([...collectArgs, '--turns', '1'], {
+        now: () => 0,
+        request: async (method) => (method === 'sessions' ? collectPage([collectRow('one')]) : reply),
+      }),
+    );
+    assert.equal(output.outcomes[0].reason, reason);
+    assert.deepEqual(output.reads[0].reply, reply);
+  }
+  let attempts = 0;
+  const retried = JSON.parse(
+    await runCollect([...collectArgs, '--turns', '1', '--max-reads', '2'], {
+      now: () => 0,
+      request: async (method) => {
+        if (method === 'sessions') return collectPage([collectRow('one'), collectRow('two')]);
+        if (++attempts === 1) throw new Error('The selected Arc window did not answer in time.');
+        return collectTurns('one');
+      },
+    }),
+  );
+  assert.equal(retried.turnRequests, 2);
+  assert.equal(retried.outcomes.length, 2);
+  assert.equal(retried.outcomes[0].observations.length, 1);
+  assert.ok(retried.outcomes.every((one) => one.status !== 'completed'));
+  attempts = 0;
+  const recovered = JSON.parse(
+    await runCollect([...collectArgs, '--turns', '1'], {
+      now: () => 0,
+      request: async (method) => {
+        if (method === 'sessions') return collectPage([collectRow('one')]);
+        if (++attempts === 1) throw new Error('The selected Arc window did not answer in time.');
+        return collectTurns('one');
+      },
+    }),
+  );
+  assert.equal(recovered.outcomes[0].status, 'completed');
+  assert.deepEqual(recovered.outcomes[0].observations, [0, 1]);
+});
+
+test('collector bounds admission, concurrency and escaped output with outcomes for every row', async () => {
+  let now = 0;
+  let calls = 0;
+  const expired = JSON.parse(
+    await runCollect([...collectArgs, '--turns', '1', '--deadline-ms', '1'], {
+      now: () => now,
+      request: async () => {
+        calls++;
+        now = 2;
+        return collectPage([collectRow('one')], { next: 'later', complete: false });
+      },
+    }),
+  );
+  assert.equal(calls, 1);
+  assert.equal(expired.listing.stop, 'deadline');
+  assert.equal(expired.outcomes[0].reason, 'deadline');
+  let page = 0;
+  let active = 0;
+  let peak = 0;
+  const capacity = JSON.parse(
+    await runCollect([...collectArgs, '--turns', '1'], {
+      now: () => 0,
+      request: async (method, params) => {
+        if (method === 'session') {
+          peak = Math.max(peak, ++active);
+          await Promise.resolve();
+          active--;
+          return collectTurns(params.sessionId);
+        }
+        const prefix = String(page++);
+        return collectPage(
+          Array.from({ length: 128 }, (_, index) => collectRow(prefix + '-' + index)),
+          { complete: false, next: 'page' + page, padding: '\u0000😀'.repeat(9000) },
+        );
+      },
+    }),
+  );
+  // Oversized replies stop their path instead of producing truncated JSON.
+  assert.equal(capacity.listing.stop, 'listing-failed');
+  assert.equal(peak, 0);
+  assert.ok(Buffer.byteLength(JSON.stringify(capacity)) <= 8 * 1024 * 1024);
+  page = 0;
+  const maximum = JSON.parse(
+    await runCollect([...collectArgs, '--turns', '1'], {
+      now: () => 0,
+      request: async (method, params) => {
+        if (method === 'session') {
+          peak = Math.max(peak, ++active);
+          await Promise.resolve();
+          active--;
+          return collectTurns(params.sessionId);
+        }
+        const prefix = String(page++);
+        return collectPage(
+          Array.from({ length: 128 }, (_, index) => collectRow(prefix + '-' + index)),
+          { complete: false, next: 'page' + page, padding: '\u0000😀'.repeat(2000) },
+        );
+      },
+    }),
+  );
+  assert.ok(maximum.listing.pageRequests <= 64);
+  assert.ok(maximum.turnRequests <= 32);
+  assert.equal(maximum.outcomes.length, maximum.rows.length);
+  assert.ok(Buffer.byteLength(JSON.stringify(maximum)) <= 8 * 1024 * 1024);
+  assert.ok(peak <= 2);
+  assert.equal(peak, 2);
+  assert.ok(maximum.outcomes.some((one) => one.reason === 'output-limit'));
+});
+
+test('bundled collector routes read-only requests and refuses invalid flags before transport', async () => {
+  const home = mkdtempSync(join(realpathSync(tmpdir()), 'arc collect & smoke '));
+  const channel = new WindowChannel(home);
+  const run = promisify(execFile);
+  const requests = [];
+  channel.setRequestHandler((request) => {
+    requests.push(request);
+    return request.method === 'sessions'
+      ? collectPage([collectRow('one', '-literal')])
+      : collectTurns(request.params.sessionId);
+  });
+  try {
+    await channel.update({ folders: [], scopeReady: true, panelReady: false, panelVisible: false });
+    const env = { ...smokeEnv, ARC_HOME: home, ARC_WINDOW: channel.hostId };
+    const output = JSON.parse(
+      (await run(process.execPath, [cli, 'collect', '--turns', '1', '--json'], { env })).stdout,
+    );
+    assert.equal(output.outcomes[0].status, 'completed');
+    assert.deepEqual(
+      requests.map((one) => one.method),
+      ['sessions', 'session'],
+    );
+    const before = requests.length;
+    for (const args of [
+      ['--json', '--json'],
+      ['--turns', '0'],
+      ['--max-pages', '65'],
+      ['--max-reads', '1'],
+      ['--limit', '129'],
+      ['--deadline-ms', '0'],
+      ['--query', 'find:needle'],
+      ['--query'],
+      ['--window', ''],
+      ['toString'],
+      ['--unknown'],
+    ])
+      await assert.rejects(run(process.execPath, [cli, 'collect', ...args], { env }));
+    await assert.rejects(run(process.execPath, [cli, 'collect'], { env: { ...env, ARC_WINDOW: '' } }));
+    assert.equal(requests.length, before);
+  } finally {
+    await channel.dispose();
+    rmSync(home, { recursive: true, force: true });
+  }
+});
 
 test('ordinary smoke fixtures create homes beneath physical temporary directories', () => {
   const source = readFileSync(fileURLToPath(import.meta.url), 'utf8');

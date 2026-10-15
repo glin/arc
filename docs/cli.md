@@ -66,6 +66,29 @@ A forged, modified, or expired cursor fails with an instruction to restart witho
 
 `session` defaults to five newest turns and accepts one through twenty. Its independent read allows at most 512 KiB, including source-directory checks and Codex opening reads. Open Arc to establish an unavailable session catalog before retrying. Output stops below 48 KiB and names excluded turns. Large turns that exceed the output allowance are excluded. A response exceeding the channel's full reply allowance fails explicitly. `partial` identifies bounded history, and `state` identifies current, stale, or unparsed reads. Stale reads return no turns. An unparsed read does not establish an empty session. Turn fields include prompt, response summary, recorded model and effort, timestamps, and completion state. These reads never mark turns read.
 
+## Collect session data
+
+`collect` follows scoped listing pages and optionally reads recent turns. It requires `--window` or `ARC_WINDOW`, resolved once before requests. It never discovers or switches windows. JSON is the default and only output. `--json` is accepted.
+
+```sh
+arc collect --window WINDOW_ID --query "-is:archived" --json
+arc collect --window WINDOW_ID --query "session:claude:one OR session:codex:two" --turns 2 --max-reads 2 --json
+```
+
+`--query` uses the production listing query. `--limit 1-128` sets rows per page and defaults to 128. Every page retains the same query and limit. Turns require explicit `--turns 1-20`. `--max-pages 1-64` defaults to 64 listing requests. `--max-reads 0-32` requires turns and defaults to 32 turn requests. Retries and abandoned requests count against those limits. At most two turn requests run concurrently. Unknown, duplicate, malformed, and inconsistent flags fail before requests.
+
+`--deadline-ms 1-60000` lowers the default sixty-second admission interval. Expiry stops new requests and permits started requests to settle. Transport and Windows helper preparation prevent a fixed completion-time promise. Request limits establish no total host-I/O bound. Cost collection remains separate.
+
+The version 1 envelope contains `window`, `selection`, `limits`, `listing`, `pages`, `rows`, `reads`, `outcomes`, and `turnRequests`. `pages` retain raw replies or bounded errors with their generation. `listing.usablePages` indexes accepted pages in the current generation. `rows` reference each usable source through `{page, row}` indexes. Raw rows occur only in their page reply. Additive reply fields and notes remain intact.
+
+`listing` separates `stop`, traversal `ended`, discovery `coverage`, cumulative `freshness`, `pageRequests`, and `generation`. Coverage and freshness remain null without a usable page. Ended traversal establishes no complete discovery. Unavailable empty first pages require recovery and never establish an empty repository. Cursor or scope refusal restarts once, excluding abandoned rows from usable results. Timeout or unavailable reads retry once with the same cursor. Repeated cursors, malformed replies, and unknown errors stop the affected path while preserving earlier observations.
+
+With turns requested, every usable source has an outcome referencing its `rows` index. Status is `completed`, `skipped`, or `failed`. Outcomes reference raw `reads` observations and give bounded reasons for omitted or failed reads. Completed collection preserves partial, stale, and unparsed replies without claiming complete turn history. Null, empty, truncated, ambiguous, colliding, and over-256-character identities receive skipped outcomes. Distinct providers and paths retain distinct listing rows. Source order establishes no priority.
+
+Turn replies preserve their returned identity separately from the requested row. Matching IDs and providers do not establish physical source continuity between observation times. Read receipts remain raw data and grant no automatic acknowledgment. Collection changes no session state and supplies no ranking, summary, or cost aggregation.
+
+Serialized output stays within eight MiB. Admission reserves response space, row references, outcomes, and terminal metadata before each request. Capacity exhaustion leaves explicit outcomes and complete JSON.
+
 ## Panel filter
 
 `filter` reveals or creates the existing Arc editor panel and replaces its session list query. `--clear` clears it through an explicit flag that survives PowerShell argument handling. Supply one nonempty positional query, one `--query QUERY`, or `--clear`. Mixing or repeating these forms fails before transport. The command preserves selection, sort, groups, folds, Show settings, and saved filter definitions. A replacement clears retained lens membership and sets the live filter to Custom. Clearing restores All sessions.

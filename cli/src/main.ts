@@ -2,6 +2,7 @@ import { renderNextTurn, renderStatus, snapshotFromClaude } from './status.ts';
 import { runCost } from './cost.ts';
 import { runWindows } from './windows.ts';
 import { runSessions } from './sessions.ts';
+import { runCollect } from './collect.ts';
 import { runManagement } from './manage.ts';
 import { runCompact } from './compact.ts';
 import { runDispatch } from './dispatch.ts';
@@ -43,6 +44,9 @@ async function run(): Promise<void> {
   if (!command) throw new Error(`Unknown command: ${args[0]}`);
   const commandArgs = args.slice(command.name.split(' ').length);
   switch (command.route) {
+    case 'collect':
+      process.stdout.write(`${await runCollect(commandArgs)}\n`);
+      return;
     case 'skills':
       await runSkills(command.action!, commandArgs);
       return;
