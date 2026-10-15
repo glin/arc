@@ -4,7 +4,7 @@ import { test, vi } from 'vitest';
 import { ChildCacheExpiryAttribution } from './childcacheexpiry.ts';
 import { turnKey } from './domain/read.ts';
 import { emptyCacheExpiryFacts, publicProjectSpendPrice, type NativeChildCacheFacts } from './projectspend.ts';
-import { turnCacheExpiryWarning } from './turncard.ts';
+import { turnCacheExpiryWarning, type CacheExpiryWarning } from './turncard.ts';
 import assert from 'node:assert';
 import * as path from 'node:path';
 import * as fs from 'node:fs';
@@ -616,18 +616,27 @@ test('child expiry attribution sums its own threshold and retains disjoint recor
   const source = (returns: ReturnType<typeof entry>[]): NativeChildCacheFacts => ({
     source: 'agent-child.jsonl',
     revision: {} as NativeChildCacheFacts['revision'],
-    facts: { ...emptyCacheExpiryFacts(), returns },
+    facts: { ...emptyCacheExpiryFacts(), counts: { '5m': returns.length, '30m': 0, '1h': 0 }, returns },
     endedAt: null,
     outcome: null,
   });
   const facts = (returns: ReturnType<typeof entry>[]) => ({
-    [parent.sessionId]: { ...emptyCacheExpiryFacts(), childSources: [source(returns)] },
+    [parent.sessionId]: {
+      ...emptyCacheExpiryFacts(),
+      counts: { '5m': returns.length, '30m': 0, '1h': 0 },
+      childSources: [source(returns)],
+    },
   });
   const quote = (dollars: number) => (bucket: { usage: { cacheRead: number } }) => ({
     dollars: bucket.usage.cacheRead ? 0 : dollars,
   });
-  for (const dollars of [0.495, 0.5, 0.6]) {
-    const cache = facts([entry(start), entry(start + 10_000)]);
+  for (const [count, dollars] of [
+    [2, 0.004],
+    [2, 0.495],
+    [2, 0.5],
+    [2, 0.6],
+  ]) {
+    const cache = facts(Array.from({ length: count }, (_, at) => entry(start + at * 10_000)));
     const result = new ChildCacheExpiryAttribution().read(
       [parent],
       cache,
@@ -637,19 +646,30 @@ test('child expiry attribution sums its own threshold and retains disjoint recor
       quote(dollars) as never,
     );
     const cost = result.get(turnKey(parent))!;
-    assert.equal(cost.count, 2);
-    assert.equal(cost.dollars, dollars * 2);
+    assert.equal(cost.count, count);
+    assert.equal(cost.dollars, dollars * count);
+    const retained = JSON.stringify(cache);
+    const session = sessionCacheExpiryStats(cache[parent.sessionId]);
     const warning = turnCacheExpiryWarning(parent, cache[parent.sessionId], cost);
     const card = toCard(parent, false, NOW, [], null, false, new Set(), [], warning);
     assert.equal(
       Boolean(
         card.chips.find((chip) => chip.metric === 'cost')?.warnings?.some((item) => item.scope === 'cache-expiry'),
       ),
-      dollars >= 0.5,
+      dollars * count >= 1,
     );
+    const chip = card.chips.find((chip) => chip.metric === 'cost')!;
+    assert.equal(
+      chip.detailList?.entries.some((item) => item.warning),
+      dollars * count >= CACHE_EXPIRY_SIGN_DOLLARS,
+    );
+    assert.equal(chip.detail.includes('Cache expiry affected'), dollars * count >= CACHE_EXPIRY_SIGN_DOLLARS);
+    assert.equal(chip.label, toCard(parent, false, NOW).chips.find((chip) => chip.metric === 'cost')?.label);
+    assert.deepEqual(sessionCacheExpiryStats(cache[parent.sessionId]), session);
+    assert.equal(JSON.stringify(cache), retained);
     assert.equal(
       new ChildCacheExpiryAttribution().read([parent], cache, NOW + 1_000_000).get(turnKey(parent))?.count,
-      2,
+      count,
       'quiet expiry contracted recorded child history',
     );
   }
@@ -769,18 +789,19 @@ test('a card batch inspects native child returns once and prices only changed so
   }
 });
 
-test('a turn that returned to an expired cache warns in its cost popover and signs its figure from $1', () => {
+test('a turn that returned to an expired cache warns in its cost popover and figure from $1', () => {
   const usage = tokenUsage({ requests: 2, input: 40_000, cacheWrite1h: 300_000, output: 2_000 });
   const ran = turn({
     model: 'claude-sonnet-5',
     usage,
     usageParts: [{ ...sonnetPart, usage }],
   });
-  const cost = (dollars: number | null) =>
+  const cost = (dollars: number | null, over: Partial<CacheExpiryWarning> = {}) =>
     toCard(ran, false, NOW, [], null, false, new Set(), [], {
       scope: 'cache-expiry',
       gapMs: 72 * 60 * 1000,
       dollars,
+      ...over,
     }).chips.find((chip) => chip.metric === 'cost')!;
   const signed = cost(2.34);
   const sentence = 'Cache expired after a 1h 12m gap and added $2.34';
@@ -792,21 +813,95 @@ test('a turn that returned to an expired cache warns in its cost popover and sig
   assert.ok(signed.name?.includes(sentence), 'the accessible name carries the full sentence');
   const atLimit = cost(CACHE_EXPIRY_SIGN_DOLLARS);
   assert.equal(atLimit.warnings?.length, 1);
-  const small = cost(0.5);
-  assert.equal(small.detailList?.entries[0].label, 'Cache expired after a 1h 12m gap and added $0.50');
-  assert.equal(small.warnings, undefined, 'below $1 the figure carries no sign');
-  assert.equal(cost(null).detailList?.entries[0].label, 'Cache expired after a 1h 12m gap');
+  const plain = toCard(ran, false, NOW).chips.find((chip) => chip.metric === 'cost')!;
+  const child = (dollars: number | null, status: 'exact' | 'atLeast' | 'unknown' = 'exact', count = 1) => ({
+    count,
+    dollars,
+    status,
+    longestGapMs: 72 * 60 * 1000,
+  });
+  for (const dollars of [0, 0.004, 0.5, 0.999, 1, 1.2]) {
+    const visible = dollars >= CACHE_EXPIRY_SIGN_DOLLARS;
+    for (const children of [undefined, child(dollars)]) {
+      const chip = cost(dollars, { children });
+      assert.equal(
+        chip.detailList?.entries.some((item) => item.warning),
+        visible,
+      );
+      assert.equal(chip.detail.includes(children ? 'Cache expiry affected' : 'Cache expired'), visible);
+      assert.equal(Boolean(chip.warnings?.length), visible, 'the text and figure sign disagree');
+      assert.equal(chip.label, plain.label, 'warning visibility changed the total');
+      if (visible) assert.ok(chip.name?.includes(children ? 'Cache expiry affected' : 'Cache expired'));
+      if (!visible) {
+        assert.deepEqual(chip.detailList, plain.detailList);
+        assert.equal(chip.name, plain.name, 'a hidden warning remained in the accessible name');
+      }
+    }
+    for (const mainDollars of [0.004, 0.5, 1, 1.2]) {
+      const chip = cost(dollars, {
+        children: child(dollars),
+        main: { dollars: mainDollars, status: 'exact', gapMs: 72 * 60 * 1000 },
+      });
+      assert.equal(chip.detail.includes('Cache expired'), mainDollars >= CACHE_EXPIRY_SIGN_DOLLARS);
+      assert.equal(chip.detail.includes('Cache expiry affected'), visible);
+      assert.equal(Boolean(chip.warnings?.length), visible || mainDollars >= CACHE_EXPIRY_SIGN_DOLLARS);
+      assert.equal(chip.name?.includes('Cache expired') ?? false, mainDollars >= CACHE_EXPIRY_SIGN_DOLLARS);
+      assert.equal(chip.name?.includes('Cache expiry affected') ?? false, visible);
+      assert.doesNotMatch(chip.detail, /^\.|\. \n/);
+    }
+  }
+  for (const status of ['atLeast', 'unknown'] as const) {
+    for (const dollars of [null, 0, 0.004, 0.5, 0.999, 1, 1.2]) {
+      for (const children of [undefined, child(dollars, status)]) {
+        const chip = cost(dollars, { status, children });
+        const visible = dollars !== null && dollars >= CACHE_EXPIRY_SIGN_DOLLARS;
+        assert.equal(
+          chip.detailList?.entries.some((item) => item.warning),
+          visible,
+        );
+        assert.equal(Boolean(chip.warnings?.length), visible, 'uncertain text and figure sign disagree');
+        assert.equal(chip.name?.includes(children ? 'Cache expiry affected' : 'Cache expired') ?? false, visible);
+        assert.equal(chip.label, plain.label);
+        if (!visible) assert.deepEqual(chip.detailList, plain.detailList);
+        if (status === 'atLeast' && visible) assert.match(chip.detail, /added at least /);
+      }
+    }
+  }
+  assert.equal(
+    cost(1.2, { children: child(1.2) }).detailList?.entries[0]?.label,
+    'Cache expiry affected 1 subagent request and added $1.20',
+  );
+  assert.equal(
+    cost(1.2, { children: child(1.2, 'exact', 3) }).detailList?.entries[0]?.label,
+    'Cache expiry affected 3 subagent requests and added $1.20',
+  );
+  for (const [main, delegated, signed] of [
+    [0.6, 0.6, false],
+    [1, 0.004, true],
+    [0.004, 1, true],
+  ] as const) {
+    const chip = cost(delegated, {
+      children: child(delegated),
+      main: { dollars: main, status: 'exact', gapMs: 72 * 60 * 1000 },
+    });
+    assert.equal(Boolean(chip.warnings?.length), signed);
+    assert.equal(chip.name?.includes('Cache expired') ?? false, signed && main >= CACHE_EXPIRY_SIGN_DOLLARS);
+    assert.equal(
+      chip.name?.includes('Cache expiry affected') ?? false,
+      signed && delegated >= CACHE_EXPIRY_SIGN_DOLLARS,
+    );
+  }
   assert.ok(
     !toCard(ran, false, NOW)
       .chips.find((chip) => chip.metric === 'cost')
       ?.detail.includes('Cache expired'),
   );
   const gap = (minutes: number) =>
-    cacheExpiryWarningText({ scope: 'cache-expiry', gapMs: minutes * 60 * 1000, dollars: null });
-  assert.equal(gap(8 * 60), 'Cache expired after an 8h 0m gap');
-  assert.equal(gap(11), 'Cache expired after an 11m gap');
-  assert.equal(gap(18 * 60), 'Cache expired after an 18h 0m gap');
-  assert.equal(gap(61), 'Cache expired after a 1h 1m gap');
+    cacheExpiryWarningText({ scope: 'cache-expiry', gapMs: minutes * 60 * 1000, dollars: 1 });
+  assert.equal(gap(8 * 60), 'Cache expired after an 8h 0m gap and added $1.00');
+  assert.equal(gap(11), 'Cache expired after an 11m gap and added $1.00');
+  assert.equal(gap(18 * 60), 'Cache expired after an 18h 0m gap and added $1.00');
+  assert.equal(gap(61), 'Cache expired after a 1h 1m gap and added $1.00');
 });
 
 test('a turn that holds a compaction names it under Included above', () => {

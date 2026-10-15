@@ -33090,7 +33090,14 @@ test('a drawn Claude card redraws with its cache-expiry warning when the session
   const dispatched = { [turn.sessionId]: {} };
   const seen: unknown[] = [];
   type Sent = {
-    cards: { chips: { metric?: string; detailList?: { entries: { label: string; warning?: boolean }[] } }[] }[];
+    cards: {
+      chips: {
+        metric?: string;
+        name?: string;
+        warnings?: unknown[];
+        detailList?: { entries: { label: string; warning?: boolean }[] };
+      }[];
+    }[];
   };
   const sent: Sent[] = [];
   const host = Object.assign(Object.create(PanelProvider.prototype), {
@@ -33124,6 +33131,26 @@ test('a drawn Claude card redraws with its cache-expiry warning when the session
   assert.match(cost?.detailList?.entries[0]?.label ?? '', /^Cache expired after a 1h 12m gap and added \$\d+\.\d\d$/);
   assert.equal(cost?.detailList?.entries[0]?.warning, true);
   assert.ok(seen.includes(dispatched), 'the redraw drew the card without its dispatched costs');
+  const small = {
+    ...expiry,
+    returns: expiry.returns.map((item) => ({
+      ...item,
+      previousInputSide: 1_800,
+      request: { ...item.request, usage: { ...item.request.usage, cacheWrite1h: 1_820 } },
+    })),
+  };
+  facts = { [turn.sessionId]: small };
+  host.postDispatchedCostsIfMoved();
+  const suppressed = sent[1]?.cards[0]?.chips.find((chip) => chip.metric === 'cost');
+  assert.ok(suppressed, 'crossing below $1 did not redraw the card');
+  assert.ok(!suppressed.detailList?.entries.some((entry) => entry.warning));
+  assert.ok(!suppressed.name?.includes('Cache expired'));
+  assert.equal(suppressed.warnings, undefined);
+  facts = { [turn.sessionId]: expiry };
+  host.postDispatchedCostsIfMoved();
+  const restored = sent[2]?.cards[0]?.chips.find((chip) => chip.metric === 'cost');
+  assert.equal(restored?.detailList?.entries[0]?.label, cost?.detailList?.entries[0]?.label);
+  assert.equal(restored?.warnings?.length, 1, 'crossing back above $1 did not restore the sign');
 });
 
 test('a child-only warning survives quiet expiry, exit, completion and saved-source reload', () => {
@@ -33196,7 +33223,7 @@ test('a child-only warning survives quiet expiry, exit, completion and saved-sou
     assert.ok(sign(), 'appending only child facts did not sign the drawn parent card');
     const amount = sign().dollars;
     const label = host.cards[0].chips.find((chip: any) => chip.metric === 'cost').detailList.entries[0].label;
-    assert.match(label, /return from a subagent/);
+    assert.match(label, /Cache expiry affected 1 subagent request/);
     live = false;
     vi.setSystemTime(NOW + 60 * 60_000);
     host.cards = [host.renderTurnCard(turn, false, 'Child cache expiry', Date.now())];

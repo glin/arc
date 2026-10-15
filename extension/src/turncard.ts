@@ -2712,12 +2712,13 @@ function costDetailList(
       ),
     ) ||
     sharedCosts.some((cost) => cost.part.model === 'codex-auto-review' && cost.publiclyPriced);
+  const expiryText = expiry ? cacheExpiryWarningText(expiry) : '';
   return {
     heading: {
       label: 'Estimated total',
       value: totalLabel ? `${totalLabel}${total.partial ? '+' : ''}` : 'cost unavailable',
     },
-    entries: [...(expiry ? [{ label: cacheExpiryWarningText(expiry), warning: true }] : []), ...entries, ...included],
+    entries: [...(expiryText ? [{ label: expiryText, warning: true }] : []), ...entries, ...included],
     // The compaction notes say part of the cost is a modelled estimate, so they stay visible.
     ...(mainEstimated || compactionNote || childCompactionNotes.length
       ? {
@@ -2855,7 +2856,7 @@ function formatExpiryGap(ms: number): string {
   return `${days}d${remainder ? ` ${remainder}h` : ''}`;
 }
 
-// The least cost added that draws the warning sign on a turn's cost figure.
+// The least known cost added that draws a warning in a turn's cost detail and figure.
 export const CACHE_EXPIRY_SIGN_DOLLARS = 1;
 
 // The return that opened `turn`, from the session's retained cache-expiry returns. A Claude
@@ -2897,7 +2898,7 @@ export function turnCacheExpiryWarning(
           publicProjectSpendPrice,
         )
       : null;
-  if (!children) return { scope: 'cache-expiry', gapMs: found!.gapMs, dollars: priced!.dollars };
+  if (!children) return { scope: 'cache-expiry', gapMs: found!.gapMs, ...priced! };
   return {
     scope: 'cache-expiry',
     gapMs: found?.gapMs ?? children.longestGapMs,
@@ -2926,13 +2927,17 @@ export function cacheExpiryWarningText(warning: CacheExpiryWarning): string {
       children.dollars === null
         ? ''
         : ` and added ${children.status === 'atLeast' ? 'at least ' : ''}${formatCost(children.dollars) ?? ZERO_COST}`;
-    const childText = `${children.count} ${children.count === 1 ? 'return from a subagent followed an expired cache' : 'returns from subagents followed expired caches'}${added}`;
-    return warning.main
-      ? `${cacheExpiryWarningText({ scope: 'cache-expiry', ...warning.main })}. ${childText}`
-      : childText;
+    const childText =
+      children.dollars !== null && children.dollars >= CACHE_EXPIRY_SIGN_DOLLARS
+        ? `Cache expiry affected ${children.count} subagent ${children.count === 1 ? 'request' : 'requests'}${added}`
+        : '';
+    return [warning.main ? cacheExpiryWarningText({ scope: 'cache-expiry', ...warning.main }) : '', childText]
+      .filter(Boolean)
+      .join('. ');
   }
+  if (warning.dollars === null || warning.dollars < CACHE_EXPIRY_SIGN_DOLLARS) return '';
   const added = warning.dollars === null ? null : (formatCost(warning.dollars) ?? ZERO_COST);
-  return `Cache expired after ${gapPhrase(warning.gapMs)}${added ? ` and added ${added}` : ''}`;
+  return `Cache expired after ${gapPhrase(warning.gapMs)}${added ? ` and added ${warning.status === 'atLeast' ? 'at least ' : ''}${added}` : ''}`;
 }
 
 export interface CacheExpiryCountFact {
