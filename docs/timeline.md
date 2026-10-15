@@ -123,7 +123,7 @@ A Claude `Skill` call has no tool category and keeps its chronological Activity 
 
 Visible narration and clear reasoning summaries are ordered activity, separate from tool steps. They do not increase tool totals. Claude contributes assistant text that stopped for a tool call. Codex contributes commentary-phase messages and clear reasoning summaries. Final-answer messages remain responses.
 
-A Codex rollout records the same commentary message twice, on two record types. An `event_msg` envelope holds it as an `AgentMessage` item with `Text` content. A `response_item` envelope holds it as a `message` with `output_text` content. Both carry `phase: "commentary"`, but their ids can differ. The reader joins matching ids or matching timestamps and text. Its byte prefilter accepts commentary on either envelope type.
+A Codex rollout records commentary through `event_msg` and `response_item` envelopes. An event holds an `AgentMessage` item with `Text` content or a root `agent_message` with a `message` string. A response item holds a `message` with `output_text` content. Both carry `phase: "commentary"`, but their ids can differ. The reader joins matching ids or matching timestamps and text. It also pairs an idless root event with an identified response item when their normalized text matches within two seconds. This fallback pairs the latest unmatched commentary once, within one turn and without an intervening prompt, tool step, or other Activity message. The first row retains its position and timestamp and takes the response identity. Its byte prefilter accepts commentary on either envelope type.
 
 ## Card sources
 

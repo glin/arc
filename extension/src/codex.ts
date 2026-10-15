@@ -1164,6 +1164,7 @@ const LAUNCHED = 'launched';
 
 interface Entry {
   kind: string;
+  wrapper?: string;
   at: number;
   payload: Record<string, unknown>;
 }
@@ -2410,7 +2411,7 @@ export function parseRecord(line: string): Entry | null {
   }
   const wrapper = o.type || '';
   const kind = wrapper === 'event_msg' || wrapper === 'response_item' ? String(payload.type || '') : wrapper;
-  return { kind, at: stamp(o.timestamp), payload };
+  return { kind, wrapper, at: stamp(o.timestamp), payload };
 }
 
 export function reduceCodexUsageLine(state: CodexUsageReducerState, line: string): UsageEvent | null {
@@ -3952,6 +3953,7 @@ interface ParsedUpdate {
   sourceId: string | null;
   kind: TurnUpdate['kind'];
   text: string;
+  commentarySource?: 'root' | 'response';
 }
 
 function blocksText(value: unknown): string {
@@ -4020,11 +4022,24 @@ function parsedAsyncMessage(payload: Record<string, unknown>, captureSessionText
 
 // Visible assistant activity only. A final answer is handled by `parsedFinalAnswer` instead,
 // and opaque reasoning fields are never copied into the normalized turn.
-function parsedUpdate(payload: Record<string, unknown>, captureSessionText = false): ParsedUpdate | null {
+function parsedUpdate(
+  payload: Record<string, unknown>,
+  captureSessionText = false,
+  wrapper?: string,
+): ParsedUpdate | null {
   const message = parsedMessageItem(payload, captureSessionText);
   if (message) {
     return message.phase === 'commentary'
-      ? { sourceId: message.sourceId, kind: 'commentary', text: message.text }
+      ? {
+          sourceId: message.sourceId,
+          kind: 'commentary',
+          text: message.text,
+          ...(!payload.item && wrapper === 'event_msg' && payload.type === 'agent_message' && !message.sourceId
+            ? { commentarySource: 'root' as const }
+            : !payload.item && wrapper === 'response_item' && payload.type === 'message' && message.sourceId
+              ? { commentarySource: 'response' as const }
+              : {}),
+        }
       : null;
   }
   const nested = isRecord(payload.item) ? payload.item : null;
@@ -5381,7 +5396,7 @@ export function discoverCodexNewestTurn(
 }
 
 export interface CodexSessionParserState {
-  version: 21;
+  version: 22;
   responseClock: CodexResponseClock;
   turns: Turn[];
   turnRanges: Array<{ start: number; end: number }>;
@@ -5414,6 +5429,8 @@ export interface CodexSessionParserState {
   stepById: Map<string, TurnStep>;
   updateById: Map<string, TurnUpdate>;
   updateByText: Map<string, TurnUpdate>;
+  // One unpaired complementary commentary source. Shared update identity survives reducer snapshots.
+  commentaryPair: { update: TurnUpdate; source: 'root' | 'response' } | null;
   answerById: Map<string, TurnAnswer>;
   pendingExec: Map<string, { step: TurnStep; expanded: boolean }>;
   launched: Map<string, TurnAgent>;
@@ -5466,7 +5483,7 @@ function emptyCodexSessionParserState(meta: CodexSessionMeta | null): CodexSessi
   const replayBoundaryAt = meta?.replayBoundaryAt ?? null;
   const openingSessionId = meta?.sessionId ?? null;
   return {
-    version: 21,
+    version: 22,
     responseClock: emptyCodexResponseClock(),
     turns: [],
     turnRanges: [],
@@ -5484,6 +5501,7 @@ function emptyCodexSessionParserState(meta: CodexSessionMeta | null): CodexSessi
     stepById: new Map(),
     updateById: new Map(),
     updateByText: new Map(),
+    commentaryPair: null,
     answerById: new Map(),
     pendingExec: new Map(),
     launched: new Map(),
@@ -5522,6 +5540,7 @@ function discardCodexTurn(state: CodexSessionParserState): void {
   state.pendingExec.clear();
   state.updateById.clear();
   state.updateByText.clear();
+  state.commentaryPair = null;
   state.answerById.clear();
 }
 
@@ -5872,6 +5891,7 @@ function closeCodexTurn(state: CodexSessionParserState, maxTurns: number, at = 0
   state.pendingExec.clear();
   state.updateById.clear();
   state.updateByText.clear();
+  state.commentaryPair = null;
   state.answerById.clear();
   boundCodexTurns(state, maxTurns);
 }
@@ -6462,6 +6482,7 @@ function reduceCodexSessionLine(
       // The first prompt opens the turn. Preserve later prompts with their timestamps as follow-up messages.
       const raw = userMessage(record);
       if (raw !== null) {
+        state.commentaryPair = null;
         const asked = codexPrompt(raw, opts.captureSessionText);
         if (!codexPrompt(raw)) {
           break;
@@ -6476,9 +6497,9 @@ function reduceCodexSessionLine(
         }
         break;
       }
-      const update = parsedUpdate(payload, opts.captureSessionText);
+      const update = parsedUpdate(payload, opts.captureSessionText, record.wrapper);
       if (update) {
-        recordUpdate(turn, state.updateById, state.updateByText, update, at, ++state.updateSequence);
+        recordUpdate(turn, state, update, at, ++state.updateSequence);
         turn.endedAt = Math.max(turn.endedAt, at);
       }
       const answer = parsedFinalAnswer(payload, opts.captureSessionText);
@@ -6727,13 +6748,13 @@ function reduceCodexSessionLine(
       }
       const asked = parsedAsyncMessage(payload, opts.captureSessionText);
       if (asked) {
-        recordUpdate(turn, state.updateById, state.updateByText, asked, at, ++state.updateSequence);
+        recordUpdate(turn, state, asked, at, ++state.updateSequence);
         turn.endedAt = Math.max(turn.endedAt, at);
         break;
       }
-      const update = parsedUpdate(payload, opts.captureSessionText);
+      const update = parsedUpdate(payload, opts.captureSessionText, record.wrapper);
       if (update) {
-        recordUpdate(turn, state.updateById, state.updateByText, update, at, ++state.updateSequence);
+        recordUpdate(turn, state, update, at, ++state.updateSequence);
         turn.endedAt = Math.max(turn.endedAt, at);
       }
       const answer = parsedFinalAnswer(payload, opts.captureSessionText);
@@ -6820,9 +6841,9 @@ function reduceCodexSessionLine(
         turn.delegation ??= delegation;
         turn.endedAt = Math.max(turn.endedAt, at);
       }
-      const update = parsedUpdate(payload, opts.captureSessionText);
+      const update = parsedUpdate(payload, opts.captureSessionText, record.wrapper);
       if (update) {
-        recordUpdate(turn, state.updateById, state.updateByText, update, at, ++state.updateSequence);
+        recordUpdate(turn, state, update, at, ++state.updateSequence);
         turn.endedAt = Math.max(turn.endedAt, at);
       }
       const answer = parsedFinalAnswer(payload, opts.captureSessionText);
@@ -6845,9 +6866,9 @@ function reduceCodexSessionLine(
     case 'AgentMessage':
     case 'Reasoning':
     case 'reasoning': {
-      const update = parsedUpdate(payload, opts.captureSessionText);
+      const update = parsedUpdate(payload, opts.captureSessionText, record.wrapper);
       if (update) {
-        recordUpdate(turn, state.updateById, state.updateByText, update, at, ++state.updateSequence);
+        recordUpdate(turn, state, update, at, ++state.updateSequence);
         turn.endedAt = Math.max(turn.endedAt, at);
       }
       const answer = parsedFinalAnswer(payload, opts.captureSessionText);
@@ -7233,7 +7254,7 @@ export function createCodexSessionReducer(
   restored?: CodexSessionParserState,
 ): CodexSessionReducer {
   const state = restored ? cloneParserState(restored) : emptyCodexSessionParserState(meta);
-  if (state.version !== 21) {
+  if (state.version !== 22) {
     throw new Error('Incompatible Codex parser state');
   }
   applyHiddenParserState(codexHiddenSlots(state), state.hidden, CODEX_HIDDEN_POLICY);
@@ -7518,21 +7539,31 @@ function recordStep(
 
 function recordUpdate(
   turn: Building,
-  byId: Map<string, TurnUpdate>,
-  byText: Map<string, TurnUpdate>,
+  state: CodexSessionParserState,
   parsed: ParsedUpdate,
   at: number,
   sequence: number,
 ): void {
+  const { updateById: byId, updateByText: byText, commentaryPair: pair } = state;
   const sourceId = parsed.sourceId ?? `${turn.promptId}:${parsed.kind}:${at}:${sequence}`;
   const textKey = `${parsed.kind}:${at}:${parsed.text}`;
-  const held = byId.get(sourceId) ?? byText.get(textKey);
+  const complementary =
+    parsed.commentarySource &&
+    pair &&
+    parsed.commentarySource !== pair.source &&
+    pair.update.kind === parsed.kind &&
+    pair.update.text === parsed.text &&
+    pair.update.stepsBefore === turn.stepCount &&
+    Math.abs(at - pair.update.at) <= ANSWER_PAIRING_WINDOW_MS;
+  const held = byId.get(sourceId) ?? byText.get(textKey) ?? (complementary ? pair.update : null);
+  // Consume both representations once. Later occurrences get their own candidate and Activity row.
+  state.commentaryPair = null;
   if (held) {
     if (parsed.text.length > held.text.length) {
       held.text = parsed.text;
     }
     held.status = 'done';
-    if (sourceId.startsWith('msg_')) {
+    if (sourceId.startsWith('msg_') || (complementary && parsed.commentarySource === 'response')) {
       held.sourceId = sourceId;
     }
     byId.set(sourceId, held);
@@ -7548,6 +7579,9 @@ function recordUpdate(
     stepsBefore: turn.stepCount,
   };
   turn.updates.push(update);
+  if (parsed.commentarySource) {
+    state.commentaryPair = { update, source: parsed.commentarySource };
+  }
   byId.set(sourceId, update);
   byText.set(textKey, update);
 }

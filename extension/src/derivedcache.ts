@@ -413,7 +413,7 @@ interface StoredCache {
 // The initial metadata budget, `INITIAL_RAIL_READ_BYTES`, spreads large workspace rebuilds across refreshes.
 // Targeted invalidation avoids a full rebuild when affected entries are identifiable at load.
 // Codex opening rows use `CODEX_META_VERSION` from codexopenings.ts and survive this version change.
-export const VERSION = 62;
+export const VERSION = 63;
 
 export class DerivedCacheCheckpointState {
   private generation = 0;

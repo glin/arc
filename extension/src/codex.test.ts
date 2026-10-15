@@ -7398,6 +7398,183 @@ test('paired narration records with different ids produce one message identity',
   }
 });
 
+test('paired root commentary with unequal timestamps produces one Activity message across snapshots', () => {
+  const text = 'I’ll check its current name and confirm what remains before archiving this chat.';
+  for (const difference of [1, 10, 2000]) {
+    const pair = [
+      event('agent_message', 4, { phase: 'commentary', message: text + '\n' }),
+      recordedAt(
+        item('message', 4, {
+          id: 'msg_commentary',
+          role: 'assistant',
+          phase: 'commentary',
+          content: [{ type: 'output_text', text: text + '\n' }],
+        }),
+        new Date(ms(4) + difference).toISOString(),
+      ),
+    ];
+    for (const ordered of [pair, [...pair].reverse()]) {
+      for (const snapshot of [false, true]) {
+        let reducer = createCodexSessionReducer('sess');
+        const records = [
+          meta(),
+          event('task_started', 1, { turn_id: TURN }),
+          message('user', 2, 'Archive this chat'),
+          item('function_call', 3, { name: 'exec_command', call_id: 'first_call', arguments: '{"cmd":"pwd"}' }),
+          ...ordered,
+        ];
+        for (const [index, record] of records.entries()) {
+          reducer.pushLine(JSON.stringify(record));
+          if (snapshot && index === 4) {
+            reducer = createCodexSessionReducer('sess', {}, null, structuredClone(reducer.snapshot()));
+          }
+        }
+        const [turn] = reducer.read().turns;
+        const card = toCard(turn, true, ms(8));
+        assert.equal(card.saidMessages.length, 1);
+        assert.deepEqual(turn.updates, [
+          {
+            sourceId: 'msg_commentary',
+            kind: 'commentary',
+            text,
+            at: Date.parse(ordered[0].timestamp),
+            status: 'done',
+            stepsBefore: 1,
+          },
+        ]);
+        assert.deepEqual(
+          Object.keys(turn.updates[0]).sort(),
+          ['sourceId', 'kind', 'text', 'at', 'status', 'stepsBefore'].sort(),
+        );
+      }
+    }
+  }
+});
+
+test('root commentary pairing preserves separate Activity messages', () => {
+  const text = 'Checking the parser.';
+  const root = (offset: number, extra: Record<string, unknown> = {}) =>
+    recordedAt(
+      event('agent_message', 4, { phase: 'commentary', message: text, ...extra }),
+      new Date(ms(4) + offset).toISOString(),
+    );
+  const response = (offset: number, id = 'msg_one', body = text) =>
+    recordedAt(
+      item('message', 4, {
+        id,
+        role: 'assistant',
+        phase: 'commentary',
+        content: [{ type: 'output_text', text: body }],
+      }),
+      new Date(ms(4) + offset).toISOString(),
+    );
+  const cases: Array<{ name: string; records: object[]; messages: number }> = [
+    { name: 'root repetition', records: [root(0), root(1)], messages: 2 },
+    { name: 'identified repetition', records: [response(0), response(1, 'msg_two')], messages: 2 },
+    { name: 'consumed root', records: [root(0), response(1), response(2, 'msg_two')], messages: 2 },
+    { name: 'consumed response', records: [response(0), root(1), root(2)], messages: 2 },
+    { name: 'two complete occurrences', records: [root(0), response(1), root(2), response(3, 'msg_two')], messages: 2 },
+    { name: 'same envelope before response', records: [root(0), root(1), response(2)], messages: 2 },
+    { name: 'changed text', records: [root(0), response(1, 'msg_one', text + ' Again.')], messages: 2 },
+    { name: 'outside window', records: [root(0), response(2001)], messages: 2 },
+    { name: 'identified root', records: [root(0, { id: 'root_one' }), response(1)], messages: 2 },
+    { name: 'unidentified response', records: [root(0), response(1, '')], messages: 2 },
+    {
+      name: 'nested event',
+      records: [
+        event('item_completed', 4, {
+          item: { type: 'AgentMessage', phase: 'commentary', content: [{ type: 'Text', text }] },
+        }),
+        response(1),
+      ],
+      messages: 2,
+    },
+    { name: 'wrong root envelope', records: [{ ...root(0), type: 'response_item' }, response(1)], messages: 2 },
+    { name: 'wrong response envelope', records: [root(0), { ...response(1), type: 'event_msg' }], messages: 2 },
+    {
+      name: 'intervening prompt',
+      records: [root(0), message('user', 4, 'Check another file'), response(1)],
+      messages: 2,
+    },
+    {
+      name: 'intervening step',
+      records: [
+        root(0),
+        item('function_call', 4, { name: 'exec_command', call_id: 'call_between', arguments: '{"cmd":"pwd"}' }),
+        response(1),
+      ],
+      messages: 2,
+    },
+    {
+      name: 'reasoning',
+      records: [
+        root(0),
+        recordedAt(
+          item('reasoning', 4, { id: 'reason_one', summary: [{ type: 'summary_text', text }] }),
+          new Date(ms(4) + 1).toISOString(),
+        ),
+      ],
+      messages: 1,
+    },
+  ];
+  for (const scenario of cases) {
+    const [turn] = readCodexSession(
+      writeRollout([
+        meta(),
+        event('task_started', 1, { turn_id: TURN }),
+        message('user', 2, 'Check'),
+        ...scenario.records,
+      ]),
+      'sess',
+    ).turns;
+    assert.equal(toCard(turn, true, ms(8)).saidMessages.length, scenario.messages, scenario.name);
+    assert.equal(turn.updates.length, 2, scenario.name);
+  }
+  const turns = readCodexSession(
+    writeRollout([
+      meta(),
+      event('task_started', 1, { turn_id: TURN }),
+      message('user', 2, 'Check'),
+      root(0),
+      event('task_complete', 4, { turn_id: TURN }),
+      event('task_started', 4, { turn_id: 'next-turn' }),
+      message('user', 4, 'Check again'),
+      response(1),
+    ]),
+    'sess',
+  ).turns;
+  assert.deepEqual(
+    turns.map((turn) => toCard(turn, true, ms(8)).saidMessages.length),
+    [1, 1],
+  );
+});
+
+test('root commentary pairs once across forward history continuation', () => {
+  const text = 'Check the current name.';
+  const file = writeRollout([
+    meta(),
+    event('task_started', 1, { turn_id: TURN }),
+    message('user', 2, 'Check'),
+    event('agent_message', 4, { phase: 'commentary', message: text }),
+  ]);
+  const initial = readCodexSessionIncremental(file, 'sess');
+  assert.ok(initial.checkpoint);
+  const response = recordedAt(
+    item('message', 4, {
+      id: 'msg_history',
+      role: 'assistant',
+      phase: 'commentary',
+      content: [{ type: 'output_text', text }],
+    }),
+    new Date(ms(4) + 10).toISOString(),
+  );
+  fs.appendFileSync(file, JSON.stringify(response) + '\n');
+  const resumed = readCodexSessionIncremental(file, 'sess', structuredClone(initial.checkpoint));
+  assert.ok(resumed.read);
+  assert.equal(toCard(resumed.read.turns[0], true, ms(8)).saidMessages.length, 1);
+  assert.equal(resumed.read.turns[0].updates[0].sourceId, 'msg_history');
+});
+
 test('equal commentary and reasoning remain distinct in either record order', () => {
   const text = 'Check the command output.';
   const pair = [
@@ -11896,7 +12073,7 @@ test('a prior Codex parser state rebuilds child identity and exact compaction us
 
   const reset = readCodexSessionIncremental(file, 'sess', initial.checkpoint, options);
   assert.equal(reset.kind, 'reset');
-  assert.equal(reset.checkpoint?.parserState.version, 21);
+  assert.equal(reset.checkpoint?.parserState.version, 22);
   assert.deepEqual(
     reset.read?.turns[0].agents.map((row) => [row.id, row.description]),
     [[child.threadId, 'astra_implementer']],

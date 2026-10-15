@@ -9047,7 +9047,7 @@ test('Codex dispatched facts survive old parent caches, late catalog arrival and
         ],
       ] as Array<[string, import('./derivedcache').ClaudeChildReferenceCacheEntry]>,
     };
-    const missing = await worker.run(request, 1, new AbortController().signal);
+    const missing = await completeDiscovery(worker, request, 1, new AbortController().signal);
     assert.ok(missing?.value.kind === 'claude-children');
     assert.deepEqual(missing.value.references, []);
     assert.equal(missing.value.referenceEntries[0][1].references.length, 1);
@@ -9055,7 +9055,8 @@ test('Codex dispatched facts survive old parent caches, late catalog arrival and
     saveDerivedCache(cache, [], missing.value.referenceEntries);
     worker.stop();
     worker = new ProgressiveWorker(source);
-    const found = await worker.run(
+    const found = await completeDiscovery(
+      worker,
       { ...request, catalog: [parent, child], referenceEntries: [...loadDerivedCache(cache).claudeChildReferences] },
       1,
       new AbortController().signal,
@@ -9073,7 +9074,12 @@ test('Codex dispatched facts survive old parent caches, late catalog arrival and
     (changedNativeRecords[0].payload as any).parent_thread_id = childId;
     write(nativeFile, changedNativeRecords);
     fs.utimesSync(nativeFile, 101, 101);
-    const changed = await worker.run({ ...request, catalog: [parent, child] }, 1, new AbortController().signal);
+    const changed = await completeDiscovery(
+      worker,
+      { ...request, catalog: [parent, child] },
+      1,
+      new AbortController().signal,
+    );
     assert.ok(changed?.value.kind === 'claude-children');
     assert.equal(
       changed.value.dispatchFacts[0].spend.models.reduce((sum, model) => sum + model.usage.output, 0),
@@ -9088,7 +9094,8 @@ test('Codex dispatched facts survive old parent caches, late catalog arrival and
         .map((entry) => JSON.stringify(entry) + '\n')
         .join(''),
     );
-    const person = await worker.run(
+    const person = await completeDiscovery(
+      worker,
       { ...request, catalog: [parent, session(childFile, childId, 'codex')] },
       1,
       new AbortController().signal,
@@ -9565,7 +9572,8 @@ test('quiet dispatched Codex roots throttle open native descendants and refresh 
 
   const worker = new ProgressiveWorker(instrument + source);
   const facts = async () => {
-    const result = await worker.run(
+    const result = await completeDiscovery(
+      worker,
       {
         kind: 'claude-children',
         parents: [parent],
