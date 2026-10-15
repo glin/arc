@@ -516,7 +516,8 @@ const SYMBOL_RUN = /^[\p{Extended_Pictographic}\u200D\uFE0F\u{1F3FB}-\u{1F3FF}]+
 
 // Returns the first Unicode character when it names a known mark.
 export function leadingSymbol(line: string): string | null {
-  const first = Array.from(line)[0];
+  const codePoint = line.codePointAt(0);
+  const first = codePoint === undefined ? undefined : String.fromCodePoint(codePoint);
   return first && markFor(first) ? first : null;
 }
 

@@ -707,14 +707,16 @@ export function renderRichMarkdown(text: string, resolveImage?: ImageResolver, i
       },
     };
     const tokenizer = new marked.Tokenizer() as marked.Tokenizer & marked.TokenizerThis;
-    const inlineText = tokenizer.inlineText;
-    const textRule = ((marked.Lexer.rules.inline as marked.Rules).breaks as marked.Rules).text as RegExp;
-    // Add the mask delimiter to Marked's text boundaries without changing its URL or email rules.
-    const citationText = new RegExp(textRule.source.replace('|$)', '|\uE000|$)'), textRule.flags);
-    tokenizer.inlineText = function (source, smartypants) {
-      const matched = citationText.exec(source);
-      return inlineText.call(this, matched?.[0] ?? '', smartypants);
-    };
+    if (masked.directives.size > 0) {
+      const inlineText = tokenizer.inlineText;
+      const textRule = ((marked.Lexer.rules.inline as marked.Rules).breaks as marked.Rules).text as RegExp;
+      // Add the mask delimiter to Marked's text boundaries without changing its URL or email rules.
+      const citationText = new RegExp(textRule.source.replace('|$)', '|\uE000|$)'), textRule.flags);
+      tokenizer.inlineText = function (source, smartypants) {
+        const matched = citationText.exec(source);
+        return inlineText.call(this, matched?.[0] ?? '', smartypants);
+      };
+    }
     const renderer = new marked.Renderer();
     renderer.html = (html: string) => escapeHtml(html);
     // Renders local images with an open action. Remote image addresses render as links.
