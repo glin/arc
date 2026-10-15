@@ -20,9 +20,11 @@ import type {
   FileRevision,
   SessionFile,
   SessionRead,
+  Turn,
   TurnStarts,
 } from './transcript';
 import type { HistoryPage, HistoryPageOutcome } from './historypages';
+import { applyHiddenTurnFields, hiddenTurnFields, type HiddenTurnFields } from './parserstate';
 
 declare const PROGRESSIVE_WORKER_BROTLI: string;
 
@@ -226,7 +228,13 @@ export type ProgressiveRequest =
     }
   | { kind: 'starts'; session: SessionFile; agentRunScan?: AgentRunScan }
   | { kind: 'window'; input: ProgressiveInput; checkpoint?: ProgressiveCheckpoint }
-  | { kind: 'retained'; input: ProgressiveInput; pages: HistoryPage[]; structuralAgentIds?: readonly string[] }
+  | {
+      kind: 'retained';
+      input: ProgressiveInput;
+      pages: HistoryPage[];
+      structuralAgentIds?: readonly string[];
+      hidden?: HiddenTurnFields[];
+    }
   | { kind: 'page'; input: ProgressiveInput; cursor: ProgressiveCursor | null };
 export type ProgressiveValue =
   | { kind: 'codex-context'; estimate: import('./codexcontext').CodexContextResult | null }
@@ -304,6 +312,15 @@ export interface WorkerMemory {
   heapTotal: number;
   heapLimit: number;
   external: number;
+}
+
+// Result order also indexes the hidden activity fields carried beside structured-cloned turns.
+export function progressiveTurns(value: ProgressiveValue): readonly Turn[] {
+  if (value.kind === 'window') return value.read.turns;
+  if (value.kind === 'metadata-recovery') return value.read?.turns ?? [];
+  if (value.kind === 'page' && value.page.kind === 'page') return value.page.turns;
+  if (value.kind === 'retained') return value.pages.flatMap((page) => page.turns);
+  return [];
 }
 
 export function sameProgressiveRevision(
@@ -536,6 +553,7 @@ export class ProgressiveWorker {
         (message: {
           id: number;
           result?: ProgressiveResult;
+          hidden?: { turns: HiddenTurnFields[]; redefinesDetail: boolean };
           error?: { name: string; code: string | null };
           progress?: boolean;
           repeatedCoverage?: string;
@@ -597,6 +615,12 @@ export class ProgressiveWorker {
           if (message.error) {
             held.reject(Object.assign(new Error('Session reading failed.'), workerErrorIdentity(message.error)));
           } else {
+            if (message.result && message.hidden) {
+              const hidden = message.hidden;
+              progressiveTurns(message.result.value).forEach((turn, index) =>
+                applyHiddenTurnFields(turn, hidden.turns[index], hidden.redefinesDetail),
+              );
+            }
             held.resolve(message.result ?? null);
           }
         },
@@ -673,7 +697,11 @@ export class ProgressiveWorker {
       const session = 'session' in request ? request.session : 'input' in request ? request.input.session : null;
       const map = session?.agent === 'claude' ? heldClaudeRepeatedMap(session.file) : null;
       const repeated = map && session ? { file: session.file, map } : undefined;
-      const message = { id, generation, request, repeated };
+      const transported =
+        request.kind === 'retained'
+          ? { ...request, hidden: request.pages.flatMap((page) => page.turns).map(hiddenTurnFields) }
+          : request;
+      const message = { id, generation, request: transported, repeated };
       this.countTransport(message, false);
       const started = performance.now();
       try {

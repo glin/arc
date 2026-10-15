@@ -127,7 +127,7 @@ import {
 } from './turnfixtures.ts';
 import { commitRowSpoken, commitRowTitle } from './webview/card-rows.ts';
 import { reduceChildArtifacts } from './childartifacts.ts';
-import { exposeClaudeAgentRelationshipIds } from './progressiveworker-entry.ts';
+import { applyHiddenTurnFields, hiddenTurnFields } from './parserstate.ts';
 import type { ChildArtifacts } from './childartifacts.ts';
 import { normalizeFsPath, sameCommitSha } from './transcript.ts';
 // Shared panel fixture for screenshots and measurements.
@@ -3454,10 +3454,14 @@ test('each subagent figure carries its own record and the row keeps the run line
 // Retained worker reads clone turns before refreshing child facts and clone the refreshed result before returning it.
 
 function retainedWorkerRead(held: Turn[], spend: Parameters<typeof refreshClaudeAgentFacts>[1]): Turn[] {
+  const hidden = held.map(hiddenTurnFields);
   const page = structuredClone(held);
+  page.forEach((turn, index) => applyHiddenTurnFields(turn, hidden[index], false));
   refreshClaudeAgentFacts(page, spend, undefined);
-  exposeClaudeAgentRelationshipIds(page);
-  return structuredClone(page);
+  const refreshed = page.map(hiddenTurnFields);
+  const result = structuredClone(page);
+  result.forEach((turn, index) => applyHiddenTurnFields(turn, refreshed[index], false));
+  return result;
 }
 
 // A growing finished child's transcript replaces its earlier fallback tool count.

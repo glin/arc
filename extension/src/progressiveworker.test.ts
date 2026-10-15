@@ -7,6 +7,7 @@ import * as path from 'node:path';
 import { buildSync } from 'esbuild';
 import { once } from 'node:events';
 import { createDiagnosticsLog } from './diagnosticslog';
+import type { HistoryPage } from './historypages';
 import {
   ProgressiveWorker,
   CommitRepositoryReservations,
@@ -6049,8 +6050,12 @@ function activity(agent: AgentKind, n: number): object {
 
 // Include hidden call ids, full commands, Claude child ids, and symbol-keyed byte ranges on open turns.
 
-function detailedTurn(agent: AgentKind, n: number, closed: boolean): object[] {
-  const command = `echo ${n}\n${'echo more detail than one line holds\n'.repeat(8)}`;
+function detailedTurn(
+  agent: AgentKind,
+  n: number,
+  closed: boolean,
+  command = `echo ${n}\n${'echo more detail than one line holds\n'.repeat(8)}`,
+): object[] {
   const answer = {
     type: 'assistant',
     timestamp: timestamp(n * 4 + 2),
@@ -6331,10 +6336,10 @@ test.each([
     const worker = new ProgressiveWorker(source);
     const now = Date.parse(timestamp(180));
     const check = (turn: Turn) => {
-      assert.equal(turn.agents[0].toolUseId, undefined);
+      assert.equal(turn.agents[0].toolUseId, 'spawn');
       assert.equal(
         turn.steps.some((step) => step.id !== undefined),
-        false,
+        true,
       );
       assert.equal(
         turn.steps.some((step) => step.name === 'spawn_agent'),
@@ -6353,7 +6358,7 @@ test.each([
       );
       assert.equal(toCard(turn, true, now).agents[0].since, null, 'a missing ending counted up without live evidence');
       const launch = logOf(turn).rows.find((step) => step.sourceId === 'spawn');
-      if (!trimmed) assert.equal(launch?.figure, '', 'runtime restored hidden Activity outcome pairing');
+      if (!trimmed) assert.equal(launch?.figure, '');
     };
     try {
       const window = await worker.run({ kind: 'window', input }, 1, new AbortController().signal);
@@ -7322,6 +7327,155 @@ test('Claude child commits cross the worker boundary and refresh on retained pag
 });
 
 for (const agent of ['claude', 'codex'] as const) {
+  test.each(['window', 'page', 'retained', 'resume', 'metadata-recovery'] as const)(
+    `${agent} worker %s preserves completed command details and hidden call associations`,
+    async (kind) => {
+      const directory = tempDir('panel-progressive-command-detail-');
+      const file = path.join(directory, 'session.jsonl');
+      const command = 'echo ' + 'x'.repeat(328);
+      const recordsOf = (n: number) => {
+        const records = detailedTurn(agent, n, true, command);
+        records.splice(
+          records.length - 1,
+          0,
+          ...(agent === 'claude'
+            ? [
+                {
+                  type: 'user',
+                  timestamp: timestamp(n * 4 + 2),
+                  message: {
+                    role: 'user',
+                    content: [
+                      { type: 'tool_result', tool_use_id: `tool-${n}`, content: 'complete' },
+                      { type: 'tool_result', tool_use_id: `agent-${n}`, content: 'complete' },
+                    ],
+                  },
+                  toolUseResult: { agentId: `child-${n}`, totalToolUseCount: 2, totalDurationMs: 1000 },
+                },
+              ]
+            : [
+                {
+                  type: 'response_item',
+                  timestamp: timestamp(n * 4 + 2),
+                  payload: { type: 'function_call_output', call_id: `tool-${n}`, output: 'Process exited with code 0' },
+                },
+                {
+                  type: 'response_item',
+                  timestamp: timestamp(n * 4 + 2),
+                  payload: {
+                    type: 'function_call',
+                    name: 'spawn_agent',
+                    call_id: `agent-${n}`,
+                    arguments: JSON.stringify({ task_name: 'look', message: 'Inspect' }),
+                  },
+                },
+                {
+                  type: 'response_item',
+                  timestamp: timestamp(n * 4 + 2),
+                  payload: {
+                    type: 'function_call_output',
+                    call_id: `agent-${n}`,
+                    output: JSON.stringify({ agent_id: `child-${n}`, nickname: 'look' }),
+                  },
+                },
+              ]),
+        );
+        return records;
+      };
+      const count = kind === 'page' ? 24 : 3;
+      fs.writeFileSync(
+        file,
+        jsonLines([
+          ...(agent === 'codex' ? opening(agent).slice(0, 1) : []),
+          ...Array.from({ length: count }, (_, index) => recordsOf(index + 1)).flat(),
+        ]),
+      );
+      const input = (): ProgressiveInput => {
+        const { size, mtimeMs } = revisionOf(fs.statSync(file, { bigint: true }));
+        return {
+          session: { file, sessionId: 'session', agent, size, mtimeMs },
+          folders: [],
+          children: [],
+          maxTurns: 40,
+          tailBytes: 1 << 20,
+        };
+      };
+      const direct = () => (agent === 'claude' ? readSession(file, 'session') : readCodexSession(file, 'session'));
+      const check = (turns: readonly Turn[]) => {
+        assert.ok(turns.length);
+        const expected = direct().turns;
+        for (const turn of turns) {
+          const original = expected.find((candidate) => candidate.prompt === turn.prompt);
+          assert.ok(original);
+          const step = turn.steps.find(
+            (candidate) => candidate.name === (agent === 'claude' ? 'Bash' : 'exec_command'),
+          );
+          assert.ok(step);
+          assert.equal(step.status, 'done');
+          assert.equal(step.detail.length, 120);
+          assert.equal(step.fullDetail, command);
+          assert.deepEqual(hiddenFieldsOf([turn]), hiddenFieldsOf([original]));
+          assert.deepEqual(hiddenDescriptorsOf([turn]), hiddenDescriptorsOf([original]));
+          assert.ok(
+            logOf(turn)
+              .rows.flatMap((row) => row.steps ?? [row])
+              .some((row) => row.title === command),
+          );
+        }
+      };
+      const worker = new ProgressiveWorker(source);
+      try {
+        if (kind === 'metadata-recovery') {
+          const result = await worker.run(
+            { kind, session: input().session, eligible: ['session'], sliceBytes: 1 << 20 },
+            1,
+            new AbortController().signal,
+          );
+          assert.ok(result?.value.kind === kind && result.value.status === 'complete' && result.value.read);
+          check(result.value.read.turns);
+        } else if (kind === 'page') {
+          const page = await worker.run({ kind, input: input(), cursor: null }, 1, new AbortController().signal);
+          assert.ok(page?.value.kind === 'page' && page.value.page.kind === 'page');
+          check(page.value.page.turns);
+          assert.ok(page.value.page.cursor);
+          const older = await worker.run(
+            { kind, input: input(), cursor: page.value.page.cursor },
+            2,
+            new AbortController().signal,
+          );
+          assert.ok(older?.value.kind === 'page' && older.value.page.kind === 'page');
+          check(older.value.page.turns);
+        } else if (kind === 'retained') {
+          let pages: HistoryPage[] = direct().turns.map((turn) => ({ turns: [turn], compactions: [], bytes: 0 }));
+          for (let generation = 1; generation <= 3; generation++) {
+            const held = pages;
+            const result = await worker.run({ kind, input: input(), pages }, generation, new AbortController().signal);
+            assert.ok(result?.value.kind === 'retained');
+            result.value.pages.forEach((page) => check(page.turns));
+            held.forEach((page) => check(page.turns));
+            pages = result.value.pages;
+          }
+        } else {
+          const first = await worker.run({ kind: 'window', input: input() }, 1, new AbortController().signal);
+          assert.ok(first?.value.kind === 'window');
+          if (kind === 'window') check(first.value.read.turns);
+          else fs.appendFileSync(file, jsonLines(recordsOf(count + 1)));
+          const resumed = await worker.run(
+            { kind: 'window', input: input(), checkpoint: first.value.checkpoint },
+            2,
+            new AbortController().signal,
+          );
+          assert.ok(resumed?.value.kind === 'window');
+          assert.equal(resumed.value.reset, false);
+          check(resumed.value.read.turns);
+        }
+      } finally {
+        worker.stop();
+        fs.rmSync(directory, { recursive: true, force: true });
+      }
+    },
+  );
+
   test(`a ${agent} parser snapshot survives the structured clone the worker boundary copies it with`, () => {
     const directory = tempDir('panel-progressive-clone-');
     const file = path.join(directory, 'session.jsonl');

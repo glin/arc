@@ -197,10 +197,13 @@ export interface HiddenStatePolicy {
 
 // Hidden fields for one retained turn.
 // Emitted turns keep their ranges in turnRanges and turnMembershipStarts, so these three range values remain null.
-export interface HiddenTurnState {
+export interface HiddenTurnState extends HiddenTurnFields {
   start: number | null;
   end: number | null;
   membershipStart: number | null;
+}
+
+export interface HiddenTurnFields {
   steps: Array<{ id?: string; fullDetail?: string }>;
   agents: Array<{ toolUseId?: string }>;
 }
@@ -243,16 +246,22 @@ function hide(value: object, key: PropertyKey, held: unknown, rewritable: boolea
   });
 }
 
-function hiddenTurnState(turn: HiddenTurnHolder, policy: HiddenStatePolicy): HiddenTurnState {
+export function hiddenTurnFields(turn: HiddenTurnHolder): HiddenTurnFields {
   return {
-    start: hiddenNumber(turn, policy.start),
-    end: hiddenNumber(turn, policy.end),
-    membershipStart: hiddenNumber(turn, policy.membershipStart),
     steps: turn.steps.map((step) => ({
       ...(step.id === undefined ? {} : { id: step.id }),
       ...(step.fullDetail === undefined ? {} : { fullDetail: step.fullDetail }),
     })),
     agents: turn.agents.map((agent) => (agent.toolUseId === undefined ? {} : { toolUseId: agent.toolUseId })),
+  };
+}
+
+function hiddenTurnState(turn: HiddenTurnHolder, policy: HiddenStatePolicy): HiddenTurnState {
+  return {
+    start: hiddenNumber(turn, policy.start),
+    end: hiddenNumber(turn, policy.end),
+    membershipStart: hiddenNumber(turn, policy.membershipStart),
+    ...hiddenTurnFields(turn),
   };
 }
 
@@ -275,6 +284,15 @@ function applyHiddenTurnState(
   if (hidden.membershipStart !== null) {
     hide(turn, policy.membershipStart, hidden.membershipStart, true);
   }
+  applyHiddenTurnFields(turn, hidden, policy.redefinesDetail);
+}
+
+export function applyHiddenTurnFields(
+  turn: HiddenTurnHolder,
+  hidden: HiddenTurnFields | undefined,
+  redefinesDetail: boolean,
+): void {
+  if (!hidden) return;
   hidden.steps.forEach((fields, index) => {
     const step = turn.steps[index];
     if (!step) {
@@ -284,7 +302,7 @@ function applyHiddenTurnState(
       hide(step, 'id', fields.id, false);
     }
     if (step.fullDetail === undefined) {
-      hide(step, 'fullDetail', fields.fullDetail, policy.redefinesDetail);
+      hide(step, 'fullDetail', fields.fullDetail, redefinesDetail);
     }
   });
   hidden.agents.forEach((fields, index) => {

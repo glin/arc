@@ -51,6 +51,7 @@ import {
   type ClaudeRepeatedHeldMap,
 } from './clauderepeated';
 import { historyPageBytes } from './historypages';
+import { applyHiddenTurnFields, hiddenTurnFields } from './parserstate';
 import {
   agentSpendDependencyKey,
   ClaudeChildSessionCache,
@@ -81,7 +82,6 @@ import {
   RELATIONSHIP_RESERVE_BYTES,
   RELATIONSHIP_SLICE_MS,
   type PersonScan,
-  type Turn,
 } from './transcript';
 import {
   CLAUDE_CHILD_REFERENCE_PARSER_VERSION,
@@ -109,7 +109,7 @@ import type {
   DiscoveryCharges,
 } from './progressiveworker';
 import type { DispatchSessionFacts } from './progressiveworker';
-import { workerErrorIdentity } from './progressiveworker';
+import { progressiveTurns, workerErrorIdentity } from './progressiveworker';
 import { TURN_QUIET_MS, statusOf } from './turncard';
 
 const agentSpends = new AgentSpendCache();
@@ -239,12 +239,6 @@ function revive(checkpoint: ProgressiveCheckpoint | undefined): ProgressiveCheck
   if (checkpoint.skippedFragment) checkpoint.skippedFragment = Buffer.from(checkpoint.skippedFragment);
   checkpoint.contentAnchor.bytes = Buffer.from(checkpoint.contentAnchor.bytes);
   return checkpoint;
-}
-
-export function exposeClaudeAgentRelationshipIds(turns: Turn[]): void {
-  for (const turn of turns) {
-    turn.agents = turn.agents.map((agent) => (agent.toolUseId ? { ...agent, toolUseId: agent.toolUseId } : agent));
-  }
 }
 
 async function execute(
@@ -1214,6 +1208,9 @@ async function execute(
     structuralChildren: children,
   };
   if (request.kind === 'retained') {
+    request.pages
+      .flatMap((page) => page.turns)
+      .forEach((turn, index) => applyHiddenTurnFields(turn, request.hidden?.[index], session.agent === 'codex'));
     return {
       kind: 'retained',
       pages: request.pages.map((page) => {
@@ -1227,7 +1224,6 @@ async function execute(
           );
         } else {
           refreshClaudeAgentFacts(page.turns, agentSpendOf, agentSessionTargetOf);
-          exposeClaudeAgentRelationshipIds(page.turns);
         }
         return { ...page, bytes: historyPageBytes(page) };
       }),
@@ -1253,9 +1249,6 @@ async function execute(
             { signal, targetTurns: 20 },
             options,
           );
-    if (session.agent === 'claude' && result.kind === 'page') {
-      exposeClaudeAgentRelationshipIds(result.page.turns);
-    }
     return {
       kind: 'page',
       recoveryBytes: result.kind === 'page' ? (result.page.recoveryBytes ?? 0) : 0,
@@ -1331,9 +1324,6 @@ async function execute(
   }
   if (!result.read) {
     return { kind: 'stale', recoveryBytes };
-  }
-  if (session.agent === 'claude') {
-    exposeClaudeAgentRelationshipIds(result.read.turns);
   }
   const codexChildFiles =
     session.agent === 'codex'
@@ -1586,7 +1576,14 @@ async function handleMessage(message: {
     };
     if (!controller.signal.aborted) {
       if (request.kind === 'metadata-recovery' && result.value.kind === 'stale') metadataRecovery = null;
-      parentPort?.postMessage({ id: message.id, result });
+      parentPort?.postMessage({
+        id: message.id,
+        result,
+        hidden: {
+          turns: progressiveTurns(result.value).map(hiddenTurnFields),
+          redefinesDetail: requested.agent === 'codex',
+        },
+      });
     }
   } catch (error) {
     if (
