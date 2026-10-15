@@ -119,6 +119,7 @@ import {
   trustedListedRevisions,
   revalidatedCatalogPaths,
   scanForHumanPrompt,
+  humanPromptScanSteps,
   promptScanLists,
   createClaudeUsageLineReducer,
   type ClaudeUsageReducerState,
@@ -8100,45 +8101,6 @@ export class PanelProvider implements vscode.Disposable {
           return;
         }
       }
-      const catalogStarted = performance.now();
-      this.codexWalk = primedWalk ?? null;
-      let all = selectedOnly ? (this.authoritativeCatalog ?? []) : this.allSessions(reuseCatalog);
-      if (
-        selectedOnly &&
-        this.authoritativeCatalog &&
-        this.showing &&
-        !this.newDrafts[this.showing] &&
-        !this.awaitingSessionRecords[this.showing]
-      ) {
-        all =
-          revalidatedCatalog(this.authoritativeCatalog, this.showing, (file) => {
-            try {
-              const stat = fileRevisionOf(fs.statSync(file, { bigint: true }));
-              return { mtimeMs: stat.mtimeMs, size: stat.size };
-            } catch {
-              return null;
-            }
-          }) ?? this.authoritativeCatalog;
-      }
-      if (selectedOnly) {
-        const admission = new Map<string, boolean>();
-        const admits = (session: SessionFile): boolean => {
-          const held = admission.get(session.file);
-          if (held !== undefined) return held;
-          const listed = session.agent !== 'claude' || session.childTranscript === true || this.hasHumanPrompt(session);
-          admission.set(session.file, listed);
-          return listed;
-        };
-        all = all.filter(admits);
-        if (this.authoritativeCatalog) {
-          const admitted = this.authoritativeCatalog.filter(admits);
-          if (admitted.length !== this.authoritativeCatalog.length) this.authoritativeCatalog = admitted;
-        }
-      }
-      this.performanceCounters.recordRefresh('catalog-enumeration', performance.now() - catalogStarted);
-      if (this.repositoryScopeReady) {
-        this.startupHistory?.stage('openingsEnumerated');
-      }
       generation = selectedOnly ? this.refreshGeneration : ++this.refreshGeneration;
       controller = new AbortController();
       if (!selectedOnly) {
@@ -8156,6 +8118,58 @@ export class PanelProvider implements vscode.Disposable {
           this.refreshOverdue = true;
           this.runPendingRefresh();
         }, CATALOG_REFRESH_DEADLINE_MS);
+      }
+      const catalogStarted = performance.now();
+      this.codexWalk = primedWalk ?? null;
+      let all = selectedOnly ? (this.authoritativeCatalog ?? []) : this.allSessions(reuseCatalog, true);
+      const humanPromptWork = { bytes: 0, sources: 0, reads: 0, unknown: new Set<string>() };
+      if (
+        selectedOnly &&
+        this.authoritativeCatalog &&
+        this.showing &&
+        !this.newDrafts[this.showing] &&
+        !this.awaitingSessionRecords[this.showing]
+      ) {
+        all =
+          revalidatedCatalog(this.authoritativeCatalog, this.showing, (file) => {
+            try {
+              const stat = fileRevisionOf(fs.statSync(file, { bigint: true }));
+              return { mtimeMs: stat.mtimeMs, size: stat.size };
+            } catch {
+              return null;
+            }
+          }) ?? this.authoritativeCatalog;
+      }
+      const admissionCandidates = all;
+      const admissionSelection = selectedOnly ? this.selectionGeneration : undefined;
+      all = await this.prepareHumanPrompts(
+        all,
+        false,
+        controller.signal,
+        humanPromptWork,
+        generation,
+        admissionSelection,
+      );
+      if (
+        controller.signal.aborted ||
+        generation !== this.refreshGeneration ||
+        (selectedOnly && admissionSelection !== this.selectionGeneration)
+      )
+        return;
+      if (this.catalog && !selectedOnly) this.catalog = { ...this.catalog, sessions: all };
+      if (selectedOnly) {
+        const admission = new Set(all.map((session) => session.file));
+        const admits = (session: SessionFile): boolean =>
+          admission.has(session.file) || humanPromptWork.unknown.has(session.file);
+        all = admissionCandidates.filter(admits);
+        if (this.authoritativeCatalog) {
+          const admitted = this.authoritativeCatalog.filter(admits);
+          if (admitted.length !== this.authoritativeCatalog.length) this.authoritativeCatalog = admitted;
+        }
+      }
+      this.performanceCounters.recordRefresh('catalog-enumeration', performance.now() - catalogStarted);
+      if (this.repositoryScopeReady) {
+        this.startupHistory?.stage('openingsEnumerated');
       }
       // Wait for repository scope before changing selection or creating a draft from an incomplete catalog.
       if (!this.repositoryScopeReady) {
@@ -8180,7 +8194,15 @@ export class PanelProvider implements vscode.Disposable {
         if (controller.signal.aborted || generation !== this.refreshGeneration) return;
         if (changed.length) {
           for (const file of changed) this.codexStats.markChanged(path.dirname(file), path.basename(file));
-          all = this.allSessions(false);
+          all = await this.prepareHumanPrompts(
+            this.allSessions(false, true),
+            true,
+            controller.signal,
+            humanPromptWork,
+            generation,
+          );
+          if (controller.signal.aborted || generation !== this.refreshGeneration) return;
+          if (this.catalog) this.catalog = { ...this.catalog, sessions: all };
           reuseCatalog = false;
         }
       }
@@ -8205,7 +8227,7 @@ export class PanelProvider implements vscode.Disposable {
         });
       if ((!reuseCatalog || dispatchChanged || this.dispatchDiscoveryPending) && !selectedOnly) {
         this.startupHistory?.stage('relationshipsStarted');
-        const discovered = await this.prepareClaudeChildren(generation, controller.signal);
+        const discovered = await this.prepareClaudeChildren(generation, controller.signal, humanPromptWork);
         if (!discovered || controller.signal.aborted || generation !== this.refreshGeneration) {
           return;
         }
@@ -10055,7 +10077,7 @@ export class PanelProvider implements vscode.Disposable {
   }
 
   // Enumerate Claude and Codex sessions in repository scope. Accepted metadata supplies the catalog's recorded-activity order.
-  private allSessions(reuseCatalog = false): SessionFile[] {
+  private allSessions(reuseCatalog = false, deferHumanPrompts = false): SessionFile[] {
     const codexWalk = this.codexWalk ?? undefined;
     this.codexWalk = null;
     const workspaceFolders = this.folders();
@@ -10077,9 +10099,12 @@ export class PanelProvider implements vscode.Disposable {
         }
       });
       if (held) {
-        const admitted = held.filter(
-          (session) => session.agent !== 'claude' || session.childTranscript === true || this.hasHumanPrompt(session),
-        );
+        const admitted = deferHumanPrompts
+          ? held
+          : held.filter(
+              (session) =>
+                session.agent !== 'claude' || session.childTranscript === true || this.hasHumanPrompt(session),
+            );
         const sorted = orderSessionCatalog(admitted, (session) => this.activityFor(session));
         this.claudeParents = sorted.filter((session) => session.childTranscript !== true);
         this.catalog = { folders: folderPrint, sessions: sorted };
@@ -10097,9 +10122,12 @@ export class PanelProvider implements vscode.Disposable {
       });
       // Reorder reused catalog rows after updating file revisions.
       if (held) {
-        const admitted = held.filter(
-          (session) => session.agent !== 'claude' || session.childTranscript === true || this.hasHumanPrompt(session),
-        );
+        const admitted = deferHumanPrompts
+          ? held
+          : held.filter(
+              (session) =>
+                session.agent !== 'claude' || session.childTranscript === true || this.hasHumanPrompt(session),
+            );
         const sorted = orderSessionCatalog(admitted, (session) => this.activityFor(session));
         // Retain the updated rows so later selections reuse their current revisions.
         this.catalog = { folders: folderPrint, sessions: sorted };
@@ -10234,14 +10262,15 @@ export class PanelProvider implements vscode.Disposable {
     this.claudeParents = [...claude, ...codex];
     this.walkedClaude = claude.map((s) => s.file);
     // Exclude Claude peer wakes and commands answered by the CLI before catalog publication.
-    const listed = claude.filter((s) => this.hasHumanPrompt(s, true));
+    const listed = deferHumanPrompts ? claude : claude.filter((s) => this.hasHumanPrompt(s, true));
     this.enumeratedAdmissionComplete =
       !claudeOpeningUnavailable &&
       listing.admission === 'complete' &&
-      claude.every((source) => {
-        const scan = this.humanScans.get(source.file);
-        return scan?.found || scan?.complete === true;
-      });
+      (deferHumanPrompts ||
+        claude.every((source) => {
+          const scan = this.humanScans.get(source.file);
+          return scan?.found || scan?.complete === true;
+        }));
     this.subagentDirectories.sweep();
     // Order the catalog by recorded activity before initializing stable session-list placement.
     const walked = new Set([
@@ -10322,7 +10351,11 @@ export class PanelProvider implements vscode.Disposable {
     }
   }
 
-  private async prepareClaudeChildren(generation: number, signal: AbortSignal): Promise<boolean> {
+  private async prepareClaudeChildren(
+    generation: number,
+    signal: AbortSignal,
+    humanPromptWork = { bytes: 0, sources: 0, reads: 0, unknown: new Set<string>() },
+  ): Promise<boolean> {
     if (!signal.aborted && generation === this.refreshGeneration) {
       this.sessionQueryDiscoveryPending = true;
       this.publishSessionQueryContext();
@@ -10558,9 +10591,8 @@ export class PanelProvider implements vscode.Disposable {
     const held = this.catalog?.sessions ?? [];
     const discoveryRoots =
       progress.roots ?? held.filter((session) => session.agent !== 'claude' || session.childTranscript !== true);
-    const roots = discoveryRoots.filter(
-      (session) => session.agent !== 'claude' || this.hasHumanPrompt(session, !!progress.roots),
-    );
+    const roots = await this.prepareHumanPrompts(discoveryRoots, !!progress.roots, signal, humanPromptWork, generation);
+    if (signal.aborted || generation !== this.refreshGeneration) return false;
     if (spendSources) {
       this.claudeSpendSources = spendSources.claude;
       this.codexSpendSources = spendSources.codex;
@@ -10705,6 +10737,118 @@ export class PanelProvider implements vscode.Disposable {
       }
     }
     return dropped;
+  }
+
+  // Admission finishes before publication. Read and source allowances span the entire refresh.
+  private async prepareHumanPrompts(
+    sessions: SessionFile[],
+    sizeCurrent: boolean,
+    signal: AbortSignal,
+    work = { bytes: 0, sources: 0, reads: 0, unknown: new Set<string>() },
+    generation = this.refreshGeneration,
+    selectionGeneration?: number,
+  ): Promise<SessionFile[]> {
+    const currentRefresh = () =>
+      !signal.aborted &&
+      generation === this.refreshGeneration &&
+      (selectionGeneration === undefined || selectionGeneration === this.selectionGeneration);
+    const admitted: SessionFile[] = [];
+    for (const session of sessions) {
+      if (!currentRefresh()) return [];
+      if (session.agent !== 'claude' || session.childTranscript === true) {
+        admitted.push(session);
+        continue;
+      }
+      if (work.sources >= 32 || work.reads >= 32 || work.bytes >= 256 * 1024) {
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        work.sources = 0;
+        work.reads = 0;
+        work.bytes = 0;
+        if (!currentRefresh()) return [];
+      }
+      work.sources++;
+      let previous = this.humanScans.get(session.file);
+      let revision;
+      try {
+        revision = fileRevisionOf(fs.statSync(session.file, { bigint: true }));
+      } catch {
+        this.enumeratedAdmissionComplete = false;
+        work.unknown.add(session.file);
+        continue;
+      }
+      if (
+        previous?.source &&
+        (previous.source.dev !== revision.dev ||
+          previous.source.ino !== revision.ino ||
+          previous.source.size > revision.size ||
+          (previous.source.size === revision.size && !sameSessionRevision(previous.source, revision)))
+      )
+        previous = undefined;
+      const size = sizeCurrent ? Math.min(session.size, revision.size) : revision.size;
+      const steps = humanPromptScanSteps(
+        session.file,
+        size,
+        previous,
+        () => 256 * 1024 - work.bytes,
+        (scan) => {
+          if (currentRefresh()) this.humanScans.set(session.file, { ...scan, source: revision });
+        },
+      );
+      try {
+        let step = steps.next();
+        while (!step.done) {
+          work.bytes += step.value;
+          work.reads++;
+          if (work.bytes >= 256 * 1024 || work.reads >= 32) {
+            await new Promise<void>((resolve) => setImmediate(resolve));
+            work.bytes = 0;
+            work.sources = 0;
+            work.reads = 0;
+            if (!currentRefresh()) return [];
+          }
+          step = steps.next();
+        }
+        if (work.sources >= 32) {
+          await new Promise<void>((resolve) => setImmediate(resolve));
+          work.sources = 0;
+          work.reads = 0;
+          work.bytes = 0;
+          if (!currentRefresh()) return [];
+        }
+        work.sources++;
+        const current = fileRevisionOf(fs.statSync(session.file, { bigint: true }));
+        if (!currentRefresh()) return [];
+        if (
+          revision.dev !== current.dev ||
+          revision.ino !== current.ino ||
+          current.size < revision.size ||
+          (current.size === revision.size && !sameSessionRevision(revision, current))
+        ) {
+          this.humanScans.delete(session.file);
+          this.enumeratedAdmissionComplete = false;
+          work.unknown.add(session.file);
+          continue;
+        }
+        const scan = {
+          ...step.value,
+          source: current,
+          complete: step.value.complete && (step.value.found || current.size === revision.size),
+        };
+        this.humanScans.set(session.file, scan);
+        if (!scan.found && scan.complete !== true) {
+          this.enumeratedAdmissionComplete = false;
+          work.unknown.add(session.file);
+          if (current.size > revision.size) continue;
+        }
+        if (promptScanLists(scan)) admitted.push(session);
+      } catch {
+        this.enumeratedAdmissionComplete = false;
+        work.unknown.add(session.file);
+      } finally {
+        steps.return({ bytes: 0, found: false });
+      }
+    }
+    return admitted;
   }
 
   // Reuse confirmed admission. Pending and withdrawn commands resume from the retained cursor.

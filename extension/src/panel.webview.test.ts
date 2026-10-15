@@ -2979,7 +2979,7 @@ test('production receipts acknowledge delivered turns and refuse appended source
   fs.unlinkSync(alias);
 });
 
-test('command-only admission removes pending rows through every catalog path and releases list and search names', () => {
+test('command-only admission removes pending rows through every catalog path and releases list and search names', async () => {
   const directory = tempDir('command-catalog-');
   const file = path.join(directory, 'command.jsonl');
   const peerFile = path.join(directory, 'peer.jsonl');
@@ -3064,12 +3064,19 @@ test('command-only admission removes pending rows through every catalog path and
     }),
   };
   const compile = (name: string, body: string, parameters: string) => {
-    const code = ts.transpileModule(`function ${name}(${parameters}) { ${body} }`, {
-      compilerOptions: { target: ts.ScriptTarget.ES2022 },
-    }).outputText;
+    const code = ts.transpileModule(
+      `${name === 'selected' || name === 'discovery' ? 'async ' : ''}function ${name}(${parameters}) { ${body} }`,
+      {
+        compilerOptions: { target: ts.ScriptTarget.ES2022 },
+      },
+    ).outputText;
     return new Function(...Object.keys(dependencies), code + `\nreturn ${name};`)(...Object.values(dependencies));
   };
-  const listing = compile('listing', methodBody('private allSessions('), 'reuseCatalog = false');
+  const listing = compile(
+    'listing',
+    methodBody('private allSessions('),
+    'reuseCatalog = false, deferHumanPrompts = false',
+  );
   const search = compile('search', methodBody('private searchCorpus('), 'only = null');
   const refreshBody = methodBody('async refresh(');
   const selected = compile(
@@ -3078,7 +3085,7 @@ test('command-only admission removes pending rows through every catalog path and
       refreshBody.indexOf('let all = selectedOnly'),
       refreshBody.indexOf("this.performanceCounters.recordRefresh('catalog-enumeration'"),
     ) + '\nreturn all;',
-    'selectedOnly = true, reuseCatalog = true',
+    'selectedOnly = true, reuseCatalog = true, controller = new AbortController(), generation = this.refreshGeneration',
   );
   const childrenBody = methodBody('private async prepareClaudeChildren(');
   const discovery = compile(
@@ -3087,7 +3094,7 @@ test('command-only admission removes pending rows through every catalog path and
       childrenBody.indexOf('const held = this.catalog?.sessions'),
       childrenBody.indexOf('this.discoveryComplete = {'),
     ) + '\nreturn sessions;',
-    'progress, spendSources = null',
+    'progress, spendSources = null, signal = new AbortController().signal, humanPromptWork = undefined, generation = this.refreshGeneration',
   );
   for (const route of ['walk', 'targeted', 'reuse', 'selected', 'worker']) {
     fs.writeFileSync(file, [caveat, command].map((row) => JSON.stringify(row)).join('\n') + '\n');
@@ -3124,6 +3131,9 @@ test('command-only admission removes pending rows through every catalog path and
       },
       corpus: new Map(),
       threadNames: { stamp: '', names: new Map() },
+      async prepareHumanPrompts(this: any, sessions: any[]) {
+        return sessions.filter((session) => session.agent !== 'claude' || this.hasHumanPrompt(session));
+      },
       allSessions(reuse = false) {
         return listing.call(this, reuse);
       },
@@ -3158,7 +3168,7 @@ test('command-only admission removes pending rows through every catalog path and
       const accepted = provider.authoritativeCatalog;
       const acceptedBytes = accepted[1].size;
       fs.appendFileSync(peerFile, JSON.stringify({ type: 'mode', mode: 'normal' }) + '\n');
-      const refreshed = read();
+      const refreshed = await read();
       assert.ok(refreshed[1].size > acceptedBytes);
       assert.equal(
         provider.authoritativeCatalog,
@@ -3171,7 +3181,7 @@ test('command-only admission removes pending rows through every catalog path and
     fs.appendFileSync(file, JSON.stringify(answer) + '\n');
     sources = [source(), peer];
     assert.deepEqual(
-      read().map((session: any) => session.sessionId),
+      (await read()).map((session: any) => session.sessionId),
       ['peer'],
       route,
     );
@@ -3196,6 +3206,233 @@ test('command-only admission removes pending rows through every catalog path and
     assert.deepEqual(provider.saved.labels.command, ['Review']);
     assert.deepEqual(provider.saved.read, ['turn']);
     assert.equal(provider.saved.readTo.command, 1);
+  }
+});
+
+test('refresh human admission shares read and source allowances and resumes cancelled scans', async () => {
+  const { humanPromptScanSteps, promptScanLists, sameSessionRevision, scanForHumanPrompt } =
+    await import('./transcript.ts');
+  const { withReadMetrics, readPhase } = await import('./readmeter.ts');
+  const directory = tempDir('human-admission-refresh-');
+  const peer = { type: 'user', origin: { kind: 'peer' }, message: { content: 'x'.repeat(8192) } };
+  const human = { type: 'user', message: { role: 'user', content: 'actual task' } };
+  const command = { type: 'user', uuid: 'command', message: { role: 'user', content: '/usage-credits' } };
+  const answer = {
+    type: 'user',
+    parentUuid: 'command',
+    message: { content: '<local-command-stdout>Done</local-command-stdout>' },
+  };
+  const records = [
+    [...Array(80).fill(peer), human],
+    [...Array(80).fill(peer)],
+    [command],
+    [command, answer],
+    ...Array.from({ length: 40 }, () => [peer]),
+  ];
+  const sources = records.map((rows, index) => {
+    const file = path.join(directory, `${index}.jsonl`);
+    fs.writeFileSync(file, rows.map((row) => JSON.stringify(row)).join('\n') + '\n');
+    return { agent: 'claude' as const, sessionId: 'same-id', file, ...revisionOf(fs.statSync(file, { bigint: true })) };
+  });
+  sources.push({ ...sources[0], agent: 'codex' as any, file: 'codex.jsonl' });
+  let slice = 0;
+  const attempts: number[] = [0];
+  let cancel: AbortController | undefined;
+  let onYield: (() => void) | undefined;
+  let preservedMtime: number | undefined;
+  const schedule = (resolve: () => void) =>
+    setImmediate(() => {
+      cancel?.abort();
+      onYield?.();
+      attempts.push(0);
+      readPhase(`slice-${++slice}`);
+      resolve();
+    });
+  const dependencies = {
+    fs: {
+      statSync: (...args: any[]) => {
+        attempts[attempts.length - 1]++;
+        return (fs.statSync as any)(...args);
+      },
+    },
+    fileRevisionOf: (stat: fs.Stats | fs.BigIntStats) => {
+      const revision = revisionOf(stat);
+      return preservedMtime === undefined ? revision : { ...revision, mtimeMs: preservedMtime };
+    },
+    sameSessionRevision,
+    humanPromptScanSteps,
+    scanForHumanPrompt,
+    promptScanLists,
+    setImmediate: schedule,
+  };
+  const compiled = ts.transpileModule(
+    `class Prepared { ${declarationSource(panelHostSource, 'prepareHumanPrompts')} }`,
+    {
+      compilerOptions: { target: ts.ScriptTarget.ES2022 },
+    },
+  ).outputText;
+  const prepare = new Function(
+    ...Object.keys(dependencies),
+    `${compiled}\nreturn Prepared.prototype.prepareHumanPrompts;`,
+  )(...Object.values(dependencies));
+  const provider: any = {
+    humanScans: new Map(),
+    refreshGeneration: 0,
+    authoritativeCatalog: null,
+    prepareHumanPrompts: prepare,
+    allSessions(_reuse: boolean, deferred: boolean) {
+      assert.equal(deferred, true);
+      return sources;
+    },
+  };
+  const refresh = methodBody('async refresh(');
+  const segment = refresh.slice(
+    refresh.indexOf('generation = selectedOnly'),
+    refresh.indexOf("this.performanceCounters.recordRefresh('catalog-enumeration'"),
+  );
+  const runSource = ts.transpileModule(
+    `async function run(selectedOnly = false) {
+    const reuseCatalog = false; let generation, controller, primedWalk;
+    ${segment}
+    clearTimeout(this.refreshDeadline);
+    return all;
+  }`,
+    { compilerOptions: { target: ts.ScriptTarget.ES2022 } },
+  ).outputText;
+  const run = new Function('CATALOG_REFRESH_DEADLINE_MS', `${runSource}\nreturn run;`)(60_000);
+  let admitted: any[] = [];
+  const measure = async (operation: () => Promise<void>) => {
+    attempts.splice(0, attempts.length, 0);
+    await withReadMetrics(operation, (metrics) => {
+      for (const value of Object.values(metrics)) {
+        assert.ok(value.bytes <= 256 * 1024, `refresh read ${value.bytes} bytes before yielding`);
+        assert.ok(value.reads <= 32, `refresh performed ${value.reads} reads before yielding`);
+      }
+    });
+    assert.ok(
+      attempts.every((count) => count <= 32),
+      `refresh stat counts: ${attempts}`,
+    );
+  };
+  await measure(async () => {
+    admitted = await run.call(provider);
+  });
+  assert.deepEqual(
+    admitted.map((source) => source.file),
+    [sources[0].file, sources[2].file, 'codex.jsonl'],
+  );
+  assert.ok(slice >= 6, 'multiple source scans did not yield at their shared allowance');
+
+  provider.humanScans.clear();
+  cancel = new AbortController();
+  await measure(async () => {
+    assert.deepEqual(await prepare.call(provider, [sources[0]], true, cancel!.signal), []);
+    assert.equal(provider.humanScans.get(sources[0].file)?.complete, false);
+    cancel = undefined;
+    assert.deepEqual(await prepare.call(provider, [sources[0]], true, new AbortController().signal), [sources[0]]);
+  });
+  const replaced = sources[0];
+  fs.unlinkSync(replaced.file);
+  fs.writeFileSync(replaced.file, JSON.stringify(peer) + '\n');
+  assert.deepEqual(await prepare.call(provider, [replaced], false, new AbortController().signal), []);
+  fs.appendFileSync(replaced.file, JSON.stringify(human) + '\n');
+  assert.deepEqual(await prepare.call(provider, [replaced], false, new AbortController().signal), [replaced]);
+
+  // Confirmed opening evidence survives appends at every scheduling yield.
+  const large = JSON.stringify({ type: 'metadata', value: 'x'.repeat(300_000) }) + '\n';
+  provider.humanScans.clear();
+  fs.writeFileSync(replaced.file, JSON.stringify(human) + '\n' + large);
+  onYield = () => fs.appendFileSync(replaced.file, JSON.stringify(peer) + '\n');
+  const appendWork = { bytes: 0, sources: 0, reads: 0, unknown: new Set<string>() };
+  assert.deepEqual(await prepare.call(provider, [replaced], false, new AbortController().signal, appendWork), [
+    replaced,
+  ]);
+  assert.equal(provider.humanScans.get(replaced.file)?.found, true);
+  assert.equal(appendWork.unknown.size, 0);
+
+  provider.humanScans.clear();
+  fs.writeFileSync(replaced.file, JSON.stringify(command) + '\n' + large);
+  onYield = () => {
+    onYield = undefined;
+    fs.appendFileSync(replaced.file, JSON.stringify(answer) + '\n');
+  };
+  const commandWork = { bytes: 0, sources: 0, reads: 0, unknown: new Set<string>() };
+  assert.deepEqual(await prepare.call(provider, [replaced], false, new AbortController().signal, commandWork), []);
+  assert.equal(commandWork.unknown.has(replaced.file), true);
+  assert.equal(provider.humanScans.get(replaced.file)?.complete, false);
+  assert.deepEqual(await prepare.call(provider, [replaced], false, new AbortController().signal), []);
+  assert.equal(provider.humanScans.get(replaced.file)?.command?.withdrawn, true);
+
+  // An unconfirmed scan keeps its cursor when new bytes arrive after its captured end.
+  provider.humanScans.clear();
+  fs.writeFileSync(replaced.file, large + JSON.stringify(peer) + '\n');
+  onYield = () => fs.appendFileSync(replaced.file, JSON.stringify(peer) + '\n');
+  const pendingWork = { bytes: 0, sources: 0, reads: 0, unknown: new Set<string>() };
+  assert.deepEqual(await prepare.call(provider, [replaced], false, new AbortController().signal, pendingWork), []);
+  const checkpoint = provider.humanScans.get(replaced.file);
+  assert.ok(checkpoint.bytes > 256 * 1024);
+  assert.equal(checkpoint.complete, false);
+  assert.equal(pendingWork.unknown.has(replaced.file), true);
+  onYield = undefined;
+  fs.appendFileSync(replaced.file, JSON.stringify(human) + '\n');
+  await withReadMetrics(
+    async () => {
+      assert.deepEqual(await prepare.call(provider, [replaced], false, new AbortController().signal), [replaced]);
+    },
+    (metrics) => {
+      assert.ok(Object.values(metrics).reduce((bytes, value) => bytes + value.bytes, 0) < 256 * 1024);
+    },
+  );
+
+  // A different physical file with equal size and modification time supplies no old evidence.
+  provider.humanScans.clear();
+  fs.writeFileSync(replaced.file, JSON.stringify(human) + '\n' + large);
+  const oldRevision = revisionOf(fs.statSync(replaced.file, { bigint: true }));
+  preservedMtime = oldRevision.mtimeMs;
+  onYield = () => {
+    onYield = undefined;
+    fs.renameSync(replaced.file, replaced.file + '.retired');
+    const peerLine = JSON.stringify(peer) + '\n';
+    fs.writeFileSync(replaced.file, peerLine + ' '.repeat(oldRevision.size - Buffer.byteLength(peerLine)));
+    assert.notEqual(revisionOf(fs.statSync(replaced.file, { bigint: true })).ino, oldRevision.ino);
+  };
+  const replacementWork = { bytes: 0, sources: 0, reads: 0, unknown: new Set<string>() };
+  assert.deepEqual(await prepare.call(provider, [replaced], false, new AbortController().signal, replacementWork), []);
+  assert.equal(provider.humanScans.has(replaced.file), false);
+  assert.equal(replacementWork.unknown.has(replaced.file), true);
+  preservedMtime = undefined;
+
+  // A selected refresh loses ownership without its private controller receiving an abort.
+  for (const supersede of ['refreshGeneration', 'selectionGeneration']) {
+    provider.humanScans.clear();
+    provider.selectionGeneration = 1;
+    fs.writeFileSync(replaced.file, large + large + large + JSON.stringify(human) + '\n');
+    provider.authoritativeCatalog = sources;
+    let retained: unknown;
+    let writes = 0;
+    const cacheWrite = vi.spyOn(provider.humanScans, 'set');
+    onYield = () => {
+      onYield = undefined;
+      provider[supersede]++;
+      retained = provider.humanScans.get(replaced.file);
+      writes = cacheWrite.mock.calls.length;
+    };
+    await withReadMetrics(
+      async () => {
+        assert.equal(await run.call(provider, true), undefined);
+      },
+      (metrics) => {
+        assert.equal(
+          Object.values(metrics).reduce((bytes, value) => bytes + value.bytes, 0),
+          256 * 1024,
+        );
+      },
+    );
+    assert.equal(cacheWrite.mock.calls.length, writes);
+    assert.equal(provider.humanScans.get(replaced.file), retained);
+    assert.equal(provider.humanScans.has(sources[1].file), false);
+    cacheWrite.mockRestore();
+    assert.deepEqual(await prepare.call(provider, [replaced], false, new AbortController().signal), [replaced]);
   }
 });
 
@@ -4799,7 +5036,7 @@ test('window session pages lose coverage when a served transcript is replaced at
       }),
     };
     const code = ts.transpileModule(
-      `function listing(reuseCatalog = false) { ${methodBody('private allSessions(')} }`,
+      `function listing(reuseCatalog = false, deferHumanPrompts = false) { ${methodBody('private allSessions(')} }`,
       {
         compilerOptions: { target: ts.ScriptTarget.ES2022 },
       },
@@ -4812,6 +5049,9 @@ test('window session pages lose coverage when a served transcript is replaced at
       catalog: { folders: [provider.folders().join('\n'), 1].join('\0'), sessions: sources },
       publishWindowState() {},
       hasHumanPrompt: () => true,
+      async prepareHumanPrompts(this: any, sessions: any[]) {
+        return sessions.filter((session) => this.hasHumanPrompt(session));
+      },
       activityFor: () => 1,
       codexMetas: { revision: 0, keys: () => [] },
       codexStats: { keys: () => [] },
@@ -9394,7 +9634,7 @@ test('a session joins the list only once a human has prompted it, and the cut st
   // Filter Claude sessions by human-prompt presence before combining the session catalog.
   sourceMatch(
     panelHostSource,
-    /const listed = claude\.filter\(\(s\) => this\.hasHumanPrompt\(s, true\)\);/,
+    /const listed = deferHumanPrompts \? claude : claude\.filter\(\(s\) => this\.hasHumanPrompt\(s, true\)\);/,
     'the peer-wake sessions still join the list',
   );
   sourceMatch(
@@ -9511,7 +9751,7 @@ test('derived session caches load, trim against the walk, and checkpoint after f
   );
 
   const listing = panelHostSource.slice(
-    panelHostSource.indexOf('private allSessions(reuseCatalog = false): SessionFile[] {'),
+    panelHostSource.indexOf('private allSessions(reuseCatalog = false, deferHumanPrompts = false): SessionFile[] {'),
   );
   sourceMatch(
     listing,
@@ -9662,7 +9902,7 @@ test('clearing empties one session and leaves the other agents alone', () => {
 });
 
 test('both agents reach one list, and each session is read and named by its own reader', () => {
-  const marker = 'private allSessions(reuseCatalog = false)';
+  const marker = 'private allSessions(reuseCatalog = false, deferHumanPrompts = false)';
   const from = panelHostSource.indexOf(marker);
   assert.notEqual(from, -1, `panelhost.ts no longer contains "${marker}", so this guard cannot see the merge`);
   const merge = memberFrom(panelHostSource, from);
@@ -9735,7 +9975,7 @@ test('both agents reach one list, and each session is read and named by its own 
 });
 
 test('Claude child catalog membership does not depend on the evictable parent turn cache', () => {
-  const from = panelHostSource.indexOf('private allSessions(reuseCatalog = false)');
+  const from = panelHostSource.indexOf('private allSessions(reuseCatalog = false, deferHumanPrompts = false)');
   const merge = memberFrom(panelHostSource, from);
   sourceDoesNotMatch(
     merge,
@@ -9779,7 +10019,7 @@ test('Claude child catalog membership does not depend on the evictable parent tu
 });
 
 test('Claude child reference discovery runs in cancellable worker work', () => {
-  const from = panelHostSource.indexOf('private allSessions(reuseCatalog = false)');
+  const from = panelHostSource.indexOf('private allSessions(reuseCatalog = false, deferHumanPrompts = false)');
   const merge = memberFrom(panelHostSource, from);
   sourceDoesNotMatch(
     merge,
@@ -10458,6 +10698,9 @@ test("the host counts a dispatched session in its parent's cost once and files i
       derivedCacheCheckpointState: { markChanged() {} },
       checkpointDerivedCache() {},
       hasHumanPrompt: () => true,
+      async prepareHumanPrompts(this: any, sessions: any[]) {
+        return sessions.filter((session) => this.hasHumanPrompt(session));
+      },
       activityFor: () => 1,
       pruneDerivedTitles: () => false,
       sendToHost: (_host: unknown, message: unknown) => posted.push(message),
@@ -21557,7 +21800,7 @@ test('the panel dates a session by what it recorded, not by its file being touch
   );
 
   // Order the merged catalog by activityFor.
-  const merge = panelHostSource.indexOf('const listed = claude.filter');
+  const merge = panelHostSource.indexOf('const listed = deferHumanPrompts ? claude : claude.filter');
   assert.notEqual(merge, -1, 'allSessions no longer merges the two listings, so this guard cannot see its order');
   const merged = memberFrom(panelHostSource, merge);
   sourceMatch(
@@ -21574,7 +21817,9 @@ test('initial session listing keeps every metadata read within 64 MiB before the
   const claudeMetadataBytes = 256 * 1024;
   const codexMetadataBytes = 256 * 1024 + 1024 * 1024;
 
-  const listingAt = panelHostSource.indexOf('private allSessions(reuseCatalog = false): SessionFile[] {');
+  const listingAt = panelHostSource.indexOf(
+    'private allSessions(reuseCatalog = false, deferHumanPrompts = false): SessionFile[] {',
+  );
   assert.notEqual(listingAt, -1, 'panelhost.ts no longer contains the initial session listing');
   const listing = memberFrom(panelHostSource, listingAt);
   sourceMatch(
@@ -26063,6 +26308,9 @@ function activityFallbackFixture(directory: string, children: { sessionId: strin
     publishWindowState() {},
     watchDirectories() {},
     hasHumanPrompt: () => true,
+    async prepareHumanPrompts(this: any, sessions: any[]) {
+      return sessions.filter((session) => this.hasHumanPrompt(session));
+    },
     catalog: { folders: [directory, 1].join('\0'), sessions },
     cwds: new Map(),
     codexMetas: { revision: 0, get: () => undefined, keys: () => [], delete() {} },
@@ -27246,7 +27494,7 @@ test('selection and accepted worker results avoid unnecessary catalog walks', ()
   // Reuse the retained catalog only when requested and its folder identity matches.
   const listing = memberFrom(
     panelHostSource,
-    panelHostSource.indexOf('private allSessions(reuseCatalog = false): SessionFile[] {'),
+    panelHostSource.indexOf('private allSessions(reuseCatalog = false, deferHumanPrompts = false): SessionFile[] {'),
   );
   const body = listing;
   sourceMatch(
@@ -30075,6 +30323,9 @@ test.each([false, true])('the first reader child selection includes its parent (
     createDraft: PanelProvider.prototype.createDraft,
     refresh: PanelProvider.prototype.refresh,
     hasHumanPrompt: () => true,
+    async prepareHumanPrompts(this: any, sessions: any[]) {
+      return sessions.filter((session) => this.hasHumanPrompt(session));
+    },
     sendToHost: (_owner: unknown, message: Record<string, any>) => {
       posted.push(message);
       return Promise.resolve(true);
@@ -30095,6 +30346,7 @@ test.each([false, true])('the first reader child selection includes its parent (
   }
   const [child] = Object.keys(provider.newDrafts);
   assert.ok(child, 'the reader action did not create its child');
+  await vi.waitFor(() => assert.ok(posted.some((message) => message.type === 'selection')));
   const selections = posted.filter((message) => message.type === 'selection');
   assert.equal(selections.length, 1, 'creation must publish one initial selection');
   assert.equal(selections[0].showing, child);
@@ -34776,6 +35028,9 @@ test('catalog prefix resolution suspends through discovery progress failure canc
     failSessionLoading() {},
     dispatchedDiscoveryWaiting: () => false,
     hasHumanPrompt: () => true,
+    async prepareHumanPrompts(this: any, sessions: any[]) {
+      return sessions.filter((session) => this.hasHumanPrompt(session));
+    },
     activityFor: () => 1,
     updateSessionSpendSources() {},
     checkpointDerivedCache() {},

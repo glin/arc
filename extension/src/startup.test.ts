@@ -1032,6 +1032,7 @@ function harness(pendingRefresh = false, registerRefreshHandler = true, extraMet
       sessionQueryContext() { return undefined; }
       publishSessionQueryContext() {}
       hasHumanPrompt() { return true; }
+      async prepareHumanPrompts(sessions) { return sessions.filter((session) => this.hasHumanPrompt(session)); }
       failSessionLoading() {}
       noteSessionRead() {}
       loadingLine = new SessionLoadingLine(() => {});
@@ -1297,6 +1298,7 @@ function completeDiscoveryHarness(
       abandonDraft() { return false; }
       anyVisible() { return true; } allSessions() { return this.partial; } folders() { return ['project']; }
       hasHumanPrompt() { return true; }
+      async prepareHumanPrompts(sessions) { return sessions.filter((session) => this.hasHumanPrompt(session)); }
       activityFor(session) { return session.activity; }
       // A discovery that runs while no further pass is pending stands for a complete reply under the current roots that answered the
       // held catalog.

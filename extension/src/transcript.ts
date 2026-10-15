@@ -1497,6 +1497,8 @@ export interface HumanPromptScan {
   bytes: number;
   found: boolean;
   complete?: boolean;
+  source?: FileRevision;
+  pending?: { bytes: number; pos: number; carry: Buffer | null };
   command?: ClaudePromptPair;
   prompt?: string;
   queuedPrompt?: string;
@@ -1581,13 +1583,47 @@ function scanPromptLines(
 // Resumes from the complete-line cursor until human evidence is confirmed.
 // Preserve UTF-8 bytes across chunks and incomplete trailing lines. Shrinkage restarts scanning.
 export function scanForHumanPrompt(file: string, size: number, prev?: HumanPromptScan): HumanPromptScan {
+  const steps = humanPromptScanSteps(file, size, prev);
+  let step = steps.next();
+  while (!step.done) step = steps.next();
+  return step.value;
+}
+
+// Each step reads at most one chunk. Callers share scheduling allowances across sources.
+export function* humanPromptScanSteps(
+  file: string,
+  size: number,
+  prev?: HumanPromptScan,
+  readLimit = () => 256 * 1024,
+  progress?: (scan: HumanPromptScan) => void,
+): Generator<number, HumanPromptScan> {
   if (prev?.found && prev.bytes <= size) {
     return prev;
   }
   const from = prev && prev.bytes <= size ? prev.bytes : 0;
   const scan: HumanPromptScan =
-    from && prev ? { ...prev, ...(prev.command ? { command: { ...prev.command } } : {}) } : { bytes: 0, found: false };
-  const { bytes, rest } = readCompleteLines(file, from, size, (text) => scanPromptLines(text, scan));
+    prev && (from > 0 || (prev.pending && prev.pending.pos <= size))
+      ? { ...prev, ...(prev.command ? { command: { ...prev.command } } : {}) }
+      : { bytes: 0, found: false };
+  const cursor =
+    scan.pending && scan.pending.pos <= size ? { ...scan.pending } : { bytes: from, pos: from, carry: null };
+  const steps = completeLineSteps(file, from, size, (text) => scanPromptLines(text, scan), readLimit, cursor);
+  let step;
+  try {
+    step = steps.next();
+    while (!step.done) {
+      scan.bytes = cursor.bytes;
+      scan.pending = { ...cursor };
+      scan.complete = false;
+      progress?.(scan);
+      yield step.value;
+      step = steps.next();
+    }
+  } finally {
+    steps.return({ bytes: cursor.bytes, rest: null });
+  }
+  const { bytes, rest } = step.value;
+  delete scan.pending;
   scan.bytes = bytes;
   scan.complete = scan.found || (rest !== null && bytes === size);
   return scan;
@@ -1604,6 +1640,20 @@ export function readCompleteLines(
   size: number,
   visit: (text: string) => boolean,
 ): { bytes: number; rest: Buffer | null } {
+  const steps = completeLineSteps(file, from, size, visit);
+  let step = steps.next();
+  while (!step.done) step = steps.next();
+  return step.value;
+}
+
+function* completeLineSteps(
+  file: string,
+  from: number,
+  size: number,
+  visit: (text: string) => boolean,
+  readLimit = () => 256 * 1024,
+  cursor = { bytes: from, pos: from, carry: null as Buffer | null },
+): Generator<number, { bytes: number; rest: Buffer | null }> {
   let bytes = from;
   if (size <= bytes) {
     return { bytes, rest: Buffer.alloc(0) };
@@ -1611,11 +1661,11 @@ export function readCompleteLines(
   let fd = -1;
   try {
     fd = fs.openSync(file, 'r');
-    let carry: Buffer | null = null;
-    let pos = bytes;
+    let carry = cursor.carry;
+    let pos = cursor.pos;
     const chunk = Buffer.allocUnsafe(256 * 1024);
     while (pos < size) {
-      const read = meterRead(file, fs.readSync(fd, chunk, 0, Math.min(chunk.length, size - pos), pos));
+      const read = meterRead(file, fs.readSync(fd, chunk, 0, Math.min(chunk.length, size - pos, readLimit()), pos));
       if (read <= 0) {
         break;
       }
@@ -1625,13 +1675,16 @@ export function readCompleteLines(
       if (lastNewline < 0) {
         // Copied, because the next read overwrites the chunk the slice points into.
         carry = Buffer.from(buf);
+        Object.assign(cursor, { bytes, pos, carry });
+        yield read;
         continue;
       }
       carry = lastNewline + 1 < buf.length ? Buffer.from(buf.subarray(lastNewline + 1)) : null;
       bytes = pos - (carry ? carry.length : 0);
-      if (visit(buf.subarray(0, lastNewline).toString('utf8'))) {
-        return { bytes, rest: null };
-      }
+      const stopped = visit(buf.subarray(0, lastNewline).toString('utf8'));
+      Object.assign(cursor, { bytes, pos, carry });
+      yield read;
+      if (stopped) return { bytes, rest: null };
     }
     if (pos >= size) {
       return { bytes, rest: carry ?? Buffer.alloc(0) };
