@@ -1,5 +1,5 @@
 import { inlineText } from './inline-text.ts';
-import { contextShare, type ContextDetail } from '../domain/context-detail.ts';
+import { contextShare, type ContextDetail, type ContextMessage } from '../domain/context-detail.ts';
 import { formatTokens } from '../view/tokens.ts';
 import { wholePercent } from '../view/tokens.ts';
 
@@ -44,18 +44,44 @@ export function drawContextDetail(document: Document, host: HTMLElement, value: 
     breakdown.append(columns);
     const list = el('ul', 'context-categories');
     list.setAttribute('role', 'list');
-    for (const row of [...native.categories].sort((a, b) => b.tokens - a.tokens)) {
-      const item = el('li', '');
+    const drawRow = (item: HTMLElement, row: { name: string; tokens: number }) => {
       const share = el('span', 'context-share', contextShare(row.tokens, used));
       share.title = `${row.tokens.toLocaleString('en-US')} tokens`;
       share.append(el('span', 'sr-only', ` of used context, ${row.tokens.toLocaleString('en-US')} tokens`));
-      item.append(...inlineText([el('span', 'context-category-label', row.name), share]));
+      const label = el('span', 'context-category-label', row.name);
+      if (row.name === 'Unattributed') label.title = 'Context that Claude does not assign to another message category.';
+      item.append(...inlineText([label, share]));
       const meter = el('div', 'sbbar context-meter');
       meter.setAttribute('aria-hidden', 'true');
       const fill = el('i', '');
       fill.style.width = `${(row.tokens / used) * 100}%`;
       meter.append(fill);
       item.append(meter);
+    };
+    for (const row of [...native.categories].sort((a, b) => b.tokens - a.tokens)) {
+      const item = el('li', '');
+      if (row.key === 'Messages' && native.messageBreakdown) {
+        item.className = 'context-disclosed';
+        const disclosure = el('details', 'context-messages');
+        const summary = el('summary', '');
+        const parent = el('span', 'context-category-row');
+        drawRow(parent, row);
+        summary.append(parent);
+        const children = el('div', 'context-message-children');
+        children.append(el('p', 'context-included', 'Included in Messages. Shares of all used context.'));
+        const childList = el('ul', 'context-categories');
+        childList.setAttribute('role', 'list');
+        for (const child of [...native.messageBreakdown].sort(
+          (a: ContextMessage, b: ContextMessage) => b.tokens - a.tokens,
+        )) {
+          const childItem = el('li', '');
+          drawRow(childItem, child);
+          childList.append(childItem);
+        }
+        children.append(childList);
+        disclosure.append(summary, children);
+        item.append(disclosure);
+      } else drawRow(item, row);
       list.append(item);
     }
     breakdown.append(list);

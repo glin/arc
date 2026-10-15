@@ -103,7 +103,7 @@ The portable review runner in `evals/agent-review/run.mjs` reads tracked case fi
 | Saved session capture | Configured Claude project directories, Codex rollout directories, and caller-supplied reader-started links and saved reader-parent identities | Verified identities across working directories and the outgoing relationships of the selected saved session. Unreachable text bodies stay outside the capture |
 | Portable review fixtures | `evals/agent-review/portable/cases/`, `evals/agent-review/fixtures/`, `evals/agent-review/cohorts/`, and captured checkout instructions | Candidate source, qualification checks, frozen keys, coverage targets, and instruction hashes for local exploratory comparisons |
 | Codex account capability | Non-refreshing `account/read` on the selected app-server process | `account.type: amazonBedrock` excludes subscription usage. Missing accounts, unknown types, and discovery failures establish no exclusion |
-| Claude context summary | `get_context_usage` with `detail: summary` on the selected connected child | Estimated content categories, occupied tokens, accounting window, free space, and compaction reserve from one response |
+| Claude context summary | `get_context_usage` with `detail: summary` on the selected connected child | Estimated content categories, optional message partitions, occupied tokens, accounting window, free space, and compaction reserve from one response |
 | Codex retained context | The selected rollout's newest complete replacement history or opening, plus subsequent response items and request usage | Locally estimated text categories, retained checkpoint tool text, and an explicit unattributed remainder, without attaching to a saved session |
 | Claude status-line JSON | CLI stdin | Current model, effort, context size and use, prompt-cache state and expiry, and session cost metadata |
 | CLI transcript target | `arc cost` path or session id | Windowed request usage and list-price cost for one session and its children |
@@ -368,7 +368,7 @@ The first column is checked against the shipped extension directory by `architec
 | `commandcatalog.ts` | Merges complete agent command catalogs, rejects superseded idle reads, and skips unchanged Prompt box payloads | no |
 | `promptassets.ts` | Prompt asset limits, descriptor normalization, media-type decisions including the plain-text check for unlisted extensions, staging paths, integrity validation, and staged-copy lifecycle | no |
 | `droppeduris.ts` | Drag type reading, `file:` URI to path conversion, path text in the path-completion format, image routing, and the `Add to Arc` argument shape | no |
-| `domain/context-detail.ts` | Separate native Claude and local Codex context normalization, bounded partition checks, category shares, aggregate-compatible demand reuse, and stale-demand release | no |
+| `domain/context-detail.ts` | Separate native Claude and local Codex context normalization, bounded category and optional Claude message partition checks, category shares, aggregate-compatible demand reuse, and stale-demand release | no |
 | `contextframe.ts` | Claude context envelope identification and transport budgets | no |
 | `webview/export-host.ts` | Local host for captured pages, bounded decoding, navigation and read-only capabilities | no |
 | `webview/static-menu.ts` | Static editor-menu stand-in shared by the demo and captured pages | no |
@@ -379,7 +379,7 @@ The first column is checked against the shipped extension directory by `architec
 | `view/static-page.ts` | Shared static-page body, header and session-list width | no |
 | `webview/export-model.ts` | Static viewer contracts and exhaustive capability policy | no |
 | `view/static-themes.ts` | Dark Modern, Light Modern and One Dark Pro Darker colors shared by static pages and browser fixtures | no |
-| `webview/context-detail.ts` | Semantic context categories, decorative chart, mismatch table, measurement disclosure, and Compact action. `webview/stat-detail.ts` retains disclosure state through refreshes and places the popover after disclosure toggles | no |
+| `webview/context-detail.ts` | Semantic context categories, decorative chart, optional Messages disclosure, mismatch table, measurement disclosure, and Compact action. `webview/stat-detail.ts` retains disclosure state through refreshes and places the popover after disclosure toggles | no |
 | `claudewire.ts` | Claude stream-json and control-channel adapter | no |
 | `compactrequest.ts` | Literal self-compaction payloads, in-memory native call bindings, deferred assignments, reader revisions, delivery to the exact retained child, and native completion evidence | no |
 | `codexwire.ts` | Codex app-server JSON-RPC adapter | no |

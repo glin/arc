@@ -243,6 +243,7 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
   // Track whether the current draw includes actions. The content print does not include this flag.
   let drawnActions = false;
   let contextMeasurementOpen = false;
+  let contextMessagesOpen = false;
   // Ids of the drawn parts before the notes disclosure, which describe a figure with notes.
   let breakdownIds: string[] = [];
   // Counts the ids given to figures that name a dialog.
@@ -430,8 +431,8 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
   // Arrow-key targets include label actions, record-row buttons, and the Context action.
   const POP_PRESSES = '.chippopnamelink, .chippoprows button, .context-bound button';
   // The Tab walk holds presses, row figure stops, rows without links, the Context
-  // measurement disclosure, and the notes disclosure. The arrow keys walk presses alone.
-  const POP_TAB_STOPS = `${POP_PRESSES}, .chippoprows [tabindex="0"], .context-measurement summary, .chippopnotes summary`;
+  // disclosures and the notes disclosure. The arrow keys walk presses alone.
+  const POP_TAB_STOPS = `${POP_PRESSES}, .chippoprows [tabindex="0"], .context-messages summary, .context-measurement summary, .chippopnotes summary`;
   // Every button the reader can reach inside the popover, in reading order.
   const actionButtons = () => Array.from(pop.querySelectorAll<HTMLButtonElement>(POP_PRESSES));
   // Every stop Tab takes inside the popover, in reading order.
@@ -485,6 +486,8 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
       drawContextDetail(document, pop, listValue.context);
       const measurement = pop.querySelector<HTMLDetailsElement>('.context-measurement');
       if (measurement) measurement.open = contextMeasurementOpen;
+      const messages = pop.querySelector<HTMLDetailsElement>('.context-messages');
+      if (messages) messages.open = contextMessagesOpen;
       return;
     }
     pop.classList.toggle('chippop-stacked', listValue?.layout === 'stacked');
@@ -597,12 +600,17 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
   const draw = (value: ResolvedDetailValue, withActions: boolean) => {
     const measurement = pop.querySelector<HTMLDetailsElement>('.context-measurement');
     if (measurement && drawnPrint !== null) contextMeasurementOpen = measurement.open;
+    const messages = pop.querySelector<HTMLDetailsElement>('.context-messages');
+    if (messages && drawnPrint !== null) contextMessagesOpen = messages.open;
     const notes = pop.querySelector<HTMLDetailsElement>('.chippopnotes');
     // Only a pinned drawing holds the reader's choice. A hover drawing is always closed.
     if (notes && drawnPrint !== null && pop.classList.contains('pinned')) notesOpen.set(document, notes.open);
-    const focused = ['.context-bound button', '.context-measurement summary', '.chippopnotes summary'].find(
-      (selector) => pop.querySelector(selector) === document.activeElement,
-    );
+    const focused = [
+      '.context-bound button',
+      '.context-messages summary',
+      '.context-measurement summary',
+      '.chippopnotes summary',
+    ].find((selector) => pop.querySelector(selector) === document.activeElement);
     redrawing = true;
     try {
       drawInto(value, withActions);
@@ -636,6 +644,7 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
       drawDebt = null;
       drawnPrint = null;
       contextMeasurementOpen = false;
+      contextMessagesOpen = false;
     }
     anchor = node;
     // Draw available actions on hover as well as when pinned.
@@ -697,6 +706,7 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
     drawnPrint = null;
     drawnActions = false;
     contextMeasurementOpen = false;
+    contextMessagesOpen = false;
     drawDebt = null;
     // Return focus after hiding. Suppress the anchor handler so it cannot reopen the popover.
     if (held && target) {
@@ -882,6 +892,7 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
       if (!anchor || pop.hidden) return;
       if (disclosure.matches('.chippopnotes')) notesOpen.set(document, disclosure.open);
       else if (disclosure.matches('.context-measurement')) contextMeasurementOpen = disclosure.open;
+      else if (disclosure.matches('.context-messages')) contextMessagesOpen = disclosure.open;
       else return;
       if (anchor && !pop.hidden) options.placeFloat(pop, anchor, view.innerHeight - 6);
     },

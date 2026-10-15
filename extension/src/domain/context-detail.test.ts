@@ -1,5 +1,7 @@
 import { test } from 'vitest';
 import assert from 'node:assert/strict';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
 import { codexContextRecords } from '../turnfixtures';
 import { estimateCodexContext } from '../codexcontext';
 import {
@@ -30,6 +32,86 @@ const native = () => ({
     { name: 'Reserve', kind: 'buffer', tokens: 10000 },
     { name: 'Deferred tools', kind: 'deferred', tokens: 900000 },
   ],
+});
+
+const messages = () => ({
+  toolCallTokens: 15000,
+  toolResultTokens: 50000,
+  attachmentTokens: 4000,
+  assistantMessageTokens: 20000,
+  userMessageTokens: 10000,
+  redirectedContextTokens: 4000,
+  unattributedTokens: 1000,
+});
+
+test('native summary records zero message fields without inventing an absent Messages parent', () => {
+  const raw = JSON.parse(
+    fs.readFileSync(path.join(__dirname, '../../test/fixtures/claude-context-summary.json'), 'utf8'),
+  );
+  assert.equal(Object.values(raw.messageBreakdown).filter((value) => value === 0).length, 7);
+  const detail = normalizeContext(raw, identity);
+  assert.equal(detail.status, 'available');
+  assert.equal(detail.messageBreakdown, undefined);
+  assert.equal(validContextDetail(detail), true);
+});
+
+test('Messages detail partitions its parent, includes redirected tokens and keeps the occupied denominator', () => {
+  const detail = normalizeContext(
+    { ...native(), messageBreakdown: { ...messages(), toolCallsByType: Array(1000).fill({}) } },
+    identity,
+  );
+  assert.equal(detail.used, 118000);
+  assert.equal(
+    detail.categories.reduce((sum, row) => sum + row.tokens, 0),
+    118000,
+  );
+  assert.equal(detail.messageBreakdown?.length, 7);
+  assert.equal(
+    detail.messageBreakdown?.reduce((sum, row) => sum + row.tokens, 0),
+    104000,
+  );
+  assert.equal(detail.messageBreakdown?.find((row) => row.key === 'redirectedContextTokens')?.tokens, 4000);
+  assert.equal(validContextDetail(detail), true);
+  assert.ok(JSON.stringify(detail).length < 2048);
+  const zero = normalizeContext(
+    { ...native(), messageBreakdown: { ...messages(), redirectedContextTokens: 0, unattributedTokens: 5000 } },
+    identity,
+  );
+  assert.equal(zero.messageBreakdown?.find((row) => row.key === 'redirectedContextTokens')?.tokens, 0);
+  assert.equal(validContextDetail(zero), true);
+});
+
+test('optional Messages failures leave honest categories available instead of hiding or inventing tokens', () => {
+  for (const messageBreakdown of [
+    undefined,
+    null,
+    [],
+    {},
+    { ...messages(), toolCallTokens: undefined },
+    { ...messages(), toolCallTokens: -1 },
+    { ...messages(), toolCallTokens: 1.1 },
+    { ...messages(), toolCallTokens: '15000' },
+    { ...messages(), toolCallTokens: Number.MAX_SAFE_INTEGER },
+    { ...messages(), redirectedContextTokens: 0 },
+    { ...messages(), unattributedTokens: 999 },
+  ]) {
+    const detail = normalizeContext({ ...native(), messageBreakdown }, identity);
+    assert.equal(detail.status, 'available');
+    assert.equal(detail.used, 118000);
+    assert.equal(detail.messageBreakdown, undefined);
+    assert.equal(validContextDetail(detail), true);
+  }
+  const detail = normalizeContext({ ...native(), messageBreakdown: messages() }, identity);
+  for (const messageBreakdown of [
+    [],
+    Array(33).fill(detail.messageBreakdown![0]),
+    detail.messageBreakdown!.slice(1),
+    detail.messageBreakdown!.map((row) => ({ ...row, key: 'other' })),
+    detail.messageBreakdown!.map((row) => ({ ...row, tokens: row.tokens + 1 })),
+    detail.messageBreakdown!.map((row) => ({ ...row, name: 'x'.repeat(32769) })),
+  ])
+    assert.equal(validContextDetail({ ...detail, messageBreakdown }), false);
+  assert.equal(validContextDetail({ ...detail, provider: 'codex' }), false);
 });
 
 test('Codex unavailable reasons stay bounded and recover from the same context demand', async () => {

@@ -6279,7 +6279,8 @@ button.railfilterlabel:focus-visible {
   font-size: inherit;
   line-height: inherit;
 }
-.context-categories li {
+.context-categories li,
+.context-category-row {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
   column-gap: 0.9em;
@@ -6287,6 +6288,38 @@ button.railfilterlabel:focus-visible {
   row-gap: 0.1em;
   overflow-wrap: anywhere;
   color: var(--vscode-foreground);
+}
+.context-categories > .context-disclosed {
+  display: block;
+}
+.context-messages summary {
+  cursor: pointer;
+  list-style-position: inside;
+  margin-left: -0.85em;
+}
+.context-messages .context-category-row {
+  display: inline-grid;
+  width: calc(100% - 0.85em);
+  vertical-align: top;
+}
+.context-messages summary::marker {
+  content: '\25B8';
+}
+.context-messages[open] summary::marker {
+  content: '\25BE';
+}
+.context-messages summary:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: 2px;
+}
+.context-message-children {
+  margin: 0.6em 0 0.3em 1em;
+  padding-left: 0.75em;
+  border-left: 1px solid var(--edge);
+}
+.context-included {
+  margin: 0 0 0.45em;
+  font-size: var(--t-small);
 }
 .context-category-label {
   min-width: 0;

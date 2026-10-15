@@ -1,0 +1,61 @@
+{
+  "categories": [
+    {
+      "name": "System prompt",
+      "tokens": 3255,
+      "color": "promptBorder",
+      "kind": "used"
+    },
+    {
+      "name": "System tools",
+      "tokens": 13921,
+      "color": "inactive",
+      "kind": "used"
+    },
+    {
+      "name": "System tools (deferred)",
+      "tokens": 25383,
+      "color": "inactive",
+      "isDeferred": true,
+      "kind": "deferred"
+    },
+    {
+      "name": "Memory files",
+      "tokens": 12999,
+      "color": "claude",
+      "kind": "used"
+    },
+    {
+      "name": "Skills",
+      "tokens": 9842,
+      "color": "warning",
+      "kind": "used"
+    },
+    {
+      "name": "Autocompact buffer",
+      "tokens": 33000,
+      "color": "inactive",
+      "kind": "buffer"
+    },
+    {
+      "name": "Free space",
+      "tokens": 926983,
+      "color": "promptBorder",
+      "kind": "free"
+    }
+  ],
+  "totalTokens": 40017,
+  "rawMaxTokens": 1000000,
+  "model": "claude-haiku-5-5",
+  "messageBreakdown": {
+    "toolCallTokens": 0,
+    "toolResultTokens": 0,
+    "attachmentTokens": 0,
+    "assistantMessageTokens": 0,
+    "userMessageTokens": 0,
+    "redirectedContextTokens": 0,
+    "unattributedTokens": 0,
+    "toolCallsByType": [],
+    "attachmentsByType": []
+  }
+}

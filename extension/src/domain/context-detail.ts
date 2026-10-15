@@ -18,6 +18,22 @@ export interface ContextCategory {
   relationship: 'used';
 }
 
+const MESSAGE_FIELDS = [
+  ['toolCallTokens', 'Tool calls'],
+  ['toolResultTokens', 'Tool results'],
+  ['attachmentTokens', 'Attachments'],
+  ['assistantMessageTokens', 'Assistant messages'],
+  ['userMessageTokens', 'User messages'],
+  ['redirectedContextTokens', 'Redirected context'],
+  ['unattributedTokens', 'Unattributed'],
+] as const;
+
+export interface ContextMessage {
+  key: (typeof MESSAGE_FIELDS)[number][0];
+  name: string;
+  tokens: number;
+}
+
 export type ContextUnavailableReason = 'pending-tools' | 'awaiting-measurement';
 
 export function contextUnavailableReason(value: unknown): value is ContextUnavailableReason {
@@ -35,6 +51,7 @@ export interface ContextDetail extends ContextIdentity {
   remaining: number | null;
   reserve: number | null;
   categories: ContextCategory[];
+  messageBreakdown?: ContextMessage[];
 }
 
 export function contextString(value: unknown): value is string {
@@ -121,6 +138,15 @@ export function normalizeContext(payload: unknown, identity: ContextIdentity, ca
   )
     return unavailable;
   categories.sort((a, b) => b.tokens - a.tokens);
+  const messages = categories.find((row) => row.key === 'Messages');
+  const breakdown = raw.messageBreakdown;
+  let messageBreakdown: ContextMessage[] | undefined;
+  if (messages && breakdown && typeof breakdown === 'object') {
+    const fields = breakdown as Record<string, unknown>;
+    const rows = MESSAGE_FIELDS.map(([key, name]) => ({ key, name, tokens: fields[key] }));
+    const sum = rows.reduce((total, row) => total + (contextNumber(row.tokens) ? row.tokens : NaN), 0);
+    if (contextNumber(sum) && sum === messages.tokens) messageBreakdown = rows as ContextMessage[];
+  }
   return {
     ...identity,
     model: raw.model,
@@ -132,6 +158,7 @@ export function normalizeContext(payload: unknown, identity: ContextIdentity, ca
     remaining,
     reserve,
     categories,
+    ...(messageBreakdown ? { messageBreakdown } : {}),
   };
 }
 
@@ -220,6 +247,29 @@ export function validContextDetail(value: unknown): value is ContextDetail {
     keys.add(category.key);
   }
   const measured = row.status === 'available' || row.status === 'mismatch';
+  if (row.messageBreakdown !== undefined) {
+    if (
+      row.provider !== 'claude' ||
+      !measured ||
+      !Array.isArray(row.messageBreakdown) ||
+      row.messageBreakdown.length !== MESSAGE_FIELDS.length
+    )
+      return false;
+    const seen = new Set<string>();
+    for (const message of row.messageBreakdown) {
+      if (
+        !message ||
+        !MESSAGE_FIELDS.some(([key, name]) => message.key === key && message.name === name) ||
+        !contextNumber(message.tokens) ||
+        seen.has(message.key)
+      )
+        return false;
+      seen.add(message.key);
+    }
+    const sum = row.messageBreakdown.reduce((total, message) => total + message.tokens, 0);
+    if (!contextNumber(sum) || sum !== row.categories.find((category) => category.key === 'Messages')?.tokens)
+      return false;
+  }
   const sum = row.categories.reduce((total, category) => total + category.tokens, 0);
   if (
     measured &&

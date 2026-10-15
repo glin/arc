@@ -1,4 +1,4 @@
-import { unavailableContext } from '../domain/context-detail.ts';
+import { normalizeContext, unavailableContext } from '../domain/context-detail.ts';
 import { test } from 'vitest';
 import assert from 'node:assert';
 
@@ -895,6 +895,42 @@ test('context wire refuses invalid identity and reduces oversized detail to matc
   assert.ok(JSON.stringify(oversized.detail).length < 32768);
   assert.equal('extra' in oversized.detail, false);
   assert.equal(parsePanelToHost({ type: 'contextDetail', session: 's1', request: -1, generation: 0 }), null);
+});
+
+test('context wire preserves valid Messages partitions and drops only invalid optional detail', () => {
+  const detail = normalizeContext(
+    {
+      totalTokens: 100,
+      rawMaxTokens: 1000,
+      model: 'opus',
+      categories: [{ name: 'Messages', kind: 'used', tokens: 100 }],
+      messageBreakdown: {
+        toolCallTokens: 10,
+        toolResultTokens: 40,
+        attachmentTokens: 0,
+        assistantMessageTokens: 20,
+        userMessageTokens: 10,
+        redirectedContextTokens: 15,
+        unattributedTokens: 5,
+      },
+    },
+    CONTEXT_DETAIL,
+  );
+  assert.equal(detail.messageBreakdown?.length, 7);
+  assert.deepEqual(parseHostToPanel({ type: 'contextDetail', detail }), { type: 'contextDetail', detail });
+  const { messageBreakdown: _messages, ...categories } = detail;
+  for (const messageBreakdown of [
+    null,
+    [],
+    Array(33).fill({}),
+    { text: 'x'.repeat(32769) },
+    detail.messageBreakdown!.map((row) => ({ ...row, tokens: 0 })),
+  ]) {
+    assert.deepEqual(parseHostToPanel({ type: 'contextDetail', detail: { ...detail, messageBreakdown } }), {
+      type: 'contextDetail',
+      detail: categories,
+    });
+  }
 });
 
 test('context wire preserves bounded active reasons and rejects invented explanations', () => {

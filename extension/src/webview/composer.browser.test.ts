@@ -17,6 +17,115 @@ import { composerView, pickMenu, newSessionDraft, type ComposerState } from '../
 import type { SessionLauncherView } from '../view/launcher.ts';
 import { SUBMITTED_PROMPT_CHARS } from './state.ts';
 import { usageBar } from '../usageview.ts';
+import { normalizeContext } from '../domain/context-detail.ts';
+
+test(
+  'Messages disclosure keeps native keyboard behavior, focus and expansion through context updates',
+  { timeout: 60_000 },
+  async (t) => {
+    const browser = await browserOrNone();
+    if (!browser) {
+      t.skip('no browser installed');
+      return;
+    }
+    try {
+      for (const theme of ['dark', 'light'] as const) {
+        const page = await browser.newPage();
+        await page.setViewportSize({ width: 340, height: 900 });
+        await page.setContent(themed(pageHtml(), theme));
+        const payload = renderPayload();
+        await post(page, payload);
+        const anchor = page.locator('.cctx');
+        const pop = page.locator('#composer-context-detail');
+        await anchor.focus();
+        const request = await page.evaluate<any>('window.__posted.filter(m => m.type === "contextDetail").at(-1)');
+        const raw = {
+          totalTokens: 10000,
+          rawMaxTokens: 20000,
+          model: 'opus',
+          categories: [
+            { name: 'Messages', kind: 'used', tokens: 8000 },
+            { name: 'System tools', kind: 'used', tokens: 2000 },
+          ],
+          messageBreakdown: {
+            toolCallTokens: 1000,
+            toolResultTokens: 3000,
+            attachmentTokens: 0,
+            assistantMessageTokens: 2000,
+            userMessageTokens: 1000,
+            redirectedContextTokens: 500,
+            unattributedTokens: 500,
+          },
+        };
+        const detail = normalizeContext(
+          raw,
+          { session: 's1', provider: 'claude', model: '', source: 'fixture', ...request },
+          1,
+        );
+        const refresh = async (next: typeof detail) => {
+          (payload.usage as { composer: { context: { generation: number } } }).composer.context.generation++;
+          await post(page, payload);
+          const requested = await page.evaluate<any>('window.__posted.filter(m => m.type === "contextDetail").at(-1)');
+          await post(page, { type: 'contextDetail', detail: { ...next, ...requested } });
+        };
+        await post(page, { type: 'contextDetail', detail });
+        const disclosure = pop.locator('.context-messages');
+        const summary = disclosure.locator('summary');
+        assert.equal(await disclosure.evaluate((node) => (node as HTMLDetailsElement).open), false);
+        await page.keyboard.press('Tab');
+        assert.equal(await summary.evaluate((node) => node === document.activeElement), true);
+        await page.keyboard.press('Enter');
+        await page.waitForFunction(() => document.querySelector<HTMLDetailsElement>('.context-messages')?.open);
+        assert.equal(await disclosure.locator('li').count(), 7);
+        const spoken = await disclosure.ariaSnapshot();
+        for (const text of ['Redirected context', '5.0%', '0 tokens', '3,000 tokens', 'of used context'])
+          assert.ok(spoken.includes(text), text);
+        assert.ok(await disclosure.getByText('Unattributed', { exact: true }).getAttribute('title'));
+        await page.keyboard.press('Tab');
+        assert.equal(
+          await pop.locator('.context-measurement summary').evaluate((node) => node === document.activeElement),
+          true,
+        );
+        await page.keyboard.press('Shift+Tab');
+        await refresh({ ...detail, capturedAt: 2 });
+        assert.equal(
+          await pop.locator('.context-bound button').evaluate((node) => node === document.activeElement),
+          true,
+        );
+        assert.equal(await disclosure.evaluate((node) => (node as HTMLDetailsElement).open), true);
+        await summary.focus();
+        await page.keyboard.press('Space');
+        await page.waitForFunction(() => !document.querySelector<HTMLDetailsElement>('.context-messages')?.open);
+        await page.keyboard.press('Space');
+        await page.waitForFunction(() => document.querySelector<HTMLDetailsElement>('.context-messages')?.open);
+        const { messageBreakdown: _messages, ...categories } = detail;
+        await refresh({ ...categories, capturedAt: 3 });
+        assert.equal(await disclosure.count(), 0);
+        assert.equal(
+          await pop.locator('.context-bound button').evaluate((node) => node === document.activeElement),
+          true,
+        );
+        await refresh({ ...detail, capturedAt: 4 });
+        assert.equal(await disclosure.evaluate((node) => (node as HTMLDetailsElement).open), true);
+        await summary.focus();
+        await page.keyboard.press('Escape');
+        assert.equal(await pop.isHidden(), true);
+        assert.equal(await anchor.evaluate((node) => node === document.activeElement), true);
+        await page.keyboard.press('Tab');
+        await anchor.focus();
+        const nextRequest = await page.evaluate<any>('window.__posted.filter(m => m.type === "contextDetail").at(-1)');
+        await post(page, { type: 'contextDetail', detail: { ...detail, ...nextRequest, capturedAt: 5 } });
+        assert.equal(await disclosure.evaluate((node) => (node as HTMLDetailsElement).open), false);
+        await summary.focus();
+        await page.locator('#prompt').focus();
+        assert.equal(await pop.isHidden(), true);
+        await page.close();
+      }
+    } finally {
+      await browser.close();
+    }
+  },
+);
 
 test(
   'usage progress replaces the refresh action with status, retains focus nearby, and announces one shared outcome',

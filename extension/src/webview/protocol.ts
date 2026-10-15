@@ -804,6 +804,10 @@ export function parseHostToPanel(raw: unknown): HostToPanel | null {
     case 'focusComposer':
       return isString(m.session) ? { type: 'focusComposer', session: m.session } : null;
     case 'contextDetail':
+      if (m.detail && typeof m.detail === 'object' && 'messageBreakdown' in m.detail && !validContextDetail(m.detail)) {
+        const { messageBreakdown: _messageBreakdown, ...categories } = m.detail;
+        if (validContextDetail(categories)) return { type: 'contextDetail', detail: categories };
+      }
       return validContextDetail(m.detail)
         ? { type: 'contextDetail', detail: m.detail }
         : contextIdentity(m.detail)
