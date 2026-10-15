@@ -10097,6 +10097,13 @@ test.each(['claude', 'codex'] as const)(
         'the spend reread missed the transcript',
       );
       assert.ok(cold.charges.dispatchSpendMs >= 1);
+      assert.equal(cold.charges.dispatchSpendAggregateStarts, agent === 'codex' ? 1 : 0);
+      assert.equal(cold.charges.dispatchSpendAggregateCompletions, agent === 'codex' ? 1 : 0);
+      assert.equal(cold.charges.dispatchSpendParserAdvancements, agent === 'codex' ? 4 : 0);
+      assert.equal(cold.charges.dispatchSpendRelationshipInvalidations, 0);
+      assert.equal(cold.charges.dispatchSpendConsumedSourceInvalidations, 0);
+      assert.equal(cold.charges.dispatchSpendSourceRestarts, 0);
+      assert.equal(cold.charges.dispatchSpendRootWaits, 0);
       assert.equal(
         cold.charges.childHeadBytes + cold.charges.dispatchSpendBytes,
         cold.observed.observedBytes,
@@ -10110,6 +10117,9 @@ test.each(['claude', 'codex'] as const)(
       assert.equal(warm.charges.dispatchSpendRereads, 0, 'held dispatched facts counted as a reread');
       assert.equal(warm.charges.dispatchSpendFiles, 0);
       assert.equal(warm.charges.dispatchSpendBytes, 0);
+      assert.equal(warm.charges.dispatchSpendAggregateStarts, 0);
+      assert.equal(warm.charges.dispatchSpendAggregateCompletions, 0);
+      assert.equal(warm.charges.dispatchSpendParserAdvancements, 0);
     } finally {
       first.stop();
       reloaded.stop();

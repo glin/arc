@@ -182,7 +182,7 @@ export interface DiscoveryCheckpoint {
 // A parent check counts every stat of a candidate source. A file count names each file once per measured pass.
 // The dispatch visit count includes sessions whose held facts read nothing. The reread count excludes them.
 // Times are wall milliseconds.
-export interface DiscoveryCharges {
+export interface DiscoveryCharges extends Record<import('./codex').CodexDispatchSpendProgress, number> {
   readBytes: number;
   hits: number;
   resets: number;

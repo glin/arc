@@ -16937,6 +16937,127 @@ test('finite dispatched Codex totals complete beyond the reusable source cache a
   }
 });
 
+test('dispatched Codex progress distinguishes advancement, source restarts, invalidations and waiting roots', () => {
+  const files = Array.from({ length: 3 }, (_, index) => {
+    const records = turnWithToolCalls(1);
+    (records[0] as any).payload.id = `progress-${index}`;
+    if (index === 1) (records[0] as any).payload.parent_thread_id = 'progress-0';
+    records.splice(4, 0, { type: 'ignored', payload: { text: 'x'.repeat(3 * 65536) } });
+    return writeRollout(records);
+  });
+  let children: CodexSubagentFile[] = [
+    {
+      file: files[1],
+      threadId: 'progress-1',
+      parentThreadId: 'progress-0',
+      agentPath: null,
+      openedAt: null,
+      startedAt: null,
+      threadSource: null,
+      backgroundReview: false,
+    },
+  ];
+  const counts: Record<import('./codex').CodexDispatchSpendProgress, number> = {
+    dispatchSpendAggregateStarts: 0,
+    dispatchSpendAggregateCompletions: 0,
+    dispatchSpendRelationshipInvalidations: 0,
+    dispatchSpendConsumedSourceInvalidations: 0,
+    dispatchSpendSourceRestarts: 0,
+    dispatchSpendParserAdvancements: 0,
+    dispatchSpendRootWaits: 0,
+  };
+  const completed: string[] = [];
+  const read = (file = files[0]) =>
+    readCodexDispatchedSpendQuantum(
+      file,
+      children,
+      Date.UTC(2030, 0, 1),
+      { bytes: 65536, deadline: Infinity },
+      () => {},
+      (source) => completed.push(source),
+      (event) => counts[event]++,
+    );
+  const clock = vi.spyOn(performance, 'now').mockReturnValue(100);
+  retainCodexDispatchSpendRoots(new Set());
+  try {
+    assert.equal(read().pending, true);
+    assert.deepEqual(Object.values(counts), [1, 0, 0, 0, 0, 1, 0]);
+    assert.equal(read().pending, true);
+    assert.deepEqual(Object.values(counts), [1, 0, 0, 0, 0, 2, 0]);
+    fs.appendFileSync(files[0], JSON.stringify({ type: 'ignored' }) + '\n');
+    assert.equal(read().pending, true);
+    assert.deepEqual(Object.values(counts), [1, 0, 0, 0, 1, 3, 0]);
+    for (let attempt = 0; attempt < 8 && !completed.includes(files[0]); attempt++) read();
+    assert.deepEqual(completed, [files[0]], 'the root must finish while its child remains pending');
+    const original = fs.readFileSync(files[0], 'utf8');
+    fs.writeFileSync(files[0], original.replace('"output_tokens":50', '"output_tokens":90'));
+    fs.utimesSync(files[0], new Date(0), new Date(Date.UTC(2029, 0, 1)));
+    assert.equal(read().pending, true);
+    assert.equal(counts.dispatchSpendConsumedSourceInvalidations, 1);
+    assert.equal(counts.dispatchSpendAggregateStarts, 2);
+    assert.equal(counts.dispatchSpendRelationshipInvalidations, 0);
+    children = children.map((child) => ({ ...child, agentPath: 'review' }));
+    assert.equal(read().pending, true);
+    assert.equal(counts.dispatchSpendRelationshipInvalidations, 1);
+    assert.equal(counts.dispatchSpendConsumedSourceInvalidations, 1);
+    assert.equal(counts.dispatchSpendAggregateStarts, 3);
+    const beforeWait = { ...counts };
+    assert.equal(read(files[2]).pending, true);
+    assert.deepEqual(counts, { ...beforeWait, dispatchSpendRootWaits: 1 });
+    let result = read();
+    for (let attempt = 0; result.pending && attempt < 20; attempt++) result = read();
+    assert.equal(result.pending, false);
+    assert.equal(result.spend.models[0].usage.output, 140);
+    assert.equal(result.spend.partial, false);
+    assert.equal(counts.dispatchSpendAggregateCompletions, 1);
+    assert.equal(counts.dispatchSpendSourceRestarts, 1);
+  } finally {
+    clock.mockRestore();
+    retainCodexDispatchSpendRoots(new Set());
+  }
+});
+
+test('dispatched Codex progress counts a revision rejected after source finalization', () => {
+  const file = writeRollout(turnWithToolCalls(1));
+  const events: import('./codex').CodexDispatchSpendProgress[] = [];
+  const mutableFs = createRequire(__filename)('node:fs') as typeof fs;
+  const originalStat = mutableFs.statSync;
+  let reads = 0;
+  const stat = vi.spyOn(mutableFs, 'statSync').mockImplementation((...args: any[]) => {
+    // The second exact bigint stat qualifies the completed parse, after the initial key read.
+    if (args[0] === file && args[1]?.bigint && ++reads === 2) {
+      fs.appendFileSync(file, JSON.stringify({ type: 'ignored' }) + '\n');
+    }
+    return (originalStat as any)(...args);
+  });
+  syncBuiltinESMExports();
+  retainCodexDispatchSpendRoots(new Set());
+  try {
+    const completed: string[] = [];
+    const result = readCodexDispatchedSpendQuantum(
+      file,
+      [],
+      Date.UTC(2030, 0, 1),
+      { bytes: 65536, deadline: Infinity },
+      () => {},
+      (source) => completed.push(source),
+      (event) => events.push(event),
+    );
+    assert.equal(result.pending, true);
+    assert.deepEqual(completed, []);
+    assert.deepEqual(events, [
+      'dispatchSpendAggregateStarts',
+      'dispatchSpendParserAdvancements',
+      'dispatchSpendParserAdvancements',
+      'dispatchSpendSourceRestarts',
+    ]);
+  } finally {
+    stat.mockRestore();
+    syncBuiltinESMExports();
+    retainCodexDispatchSpendRoots(new Set());
+  }
+});
+
 test('expired dispatched Codex deadlines grant one useful advancement across short sources and roots', () => {
   const files = Array.from({ length: 4 }, (_, index) => {
     const records = turnWithToolCalls(1);
@@ -16958,6 +17079,7 @@ test('expired dispatched Codex deadlines grant one useful advancement across sho
   ];
   const completed: string[] = [];
   const allowance = 8 * 1024 * 1024;
+  let advancements = 0;
   const read = (file: string, budget: { bytes: number; deadline: number }) =>
     readCodexDispatchedSpendQuantum(
       file,
@@ -16966,6 +17088,9 @@ test('expired dispatched Codex deadlines grant one useful advancement across sho
       budget,
       () => {},
       (file) => completed.push(file),
+      (event) => {
+        if (event === 'dispatchSpendParserAdvancements') advancements++;
+      },
     );
   const clock = vi.spyOn(performance, 'now').mockReturnValue(100);
   retainCodexDispatchSpendRoots(new Set());
@@ -16973,6 +17098,7 @@ test('expired dispatched Codex deadlines grant one useful advancement across sho
     const first = { bytes: allowance, deadline: 0 };
     assert.equal(read(files[0], first).pending, true);
     assert.deepEqual(completed, [files[0]]);
+    assert.equal(advancements, 2, 'source reading and finalization each advance the parser');
     assert.equal(first.bytes, allowance - fs.statSync(files[0]).size);
     const second = { bytes: allowance, deadline: 0 };
     const result = read(files[0], second);

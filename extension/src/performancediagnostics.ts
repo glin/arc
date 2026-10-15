@@ -136,6 +136,13 @@ const DISCOVERY_CHARGE_FIELDS: { readonly [K in keyof DiscoveryCharges]: true } 
   dispatchSpendFiles: true,
   dispatchSpendBytes: true,
   dispatchSpendMs: true,
+  dispatchSpendAggregateStarts: true,
+  dispatchSpendAggregateCompletions: true,
+  dispatchSpendRelationshipInvalidations: true,
+  dispatchSpendConsumedSourceInvalidations: true,
+  dispatchSpendSourceRestarts: true,
+  dispatchSpendParserAdvancements: true,
+  dispatchSpendRootWaits: true,
 };
 const DISCOVERY_CHARGE_KEYS = Object.keys(DISCOVERY_CHARGE_FIELDS) as (keyof DiscoveryCharges)[];
 
@@ -160,6 +167,13 @@ export class PanelPerformanceCounters {
     dispatchSpendFiles: 0,
     dispatchSpendBytes: 0,
     dispatchSpendMs: 0,
+    dispatchSpendAggregateStarts: 0,
+    dispatchSpendAggregateCompletions: 0,
+    dispatchSpendRelationshipInvalidations: 0,
+    dispatchSpendConsumedSourceInvalidations: 0,
+    dispatchSpendSourceRestarts: 0,
+    dispatchSpendParserAdvancements: 0,
+    dispatchSpendRootWaits: 0,
     continuations: 0,
     publications: 0,
   };

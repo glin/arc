@@ -397,6 +397,13 @@ async function execute(
       dispatchSpendFiles: 0,
       dispatchSpendBytes: 0,
       dispatchSpendMs: 0,
+      dispatchSpendAggregateStarts: 0,
+      dispatchSpendAggregateCompletions: 0,
+      dispatchSpendRelationshipInvalidations: 0,
+      dispatchSpendConsumedSourceInvalidations: 0,
+      dispatchSpendSourceRestarts: 0,
+      dispatchSpendParserAdvancements: 0,
+      dispatchSpendRootWaits: 0,
     };
     // A parent check is one stat of a candidate source, so it reads no bytes.
     const parentCheck = <T>(check: () => T): T => {
@@ -944,6 +951,7 @@ async function execute(
                     codexDependencies = files;
                   },
                   (file, entry) => parentPort?.postMessage({ dispatchSpend: [file, entry] }),
+                  (event) => charges[event]++,
                 );
                 spendPending = result.pending;
                 continuation ||= result.pending;

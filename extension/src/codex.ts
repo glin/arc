@@ -4863,6 +4863,15 @@ function discardDispatchAggregate(): void {
   pendingDispatchAggregate = null;
 }
 
+export type CodexDispatchSpendProgress =
+  | 'dispatchSpendAggregateStarts'
+  | 'dispatchSpendAggregateCompletions'
+  | 'dispatchSpendRelationshipInvalidations'
+  | 'dispatchSpendConsumedSourceInvalidations'
+  | 'dispatchSpendSourceRestarts'
+  | 'dispatchSpendParserAdvancements'
+  | 'dispatchSpendRootWaits';
+
 export function readCodexDispatchedSpendQuantum(
   file: string,
   children: readonly CodexSubagentFile[],
@@ -4870,18 +4879,26 @@ export function readCodexDispatchedSpendQuantum(
   budget: { bytes: number; deadline: number; advanced?: boolean },
   dependencies: (files: string[]) => void,
   completed: (file: string, entry: CodexDispatchSpendEntry) => void,
+  progress?: (event: CodexDispatchSpendProgress) => void,
 ): { spend: AgentSpend; pending: boolean } {
   const index = codexSpendIndex(children);
-  if (
-    pendingDispatchAggregate?.root === file &&
-    (pendingDispatchAggregate.relationships !== index.relationshipVersion ||
-      [...pendingDispatchAggregate.revisions].some(([source, entry]) => !compatibleDispatchSpend(source, entry, now)))
-  )
-    discardDispatchAggregate();
+  if (pendingDispatchAggregate?.root === file) {
+    if (pendingDispatchAggregate.relationships !== index.relationshipVersion) {
+      progress?.('dispatchSpendRelationshipInvalidations');
+      discardDispatchAggregate();
+    } else if (
+      [...pendingDispatchAggregate.revisions].some(([source, entry]) => !compatibleDispatchSpend(source, entry, now))
+    ) {
+      progress?.('dispatchSpendConsumedSourceInvalidations');
+      discardDispatchAggregate();
+    }
+  }
   if (pendingDispatchAggregate && pendingDispatchAggregate.root !== file) {
+    progress?.('dispatchSpendRootWaits');
     return { spend: { models: [], found: false, partial: true, effort: null }, pending: true };
   }
   if (!pendingDispatchAggregate) {
+    progress?.('dispatchSpendAggregateStarts');
     const scan = codexDispatchedSpendScan(file, index);
     pendingDispatchAggregate = {
       root: file,
@@ -4903,20 +4920,26 @@ export function readCodexDispatchedSpendQuantum(
       parsed = held.value;
     } else {
       if (pendingDispatchSpend && (pendingDispatchSpend.file !== source || pendingDispatchSpend.key !== key)) {
+        if (pendingDispatchSpend.file === source) progress?.('dispatchSpendSourceRestarts');
         pendingDispatchSpend.scan.return(undefined as never);
         pendingDispatchSpend = null;
       }
       pendingDispatchSpend ??= { root: file, file: source, key, scan: readCodexOwnSpendIncremental(source) };
       let next = pendingDispatchSpend.scan.next();
+      progress?.('dispatchSpendParserAdvancements');
       budget.advanced = true;
       if (!next.done) {
         budget.bytes -= next.value.bytes;
         if (!next.value.end) continue;
         next = pendingDispatchSpend.scan.next();
+        progress?.('dispatchSpendParserAdvancements');
         if (!next.done) break;
       }
       pendingDispatchSpend = null;
-      if (dispatchSpendKey(source) !== key) break;
+      if (dispatchSpendKey(source) !== key) {
+        progress?.('dispatchSpendSourceRestarts');
+        break;
+      }
       parsed = next.value;
       const entry = { key, ...(band ? { band } : {}), value: parsed };
       retainCodexDispatchSpend(source, entry);
@@ -4933,6 +4956,7 @@ export function readCodexDispatchedSpendQuantum(
   }
   dependencies([...aggregate.revisions.keys(), ...(!aggregate.next.done ? [aggregate.next.value] : [])]);
   if (aggregate.next.done) {
+    progress?.('dispatchSpendAggregateCompletions');
     const spend = aggregate.next.value;
     pendingDispatchAggregate = null;
     return { spend, pending: false };

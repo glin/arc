@@ -432,6 +432,13 @@ test('unfinished startup keeps fresh durable work after the pending deadline wit
     dispatchSpendFiles: 0,
     dispatchSpendBytes: 0,
     dispatchSpendMs: 0,
+    dispatchSpendAggregateStarts: 0,
+    dispatchSpendAggregateCompletions: 0,
+    dispatchSpendRelationshipInvalidations: 0,
+    dispatchSpendConsumedSourceInvalidations: 0,
+    dispatchSpendSourceRestarts: 0,
+    dispatchSpendParserAdvancements: 0,
+    dispatchSpendRootWaits: 0,
     continuations: 0,
     publications: 0,
   };
@@ -458,6 +465,22 @@ test('unfinished startup keeps fresh durable work after the pending deadline wit
         },
       },
       discovery: { ...discovery, readBytes },
+      discoveryObservation: {
+        hostRequest: 7,
+        generation: 2,
+        sequence: 3,
+        ageSinceReceiptMs: 0,
+        charges: {
+          ...discovery,
+          dispatchSpendAggregateStarts: 1,
+          dispatchSpendAggregateCompletions: 2,
+          dispatchSpendRelationshipInvalidations: 3,
+          dispatchSpendConsumedSourceInvalidations: 4,
+          dispatchSpendSourceRestarts: 5,
+          dispatchSpendParserAdvancements: 6,
+          dispatchSpendRootWaits: 7,
+        },
+      },
       generation: 2,
       discoveryPending: true,
       loadingFailed: false,
@@ -481,6 +504,28 @@ test('unfinished startup keeps fresh durable work after the pending deadline wit
     const record = JSON.parse(fs.readFileSync(health.file, 'utf8'));
     assert.equal(record.elapsedMs, 180_000);
     assert.equal(record.work.discovery.readBytes, 65_536);
+    assert.deepEqual(
+      Object.entries(record.work.discoveryObservation.charges).filter(
+        ([key]) =>
+          key.startsWith('dispatchSpend') &&
+          ![
+            'dispatchSpendVisits',
+            'dispatchSpendRereads',
+            'dispatchSpendFiles',
+            'dispatchSpendBytes',
+            'dispatchSpendMs',
+          ].includes(key),
+      ),
+      [
+        ['dispatchSpendAggregateStarts', 1],
+        ['dispatchSpendAggregateCompletions', 2],
+        ['dispatchSpendRelationshipInvalidations', 3],
+        ['dispatchSpendConsumedSourceInvalidations', 4],
+        ['dispatchSpendSourceRestarts', 5],
+        ['dispatchSpendParserAdvancements', 6],
+        ['dispatchSpendRootWaits', 7],
+      ],
+    );
     assert.equal(record.work.worker.active[0].ageMs, 180_000);
     assert.equal(record.work.worker.active[0].kind, 'claude-children');
     assert.equal(record.work.discoveryPending, true);
