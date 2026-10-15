@@ -9284,7 +9284,7 @@ test('rejected dispatch terminals keep whole spend unread until quiet and source
       .map((r) => JSON.stringify(r) + '\n')
       .join(''),
   );
-  const declaration = source.indexOf('function readCodexDispatchedSpend(');
+  const declaration = source.indexOf('function readCodexDispatchedSpendQuantum(');
   assert.ok(declaration >= 0);
   const body = source.indexOf('{', declaration);
   const instrumented =
@@ -10117,3 +10117,114 @@ test.each(['claude', 'codex'] as const)(
     }
   },
 );
+
+test('discovery publishes bounded delegated spend and reuses completed sources after worker replacement', async () => {
+  const directory = tempDir('bounded-dispatch-spend-');
+  const id = 'aaaaaaaa-1111-1111-1111-111111111111';
+  const nestedId = 'bbbbbbbb-1111-1111-1111-111111111111';
+  const parentFile = path.join(directory, 'parent.jsonl');
+  const childFile = path.join(directory, id + '.jsonl');
+  const nestedFile = path.join(directory, nestedId + '.jsonl');
+  fs.writeFileSync(
+    parentFile,
+    claudeDispatchTranscript(
+      'python child.py --arc-dispatch',
+      `ARC_DISPATCH_SESSION={"agent":"codex","session_id":"${id}","owned":true}`,
+    )
+      .map((record) => JSON.stringify(record) + '\n')
+      .join(''),
+  );
+  const write = (file: string, sessionId: string, parentThreadId?: string) => {
+    const record = (type: string, payload: object) => JSON.stringify({ type, timestamp: timestamp(1), payload }) + '\n';
+    fs.writeFileSync(
+      file,
+      record('session_meta', {
+        id: sessionId,
+        cwd: directory,
+        source: 'exec',
+        ...(parentThreadId ? { parent_thread_id: parentThreadId } : {}),
+      }) +
+        record('event_msg', { type: 'task_started', turn_id: 'work' }) +
+        record('turn_context', { turn_id: 'work', model: 'gpt-6.1-sol' }) +
+        record('event_msg', { type: 'user_message', message: 'work' }) +
+        Array.from({ length: 48 }, () => record('ignored', { text: 'x'.repeat(65500) })).join('') +
+        record('event_msg', {
+          type: 'token_count',
+          info: {
+            last_token_usage: { input_tokens: 10, output_tokens: 3, total_tokens: 13 },
+            total_token_usage: { input_tokens: 10, output_tokens: 3, total_tokens: 13 },
+          },
+        }) +
+        record('event_msg', { type: 'task_complete', turn_id: 'work' }),
+    );
+  };
+  write(childFile, id);
+  write(nestedFile, nestedId, id);
+  const session = (file: string, sessionId: string, agent: 'claude' | 'codex') => ({
+    file,
+    sessionId,
+    agent,
+    ...revisionOf(fs.statSync(file, { bigint: true })),
+  });
+  const children = [
+    {
+      file: nestedFile,
+      threadId: nestedId,
+      parentThreadId: id,
+      agentPath: null,
+      openedAt: null,
+      startedAt: null,
+      threadSource: null,
+      backgroundReview: false,
+    },
+  ];
+  const request = () => ({
+    kind: 'claude-children' as const,
+    parents: [session(parentFile, 'parent', 'claude')],
+    catalog: [session(parentFile, 'parent', 'claude'), session(childFile, id, 'codex')],
+    codexChildren: children,
+    repositoryRoots: [directory],
+  });
+  // The clock makes each quantum deterministic while the reader still parses real fixture bytes.
+  const worker = new ProgressiveWorker(
+    source +
+      '\nlet quantumClock = 0; performance.now = () => ++quantumClock; Date.now = () => ' +
+      (Date.now() + 7_200_000) +
+      ';',
+  );
+  let replaced = false;
+  let total = 0;
+  let firstBytes = 0;
+  try {
+    let complete = false;
+    for (let attempt = 0; attempt < 100 && !complete; attempt++) {
+      const result = await worker.run(request(), attempt, new AbortController().signal);
+      assert.ok(result?.value.kind === 'claude-children');
+      assert.equal(result.value.complete, true, 'qualified relationships waited for complete cost figures');
+      assert.ok(result.value.references.some((reference) => reference.sessionId === id));
+      const bytes = result.value.charges!.dispatchSpendBytes;
+      total += bytes;
+      if (!attempt) firstBytes = bytes;
+      assert.ok(bytes <= 2 * 1024 * 1024, `one discovery request read ${bytes} delegated spend bytes`);
+      if (!replaced && (worker as any).dispatchSpends.has(childFile)) {
+        assert.equal(result.value.dispatchFacts[0].spend.partial, true);
+        worker.stop();
+        replaced = true;
+      }
+      complete = !result.value.continuation;
+      if (complete) {
+        assert.equal(result.value.dispatchFacts[0].spend.found, true);
+        assert.equal(result.value.dispatchFacts[0].spend.models[0].usage.output, 6);
+      }
+    }
+    assert.equal(replaced, true, 'the fixture never replaced a worker with completed reusable work');
+    assert.equal(complete, true, 'finite delegated work never completed across repeated refreshes');
+    assert.ok(
+      total < 4 * (fs.statSync(childFile).size + fs.statSync(nestedFile).size),
+      `completed work was reread: ${total}, first ${firstBytes}`,
+    );
+  } finally {
+    worker.stop();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});

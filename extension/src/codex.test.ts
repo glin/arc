@@ -95,6 +95,8 @@ import {
   codexAgentSpendVersion,
   codexSpendIndex,
   readCodexDispatchedSpend,
+  readCodexDispatchedSpendQuantum,
+  retainCodexDispatchSpendRoots,
   scanForCodexPerson,
   readCodexSession,
   readCodexOpening,
@@ -16876,4 +16878,114 @@ test('failed Codex stat reads retain the held revision until enumeration proves 
   for (const missing of staleMetas(stats.keys(), [], { status: 'complete', files: [], uncertain: [] }))
     stats.delete(missing);
   assert.deepEqual([...stats.keys()], []);
+});
+
+test('finite dispatched Codex totals complete beyond the reusable source cache after a consumed source changes', () => {
+  const files = Array.from({ length: 205 }, (_, index) => {
+    const records = turnWithToolCalls(1);
+    (records[0] as any).payload.id = `aggregate-${index}`;
+    if (index) (records[0] as any).payload.parent_thread_id = 'aggregate-0';
+    records.splice(4, 0, { type: 'ignored', payload: { text: 'x'.repeat(65500) } });
+    return writeRollout(records);
+  });
+  const children: CodexSubagentFile[] = files.slice(1).map((file, offset) => ({
+    file,
+    threadId: `aggregate-${offset + 1}`,
+    parentThreadId: 'aggregate-0',
+    agentPath: null,
+    openedAt: null,
+    startedAt: null,
+    threadSource: null,
+    backgroundReview: false,
+  }));
+  const now = Date.UTC(2030, 0, 1);
+  const completed: string[] = [];
+  const dependencies: string[][] = [];
+  const quantum = () =>
+    readCodexDispatchedSpendQuantum(
+      files[0],
+      children,
+      now,
+      { bytes: 65536, deadline: Infinity },
+      (files) => dependencies.push(files),
+      (file) => completed.push(file),
+    );
+  retainCodexDispatchSpendRoots(new Set());
+  try {
+    for (let attempt = 0; attempt < 4 && !completed.includes(files[0]); attempt++) {
+      assert.equal(quantum().pending, true);
+    }
+    assert.ok(completed.includes(files[0]), 'the first source did not advance');
+    const original = fs.readFileSync(files[0], 'utf8');
+    // Same-size rewriting must retract the consumed source's old contribution.
+    fs.writeFileSync(files[0], original.replace('"output_tokens":50', '"output_tokens":90'));
+    const stat = fs.statSync(files[0]);
+    fs.utimesSync(files[0], stat.atime, new Date(Date.UTC(2029, 0, 1)));
+    let result = quantum();
+    let attempts = 1;
+    while (result.pending && attempts++ < 850) result = quantum();
+    assert.equal(result.pending, false, 'finite aggregate cycled after its reusable cache filled');
+    assert.equal(result.spend.models[0].usage.output, 204 * 50 + 90);
+    assert.equal(result.spend.artifacts?.turnCount, 205);
+    assert.equal(result.spend.toolUses, 205);
+    assert.equal(result.spend.partial, false);
+    assert.equal(new Set(dependencies.at(-1)).size, 205);
+    assert.equal(completed.filter((file) => file === files[0]).length, 2);
+    assert.ok(completed.length <= 206, 'completed prefix sources were parsed repeatedly');
+  } finally {
+    retainCodexDispatchSpendRoots(new Set());
+  }
+});
+
+test('expired dispatched Codex deadlines grant one useful advancement across short sources and roots', () => {
+  const files = Array.from({ length: 4 }, (_, index) => {
+    const records = turnWithToolCalls(1);
+    (records[0] as any).payload.id = `short-${index}`;
+    if (index === 1) (records[0] as any).payload.parent_thread_id = 'short-0';
+    return writeRollout(records);
+  });
+  const children: CodexSubagentFile[] = [
+    {
+      file: files[1],
+      threadId: 'short-1',
+      parentThreadId: 'short-0',
+      agentPath: null,
+      openedAt: null,
+      startedAt: null,
+      threadSource: null,
+      backgroundReview: false,
+    },
+  ];
+  const completed: string[] = [];
+  const allowance = 8 * 1024 * 1024;
+  const read = (file: string, budget: { bytes: number; deadline: number }) =>
+    readCodexDispatchedSpendQuantum(
+      file,
+      children,
+      Date.UTC(2030, 0, 1),
+      budget,
+      () => {},
+      (file) => completed.push(file),
+    );
+  const clock = vi.spyOn(performance, 'now').mockReturnValue(100);
+  retainCodexDispatchSpendRoots(new Set());
+  try {
+    const first = { bytes: allowance, deadline: 0 };
+    assert.equal(read(files[0], first).pending, true);
+    assert.deepEqual(completed, [files[0]]);
+    assert.equal(first.bytes, allowance - fs.statSync(files[0]).size);
+    const second = { bytes: allowance, deadline: 0 };
+    const result = read(files[0], second);
+    assert.equal(result.pending, false);
+    assert.equal(result.spend.models[0].usage.output, 100);
+    assert.equal(second.bytes, allowance - fs.statSync(files[1]).size);
+    assert.equal(read(files[2], second).pending, true);
+    assert.deepEqual(completed, files.slice(0, 2));
+    const third = { bytes: allowance, deadline: 0 };
+    assert.equal(read(files[2], third).pending, false);
+    assert.equal(third.bytes, allowance - fs.statSync(files[2]).size);
+  } finally {
+    clock.mockRestore();
+    retainCodexDispatchSpendRoots(new Set());
+  }
 });

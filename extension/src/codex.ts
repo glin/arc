@@ -86,7 +86,7 @@ import {
   addUsage,
   emptyUsage,
   spendFileVersion,
-  scanLines,
+  scanLinesIncremental,
 } from './agentspend';
 import {
   childToolCalls,
@@ -4052,14 +4052,23 @@ function parsedFinalAnswer(
 }
 
 // Read a child rollout's billed requests, grouped by turn. Model settings and token events can arrive in either order.
-function readCodexOwnSpend(file: string): {
+type CodexOwnSpend = {
   spend: AgentSpend;
   facts: Pick<AgentSpend, 'startedAt' | 'endedAt' | 'toolUses' | 'commits' | 'commitIntents' | 'person'>;
   meta: CodexSessionMeta | null;
   launches: TurnAgent[];
   finished: boolean;
   complete: boolean;
-} {
+};
+
+function readCodexOwnSpend(file: string): CodexOwnSpend {
+  const scan = readCodexOwnSpendIncremental(file);
+  let next = scan.next();
+  while (!next.done) next = scan.next();
+  return next.value;
+}
+
+function* readCodexOwnSpendIncremental(file: string): Generator<{ bytes: number; end: boolean }, CodexOwnSpend> {
   const meta = readCodexSessionMeta(file);
   const provider = meta?.modelProvider ?? null;
   const usageState = emptyCodexUsageReducerState(
@@ -4096,7 +4105,7 @@ function readCodexOwnSpend(file: string): {
     { maxTurns: Number.MAX_SAFE_INTEGER },
     meta,
   );
-  const found = scanLines(file, (line) => {
+  const found = yield* scanLinesIncremental(file, (line) => {
     child.pushLine(line);
     const personRecord = parseRecord(line);
     if (personRecord) codexPersonRecord(personScan, personRecord);
@@ -4415,9 +4424,30 @@ export function codexAgentSpendVersion(
 export function codexAgentSpendReader(
   index: CodexSpendIndex,
   loadOwn = readCodexOwnSpend,
-  visitOwn?: (file: string, parsed: ReturnType<typeof readCodexOwnSpend>) => void,
+  visitOwn?: (file: string, parsed: CodexOwnSpend) => void,
 ): (file: string) => AgentSpend {
-  const own = new Map<string, ReturnType<typeof readCodexOwnSpend>>();
+  const own = new Map<string, CodexOwnSpend>();
+  return (file) => {
+    const scan = codexAgentSpendScan(file, index, visitOwn);
+    let next = scan.next();
+    while (!next.done) {
+      const key = index.sourceKey(next.value);
+      let parsed = own.get(key);
+      if (!parsed) {
+        parsed = loadOwn(next.value);
+        own.set(key, parsed);
+      }
+      next = scan.next(parsed);
+    }
+    return next.value;
+  };
+}
+
+function* codexAgentSpendScan(
+  file: string,
+  index: CodexSpendIndex,
+  visitOwn?: (file: string, parsed: CodexOwnSpend) => void,
+): Generator<string, AgentSpend, CodexOwnSpend> {
   const identity = (value: ModelSpend) =>
     JSON.stringify([
       value.model,
@@ -4426,99 +4456,93 @@ export function codexAgentSpendReader(
       value.costBasis ?? null,
       [...new Set(value.usageParts?.map((usage) => usage.linkedInvocationId ?? null) ?? [])].sort(),
     ]);
-  return (file) => {
-    const visited = new Set<string>();
-    const active = new Set<string>();
-    const ancestors = new Set<string>();
-    const read = (source: string, edge?: CodexSubagentFile): AgentSpend => {
-      const key = index.sourceKey(source);
-      if (visited.has(key)) return { models: [], found: true, partial: active.has(key), effort: null };
-      visited.add(key);
-      active.add(key);
-      let parsed = own.get(key);
-      if (!parsed) {
-        parsed = loadOwn(source);
-        own.set(key, parsed);
-      }
-      const ownership = edge ?? index.entryOf(source);
-      if (
-        (index.contains(source) && !ownership) ||
-        (ownership &&
-          (!index.verified(ownership) ||
-            (parsed.meta &&
-              (parsed.meta.sessionId !== ownership.threadId ||
-                (parsed.meta.parentThreadId !== null && parsed.meta.parentThreadId !== ownership.parentThreadId)))))
-      ) {
-        active.delete(key);
-        return { models: [], found: false, partial: true, effort: null };
-      }
-      visitOwn?.(source, parsed);
-      const result = structuredClone(parsed.spend);
-      if (parsed.spend.found && parsed.facts.commits?.length) {
-        result.commits = parsed.facts.commits.map((commit) => ({ ...commit }));
-      }
-      if (parsed.spend.found && parsed.facts.commitIntents?.length) {
-        result.commitIntents = parsed.facts.commitIntents.map((intent) => ({ ...intent }));
-      }
-      if (!ownership && !parsed.meta && !result.found) {
-        active.delete(key);
-        return result;
-      }
-      result.partial ||=
-        !result.found ||
-        !parsed.meta ||
-        !parsed.complete ||
-        !parsed.finished ||
-        (!!ownership && parsed.meta?.parentThreadId === null);
-      const parent = ownership?.threadId ?? parsed.meta?.sessionId;
-      if (!edge && parsed.meta?.parentThreadId) ancestors.add(parsed.meta.parentThreadId);
-      const children = [...(parent ? index.direct(parent) : [])];
-      for (const launch of parsed.launches) {
-        const resolved = parent
-          ? index.resolve(parent, {
-              id: launch.id,
-              name: launch.description,
-              path: launch.agentType,
-              status: launch.status,
-            })
-          : null;
-        if (!resolved) result.partial = true;
-        else {
-          children.push(resolved);
-          if (resolved.parentThreadId !== parent) result.partial = true;
-        }
-      }
-      for (const child of children) {
-        if (ancestors.has(child.threadId)) {
-          result.partial = true;
-          continue;
-        }
-        if (!index.verified(child)) {
-          result.partial = true;
-          continue;
-        }
-        const nested = read(child.file, child);
-        result.partial ||= !nested.found || nested.partial;
-        result.found ||= nested.found;
-        result.usageIncomplete ||= nested.usageIncomplete;
-        for (const part of nested.models) {
-          const held = result.models.find((value) => identity(value) === identity(part));
-          if (!held) result.models.push(part);
-          else {
-            addUsage(held.usage, part.usage);
-            if (part.recordedCost !== undefined) held.recordedCost = (held.recordedCost ?? 0) + part.recordedCost;
-            if (part.unclassifiedCacheWrite !== undefined)
-              held.unclassifiedCacheWrite = (held.unclassifiedCacheWrite ?? 0) + part.unclassifiedCacheWrite;
-            if (part.usageParts) (held.usageParts ??= []).push(...part.usageParts);
-          }
-        }
-      }
-      if (!result.usageIncomplete) delete result.usageIncomplete;
+  const visited = new Set<string>();
+  const active = new Set<string>();
+  const ancestors = new Set<string>();
+  const read = function* (source: string, edge?: CodexSubagentFile): Generator<string, AgentSpend, CodexOwnSpend> {
+    const key = index.sourceKey(source);
+    if (visited.has(key)) return { models: [], found: true, partial: active.has(key), effort: null };
+    visited.add(key);
+    active.add(key);
+    const parsed = yield source;
+    const ownership = edge ?? index.entryOf(source);
+    if (
+      (index.contains(source) && !ownership) ||
+      (ownership &&
+        (!index.verified(ownership) ||
+          (parsed.meta &&
+            (parsed.meta.sessionId !== ownership.threadId ||
+              (parsed.meta.parentThreadId !== null && parsed.meta.parentThreadId !== ownership.parentThreadId)))))
+    ) {
+      active.delete(key);
+      return { models: [], found: false, partial: true, effort: null };
+    }
+    visitOwn?.(source, parsed);
+    const result = structuredClone(parsed.spend);
+    if (parsed.spend.found && parsed.facts.commits?.length) {
+      result.commits = parsed.facts.commits.map((commit) => ({ ...commit }));
+    }
+    if (parsed.spend.found && parsed.facts.commitIntents?.length) {
+      result.commitIntents = parsed.facts.commitIntents.map((intent) => ({ ...intent }));
+    }
+    if (!ownership && !parsed.meta && !result.found) {
       active.delete(key);
       return result;
-    };
-    return read(file);
+    }
+    result.partial ||=
+      !result.found ||
+      !parsed.meta ||
+      !parsed.complete ||
+      !parsed.finished ||
+      (!!ownership && parsed.meta?.parentThreadId === null);
+    const parent = ownership?.threadId ?? parsed.meta?.sessionId;
+    if (!edge && parsed.meta?.parentThreadId) ancestors.add(parsed.meta.parentThreadId);
+    const children = [...(parent ? index.direct(parent) : [])];
+    for (const launch of parsed.launches) {
+      const resolved = parent
+        ? index.resolve(parent, {
+            id: launch.id,
+            name: launch.description,
+            path: launch.agentType,
+            status: launch.status,
+          })
+        : null;
+      if (!resolved) result.partial = true;
+      else {
+        children.push(resolved);
+        if (resolved.parentThreadId !== parent) result.partial = true;
+      }
+    }
+    for (const child of children) {
+      if (ancestors.has(child.threadId)) {
+        result.partial = true;
+        continue;
+      }
+      if (!index.verified(child)) {
+        result.partial = true;
+        continue;
+      }
+      const nested = yield* read(child.file, child);
+      result.partial ||= !nested.found || nested.partial;
+      result.found ||= nested.found;
+      result.usageIncomplete ||= nested.usageIncomplete;
+      for (const part of nested.models) {
+        const held = result.models.find((value) => identity(value) === identity(part));
+        if (!held) result.models.push(part);
+        else {
+          addUsage(held.usage, part.usage);
+          if (part.recordedCost !== undefined) held.recordedCost = (held.recordedCost ?? 0) + part.recordedCost;
+          if (part.unclassifiedCacheWrite !== undefined)
+            held.unclassifiedCacheWrite = (held.unclassifiedCacheWrite ?? 0) + part.unclassifiedCacheWrite;
+          if (part.usageParts) (held.usageParts ??= []).push(...part.usageParts);
+        }
+      }
+    }
+    if (!result.usageIncomplete) delete result.usageIncomplete;
+    active.delete(key);
+    return result;
   };
+  return yield* read(file);
 }
 
 export function readCodexAgentSpend(file: string, children: readonly CodexSubagentFile[] = []): AgentSpend {
@@ -4776,45 +4800,203 @@ export function scanForCodexPerson(
   return scan;
 }
 
-const codexDispatchOwnSpends = new Map<string, { key: string; value: ReturnType<typeof readCodexOwnSpend> }>();
+export interface CodexDispatchSpendEntry {
+  key: string;
+  band?: string;
+  value: CodexOwnSpend;
+}
+
+const codexDispatchOwnSpends = new Map<string, CodexDispatchSpendEntry>();
+const CODEX_DISPATCH_CACHE_BYTES = 32 * 1024 * 1024;
+const codexDispatchCharges = new Map<string, number>();
+let codexDispatchCacheBytes = 0;
+let pendingDispatchSpend: {
+  root: string;
+  file: string;
+  key: string;
+  scan: Generator<{ bytes: number; end: boolean }, CodexOwnSpend>;
+} | null = null;
+
+function dispatchSpendKey(file: string): string {
+  try {
+    const stat = fs.statSync(file, { bigint: true });
+    return [stat.dev, stat.ino, stat.size, stat.mtimeNs, stat.ctimeNs].join(':');
+  } catch {
+    return 'missing';
+  }
+}
+
+export function retainCodexDispatchSpend(file: string, entry: CodexDispatchSpendEntry): void {
+  const bytes = Buffer.byteLength(JSON.stringify(entry));
+  codexDispatchCacheBytes -= codexDispatchCharges.get(file) ?? 0;
+  codexDispatchOwnSpends.delete(file);
+  codexDispatchCharges.delete(file);
+  if (bytes > CODEX_DISPATCH_CACHE_BYTES) return;
+  codexDispatchOwnSpends.set(file, entry);
+  codexDispatchCharges.set(file, bytes);
+  codexDispatchCacheBytes += bytes;
+  while (codexDispatchCacheBytes > CODEX_DISPATCH_CACHE_BYTES || codexDispatchOwnSpends.size > 200) {
+    const oldest = codexDispatchOwnSpends.keys().next().value!;
+    codexDispatchCacheBytes -= codexDispatchCharges.get(oldest)!;
+    codexDispatchCharges.delete(oldest);
+    codexDispatchOwnSpends.delete(oldest);
+  }
+}
+
+export function retainCodexDispatchSpendRoots(files: ReadonlySet<string>): void {
+  if (pendingDispatchAggregate && !files.has(pendingDispatchAggregate.root)) discardDispatchAggregate();
+}
+
+// One aggregate retains its traversal independently of reusable source-cache eviction.
+let pendingDispatchAggregate: {
+  root: string;
+  relationships: string | null;
+  revisions: Map<string, Pick<CodexDispatchSpendEntry, 'key' | 'band'> & { value: Pick<CodexOwnSpend, 'finished'> }>;
+  scan: Generator<string, AgentSpend, CodexOwnSpend>;
+  next: IteratorResult<string, AgentSpend>;
+} | null = null;
+
+function discardDispatchAggregate(): void {
+  pendingDispatchSpend?.scan.return(undefined as never);
+  pendingDispatchSpend = null;
+  pendingDispatchAggregate?.scan.return(undefined as never);
+  pendingDispatchAggregate = null;
+}
+
+export function readCodexDispatchedSpendQuantum(
+  file: string,
+  children: readonly CodexSubagentFile[],
+  now: number,
+  budget: { bytes: number; deadline: number; advanced?: boolean },
+  dependencies: (files: string[]) => void,
+  completed: (file: string, entry: CodexDispatchSpendEntry) => void,
+): { spend: AgentSpend; pending: boolean } {
+  const index = codexSpendIndex(children);
+  if (
+    pendingDispatchAggregate?.root === file &&
+    (pendingDispatchAggregate.relationships !== index.relationshipVersion ||
+      [...pendingDispatchAggregate.revisions].some(([source, entry]) => !compatibleDispatchSpend(source, entry, now)))
+  )
+    discardDispatchAggregate();
+  if (pendingDispatchAggregate && pendingDispatchAggregate.root !== file) {
+    return { spend: { models: [], found: false, partial: true, effort: null }, pending: true };
+  }
+  if (!pendingDispatchAggregate) {
+    const scan = codexDispatchedSpendScan(file, index);
+    pendingDispatchAggregate = {
+      root: file,
+      relationships: index.relationshipVersion,
+      revisions: new Map(),
+      scan,
+      next: scan.next(),
+    };
+  }
+  const aggregate = pendingDispatchAggregate;
+  while (!aggregate.next.done && budget.bytes > 0 && (!budget.advanced || performance.now() < budget.deadline)) {
+    const source = aggregate.next.value;
+    const key = dispatchSpendKey(source);
+    const band = openSpendBand(spendFileVersion(source), now);
+    const held = codexDispatchOwnSpends.get(source);
+    let parsed: CodexOwnSpend;
+    const reusable = held && compatibleDispatchSpend(source, held, now);
+    if (reusable) {
+      parsed = held.value;
+    } else {
+      if (pendingDispatchSpend && (pendingDispatchSpend.file !== source || pendingDispatchSpend.key !== key)) {
+        pendingDispatchSpend.scan.return(undefined as never);
+        pendingDispatchSpend = null;
+      }
+      pendingDispatchSpend ??= { root: file, file: source, key, scan: readCodexOwnSpendIncremental(source) };
+      let next = pendingDispatchSpend.scan.next();
+      budget.advanced = true;
+      if (!next.done) {
+        budget.bytes -= next.value.bytes;
+        if (!next.value.end) continue;
+        next = pendingDispatchSpend.scan.next();
+        if (!next.done) break;
+      }
+      pendingDispatchSpend = null;
+      if (dispatchSpendKey(source) !== key) break;
+      parsed = next.value;
+      const entry = { key, ...(band ? { band } : {}), value: parsed };
+      retainCodexDispatchSpend(source, entry);
+      completed(source, entry);
+    }
+    // Revision evidence retains no parsed source payload after its contribution enters the fold.
+    aggregate.revisions.set(source, {
+      key: reusable ? held.key : key,
+      ...((reusable ? held.band : band) ? { band: reusable ? held.band : band! } : {}),
+      value: { finished: parsed.finished },
+    });
+    budget.advanced = true;
+    aggregate.next = aggregate.scan.next(parsed);
+  }
+  dependencies([...aggregate.revisions.keys(), ...(!aggregate.next.done ? [aggregate.next.value] : [])]);
+  if (aggregate.next.done) {
+    const spend = aggregate.next.value;
+    pendingDispatchAggregate = null;
+    return { spend, pending: false };
+  }
+  return { spend: { models: [], found: false, partial: true, effort: null }, pending: true };
+}
+
+function compatibleDispatchSpend(
+  source: string,
+  held: Pick<CodexDispatchSpendEntry, 'key' | 'band'> & { value: Pick<CodexOwnSpend, 'finished'> },
+  now: number,
+): boolean {
+  const key = dispatchSpendKey(source);
+  const band = openSpendBand(spendFileVersion(source), now);
+  const grew =
+    key.split(':').slice(0, 2).join(':') === held.key.split(':').slice(0, 2).join(':') &&
+    BigInt(key.split(':')[2] ?? 0) > BigInt(held.key.split(':')[2] ?? 0);
+  return held.key === key || (!!band && grew && held.band === band && !held.value.finished);
+}
 
 export function readCodexDispatchedSpend(
   files: readonly string[],
   children: readonly CodexSubagentFile[] = [],
   now = Date.now(),
   dependencies?: (files: string[]) => void,
+  load?: (file: string) => CodexOwnSpend,
 ): AgentSpend {
-  const index = codexSpendIndex(children);
-  const unique = [...new Map(files.map((file) => [index.sourceKey(file), file])).values()];
-  const visitedFiles: string[] = [];
   const loadOwn = (file: string) => {
-    visitedFiles.push(file);
-    const version = spendFileVersion(file);
-    const band = openSpendBand(version, now);
-    const key = band === null ? version : `open:${band}`;
-    const canonical = index.sourceKey(file);
-    let held = codexDispatchOwnSpends.get(canonical);
-    if (!held || held.key !== key) {
-      held = { key, value: readCodexOwnSpend(file) };
-      codexDispatchOwnSpends.delete(canonical);
-      codexDispatchOwnSpends.set(canonical, held);
-      while (codexDispatchOwnSpends.size > 200)
-        codexDispatchOwnSpends.delete(codexDispatchOwnSpends.keys().next().value!);
+    if (load) return load(file);
+    const key = dispatchSpendKey(file);
+    let held = codexDispatchOwnSpends.get(file);
+    const band = openSpendBand(spendFileVersion(file), now);
+    if (!held || (held.key !== key && !(band && held.band === band && !held.value.finished))) {
+      held = { key, ...(band ? { band } : {}), value: readCodexOwnSpend(file) };
+      retainCodexDispatchSpend(file, held);
     }
     return held.value;
   };
+  const scan = codexDispatchedSpendScan(files[0], codexSpendIndex(children));
+  const visitedFiles: string[] = [];
+  let next = scan.next();
+  while (!next.done) {
+    visitedFiles.push(next.value);
+    next = scan.next(loadOwn(next.value));
+  }
+  dependencies?.(visitedFiles);
+  return next.value;
+}
+
+function* codexDispatchedSpendScan(
+  file: string | undefined,
+  index: CodexSpendIndex,
+): Generator<string, AgentSpend, CodexOwnSpend> {
   const spends: AgentSpend[] = [];
   const verifiedFiles: string[] = [];
-  const aggregate = unique[0]
-    ? codexAgentSpendReader(index, loadOwn, (file, parsed) => {
+  const aggregate = file
+    ? yield* codexAgentSpendScan(file, index, (file, parsed) => {
         verifiedFiles.push(file);
-        const spend = { ...structuredClone(parsed.spend), ...parsed.facts };
+        const spend = { ...structuredClone({ ...parsed.spend, models: [] }), ...parsed.facts };
         spend.partial ||= !parsed.finished;
         if (spend.artifacts) spend.artifacts.complete &&= parsed.finished;
         spends.push(spend);
-      })(unique[0])
+      })
     : null;
-  dependencies?.(visitedFiles);
   const own = spends[0];
   if (!own) return aggregate ?? { models: [], found: false, partial: false, effort: null };
   const artifacts = own.artifacts

@@ -1,3 +1,4 @@
+import { claudeDispatchTranscript } from './turnfixtures';
 import { sessionCoverageMember, sessionPresence, reconcileSessionCollisions } from './sessioncoverage';
 import { sessionSourceKey, sessionPageSources } from './sessionreads';
 import { test, vi } from 'vitest';
@@ -11847,4 +11848,120 @@ test('native non-primary accounting owners publish before ancestors across delay
     ),
     200,
   );
+});
+
+test('finite delegated reads publish the startup catalog while repeated catalog deadlines and polls continue', async () => {
+  const directory = tempDir('startup-delegated-deadlines-');
+  const id = 'aaaaaaaa-1111-1111-1111-111111111111';
+  const parentFile = path.join(directory, 'parent.jsonl');
+  const childFile = path.join(directory, id + '.jsonl');
+  const record = (type: string, payload: object) =>
+    JSON.stringify({ type, timestamp: '2026-01-01T00:00:01Z', payload }) + '\n';
+  fs.writeFileSync(
+    parentFile,
+    claudeDispatchTranscript(
+      'python child.py --arc-dispatch',
+      `ARC_DISPATCH_SESSION={"agent":"codex","session_id":"${id}","owned":true}`,
+    )
+      .map((value) => JSON.stringify(value) + '\n')
+      .join(''),
+  );
+  fs.writeFileSync(
+    childFile,
+    record('session_meta', { id, cwd: directory, source: 'exec' }) +
+      record('event_msg', { type: 'task_started', turn_id: 'work' }) +
+      record('turn_context', { turn_id: 'work', model: 'gpt-6.1-sol' }) +
+      record('event_msg', { type: 'user_message', message: 'work' }) +
+      Array.from({ length: 64 }, () => record('ignored', { text: 'x'.repeat(65500) })).join('') +
+      record('event_msg', {
+        type: 'token_count',
+        info: {
+          last_token_usage: { input_tokens: 10, output_tokens: 3, total_tokens: 13 },
+          total_token_usage: { input_tokens: 10, output_tokens: 3, total_tokens: 13 },
+        },
+      }) +
+      record('event_msg', { type: 'task_complete', turn_id: 'work' }),
+  );
+  const session = (file: string, sessionId: string, agent: 'claude' | 'codex') => ({
+    file,
+    sessionId,
+    agent,
+    ...revisionOf(fs.statSync(file, { bigint: true })),
+    activity: 1,
+  });
+  const parent = session(parentFile, 'parent', 'claude'),
+    child = session(childFile, id, 'codex');
+  const { provider, claudeWalk, codexWalk } = bumpedCatalogHarness();
+  (claudeWalk as SessionFile[]).splice(0, claudeWalk.length, parent);
+  (codexWalk as SessionFile[]).splice(0, codexWalk.length, child);
+  Object.assign(provider, {
+    repositoryScopeRoots: [directory],
+    repositoryScope: { snapshot: () => ({ ready: true, roots: [directory], revision: 1 }) },
+    claudeChildReferenceEntries: new Map(),
+    checkpointDerivedCache() {},
+    showing: null,
+  });
+  const worker = titleWorker(
+    '\nlet quantumClock = 0; performance.now = () => ++quantumClock; Date.now = () => ' +
+      (Date.now() + 7_200_000) +
+      ';',
+  );
+  let reads = 0;
+  const delays: number[] = [];
+  provider.progressiveWorker = {
+    run: async (
+      request: ProgressiveRequest,
+      generation: number,
+      signal: AbortSignal,
+      progress: (result: ProgressiveResult) => void,
+    ) => {
+      const result = await worker.run(request, generation, signal, progress);
+      if (!result || result.value.kind !== 'claude-children') return result;
+      // A controlled slow disk charges one catalog deadline per two MiB. Finite whole reads exceed it.
+      const delay = (result.value.charges!.dispatchSpendBytes * CATALOG_REFRESH_DEADLINE_MS) / (2 * 1024 * 1024);
+      delays.push(delay);
+      reads++;
+      return new Promise<ProgressiveResult | null>((resolve) => {
+        const cancel = () => {
+          clearTimeout(timer);
+          worker.stop();
+          resolve(null);
+        };
+        const timer = setTimeout(() => {
+          signal.removeEventListener('abort', cancel);
+          resolve(result);
+        }, delay);
+        signal.addEventListener('abort', cancel, { once: true });
+      });
+    },
+    stop: () => worker.stop(),
+  };
+  vi.useFakeTimers(STREAM_TIMERS);
+  try {
+    void provider.refresh();
+    for (let attempt = 0; attempt < 96 && !provider.dispatchFacts?.get(id)?.spend.found; attempt++) {
+      await vi.waitFor(() => assert.ok(reads > attempt), { timeout: 5000 });
+      provider.refreshFrom('poll');
+      await vi.advanceTimersByTimeAsync(Math.min(delays[attempt] + 1, CATALOG_REFRESH_DEADLINE_MS));
+    }
+    assert.ok(
+      provider.authoritativeCatalog?.some((source: SessionFile) => source.sessionId === id),
+      'repeated deadlines starved publication of a finite catalog',
+    );
+    assert.equal(
+      provider.claudeChildReferences.some((reference: any) => reference.sessionId === id && reference.owned),
+      true,
+      'publication lost delegated ownership',
+    );
+    assert.equal(
+      provider.dispatchFacts.get(id)?.spend.models[0]?.usage.output,
+      3,
+      JSON.stringify({ reads, facts: provider.dispatchFacts.get(id), pending: provider.dispatchDiscoveryPending }),
+    );
+  } finally {
+    provider.abandonCatalogRefresh?.();
+    worker.stop();
+    vi.useRealTimers();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
 });

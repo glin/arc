@@ -42,6 +42,7 @@ function overlayStaticSources(source: string): void {
     'transcript.ts',
     'richtext.ts',
     'codex.ts',
+    'agentspend.ts',
     'domain/export-model.ts',
     'readmeter.ts',
     'webview/card.ts',

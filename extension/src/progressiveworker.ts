@@ -374,6 +374,9 @@ export function workerErrorIdentity(error: unknown): { name: string; code: strin
 export class ProgressiveWorker {
   readonly transport = { requests: 0, replies: 0, postMs: 0, jsonMs: 0, requestJsonBytes: 0, replyJsonBytes: 0 };
   private worker: Worker | null = null;
+  private dispatchSpends = new Map<string, { entry: import('./codex').CodexDispatchSpendEntry; bytes: number }>();
+  private dispatchSpendBytes = 0;
+  private dispatchSeedThread: number | null = null;
   private nextId = 0;
   private discoveryActive = false;
   private discoveryWaiter?: { start(): void; cancel(): void };
@@ -536,7 +539,25 @@ export class ProgressiveWorker {
           error?: { name: string; code: string | null };
           progress?: boolean;
           repeatedCoverage?: string;
+          dispatchSpend?: [string, import('./codex').CodexDispatchSpendEntry];
         }) => {
+          if (message.dispatchSpend) {
+            if (this.worker !== worker) return;
+            const [file, entry] = message.dispatchSpend;
+            const bytes = Buffer.byteLength(JSON.stringify(entry));
+            this.dispatchSpendBytes -= this.dispatchSpends.get(file)?.bytes ?? 0;
+            this.dispatchSpends.delete(file);
+            if (bytes <= 32 * 1024 * 1024) {
+              this.dispatchSpends.set(file, { entry, bytes });
+              this.dispatchSpendBytes += bytes;
+            }
+            while (this.dispatchSpendBytes > 32 * 1024 * 1024 || this.dispatchSpends.size > 200) {
+              const oldest = this.dispatchSpends.keys().next().value!;
+              this.dispatchSpendBytes -= this.dispatchSpends.get(oldest)!.bytes;
+              this.dispatchSpends.delete(oldest);
+            }
+            return;
+          }
           if (message.repeatedCoverage !== undefined) {
             if (this.worker === worker) this.onRepeatedCoverage?.(message.repeatedCoverage);
             return;
@@ -616,6 +637,12 @@ export class ProgressiveWorker {
         this.pending.clear();
       });
     }
+    if (this.dispatchSpends.size && this.worker && this.worker.threadId !== this.dispatchSeedThread) {
+      this.worker.postMessage({
+        dispatchSpendEntries: [...this.dispatchSpends].map(([file, held]) => [file, held.entry]),
+      });
+    }
+    this.dispatchSeedThread = this.worker?.threadId ?? null;
     const id = ++this.nextId;
     return new Promise((resolve, reject) => {
       const abort = () => {

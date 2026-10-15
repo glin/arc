@@ -276,10 +276,23 @@ export function spendFileVersion(file: string): string {
 // A visitor returning exactly true stops newline-delimited scanning and returns false.
 // The final unterminated line is visited after EOF. Its visitor result does not change true completion.
 export function scanLines(file: string, visit: (line: string) => unknown): boolean {
+  const scan = scanLinesIncremental(file, visit);
+  let next = scan.next();
+  while (!next.done) next = scan.next();
+  return next.value;
+}
+
+// Each chunk returns control without retaining the complete transcript.
+export function* scanLinesIncremental(
+  file: string,
+  visit: (line: string) => unknown,
+): Generator<{ bytes: number; end: boolean }, boolean> {
   let fd = -1;
   let readWholeFile = false;
   try {
     fd = fs.openSync(file, 'r');
+    const size = fs.fstatSync(fd).size;
+    let through = 0;
     const chunk = Buffer.allocUnsafe(64 * 1024);
     const decoder = new StringDecoder('utf8');
     let held: string[] = [];
@@ -303,6 +316,8 @@ export function scanLines(file: string, visit: (line: string) => unknown): boole
       if (start < decoded.length) {
         held.push(decoded.slice(start));
       }
+      through += read;
+      yield { bytes: read, end: through >= size };
     }
     if (stopped) {
       return false;

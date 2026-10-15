@@ -30,7 +30,10 @@ import {
   codexAgentSpendReader,
   codexAgentSpendVersion,
   codexSpendIndex,
-  readCodexDispatchedSpend,
+  readCodexDispatchedSpendQuantum,
+  retainCodexDispatchSpend,
+  retainCodexDispatchSpendRoots,
+  type CodexDispatchSpendEntry,
   scanForCodexPerson,
   type CodexPersonScan,
   readCodexSessionActivity,
@@ -126,6 +129,7 @@ const dispatchFacts = new Map<
     codexPerson?: CodexPersonScan;
     codexDependencies?: string[];
     sourceGeneration?: number;
+    spendPending?: boolean;
   }
 >();
 const DISPATCH_METADATA_BYTES = 256 * 1024;
@@ -825,9 +829,11 @@ async function execute(
     discoveryPosition = epoch.position;
     discoveryEpoch = null;
     const references = resolveClaudeDispatchReferences(found.references, epoch.catalog);
+    retainCodexDispatchSpendRoots(new Set(references.flatMap((reference) => (reference.file ? [reference.file] : []))));
     const dispatched: DispatchSessionFacts[] = [];
     const seen = new Set<string>();
-    // The dispatch loop holds no await, so the window sees only its own reads.
+    // Each request caps Codex spend reads independently of relationship discovery.
+    const dispatchBudget = { bytes: CODEX_DISPATCH_REQUEST_BYTES, deadline: performance.now() + RELATIONSHIP_SLICE_MS };
     const dispatchReads = openReadWindow();
     try {
       const subagentMetas = claudeSubagentMetaReader();
@@ -868,6 +874,7 @@ async function execute(
           held &&
           sameRevision(held.revision, revision) &&
           held.tree === tree &&
+          !held.spendPending &&
           now < held.refreshAt &&
           (!held.codexPerson || held.codexPerson.bytes >= revision.size)
         ) {
@@ -923,12 +930,25 @@ async function execute(
             : dispatchActivity(reference.file, reference.sessionId, revision, now, reference.agent);
         const refreshAt = activity.activeUntil;
         const active = now < refreshAt;
+        let spendPending = false;
         const spend: AgentSpend = active
           ? { models: [], found: false, partial: false, effort: null }
           : reference.agent === 'codex'
-            ? readCodexDispatchedSpend([reference.file], request.codexChildren ?? [], now, (files) => {
-                codexDependencies = files;
-              })
+            ? (() => {
+                const result = readCodexDispatchedSpendQuantum(
+                  reference.file,
+                  request.codexChildren ?? [],
+                  now,
+                  dispatchBudget,
+                  (files) => {
+                    codexDependencies = files;
+                  },
+                  (file, entry) => parentPort?.postMessage({ dispatchSpend: [file, entry] }),
+                );
+                spendPending = result.pending;
+                continuation ||= result.pending;
+                return result.spend;
+              })()
             : readClaudeAgentSpend(reference.file, request.repositoryRoots, false, subagentMetas);
         if (!active && activity.unfinished) {
           spend.unfinished = true;
@@ -991,6 +1011,7 @@ async function execute(
         };
         dispatchFacts.set(reference.file, {
           sourceGeneration,
+          spendPending,
           revision,
           tree: reference.agent === 'codex' ? childSpendRevisionKey('completed', codexVersion(), now) : tree,
           codexDependencies,
@@ -1610,8 +1631,13 @@ parentPort?.on(
     request: ProgressiveRequest;
     cancel?: number;
     metadataEligible?: string[];
+    dispatchSpendEntries?: Array<[string, CodexDispatchSpendEntry]>;
     repeated?: { file: string; map: ClaudeRepeatedHeldMap };
   }) => {
+    if (message.dispatchSpendEntries) {
+      for (const [file, entry] of message.dispatchSpendEntries) retainCodexDispatchSpend(file, entry);
+      return;
+    }
     if (message.repeated) adoptClaudeRepeatedMap(message.repeated.file, message.repeated.map);
     if (message.metadataEligible) {
       if (metadataRecovery && !message.metadataEligible.includes(metadataRecovery.sessionId)) metadataRecovery = null;
