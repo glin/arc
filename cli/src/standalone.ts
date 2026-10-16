@@ -2,6 +2,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
 import { spawn, execFile, ChildProcess } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { isDeepStrictEqual, promisify } from 'node:util';
 import {
   DispatchReceipts,
@@ -11,6 +12,7 @@ import {
   type DispatchOutcome,
   type StandaloneOptions,
   type StandaloneObservation,
+  type StandaloneStartup,
 } from '../../extension/src/dispatchreceipts.ts';
 import { linuxProcessStart } from '../../extension/src/store.ts';
 import { payloadSha256 } from '../../extension/src/sessionwrites.ts';
@@ -533,7 +535,12 @@ export function readNativeReport(file: string): string | null {
 }
 
 // A new native user record binds the print launch before its final stdout arrives.
-function claudeStartup(options: StandaloneOptions, prompt: string, bounds: ReadBounds) {
+function claudeStartup(
+  options: StandaloneOptions,
+  prompt: string,
+  bounds: ReadBounds,
+  retain: (evidence: StandaloneStartup) => void,
+) {
   if (options.provider !== 'claude' || options.background || !options.sessionHint || !options.env?.ARC_PROJECTS_ROOT)
     return null;
   const file = path.join(options.env.ARC_PROJECTS_ROOT, projectSlug(options.cwd), `${options.sessionHint}.jsonl`);
@@ -631,6 +638,16 @@ function claudeStartup(options: StandaloneOptions, prompt: string, bounds: ReadB
           fs.realpathSync.native(row.cwd) === cwd &&
           text === prompt;
         refused = !accepted;
+        if (accepted)
+          retain({
+            file,
+            identity,
+            ancestor,
+            directory,
+            cwd,
+            bytes: opening.length,
+            sha256: createHash('sha256').update(opening).digest('hex'),
+          });
         return accepted ? options.sessionHint : null;
       }
     } catch (error) {
@@ -638,6 +655,58 @@ function claudeStartup(options: StandaloneOptions, prompt: string, bounds: ReadB
       return null;
     }
   };
+}
+
+async function startupContinuous(
+  receipts: DispatchReceipts,
+  id: string,
+  options: StandaloneOptions,
+  bounds: ReadBounds,
+  runtime: ObservationRuntime,
+  deadline: number,
+): Promise<boolean> {
+  const refuse = () => {
+    receipts.startupRefused(id, true);
+    return false;
+  };
+  try {
+    if (receipts.startupRefused(id)) return false;
+    const held = receipts.startup(id);
+    if (!held) return true;
+    const checkPaths = () => {
+      safeDispatchPath(held.file);
+      const parent = fs.statSync(held.ancestor, { bigint: true });
+      return `${parent.dev}:${parent.ino}` === held.directory && fs.realpathSync.native(options.cwd) === held.cwd;
+    };
+    if (!checkPaths()) return refuse();
+    const digest = createHash('sha256');
+    const buffer = Buffer.alloc(Math.min(bounds.readBytes, READ_BYTES));
+    let offset = 0;
+    let refused = false;
+    do {
+      const qualified = readQualifiedOpening(held.file, (fd) => {
+        const stat = fs.fstatSync(fd, { bigint: true });
+        if (`${stat.dev}:${stat.ino}` !== held.identity || stat.size < BigInt(held.bytes)) {
+          refused = true;
+          return false;
+        }
+        if (runtime.now() >= deadline || held.bytes > (bounds.workBytes ?? 64 * 1024 * 1024)) return false;
+        const count = fs.readSync(fd, buffer, 0, Math.min(buffer.length, held.bytes - offset), offset);
+        if (!count && offset < held.bytes) return false;
+        digest.update(buffer.subarray(0, count));
+        offset += count;
+        return true;
+      });
+      if (refused) return refuse();
+      if (!qualified?.value) return false;
+      if (offset < held.bytes) await runtime.yield();
+    } while (offset < held.bytes);
+    if (!checkPaths()) return refuse();
+    return digest.digest('hex') === held.sha256 || refuse();
+  } catch (error) {
+    if (String(error).includes('The dispatch path is redirected.')) return refuse();
+    return false;
+  }
 }
 
 export async function observeProcess(
@@ -1374,7 +1443,11 @@ export async function superviseStandalone(
           pending: unflushed?.pending ?? stream.partial(),
         });
       const last = receipts.latest(id);
+      const continuous = await startupContinuous(receipts, id, options, bounds, runtime, deadline);
+      if (!continuous)
+        recovered = { sessionId: null, outcome: 'unknown', availability: 'pending', text: null, evidence: null };
       if (
+        continuous &&
         !sourceFailed &&
         !incomplete &&
         (last || recovered.evidence || recovered.text) &&
@@ -1395,7 +1468,7 @@ export async function superviseStandalone(
           },
           recovered.text,
         );
-      if (!sourceFailed && !incomplete && recovered.sessionId && recovered.evidence)
+      if (continuous && !sourceFailed && !incomplete && recovered.sessionId && recovered.evidence)
         receipts.standaloneSession(id, recovered.sessionId);
       observation.sessionId = recovered.sessionId;
       observation.monitor = incomplete ? 'timed-out' : recovered.text ? 'finished' : 'unavailable';
@@ -1456,8 +1529,7 @@ export async function superviseStandalone(
         ];
         // Worker output uses inherited files, so an observation deadline does not close its output pipes.
         const observerDeadline = observationDeadline;
-        const startup = claudeStartup(options, prompt, bounds);
-        let startupAccepted = false;
+        const startup = claudeStartup(options, prompt, bounds, (evidence) => receipts.startup(id, evidence));
         const producer =
           outputEntry && options.logAlias && !options.background
             ? outputProducer(receipts, id, outputEntry, stdout, stderr)
@@ -1493,13 +1565,7 @@ export async function superviseStandalone(
           },
           bounds,
           runtime,
-          startup
-            ? () => {
-                const sessionId = startup();
-                if (sessionId) startupAccepted = true;
-                return sessionId;
-              }
-            : null,
+          startup,
         );
         worker.stdin?.on('error', () => {
           /* Exit and final evidence determine the observation. */
@@ -1594,16 +1660,18 @@ export async function superviseStandalone(
             ending.signal,
             options.provider === 'codex' ? readNativeReport(receipts.artifact(id, 'native.md')) : undefined,
           );
-          if (startupAccepted && !startup?.())
-            final = { sessionId: null, outcome: 'unknown', availability: 'pending', text: null, evidence: null };
-          if (final.sessionId && final.evidence) receipts.standaloneSession(id, final.sessionId);
-          observation.sessionId = final.sessionId;
           observation.monitor = 'finished';
         }
       } finally {
         fs.closeSync(stdout);
         fs.closeSync(stderr);
       }
+    }
+    if (!options.background) {
+      if (!(await startupContinuous(receipts, id, options, bounds, runtime, observationDeadline)))
+        final = { sessionId: null, outcome: 'unknown', availability: 'pending', text: null, evidence: null };
+      if (final.sessionId && final.evidence) receipts.standaloneSession(id, final.sessionId);
+      if (observation.monitor === 'finished') observation.sessionId = final.sessionId;
     }
     const last = receipts.latest(id);
     if (

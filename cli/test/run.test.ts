@@ -2473,6 +2473,12 @@ test.each([
   'unreadable',
   'redirected',
   'replaced after acceptance',
+  'timeout unchanged',
+  'timeout replacement',
+  'timeout rewritten',
+  'timeout unreadable',
+  'timeout missing evidence',
+  'timeout missing all evidence',
   'conflicting final',
   'malformed final',
   'duplicate final',
@@ -2539,27 +2545,32 @@ test.each([
   });
   try {
     await vi.advanceTimersByTimeAsync(100);
-    const early = [
-      'valid',
-      'replaced after acceptance',
-      'conflicting final',
-      'malformed final',
-      'duplicate final',
-    ].includes(state);
+    const early =
+      ['valid', 'replaced after acceptance', 'conflicting final', 'malformed final', 'duplicate final'].includes(
+        state,
+      ) || state.startsWith('timeout ');
     assert.equal(receipts.standaloneSession(launch.launchId), early ? options.sessionHint : null);
     assert.equal(receipts.latest(launch.launchId), null);
     assert.equal(fs.readFileSync(receipts.artifact(launch.launchId, 'stdout.log'), 'utf8'), '');
+    const timedOut = state.startsWith('timeout ');
+    if (timedOut) {
+      await vi.advanceTimersByTimeAsync(options.deadlineMs);
+      await supervised;
+      assert.equal(receipts.observation(launch.launchId)?.monitor, 'timed-out');
+      assert.equal(receipts.latest(launch.launchId)?.availability, 'pending');
+    }
     if (state === 'partial') {
       fs.appendFileSync(file, '\n');
       await vi.advanceTimersByTimeAsync(100);
       assert.equal(receipts.standaloneSession(launch.launchId), options.sessionHint);
     }
-    if (state === 'replaced' || state === 'replaced after acceptance') {
+    if (state === 'replaced' || state === 'replaced after acceptance' || state === 'timeout replacement') {
       fs.renameSync(file, file + '.original');
       fs.writeFileSync(file, record + '\n');
       await vi.advanceTimersByTimeAsync(100);
       if (state === 'replaced') assert.equal(receipts.standaloneSession(launch.launchId), null);
     }
+    if (state === 'timeout rewritten') fs.writeFileSync(file, record.replace('native-user', 'changed-user') + '\n');
     const final =
       JSON.stringify({
         type: 'result',
@@ -2568,17 +2579,101 @@ test.each([
         result: 'Report',
         is_error: false,
       }) + '\n';
-    fs.writeSync(
-      stdout,
-      state === 'malformed final' ? 'malformed\n' : final + (state === 'duplicate final' ? final : ''),
-    );
+    const output = state === 'malformed final' ? 'malformed\n' : final + (state === 'duplicate final' ? final : '');
+    if (timedOut) fs.appendFileSync(receipts.artifact(launch.launchId, 'stdout.log'), output);
+    else fs.writeSync(stdout, output);
     child.emit('close', 0, null);
     await supervised;
-    const unknown = ['replaced after acceptance', 'conflicting final', 'malformed final', 'duplicate final'].includes(
-      state,
-    );
+    const unknown =
+      timedOut ||
+      ['replaced after acceptance', 'conflicting final', 'malformed final', 'duplicate final'].includes(state);
     assert.equal(receipts.latest(launch.launchId)?.outcome, unknown ? 'unknown' : 'succeeded');
     assert.equal(receipts.latest(launch.launchId)?.report === null, unknown);
+    if (timedOut || state === 'replaced after acceptance') {
+      const pending = receipts.latest(launch.launchId)!;
+      const startupFile = path.join(receipts.root, launch.launchId, 'startup.json');
+      const missing = state === 'timeout missing evidence' || state === 'timeout missing all evidence';
+      const retained = [
+        startupFile,
+        ...(state === 'timeout missing all evidence'
+          ? [
+              path.join(receipts.root, `${launch.launchId}.startup.json`),
+              path.join(receipts.root, `${launch.launchId}.startup.accepting.json`),
+            ]
+          : []),
+      ].filter((target) => fs.existsSync(target));
+      if (missing) for (const target of retained) fs.renameSync(target, target + '.held');
+      const open = fs.openSync;
+      const close = fs.closeSync;
+      const read = fs.readSync;
+      const nativeDescriptors = new Set<number>();
+      const nativeReadSizes: number[] = [];
+      let nativeYields = 0;
+      const denied = vi.spyOn(fs, 'openSync').mockImplementation((target, ...rest) => {
+        if (state === 'timeout unreadable' && String(target) === file)
+          throw Object.assign(new Error('Native transcript unavailable'), { code: 'EACCES' });
+        const fd = Reflect.apply(open, fs, [target, ...rest]);
+        if (String(target) === file) nativeDescriptors.add(fd);
+        return fd;
+      });
+      const closed = vi.spyOn(fs, 'closeSync').mockImplementation((fd) => {
+        nativeDescriptors.delete(fd);
+        return close(fd);
+      });
+      const reads = vi.spyOn(fs, 'readSync').mockImplementation((...args) => {
+        const values: readonly unknown[] = args;
+        if (nativeDescriptors.has(args[0])) nativeReadSizes.push(Number(values[3]));
+        return Reflect.apply(read, fs, args);
+      });
+      const recover = () =>
+        superviseStandalone(
+          new DispatchReceipts(home),
+          launch.launchId,
+          true,
+          { frameBytes: 1024, readBytes: 17, workBytes: 2048 },
+          {
+            now: () => 0,
+            identity: async () => null,
+            yield: async () => {
+              if (nativeReadSizes.length) nativeYields++;
+            },
+          },
+        );
+      await recover();
+      denied.mockRestore();
+      closed.mockRestore();
+      reads.mockRestore();
+      if (state === 'timeout unchanged') {
+        const recovered = receipts.latest(launch.launchId)!;
+        assert.equal(recovered.outcome, 'unknown');
+        assert.equal(recovered.availability, 'available');
+        assert.equal((receipts.result(launch.launchId, recovered.eventId) as any).text, 'Report');
+        assert.ok(nativeReadSizes.length > 1);
+        assert.ok(nativeReadSizes.every((bytes) => bytes <= 17));
+        assert.ok(nativeYields > 0);
+      } else {
+        assert.deepEqual(receipts.latest(launch.launchId), pending);
+        assert.equal(pending.outcome, 'unknown');
+        assert.equal(pending.availability, 'pending');
+        assert.equal(pending.report, null);
+        if (state === 'timeout unreadable' || missing) {
+          if (missing) for (const target of retained) fs.renameSync(target + '.held', target);
+          await recover();
+          assert.equal(receipts.latest(launch.launchId)?.availability, 'available');
+        } else {
+          if (state === 'timeout rewritten') fs.writeFileSync(file, record + '\n');
+          else {
+            fs.unlinkSync(file);
+            fs.renameSync(file + '.original', file);
+          }
+          await recover();
+          assert.deepEqual(receipts.latest(launch.launchId), pending);
+        }
+      }
+      const recovered = receipts.latest(launch.launchId)!;
+      await recover();
+      assert.equal(receipts.latest(launch.launchId)?.eventId, recovered.eventId);
+    }
     assert.equal(vi.mocked(childProcess.spawn).mock.calls.length, 1);
   } finally {
     child.emit('close', 0, null);

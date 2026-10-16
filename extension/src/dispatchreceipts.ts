@@ -66,6 +66,15 @@ export interface StandaloneObservation {
   monitor: 'starting' | 'observing' | 'finished' | 'unavailable' | 'timed-out';
   reason?: string;
 }
+export interface StandaloneStartup {
+  file: string;
+  identity: string;
+  ancestor: string;
+  directory: string;
+  cwd: string;
+  bytes: number;
+  sha256: string;
+}
 export interface DispatchEvent {
   launchId: string;
   eventId: string;
@@ -569,6 +578,51 @@ export class DispatchReceipts {
     }
     return fs.existsSync(file) ? JSON.parse(read(file, limit, true)) : null;
   }
+  startup(id: string, evidence?: StandaloneStartup): StandaloneStartup | null {
+    if (this.launch(id).transport !== 'standalone') return null;
+    const file = this.file(id, 'startup.json');
+    if (
+      !evidence &&
+      !fs.existsSync(file) &&
+      !fs.existsSync(path.join(this.root, `${id}.startup.json`)) &&
+      !fs.existsSync(path.join(this.root, `${id}.startup.accepting.json`))
+    ) {
+      const accepted = this.file(id, 'accepted.json');
+      if (fs.existsSync(accepted)) {
+        const binding = JSON.parse(read(accepted));
+        this.bindIdentity(id, 'accepted', binding);
+        if (binding.startupRequired) throw new Error('The standalone session identity is invalid.');
+      }
+      return null;
+    }
+    const binding = evidence ? { launchId: id, ...evidence } : JSON.parse(read(file));
+    if (
+      binding.launchId !== id ||
+      ![binding.file, binding.ancestor, binding.cwd].every(
+        (value) => typeof value === 'string' && path.isAbsolute(value),
+      ) ||
+      ![binding.identity, binding.directory].every((value) => typeof value === 'string' && /^\d+:\d+$/.test(value)) ||
+      !Number.isSafeInteger(binding.bytes) ||
+      binding.bytes < 1 ||
+      binding.bytes > 49 * 1024 * 1024 ||
+      !TOKEN.test(binding.sha256)
+    )
+      throw new Error('The standalone session identity is invalid.');
+    this.bindIdentity(id, 'startup', binding);
+    return binding;
+  }
+  startupRefused(id: string, refuse = false): boolean {
+    this.launch(id);
+    if (
+      !refuse &&
+      !fs.existsSync(this.file(id, 'startup-refused.json')) &&
+      !fs.existsSync(path.join(this.root, `${id}.startup-refused.json`)) &&
+      !fs.existsSync(path.join(this.root, `${id}.startup-refused.accepting.json`))
+    )
+      return false;
+    this.bindIdentity(id, 'startup-refused', { launchId: id });
+    return true;
+  }
   monitor(id: string, channel: 'monitor' | 'output-monitor' = 'monitor'): { token: string; release: () => void } {
     if (this.launch(id).transport !== 'standalone') throw new Error('Hosted dispatch has no standalone monitor.');
     const file = this.file(id, `${channel}.json`);
@@ -612,7 +666,13 @@ export class DispatchReceipts {
   }
   bind(
     id: string,
-    binding: { provider: 'claude' | 'codex'; sessionId: string; submissionId: number; nativeTurnId: string | null },
+    binding: {
+      provider: 'claude' | 'codex';
+      sessionId: string;
+      submissionId: number;
+      nativeTurnId: string | null;
+      startupRequired?: true;
+    },
   ): void {
     this.launch(id);
     if (
@@ -669,6 +729,7 @@ export class DispatchReceipts {
             sessionId,
             submissionId: 1,
             nativeTurnId: null,
+            ...(this.startup(id) ? { startupRequired: true as const } : {}),
           };
     if (
       binding.launchId !== id ||
@@ -679,10 +740,20 @@ export class DispatchReceipts {
     )
       throw new Error('The standalone session identity is invalid.');
     if (sessionId === undefined && !fs.existsSync(path.join(this.root, `${id}.accepted.json`))) return null;
-    this.bind(id, { provider: binding.provider, sessionId: binding.sessionId, submissionId: 1, nativeTurnId: null });
+    this.bind(id, {
+      provider: binding.provider,
+      sessionId: binding.sessionId,
+      submissionId: 1,
+      nativeTurnId: null,
+      ...(binding.startupRequired ? { startupRequired: true } : {}),
+    });
     return binding.sessionId;
   }
-  private bindIdentity(id: string, kind: 'accepted' | 'background', binding: unknown): void {
+  private bindIdentity(
+    id: string,
+    kind: 'accepted' | 'background' | 'startup' | 'startup-refused',
+    binding: unknown,
+  ): void {
     const file = this.file(id, `${kind}.json`);
     const text = JSON.stringify(binding);
     const witnessFile = path.join(this.root, `${id}.${kind}.json`);
@@ -701,10 +772,7 @@ export class DispatchReceipts {
     if (checkWitness()) return;
     this.lock(id, () => {
       if (checkWitness()) return;
-      const intentFile = path.join(
-        this.root,
-        `${id}.${kind === 'accepted' ? 'accepting' : 'background.accepting'}.json`,
-      );
+      const intentFile = path.join(this.root, `${id}.${kind === 'accepted' ? 'accepting' : `${kind}.accepting`}.json`);
       if (!fs.existsSync(intentFile)) {
         if (fs.existsSync(file)) throw new Error('The accepted dispatch turn has no retained identity.');
         const name = `${kind}.${randomUUID()}.pending`;
