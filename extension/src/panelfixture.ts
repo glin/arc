@@ -929,9 +929,10 @@ export const RAIL_STATS: Record<string, SessionStatChip[]> = {
 
 // The first session's cache is warm.
 // The second is in the final quarter of its lifetime.
+// Both hold a 1-hour cache.
 const RAIL_CACHES = {
-  s1: { expiresAt: FIXTURE_CLOCK + 45 * 60_000, nearlyGoneAt: FIXTURE_CLOCK + 30 * 60_000 },
-  s2: { expiresAt: FIXTURE_CLOCK + 10 * 60_000, nearlyGoneAt: FIXTURE_CLOCK - 5 * 60_000 },
+  s1: { expiresAt: FIXTURE_CLOCK + 45 * 60_000, nearlyGoneAt: FIXTURE_CLOCK + 30 * 60_000, tier: '1h' as const },
+  s2: { expiresAt: FIXTURE_CLOCK + 10 * 60_000, nearlyGoneAt: FIXTURE_CLOCK - 5 * 60_000, tier: '1h' as const },
 };
 
 // Labels cover overflow, a single label, and sessions without labels.

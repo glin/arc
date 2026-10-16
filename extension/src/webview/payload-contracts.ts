@@ -178,6 +178,8 @@ export interface RailStat {
 export interface RailCacheMark {
   expiresAt: number;
   nearlyGoneAt: number | null;
+  // The lifetime the cache was bought for. Absent or null when the host could not tell.
+  tier?: '5m' | '30m' | '1h' | null;
 }
 
 export interface RailCardView extends Record<string, unknown> {

@@ -1207,6 +1207,7 @@ test('a rail cache mark counts down a fast session where the model publishes a f
   assert.deepEqual(railCacheMarkOf(newest('claude-opus-5', 'fast'), requestAt), {
     expiresAt: requestAt + 58.5 * 60_000,
     nearlyGoneAt: requestAt + 43.5 * 60_000,
+    tier: '1h',
   });
   assert.equal(railCacheMarkOf(newest('claude-opus-4-7', 'fast'), requestAt), null, 'Opus 4.7 has no fast rate');
   assert.equal(railCacheMarkOf(newest('claude-opus-5', 'turbo'), requestAt), null, 'a speed with no published rate');
@@ -1242,6 +1243,7 @@ test('a rail cache mark follows the newest priced request, then disappears at ex
   assert.deepEqual(railCacheMarkOf(facts, requestAt + 44 * 60_000), {
     expiresAt: requestAt + 58.5 * 60_000,
     nearlyGoneAt: requestAt + 43.5 * 60_000,
+    tier: '1h',
   });
   assert.equal(
     railCacheMarkOf(facts, requestAt + 58.5 * 60_000),
@@ -1254,6 +1256,7 @@ test('a rail cache mark follows the newest priced request, then disappears at ex
     {
       expiresAt: requestAt + 58.5 * 60_000,
       nearlyGoneAt: requestAt + 43.5 * 60_000,
+      tier: '1h',
     },
     'the warm cache mark disappeared while the newest turn was running',
   );
@@ -1275,6 +1278,7 @@ test('a rail cache mark follows the newest priced request, then disappears at ex
     {
       expiresAt: requestAt + 28.5 * 60_000,
       nearlyGoneAt: requestAt + 21 * 60_000,
+      tier: '30m',
     },
     'a cache lifetime absent from the request loses the rail mark despite the model documenting one',
   );
@@ -1294,6 +1298,22 @@ test('a rail cache mark follows the newest priced request, then disappears at ex
     )?.nearlyGoneAt,
     null,
     'a 75-second final quarter says more about the clock error than about the cache',
+  );
+  assert.equal(
+    railCacheMarkOf(
+      {
+        ...facts,
+        turns: [
+          {
+            ...facts.turns[0],
+            contextRequest: { ...facts.turns[0].contextRequest!, lifetime: '5m' },
+          },
+        ],
+      },
+      requestAt,
+    )?.tier,
+    '5m',
+    'the mark names the lifetime the request bought',
   );
   assert.equal(
     railCacheMarkOf(

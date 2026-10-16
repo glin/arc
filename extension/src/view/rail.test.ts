@@ -68,6 +68,7 @@ import {
   sessionCount,
   viewFoldId,
   railCacheState,
+  railCacheName,
   railCacheTitle,
   railDrawnRows,
   RAIL_ROW_STEP,
@@ -1610,12 +1611,12 @@ test('a cache tooltip travels as a text to write, and its state change asks for 
     at: drawnAt - 3 * 24 * 60 * 60_000,
     status: null,
     runningSince: null,
-    cache: { expiresAt: drawnAt + 45 * 60_000, nearlyGoneAt: drawnAt + 40 * 60_000 },
+    cache: { expiresAt: drawnAt + 45 * 60_000, nearlyGoneAt: drawnAt + 40 * 60_000, tier: '1h' },
   };
   const rows = [{ id: 'railrow-cached', card: cached }];
   assert.deepEqual(railTickWork(rows, drawnAt, drawnAt + 60_000), {
     redraw: false,
-    titles: [{ id: 'railrow-cached', text: 'Cache warm for another 44m' }],
+    titles: [{ id: 'railrow-cached', text: 'Cache warm for another 44m (1-hour cache)' }],
   });
   const written = railTickWork(rows, drawnAt, drawnAt + 50_000, drawnAt + 30_000);
   assert.deepEqual(written.titles, [], 'a tooltip already written is written again every tick');
@@ -1625,7 +1626,36 @@ test('a cache tooltip travels as a text to write, and its state change asks for 
     'a cache that has nearly gone keeps the face it was drawn with',
   );
   assert.equal(railCacheState(cached.cache, drawnAt + 46 * 60_000), null);
-  assert.equal(railCacheTitle(cached.cache!, drawnAt + 44 * 60_000), 'Cache expiring about now');
+  assert.equal(railCacheTitle(cached.cache!, drawnAt + 44 * 60_000), 'Cache expiring about now (1-hour cache)');
+});
+
+// The bolt hides from assistive technology, so the tooltip and the card name word the same cache lifetime.
+test('the cache bolt tooltip and accessible name word the cache lifetime after the time left', () => {
+  const expiresAt = 10_000_000;
+  const at = expiresAt - 3 * 60_000;
+  const lifetimes = [
+    ['1h', '1-hour cache'],
+    ['30m', '30-minute cache'],
+    ['5m', '5-minute cache'],
+  ] as const;
+  for (const [tier, words] of lifetimes) {
+    const cache = { expiresAt, nearlyGoneAt: expiresAt - 120_000, tier };
+    assert.equal(railCacheTitle(cache, at), `Cache warm for another 3m (${words})`);
+    assert.equal(railCacheTitle(cache, expiresAt - 5_000), `Cache expiring about now (${words})`);
+    assert.equal(railCacheName(cache, at), `cache warm, ${words}`);
+    assert.equal(railCacheName(cache, expiresAt - 60_000), `cache nearly gone, ${words}`);
+  }
+  for (const cache of [
+    { expiresAt, nearlyGoneAt: expiresAt - 120_000 },
+    { expiresAt, nearlyGoneAt: expiresAt - 120_000, tier: null },
+  ]) {
+    assert.equal(railCacheTitle(cache, at), 'Cache warm for another 3m');
+    assert.equal(railCacheTitle(cache, expiresAt - 5_000), 'Cache expiring about now');
+    assert.equal(railCacheName(cache, at), 'cache warm');
+    assert.equal(railCacheName(cache, expiresAt - 60_000), 'cache nearly gone');
+  }
+  assert.equal(railCacheName(null, at), null);
+  assert.equal(railCacheName({ expiresAt, nearlyGoneAt: null, tier: '1h' }, expiresAt), null);
 });
 
 // Group the shared workspace. pin is pinned, c2 has two labels, r2 and n4 use Codex, n4 is agent-run, and arch is archived.

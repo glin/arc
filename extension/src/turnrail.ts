@@ -36,7 +36,13 @@ import {
   subagentsStillRunning,
   type RailStatus,
 } from './view/rail.ts';
-import { CACHE_LIFETIME_MS, CONSERVATIVE_CACHE_BOUNDARY_MS, cacheLifetimeFor, nextTurnFloor } from './pricing';
+import {
+  CACHE_LIFETIME_MS,
+  CONSERVATIVE_CACHE_BOUNDARY_MS,
+  cacheLifetimeFor,
+  nextTurnFloor,
+  type CacheTier,
+} from './pricing';
 export {
   clampRailWidth,
   NEEDS_INPUT,
@@ -53,6 +59,8 @@ export type { RailBucket, RailStatus } from './view/rail.ts';
 export interface RailCacheMark {
   expiresAt: number;
   nearlyGoneAt: number | null;
+  // The lifetime the cache was bought for, which the bolt's tooltip and the card's accessible name word.
+  tier?: CacheTier | null;
 }
 
 export interface RevisionedRailCacheMark {
@@ -128,6 +136,7 @@ export function railCacheMarkOf(facts: RailCacheFacts | null, now: number = Date
   return {
     expiresAt,
     nearlyGoneAt: finalQuarter >= RAIL_CACHE_NEARLY_GONE_MIN_MS ? expiresAt - finalQuarter : null,
+    tier: lifetimeTier,
   };
 }
 

@@ -52,6 +52,7 @@ import {
   RAIL_MIN_WIDTH,
   RAIL_SHOWN_BUCKETS,
   RAIL_WIDTH_DEFAULT,
+  railCacheName,
   railCacheTitle,
   railCardName,
   railCountButtons,
@@ -546,8 +547,7 @@ function cacheIcon(state: 'warm' | 'nearly-gone', cache: RailCacheMark | null, n
 
 // Combine the shared card name with clock-dependent running and cache text, then the full activity time.
 function drawnRailCardName(card: RailCardView, now: number): string {
-  const state = railCacheState(card.cache, now);
-  const cacheName = state === 'nearly-gone' ? 'cache nearly gone' : state === 'warm' ? 'cache warm' : null;
+  const cacheName = railCacheName(card.cache, now);
   const running =
     card.status === 'running' && card.runningSince !== null ? railRunningWord(card.runningSince, now) : null;
   const runningName = running

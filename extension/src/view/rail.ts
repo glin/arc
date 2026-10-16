@@ -155,10 +155,26 @@ export function railRunningWord(since: number, now: number): string | null {
   return elapsed < 60_000 ? null : formatDuration(elapsed);
 }
 
+// The cache lifetimes a session can buy. These match the lifetimes `pricing.ts` records, and a mark assigns across the two so a drift fails typecheck.
+export type RailCacheTier = '5m' | '30m' | '1h';
+
 // How long a prompt cache has left, as the rail draws it.
 export interface RailCacheSpan {
   expiresAt: number;
   nearlyGoneAt: number | null;
+  // The lifetime the cache was bought for. Absent or null when the host could not tell.
+  tier?: RailCacheTier | null;
+}
+
+const RAIL_CACHE_LIFETIME_WORDS: Record<RailCacheTier, string> = {
+  '1h': '1-hour cache',
+  '30m': '30-minute cache',
+  '5m': '5-minute cache',
+};
+
+// The cache lifetime in words, or null when the lifetime is unknown.
+function railCacheLifetimeWords(cache: RailCacheSpan): string | null {
+  return cache.tier ? (RAIL_CACHE_LIFETIME_WORDS[cache.tier] ?? null) : null;
 }
 
 export type RailCacheState = 'warm' | 'nearly-gone';
@@ -170,11 +186,26 @@ export function railCacheState(cache: RailCacheSpan | null, now: number): RailCa
   return cache.nearlyGoneAt !== null && now >= cache.nearlyGoneAt ? 'nearly-gone' : 'warm';
 }
 
+// The bolt's native tooltip. The cache lifetime follows the time left in parentheses, so the two figures do not read as one.
 export function railCacheTitle(cache: RailCacheSpan, now: number): string {
+  const words = railCacheLifetimeWords(cache);
+  const suffix = words ? ` (${words})` : '';
   if (cache.expiresAt - now <= CACHE_SPAN_MINIMUM_SECONDS * 1000) {
-    return 'Cache expiring about now';
+    return `Cache expiring about now${suffix}`;
   }
-  return `Cache warm for another ${formatCacheSpan(cache.expiresAt - now)}`;
+  return `Cache warm for another ${formatCacheSpan(cache.expiresAt - now)}${suffix}`;
+}
+
+// The cache clause of a card's accessible name, because the bolt is hidden from assistive technology.
+// A known lifetime adds its words after the state.
+export function railCacheName(cache: RailCacheSpan | null, now: number): string | null {
+  const state = railCacheState(cache, now);
+  if (!cache || !state) {
+    return null;
+  }
+  const words = railCacheLifetimeWords(cache);
+  const name = state === 'nearly-gone' ? 'cache nearly gone' : 'cache warm';
+  return words ? `${name}, ${words}` : name;
 }
 
 // The Active lens includes activity from the last hour, independently of cache lifetime.

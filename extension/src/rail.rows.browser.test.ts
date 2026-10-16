@@ -785,23 +785,23 @@ test('rail cache bolts show both faces and leave when the lifetime ends', { time
     assert.equal(faces[0].state, 'warm', 'the ordinary warm bolt is absent');
     assert.equal(faces[0].fill, 'none', 'the ordinary warm bolt is filled');
     assert.ok(faces[0].stroke && faces[0].stroke !== 'none', 'the ordinary warm bolt has no stroke');
-    assert.match(faces[0].title ?? '', /^Cache warm for another \d+[mhdwy]$/);
-    assert.match(faces[0].name, /, just now, cache warm/);
+    assert.match(faces[0].title ?? '', /^Cache warm for another \d+[mhdwy] \(1-hour cache\)$/);
+    assert.match(faces[0].name, /, just now, cache warm, 1-hour cache/);
     assert.equal(faces[1].state, 'nearly-gone', 'the final-quarter bolt keeps the warm face');
     assert.notEqual(faces[1].fill, 'none', 'the final-quarter bolt stays hollow');
     assert.equal(
       faces[1].title,
-      'Cache warm for another 10m',
+      'Cache warm for another 10m (1-hour cache)',
       'the final-quarter tooltip hides a usable remaining duration',
     );
-    assert.match(faces[1].name, /ago, cache nearly gone/);
+    assert.match(faces[1].name, /ago, cache nearly gone, 1-hour cache/);
 
     await page.evaluate(`(() => {
       window.__railCacheTitle = document.querySelector('[data-control="rail:s1"] .railcache title');
     })()`);
     await page.clock.setFixedTime(FIXTURE_CLOCK + 60_000);
     await page.waitForFunction(
-      `document.querySelector('[data-control="rail:s1"] .railcache title')?.textContent === 'Cache warm for another 44m'`,
+      `document.querySelector('[data-control="rail:s1"] .railcache title')?.textContent === 'Cache warm for another 44m (1-hour cache)'`,
       undefined,
       { timeout: 5_000 },
     );
@@ -815,7 +815,7 @@ test('rail cache bolts show both faces and leave when the lifetime ends', { time
 
     await page.clock.setFixedTime(FIXTURE_CLOCK + 9 * 60_000);
     await page.waitForFunction(
-      `document.querySelector('[data-control="rail:s2"] .railcache title')?.textContent === 'Cache expiring about now'`,
+      `document.querySelector('[data-control="rail:s2"] .railcache title')?.textContent === 'Cache expiring about now (1-hour cache)'`,
       undefined,
       { timeout: 5_000 },
     );
