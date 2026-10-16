@@ -378,7 +378,41 @@ interface WorkerRequestObservation {
   kind: ProgressiveRequest['kind'];
   ageMs: number;
   status: 'pending';
+  // Window requests only. Host milliseconds from the request until the worker's start acknowledgment arrived.
+  enteredAfterMs?: number | null;
 }
+
+// Durations on the worker thread's monotonic clock. `enterMs` runs from receipt to the read start, including the revision check.
+// `readMs` is the wall interval of the read. Work counted in `during` interleaves with it, so it is not the read's own CPU time.
+// `replyMs` runs from the last earlier stage to the reply post and excludes structured cloning.
+export interface WorkerWindowRead {
+  enterMs: number | null;
+  readMs: number | null;
+  replyMs: number;
+  // Other requests in progress on the worker when the read arrived, by kind.
+  atReceipt: Partial<Record<ProgressiveRequest['kind'], number>>;
+  discoveryWaiting: boolean;
+  // Counts of other worker events between receipt and reply.
+  during: {
+    received: Partial<Record<ProgressiveRequest['kind'], number>>;
+    finished: Partial<Record<ProgressiveRequest['kind'], number>>;
+    discoveryProgress: number;
+    repeatedCoverage: number;
+  };
+}
+
+export interface WindowReadObservation {
+  id: number;
+  generation: number;
+  agent: SessionFile['agent'];
+  outcome: 'window' | 'stale' | 'error' | 'superseded' | 'cancelled' | 'stopped' | 'failed';
+  // Host milliseconds from the request until its settlement. Host and worker clocks share no origin, so only durations leave either side.
+  hostMs: number;
+  enteredAfterMs: number | null;
+  worker: WorkerWindowRead | null;
+}
+
+const RECENT_WINDOW_READS = 4;
 
 export function workerErrorIdentity(error: unknown): { name: string; code: string | null } {
   const value = error && typeof error === 'object' ? (error as { name?: unknown; code?: unknown }) : {};
@@ -404,12 +438,14 @@ export class ProgressiveWorker {
   private workerThreadId: number | null = null;
   private workerMemoryThreadId: number | null = null;
   private workerMemoryRequestId: number | null = null;
+  private recentWindows: WindowReadObservation[] = [];
   private pending = new Map<
     number,
     {
       generation: number;
       kind: ProgressiveRequest['kind'];
       started: number;
+      window?: { agent: SessionFile['agent']; entered: number | null };
       resolve(value: ProgressiveResult | null): void;
       reject(error: Error): void;
       dispose(): void;
@@ -432,6 +468,7 @@ export class ProgressiveWorker {
     pendingCount: number;
     waitingDiscovery: boolean;
     active: WorkerRequestObservation[];
+    recentWindows: WindowReadObservation[];
     lastFailure: WorkerFailure | null;
     memory: WorkerFailure['memory'];
   } {
@@ -444,6 +481,9 @@ export class ProgressiveWorker {
         kind: held.kind,
         ageMs: Math.max(0, now - held.started),
         status: 'pending',
+        ...(held.window
+          ? { enteredAfterMs: held.window.entered === null ? null : held.window.entered - held.started }
+          : {}),
       });
       if (active.length === 8) break;
     }
@@ -454,6 +494,7 @@ export class ProgressiveWorker {
       pendingCount: this.pending.size,
       waitingDiscovery: !!this.discoveryWaiter,
       active,
+      recentWindows: [...this.recentWindows],
       lastFailure: this.lastFailure,
       memory: {
         scope: 'session-reader worker thread',
@@ -463,6 +504,25 @@ export class ProgressiveWorker {
         ageSinceReceiptMs: this.workerMemory ? Math.max(0, now - this.workerMemoryAt) : null,
       },
     };
+  }
+
+  private settleWindow(
+    id: number,
+    held: { generation: number; started: number; window?: { agent: SessionFile['agent']; entered: number | null } },
+    outcome: WindowReadObservation['outcome'],
+    worker: WorkerWindowRead | null = null,
+  ): void {
+    if (!held.window) return;
+    this.recentWindows.push({
+      id,
+      generation: held.generation,
+      agent: held.window.agent,
+      outcome,
+      hostMs: performance.now() - held.started,
+      enteredAfterMs: held.window.entered === null ? null : held.window.entered - held.started,
+      worker,
+    });
+    if (this.recentWindows.length > RECENT_WINDOW_READS) this.recentWindows.shift();
   }
 
   private failure(reason: WorkerFailure['reason'], error: unknown, exitCode: number | null = null): WorkerFailure {
@@ -556,6 +616,8 @@ export class ProgressiveWorker {
           hidden?: { turns: HiddenTurnFields[]; redefinesDetail: boolean };
           error?: { name: string; code: string | null };
           progress?: boolean;
+          windowEntered?: boolean;
+          windowRead?: WorkerWindowRead;
           repeatedCoverage?: string;
           dispatchSpend?: [string, import('./codex').CodexDispatchSpendEntry];
         }) => {
@@ -584,8 +646,13 @@ export class ProgressiveWorker {
           if (!held || this.worker !== worker) {
             return;
           }
+          if (message.windowEntered) {
+            if (held.window) held.window.entered = performance.now();
+            return;
+          }
           if (message.result && message.result.generation !== held.generation) {
             if (!message.progress) {
+              this.settleWindow(message.id, held, 'superseded', message.windowRead);
               this.pending.delete(message.id);
               held.dispose();
               held.resolve(null);
@@ -610,6 +677,12 @@ export class ProgressiveWorker {
             return;
           }
           if (message.error) this.failure('request', message.error);
+          this.settleWindow(
+            message.id,
+            held,
+            message.error ? 'error' : message.result?.value.kind === 'window' ? 'window' : 'stale',
+            message.windowRead,
+          );
           this.pending.delete(message.id);
           held.dispose();
           if (message.error) {
@@ -631,7 +704,8 @@ export class ProgressiveWorker {
         }
         this.state = 'failed';
         terminalFailure = this.failure('error', error);
-        for (const held of this.pending.values()) {
+        for (const [id, held] of this.pending) {
+          this.settleWindow(id, held, 'failed');
           held.dispose();
           held.reject(error);
         }
@@ -654,7 +728,8 @@ export class ProgressiveWorker {
           this.failure('exit', { name: 'WorkerExit' }, exitCode);
         } else this.state = 'idle';
         this.worker = null;
-        for (const held of this.pending.values()) {
+        for (const [id, held] of this.pending) {
+          this.settleWindow(id, held, 'failed');
           held.dispose();
           held.resolve(null);
         }
@@ -674,6 +749,7 @@ export class ProgressiveWorker {
         if (!held) {
           return;
         }
+        this.settleWindow(id, held, 'cancelled');
         this.pending.delete(id);
         held.dispose();
         held.resolve(null);
@@ -687,6 +763,7 @@ export class ProgressiveWorker {
         generation,
         kind: request.kind,
         started: performance.now(),
+        ...(request.kind === 'window' ? { window: { agent: request.input.session.agent, entered: null } } : {}),
         resolve,
         reject,
         progress,
@@ -708,6 +785,8 @@ export class ProgressiveWorker {
         this.worker!.postMessage(message);
       } catch (error) {
         this.failure('request', error);
+        const held = this.pending.get(id);
+        if (held) this.settleWindow(id, held, 'failed');
         this.pending.delete(id);
         signal.removeEventListener('abort', abort);
         reject(error);
@@ -723,7 +802,8 @@ export class ProgressiveWorker {
     const worker = this.worker;
     this.worker = null;
     void worker?.terminate();
-    for (const held of this.pending.values()) {
+    for (const [id, held] of this.pending) {
+      this.settleWindow(id, held, 'stopped');
       held.dispose();
       held.resolve(null);
     }

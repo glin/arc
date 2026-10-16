@@ -1684,6 +1684,153 @@ test('a caught worker request exception preserves safe cause without its message
   }
 });
 
+test('a stalled window read reports its worker lifecycle and the requests that ran beside it', async () => {
+  const directory = tempDir('worker-window-lifecycle-');
+  const file = path.join(directory, 'PRIVATE_window.jsonl');
+  fs.writeFileSync(
+    file,
+    [1, 2, 3]
+      .map((at) =>
+        JSON.stringify({
+          type: 'user',
+          uuid: `u${at}`,
+          timestamp: timestamp(at),
+          message: { role: 'user', content: 'hi' },
+        }),
+      )
+      .join('\n') + '\n',
+  );
+  const stat = fs.statSync(file);
+  // The gate holds every deferred callback and file promise on the worker until a second request arrives.
+  const gated =
+    `const gatedPort = require('node:worker_threads').parentPort;
+    const gatedFs = require('node:fs').promises;
+    const immediate = globalThis.setImmediate;
+    let gateOpen = false; const parked = []; let releaseGate; const gate = new Promise((resolve) => { releaseGate = resolve; });
+    globalThis.setImmediate = (callback, ...args) => {
+      if (gateOpen) return immediate(callback, ...args);
+      parked.push(() => callback(...args));
+    };
+    for (const name of ['stat', 'lstat', 'open', 'readFile']) {
+      const original = gatedFs[name];
+      gatedFs[name] = async function (...args) {
+        if (!gateOpen) await gate;
+        return original.apply(this, args);
+      };
+    }
+    const gatedOn = gatedPort.on;
+    gatedPort.on = function(event, listener) {
+      return gatedOn.call(this, event, event === 'message' ? message => {
+        const result = listener(message);
+        if (message.request?.kind === 'codex-context') immediate(() => {
+          gateOpen = true; releaseGate(); for (const run of parked.splice(0)) run();
+        });
+        return result;
+      } : listener);
+    };` + source;
+  const worker = new ProgressiveWorker(gated);
+  try {
+    const session = {
+      file,
+      sessionId: 'PRIVATE_SESSION',
+      agent: 'claude' as const,
+      size: stat.size,
+      mtimeMs: stat.mtimeMs,
+    };
+    const read = worker.run(
+      { kind: 'window', input: { session, folders: [directory], children: [], maxTurns: 40, tailBytes: 65536 } },
+      3,
+      new AbortController().signal,
+    );
+    await vi.waitFor(() => assert.equal(typeof worker.snapshot().active[0]?.enteredAfterMs, 'number'));
+    assert.equal(worker.snapshot().active[0].kind, 'window');
+    const missing = { ...session, file: path.join(directory, 'PRIVATE_missing.jsonl'), agent: 'codex' as const };
+    const context = await worker.run({ kind: 'codex-context', session: missing }, 4, new AbortController().signal);
+    assert.equal(context?.value.kind, 'stale');
+    assert.equal((await read)?.value.kind, 'window');
+    const snapshot = worker.snapshot();
+    assert.deepEqual(snapshot.active, []);
+    assert.equal(snapshot.recentWindows.length, 1);
+    const [observed] = snapshot.recentWindows;
+    assert.equal(observed.generation, 3);
+    assert.equal(observed.agent, 'claude');
+    assert.equal(observed.outcome, 'window');
+    assert.ok(observed.enteredAfterMs !== null && observed.enteredAfterMs <= observed.hostMs);
+    const lifecycle = observed.worker!;
+    assert.ok(lifecycle.enterMs! >= 0 && lifecycle.readMs! >= 0 && lifecycle.replyMs >= 0);
+    assert.deepEqual(lifecycle.atReceipt, {});
+    assert.deepEqual(lifecycle.during.received, { 'codex-context': 1 }, 'the overlapping request was not counted');
+    assert.deepEqual(lifecycle.during.finished, { 'codex-context': 1 });
+    assert.ok(!JSON.stringify(snapshot).includes('PRIVATE_'));
+  } finally {
+    worker.stop();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('window read history settles cancelled, failed and stopped reads and keeps the newest four', async () => {
+  const worker = new ProgressiveWorker(
+    `const port = require('node:worker_threads').parentPort;
+    port.on('message', (message) => {
+      if (!message.request) return;
+      port.postMessage({ id: message.id, windowEntered: true });
+      const sessionId = message.request.input.session.sessionId;
+      if (sessionId === 'hold') return;
+      if (sessionId === 'error') port.postMessage({ id: message.id, error: { name: 'RangeError', code: null } });
+      else port.postMessage({ id: message.id, result: { generation: message.generation, revision: null, value: { kind: 'stale' } } });
+    });`,
+  );
+  const window = (sessionId: string, generation: number, signal = new AbortController().signal) =>
+    worker.run(
+      {
+        kind: 'window',
+        input: {
+          session: { file: 'private', sessionId, agent: 'codex', size: 0, mtimeMs: 0 },
+          folders: [],
+          children: [],
+          maxTurns: 1,
+          tailBytes: 1,
+        },
+      },
+      generation,
+      signal,
+    );
+  try {
+    const controller = new AbortController();
+    const held = window('hold', 1, controller.signal);
+    await vi.waitFor(() => assert.equal(typeof worker.snapshot().active[0]?.enteredAfterMs, 'number'));
+    controller.abort();
+    assert.equal(await held, null);
+    await assert.rejects(window('error', 2), { name: 'RangeError' });
+    assert.deepEqual(
+      worker.snapshot().recentWindows.map((row) => [row.generation, row.outcome]),
+      [
+        [1, 'cancelled'],
+        [2, 'error'],
+      ],
+    );
+    for (const generation of [3, 4, 5]) assert.equal((await window('stale', generation))?.value.kind, 'stale');
+    const stopped = window('hold', 6);
+    await vi.waitFor(() => assert.equal(typeof worker.snapshot().active[0]?.enteredAfterMs, 'number'));
+    worker.stop();
+    assert.equal(await stopped, null);
+    const recent = worker.snapshot().recentWindows;
+    assert.deepEqual(
+      recent.map((row) => [row.generation, row.outcome]),
+      [
+        [3, 'stale'],
+        [4, 'stale'],
+        [5, 'stale'],
+        [6, 'stopped'],
+      ],
+    );
+    assert.ok(recent.every((row) => row.enteredAfterMs !== null && row.worker === null));
+    assert.deepEqual(worker.snapshot().active, []);
+  } finally {
+    worker.stop();
+  }
+});
+
 test('pending startup discovery releases evicted worker cursors and retains unfinished Claude ownership', async () => {
   const directory = tempDir('pending-discovery-retention-');
   const codexFile = path.join(directory, 'codex.jsonl');

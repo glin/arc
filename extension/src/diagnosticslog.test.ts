@@ -455,6 +455,7 @@ test('unfinished startup keeps fresh durable work after the pending deadline wit
         pendingCount: 1,
         waitingDiscovery: false,
         active: [{ id: 7, kind: 'claude-children', generation: 2, ageMs: clock, status: 'pending' }],
+        recentWindows: [],
         lastFailure: null,
         memory: {
           scope: 'session-reader worker thread',

@@ -108,7 +108,7 @@ import type {
   DiscoveryCheckpoint,
   DiscoveryCharges,
 } from './progressiveworker';
-import type { DispatchSessionFacts } from './progressiveworker';
+import type { DispatchSessionFacts, WorkerWindowRead } from './progressiveworker';
 import { progressiveTurns, workerErrorIdentity } from './progressiveworker';
 import { TURN_QUIET_MS, statusOf } from './turncard';
 
@@ -1354,6 +1354,37 @@ async function execute(
 }
 
 const requests = new Map<number, AbortController>();
+// Window read lifecycles in this worker. Times use this worker's monotonic clock, so only their differences leave it.
+// Overlap counts name other work that ran on this thread during the read, not the time that work took.
+const WINDOW_READS = 8;
+type RequestKind = ProgressiveRequest['kind'];
+const activeKinds: Partial<Record<RequestKind, number>> = {};
+const windowReads = new Map<
+  number,
+  {
+    receivedAt: number;
+    enteredAt: number | null;
+    completedAt: number | null;
+    report: Omit<WorkerWindowRead, 'enterMs' | 'readMs' | 'replyMs'>;
+  }
+>();
+function countKind(counts: Partial<Record<RequestKind, number>>, kind: RequestKind): void {
+  counts[kind] = (counts[kind] ?? 0) + 1;
+}
+function noteBackground(field: 'discoveryProgress' | 'repeatedCoverage'): void {
+  for (const read of windowReads.values()) read.report.during[field]++;
+}
+function windowReadReport(id: number): WorkerWindowRead | undefined {
+  const read = windowReads.get(id);
+  if (!read) return undefined;
+  const now = performance.now();
+  return {
+    ...read.report,
+    enterMs: read.enteredAt === null ? null : read.enteredAt - read.receivedAt,
+    readMs: read.enteredAt === null || read.completedAt === null ? null : read.completedAt - read.enteredAt,
+    replyMs: now - (read.completedAt ?? read.enteredAt ?? read.receivedAt),
+  };
+}
 
 function workerMemory(): import('./progressiveworker').WorkerMemory {
   const heap = getHeapStatistics();
@@ -1484,6 +1515,21 @@ async function handleMessage(message: {
   }
   const controller = new AbortController();
   requests.set(message.id, controller);
+  const kind = message.request.kind;
+  for (const read of windowReads.values()) countKind(read.report.during.received, kind);
+  if (kind === 'window' && windowReads.size < WINDOW_READS) {
+    windowReads.set(message.id, {
+      receivedAt: performance.now(),
+      enteredAt: null,
+      completedAt: null,
+      report: {
+        atReceipt: { ...activeKinds },
+        discoveryWaiting: !!waitingDiscovery,
+        during: { received: {}, finished: {}, discoveryProgress: 0, repeatedCoverage: 0 },
+      },
+    });
+  }
+  countKind(activeKinds, kind);
   try {
     const request = message.request;
     if (request.kind === 'commit-repositories') {
@@ -1497,6 +1543,7 @@ async function handleMessage(message: {
     }
     if (request.kind === 'claude-children') {
       const value = await execute(request, controller.signal, (value) => {
+        noteBackground('discoveryProgress');
         if (!controller.signal.aborted)
           parentPort?.postMessage({
             id: message.id,
@@ -1526,6 +1573,7 @@ async function handleMessage(message: {
           revision: before,
           value: { kind: 'stale' },
         },
+        windowRead: windowReadReport(message.id),
       });
       return;
     }
@@ -1551,10 +1599,17 @@ async function handleMessage(message: {
           revision: before,
           value: { kind: 'stale' },
         },
+        windowRead: windowReadReport(message.id),
       });
       return;
     }
+    const read = windowReads.get(message.id);
+    if (read) {
+      read.enteredAt = performance.now();
+      parentPort?.postMessage({ id: message.id, windowEntered: true });
+    }
     const value = await execute(metadataRequest ?? request, controller.signal);
+    if (read) read.completedAt = performance.now();
     const after = revisionOf(file);
     const stable = sameRevision(before, after);
     const stableWindow = value.kind !== 'window' || sameRevision(value.checkpoint.revision, before);
@@ -1583,6 +1638,7 @@ async function handleMessage(message: {
           turns: progressiveTurns(result.value).map(hiddenTurnFields),
           redefinesDetail: requested.agent === 'codex',
         },
+        windowRead: windowReadReport(message.id),
       });
     }
   } catch (error) {
@@ -1592,9 +1648,18 @@ async function handleMessage(message: {
     ) {
       metadataRecovery = null;
     }
-    if (!controller.signal.aborted) parentPort?.postMessage({ id: message.id, error: workerErrorIdentity(error) });
+    if (!controller.signal.aborted)
+      parentPort?.postMessage({
+        id: message.id,
+        error: workerErrorIdentity(error),
+        windowRead: windowReadReport(message.id),
+      });
   } finally {
     requests.delete(message.id);
+    windowReads.delete(message.id);
+    if (activeKinds[kind]! > 1) activeKinds[kind]!--;
+    else delete activeKinds[kind];
+    for (const read of windowReads.values()) countKind(read.report.during.finished, kind);
   }
 }
 
@@ -1626,6 +1691,7 @@ function runDiscovery(message: WorkerMessage): void {
 // completion of the map. When a map reaches the end of its file, the host reads that file again and draws once.
 onClaudeRepeatedCoverage((file) => {
   dispatchFacts.delete(file);
+  noteBackground('repeatedCoverage');
   parentPort?.postMessage({ repeatedCoverage: file });
 });
 parentPort?.on(
