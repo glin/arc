@@ -2,7 +2,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
 import { spawn, execFile, ChildProcess } from 'node:child_process';
-import { promisify } from 'node:util';
+import { isDeepStrictEqual, promisify } from 'node:util';
 import {
   DispatchReceipts,
   DISPATCH_ID,
@@ -762,7 +762,7 @@ async function observeBackground(
 }
 
 function logCapture(receipts: DispatchReceipts, id: string, bounds: ReadBounds) {
-  const capture = receipts.capture(id);
+  const capture = receipts.capture(id, bounds.readBytes);
   const sources = (['stdout.log', 'stderr.log'] as const).map((name) => ({
     name,
     file: receipts.artifact(id, name),
@@ -780,7 +780,8 @@ function logCapture(receipts: DispatchReceipts, id: string, bounds: ReadBounds) 
         throw error;
       }
     }
-    return sources.every((source) => source.cursor.offset === fs.statSync(source.file).size);
+    const aliasPending = capture.flushAlias();
+    return !aliasPending && sources.every((source) => source.cursor.offset === fs.statSync(source.file).size);
   };
   return { native: capture.native, flush, close: capture.close };
 }
@@ -901,6 +902,7 @@ export async function produceStandaloneOutput(receipts: DispatchReceipts, id: st
   worker.stdin!.on('error', () => {});
   worker.stdin!.end(receipts.input(id));
   let progressAt = Date.now();
+  let drainDeadline: number | undefined;
   try {
     while (true) {
       let complete: boolean;
@@ -918,6 +920,11 @@ export async function produceStandaloneOutput(receipts: DispatchReceipts, id: st
         continue;
       }
       if (ended && complete) break;
+      if (ended) {
+        drainDeadline ??= Date.now() + options.deadlineMs;
+        if (Date.now() >= drainDeadline)
+          throw new Error('The requested log is incomplete. Private output remains available.');
+      }
       if (ended || !complete) await OBSERVATION_RUNTIME.yield();
       else await pause(50);
     }
@@ -1000,12 +1007,15 @@ async function produceBackgroundOutput(receipts: DispatchReceipts, id: string, o
         fs.closeSync(descriptor);
       }
       let progressAt = Date.now();
+      const drainDeadline = Date.now() + options.deadlineMs;
       while (true) {
         try {
           const cursor = nativeCapture.cursor('native-source.log');
           for (const bytes of logChunks(source, READ_BYTES, cursor, READ_BYTES)) nativeCapture.native(bytes, cursor);
           const complete = capture.flush(READ_BYTES);
           if (complete && cursor.offset === fs.statSync(source).size) break;
+          if (Date.now() >= drainDeadline)
+            throw new Error('The requested log is incomplete. Private output remains available.');
           progressAt = Date.now();
           await OBSERVATION_RUNTIME.yield();
         } catch (error) {
@@ -1224,7 +1234,16 @@ export async function superviseStandalone(
           pending: unflushed?.pending ?? stream.partial(),
         });
       const last = receipts.latest(id);
-      if (!sourceFailed && !incomplete && recovered.text && last?.report?.sha256 !== payloadSha256(recovered.text))
+      if (
+        !sourceFailed &&
+        !incomplete &&
+        (last || recovered.evidence || recovered.text) &&
+        (last?.outcome !== recovered.outcome ||
+          last?.availability !== recovered.availability ||
+          !isDeepStrictEqual(last?.nativeEnding, recovered.evidence) ||
+          last?.askId !== null ||
+          (last?.report?.sha256 ?? null) !== (recovered.text === null ? null : payloadSha256(recovered.text)))
+      )
         receipts.publish(
           id,
           {

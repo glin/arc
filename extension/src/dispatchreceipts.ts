@@ -14,6 +14,7 @@ const JSON_BYTES = 48 * 1024;
 const EVENT_BYTES = JSON_BYTES - 20 * 1024;
 const STATUS_BYTES = JSON_BYTES - 4096;
 const REPORT_BYTES = 8 * 1024 * 1024;
+const CAPTURE_SLICE_BYTES = 64 * 1024;
 const OWNER = /^[A-Za-z0-9_.:-]{1,128}$/;
 const TOKEN = /^[a-f0-9]{64}$/;
 type FileIdentity = { dev: string; ino: string };
@@ -310,7 +311,9 @@ export class DispatchReceipts {
     this.launch(id);
     return this.file(id, name);
   }
-  capture(id: string) {
+  capture(id: string, aliasByteBudget = CAPTURE_SLICE_BYTES) {
+    if (!Number.isSafeInteger(aliasByteBudget) || aliasByteBudget <= 0)
+      throw new Error('The log byte allowance must be a positive integer.');
     const options = this.launch(id).standalone;
     if (!options?.logAlias) throw new Error('This launch has no requested log.');
     const alias = options.logAlias;
@@ -394,16 +397,17 @@ export class DispatchReceipts {
           let offset = state.aliasBytes ?? 0;
           if (!Number.isSafeInteger(offset) || offset < 0 || offset > end || stat.size < BigInt(offset)) return;
           state.aliasBytes = offset;
-          const buffer = Buffer.alloc(Math.min(64 * 1024, end - offset));
-          while (offset < end) {
-            const count = fs.readSync(input, buffer, 0, Math.min(buffer.length, end - offset), offset);
+          const passEnd = Math.min(end, offset + aliasByteBudget);
+          const buffer = Buffer.alloc(Math.min(CAPTURE_SLICE_BYTES, passEnd - offset));
+          while (offset < passEnd) {
+            const count = fs.readSync(input, buffer, 0, Math.min(buffer.length, passEnd - offset), offset);
             if (!count) return;
             const written = fs.writeSync(descriptor, buffer, 0, count, offset);
             if (!written) return;
             offset += written;
             state.aliasBytes = offset;
           }
-          fs.ftruncateSync(descriptor, end);
+          if (offset === end) fs.ftruncateSync(descriptor, end);
         } finally {
           try {
             if (source !== undefined) fs.closeSync(source);
@@ -415,7 +419,7 @@ export class DispatchReceipts {
         /* Private channel output remains available after an alias changes. */
       }
     };
-    try {
+    const flushAlias = () =>
       this.lock(
         id,
         () => {
@@ -425,9 +429,23 @@ export class DispatchReceipts {
           publishAlias();
           if (state.aliasBytes !== delivered)
             writeFileAtomically(checkpoint, JSON.stringify(state), undefined, 0o600, false);
+          const end = options.background
+            ? (state.sources['native-source.log']?.offset ??
+              (fs.existsSync(this.artifact(id, 'native.log')) ? fs.statSync(this.artifact(id, 'native.log')).size : 0))
+            : state.bytes;
+          if (!state.alias || (state.aliasBytes ?? 0) >= end) return false;
+          try {
+            safePath(alias);
+            return equalIdentity(state.alias, identity(alias));
+          } catch (error) {
+            const code = (error as NodeJS.ErrnoException).code;
+            return code === 'EPERM' || code === 'EACCES';
+          }
         },
         'capture-write',
       );
+    try {
+      flushAlias();
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
       if (
@@ -440,6 +458,7 @@ export class DispatchReceipts {
       }
     }
     return {
+      flushAlias,
       cursor: (name: CaptureSource): CaptureCursor =>
         (() => {
           reload();
@@ -458,7 +477,6 @@ export class DispatchReceipts {
                   throw new Error('The original worker output position changed.');
                 if (cursor.offset <= committed.offset) {
                   Object.assign(cursor, committed);
-                  if (!options.background) publishAlias();
                   return;
                 }
                 bytes = bytes.subarray(Math.max(0, committed.offset - start));
@@ -490,15 +508,11 @@ export class DispatchReceipts {
                   throw new Error('The original native log position changed.');
                 if (cursor.offset <= committed.offset) {
                   Object.assign(cursor, committed);
-                  publishAlias();
                   return;
                 }
                 bytes = bytes.subarray(Math.max(0, committed.offset - start));
               } else if (start !== 0) throw new Error('The original native log position is unavailable.');
-            } else if (committed) {
-              publishAlias();
-              return;
-            }
+            } else if (committed) return;
             const offset = cursor ? (committed?.offset ?? 0) : 0;
             const file = this.artifact(id, 'native.log');
             if (fs.existsSync(file)) safePath(file);

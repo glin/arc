@@ -164,12 +164,16 @@ test('native capture reconciles overlapping snapshots and preserves a reused ali
 
 test.each(
   (['print', 'native'] as const).flatMap((kind) =>
-    (['continue', 'resume', 'legacy resume', 'replaced', 'reused'] as const).map((recovery) => ({ kind, recovery })),
+    (['continue', 'resume', 'legacy resume', 'bounded replay', 'replaced', 'reused'] as const).map((recovery) => ({
+      kind,
+      recovery,
+    })),
   ),
 )('failed log alias writes recover complete $kind bytes on $recovery', ({ kind, recovery }) => {
   const { receipts, launch, home } = fixture();
   const native = kind === 'native';
   const alias = path.join(home, 'live.log');
+  const aliasByteBudget = recovery === 'bounded replay' ? 17 : undefined;
   const standalone = receipts.reserve({
     ...launch,
     transport: 'standalone',
@@ -188,7 +192,7 @@ test.each(
       deadlineMs: 10_000,
     },
   });
-  let capture = receipts.capture(standalone.launchId);
+  let capture = receipts.capture(standalone.launchId, aliasByteBudget);
   const name = native ? 'native-source.log' : 'stdout.log';
   let offset = 0;
   const append = (bytes: Buffer) => {
@@ -198,7 +202,7 @@ test.each(
     else capture.write(bytes, name, cursor);
   };
   const prefix = Buffer.from('prefix\n');
-  const missing = Buffer.alloc(2 * 64 * 1024 + 17, 255);
+  const missing = Buffer.alloc(recovery === 'bounded replay' ? 39 : 2 * 64 * 1024 + 17, 255);
   const tail = Buffer.from('tail\n');
   const privateFile = receipts.artifact(standalone.launchId, native ? 'native.log' : 'worker.log');
   try {
@@ -248,13 +252,26 @@ test.each(
 
     if (recovery !== 'continue') {
       capture.close();
-      capture = new DispatchReceipts(path.dirname(receipts.root)).capture(standalone.launchId);
+      capture = new DispatchReceipts(path.dirname(receipts.root)).capture(standalone.launchId, aliasByteBudget);
+      if (recovery === 'bounded replay') {
+        const delivered = prefix.length + aliasByteBudget!;
+        assert.deepEqual(fs.readFileSync(alias), captured.subarray(0, delivered));
+        const checkpoint = JSON.parse(fs.readFileSync(receipts.artifact(standalone.launchId, 'capture.json'), 'utf8'));
+        assert.equal(checkpoint.aliasBytes, delivered);
+        assert.ok(delivered < captured.length);
+      }
+      for (let pass = 0; pass < 8 && capture.flushAlias(); pass++) {
+        /* Continue bounded delivery without new output. */
+      }
       assert.ok(
         fs.readFileSync(alias).equals(replacement ?? captured),
         'resumed alias must contain every captured byte',
       );
     }
     append(tail);
+    for (let pass = 0; pass < 8 && capture.flushAlias(); pass++) {
+      /* Drain the remaining alias bytes. */
+    }
     const complete = Buffer.concat([captured, tail]);
     assert.deepEqual(fs.readFileSync(privateFile), complete);
     assert.ok(

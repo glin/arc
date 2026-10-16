@@ -1389,6 +1389,52 @@ function outputFrames() {
       .join('\n') + '\n'
   );
 }
+test.each([
+  ['turn.failed', 1, null, 'failed'],
+  ['turn.completed', 0, null, 'succeeded'],
+  ['turn.completed', null, 'SIGTERM', 'interrupted'],
+] as const)(
+  'reportless %s recovery publishes changed outcome %s %s %s once',
+  async (type, exitCode, signal, outcome) => {
+    const { receipts, launch } = workerFixture('', 3);
+    const child = new ChildProcess();
+    child.stdin = new PassThrough();
+    vi.mocked(childProcess.spawn).mockReturnValue(child);
+    let now = 0;
+    const bounds = { frameBytes: 256, readBytes: 17, workBytes: 512 };
+    const initial = superviseStandalone(receipts, launch.launchId, false, bounds, {
+      now: () => now,
+      identity: async () => null,
+      yield: async () => {
+        now += launch.standalone!.deadlineMs;
+      },
+    });
+    const log = receipts.artifact(launch.launchId, 'stdout.log');
+    fs.writeFileSync(
+      log,
+      [{ type: 'thread.started', thread_id: session }, { type: 'turn.started' }, { type }]
+        .map((row) => JSON.stringify(row))
+        .join('\n') + '\n',
+    );
+    child.emit('close', exitCode, signal);
+    await initial;
+    assert.equal(receipts.observation(launch.launchId)?.monitor, 'timed-out');
+    assert.equal(receipts.latest(launch.launchId)?.outcome, 'unknown');
+    assert.equal(receipts.latest(launch.launchId)?.availability, 'pending');
+    const runtime = { now: () => 0, identity: async () => null, yield: () => Promise.resolve() };
+    await superviseStandalone(receipts, launch.launchId, true, bounds, runtime);
+    const event = receipts.latest(launch.launchId)!;
+    assert.equal(event.outcome, outcome);
+    assert.equal(event.availability, 'unavailable');
+    assert.equal(event.report, null);
+    assert.deepEqual(event.nativeEnding, { type, sessionId: session, messageId: null });
+    assert.equal(receipts.status(launch.launchId).events.length, 2);
+    await superviseStandalone(receipts, launch.launchId, true, bounds, runtime);
+    assert.equal(receipts.latest(launch.launchId)?.eventId, event.eventId);
+    assert.equal(receipts.status(launch.launchId).events.length, 2);
+    assert.equal(vi.mocked(childProcess.spawn).mock.calls.length, 1);
+  },
+);
 test('recovery retries unavailable identity and keeps same-lifetime launcher provenance through command changes', async () => {
   const { receipts, launch, launcher } = recoveryFixture();
   let lookups = 0;
@@ -1736,7 +1782,10 @@ test.each(['replacement', 'truncation', 'missing'] as const)(
     };
     await superviseStandalone(receipts, launch.launchId, true, bounds, runtime);
     assert.equal((receipts.scan(launch.launchId) as any).offset, fs.statSync(file).size);
-    assert.equal(receipts.latest(launch.launchId), null);
+    const initial = receipts.latest(launch.launchId)!;
+    assert.equal(initial.outcome, 'unknown');
+    assert.equal(initial.availability, 'unavailable');
+    assert.equal(initial.report, null);
     if (change === 'replacement') {
       fs.renameSync(file, file + '.original');
       fs.writeFileSync(file, outputFrames());
@@ -1744,7 +1793,7 @@ test.each(['replacement', 'truncation', 'missing'] as const)(
     else fs.unlinkSync(file);
     fs.writeFileSync(receipts.artifact(launch.launchId, 'native.md'), 'Report');
     await superviseStandalone(receipts, launch.launchId, true, bounds, runtime);
-    assert.equal(receipts.latest(launch.launchId), null);
+    assert.deepEqual(receipts.latest(launch.launchId), initial);
     assert.equal(receipts.observation(launch.launchId)?.monitor, 'unavailable');
     const lease = receipts.monitor(launch.launchId);
     lease.release();
@@ -2490,6 +2539,50 @@ test('an existing print output owner refuses another native producer', async () 
   spawn.mockReturnValue(child);
   await assert.rejects(produceStandaloneOutput(receipts, launch.launchId), { code: 'EEXIST' });
   assert.equal(spawn.mock.calls.length, 0);
+});
+
+test('print capture retries the final alias failure without new output before finishing', async () => {
+  vi.spyOn(process, 'send').mockImplementation(() => true);
+  vi.spyOn(process, 'disconnect').mockImplementation(() => {});
+  const { receipts, launch } = workerFixture('', 10_000, false, true);
+  const stdout = receipts.artifact(launch.launchId, 'stdout.log');
+  const stderr = receipts.artifact(launch.launchId, 'stderr.log');
+  fs.writeFileSync(stdout, 'prefix');
+  fs.writeFileSync(stderr, '');
+  const child = new ChildProcess();
+  child.stdin = new PassThrough();
+  vi.mocked(childProcess.spawn).mockReturnValue(child);
+  const alias = launch.standalone!.logAlias!;
+  const open = fs.openSync;
+  let failed = false;
+  let blocked = false;
+  const failure = vi.spyOn(fs, 'openSync').mockImplementation((file, ...args) => {
+    if (String(file) === alias && blocked) {
+      failed = true;
+      throw Object.assign(new Error('Alias unavailable'), { code: 'EPERM' });
+    }
+    return Reflect.apply(open, fs, [file, ...args]);
+  });
+  const owner = () => JSON.parse(fs.readFileSync(receipts.artifact(launch.launchId, 'output-owner.json'), 'utf8'));
+  const pending = produceStandaloneOutput(receipts, launch.launchId);
+  try {
+    await vi.waitFor(() => assert.equal(fs.readFileSync(alias, 'utf8'), 'prefix'));
+    blocked = true;
+    fs.appendFileSync(stdout, ' final');
+    child.emit('close', 0, null);
+    await vi.waitFor(() => assert.equal(failed, true));
+    assert.notEqual(owner().state, 'finished');
+    assert.equal(fs.readFileSync(alias, 'utf8'), 'prefix');
+    blocked = false;
+    await pending;
+    assert.equal(fs.readFileSync(alias, 'utf8'), 'prefix final');
+    assert.equal(owner().state, 'finished');
+  } finally {
+    blocked = false;
+    child.emit('close', 0, null);
+    await pending;
+    failure.mockRestore();
+  }
 });
 
 test.each([false, true])(
