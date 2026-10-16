@@ -1005,7 +1005,7 @@ function logCapture(receipts: DispatchReceipts, id: string, bounds: ReadBounds) 
     const aliasPending = capture.flushAlias();
     return !aliasPending && sources.every((source) => source.cursor.offset === fs.statSync(source.file).size);
   };
-  return { native: capture.native, flush, flushAlias: capture.flushAlias, close: capture.close };
+  return { native: capture.native, flush, close: capture.close };
 }
 
 function liveLogCapture(receipts: DispatchReceipts, id: string, bounds: ReadBounds) {
@@ -1031,7 +1031,7 @@ function liveLogCapture(receipts: DispatchReceipts, id: string, bounds: ReadBoun
           await runtime.yield();
           if (runtime.now() >= deadline) break;
           try {
-            if (!capture.flushAlias()) return true;
+            if (capture.flush(0)) return true;
           } catch {
             /* A later pass retries unavailable alias delivery. */
           }

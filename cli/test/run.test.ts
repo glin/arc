@@ -1484,6 +1484,69 @@ test.each(['complete', 'deadline'] as const)(
     }
   },
 );
+test('resumed observation retains timeout while stopped producer stderr exceeds its close allowance', async () => {
+  const { receipts, launch } = workerFixture('', 20, false, true);
+  const id = launch.launchId;
+  const bounds = { frameBytes: 1024, readBytes: 64, workBytes: 512 };
+  const stdout = Buffer.from(outputFrames());
+  const stderr = Buffer.from(Array.from({ length: 3 * bounds.workBytes + 31 }, (_, index) => 128 + (index % 128)));
+  assert.ok(stdout.length < bounds.workBytes);
+  fs.writeFileSync(receipts.artifact(id, 'stdout.log'), stdout);
+  fs.writeFileSync(receipts.artifact(id, 'stderr.log'), stderr);
+  fs.writeFileSync(receipts.artifact(id, 'native.md'), 'Report');
+  receipts.observation(id, {
+    supervisor: { pid: process.pid, token: id },
+    worker: null,
+    sessionId: null,
+    exitCode: 0,
+    signal: null,
+    monitor: 'timed-out',
+  });
+  const owner = { pid: 2147483647, producerPid: 2147483646, state: 'unavailable' };
+  fs.writeFileSync(receipts.artifact(id, 'output-owner.json'), JSON.stringify(owner));
+  const alias = launch.standalone!.logAlias!;
+  let previousStderr = 0;
+  let previous = Buffer.alloc(0);
+  let eventId: string | undefined;
+  for (let pass = 0; pass < Math.ceil(stderr.length / bounds.workBytes); pass++) {
+    let now = 0;
+    const status = (await superviseStandalone(receipts, id, true, bounds, {
+      now: () => now,
+      identity: async () => null,
+      yield: async () => {
+        now++;
+      },
+    })) as any;
+    const position = JSON.parse(fs.readFileSync(receipts.artifact(id, 'capture.json'), 'utf8'));
+    const captured = fs.readFileSync(receipts.artifact(id, 'worker.log'));
+    const expectedStderr = Math.min(stderr.length, previousStderr + bounds.workBytes);
+    assert.equal(position.sources['stdout.log'].offset, stdout.length);
+    assert.equal(position.sources['stderr.log'].offset, expectedStderr);
+    assert.equal(captured.length, stdout.length + expectedStderr);
+    assert.deepEqual(captured.subarray(0, previous.length), previous);
+    assert.deepEqual(Buffer.from([...captured].filter((byte) => byte < 128)), stdout);
+    assert.deepEqual(Buffer.from([...captured].filter((byte) => byte >= 128)), stderr.subarray(0, expectedStderr));
+    assert.deepEqual(fs.readFileSync(alias), captured);
+    const event = receipts.latest(id)!;
+    eventId ??= event.eventId;
+    assert.equal(event.eventId, eventId);
+    assert.equal(event.outcome, 'succeeded');
+    assert.equal((receipts.result(id, event.eventId) as any).text, 'Report');
+    if (expectedStderr < stderr.length) {
+      assert.equal(status.observation.monitor, 'timed-out');
+      assert.equal(status.observation.reason, 'Observation timed out before all worker output was read.');
+      assert.equal(now, launch.standalone!.deadlineMs);
+    } else assert.equal(status.observation.monitor, 'finished');
+    assert.equal(status.observation.exitCode, 0);
+    assert.equal(status.observation.worker, null);
+    previousStderr = expectedStderr;
+    previous = captured;
+  }
+  assert.equal(previousStderr, stderr.length);
+  assert.deepEqual(JSON.parse(fs.readFileSync(receipts.artifact(id, 'output-owner.json'), 'utf8')), owner);
+  assert.equal(vi.mocked(childProcess.spawn).mock.calls.length, 0);
+});
+
 test.each([
   ['turn.failed', 1, null, 'failed'],
   ['turn.completed', null, 'SIGTERM', 'interrupted'],
@@ -1770,10 +1833,13 @@ test('fresh close retains real exit and bounds output work before later complete
   assert.deepEqual(fs.readFileSync(log), expected);
   let position = 0;
   for (let attempt = 0; attempt < 20 && receipts.latest(launch.launchId)?.availability !== 'available'; attempt++) {
+    let now = 0;
     await superviseStandalone(receipts, launch.launchId, true, bounds, {
-      now: () => 0,
+      now: () => now,
       identity: async () => null,
-      yield: async () => {},
+      yield: async () => {
+        if (((receipts.scan(launch.launchId) as any)?.offset ?? 0) > position) now += launch.standalone!.deadlineMs;
+      },
     });
     const saved = receipts.scan(launch.launchId) as any;
     assert.ok(saved.offset > position);
@@ -3419,12 +3485,19 @@ test('reused explicit log and report aliases keep each launch capture and frozen
   const aliasBefore = fs.readFileSync(log);
   const secondBefore = fs.readFileSync(receipts.artifact(second.launchId, 'worker.log'));
   const spawns = vi.mocked(childProcess.spawn).mock.calls.length;
+  let now = 0;
   await superviseStandalone(
     receipts,
     first.launchId,
     true,
     { frameBytes: 1024, readBytes: 17, workBytes: 64 },
-    { now: () => 0, identity: async () => null, yield: async () => {} },
+    {
+      now: () => now,
+      identity: async () => null,
+      yield: async () => {
+        if (receipts.scan(first.launchId)) now += first.standalone!.deadlineMs;
+      },
+    },
   );
   assert.deepEqual(
     fs.readFileSync(receipts.artifact(first.launchId, 'worker.log')),
