@@ -3,6 +3,7 @@ import {
   advisorProbeRecords,
   advisorResponseRecords,
   PER_PASS_ITERATIONS,
+  claudeDispatchTranscript,
 } from '../../extension/src/turnfixtures.ts';
 import { tempDir } from '../../extension/src/temproot.ts';
 import assert from 'node:assert/strict';
@@ -211,6 +212,102 @@ test('cost preserves native usage, metadata-only sessions, and incomplete traili
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
+});
+
+test('standalone receipts price each original child once through both native parent formats', () => {
+  for (const parentAgent of ['claude', 'codex'])
+    for (const childAgent of ['claude', 'codex']) {
+      const { root, projects, codex, file } = fixture();
+      try {
+        const id = 'aaaaaaaa-1111-2222-3333-444444444444';
+        const child =
+          childAgent === 'claude'
+            ? path.join(path.dirname(file), `${id}.jsonl`)
+            : path.join(codex, `rollout-${id}.jsonl`);
+        const at = '2026-09-26T00:00:01Z';
+        const counts = {
+          input_tokens: 1000,
+          cached_input_tokens: 0,
+          cache_write_input_tokens: 0,
+          output_tokens: 100,
+          reasoning_output_tokens: 0,
+          total_tokens: 1100,
+        };
+        fs.writeFileSync(
+          child,
+          childAgent === 'claude'
+            ? fs.readFileSync(file)
+            : [
+                {
+                  type: 'session_meta',
+                  timestamp: at,
+                  payload: { id, cwd: root, source: 'exec', model_provider: 'openai' },
+                },
+                { type: 'event_msg', timestamp: at, payload: { type: 'task_started', turn_id: 'own' } },
+                {
+                  type: 'turn_context',
+                  timestamp: at,
+                  payload: { turn_id: 'own', model: 'gpt-6-astra', effort: 'high' },
+                },
+                {
+                  type: 'event_msg',
+                  timestamp: at,
+                  payload: { type: 'token_count', info: { last_token_usage: counts, total_token_usage: counts } },
+                },
+              ]
+                .map((row) => JSON.stringify(row))
+                .join('\n') + '\n',
+        );
+        const marker = `ARC_DISPATCH_SESSION=${JSON.stringify({ agent: childAgent, session_id: id, name: 'Review', owned: true })}`;
+        const command = `arc run --provider ${childAgent} --arc-dispatch --agent-run=false`;
+        const parent = parentAgent === 'claude' ? file : path.join(codex, 'rollout-parent.jsonl');
+        const records =
+          parentAgent === 'claude'
+            ? [
+                ...claudeDispatchTranscript(command, marker, 'first'),
+                ...claudeDispatchTranscript(command, marker, 'second'),
+              ]
+            : [
+                { type: 'session_meta', timestamp: at, payload: { id: 'parent', cwd: root, source: 'cli' } },
+                { type: 'event_msg', timestamp: at, payload: { type: 'task_started', turn_id: 'own' } },
+                {
+                  type: 'turn_context',
+                  timestamp: at,
+                  payload: { turn_id: 'own', cwd: root, model: 'gpt-6.1-sol', effort: 'high' },
+                },
+                ...['first', 'second'].map((tool) => ({
+                  type: 'event_msg',
+                  timestamp: at,
+                  payload: {
+                    type: 'item_completed',
+                    item: {
+                      type: 'CommandExecution',
+                      id: tool,
+                      command: ['bash', '-c', command],
+                      status: 'completed',
+                      exit_code: 0,
+                      stdout: marker,
+                    },
+                  },
+                })),
+              ];
+        fs.writeFileSync(parent, records.map((row) => JSON.stringify(row)).join('\n') + '\n');
+        fs.writeFileSync(path.join(root, 'copied-report.jsonl'), fs.readFileSync(child));
+        fs.writeFileSync(path.join(root, 'receipt-output.txt'), marker);
+        const roots = ['--projects', projects, '--codex-sessions', codex, '--by-model'];
+        const original = JSON.parse(runCost([child, '--source-only', ...roots]));
+        const report = JSON.parse(runCost([parent, ...roots]));
+        assert.equal(original.parent.requests, 1, childAgent);
+        assert.equal(report.children.length, 1, `${parentAgent}/${childAgent}`);
+        assert.equal(report.children[0].file, child);
+        assert.equal(report.children[0].sessionId, id);
+        assert.equal(report.children[0].costUsd, original.parent.costUsd);
+        assert.equal(report.combined.requests, original.parent.requests);
+        assert.equal(report.combined.costUsd, original.parent.costUsd);
+      } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+      }
+    }
 });
 
 test('cost attributes a delayed native child once through colliding parent session ids', () => {

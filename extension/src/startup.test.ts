@@ -2535,6 +2535,7 @@ test('two visible hosts accept their own concurrent selected windows while a lat
   provider.repositoryScopeRoots = [fixture.workspace, fixture.worktree];
   provider.repositoryScope = { snapshot: () => ({ ready: true, roots: provider.repositoryScopeRoots }) };
   provider.selectionWorks = new Map();
+  provider.progressiveCurrent = (source: SessionFile) => Boolean(provider.cache.get(source.file));
   const peer = { webview: {}, visible: () => true };
   provider.hosts.push(peer);
   provider.hostSessions = new Map([
@@ -3909,10 +3910,11 @@ test('a selected-only refresh before the catalog keeps every held title, and the
     walking = true;
     return walk;
   };
+  const refresh = vi.spyOn(provider, 'refresh');
   provider.workspaceFoldersChanged();
+  const scoped = refresh.mock.results.at(-1)!.value;
   assert.equal(provider.authoritativeCatalog, null, 'the workspace folder change kept the old catalog');
   provider.repositoryScopeReady = true;
-  const scoped = provider.refresh(true);
   await vi.waitFor(() => assert.ok(walking, 'the new scope refresh did not start discovery'));
   await provider.refresh(true, true, true, true);
   assert.deepEqual(heldFiles(provider.titles), listed, 'a selected-only refresh after a scope change dropped titles');
@@ -4378,8 +4380,8 @@ test('a subagent the worker hands over after the first render names its parent',
   const children = [child('a1b2c3', 4), child('d4e5f6', 3)];
   // Pairing changes neither transcript revisions nor the catalog entries.
 
-  provider.partial = parents;
-  provider.catalog = { sessions: [...parents, ...children] };
+  provider.partial = [...parents, ...children];
+  provider.catalog = { sessions: provider.partial };
   let paired = false;
   // The worker hands back new lists on every walk, as `prepareClaudeChildren` does.
   provider.prepareClaudeChildren = () => {
@@ -6393,6 +6395,7 @@ test('stale selected work retries without a new selection', async () => {
 
 test('poll and watcher refresh paths leave selected work running through completion', async () => {
   const provider = completeDiscoveryHarness(undefined, true, ['progressiveCurrent']);
+  provider.progressiveCurrent = (source: SessionFile) => Boolean(provider.cache.get(source.file));
   const selected = {
     file: 'selected.jsonl',
     sessionId: 'selected',
@@ -9074,8 +9077,10 @@ test('pending loading statuses keep the last relationship source count until com
     assert.equal(provider.posts.at(-1).known, 2, 'an older generation changed the retained count');
 
     // A scope change drops the count.
+    const refresh = vi.spyOn(provider, 'refresh');
     provider.workspaceFoldersChanged();
-    await vi.waitFor(() => assert.equal(provider.refreshController, null));
+    await refresh.mock.results.at(-1)!.value;
+    assert.equal(provider.refreshController, null);
     Object.assign(provider, { repositoryScopeReady: true, repositoryScopeRoots: ['project'] });
     provider.refreshGeneration += 1;
     provider.postSessionLoading(provider.refreshGeneration, signal);
@@ -10206,8 +10211,10 @@ test('the diagnostics log records each loading line change and stays quiet throu
     for (let index = 0; index < 3; index++) await poll();
     pendingPass();
     for (let index = 0; index < 3; index++) await poll();
+    const refresh = vi.spyOn(provider, 'refresh');
     provider.workspaceFoldersChanged();
-    await vi.waitFor(() => assert.equal(provider.refreshController, null));
+    await refresh.mock.results.at(-1)!.value;
+    assert.equal(provider.refreshController, null);
 
     assert.deepEqual(events(), [
       'shown by discovery progress: discovery pending',

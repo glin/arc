@@ -11,21 +11,58 @@ import { canonicalToolPath } from './toolownership';
 export const DISPATCH_ID = /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/;
 export const DISPATCH_TEXT_LIMIT = 16_000;
 const JSON_BYTES = 48 * 1024;
+const EVENT_BYTES = JSON_BYTES - 20 * 1024;
+const STATUS_BYTES = JSON_BYTES - 4096;
 const REPORT_BYTES = 8 * 1024 * 1024;
 const OWNER = /^[A-Za-z0-9_.:-]{1,128}$/;
 const TOKEN = /^[a-f0-9]{64}$/;
 type FileIdentity = { dev: string; ino: string };
+type CaptureSource = 'stdout.log' | 'stderr.log' | 'native-source.log';
+type CaptureCursor = { offset: number; identity: string };
+interface CaptureState {
+  raw: FileIdentity;
+  alias: FileIdentity | null;
+  bytes: number;
+  sources: Partial<Record<CaptureSource, CaptureCursor>>;
+}
 export type DispatchOutcome = 'running' | 'succeeded' | 'failed' | 'interrupted' | 'needs-input' | 'unknown';
 export interface DispatchLaunch {
   launchId: string;
   origin: string;
-  transport: 'hosted';
+  transport: 'hosted' | 'standalone';
   requester: RequesterIdentity | null;
   policy: LaunchPolicy | null;
   promptSha256: string;
   completion: 'manual' | 'wait';
   alias: string | null;
   aliasParent?: FileIdentity;
+  standalone?: StandaloneOptions;
+}
+export interface StandaloneOptions {
+  provider: 'claude' | 'codex';
+  command: string;
+  args: string[];
+  cwd: string;
+  model: string;
+  effort: string;
+  name: string;
+  agentRun: boolean;
+  background: boolean;
+  sessionHint: string | null;
+  logAlias: string | null;
+  logAliasParent?: FileIdentity;
+  deadlineMs: number;
+  env?: Record<string, string | null>;
+}
+export interface StandaloneObservation {
+  supervisor: { pid: number; token: string };
+  worker: { pid: number; command: string; argsSha256: string; startedAt: string; commandLineSha256: string } | null;
+  launcher?: StandaloneObservation['worker'];
+  sessionId: string | null;
+  exitCode: number | null;
+  signal: string | null;
+  monitor: 'starting' | 'observing' | 'finished' | 'unavailable' | 'timed-out';
+  reason?: string;
 }
 export interface DispatchEvent {
   launchId: string;
@@ -79,7 +116,7 @@ export function outsideDispatchStorage(root: string, file: string, platform = pr
     paths.isAbsolute(file) && (paths.isAbsolute(relative) || relative === '..' || relative.startsWith(`..${paths.sep}`))
   );
 }
-function read(file: string, limit = JSON_BYTES): string {
+function read(file: string, limit = JSON_BYTES, exactSize = false): string {
   safePath(file);
   const before = identity(file);
   const fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
@@ -91,14 +128,15 @@ function read(file: string, limit = JSON_BYTES): string {
       !equalIdentity(before, { dev: String(stat.dev), ino: String(stat.ino) })
     )
       throw new Error('The dispatch file is unavailable or replaced.');
-    const buffer = Buffer.alloc(limit + 1);
+    const buffer = Buffer.alloc((exactSize ? Number(stat.size) : limit) + 1);
     let length = 0;
     while (length < buffer.length) {
       const count = fs.readSync(fd, buffer, length, buffer.length - length, null);
       if (!count) break;
       length += count;
     }
-    if (length > limit) throw new Error('The dispatch file exceeds its read allowance.');
+    if (length > limit || (exactSize && length > Number(stat.size)))
+      throw new Error('The dispatch file exceeds its read allowance.');
     const text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(buffer.subarray(0, length));
     if (!equalIdentity(before, identity(file)) || Buffer.byteLength(text) > limit)
       throw new Error('The dispatch file changed during the read.');
@@ -114,6 +152,14 @@ function exclusive(file: string, text: string): void {
 function validId(id: string): void {
   if (!DISPATCH_ID.test(id)) throw new Error('The dispatch identity is invalid.');
 }
+function statusLaunch(launch: DispatchLaunch) {
+  return {
+    launchId: launch.launchId,
+    transport: launch.transport,
+    completion: launch.completion,
+    origin: launch.origin,
+  };
+}
 
 // Native records supply response and usage evidence. These files retain launch and consumption identity only.
 export class DispatchReceipts {
@@ -121,7 +167,9 @@ export class DispatchReceipts {
   constructor(home = arcHome()) {
     this.root = path.join(path.resolve(home), 'dispatch');
   }
-  reserve(input: Omit<DispatchLaunch, 'launchId' | 'transport'>): DispatchLaunch {
+  reserve(
+    input: Omit<DispatchLaunch, 'launchId' | 'transport'> & { transport?: DispatchLaunch['transport'] },
+  ): DispatchLaunch {
     if (
       !/^[a-f0-9]{24}$/.test(input.origin) ||
       !TOKEN.test(input.promptSha256) ||
@@ -131,7 +179,19 @@ export class DispatchReceipts {
       throw new Error('The dispatch origin or requester is invalid.');
     fs.mkdirSync(this.root, { recursive: true, mode: 0o700 });
     safePath(this.root);
+    if (input.standalone?.logAlias) {
+      const alias = input.standalone.logAlias;
+      if (!outsideDispatchStorage(canonicalToolPath(this.root), canonicalToolPath(alias)))
+        throw new Error('A log alias must stay outside private dispatch storage.');
+      safePath(path.dirname(alias));
+      if (fs.existsSync(alias)) {
+        safePath(alias);
+        if (!fs.lstatSync(alias).isFile()) throw new Error('A log alias must name a regular file.');
+      }
+    }
     if (input.alias) {
+      if (input.standalone?.logAlias && canonicalToolPath(input.alias) === canonicalToolPath(input.standalone.logAlias))
+        throw new Error('Choose separate paths for the log and final report.');
       if (
         !path.isAbsolute(input.alias) ||
         !outsideDispatchStorage(canonicalToolPath(this.root), canonicalToolPath(input.alias))
@@ -150,14 +210,44 @@ export class DispatchReceipts {
     }
     const launchId = randomUUID();
     const directory = path.join(this.root, launchId);
-    fs.mkdirSync(directory, { mode: 0o700 });
     const launch: DispatchLaunch = {
       ...input,
+      ...(input.standalone?.logAlias
+        ? {
+            standalone: {
+              ...input.standalone,
+              logAliasParent: identity(fs.realpathSync.native(path.dirname(input.standalone.logAlias))),
+            },
+          }
+        : {}),
       ...(input.alias ? { aliasParent: identity(fs.realpathSync.native(path.dirname(input.alias))) } : {}),
       launchId,
-      transport: 'hosted',
+      transport: input.transport ?? 'hosted',
     };
     const receipt = JSON.stringify(launch);
+    if (Buffer.byteLength(receipt) > JSON_BYTES)
+      throw new Error('The launch settings exceed the dispatch receipt allowance. Reduce the selected configuration.');
+    this.checkStatusEnvelope(
+      launch,
+      launch.standalone
+        ? {
+            supervisor: { pid: Number.MAX_SAFE_INTEGER, token: 'f'.repeat(64) },
+            worker: {
+              pid: Number.MAX_SAFE_INTEGER,
+              command: launch.standalone.command,
+              argsSha256: 'f'.repeat(64),
+              commandLineSha256: 'f'.repeat(64),
+              startedAt: '9999-12-31T23:59:59.9999999+00:00',
+            },
+            sessionId: 'f'.repeat(36),
+            exitCode: Number.MIN_SAFE_INTEGER,
+            signal: 'SIGTERM',
+            monitor: 'unavailable',
+            reason: 'The original worker output is unavailable. No worker was restarted.',
+          }
+        : null,
+    );
+    fs.mkdirSync(directory, { mode: 0o700 });
     exclusive(path.join(directory, 'receipt.json'), receipt);
     const anchor: Anchor = {
       launchId,
@@ -183,9 +273,310 @@ export class DispatchReceipts {
     )
       throw new Error('The authoritative dispatch receipt was replaced.');
     const launch = JSON.parse(text) as DispatchLaunch;
-    if (launch.launchId !== id || launch.transport !== 'hosted' || !/^[a-f0-9]{24}$/.test(launch.origin))
+    if (
+      launch.launchId !== id ||
+      !['hosted', 'standalone'].includes(launch.transport) ||
+      !/^[a-f0-9]{24}$/.test(launch.origin)
+    )
       throw new Error('The dispatch receipt identity is invalid.');
     return launch;
+  }
+  input(id: string, text?: string): string {
+    const launch = this.launch(id);
+    const file = this.file(id, 'prompt.txt');
+    if (text !== undefined) {
+      if (Buffer.byteLength(text) > 48 * 1024 || payloadSha256(text) !== launch.promptSha256)
+        throw new Error('The dispatch prompt does not match its receipt.');
+      exclusive(file, text);
+    }
+    const saved = read(file);
+    if (payloadSha256(saved) !== launch.promptSha256) throw new Error('The dispatch prompt changed.');
+    return saved;
+  }
+  artifact(
+    id: string,
+    name:
+      | 'stdout.log'
+      | 'stderr.log'
+      | 'worker.log'
+      | 'native.log'
+      | 'native-source.log'
+      | 'native.md'
+      | 'attend.sh'
+      | 'output-owner.json'
+      | 'capture.json',
+  ): string {
+    this.launch(id);
+    return this.file(id, name);
+  }
+  capture(id: string) {
+    const options = this.launch(id).standalone;
+    if (!options?.logAlias) throw new Error('This launch has no requested log.');
+    const alias = options.logAlias;
+    safePath(path.dirname(alias));
+    if (
+      !options.logAliasParent ||
+      !equalIdentity(options.logAliasParent, identity(fs.realpathSync.native(path.dirname(alias))))
+    )
+      throw new Error('The log folder was replaced.');
+    const rawFile = this.artifact(id, 'worker.log');
+    const checkpoint = this.file(id, 'capture.json');
+    let state: CaptureState = fs.existsSync(checkpoint)
+      ? JSON.parse(read(checkpoint))
+      : this.lock(
+          id,
+          (): CaptureState => {
+            if (fs.existsSync(checkpoint)) return JSON.parse(read(checkpoint));
+            // A capture without an alias witness cannot claim its current pathname.
+            const existing = fs.existsSync(rawFile);
+            if (existing) safePath(rawFile);
+            else exclusive(rawFile, '');
+            let aliasIdentity: FileIdentity | null = null;
+            if (!existing) {
+              if (fs.existsSync(alias)) safePath(alias);
+              const temporary = path.join(path.dirname(alias), `.arc-log-${randomUUID()}`);
+              fs.writeFileSync(temporary, '', { flag: 'wx', mode: 0o600 });
+              try {
+                fs.renameSync(temporary, alias);
+              } catch (error) {
+                fs.unlinkSync(temporary);
+                throw error;
+              }
+              aliasIdentity = identity(alias);
+            }
+            const initial: CaptureState = { raw: identity(rawFile), alias: aliasIdentity, bytes: 0, sources: {} };
+            writeFileAtomically(checkpoint, JSON.stringify(initial), undefined, 0o600, false);
+            return initial;
+          },
+          'capture-write',
+        );
+    safePath(rawFile);
+    if (!Number.isSafeInteger(state.bytes) || state.bytes < 0 || !equalIdentity(state.raw, identity(rawFile)))
+      throw new Error('The captured worker output was replaced.');
+    const raw = fs.openSync(rawFile, fs.constants.O_RDWR | (fs.constants.O_NOFOLLOW ?? 0));
+    const rawStat = fs.fstatSync(raw, { bigint: true });
+    if (!rawStat.isFile() || !equalIdentity(state.raw, { dev: String(rawStat.dev), ino: String(rawStat.ino) })) {
+      fs.closeSync(raw);
+      throw new Error('The captured worker output was replaced.');
+    }
+    if (rawStat.size < BigInt(state.bytes)) {
+      fs.closeSync(raw);
+      throw new Error('The captured worker output was truncated.');
+    }
+    const reload = () => {
+      const current = JSON.parse(read(checkpoint)) as CaptureState;
+      safePath(rawFile);
+      if (!equalIdentity(current.raw, identity(rawFile)) || !equalIdentity(state.raw, current.raw))
+        throw new Error('The captured worker output was replaced.');
+      if (!Number.isSafeInteger(current.bytes) || current.bytes < 0 || fs.fstatSync(raw).size < current.bytes)
+        throw new Error('The captured worker output was truncated.');
+      state = current;
+    };
+    const publishAlias = (bytes: Buffer, replace: boolean) => {
+      try {
+        safePath(alias);
+        if (!state.alias || !equalIdentity(state.alias, identity(alias))) return;
+        const descriptor = fs.openSync(alias, fs.constants.O_WRONLY | (fs.constants.O_NOFOLLOW ?? 0));
+        try {
+          const stat = fs.fstatSync(descriptor, { bigint: true });
+          if (!stat.isFile() || !equalIdentity(state.alias, { dev: String(stat.dev), ino: String(stat.ino) })) return;
+          if (!replace && stat.size < BigInt(state.bytes)) return;
+          const offset = replace ? 0 : state.bytes;
+          fs.writeSync(descriptor, bytes, 0, bytes.length, offset);
+          fs.ftruncateSync(descriptor, offset + bytes.length);
+        } finally {
+          fs.closeSync(descriptor);
+        }
+      } catch {
+        /* Private channel output remains available after an alias changes. */
+      }
+    };
+    try {
+      this.lock(
+        id,
+        () => {
+          reload();
+          fs.ftruncateSync(raw, state.bytes);
+          if (!options.background) publishAlias(Buffer.alloc(0), false);
+        },
+        'capture-write',
+      );
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (
+        code !== 'EEXIST' &&
+        code !== 'EPERM' &&
+        !/Another process holds this dispatch write|dispatch write changed during recovery/.test(String(error))
+      ) {
+        fs.closeSync(raw);
+        throw error;
+      }
+    }
+    return {
+      cursor: (name: CaptureSource): CaptureCursor =>
+        (() => {
+          reload();
+          return { ...(state.sources[name] ?? { offset: 0, identity: '' }) };
+        })(),
+      write: (bytes: Buffer, name?: CaptureSource, cursor?: CaptureCursor) =>
+        this.lock(
+          id,
+          () => {
+            reload();
+            if (name && cursor) {
+              const committed = state.sources[name];
+              const start = cursor.offset - bytes.length;
+              if (committed) {
+                if (committed.identity !== cursor.identity || start > committed.offset)
+                  throw new Error('The original worker output position changed.');
+                if (cursor.offset <= committed.offset) {
+                  Object.assign(cursor, committed);
+                  return;
+                }
+                bytes = bytes.subarray(Math.max(0, committed.offset - start));
+              } else if (start !== 0) throw new Error('The original worker output position is unavailable.');
+            }
+            fs.writeSync(raw, bytes, 0, bytes.length, state.bytes);
+            fs.ftruncateSync(raw, state.bytes + bytes.length);
+            if (!options.background) publishAlias(bytes, false);
+            const next = {
+              ...state,
+              bytes: state.bytes + bytes.length,
+              sources: { ...state.sources, ...(name && cursor ? { [name]: { ...cursor } } : {}) },
+            };
+            writeFileAtomically(checkpoint, JSON.stringify(next), undefined, 0o600, false);
+            state = next;
+          },
+          'capture-write',
+        ),
+      native: (bytes: Buffer, cursor?: CaptureCursor) =>
+        this.lock(
+          id,
+          () => {
+            reload();
+            const committed = state.sources['native-source.log'];
+            if (cursor) {
+              const start = cursor.offset - bytes.length;
+              if (committed) {
+                if (committed.identity !== cursor.identity || start > committed.offset)
+                  throw new Error('The original native log position changed.');
+                if (cursor.offset <= committed.offset) {
+                  Object.assign(cursor, committed);
+                  return;
+                }
+                bytes = bytes.subarray(Math.max(0, committed.offset - start));
+              } else if (start !== 0) throw new Error('The original native log position is unavailable.');
+            } else if (committed) return;
+            const offset = cursor ? (committed?.offset ?? 0) : 0;
+            const file = this.artifact(id, 'native.log');
+            if (fs.existsSync(file)) safePath(file);
+            const descriptor = fs.openSync(
+              file,
+              fs.constants.O_RDWR | fs.constants.O_CREAT | (fs.constants.O_NOFOLLOW ?? 0),
+              0o600,
+            );
+            try {
+              if (!fs.fstatSync(descriptor).isFile() || fs.fstatSync(descriptor).size < offset)
+                throw new Error('The captured native log was truncated.');
+              fs.writeSync(descriptor, bytes, 0, bytes.length, offset);
+              fs.ftruncateSync(descriptor, offset + bytes.length);
+            } finally {
+              fs.closeSync(descriptor);
+            }
+            try {
+              safePath(alias);
+              if (state.alias && equalIdentity(state.alias, identity(alias))) {
+                const descriptor = fs.openSync(alias, fs.constants.O_WRONLY | (fs.constants.O_NOFOLLOW ?? 0));
+                try {
+                  const stat = fs.fstatSync(descriptor, { bigint: true });
+                  if (stat.isFile() && equalIdentity(state.alias, { dev: String(stat.dev), ino: String(stat.ino) })) {
+                    fs.writeSync(descriptor, bytes, 0, bytes.length, offset);
+                    fs.ftruncateSync(descriptor, offset + bytes.length);
+                  }
+                } finally {
+                  fs.closeSync(descriptor);
+                }
+              }
+            } catch {
+              /* Native bytes remain private after an alias changes. */
+            }
+            if (cursor) {
+              const next = { ...state, sources: { ...state.sources, 'native-source.log': { ...cursor } } };
+              writeFileAtomically(checkpoint, JSON.stringify(next), undefined, 0o600, false);
+              state = next;
+            }
+          },
+          'capture-write',
+        ),
+      close: () => fs.closeSync(raw),
+    };
+  }
+
+  observation(id: string, value?: StandaloneObservation): StandaloneObservation | null {
+    const launch = this.launch(id);
+    if (launch.transport !== 'standalone') return null;
+    const file = this.file(id, 'observation.json');
+    if (value) {
+      const text = JSON.stringify(value);
+      if (Buffer.byteLength(text) > JSON_BYTES) throw new Error('The worker observation exceeds its saved allowance.');
+      this.checkStatusEnvelope(launch, value);
+      this.lock(id, () => writeFileAtomically(file, text, undefined, 0o600, false));
+    }
+    return fs.existsSync(file) ? JSON.parse(read(file)) : null;
+  }
+  scan(id: string, value?: unknown): unknown {
+    if (this.launch(id).transport !== 'standalone') return null;
+    const file = this.file(id, 'scan.json');
+    // Base64 retains one pending frame. Completed evidence includes the report and two copies of its native message identity.
+    const frameBytes = 49 * 1024 * 1024;
+    const limit = 4 * Math.ceil(frameBytes / 3) + 2 * frameBytes + 6 * REPORT_BYTES + JSON_BYTES;
+    if (value !== undefined) {
+      const text = JSON.stringify(value);
+      if (Buffer.byteLength(text) > limit) throw new Error('The saved output position exceeds its allowance.');
+      this.lock(id, () => writeFileAtomically(file, text, undefined, 0o600, false));
+    }
+    return fs.existsSync(file) ? JSON.parse(read(file, limit, true)) : null;
+  }
+  monitor(id: string, channel: 'monitor' | 'output-monitor' = 'monitor'): { token: string; release: () => void } {
+    if (this.launch(id).transport !== 'standalone') throw new Error('Hosted dispatch has no standalone monitor.');
+    const file = this.file(id, `${channel}.json`);
+    const token = randomUUID();
+    const lock = channel === 'output-monitor' ? channel : 'write';
+    this.lock(
+      id,
+      () => {
+        if (fs.existsSync(file)) {
+          const owner = JSON.parse(read(file));
+          if (!Number.isSafeInteger(owner.pid) || owner.pid < 1 || !DISPATCH_ID.test(owner.token))
+            throw new Error('The dispatch monitor identity is unavailable.');
+          if (!owner.released) {
+            let dead = false;
+            try {
+              process.kill(owner.pid, 0);
+            } catch (error) {
+              dead = (error as NodeJS.ErrnoException).code === 'ESRCH';
+            }
+            if (!dead) throw new Error('Another process is observing this dispatch launch.');
+          }
+        }
+        writeFileAtomically(file, JSON.stringify({ pid: process.pid, token }), undefined, 0o600, false);
+      },
+      lock,
+    );
+    return {
+      token,
+      release: () =>
+        this.lock(
+          id,
+          () => {
+            const owner = JSON.parse(read(file));
+            if (owner.pid !== process.pid || owner.token !== token)
+              throw new Error('The dispatch monitor owner changed.');
+            writeFileAtomically(file, JSON.stringify({ ...owner, released: true }), undefined, 0o600, false);
+          },
+          lock,
+        ),
+    };
   }
   bind(
     id: string,
@@ -205,9 +596,64 @@ export class DispatchReceipts {
           : /^[1-9][0-9]*$/.test(binding.nativeTurnId)))
     )
       throw new Error('The dispatch worker identity is invalid.');
+    this.bindIdentity(id, 'accepted', { launchId: id, ...binding });
+  }
+  background(id: string, backgroundId?: string): string | null {
+    const launch = this.launch(id);
+    const options = launch.standalone;
+    if (launch.transport !== 'standalone' || options?.provider !== 'claude' || !options.background)
+      throw new Error('This launch has no Claude background session.');
+    const file = this.file(id, 'background.json');
+    if (backgroundId === undefined && !fs.existsSync(file)) return null;
+    const binding =
+      backgroundId === undefined
+        ? JSON.parse(read(file))
+        : { launchId: id, provider: 'claude', cwd: options.cwd, backgroundId };
+    if (
+      binding.launchId !== id ||
+      binding.provider !== 'claude' ||
+      binding.cwd !== options.cwd ||
+      typeof binding.backgroundId !== 'string' ||
+      !/^(?:[a-f0-9]{8}|[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12})$/.test(binding.backgroundId)
+    )
+      throw new Error('The Claude background identity is invalid.');
+    if (backgroundId === undefined && !fs.existsSync(path.join(this.root, `${id}.background.json`)))
+      throw new Error('The Claude background identity is unavailable.');
+    this.bindIdentity(id, 'background', binding);
+    return binding.backgroundId;
+  }
+  standaloneSession(id: string, sessionId?: string): string | null {
+    const launch = this.launch(id);
+    const options = launch.standalone;
+    if (launch.transport !== 'standalone' || !options) throw new Error('This launch has no standalone session.');
     const file = this.file(id, 'accepted.json');
-    const text = JSON.stringify({ launchId: id, ...binding });
-    const witnessFile = path.join(this.root, `${id}.accepted.json`);
+    if (sessionId === undefined && !fs.existsSync(file)) return null;
+    const binding =
+      sessionId === undefined
+        ? JSON.parse(read(file))
+        : {
+            launchId: id,
+            provider: options.provider,
+            sessionId,
+            submissionId: 1,
+            nativeTurnId: null,
+          };
+    if (
+      binding.launchId !== id ||
+      binding.provider !== options.provider ||
+      binding.submissionId !== 1 ||
+      binding.nativeTurnId !== null ||
+      (options.sessionHint !== null && binding.sessionId !== options.sessionHint)
+    )
+      throw new Error('The standalone session identity is invalid.');
+    if (sessionId === undefined && !fs.existsSync(path.join(this.root, `${id}.accepted.json`))) return null;
+    this.bind(id, { provider: binding.provider, sessionId: binding.sessionId, submissionId: 1, nativeTurnId: null });
+    return binding.sessionId;
+  }
+  private bindIdentity(id: string, kind: 'accepted' | 'background', binding: unknown): void {
+    const file = this.file(id, `${kind}.json`);
+    const text = JSON.stringify(binding);
+    const witnessFile = path.join(this.root, `${id}.${kind}.json`);
     const checkWitness = () => {
       if (!fs.existsSync(witnessFile)) return false;
       const witness = JSON.parse(read(witnessFile));
@@ -223,10 +669,13 @@ export class DispatchReceipts {
     if (checkWitness()) return;
     this.lock(id, () => {
       if (checkWitness()) return;
-      const intentFile = path.join(this.root, `${id}.accepting.json`);
+      const intentFile = path.join(
+        this.root,
+        `${id}.${kind === 'accepted' ? 'accepting' : 'background.accepting'}.json`,
+      );
       if (!fs.existsSync(intentFile)) {
         if (fs.existsSync(file)) throw new Error('The accepted dispatch turn has no retained identity.');
-        const name = `accepted.${randomUUID()}.pending`;
+        const name = `${kind}.${randomUUID()}.pending`;
         const prepared = this.file(id, name);
         exclusive(prepared, text);
         exclusive(
@@ -237,7 +686,7 @@ export class DispatchReceipts {
       const intent = JSON.parse(read(intentFile));
       if (
         intent.launchId !== id ||
-        !/^accepted\.[a-f0-9-]{36}\.pending$/.test(intent.name) ||
+        !new RegExp(`^${kind}[.][a-f0-9-]{36}[.]pending$`).test(intent.name) ||
         intent.sha256 !== payloadSha256(text)
       )
         throw new Error('The accepted dispatch turn cannot change.');
@@ -284,8 +733,7 @@ export class DispatchReceipts {
       if (text !== null) exclusive(reportFile, text);
       const event: DispatchEvent = { ...input, launchId: id, eventId, assignment: 1, report };
       const serialized = JSON.stringify(event);
-      if (Buffer.byteLength(serialized) > JSON_BYTES - 20 * 1024)
-        throw new Error('The dispatch event exceeds its allowance.');
+      if (Buffer.byteLength(serialized) > EVENT_BYTES) throw new Error('The dispatch event exceeds its allowance.');
       exclusive(this.file(id, `${eventId}.json`), serialized);
       const held = {
         id: eventId,
@@ -375,10 +823,11 @@ export class DispatchReceipts {
     cursor?: string,
     limit = 32,
   ): {
-    launch: DispatchLaunch;
+    launch: ReturnType<typeof statusLaunch>;
     version: 1;
     next: string | null;
     reportSource: string | null;
+    observation?: StandaloneObservation | null;
     events: (Omit<DispatchEvent, 'nativeEnding'> & {
       consumption: Omit<EventState, 'disposition' | 'token'>;
       delivery: 'unavailable';
@@ -400,10 +849,11 @@ export class DispatchReceipts {
       throw new Error('The dispatch page is invalid.');
     const result: ReturnType<DispatchReceipts['status']> = {
       version: 1,
-      launch,
+      launch: statusLaunch(launch),
       next: null,
       reportSource: fs.existsSync(this.file(id, 'current.md')) ? this.file(id, 'current.md') : null,
       events: [],
+      ...(launch.transport === 'standalone' ? { observation: this.observation(id) } : {}),
     };
     let index = start;
     for (; index < total && result.events.length < limit; index++) {
@@ -414,13 +864,35 @@ export class DispatchReceipts {
       const { nativeEnding: _ending, ...listed } = event;
       result.events.push({ ...listed, consumption, delivery: 'unavailable' });
       result.next = index + 1 < total ? `${id}:${index + 1}` : null;
-      if (Buffer.byteLength(JSON.stringify(result)) > JSON_BYTES - 4096) {
+      if (Buffer.byteLength(JSON.stringify(result)) > STATUS_BYTES) {
         result.events.pop();
+        if (!result.events.length) throw new Error('The dispatch event cannot fit its status page.');
         break;
       }
     }
     result.next = index < total ? `${id}:${index}` : null;
+    if (Buffer.byteLength(JSON.stringify(result)) > STATUS_BYTES)
+      throw new Error('The dispatch status exceeds its page allowance.');
     return result;
+  }
+  private checkStatusEnvelope(launch: DispatchLaunch, observation: StandaloneObservation | null): void {
+    const metadata = {
+      version: 1,
+      launch: statusLaunch(launch),
+      next: `${launch.launchId}:${Number.MAX_SAFE_INTEGER}`,
+      reportSource: path.join(this.root, launch.launchId, 'current.md'),
+      events: [],
+      ...(launch.transport === 'standalone' ? { observation } : {}),
+    };
+    const listedState = {
+      consumption: { owner: 'x'.repeat(128), dispositionSha256: 'f'.repeat(64) },
+      delivery: 'unavailable',
+    };
+    if (
+      Buffer.byteLength(JSON.stringify(metadata)) + EVENT_BYTES + Buffer.byteLength(JSON.stringify(listedState)) >
+      STATUS_BYTES
+    )
+      throw new Error('The launch identity or worker observation exceeds the dispatch status allowance.');
   }
   latest(id: string): DispatchEvent | null {
     this.launch(id);
@@ -525,10 +997,10 @@ export class DispatchReceipts {
   private saveConsumption(id: string, eventId: string, state: EventState): void {
     writeFileAtomically(this.file(id, `${eventId}.consumption.json`), JSON.stringify(state), undefined, 0o600, false);
   }
-  private lock<T>(id: string, work: () => T): T {
+  private lock<T>(id: string, work: () => T, name = 'write'): T {
     this.launch(id);
-    const file = this.file(id, 'write.lock');
-    const temporary = this.file(id, `write.${process.pid}.${randomUUID()}.lock`);
+    const file = this.file(id, `${name}.lock`);
+    const temporary = this.file(id, `${name}.${process.pid}.${randomUUID()}.lock`);
     const owner = JSON.stringify({ pid: process.pid, token: randomUUID(), launchId: id });
     exclusive(temporary, owner);
     let acquired = false;
@@ -546,12 +1018,12 @@ export class DispatchReceipts {
             writeFileAtomically(file, heldText, undefined, 0o600, false);
             throw new Error('The dispatch write changed during recovery. Try again.');
           }
-          const successor = this.file(id, `write.${held.token}.next.lock`);
+          const successor = this.file(id, `${name}.${held.token}.next.lock`);
           if (fs.existsSync(successor)) {
             current = successor;
             continue;
           }
-          const released = this.file(id, `write.${held.token}.released`);
+          const released = this.file(id, `${name}.${held.token}.released`);
           if (fs.existsSync(released) && read(released) === heldText) {
             target = successor;
             break;
@@ -573,7 +1045,7 @@ export class DispatchReceipts {
       if (target !== file) writeFileAtomically(file, owner, undefined, 0o600, false);
       return work();
     } finally {
-      if (acquired) exclusive(this.file(id, `write.${JSON.parse(owner).token}.released`), owner);
+      if (acquired) exclusive(this.file(id, `${name}.${JSON.parse(owner).token}.released`), owner);
       fs.unlinkSync(temporary);
     }
   }

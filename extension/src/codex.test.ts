@@ -59,7 +59,7 @@ test.each(['claude', 'codex'] as const)(
 import { enumerateRolloutFiles } from './codex';
 import { revisionOf, readQualifiedSessionCwd } from './transcript';
 // extension/src/codex.test.ts
-import { test, vi } from 'vitest';
+import { afterEach, test, vi } from 'vitest';
 import assert from 'node:assert';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
@@ -188,6 +188,8 @@ import { RETAINED_COMPACTIONS } from './parserstate.ts';
 import { estimateCodexContext, inspectCodexContext, readCodexContext, CODEX_CONTEXT_ITEMS } from './codexcontext.ts';
 import { bedrockAstraRecords, codexContextRecords } from './turnfixtures.ts';
 import { emptyCodexResponseClock, reduceCodexResponseClock } from './outputrate';
+
+afterEach(() => vi.unstubAllEnvs());
 
 test('native Codex speed excludes serial and parallel tool waits without subtracting overlapping generation', () => {
   for (const toolWait of [1000, 1000000]) {
@@ -4404,12 +4406,15 @@ test('a Codex abort closes its outcome before a later completion record', () => 
 });
 
 test('a Codex patch outcome needs a visible file change', () => {
+  const home = path.join(os.homedir(), 'codex-state');
+  vi.stubEnv('CODEX_HOME', home);
+  vi.stubEnv('ARC_IGNORE_ROOTS', undefined);
   const cases: [string, Record<string, unknown>][] = [
     ['empty changes', {}],
     [
       'ephemeral changes',
       {
-        [path.join(os.homedir(), '.codex', 'config.toml')]: {
+        [path.join(home, 'config.toml')]: {
           type: 'update',
           unified_diff: '@@ -1 +1 @@\n-old\n+new\n',
           move_path: null,
@@ -6048,13 +6053,16 @@ test('one file written twice under either case of drive letter is one row', () =
 });
 
 test('a change under the agent’s own state is not a change the user asked to review', () => {
+  const home = path.join(os.homedir(), 'codex-state');
+  vi.stubEnv('CODEX_HOME', home);
+  vi.stubEnv('ARC_IGNORE_ROOTS', undefined);
   const records = ordinaryTurn();
   records[6] = event('patch_apply_end', 6, {
     call_id: 'exec-1',
     turn_id: TURN,
     success: true,
     changes: {
-      [path.join(os.homedir(), '.codex', 'config.toml')]: {
+      [path.join(home, 'config.toml')]: {
         type: 'update',
         unified_diff: '@@ -1 +1 @@\n-a\n+b\n',
         move_path: null,
@@ -9397,6 +9405,9 @@ test('the incremental Codex usage filter retains every record that changes reque
 });
 
 test('the incremental Codex usage reducer counts drawable turns and excludes empty ones', () => {
+  const home = path.join(os.homedir(), 'codex-state');
+  vi.stubEnv('CODEX_HOME', home);
+  vi.stubEnv('ARC_IGNORE_ROOTS', undefined);
   const first = createCodexUsageLineReducer();
   first.pushLine(JSON.stringify(event('task_started', 1, { turn_id: 'abandoned' })));
   assert.equal(first.turnCount(), 1, 'the current open turn was omitted');
@@ -9422,7 +9433,7 @@ test('the incremental Codex usage reducer counts drawable turns and excludes emp
     JSON.stringify(
       event('patch_apply_end', 5, {
         success: true,
-        changes: { [path.join(os.homedir(), '.codex', 'config.toml')]: { type: 'update' } },
+        changes: { [path.join(home, 'config.toml')]: { type: 'update' } },
       }),
     ),
   );
@@ -10159,6 +10170,32 @@ test.each([false, true])(
     assert.equal(readCodexDispatchedSpend([file], [], Date.now() + 6000).person, true);
   },
 );
+
+test('standalone receipts retain delegated and reader ownership in Codex parents', () => {
+  for (const agent of ['claude', 'codex'])
+    for (const flags of ['', '--agent-run', '--agent-run=true', '--agent-run=false', '--attach --agent-run']) {
+      const delegated = flags.includes('--agent-run') && !flags.includes('false') && !flags.includes('--attach');
+      const marker = `ARC_DISPATCH_SESSION=${JSON.stringify({ agent, session_id: UUID_B, name: 'Review', ...(!delegated ? { owned: true } : {}) })}`;
+      const command = `arc run --arc-dispatch --provider ${agent} ${flags}`;
+      const prefix = [meta(), event('task_started', 1, { turn_id: TURN }), turnContext(1, TURN, 'gpt-6.1-sol', 'high')];
+      const parent = writeRollout([
+        ...prefix,
+        commandCompleted(2, command, 0, 'completed', 'dispatch', {
+          stdout: JSON.stringify({ state: 'starting' }) + '\n' + marker,
+        }),
+      ]);
+      const [edge] = scanCodexDispatchReferences(parent, 'parent').references;
+      assert.equal(edge.sessionId, UUID_B);
+      assert.equal(edge.owned, !delegated);
+      assert.equal(agentRunAnswer(true, UUID_B, new Set(), false, true, edge.owned), delegated);
+      assert.equal(agentRunAnswer(false, UUID_B, new Set(), true, true, edge.owned), true);
+      const missing = writeRollout([
+        ...prefix,
+        commandCompleted(2, command, 0, 'completed', 'dispatch', { stdout: JSON.stringify({ state: 'starting' }) }),
+      ]);
+      assert.deepEqual(scanCodexDispatchReferences(missing, 'parent').references, []);
+    }
+});
 
 test.each(['event', 'response'])(
   'headless dispatch continuations retain final agent classification through active and quiet reads (%s)',
@@ -15261,6 +15298,9 @@ test('a turn that ran commands and recorded no patch may have changed something 
 // The session list reads Codex turn boundaries from task_started records.
 
 test('a rollout reports the turns in a window, and whether the window reached its start', () => {
+  const home = path.join(os.homedir(), 'codex-state');
+  vi.stubEnv('CODEX_HOME', home);
+  vi.stubEnv('ARC_IGNORE_ROOTS', undefined);
   const file = writeRollout([
     meta(),
     event('task_started', 1, { turn_id: 't1', model_context_window: 258400 }),
@@ -15347,7 +15387,7 @@ test('a rollout reports the turns in a window, and whether the window reached it
         event('task_started', 1, { turn_id: 't1' }),
         event('patch_apply_end', 2, {
           success: true,
-          changes: { [path.join(os.homedir(), '.codex', 'config.toml')]: { type: 'update' } },
+          changes: { [path.join(home, 'config.toml')]: { type: 'update' } },
         }),
         event('task_complete', 3, { last_agent_message: '' }),
       ]),
@@ -15499,19 +15539,14 @@ test('the thread index survives whatever is written into it', () => {
 });
 
 test('the thread index sits beside the sessions tree, wherever that is', () => {
-  const previous = process.env.ARC_CODEX_ROOT;
-  try {
-    process.env.ARC_CODEX_ROOT = path.join('c:', 'elsewhere', 'sessions');
-    assert.equal(codexSessionIndexPath(), path.join('c:', 'elsewhere', 'session_index.jsonl'));
-    delete process.env.ARC_CODEX_ROOT;
-    assert.equal(codexSessionIndexPath(), path.join(os.homedir(), '.codex', 'session_index.jsonl'));
-  } finally {
-    if (previous === undefined) {
-      delete process.env.ARC_CODEX_ROOT;
-    } else {
-      process.env.ARC_CODEX_ROOT = previous;
-    }
-  }
+  const home = path.join(os.homedir(), 'codex-state');
+  vi.stubEnv('CODEX_HOME', home);
+  vi.stubEnv('ARC_CODEX_ROOT', path.join('c:', 'elsewhere', 'sessions'));
+  assert.equal(codexSessionIndexPath(), path.join('c:', 'elsewhere', 'session_index.jsonl'));
+  vi.stubEnv('ARC_CODEX_ROOT', undefined);
+  assert.equal(codexSessionIndexPath(), path.join(home, 'session_index.jsonl'));
+  vi.stubEnv('CODEX_HOME', '');
+  assert.equal(codexSessionIndexPath(), path.join(os.homedir(), '.codex', 'session_index.jsonl'));
 });
 
 // Retain the request timestamp and billing identity behind the current context level for next-turn pricing.

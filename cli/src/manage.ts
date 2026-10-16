@@ -1,3 +1,4 @@
+import { runBackgroundManagement } from './standalone.ts';
 import { resolve } from 'node:path';
 import { validContinuation, validContinuationPath, CONTINUATION_LIMITS } from '../../extension/src/compactrequest.ts';
 import { launchPolicy } from '../../extension/src/launchpolicy.ts';
@@ -25,10 +26,7 @@ export function readPromptFile(file: string): string {
       count += read;
     }
     if (count > 48 * 1024) throw new Error('The prompt file exceeds 48 KiB.');
-    return buffer
-      .subarray(0, count)
-      .toString('utf8')
-      .replace(/^\uFEFF/, '');
+    return new TextDecoder('utf-8', { fatal: true }).decode(buffer.subarray(0, count)).replace(/^\uFEFF/, '');
   } finally {
     fs.closeSync(fd);
   }
@@ -84,6 +82,8 @@ function renderSetups(listing: SetupListing): string {
 }
 
 export async function runManagement(command: string, args: string[]): Promise<string> {
+  if (command.startsWith('standalone-'))
+    return runBackgroundManagement(command.slice(11) as 'logs' | 'attach' | 'stop' | 'rm', args);
   const options = new Map<string, string>();
   const flags = new Set<string>();
   const sessions: string[] = [];

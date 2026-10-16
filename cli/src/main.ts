@@ -6,6 +6,9 @@ import { runCollect } from './collect.ts';
 import { runManagement } from './manage.ts';
 import { runCompact } from './compact.ts';
 import { runDispatch } from './dispatch.ts';
+import { runStandalone, runSupervisor } from './run.ts';
+import { produceStandaloneOutput } from './standalone.ts';
+import { DispatchReceipts } from '../../extension/src/dispatchreceipts.ts';
 import { findCommand, renderCommandHelp, renderOverviewHelp } from './commands.ts';
 import { runSkills } from './skills.ts';
 
@@ -32,6 +35,17 @@ function widthFrom(args: string[]): number {
 
 async function run(): Promise<void> {
   const args = process.argv.slice(2);
+  if (args[0] === '__standalone-produce') {
+    if (args.length !== 2) throw new Error('The standalone output capture requires one launch ID.');
+    await produceStandaloneOutput(new DispatchReceipts(), args[1]);
+    return;
+  }
+  if (args[0] === '__standalone-supervise') {
+    if (args.length !== 2 && !(args.length === 3 && args[2] === '--attended'))
+      throw new Error('The standalone supervisor requires one launch ID.');
+    await runSupervisor(args[1], args[2] === '--attended');
+    return;
+  }
   if (args.includes('--version')) {
     process.stdout.write(`${VERSION}\n`);
     return;
@@ -46,6 +60,9 @@ async function run(): Promise<void> {
   switch (command.route) {
     case 'collect':
       process.stdout.write(`${await runCollect(commandArgs)}\n`);
+      return;
+    case 'run':
+      process.stdout.write(`${await runStandalone(commandArgs)}\n`);
       return;
     case 'skills':
       await runSkills(command.action!, commandArgs);

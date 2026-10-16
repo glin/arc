@@ -33,7 +33,7 @@
     "build": "node build.mjs",
     "prepack": "npm run build",
     "typecheck": "tsc --noEmit -p tsconfig.json",
-    "test:unit": "vitest run test/status.test.ts test/stream-fixtures.test.mjs test/cost.test.ts",
+    "test:unit": "vitest run test/status.test.ts test/stream-fixtures.test.mjs test/cost.test.ts test/run.test.ts",
     "test:smoke": "npm run build && vitest run test/smoke.test.mjs",
     "test": "npm run typecheck && npm run test:unit && npm run test:smoke"
   },

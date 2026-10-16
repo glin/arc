@@ -10,6 +10,7 @@ type Route =
   | 'label'
   | 'cost'
   | 'skills'
+  | 'run'
   | 'dispatch';
 
 export interface Command {
@@ -177,6 +178,91 @@ export const COMMANDS: readonly Command[] = [
       example: 'arc collect --window WINDOW_ID --query "-is:archived" --turns 2 --max-reads 2 --json',
     },
   },
+  {
+    name: 'run',
+    section: 'Starting and sending',
+    route: 'run',
+    help: {
+      summary: 'Start one standalone session without an Arc window.',
+      synopsis: 'arc run --provider claude|codex --cwd DIR --model MODEL --effort EFFORT --prompt-file FILE [OPTIONS]',
+      flags: [
+        ['--provider claude|codex', 'Select the provider explicitly.'],
+        ['--cwd DIR', 'Use an existing directory. Arc creates no worktree.'],
+        ['--model MODEL', 'Required. Select the provider model.'],
+        ['--effort EFFORT', 'Required. Select low, medium, high, xhigh, max, or ultra.'],
+        ['--prompt-file FILE', 'Read a regular UTF-8 prompt file up to 48 KiB.'],
+        [
+          '--read-only',
+          'Use shared provider restrictions. Claude auto mode does not guarantee filesystem immutability.',
+        ],
+        ['--read-tool TOOL', 'Allow one exact Claude MCP read tool. Repeat for more tools.'],
+        ['--permissions MODE', 'Choose writable provider permissions. Refuses with --read-only.'],
+        ['--add-dir DIR', 'Add an existing read directory. Repeat for more directories.'],
+        ['--name NAME', 'Name the standalone launch and Claude background session.'],
+        ['--arc-dispatch', 'Print a native session receipt after launch JSON when accepted identity is available.'],
+        [
+          '--agent-run[=true|false]',
+          'Retain explicit launch classification. Delegated Claude defaults its cache TTL to 5m.',
+        ],
+        [
+          '--completion manual|wait',
+          'Select one completion route. Default: manual. Wait ends after 110000 milliseconds.',
+        ],
+        ['--report-file FILE', 'Copy the frozen report to this alias. --output is an alternative spelling.'],
+        ['--output FILE', 'Alternative to --report-file. Never combine both.'],
+        ['--log FILE', 'Watch print output or Claude native logs. Codex defaults to NAME.last.md beside this path.'],
+        [
+          '--attach',
+          'Open a reader-owned session in a supported terminal. Refuses Claude read-only and waited completion.',
+        ],
+        jsonFlag,
+      ],
+      output: [
+        'JSON identifies the launch receipt. Result and status remain readable after editor shutdown.',
+        'Claude read-only uses print mode. Writable Claude uses --bg. Codex uses exec or an attended interactive session.',
+        'CLAUDE_BIN and CODEX_BIN override executable selection. Caller cache TTL overrides remain intact.',
+      ],
+      refusals: [
+        'Missing explicit settings, worktree flags, invalid prompts, and unavailable launch directories refuse before spawning.',
+        'Callback delivery requires proven original parent authority on a supported daemon and is unavailable. Manual and waited completion remain available.',
+      ],
+      example:
+        'arc run --provider codex --cwd . --model gpt-6.1-sol --effort high --read-only --prompt-file review.md --completion wait --json',
+    },
+  },
+  ...(['logs', 'attach', 'stop', 'rm'] as const).map((action): Command => ({
+    name: `dispatch ${action}`,
+    section: 'Dispatch',
+    route: 'management',
+    action: `standalone-${action}`,
+    help: {
+      summary:
+        action === 'logs'
+          ? 'Read live Claude background output.'
+          : action === 'attach'
+            ? 'Attach to an owned Claude background session.'
+            : action === 'stop'
+              ? 'Stop an owned Claude background session through Claude.'
+              : 'Request removal of an owned Claude background record.',
+      synopsis: `arc dispatch ${action} LAUNCH_ID`,
+      flags: [],
+      output:
+        action === 'rm'
+          ? ['Record removal is unavailable. The command changes no stored files.']
+          : [
+              'Native Claude output streams to this terminal. JSON confirms command completion.',
+              'Worker exit remains unknown until native session evidence establishes it.',
+            ],
+      refusals: [
+        'Requires one standalone writable Claude launch with its accepted background identity.',
+        'Unowned targets, missing or ambiguous launch acknowledgments, and extra arguments refuse before starting Claude.',
+        ...(action === 'rm'
+          ? ['Record removal refuses until native conversation and directory preservation is established.']
+          : []),
+      ],
+      example: `arc dispatch ${action} LAUNCH_ID`,
+    },
+  })),
   ...(['install', 'update', 'remove'] as const).map((action): Command => ({
     name: `skills ${action}`,
     section: 'Setup',
@@ -209,8 +295,8 @@ export const COMMANDS: readonly Command[] = [
           claim: 'Claim one dispatch event or recover the same owner token.',
           ack: 'Save the disposition for one claimed dispatch event.',
           refresh: 'Publish changed private report observations without sending input.',
-          recover: 'Observe retained hosted delivery without sending input.',
-          monitor: 'Report unavailable standalone monitoring.',
+          recover: 'Read the retained event and its recorded completion route.',
+          monitor: 'Resume standalone observation without restarting the worker.',
         } as Record<string, string>
       )[action],
       synopsis: `arc dispatch ${action} LAUNCH_ID${['result', 'claim', 'ack', 'recover'].includes(action) ? ' --event EVENT_ID' : ''}${['claim', 'ack'].includes(action) ? ' --origin ORIGIN_ID --owner OWNER_ID' : ''}${action === 'ack' ? ' --token TOKEN --outcome-file FILE' : ''} [--json]`,
@@ -246,7 +332,7 @@ export const COMMANDS: readonly Command[] = [
       ],
       output: [
         'JSON stays below 48 KiB. Result text above 16000 characters returns its private path, digest, and byte size.',
-        'Saved reports remain readable without a host or known cost. Recover sends no input. Hosted monitor and standalone recovery are unavailable.',
+        'Saved reports remain readable without a host or known cost. Recover sends no input. Hosted monitoring uses lifecycle observation.',
       ],
       refusals: [
         'Malformed or replaced identities and conflicting claims or acknowledgments refuse.',

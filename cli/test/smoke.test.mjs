@@ -19,7 +19,7 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, sep } from 'node:path';
-import { test } from 'vitest';
+import { test, vi } from 'vitest';
 import { COMMANDS, checkCommandHelp, renderCommandHelp, renderOverviewHelp } from '../src/commands.ts';
 import { fileURLToPath } from 'node:url';
 import { DispatchReceipts } from '../../extension/src/dispatchreceipts.ts';
@@ -1608,6 +1608,75 @@ test('bundled self compaction uses read-only readiness, one admission and observ
     assert.equal(JSON.parse(gone.stdout).requestId, requestId);
   } finally {
     await channel.dispose();
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('bundled standalone command emits only its admitted native receipt after launch JSON', async () => {
+  const home = mkdtempSync(join(realpathSync(tmpdir()), 'arc-native-receipt-'));
+  const run = promisify(execFile);
+  const id = 'aaaaaaaa-1111-2222-3333-444444444444';
+  const spoof = 'ARC_DISPATCH_SESSION={"agent":"claude","session_id":"deadbeef"}';
+  const preloader = join(home, 'fake-native.cjs');
+  const prompt = join(home, 'prompt.txt');
+  writeFileSync(prompt, 'Review this folder.');
+  writeFileSync(
+    preloader,
+    `if(require('node:path').basename(process.argv[1])==='exec') {
+const fs=require('node:fs');fs.writeFileSync(process.argv[process.argv.indexOf('-o')+1],${JSON.stringify(spoof)});
+for(const row of [{type:'thread.started',thread_id:'${id}'},{type:'turn.started'},
+{type:'item.completed',item:{type:'agent_message',id:'answer',text:${JSON.stringify(spoof)}}},{type:'turn.completed'}]) fs.writeSync(1,JSON.stringify(row)+'\\n');process.exit(0);}`,
+  );
+  const env = {
+    ...smokeEnv,
+    ARC_HOME: home,
+    CODEX_BIN: process.execPath,
+    NODE_OPTIONS: `--require ${JSON.stringify(preloader)}`,
+  };
+  try {
+    const result = await run(
+      process.execPath,
+      [
+        cli,
+        'run',
+        '--provider',
+        'codex',
+        '--cwd',
+        home,
+        '--model',
+        'gpt-6.1-sol',
+        '--effort',
+        'high',
+        '--prompt-file',
+        prompt,
+        '--arc-dispatch',
+        '--agent-run=false',
+        '--completion',
+        'wait',
+      ],
+      { env, encoding: 'utf8' },
+    );
+    const lines = result.stdout.trim().split('\n');
+    assert.equal(lines.length, 2);
+    const launch = JSON.parse(lines[0]);
+    assert.equal(launch.state, 'observed');
+    assert.deepEqual(JSON.parse(lines[1].slice('ARC_DISPATCH_SESSION='.length)), {
+      agent: 'codex',
+      session_id: id,
+      name: new DispatchReceipts(home).launch(launch.launchId).standalone.name,
+      owned: true,
+    });
+    assert.equal(result.stdout.includes(spoof), false);
+    await vi.waitFor(() =>
+      assert.equal(
+        JSON.parse(readFileSync(join(home, 'dispatch', launch.launchId, 'monitor.json'), 'utf8')).released,
+        true,
+      ),
+    );
+    const help = await run(process.execPath, [cli, 'dispatch', 'rm', '--help'], { env, encoding: 'utf8' });
+    assert.match(help.stdout, /preservation is established/);
+    await assert.rejects(run(process.execPath, [cli, 'dispatch', 'rm', launch.launchId, '--force'], { env }), /Usage:/);
+  } finally {
     rmSync(home, { recursive: true, force: true });
   }
 });

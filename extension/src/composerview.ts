@@ -3974,8 +3974,12 @@ function throughNode(machine: Machine, path: string, parts: string[]): Launch | 
   if (!lower.endsWith('.cmd') && !lower.endsWith('.bat')) {
     return null;
   }
-  const script = npmPackageScript(machine, parts);
-  if (script) {
+  const separator = Math.max(path.lastIndexOf('\\'), path.lastIndexOf('/'));
+  const directory = separator < 0 ? '' : path.slice(0, separator);
+  const script = directory ? join(machine.platform, [directory, 'node_modules', ...parts]) : '';
+  if (script && machine.exists(script)) {
+    const native = parts === CODEX_PACKAGE ? codexBinary(machine, directory) : null;
+    if (native) return native;
     return { command: machine.node, leadingArgs: [script], problem: null, env: {} };
   }
   return {

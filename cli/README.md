@@ -203,3 +203,7 @@ Remove the `arc` marketplace only when no installed plugin uses it. Local source
 Source command setup writes launchers to the selected Arc home's `bin` directory. Remove its owned `arc`, `arc.cmd`, and `run.cjs` files. Remove that exact directory entry from your shell configuration or Windows user PATH if you added it.
 
 Stop every process using copied releases before removing owned `tools` storage. Confirm its `ownership.json` names the selected Arc home. Preserve unfamiliar files, snapshots, logs, caches, and other user data. Never delete the complete Arc home directory.
+
+## Standalone launches
+
+Use `arc run --help` for explicit standalone launch settings. The [CLI guide](../docs/cli.md#standalone-launches) describes native receipts, completion, reports, management, and recovery.

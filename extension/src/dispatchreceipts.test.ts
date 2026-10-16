@@ -68,6 +68,100 @@ test('private reports remain independent when output aliases collide', () => {
   assert.equal(a.receipts.refresh(a.launch.launchId), null);
   assert.equal(a.receipts.status(a.launch.launchId).events.length, 1);
 });
+test('concurrent channel captures retain each source byte once across stale cursors', () => {
+  const { receipts, launch, home } = fixture();
+  const standalone = receipts.reserve({
+    ...launch,
+    transport: 'standalone',
+    standalone: {
+      provider: 'codex',
+      command: 'codex',
+      args: [],
+      cwd: home,
+      model: 'test',
+      effort: 'high',
+      name: 'test',
+      agentRun: false,
+      background: false,
+      sessionHint: null,
+      logAlias: path.join(home, 'live.log'),
+      deadlineMs: 10_000,
+    },
+  });
+  const a = receipts.capture(standalone.launchId);
+  const b = receipts.capture(standalone.launchId);
+  try {
+    const first = { offset: 3, identity: 'source' };
+    a.write(Buffer.from('abc'), 'stdout.log', first);
+    b.write(Buffer.from('abcde'), 'stdout.log', { offset: 5, identity: 'source' });
+    a.write(Buffer.from('abc'), 'stdout.log', first);
+    assert.deepEqual(first, { offset: 5, identity: 'source' });
+    const c = receipts.capture(standalone.launchId);
+    c.close();
+    a.write(Buffer.from('fg'), 'stdout.log', { offset: 7, identity: 'source' });
+    b.write(Buffer.from('ERR'), 'stderr.log', { offset: 3, identity: 'stderr' });
+    assert.deepEqual(a.cursor('stdout.log'), { offset: 7, identity: 'source' });
+    assert.equal(fs.readFileSync(receipts.artifact(standalone.launchId, 'worker.log'), 'utf8'), 'abcdefgERR');
+    assert.equal(fs.readFileSync(standalone.standalone!.logAlias!, 'utf8'), 'abcdefgERR');
+  } finally {
+    a.close();
+    b.close();
+  }
+});
+
+test('native capture reconciles overlapping snapshots and preserves a reused alias', () => {
+  const { receipts, launch, home } = fixture();
+  const standalone = receipts.reserve({
+    ...launch,
+    transport: 'standalone',
+    standalone: {
+      provider: 'claude',
+      command: 'claude',
+      args: ['--bg'],
+      cwd: home,
+      model: 'test',
+      effort: 'high',
+      name: 'test',
+      agentRun: false,
+      background: true,
+      sessionHint: null,
+      logAlias: path.join(home, 'live.log'),
+      deadlineMs: 10_000,
+    },
+  });
+  const a = receipts.capture(standalone.launchId);
+  const b = receipts.capture(standalone.launchId);
+  try {
+    a.native(Buffer.from('abc'), { offset: 3, identity: 'native' });
+    b.native(Buffer.from('abcde'), { offset: 5, identity: 'native' });
+    const stale = { offset: 3, identity: 'native' };
+    a.native(Buffer.from('abc'), stale);
+    assert.deepEqual(stale, { offset: 5, identity: 'native' });
+    a.native(Buffer.from('old snapshot'));
+    assert.equal(fs.readFileSync(standalone.standalone!.logAlias!, 'utf8'), 'abcde');
+    const second = receipts.reserve({ ...standalone, origin: 'b'.repeat(24) });
+    const replacement = receipts.capture(second.launchId);
+    try {
+      replacement.native(Buffer.from('Second launch'));
+      const resumed = receipts.capture(standalone.launchId);
+      try {
+        assert.deepEqual(resumed.cursor('native-source.log'), { offset: 5, identity: 'native' });
+        resumed.native(Buffer.from('fg'), { offset: 7, identity: 'native' });
+      } finally {
+        resumed.close();
+      }
+      assert.equal(fs.readFileSync(receipts.artifact(standalone.launchId, 'native.log'), 'utf8'), 'abcdefg');
+      assert.equal(fs.readFileSync(standalone.standalone!.logAlias!, 'utf8'), 'Second launch');
+      assert.throws(() => b.native(Buffer.from('x'), { offset: 8, identity: 'replacement' }), /position changed/);
+    } finally {
+      replacement.close();
+    }
+  } finally {
+    a.close();
+    b.close();
+  }
+});
+
 test('interrupted claims retain their token and acknowledgments retain exactly one disposition', () => {
   const { receipts, launch } = fixture();
   const event = report(receipts, launch.launchId);
@@ -286,6 +380,210 @@ test('large dispositions never hide later event identities in bounded status pag
   } while (cursor);
   assert.deepEqual(found, ids);
   assert.equal((receipts.result(launch.launchId, ids[0]) as any).consumption.disposition, '\u0001'.repeat(6000));
+});
+
+test.each(['hosted', 'standalone'] as const)(
+  'exact-boundary %s launch keeps every status event readable',
+  (transport) => {
+    const { receipts, launch, home } = fixture();
+    const input = {
+      ...launch,
+      transport,
+      policy: { readOnly: true as const, readTools: [''] },
+      ...(transport === 'standalone'
+        ? {
+            standalone: {
+              provider: 'codex' as const,
+              command: 'codex',
+              args: [],
+              cwd: home,
+              model: 'sol',
+              effort: 'high',
+              name: '',
+              agentRun: true,
+              background: false,
+              sessionHint: null,
+              logAlias: null,
+              deadlineMs: 1000,
+            },
+          }
+        : {}),
+    };
+    const measured = receipts.reserve(input);
+    input.policy.readTools[0] = 'x'.repeat(48 * 1024 - Buffer.byteLength(JSON.stringify(measured)));
+    const large = receipts.reserve(input);
+    assert.equal(Buffer.byteLength(JSON.stringify(large)), 48 * 1024);
+    assert.deepEqual(receipts.launch(large.launchId), large);
+    const empty = receipts.status(large.launchId);
+    assert.ok(
+      Buffer.byteLength(JSON.stringify(empty)) <= 44 * 1024,
+      'an admitted launch needs a readable empty status',
+    );
+    if (transport === 'standalone')
+      receipts.observation(large.launchId, {
+        supervisor: { pid: process.pid, token: 'f'.repeat(64) },
+        worker: {
+          pid: process.pid,
+          command: 'c'.repeat(10 * 1024),
+          startedAt: 'native-lifetime',
+          argsSha256: payloadSha256('args'),
+          commandLineSha256: payloadSha256('native\0args\0'),
+        },
+        sessionId: session,
+        exitCode: 0,
+        signal: null,
+        monitor: 'finished',
+      });
+    const ids: string[] = [];
+    for (let index = 0; index < 4; index++) {
+      const event = receipts.publish(
+        large.launchId,
+        {
+          outcome: 'needs-input',
+          availability: 'available',
+          nativeEnding: ending,
+          askId: 'a'.repeat(26 * 1024) + index,
+        },
+        'Original ' + index,
+      );
+      ids.push(event.eventId);
+      const owner = 'o'.repeat(128);
+      const claim = receipts.claim(large.launchId, event.eventId, origin, owner) as { token: string };
+      receipts.ack(large.launchId, event.eventId, origin, owner, claim.token, 'Disposition ' + index);
+    }
+    const found: string[] = [];
+    let cursor: string | undefined;
+    do {
+      const page = receipts.status(large.launchId, cursor, 128);
+      assert.ok(Buffer.byteLength(JSON.stringify(page)) <= 44 * 1024);
+      assert.ok(page.events.length > 0, 'the first accepted event must remain discoverable');
+      assert.notEqual(page.next, cursor, 'a nonterminal status cursor must advance');
+      assert.deepEqual(page.launch, {
+        launchId: large.launchId,
+        transport,
+        origin,
+        completion: large.completion,
+      });
+      if (transport === 'standalone') {
+        assert.equal(page.observation!.sessionId, session);
+        assert.equal(page.observation!.exitCode, 0);
+        assert.equal(page.observation!.monitor, 'finished');
+      }
+      for (const event of page.events) {
+        assert.equal(event.delivery, 'unavailable');
+        assert.equal(event.consumption.dispositionSha256, payloadSha256('Disposition ' + ids.indexOf(event.eventId)));
+      }
+      assert.ok(page.reportSource);
+      found.push(...page.events.map((event) => event.eventId));
+      cursor = page.next ?? undefined;
+      assert.ok(found.length <= ids.length);
+    } while (cursor);
+    assert.deepEqual(found, ids);
+    assert.equal((receipts.result(large.launchId, ids[0]) as any).text, 'Original 0');
+    assert.equal((receipts.result(large.launchId, ids[0]) as any).consumption.disposition, 'Disposition 0');
+  },
+);
+
+test('first accepted event advances beside large readable launch and observation metadata', () => {
+  const { receipts, launch, home } = fixture();
+  const standalone = receipts.reserve({
+    ...launch,
+    transport: 'standalone',
+    standalone: {
+      provider: 'codex',
+      command: 'codex',
+      args: ['x'.repeat(14 * 1024)],
+      cwd: home,
+      model: 'sol',
+      effort: 'high',
+      name: '',
+      agentRun: true,
+      background: false,
+      sessionHint: null,
+      logAlias: null,
+      deadlineMs: 1000,
+    },
+  });
+  receipts.observation(standalone.launchId, {
+    supervisor: { pid: process.pid, token: 'f'.repeat(64) },
+    worker: {
+      pid: process.pid,
+      command: 'c'.repeat(10 * 1024),
+      startedAt: 'native-lifetime',
+      argsSha256: payloadSha256('args'),
+      commandLineSha256: payloadSha256('native\0args\0'),
+    },
+    sessionId: session,
+    exitCode: 0,
+    signal: null,
+    monitor: 'finished',
+  });
+  assert.ok(Buffer.byteLength(JSON.stringify(receipts.launch(standalone.launchId))) < 48 * 1024);
+  assert.ok(Buffer.byteLength(JSON.stringify(receipts.observation(standalone.launchId))) < 48 * 1024);
+  const first = receipts.publish(
+    standalone.launchId,
+    {
+      outcome: 'needs-input',
+      availability: 'available',
+      nativeEnding: ending,
+      askId: 'a'.repeat(26 * 1024),
+    },
+    'First original',
+  );
+  const second = report(receipts, standalone.launchId, 'Second original');
+  const page = receipts.status(standalone.launchId, undefined, 1);
+  assert.deepEqual(
+    page.events.map((event) => event.eventId),
+    [first.eventId],
+    'the first accepted event must remain discoverable',
+  );
+  assert.equal(page.next, `${standalone.launchId}:1`);
+  assert.ok(Buffer.byteLength(JSON.stringify(page)) <= 44 * 1024);
+  const next = receipts.status(standalone.launchId, page.next, 1);
+  assert.deepEqual(
+    next.events.map((event) => event.eventId),
+    [second.eventId],
+  );
+  assert.equal(next.next, null);
+  assert.equal((receipts.result(standalone.launchId, first.eventId) as any).text, 'First original');
+});
+
+test('unreadable observations leave the last readable observation intact', () => {
+  const { receipts, launch, home } = fixture();
+  const standalone = receipts.reserve({
+    ...launch,
+    transport: 'standalone',
+    standalone: {
+      provider: 'codex',
+      command: 'codex',
+      args: [],
+      cwd: home,
+      model: 'sol',
+      effort: 'high',
+      name: '',
+      agentRun: true,
+      background: false,
+      sessionHint: null,
+      logAlias: null,
+      deadlineMs: 1000,
+    },
+  });
+  const observation = {
+    supervisor: { pid: process.pid, token: 'f'.repeat(64) },
+    worker: null,
+    sessionId: null,
+    exitCode: null,
+    signal: null,
+    monitor: 'starting' as const,
+  };
+  receipts.observation(standalone.launchId, observation);
+  assert.throws(() =>
+    receipts.observation(standalone.launchId, {
+      ...observation,
+      reason: 'x'.repeat(48 * 1024),
+    }),
+  );
+  assert.deepEqual(receipts.observation(standalone.launchId), observation);
 });
 
 test('dead write owners allow exact claim recovery while live owners remain protected', () => {

@@ -1,7 +1,7 @@
 import { test, vi } from 'vitest';
 import { randomUUID } from 'node:crypto';
 import { CLAUDE_CHILD_REFERENCE_PARSER_VERSION, METADATA_EXHAUSTED_RULE } from './derivedcache';
-import { normalizeFsPath } from './transcript';
+import { normalizeFsPath, type SessionFile } from './transcript';
 import assert from 'node:assert/strict';
 import { browserOrNone, SETTLED } from '../test/browser';
 import { LIVE_PRESS, MAX_RAIL_FILTER_NAME, pageHtml, renderPayload, themed } from './panelfixture';
@@ -402,6 +402,8 @@ test.for([
       },
       hasHumanPrompt: () => true,
       humanScans: new Map(),
+      prepareHumanPrompts: async (sessions: SessionFile[]) =>
+        sessions.filter((session) => provider.hasHumanPrompt(session)),
       activityFor: () => 1,
       updateSessionSpendSources() {},
       pruneDerivedTitles: () => false,
@@ -652,6 +654,8 @@ test('exhausted sources complete the session list through repeated full source c
       },
       hasHumanPrompt: () => true,
       humanScans: new Map(),
+      prepareHumanPrompts: async (sessions: SessionFile[]) =>
+        sessions.filter((session) => provider.hasHumanPrompt(session)),
       activityFor: () => 1,
       updateSessionSpendSources() {},
       pruneDerivedTitles: () => false,

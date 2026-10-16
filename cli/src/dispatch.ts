@@ -1,6 +1,7 @@
 import * as fs from 'node:fs';
 import { DispatchReceipts, DISPATCH_ID } from '../../extension/src/dispatchreceipts.ts';
 import { requestWindow, WindowUnavailableError } from '../../extension/src/sessionrequests.ts';
+import { waitStandalone, superviseStandalone } from './standalone.ts';
 
 export async function runDispatch(action: string, args: string[]): Promise<string> {
   const options = new Map<string, string>();
@@ -78,11 +79,14 @@ export async function runDispatch(action: string, args: string[]): Promise<strin
     if (!Number.isSafeInteger(deadlineMs) || deadlineMs < 1 || deadlineMs > 110_000)
       throw new Error('The wait deadline must be 1 through 110000 milliseconds.');
     try {
-      result = await requestWindow(
-        'dispatch',
-        { dispatchAction: 'wait', launchId: id, deadlineMs },
-        options.get('--window') ?? launch.origin,
-      );
+      result =
+        launch.transport === 'standalone'
+          ? await waitStandalone(receipts, id, deadlineMs)
+          : await requestWindow(
+              'dispatch',
+              { dispatchAction: 'wait', launchId: id, deadlineMs },
+              options.get('--window') ?? launch.origin,
+            );
     } catch (error) {
       if (!(error instanceof WindowUnavailableError)) throw error;
       result = {
@@ -92,11 +96,14 @@ export async function runDispatch(action: string, args: string[]): Promise<strin
       };
     }
   } else if (action === 'monitor')
-    result = {
-      launchId: id,
-      state: 'unavailable',
-      reason: 'Hosted dispatch uses lifecycle observation. Standalone monitoring is unavailable.',
-    };
+    result =
+      launch.transport === 'standalone'
+        ? await superviseStandalone(receipts, id, true, undefined, undefined, undefined, false, process.argv[1])
+        : {
+            launchId: id,
+            state: 'unavailable',
+            reason: 'Hosted dispatch uses lifecycle observation.',
+          };
   else if (action === 'recover') {
     const event = receipts.event(id, need('--event'));
     result = {
@@ -104,11 +111,16 @@ export async function runDispatch(action: string, args: string[]): Promise<strin
       eventId: event.eventId,
       outcome: event.outcome,
       delivery: 'unavailable',
-      reason: 'Hosted recovery observes retained delivery without sending input. This launch has no callback delivery.',
+      completion: launch.completion,
+      reason:
+        launch.transport === 'hosted'
+          ? 'Hosted recovery observes retained delivery without sending input. This launch has no callback delivery.'
+          : 'This standalone launch selected no callback delivery. Read its saved report or resume observation with dispatch monitor.',
     };
   } else if (['result', 'status', 'refresh'].includes(action)) {
     try {
-      await requestWindow('dispatch', { dispatchAction: 'status', launchId: id }, launch.origin);
+      if (launch.transport === 'hosted')
+        await requestWindow('dispatch', { dispatchAction: 'status', launchId: id }, launch.origin);
     } catch {
       /* Saved reports remain available after host shutdown. */
     }

@@ -7,6 +7,36 @@ export interface LaunchPolicy {
   readonly readTools: readonly string[];
 }
 
+const codexModelShorthands: Readonly<Record<string, string>> = {
+  sol: 'gpt-6.1-sol',
+  sol6: 'gpt-6-sol',
+  terra: 'gpt-5.6-terra',
+  luna: 'gpt-6-luna',
+  luna6: 'gpt-6-luna',
+  astra: 'gpt-6-astra',
+};
+
+export function standaloneModel(agent: 'claude' | 'codex', model: string, env: NodeJS.ProcessEnv): string {
+  if (agent === 'claude') return model === 'haiku' ? 'claude-haiku-5-5' : model;
+  const resolved = Object.hasOwn(codexModelShorthands, model) ? codexModelShorthands[model] : model;
+  let provider: string | undefined;
+  try {
+    const config = readFileSync(join(env.CODEX_HOME || join(homedir(), '.codex'), 'config.toml'), 'utf8');
+    for (const line of config.split(/\r?\n/)) {
+      const stripped = line.trim();
+      if (stripped.startsWith('[')) break;
+      const match = /^model_provider\s*=\s*['"]([^'"]+)['"]/.exec(stripped);
+      if (match) {
+        provider = match[1];
+        break;
+      }
+    }
+  } catch {
+    // An unavailable config retains the provider's unprefixed model name.
+  }
+  return provider === 'amazon-bedrock' && resolved.startsWith('gpt-') ? `openai.${resolved}` : resolved;
+}
+
 export function launchPolicy(
   agent: string,
   readOnly: boolean,

@@ -1,4 +1,5 @@
 import { test, vi } from 'vitest';
+import { agentRunAnswer } from './turnrail';
 import { enumerateSessionFiles, enumerateSessionFilesFor } from './transcript';
 import { createRequire, syncBuiltinESMExports } from 'node:module';
 import { EXPORT_LIMITS, ExportLimitError } from './exportlimits.ts';
@@ -5079,6 +5080,28 @@ test('opted-in wrappers resolve a named full ID and an unnamed unique prefix', (
     }
     assert.deepEqual(readSession(parent, 'parent').turns[0]?.dispatchToolUseIds, ['dispatch-1']);
   }
+});
+
+test('standalone receipts retain delegated and reader ownership in Claude parents', () => {
+  const id = '4f4bf298-958f-4751-8782-d8688ff808a6';
+  for (const agent of ['claude', 'codex'])
+    for (const flags of ['', '--agent-run', '--agent-run=true', '--agent-run=false', '--attach --agent-run']) {
+      const delegated = flags.includes('--agent-run') && !flags.includes('false') && !flags.includes('--attach');
+      const marker = `ARC_DISPATCH_SESSION=${JSON.stringify({ agent, session_id: id, name: 'Review', ...(!delegated ? { owned: true } : {}) })}`;
+      const command = `arc run --arc-dispatch --provider ${agent} ${flags}`;
+      const parent = writeTranscript(
+        claudeDispatchTranscript(command, JSON.stringify({ state: 'starting' }) + '\n' + marker),
+      );
+      const [edge] = readClaudeChildSessionReferences({ file: parent, sessionId: 'parent' });
+      assert.equal(edge.kind, 'dispatch');
+      if (edge.kind !== 'dispatch') throw new Error('The standalone session has no dispatch relationship.');
+      assert.equal(edge.sessionId, id);
+      assert.equal(edge.owned, !delegated);
+      assert.equal(agentRunAnswer(true, id, new Set(), false, true, edge.owned), delegated);
+      assert.equal(agentRunAnswer(false, id, new Set(), true, true, edge.owned), true);
+      const missing = writeTranscript(claudeDispatchTranscript(command, JSON.stringify({ state: 'starting' })));
+      assert.deepEqual(readClaudeChildSessionReferences({ file: missing, sessionId: 'parent' }), []);
+    }
 });
 
 test('opted-in wrapper receipts reject malformed, oversized, duplicate, and conflicting lines', () => {
