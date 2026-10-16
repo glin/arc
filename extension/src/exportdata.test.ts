@@ -1430,15 +1430,50 @@ test('capture admits a large native Codex opening through its frozen metadata wi
     .map((line) => JSON.parse(line));
   records[0].payload.padding = 'metadata '.repeat(20000);
   f.write(file, records);
-  await withExportTransaction(f.output, async (writer) => {
-    const capture = await captureSessionExport(
-      { ...f.options, root: { ...f.options.root, agent: 'codex', file, sessionId: 'codex' } },
-      writer,
-    );
-    assert.equal(capture.model.sessions[0].turnCount, 1);
-    assert.equal(capture.model.coverage.text, 'complete');
-    assert.ok(!JSON.stringify(capture.model).includes('metadata metadata'));
-  });
+  let metrics: ReadMetrics = {};
+  await withReadMetrics(
+    () =>
+      withExportTransaction(f.output, async (writer) => {
+        const capture = await captureSessionExport(
+          { ...f.options, root: { ...f.options.root, agent: 'codex', file, sessionId: 'codex' } },
+          writer,
+        );
+        assert.equal(capture.model.sessions[0].turnCount, 1);
+        assert.equal(capture.model.coverage.text, 'complete');
+        assert.ok(!JSON.stringify(capture.model).includes('metadata metadata'));
+        await capture.recheck();
+      }),
+    (result) => {
+      metrics = result;
+    },
+  );
+  assert.ok(metrics.inventory.reads <= 10, `opening inventory required ${metrics.inventory.reads} reads`);
+  assert.ok(
+    metrics['validation-inventory'].reads <= 5,
+    `opening validation required ${metrics['validation-inventory'].reads} reads`,
+  );
+});
+
+test('unrelated Codex opening admission keeps the exact record-byte boundary across growing reads', async () => {
+  for (const overflow of [false, true]) {
+    const f = fixture();
+    const opening = record('session_meta', 0, { payload: { id: CODEX_ID, padding: '界'.repeat(12000) } });
+    const recordBytes = Buffer.byteLength(JSON.stringify(opening));
+    f.write(f.codexSession(CODEX_ID), [opening, ...codexTurn('unrelated')]);
+    const operation = withExportTransaction(f.output, async (writer) => {
+      const capture = await captureSessionExport(
+        { ...f.options, limits: { recordBytes: recordBytes - Number(overflow) } },
+        writer,
+      );
+      assert.equal(capture.model.sessions.length, 1);
+      assert.equal(capture.model.sessions[0].turnCount, 1);
+      await capture.recheck();
+    });
+    if (overflow)
+      await assert.rejects(operation, (error) => error instanceof ExportLimitError && error.boundary === 'record');
+    else await operation;
+    assert.deepEqual(fs.readdirSync(f.output), []);
+  }
 });
 
 test('conflicting native and dispatched claims refuse the child instead of assigning ownership', async () => {

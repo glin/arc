@@ -198,7 +198,7 @@ async function openingOf(
 ): Promise<{ text: string; digest: string }> {
   const handle = await fs.open(file, 'r');
   try {
-    const buffer = Buffer.allocUnsafe(Math.min(limits.sliceBytes, 4096));
+    let buffer = Buffer.allocUnsafe(Math.min(limits.sliceBytes, 32 * 1024));
     const fragments: Buffer[] = [];
     let length = 0;
     for (let offset = 0; ;) {
@@ -212,6 +212,8 @@ async function openingOf(
       length += used;
       offset += bytesRead;
       if (newline >= 0 || !bytesRead) break;
+      if (buffer.length < limits.sliceBytes)
+        buffer = Buffer.allocUnsafe(Math.min(limits.sliceBytes, buffer.length * 2));
     }
     const bytes = Buffer.concat(fragments, length);
     return { text: bytes.toString('utf8'), digest: hash(bytes) };

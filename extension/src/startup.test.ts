@@ -1915,7 +1915,7 @@ test('a restored session waits for the published catalog before it opens', async
 test('an imported session waits for catalog publication after discovery completes', async () => {
   for (const agent of ['claude', 'codex'] as const) {
     const fixture = selectedSourceFixture(agent);
-    const provider = completeDiscoveryHarness(undefined, true, [], {
+    const provider = completeDiscoveryHarness(undefined, true, ['progressiveCurrent'], {
       projectsRoot: () => fixture.projects,
       codexSessionsRoot: () => fixture.codex,
     });
@@ -1927,6 +1927,7 @@ test('an imported session waits for catalog publication after discovery complete
     provider.authoritativeCatalog = [];
     provider.completeCatalogScope = JSON.stringify(provider.repositoryScopeRoots);
     provider.revisionOf = (source: any) => revisionOf(fs.statSync(source.file, { bigint: true }));
+    provider.agentSpendKey = () => '';
     const requests: string[] = [];
     provider.progressiveWorker.run = async (request: ProgressiveRequest, generation: number) => {
       assert.equal(request.kind, 'window');
