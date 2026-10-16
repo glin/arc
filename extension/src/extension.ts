@@ -408,7 +408,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const recoveryPrompts = new WeakMap<AgentPrompt, GuardedAttempt>();
   const recoveryFailure = () => {
     void vscode.window.showWarningMessage(
-      'Arc: this question cannot be saved for restart. You can still answer the current question.',
+      'Arc: this question or its answer status cannot be saved. You can still answer the current question. Check the session before answering a saved question again.',
     );
   };
   const recoveryFor = (origin: string): QuestionRecovery | undefined => {
@@ -689,9 +689,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   });
 
   const updateAgentAffordance = () => {
+    const sources = new Map<string, string | null>();
+    const sourceFor = (agent: string, session: string): string | null => {
+      const key = JSON.stringify([agent, session]);
+      if (!sources.has(key)) sources.set(key, panel.questionSource(agent, session));
+      return sources.get(key)!;
+    };
     const recovery = host.questionRecovery();
     for (const entry of recovery?.entries() ?? []) {
-      const source = panel.questionSource(entry.agent, entry.session);
+      const source = sourceFor(entry.agent, entry.session);
       if (source && !entry.source) {
         try {
           recovery?.bindSource(entry.identity, source);
@@ -700,8 +706,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         }
       }
     }
-    if (recovery) questionEvidence.reconcile(recovery, (agent, session) => panel.questionSource(agent, session));
-    const waiting = host.waiting();
+    if (recovery) questionEvidence.reconcile(recovery, sourceFor);
+    const waiting = host.waiting(sourceFor);
     panel.setAsks(
       waiting.flatMap((entry) => {
         const session = entry.session;

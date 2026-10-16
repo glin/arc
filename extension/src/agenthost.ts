@@ -3100,7 +3100,12 @@ export class AgentHost {
   }
 
   // Lists all asks waiting on the reader across this window's sessions.
-  waiting(): { key: string; session: string | null; ask: Ask; recovered?: RecoveredQuestion }[] {
+  waiting(sourceFor = this.options.recoverySource): {
+    key: string;
+    session: string | null;
+    ask: Ask;
+    recovered?: RecoveredQuestion;
+  }[] {
     const out: { key: string; session: string | null; ask: Ask; recovered?: RecoveredQuestion }[] = [];
     const live = new Set<string>();
     let entries = this.recovery?.entries() ?? [];
@@ -3138,8 +3143,7 @@ export class AgentHost {
       const waiting = out.some((open) => !open.recovered && open.session === entry.session);
       const secret = entry.ask.questions.some((q) => q.secret);
       const sourceUnavailable = Boolean(
-        this.options.recoverySource &&
-        (!entry.source || this.options.recoverySource(entry.agent, entry.session) !== entry.source),
+        sourceFor && (!entry.source || sourceFor(entry.agent, entry.session) !== entry.source),
       );
       const blocked = !owned || sourceUnavailable || entry.disposition === 'unknown' || waiting || secret;
       const detail = !owned

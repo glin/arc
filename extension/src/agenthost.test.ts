@@ -281,14 +281,15 @@ test('failed capture leaves the live question answerable and never restores it',
 });
 
 test.each(
-  ['claude', 'codex'].flatMap((agent) =>
+  ['claude', 'codex-sync', 'codex-async'].flatMap((kind) =>
     ['none', 'terminal', 'begin and terminal'].flatMap((persistence) =>
-      ['answer', 'decline', 'failed'].map((outcome) => ({ agent, persistence, outcome })),
+      ['answer', 'decline', 'failed', 'cancelled'].map((outcome) => ({ kind, persistence, outcome })),
     ),
   ),
 )(
-  'a captured live $agent $outcome handles $persistence persistence failure across host replacement',
-  async ({ agent, persistence, outcome }) => {
+  'a captured live $kind $outcome handles $persistence persistence failure across host replacement',
+  async ({ kind, persistence, outcome }) => {
+    const agent = kind === 'claude' ? 'claude' : 'codex';
     const root = tempDir('question-live-answer-');
     let writes = 0;
     const store = recoveryAt(root, '1', {
@@ -299,42 +300,85 @@ test.each(
         fs.writeFileSync(file, text);
       },
     });
-    const live = agent === 'claude' ? await recoveryHost(store) : fakeHost(undefined, undefined, { recovery: store });
-    let key = 'one';
+    const live = fakeHost(undefined, undefined, { recovery: store });
+    const key = agent === 'claude' ? 'one' : 'codex';
     let id = 'request';
     let question = 'Which option?';
-    if (agent === 'claude') live.children[0].say(questionRequest());
+    const plan =
+      agent === 'claude'
+        ? claudePlan(CLAUDE, { cwd: WS, sessionId: 'session' })
+        : codexPlan(CODEX, { cwd: WS, resume: 'session', clientInfo: CODEX_CLIENT });
+    if (outcome === 'cancelled') {
+      const driver = plan.driver;
+      // Exercise the host cancellation contract independently of provider cancellation triggers.
+      // Clear persists predecessor closure before requesting a new native session.
+      plan.driver = (send, emit) => ({
+        ...driver(send, emit),
+        answer: (request) => {
+          emit({ kind: 'askResolved', id: request, outcome: 'cancelled' });
+          return true;
+        },
+      });
+    }
+    const opening = live.host.session(key, plan);
+    if (agent === 'claude') live.children[0].answerHandshake();
     else {
-      key = 'codex';
-      question = 'choice';
-      const opening = live.host.session(
-        key,
-        codexPlan(CODEX, { cwd: WS, resume: 'session', clientInfo: CODEX_CLIENT }),
-      );
       await answerCodexHandshake(live.children[0]);
       live.children[0].reply({ thread: { id: 'session' } });
-      await opening;
+    }
+    await opening;
+    if (agent === 'claude') live.children[0].say(questionRequest());
+    else {
+      question = 'choice';
       live.children[0].say(
-        JSON.stringify({
-          id: 900,
-          method: 'item/tool/requestUserInput',
-          params: {
-            threadId: 'session',
-            turnId: 'turn',
-            itemId: 'question',
-            questions: [
-              {
-                id: 'choice',
-                header: 'Choice',
-                question: 'Which option?',
-                options: [{ label: 'One', description: 'First' }],
+        JSON.stringify(
+          kind === 'codex-async'
+            ? {
+                method: 'item/completed',
+                params: {
+                  threadId: 'session',
+                  turnId: 'turn',
+                  item: {
+                    type: 'agentMessage',
+                    id: 'question',
+                    text: '',
+                    phase: 'final_answer',
+                    delivery: 'async',
+                    questions: [{ title: 'Which option?', options: ['One'] }],
+                  },
+                },
+              }
+            : {
+                id: 900,
+                method: 'item/tool/requestUserInput',
+                params: {
+                  threadId: 'session',
+                  turnId: 'turn',
+                  itemId: 'question',
+                  questions: [
+                    {
+                      id: 'choice',
+                      header: 'Choice',
+                      question: 'Which option?',
+                      options: [{ label: 'One', description: 'First' }],
+                    },
+                  ],
+                },
               },
-            ],
-          },
-        }) + '\n',
+        ) + '\n',
       );
+      if (kind === 'codex-async') {
+        question = asyncQuestionId('question', 0);
+        live.children[0].say(
+          JSON.stringify({
+            method: 'turn/completed',
+            params: { threadId: 'session', turn: { id: 'turn', status: 'completed', items: [] } },
+          }) + '\n',
+        );
+      }
     }
     assert.equal(live.host.waiting().length, 1);
+    assert.equal(writes, 1, 'the question must be saved before persistence failures begin');
     id = live.host.waiting()[0].ask.id;
     if (outcome === 'failed') failNextWrite(live.children[0], 'Native answer cannot be written.');
     assert.equal(
@@ -345,8 +389,33 @@ test.each(
           ? { decision: 'deny', reason: 'No answer.' }
           : { decision: 'answer', answers: { [question]: { labels: ['One'], written: '' } } },
       ),
-      outcome !== 'failed',
+      outcome !== 'failed' || kind === 'codex-async',
       'recovery persistence changed ordinary live delivery',
+    );
+    if (kind === 'codex-async' && outcome === 'answer') {
+      const sent = live.children[0].sent().at(-1);
+      assert.ok(sent);
+      assert.equal(sent.method, 'turn/start');
+      assert.deepEqual((sent.params as { input: unknown }).input, [
+        {
+          type: 'text',
+          text: buildQuestionReply([{ questionItemId: question, question: 'Which option?', answer: 'One' }]),
+        },
+      ]);
+      live.children[0].reply({ turn: { id: 'answer-turn' } });
+    }
+    const terminal =
+      outcome === 'answer'
+        ? kind === 'codex-async'
+          ? 'answered'
+          : 'unknown'
+        : outcome === 'decline'
+          ? 'declined'
+          : outcome;
+    await vi.waitFor(() =>
+      assert.ok(
+        live.events.some(({ event }) => event.kind === 'askResolved' && event.id === id && event.outcome === terminal),
+      ),
     );
     if (outcome === 'failed') {
       assert.equal(live.host.waiting().length, 1, 'a failed native answer removed its live question');
@@ -355,7 +424,9 @@ test.each(
       assert.equal(live.host.waiting().length, 1, 'a failed native answer hid the saved question after child exit');
       assert.ok(live.host.waiting()[0].recovered);
     } else assert.equal(live.host.waiting().length, 0, 'the completed live answer reappeared as a recovery card');
-    const settled = outcome === 'decline' && persistence === 'none';
+    const settled =
+      persistence === 'none' &&
+      (outcome === 'decline' || outcome === 'cancelled' || (kind === 'codex-async' && outcome === 'answer'));
     const disposition =
       persistence === 'begin and terminal' || (outcome === 'failed' && persistence === 'none')
         ? 'unresolved'
@@ -461,6 +532,124 @@ test('waiting publication checks ownership once and empty reconciliation creates
   assert.equal(after.host.waiting().length, 2);
   assert.equal(owns.mock.calls.length, 1);
   owns.mockRestore();
+  after.host.dispose();
+});
+
+// Run the production publication callback without activating VS Code.
+function questionPublication(host: AgentHost, reader: QuestionEvidenceReader, panel: object): () => void {
+  const source = fs.readFileSync(path.join(__dirname, 'extension.ts'), 'utf8');
+  const callback = statementFrom(source, source.indexOf('const updateAgentAffordance ='));
+  const code = esbuild.transformSync(`${callback}; return updateAgentAffordance;`, { loader: 'ts' }).code;
+  return runInNewContext(`(function() { ${code} })()`, { host, questionEvidence: reader, panel });
+}
+
+test('question publications refresh missing, ambiguous and replaced sources while separating raw provider identities', async () => {
+  const root = tempDir('question-publication-sources-');
+  const store = recoveryAt(root, '1');
+  const before = await recoveryHost(store);
+  before.children[0].say(questionRequest());
+  const captured = before.host.waiting()[0].ask;
+  assert.ok(captured.kind === 'question');
+  store.settle(store.entries()[0].identity, 'declined');
+  for (const agent of ['claude', 'codex'] as const)
+    for (const session of ['session', 'session '])
+      for (const tool of ['first', 'second'])
+        assert.ok(store.capture(agent, session, WS, { ...captured, id: tool, toolUseId: tool }));
+  before.host.dispose();
+  const restored = recoveryAt(root, '2');
+  const live = fakeHost(undefined, undefined, { recovery: restored });
+  const panelSource = fs.readFileSync(path.join(__dirname, 'panelhost.ts'), 'utf8');
+  const start = panelSource.indexOf('  public questionSource(');
+  const method = panelSource.slice(start, panelSource.indexOf(String.fromCharCode(10) + '  private ', start));
+  const Catalog = runInNewContext(esbuild.transformSync(`class Catalog { ${method} }; Catalog`, { loader: 'ts' }).code);
+  let roots = [root];
+  let scoped: { agent: string; sessionId: string; file: string }[] = [];
+  const catalog = new Catalog();
+  Object.assign(catalog, {
+    repositoryScope: { snapshot: () => ({ roots }) },
+    folders: () => roots,
+    authoritativeCatalogScope: JSON.stringify(roots),
+    authoritativeCatalog: {},
+    sessionPageIndexFor: () => ({ scoped }),
+  });
+  let mode = 'missing';
+  const calls: string[] = [];
+  let visible: { session: string; ask: import('./agentwire').Ask }[] = [];
+  const sourceFor = (agent: string, session: string) => {
+    calls.push(JSON.stringify([agent, session]));
+    return catalog.questionSource(agent, session);
+  };
+  const publish = questionPublication(live.host, new QuestionEvidenceReader(), {
+    questionSource: sourceFor,
+    setAsks: (asks: typeof visible) => {
+      visible = asks;
+    },
+  });
+  for (mode of ['missing', 'available', 'ambiguous', 'scope changed', 'replaced', 'available']) {
+    roots = mode === 'scope changed' ? [path.join(root, 'other-scope')] : [root];
+    scoped =
+      mode === 'missing'
+        ? []
+        : ['claude', 'codex'].flatMap((agent) =>
+            ['session', 'session '].flatMap((sessionId) => {
+              const row = {
+                agent,
+                sessionId,
+                file: path.join(
+                  root,
+                  `${agent}-${sessionId.length}-${mode === 'replaced' ? 'replacement' : 'source'}.jsonl`,
+                ),
+              };
+              return mode === 'ambiguous' ? [row, { ...row, file: row.file + '.duplicate' }] : [row];
+            }),
+          );
+    calls.length = 0;
+    publish();
+    assert.equal(visible.length, 8);
+    assert.equal(
+      visible.every(({ ask }) => ask.kind === 'question' && ask.recovery?.blocked === (mode !== 'available')),
+      true,
+      mode,
+    );
+    assert.equal(calls.length, 4, 'each provider and exact session identity resolves once per publication');
+    assert.equal(new Set(calls).size, 4);
+  }
+  live.host.dispose();
+});
+
+test('question publication reads predecessor dispositions after ownership and evidence settlement', async () => {
+  const root = tempDir('question-publication-freshness-');
+  const source = path.join(root, 'source.jsonl');
+  const predecessor = recoveryAt(root, '1');
+  const live = await recoveryHost(predecessor);
+  live.children[0].say(questionRequest('first', 'first'));
+  live.children[0].say(questionRequest('second', 'second'));
+  live.children[0].say(questionRequest('third', 'third'));
+  for (const entry of predecessor.entries()) predecessor.bindSource(entry.identity, source);
+  const restored = recoveryAt(root, '2');
+  const after = fakeHost(undefined, undefined, { recovery: restored });
+  predecessor.settle(predecessor.entries()[0].identity, 'declined');
+  live.host.dispose();
+  fs.writeFileSync(
+    source,
+    JSON.stringify({
+      type: 'user',
+      sessionId: 'session',
+      message: { content: [{ type: 'tool_result', tool_use_id: 'second', content: 'One' }] },
+    }) + String.fromCharCode(10),
+  );
+  let visible: { ask: import('./agentwire').Ask }[] = [];
+  const publish = questionPublication(after.host, new QuestionEvidenceReader(), {
+    questionSource: () => source,
+    setAsks: (asks: typeof visible) => {
+      visible = asks;
+    },
+  });
+  publish();
+  assert.equal(visible.length, 1);
+  assert.equal(visible[0].ask.kind === 'question' && visible[0].ask.toolUseId, 'third');
+  assert.ok(visible[0].ask.kind === 'question');
+  assert.equal(visible[0].ask.recovery?.blocked, false);
   after.host.dispose();
 });
 
