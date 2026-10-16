@@ -14,7 +14,7 @@ import {
 } from '../../extension/src/dispatchreceipts.ts';
 import { linuxProcessStart } from '../../extension/src/store.ts';
 import { payloadSha256 } from '../../extension/src/sessionwrites.ts';
-import { projectSlug, revisionOf, type SessionFile } from '../../extension/src/transcript.ts';
+import { projectSlug, readQualifiedOpening, revisionOf, type SessionFile } from '../../extension/src/transcript.ts';
 import { savedDispatchResponse } from '../../extension/src/sessionreads.ts';
 import { childEnv } from '../../extension/src/agenthost.ts';
 
@@ -532,6 +532,114 @@ export function readNativeReport(file: string): string | null {
   }
 }
 
+// A new native user record binds the print launch before its final stdout arrives.
+function claudeStartup(options: StandaloneOptions, prompt: string, bounds: ReadBounds) {
+  if (options.provider !== 'claude' || options.background || !options.sessionHint || !options.env?.ARC_PROJECTS_ROOT)
+    return null;
+  const file = path.join(options.env.ARC_PROJECTS_ROOT, projectSlug(options.cwd), `${options.sessionHint}.jsonl`);
+  let ancestor = path.dirname(file);
+  let directory: string;
+  let cwd: string;
+  try {
+    try {
+      fs.lstatSync(file);
+      return null;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') return null;
+    }
+    while (true) {
+      try {
+        fs.lstatSync(ancestor);
+        break;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') return null;
+        ancestor = path.dirname(ancestor);
+      }
+    }
+    safeDispatchPath(ancestor);
+    const stat = fs.statSync(ancestor, { bigint: true });
+    directory = `${stat.dev}:${stat.ino}`;
+    cwd = fs.realpathSync.native(options.cwd);
+  } catch {
+    return null;
+  }
+  let identity: string | null = null;
+  let opening = Buffer.alloc(0);
+  let parsed = 0;
+  let accepted = false;
+  let refused = false;
+  return (): string | null => {
+    if (refused) return null;
+    try {
+      safeDispatchPath(file);
+      const parent = fs.statSync(ancestor, { bigint: true });
+      if (`${parent.dev}:${parent.ino}` !== directory || fs.realpathSync.native(options.cwd) !== cwd) {
+        refused = true;
+        return null;
+      }
+      const qualified = readQualifiedOpening(file, (fd) => {
+        const stat = fs.fstatSync(fd, { bigint: true });
+        const current = `${stat.dev}:${stat.ino}`;
+        if ((identity && current !== identity) || stat.size < BigInt(opening.length)) return { refused: true };
+        const buffer = Buffer.alloc(Math.min(bounds.readBytes, READ_BYTES));
+        let offset = 0;
+        while (offset < opening.length) {
+          const count = fs.readSync(fd, buffer, 0, Math.min(buffer.length, opening.length - offset), offset);
+          if (!count || !buffer.subarray(0, count).equals(opening.subarray(offset, offset + count)))
+            return { refused: true };
+          offset += count;
+        }
+        const count = accepted
+          ? 0
+          : fs.readSync(fd, buffer, 0, Math.min(buffer.length, Number(stat.size) - offset), offset);
+        return { refused: false, identity: current, bytes: Buffer.from(buffer.subarray(0, count)) };
+      });
+      safeDispatchPath(file);
+      if (!qualified) return null;
+      if (qualified.value.refused) {
+        refused = true;
+        return null;
+      }
+      identity = qualified.value.identity!;
+      if (accepted) return options.sessionHint;
+      opening = Buffer.concat([opening, qualified.value.bytes!]);
+      if (opening.length > bounds.frameBytes) {
+        refused = true;
+        return null;
+      }
+      while (true) {
+        const end = opening.indexOf(10, parsed);
+        if (end < 0) return null;
+        const row = JSON.parse(new TextDecoder('utf8', { fatal: true }).decode(opening.subarray(parsed, end)));
+        parsed = end + 1;
+        if (row.type !== 'user') continue;
+        const content = row.message?.content;
+        const text =
+          typeof content === 'string'
+            ? content
+            : Array.isArray(content) && content.every((part) => part?.type === 'text' && typeof part.text === 'string')
+              ? content.map((part) => part.text).join('\n')
+              : null;
+        accepted =
+          row.sessionId === options.sessionHint &&
+          row.message?.role === 'user' &&
+          !row.isSidechain &&
+          !row.isMeta &&
+          typeof row.uuid === 'string' &&
+          !!row.uuid &&
+          typeof row.cwd === 'string' &&
+          fs.realpathSync.native(row.cwd) === cwd &&
+          text === prompt;
+        refused = !accepted;
+        return accepted ? options.sessionHint : null;
+      }
+    } catch (error) {
+      if (identity || (error as NodeJS.ErrnoException).code !== 'ENOENT') refused = true;
+      return null;
+    }
+  };
+}
+
 export async function observeProcess(
   child: ChildProcess,
   options: StandaloneOptions,
@@ -541,6 +649,7 @@ export async function observeProcess(
   readLogs?: (cursor?: { offset: number; identity: string }) => Iterable<Buffer>,
   bounds = READ_BOUNDS,
   runtime = OBSERVATION_RUNTIME,
+  startupIdentity?: (() => string | null) | null,
 ): Promise<{
   exitCode: number | null;
   signal: string | null;
@@ -571,10 +680,18 @@ export async function observeProcess(
   const startup = new FrameStream(options, bounds);
   const startupCursor = { offset: 0, identity: '' };
   const identityTimer: ReturnType<typeof setInterval> | null =
-    readLogs && options.provider === 'codex' && !options.background
+    (readLogs && options.provider === 'codex' && !options.background) || startupIdentity
       ? setInterval(() => {
           try {
-            for (const bytes of readLogs(startupCursor)) startup.push(bytes);
+            if (startupIdentity) {
+              const sessionId = startupIdentity();
+              if (sessionId) {
+                onIdentity(sessionId);
+                clearInterval(identityTimer!);
+              }
+              return;
+            }
+            for (const bytes of readLogs!(startupCursor)) startup.push(bytes);
             const state = startup.checkpoint();
             if (state.invalid || state.conflict) clearInterval(identityTimer!);
             else if (state.sessionId) {
@@ -1339,6 +1456,8 @@ export async function superviseStandalone(
         ];
         // Worker output uses inherited files, so an observation deadline does not close its output pipes.
         const observerDeadline = observationDeadline;
+        const startup = claudeStartup(options, prompt, bounds);
+        let startupAccepted = false;
         const producer =
           outputEntry && options.logAlias && !options.background
             ? outputProducer(receipts, id, outputEntry, stdout, stderr)
@@ -1374,6 +1493,13 @@ export async function superviseStandalone(
           },
           bounds,
           runtime,
+          startup
+            ? () => {
+                const sessionId = startup();
+                if (sessionId) startupAccepted = true;
+                return sessionId;
+              }
+            : null,
         );
         worker.stdin?.on('error', () => {
           /* Exit and final evidence determine the observation. */
@@ -1468,6 +1594,8 @@ export async function superviseStandalone(
             ending.signal,
             options.provider === 'codex' ? readNativeReport(receipts.artifact(id, 'native.md')) : undefined,
           );
+          if (startupAccepted && !startup?.())
+            final = { sessionId: null, outcome: 'unknown', availability: 'pending', text: null, evidence: null };
           if (final.sessionId && final.evidence) receipts.standaloneSession(id, final.sessionId);
           observation.sessionId = final.sessionId;
           observation.monitor = 'finished';
@@ -1515,7 +1643,8 @@ export async function waitStandaloneIdentity(
 }
 
 export async function waitStandalone(receipts: DispatchReceipts, id: string, deadlineMs: number): Promise<unknown> {
-  if (receipts.launch(id).completion !== 'wait')
+  const launch = receipts.launch(id);
+  if (launch.transport !== 'standalone' && launch.completion !== 'wait')
     throw new Error('This dispatch launch did not select waited completion.');
   const deadline = Date.now() + deadlineMs;
   while (Date.now() < deadline) {

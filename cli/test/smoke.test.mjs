@@ -24,6 +24,7 @@ import { COMMANDS, checkCommandHelp, renderCommandHelp, renderOverviewHelp } fro
 import { fileURLToPath } from 'node:url';
 import { DispatchReceipts } from '../../extension/src/dispatchreceipts.ts';
 import { payloadSha256 } from '../../extension/src/sessionwrites.ts';
+import { projectSlug } from '../../extension/src/transcript.ts';
 import * as fs from 'node:fs';
 import mutableFs from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
@@ -1612,6 +1613,161 @@ test('bundled self compaction uses read-only readiness, one admission and observ
   }
 });
 
+test('manual Claude print launcher returns before release and another process waits for its original result', async () => {
+  const home = mkdtempSync(join(realpathSync(tmpdir()), 'arc-manual-print-'));
+  const run = promisify(execFile);
+  const prompt = join(home, 'prompt.txt');
+  const release = join(home, 'release');
+  const started = join(home, 'started.json');
+  const log = join(home, 'output.log');
+  const alias = join(home, 'report.md');
+  const script = join(home, 'node_modules', '@anthropic-ai', 'claude-code', 'cli.js');
+  const shim = join(home, 'claude.cmd');
+  const projects = join(home, 'projects');
+  const submitted = 'Review this folder.\nKeep the original prompt.';
+  writeFileSync(prompt, submitted);
+  fs.mkdirSync(join(home, 'node_modules', '@anthropic-ai', 'claude-code'), { recursive: true });
+  writeFileSync(shim, '');
+  writeFileSync(
+    script,
+    `#!/usr/bin/env node
+const fs=require('node:fs'),path=require('node:path');
+const cwd=process.cwd(),id=process.argv[process.argv.indexOf('--session-id')+1];
+let prompt='';process.stdin.setEncoding('utf8');process.stdin.on('data',text=>prompt+=text);
+process.stdin.on('end',()=>{
+  const file=path.join(process.env.ARC_PROJECTS_ROOT,${JSON.stringify(projectSlug(home))},id+'.jsonl');
+  fs.mkdirSync(path.dirname(file),{recursive:true});
+  fs.writeFileSync(file,JSON.stringify({type:'user',uuid:'original-native-user',sessionId:id,cwd,message:{role:'user',content:prompt}})+'\\n');
+  fs.writeFileSync(${JSON.stringify(started)},JSON.stringify({id,cwd,prompt,pid:process.pid,args:process.argv.slice(2)}));
+  console.error('Original worker is running.');
+  const finish=()=>{if(!fs.existsSync(${JSON.stringify(release)}))return;watcher.close();
+    console.log(JSON.stringify({type:'result',subtype:'success',is_error:false,session_id:id,result:'Original report'}));};
+  const watcher=fs.watch(cwd,finish);finish();
+});`,
+    { mode: 0o700 },
+  );
+  const env = {
+    ...smokeEnv,
+    ARC_HOME: home,
+    ARC_PROJECTS_ROOT: projects,
+    CLAUDE_BIN: process.platform === 'win32' ? shim : script,
+  };
+  let launchId;
+  try {
+    const launched = await run(
+      process.execPath,
+      [
+        cli,
+        'run',
+        '--provider',
+        'claude',
+        '--cwd',
+        home,
+        '--model',
+        'claude-opus-5-5',
+        '--effort',
+        'high',
+        '--read-only',
+        '--prompt-file',
+        prompt,
+        '--completion',
+        'manual',
+        '--log',
+        log,
+        '--output',
+        alias,
+        '--arc-dispatch',
+      ],
+      { env, encoding: 'utf8', timeout: 10_000 },
+    );
+    const lines = launched.stdout.trim().split('\n');
+    const launchedJson = JSON.parse(lines[0]);
+    launchId = launchedJson.launchId;
+    const receipts = new DispatchReceipts(home);
+    assert.equal(lines.length, 2, readFileSync(receipts.artifact(launchId, 'stderr.log'), 'utf8'));
+    const native = JSON.parse(readFileSync(started, 'utf8'));
+    assert.equal(fs.existsSync(release), false);
+    assert.equal(native.prompt, submitted);
+    assert.equal(realpathSync(native.cwd), realpathSync(home));
+    assert.equal(native.id, receipts.launch(launchId).standalone.sessionHint);
+    assert.equal(native.args.filter((arg) => arg === '--session-id').length, 1);
+    assert.equal(native.args.includes('-p'), true);
+    assert.equal(native.args[native.args.indexOf('--output-format') + 1], 'json');
+    assert.deepEqual(JSON.parse(lines[1].slice('ARC_DISPATCH_SESSION='.length)), {
+      agent: 'claude',
+      session_id: native.id,
+      name: receipts.launch(launchId).standalone.name,
+      owned: true,
+    });
+    assert.equal(receipts.standaloneSession(launchId), native.id);
+    assert.equal(receipts.latest(launchId), null);
+    assert.equal(readFileSync(receipts.artifact(launchId, 'stdout.log'), 'utf8'), '');
+    process.kill(native.pid, 0);
+    const waited = run(process.execPath, [cli, 'dispatch', 'wait', launchId, '--deadline-ms', '10000', '--json'], {
+      env,
+    }).then(
+      (result) => ({ result }),
+      (error) => ({ error }),
+    );
+    const status = JSON.parse(
+      (await run(process.execPath, [cli, 'dispatch', 'status', launchId, '--json'], { env })).stdout,
+    );
+    assert.equal(status.launch.launchId, launchId);
+    assert.equal(receipts.latest(launchId), null);
+    writeFileSync(release, 'complete');
+    const completion = await waited;
+    assert.equal(completion.error, undefined);
+    const observed = JSON.parse(completion.result.stdout);
+    assert.equal(observed.launchId, launchId);
+    assert.equal(observed.state, 'observed');
+    assert.equal(observed.outcome, 'succeeded');
+    const report = JSON.parse(
+      (
+        await run(process.execPath, [cli, 'dispatch', 'result', launchId, '--event', observed.eventId, '--json'], {
+          env,
+        })
+      ).stdout,
+    );
+    assert.equal(report.text, 'Original report');
+    assert.equal(readFileSync(alias, 'utf8'), 'Original report');
+    assert.equal(readFileSync(log, 'utf8'), readFileSync(receipts.artifact(launchId, 'worker.log'), 'utf8'));
+    assert.match(readFileSync(log, 'utf8'), /Original worker is running/);
+  } finally {
+    writeFileSync(release, 'complete');
+    if (!launchId && fs.existsSync(join(home, 'dispatch')))
+      launchId = fs
+        .readdirSync(join(home, 'dispatch'))
+        .find((name) => /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(name));
+    if (launchId)
+      await vi.waitFor(
+        () =>
+          assert.equal(
+            JSON.parse(readFileSync(join(home, 'dispatch', launchId, 'monitor.json'), 'utf8')).released,
+            true,
+          ),
+        { timeout: 10_000 },
+      );
+    if (launchId) {
+      const receipts = new DispatchReceipts(home);
+      const producer = JSON.parse(readFileSync(receipts.artifact(launchId, 'output-owner.json'), 'utf8'));
+      const pids = new Set([receipts.observation(launchId).supervisor.pid, producer.pid, producer.producerPid]);
+      for (const pid of pids)
+        if (pid)
+          await vi.waitFor(() => assert.throws(() => process.kill(pid, 0), { code: 'ESRCH' }), { timeout: 10_000 });
+    }
+    // A failed launcher still releases its one local fake worker before fixture cleanup.
+    await vi.waitFor(
+      () => {
+        if (!fs.existsSync(started)) return;
+        const pid = JSON.parse(readFileSync(started, 'utf8')).pid;
+        assert.throws(() => process.kill(pid, 0), { code: 'ESRCH' });
+      },
+      { timeout: 10_000 },
+    );
+    rmSync(home, { recursive: true, force: true });
+  }
+}, 30_000);
+
 test('bundled standalone command emits only its admitted native receipt after launch JSON', async () => {
   const home = mkdtempSync(join(realpathSync(tmpdir()), 'arc-native-receipt-'));
   const run = promisify(execFile);
@@ -2677,10 +2833,49 @@ test('bundled dispatch wait preserves manual routes, invalid selectors and expli
     };
     const manual = receipts.reserve({ ...input, completion: 'manual' });
     const waited = receipts.reserve({ ...input, completion: 'wait' });
+    const standalone = receipts.reserve({
+      ...input,
+      completion: 'manual',
+      transport: 'standalone',
+      standalone: {
+        provider: 'codex',
+        command: process.execPath,
+        args: [],
+        cwd: home,
+        model: 'gpt-6.1-sol',
+        effort: 'high',
+        name: 'manual',
+        agentRun: false,
+        background: false,
+        sessionHint: null,
+        logAlias: null,
+        deadlineMs: 1000,
+      },
+    });
+    const event = receipts.publish(
+      standalone.launchId,
+      { outcome: 'succeeded', availability: 'available', nativeEnding: null, askId: null },
+      'Saved report',
+    );
     const env = { ...smokeEnv, ARC_HOME: home };
     const call = (id, extra = []) =>
       run(process.execPath, [cli, 'dispatch', 'wait', id, '--deadline-ms', '1', ...extra, '--json'], { env });
     await assert.rejects(call(manual.launchId), /did not select waited/);
+    assert.deepEqual(JSON.parse((await call(standalone.launchId)).stdout), {
+      launchId: standalone.launchId,
+      state: 'observed',
+      eventId: event.eventId,
+      outcome: 'succeeded',
+      availability: 'available',
+    });
+    for (const deadline of ['0', '110001', '1.5'])
+      await assert.rejects(
+        run(process.execPath, [cli, 'dispatch', 'wait', standalone.launchId, '--deadline-ms', deadline, '--json'], {
+          env,
+        }),
+        /1 through 110000 milliseconds/,
+      );
+    assert.equal(receipts.observation(standalone.launchId), null);
     await assert.rejects(call(waited.launchId, ['--window', 'invalid']), /Invalid Arc window/);
     await assert.rejects(call(waited.launchId), /another Arc activation/);
     channel.setDispatchHandler(() => {

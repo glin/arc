@@ -74,7 +74,8 @@ export async function runDispatch(action: string, args: string[]): Promise<strin
     }
     result = receipts.ack(id, need('--event'), need('--origin'), need('--owner'), need('--token'), disposition);
   } else if (action === 'wait') {
-    if (launch.completion !== 'wait') throw new Error('This dispatch launch did not select waited completion.');
+    if (launch.transport !== 'standalone' && launch.completion !== 'wait')
+      throw new Error('This dispatch launch did not select waited completion.');
     const deadlineMs = Number(options.get('--deadline-ms') ?? '110000');
     if (!Number.isSafeInteger(deadlineMs) || deadlineMs < 1 || deadlineMs > 110_000)
       throw new Error('The wait deadline must be 1 through 110000 milliseconds.');

@@ -208,7 +208,7 @@ Authority expires after thirty minutes. Readiness after completed compaction has
 | `dispatch refresh` | Publishes changed private report observations as separate unconsumed events without messaging agents. |
 | `dispatch recover` | Reads the event and its completion route without input. Delivery remains unavailable because launches have no callback route. |
 | `dispatch monitor` | Resumes standalone observation under an exclusive monitor claim. Hosted launches use lifecycle observation. |
-| `dispatch wait` | Requires waited completion. Default deadline: 110,000 milliseconds, range: 1-110,000. Hosted waits use the channel without model polling. Standalone waits read retained events. |
+| `dispatch wait` | Accepts standalone manual or waited completion. Hosted launches require waited completion. Default deadline: 110,000 milliseconds, range: 1-110,000. Hosted waits use the channel without model polling. Standalone waits read retained events. |
 
 `reportSource` names the current private report. JSON stays below 48 KiB. Reports above eight MiB remain unavailable. A native root ending establishes success or failure. Matching saved transcript evidence establishes report availability. Missing saved evidence leaves it pending. Failed and interrupted turns retain their outcomes. Needs-input events identify the ask without a fabricated report. Process exit without a native ending reports unknown.
 

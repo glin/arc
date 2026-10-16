@@ -156,7 +156,7 @@ arc dispatch result LAUNCH_ID --event EVENT_ID --json
 arc dispatch wait LAUNCH_ID --window WINDOW_ID --json
 ```
 
-Copy `launchId` from the accepted start and `EVENT_ID` from status. Follow status pages through `next`. `wait` requires a launch created with waited completion. Disconnect returns `uncertain`. Deadline expiry returns `deadline`. Read status or recover afterward. Recovery never starts, resumes, stops, or replaces a worker.
+Copy `launchId` from the accepted start and `EVENT_ID` from status. Follow status pages through `next`. Standalone `wait` accepts manual or waited completion. Hosted `wait` requires waited completion. Disconnect returns `uncertain`. Deadline expiry returns `deadline`. Read status or recover afterward. Recovery never starts, resumes, stops, or replaces a worker.
 
 Reports remain readable after host shutdown and when full cost is unknown. [Dispatch contracts](cli-reference.md#dispatch-results) define report availability, claims, acknowledgments, and limits.
 

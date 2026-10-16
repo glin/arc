@@ -336,7 +336,7 @@ export const COMMANDS: readonly Command[] = [
       ],
       refusals: [
         'Malformed or replaced identities and conflicting claims or acknowledgments refuse.',
-        'Wait requires a launch created with --completion wait. Disconnect reports uncertain without replacing its worker.',
+        'Hosted wait requires --completion wait. Standalone wait also accepts manual completion. Disconnect reports uncertain without replacing its worker.',
       ],
       example: `arc dispatch ${action} LAUNCH_ID${['result', 'claim', 'ack', 'recover'].includes(action) ? ' --event EVENT_ID' : ''}${['claim', 'ack'].includes(action) ? ' --origin ORIGIN_ID --owner OWNER_ID' : ''}${action === 'ack' ? ' --token TOKEN --outcome-file disposition.md' : ''} --json`,
     },

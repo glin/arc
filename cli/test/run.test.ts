@@ -2461,6 +2461,165 @@ test.each(['claude', 'codex'] as const)(
   },
 );
 
+test.each([
+  'valid',
+  'missing',
+  'preexisting',
+  'wrong ID',
+  'wrong cwd',
+  'wrong prompt',
+  'partial',
+  'replaced',
+  'unreadable',
+  'redirected',
+  'replaced after acceptance',
+  'conflicting final',
+  'malformed final',
+  'duplicate final',
+] as const)('Claude print startup admits only the original submitted turn with %s evidence', async (state) => {
+  vi.useFakeTimers();
+  const { home, args } = fixture();
+  const parsed = parseRun([...args.map((arg, i) => (i === 1 ? 'claude' : arg)), '--read-only'], {
+    CLAUDE_BIN: process.execPath,
+    ARC_PROJECTS_ROOT: path.join(home, 'projects'),
+  });
+  const options = parsed.options;
+  const file = path.join(options.env!.ARC_PROJECTS_ROOT!, projectSlug(home), `${options.sessionHint}.jsonl`);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const record = JSON.stringify({
+    type: 'user',
+    uuid: 'native-user',
+    sessionId: state === 'wrong ID' ? session : options.sessionHint,
+    cwd: state === 'wrong cwd' ? os.tmpdir() : home,
+    message: { role: 'user', content: state === 'wrong prompt' ? 'Another prompt.' : parsed.prompt },
+  });
+  if (state === 'preexisting') fs.writeFileSync(file, record + '\n');
+  const receipts = new DispatchReceipts(home);
+  const launch = receipts.reserve({
+    origin: 'e'.repeat(24),
+    requester: null,
+    policy: parsed.policy,
+    completion: 'manual',
+    promptSha256: payloadSha256(parsed.prompt),
+    alias: null,
+    transport: 'standalone',
+    standalone: options,
+  });
+  receipts.input(launch.launchId, parsed.prompt);
+  const child = new ChildProcess();
+  child.stdin = new PassThrough();
+  let stdout = -1;
+  vi.mocked(childProcess.spawn).mockImplementationOnce((_command, _args, settings) => {
+    stdout = (settings.stdio as number[])[1];
+    if (state !== 'missing' && state !== 'preexisting')
+      fs.writeFileSync(file, record + (state === 'partial' || state === 'replaced' ? '' : '\n'));
+    return child;
+  });
+  if (state === 'unreadable') {
+    const original = vi.mocked(fs.statSync).getMockImplementation()!;
+    vi.mocked(fs.statSync).mockImplementation(((target, ...rest) => {
+      if (target === file) throw Object.assign(new Error('Native transcript unavailable'), { code: 'EACCES' });
+      return original(target, ...rest);
+    }) as typeof fs.statSync);
+  }
+  if (state === 'redirected') {
+    const original = fs.lstatSync;
+    vi.spyOn(fs, 'lstatSync').mockImplementation(((target, ...rest) => {
+      const stat = original(target, ...rest);
+      if (target !== file || !stat) return stat;
+      const redirected = Object.create(stat);
+      redirected.isSymbolicLink = () => true;
+      return redirected;
+    }) as typeof fs.lstatSync);
+  }
+  const supervised = superviseStandalone(receipts, launch.launchId, false, undefined, {
+    now: Date.now,
+    identity: async () => null,
+    yield: async () => {},
+  });
+  try {
+    await vi.advanceTimersByTimeAsync(100);
+    const early = [
+      'valid',
+      'replaced after acceptance',
+      'conflicting final',
+      'malformed final',
+      'duplicate final',
+    ].includes(state);
+    assert.equal(receipts.standaloneSession(launch.launchId), early ? options.sessionHint : null);
+    assert.equal(receipts.latest(launch.launchId), null);
+    assert.equal(fs.readFileSync(receipts.artifact(launch.launchId, 'stdout.log'), 'utf8'), '');
+    if (state === 'partial') {
+      fs.appendFileSync(file, '\n');
+      await vi.advanceTimersByTimeAsync(100);
+      assert.equal(receipts.standaloneSession(launch.launchId), options.sessionHint);
+    }
+    if (state === 'replaced' || state === 'replaced after acceptance') {
+      fs.renameSync(file, file + '.original');
+      fs.writeFileSync(file, record + '\n');
+      await vi.advanceTimersByTimeAsync(100);
+      if (state === 'replaced') assert.equal(receipts.standaloneSession(launch.launchId), null);
+    }
+    const final =
+      JSON.stringify({
+        type: 'result',
+        subtype: 'success',
+        session_id: state === 'conflicting final' ? session : options.sessionHint,
+        result: 'Report',
+        is_error: false,
+      }) + '\n';
+    fs.writeSync(
+      stdout,
+      state === 'malformed final' ? 'malformed\n' : final + (state === 'duplicate final' ? final : ''),
+    );
+    child.emit('close', 0, null);
+    await supervised;
+    const unknown = ['replaced after acceptance', 'conflicting final', 'malformed final', 'duplicate final'].includes(
+      state,
+    );
+    assert.equal(receipts.latest(launch.launchId)?.outcome, unknown ? 'unknown' : 'succeeded');
+    assert.equal(receipts.latest(launch.launchId)?.report === null, unknown);
+    assert.equal(vi.mocked(childProcess.spawn).mock.calls.length, 1);
+  } finally {
+    child.emit('close', 0, null);
+    await supervised;
+  }
+});
+
+test('standalone manual wait observes retained events and controlled deadlines without starting a worker', async () => {
+  vi.useFakeTimers();
+  const { receipts, options } = receiptsFixture();
+  const launch = receipts.reserve({
+    origin: 'e'.repeat(24),
+    requester: null,
+    policy: null,
+    completion: 'manual',
+    promptSha256: payloadSha256('Review this folder.'),
+    alias: null,
+    transport: 'standalone',
+    standalone: options,
+  });
+  const expired = waitStandalone(receipts, launch.launchId, 25);
+  void expired.catch(() => {});
+  await vi.advanceTimersByTimeAsync(25);
+  assert.deepEqual(await expired, { launchId: launch.launchId, state: 'deadline' });
+  const pending = waitStandalone(receipts, launch.launchId, 1000);
+  const event = receipts.publish(
+    launch.launchId,
+    { outcome: 'succeeded', availability: 'available', nativeEnding: null, askId: null },
+    'Original report',
+  );
+  await vi.advanceTimersByTimeAsync(100);
+  assert.deepEqual(await pending, {
+    launchId: launch.launchId,
+    state: 'observed',
+    eventId: event.eventId,
+    outcome: 'succeeded',
+    availability: 'available',
+  });
+  assert.equal(vi.mocked(childProcess.spawn).mock.calls.length, 0);
+});
+
 test('delayed native identity is admitted once without accepting report text or restarting a worker', async () => {
   vi.useFakeTimers();
   const { receipts, launch, options } = receiptsFixture();
