@@ -22,6 +22,7 @@ type CaptureCursor = { offset: number; identity: string };
 interface CaptureState {
   raw: FileIdentity;
   alias: FileIdentity | null;
+  aliasBytes?: number;
   bytes: number;
   sources: Partial<Record<CaptureSource, CaptureCursor>>;
 }
@@ -372,7 +373,8 @@ export class DispatchReceipts {
         throw new Error('The captured worker output was truncated.');
       state = current;
     };
-    const publishAlias = (bytes: Buffer, replace: boolean) => {
+    const publishAlias = (end = options.background ? state.sources['native-source.log']?.offset : state.bytes) => {
+      let source: number | undefined;
       try {
         safePath(alias);
         if (!state.alias || !equalIdentity(state.alias, identity(alias))) return;
@@ -380,12 +382,34 @@ export class DispatchReceipts {
         try {
           const stat = fs.fstatSync(descriptor, { bigint: true });
           if (!stat.isFile() || !equalIdentity(state.alias, { dev: String(stat.dev), ino: String(stat.ino) })) return;
-          if (!replace && stat.size < BigInt(state.bytes)) return;
-          const offset = replace ? 0 : state.bytes;
-          fs.writeSync(descriptor, bytes, 0, bytes.length, offset);
-          fs.ftruncateSync(descriptor, offset + bytes.length);
+          if (options.background) {
+            const file = this.artifact(id, 'native.log');
+            safePath(file);
+            source = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+          }
+          const input = source ?? raw;
+          const captured = fs.fstatSync(input);
+          end ??= captured.size;
+          if (!captured.isFile() || captured.size < end) return;
+          let offset = state.aliasBytes ?? 0;
+          if (!Number.isSafeInteger(offset) || offset < 0 || offset > end || stat.size < BigInt(offset)) return;
+          state.aliasBytes = offset;
+          const buffer = Buffer.alloc(Math.min(64 * 1024, end - offset));
+          while (offset < end) {
+            const count = fs.readSync(input, buffer, 0, Math.min(buffer.length, end - offset), offset);
+            if (!count) return;
+            const written = fs.writeSync(descriptor, buffer, 0, count, offset);
+            if (!written) return;
+            offset += written;
+            state.aliasBytes = offset;
+          }
+          fs.ftruncateSync(descriptor, end);
         } finally {
-          fs.closeSync(descriptor);
+          try {
+            if (source !== undefined) fs.closeSync(source);
+          } finally {
+            fs.closeSync(descriptor);
+          }
         }
       } catch {
         /* Private channel output remains available after an alias changes. */
@@ -397,7 +421,10 @@ export class DispatchReceipts {
         () => {
           reload();
           fs.ftruncateSync(raw, state.bytes);
-          if (!options.background) publishAlias(Buffer.alloc(0), false);
+          const delivered = state.aliasBytes;
+          publishAlias();
+          if (state.aliasBytes !== delivered)
+            writeFileAtomically(checkpoint, JSON.stringify(state), undefined, 0o600, false);
         },
         'capture-write',
       );
@@ -431,6 +458,7 @@ export class DispatchReceipts {
                   throw new Error('The original worker output position changed.');
                 if (cursor.offset <= committed.offset) {
                   Object.assign(cursor, committed);
+                  if (!options.background) publishAlias();
                   return;
                 }
                 bytes = bytes.subarray(Math.max(0, committed.offset - start));
@@ -438,7 +466,7 @@ export class DispatchReceipts {
             }
             fs.writeSync(raw, bytes, 0, bytes.length, state.bytes);
             fs.ftruncateSync(raw, state.bytes + bytes.length);
-            if (!options.background) publishAlias(bytes, false);
+            if (!options.background) publishAlias(state.bytes + bytes.length);
             const next = {
               ...state,
               bytes: state.bytes + bytes.length,
@@ -462,11 +490,15 @@ export class DispatchReceipts {
                   throw new Error('The original native log position changed.');
                 if (cursor.offset <= committed.offset) {
                   Object.assign(cursor, committed);
+                  publishAlias();
                   return;
                 }
                 bytes = bytes.subarray(Math.max(0, committed.offset - start));
               } else if (start !== 0) throw new Error('The original native log position is unavailable.');
-            } else if (committed) return;
+            } else if (committed) {
+              publishAlias();
+              return;
+            }
             const offset = cursor ? (committed?.offset ?? 0) : 0;
             const file = this.artifact(id, 'native.log');
             if (fs.existsSync(file)) safePath(file);
@@ -483,28 +515,14 @@ export class DispatchReceipts {
             } finally {
               fs.closeSync(descriptor);
             }
-            try {
-              safePath(alias);
-              if (state.alias && equalIdentity(state.alias, identity(alias))) {
-                const descriptor = fs.openSync(alias, fs.constants.O_WRONLY | (fs.constants.O_NOFOLLOW ?? 0));
-                try {
-                  const stat = fs.fstatSync(descriptor, { bigint: true });
-                  if (stat.isFile() && equalIdentity(state.alias, { dev: String(stat.dev), ino: String(stat.ino) })) {
-                    fs.writeSync(descriptor, bytes, 0, bytes.length, offset);
-                    fs.ftruncateSync(descriptor, offset + bytes.length);
-                  }
-                } finally {
-                  fs.closeSync(descriptor);
-                }
-              }
-            } catch {
-              /* Native bytes remain private after an alias changes. */
-            }
-            if (cursor) {
-              const next = { ...state, sources: { ...state.sources, 'native-source.log': { ...cursor } } };
-              writeFileAtomically(checkpoint, JSON.stringify(next), undefined, 0o600, false);
-              state = next;
-            }
+            if (!cursor) state.aliasBytes = 0;
+            publishAlias(offset + bytes.length);
+            const next = {
+              ...state,
+              sources: { ...state.sources, ...(cursor ? { 'native-source.log': { ...cursor } } : {}) },
+            };
+            writeFileAtomically(checkpoint, JSON.stringify(next), undefined, 0o600, false);
+            state = next;
           },
           'capture-write',
         ),

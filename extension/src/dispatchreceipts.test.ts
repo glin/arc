@@ -162,6 +162,110 @@ test('native capture reconciles overlapping snapshots and preserves a reused ali
   }
 });
 
+test.each(
+  (['print', 'native'] as const).flatMap((kind) =>
+    (['continue', 'resume', 'legacy resume', 'replaced', 'reused'] as const).map((recovery) => ({ kind, recovery })),
+  ),
+)('failed log alias writes recover complete $kind bytes on $recovery', ({ kind, recovery }) => {
+  const { receipts, launch, home } = fixture();
+  const native = kind === 'native';
+  const alias = path.join(home, 'live.log');
+  const standalone = receipts.reserve({
+    ...launch,
+    transport: 'standalone',
+    standalone: {
+      provider: native ? 'claude' : 'codex',
+      command: native ? 'claude' : 'codex',
+      args: native ? ['--bg'] : [],
+      cwd: home,
+      model: 'test',
+      effort: 'high',
+      name: 'test',
+      agentRun: false,
+      background: native,
+      sessionHint: null,
+      logAlias: alias,
+      deadlineMs: 10_000,
+    },
+  });
+  let capture = receipts.capture(standalone.launchId);
+  const name = native ? 'native-source.log' : 'stdout.log';
+  let offset = 0;
+  const append = (bytes: Buffer) => {
+    offset += bytes.length;
+    const cursor = { offset, identity: 'source' };
+    if (native) capture.native(bytes, cursor);
+    else capture.write(bytes, name, cursor);
+  };
+  const prefix = Buffer.from('prefix\n');
+  const missing = Buffer.alloc(2 * 64 * 1024 + 17, 255);
+  const tail = Buffer.from('tail\n');
+  const privateFile = receipts.artifact(standalone.launchId, native ? 'native.log' : 'worker.log');
+  try {
+    append(prefix);
+    const open = fs.openSync;
+    let failed = false;
+    const failure = vi.spyOn(fs, 'openSync').mockImplementation((file, ...args) => {
+      if (String(file) === alias && !failed) {
+        failed = true;
+        throw Object.assign(new Error('alias temporarily unavailable'), { code: 'EPERM' });
+      }
+      return (open as any)(file, ...args);
+    });
+    syncBuiltinESMExports();
+    assert.doesNotThrow(() => append(missing));
+    failure.mockRestore();
+    syncBuiltinESMExports();
+    assert.equal(failed, true);
+    assert.deepEqual(fs.readFileSync(alias), prefix);
+    const captured = Buffer.concat([prefix, missing]);
+    assert.deepEqual(fs.readFileSync(privateFile), captured);
+    assert.deepEqual(capture.cursor(name), { offset: captured.length, identity: 'source' });
+    const event = report(receipts, standalone.launchId);
+    assert.equal((receipts.result(standalone.launchId, event.eventId) as { text: string }).text, 'Report');
+
+    let replacement: Buffer | undefined;
+    if (recovery === 'replaced') {
+      fs.renameSync(alias, alias + '.old');
+      replacement = Buffer.from('Replacement');
+      fs.writeFileSync(alias, replacement);
+    } else if (recovery === 'reused') {
+      const second = receipts.reserve({ ...standalone, origin: 'b'.repeat(24) });
+      const other = receipts.capture(second.launchId);
+      replacement = Buffer.from('Second launch');
+      try {
+        if (native) other.native(replacement);
+        else other.write(replacement);
+      } finally {
+        other.close();
+      }
+    } else if (recovery === 'legacy resume') {
+      const checkpoint = receipts.artifact(standalone.launchId, 'capture.json');
+      const state = JSON.parse(fs.readFileSync(checkpoint, 'utf8'));
+      delete state.aliasBytes;
+      fs.writeFileSync(checkpoint, JSON.stringify(state));
+    }
+
+    if (recovery !== 'continue') {
+      capture.close();
+      capture = new DispatchReceipts(path.dirname(receipts.root)).capture(standalone.launchId);
+      assert.ok(
+        fs.readFileSync(alias).equals(replacement ?? captured),
+        'resumed alias must contain every captured byte',
+      );
+    }
+    append(tail);
+    const complete = Buffer.concat([captured, tail]);
+    assert.deepEqual(fs.readFileSync(privateFile), complete);
+    assert.ok(
+      fs.readFileSync(alias).equals(replacement ?? complete),
+      'alias must contain every captured byte exactly once',
+    );
+  } finally {
+    capture.close();
+  }
+});
+
 test('interrupted claims retain their token and acknowledgments retain exactly one disposition', () => {
   const { receipts, launch } = fixture();
   const event = report(receipts, launch.launchId);
