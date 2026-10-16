@@ -679,40 +679,66 @@ async function startupContinuous(
       return `${parent.dev}:${parent.ino}` === held.directory && fs.realpathSync.native(options.cwd) === held.cwd;
     };
     if (!checkPaths()) return refuse();
-    const digest = createHash('sha256');
     const buffer = Buffer.alloc(Math.min(bounds.readBytes, READ_BYTES));
-    let offset = 0;
-    let refused = false;
-    let revision: ReturnType<typeof revisionOf> | null = null;
-    do {
-      const qualified = readQualifiedOpening(held.file, (fd) => {
-        const stat = fs.fstatSync(fd, { bigint: true });
-        if (`${stat.dev}:${stat.ino}` !== held.identity || stat.size < BigInt(held.bytes)) {
-          refused = true;
-          return false;
+    const workBytes = bounds.workBytes ?? 64 * 1024 * 1024;
+    let work = 0;
+    while (runtime.now() < deadline) {
+      if (work >= workBytes) return false;
+      const digest = createHash('sha256');
+      let offset = 0;
+      let refused = false;
+      let revision: ReturnType<typeof revisionOf> | null = null;
+      let retry = false;
+      do {
+        let count = 0;
+        const qualified = readQualifiedOpening(held.file, (fd) => {
+          const stat = fs.fstatSync(fd, { bigint: true });
+          if (`${stat.dev}:${stat.ino}` !== held.identity || stat.size < BigInt(held.bytes)) {
+            refused = true;
+            return false;
+          }
+          if (runtime.now() >= deadline) return false;
+          const length = Math.min(buffer.length, held.bytes - offset, workBytes - work);
+          if (length <= 0) return false;
+          // Reserve every requested byte, including reads whose source qualification fails.
+          work += length;
+          count = fs.readSync(fd, buffer, 0, length, offset);
+          if (!count) return false;
+          digest.update(buffer.subarray(0, count));
+          offset += count;
+          return true;
+        });
+        if (refused) return refuse();
+        if (runtime.now() >= deadline || !count) return false;
+        if (!qualified?.value || (revision && !isDeepStrictEqual(revision, qualified.revision))) {
+          retry = true;
+          break;
         }
-        if (runtime.now() >= deadline || held.bytes > (bounds.workBytes ?? 64 * 1024 * 1024)) return false;
-        const count = fs.readSync(fd, buffer, 0, Math.min(buffer.length, held.bytes - offset), offset);
-        if (!count && offset < held.bytes) return false;
-        digest.update(buffer.subarray(0, count));
-        offset += count;
-        return true;
-      });
-      if (refused) return refuse();
-      if (!qualified?.value) return false;
-      if (revision && !isDeepStrictEqual(revision, qualified.revision)) return false;
-      revision = qualified.revision;
-      if (offset < held.bytes) await runtime.yield();
-    } while (offset < held.bytes);
-    const final = readQualifiedOpening(held.file, (fd) => {
-      const stat = fs.fstatSync(fd, { bigint: true });
-      if (`${stat.dev}:${stat.ino}` !== held.identity || stat.size < BigInt(held.bytes)) refused = true;
-      return true;
-    });
-    if (refused) return refuse();
-    if (!final || !isDeepStrictEqual(revision, final.revision)) return false;
-    if (!checkPaths()) return refuse();
-    return digest.digest('hex') === held.sha256 || refuse();
+        revision = qualified.revision;
+        if (offset < held.bytes) {
+          await runtime.yield();
+          if (runtime.now() >= deadline) return false;
+        }
+      } while (offset < held.bytes);
+      if (!retry) {
+        if (runtime.now() >= deadline) return false;
+        const final = readQualifiedOpening(held.file, (fd) => {
+          const stat = fs.fstatSync(fd, { bigint: true });
+          if (`${stat.dev}:${stat.ino}` !== held.identity || stat.size < BigInt(held.bytes)) refused = true;
+          return true;
+        });
+        if (refused) return refuse();
+        if (runtime.now() >= deadline) return false;
+        if (final && isDeepStrictEqual(revision, final.revision)) {
+          if (!checkPaths()) return refuse();
+          if (runtime.now() >= deadline) return false;
+          return digest.digest('hex') === held.sha256 || refuse();
+        }
+      }
+      if (work >= workBytes) return false;
+      await runtime.yield();
+    }
+    return false;
   } catch (error) {
     if (String(error).includes('The dispatch path is redirected.')) return refuse();
     return false;

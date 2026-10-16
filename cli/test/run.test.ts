@@ -2683,12 +2683,19 @@ test.each([
 
 test.each([
   'initial rewrite',
+  'initial append',
   'recovered rewrite',
   'recovered final rewrite',
   'recovered append',
+  'recovered final append',
+  'recovered cumulative exhaustion',
+  'recovered unqualified exhaustion',
+  'recovered deadline exhaustion',
+  'recovered final deadline exhaustion',
+  'recovered zero progress',
   'all acceptance unavailable',
   'binding unavailable',
-] as const)('Claude print continuity keeps reports private with %s', async (state) => {
+] as const)('Claude print continuity validates reports with %s', async (state) => {
   vi.useFakeTimers();
   const { home, args } = fixture();
   const parsed = parseRun([...args.map((arg, i) => (i === 1 ? 'claude' : arg)), '--read-only'], {
@@ -2728,18 +2735,27 @@ test.each([
     fs.utimesSync(file, 1_000_000_000, 1_000_000_000);
     return child;
   });
-  const bounds = { frameBytes: 2048, readBytes: 128, workBytes: 4096 };
+  const append = state.includes('append');
+  const exhausted = state.includes('exhaustion');
+  const bounds = {
+    frameBytes: 2048,
+    readBytes: state === 'recovered final append' ? 2048 : 128,
+    workBytes: 4096,
+  };
   let duringYield = () => {};
-  const runtime = { now: Date.now, identity: async () => null, yield: async () => duringYield() };
+  let clock = Date.now();
+  const runtime = { now: () => clock, identity: async () => null, yield: async () => duringYield() };
   const supervised = superviseStandalone(receipts, launch.launchId, false, bounds, runtime);
   await vi.waitFor(() => assert.equal(receipts.standaloneSession(launch.launchId), options.sessionHint));
-  const initial = state === 'initial rewrite';
+  const initial = state.startsWith('initial');
   if (!initial) {
     await vi.advanceTimersByTimeAsync(options.deadlineMs);
     await supervised;
     assert.equal(receipts.latest(launch.launchId)?.availability, 'pending');
   }
   const pending = receipts.latest(launch.launchId);
+  if (state.includes('cumulative') || state.includes('unqualified'))
+    bounds.workBytes = Buffer.byteLength(original) * 2 + 31;
   const held =
     state === 'all acceptance unavailable'
       ? [
@@ -2758,20 +2774,26 @@ test.each([
   const close = fs.closeSync;
   const read = fs.readSync;
   let nativeBytes = 0;
+  const nativeReads: number[] = [];
+  let yields = 0;
+  let changes = 0;
+  let expiredAtBytes: number | null = null;
+  let lateReads = 0;
   let changed = false;
   const change = () => {
-    if (changed) return;
+    if (changed && !exhausted) return;
     changed = true;
-    if (state === 'recovered append') fs.appendFileSync(file, '\n');
+    changes++;
+    if (append || exhausted) fs.appendFileSync(file, '\n');
     else {
       const fd = open(file, 'r+');
       fs.writeSync(fd, Buffer.from('x'), 0, 1, 0);
       close(fd);
     }
-    fs.utimesSync(file, 1_000_000_001, 1_000_000_001);
+    fs.utimesSync(file, 1_000_000_000 + changes, 1_000_000_000 + changes);
     const after = fs.statSync(file, { bigint: true });
     assert.equal(after.ino, before.ino);
-    assert.equal(after.size, before.size + (state === 'recovered append' ? 1n : 0n));
+    assert.equal(after.size, before.size + (append || exhausted ? BigInt(changes) : 0n));
     assert.notEqual(after.mtimeNs, before.mtimeNs);
   };
   const opened = vi.spyOn(fs, 'openSync').mockImplementation((target, ...rest) => {
@@ -2783,16 +2805,57 @@ test.each([
     const native = nativeDescriptors.delete(fd);
     close(fd);
     if (native && state === 'recovered final rewrite' && nativeBytes >= Buffer.byteLength(original)) change();
+    if (native && state === 'recovered final append' && nativeBytes >= Buffer.byteLength(original)) change();
+    if (
+      native &&
+      state === 'recovered final deadline exhaustion' &&
+      nativeBytes >= Buffer.byteLength(original) &&
+      expiredAtBytes === null
+    ) {
+      clock += options.deadlineMs;
+      expiredAtBytes = nativeBytes;
+    }
   });
   const reads = vi.spyOn(fs, 'readSync').mockImplementation((...values) => {
+    const request: readonly unknown[] = values;
+    const native = nativeDescriptors.has(values[0]);
+    if (native) {
+      if (expiredAtBytes !== null) lateReads++;
+      nativeReads.push(Number(request[3]));
+      if (state === 'recovered zero progress') return 0;
+    }
     const count = Reflect.apply(read, fs, values);
-    if (nativeDescriptors.has(values[0])) nativeBytes += count;
+    if (native) {
+      nativeBytes += count;
+      if (state === 'recovered unqualified exhaustion') change();
+      if ((state.includes('cumulative') || state.includes('unqualified')) && nativeBytes > bounds.workBytes)
+        clock += options.deadlineMs;
+    }
     return count;
   });
   duringYield = () => {
-    if (nativeBytes && ['initial rewrite', 'recovered rewrite', 'recovered append'].includes(state)) change();
+    if (!nativeReads.length) return;
+    yields++;
+    if (state === 'recovered deadline exhaustion' && changes) {
+      clock += options.deadlineMs;
+      expiredAtBytes = nativeBytes;
+    } else if (
+      [
+        'initial rewrite',
+        'initial append',
+        'recovered rewrite',
+        'recovered append',
+        'recovered cumulative exhaustion',
+        'recovered deadline exhaustion',
+      ].includes(state)
+    )
+      change();
   };
-  const recover = () => superviseStandalone(new DispatchReceipts(home), launch.launchId, true, bounds, runtime);
+  let recoveries = 0;
+  const recover = () => {
+    recoveries++;
+    return superviseStandalone(new DispatchReceipts(home), launch.launchId, true, bounds, runtime);
+  };
   try {
     const output =
       JSON.stringify({
@@ -2811,8 +2874,19 @@ test.each([
       await recover().catch((error) => {
         recoveryError = error;
       });
-    if (!held.length) assert.equal(changed, true);
+    if (!held.length && !['recovered zero progress', 'recovered final deadline exhaustion'].includes(state))
+      assert.equal(changed, true);
     const refused = receipts.latest(launch.launchId)!;
+    assert.equal(recoveries, initial ? 0 : 1);
+    assert.equal(vi.mocked(childProcess.spawn).mock.calls.length, 1);
+    if (append) {
+      assert.equal(refused.availability, 'available');
+      assert.equal((receipts.result(launch.launchId, refused.eventId) as any).text, 'Report');
+      assert.equal(receipts.startupRefused(launch.launchId), false);
+      assert.ok(nativeBytes > Buffer.byteLength(original));
+      assert.ok(yields > 0);
+      return;
+    }
     if (pending) assert.deepEqual(refused, pending);
     assert.equal(refused.availability, 'pending');
     assert.equal(refused.report, null);
@@ -2820,6 +2894,23 @@ test.each([
     assert.ok(receipts.status(launch.launchId).events.every((event) => event.report === null));
     assert.equal((receipts.result(launch.launchId, refused.eventId) as any).text, null);
     assert.equal(recoveryError, undefined);
+    if (exhausted || state === 'recovered zero progress') {
+      assert.equal(receipts.startupRefused(launch.launchId), false);
+      if (state.includes('cumulative') || state.includes('unqualified')) {
+        assert.equal(nativeBytes, bounds.workBytes);
+        assert.equal(
+          nativeReads.reduce((sum, bytes) => sum + bytes, 0),
+          bounds.workBytes,
+        );
+        assert.ok(changes > 1);
+      } else if (state.includes('deadline')) {
+        assert.equal(expiredAtBytes, nativeBytes);
+        assert.equal(nativeBytes, state.includes('final') ? Buffer.byteLength(original) : 256);
+        assert.equal(lateReads, 0);
+      } else assert.equal(nativeReads.length, 1);
+      return;
+    }
+    if (!held.length) assert.equal(receipts.startupRefused(launch.launchId), true);
     if (state === 'all acceptance unavailable') {
       for (const target of [
         path.join(receipts.root, `${launch.launchId}.accepted.json`),
@@ -2837,7 +2928,7 @@ test.each([
     closed.mockRestore();
     reads.mockRestore();
     duringYield = () => {};
-    if (held.length || state === 'recovered append') {
+    if (held.length) {
       for (const target of held) fs.renameSync(target + '.held', target);
       await recover();
       const recovered = receipts.latest(launch.launchId)!;
@@ -2846,8 +2937,6 @@ test.each([
       await recover();
       assert.equal(receipts.latest(launch.launchId)?.eventId, recovered.eventId);
     } else {
-      await recover();
-      assert.deepEqual(receipts.latest(launch.launchId), refused);
       fs.writeFileSync(file, original);
       fs.utimesSync(file, 1_000_000_002, 1_000_000_002);
       await recover();
