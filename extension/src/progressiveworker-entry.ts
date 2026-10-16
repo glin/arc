@@ -1604,10 +1604,9 @@ async function handleMessage(message: {
       return;
     }
     const read = windowReads.get(message.id);
-    if (read) {
-      read.enteredAt = performance.now();
-      parentPort?.postMessage({ id: message.id, windowEntered: true });
-    }
+    if (read) read.enteredAt = performance.now();
+    // Every window read signals its start, including one past the lifecycle bound.
+    if (kind === 'window') parentPort?.postMessage({ id: message.id, windowEntered: true });
     const value = await execute(metadataRequest ?? request, controller.signal);
     if (read) read.completedAt = performance.now();
     const after = revisionOf(file);

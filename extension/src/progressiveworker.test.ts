@@ -1684,6 +1684,33 @@ test('a caught worker request exception preserves safe cause without its message
   }
 });
 
+// The gate holds every deferred callback and file promise on the worker until a codex-context request arrives.
+const WINDOW_GATE = `const gatedPort = require('node:worker_threads').parentPort;
+  const gatedFs = require('node:fs').promises;
+  const immediate = globalThis.setImmediate;
+  let gateOpen = false; const parked = []; let releaseGate; const gate = new Promise((resolve) => { releaseGate = resolve; });
+  globalThis.setImmediate = (callback, ...args) => {
+    if (gateOpen) return immediate(callback, ...args);
+    parked.push(() => callback(...args));
+  };
+  for (const name of ['stat', 'lstat', 'open', 'readFile']) {
+    const original = gatedFs[name];
+    gatedFs[name] = async function (...args) {
+      if (!gateOpen) await gate;
+      return original.apply(this, args);
+    };
+  }
+  const gatedOn = gatedPort.on;
+  gatedPort.on = function(event, listener) {
+    return gatedOn.call(this, event, event === 'message' ? message => {
+      const result = listener(message);
+      if (message.request?.kind === 'codex-context') immediate(() => {
+        gateOpen = true; releaseGate(); for (const run of parked.splice(0)) run();
+      });
+      return result;
+    } : listener);
+  };`;
+
 test('a stalled window read reports its worker lifecycle and the requests that ran beside it', async () => {
   const directory = tempDir('worker-window-lifecycle-');
   const file = path.join(directory, 'PRIVATE_window.jsonl');
@@ -1701,33 +1728,7 @@ test('a stalled window read reports its worker lifecycle and the requests that r
       .join('\n') + '\n',
   );
   const stat = fs.statSync(file);
-  // The gate holds every deferred callback and file promise on the worker until a second request arrives.
-  const gated =
-    `const gatedPort = require('node:worker_threads').parentPort;
-    const gatedFs = require('node:fs').promises;
-    const immediate = globalThis.setImmediate;
-    let gateOpen = false; const parked = []; let releaseGate; const gate = new Promise((resolve) => { releaseGate = resolve; });
-    globalThis.setImmediate = (callback, ...args) => {
-      if (gateOpen) return immediate(callback, ...args);
-      parked.push(() => callback(...args));
-    };
-    for (const name of ['stat', 'lstat', 'open', 'readFile']) {
-      const original = gatedFs[name];
-      gatedFs[name] = async function (...args) {
-        if (!gateOpen) await gate;
-        return original.apply(this, args);
-      };
-    }
-    const gatedOn = gatedPort.on;
-    gatedPort.on = function(event, listener) {
-      return gatedOn.call(this, event, event === 'message' ? message => {
-        const result = listener(message);
-        if (message.request?.kind === 'codex-context') immediate(() => {
-          gateOpen = true; releaseGate(); for (const run of parked.splice(0)) run();
-        });
-        return result;
-      } : listener);
-    };` + source;
+  const gated = WINDOW_GATE + source;
   const worker = new ProgressiveWorker(gated);
   try {
     const session = {
@@ -1762,6 +1763,56 @@ test('a stalled window read reports its worker lifecycle and the requests that r
     assert.deepEqual(lifecycle.during.received, { 'codex-context': 1 }, 'the overlapping request was not counted');
     assert.deepEqual(lifecycle.during.finished, { 'codex-context': 1 });
     assert.ok(!JSON.stringify(snapshot).includes('PRIVATE_'));
+  } finally {
+    worker.stop();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+// Eight held reads fill the worker lifecycle bound. A ninth read must still signal its start. Without that signal
+// the host reports it as never started, which matches a request the worker never reached.
+test('a window read past the worker lifecycle bound still reports its start', async () => {
+  const directory = tempDir('worker-window-ninth-');
+  const file = path.join(directory, 'PRIVATE_window.jsonl');
+  fs.writeFileSync(
+    file,
+    JSON.stringify({ type: 'user', uuid: 'u1', timestamp: timestamp(1), message: { role: 'user', content: 'hi' } }) +
+      '\n',
+  );
+  const stat = fs.statSync(file);
+  const worker = new ProgressiveWorker(WINDOW_GATE + source);
+  const session = {
+    file,
+    sessionId: 'PRIVATE_SESSION',
+    agent: 'claude' as const,
+    size: stat.size,
+    mtimeMs: stat.mtimeMs,
+  };
+  const window = (generation: number) =>
+    worker.run(
+      { kind: 'window', input: { session, folders: [directory], children: [], maxTurns: 40, tailBytes: 65536 } },
+      generation,
+      new AbortController().signal,
+    );
+  try {
+    const tracked = [1, 2, 3, 4, 5, 6, 7, 8].map(window);
+    await vi.waitFor(() =>
+      assert.equal(worker.snapshot().active.filter((row) => typeof row.enteredAfterMs === 'number').length, 8),
+    );
+    // The snapshot lists at most eight active requests, so the ninth row is read when it settles.
+    const ninth = window(9).then((result) => ({
+      result,
+      row: worker.snapshot().recentWindows.find((row) => row.generation === 9),
+    }));
+    const missing = { ...session, file: path.join(directory, 'PRIVATE_missing.jsonl'), agent: 'codex' as const };
+    const context = await worker.run({ kind: 'codex-context', session: missing }, 10, new AbortController().signal);
+    assert.equal(context?.value.kind, 'stale');
+    for (const read of tracked) assert.equal((await read)?.value.kind, 'window');
+    const { result, row } = await ninth;
+    assert.equal(result?.value.kind, 'window');
+    assert.equal(row?.outcome, 'window');
+    assert.equal(typeof row?.enteredAfterMs, 'number', 'the ninth window read did not report its start');
+    assert.equal(row?.worker, null);
   } finally {
     worker.stop();
     fs.rmSync(directory, { recursive: true, force: true });
