@@ -11911,11 +11911,14 @@ export class PanelProvider implements vscode.Disposable {
           generation,
           controller.signal,
         );
+        const refreshed = this.currentSelectedSession(work);
+        if (!refreshed) return;
+        session = refreshed;
         // Sources can change while hydration waits, and a rejected reply stores nothing, so read the current keys again.
         let currentKeys: Map<string, string> | undefined;
         const currentKey = (file: string) =>
           (currentKeys ??= new Map(
-            this.commitRepositoryContexts(session, previous.read.turns).map((one) => [one.child.file, one.key]),
+            this.commitRepositoryContexts(refreshed, previous.read.turns).map((one) => [one.child.file, one.key]),
           )).get(file);
         roundTrip ||= contexts.some((context, index) => {
           const before = stored[index];
@@ -12011,12 +12014,12 @@ export class PanelProvider implements vscode.Disposable {
         controller.signal,
       );
       const enriched = this.currentSelectedSession(work);
-      if (
-        !enriched ||
-        !sameProgressiveRevision(result.revision, this.revisionOf(enriched)) ||
-        this.cache.get(current.file)?.read !== result.value.read
-      )
+      if (!enriched) return;
+      if (!sameProgressiveRevision(result.revision, this.revisionOf(enriched))) {
+        retryLatestRevision = true;
         return;
+      }
+      if (this.cache.get(current.file)?.read !== result.value.read) return;
       const turns = this.commitRepositoryTurns(enriched, result.value.read.turns);
       this.applyCommitRepositoryEvidence(enriched, turns);
       this.repositoryCommits.apply(turns, this.folders());

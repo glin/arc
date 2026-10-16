@@ -870,7 +870,7 @@ test('isolated startup protects baseline registrations without replacing their c
     fs.mkdirSync(source, { recursive: true });
     const registration = `const panel = registerPanel(context, root, ${cache});`;
     const original = {
-      'agenthost.ts': `export const spawnCli: Spawner = (command, args, cwd, env${cache === 'workspaceCacheRoot' ? '' : ', agent'}) => { return 'spawned'; };`,
+      'agenthost.ts': `export const spawnCli: Spawner = (command, args, cwd, env${cache === 'workspaceCacheRoot' ? '' : cache === 'retainedCache' ? ', agent, cli' : ', agent'}) => { return 'spawned'; };`,
       'panelhost.ts':
         'const stored = this.memento?.get(STATE_KEY);\nconst identity = { startedAt: Math.round(performance.timeOrigin), };',
       'extension.ts': registration,
@@ -2243,6 +2243,41 @@ test('accepted unread same-turn facts publish before repository hydration', asyn
   assert.ok(provider.messages.at(-1).cards[0].commits[0].dir);
   assert.equal(fixture.bytes.length, 2);
   process.stdout.write(`selected publication payload bytes ${JSON.stringify(fixture.bytes)}\n`);
+});
+
+test('a completed response appended during repository hydration publishes without another poll', async () => {
+  for (const cached of [false, true]) {
+    const fixture = await selectedPublicationFixture('changed', {}, cached);
+    const { provider, session } = fixture;
+    if (cached) provider.cache.get(session.file).revision = { ...provider.revisionOf(session) };
+    const pending = provider.completeSelectedWindow('selected', 0);
+    await fixture.hydrationStarted;
+    const completed = { ...fixture.newest, summary: 'The **completed response** includes `rich-code`.', agents: [] };
+    session.size++;
+    session.mtimeMs++;
+    let reads = 0;
+    provider.progressiveWorker.run = async (request: ProgressiveRequest, generation: number) => {
+      assert.equal(request.kind, 'window');
+      reads++;
+      const result = windowResult(generation, { ...session });
+      assert.equal(result.value.kind, 'window');
+      if (result.value.kind === 'window') result.value.read.turns = [completed];
+      return result;
+    };
+    await provider.completeSelectedWindow('selected', 0);
+    assert.equal(reads, 0, 'the completed response replaced an active selected read');
+    fixture.finish();
+    await pending;
+    await vi.waitFor(() =>
+      assert.equal(
+        provider.messages.at(-1)?.cards[0]?.summary === completed.summary,
+        true,
+        'the completed response waited for another poll',
+      ),
+    );
+    assert.equal(reads, 1, 'the appended response did not receive one replacement read');
+    await vi.waitFor(() => assert.equal(provider.selectionWork, null));
+  }
 });
 
 test('selected publication suppresses unchanged and obsolete repository enrichment', async () => {

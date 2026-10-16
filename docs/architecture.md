@@ -473,7 +473,7 @@ File citations use a typed literal destination through response links and native
 
 ## Module boundaries
 
-Accepted selected windows publish current turn facts before commit repository discovery waits. Incomplete repository evidence clears commit navigation before publication. The owning panel's transport state retains the successfully accepted window and commit rows. Completion retries an undelivered current window even when commit rows stay unchanged. Enrichment compares indexed visible cards with those rows through the shared commit-only projection. A failed independent post leaves enrichment pending.
+Accepted selected windows publish current turn facts before commit repository discovery waits. Repository hydration rechecks the selected source. A changed source resumes selected reading without another refresh trigger. Incomplete repository evidence clears commit navigation before publication. The owning panel's transport state retains the successfully accepted window and commit rows. Completion retries an undelivered current window even when commit rows stay unchanged. Enrichment compares indexed visible cards with those rows through the shared commit-only projection. A failed independent post leaves enrichment pending.
 
 Preact removes the focused usage refresh button when busy status replaces it. The removal emits focusout with no destination during rendering. Redrawing inside that event can retain stale busy content. The usage popover ignores null focus destinations and redundant focus entry. An outside press clears both hovered and pinned state, independently of focus events.
 

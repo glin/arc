@@ -4,7 +4,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import { createHash, randomUUID } from 'node:crypto';
 import * as path from 'node:path';
-import { instrumentSelection, measureSelection } from './selection';
+import { instrumentSelection, measureSelection, instrumentResponse, measureResponse } from './selection';
 import { codexSessionFiles, codexSessionsRoot } from '../../src/codex.ts';
 import { DIAGNOSTICS_LOG_DIRECTORY } from '../../src/diagnosticslog.ts';
 import type { StartupMilestone } from '../../src/performancediagnostics.ts';
@@ -39,6 +39,7 @@ let fixture: {
 const STATE = path.join(SCRATCH, 'state.json');
 const MEASUREMENT_RUN = randomUUID();
 let selectionRequested = false;
+let responseRequested = false;
 let expectedSelection: { session: string; key?: string; prompt?: string; summary?: string } | null = null;
 function isolatedEnvironment(): NodeJS.ProcessEnv {
   return {
@@ -47,7 +48,7 @@ function isolatedEnvironment(): NodeJS.ProcessEnv {
     CODEX_HOME: path.join(SCRATCH, 'codex-config'),
     ARC_HOME: ARC_STORE,
     ARC_PROJECTS_ROOT: fixture.projects,
-    ARC_CODEX_ROOT: fixture.codex,
+    ARC_CODEX_ROOT: responseRequested ? path.join(SCRATCH, 'response-codex') : fixture.codex,
     ARC_MEASURE_STATE: STATE,
     ARC_MEASURE_BLOCK_AGENTS: '1',
     ARC_MEASURE_RUN: MEASUREMENT_RUN,
@@ -67,6 +68,7 @@ interface Options {
   timeoutMs: number;
   keep: boolean;
   selection: boolean;
+  response: boolean;
 }
 
 interface LogLine {
@@ -120,10 +122,16 @@ function readOptions(argv: string[]): Options {
     keep: false,
     fixture: '',
     selection: false,
+    response: false,
   };
   for (let i = 0; i < argv.length; i += 1) {
     const flag = argv[i];
     const value = argv[i + 1];
+    if (flag === '--response') {
+      options.response = true;
+      options.selection = true;
+      continue;
+    }
     if (flag === '--selection') {
       options.selection = true;
       continue;
@@ -305,12 +313,16 @@ export function frozenPath(root: string, input: string): string {
 }
 
 function seedProfile(): void {
+  if (responseRequested) fs.cpSync(fixture.codex, path.join(SCRATCH, 'response-codex'), { recursive: true });
   fs.mkdirSync(path.join(USER_DATA, 'User'), { recursive: true });
   fs.writeFileSync(
     path.join(USER_DATA, 'User', 'settings.json'),
     JSON.stringify({
       'arc.diagnostics.log': true,
       'telemetry.telemetryLevel': 'off',
+      'workbench.startupEditor': 'none',
+      'workbench.welcomePage.walkthroughs.openOnInstall': false,
+      'workbench.welcomePage.experimentalOnboarding': false,
       'update.mode': 'none',
       'extensions.autoCheckUpdates': false,
       'extensions.autoUpdate': false,
@@ -463,7 +475,7 @@ export function protectBaseline(tree: string): void {
   };
   const spawner = fs.readFileSync(path.join(tree, 'extension', 'src', 'agenthost.ts'), 'utf8');
   const spawnDeclaration = spawner.match(
-    /export const spawnCli: Spawner = \(command, args, cwd, env(?:, agent)?\) => \{/,
+    /export const spawnCli: Spawner = \(command, args, cwd, env(?:, agent(?:, cli)?)?\) => \{/,
   );
   if (!spawnDeclaration) throw new Error('The baseline lacks its agent launch boundary.');
   edit(
@@ -810,7 +822,9 @@ async function measure(commandLine: string, workspace: string, timeoutMs: number
   try {
     const outcome = await pollStartup(() => reader.read(), launch, timeoutMs, MEASUREMENT_RUN, expectedSelection);
     if (outcome.complete && selectionRequested) {
-      const result = await measureSelection(SCRATCH, timeoutMs);
+      const result = responseRequested
+        ? await measureResponse(SCRATCH, timeoutMs)
+        : await measureSelection(SCRATCH, timeoutMs);
       return { ...outcome, note: result.note, complete: result.complete };
     }
     return outcome;
@@ -914,6 +928,7 @@ function report(outcome: Outcome, label: string, workspace: string): void {
 async function main(): Promise<void> {
   const options = readOptions(process.argv.slice(2));
   selectionRequested = options.selection;
+  responseRequested = options.response;
   loadFixture(options.fixture);
   options.workspace = fixture.workspace;
   const commandLine = editorCommandLine();
@@ -926,6 +941,7 @@ async function main(): Promise<void> {
     protectBaseline(tree);
     instrumentStartup(tree);
     if (selectionRequested) instrumentSelection(tree);
+    if (responseRequested) instrumentResponse(tree);
     const label = git(['rev-parse', '--short', source]);
     npm(['run', 'build'], path.join(tree, 'extension'));
     npm(['run', 'package'], path.join(tree, 'extension'));

@@ -404,6 +404,305 @@ export function instrumentSelection(tree: string): void {
   );
 }
 
+// This overlay runs only in the disposable editor with agent connections blocked.
+export function instrumentResponse(tree: string): void {
+  const source = path.join(tree, 'extension', 'src');
+  const traceFile = path.join(source, 'selection-measure.ts');
+  let traceSource = fs.readFileSync(traceFile, 'utf8');
+  traceSource = traceSource.replace(
+    'const write = fs.writeSync.bind(fs);',
+    'const write = fs.writeSync.bind(fs); let retained = 0;',
+  );
+  traceSource = traceSource.replace(
+    '  write(descriptor, JSON.stringify({stage, click, payload, time:',
+    "  if (click !== 'synthetic-rich-response' && !String(click).startsWith('response-clock-') && !stage.startsWith('response-')) return; if (++retained > 20000) throw new Error('Response trace capacity exceeded.');\n  write(descriptor, JSON.stringify({stage, click, payload, time:",
+  );
+  fs.writeFileSync(traceFile, traceSource);
+  const patch = (name: string, needle: string, replacement: string) => {
+    const file = path.join(source, name);
+    const text = fs.readFileSync(file, 'utf8');
+    if (text.split(needle).length !== 2) throw new Error(`Response overlay boundary is ambiguous: ${name}`);
+    fs.writeFileSync(file, text.replace(needle, replacement));
+  };
+  patch(
+    'panelhost.ts',
+    '    const click = (raw as any)?.__arcMeasure;',
+    `
+    if ((raw as any)?.type === '__arcResponse') {
+      if (process.env.ARC_MEASURE_BLOCK_AGENTS !== '1') throw new Error('Response capture requires launch isolation.');
+      const input = raw as any;
+      return selectionContext.run(input.id, async () => {
+        try {
+          if (input.action === 'begin') {
+            const session = this.showing;
+            const state = session && this.stateFor(session);
+            const sources = this.catalog?.sessions.filter(one => one.sessionId === session && one.agent === 'codex') ?? [];
+            if (!state || sources.length !== 1) throw new Error('One selected synthetic Codex source is required.');
+            const file = fs.realpathSync(sources[0].file);
+            const root = fs.realpathSync(process.env.ARC_CODEX_ROOT!);
+            if (!file.startsWith(root + path.sep)) throw new Error('Source is outside the synthetic root.');
+            const at = this.noteLive(state, 'prompt', input.prompt);
+            const turnId = 880001;
+            const timer = setTimeout(() => this.forgetPendingResponses(turnId), LIVE_PRESS_LIMIT_MS);
+            timer.unref?.();
+            this.pendingResponseOwners.set(turnId, {session, source:session, at, timer});
+            selectionTrace('response-owner', {session, at, turnId, registered:this.pendingResponseOwners.has(turnId)});
+            this.livePressAnswered(session, at, {delivered:true, session, turnId});
+            const press = this.live[session]?.find(one => one.at === at);
+            if (!press || press.turnId !== turnId || !press.ran) throw new Error('Delivery did not bind the intended press.');
+            const identity = {session, at, turnId, file, prompt:input.prompt, text:input.text,
+              nativeTurn:input.id, initialSha256:require('node:crypto').createHash('sha256').update(fs.readFileSync(file)).digest('hex')};
+            (this as any).__arcResponse = identity;
+            selectionTrace('response-bound', identity);
+            this.noteReply(session, input.text, turnId);
+            this.postReply();
+            selectionTrace('response-live', {identity, press:this.live[session]?.find(one => one.at === at)});
+            await host.webview.postMessage({type:'__arcResponse', action:'begin', identity});
+          } else {
+            const identity = (this as any).__arcResponse;
+            if (!identity || identity.nativeTurn !== input.id) throw new Error('Response identity is missing.');
+            const {session, at, turnId, file, prompt, text} = identity;
+            const record = (type, payload) => JSON.stringify({timestamp:new Date(at + 1).toISOString(), type, payload}) + '\\n';
+            const bytes = record('event_msg',{type:'task_started',turn_id:input.id}) +
+              record('event_msg',{type:'user_message',message:prompt}) +
+              Array.from({length:80}, () => record('measurement_padding',{text:'x'.repeat(65536)})).join('') +
+              record('event_msg',{type:'agent_message',phase:'final_answer',message:text}) +
+              record('event_msg',{type:'task_complete',turn_id:input.id,last_agent_message:text});
+            const offset = fs.statSync(file).size;
+            fs.appendFileSync(file, bytes);
+            selectionTrace('response-append', {identity,offset,bytes:Buffer.byteLength(bytes),
+              sha256:require('node:crypto').createHash('sha256').update(bytes).digest('hex'),
+              finalSha256:require('node:crypto').createHash('sha256').update(fs.readFileSync(file)).digest('hex')});
+            this.noteCompletedReply(session, text, input.id, turnId, () => selectionTrace('response-saved', identity));
+            await host.webview.postMessage({type:'__arcResponse',action:'complete',identity});
+          }
+        } catch (error) { selectionTrace('response-error', String(error)); await host.webview.postMessage({type:'__arcResponse',error:String(error)}); }
+      });
+    }
+    const click = (raw as any)?.__arcMeasure;`,
+  );
+  patch(
+    'panelhost.ts',
+    '  private async completeSelectedWindow(sessionId: string, generation: number): Promise<void> {',
+    `  private async completeSelectedWindow(sessionId: string, generation: number): Promise<void> {
+      selectionTrace('response-read-trigger', {sessionId,generation,held:!!this.selectionWorks?.get(sessionId)});`,
+  );
+  patch(
+    'panelhost.ts',
+    '      this.updateHistoryAfterAcceptedWindow(sessionId, previous, result, true);',
+    `      selectionTrace('response-read-accepted', {sessionId,generation,result});
+      this.updateHistoryAfterAcceptedWindow(sessionId, previous, result, true);`,
+  );
+  patch(
+    'panelhost.ts',
+    '      summaryHtml: renderRichMarkdown(turn.summary),',
+    `      summaryHtml: (() => { selectionTrace('response-prepare-start',{session:turn.sessionId,summary:turn.summary});
+      const html = renderRichMarkdown(turn.summary); selectionTrace('response-prepare-end',{session:turn.sessionId,summary:turn.summary,html}); return html; })(),`,
+  );
+  patch(
+    'webview/panel.ts',
+    '    const tagged = data as any;',
+    `
+    const tagged = data as any;
+    if (tagged?.type === '__arcResponse') {
+      (window as any).__arcResponse = tagged;
+      trace('response-ack', tagged, tagged.identity?.nativeTurn);
+      return;
+    }`,
+  );
+  patch(
+    'webview/panel.ts',
+    '  let drawSerial = 0;',
+    `
+  (window as any).__arcResponseSend = input => kernel.sendToHost({type:'__arcResponse',...input} as any);
+  let responseDomKey = '';
+  new MutationObserver(() => {
+    const identity = (window as any).__arcResponse?.identity;
+    if (!identity) return;
+    const live = document.querySelector('.clive[data-live-at="' + identity.at + '"]');
+    const card = latest?.cards.find(one => one.sessionId === identity.session && one.summary === identity.text);
+    const article = card && Array.from(document.querySelectorAll('article.turn')).find(one => (one as HTMLElement).dataset.key === card.key);
+    const rich = article?.querySelector('.summary strong');
+    const code = article?.querySelector('.summary code');
+    const key = JSON.stringify([!!live,card?.key,!!rich,!!code,window.getSelection()?.toString()]);
+    if (key === responseDomKey) return;
+    responseDomKey = key;
+    const payload = {identity, live:!!live, key:card?.key, rich:rich?.textContent, code:code?.textContent, selected:window.getSelection()?.toString()};
+    trace('response-dom',payload,identity.nativeTurn);
+    if (!live && rich && code) requestAnimationFrame(() => trace('response-frame',payload,identity.nativeTurn));
+  }).observe(document.body,{subtree:true,childList:true,characterData:true,attributes:true});
+  let drawSerial = 0;`,
+  );
+}
+
+export async function measureResponse(
+  scratch: string,
+  timeoutMs: number,
+): Promise<{ complete: boolean; note: string }> {
+  const deadline = performance.now() + timeoutMs;
+  let browser: Awaited<ReturnType<typeof chromium.connectOverCDP>> | undefined;
+  let frame: Frame | undefined;
+  const receipt: Record<string, unknown> = { complete: false, synthetic: true, compositorPresentation: false };
+  try {
+    const port = fs.readFileSync(path.join(scratch, 'user-data', 'DevToolsActivePort'), 'utf8').split('\n')[0];
+    browser = await chromium.connectOverCDP('http://127.0.0.1:' + port, {
+      timeout: Math.max(1, deadline - performance.now()),
+    });
+    receipt.cdpConnected = true;
+    const transport = await browser.newBrowserCDPSession();
+    receipt.cdpTargets = await transport.send('Target.getTargets');
+    // Reload the isolated workbench after attachment so Chromium reports existing webview children.
+    for (const context of browser.contexts())
+      for (const page of context.pages())
+        if (page.url().startsWith('vscode-file:'))
+          await page.reload({ waitUntil: 'domcontentloaded', timeout: Math.max(1, deadline - performance.now()) });
+    receipt.discoveryReload = true;
+    frame = await poll(async () => {
+      receipt.frames = browser!
+        .contexts()
+        .flatMap((context) => context.pages().flatMap((page) => page.frames().map((candidate) => candidate.url())));
+      for (const context of browser!.contexts())
+        for (const page of context.pages())
+          for (const candidate of page.frames()) {
+            try {
+              if (await candidate.evaluate(() => typeof (window as any).__arcResponseSend === 'function'))
+                return candidate;
+            } catch {}
+          }
+      return null;
+    }, deadline);
+    await frame.waitForFunction(
+      () =>
+        !!document.querySelector('article.turn') && !!document.querySelector('button.railcard[aria-current="true"]'),
+      undefined,
+      { timeout: Math.max(1, deadline - performance.now()) },
+    );
+    const workbench = frame.page();
+    const welcome = workbench.getByRole('dialog', { name: 'Welcome to Visual Studio Code' });
+    receipt.welcomeBefore = await welcome.count();
+    if (await welcome.count()) {
+      receipt.welcomeButtons = await welcome.getByRole('button').allTextContents();
+      const dismiss = welcome.getByRole('button', { name: /skip|close|done|start/i }).last();
+      await dismiss.click({ timeout: Math.max(1, deadline - performance.now()) });
+    }
+    await workbench.waitForFunction(() => !document.querySelector('.onboarding-a-overlay'), undefined, {
+      timeout: Math.max(1, deadline - performance.now()),
+    });
+    receipt.welcomeAbsent = true;
+    for (let index = 0; index < 3; index++) {
+      const alignment = 'response-clock-' + index;
+      await frame.evaluate((id) => (window as any).__arcClock(id), alignment);
+      await frame.waitForFunction(
+        (id) =>
+          (window as any).__arcEvents.some(
+            (event: SelectionEvent) => event.stage === 'browser-receive' && event.click === id,
+          ),
+        alignment,
+        { timeout: Math.max(1, deadline - performance.now()) },
+      );
+    }
+    const id = 'synthetic-rich-response';
+    await frame.evaluate((input) => (window as any).__arcResponseSend(input), {
+      id,
+      action: 'begin',
+      prompt: 'Review the response transition',
+      text: 'The **synthetic response** includes `rich-code`.',
+    });
+    await frame.waitForFunction(
+      () => (window as any).__arcResponse?.action === 'begin' || (window as any).__arcResponse?.error,
+      undefined,
+      { timeout: Math.max(1, deadline - performance.now()) },
+    );
+    const begin = await frame.evaluate(() => (window as any).__arcResponse);
+    receipt.begin = begin;
+    if (begin.error) throw new Error(begin.error);
+    await frame.locator('.clive .head').click({ timeout: Math.max(1, deadline - performance.now()) });
+    await frame.waitForFunction(
+      () =>
+        document.querySelector('.cliveresponse')?.textContent === 'The **synthetic response** includes `rich-code`.',
+      undefined,
+      { timeout: Math.max(1, deadline - performance.now()) },
+    );
+    await frame.page().screenshot({ path: path.join(scratch, 'response-before.png') });
+    await frame.evaluate(() => {
+      const text = document.querySelector('.cliveresponse')!.firstChild!;
+      const range = document.createRange();
+      range.setStart(text, 0);
+      range.setEnd(text, 3);
+      window.getSelection()!.removeAllRanges();
+      window.getSelection()!.addRange(range);
+      document.dispatchEvent(new Event('selectionchange'));
+    });
+    await frame.evaluate((input) => (window as any).__arcResponseSend(input), { id, action: 'complete' });
+    await poll(
+      async () =>
+        nodeEvents(scratch).some(
+          (event) =>
+            event.stage === 'response-read-accepted' &&
+            event.click === id &&
+            (event.payload as any)?.result?.value?.read?.turns.some(
+              (turn: any) => turn.summary === begin.identity.text,
+            ),
+        )
+          ? true
+          : null,
+      deadline,
+    );
+    await frame.waitForFunction(
+      (identity) =>
+        (window as any).__arcEvents.some(
+          (event: SelectionEvent) =>
+            event.stage === 'browser-receive' &&
+            (event.payload as any)?.cards?.some(
+              (card: any) => card.sessionId === identity.session && card.summary === identity.text,
+            ),
+        ),
+      begin.identity,
+      { timeout: Math.max(1, deadline - performance.now()) },
+    );
+    receipt.protection = await frame.evaluate(() => ({
+      selected: window.getSelection()?.toString(),
+      live: !!document.querySelector('.clive'),
+    }));
+    if ((receipt.protection as any).selected !== 'The' || !(receipt.protection as any).live)
+      throw new Error('Live response selection was not retained through accepted recorded content.');
+    await frame.evaluate(() => {
+      window.getSelection()!.removeAllRanges();
+      document.dispatchEvent(new Event('selectionchange'));
+    });
+    await frame.waitForFunction(
+      () => (window as any).__arcEvents.some((event: SelectionEvent) => event.stage === 'response-frame'),
+      undefined,
+      { timeout: Math.max(1, deadline - performance.now()) },
+    );
+    await frame.page().screenshot({ path: path.join(scratch, 'response-after.png') });
+    receipt.domTransitionObserved = true;
+    receipt.complete = true;
+    return {
+      complete: true,
+      note: 'Synthetic response delivery, recorded rich descendants, and selection protection observed.',
+    };
+  } catch (error) {
+    receipt.error = String(error);
+    await frame
+      ?.page()
+      .screenshot({ path: path.join(scratch, 'response-error.png') })
+      .catch(() => {});
+    return { complete: false, note: String(error) };
+  } finally {
+    if (frame) {
+      try {
+        receipt.browserEvents = await frame.evaluate(() => (window as any).__arcEvents);
+      } catch (error) {
+        receipt.browserTraceError = String(error);
+      }
+    }
+    receipt.hostWorkerEvents = nodeEvents(scratch);
+    fs.writeFileSync(path.join(scratch, 'response.json'), JSON.stringify(receipt, null, 2));
+    await browser?.close();
+  }
+}
+
 async function poll<T>(read: () => Promise<T | null>, deadline: number): Promise<T> {
   for (;;) {
     const value = await read();
@@ -555,6 +854,10 @@ export async function measureSelection(
     };
   } catch (error) {
     receipt.error = String(error);
+    await frame
+      ?.page()
+      .screenshot({ path: path.join(scratch, 'selection-error.png') })
+      .catch(() => {});
     return { complete: false, note: String(error) };
   } finally {
     try {
