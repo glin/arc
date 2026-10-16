@@ -2681,6 +2681,185 @@ test.each([
   }
 });
 
+test.each([
+  'initial rewrite',
+  'recovered rewrite',
+  'recovered final rewrite',
+  'recovered append',
+  'all acceptance unavailable',
+  'binding unavailable',
+] as const)('Claude print continuity keeps reports private with %s', async (state) => {
+  vi.useFakeTimers();
+  const { home, args } = fixture();
+  const parsed = parseRun([...args.map((arg, i) => (i === 1 ? 'claude' : arg)), '--read-only'], {
+    CLAUDE_BIN: process.execPath,
+    ARC_PROJECTS_ROOT: path.join(home, 'projects'),
+  });
+  const options = parsed.options;
+  const file = path.join(options.env!.ARC_PROJECTS_ROOT!, projectSlug(home), `${options.sessionHint}.jsonl`);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const original =
+    JSON.stringify({
+      type: 'user',
+      uuid: 'native-user',
+      padding: ' '.repeat(256),
+      sessionId: options.sessionHint,
+      cwd: home,
+      message: { role: 'user', content: parsed.prompt },
+    }) + '\n';
+  const receipts = new DispatchReceipts(home);
+  const launch = receipts.reserve({
+    origin: 'e'.repeat(24),
+    requester: null,
+    policy: parsed.policy,
+    completion: 'manual',
+    promptSha256: payloadSha256(parsed.prompt),
+    alias: null,
+    transport: 'standalone',
+    standalone: options,
+  });
+  receipts.input(launch.launchId, parsed.prompt);
+  const child = new ChildProcess();
+  child.stdin = new PassThrough();
+  let stdout = -1;
+  vi.mocked(childProcess.spawn).mockImplementationOnce((_command, _args, settings) => {
+    stdout = (settings.stdio as number[])[1];
+    fs.writeFileSync(file, original);
+    fs.utimesSync(file, 1_000_000_000, 1_000_000_000);
+    return child;
+  });
+  const bounds = { frameBytes: 2048, readBytes: 128, workBytes: 4096 };
+  let duringYield = () => {};
+  const runtime = { now: Date.now, identity: async () => null, yield: async () => duringYield() };
+  const supervised = superviseStandalone(receipts, launch.launchId, false, bounds, runtime);
+  await vi.waitFor(() => assert.equal(receipts.standaloneSession(launch.launchId), options.sessionHint));
+  const initial = state === 'initial rewrite';
+  if (!initial) {
+    await vi.advanceTimersByTimeAsync(options.deadlineMs);
+    await supervised;
+    assert.equal(receipts.latest(launch.launchId)?.availability, 'pending');
+  }
+  const pending = receipts.latest(launch.launchId);
+  const held =
+    state === 'all acceptance unavailable'
+      ? [
+          path.join(receipts.root, launch.launchId, 'startup.json'),
+          path.join(receipts.root, `${launch.launchId}.startup.json`),
+          path.join(receipts.root, `${launch.launchId}.startup.accepting.json`),
+          path.join(receipts.root, launch.launchId, 'accepted.json'),
+        ]
+      : state === 'binding unavailable'
+        ? [path.join(receipts.root, launch.launchId, 'accepted.json')]
+        : [];
+  for (const target of held) fs.renameSync(target, target + '.held');
+  const before = fs.statSync(file, { bigint: true });
+  const nativeDescriptors = new Set<number>();
+  const open = fs.openSync;
+  const close = fs.closeSync;
+  const read = fs.readSync;
+  let nativeBytes = 0;
+  let changed = false;
+  const change = () => {
+    if (changed) return;
+    changed = true;
+    if (state === 'recovered append') fs.appendFileSync(file, '\n');
+    else {
+      const fd = open(file, 'r+');
+      fs.writeSync(fd, Buffer.from('x'), 0, 1, 0);
+      close(fd);
+    }
+    fs.utimesSync(file, 1_000_000_001, 1_000_000_001);
+    const after = fs.statSync(file, { bigint: true });
+    assert.equal(after.ino, before.ino);
+    assert.equal(after.size, before.size + (state === 'recovered append' ? 1n : 0n));
+    assert.notEqual(after.mtimeNs, before.mtimeNs);
+  };
+  const opened = vi.spyOn(fs, 'openSync').mockImplementation((target, ...rest) => {
+    const fd = Reflect.apply(open, fs, [target, ...rest]);
+    if (String(target) === file) nativeDescriptors.add(fd);
+    return fd;
+  });
+  const closed = vi.spyOn(fs, 'closeSync').mockImplementation((fd) => {
+    const native = nativeDescriptors.delete(fd);
+    close(fd);
+    if (native && state === 'recovered final rewrite' && nativeBytes >= Buffer.byteLength(original)) change();
+  });
+  const reads = vi.spyOn(fs, 'readSync').mockImplementation((...values) => {
+    const count = Reflect.apply(read, fs, values);
+    if (nativeDescriptors.has(values[0])) nativeBytes += count;
+    return count;
+  });
+  duringYield = () => {
+    if (nativeBytes && ['initial rewrite', 'recovered rewrite', 'recovered append'].includes(state)) change();
+  };
+  const recover = () => superviseStandalone(new DispatchReceipts(home), launch.launchId, true, bounds, runtime);
+  try {
+    const output =
+      JSON.stringify({
+        type: 'result',
+        subtype: 'success',
+        session_id: options.sessionHint,
+        result: 'Report',
+        is_error: false,
+      }) + '\n';
+    if (initial) fs.writeSync(stdout, output);
+    else fs.appendFileSync(receipts.artifact(launch.launchId, 'stdout.log'), output);
+    child.emit('close', 0, null);
+    let recoveryError: unknown;
+    if (initial) await supervised;
+    else
+      await recover().catch((error) => {
+        recoveryError = error;
+      });
+    if (!held.length) assert.equal(changed, true);
+    const refused = receipts.latest(launch.launchId)!;
+    if (pending) assert.deepEqual(refused, pending);
+    assert.equal(refused.availability, 'pending');
+    assert.equal(refused.report, null);
+    assert.equal(receipts.status(launch.launchId).reportSource, null);
+    assert.ok(receipts.status(launch.launchId).events.every((event) => event.report === null));
+    assert.equal((receipts.result(launch.launchId, refused.eventId) as any).text, null);
+    assert.equal(recoveryError, undefined);
+    if (state === 'all acceptance unavailable') {
+      for (const target of [
+        path.join(receipts.root, `${launch.launchId}.accepted.json`),
+        path.join(receipts.root, `${launch.launchId}.accepting.json`),
+      ]) {
+        fs.renameSync(target, target + '.held');
+        try {
+          assert.throws(() => receipts.startup(launch.launchId));
+        } finally {
+          fs.renameSync(target + '.held', target);
+        }
+      }
+    }
+    opened.mockRestore();
+    closed.mockRestore();
+    reads.mockRestore();
+    duringYield = () => {};
+    if (held.length || state === 'recovered append') {
+      for (const target of held) fs.renameSync(target + '.held', target);
+      await recover();
+      const recovered = receipts.latest(launch.launchId)!;
+      assert.equal(recovered.availability, 'available');
+      assert.equal((receipts.result(launch.launchId, recovered.eventId) as any).text, 'Report');
+      await recover();
+      assert.equal(receipts.latest(launch.launchId)?.eventId, recovered.eventId);
+    } else {
+      await recover();
+      assert.deepEqual(receipts.latest(launch.launchId), refused);
+      fs.writeFileSync(file, original);
+      fs.utimesSync(file, 1_000_000_002, 1_000_000_002);
+      await recover();
+      assert.deepEqual(receipts.latest(launch.launchId), refused);
+    }
+    assert.equal(vi.mocked(childProcess.spawn).mock.calls.length, 1);
+  } finally {
+    child.emit('close', 0, null);
+    await supervised;
+  }
+});
+
 test('standalone manual wait observes retained events and controlled deadlines without starting a worker', async () => {
   vi.useFakeTimers();
   const { receipts, options } = receiptsFixture();

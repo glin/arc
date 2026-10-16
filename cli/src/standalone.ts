@@ -683,6 +683,7 @@ async function startupContinuous(
     const buffer = Buffer.alloc(Math.min(bounds.readBytes, READ_BYTES));
     let offset = 0;
     let refused = false;
+    let revision: ReturnType<typeof revisionOf> | null = null;
     do {
       const qualified = readQualifiedOpening(held.file, (fd) => {
         const stat = fs.fstatSync(fd, { bigint: true });
@@ -699,8 +700,17 @@ async function startupContinuous(
       });
       if (refused) return refuse();
       if (!qualified?.value) return false;
+      if (revision && !isDeepStrictEqual(revision, qualified.revision)) return false;
+      revision = qualified.revision;
       if (offset < held.bytes) await runtime.yield();
     } while (offset < held.bytes);
+    const final = readQualifiedOpening(held.file, (fd) => {
+      const stat = fs.fstatSync(fd, { bigint: true });
+      if (`${stat.dev}:${stat.ino}` !== held.identity || stat.size < BigInt(held.bytes)) refused = true;
+      return true;
+    });
+    if (refused) return refuse();
+    if (!final || !isDeepStrictEqual(revision, final.revision)) return false;
     if (!checkPaths()) return refuse();
     return digest.digest('hex') === held.sha256 || refuse();
   } catch (error) {
@@ -1443,7 +1453,14 @@ export async function superviseStandalone(
           pending: unflushed?.pending ?? stream.partial(),
         });
       const last = receipts.latest(id);
-      const continuous = await startupContinuous(receipts, id, options, bounds, runtime, deadline);
+      let continuous = await startupContinuous(receipts, id, options, bounds, runtime, deadline);
+      if (continuous && !sourceFailed && !incomplete && recovered.sessionId && recovered.evidence) {
+        try {
+          receipts.standaloneSession(id, recovered.sessionId);
+        } catch {
+          continuous = false;
+        }
+      }
       if (!continuous)
         recovered = { sessionId: null, outcome: 'unknown', availability: 'pending', text: null, evidence: null };
       if (
@@ -1468,8 +1485,6 @@ export async function superviseStandalone(
           },
           recovered.text,
         );
-      if (continuous && !sourceFailed && !incomplete && recovered.sessionId && recovered.evidence)
-        receipts.standaloneSession(id, recovered.sessionId);
       observation.sessionId = recovered.sessionId;
       observation.monitor = incomplete ? 'timed-out' : recovered.text ? 'finished' : 'unavailable';
       observation.reason = sourceFailed

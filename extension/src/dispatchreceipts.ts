@@ -588,7 +588,11 @@ export class DispatchReceipts {
       !fs.existsSync(path.join(this.root, `${id}.startup.accepting.json`))
     ) {
       const accepted = this.file(id, 'accepted.json');
-      if (fs.existsSync(accepted)) {
+      if (
+        fs.existsSync(accepted) ||
+        fs.existsSync(path.join(this.root, `${id}.accepted.json`)) ||
+        fs.existsSync(path.join(this.root, `${id}.accepting.json`))
+      ) {
         const binding = JSON.parse(read(accepted));
         this.bindIdentity(id, 'accepted', binding);
         if (binding.startupRequired) throw new Error('The standalone session identity is invalid.');
