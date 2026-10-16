@@ -783,7 +783,7 @@ function logCapture(receipts: DispatchReceipts, id: string, bounds: ReadBounds) 
     const aliasPending = capture.flushAlias();
     return !aliasPending && sources.every((source) => source.cursor.offset === fs.statSync(source.file).size);
   };
-  return { native: capture.native, flush, close: capture.close };
+  return { native: capture.native, flush, flushAlias: capture.flushAlias, close: capture.close };
 }
 
 function liveLogCapture(receipts: DispatchReceipts, id: string, bounds: ReadBounds) {
@@ -797,12 +797,24 @@ function liveLogCapture(receipts: DispatchReceipts, id: string, bounds: ReadBoun
   }, 50);
   return {
     native: capture.native,
-    close: () => {
+    close: async (deadline: number, runtime: ObservationRuntime) => {
       clearInterval(timer);
       try {
-        capture.flush(bounds.workBytes ?? 64 * 1024 * 1024);
-      } catch {
-        /* Source errors do not replace the retained final observation. */
+        try {
+          if (capture.flush(bounds.workBytes ?? 64 * 1024 * 1024)) return true;
+        } catch {
+          /* Original channel files remain available. */
+        }
+        while (runtime.now() < deadline) {
+          await runtime.yield();
+          if (runtime.now() >= deadline) break;
+          try {
+            if (!capture.flushAlias()) return true;
+          } catch {
+            /* A later pass retries unavailable alias delivery. */
+          }
+        }
+        return false;
       } finally {
         capture.close();
       }
@@ -1101,6 +1113,17 @@ export async function superviseStandalone(
     }
   };
   let capture: ReturnType<typeof liveLogCapture> | undefined;
+  const finishObservation = async () => {
+    const current = capture;
+    capture = undefined;
+    if (current && !(await current.close(observationDeadline, runtime))) {
+      observation.monitor = 'timed-out';
+      observation.reason = 'Observation timed out before all worker output was read.';
+    }
+    await publishObservation();
+    if (publicationError) throw publicationError;
+    return receipts.status(id);
+  };
   try {
     if (recovery && !retained) return receipts.status(id);
     if (
@@ -1238,6 +1261,7 @@ export async function superviseStandalone(
         !sourceFailed &&
         !incomplete &&
         (last || recovered.evidence || recovered.text) &&
+        (!last || last.outcome === 'unknown' || recovered.outcome !== 'unknown') &&
         (last?.outcome !== recovered.outcome ||
           last?.availability !== recovered.availability ||
           !isDeepStrictEqual(last?.nativeEnding, recovered.evidence) ||
@@ -1263,15 +1287,14 @@ export async function superviseStandalone(
         : observation.exitCode === null && observation.signal === null
           ? 'Original worker exit remains unknown. No worker was restarted.'
           : undefined;
-      receipts.observation(id, observation);
-      return receipts.status(id);
+      return await finishObservation();
     }
     let final: FinalObservation;
     if (recovery) {
       if (!receipts.background(id))
         throw new Error('The background session identity is unavailable. No worker was restarted.');
       startBackgroundOutput(receipts, id, outputEntry);
-      if (receipts.latest(id)?.availability === 'available') return receipts.status(id);
+      if (receipts.latest(id)?.availability === 'available') return await finishObservation();
       observation.monitor = 'observing';
       final = await observeBackground(receipts, id, observation, options, prompt, publishObservation, capture);
     } else {
@@ -1465,12 +1488,10 @@ export async function superviseStandalone(
         { outcome: final.outcome, availability: final.availability, nativeEnding: final.evidence, askId: null },
         final.text,
       );
-    await publishObservation();
-    if (publicationError) throw publicationError;
-    return receipts.status(id);
+    return await finishObservation();
   } finally {
     try {
-      capture?.close();
+      await capture?.close(observationDeadline, runtime);
     } finally {
       lease.release();
     }

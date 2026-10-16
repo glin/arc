@@ -1389,6 +1389,142 @@ function outputFrames() {
       .join('\n') + '\n'
   );
 }
+test.each(['complete', 'deadline'] as const)(
+  'resumed observation drains a stopped producer alias backlog through %s',
+  async (ending) => {
+    const { receipts, launch } = workerFixture('', 10, false, true);
+    const id = launch.launchId;
+    const stdout = Buffer.from(
+      (JSON.stringify({ type: 'progress', text: 'x'.repeat(80) }) + '\n').repeat(2048) + outputFrames(),
+    );
+    const stderr = Buffer.alloc(4096, 255);
+    fs.writeFileSync(receipts.artifact(id, 'stdout.log'), stdout);
+    fs.writeFileSync(receipts.artifact(id, 'stderr.log'), stderr);
+    fs.writeFileSync(receipts.artifact(id, 'native.md'), 'Report');
+    receipts.observation(id, {
+      supervisor: { pid: process.pid, token: id },
+      worker: null,
+      sessionId: null,
+      exitCode: 0,
+      signal: null,
+      monitor: 'timed-out',
+    });
+    const owner = {
+      pid: 2147483647,
+      producerPid: 2147483646,
+      state: 'unavailable',
+      reason: 'The requested log is incomplete. Private output remains available.',
+    };
+    fs.writeFileSync(receipts.artifact(id, 'output-owner.json'), JSON.stringify(owner));
+    const alias = launch.standalone!.logAlias!;
+    const open = fs.openSync;
+    let blocked = true;
+    const failure = vi.spyOn(fs, 'openSync').mockImplementation((file, ...args) => {
+      if (String(file) === alias && blocked) throw Object.assign(new Error('Alias unavailable'), { code: 'EPERM' });
+      return Reflect.apply(open, fs, [file, ...args]);
+    });
+    const bounds = { frameBytes: 1024, readBytes: 64 * 1024, workBytes: 1024 * 1024 };
+    let now = 0;
+    try {
+      await superviseStandalone(receipts, id, true, bounds, {
+        now: () => now,
+        identity: async () => null,
+        yield: async () => {
+          if (receipts.scan(id)) now += launch.standalone!.deadlineMs;
+        },
+      });
+      assert.equal((receipts.scan(id) as any).offset, stdout.length);
+      const position = JSON.parse(fs.readFileSync(receipts.artifact(id, 'capture.json'), 'utf8'));
+      assert.equal(position.sources['stdout.log'].offset, stdout.length);
+      assert.equal(position.sources['stderr.log'].offset, stderr.length);
+      assert.equal(fs.statSync(alias).size, 0);
+      const captured = fs.readFileSync(receipts.artifact(id, 'worker.log'));
+      assert.ok(captured.length > 2 * bounds.readBytes);
+      assert.equal(captured.length, stdout.length + stderr.length);
+      const event = receipts.latest(id)!;
+      blocked = false;
+      now = 0;
+      let yields = 0;
+      const runtime = {
+        now: () => now,
+        identity: async () => null,
+        yield: async () => {
+          yields++;
+          now += ending === 'deadline' ? launch.standalone!.deadlineMs : 1;
+        },
+      };
+      const status = (await superviseStandalone(receipts, id, true, bounds, runtime)) as any;
+      if (ending === 'deadline') {
+        assert.equal(status.observation.monitor, 'timed-out');
+        assert.equal(status.observation.reason, 'Observation timed out before all worker output was read.');
+        assert.ok(fs.statSync(alias).size < captured.length);
+        assert.ok(now <= launch.standalone!.deadlineMs);
+        now = 0;
+        await superviseStandalone(receipts, id, true, bounds, {
+          ...runtime,
+          yield: async () => {
+            now++;
+          },
+        });
+      } else assert.equal(status.observation.monitor, 'finished');
+      assert.equal(fs.statSync(alias).size, captured.length);
+      assert.ok(yields > 0);
+      assert.deepEqual(fs.readFileSync(alias), captured);
+      assert.deepEqual(Buffer.from([...captured].filter((byte) => byte !== 255)), stdout);
+      assert.equal([...captured].filter((byte) => byte === 255).length, stderr.length);
+      assert.deepEqual(fs.readFileSync(receipts.artifact(id, 'worker.log')), captured);
+      assert.equal(receipts.latest(id)?.eventId, event.eventId);
+      assert.equal((receipts.result(id, event.eventId) as any).text, 'Report');
+      assert.equal(receipts.observation(id)?.monitor, 'finished');
+      assert.equal(receipts.observation(id)?.worker, null);
+      assert.deepEqual(JSON.parse(fs.readFileSync(receipts.artifact(id, 'output-owner.json'), 'utf8')), owner);
+      assert.equal(vi.mocked(childProcess.spawn).mock.calls.length, 0);
+    } finally {
+      failure.mockRestore();
+    }
+  },
+);
+test.each([
+  ['turn.failed', 1, null, 'failed'],
+  ['turn.completed', null, 'SIGTERM', 'interrupted'],
+] as const)(
+  'native report denial preserves the established %s %s %s outcome %s',
+  async (type, exitCode, signal, outcome) => {
+    const { receipts, launch } = recoveryFixture();
+    const id = launch.launchId;
+    fs.writeFileSync(receipts.artifact(id, 'stdout.log'), outputFrames().replace('turn.completed', type));
+    const report = receipts.artifact(id, 'native.md');
+    fs.writeFileSync(report, 'Report');
+    receipts.observation(id, { ...receipts.observation(id)!, exitCode, signal });
+    const runtime = { now: () => 0, identity: async () => null, yield: () => Promise.resolve() };
+    await superviseStandalone(receipts, id, true, undefined, runtime);
+    const event = receipts.latest(id)!;
+    assert.equal(event.outcome, outcome);
+    assert.equal(event.availability, 'available');
+    const frozen = receipts.result(id, event.eventId);
+    const open = fs.openSync;
+    let denied = false;
+    const failure = vi.spyOn(fs, 'openSync').mockImplementation((file, ...args) => {
+      if (String(file) === report) {
+        denied = true;
+        throw Object.assign(new Error('Report unavailable'), { code: 'EACCES' });
+      }
+      return Reflect.apply(open, fs, [file, ...args]);
+    });
+    try {
+      await superviseStandalone(receipts, id, true, undefined, runtime);
+      assert.equal(denied, true);
+      assert.deepEqual(receipts.latest(id), event);
+      assert.deepEqual(receipts.result(id, event.eventId), frozen);
+    } finally {
+      failure.mockRestore();
+    }
+    await superviseStandalone(receipts, id, true, undefined, runtime);
+    assert.equal(receipts.latest(id)?.eventId, event.eventId);
+    assert.equal(receipts.status(id).events.length, 1);
+    assert.equal(vi.mocked(childProcess.spawn).mock.calls.length, 0);
+  },
+);
 test.each([
   ['turn.failed', 1, null, 'failed'],
   ['turn.completed', 0, null, 'succeeded'],
