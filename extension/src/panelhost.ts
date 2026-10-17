@@ -13919,6 +13919,7 @@ export function registerPanel(
   storeRootDir: string,
   workspaceCache: WorkspaceCachePartition,
   activationAt = performance.now(),
+  observeDiagnostics?: (diagnostics: DiagnosticsLog) => void,
 ): PanelProvider {
   const output = vscode.window.createOutputChannel('Arc');
   output.appendLine(
@@ -13934,6 +13935,7 @@ export function registerPanel(
     startedAt: Math.round(performance.timeOrigin),
     measurementRun: process.env[MEASUREMENT_ENVIRONMENT.run],
   });
+  observeDiagnostics?.(diagnostics);
   let provider: PanelProvider | undefined;
   const health = new HostHealth({
     directory: path.join(arcHome(), DIAGNOSTICS_LOG_DIRECTORY),

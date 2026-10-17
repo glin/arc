@@ -13,9 +13,19 @@ import * as fs from 'node:fs';
 import filesystem from 'node:fs';
 import * as net from 'node:net';
 import * as crypto from 'node:crypto';
-import { spawn, spawnSync } from 'node:child_process';
-import type { Duplex } from 'node:stream';
-import { WindowsPipeServer } from './windowpipe.ts';
+import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { Duplex, PassThrough } from 'node:stream';
+import { EventEmitter } from 'node:events';
+import {
+  WindowsPipeServer,
+  PipeBridge,
+  compileWindowsPipe,
+  reportWindowTransport,
+  windowTransportErrorCode,
+  type WindowTransportRecord,
+  type WindowTransportSink,
+} from './windowpipe.ts';
+import { createDiagnosticsLog } from './diagnosticslog';
 import { WINDOW_PIPE_SOURCE } from './windowpipe-source.ts';
 import network from 'node:net';
 import { syncBuiltinESMExports } from 'node:module';
@@ -2072,6 +2082,310 @@ test.skipIf(process.platform !== 'win32')('eight simultaneous clients reach one 
   }
 });
 
+function bridgeFixture(sink?: WindowTransportSink) {
+  const child = Object.assign(new EventEmitter(), {
+    pid: 12345,
+    stdin: new PassThrough(),
+    stdout: new PassThrough(),
+    stderr: new PassThrough(),
+    kill: vi.fn<() => boolean>(() => true),
+  });
+  const records: WindowTransportRecord[] = [];
+  const owner = new PipeBridge(
+    child as unknown as ChildProcessWithoutNullStreams,
+    sink ?? ((_event, record) => records.push(record)),
+  );
+  return { child, owner, records };
+}
+
+test('bridge failures retain one bounded reason before empty-owner teardown without stream or error contents', () => {
+  const secret = 'secret-token-registration-path-prompt';
+  const cases: [WindowTransportRecord['reason'], (fixture: ReturnType<typeof bridgeFixture>) => void][] = [
+    ['stderr', ({ child }) => child.stderr.emit('data', Buffer.from(secret))],
+    ['stdoutOverflow', ({ child }) => child.stdout.emit('data', secret.repeat(4000))],
+    [
+      'stdinDestroyed',
+      ({ child, owner }) => {
+        child.stdin.destroy();
+        owner.send(secret);
+      },
+    ],
+    [
+      'stdinBacklog',
+      ({ child, owner }) => {
+        Object.defineProperty(child.stdin, 'writableLength', { value: 2 * 1024 * 1024 });
+        owner.send(secret);
+      },
+    ],
+    [
+      'stdinError',
+      ({ child }) => child.stdin.emit('error', Object.assign(new Error(secret), { code: 'EPIPE', stack: secret })),
+    ],
+    [
+      'childError',
+      ({ child }) => child.emit('error', Object.assign(new Error(secret), { code: secret, stack: secret })),
+    ],
+    ['childClose', ({ child }) => child.emit('close', 17, 'SIGTERM')],
+    ['listenerError', ({ child }) => child.stdout.emit('data', 'error:12\n')],
+  ];
+  for (const [reason, trigger] of cases) {
+    const fixture = bridgeFixture();
+    trigger(fixture);
+    trigger(fixture);
+    assert.equal(fixture.records.length, 1, reason);
+    const record = fixture.records[0];
+    assert.equal(record.reason, reason);
+    assert.deepEqual(
+      [record.childPid, record.servers, record.sockets, record.released, record.stdinEnded],
+      [12345, 0, 0, false, false],
+    );
+    if (reason === 'stderr') assert.equal(record.stderrBytes, Buffer.byteLength(secret));
+    if (reason === 'stdinError') assert.equal(record.errorCode, 'EPIPE');
+    if (reason === 'childError') assert.equal(record.errorCode, 'unknown');
+    if (reason === 'childClose') assert.deepEqual([record.exitCode, record.signal], [17, 'SIGTERM']);
+    if (reason === 'listenerError') assert.equal(record.serverId, 12);
+    if (['stderr', 'stdoutOverflow', 'stdinDestroyed', 'stdinBacklog'].includes(reason))
+      assert.equal(fixture.child.kill.mock.calls.length, 2);
+    const serialized = JSON.stringify(record);
+    assert.ok(Buffer.byteLength(serialized) <= 1024);
+    assert.equal(serialized.includes(secret), false);
+    assert.equal(/message|stack|token|payload|address|registrationFile/.test(serialized), false);
+  }
+});
+
+test('bridge release records ownership transitions and child close retains stdin-end state when logging fails', () => {
+  const { owner, child, records } = bridgeFixture();
+  owner.servers.set(7, new WindowsPipeServer());
+  owner.release();
+  assert.equal(records.length, 0);
+  assert.equal(child.stdin.writableEnded, false);
+  owner.servers.delete(7);
+  owner.release();
+  owner.release();
+  child.emit('close', null, 'SIGKILL');
+  assert.deepEqual(
+    records.map((record) => record.reason),
+    ['release', 'childClose'],
+  );
+  assert.deepEqual([records[0].released, records[0].stdinEnded, records[1].stdinEnded], [true, false, true]);
+  assert.deepEqual([records[1].exitCode, records[1].signal], [null, 'SIGKILL']);
+  const throwing = bridgeFixture(() => {
+    throw new Error('diagnostic failure');
+  });
+  assert.doesNotThrow(() => throwing.child.stderr.emit('data', Buffer.from('secret')));
+  assert.equal(throwing.child.kill.mock.calls.length, 1);
+  assert.doesNotThrow(() => throwing.owner.release());
+  assert.equal(throwing.child.stdin.writableEnded, true);
+  assert.equal(windowTransportErrorCode({ code: 'EACCES', message: 'secret' }), 'EACCES');
+  assert.equal(
+    windowTransportErrorCode({
+      get code() {
+        throw new Error('secret');
+      },
+    }),
+    'unknown',
+  );
+});
+
+test('window transport warnings persist with detailed diagnostics disabled and omit unsafe fields', () => {
+  const log = createDiagnosticsLog({
+    enabled: false,
+    directory: tempDir('window-diagnostics-'),
+    workspace: 'fixture',
+    pid: 54321,
+    startedAt: 1,
+  });
+  reportWindowTransport((event, record) => log.warn(event, record), 'childError', {
+    errorCode: 'private-path-secret',
+    signal: 'private-path-secret' as NodeJS.Signals,
+    ...({ payload: 'private-path-secret', message: 'private-path-secret', stack: 'private-path-secret' } as object),
+  });
+  assert.equal(log.enabled(), false);
+  const line = fs.readFileSync(log.file()!, 'utf8');
+  const record = JSON.parse(line);
+  assert.deepEqual([record.event, record.reason, record.errorCode], ['windowTransport', 'childError', 'unknown']);
+  assert.equal(line.includes('private-path-secret'), false);
+  assert.equal(record.signal, undefined);
+  assert.ok(Buffer.byteLength(line) <= 1024);
+  const { child } = bridgeFixture((event, fields) => log.warn(event, fields));
+  child.emit('close', 23, null);
+  const close = JSON.parse(fs.readFileSync(log.file()!, 'utf8').trim().split('\n').at(-1)!);
+  assert.deepEqual(
+    [close.event, close.reason, close.pid, close.childPid, close.instance, close.exitCode],
+    ['windowTransport', 'childClose', 54321, 12345, '54321-1', 23],
+  );
+});
+
+test('compiler termination and setup rejection retain reason, operation and exit evidence without compiler text', async () => {
+  vi.useFakeTimers();
+  for (const reason of ['compilerTimeout', 'compilerOutputOverflow', 'compilerError', 'compilerClose'] as const) {
+    const { child } = bridgeFixture();
+    const records: WindowTransportRecord[] = [];
+    const launch = vi.fn<() => ChildProcessWithoutNullStreams>(
+      () => child as unknown as ChildProcessWithoutNullStreams,
+    );
+    const run = vi.fn<() => Promise<{ stdout: string; stderr: string }>>(async () => ({
+      stdout: 'S-1-5-21-123',
+      stderr: '',
+    }));
+    const pending = compileWindowsPipe((_event, record) => records.push(record), run as never, launch as never);
+    const rejected = assert.rejects(pending);
+    await vi.waitFor(() => assert.equal(launch.mock.calls.length, 1));
+    if (reason === 'compilerTimeout') vi.advanceTimersByTime(10_000);
+    if (reason === 'compilerOutputOverflow') {
+      child.stderr.emit('data', Buffer.alloc(65537, 's'));
+      child.stderr.emit('data', Buffer.alloc(1, 's'));
+    }
+    if (reason === 'compilerError') child.emit('error', Object.assign(new Error('secret'), { code: 'ENOENT' }));
+    child.emit('close', 23, null);
+    await rejected;
+    assert.equal(records.filter((record) => record.reason === reason).length, 1, reason);
+    assert.deepEqual(
+      records.find((record) => record.reason === 'compilerClose'),
+      {
+        reason: 'compilerClose',
+        childPid: 12345,
+        outputBytes: reason === 'compilerOutputOverflow' ? 65538 : 0,
+        stage: 'compiler',
+        exitCode: 23,
+        signal: null,
+      },
+    );
+    assert.equal(records.at(-1)!.reason, 'setupRejected');
+    assert.equal(records.at(-1)!.stage, 'compiler');
+    assert.equal(JSON.stringify(records).includes('secret'), false);
+  }
+  const records: WindowTransportRecord[] = [];
+  await assert.rejects(
+    compileWindowsPipe((_event, record) => records.push(record), (async () => {
+      throw Object.assign(new Error('secret'), { code: 'EACCES' });
+    }) as never),
+  );
+  assert.deepEqual(records, [{ reason: 'setupRejected', stage: 'identity', errorCode: 'EACCES' }]);
+});
+
+test('channel disposal reports exact registration ownership outcomes and classified removal failure', async () => {
+  for (const outcome of ['noExpectedBytes', 'ownershipMismatch', 'removed', 'failed'] as const) {
+    const records: WindowTransportRecord[] = [];
+    const home = tempDir('window-removal-evidence-');
+    const channel = new WindowChannel(home);
+    channels.push(channel);
+    channel.setDiagnostics((_event, record) => records.push(record));
+    const file = path.join(home, 'hosts', `${channel.hostId}.json`);
+    if (outcome !== 'noExpectedBytes') await channel.update(state);
+    if (outcome === 'ownershipMismatch') fs.writeFileSync(file, 'private-registration');
+    const unlink = filesystem.unlinkSync;
+    const mocked = vi.spyOn(filesystem, 'unlinkSync').mockImplementation((target) => {
+      if (outcome === 'failed' && target === file)
+        throw Object.assign(new Error('private-registration'), { code: 'EBUSY' });
+      return unlink(target);
+    });
+    syncBuiltinESMExports();
+    try {
+      await channel.dispose();
+      await channel.dispose();
+    } finally {
+      mocked.mockRestore();
+      syncBuiltinESMExports();
+    }
+    assert.deepEqual(
+      records
+        .filter((record) => ['channelDispose', 'registrationRemoval'].includes(record.reason))
+        .map((record) => record.reason),
+      ['channelDispose', 'registrationRemoval'],
+    );
+    const removal = records.find((record) => record.reason === 'registrationRemoval')!;
+    assert.equal(removal.outcome, outcome);
+    assert.equal(removal.registrationRemoved, outcome === 'removed');
+    if (outcome === 'failed') assert.deepEqual([removal.stage, removal.errorCode], ['unlink', 'EBUSY']);
+    if (outcome === 'ownershipMismatch') assert.equal(fs.readFileSync(file, 'utf8'), 'private-registration');
+    assert.equal(JSON.stringify(records).includes('private-registration'), false);
+    assert.equal(JSON.stringify(records).includes(home), false);
+  }
+});
+
+test.each(['linux', 'darwin'] as const)(
+  '%s disposal reports completed cleanup when the closed listener socket is absent',
+  async (platform) => {
+    for (const fallback of [false, true]) {
+      for (const errorCode of ['ENOENT', 'EACCES', 'EIO']) {
+        const home = tempDir('window-closed-socket-');
+        const channel = new WindowChannel(home);
+        channels.push(channel);
+        const directory = path.join(home, fallback ? 'socket' : 'hosts');
+        fs.mkdirSync(path.join(home, 'hosts'));
+        if (fallback) fs.mkdirSync(directory);
+        const address = path.join(directory, 'closed.sock');
+        const file = path.join(home, 'hosts', `${channel.hostId}.json`);
+        fs.writeFileSync(file, 'owned-registration');
+        Object.assign(channel, { address, registeredBytes: 'owned-registration' });
+        assert.equal(fs.existsSync(address), false);
+        const records: WindowTransportRecord[] = [];
+        channel.setDiagnostics((_event, record) => records.push(record));
+        const descriptor = Object.getOwnPropertyDescriptor(process, 'platform')!;
+        const original = filesystem.lstatSync;
+        const stat = vi.spyOn(filesystem, 'lstatSync').mockImplementation((...args) => {
+          if (args[0] === address && errorCode !== 'ENOENT')
+            throw Object.assign(new Error('private-socket'), { code: errorCode });
+          return original(...args);
+        });
+        syncBuiltinESMExports();
+        Object.defineProperty(process, 'platform', { ...descriptor, value: platform });
+        try {
+          await channel.dispose();
+        } finally {
+          Object.defineProperty(process, 'platform', descriptor);
+          stat.mockRestore();
+          syncBuiltinESMExports();
+        }
+        assert.equal(fs.existsSync(file), false);
+        assert.equal(fs.existsSync(directory), !fallback);
+        const removal = records.find((record) => record.reason === 'registrationRemoval')!;
+        assert.equal(removal.registrationRemoved, true);
+        assert.equal(removal.outcome, errorCode === 'ENOENT' ? 'removed' : 'failed');
+        if (errorCode === 'ENOENT') assert.equal(removal.errorCode, undefined);
+        else assert.deepEqual([removal.stage, removal.errorCode], ['socketStat', errorCode]);
+        assert.equal(JSON.stringify(records).includes('private-socket'), false);
+      }
+    }
+  },
+);
+
+test('channel setup rejection retains error and disposal evidence before registration exists', async () => {
+  const home = tempDir('window-setup-evidence-');
+  fs.writeFileSync(path.join(home, 'hosts'), 'private-registration');
+  const records: WindowTransportRecord[] = [];
+  const channel = new WindowChannel(home);
+  channels.push(channel);
+  channel.setDiagnostics((_event, record) => records.push(record));
+  await assert.rejects(channel.update(state));
+  await channel.dispose();
+  assert.deepEqual(
+    records.map((record) => record.reason),
+    ['channelSetupRejected', 'channelDispose', 'registrationRemoval'],
+  );
+  assert.equal(JSON.stringify(records).includes('private-registration'), false);
+});
+
+test('channel listener failure records its classified error before disposal and leaves diagnostics failure harmless', async () => {
+  const { channel, file } = await fixture();
+  const records: WindowTransportRecord[] = [];
+  channel.setDiagnostics((_event, record) => {
+    records.push(record);
+    throw new Error('secret');
+  });
+  const server = (channel as unknown as { server: net.Server }).server;
+  assert.doesNotThrow(() => server.emit('error', Object.assign(new Error('secret'), { code: 'EIO' })));
+  await channel.dispose();
+  assert.deepEqual(
+    records.slice(0, 2).map((record) => record.reason),
+    ['channelError', 'channelDispose'],
+  );
+  assert.equal(records[0].errorCode, 'EIO');
+  assert.equal(fs.existsSync(file), false);
+  assert.equal(JSON.stringify(records).includes('secret'), false);
+});
+
 function nativeFixture(source: string) {
   const directory = tempDir('window-native-');
   const input = path.join(directory, 'bridge.cs');
@@ -2105,14 +2419,59 @@ function nativeFixture(source: string) {
   };
 }
 
+function replaceNativeLiteral(source: string, before: string, after: string): string {
+  assert.ok(source.includes(before), `Native fixture replacement is absent: ${before}`);
+  return source.replace(before, after);
+}
+
 const gatedNativeSource = () =>
-  WINDOW_PIPE_SOURCE.replace(/\r\n/g, '\n')
-    .replace(
-      'class ArcPipe {',
-      'class ArcPipe { static readonly ManualResetEvent acceptGate = new ManualResetEvent(false);',
-    )
-    .replace('Output("listen:" + id); first = false;', 'Output("listen:" + id); acceptGate.WaitOne(); first = false;')
-    .replace('if(parts[0] == "listen")', 'if(parts[0] == "resume") acceptGate.Set(); else if(parts[0] == "listen")');
+  [
+    ['class ArcPipe {', 'class ArcPipe { static readonly ManualResetEvent acceptGate = new ManualResetEvent(false);'],
+    ['Output("listen:" + id); first = false;', 'Output("listen:" + id); acceptGate.WaitOne(); first = false;'],
+    ['if(parts[0] == "listen")', 'if(parts[0] == "resume") acceptGate.Set(); else if(parts[0] == "listen")'],
+  ].reduce(
+    (source, [before, after]) => replaceNativeLiteral(source, before, after),
+    WINDOW_PIPE_SOURCE.replace(/\r\n/g, '\n'),
+  );
+
+test.skipIf(process.platform !== 'win32')(
+  'Windows listener errors and native child exit reach bounded Node evidence',
+  async () => {
+    const source = replaceNativeLiteral(
+      gatedNativeSource(),
+      'if(parts[0] == "resume")',
+      'if(parts[0] == "fixtureExit") Environment.Exit(23); else if(parts[0] == "resume")',
+    );
+    const native = nativeFixture(source);
+    const records: WindowTransportRecord[] = [];
+    const owner = new PipeBridge(native.child, (_event, record) => records.push(record));
+    const server = new WindowsPipeServer();
+    const errors: Error[] = [];
+    server.on('error', (error) => errors.push(error));
+    owner.servers.set(1, server);
+    const ended = new Promise<void>((resolve) => native.child.once('close', () => resolve()));
+    try {
+      native.send(`listen:1:${Buffer.from('invalid-private-fixture-address').toString('base64')}`);
+      await vi.waitFor(() => assert.equal(errors.length, 1));
+      assert.equal(records[0].reason, 'listenerError');
+      assert.equal(records[0].serverId, 1);
+      assert.equal(records[0].servers, 1);
+      native.send('fixtureExit:0');
+      await ended;
+      assert.deepEqual(
+        records.filter((record) => record.reason === 'childClose').map(({ exitCode, signal }) => [exitCode, signal]),
+        [[23, null]],
+      );
+      assert.equal(errors.length, 2);
+      assert.equal(JSON.stringify(records).includes('private-fixture-address'), false);
+    } finally {
+      if (native.child.exitCode === null && native.child.signalCode === null) {
+        native.child.kill();
+        await ended;
+      }
+    }
+  },
+);
 
 test.skipIf(process.platform !== 'win32')(
   'Windows busy opens honor deadline and cancellation before availability returns',

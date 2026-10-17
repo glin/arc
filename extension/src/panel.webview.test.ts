@@ -2096,6 +2096,7 @@ import {
   type PerformanceEventSink,
 } from './performancediagnostics.ts';
 import { StartupThresholdWatch, createDiagnosticsLog, HostHealth } from './diagnosticslog.ts';
+import { reportWindowTransport, windowTransportErrorCode, type WindowTransportRecord } from './windowpipe.ts';
 import { answerSessionRename, sessionRenameTitle } from './sessionrename.ts';
 import * as renameTranscripts from './transcript.ts';
 import { claudeSkillPath } from './claudeskillpath.ts';
@@ -5681,6 +5682,13 @@ test('channel construction failure leaves panel activation and provider registra
   const providers: string[] = [];
   let panels = 0;
   let publish!: (state: unknown) => void;
+  const diagnostics = createDiagnosticsLog({
+    enabled: false,
+    directory: tempDir('activation-window-diagnostics-'),
+    workspace: 'fixture',
+    pid: 12345,
+    startedAt: 1,
+  });
   const scope = {
     context: { subscriptions: [] as unknown[] },
     performance,
@@ -5690,6 +5698,8 @@ test('channel construction failure leaves panel activation and provider registra
     WindowChannel: function () {
       throw new Error('The Arc window channel path is too long.');
     },
+    reportWindowTransport,
+    windowTransportErrorCode,
     windowChannel: null,
     arcCliSpawner: () => () => {},
     TerminalTools: function () {
@@ -5720,8 +5730,15 @@ test('channel construction failure leaves panel activation and provider registra
       },
       Uri: { file: (file: string) => file },
     },
-    registerPanel: () => {
+    registerPanel: (
+      _context: unknown,
+      _root: unknown,
+      _cache: unknown,
+      _activation: unknown,
+      observeDiagnostics: (log: typeof diagnostics) => void,
+    ) => {
       panels++;
+      observeDiagnostics(diagnostics);
       return {
         setWindowStateHandler: (handler: typeof publish) => {
           publish = handler;
@@ -5733,6 +5750,14 @@ test('channel construction failure leaves panel activation and provider registra
   assert.deepEqual(providers, ['arc-snapshot']);
   assert.equal(panels, 1);
   assert.doesNotThrow(() => publish({ folders: [], scopeReady: true, panelReady: false, panelVisible: false }));
+  const evidence = JSON.parse(fs.readFileSync(diagnostics.file()!, 'utf8')) as WindowTransportRecord & {
+    event: string;
+  };
+  assert.deepEqual(
+    [evidence.event, evidence.reason, evidence.errorCode],
+    ['windowTransport', 'channelConstructionRejected', 'unknown'],
+  );
+  assert.equal(JSON.stringify(evidence).includes('path is too long'), false);
 });
 
 test('folderless ownership survives tab closure, pending checkpoint, reclamation and reopening', async () => {

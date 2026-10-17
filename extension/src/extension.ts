@@ -106,6 +106,7 @@ import { sameSkillList, withDirectorySkills } from './domain/claude-skills';
 import { normalizeWorkspace } from './projectspend';
 import { ConfigWatches } from './configwatch';
 import { WindowChannel } from './sessionrequests';
+import { reportWindowTransport, windowTransportErrorCode, type WindowTransportSink } from './windowpipe';
 import { CompactHost } from './compactrequest';
 import {
   GuardedSends,
@@ -137,9 +138,11 @@ let snapshotSetup: ClaudePluginOffer | undefined;
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   const activationAt = performance.now();
   let channel: WindowChannel | null = null;
+  let channelConstructionError: string | undefined;
   try {
     channel = new WindowChannel();
-  } catch {
+  } catch (error) {
+    channelConstructionError = windowTransportErrorCode(error);
     /* Window discovery failure leaves panel activation available. */
   }
   windowChannel = channel;
@@ -215,7 +218,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // Register the panel that displays recorded turns.
   let snapshotOffer: ClaudePluginOffer | undefined;
   let snapshotPanelOpened = false;
-  const panel = registerPanel(context, root, workspaceCache, activationAt);
+  const panel = registerPanel(context, root, workspaceCache, activationAt, (diagnostics) => {
+    const sink: WindowTransportSink = (event, record) => diagnostics.warn(event, record);
+    channel?.setDiagnostics(sink);
+    if (channelConstructionError)
+      reportWindowTransport(sink, 'channelConstructionRejected', { errorCode: channelConstructionError });
+  });
   const questionEvidence = new QuestionEvidenceReader();
   channel?.setRequestHandler((request) => panel.handleSessionRequest(request));
   panel.setWindowStateHandler((state) => {

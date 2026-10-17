@@ -9,7 +9,12 @@ import type { Duplex } from 'node:stream';
 import { writeFileAtomically } from './atomicfile.ts';
 import { ARC_IDENTITY } from './identity.ts';
 import { arcHome } from './store.ts';
-import { WindowsPipeServer } from './windowpipe.ts';
+import {
+  WindowsPipeServer,
+  reportWindowTransport,
+  windowTransportErrorCode,
+  type WindowTransportSink,
+} from './windowpipe.ts';
 import {
   GUARDED_SEND_REASONS,
   SessionWriteRequests,
@@ -404,6 +409,11 @@ export class WindowChannel {
   private requestHandler: ((request: SessionRequest) => unknown | Promise<unknown>) | null = null;
   private compactHandler: ((request: SessionRequest) => unknown | Promise<unknown>) | null = null;
   private dispatchHandler: ((request: SessionRequest) => unknown | Promise<unknown>) | null = null;
+  private diagnostics?: WindowTransportSink;
+
+  setDiagnostics(diagnostics: WindowTransportSink): void {
+    this.diagnostics = diagnostics;
+  }
 
   setDispatchHandler(handler: (request: SessionRequest) => unknown | Promise<unknown>): void {
     this.dispatchHandler = handler;
@@ -437,10 +447,12 @@ export class WindowChannel {
     this.address = hostAddress(home, this.hostId);
     this.registryFile = path.join(home, 'hosts', `${this.hostId}.json`);
     this.server = net.createServer((socket) => this.accept(socket));
-    this.windowsServer = process.platform === 'win32' ? new WindowsPipeServer() : null;
+    this.windowsServer =
+      process.platform === 'win32' ? new WindowsPipeServer((event, record) => this.diagnostics?.(event, record)) : null;
     this.windowsServer?.on('connection', (socket: Duplex) => this.accept(socket));
     this.windowsServer?.on('error', (error: Error) => this.server.emit('error', error));
-    this.server.on('error', () => {
+    this.server.on('error', (error) => {
+      reportWindowTransport(this.diagnostics, 'channelError', { errorCode: windowTransportErrorCode(error) });
       void this.dispose();
     });
   }
@@ -457,6 +469,7 @@ export class WindowChannel {
       if (!this.starting) this.starting = this.listen();
       await this.starting;
     } catch (error) {
+      reportWindowTransport(this.diagnostics, 'channelSetupRejected', { errorCode: windowTransportErrorCode(error) });
       void this.dispose();
       throw error;
     }
@@ -701,6 +714,7 @@ export class WindowChannel {
 
   dispose(): Promise<void> {
     if (this.disposal) return this.disposal;
+    reportWindowTransport(this.diagnostics, 'channelDispose', { sockets: this.sockets.size });
     this.closed = true;
     for (const socket of this.sockets) socket.destroy();
     this.disposal = this.close();
@@ -712,7 +726,7 @@ export class WindowChannel {
     await this.starting?.catch(() => {});
     if (this.windowsServer) this.windowsServer.close();
     else if (this.listening) await new Promise<void>((resolve) => this.server.close(() => resolve()));
-    removeOwnedRegistration(this.registryFile, this.registeredBytes, this.address, this.home);
+    removeOwnedRegistration(this.registryFile, this.registeredBytes, this.address, this.home, true, this.diagnostics);
     this.server.removeAllListeners();
   }
 }
@@ -723,17 +737,41 @@ function removeOwnedRegistration(
   address: string,
   home: string,
   removeSocket = true,
+  diagnostics?: WindowTransportSink,
 ): boolean {
-  if (expected === null) return false;
+  if (expected === null) {
+    reportWindowTransport(diagnostics, 'registrationRemoval', {
+      outcome: 'noExpectedBytes',
+      registrationRemoved: false,
+    });
+    return false;
+  }
   let removed = false;
+  type RemovalStage = 'read' | 'unlink' | 'socketStat' | 'socketUnlink' | 'directoryRemove';
+  let stage: RemovalStage = 'read';
+  let failure: { stage: RemovalStage; errorCode: string } | undefined;
   try {
-    if (readRegistration(file) !== expected) return false;
+    if (readRegistration(file) !== expected) {
+      reportWindowTransport(diagnostics, 'registrationRemoval', {
+        outcome: 'ownershipMismatch',
+        stage,
+        registrationRemoved: false,
+      });
+      return false;
+    }
+    stage = 'unlink';
     fs.unlinkSync(file);
     removed = true;
     if (removeSocket && process.platform !== 'win32') {
-      if (fs.lstatSync(address).isSocket()) fs.unlinkSync(address);
+      stage = 'socketStat';
+      if (fs.lstatSync(address).isSocket()) {
+        stage = 'socketUnlink';
+        fs.unlinkSync(address);
+      }
     }
-  } catch {
+  } catch (error) {
+    const errorCode = windowTransportErrorCode(error);
+    if (stage !== 'socketStat' || errorCode !== 'ENOENT') failure = { stage, errorCode };
     /* Preserve paths whose ownership cannot be established. */
   }
   if (
@@ -742,11 +780,18 @@ function removeOwnedRegistration(
     path.dirname(address) !== path.join(path.resolve(home), 'hosts')
   ) {
     try {
+      stage = 'directoryRemove';
       fs.rmdirSync(path.dirname(address));
-    } catch {
+    } catch (error) {
+      failure ??= { stage, errorCode: windowTransportErrorCode(error) };
       /* Another host retains the shared directory. */
     }
   }
+  reportWindowTransport(diagnostics, 'registrationRemoval', {
+    outcome: failure ? 'failed' : 'removed',
+    registrationRemoved: removed,
+    ...(failure ?? { stage }),
+  });
   return removed;
 }
 

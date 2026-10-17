@@ -11,54 +11,193 @@ let bridge: Promise<PipeBridge> | null = null;
 let executable: Promise<string> | null = null;
 let nextId = 0;
 
-async function compile(): Promise<string> {
-  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'arc-window-pipe-'));
-  const source = path.join(directory, 'bridge.cs');
-  const output = path.join(directory, 'bridge.exe');
-  const system = process.env.SystemRoot ?? 'C:/Windows';
-  const compiler = path.join(system, 'Microsoft.NET', 'Framework64', 'v4.0.30319', 'csc.exe');
+export type WindowTransportReason =
+  | 'compilerTimeout'
+  | 'compilerOutputOverflow'
+  | 'compilerError'
+  | 'compilerClose'
+  | 'setupRejected'
+  | 'stderr'
+  | 'stdoutOverflow'
+  | 'stdinDestroyed'
+  | 'stdinBacklog'
+  | 'stdinError'
+  | 'childError'
+  | 'childClose'
+  | 'listenerError'
+  | 'release'
+  | 'channelError'
+  | 'channelSetupRejected'
+  | 'channelDispose'
+  | 'registrationRemoval'
+  | 'channelConstructionRejected';
+type TransportFields = {
+  stage?:
+    | 'directory'
+    | 'identity'
+    | 'permissions'
+    | 'source'
+    | 'compiler'
+    | 'spawn'
+    | 'read'
+    | 'unlink'
+    | 'socketStat'
+    | 'socketUnlink'
+    | 'directoryRemove';
+  outcome?: 'noExpectedBytes' | 'ownershipMismatch' | 'removed' | 'failed';
+  errorCode?: string;
+  childPid?: number;
+  serverId?: number;
+  servers?: number;
+  sockets?: number;
+  stdoutCharacters?: number;
+  stderrBytes?: number;
+  outputBytes?: number;
+  stdinBytes?: number;
+  released?: boolean;
+  stdinEnded?: boolean;
+  stdinDestroyed?: boolean;
+  registrationRemoved?: boolean;
+  exitCode?: number | null;
+  signal?: NodeJS.Signals | null;
+};
+export type WindowTransportRecord = { reason: WindowTransportReason } & TransportFields;
+export type WindowTransportSink = (event: 'windowTransport', record: WindowTransportRecord) => void;
+const ERROR_CODES = new Set([
+  'ENOENT',
+  'EACCES',
+  'EPERM',
+  'EBUSY',
+  'EPIPE',
+  'ECONNRESET',
+  'ENOBUFS',
+  'EIO',
+  'ETIMEDOUT',
+]);
+
+export function windowTransportErrorCode(error: unknown): string {
   try {
-    const run = promisify(execFile);
+    const code = (error as NodeJS.ErrnoException | null)?.code;
+    return typeof code === 'string' && ERROR_CODES.has(code) ? code : 'unknown';
+  } catch {
+    return 'unknown';
+  }
+}
+
+export function reportWindowTransport(
+  sink: WindowTransportSink | undefined,
+  reason: WindowTransportReason,
+  fields: TransportFields = {},
+): void {
+  if (!sink) return;
+  try {
+    // Copy only the fixed transport fields. No stream or error object reaches the sink.
+    const record: WindowTransportRecord = { reason };
+    for (const key of [
+      'childPid',
+      'serverId',
+      'servers',
+      'sockets',
+      'stdoutCharacters',
+      'stderrBytes',
+      'outputBytes',
+      'stdinBytes',
+      'exitCode',
+    ] as const) {
+      const value = fields[key];
+      if (typeof value === 'number' && Number.isSafeInteger(value)) record[key] = value;
+    }
+    if (fields.exitCode === null) record.exitCode = null;
+    for (const key of ['released', 'stdinEnded', 'stdinDestroyed', 'registrationRemoved'] as const)
+      if (typeof fields[key] === 'boolean') record[key] = fields[key];
+    if (fields.stage) record.stage = fields.stage;
+    if (fields.outcome) record.outcome = fields.outcome;
+    if (fields.errorCode) record.errorCode = ERROR_CODES.has(fields.errorCode) ? fields.errorCode : 'unknown';
+    if (fields.signal === null) record.signal = null;
+    else if (fields.signal && Object.hasOwn(os.constants.signals, fields.signal)) record.signal = fields.signal;
+    if (Buffer.byteLength(JSON.stringify({ event: 'windowTransport', ...record })) <= 1024)
+      sink('windowTransport', record);
+  } catch {
+    /* Diagnostic failure leaves transport behavior unchanged. */
+  }
+}
+
+export async function compileWindowsPipe(
+  diagnostics?: WindowTransportSink,
+  run = promisify(execFile),
+  launch = spawn,
+): Promise<string> {
+  let stage: TransportFields['stage'] = 'directory';
+  const reasons = new Set<WindowTransportReason>();
+  const report = (reason: WindowTransportReason, fields: TransportFields = {}) => {
+    if (reasons.has(reason)) return;
+    reasons.add(reason);
+    reportWindowTransport(diagnostics, reason, { stage, ...fields });
+  };
+  let directory: string | undefined;
+  try {
+    directory = fs.mkdtempSync(path.join(os.tmpdir(), 'arc-window-pipe-'));
+    const source = path.join(directory, 'bridge.cs');
+    const output = path.join(directory, 'bridge.exe');
+    const system = process.env.SystemRoot ?? 'C:/Windows';
+    const compiler = path.join(system, 'Microsoft.NET', 'Framework64', 'v4.0.30319', 'csc.exe');
     const options = { windowsHide: true, timeout: 10_000, maxBuffer: 64 * 1024 };
+    stage = 'identity';
     const identity = await run(path.join(system, 'System32', 'whoami.exe'), ['/user', '/fo', 'csv', '/nh'], options);
     const sid = identity.stdout.match(/S-1-\d+(?:-\d+)+/)?.[0];
     if (!sid) throw new Error('The Arc window channel is unavailable.');
+    stage = 'permissions';
     await run(
       path.join(system, 'System32', 'icacls.exe'),
       [directory, '/inheritance:r', '/grant:r', `*${sid}:(OI)(CI)F`, '*S-1-5-18:(OI)(CI)F'],
       options,
     );
+    stage = 'source';
     fs.writeFileSync(source, WINDOW_PIPE_SOURCE);
+    stage = 'compiler';
     await new Promise<void>((resolve, reject) => {
-      const child = spawn(compiler, ['/nologo', '/optimize+', '/target:exe', `/out:${output}`, source], {
+      const child = launch(compiler, ['/nologo', '/optimize+', '/target:exe', `/out:${output}`, source], {
         windowsHide: true,
         stdio: ['ignore', 'pipe', 'pipe'],
       });
       let bytes = 0;
-      const deadline = setTimeout(() => child.kill(), 10_000);
+      const deadline = setTimeout(() => {
+        report('compilerTimeout', { childPid: child.pid, outputBytes: bytes });
+        child.kill();
+      }, 10_000);
       const count = (chunk: Buffer) => {
         bytes += chunk.length;
-        if (bytes > 64 * 1024) child.kill();
+        if (bytes > 64 * 1024) {
+          report('compilerOutputOverflow', { childPid: child.pid, outputBytes: bytes });
+          child.kill();
+        }
       };
       child.stdout.on('data', count);
       child.stderr.on('data', count);
-      child.once('error', reject);
-      child.once('close', (code) => {
+      child.once('error', (error) => {
+        report('compilerError', { childPid: child.pid, errorCode: windowTransportErrorCode(error) });
+        reject(error);
+      });
+      child.once('close', (code, signal) => {
         clearTimeout(deadline);
+        if (code !== 0) report('compilerClose', { childPid: child.pid, exitCode: code, signal, outputBytes: bytes });
         if (code === 0) resolve();
         else reject(new Error('The Arc window channel is unavailable.'));
       });
     });
     process.once('exit', () => {
       try {
-        fs.rmSync(directory, { recursive: true, force: true });
+        fs.rmSync(directory!, { recursive: true, force: true });
       } catch {
         /* A terminated bridge retains its private build directory. */
       }
     });
     return output;
   } catch (error) {
-    fs.rmSync(directory, { recursive: true, force: true });
+    if (stage === 'compiler' && reasons.size === 0)
+      report('compilerError', { errorCode: windowTransportErrorCode(error) });
+    report('setupRejected', { errorCode: windowTransportErrorCode(error) });
+    if (directory) fs.rmSync(directory, { recursive: true, force: true });
     throw error;
   }
 }
@@ -87,12 +226,16 @@ export class WindowsPipeServer extends EventEmitter {
   pid = 0;
   private owner: PipeBridge | null = null;
   private ended = false;
+  constructor(private readonly diagnostics?: WindowTransportSink) {
+    super();
+  }
   async listen(address: string): Promise<void> {
-    const owner = await getBridge();
+    const owner = await getBridge(this.diagnostics);
     if (this.ended) return;
     this.owner = owner;
     this.pid = owner.child.pid!;
     owner.servers.set(this.id, this);
+    owner.retain();
     await new Promise<void>((resolve, reject) => {
       this.once('listening', resolve);
       this.once('error', reject);
@@ -107,11 +250,16 @@ export class WindowsPipeServer extends EventEmitter {
   }
 }
 
-class PipeBridge {
+export class PipeBridge {
   readonly sockets = new Map<number, PipeSocket>();
   readonly servers = new Map<number, WindowsPipeServer>();
   private pending = '';
-  constructor(readonly child: ChildProcessWithoutNullStreams) {
+  private released = false;
+  private readonly reasons = new Set<WindowTransportReason>();
+  constructor(
+    readonly child: ChildProcessWithoutNullStreams,
+    private diagnostics?: WindowTransportSink,
+  ) {
     child.stdout.setEncoding('utf8');
     child.stdout.on('data', (chunk: string) => {
       this.pending += chunk;
@@ -123,8 +271,10 @@ class PipeBridge {
         const socket = this.sockets.get(id);
         const server = this.servers.get(id);
         if (parts[0] === 'listen') server?.emit('listening');
-        else if (parts[0] === 'error') server?.emit('error', new Error('The Arc window channel is unavailable.'));
-        else if (parts[0] === 'accept') {
+        else if (parts[0] === 'error') {
+          this.report('listenerError', { serverId: id });
+          server?.emit('error', new Error('The Arc window channel is unavailable.'));
+        } else if (parts[0] === 'accept') {
           const accepted = new PipeSocket(Number(parts[2]), this);
           this.sockets.set(accepted.id, accepted);
           if (server) server.emit('connection', accepted);
@@ -134,15 +284,52 @@ class PipeBridge {
           if (socket && !socket.push(Buffer.from(parts[2], 'base64'))) socket.destroy();
         } else if (parts[0] === 'close') socket?.destroy();
       }
-      if (this.pending.length > 100_000) child.kill();
+      if (this.pending.length > 100_000) {
+        this.report('stdoutOverflow', { stdoutCharacters: this.pending.length });
+        child.kill();
+      }
     });
-    child.stderr.on('data', () => child.kill());
-    child.on('error', () => this.failed());
-    child.on('close', () => this.failed());
-    child.stdin.on('error', () => this.failed());
+    child.stderr.on('data', (chunk: Buffer) => {
+      this.report('stderr', { stderrBytes: chunk.length });
+      child.kill();
+    });
+    child.on('error', (error) => {
+      this.report('childError', { errorCode: windowTransportErrorCode(error) });
+      this.failed();
+    });
+    child.on('close', (exitCode, signal) => {
+      this.report('childClose', { exitCode, signal });
+      this.failed();
+    });
+    child.stdin.on('error', (error) => {
+      this.report('stdinError', { errorCode: windowTransportErrorCode(error) });
+      this.failed();
+    });
+  }
+  observe(diagnostics?: WindowTransportSink): void {
+    this.diagnostics ??= diagnostics;
+  }
+  retain(): void {
+    this.released = false;
+  }
+  private report(reason: WindowTransportReason, fields: TransportFields = {}): void {
+    if (reason !== 'release' && this.reasons.has(reason)) return;
+    this.reasons.add(reason);
+    reportWindowTransport(this.diagnostics, reason, {
+      childPid: this.child.pid,
+      servers: this.servers.size,
+      sockets: this.sockets.size,
+      released: this.released,
+      stdinEnded: this.child.stdin.writableEnded,
+      stdinDestroyed: this.child.stdin.destroyed,
+      ...fields,
+    });
   }
   send(line: string, callback: (error?: Error | null) => void = () => {}): void {
     if (this.child.stdin.destroyed || this.child.stdin.writableLength + line.length > 2 * 1024 * 1024) {
+      this.report(this.child.stdin.destroyed ? 'stdinDestroyed' : 'stdinBacklog', {
+        stdinBytes: this.child.stdin.writableLength + line.length,
+      });
       this.child.kill();
       callback(new Error('The Arc window channel is unavailable.'));
       return;
@@ -151,6 +338,10 @@ class PipeBridge {
   }
   release(): void {
     if (!this.servers.size && !this.sockets.size) {
+      if (!this.released) {
+        this.released = true;
+        this.report('release');
+      }
       bridge = null;
       this.child.stdin.end();
     }
@@ -165,12 +356,24 @@ class PipeBridge {
   }
 }
 
-async function getBridge(): Promise<PipeBridge> {
+async function getBridge(diagnostics?: WindowTransportSink): Promise<PipeBridge> {
   const packaged = path.join(__dirname, 'windowpipe.exe');
-  executable ??= fs.existsSync(packaged) ? Promise.resolve(packaged) : compile();
-  bridge ??= executable.then((file) => new PipeBridge(spawn(file, [], { windowsHide: true, stdio: 'pipe' })));
+  executable ??= fs.existsSync(packaged) ? Promise.resolve(packaged) : compileWindowsPipe(diagnostics);
+  bridge ??= executable.then((file) => {
+    try {
+      return new PipeBridge(spawn(file, [], { windowsHide: true, stdio: 'pipe' }), diagnostics);
+    } catch (error) {
+      reportWindowTransport(diagnostics, 'setupRejected', {
+        stage: 'spawn',
+        errorCode: windowTransportErrorCode(error),
+      });
+      throw error;
+    }
+  });
   try {
-    return await bridge;
+    const owner = await bridge;
+    owner.observe(diagnostics);
+    return owner;
   } catch (error) {
     bridge = null;
     executable = null;
@@ -188,6 +391,7 @@ export async function connectWindowsPipe(
   const owner = await getBridge();
   const socket = new PipeSocket(++nextId, owner);
   owner.sockets.set(socket.id, socket);
+  owner.retain();
   queueMicrotask(() =>
     owner.send(
       `connect:${socket.id}:${Buffer.from(address).toString('base64')}:${hostPid}:${serverPid}:${Buffer.from(registrationFile).toString('base64')}:${Math.max(1, Math.min(2_147_483_647, Math.trunc(deadlineMs)))}`,
