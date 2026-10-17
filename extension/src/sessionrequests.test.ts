@@ -1,4 +1,7 @@
 import { revisionOf, supportedFileIdentity, type SessionFile } from './transcript';
+import ts from 'typescript';
+import { runInNewContext } from 'node:vm';
+import { declarationSource } from '../test/source-contract';
 import {
   guardedSourceRevision,
   guardedSourceIdentity,
@@ -347,9 +350,14 @@ import {
   CompactRequests,
   compactCommandPayload,
   COMPACT_LIMITS,
+  validContinuation,
+  validContinuationPath,
+  type CompactPersistence,
+  type CompactReceipt,
   type CompactBinding,
   type CompactChild,
 } from './compactrequest';
+import { CompactStore } from './compactstore';
 import type { NativeEvent } from './agentwire';
 import { CodexWire } from './codexwire.ts';
 import { arcCliSpawner, childEnv } from './agenthost.ts';
@@ -3477,12 +3485,20 @@ test('exact decimal source identity distinguishes adjacent Windows inodes and ke
 });
 
 // A retained child whose state each case changes between host observations.
-function compactHostFixture(agent: 'claude' | 'codex' = 'codex') {
+function compactHostFixture(agent: 'claude' | 'codex' = 'codex', persistence?: CompactPersistence) {
   const state = { sessionId: 'self' as string | null, busy: true, asks: [] as unknown[], ready: true, exited: false };
   const fixture = {
     clock: 0,
     calls: 0,
     writes: 0,
+    continuationWrites: [] as string[],
+    authority: 'source' as string | null,
+    unresolved: false,
+    idle: true,
+    continuationWork: 'none' as 'none' | 'pending' | 'absent' | 'unknown',
+    continuationBoundary: () => {},
+    writeFailure: false,
+    receiptOutcome: 'accepted' as 'accepted' | 'unknown',
     // The last native submission generation. The requesting turn of the Claude cases is generation 1.
     compactions: 1,
     work: 'none' as 'none' | 'pending' | 'absent' | 'unknown',
@@ -3498,7 +3514,24 @@ function compactHostFixture(agent: 'claude' | 'codex' = 'codex') {
       key,
       agent,
       state: () => state,
-      compactionUnresolved: () => false,
+      compactionUnresolved: () => fixture.unresolved,
+      guardedIdle: () => (fixture.idle && !state.busy ? null : 'busy'),
+      guardedPrompt: (text, uuid, submitted, check) => {
+        const attempt = new GuardedAttempt(uuid, check);
+        submitted(8);
+        state.busy = true;
+        try {
+          fixture.continuationBoundary();
+          attempt.prepareWrite();
+          if (fixture.writeFailure) throw new Error('write failed');
+          fixture.continuationWrites.push(text);
+          attempt.markWritten();
+          attempt.settle({ outcome: fixture.receiptOutcome, nativeTurnId: 'continued', reason: '' });
+        } catch (error) {
+          attempt.settle({ outcome: 'unknown', nativeTurnId: null, reason: (error as Error).message });
+        }
+        return attempt;
+      },
       compact: async (check) => {
         fixture.calls++;
         state.busy = true;
@@ -3538,8 +3571,11 @@ function compactHostFixture(agent: 'claude' | 'codex' = 'codex') {
         return undefined;
       },
       readerWork: () => fixture.work,
+      continuationWork: () => fixture.continuationWork,
+      authority: () => fixture.authority,
     },
     () => fixture.clock,
+    persistence,
   );
   return { fixture, makeChild };
 }
@@ -3558,6 +3594,676 @@ function admittedCompaction(fixture: ReturnType<typeof compactHostFixture>['fixt
 const compactState = (host: CompactHost<CompactChild>) =>
   (host.handle({ method: 'compact-status', params: { requestId: compactPayload.requestId } }) as { state: string })
     .state;
+
+const continuationText = '  Continue the "quoted" task.\r\nWrite café once.\r\n';
+const continuationPayload = {
+  ...compactPayload,
+  continuation: {
+    text: continuationText,
+    sha256: crypto.createHash('sha256').update(continuationText).digest('hex'),
+  },
+};
+const continuationLiteral = (payload = continuationPayload) =>
+  `arc compact request --self --after-turn --continuation-file '${process.platform === 'win32' ? 'C:/temp/next turn.txt' : '/tmp/next turn.txt'}' --continuation-sha256 ${payload.continuation.sha256} --request-id ${payload.requestId} --window ${payload.window} --json`;
+function memoryCompactionStore() {
+  const records = new Map<string, CompactReceipt>();
+  const store: CompactPersistence = {
+    reserve: async (receipt) => {
+      records.set(receipt.observation.requestId, structuredClone(receipt));
+    },
+    save: async (receipt) => {
+      records.set(receipt.observation.requestId, structuredClone(receipt));
+    },
+    read: (id) => structuredClone(records.get(id) ?? null),
+    ended: () => false,
+    release: () => {},
+  };
+  return { store, records };
+}
+async function admitContinuation(
+  fixture: ReturnType<typeof compactHostFixture>['fixture'],
+  payload = continuationPayload,
+) {
+  fixture.host.submitted(fixture.child, 7);
+  fixture.host.native(
+    fixture.child,
+    compactEvent('toolStart', {
+      command: continuationLiteral(payload),
+      provider: fixture.child.agent,
+      generation: fixture.child.agent === 'claude' ? 1 : null,
+    }),
+    7,
+  );
+  return (await fixture.host.handle({ method: 'compact-request', params: payload })) as { state: string };
+}
+async function finishRequest(fixture: ReturnType<typeof compactHostFixture>['fixture']) {
+  const extra = { provider: fixture.child.agent, generation: fixture.child.agent === 'claude' ? 1 : null };
+  fixture.host.native(fixture.child, compactEvent('toolEnd', extra), 7);
+  fixture.host.replyRetained(fixture.child, 7);
+  fixture.host.native(fixture.child, compactEvent('rootEnd', extra), 7);
+  fixture.state.busy = false;
+  await fixture.host.drain('self');
+}
+function finishCompact(fixture: ReturnType<typeof compactHostFixture>['fixture'], generation = 2) {
+  const stages: readonly [string, object][] =
+    fixture.child.agent === 'claude'
+      ? [
+          ['status', { compact_result: 'success' }],
+          ['boundary', { compact_metadata: { trigger: 'manual' } }],
+          ['turnEnd', { subtype: 'success', is_error: false }],
+        ]
+      : [
+          ['turnStart', {}],
+          ['itemStart', { item: { id: 'item' } }],
+          ['itemEnd', { item: { id: 'item' } }],
+          ['turnEnd', { turn: { status: 'completed' } }],
+        ];
+  for (const [stage, evidence] of stages)
+    fixture.host.native(
+      fixture.child,
+      {
+        provider: fixture.child.agent,
+        sessionId: 'self',
+        turnId: 'compact',
+        generation,
+        evidence,
+        kind: 'compact',
+        stage,
+      } as NativeEvent,
+      undefined,
+    );
+}
+const continuationState = (fixture: ReturnType<typeof compactHostFixture>['fixture']) =>
+  fixture.host.handle({ method: 'compact-status', params: { requestId: continuationPayload.requestId } }) as {
+    state: string;
+    continuation?: { state: string; write: string; text: string };
+  };
+
+test('continuation binds exact bytes and a platform absolute path to the observed foreground literal', () => {
+  assert.equal(validContinuation(continuationText, continuationPayload.continuation.sha256), true);
+  assert.equal(
+    compactCommandPayload(continuationLiteral())?.continuation?.sha256,
+    continuationPayload.continuation.sha256,
+  );
+  for (const text of [
+    '',
+    ' ',
+    '/compact',
+    '\uFEFFnext',
+    'next\0',
+    '\ud800',
+    continuationText + 'changed',
+    'x'.repeat(8193),
+  ])
+    assert.equal(
+      validContinuation(text, continuationPayload.continuation.sha256),
+      false,
+      JSON.stringify(text.slice(0, 30)),
+    );
+  for (const platform of ['win32', 'linux', 'darwin'] as const) {
+    assert.equal(validContinuationPath('C:/temp/next.txt', platform), platform === 'win32');
+    assert.equal(validContinuationPath('/tmp/next.txt', platform), platform !== 'win32');
+    for (const file of [
+      'C:/../next.txt',
+      '/tmp/../next.txt',
+      '/tmp//next.txt',
+      '/tmp/next.txt/',
+      '/tmp/next$HOME',
+      'C:\\temp\\next.txt',
+      '/tmp/./next.txt',
+    ])
+      assert.equal(validContinuationPath(file, platform), false, file);
+  }
+});
+
+test('both providers continue once only after attributable native completion and settled idle ownership', async () => {
+  for (const agent of ['claude', 'codex'] as const) {
+    const { store } = memoryCompactionStore();
+    const { fixture } = compactHostFixture(agent, store);
+    assert.equal((await admitContinuation(fixture)).state, 'queued');
+    await finishRequest(fixture);
+    assert.equal(fixture.writes, 1);
+    assert.deepEqual(fixture.continuationWrites, []);
+    finishCompact(fixture, 99);
+    await fixture.host.drain('self');
+    assert.deepEqual(fixture.continuationWrites, []);
+    finishCompact(fixture);
+    fixture.state.busy = false;
+    fixture.unresolved = true;
+    await fixture.host.drain('self');
+    assert.deepEqual(fixture.continuationWrites, []);
+    fixture.unresolved = false;
+    fixture.idle = false;
+    await fixture.host.drain('self');
+    assert.deepEqual(fixture.continuationWrites, []);
+    fixture.idle = true;
+    await Promise.all([fixture.host.drain('self'), fixture.host.drain('self')]);
+    await fixture.host.drain('self');
+    assert.deepEqual(fixture.continuationWrites, [continuationText]);
+    assert.equal(continuationState(fixture).state, 'completed');
+    assert.equal(continuationState(fixture).continuation?.state, 'accepted');
+    const again = { ...continuationPayload, requestId: compactWindow + ':bbbbbbbb-1111-2222-3333-444444444444' };
+    fixture.host.native(
+      fixture.child,
+      compactEvent('toolStart', {
+        command: continuationLiteral(again),
+        toolId: 'second',
+        provider: agent,
+        generation: agent === 'claude' ? 3 : null,
+      }),
+      8,
+    );
+    assert.equal(
+      ((await fixture.host.handle({ method: 'compact-request', params: again })) as { state: string }).state,
+      'refused',
+    );
+    assert.deepEqual(fixture.continuationWrites, [continuationText]);
+  }
+});
+
+test('continuation admission reserves once across async storage and cancels changed reader authority before native input', async () => {
+  const { store, records } = memoryCompactionStore();
+  let settle!: () => void;
+  const reserve = store.reserve;
+  let reservations = 0;
+  store.reserve = async (receipt) => {
+    reservations++;
+    await new Promise<void>((resolve) => {
+      settle = resolve;
+    });
+    await reserve(receipt);
+  };
+  const { fixture } = compactHostFixture('codex', store);
+  const admission = admitContinuation(fixture);
+  const duplicate = fixture.host.handle({ method: 'compact-request', params: continuationPayload });
+  assert.equal(reservations, 1);
+  fixture.host.readerAction('self');
+  settle();
+  assert.equal((await admission).state, 'cancelled');
+  assert.equal(((await duplicate) as { state: string }).state, 'cancelled');
+  await finishRequest(fixture);
+  assert.equal(fixture.writes, 0);
+  assert.equal(records.get(continuationPayload.requestId)?.observation.continuation?.state, 'cancelled');
+});
+
+test('continuation invalidations suppress input before preparation and at the final provider boundary', async () => {
+  for (const change of [
+    'reader',
+    'answer',
+    'pending',
+    'question',
+    'archive or source or settings',
+    'archive',
+    'child',
+    'scope',
+    'expiry',
+    'write boundary',
+    'write failure',
+    'failed compaction',
+    'late refusal',
+    'save failure',
+  ] as const) {
+    const { store } = memoryCompactionStore();
+    const { fixture, makeChild } = compactHostFixture('codex', store);
+    await admitContinuation(fixture);
+    await finishRequest(fixture);
+    if (change === 'failed compaction')
+      fixture.host.native(
+        fixture.child,
+        {
+          provider: 'codex',
+          sessionId: 'self',
+          turnId: null,
+          generation: 2,
+          evidence: {},
+          kind: 'compact',
+          stage: 'refused',
+        },
+        undefined,
+      );
+    else finishCompact(fixture);
+    if (change === 'late refusal')
+      fixture.host.native(
+        fixture.child,
+        {
+          provider: 'codex',
+          sessionId: 'self',
+          turnId: null,
+          generation: 2,
+          evidence: {},
+          kind: 'compact',
+          stage: 'refused',
+        },
+        undefined,
+      );
+    fixture.state.busy = false;
+    if (change === 'reader') fixture.host.readerAction('self');
+    if (change === 'answer') fixture.host.readerAction('self', true);
+    if (change === 'pending') fixture.continuationWork = 'pending';
+    if (change === 'question') fixture.state.asks = [{}];
+    if (change === 'archive or source or settings') fixture.authority = 'changed';
+    if (change === 'archive') {
+      fixture.host.archived(new Set(['self']));
+      fixture.host.archived(new Set());
+    }
+    if (change === 'child') fixture.current = makeChild('replacement');
+    if (change === 'scope') fixture.work = 'absent';
+    if (change === 'expiry') fixture.clock = 30 * 60_000;
+    if (change === 'write boundary') fixture.continuationBoundary = () => fixture.host.readerAction('self');
+    if (change === 'write failure') fixture.writeFailure = true;
+    if (change === 'save failure')
+      store.save = async () => {
+        throw new Error('save failed');
+      };
+    await fixture.host.drain('self');
+    await fixture.host.drain('self');
+    assert.deepEqual(fixture.continuationWrites, [], change);
+    if (change === 'write failure') assert.equal(continuationState(fixture).continuation?.state, 'uncertain');
+    if (change === 'write boundary') assert.equal(continuationState(fixture).continuation?.write, 'not-written');
+  }
+});
+
+test.each(['saved text', 'delivery'])(
+  'continuation replacement with colliding numeric inodes denies %s',
+  async (observation) => {
+    const source = path.join(tempDir('continuation-source-'), 'session.jsonl');
+    fs.writeFileSync(source, '{}');
+    const snapshot = fs.lstatSync(source, { bigint: true });
+    let inode = 56576470320201115n;
+    const original = filesystem.lstatSync;
+    const stat = vi.spyOn(filesystem, 'lstatSync').mockImplementation(((
+      file: fs.PathLike,
+      options?: { bigint?: boolean },
+    ) => {
+      if (String(file) !== source) return original(file, options as never);
+      const value = Object.assign(Object.create(snapshot), { dev: 0n, ino: inode });
+      return options?.bigint ? value : Object.assign(Object.create(value), { dev: 0, ino: Number(inode) });
+    }) as typeof fs.lstatSync);
+    syncBuiltinESMExports();
+    try {
+      const method = declarationSource(
+        fs.readFileSync(path.join(__dirname, 'panelhost.ts'), 'utf8'),
+        'continuationSource',
+      );
+      const compiled = ts.transpileModule(`class Source { ${method} }`, {
+        compilerOptions: { target: ts.ScriptTarget.ES2022 },
+      }).outputText;
+      const Source = runInNewContext(`${compiled}; Source;`, { fs, fileRevisionOf: revisionOf, supportedFileIdentity });
+      const host = new Source();
+      Object.assign(host, {
+        readScopeKey: () => 'scope',
+        questionSource: () => source,
+        stateFor: () => ({ agent: 'codex' }),
+        hidden: new Set(),
+        cwdForSession: () => path.dirname(source),
+      });
+      const identity = () => host.continuationSource('codex', 'self');
+      const { store } = memoryCompactionStore();
+      const { fixture } = compactHostFixture('codex', store);
+      Object.defineProperty(fixture, 'authority', { get: identity });
+      assert.equal((await admitContinuation(fixture)).state, 'queued');
+      await finishRequest(fixture);
+      finishCompact(fixture);
+      fixture.state.busy = false;
+      const before = identity();
+      inode = 56576470320201114n;
+      assert.equal(Number(inode), Number(56576470320201115n));
+      if (observation === 'saved text')
+        assert.deepEqual(continuationState(fixture), {
+          requestId: continuationPayload.requestId,
+          state: 'unavailable',
+        });
+      else {
+        await fixture.host.drain('self');
+        assert.deepEqual(fixture.continuationWrites, []);
+      }
+      assert.notEqual(identity(), before);
+      inode = 0n;
+      assert.equal(identity(), null);
+    } finally {
+      stat.mockRestore();
+      syncBuiltinESMExports();
+    }
+  },
+);
+
+test('continuation status after restart reads through current authority without writes or replay', async () => {
+  const { store, records } = memoryCompactionStore();
+  const { fixture } = compactHostFixture('codex', store);
+  await admitContinuation(fixture);
+  await finishRequest(fixture);
+  const saved = structuredClone(records.get(continuationPayload.requestId)!);
+  store.ended = () => true;
+  store.save = async () => {
+    throw new Error('status must not write');
+  };
+  const replacement = new CompactHost<CompactChild>(
+    'b'.repeat(24),
+    { find: () => null, withActivity: async () => null, readerWork: () => 'none', authority: () => 'source' },
+    () => 0,
+    store,
+  );
+  for (const attempted of [false, true]) {
+    saved.observation.continuation!.state = attempted ? 'attempting' : 'waiting';
+    records.set(continuationPayload.requestId, structuredClone(saved));
+    const reply = replacement.handle({
+      method: 'compact-status',
+      params: { requestId: continuationPayload.requestId },
+    }) as { continuation: { state: string }; servedByWindow: string };
+    assert.equal(reply.continuation.state, attempted ? 'uncertain' : 'cancelled');
+    assert.equal(reply.servedByWindow, 'b'.repeat(24));
+    assert.deepEqual(records.get(continuationPayload.requestId), saved);
+    await replacement.drain('self');
+    assert.deepEqual(fixture.continuationWrites, []);
+  }
+  const foreign = new CompactHost<CompactChild>(
+    'c'.repeat(24),
+    { find: () => null, withActivity: async () => null, readerWork: () => 'none', authority: () => 'different' },
+    () => 0,
+    store,
+  );
+  assert.deepEqual(foreign.handle({ method: 'compact-status', params: { requestId: continuationPayload.requestId } }), {
+    requestId: continuationPayload.requestId,
+    state: 'unavailable',
+  });
+});
+
+test('lost continuation receipt retains one possible write and never submits a replacement', async () => {
+  const { store, records } = memoryCompactionStore();
+  const { fixture } = compactHostFixture('codex', store);
+  await admitContinuation(fixture);
+  await finishRequest(fixture);
+  finishCompact(fixture);
+  fixture.state.busy = false;
+  fixture.receiptOutcome = 'unknown';
+  await fixture.host.drain('self');
+  fixture.state.busy = false;
+  await fixture.host.drain('self');
+  assert.deepEqual(fixture.continuationWrites, [continuationText]);
+  assert.equal(continuationState(fixture).continuation?.state, 'uncertain');
+  assert.equal(records.get(continuationPayload.requestId)?.observation.continuation?.write, 'unknown');
+});
+
+test('unrelated reader work and unchanged scope refresh do not save continuation receipts', async () => {
+  const { store, records } = memoryCompactionStore();
+  const { fixture } = compactHostFixture('codex', store);
+  await admitContinuation(fixture);
+  const save = vi.spyOn(store, 'save');
+  fixture.host.readerAction('unrelated');
+  fixture.host.scopeChanged();
+  fixture.host.sessionsRefreshed();
+  await fixture.host.drain('self');
+  assert.equal(save.mock.calls.length, 0);
+  fixture.host.readerAction('self');
+  assert.equal(save.mock.calls.length, 1);
+  assert.equal(records.get(continuationPayload.requestId)?.observation.continuation?.state, 'cancelled');
+  fixture.host.readerAction('self');
+  fixture.host.sessionsRefreshed();
+  await fixture.host.drain('self');
+  assert.equal(save.mock.calls.length, 1);
+});
+
+test('continuation receipt updates bound lease reads across pending owners and recheck ownership each operation', async () => {
+  const records = new Map<string, CompactReceipt>();
+  const captured = memoryCompactionStore();
+  await admitContinuation(compactHostFixture('codex', captured.store).fixture);
+  const template = captured.records.get(continuationPayload.requestId)!;
+  const root = tempDir('continuation-history-');
+  const leases = path.join(root, 'leases');
+  fs.mkdirSync(leases);
+  const owners = Array.from({ length: 64 }, (_, index) => (index + 1).toString(16).padStart(24, '0'));
+  owners.push(compactWindow);
+  for (const [index, owner] of owners.entries())
+    fs.writeFileSync(
+      path.join(leases, index ? owners[index - 1] + '.next' : 'initial'),
+      JSON.stringify({ activation: owner, pid: index === 64 ? process.pid : index + 1 }),
+    );
+  for (let index = 0; index < 24; index++) {
+    const receipt = structuredClone(template);
+    receipt.owner = index === 23 ? compactWindow : owners[61 + (index % 3)];
+    receipt.binding.activation = receipt.owner;
+    receipt.observation.requestId = receipt.owner + ':' + crypto.randomUUID();
+    receipt.observation.continuation!.state = index < 12 ? 'accepted' : index % 2 ? 'attempting' : 'waiting';
+    receipt.terminalAt = index < 12 ? 0 : null;
+    const file = crypto.createHash('sha256').update(receipt.observation.requestId).digest('hex') + '.json';
+    fs.writeFileSync(path.join(root, file), JSON.stringify(receipt));
+    records.set(receipt.observation.requestId, receipt);
+  }
+  const own = [...records.values()].find((receipt) => receipt.owner === compactWindow)!;
+  let processEnded = false;
+  const store = new CompactStore(
+    root,
+    compactWindow,
+    () => 0,
+    () => processEnded,
+  );
+  const open = vi.spyOn(filesystem, 'openSync');
+  syncBuiltinESMExports();
+  const chainReads = () =>
+    open.mock.calls.filter(
+      ([file]) =>
+        path.dirname(String(file)) === leases && /^(initial|[a-f0-9]{24}\.next)$/.test(path.basename(String(file))),
+    ).length;
+  try {
+    await store.save(own);
+    assert.ok(chainReads() <= owners.length * 2, `Lease reads: ${chainReads()}`);
+    for (const receipt of records.values())
+      assert.equal(
+        store.read(receipt.observation.requestId)?.observation.continuation?.state,
+        receipt.observation.continuation?.state,
+      );
+    open.mockClear();
+    processEnded = true;
+    await store.save(own);
+    assert.ok(chainReads() <= owners.length * 2, `Lease reads: ${chainReads()}`);
+    for (const receipt of records.values()) {
+      if (receipt.owner === compactWindow) continue;
+      const before = receipt.observation.continuation!.state;
+      const after = store.read(receipt.observation.requestId)!.observation.continuation!;
+      assert.equal(after.state, before === 'attempting' ? 'uncertain' : before === 'waiting' ? 'cancelled' : before);
+      if (before === 'attempting') assert.equal(after.write, 'unknown');
+    }
+    open.mockClear();
+    await store.save(own);
+    assert.equal(chainReads(), owners.length);
+  } finally {
+    open.mockRestore();
+    syncBuiltinESMExports();
+  }
+});
+
+test('durable continuation lease rejects live or malformed owners and retains receipts without execution takeover', async () => {
+  const root = tempDir('continuation-store-');
+  const first = new CompactStore(
+    root,
+    compactWindow,
+    () => 0,
+    () => false,
+  );
+  const { store: captured, records } = memoryCompactionStore();
+  const control = compactHostFixture('codex', captured).fixture;
+  await admitContinuation(control);
+  await first.reserve(records.get(continuationPayload.requestId)!);
+  await first.save(records.get(continuationPayload.requestId)!);
+  const receipt = first.read(continuationPayload.requestId)!;
+  assert.equal(receipt.observation.continuation?.text, continuationText);
+  const second = new CompactStore(
+    root,
+    'b'.repeat(24),
+    () => 0,
+    () => false,
+  );
+  const successor = structuredClone(receipt);
+  successor.owner = 'b'.repeat(24);
+  successor.binding.activation = successor.owner;
+  successor.observation.requestId = successor.owner + ':aaaaaaaa-1111-2222-3333-444444444444';
+  await assert.rejects(second.reserve(successor), /Another window/);
+  assert.equal(second.ended(compactWindow), false);
+  first.release();
+  await vi.waitFor(() => assert.equal(second.ended(compactWindow), true));
+  assert.equal(second.read(continuationPayload.requestId)?.observation.continuation?.state, 'waiting');
+  await second.reserve(successor);
+  assert.equal(second.read(continuationPayload.requestId)?.observation.continuation?.state, 'cancelled');
+  const corrupt = tempDir('continuation-corrupt-');
+  fs.mkdirSync(path.join(corrupt, 'leases'));
+  fs.writeFileSync(path.join(corrupt, 'leases', 'initial'), '');
+  const blocked = new CompactStore(corrupt, compactWindow);
+  await assert.rejects(blocked.reserve(receipt));
+  assert.equal(fs.readFileSync(path.join(corrupt, 'leases', 'initial'), 'utf8'), '');
+});
+
+test.each(['open', 'after read', 'unknown'] as const)(
+  'continuation storage rejects physical replacement at %s',
+  async (boundary) => {
+    const { store, records } = memoryCompactionStore();
+    const { fixture } = compactHostFixture('codex', store);
+    await admitContinuation(fixture);
+    const root = tempDir('continuation-identity-');
+    const saved = new CompactStore(root, compactWindow, () => 0);
+    await saved.reserve(records.get(continuationPayload.requestId)!);
+    const file = path.join(
+      root,
+      crypto.createHash('sha256').update(continuationPayload.requestId).digest('hex') + '.json',
+    );
+    const snapshot = fs.lstatSync(file, { bigint: true });
+    const nativeLstat = filesystem.lstatSync;
+    const nativeFstat = filesystem.fstatSync;
+    const value = (inode: bigint, options?: { bigint?: boolean }) =>
+      Object.assign(Object.create(snapshot), {
+        dev: options?.bigint ? 0n : 0,
+        ino: options?.bigint ? inode : Number(inode),
+      });
+    let reads = 0;
+    const stat = vi
+      .spyOn(filesystem, 'lstatSync')
+      .mockImplementation(((target: fs.PathLike, options?: { bigint?: boolean }) =>
+        String(target) === file
+          ? value(
+              boundary === 'unknown'
+                ? 0n
+                : boundary === 'after read' && reads++ > 0
+                  ? 56576470320201114n
+                  : 56576470320201115n,
+              options,
+            )
+          : nativeLstat(target, options as never)) as typeof fs.lstatSync);
+    const opened = vi
+      .spyOn(filesystem, 'fstatSync')
+      .mockImplementation(((_fd: number, options?: { bigint?: boolean }) =>
+        value(boundary === 'open' ? 56576470320201114n : 56576470320201115n, options)) as typeof fs.fstatSync);
+    syncBuiltinESMExports();
+    try {
+      assert.equal(saved.read(continuationPayload.requestId), null, boundary);
+    } finally {
+      stat.mockRestore();
+      opened.mockRestore();
+      syncBuiltinESMExports();
+    }
+    assert.equal(filesystem.fstatSync, nativeFstat);
+    assert.equal(saved.read(continuationPayload.requestId)?.observation.continuation?.text, continuationText);
+  },
+);
+
+test('continuation storage opens replaced paths without blocking and refuses nonregular descriptors', () => {
+  const method = declarationSource(fs.readFileSync(path.join(__dirname, 'compactstore.ts'), 'utf8'), 'readJson');
+  const compiled = ts.transpileModule(`class Store { ${method} }`, {
+    compilerOptions: { target: ts.ScriptTarget.ES2022 },
+  }).outputText;
+  for (const platform of ['win32', 'linux', 'darwin']) {
+    let closed = false;
+    const filesystem = {
+      constants: { O_RDONLY: 0, O_NONBLOCK: 2048 },
+      lstatSync: () => ({ isFile: () => true, isSymbolicLink: () => false, dev: 0n, ino: 2n, uid: 1n, size: 1n }),
+      openSync: (_file: string, flags: number) => {
+        assert.equal(flags, platform === 'win32' ? 0 : 2048);
+        return 123;
+      },
+      fstatSync: () => ({ isFile: () => false, dev: 0n, ino: 2n, uid: 1n, size: 1n }),
+      closeSync: (fd: number) => {
+        assert.equal(fd, 123);
+        closed = true;
+      },
+    };
+    const Store = runInNewContext(`${compiled}; Store;`, {
+      fs: filesystem,
+      path,
+      process: { platform, getuid: () => 1 },
+      admitToolPath: () => {},
+      revisionOf,
+      supportedFileIdentity,
+    });
+    assert.throws(() => new Store().readJson('receipt.json'), /storage changed/);
+    assert.equal(closed, true);
+  }
+});
+
+test('continuation ownership publishes a complete lease before any authoritative claim becomes visible', async () => {
+  const { store, records } = memoryCompactionStore();
+  await admitContinuation(compactHostFixture('codex', store).fixture);
+  const receipt = records.get(continuationPayload.requestId)!;
+  const root = tempDir('continuation-publication-');
+  const original = filesystem.linkSync;
+  const published: string[] = [];
+  const link = vi.spyOn(filesystem, 'linkSync').mockImplementation((source, target) => {
+    const value = JSON.parse(fs.readFileSync(source, 'utf8'));
+    assert.equal(value.activation ?? value.owner, compactWindow);
+    assert.equal(fs.existsSync(target), false);
+    published.push(String(target));
+    return original(source, target);
+  });
+  syncBuiltinESMExports();
+  try {
+    await new CompactStore(root, compactWindow).reserve(receipt);
+    assert.equal(published.length, 2);
+  } finally {
+    link.mockRestore();
+    syncBuiltinESMExports();
+  }
+  const failedRoot = tempDir('continuation-publication-failure-');
+  const failure = vi.spyOn(filesystem, 'linkSync').mockImplementation(() => {
+    throw new Error('publication failed');
+  });
+  syncBuiltinESMExports();
+  try {
+    await assert.rejects(new CompactStore(failedRoot, compactWindow).reserve(receipt));
+    assert.equal(fs.existsSync(path.join(failedRoot, 'leases', 'initial')), false);
+  } finally {
+    failure.mockRestore();
+    syncBuiltinESMExports();
+  }
+  await new CompactStore(failedRoot, compactWindow).reserve(receipt);
+});
+
+test('continuation storage refuses bounded capacity and reclaims only owned expired terminal receipts', async () => {
+  const { store, records } = memoryCompactionStore();
+  await admitContinuation(compactHostFixture('codex', store).fixture);
+  const receipt = records.get(continuationPayload.requestId)!;
+  const root = tempDir('continuation-capacity-');
+  let now = 0;
+  const saved = new CompactStore(root, compactWindow, () => now);
+  await saved.reserve(receipt);
+  for (let index = 1; index < COMPACT_LIMITS.records; index++) {
+    const terminal = structuredClone(receipt);
+    terminal.observation.requestId =
+      compactWindow + ':' + index.toString(16).padStart(8, '0') + '-1111-2222-3333-444444444444';
+    terminal.observation.continuation!.state = 'cancelled';
+    terminal.terminalAt = 0;
+    const file = crypto.createHash('sha256').update(terminal.observation.requestId).digest('hex') + '.json';
+    fs.writeFileSync(path.join(root, file), JSON.stringify(terminal));
+  }
+  const next = structuredClone(receipt);
+  next.observation.requestId = compactWindow + ':ffffffff-1111-2222-3333-444444444444';
+  await assert.rejects(saved.reserve(next), /full/);
+  now = 90 * 60_000;
+  next.admittedAt = now;
+  await saved.reserve(next);
+  assert.equal(fs.readdirSync(root).filter((name) => name.endsWith('.json')).length, 2);
+  assert.equal(saved.read(next.observation.requestId)?.observation.continuation?.text, continuationText);
+  const oversized = structuredClone(next);
+  oversized.observation.requestId = compactWindow + ':eeeeeeee-1111-2222-3333-444444444444';
+  oversized.binding.authority = 'x'.repeat(65536);
+  await assert.rejects(saved.reserve(oversized), /too large/);
+});
 
 test('host compaction runs once after the exact turn succeeds and its final response is saved', async () => {
   const { fixture } = compactHostFixture();

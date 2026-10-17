@@ -5742,7 +5742,7 @@ test('activate wires the guarded send policy into reader callbacks, draft starts
   );
   sourceMatch(
     activate,
-    /guardedDeliveryPort\(guardedSends, host, activeWriterFailure, randomUUID, \(child, turnId\) =>\s*compaction\?\.submitted\(child, turnId\),?\s*\)/,
+    /guardedDeliveryPort\(guardedSends, host, activeWriterFailure, randomUUID, \(child, turnId\) =>\s*compaction\?\.submitted\(child, turnId, 'followup'\),?\s*\)/,
   );
   sourceMatch(
     activate,
@@ -5750,6 +5750,10 @@ test('activate wires the guarded send policy into reader callbacks, draft starts
     'guarded observations require the exact child retained by the host',
   );
   const intervention = activate.indexOf('interveneOnReaderInput(panel, guardedSends);');
+  sourceMatch(
+    activate,
+    /panel\.onArchivedSessionsChange = \(sessions\) => \{\s*compaction\?\.archived\(sessions\);\s*host\.setArchived\(sessions\);/,
+  );
   assert.ok(intervention >= 0, 'activate wraps the directing reader callbacks');
   for (const name of ['onSendPrompt', 'onCompact', 'onClear', 'onStopTurn', 'onAnswerAsk']) {
     const assigned = activate.lastIndexOf(`panel.${name} =`);
@@ -9146,12 +9150,9 @@ test('an idle Codex rename rejects with the server refusal', async () => {
   assert.equal(child.sent().some(MODEL_TURN), false);
 });
 
-test('a guarded Claude prompt needs positive idle evidence, releases its lease at the write, and never reopens a retired child', async () => {
+test('an ordinary Claude child acknowledges guarded continuation, requires idle evidence, and never reopens after retirement', async () => {
   const fake = fakeHost();
-  const starting = fake.host.session(
-    'guarded',
-    claudePlan(CLAUDE, { cwd: WS, sessionId: 'worker-session', replayUserMessages: true }),
-  );
+  const starting = fake.host.session('guarded', claudePlan(CLAUDE, { cwd: WS, sessionId: 'worker-session' }));
   const child = fake.children[0];
   child.answerHandshake();
   const session = await starting;
@@ -9165,13 +9166,21 @@ test('a guarded Claude prompt needs positive idle evidence, releases its lease a
   assert.equal(session.guardedIdle(), null);
 
   let receiptSettled = false;
+  let boundaryChecked = false;
   const attempt = await fake.host.withActivity('guarded', async (live) => {
-    const written = live.guardedPrompt('Apply the accepted corrections.', 'uuid-guarded');
+    const written = live.guardedPrompt('Apply the accepted corrections.', 'uuid-guarded', undefined, () => {
+      assert.equal(
+        child.sent().some((line) => line.uuid === 'uuid-guarded'),
+        false,
+      );
+      boundaryChecked = true;
+    });
     void written.receipt.then(() => (receiptSettled = true));
     await written.written;
     return written;
   });
   assert.ok(attempt);
+  assert.equal(boundaryChecked, true);
   assert.equal(receiptSettled, false, 'the activity lease ends at the write, before any receipt');
   assert.equal(session.guardedIdle(), 'busy');
   const line = child.sent().at(-1)!;

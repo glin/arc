@@ -65,7 +65,7 @@ Acknowledgment covers only the delivered completed projection. It does not estab
 
 An explicit request to run follow-ups authorizes executing the named steps and choosing their session. A request for thoughts, a plan, or consultation grants no execution authority. Preserve phase-only restrictions and every implementation, review, request, token, and dollar limit. Compaction and session transfer renew none of them.
 
-Continue in this session while its context serves the work. Native compaction during ongoing work does not end the task or require another invocation. Arc's after-turn compaction schedules no next prompt. Never use it for unattended continuation or queue a follow-up before requesting it. The request to run follow-ups delegates compaction for this turn, subject to Request compaction of this session below.
+Continue in this session while its context serves the work. Native compaction during ongoing work does not end the task or require another invocation. Arc's after-turn compaction accepts one explicit saved continuation. Use the continuation form below for requested same-session work. Never queue that follow-up before compaction. The request to run follow-ups delegates compaction for this turn, subject to Request compaction of this session below.
 
 Use at most one reader-owned successor when clean context serves the authorized next step. Follow this sequence only when Arc can preserve the required settings and durable state:
 
@@ -89,17 +89,49 @@ Run one foreground command in this exact form. Write the window `hostId` and a f
 arc compact request --self --after-turn --request-id WINDOW_ID:UUID --window WINDOW_ID --json
 ```
 
-Both window values are the `hostId` of the window that hosts this session. `ARC_WINDOW` names it when supplied. Claude agents run the command with the Bash tool. Arc does not admit it from the Claude PowerShell tool. Codex agents run the bare command as a foreground shell command. Codex adds its own PowerShell wrapper on Windows, so never write a wrapper. Do not use shell substitutions, command chains, background execution, or payload files.
+Both window values are the `hostId` of the window that hosts this session. `ARC_WINDOW` names it when supplied. Claude agents run the command with the Bash tool. Arc does not admit it from the Claude PowerShell tool. Codex agents run the bare command as a foreground shell command. Codex adds its own PowerShell wrapper on Windows, so never write a wrapper. Do not use shell substitutions, command chains, background execution, or alternate payload transports.
 
 Arc admits the request only while this tool call runs in a session that this window's panel holds. The session must have no open asks, no queued reader prompts, and no reader action since this turn's prompt. An answer to one of this turn's asks given before the request does not block admission. Any reader action after admission, including an answer, cancels the request. Each turn holds one pending request. Each request ID is admitted once in a window activation.
 
 Read the `state` field of the result. The command returns at once. After `queued`, finish the successful final response. Report the request in the past tense: "I requested compaction after this turn." Arc checks delivery conditions after the turn. Reader intervention can cancel unsubmitted compaction after the last observation, including while you write the final response. Never promise future delivery from `queued` or a status check.
 
+For authorized same-session follow-up work, save the exact next-turn instruction in a regular UTF-8 file. Include the durable handoff location and inherited execution limits. Use 1 through 8192 bytes. Preserve its whitespace. Exclude a byte-order mark, NUL, invalid UTF-8, and a leading slash command. Arc sends this agent-authored instruction as one ordinary next-turn prompt without adding reader comments or files.
+
+Compute the lowercase digest before the foreground request. On Windows:
+
+```powershell
+(Get-FileHash -Algorithm SHA256 -LiteralPath 'C:/Windows/Temp/arc-next.txt').Hash.ToLowerInvariant()
+```
+
+On Linux:
+
+```sh
+sha256sum /tmp/arc-next.txt
+```
+
+On macOS:
+
+```sh
+shasum -a 256 /tmp/arc-next.txt
+```
+
+Copy only the 64-character digest into this exact command. Windows requires the drive-absolute form shown. POSIX requires a path beginning `/`. Use forward slashes and single quotes. Filenames accept ASCII letters, digits, spaces, underscore, period, hyphen, parentheses, and slash. Dot segments, repeated slashes, and shell expansion refuse.
+
+```text
+arc compact request --self --after-turn --continuation-file 'C:/Windows/Temp/arc-next.txt' --continuation-sha256 SHA256 --request-id WINDOW_ID:UUID --window WINDOW_ID --json
+```
+
+Admission consumes this reader assignment's single continuation allowance, including cancellation or failure. A different request ID never returns it. Finish the requesting turn successfully after admission. Compaction completion and continuation acceptance are separate observations. The continuation states are `waiting`, `preparing`, `attempting`, `accepted`, `cancelled`, `refused`, and `uncertain`. Acceptance confirms prompt acknowledgment rather than successful task completion. Never retry uncertain input, reopen a child, or chain another continuation without a new explicit reader submission.
+
+After window reload, select the current window for the same workspace. Keep the original request ID for status. Status returns saved text only when the current scope admits the exact original source. Restart recovery cancels unattempted continuation and marks possible input uncertain. It never restarts work.
+
 Observe a known request without submitting work:
 
 ```text
-arc compact status --request-id WINDOW_ID:UUID --window WINDOW_ID --json
+arc compact status --request-id ORIGINAL_WINDOW:UUID --window CURRENT_WINDOW --json
 ```
+
+`ORIGINAL_WINDOW` identifies the admitting activation. `CURRENT_WINDOW` identifies the selected current window for the same workspace.
 
 The `state` field names one outcome:
 

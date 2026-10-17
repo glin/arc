@@ -131,8 +131,7 @@ export interface SpawnOptions {
   sessionId?: string;
   persistSession?: boolean;
   settings?: string;
-  // Echoes received user messages with `isReplay` for requester starts and resumed sessions.
-  // Guarded follow-ups use the echo as their receipt.
+  // Echoes received user messages with `isReplay`. Guarded prompts use the echo as their receipt.
   replayUserMessages?: boolean;
 }
 

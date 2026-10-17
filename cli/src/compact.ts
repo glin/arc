@@ -1,5 +1,6 @@
 import { requestWindow } from '../../extension/src/sessionrequests.ts';
 import { validCompactPayload } from '../../extension/src/compactrequest.ts';
+import { readContinuationFile } from './manage.ts';
 
 // Readiness spreads its reads across this window, so a tool start that reaches the host late can still be admitted.
 const READINESS = { attempts: 4, intervalMs: 500, deadlineMs: 2_000 } as const;
@@ -11,7 +12,11 @@ export async function runCompact(args: string[]): Promise<string> {
   const flags = new Set<string>();
   for (let index = 1; index < args.length; index++) {
     const arg = args[index];
-    if (arg === '--request-id' || arg === '--window') {
+    if (
+      arg === '--request-id' ||
+      arg === '--window' ||
+      (command === 'request' && ['--continuation-file', '--continuation-sha256'].includes(arg))
+    ) {
       const value = args[++index];
       if (!value || value.startsWith('-') || values.has(arg)) throw new Error(`Invalid or repeated argument: ${arg}`);
       values.set(arg, value);
@@ -27,9 +32,20 @@ export async function runCompact(args: string[]): Promise<string> {
     window: values.get('--window') ?? '',
     self: true as const,
     afterTurn: true as const,
+    ...(values.has('--continuation-file') || values.has('--continuation-sha256')
+      ? {
+          continuation: readContinuationFile(
+            values.get('--continuation-file') ?? '',
+            values.get('--continuation-sha256') ?? '',
+          ),
+        }
+      : {}),
   };
   if (
-    !validCompactPayload(payload) ||
+    !(command === 'status'
+      ? /^[a-f0-9]{24}$/.test(payload.window) &&
+        /^[a-f0-9]{24}:[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(payload.requestId)
+      : validCompactPayload(payload)) ||
     !flags.has('--json') ||
     (command === 'request' && (!flags.has('--self') || !flags.has('--after-turn')))
   )

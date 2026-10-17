@@ -99,21 +99,39 @@ function compact(action: 'request' | 'status'): Command {
       summary: request
         ? 'Request compaction of this session after its current turn.'
         : 'Observe a compaction request without submitting work.',
-      synopsis: `arc compact ${action}${request ? ' --self --after-turn' : ''} --request-id WINDOW:UUID --window WINDOW --json`,
+      synopsis: request
+        ? "arc compact request --self --after-turn [--continuation-file 'ABSOLUTE_PATH' --continuation-sha256 SHA256] --request-id WINDOW:UUID --window WINDOW --json"
+        : 'arc compact status --request-id ORIGINAL_WINDOW:UUID --window CURRENT_WINDOW --json',
       flags: [
         ...(request
           ? ([
               ['--self', 'Compact only the requesting main agent session.'],
               ['--after-turn', 'Wait for this turn to succeed and its final response to be saved.'],
+              [
+                '--continuation-file ABSOLUTE_PATH',
+                'Optional exact UTF-8 next-turn prompt, at most 8192 bytes. Use forward slashes and single quotes.',
+              ],
+              ['--continuation-sha256 SHA256', 'Required with --continuation-file. Supply its lowercase SHA-256.'],
             ] as Flag[])
           : []),
-        ['--request-id WINDOW:UUID', 'Required. Use this window hostId and a lowercase UUID.'],
-        ['--window WINDOW', 'Required. Must match the request ID window activation.'],
+        [
+          '--request-id WINDOW:UUID',
+          request
+            ? 'Required. Use this window hostId and a lowercase UUID.'
+            : 'Required. Keep the original admitting window and request UUID.',
+        ],
+        [
+          '--window WINDOW',
+          request
+            ? 'Required. Must match the request ID window activation.'
+            : 'Required. Select the current window serving the original request.',
+        ],
         ['--json', 'Required. Print the compaction outcome.'],
       ],
       output: [
         'JSON: requestId, state, and reason when available. Admitted outcomes include admission, sequence, provider, sessionId, childGeneration, turn, toolId, submissionId, readerRevision. Local outcomes also include version and window.',
         'State is queued, started, completed, cancelled, refused, failed, uncertain, or unavailable.',
+        'A continuation has separate state and sequence, exact text, sha256, write outcome, nativeTurnId, and reason. Completed compaction does not establish continuation acceptance.',
         ...(request ? ['After uncertain admission, observe this ID. Never retry or switch transports.'] : []),
       ],
       refusals: [

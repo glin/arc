@@ -334,7 +334,7 @@ export function codexAskMode(mode: AskMode): {
 
 // Claude Code: one child per session, speaking its stream-json protocol.
 export function claudePlan(launch: Launch, options: SpawnOptions): AgentPlan {
-  options = { ...options };
+  options = { ...options, replayUserMessages: true };
   return {
     policy: options.policy,
     agent: 'claude',
@@ -1084,8 +1084,13 @@ export class AgentSession {
 
   // Writes one guarded text prompt through the ordinary prompt accounting. The attempt's
   // `written` promise resolves at the input write, and `receipt` settles by the provider receipt.
-  guardedPrompt(text: string, clientUuid: string, onSubmitted?: (turnId: number) => void): GuardedAttempt {
-    const attempt = new GuardedAttempt(clientUuid);
+  guardedPrompt(
+    text: string,
+    clientUuid: string,
+    onSubmitted?: (turnId: number) => void,
+    beforeWrite?: () => void,
+  ): GuardedAttempt {
+    const attempt = new GuardedAttempt(clientUuid, beforeWrite);
     this.prompt({ text, assets: [] }, onSubmitted, attempt).catch((error: unknown) =>
       attempt.settle({ outcome: 'unknown', nativeTurnId: null, reason: (error as Error).message }),
     );

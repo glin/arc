@@ -1,4 +1,5 @@
-import type { NativeEvent } from './agentwire';
+import { createHash, randomUUID } from 'node:crypto';
+import type { GuardedAttempt, NativeEvent } from './agentwire';
 
 export const COMPACT_LIMITS = { records: 256, admissionMs: 15 * 60_000, retentionMs: 60 * 60_000 } as const;
 export interface CompactPayload {
@@ -6,6 +7,57 @@ export interface CompactPayload {
   window: string;
   self: true;
   afterTurn: true;
+  continuation?: { text: string; sha256: string };
+}
+export type CompactCommand = Omit<CompactPayload, 'continuation'> & { continuation?: { sha256: string } };
+export const CONTINUATION_LIMITS = { bytes: 8192, assignmentMs: 30 * 60_000, readyMs: 2 * 60_000 } as const;
+export interface ContinuationObservation {
+  state: 'waiting' | 'preparing' | 'attempting' | 'accepted' | 'cancelled' | 'refused' | 'uncertain';
+  sequence: number;
+  text: string;
+  sha256: string;
+  reason: string;
+  write: 'not-written' | 'unknown' | 'accepted';
+  nativeTurnId: string | null;
+}
+export interface CompactReceipt {
+  version: 1;
+  owner: string;
+  admittedAt: number;
+  terminalAt: number | null;
+  binding: CompactBinding;
+  observation: CompactObservation;
+}
+export interface CompactPersistence {
+  reserve(receipt: CompactReceipt): Promise<void>;
+  save(receipt: CompactReceipt): Promise<void>;
+  read(id: string): CompactReceipt | null;
+  ended(owner: string): boolean;
+  release(): void;
+}
+export function validContinuation(text: unknown, sha256: unknown): text is string {
+  return (
+    typeof text === 'string' &&
+    typeof sha256 === 'string' &&
+    /^[a-f0-9]{64}$/.test(sha256) &&
+    Buffer.byteLength(text) <= CONTINUATION_LIMITS.bytes &&
+    text.trim().length > 0 &&
+    !text.includes('\0') &&
+    !text.startsWith('\uFEFF') &&
+    !text.trimStart().startsWith('/') &&
+    Buffer.from(text).toString('utf8') === text &&
+    createHash('sha256').update(text).digest('hex') === sha256
+  );
+}
+export function validContinuationPath(file: string, platform = process.platform): boolean {
+  if (file.length > 1024) return false;
+  const prefix = platform === 'win32' ? /^[A-Za-z]:\// : /^\//;
+  if (!prefix.test(file)) return false;
+  const relative = file.replace(prefix, '');
+  return (
+    /^[A-Za-z0-9 _.()/-]+$/.test(relative) &&
+    relative.split('/').every((part) => part.length > 0 && part !== '.' && part !== '..')
+  );
 }
 export type CompactState = 'queued' | 'started' | 'completed' | 'cancelled' | 'refused' | 'failed' | 'uncertain';
 export interface CompactBinding {
@@ -16,6 +68,9 @@ export interface CompactBinding {
   turn: string;
   submissionId: string;
   readerRevision: number;
+  assignmentId?: string;
+  authority?: string;
+  sourceIdentity?: string;
 }
 export interface CompactObservation {
   requestId: string;
@@ -30,6 +85,10 @@ export interface CompactObservation {
   toolId: string;
   submissionId: string;
   readerRevision: number;
+  originWindow?: string;
+  servedByWindow?: string;
+  continuation?: ContinuationObservation;
+  compactGeneration?: number;
 }
 interface Assignment {
   payload: CompactPayload;
@@ -44,9 +103,13 @@ interface Assignment {
   terminalAt: number | null;
   observation: CompactObservation;
   operation?: NativeCompactOperation;
+  admittedAt: number;
+  persisted: boolean;
+  continuationDeadline?: number;
+  possibleWrite?: boolean;
 }
 interface Call {
-  payload: CompactPayload;
+  payload: CompactCommand;
   binding: Readonly<CompactBinding>;
   toolId: string;
 }
@@ -55,7 +118,18 @@ export function validCompactPayload(input: unknown): input is CompactPayload {
   if (!input || typeof input !== 'object' || Array.isArray(input)) return false;
   const value = input as Record<string, unknown>;
   return (
-    Object.keys(value).sort().join(',') === 'afterTurn,requestId,self,window' &&
+    Object.keys(value).sort().join(',') ===
+      (value.continuation === undefined
+        ? 'afterTurn,requestId,self,window'
+        : 'afterTurn,continuation,requestId,self,window') &&
+    (value.continuation === undefined ||
+      (!!value.continuation &&
+        typeof value.continuation === 'object' &&
+        Object.keys(value.continuation).sort().join(',') === 'sha256,text' &&
+        validContinuation(
+          (value.continuation as { text: unknown }).text,
+          (value.continuation as { sha256: unknown }).sha256,
+        ))) &&
     value.self === true &&
     value.afterTurn === true &&
     typeof value.window === 'string' &&
@@ -74,16 +148,17 @@ const POWERSHELL_WRAPPER =
   /^(?:"(?:[A-Za-z]:[A-Za-z0-9 _.()\\-]*\\)?(?:powershell|pwsh)\.exe"|(?:powershell|pwsh)\.exe)(?: -NoProfile)? -Command (?:"([^"\r\n]*)"|'([^'\r\n]*)')$/;
 
 // Exact literal commands exclude shell composition and inherited selectors.
-export function compactCommandPayload(command: string): CompactPayload | null {
+export function compactCommandPayload(command: string): CompactCommand | null {
   const wrapped = POWERSHELL_WRAPPER.exec(command);
   const literal = wrapped ? (wrapped[1] ?? wrapped[2]) : command;
   const match =
-    /^arc compact request --self --after-turn --request-id ([a-f0-9]{24}:[a-f0-9-]{36}) --window ([a-f0-9]{24}) --json$/.exec(
+    /^arc compact request --self --after-turn(?: --continuation-file '([^'\r\n]+)' --continuation-sha256 ([a-f0-9]{64}))? --request-id ([a-f0-9]{24}:[a-f0-9-]{36}) --window ([a-f0-9]{24}) --json$/.exec(
       literal,
     );
   if (!match) return null;
-  const payload = { requestId: match[1], window: match[2], self: true as const, afterTurn: true as const };
-  return validCompactPayload(payload) ? payload : null;
+  const payload = { requestId: match[3], window: match[4], self: true as const, afterTurn: true as const };
+  if (!validCompactPayload(payload) || (match[1] && !validContinuationPath(match[1]))) return null;
+  return match[1] ? { ...payload, continuation: { sha256: match[2] } } : payload;
 }
 
 function sameBinding(a: CompactBinding, b: CompactBinding): boolean {
@@ -98,8 +173,14 @@ function sameBinding(a: CompactBinding, b: CompactBinding): boolean {
   );
 }
 
-function payloadKey(payload: CompactPayload): string {
-  return JSON.stringify([payload.requestId, payload.window, payload.self, payload.afterTurn]);
+function payloadKey(payload: CompactCommand): string {
+  return JSON.stringify([
+    payload.requestId,
+    payload.window,
+    payload.self,
+    payload.afterTurn,
+    payload.continuation?.sha256,
+  ]);
 }
 
 function eventMatches(binding: CompactBinding, event: NativeEvent): boolean {
@@ -130,10 +211,13 @@ export class CompactRequests {
   // event synchronously after the write callback, and that event names the operation's generation.
   private claiming: Assignment | null = null;
   private disposed = false;
+  private readonly continuationAssignments = new Set<string>();
+  private readonly admissions = new Map<string, Promise<Readonly<CompactObservation>>>();
   constructor(
     private readonly activation: string,
     private readonly now = Date.now,
     private readonly capacity: number = COMPACT_LIMITS.records,
+    private readonly persistence?: CompactPersistence,
   ) {}
 
   observe(binding: CompactBinding, event: NativeEvent, finalRetained = false): void {
@@ -196,6 +280,10 @@ export class CompactRequests {
       if (!claiming || !owns(claiming)) return;
       this.claiming = null;
       if (event.text === '/compact' && claiming.operation) claiming.operation.generation = event.generation;
+      if (claiming.observation.continuation) {
+        claiming.observation = { ...claiming.observation, compactGeneration: event.generation };
+        void this.persist(claiming).catch(() => {});
+      }
       return;
     }
     if (event.kind !== 'compact') return;
@@ -211,7 +299,7 @@ export class CompactRequests {
     return [
       ...new Set(
         [...this.assignments.values()]
-          .filter((a) => !a.submitted && a.observation.state === 'queued')
+          .filter((a) => (!a.submitted && a.observation.state === 'queued') || this.continuationPending(a))
           .map((a) => a.binding.sessionId),
       ),
     ];
@@ -225,6 +313,7 @@ export class CompactRequests {
         ([, a]) =>
           a.binding.sessionId === sessionId &&
           !a.submitted &&
+          a.persisted &&
           !a.delivering &&
           a.observation.state === 'queued' &&
           a.toolSucceeded &&
@@ -267,6 +356,14 @@ export class CompactRequests {
       throw new Error('The live requesting tool is unavailable, or the session has asks or queued reader input.');
     const [key, call] = live;
     if (
+      payload.continuation &&
+      (!this.persistence ||
+        !call.binding.authority ||
+        !call.binding.assignmentId ||
+        this.continuationAssignments.has(call.binding.assignmentId))
+    )
+      throw new Error('This reader assignment cannot admit another continuation.');
+    if (
       [...this.assignments.values()].some(
         (a) =>
           a.binding.sessionId === call.binding.sessionId &&
@@ -278,6 +375,7 @@ export class CompactRequests {
       throw new Error('This turn already has a pending compaction request.');
     this.calls.delete(key);
     this.consumed.add(payload.requestId);
+    if (payload.continuation) this.continuationAssignments.add(call.binding.assignmentId!);
     const acknowledgement = Object.freeze({
       requestId: payload.requestId,
       admission: 'queued' as const,
@@ -291,6 +389,19 @@ export class CompactRequests {
       toolId: call.toolId,
       submissionId: call.binding.submissionId,
       readerRevision: call.binding.readerRevision,
+      ...(payload.continuation
+        ? {
+            originWindow: this.activation,
+            continuation: {
+              ...payload.continuation,
+              state: 'waiting' as const,
+              sequence: 1,
+              reason: '',
+              write: 'not-written' as const,
+              nativeTurnId: null,
+            },
+          }
+        : {}),
     });
     this.assignments.set(payload.requestId, {
       payload: { ...payload },
@@ -304,22 +415,244 @@ export class CompactRequests {
       delivering: false,
       terminalAt: null,
       observation: { ...acknowledgement },
+      admittedAt: this.now(),
+      persisted: !payload.continuation,
     });
     return { ...acknowledgement };
   }
 
-  status(id: string): CompactObservation | null {
+  admitSaved(
+    payload: CompactPayload,
+    eligible: (binding: Readonly<CompactBinding>) => boolean,
+  ): Promise<Readonly<CompactObservation>> {
+    const pending = this.admissions.get(payload.requestId);
+    if (pending) {
+      const assignment = this.assignments.get(payload.requestId);
+      return assignment && payloadKey(assignment.payload) === payloadKey(payload)
+        ? pending
+        : Promise.reject(new Error('This compaction request ID has different arguments.'));
+    }
+    let observation: Readonly<CompactObservation>;
+    try {
+      observation = this.admit(payload, eligible);
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    const assignment = this.assignments.get(payload.requestId)!;
+    if (assignment.persisted || assignment.observation.continuation?.state !== 'waiting')
+      return Promise.resolve(observation);
+    const result = (async () => {
+      try {
+        await this.persistence!.reserve(this.receipt(assignment));
+        if (!this.readyAssignment(assignment) || !eligible(assignment.binding)) {
+          this.cancelContinuation(assignment, 'The requesting session changed before admission settled.');
+          this.change(assignment, 'cancelled', 'The requesting session changed before admission settled.');
+        } else assignment.persisted = true;
+        await this.persist(assignment);
+        return this.status(payload.requestId)!;
+      } catch {
+        this.cancelContinuation(assignment, 'The continuation could not be saved.');
+        this.change(assignment, 'refused', 'The continuation could not be saved.');
+        return this.status(payload.requestId)!;
+      }
+    })();
+    this.admissions.set(payload.requestId, result);
+    void result.then(
+      () => this.admissions.delete(payload.requestId),
+      () => this.admissions.delete(payload.requestId),
+    );
+    return result;
+  }
+
+  private readyAssignment(assignment: Assignment): boolean {
+    return (
+      !this.disposed &&
+      !assignment.toolSucceeded &&
+      !assignment.turnSucceeded &&
+      assignment.observation.state === 'queued' &&
+      this.now() < assignment.deadline
+    );
+  }
+
+  private continuationPending(assignment: Assignment): boolean {
+    return (
+      !!assignment.observation.continuation &&
+      ['waiting', 'preparing', 'attempting'].includes(assignment.observation.continuation.state)
+    );
+  }
+
+  continuationDeliverable(sessionId: string): { id: string; binding: Readonly<CompactBinding> }[] {
     this.prune();
+    return [...this.assignments]
+      .filter(
+        ([, a]) =>
+          a.binding.sessionId === sessionId &&
+          a.persisted &&
+          a.submitted &&
+          !a.delivering &&
+          a.observation.state === 'completed' &&
+          a.observation.continuation?.state === 'waiting',
+      )
+      .map(([id, a]) => ({ id, binding: a.binding }));
+  }
+
+  async continue(
+    id: string,
+    delivery: {
+      eligible(binding: Readonly<CompactBinding>, writing: boolean): boolean;
+      submit(text: string, beforeWrite: () => void): GuardedAttempt;
+    },
+  ): Promise<void> {
     const assignment = this.assignments.get(id);
-    return assignment ? { ...assignment.observation } : null;
+    if (
+      !assignment ||
+      assignment.delivering ||
+      assignment.observation.state !== 'completed' ||
+      assignment.observation.continuation?.state !== 'waiting' ||
+      !assignment.persisted
+    )
+      return;
+    const check = (writing: boolean) =>
+      !this.disposed &&
+      assignment.observation.state === 'completed' &&
+      this.continuationPending(assignment) &&
+      this.now() <
+        Math.min(assignment.admittedAt + CONTINUATION_LIMITS.assignmentMs, assignment.continuationDeadline ?? 0) &&
+      delivery.eligible(assignment.binding, writing);
+    if (!check(false)) return;
+    assignment.delivering = true;
+    let entered = false;
+    let cancelled = false;
+    try {
+      this.continuationChange(assignment, 'preparing');
+      await this.persist(assignment);
+      if (!check(false)) {
+        this.cancelContinuation(assignment, 'The session changed before continuation.');
+        return;
+      }
+      this.continuationChange(assignment, 'attempting', '', 'unknown');
+      await this.persist(assignment);
+      if (!check(false)) {
+        this.cancelContinuation(assignment, 'The session changed before continuation.');
+        return;
+      }
+      const attempt = delivery.submit(assignment.observation.continuation.text, () => {
+        if (!check(true)) {
+          cancelled = true;
+          throw new NotReady('The session changed before continuation.');
+        }
+        // Passing the callback enters the protocol-write boundary. A throwing write is still uncertain.
+        entered = true;
+        assignment.possibleWrite = true;
+      });
+      const receipt = await attempt.receipt;
+      if (cancelled || !entered)
+        this.cancelContinuation(assignment, receipt.reason || 'The continuation was not written.');
+      else
+        this.continuationChange(
+          assignment,
+          receipt.outcome === 'accepted' && !receipt.sharedTurn ? 'accepted' : 'uncertain',
+          receipt.reason,
+          receipt.outcome === 'accepted' && !receipt.sharedTurn ? 'accepted' : 'unknown',
+          receipt.nativeTurnId,
+        );
+    } catch (error) {
+      this.continuationChange(
+        assignment,
+        entered ? 'uncertain' : 'cancelled',
+        error instanceof Error ? error.message : 'Continuation is unavailable.',
+        entered ? 'unknown' : 'not-written',
+      );
+    } finally {
+      // Failure after a possible write leaves durable attempting and never permits a second input.
+      try {
+        await this.persist(assignment);
+      } catch {
+        if (entered)
+          this.continuationChange(assignment, 'uncertain', 'Continuation delivery could not be saved.', 'unknown');
+      }
+      assignment.delivering = false;
+    }
+  }
+
+  private receipt(assignment: Assignment): CompactReceipt {
+    return structuredClone({
+      version: 1,
+      owner: this.activation,
+      admittedAt: assignment.admittedAt,
+      terminalAt: assignment.terminalAt,
+      binding: assignment.binding,
+      observation: assignment.observation,
+    });
+  }
+  private persist(assignment: Assignment): Promise<void> {
+    return this.persistence!.save(this.receipt(assignment));
+  }
+  private continuationChange(
+    assignment: Assignment,
+    state: ContinuationObservation['state'],
+    reason = '',
+    write?: ContinuationObservation['write'],
+    nativeTurnId: string | null = null,
+  ): void {
+    const held = assignment.observation.continuation;
+    if (!held) return;
+    assignment.observation = {
+      ...assignment.observation,
+      continuation: { ...held, state, sequence: held.sequence + 1, reason, write: write ?? held.write, nativeTurnId },
+    };
+    if (!this.continuationPending(assignment)) assignment.terminalAt = this.now();
+  }
+  private cancelContinuation(assignment: Assignment, reason: string): void {
+    if (!this.continuationPending(assignment)) return;
+    this.continuationChange(
+      assignment,
+      assignment.possibleWrite ? 'uncertain' : 'cancelled',
+      reason,
+      assignment.possibleWrite ? 'unknown' : 'not-written',
+    );
+  }
+
+  status(id: string): CompactObservation | null {
+    const assignment = this.assignments.get(id);
+    if (
+      !assignment ||
+      (assignment.terminalAt !== null && this.now() - assignment.terminalAt >= COMPACT_LIMITS.retentionMs)
+    )
+      return null;
+    const observation = structuredClone(assignment.observation);
+    if (!assignment.submitted && observation.state === 'queued' && this.now() >= assignment.deadline) {
+      observation.state = 'cancelled';
+      observation.reason = 'The compaction request expired before it started.';
+      observation.sequence++;
+    }
+    if (
+      observation.continuation &&
+      this.continuationPending(assignment) &&
+      !assignment.delivering &&
+      this.now() >=
+        Math.min(assignment.admittedAt + CONTINUATION_LIMITS.assignmentMs, assignment.continuationDeadline ?? Infinity)
+    ) {
+      observation.continuation.state = 'cancelled';
+      observation.continuation.reason = 'The continuation request expired.';
+      observation.continuation.write = 'not-written';
+      observation.continuation.sequence++;
+    }
+    return observation;
   }
 
   // Cancels unsubmitted assignments that match. Live calls that match also lose their authority unless keepCalls is set.
   invalidate(predicate: (binding: Readonly<CompactBinding>) => boolean, reason: string, keepCalls = false): void {
     if (!keepCalls) for (const [key, call] of this.calls) if (predicate(call.binding)) this.calls.delete(key);
-    for (const assignment of this.assignments.values())
-      if (!assignment.submitted && assignment.observation.state === 'queued' && predicate(assignment.binding))
+    for (const assignment of this.assignments.values()) {
+      if (!predicate(assignment.binding)) continue;
+      const previous = assignment.observation;
+      this.cancelContinuation(assignment, reason);
+      if (!assignment.submitted && assignment.observation.state === 'queued')
         this.change(assignment, 'cancelled', reason);
+      else if (assignment.persisted && assignment.observation !== previous)
+        void this.persist(assignment).catch(() => {});
+    }
   }
 
   dispose(): void {
@@ -393,10 +726,17 @@ export class CompactRequests {
     const previous = assignment.observation.state;
     if (previous === state) return;
     if (previous === 'completed' || previous === 'failed') {
-      if (state !== 'started') this.change(assignment, 'uncertain', 'Native compaction outcomes conflict.');
+      if (state !== 'started') {
+        this.cancelContinuation(assignment, 'Native compaction outcomes conflict.');
+        this.change(assignment, 'uncertain', 'Native compaction outcomes conflict.');
+      }
       return;
     }
+    if (state === 'failed' || state === 'uncertain')
+      this.cancelContinuation(assignment, 'Native compaction did not complete conclusively.');
     this.change(assignment, state, reason);
+    if (state === 'completed' && assignment.observation.continuation)
+      assignment.continuationDeadline = this.now() + CONTINUATION_LIMITS.readyMs;
   }
 
   private change(assignment: Assignment, state: CompactState, reason: string): void {
@@ -407,9 +747,25 @@ export class CompactRequests {
       sequence: assignment.observation.sequence + 1,
     };
     assignment.terminalAt = ['completed', 'cancelled', 'refused', 'failed'].includes(state) ? this.now() : null;
+    if (state !== 'completed' && ['cancelled', 'refused', 'failed'].includes(state))
+      this.cancelContinuation(assignment, reason);
+    if (this.continuationPending(assignment)) assignment.terminalAt = null;
+    if (assignment.persisted && assignment.observation.continuation) void this.persist(assignment).catch(() => {});
   }
   private prune(): void {
     for (const [id, assignment] of this.assignments) {
+      if (
+        this.continuationPending(assignment) &&
+        !assignment.delivering &&
+        this.now() >=
+          Math.min(
+            assignment.admittedAt + CONTINUATION_LIMITS.assignmentMs,
+            assignment.continuationDeadline ?? Infinity,
+          )
+      ) {
+        this.cancelContinuation(assignment, 'The continuation request expired.');
+        if (assignment.persisted) void this.persist(assignment).catch(() => {});
+      }
       if (!assignment.submitted && assignment.observation.state === 'queued' && this.now() >= assignment.deadline)
         this.change(assignment, 'cancelled', 'The compaction request expired before it started.');
       if (assignment.terminalAt !== null && this.now() - assignment.terminalAt >= COMPACT_LIMITS.retentionMs)
@@ -508,6 +864,13 @@ export interface CompactChild {
   // True while an earlier compaction request of this child can still start or finish a turn.
   compactionUnresolved(): boolean;
   compact(beforeWrite: () => void): Promise<unknown>;
+  guardedIdle?(): string | null;
+  guardedPrompt?(
+    text: string,
+    uuid: string,
+    onSubmitted: (turn: number) => void,
+    beforeWrite: () => void,
+  ): GuardedAttempt;
 }
 
 export interface CompactHostPort<C extends CompactChild> {
@@ -517,11 +880,16 @@ export interface CompactHostPort<C extends CompactChild> {
   // Names queued reader prompts or a clear in progress as pending, and a session outside the panel's scope as absent.
   // Unavailable membership blocks delivery without cancelling the assignment.
   readerWork(sessionId: string): 'none' | 'pending' | 'absent' | 'unknown';
+  // Stable physical source, current scope, cwd and effective setup. Null means authority is unknown.
+  authority?(provider: 'claude' | 'codex', sessionId: string): string | null;
+  source?(provider: 'claude' | 'codex', sessionId: string): string | null;
+  continuationWork?(sessionId: string): 'none' | 'pending' | 'absent' | 'unknown';
 }
 
 interface Submission {
   sessionId: string | null;
   revision: number;
+  assignmentId: string;
 }
 
 const SUBMISSIONS_PER_CHILD = 32;
@@ -540,13 +908,15 @@ export class CompactHost<C extends CompactChild> {
   // True from a scope change until the panel's session rows reflect the new scope.
   private settling = false;
   private disposed = false;
+  private readonly assignments = new WeakMap<C, string>();
 
   constructor(
     private readonly activation: string,
     private readonly port: CompactHostPort<C>,
     now: () => number = Date.now,
+    private readonly persistence?: CompactPersistence,
   ) {
-    this.requests = new CompactRequests(activation, now);
+    this.requests = new CompactRequests(activation, now, COMPACT_LIMITS.records, persistence);
   }
 
   // An answer can approve the requesting command inside its own turn, so it keeps the reader
@@ -557,6 +927,13 @@ export class CompactHost<C extends CompactChild> {
       (binding) => binding.sessionId === sessionId,
       'The reader acted in this session before compaction started.',
       answer,
+    );
+  }
+
+  archived(sessionIds: ReadonlySet<string>): void {
+    this.requests.invalidate(
+      (binding) => sessionIds.has(binding.sessionId),
+      'The session was archived before continuation.',
     );
   }
 
@@ -583,14 +960,25 @@ export class CompactHost<C extends CompactChild> {
   }
 
   // Records the reader revision of a prompt the child accepted for writing.
-  submitted(child: C, turnId: number): void {
+  submitted(
+    child: C,
+    turnId: number,
+    origin: 'reader' | 'followup' | 'continuation' = 'reader',
+    assignmentId?: string,
+  ): void {
     if (this.disposed) return;
     const sessionId = child.state().sessionId;
     const book = this.submissions.get(child) ?? new Map<number, Submission>();
+    const assignment =
+      origin === 'reader'
+        ? `${this.generationOf(child)}:${turnId}`
+        : (assignmentId ?? this.assignments.get(child) ?? `${this.generationOf(child)}:${turnId}`);
+    this.assignments.set(child, assignment);
     this.submissions.set(child, book);
     book.set(turnId, {
       sessionId,
       revision: sessionId ? this.revision(sessionId) : 0,
+      assignmentId: assignment,
     });
     if (book.size > SUBMISSIONS_PER_CHILD) book.delete(book.keys().next().value!);
     this.generationOf(child);
@@ -693,17 +1081,59 @@ export class CompactHost<C extends CompactChild> {
           'The agent process ended before compaction started.',
         );
     }
+    for (const { id, binding } of this.requests.continuationDeliverable(sessionId)) {
+      const child = this.current(binding);
+      if (!child) {
+        this.requests.invalidate((current) => current === binding, 'The continuation session changed.');
+        continue;
+      }
+      if (!child.guardedPrompt || child.guardedIdle?.() !== null) continue;
+      await this.port.withActivity(child, async (live) => {
+        if (live !== child) return;
+        await this.requests.continue(id, {
+          eligible: (current, writing) =>
+            this.eligible(current, writing ? 'write' : 'deliver') &&
+            (!this.port.continuationWork || this.port.continuationWork(sessionId) === 'none') &&
+            (writing || live.guardedIdle?.() === null),
+          submit: (text, beforeWrite) =>
+            live.guardedPrompt!(
+              text,
+              randomUUID(),
+              (turn) => this.submitted(live, turn, 'continuation', binding.assignmentId),
+              beforeWrite,
+            ),
+        });
+      });
+    }
   }
 
   handle(request: { method: string; params: object }): unknown {
     const params = request.params as Record<string, unknown>;
-    if (request.method === 'compact-status')
-      return (
-        this.requests.status(String(params.requestId)) ?? {
-          requestId: params.requestId,
-          state: 'unavailable',
+    if (request.method === 'compact-status') {
+      const current = this.requests.status(String(params.requestId));
+      if (current && !current.continuation) return current;
+      const saved = this.persistence?.read(String(params.requestId));
+      const source =
+        saved && (this.port.source ?? this.port.authority)?.(saved.binding.provider, saved.binding.sessionId);
+      if (saved && source && source === saved.binding.sourceIdentity) {
+        const observation = current ?? structuredClone(saved.observation);
+        const continuation = observation.continuation!;
+        if (
+          this.persistence!.ended(saved.owner) &&
+          ['waiting', 'preparing', 'attempting'].includes(continuation.state)
+        ) {
+          continuation.state = continuation.state === 'attempting' ? 'uncertain' : 'cancelled';
+          continuation.write = continuation.state === 'uncertain' ? 'unknown' : 'not-written';
+          continuation.reason = 'The originating window ended. Continuation will not restart.';
+          continuation.sequence++;
         }
-      );
+        return { ...observation, servedByWindow: this.activation };
+      }
+      return {
+        requestId: params.requestId,
+        state: 'unavailable',
+      };
+    }
     if (request.method === 'compact-ready')
       return {
         ready: validCompactPayload(params) && this.requests.ready(params),
@@ -711,6 +1141,14 @@ export class CompactHost<C extends CompactChild> {
     try {
       if (request.method !== 'compact-request' || !validCompactPayload(params))
         throw new Error('This compaction request is unavailable in this Arc window.');
+      if (params.continuation)
+        return this.requests
+          .admitSaved(params, (binding) => this.eligible(binding, 'admit'))
+          .catch((error: unknown) => ({
+            requestId: params.requestId,
+            state: 'refused',
+            reason: error instanceof Error ? error.message : 'Compaction was refused.',
+          }));
       return this.requests.admit(params, (binding) => this.eligible(binding, 'admit'));
     } catch (error) {
       return {
@@ -724,6 +1162,7 @@ export class CompactHost<C extends CompactChild> {
   dispose(): void {
     this.disposed = true;
     this.requests.dispose();
+    this.persistence?.release();
   }
 
   private revision(sessionId: string): number {
@@ -761,6 +1200,11 @@ export class CompactHost<C extends CompactChild> {
       turn,
       submissionId: String(turnId),
       readerRevision: submission.revision,
+      assignmentId: submission.assignmentId,
+      ...(this.port.authority ? { authority: this.port.authority(provider, event.sessionId) ?? undefined } : {}),
+      ...((this.port.source ?? this.port.authority)
+        ? { sourceIdentity: (this.port.source ?? this.port.authority)!(provider, event.sessionId) ?? undefined }
+        : {}),
     };
   }
 
@@ -772,6 +1216,8 @@ export class CompactHost<C extends CompactChild> {
   private eligible(binding: Readonly<CompactBinding>, mode: 'admit' | 'deliver' | 'write'): boolean {
     const child = this.current(binding);
     if (!child) return false;
+    if (binding.authority && this.port.authority?.(binding.provider, binding.sessionId) !== binding.authority)
+      return false;
     const state = child.state();
     if (state.asks.length > 0 || this.port.readerWork(binding.sessionId) !== 'none') return false;
     if (mode === 'admit') return true;
@@ -783,6 +1229,8 @@ export class CompactHost<C extends CompactChild> {
   private current(binding: Readonly<CompactBinding>): C | null {
     if (this.disposed || this.revision(binding.sessionId) !== binding.readerRevision) return null;
     if (this.port.readerWork(binding.sessionId) === 'absent') return null;
+    const authority = this.port.authority?.(binding.provider, binding.sessionId);
+    if (binding.authority && authority && authority !== binding.authority) return null;
     const child = this.port.find(binding.provider, binding.sessionId);
     if (!child || this.generations.get(child) !== binding.childGeneration) return null;
     const state = child.state();

@@ -1,5 +1,7 @@
 import { test, vi } from 'vitest';
 import assert from 'node:assert';
+import { createHash } from 'node:crypto';
+import { CompactRequests, type CompactBinding } from './compactrequest.ts';
 import {
   CodexWire,
   SandboxMode,
@@ -170,6 +172,65 @@ test.each(['start', 'fork'])(
     }
   },
 );
+
+test('Codex foreground shell evidence admits self-compaction only while the exact requesting command runs', async () => {
+  const window = 'a'.repeat(24);
+  const text = 'Continue the assigned work.';
+  const sha256 = createHash('sha256').update(text).digest('hex');
+  const payload = {
+    requestId: `${window}:aaaaaaaa-1111-2222-3333-444444444444`,
+    window,
+    self: true as const,
+    afterTurn: true as const,
+    continuation: { text, sha256 },
+  };
+  const binding: CompactBinding = {
+    activation: window,
+    provider: 'codex',
+    sessionId: THREAD,
+    childGeneration: 1,
+    turn: TURN,
+    submissionId: 'reader',
+    readerRevision: 1,
+  };
+  const command = `arc compact request --self --after-turn --continuation-file '${process.platform === 'win32' ? 'C:/temp/next.txt' : '/tmp/next.txt'}' --continuation-sha256 ${sha256} --request-id ${payload.requestId} --window ${window} --json`;
+  for (const [source, processId, status, threadId, turnId, expected] of [
+    ['agent', null, 'inProgress', THREAD, TURN, true],
+    ['unifiedExecStartup', '123', 'inProgress', THREAD, TURN, true],
+    ['agent', '123', 'inProgress', THREAD, TURN, false],
+    ['agent', undefined, 'inProgress', THREAD, TURN, false],
+    ['unifiedExecStartup', null, 'inProgress', THREAD, TURN, false],
+    ['unifiedExecInteraction', '123', 'inProgress', THREAD, TURN, false],
+    ['userShell', null, 'inProgress', THREAD, TURN, false],
+    ['unknown', null, 'inProgress', THREAD, TURN, false],
+    ['agent', null, 'completed', THREAD, TURN, false],
+    ['agent', null, 'failed', THREAD, TURN, false],
+    ['agent', null, 'inProgress', 'foreign', TURN, false],
+    ['agent', null, 'inProgress', THREAD, 'foreign', false],
+  ] as const) {
+    const h = harness();
+    const starting = h.wire.startThread({ cwd: 'C:/ws' });
+    reply(h, { thread: { id: THREAD } });
+    await starting;
+    const book = new CompactRequests(window);
+    const item = { type: 'commandExecution', id: 'command', command, source, processId, status };
+    h.wire.receive(JSON.stringify({ method: 'item/started', params: { threadId, turnId, item } }));
+    for (const event of h.events) if (event.kind === 'native') book.observe(binding, event.event);
+    assert.equal(book.ready(payload), expected, JSON.stringify({ source, processId, status, threadId, turnId }));
+    if (expected) {
+      h.events.length = 0;
+      h.wire.receive(
+        JSON.stringify({
+          method: 'item/completed',
+          params: { threadId, turnId, item: { ...item, status: 'failed', exitCode: 1 } },
+        }),
+      );
+      for (const event of h.events) if (event.kind === 'native') book.observe(binding, event.event);
+      assert.equal(book.ready(payload), false);
+    }
+    h.wire.close('finished');
+  }
+});
 
 test('Codex native evidence requires exact thread fields and separates command exit, compaction acceptance and completion', async () => {
   const h = harness();

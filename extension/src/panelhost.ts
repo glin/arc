@@ -114,6 +114,7 @@ import {
   TRANSCRIPT_WAKE_MS,
   sameSessionRevision,
   revisionOf as fileRevisionOf,
+  supportedFileIdentity,
   revalidatedCatalog,
   replacedCatalogFiles,
   trustedListedRevisions,
@@ -2503,6 +2504,54 @@ export class PanelProvider implements vscode.Disposable {
       (source) => source.agent === agent && source.sessionId === session,
     );
     return matches.length === 1 ? matches[0].file : null;
+  }
+
+  public continuationSource(agent: 'claude' | 'codex', session: string): string | null {
+    const scope = this.readScopeKey();
+    const source = this.questionSource(agent, session);
+    const state = this.stateFor(session);
+    if (!scope || !source || !state || state.agent !== agent || this.hidden.has(session)) return null;
+    const cwd = this.cwdForSession(agent, session);
+    if (!cwd) return null;
+    try {
+      const stat = fs.lstatSync(source, { bigint: true });
+      const identity = fileRevisionOf(stat);
+      if (!stat.isFile() || stat.isSymbolicLink() || !supportedFileIdentity(identity)) return null;
+      return JSON.stringify([fs.realpathSync.native(source), identity.dev, identity.ino, fs.realpathSync.native(cwd)]);
+    } catch {
+      return null;
+    }
+  }
+
+  public continuationAuthority(agent: 'claude' | 'codex', session: string): string | null {
+    const source = this.continuationSource(agent, session);
+    const state = this.stateFor(session);
+    if (!source || !state) return null;
+    return JSON.stringify([
+      source,
+      JSON.stringify([this.folders(), this.repositoryScope.snapshot(this.folders()).roots]),
+      state.settings.selectedModel,
+      state.settings.confirmedModel,
+      state.settings.selectedEffort,
+      state.settings.confirmedEffort,
+      state.askMode,
+      state.effectiveMode,
+      state.effectivePermissionMode,
+    ]);
+  }
+
+  public continuationWork(session: string): 'none' | 'pending' | 'absent' | 'unknown' {
+    const work = this.readerWork(session);
+    if (work !== 'none') return work;
+    const facts = this.guardedTargetFacts(session);
+    if (!facts?.current) return 'unknown';
+    return facts.archived ||
+      facts.queued > 0 ||
+      facts.pendingSubmissions > 0 ||
+      facts.pendingControls > 0 ||
+      (this.stateFor(session)?.asks?.length ?? 0) > 0
+      ? 'pending'
+      : 'none';
   }
 
   private applySessionFilter(request: import('./sessionrequests').SessionRequest): Promise<unknown> {

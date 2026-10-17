@@ -13126,7 +13126,7 @@ test('archive and turn-end wiring reaches the process lifecycle owner', () => {
   );
   sourceMatch(
     extensionSource,
-    /panel\.onArchivedSessionsChange = \(sessions\) => host\.setArchived\(sessions\);\s*host\.setArchived\(panel\.archivedSessions\(\)\)/,
+    /panel\.onArchivedSessionsChange = \(sessions\) => \{\s*compaction\?\.archived\(sessions\);\s*host\.setArchived\(sessions\);\s*\};\s*host\.setArchived\(panel\.archivedSessions\(\)\)/,
     'AgentHost does not receive both restored and later archive sets',
   );
   sourceMatch(

@@ -1,4 +1,5 @@
 import { resolve } from 'node:path';
+import { validContinuation, validContinuationPath, CONTINUATION_LIMITS } from '../../extension/src/compactrequest.ts';
 import { launchPolicy } from '../../extension/src/launchpolicy.ts';
 import * as fs from 'node:fs';
 import { requestWindow, requesterIdentity } from '../../extension/src/sessionrequests.ts';
@@ -27,6 +28,30 @@ export function readPromptFile(file: string): string {
       .subarray(0, count)
       .toString('utf8')
       .replace(/^\uFEFF/, '');
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+export function readContinuationFile(file: string, sha256: string): { text: string; sha256: string } {
+  if (!validContinuationPath(file)) throw new Error('Supply an absolute continuation file path with forward slashes.');
+  const fd = fs.openSync(file, fs.constants.O_RDONLY | (process.platform === 'win32' ? 0 : fs.constants.O_NONBLOCK));
+  try {
+    if (!fs.fstatSync(fd).isFile()) throw new Error('The continuation file must be a regular file.');
+    const bytes = Buffer.alloc(CONTINUATION_LIMITS.bytes + 1);
+    let count = 0;
+    while (count < bytes.length) {
+      const read = fs.readSync(fd, bytes, count, bytes.length - count, null);
+      if (!read) break;
+      count += read;
+    }
+    const input = bytes.subarray(0, count);
+    if (input.subarray(0, 3).equals(Buffer.from([0xef, 0xbb, 0xbf])))
+      throw new Error('The continuation file must not begin with a byte-order mark.');
+    const text = new TextDecoder('utf-8', { fatal: true }).decode(input);
+    if (!validContinuation(text, sha256))
+      throw new Error('The continuation file is invalid or its SHA-256 does not match.');
+    return { text, sha256 };
   } finally {
     fs.closeSync(fd);
   }

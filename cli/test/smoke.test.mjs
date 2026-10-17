@@ -30,6 +30,7 @@ import { readSkillPayload, skillTemporaryRoots } from '../src/skillfiles.ts';
 import { operateSkill } from '../src/skills.ts';
 import { runCollect } from '../src/collect.ts';
 import { SESSION_PAGE_ERRORS } from '../../extension/src/sessionreads.ts';
+import { readContinuationFile } from '../src/manage.ts';
 
 const collectWindow = 'a'.repeat(24);
 const collectRow = (source, id = source, extra = {}) => ({
@@ -1381,6 +1382,83 @@ test('command admission requires complete help data', () => {
   }
 });
 
+test('continuation file opening refuses nonregular descriptors with platform nonblocking flags', () => {
+  const descriptor = Object.getOwnPropertyDescriptor(process, 'platform');
+  const open = mutableFs.openSync;
+  const stat = mutableFs.fstatSync;
+  const close = mutableFs.closeSync;
+  const nonblock = Object.getOwnPropertyDescriptor(mutableFs.constants, 'O_NONBLOCK');
+  try {
+    Object.defineProperty(mutableFs.constants, 'O_NONBLOCK', { value: 2048, configurable: true });
+    for (const platform of ['win32', 'linux', 'darwin']) {
+      Object.defineProperty(process, 'platform', { value: platform });
+      let closed = false;
+      mutableFs.openSync = (_file, flags) => {
+        assert.equal(flags, mutableFs.constants.O_RDONLY | (platform === 'win32' ? 0 : 2048));
+        return 123;
+      };
+      mutableFs.fstatSync = () => ({ isFile: () => false });
+      mutableFs.closeSync = (fd) => {
+        assert.equal(fd, 123);
+        closed = true;
+      };
+      syncBuiltinESMExports();
+      assert.throws(
+        () => readContinuationFile(platform === 'win32' ? 'C:/temp/next.txt' : '/tmp/next.txt', 'a'.repeat(64)),
+        /regular file/,
+      );
+      assert.equal(closed, true);
+    }
+  } finally {
+    Object.defineProperty(process, 'platform', descriptor);
+    if (nonblock) Object.defineProperty(mutableFs.constants, 'O_NONBLOCK', nonblock);
+    else delete mutableFs.constants.O_NONBLOCK;
+    Object.assign(mutableFs, { openSync: open, fstatSync: stat, closeSync: close });
+    syncBuiltinESMExports();
+  }
+});
+
+test(
+  'bundled continuation request refuses a FIFO without a writer',
+  { skip: process.platform === 'win32' },
+  async () => {
+    const home = mkdtempSync(join(realpathSync(tmpdir()), 'arc-compact-fifo-'));
+    const file = join(home, 'next.txt');
+    try {
+      execFileSync('mkfifo', [file]);
+      await assert.rejects(
+        promisify(execFile)(
+          process.execPath,
+          [
+            cli,
+            'compact',
+            'request',
+            '--self',
+            '--after-turn',
+            '--continuation-file',
+            file,
+            '--continuation-sha256',
+            'a'.repeat(64),
+            '--request-id',
+            'a'.repeat(24) + ':aaaaaaaa-1111-2222-3333-444444444444',
+            '--window',
+            'a'.repeat(24),
+            '--json',
+          ],
+          { env: smokeEnv, timeout: 3000 },
+        ),
+        (error) => {
+          assert.equal(error.killed, false);
+          assert.match(error.stderr, /regular file/);
+          return true;
+        },
+      );
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  },
+);
+
 test('bundled self compaction uses read-only readiness, one admission and observation without retries', async () => {
   const home = mkdtempSync(join(realpathSync(tmpdir()), 'arc compact smoke '));
   const channel = new WindowChannel(home);
@@ -1428,6 +1506,43 @@ test('bundled self compaction uses read-only readiness, one admission and observ
       { env },
     );
     assert.equal(requests.at(-1).method, 'compact-status');
+    const continuationFile = join(home, 'next turn.txt').replaceAll('\\', '/');
+    const continuation = '  Continue "once".\r\nWrite café.\r\n';
+    writeFileSync(continuationFile, continuation);
+    const digest = createHash('sha256').update(continuation).digest('hex');
+    const continuationArgs = [
+      ...args.slice(0, 5),
+      '--continuation-file',
+      continuationFile,
+      '--continuation-sha256',
+      digest,
+      ...args.slice(5),
+    ];
+    assert.equal(JSON.parse((await run(process.execPath, continuationArgs, { env })).stdout).state, 'queued');
+    assert.deepEqual(requests.at(-1).params.continuation, { text: continuation, sha256: digest });
+    const originalWindow = 'b'.repeat(24);
+    await run(
+      process.execPath,
+      [
+        cli,
+        'compact',
+        'status',
+        '--request-id',
+        originalWindow + ':aaaaaaaa-1111-2222-3333-444444444444',
+        '--window',
+        channel.hostId,
+        '--json',
+      ],
+      { env },
+    );
+    assert.equal(requests.at(-1).params.requestId.startsWith(originalWindow), true);
+    const beforeInvalid = requests.length;
+    writeFileSync(continuationFile, 'changed');
+    await assert.rejects(run(process.execPath, continuationArgs, { env }));
+    assert.equal(requests.length, beforeInvalid);
+    writeFileSync(continuationFile, Buffer.from([0xc3, 0x28]));
+    await assert.rejects(run(process.execPath, continuationArgs, { env }));
+    assert.equal(requests.length, beforeInvalid);
     const before = requests.length;
     for (const extra of ['--session', '--background', '--self'])
       await assert.rejects(run(process.execPath, [...args, extra], { env }));

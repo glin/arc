@@ -108,6 +108,7 @@ import { ConfigWatches } from './configwatch';
 import { WindowChannel } from './sessionrequests';
 import { reportWindowTransport, windowTransportErrorCode, type WindowTransportSink } from './windowpipe';
 import { CompactHost } from './compactrequest';
+import { CompactStore } from './compactstore';
 import {
   GuardedSends,
   guardedChannelSend,
@@ -663,11 +664,21 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   panel.onDispatchEvidence = () => dispatch.reconcileAll();
   const activation = channel?.windowId;
   if (channel && activation) {
-    const owner = new CompactHost<AgentSession>(activation, {
-      find: (provider, sessionId) => host.find(provider, sessionId),
-      withActivity: (child, work) => host.withActivity(child.key, work),
-      readerWork: (sessionId) => panel.readerWork(sessionId),
-    });
+    const owner = new CompactHost<AgentSession>(
+      activation,
+      {
+        find: (provider, sessionId) => host.find(provider, sessionId),
+        withActivity: (child, work) => host.withActivity(child.key, work),
+        readerWork: (sessionId) => panel.readerWork(sessionId),
+        continuationWork: (sessionId) => panel.continuationWork(sessionId),
+        authority: (provider, sessionId) => panel.continuationAuthority(provider, sessionId),
+        source: (provider, sessionId) => panel.continuationSource(provider, sessionId),
+      },
+      Date.now,
+      context.storageUri
+        ? new CompactStore(path.join(context.storageUri.fsPath, 'continuations'), activation)
+        : undefined,
+    );
     compaction = owner;
     panel.onReaderAction = (session, answer) => owner.readerAction(session, answer);
     panel.onScopeChange = (outOfScope) => owner.scopeChanged(outOfScope);
@@ -677,7 +688,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   }
   panel.onBackgroundWorkDetected = (session, commands, children) =>
     host.retainBackgroundWork(session.agent, session.sessionId, commands, children);
-  panel.onArchivedSessionsChange = (sessions) => host.setArchived(sessions);
+  panel.onArchivedSessionsChange = (sessions) => {
+    compaction?.archived(sessions);
+    host.setArchived(sessions);
+  };
 
   host.setArchived(panel.archivedSessions());
   context.subscriptions.push(
@@ -1660,7 +1674,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   );
   // A guarded write registers its submission like ordinary delivery, so a deferred compaction its turn requests binds.
   const guardedPort = guardedDeliveryPort(guardedSends, host, activeWriterFailure, randomUUID, (child, turnId) =>
-    compaction?.submitted(child, turnId),
+    compaction?.submitted(child, turnId, 'followup'),
   );
   // Read Codex context from the panel's source. Read Claude context only through the current live child for this session.
   panel.contextSource = (agent, sessionId) => {

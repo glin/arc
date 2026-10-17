@@ -1539,9 +1539,9 @@ export class CodexWire {
             toolId,
             command: str(item.command)!,
             foreground:
-              item.source === 'unifiedExecStartup' &&
-              typeof item.processId === 'string' &&
-              item.status === 'inProgress',
+              item.status === 'inProgress' &&
+              ((item.source === 'agent' && item.processId === null) ||
+                (item.source === 'unifiedExecStartup' && typeof item.processId === 'string')),
           },
         });
     }
