@@ -8,6 +8,7 @@ import { promisify } from 'node:util';
 import { WINDOW_PIPE_SOURCE } from './windowpipe-source.ts';
 
 let bridge: Promise<PipeBridge> | null = null;
+let currentBridge: PipeBridge | null = null;
 let executable: Promise<string> | null = null;
 let nextId = 0;
 
@@ -206,6 +207,7 @@ class PipeSocket extends Duplex {
   constructor(
     readonly id: number,
     private readonly owner: PipeBridge,
+    readonly serverId?: number,
   ) {
     super();
   }
@@ -226,27 +228,58 @@ export class WindowsPipeServer extends EventEmitter {
   pid = 0;
   private owner: PipeBridge | null = null;
   private ended = false;
+  private acquiring: Promise<PipeBridge> | null = null;
+  private cancelListen: (() => void) | null = null;
+  private startup: Promise<void> | null = null;
+  private disposal: Promise<void> | null = null;
   constructor(private readonly diagnostics?: WindowTransportSink) {
     super();
   }
   async listen(address: string): Promise<void> {
-    const owner = await getBridge(this.diagnostics);
-    if (this.ended) return;
+    const owner = await (this.acquiring = getBridge(this.diagnostics));
+    if (this.ended) {
+      owner.release();
+      throw new Error('The Arc window channel is unavailable.');
+    }
     this.owner = owner;
-    this.pid = owner.child.pid!;
     owner.servers.set(this.id, this);
     owner.retain();
+    let settled!: () => void;
+    this.startup = new Promise<void>((resolve) => {
+      settled = resolve;
+    });
     await new Promise<void>((resolve, reject) => {
-      this.once('listening', resolve);
-      this.once('error', reject);
+      const listening = () => {
+        cleanup();
+        if (!this.ended) this.pid = owner.child.pid!;
+        resolve();
+      };
+      const failed = (error: Error) => {
+        cleanup();
+        reject(error);
+      };
+      const cleanup = () => {
+        this.removeListener('listening', listening);
+        this.removeListener('error', failed);
+        this.cancelListen = null;
+        settled();
+      };
+      // Public cancellation preserves the native outcome needed to order listener retirement.
+      this.cancelListen = () => reject(new Error('The Arc window channel is unavailable.'));
+      this.once('listening', listening);
+      this.once('error', failed);
       owner.send(`listen:${this.id}:${Buffer.from(address).toString('base64')}`);
     });
   }
-  close(): void {
+  close(): Promise<void> {
+    if (this.disposal) return this.disposal;
     this.ended = true;
-    this.owner?.servers.delete(this.id);
-    this.owner?.send(`close:${this.id}`);
-    this.owner?.release();
+    this.cancelListen?.();
+    return (this.disposal = (async () => {
+      const owner = this.owner ?? (await this.acquiring?.catch(() => null));
+      await this.startup;
+      if (owner) await owner.retire(this.id);
+    })());
   }
 }
 
@@ -255,11 +288,19 @@ export class PipeBridge {
   readonly servers = new Map<number, WindowsPipeServer>();
   private pending = '';
   private released = false;
+  private dead = false;
+  private closed = false;
+  private readonly closing = new Map<number, () => void>();
+  private readonly childClosed: Promise<void>;
+  private resolveClosed!: () => void;
   private readonly reasons = new Set<WindowTransportReason>();
   constructor(
     readonly child: ChildProcessWithoutNullStreams,
     private diagnostics?: WindowTransportSink,
   ) {
+    this.childClosed = new Promise((resolve) => {
+      this.resolveClosed = resolve;
+    });
     child.stdout.setEncoding('utf8');
     child.stdout.on('data', (chunk: string) => {
       this.pending += chunk;
@@ -275,14 +316,18 @@ export class PipeBridge {
           this.report('listenerError', { serverId: id });
           server?.emit('error', new Error('The Arc window channel is unavailable.'));
         } else if (parts[0] === 'accept') {
-          const accepted = new PipeSocket(Number(parts[2]), this);
+          const accepted = new PipeSocket(Number(parts[2]), this, id);
           this.sockets.set(accepted.id, accepted);
           if (server) server.emit('connection', accepted);
           else accepted.destroy();
         } else if (parts[0] === 'open') socket?.emit('connect');
         else if (parts[0] === 'data') {
           if (socket && !socket.push(Buffer.from(parts[2], 'base64'))) socket.destroy();
-        } else if (parts[0] === 'close') socket?.destroy();
+        } else if (parts[0] === 'close') {
+          socket?.destroy();
+          this.closing.get(id)?.();
+          this.closing.delete(id);
+        }
       }
       if (this.pending.length > 100_000) {
         this.report('stdoutOverflow', { stdoutCharacters: this.pending.length });
@@ -299,6 +344,10 @@ export class PipeBridge {
     });
     child.on('close', (exitCode, signal) => {
       this.report('childClose', { exitCode, signal });
+      this.closed = true;
+      this.resolveClosed();
+      for (const resolve of this.closing.values()) resolve();
+      this.closing.clear();
       this.failed();
     });
     child.stdin.on('error', (error) => {
@@ -311,6 +360,25 @@ export class PipeBridge {
   }
   retain(): void {
     this.released = false;
+  }
+  async retire(serverId: number): Promise<void> {
+    this.servers.delete(serverId);
+    const pending: Promise<void>[] = [];
+    for (const socket of this.sockets.values()) {
+      if (socket.serverId !== serverId) continue;
+      if (!this.closed) pending.push(new Promise((resolve) => this.closing.set(socket.id, resolve)));
+      socket.destroy();
+    }
+    if (!this.closed && !this.dead && !this.released) this.send(`close:${serverId}`);
+    this.release();
+    if (this.released || this.dead) await this.childClosed;
+    else {
+      // A rejected connect acknowledges consumption of the preceding close command.
+      const id = ++nextId;
+      const consumed = new Promise<void>((resolve) => this.closing.set(id, resolve));
+      this.send(`connect:${id}::0:0::1`);
+      await Promise.all([...pending, consumed]);
+    }
   }
   private report(reason: WindowTransportReason, fields: TransportFields = {}): void {
     if (reason !== 'release' && this.reasons.has(reason)) return;
@@ -342,17 +410,24 @@ export class PipeBridge {
         this.released = true;
         this.report('release');
       }
-      bridge = null;
+      this.detach();
       this.child.stdin.end();
     }
   }
   private failed(): void {
+    this.dead = true;
+    this.detach();
+    if (!this.closed) this.child.kill();
     if (!this.servers.size && !this.sockets.size) return;
-    bridge = null;
     for (const socket of this.sockets.values()) socket.destroy();
     for (const server of this.servers.values())
       server.emit('error', new Error('The Arc window channel is unavailable.'));
     this.servers.clear();
+  }
+  private detach(): void {
+    if (currentBridge !== this) return;
+    currentBridge = null;
+    bridge = null;
   }
 }
 
@@ -361,7 +436,9 @@ async function getBridge(diagnostics?: WindowTransportSink): Promise<PipeBridge>
   executable ??= fs.existsSync(packaged) ? Promise.resolve(packaged) : compileWindowsPipe(diagnostics);
   bridge ??= executable.then((file) => {
     try {
-      return new PipeBridge(spawn(file, [], { windowsHide: true, stdio: 'pipe' }), diagnostics);
+      const owner = new PipeBridge(spawn(file, [], { windowsHide: true, stdio: 'pipe' }), diagnostics);
+      currentBridge = owner;
+      return owner;
     } catch (error) {
       reportWindowTransport(diagnostics, 'setupRejected', {
         stage: 'spawn',
@@ -370,13 +447,16 @@ async function getBridge(diagnostics?: WindowTransportSink): Promise<PipeBridge>
       throw error;
     }
   });
+  const pending = bridge;
   try {
-    const owner = await bridge;
+    const owner = await pending;
     owner.observe(diagnostics);
     return owner;
   } catch (error) {
-    bridge = null;
-    executable = null;
+    if (bridge === pending) {
+      bridge = null;
+      executable = null;
+    }
     throw error;
   }
 }

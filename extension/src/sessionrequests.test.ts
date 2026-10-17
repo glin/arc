@@ -16,6 +16,7 @@ import * as crypto from 'node:crypto';
 import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { Duplex, PassThrough } from 'node:stream';
 import { EventEmitter } from 'node:events';
+import { buildSync } from 'esbuild';
 import {
   WindowsPipeServer,
   PipeBridge,
@@ -2044,7 +2045,7 @@ test('an endpoint without server knowledge receives no token or requester', asyn
     assert.equal(inputs.length, 1);
   } finally {
     for (const socket of sockets) socket.destroy();
-    if (server instanceof WindowsPipeServer) server.close();
+    if (server instanceof WindowsPipeServer) await server.close();
     else await new Promise<void>((resolve) => server.close(() => resolve()));
   }
 });
@@ -2367,7 +2368,7 @@ test('channel setup rejection retains error and disposal evidence before registr
   assert.equal(JSON.stringify(records).includes('private-registration'), false);
 });
 
-test('channel listener failure records its classified error before disposal and leaves diagnostics failure harmless', async () => {
+test('channel listener failure records its classified error and leaves diagnostics failure harmless', async () => {
   const { channel, file } = await fixture();
   const records: WindowTransportRecord[] = [];
   channel.setDiagnostics((_event, record) => {
@@ -2378,13 +2379,452 @@ test('channel listener failure records its classified error before disposal and 
   assert.doesNotThrow(() => server.emit('error', Object.assign(new Error('secret'), { code: 'EIO' })));
   await channel.dispose();
   assert.deepEqual(
-    records.slice(0, 2).map((record) => record.reason),
+    records
+      .filter((record) => record.reason === 'channelError' || record.reason === 'channelDispose')
+      .map((record) => record.reason),
     ['channelError', 'channelDispose'],
   );
   assert.equal(records[0].errorCode, 'EIO');
   assert.equal(fs.existsSync(file), false);
   assert.equal(JSON.stringify(records).includes('secret'), false);
 });
+
+// These cases keep clocks controlled while exercising the activation's publication and disposal boundaries.
+async function recoveryFixture(pending = false) {
+  const descriptor = Object.getOwnPropertyDescriptor(process, 'platform')!;
+  Object.defineProperty(process, 'platform', { ...descriptor, value: 'win32' });
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+  const servers: WindowsPipeServer[] = [];
+  const ready: (() => void)[] = [];
+  const listen = vi.spyOn(WindowsPipeServer.prototype, 'listen').mockImplementation(function (this: WindowsPipeServer) {
+    servers.push(this);
+    return new Promise<void>((resolve) => {
+      const acknowledge = () => {
+        this.pid = 1000 + servers.indexOf(this);
+        resolve();
+      };
+      ready.push(acknowledge);
+      if (!pending) acknowledge();
+    });
+  });
+  const close = vi.spyOn(WindowsPipeServer.prototype, 'close').mockResolvedValue();
+  const home = tempDir('window-recovery-');
+  const channel = new WindowChannel(home);
+  const file = path.join(home, 'hosts', `${channel.hostId}.json`);
+  const started = channel.update(state);
+  if (!pending) await started;
+  const settle = async () => {
+    await (channel as unknown as { retirement: Promise<void> }).retirement;
+  };
+  return {
+    channel,
+    file,
+    servers,
+    ready,
+    started,
+    close,
+    settle,
+    fail: () => servers.at(-1)!.emit('error', new Error('Fixture listener unavailable')),
+    finish: async () => {
+      for (const acknowledge of ready) acknowledge();
+      await channel.dispose();
+      listen.mockRestore();
+      close.mockRestore();
+      vi.useRealTimers();
+      Object.defineProperty(process, 'platform', descriptor);
+    },
+  };
+}
+
+test('one activation replaces failed listeners with bounded retries and ignores obsolete errors', async () => {
+  const f = await recoveryFixture();
+  try {
+    const entry = JSON.parse(fs.readFileSync(f.file, 'utf8')) as HostRegistration;
+    for (const [index, delay] of [100, 500, 2000].entries()) {
+      f.fail();
+      await f.settle();
+      await vi.advanceTimersByTimeAsync(delay - 1);
+      assert.equal(f.servers.length, index + 1);
+      await vi.advanceTimersByTimeAsync(1);
+      assert.equal(f.servers.length, index + 2);
+      const next = JSON.parse(fs.readFileSync(f.file, 'utf8')) as HostRegistration;
+      assert.equal(next.hostId, entry.hostId);
+      assert.equal(next.token, entry.token);
+      assert.equal(next.address, entry.address);
+      assert.equal(next.transportPid, 1001 + index);
+      f.servers[index].emit('error', new Error('Obsolete listener'));
+      const obsolete = new PassThrough();
+      f.servers[index].emit('connection', obsolete);
+      assert.equal(obsolete.destroyed, true);
+      await f.settle();
+      assert.equal(JSON.parse(fs.readFileSync(f.file, 'utf8')).transportPid, next.transportPid);
+    }
+    f.fail();
+    await f.settle();
+    assert.equal(f.channel.windowId, null);
+    await f.channel.dispose();
+    assert.equal(fs.existsSync(f.file), false);
+    await vi.advanceTimersByTimeAsync(100_000);
+    assert.equal(f.servers.length, 4);
+    assert.equal(vi.getTimerCount(), 0);
+  } finally {
+    await f.finish();
+  }
+});
+
+test('thirty continuously healthy seconds reset recovery and disposal cancels a queued retry', async () => {
+  const f = await recoveryFixture();
+  try {
+    f.fail();
+    await f.settle();
+    await vi.advanceTimersByTimeAsync(100);
+    await vi.advanceTimersByTimeAsync(29_999);
+    f.fail();
+    await f.settle();
+    await vi.advanceTimersByTimeAsync(499);
+    assert.equal(f.servers.length, 2);
+    await vi.advanceTimersByTimeAsync(1);
+    await vi.advanceTimersByTimeAsync(30_000);
+    f.fail();
+    await f.settle();
+    await vi.advanceTimersByTimeAsync(100);
+    assert.equal(f.servers.length, 4);
+    f.fail();
+    await f.settle();
+    await f.channel.dispose();
+    await vi.advanceTimersByTimeAsync(100_000);
+    assert.equal(f.servers.length, 4);
+    assert.equal(vi.getTimerCount(), 0);
+    assert.equal(fs.existsSync(f.file), false);
+  } finally {
+    await f.finish();
+  }
+});
+
+test('pending listener publication retains updates and read capability without publishing an obsolete PID', async () => {
+  const f = await recoveryFixture(true);
+  try {
+    const updated = f.channel.update({ ...state, panelReady: true });
+    f.channel.setGuardedReadHandler(async () => ({ status: 'refused' }) as never);
+    assert.equal(fs.existsSync(f.file), false);
+    f.ready[0]();
+    await Promise.all([f.started, updated]);
+    assert.equal(JSON.parse(fs.readFileSync(f.file, 'utf8')).panelReady, true);
+    assert.ok(JSON.parse(fs.readFileSync(f.file, 'utf8')).capabilities.includes('sessionRead'));
+    f.fail();
+    await f.settle();
+    await vi.advanceTimersByTimeAsync(100);
+    const before = fs.readFileSync(f.file, 'utf8');
+    const update = f.channel.update({ ...state, panelVisible: true });
+    f.channel.setGuardedReadHandler(async () => ({ status: 'refused' }) as never);
+    assert.equal(fs.readFileSync(f.file, 'utf8'), before);
+    const disposed = f.channel.dispose();
+    f.ready[1]();
+    await Promise.all([disposed, update]);
+    assert.equal(fs.existsSync(f.file), false);
+    assert.equal(vi.getTimerCount(), 0);
+  } finally {
+    await f.finish();
+  }
+});
+
+test('replacement waits for retirement and disposal before initial acknowledgement prevents resurrection', async () => {
+  const f = await recoveryFixture(true);
+  try {
+    const disposed = f.channel.dispose();
+    f.ready[0]();
+    await Promise.all([disposed, f.started]);
+    await vi.advanceTimersByTimeAsync(100_000);
+    assert.equal(f.servers.length, 1);
+    assert.equal(fs.existsSync(f.file), false);
+    assert.equal(vi.getTimerCount(), 0);
+  } finally {
+    await f.finish();
+  }
+  const g = await recoveryFixture();
+  let retired!: () => void;
+  g.close.mockImplementationOnce(
+    () =>
+      new Promise<void>((resolve) => {
+        retired = resolve;
+      }),
+  );
+  try {
+    g.fail();
+    await vi.advanceTimersByTimeAsync(100_000);
+    assert.equal(g.servers.length, 1);
+    retired();
+    await g.settle();
+    await vi.advanceTimersByTimeAsync(100);
+    assert.equal(g.servers.length, 2);
+  } finally {
+    retired?.();
+    await g.finish();
+  }
+});
+
+test.skipIf(process.platform !== 'win32')(
+  'disposal during native listener submission leaves no listener while a shared peer stays reachable',
+  async () => {
+    const peer = await fixture();
+    const channel = new WindowChannel(tempDir('window-startup-disposal-'));
+    channels.push(channel);
+    const server = (channel as unknown as { windowsServer: WindowsPipeServer }).windowsServer;
+    const address = (channel as unknown as { address: string }).address;
+    const file = (channel as unknown as { registryFile: string }).registryFile;
+    const send = PipeBridge.prototype.send;
+    let disposal: Promise<void> | undefined;
+    const submission = vi.spyOn(PipeBridge.prototype, 'send').mockImplementation(function (
+      this: PipeBridge,
+      line: string,
+      callback?: (error?: Error | null) => void,
+    ) {
+      send.call(this, line, callback);
+      if (line.startsWith(`listen:${server.id}:`)) disposal = channel.dispose();
+    });
+    const replacement = new WindowsPipeServer();
+    replacement.on('error', () => {});
+    try {
+      await channel.update(state);
+      assert.ok(disposal, 'Disposal did not run at native listen submission');
+      await disposal;
+      assert.equal(channel.windowId, null);
+      assert.equal(server.pid, 0);
+      assert.equal(fs.existsSync(file), false);
+      await vi.waitFor(
+        async () => {
+          const socket = net.createConnection(address);
+          const outcome = await new Promise<string>((resolve) => {
+            socket.once('connect', () => resolve('connected'));
+            socket.once('error', () => resolve('unavailable'));
+          });
+          socket.destroy();
+          assert.equal(outcome, 'unavailable', 'Disposed native listener still accepts connections');
+        },
+        { timeout: 5_000 },
+      );
+      await replacement.listen(address);
+      assert.equal(replacement.pid, peer.entry.transportPid);
+      assert.equal((await pingWindow(peer.entry, 500, peer.file))?.hostId, peer.channel.hostId);
+    } finally {
+      submission.mockRestore();
+      await channel.dispose();
+      await replacement.close();
+      await peer.channel.dispose();
+      assert.throws(() => process.kill(peer.entry.transportPid!, 0));
+    }
+  },
+);
+
+test.skipIf(process.platform !== 'win32')(
+  'a listener failure retires its connected clients while another helper owner remains reachable',
+  async () => {
+    const first = await fixture();
+    const other = await fixture();
+    const socket = await connect(first.entry.address);
+    const disconnected = closed(socket);
+    await vi.waitFor(() => assert.equal((first.channel as unknown as { sockets: Set<Duplex> }).sockets.size, 1));
+    const server = (first.channel as unknown as { windowsServer: WindowsPipeServer }).windowsServer;
+    server.emit('error', new Error('Fixture listener unavailable'));
+    await disconnected;
+    await vi.waitFor(
+      async () => assert.equal((await pingWindow(first.entry, 500, first.file))?.hostId, first.channel.hostId),
+      { timeout: 10_000 },
+    );
+    assert.equal((await pingWindow(other.entry, 500, other.file))?.hostId, other.channel.hostId);
+    assert.equal(JSON.parse(fs.readFileSync(first.file, 'utf8')).transportPid, other.entry.transportPid);
+  },
+);
+
+test.each(['linux', 'darwin'] as const)(
+  '%s listener replacement retains current state and removes its owned socket on disposal',
+  async (platform) => {
+    const descriptor = Object.getOwnPropertyDescriptor(process, 'platform')!;
+    const servers: (EventEmitter & {
+      listening: boolean;
+      listen: (address: string, ready: () => void) => void;
+      close: (done: () => void) => void;
+    })[] = [];
+    const create = vi.spyOn(network, 'createServer').mockImplementation(() => {
+      let address = '';
+      const server = Object.assign(new EventEmitter(), {
+        listening: false,
+        listen: (target: string, ready: () => void) => {
+          address = target;
+          fs.writeFileSync(address, '');
+          server.listening = true;
+          queueMicrotask(ready);
+        },
+        close: (done: () => void) => {
+          server.listening = false;
+          fs.unlinkSync(address);
+          queueMicrotask(done);
+        },
+      });
+      servers.push(server);
+      return server as unknown as net.Server;
+    });
+    syncBuiltinESMExports();
+    Object.defineProperty(process, 'platform', { ...descriptor, value: platform });
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    const home = tempDir('window-posix-recovery-');
+    const channel = new WindowChannel(home);
+    const file = path.join(home, 'hosts', `${channel.hostId}.json`);
+    try {
+      await channel.update(state);
+      const original = JSON.parse(fs.readFileSync(file, 'utf8')) as HostRegistration;
+      servers[0].emit('error', new Error('Fixture listener unavailable'));
+      await channel.update({ ...state, panelVisible: true });
+      await vi.advanceTimersByTimeAsync(100);
+      assert.equal(servers.length, 2);
+      assert.equal(servers[0].listening, false);
+      const current = JSON.parse(fs.readFileSync(file, 'utf8')) as HostRegistration;
+      assert.equal(current.token, original.token);
+      assert.equal(current.hostId, original.hostId);
+      assert.equal(current.panelVisible, true);
+      assert.equal(current.transportPid, undefined);
+      await channel.dispose();
+      assert.equal(fs.existsSync(file), false);
+      assert.equal(fs.existsSync(original.address), false);
+      assert.equal(vi.getTimerCount(), 0);
+    } finally {
+      await channel.dispose();
+      create.mockRestore();
+      syncBuiltinESMExports();
+      vi.useRealTimers();
+      Object.defineProperty(process, 'platform', descriptor);
+    }
+  },
+);
+
+test.skipIf(process.platform !== 'win32')(
+  'an external authenticated caller regains the same activation after helper loss without replaying an accepted write',
+  async () => {
+    const { channel, home, file, entry } = await fixture();
+    const oldServer = (channel as unknown as { windowsServer: WindowsPipeServer }).windowsServer;
+    const oldOwner = (oldServer as unknown as { owner: PipeBridge }).owner;
+    const directory = tempDir('window-recovery-client-');
+    const script = path.join(directory, 'client.cjs');
+    buildSync({
+      stdin: {
+        contents: `import { discoverWindows, requestWindow } from './sessionrequests.ts';
+          import { WindowsPipeServer } from './windowpipe.ts';
+          const bridgePids = new Set();
+          const connect = WindowsPipeServer.connect;
+          WindowsPipeServer.connect = async (...args) => {
+            const socket = await connect(...args); bridgePids.add(socket.owner.child.pid); return socket;
+          };
+          process.on('message', async ({ id, method, home, hostId, requestId, params }) => {
+            try {
+              const data = method === 'discover' ? await discoverWindows(home) : await requestWindow(method, params, hostId, home, requestId);
+              process.send({id, data, bridgePids: [...bridgePids]});
+            } catch (error) { process.send({id, error: error.message, bridgePids: [...bridgePids]}); }
+          });`,
+        resolveDir: __dirname,
+        loader: 'ts',
+      },
+      bundle: true,
+      platform: 'node',
+      format: 'cjs',
+      outfile: script,
+      logLevel: 'silent',
+    });
+    const client = spawn(process.execPath, [script], {
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+      windowsHide: true,
+      env: { ...process.env, CLAUDE_CODE_SESSION_ID: '', CODEX_THREAD_ID: '' },
+    });
+    const ended = new Promise<void>((resolve) => client.once('close', () => resolve()));
+    let sequence = 0;
+    const clientBridges = new Set<number>();
+    const responses = new Map<number, { data?: any; error?: string }>();
+    client.on('message', (value: { id: number; data?: unknown; error?: string; bridgePids?: number[] }) => {
+      responses.set(value.id, value);
+      for (const pid of value.bridgePids ?? []) clientBridges.add(pid);
+    });
+    const send = (method: string, params = {}, requestId?: string) => {
+      const id = ++sequence;
+      client.send({ id, method, home, hostId: channel.hostId, params, requestId });
+      return id;
+    };
+    const response = async (id: number) => {
+      await vi.waitFor(() => assert.ok(responses.has(id)), { timeout: 15_000 });
+      return responses.get(id)!;
+    };
+    let writes = 0;
+    let release!: () => void;
+    channel.setRequestHandler(async () => {
+      writes++;
+      await new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      return { status: 'accepted', sessionId: 'surviving-write' };
+    });
+    const params = {
+      prompt: 'recover',
+      agentRun: false,
+      setup: { kind: 'custom', agent: 'codex', model: '', effort: '', permissionMode: '' },
+    };
+    const requestId = channel.hostId + ':recovery';
+    let replacementPid = 0;
+    try {
+      const discovered = await response(send('discover'));
+      assert.equal(discovered.data.windows[0].hostId, channel.hostId);
+      const accepted = send('start', params, requestId);
+      await vi.waitFor(() => assert.equal(writes, 1));
+      process.kill(entry.transportPid!);
+      const disconnected = await response(accepted);
+      assert.equal(disconnected.data.status, 'unknown');
+      await vi.waitFor(
+        () => {
+          const current = JSON.parse(fs.readFileSync(file, 'utf8')) as HostRegistration;
+          assert.notEqual(current.transportPid, entry.transportPid);
+          assert.equal(current.hostId, entry.hostId);
+          assert.equal(current.token, entry.token);
+          assert.equal(current.address, entry.address);
+          replacementPid = current.transportPid!;
+        },
+        { timeout: 15_000 },
+      );
+      const rediscovered = await response(send('discover'));
+      assert.equal(rediscovered.data.windows[0].hostId, channel.hostId);
+      const retry = send('start', params, requestId);
+      release();
+      assert.equal((await response(retry)).data.sessionId, 'surviving-write');
+      assert.equal(writes, 1);
+      oldOwner.child.emit('close', 0, null);
+      oldOwner.release();
+      const peer = await fixture();
+      assert.equal(peer.entry.transportPid, replacementPid, 'Obsolete bridge callbacks detached the current helper');
+      await peer.channel.dispose();
+      await channel.dispose();
+      assert.equal(fs.existsSync(file), false);
+      assert.throws(() => process.kill(replacementPid, 0));
+      assert.throws(() => process.kill(entry.transportPid!, 0));
+    } finally {
+      release?.();
+      await channel.dispose();
+      client.kill();
+      await ended;
+      await vi.waitFor(
+        () => {
+          for (const pid of clientBridges) assert.throws(() => process.kill(pid, 0));
+        },
+        { timeout: 5_000 },
+      );
+      console.info(
+        'Window recovery fixture resources',
+        JSON.stringify({
+          clientPid: client.pid,
+          initialPid: entry.transportPid,
+          replacementPid,
+          clientBridgePids: [...clientBridges],
+          disposed: true,
+        }),
+      );
+    }
+  },
+);
 
 function nativeFixture(source: string) {
   const directory = tempDir('window-native-');
@@ -2904,7 +3344,7 @@ test('ping identifies Claude and Codex requesters and leaves an absent requester
   } finally {
     vi.unstubAllEnvs();
     for (const socket of sockets) socket.destroy();
-    if (server instanceof WindowsPipeServer) server.close();
+    if (server instanceof WindowsPipeServer) await server.close();
     else await new Promise<void>((resolve) => server.close(() => resolve()));
   }
 });
@@ -2944,7 +3384,7 @@ test('constructor failure leaves an activation spawner without a foreign window 
   }
 });
 
-test('activation spawners clear their window target after asynchronous startup and later channel failures', async () => {
+test('activation spawners retain their activation target through recoverable startup and later channel failures', async () => {
   for (const failure of ['directory', 'listener-start', 'publish-start', 'listener-later', 'publish-later']) {
     const home = tempDir('window-failed-target-');
     const original = network.createServer;
@@ -2998,7 +3438,7 @@ test('activation spawners clear their window target after asynchronous startup a
       else server!.emit('error', new Error('Listener unavailable'));
     }
     spawner('unused', [], '.', {});
-    assert.deepEqual(targets, [channel.hostId, undefined], failure);
+    assert.deepEqual(targets, [channel.hostId, channel.hostId], failure);
     await channel.dispose();
   }
 });

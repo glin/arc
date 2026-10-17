@@ -397,8 +397,14 @@ export class WindowChannel {
   private readonly address: string;
   private readonly registryFile: string;
   private readonly sockets = new Set<Duplex>();
-  private readonly server: net.Server;
-  private readonly windowsServer: WindowsPipeServer | null;
+  private server!: net.Server;
+  private windowsServer: WindowsPipeServer | null = null;
+  private generation = 0;
+  private failedGeneration = -1;
+  private retirement: Promise<void> = Promise.resolve();
+  private retry: ReturnType<typeof setTimeout> | null = null;
+  private healthy: ReturnType<typeof setTimeout> | null = null;
+  private replacements = 0;
   private state: WindowState | null = null;
   private registeredBytes: string | null = null;
   private listening = false;
@@ -446,31 +452,41 @@ export class WindowChannel {
   ) {
     this.address = hostAddress(home, this.hostId);
     this.registryFile = path.join(home, 'hosts', `${this.hostId}.json`);
-    this.server = net.createServer((socket) => this.accept(socket));
+    this.createTransport();
+  }
+
+  private createTransport(): void {
+    const generation = ++this.generation;
+    this.server = net.createServer((socket) => this.accept(socket, generation));
     this.windowsServer =
       process.platform === 'win32' ? new WindowsPipeServer((event, record) => this.diagnostics?.(event, record)) : null;
-    this.windowsServer?.on('connection', (socket: Duplex) => this.accept(socket));
-    this.windowsServer?.on('error', (error: Error) => this.server.emit('error', error));
+    const server = this.server;
+    this.windowsServer?.on('connection', (socket: Duplex) => this.accept(socket, generation));
+    this.windowsServer?.on('error', (error: Error) => server.emit('error', error));
     this.server.on('error', (error) => {
+      if (generation !== this.generation || this.closed) return;
       reportWindowTransport(this.diagnostics, 'channelError', { errorCode: windowTransportErrorCode(error) });
-      void this.dispose();
+      this.failTransport(generation);
     });
   }
 
   // The provider calls update only after it restores saved state.
   async update(state: WindowState): Promise<void> {
     if (this.closed) return Promise.resolve();
+    const generation = this.generation;
     try {
       this.state = { ...state, folders: [...state.folders] };
       if (this.listening) {
         this.publish();
         return;
       }
-      if (!this.starting) this.starting = this.listen();
+      if (this.retry || this.failedGeneration === this.generation) return;
+      if (!this.starting) this.startTransport();
       await this.starting;
     } catch (error) {
+      if (this.closed) return;
       reportWindowTransport(this.diagnostics, 'channelSetupRejected', { errorCode: windowTransportErrorCode(error) });
-      void this.dispose();
+      this.failTransport(generation);
       throw error;
     }
   }
@@ -498,7 +514,7 @@ export class WindowChannel {
   }
 
   private publish(): void {
-    if (this.closed || !this.state) return;
+    if (this.closed || !this.state || !this.listening) return;
     const registration: HostRegistration = {
       ...this.info(),
       address: this.address,
@@ -519,35 +535,93 @@ export class WindowChannel {
     this.registeredBytes = bytes;
   }
 
-  private async listen(): Promise<void> {
+  private startTransport(): void {
+    const generation = this.generation;
+    const starting = this.listen(generation).finally(() => {
+      if (this.starting === starting) this.starting = null;
+    });
+    this.starting = starting;
+  }
+
+  private async listen(generation: number): Promise<void> {
     privateDirectory(path.dirname(this.registryFile));
     if (process.platform !== 'win32') privateDirectory(path.dirname(this.address));
     if (this.windowsServer) {
       await this.windowsServer.listen(this.address);
-      this.listening = true;
     } else {
       await new Promise<void>((resolve, reject) => {
         const failed = (error: Error) => reject(error);
         this.server.once('error', failed);
         this.server.listen(this.address, () => {
           this.server.removeListener('error', failed);
-          this.listening = true;
           resolve();
         });
       });
     }
-    if (this.closed) return;
-    try {
-      if (process.platform !== 'win32') fs.chmodSync(this.address, 0o600);
-      this.publish();
-    } catch (error) {
-      void this.dispose();
-      throw error;
-    }
+    if (this.closed || generation !== this.generation || this.failedGeneration === generation) return;
+    this.listening = true;
+    if (process.platform !== 'win32') fs.chmodSync(this.address, 0o600);
+    this.publish();
+    this.healthy = setTimeout(() => {
+      this.healthy = null;
+      if (!this.closed && generation === this.generation && this.listening) this.replacements = 0;
+    }, 30_000);
+    this.healthy.unref?.();
   }
 
-  private accept(socket: Duplex): void {
-    if (this.closed || this.sockets.size >= this.limits.connections) {
+  private failTransport(generation: number): void {
+    if (this.closed || generation !== this.generation || this.failedGeneration === generation) return;
+    this.failedGeneration = generation;
+    this.listening = false;
+    if (this.healthy) clearTimeout(this.healthy);
+    this.healthy = null;
+    const server = this.server;
+    const windows = this.windowsServer;
+    const starting = this.starting;
+    for (const socket of this.sockets) socket.destroy();
+    this.retirement = this.retireTransport(server, windows, starting);
+    void this.retirement.then(() => {
+      if (this.closed || generation !== this.generation) return;
+      const delay = [100, 500, 2000][this.replacements];
+      if (delay === undefined) {
+        void this.dispose();
+        return;
+      }
+      this.replacements++;
+      this.retry = setTimeout(() => {
+        this.retry = null;
+        if (this.closed || generation !== this.generation) return;
+        this.createTransport();
+        this.startTransport();
+        void this.starting!.catch((error) => {
+          if (this.closed) return;
+          reportWindowTransport(this.diagnostics, 'channelSetupRejected', {
+            errorCode: windowTransportErrorCode(error),
+          });
+          this.failTransport(this.generation);
+        });
+      }, delay);
+      this.retry.unref?.();
+    });
+  }
+
+  private async retireTransport(
+    server: net.Server,
+    windows: WindowsPipeServer | null,
+    starting: Promise<void> | null,
+  ): Promise<void> {
+    if (windows) await windows.close();
+    await starting?.catch(() => {});
+    if (!windows && server.listening) await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+
+  private accept(socket: Duplex, generation: number): void {
+    if (
+      this.closed ||
+      generation !== this.generation ||
+      this.failedGeneration === generation ||
+      this.sockets.size >= this.limits.connections
+    ) {
       socket.on('error', () => {});
       socket.destroy();
       return;
@@ -716,16 +790,18 @@ export class WindowChannel {
     if (this.disposal) return this.disposal;
     reportWindowTransport(this.diagnostics, 'channelDispose', { sockets: this.sockets.size });
     this.closed = true;
+    this.listening = false;
+    if (this.retry) clearTimeout(this.retry);
+    if (this.healthy) clearTimeout(this.healthy);
+    this.retry = this.healthy = null;
     for (const socket of this.sockets) socket.destroy();
     this.disposal = this.close();
     return this.disposal;
   }
 
   private async close(): Promise<void> {
-    // A submitted listener must finish before its channel can close.
-    await this.starting?.catch(() => {});
-    if (this.windowsServer) this.windowsServer.close();
-    else if (this.listening) await new Promise<void>((resolve) => this.server.close(() => resolve()));
+    await this.retireTransport(this.server, this.windowsServer, this.starting);
+    await this.retirement;
     removeOwnedRegistration(this.registryFile, this.registeredBytes, this.address, this.home, true, this.diagnostics);
     this.server.removeAllListeners();
   }
