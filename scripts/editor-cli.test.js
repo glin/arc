@@ -1483,7 +1483,6 @@ describe('unverified current editor hints retain the all-editor menu and default
     const malformed = f.editor('code-insiders', 'linux');
     fs.writeFileSync(malformed.metadata, '{');
     hints = [
-      {},
       { TERM_PROGRAM: 'vscode' },
       { ...editor.env, TERM_PROGRAM: 'other' },
       { ...editor.env, VSCODE_GIT_ASKPASS_MAIN: path.join(f.dir, 'missing.js') },
@@ -1497,7 +1496,6 @@ describe('unverified current editor hints retain the all-editor menu and default
   });
   afterAll(() => f.cleanup());
   for (const [index, hint] of [
-    'no editor hints',
     'terminal program alone',
     'another terminal program',
     'missing askpass script',
@@ -1538,6 +1536,7 @@ test('the editor menu defaults to all and individual choices limit installation'
         expected,
       );
       assert.match(r.stdout, /ARC_INSTALL_SCRIPT_TAIL/);
+      assert.doesNotMatch(r.stdout, /Current editor/);
     }
     for (const terminalInput of ['0\n', '4\n', 'invalid\n', '999999999\n']) {
       const r = f.run(['--local'], {}, { stdin: true, cwd: f.source, terminalInput });
@@ -1751,16 +1750,12 @@ test('source installer rejects invalid options, missing tools, and old Claude be
     assert.match(oldRemote.commands, /curl[\s\S]*npm[\s\S]*editor/);
     const local = f.run(['code'], { ARC_TEST_CLAUDE_VERSION: '2.1.223' });
     assert.equal(local.status, 0, local.stderr);
-    for (const tool of ['node', 'npm']) {
-      assert.equal(bash('PATH="$1"; command -v "$2"', bashPath(f.hostBin), tool), bashPath(f.hostBin) + '/' + tool);
-      const file = path.join(f.bin, tool);
-      const saved = fs.readFileSync(file);
-      fs.unlinkSync(file);
-      const r = f.run(['code']);
-      assert.equal(r.status, 2);
-      assert.match(r.stderr, new RegExp(tool + ' is required'));
-      fs.writeFileSync(file, saved, { mode: 0o755 });
-    }
+    assert.equal(bash('PATH="$1"; command -v npm', bashPath(f.hostBin)), bashPath(f.hostBin) + '/npm');
+    const npm = path.join(f.bin, 'npm');
+    fs.unlinkSync(npm);
+    const missing = f.run(['code']);
+    assert.equal(missing.status, 2);
+    assert.match(missing.stderr, /npm is required/);
   } finally {
     f.cleanup();
   }

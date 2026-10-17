@@ -502,6 +502,7 @@ describe('disposable probe packaging and evidence', () => {
     fs.symlinkSync(target, link, 'junction');
     try {
       const session = editor.createRun({ scratch: selected, list: () => [] });
+      assert.deepEqual(editor.readManifest(session.layout.root), session.manifest);
       const evidence = (session.manifest.evidence = `${session.layout.root}-evidence`);
       const relative = path.join('user-data', 'logs', 'exthost.log');
       const log = path.join(session.layout.root, relative);
@@ -965,22 +966,6 @@ describe('isolated editor launch', () => {
       canonical.mockRestore();
       mkdir.mockRestore();
     }
-  });
-
-  test('keeps explicit scratch physical and preserves run manifests and cleanup', async () => {
-    const parent = scratch();
-    const session = editor.createRun({ scratch: parent, list: () => [] });
-    assert.equal(path.dirname(session.layout.root), fs.realpathSync(parent));
-    assert.deepEqual(editor.readManifest(session.layout.root), session.manifest);
-    session.manifest.evidence = `${session.layout.root}-evidence`;
-    editor.writeManifest(session.layout, session.manifest);
-    const report = await editor.cleanupRun(session.manifest, { list: () => [] });
-    assert.equal(report.ok, true, report.errors.join('\n'));
-    assert.equal(fs.existsSync(session.layout.root), false);
-    assert.equal(
-      JSON.parse(fs.readFileSync(path.join(report.evidence.directory, 'run.json'))).profile,
-      session.layout.userData,
-    );
   });
 
   test('refuses oversized explicit macOS scratch before making a run', () => {

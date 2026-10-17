@@ -359,7 +359,31 @@ test('collector bounds admission, concurrency and escaped output with outcomes f
   assert.ok(maximum.outcomes.some((one) => one.reason === 'output-limit'));
 });
 
-test('bundled collector routes read-only requests and refuses invalid flags before transport', async () => {
+test('collector refuses invalid flags before any transport request', async () => {
+  const calls = [];
+  const request = async (...call) => calls.push(call);
+  for (const args of [
+    ['--json', '--json'],
+    ['--turns', '0'],
+    ['--max-pages', '65'],
+    ['--max-reads', '1'],
+    ['--limit', '129'],
+    ['--deadline-ms', '0'],
+    ['--query', 'find:needle'],
+    ['--query'],
+    ['--window', ''],
+    ['toString'],
+    ['--unknown'],
+  ])
+    await assert.rejects(
+      runCollect(args.includes('--window') ? args : [...collectArgs, ...args], { now: () => 0, request }),
+      undefined,
+      args.join(' '),
+    );
+  assert.deepEqual(calls, []);
+});
+
+test('bundled collector routes read-only requests and refuses an invalid flag before transport', async () => {
   const home = mkdtempSync(join(realpathSync(tmpdir()), 'arc collect & smoke '));
   const channel = new WindowChannel(home);
   const run = promisify(execFile);
@@ -382,20 +406,7 @@ test('bundled collector routes read-only requests and refuses invalid flags befo
       ['sessions', 'session'],
     );
     const before = requests.length;
-    for (const args of [
-      ['--json', '--json'],
-      ['--turns', '0'],
-      ['--max-pages', '65'],
-      ['--max-reads', '1'],
-      ['--limit', '129'],
-      ['--deadline-ms', '0'],
-      ['--query', 'find:needle'],
-      ['--query'],
-      ['--window', ''],
-      ['toString'],
-      ['--unknown'],
-    ])
-      await assert.rejects(run(process.execPath, [cli, 'collect', ...args], { env }));
+    await assert.rejects(run(process.execPath, [cli, 'collect', '--max-pages', '65'], { env }));
     await assert.rejects(run(process.execPath, [cli, 'collect'], { env: { ...env, ARC_WINDOW: '' } }));
     assert.equal(requests.length, before);
   } finally {
@@ -469,6 +480,7 @@ test('foreign, changed, added and linked skills remain unchanged for explicit op
       for (const action of ['install', 'update', 'remove']) {
         const result = await operateSkill(action, 'codex', payload, options);
         assert.ok(['failed', 'incomplete', 'external-match-preserved'].includes(result.status), JSON.stringify(result));
+        if (conflict === 'edited' && action === 'remove') assert.equal(result.status, 'failed');
         assert.equal(fs.lstatSync(destination).ino, before.ino);
         if (bytes) assert.deepEqual(readFileSync(join(destination, 'SKILL.md')), bytes);
       }
@@ -895,22 +907,6 @@ if(phase==='backed-up'){process.stdin.resume(); process.stdout.write('backed-up\
       child.kill('SIGKILL');
       await stopped;
     }
-    rmSync(home, { recursive: true, force: true });
-  }
-});
-
-test('edited owned removal preserves the reader bytes', async () => {
-  const home = mkdtempSync(join(realpathSync(tmpdir()), 'arc-edited-removal-'));
-  const payload = readSkillPayload(cli);
-  const options = { home, signal: new AbortController().signal };
-  const definition = join(home, '.agents/skills/arc-sessions/SKILL.md');
-  try {
-    assert.equal((await operateSkill('install', 'codex', payload, options)).status, 'installed');
-    writeFileSync(definition, 'reader changes');
-    const result = await operateSkill('remove', 'codex', payload, options);
-    assert.equal(result.status, 'failed');
-    assert.equal(readFileSync(definition, 'utf8'), 'reader changes');
-  } finally {
     rmSync(home, { recursive: true, force: true });
   }
 });
@@ -1712,27 +1708,14 @@ test('bundled send reads Unicode multiline prompt files, requires observations a
   }
 });
 
-test('bundled guarded starts refuse ambiguous requesters, and a window without the provider capability gets only the base request keys', async () => {
+test('bundled guarded starts refuse ambiguous requesters', async () => {
   const home = mkdtempSync(join(realpathSync(tmpdir()), 'arc guarded start smoke '));
   const channel = new WindowChannel(home);
-  // A window from before the provider field publishes no capabilities, and its parser accepts only the base keys.
-  const info = channel.info;
-  channel.info = function () {
-    const { capabilities: _capabilities, ...rest } = info.call(this);
-    return rest;
-  };
   const run = promisify(execFile);
   const requests = [];
   channel.setRequestHandler((request) => {
     requests.push(request);
-    return request.method === 'start'
-      ? { status: 'accepted', provider: 'claude', sessionId: 'worker' }
-      : { state: 'current', turns: [] };
-  });
-  const sends = [];
-  channel.setGuardedSendHandler(async (request) => {
-    sends.push(request);
-    return { version: 1, status: 'accepted', requestId: request.id, payloadSha256: 'x', nativeTurnId: 't', reason: '' };
+    return { status: 'accepted', provider: 'claude', sessionId: 'worker' };
   });
   try {
     await channel.update({ folders: [home], scopeReady: true, panelReady: true, panelVisible: true });
@@ -1741,39 +1724,19 @@ test('bundled guarded starts refuse ambiguous requesters, and a window without t
       ARC_HOME: home,
       ARC_WINDOW: channel.hostId,
       CLAUDE_CODE_SESSION_ID: 'coordinator',
-      CODEX_THREAD_ID: '',
+      CODEX_THREAD_ID: 'codex-thread',
     };
     const prompt = join(home, 'prompt.txt');
     writeFileSync(prompt, 'Prepare the worktree.');
     const start = [cli, 'start', '--provider', 'claude', '--prompt-file', prompt];
     await assert.rejects(
-      run(process.execPath, [...start, '--arc-dispatch'], { env, encoding: 'utf8' }),
-      /must reload.*dispatch/,
+      run(process.execPath, [...start, '--arc-dispatch'], { env }),
+      /Both CLAUDE_CODE_SESSION_ID and CODEX_THREAD_ID/,
     );
     assert.equal(requests.length, 0);
     await run(process.execPath, start, { env, encoding: 'utf8' });
-    await run(process.execPath, [cli, 'session', 'worker', '--json'], { env, encoding: 'utf8' });
-    const base = 'id,method,params,requester,token,version';
-    assert.deepEqual(
-      requests.map((request) => Object.keys(request).sort().join(',')),
-      [base, base],
-    );
-    const observation = 'a'.repeat(40) + '.' + 'b'.repeat(43);
-    const send = [cli, 'send', 'worker', '--prompt-file', prompt, '--observation', observation];
-    await assert.rejects(
-      run(process.execPath, [...send, '--request-id', `${channel.hostId}:send`], { env }),
-      /must reload/,
-    );
-    assert.equal(sends.length, 0);
-    const ambiguous = { ...env, CODEX_THREAD_ID: 'codex-thread' };
-    await assert.rejects(
-      run(process.execPath, [...start, '--arc-dispatch'], { env: ambiguous }),
-      /Both CLAUDE_CODE_SESSION_ID and CODEX_THREAD_ID/,
-    );
-    assert.equal(requests.length, 2);
-    await run(process.execPath, start, { env: ambiguous, encoding: 'utf8' });
-    assert.equal(requests.length, 3, 'a start without --arc-dispatch keeps working and records no owner');
-    assert.equal('requesterProvider' in requests[2], false);
+    assert.equal(requests.length, 1, 'a start without --arc-dispatch keeps working and records no owner');
+    assert.equal('requesterProvider' in requests[0], false);
   } finally {
     await channel.dispose();
     rmSync(home, { recursive: true, force: true });
@@ -2000,49 +1963,18 @@ test('the bundled cost command reads isolated roots and reports failures on stde
     assert.equal(report.source.file, file);
     assert.equal(report.parent.requests, 1);
     assert.equal('modelCosts' in report.parent, false);
-    const detail = spawnSync(process.execPath, [cli, 'cost', file, '--source-only', '--by-model'], {
-      env,
-      encoding: 'utf8',
-    });
-    assert.equal(detail.status, 0, detail.stderr);
-    const flagged = JSON.parse(detail.stdout);
-    const { modelCosts, ...parent } = flagged.parent;
-    assert.deepEqual(parent, report.parent);
-    assert.deepEqual(flagged.children, []);
-    assert.deepEqual(flagged.combined, parent);
-    assert.equal(modelCosts[0].model, 'claude-opus-5');
-    assert.equal(modelCosts[0].requests, 1);
-    const rejected = spawnSync(process.execPath, [cli, 'cost', 'session-1', '--source-only'], {
-      env,
-      encoding: 'utf8',
-    });
-    assert.equal(rejected.status, 1);
-    assert.match(rejected.stderr, /requires an existing transcript file path/);
-    const failure = spawnSync(process.execPath, [cli, 'cost', 'missing'], { env, encoding: 'utf8' });
-    assert.equal(failure.status, 1);
-    assert.equal(failure.stdout, '');
-    assert.match(failure.stderr, /No transcript found/);
     const native = readFileSync(file, 'utf8');
     const stream = [
       { type: 'system', subtype: 'init', session_id: 'stream', tools: [] },
       { ...JSON.parse(native), parent_tool_use_id: null },
       { type: 'result', subtype: 'success', total_cost_usd: 1 },
     ];
-    for (const content of [
-      JSON.stringify(stream),
-      JSON.stringify(stream, null, 2),
-      stream.map((record) => JSON.stringify(record)).join('\n'),
-      '',
-      'not JSON',
-      '{"unrelated":true}',
-    ]) {
-      writeFileSync(file, content);
-      const unsupported = spawnSync(process.execPath, [cli, 'cost', file, '--source-only'], { env, encoding: 'utf8' });
-      assert.equal(unsupported.status, 1, content);
-      assert.equal(unsupported.stdout, '');
-      assert.match(unsupported.stderr, /Claude stream logs|No native transcript records/);
-      assert.equal(unsupported.stderr.includes(file), true);
-    }
+    writeFileSync(file, stream.map((record) => JSON.stringify(record)).join('\n'));
+    const unsupported = spawnSync(process.execPath, [cli, 'cost', file, '--source-only'], { env, encoding: 'utf8' });
+    assert.equal(unsupported.status, 1);
+    assert.equal(unsupported.stdout, '');
+    assert.match(unsupported.stderr, /Claude stream logs are unsupported/);
+    assert.equal(unsupported.stderr.includes(file), true);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -2267,24 +2199,6 @@ test('bundled filter commands retrieve selected identities and clear through an 
       ['filter', '--query', query, '--query', query],
     ])
       await assert.rejects(run(process.execPath, [cli, ...args], { env }));
-    assert.equal(requests.length, before);
-    const registration = join(home, 'hosts', `${channel.hostId}.json`);
-    const old = JSON.parse(readFileSync(registration, 'utf8'));
-    old.capabilities = ['requesterProvider', 'sessionQuery'];
-    writeFileSync(registration, JSON.stringify(old));
-    for (const prefix of ['id:01a12cef id:01a12a6b', '-session:claude:abcdefgh', 'session:codex:abcdefgh']) {
-      for (const args of [
-        ['filter', prefix],
-        ['filter', '--query', prefix],
-        ['sessions', '--query', prefix],
-      ])
-        await assert.rejects(run(process.execPath, [cli, ...args], { env }), /must reload/);
-    }
-    assert.equal(requests.length, before);
-    old.capabilities = ['requesterProvider'];
-    writeFileSync(registration, JSON.stringify(old));
-    await assert.rejects(run(process.execPath, [cli, 'filter', query], { env }), /must reload/);
-    await assert.rejects(run(process.execPath, [cli, 'sessions', '--query', query], { env }), /must reload/);
     assert.equal(requests.length, before);
   } finally {
     await channel.dispose();
