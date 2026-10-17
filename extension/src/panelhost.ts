@@ -8142,21 +8142,24 @@ export class PanelProvider implements vscode.Disposable {
       }
       const admissionCandidates = all;
       const admissionSelection = selectedOnly ? this.selectionGeneration : undefined;
-      all = await this.prepareHumanPrompts(
-        all,
-        false,
-        controller.signal,
-        humanPromptWork,
-        generation,
-        admissionSelection,
-      );
-      if (
-        controller.signal.aborted ||
-        generation !== this.refreshGeneration ||
-        (selectedOnly && admissionSelection !== this.selectionGeneration)
-      )
-        return;
-      if (this.catalog && !selectedOnly) this.catalog = { ...this.catalog, sessions: all };
+      // Without repository scope, a catalog refresh keeps the held catalog and reaches the scope check in the same turn.
+      if (selectedOnly || this.repositoryScopeReady) {
+        all = await this.prepareHumanPrompts(
+          all,
+          false,
+          controller.signal,
+          humanPromptWork,
+          generation,
+          admissionSelection,
+        );
+        if (
+          controller.signal.aborted ||
+          generation !== this.refreshGeneration ||
+          (selectedOnly && admissionSelection !== this.selectionGeneration)
+        )
+          return;
+        if (this.catalog && !selectedOnly) this.catalog = { ...this.catalog, sessions: all };
+      }
       if (selectedOnly) {
         const admission = new Set(all.map((session) => session.file));
         const admits = (session: SessionFile): boolean =>

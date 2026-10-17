@@ -2527,7 +2527,7 @@ test('two visible hosts accept their own concurrent selected windows while a lat
   const secondId = 'second-native';
   const secondFile = path.join(path.dirname(fixture.file), `${secondId}.jsonl`);
   fs.writeFileSync(secondFile, fixture.opening(secondId));
-  const provider = completeDiscoveryHarness(undefined, true, [], {
+  const provider = completeDiscoveryHarness(undefined, true, ['progressiveCurrent'], {
     projectsRoot: () => fixture.projects,
     codexSessionsRoot: () => fixture.codex,
   });
@@ -2556,8 +2556,22 @@ test('two visible hosts accept their own concurrent selected windows while a lat
       }),
   };
   provider.authoritativeCatalog = [
-    { file: fixture.file, sessionId: fixture.sessionId, agent: 'claude', cwd: fixture.worktree, activity: 2 },
-    { file: secondFile, sessionId: secondId, agent: 'claude', cwd: fixture.worktree, activity: 1 },
+    {
+      file: fixture.file,
+      sessionId: fixture.sessionId,
+      agent: 'claude',
+      cwd: fixture.worktree,
+      activity: 2,
+      ...provider.revisionOf({ file: fixture.file }),
+    },
+    {
+      file: secondFile,
+      sessionId: secondId,
+      agent: 'claude',
+      cwd: fixture.worktree,
+      activity: 1,
+      ...provider.revisionOf({ file: secondFile }),
+    },
   ];
   provider.dispatchDiscoveryPending = true;
   const first = provider.completeSelectedWindow(fixture.sessionId, 0);
@@ -4375,6 +4389,7 @@ test('a subagent the worker hands over after the first render names its parent',
       reference('parent', 'd4e5f6'),
     ];
     provider.claudeChildren = paired ? children.map((row) => ({ ...row })) : [];
+    provider.catalog = { sessions: [...parents, ...children] };
     return Promise.resolve(true);
   };
   const last = () => provider.messages.at(-1);
@@ -6377,7 +6392,7 @@ test('stale selected work retries without a new selection', async () => {
 });
 
 test('poll and watcher refresh paths leave selected work running through completion', async () => {
-  const provider = completeDiscoveryHarness(undefined, true);
+  const provider = completeDiscoveryHarness(undefined, true, ['progressiveCurrent']);
   const selected = {
     file: 'selected.jsonl',
     sessionId: 'selected',

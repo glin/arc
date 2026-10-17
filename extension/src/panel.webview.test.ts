@@ -3281,6 +3281,7 @@ test('refresh human admission shares read and source allowances and resumes canc
     humanScans: new Map(),
     refreshGeneration: 0,
     authoritativeCatalog: null,
+    repositoryScopeReady: true,
     prepareHumanPrompts: prepare,
     allSessions(_reuse: boolean, deferred: boolean) {
       assert.equal(deferred, true);
