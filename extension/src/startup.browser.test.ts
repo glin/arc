@@ -401,6 +401,7 @@ test.for([
         await page.evaluate((value) => window.postMessage(value, '*'), message);
       },
       hasHumanPrompt: () => true,
+      humanScans: new Map(),
       activityFor: () => 1,
       updateSessionSpendSources() {},
       pruneDerivedTitles: () => false,
@@ -650,6 +651,7 @@ test('exhausted sources complete the session list through repeated full source c
         return posted;
       },
       hasHumanPrompt: () => true,
+      humanScans: new Map(),
       activityFor: () => 1,
       updateSessionSpendSources() {},
       pruneDerivedTitles: () => false,
