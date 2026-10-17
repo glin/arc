@@ -12554,7 +12554,7 @@ export class PanelProvider implements vscode.Disposable {
     for (const sessionId of selectedSessions) {
       const held = this.history.get(sessionId);
       if (held) {
-        this.history.set(sessionId, { ...held, usedAt: now });
+        held.usedAt = now;
       }
     }
     const entries = [...this.history.values()].map((held) => ({

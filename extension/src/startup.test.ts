@@ -12140,3 +12140,92 @@ test('finite delegated reads publish the startup catalog while repeated catalog 
     fs.rmSync(directory, { recursive: true, force: true });
   }
 });
+
+test.each(['selected', 'background'] as const)(
+  'a %s retained refresh settles after rendering updates history recency',
+  async (lane) => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(100001);
+    try {
+      for (const change of ['recency', 'pages', 'removal']) {
+        const requests: ProgressiveRequest[] = [];
+        let provider: any;
+        provider = selectedWindowHarness(
+          async (request, generation) => {
+            requests.push(request);
+            assert.equal(request.kind, 'retained');
+            return {
+              generation,
+              revision: provider.revisionOf(provider.session),
+              value: {
+                kind: 'retained',
+                pages: [
+                  {
+                    turns: [turn({ sessionId: 'selected', summary: 'Refreshed response' })],
+                    compactions: [],
+                    bytes: 40,
+                  },
+                ],
+              },
+            };
+          },
+          ['trimOlderHistory', 'prepareProgressive'],
+        );
+        provider.structural = 'current';
+        if (lane === 'background') provider.showing = 'other';
+        const revision = provider.revisionOf(provider.session);
+        provider.cache.set(provider.session.file, {
+          key: transcriptReadCacheKey(provider.session, 40, 1024, []),
+          agentKey: '',
+          revision,
+          read: { turns: [], compactions: [], readBytes: 10, turnLimitReached: false },
+        });
+        provider.history.set(
+          'selected',
+          loadedHistory(revision, [
+            { turns: [turn({ sessionId: 'selected', summary: 'Old response' })], compactions: [], bytes: 40 },
+          ]),
+        );
+        const refresh = () =>
+          lane === 'selected'
+            ? provider.completeSelectedWindow('selected', 1)
+            : provider.prepareProgressive([provider.session], 1, new AbortController().signal);
+        const pending = refresh();
+        vi.setSystemTime(100002);
+        provider.trimOlderHistory([provider.session]);
+        if (change === 'pages') {
+          provider.history.set('selected', {
+            ...provider.history.get('selected'),
+            pages: [{ turns: [turn({ sessionId: 'selected', summary: 'New page' })], compactions: [], bytes: 40 }],
+          });
+        } else if (change === 'removal') {
+          provider.dropOlderHistory('selected');
+        }
+        await pending;
+        if (change === 'recency') {
+          assert.equal(
+            provider.history.get('selected').pages[0].turns[0].summary,
+            'Refreshed response',
+            'rendering discarded the refreshed response',
+          );
+          assert.equal(provider.history.get('selected').usedAt, 100002, 'acceptance discarded the rendered recency');
+          await refresh();
+          assert.equal(requests.length, 1, 'an unchanged render repeated retained work');
+        } else {
+          assert.equal(
+            provider.historyStructuralKeys.has('selected'),
+            false,
+            'replaced history accepted the old dependency key',
+          );
+          assert.equal(
+            provider.history.get('selected')?.pages[0].turns[0].summary,
+            change === 'pages' ? 'New page' : undefined,
+            'the earlier reply replaced newer history',
+          );
+        }
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  },
+);

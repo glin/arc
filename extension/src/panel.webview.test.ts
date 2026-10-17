@@ -19737,8 +19737,13 @@ test('older pages survive an append, and go when the file or the budget says so'
   );
   sourceMatch(
     body,
-    /this\.history\.set\(sessionId, \{ \.\.\.held, usedAt: now \}\);/,
-    'rendering a selected session does not update retained-history recency',
+    /held\.usedAt = now;/,
+    'rendering a selected session does not update retained-history recency in place',
+  );
+  sourceDoesNotMatch(
+    body,
+    /this\.history\.set\(sessionId, \{ \.\.\.held,/,
+    'rendering a selected session replaces retained-history state',
   );
   const admission = panelHostSource.slice(
     panelHostSource.indexOf('private updateHistoryAfterAcceptedWindow('),
