@@ -741,9 +741,7 @@ export class CodexStatCache {
   }
 }
 
-// What the cold pass hands the first catalog walk: the rollouts it walked, and whether it read a
-// row the stored opening records lacked. The walk lists from `walked`, so a startup walks the
-// rollout tree once.
+// The cold pass supplies traversal evidence and paths to its refresh, plus whether it read missing opening records.
 export interface ColdOpeningPass {
   enumeration: SourceEnumeration;
   walked: string[];

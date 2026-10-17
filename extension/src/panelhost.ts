@@ -1297,9 +1297,6 @@ export class PanelProvider implements vscode.Disposable {
   private codexColdReads: (() => Promise<ColdOpeningPass>) | null = () =>
     coldOpeningPass(this.codexMetas, codexSessionsRoot());
   private codexPriming: Promise<ColdOpeningPass> | null = null;
-  // The cold pass's rollout paths, consumed by the next `allSessions` call.
-  private codexWalk: string[] | null = null;
-  private codexWalkEnumeration?: SourceEnumeration;
   private sourceEnumerations?: { claude: SourceEnumeration; codex: SourceEnumeration };
   private membershipCoverage?: SessionCoverage;
   private physicalCoverage?: { claude: SessionCoverage; codex: SessionCoverage };
@@ -8067,7 +8064,7 @@ export class PanelProvider implements vscode.Disposable {
     const targetedRefreshPaths = this.targetedRefreshPaths;
     let controller: AbortController | null = null;
     let primed = false;
-    let primedWalk: string[] | undefined;
+    let primedEnumeration: SourceEnumeration | undefined;
     let generation = this.refreshGeneration;
     try {
       if (!this.anyVisible()) {
@@ -8088,8 +8085,7 @@ export class PanelProvider implements vscode.Disposable {
         this.codexPriming = coldReads();
         try {
           const pass = await this.codexPriming;
-          primedWalk = pass.walked;
-          this.codexWalkEnumeration = pass.enumeration;
+          primedEnumeration = pass.enumeration;
           // Mark cold-pass metadata for persistence because its reads precede the catalog's revision comparison.
           if (pass.read) {
             this.derivedCacheCheckpointState.markChanged(true);
@@ -8120,8 +8116,9 @@ export class PanelProvider implements vscode.Disposable {
         }, CATALOG_REFRESH_DEADLINE_MS);
       }
       const catalogStarted = performance.now();
-      this.codexWalk = primedWalk ?? null;
-      let all = selectedOnly ? (this.authoritativeCatalog ?? []) : this.allSessions(reuseCatalog, true);
+      let all = selectedOnly
+        ? (this.authoritativeCatalog ?? [])
+        : this.allSessions(reuseCatalog, true, primedEnumeration);
       const humanPromptWork = { bytes: 0, sources: 0, reads: 0, unknown: new Set<string>() };
       if (
         selectedOnly &&
@@ -10077,9 +10074,11 @@ export class PanelProvider implements vscode.Disposable {
   }
 
   // Enumerate Claude and Codex sessions in repository scope. Accepted metadata supplies the catalog's recorded-activity order.
-  private allSessions(reuseCatalog = false, deferHumanPrompts = false): SessionFile[] {
-    const codexWalk = this.codexWalk ?? undefined;
-    this.codexWalk = null;
+  private allSessions(
+    reuseCatalog = false,
+    deferHumanPrompts = false,
+    codexEnumeration?: SourceEnumeration,
+  ): SessionFile[] {
     const workspaceFolders = this.folders();
     const scope = this.repositoryScope.snapshot(workspaceFolders);
     this.repositoryScopeReady = scope.ready;
@@ -10135,13 +10134,23 @@ export class PanelProvider implements vscode.Disposable {
         return sorted;
       }
     }
+    return this.walkedSessions(scope.roots, workspaceFolders, folderPrint, deferHumanPrompts, codexEnumeration);
+  }
+
+  private walkedSessions(
+    roots: string[],
+    workspaceFolders: string[],
+    folderPrint: string,
+    deferHumanPrompts: boolean,
+    codexEnumeration?: SourceEnumeration,
+  ): SessionFile[] {
     const codexRevision = this.codexMetas.revision;
     const collisionFiles = new Set(
       this.enumeratedCollisions?.sources.map((source) => source.agent + '\0' + normalizeFsPath(source.file)),
     );
     const physicalContext = {
       domain: 'physical' as const,
-      scope: JSON.stringify(scope.roots),
+      scope: JSON.stringify(roots),
       revision: String(this.coverageRevision),
     };
     const sourceObservations: SessionCollisionObservation[] = [];
@@ -10149,7 +10158,7 @@ export class PanelProvider implements vscode.Disposable {
     let claudeOpeningUnavailable = false;
     const claudeListing = enumerateSessionFilesFor(
       projectsRoot(),
-      scope.roots,
+      roots,
       (file, session) => {
         if (collisionFiles.has('claude\0' + normalizeFsPath(file))) {
           const opening = readQualifiedSessionCwd(file);
@@ -10167,7 +10176,7 @@ export class PanelProvider implements vscode.Disposable {
             sourceObservations.push({
               ...physicalContext,
               source: { ...session, cwd: opening.value },
-              excluded: !isInside(opening.value, scope.roots),
+              excluded: !isInside(opening.value, roots),
             });
             return opening.value;
           }
@@ -10195,7 +10204,7 @@ export class PanelProvider implements vscode.Disposable {
     // A hidden panel ignores watcher events, so a walk then stats every rollout and holds none.
     const listing = codexSessionFiles(
       codexSessionsRoot(),
-      scope.roots,
+      roots,
       (file) => {
         if (collisionFiles.has('codex\0' + normalizeFsPath(file))) {
           const opening = readQualifiedCodexOpening(file);
@@ -10212,7 +10221,7 @@ export class PanelProvider implements vscode.Disposable {
             sourceObservations.push({
               ...physicalContext,
               source,
-              excluded: !isInside(source.cwd!, scope.roots),
+              excluded: !isInside(source.cwd!, roots),
               hidden: isHiddenThread(opening.value),
             });
             qualifiedCodexStats.set(file, { ...opening.revision, isFile: true });
@@ -10222,10 +10231,9 @@ export class PanelProvider implements vscode.Disposable {
         return this.codexMetas.get(file);
       },
       (file) => qualifiedCodexStats.get(file) ?? (this.watching ? this.codexStats.get(file) : readRolloutStat(file)),
-      codexWalk,
-      this.codexWalkEnumeration,
+      undefined,
+      codexEnumeration,
     );
-    this.codexWalkEnumeration = undefined;
     this.sourceEnumerations = { claude: claudeListing, codex: listing.enumeration };
     const physical: SessionCoverage = {
       ...listing.enumeration,
@@ -10300,7 +10308,7 @@ export class PanelProvider implements vscode.Disposable {
         this.enumeratedMembers.add(sessionCoverageMember(entry.session));
     }
     const acceptedCoverage = this.membershipCoverage;
-    if (acceptedCoverage?.scope === JSON.stringify(scope.roots)) {
+    if (acceptedCoverage?.scope === JSON.stringify(roots)) {
       const unchanged =
         acceptedCoverage.status === 'complete' &&
         this.sourceEnumerations.claude.status === 'complete' &&

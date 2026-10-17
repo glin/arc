@@ -3292,7 +3292,7 @@ test('refresh human admission shares read and source allowances and resumes canc
   );
   const runSource = ts.transpileModule(
     `async function run(selectedOnly = false) {
-    const reuseCatalog = false; let generation, controller, primedWalk;
+    const reuseCatalog = false; let generation, controller, primedEnumeration;
     ${segment}
     clearTimeout(this.refreshDeadline);
     return all;
@@ -9750,9 +9750,7 @@ test('derived session caches load, trim against the walk, and checkpoint after f
     'a failed derived-cache write can affect shutdown',
   );
 
-  const listing = panelHostSource.slice(
-    panelHostSource.indexOf('private allSessions(reuseCatalog = false, deferHumanPrompts = false): SessionFile[] {'),
-  );
+  const listing = panelHostSource.slice(panelHostSource.indexOf('private allSessions('));
   sourceMatch(
     listing,
     /this\.pruneDerivedTitles\(walked\)/,
@@ -9902,10 +9900,11 @@ test('clearing empties one session and leaves the other agents alone', () => {
 });
 
 test('both agents reach one list, and each session is read and named by its own reader', () => {
-  const marker = 'private allSessions(reuseCatalog = false, deferHumanPrompts = false)';
+  const marker = 'private allSessions(';
   const from = panelHostSource.indexOf(marker);
   assert.notEqual(from, -1, `panelhost.ts no longer contains "${marker}", so this guard cannot see the merge`);
-  const merge = memberFrom(panelHostSource, from);
+  const merge =
+    memberFrom(panelHostSource, from) + memberFrom(panelHostSource, panelHostSource.indexOf('private walkedSessions('));
   sourceMatch(merge, /enumerateSessionFilesFor\(projectsRoot\(\)/, 'the list no longer holds Claude Code sessions');
   sourceMatch(merge, /codexSessionFiles\(codexSessionsRoot\(\)/, 'the list no longer holds Codex sessions');
   sourceMatch(
@@ -9915,12 +9914,12 @@ test('both agents reach one list, and each session is read and named by its own 
   );
   sourceMatch(
     merge,
-    /enumerateSessionFilesFor\(projectsRoot\(\), scope\.roots,[\s\S]*workspaceFolders\);/,
+    /enumerateSessionFilesFor\(projectsRoot\(\), roots,[\s\S]*workspaceFolders\);/,
     'Claude discovery either omits worktree roots or trusts a missing cwd outside the open folder',
   );
   sourceMatch(
     merge,
-    /codexSessionFiles\(codexSessionsRoot\(\), scope\.roots,/,
+    /codexSessionFiles\(codexSessionsRoot\(\), roots,/,
     'Codex discovery does not use the same registered worktree scope as Claude',
   );
   sourceMatch(
@@ -9975,8 +9974,9 @@ test('both agents reach one list, and each session is read and named by its own 
 });
 
 test('Claude child catalog membership does not depend on the evictable parent turn cache', () => {
-  const from = panelHostSource.indexOf('private allSessions(reuseCatalog = false, deferHumanPrompts = false)');
-  const merge = memberFrom(panelHostSource, from);
+  const from = panelHostSource.indexOf('private allSessions(');
+  const merge =
+    memberFrom(panelHostSource, from) + memberFrom(panelHostSource, panelHostSource.indexOf('private walkedSessions('));
   sourceDoesNotMatch(
     merge,
     /readClaudeChildSessionReferences|discoverClaudeChildSession/,
@@ -10019,8 +10019,9 @@ test('Claude child catalog membership does not depend on the evictable parent tu
 });
 
 test('Claude child reference discovery runs in cancellable worker work', () => {
-  const from = panelHostSource.indexOf('private allSessions(reuseCatalog = false, deferHumanPrompts = false)');
-  const merge = memberFrom(panelHostSource, from);
+  const from = panelHostSource.indexOf('private allSessions(');
+  const merge =
+    memberFrom(panelHostSource, from) + memberFrom(panelHostSource, panelHostSource.indexOf('private walkedSessions('));
   sourceDoesNotMatch(
     merge,
     /readClaudeChildSessionReferences|discoverClaudeChildSessionFiles/,
@@ -17447,7 +17448,15 @@ function methodBody(marker: string): string {
       at < node.parent.end,
   );
   assert.ok(body !== undefined, `${marker} has no body this guard can read`);
-  return body.slice(1, -1);
+  const extracted = body.slice(1, -1);
+  if (marker === 'private allSessions(') {
+    return `const codexEnumeration = arguments[2];
+      this.walkedSessions = function(roots, workspaceFolders, folderPrint, deferHumanPrompts, codexEnumeration) {
+        ${methodBody('private walkedSessions(')}
+      };
+      ${extracted}`;
+  }
+  return extracted;
 }
 
 function extractedFlushQueue(): (this: Record<string, any>, session: string) => void {
@@ -21817,11 +21826,11 @@ test('initial session listing keeps every metadata read within 64 MiB before the
   const claudeMetadataBytes = 256 * 1024;
   const codexMetadataBytes = 256 * 1024 + 1024 * 1024;
 
-  const listingAt = panelHostSource.indexOf(
-    'private allSessions(reuseCatalog = false, deferHumanPrompts = false): SessionFile[] {',
-  );
+  const listingAt = panelHostSource.indexOf('private allSessions(');
   assert.notEqual(listingAt, -1, 'panelhost.ts no longer contains the initial session listing');
-  const listing = memberFrom(panelHostSource, listingAt);
+  const listing =
+    memberFrom(panelHostSource, listingAt) +
+    memberFrom(panelHostSource, panelHostSource.indexOf('private walkedSessions('));
   sourceMatch(
     listing,
     /this\.activityFor\(/,
@@ -27492,11 +27501,8 @@ test('selection and accepted worker results avoid unnecessary catalog walks', ()
   );
 
   // Reuse the retained catalog only when requested and its folder identity matches.
-  const listing = memberFrom(
-    panelHostSource,
-    panelHostSource.indexOf('private allSessions(reuseCatalog = false, deferHumanPrompts = false): SessionFile[] {'),
-  );
-  const body = listing;
+  const listing = memberFrom(panelHostSource, panelHostSource.indexOf('private allSessions('));
+  const body = listing + memberFrom(panelHostSource, panelHostSource.indexOf('private walkedSessions('));
   sourceMatch(
     body,
     /if \(reuseCatalog && this\.catalog && this\.catalog\.folders === folderPrint\)/,
@@ -36432,9 +36438,9 @@ test.each(
 test.each([false, true])(
   'fresh source collisions retain pending recovery and block recorded composer access before publication: admitted %s',
   async (admitted) => {
-    const enumeration = methodBody('private allSessions(');
+    const enumeration = methodBody('private walkedSessions(');
     const quarantineSource = ts.transpileModule(
-      `function quarantine(claude, codex, scope, sourceObservations = []) { const physicalContext = { domain: "physical", scope: JSON.stringify(scope.roots), revision: String(this.coverageRevision) }; const walkedSessions = [...claude, ...codex]; ${enumeration.slice(enumeration.indexOf('this.enumeratedMembers ='), enumeration.indexOf('this.catalog = { folders: folderPrint', enumeration.indexOf('this.enumeratedMembers =')))} }`,
+      `function quarantine(claude, codex, scope, sourceObservations = []) { const roots = scope.roots; const physicalContext = { domain: "physical", scope: JSON.stringify(scope.roots), revision: String(this.coverageRevision) }; const walkedSessions = [...claude, ...codex]; ${enumeration.slice(enumeration.indexOf('this.enumeratedMembers ='), enumeration.indexOf('this.catalog = { folders: folderPrint', enumeration.indexOf('this.enumeratedMembers =')))} }`,
       { compilerOptions: { target: ts.ScriptTarget.ES2022 } },
     ).outputText;
     const quarantine = new Function(

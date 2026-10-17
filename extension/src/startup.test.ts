@@ -6,10 +6,19 @@ import { pendingResponseSessionAdmitted, resolveResponseSession } from './domain
 import { createPanelVisibility } from './panelvisibility';
 import { outcomesFor } from './timelinestate';
 import { selectedDependencies } from './selectedsource';
-import { projectSlug, isInside, replacedCatalogFiles, ClaudeChildSessionCache } from './transcript';
+import {
+  projectSlug,
+  isInside,
+  replacedCatalogFiles,
+  ClaudeChildSessionCache,
+  revisionOf as fileRevisionOf,
+  revalidatedCatalogPaths,
+} from './transcript';
 import { randomUUID } from 'node:crypto';
 import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
+import mutableFs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import * as path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { isDeepStrictEqual } from 'node:util';
@@ -18,6 +27,8 @@ import { agentSpendIsOpen, spendFileVersion, spendTokens } from './agentspend';
 import {
   CodexMetaCache,
   CodexStatCache,
+  codexSessionFiles,
+  readRolloutStat,
   readCodexSessionTitlePair,
   coldOpeningPass,
   codexSubagentFor,
@@ -1222,6 +1233,7 @@ function completeDiscoveryHarness(
       'acceptSelectedMetadataRead',
     );
   }
+  if (names.includes('allSessions')) names.push('walkedSessions');
   const body = owner.members
     .filter((member) => member.name && names.includes(member.name.getText(file)))
     .map((member) => member.getText(file))
@@ -3919,17 +3931,18 @@ test('a cold start walks the catalog once every opening record is read', async (
   let finish: () => void = () => {};
   let coldPasses = 0;
   const walked = ['rollout.jsonl'];
+  const enumeration = { status: 'complete', files: walked, uncertain: [] };
   provider.codexColdReads = () => {
     coldPasses += 1;
     return new Promise((resolve) => {
-      finish = () => resolve({ walked, read: false });
+      finish = () => resolve({ walked, enumeration, read: false });
     });
   };
   let walks = 0;
-  const codexWalks: unknown[] = [];
-  provider.allSessions = () => {
+  const enumerations: unknown[] = [];
+  provider.allSessions = (_reuse: boolean, _defer: boolean, supplied: unknown) => {
     walks += 1;
-    codexWalks.push(provider.codexWalk);
+    enumerations.push(supplied);
     return provider.partial;
   };
   const first = provider.refresh(true);
@@ -3948,7 +3961,7 @@ test('a cold start walks the catalog once every opening record is read', async (
   );
   await vi.waitFor(() => assert.equal(walks, 2, 'the trigger that waited behind the reads never ran'));
   assert.equal(coldPasses, 1, 'a later refresh read the opening records again');
-  assert.deepEqual(codexWalks, [walked, null], 'the first catalog walked the rollout tree again after the pass');
+  assert.deepEqual(enumerations, [enumeration, undefined], 'cold traversal evidence outlived its refresh');
 });
 
 test('two loads of older history during the cold pass show the loading status at once and read the pages once, after the pass', async () => {
@@ -4143,8 +4156,8 @@ test('opening records the cold pass reads reach the checkpoint and the shared fi
   };
   provider.codexColdReads = () => coldOpeningPass(cache, root);
   // allSessions retains the revision after the opening pass reads every record.
-  provider.allSessions = () => {
-    writer.setWalk(provider.codexWalk ?? []);
+  provider.allSessions = (_reuse: boolean, _defer: boolean, enumeration: { files: string[] }) => {
+    writer.setWalk(enumeration.files);
     return provider.partial;
   };
   await provider.refresh(true);
@@ -5399,7 +5412,7 @@ test('a bounded pass after a derived cache version bump keeps the stored names o
 
 // Restores a derived-cache fixture through catalog discovery and naming methods.
 // The metadata harness reads no source bytes. codexWalk controls the returned Codex listing.
-function bumpedCatalogHarness() {
+function bumpedCatalogHarness(scope: Record<string, unknown> = {}) {
   const { cacheFile, codex, claude, child } = bumpedDerivedCache();
   const codexWalk = [codex];
   const claudeWalk = [claude];
@@ -5432,6 +5445,7 @@ function bumpedCatalogHarness() {
       sameClaudeChildReferenceCaches: () => true,
       sameSessionRevision,
       codexTitleFor,
+      ...scope,
     },
   );
   const restored = loadDerivedCache(cacheFile);
@@ -5474,6 +5488,115 @@ function bumpedCatalogHarness() {
   });
   return { provider, codex, claude, child, codexWalk, claudeWalk };
 }
+
+test.each(['unresolved scope', 'reused catalog', 'targeted catalog'])(
+  'a cold enumeration discarded by %s does not omit a new rollout from the next accepted catalog',
+  async (earlyReturn) => {
+    const root = tempDir('enumeration-owner-');
+    const workspace = path.join(root, 'project');
+    fs.mkdirSync(workspace);
+    const writeRollout = (id: string) => {
+      const file = path.join(root, `rollout-${id}.jsonl`);
+      fs.writeFileSync(
+        file,
+        `${JSON.stringify({
+          timestamp: '2026-10-01T12:00:00.000Z',
+          type: 'session_meta',
+          payload: { id, cwd: workspace, source: 'vscode' },
+        })}\n`,
+      );
+      return file;
+    };
+    const earlier = writeRollout('earlier');
+    const cache = new CodexMetaCache();
+    let listingCalls = 0;
+    const { provider, claudeWalk } = bumpedCatalogHarness({
+      codexSessionsRoot: () => root,
+      codexSessionFiles: (...args: Parameters<typeof codexSessionFiles>) => {
+        listingCalls += 1;
+        return codexSessionFiles(...args);
+      },
+      readRolloutStat,
+      fs,
+      fileRevisionOf,
+      revalidatedCatalogPaths,
+    });
+    claudeWalk.splice(0);
+    provider.claudeChildren = [];
+    provider.codexMetas = cache;
+    provider.codexStats = new CodexStatCache();
+    provider.folders = () => [workspace];
+    let ready = earlyReturn !== 'unresolved scope';
+    provider.repositoryScope = { snapshot: () => ({ ready, roots: [workspace], revision: 1 }) };
+    provider.prepareClaudeChildren = () => {
+      provider.discoveryComplete = {
+        scope: JSON.stringify(provider.repositoryScopeRoots),
+        files: new Set(provider.catalog.sessions.map((session: SessionFile) => session.file)),
+      };
+      return Promise.resolve(true);
+    };
+    provider.prepareMetadata = () => Promise.resolve(true);
+    provider.codexColdReads = null;
+    if (ready) {
+      await provider.refresh(true);
+      assert.deepEqual(
+        provider.authoritativeCatalog.map((session: SessionFile) => session.file),
+        [earlier],
+      );
+    }
+    provider.codexColdReads = () => coldOpeningPass(cache, root);
+    provider.targetedRefreshPaths = earlyReturn === 'targeted catalog' ? [earlier] : null;
+    const beforeEarlyReturn = listingCalls;
+    await provider.refresh(true, earlyReturn === 'reused catalog');
+    assert.equal(listingCalls, beforeEarlyReturn, 'the expected early return performed a broad listing');
+    if (!ready) assert.equal(provider.authoritativeCatalog, null);
+    const added = writeRollout('added');
+    ready = true;
+    provider.targetedRefreshPaths = null;
+    await provider.refresh(true);
+    assert.deepEqual(
+      provider.authoritativeCatalog.map((session: SessionFile) => session.file).sort(),
+      [earlier, added].sort(),
+      'the first accepted resolved catalog omitted the rollout created after the discarded enumeration',
+    );
+  },
+);
+
+test('a cold handoff accepts the catalog without enumerating the rollout directory twice', async () => {
+  const root = tempDir('enumeration-single-walk-');
+  const { provider, claudeWalk } = bumpedCatalogHarness({
+    codexSessionFiles,
+    readRolloutStat,
+    codexSessionsRoot: () => root,
+  });
+  claudeWalk.splice(0);
+  const file = path.join(root, 'rollout-only.jsonl');
+  fs.writeFileSync(file, `${JSON.stringify({ type: 'session_meta', payload: { id: 'only', cwd: 'project' } })}\n`);
+  const cache = new CodexMetaCache();
+  provider.codexMetas = cache;
+  provider.codexColdReads = async () => {
+    const pass = await coldOpeningPass(cache, root);
+    provider.directoryReads = vi.spyOn(mutableFs, 'readdirSync');
+    syncBuiltinESMExports();
+    return pass;
+  };
+  provider.prepareClaudeChildren = () => Promise.resolve(true);
+  try {
+    await provider.refresh(true);
+    assert.deepEqual(
+      provider.authoritativeCatalog.map((session: SessionFile) => session.file),
+      [file],
+    );
+    assert.equal(
+      provider.directoryReads.mock.calls.filter(([directory]: [fs.PathLike]) => String(directory) === root).length,
+      0,
+      'catalog assembly repeated the cold traversal',
+    );
+  } finally {
+    provider.directoryReads?.mockRestore();
+    syncBuiltinESMExports();
+  }
+});
 
 test('the first rail after a derived cache version bump draws every stored name, a Claude child included', async () => {
   const { provider, codex, claude, child } = bumpedCatalogHarness();
