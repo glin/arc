@@ -124,6 +124,7 @@ import {
   createClaudeUsageLineReducer,
   type ClaudeUsageReducerState,
   isInside,
+  folderMatcher,
   linkTargetIsHtml,
   linkTargetIsMarkdown,
   linkTargetIsVideo,
@@ -2821,7 +2822,8 @@ export class PanelProvider implements vscode.Disposable {
   private sessionPageIndexFor(accepted: SessionFile[], roots: string, scopeRoots: string[]) {
     const held = this.sessionPageIndex;
     if (held?.catalog === accepted && held.roots === roots) return held;
-    const scoped = accepted.filter((source) => !source.cwd || isInside(source.cwd, scopeRoots));
+    const inScope = folderMatcher(scopeRoots);
+    const scoped = accepted.filter((source) => !source.cwd || inScope(source.cwd));
     this.sessionPageIndex = {
       catalog: accepted,
       roots,
@@ -3591,6 +3593,7 @@ export class PanelProvider implements vscode.Disposable {
       this.publishWindowState();
     }
     if (scope.ready) {
+      const inScope = folderMatcher(scope.roots);
       const removed = new Set(
         [
           ...(this.authoritativeCatalog ?? []),
@@ -3598,7 +3601,7 @@ export class PanelProvider implements vscode.Disposable {
           ...Object.values(this.newDrafts ?? {}),
           ...Object.values(this.awaitingSessionRecords ?? {}),
         ]
-          .filter((source) => source.cwd && !isInside(source.cwd, scope.roots))
+          .filter((source) => source.cwd && !inScope(source.cwd))
           .map((source) => ('sessionId' in source ? source.sessionId : source.draftId)),
       );
       this.onScopeChange?.(removed);
@@ -10148,6 +10151,10 @@ export class PanelProvider implements vscode.Disposable {
     const collisionFiles = new Set(
       this.enumeratedCollisions?.sources.map((source) => source.agent + '\0' + normalizeFsPath(source.file)),
     );
+    const inRoots = folderMatcher(roots);
+    // Without a collision, no file needs its path normalized to find that out.
+    const collides = (agent: 'claude' | 'codex', file: string) =>
+      collisionFiles.size > 0 && collisionFiles.has(agent + '\0' + normalizeFsPath(file));
     const physicalContext = {
       domain: 'physical' as const,
       scope: JSON.stringify(roots),
@@ -10160,7 +10167,7 @@ export class PanelProvider implements vscode.Disposable {
       projectsRoot(),
       roots,
       (file, session) => {
-        if (collisionFiles.has('claude\0' + normalizeFsPath(file))) {
+        if (collides('claude', file)) {
           const opening = readQualifiedSessionCwd(file);
           if (
             opening &&
@@ -10176,7 +10183,7 @@ export class PanelProvider implements vscode.Disposable {
             sourceObservations.push({
               ...physicalContext,
               source: { ...session, cwd: opening.value },
-              excluded: !isInside(opening.value, roots),
+              excluded: !inRoots(opening.value),
             });
             return opening.value;
           }
@@ -10206,7 +10213,7 @@ export class PanelProvider implements vscode.Disposable {
       codexSessionsRoot(),
       roots,
       (file) => {
-        if (collisionFiles.has('codex\0' + normalizeFsPath(file))) {
+        if (collides('codex', file)) {
           const opening = readQualifiedCodexOpening(file);
           if (opening) {
             const source: SessionFile = {
@@ -10221,7 +10228,7 @@ export class PanelProvider implements vscode.Disposable {
             sourceObservations.push({
               ...physicalContext,
               source,
-              excluded: !isInside(source.cwd!, roots),
+              excluded: !inRoots(source.cwd!),
               hidden: isHiddenThread(opening.value),
             });
             qualifiedCodexStats.set(file, { ...opening.revision, isFile: true });
@@ -10235,16 +10242,20 @@ export class PanelProvider implements vscode.Disposable {
       codexEnumeration,
     );
     this.sourceEnumerations = { claude: claudeListing, codex: listing.enumeration };
-    const physical: SessionCoverage = {
-      ...listing.enumeration,
-      ...physicalContext,
-      paths: new Set(listing.enumeration.files.map(normalizeFsPath)),
-      directoryPaths: listing.enumeration.directories
-        ? new Set(listing.enumeration.directories.map((directory) => normalizeFsPath(directory).replace(/\/$/, '')))
-        : undefined,
+    // Only a cached file that the walk missed needs this, so a refresh with none builds no path sets.
+    let physical: SessionCoverage | undefined;
+    const absent = (file: string) => {
+      if (!isInside(file, [codexSessionsRoot()])) return false;
+      physical ??= {
+        ...listing.enumeration,
+        ...physicalContext,
+        paths: new Set(listing.enumeration.files.map(normalizeFsPath)),
+        directoryPaths: listing.enumeration.directories
+          ? new Set(listing.enumeration.directories.map((directory) => normalizeFsPath(directory).replace(/\/$/, '')))
+          : undefined,
+      };
+      return sessionPresence(physical, physicalContext, { file }) === 'absent';
     };
-    const absent = (file: string) =>
-      isInside(file, [codexSessionsRoot()]) && sessionPresence(physical, physicalContext, { file }) === 'absent';
     for (const file of staleMetas(this.codexStats.keys(), listing.walked, listing.enumeration, absent)) {
       this.codexStats.delete(file);
     }

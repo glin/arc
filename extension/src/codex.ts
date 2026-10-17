@@ -45,7 +45,7 @@ import {
   countLines,
   firstLine,
   isEphemeralPath,
-  isInside,
+  folderMatcher,
   normalizeFsPath,
   sameCommitSha,
   revisionOf,
@@ -774,13 +774,24 @@ export function codexSessionFiles(
   const out: SessionFile[] = [];
   const sources: { file: string }[] = [];
   const subagents: CodexSubagentFile[] = [];
+  // Most rollouts share a few working directories, so each distinct cwd is matched once.
+  const inFolders = folderMatcher(folders);
+  const memberCwds = new Map<string, boolean>();
+  const cwdInFolders = (cwd: string): boolean => {
+    let member = memberCwds.get(cwd);
+    if (member === undefined) {
+      member = inFolders(cwd);
+      memberCwds.set(cwd, member);
+    }
+    return member;
+  };
   for (const file of walked) {
     // Check cached opening metadata before requesting a stat. Other workspaces need no stat read here.
     const meta = metaOf(file);
     // No readable opening record means no cwd, and the path holds none either, so there is
     // nothing that puts the session in this workspace.
     if (!meta || !meta.cwd) admission = 'incomplete';
-    if (!meta || !meta.cwd || !isInside(meta.cwd, folders)) {
+    if (!meta || !meta.cwd || !cwdInFolders(meta.cwd)) {
       continue;
     }
     sources.push({ file });

@@ -299,6 +299,7 @@ import {
   ranGit,
   recordCommits,
   responseAnswerIndex,
+  folderMatcher,
   isInside,
   stripCompactPreamble,
   countLines,
@@ -6757,6 +6758,42 @@ test('normalizeFsPath makes transcript and snapshot-store paths comparable', () 
       assert.equal(normalizeFsPath('C:/Repo/File.ts'), 'c:/repo/file.ts');
       assert.equal(normalizeFsPath('/Repo/File.ts'), platform === 'win32' ? '/repo/file.ts' : '/Repo/File.ts');
       assert.equal(normalizeFsPath('/Repo/File.ts') === normalizeFsPath('/repo/file.ts'), platform === 'win32');
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  }
+});
+
+// A matcher built once must answer exactly as isInside does for the same folders.
+test('folderMatcher agrees with isInside on drive casing, separators, trailing slashes and prefix collisions', () => {
+  const folders = ['C:\\a\\arc\\', 'c:/a/arc-complete', '/srv/Repo'];
+  const cases: [string, boolean, boolean][] = [
+    // [target, inside on win32, inside on POSIX]
+    ['C:\\a\\arc', true, true],
+    ['c:/A/ARC/sub/file.ts', true, true],
+    ['C:\\a\\arc\\deep\\file.ts', true, true],
+    ['c:/a/arc/', true, true],
+    ['c:/a/arc-complete-68', false, false],
+    ['c:/a/arc-complete-68/x', false, false],
+    ['c:/a/arc-complete/x', true, true],
+    ['c:/a/arcade', false, false],
+    ['c:/a', false, false],
+    ['/srv/Repo', true, true],
+    ['/srv/Repo/src', true, true],
+    ['/srv/repo/src', true, false],
+    ['/srv/Repository', false, false],
+    ['', false, false],
+  ];
+  for (const platform of ['win32', 'linux', 'darwin']) {
+    vi.stubGlobal('process', { ...process, platform });
+    try {
+      const inFolders = folderMatcher(folders);
+      for (const [target, win, posix] of cases) {
+        const expected = platform === 'win32' ? win : posix;
+        assert.equal(inFolders(target), expected, `${platform}: ${target}`);
+        assert.equal(isInside(target, folders), expected, `${platform}: ${target} through isInside`);
+      }
+      assert.equal(folderMatcher([])('c:/a/arc'), false, 'no folders contain nothing');
     } finally {
       vi.unstubAllGlobals();
     }

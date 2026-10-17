@@ -3052,6 +3052,7 @@ test('command-only admission removes pending rows through every catalog path and
     reconcileSessionCollisions,
     sessionPageSources,
     normalizeFsPath: renameTranscripts.normalizeFsPath,
+    folderMatcher: renameTranscripts.folderMatcher,
     staleMetas: () => [],
     discoverClaudeSessionSpendSources: () => [],
     codexSessionFiles: () => ({
@@ -5024,6 +5025,7 @@ test('window session pages lose coverage when a served transcript is replaced at
       reconcileSessionCollisions,
       sessionPageSources,
       normalizeFsPath: renameTranscripts.normalizeFsPath,
+      folderMatcher: renameTranscripts.folderMatcher,
       staleMetas: () => [],
       discoverClaudeSessionSpendSources: () => [],
       codexSessionFiles: () => ({
@@ -36433,6 +36435,40 @@ test.each(
     refusal?.mockRestore();
     syncBuiltinESMExports();
   }
+});
+
+test('a complete walk drops the cached openings and stats of a deleted rollout and keeps those under a directory it did not visit', async () => {
+  const codexModule = await import('./codex.js');
+  const { provider, workspace, codex } = await coverageEnumerationFixture();
+  const directory = path.join(codex, '2026', '10', '13');
+  fs.mkdirSync(directory, { recursive: true });
+  const rollout = (id: string) => {
+    const file = path.join(directory, `rollout-${id}.jsonl`);
+    fs.writeFileSync(
+      file,
+      JSON.stringify({ type: 'session_meta', payload: { id, cwd: workspace, source: 'vscode' } }) + '\n',
+    );
+    return file;
+  };
+  const kept = rollout('11111111-1111-4111-8111-111111111111');
+  const deleted = rollout('22222222-2222-4222-8222-222222222222');
+  const unvisited = path.join(codex, '2020', '01', '01', 'rollout-33333333-3333-4333-8333-333333333333.jsonl');
+  provider.codexStats = new codexModule.CodexStatCache(() => ({ isFile: true, size: 1, mtimeMs: 1 }));
+  provider.allSessions();
+  for (const file of [kept, deleted, unvisited]) provider.codexStats.get(file);
+  provider.codexMetas.load([[unvisited, codexModule.readCodexSessionMeta(kept)!]]);
+  const cached = (cache: { keys(): Iterable<string> }) => [...cache.keys()].sort();
+  assert.deepEqual(cached(provider.codexMetas), [deleted, kept, unvisited].sort());
+  assert.deepEqual(cached(provider.codexStats), [deleted, kept, unvisited].sort());
+  fs.rmSync(deleted);
+  provider.allSessions();
+  assert.equal(provider.sourceEnumerations.codex.status, 'complete');
+  assert.deepEqual(
+    cached(provider.codexMetas),
+    [kept, unvisited].sort(),
+    'cached openings after the rollout was deleted',
+  );
+  assert.deepEqual(cached(provider.codexStats), [kept, unvisited].sort(), 'cached stats after the rollout was deleted');
 });
 
 test.each([false, true])(

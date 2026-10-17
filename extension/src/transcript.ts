@@ -3370,8 +3370,21 @@ export function activityIn(lines: string[], workOnly = false, now = Infinity): n
   return newest;
 }
 
-// True when `target` is, or sits inside, one of `folders`. Shared with the Codex reader,
-// which decides membership per file for the same reason and must decide it the same way.
+// Membership test for `folders` with each folder normalized once. A caller that tests many targets
+// against one folder list builds the matcher once and reuses it. `isInside` decides the same way,
+// so both must change together.
+export function folderMatcher(folders: string[]): (target: string) => boolean {
+  const bases = folders.map((f) => normalizeFsPath(f).replace(/\/$/, ''));
+  const prefixes = bases.map((base) => base + '/');
+  return (target) => {
+    const t = normalizeFsPath(target);
+    return bases.some((base, i) => t === base || t.startsWith(prefixes[i]));
+  };
+}
+
+// True when `target` is, or sits inside, one of `folders`. A single test stops at the first
+// matching folder and normalizes no later one. The Codex reader tests many targets against one
+// folder list, so it uses `folderMatcher`, which applies the same rule.
 export function isInside(target: string, folders: string[]): boolean {
   const t = normalizeFsPath(target);
   return folders.some((f) => {
@@ -3559,6 +3572,7 @@ export function enumerateSessionFilesFor(
   const slugs = folders.map((f) => projectSlug(f).toLowerCase());
   const missingCwdSlugs = missingCwdFolders.map((f) => projectSlug(f).toLowerCase());
   const out: SessionFile[] = [];
+  const inFolders = folderMatcher(folders);
   for (const d of dirs) {
     const name = d.toLowerCase();
     if (!slugs.some((slug) => projectDirectoryMatches(name, slug))) {
@@ -3572,7 +3586,7 @@ export function enumerateSessionFilesFor(
     for (const f of listing.sessions) {
       const cwd = cwdOf(f.file, f);
       // Recorded cwd decides membership. Without it, require an exact allowed fallback slug.
-      if (cwd ? isInside(cwd, folders) : missingCwdSlugs.includes(name)) {
+      if (cwd ? inFolders(cwd) : missingCwdSlugs.includes(name)) {
         out.push(cwd ? { ...f, cwd } : f);
       }
     }

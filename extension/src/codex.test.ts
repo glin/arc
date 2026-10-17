@@ -14618,6 +14618,81 @@ test('a listing reports every rollout it walked, not only the ones it kept', () 
   assert.equal(codexSessionFiles(root, []).walked.length, 3);
 });
 
+// Membership is decided per distinct working directory, so the cost of the folder list must not grow with the rollout count.
+test('a listing matches many rollouts that share a few working directories without renormalizing the folders', () => {
+  const root = sessionsRoot([{ day: '2026/08/25', name: ROLLOUT(UUID_A), records: [meta({ id: UUID_A })] }]);
+  const template = readCodexSessionMeta(path.join(root, '2026', '08', '25', ROLLOUT(UUID_A)));
+  assert.ok(template);
+  const cwds = ['c:\\repo', 'C:/repo/packages/app', 'c:\\repo-other', 'd:\\elsewhere', 'c:\\repo\\'];
+  const listWith = (count: number) => {
+    let folderReads = 0;
+    let targetReads = 0;
+    // normalizeFsPath calls replace on its argument first, so a counting replace sees each normalization.
+    const counted = (value: string, onRead: () => void) =>
+      ({
+        replace: (...args: [RegExp, string]) => {
+          onRead();
+          return value.replace(...args);
+        },
+      }) as unknown as string;
+    const folders = [counted('c:\\repo', () => folderReads++), counted('d:\\trees\\topic', () => folderReads++)];
+    // One object per distinct working directory, shared by every rollout that records it.
+    const targets = cwds.map((cwd) => counted(cwd, () => targetReads++));
+    const walked = Array.from({ length: count }, (_, i) => `/sessions/${String(i).padStart(5, '0')}.jsonl`);
+    const listing = codexSessionFiles(
+      '/sessions',
+      folders,
+      (file) => ({ ...template, cwd: targets[Number(file.slice(10, 15)) % cwds.length] }),
+      () => ({ isFile: true, size: 10, mtimeMs: 1000 }),
+      walked,
+    );
+    return { listing, folderReads, targetReads, walked };
+  };
+  const small = listWith(10);
+  const large = listWith(500);
+  assert.equal(
+    large.folderReads,
+    small.folderReads,
+    'the folders are normalized the same number of times for 10 and 500 rollouts',
+  );
+  assert.equal(small.targetReads, cwds.length, 'each distinct working directory is normalized once for 10 rollouts');
+  assert.equal(large.targetReads, cwds.length, 'each distinct working directory is normalized once for 500 rollouts');
+  // Indexes 0, 1 and 4 of the cwd list sit inside the first folder.
+  const members = large.walked.filter((file) => [0, 1, 4].includes(Number(file.slice(10, 15)) % cwds.length));
+  assert.deepEqual(
+    large.listing.sources.map((source) => source.file),
+    members,
+  );
+  assert.deepEqual(large.listing.sessions.map((session) => session.file).sort(), members);
+  assert.equal(large.listing.walked.length, 500);
+});
+
+// The per-directory memo keys on the exact recorded string, so it must keep the platform's case rule.
+test.each([
+  ['linux', 3],
+  ['darwin', 3],
+  ['win32', 6],
+])('a listing keeps case-different working directories apart as %s path rules do', (platform, members) => {
+  const root = sessionsRoot([{ day: '2026/08/25', name: ROLLOUT(UUID_A), records: [meta({ id: UUID_A })] }]);
+  const template = readCodexSessionMeta(path.join(root, '2026', '08', '25', ROLLOUT(UUID_A)));
+  assert.ok(template);
+  vi.stubGlobal('process', { ...process, platform });
+  try {
+    const walked = Array.from({ length: 6 }, (_, i) => `/sessions/${String(i).padStart(5, '0')}.jsonl`);
+    const listing = codexSessionFiles(
+      '/sessions',
+      ['/srv/Repo'],
+      (file) => ({ ...template, cwd: Number(file.slice(10, 15)) % 2 === 0 ? '/srv/Repo/a' : '/srv/repo/a' }),
+      () => ({ isFile: true, size: 10, mtimeMs: 1000 }),
+      walked,
+    );
+    assert.equal(listing.sources.length, members);
+    assert.ok(listing.sources.some((source) => Number(source.file.slice(10, 15)) % 2 === 0));
+  } finally {
+    vi.unstubAllGlobals();
+  }
+});
+
 test('a cached opening record is dropped only once its rollout is gone', () => {
   const walked = ['/x/a.jsonl', '/x/b.jsonl', '/x/c.jsonl'];
   // Trim cached openings against all walked files rather than only sessions admitted to the workspace.

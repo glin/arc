@@ -68,6 +68,7 @@ import {
   headlineOf,
   type HeadlineSource,
   isInside,
+  folderMatcher,
   normalizeFsPath,
   openingLines,
   responseAnswerIndex,
@@ -746,7 +747,8 @@ export interface FileRowName {
 // Only basename rows participate in distinct-name calculation.
 // Full-path rows announce their displayed paths. Display paths use forward slashes.
 export function fileRowNames(paths: string[], folders: string[]): FileRowName[] {
-  const byBaseName = paths.map((p) => folders.length === 0 || isInside(p, folders));
+  const inFolders = folderMatcher(folders);
+  const byBaseName = paths.map((p) => folders.length === 0 || inFolders(p));
   const distinct = distinctNames(paths.filter((_, i) => byBaseName[i]));
   let next = 0;
   return paths.map((p, i) => {

@@ -1029,6 +1029,7 @@ function harness(pendingRefresh = false, registerRefreshHandler = true, extraMet
     `
     const serializedMessageBytes = () => 0;
     const isInside = () => true;
+    const folderMatcher = () => () => true;
     const revalidatedCatalog = (sessions) => sessions;
     const replacedCatalogFiles = async () => [];
     const normalizeFsPath = ${normalizeFsPath.toString()};
@@ -1241,6 +1242,7 @@ function completeDiscoveryHarness(
   const compiled = transformSync(
     `
     const isInside = ${scope.scopeInside ? 'scopeInside' : '() => true'};
+    const folderMatcher = (folders) => (target) => isInside(target, folders);
     const pickShowing = (sessions, wanted) => wanted && sessions.includes(wanted) ? wanted : sessions[0] ?? null;
     const sessionLauncherView = (_state, recent) => ({ recent, primary: recent?.[0] ? { key: 'recent:0', profile: recent[0] } : null });
     const launcherProfile = (view, request) => (request.kind === 'row' && view.primary?.key === request.key ? { ...view.primary.profile } : null);
