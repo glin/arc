@@ -88,6 +88,206 @@ function frames() {
   frame.line('{"type":"item.completed","item":{"type":"agent_message","id":"item_1","text":"Report"}}');
   return frame;
 }
+test.each(['missing', 'different', 'oversized'] as const)(
+  'qualified Codex disagreement retains failure for %s reports',
+  (kind) => {
+    for (const [type, code, signal, expected] of [
+      ['turn.failed', 1, null, 'failed'],
+      ['turn.completed', null, 'SIGTERM', 'interrupted'],
+      ['turn.completed', 0, null, 'unknown'],
+    ] as const) {
+      const frame = frames();
+      if (kind === 'oversized')
+        frame.line(
+          JSON.stringify({
+            type: 'item.completed',
+            item: { type: 'agent_message', id: 'large', text: 'x'.repeat(8 * 1024 * 1024 + 1) },
+          }),
+        );
+      frame.line(JSON.stringify({ type }));
+      const report = kind === 'different' ? 'Other' : null;
+      const result = frame.finish(code, signal, report);
+      assert.equal(result.outcome, expected);
+      assert.equal(result.availability, 'unavailable');
+      assert.equal(result.text, null);
+      assert.ok(result.evidence);
+      frame.line(JSON.stringify({ type }));
+      const invalid = frame.finish(code, signal, report);
+      assert.equal(invalid.outcome, 'unknown');
+      assert.equal(invalid.evidence, null);
+    }
+    assert.equal(frames().finish(1, 'SIGTERM', null).outcome, 'unknown');
+  },
+);
+
+test.each(['complete', 'budget', 'denied'] as const)(
+  'frozen-clock capture close stops or drains %s output',
+  async (kind) => {
+    const { receipts, launch } = workerFixture('', 100, false, true);
+    const id = launch.launchId;
+    const stdout = Buffer.from(outputFrames());
+    const stderr = Buffer.alloc(kind === 'complete' ? 200_000 : 700, 255);
+    fs.writeFileSync(receipts.artifact(id, 'stdout.log'), stdout);
+    fs.writeFileSync(receipts.artifact(id, 'stderr.log'), stderr);
+    fs.writeFileSync(receipts.artifact(id, 'native.md'), 'Report');
+    receipts.observation(id, {
+      supervisor: { pid: process.pid, token: id },
+      worker: null,
+      sessionId: null,
+      exitCode: 0,
+      signal: null,
+      monitor: 'timed-out',
+    });
+    fs.writeFileSync(
+      receipts.artifact(id, 'output-owner.json'),
+      JSON.stringify({ pid: 2147483647, state: 'unavailable' }),
+    );
+    const alias = launch.standalone!.logAlias!;
+    const open = fs.openSync;
+    vi.spyOn(fs, 'openSync').mockImplementation((file, ...args) => {
+      if (kind === 'denied' && String(file) === alias)
+        throw Object.assign(new Error('Alias unavailable'), { code: 'EPERM' });
+      return Reflect.apply(open, fs, [file, ...args]);
+    });
+    let yields = 0;
+    const bounds = { frameBytes: 1024, readBytes: 64 * 1024, workBytes: kind === 'budget' ? 512 : 1024 * 1024 };
+    const status = (await superviseStandalone(receipts, id, true, bounds, {
+      now: () => 0,
+      identity: async () => null,
+      yield: async () => {
+        assert.ok(++yields <= 32, 'Capture exceeded finite yields.');
+      },
+    })) as any;
+    const cursor = JSON.parse(fs.readFileSync(receipts.artifact(id, 'capture.json'), 'utf8'));
+    assert.equal(cursor.sources['stdout.log'].offset, stdout.length);
+    assert.equal(cursor.sources['stderr.log'].offset, Math.min(stderr.length, bounds.workBytes));
+    assert.equal(status.observation.monitor, kind === 'complete' ? 'finished' : 'timed-out');
+    assert.equal(fs.readFileSync(receipts.artifact(id, 'stderr.log')).equals(stderr), true);
+    if (kind === 'complete') assert.equal(fs.readFileSync(alias).equals(Buffer.concat([stdout, stderr])), true);
+    else assert.ok(fs.statSync(alias).size < stdout.length + stderr.length);
+    assert.equal(status.observation.exitCode, 0);
+    assert.equal(vi.mocked(childProcess.spawn).mock.calls.length, 0);
+  },
+);
+
+test.each(['print', 'background'] as const)(
+  'ended %s producer stops denied alias delivery without advancing time',
+  async (kind) => {
+    if (process.send) vi.spyOn(process, 'send').mockImplementation(() => true);
+    vi.spyOn(process, 'disconnect').mockImplementation(() => {});
+    const { receipts, launch } = kind === 'background' ? backgroundFixture(true) : workerFixture('', 100, false, true);
+    const id = launch.launchId;
+    fs.writeFileSync(receipts.artifact(id, 'stdout.log'), 'output');
+    fs.writeFileSync(receipts.artifact(id, 'stderr.log'), 'diagnostic');
+    if (kind === 'background') receipts.background(id, 'deadbeef');
+    const registry = vi.mocked(promisify(childProcess.execFile));
+    registry.mockImplementation(() =>
+      Object.assign(
+        Promise.resolve({
+          stdout: JSON.stringify([{ id: 'deadbeef', sessionId: session, state: 'done' }]),
+          stderr: '',
+        }),
+        { child: new ChildProcess() },
+      ),
+    );
+    vi.mocked(childProcess.spawn).mockImplementation((_command, _args, settings) => {
+      assert.ok(vi.mocked(childProcess.spawn).mock.calls.length <= 2);
+      if (kind === 'background') fs.writeSync((settings!.stdio as number[])[1], Buffer.from('native'));
+      const child = new ChildProcess();
+      child.stdin = new PassThrough();
+      queueMicrotask(() => child.emit('close', 0, null));
+      return child;
+    });
+    const open = fs.openSync;
+    vi.spyOn(fs, 'openSync').mockImplementation((file, ...args) => {
+      if (String(file) === launch.standalone!.logAlias)
+        throw Object.assign(new Error('Alias unavailable'), { code: 'EPERM' });
+      return Reflect.apply(open, fs, [file, ...args]);
+    });
+    const capture = receipts.capture.bind(receipts);
+    let flushes = 0;
+    vi.spyOn(receipts, 'capture').mockImplementation((...args) => {
+      const result = capture(...args);
+      const flush = result.flushAlias;
+      result.flushAlias = () => {
+        if (++flushes > 12) throw new Error('Finite alias invocation bound.');
+        return flush();
+      };
+      return result;
+    });
+    vi.spyOn(Date, 'now').mockReturnValue(0);
+    await produceStandaloneOutput(receipts, id);
+    const owner = JSON.parse(fs.readFileSync(receipts.artifact(id, 'output-owner.json'), 'utf8'));
+    assert.equal(owner.state, 'unavailable');
+    assert.ok(flushes <= 4, 'Denied delivery must stop without repeated alias attempts.');
+    assert.equal(fs.readFileSync(receipts.artifact(id, 'stdout.log'), 'utf8'), 'output');
+    assert.equal(receipts.latest(id), null);
+  },
+);
+
+test('background interrupted completion publishes unavailable saved evidence after pending', async () => {
+  const { home } = fixture();
+  const { receipts, launch, options } = backgroundFixture(false, {
+    ...process.env,
+    ARC_PROJECTS_ROOT: path.join(home, 'projects'),
+  });
+  const id = launch.launchId;
+  receipts.background(id, 'deadbeef');
+  receipts.observation(id, {
+    supervisor: { pid: process.pid, token: id },
+    worker: null,
+    sessionId: session,
+    exitCode: null,
+    signal: null,
+    monitor: 'observing',
+  });
+  vi.mocked(promisify(childProcess.execFile)).mockImplementation(() =>
+    Object.assign(
+      Promise.resolve({
+        stdout: JSON.stringify([{ id: 'deadbeef', sessionId: session, state: 'stopped' }]),
+        stderr: '',
+      }),
+      { child: new ChildProcess() },
+    ),
+  );
+  await superviseStandalone(receipts, id, true);
+  const pending = receipts.latest(id)!;
+  assert.equal(pending.outcome, 'interrupted');
+  assert.equal(pending.availability, 'pending');
+  const source = path.join(options.env!.ARC_PROJECTS_ROOT!, projectSlug(options.cwd), `${session}.jsonl`);
+  fs.mkdirSync(path.dirname(source), { recursive: true });
+  const timestamp = '2026-01-01T00:00:00Z';
+  fs.writeFileSync(
+    source,
+    [
+      { type: 'user', uuid: 'prompt', timestamp, message: { role: 'user', content: 'Review this folder.' } },
+      {
+        type: 'assistant',
+        timestamp,
+        message: {
+          id: 'response',
+          role: 'assistant',
+          stop_reason: 'end_turn',
+          content: [{ type: 'text', text: 'x'.repeat(8 * 1024 * 1024 + 1) }],
+        },
+      },
+      { type: 'user', timestamp, message: { role: 'user', content: '[Request interrupted by user]' } },
+    ]
+      .map((row) => JSON.stringify(row))
+      .join('\n') + '\n',
+  );
+  for (let pass = 0; pass < 20 && receipts.latest(id)?.availability === 'pending'; pass++)
+    await superviseStandalone(receipts, id, true);
+  const final = receipts.latest(id)!;
+  assert.equal(final.outcome, 'interrupted');
+  assert.equal(final.availability, 'unavailable');
+  assert.notEqual(final.eventId, pending.eventId);
+  assert.equal(final.report, null);
+  assert.ok(final.nativeEnding);
+  await superviseStandalone(receipts, id, true);
+  assert.equal(receipts.latest(id)?.eventId, final.eventId);
+});
+
 function receiptsFixture() {
   const { home, args } = fixture();
   const options = parseRun(args).options;
@@ -1508,7 +1708,7 @@ test.each(['complete', 'deadline'] as const)(
       const status = (await superviseStandalone(receipts, id, true, bounds, runtime)) as any;
       if (ending === 'deadline') {
         assert.equal(status.observation.monitor, 'timed-out');
-        assert.equal(status.observation.reason, 'Observation timed out before all worker output was read.');
+        assert.equal(status.observation.reason, 'The requested log is incomplete. Private output remains available.');
         assert.ok(fs.statSync(alias).size < captured.length);
         assert.ok(now <= launch.standalone!.deadlineMs);
         now = 0;
@@ -1586,8 +1786,8 @@ test('resumed observation retains timeout while stopped producer stderr exceeds 
     assert.equal((receipts.result(id, event.eventId) as any).text, 'Report');
     if (expectedStderr < stderr.length) {
       assert.equal(status.observation.monitor, 'timed-out');
-      assert.equal(status.observation.reason, 'Observation timed out before all worker output was read.');
-      assert.equal(now, launch.standalone!.deadlineMs);
+      assert.equal(status.observation.reason, 'The requested log is incomplete. Private output remains available.');
+      assert.ok(now < launch.standalone!.deadlineMs);
     } else assert.equal(status.observation.monitor, 'finished');
     assert.equal(status.observation.exitCode, 0);
     assert.equal(status.observation.worker, null);
@@ -1836,7 +2036,7 @@ test('supervisor timeout retains captured signal and output-read reason', async 
   assert.equal(observation.monitor, 'timed-out');
   assert.equal(observation.signal, 'SIGTERM');
   assert.equal(observation.exitCode, null);
-  assert.equal(observation.reason, 'Observation timed out before all worker output was read.');
+  assert.equal(observation.reason, 'The requested log is incomplete. Private output remains available.');
   assert.equal(receipts.latest(launch.launchId)?.availability, 'pending');
 });
 
@@ -1854,7 +2054,7 @@ test('fresh close retains real exit and bounds output work before later complete
   assert.equal(receipts.observation(launch.launchId)?.exitCode, 0);
   assert.equal(
     receipts.observation(launch.launchId)?.reason,
-    'Observation timed out before all worker output was read.',
+    'The requested log is incomplete. Private output remains available.',
   );
   const pending = receipts.latest(launch.launchId)!;
   assert.equal(pending.availability, 'pending');
@@ -3533,7 +3733,7 @@ test('an existing print output owner refuses another native producer', async () 
   assert.equal(spawn.mock.calls.length, 0);
 });
 
-test('print capture retries the final alias failure without new output before finishing', async () => {
+test('print capture retains final bytes for alias recovery after denied delivery', async () => {
   vi.spyOn(process, 'send').mockImplementation(() => true);
   vi.spyOn(process, 'disconnect').mockImplementation(() => {});
   const { receipts, launch } = workerFixture('', 10_000, false, true);
@@ -3565,10 +3765,18 @@ test('print capture retries the final alias failure without new output before fi
     await vi.waitFor(() => assert.equal(failed, true));
     assert.notEqual(owner().state, 'finished');
     assert.equal(fs.readFileSync(alias, 'utf8'), 'prefix');
-    blocked = false;
     await pending;
+    assert.equal(owner().state, 'unavailable');
+    assert.equal(fs.readFileSync(receipts.artifact(launch.launchId, 'worker.log'), 'utf8'), 'prefix final');
+    blocked = false;
+    const recovery = receipts.capture(launch.launchId);
+    try {
+      assert.equal(recovery.flushAlias(), false);
+    } finally {
+      recovery.close();
+    }
     assert.equal(fs.readFileSync(alias, 'utf8'), 'prefix final');
-    assert.equal(owner().state, 'finished');
+    assert.equal(owner().state, 'unavailable');
   } finally {
     blocked = false;
     child.emit('close', 0, null);

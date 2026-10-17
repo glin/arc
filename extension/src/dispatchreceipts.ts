@@ -468,6 +468,10 @@ export class DispatchReceipts {
     }
     return {
       flushAlias,
+      delivered: () => {
+        reload();
+        return state.aliasBytes ?? 0;
+      },
       cursor: (name: CaptureSource): CaptureCursor =>
         (() => {
           reload();

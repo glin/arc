@@ -204,19 +204,19 @@ export class StandaloneFrames {
         text: null,
         evidence: null,
       };
-    if (this.provider === 'codex' && nativeReport !== undefined && (this.oversized || nativeReport !== this.text))
-      return {
-        sessionId: this.sessionId,
-        outcome: 'unknown',
-        availability: 'unavailable',
-        text: null,
-        evidence: this.ending,
-      };
     const outcome = signal
       ? 'interrupted'
       : exitCode === null || (exitCode !== 0 && this.outcome === 'succeeded')
         ? 'unknown'
         : this.outcome;
+    if (this.provider === 'codex' && nativeReport !== undefined && (this.oversized || nativeReport !== this.text))
+      return {
+        sessionId: this.sessionId,
+        outcome: outcome === 'failed' || outcome === 'interrupted' ? outcome : 'unknown',
+        availability: 'unavailable',
+        text: null,
+        evidence: this.ending,
+      };
     const available = this.text !== null && Buffer.byteLength(this.text) <= REPORT_BYTES;
     return {
       sessionId: this.sessionId,
@@ -462,6 +462,13 @@ export function registryStep(
       done: true,
       outcome: status === 'stopped' || status === 'killed' ? 'interrupted' : 'failed',
       reason: `Claude ended with state ${status}.`,
+      entry,
+    };
+  if (status === 'done')
+    return {
+      done: true,
+      outcome: 'unknown',
+      reason: 'Claude reports done. Final response evidence is unavailable.',
       entry,
     };
   return { done: true, outcome: 'unknown', reason: 'Claude registry state is unavailable.', entry };
@@ -1036,6 +1043,10 @@ function logCapture(receipts: DispatchReceipts, id: string, bounds: ReadBounds) 
     file: receipts.artifact(id, name),
     cursor: capture.cursor(name),
   }));
+  const sourceComplete = () =>
+    sources.every((source) => capture.cursor(source.name).offset === fs.statSync(source.file).size);
+  const progress = () =>
+    sources.reduce((total, source) => total + capture.cursor(source.name).offset, capture.delivered());
   const flush = (bytes: number) => {
     for (const source of sources) {
       if (!fs.existsSync(source.file)) continue;
@@ -1049,9 +1060,9 @@ function logCapture(receipts: DispatchReceipts, id: string, bounds: ReadBounds) 
       }
     }
     const aliasPending = capture.flushAlias();
-    return !aliasPending && sources.every((source) => source.cursor.offset === fs.statSync(source.file).size);
+    return !aliasPending && sourceComplete();
   };
-  return { native: capture.native, flush, close: capture.close };
+  return { native: capture.native, flush, sourceComplete, progress, close: capture.close };
 }
 
 function liveLogCapture(receipts: DispatchReceipts, id: string, bounds: ReadBounds) {
@@ -1068,20 +1079,20 @@ function liveLogCapture(receipts: DispatchReceipts, id: string, bounds: ReadBoun
     close: async (deadline: number, runtime: ObservationRuntime) => {
       clearInterval(timer);
       try {
-        try {
-          if (capture.flush(bounds.workBytes ?? 64 * 1024 * 1024)) return true;
-        } catch {
-          /* Original channel files remain available. */
-        }
+        if (runtime.now() >= deadline) return false;
+        let complete = capture.flush(bounds.workBytes ?? 64 * 1024 * 1024);
+        if (complete) return true;
+        if (!capture.sourceComplete()) return false;
         while (runtime.now() < deadline) {
+          const before = capture.progress();
           await runtime.yield();
           if (runtime.now() >= deadline) break;
-          try {
-            if (capture.flush(0)) return true;
-          } catch {
-            /* A later pass retries unavailable alias delivery. */
-          }
+          complete = capture.flush(0);
+          if (complete) return true;
+          if (capture.progress() <= before) return false;
         }
+        return false;
+      } catch {
         return false;
       } finally {
         capture.close();
@@ -1187,7 +1198,10 @@ export async function produceStandaloneOutput(receipts: DispatchReceipts, id: st
     while (true) {
       let complete: boolean;
       try {
+        const before = capture.progress();
         complete = capture.flush(READ_BYTES);
+        if (ended && !complete && capture.progress() <= before)
+          throw new Error('The requested log is incomplete. Private output remains available.');
         progressAt = Date.now();
       } catch (error) {
         const code = (error as NodeJS.ErrnoException).code;
@@ -1195,7 +1209,7 @@ export async function produceStandaloneOutput(receipts: DispatchReceipts, id: st
           code === 'EEXIST' ||
           code === 'EPERM' ||
           /Another process holds this dispatch write|dispatch write changed during recovery/.test(String(error));
-        if (!busy || Date.now() - progressAt >= options.deadlineMs) throw error;
+        if (ended || !busy || Date.now() - progressAt >= options.deadlineMs) throw error;
         await pause(50);
         continue;
       }
@@ -1291,10 +1305,11 @@ async function produceBackgroundOutput(receipts: DispatchReceipts, id: string, o
       while (true) {
         try {
           const cursor = nativeCapture.cursor('native-source.log');
+          const before = cursor.offset + capture.progress();
           for (const bytes of logChunks(source, READ_BYTES, cursor, READ_BYTES)) nativeCapture.native(bytes, cursor);
           const complete = capture.flush(READ_BYTES);
           if (complete && cursor.offset === fs.statSync(source).size) break;
-          if (Date.now() >= drainDeadline)
+          if (cursor.offset + capture.progress() <= before || Date.now() >= drainDeadline)
             throw new Error('The requested log is incomplete. Private output remains available.');
           progressAt = Date.now();
           await OBSERVATION_RUNTIME.yield();
@@ -1386,7 +1401,7 @@ export async function superviseStandalone(
     capture = undefined;
     if (current && !(await current.close(observationDeadline, runtime))) {
       observation.monitor = 'timed-out';
-      observation.reason = 'Observation timed out before all worker output was read.';
+      observation.reason = 'The requested log is incomplete. Private output remains available.';
     }
     await publishObservation();
     if (publicationError) throw publicationError;
@@ -1541,6 +1556,11 @@ export async function superviseStandalone(
         !incomplete &&
         (last || recovered.evidence || recovered.text) &&
         (!last || last.outcome === 'unknown' || recovered.outcome !== 'unknown') &&
+        !(
+          last?.availability === 'available' &&
+          recovered.availability !== 'available' &&
+          (last.outcome === 'failed' || last.outcome === 'interrupted')
+        ) &&
         (last?.outcome !== recovered.outcome ||
           last?.availability !== recovered.availability ||
           !isDeepStrictEqual(last?.nativeEnding, recovered.evidence) ||
@@ -1764,6 +1784,9 @@ export async function superviseStandalone(
     if (
       !last ||
       last.outcome !== final.outcome ||
+      last.availability !== final.availability ||
+      !isDeepStrictEqual(last.nativeEnding, final.evidence) ||
+      last.askId !== null ||
       last.report?.sha256 !== (final.text === null ? undefined : payloadSha256(final.text))
     )
       receipts.publish(

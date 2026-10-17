@@ -210,7 +210,10 @@ export const COMMANDS: readonly Command[] = [
         ],
         ['--report-file FILE', 'Copy the frozen report to this alias. --output is an alternative spelling.'],
         ['--output FILE', 'Alternative to --report-file. Never combine both.'],
-        ['--log FILE', 'Watch print output or Claude native logs. Codex defaults to NAME.last.md beside this path.'],
+        [
+          '--log FILE',
+          'Watch print output or Claude native logs. Codex defaults to the log file stem plus .last.md beside this path.',
+        ],
         [
           '--attach',
           'Open a reader-owned session in a supported terminal. Refuses Claude read-only and waited completion.',
