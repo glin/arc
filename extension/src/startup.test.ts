@@ -3912,9 +3912,10 @@ test('a selected-only refresh before the catalog keeps every held title, and the
   };
   const refresh = vi.spyOn(provider, 'refresh');
   provider.workspaceFoldersChanged();
-  const scoped = refresh.mock.results.at(-1)!.value;
+  await refresh.mock.results.at(-1)!.value;
   assert.equal(provider.authoritativeCatalog, null, 'the workspace folder change kept the old catalog');
   provider.repositoryScopeReady = true;
+  const scoped = provider.refresh(true);
   await vi.waitFor(() => assert.ok(walking, 'the new scope refresh did not start discovery'));
   await provider.refresh(true, true, true, true);
   assert.deepEqual(heldFiles(provider.titles), listed, 'a selected-only refresh after a scope change dropped titles');

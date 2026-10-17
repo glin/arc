@@ -1032,6 +1032,7 @@ test('the command-line entry point rejects an invalid mode', () => {
 });
 
 test('forwards Vitest flags with the node lane worker cap and returns the child status', () => {
+  vi.stubEnv('VITEST_MAX_WORKERS', '');
   const root = fixture();
   let command;
   let args;
@@ -1062,11 +1063,13 @@ test('forwards Vitest flags with the node lane worker cap and returns the child 
     ]);
     assert.deepEqual(options, { cwd: root, stdio: 'inherit' });
   } finally {
+    vi.unstubAllEnvs();
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
 
 test('the standalone and full browser invocations use four workers', async () => {
+  vi.stubEnv('VITEST_MAX_WORKERS', '');
   const root = fixture();
   const args = [];
   const acquireLock = async () => ({ release: () => true });
@@ -1096,6 +1099,7 @@ test('the standalone and full browser invocations use four workers', async () =>
     assert.deepEqual(args[1].slice(2, 4), ['--fileParallelism', '--maxWorkers=8']);
     assert.deepEqual(args[2].slice(2, 4), ['--fileParallelism', '--maxWorkers=4']);
   } finally {
+    vi.unstubAllEnvs();
     fs.rmSync(root, { recursive: true, force: true });
   }
 });

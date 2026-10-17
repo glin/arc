@@ -13,9 +13,9 @@ async function noopAcquireLock() {
 const root = dirname(fileURLToPath(import.meta.url));
 const modes = new Set(['full', 'node', 'browser']);
 // Cap lane workers explicitly instead of using Vitest's core-count default.
-const LANE_ARGS = {
-  node: ['--fileParallelism', '--maxWorkers=8'],
-  browser: ['--fileParallelism', '--maxWorkers=4'],
+const LANE_WORKERS = {
+  node: 8,
+  browser: 4,
 };
 
 // Vitest flags with required values. The installed cliOptionsConfig marks required arguments with angle brackets.
@@ -149,7 +149,15 @@ function narrowSelection(fileArgs, selected, testRoot, mode) {
 
 // List files before flags because Vitest optional-value flags can consume following filenames.
 function vitestArgs(mode, extraArgs, selected, testRoot) {
-  return [join(testRoot, 'node_modules', 'vitest', 'vitest.mjs'), 'run', ...LANE_ARGS[mode], ...selected, ...extraArgs];
+  const workers = process.env.VITEST_MAX_WORKERS || LANE_WORKERS[mode];
+  return [
+    join(testRoot, 'node_modules', 'vitest', 'vitest.mjs'),
+    'run',
+    '--fileParallelism',
+    `--maxWorkers=${workers}`,
+    ...selected,
+    ...extraArgs,
+  ];
 }
 
 function spawnLane(mode, selected, extraArgs, testRoot, spawn) {

@@ -202,6 +202,121 @@ test.each(['complete', 'budget', 'denied', 'transient', 'busy', 'busy-budget', '
   },
 );
 
+test('pending final capture waits between alias attempts with a frozen clock', async () => {
+  vi.useFakeTimers({ toFake: ['setTimeout', 'setImmediate'] });
+  const { receipts, launch } = workerFixture('', 100, false, true);
+  const id = launch.launchId;
+  const stdout = outputFrames();
+  fs.writeFileSync(receipts.artifact(id, 'stdout.log'), stdout);
+  fs.writeFileSync(receipts.artifact(id, 'stderr.log'), 'diagnostic');
+  fs.writeFileSync(receipts.artifact(id, 'native.md'), 'Report');
+  receipts.observation(id, {
+    supervisor: { pid: process.pid, token: id },
+    worker: null,
+    sessionId: null,
+    exitCode: 0,
+    signal: null,
+    monitor: 'timed-out',
+  });
+  fs.writeFileSync(
+    receipts.artifact(id, 'output-owner.json'),
+    JSON.stringify({ pid: 2147483647, state: 'unavailable' }),
+  );
+  const open = fs.openSync;
+  let attempts = 0;
+  vi.spyOn(fs, 'openSync').mockImplementation((file, ...args) => {
+    if (String(file) === launch.standalone!.logAlias) {
+      assert.ok(++attempts <= 8, 'Alias attempts exceeded the tiny retry budget.');
+      throw Object.assign(new Error('Alias unavailable'), { code: 'EPERM' });
+    }
+    return Reflect.apply(open, fs, [file, ...args]);
+  });
+  let yields = 0;
+  let settled = false;
+  const pending = superviseStandalone(
+    receipts,
+    id,
+    true,
+    { frameBytes: 1024, readBytes: 1024, workBytes: 1024 },
+    {
+      now: () => 0,
+      identity: async () => null,
+      yield: async () => {
+        assert.ok(++yields <= 12, 'Capture exceeded the tiny yield budget.');
+      },
+    },
+  ).then((value) => {
+    settled = true;
+    return value;
+  });
+  await vi.advanceTimersByTimeAsync(0);
+  assert.equal(settled, false, 'Final capture retried without waiting.');
+  const before = attempts;
+  assert.ok(before > 0);
+  await vi.advanceTimersByTimeAsync(49);
+  assert.equal(attempts, before, 'Alias retried before the bounded pause elapsed.');
+  await vi.advanceTimersByTimeAsync(1);
+  assert.ok(attempts > before);
+  await vi.runAllTimersAsync();
+  const status = (await pending) as any;
+  assert.equal(status.observation.monitor, 'timed-out');
+  const cursor = JSON.parse(fs.readFileSync(receipts.artifact(id, 'capture.json'), 'utf8'));
+  assert.equal(cursor.sources['stdout.log'].offset, Buffer.byteLength(stdout));
+  assert.equal(cursor.sources['stderr.log'].offset, 10);
+  assert.equal(fs.readFileSync(receipts.artifact(id, 'worker.log'), 'utf8'), stdout + 'diagnostic');
+  assert.equal(vi.mocked(childProcess.spawn).mock.calls.length, 0);
+});
+
+test.each(['progress', 'exit'] as const)(
+  'print retry allowance renews after %s before the ended drain',
+  async (kind) => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'setImmediate'] });
+    if (process.send) vi.spyOn(process, 'send').mockImplementation(() => true);
+    vi.spyOn(process, 'disconnect').mockImplementation(() => {});
+    vi.spyOn(Date, 'now').mockReturnValue(0);
+    const { receipts, launch } = workerFixture('', 100, false, true);
+    const id = launch.launchId;
+    fs.writeFileSync(receipts.artifact(id, 'stdout.log'), 'output');
+    fs.writeFileSync(receipts.artifact(id, 'stderr.log'), 'diagnostic');
+    const child = new ChildProcess();
+    child.stdin = new PassThrough();
+    vi.mocked(childProcess.spawn).mockReturnValue(child);
+    const open = fs.openSync;
+    let blocked = true;
+    vi.spyOn(fs, 'openSync').mockImplementation((file, ...args) => {
+      if (blocked && String(file) === launch.standalone!.logAlias)
+        throw Object.assign(new Error('Alias unavailable'), { code: 'EPERM' });
+      return Reflect.apply(open, fs, [file, ...args]);
+    });
+    let flushes = 0;
+    const capture = receipts.capture.bind(receipts);
+    vi.spyOn(receipts, 'capture').mockImplementation((...args) => {
+      const result = capture(...args);
+      const flush = result.flushAlias;
+      result.flushAlias = () => {
+        assert.ok(++flushes <= 8, 'Producer exceeded the tiny retry budget.');
+        const busy = kind === 'progress' ? [1, 3, 5].includes(flushes) : flushes <= 3;
+        blocked = kind === 'progress' ? flushes >= 5 && flushes <= 7 : flushes <= 4;
+        if (kind === 'progress' && flushes === 5) fs.appendFileSync(receipts.artifact(id, 'stderr.log'), 'tail');
+        if (flushes === (kind === 'progress' ? 6 : 2)) queueMicrotask(() => child.emit('close', 0, null));
+        if (busy) throw new Error('Another process holds this dispatch write');
+        return flush();
+      };
+      return result;
+    });
+    const pending = produceStandaloneOutput(receipts, id);
+    await vi.runAllTimersAsync();
+    await pending;
+    const owner = JSON.parse(fs.readFileSync(receipts.artifact(id, 'output-owner.json'), 'utf8'));
+    assert.equal(owner.state, 'finished');
+    assert.equal(flushes, kind === 'progress' ? 8 : 5);
+    assert.equal(vi.mocked(childProcess.spawn).mock.calls.length, 1);
+    const expected = 'outputdiagnostic' + (kind === 'progress' ? 'tail' : '');
+    assert.equal(fs.readFileSync(launch.standalone!.logAlias!, 'utf8'), expected);
+    assert.equal(fs.readFileSync(receipts.artifact(id, 'worker.log'), 'utf8'), expected);
+  },
+);
+
 test.each(
   ['print', 'background'].flatMap((kind) =>
     ['denied', 'transient', 'busy', 'permanent-busy'].map((failure) => ({ kind, failure })),

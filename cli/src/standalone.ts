@@ -1107,6 +1107,7 @@ function liveLogCapture(receipts: DispatchReceipts, id: string, bounds: ReadBoun
             if (!captureWriteBusy(error)) return false;
           }
           if (stalled && waits-- <= 0) return false;
+          if (stalled) await pause(Math.min(50, deadline - runtime.now()));
           await runtime.yield();
         }
         return false;
@@ -1215,7 +1216,10 @@ export async function produceStandaloneOutput(receipts: DispatchReceipts, id: st
   let waits = Math.ceil(options.deadlineMs / 50);
   try {
     while (true) {
-      if (ended) drainDeadline ??= Date.now() + options.deadlineMs;
+      if (ended && drainDeadline === undefined) {
+        drainDeadline = Date.now() + options.deadlineMs;
+        waits = Math.ceil(options.deadlineMs / 50);
+      }
       let complete: boolean;
       let stalled = false;
       try {
@@ -1225,6 +1229,7 @@ export async function produceStandaloneOutput(receipts: DispatchReceipts, id: st
         if (ended && stalled && !capture.sourceComplete())
           throw new Error('The requested log is incomplete. Private output remains available.');
         progressAt = Date.now();
+        if (!ended) waits = Math.ceil(options.deadlineMs / 50);
       } catch (error) {
         if (
           !captureWriteBusy(error) ||

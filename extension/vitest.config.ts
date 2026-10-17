@@ -10,7 +10,7 @@ export default defineConfig({
     globalSetup: [fileURLToPath(new URL('./test/temp-run.ts', import.meta.url))],
     include: ['src/**/*.test.ts'],
     // Cap direct Vitest and IDE runs at four workers.
-    // extension/test.mjs overrides this with --maxWorkers=8 for the Node lane.
+    // extension/test.mjs sets the lane cap and honors VITEST_MAX_WORKERS.
     fileParallelism: true,
     maxWorkers: 4,
     testTimeout: 30_000,
