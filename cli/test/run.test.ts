@@ -6,6 +6,7 @@ import { ChildProcess, spawn } from 'node:child_process';
 import * as childProcess from 'node:child_process';
 import { PassThrough } from 'node:stream';
 import { once } from 'node:events';
+import { promisify } from 'node:util';
 import { afterEach, test, vi } from 'vitest';
 import { parseRun, runStandalone, runSupervisor } from '../src/run.ts';
 import {
@@ -41,7 +42,15 @@ vi.mock('node:os', async (importOriginal) => {
 });
 vi.mock('node:child_process', async (importOriginal) => {
   const original = await importOriginal<typeof import('node:child_process')>();
-  return { ...original, spawn: vi.fn<typeof original.spawn>(original.spawn) };
+  const { promisify } = await import('node:util');
+  const execute = promisify(original.execFile);
+  return {
+    ...original,
+    spawn: vi.fn<typeof original.spawn>(original.spawn),
+    execFile: Object.assign(vi.fn<typeof original.execFile>(original.execFile), {
+      [promisify.custom]: vi.fn<typeof execute>(execute),
+    }),
+  };
 });
 
 const session = 'aaaaaaaa-1111-2222-3333-444444444444';
@@ -3630,6 +3639,106 @@ test('background log continues after observation and recovers without taking a r
     secondCapture?.close();
   }
 }, 35_000);
+
+test.each(['done', 'missing'] as const)(
+  'background log producer drains final bytes and handles %s without changing results',
+  async (ending) => {
+    const { receipts, launch, options, script } = backgroundFixture(true);
+    const row = { id: 'deadbeef', sessionId: session, state: 'working' };
+    let rows = [row];
+    const stdout = Buffer.from('Launcher stdout\n');
+    const stderr = Buffer.from([100, 105, 97, 103, 0, 255, 10]);
+    fs.writeFileSync(receipts.artifact(launch.launchId, 'stdout.log'), stdout);
+    fs.writeFileSync(receipts.artifact(launch.launchId, 'stderr.log'), stderr);
+    receipts.background(launch.launchId, 'deadbeef');
+    receipts.observation(launch.launchId, {
+      supervisor: { pid: process.pid, token: 'retained' },
+      worker: null,
+      sessionId: session,
+      exitCode: null,
+      signal: null,
+      monitor: 'timed-out',
+    });
+    const observation = receipts.observation(launch.launchId);
+    const frozen = receipts.publish(
+      launch.launchId,
+      { outcome: 'unknown', availability: 'available', nativeEnding: null, askId: null },
+      'Frozen response',
+    );
+    const first = Buffer.concat([Buffer.from('Native prefix\n'), Buffer.alloc(270_000, 255)]);
+    const final = Buffer.concat([first, Buffer.from('Final bytes\n'), Buffer.alloc(280_000, 254)]);
+    const snapshots: string[] = [];
+    const logArgs: string[][] = [];
+    const registry = vi.mocked(promisify(childProcess.execFile));
+    registry.mockImplementation((_command, args) => {
+      assert.ok(registry.mock.calls.length <= 6, 'Registry invocation bound exceeded.');
+      assert.deepEqual(args, [script, 'agents', '--json']);
+      const snapshot = JSON.stringify(rows);
+      snapshots.push(snapshot);
+      return Object.assign(Promise.resolve({ stdout: snapshot, stderr: '' }), { child: new ChildProcess() });
+    });
+    const owner = () => JSON.parse(fs.readFileSync(receipts.artifact(launch.launchId, 'output-owner.json'), 'utf8'));
+    vi.mocked(childProcess.spawn).mockImplementation((_command, args, settings) => {
+      assert.ok(vi.mocked(childProcess.spawn).mock.calls.length <= 6, 'Log invocation bound exceeded.');
+      logArgs.push([...(args as string[])].slice(1));
+      assert.equal(owner().state, 'capturing');
+      fs.writeSync((settings!.stdio as number[])[1], snapshots.length === 1 ? first : final);
+      const child = new ChildProcess();
+      queueMicrotask(() => child.emit('close', 0, null));
+      return child;
+    });
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    let finished = false;
+    const pending = produceStandaloneOutput(receipts, launch.launchId).then(() => {
+      finished = true;
+    });
+    try {
+      await vi.waitFor(() => assert.equal(fs.readFileSync(options.logAlias!).equals(first), true));
+      assert.equal(owner().state, 'capturing');
+      rows = ending === 'done' ? [{ ...row, state: 'done' }] : [];
+      await vi.advanceTimersByTimeAsync(2_000);
+      await vi.waitFor(() => assert.equal(fs.readFileSync(options.logAlias!).equals(final), true));
+      if (ending === 'done') {
+        assert.equal(owner().state, 'finished', 'Capture must finish after the done snapshot and final drain.');
+        await pending;
+        assert.equal(snapshots.length, 2);
+        assert.equal(JSON.parse(snapshots[1])[0].state, 'done');
+      } else {
+        assert.equal(owner().state, 'capturing', 'Missing registry rows must retain capture.');
+        for (let iteration = 0; iteration < 2; iteration++) {
+          await vi.advanceTimersByTimeAsync(2_000);
+          await vi.waitFor(() => assert.equal(snapshots.length, iteration + 3));
+          assert.equal(owner().state, 'capturing', 'Missing registry rows must retain capture.');
+          assert.equal(finished, false);
+        }
+        assert.ok(snapshots.slice(1).every((snapshot) => snapshot === '[]'));
+      }
+      assert.ok(logArgs.every((args) => JSON.stringify(args) === JSON.stringify(['logs', 'deadbeef'])));
+      assert.equal(fs.readFileSync(receipts.artifact(launch.launchId, 'native.log')).equals(final), true);
+      assert.equal(fs.readFileSync(receipts.artifact(launch.launchId, 'native-source.log')).equals(final), true);
+      assert.equal(
+        fs.readFileSync(receipts.artifact(launch.launchId, 'worker.log')).equals(Buffer.concat([stdout, stderr])),
+        true,
+      );
+      assert.equal(fs.readFileSync(receipts.artifact(launch.launchId, 'stdout.log')).equals(stdout), true);
+      assert.equal(fs.readFileSync(receipts.artifact(launch.launchId, 'stderr.log')).equals(stderr), true);
+      assert.deepEqual(receipts.observation(launch.launchId), observation);
+      assert.equal(receipts.observation(launch.launchId)?.exitCode, null);
+      assert.equal(receipts.latest(launch.launchId)?.eventId, frozen.eventId);
+      assert.equal(receipts.latest(launch.launchId)?.outcome, 'unknown');
+      assert.equal((receipts.result(launch.launchId, frozen.eventId) as any).text, 'Frozen response');
+    } finally {
+      rows = [{ ...row, state: 'stopped' }];
+      for (let iteration = 0; iteration < 6; iteration++) {
+        if (finished) break;
+        await vi.advanceTimersByTimeAsync(2_000);
+        await vi.waitFor(() => assert.ok(finished || snapshots.length > iteration));
+      }
+      assert.equal(finished, true, 'Producer cleanup exceeded six clock advances.');
+      await pending;
+    }
+  },
+);
 
 test('explicit writable Claude log retains native bytes through the exact accepted background ID', async () => {
   const { receipts, launch, options, calls } = backgroundFixture(true);

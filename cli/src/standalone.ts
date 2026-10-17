@@ -1267,7 +1267,7 @@ async function produceBackgroundOutput(receipts: DispatchReceipts, id: string, o
         }
       }
       const status = step.entry?.state ?? step.entry?.status;
-      if (['failed', 'stopped', 'killed', 'error'].includes(status)) break;
+      if (['done', 'failed', 'stopped', 'killed', 'error'].includes(status)) break;
       await pause(2_000);
     }
     save('finished');
