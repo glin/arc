@@ -376,22 +376,28 @@ export interface RegistryClock {
 }
 export function registryStep(
   state: RegistryClock,
-  snapshot: string | null,
+  snapshot: string | null | { error: string },
   session: string,
   now: number,
 ): { done: boolean; outcome: DispatchOutcome; reason: string; entry?: any } {
   let rows: any;
+  let failure = snapshot && typeof snapshot === 'object' ? snapshot.error : undefined;
   try {
-    rows = JSON.parse(snapshot ?? '');
+    rows = JSON.parse(typeof snapshot === 'string' ? snapshot : '');
   } catch {
     rows = null;
+    failure ??= 'Claude session list contains invalid JSON.';
   }
   if (
     !Array.isArray(rows) ||
     rows.some((entry) => !entry || typeof entry !== 'object' || typeof entry.id !== 'string')
   ) {
     state.errors++;
-    return { done: state.errors >= 3, outcome: 'unknown', reason: 'Claude registry is unavailable.' };
+    return {
+      done: state.errors >= 3,
+      outcome: 'unknown',
+      reason: `Claude registry is unavailable. ${failure ?? 'Claude returned an invalid session list.'}`,
+    };
   }
   const matches = rows.filter(
     (entry) =>
@@ -870,7 +876,7 @@ export async function observeProcess(
   });
 }
 
-async function registry(options: StandaloneOptions): Promise<string | null> {
+async function registry(options: StandaloneOptions): Promise<string | { error: string }> {
   requireBackgroundContext(options);
   // The launch's leading package script remains part of registry commands.
   const offset = options.args.findIndex((arg) => arg === '--bg');
@@ -885,8 +891,15 @@ async function registry(options: StandaloneOptions): Promise<string | null> {
         encoding: 'utf8',
       })
     ).stdout;
-  } catch {
-    return null;
+  } catch (error) {
+    const failed = error as NodeJS.ErrnoException & { killed?: boolean; stderr?: string };
+    const detail = failed.killed
+      ? 'Claude session list timed out.'
+      : typeof failed.code === 'number'
+        ? `Claude session list exited with code ${failed.code}.`
+        : `Claude session list could not start (${String(failed.code ?? 'unknown').slice(0, 64)}).`;
+    const stderr = typeof failed.stderr === 'string' ? failed.stderr.slice(0, 320).replace(/\s+/g, ' ').trim() : '';
+    return { error: detail + (stderr ? ` ${stderr}` : '') };
   }
 }
 

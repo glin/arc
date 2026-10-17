@@ -2183,6 +2183,62 @@ function backgroundFixture(logged = false, env = process.env) {
   return { receipts, launch, options, script, calls };
 }
 
+test.each(['exit', 'timeout', 'parse', 'shape', 'spawn'] as const)(
+  'background observation retains registry failure causes for %s',
+  async (kind) => {
+    const { receipts, launch, script } = backgroundFixture();
+    receipts.background(launch.launchId, 'deadbeef');
+    receipts.observation(launch.launchId, {
+      supervisor: { pid: process.pid, token: 'retained' },
+      worker: null,
+      sessionId: null,
+      exitCode: null,
+      signal: null,
+      monitor: 'observing',
+    });
+    const registry = vi.mocked(promisify(childProcess.execFile));
+    registry.mockImplementation((_command, args, settings) => {
+      assert.ok(registry.mock.calls.length <= 3, 'Registry invocation bound exceeded.');
+      assert.deepEqual(args, [script, 'agents', '--json']);
+      assert.equal(settings?.timeout, 20_000);
+      assert.equal(settings?.maxBuffer, 4 * 1024 * 1024);
+      const error = Object.assign(new Error('Native command failed'), {
+        code: kind === 'exit' ? 7 : 'ENOENT',
+        killed: kind === 'timeout',
+        stderr: 'native diagnostic ' + 'x'.repeat(700),
+      });
+      const response =
+        kind === 'parse' || kind === 'shape'
+          ? Promise.resolve({ stdout: kind === 'parse' ? '{broken' : '{}', stderr: '' })
+          : Promise.reject(error);
+      return Object.assign(response, { child: new ChildProcess() });
+    });
+    vi.useFakeTimers();
+    const pending = superviseStandalone(receipts, launch.launchId, true);
+    await vi.advanceTimersByTimeAsync(6_000);
+    await pending;
+    const observation = receipts.observation(launch.launchId)!;
+    const expected = {
+      exit: 'exited with code 7',
+      timeout: 'timed out',
+      parse: 'invalid JSON',
+      shape: 'invalid session list',
+      spawn: 'could not start (ENOENT)',
+    }[kind];
+    assert.equal(observation.reason?.includes(expected), true, 'Registry failure cause must survive observation.');
+    assert.ok(observation.reason!.length < 512);
+    if (kind === 'exit' || kind === 'timeout' || kind === 'spawn')
+      assert.equal(observation.reason!.includes('native diagnostic'), true);
+    assert.equal(registry.mock.calls.length, 3);
+    assert.equal(observation.monitor, 'unavailable');
+    assert.equal(observation.worker, null);
+    assert.equal(observation.sessionId, null);
+    assert.equal(observation.exitCode, null);
+    assert.equal(receipts.latest(launch.launchId)?.outcome, 'unknown');
+    assert.equal(receipts.latest(launch.launchId)?.availability, 'pending');
+  },
+);
+
 test('legacy background receipts refuse colliding native roots while saved reports remain readable', async () => {
   const { home } = fixture();
   const roots = [path.join(home, 'original'), path.join(home, 'later')];
