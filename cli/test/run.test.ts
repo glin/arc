@@ -661,9 +661,11 @@ test('registry disappearance, blocked grace, malformed snapshots and colliding I
   assert.equal(structure.reason.includes('private-value'), false);
   const malformedRow = registryStep(state, '[null]', session, 115_005);
   assert.match(malformedRow.reason, /top-level array, row 0: null/);
-  const idless = registryStep(state, '[{"kind":"interactive"},{"id":7}]', session, 115_006);
+  const idless = registryStep(state, '[{"kind":"interactive"}]', session, 115_006);
   assert.equal(idless.outcome, 'unknown');
   assert.equal(idless.entry, undefined);
+  assert.equal(state.errors, 0);
+  assert.equal(idless.reason.includes('unavailable'), false);
   assert.ok(structure.reason.length <= 352);
   assert.equal(
     registryStep(
@@ -677,6 +679,38 @@ test('registry disappearance, blocked grace, malformed snapshots and colliding I
   assert.equal(backgroundIdentity(`backgrounded · ${session} · task`, 'task'), session);
   assert.equal(backgroundIdentity(`backgrounded · ${session} · task\nbackgrounded · ${session} · task`, 'task'), null);
 });
+test.each([
+  ['[{"id":7}]', 'row 0: object, keys "id":number'],
+  ['[{"id":{"private-value":1}}]', 'row 0: object, keys "id":object'],
+  ['[[]]', 'row 0: array'],
+  ['[null]', 'row 0: null'],
+  ['[7]', 'row 0: number'],
+  ['{}', 'top-level object'],
+])('malformed native session rows retain structural failure after observing a bound job: %s', (snapshot, detail) => {
+  const state = { started: 0, seen: false, blockedAt: null, errors: 0 };
+  const working = JSON.stringify([{ id: session, state: 'working' }]);
+  assert.equal(registryStep(state, working, session, 0).outcome, 'running');
+  assert.equal(state.seen, true);
+  const malformed = registryStep(state, snapshot, session, 1);
+  assert.equal(
+    malformed.reason.includes('Claude registry is unavailable.'),
+    true,
+    'Malformed rows must retain the structural failure reason.',
+  );
+  assert.equal(malformed.reason.includes(detail), true);
+  assert.equal(malformed.reason.includes('private-value'), false);
+  assert.ok(malformed.reason.length <= 352);
+  assert.equal(malformed.outcome, 'unknown');
+  assert.equal(malformed.entry, undefined);
+  assert.equal(malformed.done, false);
+  assert.equal(state.errors, 1);
+  assert.equal(registryStep(state, snapshot, session, 2).done, false);
+  const unavailable = registryStep(state, snapshot, session, 3);
+  assert.equal(unavailable.done, true);
+  assert.equal(unavailable.outcome, 'unknown');
+  assert.equal(state.errors, 3);
+});
+
 test('finite observation timeout leaves the worker untouched', async () => {
   vi.useFakeTimers();
   const { options } = receiptsFixture();

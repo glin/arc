@@ -388,7 +388,15 @@ export function registryStep(
     rows = null;
     failure ??= 'Claude session list contains invalid JSON.';
   }
-  const invalidRow = Array.isArray(rows) ? rows.findIndex((entry) => !entry || typeof entry !== 'object') : -1;
+  const invalidRow = Array.isArray(rows)
+    ? rows.findIndex(
+        (entry) =>
+          !entry ||
+          typeof entry !== 'object' ||
+          Array.isArray(entry) ||
+          ('id' in entry && typeof entry.id !== 'string'),
+      )
+    : -1;
   if (!Array.isArray(rows) || invalidRow >= 0) {
     const value = invalidRow >= 0 ? rows[invalidRow] : rows;
     const type = value === null ? 'null' : Array.isArray(value) ? 'array' : typeof value;
