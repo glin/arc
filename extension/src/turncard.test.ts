@@ -388,6 +388,7 @@ test('cache expiry presentation keeps exact, lower-bound, and recording-limit fa
   const chip = sessionCacheExpiryStats(exact)[0];
   assert.equal(chip.label, '3 cache expiries');
   assert.equal(chip.focusable, true);
+  assert.deepEqual(chip.detailList?.heading, { label: 'Cache expiry', value: '3 affected requests' });
   assert.deepEqual(
     chip.detailList?.entries.map((entry) => entry.label),
     ['Cache lifetimes', 'Cost added', 'Longest qualifying gap', 'Excluded ambiguous events'],

@@ -1816,9 +1816,8 @@ test('latest compaction stays with context and uses turns only as its fallback',
       const turnsChip = page.locator('section.sessionsection .sessionstats [data-metric="turns"]');
       await turnsChip.click();
       const turnsText = await contextPop.innerText();
-      assert.match(turnsText, /Turns in the main session\s+22/);
-      assert.match(turnsText, /First to last turn\s+10m/);
-      assert.match(turnsText, /Compactions\s+3/);
+      const turnValues = await contextPop.locator('.chippopitem .chippopvalue').allInnerTexts();
+      for (const value of ['22', '10m', '3']) assert.ok(turnValues.includes(value), `${value} in ${turnValues}`);
       assert.match(turnsText, /About these figures/);
       assert.match(turnsText, /Latest compaction\s+Automatic/);
       assert.doesNotMatch(turnsText, removed);
@@ -2039,8 +2038,9 @@ test('a comment editor holds a replacement view that a session change draws at o
     const retainedChip = page.locator('section.sessionsection[data-session="s1"] .sessionstats [data-metric="turns"]');
     await retainedChip.evaluate((node: HTMLElement) => node.click());
     assert.ok((await page.locator('#chippop .chippopitem').count()) > 0);
-    assert.match(await page.locator('#chippop').innerText(), /Turns in the main session\s+32/);
-    assert.doesNotMatch(await page.locator('#chippop').innerText(), /\b64\b|Compactions\s+4/);
+    const retainedValues = await page.locator('#chippop .chippopitem .chippopvalue').allInnerTexts();
+    assert.ok(retainedValues.includes('32'), `32 in ${retainedValues}`);
+    assert.equal(retainedValues.includes('64') || retainedValues.includes('4'), false, `${retainedValues}`);
 
     await page.locator('.quoteslot .notearea').press('Escape');
     await page.evaluate(SETTLED);

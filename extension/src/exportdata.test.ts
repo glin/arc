@@ -1274,6 +1274,66 @@ test('recorded Codex compactions retain priced overhead and request averages thr
   }
 });
 
+test('captured Claude compactions keep their timestamp and only a recorded summary', async () => {
+  const f = fixture();
+  const boundary = { compactMetadata: { trigger: 'manual', preTokens: 1000, postTokens: 100 } };
+  const file = f.write(f.root, [
+    record('user', 0, {
+      uuid: 'p',
+      promptId: 'p',
+      message: { role: 'user', content: 'Review this session' },
+    }),
+    record('assistant', 1, {
+      uuid: 'a',
+      message: {
+        id: 'a',
+        role: 'assistant',
+        model: 'claude-sonnet-4-5',
+        stop_reason: 'end_turn',
+        content: [{ type: 'text', text: 'Reviewed the session' }],
+      },
+    }),
+    record('system', 2, { subtype: 'compact_boundary', ...boundary }),
+    record('user', 2, { uuid: 'empty-summary', isCompactSummary: true, message: { role: 'user', content: '' } }),
+    record('user', 3, {
+      uuid: 'followup-p',
+      promptId: 'followup-p',
+      message: { role: 'user', content: 'Continue reviewing' },
+    }),
+    record('assistant', 4, {
+      uuid: 'followup-a',
+      message: {
+        id: 'followup-a',
+        role: 'assistant',
+        model: 'claude-sonnet-4-5',
+        stop_reason: 'end_turn',
+        content: [{ type: 'text', text: 'Continued reviewing' }],
+      },
+    }),
+    record('system', 5, { subtype: 'compact_boundary', ...boundary }),
+    record('user', 5, {
+      uuid: 'summary',
+      isCompactSummary: true,
+      message: { role: 'user', content: 'Keep this recorded summary' },
+    }),
+  ]);
+  const options = {
+    ...f.options,
+    root: { ...f.options.root, size: fs.statSync(file).size, mtimeMs: fs.statSync(file).mtimeMs },
+  };
+  await withExportTransaction(f.output, async (writer) => {
+    const capture = await captureSessionExport(options, writer);
+    const compactions = (
+      await Promise.all(capture.model.sessions[0].pages.map((key) => writer.readSpool<ExportPage>(key)))
+    ).flatMap((page) => page.compactions);
+    const empty = compactions.find((compaction) => compaction.summary === '');
+    const recorded = compactions.find((compaction) => compaction.summary !== '');
+    assert.equal(empty?.at, Date.parse(at(2)));
+    assert.equal(recorded?.at, Date.parse(at(5)));
+    assert.equal(recorded?.summary, 'Keep this recorded summary');
+  });
+});
+
 test('linked Claude command dollars stay exact through exported session and turn totals', async () => {
   for (const provisional of [false, true]) {
     const f = fixture();
