@@ -8142,7 +8142,7 @@ export class PanelProvider implements vscode.Disposable {
       }
       const admissionCandidates = all;
       const admissionSelection = selectedOnly ? this.selectionGeneration : undefined;
-      // Without repository scope, a catalog refresh keeps the held catalog and reaches the scope check in the same turn.
+      // Without repository scope, a catalog refresh keeps the held catalog and reaches the scope check without yielding.
       if (selectedOnly || this.repositoryScopeReady) {
         all = await this.prepareHumanPrompts(
           all,
