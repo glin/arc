@@ -388,21 +388,34 @@ export function registryStep(
     rows = null;
     failure ??= 'Claude session list contains invalid JSON.';
   }
-  if (
-    !Array.isArray(rows) ||
-    rows.some((entry) => !entry || typeof entry !== 'object' || typeof entry.id !== 'string')
-  ) {
+  const invalidRow = Array.isArray(rows) ? rows.findIndex((entry) => !entry || typeof entry !== 'object') : -1;
+  if (!Array.isArray(rows) || invalidRow >= 0) {
+    const value = invalidRow >= 0 ? rows[invalidRow] : rows;
+    const type = value === null ? 'null' : Array.isArray(value) ? 'array' : typeof value;
+    const keys =
+      value && typeof value === 'object'
+        ? Object.keys(value)
+            .slice(0, 6)
+            .map((key) => `${JSON.stringify(key.slice(0, 24))}:${typeof value[key]}`)
+            .join(', ')
+        : '';
+    failure ??=
+      `Claude returned an invalid session list (top-level ${Array.isArray(rows) ? 'array' : type}${invalidRow >= 0 ? `, row ${invalidRow}: ${type}` : ''}${keys ? `, keys ${keys}` : ''}).`.slice(
+        0,
+        320,
+      );
     state.errors++;
     return {
       done: state.errors >= 3,
       outcome: 'unknown',
-      reason: `Claude registry is unavailable. ${failure ?? 'Claude returned an invalid session list.'}`,
+      reason: `Claude registry is unavailable. ${failure}`,
     };
   }
   const matches = rows.filter(
     (entry) =>
-      entry.id === session ||
-      (/^[a-f0-9]{8}$/i.test(session) && entry.id.toLowerCase().startsWith(session.toLowerCase())),
+      typeof entry.id === 'string' &&
+      (entry.id === session ||
+        (/^[a-f0-9]{8}$/i.test(session) && entry.id.toLowerCase().startsWith(session.toLowerCase()))),
   );
   if (matches.length > 1) return { done: true, outcome: 'unknown', reason: 'Claude session identity is ambiguous.' };
   state.errors = 0;

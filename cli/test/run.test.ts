@@ -656,6 +656,15 @@ test('registry disappearance, blocked grace, malformed snapshots and colliding I
   assert.equal(registryStep(state, null, session, 115_001).done, false);
   registryStep(state, 'not-json', session, 115_002);
   assert.equal(registryStep(state, '{}', session, 115_003).done, true);
+  const structure = registryStep(state, JSON.stringify({ sessions: 'private-value', count: 5 }), session, 115_004);
+  assert.match(structure.reason, /top-level object, keys "sessions":string, "count":number/);
+  assert.equal(structure.reason.includes('private-value'), false);
+  const malformedRow = registryStep(state, '[null]', session, 115_005);
+  assert.match(malformedRow.reason, /top-level array, row 0: null/);
+  const idless = registryStep(state, '[{"kind":"interactive"},{"id":7}]', session, 115_006);
+  assert.equal(idless.outcome, 'unknown');
+  assert.equal(idless.entry, undefined);
+  assert.ok(structure.reason.length <= 352);
   assert.equal(
     registryStep(
       state,
@@ -2182,6 +2191,85 @@ function backgroundFixture(logged = false, env = process.env) {
   receipts.input(launch.launchId, 'Review this folder.');
   return { receipts, launch, options, script, calls };
 }
+
+test('mixed native session lists retain the launch-bound job and completed report', async () => {
+  const { home } = fixture();
+  const { receipts, launch, options, script } = backgroundFixture(false, {
+    ...process.env,
+    ARC_PROJECTS_ROOT: path.join(home, 'projects'),
+  });
+  receipts.background(launch.launchId, 'deadbeef');
+  receipts.observation(launch.launchId, {
+    supervisor: { pid: process.pid, token: 'retained' },
+    worker: null,
+    sessionId: null,
+    exitCode: null,
+    signal: null,
+    monitor: 'observing',
+  });
+  const source = path.join(options.env!.ARC_PROJECTS_ROOT!, projectSlug(options.cwd), `${session}.jsonl`);
+  fs.mkdirSync(path.dirname(source), { recursive: true });
+  const at = '2026-01-01T00:00:00Z';
+  fs.writeFileSync(
+    source,
+    JSON.stringify({
+      type: 'user',
+      uuid: 'prompt',
+      timestamp: at,
+      message: { role: 'user', content: 'Review this folder.' },
+    }) + '\n',
+  );
+  const registry = vi.mocked(promisify(childProcess.execFile));
+  registry.mockImplementation((_command, args, settings) => {
+    const call = registry.mock.calls.length;
+    assert.ok(call <= 3, 'Registry invocation bound exceeded.');
+    assert.deepEqual(args, [script, 'agents', '--json']);
+    assert.equal(settings?.timeout, 20_000);
+    assert.equal(settings?.maxBuffer, 4 * 1024 * 1024);
+    if (call === 2)
+      fs.appendFileSync(
+        source,
+        JSON.stringify({
+          type: 'assistant',
+          timestamp: at,
+          message: {
+            id: 'response',
+            role: 'assistant',
+            stop_reason: 'end_turn',
+            content: [{ type: 'text', text: 'Completed report' }],
+            usage: { input_tokens: 1, output_tokens: 2 },
+          },
+        }) + '\n',
+      );
+    const stdout = JSON.stringify([
+      { pid: 456, cwd: options.cwd, kind: 'interactive', startedAt: at, status: 'busy' },
+      { id: 'deadbeef', sessionId: session, state: call === 1 ? 'working' : 'done', pid: 123 },
+    ]);
+    return Object.assign(Promise.resolve({ stdout, stderr: '' }), { child: new ChildProcess() });
+  });
+  vi.useFakeTimers();
+  const pending = superviseStandalone(receipts, launch.launchId, true, {
+    frameBytes: 256,
+    readBytes: 17,
+    workBytes: 1024,
+  });
+  await vi.advanceTimersByTimeAsync(6_000);
+  await pending;
+  const observation = receipts.observation(launch.launchId)!;
+  assert.equal(
+    observation.sessionId === session,
+    true,
+    'Launch-bound job must remain observable beside interactive sessions.',
+  );
+  assert.equal(registry.mock.calls.length, 2);
+  assert.equal(observation.monitor, 'finished');
+  assert.equal(observation.worker, null);
+  assert.equal(observation.exitCode, null);
+  const event = receipts.latest(launch.launchId)!;
+  assert.equal(event.outcome, 'succeeded');
+  assert.equal(event.availability, 'available');
+  assert.equal((receipts.result(launch.launchId, event.eventId) as { text: string }).text, 'Completed report');
+});
 
 test.each(['exit', 'timeout', 'parse', 'shape', 'spawn'] as const)(
   'background observation retains registry failure causes for %s',
