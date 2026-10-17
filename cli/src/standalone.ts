@@ -1036,6 +1036,15 @@ async function observeBackground(
   return { sessionId: observation.sessionId, outcome: 'unknown', availability: 'pending', text: null, evidence: null };
 }
 
+function captureWriteBusy(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException).code;
+  return (
+    code === 'EEXIST' ||
+    code === 'EPERM' ||
+    /Another process holds this dispatch write|dispatch write changed during recovery/.test(String(error))
+  );
+}
+
 function logCapture(receipts: DispatchReceipts, id: string, bounds: ReadBounds) {
   const capture = receipts.capture(id, bounds.readBytes);
   const sources = (['stdout.log', 'stderr.log'] as const).map((name) => ({
@@ -1047,13 +1056,17 @@ function logCapture(receipts: DispatchReceipts, id: string, bounds: ReadBounds) 
     sources.every((source) => capture.cursor(source.name).offset === fs.statSync(source.file).size);
   const progress = () =>
     sources.reduce((total, source) => total + capture.cursor(source.name).offset, capture.delivered());
-  const flush = (bytes: number) => {
-    for (const source of sources) {
+  const sourceAllowance = (bytes: number) => sources.map(() => bytes);
+  const flush = (bytes: number, allowance?: number[]) => {
+    for (const [index, source] of sources.entries()) {
       if (!fs.existsSync(source.file)) continue;
       try {
         source.cursor = capture.cursor(source.name);
-        for (const chunk of logChunks(source.file, bounds.readBytes, source.cursor, bytes))
+        const remaining = allowance ? allowance[index] : bytes;
+        for (const chunk of logChunks(source.file, bounds.readBytes, source.cursor, Math.min(bytes, remaining))) {
+          if (allowance) allowance[index] -= chunk.length;
           capture.write(chunk, source.name, source.cursor);
+        }
       } catch (error) {
         source.cursor = capture.cursor(source.name);
         throw error;
@@ -1062,7 +1075,7 @@ function logCapture(receipts: DispatchReceipts, id: string, bounds: ReadBounds) 
     const aliasPending = capture.flushAlias();
     return !aliasPending && sourceComplete();
   };
-  return { native: capture.native, flush, sourceComplete, progress, close: capture.close };
+  return { native: capture.native, flush, sourceComplete, sourceAllowance, progress, close: capture.close };
 }
 
 function liveLogCapture(receipts: DispatchReceipts, id: string, bounds: ReadBounds) {
@@ -1080,16 +1093,21 @@ function liveLogCapture(receipts: DispatchReceipts, id: string, bounds: ReadBoun
       clearInterval(timer);
       try {
         if (runtime.now() >= deadline) return false;
-        let complete = capture.flush(bounds.workBytes ?? 64 * 1024 * 1024);
-        if (complete) return true;
-        if (!capture.sourceComplete()) return false;
+        const bytes = bounds.workBytes ?? 64 * 1024 * 1024;
+        const allowance = capture.sourceAllowance(bytes);
+        let waits = Math.ceil((deadline - runtime.now()) / 50);
         while (runtime.now() < deadline) {
-          const before = capture.progress();
+          let stalled = true;
+          try {
+            const before = capture.progress();
+            if (capture.flush(capture.sourceComplete() ? 0 : bytes, allowance)) return true;
+            if (!capture.sourceComplete()) return false;
+            stalled = capture.progress() <= before;
+          } catch (error) {
+            if (!captureWriteBusy(error)) return false;
+          }
+          if (stalled && waits-- <= 0) return false;
           await runtime.yield();
-          if (runtime.now() >= deadline) break;
-          complete = capture.flush(0);
-          if (complete) return true;
-          if (capture.progress() <= before) return false;
         }
         return false;
       } catch {
@@ -1194,32 +1212,36 @@ export async function produceStandaloneOutput(receipts: DispatchReceipts, id: st
   worker.stdin!.end(receipts.input(id));
   let progressAt = Date.now();
   let drainDeadline: number | undefined;
+  let waits = Math.ceil(options.deadlineMs / 50);
   try {
     while (true) {
+      if (ended) drainDeadline ??= Date.now() + options.deadlineMs;
       let complete: boolean;
+      let stalled = false;
       try {
         const before = capture.progress();
-        complete = capture.flush(READ_BYTES);
-        if (ended && !complete && capture.progress() <= before)
+        complete = capture.flush(capture.sourceComplete() ? 0 : READ_BYTES);
+        stalled = !complete && capture.progress() <= before;
+        if (ended && stalled && !capture.sourceComplete())
           throw new Error('The requested log is incomplete. Private output remains available.');
         progressAt = Date.now();
       } catch (error) {
-        const code = (error as NodeJS.ErrnoException).code;
-        const busy =
-          code === 'EEXIST' ||
-          code === 'EPERM' ||
-          /Another process holds this dispatch write|dispatch write changed during recovery/.test(String(error));
-        if (ended || !busy || Date.now() - progressAt >= options.deadlineMs) throw error;
+        if (
+          !captureWriteBusy(error) ||
+          (drainDeadline === undefined ? Date.now() - progressAt >= options.deadlineMs : Date.now() >= drainDeadline) ||
+          waits-- <= 0
+        )
+          throw error;
         await pause(50);
         continue;
       }
       if (ended && complete) break;
       if (ended) {
-        drainDeadline ??= Date.now() + options.deadlineMs;
-        if (Date.now() >= drainDeadline)
+        if (Date.now() >= drainDeadline! || (stalled && waits-- <= 0))
           throw new Error('The requested log is incomplete. Private output remains available.');
       }
-      if (ended || !complete) await OBSERVATION_RUNTIME.yield();
+      if (ended && stalled) await pause(50);
+      else if (ended || !complete) await OBSERVATION_RUNTIME.yield();
       else await pause(50);
     }
     save('finished');
@@ -1300,30 +1322,23 @@ async function produceBackgroundOutput(receipts: DispatchReceipts, id: string, o
       } finally {
         fs.closeSync(descriptor);
       }
-      let progressAt = Date.now();
       const drainDeadline = Date.now() + options.deadlineMs;
+      let waits = Math.ceil(options.deadlineMs / 50);
       while (true) {
         try {
           const cursor = nativeCapture.cursor('native-source.log');
           const before = cursor.offset + capture.progress();
           for (const bytes of logChunks(source, READ_BYTES, cursor, READ_BYTES)) nativeCapture.native(bytes, cursor);
-          const complete = capture.flush(READ_BYTES);
+          const complete = capture.flush(capture.sourceComplete() ? 0 : READ_BYTES);
           if (complete && cursor.offset === fs.statSync(source).size) break;
-          if (cursor.offset + capture.progress() <= before || Date.now() >= drainDeadline)
+          const stalled = cursor.offset + capture.progress() <= before;
+          const pendingAlias = capture.sourceComplete() && cursor.offset === fs.statSync(source).size;
+          if ((stalled && !pendingAlias) || Date.now() >= drainDeadline || (stalled && waits-- <= 0))
             throw new Error('The requested log is incomplete. Private output remains available.');
-          progressAt = Date.now();
-          await OBSERVATION_RUNTIME.yield();
+          if (stalled) await pause(50);
+          else await OBSERVATION_RUNTIME.yield();
         } catch (error) {
-          const code = (error as NodeJS.ErrnoException).code;
-          if (
-            (code !== 'EEXIST' &&
-              code !== 'EPERM' &&
-              !/Another process holds this dispatch write|dispatch write changed during recovery/.test(
-                String(error),
-              )) ||
-            Date.now() - progressAt >= options.deadlineMs
-          )
-            throw error;
+          if (!captureWriteBusy(error) || Date.now() >= drainDeadline || waits-- <= 0) throw error;
           await pause(50);
         }
       }

@@ -120,7 +120,7 @@ test.each(['missing', 'different', 'oversized'] as const)(
   },
 );
 
-test.each(['complete', 'budget', 'denied'] as const)(
+test.each(['complete', 'budget', 'denied', 'transient', 'busy', 'busy-budget', 'busy-denied'] as const)(
   'frozen-clock capture close stops or drains %s output',
   async (kind) => {
     const { receipts, launch } = workerFixture('', 100, false, true);
@@ -144,86 +144,134 @@ test.each(['complete', 'budget', 'denied'] as const)(
     );
     const alias = launch.standalone!.logAlias!;
     const open = fs.openSync;
+    let blocked = kind === 'denied' || kind === 'transient';
     vi.spyOn(fs, 'openSync').mockImplementation((file, ...args) => {
-      if (kind === 'denied' && String(file) === alias)
-        throw Object.assign(new Error('Alias unavailable'), { code: 'EPERM' });
+      if (blocked && String(file) === alias) throw Object.assign(new Error('Alias unavailable'), { code: 'EPERM' });
       return Reflect.apply(open, fs, [file, ...args]);
     });
+    const capture = receipts.capture.bind(receipts);
+    let writes = 0;
+    vi.spyOn(receipts, 'capture').mockImplementation((...args) => {
+      const result = capture(...args);
+      const write = result.write;
+      result.write = (...values) => {
+        if (values[1] === 'stderr.log' && kind.startsWith('busy')) {
+          writes++;
+          if (kind === 'busy-denied' || writes === 2) throw new Error('Another process holds this dispatch write');
+        }
+        return write(...values);
+      };
+      return result;
+    });
     let yields = 0;
-    const bounds = { frameBytes: 1024, readBytes: 64 * 1024, workBytes: kind === 'budget' ? 512 : 1024 * 1024 };
+    let aliasYields = 0;
+    const budget = kind === 'budget' || kind === 'busy-budget';
+    const bounds = {
+      frameBytes: 1024,
+      readBytes: kind.startsWith('busy') ? 64 : 64 * 1024,
+      workBytes: budget ? 512 : 1024 * 1024,
+    };
     const status = (await superviseStandalone(receipts, id, true, bounds, {
       now: () => 0,
       identity: async () => null,
       yield: async () => {
         assert.ok(++yields <= 32, 'Capture exceeded finite yields.');
+        if (kind === 'transient' && fs.existsSync(receipts.artifact(id, 'capture.json'))) {
+          const state = JSON.parse(fs.readFileSync(receipts.artifact(id, 'capture.json'), 'utf8'));
+          if (state.sources['stderr.log']?.offset === stderr.length && ++aliasYields >= 2) blocked = false;
+        }
       },
     })) as any;
     const cursor = JSON.parse(fs.readFileSync(receipts.artifact(id, 'capture.json'), 'utf8'));
     assert.equal(cursor.sources['stdout.log'].offset, stdout.length);
-    assert.equal(cursor.sources['stderr.log'].offset, Math.min(stderr.length, bounds.workBytes));
-    assert.equal(status.observation.monitor, kind === 'complete' ? 'finished' : 'timed-out');
+    assert.equal(
+      cursor.sources['stderr.log']?.offset ?? 0,
+      kind === 'busy-denied'
+        ? 0
+        : kind === 'busy-budget'
+          ? bounds.workBytes - bounds.readBytes
+          : Math.min(stderr.length, bounds.workBytes),
+    );
+    const complete = ['complete', 'transient', 'busy'].includes(kind);
+    assert.equal(status.observation.monitor, complete ? 'finished' : 'timed-out');
     assert.equal(fs.readFileSync(receipts.artifact(id, 'stderr.log')).equals(stderr), true);
-    if (kind === 'complete') assert.equal(fs.readFileSync(alias).equals(Buffer.concat([stdout, stderr])), true);
+    if (complete) assert.equal(fs.readFileSync(alias).equals(Buffer.concat([stdout, stderr])), true);
     else assert.ok(fs.statSync(alias).size < stdout.length + stderr.length);
     assert.equal(status.observation.exitCode, 0);
     assert.equal(vi.mocked(childProcess.spawn).mock.calls.length, 0);
   },
 );
 
-test.each(['print', 'background'] as const)(
-  'ended %s producer stops denied alias delivery without advancing time',
-  async (kind) => {
-    if (process.send) vi.spyOn(process, 'send').mockImplementation(() => true);
-    vi.spyOn(process, 'disconnect').mockImplementation(() => {});
-    const { receipts, launch } = kind === 'background' ? backgroundFixture(true) : workerFixture('', 100, false, true);
-    const id = launch.launchId;
-    fs.writeFileSync(receipts.artifact(id, 'stdout.log'), 'output');
-    fs.writeFileSync(receipts.artifact(id, 'stderr.log'), 'diagnostic');
-    if (kind === 'background') receipts.background(id, 'deadbeef');
-    const registry = vi.mocked(promisify(childProcess.execFile));
-    registry.mockImplementation(() =>
-      Object.assign(
-        Promise.resolve({
-          stdout: JSON.stringify([{ id: 'deadbeef', sessionId: session, state: 'done' }]),
-          stderr: '',
-        }),
-        { child: new ChildProcess() },
-      ),
+test.each(
+  ['print', 'background'].flatMap((kind) =>
+    ['denied', 'transient', 'busy', 'permanent-busy'].map((failure) => ({ kind, failure })),
+  ),
+)('ended $kind producer bounds $failure delivery without advancing time', async ({ kind, failure }) => {
+  vi.useFakeTimers({ toFake: ['setTimeout', 'setImmediate'] });
+  if (process.send) vi.spyOn(process, 'send').mockImplementation(() => true);
+  vi.spyOn(process, 'disconnect').mockImplementation(() => {});
+  const { receipts, launch } = kind === 'background' ? backgroundFixture(true) : workerFixture('', 100, false, true);
+  launch.standalone!.deadlineMs = 100;
+  vi.spyOn(receipts, 'launch').mockReturnValue(launch);
+  const id = launch.launchId;
+  fs.writeFileSync(receipts.artifact(id, 'stdout.log'), 'output');
+  fs.writeFileSync(receipts.artifact(id, 'stderr.log'), 'diagnostic');
+  if (kind === 'background') receipts.background(id, 'deadbeef');
+  const registry = vi.mocked(promisify(childProcess.execFile));
+  registry.mockImplementation(() =>
+    Object.assign(
+      Promise.resolve({
+        stdout: JSON.stringify([{ id: 'deadbeef', sessionId: session, state: 'done' }]),
+        stderr: '',
+      }),
+      { child: new ChildProcess() },
+    ),
+  );
+  vi.mocked(childProcess.spawn).mockImplementation((_command, _args, settings) => {
+    assert.ok(vi.mocked(childProcess.spawn).mock.calls.length <= 2);
+    if (kind === 'background') fs.writeSync((settings!.stdio as number[])[1], Buffer.from('native'));
+    const child = new ChildProcess();
+    child.stdin = new PassThrough();
+    queueMicrotask(() => child.emit('close', 0, null));
+    return child;
+  });
+  const open = fs.openSync;
+  let blocked = failure === 'denied' || failure === 'transient';
+  vi.spyOn(fs, 'openSync').mockImplementation((file, ...args) => {
+    if (blocked && String(file) === launch.standalone!.logAlias)
+      throw Object.assign(new Error('Alias unavailable'), { code: 'EPERM' });
+    return Reflect.apply(open, fs, [file, ...args]);
+  });
+  const capture = receipts.capture.bind(receipts);
+  let flushes = 0;
+  vi.spyOn(receipts, 'capture').mockImplementation((...args) => {
+    const result = capture(...args);
+    const flush = result.flushAlias;
+    result.flushAlias = () => {
+      if (++flushes > 12) throw new Error('Finite alias invocation bound.');
+      if (failure === 'transient' && flushes > 2) blocked = false;
+      if (failure === 'permanent-busy' || (failure === 'busy' && flushes === 2))
+        throw new Error('Another process holds this dispatch write');
+      return flush();
+    };
+    return result;
+  });
+  vi.spyOn(Date, 'now').mockReturnValue(0);
+  const pending = produceStandaloneOutput(receipts, id);
+  await vi.runAllTimersAsync();
+  await pending;
+  const owner = JSON.parse(fs.readFileSync(receipts.artifact(id, 'output-owner.json'), 'utf8'));
+  const complete = failure === 'transient' || failure === 'busy';
+  assert.equal(owner.state, complete ? 'finished' : 'unavailable');
+  assert.ok(flushes <= 5, 'Delivery exceeded its finite retry allowance.');
+  if (complete)
+    assert.equal(
+      fs.readFileSync(launch.standalone!.logAlias!, 'utf8'),
+      kind === 'background' ? 'native' : 'outputdiagnostic',
     );
-    vi.mocked(childProcess.spawn).mockImplementation((_command, _args, settings) => {
-      assert.ok(vi.mocked(childProcess.spawn).mock.calls.length <= 2);
-      if (kind === 'background') fs.writeSync((settings!.stdio as number[])[1], Buffer.from('native'));
-      const child = new ChildProcess();
-      child.stdin = new PassThrough();
-      queueMicrotask(() => child.emit('close', 0, null));
-      return child;
-    });
-    const open = fs.openSync;
-    vi.spyOn(fs, 'openSync').mockImplementation((file, ...args) => {
-      if (String(file) === launch.standalone!.logAlias)
-        throw Object.assign(new Error('Alias unavailable'), { code: 'EPERM' });
-      return Reflect.apply(open, fs, [file, ...args]);
-    });
-    const capture = receipts.capture.bind(receipts);
-    let flushes = 0;
-    vi.spyOn(receipts, 'capture').mockImplementation((...args) => {
-      const result = capture(...args);
-      const flush = result.flushAlias;
-      result.flushAlias = () => {
-        if (++flushes > 12) throw new Error('Finite alias invocation bound.');
-        return flush();
-      };
-      return result;
-    });
-    vi.spyOn(Date, 'now').mockReturnValue(0);
-    await produceStandaloneOutput(receipts, id);
-    const owner = JSON.parse(fs.readFileSync(receipts.artifact(id, 'output-owner.json'), 'utf8'));
-    assert.equal(owner.state, 'unavailable');
-    assert.ok(flushes <= 4, 'Denied delivery must stop without repeated alias attempts.');
-    assert.equal(fs.readFileSync(receipts.artifact(id, 'stdout.log'), 'utf8'), 'output');
-    assert.equal(receipts.latest(id), null);
-  },
-);
+  assert.equal(fs.readFileSync(receipts.artifact(id, 'stdout.log'), 'utf8'), 'output');
+  assert.equal(receipts.latest(id), null);
+});
 
 test('background interrupted completion publishes unavailable saved evidence after pending', async () => {
   const { home } = fixture();
@@ -3734,9 +3782,10 @@ test('an existing print output owner refuses another native producer', async () 
 });
 
 test('print capture retains final bytes for alias recovery after denied delivery', async () => {
+  vi.useFakeTimers({ toFake: ['setTimeout', 'setImmediate'] });
   vi.spyOn(process, 'send').mockImplementation(() => true);
   vi.spyOn(process, 'disconnect').mockImplementation(() => {});
-  const { receipts, launch } = workerFixture('', 10_000, false, true);
+  const { receipts, launch } = workerFixture('', 100, false, true);
   const stdout = receipts.artifact(launch.launchId, 'stdout.log');
   const stderr = receipts.artifact(launch.launchId, 'stderr.log');
   fs.writeFileSync(stdout, 'prefix');
@@ -3758,13 +3807,15 @@ test('print capture retains final bytes for alias recovery after denied delivery
   const owner = () => JSON.parse(fs.readFileSync(receipts.artifact(launch.launchId, 'output-owner.json'), 'utf8'));
   const pending = produceStandaloneOutput(receipts, launch.launchId);
   try {
-    await vi.waitFor(() => assert.equal(fs.readFileSync(alias, 'utf8'), 'prefix'));
+    assert.equal(fs.readFileSync(alias, 'utf8'), 'prefix');
     blocked = true;
     fs.appendFileSync(stdout, ' final');
     child.emit('close', 0, null);
-    await vi.waitFor(() => assert.equal(failed, true));
+    await vi.advanceTimersByTimeAsync(50);
+    assert.equal(failed, true);
     assert.notEqual(owner().state, 'finished');
     assert.equal(fs.readFileSync(alias, 'utf8'), 'prefix');
+    await vi.runAllTimersAsync();
     await pending;
     assert.equal(owner().state, 'unavailable');
     assert.equal(fs.readFileSync(receipts.artifact(launch.launchId, 'worker.log'), 'utf8'), 'prefix final');
@@ -3780,6 +3831,7 @@ test('print capture retains final bytes for alias recovery after denied delivery
   } finally {
     blocked = false;
     child.emit('close', 0, null);
+    await vi.runAllTimersAsync();
     await pending;
     failure.mockRestore();
   }

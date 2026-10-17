@@ -221,9 +221,9 @@ test.each(
     failure.mockRestore();
     syncBuiltinESMExports();
     assert.equal(failed, true);
-    assert.deepEqual(fs.readFileSync(alias), prefix);
+    assert.equal(fs.readFileSync(alias).equals(prefix), true);
     const captured = Buffer.concat([prefix, missing]);
-    assert.deepEqual(fs.readFileSync(privateFile), captured);
+    assert.equal(fs.readFileSync(privateFile).equals(captured), true);
     assert.deepEqual(capture.cursor(name), { offset: captured.length, identity: 'source' });
     const event = report(receipts, standalone.launchId);
     assert.equal((receipts.result(standalone.launchId, event.eventId) as { text: string }).text, 'Report');
@@ -273,7 +273,7 @@ test.each(
       /* Drain the remaining alias bytes. */
     }
     const complete = Buffer.concat([captured, tail]);
-    assert.deepEqual(fs.readFileSync(privateFile), complete);
+    assert.equal(fs.readFileSync(privateFile).equals(complete), true);
     assert.ok(
       fs.readFileSync(alias).equals(replacement ?? complete),
       'alias must contain every captured byte exactly once',
