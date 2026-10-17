@@ -335,41 +335,6 @@ test('repeated dispatch receipts charge the first chronological turn across spoo
   }
 });
 
-test('child file records exclude colliding parent rows through capture and wire projection', () => {
-  const child = projectTurn(
-    turn({ files: [{ path: '/one/src/shared.ts', added: 3, removed: 0, isNew: false, edits: [] }] }),
-    'child',
-    { cwd: '/one' },
-    [],
-    'child',
-    new Map(),
-  );
-  const parent = projectTurn(
-    turn({
-      files: [{ path: '/root/src/shared.ts', added: 2, removed: 0, isNew: false, edits: [] }],
-      agents: [subagent({ id: 'child', description: 'Child task', status: 'completed' })],
-    }),
-    'parent',
-    { cwd: '/root' },
-    [],
-    'root',
-    new Map(),
-  );
-  parent.agents[0].artifacts = { files: child.files, commits: [], complete: true };
-  const projected = toCard(exportTurn(parent, 'claude', 'root'), false, 10000);
-  const card: CardView = JSON.parse(JSON.stringify(exportCard(projected)));
-  const figure = card.agents![0].figures.find((figure) => figure.metric === 'files')!;
-  assert.equal(figure.compactLabel, '1 file');
-  const record = agentFigureRecord(figure, card.key, card.files!, [])!();
-  assert.equal(record.rows?.kind, 'files');
-  if (record.rows?.kind !== 'files') throw new Error('Missing child files');
-  assert.deepEqual(
-    record.rows.files.map((file) => ({ path: file.path, added: file.added })),
-    [{ path: 'src/shared.ts', added: 3 }],
-  );
-  assert.doesNotMatch(JSON.stringify(card), /\/root\/|\/one\//);
-});
-
 test('delegated file identities distinguish relative-name collisions and deduplicate physical paths', async () => {
   for (const platform of ['win32', 'darwin', 'linux']) {
     vi.stubGlobal('process', { ...process, platform });

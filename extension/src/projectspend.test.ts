@@ -4178,7 +4178,9 @@ test('per-pass pricing replaces growing child bands after a ledger reload withou
   const first = indexSpendFile(undefined, file, 'w', makeChildReducer, 1, budget).record;
   saveSpendLedger(storage, 'w', [first]);
   const restored = loadSpendLedger(storage, 'w').files[0];
-  fs.appendFileSync(file, write(advisorResponseRecords({ sidechain: true, iterations: MIXED_PASS_ITERATIONS })));
+  // The grown response is written twice, so the resumed read also proves that a replayed line adds nothing.
+  for (let replay = 0; replay < 2; replay++)
+    fs.appendFileSync(file, write(advisorResponseRecords({ sidechain: true, iterations: MIXED_PASS_ITERATIONS })));
   const resumed = indexSpendFile(restored, file, 'w', makeChildReducer, 2, budget).record;
   const full = indexSpendFile(undefined, file, 'w', makeChildReducer, 2, budget).record;
   assert.deepEqual(resumed.buckets, full.buckets);

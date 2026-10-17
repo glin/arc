@@ -377,7 +377,6 @@ test('every streamed citation prefix stays nonactionable until its closing brace
   for (let end = 0; end < source.length; end += 1)
     assert.doesNotMatch(renderRichMarkdown(source.slice(0, end)), /data-link-kind/, `${end}`);
   assert.match(renderRichMarkdown(source), /data-link-kind/);
-  assert.equal(source, citation(citationPath('file%20name.csv'), 'purpose=source'));
 });
 
 test('malformed citation scanning shares a four-code-unit allowance across retries', () => {

@@ -2256,7 +2256,6 @@ test('accepted unread same-turn facts publish before repository hydration', asyn
   assert.equal(provider.messages.length, 2);
   assert.ok(provider.messages.at(-1).cards[0].commits[0].dir);
   assert.equal(fixture.bytes.length, 2);
-  process.stdout.write(`selected publication payload bytes ${JSON.stringify(fixture.bytes)}\n`);
 });
 
 test('a completed response appended during repository hydration publishes without another poll', async () => {
@@ -2348,7 +2347,6 @@ test('selected publication suppresses unchanged and obsolete repository enrichme
       `${outcome} repeated the selected publication`,
     );
     assert.equal(fixture.bytes.length, outcome === 'published' ? 2 : 1, outcome);
-    process.stdout.write(`selected publication case ${outcome} ${JSON.stringify(fixture.bytes)}\n`);
   }
 });
 
@@ -2521,7 +2519,6 @@ test('unchanged selected enrichment indexes retained history and projects only c
     assert.ok(keyReads <= count * 2, `${count} retained turns performed ${keyReads} card key reads`);
     assert.equal(projections, count, 'retained turns did not use the shared commit-row projection');
     assert.equal(fullCards, 0, 'commit comparison projected response, activity, and file content');
-    process.stdout.write(`retained publication work ${JSON.stringify({ count, keyReads, projections, fullCards })}\n`);
   }
 });
 

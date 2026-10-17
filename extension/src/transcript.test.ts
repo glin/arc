@@ -276,8 +276,6 @@ import {
   OPEN_SPEND_BAND_MS,
   OPEN_SPEND_BYTES_PER_MS,
   readChildSpend,
-  addUsage,
-  emptyUsage,
   spendTokens,
 } from './agentspend.ts';
 import { estimateCost, quoteUsage } from './pricing.ts';
@@ -16116,26 +16114,6 @@ test('a child read replaces each advisor consultation of a growing response, acr
   // A saved state is JSON, so the resumed read starts from a JSON copy.
   const resumed = createClaudeUsageLineReducer(JSON.parse(JSON.stringify(first.snapshot())), { childTranscript: true });
   assert.deepEqual(totals([...head, ...lines.slice(2).flatMap((line) => resumed.pushLine(line))]), single);
-});
-
-test('per-pass pricing keeps growing child bands equal through a restored checkpoint', () => {
-  const iterations = [
-    advisorIteration({ input_tokens: 100000, output_tokens: 7 }),
-    advisorIteration({ input_tokens: 100001, output_tokens: 11 }),
-  ];
-  const line = (count: number) =>
-    JSON.stringify(advisorResponseRecords({ sidechain: true, iterations: iterations.slice(0, count), blocks: 1 })[0]);
-  const initial = createClaudeUsageLineReducer(undefined, { childTranscript: true });
-  const total = emptyUsage();
-  for (const event of initial.pushLine(line(1))) addUsage(total, event.usage, event.contextBand);
-  const resumed = createClaudeUsageLineReducer(JSON.parse(JSON.stringify(initial.snapshot())), {
-    childTranscript: true,
-  });
-  for (const event of resumed.pushLine(line(2))) addUsage(total, event.usage, event.contextBand);
-  for (const event of resumed.pushLine(line(2))) addUsage(total, event.usage, event.contextBand);
-  assert.ok(Math.abs(estimateCost(total, 'claude-haiku-5-5')! - 0.0600315) < 1e-12);
-  const full = createClaudeUsageLineReducer(undefined, { childTranscript: true }).pushLine(line(2))[0].usage;
-  assert.deepEqual(total, full);
 });
 
 test('per-pass pricing measures the post-compaction prefix from the first executor pass', () => {
