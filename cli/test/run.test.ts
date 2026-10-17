@@ -1721,10 +1721,10 @@ test.each(['complete', 'deadline'] as const)(
       } else assert.equal(status.observation.monitor, 'finished');
       assert.equal(fs.statSync(alias).size, captured.length);
       assert.ok(yields > 0);
-      assert.deepEqual(fs.readFileSync(alias), captured);
-      assert.deepEqual(Buffer.from([...captured].filter((byte) => byte !== 255)), stdout);
+      assert.equal(fs.readFileSync(alias).equals(captured), true);
+      assert.equal(Buffer.from([...captured].filter((byte) => byte !== 255)).equals(stdout), true);
       assert.equal([...captured].filter((byte) => byte === 255).length, stderr.length);
-      assert.deepEqual(fs.readFileSync(receipts.artifact(id, 'worker.log')), captured);
+      assert.equal(fs.readFileSync(receipts.artifact(id, 'worker.log')).equals(captured), true);
       assert.equal(receipts.latest(id)?.eventId, event.eventId);
       assert.equal((receipts.result(id, event.eventId) as any).text, 'Report');
       assert.equal(receipts.observation(id)?.monitor, 'finished');
@@ -3854,12 +3854,12 @@ const lateWatcher=fs.watch(process.cwd(),lateFinish);lateFinish();return;`;
       await vi.waitFor(() => assert.equal(owner().state, 'finished'), { timeout: 5000 });
       const stdout = fs.readFileSync(receipts.artifact(launch.launchId, 'stdout.log'));
       const stderr = fs.readFileSync(receipts.artifact(launch.launchId, 'stderr.log'));
-      assert.deepEqual(stdout, Buffer.from(stdoutPrefix + (stderrEnding ? '' : terminal)));
-      assert.deepEqual(stderr, Buffer.concat([diagnostic, ...(stderrEnding ? [Buffer.from(terminal)] : [])]));
+      assert.equal(stdout.equals(Buffer.from(stdoutPrefix + (stderrEnding ? '' : terminal))), true);
+      assert.equal(stderr.equals(Buffer.concat([diagnostic, ...(stderrEnding ? [Buffer.from(terminal)] : [])])), true);
       const captured = fs.readFileSync(receipts.artifact(launch.launchId, 'worker.log'));
       assert.equal(captured.length, stdout.length + stderr.length);
       if (!stderrEnding) {
-        assert.deepEqual(Buffer.from([...captured].filter((byte) => byte !== 255)), stdout);
+        assert.equal(Buffer.from([...captured].filter((byte) => byte !== 255)).equals(stdout), true);
         assert.equal([...captured].filter((byte) => byte === 255).length, diagnostic.length);
       }
       assert.equal(fs.readFileSync(alias, 'utf8'), 'Second launch');
@@ -4060,7 +4060,10 @@ test('background log continues after observation and recovers without taking a r
     fs.appendFileSync(native, 'Survives capture failure\n');
     await vi.waitFor(() => assert.equal(owner().state, 'unavailable'), { timeout: 8000 });
     await vi.waitFor(() => assert.throws(() => process.kill(owner().pid, 0), { code: 'ESRCH' }), { timeout: 5000 });
-    assert.deepEqual(fs.readFileSync(native), Buffer.concat([combined, Buffer.from('Survives capture failure\n')]));
+    assert.equal(
+      fs.readFileSync(native).equals(Buffer.concat([combined, Buffer.from('Survives capture failure\n')])),
+      true,
+    );
     fs.rmdirSync(capturedNative);
     fs.renameSync(capturedNative + '.saved', capturedNative);
     fs.writeFileSync(registry, JSON.stringify([{ ...registryEntry, state: 'stopped' }]));
@@ -4073,7 +4076,7 @@ test('background log continues after observation and recovers without taking a r
       },
       { timeout: 8000 },
     );
-    assert.deepEqual(fs.readFileSync(capturedNative), fs.readFileSync(native));
+    assert.equal(fs.readFileSync(capturedNative).equals(fs.readFileSync(native)), true);
     assert.equal(fs.readFileSync(options.logAlias!, 'utf8'), 'Second launch');
     assert.equal((receipts.result(launch.launchId, frozen.eventId) as any).text, 'Frozen response');
     const position = JSON.parse(fs.readFileSync(receipts.artifact(launch.launchId, 'capture.json'), 'utf8'));
