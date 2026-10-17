@@ -4791,9 +4791,17 @@ test('older hosts refuse shorthand before either query route connects and retain
   await channel.update({ folders: [], scopeReady: true, panelReady: false, panelVisible: false });
   const registration = path.join(home, 'hosts', `${channel.hostId}.json`);
   const old = JSON.parse(fs.readFileSync(registration, 'utf8'));
-  old.capabilities = ['sessionQuery'];
+  old.capabilities = ['requesterProvider'];
   fs.writeFileSync(registration, JSON.stringify(old));
   try {
+    for (const method of ['filter', 'sessions'] as const)
+      await assert.rejects(
+        requestWindow(method, { query: 'session:one' }, channel.hostId, home),
+        /must reload before it can accept filter queries/,
+      );
+    assert.equal(seen.length, 0);
+    old.capabilities = ['sessionQuery'];
+    fs.writeFileSync(registration, JSON.stringify(old));
     for (const method of ['filter', 'sessions'] as const) {
       for (const query of [
         'id:01a12cef id:01a12a6b',
