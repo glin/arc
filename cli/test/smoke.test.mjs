@@ -1787,7 +1787,7 @@ for(const row of [{type:'thread.started',thread_id:'${id}'},{type:'turn.started'
     ...smokeEnv,
     ARC_HOME: home,
     CODEX_BIN: process.execPath,
-    NODE_OPTIONS: `--require ${JSON.stringify(preloader)}`,
+    NODE_OPTIONS: [smokeEnv.NODE_OPTIONS, `--require ${JSON.stringify(preloader)}`].filter(Boolean).join(' '),
   };
   try {
     const result = await run(
