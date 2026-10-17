@@ -16,7 +16,13 @@ import {
 } from '../../extension/src/dispatchreceipts.ts';
 import { linuxProcessStart } from '../../extension/src/store.ts';
 import { payloadSha256 } from '../../extension/src/sessionwrites.ts';
-import { projectSlug, readQualifiedOpening, revisionOf, type SessionFile } from '../../extension/src/transcript.ts';
+import {
+  cleanPrompt,
+  projectSlug,
+  readQualifiedOpening,
+  revisionOf,
+  type SessionFile,
+} from '../../extension/src/transcript.ts';
 import { savedDispatchResponse } from '../../extension/src/sessionreads.ts';
 import { childEnv } from '../../extension/src/agenthost.ts';
 
@@ -935,7 +941,13 @@ function savedBackground(
     const revision = revisionOf(fs.statSync(file, { bigint: true }));
     const source = { ...revision, file, sessionId, agent: 'claude' } as SessionFile;
     const response = savedDispatchResponse(source, '1');
-    if (!response?.finished || response.prompt !== prompt || !response.responseIds.length) return null;
+    if (
+      !response?.finished ||
+      !response.prompt ||
+      response.prompt !== cleanPrompt(prompt) ||
+      !response.responseIds.length
+    )
+      return null;
     const text = response.text.trim() && Buffer.byteLength(response.text) <= REPORT_BYTES ? response.text : null;
     return {
       sessionId,

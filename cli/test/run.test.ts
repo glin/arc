@@ -2196,8 +2196,9 @@ test('fresh close at exact-budget EOF completes its original report', async () =
   }
 });
 
-function backgroundFixture(logged = false, env = process.env) {
+function backgroundFixture(logged = false, env = process.env, prompt = 'Review this folder.') {
   const { home, args } = fixture();
+  fs.writeFileSync(path.join(home, 'prompt.txt'), prompt);
   const options = parseRun(
     [
       ...args.map((value, index) => (index === 1 ? 'claude' : value)),
@@ -2217,14 +2218,94 @@ function backgroundFixture(logged = false, env = process.env) {
     requester: null,
     policy: null,
     completion: 'manual',
-    promptSha256: payloadSha256('Review this folder.'),
+    promptSha256: payloadSha256(prompt),
     alias: null,
     transport: 'standalone',
     standalone: { ...options, command: process.execPath, args: [script, ...options.args] },
   });
-  receipts.input(launch.launchId, 'Review this folder.');
+  receipts.input(launch.launchId, prompt);
   return { receipts, launch, options, script, calls };
 }
+
+test.each(['matching', 'different'] as const)(
+  'CRLF prompt-file background response accepts only %s content',
+  async (kind) => {
+    const { home } = fixture();
+    const prompt = 'Review this folder.\r\n';
+    const { receipts, launch, options, script } = backgroundFixture(
+      false,
+      {
+        ...process.env,
+        ARC_PROJECTS_ROOT: path.join(home, 'projects'),
+      },
+      prompt,
+    );
+    receipts.background(launch.launchId, 'deadbeef');
+    receipts.observation(launch.launchId, {
+      supervisor: { pid: process.pid, token: 'retained' },
+      worker: null,
+      sessionId: null,
+      exitCode: null,
+      signal: null,
+      monitor: 'observing',
+    });
+    const source = path.join(options.env!.ARC_PROJECTS_ROOT!, projectSlug(options.cwd), `${session}.jsonl`);
+    fs.mkdirSync(path.dirname(source), { recursive: true });
+    const at = '2026-01-01T00:00:00Z';
+    const transcriptPrompt = kind === 'matching' ? prompt : 'Review another folder.\r\n';
+    fs.writeFileSync(
+      source,
+      [
+        { type: 'user', uuid: 'prompt', timestamp: at, message: { role: 'user', content: transcriptPrompt } },
+        {
+          type: 'assistant',
+          timestamp: at,
+          message: {
+            id: 'response',
+            role: 'assistant',
+            stop_reason: 'end_turn',
+            content: [{ type: 'text', text: 'Completed report' }],
+            usage: { input_tokens: 1, output_tokens: 2 },
+          },
+        },
+      ]
+        .map((row) => JSON.stringify(row))
+        .join('\n') + '\n',
+    );
+    const registry = vi.mocked(promisify(childProcess.execFile));
+    registry.mockImplementation((_command, args) => {
+      assert.equal(registry.mock.calls.length, 1, 'Registry invocation bound exceeded.');
+      assert.deepEqual(args, [script, 'agents', '--json']);
+      return Object.assign(
+        Promise.resolve({
+          stdout: JSON.stringify([{ id: 'deadbeef', sessionId: session, state: 'done', pid: 123 }]),
+          stderr: '',
+        }),
+        { child: new ChildProcess() },
+      );
+    });
+    await superviseStandalone(receipts, launch.launchId, true, {
+      frameBytes: 256,
+      readBytes: 17,
+      workBytes: 1024,
+    });
+    assert.equal(receipts.input(launch.launchId), prompt);
+    assert.equal(launch.promptSha256, payloadSha256(prompt));
+    assert.equal(Buffer.byteLength(receipts.input(launch.launchId)), Buffer.byteLength(prompt));
+    assert.equal(receipts.observation(launch.launchId)?.sessionId, session);
+    const event = receipts.latest(launch.launchId)!;
+    if (kind === 'different') {
+      assert.equal(event.report, null, 'Different prompt content must not publish a report.');
+      assert.equal(event.availability, 'pending');
+      return;
+    }
+    assert.equal(event.availability, 'available', 'The CRLF prompt must publish its completed report.');
+    assert.equal(event.outcome, 'succeeded');
+    assert.equal((receipts.result(launch.launchId, event.eventId) as { text: string }).text, 'Completed report');
+    fs.writeFileSync(source, 'Changed transcript');
+    assert.equal((receipts.result(launch.launchId, event.eventId) as { text: string }).text, 'Completed report');
+  },
+);
 
 test('mixed native session lists retain the launch-bound job and completed report', async () => {
   const { home } = fixture();
