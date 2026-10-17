@@ -110,52 +110,59 @@ function waitForExit(child) {
   return new Promise((resolveExit) => child.once('exit', resolveExit));
 }
 
-function forceStopProcessTree(pid) {
-  if (!pid) return;
+// Each Windows taskkill call takes seconds on a busy machine, so one call stops every tree.
+function forceStopProcessTrees(pids) {
+  const targets = [...new Set(pids.filter(Boolean))];
+  if (!targets.length) return;
   if (process.platform === 'win32') {
-    spawnSync('taskkill', ['/pid', String(pid), '/t', '/f'], { windowsHide: true });
+    spawnSync('taskkill', [...targets.flatMap((pid) => ['/pid', String(pid)]), '/t', '/f'], { windowsHide: true });
     return;
   }
-  try {
-    process.kill(-pid, 'SIGKILL');
-  } catch {
+  for (const pid of targets) {
     try {
-      process.kill(pid, 'SIGKILL');
-    } catch {}
+      process.kill(-pid, 'SIGKILL');
+    } catch {
+      try {
+        process.kill(pid, 'SIGKILL');
+      } catch {}
+    }
   }
 }
 
-function ownedBrowserPids(token) {
+// Stops every process tree whose command line carries the token, and the extra trees, then returns the token pids.
+// On Windows one PowerShell call both queries and stops, because each process query takes seconds on a busy machine.
+// Its own command line carries the token too, so the query skips its own process.
+function stopOwnedBrowserProcesses(token, extraPids = []) {
+  const argument = `${BROWSER_OWNERSHIP_ARGUMENT}${token}`;
   let result;
   if (process.platform === 'win32') {
-    result = spawnSync(
-      'powershell.exe',
-      [
-        '-NoProfile',
-        '-NonInteractive',
-        '-Command',
-        'Get-CimInstance Win32_Process | Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress',
-      ],
-      { encoding: 'utf8', windowsHide: true, timeout: 5_000 },
-    );
+    const extra = extraPids.filter(Number.isInteger).join(',');
+    const script = [
+      `$owned = @(Get-CimInstance Win32_Process | Where-Object { $_.ProcessId -ne $PID -and $_.CommandLine -and $_.CommandLine.Contains('${argument}') } | ForEach-Object { $_.ProcessId })`,
+      `$targets = @($owned) + @(${extra})`,
+      `if ($targets.Count) { $arguments = foreach ($id in $targets) { '/pid'; [string]$id }; taskkill.exe @arguments /t /f 2>&1 | Out-Null }`,
+      `$owned -join ','`,
+    ].join('\n');
+    result = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], {
+      encoding: 'utf8',
+      windowsHide: true,
+      timeout: 15_000,
+    });
     if (result.error || result.status !== 0) {
-      throw new Error(`could not inspect owned browser processes: ${commandFailure(result, 5_000)}`);
+      throw new Error(`could not stop owned browser processes: ${commandFailure(result, 15_000)}`);
     }
-    const parsed = result.stdout.trim() ? JSON.parse(result.stdout) : [];
-    const processes = Array.isArray(parsed) ? parsed : [parsed];
-    return processes
-      .filter((entry) => entry.CommandLine?.includes(`${BROWSER_OWNERSHIP_ARGUMENT}${token}`))
-      .map((entry) => Number(entry.ProcessId))
-      .filter(Number.isInteger);
+    return result.stdout.trim().split(',').filter(Boolean).map(Number).filter(Number.isInteger);
   }
   result = spawnSync('ps', ['-A', '-o', 'pid=,args='], { encoding: 'utf8', timeout: 5_000 });
   if (result.error || result.status !== 0) {
     throw new Error(`could not inspect owned browser processes: ${commandFailure(result, 5_000)}`);
   }
-  return result.stdout.split('\n').flatMap((line) => {
+  const owned = result.stdout.split('\n').flatMap((line) => {
     const match = line.match(/^\s*(\d+)\s+(.*)$/);
-    return match?.[2].includes(`${BROWSER_OWNERSHIP_ARGUMENT}${token}`) ? [Number(match[1])] : [];
+    return match?.[2].includes(argument) ? [Number(match[1])] : [];
   });
+  forceStopProcessTrees([...owned, ...extraPids]);
+  return owned;
 }
 
 function processExists(pid) {
@@ -187,12 +194,11 @@ function waitForProcessIdsToExit(pids, deadlineMs) {
 }
 
 async function stopBrowserOwner(child, token) {
-  const owned = new Set(ownedBrowserPids(token));
-  for (const pid of owned) forceStopProcessTree(pid);
-  if (child.exitCode === null && child.signalCode === null) forceStopProcessTree(child.pid);
+  const ownerRunning = child.exitCode === null && child.signalCode === null;
+  const owned = new Set(stopOwnedBrowserProcesses(token, ownerRunning ? [child.pid] : []));
   await withDeadline(waitForExit(child), 2_000, 'browser owner could not be stopped');
-  for (const pid of ownedBrowserPids(token)) owned.add(pid);
-  for (const pid of owned) forceStopProcessTree(pid);
+  // The second pass stops a process that launched during the first one.
+  for (const pid of stopOwnedBrowserProcesses(token)) owned.add(pid);
   await waitForProcessIdsToExit([...owned], 5_000);
 }
 
@@ -251,8 +257,7 @@ function launchBrowserOwner(channel, { launchHost, endpointOverride } = {}) {
           try {
             await withDeadline(waitForExit(child), BROWSER_CLOSE_TIMEOUT_MS + 2_000, 'browser owner did not exit');
           } catch (error) {
-            forceStopProcessTree(message.browserPid);
-            forceStopProcessTree(child.pid);
+            forceStopProcessTrees([message.browserPid, child.pid]);
             await withDeadline(waitForExit(child), 2_000, 'browser owner could not be stopped').catch(() => {});
             throw error;
           }
