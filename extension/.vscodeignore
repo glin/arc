@@ -1,5 +1,6 @@
 .vscodeignore
 CLAUDE.md
+AGENTS.md
 src/**
 resources/**
 test/**

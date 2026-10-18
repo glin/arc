@@ -5,6 +5,7 @@ const os = require('node:os');
 const path = require('node:path');
 
 const repositoryRoot = path.join(__dirname, '..');
+const integrationTimeout = 120_000;
 
 function toolBin(name) {
   if (name === 'npm') return process.env.npm_execpath;
@@ -37,7 +38,7 @@ function runScript(script, cwd) {
   return runTool('npm', ['run', script], cwd);
 }
 
-test('root formatting and lint commands exclude private run source and configurations', () => {
+function scopeFixture() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'arc-ship-log-scope-'));
   const savedRoots = [
     path.join(root, '.claude', 'ship-logs', 'run', 'implementation', 'before-format'),
@@ -70,44 +71,84 @@ test('root formatting and lint commands exclude private run source and configura
     }
     fs.writeFileSync(maintainedSource, 'console.log(42);\n');
 
-    const rootSource = path.join(root, 'vitest.config.mts');
-    fs.writeFileSync(rootSource, brokenSource);
-    for (const [name, args] of [
-      ['oxfmt', ['--config', '.oxfmtrc.mjs', '--disable-nested-config', '--check']],
-      ['oxlint', ['--disable-nested-config', '--deny-warnings']],
-    ]) {
-      const result = runTool(name, args, root);
-      const output = result.stdout + result.stderr;
-      assert.notEqual(result.status, 0, `${name} skipped maintained root source`);
-      assert.match(output, /vitest\.config\.mts/);
-      for (const savedSource of savedSources) assert.ok(!output.includes(path.basename(savedSource)), output);
-    }
-    fs.unlinkSync(rootSource);
+    return { root, savedSources, maintainedSource, brokenSource };
+  } catch (error) {
+    fs.rmSync(root, { recursive: true, force: true });
+    throw error;
+  }
+}
 
-    for (const script of ['format:check', 'lint', 'format']) {
-      const result = runScript(script, root);
-      assert.equal(result.status, 0, `${script} scanned saved source:\n${result.stdout}${result.stderr}`);
-      for (const savedSource of savedSources) {
-        assert.equal(fs.readFileSync(savedSource, 'utf8'), brokenSource, `${script} rewrote saved evidence`);
+for (const script of ['format:check', 'lint', 'format']) {
+  test(
+    `root ${script} excludes private run source and configurations`,
+    () => {
+      const { root, savedSources, brokenSource } = scopeFixture();
+      try {
+        const result = runScript(script, root);
+        assert.equal(result.status, 0, `${script} scanned saved source:\n${result.stdout}${result.stderr}`);
+        for (const savedSource of savedSources) {
+          assert.equal(fs.readFileSync(savedSource, 'utf8'), brokenSource, `${script} rewrote saved evidence`);
+        }
+      } finally {
+        fs.rmSync(root, { recursive: true, force: true });
       }
-    }
+    },
+    script === 'lint' ? integrationTimeout : undefined,
+  );
+}
 
-    fs.writeFileSync(maintainedSource, brokenSource);
-    for (const script of ['format:check', 'lint']) {
-      const result = runScript(script, root);
-      assert.notEqual(result.status, 0, `${script} skipped maintained source`);
-      assert.ok((result.stdout + result.stderr).includes('stop-manifest.cjs'));
-    }
+test.each([
+  ['oxfmt', ['--config', '.oxfmtrc.mjs', '--disable-nested-config', '--check']],
+  ['oxlint', ['--disable-nested-config', '--deny-warnings']],
+])('%s rejects maintained root source without scanning private source', (name, args) => {
+  const { root, savedSources, brokenSource } = scopeFixture();
+  try {
+    fs.writeFileSync(path.join(root, 'vitest.config.mts'), brokenSource);
+    const result = runTool(name, args, root);
+    const output = result.stdout + result.stderr;
+    assert.notEqual(result.status, 0, `${name} skipped maintained root source`);
+    assert.match(output, /vitest\.config\.mts/);
+    for (const savedSource of savedSources) assert.ok(!output.includes(path.basename(savedSource)), output);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
 
-test('CSS entrypoints reject malformed declarations, unknown properties and values within production scope', () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'arc-css-scope-'));
-  const css = path.join(root, 'extension', 'src', 'webview', 'panel.css');
+for (const script of ['format:check', 'lint']) {
+  test(
+    `root ${script} rejects malformed maintained source`,
+    () => {
+      const { root, maintainedSource, brokenSource } = scopeFixture();
+      try {
+        fs.writeFileSync(maintainedSource, brokenSource);
+        const result = runScript(script, root);
+        assert.notEqual(result.status, 0, `${script} skipped maintained source`);
+        assert.ok((result.stdout + result.stderr).includes('stop-manifest.cjs'));
+      } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+      }
+    },
+    script === 'lint' ? integrationTimeout : undefined,
+  );
+}
+
+describe('CSS entrypoints', () => {
+  let root;
+  let css;
+  let ready = false;
   const valid = 'a { color: var(--vscode-foreground, red); display: block; display: flex; }\n';
-  try {
+  const excluded = [
+    '.claude/plans/task/runs/run/extension/src/webview/panel.css',
+    '.claude/ship-logs/run/extension/src/webview/panel.css',
+    '.claude/skills/panel-mockup/panel.css',
+    'evals/agent-review/fixtures/panel.css',
+    'extension/test/fixtures/panel.css',
+    'extension/src/webview/nested/panel.css',
+    'extension/dist/panel.css',
+  ];
+  beforeAll(() => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'arc-css-scope-'));
+    css = path.join(root, 'extension', 'src', 'webview', 'panel.css');
     fs.mkdirSync(path.dirname(css), { recursive: true });
     fs.copyFileSync(path.join(repositoryRoot, 'package.json'), path.join(root, 'package.json'));
     fs.copyFileSync(path.join(repositoryRoot, '.oxlintrc.jsonc'), path.join(root, '.oxlintrc.jsonc'));
@@ -116,35 +157,51 @@ test('CSS entrypoints reject malformed declarations, unknown properties and valu
       path.join(path.dirname(css), '.stylelintrc.cjs'),
       "module.exports = { rules: { 'property-no-unknown': null } };\n",
     );
-    fs.writeFileSync(css, valid);
-    const excluded = [
-      '.claude/plans/task/runs/run/extension/src/webview/panel.css',
-      '.claude/ship-logs/run/extension/src/webview/panel.css',
-      '.claude/skills/panel-mockup/panel.css',
-      'evals/agent-review/fixtures/panel.css',
-      'extension/test/fixtures/panel.css',
-      'extension/src/webview/nested/panel.css',
-      'extension/dist/panel.css',
-    ];
     for (const file of excluded) {
       fs.mkdirSync(path.dirname(path.join(root, file)), { recursive: true });
       fs.writeFileSync(path.join(root, file), 'a { colro: red; }\n');
     }
-    for (const script of ['lint:css', 'lint']) {
-      const passed = runScript(script, root);
-      assert.equal(passed.status, 0, `${script}:\n${passed.stdout}${passed.stderr}`);
-      const inputs = ['a { color red; }\n', 'a { colro: red; }\n', 'a { display: invalid; }\n'];
-      for (const broken of script === 'lint' ? inputs.slice(0, 1) : inputs) {
+    ready = true;
+  });
+  afterAll(() => {
+    try {
+      if (ready) {
+        for (const file of excluded)
+          assert.equal(fs.readFileSync(path.join(root, file), 'utf8'), 'a { colro: red; }\n');
+      }
+    } finally {
+      if (root) fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  for (const script of ['lint:css', 'lint']) {
+    test(
+      `${script} accepts production CSS within its scope`,
+      () => {
+        fs.writeFileSync(css, valid);
+        const passed = runScript(script, root);
+        assert.equal(passed.status, 0, `${script}:\n${passed.stdout}${passed.stderr}`);
+      },
+      script === 'lint' ? integrationTimeout : undefined,
+    );
+  }
+
+  for (const [script, kind, broken] of [
+    ['lint:css', 'malformed declarations', 'a { color red; }\n'],
+    ['lint:css', 'unknown properties', 'a { colro: red; }\n'],
+    ['lint:css', 'unknown values', 'a { display: invalid; }\n'],
+    ['lint', 'malformed declarations', 'a { color red; }\n'],
+  ]) {
+    test(
+      `${script} rejects ${kind} in production CSS`,
+      () => {
         fs.writeFileSync(css, broken);
         const failed = runScript(script, root);
         assert.notEqual(failed.status, 0, `${script} skipped invalid production CSS`);
         assert.match(failed.stdout + failed.stderr, /panel\.css/);
-      }
-      fs.writeFileSync(css, valid);
-    }
-    for (const file of excluded) assert.equal(fs.readFileSync(path.join(root, file), 'utf8'), 'a { colro: red; }\n');
-  } finally {
-    fs.rmSync(root, { recursive: true, force: true });
+      },
+      script === 'lint' ? integrationTimeout : undefined,
+    );
   }
 });
 
@@ -220,78 +277,139 @@ function hookFixture() {
       return spawnSync('git', ['-c', 'core.hooksPath=' + path.dirname(hook), 'hook', 'run', 'pre-commit'], {
         cwd,
         encoding: 'utf8',
+        env: { ...process.env, GIT_TRACE: '1' },
       });
     },
   };
 }
 
-test('pre-commit checks staged CSS with literal paths and preserves partial staging and scope', () => {
-  const fixture = hookFixture();
-  const { root } = fixture;
-  const css = 'extension/src/webview/panel [copy] space.css';
-  try {
-    fixture.write(css, 'a { colro: red; }\n');
-    git(root, 'add', '--', css);
-    const failed = fixture.run();
-    assert.notEqual(failed.status, 0, 'pre-commit skipped staged CSS');
-    assert.match(failed.stdout + failed.stderr, /property-no-unknown/);
-    fixture.write(css, 'a { color: red; }\n');
-    const partial = fixture.run();
-    assert.equal(partial.status, 0, partial.stdout + partial.stderr);
-    assert.match(partial.stderr, /partly staged/);
-    assert.match(git(root, 'show', ':' + css).stdout, /colro/);
-    git(root, 'add', '--', css);
-    for (const file of [
+test(
+  'pre-commit checks literal CSS paths without fallback tool queries',
+  () => {
+    const fixture = hookFixture();
+    const { root } = fixture;
+    const css = 'extension/src/webview/panel [copy] space.css';
+    try {
+      fixture.write(css, 'a { colro: red; }\n');
+      git(root, 'add', '--', css);
+      const failed = fixture.run();
+      assert.notEqual(failed.status, 0, 'pre-commit skipped staged CSS');
+      assert.match(failed.stdout + failed.stderr, /property-no-unknown/);
+      assert.doesNotMatch(failed.stderr, /git rev-parse --git-common-dir/);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  },
+  integrationTimeout,
+);
+
+test(
+  'pre-commit preserves partial CSS staging',
+  () => {
+    const fixture = hookFixture();
+    const { root } = fixture;
+    const css = 'extension/src/webview/panel [copy] space.css';
+    try {
+      fixture.write(css, 'a { colro: red; }\n');
+      git(root, 'add', '--', css);
+      fixture.write(css, 'a { color: red; }\n');
+      const partial = fixture.run();
+      assert.equal(partial.status, 0, partial.stdout + partial.stderr);
+      assert.match(partial.stderr, /partly staged/);
+      assert.match(git(root, 'show', ':' + css).stdout, /colro/);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  },
+  integrationTimeout,
+);
+
+test(
+  'pre-commit checks production CSS and excludes other CSS paths',
+  () => {
+    const fixture = hookFixture();
+    const { root } = fixture;
+    const css = 'extension/src/webview/panel.css';
+    const excluded = [
       'evals/agent-review/fixtures/invalid.css',
       '.claude/plans/invalid.css',
       'extension/src/webview/nested/invalid.css',
-    ]) {
-      fixture.write(file, 'a { colro: red; }\n');
-      git(root, 'add', '--', file);
-    }
-    const passed = fixture.run();
-    assert.equal(passed.status, 0, passed.stdout + passed.stderr);
-    fs.unlinkSync(path.join(root, 'node_modules', '.bin', 'stylelint'));
-    const missing = fixture.run();
-    assert.notEqual(missing.status, 0);
-    assert.match(missing.stderr, /stylelint is not installed/);
-    git(root, 'rm', '--cached', '--', css);
-    const excludedOnly = fixture.run();
-    assert.equal(excludedOnly.status, 0, excludedOnly.stdout + excludedOnly.stderr);
-  } finally {
-    fs.rmSync(root, { recursive: true, force: true });
-  }
-}, 120_000);
-
-test('pre-commit skips staged symbolic links', (context) => {
-  const fixture = hookFixture();
-  const { root } = fixture;
-  const css = 'extension/src/webview/linked.css';
-  try {
-    fixture.write('target.css', 'a { colro: red; }\n');
-    fs.mkdirSync(path.dirname(path.join(root, css)), { recursive: true });
+    ];
     try {
-      fs.symlinkSync(path.join(root, 'target.css'), path.join(root, css), 'file');
-    } catch (error) {
-      if (error.code === 'EPERM' || error.code === 'EACCES') {
-        context.skip('Creating symbolic links requires permission on this host.');
-        return;
+      fixture.write(css, 'a { color: red; }\n');
+      for (const file of excluded) {
+        fixture.write(file, 'a { colro: red; }\n');
       }
-      throw error;
+      git(root, 'add', '--', css, ...excluded);
+      const passed = fixture.run();
+      assert.equal(passed.status, 0, passed.stdout + passed.stderr);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
     }
-    git(root, 'add', '--', css);
-    const result = fixture.run();
-    assert.equal(result.status, 0, result.stdout + result.stderr);
-  } finally {
-    fs.rmSync(root, { recursive: true, force: true });
-  }
-});
+  },
+  integrationTimeout,
+);
 
-test('pre-commit resolves CSS tools from the main worktree when the checkout has none', () => {
-  const fixture = hookFixture();
-  const { root } = fixture;
-  const checkout = fs.mkdtempSync(path.join(os.tmpdir(), 'arc-css-checkout-'));
-  try {
+test(
+  'pre-commit requires Stylelint only for staged production CSS',
+  () => {
+    const fixture = hookFixture();
+    const { root } = fixture;
+    const css = 'extension/src/webview/panel.css';
+    try {
+      fixture.write(css, 'a { color: red; }\n');
+      fixture.write('evals/agent-review/fixtures/invalid.css', 'a { colro: red; }\n');
+      git(root, 'add', '--', css, 'evals/agent-review/fixtures/invalid.css');
+      fs.unlinkSync(path.join(root, 'node_modules', '.bin', 'stylelint'));
+      const missing = fixture.run();
+      assert.notEqual(missing.status, 0);
+      assert.match(missing.stderr, /stylelint is not installed/);
+      git(root, 'rm', '--cached', '--', css);
+      const excludedOnly = fixture.run();
+      assert.equal(excludedOnly.status, 0, excludedOnly.stdout + excludedOnly.stderr);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  },
+  integrationTimeout,
+);
+
+test(
+  'pre-commit skips staged symbolic links',
+  (context) => {
+    const fixture = hookFixture();
+    const { root } = fixture;
+    const css = 'extension/src/webview/linked.css';
+    try {
+      fixture.write('target.css', 'a { colro: red; }\n');
+      fs.mkdirSync(path.dirname(path.join(root, css)), { recursive: true });
+      try {
+        fs.symlinkSync(path.join(root, 'target.css'), path.join(root, css), 'file');
+      } catch (error) {
+        if (error.code === 'EPERM' || error.code === 'EACCES') {
+          context.skip('Creating symbolic links requires permission on this host.');
+          return;
+        }
+        throw error;
+      }
+      git(root, 'add', '--', css);
+      const result = fixture.run();
+      assert.equal(result.status, 0, result.stdout + result.stderr);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  },
+  integrationTimeout,
+);
+
+describe('pre-commit resolves main-worktree tools', () => {
+  let fixture;
+  let checkout;
+  let css;
+  beforeAll(() => {
+    fixture = hookFixture();
+    const { root } = fixture;
+    checkout = fs.mkdtempSync(path.join(os.tmpdir(), 'arc-css-checkout-'));
     fs.cpSync(
       path.join(repositoryRoot, 'node_modules', 'stylelint-config-recommended'),
       path.join(root, 'node_modules', 'stylelint-config-recommended'),
@@ -302,21 +420,30 @@ test('pre-commit resolves CSS tools from the main worktree when the checkout has
     fs.copyFileSync(path.join(repositoryRoot, '.stylelintrc.cjs'), path.join(checkout, '.stylelintrc.cjs'));
     fixture.write('.stylelintrc.cjs', "throw new Error('The checkout configuration must be used.');\n");
     assert.equal(fs.existsSync(path.join(checkout, 'node_modules')), false);
-    const css = path.join(checkout, 'extension', 'src', 'webview', 'panel.css');
+    css = path.join(checkout, 'extension', 'src', 'webview', 'panel.css');
     fs.mkdirSync(path.dirname(css), { recursive: true });
-    fs.writeFileSync(css, 'a { color: red; }\n');
-    git(checkout, 'add', 'extension/src/webview/panel.css');
-    const passed = fixture.run(checkout);
-    assert.equal(passed.status, 0, passed.stdout + passed.stderr);
-    fs.writeFileSync(css, 'a { colro: red; }\n');
-    git(checkout, 'add', 'extension/src/webview/panel.css');
-    const failed = fixture.run(checkout);
-    assert.notEqual(failed.status, 0);
-    assert.match(failed.stdout + failed.stderr, /property-no-unknown/);
-  } finally {
-    fs.rmSync(checkout, { recursive: true, force: true });
-    fs.rmSync(root, { recursive: true, force: true });
-  }
+  });
+  afterAll(() => {
+    if (checkout) fs.rmSync(checkout, { recursive: true, force: true });
+    if (fixture) fs.rmSync(fixture.root, { recursive: true, force: true });
+  });
+
+  test.each(['valid', 'invalid'])(
+    'checks %s production CSS',
+    (kind) => {
+      fs.writeFileSync(css, kind === 'valid' ? 'a { color: red; }\n' : 'a { colro: red; }\n');
+      git(checkout, 'add', 'extension/src/webview/panel.css');
+      const result = fixture.run(checkout);
+      assert.doesNotMatch(result.stderr, /git rev-parse --git-common-dir/);
+      if (kind === 'valid') {
+        assert.equal(result.status, 0, result.stdout + result.stderr);
+      } else {
+        assert.notEqual(result.status, 0);
+        assert.match(result.stdout + result.stderr, /property-no-unknown/);
+      }
+    },
+    integrationTimeout,
+  );
 });
 
 test('the maintained hook filenames are discovered by Oxfmt and Oxlint', () => {

@@ -2806,18 +2806,18 @@ test.skipIf(process.platform !== 'win32')(
       const disconnected = await response(accepted);
       assert.equal(disconnected.data.status, 'unknown');
       await vi.waitFor(
-        () => {
+        async () => {
           const current = JSON.parse(fs.readFileSync(file, 'utf8')) as HostRegistration;
           assert.notEqual(current.transportPid, entry.transportPid);
           assert.equal(current.hostId, entry.hostId);
           assert.equal(current.token, entry.token);
           assert.equal(current.address, entry.address);
           replacementPid = current.transportPid!;
+          const rediscovered = await response(send('discover'));
+          assert.equal(rediscovered.data.windows[0].hostId, channel.hostId);
         },
         { timeout: 15_000 },
       );
-      const rediscovered = await response(send('discover'));
-      assert.equal(rediscovered.data.windows[0].hostId, channel.hostId);
       const retry = send('start', params, requestId);
       release();
       assert.equal((await response(retry)).data.sessionId, 'surviving-write');

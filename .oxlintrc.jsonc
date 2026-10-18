@@ -50,6 +50,18 @@
   },
   "overrides": [
     {
+      "files": ["scripts/agent-review-evals.test.js"],
+      "env": { "node": true },
+      "globals": {
+        "afterAll": "readonly",
+        "beforeAll": "readonly",
+        "describe": "readonly",
+        "test": "readonly",
+        "vi": "readonly",
+      },
+      "rules": { "no-undef": "error" },
+    },
+    {
       "files": ["extension/src/startup.test.ts", "extension/src/panel.webview.test.ts"],
       "rules": {
         // These tests execute isolated browser-source functions because panelhost.ts cannot load outside VS Code.

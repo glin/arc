@@ -59,7 +59,7 @@ test.each(['claude', 'codex'] as const)(
 import { enumerateRolloutFiles } from './codex';
 import { revisionOf, readQualifiedSessionCwd } from './transcript';
 // extension/src/codex.test.ts
-import { afterEach, test, vi } from 'vitest';
+import { afterAll, afterEach, beforeAll, describe, test, vi } from 'vitest';
 import assert from 'node:assert';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
@@ -8018,16 +8018,17 @@ test('native Codex loop commits in separate repositories recover exact owners af
   for (const commit of commits)
     commit.candidates = { dirs: targets.find((target) => target.sha === commit.printedSha)!.dirs, complete: true };
   const owner = fixtureTurn({ commits });
-  const resolver = new RepositoryCommits(nodeGitRunner(), () => {});
-  await vi.waitFor(
-    () => {
-      resolver.apply([owner], [outer]);
-      assert.deepEqual(
-        commits.map((commit) => commit.dir),
-        roots.map(normalizeFsPath),
-      );
-    },
-    { timeout: 10_000 },
+  let fill!: () => void;
+  const filled = new Promise<void>((resolve) => {
+    fill = resolve;
+  });
+  const resolver = new RepositoryCommits(nodeGitRunner(0), fill);
+  resolver.apply([owner], [outer]);
+  await filled;
+  resolver.apply([owner], [outer]);
+  assert.deepEqual(
+    commits.map((commit) => commit.dir),
+    roots.map(normalizeFsPath),
   );
   assert.deepEqual(
     commits.map(({ subject, files, added, removed, at, sha }) => ({ subject, files, added, removed, at, sha })),
@@ -8052,15 +8053,16 @@ test('worktree ownership accepts constant loops and rejects binding or failure a
     assert.equal(worktreeRelationships(changed, 'powershell'), null, changed);
 });
 
-test.each(['selected', 'ambiguous', 'redirected'])(
-  'a child recreating a parent worktree refuses ownership despite an object present in both roots: %s',
-  async (selection) => {
-    const directory = tempDir('recreated-owner-');
-    const roots = ['first', 'second'].map((name) => path.join(directory, name).replace(/\\/g, '/'));
-    const git = (root: string, ...args: string[]) =>
-      execFileSync('git', ['-C', root, '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', ...args], {
-        encoding: 'utf8',
-      }).trim();
+describe('recreated worktree ownership', () => {
+  const directory = tempDir('recreated-owner-');
+  const roots = ['first', 'second'].map((name) => path.join(directory, name).replace(/\\/g, '/'));
+  const git = (root: string, ...args: string[]) =>
+    execFileSync('git', ['-C', root, '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', ...args], {
+      encoding: 'utf8',
+    }).trim();
+  const worktree = roots[0] + '/.claude/worktrees/worker';
+  let sha: string;
+  beforeAll(() => {
     for (const root of roots) {
       fs.mkdirSync(root);
       git(root, 'init', '-q');
@@ -8068,13 +8070,12 @@ test.each(['selected', 'ambiguous', 'redirected'])(
       git(root, 'add', 'file');
       git(root, 'commit', '-qm', 'Base');
     }
-    const worktree = roots[0] + '/.claude/worktrees/worker';
     git(roots[0], 'worktree', 'add', '-q', '-b', 'parent', worktree);
     git(roots[0], 'worktree', 'remove', worktree);
     git(roots[1], 'worktree', 'add', '-q', '-b', 'child', worktree);
     fs.writeFileSync(path.join(worktree, 'file'), 'Child commit');
     git(worktree, 'commit', '-qam', 'Child commit');
-    const sha = git(worktree, 'rev-parse', 'HEAD');
+    sha = git(worktree, 'rev-parse', 'HEAD');
     git(roots[0], 'fetch', '-q', roots[1], sha);
     assert.equal(git(roots[0], 'cat-file', '-t', sha), 'commit');
     assert.equal(git(roots[1], 'cat-file', '-t', sha), 'commit');
@@ -8082,132 +8083,140 @@ test.each(['selected', 'ambiguous', 'redirected'])(
     git(roots[0], 'init', '-q');
     git(roots[0], 'fetch', '-q', roots[1], sha);
     assert.equal(git(roots[0], 'cat-file', '-t', sha), 'commit');
-    const fixture = ownershipRecords(
-      [roots[0]],
-      [sha],
-      `git -C '${roots[0]}' worktree remove '${worktree}'\ngit -C '${roots[1]}' worktree add '${worktree}'`,
-    );
-    if (selection === 'ambiguous')
-      (fixture.child[4] as any).payload.item.parsed_cmd = [
-        { cmd: `git -C '${roots[0]}' worktree remove '${worktree}'` },
-        { cmd: `git -C '${roots[1]}' worktree add '${worktree}'` },
-      ];
-    if (selection === 'redirected') {
-      const removal = `rm -rf '${worktree}' > C:/logs/remove.txt`;
-      const copying = `cp -a '${roots[1]}' '${worktree}' > C:/logs/copy.txt`;
-      (fixture.child[4] as any).payload.item.command = ['bash', '-c', removal + '\n' + copying];
-      (fixture.child[4] as any).payload.item.parsed_cmd = [{ cmd: removal + '\n' + copying }];
-    }
-    const parent = await ownershipScan(writeRollout(fixture.parent), 'parent', null, fixture.dirs);
-    const child = await ownershipScan(writeRollout(fixture.child), 'child', 'parent', fixture.dirs);
-    assert.deepEqual(
-      commitRepositoryTargets(parent, child, [
-        { sha, at: ms(5), evidenceAt: ms(6), dirs: fixture.dirs, turnId: 'child-turn' },
-      ]),
-      [],
-    );
-    if (selection === 'selected') {
-      for (const confirmation of ['before', 'after', 'closed'] as const) {
-        const rounded = ownershipRecords(
-          [roots[0]],
-          [sha],
-          `git -C '${roots[0]}' worktree remove '${worktree}'\ngit -C '${roots[1]}' worktree add '${worktree}'`,
-          { created: 3745, started: 3000 },
-        );
-        const bill = event('token_usage_record', 8, {
-          turn_id: 'child-turn',
-          thread_id: 'child',
-          session_id: 'parent',
-          response_id: 'own',
-          usage: usage({ input_tokens: 1000 }),
-        });
-        bill.timestamp = new Date(
-          ms(0) + (confirmation === 'before' ? 3900 : confirmation === 'after' ? 4500 : 8000),
-        ).toISOString();
-        rounded.child.splice(
-          confirmation === 'before' ? 4 : confirmation === 'after' ? 5 : rounded.child.length,
-          0,
-          bill,
-        );
-        const before = await ownershipScan(writeRollout(rounded.parent), 'parent', null, rounded.dirs);
-        const after = await ownershipScan(writeRollout(rounded.child), 'child', 'parent', rounded.dirs);
-        assert.equal(after.complete, true, confirmation);
-        assert.deepEqual(
-          commitRepositoryTargets(before, after, [
-            { sha, at: ms(5), evidenceAt: ms(6), dirs: rounded.dirs, turnId: 'child-turn' },
-          ]),
-          [],
-          confirmation + ' must refuse the wrong surviving owner',
-        );
-      }
-    }
-    for (const stream of ['parent', 'child'] as const) {
-      const replacement = ownershipRecords([roots[0]], [sha]);
-      replacement[stream].splice(
-        stream === 'parent' ? 4 : 4,
-        0,
-        commandCompleted(4, `Remove-Item -LiteralPath '${roots[0]}/.git' -Recurse`, 0, 'completed', 'replace-owner', {
-          started_at_ms: ms(4) - 10,
-          completed_at_ms: ms(4),
-        }),
+  });
+  afterAll(() => {
+    git(roots[1], 'worktree', 'remove', worktree);
+    assert.equal(fs.existsSync(worktree), false, 'the ownership fixture worktree remains after cleanup');
+  });
+  test.each(['selected', 'ambiguous', 'redirected'])(
+    'a child recreating a parent worktree refuses ownership despite an object present in both roots: %s',
+    async (selection) => {
+      const fixture = ownershipRecords(
+        [roots[0]],
+        [sha],
+        `git -C '${roots[0]}' worktree remove '${worktree}'\ngit -C '${roots[1]}' worktree add '${worktree}'`,
       );
-      const before = await ownershipScan(writeRollout(replacement.parent), 'parent', null, replacement.dirs);
-      const after = await ownershipScan(writeRollout(replacement.child), 'child', 'parent', replacement.dirs);
+      if (selection === 'ambiguous')
+        (fixture.child[4] as any).payload.item.parsed_cmd = [
+          { cmd: `git -C '${roots[0]}' worktree remove '${worktree}'` },
+          { cmd: `git -C '${roots[1]}' worktree add '${worktree}'` },
+        ];
+      if (selection === 'redirected') {
+        const removal = `rm -rf '${worktree}' > C:/logs/remove.txt`;
+        const copying = `cp -a '${roots[1]}' '${worktree}' > C:/logs/copy.txt`;
+        (fixture.child[4] as any).payload.item.command = ['bash', '-c', removal + '\n' + copying];
+        (fixture.child[4] as any).payload.item.parsed_cmd = [{ cmd: removal + '\n' + copying }];
+      }
+      const parent = await ownershipScan(writeRollout(fixture.parent), 'parent', null, fixture.dirs);
+      const child = await ownershipScan(writeRollout(fixture.child), 'child', 'parent', fixture.dirs);
       assert.deepEqual(
-        commitRepositoryTargets(before, after, [
-          { sha, at: ms(5), evidenceAt: ms(6), dirs: replacement.dirs, turnId: 'child-turn' },
+        commitRepositoryTargets(parent, child, [
+          { sha, at: ms(5), evidenceAt: ms(6), dirs: fixture.dirs, turnId: 'child-turn' },
         ]),
         [],
-        stream + ' backing Git entry replacement',
       );
-    }
-    if (selection === 'selected') {
-      const results: Record<string, ReturnType<typeof commitRepositoryTargets>> = {};
+      if (selection === 'selected') {
+        for (const confirmation of ['before', 'after', 'closed'] as const) {
+          const rounded = ownershipRecords(
+            [roots[0]],
+            [sha],
+            `git -C '${roots[0]}' worktree remove '${worktree}'\ngit -C '${roots[1]}' worktree add '${worktree}'`,
+            { created: 3745, started: 3000 },
+          );
+          const bill = event('token_usage_record', 8, {
+            turn_id: 'child-turn',
+            thread_id: 'child',
+            session_id: 'parent',
+            response_id: 'own',
+            usage: usage({ input_tokens: 1000 }),
+          });
+          bill.timestamp = new Date(
+            ms(0) + (confirmation === 'before' ? 3900 : confirmation === 'after' ? 4500 : 8000),
+          ).toISOString();
+          rounded.child.splice(
+            confirmation === 'before' ? 4 : confirmation === 'after' ? 5 : rounded.child.length,
+            0,
+            bill,
+          );
+          const before = await ownershipScan(writeRollout(rounded.parent), 'parent', null, rounded.dirs);
+          const after = await ownershipScan(writeRollout(rounded.child), 'child', 'parent', rounded.dirs);
+          assert.equal(after.complete, true, confirmation);
+          assert.deepEqual(
+            commitRepositoryTargets(before, after, [
+              { sha, at: ms(5), evidenceAt: ms(6), dirs: rounded.dirs, turnId: 'child-turn' },
+            ]),
+            [],
+            confirmation + ' must refuse the wrong surviving owner',
+          );
+        }
+      }
       for (const stream of ['parent', 'child'] as const) {
-        for (const protocol of ['FileChange', 'patch_apply_end'] as const) {
-          for (const changedPath of ['written', 'moved-from', 'moved-to', 'unrelated'] as const) {
-            for (const timing of ['complete', 'missing-start', 'missing-end', 'reversed'] as const) {
-              const replacement = ownershipRecords([roots[0]], [sha]);
-              const gitEntry = worktree + '/.git';
-              const unrelated = roots[1] + '/output.txt';
-              const written = changedPath === 'moved-to' || changedPath === 'unrelated' ? unrelated : gitEntry;
-              const changes = {
-                [written]: {
-                  type: 'update',
-                  ...(changedPath === 'moved-to' ? { move_path: gitEntry } : {}),
-                  ...(changedPath === 'moved-from' ? { move_path: unrelated } : {}),
-                  unified_diff: '@@ -1 +1 @@\n-old\n+gitdir: ' + roots[1] + '/.git/worktrees/worker\n',
-                },
-              };
-              const times = {
-                ...(timing !== 'missing-start' ? { started_at_ms: ms(timing === 'reversed' ? 8 : 4) - 10 } : {}),
-                ...(timing !== 'missing-end' ? { completed_at_ms: ms(4) } : {}),
-              };
-              const mutation =
-                protocol === 'FileChange'
-                  ? event('item_completed', 4, {
-                      item: { type: protocol, id: 'write-git-entry', status: 'completed', changes, ...times },
-                    })
-                  : event(protocol, 4, { call_id: 'write-git-entry', success: true, changes, ...times });
-              if (timing === 'missing-end') mutation.timestamp = '';
-              replacement[stream].splice(4, 0, mutation);
-              const before = await ownershipScan(writeRollout(replacement.parent), 'parent', null, replacement.dirs);
-              const after = await ownershipScan(writeRollout(replacement.child), 'child', 'parent', replacement.dirs);
-              const key = [stream, protocol, changedPath, timing].join(' ');
-              const targets = commitRepositoryTargets(before, after, [
-                { sha, at: ms(5), evidenceAt: ms(6), dirs: replacement.dirs, turnId: 'child-turn' },
-              ]);
-              if (changedPath === 'unrelated') assert.equal(targets.length, 1, key);
-              else results[key] = targets;
+        const replacement = ownershipRecords([roots[0]], [sha]);
+        replacement[stream].splice(
+          stream === 'parent' ? 4 : 4,
+          0,
+          commandCompleted(4, `Remove-Item -LiteralPath '${roots[0]}/.git' -Recurse`, 0, 'completed', 'replace-owner', {
+            started_at_ms: ms(4) - 10,
+            completed_at_ms: ms(4),
+          }),
+        );
+        const before = await ownershipScan(writeRollout(replacement.parent), 'parent', null, replacement.dirs);
+        const after = await ownershipScan(writeRollout(replacement.child), 'child', 'parent', replacement.dirs);
+        assert.deepEqual(
+          commitRepositoryTargets(before, after, [
+            { sha, at: ms(5), evidenceAt: ms(6), dirs: replacement.dirs, turnId: 'child-turn' },
+          ]),
+          [],
+          stream + ' backing Git entry replacement',
+        );
+      }
+      if (selection === 'selected') {
+        const results: Record<string, ReturnType<typeof commitRepositoryTargets>> = {};
+        for (const stream of ['parent', 'child'] as const) {
+          for (const protocol of ['FileChange', 'patch_apply_end'] as const) {
+            for (const changedPath of ['written', 'moved-from', 'moved-to', 'unrelated'] as const) {
+              for (const timing of ['complete', 'missing-start', 'missing-end', 'reversed'] as const) {
+                const replacement = ownershipRecords([roots[0]], [sha]);
+                const gitEntry = worktree + '/.git';
+                const unrelated = roots[1] + '/output.txt';
+                const written = changedPath === 'moved-to' || changedPath === 'unrelated' ? unrelated : gitEntry;
+                const changes = {
+                  [written]: {
+                    type: 'update',
+                    ...(changedPath === 'moved-to' ? { move_path: gitEntry } : {}),
+                    ...(changedPath === 'moved-from' ? { move_path: unrelated } : {}),
+                    unified_diff: '@@ -1 +1 @@\n-old\n+gitdir: ' + roots[1] + '/.git/worktrees/worker\n',
+                  },
+                };
+                const times = {
+                  ...(timing !== 'missing-start' ? { started_at_ms: ms(timing === 'reversed' ? 8 : 4) - 10 } : {}),
+                  ...(timing !== 'missing-end' ? { completed_at_ms: ms(4) } : {}),
+                };
+                const mutation =
+                  protocol === 'FileChange'
+                    ? event('item_completed', 4, {
+                        item: { type: protocol, id: 'write-git-entry', status: 'completed', changes, ...times },
+                      })
+                    : event(protocol, 4, { call_id: 'write-git-entry', success: true, changes, ...times });
+                if (timing === 'missing-end') mutation.timestamp = '';
+                replacement[stream].splice(4, 0, mutation);
+                const before = await ownershipScan(writeRollout(replacement.parent), 'parent', null, replacement.dirs);
+                const after = await ownershipScan(writeRollout(replacement.child), 'child', 'parent', replacement.dirs);
+                const key = [stream, protocol, changedPath, timing].join(' ');
+                const targets = commitRepositoryTargets(before, after, [
+                  { sha, at: ms(5), evidenceAt: ms(6), dirs: replacement.dirs, turnId: 'child-turn' },
+                ]);
+                if (changedPath === 'unrelated') assert.equal(targets.length, 1, key);
+                else results[key] = targets;
+              }
             }
           }
         }
+        assert.deepEqual(results, Object.fromEntries(Object.keys(results).map((key) => [key, []])));
       }
-      assert.deepEqual(results, Object.fromEntries(Object.keys(results).map((key) => [key, []])));
-    }
-    git(roots[1], 'worktree', 'remove', worktree);
-  },
-);
+    },
+  );
+});
 
 test('copied command JSON and contradictory parent creations never establish commit ownership', async () => {
   const sha = 'a'.repeat(40);

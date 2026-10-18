@@ -4,17 +4,21 @@
 
 set -u
 
-root=$(git rev-parse --show-toplevel) || exit 1
+repository_paths=$(git rev-parse --path-format=absolute --show-toplevel --git-common-dir) || exit 1
+root=${repository_paths%%$'\n'*}
+git_common_dir=${repository_paths#*$'\n'}
 cd "$root" || exit 1
 
 tool() {
   local name=$1 dir
-  for dir in "$root" "$(cd "$(git rev-parse --git-common-dir)/.." && pwd)"; do
-    if [ -x "$dir/node_modules/.bin/$name" ]; then
-      printf '%s\n' "$dir/node_modules/.bin/$name"
-      return 0
-    fi
-  done
+  dir=$root
+  if [ ! -x "$dir/node_modules/.bin/$name" ]; then
+    dir=$git_common_dir/..
+  fi
+  if [ -x "$dir/node_modules/.bin/$name" ]; then
+    printf '%s\n' "$dir/node_modules/.bin/$name"
+    return 0
+  fi
   return 1
 }
 

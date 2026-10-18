@@ -12,6 +12,18 @@ const HEAVY = { timeout: 120_000 };
 const root = path.resolve(__dirname, '..');
 const cli = path.join(root, 'evals/agent-review/cli.mjs');
 const portable = path.join(root, 'evals/agent-review/run.mjs');
+let temp;
+
+beforeAll(() => {
+  temp = fs.mkdtempSync(path.join(os.tmpdir(), 'arc-review-eval-test-'));
+});
+
+afterAll(() => {
+  assert.equal(path.dirname(temp), os.tmpdir());
+  assert.match(path.basename(temp), /^arc-review-eval-test-/);
+  fs.rmSync(temp, { recursive: true, force: true });
+});
+
 const digest = (text) => createHash('sha256').update(text).digest('hex');
 const json = (value) => JSON.stringify(value, null, 2) + '\n';
 const fixtureEvidence = () => ({
@@ -813,7 +825,7 @@ describe('frozen continuation', () => {
     }
   });
 
-  test('native host waits for authorization and kills descendants after runner death', async () => {
+  test('native host waits for authorization and kills descendants after runner death', HEAVY, async () => {
     if (process.platform !== 'win32') return;
     const { spawn } = require('node:child_process');
     const attempt = path.join(temp, 'resume-native-host');
@@ -1218,9 +1230,12 @@ syncBuiltinESMExports();
     }
   });
 
-  test('validates from a source archive without Git and from one commit', HEAVY, () => {
-    const archive = fs.mkdtempSync(path.join(os.tmpdir(), 'arc-portable-archive-'));
-    try {
+  describe('source archive validation', () => {
+    let archive;
+    let portableCli;
+
+    beforeAll(() => {
+      archive = fs.mkdtempSync(path.join(os.tmpdir(), 'arc-portable-archive-'));
       const files = ['CLAUDE.md', 'scripts/register-hooks.js', 'evals/agent-review/run.mjs'];
       const manifest = JSON.parse(
         fs.readFileSync(path.join(root, 'evals/agent-review/portable/instructions.json'), 'utf8'),
@@ -1234,13 +1249,23 @@ syncBuiltinESMExports();
       }
       for (const relative of ['evals/agent-review/portable', 'evals/agent-review/fixtures'])
         fs.cpSync(path.join(root, relative), path.join(archive, relative), { recursive: true });
-      const portableCli = path.join(archive, 'evals/agent-review/run.mjs');
+      portableCli = path.join(archive, 'evals/agent-review/run.mjs');
+    });
+
+    afterAll(() => {
+      fs.rmSync(archive, { recursive: true, force: true });
+    });
+
+    test('validates without Git', HEAVY, () => {
       const offline = spawnSync(process.execPath, [portableCli, 'validate'], {
         cwd: archive,
         encoding: 'utf8',
         env: { ...process.env, PATH: path.join(archive, 'empty-bin'), Path: path.join(archive, 'empty-bin') },
       });
       assert.equal(offline.status, 0, offline.stderr);
+    });
+
+    test('validates after one commit', HEAVY, () => {
       git(archive, 'init', '--quiet');
       git(archive, 'config', 'user.name', 'Fixture');
       git(archive, 'config', 'user.email', 'fixture@example.invalid');
@@ -1249,9 +1274,7 @@ syncBuiltinESMExports();
       assert.equal(git(archive, 'rev-list', '--count', 'HEAD'), '1');
       const oneCommit = spawnSync(process.execPath, [portableCli, 'validate'], { cwd: archive, encoding: 'utf8' });
       assert.equal(oneCommit.status, 0, oneCommit.stderr);
-    } finally {
-      fs.rmSync(archive, { recursive: true, force: true });
-    }
+    });
   });
 
   test(
@@ -1928,1045 +1951,1300 @@ const runPortable = (...args) => {
 };
 const git = (cwd, ...args) => execFileSync('git', ['-C', cwd, ...args], { encoding: 'utf8' }).trim();
 
-let temp;
-let source;
-let cache;
-let catalog;
-let fixtureCase;
-let prepared;
+describe('review repository fixture', () => {
+  let source;
+  let cache;
+  let catalog;
+  let fixtureCase;
+  let prepared;
+  let scoring;
 
-beforeAll(() => {
-  temp = fs.mkdtempSync(path.join(os.tmpdir(), 'arc-review-eval-test-'));
-  source = path.join(temp, 'source');
-  cache = path.join(temp, 'cache.git');
-  catalog = path.join(temp, 'catalog');
-  fs.mkdirSync(source);
-  fs.mkdirSync(catalog);
-  git(source, 'init', '--quiet');
-  git(source, 'config', 'user.name', 'Fixture');
-  git(source, 'config', 'user.email', 'fixture@example.invalid');
-  const commits = [];
-  for (const content of ['base\n', 'candidate defect\n', 'corrected\n']) {
-    fs.writeFileSync(path.join(source, 'fixture.txt'), content);
-    git(source, 'add', 'fixture.txt');
-    git(source, 'commit', '--quiet', '-m', 'fixture');
-    commits.push(git(source, 'rev-parse', 'HEAD'));
-  }
-  fixtureCase = {
-    schema: 'arc-review-case-v1',
-    id: 'fixture-case',
-    source_kind: 'accepted_review',
-    family: 'fixture-family',
-    case_revision: 1,
-    key_revision: 1,
-    source: { base: commits[0], candidate: commits[1], correction: commits[2] },
-    key_state: 'historical-partial',
-    historical_context: { original_prompt: null, plan: null },
-    fixture_paths: ['fixture.txt'],
-    keys: [
-      {
-        id: 'defect-a',
-        severity: 'high',
-        summary: 'Candidate contains a visible defect.',
-        paths: ['fixture.txt'],
-        evidence: fixtureEvidence(),
-      },
-      {
-        id: 'defect-b',
-        severity: 'medium',
-        summary: 'Candidate contains another visible defect.',
-        paths: ['fixture.txt'],
-        evidence: fixtureEvidence(),
-      },
-    ],
-  };
-  fs.writeFileSync(path.join(catalog, 'fixture-case.json'), json(fixtureCase));
-  const captured = run('capture', '--repository', source, '--out', cache, '--catalog', catalog);
-  assert.equal(captured.status, 0, captured.error);
-  prepared = path.join(temp, 'prepared');
-  const exported = run('prepare', '--cache', cache, '--case', 'fixture-case', '--out', prepared, '--catalog', catalog);
-  assert.equal(exported.status, 0, exported.error);
-});
-
-afterAll(() => {
-  assert.equal(path.dirname(temp), os.tmpdir());
-  assert.match(path.basename(temp), /^arc-review-eval-test-/);
-  fs.rmSync(temp, { recursive: true, force: true });
-});
-
-function registration(overrides = {}) {
-  const manifest = JSON.parse(fs.readFileSync(path.join(prepared, 'manifest.json'), 'utf8'));
-  return {
-    schema: 'arc-review-registration-v1',
-    suite_revision: 'fixture-1',
-    seed: 'a'.repeat(64),
-    tasks: [
-      {
-        case_id: 'fixture-case',
-        case_revision: 1,
-        key_revision: 1,
-        case_hash: digest(json(fixtureCase)),
-        prompt_hash: manifest.prompt_hash,
-        workspace_hash: manifest.workspace_hash,
-        diff_hash: manifest.diff_hash,
-        preparation_path: prepared,
-        cache_path: cache,
-        source_kind: 'accepted_review',
-        family: 'fixture-family',
-        key_state: 'historical-partial',
-        repeats: 2,
-        temporal_blocks: 1,
-        budget_usd: 1,
-        max_attempts: 2,
-        ...overrides,
-      },
-    ],
-    arms: [
-      {
-        id: 'arm-a',
-        model_id: 'model-a',
-        requested_effort: 'high',
-        harness: 'harness-a',
-        observed_effort_required: true,
-      },
-      {
-        id: 'arm-b',
-        model_id: 'model-b',
-        requested_effort: 'high',
-        harness: 'harness-a',
-        observed_effort_required: true,
-      },
-    ],
-  };
-}
-
-function matrixFileWithCatalog(registrationValue, folder) {
-  const input = path.join(temp, 'registration-' + Math.random().toString(36).slice(2) + '.json');
-  const output = path.join(temp, 'matrix-' + Math.random().toString(36).slice(2) + '.json');
-  fs.writeFileSync(input, json(registrationValue));
-  const result = run('matrix', '--registration', input, '--out', output, '--catalog', folder);
-  return { result, output, matrix: result.status === 0 ? JSON.parse(fs.readFileSync(output, 'utf8')) : null };
-}
-const matrixFile = (registrationValue = registration()) => matrixFileWithCatalog(registrationValue, catalog);
-
-function attempt(number = 1, changes = {}) {
-  return {
-    attempt_id: 'attempt-' + number,
-    attempt_number: number,
-    status: 'completed',
-    reason: null,
-    observed_effort: 'high',
-    cost_usd: 0.5,
-    wall_ms: 100,
-    requests: 1,
-    tokens: 10,
-    tool_calls: 0,
-    matched_key_ids: ['defect-a'],
-    novel_findings: [],
-    false_claims: 0,
-    wrong_verdict: false,
-    verdict: null,
-    ...changes,
-  };
-}
-
-function summarizeFixture(changes = (cells) => cells, allowPartial = false) {
-  const { matrix, output } = matrixFile();
-  const cells = changes(matrix.cells.map((cell) => ({ ...cell, attempts: [attempt()] })));
-  for (const cell of cells)
-    for (const value of cell.attempts) value.attempt_id = 'attempt-' + cell.cell_id + '-' + value.attempt_number;
-  const input = path.join(temp, 'cells-' + Math.random().toString(36).slice(2) + '.json');
-  fs.writeFileSync(input, json({ schema: 'arc-review-cells-v1', cells }));
-  const result = run(
-    'summarize',
-    '--matrix',
-    output,
-    '--cells',
-    input,
-    '--catalog',
-    catalog,
-    ...(allowPartial ? ['--allow-partial'] : []),
-  );
-  return { result, summary: result.status === 0 ? JSON.parse(result.output) : null };
-}
-
-test('a captured cache prepares exact bytes after its disposable source object database is removed', () => {
-  const original = fs.readFileSync(path.join(prepared, 'workspace', 'fixture.txt'));
-  assert.equal(original.toString(), 'candidate defect\n');
-  assert.equal(fs.existsSync(path.join(prepared, 'workspace', '.git')), false);
-  assert.equal(fs.existsSync(path.join(prepared, 'workspace', 'prompt.txt')), false);
-  const objectDb = path.join(source, '.git', 'objects');
-  assert.equal(path.dirname(objectDb), path.join(source, '.git'));
-  fs.rmSync(objectDb, { recursive: true });
-  assert.equal(run('validate', '--cache', cache, '--catalog', catalog).status, 0);
-  const second = run(
-    'prepare',
-    '--cache',
-    cache,
-    '--case',
-    'fixture-case',
-    '--out',
-    path.join(temp, 'prepared-again'),
-    '--catalog',
-    catalog,
-  );
-  assert.equal(second.status, 0, second.error);
-});
-
-test('cache validation rejects a missing object and a forged manifest', () => {
-  const objectFile = path.join(
-    cache,
-    'objects',
-    fixtureCase.source.candidate.slice(0, 2),
-    fixtureCase.source.candidate.slice(2),
-  );
-  const bytes = fs.readFileSync(objectFile);
-  fs.unlinkSync(objectFile);
-  try {
-    assert.notEqual(run('validate', '--cache', cache, '--catalog', catalog).status, 0);
-  } finally {
-    fs.writeFileSync(objectFile, bytes);
-  }
-  const manifestFile = path.join(cache, 'evidence.json');
-  const original = fs.readFileSync(manifestFile);
-  const changed = JSON.parse(original);
-  changed.cases[0].candidate = '0'.repeat(40);
-  fs.writeFileSync(manifestFile, json(changed));
-  try {
-    assert.notEqual(run('validate', '--cache', cache, '--catalog', catalog).status, 0);
-  } finally {
-    fs.writeFileSync(manifestFile, original);
-  }
-  assert.equal(run('validate', '--cache', cache, '--catalog', catalog).status, 0);
-});
-
-test('case intake rejects traversal and direct answer leaks', () => {
-  const file = path.join(catalog, 'fixture-case.json');
-  const original = fs.readFileSync(file);
-  const changed = JSON.parse(original);
-  changed.fixture_paths = ['../fixture.txt'];
-  fs.writeFileSync(file, json(changed));
-  try {
-    assert.notEqual(run('validate', '--cache', cache, '--catalog', catalog).status, 0);
-  } finally {
-    fs.writeFileSync(file, original);
-  }
-  const workspace = path.join(temp, 'leak-source');
-  fs.mkdirSync(workspace);
-  git(workspace, 'init', '--quiet');
-  git(workspace, 'config', 'user.name', 'Fixture');
-  git(workspace, 'config', 'user.email', 'fixture@example.invalid');
-  fs.writeFileSync(path.join(workspace, 'fixture.txt'), 'defect-a\n');
-  git(workspace, 'add', 'fixture.txt');
-  git(workspace, 'commit', '--quiet', '-m', 'fixture');
-  const leak = git(workspace, 'rev-parse', 'HEAD');
-  const caseWithLeak = { ...fixtureCase, source: { base: leak, candidate: leak, correction: leak } };
-  const leakCatalog = path.join(temp, 'leak-catalog');
-  fs.mkdirSync(leakCatalog);
-  fs.writeFileSync(path.join(leakCatalog, 'fixture-case.json'), json(caseWithLeak));
-  const leakCache = path.join(temp, 'leak-cache.git');
-  assert.equal(run('capture', '--repository', workspace, '--out', leakCache, '--catalog', leakCatalog).status, 0);
-  assert.match(
-    run(
-      'prepare',
-      '--cache',
-      leakCache,
-      '--case',
-      'fixture-case',
-      '--out',
-      path.join(temp, 'leaked'),
-      '--catalog',
-      leakCatalog,
-    ).error,
-    /direct answer leak/,
-  );
-});
-
-test('matrix rejects zero budgets and unbounded counts', () => {
-  assert.match(matrixFile(registration({ budget_usd: 0 })).result.error, /budget or attempts/);
-  assert.match(matrixFile(registration({ repeats: 1001 })).result.error, /repeat or block count/);
-});
-
-test('missing whole tasks and changed conditions cannot contribute a score', () => {
-  assert.match(summarizeFixture(() => []).result.error, /missing cells/);
-  assert.match(
-    summarizeFixture((cells) => {
-      cells[0].prompt_hash = '0'.repeat(64);
-      return cells;
-    }).result.error,
-    /changed condition/,
-  );
-  assert.match(summarizeFixture((cells) => [...cells, cells[0]]).result.error, /duplicate cell/);
-  const partial = summarizeFixture((cells) => cells.slice(0, 1), true).summary;
-  assert.equal(partial.complete, false);
-  assert.equal(partial.comparison_suppressed, true);
-  assert.equal(partial.missing_cell_ids.length, 3);
-});
-
-test('void replacement is charged and a model failure cannot be retried', () => {
-  const valid = summarizeFixture((cells) => {
-    cells[0].attempts = [
-      attempt(1, { status: 'void', reason: 'infrastructure', cost_usd: 0.2, matched_key_ids: [] }),
-      attempt(2, { cost_usd: 0.3 }),
-    ];
-    return cells;
-  }).summary;
-  assert.equal(valid.attempts.void, 1);
-  assert.equal(valid.cost_usd, 2);
-  assert.match(
-    summarizeFixture((cells) => {
-      cells[0].attempts = [attempt(1, { status: 'model-failure' }), attempt(2)];
-      return cells;
-    }).result.error,
-    /retry after terminal/,
-  );
-});
-
-test('recall stays bounded and unknown cost stays distinct from zero', () => {
-  assert.match(
-    summarizeFixture((cells) => {
-      cells[0].attempts[0].matched_key_ids = ['defect-a', 'defect-a'];
-      return cells;
-    }).result.error,
-    /duplicate matched key/,
-  );
-  assert.match(
-    summarizeFixture((cells) => {
-      cells[0].attempts[0].matched_key_ids = ['other-defect'];
-      return cells;
-    }).result.error,
-    /unknown or nonserious key/,
-  );
-  const report = summarizeFixture((cells) => {
-    cells[0].attempts[0].cost_usd = null;
-    cells[1].attempts[0].cost_usd = 0;
-    return cells;
-  }).summary;
-  assert.equal(report.results[0].known_key_recall, 0.5);
-  assert.equal(report.cost_usd, null);
-  assert.equal(report.unknown_cost_attempts, 1);
-  assert.equal(report.known_cost_usd, 1);
-});
-
-test('a serious novel finding makes every arm exploratory', () => {
-  const report = summarizeFixture((cells) => {
-    cells[0].attempts[0].novel_findings = [{ id: 'novel-a', serious: true, true_finding: true }];
-    return cells;
-  }).summary;
-  assert.equal(report.results.length, 4);
-  assert.ok(report.results.every((row) => row.key_incomplete && row.comparison === 'exploratory'));
-});
-
-test('a clean control has no recall denominator and exposes a false blocker', () => {
-  const control = {
-    ...fixtureCase,
-    id: 'fixture-control',
-    source_kind: 'clean_control',
-    family: 'fixture-control-family',
-    key_state: 'reviewed',
-    keys: [],
-    control_audit: { condition: 'audited-no-blocker', evidence_sha256: 'c'.repeat(64) },
-  };
-  const folder = path.join(temp, 'control-catalog');
-  fs.mkdirSync(folder);
-  fs.writeFileSync(path.join(folder, 'fixture-control.json'), json(control));
-  const controlCache = path.join(temp, 'control-cache.git');
-  const controlPrepared = path.join(temp, 'control-prepared');
-  assert.equal(run('capture', '--repository', cache, '--out', controlCache, '--catalog', folder).status, 0);
-  assert.equal(
-    run('prepare', '--cache', controlCache, '--case', control.id, '--out', controlPrepared, '--catalog', folder).status,
-    0,
-  );
-  const controlManifest = JSON.parse(fs.readFileSync(path.join(controlPrepared, 'manifest.json'), 'utf8'));
-  const r = registration();
-  r.tasks = [
-    {
-      ...r.tasks[0],
-      case_id: control.id,
-      case_hash: digest(json(control)),
-      prompt_hash: controlManifest.prompt_hash,
-      workspace_hash: controlManifest.workspace_hash,
-      diff_hash: controlManifest.diff_hash,
-      preparation_path: controlPrepared,
-      cache_path: controlCache,
-      source_kind: control.source_kind,
-      family: control.family,
-      key_state: control.key_state,
-      repeats: 1,
-    },
-  ];
-  const registrationFile = path.join(temp, 'control-registration.json');
-  const matrixPath = path.join(temp, 'control-matrix.json');
-  const cellsPath = path.join(temp, 'control-cells.json');
-  fs.writeFileSync(registrationFile, json(r));
-  const frozen = run('matrix', '--registration', registrationFile, '--out', matrixPath, '--catalog', folder);
-  assert.equal(frozen.status, 0, frozen.error);
-  const cells = JSON.parse(frozen.output).cells.map((cell, index) => ({
-    ...cell,
-    attempts: [
-      attempt(1, {
-        attempt_id: 'control-' + (index + 1),
-        matched_key_ids: [],
-        wrong_verdict: index === 0,
-        verdict: index === 0 ? 'reject' : 'approve',
-      }),
-    ],
-  }));
-  fs.writeFileSync(cellsPath, json({ schema: 'arc-review-cells-v1', cells }));
-  const scored = run('summarize', '--matrix', matrixPath, '--cells', cellsPath, '--catalog', folder);
-  assert.equal(scored.status, 0, scored.error);
-  const report = JSON.parse(scored.output);
-  assert.ok(report.results.every((row) => row.known_key_recall === null));
-  assert.deepEqual(
-    report.results.map((row) => row.false_blocker),
-    [true, false],
-  );
-});
-
-test('excluded additions, deletions, and renames stay out of both review outputs', () => {
-  const repo = path.join(temp, 'diff-source');
-  const folder = path.join(temp, 'diff-catalog');
-  fs.mkdirSync(repo);
-  fs.mkdirSync(folder);
-  git(repo, 'init', '--quiet');
-  git(repo, 'config', 'user.name', 'Fixture');
-  git(repo, 'config', 'user.email', 'fixture@example.invalid');
-  fs.mkdirSync(path.join(repo, '.claude', 'reviews'), { recursive: true });
-  fs.mkdirSync(path.join(repo, 'docs'));
-  fs.writeFileSync(path.join(repo, 'fixture.txt'), 'base\n');
-  fs.writeFileSync(path.join(repo, 'docs', 'defect.md'), 'base defect\n');
-  fs.writeFileSync(path.join(repo, '.claude', 'reviews', 'deleted.md'), 'private deleted answer\n');
-  fs.writeFileSync(path.join(repo, '.claude', 'reviews', 'renamed.md'), 'private renamed answer\n');
-  git(repo, 'add', '.');
-  git(repo, 'commit', '--quiet', '-m', 'base');
-  const base = git(repo, 'rev-parse', 'HEAD');
-  fs.unlinkSync(path.join(repo, '.claude', 'reviews', 'deleted.md'));
-  fs.renameSync(path.join(repo, '.claude', 'reviews', 'renamed.md'), path.join(repo, '.claude', 'reviews', 'moved.md'));
-  fs.writeFileSync(path.join(repo, '.claude', 'reviews', 'added.md'), 'private added answer\n');
-  fs.writeFileSync(path.join(repo, 'fixture.txt'), 'candidate defect\n');
-  fs.writeFileSync(path.join(repo, 'docs', 'defect.md'), 'candidate documentation defect\n');
-  git(repo, 'add', '.');
-  git(repo, 'commit', '--quiet', '-m', 'candidate');
-  const candidate = git(repo, 'rev-parse', 'HEAD');
-  const item = {
-    ...fixtureCase,
-    id: 'diff-case',
-    source: { base, candidate, correction: candidate },
-    fixture_paths: ['fixture.txt', 'docs/defect.md'],
-  };
-  fs.writeFileSync(path.join(folder, 'diff-case.json'), json(item));
-  const evidence = path.join(temp, 'diff-cache.git');
-  const output = path.join(temp, 'diff-prepared');
-  assert.equal(run('capture', '--repository', repo, '--out', evidence, '--catalog', folder).status, 0);
-  const preparedResult = run('prepare', '--cache', evidence, '--case', item.id, '--out', output, '--catalog', folder);
-  assert.equal(preparedResult.status, 0, preparedResult.error);
-  const diff = fs.readFileSync(path.join(output, 'candidate.diff'), 'utf8');
-  assert.match(diff, /candidate documentation defect/);
-  assert.doesNotMatch(diff, /private (deleted|renamed|added) answer/);
-  assert.doesNotMatch(diff, /\.claude\/reviews/);
-  assert.equal(fs.existsSync(path.join(output, 'workspace', '.claude')), false);
-  const removal = JSON.parse(fs.readFileSync(path.join(output, 'manifest.json'), 'utf8')).removal_accounting;
-  assert.ok(removal.some((entry) => entry.path.endsWith('deleted.md') && entry.side === 'base diff'));
-  assert.ok(removal.some((entry) => entry.path.endsWith('moved.md') && entry.side === 'candidate'));
-});
-
-test.each(['prompt.txt', path.join('workspace', 'fixture.txt'), 'candidate.diff'])(
-  'registration checks preparation bytes and freezes portable conditions: changed %s',
-  HEAVY,
-  (relative) => {
-    const file = path.join(prepared, relative);
-    const bytes = fs.readFileSync(file);
-    fs.writeFileSync(file, 'changed\n');
-    try {
-      assert.notEqual(matrixFile().result.status, 0);
-    } finally {
-      fs.writeFileSync(file, bytes);
-    }
-    assert.equal(matrixFile().result.status, 0);
-  },
-);
-
-test('registration checks preparation bytes and freezes portable conditions: changed manifest', HEAVY, () => {
-  const manifestFile = path.join(prepared, 'manifest.json');
-  const manifestBytes = fs.readFileSync(manifestFile);
-  const alteredManifest = JSON.parse(manifestBytes);
-  alteredManifest.limitations.push('changed');
-  fs.writeFileSync(manifestFile, json(alteredManifest));
-  try {
-    assert.match(matrixFile().result.error, /preparation manifest hash/);
-  } finally {
-    fs.writeFileSync(manifestFile, manifestBytes);
-  }
-});
-
-test(
-  'registration checks preparation bytes and freezes portable conditions: changed workspace inventory',
-  HEAVY,
-  () => {
-    const extra = path.join(prepared, 'workspace', 'extra.txt');
-    fs.writeFileSync(extra, 'extra\n');
-    try {
-      assert.match(matrixFile().result.error, /changed workspace inventory/);
-    } finally {
-      fs.unlinkSync(extra);
-    }
-    assert.equal(matrixFile().result.status, 0);
-  },
-);
-
-test('registration checks preparation bytes and freezes portable conditions: changed prompt condition', HEAVY, () => {
-  const wrong = registration({ prompt_hash: '0'.repeat(64) });
-  assert.match(matrixFile(wrong).result.error, /preparation condition/);
-});
-
-test('registration checks preparation bytes and freezes portable conditions: portable summary', HEAVY, () => {
-  const { matrix: frozen, output } = matrixFile();
-  assert.equal('preparation_path' in frozen.registration.tasks[0], false);
-  assert.equal('cache_path' in frozen.registration.tasks[0], false);
-  assert.equal(frozen.cells[0].diff_hash, registration().tasks[0].diff_hash);
-  assert.equal(frozen.cells[0].preparation_manifest_hash, frozen.registration.tasks[0].prepared.manifest_hash);
-  const moved = prepared + '-moved';
-  const movedCache = cache + '-moved';
-  fs.renameSync(prepared, moved);
-  fs.renameSync(cache, movedCache);
-  try {
-    const cells = frozen.cells.map((cell) => ({
-      ...cell,
-      attempts: [attempt(1, { attempt_id: 'portable-' + cell.cell_id })],
-    }));
-    const input = path.join(temp, 'portable-cells.json');
-    fs.writeFileSync(input, json({ schema: 'arc-review-cells-v1', cells }));
-    assert.equal(run('summarize', '--matrix', output, '--cells', input, '--catalog', catalog).status, 0);
-  } finally {
-    fs.renameSync(movedCache, cache);
-    fs.renameSync(moved, prepared);
-  }
-});
-
-test.each([
-  [
-    'schema',
-    (manifest) => {
-      manifest.schema = 'unrelated';
-    },
-  ],
-  [
-    'source',
-    (manifest) => {
-      manifest.source = { base: '0'.repeat(40), candidate: '0'.repeat(40), correction: '0'.repeat(40) };
-    },
-  ],
-  [
-    'git_object',
-    (manifest) => {
-      manifest.files[0].git_object = '0'.repeat(40);
-    },
-  ],
-  [
-    'removal_accounting',
-    (manifest) => {
-      manifest.removal_accounting = [{ path: 'fixture.txt', side: 'candidate', reason: 'forged' }];
-    },
-  ],
-  [
-    'mode',
-    (manifest) => {
-      manifest.files[0].mode = manifest.files[0].mode === '100644' ? '100755' : '100644';
-      manifest.workspace_hash = digest(
-        `${manifest.files[0].path}\0${manifest.files[0].mode}\0${manifest.files[0].sha256}\n`,
-      );
-    },
-  ],
-  [
-    'sha256',
-    (manifest, forged) => {
-      manifest.files[0].sha256 = digest('forged bytes\n');
-      manifest.workspace_hash = digest(
-        `${manifest.files[0].path}\0${manifest.files[0].mode}\0${manifest.files[0].sha256}\n`,
-      );
-      fs.writeFileSync(path.join(forged, 'workspace', 'fixture.txt'), 'forged bytes\n');
-    },
-  ],
-  [
-    'diff',
-    (manifest, forged) => {
-      fs.writeFileSync(path.join(forged, 'candidate.diff'), 'forged diff\n');
-      manifest.diff_hash = digest('forged diff\n');
-    },
-  ],
-  [
-    'prompt',
-    (manifest, forged) => {
-      fs.writeFileSync(path.join(forged, 'prompt.txt'), 'forged prompt\n');
-      manifest.prompt_hash = digest('forged prompt\n');
-    },
-  ],
-])('registration rejects preparation that disagrees with captured source evidence: %s', (mutation, change) => {
-  const forged = path.join(temp, `forged-prepared-${mutation}`);
-  fs.cpSync(prepared, forged, { recursive: true });
-  const manifestFile = path.join(forged, 'manifest.json');
-  const manifest = JSON.parse(fs.readFileSync(manifestFile, 'utf8'));
-  change(manifest, forged);
-  delete manifest.manifest_hash;
-  manifest.manifest_hash = digest(json(manifest));
-  fs.writeFileSync(manifestFile, json(manifest));
-  const registered = registration({ preparation_path: forged });
-  Object.assign(registered.tasks[0], {
-    prompt_hash: manifest.prompt_hash,
-    workspace_hash: manifest.workspace_hash,
-    diff_hash: manifest.diff_hash,
-  });
-  assert.notEqual(matrixFile(registered).result.status, 0);
-});
-
-test('identifiers and hashes require primitive strings', HEAVY, () => {
-  for (const value of [['arm-a'], ['a'.repeat(64)]]) {
-    const registered = registration();
-    if (value[0] === 'arm-a') registered.arms[0].id = value;
-    else registered.seed = value;
-    assert.notEqual(matrixFile(registered).result.status, 0);
-  }
-  const folder = path.join(temp, 'typed-catalog');
-  fs.mkdirSync(folder);
-  for (const change of [
-    (item) => {
-      item.id = ['fixture-case'];
-    },
-    (item) => {
-      item.family = ['fixture-family'];
-    },
-    (item) => {
-      item.source.candidate = [fixtureCase.source.candidate];
-    },
-    (item) => {
-      item.keys[0].id = ['defect-a'];
-    },
-    (item) => {
-      item.keys[0].evidence.sha256 = ['b'.repeat(64)];
-    },
-    (item) => {
-      item.keys[0].evidence.exclude_attempt_ids = [['source-attempt']];
-    },
-  ]) {
-    const item = structuredClone(fixtureCase);
-    change(item);
-    fs.writeFileSync(path.join(folder, 'fixture-case.json'), json(item));
-    assert.notEqual(run('validate', '--cache', cache, '--catalog', folder).status, 0);
-  }
-  const { matrix, output } = matrixFile();
-  const cellFile = path.join(temp, 'typed-cells.json');
-  for (const changes of [
-    { attempt_id: ['attempt-1'] },
-    { matched_key_ids: [['defect-a']] },
-    { novel_findings: [{ id: ['novel'], serious: true, true_finding: true }] },
-  ]) {
-    const cell = { ...matrix.cells[0], attempts: [attempt(1, changes)] };
-    fs.writeFileSync(cellFile, json({ schema: 'arc-review-cells-v1', cells: [cell] }));
-    assert.notEqual(
-      run('summarize', '--matrix', output, '--cells', cellFile, '--catalog', catalog, '--allow-partial').status,
-      0,
+  beforeAll(() => {
+    source = path.join(temp, 'source');
+    cache = path.join(temp, 'cache.git');
+    catalog = path.join(temp, 'catalog');
+    fs.mkdirSync(source);
+    fs.mkdirSync(catalog);
+    git(source, 'init', '--quiet', '--initial-branch=fixture', '--object-format=sha1');
+    const marksFile = path.join(temp, 'fixture-marks');
+    const history = ['base\n', 'candidate defect\n', 'corrected\n']
+      .map(
+        (content, index) =>
+          `commit refs/heads/fixture\nmark :${index + 1}\ncommitter Fixture <fixture@example.invalid> ${index + 1} +0000\ndata 8\nfixture\n${index ? `from :${index}\n` : ''}M 100644 inline fixture.txt\ndata ${Buffer.byteLength(content)}\n${content}\n`,
+      )
+      .join('');
+    execFileSync('git', ['-C', source, 'fast-import', '--quiet', '--export-marks=' + marksFile], {
+      input: history,
+      encoding: 'utf8',
+    });
+    const marks = new Map(
+      fs
+        .readFileSync(marksFile, 'utf8')
+        .trim()
+        .split('\n')
+        .map((line) => {
+          assert.match(line, /^:[123] [a-f0-9]{40}$/);
+          return line.split(' ');
+        }),
     );
-  }
-  const named = structuredClone(fixtureCase);
-  named.id = 'constructor';
-  named.family = 'constructor';
-  const namedCatalog = path.join(temp, 'constructor-catalog');
-  const namedCache = path.join(temp, 'constructor-cache.git');
-  const namedPrepared = path.join(temp, 'constructor-prepared');
-  fs.mkdirSync(namedCatalog);
-  fs.writeFileSync(path.join(namedCatalog, 'constructor.json'), json(named));
-  const namedCapture = run('capture', '--repository', cache, '--out', namedCache, '--catalog', namedCatalog);
-  assert.equal(namedCapture.status, 0, namedCapture.error);
-  assert.equal(
-    run('prepare', '--cache', namedCache, '--case', named.id, '--out', namedPrepared, '--catalog', namedCatalog).status,
-    0,
-  );
-  const namedManifest = JSON.parse(fs.readFileSync(path.join(namedPrepared, 'manifest.json'), 'utf8'));
-  const namedRegistration = registration({
-    case_id: named.id,
-    case_hash: digest(json(named)),
-    family: named.family,
-    prompt_hash: namedManifest.prompt_hash,
-    workspace_hash: namedManifest.workspace_hash,
-    diff_hash: namedManifest.diff_hash,
-    preparation_path: namedPrepared,
-    cache_path: namedCache,
-  });
-  namedRegistration.arms[0].id = 'constructor';
-  const {
-    result: namedResult,
-    matrix: namedMatrix,
-    output: namedMatrixPath,
-  } = matrixFileWithCatalog(namedRegistration, namedCatalog);
-  assert.equal(namedResult.status, 0, namedResult.error);
-  const namedCells = namedMatrix.cells.map((cell) => ({
-    ...cell,
-    attempts: [attempt(1, { attempt_id: 'attempt-' + cell.cell_id })],
-  }));
-  const namedCellsPath = path.join(temp, 'constructor-cells.json');
-  fs.writeFileSync(namedCellsPath, json({ schema: 'arc-review-cells-v1', cells: namedCells }));
-  const scored = run('summarize', '--matrix', namedMatrixPath, '--cells', namedCellsPath, '--catalog', namedCatalog);
-  assert.equal(scored.status, 0, scored.error);
-  const report = JSON.parse(scored.output);
-  assert.equal(report.family_means.accepted_review.constructor.constructor, 0.5);
-  assert.equal(report.paired_family_means.accepted_review.constructor['constructor:arm-b'].valid_pairs, 2);
-});
-
-test('Git tree names reject case aliases in directory prefixes', () => {
-  const repo = path.join(temp, 'prefix-source');
-  const folder = path.join(temp, 'prefix-catalog');
-  fs.mkdirSync(repo);
-  fs.mkdirSync(folder);
-  git(repo, 'init', '--quiet');
-  git(repo, 'config', 'user.name', 'Fixture');
-  git(repo, 'config', 'user.email', 'fixture@example.invalid');
-  fs.writeFileSync(path.join(repo, 'fixture.txt'), 'safe\n');
-  git(repo, 'add', 'fixture.txt');
-  git(repo, 'commit', '--quiet', '-m', 'base');
-  const base = git(repo, 'rev-parse', 'HEAD');
-  const blob = git(repo, 'rev-parse', 'HEAD:fixture.txt');
-  const subtree = spawnSync('git', ['-C', repo, 'mktree'], { input: `100644 blob ${blob}\tx.txt\n`, encoding: 'utf8' });
-  assert.equal(subtree.status, 0, subtree.stderr);
-  for (const [index, second] of [`040000 tree ${subtree.stdout.trim()}\ta\n`, `100644 blob ${blob}\ta\n`].entries()) {
-    const tree = spawnSync('git', ['-C', repo, 'mktree'], {
-      input: `100644 blob ${blob}\tfixture.txt\n040000 tree ${subtree.stdout.trim()}\tA\n${second}`,
-      encoding: 'utf8',
+    assert.equal(marks.size, 3);
+    const commits = [1, 2, 3].map((mark) => {
+      const hash = marks.get(':' + mark);
+      assert.match(hash, /^[a-f0-9]{40}$/);
+      return hash;
     });
-    assert.equal(tree.status, 0, tree.stderr);
-    const commit = spawnSync('git', ['-C', repo, 'commit-tree', tree.stdout.trim(), '-p', base], {
-      input: 'prefix candidate\n',
-      encoding: 'utf8',
-    });
-    assert.equal(commit.status, 0, commit.stderr);
-    const item = {
-      ...fixtureCase,
-      id: 'prefix-case',
-      source: { base, candidate: commit.stdout.trim(), correction: commit.stdout.trim() },
+    git(source, 'read-tree', '-m', '-u', 'HEAD');
+    assert.deepEqual(git(source, 'rev-list', '--parents', '--reverse', 'HEAD').split('\n'), [
+      commits[0],
+      commits[1] + ' ' + commits[0],
+      commits[2] + ' ' + commits[1],
+    ]);
+    assert.deepEqual(git(source, 'status', '--porcelain=v2', '--branch').split('\n'), [
+      '# branch.oid ' + commits[2],
+      '# branch.head fixture',
+    ]);
+    assert.equal(fs.readFileSync(path.join(source, 'fixture.txt'), 'utf8'), 'corrected\n');
+    fixtureCase = {
+      schema: 'arc-review-case-v1',
+      id: 'fixture-case',
+      source_kind: 'accepted_review',
+      family: 'fixture-family',
+      case_revision: 1,
+      key_revision: 1,
+      source: { base: commits[0], candidate: commits[1], correction: commits[2] },
+      key_state: 'historical-partial',
+      historical_context: { original_prompt: null, plan: null },
+      fixture_paths: ['fixture.txt'],
+      keys: [
+        {
+          id: 'defect-a',
+          severity: 'high',
+          summary: 'Candidate contains a visible defect.',
+          paths: ['fixture.txt'],
+          evidence: fixtureEvidence(),
+        },
+        {
+          id: 'defect-b',
+          severity: 'medium',
+          summary: 'Candidate contains another visible defect.',
+          paths: ['fixture.txt'],
+          evidence: fixtureEvidence(),
+        },
+      ],
     };
-    fs.writeFileSync(path.join(folder, 'prefix-case.json'), json(item));
-    assert.notEqual(
-      run('capture', '--repository', repo, '--out', path.join(temp, 'prefix-' + index + '.git'), '--catalog', folder)
-        .status,
-      0,
-    );
-  }
-  const peers = spawnSync('git', ['-C', repo, 'mktree'], {
-    input: `100644 blob ${blob}\tx.txt\n100644 blob ${blob}\ty.txt\n`,
-    encoding: 'utf8',
+    fs.writeFileSync(path.join(catalog, 'fixture-case.json'), json(fixtureCase));
   });
-  assert.equal(peers.status, 0, peers.stderr);
-  const tree = spawnSync('git', ['-C', repo, 'mktree'], {
-    input: `100644 blob ${blob}\tfixture.txt\n040000 tree ${peers.stdout.trim()}\tA\n`,
-    encoding: 'utf8',
-  });
-  assert.equal(tree.status, 0, tree.stderr);
-  const commit = spawnSync('git', ['-C', repo, 'commit-tree', tree.stdout.trim(), '-p', base], {
-    input: 'valid peers\n',
-    encoding: 'utf8',
-  });
-  assert.equal(commit.status, 0, commit.stderr);
-  const item = {
-    ...fixtureCase,
-    id: 'prefix-case',
-    source: { base, candidate: commit.stdout.trim(), correction: commit.stdout.trim() },
-  };
-  fs.writeFileSync(path.join(folder, 'prefix-case.json'), json(item));
-  const accepted = run(
-    'capture',
-    '--repository',
-    repo,
-    '--out',
-    path.join(temp, 'prefix-peers.git'),
-    '--catalog',
-    folder,
-  );
-  assert.equal(accepted.status, 0, accepted.error);
-});
 
-test('malformed catalogs and false controls fail before matrix and summary', () => {
-  const file = path.join(catalog, 'fixture-case.json');
-  const original = fs.readFileSync(file);
-  const altered = JSON.parse(original);
-  altered.keys[0].paths = ['missing.txt'];
-  fs.writeFileSync(file, json(altered));
-  try {
-    assert.notEqual(matrixFile().result.status, 0);
-  } finally {
-    fs.writeFileSync(file, original);
+  function registration(overrides = {}) {
+    const manifest = JSON.parse(fs.readFileSync(path.join(prepared, 'manifest.json'), 'utf8'));
+    return {
+      schema: 'arc-review-registration-v1',
+      suite_revision: 'fixture-1',
+      seed: 'a'.repeat(64),
+      tasks: [
+        {
+          case_id: 'fixture-case',
+          case_revision: 1,
+          key_revision: 1,
+          case_hash: digest(json(fixtureCase)),
+          prompt_hash: manifest.prompt_hash,
+          workspace_hash: manifest.workspace_hash,
+          diff_hash: manifest.diff_hash,
+          preparation_path: prepared,
+          cache_path: cache,
+          source_kind: 'accepted_review',
+          family: 'fixture-family',
+          key_state: 'historical-partial',
+          repeats: 2,
+          temporal_blocks: 1,
+          budget_usd: 1,
+          max_attempts: 2,
+          ...overrides,
+        },
+      ],
+      arms: [
+        {
+          id: 'arm-a',
+          model_id: 'model-a',
+          requested_effort: 'high',
+          harness: 'harness-a',
+          observed_effort_required: true,
+        },
+        {
+          id: 'arm-b',
+          model_id: 'model-b',
+          requested_effort: 'high',
+          harness: 'harness-a',
+          observed_effort_required: true,
+        },
+      ],
+    };
   }
-  assert.equal(matrixFile().result.status, 0);
-  const duplicate = path.join(catalog, 'duplicate.json');
-  fs.writeFileSync(duplicate, original);
-  try {
-    assert.match(matrixFile().result.error, /duplicate case id/);
-  } finally {
-    fs.unlinkSync(duplicate);
-  }
-  const noKey = JSON.parse(original);
-  noKey.keys = [];
-  fs.writeFileSync(file, json(noKey));
-  try {
-    assert.match(matrixFile().result.error, /missing serious key denominator/);
-  } finally {
-    fs.writeFileSync(file, original);
-  }
-  const falseControl = JSON.parse(original);
-  falseControl.source_kind = 'clean_control';
-  falseControl.keys = [];
-  falseControl.key_state = 'reviewed';
-  fs.writeFileSync(file, json(falseControl));
-  try {
-    assert.match(matrixFile().result.error, /clean control audit/);
-  } finally {
-    fs.writeFileSync(file, original);
-  }
-  assert.equal(matrixFile().result.status, 0);
-  const badCaptureFolder = path.join(temp, 'dangling-catalog');
-  fs.mkdirSync(badCaptureFolder);
-  const dangling = JSON.parse(original);
-  dangling.fixture_paths = ['missing.txt'];
-  fs.writeFileSync(path.join(badCaptureFolder, 'fixture-case.json'), json(dangling));
-  assert.match(
-    run('capture', '--repository', cache, '--out', path.join(temp, 'dangling-cache.git'), '--catalog', badCaptureFolder)
-      .error,
-    /dangling fixture path/,
-  );
-  const invalidArm = registration();
-  invalidArm.arms[0].model_id = {};
-  assert.match(matrixFile(invalidArm).result.error, /arm fields/);
-  const ambiguous = registration();
-  ambiguous.arms[0].unverified_harness = true;
-  assert.match(matrixFile(ambiguous).result.error, /effort readback condition/);
-});
 
-test('all-void quality stays missing while terminal failures keep partial credit in pairs', () => {
-  const report = summarizeFixture((cells) => {
-    cells[0].attempts = [
-      attempt(1, { status: 'void', reason: 'infrastructure', matched_key_ids: [], cost_usd: 0.2, requests: null }),
-    ];
-    cells[2].attempts = [attempt(1, { status: 'model-failure', matched_key_ids: ['defect-a'] })];
-    cells[3].attempts = [attempt(1, { status: 'budget-exhausted', matched_key_ids: [] })];
-    return cells;
-  }).summary;
-  assert.equal(report.results[0].known_key_recall, null);
-  assert.equal(report.results[1].known_key_recall, 0.5);
-  assert.equal(report.results[2].known_key_recall, 0.5);
-  assert.equal(report.results[3].known_key_recall, 0);
-  assert.equal(report.paired_family_means.accepted_review['fixture-family']['arm-a:arm-b'].valid_pairs, 1);
-  assert.equal(report.paired_family_means.accepted_review['fixture-family']['arm-a:arm-b'].missing_valid_pairs, 1);
-  assert.equal(report.usage.requests, null);
-  assert.equal(report.known_usage.requests, 3);
-  assert.equal(report.unknown_usage_attempts.requests, 1);
-  assert.equal(report.attempts['model-failure'], 1);
-  assert.equal(report.attempts['budget-exhausted'], 1);
-  assert.equal(report.attempts.void, 1);
-});
-
-test('missing whole arms and replicate blocks remain incomplete', () => {
-  for (const select of [(cell) => cell.arm_id === 'arm-a', (cell) => cell.replicate === 1]) {
-    const report = summarizeFixture((cells) => cells.filter(select), true).summary;
-    assert.equal(report.complete, false);
-    assert.equal(report.comparison_suppressed, true);
-    assert.equal(report.missing_cell_ids.length, 2);
-    assert.deepEqual(report.pair_contrasts, []);
+  function matrixFileWithCatalog(registrationValue, folder) {
+    const input = path.join(temp, 'registration-' + Math.random().toString(36).slice(2) + '.json');
+    const output = path.join(temp, 'matrix-' + Math.random().toString(36).slice(2) + '.json');
+    fs.writeFileSync(input, json(registrationValue));
+    const result = run('matrix', '--registration', input, '--out', output, '--catalog', folder);
+    return { result, output, matrix: result.status === 0 ? JSON.parse(fs.readFileSync(output, 'utf8')) : null };
   }
-});
+  const matrixFile = (registrationValue = registration()) => matrixFileWithCatalog(registrationValue, catalog);
 
-test('source attempts are excluded when identities are known', () => {
-  const item = structuredClone(fixtureCase);
-  item.id = 'exclusion-case';
-  item.case_revision = 2;
-  item.key_revision = 3;
-  item.keys[0].evidence.source_attempt_identity = 'known';
-  item.keys[0].evidence.exclude_attempt_ids = ['source-attempt'];
-  const folder = path.join(temp, 'exclusion-catalog');
-  fs.mkdirSync(folder);
-  fs.writeFileSync(path.join(folder, 'exclusion-case.json'), json(item));
-  const evidence = path.join(temp, 'exclusion-cache.git');
-  const output = path.join(temp, 'exclusion-prepared');
-  assert.equal(run('capture', '--repository', cache, '--out', evidence, '--catalog', folder).status, 0);
-  assert.equal(run('prepare', '--cache', evidence, '--case', item.id, '--out', output, '--catalog', folder).status, 0);
-  const preparedManifest = JSON.parse(fs.readFileSync(path.join(output, 'manifest.json'), 'utf8'));
-  const registered = registration();
-  Object.assign(registered.tasks[0], {
-    case_id: item.id,
-    case_revision: 2,
-    key_revision: 3,
-    case_hash: digest(json(item)),
-    prompt_hash: preparedManifest.prompt_hash,
-    workspace_hash: preparedManifest.workspace_hash,
-    diff_hash: preparedManifest.diff_hash,
-    preparation_path: output,
-    cache_path: evidence,
-  });
-  const { matrix: frozen, output: matrixPath } = matrixFileWithCatalog(registered, folder);
-  const cells = frozen.cells.map((cell) => ({
-    ...cell,
-    attempts: [attempt(1, { attempt_id: 'attempt-' + cell.cell_id })],
-  }));
-  cells[0].attempts[0].attempt_id = 'source-attempt';
-  const cellFile = path.join(temp, 'excluded-cells.json');
-  fs.writeFileSync(cellFile, json({ schema: 'arc-review-cells-v1', cells }));
-  assert.match(
-    run('summarize', '--matrix', matrixPath, '--cells', cellFile, '--catalog', folder).error,
-    /source attempt excluded/,
-  );
-  cells[0].attempts[0].attempt_id = 'new-attempt';
-  fs.writeFileSync(cellFile, json({ schema: 'arc-review-cells-v1', cells }));
-  const accepted = run('summarize', '--matrix', matrixPath, '--cells', cellFile, '--catalog', folder);
-  assert.equal(accepted.status, 0, accepted.error);
-});
+  function pathFixture(name, content = 'safe\n') {
+    const repo = path.join(temp, name);
+    fs.mkdirSync(repo);
+    git(repo, 'init', '--quiet');
+    fs.appendFileSync(path.join(repo, '.git', 'config'), '\n[user]\nname = Fixture\nemail = fixture@example.invalid\n');
+    execFileSync('git', ['-C', repo, 'fast-import', '--quiet'], {
+      input: `commit refs/heads/fixture\ncommitter Fixture <fixture@example.invalid> 1 +0000\ndata 5\nbase\nM 100644 inline fixture.txt\ndata ${Buffer.byteLength(content)}\n${content}\n`,
+      encoding: 'utf8',
+    });
+    const [base, blob] = git(repo, 'rev-parse', 'refs/heads/fixture', 'refs/heads/fixture:fixture.txt').split('\n');
+    assert.match(base, /^[a-f0-9]{40}$/);
+    assert.match(blob, /^[a-f0-9]{40}$/);
+    return { repo, base, blob };
+  }
 
-test('source path dialects and standalone object ownership survive validation', () => {
-  const file = path.join(cache, 'evidence.json');
-  const original = fs.readFileSync(file);
-  for (const [index, sourceRoot] of ['C:\\source\\arc', '/source/arc'].entries()) {
-    const changed = JSON.parse(original);
-    changed.source_root = sourceRoot;
-    fs.writeFileSync(file, json(changed));
-    assert.equal(run('validate', '--cache', cache, '--catalog', catalog).status, 0);
+  function attempt(number = 1, changes = {}) {
+    return {
+      attempt_id: 'attempt-' + number,
+      attempt_number: number,
+      status: 'completed',
+      reason: null,
+      observed_effort: 'high',
+      cost_usd: 0.5,
+      wall_ms: 100,
+      requests: 1,
+      tokens: 10,
+      tool_calls: 0,
+      matched_key_ids: ['defect-a'],
+      novel_findings: [],
+      false_claims: 0,
+      wrong_verdict: false,
+      verdict: null,
+      ...changes,
+    };
+  }
+
+  function summarizeFixture(changes = (cells) => cells, allowPartial = false) {
+    const { matrix, output } = scoring;
+    const cells = changes(matrix.cells.map((cell) => ({ ...cell, attempts: [attempt()] })));
+    for (const cell of cells)
+      for (const value of cell.attempts) value.attempt_id = 'attempt-' + cell.cell_id + '-' + value.attempt_number;
+    const input = path.join(temp, 'cells-' + Math.random().toString(36).slice(2) + '.json');
+    fs.writeFileSync(input, json({ schema: 'arc-review-cells-v1', cells }));
     const result = run(
-      'prepare',
-      '--cache',
-      cache,
-      '--case',
-      fixtureCase.id,
-      '--out',
-      path.join(temp, 'dialect-' + index),
+      'summarize',
+      '--matrix',
+      output,
+      '--cells',
+      input,
       '--catalog',
       catalog,
+      ...(allowPartial ? ['--allow-partial'] : []),
     );
-    assert.equal(result.status, 0, result.error);
+    return { result, summary: result.status === 0 ? JSON.parse(result.output) : null };
   }
-  fs.writeFileSync(file, original);
-  const object = path.join(
-    cache,
-    'objects',
-    fixtureCase.source.candidate.slice(0, 2),
-    fixtureCase.source.candidate.slice(2),
-  );
-  const hardlink = path.join(temp, 'object-hardlink');
-  fs.linkSync(object, hardlink);
-  try {
-    assert.match(run('validate', '--cache', cache, '--catalog', catalog).error, /linked cache object/);
-  } finally {
-    fs.unlinkSync(hardlink);
-  }
-  assert.equal(run('validate', '--cache', cache, '--catalog', catalog).status, 0);
-});
 
-test('Git tree names reject device aliases, streams, forbidden characters, and trailing dots or spaces', () => {
-  const repo = path.join(temp, 'unsafe-source');
-  const folder = path.join(temp, 'unsafe-catalog');
-  fs.mkdirSync(repo);
-  fs.mkdirSync(folder);
-  git(repo, 'init', '--quiet');
-  git(repo, 'config', 'user.name', 'Fixture');
-  git(repo, 'config', 'user.email', 'fixture@example.invalid');
-  fs.writeFileSync(path.join(repo, 'fixture.txt'), 'safe\n');
-  git(repo, 'add', 'fixture.txt');
-  git(repo, 'commit', '--quiet', '-m', 'base');
-  const base = git(repo, 'rev-parse', 'HEAD');
-  const blob = git(repo, 'rev-parse', 'HEAD:fixture.txt');
-  for (const [index, name] of [
-    'CON.txt',
-    'COM¹.txt',
-    'data:stream',
-    'trailing.',
-    'trailing ',
-    'bad?.txt',
-    'AUX',
-  ].entries()) {
-    const tree = spawnSync('git', ['-C', repo, 'mktree'], {
-      input: `100644 blob ${blob}\tfixture.txt\n100644 blob ${blob}\t${name}\n`,
-      encoding: 'utf8',
+  describe('captured review fixture', () => {
+    beforeAll(() => {
+      const captured = run('capture', '--repository', source, '--out', cache, '--catalog', catalog);
+      assert.equal(captured.status, 0, captured.error);
     });
-    assert.equal(tree.status, 0, tree.stderr);
-    const commit = spawnSync('git', ['-C', repo, 'commit-tree', tree.stdout.trim(), '-p', base], {
-      input: 'unsafe candidate\n',
-      encoding: 'utf8',
+
+    describe('prepared review fixture', () => {
+      beforeAll(() => {
+        prepared = path.join(temp, 'prepared');
+        const exported = run(
+          'prepare',
+          '--cache',
+          cache,
+          '--case',
+          'fixture-case',
+          '--out',
+          prepared,
+          '--catalog',
+          catalog,
+        );
+        assert.equal(exported.status, 0, exported.error);
+      });
+
+      beforeAll(() => {
+        scoring = matrixFile();
+        assert.equal(scoring.result.status, 0, scoring.result.error);
+      });
+
+      test('a captured cache prepares exact bytes after its disposable source object database is removed', () => {
+        const original = fs.readFileSync(path.join(prepared, 'workspace', 'fixture.txt'));
+        assert.equal(original.toString(), 'candidate defect\n');
+        assert.equal(fs.existsSync(path.join(prepared, 'workspace', '.git')), false);
+        assert.equal(fs.existsSync(path.join(prepared, 'workspace', 'prompt.txt')), false);
+        const objectDb = path.join(source, '.git', 'objects');
+        assert.equal(path.dirname(objectDb), path.join(source, '.git'));
+        fs.rmSync(objectDb, { recursive: true });
+        assert.equal(run('validate', '--cache', cache, '--catalog', catalog).status, 0);
+        const second = run(
+          'prepare',
+          '--cache',
+          cache,
+          '--case',
+          'fixture-case',
+          '--out',
+          path.join(temp, 'prepared-again'),
+          '--catalog',
+          catalog,
+        );
+        assert.equal(second.status, 0, second.error);
+      });
+
+      test('matrix rejects zero budgets and unbounded counts', () => {
+        assert.match(matrixFile(registration({ budget_usd: 0 })).result.error, /budget or attempts/);
+        assert.match(matrixFile(registration({ repeats: 1001 })).result.error, /repeat or block count/);
+      });
+
+      test('missing whole tasks cannot contribute a score', () => {
+        assert.match(summarizeFixture(() => []).result.error, /missing cells/);
+      });
+      test('changed conditions cannot contribute a score', () => {
+        assert.match(
+          summarizeFixture((cells) => {
+            cells[0].prompt_hash = '0'.repeat(64);
+            return cells;
+          }).result.error,
+          /changed condition/,
+        );
+      });
+      test('duplicate cells cannot contribute a score', () => {
+        assert.match(summarizeFixture((cells) => [...cells, cells[0]]).result.error, /duplicate cell/);
+      });
+      test('missing cells suppress the partial comparison', () => {
+        const partial = summarizeFixture((cells) => cells.slice(0, 1), true).summary;
+        assert.equal(partial.complete, false);
+        assert.equal(partial.comparison_suppressed, true);
+        assert.equal(partial.missing_cell_ids.length, 3);
+      });
+
+      test('void replacement is charged and a model failure cannot be retried', () => {
+        const valid = summarizeFixture((cells) => {
+          cells[0].attempts = [
+            attempt(1, { status: 'void', reason: 'infrastructure', cost_usd: 0.2, matched_key_ids: [] }),
+            attempt(2, { cost_usd: 0.3 }),
+          ];
+          return cells;
+        }).summary;
+        assert.equal(valid.attempts.void, 1);
+        assert.equal(valid.cost_usd, 2);
+        assert.match(
+          summarizeFixture((cells) => {
+            cells[0].attempts = [attempt(1, { status: 'model-failure' }), attempt(2)];
+            return cells;
+          }).result.error,
+          /retry after terminal/,
+        );
+      });
+
+      test('recall stays bounded and unknown cost stays distinct from zero', () => {
+        assert.match(
+          summarizeFixture((cells) => {
+            cells[0].attempts[0].matched_key_ids = ['defect-a', 'defect-a'];
+            return cells;
+          }).result.error,
+          /duplicate matched key/,
+        );
+        assert.match(
+          summarizeFixture((cells) => {
+            cells[0].attempts[0].matched_key_ids = ['other-defect'];
+            return cells;
+          }).result.error,
+          /unknown or nonserious key/,
+        );
+        const report = summarizeFixture((cells) => {
+          cells[0].attempts[0].cost_usd = null;
+          cells[1].attempts[0].cost_usd = 0;
+          return cells;
+        }).summary;
+        assert.equal(report.results[0].known_key_recall, 0.5);
+        assert.equal(report.cost_usd, null);
+        assert.equal(report.unknown_cost_attempts, 1);
+        assert.equal(report.known_cost_usd, 1);
+      });
+
+      test('a serious novel finding makes every arm exploratory', () => {
+        const report = summarizeFixture((cells) => {
+          cells[0].attempts[0].novel_findings = [{ id: 'novel-a', serious: true, true_finding: true }];
+          return cells;
+        }).summary;
+        assert.equal(report.results.length, 4);
+        assert.ok(report.results.every((row) => row.key_incomplete && row.comparison === 'exploratory'));
+      });
+
+      describe('a clean control has no recall denominator and exposes a false blocker', () => {
+        let control;
+        let folder;
+        let controlCache;
+        let controlPrepared;
+        let matrixPath;
+        let cellsPath;
+        beforeAll(() => {
+          control = {
+            ...fixtureCase,
+            id: 'fixture-control',
+            source_kind: 'clean_control',
+            family: 'fixture-control-family',
+            key_state: 'reviewed',
+            keys: [],
+            control_audit: { condition: 'audited-no-blocker', evidence_sha256: 'c'.repeat(64) },
+          };
+          folder = path.join(temp, 'control-catalog');
+          fs.mkdirSync(folder);
+          fs.writeFileSync(path.join(folder, 'fixture-control.json'), json(control));
+          controlCache = path.join(temp, 'control-cache.git');
+          controlPrepared = path.join(temp, 'control-prepared');
+        });
+        beforeAll(() => {
+          assert.equal(run('capture', '--repository', cache, '--out', controlCache, '--catalog', folder).status, 0);
+        });
+        beforeAll(() => {
+          assert.equal(
+            run('prepare', '--cache', controlCache, '--case', control.id, '--out', controlPrepared, '--catalog', folder)
+              .status,
+            0,
+          );
+        });
+        beforeAll(() => {
+          const controlManifest = JSON.parse(fs.readFileSync(path.join(controlPrepared, 'manifest.json'), 'utf8'));
+          const r = registration();
+          r.tasks = [
+            {
+              ...r.tasks[0],
+              case_id: control.id,
+              case_hash: digest(json(control)),
+              prompt_hash: controlManifest.prompt_hash,
+              workspace_hash: controlManifest.workspace_hash,
+              diff_hash: controlManifest.diff_hash,
+              preparation_path: controlPrepared,
+              cache_path: controlCache,
+              source_kind: control.source_kind,
+              family: control.family,
+              key_state: control.key_state,
+              repeats: 1,
+            },
+          ];
+          const registrationFile = path.join(temp, 'control-registration.json');
+          matrixPath = path.join(temp, 'control-matrix.json');
+          cellsPath = path.join(temp, 'control-cells.json');
+          fs.writeFileSync(registrationFile, json(r));
+          const frozen = run('matrix', '--registration', registrationFile, '--out', matrixPath, '--catalog', folder);
+          assert.equal(frozen.status, 0, frozen.error);
+          const cells = JSON.parse(frozen.output).cells.map((cell, index) => ({
+            ...cell,
+            attempts: [
+              attempt(1, {
+                attempt_id: 'control-' + (index + 1),
+                matched_key_ids: [],
+                wrong_verdict: index === 0,
+                verdict: index === 0 ? 'reject' : 'approve',
+              }),
+            ],
+          }));
+          fs.writeFileSync(cellsPath, json({ schema: 'arc-review-cells-v1', cells }));
+        });
+        test('scores the control', () => {
+          const scored = run('summarize', '--matrix', matrixPath, '--cells', cellsPath, '--catalog', folder);
+          assert.equal(scored.status, 0, scored.error);
+          const report = JSON.parse(scored.output);
+          assert.ok(report.results.every((row) => row.known_key_recall === null));
+          assert.deepEqual(
+            report.results.map((row) => row.false_blocker),
+            [true, false],
+          );
+        });
+      });
+
+      test.each(['prompt.txt', path.join('workspace', 'fixture.txt'), 'candidate.diff'])(
+        'registration checks preparation bytes and freezes portable conditions: changed %s',
+        HEAVY,
+        (relative) => {
+          const file = path.join(prepared, relative);
+          const bytes = fs.readFileSync(file);
+          fs.writeFileSync(file, 'changed\n');
+          try {
+            assert.notEqual(matrixFile().result.status, 0);
+          } finally {
+            fs.writeFileSync(file, bytes);
+          }
+          assert.equal(matrixFile().result.status, 0);
+        },
+      );
+
+      test('registration checks preparation bytes and freezes portable conditions: changed manifest', HEAVY, () => {
+        const manifestFile = path.join(prepared, 'manifest.json');
+        const manifestBytes = fs.readFileSync(manifestFile);
+        const alteredManifest = JSON.parse(manifestBytes);
+        alteredManifest.limitations.push('changed');
+        fs.writeFileSync(manifestFile, json(alteredManifest));
+        try {
+          assert.match(matrixFile().result.error, /preparation manifest hash/);
+        } finally {
+          fs.writeFileSync(manifestFile, manifestBytes);
+        }
+      });
+
+      test(
+        'registration checks preparation bytes and freezes portable conditions: changed workspace inventory',
+        HEAVY,
+        () => {
+          const extra = path.join(prepared, 'workspace', 'extra.txt');
+          fs.writeFileSync(extra, 'extra\n');
+          try {
+            assert.match(matrixFile().result.error, /changed workspace inventory/);
+          } finally {
+            fs.unlinkSync(extra);
+          }
+          assert.equal(matrixFile().result.status, 0);
+        },
+      );
+
+      test(
+        'registration checks preparation bytes and freezes portable conditions: changed prompt condition',
+        HEAVY,
+        () => {
+          const wrong = registration({ prompt_hash: '0'.repeat(64) });
+          assert.match(matrixFile(wrong).result.error, /preparation condition/);
+        },
+      );
+
+      test('registration checks preparation bytes and freezes portable conditions: portable summary', HEAVY, () => {
+        const { matrix: frozen, output } = matrixFile();
+        assert.equal('preparation_path' in frozen.registration.tasks[0], false);
+        assert.equal('cache_path' in frozen.registration.tasks[0], false);
+        assert.equal(frozen.cells[0].diff_hash, registration().tasks[0].diff_hash);
+        assert.equal(frozen.cells[0].preparation_manifest_hash, frozen.registration.tasks[0].prepared.manifest_hash);
+        const moved = prepared + '-moved';
+        const movedCache = cache + '-moved';
+        fs.renameSync(prepared, moved);
+        fs.renameSync(cache, movedCache);
+        try {
+          const cells = frozen.cells.map((cell) => ({
+            ...cell,
+            attempts: [attempt(1, { attempt_id: 'portable-' + cell.cell_id })],
+          }));
+          const input = path.join(temp, 'portable-cells.json');
+          fs.writeFileSync(input, json({ schema: 'arc-review-cells-v1', cells }));
+          assert.equal(run('summarize', '--matrix', output, '--cells', input, '--catalog', catalog).status, 0);
+        } finally {
+          fs.renameSync(movedCache, cache);
+          fs.renameSync(moved, prepared);
+        }
+      });
+
+      test.each([
+        [
+          'schema',
+          (manifest) => {
+            manifest.schema = 'unrelated';
+          },
+        ],
+        [
+          'source',
+          (manifest) => {
+            manifest.source = { base: '0'.repeat(40), candidate: '0'.repeat(40), correction: '0'.repeat(40) };
+          },
+        ],
+        [
+          'git_object',
+          (manifest) => {
+            manifest.files[0].git_object = '0'.repeat(40);
+          },
+        ],
+        [
+          'removal_accounting',
+          (manifest) => {
+            manifest.removal_accounting = [{ path: 'fixture.txt', side: 'candidate', reason: 'forged' }];
+          },
+        ],
+        [
+          'mode',
+          (manifest) => {
+            manifest.files[0].mode = manifest.files[0].mode === '100644' ? '100755' : '100644';
+            manifest.workspace_hash = digest(
+              `${manifest.files[0].path}\0${manifest.files[0].mode}\0${manifest.files[0].sha256}\n`,
+            );
+          },
+        ],
+        [
+          'sha256',
+          (manifest, forged) => {
+            manifest.files[0].sha256 = digest('forged bytes\n');
+            manifest.workspace_hash = digest(
+              `${manifest.files[0].path}\0${manifest.files[0].mode}\0${manifest.files[0].sha256}\n`,
+            );
+            fs.writeFileSync(path.join(forged, 'workspace', 'fixture.txt'), 'forged bytes\n');
+          },
+        ],
+        [
+          'diff',
+          (manifest, forged) => {
+            fs.writeFileSync(path.join(forged, 'candidate.diff'), 'forged diff\n');
+            manifest.diff_hash = digest('forged diff\n');
+          },
+        ],
+        [
+          'prompt',
+          (manifest, forged) => {
+            fs.writeFileSync(path.join(forged, 'prompt.txt'), 'forged prompt\n');
+            manifest.prompt_hash = digest('forged prompt\n');
+          },
+        ],
+      ])('registration rejects preparation that disagrees with captured source evidence: %s', (mutation, change) => {
+        const forged = path.join(temp, `forged-prepared-${mutation}`);
+        fs.cpSync(prepared, forged, { recursive: true });
+        const manifestFile = path.join(forged, 'manifest.json');
+        const manifest = JSON.parse(fs.readFileSync(manifestFile, 'utf8'));
+        change(manifest, forged);
+        delete manifest.manifest_hash;
+        manifest.manifest_hash = digest(json(manifest));
+        fs.writeFileSync(manifestFile, json(manifest));
+        const registered = registration({ preparation_path: forged });
+        Object.assign(registered.tasks[0], {
+          prompt_hash: manifest.prompt_hash,
+          workspace_hash: manifest.workspace_hash,
+          diff_hash: manifest.diff_hash,
+        });
+        assert.notEqual(matrixFile(registered).result.status, 0);
+      });
+
+      test('identifiers and hashes require primitive strings', HEAVY, () => {
+        for (const value of [['arm-a'], ['a'.repeat(64)]]) {
+          const registered = registration();
+          if (value[0] === 'arm-a') registered.arms[0].id = value;
+          else registered.seed = value;
+          assert.notEqual(matrixFile(registered).result.status, 0);
+        }
+        const folder = path.join(temp, 'typed-catalog');
+        fs.mkdirSync(folder);
+        for (const change of [
+          (item) => {
+            item.id = ['fixture-case'];
+          },
+          (item) => {
+            item.family = ['fixture-family'];
+          },
+          (item) => {
+            item.source.candidate = [fixtureCase.source.candidate];
+          },
+          (item) => {
+            item.keys[0].id = ['defect-a'];
+          },
+          (item) => {
+            item.keys[0].evidence.sha256 = ['b'.repeat(64)];
+          },
+          (item) => {
+            item.keys[0].evidence.exclude_attempt_ids = [['source-attempt']];
+          },
+        ]) {
+          const item = structuredClone(fixtureCase);
+          change(item);
+          fs.writeFileSync(path.join(folder, 'fixture-case.json'), json(item));
+          assert.notEqual(run('validate', '--cache', cache, '--catalog', folder).status, 0);
+        }
+        const { matrix, output } = matrixFile();
+        const cellFile = path.join(temp, 'typed-cells.json');
+        for (const changes of [
+          { attempt_id: ['attempt-1'] },
+          { matched_key_ids: [['defect-a']] },
+          { novel_findings: [{ id: ['novel'], serious: true, true_finding: true }] },
+        ]) {
+          const cell = { ...matrix.cells[0], attempts: [attempt(1, changes)] };
+          fs.writeFileSync(cellFile, json({ schema: 'arc-review-cells-v1', cells: [cell] }));
+          assert.notEqual(
+            run('summarize', '--matrix', output, '--cells', cellFile, '--catalog', catalog, '--allow-partial').status,
+            0,
+          );
+        }
+        const named = structuredClone(fixtureCase);
+        named.id = 'constructor';
+        named.family = 'constructor';
+        const namedCatalog = path.join(temp, 'constructor-catalog');
+        const namedCache = path.join(temp, 'constructor-cache.git');
+        const namedPrepared = path.join(temp, 'constructor-prepared');
+        fs.mkdirSync(namedCatalog);
+        fs.writeFileSync(path.join(namedCatalog, 'constructor.json'), json(named));
+        const namedCapture = run('capture', '--repository', cache, '--out', namedCache, '--catalog', namedCatalog);
+        assert.equal(namedCapture.status, 0, namedCapture.error);
+        assert.equal(
+          run('prepare', '--cache', namedCache, '--case', named.id, '--out', namedPrepared, '--catalog', namedCatalog)
+            .status,
+          0,
+        );
+        const namedManifest = JSON.parse(fs.readFileSync(path.join(namedPrepared, 'manifest.json'), 'utf8'));
+        const namedRegistration = registration({
+          case_id: named.id,
+          case_hash: digest(json(named)),
+          family: named.family,
+          prompt_hash: namedManifest.prompt_hash,
+          workspace_hash: namedManifest.workspace_hash,
+          diff_hash: namedManifest.diff_hash,
+          preparation_path: namedPrepared,
+          cache_path: namedCache,
+        });
+        namedRegistration.arms[0].id = 'constructor';
+        const {
+          result: namedResult,
+          matrix: namedMatrix,
+          output: namedMatrixPath,
+        } = matrixFileWithCatalog(namedRegistration, namedCatalog);
+        assert.equal(namedResult.status, 0, namedResult.error);
+        const namedCells = namedMatrix.cells.map((cell) => ({
+          ...cell,
+          attempts: [attempt(1, { attempt_id: 'attempt-' + cell.cell_id })],
+        }));
+        const namedCellsPath = path.join(temp, 'constructor-cells.json');
+        fs.writeFileSync(namedCellsPath, json({ schema: 'arc-review-cells-v1', cells: namedCells }));
+        const scored = run(
+          'summarize',
+          '--matrix',
+          namedMatrixPath,
+          '--cells',
+          namedCellsPath,
+          '--catalog',
+          namedCatalog,
+        );
+        assert.equal(scored.status, 0, scored.error);
+        const report = JSON.parse(scored.output);
+        assert.equal(report.family_means.accepted_review.constructor.constructor, 0.5);
+        assert.equal(report.paired_family_means.accepted_review.constructor['constructor:arm-b'].valid_pairs, 2);
+      });
+
+      test.each([
+        [
+          'dangling key path',
+          (item) => {
+            item.keys[0].paths = ['missing.txt'];
+          },
+          null,
+        ],
+        [
+          'missing serious key denominator',
+          (item) => {
+            item.keys = [];
+          },
+          /missing serious key denominator/,
+        ],
+        [
+          'clean control audit',
+          (item) => {
+            item.source_kind = 'clean_control';
+            item.keys = [];
+            item.key_state = 'reviewed';
+          },
+          /clean control audit/,
+        ],
+      ])('malformed catalogs and false controls fail before matrix and summary: %s', (name, change, error) => {
+        const file = path.join(catalog, 'fixture-case.json');
+        const original = fs.readFileSync(file);
+        const altered = JSON.parse(original);
+        change(altered);
+        fs.writeFileSync(file, json(altered));
+        try {
+          const { result } = matrixFile();
+          assert.notEqual(result.status, 0);
+          if (error) assert.match(result.error, error);
+        } finally {
+          fs.writeFileSync(file, original);
+        }
+      });
+
+      test('malformed catalogs and false controls fail before matrix and summary: valid catalog', () => {
+        assert.equal(matrixFile().result.status, 0);
+      });
+
+      test('malformed catalogs and false controls fail before matrix and summary: duplicate case', () => {
+        const duplicate = path.join(catalog, 'duplicate.json');
+        fs.copyFileSync(path.join(catalog, 'fixture-case.json'), duplicate);
+        try {
+          assert.match(matrixFile().result.error, /duplicate case id/);
+        } finally {
+          fs.unlinkSync(duplicate);
+        }
+      });
+
+      test('malformed catalogs and false controls fail before matrix and summary: restored catalog', () => {
+        assert.equal(matrixFile().result.status, 0);
+      });
+
+      test('malformed catalogs and false controls fail before matrix and summary: dangling fixture', () => {
+        const badCaptureFolder = path.join(temp, 'dangling-catalog');
+        fs.mkdirSync(badCaptureFolder);
+        const dangling = structuredClone(fixtureCase);
+        dangling.fixture_paths = ['missing.txt'];
+        fs.writeFileSync(path.join(badCaptureFolder, 'fixture-case.json'), json(dangling));
+        assert.match(
+          run(
+            'capture',
+            '--repository',
+            cache,
+            '--out',
+            path.join(temp, 'dangling-cache.git'),
+            '--catalog',
+            badCaptureFolder,
+          ).error,
+          /dangling fixture path/,
+        );
+      });
+
+      test('malformed catalogs and false controls fail before matrix and summary: invalid arm', () => {
+        const invalidArm = registration();
+        invalidArm.arms[0].model_id = {};
+        assert.match(matrixFile(invalidArm).result.error, /arm fields/);
+      });
+
+      test('malformed catalogs and false controls fail before matrix and summary: ambiguous effort', () => {
+        const ambiguous = registration();
+        ambiguous.arms[0].unverified_harness = true;
+        assert.match(matrixFile(ambiguous).result.error, /effort readback condition/);
+      });
+
+      test('all-void quality stays missing while terminal failures keep partial credit in pairs', () => {
+        const report = summarizeFixture((cells) => {
+          cells[0].attempts = [
+            attempt(1, {
+              status: 'void',
+              reason: 'infrastructure',
+              matched_key_ids: [],
+              cost_usd: 0.2,
+              requests: null,
+            }),
+          ];
+          cells[2].attempts = [attempt(1, { status: 'model-failure', matched_key_ids: ['defect-a'] })];
+          cells[3].attempts = [attempt(1, { status: 'budget-exhausted', matched_key_ids: [] })];
+          return cells;
+        }).summary;
+        assert.equal(report.results[0].known_key_recall, null);
+        assert.equal(report.results[1].known_key_recall, 0.5);
+        assert.equal(report.results[2].known_key_recall, 0.5);
+        assert.equal(report.results[3].known_key_recall, 0);
+        assert.equal(report.paired_family_means.accepted_review['fixture-family']['arm-a:arm-b'].valid_pairs, 1);
+        assert.equal(
+          report.paired_family_means.accepted_review['fixture-family']['arm-a:arm-b'].missing_valid_pairs,
+          1,
+        );
+        assert.equal(report.usage.requests, null);
+        assert.equal(report.known_usage.requests, 3);
+        assert.equal(report.unknown_usage_attempts.requests, 1);
+        assert.equal(report.attempts['model-failure'], 1);
+        assert.equal(report.attempts['budget-exhausted'], 1);
+        assert.equal(report.attempts.void, 1);
+      });
+
+      test('missing whole arms and replicate blocks remain incomplete', () => {
+        for (const select of [(cell) => cell.arm_id === 'arm-a', (cell) => cell.replicate === 1]) {
+          const report = summarizeFixture((cells) => cells.filter(select), true).summary;
+          assert.equal(report.complete, false);
+          assert.equal(report.comparison_suppressed, true);
+          assert.equal(report.missing_cell_ids.length, 2);
+          assert.deepEqual(report.pair_contrasts, []);
+        }
+      });
+
+      describe('source attempts are excluded when identities are known', () => {
+        let item;
+        let folder;
+        let evidence;
+        let output;
+        let matrixPath;
+        let cells;
+        let cellFile;
+        beforeAll(() => {
+          item = structuredClone(fixtureCase);
+          item.id = 'exclusion-case';
+          item.case_revision = 2;
+          item.key_revision = 3;
+          item.keys[0].evidence.source_attempt_identity = 'known';
+          item.keys[0].evidence.exclude_attempt_ids = ['source-attempt'];
+          folder = path.join(temp, 'exclusion-catalog');
+          fs.mkdirSync(folder);
+          fs.writeFileSync(path.join(folder, 'exclusion-case.json'), json(item));
+          evidence = path.join(temp, 'exclusion-cache.git');
+          output = path.join(temp, 'exclusion-prepared');
+        });
+        beforeAll(() => {
+          assert.equal(run('capture', '--repository', cache, '--out', evidence, '--catalog', folder).status, 0);
+        });
+        beforeAll(() => {
+          assert.equal(
+            run('prepare', '--cache', evidence, '--case', item.id, '--out', output, '--catalog', folder).status,
+            0,
+          );
+        });
+        beforeAll(() => {
+          const preparedManifest = JSON.parse(fs.readFileSync(path.join(output, 'manifest.json'), 'utf8'));
+          const registered = registration();
+          Object.assign(registered.tasks[0], {
+            case_id: item.id,
+            case_revision: 2,
+            key_revision: 3,
+            case_hash: digest(json(item)),
+            prompt_hash: preparedManifest.prompt_hash,
+            workspace_hash: preparedManifest.workspace_hash,
+            diff_hash: preparedManifest.diff_hash,
+            preparation_path: output,
+            cache_path: evidence,
+          });
+          const registeredMatrix = matrixFileWithCatalog(registered, folder);
+          matrixPath = registeredMatrix.output;
+          cells = registeredMatrix.matrix.cells.map((cell) => ({
+            ...cell,
+            attempts: [attempt(1, { attempt_id: 'attempt-' + cell.cell_id })],
+          }));
+          cells[0].attempts[0].attempt_id = 'source-attempt';
+          cellFile = path.join(temp, 'excluded-cells.json');
+          fs.writeFileSync(cellFile, json({ schema: 'arc-review-cells-v1', cells }));
+        });
+        test('rejects a source attempt', () => {
+          assert.match(
+            run('summarize', '--matrix', matrixPath, '--cells', cellFile, '--catalog', folder).error,
+            /source attempt excluded/,
+          );
+        });
+        test('accepts a fresh attempt', () => {
+          cells[0].attempts[0].attempt_id = 'new-attempt';
+          fs.writeFileSync(cellFile, json({ schema: 'arc-review-cells-v1', cells }));
+          const accepted = run('summarize', '--matrix', matrixPath, '--cells', cellFile, '--catalog', folder);
+          assert.equal(accepted.status, 0, accepted.error);
+        });
+      });
     });
-    assert.equal(commit.status, 0, commit.stderr);
-    const item = {
-      ...fixtureCase,
-      id: 'unsafe-case',
-      source: { base, candidate: commit.stdout.trim(), correction: commit.stdout.trim() },
-    };
-    fs.writeFileSync(path.join(folder, 'unsafe-case.json'), json(item));
-    assert.notEqual(
-      run('capture', '--repository', repo, '--out', path.join(temp, 'unsafe-' + index + '.git'), '--catalog', folder)
-        .status,
-      0,
-      name,
-    );
-  }
-  const tree = spawnSync('git', ['-C', repo, 'mktree'], {
-    input: `100644 blob ${blob}\tfixture.txt\n120000 blob ${blob}\tlink\n`,
-    encoding: 'utf8',
+
+    test('cache validation rejects a missing object', () => {
+      const objectFile = path.join(
+        cache,
+        'objects',
+        fixtureCase.source.candidate.slice(0, 2),
+        fixtureCase.source.candidate.slice(2),
+      );
+      const bytes = fs.readFileSync(objectFile);
+      fs.unlinkSync(objectFile);
+      try {
+        assert.notEqual(run('validate', '--cache', cache, '--catalog', catalog).status, 0);
+      } finally {
+        fs.writeFileSync(objectFile, bytes);
+      }
+    });
+    test('cache validation rejects a forged manifest', () => {
+      const manifestFile = path.join(cache, 'evidence.json');
+      const original = fs.readFileSync(manifestFile);
+      const changed = JSON.parse(original);
+      changed.cases[0].candidate = '0'.repeat(40);
+      fs.writeFileSync(manifestFile, json(changed));
+      try {
+        assert.notEqual(run('validate', '--cache', cache, '--catalog', catalog).status, 0);
+      } finally {
+        fs.writeFileSync(manifestFile, original);
+      }
+    });
+    test('cache validation accepts restored evidence', () => {
+      assert.equal(run('validate', '--cache', cache, '--catalog', catalog).status, 0);
+    });
+
+    describe('case intake rejects traversal and direct answer leaks', () => {
+      test('rejects traversal', () => {
+        const file = path.join(catalog, 'fixture-case.json');
+        const original = fs.readFileSync(file);
+        const changed = JSON.parse(original);
+        changed.fixture_paths = ['../fixture.txt'];
+        fs.writeFileSync(file, json(changed));
+        try {
+          assert.notEqual(run('validate', '--cache', cache, '--catalog', catalog).status, 0);
+        } finally {
+          fs.writeFileSync(file, original);
+        }
+      });
+      describe('captured answer leak', () => {
+        let workspace;
+        let leakCatalog;
+        let leakCache;
+        beforeAll(() => {
+          const fixture = pathFixture('leak-source', 'defect-a\n');
+          workspace = fixture.repo;
+          const leak = fixture.base;
+          const caseWithLeak = { ...fixtureCase, source: { base: leak, candidate: leak, correction: leak } };
+          leakCatalog = path.join(temp, 'leak-catalog');
+          fs.mkdirSync(leakCatalog);
+          fs.writeFileSync(path.join(leakCatalog, 'fixture-case.json'), json(caseWithLeak));
+          leakCache = path.join(temp, 'leak-cache.git');
+        });
+        beforeAll(() => {
+          assert.equal(
+            run('capture', '--repository', workspace, '--out', leakCache, '--catalog', leakCatalog).status,
+            0,
+          );
+        });
+        test('rejects preparation', () => {
+          assert.match(
+            run(
+              'prepare',
+              '--cache',
+              leakCache,
+              '--case',
+              'fixture-case',
+              '--out',
+              path.join(temp, 'leaked'),
+              '--catalog',
+              leakCatalog,
+            ).error,
+            /direct answer leak/,
+          );
+        });
+      });
+    });
+
+    describe('excluded additions, deletions, and renames stay out of both review outputs', () => {
+      let repo;
+      let folder;
+      let item;
+      let evidence;
+      let output;
+      beforeAll(() => {
+        repo = path.join(temp, 'diff-source');
+        folder = path.join(temp, 'diff-catalog');
+        fs.mkdirSync(repo);
+        fs.mkdirSync(folder);
+        git(repo, 'init', '--quiet');
+        git(repo, 'config', 'user.name', 'Fixture');
+        git(repo, 'config', 'user.email', 'fixture@example.invalid');
+        fs.mkdirSync(path.join(repo, '.claude', 'reviews'), { recursive: true });
+        fs.mkdirSync(path.join(repo, 'docs'));
+        fs.writeFileSync(path.join(repo, 'fixture.txt'), 'base\n');
+        fs.writeFileSync(path.join(repo, 'docs', 'defect.md'), 'base defect\n');
+        fs.writeFileSync(path.join(repo, '.claude', 'reviews', 'deleted.md'), 'private deleted answer\n');
+        fs.writeFileSync(path.join(repo, '.claude', 'reviews', 'renamed.md'), 'private renamed answer\n');
+        git(repo, 'add', '.');
+        git(repo, 'commit', '--quiet', '-m', 'base');
+        const base = git(repo, 'rev-parse', 'HEAD');
+        fs.unlinkSync(path.join(repo, '.claude', 'reviews', 'deleted.md'));
+        fs.renameSync(
+          path.join(repo, '.claude', 'reviews', 'renamed.md'),
+          path.join(repo, '.claude', 'reviews', 'moved.md'),
+        );
+        fs.writeFileSync(path.join(repo, '.claude', 'reviews', 'added.md'), 'private added answer\n');
+        fs.writeFileSync(path.join(repo, 'fixture.txt'), 'candidate defect\n');
+        fs.writeFileSync(path.join(repo, 'docs', 'defect.md'), 'candidate documentation defect\n');
+        git(repo, 'add', '.');
+        git(repo, 'commit', '--quiet', '-m', 'candidate');
+        const candidate = git(repo, 'rev-parse', 'HEAD');
+        item = {
+          ...fixtureCase,
+          id: 'diff-case',
+          source: { base, candidate, correction: candidate },
+          fixture_paths: ['fixture.txt', 'docs/defect.md'],
+        };
+        fs.writeFileSync(path.join(folder, 'diff-case.json'), json(item));
+        evidence = path.join(temp, 'diff-cache.git');
+        output = path.join(temp, 'diff-prepared');
+      });
+      beforeAll(() => {
+        assert.equal(run('capture', '--repository', repo, '--out', evidence, '--catalog', folder).status, 0);
+      });
+      test('prepares public source and omits private answers', () => {
+        const preparedResult = run(
+          'prepare',
+          '--cache',
+          evidence,
+          '--case',
+          item.id,
+          '--out',
+          output,
+          '--catalog',
+          folder,
+        );
+        assert.equal(preparedResult.status, 0, preparedResult.error);
+        const diff = fs.readFileSync(path.join(output, 'candidate.diff'), 'utf8');
+        assert.match(diff, /candidate documentation defect/);
+        assert.doesNotMatch(diff, /private (deleted|renamed|added) answer/);
+        assert.doesNotMatch(diff, /\.claude\/reviews/);
+        assert.equal(fs.existsSync(path.join(output, 'workspace', '.claude')), false);
+        const removal = JSON.parse(fs.readFileSync(path.join(output, 'manifest.json'), 'utf8')).removal_accounting;
+        assert.ok(removal.some((entry) => entry.path.endsWith('deleted.md') && entry.side === 'base diff'));
+        assert.ok(removal.some((entry) => entry.path.endsWith('moved.md') && entry.side === 'candidate'));
+      });
+    });
+
+    describe('Git tree names reject case aliases in directory prefixes', () => {
+      let repo;
+      let folder;
+      let base;
+      let blob;
+      let subtree;
+      beforeAll(() => {
+        ({ repo, base, blob } = pathFixture('prefix-source'));
+        folder = path.join(temp, 'prefix-catalog');
+        fs.mkdirSync(folder);
+        subtree = spawnSync('git', ['-C', repo, 'mktree'], {
+          input: `100644 blob ${blob}\tx.txt\n`,
+          encoding: 'utf8',
+        });
+        assert.equal(subtree.status, 0, subtree.stderr);
+      });
+      test.each(['directory', 'file'])('rejects a directory alias beside a %s', (kind) => {
+        const second = kind === 'directory' ? `040000 tree ${subtree.stdout.trim()}\ta\n` : `100644 blob ${blob}\ta\n`;
+        const tree = spawnSync('git', ['-C', repo, 'mktree'], {
+          input: `100644 blob ${blob}\tfixture.txt\n040000 tree ${subtree.stdout.trim()}\tA\n${second}`,
+          encoding: 'utf8',
+        });
+        assert.equal(tree.status, 0, tree.stderr);
+        const commit = spawnSync('git', ['-C', repo, 'commit-tree', tree.stdout.trim(), '-p', base], {
+          input: 'prefix candidate\n',
+          encoding: 'utf8',
+        });
+        assert.equal(commit.status, 0, commit.stderr);
+        const item = {
+          ...fixtureCase,
+          id: 'prefix-case',
+          source: { base, candidate: commit.stdout.trim(), correction: commit.stdout.trim() },
+        };
+        fs.writeFileSync(path.join(folder, 'prefix-case.json'), json(item));
+        assert.notEqual(
+          run('capture', '--repository', repo, '--out', path.join(temp, 'prefix-' + kind + '.git'), '--catalog', folder)
+            .status,
+          0,
+        );
+      });
+      test('accepts peers within one directory', () => {
+        const peers = spawnSync('git', ['-C', repo, 'mktree'], {
+          input: `100644 blob ${blob}\tx.txt\n100644 blob ${blob}\ty.txt\n`,
+          encoding: 'utf8',
+        });
+        assert.equal(peers.status, 0, peers.stderr);
+        const tree = spawnSync('git', ['-C', repo, 'mktree'], {
+          input: `100644 blob ${blob}\tfixture.txt\n040000 tree ${peers.stdout.trim()}\tA\n`,
+          encoding: 'utf8',
+        });
+        assert.equal(tree.status, 0, tree.stderr);
+        const commit = spawnSync('git', ['-C', repo, 'commit-tree', tree.stdout.trim(), '-p', base], {
+          input: 'valid peers\n',
+          encoding: 'utf8',
+        });
+        assert.equal(commit.status, 0, commit.stderr);
+        const item = {
+          ...fixtureCase,
+          id: 'prefix-case',
+          source: { base, candidate: commit.stdout.trim(), correction: commit.stdout.trim() },
+        };
+        fs.writeFileSync(path.join(folder, 'prefix-case.json'), json(item));
+        const accepted = run(
+          'capture',
+          '--repository',
+          repo,
+          '--out',
+          path.join(temp, 'prefix-peers.git'),
+          '--catalog',
+          folder,
+        );
+        assert.equal(accepted.status, 0, accepted.error);
+      });
+    });
+
+    describe('source path dialects and standalone object ownership survive validation', () => {
+      let file;
+      let original;
+      beforeAll(() => {
+        file = path.join(cache, 'evidence.json');
+        original = fs.readFileSync(file);
+      });
+      describe.each(['C:\\source\\arc', '/source/arc'])('%s', (sourceRoot) => {
+        beforeAll(() => {
+          const changed = JSON.parse(original);
+          changed.source_root = sourceRoot;
+          fs.writeFileSync(file, json(changed));
+        });
+        afterAll(() => {
+          fs.writeFileSync(file, original);
+        });
+        test('validates the cache', () => {
+          assert.equal(run('validate', '--cache', cache, '--catalog', catalog).status, 0);
+        });
+        test('prepares the candidate', () => {
+          const result = run(
+            'prepare',
+            '--cache',
+            cache,
+            '--case',
+            fixtureCase.id,
+            '--out',
+            path.join(temp, 'dialect-' + (sourceRoot.startsWith('/') ? 'posix' : 'windows')),
+            '--catalog',
+            catalog,
+          );
+          assert.equal(result.status, 0, result.error);
+        });
+      });
+      test('rejects linked cache objects', () => {
+        const object = path.join(
+          cache,
+          'objects',
+          fixtureCase.source.candidate.slice(0, 2),
+          fixtureCase.source.candidate.slice(2),
+        );
+        const hardlink = path.join(temp, 'object-hardlink');
+        fs.linkSync(object, hardlink);
+        try {
+          assert.match(run('validate', '--cache', cache, '--catalog', catalog).error, /linked cache object/);
+        } finally {
+          fs.unlinkSync(hardlink);
+        }
+      });
+      test('accepts the cache after unlinking', () => {
+        assert.equal(run('validate', '--cache', cache, '--catalog', catalog).status, 0);
+      });
+    });
+
+    describe('Git tree names reject device aliases, streams, forbidden characters, and trailing dots or spaces', () => {
+      let repo;
+      let folder;
+      let base;
+      let blob;
+      beforeAll(() => {
+        ({ repo, base, blob } = pathFixture('unsafe-source'));
+        folder = path.join(temp, 'unsafe-catalog');
+        fs.mkdirSync(folder);
+      });
+      test.each(['CON.txt', 'COM¹.txt', 'data:stream', 'trailing.', 'trailing ', 'bad?.txt', 'AUX'])(
+        'rejects %s',
+        (name) => {
+          const tree = spawnSync('git', ['-C', repo, 'mktree'], {
+            input: `100644 blob ${blob}\tfixture.txt\n100644 blob ${blob}\t${name}\n`,
+            encoding: 'utf8',
+          });
+          assert.equal(tree.status, 0, tree.stderr);
+          const commit = spawnSync('git', ['-C', repo, 'commit-tree', tree.stdout.trim(), '-p', base], {
+            input: 'unsafe candidate\n',
+            encoding: 'utf8',
+          });
+          assert.equal(commit.status, 0, commit.stderr);
+          const item = {
+            ...fixtureCase,
+            id: 'unsafe-case',
+            source: { base, candidate: commit.stdout.trim(), correction: commit.stdout.trim() },
+          };
+          fs.writeFileSync(path.join(folder, 'unsafe-case.json'), json(item));
+          assert.notEqual(
+            run(
+              'capture',
+              '--repository',
+              repo,
+              '--out',
+              path.join(temp, 'unsafe-' + digest(name).slice(0, 8) + '.git'),
+              '--catalog',
+              folder,
+            ).status,
+            0,
+            name,
+          );
+        },
+      );
+      describe('symlink', () => {
+        let item;
+        let evidence;
+        beforeAll(() => {
+          const tree = spawnSync('git', ['-C', repo, 'mktree'], {
+            input: `100644 blob ${blob}\tfixture.txt\n120000 blob ${blob}\tlink\n`,
+            encoding: 'utf8',
+          });
+          const commit = spawnSync('git', ['-C', repo, 'commit-tree', tree.stdout.trim(), '-p', base], {
+            input: 'linked candidate\n',
+            encoding: 'utf8',
+          });
+          item = {
+            ...fixtureCase,
+            id: 'linked-case',
+            source: { base, candidate: commit.stdout.trim(), correction: commit.stdout.trim() },
+          };
+          if (fs.existsSync(path.join(folder, 'unsafe-case.json')))
+            fs.unlinkSync(path.join(folder, 'unsafe-case.json'));
+          fs.writeFileSync(path.join(folder, 'linked-case.json'), json(item));
+          evidence = path.join(temp, 'linked-cache.git');
+        });
+        describe('captured symlink', () => {
+          beforeAll(() => {
+            assert.equal(run('capture', '--repository', repo, '--out', evidence, '--catalog', folder).status, 0);
+          });
+          test('rejects preparation', () => {
+            assert.match(
+              run(
+                'prepare',
+                '--cache',
+                evidence,
+                '--case',
+                item.id,
+                '--out',
+                path.join(temp, 'linked-prepared'),
+                '--catalog',
+                folder,
+              ).error,
+              /symlink or submodule/,
+            );
+          });
+        });
+      });
+      describe('executable', () => {
+        let executable;
+        let executableCache;
+        let executableOutput;
+        beforeAll(() => {
+          const executableTree = spawnSync('git', ['-C', repo, 'mktree'], {
+            input: `100755 blob ${blob}\tfixture.txt\n`,
+            encoding: 'utf8',
+          });
+          const executableCommit = spawnSync(
+            'git',
+            ['-C', repo, 'commit-tree', executableTree.stdout.trim(), '-p', base],
+            {
+              input: 'executable candidate\n',
+              encoding: 'utf8',
+            },
+          );
+          executable = {
+            ...fixtureCase,
+            id: 'executable-case',
+            source: {
+              base,
+              candidate: executableCommit.stdout.trim(),
+              correction: executableCommit.stdout.trim(),
+            },
+          };
+          if (fs.existsSync(path.join(folder, 'unsafe-case.json')))
+            fs.unlinkSync(path.join(folder, 'unsafe-case.json'));
+          if (fs.existsSync(path.join(folder, 'linked-case.json')))
+            fs.unlinkSync(path.join(folder, 'linked-case.json'));
+          fs.writeFileSync(path.join(folder, 'executable-case.json'), json(executable));
+          executableCache = path.join(temp, 'executable-cache.git');
+          executableOutput = path.join(temp, 'executable-prepared');
+        });
+        describe('captured executable', () => {
+          beforeAll(() => {
+            assert.equal(run('capture', '--repository', repo, '--out', executableCache, '--catalog', folder).status, 0);
+          });
+          test('retains executable mode in preparation', () => {
+            const preparedExecutable = run(
+              'prepare',
+              '--cache',
+              executableCache,
+              '--case',
+              executable.id,
+              '--out',
+              executableOutput,
+              '--catalog',
+              folder,
+            );
+            assert.equal(preparedExecutable.status, 0, preparedExecutable.error);
+            const entry = JSON.parse(fs.readFileSync(path.join(executableOutput, 'manifest.json'), 'utf8')).files[0];
+            assert.equal(entry.mode, '100755');
+            if (process.platform !== 'win32')
+              assert.ok(fs.statSync(path.join(executableOutput, 'workspace', 'fixture.txt')).mode & 0o111);
+          });
+        });
+      });
+    });
   });
-  const commit = spawnSync('git', ['-C', repo, 'commit-tree', tree.stdout.trim(), '-p', base], {
-    input: 'linked candidate\n',
-    encoding: 'utf8',
-  });
-  const item = {
-    ...fixtureCase,
-    id: 'linked-case',
-    source: { base, candidate: commit.stdout.trim(), correction: commit.stdout.trim() },
-  };
-  fs.unlinkSync(path.join(folder, 'unsafe-case.json'));
-  fs.writeFileSync(path.join(folder, 'linked-case.json'), json(item));
-  const evidence = path.join(temp, 'linked-cache.git');
-  assert.equal(run('capture', '--repository', repo, '--out', evidence, '--catalog', folder).status, 0);
-  assert.match(
-    run(
-      'prepare',
-      '--cache',
-      evidence,
-      '--case',
-      item.id,
-      '--out',
-      path.join(temp, 'linked-prepared'),
-      '--catalog',
-      folder,
-    ).error,
-    /symlink or submodule/,
-  );
-  const executableTree = spawnSync('git', ['-C', repo, 'mktree'], {
-    input: `100755 blob ${blob}\tfixture.txt\n`,
-    encoding: 'utf8',
-  });
-  const executableCommit = spawnSync('git', ['-C', repo, 'commit-tree', executableTree.stdout.trim(), '-p', base], {
-    input: 'executable candidate\n',
-    encoding: 'utf8',
-  });
-  const executable = {
-    ...fixtureCase,
-    id: 'executable-case',
-    source: {
-      base,
-      candidate: executableCommit.stdout.trim(),
-      correction: executableCommit.stdout.trim(),
-    },
-  };
-  fs.unlinkSync(path.join(folder, 'linked-case.json'));
-  fs.writeFileSync(path.join(folder, 'executable-case.json'), json(executable));
-  const executableCache = path.join(temp, 'executable-cache.git');
-  const executableOutput = path.join(temp, 'executable-prepared');
-  assert.equal(run('capture', '--repository', repo, '--out', executableCache, '--catalog', folder).status, 0);
-  const preparedExecutable = run(
-    'prepare',
-    '--cache',
-    executableCache,
-    '--case',
-    executable.id,
-    '--out',
-    executableOutput,
-    '--catalog',
-    folder,
-  );
-  assert.equal(preparedExecutable.status, 0, preparedExecutable.error);
-  const entry = JSON.parse(fs.readFileSync(path.join(executableOutput, 'manifest.json'), 'utf8')).files[0];
-  assert.equal(entry.mode, '100755');
-  if (process.platform !== 'win32')
-    assert.ok(fs.statSync(path.join(executableOutput, 'workspace', 'fixture.txt')).mode & 0o111);
 });
