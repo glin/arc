@@ -203,115 +203,159 @@ test.each(['complete', 'budget', 'denied', 'transient', 'busy', 'busy-budget', '
   },
 );
 
-test.each(['construct', 'cursor', 'persistent', 'invalid', 'init-alias', 'init-checkpoint'] as const)(
-  'construction contention handles %s without losing output or capture ownership',
-  async (phase) => {
-    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
-    const { receipts, launch } = workerFixture('', 100, false, true);
-    const id = launch.launchId;
-    const stdout = Buffer.from(outputFrames());
-    const stderr = Buffer.alloc(700, 255);
-    fs.writeFileSync(receipts.artifact(id, 'stdout.log'), stdout);
-    fs.writeFileSync(receipts.artifact(id, 'stderr.log'), stderr);
-    fs.writeFileSync(receipts.artifact(id, 'native.md'), 'Report');
-    receipts.observation(id, {
-      supervisor: { pid: process.pid, token: id },
-      worker: null,
-      sessionId: null,
-      exitCode: 0,
-      signal: null,
-      monitor: 'timed-out',
-    });
+test.each([
+  'construct',
+  'cursor',
+  'persistent',
+  'invalid',
+  'init-alias',
+  'init-checkpoint',
+  'init-cleanup',
+  'producer-init',
+] as const)('construction contention handles %s without losing output or capture ownership', async (phase) => {
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+  const { receipts, launch } = workerFixture('', 100, false, true);
+  const id = launch.launchId;
+  const stdout = Buffer.from(outputFrames());
+  const stderr = Buffer.alloc(700, 255);
+  fs.writeFileSync(receipts.artifact(id, 'stdout.log'), stdout);
+  fs.writeFileSync(receipts.artifact(id, 'stderr.log'), stderr);
+  fs.writeFileSync(receipts.artifact(id, 'native.md'), 'Report');
+  receipts.observation(id, {
+    supervisor: { pid: process.pid, token: id },
+    worker: null,
+    sessionId: null,
+    exitCode: 0,
+    signal: null,
+    monitor: 'timed-out',
+  });
+  if (phase !== 'producer-init')
     fs.writeFileSync(
       receipts.artifact(id, 'output-owner.json'),
       JSON.stringify({ pid: 2147483647, state: 'unavailable' }),
     );
-    const construct = receipts.capture.bind(receipts);
-    const originalFs = (await vi.importActual<{ default: typeof import('node:fs') }>('node:fs')).default;
-    const rename = originalFs.renameSync;
-    let injected = false;
-    const publication = phase === 'init-alias' ? launch.standalone!.logAlias : receipts.artifact(id, 'capture.json');
-    if (phase === 'init-alias' || phase === 'init-checkpoint') {
-      const renameWithFailure: typeof rename = (from, to) => {
-        if (!injected && String(to) === publication) {
-          injected = true;
-          throw Object.assign(new Error('Publication is busy.'), { code: 'EPERM' });
-        }
-        rename(from, to);
-      };
-      vi.spyOn(fs, 'renameSync').mockImplementation(renameWithFailure);
-      vi.spyOn(originalFs, 'renameSync').mockImplementation(renameWithFailure);
-    }
-    let attempts = 0;
-    let opened = 0;
-    let closed = 0;
-    vi.spyOn(receipts, 'capture').mockImplementation((...args) => {
-      attempts++;
-      if (phase === 'invalid') throw new Error('The captured worker output was replaced.');
-      if (phase === 'persistent' || (phase === 'construct' && attempts === 1))
+  const construct = receipts.capture.bind(receipts);
+  const originalFs = (await vi.importActual<{ default: typeof import('node:fs') }>('node:fs')).default;
+  const rename = originalFs.renameSync;
+  let injected = false;
+  const initialization = phase.startsWith('init-') || phase === 'producer-init';
+  const publication =
+    phase === 'init-checkpoint' ? receipts.artifact(id, 'capture.json') : launch.standalone!.logAlias!;
+  const publicationError = Object.assign(new Error(`EPERM: publication is busy, rename '${publication}'`), {
+    code: 'EPERM',
+    path: publication,
+  });
+  const cleanupError = Object.assign(new Error('EPERM: lock cleanup is busy.'), { code: 'EPERM' });
+  let cleanupInjected = false;
+  if (initialization) {
+    const renameWithFailure: typeof rename = (from, to) => {
+      if (!injected && String(to) === publication) {
+        injected = true;
+        throw publicationError;
+      }
+      rename(from, to);
+    };
+    vi.spyOn(fs, 'renameSync').mockImplementation(renameWithFailure);
+    vi.spyOn(originalFs, 'renameSync').mockImplementation(renameWithFailure);
+  }
+  if (phase === 'init-cleanup') {
+    const unlink = originalFs.unlinkSync;
+    const unlinkWithFailure: typeof unlink = (file) => {
+      if (injected && !cleanupInjected && path.basename(String(file)).startsWith(`capture-write.${process.pid}.`)) {
+        cleanupInjected = true;
+        throw cleanupError;
+      }
+      unlink(file);
+    };
+    vi.spyOn(fs, 'unlinkSync').mockImplementation(unlinkWithFailure);
+    vi.spyOn(originalFs, 'unlinkSync').mockImplementation(unlinkWithFailure);
+  }
+  let attempts = 0;
+  let opened = 0;
+  let closed = 0;
+  vi.spyOn(receipts, 'capture').mockImplementation((...args) => {
+    attempts++;
+    if (phase === 'invalid') throw new Error('The captured worker output was replaced.');
+    if (phase === 'persistent' || (phase === 'construct' && attempts === 1))
+      throw new Error('The dispatch write changed during recovery. Try again.');
+    const capture = construct(...args);
+    opened++;
+    const close = capture.close;
+    capture.close = () => {
+      closed++;
+      close();
+    };
+    if (phase === 'cursor' && attempts === 1)
+      capture.cursor = () => {
         throw new Error('The dispatch write changed during recovery. Try again.');
-      const capture = construct(...args);
-      opened++;
-      const close = capture.close;
-      capture.close = () => {
-        closed++;
-        close();
       };
-      if (phase === 'cursor' && attempts === 1)
-        capture.cursor = () => {
-          throw new Error('The dispatch write changed during recovery. Try again.');
-        };
-      return capture;
-    });
-    let settled = false;
-    let failure: unknown;
-    const pending = superviseStandalone(
-      receipts,
-      id,
-      true,
-      { frameBytes: 1024, readBytes: 64, workBytes: 1024 * 1024 },
-      {
-        now: () => 0,
-        identity: async () => null,
-        yield: () => Promise.resolve(),
-      },
-    ).then(
-      () => {
-        settled = true;
-      },
-      (error) => {
-        failure = error;
-        settled = true;
-      },
-    );
-    await vi.waitFor(() => assert.ok(settled), { timeout: 5000 });
-    await pending;
-    if (phase === 'init-alias' || phase === 'init-checkpoint') {
-      assert.equal(injected, true);
-      assert.notEqual(receipts.observation(id)?.monitor, 'finished');
-      assert.match(String(failure), /The requested log is unavailable/);
-      assert.equal((failure as Error).cause && ((failure as Error).cause as NodeJS.ErrnoException).code, 'EPERM');
-      assert.equal(attempts, 1);
-      assert.deepEqual(fs.readFileSync(receipts.artifact(id, 'stdout.log')), stdout);
-      assert.deepEqual(fs.readFileSync(receipts.artifact(id, 'stderr.log')), stderr);
-      assert.equal(fs.statSync(receipts.artifact(id, 'worker.log')).size, 0);
-      assert.equal(fs.existsSync(receipts.artifact(id, 'capture.json')), false);
-    } else if (phase === 'persistent' || phase === 'invalid') {
-      assert.match(
-        String(failure),
-        phase === 'invalid' ? /output was replaced/ : /dispatch write changed during recovery/,
-      );
-      assert.equal(attempts, phase === 'invalid' ? 1 : 3);
-    } else {
-      assert.equal(failure, undefined);
-      assert.equal(attempts, 2);
-      assert.equal(fs.readFileSync(launch.standalone!.logAlias!).equals(Buffer.concat([stdout, stderr])), true);
-      assert.equal(receipts.observation(id)?.monitor, 'finished');
+    return capture;
+  });
+  let settled = false;
+  let failure: unknown;
+  const operation =
+    phase === 'producer-init'
+      ? produceStandaloneOutput(receipts, id)
+      : superviseStandalone(
+          receipts,
+          id,
+          true,
+          { frameBytes: 1024, readBytes: 64, workBytes: 1024 * 1024 },
+          {
+            now: () => 0,
+            identity: async () => null,
+            yield: () => Promise.resolve(),
+          },
+        );
+  const pending = operation.then(
+    () => {
+      settled = true;
+    },
+    (error) => {
+      failure = error;
+      settled = true;
+    },
+  );
+  await vi.waitFor(() => assert.ok(settled), { timeout: 5000 });
+  await pending;
+  if (initialization) {
+    assert.equal(injected, true);
+    assert.notEqual(receipts.observation(id)?.monitor, 'finished');
+    assert.match(String(failure), /The requested log is unavailable/);
+    const primary = phase === 'init-cleanup' ? (failure as AggregateError).errors[0] : failure;
+    assert.equal((primary as Error).cause, publicationError);
+    if (phase === 'init-cleanup') {
+      assert.equal(cleanupInjected, true);
+      assert.equal((failure as Error).cause, primary);
+      assert.equal((failure as AggregateError).errors[1], cleanupError);
     }
-    assert.equal(closed, opened);
-    assert.equal(vi.mocked(childProcess.spawn).mock.calls.length, 0);
-  },
-);
+    if (phase === 'producer-init') {
+      const owner = JSON.parse(fs.readFileSync(receipts.artifact(id, 'output-owner.json'), 'utf8'));
+      assert.equal(owner.state, 'unavailable');
+      assert.ok(owner.reason.includes('EPERM'));
+      assert.ok(owner.reason.includes(publication));
+      assert.ok(owner.reason.length <= 512);
+    }
+    assert.equal(attempts, 1);
+    assert.deepEqual(fs.readFileSync(receipts.artifact(id, 'stdout.log')), stdout);
+    assert.deepEqual(fs.readFileSync(receipts.artifact(id, 'stderr.log')), stderr);
+    assert.equal(fs.statSync(receipts.artifact(id, 'worker.log')).size, 0);
+    assert.equal(fs.existsSync(receipts.artifact(id, 'capture.json')), false);
+  } else if (phase === 'persistent' || phase === 'invalid') {
+    assert.match(
+      String(failure),
+      phase === 'invalid' ? /output was replaced/ : /dispatch write changed during recovery/,
+    );
+    assert.equal(attempts, phase === 'invalid' ? 1 : 3);
+  } else {
+    assert.equal(failure, undefined);
+    assert.equal(attempts, 2);
+    assert.equal(fs.readFileSync(launch.standalone!.logAlias!).equals(Buffer.concat([stdout, stderr])), true);
+    assert.equal(receipts.observation(id)?.monitor, 'finished');
+  }
+  assert.equal(closed, opened);
+  assert.equal(vi.mocked(childProcess.spawn).mock.calls.length, 0);
+});
 
 test('pending final capture waits between alias attempts with a frozen clock', async () => {
   vi.useFakeTimers({ toFake: ['setTimeout', 'setImmediate'] });

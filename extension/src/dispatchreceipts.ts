@@ -1175,6 +1175,8 @@ export class DispatchReceipts {
     const owner = JSON.stringify({ pid: process.pid, token: randomUUID(), launchId: id });
     exclusive(temporary, owner);
     let acquired = false;
+    let failure: { error: unknown } | undefined;
+    let result: T | undefined;
     try {
       let target = file;
       if (fs.existsSync(file)) {
@@ -1214,10 +1216,24 @@ export class DispatchReceipts {
       fs.linkSync(temporary, target);
       acquired = true;
       if (target !== file) writeFileAtomically(file, owner, undefined, 0o600, false);
-      return work();
-    } finally {
+      result = work();
+    } catch (error) {
+      failure = { error };
+    }
+    try {
       if (acquired) exclusive(this.file(id, `${name}.${JSON.parse(owner).token}.released`), owner);
       fs.unlinkSync(temporary);
+    } catch (error) {
+      if (failure)
+        throw Object.assign(
+          new AggregateError([failure.error, error], String(failure.error), { cause: failure.error }),
+          {
+            code: (failure.error as NodeJS.ErrnoException)?.code,
+          },
+        );
+      throw error;
     }
+    if (failure) throw failure.error;
+    return result!;
   }
 }

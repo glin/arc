@@ -1197,7 +1197,13 @@ export async function produceStandaloneOutput(receipts: DispatchReceipts, id: st
   try {
     capture = await openCapture(() => logCapture(receipts, id, READ_BOUNDS), Date.now() + options.deadlineMs);
   } catch (error) {
-    save('unavailable', String(error).slice(0, 512));
+    let reason = String(error);
+    let cause = (error as Error)?.cause;
+    for (let depth = 0; cause && depth < 4 && reason.length < 512; depth++) {
+      reason += `: ${String(cause)}`;
+      cause = (cause as Error).cause;
+    }
+    save('unavailable', reason.slice(0, 512));
     throw error;
   }
   const send = (message: object) => {
