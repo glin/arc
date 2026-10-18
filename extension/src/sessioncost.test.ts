@@ -1588,6 +1588,28 @@ test('Codex reconciliation continues through several compactions and stops at a 
   assert.equal(typeof latest.costUsd, 'number');
 });
 
+test('Codex counters that advance by less than the bill are not reported as a reset', () => {
+  const f = compactionCostFixture();
+  const first = [1_000, 0, 0, 100, 0];
+  const second = [400, 0, 0, 40, 0];
+  const shortfall = [200, 0, 0, 20, 0];
+  const file = f.save([
+    ...f.start,
+    f.bill('first', 3, first, first),
+    f.snapshot(4, first, f.counters(first)),
+    f.bill('second', 5, second, f.add(first, shortfall)),
+    f.snapshot(6, f.add(first, shortfall), f.counters(second)),
+  ]);
+  const summary = sessionCostReport(file, { since: f.at(5), sourceOnly: true }).parent;
+  assert.equal(summary.coverage, 'billed-with-unknown-coverage');
+  assert.equal(summary.costUsd, null);
+  assert.deepEqual(summary.coverageDefect, {
+    kind: 'billed-with-unknown-coverage',
+    since: f.at(5),
+    cause: 'cumulative-jump',
+  });
+});
+
 test('an unexplained Codex compaction offset keeps the full cost unknown', () => {
   for (const options of [{ afterExtraInput: 1 }, { withoutCompactionBill: true }, { withoutZeroSnapshot: true }]) {
     const f = compactionCostFixture();

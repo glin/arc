@@ -1635,10 +1635,10 @@ function reconcileCodexCosts(
       if (!previous && zeroBaseline) restarts.push(bill);
     } else {
       const gap = positiveJump && ownership && baselineKnown && !bill.conflicted;
-      // Reset names counters that moved backward. Missing counters leave the bill without a snapshot match.
+      // Reset names counters that fell below the previous bill's counters. Missing counters leave the bill without a snapshot match.
       const backward = [
-        [bill.thread, expectedThread],
-        [bill.turn, expectedTurn],
+        [bill.thread, previous?.thread ?? null],
+        [bill.turn, priorTurn ?? null],
       ].some(([actual, expected]) => actual && expected && actual.some((value, index) => value < expected[index]));
       const cause: CoverageCause = bill.conflicted
         ? 'conflicting-bill'

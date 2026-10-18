@@ -240,8 +240,8 @@ A source summary whose coverage is neither absent nor `recorded-reconciled` carr
 | `snapshot-unmatched` | A bill has no matching snapshot or no cumulative counters, or a snapshot has no matching bill. |
 | `foreign-thread` | A bill or session record belongs to another thread. |
 | `conflicting-bill` | Complete revisions of one bill disagree. |
-| `cumulative-jump` | Cumulative counters advanced beyond the identified bills. |
-| `reset` | Cumulative counters moved backward. |
+| `cumulative-jump` | Cumulative counters advanced, but not by the amount of the identified bills. |
+| `reset` | Cumulative counters moved below their previous values. |
 | `anonymous-evidence` | Evidence names no billing identity or no thread. |
 | `legacy-snapshots` | The source records snapshots and no bills. |
 
