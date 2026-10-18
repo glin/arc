@@ -2365,11 +2365,11 @@ test('excluded additions, deletions, and renames stay out of both review outputs
   assert.ok(removal.some((entry) => entry.path.endsWith('moved.md') && entry.side === 'candidate'));
 });
 
-test('registration checks preparation bytes and freezes portable conditions', HEAVY, () => {
-  const prompt = path.join(prepared, 'prompt.txt');
-  const workspaceFile = path.join(prepared, 'workspace', 'fixture.txt');
-  const diff = path.join(prepared, 'candidate.diff');
-  for (const file of [prompt, workspaceFile, diff]) {
+test.each(['prompt.txt', path.join('workspace', 'fixture.txt'), 'candidate.diff'])(
+  'registration checks preparation bytes and freezes portable conditions: changed %s',
+  HEAVY,
+  (relative) => {
+    const file = path.join(prepared, relative);
     const bytes = fs.readFileSync(file);
     fs.writeFileSync(file, 'changed\n');
     try {
@@ -2378,7 +2378,10 @@ test('registration checks preparation bytes and freezes portable conditions', HE
       fs.writeFileSync(file, bytes);
     }
     assert.equal(matrixFile().result.status, 0);
-  }
+  },
+);
+
+test('registration checks preparation bytes and freezes portable conditions: changed manifest', HEAVY, () => {
   const manifestFile = path.join(prepared, 'manifest.json');
   const manifestBytes = fs.readFileSync(manifestFile);
   const alteredManifest = JSON.parse(manifestBytes);
@@ -2389,6 +2392,9 @@ test('registration checks preparation bytes and freezes portable conditions', HE
   } finally {
     fs.writeFileSync(manifestFile, manifestBytes);
   }
+});
+
+test('registration checks preparation bytes and freezes portable conditions: changed workspace inventory', HEAVY, () => {
   const extra = path.join(prepared, 'workspace', 'extra.txt');
   fs.writeFileSync(extra, 'extra\n');
   try {
@@ -2397,8 +2403,14 @@ test('registration checks preparation bytes and freezes portable conditions', HE
     fs.unlinkSync(extra);
   }
   assert.equal(matrixFile().result.status, 0);
+});
+
+test('registration checks preparation bytes and freezes portable conditions: changed prompt condition', HEAVY, () => {
   const wrong = registration({ prompt_hash: '0'.repeat(64) });
   assert.match(matrixFile(wrong).result.error, /preparation condition/);
+});
+
+test('registration checks preparation bytes and freezes portable conditions: portable summary', HEAVY, () => {
   const { matrix: frozen, output } = matrixFile();
   assert.equal('preparation_path' in frozen.registration.tasks[0], false);
   assert.equal('cache_path' in frozen.registration.tasks[0], false);
