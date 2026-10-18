@@ -29,18 +29,16 @@ export interface Command {
 
 const windowFlag: Flag = ['--window ID', 'Select this window before ARC_WINDOW or automatic terminal ownership.'];
 const jsonFlag: Flag = ['--json', 'Print JSON. This command already prints JSON by default.'];
+const readJsonFlag: Flag = ['--json', 'Print structured fields instead of readable text.'];
 const requestFlag: Flag = [
   '--request-id ID',
   'Use a fresh selected-window hostId:ID, or retry the identical payload with its retained ID.',
 ];
 const dryRunFlag: Flag = ['--dry-run', 'Check admission without changing session metadata.'];
 const windowRefusal = 'Window selection, unavailable capabilities, or repository readiness can refuse the request.';
-const argumentRefusal =
-  'Unknown flags, repeated scalar flags, and missing flag values refuse before sending. Host validation can refuse request values after sending.';
 const curationOutput = [
-  'Host JSON: version, requestId, status, sessionId, action, requester. Refusals include reason.',
-  'Applied results also include labels, pinned, archived. Host status is applied, dry-run, or refused.',
-  'Unknown delivery JSON: version, status, requestId, window, reason. It omits requester and curation details.',
+  'JSON status is applied, dry-run, refused, or unknown. Keep requestId and window after unknown delivery.',
+  'Applied replies include labels, pinned, and archived. Refusals include reason.',
 ];
 
 function curation(name: string, summary: string, refusal: string, flags: readonly Flag[] = []): Command {
@@ -60,7 +58,7 @@ function curation(name: string, summary: string, refusal: string, flags: readonl
               'Forced host replies also include evaluatedRunStatus, captured before membership changes, or null when no listing row exists.',
             ]
           : curationOutput,
-      refusals: [argumentRefusal, 'One unique scoped session ID is required.', windowRefusal, refusal],
+      refusals: ['One unique scoped session ID is required.', windowRefusal, refusal],
       example: `arc ${name} SESSION_ID --dry-run --window WINDOW_ID`,
     },
   };
@@ -83,7 +81,7 @@ function label(action: 'add' | 'remove'): Command {
         jsonFlag,
       ],
       output: curationOutput,
-      refusals: [argumentRefusal, 'One unique scoped session ID and at least one label are required.', windowRefusal],
+      refusals: ['One unique scoped session ID and at least one label are required.', windowRefusal],
       example: `arc label ${action} SESSION_ID --label Review --dry-run --window WINDOW_ID`,
     },
   };
@@ -135,7 +133,6 @@ function compact(action: 'request' | 'status'): Command {
         ...(request ? ['After uncertain admission, observe this ID. Never retry or switch transports.'] : []),
       ],
       refusals: [
-        argumentRefusal,
         'All synopsis flags are required. Window and UUID syntax must match.',
         ...(request
           ? [
@@ -174,7 +171,6 @@ export const COMMANDS: readonly Command[] = [
         'Turn replies cannot establish physical source continuity with listing rows. Costs and report policy stay with the caller.',
       ],
       refusals: [
-        argumentRefusal,
         'Missing explicit selection fails before requests. No window switching occurs.',
         'Unknown failures preserve prior observations and stop the affected collection path.',
       ],
@@ -276,7 +272,7 @@ export const COMMANDS: readonly Command[] = [
       ],
       output: [
         'Default: text with context, cache, next-turn price, and available model, workspace, session, and account limits.',
-        'JSON: schemaVersion, source, model, workspace, session, context, cache, nextTurn, limits. Unavailable figures are null.',
+        'JSON uses schemaVersion 1. Unavailable figures are null.',
       ],
       refusals: [
         'Empty stdin, malformed JSON, or a value other than an object fails.',
@@ -317,15 +313,13 @@ export const COMMANDS: readonly Command[] = [
         ['--limit 1-128', 'Maximum rows on this page. Default: 128.'],
         ['--cursor CURSOR', 'Pass the previous page next value unchanged. A reload or changed query expires it.'],
         windowFlag,
-        jsonFlag,
+        readJsonFlag,
       ],
       output: [
-        'JSON: version, requester, sessions, complete, notes, next, coverage, freshness.',
-        'Rows include source, id, provider, path, ambiguous, name, setup, labels, pinned, archived, runStatus, attention, lastActivity, parent, agentRun, facts, truncated.',
+        'Text shows full IDs, names, state, and uncertainty. JSON includes source, path, ambiguous, truncated, and targeting fields.',
         'Follow next until null. Preserve coverage and freshness independently of pagination.',
       ],
       refusals: [
-        argumentRefusal,
         'Queries accept at most 200 characters. Use filter for live statuses and other search areas.',
         'Modified or expired cursors refuse. Restart without --cursor.',
         windowRefusal,
@@ -340,17 +334,12 @@ export const COMMANDS: readonly Command[] = [
     help: {
       summary: 'Read bounded recent turns without marking them read.',
       synopsis: 'arc session ID [--turns 1-20] [--window ID] [--json]',
-      flags: [['--turns 1-20', 'Read this many newest turns. Default: 5.'], windowFlag, jsonFlag],
+      flags: [['--turns 1-20', 'Read this many newest turns. Default: 5.'], windowFlag, readJsonFlag],
       output: [
-        'JSON: version, requester, id, provider, state, turns, partial, readByteLimit, notes.',
-        'Turns contain promptId, startedAt, endedAt, prompt, summary, model, effort, finished, interrupted, error.',
+        'Text shows delivered prompts and responses. JSON preserves state, partial, notes, and turn fields.',
         'An eligible owning requester receives observation for send. Eligible current replies include readObservation for delivered completed turns. Stale reads return no turns.',
       ],
-      refusals: [
-        argumentRefusal,
-        'One unique scoped session ID is required. File paths do not select a source.',
-        windowRefusal,
-      ],
+      refusals: ['One unique scoped session ID is required. File paths do not select a source.', windowRefusal],
       example: 'arc session SESSION_ID --turns 5 --window WINDOW_ID --json',
     },
   },
@@ -374,7 +363,6 @@ export const COMMANDS: readonly Command[] = [
         'Status is applied, dry-run, refused, or unknown. Completed delivered identities alone are acknowledged.',
       ],
       refusals: [
-        argumentRefusal,
         windowRefusal,
         'An explicit request ID, sessionRead capability, native requester identity, and current receipt are required.',
       ],
@@ -390,14 +378,12 @@ export const COMMANDS: readonly Command[] = [
     help: {
       summary: 'List runtime settings and reusable setup keys.',
       synopsis: 'arc setups [--window ID] [--json]',
-      flags: [windowFlag, jsonFlag],
+      flags: [windowFlag, readJsonFlag],
       output: [
         'Text lists the project, reusable setup keys, models with their efforts, and permissions.',
-        '--json returns one compact object with version, project, optional primary key, setups, and agents.',
-        'Setups supply key, provider, nonempty model, effort, permissions, and missingValue only when unavailable.',
-        'Agents supply provider, models with value and string-array efforts, permissions, and modelsPending only when true.',
+        'JSON provides setup keys and supported launch values. missingValue explains unavailable setups. modelsPending means discovery is loading.',
       ],
-      refusals: [argumentRefusal, 'Positional arguments refuse.', windowRefusal],
+      refusals: ['Positional arguments refuse.', windowRefusal],
       example: 'arc setups --window WINDOW_ID --json',
     },
   },
@@ -449,13 +435,12 @@ export const COMMANDS: readonly Command[] = [
         jsonFlag,
       ],
       output: [
-        'Host JSON: version, requestId, status, requester. Accepted results include sessionId, provider, requestedSetup, agentRun, errors, and launchId for dispatch. Refusals include reason.',
+        'JSON includes status, requestId, and accepted sessionId. Save launchId for dispatch retrieval and errors for metadata failures.',
         'Host status is accepted, accepted-with-errors, or refused. Requested settings do not establish observed execution.',
-        'Unknown delivery JSON: version, status, requestId, window, reason. It omits requester and accepted-result details.',
+        'Unknown delivery retains requestId, window, and reason. Preserve them without launching a replacement.',
         '--arc-dispatch adds ARC_DISPATCH_SESSION after an accepted result with a session ID. Reader-owned receipts include owned: true.',
       ],
       refusals: [
-        argumentRefusal,
         'Classification accepts only literal true or false and cannot repeat across bare and equals forms.',
         '--setup cannot combine with explicit provider, model, effort, or permissions.',
         'Empty prompts, slash commands, oversized files or encoded requests, and unsupported setups refuse launch.',
@@ -489,7 +474,6 @@ export const COMMANDS: readonly Command[] = [
         'Accepted confirms prompt receipt. Refused means no input. Unknown blocks further sends until reader intervention.',
       ],
       refusals: [
-        argumentRefusal,
         'One session ID, prompt file, observation, and explicit request ID are required.',
         'Missing or ambiguous native requester identity, stale observations, unavailable ownership, or a busy session refuses input.',
         'Empty prompts, slash commands, oversized files or encoded requests refuse.',
@@ -518,7 +502,6 @@ export const COMMANDS: readonly Command[] = [
         'Queries support session:ID, provider-qualified identities, OR groups, title:, label:, agent:, is:, find:, in:, cost:, and cache-expiry:.',
       ],
       refusals: [
-        argumentRefusal,
         'Supply one nonempty positional query, one --query QUERY, or --clear. Queries accept at most 200 characters and must use valid session list syntax.',
         windowRefusal,
       ],
@@ -585,11 +568,10 @@ export const COMMANDS: readonly Command[] = [
         ['--by-tool-kind', 'Add parent request costs attributed to tool-result kinds.'],
         ['--until-text REGEX', 'With --by-tool-kind, add a separate result before the first matching parent request.'],
         ['--window-agent ID', 'Add a separate parent interval from the named Agent launch.'],
-        jsonFlag,
+        readJsonFlag,
       ],
       output: [
-        'JSON: schemaVersion, buildCommit, source, window when bounded, parent, children, combined, rateNote, cacheExpiryNote.',
-        'Optional fields: modelCosts within source summaries, byToolKind, untilText, parentWindow.',
+        'Text shows parent, children, combined, and requested breakdowns. JSON retains tokens, cache, context, and pricing evidence.',
         'Unknown full costs remain null. Priced subtotals and coverage retain available evidence. TARGET is one session ID or transcript path. Existing paths take precedence over ID discovery. Stdin is unused.',
       ],
       refusals: [

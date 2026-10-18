@@ -11,7 +11,42 @@ import os from 'node:os';
 import path from 'node:path';
 import { createRequire, syncBuiltinESMExports } from 'node:module';
 import { afterEach, beforeEach, test, vi } from 'vitest';
-import { runCost } from '../src/cost.ts';
+import { runCost as costOutput } from '../src/cost.ts';
+
+const runCost = (args: string[]) => costOutput([...args, '--json']);
+
+test('human cost preserves unknown totals and requested detail while JSON drops only invariant notes', () => {
+  const { root, file } = fixture();
+  try {
+    const args = [file, '--source-only', '--by-model', '--by-tool-kind', '--until-text', 'no match'];
+    const report = JSON.parse(runCost(args));
+    const human = costOutput(args);
+    for (const value of [
+      'Parent',
+      'Combined',
+      '$0.0002',
+      'By model:',
+      'By tool kind',
+      'Matched: false',
+      report.untilText.note,
+    ])
+      assert.ok(human.includes(value), value);
+    assert.equal(report.untilText.matched, false);
+    assert.equal('cacheExpiryNote' in report, false);
+    assert.equal('requestsNote' in report.byToolKind, false);
+    assert.equal('requestsNote' in report.untilText.byToolKind, false);
+    const record = JSON.parse(fs.readFileSync(file, 'utf8'));
+    record.message.model = 'unpriced-future-model';
+    fs.writeFileSync(file, JSON.stringify(record) + '\n');
+    const unknown = costOutput([file, '--source-only']);
+    assert.match(unknown, /Parent\s+1\s+unknown/);
+    assert.ok(unknown.includes('unpriced-future-model'));
+    const zero = costOutput([file, '--source-only', '--since', '2027-01-01T00:00:00Z']);
+    assert.match(zero, /Parent\s+0\s+unknown/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
 
 const defaultRoots = { codex: tempDir('cli-cost-codex-'), projects: tempDir('cli-cost-projects-') };
 
@@ -900,6 +935,18 @@ test('cost attributes failed tools and launch windows to the requests that made 
     assert.equal(report.parentWindow.requests, 2);
     assert.equal(report.parentWindow.contextAtStart, 100);
     assert.equal(report.parentWindow.contextAtPeak, 100);
+    assert.equal('requestsNote' in report.parentWindow.byToolKind, false);
+    const human = costOutput([
+      file,
+      '--source-only',
+      '--by-tool-kind',
+      '--until-text',
+      'FINDING',
+      '--window-agent',
+      'a1',
+    ]);
+    for (const detail of ['Failed tools: 1', 'Matched: true', 'Agent window:', 'Agent window tool kinds'])
+      assert.ok(human.includes(detail), detail);
     const exclusive = JSON.parse(runCost([file, '--window-agent', 'a1', '--until', at(3)]));
     assert.equal(exclusive.parent.requests, 1);
     assert.equal(exclusive.parentWindow.requests, 2);

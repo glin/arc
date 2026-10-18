@@ -1922,6 +1922,128 @@ const setupReply = {
   ],
 };
 
+test('bundled human session reads preserve delivered text, identity, and uncertainty without exposing receipts', async () => {
+  const home = mkdtempSync(join(realpathSync(tmpdir()), 'arc-human-reads-'));
+  const channel = new WindowChannel(home);
+  const run = promisify(execFile);
+  const row = {
+    ...collectRow('physical-source', 'complete-session-id'),
+    path: '/private/transcript',
+    name: 'Review\nforged row\u0085\u2028',
+    setup: { model: null, effort: null, source: 'unavailable' },
+    labels: [{ name: 'cli', source: 'reader' }],
+    pinned: true,
+    archived: true,
+    runStatus: 'stopped',
+    lastActivity: null,
+    parent: null,
+    agentRun: null,
+    facts: 'unparsed',
+  };
+  let reply = collectPage(
+    [row, { ...row, id: null, name: null, ambiguous: true, truncated: ['id', 'name'], facts: 'stale' }],
+    {
+      coverage: 'incomplete',
+      freshness: 'stale',
+      complete: false,
+      next: 'Exact_cursor-2',
+      notes: ['Discovery unfinished.'],
+    },
+  );
+  channel.setRequestHandler(() => reply);
+  const env = { ...smokeEnv, ARC_HOME: home, ARC_WINDOW: channel.hostId };
+  const call = (command, json = false) =>
+    run(
+      process.execPath,
+      [cli, command, ...(command === 'session' ? ['complete-session-id'] : []), ...(json ? ['--json'] : [])],
+      { env, encoding: 'utf8' },
+    );
+  try {
+    await channel.update({ folders: [home], scopeReady: true, panelReady: true, panelVisible: true });
+    const listing = (await call('sessions')).stdout;
+    for (const fact of [
+      'complete-session-id',
+      'physical-source',
+      'classification unknown',
+      'ambiguous ID',
+      'truncated: id, name',
+      '(ID truncated)',
+      'facts stale',
+      'facts unparsed',
+      'pinned',
+      'archived',
+      'labels: cli',
+      'Discovery unfinished.',
+      'Exact_cursor-2',
+    ])
+      assert.ok(listing.includes(fact), fact);
+    assert.ok(listing.includes('Review\\nforged row'));
+    assert.ok(!listing.includes('\nforged row'));
+    assert.doesNotMatch(listing, /[\x7f-\x9f\u2028\u2029]/);
+    assert.ok(!listing.includes('/private/transcript'));
+    assert.deepEqual(JSON.parse((await call('sessions', true)).stdout), reply);
+    reply = collectPage([], { coverage: 'unavailable', next: null, notes: ['Catalog unavailable.'] });
+    assert.match((await call('sessions')).stdout, /Discovery remains unavailable/);
+    const prompt = '  Привет 🐈\n\tretain whitespace  \n';
+    const response = '\n回答\r\n  trailing spaces  ';
+    reply = collectTurns('complete-session-id', {
+      turns: [
+        {
+          promptId: 'turn-1',
+          startedAt: 0,
+          endedAt: 1,
+          prompt,
+          summary: response,
+          model: 'model',
+          effort: 'high',
+          finished: false,
+          interrupted: true,
+          error: 'recorded failure',
+        },
+      ],
+      observation: 'SECRET_SEND',
+      readObservation: 'SECRET_READ',
+      notes: ['Older turn excluded.'],
+    });
+    const detail = (await call('session')).stdout;
+    for (const value of [
+      prompt,
+      response,
+      'turn-1',
+      'error',
+      'model',
+      'high',
+      'Older turn excluded.',
+      'partial',
+      '--json',
+    ])
+      assert.ok(detail.includes(value), value);
+    assert.ok(!detail.includes('SECRET_'));
+    assert.deepEqual(JSON.parse((await call('session', true)).stdout), reply);
+    for (const state of ['stale', 'unparsed']) {
+      reply = collectTurns('complete-session-id', { state });
+      assert.match((await call('session')).stdout, new RegExp(`History is ${state}`));
+    }
+    for (const command of ['sessions', 'session']) {
+      const valid = command === 'sessions' ? collectPage([row]) : collectTurns('complete-session-id');
+      for (const malformed of [
+        { ...valid, version: 99 },
+        { ...valid, notes: null },
+        command === 'sessions'
+          ? { ...valid, sessions: [{ ...row, labels: [{}] }] }
+          : { ...valid, turns: [{ prompt: null }] },
+      ]) {
+        reply = malformed;
+        await assert.rejects(call(command), (error) => error.stdout === '' && /^arc: .*--json.*\n$/.test(error.stderr));
+        assert.deepEqual(JSON.parse((await call(command, true)).stdout), malformed);
+      }
+    }
+  } finally {
+    await channel.dispose();
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test('bundled setups print readable launch values by default and compact JSON on request', async () => {
   const home = mkdtempSync(join(realpathSync(tmpdir()), 'arc-setups-smoke-'));
   const channel = new WindowChannel(home);
@@ -2003,7 +2125,7 @@ test('bundled session commands select one window, reject unknown IDs, and bound 
   try {
     await channel.update({ folders: [], scopeReady: true, panelReady: false, panelVisible: false });
     await second.update({ folders: [], scopeReady: true, panelReady: false, panelVisible: false });
-    const listing = await run(process.execPath, [cli, 'sessions'], { env, encoding: 'utf8' });
+    const listing = await run(process.execPath, [cli, 'sessions', '--json'], { env, encoding: 'utf8' });
     assert.deepEqual(JSON.parse(listing.stdout), { method: 'sessions', params: {}, requester: 'requesting-agent' });
     const paged = await run(process.execPath, [cli, 'sessions', '--limit', '5', '--cursor', 'Page-2_x', '--json'], {
       env,
@@ -2035,7 +2157,7 @@ test('bundled session commands select one window, reject unknown IDs, and bound 
     };
     assert.deepEqual(parseSessionRequest(wireRequest), wireRequest);
     assert.equal(parseSessionRequest({ ...wireRequest, params: { limit: maximum + 1 } }), null);
-    const largest = await run(process.execPath, [cli, 'sessions', '--limit', String(maximum)], {
+    const largest = await run(process.execPath, [cli, 'sessions', '--limit', String(maximum), '--json'], {
       env,
       encoding: 'utf8',
     });
@@ -2210,7 +2332,7 @@ test('the bundled cost command reads isolated roots and reports failures on stde
     ARC_CODEX_ROOT: codex,
   };
   try {
-    const result = spawnSync(process.execPath, [cli, 'cost', 'session-1'], { env, encoding: 'utf8' });
+    const result = spawnSync(process.execPath, [cli, 'cost', 'session-1', '--json'], { env, encoding: 'utf8' });
     assert.equal(result.status, 0, result.stderr);
     const report = JSON.parse(result.stdout);
     assert.equal(report.schemaVersion, 2);
@@ -2218,6 +2340,14 @@ test('the bundled cost command reads isolated roots and reports failures on stde
     assert.equal(report.source.file, file);
     assert.equal(report.parent.requests, 1);
     assert.equal('modelCosts' in report.parent, false);
+    const human = spawnSync(
+      process.execPath,
+      [cli, 'cost', 'session-1', '--by-model', '--by-tool-kind', '--until-text', 'absent'],
+      { env, encoding: 'utf8' },
+    );
+    assert.equal(human.status, 0, human.stderr);
+    for (const detail of ['Parent', 'Combined', '$0.0002', 'By model:', 'By tool kind', 'Matched: false'])
+      assert.ok(human.stdout.includes(detail), detail);
     const native = readFileSync(file, 'utf8');
     const stream = [
       { type: 'system', subtype: 'init', session_id: 'stream', tools: [] },
@@ -2354,7 +2484,7 @@ test('the packed package installs only arc globally and runs locally offline', (
         },
       }) + '\n',
     );
-    const costArgs = ['cost', transcript, '--source-only', '--by-model'];
+    const costArgs = ['cost', transcript, '--source-only', '--by-model', '--json'];
     const expectedCost = JSON.parse(execFileSync(process.execPath, [cli, ...costArgs], options));
     const installedInput = JSON.stringify({
       ...fixture,

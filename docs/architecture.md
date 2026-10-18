@@ -505,7 +505,7 @@ Subagent row names contain absolutely positioned accessible text. The clipped na
 
 The editor boundary is `extension.ts`, `panelhost.ts`, `uris.ts`, and `config.ts`. Other production modules avoid `vscode`, so tests can import their decisions directly. `extension/src/imports.test.ts` enforces package direction and runtime cycles.
 
-`cli/src/commands.ts` owns admitted command identities and required help data. `main.ts` dispatches those identities and renders help before stdin or window access. Missing help data refuses command admission.
+`cli/src/commands.ts` owns admitted command identities and required help data. `sessions.ts` renders readable listings and turns, and passes explicit JSON replies through. `cost.ts` renders readable cost summaries and omits invariant explanatory notes from CLI JSON. `main.ts` dispatches those identities and renders help before stdin or window access. Missing help data refuses command admission.
 
 `cli/src/skills.ts` owns explicit personal skill copying, replacement, removal, cancellation, and destination ownership. Its control folder sits beside the discovery root and binds physical directory identities, operation tokens, complete file digests, and settled seals. Uncertain operations retain matching locks for manual recovery. Resources finish before exclusive completed-file publication exposes `SKILL.md`. `skillfiles.ts` selects only the executing artifact's payload layout and resolves physical temporary roots without write admission. The source installer invokes the matching compiled CLI after editor installation and awaits child exit before deleting downloaded source. [Skill installation](arc-sessions.md#install-the-parts-you-need) owns destination, conflict, and recovery behavior.
 

@@ -41,7 +41,7 @@ arc sessions --query 'label:Review -is:archived' --window WINDOW_ID --json
 arc session SESSION_ID --turns 5 --window WINDOW_ID --json
 ```
 
-`sessions` returns one page. Follow `next` with `--cursor`, retaining the window, query, and limit:
+`sessions` prints readable rows by default. `session` prints delivered prompts and responses. Use `--json` for fields and receipts. `sessions` returns one page. Follow `next` with `--cursor`, retaining the window, query, and limit:
 
 ```sh
 arc sessions --query 'label:Review -is:archived' --cursor CURSOR --window WINDOW_ID --json
@@ -181,6 +181,8 @@ arc cost SESSION_ID --since 2026-10-01T00:00:00Z --until 2026-10-02T00:00:00Z
 ```
 
 Use a saved Claude Code or Codex ID, or an existing transcript or rollout path. An exact path resolves ambiguous ID discovery. `--source-only` requires a path and excludes children. Times require `Z` or an explicit offset. The report includes `--since` and excludes `--until`.
+
+`cost` prints readable summaries by default. Add `--json` for the fields below, tokens, context, and cache details.
 
 | Field              | Meaning                                                                |
 | ------------------ | ---------------------------------------------------------------------- |

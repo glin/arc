@@ -24,7 +24,7 @@ Session reads use the selected window's accepted catalog and repository scope. T
 
 ### Listing output
 
-`sessions` prints JSON with `version`, `requester`, `sessions`, `complete`, `notes`, `next`, `coverage`, and `freshness`.
+`sessions --json` returns `version`, `requester`, `sessions`, `complete`, `notes`, `next`, `coverage`, and `freshness`.
 
 | Row field | Meaning |
 | --- | --- |
@@ -75,7 +75,7 @@ Claude reports `none` with current whole-file metadata, known empty turn starts,
 
 ### Turn reads
 
-`session` prints `version`, `requester`, `id`, `provider`, `state`, `turns`, `partial`, `readByteLimit`, and `notes`. Eligible replies also supply `observation` for follow-ups and `readObservation` for read acknowledgments.
+`session --json` returns `version`, `requester`, `id`, `provider`, `state`, `turns`, `partial`, `readByteLimit`, and `notes`. Eligible replies also supply `observation` for follow-ups and `readObservation` for read acknowledgments.
 
 The default is five newest turns, with 1 through 20 permitted. Reads allow 512 KiB, including directory checks and Codex opening reads. Output stays below 48 KiB and names excluded turns. Oversized turns are excluded. Exceeding the window's full reply allowance fails explicitly.
 
@@ -224,7 +224,7 @@ Unavailable source facts project no marks. Reader boundaries remain separate, an
 
 ## Cost reports
 
-Cost prints one JSON object and a newline, without reading stdin. `schemaVersion: 2` identifies the contract. `buildCommit` identifies the bundled commit, or `unknown` without build identity. `rateNote` describes pricing. `cacheExpiryNote` describes cache-expiry evidence limits.
+Cost prints readable summaries by default. `--json` prints one structured object. Neither format reads stdin. `schemaVersion: 2` identifies the contract. `buildCommit` identifies the bundled commit, or `unknown` without build identity. `rateNote` describes pricing.
 
 ### Source selection
 
@@ -275,7 +275,7 @@ Source summaries include supported request counts, tokens, context, averages, to
 
 `cacheExpiry.inputCostAfterExpiryUsd` prices uncached input and cache writes on return requests. It excludes cached reads and output. `extraCostAfterExpiryUsd` prices returning first-pass input that resends prior final-pass context, above the cached-read price. It excludes new prompt text. Unpriced returns leave either amount null.
 
-Compaction between requests crossing cache lifetime increments `cacheExpiry.excludedAmbiguous`. The command never measures that pair from compaction. Codex pairs remain observations. Their amounts stay null without independent adjacency evidence.
+Compaction between requests crossing cache lifetime increments `cacheExpiry.excludedAmbiguous`. The command never measures that pair from compaction. Codex cache-write counters establish volume, not lifetime. Claude child prompts have no visible turn boundary. Codex pairs remain observations. Their amounts stay null without independent adjacency evidence.
 
 ### Model detail
 

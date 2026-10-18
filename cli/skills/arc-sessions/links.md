@@ -8,7 +8,7 @@ Report known sessions as named Markdown links:
 
 Link only destinations established in the window scope containing the invoking conversation. When supplied, `ARC_WINDOW` identifies that window. A successful operation with explicit `--window` does not establish the invoking window. Keep another or unestablished window's sessions as plain text with their known names and IDs. Never invent an ID or link an unverified destination. Never substitute a source hash, transcript path, short reference, or guess.
 
-For lookup reports, use `arc sessions` rows with exact, nonnull `id` and `name`, neither listed in `truncated`, and `ambiguous: false`. Keep incomplete identities and ambiguous rows as plain text. A detailed `arc session` read returns `id`, without a session name. Pair it with an exact, untruncated name from an authorized source before linking.
+For lookup reports, use `arc sessions --window WINDOW_ID --json` rows with exact, nonnull `id` and `name`, neither listed in `truncated`, and `ambiguous: false`. Keep incomplete identities and ambiguous rows as plain text. A detailed `arc session` read returns `id`, without a session name. Pair it with an exact, untruncated name from an authorized source before linking.
 
 For an accepted start, use the requested name and returned `sessionId`. If naming failed, identify the name as requested and report the error. Do not claim that Arc saved it.
 
