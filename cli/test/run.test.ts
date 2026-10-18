@@ -3934,6 +3934,10 @@ test.each([
   );
   const diagnostic = Buffer.from([100, 105, 97, 103, 0, 255, 10]);
   try {
+    await vi.waitFor(() => {
+      assert.equal(descriptors.length, 3);
+      assert.ok(child.listenerCount('close') > 0);
+    });
     fs.writeSync(descriptors[1], opening);
     fs.writeSync(descriptors[2], diagnostic);
     await vi.waitFor(() => assert.deepEqual(fs.readFileSync(log), Buffer.concat([opening, diagnostic])));
@@ -4021,7 +4025,10 @@ test('print capture retains final bytes for alias recovery after denied delivery
   const owner = () => JSON.parse(fs.readFileSync(receipts.artifact(launch.launchId, 'output-owner.json'), 'utf8'));
   const pending = produceStandaloneOutput(receipts, launch.launchId);
   try {
-    assert.equal(fs.readFileSync(alias, 'utf8'), 'prefix');
+    await vi.waitFor(() => {
+      assert.ok(child.listenerCount('close') > 0);
+      assert.equal(fs.readFileSync(alias, 'utf8'), 'prefix');
+    });
     blocked = true;
     fs.appendFileSync(stdout, ' final');
     child.emit('close', 0, null);
