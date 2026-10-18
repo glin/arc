@@ -38,8 +38,8 @@ const skillCLI = require('../extension/node_modules/esbuild').buildSync({
   write: false,
 }).outputFiles[0].contents;
 const catalogUrl = 'https://github.com/glin/arc/releases/latest/download/arc-marketplace.json';
-// One installer run stops after this time. Git Bash starts every child process of a run, and on a loaded
-// Windows machine one run with hooks starts about twenty of them in more than 20 seconds.
+// One installer run stops after this time. Git Bash starts every child process of a run.
+// One run with hooks starts about twenty of them. On a loaded Windows machine that takes more than 20 seconds.
 const RUN_TIMEOUT = 60_000;
 // A case gets the run budget for each installer run, plus time for its fixture and assertions.
 function runBudget(runs) {
@@ -211,48 +211,52 @@ test('Git Bash cancellation after skill child success retains source until exit 
 });
 
 for (const mode of ['local', 'remote'])
-  test(`${mode} handled cancellation before temporary allocation stops without a download failure`, () => {
-    for (const [first, second, status] of [
-      ['TERM', 'HUP', 143],
-      ['HUP', 'INT', 129],
-      ['INT', 'TERM', 130],
-    ]) {
-      const f = installerFixture();
-      try {
-        const script = path.join(f.source, 'install.sh');
-        const original = fs.readFileSync(script, 'utf8').replaceAll('\r\n', '\n');
-        const changed = original.replace(
-          '  hook_source="$marketplace_url"',
-          () =>
-            `  hook_source="$marketplace_url"\n  echo acknowledged-before-temp >> "$ARC_TEST_LOG"\n  kill -${first} "$$"\n  kill -${second} "$$"`,
-        );
-        assert.notEqual(changed, original);
-        fs.writeFileSync(script, changed);
-        const allocator = path.join(f.bin, 'mktemp');
-        fs.writeFileSync(
-          allocator,
-          fs.readFileSync(allocator, 'utf8').replace('exec ', 'echo temporary-allocation >> "$ARC_TEST_LOG"\nexec '),
-        );
-        const result = f.run(
-          [`--${mode}`, '--skill-agent', 'claude', '--skill-agent', 'codex', 'code'],
-          { CLAUDE_CONFIG_DIR: '' },
-          { skills: true },
-        );
-        assert.equal(result.status, status, result.stdout + result.stderr);
-        assert.equal(result.commands.trim(), 'acknowledged-before-temp');
-        assert.doesNotMatch(result.stderr, /download failed|extraction failed/);
-        const receipt = JSON.parse(result.stdout.trim().split('\n').at(-1));
-        assert.deepEqual(receipt.selectedAgents, ['claude', 'codex']);
-        assert.deepEqual(receipt.editors, []);
-        assert.deepEqual(receipt.components, { editors: 'unattempted', skills: 'cancelled', hooks: 'cancelled' });
-        assert.equal(receipt.cancellation, status);
-        assert.equal(receipt.skills, undefined);
-        assert.deepEqual(fs.readdirSync(f.temporary), []);
-      } finally {
-        f.cleanup();
+  test(
+    `${mode} handled cancellation before temporary allocation stops without a download failure`,
+    { timeout: runBudget(3) },
+    () => {
+      for (const [first, second, status] of [
+        ['TERM', 'HUP', 143],
+        ['HUP', 'INT', 129],
+        ['INT', 'TERM', 130],
+      ]) {
+        const f = installerFixture();
+        try {
+          const script = path.join(f.source, 'install.sh');
+          const original = fs.readFileSync(script, 'utf8').replaceAll('\r\n', '\n');
+          const changed = original.replace(
+            '  hook_source="$marketplace_url"',
+            () =>
+              `  hook_source="$marketplace_url"\n  echo acknowledged-before-temp >> "$ARC_TEST_LOG"\n  kill -${first} "$$"\n  kill -${second} "$$"`,
+          );
+          assert.notEqual(changed, original);
+          fs.writeFileSync(script, changed);
+          const allocator = path.join(f.bin, 'mktemp');
+          fs.writeFileSync(
+            allocator,
+            fs.readFileSync(allocator, 'utf8').replace('exec ', 'echo temporary-allocation >> "$ARC_TEST_LOG"\nexec '),
+          );
+          const result = f.run(
+            [`--${mode}`, '--skill-agent', 'claude', '--skill-agent', 'codex', 'code'],
+            { CLAUDE_CONFIG_DIR: '' },
+            { skills: true },
+          );
+          assert.equal(result.status, status, result.stdout + result.stderr);
+          assert.equal(result.commands.trim(), 'acknowledged-before-temp');
+          assert.doesNotMatch(result.stderr, /download failed|extraction failed/);
+          const receipt = JSON.parse(result.stdout.trim().split('\n').at(-1));
+          assert.deepEqual(receipt.selectedAgents, ['claude', 'codex']);
+          assert.deepEqual(receipt.editors, []);
+          assert.deepEqual(receipt.components, { editors: 'unattempted', skills: 'cancelled', hooks: 'cancelled' });
+          assert.equal(receipt.cancellation, status);
+          assert.equal(receipt.skills, undefined);
+          assert.deepEqual(fs.readdirSync(f.temporary), []);
+        } finally {
+          f.cleanup();
+        }
       }
-    }
-  });
+    },
+  );
 
 test.each([
   ['revision', '    if ! run_child curl --fail', /curl|tar-attempt|package/],
@@ -609,12 +613,12 @@ function absoluteBash() {
   return absoluteBashPath;
 }
 
-let temporaryBashPath;
-// Fixture folders sit directly in the temporary directory, so one conversion serves every fixture.
+const parentBashPaths = new Map();
+// One conversion serves every fixture folder in the same parent folder.
 function fixtureBashPath(dir) {
-  assert.equal(path.dirname(dir), os.tmpdir());
-  temporaryBashPath ??= bashPath(os.tmpdir());
-  return temporaryBashPath + '/' + path.basename(dir);
+  const parent = path.dirname(dir);
+  if (!parentBashPaths.has(parent)) parentBashPaths.set(parent, bashPath(parent));
+  return parentBashPaths.get(parent) + '/' + path.basename(dir);
 }
 
 let templateDir;
@@ -1148,7 +1152,7 @@ test(
   },
 );
 
-test('local hook ownership failures preserve successful editor installation', () => {
+test('local hook ownership failures preserve successful editor installation', { timeout: runBudget(3) }, () => {
   const f = installerFixture();
   try {
     for (const entry of [
@@ -1806,45 +1810,43 @@ for (const conflict of ['disabled settings', 'project', 'local'])
     }
   });
 
-test('remote stdin installation from an unrelated directory downloads the main revision', () => {
-  const f = installerFixture();
-  try {
-    const success = f.run(['code'], {}, { stdin: true });
-    assert.equal(success.status, 0, success.stderr);
-    assert.match(success.commands, /api.github.com\/repos\/glin\/arc\/commits\/main/);
-    assert.match(success.commands, /codeload.github.com\/glin\/arc\/tar.gz/);
-  } finally {
-    f.cleanup();
-  }
-});
-
-test.each([
-  { ARC_TEST_HTTP_FAILURE: 'api.github' },
-  { ARC_TEST_HTTP_FAILURE: 'codeload' },
-  { ARC_TEST_BAD_ARCHIVE: '1' },
-  { ARC_TEST_BAD_REVISION: '1' },
-  { ARC_TEST_INTERRUPT: '1' },
-  { ARC_TEST_NPM_FAILURE: '1' },
-  { ARC_TEST_PACKAGE_FAILURE: '1' },
-])('remote stdin installation from an unrelated directory cleans up after %o', (env) => {
-  const f = installerFixture();
-  try {
-    const r = f.run(['code'], env, { stdin: true });
-    assert.equal(
-      r.status,
-      env.ARC_TEST_INTERRUPT
-        ? 143
-        : env.ARC_TEST_HTTP_FAILURE || env.ARC_TEST_BAD_ARCHIVE || env.ARC_TEST_BAD_REVISION
-          ? 2
-          : 1,
-      r.stdout + r.stderr,
-    );
-    assert.deepEqual(fs.readdirSync(f.temporary), []);
-    assert.doesNotMatch(r.commands, /editor/);
-  } finally {
-    f.cleanup();
-  }
-});
+test(
+  'remote stdin installation from an unrelated directory cleans failures and interruptions',
+  { timeout: runBudget(8) },
+  () => {
+    const f = installerFixture();
+    try {
+      const success = f.run(['code'], {}, { stdin: true });
+      assert.equal(success.status, 0, success.stderr);
+      assert.match(success.commands, /api.github.com\/repos\/glin\/arc\/commits\/main/);
+      assert.match(success.commands, /codeload.github.com\/glin\/arc\/tar.gz/);
+      for (const env of [
+        { ARC_TEST_HTTP_FAILURE: 'api.github' },
+        { ARC_TEST_HTTP_FAILURE: 'codeload' },
+        { ARC_TEST_BAD_ARCHIVE: '1' },
+        { ARC_TEST_BAD_REVISION: '1' },
+        { ARC_TEST_INTERRUPT: '1' },
+        { ARC_TEST_NPM_FAILURE: '1' },
+        { ARC_TEST_PACKAGE_FAILURE: '1' },
+      ]) {
+        const r = f.run(['code'], env, { stdin: true });
+        assert.equal(
+          r.status,
+          env.ARC_TEST_INTERRUPT
+            ? 143
+            : env.ARC_TEST_HTTP_FAILURE || env.ARC_TEST_BAD_ARCHIVE || env.ARC_TEST_BAD_REVISION
+              ? 2
+              : 1,
+          r.stdout + r.stderr,
+        );
+        assert.deepEqual(fs.readdirSync(f.temporary), []);
+        assert.doesNotMatch(r.commands, /editor/);
+      }
+    } finally {
+      f.cleanup();
+    }
+  },
+);
 
 test.each([
   [['--unknown']],
@@ -2042,7 +2044,7 @@ test('sourcing the installer from zsh reports the supported invocation', { skip:
   assert.doesNotMatch(result.stderr, /bad substitution/);
 });
 
-test('the installer refuses unsupported packaging Node versions before npm', () => {
+test('the installer refuses unsupported packaging Node versions before npm', { timeout: runBudget(8) }, () => {
   const f = installerFixture();
   try {
     fs.writeFileSync(
