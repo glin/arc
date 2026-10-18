@@ -392,7 +392,7 @@ The first column is checked against the shipped extension directory by `architec
 | `claudewire.ts` | Claude stream-json and control-channel adapter | no |
 | `compactrequest.ts` | Digest-bound self-compaction commands, reader assignments, separate continuation observations, durable admission ports, exact-child guarded delivery, and native completion evidence | no |
 | `compactstore.ts` | Workspace continuation receipts, exclusive immutable recovery leases, bounded storage, pure status reads, and ended-owner evidence | no |
-| `codexwire.ts` | Codex app-server JSON-RPC adapter | no |
+| `codexwire.ts` | Codex app-server JSON-RPC adapter, ordered cancellable prompt preparation, and child-local skill discovery authority for native prompt attachments | no |
 | `codexreply.ts` | Codex async-question ids and the reply envelope that answers them | no |
 | `questionrecovery.ts` | Durable captured questions, exclusive origin leases, local dispositions, admission, and contextual answer construction | no |
 | `questionrecords.ts` | Bounded exact-source reconciliation for captured question identities, with independent read cursors | no |

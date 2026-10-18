@@ -461,7 +461,7 @@ export function normalizeQueuedSubmissions(raw: unknown): Record<string, QueuedS
       }
       // Keep every admitted prompt whole. Admission refuses a book that would lose an entry.
       if (typeof entry.text === 'string' && entry.text.length > DRAFT_TEXT_LIMIT) continue;
-      const text = typeof entry.text === 'string' ? entry.text.trim() : '';
+      const text = typeof entry.text === 'string' ? entry.text : '';
       if (textChars + text.length > QUEUED_TEXT_CHARS) continue;
       const id = typeof entry.id === 'string' && QUEUED_SUBMISSION_ID.test(entry.id) ? entry.id : '';
       if (!id || ids.has(id)) {
@@ -495,7 +495,7 @@ export function normalizeQueuedSubmissions(raw: unknown): Record<string, QueuedS
           ? (entry.delivery as Record<string, unknown>)
           : null;
       const storedPhase = storedDelivery && typeof storedDelivery.phase === 'string' ? storedDelivery.phase : '';
-      if (!text && !commentIds.length && !assets.length && storedPhase !== 'draft-recovery') {
+      if (!text.trim() && !commentIds.length && !assets.length && storedPhase !== 'draft-recovery') {
         continue;
       }
       const at =
@@ -513,7 +513,7 @@ export function normalizeQueuedSubmissions(raw: unknown): Record<string, QueuedS
         QUEUED_SUBMISSION_ID.test(storedDelivery.resetId)
           ? storedDelivery.resetId
           : '';
-      const legacyReset = /^\/new(?:[ \t]+.*)?$/i.test(text);
+      const legacyReset = /^\/new(?:[ \t]+.*)?$/i.test(text.trim());
       const resetId = storedResetId || (legacyReset ? id : precedingReset);
       const storedReason =
         storedDelivery && typeof storedDelivery.reason === 'string'
@@ -671,7 +671,7 @@ export function queuedSubmissionBookFits(
     const kept = normalized[session];
     return (
       kept?.length === entries.length &&
-      entries.every((entry, index) => kept[index]?.id === entry.id && kept[index]?.text === entry.text.trim())
+      entries.every((entry, index) => kept[index]?.id === entry.id && kept[index]?.text === entry.text)
     );
   });
 }

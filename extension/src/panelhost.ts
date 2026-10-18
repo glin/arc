@@ -5831,7 +5831,7 @@ export class PanelProvider implements vscode.Disposable {
     }
     const ready = { ...state, queued: [], assets, comments: carried };
     const text = next.text;
-    if (!text && !carried.length && !assets.length) {
+    if (!text.trim() && !carried.length && !assets.length) {
       // The reader removed the comments while they waited. Do not turn that cancellation
       // into an empty prompt, and continue to the next real submission if there is one.
       this.queues[state.sessionId] = queueAfterAcceptedRecovery(rest, next);

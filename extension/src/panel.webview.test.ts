@@ -17682,6 +17682,46 @@ function methodBody(marker: string): string {
   return extracted;
 }
 
+test('removing the last comment cancels a whitespace-only queued Codex submission', async () => {
+  const flushQueue = extractedFlushQueue();
+  const entries = queueSubmissionAfter([], 'comments', ' \n\t ', ['removed-comment'], [], 1, false, {
+    agent: 'codex',
+    owner: 'cx',
+  });
+  const delivered: string[] = [];
+  const provider = {
+    repositoryScopeReady: true,
+    queues: { cx: entries },
+    queueHandoffs: new Set(),
+    queuedEditReservations: new Set(),
+    attachmentStorageDir: null,
+    stateFor(session: string) {
+      return {
+        sessionId: session,
+        agent: 'codex',
+        running: false,
+        clearing: false,
+        queued: this.queues.cx,
+        comments: [],
+        draftCommentIds: [],
+      };
+    },
+    writeDrafts() {
+      return Promise.resolve();
+    },
+    flushQueue(session: string) {
+      flushQueue.call(this, session);
+    },
+    send(_state: unknown, text: string) {
+      delivered.push(text);
+    },
+  } as any;
+  provider.flushQueue('cx');
+  await Promise.resolve();
+  assert.deepEqual(delivered, []);
+  assert.deepEqual(provider.queues.cx, []);
+});
+
 function extractedFlushQueue(): (this: Record<string, any>, session: string) => void {
   const compiled = esbuild.transformSync(
     `
@@ -24870,7 +24910,7 @@ test('queued comments and prompts drain only after compaction ends', () => {
     /this\.assets\[state\.sessionId\]/,
     'a file attached for the next draft can ride out with an older queued prompt',
   );
-  sourceMatch(body, /!text && !carried\.length/, 'removed comments drain as an empty prompt');
+  sourceMatch(body, /!text\.trim\(\) && !carried\.length/, 'removed comments drain as an empty prompt');
   sourceMatch(
     body,
     /queueHandoffs\.has\(next\.id\)/,
@@ -32013,7 +32053,7 @@ test('submitted recovery waits behind compaction started during storage', async 
   await pending;
   assert.equal(sent.length, 0, 'prompt delivery began before compaction ended');
   assert.equal(provider.queues.source.length, 1);
-  assert.equal(provider.queues.source[0].text, text.trim());
+  assert.equal(provider.queues.source[0].text, text);
   assert.equal(provider.queues.source[0].recoveryId, attempt.id);
   assert.deepEqual(provider.stateFor('source').settings, settings);
   assert.equal(provider.drafts.source, 'newer B');
@@ -32023,7 +32063,7 @@ test('submitted recovery waits behind compaction started during storage', async 
   provider.flushQueue('source');
   await vi.waitFor(() => assert.equal(sent.length, 1));
   await vi.waitFor(() => assert.equal(provider.queues.source, undefined));
-  assert.equal(sent[0].text, 'frozen A');
+  assert.equal(sent[0].text, text);
   assert.equal(provider.drafts.source, 'newer B');
   assert.deepEqual(provider.saved.submittedPrompts[0].text, text);
 });

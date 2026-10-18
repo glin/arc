@@ -2583,9 +2583,9 @@ export function commentsAfterSend(
   });
 }
 
-// Combine the trimmed draft with its generated comments block. Omit headings and separators when no comments exist.
+// Append generated comments to the draft. Claude receives trimmed text.
 export function promptToSend(state: ComposerState, now?: number): string {
-  const prompt = state.draft.trim();
+  const prompt = state.agent === 'codex' ? state.draft : state.draft.trim();
   // Assemble comments with the shared formatter.
   const notes = emitComments(commentsForActiveSubmission(state), state.sessionId, now);
   if (!notes) {
@@ -2870,16 +2870,16 @@ export function queueSubmissionAfter(
   heldForClear = false,
   ownership?: { agent: string; owner: string },
 ): QueuedSubmission[] {
+  const one = ownership?.agent === 'codex' ? text : text.trim();
   if (
     queued.length >= QUEUED_SUBMISSION_LIMIT ||
-    text.trim().length > DRAFT_TEXT_LIMIT ||
-    queued.reduce((sum, entry) => sum + entry.text.length, 0) + text.trim().length > QUEUED_TEXT_CHARS
+    one.length > DRAFT_TEXT_LIMIT ||
+    queued.reduce((sum, entry) => sum + entry.text.length, 0) + one.length > QUEUED_TEXT_CHARS
   ) {
     return [...queued];
   }
   const claimed = new Set(queued.flatMap((entry) => entry.commentIds));
   const own = commentIds.filter((id) => !claimed.has(id));
-  const one = text.trim();
   const owner = ownership?.owner ?? queued[0]?.delivery.owner ?? '';
   const reset = [...queued].reverse().find((entry) => {
     const route = entry.delivery;
@@ -2900,7 +2900,7 @@ export function queueSubmissionAfter(
     ...(resetRequest?.command === 'new' ? { resetId: id } : {}),
     ...(barrier || heldForClear ? { barrier: barrier || `clear:${owner}` } : {}),
   };
-  return one || own.length || assets.length
+  return one.trim() || own.length || assets.length
     ? [
         ...queued,
         {
@@ -2939,7 +2939,7 @@ export function commentsForQueuedSubmission(
 
 // Build a waiting row with abbreviated text and a full copy of its prompt. Long text gets an expansion control.
 function queuedPrompt(state: ComposerState, entry: QueuedSubmission, name: string, now: number): QueuedPrompt {
-  const text = entry.text.trim();
+  const text = state.agent === 'codex' ? entry.text : entry.text.trim();
   const ownedComments = new Set(entry.commentIds);
   const copyText = promptToSend(
     {
@@ -2952,7 +2952,7 @@ function queuedPrompt(state: ComposerState, entry: QueuedSubmission, name: strin
     now,
   );
   const display =
-    text ||
+    (text.trim() ? text : '') ||
     (entry.assets.length
       ? `Attached: ${entry.assets.map((asset) => asset.name).join(', ')}`
       : 'Comments attached to turns');
@@ -3007,7 +3007,7 @@ function queuedPrompt(state: ComposerState, entry: QueuedSubmission, name: strin
   };
 }
 
-// Append a trimmed prompt through the shared submission builder. Empty text adds nothing.
+// Append a prompt through the shared submission builder. Whitespace alone adds nothing. Codex retains its original text.
 export function queueAfter(
   queued: readonly QueuedSubmission[],
   id: string,
@@ -3317,7 +3317,7 @@ export function queueRecoverySubmission(
   return {
     id: marker.id,
     ...(marker.recoveryId ? { recoveryId: marker.recoveryId } : {}),
-    text: text.trim(),
+    text: agent === 'codex' ? text : text.trim(),
     commentIds: [...commentIds],
     assets: assets.map((asset) => ({ ...asset })),
     at,

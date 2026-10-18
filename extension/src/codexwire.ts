@@ -1,4 +1,5 @@
 import { unavailableDefaults, type AppliedDefaults } from './view/model-picks';
+import { promptToken } from './domain/composer-editing';
 // Adapts Codex app-server messages to the shared agent wire events.
 // JSON-RPC messages travel over stdio as one object per line without the jsonrpc field.
 // Responses have id only, notifications have method only, and server requests have both.
@@ -351,6 +352,9 @@ export class CodexWire {
   // Starts stay in send order. Codex can accept another prompt into the turn already in
   // progress, so starts that return the same id are folded into one server turn.
   private readonly turns: ActiveTurn[] = [];
+  // Preparation ends at the native write, so later input can still join a running turn.
+  private preparing: Promise<void> | null = null;
+  private readonly pendingPrompts = new Set<() => void>();
   // The compaction request only acknowledges startup. Notifications identify and end its native turn.
   // Caller errors transfer any running turn to a receipt without ending native ownership.
   private compaction: PendingCompaction | null = null;
@@ -393,9 +397,11 @@ export class CodexWire {
   // notifications. Kept by server name so one reading can join the two halves.
   private readonly mcpStartup = new Map<string, McpStartup>();
   private commandsOpening = false;
+  private commandsPending: Promise<PromptEntry[]> | null = null;
   private commandsOpened = false;
   private skillRefresh: Promise<void> | null = null;
   private skillRefreshAgain = false;
+  private skills = new Map<string, { name: string; path: string } | null>();
 
   constructor(options: CodexWireOptions) {
     this.send = options.send;
@@ -410,7 +416,12 @@ export class CodexWire {
   }
 
   hasOpenTurns(): boolean {
-    return this.turns.length > 0 || this.compaction !== null || this.runningCompactionTurns.size > 0;
+    return (
+      this.pendingPrompts.size > 0 ||
+      this.turns.length > 0 ||
+      this.compaction !== null ||
+      this.runningCompactionTurns.size > 0
+    );
   }
 
   // True while a settled caller's compaction can still start or finish its native turn.
@@ -456,8 +467,18 @@ export class CodexWire {
   }
 
   // Lists panel commands and skills available in this working directory.
-  async commands(): Promise<PromptEntry[]> {
+  commands(): Promise<PromptEntry[]> {
+    if (this.commandsPending) return this.commandsPending;
+    const pending = this.openCommands().finally(() => {
+      if (this.commandsPending === pending) this.commandsPending = null;
+    });
+    this.commandsPending = pending;
+    return pending;
+  }
+
+  private async openCommands(): Promise<PromptEntry[]> {
     this.commandsOpening = true;
+    this.skills.clear();
     try {
       const commands = await this.commandCatalog(false);
       this.emit({ kind: 'ready', commands });
@@ -483,10 +504,21 @@ export class CodexWire {
       ...(forceReload ? { forceReload: true } : {}),
     });
     const names = new Set(commands.map((command) => command.name.toLowerCase()));
+    const skills = new Map<string, { name: string; path: string } | null>();
     for (const group of arr(result.data)) {
       for (const entry of arr(obj(group)?.skills)) {
         const skill = obj(entry);
         const name = skill && str(skill.name);
+        const path = skill && str(skill.path);
+        if (name && obj(group)?.cwd === this.cwd) {
+          const key = name.toLowerCase();
+          skills.set(
+            key,
+            skills.has(key) || skill?.enabled !== true || !path || !/^[a-z0-9][a-z0-9_.:-]*$/i.test(name)
+              ? null
+              : { name, path },
+          );
+        }
         if (name && !names.has(name.toLowerCase())) {
           commands.push({
             kind: 'skill',
@@ -499,10 +531,12 @@ export class CodexWire {
         }
       }
     }
+    if (!this.closed && !this.skillRefreshAgain) this.skills = skills;
     return commands;
   }
 
   private refreshCommandCatalog(): void {
+    this.skills.clear();
     if (this.closed) {
       return;
     }
@@ -519,7 +553,7 @@ export class CodexWire {
             this.emit({ kind: 'commands', commands });
           }
         } catch {
-          // The last complete catalog stays active until a later notification can replace it.
+          // Autocomplete retains its last complete catalog. Attachments require a successful current read.
         }
       } while (this.skillRefreshAgain && !this.closed);
     };
@@ -712,9 +746,54 @@ export class CodexWire {
       throw new Error('the session is not idle');
     const threadId = this.thread;
     const prompt = normalizeAgentPrompt(input);
+    const first = prompt.text.search(/\S/);
+    const token = first < 0 ? null : promptToken('codex', prompt.text, first);
+    const previous = this.preparing;
+    let release!: () => void;
+    const prepared = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    this.preparing = prepared;
+    let stopped = false;
+    let cancel!: () => void;
+    const cancelled = new Promise<void>((resolve) => {
+      cancel = () => {
+        stopped = true;
+        resolve();
+      };
+    });
+    this.pendingPrompts.add(cancel);
+    try {
+      if (previous) await Promise.race([previous, cancelled]);
+      if (token) {
+        while (this.commandsPending || this.skillRefresh) {
+          if (stopped) break;
+          await Promise.race([this.commandsPending ?? this.skillRefresh, cancelled]);
+        }
+      }
+      if (stopped) throw new Error('the prompt was stopped before it reached the agent');
+      if (this.closed || threadId !== this.thread) throw new Error('the Codex session changed before delivery');
+      return this.startPrompt(prompt, token, threadId, guard);
+    } finally {
+      this.pendingPrompts.delete(cancel);
+      if (this.preparing === prepared) this.preparing = null;
+      release();
+    }
+  }
+
+  private async startPrompt(
+    prompt: ReturnType<typeof normalizeAgentPrompt>,
+    token: ReturnType<typeof promptToken>,
+    threadId: string,
+    guard?: GuardedAttempt,
+  ): Promise<string> {
     const content: Record<string, unknown>[] = [];
     if (prompt.text) {
       content.push({ type: 'text', text: prompt.text });
+    }
+    const skill = token && this.skills.get(token.typed.toLowerCase());
+    if (token && skill && !CODEX_COMMANDS.some((command) => command.name.toLowerCase() === token.typed.toLowerCase())) {
+      content.push({ type: 'skill', name: skill.name, path: skill.path });
     }
     for (const asset of prompt.assets) {
       content.push(
@@ -811,6 +890,7 @@ export class CodexWire {
   }
 
   async interrupt(): Promise<void> {
+    for (const cancel of this.pendingPrompts) cancel();
     while (this.turns.length) {
       const active = this.turns[0];
       let turnId: string;
@@ -1061,6 +1141,7 @@ export class CodexWire {
       return;
     }
     this.closed = true;
+    for (const cancel of this.pendingPrompts) cancel();
     this.turns.splice(0);
     if (this.compaction) {
       this.failCompaction(this.compaction, new Error(reason));

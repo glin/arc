@@ -2566,6 +2566,28 @@ test('comments alone are a prompt, so an empty box with marks on the cards still
   assert.equal(rows[1].dropLabel, 'Drop');
 });
 
+test('Codex whitespace keeps useful waiting descriptions for comments and attachments', () => {
+  const text = ' \n\t ';
+  const heldComment = comment({ id: 'c1' });
+  const asset = {
+    id: '12345678-1234-4123-8123-123456789abc',
+    name: 'first.png',
+    mime: 'image/png',
+    size: 4,
+    digest: '0'.repeat(64),
+  };
+  for (const assets of [[], [asset]]) {
+    const queued = queueSubmissionAfter([], 'whitespace', text, [heldComment.id], assets, 1, false, {
+      agent: 'codex',
+      owner: 's1',
+    });
+    assert.equal(queued[0].text, text);
+    const row = drawn({ agent: 'codex', queued, comments: [heldComment] }).queue[0];
+    assert.equal(row.label, assets.length ? 'Attached: first.png' : 'Comments attached to turns');
+    assert.ok(row.copyText.includes(heldComment.note));
+  }
+});
+
 test('queued submissions keep later comments out of earlier text', () => {
   const first = comment({ id: 'first' });
   const later = comment({ id: 'later', note: 'answer this separately' });
@@ -3049,6 +3071,35 @@ test('a prompt with nothing attached goes out exactly as it was typed', () => {
 
   assert.equal(promptToSend(composerState({ draft: 'read the config' })), 'read the config');
   assert.equal(promptToSend(composerState({ draft: '  read the config \n' })), 'read the config');
+});
+
+test('Codex assembly and queue recovery preserve reader text with appended comments', () => {
+  const text = ' \n/recap does this work better? \n';
+  const notes = [comment()];
+  const state = composerState({ agent: 'codex', draft: text, comments: notes });
+  const assembled = `${text}\n\n${emitComments(notes, 'session-1', COMMENT_NOW)}`;
+  assert.equal(promptToSend(state, COMMENT_NOW), assembled);
+  assert.equal(promptToSend({ ...state, comments: [] }), text);
+  const queued = queueSubmissionAfter([], 'recap', text, [notes[0].id], [], 1, false, {
+    agent: 'codex',
+    owner: 'session-1',
+  });
+  assert.equal(queued[0].text, text);
+  assert.equal(composerView({ ...state, draft: '', queued }, COMMENT_NOW)?.queue[0].copyText, assembled);
+  const marker = {
+    ...queued[0],
+    delivery: { phase: 'draft-recovery' as const, owner: 'session-1', source: 'old', resetId: 'reset' },
+  };
+  assert.equal(queueRecoverySubmission(marker, text, [], [], 2, 'codex')?.text, text);
+  assert.equal(queueRecoverySubmission(marker, text, [], [], 2, 'claude')?.text, text.trim());
+  assert.equal(
+    queueSubmissionAfter([], 'claude', text, [], [], 1, false, { agent: 'claude', owner: 'session-1' })[0].text,
+    text.trim(),
+  );
+  assert.deepEqual(
+    queueSubmissionAfter([], 'empty', ' \n', [], [], 1, false, { agent: 'codex', owner: 'session-1' }),
+    [],
+  );
 });
 
 test('notes with no prompt of their own still go out', () => {

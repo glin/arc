@@ -85,14 +85,14 @@ const RATE_LIMITS = JSON.stringify({
   },
 });
 
-function harness(deadlineMs?: number) {
+function harness(deadlineMs?: number, cwd = 'C:\\ws') {
   const sent: string[] = [];
   const events: WireEvent[] = [];
   const wire = new CodexWire({
     send: (line) => sent.push(line),
     emit: (event) => events.push(event),
     clientInfo: { name: 'arc', title: 'Arc', version: '0.1.0' },
-    cwd: 'C:\\ws',
+    cwd,
     deadlineMs,
   });
   return { wire, sent, events, parsed: () => sent.map((l) => JSON.parse(l)) };
@@ -1142,6 +1142,195 @@ test('a prompt goes out as a turn on the thread that was started', async () => {
   assert.equal(turn.method, 'turn/start');
   assert.equal(turn.params.threadId, THREAD);
   assert.deepEqual(turn.params.input, [{ type: 'text', text: 'hello' }]);
+});
+
+test.each([
+  ['C:\\ws', 'C:\\Users\\reader\\.agents\\skills\\recap\\SKILL.md'],
+  ['/Users/reader/project', '/Users/reader/.agents/skills/recap/SKILL.md'],
+  ['/home/reader/project', '/home/reader/.agents/skills/recap/SKILL.md'],
+])('explicit Codex skills retain native text and assets for %s', async (cwd, path) => {
+  const h = harness(undefined, cwd);
+  const opening = h.wire.commands();
+  reply(h, { data: [{ cwd, skills: [{ name: 'Tools:Recap', path, enabled: true }], errors: [] }] });
+  await opening;
+  const starting = h.wire.startThread({ cwd });
+  reply(h, { thread: { id: THREAD } });
+  await starting;
+  const asset = {
+    id: 'one',
+    name: 'notes.txt',
+    mime: 'text/plain',
+    size: 5,
+    digest: '0'.repeat(64),
+    path: '/staged/one',
+  };
+  for (const prefix of ['/', '$']) {
+    for (const text of [
+      `${prefix}tools:recap`,
+      ` \n${prefix}tools:recap does this work better? \n`,
+      `${prefix}Tools:Recap `,
+    ]) {
+      const delivery = h.wire.prompt({ text, assets: [asset] });
+      assert.deepEqual(h.parsed().at(-1).params.input, [
+        { type: 'text', text },
+        { type: 'skill', name: 'Tools:Recap', path },
+        { type: 'mention', name: asset.name, path: asset.path },
+      ]);
+      reply(h, { turn: { id: TURN } });
+      await delivery;
+      h.wire.receive(TURN_COMPLETED);
+    }
+  }
+  h.wire.close('test complete');
+});
+
+test('Codex attaches only an enabled unambiguous leading catalog skill in its directory', async () => {
+  const h = harness();
+  const opening = h.wire.commands();
+  const skill = { name: 'recap', path: 'C:\\skills\\recap\\SKILL.md', enabled: true };
+  reply(h, {
+    data: [
+      { cwd: 'C:\\elsewhere', skills: [{ ...skill, name: 'elsewhere' }] },
+      {
+        cwd: 'C:\\ws',
+        skills: [
+          skill,
+          { ...skill, name: 'disabled', enabled: false },
+          { ...skill, name: 'uncertain', enabled: undefined },
+          { ...skill, name: 'missing', path: undefined },
+          { ...skill, name: 'duplicate' },
+          { ...skill, name: 'Duplicate', path: '/other/SKILL.md' },
+          ...['compact', 'clear', 'new', 'rename'].map((name) => ({ ...skill, name })),
+          { ...skill, name: 'bad/name' },
+          { ...skill, name: 'bad`name' },
+        ],
+        errors: [],
+      },
+    ],
+  });
+  await opening;
+  const starting = h.wire.startThread({ cwd: 'C:\\ws' });
+  reply(h, { thread: { id: THREAD } });
+  await starting;
+  for (const text of [
+    'explain /recap',
+    'https://example/recap',
+    '\\$recap',
+    '\\ /recap',
+    '"/recap"',
+    '`/recap`',
+    '```\n/recap\n```',
+    '/rec',
+    '/recap,',
+    '$HOME',
+    '/disabled',
+    '/uncertain',
+    '/missing',
+    '/duplicate',
+    '/elsewhere',
+    '/bad/name',
+    '/bad`name',
+    '/unknown',
+    '/',
+    '$',
+    '/compact',
+    '/clear',
+    '/new review',
+    '/rename title',
+  ]) {
+    const delivery = h.wire.prompt(text);
+    assert.deepEqual(h.parsed().at(-1).params.input, [{ type: 'text', text }], text);
+    reply(h, { turn: { id: TURN } });
+    await delivery;
+    h.wire.receive(TURN_COMPLETED);
+  }
+  h.wire.close('test complete');
+});
+
+test('Codex waits for current skill discovery and never attaches stale display paths after failure or removal', async () => {
+  const h = harness();
+  const starting = h.wire.startThread({ cwd: 'C:\\ws' });
+  reply(h, { thread: { id: THREAD } });
+  await starting;
+  const opening = h.wire.commands();
+  const first = h.wire.prompt('/recap');
+  assert.equal(h.parsed().filter((m) => m.method === 'turn/start').length, 0);
+  reply(h, { data: [{ cwd: 'C:\\ws', skills: [{ name: 'recap', path: '/old/SKILL.md', enabled: true }] }] });
+  await opening;
+  await vi.waitFor(() => assert.equal(h.parsed().at(-1).method, 'turn/start'));
+  assert.deepEqual(h.parsed().at(-1).params.input[1], { type: 'skill', name: 'recap', path: '/old/SKILL.md' });
+  reply(h, { turn: { id: TURN } });
+  await first;
+  h.wire.receive(TURN_COMPLETED);
+  for (const outcome of ['changed', 'failed', 'removed']) {
+    h.wire.receive(JSON.stringify({ method: 'skills/changed', params: {} }));
+    const before = h.parsed().filter((m) => m.method === 'turn/start').length;
+    const delivery = h.wire.prompt('$recap');
+    assert.equal(h.parsed().filter((m) => m.method === 'turn/start').length, before);
+    if (outcome === 'changed') {
+      h.wire.receive(JSON.stringify({ method: 'skills/changed', params: {} }));
+      reply(h, {
+        data: [{ cwd: 'C:\\ws', skills: [{ name: 'recap', path: '/intermediate/SKILL.md', enabled: true }] }],
+      });
+      await vi.waitFor(() => assert.equal(h.parsed().filter((m) => m.method === 'skills/list').length, 3));
+      assert.equal(h.parsed().filter((m) => m.method === 'turn/start').length, before);
+      reply(h, { data: [{ cwd: 'C:\\ws', skills: [{ name: 'recap', path: '/current/SKILL.md', enabled: true }] }] });
+    } else if (outcome === 'failed') {
+      h.wire.receive(JSON.stringify({ id: h.parsed().at(-1).id, error: { code: -1, message: 'discovery failed' } }));
+    } else reply(h, { data: [{ cwd: 'C:\\ws', skills: [] }] });
+    await vi.waitFor(() => assert.equal(h.parsed().at(-1).method, 'turn/start'));
+    assert.deepEqual(h.parsed().at(-1).params.input, [
+      { type: 'text', text: '$recap' },
+      ...(outcome === 'changed' ? [{ type: 'skill', name: 'recap', path: '/current/SKILL.md' }] : []),
+    ]);
+    reply(h, { turn: { id: TURN } });
+    await delivery;
+    h.wire.receive(TURN_COMPLETED);
+  }
+  h.wire.close('test complete');
+});
+
+test('Stop cancels Codex input awaiting skill discovery before its native write', async () => {
+  const h = harness();
+  const starting = h.wire.startThread({ cwd: 'C:\\ws' });
+  reply(h, { thread: { id: THREAD } });
+  await starting;
+  const discovery = h.wire.commands();
+  const delivery = h.wire.prompt('/recap');
+  let outcome: string | null = null;
+  const settled = delivery.then(
+    () => (outcome = 'accepted'),
+    () => (outcome = 'stopped'),
+  );
+  await h.wire.interrupt();
+  reply(h, { data: [] });
+  await discovery;
+  await vi.waitFor(() => assert.ok(outcome || h.parsed().some((m) => m.method === 'turn/start')));
+  assert.equal(h.parsed().filter((m) => m.method === 'turn/start').length, 0);
+  assert.equal(await settled, 'stopped');
+  h.wire.close('test complete');
+});
+
+test('Codex discovery preserves skill then ordinary submission order without awaiting acceptance', async () => {
+  const h = harness();
+  const starting = h.wire.startThread({ cwd: 'C:\\ws' });
+  reply(h, { thread: { id: THREAD } });
+  await starting;
+  const discovery = h.wire.commands();
+  const first = h.wire.prompt('/recap first');
+  const second = h.wire.prompt('second prompt');
+  assert.equal(h.parsed().filter((m) => m.method === 'turn/start').length, 0);
+  reply(h, { data: [] });
+  await discovery;
+  await vi.waitFor(() => assert.equal(h.parsed().filter((m) => m.method === 'turn/start').length, 2));
+  const starts = h.parsed().filter((m) => m.method === 'turn/start');
+  assert.deepEqual(
+    starts.map((m) => m.params.input[0].text),
+    ['/recap first', 'second prompt'],
+  );
+  for (const start of starts) h.wire.receive(JSON.stringify({ id: start.id, result: { turn: { id: TURN } } }));
+  await Promise.all([first, second]);
+  h.wire.close('test complete');
 });
 
 test('mid-turn prompts that share a turn id are stopped and completed as one turn', async () => {

@@ -1782,6 +1782,23 @@ test('queue admission retains long text and refuses total text overflow without 
   assert.deepEqual(normalizeQueuedSubmissions({ s: [overlong] }), {});
 });
 
+test('saved queued skill invocations preserve reader whitespace through reload', () => {
+  const text = ' \n$recap does this work better? \n';
+  const queued = {
+    id: 'recap',
+    text,
+    commentIds: ['note'],
+    assets: [],
+    at: 1,
+    delivery: { phase: 'queued' as const, owner: 's' },
+  };
+  assert.deepEqual(normalizeQueuedSubmissions({ s: [queued] }).s, [queued]);
+  assert.deepEqual(normalizePanelState({ queues: { s: [queued] } }).queues.s, [queued]);
+  assert.equal(queuedSubmissionBookFits({}, 's', [queued]), true);
+  const padded = { ...queued, text: ' '.repeat(DRAFT_TEXT_LIMIT) + '/recap' };
+  assert.equal(queuedSubmissionBookFits({}, 's', [padded]), false);
+});
+
 test('an edited waiting prompt keeps its comment claim through stored state', () => {
   const claims = { 'session-1': ['comment-1', 'comment-1', 'comment-2'] };
   assert.deepEqual(normalizeDraftCommentIds(claims), {

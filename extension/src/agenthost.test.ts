@@ -80,7 +80,8 @@ import { USAGE_FRESH_MS, UsageBook, usageBar } from './usageview.ts';
 import { tempDir } from './temproot.ts';
 import { QuestionRecovery, questionContinuation } from './questionrecovery';
 import { QuestionEvidenceReader } from './questionrecords';
-import { askCard } from './composerview';
+import { askCard, queueSubmissionAfter } from './composerview';
+import { normalizeQueuedSubmissions } from './turnview';
 import { asyncQuestionId, buildQuestionReply } from './codexreply';
 import { launchPolicy } from './launchpolicy.ts';
 import { DispatchReceipts } from './dispatchreceipts';
@@ -4508,6 +4509,69 @@ test('a Codex plan without a permission pick leaves the thread and turn unconfig
   }
   child.reply({ turn: { id: 'turn-1' } });
   await delivery;
+});
+
+test('Stop cancels hosted Codex input awaiting a refreshed skill catalog', async () => {
+  const { host, children } = fakeHost();
+  const starting = host.session('cx', codexPlan(CODEX, { cwd: WS, clientInfo: CODEX_CLIENT }));
+  const child = children[0];
+  await answerCodexHandshake(child);
+  child.reply({ thread: { id: 'thread-7' } });
+  const session = await starting;
+  child.say(JSON.stringify({ method: 'skills/changed', params: {} }) + '\n');
+  const delivery = session.prompt('/recap');
+  let outcome: string | null = null;
+  const settled = delivery.then(
+    () => (outcome = 'accepted'),
+    () => (outcome = 'stopped'),
+  );
+  assert.equal(session.state().busy, true);
+  await session.interrupt();
+  child.reply({ data: [] });
+  await vi.waitFor(() => assert.ok(outcome || child.sent().some((m) => m.method === 'turn/start')));
+  assert.equal(child.sent().filter((m) => m.method === 'turn/start').length, 0);
+  assert.equal(await settled, 'stopped');
+  assert.equal(session.state().busy, false);
+  child.exit(0);
+});
+
+test('queued explicit skills use the cold or recreated destination child catalog', async () => {
+  const { host, children } = fakeHost();
+  const text = ' \n$recap does this work better? \n';
+  const queued = normalizeQueuedSubmissions({
+    cx: queueSubmissionAfter([], 'recap', text, [], [], 1, false, { agent: 'codex', owner: 'cx' }),
+  }).cx[0];
+  for (const [index, cwd] of [WS, '/Users/reader/project', '/home/reader/project'].entries()) {
+    const starting = host.session('cx', codexPlan(CODEX, { cwd, resume: 'thread-7', clientInfo: CODEX_CLIENT }));
+    const child = children[index];
+    child.reply({ userAgent: 'codex' });
+    await vi.waitFor(() => assert.equal(child.sent().at(-1)?.method, 'skills/list'));
+    assert.deepEqual(child.sent().at(-1)?.params, { cwds: [cwd] });
+    assert.equal(
+      child.sent().some((m) => m.method === 'turn/start'),
+      false,
+    );
+    const path = index === 0 ? 'C:\\skills\\recap\\SKILL.md' : `${cwd}/skills/recap/SKILL.md`;
+    child.reply({ data: [{ cwd, skills: [{ name: 'Recap', path, enabled: true }], errors: [] }] });
+    await vi.waitFor(() => assert.equal(child.sent().at(-1)?.method, 'thread/resume'));
+    child.reply({ thread: { id: 'thread-7' } });
+    const session = await starting;
+    if (index) children[index - 1].say(JSON.stringify({ method: 'skills/changed', params: {} }) + '\n');
+    const delivery = session.prompt({ text: queued.text, assets: [] });
+    await vi.waitFor(() => assert.equal(child.sent().at(-1)?.method, 'turn/start'));
+    assert.deepEqual(child.sent().at(-1)?.params, {
+      threadId: 'thread-7',
+      input: [
+        { type: 'text', text },
+        { type: 'skill', name: 'Recap', path },
+      ],
+    });
+    child.reply({ turn: { id: `turn-${index}` } });
+    await delivery;
+    child.exit(0);
+    assert.equal(session.state().exited, true);
+  }
+  assert.equal(children.length, 3);
 });
 
 test('a live Codex session replaces its commands after a skill change', async () => {
