@@ -391,7 +391,7 @@ export interface RailCard {
   // The `agentRun` fact, independent of its bucket. Archiving does not change it.
   // Lens figures and `is:agentrun` exclude agent runs whether or not the Archived switch is on.
   runByAgent: boolean;
-  // Agent wording for the card meta row. Pinned agent runs use the agent-run phrase.
+  // Agent-run origin wording for row metadata, independent of the section that draws it.
   agentWord: string;
   // The newest turn's status, or null when unknown.
   // The card uses the corresponding turn card border color. Its accessible name also states the status as text.
@@ -1128,7 +1128,6 @@ export function railSessions(
     // Stored state can contain both flags. A pinned archived card must stay in its folded bucket rather than occupying the list top.
     const onTop = pinnedTop.has(s.id) && !archived;
     // Archiving and pinning take precedence over inferred session origins. Archived runs stay in Archived. Pinned runs stay at the top.
-    // Only pinned runs need the origin phrase because they appear without a heading that supplies it.
     const agentRun = s.agentRun === true && !archived;
     const runByAgent = s.agentRun === true;
     const status = statuses.get(s.id) ?? null;
@@ -1184,7 +1183,7 @@ export function railSessions(
     const nameBeforeAge = [
       archived ? 'archived' : null,
       onTop ? 'pinned' : null,
-      agentRun ? CARD_ACTIONS.agentRun : null,
+      runByAgent ? CARD_ACTIONS.agentRun : null,
       s.agent,
       runningSince === null && status !== 'subagents' && status !== 'background' ? statusName : null,
     ]
@@ -1207,8 +1206,7 @@ export function railSessions(
         : unread !== false
           ? RAIL_MENU_SECTIONS.unread
           : RAIL_MENU_SECTIONS.read;
-    // Pinned agent runs use the agent-run phrase because they sit outside the agent-run heading.
-    const agentWord = agentRun && onTop ? CARD_ACTIONS.agentRun : s.agent;
+    const agentWord = runByAgent ? CARD_ACTIONS.agentRun : s.agent;
     out.push({
       id: s.id,
       persisted: s.persisted === true,

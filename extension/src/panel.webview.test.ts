@@ -2065,7 +2065,20 @@ import { isSearch, searchScope, searchScopeName, searchTurns } from './turnsearc
 import { LABEL_NAME_LIMIT, labelTypedNotes } from './domain/labels.ts';
 import { canStartSearch, matchSessions, parseSessionQuery, queryToken, withWhere } from './domain/session-query.ts';
 import { labelSuggestions, whereNote } from './view/session-query.ts';
-import { RAIL_FOLDS, railBuckets, railCountButtons, railCounts, railTimeSlot, sessionCount } from './view/rail.ts';
+import {
+  RAIL_FOLDS,
+  railBuckets,
+  railCountButtons,
+  railCounts,
+  railTimeSlot,
+  sessionCount,
+  railSections,
+  railHoverLines,
+  railAgentWordShown,
+  railAgentRunWord,
+  RAIL_GROUP_BY,
+  RAIL_SHOWN_BUCKETS,
+} from './view/rail.ts';
 import { formatRelative } from './view/time.ts';
 import { outsideCommentMarks } from './webview/comments.ts';
 import { detailRowsFor } from './webview/card-rows.ts';
@@ -8979,69 +8992,154 @@ const browserComposerPresentationSource = fs.readFileSync(
 const queueLiveSource = fs.readFileSync(path.join(__dirname, 'webview', 'queue-live.ts'), 'utf8');
 const railSource = fs.readFileSync(path.join(__dirname, 'webview', 'rail.ts'), 'utf8');
 
-test('pinned agent-run session cards keep the provider visible and classification available', () => {
+test('saved views retain agent-run origin in full rows and compact hovers', () => {
   const [source] = sourceNodes(railSource, (node) => ts.isFunctionDeclaration(node) && node.name?.text === 'RailRow');
   assert.ok(source, 'the session list row renderer is missing');
   const compiled = ts.transpileModule(source, { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText;
+  const [hoverSource] = sourceNodes(
+    railSource,
+    (node) =>
+      ts.isCallExpression(node) &&
+      node.expression.getText() === 'options.hintBody' &&
+      node.arguments[0]?.getText() === "'railcard'",
+  );
+  assert.ok(hoverSource, 'the session list hover renderer is missing');
+  const hoverCompiled = ts.transpileModule(hoverSource, {
+    compilerOptions: { target: ts.ScriptTarget.ES2022 },
+  }).outputText;
   for (const agent of ['Codex', 'Claude', '']) {
-    const [card] = railSessions(
-      [{ id: 'run', label: 'Agent work', agent, when: '2:32 PM', at: 4200, relative: 'now', agentRun: true }],
-      new Map(),
-      new Map(),
-      new Map(),
-      new Set(),
-      null,
-      new Set(['run']),
-      new Map(),
-      {},
-      {},
-    );
-    const elements: Array<{ tag: string; props: Record<string, unknown>; text: unknown }> = [];
-    const h = (tag: string, props: Record<string, unknown>, text: unknown) => {
-      elements.push({ tag, props, text });
-      return { tag, props, text };
-    };
-    const dependencies = {
-      h,
-      railTimeSlot,
-      railCacheState: () => null,
-      railCardHint: () => ({}),
-      railRowId: () => 'row',
-      railRowKey: () => 'row',
-      railCardClass: () => 'railcard',
-      drawnRailCardName: () => card.nameBeforeAge,
-      inlineText: (parts: unknown) => parts,
-      railAgentWordShown: () => true,
-      railStatusClass: () => 'railstatus',
-      railAgeFormat: () => () => 'now',
-      RailStats: () => null,
-      RailLabels: () => null,
-      actionProps: () => ({}),
-      labelIcon: () => null,
-      archiveIcon: () => null,
-      pinIcon: () => null,
-    };
-    const draw = new Function(...Object.keys(dependencies), `${compiled}\nreturn RailRow;`)(
-      ...Object.values(dependencies),
-    );
-    draw({
-      card,
-      stats: [],
-      bucket: 'pinned',
-      owner: {},
-      options: { platform: 'Win32', words: {}, rowContext: () => '' },
-      now: 4200,
-      density: 'comfortable',
-      labelsOpen: null,
-    });
-    const provider = elements.find((element) => element.props?.class === 'railagent');
-    assert.ok(provider);
-    assert.equal(provider.text, agent || 'run by an agent');
-    assert.equal(provider.props.title, 'run by an agent');
-    assert.equal(card.runByAgent, true);
-    assert.equal(card.agentWord, 'run by an agent');
-    assert.match(card.nameBeforeAge, /run by an agent/);
-    if (agent) assert.ok(card.nameBeforeAge.includes(agent));
+    for (const placement of ['view', 'archived-view', 'pinned', 'archived', 'agent'] as const) {
+      for (const groupBy of RAIL_GROUP_BY) {
+        const cards = railSessions(
+          [{ id: 'run', label: 'Agent work', agent, when: '2:32 PM', at: 4200, relative: 'now', agentRun: true }],
+          new Map(),
+          new Map(),
+          new Map(),
+          new Set(placement === 'archived' || placement === 'archived-view' ? ['run'] : []),
+          null,
+          new Set(placement === 'pinned' ? ['run'] : []),
+          new Map(),
+          {},
+          {},
+        );
+        const inView = placement === 'view' || placement === 'archived-view';
+        const views = inView
+          ? ['perf', 'review'].map((id) => ({
+              id,
+              name: id,
+              query: 'title:work',
+              archived: placement === 'archived-view',
+            }))
+          : [];
+        const { sections } = railSections(cards, 4200, views, 'latest', RAIL_SHOWN_BUCKETS, { groupBy });
+        if (inView) {
+          assert.equal(
+            sections.filter((section) => section.id.startsWith('railgroup:view:') && section.cards.length).length,
+            2,
+          );
+        }
+        for (const section of sections.filter((section) => section.cards.length)) {
+          const card = section.cards[0];
+          assert.equal(card.id, 'run');
+          if (placement === 'agent') assert.equal(section.id, RAIL_FOLDS.agent);
+          const elements: Array<{ tag: string; props: Record<string, unknown>; text: unknown }> = [];
+          const h = (tag: string, props: Record<string, unknown>, text: unknown) => {
+            elements.push({ tag, props, text });
+            return { tag, props, text };
+          };
+          const dependencies = {
+            h,
+            railTimeSlot,
+            railCacheState: () => null,
+            railCardHint: () => ({}),
+            railRowId: () => 'row',
+            railRowKey: () => 'row',
+            railCardClass: () => 'railcard',
+            drawnRailCardName: () => card.nameBeforeAge,
+            inlineText: (parts: unknown) => parts,
+            railAgentWordShown,
+            railAgentRunWord,
+            railStatusClass: () => 'railstatus',
+            railAgeFormat: () => () => 'now',
+            RailStats: () => null,
+            RailLabels: () => null,
+            actionProps: () => ({}),
+            labelIcon: () => null,
+            archiveIcon: () => null,
+            pinIcon: () => null,
+          };
+          const draw = new Function(...Object.keys(dependencies), `${compiled}\nreturn RailRow;`)(
+            ...Object.values(dependencies),
+          );
+          draw({
+            card,
+            stats: [],
+            bucket: section.id,
+            owner: {},
+            options: { platform: 'Win32', words: {}, rowContext: () => '' },
+            now: 4200,
+            density: 'comfortable',
+            labelsOpen: null,
+          });
+          const words = elements
+            .filter((element) => String(element.props?.class).split(' ').includes('railagent'))
+            .map((element) => element.text);
+          const origin = placement === 'agent' ? [] : ['run by an agent'];
+          assert.deepEqual(
+            words,
+            [agent, ...origin].filter(Boolean),
+            `${agent}: ${placement}: ${groupBy}: ${section.id}`,
+          );
+          const hover = railHoverLines(card, 4200, CARD_ACTIONS, section.id);
+          const row = elements.find((element) => element.props?.['data-rail-bucket'] === section.id);
+          assert.ok(row, 'the rendered row has no section');
+          let drawnHover: ReturnType<typeof railHoverLines> | null = null;
+          new Function(
+            'options',
+            'drawnCards',
+            'railHoverCard',
+            'railHoverLines',
+            'document',
+            'drawnStats',
+            'NO_RAIL_STATS',
+            hoverCompiled,
+          )(
+            {
+              words: CARD_ACTIONS,
+              hintBody: (_kind: string, render: (anchor: unknown) => unknown) =>
+                render({
+                  dataset: { session: card.id },
+                  closest: (selector: string) => {
+                    assert.equal(selector, '[data-rail-bucket]');
+                    return { dataset: { railBucket: row.props['data-rail-bucket'] } };
+                  },
+                }),
+            },
+            [card],
+            (_document: unknown, lines: ReturnType<typeof railHoverLines>) => {
+              drawnHover = lines;
+            },
+            railHoverLines,
+            {},
+            {},
+            [],
+          );
+          assert.deepEqual(
+            drawnHover!.meta.filter((part) => part.kind === 'agentRun').map((part) => part.text),
+            origin,
+          );
+          assert.deepEqual(
+            hover.meta.filter((part) => part.kind === 'agentRun').map((part) => part.text),
+            origin,
+          );
+          assert.equal(hover.meta[0].text, agent);
+          assert.equal(card.runByAgent, true);
+          assert.equal(card.agentWord, 'run by an agent');
+          assert.match(card.nameBeforeAge, /run by an agent/);
+          if (agent) assert.ok(card.nameBeforeAge.includes(agent));
+        }
+      }
+    }
   }
 });
 const sessionRenameSource = fs.readFileSync(path.join(__dirname, 'webview', 'session-rename.ts'), 'utf8');
@@ -9130,6 +9228,7 @@ const panelSource = [
   outerPanelHostSource,
   chromeSource,
   railSource,
+  railHoverSource,
   browserComposerSource,
   requestsSource,
   composerControlsSource,

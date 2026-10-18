@@ -5844,14 +5844,17 @@ body {
    spent, which at the narrowest the sash allows is a pixel or so. The status word never
    does. It can be a phrase rather than a single word, `needs input` beside `running` and
    `failed`, and none of the three survives a cut. */
+.railmeta,
+.railorigin {
+  margin-top: 2px;
+  font-size: var(--t-small);
+  color: var(--idle);
+}
 .railmeta {
   display: flex;
   flex-wrap: nowrap;
   gap: 8px;
   align-items: baseline;
-  margin-top: 2px;
-  font-size: var(--t-small);
-  color: var(--idle);
 }
 .railmeta > * {
   min-width: 0;

@@ -970,7 +970,8 @@ test('each density draws its own age, and the tick compares with it', () => {
 test("a compact card's hover opens the card under its name, and a state hint stays in both densities", () => {
   const card = {
     label: 'Fix login (retry)',
-    agentWord: 'Codex',
+    agent: 'Codex',
+    agentWord: 'run by an agent',
     nameAfterAge: '$1.20 estimated, 4 turns, labelled release',
   };
   const state = { hint: 'Subagents still running', detail: 'Takes a prompt now' };
@@ -984,13 +985,14 @@ test("a compact card's hover opens the card under its name, and a state hint sta
   assert.equal(both.body, 'railcard');
   assert.equal(both.hint, card.label, 'a compact state card led with its state rather than its name');
   assert.ok(both.detail?.includes(state.detail) && both.detail.includes(card.nameAfterAge), both.detail);
-  const bare = railCardHint({ label: card.label, agentWord: '', nameAfterAge: '' }, 'compact', state);
+  assert.equal(both.detail, `${state.detail}\n${card.agent}, ${card.nameAfterAge}`);
+  const bare = railCardHint({ label: card.label, agent: '', nameAfterAge: '' }, 'compact', state);
   assert.deepEqual(bare, { hint: card.label, detail: state.detail, lines: false, body: 'railcard' });
 });
 
 // Accessible names include the agent, figures and labels in both densities. Descriptions omit those repeated words and retain the state explanation.
 test("a compact card's linked description never repeats what the name already says", () => {
-  const card = { label: 'Fix login', agentWord: 'Codex', nameAfterAge: '$1.20 estimated, 4 turns, labelled release' };
+  const card = { label: 'Fix login', agent: 'Codex', nameAfterAge: '$1.20 estimated, 4 turns, labelled release' };
   assert.equal(railCardHint(card, 'comfortable', null).description, undefined);
   const compactPlain = railCardHint(card, 'compact', null);
   assert.equal(compactPlain.description, '', 'a compact card with only dropped words kept a linked description');
@@ -998,13 +1000,13 @@ test("a compact card's linked description never repeats what the name already sa
   assert.equal(railCardHint(card, 'comfortable', state).description, undefined);
   const compactState = railCardHint(card, 'compact', state);
   assert.equal(compactState.description, state.detail);
-  assert.ok(!compactState.description!.includes(card.agentWord), compactState.description);
+  assert.ok(!compactState.description!.includes(card.agent), compactState.description);
   assert.ok(!compactState.description!.includes(card.nameAfterAge), compactState.description);
 });
 
 // A compact row with only an agent word needs no second detail line or linked description. Its hover still shows the card.
 test('a compact card with one dropped word carries no detail and no description', () => {
-  const hint = railCardHint({ label: 'Fix login', agentWord: 'Codex', nameAfterAge: '' }, 'compact', null);
+  const hint = railCardHint({ label: 'Fix login', agent: 'Codex', nameAfterAge: '' }, 'compact', null);
   assert.equal(hint.hint, 'Fix login');
   assert.equal(hint.body, 'railcard');
   assert.equal(hint.detail, undefined, 'a single dropped word wrote a second hover line');

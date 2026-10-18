@@ -82,6 +82,7 @@ import {
   normalizeRailGroupBy,
   railAgeFormat,
   railAgentWordShown,
+  railAgentRunWord,
   railCardHint,
   railHoverLines,
   railStatusClass,
@@ -634,6 +635,7 @@ function RailRow({
     labelsOpen.session === card.id &&
     (labelsOpen.section === null ? !repeat : labelsOpen.section === bucket);
   const slot = railTimeSlot(card.status, !!card.unsentWord, card.subagents, card.commands);
+  const origin = railAgentRunWord(card, bucket);
   const subagents = card.status === 'subagents' ? (card.subagents ?? 0) : null;
   const commands = card.status === 'background' ? (card.commands ?? 0) : null;
   const archiveKey = /^Mac/.test(options.platform || '') ? 'Backspace' : 'Delete';
@@ -682,13 +684,7 @@ function RailRow({
             'div',
             { class: 'railmeta' },
             inlineText([
-              railAgentWordShown(bucket)
-                ? h(
-                    'span',
-                    { class: 'railagent', title: card.agentWord !== card.agent ? card.agentWord : undefined },
-                    card.agent || card.agentWord,
-                  )
-                : null,
+              railAgentWordShown(bucket) && card.agent ? h('span', { class: 'railagent' }, card.agent) : null,
               h('span', { class: railStatusClass(card.status) }, [
                 slot.word || '',
                 card.status === 'running' && card.runningSince !== null && railRunningWord(card.runningSince, now)
@@ -717,6 +713,7 @@ function RailRow({
               slot.time && cache && card.cache ? cacheIcon(cache, card.cache, now) : null,
             ]),
           ),
+          origin ? h('div', { class: 'railagent railorigin' }, origin) : null,
           h(RailStats, { stats, contextClass: options.contextClass }),
           h(RailLabels, { card }),
         ],
@@ -1724,7 +1721,16 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
     const id = anchor.dataset.session;
     const card = drawnCards.find((candidate) => candidate.id === id);
     return card
-      ? railHoverCard(document, railHoverLines(card, Date.now(), options.words), drawnStats[card.id] ?? NO_RAIL_STATS)
+      ? railHoverCard(
+          document,
+          railHoverLines(
+            card,
+            Date.now(),
+            options.words,
+            anchor.closest<HTMLElement>('[data-rail-bucket]')?.dataset.railBucket,
+          ),
+          drawnStats[card.id] ?? NO_RAIL_STATS,
+        )
       : null;
   });
   let labels: readonly LabelSuggestionCount[] = [];
