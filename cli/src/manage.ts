@@ -26,7 +26,11 @@ export function readPromptFile(file: string): string {
       count += read;
     }
     if (count > 48 * 1024) throw new Error('The prompt file exceeds 48 KiB.');
-    return new TextDecoder('utf-8', { fatal: true }).decode(buffer.subarray(0, count)).replace(/^\uFEFF/, '');
+    try {
+      return new TextDecoder('utf-8', { fatal: true }).decode(buffer.subarray(0, count)).replace(/^\uFEFF/, '');
+    } catch {
+      throw new Error('The prompt file is not valid UTF-8.');
+    }
   } finally {
     fs.closeSync(fd);
   }

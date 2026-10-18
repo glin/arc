@@ -28,6 +28,7 @@ import {
 } from '../src/standalone.ts';
 import { DispatchReceipts } from '../../extension/src/dispatchreceipts.ts';
 import { findCommand } from '../src/commands.ts';
+import { readPromptFile } from '../src/manage.ts';
 import { payloadSha256 } from '../../extension/src/sessionwrites.ts';
 import { projectSlug } from '../../extension/src/transcript.ts';
 import { build } from 'esbuild';
@@ -1116,6 +1117,19 @@ test('wait deadlines use a controlled clock and never start a worker', async () 
   await vi.advanceTimersByTimeAsync(25);
   assert.deepEqual(await waited, { launchId: launch.launchId, state: 'deadline' });
 });
+test('prompt files reject invalid UTF-8 with an identifying error', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'arc-prompt-'));
+  const file = path.join(directory, 'prompt.txt');
+  try {
+    fs.writeFileSync(file, Buffer.from([0xc3, 0x28]));
+    assert.throws(() => readPromptFile(file), /The prompt file is not valid UTF-8/);
+    fs.writeFileSync(file, '\uFEFFReview this.');
+    assert.equal(readPromptFile(file), 'Review this.');
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test('native report rejects missing, empty, oversized and invalid UTF-8 files', () => {
   const { home } = fixture();
   const file = path.join(home, 'native.md');

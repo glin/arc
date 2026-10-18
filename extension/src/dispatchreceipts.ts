@@ -127,18 +127,17 @@ export function outsideDispatchStorage(root: string, file: string, platform = pr
     paths.isAbsolute(file) && (paths.isAbsolute(relative) || relative === '..' || relative.startsWith(`..${paths.sep}`))
   );
 }
+class DispatchFileChanged extends Error {}
+
 function read(file: string, limit = JSON_BYTES, exactSize = false): string {
   safePath(file);
   const before = identity(file);
   const fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
   try {
     const stat = fs.fstatSync(fd, { bigint: true });
-    if (
-      !stat.isFile() ||
-      stat.size > BigInt(limit) ||
-      !equalIdentity(before, { dev: String(stat.dev), ino: String(stat.ino) })
-    )
-      throw new Error('The dispatch file is unavailable or replaced.');
+    if (!stat.isFile() || stat.size > BigInt(limit)) throw new Error('The dispatch file is unavailable or replaced.');
+    if (!equalIdentity(before, { dev: String(stat.dev), ino: String(stat.ino) }))
+      throw new DispatchFileChanged('The dispatch file is unavailable or replaced.');
     const buffer = Buffer.alloc((exactSize ? Number(stat.size) : limit) + 1);
     let length = 0;
     while (length < buffer.length) {
@@ -149,11 +148,21 @@ function read(file: string, limit = JSON_BYTES, exactSize = false): string {
     if (length > limit || (exactSize && length > Number(stat.size)))
       throw new Error('The dispatch file exceeds its read allowance.');
     const text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(buffer.subarray(0, length));
-    if (!equalIdentity(before, identity(file)) || Buffer.byteLength(text) > limit)
-      throw new Error('The dispatch file changed during the read.');
+    if (!equalIdentity(before, identity(file)))
+      throw new DispatchFileChanged('The dispatch file changed during the read.');
+    if (Buffer.byteLength(text) > limit) throw new Error('The dispatch file changed during the read.');
     return text;
   } finally {
     fs.closeSync(fd);
+  }
+}
+function readChanging(file: string): string {
+  try {
+    return read(file);
+  } catch (error) {
+    if (error instanceof DispatchFileChanged)
+      throw new Error('The dispatch write changed during recovery. Try again.', { cause: error });
+    throw error;
   }
 }
 function exclusive(file: string, text: string): void {
@@ -335,11 +344,11 @@ export class DispatchReceipts {
     const rawFile = this.artifact(id, 'worker.log');
     const checkpoint = this.file(id, 'capture.json');
     let state: CaptureState = fs.existsSync(checkpoint)
-      ? JSON.parse(read(checkpoint))
+      ? JSON.parse(readChanging(checkpoint))
       : this.lock(
           id,
           (): CaptureState => {
-            if (fs.existsSync(checkpoint)) return JSON.parse(read(checkpoint));
+            if (fs.existsSync(checkpoint)) return JSON.parse(readChanging(checkpoint));
             // A capture without an alias witness cannot claim its current pathname.
             const existing = fs.existsSync(rawFile);
             if (existing) safePath(rawFile);
@@ -377,7 +386,7 @@ export class DispatchReceipts {
       throw new Error('The captured worker output was truncated.');
     }
     const reload = () => {
-      const current = JSON.parse(read(checkpoint)) as CaptureState;
+      const current = JSON.parse(readChanging(checkpoint)) as CaptureState;
       safePath(rawFile);
       if (!equalIdentity(current.raw, identity(rawFile)) || !equalIdentity(state.raw, current.raw))
         throw new Error('The captured worker output was replaced.');
@@ -452,20 +461,25 @@ export class DispatchReceipts {
               (!cursor || cursor.identity === `${stat.dev}:${stat.ino}`)
             );
           });
-          safePath(alias);
-          if (
-            complete &&
-            fs.fstatSync(raw).size === state.bytes &&
-            state.alias &&
-            state.aliasBytes === end &&
-            equalIdentity(state.alias, identity(alias)) &&
-            fs.statSync(alias).size === end
-          ) {
-            if (!options.background) return false;
-            const native = this.artifact(id, 'native.log');
-            safePath(native);
-            const stat = fs.statSync(native);
-            if (stat.isFile() && stat.size === end) return false;
+          if (complete && fs.fstatSync(raw).size === state.bytes) {
+            let nativeComplete = !options.background;
+            if (options.background) {
+              const native = this.artifact(id, 'native.log');
+              safePath(native);
+              const stat = fs.statSync(native);
+              nativeComplete = stat.isFile() && stat.size === end;
+            }
+            if (nativeComplete) {
+              if (!state.alias) return false;
+              try {
+                safePath(alias);
+                if (!equalIdentity(state.alias, identity(alias))) return false;
+              } catch (error) {
+                if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+                throw error;
+              }
+              if (state.aliasBytes === end && fs.statSync(alias).size === end) return false;
+            }
           }
         } catch {
           /* Changed or unavailable files retain the locked repair path. */
@@ -1159,7 +1173,7 @@ export class DispatchReceipts {
       if (fs.existsSync(file)) {
         let current = file;
         for (let steps = 0; ; steps++) {
-          const heldText = read(current);
+          const heldText = current === file ? readChanging(current) : read(current);
           const held = JSON.parse(heldText);
           if (held.launchId !== id || !Number.isSafeInteger(held.pid) || held.pid < 1 || !DISPATCH_ID.test(held.token))
             throw new Error('The dispatch write owner is unavailable.');

@@ -283,6 +283,98 @@ test.each(
   }
 });
 
+test.each(['capture.json', 'capture-write.lock'].flatMap((name) => ['open', 'read'].map((phase) => ({ name, phase }))))(
+  'concurrent capture replacement remains retryable at $name during $phase',
+  ({ name, phase }) => {
+    const { receipts, launch, home } = fixture();
+    const alias = path.join(home, 'live.log');
+    const standalone = receipts.reserve({
+      ...launch,
+      transport: 'standalone',
+      standalone: {
+        provider: 'codex',
+        command: 'codex',
+        args: [],
+        cwd: home,
+        model: 'test',
+        effort: 'high',
+        name: 'test',
+        agentRun: false,
+        background: false,
+        sessionHint: null,
+        logAlias: alias,
+        deadlineMs: 10_000,
+      },
+    });
+    const id = standalone.launchId;
+    const a = receipts.capture(id, 2);
+    const b = new DispatchReceipts(home).capture(id, 2);
+    const source = receipts.artifact(id, 'stdout.log');
+    fs.writeFileSync(source, 'abcdefghij');
+    const stat = fs.statSync(source, { bigint: true });
+    const cursor = { offset: 10, identity: `${stat.dev}:${stat.ino}` };
+    const target = path.join(path.dirname(source), name);
+    const open = fs.openSync;
+    const read = fs.readSync;
+    const lstat = fs.lstatSync;
+    let descriptor: number | undefined;
+    let readStarted = false;
+    let fired = false;
+    const replace = () => {
+      fired = true;
+      b.write(Buffer.from('abcdefghij'), 'stdout.log', cursor);
+    };
+    const opening = vi.spyOn(fs, 'openSync').mockImplementation((file, ...args) => {
+      if (!fired && String(file) === target && phase === 'open') replace();
+      const fd = (open as any)(file, ...args);
+      if (!fired && String(file) === target) descriptor = fd;
+      return fd;
+    });
+    const reading = vi.spyOn(fs, 'readSync').mockImplementation(((fd: number, ...args: any[]) => {
+      const count = (read as any)(fd, ...args);
+      if (fd === descriptor) readStarted = true;
+      return count;
+    }) as typeof fs.readSync);
+    const stating = vi.spyOn(fs, 'lstatSync').mockImplementation(((file: any, ...args: any[]) => {
+      const stat = (lstat as any)(file, ...args);
+      if (readStarted && String(file) === target && phase === 'read') {
+        fired = true;
+        return Object.assign(Object.create(Object.getPrototypeOf(stat)), stat, {
+          ino: typeof stat.ino === 'bigint' ? stat.ino + 1n : stat.ino + 1,
+        });
+      }
+      return stat;
+    }) as typeof fs.lstatSync);
+    syncBuiltinESMExports();
+    try {
+      assert.throws(
+        () =>
+          name === 'capture.json' ? a.cursor('stdout.log') : a.write(Buffer.from('abcdefghij'), 'stdout.log', cursor),
+        /dispatch write changed during recovery/,
+      );
+      assert.equal(fired, true);
+      opening.mockRestore();
+      reading.mockRestore();
+      stating.mockRestore();
+      syncBuiltinESMExports();
+      if (phase === 'read') b.write(Buffer.from('abcdefghij'), 'stdout.log', cursor);
+      assert.equal(a.cursor('stdout.log').offset, 10);
+      for (let pass = 0; pass < 8 && a.flushAlias(); pass++) {
+        /* Drain bounded alias writes. */
+      }
+      assert.equal(fs.readFileSync(alias, 'utf8'), 'abcdefghij');
+      assert.equal(fs.readFileSync(receipts.artifact(id, 'worker.log'), 'utf8'), 'abcdefghij');
+    } finally {
+      opening.mockRestore();
+      reading.mockRestore();
+      stating.mockRestore();
+      syncBuiltinESMExports();
+      a.close();
+      b.close();
+    }
+  },
+);
+
 test.each([false, true])(
   'idle alias flushes preserve lock history and repair changed files, background %s',
   (background) => {
@@ -352,8 +444,19 @@ test.each([false, true])(
       fs.renameSync(alias, alias + '.old');
       fs.writeFileSync(alias, 'Replacement');
       const replaced = history();
-      a.flushAlias();
-      assert.notDeepEqual(history(), replaced);
+      for (let pass = 0; pass < 12; pass++) assert.equal(a.flushAlias(), false);
+      assert.deepEqual(history(), replaced);
+      assert.equal(fs.readFileSync(alias, 'utf8'), 'Replacement');
+      fs.unlinkSync(alias);
+      for (let pass = 0; pass < 12; pass++) assert.equal(a.flushAlias(), false);
+      assert.deepEqual(history(), replaced);
+      assert.equal(fs.existsSync(alias), false);
+      fs.writeFileSync(alias, 'Replacement');
+      const checkpoint = path.join(directory, 'capture.json');
+      const state = JSON.parse(fs.readFileSync(checkpoint, 'utf8'));
+      fs.writeFileSync(checkpoint, JSON.stringify({ ...state, alias: null }));
+      for (let pass = 0; pass < 12; pass++) assert.equal(a.flushAlias(), false);
+      assert.deepEqual(history(), replaced);
       assert.equal(fs.readFileSync(alias, 'utf8'), 'Replacement');
       assert.equal(
         fs.readFileSync(background ? receipts.artifact(standalone.launchId, 'native.log') : raw, 'utf8'),
