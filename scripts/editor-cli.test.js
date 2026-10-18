@@ -5,6 +5,20 @@ const path = require('node:path');
 const { spawnSync } = require('node:child_process');
 
 const resolver = path.join(__dirname, 'editor-cli.sh');
+const skillSource = path.join(__dirname, '../cli/skills/arc-sessions');
+// The installed skill carries SKILL.md and every reference file beside it.
+function expectSkillCopy(directory) {
+  const files = (root) =>
+    fs
+      .readdirSync(root, { recursive: true })
+      .map(String)
+      .filter((file) => fs.statSync(path.join(root, file)).isFile())
+      .sort();
+  assert.ok(files(skillSource).length > 1);
+  assert.deepEqual(files(directory), files(skillSource));
+  for (const file of files(skillSource))
+    assert.deepEqual(fs.readFileSync(path.join(directory, file)), fs.readFileSync(path.join(skillSource, file)));
+}
 function gitBashExecutable() {
   if (process.platform !== 'win32') {
     const result = spawnSync('bash', ['-c', 'command -v bash'], { encoding: 'utf8' });
@@ -161,12 +175,9 @@ test.each([[['codex']], [['claude']], [['claude', 'codex']]])(
       assert.deepEqual(fs.readdirSync(f.temporary), []);
       fs.rmSync(f.source, { recursive: true });
       for (const agent of agents) {
-        const file = path.join(f.dir, agent === 'claude' ? '.claude' : '.agents', 'skills/arc-sessions/SKILL.md');
-        assert.deepEqual(
-          fs.readFileSync(file),
-          fs.readFileSync(path.join(__dirname, '../cli/skills/arc-sessions/SKILL.md')),
-        );
-        assert.equal(fs.lstatSync(file).isSymbolicLink(), false);
+        const directory = path.join(f.dir, agent === 'claude' ? '.claude' : '.agents', 'skills/arc-sessions');
+        expectSkillCopy(directory);
+        assert.equal(fs.lstatSync(path.join(directory, 'SKILL.md')).isSymbolicLink(), false);
       }
       assert.match(result.stdout, /"skills":"completed"/);
       const receipt = JSON.parse(result.stdout.trim().split('\n').at(-1));
@@ -201,10 +212,7 @@ test('Git Bash cancellation after skill child success retains source until exit 
     assert.match(result.stdout, /"skills":"completed"/);
     assert.match(result.stdout, /"cancellation":143/);
     assert.deepEqual(fs.readdirSync(f.temporary), []);
-    assert.deepEqual(
-      fs.readFileSync(path.join(f.dir, '.agents/skills/arc-sessions/SKILL.md')),
-      fs.readFileSync(path.join(__dirname, '../cli/skills/arc-sessions/SKILL.md')),
-    );
+    expectSkillCopy(path.join(f.dir, '.agents/skills/arc-sessions'));
   } finally {
     f.cleanup();
   }
@@ -1001,50 +1009,52 @@ function installerFixture() {
   };
 }
 
-test('source setup refuses an incomplete checkout before building when its canonical session skill is absent', () => {
-  const f = installerFixture();
-  try {
-    fs.unlinkSync(path.join(f.source, 'cli/skills/arc-sessions/SKILL.md'));
-    const result = f.run(['--local', '--no-hooks', 'code']);
-    assert.equal(result.status, 2, result.stderr);
-    assert.match(result.stderr, /--local requires a complete Arc source directory/);
-    assert.doesNotMatch(result.commands, /npm |editor /);
-  } finally {
-    fs.rmSync(f.dir, { recursive: true, force: true });
-  }
-});
+for (const missing of ['SKILL.md', 'compaction.md']) {
+  test(`source setup refuses an incomplete checkout before building when its session skill lacks ${missing}`, () => {
+    const f = installerFixture();
+    try {
+      fs.unlinkSync(path.join(f.source, 'cli/skills/arc-sessions', missing));
+      const result = f.run(['--local', '--no-hooks', 'code']);
+      assert.equal(result.status, 2, result.stderr);
+      assert.match(result.stderr, /--local requires a complete Arc source directory/);
+      assert.doesNotMatch(result.commands, /npm |editor /);
+    } finally {
+      fs.rmSync(f.dir, { recursive: true, force: true });
+    }
+  });
 
-test('downloaded incomplete source refuses globally before build or native installation', () => {
-  const f = installerFixture();
-  try {
-    fs.unlinkSync(path.join(f.source, 'cli/skills/arc-sessions/SKILL.md'));
-    const archive = spawnSync(
-      bashExecutable,
-      [
-        '-c',
-        'tar -czf "$1" -C "$2" "$3"',
-        'bash',
-        bashPath(f.dir) + '/source.tar.gz',
-        bashPath(f.dir),
-        path.basename(f.source),
-      ],
-      { encoding: 'utf8' },
-    );
-    assert.equal(archive.status, 0, archive.stderr);
-    const result = f.run(
-      ['--remote', '--no-hooks', '--skill-agent', 'codex', 'code'],
-      { CLAUDE_CONFIG_DIR: '' },
-      { skills: true },
-    );
-    assert.equal(result.status, 2, result.stdout + result.stderr);
-    assert.match(result.stderr, /downloaded archive lacks required Arc source files/);
-    assert.doesNotMatch(result.commands, /npm|editor/);
-    assert.equal(fs.existsSync(path.join(f.dir, '.agents/skills')), false);
-    assert.deepEqual(fs.readdirSync(f.temporary), []);
-  } finally {
-    f.cleanup();
-  }
-});
+  test(`downloaded incomplete source refuses globally before build or native installation when the session skill lacks ${missing}`, () => {
+    const f = installerFixture();
+    try {
+      fs.unlinkSync(path.join(f.source, 'cli/skills/arc-sessions', missing));
+      const archive = spawnSync(
+        bashExecutable,
+        [
+          '-c',
+          'tar -czf "$1" -C "$2" "$3"',
+          'bash',
+          bashPath(f.dir) + '/source.tar.gz',
+          bashPath(f.dir),
+          path.basename(f.source),
+        ],
+        { encoding: 'utf8' },
+      );
+      assert.equal(archive.status, 0, archive.stderr);
+      const result = f.run(
+        ['--remote', '--no-hooks', '--skill-agent', 'codex', 'code'],
+        { CLAUDE_CONFIG_DIR: '' },
+        { skills: true },
+      );
+      assert.equal(result.status, 2, result.stdout + result.stderr);
+      assert.match(result.stderr, /downloaded archive lacks required Arc source files/);
+      assert.doesNotMatch(result.commands, /npm|editor/);
+      assert.equal(fs.existsSync(path.join(f.dir, '.agents/skills')), false);
+      assert.deepEqual(fs.readdirSync(f.temporary), []);
+    } finally {
+      f.cleanup();
+    }
+  });
+}
 
 test(
   'local installation refreshes its directory marketplace and migrates owned legacy hooks after plugin success',

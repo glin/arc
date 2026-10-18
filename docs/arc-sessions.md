@@ -11,7 +11,7 @@ The `arc-sessions` skill lets a Claude Code or Codex agent start, inspect, and o
 | `arc-sessions` skill | Gives an agent instructions for bounded session work through the CLI. | Source installer, explicit CLI setup, or a manual copy or link. |
 | `arc-hooks` Claude plugin | Captures first-touch file snapshots for Claude file diffs. | Source installer or Claude plugin marketplace. |
 
-The skill source is [`cli/skills/arc-sessions/SKILL.md`](../cli/skills/arc-sessions/SKILL.md). The standalone CLI package includes it under `skills/arc-sessions/SKILL.md`. The VSIX includes the canonical skill directory under `dist/tools/skills/arc-sessions`, with its paths and digests in the tool identity. The Claude plugin does not include the skill.
+The skill source is [`cli/skills/arc-sessions/SKILL.md`](../cli/skills/arc-sessions/SKILL.md). `SKILL.md` links to reference files beside it, and every artifact and installation carries them. The source installer, the bundler, and the skill payload loader refuse a skill that lacks a file `SKILL.md` links. The standalone CLI package includes the directory under `skills/arc-sessions`. The VSIX includes the canonical skill directory under `dist/tools/skills/arc-sessions`, with its paths and digests in the tool identity. The Claude plugin does not include the skill.
 
 Bundled files are part of an artifact. An installed skill exists in an agent's skill directory. A release requires publication of the corresponding artifact. None of these states establishes the others.
 
@@ -142,7 +142,7 @@ An agent reports a known session with a named Markdown link:
 [name](arc-session:<id>)
 ```
 
-Links open only inside the live extension panel that contains the invoking session. The [skill's reporting rules](../cli/skills/arc-sessions/SKILL.md#report-session-links) define identity sources, label escaping, destination encoding, scope, and plain-text fallbacks.
+Links open only inside the live extension panel that contains the invoking session. The [skill's reporting rules](../cli/skills/arc-sessions/links.md) define identity sources, label escaping, destination encoding, scope, and plain-text fallbacks.
 
 The response link complements the Dispatched link. Its receipt, attribution, and delegated cost accounting remain part of that relationship. [Architecture](architecture.md#module-boundaries) owns response-link resolution and navigation.
 

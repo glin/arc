@@ -34,7 +34,11 @@ export function bundledTools(dist, sourceRoot, build) {
   };
   for (const folder of ['.claude-plugin', 'hooks', 'scripts'])
     visit(plugin, folder, 'plugin', '../plugins/arc-hooks', true);
-  visit(path.join(sourceRoot, 'cli/skills/arc-sessions'), '', 'skills/arc-sessions', '../cli/skills/arc-sessions');
+  const skills = path.join(sourceRoot, 'cli/skills/arc-sessions');
+  visit(skills, '', 'skills/arc-sessions', '../cli/skills/arc-sessions');
+  const definition = fs.readFileSync(path.join(skills, 'SKILL.md'), 'utf8');
+  for (const [, reference] of definition.matchAll(/\]\(([\w-]+\.md)(?:#[^)]*)?\)/g))
+    if (!fs.existsSync(path.join(skills, reference))) throw new Error(`The session skill lacks ${reference}.`);
   copy(path.join(plugin, 'LICENSE'), 'plugin/LICENSE');
   const launchers = {
     arc: '#!/bin/sh\nELECTRON_RUN_AS_NODE=1 exec "$ARC_EDITOR_EXECUTABLE" "${0%/*}/../cli/arc.cjs" "$@"\n',

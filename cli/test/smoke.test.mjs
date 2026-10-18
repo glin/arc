@@ -18,7 +18,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, sep } from 'node:path';
 import { test } from 'vitest';
 import { COMMANDS, checkCommandHelp, renderCommandHelp, renderOverviewHelp } from '../src/commands.ts';
 import { fileURLToPath } from 'node:url';
@@ -28,6 +28,16 @@ import * as fs from 'node:fs';
 import mutableFs from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
 import { readSkillPayload, skillTemporaryRoots } from '../src/skillfiles.ts';
+
+// Every regular file under the canonical skill directory, as slash-separated relative paths. The reference files ship beside SKILL.md.
+function skillFiles(directory) {
+  return fs
+    .readdirSync(directory, { recursive: true })
+    .map(String)
+    .filter((file) => fs.statSync(join(directory, file)).isFile())
+    .map((file) => file.split(sep).join('/'))
+    .sort();
+}
 import { operateSkill } from '../src/skills.ts';
 import { runCollect } from '../src/collect.ts';
 import { SESSION_PAGE_ERRORS } from '../../extension/src/sessionreads.ts';
@@ -932,11 +942,14 @@ test('the compiled skill CLI validates selectors before destination writes and r
       ['installed', 'installed'],
     );
     assert.equal(fs.existsSync(join(home, 'ignored')), false);
-    for (const directory of ['.claude', '.agents'])
-      assert.deepEqual(
-        readFileSync(join(home, directory, 'skills/arc-sessions/SKILL.md')),
-        readFileSync(new URL('../skills/arc-sessions/SKILL.md', import.meta.url)),
-      );
+    const canonical = fileURLToPath(new URL('../skills/arc-sessions', import.meta.url));
+    assert.ok(skillFiles(canonical).length > 1);
+    for (const directory of ['.claude', '.agents']) {
+      const installedSkill = join(home, directory, 'skills/arc-sessions');
+      assert.deepEqual(skillFiles(installedSkill), skillFiles(canonical));
+      for (const file of skillFiles(canonical))
+        assert.deepEqual(readFileSync(join(installedSkill, file)), readFileSync(join(canonical, file)));
+    }
     const launcher = join(home, 'launcher');
     fs.symlinkSync(join(cli, '..'), launcher, 'junction');
     try {
@@ -989,12 +1002,23 @@ test('session skill payload selection follows each executing artifact and reject
       fs.cpSync(source, join(root, payload), { recursive: true });
       if (executable.startsWith('npm/')) writeFileSync(join(root, 'npm/package.json'), '{"name":"@glin/arc"}');
       const selected = readSkillPayload(join(root, executable));
-      assert.deepEqual(selected.files.get('SKILL.md'), readFileSync(join(source, 'SKILL.md')));
+      assert.deepEqual([...selected.files.keys()].sort(), skillFiles(source));
+      for (const [file, bytes] of selected.files) assert.deepEqual(bytes, readFileSync(join(source, file)));
       identities.push(selected.identity);
       fs.renameSync(join(root, payload), join(root, payload) + '.unavailable');
       assert.throws(() => readSkillPayload(join(root, executable)), /ENOENT/);
     }
     assert.equal(new Set(identities).size, 1);
+    const linked = join(root, 'release/tools/skills/arc-sessions/compaction.md');
+    fs.renameSync(
+      join(root, 'release/tools/skills/arc-sessions.unavailable'),
+      join(root, 'release/tools/skills/arc-sessions'),
+    );
+    fs.rmSync(linked);
+    assert.throws(
+      () => readSkillPayload(join(root, 'release/tools/cli/arc.cjs')),
+      /cannot find the session skill file compaction\.md/,
+    );
     assert.throws(() => readSkillPayload(join(root, 'unknown.cjs')), /layout/);
     assert.throws(() => readSkillPayload('dist/arc.cjs'), /absolute/);
   } finally {
@@ -2222,7 +2246,8 @@ test('the packed package installs only arc globally and runs locally offline', (
   mkdirSync(consumer);
   mkdirSync(join(packable, 'dist'), { recursive: true });
   mkdirSync(join(packable, 'skills/arc-sessions'), { recursive: true });
-  for (const file of ['package.json', 'README.md', 'LICENSE', 'dist/arc.cjs', 'skills/arc-sessions/SKILL.md']) {
+  const skillPaths = skillFiles(join(packageRoot, 'skills/arc-sessions')).map((file) => 'skills/arc-sessions/' + file);
+  for (const file of ['package.json', 'README.md', 'LICENSE', 'dist/arc.cjs', ...skillPaths]) {
     copyFileSync(join(packageRoot, file), join(packable, file));
   }
   writeFileSync(join(packable, 'dist/obsolete.cjs'), 'obsolete bundle');
@@ -2287,15 +2312,13 @@ test('the packed package installs only arc globally and runs locally offline', (
       'README.md',
       'dist/arc.cjs',
       'package.json',
-      'skills/arc-sessions/SKILL.md',
+      ...skillPaths,
     ]);
     npm(['install', '--global', '--prefix', prefix, tarball]);
     const installedRoot = join(prefix, process.platform === 'win32' ? 'node_modules' : 'lib/node_modules', '@glin/arc');
     const manifest = JSON.parse(readFileSync(join(installedRoot, 'package.json'), 'utf8'));
-    assert.equal(
-      readFileSync(join(installedRoot, 'skills/arc-sessions/SKILL.md'), 'utf8'),
-      readFileSync(join(packageRoot, 'skills/arc-sessions/SKILL.md'), 'utf8'),
-    );
+    for (const file of skillPaths)
+      assert.equal(readFileSync(join(installedRoot, file), 'utf8'), readFileSync(join(packageRoot, file), 'utf8'));
     assert.equal(manifest.name, '@glin/arc');
     assert.deepEqual(manifest.bin, { arc: 'dist/arc.cjs' });
     assert.equal(manifest.license, 'MIT');

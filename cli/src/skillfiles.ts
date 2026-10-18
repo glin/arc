@@ -49,6 +49,9 @@ export function readSkillPayload(executable: string): SkillPayload {
     throw new Error('Arc cannot identify its session skill. Rebuild or reinstall Arc.');
   if (!/^name: arc-sessions\r?$/m.test(definition.split(/\r?\n---(?:\r?\n|$)/)[0]))
     throw new Error('Arc cannot identify its session skill. Rebuild or reinstall Arc.');
+  for (const [, reference] of definition.matchAll(/\]\(([\w-]+\.md)(?:#[^)]*)?\)/g))
+    if (!files.has(reference))
+      throw new Error(`Arc cannot find the session skill file ${reference}. Rebuild or reinstall Arc.`);
   const identity = createHash('sha256');
   for (const [relative, bytes] of files) {
     identity.update(JSON.stringify(relative));

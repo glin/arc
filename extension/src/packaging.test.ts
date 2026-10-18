@@ -7,6 +7,7 @@ import nativeFs from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
 import { tempDir } from './temproot.ts';
 import * as path from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { createHash } from 'node:crypto';
 import { buildSync, transformSync } from 'esbuild';
 import { inflateRawSync } from 'node:zlib';
@@ -481,6 +482,7 @@ test('the canonical session skill ships as regular exact files with independent 
     .map((file) => file.split(path.sep).join('/'))
     .sort();
   assert.ok(expected.includes('SKILL.md'));
+  assert.ok(expected.includes('compaction.md'), 'the reference files ship beside SKILL.md');
   assert.deepEqual(
     Object.keys(payload.files)
       .filter((file) => file.startsWith('skills/'))
@@ -498,6 +500,33 @@ test('the canonical session skill ships as regular exact files with independent 
       createHash('sha256').update(bytes).digest('hex'),
     );
   }
+});
+
+test('the session skill stays under the agent read cap and links only to files it ships', () => {
+  const source = path.join(extensionRoot, '../cli/skills/arc-sessions');
+  const definition = fs.readFileSync(path.join(source, 'SKILL.md'), 'utf8');
+  // A Codex skill read stops near 11,000 tokens, so the file the agent reads first stays small.
+  assert.ok(Buffer.byteLength(definition) <= 17_000, 'SKILL.md is over its 17,000 byte limit');
+  const linked = [...definition.matchAll(/\]\(([\w-]+\.md)\)/g)].map((match) => match[1]);
+  assert.ok(linked.length > 0);
+  for (const file of linked) assert.equal(fs.lstatSync(path.join(source, file)).isFile(), true, file);
+});
+
+test('the bundler refuses a session skill that lacks a file its SKILL.md links', async () => {
+  const root = tempDir('arc-skill-links-');
+  const sourceRoot = path.join(root, 'source');
+  const dist = path.join(root, 'extension/dist');
+  fs.mkdirSync(dist, { recursive: true });
+  fs.writeFileSync(path.join(dist, 'cli.cjs'), '');
+  fs.writeFileSync(path.join(dist, 'windowpipe.exe'), '');
+  fs.mkdirSync(sourceRoot);
+  fs.copyFileSync(path.join(extensionRoot, '../LICENSE'), path.join(sourceRoot, 'LICENSE'));
+  fs.cpSync(path.join(extensionRoot, '../plugins'), path.join(sourceRoot, 'plugins'), { recursive: true });
+  fs.cpSync(path.join(extensionRoot, '../cli/skills'), path.join(sourceRoot, 'cli/skills'), { recursive: true });
+  const { bundledTools } = await import(pathToFileURL(path.join(extensionRoot, 'scripts/bundled-tools.mjs')).href);
+  assert.ok(bundledTools(dist, sourceRoot, {}).identity.files['skills/arc-sessions/compaction.md']);
+  fs.rmSync(path.join(sourceRoot, 'cli/skills/arc-sessions/compaction.md'));
+  assert.throws(() => bundledTools(dist, sourceRoot, {}), /lacks compaction\.md/);
 });
 
 test('the extension package contains exactly the intended files', () => {

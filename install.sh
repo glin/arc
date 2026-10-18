@@ -10,6 +10,13 @@ complete_source() {
   for file in extension/package.json extension/package-lock.json cli/skills/arc-sessions/SKILL.md scripts/editor-cli.sh scripts/register-hooks.js scripts/install-claude-hooks.sh scripts/check-claude-marketplace.js .claude-plugin/marketplace.json plugins/arc-hooks/.claude-plugin/plugin.json; do
     [ -f "$root/$file" ] || return 1
   done
+  local skill="$root/cli/skills/arc-sessions" text link='\]\(([A-Za-z0-9_-]+\.md)[)#]'
+  text="$(<"$skill/SKILL.md")"
+  while [[ "$text" =~ $link ]]; do
+    [ -f "$skill/${BASH_REMATCH[1]}" ] || return 1
+    text="${text#*"${BASH_REMATCH[0]}"}"
+  done
+  return 0
 }
 
 current_editor_cli() {
