@@ -75,9 +75,9 @@ test(
       assert.equal(await summary.evaluate((node) => node === document.activeElement), true);
       await page.keyboard.press('Enter');
       await page.waitForFunction(() => document.querySelector<HTMLDetailsElement>('.context-messages')?.open);
-      assert.equal(await disclosure.locator('li').count(), 7);
+      assert.equal(await disclosure.locator('li').count(), 6);
       const spoken = await disclosure.ariaSnapshot();
-      for (const text of ['Redirected context', '5.0%', '0 tokens', '3,000 tokens', 'of used context'])
+      for (const text of ['Redirected context', '5.0%', '3,000 tokens', 'of used context'])
         assert.ok(spoken.includes(text), text);
       assert.ok(await disclosure.getByText('Unattributed', { exact: true }).getAttribute('title'));
       await page.keyboard.press('Tab');

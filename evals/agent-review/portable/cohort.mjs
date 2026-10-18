@@ -2,7 +2,19 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
-import { assert, captureInstructions, copyInputs, encoded, loadCase, qualify, readJson, root, sha } from './core.mjs';
+import {
+  assert,
+  captureInstructions,
+  copyInputs,
+  eachLimited,
+  encoded,
+  loadCase,
+  qualificationLimit,
+  qualifyAsync,
+  readJson,
+  root,
+  sha,
+} from './core.mjs';
 
 const hash = /^[a-f0-9]{64}$/;
 const categories = ['diff-local', 'cross-file', 'runtime-interaction'];
@@ -100,13 +112,13 @@ function auditAssigned(loaded, entry, instructions) {
   };
 }
 
-export function qualifyCohort(file) {
+// Entries qualify together. The first failure in cohort order is reported.
+export async function qualifyCohort(file) {
   const cohort = readCohort(file);
   const instructions = captureInstructions(root, [], cohort.audited_instructions);
-  const results = [];
   const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'arc-review-cohort-'));
   try {
-    for (const entry of cohort.entries) {
+    const results = await eachLimited(cohort.entries, qualificationLimit, async (entry, signal) => {
       const loaded = loadCase(entry.case_id);
       assert(
         loaded.item.kind === entry.kind &&
@@ -157,17 +169,18 @@ export function qualifyCohort(file) {
       const candidate = path.join(scratch, entry.case_id, 'candidate');
       copyInputs(path.join(loaded.fixture, 'input'), candidate, loaded.item.inputs);
       const script = path.join(loaded.fixture, 'qualify.mjs');
-      const result = qualify(script, candidate, path.join(loaded.fixture, 'reference'), entry.kind);
+      const result = await qualifyAsync(script, candidate, path.join(loaded.fixture, 'reference'), entry.kind, signal);
       if (provenance.source.change_origin === 'reconstructed-causal-introduction') {
         const base = provenance.reconstructed_base;
         assert(base && base.source_anchor === provenance.source.candidate, 'reconstructed base identity');
         checkedFile(path.join(loaded.fixture, 'base'), base.path, base.source_sha256);
         checkedFile(path.join(loaded.fixture, 'base'), 'runtime.cjs', base.runtime_sha256);
-        const boundary = qualify(
+        const boundary = await qualifyAsync(
           script,
           path.join(loaded.fixture, 'base'),
           path.join(loaded.fixture, 'reference'),
           'clean',
+          signal,
         );
         assert(encoded(boundary.candidate) === encoded(base.result), 'reconstructed base qualification');
       }
@@ -185,20 +198,21 @@ export function qualifyCohort(file) {
         assert(changed.length > 0, `missing reinjection: ${entry.case_id}`);
         for (const input of changed)
           fs.writeFileSync(path.join(mutated, input.path), fs.readFileSync(path.join(candidate, input.path)));
-        reinjection = qualify(script, mutated, path.join(loaded.fixture, 'reference'), 'bug').candidate;
+        reinjection = (await qualifyAsync(script, mutated, path.join(loaded.fixture, 'reference'), 'bug', signal))
+          .candidate;
       }
       assert(
         encoded(result) === encoded(entry.qualification.result),
         `qualification receipt changed: ${entry.case_id}`,
       );
-      results.push({
+      return {
         case_id: entry.case_id,
         result,
         reinjection,
         audit,
         source_files: provenance.source_files.length,
-      });
-    }
+      };
+    });
     return {
       schema: 'arc-review-cohort-qualification-v1',
       cohort_id: cohort.id,

@@ -4,11 +4,13 @@ import path from 'node:path';
 import {
   assert,
   captureInstructions,
+  eachLimited,
   encoded,
   externalRunDirectory,
   listCases,
   loadCase,
   prepareFixed,
+  qualificationLimit,
   readJson,
   root,
   runIdentity,
@@ -57,10 +59,10 @@ function numeric(raw, name, max = Infinity) {
 function loaded(id) {
   return id === currentId ? currentRecipe() : loadCase(id);
 }
-function prepared(source, workspace, instructions) {
+function prepared(source, workspace, instructions, signal) {
   return source.item.source_mode === 'current'
-    ? prepareCurrent(source, workspace, instructions)
-    : prepareFixed(source, workspace, instructions);
+    ? prepareCurrent(source, workspace, instructions, signal)
+    : prepareFixed(source, workspace, instructions, signal);
 }
 function ordering(cells, seed) {
   return cells.sort((a, b) => sha(`${seed}:${a.id}`).localeCompare(sha(`${seed}:${b.id}`)));
@@ -81,20 +83,19 @@ function printHelp() {
   process.stdout.write('report --run <run-directory>\n');
 }
 
-function validate() {
+async function validate() {
   const cases = listCases();
   const instructions = captureInstructions(root);
-  let checked = 0;
-  for (const source of [...cases, currentRecipe()]) {
+  const sources = [...cases, currentRecipe()];
+  await eachLimited(sources, qualificationLimit, async (source, signal) => {
     const temp = externalRunDirectory();
     try {
-      prepared(source, path.join(temp, 'workspace'), instructions);
-      checked++;
+      await prepared(source, path.join(temp, 'workspace'), instructions, signal);
     } finally {
       fs.rmSync(temp, { recursive: true, force: true });
     }
-  }
-  process.stdout.write(`Qualified ${checked} portable cases and recipes.\n`);
+  });
+  process.stdout.write(`Qualified ${sources.length} portable cases and recipes.\n`);
 }
 
 function configFromArgs() {
@@ -210,12 +211,12 @@ function registrationFor(config, cells, sources, instructions, budget, mode = 'l
   };
 }
 
-function workspaceFor(run, cell, source, instructions, audited = false) {
+async function workspaceFor(run, cell, source, instructions, audited = false, signal) {
   const folder = path.join(run, 'attempts', cell.id);
   fs.mkdirSync(folder, { recursive: true });
   const workspace = path.join(folder, 'workspace');
   fs.mkdirSync(workspace);
-  const prep = prepared(source, workspace, instructions);
+  const prep = await prepared(source, workspace, instructions, signal);
   fs.writeFileSync(path.join(folder, 'candidate.diff'), prep.diff);
   fs.writeFileSync(path.join(folder, 'prompt.txt'), prep.prompt);
   persist(path.join(folder, 'preparation.json'), {
@@ -278,11 +279,13 @@ async function runExperiment() {
     });
     persist(path.join(run, 'preflight.json'), { status: 'passed', native_sandbox: cli.sandboxPreflight });
   }
+  const prepare = (cell, signal) =>
+    workspaceFor(run, cell, lookup.get(cell.case_id), instructions, !!config.audited_instructions, signal);
+  // A dry run launches nothing, so its workspaces qualify together.
+  if (dry) await eachLimited(records, qualificationLimit, prepare);
   let spent = 0;
-  for (const cell of records) {
-    const source = lookup.get(cell.case_id);
-    const { folder, workspace, prompt } = workspaceFor(run, cell, source, instructions, !!config.audited_instructions);
-    if (dry) continue;
+  for (const cell of dry ? [] : records) {
+    const { folder, workspace, prompt } = await prepare(cell);
     if (!canReserve(spent, config.reservation_usd, budget)) {
       process.stdout.write(`Launch budget exhausted before ${cell.id}.\n`);
       break;
@@ -332,7 +335,7 @@ async function runExperiment() {
   report(run);
 }
 
-function demo() {
+async function demo() {
   const config = readJson(path.join(suite, 'experiments', 'single.json'));
   config.cases = [currentId, 'portable-017'];
   config.models = ['scripted-demo'];
@@ -361,10 +364,11 @@ function demo() {
       'Demonstration response, not a model result: scripts/register-hooks.js removes an unrelated command when it shares a group with an old Arc hook. The user hook stops running after source installation.',
     'portable-017': 'Demonstration response, not a model result: no material defect found in the scoped change.',
   };
-  const records = cells.map((cell) => {
+  const records = [];
+  for (const cell of cells) {
     const source = sources.find((entry) => entry.item.id === cell.case_id);
-    workspaceFor(run, cell, source, instructions);
-    return {
+    await workspaceFor(run, cell, source, instructions);
+    records.push({
       ...cell,
       reply_id: sha(`${registration.run_id}:${cell.id}`).slice(0, 16),
       case_hash: registration.cases.find((entry) => entry.id === cell.case_id).case_hash,
@@ -379,8 +383,8 @@ function demo() {
         usage: null,
         elapsedMs: 0,
       },
-    };
-  });
+    });
+  }
   persist(path.join(run, 'cells.json'), records);
   const sheet = worksheet(run);
   for (const reply of sheet.replies) {
@@ -408,18 +412,18 @@ try {
     process.stdout.write(`${currentId} bug interaction-routing current\n`);
   } else if (command === 'validate') {
     noExtra();
-    validate();
+    await validate();
   } else if (command === 'qualify' || command === 'check-cohort') {
     const file = option('--cohort');
     noExtra();
     assert(file, 'missing --cohort');
-    const qualification = qualifyCohort(path.resolve(file));
+    const qualification = await qualifyCohort(path.resolve(file));
     const result = command === 'qualify' ? qualification : cohortCoverage(path.resolve(file));
     process.stdout.write(encoded(result));
     if (!result.complete) process.exitCode = 1;
   } else if (command === 'demo') {
     noExtra();
-    demo();
+    await demo();
   } else if (command === 'run') await runExperiment();
   else if (command === 'resume') {
     const original = option('--run');

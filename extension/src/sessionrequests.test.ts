@@ -53,8 +53,21 @@ import {
   type SessionPageRequest,
 } from './sessionreads.ts';
 import { openReadWindow, closeReadWindow } from './readmeter.ts';
-import { terminalOwnership, type TerminalShell } from './terminalownership.ts';
+import { terminalOwnership, type ProcessAncestry, type TerminalShell } from './terminalownership.ts';
 import { requestWindow, requesterIdentity } from './sessionrequests.ts';
+
+// Terminal cases route on a fixed caller ancestry and fixed identities.
+// The real process table can take longer than the product deadline on a loaded machine.
+// terminalownership.test.ts reads the real process table.
+const callerBirth = '1000';
+const identities = async (pids: number[]) => pids.map((pid) => ({ pid, birth: callerBirth }));
+vi.mock('./terminalownership.ts', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./terminalownership.ts')>()),
+  collectProcessAncestry: async (): Promise<ProcessAncestry> => ({
+    platform: process.platform as ProcessAncestry['platform'],
+    chain: [{ pid: process.pid, parent: 0, birth: callerBirth }],
+  }),
+}));
 import {
   GUARDED_SEND_REASONS,
   SessionReadObservations,
@@ -2763,8 +2776,14 @@ test.skipIf(process.platform !== 'win32')(
     };
     let writes = 0;
     let release!: () => void;
+    // The write reaches the handler through the client process and its pipe helper, so the test awaits the handler itself.
+    let written!: () => void;
+    const firstWrite = new Promise<void>((resolve) => {
+      written = resolve;
+    });
     channel.setRequestHandler(async () => {
       writes++;
+      written();
       await new Promise<void>((resolve) => {
         release = resolve;
       });
@@ -2781,7 +2800,8 @@ test.skipIf(process.platform !== 'win32')(
       const discovered = await response(send('discover'));
       assert.equal(discovered.data.windows[0].hostId, channel.hostId);
       const accepted = send('start', params, requestId);
-      await vi.waitFor(() => assert.equal(writes, 1));
+      await firstWrite;
+      assert.equal(writes, 1);
       process.kill(entry.transportPid!);
       const disconnected = await response(accepted);
       assert.equal(disconnected.data.status, 'unknown');
@@ -6150,8 +6170,8 @@ test('integrated setups selects its owning window among competing same-folder ch
   channels.push(competitor);
   let roots: TerminalShell[] = [{ processId: Promise.resolve(process.pid) }];
   const source = { allowed: () => true, terminals: () => roots };
-  channel.setTerminalOwnership(terminalOwnership(source));
-  competitor.setTerminalOwnership(terminalOwnership({ allowed: () => true, terminals: () => [] }));
+  channel.setTerminalOwnership(terminalOwnership(source, identities));
+  competitor.setTerminalOwnership(terminalOwnership({ allowed: () => true, terminals: () => [] }, identities));
   const first = vi.fn<() => Record<string, unknown>>(() => ({ owner: channel.hostId }));
   const second = vi.fn<() => Record<string, unknown>>(() => ({ owner: competitor.hostId }));
   channel.setRequestHandler(first);

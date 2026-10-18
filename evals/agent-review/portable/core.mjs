@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -171,17 +171,69 @@ function checkQualification(output, label) {
   return parsed.checks;
 }
 
+// A lone qualification script must finish within this time.
+const qualificationTimeout = 15000;
+// Each qualification starts two Node processes, and several qualifications run at once.
+export const qualificationLimit = Math.max(1, Math.min(4, Math.floor(os.availableParallelism() / 2)));
+// A script that shares the machine with every process allowed at once gets the time a lone script gets.
+const sharedQualificationTimeout = qualificationTimeout * 2 * qualificationLimit;
+
+function qualificationChecks(result, label) {
+  assert(
+    result.status === 0 && !result.error,
+    `qualification failed: ${label}: ${result.stderr || result.error?.message || ''}`,
+  );
+  return checkQualification(result.stdout, label);
+}
+
+// Runs a qualification script without blocking, so several workspaces qualify at once.
+function qualificationRun(script, folder, signal) {
+  return new Promise((resolve) => {
+    const child = spawn(process.execPath, [script, folder], { stdio: ['ignore', 'pipe', 'pipe'], signal });
+    let stdout = '';
+    let stderr = '';
+    let error;
+    let settled = false;
+    child.stdout.setEncoding('utf8').on('data', (text) => (stdout += text));
+    child.stderr.setEncoding('utf8').on('data', (text) => (stderr += text));
+    const settle = (status) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve({ status, stdout, stderr, error });
+    };
+    const timer = setTimeout(() => {
+      error = new Error(`timed out after ${sharedQualificationTimeout} ms`);
+      child.kill();
+    }, sharedQualificationTimeout);
+    // An aborted run still settles after its process closes, so the caller can remove the workspace.
+    child.on('error', (failure) => {
+      error ??= failure;
+      if (child.pid === undefined) settle(null);
+    });
+    child.on('close', settle);
+  });
+}
+
 export function qualify(script, candidate, reference, kind) {
-  const run = (folder, label) => {
-    const result = spawnSync(process.execPath, [script, folder], { encoding: 'utf8', timeout: 15000 });
-    assert(
-      result.status === 0 && !result.error,
-      `qualification failed: ${label}: ${result.stderr || result.error?.message || ''}`,
-    );
-    return checkQualification(result.stdout, label);
-  };
-  const before = run(candidate, 'candidate');
-  const after = run(reference, 'reference');
+  const run = (folder) =>
+    spawnSync(process.execPath, [script, folder], { encoding: 'utf8', timeout: qualificationTimeout });
+  return qualified(run(candidate), run(reference), kind);
+}
+
+// Runs the candidate and reference qualifications together.
+// An aborted signal stops both scripts.
+export async function qualifyAsync(script, candidate, reference, kind, signal) {
+  const [before, after] = await Promise.all([
+    qualificationRun(script, candidate, signal),
+    qualificationRun(script, reference, signal),
+  ]);
+  return qualified(before, after, kind);
+}
+
+function qualified(candidateResult, referenceResult, kind) {
+  const before = qualificationChecks(candidateResult, 'candidate');
+  const after = qualificationChecks(referenceResult, 'reference');
   assert(
     encoded(before.map(({ id: checkId, role }) => ({ id: checkId, role }))) ===
       encoded(after.map(({ id: checkId, role }) => ({ id: checkId, role }))),
@@ -287,7 +339,41 @@ export function externalRunDirectory(out) {
   return folder;
 }
 
-export function prepareFixed(loaded, workspace, instructions) {
+// Applies an asynchronous step to every item with at most `limit` in flight.
+// Items start in order, each after the previous step reaches its first wait, so a step that fails
+// at once starts no later item. A failure aborts the steps for later items and starts no new ones.
+// Earlier items still settle, so the thrown failure is the first in item order.
+export async function eachLimited(items, limit, step) {
+  const results = new Array(items.length);
+  const controllers = [];
+  const running = new Set();
+  let failedAt = Infinity;
+  for (let index = 0; index < items.length && index < failedAt; index++) {
+    while (running.size >= limit) await Promise.race(running);
+    if (index > failedAt) break;
+    controllers[index] = new AbortController();
+    const task = (async () => {
+      try {
+        results[index] = { value: await step(items[index], controllers[index].signal) };
+      } catch (error) {
+        results[index] = { error };
+        if (index < failedAt) {
+          failedAt = index;
+          controllers.forEach((controller, at) => at > index && controller.abort());
+        }
+      }
+    })();
+    running.add(task);
+    void task.then(() => running.delete(task));
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  await Promise.all(running);
+  const failed = results.find((result) => result && 'error' in result);
+  if (failed) throw failed.error;
+  return results.map((result) => result.value);
+}
+
+export async function prepareFixed(loaded, workspace, instructions, signal) {
   const { item, fixture } = loaded;
   copyInputs(path.join(fixture, 'input'), workspace, item.inputs);
   const context = path.join(workspace, 'context');
@@ -296,7 +382,13 @@ export function prepareFixed(loaded, workspace, instructions) {
     fs.mkdirSync(path.dirname(dest), { recursive: true });
     fs.writeFileSync(dest, doc.bytes, { flag: 'wx' });
   }
-  const result = qualify(path.join(fixture, 'qualify.mjs'), workspace, path.join(fixture, 'reference'), item.kind);
+  const result = await qualifyAsync(
+    path.join(fixture, 'qualify.mjs'),
+    workspace,
+    path.join(fixture, 'reference'),
+    item.kind,
+    signal,
+  );
   const prompt = regular(path.join(fixture, 'prompt.txt')).toString('utf8');
   const diff = regular(path.join(fixture, 'candidate.diff')).toString('utf8');
   return {

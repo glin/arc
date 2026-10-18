@@ -6,6 +6,9 @@ const os = require('node:os');
 const path = require('node:path');
 const { pathToFileURL } = require('node:url');
 
+// The heaviest cases start dozens of Node and Git processes. On a loaded Windows machine one process start can take a second.
+const HEAVY = { timeout: 120_000 };
+
 const root = path.resolve(__dirname, '..');
 const cli = path.join(root, 'evals/agent-review/cli.mjs');
 const portable = path.join(root, 'evals/agent-review/run.mjs');
@@ -820,7 +823,7 @@ describe('frozen continuation', () => {
     fs.writeFileSync(descendant, "require('node:net').createServer().listen(0);\n");
     fs.writeFileSync(
       worker,
-      `const fs=require('node:fs');const {spawn}=require('node:child_process');const child=spawn(process.execPath,[${JSON.stringify(descendant)}],{stdio:'ignore'});fs.writeFileSync(${JSON.stringify(path.join(attempt, 'descendant.json'))},JSON.stringify({pid:child.pid,workerPid:process.pid}));require('node:net').createServer().listen(0);`,
+      `const fs=require('node:fs');const {spawn}=require('node:child_process');const child=spawn(process.execPath,[${JSON.stringify(descendant)}],{stdio:'ignore'});fs.writeFileSync(${JSON.stringify(path.join(attempt, 'descendant.json.tmp'))},JSON.stringify({pid:child.pid,workerPid:process.pid}));fs.renameSync(${JSON.stringify(path.join(attempt, 'descendant.json.tmp'))},${JSON.stringify(path.join(attempt, 'descendant.json'))});require('node:net').createServer().listen(0);`,
     );
     const runnerFile = path.join(attempt, 'runner.mjs');
     fs.writeFileSync(
@@ -874,7 +877,7 @@ function oldRunId(folder) {
 }
 
 describe('portable review runner', () => {
-  test('partial production cohort qualifies without Git after archive relocation', async () => {
+  test('partial production cohort qualifies without Git after archive relocation', HEAVY, async () => {
     const source = fs.mkdtempSync(path.join(os.tmpdir(), 'arc-review-corpus-source-'));
     const relocated = source + '-moved';
     try {
@@ -927,7 +930,7 @@ describe('portable review runner', () => {
     } finally {
       for (const folder of [source, relocated]) fs.rmSync(folder, { recursive: true, force: true });
     }
-  }, 120_000);
+  });
 
   test('runtime diversity excludes missing mechanism identifiers', async () => {
     const { readCohort, cohortCoverage } = await import('../evals/agent-review/portable/cohort.mjs');
@@ -968,7 +971,7 @@ describe('portable review runner', () => {
     assert.equal(cohortCoverage(cohortFile).actual.runtime_mechanisms, 2);
   });
 
-  test('production cohort rejects source, instruction, answer and receipt drift', async () => {
+  test('production cohort rejects source, instruction, answer and receipt drift', HEAVY, async () => {
     const archive = fs.mkdtempSync(path.join(os.tmpdir(), 'arc-review-corpus-drift-'));
     try {
       fs.cpSync(path.join(root, 'evals/agent-review'), path.join(archive, 'evals/agent-review'), { recursive: true });
@@ -980,10 +983,10 @@ describe('portable review runner', () => {
         if (!backup.has(file)) backup.set(file, fs.readFileSync(file));
         fs.writeFileSync(file, bytes);
       };
-      const mutate = (fn, pattern) => {
+      const mutate = async (fn, pattern) => {
         try {
           fn();
-          assert.throws(() => qualifyCohort(cohortFile), pattern);
+          await assert.rejects(qualifyCohort(cohortFile), pattern);
         } finally {
           for (const [file, bytes] of backup) fs.writeFileSync(file, bytes);
           backup.clear();
@@ -992,24 +995,27 @@ describe('portable review runner', () => {
       const cohort = () => JSON.parse(fs.readFileSync(cohortFile));
       const fixture = path.join(suite, 'fixtures/portable-024');
       const caseFile = path.join(suite, 'portable/cases/portable-024.json');
-      mutate(() => write(path.join(fixture, 'input/runtime.cjs'), 'altered'), /changed input/);
-      mutate(() => write(path.join(fixture, 'reference/runtime.cjs'), 'altered'), /cohort hash changed/);
-      mutate(() => write(path.join(suite, 'fixtures/portable-025/base/runtime.cjs'), 'altered'), /cohort hash changed/);
-      mutate(
+      await mutate(() => write(path.join(fixture, 'input/runtime.cjs'), 'altered'), /changed input/);
+      await mutate(() => write(path.join(fixture, 'reference/runtime.cjs'), 'altered'), /cohort hash changed/);
+      await mutate(
+        () => write(path.join(suite, 'fixtures/portable-025/base/runtime.cjs'), 'altered'),
+        /cohort hash changed/,
+      );
+      await mutate(
         () => write(path.join(suite, 'fixtures/review-diversity-instructions/CLAUDE.md'), 'altered'),
         /changed audited instruction/,
       );
-      mutate(() => {
+      await mutate(() => {
         const value = cohort();
         value.entries[4].readiness = 'disputed';
         write(cohortFile, json(value));
       }, /case readiness/);
-      mutate(() => {
+      await mutate(() => {
         const value = cohort();
         value.targets.bugs = 4;
         write(cohortFile, json(value));
       }, /coverage targets changed/);
-      mutate(() => {
+      await mutate(() => {
         const value = cohort(),
           p = path.join(fixture, 'provenance.json'),
           provenance = JSON.parse(fs.readFileSync(p));
@@ -1018,7 +1024,7 @@ describe('portable review runner', () => {
         value.entries[0].provenance_sha256 = digest(fs.readFileSync(p));
         write(cohortFile, json(value));
       }, /source object mismatch/);
-      mutate(() => {
+      await mutate(() => {
         const value = cohort(),
           item = JSON.parse(fs.readFileSync(caseFile)),
           p = path.join(fixture, 'prompt.txt');
@@ -1028,7 +1034,7 @@ describe('portable review runner', () => {
         value.entries[0].case_sha256 = digest(fs.readFileSync(caseFile));
         write(cohortFile, json(value));
       }, /answer leakage/);
-      mutate(() => {
+      await mutate(() => {
         const value = cohort(),
           item = JSON.parse(fs.readFileSync(caseFile)),
           p = path.join(fixture, 'provenance.json'),
@@ -1047,12 +1053,12 @@ describe('portable review runner', () => {
         value.entries[0].provenance_sha256 = digest(fs.readFileSync(p));
         write(cohortFile, json(value));
       }, /missing source import/);
-      mutate(() => {
+      await mutate(() => {
         const value = cohort();
         value.entries[0].qualification.result.candidate[0].pass = true;
         write(cohortFile, json(value));
       }, /qualification receipt changed/);
-      mutate(() => {
+      await mutate(() => {
         const value = cohort(),
           p = path.join(fixture, 'qualify.mjs');
         write(
@@ -1074,7 +1080,7 @@ describe('portable review runner', () => {
         const changed = cohort();
         changed.audited_instructions = 'evals/agent-review/fixtures/linked-instructions/manifest.json';
         write(cohortFile, json(changed));
-        assert.throws(() => qualifyCohort(cohortFile), /linked audited instruction directory/);
+        await assert.rejects(qualifyCohort(cohortFile), /linked audited instruction directory/);
       } finally {
         fs.unlinkSync(linked);
       }
@@ -1089,7 +1095,7 @@ describe('portable review runner', () => {
     } finally {
       fs.rmSync(archive, { recursive: true, force: true });
     }
-  }, 120_000);
+  });
 
   test('billing qualification does not read external Codex history', () => {
     const folder = path.join(temp, 'billing-qualification');
@@ -1148,7 +1154,10 @@ syncBuiltinESMExports();
   test('stops the matrix after an unverified or mismatched completed review', async () => {
     const { canReserve, estimateCost } = await import('../evals/agent-review/portable/live.mjs');
     const source = fs.readFileSync(portable, 'utf8');
-    const body = source.slice(source.indexOf('async function runExperiment()'), source.indexOf('\nfunction demo()'));
+    const body = source.slice(
+      source.indexOf('async function runExperiment()'),
+      source.indexOf('\nasync function demo()'),
+    );
     const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
     for (const state of ['unverified', 'void', 'verified']) {
       const cells = [1, 2].map((repeat) => ({
@@ -1209,7 +1218,7 @@ syncBuiltinESMExports();
     }
   });
 
-  test('validates from a source archive without Git and from one commit', () => {
+  test('validates from a source archive without Git and from one commit', HEAVY, () => {
     const archive = fs.mkdtempSync(path.join(os.tmpdir(), 'arc-portable-archive-'));
     try {
       const files = ['CLAUDE.md', 'scripts/register-hooks.js', 'evals/agent-review/run.mjs'];
@@ -1243,9 +1252,9 @@ syncBuiltinESMExports();
     } finally {
       fs.rmSync(archive, { recursive: true, force: true });
     }
-  }, 120_000);
+  });
 
-  test('qualifies tracked bytes and prepares the full experiment without a model', () => {
+  test('qualifies tracked bytes and prepares the full experiment without a model', HEAVY, () => {
     const listed = runPortable('list');
     assert.equal(listed.status, 0, listed.error);
     for (const id of ['portable-001', 'portable-023', 'portable-024', 'portable-029'])
@@ -2356,7 +2365,7 @@ test('excluded additions, deletions, and renames stay out of both review outputs
   assert.ok(removal.some((entry) => entry.path.endsWith('moved.md') && entry.side === 'candidate'));
 });
 
-test('registration checks preparation bytes and freezes portable conditions', () => {
+test('registration checks preparation bytes and freezes portable conditions', HEAVY, () => {
   const prompt = path.join(prepared, 'prompt.txt');
   const workspaceFile = path.join(prepared, 'workspace', 'fixture.txt');
   const diff = path.join(prepared, 'candidate.diff');
@@ -2469,7 +2478,7 @@ test('registration rejects preparation that disagrees with captured source evide
   });
 });
 
-test('identifiers and hashes require primitive strings', () => {
+test('identifiers and hashes require primitive strings', HEAVY, () => {
   for (const value of [['arm-a'], ['a'.repeat(64)]]) {
     const registered = registration();
     if (value[0] === 'arm-a') registered.arms[0].id = value;

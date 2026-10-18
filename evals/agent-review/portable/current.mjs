@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { assert, copyInputs, qualify, root, sha } from './core.mjs';
+import { assert, copyInputs, qualifyAsync, root, sha } from './core.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 export const currentId = 'current-hooks-001';
@@ -42,7 +42,7 @@ export function currentRecipe(checkout = root) {
   return { item, candidate, source, script };
 }
 
-export function prepareCurrent(recipe, workspace, instructions) {
+export async function prepareCurrent(recipe, workspace, instructions, signal) {
   const reference = fs.mkdtempSync(path.join(path.dirname(workspace), 'reference-'));
   try {
     const input = path.join(reference, sourcePath);
@@ -62,7 +62,7 @@ export function prepareCurrent(recipe, workspace, instructions) {
       fs.mkdirSync(path.dirname(dest), { recursive: true });
       fs.writeFileSync(dest, doc.bytes, { flag: 'wx' });
     }
-    const qualification = qualify(recipe.script, workspace, reference, 'bug');
+    const qualification = await qualifyAsync(recipe.script, workspace, reference, 'bug', signal);
     return {
       prompt:
         'Review the candidate hook registration change for material defects. Report file, severity, scenario, and evidence.\n',

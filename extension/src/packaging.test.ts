@@ -736,7 +736,7 @@ test.each(launcherShells)(
       const status = run('arc statusline --json', '{}');
       assert.equal(status.status, 0, status.stderr);
       assert.equal(JSON.parse(status.stdout).schemaVersion, 1);
-      const cost = run(`arc cost "${transcript.replaceAll('\\', '/')}" --source-only --by-model`);
+      const cost = run(`arc cost "${transcript.replaceAll('\\', '/')}" --source-only --by-model --json`);
       assert.equal(cost.status, 0, cost.stderr);
       const report = JSON.parse(cost.stdout);
       assert.equal(report.schemaVersion, 2);

@@ -55,14 +55,77 @@ const count = (n, max = 1000) => Number.isSafeInteger(n) && n > 0 && n <= max;
 const revision = (n) => Number.isSafeInteger(n) && n > 0;
 const unique = (values, label) => required(new Set(values).size === values.length, 'duplicate ' + label);
 
+// One git process returns at most this many bytes.
+const gitOutputLimit = 128 * 1024 * 1024;
+
 function git(repository, args, input) {
   const result = spawnSync('git', ['-C', repository, ...args], {
     input,
     encoding: null,
-    maxBuffer: 128 * 1024 * 1024,
+    maxBuffer: gitOutputLimit,
   });
   required(result.status === 0, `git ${args[0]}: ${result.stderr.toString().trim()}`);
   return result.stdout;
+}
+
+// One git process answers every lookup in a batch. Each process start costs more than the lookups on Windows.
+function objectDetails(repository, objects) {
+  const lines = git(
+    repository,
+    ['cat-file', '--batch-check=%(objectname) %(objecttype) %(objectsize)'],
+    objects.join('\n') + '\n',
+  )
+    .toString('utf8')
+    .split('\n')
+    .filter(Boolean);
+  required(lines.length === objects.length, 'git cat-file: incomplete object list');
+  return lines.map((line) => {
+    const [, type, size] = line.split(' ');
+    return { type, size: Number(size) };
+  });
+}
+
+function objectTypes(repository, objects) {
+  return objectDetails(repository, objects).map(({ type }) => type);
+}
+
+// The blobs of one batch fit the output limit of one git process. A blob that fills the limit alone has its own process.
+function blobs(repository, list) {
+  const objects = [...new Set(list)];
+  const found = new Map();
+  if (objects.length === 0) return found;
+  const details = objectDetails(repository, objects);
+  const batches = [[]];
+  let bytes = 0;
+  objects.forEach((object, index) => {
+    required(details[index].type === 'blob', 'git cat-file: not a blob: ' + object);
+    // A batch record adds a header line and a newline to the blob bytes.
+    const size = details[index].size + object.length + 32;
+    if (batches.at(-1).length && bytes + size > gitOutputLimit) {
+      batches.push([]);
+      bytes = 0;
+    }
+    batches.at(-1).push(object);
+    bytes += size;
+  });
+  for (const names of batches) {
+    if (names.length === 1) {
+      found.set(names[0], git(repository, ['cat-file', 'blob', names[0]]));
+      continue;
+    }
+    const output = git(repository, ['cat-file', '--batch'], names.join('\n') + '\n');
+    let offset = 0;
+    for (const object of names) {
+      const end = output.indexOf(10, offset);
+      required(end >= 0, 'git cat-file: incomplete object list');
+      const [name, type, size] = output.subarray(offset, end).toString('utf8').split(' ');
+      required(name === object && type === 'blob', 'git cat-file: not a blob: ' + object);
+      const start = end + 1;
+      found.set(object, output.subarray(start, start + Number(size)));
+      offset = start + Number(size) + 1;
+    }
+  }
+  return found;
 }
 
 function loadCases(folder) {
@@ -166,7 +229,15 @@ function caseCheck(item) {
 
 const cases = loadCases(catalogFolder);
 
+// A commit names its tree exactly, so each tree is read once per repository.
+const trees = new Map();
 function sourceTree(repository, commit) {
+  const key = repository + '\0' + commit;
+  if (!trees.has(key)) trees.set(key, readTree(repository, commit));
+  return trees.get(key);
+}
+
+function readTree(repository, commit) {
   const entries = git(repository, ['ls-tree', '-rz', '--full-tree', commit])
     .toString('utf8')
     .split('\0')
@@ -235,25 +306,30 @@ function validate(cache) {
   }
   const config = git(cache, ['remote']).toString('utf8').trim();
   required(config === '', 'source remote');
+  const roles = ['base', 'candidate', 'correction'];
   for (const captured of manifest.cases) {
     const item = expected.get(captured.id);
     required(item, 'unknown captured case');
     caseCheck(item);
     required(captured.case_sha256 === sha(json(item)), 'changed case definition');
-    for (const role of ['base', 'candidate', 'correction']) {
-      required(captured[role] === item.source[role], 'changed source commit');
-      required(
-        git(cache, ['rev-parse', `refs/evals/${item.id}/${role}`])
-          .toString('utf8')
-          .trim() === captured[role],
-        'changed capture ref',
-      );
-      required(
-        git(cache, ['cat-file', '-t', captured[role]]).toString('utf8').trim() === 'commit',
-        'missing captured commit',
-      );
-      sourceTree(cache, captured[role]);
-    }
+    for (const role of roles) required(captured[role] === item.source[role], 'changed source commit');
+  }
+  const commits = manifest.cases.flatMap((captured) => roles.map((role) => captured[role]));
+  const refs = git(cache, [
+    'rev-parse',
+    ...manifest.cases.flatMap(({ id }) => roles.map((role) => `refs/evals/${id}/${role}`)),
+  ])
+    .toString('utf8')
+    .split('\n')
+    .filter(Boolean);
+  required(refs.length === commits.length && refs.every((ref, index) => ref === commits[index]), 'changed capture ref');
+  required(
+    commits.length === 0 || objectTypes(cache, commits).every((type) => type === 'commit'),
+    'missing captured commit',
+  );
+  for (const captured of manifest.cases) {
+    const item = expected.get(captured.id);
+    for (const role of roles) sourceTree(cache, captured[role]);
     const candidatePaths = new Set(sourceTree(cache, item.source.candidate).map((entry) => entry.name));
     for (const file of item.fixture_paths) required(candidatePaths.has(file), 'dangling fixture path: ' + file);
     for (const key of item.keys)
@@ -273,24 +349,29 @@ function capture(repository, out) {
   required(existsSync(repository), 'source must exist');
   required(!existsSync(out), 'cache must be fresh');
   required(!inside(out, repository) || inside(out, path.join(suite, '.runs')), 'cache inside source');
-  for (const item of cases) {
-    caseCheck(item);
-    for (const role of ['base', 'candidate', 'correction']) {
-      required(
-        git(repository, ['cat-file', '-t', item.source[role]]).toString('utf8').trim() === 'commit',
-        'missing source commit',
-      );
-      sourceTree(repository, item.source[role]);
-    }
-  }
+  for (const item of cases) caseCheck(item);
+  const sources = cases.flatMap((item) => ['base', 'candidate', 'correction'].map((role) => item.source[role]));
+  required(
+    sources.length === 0 || objectTypes(repository, sources).every((type) => type === 'commit'),
+    'missing source commit',
+  );
+  for (const commit of sources) sourceTree(repository, commit);
   mkdirSync(out, { recursive: true });
   git(out, ['init', '--bare', '--quiet']);
   const commits = [...new Set(cases.flatMap((item) => Object.values(item.source)))];
   const pack = git(repository, ['pack-objects', '--stdout', '--revs'], commits.join('\n') + '\n');
   git(out, ['unpack-objects', '-r'], pack);
-  for (const item of cases)
-    for (const role of ['base', 'candidate', 'correction'])
-      git(out, ['update-ref', `refs/evals/${item.id}/${role}`, item.source[role]]);
+  git(
+    out,
+    ['update-ref', '--stdin'],
+    cases
+      .flatMap((item) =>
+        ['base', 'candidate', 'correction'].map(
+          (role) => `update refs/evals/${item.id}/${role} ${item.source[role]}\n`,
+        ),
+      )
+      .join(''),
+  );
   const manifest = {
     schema: 'arc-review-cache-v1',
     source_root: real(repository),
@@ -391,8 +472,12 @@ function prepare(cache, caseId, out) {
       );
   const correction = item.source.correction.toLowerCase();
   const keyIds = item.keys.map((key) => key.id.toLowerCase());
+  const keptBytes = blobs(
+    cache,
+    kept.map((entry) => entry.object),
+  );
   const contents = kept.map((entry) => {
-    const bytes = git(cache, ['cat-file', 'blob', entry.object]);
+    const bytes = keptBytes.get(entry.object);
     const body = bytes.toString('utf8').toLowerCase();
     required(
       !body.includes(correction) && !keyIds.some((key) => body.includes(key)),
@@ -517,6 +602,7 @@ function preparationCheck(task, item) {
     'prepared path',
   );
   required(json(actual.sort()) === json(manifest.files.map((file) => file.path).sort()), 'changed workspace inventory');
+  const sourceBytes = blobs(cache, manifest.files.map((file) => expectedPaths.get(file.path)?.object).filter(Boolean));
   for (const file of manifest.files) {
     checkPath(file.path);
     required(
@@ -528,7 +614,7 @@ function preparationCheck(task, item) {
     required(source && source.object === file.git_object && source.mode === file.mode, 'prepared source file');
     const bytes = readFileSync(path.join(workspace, ...file.path.split('/')));
     required(sha(bytes) === file.sha256, 'changed prepared file');
-    required(bytes.equals(git(cache, ['cat-file', 'blob', source.object])), 'changed source blob');
+    required(bytes.equals(sourceBytes.get(source.object)), 'changed source blob');
     const body = bytes.toString('utf8').toLowerCase();
     required(
       !body.includes(item.source.correction.toLowerCase()) &&
