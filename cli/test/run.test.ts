@@ -3982,7 +3982,15 @@ const lateWatcher=fs.watch(process.cwd(),lateFinish);lateFinish();return;`;
     const pending = superviseStandalone(receipts, launch.launchId, false, bounds, undefined, undefined, false, entry);
     let secondCapture: ReturnType<DispatchReceipts['capture']> | undefined;
     try {
-      await vi.waitFor(() => assert.ok(fs.existsSync(started)), { timeout: 5000 });
+      await vi.waitFor(
+        () => {
+          assert.ok(fs.existsSync(started));
+          const nativePid = Number(fs.readFileSync(started, 'utf8').trim());
+          const observed = receipts.observation(launch.launchId);
+          assert.equal((observed?.worker ?? observed?.launcher)?.pid, nativePid);
+        },
+        { timeout: 5000 },
+      );
       await vi.advanceTimersByTimeAsync(10_000);
       await pending;
       assert.equal(receipts.observation(launch.launchId)?.monitor, 'timed-out');
