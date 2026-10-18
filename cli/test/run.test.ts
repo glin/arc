@@ -4239,7 +4239,21 @@ test('background log continues after observation and recovers without taking a r
     const combined = Buffer.concat([first, late]);
     await vi.waitFor(() => assert.ok(fs.readFileSync(options.logAlias!).equals(combined)), { timeout: 8000 });
     assert.equal(owner().state, 'capturing');
-    await superviseStandalone(receipts, launch.launchId, true, bounds, undefined, undefined, false, entry);
+    let recovered1 = false;
+    const recovery1 = superviseStandalone(
+      receipts,
+      launch.launchId,
+      true,
+      bounds,
+      undefined,
+      undefined,
+      false,
+      entry,
+    ).finally(() => {
+      recovered1 = true;
+    });
+    await vi.waitFor(() => assert.ok(recovered1), { timeout: 5000 });
+    await recovery1;
     const spawned = vi.mocked(childProcess.spawn);
     const duplicateIndex = spawned.mock.calls.map((args) => args[1]?.[0] === entry).lastIndexOf(true);
     const duplicate = spawned.mock.results[duplicateIndex].value as ChildProcess;
@@ -4261,7 +4275,21 @@ test('background log continues after observation and recovers without taking a r
     fs.rmdirSync(capturedNative);
     fs.renameSync(capturedNative + '.saved', capturedNative);
     fs.writeFileSync(registry, JSON.stringify([{ ...registryEntry, state: 'stopped' }]));
-    await superviseStandalone(receipts, launch.launchId, true, bounds, undefined, undefined, false, entry);
+    let recovered2 = false;
+    const recovery2 = superviseStandalone(
+      receipts,
+      launch.launchId,
+      true,
+      bounds,
+      undefined,
+      undefined,
+      false,
+      entry,
+    ).finally(() => {
+      recovered2 = true;
+    });
+    await vi.waitFor(() => assert.ok(recovered2), { timeout: 5000 });
+    await recovery2;
     await vi.waitFor(
       () => {
         assert.notEqual(owner().pid, [...pids][0]);
