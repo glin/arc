@@ -203,7 +203,7 @@ test.each(['complete', 'budget', 'denied', 'transient', 'busy', 'busy-budget', '
   },
 );
 
-test.each(['construct', 'cursor', 'persistent', 'invalid'] as const)(
+test.each(['construct', 'cursor', 'persistent', 'invalid', 'init-alias', 'init-checkpoint'] as const)(
   'construction contention handles %s without losing output or capture ownership',
   async (phase) => {
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
@@ -227,6 +227,21 @@ test.each(['construct', 'cursor', 'persistent', 'invalid'] as const)(
       JSON.stringify({ pid: 2147483647, state: 'unavailable' }),
     );
     const construct = receipts.capture.bind(receipts);
+    const originalFs = (await vi.importActual<{ default: typeof import('node:fs') }>('node:fs')).default;
+    const rename = originalFs.renameSync;
+    let injected = false;
+    const publication = phase === 'init-alias' ? launch.standalone!.logAlias : receipts.artifact(id, 'capture.json');
+    if (phase === 'init-alias' || phase === 'init-checkpoint') {
+      const renameWithFailure: typeof rename = (from, to) => {
+        if (!injected && String(to) === publication) {
+          injected = true;
+          throw Object.assign(new Error('Publication is busy.'), { code: 'EPERM' });
+        }
+        rename(from, to);
+      };
+      vi.spyOn(fs, 'renameSync').mockImplementation(renameWithFailure);
+      vi.spyOn(originalFs, 'renameSync').mockImplementation(renameWithFailure);
+    }
     let attempts = 0;
     let opened = 0;
     let closed = 0;
@@ -271,7 +286,17 @@ test.each(['construct', 'cursor', 'persistent', 'invalid'] as const)(
     );
     await vi.waitFor(() => assert.ok(settled), { timeout: 5000 });
     await pending;
-    if (phase === 'persistent' || phase === 'invalid') {
+    if (phase === 'init-alias' || phase === 'init-checkpoint') {
+      assert.equal(injected, true);
+      assert.notEqual(receipts.observation(id)?.monitor, 'finished');
+      assert.match(String(failure), /The requested log could not be prepared/);
+      assert.equal((failure as Error).cause && ((failure as Error).cause as NodeJS.ErrnoException).code, 'EPERM');
+      assert.equal(attempts, 1);
+      assert.deepEqual(fs.readFileSync(receipts.artifact(id, 'stdout.log')), stdout);
+      assert.deepEqual(fs.readFileSync(receipts.artifact(id, 'stderr.log')), stderr);
+      assert.equal(fs.statSync(receipts.artifact(id, 'worker.log')).size, 0);
+      assert.equal(fs.existsSync(receipts.artifact(id, 'capture.json')), false);
+    } else if (phase === 'persistent' || phase === 'invalid') {
       assert.match(
         String(failure),
         phase === 'invalid' ? /output was replaced/ : /dispatch write changed during recovery/,

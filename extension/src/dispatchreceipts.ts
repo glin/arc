@@ -349,26 +349,33 @@ export class DispatchReceipts {
           id,
           (): CaptureState => {
             if (fs.existsSync(checkpoint)) return JSON.parse(readChanging(checkpoint));
-            // A capture without an alias witness cannot claim its current pathname.
-            const existing = fs.existsSync(rawFile);
-            if (existing) safePath(rawFile);
-            else exclusive(rawFile, '');
-            let aliasIdentity: FileIdentity | null = null;
-            if (!existing) {
-              if (fs.existsSync(alias)) safePath(alias);
-              const temporary = path.join(path.dirname(alias), `.arc-log-${randomUUID()}`);
-              fs.writeFileSync(temporary, '', { flag: 'wx', mode: 0o600 });
-              try {
-                fs.renameSync(temporary, alias);
-              } catch (error) {
-                fs.unlinkSync(temporary);
-                throw error;
+            try {
+              // A capture without an alias witness cannot claim its current pathname.
+              const existing = fs.existsSync(rawFile);
+              if (existing) safePath(rawFile);
+              else exclusive(rawFile, '');
+              let aliasIdentity: FileIdentity | null = null;
+              if (!existing) {
+                if (fs.existsSync(alias)) safePath(alias);
+                const temporary = path.join(path.dirname(alias), `.arc-log-${randomUUID()}`);
+                fs.writeFileSync(temporary, '', { flag: 'wx', mode: 0o600 });
+                try {
+                  fs.renameSync(temporary, alias);
+                } catch (error) {
+                  fs.unlinkSync(temporary);
+                  throw error;
+                }
+                aliasIdentity = identity(alias);
               }
-              aliasIdentity = identity(alias);
+              const initial: CaptureState = { raw: identity(rawFile), alias: aliasIdentity, bytes: 0, sources: {} };
+              writeFileAtomically(checkpoint, JSON.stringify(initial), undefined, 0o600, false);
+              return initial;
+            } catch (error) {
+              // Initialization can retain private output before its alias witness is saved.
+              throw new Error('The requested log could not be prepared. Private output remains available.', {
+                cause: error,
+              });
             }
-            const initial: CaptureState = { raw: identity(rawFile), alias: aliasIdentity, bytes: 0, sources: {} };
-            writeFileAtomically(checkpoint, JSON.stringify(initial), undefined, 0o600, false);
-            return initial;
           },
           'capture-write',
         );
