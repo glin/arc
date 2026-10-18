@@ -2434,61 +2434,81 @@ test('registration checks preparation bytes and freezes portable conditions: por
   }
 });
 
-test('registration rejects preparation that disagrees with captured source evidence', () => {
-  const forged = path.join(temp, 'forged-prepared');
+test.each([
+  [
+    'schema',
+    (manifest) => {
+      manifest.schema = 'unrelated';
+    },
+  ],
+  [
+    'source',
+    (manifest) => {
+      manifest.source = { base: '0'.repeat(40), candidate: '0'.repeat(40), correction: '0'.repeat(40) };
+    },
+  ],
+  [
+    'git_object',
+    (manifest) => {
+      manifest.files[0].git_object = '0'.repeat(40);
+    },
+  ],
+  [
+    'removal_accounting',
+    (manifest) => {
+      manifest.removal_accounting = [{ path: 'fixture.txt', side: 'candidate', reason: 'forged' }];
+    },
+  ],
+  [
+    'mode',
+    (manifest) => {
+      manifest.files[0].mode = manifest.files[0].mode === '100644' ? '100755' : '100644';
+      manifest.workspace_hash = digest(
+        `${manifest.files[0].path}\0${manifest.files[0].mode}\0${manifest.files[0].sha256}\n`,
+      );
+    },
+  ],
+  [
+    'sha256',
+    (manifest, forged) => {
+      manifest.files[0].sha256 = digest('forged bytes\n');
+      manifest.workspace_hash = digest(
+        `${manifest.files[0].path}\0${manifest.files[0].mode}\0${manifest.files[0].sha256}\n`,
+      );
+      fs.writeFileSync(path.join(forged, 'workspace', 'fixture.txt'), 'forged bytes\n');
+    },
+  ],
+  [
+    'diff',
+    (manifest, forged) => {
+      fs.writeFileSync(path.join(forged, 'candidate.diff'), 'forged diff\n');
+      manifest.diff_hash = digest('forged diff\n');
+    },
+  ],
+  [
+    'prompt',
+    (manifest, forged) => {
+      fs.writeFileSync(path.join(forged, 'prompt.txt'), 'forged prompt\n');
+      manifest.prompt_hash = digest('forged prompt\n');
+    },
+  ],
+])('registration rejects preparation that disagrees with captured source evidence: %s', (mutation, change) => {
+  const forged = path.join(temp, `forged-prepared-${mutation}`);
   fs.cpSync(prepared, forged, { recursive: true });
   const manifestFile = path.join(forged, 'manifest.json');
-  const original = JSON.parse(fs.readFileSync(manifestFile, 'utf8'));
-  const check = (change) => {
-    const manifest = structuredClone(original);
-    change(manifest);
-    delete manifest.manifest_hash;
-    manifest.manifest_hash = digest(json(manifest));
-    fs.writeFileSync(manifestFile, json(manifest));
-    const registered = registration({ preparation_path: forged });
-    Object.assign(registered.tasks[0], {
-      prompt_hash: manifest.prompt_hash,
-      workspace_hash: manifest.workspace_hash,
-      diff_hash: manifest.diff_hash,
-    });
-    assert.notEqual(matrixFile(registered).result.status, 0);
-  };
-  check((manifest) => {
-    manifest.schema = 'unrelated';
+  const manifest = JSON.parse(fs.readFileSync(manifestFile, 'utf8'));
+  change(manifest, forged);
+  delete manifest.manifest_hash;
+  manifest.manifest_hash = digest(json(manifest));
+  fs.writeFileSync(manifestFile, json(manifest));
+  const registered = registration({ preparation_path: forged });
+  Object.assign(registered.tasks[0], {
+    prompt_hash: manifest.prompt_hash,
+    workspace_hash: manifest.workspace_hash,
+    diff_hash: manifest.diff_hash,
   });
-  check((manifest) => {
-    manifest.source = { base: '0'.repeat(40), candidate: '0'.repeat(40), correction: '0'.repeat(40) };
-  });
-  check((manifest) => {
-    manifest.files[0].git_object = '0'.repeat(40);
-  });
-  check((manifest) => {
-    manifest.removal_accounting = [{ path: 'fixture.txt', side: 'candidate', reason: 'forged' }];
-  });
-  check((manifest) => {
-    manifest.files[0].mode = manifest.files[0].mode === '100644' ? '100755' : '100644';
-    manifest.workspace_hash = digest(
-      `${manifest.files[0].path}\0${manifest.files[0].mode}\0${manifest.files[0].sha256}\n`,
-    );
-  });
-  check((manifest) => {
-    manifest.files[0].sha256 = digest('forged bytes\n');
-    manifest.workspace_hash = digest(
-      `${manifest.files[0].path}\0${manifest.files[0].mode}\0${manifest.files[0].sha256}\n`,
-    );
-    fs.writeFileSync(path.join(forged, 'workspace', 'fixture.txt'), 'forged bytes\n');
-  });
-  fs.writeFileSync(path.join(forged, 'workspace', 'fixture.txt'), 'candidate defect\n');
-  check((manifest) => {
-    fs.writeFileSync(path.join(forged, 'candidate.diff'), 'forged diff\n');
-    manifest.diff_hash = digest('forged diff\n');
-  });
-  fs.writeFileSync(path.join(forged, 'candidate.diff'), fs.readFileSync(path.join(prepared, 'candidate.diff')));
-  check((manifest) => {
-    fs.writeFileSync(path.join(forged, 'prompt.txt'), 'forged prompt\n');
-    manifest.prompt_hash = digest('forged prompt\n');
-  });
-}, 120_000);
+  assert.notEqual(matrixFile(registered).result.status, 0);
+});
 
 test('identifiers and hashes require primitive strings', HEAVY, () => {
   for (const value of [['arm-a'], ['a'.repeat(64)]]) {
