@@ -71,9 +71,9 @@ export function drawContextDetail(document: Document, host: HTMLElement, value: 
         children.append(el('p', 'context-included', 'Included in Messages. Shares of all used context.'));
         const childList = el('ul', 'context-categories');
         childList.setAttribute('role', 'list');
-        for (const child of [...native.messageBreakdown].sort(
-          (a: ContextMessage, b: ContextMessage) => b.tokens - a.tokens,
-        )) {
+        for (const child of native.messageBreakdown
+          .filter((row) => row.tokens !== 0)
+          .sort((a: ContextMessage, b: ContextMessage) => b.tokens - a.tokens)) {
           const childItem = el('li', '');
           drawRow(childItem, child);
           childList.append(childItem);

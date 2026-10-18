@@ -1323,7 +1323,7 @@ import { ProjectSetupStore, SetupProjects, normalizeProjectPath, projectSetupKey
 import { STORED_STATE_KEYS } from './identity.ts';
 import { claudeDispatchTranscript, codexContextRecords, turn as fixtureTurn } from './turnfixtures';
 import { readCodexContext } from './codexcontext';
-import { unavailableContext } from './domain/context-detail';
+import { normalizeContext, unavailableContext } from './domain/context-detail';
 import { drawContextDetail } from './webview/context-detail';
 
 import { beforeAll, test, vi } from 'vitest';
@@ -22995,6 +22995,60 @@ test('Context detail keeps the percentage, window and used count together', () =
     /el\(\s*'span',\s*'chippopvalue',\s*`\$\{wholePercent\(used \/ capacity\)\}% of \$\{formatTokens\(capacity\)\} \(\$\{formatTokens\(used\)\}\)`,?\s*\)/,
     'the visible Context figure omits its percentage, window or used count',
   );
+});
+
+test('Messages detail omits exact-zero children and retains small positive shares', () => {
+  const document = {
+    createElement(tag: string) {
+      const node = fakeDocument.createElement(tag);
+      node.append = (...parts: Array<FakeElement | string>) => {
+        for (const part of parts) {
+          const child = typeof part === 'string' ? fakeDocument.createTextNode(part) : part;
+          node.appendChild(child);
+          child.parentNode = node;
+        }
+      };
+      return node;
+    },
+  } as unknown as Document;
+  const detail = normalizeContext(
+    {
+      totalTokens: 1_000_000,
+      rawMaxTokens: 2_000_000,
+      model: 'opus',
+      categories: [{ name: 'Messages', kind: 'used', tokens: 1_000_000 }],
+      messageBreakdown: {
+        toolCallTokens: 0,
+        toolResultTokens: 999_999,
+        attachmentTokens: 0,
+        assistantMessageTokens: 0,
+        userMessageTokens: 1,
+        redirectedContextTokens: 0,
+        unattributedTokens: 0,
+      },
+    },
+    { session: 's1', provider: 'claude', model: 'opus', source: 'fixture', request: 1, generation: 0 },
+  );
+  assert.equal(detail.messageBreakdown?.length, 7);
+  const host = document.createElement('div');
+  drawContextDetail(document, host, {
+    used: 1_000_000,
+    capacity: 2_000_000,
+    detail,
+    loading: false,
+    compact: false,
+    run() {},
+  });
+  const rendered = host as unknown as FakeElement;
+  const children = fakeFind(rendered, '.context-message-children')!;
+  const rows = fakeFindAll(children, 'li');
+  assert.equal(rows.length, 2);
+  assert.deepEqual(
+    rows.map((row) => fakeFind(row, '.context-category-label')!.textContent),
+    ['Tool results', 'User messages'],
+  );
+  assert.equal(fakeFind(rows[1], '.context-share')!.textContent, '<0.01%');
+  assert.equal(fakeFind(fakeFind(rendered, '.context-category-row')!, '.context-share')!.textContent, '100.00%');
 });
 
 test('active Context feedback explains its measurement boundary and preserves recorded figures and Compact', () => {
