@@ -78,11 +78,11 @@ Request compaction after saving a handoff:
 After saving the handoff, request compaction of this session after your response.
 ```
 
-A compaction request does not establish completed compaction. [CLI compaction requests](cli.md#session-management) owns admission and outcome states.
+A compaction request does not establish completed compaction. [CLI compaction requests](cli-reference.md#compaction) define admission and outcome states.
 
 ## Collect data for a report
 
-Use `arc collect` for scoped pagination and optional recent turns. The caller selects the query and interprets the returned observations. [Collection output](cli.md#collect-session-data) defines references, outcomes, recovery, and limits. The command requires an explicit window selection and changes no session state.
+Use `arc collect` for scoped pagination and optional recent turns. The caller selects the query and interprets the returned observations. [Collection output](cli-reference.md#collection) defines references, outcomes, recovery, and limits. The command requires an explicit window selection and changes no session state.
 
 ## A bounded coordinator run
 
@@ -128,7 +128,7 @@ arc CLI <--- local channel ---> Selected ready Arc window
 
 `arc start --arc-dispatch` emits the parent-link receipt for `accepted` and `accepted-with-errors` results that include a session ID. Basic starts require no personal dispatch script. Personal dispatch workflow receipts link sessions. Personal dispatch workflows own durable callback claim/ack outside Arc to track callback ownership and acknowledgement. The receipt does not provide that state. Arc supplies neither detached callbacks nor a cross-provider peer inbox.
 
-Python and shell coordinators both invoke the same CLI. Reader-requested starts keep reader ownership by default. Use `--agent-run` for delegated work. Run `arc --help` and `arc COMMAND --help` for command syntax. [Session management](cli.md#session-management) owns delivery outcomes, session data, archive rules, and uncertain-launch handling.
+Python and shell coordinators both invoke the same CLI. Reader-requested starts keep reader ownership by default. Use `--agent-run` for delegated work. Run `arc --help` and `arc COMMAND --help` for command syntax. [CLI contracts](cli-reference.md) define delivery outcomes and session data. [Session management](cli.md#session-management) explains archive rules and uncertain launches.
 
 Read each result before describing it. Recorded model and effort establish execution settings, while a requested setup only establishes what the caller selected. Keep a session available for reader continuation when that is part of the task.
 
@@ -161,7 +161,7 @@ arc pin SESSION_ID --dry-run --window WINDOW_ID
 
 Replace `WINDOW_ID` with the selected window's `hostId`. Confirm `scopeReady` and `panelReady` before proceeding. When the listing returns a `next` cursor, run `arc sessions --window WINDOW_ID --cursor NEXT --json` until `next` is `null`. Replace `SESSION_ID` with a complete, nonnull ID from that scoped listing. Never abbreviate the action target. If the list is empty, skip the session read and pin dry run. Reads leave reader attention unchanged, and the pin dry run writes no state. Preserve incomplete or unknown results when reporting the check.
 
-[Window discovery](cli.md#windows) defines capability output and observed access diagnostics. [Session selection](cli.md#sessions) defines stale activation handling. The [skill](../cli/skills/arc-sessions/SKILL.md#select-a-ready-window) applies these limits before agent actions.
+[Window discovery](cli-reference.md#windows) defines capability output and observed access diagnostics. [Window selection](cli.md#windows) defines stale activation handling. The [skill](../cli/skills/arc-sessions/SKILL.md#select-a-ready-window) applies these limits before agent actions.
 
 An optional launch check sends paid agent requests and requires reader authorization. Choose the cheapest suitable offered settings for one Claude session and one Codex session. In `arc setups`, reusable rows appear in `primary`, `inherited`, `pinned`, and `recent`. Each row supplies a `key` and a `profile.agent`. Use a row for the intended provider, and exclude pinned rows whose `available` is false.
 
@@ -233,4 +233,4 @@ A coordinator's handoff must retain the selected window, accepted session IDs, r
 
 ## Read acknowledgments
 
-The session-management skill requires explicit reader authority before marking a bounded set read. Agents read the delivered completed turns and acknowledge only that projection. [CLI read acknowledgments](cli.md#read-acknowledgments) owns receipt, retry, source-change, and publication behavior.
+The session-management skill requires explicit reader authority before marking a bounded set read. Agents read the delivered completed turns and acknowledge only that projection. [CLI read acknowledgments](cli-reference.md#read-acknowledgments) define receipt, retry, source-change, and publication behavior.

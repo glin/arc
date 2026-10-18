@@ -41,7 +41,7 @@ Subscription limits and recorded request costs use separate sources. [Usage stat
 
 Main-agent and delegated-work figures describe who used tokens. Token categories describe how the provider billed them, so the two views answer different questions.
 
-The CLI distinguishes reconciled recorded usage from missing or unresolved coverage. Reconciliation describes the saved records. It does not establish that the provider logged every request. See [CLI quantities and missing coverage](cli.md#quantities-and-missing-coverage) for field meanings and unavailable totals.
+The CLI distinguishes reconciled recorded usage from missing or unresolved coverage. Reconciliation describes the saved records. It does not establish that the provider logged every request. See [CLI quantities and missing coverage](cli-reference.md#quantities-and-missing-coverage) for field meanings and unavailable totals.
 
 ### Token categories
 
@@ -137,7 +137,7 @@ Arc uses its local queue during Codex compaction or when an agent cannot accept 
 
 ## Check cost outside the panel
 
-The [CLI guide](cli.md) describes Arc's session cost command and Claude status-line command. It owns command arguments, output fields, and examples.
+The [CLI guide](cli.md) provides cost and status-line examples. The [CLI reference](cli-reference.md#cost-reports) defines output fields and coverage.
 
 A native Codex status line can show model, context, token counts, limits, Git state, and a thread-cost item when that item is available. Availability depends on the client and account. The panel's transcript-derived estimate remains a separate list-price figure with its own supported routes and missing-data limits.
 

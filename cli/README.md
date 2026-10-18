@@ -2,7 +2,7 @@
 
 The Arc CLI is experimental. npm publication is deferred.
 
-Show context, prompt-cache status, and the next turn's starting price in Claude Code. Read estimated costs for saved Claude Code and Codex sessions. [Session commands](../docs/cli.md#sessions) filter and list a running Arc window's repository sessions and read bounded turns.
+Install `arc` for saved session costs, a Claude Code status line, and session commands through a running Arc window. The [CLI guide](https://github.com/glin/arc/blob/main/docs/cli.md) provides command examples and troubleshooting. The [CLI reference](https://github.com/glin/arc/blob/main/docs/cli-reference.md) defines output contracts and limits.
 
 ## Install
 
@@ -43,18 +43,6 @@ ln -s "$arc_skill" ~/.agents/skills/arc-sessions
 ```
 
 A source checkout supplies the same skill under `cli/skills/arc-sessions`. A project-local package supplies it under `node_modules/@glin/arc/skills/arc-sessions`. Use that absolute directory as the link target. Existing links require a separate removal before replacement. Restart the agent session to load the skill.
-
-Run `arc --help` for command sections and `arc COMMAND --help` for syntax, flags, output fields, refusals, and examples. The [CLI guide](https://github.com/glin/arc/blob/main/docs/cli.md#session-management) explains delivery and session data.
-
-Filter a selected window with the existing session list query:
-
-```sh
-arc sessions --query 'session:claude:one OR session:codex:two' --json
-arc filter --query 'id:01a12cef id:01a12a6b' --json
-arc filter --clear --json
-```
-
-[Session query syntax](../docs/rail-and-navigation.md#session-list) defines full IDs and alternative groups. [Panel filter](../docs/cli.md#panel-filter) defines completion outcomes and persistence.
 
 ## Status-line setup
 
@@ -126,12 +114,6 @@ Escape each double quote as `\"` inside the JSON command string. For example:
 }
 ```
 
-To run the npm-installed bundle directly in PowerShell:
-
-```powershell
-node "C:/path/to/npm-prefix/node_modules/@glin/arc/dist/arc.cjs" statusline
-```
-
 ### Show the next-turn price in another status line
 
 `arc statusline --next-turn` prints one segment, for example `next turn starts at $0.47`. A status line tool that runs a command with Claude Code's JSON on stdin can show it beside its own segments.
@@ -158,85 +140,15 @@ Then add the widget to a line in `~/.config/ccstatusline/settings.json`. If ccst
 }
 ```
 
-## Session costs
-
-Read a saved session by ID or transcript path:
+## Commands
 
 ```sh
+arc --help
 arc cost SESSION_ID --by-model
-arc cost ./session.jsonl --source-only
-```
-
-Replace `SESSION_ID` with a saved Claude Code or Codex session ID. The command reads local records and prints JSON. It includes discovered child sessions unless you use `--source-only`, which requires a file path. `--by-model` adds cost subtotals for each model.
-
-The output has this shape for a Claude Code session that used six subagents. The excerpt shows selected fields, substitutes placeholders for IDs and paths, and keeps one of the six children:
-
-```json
-{
-  "schemaVersion": 2,
-  "source": {
-    "kind": "claude",
-    "file": "TRANSCRIPT_PATH",
-    "sessionId": "SESSION_ID"
-  },
-  "parent": {
-    "requests": 56,
-    "costUsd": 3.2912,
-    "uncachedInputTokens": 112,
-    "cachedInputTokens": 6950100,
-    "cacheWriteInputTokens": 143198,
-    "outputTokens": 37758
-  },
-  "children": [
-    {
-      "kind": "claude-subagent",
-      "file": "SUBAGENT_PATH",
-      "sessionId": "SUBAGENT_ID",
-      "requests": 76,
-      "costUsd": 3.4524,
-      "cachedInputTokens": 10513585,
-      "outputTokens": 12266
-    }
-  ],
-  "combined": {
-    "requests": 229,
-    "costUsd": 9.5626,
-    "uncachedInputTokens": 458,
-    "cachedInputTokens": 24421505,
-    "cacheWriteInputTokens": 1650883,
-    "outputTokens": 51739,
-    "cacheExpiry": {
-      "returns": 6,
-      "extraCostAfterExpiryUsd": 2.1224
-    }
-  }
-}
-```
-
-`combined` adds the parent and all six children. The [CLI guide](https://github.com/glin/arc/blob/main/docs/cli.md#read-a-cost-report) defines each field.
-
-Restrict the report to a time window:
-
-```sh
-arc cost SESSION_ID --since 2026-10-01T00:00:00Z --until 2026-10-02T00:00:00Z
-```
-
-Use ISO timestamps with `Z` or a UTC offset. The report includes requests at `--since` and excludes requests at `--until`.
-
-Pricing covers supported Anthropic and OpenAI models, including supported models through Amazon Bedrock. Estimates use published prices, not your subscription bill. Missing usage or unsupported prices produce partial totals. `costUsd` is `null` when the full cost is unknown. `pricedCostUsd` contains the known subtotal.
-
-Run `arc cost --help` for cost options. The [CLI guide](https://github.com/glin/arc/blob/main/docs/cli.md) explains output fields, custom session folders, and additional reports.
-
-## Running windows
-
-List running Arc windows, including windows without folders:
-
-```sh
-arc windows
 arc windows --json
 ```
 
-The [CLI guide](https://github.com/glin/arc/blob/main/docs/cli.md#windows) explains discovery, output fields, and `ARC_HOME`.
+Replace `SESSION_ID` with a saved Claude Code or Codex session ID. See the [CLI guide](https://github.com/glin/arc/blob/main/docs/cli.md) for time windows, partial costs, window selection, and session management.
 
 ## Build from source
 
