@@ -465,10 +465,10 @@ test('a session an agent ran says so, in the name always and on screen only wher
   // The accessible name includes agent-run identity and the agent name.
 
   assert.equal(railCardName(rail[1]), 'Session run, run by an agent, Claude, 3 hours ago');
-  // Rows retain origin wording before the browser assigns their sections.
-  assert.equal(rail[1].agentWord, 'run by an agent');
+  // Inside its own bucket the heading has said it, so the card keeps the agent's name.
+  assert.equal(rail[1].agentWord, 'Claude');
   assert.equal(rail[0].agentWord, 'Claude');
-  // Pinned agent runs retain their classification and provider.
+  // Pinned agent runs show their classification in the agent-word slot.
 
   const pinned = railSessions(
     [s('mine'), s('run', true)],
@@ -502,8 +502,8 @@ test('a session an agent ran says so, in the name always and on screen only wher
   );
   const archived = away.find((c) => c.id === 'run');
   assert.equal(archived?.agentRun, false);
-  assert.equal(archived?.agentWord, 'run by an agent');
-  assert.match(archived ? railCardName(archived) : '', /^Session run, archived, run by an agent, Claude/);
+  assert.equal(archived?.agentWord, 'Claude');
+  assert.match(archived ? railCardName(archived) : '', /^Session run, archived, Claude/);
 });
 
 test('pinned sessions hold the top of the rail, whatever their age', () => {

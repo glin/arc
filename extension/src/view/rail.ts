@@ -1053,11 +1053,6 @@ export function railAgentWordShown(sectionId: string): boolean {
   return !sectionId.startsWith(`${RAIL_GROUP_FOLD_PREFIX}agent:`);
 }
 
-// The dedicated heading supplies origin. Other sections retain it on each card.
-export function railAgentRunWord(card: { agent: string; agentWord: string }, sectionId: string): string | null {
-  return sectionId !== RAIL_FOLDS.agent && card.agentWord !== card.agent ? card.agentWord || null : null;
-}
-
 // How the rail groups its sessions.
 export interface RailGrouping {
   queryContext?: SessionQueryContext;
@@ -1236,7 +1231,7 @@ const RAIL_DENSITY_DROPS: Record<RailDensity, boolean> = { comfortable: false, c
 // Accessible descriptions omit metadata already present in the accessible name. They retain the state explanation.
 // description overrides detail for screen readers. Without description, detail supplies the linked description.
 export function railCardHint(
-  card: { name?: string; label: string; agent: string; nameAfterAge: string },
+  card: { name?: string; label: string; agentWord: string; nameAfterAge: string },
   density: RailDensity,
   state: { hint: string; detail: string } | null,
 ): { hint?: string; detail?: string; description?: string; lines: boolean; body?: 'railcard' } {
@@ -1244,7 +1239,7 @@ export function railCardHint(
     return state ? { hint: state.hint, detail: state.detail, lines: false } : { lines: false };
   }
   const hint = card.name ?? card.label;
-  const dropped = [card.agent, card.nameAfterAge].filter(Boolean);
+  const dropped = [card.agentWord, card.nameAfterAge].filter(Boolean);
   if (state) {
     return dropped.length
       ? {
@@ -1313,16 +1308,10 @@ export const RAIL_HOVER_LABELS = 8;
 // Metadata includes the agent, agent-run label, status, unsent-input label and age.
 // Running sessions with a start time replace age with duration after the first minute. Those without a start retain age.
 // Subagents and background statuses omit age. Format ages using now because the host-supplied relative text has a fixed clock.
-export function railHoverLines(
-  card: RailHoverCard,
-  now: number,
-  words: RailHoverWords,
-  sectionId = '',
-): RailHoverLines {
+export function railHoverLines(card: RailHoverCard, now: number, words: RailHoverWords): RailHoverLines {
   const meta: RailHoverPart[] = [{ kind: 'agent', text: card.agent }];
-  const origin = railAgentRunWord(card, sectionId);
-  if (origin) {
-    meta.push({ kind: 'agentRun', text: origin });
+  if (card.agentWord && card.agentWord !== card.agent) {
+    meta.push({ kind: 'agentRun', text: card.agentWord });
   }
   const className = railStatusClass(card.status);
   let note: string | null = null;

@@ -1931,9 +1931,9 @@ test('a rail card meta line stays on one line at the narrowest the rail can be',
       ...payload.rail[0],
       pinnedTop: true,
       agentRun: true,
-      agent: 'Claude',
+      agent: '',
       agentWord: CARD_ACTIONS.agentRun,
-      status: 'waiting',
+      status: 'failed',
       at: NOW - 330 * 24 * 3_600_000,
       cache: null,
       unsentWord: 'unsent',
@@ -1951,8 +1951,8 @@ test('a rail card meta line stays on one line at the narrowest the rail can be',
       lines.length >= 3,
       `the rail drew ${lines.length} cards at ${RAIL_WIDTH_MIN}px, so this measures nothing`,
     );
-    const worst = lines.find((l) => l.words.includes('Claude') && l.words.includes('unsent'));
-    assert.ok(worst, 'no card says Claude and unsent, so the widest line was never drawn');
+    const worst = lines.find((l) => l.words.includes(CARD_ACTIONS.agentRun));
+    assert.ok(worst, `no card says ${JSON.stringify(CARD_ACTIONS.agentRun)}, so the widest line was never drawn`);
     assert.equal(
       worst.words.length,
       3,

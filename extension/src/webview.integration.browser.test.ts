@@ -455,7 +455,9 @@ test('session selection reuses unchanged mounted rows at 100 and 1000 sessions',
         selected,
       );
       assert.deepEqual(
-        await page.locator('.railcard[data-session="bulk2"] .railorigin').allTextContents(),
+        await page
+          .locator('.railcard[data-session="bulk2"] .railagent')
+          .evaluateAll((nodes) => nodes.map((node) => node.getAttribute('title'))),
         Array(selected).fill('Started by agent'),
       );
       const mutationBefore = await constructed();
@@ -482,7 +484,9 @@ test('session selection reuses unchanged mounted rows at 100 and 1000 sessions',
         Array(selected).fill('Mutated label'),
       );
       assert.deepEqual(
-        await page.locator('.railcard[data-session="bulk2"] .railorigin').allTextContents(),
+        await page
+          .locator('.railcard[data-session="bulk2"] .railagent')
+          .evaluateAll((nodes) => nodes.map((node) => node.getAttribute('title'))),
         Array(selected).fill('Started by another agent'),
       );
       const costs = page.locator('.railcard[data-session="bulk2"] [data-metric="cost"]');

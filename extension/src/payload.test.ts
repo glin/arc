@@ -55,7 +55,7 @@ const CEILINGS = {
   renderCards: 113_000,
   selectionTotal: 8_070,
   railMessageTotal: 2_676_966,
-  railRow: 1_280,
+  railRow: 1_255,
   duplicateWaste: 243_665,
 };
 
