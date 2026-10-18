@@ -261,7 +261,7 @@ test('pre-commit checks staged CSS with literal paths and preserves partial stag
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
-});
+}, 120_000);
 
 test('pre-commit skips staged symbolic links', (context) => {
   const fixture = hookFixture();

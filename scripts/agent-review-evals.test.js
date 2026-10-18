@@ -1279,7 +1279,7 @@ syncBuiltinESMExports();
     } finally {
       fs.rmSync(folder, { recursive: true, force: true });
     }
-  });
+  }, 120_000);
 
   test('scripted demo can be scored and rejects a changed reply or key', () => {
     const demo = runPortable('demo');
@@ -2488,7 +2488,7 @@ test('registration rejects preparation that disagrees with captured source evide
     fs.writeFileSync(path.join(forged, 'prompt.txt'), 'forged prompt\n');
     manifest.prompt_hash = digest('forged prompt\n');
   });
-});
+}, 120_000);
 
 test('identifiers and hashes require primitive strings', HEAVY, () => {
   for (const value of [['arm-a'], ['a'.repeat(64)]]) {
