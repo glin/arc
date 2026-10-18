@@ -230,7 +230,7 @@ test('cumulative evidence reconciles distinct equal responses and delayed snapsh
   assert.equal(report.combined.costUsd, 0.006);
   assert.equal(report.parent.toolCalls, null);
   assert.equal(report.parent.requestsWithTwoOrMoreTools, null);
-  assert.equal(report.parent.cacheExpiry!.coverage, 'unknown-request-coverage');
+  assert.equal(report.parent.cacheExpiry!.coverage, 'complete');
   const later = sessionCostReport(file, { since: f.at(6), until: f.at(10), sourceOnly: true }).parent;
   assert.equal(later.requests, 0);
   assert.equal(later.costUsd, undefined);
@@ -525,6 +525,11 @@ test('a partial bill receives complete cumulative evidence without moving its ch
 
 test('missing ownership or cumulative counters preserve unknown coverage and the priced subtotal', () => {
   const f = cumulativeCostFixture();
+  const causes = {
+    thread_id: 'anonymous-evidence',
+    thread_token_usage: 'snapshot-unmatched',
+    turn_token_usage: 'snapshot-unmatched',
+  } as const;
   for (const field of ['thread_id', 'thread_token_usage', 'turn_token_usage'] as const) {
     const bill = f.bill('one', 3, 1);
     const { [field]: omitted, ...payload } = bill.payload;
@@ -535,6 +540,7 @@ test('missing ownership or cumulative counters preserve unknown coverage and the
     assert.equal(summary.coverage, 'billed-with-unknown-coverage');
     assert.equal(summary.costUsd, null);
     assert.equal(summary.pricedCostUsd, 0.003);
+    assert.equal(summary.coverageDefect?.cause, causes[field], field);
   }
 });
 
@@ -1391,6 +1397,364 @@ test('identified compaction usage keeps its priced subtotal beside a native norm
     assert.equal(summary.costUsd, null);
     assert.equal(summary.coverage, 'billed-with-unknown-coverage');
   }
+});
+
+// Usage vectors from the first compaction of a recorded Codex rollout: input, cached, cache write, output, reasoning.
+const RECORDED_COMPACTION = {
+  before: [253_027, 250_624, 0, 239, 31],
+  compaction: [255_583, 252_800, 0, 6_664, 0],
+  after: [35_516, 12_544, 0, 413, 27],
+  next: [45_415, 35_328, 0, 162, 56],
+} as const;
+
+function compactionCostFixture(id = 'parent') {
+  const f = cumulativeCostFixture(id);
+  const counters = (vector: readonly number[]) => ({
+    input_tokens: vector[0],
+    cached_input_tokens: vector[1],
+    cache_write_input_tokens: vector[2],
+    output_tokens: vector[3],
+    reasoning_output_tokens: vector[4],
+    total_tokens: vector[0] + vector[3],
+  });
+  const add = (...vectors: (readonly number[])[]) =>
+    vectors.reduce<number[]>((sum, vector) => sum.map((value, index) => value + vector[index]), [0, 0, 0, 0, 0]);
+  const bill = (response: string, second: number, usage: readonly number[], thread: readonly number[]) => ({
+    type: 'token_usage_record',
+    timestamp: f.at(second),
+    payload: {
+      thread_id: id,
+      session_id: 'root-parent',
+      turn_id: 'turn-1',
+      response_id: response,
+      usage: counters(usage),
+      thread_token_usage: counters(thread),
+      turn_token_usage: counters(thread),
+    },
+  });
+  const snapshot = (second: number, total: readonly number[], last: object) => ({
+    type: 'event_msg',
+    timestamp: f.at(second),
+    payload: { type: 'token_count', info: { total_token_usage: counters(total), last_token_usage: last } },
+  });
+  // Codex reports zero request counters and the new context size after a compaction.
+  const zeroLast = { ...counters([0, 0, 0, 0, 0]), total_tokens: 30_094 };
+  const compacted = (second: number, response: string, usage: readonly number[], thread: readonly number[]) => ({
+    type: 'compacted',
+    timestamp: f.at(second),
+    payload: {
+      message: '',
+      compaction_response_id: response,
+      latest_token_usage_record: {
+        thread_id: id,
+        turn_id: 'turn-1',
+        response_id: response,
+        usage: counters(usage),
+        thread_token_usage: counters(thread),
+        turn_token_usage: counters(thread),
+      },
+    },
+  });
+  const settings = (second: number) => ({
+    type: 'event_msg',
+    timestamp: f.at(second),
+    payload: { type: 'thread_settings_applied', thread_id: id, thread_settings: { model: 'gpt-6-sol' } },
+  });
+  // One compaction between two reconciled requests on each side. Thread totals include the compaction
+  // request. Snapshot totals exclude it.
+  const records = (
+    options: {
+      nativeAfter?: boolean;
+      withoutCompactionBill?: boolean;
+      withoutZeroSnapshot?: boolean;
+      afterExtraInput?: number;
+      // Fields that replace the compacted record's copy of the compaction bill.
+      copy?: Record<string, unknown>;
+    } = {},
+  ) => {
+    const { before, compaction, after, next } = RECORDED_COMPACTION;
+    const compactionThread = add(before, compaction);
+    const compactionBill = options.withoutCompactionBill
+      ? []
+      : [bill('compaction', options.nativeAfter ? 7 : 6, compaction, compactionThread)];
+    const compactedRecord = compacted(options.nativeAfter ? 6 : 7, 'compaction', compaction, compactionThread);
+    Object.assign(compactedRecord.payload.latest_token_usage_record, options.copy);
+    const record = [compactedRecord, settings(options.nativeAfter ? 6 : 7)];
+    const afterThread = add(compactionThread, after, [options.afterExtraInput ?? 0, 0, 0, 0, 0]);
+    return [
+      ...f.start,
+      bill('before', 3, before, before),
+      snapshot(4, before, counters(before)),
+      ...(options.nativeAfter ? [...record, ...compactionBill] : [...compactionBill, ...record]),
+      ...(options.withoutZeroSnapshot ? [] : [snapshot(8, before, zeroLast)]),
+      bill('after', 10, after, afterThread),
+      snapshot(11, add(before, after), counters(after)),
+      bill('next', 12, next, add(compactionThread, after, next)),
+      snapshot(13, add(before, after, next), counters(next)),
+    ];
+  };
+  return { ...f, counters, add, bill, snapshot, zeroLast, compacted, settings, records };
+}
+
+test('an identified Codex compaction bill keeps the parent reconciled in every window around the compaction', () => {
+  for (const nativeAfter of [false, true]) {
+    const f = compactionCostFixture();
+    const file = f.save(f.records({ nativeAfter }));
+    const label = JSON.stringify({ nativeAfter });
+    const requests = readSessionRequests(file);
+    assert.equal(requests.filter((request) => request.compactionUsage && !request.evidenceOnly).length, 1, label);
+    const whole = sessionCostReport(file, { sourceOnly: true, byModel: true }).parent;
+    assert.equal(whole.coverage, 'recorded-reconciled', label);
+    assert.equal(whole.requests, 4, label);
+    assert.equal(whole.requestCountExact, undefined, label);
+    assert.equal(typeof whole.costUsd, 'number', label);
+    assert.equal(whole.costUsd, whole.pricedCostUsd, label);
+    assert.equal(whole.contextMax, RECORDED_COMPACTION.compaction[0], label);
+    assert.equal(whole.contextFirst, RECORDED_COMPACTION.before[0], label);
+    assert.equal(whole.coverageDefect, undefined, label);
+    const ending = sessionCostReport(file, { until: f.at(9), sourceOnly: true }).parent;
+    assert.equal(ending.coverage, 'recorded-reconciled', label);
+    assert.equal(ending.requests, 2, label);
+    assert.equal(typeof ending.costUsd, 'number', label);
+    const starting = sessionCostReport(file, { since: f.at(9), sourceOnly: true }).parent;
+    assert.equal(starting.coverage, 'recorded-reconciled', label);
+    assert.equal(starting.requests, 2, label);
+    assert.equal(typeof starting.costUsd, 'number', label);
+    assert.equal(starting.contextFirst, RECORDED_COMPACTION.after[0], label);
+    assert.equal(starting.contextMax, RECORDED_COMPACTION.next[0], label);
+    const empty = sessionCostReport(file, { since: f.at(9), until: f.at(9), sourceOnly: true }).parent;
+    assert.equal(empty.requests, 0, label);
+    assert.equal(empty.costUsd, undefined, label);
+    assert.equal(empty.coverage, undefined, label);
+  }
+});
+
+test('Codex reconciliation continues through several compactions and stops at a genuine counter reset', () => {
+  const f = compactionCostFixture();
+  const { before, compaction, after } = RECORDED_COMPACTION;
+  const second = [276_066, 271_104, 0, 8_480, 0];
+  const first = f.add(before, compaction);
+  const middle = f.add(first, after);
+  const secondThread = f.add(middle, second);
+  const last = f.add(secondThread, after);
+  const reset = [1_000, 0, 0, 100, 0];
+  const file = f.save([
+    ...f.start,
+    f.bill('before', 3, before, before),
+    f.snapshot(4, before, f.counters(before)),
+    f.bill('compaction-1', 5, compaction, first),
+    f.compacted(6, 'compaction-1', compaction, first),
+    f.settings(6),
+    f.snapshot(7, before, f.zeroLast),
+    f.bill('after-1', 8, after, middle),
+    f.snapshot(9, f.add(before, after), f.counters(after)),
+    f.bill('compaction-2', 10, second, secondThread),
+    f.compacted(11, 'compaction-2', second, secondThread),
+    f.settings(11),
+    f.snapshot(12, f.add(before, after), f.zeroLast),
+    f.bill('after-2', 13, after, last),
+    f.snapshot(14, f.add(before, after, after), f.counters(after)),
+    f.snapshot(15, [0, 0, 0, 0, 0], f.counters([0, 0, 0, 0, 0])),
+    f.bill('restart', 16, reset, reset),
+    f.snapshot(17, reset, f.counters(reset)),
+    // A compaction after the new baseline must not carry the offsets gained before the reset.
+    f.bill('compaction-3', 18, second, f.add(reset, second)),
+    f.compacted(19, 'compaction-3', second, f.add(reset, second)),
+    f.settings(19),
+    f.snapshot(20, reset, f.zeroLast),
+    f.bill('after-3', 21, after, f.add(reset, second, after)),
+    f.snapshot(22, f.add(reset, after), f.counters(after)),
+  ]);
+  const reconciled = sessionCostReport(file, { until: f.at(15), sourceOnly: true }).parent;
+  assert.equal(reconciled.coverage, 'recorded-reconciled');
+  assert.equal(reconciled.requests, 5);
+  assert.equal(typeof reconciled.costUsd, 'number');
+  const resetWindow = sessionCostReport(file, { since: f.at(15), until: f.at(16), sourceOnly: true }).parent;
+  assert.equal(resetWindow.coverage, 'billed-with-unknown-coverage');
+  assert.equal(resetWindow.costUsd, null);
+  assert.deepEqual(resetWindow.coverageDefect, {
+    kind: 'billed-with-unknown-coverage',
+    since: f.at(15),
+    cause: 'reset',
+  });
+  const restarted = sessionCostReport(file, { since: f.at(16), sourceOnly: true }).parent;
+  assert.equal(restarted.coverage, 'recorded-reconciled');
+  assert.equal(restarted.requests, 3);
+  assert.equal(typeof restarted.costUsd, 'number');
+  assert.equal(restarted.coverageDefect, undefined);
+  const latest = sessionCostReport(file, { since: f.at(21), sourceOnly: true }).parent;
+  assert.equal(latest.coverage, 'recorded-reconciled');
+  assert.equal(latest.requests, 1);
+  assert.equal(typeof latest.costUsd, 'number');
+});
+
+test('an unexplained Codex compaction offset keeps the full cost unknown', () => {
+  for (const options of [{ afterExtraInput: 1 }, { withoutCompactionBill: true }, { withoutZeroSnapshot: true }]) {
+    const f = compactionCostFixture();
+    const file = f.save(f.records(options));
+    const label = JSON.stringify(options);
+    for (const window of [{}, { since: f.at(9) }]) {
+      const summary = sessionCostReport(file, { ...window, sourceOnly: true }).parent;
+      assert.notEqual(summary.coverage, 'recorded-reconciled', label);
+      assert.notEqual(summary.coverage, undefined, label);
+      assert.equal(summary.costUsd, null, label);
+      assert.equal(summary.requestCountExact, false, label);
+      assert.equal(summary.contextMax, null, label);
+    }
+    const earlier = sessionCostReport(file, { until: f.at(5), sourceOnly: true }).parent;
+    assert.equal(earlier.coverage, 'recorded-reconciled', label);
+    assert.equal(typeof earlier.costUsd, 'number', label);
+  }
+});
+
+test('a compacted record whose bill copy disagrees with the native bill keeps the full cost unknown', () => {
+  const { compaction, before } = RECORDED_COMPACTION;
+  const f = compactionCostFixture();
+  const variants = {
+    usage: { usage: f.counters(f.add(compaction, compaction)) },
+    thread: { thread_id: 'foreign' },
+    response: { response_id: 'other-response' },
+    cumulative: { thread_token_usage: f.counters(f.add(before, compaction, [1, 0, 0, 0, 0])) },
+  };
+  for (const nativeAfter of [false, true]) {
+    for (const [name, copy] of Object.entries(variants)) {
+      const file = f.save(f.records({ nativeAfter, copy }));
+      const label = JSON.stringify({ nativeAfter, name });
+      for (const window of [{}, { since: f.at(9) }]) {
+        const summary = sessionCostReport(file, { ...window, sourceOnly: true }).parent;
+        assert.equal(summary.coverage, 'billed-with-unknown-coverage', label);
+        assert.equal(summary.costUsd, null, label);
+        assert.equal(summary.requestCountExact, false, label);
+        assert.equal(summary.coverageDefect?.kind, 'billed-with-unknown-coverage', label);
+      }
+    }
+  }
+});
+
+test('the coverage diagnostic names the first unresolved interval and its cause', () => {
+  const f = compactionCostFixture();
+  const unmatched = f.save(f.records({ withoutCompactionBill: true }));
+  for (const window of [{}, { since: f.at(9) }]) {
+    const report = sessionCostReport(unmatched, { ...window, sourceOnly: true, byModel: true });
+    assert.deepEqual(report.parent.coverageDefect, {
+      kind: 'billed-with-unknown-coverage',
+      since: f.at(7),
+      cause: 'compaction-unmatched',
+    });
+    for (const row of report.parent.modelCosts!) assert.equal('coverageDefect' in row, false);
+    assert.equal(report.combined.coverageDefect, undefined);
+  }
+  const legacy = cumulativeCostFixture('legacy');
+  const file = legacy.save([...legacy.start, legacy.snapshot(4, 1)]);
+  const summary = sessionCostReport(file, { sourceOnly: true }).parent;
+  assert.equal(summary.coverage, 'legacy-snapshots');
+  assert.deepEqual(summary.coverageDefect, { kind: 'legacy-snapshots', since: null, cause: 'legacy-snapshots' });
+  // An unmatched bill precedes a cumulative jump. The gap sets the kind, and the earlier interval sets the rest.
+  const mixed = cumulativeCostFixture();
+  const jump = sessionCostReport(
+    mixed.save([
+      ...mixed.start,
+      mixed.bill('one', 3, 1),
+      mixed.snapshot(4, 1),
+      mixed.bill('two', 5, 2),
+      mixed.bill('three', 6, 3),
+      mixed.snapshot(7, 3),
+      mixed.bill('five', 8, 5),
+      mixed.snapshot(9, 5),
+    ]),
+    { sourceOnly: true },
+  ).parent;
+  assert.deepEqual(jump.coverageDefect, { kind: 'recorded-gaps', since: mixed.at(5), cause: 'snapshot-unmatched' });
+});
+
+test('parent, child, combined, and model figures agree for a reconciled compaction', () => {
+  const root = directory();
+  const f = compactionCostFixture();
+  const child = cumulativeCostFixture('child');
+  const parent = write(path.join(root, 'rollout-2026-09-26T00-00-00-parent.jsonl'), f.records());
+  write(path.join(root, 'rollout-2026-09-26T00-00-00-child.jsonl'), [
+    { ...child.start[0], payload: { ...child.start[0].payload, parent_thread_id: 'parent' } },
+    ...child.start.slice(1),
+    child.bill('child-one', 3, 1),
+    child.snapshot(4, 1),
+  ]);
+  const report = sessionCostReport(parent, { roots: { codexSessions: root, projects: root }, byModel: true });
+  assert.equal(report.parent.coverage, 'recorded-reconciled');
+  assert.equal(report.parent.requests, 4);
+  assert.equal(typeof report.parent.costUsd, 'number');
+  assert.equal(report.children.length, 1);
+  assert.equal(report.children[0].coverage, 'recorded-reconciled');
+  assert.equal(report.children[0].costUsd, 0.003);
+  assert.equal(report.combined.coverage, 'recorded-reconciled');
+  assert.equal(report.combined.requests, 5);
+  assert.equal(report.combined.costUsd, Math.round((report.parent.costUsd! + 0.003) * 10_000) / 10_000);
+  assert.equal(report.combined.contextMax, RECORDED_COMPACTION.compaction[0]);
+  const rows = report.parent.modelCosts!;
+  assert.deepEqual(
+    rows.map((row) => [row.model, row.requests, row.costUsd]),
+    [['gpt-6-sol', 4, report.parent.costUsd]],
+  );
+  for (const row of [...rows, ...report.children[0].modelCosts!]) assert.equal('coverageDefect' in row, false);
+});
+
+function cacheExpiryCostFixture() {
+  const f = compactionCostFixture();
+  const usage = [100_000, 90_000, 0, 500, 0];
+  const records = (
+    options: { withoutFirst?: boolean; withoutFirstSnapshot?: boolean; withoutSecondSnapshot?: boolean } = {},
+  ) => {
+    const gap = 31 * 60;
+    // An unmatched first bill needs an earlier reconciled baseline, so its successor still reconciles.
+    const base = options.withoutFirstSnapshot ? usage : [0, 0, 0, 0, 0];
+    return [
+      ...f.start,
+      ...(options.withoutFirstSnapshot
+        ? [f.bill('opening', 2, usage, usage), f.snapshot(2, usage, f.counters(usage))]
+        : []),
+      ...(options.withoutFirst ? [] : [f.bill('first', 3, usage, f.add(base, usage))]),
+      ...(options.withoutFirst || options.withoutFirstSnapshot
+        ? []
+        : [f.snapshot(4, f.add(base, usage), f.counters(usage))]),
+      f.bill('second', 3 + gap, usage, f.add(base, usage, usage)),
+      ...(options.withoutSecondSnapshot ? [] : [f.snapshot(4 + gap, f.add(base, usage, usage), f.counters(usage))]),
+    ];
+  };
+  return { ...f, records, gap: 31 * 60 };
+}
+
+test('a reconciled Codex source prices its cache-expiry return', () => {
+  const f = cacheExpiryCostFixture();
+  const summary = sessionCostReport(f.save(f.records()), { sourceOnly: true }).parent;
+  assert.equal(summary.coverage, 'recorded-reconciled');
+  assert.equal(summary.cacheExpiry!.coverage, 'complete');
+  assert.equal(summary.cacheExpiry!.returns, 1);
+  assert.equal(summary.cacheExpiry!.longestGapSeconds, f.gap);
+  assert.equal(typeof summary.cacheExpiry!.extraCostAfterExpiryUsd, 'number');
+  assert.equal(typeof summary.cacheExpiry!.inputCostAfterExpiryUsd, 'number');
+  assert.equal(summary.toolCalls, null);
+  assert.equal(summary.requestsWithTwoOrMoreTools, null);
+});
+
+test('cache expiry uses the request before the window and stays unknown when that request is unknown', () => {
+  const f = cacheExpiryCostFixture();
+  const since = f.at(10);
+  const windowed = sessionCostReport(f.save(f.records()), { since, sourceOnly: true }).parent;
+  assert.equal(windowed.requests, 1);
+  assert.equal(windowed.coverage, 'recorded-reconciled');
+  assert.equal(windowed.cacheExpiry!.coverage, 'complete');
+  assert.equal(windowed.cacheExpiry!.returns, 1);
+  assert.equal(typeof windowed.cacheExpiry!.extraCostAfterExpiryUsd, 'number');
+  const unmatched = sessionCostReport(f.save(f.records({ withoutFirstSnapshot: true })), { since, sourceOnly: true });
+  assert.equal(unmatched.parent.coverage, 'recorded-reconciled');
+  assert.equal(unmatched.parent.cacheExpiry!.coverage, 'unknown-request-coverage');
+  assert.equal(unmatched.parent.cacheExpiry!.extraCostAfterExpiryUsd, null);
+  const missing = sessionCostReport(f.save(f.records({ withoutFirst: true })), { since, sourceOnly: true }).parent;
+  assert.equal(missing.cacheExpiry!.coverage, 'unknown-request-coverage');
+  assert.equal(missing.cacheExpiry!.extraCostAfterExpiryUsd, null);
+  const unknown = sessionCostReport(f.save(f.records({ withoutSecondSnapshot: true })), { sourceOnly: true }).parent;
+  assert.equal(unknown.coverage, 'billed-with-unknown-coverage');
+  assert.equal(unknown.cacheExpiry!.coverage, 'unknown-request-coverage');
+  assert.equal(unknown.cacheExpiry!.inputCostAfterExpiryUsd, null);
 });
 
 test('equal billing usage on separate responses does not merge across a preceding snapshot', () => {
@@ -3093,7 +3457,9 @@ test('a Codex session reports a linked multi-request Claude print result without
     });
     assert.deepEqual(direct.parent, ordinary.parent);
     assert.deepEqual(direct.children, []);
+    // The coverage diagnostic belongs to source summaries only.
     const { modelCosts, ...parent } = direct.parent;
+    delete parent.coverageDefect;
     assert.deepEqual(direct.combined, parent);
     assert.equal(modelCosts!.length, direct.parent.requests ? 1 : 0);
     assert.equal('modelCosts' in direct.combined, false);

@@ -74,8 +74,20 @@ export interface SessionRequest extends UsageEvent {
   coverageDefect?: {
     kind: 'recorded-gaps' | 'billed-with-unknown-coverage' | 'unknown-request-coverage';
     until: number;
+    cause?: CoverageCause;
   };
 }
+
+// What made a Codex interval unresolved. A summary reports the cause of its earliest intersecting interval.
+export type CoverageCause =
+  | 'compaction-unmatched'
+  | 'snapshot-unmatched'
+  | 'foreign-thread'
+  | 'conflicting-bill'
+  | 'cumulative-jump'
+  | 'reset'
+  | 'anonymous-evidence'
+  | 'legacy-snapshots';
 
 interface CacheExpiryReport {
   coverage: 'complete' | 'unknown-request-coverage';
@@ -135,6 +147,12 @@ export interface SessionCostSummary {
   fastModeUnpricedRequests?: number;
   cacheExpiry?: CacheExpiryReport;
   modelCosts?: ModelCostSummary[];
+  // Source summaries only. Combined summaries and model rows omit it.
+  coverageDefect?: {
+    kind: Exclude<NonNullable<SessionCostSummary['coverage']>, 'recorded-reconciled'>;
+    since: string | null;
+    cause: CoverageCause;
+  };
 }
 
 export type ModelCostSummary = Pick<
@@ -256,7 +274,8 @@ function requestQuote(request: SessionRequest) {
       });
 }
 
-function cacheExpiry(requests: readonly SessionRequest[]): CacheExpiryReport {
+// A predecessor is the request before the first selected one. It establishes adjacency and is never charged.
+function cacheExpiry(requests: readonly SessionRequest[], predecessor?: SessionRequest): CacheExpiryReport {
   const report: CacheExpiryReport = {
     coverage: 'complete',
     returns: 0,
@@ -271,6 +290,7 @@ function cacheExpiry(requests: readonly SessionRequest[]): CacheExpiryReport {
   };
   // Advisor consultations do not establish executor cache-expiry neighbors.
   const rows = requests.filter((request) => !request.evidenceOnly && !request.usageOrigin);
+  if (predecessor) rows.unshift(predecessor);
   for (let index = 1; index < rows.length; index++) {
     const before = rows[index - 1];
     const after = rows[index];
@@ -464,10 +484,44 @@ function modelCosts(
     }));
 }
 
+function coverageDiagnostic(
+  requests: readonly SessionRequest[],
+  coverage: SessionCostSummary['coverage'],
+): SessionCostSummary['coverageDefect'] {
+  if (!coverage || coverage === 'recorded-reconciled') return undefined;
+  if (coverage === 'legacy-snapshots') return { kind: coverage, since: null, cause: 'legacy-snapshots' };
+  const earliest = (rows: readonly SessionRequest[]) =>
+    rows.reduce<SessionRequest | null>((first, row) => (!first || row.timestamp < first.timestamp ? row : first), null);
+  // The aggregate kind ranks classes, but the start and cause come from the earliest interval of any class.
+  const interval = earliest(requests.filter((request) => request.coverageDefect));
+  if (interval)
+    return {
+      kind: coverage,
+      since: new Date(interval.timestamp).toISOString(),
+      cause: interval.coverageDefect!.cause ?? 'anonymous-evidence',
+    };
+  const anonymous = earliest(
+    requests.filter(
+      (request) =>
+        !request.coverageDefect &&
+        !request.toolOnly &&
+        !request.recordedReconciled &&
+        (request.evidenceOnly || request.billingRecord),
+    ),
+  );
+  return {
+    kind: coverage,
+    since: anonymous ? new Date(anonymous.timestamp).toISOString() : null,
+    cause: 'anonymous-evidence',
+  };
+}
+
+// expiryPredecessor is the source's request before the window, or unknown when the source cannot establish it.
 export function summarizeRequests(
   requests: readonly SessionRequest[],
   codexFailures?: number,
   byModel = false,
+  expiryPredecessor?: SessionRequest | 'unknown',
 ): SessionCostSummary {
   const evidence = requests.filter((request) => request.evidenceOnly);
   const snapshots = evidence.filter((request) => !request.toolOnly && !request.coverageDefect);
@@ -477,7 +531,7 @@ export function summarizeRequests(
   const failedRequests = pricedRequests.filter((request) => (request.failedToolCalls ?? 0) > 0);
   const failedToolCalls =
     (codexFailures ?? 0) + failedRequests.reduce((sum, request) => sum + (request.failedToolCalls ?? 0), 0);
-  const expiry = cacheExpiry(requests);
+  const expiry = cacheExpiry(requests, expiryPredecessor === 'unknown' ? undefined : expiryPredecessor);
   const diagnostics = {
     failedToolCalls,
     failedToolCallRequests: failedRequests.length,
@@ -511,6 +565,7 @@ export function summarizeRequests(
             ? 'recorded-reconciled'
             : undefined;
   const uncertainCoverage = coverage !== undefined && coverage !== 'recorded-reconciled';
+  const coverageDefect = coverageDiagnostic(requests, coverage);
   if (!count) {
     if (byModel) summary.modelCosts = [];
     if (evidence.length) {
@@ -520,6 +575,7 @@ export function summarizeRequests(
     }
     Object.assign(summary, diagnostics);
     if (coverage) summary.coverage = coverage;
+    if (coverageDefect) summary.coverageDefect = coverageDefect;
     if (uncertainCoverage) {
       summary.requestCountExact = false;
       summary.costUsd = null;
@@ -529,9 +585,11 @@ export function summarizeRequests(
     }
     return summary;
   }
+  // Bills establish request identity and order, which expiry adjacency needs, but not tool attribution.
   const toolEvidenceExact = !billed && !billedEvidence && !uncertainCoverage;
   if (
-    !toolEvidenceExact ||
+    uncertainCoverage ||
+    expiryPredecessor === 'unknown' ||
     pricedRequests.some((request) => request.requestCountExact === false || request.incomplete)
   ) {
     diagnostics.cacheExpiry.coverage = 'unknown-request-coverage';
@@ -644,6 +702,7 @@ export function summarizeRequests(
     models: [...models].sort(),
     unpricedModels: [...unpricedModels].sort(),
     ...diagnostics,
+    ...(coverageDefect ? { coverageDefect } : {}),
   };
   if (byModel) result.modelCosts = modelCosts(pricedRequests, costs, result);
   return result;
@@ -708,14 +767,33 @@ export function sessionCostReport(
       : (since === null || request.timestamp >= since) && (until === null || request.timestamp < until);
   const allRequestsFor = (source: SessionSource) =>
     source.requests ?? readSessionRequests(source.file, source.kind, source.invocationId);
-  const requestsFor = (source: SessionSource) => allRequestsFor(source).filter(inWindow);
   const failureCount = (source: SessionSource) =>
     source.failedToolTimestamps?.filter((at) => (since === null || at >= since) && (until === null || at < until))
       .length;
+  // The request before the first selected request supplies cache-expiry adjacency across --since.
+  const expiryPredecessor = (all: readonly SessionRequest[]): SessionRequest | 'unknown' | undefined => {
+    if (since === null) return undefined;
+    const rows = all.filter((request) => !request.evidenceOnly && !request.usageOrigin);
+    const first = rows.findIndex(inWindow);
+    if (first < 0) return undefined;
+    const previous = first > 0 ? rows[first - 1] : null;
+    const from = previous?.timestamp ?? -Infinity;
+    const unknown =
+      (previous &&
+        (previous.timestamp >= since ||
+          previous.incomplete ||
+          previous.requestCountExact === false ||
+          (previous.billingRecord && !previous.recordedReconciled))) ||
+      all.some((request) => request.coverageDefect && request.timestamp < since && request.coverageDefect.until > from);
+    return unknown ? 'unknown' : (previous ?? undefined);
+  };
   const parent = sources[0];
   const allParentRequests = allRequestsFor(parent);
   const parentRequests = allParentRequests.filter(inWindow);
-  const children = sources.slice(1).map((source) => ({ source, requests: requestsFor(source) }));
+  const children = sources.slice(1).map((source) => {
+    const all = allRequestsFor(source);
+    return { source, requests: all.filter(inWindow), predecessor: expiryPredecessor(all) };
+  });
   const firstRequestTime = (requests: readonly SessionRequest[]) =>
     requests.reduce((first, request) => Math.min(first, request.timestamp), Infinity);
   const retained = children
@@ -730,14 +808,19 @@ export function sessionCostReport(
         (left, right) => left.timestamp - right.timestamp,
       );
   const sol = PROMOTIONS.find(({ pattern }) => pattern.test('gpt-5.6-sol'))?.promo;
-  const parentSummary = summarizeRequests(parentRequests, failureCount(parent), options.byModel);
-  const childReports = retained.map(({ source, requests }) => ({
+  const parentSummary = summarizeRequests(
+    parentRequests,
+    failureCount(parent),
+    options.byModel,
+    expiryPredecessor(allParentRequests),
+  );
+  const childReports = retained.map(({ source, requests, predecessor }) => ({
     kind: source.kind,
     file: source.file,
     sessionId: source.sessionId,
     ...(source.agent ? { agent: source.agent } : {}),
     ...(source.invocationId ? { invocationId: source.invocationId } : {}),
-    ...summarizeRequests(requests, failureCount(source), options.byModel),
+    ...summarizeRequests(requests, failureCount(source), options.byModel, predecessor),
   }));
   const combinedFailureCount = [parent, ...retained.map(({ source }) => source)].map(failureCount);
   const combinedSummary = summarizeRequests(
@@ -746,6 +829,7 @@ export function sessionCostReport(
       ? combinedFailureCount.reduce<number>((sum, count) => sum + (count ?? 0), 0)
       : undefined,
   );
+  delete combinedSummary.coverageDefect;
   const expiries = [parentSummary, ...childReports].map((summary) => summary.cacheExpiry!);
   const combinedExpiry = combineCacheExpirySummaries(
     expiries.map((expiry) => ({
@@ -1123,7 +1207,22 @@ interface CodexCostSnapshot {
   segment: number;
   total: CodexCostVector | null;
   last: CodexCostVector | null;
+  // Every request counter of last_token_usage is zero, whatever its total_tokens says.
+  zeroCounters?: true;
+  // Identified compaction usage added to total, because snapshot totals exclude compaction requests.
+  offset?: CodexCostVector;
   matched?: true;
+}
+interface CodexCostBoundary {
+  timestamp: number;
+  segment: number;
+  turnId: string | null;
+  order: number;
+  cause: CoverageCause;
+  // The compaction request that a compacted record names, as the reducer identified it.
+  responseId?: string;
+  // The compacted record's copy of the compaction bill, as raw fields.
+  embedded?: { responseId?: unknown; threadId?: unknown; usage?: unknown; thread?: unknown; turn?: unknown };
 }
 
 // Snapshot records omit a zero cache-write counter on some client versions.
@@ -1147,6 +1246,81 @@ function costVector(value: unknown): CodexCostVector | null {
 
 function equalCostVector(left: CodexCostVector | null, right: CodexCostVector | null): boolean {
   return left !== null && right !== null && left.every((value, index) => value === right[index]);
+}
+
+function addCostVector(left: CodexCostVector, right: CodexCostVector, sign = 1): CodexCostVector {
+  return left.map((value, index) => value + sign * right[index]);
+}
+
+// Codex token_count totals exclude compaction requests, while billing thread totals include them.
+// A compaction explains that difference when its named response has an owned, complete bill and the next
+// snapshot repeats the total before that bill with zero request counters. Such a compaction starts no
+// segment, every later snapshot total gains the bill's usage, and the next snapshot becomes the compaction
+// bill's zero-usage snapshot. Matching still requires exact totals, so an unexplained offset leaves bills
+// unreconciled. The compacted record repeats the bill, and every field that copy carries must agree with it.
+// A snapshot total that moves backward restarts the counters, so offsets gained before it no longer apply.
+function applyCompactionOffsets(
+  bills: ReadonlyMap<string, CodexBillEvidence>,
+  snapshots: readonly CodexCostSnapshot[],
+  boundaries: readonly CodexCostBoundary[],
+  openingId: string | null,
+): CodexCostBoundary[] {
+  const ordered = [...snapshots].sort((left, right) => left.order - right.order);
+  const accepted: { boundary: CodexCostBoundary; usage: CodexCostVector; first: CodexCostSnapshot }[] = [];
+  let offset: CodexCostVector | null = null;
+  let cursor = 0;
+  let previousTotal: CodexCostVector | null = null;
+  const agrees = (value: unknown, vector: CodexCostVector | null) =>
+    value === undefined || equalCostVector(costVector(value), vector);
+  for (const boundary of [...boundaries].sort((left, right) => left.order - right.order)) {
+    for (; cursor < ordered.length && ordered[cursor].order < boundary.order; cursor++) {
+      const total = ordered[cursor].total;
+      if (!total) continue;
+      if (previousTotal?.some((value, index) => total[index] < value)) offset = null;
+      previousTotal = total;
+    }
+    const bill = boundary.responseId ? bills.get(boundary.responseId) : undefined;
+    const copy = boundary.embedded;
+    if (
+      !openingId ||
+      !bill?.usage ||
+      !bill.thread ||
+      bill.threadId !== openingId ||
+      bill.conflicted ||
+      bill.request.incomplete ||
+      (copy &&
+        ((copy.responseId !== undefined && copy.responseId !== boundary.responseId) ||
+          (copy.threadId !== undefined && copy.threadId !== openingId) ||
+          !agrees(copy.usage, bill.usage) ||
+          !agrees(copy.thread, bill.thread) ||
+          !agrees(copy.turn, bill.turn)))
+    )
+      continue;
+    const first = ordered.find((snapshot) => snapshot.order > boundary.order);
+    const before = addCostVector(bill.thread, bill.usage, -1);
+    if (!first?.zeroCounters || !equalCostVector(first.total, offset ? addCostVector(before, offset, -1) : before))
+      continue;
+    accepted.push({ boundary, usage: bill.usage, first });
+    offset = offset ? addCostVector(offset, bill.usage) : bill.usage;
+  }
+  if (!accepted.length) return [...boundaries];
+  const removed = (order: number) => accepted.filter(({ boundary }) => boundary.order < order).length;
+  for (const bill of bills.values()) {
+    bill.segment -= removed(bill.order);
+    for (const observation of bill.observations) observation.segment -= removed(observation.order);
+  }
+  for (const { boundary, usage, first } of accepted) {
+    first.last ??= usage.map(() => 0);
+    for (const snapshot of ordered) {
+      if (snapshot.order < boundary.order || !snapshot.total) continue;
+      snapshot.total = addCostVector(snapshot.total, usage);
+      snapshot.offset = snapshot.offset ? addCostVector(snapshot.offset, usage) : usage;
+    }
+  }
+  for (const snapshot of snapshots) snapshot.segment -= removed(snapshot.order);
+  const kept = boundaries.filter((boundary) => !accepted.some((item) => item.boundary === boundary));
+  for (const boundary of kept) boundary.segment -= removed(boundary.order);
+  return kept;
 }
 
 function matchCostSnapshots(
@@ -1198,7 +1372,7 @@ function matchCostSnapshots(
 function classifyCostSegments(
   bills: readonly CodexBillEvidence[],
   snapshots: CodexCostSnapshot[],
-  boundaries: { timestamp: number; segment: number; turnId: string | null; order: number }[],
+  boundaries: CodexCostBoundary[],
   openingId: string | null,
 ) {
   const pending = new Map<string, { rows: CodexBillEvidence[]; next: number }>();
@@ -1254,6 +1428,8 @@ function classifyCostSegments(
   let previous: CodexCostSnapshot | null = null;
   let progress = 0;
   let previousProgress = -1;
+  // A genuine reset restarts both counters, so compaction offsets before it no longer apply.
+  let cleared: CodexCostVector | null = null;
   const retained: CodexCostSnapshot[] = [];
   for (const arrival of arrivals) {
     if ('boundary' in arrival) {
@@ -1274,6 +1450,10 @@ function classifyCostSegments(
       }
     } else {
       const snapshot = arrival.snapshot;
+      if (cleared && snapshot.offset && snapshot.total) {
+        snapshot.total = addCostVector(snapshot.total, cleared, -1);
+        snapshot.offset = addCostVector(snapshot.offset, cleared, -1);
+      }
       const duplicate =
         previous &&
         previousProgress === progress &&
@@ -1317,12 +1497,23 @@ function classifyCostSegments(
         );
       retained.push(snapshot);
       if (reset) {
+        const raw = (item: CodexCostSnapshot) =>
+          item.offset ? addCostVector(item.total!, item.offset, -1) : item.total!;
+        // When the recorded counters still advance, only an unexplained compaction offset makes them drop.
+        const offsetMismatch =
+          snapshot.offset && previous?.total && raw(snapshot).every((value, index) => value >= raw(previous!)[index]);
         boundaries.push({
           timestamp: snapshot.timestamp,
           segment: ++segment,
           turnId: snapshot.turnId,
           order: snapshot.order,
+          cause: offsetMismatch ? 'compaction-unmatched' : 'reset',
         });
+        if (snapshot.offset) {
+          cleared = cleared ? addCostVector(cleared, snapshot.offset) : snapshot.offset;
+          snapshot.total = raw(snapshot);
+          delete snapshot.offset;
+        }
         segmentStart = snapshot.order;
         frontier = null;
         previous = null;
@@ -1338,7 +1529,7 @@ function classifyCostSegments(
 function reconcileCodexCosts(
   bills: readonly CodexBillEvidence[],
   snapshots: readonly CodexCostSnapshot[],
-  boundaries: readonly { timestamp: number; segment: number; turnId: string | null }[],
+  boundaries: readonly CodexCostBoundary[],
   openingId: string | null,
   openingTimestamp: number,
 ): SessionRequest[] {
@@ -1350,6 +1541,7 @@ function reconcileCodexCosts(
     start: number,
     end: number,
     segment: number,
+    cause: CoverageCause,
   ) => {
     defectSegments.push(segment);
     defects.push({
@@ -1373,7 +1565,11 @@ function reconcileCodexCosts(
       recordedReconciled: undefined,
       evidenceOnly: true,
       billedCoverage: true,
-      coverageDefect: { kind, until: Math.max(start, end) === Infinity ? Infinity : Math.max(start, end) + 1 },
+      coverageDefect: {
+        kind,
+        until: Math.max(start, end) === Infinity ? Infinity : Math.max(start, end) + 1,
+        cause,
+      },
     });
   };
   const matched = new Set<CodexCostSnapshot>();
@@ -1382,6 +1578,8 @@ function reconcileCodexCosts(
   const restarts: CodexBillEvidence[] = [];
   let previous: CodexBillEvidence | null = null;
   let baselineKnown = false;
+  // Why the current segment has no known baseline, when a boundary or a broken progression removed it.
+  let baselineCause: CoverageCause | null = null;
   let currentSegment = 0;
   const turnTotals = new Map<string, CodexCostVector>();
   for (const bill of bills) {
@@ -1389,6 +1587,7 @@ function reconcileCodexCosts(
       currentSegment = bill.segment;
       previous = null;
       baselineKnown = false;
+      baselineCause = boundaries.find((boundary) => boundary.segment === bill.segment)?.cause ?? null;
       turnTotals.clear();
     }
     const snapshot = matches.get(bill);
@@ -1404,8 +1603,10 @@ function reconcileCodexCosts(
       bill.threadId === openingId &&
       !bill.conflicted &&
       !bill.request.incomplete
-    )
+    ) {
       baselineKnown = true;
+      baselineCause = null;
+    }
     const expectedThread = previous?.thread
       ? (bill.usage?.map((value, index) => value + previous!.thread![index]) ?? null)
       : bill.usage;
@@ -1434,15 +1635,37 @@ function reconcileCodexCosts(
       if (!previous && zeroBaseline) restarts.push(bill);
     } else {
       const gap = positiveJump && ownership && baselineKnown && !bill.conflicted;
+      // Reset names counters that moved backward. Missing counters leave the bill without a snapshot match.
+      const backward = [
+        [bill.thread, expectedThread],
+        [bill.turn, expectedTurn],
+      ].some(([actual, expected]) => actual && expected && actual.some((value, index) => value < expected[index]));
+      const cause: CoverageCause = bill.conflicted
+        ? 'conflicting-bill'
+        : !ownership
+          ? bill.threadId === null || !openingId
+            ? 'anonymous-evidence'
+            : 'foreign-thread'
+          : gap
+            ? 'cumulative-jump'
+            : !baselineKnown && baselineCause
+              ? baselineCause
+              : !bill.usage || !bill.thread || !bill.turn || progression
+                ? 'snapshot-unmatched'
+                : backward
+                  ? 'reset'
+                  : 'cumulative-jump';
       defect(
         gap ? 'recorded-gaps' : 'billed-with-unknown-coverage',
         gap || !previous ? start : bill.request.timestamp,
         bill.request.timestamp,
         bill.segment,
+        cause,
       );
       if (!progression || !ownership || !bill.thread || bill.conflicted) {
         baselineKnown = false;
-        defect('billed-with-unknown-coverage', bill.request.timestamp, Infinity, bill.segment);
+        baselineCause = cause;
+        defect('billed-with-unknown-coverage', bill.request.timestamp, Infinity, bill.segment, cause);
       }
     }
     if (ownership) {
@@ -1461,6 +1684,7 @@ function reconcileCodexCosts(
           : restart.request.timestamp
         : Infinity,
       boundary.segment,
+      boundary.cause,
     );
   }
   // A delayed snapshot belongs to its matched bill, irrespective of report windows.
@@ -1490,6 +1714,7 @@ function reconcileCodexCosts(
       reset || unresolved ? snapshot.timestamp : start,
       reset ? Infinity : snapshot.timestamp,
       snapshot.segment,
+      reset ? 'reset' : cumulativeEvidence ? 'cumulative-jump' : 'snapshot-unmatched',
     );
   }
   for (const [index, request] of defects.entries()) {
@@ -1544,7 +1769,7 @@ export function readSessionRequests(
     { model: string | null; provider: string | null; serviceTier: string | null }
   >();
   const costSnapshots: CodexCostSnapshot[] = [];
-  const costBoundaries: { timestamp: number; segment: number; turnId: string | null; order: number }[] = [];
+  const costBoundaries: CodexCostBoundary[] = [];
   let sourceOrder = 0;
   let nativeRecords = false;
   let unsupported: 'array' | 'stream' | null = null;
@@ -1579,6 +1804,10 @@ export function readSessionRequests(
       return;
     }
     sourceOrder++;
+    const compactionsBeforeLine =
+      codex && line.includes('"compacted"')
+        ? (reducer as ReturnType<typeof createCodexUsageLineReducer>).snapshot().compactionCount
+        : null;
     try {
       const record = JSON.parse(line) as Record<string, unknown>;
       if (record && typeof record === 'object' && !Array.isArray(record)) {
@@ -1940,6 +2169,7 @@ export function readSessionRequests(
             segment: costSegment,
             turnId: null,
             order: sourceOrder,
+            cause: 'foreign-thread',
           });
         }
       } catch {
@@ -1956,15 +2186,52 @@ export function readSessionRequests(
       ) {
         const raw = JSON.parse(line) as {
           timestamp?: string;
-          payload?: { info?: { total_token_usage?: unknown; last_token_usage?: unknown } };
+          payload?: {
+            info?: { total_token_usage?: unknown; last_token_usage?: Record<string, unknown> };
+            latest_token_usage_record?: unknown;
+          };
         };
         const timestamp = Date.parse(raw.timestamp ?? '') || 0;
         if (record.kind === 'compacted') {
+          const latest = raw.payload?.latest_token_usage_record;
+          const embedded =
+            latest && typeof latest === 'object' && !Array.isArray(latest)
+              ? (latest as Record<string, unknown>)
+              : undefined;
           costSegment++;
-          costBoundaries.push({ timestamp, segment: costSegment, turnId: state.currentTurnId, order: sourceOrder });
+          const added =
+            compactionsBeforeLine !== null && state.compactionCount > compactionsBeforeLine
+              ? state.recentCompactions.find((item) => item.ordinal === state.compactionCount)
+              : undefined;
+          costBoundaries.push({
+            timestamp,
+            segment: costSegment,
+            turnId: state.currentTurnId,
+            order: sourceOrder,
+            cause: 'compaction-unmatched',
+            ...(added?.responseId ? { responseId: added.responseId } : {}),
+            ...(embedded
+              ? {
+                  embedded: {
+                    responseId: embedded.response_id,
+                    threadId: embedded.thread_id,
+                    usage: embedded.usage,
+                    thread: embedded.thread_token_usage,
+                    turn: embedded.turn_token_usage,
+                  },
+                }
+              : {}),
+          });
         } else if (raw.payload?.info) {
           const total = costVector(raw.payload.info.total_token_usage);
           const last = costVector(raw.payload.info.last_token_usage);
+          const counters = raw.payload.info.last_token_usage;
+          const zeroCounters =
+            !!counters &&
+            ['input_tokens', 'cached_input_tokens', 'output_tokens', 'reasoning_output_tokens'].every(
+              (field) => counters[field] === 0,
+            ) &&
+            (counters.cache_write_input_tokens === undefined || counters.cache_write_input_tokens === 0);
           if (!placeholder || total?.some((value) => value > 0)) {
             costSnapshots.push({
               turnId: state.currentTurnId,
@@ -1973,6 +2240,7 @@ export function readSessionRequests(
               segment: costSegment,
               total,
               last,
+              ...(zeroCounters ? { zeroCounters: true as const } : {}),
             });
           }
         }
@@ -2141,10 +2409,16 @@ export function readSessionRequests(
     }));
   if (!codex) return requests;
   const finalState = (reducer as ReturnType<typeof createCodexUsageLineReducer>).snapshot();
-  const scopedBoundaries = costBoundaries.filter((boundary) => !boundary.turnId || !copiedTurns.has(boundary.turnId));
+  const ownSnapshots = costSnapshots.filter((snapshot) => !copiedTurns.has(snapshot.turnId));
+  const scopedBoundaries = applyCompactionOffsets(
+    billingRecords,
+    ownSnapshots,
+    costBoundaries.filter((boundary) => !boundary.turnId || !copiedTurns.has(boundary.turnId)),
+    finalState.openingSessionId,
+  );
   const scopedSnapshots = classifyCostSegments(
     [...billingRecords.values()],
-    costSnapshots.filter((snapshot) => !copiedTurns.has(snapshot.turnId)),
+    ownSnapshots,
     scopedBoundaries,
     finalState.openingSessionId,
   );
@@ -2165,7 +2439,11 @@ export function readSessionRequests(
       ).map((request) => ({
         ...request,
         billedCoverage: undefined,
-        coverageDefect: { ...request.coverageDefect!, kind: 'unknown-request-coverage' as const },
+        coverageDefect: {
+          ...request.coverageDefect!,
+          kind: 'unknown-request-coverage' as const,
+          cause: 'anonymous-evidence' as const,
+        },
       }));
   const requestByTurn = new Map<string, SessionRequest>();
   for (const request of requests) {

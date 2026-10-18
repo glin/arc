@@ -51,7 +51,11 @@ function sourceOnlyParity(file: string, flags: string[] = []): void {
   const direct = JSON.parse(runCost([file, ...flags, '--source-only']));
   assert.deepEqual(direct.parent, ordinary.parent);
   assert.deepEqual(direct.children, []);
-  assert.deepEqual(direct.combined, direct.parent);
+  // The coverage diagnostic belongs to source summaries only.
+  const { coverageDefect, ...quantities } = direct.parent;
+  assert.deepEqual(direct.combined, quantities);
+  assert.equal('coverageDefect' in direct.combined, false);
+  assert.equal(coverageDefect === undefined || typeof coverageDefect.cause === 'string', true);
   for (const key of ['source', 'window', 'byToolKind', 'untilText', 'parentWindow'])
     assert.deepEqual(direct[key], ordinary[key]);
   assert.equal('modelCosts' in ordinary.parent, false);
@@ -60,7 +64,7 @@ function sourceOnlyParity(file: string, flags: string[] = []): void {
   assert.deepEqual(parent, ordinary.parent);
   assert.equal(Array.isArray(modelCosts), true);
   assert.deepEqual(detail.children, []);
-  assert.deepEqual(detail.combined, parent);
+  assert.deepEqual(detail.combined, quantities);
   for (const key of ['source', 'window', 'byToolKind', 'untilText', 'parentWindow'])
     assert.deepEqual(detail[key], ordinary[key]);
 }

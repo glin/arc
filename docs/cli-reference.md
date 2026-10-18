@@ -224,17 +224,34 @@ The [guide](cli.md#read-a-cost-report) defines top-level summaries and dollar fi
 | --- | --- |
 | `recorded-reconciled` | Recorded usage reconciles. A numeric total requires supported prices for every selected request. |
 | `recorded-gaps` | Recorded usage is missing. |
-| `billed-with-unknown-coverage` | Ownership, cumulative evidence, compaction, resets, or contradictory revisions remain unresolved. |
+| `billed-with-unknown-coverage` | Ownership, cumulative evidence, an unexplained compaction, resets, or contradictory revisions remain unresolved. |
 | `unknown-request-coverage` | Evidence lacks identified requests. |
 | `legacy-snapshots` | Estimates use snapshots without bills. |
 
 Unique Codex response IDs establish recorded billing requests. Identified compaction usage enters the total once, including when its native bill also exists. Combined coverage ranks gaps above unknown coverage, then reconciled usage.
+
+A compaction keeps reconciliation intact when its `compacted` record names a response, that response has a complete bill from the source thread, and the next snapshot repeats the total before that bill with zero request counters. When the `compacted` record carries a copy of that bill, each response, thread, usage, and cumulative field in the copy must equal the native bill. Each later snapshot must then equal its bill's thread total minus the usage of every earlier compaction bill that meets these conditions since the last snapshot reset, in every counter. Any other difference leaves coverage unresolved from that point.
+
+A source summary whose coverage is neither absent nor `recorded-reconciled` carries `coverageDefect`. Its `kind` repeats the coverage value. `since` is the start of the earliest intersecting unresolved interval of any kind, which can precede `--since`. It is null for `legacy-snapshots`, which has no interval. `cause` names what left that interval unresolved. Combined summaries and `modelCosts` rows omit `coverageDefect`. Unsupported prices appear in `unpricedModels` instead.
+
+| Cause | Meaning |
+| --- | --- |
+| `compaction-unmatched` | A compaction has no identified bill, its copy in the `compacted` record disagrees with the bill, or the bill does not explain later snapshot totals. |
+| `snapshot-unmatched` | A bill has no matching snapshot or no cumulative counters, or a snapshot has no matching bill. |
+| `foreign-thread` | A bill or session record belongs to another thread. |
+| `conflicting-bill` | Complete revisions of one bill disagree. |
+| `cumulative-jump` | Cumulative counters advanced beyond the identified bills. |
+| `reset` | Cumulative counters moved backward. |
+| `anonymous-evidence` | Evidence names no billing identity or no thread. |
+| `legacy-snapshots` | The source records snapshots and no bills. |
 
 `requestCountExact: false` marks uncertain recorded request counts. Omission establishes exact recorded identities, not complete provider logging. With bills present, anonymous snapshots appear under `snapshotEvidence`. Request averages remain null when request identity is uncertain. Codex tool attribution and batching remain null.
 
 An empty window omits cost fields without a coverage defect. An intersecting defect retains a null total and uncertain request count, even without selected requests. Evidence outside the window can resolve bills or reveal intersecting gaps.
 
 Source summaries include supported request counts, tokens, context, averages, tool batching, failures, fast-mode pricing gaps, and cache-expiry returns. Claude context uses the final executor pass input. Tokens sum every executor pass and advisor consultation. Codex failures retain a count without attributed request cost.
+
+`cacheExpiry.coverage` is `complete` when coverage is absent or `recorded-reconciled` and every selected request is exact and complete. The request before `--since` supplies the neighbor of the first selected request. It adds no return or charge. When the source cannot establish that request, `cacheExpiry.coverage` is `unknown-request-coverage`.
 
 `cacheExpiry.inputCostAfterExpiryUsd` prices uncached input and cache writes on return requests. It excludes cached reads and output. `extraCostAfterExpiryUsd` prices returning first-pass input that resends prior final-pass context, above the cached-read price. It excludes new prompt text. Unpriced returns leave either amount null.
 
