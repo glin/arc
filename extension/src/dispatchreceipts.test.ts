@@ -283,6 +283,89 @@ test.each(
   }
 });
 
+test.each([false, true])(
+  'idle alias flushes preserve lock history and repair changed files, background %s',
+  (background) => {
+    const { receipts, launch, home } = fixture();
+    const alias = path.join(home, 'live.log');
+    const standalone = receipts.reserve({
+      ...launch,
+      transport: 'standalone',
+      standalone: {
+        provider: background ? 'claude' : 'codex',
+        command: background ? 'claude' : 'codex',
+        args: [],
+        cwd: home,
+        model: 'test',
+        effort: 'high',
+        name: 'test',
+        agentRun: false,
+        background,
+        sessionHint: null,
+        logAlias: alias,
+        deadlineMs: 10_000,
+      },
+    });
+    const raw = receipts.artifact(standalone.launchId, 'worker.log');
+    const directory = path.dirname(raw);
+    const history = () =>
+      fs
+        .readdirSync(directory)
+        .filter((name) => name.startsWith('capture-write'))
+        .sort();
+    const source = receipts.artifact(standalone.launchId, background ? 'native-source.log' : 'stdout.log');
+    const a = receipts.capture(standalone.launchId, 2);
+    const b = receipts.capture(standalone.launchId, 2);
+    const append = (text: string) => {
+      fs.appendFileSync(source, text);
+      const stat = fs.statSync(source, { bigint: true });
+      const cursor = { offset: Number(stat.size), identity: `${stat.dev}:${stat.ino}` };
+      if (background) b.native(Buffer.from(text), cursor);
+      else b.write(Buffer.from(text), 'stdout.log', cursor);
+    };
+    const drain = () => {
+      for (let pass = 0; pass < 8 && a.flushAlias(); pass++) {
+        /* Drain bounded alias writes. */
+      }
+    };
+    try {
+      append('abcdef');
+      drain();
+      assert.equal(fs.readFileSync(alias, 'utf8'), 'abcdef');
+      const idle = history();
+      for (let pass = 0; pass < 12; pass++) assert.equal(a.flushAlias(), false);
+      assert.deepEqual(history(), idle);
+
+      fs.appendFileSync(raw, 'uncommitted');
+      fs.appendFileSync(alias, 'uncommitted');
+      a.flushAlias();
+      assert.equal(fs.statSync(raw).size, background ? 0 : 6);
+      assert.equal(fs.readFileSync(alias, 'utf8'), 'abcdef');
+
+      append('ghij');
+      drain();
+      assert.equal(fs.readFileSync(alias, 'utf8'), 'abcdefghij');
+      const settled = history();
+      for (let pass = 0; pass < 12; pass++) assert.equal(a.flushAlias(), false);
+      assert.deepEqual(history(), settled);
+
+      fs.renameSync(alias, alias + '.old');
+      fs.writeFileSync(alias, 'Replacement');
+      const replaced = history();
+      a.flushAlias();
+      assert.notDeepEqual(history(), replaced);
+      assert.equal(fs.readFileSync(alias, 'utf8'), 'Replacement');
+      assert.equal(
+        fs.readFileSync(background ? receipts.artifact(standalone.launchId, 'native.log') : raw, 'utf8'),
+        'abcdefghij',
+      );
+    } finally {
+      a.close();
+      b.close();
+    }
+  },
+);
+
 test('interrupted claims retain their token and acknowledgments retain exactly one disposition', () => {
   const { receipts, launch } = fixture();
   const event = report(receipts, launch.launchId);

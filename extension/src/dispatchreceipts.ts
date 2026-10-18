@@ -428,8 +428,50 @@ export class DispatchReceipts {
         /* Private channel output remains available after an alias changes. */
       }
     };
-    const flushAlias = () =>
-      this.lock(
+    const aliasEnd = () =>
+      options.background
+        ? (state.sources['native-source.log']?.offset ??
+          (fs.existsSync(this.artifact(id, 'native.log')) ? fs.statSync(this.artifact(id, 'native.log')).size : 0))
+        : state.bytes;
+    let flushed = false;
+    const flushAlias = () => {
+      if (flushed) {
+        try {
+          reload();
+          const end = aliasEnd();
+          const names = options.background ? (['native-source.log'] as const) : (['stdout.log', 'stderr.log'] as const);
+          const complete = names.every((name) => {
+            const file = this.artifact(id, name);
+            const cursor = state.sources[name];
+            if (!fs.existsSync(file)) return !cursor;
+            safePath(file);
+            const stat = fs.statSync(file, { bigint: true });
+            return (
+              stat.isFile() &&
+              stat.size === BigInt(cursor?.offset ?? 0) &&
+              (!cursor || cursor.identity === `${stat.dev}:${stat.ino}`)
+            );
+          });
+          safePath(alias);
+          if (
+            complete &&
+            fs.fstatSync(raw).size === state.bytes &&
+            state.alias &&
+            state.aliasBytes === end &&
+            equalIdentity(state.alias, identity(alias)) &&
+            fs.statSync(alias).size === end
+          ) {
+            if (!options.background) return false;
+            const native = this.artifact(id, 'native.log');
+            safePath(native);
+            const stat = fs.statSync(native);
+            if (stat.isFile() && stat.size === end) return false;
+          }
+        } catch {
+          /* Changed or unavailable files retain the locked repair path. */
+        }
+      }
+      const pending = this.lock(
         id,
         () => {
           reload();
@@ -438,10 +480,7 @@ export class DispatchReceipts {
           publishAlias();
           if (state.aliasBytes !== delivered)
             writeFileAtomically(checkpoint, JSON.stringify(state), undefined, 0o600, false);
-          const end = options.background
-            ? (state.sources['native-source.log']?.offset ??
-              (fs.existsSync(this.artifact(id, 'native.log')) ? fs.statSync(this.artifact(id, 'native.log')).size : 0))
-            : state.bytes;
+          const end = aliasEnd();
           if (!state.alias || (state.aliasBytes ?? 0) >= end) return false;
           try {
             safePath(alias);
@@ -453,6 +492,9 @@ export class DispatchReceipts {
         },
         'capture-write',
       );
+      flushed = true;
+      return pending;
+    };
     try {
       flushAlias();
     } catch (error) {
