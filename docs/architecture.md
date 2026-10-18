@@ -433,7 +433,7 @@ The first column is checked against the shipped extension directory by `architec
 | `view/cost.ts` | Browser-safe money wording for a cost estimate | no |
 | `domain/model-catalog.ts` | Browser-safe model and effort catalog types | no |
 | `view/model-picks.ts` | Model and effort reading labels, open-option default annotations, and saved-value transitions | no |
-| `view/launcher.ts` | Browser-safe launcher contracts and the custom setup's accessible names for Create draft and the field pin | no |
+| `view/launcher.ts` | Browser-safe launcher contracts, compact CLI setup projection from exact supported launch choices, and accessible names for Create draft and the field pin | no |
 | `view/projectspend.ts` | Browser-safe Project cost display contracts, projections, ordering, and indexing timing | no |
 | `view/rail.ts` | Browser-safe session list preferred width, effective viewport bounds, keyboard resize decisions, group-list identities, bucket, section, grouping, sort, density, time-slot, count, label-chip count, cache-mark, figure, drawn-row, row-id, and clock-tick projections, and the pin glyph the session list card and the session heading share, with the pencil glyph beside it | no |
 | `view/session-query.ts` | Browser-safe label suggestions, unknown search-area wording, identity resolution notes, and the cost and cache-expiry invalid-value notes | no |

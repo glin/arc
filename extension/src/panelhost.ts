@@ -419,7 +419,7 @@ import {
   type CompleteSetupValues,
   type PinnedSetup,
 } from './domain/session-setups';
-import type { PinSetupRequest } from './view/launcher';
+import { setupListing, type PinSetupRequest } from './view/launcher';
 import { claudeSkillPath } from './claudeskillpath';
 import {
   AgentPrompt,
@@ -2274,7 +2274,7 @@ export class PanelProvider implements vscode.Disposable {
       throw new Error('This Arc window is not ready to start sessions. Open Arc in a project and retry.');
     }
     const { view } = this.launcherFor();
-    if (request.method === 'setups') return { version: 1, project: this.setupProject, ...view };
+    if (request.method === 'setups') return setupListing(view, this.setupProject);
     const params = request.params;
     const text = params.prompt!;
     if (!text.trim() || text.trimStart().startsWith('/'))

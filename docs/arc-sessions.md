@@ -163,9 +163,9 @@ Replace `WINDOW_ID` with the selected window's `hostId`. Confirm `scopeReady` an
 
 [Window discovery](cli-reference.md#windows) defines capability output and observed access diagnostics. [Window selection](cli.md#windows) defines stale activation handling. The [skill](../cli/skills/arc-sessions/SKILL.md#select-a-ready-window) applies these limits before agent actions.
 
-An optional launch check sends paid agent requests and requires reader authorization. Choose the cheapest suitable offered settings for one Claude session and one Codex session. In `arc setups`, reusable rows appear in `primary`, `inherited`, `pinned`, and `recent`. Each row supplies a `key` and a `profile.agent`. Use a row for the intended provider, and exclude pinned rows whose `available` is false.
+An optional launch check sends paid agent requests and requires reader authorization. Choose the cheapest suitable offered settings for one Claude session and one Codex session. `arc setups` prints readable choices. For structured choices, use `arc setups --window WINDOW_ID --json`. Reusable rows appear in `setups`, with `key` and `provider`. Use a row for the intended provider, and exclude rows with `missingValue`.
 
-A provider without a reusable row still has explicit choices in `agents`. Select its `value`, then a model's `models[].value`, that model's `efforts[].value`, and the provider's `permissions[].value`. Model choices are values, not setup keys. A fresh project has no guaranteed reusable row for either provider. If `modelsPending` is true or no model is offered, wait for catalog loading and read setups again.
+A provider without a reusable row still has explicit choices in `agents`. Select its `provider`, then a model's `models[].value`, that model's string-array `efforts`, and the provider's string-array `permissions`. Model choices are values, not setup keys. A fresh project has no guaranteed reusable row for either provider. If `modelsPending` is true or no model is offered, wait for catalog loading and read setups again. [Setups](cli-reference.md#setups) defines empty values and the output fields.
 
 Create the prompt file below in PowerShell. Replace `WINDOW_ID` with the selected window's `hostId`. This writes regular UTF-8 without a byte-order mark, including on PowerShell 5.1.
 

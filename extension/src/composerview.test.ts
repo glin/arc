@@ -11,7 +11,7 @@ import {
 } from './view/model-picks';
 import { test, vi } from 'vitest';
 import { marked } from 'marked';
-import { launcherCustomRequest } from './view/launcher';
+import { launcherCustomRequest, setupListing } from './view/launcher';
 
 import assert from 'node:assert';
 import * as fs from 'node:fs';
@@ -4937,6 +4937,168 @@ const LAUNCH_MODELS: Record<string, ModelChoice[]> = {
     },
   ],
 };
+
+test('CLI setups preserve exact launch choices and flatten reusable keys without panel presentation', () => {
+  const model = (value: string, efforts: string[], extra: Partial<ModelChoice> = {}): ModelChoice => ({
+    value,
+    label: value,
+    description: 'Model description',
+    efforts: efforts.map((value) => ({ value, label: value, description: 'Effort description' })),
+    ...extra,
+  });
+  const catalog = {
+    claude: [
+      model('opus', ['high', 'high'], { resolvedModel: 'claude-opus-full' }),
+      model('opus', ['low'], { resolvedModel: 'claude-other-full' }),
+      model('default', ['low']),
+      model('hidden', ['max'], { hidden: true }),
+    ],
+    codex: [model('codex-alias', ['medium'], { resolvedModel: 'codex-full' }), model('codex-small', ['low'])],
+  };
+  const profile: SessionProfile = {
+    agent: 'claude',
+    model: 'opus',
+    effort: 'high',
+    permissionMode: '',
+    source: 'recent',
+  };
+  const omitted: SessionProfile = { agent: 'codex', model: '', effort: '', permissionMode: '', source: 'recent' };
+  const view = sessionLauncherView(
+    null,
+    [profile, omitted],
+    catalog,
+    [
+      { id: 'saved', ...profile },
+      { id: 'retired', ...profile, model: 'gone', effort: 'stored-effort', permissionMode: 'stored-permission' },
+      { id: 'effort', ...profile, effort: 'low' },
+      { id: 'permission', ...profile, permissionMode: 'gone' },
+    ],
+    {},
+    [],
+    'panel-owner',
+  );
+  assert.ok(!view.recent.some((row) => row.key === 'recent:0'));
+  const listing = setupListing(view, '/project');
+  assert.deepEqual(Object.keys(listing), ['version', 'project', 'primary', 'setups', 'agents']);
+  assert.equal(listing.primary, 'recent:0');
+  assert.deepEqual(listing.setups, [
+    { key: 'recent:0', provider: 'claude', model: 'opus', effort: 'high' },
+    { key: 'pin:saved', provider: 'claude', model: 'opus', effort: 'high' },
+    {
+      key: 'pin:retired',
+      provider: 'claude',
+      model: 'gone',
+      effort: 'stored-effort',
+      permissions: 'stored-permission',
+      missingValue: 'model',
+    },
+    { key: 'pin:effort', provider: 'claude', model: 'opus', effort: 'low', missingValue: 'effort' },
+    {
+      key: 'pin:permission',
+      provider: 'claude',
+      model: 'opus',
+      effort: 'high',
+      permissions: 'gone',
+      missingValue: 'permission',
+    },
+    { key: 'recent:1', provider: 'codex' },
+  ]);
+  assert.deepEqual(listing.agents[0].models, [
+    { value: '', efforts: ['', 'high', 'low', 'max'] },
+    { value: 'opus', efforts: ['', 'high'] },
+    { value: 'claude-opus-full', efforts: ['', 'high'] },
+    { value: 'claude-other-full', efforts: ['', 'low'] },
+    { value: 'default', efforts: ['', 'low'] },
+    { value: 'hidden', efforts: ['', 'max'] },
+  ]);
+  assert.deepEqual(listing.agents[1].models, [
+    { value: '', efforts: ['', 'medium', 'low'] },
+    { value: 'codex-alias', efforts: ['', 'medium'] },
+    { value: 'codex-full', efforts: ['', 'medium'] },
+    { value: 'codex-small', efforts: ['', 'low'] },
+  ]);
+  for (const agent of listing.agents) {
+    assert.deepEqual(Object.keys(agent), ['provider', 'models', 'permissions']);
+    assert.deepEqual(
+      agent.permissions,
+      view.agents.find((row) => row.value === agent.provider)!.permissions.map((row) => row.value),
+    );
+    assert.ok(agent.permissions.includes(''));
+    for (const model of agent.models)
+      for (const effort of model.efforts)
+        for (const permissionMode of agent.permissions) {
+          const request = {
+            kind: 'custom' as const,
+            agent: agent.provider,
+            model: model.value,
+            effort,
+            permissionMode,
+          };
+          assert.ok(launcherProfile(view, request), JSON.stringify(request));
+        }
+  }
+  for (const setup of listing.setups) {
+    assert.equal(Boolean(launcherProfile(view, { kind: 'row', key: setup.key })), !setup.missingValue, setup.key);
+  }
+  assert.ok(
+    launcherProfile(view, {
+      kind: 'custom',
+      agent: 'claude',
+      model: 'claude-opus-full[1m]',
+      effort: 'high',
+      permissionMode: '',
+    }),
+  );
+  assert.equal(
+    launcherProfile(view, { kind: 'custom', agent: 'claude', model: 'opus', effort: 'low', permissionMode: '' }),
+    null,
+  );
+  assert.doesNotMatch(
+    JSON.stringify(listing),
+    /"(?:missingValue|model|effort|permissions)":null|"(?:owner|words|catalog|defaults|supportedModels|profile|label|detail|name|available|id|source)":/,
+  );
+});
+
+test('CLI setups retain an unavailable current primary once and omit an absent primary', () => {
+  const profile: SessionProfile = {
+    agent: 'claude',
+    model: 'retired',
+    effort: '',
+    permissionMode: '',
+    source: 'inherited',
+  };
+  const state = composerState({ model: 'retired', effort: '', askMode: '', profile });
+  const view = sessionLauncherView(state, [], LAUNCH_MODELS);
+  const listing = setupListing(view, '/project');
+  assert.equal(listing.primary, 'current');
+  assert.deepEqual(listing.setups, [{ key: 'current', provider: 'claude', model: 'retired', missingValue: 'model' }]);
+  assert.equal(launcherProfile(view, { kind: 'row', key: 'current' }), null);
+  const empty = setupListing(sessionLauncherView(null, [], {}), '/fresh');
+  assert.deepEqual(empty.setups, []);
+  assert.equal('primary' in empty, false);
+});
+
+test('CLI setups retain permissions and stored values while model discovery is pending', () => {
+  const profile: SessionProfile = {
+    agent: 'codex',
+    model: 'waiting-model',
+    effort: 'waiting-effort',
+    permissionMode: '',
+    source: 'recent',
+  };
+  const view = sessionLauncherView(null, [profile], {}, [], {}, ['codex']);
+  const listing = setupListing(view, '/project');
+  assert.deepEqual(listing.setups, [
+    { key: 'recent:0', provider: 'codex', model: 'waiting-model', effort: 'waiting-effort' },
+  ]);
+  assert.equal(listing.agents[1].modelsPending, true);
+  assert.equal('modelsPending' in listing.agents[0], false);
+  assert.deepEqual(listing.agents[1].models, [{ value: '', efforts: [''] }]);
+  assert.deepEqual(
+    listing.agents[1].permissions,
+    view.agents[1].permissions.map((row) => row.value),
+  );
+});
 
 test('the primary launcher snapshots the effective setup of the current session', () => {
   const current = composerState({

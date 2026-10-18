@@ -1866,6 +1866,97 @@ test('bundled guarded starts refuse ambiguous requesters', async () => {
   }
 });
 
+const setupReply = {
+  version: 1,
+  project: '/project',
+  primary: 'recent:0',
+  setups: [
+    { key: 'recent:0', provider: 'claude', model: 'opus', effort: 'high' },
+    { key: 'pin:stored', provider: 'codex', model: 'retired', missingValue: 'model' },
+    { key: 'recent:1', provider: 'codex' },
+  ],
+  agents: [
+    {
+      provider: 'claude',
+      models: [
+        { value: '', efforts: ['', 'low', 'high'] },
+        { value: 'default', efforts: ['', 'low'] },
+        { value: 'opus', efforts: ['', 'high'] },
+        { value: 'claude-opus-full', efforts: ['', 'high'] },
+      ],
+      permissions: ['', 'auto', 'manual', 'acceptEdits', 'plan'],
+    },
+    {
+      provider: 'codex',
+      models: [
+        { value: '', efforts: ['', 'medium', 'high'] },
+        { value: 'codex-alias', efforts: ['', 'medium', 'high'] },
+        { value: 'codex-full', efforts: ['', 'medium', 'high'] },
+      ],
+      permissions: ['', 'read-only', 'untrusted', 'on-request', 'never'],
+    },
+  ],
+};
+
+test('bundled setups print readable launch values by default and compact JSON on request', async () => {
+  const home = mkdtempSync(join(realpathSync(tmpdir()), 'arc-setups-smoke-'));
+  const channel = new WindowChannel(home);
+  const run = promisify(execFile);
+  let reply = setupReply;
+  const requests = [];
+  channel.setRequestHandler((request) => {
+    requests.push(request);
+    return reply;
+  });
+  const env = { ...smokeEnv, ARC_HOME: home, ARC_WINDOW: channel.hostId };
+  try {
+    await channel.update({ folders: [home], scopeReady: true, panelReady: true, panelVisible: true });
+    const human = await run(process.execPath, [cli, 'setups'], { env, encoding: 'utf8' });
+    assert.match(human.stdout, /Project: \/project/);
+    assert.match(human.stdout, /recent:0\s+claude\s+opus\s+high\s+\(default\)\s+\(primary\)/);
+    assert.match(human.stdout, /pin:stored\s+codex\s+retired.*unavailable: model/);
+    assert.match(human.stdout, /recent:1\s+codex\s+\(default\)\s+\(default\)\s+\(default\)/);
+    const lines = human.stdout.trimEnd().split('\n');
+    for (const agent of reply.agents) {
+      const start = lines.indexOf(agent.provider);
+      assert.ok(start >= 0);
+      const end = lines.indexOf('', start);
+      const section = lines.slice(start + 1, end < 0 ? undefined : end);
+      for (const model of agent.models) {
+        const line = section.find((line) => line.startsWith(`  ${model.value || '(default)'}  Effort:`));
+        assert.ok(line, model.value);
+        assert.deepEqual(
+          line.split('Effort: ')[1].split(', '),
+          model.efforts.map((value) => value || '(default)'),
+        );
+      }
+      assert.ok(
+        section.includes(`  Permissions: ${agent.permissions.map((value) => value || '(default)').join(', ')}`),
+      );
+    }
+    const json = await run(process.execPath, [cli, 'setups', '--json'], { env, encoding: 'utf8' });
+    assert.equal(json.stdout.trimEnd(), JSON.stringify(reply));
+    assert.deepEqual(JSON.parse(json.stdout), reply);
+    const { primary: _primary, ...empty } = reply;
+    reply = {
+      ...empty,
+      setups: [],
+      agents: [{ ...reply.agents[1], modelsPending: true, models: [{ value: '', efforts: [''] }] }],
+    };
+    const pending = await run(process.execPath, [cli, 'setups'], { env, encoding: 'utf8' });
+    assert.match(pending.stdout, /explicit provider settings/i);
+    assert.match(pending.stdout, /loading/i);
+    assert.match(pending.stdout, /never/);
+    const pendingJson = await run(process.execPath, [cli, 'setups', '--json'], { env, encoding: 'utf8' });
+    assert.deepEqual(JSON.parse(pendingJson.stdout), reply);
+    assert.equal(requests.length, 4);
+    assert.ok(requests.every((request) => request.method === 'setups' && Object.keys(request.params).length === 0));
+  } finally {
+    await channel.dispose();
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test('bundled session commands select one window, reject unknown IDs, and bound turns before sending', async () => {
   const home = mkdtempSync(join(realpathSync(tmpdir()), 'arc-session-smoke-'));
   const channel = new WindowChannel(home);
@@ -1874,6 +1965,7 @@ test('bundled session commands select one window, reject unknown IDs, and bound 
   let requests = 0;
   channel.setRequestHandler((request) => {
     requests++;
+    if (request.method === 'setups') return setupReply;
     if (request.method === 'session' && request.params.sessionId !== 'known') throw new Error('Unknown session.');
     return { method: request.method, params: request.params, requester: request.requester };
   });
@@ -1980,7 +2072,7 @@ test('bundled session commands select one window, reject unknown IDs, and bound 
       env: { ...env, ARC_WINDOW: '', TERM_PROGRAM: 'vscode' },
       encoding: 'utf8',
     });
-    assert.equal(JSON.parse(integrated.stdout).method, 'setups');
+    assert.deepEqual(JSON.parse(integrated.stdout), setupReply);
     assert.equal(requests, before + 1);
     assert.equal(competingRequests, 0);
   } finally {

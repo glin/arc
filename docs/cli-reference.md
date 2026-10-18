@@ -113,9 +113,29 @@ Assignments run in admission order. Queue time, readiness, application, and pers
 
 Expired or disconnected queued requests never apply or begin storage later. Started saves can settle after expiry and retain their ordering barrier. Storage rollback is not guaranteed. An unconfirmed application, including one superseded by Reset Panel State, reports `unknown`.
 
+## Setups
+
+`arc setups` prints the project, reusable setup keys, model-specific efforts, and provider permissions. It marks the primary key and unavailable setups. `(default)` means omitting that flag. The literal model alias `default` remains distinct. A project without reusable setups still offers explicit provider settings.
+
+`--json` returns one compact object:
+
+| Field     | Meaning                                                                                                  |
+| --------- | -------------------------------------------------------------------------------------------------------- |
+| `version` | Output version, currently `1`.                                                                           |
+| `project` | Project identity.                                                                                        |
+| `primary` | Preferred setup key, omitted when absent. An unavailable current setup can remain primary.               |
+| `setups`  | Reusable rows with `key`, `provider`, and optional `model`, `effort`, `permissions`, and `missingValue`. |
+| `agents`  | Providers with `provider`, `models`, `permissions`, and optional `modelsPending: true`.                  |
+
+Setup keys retain `current`, `pin:ID`, and `recent:INDEX` values. Each distinct key appears once, including a primary key hidden from the panel's recent list. Empty setup overrides are omitted. Their absence retains provider resolution without identifying a concrete model, effort, or permission preset. `missingValue` identifies the first unavailable dimension: `agent`, `model`, `effort`, or `permission`. Available rows omit it.
+
+Each provider's `models` lists exact catalog values as `{value, efforts}`, with string-array efforts. Aliases and full model IDs remain separate values. The first occurrence of an exact model value determines its efforts. Empty model, effort, and permission strings remain selectable provider defaults. The empty model offers the union of catalog efforts. Existing unique window-suffix matches, such as `opus[1m]`, also validate.
+
+`modelsPending: true` marks incomplete model discovery. Permissions remain listed during discovery. Starts refuse until that provider's catalog loads, including reusable rows without a missing value.
+
 ## Session writes
 
-Starts require a ready panel, project setup storage, and a loaded provider catalog. `setups` returns runtime values and current, pinned, and recent keys. Omitted model, effort, and permissions retain provider defaults. Unsupported settings refuse launch.
+Starts require a ready panel, project setup storage, and a loaded provider catalog. Unsupported settings refuse launch.
 
 Prompt files must be regular and at most 48 KiB. Empty prompts and slash commands refuse. Encoded requests above the 64 KiB channel limit refuse before connection. Explicit working directories resolve from the caller's directory and use their real filesystem destination.
 

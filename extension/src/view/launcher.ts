@@ -94,6 +94,66 @@ export interface SessionLauncherView {
   };
 }
 
+export interface SetupListing {
+  version: 1;
+  project: string;
+  primary?: string;
+  setups: {
+    key: string;
+    provider: SessionProfile['agent'];
+    model?: string;
+    effort?: string;
+    permissions?: string;
+    missingValue?: SetupValueName;
+  }[];
+  agents: {
+    provider: string;
+    modelsPending?: true;
+    models: { value: string; efforts: string[] }[];
+    permissions: string[];
+  }[];
+}
+
+export function setupListing(view: SessionLauncherView, project: string): SetupListing {
+  const keys = new Set<string>();
+  const setups: SetupListing['setups'] = [];
+  for (const row of [view.inherited, view.primary, ...view.pinned, ...view.recent]) {
+    if (!row || keys.has(row.key)) continue;
+    keys.add(row.key);
+    const { agent, model, effort, permissionMode } = row.profile;
+    const missingValue = missingSetupValue(row.profile, view.agents);
+    setups.push({
+      key: row.key,
+      provider: agent,
+      ...(model ? { model } : {}),
+      ...(effort ? { effort } : {}),
+      ...(permissionMode ? { permissions: permissionMode } : {}),
+      ...(missingValue ? { missingValue } : {}),
+    });
+  }
+  return {
+    version: 1,
+    project,
+    ...(view.primary ? { primary: view.primary.key } : {}),
+    setups,
+    agents: view.agents.map((agent) => {
+      const values = new Set<string>();
+      const models: SetupListing['agents'][number]['models'] = [];
+      for (const model of agent.supportedModels ?? agent.models) {
+        if (values.has(model.value)) continue;
+        values.add(model.value);
+        models.push({ value: model.value, efforts: [...new Set(model.efforts.map((effort) => effort.value))] });
+      }
+      return {
+        provider: agent.value,
+        ...(agent.modelsPending ? { modelsPending: true } : {}),
+        models,
+        permissions: agent.permissions.map((permission) => permission.value),
+      };
+    }),
+  };
+}
+
 export type LauncherRequest =
   | { kind: 'row'; key: string }
   | { kind: 'custom'; agent: string; model: string; effort: string; permissionMode: string };

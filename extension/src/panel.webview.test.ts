@@ -3935,6 +3935,124 @@ test('window session reads leave reader state and live capabilities unchanged an
 });
 
 // These host cases catch reader-state loss and premature durable replies. They reuse the live-provider fixture without browser startup.
+test('window setups advertise launchable keys and exact choices while unavailable and pending starts refuse', async () => {
+  const provider: any = liveProviderFixture(livePress({ sessionId: 'reader', agent: 'claude' })).provider;
+  const catalog = {
+    claude: [
+      {
+        value: 'opus',
+        resolvedModel: 'claude-opus-full',
+        label: 'Opus',
+        description: '',
+        efforts: [{ value: 'high', label: 'High', description: '' }],
+      },
+      { value: 'small', label: 'Small', description: '', efforts: [{ value: 'low', label: 'Low', description: '' }] },
+    ],
+    codex: [
+      {
+        value: 'codex-alias',
+        resolvedModel: 'codex-full',
+        label: 'Codex',
+        description: '',
+        efforts: [{ value: 'medium', label: 'Medium', description: '' }],
+      },
+      {
+        value: 'hidden',
+        hidden: true,
+        label: 'Hidden',
+        description: '',
+        efforts: [{ value: 'high', label: 'High', description: '' }],
+      },
+    ],
+  };
+  const profile: SessionProfile = {
+    agent: 'claude',
+    model: 'opus',
+    effort: 'high',
+    permissionMode: '',
+    source: 'recent',
+  };
+  let view = sessionLauncherView(
+    null,
+    [profile, { ...profile, agent: 'codex', model: '', effort: 'medium' }],
+    catalog,
+    [
+      { id: 'saved', ...profile },
+      { id: 'gone', ...profile, model: 'retired' },
+    ],
+  );
+  const delivered: SessionProfile[] = [];
+  Object.assign(provider, {
+    setupProject: '/project',
+    pendingModels: [],
+    folders: () => ['C:/workspace'],
+    repositoryScope: { snapshot: () => ({ ready: true, roots: ['C:/workspace'] }) },
+    launcherFor: () => ({ view }),
+    onSendDraftPrompt: async (draft: NewSessionDraft) => {
+      delivered.push(draft.profile);
+      return { delivered: false, reason: 'delivery stopped by fixture' };
+    },
+  });
+  const before = JSON.stringify([provider.saved, provider.drafts, provider.showing, [...provider.hostSessions]]);
+  const listing = await provider.handleSessionRequest({ method: 'setups', params: {}, requester: null });
+  assert.deepEqual(Object.keys(listing), ['version', 'project', 'primary', 'setups', 'agents']);
+  assert.equal(listing.project, '/project');
+  assert.equal(listing.primary, 'recent:0');
+  assert.deepEqual(
+    listing.setups.map((row: any) => row.key),
+    ['recent:0', 'pin:saved', 'pin:gone', 'recent:1'],
+  );
+  const start = (setup: unknown) =>
+    provider.handleSessionRequest({ method: 'start', requester: null, params: { prompt: 'review', setup } });
+  for (const row of listing.setups) {
+    const setup = { kind: 'row' as const, key: row.key };
+    if (row.missingValue) await assert.rejects(start(setup), /unavailable/);
+    else {
+      await start(setup);
+      assert.deepEqual(delivered.at(-1), launcherProfile(view, setup));
+    }
+  }
+  for (const agent of listing.agents)
+    for (const model of agent.models)
+      for (const effort of model.efforts)
+        for (const permissionMode of agent.permissions) {
+          const setup = { kind: 'custom', agent: agent.provider, model: model.value, effort, permissionMode };
+          const count = delivered.length;
+          await start(setup);
+          assert.equal(delivered.length, count + 1);
+          assert.deepEqual(delivered.at(-1), {
+            agent: agent.provider,
+            model: model.value,
+            effort,
+            permissionMode,
+            source: 'custom',
+          });
+        }
+  await start({ kind: 'custom', ...profile, model: 'opus[1m]' });
+  assert.equal(delivered.at(-1)?.model, 'opus[1m]');
+  const count = delivered.length;
+  await assert.rejects(start({ kind: 'custom', ...profile, effort: 'low' }), /unavailable/);
+  view = { ...view, inherited: { ...view.primary!, key: 'current', profile: { ...profile, model: 'retired' } } };
+  view.primary = view.inherited;
+  const unavailable = await provider.handleSessionRequest({ method: 'setups', params: {}, requester: null });
+  assert.equal(unavailable.primary, 'current');
+  assert.equal(unavailable.setups[0].missingValue, 'model');
+  await assert.rejects(start({ kind: 'row', key: 'current' }), /unavailable/);
+  view = sessionLauncherView(null, [profile], {}, [], {}, ['claude']);
+  provider.pendingModels = ['claude'];
+  const pending = await provider.handleSessionRequest({ method: 'setups', params: {}, requester: null });
+  assert.equal(pending.agents[0].modelsPending, true);
+  assert.ok(pending.agents[0].permissions.includes('auto'));
+  await assert.rejects(start({ kind: 'row', key: pending.primary }), /still loading/);
+  await assert.rejects(start({ kind: 'custom', ...profile }), /still loading/);
+  assert.equal(delivered.length, count);
+  view = sessionLauncherView(null, [], {});
+  const empty = await provider.handleSessionRequest({ method: 'setups', params: {}, requester: null });
+  assert.deepEqual(empty.setups, []);
+  assert.equal('primary' in empty, false);
+  assert.equal(JSON.stringify([provider.saved, provider.drafts, provider.showing, [...provider.hostSessions]]), before);
+});
+
 test('window starts adopt both providers and classifications without changing the reader draft, selection, watermarks or tabs', async () => {
   for (const agent of ['claude', 'codex'] as const)
     for (const agentRun of [false, true]) {

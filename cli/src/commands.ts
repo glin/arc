@@ -392,9 +392,10 @@ export const COMMANDS: readonly Command[] = [
       synopsis: 'arc setups [--window ID] [--json]',
       flags: [windowFlag, jsonFlag],
       output: [
-        'JSON: version, project, primary, inherited, pinned, recent, agents, words. project identifies the project.',
-        'Optional owner is a setup selection generation token.',
-        'Rows supply a key and profile. Agents supply offered model, effort, and permission values.',
+        'Text lists the project, reusable setup keys, models with their efforts, and permissions.',
+        '--json returns one compact object with version, project, optional primary key, setups, and agents.',
+        'Setups supply key, provider, nonempty model, effort, permissions, and missingValue only when unavailable.',
+        'Agents supply provider, models with value and string-array efforts, permissions, and modelsPending only when true.',
       ],
       refusals: [argumentRefusal, 'Positional arguments refuse.', windowRefusal],
       example: 'arc setups --window WINDOW_ID --json',

@@ -1,6 +1,7 @@
 import { resolve } from 'node:path';
 import { validContinuation, validContinuationPath, CONTINUATION_LIMITS } from '../../extension/src/compactrequest.ts';
 import { launchPolicy } from '../../extension/src/launchpolicy.ts';
+import type { SetupListing } from '../../extension/src/view/launcher.ts';
 import * as fs from 'node:fs';
 import { requestWindow, requesterIdentity } from '../../extension/src/sessionrequests.ts';
 import {
@@ -55,6 +56,31 @@ export function readContinuationFile(file: string, sha256: string): { text: stri
   } finally {
     fs.closeSync(fd);
   }
+}
+
+function renderSetups(listing: SetupListing): string {
+  const choice = (value: string | undefined) => value || '(default)';
+  const lines = [`Project: ${listing.project}`];
+  if (listing.setups.length) {
+    lines.push('Setups');
+    for (const setup of listing.setups) {
+      lines.push(
+        `  ${setup.key}  ${setup.provider}  ${choice(setup.model)}  ${choice(setup.effort)}  ${choice(setup.permissions)}` +
+          (setup.key === listing.primary ? '  (primary)' : '') +
+          (setup.missingValue ? `  (unavailable: ${setup.missingValue})` : ''),
+      );
+    }
+  } else lines.push('No reusable setups. Explicit provider settings remain available.');
+  for (const agent of listing.agents) {
+    lines.push('', agent.provider);
+    if (agent.modelsPending) lines.push('  Models: loading');
+    for (const model of agent.models) {
+      lines.push(`  ${choice(model.value)}  Effort: ${model.efforts.map(choice).join(', ')}`);
+    }
+    lines.push(`  Permissions: ${agent.permissions.map(choice).join(', ')}`);
+  }
+  lines.push('', '(default) means omitting that flag.');
+  return lines.join('\n');
 }
 
 export async function runManagement(command: string, args: string[]): Promise<string> {
@@ -152,7 +178,8 @@ export async function runManagement(command: string, args: string[]): Promise<st
   const requestId = options.get('--request-id');
   if (command === 'setups') {
     if (sessions.length) throw new Error('Usage: arc setups [--window ID] [--json]');
-    return JSON.stringify(await requestWindow('setups', {}, window));
+    const listing = (await requestWindow('setups', {}, window)) as SetupListing;
+    return flags.has('--json') ? JSON.stringify(listing) : renderSetups(listing);
   }
   if (command === 'read') {
     if (sessions.length !== 1 || !options.has('--observation') || !requestId)
