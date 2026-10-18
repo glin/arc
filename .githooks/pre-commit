@@ -45,7 +45,7 @@ oxfmt=$(tool oxfmt) && oxlint=$(tool oxlint) || {
 }
 
 status=0
-"$oxfmt" --disable-nested-config --check --no-error-on-unmatched-pattern "${files[@]}" || status=1
+"$oxfmt" --config "$root/.oxfmtrc.mjs" --disable-nested-config --check --no-error-on-unmatched-pattern "${files[@]}" || status=1
 "$oxlint" --disable-nested-config --deny-warnings --no-error-on-unmatched-pattern "${files[@]}" || status=1
 if [ ${#cssfiles[@]} -ne 0 ]; then
   if stylelint=$(tool stylelint); then

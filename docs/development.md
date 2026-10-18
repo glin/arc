@@ -159,8 +159,8 @@ npm test
 In a shared checkout, another session can hold unformatted edits in files you do not own. A whole-repository format check then fails on their work. Format and check only your own files, then run the remaining steps of `npm test` one by one:
 
 ```bash
-npx oxfmt extension/src/panelhost.ts extension/src/panel.webview.test.ts
-npx oxfmt --check extension/src/panelhost.ts extension/src/panel.webview.test.ts
+npx oxfmt --config .oxfmtrc.mjs extension/src/panelhost.ts extension/src/panel.webview.test.ts
+npx oxfmt --config .oxfmtrc.mjs --check extension/src/panelhost.ts extension/src/panel.webview.test.ts
 npm run lint
 npm run typecheck
 npm run test:unit
@@ -214,7 +214,7 @@ npm run lint
 
 Stylelint checks only `extension/src/webview/*.css` with zero allowed warnings and the explicit root configuration in `.stylelintrc.cjs`. It excludes nested folders, generated output, fixtures, private agent files, and CSS embedded in TypeScript. The configuration extends `stylelint-config-recommended` and documents exceptions for selector organization, legacy accessibility clipping, and exact build placeholders. Property and value checks remain enabled. Host-provided VS Code custom properties need no local definitions.
 
-Oxfmt covers root tooling, plugin hooks, CLI source and tests, extension build scripts, configuration, and current documentation. The `format` script in `package.json` names each folder and root file that it covers. Other files at the repository root, such as saved diagnostics and exported sessions, are not checked. Under `extension/src` it covers every file except `panel-shots.test.ts`, including `panel.css` and `webview/tsconfig.json`. It leaves generated output, dependencies, screenshots, fixtures, and private agent files unchanged. Oxfmt and Oxlint disable nested configurations, so saved configurations under private agent directories cannot change their scan scope. Run evidence belongs under its owning plan's `runs/` directory, or `.claude/plans/runs/` for tasks without plans. Git ignores the existing `.claude/plans/` tree. Oxlint checks `extension/src` and every other maintained source tree. The `lint:js` script names each folder and root file that it checks. Type-aware checks cover every package project.
+Oxfmt covers root tooling, plugin hooks, CLI source and tests, extension build scripts, configuration, and current documentation. The root `.oxfmtrc.mjs` names each folder and root file that Oxfmt covers. Other files at the repository root, such as saved diagnostics and exported sessions, are not checked. Under `extension/src` it covers every file except `panel-shots.test.ts`, including `panel.css` and `webview/tsconfig.json`. It leaves generated output, dependencies, screenshots, fixtures, and private agent files unchanged. Oxfmt and Oxlint disable nested configurations, so saved configurations under private agent directories cannot change their scan scope. Run evidence belongs under its owning plan's `runs/` directory, or `.claude/plans/runs/` for tasks without plans. Git ignores the existing `.claude/plans/` tree. Oxlint checks `extension/src` and every other maintained source tree. The root `.oxlintrc.jsonc` names each folder and root file that Oxlint checks. Type-aware checks cover every package project.
 
 Run the full test suite:
 

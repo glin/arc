@@ -25,7 +25,11 @@ function copyStylelintConfig(root) {
     path.join(root, '.stylelintrc.cjs'),
     `module.exports = { ...require(${JSON.stringify(path.join(repositoryRoot, '.stylelintrc.cjs'))}), extends: ${JSON.stringify(path.join(repositoryRoot, 'node_modules', 'stylelint-config-recommended', 'index.js'))} };\n`,
   );
-  const formatted = runTool('oxfmt', [path.join(root, '.stylelintrc.cjs')], root);
+  const formatted = runTool(
+    'oxfmt',
+    ['--config', path.join(repositoryRoot, '.oxfmtrc.mjs'), path.join(root, '.stylelintrc.cjs')],
+    root,
+  );
   assert.equal(formatted.status, 0, formatted.stderr);
 }
 
@@ -39,13 +43,17 @@ test('root formatting and lint commands exclude private run source and configura
     path.join(root, '.claude', 'ship-logs', 'run', 'implementation', 'before-format'),
     path.join(root, '.claude', 'plans', 'task', 'runs', 'run', 'implementation', 'before-format'),
   ];
-  const savedSources = savedRoots.map((savedRoot) => path.join(savedRoot, 'extension', 'src', 'transcript.ts'));
+  const savedSources = [
+    ...savedRoots.map((savedRoot) => path.join(savedRoot, 'extension', 'src', 'transcript.ts')),
+    path.join(root, 'diagnostic-export.js'),
+    path.join(root, 'saved-session', 'extension', 'src', 'transcript.ts'),
+  ];
   const maintainedSource = path.join(root, 'plugins', 'arc-hooks', 'scripts', 'stop-manifest.cjs');
   const brokenSource = 'const value={answer:42}; debugger; console.log(value);\n';
   try {
     fs.mkdirSync(path.dirname(maintainedSource), { recursive: true });
     fs.copyFileSync(path.join(repositoryRoot, 'package.json'), path.join(root, 'package.json'));
-    for (const name of ['.oxfmtrc.json', '.oxlintrc.jsonc']) {
+    for (const name of ['.oxfmtrc.mjs', '.oxlintrc.jsonc']) {
       fs.copyFileSync(path.join(repositoryRoot, name), path.join(root, name));
       for (const savedRoot of savedRoots) {
         fs.mkdirSync(path.join(savedRoot, 'extension', 'src'), { recursive: true });
@@ -56,8 +64,25 @@ test('root formatting and lint commands exclude private run source and configura
     copyStylelintConfig(root);
     fs.mkdirSync(path.join(root, 'extension', 'src', 'webview'), { recursive: true });
     fs.writeFileSync(path.join(root, 'extension', 'src', 'webview', 'panel.css'), 'a {\n  color: red;\n}\n');
-    for (const savedSource of savedSources) fs.writeFileSync(savedSource, brokenSource);
+    for (const savedSource of savedSources) {
+      fs.mkdirSync(path.dirname(savedSource), { recursive: true });
+      fs.writeFileSync(savedSource, brokenSource);
+    }
     fs.writeFileSync(maintainedSource, 'console.log(42);\n');
+
+    const rootSource = path.join(root, 'vitest.config.mts');
+    fs.writeFileSync(rootSource, brokenSource);
+    for (const [name, args] of [
+      ['oxfmt', ['--config', '.oxfmtrc.mjs', '--disable-nested-config', '--check']],
+      ['oxlint', ['--disable-nested-config', '--deny-warnings']],
+    ]) {
+      const result = runTool(name, args, root);
+      const output = result.stdout + result.stderr;
+      assert.notEqual(result.status, 0, `${name} skipped maintained root source`);
+      assert.match(output, /vitest\.config\.mts/);
+      for (const savedSource of savedSources) assert.ok(!output.includes(path.basename(savedSource)), output);
+    }
+    fs.unlinkSync(rootSource);
 
     for (const script of ['format:check', 'lint', 'format']) {
       const result = runScript(script, root);
