@@ -2199,7 +2199,7 @@ test('supervisor timeout retains captured signal and output-read reason', async 
   assert.equal(observation.monitor, 'timed-out');
   assert.equal(observation.signal, 'SIGTERM');
   assert.equal(observation.exitCode, null);
-  assert.equal(observation.reason, 'The requested log is incomplete. Private output remains available.');
+  assert.equal(observation.reason, 'Observation timed out before all worker output was read.');
   assert.equal(receipts.latest(launch.launchId)?.availability, 'pending');
 });
 
@@ -4004,11 +4004,16 @@ const lateWatcher=fs.watch(process.cwd(),lateFinish);lateFinish();return;`;
         () => assert.ok(fs.statSync(receipts.artifact(launch.launchId, 'stdout.log')).size > bounds.workBytes),
         { timeout: 5000 },
       );
-      await superviseStandalone(receipts, launch.launchId, true, bounds, {
+      let recovered = false;
+      const recovery = superviseStandalone(receipts, launch.launchId, true, bounds, {
         now: () => 0,
         identity: async () => null,
         yield: () => Promise.resolve(),
+      }).finally(() => {
+        recovered = true;
       });
+      await vi.waitFor(() => assert.ok(recovered), { timeout: 5000 });
+      await recovery;
       await vi.waitFor(
         () => assert.equal(fs.statSync(alias).size, Buffer.byteLength(stdoutPrefix) + diagnostic.length),
         { timeout: 5000 },
