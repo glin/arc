@@ -256,12 +256,14 @@ function countedListenerPageHtml(bodyClass = 'vscode-dark'): string {
 // Count onDraw calls because repeated full draws can produce the same final DOM as a batched update.
 
 function drawCountedPageHtml(): string {
-  return browserStatePageHtml()
-    .replace(
-      'window.__posted = [];',
-      `window.__posted = [];
+  return (
+    browserStatePageHtml()
+      .replace(
+        'window.__posted = [];',
+        `window.__posted = [];
   window.__browserSaves = 0;
   window.__arcCardPrints = 0;
+  window.__arcRailRows = 0;
   window.__railTabWrites = 0;
   const tabIndexProperty = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'tabIndex');
   Object.defineProperty(HTMLElement.prototype, 'tabIndex', {
@@ -273,9 +275,12 @@ function drawCountedPageHtml(): string {
   });
   window.__arcDrawCounts = { timeline: 0, rail: 0 };
   window.__arcOnDraw = (renderer) => { window.__arcDrawCounts[renderer] += 1; };`,
-    )
-    .replace('window.__browserState = state;', 'window.__browserSaves += 1; window.__browserState = state;')
-    .replace(/([A-Za-z_$][\w$]*)\.cardPrint\(([^)]*)\)/g, '(window.__arcCardPrints += 1, $&)');
+      )
+      .replace('window.__browserState = state;', 'window.__browserSaves += 1; window.__browserState = state;')
+      .replace(/([A-Za-z_$][\w$]*)\.cardPrint\(([^)]*)\)/g, '(window.__arcCardPrints += 1, $&)')
+      // Count row construction in the bundled renderer, independently of update admission.
+      .replace(/[$\w]+\?"railrow railviewedge":"railrow"/g, '(window.__arcRailRows += 1, $&)')
+  );
 }
 
 async function drawCounts(page: Page): Promise<{ timeline: number; rail: number }> {
@@ -333,6 +338,187 @@ async function openScaledPage(page: Page, n: number, turns?: number): Promise<Pa
   await page.evaluate(SETTLED);
   return initial;
 }
+
+test('session selection reuses unchanged mounted rows at 100 and 1000 sessions', { timeout: 120_000 }, async (t) => {
+  const browser = await browserOrNone();
+  if (!browser) {
+    t.skip('no browser available');
+    return;
+  }
+  const observations: Array<{
+    sessions: number;
+    mounted: number;
+    initial: number;
+    selection: number;
+    equal: number;
+    changed: number;
+    mutated: number;
+    selected: number;
+  }> = [];
+  try {
+    for (const n of [100, 1000]) {
+      const page = await browser.newPage();
+      const failures: string[] = [];
+      page.on('pageerror', (error) => failures.push(String(error)));
+      await page.clock.setFixedTime(NOW);
+      await page.setContent(themed(drawCountedPageHtml()));
+      const initial = scaledPayload(n, 12);
+      initial.stats.bulk2 = structuredClone(initial.stats.bulk2);
+      initial.views = [{ id: 'all', name: 'All sessions', query: '', archived: false }];
+      initial.rail = initial.rail.map((row) => ({ ...row, pinnedTop: true }));
+      initial.pinnedTop = initial.rail.map((row) => row.id);
+      initial.rail.find((row) => row.id === 'bulk2')!.agentWord = 'Started by agent';
+      await page.evaluate((payload) => window.postMessage(payload, '*'), initial);
+      await page.waitForFunction(() => document.querySelectorAll('.railrow').length > 0);
+      await page.waitForFunction(() => (window as any).__arcDrawCounts.rail > 0);
+      const mounted = await page.locator('.railrow').count();
+      const constructed = () => page.evaluate<number>('window.__arcRailRows');
+      const initialWork = await constructed();
+      assert.ok(initialWork >= mounted && mounted >= n, 'the counter must observe actual initial row construction');
+      const target = page.locator('.railcard[data-session="bulk1"]');
+      const selected = await target.count();
+      assert.ok(selected > 1, 'the fixture must include repeated session rows');
+      await target.first().focus();
+      const before = await constructed();
+      const rail: Payload['rail'] = initial.rail.map((row) => ({ ...row, current: row.id === 'bulk1' }));
+      const selection = {
+        type: 'selection',
+        replaces: ['bulk0', 'bulk1'],
+        showing: 'bulk1',
+        cards: initial.cards.map((card) => ({ ...card, sessionId: 'bulk1' })),
+        sessions: initial.sessions
+          .filter((row) => row.id === 'bulk0' || row.id === 'bulk1')
+          .map((row) => ({ ...row, shown: row.id === 'bulk1' })),
+        rail: rail.filter((row) => row.id === 'bulk0' || row.id === 'bulk1'),
+        stats: { bulk0: initial.stats.bulk0, bulk1: initial.stats.bulk1 },
+        olderHistory: null,
+        diagnosis: null,
+        usage: initial.usage,
+        startup: null,
+      };
+      await page.evaluate((message) => window.postMessage(message, '*'), selection);
+      await page.waitForFunction(
+        () =>
+          !document.querySelector('.railcard.is-current[data-session="bulk0"]') &&
+          !!document.querySelector('.railcard.is-current[data-session="bulk1"]'),
+      );
+      await page.evaluate(SETTLED);
+      const selectionWork = (await constructed()) - before;
+      assert.equal(await page.locator('.railcard[data-session="bulk1"][aria-current="true"]').count(), selected);
+      assert.equal(await page.locator('.railcard[data-session="bulk0"][aria-current]').count(), 0);
+      assert.equal(await target.first().evaluate((node) => document.activeElement === node), true);
+      const postRail = async (rows: Payload['rail']) => {
+        const beforeDraw = (await drawCounts(page)).rail;
+        await page.evaluate(
+          (message) => {
+            (window as any).__rowReuseMessage = message;
+            window.dispatchEvent(new MessageEvent('message', { data: message }));
+          },
+          {
+            type: 'rail',
+            rail: rows,
+            labels: initial.labels,
+            views: initial.views,
+            railFilters: initial.railFilters,
+            stats: initial.stats,
+            hidden: initial.hidden,
+            pinnedTop: initial.pinnedTop,
+            sessionAdoptions: [],
+          },
+        );
+        await page.waitForFunction((before) => (window as any).__arcDrawCounts.rail > before, beforeDraw);
+      };
+      const equalBefore = await constructed();
+      await postRail(rail);
+      const equalWork = (await constructed()) - equalBefore;
+      const changedBefore = await constructed();
+      await postRail(
+        rail.map((row) =>
+          row.id === 'bulk2' ? { ...row, name: 'Changed session', labelChips: ['Changed label'] } : row,
+        ),
+      );
+      await page.waitForFunction(() =>
+        Array.from(document.querySelectorAll('.railcard[data-session="bulk2"] .railname')).every(
+          (node) => node.textContent === 'Changed session',
+        ),
+      );
+      await page.evaluate(SETTLED);
+      const changedWork = (await constructed()) - changedBefore;
+      assert.equal(await page.locator('.railcard[data-session="bulk2"]').count(), selected);
+      for (const name of await page
+        .locator('.railcard[data-session="bulk2"]')
+        .evaluateAll((nodes) => nodes.map((node) => node.getAttribute('aria-label') ?? ''))) {
+        assert.ok(name.includes('Changed session'), 'every occurrence must expose the current accessible name');
+      }
+      assert.equal(
+        await page.locator('.railcard[data-session="bulk2"] .raillabel:not(.raillabelmore)').count(),
+        selected,
+      );
+      assert.deepEqual(
+        await page.locator('.railcard[data-session="bulk2"] .railorigin').allTextContents(),
+        Array(selected).fill('Started by agent'),
+      );
+      const mutationBefore = await constructed();
+      // Reuse the same input objects so shared references cannot hide changed nested values.
+      await page.evaluate(() => {
+        const message = (window as any).__rowReuseMessage;
+        const card = message.rail.find((row: { id: string }) => row.id === 'bulk2');
+        card.name = 'Mutated session';
+        card.agentWord = 'Started by another agent';
+        card.labelChips[0] = 'Mutated label';
+        const stat = message.stats.bulk2.find((value: { metric: string }) => value.metric === 'cost');
+        stat.compactLabel = '$99';
+        stat.name = 'Mutated cost';
+        window.dispatchEvent(new MessageEvent('message', { data: message }));
+      });
+      await page.waitForFunction(() =>
+        Array.from(document.querySelectorAll('.railcard[data-session="bulk2"] .railname')).every(
+          (node) => node.textContent === 'Mutated session',
+        ),
+      );
+      const mutatedWork = (await constructed()) - mutationBefore;
+      assert.deepEqual(
+        await page.locator('.railcard[data-session="bulk2"] .raillabel:not(.raillabelmore)').allTextContents(),
+        Array(selected).fill('Mutated label'),
+      );
+      assert.deepEqual(
+        await page.locator('.railcard[data-session="bulk2"] .railorigin').allTextContents(),
+        Array(selected).fill('Started by another agent'),
+      );
+      const costs = page.locator('.railcard[data-session="bulk2"] [data-metric="cost"]');
+      assert.deepEqual(await costs.allTextContents(), Array(selected).fill('$99'));
+      assert.deepEqual(
+        await costs.evaluateAll((nodes) => nodes.map((node) => node.getAttribute('aria-label'))),
+        Array(selected).fill('Mutated cost'),
+      );
+      observations.push({
+        sessions: n,
+        mounted,
+        initial: initialWork,
+        selection: selectionWork,
+        equal: equalWork,
+        changed: changedWork,
+        mutated: mutatedWork,
+        selected,
+      });
+      assert.deepEqual(failures, []);
+      await page.close();
+    }
+    console.log('SESSION_ROW_WORK', JSON.stringify(observations));
+    for (const observed of observations) {
+      assert.equal(
+        observed.selection,
+        observed.selected * 2,
+        'selection-only updates must construct only the old and new current occurrences',
+      );
+      assert.equal(observed.equal, 0, 'equal reconstructed inputs must preserve mounted rows');
+      assert.equal(observed.changed, observed.selected, 'changed session values must redraw every occurrence');
+      assert.equal(observed.mutated, observed.selected, 'in-place changes must redraw every occurrence');
+    }
+  } finally {
+    await browser.close();
+  }
+});
 
 test('Activity publishes only the changed card beside unchanged cards', { timeout: 60_000 }, async (t) => {
   const browser = await browserOrNone();

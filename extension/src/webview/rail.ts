@@ -1,4 +1,4 @@
-import { Fragment, h, render, type ComponentChildren } from 'preact';
+import { Component, Fragment, h, render, type ComponentChildren } from 'preact';
 import { nativeMenuIcon, pressNativeMenu } from './native-menu.ts';
 import { navigationIndex, plainNavigationKey } from './navigation.ts';
 import type { SessionLauncherView } from '../view/launcher.ts';
@@ -605,6 +605,33 @@ function RailLabels({ card }: { card: RailCardView }): ComponentChildren {
   );
 }
 
+interface RailRowProps {
+  card: RailCardView;
+  stats: readonly RailStat[];
+  bucket: string;
+  view: boolean;
+  repeat: boolean;
+  owner: RailRenderer;
+  options: RailOptions;
+  now: number;
+  density: RailDensity;
+  labelsOpen: { session: string; section: string | null } | null;
+  menuContext: string;
+  contextClasses: Record<string, string>;
+}
+
+// Each mounted occurrence retains its row until its values or displayed clock text change.
+// Preact releases the retained props when the occurrence leaves its group.
+class RetainedRailRow extends Component<RailRowProps & { print: string; environment: string }> {
+  shouldComponentUpdate(next: Readonly<RailRowProps & { print: string; environment: string }>): boolean {
+    return next.print !== this.props.print || next.environment !== this.props.environment;
+  }
+
+  render(): ComponentChildren {
+    return RailRow(this.props);
+  }
+}
+
 function RailRow({
   card,
   stats,
@@ -616,18 +643,9 @@ function RailRow({
   now,
   density,
   labelsOpen,
-}: {
-  card: RailCardView;
-  stats: readonly RailStat[];
-  bucket: string;
-  view: boolean;
-  repeat: boolean;
-  owner: RailRenderer;
-  options: RailOptions;
-  now: number;
-  density: RailDensity;
-  labelsOpen: { session: string; section: string | null } | null;
-}): ComponentChildren {
+  menuContext,
+  contextClasses,
+}: RailRowProps): ComponentChildren {
   // Mark the row that anchors the open label editor.
   // An action outside the session list uses the first occurrence, matching labelAnchorFor.
   const labelsHere =
@@ -668,7 +686,7 @@ function RailRow({
           'data-control': `rail:${card.id}`,
           'data-session': card.id,
           'data-archived': String(card.archived),
-          'data-vscode-context': options.rowContext(card.id, card.menuSection, card.persisted),
+          'data-vscode-context': menuContext,
           'aria-label': drawnRailCardName(card, now),
           'aria-current': card.current ? 'true' : undefined,
           'data-hint': hint.hint,
@@ -714,7 +732,7 @@ function RailRow({
             ]),
           ),
           origin ? h('div', { class: 'railagent railorigin' }, origin) : null,
-          h(RailStats, { stats, contextClass: options.contextClass }),
+          h(RailStats, { stats, contextClass: (level) => contextClasses[level] ?? '' }),
           h(RailLabels, { card }),
         ],
       ),
@@ -2880,6 +2898,7 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
         null)
       : null;
     const railLayout = layout();
+    const environment = JSON.stringify([options.platform, options.readOnly, options.words]);
     const repeated = railRepeatRows(railLayout.sections);
     const children: ComponentChildren[] = [];
     // A section draws at least through the current session's row.
@@ -2947,10 +2966,33 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
             id: railGroupListId(bucket.id),
             'aria-labelledby': railGroupHeadingId(bucket.id),
           },
-          bucketRows.map(({ card, repeat }) =>
-            h(RailRow, {
+          bucketRows.map(({ card, repeat }) => {
+            const stats = drawnStats[card.id] ?? NO_RAIL_STATS;
+            const menuContext = options.rowContext(card.id, card.menuSection, card.persisted);
+            const contextClasses = Object.fromEntries(
+              stats.filter((stat) => stat.level).map((stat) => [stat.level!, options.contextClass(stat.level!)]),
+            );
+            const editor = labelsOpen && { session: labelsOpen.session, section: labelsOpen.section };
+            const print = JSON.stringify([
               card,
-              stats: drawnStats[card.id] ?? NO_RAIL_STATS,
+              stats,
+              bucket.id,
+              !!view,
+              repeat,
+              railDensity,
+              editor,
+              menuContext,
+              contextClasses,
+              railAgeFormat(railDensity)(card.at, now),
+              card.runningSince === null ? null : railRunningWord(card.runningSince, now),
+              railCacheState(card.cache, now),
+              railCacheName(card.cache, now),
+              card.cache ? railCacheTitle(card.cache, now) : null,
+              drawnRailCardName(card, now),
+            ]);
+            return h(RetainedRailRow, {
+              card,
+              stats,
               bucket: bucket.id,
               view: !!view,
               owner,
@@ -2958,10 +3000,14 @@ export function createRailRenderer(options: RailOptions): RailRenderer {
               now,
               density: railDensity,
               repeat,
-              labelsOpen: labelsOpen && { session: labelsOpen.session, section: labelsOpen.section },
+              labelsOpen: editor,
+              menuContext,
+              contextClasses,
+              print,
+              environment,
               key: railRowKey(bucket.id, card.id),
-            }),
-          ),
+            });
+          }),
         ),
       );
       const undrawn = left.get(bucket.id) ?? 0;
