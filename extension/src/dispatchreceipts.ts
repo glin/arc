@@ -372,7 +372,7 @@ export class DispatchReceipts {
               return initial;
             } catch (error) {
               // Initialization can retain private output before its alias witness is saved.
-              throw new Error('The requested log could not be prepared. Private output remains available.', {
+              throw new Error('The requested log is unavailable. Private output remains available.', {
                 cause: error,
               });
             }

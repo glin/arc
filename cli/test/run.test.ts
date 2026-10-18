@@ -289,7 +289,7 @@ test.each(['construct', 'cursor', 'persistent', 'invalid', 'init-alias', 'init-c
     if (phase === 'init-alias' || phase === 'init-checkpoint') {
       assert.equal(injected, true);
       assert.notEqual(receipts.observation(id)?.monitor, 'finished');
-      assert.match(String(failure), /The requested log could not be prepared/);
+      assert.match(String(failure), /The requested log is unavailable/);
       assert.equal((failure as Error).cause && ((failure as Error).cause as NodeJS.ErrnoException).code, 'EPERM');
       assert.equal(attempts, 1);
       assert.deepEqual(fs.readFileSync(receipts.artifact(id, 'stdout.log')), stdout);
