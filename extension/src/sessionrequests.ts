@@ -30,6 +30,19 @@ import { RAIL_FILTER_QUERY_LIMIT } from './domain/rail-filters.ts';
 import { listingQueryError, sessionQueryError } from './domain/session-query.ts';
 import { validCompactPayload } from './compactrequest.ts';
 import { DISPATCH_ID } from './dispatchreceipts';
+import {
+  TERMINAL_OWNERSHIP_CAPABILITY,
+  collectProcessAncestry,
+  integratedTerminal,
+  localTerminalPlacement,
+  validAncestry,
+  validTerminalOrigin,
+  validTerminalOwner,
+  type ProcessAncestry,
+  type TerminalOrigin,
+  type terminalOwnership,
+} from './terminalownership.ts';
+import { leaseWindowsPipe } from './windowpipe.ts';
 
 export const SESSION_REQUEST_VERSION = 1;
 export const SESSION_REQUEST_LIMITS = {
@@ -92,6 +105,7 @@ export interface SessionRequest {
   version: typeof SESSION_REQUEST_VERSION;
   token: string;
   method:
+    | 'terminal-owner'
     | 'ping'
     | 'filter'
     | 'sessions'
@@ -105,11 +119,18 @@ export interface SessionRequest {
     | 'compact-request'
     | 'compact-status'
     | 'dispatch';
+  terminalOrigin?: TerminalOrigin;
   requester: string | null;
   // The requester's provider. The CLI sends it on send, session reads, and `arc start --arc-dispatch`, and only
   // when exactly one provider variable is set and the window lists `REQUESTER_PROVIDER_CAPABILITY`.
   requesterProvider?: RequesterProvider;
-  params: SessionWriteParams & { requestId?: string; window?: string; self?: true; afterTurn?: true };
+  params: SessionWriteParams & {
+    requestId?: string;
+    window?: string;
+    self?: true;
+    afterTurn?: true;
+    ancestry?: ProcessAncestry;
+  };
   // The channel sets the payload allowance for sessions requests. The wire parser refuses this key.
   replyBytes?: number;
   filterContext?: { deadline: number; signal: AbortSignal };
@@ -164,7 +185,21 @@ export function requesterIdentity(env: NodeJS.ProcessEnv = process.env): {
 }
 
 export function parseSessionRequest(value: unknown): SessionRequest | null {
-  const keys = record(value) ? Object.keys(value).sort().join(',') : '';
+  const keys = record(value)
+    ? Object.keys(value)
+        .filter((key) => key !== 'terminalOrigin')
+        .sort()
+        .join(',')
+    : '';
+  if (
+    record(value) &&
+    value.terminalOrigin !== undefined &&
+    (!validTerminalOrigin(value.terminalOrigin) ||
+      ['ping', 'terminal-owner', 'dispatch', 'compact-ready', 'compact-request', 'compact-status'].includes(
+        value.method as string,
+      ))
+  )
+    return null;
   if (
     !record(value) ||
     (keys !== 'id,method,params,requester,token,version' &&
@@ -187,6 +222,7 @@ export function parseSessionRequest(value: unknown): SessionRequest | null {
     !TOKEN.test(value.token) ||
     ![
       'ping',
+      'terminal-owner',
       'sessions',
       'filter',
       'session',
@@ -207,7 +243,9 @@ export function parseSessionRequest(value: unknown): SessionRequest | null {
     !record(value.params)
   )
     return null;
-  if (value.method === 'dispatch') {
+  if (value.method === 'terminal-owner') {
+    if (Object.keys(value.params).join(',') !== 'ancestry' || !validAncestry(value.params.ancestry)) return null;
+  } else if (value.method === 'dispatch') {
     const params = value.params;
     const fields =
       params.dispatchAction === 'result'
@@ -417,6 +455,12 @@ export class WindowChannel {
   private dispatchHandler: ((request: SessionRequest) => unknown | Promise<unknown>) | null = null;
   private diagnostics?: WindowTransportSink;
 
+  private ownership: ReturnType<typeof terminalOwnership> | null = null;
+  setTerminalOwnership(ownership: ReturnType<typeof terminalOwnership>): void {
+    this.ownership = ownership;
+    if (this.listening) this.publish();
+  }
+
   setDiagnostics(diagnostics: WindowTransportSink): void {
     this.diagnostics = diagnostics;
   }
@@ -503,6 +547,7 @@ export class WindowChannel {
       pid: process.pid,
       version: SESSION_REQUEST_VERSION,
       capabilities: [
+        ...(this.ownership ? [TERMINAL_OWNERSHIP_CAPABILITY] : []),
         REQUESTER_PROVIDER_CAPABILITY,
         SESSION_QUERY_CAPABILITY,
         SESSION_QUERY_SHORTHAND_CAPABILITY,
@@ -676,9 +721,28 @@ export class WindowChannel {
         }
         this.inFlight++;
         void Promise.resolve()
-          .then<unknown>(() => {
+          .then<unknown>(async () => {
             if (this.closed) throw new Error('Window unavailable.');
             if (request.method === 'ping') return this.ping(this.info());
+            if (request.method === 'terminal-owner') {
+              const data = this.ownership
+                ? await this.ownership.inquire(request.params.ancestry!)
+                : { status: 'unknown' };
+              if (this.closed || generation !== this.generation || socket.destroyed)
+                throw new Error('Window unavailable.');
+              return { window: this.info(), data };
+            }
+            if (request.terminalOrigin) {
+              const admitted = this.ownership && (await this.ownership.admit(request.terminalOrigin));
+              if (
+                !admitted ||
+                this.closed ||
+                generation !== this.generation ||
+                this.failedGeneration === generation ||
+                socket.destroyed
+              )
+                throw new Error('The terminal no longer belongs to this Arc window. Select a window with --window.');
+            }
             if (request.method === 'dispatch') {
               if (!this.dispatchHandler) throw new Error('This Arc window does not support dispatch results.');
               return Promise.resolve(this.dispatchHandler(request)).then((data) => {
@@ -900,6 +964,7 @@ async function exchangeWindow(
   attributed = false,
   onTimeout?: () => void,
   onFailure?: (code: WindowDiagnostic['code']) => void,
+  terminalOrigin?: TerminalOrigin,
 ): Promise<unknown | null> {
   if (process.platform === 'win32' && (!Number.isSafeInteger(entry.transportPid) || entry.transportPid! <= 0))
     return null;
@@ -912,6 +977,8 @@ async function exchangeWindow(
     throw new Error(
       'The selected Arc window does not support read-only starts or scoped launch folders. No session was started.',
     );
+  if ((method === 'terminal-owner' || terminalOrigin) && !entry.capabilities?.includes(TERMINAL_OWNERSHIP_CAPABILITY))
+    throw new Error('Reload this Arc window or select it explicitly with --window.');
   const identity = requesterIdentity();
   const request: SessionRequest = {
     id,
@@ -919,6 +986,7 @@ async function exchangeWindow(
     token: entry.token,
     method,
     requester: identity.requester,
+    ...(terminalOrigin ? { terminalOrigin } : {}),
     ...(attributed && identity.provider && providerCapable(entry) ? { requesterProvider: identity.provider } : {}),
     params,
   };
@@ -1065,130 +1133,184 @@ export async function requestWindow(
   guardedStart = false,
 ): Promise<unknown> {
   if (method === 'read' && !requestId) throw new Error('Marking read requires an explicit request ID.');
-  let selected = selector;
-  if (!selected) {
-    const discovery = await discoverWindows(home);
-    if (!discovery.complete) throw new Error('Arc window discovery is incomplete. Select a window with --window.');
-    if (discovery.windows.length !== 1)
-      throw new Error(`Select one Arc window with --window or ${ARC_IDENTITY.environmentPrefix}WINDOW.`);
-    selected = discovery.windows[0].hostId;
-  }
-  if (!HOST_ID.test(selected)) throw new Error('Invalid Arc window identifier.');
-  const file = path.join(home, 'hosts', `${selected}.json`);
-  let entry: HostRegistration;
+  if (!selector && (method.startsWith('compact-') || method === 'dispatch'))
+    throw new Error('Select an Arc window with --window.');
+  const automatic = !selector && integratedTerminal();
+  const release = automatic ? await leaseWindowsPipe() : () => {};
   try {
-    const value: unknown = JSON.parse(readRegistration(file));
+    let ancestry: ProcessAncestry | undefined;
+    if (automatic) {
+      if (!localTerminalPlacement()) throw new Error('Select this Arc window with --window in this terminal.');
+      try {
+        ancestry = await collectProcessAncestry();
+      } catch {
+        throw new Error('The terminal owner is unavailable. Select this Arc window with --window.');
+      }
+    }
+    let origin: TerminalOrigin | undefined;
+    let selected = selector;
+    if (!selected) {
+      const discovery = await discoverWindows(home);
+      if (!discovery.complete) throw new Error('Arc window discovery is incomplete. Select a window with --window.');
+      if (ancestry) {
+        if (
+          !discovery.windows.length ||
+          discovery.windows.some((window) => !window.capabilities?.includes(TERMINAL_OWNERSHIP_CAPABILITY))
+        )
+          throw new Error('Reload Arc windows or select the intended window with --window.');
+        const replies = await Promise.all(
+          discovery.windows.map(async (window) => {
+            try {
+              return { window, owner: await requestWindow('terminal-owner', { ancestry }, window.hostId, home) };
+            } catch {
+              return { window, owner: null };
+            }
+          }),
+        );
+        if (replies.some(({ owner }) => !validTerminalOwner(owner) || owner.status === 'unknown'))
+          throw new Error('The terminal owner is unavailable. Select this Arc window with --window.');
+        const matches = replies.filter(({ owner }) => validTerminalOwner(owner) && owner.status === 'match');
+        if (matches.length !== 1)
+          throw new Error('Select this Arc window with --window. The terminal owner is not unique.');
+        const match = matches[0];
+        if (!validTerminalOwner(match.owner) || match.owner.status !== 'match')
+          throw new Error('Terminal unavailable.');
+        selected = match.window.hostId;
+        origin = {
+          platform: ancestry.platform,
+          caller: { pid: ancestry.chain[0].pid, birth: ancestry.chain[0].birth },
+          root: match.owner.root,
+        };
+      } else {
+        if (discovery.windows.length !== 1)
+          throw new Error(`Select one Arc window with --window or ${ARC_IDENTITY.environmentPrefix}WINDOW.`);
+        selected = discovery.windows[0].hostId;
+      }
+    }
+    if (!HOST_ID.test(selected)) throw new Error('Invalid Arc window identifier.');
+    const file = path.join(home, 'hosts', `${selected}.json`);
+    let entry: HostRegistration;
+    try {
+      const value: unknown = JSON.parse(readRegistration(file));
+      if (
+        !windowInfo(value) ||
+        !record(value) ||
+        value.hostId !== selected ||
+        typeof value.token !== 'string' ||
+        !TOKEN.test(value.token) ||
+        !validHostAddress(home, selected, value.address)
+      )
+        throw new Error();
+      entry = value as unknown as HostRegistration;
+    } catch (error) {
+      const code = windowFailureCode(error);
+      if (code === 'ENOENT')
+        throw new WindowUnavailableError(
+          'The selected Arc window is not registered. Run arc windows and select the intended folders.',
+        );
+      if (code === 'EACCES' || code === 'EPERM')
+        throw new WindowUnavailableError(
+          `Local access to Arc window ${selected} failed (${code}). Check that your current permissions allow reading this window's local details.`,
+        );
+      throw new WindowUnavailableError('The selected Arc window is unavailable.');
+    }
+    const id = requestId ?? `${entry.hostId}:${crypto.randomBytes(12).toString('hex')}`;
+    if (requestId && !requestId.startsWith(entry.hostId + ':'))
+      throw new Error(`Request ${requestId} has an unknown outcome in this activation.`);
+    if (method === 'send' && !providerCapable(entry))
+      throw new Error('The selected Arc window must reload before it can accept send. No prompt was sent.');
     if (
-      !windowInfo(value) ||
-      !record(value) ||
-      value.hostId !== selected ||
-      typeof value.token !== 'string' ||
-      !TOKEN.test(value.token) ||
-      !validHostAddress(home, selected, value.address)
+      (method === 'dispatch' || (method === 'start' && params.dispatch)) &&
+      !entry.capabilities?.includes('dispatchResults')
     )
-      throw new Error();
-    entry = value as unknown as HostRegistration;
-  } catch (error) {
-    const code = windowFailureCode(error);
-    if (code === 'ENOENT')
-      throw new WindowUnavailableError(
-        'The selected Arc window is not registered. Run arc windows and select the intended folders.',
-      );
-    if (code === 'EACCES' || code === 'EPERM')
-      throw new WindowUnavailableError(
-        `Local access to Arc window ${selected} failed (${code}). Check that your current permissions allow reading this window's local details.`,
-      );
-    throw new WindowUnavailableError('The selected Arc window is unavailable.');
-  }
-  const id = requestId ?? `${entry.hostId}:${crypto.randomBytes(12).toString('hex')}`;
-  if (requestId && !requestId.startsWith(entry.hostId + ':'))
-    throw new Error(`Request ${requestId} has an unknown outcome in this activation.`);
-  if (method === 'send' && !providerCapable(entry))
-    throw new Error('The selected Arc window must reload before it can accept send. No prompt was sent.');
-  if (
-    (method === 'dispatch' || (method === 'start' && params.dispatch)) &&
-    !entry.capabilities?.includes('dispatchResults')
-  )
-    throw new Error('The selected Arc window must reload before it can accept dispatch results. No prompt was sent.');
-  if (method === 'read' && (!providerCapable(entry) || !entry.capabilities?.includes(SESSION_READ_CAPABILITY)))
-    throw new Error('The selected Arc window does not support marking sessions read.');
-  if (
-    (method === 'filter' || (method === 'sessions' && params.query !== undefined)) &&
-    !entry.capabilities?.includes(SESSION_QUERY_CAPABILITY)
-  )
-    throw new Error('The selected Arc window must reload before it can accept filter queries.');
-  if (
-    (method === 'filter' || method === 'sessions') &&
-    params.query !== undefined &&
-    sessionQueryNeedsShorthand(params.query) &&
-    !entry.capabilities?.includes(SESSION_QUERY_SHORTHAND_CAPABILITY)
-  )
-    throw new Error('The selected Arc window must reload before it can accept session ID shorthand.');
-  const write =
-    method === 'start' || method === 'curate' || method === 'send' || method === 'read' || method === 'compact-request';
-  const attributed =
-    method === 'send' || method === 'read' || method === 'session' || (method === 'start' && guardedStart);
-  let timedOut = false;
-  let failureCode: WindowDiagnostic['code'] | undefined;
-  const result = await exchangeWindow(
-    entry,
-    method === 'filter'
-      ? FILTER_LIMITS.transportMs
-      : method === 'dispatch' && params.dispatchAction === 'wait'
-        ? (params.deadlineMs ?? 110_000) + 5_000
-        : write
-          ? 120_000
-          : 5_000,
-    file,
-    method,
-    params,
-    id,
-    attributed,
-    () => {
-      timedOut = true;
-    },
-    (code) => {
-      failureCode = code;
-    },
-  );
-  if (result === null) {
-    if (method === 'dispatch' && params.dispatchAction === 'wait')
-      return {
-        launchId: params.launchId,
-        state: 'uncertain',
-        reason: 'The wait disconnected. Read dispatch status or recover this receipt.',
-      };
-    if (method === 'filter')
-      return {
-        version: 1,
-        status: 'unknown',
-        reason: 'The filter outcome is unknown. Read the panel before retrying.',
-      };
-    if (method === 'compact-request')
-      return {
-        version: 1,
-        state: 'uncertain',
-        requestId: id,
-        window: entry.hostId,
-        reason: 'Admission is uncertain. Observe this request without retrying or switching transports.',
-      };
-    if (write)
-      return {
-        version: 1,
-        status: 'unknown',
-        requestId: id,
-        window: entry.hostId,
-        reason: 'Delivery is unknown. Retry only this request ID in this window.',
-      };
-    if (failureCode === 'EACCES' || failureCode === 'EPERM')
-      throw new WindowUnavailableError(
-        `Local access to Arc window ${entry.hostId} failed (${failureCode}). Check that your current permissions allow connecting to this window's local socket.`,
-      );
-    throw new Error(
-      timedOut ? 'The selected Arc window did not answer in time.' : 'The selected Arc window is unavailable.',
+      throw new Error('The selected Arc window must reload before it can accept dispatch results. No prompt was sent.');
+    if (method === 'read' && (!providerCapable(entry) || !entry.capabilities?.includes(SESSION_READ_CAPABILITY)))
+      throw new Error('The selected Arc window does not support marking sessions read.');
+    if (
+      (method === 'filter' || (method === 'sessions' && params.query !== undefined)) &&
+      !entry.capabilities?.includes(SESSION_QUERY_CAPABILITY)
+    )
+      throw new Error('The selected Arc window must reload before it can accept filter queries.');
+    if (
+      (method === 'filter' || method === 'sessions') &&
+      params.query !== undefined &&
+      sessionQueryNeedsShorthand(params.query) &&
+      !entry.capabilities?.includes(SESSION_QUERY_SHORTHAND_CAPABILITY)
+    )
+      throw new Error('The selected Arc window must reload before it can accept session ID shorthand.');
+    const write =
+      method === 'start' ||
+      method === 'curate' ||
+      method === 'send' ||
+      method === 'read' ||
+      method === 'compact-request';
+    const attributed =
+      method === 'send' || method === 'read' || method === 'session' || (method === 'start' && guardedStart);
+    let timedOut = false;
+    let failureCode: WindowDiagnostic['code'] | undefined;
+    const result = await exchangeWindow(
+      entry,
+      method === 'filter'
+        ? FILTER_LIMITS.transportMs
+        : method === 'dispatch' && params.dispatchAction === 'wait'
+          ? (params.deadlineMs ?? 110_000) + 5_000
+          : write
+            ? 120_000
+            : 5_000,
+      file,
+      method,
+      params,
+      id,
+      attributed,
+      () => {
+        timedOut = true;
+      },
+      (code) => {
+        failureCode = code;
+      },
+      origin,
     );
+    if (result === null) {
+      if (method === 'dispatch' && params.dispatchAction === 'wait')
+        return {
+          launchId: params.launchId,
+          state: 'uncertain',
+          reason: 'The wait disconnected. Read dispatch status or recover this receipt.',
+        };
+      if (method === 'filter')
+        return {
+          version: 1,
+          status: 'unknown',
+          reason: 'The filter outcome is unknown. Read the panel before retrying.',
+        };
+      if (method === 'compact-request')
+        return {
+          version: 1,
+          state: 'uncertain',
+          requestId: id,
+          window: entry.hostId,
+          reason: 'Admission is uncertain. Observe this request without retrying or switching transports.',
+        };
+      if (write)
+        return {
+          version: 1,
+          status: 'unknown',
+          requestId: id,
+          window: entry.hostId,
+          reason: 'Delivery is unknown. Retry only this request ID in this window.',
+        };
+      if (failureCode === 'EACCES' || failureCode === 'EPERM')
+        throw new WindowUnavailableError(
+          `Local access to Arc window ${entry.hostId} failed (${failureCode}). Check that your current permissions allow connecting to this window's local socket.`,
+        );
+      throw new Error(
+        timedOut ? 'The selected Arc window did not answer in time.' : 'The selected Arc window is unavailable.',
+      );
+    }
+    return result;
+  } finally {
+    release();
   }
-  return result;
 }
 
 function processIsDead(pid: number): boolean {

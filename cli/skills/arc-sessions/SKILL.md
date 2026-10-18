@@ -11,7 +11,7 @@ Treat tag as a natural-language synonym for label. Keep `arc label`, `--label`, 
 
 ## Select a ready window
 
-Run `arc windows --json`. Select the intended window by its folders and `hostId`. Pass that ID through `--window` on every session command. `--window` overrides `ARC_WINDOW`. Without either, Arc requires exactly one live window and complete discovery.
+Run `arc windows --json`. Select the intended window by its folders and `hostId`. Pass that ID through `--window` on every session command. `--window` overrides `ARC_WINDOW`. Without either, integrated terminals select their current owning window. External shells require exactly one live window. Automatic selection requires complete discovery. Recognized integrated terminals also require conclusive terminal membership. Remote integrated terminals require explicit selection. Reload older Arc windows or select explicitly when ownership is unavailable.
 
 After reload or reconnection, refresh discovery before a new operation. Explicitly reselect the intended folders and their current `hostId`. A stale explicit `--window` or inherited `ARC_WINDOW` still selects the old activation. Never transfer an old request ID or follow-up ownership to the new activation. Preserve uncertain outcomes under Interpret delivery before starting new work.
 

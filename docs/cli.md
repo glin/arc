@@ -48,7 +48,7 @@ Optional `diagnostics` contain observed `ENOENT`, `EACCES`, or `EPERM`, a `regis
 
 ## Sessions
 
-`sessions` and `session` print JSON. `--window` selects the window explicitly and takes precedence over `ARC_WINDOW`. Without either, exactly one live window and complete discovery are required. `session` rejects unknown or ambiguous IDs. File paths never select a session source. The selected window's current repository scope supplies session membership.
+`sessions` and `session` print JSON. `--window` selects the window explicitly and takes precedence over `ARC_WINDOW`. Without either, integrated terminals select their current owning window through native process ancestry and current terminal membership. External shells require exactly one live window. Automatic selection requires complete discovery. Recognized integrated terminals also require conclusive ownership replies from every window. Reload older Arc windows or select explicitly when ownership is unavailable. Integrated terminals on remote hosts or in incompatible process namespaces require explicit selection. `session` rejects unknown or ambiguous IDs. File paths never select a session source. The selected window's current repository scope supplies session membership.
 
 A missing selected registration reports that the window is not registered. Observed `EACCES` or `EPERM` reports local access failure. Other unavailable causes remain generic. After reload or reconnection, run fresh discovery before new work and explicitly reselect the intended folders. Stale `--window` and inherited `ARC_WINDOW` values keep selecting the old activation. Preserve uncertain writes, their request IDs, and their original activation before starting another operation.
 

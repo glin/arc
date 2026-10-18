@@ -3,6 +3,7 @@ import { execFile, execFileSync, spawn, spawnSync } from 'node:child_process';
 import { promisify } from 'node:util';
 import { createHash } from 'node:crypto';
 import { canonicalToolPath } from '../../extension/src/toolownership.ts';
+import { terminalOwnership } from '../../extension/src/terminalownership.ts';
 import { parseSessionRequest, WindowChannel } from '../../extension/src/sessionrequests.ts';
 import { sessionListingPage, SESSION_PAGE_LIMITS } from '../../extension/src/sessionreads.ts';
 import { childEnv } from '../../extension/src/agenthost.ts';
@@ -963,7 +964,14 @@ const packageJson = JSON.parse(readFileSync(new URL('../package.json', import.me
 fixture.prompt_cache.expires_at = Math.ceil(Date.now() / 1000) + 300;
 const input = JSON.stringify(fixture);
 const cli = fileURLToPath(new URL('../dist/arc.cjs', import.meta.url));
-const smokeEnv = { ...process.env, CLAUDE_CODE_SESSION_ID: '', CODEX_THREAD_ID: '' };
+const smokeEnv = {
+  ...process.env,
+  CLAUDE_CODE_SESSION_ID: '',
+  CODEX_THREAD_ID: '',
+  TERM_PROGRAM: '',
+  VSCODE_PID: '',
+  VSCODE_IPC_HOOK_CLI: '',
+};
 
 test('session skill payload selection follows each executing artifact and rejects caller substitutes', () => {
   const root = mkdtempSync(join(realpathSync(tmpdir()), 'arc-skill-layout-'));
@@ -1959,6 +1967,22 @@ test('bundled session commands select one window, reject unknown IDs, and bound 
       run(process.execPath, [cli, 'sessions'], { env: { ...env, ARC_WINDOW: '' } }),
       /Select one Arc window/,
     );
+    // A built CLI must dispatch to its terminal owner when another authenticated window is live.
+    let competingRequests = 0;
+    second.setRequestHandler(() => {
+      competingRequests++;
+      return { wrongWindow: true };
+    });
+    const roots = [{ processId: Promise.resolve(process.pid) }];
+    channel.setTerminalOwnership(terminalOwnership({ allowed: () => true, terminals: () => roots }));
+    second.setTerminalOwnership(terminalOwnership({ allowed: () => true, terminals: () => [] }));
+    const integrated = await run(process.execPath, [cli, 'setups', '--json'], {
+      env: { ...env, ARC_WINDOW: '', TERM_PROGRAM: 'vscode' },
+      encoding: 'utf8',
+    });
+    assert.equal(JSON.parse(integrated.stdout).method, 'setups');
+    assert.equal(requests, before + 1);
+    assert.equal(competingRequests, 0);
   } finally {
     await Promise.all([channel.dispose(), second.dispose()]);
     rmSync(home, { recursive: true, force: true });

@@ -35,6 +35,10 @@ function overlayStaticSources(source: string): void {
     'bundledtools.ts',
     'toolownership.ts',
     'toolpath.ts',
+    'terminalownership.ts',
+    'sessionrequests.ts',
+    'windowpipe.ts',
+    'windowpipe-source.ts',
     'claudeplugin.ts',
     'panelbundle.ts',
     'sessionexport.ts',
@@ -532,203 +536,208 @@ test('the extension package contains exactly the intended files', () => {
   );
 });
 
-test('bare arc launchers preserve arguments, stdin, exit status, and window targeting with spaced paths', async () => {
-  const root = tempDir('arc-launchers-');
-  const tools = new BundledTools(
-    readToolPackage(path.join(extensionRoot, 'dist')),
-    path.join(root, 'software with spaces'),
-  );
-  const installed = tools.stage();
-  const bin = path.join(installed, 'launchers');
-  const editor = path.join(root, 'editor with spaces', process.platform === 'win32' ? 'Code.exe' : 'editor');
-  fs.mkdirSync(path.dirname(editor));
-  fs.copyFileSync(process.execPath, editor);
-  fs.chmodSync(editor, 0o755);
-  const bundle = path.join(installed, 'cli/arc.cjs');
-  const transcript = path.join(root, 'session with spaces.jsonl');
-  fs.writeFileSync(
-    transcript,
-    JSON.stringify({
-      type: 'assistant',
-      timestamp: '2026-09-26T00:00:01Z',
-      message: {
-        id: 'request-1',
-        model: 'claude-opus-5',
-        role: 'assistant',
-        content: [],
-        usage: { input_tokens: 10, output_tokens: 5, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+const launcherShells =
+  process.platform === 'win32'
+    ? [
+        { command: process.env.ComSpec ?? 'cmd.exe', args: ['/d', '/s', '/c'] },
+        {
+          command: path.join(
+            process.env.SystemRoot ?? 'C:/Windows',
+            'System32',
+            'WindowsPowerShell',
+            'v1.0',
+            'powershell.exe',
+          ),
+          args: ['-NoProfile', '-EncodedCommand'],
+        },
+        {
+          command:
+            process.env.GIT_BASH_PATH ??
+            path.join(process.env.ProgramFiles ?? 'C:/Program Files', 'Git', 'bin', 'bash.exe'),
+          args: ['--noprofile', '--norc', '-c'],
+        },
+      ]
+    : [
+        { command: '/bin/sh', args: ['-c'] },
+        { command: 'bash', args: ['--noprofile', '--norc', '-c'] },
+      ];
+
+test.each(launcherShells)(
+  'bare arc launchers preserve arguments, stdin, exit status, and window targeting with spaced paths ($command)',
+  async (selectedShell) => {
+    const root = tempDir('arc-launchers-');
+    const tools = new BundledTools(
+      readToolPackage(path.join(extensionRoot, 'dist')),
+      path.join(root, 'software with spaces'),
+    );
+    const installed = tools.stage();
+    const bin = path.join(installed, 'launchers');
+    const editor = path.join(root, 'editor with spaces', process.platform === 'win32' ? 'Code.exe' : 'editor');
+    fs.mkdirSync(path.dirname(editor));
+    fs.copyFileSync(process.execPath, editor);
+    fs.chmodSync(editor, 0o755);
+    const bundle = path.join(installed, 'cli/arc.cjs');
+    const transcript = path.join(root, 'session with spaces.jsonl');
+    fs.writeFileSync(
+      transcript,
+      JSON.stringify({
+        type: 'assistant',
+        timestamp: '2026-09-26T00:00:01Z',
+        message: {
+          id: 'request-1',
+          model: 'claude-opus-5',
+          role: 'assistant',
+          content: [],
+          usage: { input_tokens: 10, output_tokens: 5, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+        },
+      }) + '\n',
+    );
+    const env = childEnv(
+      process.env,
+      { ELECTRON_RUN_AS_NODE: '0', ARC_HOME: path.join(root, 'empty home') },
+      undefined,
+      undefined,
+      {
+        directory: bin,
+        editorExecutable: editor,
+        windowId: 'this-window',
       },
-    }) + '\n',
-  );
-  const env = childEnv(
-    process.env,
-    { ELECTRON_RUN_AS_NODE: '0', ARC_HOME: path.join(root, 'empty home') },
-    undefined,
-    undefined,
-    {
-      directory: bin,
-      editorExecutable: editor,
-      windowId: 'this-window',
-    },
-  );
-  env.ELECTRON_RUN_AS_NODE = '0';
-  const shells =
-    process.platform === 'win32'
-      ? [
-          { command: process.env.ComSpec ?? 'cmd.exe', args: ['/d', '/s', '/c'] },
-          {
-            command: path.join(
-              process.env.SystemRoot ?? 'C:/Windows',
-              'System32',
-              'WindowsPowerShell',
-              'v1.0',
-              'powershell.exe',
-            ),
-            args: ['-NoProfile', '-EncodedCommand'],
-          },
-          {
-            command:
-              process.env.GIT_BASH_PATH ??
-              path.join(process.env.ProgramFiles ?? 'C:/Program Files', 'Git', 'bin', 'bash.exe'),
-            args: ['--noprofile', '--norc', '-c'],
-          },
-        ]
-      : [
-          { command: '/bin/sh', args: ['-c'] },
-          { command: 'bash', args: ['--noprofile', '--norc', '-c'] },
-        ];
-  const values = new Map<string, { type: 'append' | 'replace'; value: string }>();
-  const collection = {
-    persistent: true,
-    description: undefined as unknown,
-    clear: () => values.clear(),
-    append: (key: string, value: string) => values.set(key, { type: 'append', value }),
-    replace: (key: string, value: string) => values.set(key, { type: 'replace', value }),
-  };
-  const activation = declarationSource(fs.readFileSync(path.join(__dirname, 'extension.ts'), 'utf8'), 'activate');
-  const start = activation.indexOf('const privateTools');
-  const end = activation.indexOf('const spawner');
-  assert.ok(start >= 0 && end > start);
-  const compiled = ts.transpileModule(activation.slice(start, end), {
-    compilerOptions: { target: ts.ScriptTarget.ES2022 },
-  }).outputText;
-  const subscriptions: TerminalTools[] = [];
-  const scope = {
-    TerminalTools,
-    context: {
-      environmentVariableCollection: collection,
-      subscriptions,
-      extensionPath: extensionRoot,
-      extensionMode: 1,
-    },
-    vscode: { workspace: { isTrusted: true, workspaceFolders: [] }, ExtensionMode: { Development: 2 } },
-    toolRoot: () => path.join(root, 'software with spaces'),
-    prepareEditorCommands: async () => bin,
-    path,
-    os: { hostname: () => 'fixture-host' },
-    process: { execPath: editor },
-  };
-  await vm.runInNewContext('(async () => {' + compiled + '})()', scope);
-  try {
-    await vi.waitFor(() => assert.equal(values.size, 2, 'activation did not publish terminal commands'));
-    for (const casing of process.platform === 'win32' ? ['PATH', 'Path', 'path'] : ['PATH']) {
-      const terminalEnv: NodeJS.ProcessEnv = {};
-      for (const [key, value] of Object.entries(process.env)) {
-        if (!/^(PATH|ARC_|ELECTRON_RUN_AS_NODE)$/i.test(key) && !key.startsWith('ARC_')) terminalEnv[key] = value;
-      }
-      terminalEnv[casing] =
-        process.platform === 'win32'
-          ? path.dirname(process.env.ComSpec ?? 'C:/Windows/System32/cmd.exe')
-          : '/usr/bin:/bin';
-      for (const [key, mutation] of values) {
-        const actual =
+    );
+    env.ELECTRON_RUN_AS_NODE = '0';
+    const shells = [selectedShell];
+    const values = new Map<string, { type: 'append' | 'replace'; value: string }>();
+    const collection = {
+      persistent: true,
+      description: undefined as unknown,
+      clear: () => values.clear(),
+      append: (key: string, value: string) => values.set(key, { type: 'append', value }),
+      replace: (key: string, value: string) => values.set(key, { type: 'replace', value }),
+    };
+    const activation = declarationSource(fs.readFileSync(path.join(__dirname, 'extension.ts'), 'utf8'), 'activate');
+    const start = activation.indexOf('const privateTools');
+    const end = activation.indexOf('const spawner');
+    assert.ok(start >= 0 && end > start);
+    const compiled = ts.transpileModule(activation.slice(start, end), {
+      compilerOptions: { target: ts.ScriptTarget.ES2022 },
+    }).outputText;
+    const subscriptions: TerminalTools[] = [];
+    const scope = {
+      TerminalTools,
+      context: {
+        environmentVariableCollection: collection,
+        subscriptions,
+        extensionPath: extensionRoot,
+        extensionMode: 1,
+      },
+      vscode: { workspace: { isTrusted: true, workspaceFolders: [] }, ExtensionMode: { Development: 2 } },
+      toolRoot: () => path.join(root, 'software with spaces'),
+      prepareEditorCommands: async () => bin,
+      path,
+      os: { hostname: () => 'fixture-host' },
+      process: { execPath: editor },
+    };
+    await vm.runInNewContext('(async () => {' + compiled + '})()', scope);
+    try {
+      await vi.waitFor(() => assert.equal(values.size, 2, 'activation did not publish terminal commands'));
+      for (const casing of process.platform === 'win32' ? ['PATH', 'Path', 'path'] : ['PATH']) {
+        const terminalEnv: NodeJS.ProcessEnv = {};
+        for (const [key, value] of Object.entries(process.env)) {
+          if (!/^(PATH|ARC_|ELECTRON_RUN_AS_NODE)$/i.test(key) && !key.startsWith('ARC_')) terminalEnv[key] = value;
+        }
+        terminalEnv[casing] =
           process.platform === 'win32'
-            ? (Object.keys(terminalEnv).find((name) => name.toLowerCase() === key.toLowerCase()) ?? key)
-            : key;
-        terminalEnv[actual] =
-          mutation.type === 'append' ? (terminalEnv[actual] ?? '') + mutation.value : mutation.value;
+            ? path.dirname(process.env.ComSpec ?? 'C:/Windows/System32/cmd.exe')
+            : '/usr/bin:/bin';
+        for (const [key, mutation] of values) {
+          const actual =
+            process.platform === 'win32'
+              ? (Object.keys(terminalEnv).find((name) => name.toLowerCase() === key.toLowerCase()) ?? key)
+              : key;
+          terminalEnv[actual] =
+            mutation.type === 'append' ? (terminalEnv[actual] ?? '') + mutation.value : mutation.value;
+        }
+        assert.equal(terminalEnv.ARC_WINDOW, undefined);
+        assert.equal(terminalEnv.ELECTRON_RUN_AS_NODE, undefined);
+        for (const shell of shells) {
+          const command = 'arc --version';
+          const script = shell.args.includes('-EncodedCommand')
+            ? Buffer.from(command, 'utf16le').toString('base64')
+            : command;
+          const result = spawnSync(shell.command, [...shell.args, script], {
+            cwd: root,
+            env: terminalEnv,
+            encoding: 'utf8',
+            windowsVerbatimArguments: shell.args.includes('/c'),
+          });
+          assert.ifError(result.error);
+          assert.equal(result.status, 0, `${shell.command} (${casing}): ${result.stderr}`);
+          assert.equal(
+            result.stdout.trim(),
+            JSON.parse(fs.readFileSync(path.join(extensionRoot, 'package.json'), 'utf8')).version,
+          );
+        }
       }
-      assert.equal(terminalEnv.ARC_WINDOW, undefined);
-      assert.equal(terminalEnv.ELECTRON_RUN_AS_NODE, undefined);
-      for (const shell of shells) {
-        const command = 'arc --version';
+    } finally {
+      subscriptions.forEach((owner) => owner.dispose());
+    }
+    for (const shell of shells) {
+      const run = (command: string, input?: string) => {
         const script = shell.args.includes('-EncodedCommand')
           ? Buffer.from(command, 'utf16le').toString('base64')
           : command;
         const result = spawnSync(shell.command, [...shell.args, script], {
           cwd: root,
-          env: terminalEnv,
+          env,
+          input,
           encoding: 'utf8',
           windowsVerbatimArguments: shell.args.includes('/c'),
         });
         assert.ifError(result.error);
-        assert.equal(result.status, 0, `${shell.command} (${casing}): ${result.stderr}`);
-        assert.equal(
-          result.stdout.trim(),
-          JSON.parse(fs.readFileSync(path.join(extensionRoot, 'package.json'), 'utf8')).version,
-        );
-      }
+        return result;
+      };
+      const version = run('arc --version');
+      assert.equal(version.status, 0, `${shell.command}: ${version.stderr}`);
+      assert.equal(
+        version.stdout.trim(),
+        JSON.parse(fs.readFileSync(path.join(extensionRoot, 'package.json'), 'utf8')).version,
+      );
+      const windows = run('arc windows --json');
+      assert.equal(windows.status, 0, windows.stderr);
+      assert.deepEqual(JSON.parse(windows.stdout), { version: 1, windows: [], complete: true });
+      const status = run('arc statusline --json', '{}');
+      assert.equal(status.status, 0, status.stderr);
+      assert.equal(JSON.parse(status.stdout).schemaVersion, 1);
+      const cost = run(`arc cost "${transcript.replaceAll('\\', '/')}" --source-only --by-model`);
+      assert.equal(cost.status, 0, cost.stderr);
+      const report = JSON.parse(cost.stdout);
+      assert.equal(report.schemaVersion, 2);
+      assert.equal(report.parent.requests, 1);
+      assert.equal(report.parent.modelCosts[0].model, 'claude-opus-5');
+      assert.match(report.buildCommit, /^[0-9a-f]{40}$/);
+      const failure = run('arc "unknown command"');
+      assert.equal(failure.status, 1, failure.stderr);
+      assert.match(failure.stderr, /Unknown command: unknown command/);
     }
-  } finally {
-    subscriptions.forEach((owner) => owner.dispose());
-  }
-  for (const shell of shells) {
-    const run = (command: string, input?: string) => {
+    fs.writeFileSync(
+      bundle,
+      'console.log(JSON.stringify({node:process.env.ELECTRON_RUN_AS_NODE,window:process.env.ARC_WINDOW,args:process.argv.slice(2)}));',
+    );
+    for (const shell of shells) {
+      const command = 'arc "argument with spaces"';
       const script = shell.args.includes('-EncodedCommand')
         ? Buffer.from(command, 'utf16le').toString('base64')
         : command;
       const result = spawnSync(shell.command, [...shell.args, script], {
         cwd: root,
         env,
-        input,
         encoding: 'utf8',
         windowsVerbatimArguments: shell.args.includes('/c'),
       });
-      assert.ifError(result.error);
-      return result;
-    };
-    const version = run('arc --version');
-    assert.equal(version.status, 0, `${shell.command}: ${version.stderr}`);
-    assert.equal(
-      version.stdout.trim(),
-      JSON.parse(fs.readFileSync(path.join(extensionRoot, 'package.json'), 'utf8')).version,
-    );
-    const windows = run('arc windows --json');
-    assert.equal(windows.status, 0, windows.stderr);
-    assert.deepEqual(JSON.parse(windows.stdout), { version: 1, windows: [], complete: true });
-    const status = run('arc statusline --json', '{}');
-    assert.equal(status.status, 0, status.stderr);
-    assert.equal(JSON.parse(status.stdout).schemaVersion, 1);
-    const cost = run(`arc cost "${transcript.replaceAll('\\', '/')}" --source-only --by-model`);
-    assert.equal(cost.status, 0, cost.stderr);
-    const report = JSON.parse(cost.stdout);
-    assert.equal(report.schemaVersion, 2);
-    assert.equal(report.parent.requests, 1);
-    assert.equal(report.parent.modelCosts[0].model, 'claude-opus-5');
-    assert.match(report.buildCommit, /^[0-9a-f]{40}$/);
-    const failure = run('arc "unknown command"');
-    assert.equal(failure.status, 1, failure.stderr);
-    assert.match(failure.stderr, /Unknown command: unknown command/);
-  }
-  fs.writeFileSync(
-    bundle,
-    'console.log(JSON.stringify({node:process.env.ELECTRON_RUN_AS_NODE,window:process.env.ARC_WINDOW,args:process.argv.slice(2)}));',
-  );
-  for (const shell of shells) {
-    const command = 'arc "argument with spaces"';
-    const script = shell.args.includes('-EncodedCommand')
-      ? Buffer.from(command, 'utf16le').toString('base64')
-      : command;
-    const result = spawnSync(shell.command, [...shell.args, script], {
-      cwd: root,
-      env,
-      encoding: 'utf8',
-      windowsVerbatimArguments: shell.args.includes('/c'),
-    });
-    assert.equal(result.status, 0, result.stderr);
-    assert.deepEqual(JSON.parse(result.stdout), { node: '1', window: 'this-window', args: ['argument with spaces'] });
-  }
-});
+      assert.equal(result.status, 0, result.stderr);
+      assert.deepEqual(JSON.parse(result.stdout), { node: '1', window: 'this-window', args: ['argument with spaces'] });
+    }
+  },
+);
 
 test.skipIf(process.platform !== 'win32')(
   'long private Windows launchers preserve terminal commands and matching path arguments',

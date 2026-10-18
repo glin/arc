@@ -52,6 +52,8 @@ class ArcPipe {
   }
   [DllImport("kernel32.dll", SetLastError=true)] static extern IntPtr OpenProcess(uint access, bool inherit, uint pid);
   [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr handle);
+  [DllImport("kernel32.dll", SetLastError=true)] static extern bool GetProcessTimes(IntPtr process, out long creation, out long exit, out long kernel, out long user);
+  [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern bool QueryFullProcessImageName(IntPtr process, uint flags, StringBuilder name, ref uint size);
   [DllImport("kernel32.dll")] static extern IntPtr LocalFree(IntPtr memory);
   [DllImport("kernel32.dll")] static extern IntPtr CreateToolhelp32Snapshot(uint flags, uint pid);
   [DllImport("kernel32.dll", CharSet=CharSet.Unicode)] static extern bool Process32First(IntPtr snapshot, ref ProcessEntry entry);
@@ -119,6 +121,56 @@ class ArcPipe {
       if(Process32First(snapshot, ref entry)) do { if(entry.pid == pid) return entry.parent; } while(Process32Next(snapshot, ref entry));
       throw new IOException("Process unavailable");
     } finally { CloseHandle(snapshot); }
+  }
+  static long Birth(uint pid) {
+    IntPtr process = OpenProcess(0x1000, false, pid);
+    if(process == IntPtr.Zero) throw new IOException("Process unavailable");
+    try { long creation, exit, kernel, user;
+      if(!GetProcessTimes(process, out creation, out exit, out kernel, out user) || creation <= 0 || exit != 0) throw new IOException("Process unavailable");
+      return creation;
+    } finally { CloseHandle(process); }
+  }
+  static string Ancestry(uint pid) {
+    var clock = Stopwatch.StartNew();
+    var parents = new Dictionary<uint, uint>();
+    IntPtr snapshot = CreateToolhelp32Snapshot(2, 0);
+    if(snapshot == new IntPtr(-1)) throw new IOException("Process unavailable");
+    try { var entry = new ProcessEntry(); entry.size = (uint)Marshal.SizeOf(entry);
+      if(!Process32First(snapshot, ref entry)) throw new IOException("Process unavailable");
+      do {
+        if(parents.Count >= 4096 || clock.ElapsedMilliseconds >= 1500) throw new IOException("Process limit exceeded");
+        parents.Add(entry.pid, entry.parent);
+      } while(Process32Next(snapshot, ref entry));
+    } finally { CloseHandle(snapshot); }
+    var identities = new Dictionary<uint, long>();
+    var rows = new List<string>();
+    long childBirth = long.MaxValue;
+    while(pid != 0 && rows.Count < 32) {
+      uint parent;
+      if(!parents.TryGetValue(pid, out parent)) break;
+      if(identities.ContainsKey(pid) || clock.ElapsedMilliseconds >= 1500) throw new IOException("Process limit exceeded");
+      long birth;
+      try { birth = Birth(pid); } catch(IOException) { if(rows.Count == 0) throw; break; }
+      if(birth > childBirth) break;
+      identities.Add(pid, birth);
+      rows.Add("{\"pid\":" + pid + ",\"parent\":" + parent + ",\"birth\":\"" + birth + "\"}");
+      childBirth = birth; pid = parent;
+    }
+    if(rows.Count == 0) throw new IOException("Process unavailable");
+    foreach(var identity in identities) if(Birth(identity.Key) != identity.Value) throw new IOException("Process changed");
+    string output = "[" + string.Join(",", rows.ToArray()) + "]";
+    if(output.Length > 65536 || clock.ElapsedMilliseconds >= 1500) throw new IOException("Process limit exceeded");
+    return output;
+  }
+  static string Image(uint pid) {
+    long birth = Birth(pid);
+    IntPtr process = OpenProcess(0x1000, false, pid);
+    if(process == IntPtr.Zero) throw new IOException("Process unavailable");
+    try {
+      var name = new StringBuilder(32768); uint size = 32768;
+      if(!QueryFullProcessImageName(process, 0, name, ref size) || Birth(pid) != birth) throw new IOException("Process changed");
+      return "{\"pid\":" + pid + ",\"birth\":\"" + birth + "\",\"image\":\"" + Convert.ToBase64String(Encoding.UTF8.GetBytes(name.ToString())) + "\"}";
+    } finally { CloseHandle(process); }
   }
   static SecurityAttributes Attributes() {
     string owner = WindowsIdentity.GetCurrent().User.Value;
@@ -209,6 +261,21 @@ class ArcPipe {
         string[] parts = line.Split(':'); int id = int.Parse(parts[1]);
         if(parts[0] == "listen") { string address = Decode(parts[2]); new Thread(delegate() { Listen(id, address); }) { IsBackground = true }.Start(); }
         else if(parts[0] == "connect") { string address = Decode(parts[2]), file = Decode(parts[5]); uint host = uint.Parse(parts[3]), server = uint.Parse(parts[4]); int timeout = int.Parse(parts[6]); var stream = new Connection(); lock(stateLock) connecting.Add(id, stream); new Thread(delegate() { Connect(id, stream, address, host, server, file, timeout); }) { IsBackground = true }.Start(); }
+        else if(parts[0] == "ancestry" || parts[0] == "identities" || parts[0] == "image") {
+          string operation = parts[0], input = parts[2];
+          ThreadPool.QueueUserWorkItem(delegate {
+            try { string result;
+              if(operation == "ancestry") result = Ancestry(uint.Parse(input));
+              else if(operation == "image") result = Image(uint.Parse(input));
+              else { var rows = new List<string>(); var pids = input.Split(',');
+                if(pids.Length == 0 || pids.Length > 32) throw new IOException("Process limit exceeded");
+                foreach(string text in pids) { uint pid = uint.Parse(text); if(pid == 0) throw new IOException("Process unavailable"); rows.Add("{\"pid\":" + pid + ",\"birth\":\"" + Birth(pid) + "\"}"); }
+                result = "[" + string.Join(",", rows.ToArray()) + "]";
+              }
+              Output("process:" + id + ":" + Convert.ToBase64String(Encoding.UTF8.GetBytes(result)));
+            } catch(Exception) { Output("process-error:" + id); }
+          });
+        }
         else if(parts[0] == "write") { Connection stream; lock(stateLock) streams.TryGetValue(id, out stream); if(stream != null) stream.Write(Convert.FromBase64String(parts[2])); }
         else if(parts[0] == "close") { Connection stream, listener; lock(stateLock) { if(!streams.TryGetValue(id, out stream)) connecting.TryGetValue(id, out stream); listeners.TryGetValue(id, out listener); servers.Remove(id); } if(stream != null) stream.Close(); if(listener != null) listener.Close(); }
       }

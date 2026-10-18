@@ -106,6 +106,7 @@ import { sameSkillList, withDirectorySkills } from './domain/claude-skills';
 import { normalizeWorkspace } from './projectspend';
 import { ConfigWatches } from './configwatch';
 import { WindowChannel } from './sessionrequests';
+import { terminalOwnership, localTerminalPlacement } from './terminalownership';
 import { reportWindowTransport, windowTransportErrorCode, type WindowTransportSink } from './windowpipe';
 import { CompactHost } from './compactrequest';
 import { CompactStore } from './compactstore';
@@ -142,6 +143,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   let channelConstructionError: string | undefined;
   try {
     channel = new WindowChannel();
+    channel.setTerminalOwnership(
+      terminalOwnership({
+        terminals: () => vscode.window.terminals,
+        allowed: () => vscode.workspace.isTrusted && !vscode.env.remoteName && localTerminalPlacement(),
+      }),
+    );
   } catch (error) {
     channelConstructionError = windowTransportErrorCode(error);
     /* Window discovery failure leaves panel activation available. */

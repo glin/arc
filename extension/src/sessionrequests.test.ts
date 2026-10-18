@@ -53,6 +53,7 @@ import {
   type SessionPageRequest,
 } from './sessionreads.ts';
 import { openReadWindow, closeReadWindow } from './readmeter.ts';
+import { terminalOwnership, type TerminalShell } from './terminalownership.ts';
 import { requestWindow, requesterIdentity } from './sessionrequests.ts';
 import {
   GUARDED_SEND_REASONS,
@@ -917,6 +918,7 @@ test('request schema rejects unsupported versions, methods, identifiers, and par
 });
 
 test('session requests reject paths, extra parameters, and invalid turn counts before dispatch', async () => {
+  for (const key of ['TERM_PROGRAM', 'VSCODE_PID', 'VSCODE_IPC_HOOK_CLI']) vi.stubEnv(key, '');
   const { home, channel, entry } = await fixture();
   const valid = request(entry, { method: 'session', params: { sessionId: 'known', turns: 2 } });
   assert.deepEqual(parseSessionRequest(valid), valid);
@@ -6131,3 +6133,179 @@ test('dispatch wait disconnect cancels the channel subscription and retains its 
   await vi.waitFor(() => assert.equal(admitted.filterContext.signal.aborted, true));
   assert.equal(receipts.launch(launchId).launchId, launchId);
 });
+
+// Two real channels expose wrong-window dispatch and admission races without editor startup.
+test('integrated setups selects its owning window among competing same-folder channels', async () => {
+  vi.stubEnv('TERM_PROGRAM', 'vscode');
+  for (const key of [
+    'WSL_DISTRO_NAME',
+    'SSH_CONNECTION',
+    'SSH_CLIENT',
+    'REMOTE_CONTAINERS',
+    'VSCODE_REMOTE_CONTAINERS_SESSION',
+  ])
+    vi.stubEnv(key, '');
+  const { home, channel } = await fixture();
+  const competitor = new WindowChannel(home);
+  channels.push(competitor);
+  let roots: TerminalShell[] = [{ processId: Promise.resolve(process.pid) }];
+  const source = { allowed: () => true, terminals: () => roots };
+  channel.setTerminalOwnership(terminalOwnership(source));
+  competitor.setTerminalOwnership(terminalOwnership({ allowed: () => true, terminals: () => [] }));
+  const first = vi.fn<() => Record<string, unknown>>(() => ({ owner: channel.hostId }));
+  const second = vi.fn<() => Record<string, unknown>>(() => ({ owner: competitor.hostId }));
+  channel.setRequestHandler(first);
+  competitor.setRequestHandler(second);
+  await competitor.update(state);
+  assert.deepEqual(await requestWindow('setups', {}, '', home), { owner: channel.hostId });
+  assert.equal(first.mock.calls.length, 1);
+  assert.equal(second.mock.calls.length, 0);
+  vi.stubEnv('ARC_WINDOW', competitor.hostId);
+  assert.deepEqual(await requestWindow('setups', {}, undefined, home), { owner: competitor.hostId });
+  assert.deepEqual(await requestWindow('setups', {}, channel.hostId, home), { owner: channel.hostId });
+  roots = [];
+  await assert.rejects(requestWindow('setups', {}, '', home), /terminal owner is not unique/);
+  assert.equal(first.mock.calls.length, 2);
+  assert.equal(second.mock.calls.length, 1);
+  roots = [{ processId: Promise.resolve(process.pid) }];
+  channel.setRequestHandler(() => {
+    void channel.dispose();
+    return { status: 'started' };
+  });
+  const uncertain = (await requestWindow(
+    'start',
+    {
+      setup: { kind: 'custom', agent: 'codex', model: '', effort: '', permissionMode: '' },
+      agentRun: false,
+      prompt: 'owned test',
+    },
+    '',
+    home,
+  )) as { status: string; window: string };
+  assert.equal(uncertain.status, 'unknown');
+  assert.equal(uncertain.window, channel.hostId);
+  assert.equal(second.mock.calls.length, 1);
+});
+
+test('integrated ownership refuses ambiguous, unsupported and unknown windows without dispatch', async () => {
+  vi.stubEnv('TERM_PROGRAM', 'vscode');
+  const { home, channel } = await fixture();
+  const competitor = new WindowChannel(home);
+  channels.push(competitor);
+  const handler = vi.fn<() => Record<string, unknown>>(() => ({}));
+  channel.setRequestHandler(handler);
+  competitor.setRequestHandler(handler);
+  const roots = [{ processId: Promise.resolve(process.pid) }];
+  channel.setTerminalOwnership(terminalOwnership({ allowed: () => true, terminals: () => roots }));
+  await competitor.update(state);
+  await assert.rejects(requestWindow('setups', {}, '', home), /Reload Arc windows/);
+  competitor.setTerminalOwnership(terminalOwnership({ allowed: () => true, terminals: () => roots }));
+  await assert.rejects(requestWindow('setups', {}, '', home), /not unique/);
+  competitor.setTerminalOwnership(terminalOwnership({ allowed: () => false, terminals: () => [] }));
+  await assert.rejects(requestWindow('setups', {}, '', home), /terminal owner is unavailable/);
+  assert.equal(handler.mock.calls.length, 0);
+});
+
+test.each(['transfer', 'caller-reuse', 'root-reuse', 'disposed'] as const)(
+  'final terminal admission refuses %s before handler effects',
+  async (change) => {
+    vi.stubEnv('TERM_PROGRAM', 'vscode');
+    const { home, channel } = await fixture();
+    const competitor = new WindowChannel(home);
+    channels.push(competitor);
+    let roots: TerminalShell[] = [{ processId: Promise.resolve(process.pid) }];
+    const source = { allowed: () => true, terminals: () => roots };
+    const ownership = terminalOwnership(source);
+    const originalInquire = ownership.inquire;
+    let observedBirth = '';
+    ownership.inquire = async (ancestry) => {
+      observedBirth = ancestry.chain[0].birth;
+      return originalInquire(ancestry);
+    };
+    const admission = terminalOwnership(source, async (pids) => {
+      if (change === 'transfer') roots = [];
+      if (change === 'disposed') void channel.dispose();
+      return pids.map((pid, index) => ({
+        pid,
+        birth:
+          (change === 'caller-reuse' && index === 0) || (change === 'root-reuse' && index === 1) ? '1' : observedBirth,
+      }));
+    });
+    channel.setTerminalOwnership({ inquire: ownership.inquire, admit: admission.admit });
+    competitor.setTerminalOwnership(terminalOwnership({ allowed: () => true, terminals: () => [] }));
+    const first = vi.fn<() => Record<string, unknown>>(() => ({ status: 'started' }));
+    const second = vi.fn<() => Record<string, unknown>>(() => ({ status: 'started' }));
+    channel.setRequestHandler(first);
+    competitor.setRequestHandler(second);
+    await competitor.update(state);
+    const result = requestWindow(
+      'start',
+      {
+        setup: { kind: 'custom', agent: 'codex', model: '', effort: '', permissionMode: '' },
+        agentRun: false,
+        prompt: 'owned test',
+        cwd: home,
+      },
+      '',
+      home,
+    );
+    if (change === 'disposed') assert.equal(((await result) as { status: string }).status, 'unknown');
+    else await assert.rejects(result, /terminal no longer belongs/);
+    assert.equal(first.mock.calls.length, 0);
+    assert.equal(second.mock.calls.length, 0);
+  },
+);
+
+// Pending queries and the selection lease must preserve one bridge without keeping abandoned helpers alive.
+test('process queries retain the bridge through resolution and release their scoped lease once', async () => {
+  const { child, owner } = bridgeFixture();
+  const release = owner.lease();
+  let command = '';
+  child.stdin.on('data', (chunk) => {
+    command += chunk.toString();
+  });
+  const pending = owner.query('ancestry', [73]);
+  const id = command.trim().split(':')[1];
+  const rows = [{ pid: 73, parent: 12, birth: '100' }];
+  child.stdout.emit('data', `process:${id}:${Buffer.from(JSON.stringify(rows)).toString('base64')}\n`);
+  assert.deepEqual(await pending, rows);
+  assert.equal(child.stdin.writableEnded, false);
+  owner.release();
+  assert.equal(child.stdin.writableEnded, false);
+  release();
+  release();
+  assert.equal(child.stdin.writableEnded, true);
+});
+
+test.each(['cancel', 'timeout', 'malformed', 'child-error', 'child-close', 'stdin-error'] as const)(
+  'process query %s settles without affecting an unrelated listener',
+  async (failure) => {
+    vi.useFakeTimers();
+    const { child, owner } = bridgeFixture();
+    owner.servers.set(17, new EventEmitter() as WindowsPipeServer);
+    owner.servers.get(17)!.on('error', () => {});
+    let command = '';
+    child.stdin.on('data', (chunk) => {
+      command += chunk.toString();
+    });
+    const cancellation = new AbortController();
+    const pending = owner.query('identities', [73], cancellation.signal);
+    const rejected = assert.rejects(pending, /Process details unavailable/);
+    const id = command.trim().split(':')[1];
+    if (failure === 'cancel') cancellation.abort();
+    else if (failure === 'timeout') await vi.advanceTimersByTimeAsync(2000);
+    else if (failure === 'malformed') child.stdout.emit('data', `process:${id}:invalid!\n`);
+    else if (failure === 'child-error') child.emit('error', new Error('unavailable'));
+    else if (failure === 'child-close') child.emit('close', 1, null);
+    else child.stdin.emit('error', new Error('unavailable'));
+    await rejected;
+    child.stdout.emit('data', `process:${id}:W10=\n`);
+    if (['cancel', 'timeout', 'malformed'].includes(failure)) {
+      assert.equal(owner.servers.has(17), true);
+      assert.equal(child.kill.mock.calls.length, 0);
+      assert.equal(child.stdin.writableEnded, false);
+    }
+    owner.servers.clear();
+    owner.release();
+  },
+);

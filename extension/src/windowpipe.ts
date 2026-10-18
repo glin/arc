@@ -286,6 +286,8 @@ export class WindowsPipeServer extends EventEmitter {
 export class PipeBridge {
   readonly sockets = new Map<number, PipeSocket>();
   readonly servers = new Map<number, WindowsPipeServer>();
+  private leases = 0;
+  private readonly queries = new Map<number, (value: unknown, error?: Error) => void>();
   private pending = '';
   private released = false;
   private dead = false;
@@ -311,7 +313,20 @@ export class PipeBridge {
         const id = Number(parts[1]);
         const socket = this.sockets.get(id);
         const server = this.servers.get(id);
-        if (parts[0] === 'listen') server?.emit('listening');
+        if (parts[0] === 'process') {
+          const finish = this.queries.get(id);
+          if (finish) {
+            try {
+              if (parts.length !== 3 || parts[2].length > 65536 || !/^[A-Za-z0-9+/]*={0,2}$/.test(parts[2]))
+                throw new Error('Process details unavailable.');
+              finish(JSON.parse(Buffer.from(parts[2], 'base64').toString('utf8')));
+            } catch {
+              finish(null, new Error('Process details unavailable.'));
+            }
+          }
+        } else if (parts[0] === 'process-error')
+          this.queries.get(id)?.(null, new Error('Process details unavailable.'));
+        else if (parts[0] === 'listen') server?.emit('listening');
         else if (parts[0] === 'error') {
           this.report('listenerError', { serverId: id });
           server?.emit('error', new Error('The Arc window channel is unavailable.'));
@@ -361,6 +376,39 @@ export class PipeBridge {
   retain(): void {
     this.released = false;
   }
+  lease(): () => void {
+    if (this.dead || this.released) throw new Error('Process details unavailable.');
+    this.leases++;
+    let active = true;
+    return () => {
+      if (active) {
+        active = false;
+        this.leases--;
+        this.release();
+      }
+    };
+  }
+  query(operation: 'ancestry' | 'identities' | 'image', pids: number[], signal?: AbortSignal): Promise<unknown> {
+    if (this.dead || this.released || signal?.aborted) return Promise.reject(new Error('Process details unavailable.'));
+    const id = ++nextId;
+    return new Promise((resolve, reject) => {
+      const finish = (value: unknown, error?: Error) => {
+        if (!this.queries.delete(id)) return;
+        clearTimeout(timer);
+        signal?.removeEventListener('abort', cancel);
+        if (error) reject(error);
+        else resolve(value);
+        this.release();
+      };
+      const cancel = () => finish(null, new Error('Process details unavailable.'));
+      const timer = setTimeout(cancel, 2000);
+      this.queries.set(id, finish);
+      signal?.addEventListener('abort', cancel, { once: true });
+      this.send(`${operation}:${id}:${pids.join(',')}`, (error) => {
+        if (error) finish(null, error);
+      });
+    });
+  }
   async retire(serverId: number): Promise<void> {
     this.servers.delete(serverId);
     const pending: Promise<void>[] = [];
@@ -405,7 +453,7 @@ export class PipeBridge {
     this.child.stdin.write(line + '\n', callback);
   }
   release(): void {
-    if (!this.servers.size && !this.sockets.size) {
+    if (!this.servers.size && !this.sockets.size && !this.queries.size && !this.leases) {
       if (!this.released) {
         this.released = true;
         this.report('release');
@@ -418,6 +466,7 @@ export class PipeBridge {
     this.dead = true;
     this.detach();
     if (!this.closed) this.child.kill();
+    for (const finish of this.queries.values()) finish(null, new Error('Process details unavailable.'));
     if (!this.servers.size && !this.sockets.size) return;
     for (const socket of this.sockets.values()) socket.destroy();
     for (const server of this.servers.values())
@@ -431,10 +480,15 @@ export class PipeBridge {
   }
 }
 
-async function getBridge(diagnostics?: WindowTransportSink): Promise<PipeBridge> {
+export function windowsPipeExecutable(diagnostics?: WindowTransportSink): Promise<string> {
   const packaged = path.join(__dirname, 'windowpipe.exe');
   executable ??= fs.existsSync(packaged) ? Promise.resolve(packaged) : compileWindowsPipe(diagnostics);
-  bridge ??= executable.then((file) => {
+  return executable;
+}
+
+async function getBridge(diagnostics?: WindowTransportSink): Promise<PipeBridge> {
+  const resolved = windowsPipeExecutable(diagnostics);
+  bridge ??= resolved.then((file) => {
     try {
       const owner = new PipeBridge(spawn(file, [], { windowsHide: true, stdio: 'pipe' }), diagnostics);
       currentBridge = owner;
@@ -478,4 +532,22 @@ export async function connectWindowsPipe(
     ),
   );
   return socket;
+}
+
+export async function leaseWindowsPipe(): Promise<() => void> {
+  return process.platform === 'win32' ? (await getBridge()).lease() : () => {};
+}
+
+export async function queryWindowsProcesses(
+  operation: 'ancestry' | 'identities' | 'image',
+  pids: number[],
+  signal?: AbortSignal,
+): Promise<unknown> {
+  if (
+    pids.length < 1 ||
+    pids.length > 32 ||
+    pids.some((pid) => !Number.isSafeInteger(pid) || pid <= 0 || pid > 0xffffffff)
+  )
+    throw new Error('Process details unavailable.');
+  return (await getBridge()).query(operation, pids, signal);
 }

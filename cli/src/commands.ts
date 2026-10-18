@@ -27,7 +27,7 @@ export interface Command {
   };
 }
 
-const windowFlag: Flag = ['--window ID', 'Select this window before ARC_WINDOW or unambiguous live discovery.'];
+const windowFlag: Flag = ['--window ID', 'Select this window before ARC_WINDOW or automatic terminal ownership.'];
 const jsonFlag: Flag = ['--json', 'Print JSON. This command already prints JSON by default.'];
 const requestFlag: Flag = [
   '--request-id ID',
@@ -672,6 +672,6 @@ export function renderOverviewHelp(): string {
     ]),
     '',
     'Session IDs come from arc sessions. Query shorthand session:ID matches either provider. session:claude:ID and session:codex:ID select one provider.',
-    'Window selection: --window, then ARC_WINDOW, then exactly one live window with complete discovery. collect requires --window or ARC_WINDOW.',
+    'Window selection: --window, then ARC_WINDOW, then the owning integrated terminal window. External shells require exactly one live window. Discovery must be complete. collect requires --window or ARC_WINDOW.',
   ].join('\n');
 }
