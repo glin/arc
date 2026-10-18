@@ -88,7 +88,7 @@ Never wait a fixed time in a test. Poll for the condition the test needs, and fa
 
 `SETTLED` from `extension/test/browser.ts` waits for two animation frames. It does not confirm media-query delivery, ResizeObserver placement, compositor scrolling, or timer expiry. After those operations, wait for the state the assertion reads. Preserve the outcome assertion when repairing synchronization. Do not replace it with a retry, a larger deadline, or a wider tolerance.
 
-Control clocks and filesystem timestamps in expiry and cache-band tests. Set explicit byte budgets in cancellation and incremental-read tests. Test path rules with mixed-case fixtures and independent Windows, macOS, and Linux expectations.
+Control clocks and filesystem timestamps in expiry and cache-band tests. Inject operating-system process reads in tests of code that has a deadline. Test the real read separately, without that deadline. Set explicit byte budgets in cancellation and incremental-read tests. Test path rules with mixed-case fixtures and independent Windows, macOS, and Linux expectations.
 
 Add a test to the existing file for its subject and reuse that file's setup and helpers. Create a new browser test file only when no file covers the subject. Add a browser test only when no Node test or text scan can catch the defect. Never add a browser test to check a width, spacing, color, font or wording. A plan or brief does not override this rule. When one asks for such a test, skip it and name the conflict in your report.
 
