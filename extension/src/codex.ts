@@ -3367,13 +3367,13 @@ export function codexDispatchRecord(
     (cursor.currentTurnCopied && !cursor.pendingOwnershipTurnIds.includes(cursor.currentTurnId))
   )
     return;
-  const item = isRecord(payload.item) ? payload.item : null;
-  if (!item || item.type !== 'CommandExecution' || typeof item.stdout !== 'string') return;
-  const id = str(item.id);
+  const command = completedCommand(payload, true);
+  if (!command) return;
+  const id = command.sourceId;
   if (!id || cursor.candidates.some((candidate) => candidate.reference.toolUseIds.includes(id))) return;
-  const launch = claudeLaunchKind(commandText(item, true), commandShell(item));
+  const launch = claudeLaunchKind(command.command, command.shell);
   if (!launch || launch.kind === 'native') return;
-  const receipts = shellDispatchFromOutput(item.stdout, launch);
+  const receipts = shellDispatchFromOutput(command.stdout, launch);
   for (const receipt of receipts) {
     if (cursor.candidates.length >= (cursor.exportPolicy?.relationships ?? 4096)) {
       if (cursor.exportPolicy) throw new ExportLimitError('relationships', cursor.exportPolicy.relationships);
@@ -3901,13 +3901,13 @@ function localCommandCwd(value: unknown): string | null {
 }
 
 // Read one completed command from a single parsed command or a direct command string.
-// An argv array without a single parsed command supplies no command text here.
-export function completedCommand(payload: Record<string, unknown>): CompletedCommand | null {
+// By default, an argv array without a single parsed command supplies no command text.
+export function completedCommand(payload: Record<string, unknown>, commandArray = false): CompletedCommand | null {
   const item = payload.item as Record<string, unknown> | undefined;
   if (!item || str(item.type) !== 'CommandExecution') {
     return null;
   }
-  const command = commandText(item);
+  const command = commandText(item, commandArray);
   const detail = stepDetail({ command });
   if (!detail) {
     return null;

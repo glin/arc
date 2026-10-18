@@ -359,7 +359,7 @@ export interface CarriedName {
   fullLabel: string;
 }
 
-export const CLAUDE_CHILD_REFERENCE_PARSER_VERSION = 25;
+export const CLAUDE_CHILD_REFERENCE_PARSER_VERSION = 26;
 export const MAX_CLAUDE_CHILD_REFERENCE_FILES = 10_000;
 export const MAX_CODEX_DISPATCH_CURSOR_BYTES = 64 * 1024 * 1024;
 export { MAX_CLAUDE_CHILD_REFERENCES_PER_FILE };

@@ -10221,6 +10221,57 @@ test.each(['event', 'response'])(
   },
 );
 
+test.each(['aggregated', 'stdout', 'both', 'empty stdout', 'stderr', 'missing source'])(
+  'native Codex dispatch output preserves reader ownership of a headless child (%s)',
+  (shape) => {
+    const id = UUID_B;
+    const receipt = `ARC_DISPATCH_SESSION={"agent":"codex","session_id":"${id}","owned":true}`;
+    const owned = !['empty stdout', 'stderr', 'missing source'].includes(shape);
+    const parent = writeRollout([
+      meta(),
+      event('task_started', 1, { turn_id: TURN }),
+      turnContext(1, TURN, 'gpt-6.1-sol', 'high'),
+      commandCompleted(
+        2,
+        'python dispatch.py --runner codex --owned --arc-dispatch | Tee-Object -FilePath receipt.log',
+        0,
+        'completed',
+        'dispatch',
+        {
+          ...(shape === 'stdout' || shape === 'both' ? { stdout: receipt } : {}),
+          ...(shape === 'empty stdout' ? { stdout: '' } : {}),
+          ...(shape !== 'stderr' && shape !== 'stdout' ? { aggregated_output: receipt } : {}),
+          ...(shape === 'stderr' ? { stderr: receipt } : {}),
+          ...(shape === 'missing source' ? { id: undefined } : {}),
+        },
+      ),
+    ]);
+    const references = scanCodexDispatchReferences(parent, 'parent').references;
+    assert.deepEqual(
+      references.map((edge) => [edge.sessionId, edge.owned, edge.toolUseIds]),
+      owned ? [[id, true, ['dispatch']]] : [],
+    );
+    const root = sessionsRoot([
+      { day: '2026/08/25', name: ROLLOUT(id), records: [meta({ id, source: 'exec', originator: 'codex_exec' })] },
+    ]);
+    const [session] = codexSessionFiles(root, ['c:\\repo']).sessions;
+    const scan = scanForCodexPerson(session.file, fs.statSync(session.file).size, undefined, id);
+    assert.equal(session.agentRun, true);
+    assert.equal(scan.person, false);
+    assert.equal(
+      agentRunAnswer(
+        session.agentRun === true,
+        id,
+        new Set(),
+        false,
+        references.length > 0,
+        references[0]?.owned || scan.person,
+      ),
+      !owned,
+    );
+  },
+);
+
 test.each(['cli', 'vscode'])(
   'interactive Codex resume metadata retains reader ownership across bounded appends (%s)',
   (source) => {
