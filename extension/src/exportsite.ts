@@ -398,6 +398,9 @@ export function exportTurn(value: ExportTurn, agent: 'claude' | 'codex', session
       : undefined,
     outputRate: value.outputRate ?? undefined,
     outputRateModel: value.outputRateModel,
+    ...(value.outputRate && (value.outputRateBasis === 'stream' || value.outputRateBasis === 'request')
+      ? { outputRateBasis: value.outputRateBasis }
+      : {}),
     toolUses: value.activity.calls,
     toolCounts: value.activity.counts,
     toolTally: value.activity.tools ?? {},
@@ -527,7 +530,8 @@ async function sessionAgentFacts(
         for (const [name, amount] of Object.entries(value.activity.failedTools ?? {}))
           failedTools[name] = (failedTools[name] ?? 0) + amount;
         artifacts = { ...merged, ...(failures ? { failed: { count: failures, byTool: { ...failedTools } } } : {}) };
-        if (!value.interrupted && value.outputRate) {
+        // An agent row names the observed stream, so a request-timed turn leaves the row unmeasured.
+        if (!value.interrupted && value.outputRate && value.outputRateBasis !== 'request') {
           if (
             !value.outputRateModel ||
             !validRate(value.outputRate) ||

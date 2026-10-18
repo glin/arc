@@ -586,6 +586,7 @@ export function projectTurn(
     },
     outputRate: turn.outputRate ? { output: turn.outputRate.output, milliseconds: turn.outputRate.milliseconds } : null,
     ...(turn.outputRateModel ? { outputRateModel: turn.outputRateModel } : {}),
+    ...(turn.outputRate && turn.outputRateBasis ? { outputRateBasis: turn.outputRateBasis } : {}),
     error: turn.error,
     activity: {
       steps: turn.steps.map((step) => ({

@@ -293,6 +293,62 @@ test('Claude capture retains every unfinished assistant text block before a clos
   );
 });
 
+// Request records hold the whole request body, so a filtered page keeps only their id and send time.
+test('filtered Claude history pages time responses from compact request records', async () => {
+  const file = path.join(tempDir('request-timing-'), 'session.jsonl');
+  const at = (second: number) => new Date(Date.UTC(2026, 0, 2, 0, 0, second)).toISOString();
+  const body = { system: 'x'.repeat(20 * 1024) };
+  const request = (id: string, second: number) =>
+    JSON.stringify({ type: 'api-request', sessionId: 'timed', id, timestamp: at(second), params: body });
+  const prompt = (promptId: string, second: number) =>
+    JSON.stringify({ type: 'user', promptId, timestamp: at(second), message: { role: 'user', content: promptId } });
+  const answer = (id: string, requestRef: string, second: number, output: number) =>
+    JSON.stringify({
+      type: 'assistant',
+      requestRef,
+      timestamp: at(second),
+      message: {
+        role: 'assistant',
+        id,
+        model: 'claude-opus-5',
+        stop_reason: 'end_turn',
+        content: [{ type: 'text', text: `answer ${id}` }],
+        usage: { input_tokens: 10, output_tokens: output },
+      },
+    });
+  fs.writeFileSync(
+    file,
+    [
+      prompt('older', 0),
+      ...Array.from({ length: 200 }, (_, index) => request(`older-${index}`, 2)),
+      answer('m-older', 'older-199', 6, 200),
+      prompt('newest', 10),
+      request('newest', 11),
+      answer('m-newest', 'newest', 13, 300),
+    ].join('\n') + '\n',
+  );
+  const options = { targetTurns: 1, chunkBytes: 64 * 1024 };
+  const first = await readClaudeHistoryPageAsync(file, 'timed', null, options);
+  assert.equal(first.kind, 'page');
+  if (first.kind !== 'page') return;
+  assert.deepEqual(
+    first.page.turns.map((turn) => turn.outputRate),
+    [{ output: 300, milliseconds: 2000 }],
+  );
+  assert.equal(first.page.turns[0].outputRateBasis, 'request');
+  const cursor = first.page.nextOlderCursor;
+  assert.ok(cursor);
+  const heldText = cursor.heldRecords.reduce((total, record) => total + record.text.length, 0);
+  assert.ok(heldText < 256 * 1024, `the page held ${heldText} characters of request text`);
+  const older = await readClaudeHistoryPageAsync(file, 'timed', cursor, options);
+  assert.equal(older.kind, 'page');
+  if (older.kind !== 'page') return;
+  assert.deepEqual(
+    older.page.turns.map((turn) => turn.outputRate),
+    [{ output: 200, milliseconds: 4000 }],
+  );
+});
+
 test('commit ownership quanta count every range read and preserve split UTF-8 and ownership records', async () => {
   const directory = tempDir('commit-ownership-quanta-');
   const file = path.join(directory, 'parent.jsonl');

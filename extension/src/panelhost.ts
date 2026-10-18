@@ -12902,7 +12902,14 @@ export class PanelProvider implements vscode.Disposable {
       activeTurn.agent === 'claude' && this.responseRates?.length
         ? responseRateForTurn(activeTurn, this.responseRates)
         : activeTurn.outputRate;
-    const turn = rate ? { ...activeTurn, outputRate: rate } : activeTurn;
+    // A rate from the live join replaces the transcript's request-timed rate and names its own interval.
+    const turn: Turn = rate
+      ? {
+          ...activeTurn,
+          outputRate: rate,
+          ...(rate !== activeTurn.outputRate ? { outputRateBasis: 'stream' as const } : {}),
+        }
+      : activeTurn;
     const callIds = new Set([
       ...(turn.dispatchToolUseIds ?? []),
       ...turn.steps.map((step) => step.sourceId).filter((id): id is string => !!id),

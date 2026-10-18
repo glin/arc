@@ -591,6 +591,66 @@ test('child and dispatch recorded costs exclude lifetime supplements and retain 
   }
 });
 
+test('an exported Dispatched Claude row shows no speed from request-timed child turns', async () => {
+  const writer = await ExportTransaction.create(tempDir('arc-site-dispatch-rate-'));
+  try {
+    const model = await sessionSiteFixture(writer);
+    const child = model.sessions[1];
+    child.agent = 'claude';
+    const part = costPartOf({
+      role: 'main',
+      model: 'claude-opus-5',
+      provider: null,
+      contextWindow: null,
+      usage: { requests: 1, input: 1000, cacheRead: 0, cacheWrite1h: 0, cacheWrite5m: 0, output: 300, thinking: 0 },
+    });
+    child.numbers = {
+      parts: [part],
+      main: { dollars: 0.1, partial: false },
+      delegated: { dollars: 0, partial: false },
+      combined: { dollars: 0.1, partial: false },
+      coverage: { usage: 'complete', cost: 'complete' },
+    };
+    const childPage = await writer.readSpool<import('./exportdata').ExportPage>(child.pages[0]);
+    const timed = childPage.turns[0];
+    timed.finished = true;
+    timed.model = 'claude-opus-5';
+    timed.outputRate = { output: 300, milliseconds: 2000 };
+    timed.outputRateModel = 'claude-opus-5';
+    timed.outputRateBasis = 'request';
+    child.pages = [await writer.spool(childPage)];
+    model.relationships[0].kind = 'dispatched';
+    model.relationships[0].ownership = 'delegated';
+    await projectSessionSite(model, writer, { script: '', stylesheet: '' });
+    const { manifest, data } = exportedSiteData((await writer.publish(async () => {})).directory);
+    const card = (data.get(manifest.sessions[0].pages[0].cards![0].id) as { card: CardView }).card;
+    assert.ok(card.dispatched?.[0]);
+    assert.doesNotMatch(JSON.stringify(card.dispatched[0]), /tok\/s/);
+  } finally {
+    await writer.dispose();
+  }
+});
+
+test('an exported Claude turn keeps the interval that timed its output speed', () => {
+  const original = turn({
+    agent: 'claude',
+    usage: { requests: 1, input: 0, cacheRead: 0, cacheWrite1h: 0, cacheWrite5m: 0, output: 300, thinking: 0 },
+    outputRate: { output: 300, milliseconds: 2000 },
+    outputRateModel: 'claude-opus-5',
+    outputRateBasis: 'request',
+  });
+  const restored = exportTurn(
+    projectTurn(original, 'turn', { cwd: '/project' }, [], 'root', new Map()),
+    'claude',
+    'root',
+  );
+  const speed = (card: ReturnType<typeof toCard>) =>
+    card.chips.find((chip) => chip.metric === 'tokens')?.detailList?.entries.find((entry) => entry.label === 'Output')
+      ?.lines?.[0];
+  assert.deepEqual(speed(toCard(restored, false, 200_000)), speed(toCard(original, false, 200_000)));
+  assert.match(JSON.stringify(speed(toCard(restored, false, 200_000))), /Request time includes the wait/);
+});
+
 test('exported turn figures retain production records, warnings and counted partial lines', () => {
   for (const agent of ['claude', 'codex'] as const) {
     const original = turn({

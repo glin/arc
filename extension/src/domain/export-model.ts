@@ -117,6 +117,7 @@ export interface ExportTurn {
   };
   outputRate: { output: number; milliseconds: number } | null;
   outputRateModel?: string;
+  outputRateBasis?: 'stream' | 'request';
   error: string | null;
   activity: {
     steps?: {

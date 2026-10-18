@@ -1,6 +1,6 @@
 import { wholePercent } from './view/tokens.ts';
 import type { ChildExpiryCost } from './childcacheexpiry';
-import { outputRateText, type OutputRate } from './outputrate';
+import { outputRateText, type OutputRate, type OutputRateBasis } from './outputrate';
 // Reduces turns to card headlines, status, figures, and control text.
 // `turnview.ts` re-exports these projections for compatibility.
 
@@ -1741,6 +1741,7 @@ function usageDetailEntries(
   provider: AgentKind = 'claude',
   measuredModel?: string,
   cacheUsage = u,
+  basis: OutputRateBasis = 'stream',
 ): StatDetailEntry[] {
   const entries: StatDetailEntry[] = [...lead];
   const input = inputSideTokens(u);
@@ -1751,7 +1752,9 @@ function usageDetailEntries(
     const rate = outputRateText(measurement);
     const title =
       provider === 'claude'
-        ? 'Output tokens per second. Actual output includes thinking. Observed response time excludes untimed responses.'
+        ? basis === 'request'
+          ? 'Output tokens per second. Actual output includes thinking. Request time includes the wait for the first response event. Untimed responses are excluded.'
+          : 'Output tokens per second. Actual output includes thinking. Observed response time excludes untimed responses.'
         : 'Output tokens per second. Actual output includes reasoning. Request time includes preparation and hooks. Blocking local tool waits and untimed responses are excluded.';
     const lines: StatDetailLine[] = rate
       ? [
@@ -1810,6 +1813,7 @@ function tokenDetailList(turn: Turn): StatDetailList {
     turn.agent,
     undefined,
     cacheDetailUsage(turn.usage, turn.usageParts ?? []),
+    turn.outputRateBasis,
   );
   return { entries };
 }

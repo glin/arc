@@ -357,6 +357,7 @@ import {
   claudeCacheLifetime,
   claudeProcessEndedAt,
   claudeSessionLineMayAffectRead,
+  claudeRetainedLine,
   emptyClaudeUsageReducerState,
   reduceClaudeUsageRecord,
   reduceClaudeUsageLine,
@@ -625,6 +626,193 @@ test('Claude turns retain main response identities for exact observed-speed publ
   const child = { ...assistantText('child', 2, { output_tokens: 999 }), isSidechain: true };
   const read = readSession(writeTranscript([userPrompt('work'), first, first, child, second]), 'sess');
   assert.deepEqual(read.turns[0].responseIds, [first.message.id, second.message.id]);
+});
+
+// The CLI writes a request record before each request, and each content block of the response names it.
+function requestRecord(id: string, second: number, type = 'api-request') {
+  return {
+    type,
+    sessionId: 'sess',
+    id,
+    timestamp: at(second),
+    version: '2.1.302',
+    querySource: 'repl_main_thread',
+    params: { model: 'claude-opus-5', messages: [{ role: 'assistant', content: '"type":"assistant"' }] },
+  };
+}
+function requestBlock(
+  id: string,
+  requestRef: string,
+  second: number,
+  output: number,
+  stop = 'end_turn',
+  model = 'claude-opus-5',
+) {
+  return {
+    type: 'assistant',
+    requestRef,
+    timestamp: at(second),
+    message: {
+      role: 'assistant',
+      id,
+      model,
+      stop_reason: stop,
+      content: [{ type: 'text', text: `block ${second}` }],
+      usage: { input_tokens: 10, output_tokens: output },
+    },
+  };
+}
+const outputLines = (turn: Parameters<typeof toCard>[0]) =>
+  toCard(turn, false, ms(120))
+    .chips.find((chip) => chip.metric === 'tokens')
+    ?.detailList?.entries.find((entry) => entry.label === 'Output')?.lines ?? [];
+const REQUEST_TITLE =
+  '100.0 tok/s. Output tokens per second. Actual output includes thinking. Request time includes the wait for the first response event. Untimed responses are excluded.';
+
+test('a Claude turn from a terminal transcript shows output speed from its request record', () => {
+  const read = readSession(
+    writeTranscript([
+      userPrompt('work'),
+      requestRecord('req-1', 10),
+      requestBlock('m-timed', 'req-1', 13, 400),
+      requestBlock('m-timed', 'req-1', 14, 400),
+    ]),
+    'sess',
+  );
+  const turn = read.turns[0];
+  assert.deepEqual(turn.outputRate, { output: 400, milliseconds: 4000 });
+  assert.equal(turn.outputRateModel, 'claude-opus-5');
+  assert.equal(turn.outputRateBasis, 'request');
+  assert.deepEqual(outputLines(turn)[0], { text: '100.0 tok/s', title: REQUEST_TITLE });
+});
+
+test('Claude request timing sums only stopped responses of the turn model that join a request record', () => {
+  const read = readSession(
+    writeTranscript([
+      userPrompt('work'),
+      requestBlock('m-unjoined', 'req-missing', 5, 100, 'tool_use'),
+      requestRecord('req-other', 6, 'api-request-blob'),
+      requestRecord('req-other', 6, 'api-request-shape'),
+      requestBlock('m-other', 'req-other', 8, 50, 'tool_use'),
+      requestRecord('req-sonnet', 10),
+      requestBlock('m-sonnet', 'req-sonnet', 12, 70, 'tool_use', 'claude-sonnet-5'),
+      requestRecord('req-first-send', 20),
+      requestRecord('req-second-send', 21),
+      requestBlock('m-unstopped', 'req-second-send', 22, 30, ''),
+      requestBlock('m-timed', 'req-second-send', 23, 400, 'tool_use'),
+      requestBlock('m-timed', 'req-second-send', 25, 400, 'end_turn'),
+    ]),
+    'sess',
+  );
+  assert.deepEqual(read.turns[0].outputRate, { output: 400, milliseconds: 4000 });
+
+  const untimed = readSession(
+    writeTranscript([userPrompt('work'), requestBlock('m-unjoined', 'req-missing', 5, 100)]),
+    'sess',
+  ).turns[0];
+  assert.equal(untimed.outputRate, undefined);
+  assert.equal(untimed.outputRateBasis, undefined);
+  assert.doesNotMatch(JSON.stringify(outputLines(untimed)), /tok\/s/);
+
+  const interrupted = readSession(
+    writeTranscript([
+      userPrompt('work'),
+      requestRecord('req-1', 10),
+      requestBlock('m-timed', 'req-1', 13, 400, 'tool_use'),
+      userPrompt('[Request interrupted by user]', 14),
+    ]),
+    'sess',
+  ).turns[0];
+  assert.equal(interrupted.interrupted, true);
+  assert.equal(interrupted.outputRate, undefined);
+});
+
+test('the Claude prompt scan never parses a request record', () => {
+  const line = JSON.stringify({ ...requestRecord('req-1', 10), prompt: { type: 'user', text: 'x'.repeat(4096) } });
+  assert.equal(claudeSessionLineMayAffectRead(line), true, 'filtered reads drop request records');
+  const parse = vi.spyOn(JSON, 'parse');
+  try {
+    holdsHumanPrompt(line);
+    assert.ok(!parse.mock.calls.some(([text]) => text === line), 'the prompt scan parsed a request body');
+  } finally {
+    parse.mockRestore();
+  }
+});
+
+test('a Claude assistant record whose tool input holds a request marker keeps its usage and activity', () => {
+  const record = {
+    type: 'assistant',
+    requestRef: 'req-1',
+    timestamp: at(13),
+    message: {
+      role: 'assistant',
+      id: 'm-tool',
+      model: 'claude-opus-5',
+      stop_reason: 'tool_use',
+      content: [
+        {
+          type: 'tool_use',
+          id: 'toolu_request',
+          name: 'Write',
+          input: { type: 'api-request', id: 'req-shaped', timestamp: at(12), file_path: '/p/request.json' },
+        },
+      ],
+      usage: { input_tokens: 10, output_tokens: 400 },
+    },
+  };
+  const line = JSON.stringify(record);
+  assert.ok(line.indexOf('"type":"api-request",') < 400, 'the marker sits in the head of the line');
+  assert.equal(claudeRetainedLine(line), line);
+  const turn = readSession(writeTranscript([userPrompt('work'), requestRecord('req-1', 10), record]), 'sess').turns[0];
+  assert.equal(turn.usage.output, 400);
+  assert.deepEqual(
+    turn.steps.map((step) => step.name),
+    ['Write'],
+  );
+  assert.deepEqual(turn.outputRate, { output: 400, milliseconds: 3000 });
+});
+
+test('Claude request timing leaves the parser state when its turn is emitted', () => {
+  const records = [
+    userPrompt('first', 0),
+    requestRecord('req-first', 1),
+    requestBlock('m-first', 'req-first', 3, 200),
+    userPrompt('second', 10),
+    requestRecord('req-second', 11),
+    requestBlock('m-second', 'req-second', 13, 300),
+    requestBlock('m-second', 'req-second', 14, 300),
+  ];
+  const first = createClaudeSessionReducer('sess');
+  for (const record of records.slice(0, 5)) first.pushLine(JSON.stringify(record));
+  const resumed = createClaudeSessionReducer('sess', {}, first.snapshot());
+  for (const record of records.slice(5)) resumed.pushLine(JSON.stringify(record));
+  const turns = resumed.read().turns;
+  assert.deepEqual(
+    turns.map((turn) => turn.outputRate),
+    [
+      { output: 200, milliseconds: 2000 },
+      { output: 300, milliseconds: 3000 },
+    ],
+  );
+  const state = resumed.snapshot();
+  assert.deepEqual([...state.requestTimes.keys()], ['req-second']);
+  assert.deepEqual([...state.responseTimings.keys()], ['m-second']);
+});
+
+test('a Claude turn that model work reopens after a local command keeps the speed of its earlier responses', () => {
+  const read = readSession(
+    writeTranscript([
+      userPrompt('first question', 0),
+      requestRecord('req-1', 1),
+      requestBlock('m-1', 'req-1', 3, 200),
+      ...localCommand('/mcp', '', 4, 'mcp-1', { stdout: 'Reconnected to shotcut.', user: true }),
+      requestRecord('req-2', 5),
+      requestBlock('m-2', 'req-2', 8, 300),
+    ]),
+    'sess',
+  );
+  assert.equal(read.turns.length, 1);
+  assert.deepEqual(read.turns[0].outputRate, { output: 500, milliseconds: 5000 });
 });
 
 // Haiku 5.5 prices each request in its own prompt-length band, so a turn total must keep both bands.

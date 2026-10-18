@@ -80,6 +80,8 @@ export interface ForwardRecoveryControl {
   // An unfinished record larger than this is reduced while it is read, and the record limit applies to the reduced bytes.
   reduceAbove: number;
   accepts(text: string): boolean;
+  // The text kept for an accepted record. Absent keeps the whole record.
+  retain?(text: string): string;
   fragments: Buffer[];
   // Source bytes of the unfinished record, whether held whole or reduced.
   fragmentBytes: number;
@@ -145,7 +147,11 @@ function* frameRecovery<State>(
       const charge = bytes.length * 8 + 256;
       yield* reserve(charge);
       control.retainedCharge += charge;
-      reducer.pushLine({ text, start: appliedThrough, end: baseOffset + end });
+      reducer.pushLine({
+        text: control.retain ? control.retain(text) : text,
+        start: appliedThrough,
+        end: baseOffset + end,
+      });
     }
     control.fragments = [];
     control.fragmentBytes = 0;
@@ -220,6 +226,8 @@ export interface SemanticSourceAdapter<State> {
   source: AgentKind;
   initialState(file: string, revision: FileRevision): State;
   accepts(record: BufferedHistoryRecord): boolean;
+  // The text a filtered page holds for an accepted record, at the record's own offsets. Absent holds the whole record.
+  retain?(text: string): string;
   parse(records: readonly BufferedHistoryRecord[], state: State): SemanticParse<State>;
   scanOlderEvidence?(
     records: readonly BufferedHistoryRecord[],
@@ -802,7 +810,8 @@ function* scanSemanticHistoryPage<State>(
           start: line.offset,
           end: line.offset + Buffer.byteLength(line.text),
         }))
-        .filter((record) => limits || adapter.accepts(record));
+        .filter((record) => limits || adapter.accepts(record))
+        .map((record) => (!limits && adapter.retain ? { ...record, text: adapter.retain(record.text) } : record));
       if (older.length) {
         const olderBytes = older.reduce((total, record) => total + charge(record), 0);
         if (limits && heldBytes + olderBytes + batch.cursor.fragment.length > limits.pageBytes)
@@ -871,7 +880,8 @@ function* scanSemanticHistoryPage<State>(
             start: line.offset,
             end: line.offset + Buffer.byteLength(line.text),
           }))
-          .filter((record) => adapter.accepts(record));
+          .filter((record) => adapter.accepts(record))
+          .map((record) => (adapter.retain ? { ...record, text: adapter.retain(record.text) } : record));
         evidenceCursor = batch.cursor;
         const scanned = adapter.scanOlderEvidence(records, remaining, evidenceState, evidenceCursor.end === 0);
         evidenceState = scanned.adapterState;

@@ -71,6 +71,7 @@ import { shortenTo } from './domain/text.ts';
 import { ARC_IDENTITY } from './identity';
 import { arcHome } from './store';
 import { claudeConfigHome, codexHome } from './agentpaths';
+import { RESPONSE_RATE_LIMIT, validRate, type OutputRate, type OutputRateBasis } from './outputrate';
 
 export { describeToolInput } from './activitydetail';
 export { shortenTo } from './domain/text.ts';
@@ -727,6 +728,8 @@ export interface Turn {
   contextTokens: number; // input plus cache of the turn's last real assistant message
   outputRate?: import('./outputrate').OutputRate;
   outputRateModel?: string;
+  // The interval that measured `outputRate`. Absent means the observed stream.
+  outputRateBasis?: OutputRateBasis;
   responseIds?: string[];
   finalResponse?: { text: string; sourceId: string | null };
   // The turn's first response id, which the cap on `responseIds` never drops.
@@ -1535,7 +1538,7 @@ function scanPromptLines(
       scan.found = true;
       return true;
     }
-    if (!claudeSessionLineMayAffectRead(line)) continue;
+    if (!claudePromptScanLineMayMatter(line)) continue;
     let o: Record<string, unknown>;
     try {
       o = JSON.parse(line) as Record<string, unknown>;
@@ -9594,6 +9597,10 @@ export interface ClaudeSessionParserState {
   // ran git and any edit whose change is only in its own input.
   wrote: Set<string>;
   usageState: ClaudeUsageReducerState;
+  // Send times of recent `api-request` records, keyed by request id.
+  requestTimes: Map<string, number>;
+  // Recent main-thread responses, keyed by message id, for request-timed output rates.
+  responseTimings: Map<string, ClaudeResponseTiming>;
   cur: SourcedBuilding | null;
   // The id of the typed record that opened `cur`, and whether a local command answer that
   // names it has finished `cur`. Such a turn is no turn. It closes with no card, and a process
@@ -9703,6 +9710,8 @@ function emptyClaudeSessionParserState(opts: ReadOptions): ClaudeSessionParserSt
     lastResultCallAt: 0,
     wrote: new Set(),
     usageState: emptyClaudeUsageReducerState(),
+    requestTimes: new Map(),
+    responseTimings: new Map(),
     cur: null,
     curCommand: null,
     curLocalAnswer: false,
@@ -9727,6 +9736,17 @@ function emptyClaudeSessionParserState(opts: ReadOptions): ClaudeSessionParserSt
 
 function emitClaudeTurn(state: ClaudeSessionParserState, turn: SourcedBuilding, maxTurns: number): void {
   const emitted: Turn = { ...turn, files: [...turn.files.values()] };
+  const rate = claudeRequestRate(state, emitted);
+  if (rate && emitted.model) {
+    emitted.outputRate = rate;
+    emitted.outputRateModel = emitted.model;
+    emitted.outputRateBasis = 'request';
+  } else {
+    delete emitted.outputRate;
+    delete emitted.outputRateModel;
+    delete emitted.outputRateBasis;
+  }
+  consumeClaudeResponseTimings(state, emitted);
   state.turns.push(emitted);
   for (const [id, owner] of state.toolOwnerById) {
     if (owner === turn) {
@@ -10417,6 +10437,12 @@ function reduceClaudeSessionLine(
   if (line.length < 20) {
     return;
   }
+  // A request record holds the whole request body, which can contain any marker the branches below test.
+  const request = claudeRequestRecord(line);
+  if (request) {
+    if (!opts.childTranscript) noteClaudeRequest(state, request);
+    return;
+  }
   if (line.indexOf(MODEL_ATTACHMENT_MARK) >= 0 || (line.includes('"attachment"') && line.includes('"model"'))) {
     try {
       const o = JSON.parse(line) as Record<string, unknown>;
@@ -11023,6 +11049,7 @@ function reduceClaudeSessionLine(
   if (answeredATurn(o)) {
     cur.error = null;
   }
+  if (!opts.childTranscript) noteClaudeResponseTiming(state, o, message);
   if (message.model) {
     cur.model = message.model;
     state.currentModelSource = { start: sourceStart, end: sourceEnd };
@@ -11549,13 +11576,147 @@ export function claudeSessionLineMayAffectRead(line: string): boolean {
     line.indexOf(MODEL_ATTACHMENT_MARK) >= 0 ||
     (line.includes('"attachment"') && line.includes('"model"')) ||
     line.indexOf('"type":"cost-state"') >= 0 ||
-    line.indexOf('"local_command"') >= 0
+    line.indexOf('"local_command"') >= 0 ||
+    claudeRequestMarked(line)
   ) {
     return true;
   }
   const isAssistant = line.indexOf('"type":"assistant"') >= 0;
   const isUser = !isAssistant && line.indexOf('"type":"user"') >= 0;
   return (isAssistant || isUser) && !skipsOrdinaryToolResult(line, isUser);
+}
+
+// The prompt scan reads prompts and commands, so it never parses a request record.
+function claudePromptScanLineMayMatter(line: string): boolean {
+  return claudeSessionLineMayAffectRead(line) && !claudeRequestMarked(line);
+}
+
+const CLAUDE_REQUEST_MARK = '"type":"api-request",';
+// The CLI writes `type` first, then `sessionId`, `id`, and `timestamp`, ahead of the request body.
+const CLAUDE_REQUEST_LEAD = '{' + CLAUDE_REQUEST_MARK;
+const CLAUDE_REQUEST_HEAD = 512;
+
+// Whether the head of the line holds the request marker. A nested object, such as a tool input,
+// can hold it too, so a marked line is a request record only when its top-level type says so.
+function claudeRequestMarked(line: string): boolean {
+  return line.lastIndexOf(CLAUDE_REQUEST_MARK, CLAUDE_REQUEST_HEAD - CLAUDE_REQUEST_MARK.length) >= 0;
+}
+
+interface ClaudeRequestRecord {
+  id: string;
+  timestamp: string;
+}
+
+// The id and send time of an `api-request` record, or null for any other line. A line that opens
+// with the request type supplies both from its head when it holds them. Any other marked line
+// is parsed, and only a top-level request type qualifies.
+function claudeRequestRecord(line: string): ClaudeRequestRecord | null {
+  if (!claudeRequestMarked(line)) return null;
+  if (line.startsWith(CLAUDE_REQUEST_LEAD)) {
+    const head = line.slice(0, CLAUDE_REQUEST_HEAD);
+    const id = /"id":"([^"\\]{1,512})"/.exec(head)?.[1];
+    const timestamp = /"timestamp":"([^"\\]{1,64})"/.exec(head)?.[1];
+    // A regular expression capture shares the memory of the whole line. The parser state keeps
+    // request ids, so the id is copied to keep the line collectable.
+    if (id && timestamp && stamp(timestamp) > 0) return { id: Buffer.from(id).toString(), timestamp };
+  }
+  try {
+    const o = JSON.parse(line) as Record<string, unknown>;
+    if (
+      o?.type === 'api-request' &&
+      typeof o.id === 'string' &&
+      o.id.length > 0 &&
+      o.id.length <= 512 &&
+      typeof o.timestamp === 'string' &&
+      stamp(o.timestamp) > 0
+    ) {
+      return { id: o.id, timestamp: o.timestamp };
+    }
+  } catch {
+    /* skip malformed line */
+  }
+  return null;
+}
+
+// The text that a filtered read keeps for a line. A request record shrinks to its type, id, and send time.
+export function claudeRetainedLine(line: string): string {
+  const request = claudeRequestRecord(line);
+  return request ? JSON.stringify({ type: 'api-request', id: request.id, timestamp: request.timestamp }) : line;
+}
+
+interface ClaudeResponseTiming {
+  requestRef: string | null;
+  // The newest content block time of the response.
+  at: number;
+  output: number | null;
+  stopped: boolean;
+  model: string | null;
+}
+
+function noteClaudeRequest(state: ClaudeSessionParserState, request: ClaudeRequestRecord): void {
+  state.requestTimes.delete(request.id);
+  state.requestTimes.set(request.id, stamp(request.timestamp));
+  for (const id of state.requestTimes.keys()) {
+    if (state.requestTimes.size <= RESPONSE_RATE_LIMIT) break;
+    state.requestTimes.delete(id);
+  }
+}
+
+// Each content block of a response is its own record, and each repeats the final output and stop reason.
+function noteClaudeResponseTiming(
+  state: ClaudeSessionParserState,
+  o: Record<string, unknown>,
+  message: { id?: string; model?: string; stop_reason?: string; usage?: ClaudeUsage },
+): void {
+  const id = message.id;
+  if (typeof id !== 'string' || !id || id.length > 512) return;
+  const held = state.responseTimings.get(id);
+  const output = (message.usage as { output_tokens?: unknown } | undefined)?.output_tokens;
+  const timing: ClaudeResponseTiming = {
+    requestRef: typeof o.requestRef === 'string' && o.requestRef ? o.requestRef : (held?.requestRef ?? null),
+    at: Math.max(held?.at ?? 0, stamp(o.timestamp)),
+    output: typeof output === 'number' ? output : (held?.output ?? null),
+    stopped: !!message.stop_reason || held?.stopped === true,
+    model: message.model || held?.model || null,
+  };
+  state.responseTimings.delete(id);
+  state.responseTimings.set(id, timing);
+  for (const key of state.responseTimings.keys()) {
+    if (state.responseTimings.size <= RESPONSE_RATE_LIMIT) break;
+    state.responseTimings.delete(key);
+  }
+}
+
+// Sums the turn's qualified responses. Each has a stop reason, a recorded request, the turn's model,
+// and a positive interval from the request's send time to the response's last content block.
+// A reopened turn starts from the request rate of its last emission, because that emission
+// consumed the timings it summed.
+function claudeRequestRate(state: ClaudeSessionParserState, turn: Turn): OutputRate | undefined {
+  if (turn.interrupted || !turn.model) return undefined;
+  const carried = turn.outputRateBasis === 'request' && turn.outputRateModel === turn.model ? turn.outputRate : null;
+  const total = { output: carried?.output ?? 0, milliseconds: carried?.milliseconds ?? 0 };
+  for (const id of turn.responseIds ?? []) {
+    const timing = state.responseTimings.get(id);
+    const sent = timing?.requestRef ? state.requestTimes.get(timing.requestRef) : undefined;
+    if (!timing || !sent || !timing.stopped || timing.model !== turn.model || timing.output === null) continue;
+    const measured = { output: timing.output, milliseconds: timing.at - sent };
+    if (!validRate(measured)) continue;
+    total.output += measured.output;
+    total.milliseconds += measured.milliseconds;
+  }
+  return total.output > 0 && validRate(total) ? total : undefined;
+}
+
+// Drops the timings of an emitted turn's stopped responses and the requests they name, so the
+// parser state holds only open responses. A response without a stop reason can continue in a
+// later record, so its timing stays.
+function consumeClaudeResponseTimings(state: ClaudeSessionParserState, turn: Turn): void {
+  for (const id of turn.responseIds ?? []) {
+    const timing = state.responseTimings.get(id);
+    if (!timing?.stopped) continue;
+    if (timing.requestRef) state.requestTimes.delete(timing.requestRef);
+    state.responseTimings.delete(id);
+  }
 }
 
 function finishClaudeSession(state: ClaudeSessionParserState, opts: ReadOptions, readBytes: number): SessionRead {
@@ -11617,6 +11778,8 @@ export function createClaudeSessionReducer(
   state.attachmentBoundary ??= { open: true, model: null, turns: [] };
   state.pendingTypedSkill ??= null;
   state.handbacks ??= new Map();
+  state.requestTimes ??= new Map();
+  state.responseTimings ??= new Map();
   state.handedBack ??= false;
   state.closingReply ??= null;
   state.repeatNotice ??= false;

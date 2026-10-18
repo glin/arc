@@ -5,6 +5,7 @@ import {
   ClaudeSessionParserState,
   ReadOptions,
   claudeSessionLineMayAffectRead,
+  claudeRetainedLine,
   RecordedTitleSource,
   createClaudeSessionReducer,
   normalizeFullSessionTitle,
@@ -344,6 +345,7 @@ function claudeAdapter(sessionId: string, opts: ReadOptions): SemanticSourceAdap
       };
     },
     accepts: (record) => claudeSessionLineMayAffectRead(record.text),
+    retain: claudeRetainedLine,
     parse: (input, backward) => {
       const captured = opts.captureRepeated
         ? input.filter((record) => !insideClaudeRepeated(opts.captureRepeated, record.start))

@@ -13,6 +13,10 @@ export interface ResponseRate extends OutputRate {
 
 export const RESPONSE_RATE_LIMIT = 512;
 
+// `stream` times a Claude response from its first stream event to its stop. `request` times it from
+// the recorded request send time to its last recorded content block.
+export type OutputRateBasis = 'stream' | 'request';
+
 export function validRate(value: OutputRate): boolean {
   return (
     Number.isSafeInteger(value.output) &&

@@ -679,6 +679,83 @@ import { openReadWindow, closeReadWindow } from './readmeter';
 import { responseRateForTurn, savedResponseRates } from './outputrate';
 import { emptyUsage } from './agentspend';
 
+// A session the CLI ran in a terminal has no observed stream, so its speed comes from its transcript's request records.
+test('a terminal Claude turn shows request-timed speed while observed rates hold other sessions', () => {
+  const at = (second: number) => new Date(Date.UTC(2026, 0, 3, 0, 0, second)).toISOString();
+  const file = path.join(tempDir('terminal-speed-'), 'terminal.jsonl');
+  const message = (id: string, second: number, stop: string) => ({
+    type: 'assistant',
+    requestRef: 'req-terminal',
+    timestamp: at(second),
+    message: {
+      role: 'assistant',
+      id,
+      model: 'claude-opus-5',
+      stop_reason: stop,
+      content: [{ type: 'text', text: `block ${second}` }],
+      usage: { input_tokens: 10, output_tokens: 400 },
+    },
+  });
+  fs.writeFileSync(
+    file,
+    [
+      { type: 'user', promptId: 'terminal-prompt', timestamp: at(0), message: { role: 'user', content: 'work' } },
+      {
+        type: 'api-request',
+        sessionId: 'terminal',
+        id: 'req-terminal',
+        timestamp: at(10),
+        querySource: 'repl_main_thread',
+      },
+      message('m-terminal', 13, 'end_turn'),
+      message('m-terminal', 14, 'end_turn'),
+    ]
+      .map((record) => JSON.stringify(record))
+      .join('\n') + '\n',
+  );
+  const recorded = readSession(file, 'terminal').turns[0];
+  const observed = (sessionId: string) => ({
+    sessionId,
+    responseId: 'm-terminal',
+    model: 'claude-opus-5',
+    output: 400,
+    milliseconds: 2000,
+  });
+  const host = Object.assign(Object.create(PanelProvider.prototype), {
+    live: {},
+    liveActivity: {},
+    turnsByKey: new Map([[turnKey(recorded), recorded]]),
+    newestBySession: new Map(),
+    sessionNames: new SessionNames(),
+    hosts: [{ webview: {} }],
+    projectSpendHydrated: true,
+    responseRates: [observed('hosted')],
+    lifetimeFiguresBySession: () => ({ cacheExpiryFacts: {} }),
+    dispatchedTurnCosts: () => ({}),
+    dispatchedCostsForTurn: () => [],
+    folders: () => [],
+    runningSessions: () => new Set(),
+    liveOpenChildren: () => new Map(),
+    railStatuses: () => ({ statuses: new Map(), openChildren: new Map() }),
+  });
+  const speed = () =>
+    host
+      .renderTurnCard(recorded, false, 'Terminal', NOW)
+      .chips.find((chip: { metric?: string }) => chip.metric === 'tokens')
+      .detailList.entries.find((entry: { label: string }) => entry.label === 'Output').lines[0];
+  assert.deepEqual(speed(), {
+    text: '100.0 tok/s',
+    title:
+      '100.0 tok/s. Output tokens per second. Actual output includes thinking. Request time includes the wait for the first response event. Untimed responses are excluded.',
+  });
+  host.responseRates = [observed('terminal')];
+  assert.deepEqual(speed(), {
+    text: '200.0 tok/s',
+    title:
+      '200.0 tok/s. Output tokens per second. Actual output includes thinking. Observed response time excludes untimed responses.',
+  });
+});
+
 test('the panel persists an owned response speed and omits unowned or foreign completions', () => {
   const saves: Array<{ key: string; rates: unknown }> = [];
   const rate = {

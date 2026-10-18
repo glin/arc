@@ -68,6 +68,7 @@ import {
   readSessionMeta,
   createClaudeSessionReducer,
   claudeSessionLineMayAffectRead,
+  claudeRetainedLine,
   readSessionTurnStarts,
   refreshClaudeAgentFacts,
   scanForAgentRun,
@@ -271,6 +272,7 @@ async function execute(
         recordLimit: request.recordBytes ?? 16 * 1024 * 1024,
         reduceAbove: request.reduceAboveBytes ?? 1024 * 1024,
         accepts: session.agent === 'codex' ? codexSessionLineMayAffectRead : claudeSessionLineMayAffectRead,
+        ...(session.agent === 'codex' ? {} : { retain: claudeRetainedLine }),
         fragments: [],
         fragmentBytes: 0,
       };
