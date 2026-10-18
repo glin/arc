@@ -283,9 +283,15 @@ test.each(
   }
 });
 
-test.each(['capture.json', 'capture-write.lock'].flatMap((name) => ['open', 'read'].map((phase) => ({ name, phase }))))(
-  'concurrent capture replacement remains retryable at $name during $phase',
-  ({ name, phase }) => {
+test.each(
+  ['capture.json', 'capture-write.lock'].flatMap((name) =>
+    ['open', 'read'].flatMap((phase) =>
+      (name === 'capture.json' ? [false, true] : [false]).map((construction) => ({ name, phase, construction })),
+    ),
+  ),
+)(
+  'concurrent capture replacement remains retryable at $name during $phase with construction=$construction',
+  ({ name, phase, construction }) => {
     const { receipts, launch, home } = fixture();
     const alias = path.join(home, 'live.log');
     const standalone = receipts.reserve({
@@ -349,7 +355,11 @@ test.each(['capture.json', 'capture-write.lock'].flatMap((name) => ['open', 'rea
     try {
       assert.throws(
         () =>
-          name === 'capture.json' ? a.cursor('stdout.log') : a.write(Buffer.from('abcdefghij'), 'stdout.log', cursor),
+          construction
+            ? receipts.capture(id, 2).cursor('stdout.log')
+            : name === 'capture.json'
+              ? a.cursor('stdout.log')
+              : a.write(Buffer.from('abcdefghij'), 'stdout.log', cursor),
         /dispatch write changed during recovery/,
       );
       assert.equal(fired, true);

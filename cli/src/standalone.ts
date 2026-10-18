@@ -1045,13 +1045,32 @@ function captureWriteBusy(error: unknown): boolean {
   );
 }
 
+async function openCapture<T>(construct: () => T, deadline: number, runtime = OBSERVATION_RUNTIME): Promise<T> {
+  let waits = Math.ceil(Math.max(0, deadline - runtime.now()) / 50);
+  while (true) {
+    try {
+      return construct();
+    } catch (error) {
+      if (!captureWriteBusy(error) || runtime.now() >= deadline || waits-- <= 0) throw error;
+      await pause(Math.min(50, deadline - runtime.now()));
+    }
+  }
+}
+
 function logCapture(receipts: DispatchReceipts, id: string, bounds: ReadBounds) {
   const capture = receipts.capture(id, bounds.readBytes);
-  const sources = (['stdout.log', 'stderr.log'] as const).map((name) => ({
-    name,
-    file: receipts.artifact(id, name),
-    cursor: capture.cursor(name),
-  }));
+  const sources = (() => {
+    try {
+      return (['stdout.log', 'stderr.log'] as const).map((name) => ({
+        name,
+        file: receipts.artifact(id, name),
+        cursor: capture.cursor(name),
+      }));
+    } catch (error) {
+      capture.close();
+      throw error;
+    }
+  })();
   const sourceComplete = () =>
     sources.every((source) => capture.cursor(source.name).offset === fs.statSync(source.file).size);
   const progress = () =>
@@ -1176,7 +1195,7 @@ export async function produceStandaloneOutput(receipts: DispatchReceipts, id: st
   });
   let capture: ReturnType<typeof logCapture>;
   try {
-    capture = logCapture(receipts, id, READ_BOUNDS);
+    capture = await openCapture(() => logCapture(receipts, id, READ_BOUNDS), Date.now() + options.deadlineMs);
   } catch (error) {
     save('unavailable', String(error).slice(0, 512));
     throw error;
@@ -1299,8 +1318,9 @@ async function produceBackgroundOutput(receipts: DispatchReceipts, id: string, o
   let nativeCapture: ReturnType<DispatchReceipts['capture']> | undefined;
   try {
     save('capturing');
-    capture = logCapture(receipts, id, READ_BOUNDS);
-    nativeCapture = receipts.capture(id);
+    const deadline = Date.now() + options.deadlineMs;
+    capture = await openCapture(() => logCapture(receipts, id, READ_BOUNDS), deadline);
+    nativeCapture = await openCapture(() => receipts.capture(id), deadline);
     const source = receipts.artifact(id, 'native-source.log');
     if (fs.existsSync(source)) safeDispatchPath(source);
     else fs.writeFileSync(source, '', { flag: 'wx', mode: 0o600 });
@@ -1438,7 +1458,7 @@ export async function superviseStandalone(
       return receipts.status(id);
     const prompt = receipts.input(id);
     if (options.logAlias && !outputEntry && (!recovery || options.background))
-      capture = liveLogCapture(receipts, id, bounds);
+      capture = await openCapture(() => liveLogCapture(receipts, id, bounds), observationDeadline, runtime);
     if (recovery && !options.background) {
       const stream = new FrameStream(options, bounds);
       const log = receipts.artifact(id, 'stdout.log');
@@ -1464,7 +1484,8 @@ export async function superviseStandalone(
         receipts.observation(id, observation);
         return receipts.status(id);
       }
-      if (options.logAlias) capture = liveLogCapture(receipts, id, bounds);
+      if (options.logAlias)
+        capture = await openCapture(() => liveLogCapture(receipts, id, bounds), observationDeadline, runtime);
       observation.monitor = 'observing';
       receipts.observation(id, observation);
       let work = 0;

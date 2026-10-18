@@ -376,14 +376,14 @@ export class DispatchReceipts {
     if (!Number.isSafeInteger(state.bytes) || state.bytes < 0 || !equalIdentity(state.raw, identity(rawFile)))
       throw new Error('The captured worker output was replaced.');
     const raw = fs.openSync(rawFile, fs.constants.O_RDWR | (fs.constants.O_NOFOLLOW ?? 0));
-    const rawStat = fs.fstatSync(raw, { bigint: true });
-    if (!rawStat.isFile() || !equalIdentity(state.raw, { dev: String(rawStat.dev), ino: String(rawStat.ino) })) {
+    try {
+      const rawStat = fs.fstatSync(raw, { bigint: true });
+      if (!rawStat.isFile() || !equalIdentity(state.raw, { dev: String(rawStat.dev), ino: String(rawStat.ino) }))
+        throw new Error('The captured worker output was replaced.');
+      if (rawStat.size < BigInt(state.bytes)) throw new Error('The captured worker output was truncated.');
+    } catch (error) {
       fs.closeSync(raw);
-      throw new Error('The captured worker output was replaced.');
-    }
-    if (rawStat.size < BigInt(state.bytes)) {
-      fs.closeSync(raw);
-      throw new Error('The captured worker output was truncated.');
+      throw error;
     }
     const reload = () => {
       const current = JSON.parse(readChanging(checkpoint)) as CaptureState;
