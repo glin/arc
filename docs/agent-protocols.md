@@ -87,7 +87,7 @@ A command the CLI answers by itself still reports a result. The result carries t
 
 `system/init` repeats before every local command result, so its arrival means nothing on its own. Only a change of session id does.
 
-Every Claude session starts with `--replay-user-messages`, because guarded follow-ups and continuations use the replay as their receipt. The follow-up write starts a native submission, as an ordinary prompt does. The follow-up carries a client UUID. Only a replay frame with that UUID, the same session, root scope, and exact text accepts it. A result, an idle report, child exit, or 120 seconds without that frame leave the outcome unknown. Replay frames never reach display or turn tracking.
+Every hosted Claude session starts with `--replay-user-messages`, because guarded follow-ups and continuations use the replay as their receipt. The follow-up write starts a native submission, as an ordinary prompt does. The follow-up carries a client UUID. Only a replay frame with that UUID, the same session, root scope, and exact text accepts it. A result, an idle report, child exit, or 120 seconds without that frame leave the outcome unknown. Replay frames never reach display or turn tracking.
 
 ## Codex app-server
 
