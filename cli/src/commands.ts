@@ -312,7 +312,7 @@ export const COMMANDS: readonly Command[] = [
       flags: [
         [
           '--query QUERY',
-          'Filter by session:, agent:, title:, label:, is:archived, or is:agentrun. Repeat the query on every page.',
+          'Filter by session:, agent:, title:, label:, is:archived, or is:agentrun. Rows include archived sessions unless the query adds -is:archived. Repeat the query on every page.',
         ],
         ['--limit 1-128', 'Maximum rows on this page. Default: 128.'],
         ['--cursor CURSOR', 'Pass the previous page next value unchanged. A reload or changed query expires it.'],
