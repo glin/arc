@@ -10,6 +10,8 @@ Do not line wrap Markdown. One paragraph is one line, and one list item is one l
 
 `docs/architecture.md` owns the component map, data sources, and non-obvious gotchas. Update it in the same commit when a change alters a component job, adds a data source, or introduces a gotcha. Keep other feature detail in code, tests, or `docs/design-goals.md`. Do not put repository inventories or counts in prose unless a test enforces them.
 
+Read [CLI instructions](cli/CLAUDE.md) for CLI changes, including command help and CLI documentation outside `cli/`. Read [extension instructions](extension/CLAUDE.md) for extension changes and tests.
+
 ## Writing
 
 `docs/` and both READMEs are public prose. Keep them timeless, and keep them true to the code.
@@ -27,9 +29,7 @@ Do not line wrap Markdown. One paragraph is one line, and one list item is one l
 
 ## CLI
 
-- Design CLI changes for the author and the `arc-sessions` skill.
-- For new or changed CLI output, default to readable text and put structured output behind `--json`. Agent calls must use `--json` when the command supports it.
-- Keep human output, command help, and user docs concise. State the result and any required next step.
+Agent calls must use `--json` when the command supports it.
 
 ## Feature proposals
 
@@ -53,22 +53,6 @@ Use the diagnostic capture script in [Performance capture](docs/development.md#p
 
 Follow the Fast iteration section of `docs/development.md` to test a change while you work and before handoff.
 
-The `panel.layout*.test.ts` files run the panel in bundled Chromium, Edge, or Chrome. Each skips when no browser exists. Read the skip result after changing `extension/src/webview/panel.css`.
-
-Build before viewing changes to `extension/src/webview/panel.css`, `extension/src/webview/panel.ts`, `extension/src/webview/main.ts`, or `extension/src/panelbundle.ts`:
-
-```bash
-npm --prefix extension run build
-```
-
-Review browser shots before and after changes to panel styles or browser code:
-
-```bash
-npm --prefix extension run shots
-```
-
-After changing panel host options, check a new panel tab in the isolated editor. Check a restored tab with `node scripts/isolated-editor.mjs restore --baseline-commit <revision>`, where the revision saved the old options. Browser tests cannot read options saved when the editor created a tab. A tab restored by the owner's own editor is an owner check.
-
 Check a change with the cheapest method that reaches it, in this order:
 
 1. Node tests.
@@ -84,50 +68,16 @@ Agents never drive the owner's own VS Code window, with computer use or any othe
 
 ## Tests
 
-Never wait a fixed time in a test. Poll for the condition the test needs, and fail on a deadline. `page.waitForTimeout`, a `setTimeout` used as a sleep, and any fixed delay before an assertion are banned. In a browser test use `page.waitForFunction` or an auto-retrying Playwright locator assertion. In a Node test use fake timers and advance the clock, or `vi.waitFor`. A fixed delay passes on a fast machine and fails on a loaded one, and it costs its full length on every run.
-
-`SETTLED` from `extension/test/browser.ts` waits for two animation frames. It does not confirm media-query delivery, ResizeObserver placement, compositor scrolling, or timer expiry. After those operations, wait for the state the assertion reads. Preserve the outcome assertion when repairing synchronization. Do not replace it with a retry, a larger deadline, or a wider tolerance.
+Never wait a fixed time in a test. Poll for the condition the test needs, and fail on a deadline. `page.waitForTimeout`, a `setTimeout` used as a sleep, and any fixed delay before an assertion are banned. In a Node test use fake timers and advance the clock, or `vi.waitFor`. A fixed delay passes on a fast machine and fails on a loaded one, and it costs its full length on every run.
 
 Control clocks and filesystem timestamps in expiry and cache-band tests. Inject operating-system process reads in tests of code that has a deadline. Test the real read separately, without that deadline. Set explicit byte budgets in cancellation and incremental-read tests. Test path rules with mixed-case fixtures and independent Windows, macOS, and Linux expectations.
 
-Add a test to the existing file for its subject and reuse that file's setup and helpers. Create a new browser test file only when no file covers the subject. Add a browser test only when no Node test or text scan can catch the defect. Never add a browser test to check a width, spacing, color, font or wording. A plan or brief does not override this rule. When one asks for such a test, skip it and name the conflict in your report.
+Add a test to the existing file for its subject and reuse that file's setup and helpers.
 
 Review each changed timing test's trigger, time-dependent fixture setup, and controlled clock or awaited state. Before a test timing change lands, run the test several times on the old commit and on the new commit.
 
-Use the `themed` helper from `extension/src/panelfixture.ts` for browser tests. Never set a theme variable by hand.
-
 ## Code boundaries
-
-Put logic in a module that does not import `vscode`. Keep `vscode` glue small and move decisions into tested modules. `extension/src/imports.test.ts` enforces VS Code exemptions, production fixture boundaries, package directions, and runtime cycles.
 
 Use the component map and ownership graph in `docs/architecture.md` when adding or moving a component. Do not maintain a separate component inventory here.
 
-`extension/src/webview/panel.ts` and `extension/src/webview/panel.css` are build inputs with text, unit, and browser coverage.
-
-`extension/src/turnfixtures.ts` holds test data, not shipping logic. Add a builder when shared tests need it. Production code must not import it.
-
-## UI work
-
-Read [UI design](docs/ui-design.md) before adding or changing panel UI.
-
-Make every visible control keyboard reachable and screen-reader readable. Use real buttons, visible focus, and accessible names that include visible information. Follow the panel reachability patterns in `docs/rail-and-navigation.md`.
-
-Support Windows, macOS, and Linux. Follow host conventions for platform labels and shortcuts. Test every platform branch.
-
-Use `extension/src/webview/inline-text.ts` for compound text split across elements. Render literal DOM separators because CSS gaps are visual only.
-
-Apply relative text scaling to the text owner. Give repeated UI roles one production component or CSS rule. Review rendered peers at wide and narrow widths in each default theme.
-
-A webview helper that performs a full Preact draw must never run inside a loop over sessions or cards. Process the list, then draw once. `extension/src/webview.integration.browser.test.ts` guards this at 100 and 1000 sessions.
-
-Size text-related elements in `em`. Use `px` for hairlines, radii, and decorative bars.
-
-Use the `panel-mockup` skill for a mockup or panel review. It starts with headless shots of the built panel and uses the panel stylesheet.
-
-Use the shared relative-age formatter. Show full local time in a native tooltip and accessible name. Show time for today and a short date for earlier days when calendar context matters.
-
-Order and word a context menu entry by the convention in `docs/rail-and-navigation.md`'s "Context menus and copy" section.
-
-Use `data-hint` and `data-hint-detail` for controls. Use native `title` for read-only text and rows in open popovers. Do not put native `title` on a button. Drop a hint that repeats visible control text.
-
-In user-facing copy, never say chip. Say Compact for the Card layout setting, or name the figure.
+Support Windows, macOS, and Linux. Test every platform branch.
