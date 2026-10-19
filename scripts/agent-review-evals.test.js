@@ -1,3 +1,4 @@
+// @module-tag subprocess
 const assert = require('node:assert/strict');
 const { execFileSync, spawnSync } = require('node:child_process');
 const { createHash } = require('node:crypto');
@@ -8,6 +9,8 @@ const { pathToFileURL } = require('node:url');
 
 // The heaviest cases start dozens of Node and Git processes. On a loaded Windows machine one process start can take a second.
 const HEAVY = { timeout: 120_000 };
+// The setup hooks build fixture repositories with Git and Node processes. A tag budget covers tests and not hooks.
+vi.setConfig({ hookTimeout: 120_000 });
 
 const root = path.resolve(__dirname, '..');
 const cli = path.join(root, 'evals/agent-review/cli.mjs');

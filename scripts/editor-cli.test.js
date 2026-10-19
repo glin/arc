@@ -1,3 +1,4 @@
+// @module-tag subprocess
 const assert = require('node:assert');
 const fs = require('node:fs');
 const os = require('node:os');
@@ -60,7 +61,8 @@ const RUN_TIMEOUT = 120_000;
 function runBudget(runs) {
   return runs * RUN_TIMEOUT + 10_000;
 }
-vi.setConfig({ testTimeout: runBudget(1) });
+// The describe-level hooks build the installer fixture, which can start a build under load.
+vi.setConfig({ testTimeout: runBudget(1), hookTimeout: runBudget(1) });
 
 // Cases with their own fixture run concurrently. Cases in a describe block share one fixture and run in order.
 // Run a child without blocking the worker, so concurrent tests overlap their installer runs.

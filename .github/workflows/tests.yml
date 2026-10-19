@@ -61,6 +61,8 @@ jobs:
         run: node extension/node_modules/playwright-core/cli.js install --with-deps chromium-headless-shell
       - name: Root tests
         run: npm run test:root
+      - name: Root subprocess tests
+        run: npm run test:subprocess
       - name: Panel-mockup tests
         run: npm run test:panel-mockup
       - name: Extension node lane

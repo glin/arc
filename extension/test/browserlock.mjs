@@ -202,12 +202,15 @@ export async function acquireBrowserLock({
   waitForPoll = (milliseconds) => new Promise((resolveWait) => setTimeout(resolveWait, milliseconds)),
   pollMs = BROWSER_LOCK_POLL_MS,
   deadlineMs = BROWSER_LOCK_DEADLINE_MS,
+  label = 'browser',
   staleAfterMs = BROWSER_LOCK_STALE_AFTER_MS,
   heartbeatMs = BROWSER_LOCK_HEARTBEAT_MS,
   scheduleHeartbeat = defaultScheduleHeartbeat,
   cancelHeartbeat = clearInterval,
   rename = renameSync,
 } = {}) {
+  const lockName = `${label} test lock`;
+  const heading = `${label[0].toUpperCase()}${label.slice(1)} tests`;
   let announced = false;
   let staleObservation = null;
   const waitStartedAt = monotonicNow();
@@ -217,7 +220,7 @@ export async function acquireBrowserLock({
     const text = JSON.stringify({ pid, cwd, startedAt: new Date(now()).toISOString() });
     if (publishLock(lockPath, text, pid)) {
       if (announced) {
-        console.log(`Browser tests resumed after ${Math.round(monotonicNow() - waitStartedAt)} ms waiting.`);
+        console.log(`${heading} resumed after ${Math.round(monotonicNow() - waitStartedAt)} ms waiting.`);
       }
       const heartbeat = startHeartbeat(lockPath, pid, scheduleHeartbeat, heartbeatMs, now);
       let released = false;
@@ -230,14 +233,14 @@ export async function acquireBrowserLock({
           try {
             current = readLock(lockPath).owner;
           } catch (error) {
-            console.error(`Could not release the browser test lock: ${error.message}`);
+            console.error(`Could not release the ${lockName}: ${error.message}`);
             return false;
           }
           if (!current || current.pid !== pid) return false;
           try {
             rmSync(lockPath, { force: true });
           } catch (error) {
-            console.error(`Could not release the browser test lock: ${error.message}`);
+            console.error(`Could not release the ${lockName}: ${error.message}`);
             return false;
           }
           return true;
@@ -269,12 +272,12 @@ export async function acquireBrowserLock({
       }
     }
     if (!announced) {
-      console.log(`Browser tests are waiting for another run to finish: held by ${describeHolder(current)}.`);
+      console.log(`${heading} are waiting for another run to finish: held by ${describeHolder(current)}.`);
       announced = true;
     }
     const remaining = deadline - monotonicNow();
     if (remaining <= 0) {
-      throw new Error(`Timed out waiting for the browser test lock held by ${describeHolder(current)}.`);
+      throw new Error(`Timed out waiting for the ${lockName} held by ${describeHolder(current)}.`);
     }
     await waitForPoll(Math.min(pollMs, remaining));
   }

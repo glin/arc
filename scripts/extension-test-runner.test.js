@@ -4,6 +4,9 @@ const os = require('node:os');
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
 
+// Tests that start real processes run in the locked test:subprocess lane.
+const SUBPROCESS = { tags: ['subprocess'] };
+
 let runner;
 let browserChannels;
 let browserLock;
@@ -336,6 +339,40 @@ test('a free browser lock is taken by the first run and released', async () => {
     assert.equal(lock.release(), true);
     assert.equal(fs.existsSync(lockPath), false);
   } finally {
+    fs.rmSync(path.dirname(lockPath), { recursive: true, force: true });
+  }
+});
+
+test('a lock with a label names that label in its wait, resume, and timeout messages', async () => {
+  const lockPath = lockFixture();
+  fs.writeFileSync(lockPath, JSON.stringify({ pid: 601, cwd: '/repo/worktree-a', startedAt: 'earlier' }));
+  const logs = [];
+  const original = console.log;
+  console.log = (message) => logs.push(message);
+  try {
+    const lock = await browserLock.acquireBrowserLock({
+      lockPath,
+      pid: 602,
+      label: 'subprocess',
+      isProcessAlive: (pid) => pid === 601,
+      waitForPoll: async () => fs.rmSync(lockPath, { force: true }),
+    });
+    assert.match(logs[0], /^Subprocess tests are waiting for another run to finish: held by PID 601/);
+    assert.match(logs[1], /^Subprocess tests resumed after \d+ ms waiting\.$/);
+    lock.release();
+    fs.writeFileSync(lockPath, JSON.stringify({ pid: 601, cwd: '/repo/worktree-a', startedAt: 'earlier' }));
+    await assert.rejects(
+      browserLock.acquireBrowserLock({
+        lockPath,
+        label: 'subprocess',
+        isProcessAlive: () => true,
+        deadlineMs: 0,
+        waitForPoll: async () => {},
+      }),
+      /^Error: Timed out waiting for the subprocess test lock held by PID 601/,
+    );
+  } finally {
+    console.log = original;
     fs.rmSync(path.dirname(lockPath), { recursive: true, force: true });
   }
 });
@@ -1023,7 +1060,7 @@ test('rejects an invalid mode without starting Node', () => {
   }
 });
 
-test('the command-line entry point rejects an invalid mode', () => {
+test('the command-line entry point rejects an invalid mode', SUBPROCESS, () => {
   const result = spawnSync(process.execPath, [path.join(__dirname, '..', 'extension', 'test.mjs'), 'slow'], {
     encoding: 'utf8',
   });

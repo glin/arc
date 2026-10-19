@@ -9,6 +9,9 @@ const { createRequire } = require('node:module');
 const { packageClaudePlugin } = require('./package-claude-plugin.js');
 const yauzl = createRequire(path.join(__dirname, '..', 'extension', 'package.json'))('yauzl');
 
+// Tests that start real processes run in the locked test:subprocess lane.
+const SUBPROCESS = { tags: ['subprocess'] };
+
 const installer = path.join(__dirname, 'install-release.sh');
 const asset = 'glin.arc-0.1.0.vsix';
 const body = Buffer.from('fixture VSIX');
@@ -78,13 +81,13 @@ async function fixture(checksum, editors, selection = '', explicit = false, conf
   }
 }
 
-test('the standalone installer downloads, verifies, and installs in the sole editor', async () => {
+test('the standalone installer downloads, verifies, and installs in the sole editor', SUBPROCESS, async () => {
   const result = await fixture(digest, ['code']);
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.installed, /code --install-extension .*glin\.arc-0\.1\.0\.vsix --force/);
 });
 
-test('the standalone installer gives an explicit editor instruction without a terminal', async () => {
+test('the standalone installer gives an explicit editor instruction without a terminal', SUBPROCESS, async () => {
   const result = await fixture(digest, ['code', 'cursor']);
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /Choose one editor:/);
@@ -92,7 +95,7 @@ test('the standalone installer gives an explicit editor instruction without a te
   assert.equal(result.installed, '');
 });
 
-test('the standalone installer finds a macOS app-bundle CLI outside PATH', async () => {
+test('the standalone installer finds a macOS app-bundle CLI outside PATH', SUBPROCESS, async () => {
   const result = await fixture(digest, [], '', false, ({ directory }) => {
     const home = path.join(directory, 'home');
     const cli = path.join(
@@ -113,7 +116,7 @@ test('the standalone installer finds a macOS app-bundle CLI outside PATH', async
   assert.match(result.installed, /Visual Studio Code\.app.*code --install-extension/);
 });
 
-test('the standalone installer uses the Positron extension CLI beside its desktop command', async () => {
+test('the standalone installer uses the Positron extension CLI beside its desktop command', SUBPROCESS, async () => {
   const result = await fixture(digest, ['positron'], '', false, ({ commands }) => {
     fs.writeFileSync(path.join(commands, 'positron'), '#!/usr/bin/env bash\nexit 99\n');
     const cli = path.join(commands, 'bin', 'positron');
@@ -127,6 +130,7 @@ test('the standalone installer uses the Positron extension CLI beside its deskto
 
 test.skipIf(process.platform === 'win32')(
   'the standalone installer verifies a download under a backslash temp path',
+  SUBPROCESS,
   async () => {
     const result = await fixture(digest, ['code'], '', false, ({ directory }) => {
       const tmpdir = path.join(directory, 'back\\slash');
@@ -138,21 +142,21 @@ test.skipIf(process.platform === 'win32')(
   },
 );
 
-test('the standalone installer rejects an uppercase digest as an invalid checksum file', async () => {
+test('the standalone installer rejects an uppercase digest as an invalid checksum file', SUBPROCESS, async () => {
   const result = await fixture(digest.toUpperCase(), ['code']);
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /Invalid Arc checksum file/);
   assert.equal(result.installed, '');
 });
 
-test('the standalone installer accepts one explicit editor CLI', async () => {
+test('the standalone installer accepts one explicit editor CLI', SUBPROCESS, async () => {
   const result = await fixture(digest, ['code', 'cursor'], '', true);
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.installed, /code --install-extension/);
   assert.doesNotMatch(result.installed, /cursor --install-extension/);
 });
 
-test('the standalone installer rejects a changed VSIX before opening the editor', async () => {
+test('the standalone installer rejects a changed VSIX before opening the editor', SUBPROCESS, async () => {
   const result = await fixture('0'.repeat(64), ['code']);
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /failed checksum verification/);

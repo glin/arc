@@ -1,4 +1,5 @@
 // plugins/arc-hooks/scripts/integration.test.js
+// @module-tag subprocess
 const assert = require('node:assert');
 const fs = require('node:fs');
 const path = require('node:path');

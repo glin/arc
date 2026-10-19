@@ -6,6 +6,9 @@ const os = require('node:os');
 const { spawn } = require('node:child_process');
 const { writeFileAtomically } = require('./persistence.js');
 
+// Tests that start real processes run in the locked test:subprocess lane.
+const SUBPROCESS = { tags: ['subprocess'] };
+
 function tmpRoot() {
   const d = fs.mkdtempSync(path.join(os.tmpdir(), 'arc-'));
   process.env.ARC_HOME = d;
@@ -543,7 +546,7 @@ test.each(['index.json', 'manifest.json', 'trigger'])(
   },
 );
 
-test.each(['edit', 'revert'])('overlapping Stops preserve the later %s publication', async (change) => {
+test.each(['edit', 'revert'])('overlapping Stops preserve the later %s publication', SUBPROCESS, async (change) => {
   const root = tmpRoot();
   const lib = require('./lib.js');
   const work = fs.mkdtempSync(path.join(os.tmpdir(), 'wk-'));
@@ -612,7 +615,7 @@ test.each(['edit', 'revert'])('overlapping Stops preserve the later %s publicati
   assert.equal(fs.existsSync(path.join(dir, 'trigger')), true);
 });
 
-test('concurrent baseline hooks retain every first touch', async () => {
+test('concurrent baseline hooks retain every first touch', SUBPROCESS, async () => {
   const root = tmpRoot();
   const work = fs.mkdtempSync(path.join(os.tmpdir(), 'wk-'));
   const gate = path.join(root, 'start');
@@ -685,7 +688,7 @@ test('concurrent baseline hooks retain every first touch', async () => {
   );
 });
 
-test('a wall-clock jump does not evict the writer inside the index lock', async () => {
+test('a wall-clock jump does not evict the writer inside the index lock', SUBPROCESS, async () => {
   const root = tmpRoot();
   const dir = path.join(root, 'clock-jump');
   const ready = path.join(root, 'writer-ready');

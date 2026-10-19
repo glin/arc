@@ -5,6 +5,9 @@ const path = require('node:path');
 const { spawnSync } = require('node:child_process');
 const { removeLegacyHooks } = require('./register-hooks.js');
 
+// Tests that start real processes run in the locked test:subprocess lane.
+const SUBPROCESS = { tags: ['subprocess'] };
+
 const legacyDir = path.join(__dirname, '..', 'hooks').replace(/\\/g, '/');
 
 function fixture(value) {
@@ -71,7 +74,7 @@ test('missing and malformed Claude settings are never replaced', () => {
   }
 });
 
-test('CLI migration uses both agent homes and leaves unrelated hooks unchanged', () => {
+test('CLI migration uses both agent homes and leaves unrelated hooks unchanged', SUBPROCESS, () => {
   const { dir, file } = fixture(
     JSON.stringify({
       hooks: {

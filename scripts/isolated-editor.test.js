@@ -5,6 +5,9 @@ const os = require('node:os');
 const path = require('node:path');
 const { pathToFileURL } = require('node:url');
 
+// Tests that start real processes run in the locked test:subprocess lane.
+const SUBPROCESS = { tags: ['subprocess'] };
+
 let editor;
 const roots = [];
 
@@ -337,36 +340,40 @@ describe('installed editor CLI', () => {
     assert.equal(JSON.parse(fs.readFileSync(path.join(layout.root, 'probe-vsix-install.json'))).candidate, probe);
   });
 
-  test('executes the exact Windows launcher selection with spaces and ignores other update directories', () => {
-    const relative = 'abcdef0123/resources/app/out/cli.js';
-    const fixture = cliFixture(relative);
-    writeLauncher(fixture.installation, relative);
-    for (const other of ['resources/app/out/cli.js', 'fffffffffe/resources/app/out/cli.js']) {
-      const cli = path.join(fixture.installation, other);
-      fs.mkdirSync(path.dirname(cli), { recursive: true });
-      fs.writeFileSync(cli, 'throw new Error("Wrong editor runtime");');
-    }
-    const selected = editor.editorCli(fixture.executable, 'win32');
-    const result = spawnSync(process.execPath, [selected, 'argument with spaces'], {
-      cwd: fixture.installation,
-      encoding: 'utf8',
-      timeout: 5000,
-      windowsHide: true,
-    });
-    assert.equal(result.error, undefined);
-    assert.equal(result.status, 0, result.stderr);
-    assert.deepEqual(JSON.parse(result.stdout).args, ['argument with spaces']);
-    assert.equal(selected, fixture.cli);
-    assert.equal(JSON.parse(result.stdout).cwd, fixture.installation);
-    fs.rmSync(path.join(fixture.installation, 'resources'), { recursive: true });
-    const versionedOnly = spawnSync(process.execPath, [editor.editorCli(fixture.executable, 'win32')], {
-      cwd: fixture.installation,
-      encoding: 'utf8',
-      timeout: 5000,
-      windowsHide: true,
-    });
-    assert.equal(versionedOnly.status, 0, versionedOnly.stderr);
-  });
+  test(
+    'executes the exact Windows launcher selection with spaces and ignores other update directories',
+    SUBPROCESS,
+    () => {
+      const relative = 'abcdef0123/resources/app/out/cli.js';
+      const fixture = cliFixture(relative);
+      writeLauncher(fixture.installation, relative);
+      for (const other of ['resources/app/out/cli.js', 'fffffffffe/resources/app/out/cli.js']) {
+        const cli = path.join(fixture.installation, other);
+        fs.mkdirSync(path.dirname(cli), { recursive: true });
+        fs.writeFileSync(cli, 'throw new Error("Wrong editor runtime");');
+      }
+      const selected = editor.editorCli(fixture.executable, 'win32');
+      const result = spawnSync(process.execPath, [selected, 'argument with spaces'], {
+        cwd: fixture.installation,
+        encoding: 'utf8',
+        timeout: 5000,
+        windowsHide: true,
+      });
+      assert.equal(result.error, undefined);
+      assert.equal(result.status, 0, result.stderr);
+      assert.deepEqual(JSON.parse(result.stdout).args, ['argument with spaces']);
+      assert.equal(selected, fixture.cli);
+      assert.equal(JSON.parse(result.stdout).cwd, fixture.installation);
+      fs.rmSync(path.join(fixture.installation, 'resources'), { recursive: true });
+      const versionedOnly = spawnSync(process.execPath, [editor.editorCli(fixture.executable, 'win32')], {
+        cwd: fixture.installation,
+        encoding: 'utf8',
+        timeout: 5000,
+        windowsHide: true,
+      });
+      assert.equal(versionedOnly.status, 0, versionedOnly.stderr);
+    },
+  );
 
   test('resolves readable flat Windows, Linux and macOS CLI layouts', () => {
     const flat = cliFixture();
@@ -406,6 +413,7 @@ describe('installed editor CLI', () => {
 
   test.skipIf(process.platform !== 'win32')(
     'installs from a long owned run directory through the selected Windows CLI',
+    SUBPROCESS,
     () => {
       const fixture = cliFixture('abcdef0123/resources/app/out/cli.js');
       writeLauncher(fixture.installation, 'abcdef0123/resources/app/out/cli.js');
@@ -1035,40 +1043,44 @@ describe('isolated editor launch', () => {
     }
   });
 
-  test.skipIf(process.platform !== 'win32')('starts a native child with a long owned run directory', async () => {
-    const checkout = fakeCheckout();
-    const parent = path.join(scratch(), ...Array(6).fill('owned editor run directory'));
-    const session = {};
-    let result;
-    globalThis.__isolatedEditorLaunch = async (options) => {
-      assert.ok(session.layout.root.length > 260);
-      assert.ok(fs.statSync(session.layout.root).isDirectory());
-      result = spawnSync(process.execPath, ['-p', 'process.cwd()'], {
-        ...options,
-        encoding: 'utf8',
-        windowsHide: true,
-      });
-      assert.equal(result.error, undefined);
-      assert.equal(result.status, 0, result.stderr);
-      assert.equal(result.stdout.trim(), checkout.install);
-      throw new Error('fixture native child completed');
-    };
-    try {
-      await assert.rejects(
-        editor.launchIsolatedEditor(
-          { repository: checkout.root, editor: checkout.install, scratch: parent, list: () => [] },
-          session,
-        ),
-        /fixture native child completed/,
-      );
-      assert.equal(result.status, 0);
-      assert.equal(session.manifest.profile, session.layout.userData);
-      assert.ok(fs.existsSync(session.layout.manifest));
-      assert.deepEqual(session.manifest.processes, []);
-    } finally {
-      delete globalThis.__isolatedEditorLaunch;
-    }
-  });
+  test.skipIf(process.platform !== 'win32')(
+    'starts a native child with a long owned run directory',
+    SUBPROCESS,
+    async () => {
+      const checkout = fakeCheckout();
+      const parent = path.join(scratch(), ...Array(6).fill('owned editor run directory'));
+      const session = {};
+      let result;
+      globalThis.__isolatedEditorLaunch = async (options) => {
+        assert.ok(session.layout.root.length > 260);
+        assert.ok(fs.statSync(session.layout.root).isDirectory());
+        result = spawnSync(process.execPath, ['-p', 'process.cwd()'], {
+          ...options,
+          encoding: 'utf8',
+          windowsHide: true,
+        });
+        assert.equal(result.error, undefined);
+        assert.equal(result.status, 0, result.stderr);
+        assert.equal(result.stdout.trim(), checkout.install);
+        throw new Error('fixture native child completed');
+      };
+      try {
+        await assert.rejects(
+          editor.launchIsolatedEditor(
+            { repository: checkout.root, editor: checkout.install, scratch: parent, list: () => [] },
+            session,
+          ),
+          /fixture native child completed/,
+        );
+        assert.equal(result.status, 0);
+        assert.equal(session.manifest.profile, session.layout.userData);
+        assert.ok(fs.existsSync(session.layout.manifest));
+        assert.deepEqual(session.manifest.processes, []);
+      } finally {
+        delete globalThis.__isolatedEditorLaunch;
+      }
+    },
+  );
 
   test('writes the manifest before the editor starts and records the main process after', async () => {
     const checkout = fakeCheckout();
@@ -1287,6 +1299,7 @@ describe('isolated editor cleanup', () => {
 
   test.skipIf(process.platform !== 'win32')(
     'the Windows stop compares the start time through the process handle before it stops the process',
+    SUBPROCESS,
     async () => {
       const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
       const exited = new Promise((resolve) => child.once('exit', resolve));
@@ -1846,7 +1859,7 @@ describe('isolated editor restore check', () => {
     assert.equal(report.ok, true, report.errors.join('\n'));
   });
 
-  test('stopping an editor waits for its processes to exit and names the wait when they stay', async () => {
+  test('stopping an editor waits for its processes to exit and names the wait when they stay', SUBPROCESS, async () => {
     const session = {};
     editor.createRun({ scratch: path.join(scratch(), 'stop parent') }, session);
     let polls = 0;
@@ -1940,47 +1953,51 @@ describe('isolated editor restore check', () => {
     ]);
   });
 
-  test('exports a revision without the repository index or review fixtures, links the dependencies, and builds it', async () => {
-    const repository = path.join(scratch(), 'source repo');
-    const files = {
-      'extension/package.json': '{"name":"arc","publisher":"glin"}',
-      'extension/esbuild.mjs':
-        "import fs from 'node:fs'; fs.mkdirSync('dist'); fs.writeFileSync('dist/extension.js', 'built');",
-      'evals/fixture.txt': 'fixture',
-    };
-    for (const [name, text] of Object.entries(files)) {
-      fs.mkdirSync(path.dirname(path.join(repository, name)), { recursive: true });
-      fs.writeFileSync(path.join(repository, name), text);
-    }
-    fs.mkdirSync(path.join(repository, 'extension', 'node_modules'));
-    fs.writeFileSync(path.join(repository, 'extension', 'node_modules', 'canary.txt'), 'kept');
-    const git = (...args) => {
-      const result = spawnSync('git', ['-C', repository, '-c', 'user.name=t', '-c', 'user.email=t@t', ...args], {
-        encoding: 'utf8',
+  test(
+    'exports a revision without the repository index or review fixtures, links the dependencies, and builds it',
+    SUBPROCESS,
+    async () => {
+      const repository = path.join(scratch(), 'source repo');
+      const files = {
+        'extension/package.json': '{"name":"arc","publisher":"glin"}',
+        'extension/esbuild.mjs':
+          "import fs from 'node:fs'; fs.mkdirSync('dist'); fs.writeFileSync('dist/extension.js', 'built');",
+        'evals/fixture.txt': 'fixture',
+      };
+      for (const [name, text] of Object.entries(files)) {
+        fs.mkdirSync(path.dirname(path.join(repository, name)), { recursive: true });
+        fs.writeFileSync(path.join(repository, name), text);
+      }
+      fs.mkdirSync(path.join(repository, 'extension', 'node_modules'));
+      fs.writeFileSync(path.join(repository, 'extension', 'node_modules', 'canary.txt'), 'kept');
+      const git = (...args) => {
+        const result = spawnSync('git', ['-C', repository, '-c', 'user.name=t', '-c', 'user.email=t@t', ...args], {
+          encoding: 'utf8',
+        });
+        assert.equal(result.status, 0, result.stderr);
+        return result.stdout.trim();
+      };
+      git('init', '-q');
+      git('add', 'extension/package.json', 'extension/esbuild.mjs', 'evals/fixture.txt');
+      git('commit', '-q', '-m', 'one');
+      const commit = git('rev-parse', 'HEAD');
+      fs.writeFileSync(path.join(repository, 'extension', 'esbuild.mjs'), 'throw new Error("working tree edit");');
+      const session = {};
+      editor.createRun({ scratch: path.join(scratch(), 'export parent') }, session);
+      const baseline = await editor.prepareBaseline(session, {
+        repository,
+        baselineCommit: 'HEAD',
       });
-      assert.equal(result.status, 0, result.stderr);
-      return result.stdout.trim();
-    };
-    git('init', '-q');
-    git('add', 'extension/package.json', 'extension/esbuild.mjs', 'evals/fixture.txt');
-    git('commit', '-q', '-m', 'one');
-    const commit = git('rev-parse', 'HEAD');
-    fs.writeFileSync(path.join(repository, 'extension', 'esbuild.mjs'), 'throw new Error("working tree edit");');
-    const session = {};
-    editor.createRun({ scratch: path.join(scratch(), 'export parent') }, session);
-    const baseline = await editor.prepareBaseline(session, {
-      repository,
-      baselineCommit: 'HEAD',
-    });
-    const tree = path.join(session.layout.root, editor.BASELINE_DIRECTORY);
-    assert.deepEqual(baseline, { repository: tree, label: commit });
-    assert.equal(fs.readFileSync(path.join(tree, 'extension', 'dist', 'extension.js'), 'utf8'), 'built');
-    assert.equal(fs.existsSync(path.join(tree, 'evals')), false);
-    assert.equal(fs.readFileSync(path.join(tree, 'extension', 'node_modules', 'canary.txt'), 'utf8'), 'kept');
-    assert.equal(git('status', '--porcelain', '--untracked-files=no'), 'M extension/esbuild.mjs');
-    await editor.closeIsolatedEditor(session, { list: () => [], clock: fakeClock() });
-    assert.equal(fs.readFileSync(path.join(repository, 'extension', 'node_modules', 'canary.txt'), 'utf8'), 'kept');
-  });
+      const tree = path.join(session.layout.root, editor.BASELINE_DIRECTORY);
+      assert.deepEqual(baseline, { repository: tree, label: commit });
+      assert.equal(fs.readFileSync(path.join(tree, 'extension', 'dist', 'extension.js'), 'utf8'), 'built');
+      assert.equal(fs.existsSync(path.join(tree, 'evals')), false);
+      assert.equal(fs.readFileSync(path.join(tree, 'extension', 'node_modules', 'canary.txt'), 'utf8'), 'kept');
+      assert.equal(git('status', '--porcelain', '--untracked-files=no'), 'M extension/esbuild.mjs');
+      await editor.closeIsolatedEditor(session, { list: () => [], clock: fakeClock() });
+      assert.equal(fs.readFileSync(path.join(repository, 'extension', 'node_modules', 'canary.txt'), 'utf8'), 'kept');
+    },
+  );
 
   // Steps that record their order and leave the real run directory for the cleanup to remove.
   function fakeSteps(parent, calls, overrides = {}) {
