@@ -60,12 +60,6 @@ vi.mock('node:child_process', async (importOriginal) => {
   };
 });
 
-let outputProducerBuild: Promise<string> | undefined;
-let outputProducerHome: string | undefined;
-afterAll(() => {
-  if (outputProducerHome) fs.rmSync(outputProducerHome, { recursive: true, force: true });
-});
-
 const session = 'aaaaaaaa-1111-2222-3333-444444444444';
 const homes: string[] = [];
 function fixture() {
@@ -94,6 +88,49 @@ afterEach(() => {
   vi.unstubAllEnvs();
   for (const home of homes.splice(0)) fs.rmSync(home, { recursive: true, force: true });
 });
+// Cases that start real child processes wait for the state they read and fail on this deadline.
+// One process start costs seconds on a machine that runs several test suites, so a shorter guess fails under load.
+const PROCESS_WAIT = { timeout: 60_000 };
+const PROCESS_CASE = 120_000;
+const bundleDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'arc-run-bundles-'));
+const bundles = new Map<string, Promise<string>>();
+afterAll(() => fs.rmSync(bundleDirectory, { recursive: true, force: true }));
+// Each entry is bundled once per file, so a case starts neither a bundler nor a TypeScript loader.
+function bundled(name: string, contents: string): Promise<string> {
+  let outfile = bundles.get(name);
+  if (!outfile) {
+    const file = path.join(bundleDirectory, name);
+    outfile = build({
+      stdin: { contents, resolveDir: path.resolve('..') },
+      bundle: true,
+      platform: 'node',
+      format: 'cjs',
+      outfile: file,
+      logLevel: 'silent',
+    }).then(() => file);
+    bundles.set(name, outfile);
+  }
+  return outfile;
+}
+const outputEntry = () =>
+  bundled(
+    'output-entry.cjs',
+    `import {produceStandaloneOutput} from './cli/src/standalone.ts';import {DispatchReceipts} from './extension/src/dispatchreceipts.ts';produceStandaloneOutput(new DispatchReceipts(),process.argv[3]).catch(e=>{console.error(e);process.exitCode=1});`,
+  );
+const supervisorEntry = () =>
+  bundled(
+    'supervisor-entry.cjs',
+    `import {DispatchReceipts} from './extension/src/dispatchreceipts.ts';import {superviseStandalone} from './cli/src/standalone.ts';superviseStandalone(new DispatchReceipts(process.argv[2]),process.argv[3],false).catch(e=>{console.error(e);process.exitCode=1});`,
+  );
+const processAlive = (pid: number) => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ESRCH') return false;
+    throw error;
+  }
+};
 function frames() {
   const frame = new StandaloneFrames('codex', null);
   frame.line(JSON.stringify({ type: 'thread.started', thread_id: session }));
@@ -250,24 +287,6 @@ function claudePrintFixture() {
   const receipts = new DispatchReceipts(home);
   const launch = admitParsed(receipts, parsed);
   return { home, parsed, options, file, receipts, launch, child: providerChild() };
-}
-function buildOutputEntry(): Promise<string> {
-  return (outputProducerBuild ??= (async () => {
-    outputProducerHome = fs.mkdtempSync(path.join(os.tmpdir(), 'arc-output-producer-'));
-    const entry = path.join(outputProducerHome!, 'output-entry.cjs');
-    await build({
-      stdin: {
-        contents: `import {produceStandaloneOutput} from './cli/src/standalone.ts';import {DispatchReceipts} from './extension/src/dispatchreceipts.ts';produceStandaloneOutput(new DispatchReceipts(),process.argv[3]).catch(e=>{console.error(e);process.exitCode=1});`,
-        resolveDir: path.resolve('..'),
-      },
-      bundle: true,
-      platform: 'node',
-      format: 'cjs',
-      outfile: entry,
-      logLevel: 'silent',
-    });
-    return entry;
-  })());
 }
 test.each(['missing', 'different', 'oversized'] as const)(
   'qualified Codex disagreement retains failure for %s reports',
@@ -1758,15 +1777,7 @@ test(
   { timeout: 30_000 },
   async () => {
     const { receipts, launch, options, release, started, script, markerRelease } = workerFixture('', 10_000, true);
-    const runner = path.join(options.cwd, 'supervisor.mjs');
-    fs.writeFileSync(
-      runner,
-      `import {DispatchReceipts} from ${JSON.stringify(new URL('../../extension/src/dispatchreceipts.ts', import.meta.url).href)};
-import {superviseStandalone} from ${JSON.stringify(new URL('../src/standalone.ts', import.meta.url).href)};
-await superviseStandalone(new DispatchReceipts(${JSON.stringify(options.cwd)}),${JSON.stringify(launch.launchId)},false);`,
-    );
-    const supervisor = spawn(process.execPath, ['--import', 'tsx', runner], {
-      cwd: new URL('..', import.meta.url),
+    const supervisor = spawn(process.execPath, [await supervisorEntry(), options.cwd, launch.launchId], {
       stdio: 'ignore',
       windowsHide: true,
     });
@@ -1786,8 +1797,15 @@ await superviseStandalone(new DispatchReceipts(${JSON.stringify(options.cwd)}),$
       fs.writeFileSync(markerRelease, 'ready');
       await marker;
       assert.equal(owned.pid, Number(fs.readFileSync(started, 'utf8').trim()));
-      assert.ok((await standaloneProcessIdentity(owned.pid))?.commandLine.includes(script));
+      // This is the only direct operating-system read. The supervisor reads once more in its own process.
       const native = await standaloneProcessIdentity(owned.pid);
+      assert.ok(native?.commandLine.includes(script));
+      // Later recovery passes read this process through the saved native identity while it lives, so they start no shell.
+      const runtime = {
+        now: Date.now,
+        identity: async (pid: number) => (pid === owned.pid && processAlive(pid) ? native : null),
+        yield: () => new Promise<void>((resolve) => setImmediate(resolve)),
+      };
       assert.equal(owned.startedAt, native?.startedAt);
       assert.equal(owned.command, native?.command);
       assert.equal(owned.commandLineSha256, payloadSha256(native!.commandLine));
@@ -1800,12 +1818,12 @@ await superviseStandalone(new DispatchReceipts(${JSON.stringify(options.cwd)}),$
         ...retained,
         launcher: { ...owned, startedAt: 'different-lifetime' },
       });
-      await superviseStandalone(receipts, launch.launchId, true, { frameBytes: 256, readBytes: 17 });
+      await superviseStandalone(receipts, launch.launchId, true, { frameBytes: 256, readBytes: 17 }, runtime);
       assert.equal(receipts.observation(launch.launchId)?.monitor, 'unavailable');
       assert.equal(receipts.latest(launch.launchId), null);
-      assert.equal((await standaloneProcessIdentity(owned.pid))?.startedAt, owned.startedAt);
+      assert.equal((await runtime.identity(owned.pid))?.startedAt, owned.startedAt);
       receipts.observation(launch.launchId, retained);
-      const resumed = superviseStandalone(receipts, launch.launchId, true, { frameBytes: 256, readBytes: 17 });
+      const resumed = superviseStandalone(receipts, launch.launchId, true, { frameBytes: 256, readBytes: 17 }, runtime);
       await vi.waitFor(() => assert.notEqual(receipts.observation(launch.launchId)?.supervisor.pid, supervisor.pid));
       await assert.rejects(superviseStandalone(receipts, launch.launchId, true), /Another process/);
       assert.equal(receipts.latest(launch.launchId), null);
@@ -1837,10 +1855,7 @@ await superviseStandalone(new DispatchReceipts(${JSON.stringify(options.cwd)}),$
         supervisor.kill();
         await closed;
       }
-      if (original)
-        await vi.waitFor(async () => assert.equal(await standaloneProcessIdentity(original!.pid), null), {
-          timeout: 10_000,
-        });
+      if (original) await vi.waitFor(() => assert.equal(processAlive(original!.pid), false), { timeout: 10_000 });
     }
   },
 );
@@ -3839,7 +3854,7 @@ test.each([false, true])(
 const lateFinish=()=>{if(!fs.existsSync(path.join(process.cwd(),'${finalSignalName}')))return;lateWatcher.close();fs.writeFileSync(process.argv[process.argv.indexOf('-o')+1],'Report');fs.writeSync(${stderrEnding ? 2 : 1},${JSON.stringify(terminal)});};
 const lateWatcher=fs.watch(process.cwd(),lateFinish);lateFinish();return;`;
     const { receipts, launch, options, started, release } = workerFixture(extra, 10_000, false, true);
-    const entry = await buildOutputEntry();
+    const entry = await outputEntry();
     const owner = () => artifactJson(receipts, launch.launchId, 'output-owner.json');
     const alias = launch.standalone!.logAlias!;
     const bounds = { frameBytes: 512_000, readBytes: 17, workBytes: 512 };
@@ -3999,134 +4014,135 @@ test('reused explicit log and report aliases keep each launch capture and frozen
   assert.deepEqual(fs.readFileSync(log), aliasBefore);
 });
 
-test('background log continues after observation and recovers without taking a reused alias', async () => {
-  const { receipts, launch, options, script, calls } = backgroundFixture(true);
-  const registry = path.join(options.cwd, 'registry.json');
-  const native = path.join(options.cwd, 'native-output');
-  const registryEntry = { id: 'deadbeef', sessionId: session, state: 'working', pid: process.pid };
-  fs.writeFileSync(registry, JSON.stringify([registryEntry]));
-  const first = Buffer.concat([Buffer.from('Native prefix\n'), Buffer.alloc(270_000, 255)]);
-  fs.writeFileSync(native, first);
-  fs.writeFileSync(
-    script,
-    `const fs=require('node:fs');const args=process.argv.slice(2);fs.appendFileSync(${JSON.stringify(calls)},JSON.stringify({args})+'\\n');if(args.includes('--bg')){process.stdin.resume();process.stdin.on('end',()=>console.log('backgrounded · deadbeef · ${options.name}'));}else if(args[0]==='agents')process.stdout.write(fs.readFileSync(${JSON.stringify(registry)}));else if(args[0]==='logs'){if(args[1]!=='deadbeef')process.exitCode=1;else fs.writeSync(1,fs.readFileSync(${JSON.stringify(native)}));}`,
-  );
-  const entry = await buildOutputEntry();
-  const owner = () => artifactJson(receipts, launch.launchId, 'output-owner.json');
-  const capturedNative = receipts.artifact(launch.launchId, 'native.log');
-  const bounds = { frameBytes: 512_000, readBytes: 17, workBytes: 512 };
-  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
-  let now = 0;
-  vi.spyOn(Date, 'now').mockImplementation(() => now);
-  const pending = superviseStandalone(receipts, launch.launchId, false, bounds, undefined, undefined, false, entry);
-  const pids = new Set<number>();
-  let secondCapture: ReturnType<DispatchReceipts['capture']> | undefined;
-  try {
-    await vi.waitFor(() => assert.ok(fs.readFileSync(options.logAlias!).equals(first)), { timeout: 5000 });
-    pids.add(owner().pid);
-    now = options.deadlineMs;
-    await vi.advanceTimersByTimeAsync(options.deadlineMs);
-    await pending;
-    assert.equal(receipts.observation(launch.launchId)?.monitor, 'timed-out');
-    assert.equal(receipts.observation(launch.launchId)?.exitCode, null);
-    assert.equal(receipts.observation(launch.launchId)?.worker, null);
-    assert.equal(owner().backgroundId, 'deadbeef');
-    assert.equal(owner().state, 'capturing');
-    const frozen = publishAvailable(receipts, launch.launchId, 'unknown', 'Frozen response');
-    fs.writeFileSync(registry, '[]');
-    const late = Buffer.concat([Buffer.from('Late bytes\n'), Buffer.alloc(280_000, 254)]);
-    fs.appendFileSync(native, late);
-    const combined = Buffer.concat([first, late]);
-    await vi.waitFor(() => assert.ok(fs.readFileSync(options.logAlias!).equals(combined)), { timeout: 8000 });
-    assert.equal(owner().state, 'capturing');
-    let recovered1 = false;
-    const recovery1 = superviseStandalone(
-      receipts,
-      launch.launchId,
-      true,
-      bounds,
-      undefined,
-      undefined,
-      false,
-      entry,
-    ).finally(() => {
-      recovered1 = true;
-    });
-    await vi.waitFor(() => assert.ok(recovered1), { timeout: 5000 });
-    await recovery1;
-    const spawned = vi.mocked(childProcess.spawn);
-    const duplicateIndex = spawned.mock.calls.map((args) => args[1]?.[0] === entry).lastIndexOf(true);
-    const duplicate = spawned.mock.results[duplicateIndex].value as ChildProcess;
-    await vi.waitFor(() => assert.ok(duplicate.exitCode !== null || duplicate.signalCode !== null), { timeout: 5000 });
-    assert.equal(owner().pid, [...pids][0]);
-    const second = receipts.reserve({ ...launch, origin: 'e'.repeat(24) });
-    secondCapture = receipts.capture(second.launchId);
-    secondCapture.native(Buffer.from('Second launch'));
-    assert.equal(fs.readFileSync(options.logAlias!, 'utf8'), 'Second launch');
-    fs.renameSync(capturedNative, capturedNative + '.saved');
-    fs.mkdirSync(capturedNative);
-    fs.appendFileSync(native, 'Survives capture failure\n');
-    await vi.waitFor(() => assert.equal(owner().state, 'unavailable'), { timeout: 8000 });
-    await vi.waitFor(() => assert.throws(() => process.kill(owner().pid, 0), { code: 'ESRCH' }), { timeout: 5000 });
-    assert.equal(
-      fs.readFileSync(native).equals(Buffer.concat([combined, Buffer.from('Survives capture failure\n')])),
-      true,
+test(
+  'background log continues after observation and recovers without taking a reused alias',
+  async () => {
+    const { receipts, launch, options, script, calls } = backgroundFixture(true);
+    const registry = path.join(options.cwd, 'registry.json');
+    const native = path.join(options.cwd, 'native-output');
+    const registryEntry = { id: 'deadbeef', sessionId: session, state: 'working', pid: process.pid };
+    fs.writeFileSync(registry, JSON.stringify([registryEntry]));
+    const first = Buffer.concat([Buffer.from('Native prefix\n'), Buffer.alloc(270_000, 255)]);
+    fs.writeFileSync(native, first);
+    fs.writeFileSync(
+      script,
+      `const fs=require('node:fs');const args=process.argv.slice(2);fs.appendFileSync(${JSON.stringify(calls)},JSON.stringify({args})+'\\n');if(args.includes('--bg')){process.stdin.resume();process.stdin.on('end',()=>console.log('backgrounded · deadbeef · ${options.name}'));}else if(args[0]==='agents')process.stdout.write(fs.readFileSync(${JSON.stringify(registry)}));else if(args[0]==='logs'){if(args[1]!=='deadbeef')process.exitCode=1;else fs.writeSync(1,fs.readFileSync(${JSON.stringify(native)}));}`,
     );
-    fs.rmdirSync(capturedNative);
-    fs.renameSync(capturedNative + '.saved', capturedNative);
-    fs.writeFileSync(registry, JSON.stringify([{ ...registryEntry, state: 'stopped' }]));
-    let recovered2 = false;
-    const recovery2 = superviseStandalone(
-      receipts,
-      launch.launchId,
-      true,
-      bounds,
-      undefined,
-      undefined,
-      false,
-      entry,
-    ).finally(() => {
-      recovered2 = true;
-    });
-    await vi.waitFor(() => assert.ok(recovered2), { timeout: 5000 });
-    await recovery2;
-    await vi.waitFor(
-      () => {
+    const entry = await outputEntry();
+    const owner = () => artifactJson(receipts, launch.launchId, 'output-owner.json');
+    const capturedNative = receipts.artifact(launch.launchId, 'native.log');
+    const bounds = { frameBytes: 512_000, readBytes: 17, workBytes: 512 };
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    let now = 0;
+    vi.spyOn(Date, 'now').mockImplementation(() => now);
+    const pending = superviseStandalone(receipts, launch.launchId, false, bounds, undefined, undefined, false, entry);
+    const pids = new Set<number>();
+    let secondCapture: ReturnType<DispatchReceipts['capture']> | undefined;
+    try {
+      await vi.waitFor(() => assert.ok(fs.readFileSync(options.logAlias!).equals(first)), PROCESS_WAIT);
+      pids.add(owner().pid);
+      now = options.deadlineMs;
+      await vi.advanceTimersByTimeAsync(options.deadlineMs);
+      await pending;
+      assert.equal(receipts.observation(launch.launchId)?.monitor, 'timed-out');
+      assert.equal(receipts.observation(launch.launchId)?.exitCode, null);
+      assert.equal(receipts.observation(launch.launchId)?.worker, null);
+      assert.equal(owner().backgroundId, 'deadbeef');
+      assert.equal(owner().state, 'capturing');
+      const frozen = publishAvailable(receipts, launch.launchId, 'unknown', 'Frozen response');
+      fs.writeFileSync(registry, '[]');
+      const late = Buffer.concat([Buffer.from('Late bytes\n'), Buffer.alloc(280_000, 254)]);
+      fs.appendFileSync(native, late);
+      const combined = Buffer.concat([first, late]);
+      await vi.waitFor(() => assert.ok(fs.readFileSync(options.logAlias!).equals(combined)), PROCESS_WAIT);
+      assert.equal(owner().state, 'capturing');
+      let recovered1 = false;
+      const recovery1 = superviseStandalone(
+        receipts,
+        launch.launchId,
+        true,
+        bounds,
+        undefined,
+        undefined,
+        false,
+        entry,
+      ).finally(() => {
+        recovered1 = true;
+      });
+      await vi.waitFor(() => assert.ok(recovered1), PROCESS_WAIT);
+      await recovery1;
+      const spawned = vi.mocked(childProcess.spawn);
+      const duplicateIndex = spawned.mock.calls.map((args) => args[1]?.[0] === entry).lastIndexOf(true);
+      const duplicate = spawned.mock.results[duplicateIndex].value as ChildProcess;
+      await vi.waitFor(() => assert.ok(duplicate.exitCode !== null || duplicate.signalCode !== null), PROCESS_WAIT);
+      assert.equal(owner().pid, [...pids][0]);
+      const second = receipts.reserve({ ...launch, origin: 'e'.repeat(24) });
+      secondCapture = receipts.capture(second.launchId);
+      secondCapture.native(Buffer.from('Second launch'));
+      assert.equal(fs.readFileSync(options.logAlias!, 'utf8'), 'Second launch');
+      fs.renameSync(capturedNative, capturedNative + '.saved');
+      fs.mkdirSync(capturedNative);
+      fs.appendFileSync(native, 'Survives capture failure\n');
+      await vi.waitFor(() => assert.equal(owner().state, 'unavailable'), PROCESS_WAIT);
+      await vi.waitFor(() => assert.throws(() => process.kill(owner().pid, 0), { code: 'ESRCH' }), PROCESS_WAIT);
+      assert.equal(
+        fs.readFileSync(native).equals(Buffer.concat([combined, Buffer.from('Survives capture failure\n')])),
+        true,
+      );
+      fs.rmdirSync(capturedNative);
+      fs.renameSync(capturedNative + '.saved', capturedNative);
+      fs.writeFileSync(registry, JSON.stringify([{ ...registryEntry, state: 'stopped' }]));
+      let recovered2 = false;
+      const recovery2 = superviseStandalone(
+        receipts,
+        launch.launchId,
+        true,
+        bounds,
+        undefined,
+        undefined,
+        false,
+        entry,
+      ).finally(() => {
+        recovered2 = true;
+      });
+      await vi.waitFor(() => assert.ok(recovered2), PROCESS_WAIT);
+      await recovery2;
+      await vi.waitFor(() => {
         assert.notEqual(owner().pid, [...pids][0]);
         pids.add(owner().pid);
         assert.equal(owner().state, 'finished');
-      },
-      { timeout: 8000 },
-    );
-    assert.equal(fs.readFileSync(capturedNative).equals(fs.readFileSync(native)), true);
-    assert.equal(fs.readFileSync(options.logAlias!, 'utf8'), 'Second launch');
-    assert.equal((receipts.result(launch.launchId, frozen.eventId) as any).text, 'Frozen response');
-    const position = artifactJson(receipts, launch.launchId, 'capture.json');
-    assert.equal(position.sources['native-source.log'].offset, fs.statSync(native).size);
-    const invoked = readJsonLines(calls);
-    assert.equal(invoked.filter((row) => row.args.includes('--bg')).length, 1);
-    assert.ok(invoked.filter((row) => row.args[0] === 'logs').every((row) => row.args[1] === 'deadbeef'));
-    assert.equal(receipts.latest(launch.launchId)?.eventId, frozen.eventId);
-  } finally {
-    fs.writeFileSync(registry, JSON.stringify([{ ...registryEntry, state: 'stopped' }]));
-    if (fs.existsSync(capturedNative) && fs.statSync(capturedNative).isDirectory()) {
-      fs.rmdirSync(capturedNative);
-      fs.renameSync(capturedNative + '.saved', capturedNative);
+      }, PROCESS_WAIT);
+      assert.equal(fs.readFileSync(capturedNative).equals(fs.readFileSync(native)), true);
+      assert.equal(fs.readFileSync(options.logAlias!, 'utf8'), 'Second launch');
+      assert.equal((receipts.result(launch.launchId, frozen.eventId) as any).text, 'Frozen response');
+      const position = artifactJson(receipts, launch.launchId, 'capture.json');
+      assert.equal(position.sources['native-source.log'].offset, fs.statSync(native).size);
+      const invoked = readJsonLines(calls);
+      assert.equal(invoked.filter((row) => row.args.includes('--bg')).length, 1);
+      assert.ok(invoked.filter((row) => row.args[0] === 'logs').every((row) => row.args[1] === 'deadbeef'));
+      assert.equal(receipts.latest(launch.launchId)?.eventId, frozen.eventId);
+    } finally {
+      fs.writeFileSync(registry, JSON.stringify([{ ...registryEntry, state: 'stopped' }]));
+      if (fs.existsSync(capturedNative) && fs.statSync(capturedNative).isDirectory()) {
+        fs.rmdirSync(capturedNative);
+        fs.renameSync(capturedNative + '.saved', capturedNative);
+      }
+      now += options.deadlineMs;
+      await vi.advanceTimersByTimeAsync(options.deadlineMs);
+      await pending.catch(() => {});
+      if (fs.existsSync(receipts.artifact(launch.launchId, 'output-owner.json'))) pids.add(owner().pid);
+      for (const pid of pids)
+        await vi.waitFor(() => assert.throws(() => process.kill(pid, 0), { code: 'ESRCH' }), PROCESS_WAIT);
+      for (const [index, args] of vi.mocked(childProcess.spawn).mock.calls.entries()) {
+        if (args[1]?.[0] !== entry) continue;
+        const child = vi.mocked(childProcess.spawn).mock.results[index].value as ChildProcess;
+        await vi.waitFor(() => assert.ok(child.exitCode !== null || child.signalCode !== null), PROCESS_WAIT);
+      }
+      secondCapture?.close();
     }
-    now += options.deadlineMs;
-    await vi.advanceTimersByTimeAsync(options.deadlineMs);
-    await pending.catch(() => {});
-    if (fs.existsSync(receipts.artifact(launch.launchId, 'output-owner.json'))) pids.add(owner().pid);
-    for (const pid of pids)
-      await vi.waitFor(() => assert.throws(() => process.kill(pid, 0), { code: 'ESRCH' }), { timeout: 8000 });
-    for (const [index, args] of vi.mocked(childProcess.spawn).mock.calls.entries()) {
-      if (args[1]?.[0] !== entry) continue;
-      const child = vi.mocked(childProcess.spawn).mock.results[index].value as ChildProcess;
-      await vi.waitFor(() => assert.ok(child.exitCode !== null || child.signalCode !== null), { timeout: 8000 });
-    }
-    secondCapture?.close();
-  }
-}, 35_000);
+  },
+  PROCESS_CASE,
+);
 
 test.each(['done', 'missing'] as const)(
   'background log producer drains final bytes and handles %s without changing results',

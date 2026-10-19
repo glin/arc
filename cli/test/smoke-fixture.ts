@@ -97,6 +97,10 @@ const setupReply = {
   ],
 };
 
+// The slowest cases that start compiled-CLI processes took at most 14.7 s while twelve other processes
+// started in a loop. Their deadline is six times that.
+const PROCESS_CASE = 90_000;
+
 export {
   skillFiles,
   collectWindow,
@@ -111,4 +115,5 @@ export {
   expectedVersion,
   smokeEnv,
   setupReply,
+  PROCESS_CASE,
 };

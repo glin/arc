@@ -35,6 +35,7 @@ import {
   collectProcessAncestry,
   integratedTerminal,
   localTerminalPlacement,
+  PROCESS_COLLECTION_EXPIRED,
   validAncestry,
   validTerminalOrigin,
   validTerminalOwner,
@@ -1143,8 +1144,13 @@ export async function requestWindow(
       if (!localTerminalPlacement()) throw new Error('Select this Arc window with --window in this terminal.');
       try {
         ancestry = await collectProcessAncestry();
-      } catch {
-        throw new Error('The terminal owner is unavailable. Select this Arc window with --window.');
+      } catch (error) {
+        if (error instanceof Error && error.message === PROCESS_COLLECTION_EXPIRED)
+          throw new Error(
+            'Reading the terminal process list took too long. Run the command again or select this Arc window with --window.',
+            { cause: error },
+          );
+        throw new Error('The terminal owner is unavailable. Select this Arc window with --window.', { cause: error });
       }
     }
     let origin: TerminalOrigin | undefined;

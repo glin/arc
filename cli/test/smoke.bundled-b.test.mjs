@@ -7,7 +7,7 @@ import { mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'vitest';
-import { cli, smokeEnv } from './smoke-fixture.ts';
+import { cli, smokeEnv, PROCESS_CASE } from './smoke-fixture.ts';
 
 test('bundled read validates bounded attribution and capability before retaining curation retries', async () => {
   const home = mkdtempSync(join(realpathSync(tmpdir()), 'arc read smoke '));
@@ -138,236 +138,246 @@ test('bundled filter commands retrieve selected identities and clear through an 
 });
 
 // This packaged check catches argument routing and unwanted dispatch receipts with one local channel.
-test('bundled management commands carry reader-default classification, prompt files and curation without implicit receipts', async () => {
-  const home = mkdtempSync(join(realpathSync(tmpdir()), 'arc management smoke '));
-  const channel = new WindowChannel(home);
-  const run = promisify(execFile);
-  const requests = [];
-  channel.setDispatchHandler(() => null);
-  channel.setRequestHandler((request) => {
-    requests.push(request);
-    return request.method === 'start'
-      ? { status: 'accepted', provider: request.params.setup.agent, sessionId: 'accepted' }
-      : { status: 'applied' };
-  });
-  try {
-    await channel.update({ folders: [home], scopeReady: true, panelReady: true, panelVisible: true });
-    const env = { ...smokeEnv, CLAUDE_CODE_SESSION_ID: 'coordinator', ARC_HOME: home, ARC_WINDOW: channel.hostId };
-    const prompt = join(home, 'initial prompt.txt');
-    writeFileSync(prompt, 'Review this project.');
-    for (const [provider, tagged] of [
-      ['claude', false],
-      ['codex', true],
-    ]) {
-      const args = [
-        cli,
-        'start',
-        '--provider',
-        provider,
-        '--model',
-        'runtime-model',
-        '--effort',
-        'runtime-effort',
-        '--prompt-file',
-        prompt,
-        '--name',
-        'Review',
-        '--label',
-        'Initial',
-        '--pinned',
-        ...(tagged ? ['--arc-dispatch'] : []),
-      ];
-      const output = await run(process.execPath, args, { env, encoding: 'utf8' });
-      assert.equal(requests.at(-1).params.agentRun, false);
-      assert.equal(requests.at(-1).params.prompt, 'Review this project.');
-      if (tagged) {
-        const receipt = JSON.parse(output.stdout.trim().split('\n')[1].slice('ARC_DISPATCH_SESSION='.length));
-        assert.equal(receipt.agent, provider);
-        assert.equal(receipt.owned, true);
-      } else assert.equal(output.stdout.includes('ARC_DISPATCH_SESSION='), false);
-    }
-    await run(process.execPath, [cli, 'label', 'remove', 'accepted', '--label', 'Initial', '--dry-run'], { env });
-    assert.equal(requests.at(-1).params.action, 'label-remove');
-    assert.equal(requests.at(-1).params.dryRun, true);
-    await run(process.execPath, [cli, 'archive', 'accepted', '--force'], { env });
-    assert.equal(requests.at(-1).params.force, true);
-    for (const cwd of [home, process.cwd()]) {
+test(
+  'bundled management commands carry reader-default classification, prompt files and curation without implicit receipts',
+  async () => {
+    const home = mkdtempSync(join(realpathSync(tmpdir()), 'arc management smoke '));
+    const channel = new WindowChannel(home);
+    const run = promisify(execFile);
+    const requests = [];
+    channel.setDispatchHandler(() => null);
+    channel.setRequestHandler((request) => {
+      requests.push(request);
+      return request.method === 'start'
+        ? { status: 'accepted', provider: request.params.setup.agent, sessionId: 'accepted' }
+        : { status: 'applied' };
+    });
+    try {
+      await channel.update({ folders: [home], scopeReady: true, panelReady: true, panelVisible: true });
+      const env = { ...smokeEnv, CLAUDE_CODE_SESSION_ID: 'coordinator', ARC_HOME: home, ARC_WINDOW: channel.hostId };
+      const prompt = join(home, 'initial prompt.txt');
+      writeFileSync(prompt, 'Review this project.');
+      for (const [provider, tagged] of [
+        ['claude', false],
+        ['codex', true],
+      ]) {
+        const args = [
+          cli,
+          'start',
+          '--provider',
+          provider,
+          '--model',
+          'runtime-model',
+          '--effort',
+          'runtime-effort',
+          '--prompt-file',
+          prompt,
+          '--name',
+          'Review',
+          '--label',
+          'Initial',
+          '--pinned',
+          ...(tagged ? ['--arc-dispatch'] : []),
+        ];
+        const output = await run(process.execPath, args, { env, encoding: 'utf8' });
+        assert.equal(requests.at(-1).params.agentRun, false);
+        assert.equal(requests.at(-1).params.prompt, 'Review this project.');
+        if (tagged) {
+          const receipt = JSON.parse(output.stdout.trim().split('\n')[1].slice('ARC_DISPATCH_SESSION='.length));
+          assert.equal(receipt.agent, provider);
+          assert.equal(receipt.owned, true);
+        } else assert.equal(output.stdout.includes('ARC_DISPATCH_SESSION='), false);
+      }
+      await run(process.execPath, [cli, 'label', 'remove', 'accepted', '--label', 'Initial', '--dry-run'], { env });
+      assert.equal(requests.at(-1).params.action, 'label-remove');
+      assert.equal(requests.at(-1).params.dryRun, true);
+      await run(process.execPath, [cli, 'archive', 'accepted', '--force'], { env });
+      assert.equal(requests.at(-1).params.force, true);
+      for (const cwd of [home, process.cwd()]) {
+        await run(
+          process.execPath,
+          [cli, 'start', '--provider', 'codex', '--prompt-file', prompt, '--read-only', '--cwd', '.'],
+          { env, cwd },
+        );
+        assert.equal(requests.at(-1).params.cwd, realpathSync(cwd));
+        assert.equal(requests.at(-1).params.readOnly, true);
+        assert.equal(requests.at(-1).params.agentRun, false);
+      }
       await run(
         process.execPath,
-        [cli, 'start', '--provider', 'codex', '--prompt-file', prompt, '--read-only', '--cwd', '.'],
-        { env, cwd },
+        [
+          cli,
+          'start',
+          '--provider',
+          'claude',
+          '--prompt-file',
+          prompt,
+          '--read-only',
+          '--read-tool',
+          'mcp__server__read',
+          '--read-tool',
+          'mcp__server__list',
+        ],
+        { env },
       );
-      assert.equal(requests.at(-1).params.cwd, realpathSync(cwd));
-      assert.equal(requests.at(-1).params.readOnly, true);
-      assert.equal(requests.at(-1).params.agentRun, false);
-    }
-    await run(
-      process.execPath,
-      [
-        cli,
-        'start',
-        '--provider',
-        'claude',
-        '--prompt-file',
-        prompt,
-        '--read-only',
-        '--read-tool',
-        'mcp__server__read',
-        '--read-tool',
-        'mcp__server__list',
-      ],
-      { env },
-    );
-    assert.deepEqual(requests.at(-1).params.readTools, ['mcp__server__read', 'mcp__server__list']);
-    const before = requests.length;
-    await assert.rejects(
-      run(process.execPath, [cli, 'start', '--provider', 'codex', '--prompt-file', prompt, '--agent-run=yes'], { env }),
-      (error) => error.code === 1 && /--agent-run accepts only true or false/.test(error.stderr),
-    );
-    assert.equal(requests.length, before, 'invalid classification never reaches the host');
-  } finally {
-    await channel.dispose();
-    rmSync(home, { recursive: true, force: true });
-  }
-});
-
-test('bundled self compaction uses read-only readiness, one admission and observation without retries', async () => {
-  const home = mkdtempSync(join(realpathSync(tmpdir()), 'arc compact smoke '));
-  const channel = new WindowChannel(home);
-  const run = promisify(execFile);
-  const requests = [];
-  let ready = true;
-  let terminal = null;
-  let loseReply = false;
-  const readyTimes = [];
-  channel.setCompactRequestHandler(async (request) => {
-    requests.push(request);
-    if (request.method === 'compact-ready') readyTimes.push(Date.now());
-    if (request.method === 'compact-ready') return ready ? { ready } : (terminal ?? { ready });
-    if (request.method === 'compact-request' && loseReply) {
+      assert.deepEqual(requests.at(-1).params.readTools, ['mcp__server__read', 'mcp__server__list']);
+      const before = requests.length;
+      await assert.rejects(
+        run(process.execPath, [cli, 'start', '--provider', 'codex', '--prompt-file', prompt, '--agent-run=yes'], {
+          env,
+        }),
+        (error) => error.code === 1 && /--agent-run accepts only true or false/.test(error.stderr),
+      );
+      assert.equal(requests.length, before, 'invalid classification never reaches the host');
+    } finally {
       await channel.dispose();
-      return {};
+      rmSync(home, { recursive: true, force: true });
     }
-    return { state: 'queued', requestId: request.params.requestId };
-  });
-  try {
-    await channel.update({ folders: [home], scopeReady: true, panelReady: true, panelVisible: true });
-    const env = { ...smokeEnv, ARC_HOME: home };
-    const requestId = channel.hostId + ':aaaaaaaa-1111-2222-3333-444444444444';
-    const args = [
-      cli,
-      'compact',
-      'request',
-      '--self',
-      '--after-turn',
-      '--request-id',
-      requestId,
-      '--window',
-      channel.hostId,
-      '--json',
-    ];
-    const output = await run(process.execPath, args, { env });
-    assert.equal(JSON.parse(output.stdout).state, 'queued');
-    assert.deepEqual(
-      requests.map((r) => r.method),
-      ['compact-ready', 'compact-request'],
-    );
-    assert.equal(requests[1].id, requestId);
-    await run(
-      process.execPath,
-      [cli, 'compact', 'status', '--request-id', requestId, '--window', channel.hostId, '--json'],
-      { env },
-    );
-    assert.equal(requests.at(-1).method, 'compact-status');
-    const continuationFile = join(home, 'next turn.txt').replaceAll('\\', '/');
-    const continuation = '  Continue "once".\r\nWrite café.\r\n';
-    writeFileSync(continuationFile, continuation);
-    const digest = createHash('sha256').update(continuation).digest('hex');
-    const continuationArgs = [
-      ...args.slice(0, 5),
-      '--continuation-file',
-      continuationFile,
-      '--continuation-sha256',
-      digest,
-      ...args.slice(5),
-    ];
-    assert.equal(JSON.parse((await run(process.execPath, continuationArgs, { env })).stdout).state, 'queued');
-    assert.deepEqual(requests.at(-1).params.continuation, { text: continuation, sha256: digest });
-    const originalWindow = 'b'.repeat(24);
-    await run(
-      process.execPath,
-      [
+  },
+  PROCESS_CASE,
+);
+
+test(
+  'bundled self compaction uses read-only readiness, one admission and observation without retries',
+  async () => {
+    const home = mkdtempSync(join(realpathSync(tmpdir()), 'arc compact smoke '));
+    const channel = new WindowChannel(home);
+    const run = promisify(execFile);
+    const requests = [];
+    let ready = true;
+    let terminal = null;
+    let loseReply = false;
+    const readyTimes = [];
+    channel.setCompactRequestHandler(async (request) => {
+      requests.push(request);
+      if (request.method === 'compact-ready') readyTimes.push(Date.now());
+      if (request.method === 'compact-ready') return ready ? { ready } : (terminal ?? { ready });
+      if (request.method === 'compact-request' && loseReply) {
+        await channel.dispose();
+        return {};
+      }
+      return { state: 'queued', requestId: request.params.requestId };
+    });
+    try {
+      await channel.update({ folders: [home], scopeReady: true, panelReady: true, panelVisible: true });
+      const env = { ...smokeEnv, ARC_HOME: home };
+      const requestId = channel.hostId + ':aaaaaaaa-1111-2222-3333-444444444444';
+      const args = [
         cli,
         'compact',
-        'status',
+        'request',
+        '--self',
+        '--after-turn',
         '--request-id',
-        originalWindow + ':aaaaaaaa-1111-2222-3333-444444444444',
+        requestId,
         '--window',
         channel.hostId,
         '--json',
-      ],
-      { env },
-    );
-    assert.equal(requests.at(-1).params.requestId.startsWith(originalWindow), true);
-    const beforeInvalid = requests.length;
-    writeFileSync(continuationFile, 'changed');
-    await assert.rejects(run(process.execPath, continuationArgs, { env }));
-    assert.equal(requests.length, beforeInvalid);
-    writeFileSync(continuationFile, Buffer.from([0xc3, 0x28]));
-    await assert.rejects(run(process.execPath, continuationArgs, { env }));
-    assert.equal(requests.length, beforeInvalid);
-    const before = requests.length;
-    await assert.rejects(run(process.execPath, [...args, '--session'], { env }));
-    assert.equal(requests.length, before);
-    ready = false;
-    const readsBefore = readyTimes.length;
-    const refused = JSON.parse((await run(process.execPath, args, { env })).stdout);
-    assert.equal(refused.state, 'refused');
-    // Back-to-back reads would end before a late native tool start reaches the window.
-    const reads = readyTimes.slice(readsBefore);
-    assert.ok(reads.length >= 2, 'readiness reads more than once');
-    assert.ok(reads.at(-1) - reads[0] >= 450 * (reads.length - 1), 'readiness reads are spread across its deadline');
-    assert.equal(
-      requests.slice(before).every((r) => r.method === 'compact-ready'),
-      true,
-    );
-    // A terminal readiness code ends polling at once and reports the window's reason.
-    for (const code of [
-      'no-reader-instruction',
-      'reader-acted',
-      'background',
-      'already-used',
-      'request-used',
-      'withdrawn',
-    ]) {
-      terminal = { ready: false, code, reason: `Reason for ${code}.` };
-      const readsBeforeCode = readyTimes.length;
-      const coded = JSON.parse((await run(process.execPath, args, { env })).stdout);
-      assert.deepEqual([coded.state, coded.reason], ['refused', `Reason for ${code}.`]);
-      assert.equal(readyTimes.length - readsBeforeCode, 1, code);
+      ];
+      const output = await run(process.execPath, args, { env });
+      assert.equal(JSON.parse(output.stdout).state, 'queued');
+      assert.deepEqual(
+        requests.map((r) => r.method),
+        ['compact-ready', 'compact-request'],
+      );
+      assert.equal(requests[1].id, requestId);
+      await run(
+        process.execPath,
+        [cli, 'compact', 'status', '--request-id', requestId, '--window', channel.hostId, '--json'],
+        { env },
+      );
+      assert.equal(requests.at(-1).method, 'compact-status');
+      const continuationFile = join(home, 'next turn.txt').replaceAll('\\', '/');
+      const continuation = '  Continue "once".\r\nWrite café.\r\n';
+      writeFileSync(continuationFile, continuation);
+      const digest = createHash('sha256').update(continuation).digest('hex');
+      const continuationArgs = [
+        ...args.slice(0, 5),
+        '--continuation-file',
+        continuationFile,
+        '--continuation-sha256',
+        digest,
+        ...args.slice(5),
+      ];
+      assert.equal(JSON.parse((await run(process.execPath, continuationArgs, { env })).stdout).state, 'queued');
+      assert.deepEqual(requests.at(-1).params.continuation, { text: continuation, sha256: digest });
+      const originalWindow = 'b'.repeat(24);
+      await run(
+        process.execPath,
+        [
+          cli,
+          'compact',
+          'status',
+          '--request-id',
+          originalWindow + ':aaaaaaaa-1111-2222-3333-444444444444',
+          '--window',
+          channel.hostId,
+          '--json',
+        ],
+        { env },
+      );
+      assert.equal(requests.at(-1).params.requestId.startsWith(originalWindow), true);
+      const beforeInvalid = requests.length;
+      writeFileSync(continuationFile, 'changed');
+      await assert.rejects(run(process.execPath, continuationArgs, { env }));
+      assert.equal(requests.length, beforeInvalid);
+      writeFileSync(continuationFile, Buffer.from([0xc3, 0x28]));
+      await assert.rejects(run(process.execPath, continuationArgs, { env }));
+      assert.equal(requests.length, beforeInvalid);
+      const before = requests.length;
+      await assert.rejects(run(process.execPath, [...args, '--session'], { env }));
+      assert.equal(requests.length, before);
+      ready = false;
+      const readsBefore = readyTimes.length;
+      const refused = JSON.parse((await run(process.execPath, args, { env })).stdout);
+      assert.equal(refused.state, 'refused');
+      // Back-to-back reads would end before a late native tool start reaches the window.
+      const reads = readyTimes.slice(readsBefore);
+      assert.ok(reads.length >= 2, 'readiness reads more than once');
+      assert.ok(reads.at(-1) - reads[0] >= 450 * (reads.length - 1), 'readiness reads are spread across its deadline');
+      assert.equal(
+        requests.slice(before).every((r) => r.method === 'compact-ready'),
+        true,
+      );
+      // A terminal readiness code ends polling at once and reports the window's reason.
+      for (const code of [
+        'no-reader-instruction',
+        'reader-acted',
+        'background',
+        'already-used',
+        'request-used',
+        'withdrawn',
+      ]) {
+        terminal = { ready: false, code, reason: `Reason for ${code}.` };
+        const readsBeforeCode = readyTimes.length;
+        const coded = JSON.parse((await run(process.execPath, args, { env })).stdout);
+        assert.deepEqual([coded.state, coded.reason], ['refused', `Reason for ${code}.`]);
+        assert.equal(readyTimes.length - readsBeforeCode, 1, code);
+      }
+      terminal = { ready: false, code: 'not-observed', reason: 'Not seen yet.' };
+      const readsBeforeUnseen = readyTimes.length;
+      assert.equal(JSON.parse((await run(process.execPath, args, { env })).stdout).reason, 'Not seen yet.');
+      assert.ok(readyTimes.length - readsBeforeUnseen >= 2, 'readiness keeps polling while the command is unseen');
+      terminal = null;
+      ready = true;
+      loseReply = true;
+      const writesBefore = requests.filter((r) => r.method === 'compact-request').length;
+      const uncertain = JSON.parse((await run(process.execPath, args, { env })).stdout);
+      assert.equal(uncertain.state, 'uncertain');
+      assert.equal(uncertain.requestId, requestId);
+      assert.equal(requests.filter((r) => r.method === 'compact-request').length, writesBefore + 1);
+      // The lost reply closed the window, so status names the outcome instead of failing.
+      const gone = await run(
+        process.execPath,
+        [cli, 'compact', 'status', '--request-id', requestId, '--window', channel.hostId, '--json'],
+        { env },
+      );
+      assert.equal(JSON.parse(gone.stdout).state, 'unavailable');
+      assert.equal(JSON.parse(gone.stdout).requestId, requestId);
+    } finally {
+      await channel.dispose();
+      rmSync(home, { recursive: true, force: true });
     }
-    terminal = { ready: false, code: 'not-observed', reason: 'Not seen yet.' };
-    const readsBeforeUnseen = readyTimes.length;
-    assert.equal(JSON.parse((await run(process.execPath, args, { env })).stdout).reason, 'Not seen yet.');
-    assert.ok(readyTimes.length - readsBeforeUnseen >= 2, 'readiness keeps polling while the command is unseen');
-    terminal = null;
-    ready = true;
-    loseReply = true;
-    const writesBefore = requests.filter((r) => r.method === 'compact-request').length;
-    const uncertain = JSON.parse((await run(process.execPath, args, { env })).stdout);
-    assert.equal(uncertain.state, 'uncertain');
-    assert.equal(uncertain.requestId, requestId);
-    assert.equal(requests.filter((r) => r.method === 'compact-request').length, writesBefore + 1);
-    // The lost reply closed the window, so status names the outcome instead of failing.
-    const gone = await run(
-      process.execPath,
-      [cli, 'compact', 'status', '--request-id', requestId, '--window', channel.hostId, '--json'],
-      { env },
-    );
-    assert.equal(JSON.parse(gone.stdout).state, 'unavailable');
-    assert.equal(JSON.parse(gone.stdout).requestId, requestId);
-  } finally {
-    await channel.dispose();
-    rmSync(home, { recursive: true, force: true });
-  }
-});
+  },
+  PROCESS_CASE,
+);

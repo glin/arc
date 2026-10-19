@@ -61,12 +61,16 @@ import { requestWindow, requesterIdentity } from './sessionrequests.ts';
 // terminalownership.test.ts reads the real process table.
 const callerBirth = '1000';
 const identities = async (pids: number[]) => pids.map((pid) => ({ pid, birth: callerBirth }));
+const ancestryRead = vi.hoisted(() => ({ failure: null as Error | null }));
 vi.mock('./terminalownership.ts', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./terminalownership.ts')>()),
-  collectProcessAncestry: async (): Promise<ProcessAncestry> => ({
-    platform: process.platform as ProcessAncestry['platform'],
-    chain: [{ pid: process.pid, parent: 0, birth: callerBirth }],
-  }),
+  collectProcessAncestry: async (): Promise<ProcessAncestry> => {
+    if (ancestryRead.failure) throw ancestryRead.failure;
+    return {
+      platform: process.platform as ProcessAncestry['platform'],
+      chain: [{ pid: process.pid, parent: 0, birth: callerBirth }],
+    };
+  },
 }));
 import {
   ARCHIVE_COMPLETION_UNAVAILABLE,
@@ -6355,6 +6359,23 @@ test('integrated ownership refuses ambiguous, unsupported and unknown windows wi
   await assert.rejects(requestWindow('setups', {}, '', home), /not unique/);
   competitor.setTerminalOwnership(terminalOwnership({ allowed: () => false, terminals: () => [] }));
   await assert.rejects(requestWindow('setups', {}, '', home), /terminal owner is unavailable/);
+  assert.equal(handler.mock.calls.length, 0);
+});
+
+test.each([
+  ['Process collection expired.', /took too long/],
+  ['Process unavailable.', /terminal owner is unavailable/],
+])('a terminal process read that fails with "%s" reports %s', async (failure, message) => {
+  vi.stubEnv('TERM_PROGRAM', 'vscode');
+  const { home, channel } = await fixture();
+  const handler = vi.fn<() => Record<string, unknown>>(() => ({}));
+  channel.setRequestHandler(handler);
+  ancestryRead.failure = new Error(failure);
+  try {
+    await assert.rejects(requestWindow('setups', {}, '', home), message);
+  } finally {
+    ancestryRead.failure = null;
+  }
   assert.equal(handler.mock.calls.length, 0);
 });
 

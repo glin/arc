@@ -2,9 +2,10 @@ import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { copyFileSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { expect, test } from 'vitest';
+import { auditStreams } from './fixtures/stream/audit-core.mjs';
 
 const directory = fileURLToPath(new URL('./fixtures/stream/', import.meta.url));
 const audit = join(directory, 'audit.mjs');
@@ -92,17 +93,59 @@ test('stream expectations keep unavailable evidence unknown', () => {
   expect(sameTurn.parent.cache.expiryReturns).toBe(0);
 });
 
+// The audit compares expected files with a command's output. These cases run the comparison in
+// process with the command replaced by a reader of the expected files, so each case starts no process.
+function readExpected(expectedDirectory) {
+  return (invocation) => {
+    const fixture = basename(invocation[invocation.length - 1]);
+    const file = fixture.replace(/\.jsonl?$/, '.expected.json');
+    return {
+      status: 0,
+      stdout: readFileSync(join(expectedDirectory, file), 'utf8'),
+      stderr: '',
+    };
+  };
+}
+
+function copyFixtures(temp, filter = () => true) {
+  for (const file of readdirSync(directory).filter((name) => /\.jsonl?$/.test(name) && filter(name))) {
+    copyFileSync(join(directory, file), join(temp, file));
+  }
+}
+
 test('stream audit rejects changed expected values', () => {
   const temp = mkdtempSync(join(tmpdir(), 'arc-stream-audit-'));
   try {
-    for (const file of [
-      'one-request.json',
-      'one-request.expected.json',
-      'bedrock-regional.json',
-      'bedrock-regional.expected.json',
-    ]) {
-      copyFileSync(join(directory, file), join(temp, file));
-    }
+    copyFixtures(temp);
+    const audit = () =>
+      auditStreams({
+        directory: temp,
+        command: ['reader', '{}'],
+        execute: readExpected(directory),
+      });
+    assert.deepEqual(audit(), []);
+    const expectedPath = join(temp, 'one-request.expected.json');
+    const changed = JSON.parse(readFileSync(expectedPath, 'utf8'));
+    changed.parent.requests = 999;
+    writeFileSync(expectedPath, JSON.stringify(changed));
+    assert.deepEqual(audit(), ['one-request parent.requests: expected 999, actual 1']);
+    const bedrockPath = join(temp, 'bedrock-regional.expected.json');
+    const bedrock = JSON.parse(readFileSync(bedrockPath, 'utf8'));
+    bedrock.parent.costUsd = 0.008;
+    writeFileSync(bedrockPath, JSON.stringify(bedrock));
+    assert.deepEqual(audit(), [
+      'bedrock-regional parent.costUsd: expected 0.008, actual 0.0088',
+      'one-request parent.requests: expected 999, actual 1',
+    ]);
+  } finally {
+    rmSync(temp, { recursive: true, force: true });
+  }
+});
+
+test('stream audit command prints each mismatch and exits with the failure status', () => {
+  const temp = mkdtempSync(join(tmpdir(), 'arc-stream-audit-cli-'));
+  try {
+    copyFixtures(temp, (name) => name.startsWith('one-request'));
     const command = join(temp, 'expected.mjs');
     writeFileSync(
       command,
@@ -111,25 +154,19 @@ import { basename, join } from 'node:path';
 const fixture = basename(process.argv[2]).replace(/\\.jsonl?$/, '.expected.json');
 process.stdout.write(readFileSync(join(${JSON.stringify(directory)}, fixture), 'utf8'));`,
     );
-    const invocation = [audit, '--fixtures', temp, '--', process.execPath, command, '{}'];
-    const baseline = spawnSync(process.execPath, invocation, { encoding: 'utf8' });
-    assert.equal(baseline.status, 0, baseline.stderr);
-    const childOptions = spawnSync(process.execPath, [...invocation, '--fixtures', '--map'], { encoding: 'utf8' });
-    assert.equal(childOptions.status, 0, childOptions.stderr);
     const expectedPath = join(temp, 'one-request.expected.json');
+    writeFileSync(expectedPath, readFileSync(join(directory, 'one-request.expected.json')));
+    const invocation = [audit, '--fixtures', temp, '--', process.execPath, command, '{}', '--fixtures', '--map'];
+    const baseline = spawnSync(process.execPath, invocation, {
+      encoding: 'utf8',
+    });
+    assert.equal(baseline.status, 0, baseline.stderr);
     const changed = JSON.parse(readFileSync(expectedPath, 'utf8'));
     changed.parent.requests = 999;
     writeFileSync(expectedPath, JSON.stringify(changed));
     const run = spawnSync(process.execPath, invocation, { encoding: 'utf8' });
     assert.equal(run.status, 1);
     assert.match(run.stderr, /one-request parent.requests: expected 999, actual 1/);
-    const bedrockPath = join(temp, 'bedrock-regional.expected.json');
-    const bedrock = JSON.parse(readFileSync(bedrockPath, 'utf8'));
-    bedrock.parent.costUsd = 0.008;
-    writeFileSync(bedrockPath, JSON.stringify(bedrock));
-    const rate = spawnSync(process.execPath, invocation, { encoding: 'utf8' });
-    assert.equal(rate.status, 1);
-    assert.match(rate.stderr, /bedrock-regional parent.costUsd: expected 0.008, actual 0.0088/);
   } finally {
     rmSync(temp, { recursive: true, force: true });
   }
@@ -138,29 +175,20 @@ process.stdout.write(readFileSync(join(${JSON.stringify(directory)}, fixture), '
 test('stream audit rejects missing input and expected files', () => {
   const temp = mkdtempSync(join(tmpdir(), 'arc-stream-audit-empty-'));
   try {
-    const command = join(temp, 'expected.mjs');
-    writeFileSync(
-      command,
-      `import { readFileSync } from 'node:fs';
-import { basename, join } from 'node:path';
-const fixture = basename(process.argv[2]).replace(/\\.jsonl?$/, '.expected.json');
-process.stdout.write(readFileSync(join(${JSON.stringify(temp)}, fixture), 'utf8'));`,
-    );
-    const invocation = [audit, '--fixtures', temp, '--', process.execPath, command, '{}'];
-    const empty = spawnSync(process.execPath, invocation, { encoding: 'utf8' });
-    assert.equal(empty.status, 1);
-    assert.match(empty.stderr, /No expected stream fixtures found/);
+    const audit = () =>
+      auditStreams({
+        directory: temp,
+        command: ['reader', '{}'],
+        execute: readExpected(directory),
+      });
+    assert.deepEqual(audit(), ['No expected stream fixtures found']);
     copyFileSync(join(directory, 'one-request.json'), join(temp, 'one-request.json'));
     copyFileSync(join(directory, 'five-requests.json'), join(temp, 'five-requests.json'));
     copyFileSync(join(directory, 'one-request.expected.json'), join(temp, 'one-request.expected.json'));
-    const unmatched = spawnSync(process.execPath, invocation, { encoding: 'utf8' });
-    assert.equal(unmatched.status, 1);
-    assert.match(unmatched.stderr, /five-requests has no expected file/);
+    assert.deepEqual(audit(), ['five-requests has no expected file']);
     rmSync(join(temp, 'five-requests.json'));
     copyFileSync(join(directory, 'five-requests.expected.json'), join(temp, 'five-requests.expected.json'));
-    const orphan = spawnSync(process.execPath, invocation, { encoding: 'utf8' });
-    assert.equal(orphan.status, 1);
-    assert.match(orphan.stderr, /five-requests has no input file/);
+    assert.deepEqual(audit(), ['five-requests has no input file']);
   } finally {
     rmSync(temp, { recursive: true, force: true });
   }

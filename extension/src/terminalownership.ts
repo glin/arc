@@ -134,7 +134,7 @@ export async function collectWindowsAncestry(
     const logical = new Map<number, { parent: number; native: number }>();
     const native = new Set<number>();
     for (const line of lines) {
-      const fields = /^\s*(\d+)\s+(\d+)\s+\d+\s+(\d+)\s/.exec(line);
+      const fields = /^(?:[IOS] )?\s*(\d+)\s+(\d+)\s+\d+\s+(\d+)\s/.exec(line);
       if (!fields) throw new Error('Process unavailable.');
       const id = Number(fields[1]),
         parent = Number(fields[2]),
@@ -189,6 +189,9 @@ export async function collectWindowsAncestry(
   return chain;
 }
 
+// Every read that the deadline or the caller's signal stops fails with this message.
+export const PROCESS_COLLECTION_EXPIRED = 'Process collection expired.';
+
 export async function collectProcessAncestry(processId = process.pid, signal?: AbortSignal): Promise<ProcessAncestry> {
   if (!pid(processId)) throw new Error('Process unavailable.');
   const cancellation = new AbortController();
@@ -197,7 +200,7 @@ export async function collectProcessAncestry(processId = process.pid, signal?: A
   signal?.addEventListener('abort', cancel, { once: true });
   if (signal?.aborted) cancel();
   const check = () => {
-    if (cancellation.signal.aborted) throw new Error('Process collection expired.');
+    if (cancellation.signal.aborted) throw new Error(PROCESS_COLLECTION_EXPIRED);
   };
   try {
     check();
@@ -252,6 +255,9 @@ export async function collectProcessAncestry(processId = process.pid, signal?: A
     const result = { platform, chain };
     if (!validAncestry(result) || result.chain[0].pid !== processId) throw new Error('Process ancestry unavailable.');
     return result;
+  } catch (error) {
+    if (cancellation.signal.aborted) throw new Error(PROCESS_COLLECTION_EXPIRED, { cause: error });
+    throw error;
   } finally {
     clearTimeout(timer);
     signal?.removeEventListener('abort', cancel);

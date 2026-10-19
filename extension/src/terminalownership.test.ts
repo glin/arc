@@ -142,7 +142,7 @@ test('Linux and macOS parse independent native process fixtures with malformed a
 test('cancelled collection refuses before starting a helper', async () => {
   const aborted = new AbortController();
   aborted.abort();
-  await assert.rejects(collectProcessAncestry(process.pid, aborted.signal));
+  await assert.rejects(collectProcessAncestry(process.pid, aborted.signal), /Process collection expired/);
 });
 
 test('MSYS logical parents route a missing native hop to one current terminal and preserve admission', async () => {
@@ -198,6 +198,18 @@ test('MSYS logical parents route a missing native hop to one current terminal an
       true,
     );
     assert.equal(execute.mock.calls.length, 2);
+    // MSYS ps prefixes a row with a state flag (I, O or S) when the process waits on its terminal or is stopped.
+    for (const flag of ['I', 'O', 'S']) {
+      execute.mockImplementationOnce(async () => ({
+        stdout: `${text}${flag} 4 1 4 50 cons1 1 00:00 /usr/bin/less\n`,
+        stderr: '',
+      }));
+      const flagged = await collectWindowsAncestry(30, new AbortController().signal, query, execute as never);
+      assert.deepEqual(
+        flagged.map((row) => row.pid),
+        [30, 20, 10, 5],
+      );
+    }
     execute.mockImplementation(async () => ({ stdout: text.replace('3 2 3 20', '3 2 3 30'), stderr: '' }));
     const executed = await collectWindowsAncestry(30, new AbortController().signal, query, execute as never);
     assert.deepEqual(
@@ -205,7 +217,15 @@ test('MSYS logical parents route a missing native hop to one current terminal an
       [30, 10, 5],
     );
 
-    for (const invalid of [text + ' 2 1 2 40 cons1 1 00:00 /usr/bin/bash\n', text.replace('2 1 2 10', '2 1 2 20')]) {
+    // ps never prints these first columns, so a row that starts with one is not process output.
+    const unprinted = ['-7 1 7 60', 'x7 1 7 60', 'I7 1 7 60'].map(
+      (row) => `${text}${row} cons1 1 00:00 /usr/bin/less\n`,
+    );
+    for (const invalid of [
+      text + ' 2 1 2 40 cons1 1 00:00 /usr/bin/bash\n',
+      text.replace('2 1 2 10', '2 1 2 20'),
+      ...unprinted,
+    ]) {
       execute.mockImplementation(async () => ({ stdout: invalid, stderr: '' }));
       await assert.rejects(collectWindowsAncestry(30, new AbortController().signal, query, execute as never));
     }
