@@ -11,11 +11,14 @@ import { fileURLToPath } from 'node:url';
 import * as fs from 'node:fs';
 import mutableFs from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
+import { runInNewContext } from 'node:vm';
+import ts from 'typescript';
+import { declarationSource } from '../../extension/test/source-contract.ts';
+import { validContinuationPath } from '../../extension/src/compactrequest.ts';
 import { readSkillPayload, skillTemporaryRoots } from '../src/skillfiles.ts';
 import { operateSkill } from '../src/skills.ts';
 import { runCollect } from '../src/collect.ts';
 import { SESSION_PAGE_ERRORS } from '../../extension/src/sessionreads.ts';
-import { readContinuationFile } from '../src/manage.ts';
 import { skillFiles, collectWindow, collectRow, collectPage, collectTurns, collectArgs, cli } from './smoke-fixture.ts';
 
 test('collector restart excludes abandoned rows and preserves independent observations', async () => {
@@ -1238,38 +1241,35 @@ test('command admission requires complete help data', () => {
 });
 
 test('continuation file opening refuses nonregular descriptors with platform nonblocking flags', () => {
-  const descriptor = Object.getOwnPropertyDescriptor(process, 'platform');
-  const open = mutableFs.openSync;
-  const stat = mutableFs.fstatSync;
-  const close = mutableFs.closeSync;
-  const nonblock = Object.getOwnPropertyDescriptor(mutableFs.constants, 'O_NONBLOCK');
-  try {
-    Object.defineProperty(mutableFs.constants, 'O_NONBLOCK', { value: 2048, configurable: true });
-    for (const platform of ['win32', 'linux', 'darwin']) {
-      Object.defineProperty(process, 'platform', { value: platform });
-      let closed = false;
-      mutableFs.openSync = (_file, flags) => {
-        assert.equal(flags, mutableFs.constants.O_RDONLY | (platform === 'win32' ? 0 : 2048));
+  const source = readFileSync(new URL('../src/manage.ts', import.meta.url), 'utf8');
+  const declaration = declarationSource(source, 'readContinuationFile').replace(/^export\s+/, '');
+  const compiled = ts.transpileModule(declaration, {
+    compilerOptions: { target: ts.ScriptTarget.ES2022 },
+  }).outputText;
+  for (const platform of ['win32', 'linux', 'darwin']) {
+    let closed = false;
+    const filesystem = {
+      constants: Object.freeze({ O_RDONLY: 0, O_NONBLOCK: 2048 }),
+      openSync: (_file, flags) => {
+        assert.equal(flags, platform === 'win32' ? 0 : 2048);
         return 123;
-      };
-      mutableFs.fstatSync = () => ({ isFile: () => false });
-      mutableFs.closeSync = (fd) => {
+      },
+      fstatSync: () => ({ isFile: () => false }),
+      closeSync: (fd) => {
         assert.equal(fd, 123);
         closed = true;
-      };
-      syncBuiltinESMExports();
-      assert.throws(
-        () => readContinuationFile(platform === 'win32' ? 'C:/temp/next.txt' : '/tmp/next.txt', 'a'.repeat(64)),
-        /regular file/,
-      );
-      assert.equal(closed, true);
-    }
-  } finally {
-    Object.defineProperty(process, 'platform', descriptor);
-    if (nonblock) Object.defineProperty(mutableFs.constants, 'O_NONBLOCK', nonblock);
-    else delete mutableFs.constants.O_NONBLOCK;
-    Object.assign(mutableFs, { openSync: open, fstatSync: stat, closeSync: close });
-    syncBuiltinESMExports();
+      },
+    };
+    const readContinuationFile = runInNewContext(`${compiled}; readContinuationFile;`, {
+      fs: filesystem,
+      process: { platform },
+      validContinuationPath: (file) => validContinuationPath(file, platform),
+    });
+    assert.throws(
+      () => readContinuationFile(platform === 'win32' ? 'C:/temp/next.txt' : '/tmp/next.txt', 'a'.repeat(64)),
+      /regular file/,
+    );
+    assert.equal(closed, true);
   }
 });
 

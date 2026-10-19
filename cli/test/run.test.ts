@@ -1464,6 +1464,10 @@ test('attended public launches select both Git Bash layouts and literal platform
 test('attended Codex uses interactive argv and its positional prompt through the public supervisor', async () => {
   for (const permission of ['read-only', 'workspace-write', 'danger-full-access']) {
     const { home, args, prompt } = fixture();
+    const defaultHome = path.join(home, 'default-home');
+    fs.mkdirSync(path.join(defaultHome, '.codex'), { recursive: true });
+    fs.writeFileSync(path.join(defaultHome, '.codex', 'config.toml'), 'model_provider = "amazon-bedrock"\n');
+    vi.mocked(os.homedir).mockReturnValue(defaultHome);
     const text = "Inspect élève $() ' & \\ paths.\nKeep newlines.";
     fs.writeFileSync(prompt, text);
     const parsed = parseRun(
@@ -1475,7 +1479,7 @@ test('attended Codex uses interactive argv and its positional prompt through the
         '--add-dir',
         home,
       ],
-      { CODEX_BIN: process.execPath },
+      { CODEX_BIN: process.execPath, CODEX_HOME: home },
     );
     assert.deepEqual(parsed.options.args, [
       '-C',
