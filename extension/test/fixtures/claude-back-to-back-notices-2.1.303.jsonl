@@ -1,0 +1,29 @@
+{"type":"system","subtype":"session_state_changed","state":"running","uuid":"uuid-1","session_id":"sess-1"}
+{"type":"system","subtype":"init","uuid":"uuid-2","session_id":"sess-1","permissionMode":"default"}
+{"type":"user","parent_tool_use_id":null,"uuid":"uuid-3","isReplay":true,"session_id":"sess-1","message":{"role":"user","content":"Start the background work, then end the turn."}}
+{"type":"assistant","parent_tool_use_id":null,"uuid":"uuid-4","session_id":"sess-1","message":{"role":"assistant","content":[{"type":"tool_use","name":"Bash","id":"tool-5","caller":{"type":"direct"},"input":{"command":"sleep 8 && echo done-a","run_in_background":true,"description":"background work"}}]}}
+{"type":"assistant","parent_tool_use_id":null,"uuid":"uuid-6","session_id":"sess-1","message":{"role":"assistant","content":[{"type":"tool_use","name":"Bash","id":"tool-7","caller":{"type":"direct"},"input":{"command":"sleep 8 && echo done-b","run_in_background":true,"description":"background work"}}]}}
+{"type":"system","subtype":"task_started","uuid":"uuid-8","session_id":"sess-1","task_id":"task-9","run_id":"run-10","tool_use_id":"tool-7","is_backgrounded":true,"task_type":"local_bash"}
+{"type":"user","parent_tool_use_id":null,"uuid":"uuid-11","session_id":"sess-1","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tool-7","is_error":false,"content":"output"}]},"tool_use_result":{"backgroundTaskId":"task-9","interrupted":false}}
+{"type":"system","subtype":"task_started","uuid":"uuid-12","session_id":"sess-1","task_id":"task-13","run_id":"run-14","tool_use_id":"tool-5","is_backgrounded":true,"task_type":"local_bash"}
+{"type":"user","parent_tool_use_id":null,"uuid":"uuid-15","session_id":"sess-1","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tool-5","is_error":false,"content":"output"}]},"tool_use_result":{"backgroundTaskId":"task-13","interrupted":false}}
+{"type":"assistant","parent_tool_use_id":null,"uuid":"uuid-16","session_id":"sess-1","message":{"role":"assistant","content":[{"type":"text","text":"launched"}]}}
+{"type":"result","subtype":"success","uuid":"uuid-17","session_id":"sess-1","is_error":false,"terminal_reason":"completed","num_turns":3,"result_index":0,"result":"launched"}
+{"type":"system","subtype":"session_state_changed","state":"idle","uuid":"uuid-18","session_id":"sess-1"}
+{"type":"system","subtype":"task_notification","uuid":"uuid-19","session_id":"sess-1","task_id":"task-9","run_id":"run-10","tool_use_id":"tool-7","status":"completed"}
+{"type":"system","subtype":"session_state_changed","state":"running","uuid":"uuid-20","session_id":"sess-1"}
+{"type":"system","subtype":"init","uuid":"uuid-21","session_id":"sess-1","permissionMode":"default"}
+{"type":"system","subtype":"task_notification","uuid":"uuid-22","session_id":"sess-1","task_id":"task-13","run_id":"run-14","tool_use_id":"tool-5","status":"completed"}
+{"type":"assistant","parent_tool_use_id":null,"uuid":"uuid-23","session_id":"sess-1","message":{"role":"assistant","content":[{"type":"tool_use","name":"Bash","id":"tool-24","caller":{"type":"direct"},"input":{"command":"sleep 6","description":"background work"}}]}}
+{"type":"system","subtype":"task_started","uuid":"uuid-25","session_id":"sess-1","task_id":"task-26","run_id":"run-27","tool_use_id":"tool-24","is_backgrounded":false,"task_type":"local_bash"}
+{"type":"system","subtype":"task_notification","uuid":"uuid-28","session_id":"sess-1","task_id":"task-26","run_id":"run-27","tool_use_id":"tool-24","status":"completed"}
+{"type":"user","parent_tool_use_id":null,"uuid":"uuid-29","session_id":"sess-1","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tool-24","is_error":false,"content":"output"}]},"tool_use_result":{"interrupted":false}}
+{"type":"user","parent_tool_use_id":null,"uuid":"uuid-30","isReplay":true,"origin":{"kind":"task-notification","producer":"session-task","runId":"run-14"},"session_id":"sess-1","message":{"role":"user","content":"<task-notification>\n<task-id>task-13</task-id>\n<tool-use-id>tool-5</tool-use-id>\n<status>completed</status>\n</task-notification>"}}
+{"type":"assistant","parent_tool_use_id":null,"uuid":"uuid-31","session_id":"sess-1","message":{"role":"assistant","content":[{"type":"thinking","thinking":""}]}}
+{"type":"assistant","parent_tool_use_id":null,"uuid":"uuid-32","session_id":"sess-1","message":{"role":"assistant","content":[{"type":"tool_use","name":"Bash","id":"tool-33","caller":{"type":"direct"},"input":{"command":"sleep 6","description":"background work"}}]}}
+{"type":"system","subtype":"task_started","uuid":"uuid-34","session_id":"sess-1","task_id":"task-35","run_id":"run-36","tool_use_id":"tool-33","is_backgrounded":false,"task_type":"local_bash"}
+{"type":"system","subtype":"task_notification","uuid":"uuid-37","session_id":"sess-1","task_id":"task-35","run_id":"run-36","tool_use_id":"tool-33","status":"completed"}
+{"type":"user","parent_tool_use_id":null,"uuid":"uuid-38","session_id":"sess-1","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tool-33","is_error":false,"content":"output"}]},"tool_use_result":{"interrupted":false}}
+{"type":"assistant","parent_tool_use_id":null,"uuid":"uuid-39","session_id":"sess-1","message":{"role":"assistant","content":[{"type":"text","text":"noted"}]}}
+{"type":"result","subtype":"success","uuid":"uuid-40","session_id":"sess-1","is_error":false,"terminal_reason":"completed","num_turns":3,"result_index":1,"result":"noted","origin":{"kind":"task-notification","producer":"session-task","runId":"run-10"}}
+{"type":"system","subtype":"session_state_changed","state":"idle","uuid":"uuid-41","session_id":"sess-1"}

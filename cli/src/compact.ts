@@ -64,18 +64,25 @@ export async function runCompact(args: string[]): Promise<string> {
   }
   try {
     let ready = false;
+    let reason = 'Arc has not seen this command run in the session yet. No compaction was queued.';
     const deadline = Date.now() + READINESS.deadlineMs;
     for (let attempt = 0; attempt < READINESS.attempts && Date.now() < deadline; attempt++) {
       if (attempt > 0) await new Promise((resolve) => setTimeout(resolve, READINESS.intervalMs));
       if (Date.now() >= deadline) break;
-      const observation = (await requestWindow('compact-ready', payload, payload.window)) as { ready?: boolean };
+      const observation = (await requestWindow('compact-ready', payload, payload.window)) as {
+        ready?: boolean;
+        code?: string;
+        reason?: string;
+      };
       if (observation.ready === true) {
         ready = true;
         break;
       }
+      if (typeof observation.reason === 'string' && observation.reason) reason = observation.reason;
+      // Only a command the window has not seen yet can still become ready.
+      if (observation.code !== undefined && observation.code !== 'not-observed') break;
     }
-    if (!ready)
-      return result('refused', 'The live requesting tool is unavailable. No compaction request was admitted.');
+    if (!ready) return result('refused', reason);
   } catch (error) {
     return result('refused', error instanceof Error ? error.message : 'The Arc window is unavailable.');
   }

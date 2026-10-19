@@ -58,6 +58,8 @@ import {
   type SessionRunWitness,
   SESSION_PAGE_ERRORS,
   SESSION_PAGE_LIMITS,
+  RecordedReplies,
+  recordedReplyTurns,
   type SessionCursorBody,
   type SessionListingRow,
   type SessionPageSource,
@@ -680,6 +682,8 @@ const TRANSCRIPT_TURN_LIMIT = 40;
 const TRANSCRIPT_TAIL_BYTES = 4 * 1024 * 1024;
 const SEARCH_TAIL_BYTES = 16 * 1024 * 1024;
 const POLL_INTERVAL_MILLISECONDS = 5 * 1000;
+// A hidden panel does not poll, so a final response the transcript records late gets its own reads.
+const RECORDED_REPLY_RETRY_MS = 1_000;
 
 // Each source adapter owns the cursor for its next older page. The provider passes
 // it back to that adapter and drops it when the source revision changes.
@@ -2980,9 +2984,11 @@ export class PanelProvider implements vscode.Disposable {
     this.performanceOutput = performanceOutput ?? null;
     this.responseRates = savedResponseRates(this.memento?.get(STORED_STATE_KEYS.responseRates));
     this.repositoryScope = this.createRepositoryScope(nodeGitRunner());
-    this.watchScheduler = new BoundedTrailingScheduler(TRANSCRIPT_WAKE_MS, TRANSCRIPT_WAKE_MAX_MS, (event) =>
-      this.runPendingWatch(event),
-    );
+    // A transcript append can record a final response that a turn Claude started by itself waits for.
+    this.watchScheduler = new BoundedTrailingScheduler(TRANSCRIPT_WAKE_MS, TRANSCRIPT_WAKE_MAX_MS, (event) => {
+      this.runPendingWatch(event);
+      this.settleRecordedReplies();
+    });
     this.projectSpendSaveScheduler = this.newProjectSpendSaveScheduler();
     const cached = this.derivedCacheFile ? loadDerivedCache(this.derivedCacheFile) : null;
     if (cached) {
@@ -3152,6 +3158,10 @@ export class PanelProvider implements vscode.Disposable {
     if (this.derivedCacheCheckpointTick) {
       clearTimeout(this.derivedCacheCheckpointTick);
       this.derivedCacheCheckpointTick = null;
+    }
+    if (this.recordedReplyRetry) {
+      clearTimeout(this.recordedReplyRetry);
+      this.recordedReplyRetry = null;
     }
     if (this.derivedCacheCheckpointState.dirty && this.writeDerivedCache()) {
       this.derivedCacheCheckpointState.markSaved(Date.now());
@@ -5437,6 +5447,9 @@ export class PanelProvider implements vscode.Disposable {
   >();
   private pendingResponsePosts = new Map<number, Array<() => void>>();
   private reconciledResponseOwners = new Map<number, string>();
+  // Final responses of turns Claude started by itself, waiting for a recorded turn to hold them.
+  private recordedReplies = new RecordedReplies();
+  private recordedReplyRetry: ReturnType<typeof setTimeout> | null = null;
   private pendingResponseOwners = new Map<
     number,
     { session: string; source: string; at: number; timer: ReturnType<typeof setTimeout> }
@@ -5511,6 +5524,46 @@ export class PanelProvider implements vscode.Disposable {
     this.postReply();
     if (this.showing === session || [...this.hostSessions.values()].includes(session))
       void this.completeSelectedWindow(session, this.selectionGeneration);
+  }
+
+  // A turn Claude started by itself has no response card. Its final response is held for reader
+  // review once a recorded turn of the session carries the same assistant message.
+  public noteRecordedReply(
+    session: string,
+    sourceId: string,
+    text: string,
+    saved: () => void,
+    wanted: () => boolean,
+  ): void {
+    if (this.disposed) return;
+    if (this.recordedReplies.note(session, { sourceId, text, saved, wanted })) this.settleRecordedReplies();
+  }
+
+  // The panel's own reads omit final responses, so each session with a waiting response gets a
+  // separate bounded read, whether or not a panel shows it.
+  public settleRecordedReplies(): void {
+    if (this.disposed) return;
+    const sessions = this.catalog?.sessions ?? this.authoritativeCatalog ?? [];
+    for (const session of this.recordedReplies.sessions()) {
+      const source = sessions.find((one) => one.agent === 'claude' && one.sessionId === session);
+      if (!source) continue;
+      let turns: Turn[];
+      try {
+        turns = recordedReplyTurns(source);
+      } catch {
+        continue;
+      }
+      this.recordedReplies.settle(session, turns);
+    }
+    // The reads repeat until no request waits for a recorded response. A request stops waiting at
+    // its deadline, so the reads stop then even when the transcript never records the response.
+    if (this.recordedReplyRetry) clearTimeout(this.recordedReplyRetry);
+    this.recordedReplyRetry = this.recordedReplies.sessions().length
+      ? setTimeout(() => {
+          this.recordedReplyRetry = null;
+          this.settleRecordedReplies();
+        }, RECORDED_REPLY_RETRY_MS)
+      : null;
   }
 
   public noteResponseRate(session: string, rate: import('./outputrate').ResponseRate, turnId?: number): void {

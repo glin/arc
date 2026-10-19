@@ -12,6 +12,8 @@ Both window values are the `hostId` of the window that hosts this session, as se
 
 Arc admits the request only while this tool call runs in a session that this window's panel holds. The session must have no open asks, no queued reader prompts, and no reader action since this turn's prompt. An answer to one of this turn's asks given before the request does not block admission. Any reader action after admission, including an answer, cancels the request. Each turn holds one pending request. Each request ID is admitted once in a window activation.
 
+A Claude turn that starts without a reader prompt, such as one a background task notice or a subagent hand-back wakes, carries the reader instruction of the turn that launched that work. Arc refuses the request when no task notice from work that a reader turn launched woke the turn, or when the notices that woke it come from work of different reader turns. One reader instruction admits one compaction across its own turn and every turn that its launched work wakes.
+
 Read the `state` field of the result. The command returns at once. After `queued`, finish the successful final response. Report the request in the past tense: "I requested compaction after this turn." Arc checks delivery conditions after the turn. Reader intervention can cancel unsubmitted compaction after the last observation, including while you write the final response. Never promise future delivery from `queued` or a status check.
 
 For authorized same-session follow-up work, save the exact next-turn instruction in a regular UTF-8 file. Include the durable handoff location and inherited execution limits. Use 1 through 8192 bytes. Preserve its whitespace. Exclude a byte-order mark, NUL, invalid UTF-8, and a leading slash command. Arc sends this agent-authored instruction as one ordinary next-turn prompt without adding reader comments or files.
@@ -58,7 +60,7 @@ The `state` field names one outcome:
 - `started`: the agent accepted the compaction.
 - `completed`: the agent finished the compaction.
 - `cancelled`: a reader action, a session change, the session leaving the window's scope, the agent process ending, the window closing, or the 15-minute deadline stopped the request before Arc sent it.
-- `refused`: Arc did not admit the request, or did not send it. A window without compaction support also refuses.
+- `refused`: Arc did not admit the request, or did not send it. A window without compaction support also refuses. The `reason` names the missing condition, for example a reader action after the instruction or an instruction that already requested compaction.
 - `failed`: the requesting tool or turn failed, the final response was not saved, or the agent refused or failed the compaction.
 - `uncertain`: admission or the compaction outcome is not known yet. Arc also reports this right after it sends the compaction, until native evidence arrives. When the request command returns it, report it and finish the turn. Never resend, change transport, reopen the session, or fork the session.
 - `unavailable`: the window holds no record of this request ID, or the window did not answer the status read.

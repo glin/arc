@@ -108,7 +108,7 @@ import { ConfigWatches } from './configwatch';
 import { WindowChannel } from './sessionrequests';
 import { terminalOwnership, localTerminalPlacement } from './terminalownership';
 import { reportWindowTransport, windowTransportErrorCode, type WindowTransportSink } from './windowpipe';
-import { CompactHost } from './compactrequest';
+import { CompactHost, routeCompactionEvent } from './compactrequest';
 import { CompactStore } from './compactstore';
 import {
   GuardedSends,
@@ -447,11 +447,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     idleDurationMs: readSetting('agentIdleMinutes') * 60_000,
     onEvent: ({ key, event, turnId, dispatchTurnId }) => {
       panel.onDispatchEvent?.(key, event, dispatchTurnId ?? turnId);
-      if (event.kind === 'native') {
-        const child = host.get(key);
-        if (child) compaction?.native(child, event.event, turnId);
-        return;
-      }
       if (event.kind === 'responseRate') {
         const where = host.get(key)?.state().sessionId;
         if (where === event.rate.sessionId) panel.noteResponseRate(where, event.rate, turnId);
@@ -472,20 +467,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         }
         return;
       }
-      if (event.kind === 'text') {
-        const child = host.get(key);
-        const where = child?.state().sessionId;
-        if (where)
-          panel.noteCompletedReply(where, event.text, event.sourceId, turnId, () => {
-            if (child && turnId !== undefined) compaction?.replyRetained(child, turnId);
-          });
-        return;
-      }
-      const agent = host.get(key)?.agent;
       if (event.kind === 'turnEnd') {
         const where = host.get(key)?.state().sessionId;
         if (where) panel.noteResponseEnded(where, event.outcome, turnId);
       }
+      if (routeCompactionEvent(compaction, panel, host.get(key) ?? null, event, turnId)) return;
+      const agent = host.get(key)?.agent;
       if (event.kind === 'commands') {
         commandStateChanges.add(key);
         if (agent) {

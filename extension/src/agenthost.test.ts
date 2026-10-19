@@ -60,6 +60,8 @@ test('measurement windows refuse agent processes before launch', () => {
   }
 });
 import { ClaudeWire, type PermissionMode } from './claudewire.ts';
+import { CompactHost, routeCompactionEvent, type CompactChild } from './compactrequest.ts';
+import { RecordedReplies } from './sessionreads.ts';
 import { CODEX_DEADLINE_MS, sandboxPolicy } from './codexwire.ts';
 import { requesterIdentity } from './sessionrequests.ts';
 import { GuardedAttempt, McpServer, ModelList, UsageReading, WireEvent } from './agentwire.ts';
@@ -9269,4 +9271,213 @@ test('an ordinary Claude child acknowledges guarded continuation, requires idle 
   assert.equal(await fake.host.withActivity('guarded', async () => 'reopened'), null);
   assert.equal(fake.host.find('claude', 'worker-session'), null);
   assert.equal(fake.children.length, 1, 'no second writer starts');
+});
+
+// Replays recorded Claude Code stream-json: the reader turn launches a background command and a
+// background subagent, then Claude starts two turns by itself as their task notices arrive.
+function agentStartedTurns(window: string, ids: readonly string[]) {
+  const lines = fs
+    .readFileSync(path.join(__dirname, '../test/fixtures/claude-agent-started-turns-2.1.302.jsonl'), 'utf8')
+    .trim()
+    .split('\n');
+  let index = 0;
+  return lines.map((line) => {
+    const literal = (id: string) =>
+      `arc compact request --self --after-turn --request-id ${window}:${id} --window ${window} --json`;
+    const command = line.includes('{{compact}}')
+      ? line.replace('{{compact}}', literal(ids[index++]))
+      : line.includes('"echo noticed"') && index < ids.length
+        ? line.replace('echo noticed', literal(ids[index++]))
+        : line;
+    return command;
+  });
+}
+
+function compactionThroughHost() {
+  const window = 'c'.repeat(24);
+  const ids = ['aaaaaaaa-1111-2222-3333-444444444444', 'bbbbbbbb-1111-2222-3333-444444444444'];
+  const payload = (id: string) => ({
+    requestId: `${window}:${id}`,
+    window,
+    self: true as const,
+    afterTurn: true as const,
+  });
+  const owners: (number | undefined)[] = [];
+  const events: { kind: string; turnId: number | undefined }[] = [];
+  const replies = new RecordedReplies();
+  const holder = {
+    noteRecordedReply: (session: string, sourceId: string, text: string, saved: () => void, wanted: () => boolean) =>
+      replies.note(session, { sourceId, text, saved, wanted }),
+    noteCompletedReply: () => {},
+    settleRecordedReplies: () => {},
+  };
+  let current: CompactChild | null = null;
+  const compaction = new CompactHost<CompactChild>(window, {
+    find: (_provider, sessionId) => (current?.state().sessionId === sessionId ? current : null),
+    withActivity: async (child, work) => {
+      await work(child);
+      return undefined;
+    },
+    readerWork: () => 'none',
+  });
+  const { host, children } = fakeHost(undefined, Date.now, {
+    onEvent: ({ key, event, turnId }) => {
+      const child = host.get(key) as unknown as (CompactChild & { startedByAgent?: (id: number) => boolean }) | null;
+      if (!child) return;
+      events.push({ kind: event.kind === 'native' ? event.event.kind : event.kind, turnId });
+      if (event.kind === 'native' && event.event.kind === 'toolStart') owners.push(turnId);
+      // The window's own routing, with a panel that holds recorded replies.
+      routeCompactionEvent(compaction, holder, child, event, turnId);
+      if (event.kind === 'turnEnd') compaction.turnEnded(child);
+    },
+  });
+  return {
+    window,
+    ids,
+    payload,
+    owners,
+    events,
+    replies,
+    compaction,
+    host,
+    children,
+    setCurrent: (c: CompactChild) => (current = c),
+  };
+}
+
+// Opens a Claude session, sends the reader prompt, and replays the fixture through the first
+// request line, which runs inside the first turn Claude starts by itself.
+async function insideAgentStartedTurn() {
+  const through = compactionThroughHost();
+  const opening = through.host.session('one', claudePlan(CLAUDE, { cwd: WS, sessionId: 'sess-1' }));
+  through.children[0].answerHandshake();
+  const session = await opening;
+  through.setCurrent(session);
+  await session.prompt('Start the background work, then end the turn.', (turnId) =>
+    through.compaction.submitted(session, turnId),
+  );
+  const lines = agentStartedTurns(through.window, through.ids);
+  const request = lines.findIndex((line) => line.includes(through.ids[0]));
+  for (const line of lines.slice(0, request + 1)) through.children[0].say(line + '\n');
+  const ending = lines.findIndex((line, index) => index > request && line.includes('"type":"result"'));
+  return { ...through, session, rest: lines.slice(request + 1, ending + 1) };
+}
+
+// Catches a reader prompt that joins a turn Claude started by itself losing its live reply and ending.
+test('a reader prompt that joins a turn Claude started by itself owns the later events of that turn', async () => {
+  const { session, events, children, rest, compaction } = await insideAgentStartedTurn();
+  let joined: number | undefined;
+  await session.prompt('A joined reader prompt.', (turnId) => {
+    joined = turnId;
+    compaction.submitted(session, turnId);
+  });
+  const before = events.length;
+  for (const line of rest) children[0].say(line + '\n');
+  const later = events.slice(before).filter((one) => ['toolEnd', 'text', 'rootEnd', 'turnEnd'].includes(one.kind));
+  assert.deepEqual([...new Set(later.map((one) => one.kind))].sort(), ['rootEnd', 'text', 'toolEnd', 'turnEnd']);
+  assert.ok(joined !== undefined && later.every((one) => one.turnId === joined), JSON.stringify(later));
+});
+
+// Catches Stop leaving the owner of a turn Claude started by itself attached to the next reader turn.
+test('Stop during a turn Claude started by itself leaves the next reader prompt its own events', async () => {
+  const { session, events, children, rest, compaction } = await insideAgentStartedTurn();
+  const stopping = session.interrupt();
+  children[0].answerControl('interrupt', {});
+  await stopping;
+  // A late event of the stopped turn belongs to no turn.
+  const stray = events.length;
+  children[0].say(rest[0] + '\n');
+  assert.deepEqual(
+    events.slice(stray).map((one) => one.turnId),
+    [undefined],
+  );
+  let next: number | undefined;
+  await session.prompt('The next reader prompt.', (turnId) => {
+    next = turnId;
+    compaction.submitted(session, turnId);
+  });
+  const before = events.length;
+  for (const line of rest.slice(1)) children[0].say(line + '\n');
+  const later = events.slice(before).filter((one) => ['text', 'rootEnd'].includes(one.kind));
+  assert.ok(later.length >= 2);
+  assert.ok(next !== undefined && later.every((one) => one.turnId === next), JSON.stringify(later));
+});
+
+test('a turn Claude starts after a background notice admits the reader-requested compaction once', async () => {
+  const { window, ids, payload, owners, replies, compaction, host, children, setCurrent } = compactionThroughHost();
+  const opening = host.session('one', claudePlan(CLAUDE, { cwd: WS, sessionId: 'sess-1' }));
+  children[0].answerHandshake();
+  const session = await opening;
+  setCurrent(session);
+  await session.prompt('Start the background work, then end the turn.', (turnId) =>
+    compaction.submitted(session, turnId),
+  );
+  const lines = agentStartedTurns(window, ids);
+  const firstRequest = lines.findIndex((line) => line.includes(ids[0]));
+  for (const line of lines.slice(0, firstRequest + 1)) children[0].say(line + '\n');
+  assert.deepEqual(compaction.handle({ method: 'compact-ready', params: payload(ids[0]) }), { ready: true });
+  assert.equal(
+    (compaction.handle({ method: 'compact-request', params: payload(ids[0]) }) as { state: string }).state,
+    'queued',
+  );
+  const secondRequest = lines.findIndex((line) => line.includes(ids[1]));
+  const firstEnd = lines.findIndex((line, index) => index > firstRequest && line.includes('"type":"result"'));
+  for (const line of lines.slice(firstRequest + 1, firstEnd + 1)) children[0].say(line + '\n');
+  // An earlier recorded turn with the same text does not hold this turn's response.
+  replies.settle('sess-1', [{ finalResponse: { text: 'noted', sourceId: 'msg-earlier' } }]);
+  assert.equal(compaction.requests.deliverable('sess-1').length, 0, 'the response is not recorded yet');
+  replies.settle('sess-1', [{ finalResponse: { text: 'noted', sourceId: 'msg-35' } }]);
+  assert.equal(compaction.requests.deliverable('sess-1').length, 1, 'the turn ended with a recorded final response');
+  for (const line of lines.slice(firstEnd + 1, secondRequest)) children[0].say(line + '\n');
+  children[0].say(lines[secondRequest] + '\n');
+  assert.deepEqual(compaction.handle({ method: 'compact-ready', params: payload(ids[1]) }), {
+    ready: false,
+    code: 'already-used',
+    reason: "The reader's instruction already requested compaction once. No compaction was queued.",
+  });
+  for (const line of lines.slice(secondRequest + 1)) children[0].say(line + '\n');
+  assert.equal(new Set(owners).size, 3, 'each turn Claude started by itself has its own owner');
+  assert.ok(!owners.includes(undefined));
+  // The provider receives the compaction once the session is idle.
+  await compaction.drain('sess-1');
+  assert.equal(sentTexts(children[0]).at(-1), '/compact');
+  assert.equal(compaction.requests.deliverable('sess-1').length, 0);
+});
+
+// Catches a notice that Claude absorbs into a woken turn before its first tool call staying
+// waiting after that turn, so a later turn with no notice spends the reader's one compaction.
+test('a notice absorbed before the woken turn has an owner binds no later turn', async () => {
+  const { window, ids, payload, compaction, host, children, setCurrent } = compactionThroughHost();
+  const opening = host.session('one', claudePlan(CLAUDE, { cwd: WS, sessionId: 'sess-1' }));
+  children[0].answerHandshake();
+  const session = await opening;
+  setCurrent(session);
+  await session.prompt('Start the background work, then end the turn.', (turnId) =>
+    compaction.submitted(session, turnId),
+  );
+  const lines = fs
+    .readFileSync(path.join(__dirname, '../test/fixtures/claude-back-to-back-notices-2.1.303.jsonl'), 'utf8')
+    .trim()
+    .split('\n');
+  for (const line of lines) children[0].say(line + '\n');
+  const command = `arc compact request --self --after-turn --request-id ${window}:${ids[0]} --window ${window} --json`;
+  for (const line of [
+    { type: 'system', subtype: 'session_state_changed', state: 'running', uuid: 'uuid-50', session_id: 'sess-1' },
+    { type: 'system', subtype: 'init', uuid: 'uuid-51', session_id: 'sess-1', permissionMode: 'default' },
+    {
+      type: 'assistant',
+      parent_tool_use_id: null,
+      uuid: 'uuid-52',
+      session_id: 'sess-1',
+      message: {
+        role: 'assistant',
+        content: [{ type: 'tool_use', name: 'Bash', id: 'tool-53', caller: { type: 'direct' }, input: { command } }],
+      },
+    },
+  ])
+    children[0].say(JSON.stringify(line) + '\n');
+  assert.equal(
+    (compaction.handle({ method: 'compact-ready', params: payload(ids[0]) }) as { code?: string }).code,
+    'no-reader-instruction',
+  );
 });

@@ -1498,12 +1498,13 @@ test('bundled self compaction uses read-only readiness, one admission and observ
   const run = promisify(execFile);
   const requests = [];
   let ready = true;
+  let terminal = null;
   let loseReply = false;
   const readyTimes = [];
   channel.setCompactRequestHandler(async (request) => {
     requests.push(request);
     if (request.method === 'compact-ready') readyTimes.push(Date.now());
-    if (request.method === 'compact-ready') return { ready };
+    if (request.method === 'compact-ready') return ready ? { ready } : (terminal ?? { ready });
     if (request.method === 'compact-request' && loseReply) {
       await channel.dispose();
       return {};
@@ -1592,6 +1593,26 @@ test('bundled self compaction uses read-only readiness, one admission and observ
       requests.slice(before).every((r) => r.method === 'compact-ready'),
       true,
     );
+    // A terminal readiness code ends polling at once and reports the window's reason.
+    for (const code of [
+      'no-reader-instruction',
+      'reader-acted',
+      'background',
+      'already-used',
+      'request-used',
+      'withdrawn',
+    ]) {
+      terminal = { ready: false, code, reason: `Reason for ${code}.` };
+      const readsBeforeCode = readyTimes.length;
+      const coded = JSON.parse((await run(process.execPath, args, { env })).stdout);
+      assert.deepEqual([coded.state, coded.reason], ['refused', `Reason for ${code}.`]);
+      assert.equal(readyTimes.length - readsBeforeCode, 1, code);
+    }
+    terminal = { ready: false, code: 'not-observed', reason: 'Not seen yet.' };
+    const readsBeforeUnseen = readyTimes.length;
+    assert.equal(JSON.parse((await run(process.execPath, args, { env })).stdout).reason, 'Not seen yet.');
+    assert.ok(readyTimes.length - readsBeforeUnseen >= 2, 'readiness keeps polling while the command is unseen');
+    terminal = null;
     ready = true;
     loseReply = true;
     const writesBefore = requests.filter((r) => r.method === 'compact-request').length;
@@ -2886,4 +2907,13 @@ test('bundled dispatch wait preserves manual routes, invalid selectors and expli
     await channel.dispose();
     rmSync(home, { recursive: true, force: true });
   }
+});
+
+// Catches the CLI's copy of the not-observed refusal drifting from the window's text.
+test('the CLI not-observed refusal matches the window text', () => {
+  const cli = readFileSync(new URL('../src/compact.ts', import.meta.url), 'utf8');
+  const window = readFileSync(new URL('../../extension/src/compactrequest.ts', import.meta.url), 'utf8');
+  const text = /'not-observed': '([^']+)'/.exec(window)?.[1];
+  assert.ok(text, 'the window names a not-observed refusal');
+  assert.ok(cli.includes(`'${text}'`), 'the CLI reports the same text');
 });

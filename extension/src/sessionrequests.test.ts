@@ -432,7 +432,7 @@ function compactEvent(kind: 'toolStart' | 'toolEnd' | 'rootEnd', extra: Record<s
 test('self compaction joins one live literal root call and acknowledges before the tool and exact turn finish', async () => {
   let clock = 0;
   const book = new CompactRequests(compactWindow, () => clock);
-  assert.throws(() => book.admit(compactPayload, () => true), /live requesting tool/);
+  assert.throws(() => book.admit(compactPayload, () => true), /has not seen this command/);
   book.observe(compactBinding, compactEvent('toolStart', { sessionId: 'foreign' }));
   assert.equal(book.ready(compactPayload), false);
   book.observe(compactBinding, compactEvent('toolStart', { foreground: false }));
@@ -4506,6 +4506,123 @@ test('host compaction reports a refused provider request as failed', async () =>
     undefined,
   );
   assert.equal(compactState(host), 'failed');
+});
+
+// Catches a turn Claude starts by itself binding without the task notice that woke it, and a
+// launch that never ends, fails, or falls out of capacity binding a later turn.
+test('host compaction in a turn Claude starts by itself binds only through the notices that woke it', () => {
+  const claude = (kind: 'toolStart' | 'toolEnd' | 'rootEnd', extra: Record<string, unknown> = {}) =>
+    compactEvent(kind, { provider: 'claude', generation: 1, ...extra });
+  const launch = (toolId: string): NativeEvent => ({
+    provider: 'claude',
+    sessionId: 'self',
+    turnId: null,
+    generation: 1,
+    evidence: {},
+    kind: 'launch',
+    toolId,
+    agentId: `agent-${toolId}`,
+  });
+  const wake = (toolId: string): NativeEvent => ({
+    provider: 'claude',
+    sessionId: 'self',
+    turnId: null,
+    generation: 1,
+    evidence: {},
+    kind: 'wake',
+    toolId,
+    runId: `run-${toolId}`,
+  });
+  const code = (host: CompactHost<CompactChild>) =>
+    (host.handle({ method: 'compact-ready', params: compactPayload }) as { code?: string }).code;
+  for (const [name, expected] of [
+    ['launch without a notice', 'no-reader-instruction'],
+    ['notice inside a running turn', 'no-reader-instruction'],
+    ['notices of two reader turns', 'no-reader-instruction'],
+    ['notice of a launch whose tool failed', 'no-reader-instruction'],
+    ['notice of a launch that capacity dropped', 'no-reader-instruction'],
+    ['reader acted after the notice', 'reader-acted'],
+    ['background request', 'background'],
+    ['notice of the reader turn', undefined],
+    ['never-ending launch of an earlier reader turn', undefined],
+  ] as const) {
+    const { fixture } = compactHostFixture('claude');
+    const { host, child } = fixture;
+    child.startedByAgent = (turnId) => turnId === 9;
+    host.submitted(child, 7);
+    host.native(child, launch('one'), 7);
+    if (name === 'notice of a launch whose tool failed')
+      host.native(
+        child,
+        claude('toolEnd', {
+          toolId: 'one',
+          success: false,
+          evidence: { message: { content: [{ type: 'tool_result', tool_use_id: 'one', is_error: true }] } },
+        }),
+        7,
+      );
+    if (name === 'notices of two reader turns' || name === 'never-ending launch of an earlier reader turn') {
+      host.readerAction('self');
+      host.submitted(child, 8);
+      host.native(child, launch('two'), 8);
+      host.native(child, wake('two'), undefined);
+    }
+    if (name === 'notice of a launch that capacity dropped') {
+      host.readerAction('self');
+      host.submitted(child, 8);
+      for (let index = 0; index < 32; index++) host.native(child, launch(`later-${index}`), 8);
+      host.native(child, wake('later-0'), undefined);
+    }
+    if (!['launch without a notice', 'never-ending launch of an earlier reader turn'].includes(name))
+      host.native(child, wake('one'), name === 'notice inside a running turn' ? 7 : undefined);
+    if (name === 'reader acted after the notice') {
+      host.readerAction('self');
+      host.submitted(child, 8);
+    }
+    host.native(child, claude('toolStart', { foreground: name !== 'background request' }), 9);
+    assert.equal(code(host), expected, name);
+  }
+  // A bound turn's ending fails when its origin names no waiting notice of its submission, or when
+  // its result fails. A failed result fails at the turn end without waiting for its deadline.
+  for (const [name, evidence, success, expected] of [
+    ['origin names its notice', { origin: { kind: 'task-notification', runId: 'run-one' } }, true, 'queued'],
+    ['origin names another run', { origin: { kind: 'task-notification', runId: 'run-other' } }, true, 'failed'],
+    ['origin names its subagent', { origin: { kind: 'peer', from: 'agent-one' } }, true, 'queued'],
+    ['origin names a peer this session did not launch', { origin: { kind: 'peer', from: 'stranger' } }, true, 'failed'],
+    ['failed result', {}, false, 'failed'],
+  ] as const) {
+    const { fixture } = compactHostFixture('claude');
+    const { host, child } = fixture;
+    child.startedByAgent = (turnId) => turnId === 9 || turnId === 10;
+    host.submitted(child, 7);
+    host.native(child, launch('one'), 7);
+    host.native(child, launch('two'), 7);
+    host.native(child, wake('one'), undefined);
+    host.native(child, claude('toolStart'), 9);
+    const ack = host.handle({ method: 'compact-request', params: compactPayload }) as { state: string };
+    assert.equal(ack.state, 'queued', name);
+    host.native(child, claude('toolEnd'), 9);
+    if (success) host.replyRetained(child, 9);
+    host.native(child, claude('rootEnd', { evidence, success }), 9);
+    host.turnEnded(child);
+    assert.equal(compactState(host), expected, name);
+    // A later turn that work of the same instruction wakes cannot admit a second compaction.
+    const second = { ...compactPayload, requestId: compactWindow + ':bbbbbbbb-1111-2222-3333-444444444444' };
+    host.native(child, wake('two'), undefined);
+    host.native(
+      child,
+      claude('toolStart', {
+        toolId: 'second',
+        command: compactLiteral.replace(compactPayload.requestId, second.requestId),
+      }),
+      10,
+    );
+    assert.equal(
+      (host.handle({ method: 'compact-ready', params: second }) as { code?: string }).code,
+      'already-used',
+      name,
+    );
+  }
 });
 
 // Catches a Claude request that never binds to its prompt generation or never completes from the manual compact result.

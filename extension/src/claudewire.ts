@@ -985,12 +985,24 @@ export class ClaudeWire {
             kind: 'native',
             event: { ...base, kind: 'toolStart', toolId, command, foreground: input?.run_in_background !== true },
           });
+        if (
+          tool?.type === 'tool_use' &&
+          ['Bash', 'Agent', 'Task'].includes(String(tool.name)) &&
+          input?.run_in_background === true &&
+          toolId
+        )
+          this.emit({ kind: 'native', event: { ...base, kind: 'launch', toolId, agentId: null } });
       }
     }
     if (message.type === 'user' && message.parent_tool_use_id === null) {
       for (const block of arr(obj(message.message)?.content)) {
         const tool = obj(block);
         const toolId = str(tool?.tool_use_id);
+        if (tool?.type === 'tool_result' && toolId && backgroundResult?.status === 'async_launched')
+          this.emit({
+            kind: 'native',
+            event: { ...base, kind: 'launch', toolId, agentId: str(backgroundResult.agentId) },
+          });
         if (tool?.type === 'tool_result' && toolId)
           this.emit({
             kind: 'native',
@@ -1022,6 +1034,13 @@ export class ClaudeWire {
           },
         });
     }
+    // Claude Code reports the end of background work as a system notice that names the launching
+    // tool call. A notice that arrives while no turn runs precedes the turn Claude starts by itself.
+    if (message.type === 'system' && message.subtype === 'task_notification' && str(message.tool_use_id))
+      this.emit({
+        kind: 'native',
+        event: { ...base, kind: 'wake', toolId: str(message.tool_use_id)!, runId: str(message.run_id) },
+      });
     if (message.type === 'system' && (message.subtype === 'status' || message.subtype === 'compact_boundary'))
       this.emit({
         kind: 'native',

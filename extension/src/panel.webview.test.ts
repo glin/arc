@@ -670,6 +670,7 @@ test('response session navigation releases only its invoking clear route and ret
 import type { TurnOutcome } from './transcript';
 import {
   guardedSourceRevision,
+  RecordedReplies,
   sessionCatalogMembership,
   sessionDiscoveryMembership,
   sessionSourceKey,
@@ -2147,7 +2148,7 @@ import { sameCommitSha, listSessionFiles, readTurns } from './transcript.ts';
 import { handoffRefusalMessage, pressIsMidTurn, pressesAfter } from './composerview.ts';
 import { compaction, livePress, powershellDispatchExecution, subagentCommitTurn, turn } from './turnfixtures.ts';
 import { ClaudeWire } from './claudewire.ts';
-import { CompactHost, type CompactChild } from './compactrequest.ts';
+import { COMPACT_LIMITS, CompactHost, CompactRequests, type CompactChild } from './compactrequest.ts';
 import { currentRecordsBySession, turnKey } from './turnread.ts';
 import { ProgressiveWorker, acceptsProgressiveResult, type ProgressiveInput } from './progressiveworker.ts';
 import { handleNavigationPress, navigationButton, ROVING_SELECTOR } from './webview/navigation.ts';
@@ -25876,7 +25877,12 @@ test('completed responses replace streamed text and survive consecutive prompts 
     const extensionSource = fs.readFileSync(path.join(__dirname, 'extension.ts'), 'utf8');
     sourceMatch(
       extensionSource,
-      /if \(event\.kind === 'text'\) \{[\s\S]*?panel\.noteCompletedReply\(where, event\.text, event\.sourceId, turnId,[\s\S]*?return;/,
+      /routeCompactionEvent\(compaction, panel,/,
+      'the window routes text events to the panel',
+    );
+    sourceMatch(
+      fs.readFileSync(path.join(__dirname, 'compactrequest.ts'), 'utf8'),
+      /if \(event\.kind === 'text'\) \{[\s\S]*?replies\.noteCompletedReply\(where, event\.text, event\.sourceId, turnId,[\s\S]*?return true;/,
       'completed response delivery waits for catalog refresh',
     );
     await vi.runOnlyPendingTimersAsync();
@@ -26070,6 +26076,174 @@ test('pending response ownership rejects foreign events and clears failed, expir
   } finally {
     vi.useRealTimers();
   }
+});
+
+// A turn Claude started by itself has no response card. Its final response counts once the
+// session's transcript records the same assistant message, read without the panel showing it.
+function recordedReplyFixture(prefix: string) {
+  const sessionId = 'woken';
+  const file = path.join(tempDir(prefix), `${sessionId}.jsonl`);
+  fs.writeFileSync(file, '');
+  let second = 0;
+  const at = () => new Date(Date.UTC(2026, 0, 4, 0, 0, second++)).toISOString();
+  const record = (prompt: string, id: string, text: string) =>
+    fs.appendFileSync(
+      file,
+      [
+        { type: 'user', timestamp: at(), message: { role: 'user', content: prompt } },
+        {
+          type: 'assistant',
+          timestamp: at(),
+          message: {
+            role: 'assistant',
+            id,
+            model: 'claude-opus-5',
+            stop_reason: 'end_turn',
+            content: [{ type: 'text', text }],
+            usage: { input_tokens: 10, output_tokens: 20 },
+          },
+        },
+      ]
+        .map((line) => JSON.stringify(line))
+        .join('\n') + '\n',
+    );
+  const provider: any = Object.assign(Object.create(PanelProvider.prototype), {
+    disposed: false,
+    showing: 'other',
+    hostSessions: new Map(),
+    newestBySession: new Map(),
+    catalog: { folders: '', sessions: [{ agent: 'claude', sessionId, file }] },
+    recordedReplies: new RecordedReplies(),
+  });
+  const saves: string[] = [];
+  const note = (sourceId: string, text: string, wanted = () => true) =>
+    provider.noteRecordedReply(sessionId, sourceId, text, () => saves.push(sourceId), wanted);
+  return { provider, record, note, saves };
+}
+
+test('a recorded reply of a session no panel shows settles through its own transcript read', () => {
+  const { provider, record, note, saves } = recordedReplyFixture('recorded-reply-unshown-');
+  note('msg-woken', 'The tests pass.');
+  assert.deepEqual(saves, [], 'the transcript does not hold the response yet');
+  record('task finished', 'msg-woken', 'The tests pass.');
+  provider.settleRecordedReplies();
+  assert.deepEqual(saves, ['msg-woken']);
+  provider.settleRecordedReplies();
+  assert.deepEqual(saves, ['msg-woken'], 'a settled response is not saved twice');
+});
+
+// Catches a hidden panel never settling a response that the transcript records after the turn ended.
+test('a recorded reply settles without panel polling when the transcript records it after the turn end', () => {
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+  try {
+    const { provider, record, note, saves } = recordedReplyFixture('recorded-reply-late-');
+    // Every panel is hidden, so polling has stopped.
+    provider.watching = false;
+    note('msg-late', 'The build passed.');
+    // The turn end settles before the transcript holds the response.
+    provider.settleRecordedReplies();
+    assert.deepEqual(saves, []);
+    record('task finished', 'msg-late', 'The build passed.');
+    vi.runOnlyPendingTimers();
+    assert.deepEqual(saves, ['msg-late']);
+    assert.equal(vi.getTimerCount(), 0, 'nothing waits, so the reads stop');
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+// Catches hidden-window reads repeating every second after the compaction request's deadline,
+// when the transcript never records the response and no other event expires the request.
+test('recorded reply reads stop at the compaction request deadline when the transcript never records the response', () => {
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+  try {
+    const window = 'b'.repeat(24);
+    const requests = new CompactRequests(window, () => Date.now());
+    const binding = {
+      activation: window,
+      provider: 'claude' as const,
+      sessionId: 'woken',
+      childGeneration: 1,
+      turn: '1',
+      submissionId: '9',
+      readerRevision: 1,
+    };
+    const payload = {
+      requestId: window + ':aaaaaaaa-1111-2222-3333-444444444444',
+      window,
+      self: true as const,
+      afterTurn: true as const,
+    };
+    requests.observe(binding, {
+      provider: 'claude',
+      sessionId: 'woken',
+      turnId: 'root',
+      generation: 1,
+      evidence: {},
+      kind: 'toolStart',
+      toolId: 'call',
+      command: `arc compact request --self --after-turn --request-id ${payload.requestId} --window ${window} --json`,
+      foreground: true,
+    });
+    assert.equal(requests.admit(payload, () => true).state, 'queued');
+    const { provider, note, saves } = recordedReplyFixture('recorded-reply-deadline-');
+    // Every panel is hidden, so polling has stopped.
+    provider.watching = false;
+    note('msg-unrecorded', 'The build passed.', () => requests.awaitsReply(() => true));
+    provider.settleRecordedReplies();
+    vi.runOnlyPendingTimers();
+    assert.equal(vi.getTimerCount(), 1, 'the request still waits, so the reads continue');
+    vi.setSystemTime(Date.now() + COMPACT_LIMITS.admissionMs);
+    vi.runOnlyPendingTimers();
+    assert.equal(vi.getTimerCount(), 0, 'the deadline passed, so the reads stop');
+    assert.deepEqual(saves, []);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('a recorded reply matches its own assistant message, not an earlier turn with the same text', () => {
+  const { provider, record, note, saves } = recordedReplyFixture('recorded-reply-identical-');
+  record('first notice', 'msg-first', 'noted');
+  note('msg-second', 'noted');
+  provider.settleRecordedReplies();
+  assert.deepEqual(saves, [], 'the earlier turn answered with the same text');
+  record('second notice', 'msg-second', 'noted');
+  provider.settleRecordedReplies();
+  assert.deepEqual(saves, ['msg-second']);
+});
+
+test('a recorded reply settles when a newer turn is recorded before the next read', () => {
+  const { provider, record, note, saves } = recordedReplyFixture('recorded-reply-newer-');
+  note('msg-earlier', 'Done with the build.');
+  record('build notice', 'msg-earlier', 'Done with the build.');
+  record('review notice', 'msg-later', 'The review is clean.');
+  provider.settleRecordedReplies();
+  assert.deepEqual(saves, ['msg-earlier']);
+});
+
+test('a recorded reply with empty text or no assistant message id never waits', () => {
+  const { provider, record, note, saves } = recordedReplyFixture('recorded-reply-empty-');
+  record('notice', 'msg-blank', 'Recorded text.');
+  note('msg-blank', '   ');
+  note('', 'Recorded text.');
+  provider.settleRecordedReplies();
+  assert.deepEqual(saves, []);
+  assert.deepEqual(provider.recordedReplies.sessions(), []);
+});
+
+test('a recorded reply is dropped once its request no longer waits', () => {
+  const { provider, record, note, saves } = recordedReplyFixture('recorded-reply-unwanted-');
+  let waits = true;
+  note('msg-expired', 'Finished.', () => waits);
+  note('msg-refused', 'Finished.', () => false);
+  assert.deepEqual(provider.recordedReplies.sessions(), ['woken']);
+  waits = false;
+  record('notice', 'msg-expired', 'Finished.');
+  record('notice', 'msg-refused', 'Finished.');
+  provider.settleRecordedReplies();
+  assert.deepEqual(saves, []);
+  assert.deepEqual(provider.recordedReplies.sessions(), []);
 });
 
 test('zero-turn local answers retire their unfinished prompt beside retained responses', () => {

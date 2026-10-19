@@ -138,6 +138,8 @@ function compact(action: 'request' | 'status'): Command {
         ...(request
           ? [
               'Admission requires this live foreground tool call in the hosted main session, with no open asks or queued reader input.',
+              'A turn Claude starts by itself admits a request only when task notices from background work of one reader turn woke it.',
+              'One reader instruction admits one compaction. A refusal reason names the missing condition.',
               'Missing readiness or reader intervention refuses or cancels compaction.',
             ]
           : ['A missing request or unavailable window reports unavailable.']),

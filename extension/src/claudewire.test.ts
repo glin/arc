@@ -2395,3 +2395,33 @@ test('Claude idle evidence clears at every user frame, including a delayed attac
   assert.equal(h.parsed().at(-1).message.content[0].text, '/effort high');
   assert.equal(h.wire.idleEvidence(), false);
 });
+
+// Catches a change in the envelopes that bind a turn Claude starts by itself: the launch, its task
+// notice, and the origin that names the notice by run or the subagent by its launched agent id.
+test('recorded task notices and hand-backs name the launch that the woken result names', async () => {
+  const { readFileSync } = await import('node:fs');
+  const path = await import('node:path');
+  const replay = (name: string) => {
+    const h = harness();
+    for (const line of readFileSync(path.join(__dirname, '../test/fixtures', name), 'utf8')
+      .trim()
+      .split('\n'))
+      h.wire.receive(line);
+    return h.events.flatMap((e) => (e.kind === 'native' ? [e.event] : []));
+  };
+  const peer = replay('claude-peer-handback-2.1.303.jsonl');
+  const launched = peer.find((e) => e.kind === 'launch' && e.agentId !== null);
+  assert.ok(launched?.kind === 'launch');
+  assert.ok(peer.some((e) => e.kind === 'wake' && e.toolId === launched.toolId));
+  const origins = peer.flatMap((e) =>
+    e.kind === 'rootEnd' ? [e.evidence.origin as { kind?: string; from?: string }] : [],
+  );
+  assert.ok(origins.some((origin) => origin?.kind === 'peer' && origin.from === launched.agentId));
+  const queued = replay('claude-back-to-back-notices-2.1.303.jsonl');
+  const runs = queued.flatMap((e) => (e.kind === 'wake' ? [e.runId] : []));
+  const named = queued.flatMap((e) =>
+    e.kind === 'rootEnd' && e.evidence.origin ? [(e.evidence.origin as { runId?: string }).runId] : [],
+  );
+  assert.equal(named.length, 1);
+  assert.ok(runs.includes(named[0]!));
+});

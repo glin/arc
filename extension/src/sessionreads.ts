@@ -995,3 +995,74 @@ export function boundedSessionRead(
     result.notes.push('No turns were parsed in the bounded window. This does not establish an empty session.');
   return result;
 }
+
+export const RECORDED_REPLY_LIMITS = { perSession: 4, sessions: 32, turns: 4, tailBytes: 1024 * 1024 } as const;
+
+export interface RecordedReply {
+  // The assistant message id of the final response.
+  sourceId: string;
+  text: string;
+  // Called once, when a recorded turn holds this final response.
+  saved: () => void;
+  // False once nothing waits for this response. The entry is then dropped.
+  wanted: () => boolean;
+}
+
+// Final responses of turns Claude started by itself. Such a turn has no response card, so its
+// response counts as held once a recorded turn of the session carries the same assistant message.
+export class RecordedReplies {
+  private waiting = new Map<string, RecordedReply[]>();
+
+  // Holds a response until a recorded turn carries it. Returns false for an empty id or text,
+  // or for a response nothing waits for.
+  note(session: string, reply: RecordedReply): boolean {
+    if (!reply.sourceId || !reply.text.trim() || !reply.wanted()) return false;
+    const held = (this.waiting.get(session) ?? []).filter((one) => one.sourceId !== reply.sourceId && one.wanted());
+    this.waiting.delete(session);
+    this.waiting.set(session, [...held, reply].slice(-RECORDED_REPLY_LIMITS.perSession));
+    while (this.waiting.size > RECORDED_REPLY_LIMITS.sessions) this.waiting.delete(this.waiting.keys().next().value!);
+    return true;
+  }
+
+  // The sessions with a response still wanted. Entries nothing waits for are dropped first.
+  sessions(): string[] {
+    for (const [session, held] of [...this.waiting]) {
+      const wanted = held.filter((one) => one.wanted());
+      if (wanted.length) this.waiting.set(session, wanted);
+      else this.waiting.delete(session);
+    }
+    return [...this.waiting.keys()];
+  }
+
+  // Settles each waiting response that one of the session's recorded turns holds as its final
+  // response, with nonempty text. Any turn counts, so a newer turn recorded first does not hide it.
+  settle(session: string, turns: readonly Pick<Turn, 'finalResponse'>[]): void {
+    const held = this.waiting.get(session);
+    if (!held) return;
+    const recorded = new Set<string>();
+    for (const turn of turns)
+      if (turn.finalResponse?.sourceId && turn.finalResponse.text.trim()) recorded.add(turn.finalResponse.sourceId);
+    const left: RecordedReply[] = [];
+    const settled: RecordedReply[] = [];
+    for (const one of held) {
+      if (!one.wanted()) continue;
+      (recorded.has(one.sourceId) ? settled : left).push(one);
+    }
+    if (left.length) this.waiting.set(session, left);
+    else this.waiting.delete(session);
+    for (const one of settled) one.saved();
+  }
+}
+
+// The newest turns of one Claude transcript with their final responses. The read is bounded and
+// does not depend on a panel showing the session.
+export function recordedReplyTurns(source: SessionFile): Turn[] {
+  return readSession(source.file, source.sessionId, {
+    maxTurns: RECORDED_REPLY_LIMITS.turns,
+    tailBytes: RECORDED_REPLY_LIMITS.tailBytes,
+    turnsOnly: true,
+    dispatchResponse: true,
+    boundedRepeated: true,
+    childTranscript: source.childTranscript === true,
+  }).turns;
+}

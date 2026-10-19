@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import type { GuardedAttempt, NativeEvent } from './agentwire';
+import type { GuardedAttempt, NativeEvent, WireEvent } from './agentwire';
 
 export const COMPACT_LIMITS = { records: 256, admissionMs: 15 * 60_000, retentionMs: 60 * 60_000 } as const;
 export interface CompactPayload {
@@ -59,6 +59,25 @@ export function validContinuationPath(file: string, platform = process.platform)
     relative.split('/').every((part) => part.length > 0 && part !== '.' && part !== '..')
   );
 }
+// Why `compact-ready` holds no live call for a payload. Only `not-observed` can still change.
+export type CompactRejection =
+  | 'not-observed'
+  | 'no-reader-instruction'
+  | 'reader-acted'
+  | 'background'
+  | 'already-used'
+  | 'request-used'
+  | 'withdrawn';
+export const COMPACT_REJECTIONS: Record<CompactRejection, string> = {
+  'not-observed': 'Arc has not seen this command run in the session yet. No compaction was queued.',
+  'no-reader-instruction': "Arc cannot connect this request to the reader's instructions. No compaction was queued.",
+  'reader-acted': 'The reader acted in this session after giving the instruction. No compaction was queued.',
+  background: 'The command ran in the background. Arc accepts only a foreground command. No compaction was queued.',
+  'already-used': "The reader's instruction already requested compaction once. No compaction was queued.",
+  'request-used': 'This request ID was already used in this Arc window. No compaction was queued.',
+  withdrawn: 'The session changed or closed before Arc could accept the request. No compaction was queued.',
+};
+export type CompactReadiness = { ready: true } | { ready: false; code: CompactRejection; reason: string };
 export type CompactState = 'queued' | 'started' | 'completed' | 'cancelled' | 'refused' | 'failed' | 'uncertain';
 export interface CompactBinding {
   activation: string;
@@ -212,6 +231,10 @@ export class CompactRequests {
   private claiming: Assignment | null = null;
   private disposed = false;
   private readonly continuationAssignments = new Set<string>();
+  // Reader assignments that admitted a compaction. One assignment admits one, across its own turn
+  // and every turn that work it launched wakes.
+  private readonly compactedAssignments = new Set<string>();
+  private readonly rejections = new Map<string, CompactRejection>();
   private readonly admissions = new Map<string, Promise<Readonly<CompactObservation>>>();
   constructor(
     private readonly activation: string,
@@ -323,8 +346,48 @@ export class CompactRequests {
       .map(([id, a]) => ({ id, binding: a.binding }));
   }
 
+  // Whether an unsubmitted assignment that matches still waits for its final response. An
+  // assignment past its deadline no longer waits, even before prune records the expiry.
+  awaitsReply(predicate: (binding: Readonly<CompactBinding>) => boolean): boolean {
+    return [...this.assignments.values()].some(
+      (a) =>
+        !a.submitted &&
+        a.observation.state === 'queued' &&
+        !a.finalRetained &&
+        this.now() < a.deadline &&
+        predicate(a.binding),
+    );
+  }
+
+  readiness(payload: CompactPayload): CompactReadiness {
+    const refuse = (code: CompactRejection): CompactReadiness => ({
+      ready: false,
+      code,
+      reason: COMPACT_REJECTIONS[code],
+    });
+    if (this.disposed) return refuse('not-observed');
+    const live = [...this.calls.values()].find((call) => payloadKey(call.payload) === payloadKey(payload));
+    if (this.consumed.has(payload.requestId)) return refuse('request-used');
+    if (live?.binding.assignmentId !== undefined && this.compactedAssignments.has(live.binding.assignmentId))
+      return refuse('already-used');
+    if (live) return { ready: true };
+    return refuse(this.rejections.get(payloadKey(payload)) ?? 'not-observed');
+  }
+
   ready(payload: CompactPayload): boolean {
-    return !this.disposed && [...this.calls.values()].some((call) => payloadKey(call.payload) === payloadKey(payload));
+    return this.readiness(payload).ready;
+  }
+
+  // Keeps why an exact request command gained no live call, so readiness reports the reason.
+  reject(command: string, code: CompactRejection): void {
+    const payload = compactCommandPayload(command);
+    if (payload && payload.window === this.activation) this.rejectPayload(payload, code);
+  }
+
+  private rejectPayload(payload: CompactCommand, code: CompactRejection): void {
+    this.rejections.delete(payloadKey(payload));
+    this.rejections.set(payloadKey(payload), code);
+    if (this.rejections.size > this.capacity) this.rejections.delete(this.rejections.keys().next().value!);
   }
 
   admit(
@@ -352,9 +415,18 @@ export class CompactRequests {
       this.assignments.size >= this.capacity
     )
       throw new Error('This compaction request is unavailable in this Arc window.');
-    if (!live || !eligible(live[1].binding))
-      throw new Error('The live requesting tool is unavailable, or the session has asks or queued reader input.');
+    if (!live) {
+      const readiness = this.readiness(payload);
+      throw new Error(readiness.ready ? COMPACT_REJECTIONS['not-observed'] : readiness.reason);
+    }
     const [key, call] = live;
+    if (call.binding.assignmentId !== undefined && this.compactedAssignments.has(call.binding.assignmentId)) {
+      this.calls.delete(key);
+      this.rejectPayload(payload, 'already-used');
+      throw new Error(COMPACT_REJECTIONS['already-used']);
+    }
+    if (!eligible(call.binding))
+      throw new Error('The session has an open question or queued reader input. No compaction was queued.');
     if (
       payload.continuation &&
       (!this.persistence ||
@@ -369,12 +441,14 @@ export class CompactRequests {
           a.binding.sessionId === call.binding.sessionId &&
           a.binding.childGeneration === call.binding.childGeneration &&
           a.binding.turn === call.binding.turn &&
+          a.binding.submissionId === call.binding.submissionId &&
           ['queued', 'started', 'uncertain'].includes(a.observation.state),
       )
     )
       throw new Error('This turn already has a pending compaction request.');
     this.calls.delete(key);
     this.consumed.add(payload.requestId);
+    if (call.binding.assignmentId !== undefined) this.compactedAssignments.add(call.binding.assignmentId);
     if (payload.continuation) this.continuationAssignments.add(call.binding.assignmentId!);
     const acknowledgement = Object.freeze({
       requestId: payload.requestId,
@@ -642,8 +716,18 @@ export class CompactRequests {
   }
 
   // Cancels unsubmitted assignments that match. Live calls that match also lose their authority unless keepCalls is set.
-  invalidate(predicate: (binding: Readonly<CompactBinding>) => boolean, reason: string, keepCalls = false): void {
-    if (!keepCalls) for (const [key, call] of this.calls) if (predicate(call.binding)) this.calls.delete(key);
+  invalidate(
+    predicate: (binding: Readonly<CompactBinding>) => boolean,
+    reason: string,
+    keepCalls = false,
+    code?: CompactRejection,
+  ): void {
+    if (!keepCalls)
+      for (const [key, call] of this.calls)
+        if (predicate(call.binding)) {
+          this.calls.delete(key);
+          this.rejectPayload(call.payload, code ?? 'withdrawn');
+        }
     for (const assignment of this.assignments.values()) {
       if (!predicate(assignment.binding)) continue;
       const previous = assignment.observation;
@@ -863,6 +947,8 @@ export interface CompactChild {
   };
   // True while an earlier compaction request of this child can still start or finish a turn.
   compactionUnresolved(): boolean;
+  // True for a turn Claude started by itself, such as one a background task notice woke.
+  startedByAgent?(turnId: number): boolean;
   compact(beforeWrite: () => void): Promise<unknown>;
   guardedIdle?(): string | null;
   guardedPrompt?(
@@ -892,6 +978,31 @@ interface Submission {
   assignmentId: string;
 }
 
+// A root background launch, the submission whose turn made it, and the subagent it started, if any.
+// The submission is null when that turn had no reader instruction. `woke` holds while its task notice waits for the turn that Claude
+// starts by itself to answer it.
+interface Launch {
+  submission: Submission | null;
+  agentId: string | null;
+  runId: string | null;
+  woke: boolean;
+}
+
+function launchFailed(evidence: unknown, toolId: string): boolean {
+  const content = (evidence as { message?: { content?: unknown } } | null)?.message?.content;
+  return (
+    Array.isArray(content) &&
+    content.some(
+      (block: { type?: unknown; tool_use_id?: unknown; is_error?: unknown } | null) =>
+        block?.type === 'tool_result' && block.tool_use_id === toolId && block.is_error === true,
+    )
+  );
+}
+
+function lineageKey(submission: Submission): string {
+  return `${submission.sessionId}:${submission.revision}:${submission.assignmentId}`;
+}
+
 const SUBMISSIONS_PER_CHILD = 32;
 
 // Joins host observations to deferred assignments for one window activation.
@@ -909,6 +1020,13 @@ export class CompactHost<C extends CompactChild> {
   private settling = false;
   private disposed = false;
   private readonly assignments = new WeakMap<C, string>();
+  private readonly launches = new WeakMap<C, Map<string, Launch>>();
+  // Launches that capacity dropped from `launches`. A task notice that names one explains nothing.
+  private readonly evicted = new WeakMap<C, Set<string>>();
+  // Children whose dropped launches also overflowed `evicted`. They bind nothing until both are empty.
+  private readonly incomplete = new WeakSet<C>();
+  // Turns Claude started by itself that no task notice explains. They never bind.
+  private readonly unbound = new WeakMap<C, Set<number>>();
 
   constructor(
     private readonly activation: string,
@@ -927,6 +1045,7 @@ export class CompactHost<C extends CompactChild> {
       (binding) => binding.sessionId === sessionId,
       'The reader acted in this session before compaction started.',
       answer,
+      'reader-acted',
     );
   }
 
@@ -994,17 +1113,40 @@ export class CompactHost<C extends CompactChild> {
         queueMicrotask(() => void this.drain(event.sessionId));
       return;
     }
+    if (event.kind === 'wake') {
+      this.wake(child, event.toolId, event.runId, turnId);
+      return;
+    }
+    if (event.kind === 'launch') {
+      const submission = turnId === undefined ? undefined : this.submissionOf(child, turnId);
+      this.recordLaunch(child, event.toolId, submission ?? null, event.agentId);
+      return;
+    }
+    // A launch whose tool reported an error never sends a task notice. A launched task's result
+    // carries no interruption field, so `success` alone cannot tell it from a failed launch.
+    if (event.kind === 'toolEnd' && launchFailed(event.evidence, event.toolId)) this.release(child, event.toolId);
     const binding = this.binding(child, event, turnId);
+    if (event.kind === 'toolStart') {
+      if (!event.foreground) this.requests.reject(event.command, 'background');
+      else if (!binding) this.requests.reject(event.command, 'no-reader-instruction');
+      else if (binding.readerRevision !== this.revision(binding.sessionId)) {
+        this.requests.reject(event.command, 'reader-acted');
+        return;
+      }
+    }
+    if (event.kind === 'rootEnd' && !this.answered(child, event, turnId) && binding)
+      event = { ...event, success: false };
     if (!binding || turnId === undefined) return;
     const replies = this.replies.get(child) ?? new Set<number>();
     this.replies.set(child, replies);
     if (event.kind === 'rootEnd') {
       // A root success waits until the panel saves the final response for the reader.
       if (replies.has(turnId)) this.requests.observe(binding, event, true);
-      else {
+      else if (!child.startedByAgent?.(turnId) || this.awaitsRecordedReply(child, turnId)) {
         const endings = this.endings.get(child) ?? new Map<number, { binding: CompactBinding; event: NativeEvent }>();
         this.endings.set(child, endings);
         endings.set(turnId, { binding, event });
+        if (endings.size > SUBMISSIONS_PER_CHILD) endings.delete(endings.keys().next().value!);
       }
       return;
     }
@@ -1026,12 +1168,26 @@ export class CompactHost<C extends CompactChild> {
     this.requests.observe(ending.binding, ending.event, true);
   }
 
-  // A child turn ended. Root endings still waiting for a saved response fail.
+  // Whether an admitted request of this turn still waits for the panel to hold its final response.
+  awaitsRecordedReply(child: C, turnId: number): boolean {
+    if (this.disposed || !this.generations.has(child)) return false;
+    const generation = this.generations.get(child);
+    return this.requests.awaitsReply(
+      (binding) => binding.childGeneration === generation && binding.submissionId === String(turnId),
+    );
+  }
+
+  // A child turn ended. Root endings still waiting for a saved response fail, except the successful
+  // ending of a turn Claude started by itself. That turn has no response card, so its ending waits
+  // until the panel reads the recorded turn, or until the assignment deadline.
   turnEnded(child: C): void {
     const endings = this.endings.get(child);
     if (!endings) return;
-    this.endings.delete(child);
-    for (const ending of endings.values()) this.requests.observe(ending.binding, ending.event, false);
+    for (const [turnId, ending] of endings) {
+      if (ending.event.kind === 'rootEnd' && ending.event.success && child.startedByAgent?.(turnId)) continue;
+      endings.delete(turnId);
+      this.requests.observe(ending.binding, ending.event, false);
+    }
   }
 
   childGone(key: string): void {
@@ -1135,9 +1291,9 @@ export class CompactHost<C extends CompactChild> {
       };
     }
     if (request.method === 'compact-ready')
-      return {
-        ready: validCompactPayload(params) && this.requests.ready(params),
-      };
+      return validCompactPayload(params)
+        ? this.requests.readiness(params)
+        : { ready: false, code: 'not-observed', reason: COMPACT_REJECTIONS['not-observed'] };
     try {
       if (request.method !== 'compact-request' || !validCompactPayload(params))
         throw new Error('This compaction request is unavailable in this Arc window.');
@@ -1183,7 +1339,7 @@ export class CompactHost<C extends CompactChild> {
     const provider = child.agent;
     if (turnId === undefined || (provider !== 'claude' && provider !== 'codex') || event.provider !== provider)
       return null;
-    const submission = this.submissions.get(child)?.get(turnId);
+    const submission = this.submissionOf(child, turnId);
     const turn = provider === 'claude' ? (event.generation === null ? null : String(event.generation)) : event.turnId;
     if (
       !submission ||
@@ -1206,6 +1362,93 @@ export class CompactHost<C extends CompactChild> {
         ? { sourceIdentity: (this.port.source ?? this.port.authority)!(provider, event.sessionId) ?? undefined }
         : {}),
     };
+  }
+
+  // A turn Claude starts by itself answers the task notices that arrived while no turn ran. It takes
+  // the submission whose turns launched the work of every such notice. It binds nothing when no
+  // notice waits, when a notice names a launch of a turn without a reader instruction or a dropped
+  // launch, or when the notices name launches of different submissions. The copy keeps the source's
+  // session, revision and reader assignment.
+  private submissionOf(child: C, turnId: number): Submission | undefined {
+    const book = this.submissions.get(child);
+    const known = book?.get(turnId);
+    if (known || !child.startedByAgent?.(turnId) || this.unbound.get(child)?.has(turnId)) return known;
+    const sources = new Map<string, Submission | null>();
+    for (const launch of this.launches.get(child)?.values() ?? [])
+      if (launch.woke) sources.set(launch.submission ? lineageKey(launch.submission) : '', launch.submission);
+    const source = sources.size === 1 ? [...sources.values()][0] : null;
+    if (!source || this.incomplete.has(child)) {
+      const unbound = this.unbound.get(child) ?? new Set<number>();
+      this.unbound.set(child, unbound);
+      unbound.add(turnId);
+      if (unbound.size > SUBMISSIONS_PER_CHILD) unbound.delete(unbound.values().next().value!);
+      return undefined;
+    }
+    const entry = { ...source };
+    const target = book ?? new Map<number, Submission>();
+    this.submissions.set(child, target);
+    target.set(turnId, entry);
+    if (target.size > SUBMISSIONS_PER_CHILD) target.delete(target.keys().next().value!);
+    return entry;
+  }
+
+  private recordLaunch(child: C, toolId: string, submission: Submission | null, agentId: string | null): void {
+    const launches = this.launches.get(child) ?? new Map<string, Launch>();
+    this.launches.set(child, launches);
+    const known = launches.get(toolId);
+    if (known) {
+      known.agentId ??= agentId;
+      return;
+    }
+    launches.set(toolId, { submission, agentId, runId: null, woke: false });
+    if (launches.size <= SUBMISSIONS_PER_CHILD) return;
+    const dropped = launches.keys().next().value!;
+    launches.delete(dropped);
+    const evicted = this.evicted.get(child) ?? new Set<string>();
+    this.evicted.set(child, evicted);
+    evicted.add(dropped);
+    if (evicted.size <= SUBMISSIONS_PER_CHILD) return;
+    evicted.delete(evicted.values().next().value!);
+    this.incomplete.add(child);
+  }
+
+  // A task notice inside an owned turn is that turn's to answer, so it releases its launch. Any other
+  // notice waits. The next turn Claude starts by itself binds to it, and the next `result` releases it.
+  private wake(child: C, toolId: string, runId: string | null, turnId: number | undefined): void {
+    const launches = this.launches.get(child) ?? new Map<string, Launch>();
+    this.launches.set(child, launches);
+    if (this.evicted.get(child)?.delete(toolId))
+      launches.set(toolId, { submission: null, agentId: null, runId, woke: false });
+    const launch = launches.get(toolId);
+    if (!launch) return;
+    if (turnId !== undefined) this.release(child, toolId);
+    else Object.assign(launch, { runId, woke: true });
+  }
+
+  private release(child: C, toolId: string): void {
+    const launches = this.launches.get(child);
+    launches?.delete(toolId);
+    if (!launches?.size && !this.evicted.get(child)?.size) this.incomplete.delete(child);
+  }
+
+  // Releases every waiting notice at a turn's `result`. Claude answers each notice that reaches a
+  // running turn inside that turn, also one that arrives before the turn's first tool call, when
+  // the turn has no owner yet. False when the bound turn Claude started by itself has an `origin`
+  // that names no waiting notice of its submission. The origin names a run for a task notice and a
+  // subagent for a hand-back.
+  private answered(child: C, event: NativeEvent, turnId: number | undefined): boolean {
+    const waiting = [...(this.launches.get(child) ?? [])].filter(([, launch]) => launch.woke);
+    for (const [toolId] of waiting) this.release(child, toolId);
+    const agentStarted = turnId !== undefined && !!child.startedByAgent?.(turnId);
+    const origin = event.evidence.origin as { kind?: unknown; runId?: unknown; from?: unknown } | undefined;
+    if (!agentStarted || !origin || typeof origin !== 'object') return true;
+    const named = waiting.find(([, launch]) =>
+      origin.kind === 'peer'
+        ? launch.agentId !== null && launch.agentId === origin.from
+        : origin.kind === 'task-notification' && launch.runId !== null && launch.runId === origin.runId,
+    );
+    const bound = this.submissions.get(child)?.get(turnId);
+    return !bound || (!!named?.[1].submission && lineageKey(named[1].submission) === lineageKey(bound));
   }
 
   // Asks and queued reader input, including a queued `/compact`, block admission and delivery.
@@ -1236,4 +1479,48 @@ export class CompactHost<C extends CompactChild> {
     const state = child.state();
     return state.exited || state.sessionId !== binding.sessionId ? null : child;
   }
+}
+
+// The panel calls that hold a final response for the compaction its turn requested.
+export interface ReplyHolder {
+  noteRecordedReply(session: string, sourceId: string, text: string, saved: () => void, wanted: () => boolean): void;
+  noteCompletedReply(session: string, text: string, sourceId?: string, turnId?: number, saved?: () => void): void;
+  settleRecordedReplies(): void;
+}
+
+// Routes the child events that self-compaction reads. Returns true when the event needs no other
+// handling. A turn Claude started by itself has no response card, so its final response waits for a
+// recorded turn while a compaction request of that turn waits for it.
+export function routeCompactionEvent<C extends CompactChild>(
+  compaction: CompactHost<C> | null,
+  replies: ReplyHolder,
+  child: C | null,
+  event: WireEvent,
+  turnId: number | undefined,
+): boolean {
+  if (event.kind === 'native') {
+    if (child) compaction?.native(child, event.event, turnId);
+    return true;
+  }
+  if (event.kind === 'text') {
+    const where = child?.state().sessionId;
+    if (!child || !where) return true;
+    if (turnId !== undefined && child.startedByAgent?.(turnId)) {
+      if (compaction?.awaitsRecordedReply(child, turnId))
+        replies.noteRecordedReply(
+          where,
+          event.sourceId ?? '',
+          event.text,
+          () => compaction.replyRetained(child, turnId),
+          () => compaction.awaitsRecordedReply(child, turnId),
+        );
+    } else
+      replies.noteCompletedReply(where, event.text, event.sourceId, turnId, () => {
+        if (turnId !== undefined) compaction?.replyRetained(child, turnId);
+      });
+    return true;
+  }
+  // The transcript can record the final response after its text event.
+  if (event.kind === 'turnEnd') replies.settleRecordedReplies();
+  return false;
 }

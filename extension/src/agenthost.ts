@@ -824,6 +824,11 @@ export class AgentSession {
   private readonly promptsBehindEffort = new Set<{ id: number }>();
   private readonly preparingTurns = new Set<{ id: number }>();
   private readonly openTurns = new Set<{ id: number }>();
+  // The owner of a turn Claude starts by itself, such as one a background task notice wakes.
+  // It opens at the first root event after a `result` while no Arc turn is open or being prepared.
+  private agentTurn: { id: number } | null = null;
+  private readonly agentTurnIds = new Set<number>();
+  private resultSeen = false;
   private readonly nativeTurnOwners = new Map<string, number>();
   private readonly respondingTurns = new Set<number>();
   private readonly responseOwners = new Map<string, number>();
@@ -1267,6 +1272,7 @@ export class AgentSession {
       for (const turn of interrupted) {
         this.openTurns.delete(turn);
       }
+      this.agentTurn = null;
       // An accepted Stop leaves the session idle before the CLI says so.
       this.agentRunning = false;
       this.busy = this.countedBusy();
@@ -1413,8 +1419,34 @@ export class AgentSession {
     return this.preparingTurns.size > 0 || this.openTurns.size > 0 || this.agentRunning;
   }
 
+  // Whether Claude started this turn by itself rather than for an Arc submission.
+  startedByAgent(turnId: number): boolean {
+    return this.agentTurnIds.has(turnId);
+  }
+
+  // Opens the owner of a turn Claude started by itself, when the event can start one, and returns its ID.
+  private openAgentTurn(): number | undefined {
+    if (
+      this.agent !== 'claude' ||
+      this.driver.hasOpenTurns ||
+      !this.resultSeen ||
+      this.openTurns.size > 0 ||
+      this.preparingTurns.size > 0
+    )
+      return undefined;
+    this.resultSeen = false;
+    this.agentTurn = { id: ++sessionTurnSequence };
+    this.agentTurnIds.add(this.agentTurn.id);
+    if (this.agentTurnIds.size > 64) this.agentTurnIds.delete(this.agentTurnIds.values().next().value!);
+    return this.agentTurn.id;
+  }
+
+  // A reader prompt that opens or joins a turn retires the owner of a turn Claude started by itself.
+  // Its events then follow the reader turn, as they do for any joined prompt.
   private openTurn(turn: { id: number }): void {
     this.openTurns.add(turn);
+    this.agentTurn = null;
+    this.resultSeen = false;
     this.openedAtEnding.set(turn, this.turnEndings);
   }
 
@@ -1433,6 +1465,7 @@ export class AgentSession {
       settled.push(turn.id);
     }
     for (const id of settled) this.respondingTurns.delete(id);
+    this.agentTurn = null;
     this.agentRunning = false;
     this.interruptedTurnEnds = 0;
     this.stoppedSubmission = null;
@@ -1567,9 +1600,15 @@ export class AgentSession {
         ? native.turnId
           ? this.nativeTurnOwners.get(native.turnId)
           : undefined
-        : this.openTurns.size === 1 && this.preparingTurns.size === 0
-          ? this.openTurns.values().next().value?.id
-          : undefined;
+        : this.agentTurn
+          ? this.openTurns.size === 0 && this.preparingTurns.size === 0
+            ? this.agentTurn.id
+            : undefined
+          : this.openTurns.size === 1 && this.preparingTurns.size === 0
+            ? this.openTurns.values().next().value?.id
+            : ['toolStart', 'toolEnd', 'rootEnd', 'launch'].includes(native.kind)
+              ? this.openAgentTurn()
+              : undefined;
       let dispatchTurnId: number | undefined;
       if (
         !this.driver.hasOpenTurns &&
@@ -1611,7 +1650,12 @@ export class AgentSession {
         }
       } else if (event.kind !== 'turnEnd') {
         endedTurnId = event.sourceId ? this.responseOwners.get(event.sourceId) : undefined;
-        endedTurnId ??= this.openTurns.values().next().value?.id;
+        endedTurnId ??= this.agentTurn
+          ? this.openTurns.size === 0 && this.preparingTurns.size === 0
+            ? this.agentTurn.id
+            : undefined
+          : // Subagent text arrives between turns too, so only a root event opens a turn Claude started by itself.
+            this.openTurns.values().next().value?.id;
         if (event.sourceId && endedTurnId !== undefined) this.responseOwners.set(event.sourceId, endedTurnId);
       }
     }
@@ -1663,8 +1707,12 @@ export class AgentSession {
           this.stoppedSubmission = null;
         }
         this.turnEndings += 1;
+        this.resultSeen = true;
         const first = this.openTurns.values().next().value;
-        if (first) {
+        if (this.agentTurn) {
+          endedTurnId = this.agentTurn.id;
+          this.agentTurn = null;
+        } else if (first) {
           endedTurnId = first.id;
           this.openTurns.delete(first);
         }
@@ -1699,6 +1747,7 @@ export class AgentSession {
     this.exited = true;
     this.preparingTurns.clear();
     this.openTurns.clear();
+    this.agentTurn = null;
     this.nativeTurnOwners.clear();
     this.respondingTurns.clear();
     this.responseOwners.clear();
