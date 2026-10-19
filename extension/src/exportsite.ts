@@ -7,6 +7,7 @@ import type {
   ExportUsage,
   ExportPage,
   ExportCostPart,
+  ExportRelationship,
 } from './exportdata';
 import type { SiteAsset, SiteManifest, SitePage } from './webview/export-model';
 import {
@@ -461,6 +462,15 @@ function turnCard(
   return card;
 }
 
+// A Claude session row shows a speed only as a subagent, so every other Claude rebuild drops the session's request timing.
+function linkedRowSpend(spend: AgentSpend, kind: ExportRelationship['kind'], agent: 'claude' | 'codex'): AgentSpend {
+  if (kind === 'subagent' || agent !== 'claude') return spend;
+  const kept = { ...spend };
+  delete kept.outputRate;
+  delete kept.outputRateModel;
+  return kept;
+}
+
 interface SessionAgentFacts {
   spend: AgentSpend;
   newest: number | null;
@@ -530,8 +540,10 @@ async function sessionAgentFacts(
         for (const [name, amount] of Object.entries(value.activity.failedTools ?? {}))
           failedTools[name] = (failedTools[name] ?? 0) + amount;
         artifacts = { ...merged, ...(failures ? { failed: { count: failures, byTool: { ...failedTools } } } : {}) };
-        // An agent row names the observed stream, so a request-timed turn leaves the row unmeasured.
-        if (!value.interrupted && value.outputRate && value.outputRateBasis !== 'request') {
+        // A Claude child row names request time, so only a request-timed Claude turn adds to its speed.
+        // A Codex turn records no basis.
+        const timed = session.agent === 'claude' ? value.outputRateBasis === 'request' : true;
+        if (!value.interrupted && value.outputRate && timed) {
           if (
             !value.outputRateModel ||
             !validRate(value.outputRate) ||
@@ -847,7 +859,7 @@ export async function projectSessionSite(
                         dispatchedAgentCard(
                           target.key,
                           target.title,
-                          facts.spend,
+                          linkedRowSpend(facts.spend, edge.kind, target.agent),
                           facts.state,
                           facts.spend.artifacts?.startedAt ?? null,
                           facts.spend.artifacts?.endedAt ?? null,

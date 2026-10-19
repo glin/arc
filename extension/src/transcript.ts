@@ -71,7 +71,7 @@ import { shortenTo } from './domain/text.ts';
 import { ARC_IDENTITY } from './identity';
 import { arcHome } from './store';
 import { claudeConfigHome, codexHome } from './agentpaths';
-import { RESPONSE_RATE_LIMIT, validRate, type OutputRate, type OutputRateBasis } from './outputrate';
+import { RESPONSE_RATE_LIMIT, summedTurnRate, validRate, type OutputRate, type OutputRateBasis } from './outputrate';
 
 export { describeToolInput } from './activitydetail';
 export { shortenTo } from './domain/text.ts';
@@ -731,6 +731,8 @@ export interface Turn {
   // The interval that measured `outputRate`. Absent means the observed stream.
   outputRateBasis?: OutputRateBasis;
   responseIds?: string[];
+  // A child read's response ids, kept for request timing alone. Child reads leave `responseIds` unset.
+  timedResponseIds?: string[];
   finalResponse?: { text: string; sourceId: string | null };
   // The turn's first response id, which the cap on `responseIds` never drops.
   openingResponseId?: string;
@@ -9088,6 +9090,9 @@ interface ClaudeOwnSpend {
   effort: string | null;
   finished: boolean;
   record: ClaudeSpendRecord | null;
+  // The summed request timing of this transcript's own turns. Only a subagent transcript has one.
+  outputRate?: OutputRate;
+  outputRateModel?: string;
 }
 
 // Own spend by file and parse inputs, checked against the file's own revision. A write to one
@@ -9232,6 +9237,8 @@ function readClaudeOwnSpend(
     addTurnUsagePart(exact, request);
   }
   const childTurns = child.finish().turns;
+  // A dispatched session row keeps no speed, so only a subagent transcript sums its turns.
+  const measured = childTranscript ? summedTurnRate(childTurns) : undefined;
   let record: ClaudeSpendRecord | null = null;
   if (withRecord) {
     const span = childTurnSpan(childTurns);
@@ -9275,6 +9282,7 @@ function readClaudeOwnSpend(
     effort,
     finished: childTurns.at(-1)?.finished === true,
     record,
+    ...measured,
   };
   claudeOwnSpends.delete(key);
   claudeOwnSpends.set(key, own);
@@ -9335,7 +9343,15 @@ function readClaudeSpendTree(
   // Descendant spend remains partial until its own record supplies a closed last turn.
   // The row names the model this transcript ran, so a nested subagent's heavier model never answers.
   const ownModel = own.executorModel;
-  return { spend: { models, ownModel, found: true, partial, effort: own.effort, ...record }, finished: own.finished };
+  // Only this transcript's own turns are timed. A nested subagent adds spend and never time.
+  const rate =
+    own.outputRate && own.outputRateModel
+      ? { outputRate: { ...own.outputRate }, outputRateModel: own.outputRateModel }
+      : {};
+  return {
+    spend: { models, ownModel, found: true, partial, effort: own.effort, ...rate, ...record },
+    finished: own.finished,
+  };
 }
 
 // Turns in the tail of one session transcript, oldest first.
@@ -9599,7 +9615,7 @@ export interface ClaudeSessionParserState {
   usageState: ClaudeUsageReducerState;
   // Send times of recent `api-request` records, keyed by request id.
   requestTimes: Map<string, number>;
-  // Recent main-thread responses, keyed by message id, for request-timed output rates.
+  // Recent responses of this transcript's own thread, keyed by message id, for request-timed output rates.
   responseTimings: Map<string, ClaudeResponseTiming>;
   cur: SourcedBuilding | null;
   // The id of the typed record that opened `cur`, and whether a local command answer that
@@ -10440,7 +10456,7 @@ function reduceClaudeSessionLine(
   // A request record holds the whole request body, which can contain any marker the branches below test.
   const request = claudeRequestRecord(line);
   if (request) {
-    if (!opts.childTranscript) noteClaudeRequest(state, request);
+    noteClaudeRequest(state, request);
     return;
   }
   if (line.indexOf(MODEL_ATTACHMENT_MARK) >= 0 || (line.includes('"attachment"') && line.includes('"model"'))) {
@@ -11049,7 +11065,7 @@ function reduceClaudeSessionLine(
   if (answeredATurn(o)) {
     cur.error = null;
   }
-  if (!opts.childTranscript) noteClaudeResponseTiming(state, o, message);
+  noteClaudeResponseTiming(state, o, message);
   if (message.model) {
     cur.model = message.model;
     state.currentModelSource = { start: sourceStart, end: sourceEnd };
@@ -11077,9 +11093,10 @@ function reduceClaudeSessionLine(
     opts.childTranscript ? { countSidechain: true, emitRepeats: true } : {},
   );
   if (usageEvent) {
-    if (!opts.childTranscript && typeof message.id === 'string' && message.id && message.id.length <= 512) {
-      const ids = (cur.responseIds ??= []);
-      cur.openingResponseId ??= message.id;
+    // Cache-expiry matching reads `responseIds`, so a child read keeps its timed responses apart.
+    if (typeof message.id === 'string' && message.id && message.id.length <= 512) {
+      const ids = opts.childTranscript ? (cur.timedResponseIds ??= []) : (cur.responseIds ??= []);
+      if (!opts.childTranscript) cur.openingResponseId ??= message.id;
       if (!ids.includes(message.id)) ids.push(message.id);
       if (ids.length > 512) ids.shift();
     }
@@ -11695,7 +11712,7 @@ function claudeRequestRate(state: ClaudeSessionParserState, turn: Turn): OutputR
   if (turn.interrupted || !turn.model) return undefined;
   const carried = turn.outputRateBasis === 'request' && turn.outputRateModel === turn.model ? turn.outputRate : null;
   const total = { output: carried?.output ?? 0, milliseconds: carried?.milliseconds ?? 0 };
-  for (const id of turn.responseIds ?? []) {
+  for (const id of turn.timedResponseIds ?? turn.responseIds ?? []) {
     const timing = state.responseTimings.get(id);
     const sent = timing?.requestRef ? state.requestTimes.get(timing.requestRef) : undefined;
     if (!timing || !sent || !timing.stopped || timing.model !== turn.model || timing.output === null) continue;
@@ -11711,7 +11728,7 @@ function claudeRequestRate(state: ClaudeSessionParserState, turn: Turn): OutputR
 // parser state holds only open responses. A response without a stop reason can continue in a
 // later record, so its timing stays.
 function consumeClaudeResponseTimings(state: ClaudeSessionParserState, turn: Turn): void {
-  for (const id of turn.responseIds ?? []) {
+  for (const id of turn.timedResponseIds ?? turn.responseIds ?? []) {
     const timing = state.responseTimings.get(id);
     if (!timing?.stopped) continue;
     if (timing.requestRef) state.requestTimes.delete(timing.requestRef);
@@ -11927,6 +11944,13 @@ export function refreshClaudeAgentFacts(
       }
       if (!agent.effort) {
         agent.effort = spend.effort;
+      }
+      if (spend.outputRate && spend.outputRateModel) {
+        agent.outputRate = { ...spend.outputRate };
+        agent.outputRateModel = spend.outputRateModel;
+      } else {
+        delete agent.outputRate;
+        delete agent.outputRateModel;
       }
       agent.spendFound = spend.found;
       agent.spendPartial = spend.partial;

@@ -1,7 +1,12 @@
 import type { SourceEnumeration } from './sessioncoverage';
 import * as fs from 'node:fs';
 import { ExportLimitError, type ExportRelationshipLimits } from './exportlimits';
-import { emptyCodexResponseClock, validRate, reduceCodexResponseClock, type CodexResponseClock } from './outputrate';
+import {
+  emptyCodexResponseClock,
+  summedTurnRate,
+  reduceCodexResponseClock,
+  type CodexResponseClock,
+} from './outputrate';
 import { meterRead, meterReadWork } from './readmeter';
 import * as path from 'node:path';
 import { createHash } from 'node:crypto';
@@ -4208,22 +4213,8 @@ function* readCodexOwnSpendIncremental(file: string): Generator<{ bytes: number;
   partial ||= Object.keys(usageState.pendingClaudeResults).length > 0;
   const usageIncomplete = incompleteRequests > 0;
   const turns = child.finish(0).turns;
-  const outputRate = { output: 0, milliseconds: 0 };
-  let measuredModel: string | undefined;
-  let qualifiedRate = false;
-  for (const turn of turns) {
-    if (turn.sessionId !== meta?.sessionId || turn.interrupted || !turn.outputRate) continue;
-    const model = turn.outputRateModel;
-    if (!model || model.length > 512 || !validRate(turn.outputRate) || (measuredModel && measuredModel !== model)) {
-      qualifiedRate = false;
-      break;
-    }
-    measuredModel = model;
-    qualifiedRate = true;
-    outputRate.output += turn.outputRate.output;
-    outputRate.milliseconds += turn.outputRate.milliseconds;
-  }
-  qualifiedRate &&= validRate(outputRate) && outputRate.output > 0;
+  // Only the child's own turns are timed. Turns of other sessions in the rollout add nothing.
+  const measured = summedTurnRate(turns.filter((turn) => turn.sessionId === meta?.sessionId));
   const artifacts = reduceChildArtifacts(
     { turns },
     {
@@ -4240,7 +4231,7 @@ function* readCodexOwnSpendIncremental(file: string): Generator<{ bytes: number;
   const spend: AgentSpend = found
     ? {
         models: [...byIdentity.values()],
-        ...(qualifiedRate ? { outputRate, outputRateModel: measuredModel } : {}),
+        ...measured,
         found: true,
         partial,
         effort,

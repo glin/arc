@@ -990,6 +990,7 @@ function agentCostEntries(agent: TurnAgent, runner: AgentKind, noEnding: boolean
         spend.usageParts?.length ? spend.usageParts : [spend],
       ),
     ),
+    agentRateBasis(runner),
   );
   if (usage.length) {
     entries.push({ ...usage[0], separateBefore: true }, ...usage.slice(1));
@@ -1089,9 +1090,20 @@ function costRecordList(
   return notes.length ? { entries, notes } : { entries };
 }
 
+// A Claude child has no observed stream, so its own request records time it.
+function agentRateBasis(runner: AgentKind): OutputRateBasis {
+  return runner === 'claude' ? 'request' : 'stream';
+}
+
 // Unpriced children display token usage as a separate figure.
 // Priced children include that usage in their cost records.
-function agentTokensFigure(agent: TurnAgent, priced: boolean, running = false, noEnding = false): AgentFigure | null {
+function agentTokensFigure(
+  agent: TurnAgent,
+  priced: boolean,
+  runner: AgentKind,
+  running = false,
+  noEnding = false,
+): AgentFigure | null {
   if (priced) {
     return null;
   }
@@ -1116,7 +1128,7 @@ function agentTokensFigure(agent: TurnAgent, priced: boolean, running = false, n
             total,
             [],
             agent.outputRateModel ? agent.outputRate : undefined,
-            'codex',
+            runner,
             agent.outputRateModel,
             cacheDetailUsage(
               total,
@@ -1124,6 +1136,7 @@ function agentTokensFigure(agent: TurnAgent, priced: boolean, running = false, n
                 spend.usageParts?.length ? spend.usageParts : [spend],
               ),
             ),
+            agentRateBasis(runner),
           ),
           ...(running ? { footer: [noEnding ? AGENT_USAGE_NO_ENDING : AGENT_USAGE_SO_FAR] } : {}),
         },
@@ -1243,7 +1256,7 @@ function agentFigures(
     });
   }
   if (running) {
-    const tokens = agentTokensFigure(agent, !!cost, true, noEnding);
+    const tokens = agentTokensFigure(agent, !!cost, runner, true, noEnding);
     return tokens ? [...figures, tokens] : figures;
   }
   const ran = agentDurationFigure(agent, now);
@@ -1298,7 +1311,7 @@ function agentFigures(
       ),
     });
   }
-  const tokens = agentTokensFigure(agent, !!cost);
+  const tokens = agentTokensFigure(agent, !!cost, runner);
   if (tokens) {
     figures.push(tokens);
   }

@@ -631,6 +631,128 @@ test('an exported Dispatched Claude row shows no speed from request-timed child 
   }
 });
 
+// Projects the fixture's one linked row, timed at 150 tok/s, and returns the root card holding it.
+async function linkedRateCard(kind: 'subagent' | 'dispatched' | 'reader-started', agent: 'claude' | 'codex') {
+  const writer = await ExportTransaction.create(tempDir('arc-site-linked-rate-'));
+  try {
+    const model = await sessionSiteFixture(writer);
+    const child = model.sessions[1];
+    child.agent = agent;
+    const childModel = agent === 'claude' ? 'claude-opus-5' : 'gpt-5.5';
+    child.numbers = {
+      parts: [
+        costPartOf({
+          role: 'main',
+          model: childModel,
+          provider: null,
+          contextWindow: null,
+          usage: { requests: 1, input: 1000, cacheRead: 0, cacheWrite1h: 0, cacheWrite5m: 0, output: 300, thinking: 0 },
+        }),
+      ],
+      main: { dollars: 0.1, partial: false },
+      delegated: { dollars: 0, partial: false },
+      combined: { dollars: 0.1, partial: false },
+      coverage: { usage: 'complete', cost: 'complete' },
+    };
+    const childPage = await writer.readSpool<import('./exportdata').ExportPage>(child.pages[0]);
+    Object.assign(childPage.turns[0], {
+      finished: true,
+      model: childModel,
+      outputRate: { output: 300, milliseconds: 2000 },
+      outputRateModel: childModel,
+      ...(agent === 'claude' ? { outputRateBasis: 'request' } : {}),
+    });
+    child.pages = [await writer.spool(childPage)];
+    model.relationships[0].kind = kind;
+    model.relationships[0].ownership = kind === 'reader-started' ? 'navigation' : 'delegated';
+    await projectSessionSite(model, writer, { script: '', stylesheet: '' });
+    const { manifest, data } = exportedSiteData((await writer.publish(async () => {})).directory);
+    const card = (data.get(manifest.sessions[0].pages[0].cards![0].id) as { card: CardView }).card;
+    const rows = [...(card.agents ?? []), ...(card.dispatched ?? [])];
+    assert.ok(
+      rows.some((row) => row.sessionId === 'child'),
+      JSON.stringify(rows),
+    );
+    return JSON.stringify(rows);
+  } finally {
+    await writer.dispose();
+  }
+}
+
+test('an exported Reader-started Claude row shows no speed from request-timed child turns', async () => {
+  assert.doesNotMatch(await linkedRateCard('reader-started', 'claude'), /tok\/s/);
+});
+
+test('an exported Codex row of every relationship kind keeps its measured speed', async () => {
+  for (const kind of ['subagent', 'dispatched', 'reader-started'] as const)
+    assert.match(await linkedRateCard(kind, 'codex'), /150\.0 tok\/s/, kind);
+});
+
+test('an exported Claude subagent row shows the speed its request-timed turns measure', async () => {
+  const writer = await ExportTransaction.create(tempDir('arc-site-subagent-rate-'));
+  try {
+    const model = await sessionSiteFixture(writer);
+    model.sessions[0].agent = 'claude';
+    const child = model.sessions[1];
+    child.agent = 'claude';
+    const part = costPartOf({
+      role: 'main',
+      model: 'claude-opus-5',
+      provider: null,
+      contextWindow: null,
+      usage: { requests: 1, input: 1000, cacheRead: 0, cacheWrite1h: 0, cacheWrite5m: 0, output: 300, thinking: 0 },
+    });
+    child.numbers = {
+      parts: [part],
+      main: { dollars: 0.1, partial: false },
+      delegated: { dollars: 0, partial: false },
+      combined: { dollars: 0.1, partial: false },
+      coverage: { usage: 'complete', cost: 'complete' },
+    };
+    const childPage = await writer.readSpool<import('./exportdata').ExportPage>(child.pages[0]);
+    Object.assign(childPage.turns[0], {
+      finished: true,
+      model: 'claude-opus-5',
+      outputRate: { output: 300, milliseconds: 2000 },
+      outputRateModel: 'claude-opus-5',
+      outputRateBasis: 'request',
+    });
+    child.pages = [await writer.spool(childPage)];
+    const root = await writer.readSpool<import('./exportdata').ExportPage>(model.sessions[0].pages[0]);
+    model.relationships[0].kind = 'subagent';
+    model.relationships[0].ownership = 'delegated';
+    root.turns[0].agents = [
+      {
+        key: 'native',
+        relationships: [model.relationships[0].key],
+        description: 'Native task',
+        agentType: null,
+        model: null,
+        effort: null,
+        status: 'completed',
+        startedAt: null,
+        durationMs: null,
+        tokens: null,
+        toolUses: null,
+        partial: false,
+      },
+    ];
+    model.sessions[0].pages[0] = await writer.spool(root);
+    await projectSessionSite(model, writer, { script: '', stylesheet: '' });
+    const { manifest, data } = exportedSiteData((await writer.publish(async () => {})).directory);
+    const card = (data.get(manifest.sessions[0].pages[0].cards![0].id) as { card: CardView }).card;
+    const cost = card.agents![0].figures.find((figure) => figure.metric === 'cost');
+    const record = cost?.record as { entries: { label: string; lines?: unknown[] }[] } | undefined;
+    const line = record?.entries.find((entry) => entry.label === 'Output')?.lines?.[0] as
+      | { text: string; title?: string }
+      | undefined;
+    assert.equal(line?.text, '150.0 tok/s', JSON.stringify(cost));
+    assert.match(line?.title ?? '', /Request time includes the wait for the first response event/);
+  } finally {
+    await writer.dispose();
+  }
+});
+
 test('an exported Claude turn keeps the interval that timed its output speed', () => {
   const original = turn({
     agent: 'claude',

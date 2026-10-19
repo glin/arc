@@ -78,6 +78,27 @@ export function responseRateForTurn(
   );
 }
 
+// Sums one source's measured turns. Interrupted and unmeasured turns add nothing. An invalid
+// rate, a missing model, or a second model leaves the source without a measurement.
+export function summedTurnRate(
+  turns: readonly { interrupted: boolean; outputRate?: OutputRate; outputRateModel?: string }[],
+): { outputRate: OutputRate; outputRateModel: string } | undefined {
+  const outputRate = { output: 0, milliseconds: 0 };
+  let outputRateModel: string | undefined;
+  for (const turn of turns) {
+    if (turn.interrupted || !turn.outputRate) continue;
+    const model = turn.outputRateModel;
+    if (!model || model.length > 512 || !validRate(turn.outputRate) || (outputRateModel && outputRateModel !== model))
+      return undefined;
+    outputRateModel = model;
+    outputRate.output += turn.outputRate.output;
+    outputRate.milliseconds += turn.outputRate.milliseconds;
+  }
+  return outputRateModel && outputRate.output > 0 && validRate(outputRate)
+    ? { outputRate, outputRateModel }
+    : undefined;
+}
+
 export function outputRateText(rate: OutputRate | undefined): string | null {
   if (!rate || !validRate(rate) || rate.output === 0) return null;
   const value = (rate.output * 1000) / rate.milliseconds;

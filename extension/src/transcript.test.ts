@@ -9464,6 +9464,106 @@ test('a dispatched session folds its own subagents and theirs', () => {
   assert.deepEqual([whole.models[0]?.usage.input, whole.partial], [3000, false]);
 });
 
+// A subagent request record opens with its type, session, and agent, then its id and send time.
+function childRequest(id: string, second: number) {
+  return { type: 'api-request', sessionId: 'sess', agentId: 'a1', id, timestamp: at(second), version: '2.1.302' };
+}
+function childBlock(
+  id: string,
+  requestRef: string,
+  second: number,
+  output: number,
+  stop: string | null = 'end_turn',
+  model = 'claude-opus-5',
+  content: object[] = doneText,
+) {
+  const block = requestBlock(id, requestRef, second, output, 'end_turn', model);
+  return { ...block, isSidechain: true, message: { ...block.message, stop_reason: stop, content } };
+}
+const childTurn = (text: string, second: number) => userPrompt(text, second, { isSidechain: true });
+const childRate = (file: string) => {
+  const spend = readClaudeAgentSpend(file);
+  return spend.outputRate ? { ...spend.outputRate, model: spend.outputRateModel } : undefined;
+};
+
+test('a Claude subagent read times its own turns from their request records', () => {
+  const folder = tempDir('child-rate-');
+  const file = path.join(folder, 'agent-a1.jsonl');
+  writeRecords(file, [
+    childTurn('work', 0),
+    childRequest('req-1', 10),
+    childBlock('m1', 'req-1', 12, 5, null),
+    childBlock('m1', 'req-1', 14, 400),
+  ]);
+  const turn = readSession(file, 'agent-a1', { childTranscript: true }).turns[0];
+  assert.deepEqual(turn.outputRate, { output: 400, milliseconds: 4000 });
+  assert.equal(turn.outputRateBasis, 'request');
+  assert.deepEqual(turn.timedResponseIds, ['m1']);
+  assert.equal(turn.responseIds, undefined, 'cache-expiry matching never sees child responses');
+  assert.deepEqual(childRate(file), { output: 400, milliseconds: 4000, model: 'claude-opus-5' });
+});
+
+test('a Claude subagent speed leaves out unstopped responses, other models, interrupted turns, and nested work', () => {
+  const folder = tempDir('child-rate-rules-');
+  const opening = path.join(folder, 'agent-opening.jsonl');
+  // Most child responses end on the opening output count and never record a stop reason.
+  writeRecords(opening, [childTurn('work', 0), childRequest('req-1', 10), childBlock('m1', 'req-1', 12, 5, null)]);
+  assert.equal(childRate(opening), undefined);
+
+  const models = path.join(folder, 'agent-models.jsonl');
+  writeRecords(models, [
+    childTurn('first', 0),
+    childRequest('req-1', 10),
+    childBlock('m1', 'req-1', 14, 400),
+    childTurn('second', 20),
+    childRequest('req-2', 21),
+    childBlock('m2', 'req-2', 22, 100, 'end_turn', 'claude-sonnet-5'),
+  ]);
+  assert.equal(childRate(models), undefined);
+
+  const interrupted = path.join(folder, 'agent-interrupted.jsonl');
+  writeRecords(interrupted, [
+    childTurn('first', 0),
+    childRequest('req-1', 10),
+    childBlock('m1', 'req-1', 14, 400),
+    childTurn('second', 20),
+    childRequest('req-2', 21),
+    childBlock('m2', 'req-2', 22, 100, 'tool_use'),
+    childTurn('[Request interrupted by user]', 23),
+  ]);
+  assert.deepEqual(childRate(interrupted), { output: 400, milliseconds: 4000, model: 'claude-opus-5' });
+
+  // The launcher times its own launch response, and its nested subagent adds spend but no time.
+  const launcher = path.join(folder, 'agent-a1.jsonl');
+  writeRecords(launcher, [
+    childTurn('launch', 0),
+    childRequest('req-1', 10),
+    childBlock('m1', 'req-1', 14, 400, 'end_turn', 'claude-opus-5', [...agentLaunch('launch-2'), ...doneText]),
+  ]);
+  writeSubagentMeta(folder, 'a2', 'launch-2', 'a1');
+  writeRecords(path.join(folder, 'agent-a2.jsonl'), [
+    childTurn('nested', 15),
+    childRequest('req-9', 16),
+    childBlock('m9', 'req-9', 17, 900),
+  ]);
+  const nested = readClaudeAgentSpend(launcher);
+  assert.equal(nested.models[0]?.usage.output, 1300, 'the nested subagent adds its spend');
+  assert.deepEqual(childRate(launcher), { output: 400, milliseconds: 4000, model: 'claude-opus-5' });
+  writeRecords(launcher, [
+    childTurn('launch', 0),
+    haikuRequest('m1', 1, 'end_turn', [...agentLaunch('launch-2'), ...doneText]),
+  ]);
+  assert.equal(childRate(launcher), undefined, 'an untimed launcher takes no time from its nested subagent');
+});
+
+test('a dispatched Claude session read keeps no speed for its row', () => {
+  const file = writeTranscript([userPrompt('work'), requestRecord('req-1', 10), requestBlock('m1', 'req-1', 14, 400)]);
+  assert.equal(readSession(file, 'sess').turns[0].outputRateBasis, 'request', 'the session turn itself is timed');
+  const spend = readClaudeAgentSpend(file, [], false);
+  assert.equal(spend.outputRate, undefined);
+  assert.equal(spend.outputRateModel, undefined);
+});
+
 test('a subagent launch that failed before it started leaves the row complete', () => {
   const folder = tempDir('nested-failed-launch-');
   const launcher = path.join(folder, 'agent-a1.jsonl');

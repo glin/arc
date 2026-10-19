@@ -6085,6 +6085,150 @@ test('a nested launch with no meta file or no transcript keeps the turn cost a f
   }
 });
 
+// A timed response: a request record, then two content blocks of one response. The first block
+// records the opening output count, and only the last records the stop reason and final count.
+// The tag keeps the ids of a second timed response in the same transcript distinct.
+function timedResponse(model: string, sidechain: boolean, at: (second: number) => string, tag = ''): object[] {
+  const block = (second: number, output: number, stop: string | null) => ({
+    type: 'assistant',
+    requestRef: `req-1${tag}`,
+    isSidechain: sidechain,
+    timestamp: at(second),
+    message: {
+      role: 'assistant',
+      id: `m-timed${tag}`,
+      model,
+      stop_reason: stop,
+      content: [{ type: 'text', text: `Block ${second}.` }],
+      usage: { input_tokens: 1000, output_tokens: output },
+    },
+  });
+  return [
+    {
+      type: 'user',
+      promptId: `p-timed${tag}`,
+      timestamp: at(2),
+      isSidechain: sidechain,
+      message: { role: 'user', content: [{ type: 'text', text: 'Time this work.' }] },
+    },
+    {
+      type: 'api-request',
+      sessionId: 'sess',
+      ...(sidechain ? { agentId: 'a1' } : {}),
+      id: `req-1${tag}`,
+      timestamp: at(10),
+    },
+    block(12, 5, null),
+    block(14, 400, 'end_turn'),
+  ];
+}
+
+// The main transcript launches one subagent whose own transcript holds a timed response.
+function timedAgentTurn(model: string): { turn: Turn; child: string; at: (second: number) => string } {
+  const at = (second: number) => new Date(Date.UTC(2026, 0, 1, 0, 0, second)).toISOString();
+  const folder = tempDir('timed-agent-');
+  const subagents = path.join(folder, 'sess', 'subagents');
+  fs.mkdirSync(subagents, { recursive: true });
+  const write = (file: string, records: object[]) =>
+    fs.writeFileSync(file, records.map((record) => JSON.stringify(record)).join('\n') + '\n');
+  const say = (id: string, second: number, stop: string, content: object[]) => ({
+    type: 'assistant',
+    timestamp: at(second),
+    message: {
+      role: 'assistant',
+      id,
+      model: 'claude-haiku-4-5',
+      stop_reason: stop,
+      content,
+      usage: { input_tokens: 10, output_tokens: 1 },
+    },
+  });
+  write(path.join(folder, 'sess.jsonl'), [
+    {
+      type: 'user',
+      promptId: 'p0',
+      timestamp: at(0),
+      message: { role: 'user', content: [{ type: 'text', text: 'Launch a timed agent.' }] },
+    },
+    say('m0', 1, 'tool_use', [{ type: 'tool_use', id: 'launch-1', name: 'Agent', input: { description: 'Timed' } }]),
+    {
+      type: 'user',
+      timestamp: at(20),
+      message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'launch-1', content: 'done' }] },
+      toolUseResult: { agentId: 'a1', status: 'completed', totalToolUseCount: 0 },
+    },
+    say('m0-end', 21, 'end_turn', [{ type: 'text', text: 'Done.' }]),
+  ]);
+  write(path.join(subagents, 'agent-a1.jsonl'), timedResponse(model, true, at));
+  fs.writeFileSync(
+    path.join(subagents, 'agent-a1.meta.json'),
+    JSON.stringify({ agentType: 'general-purpose', description: 'Timed', toolUseId: 'launch-1' }),
+  );
+  const [read] = readSession(path.join(folder, 'sess.jsonl'), 'sess', {
+    agentSpendOf: (launched) => readClaudeAgentSpend(path.join(subagents, `agent-${launched.id}.jsonl`)),
+  }).turns;
+  return { turn: read, child: path.join(subagents, 'agent-a1.jsonl'), at };
+}
+
+// 400 tokens over the 4 seconds from the request send time to the last content block.
+const childRequestTitle = (model: string) =>
+  `100.0 tok/s. Output tokens per second. Actual output includes thinking. Request time includes the wait for the first response event. Untimed responses are excluded. Measured model: ${model}. Only this subagent is timed. Usage totals include any delegated work.`;
+
+const outputSpeedLine = (row: ReturnType<typeof toCard>['agents'][number], metric: string) =>
+  row.figures.find((figure) => figure.metric === metric)?.record?.entries.find((entry) => entry.label === 'Output')
+    ?.lines?.[0];
+
+test('a Claude subagent row shows the output speed its own request records measure', () => {
+  const row = toCard(timedAgentTurn('claude-haiku-4-5').turn, false, NOW).agents[0];
+  assert.deepEqual(outputSpeedLine(row, 'cost'), {
+    text: '100.0 tok/s',
+    title: childRequestTitle('claude-haiku-4-5'),
+  });
+});
+
+test('a Claude subagent row drops its output speed once the subagent times a second model', () => {
+  const { turn, child, at } = timedAgentTurn('claude-haiku-4-5');
+  assert.deepEqual(outputSpeedLine(toCard(turn, false, NOW).agents[0], 'cost'), {
+    text: '100.0 tok/s',
+    title: childRequestTitle('claude-haiku-4-5'),
+  });
+  fs.appendFileSync(
+    child,
+    timedResponse('claude-sonnet-4-5', true, (second) => at(second + 30), '-second')
+      .map((record) => JSON.stringify(record))
+      .join('\n') + '\n',
+  );
+  refreshClaudeAgentFacts([turn], () => readClaudeAgentSpend(child), undefined);
+  const row = toCard(turn, false, NOW).agents[0];
+  assert.ok(row.figures.some((figure) => figure.metric === 'cost'));
+  assert.doesNotMatch(JSON.stringify(row), /tok\/s/);
+});
+
+test('an unpriced Claude subagent row names request time in its tokens figure', () => {
+  const row = toCard(timedAgentTurn('claude-unpriced-9').turn, false, NOW).agents[0];
+  assert.ok(!row.figures.some((figure) => figure.metric === 'cost'));
+  assert.deepEqual(outputSpeedLine(row, 'tokens'), {
+    text: '100.0 tok/s',
+    title: childRequestTitle('claude-unpriced-9'),
+  });
+});
+
+test('a dispatched Claude session row keeps no output speed', () => {
+  const at = (second: number) => new Date(Date.UTC(2026, 0, 1, 0, 0, second)).toISOString();
+  const file = path.join(tempDir('timed-dispatch-'), 'sess.jsonl');
+  fs.writeFileSync(
+    file,
+    timedResponse('claude-haiku-4-5', false, at)
+      .map((record) => JSON.stringify(record))
+      .join('\n') + '\n',
+  );
+  assert.equal(readSession(file, 'sess').turns[0].outputRateBasis, 'request', 'the session turn itself is timed');
+  const spend = readClaudeAgentSpend(file, [], false);
+  const row = dispatchedAgentCard('sess', 'Review the card', spend, 'done', 1000, 65000, 2, [], NOW, 'claude');
+  assert.ok(row.figures.some((figure) => figure.metric === 'cost'));
+  assert.doesNotMatch(JSON.stringify(row), /tok\/s/);
+});
+
 test('a completed child with no billed response is an exact zero', () => {
   const t = turn({
     usage: { input: 1_000_000, cacheWrite1h: 0, cacheWrite5m: 0, cacheRead: 0, output: 0, thinking: 0 },
