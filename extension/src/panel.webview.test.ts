@@ -1079,7 +1079,7 @@ test('the host reads closed child work once per file version and never reads ope
   assert.deepEqual(read.call(host, now), new Map([['parent', ['child']]]));
   assert.equal(reader.mock.calls.length, 3);
 });
-import { ConfigWatches } from './configwatch.ts';
+import { comparableFolder, ConfigWatches, defaultsKey, defaultsKeyParts } from './configwatch.ts';
 import { EventEmitter } from 'node:events';
 import { TerminalTools } from './toolpath';
 import { askIdleDefaults, arcCliSpawner, claudeIdlePlan, type AgentPlan, type ChildLike } from './agenthost';
@@ -1307,6 +1307,7 @@ test('visibility revisions belong to one panel lifetime', () => {
 import type { PromptDelivery } from './composerview.ts';
 import {
   ModelBook,
+  SavedDefaults,
   UsageReadQueue,
   McpBook,
   McpPendingRefreshes,
@@ -12784,7 +12785,24 @@ test('a host takes its own listeners away with it, and the editor ones are wired
   sourceMatch(panelHostSource, /this\.wireEditorListeners\(\);/, 'nothing wires the editor-wide listeners at all');
 });
 
+// A saved-state fake with the calls `globalState` supplies.
+function memoryState() {
+  const values = new Map<string, unknown>();
+  return {
+    values,
+    get: (key: string) => values.get(key),
+    update: (key: string, value: unknown) => {
+      if (value === undefined) values.delete(key);
+      else values.set(key, structuredClone(value));
+      return Promise.resolve();
+    },
+    keys: () => [...values.keys()],
+  };
+}
+
 function wireDefaultMetadata(context: any, panel: any, environment: Record<string, unknown>) {
+  context.globalState ??= memoryState();
+  environment = { SavedDefaults, comparableFolder, defaultsKey, defaultsKeyParts, ...environment };
   const source = fs.readFileSync(path.join(__dirname, 'extension.ts'), 'utf8');
   const begin = source.indexOf('let defaultsRevision = 0;');
   const end = source.indexOf('const readFrom = async', begin);
@@ -13085,7 +13103,8 @@ function activationDefaultsFixture(options: { trusted?: boolean; rejectedRequest
       dispose();
       process.off('unhandledRejection', unhandled);
     },
-    values: () => [...panel.appliedDefaults.values()] as Array<{ status: string; model: string }>,
+    values: () =>
+      [...panel.appliedDefaults.values()].map((held) => held.defaults) as Array<{ status: string; model: string }>,
   };
 }
 
@@ -13263,6 +13282,320 @@ test('launcher initial and refreshed metadata requests follow its committed rece
   provider.appliedDefaultsRevision++;
   provider.launcherDefaults();
   assert.equal(requests.length, 6);
+});
+
+// A draft host with one Codex draft in `cwd`, whose session discovery never answers.
+function savedDefaultsDraftHost(cwd: string, folder = cwd) {
+  const { provider } = queueRecoveryProvider();
+  const session = 'draft:saved-defaults';
+  const host = { webview: {} };
+  const profile: SessionProfile = { agent: 'codex', model: '', effort: '', permissionMode: '', source: 'custom' };
+  const draft = newSessionDraft(session, cwd, null, 1000, profile);
+  Object.assign(provider, {
+    hosts: [host],
+    hostSessions: new Map([[host, session]]),
+    readyHosts: new Set([host]),
+    hostPreviousSessions: new Map(),
+    hidden: new Set(),
+    pinnedTop: new Set(),
+    trail: emptyTrail(),
+    showing: session,
+    sessionRows: [{ id: session, label: 'Draft', agentKey: 'codex' }],
+    commandLists: {},
+    skillLists: {},
+    askLevels: {},
+    running: new Set(),
+    models: {
+      claude: [
+        {
+          value: 'haiku',
+          label: 'Haiku',
+          description: '',
+          resolvedModel: 'claude-haiku-5-5',
+          efforts: [{ value: 'medium', label: 'medium', description: '' }],
+        },
+      ],
+    },
+    pendingModels: [],
+    recentProfiles: [],
+    pinnedSetups: [],
+    usage: [],
+    mcpServers: {},
+    stagingTokens: new Map(),
+    stagingOperations: new Map(),
+    draftRevisions: new Map(),
+    appliedDefaults: new Map(),
+    appliedDefaultsRevision: 0,
+    folders: () => [folder],
+  });
+  delete provider.usagePayload;
+  delete provider.cwdForSession;
+  provider.newDrafts[session] = draft;
+  provider.draftProfiles[session] = profile;
+  provider.picks[session] = sessionSettingsForProfile(profile);
+  const reads: string[][] = [];
+  const order: string[] = [];
+  const posts: any[] = [];
+  provider.onReadDefaults = (...args: string[]) => reads.push(args);
+  provider.onWatchDefaults = () => {};
+  provider.refresh = () => {
+    order.push('refresh');
+    return new Promise(() => {});
+  };
+  provider.post = async (message: any) => {
+    order.push(message.type);
+    posts.push(message);
+  };
+  const labels = () =>
+    [
+      ...JSON.stringify(posts.filter((message) => message.type === 'usage').at(-1)?.usage.composer ?? {}).matchAll(
+        /"(?:Model|Effort): [^".]*/g,
+      ),
+    ].map(([text]) => text.slice(1));
+  return { provider, session, reads, order, posts, labels };
+}
+
+const SAVED_HAIKU = { status: 'ready', model: 'claude-haiku-5-5', effort: 'medium', reason: '' } as const;
+
+test('a draft switched to Claude names the saved model and effort before discovery or any CLI read answers', async () => {
+  const cwd = path.resolve('Saved-Folder');
+  const fixture = savedDefaultsDraftHost(cwd);
+  const saved = new SavedDefaults(memoryState(), path);
+  await saved.save('claude', cwd, '', SAVED_HAIKU);
+  fixture.provider.savedDefaults = saved;
+  fixture.provider.pickOnDraft(fixture.session, 'agent', 'claude');
+  assert.equal(fixture.order[0], 'usage', 'the new agent waited behind session discovery');
+  assert.deepEqual(fixture.labels(), ['Model: Haiku, for this draft', 'Effort: medium, for this draft']);
+  assert.deepEqual(
+    fixture.reads.filter(([agent]) => agent === 'claude'),
+    [['claude', cwd, '']],
+  );
+});
+
+test('a host activated in one folder draws the saved reading of a draft in another folder', async () => {
+  const draftFolder = path.resolve('Draft-Folder');
+  const fixture = savedDefaultsDraftHost(draftFolder, path.resolve('Activation-Folder'));
+  const saved = new SavedDefaults(memoryState(), path);
+  await saved.save('claude', draftFolder, '', SAVED_HAIKU);
+  fixture.provider.savedDefaults = saved;
+  fixture.provider.pickOnDraft(fixture.session, 'agent', 'claude');
+  assert.deepEqual(fixture.labels(), ['Model: Haiku, for this draft', 'Effort: medium, for this draft']);
+});
+
+test('a selected alias finds the saved reading stored under its launch value', async () => {
+  const cwd = path.resolve('Alias-Folder');
+  const fixture = savedDefaultsDraftHost(cwd);
+  const saved = new SavedDefaults(memoryState(), path);
+  await saved.save('claude', cwd, 'haiku', SAVED_HAIKU);
+  fixture.provider.savedDefaults = saved;
+  assert.deepEqual(fixture.provider.defaultContext('claude', cwd, 'haiku').models, { haiku: SAVED_HAIKU });
+});
+
+test.each([
+  ['Windows', path.win32, 'C:\\Work\\Repo', 'c:\\WORK\\repo', 1],
+  ['macOS', path.posix, '/Users/Me/Repo', '/users/me/REPO', 2],
+  ['Linux', path.posix, '/home/Me/Repo', '/home/me/REPO', 2],
+] as const)(
+  'on %s path rules a folder that differs only in case starts %i base reads',
+  (_name, rules, prefetched, draft, reads) => {
+    const fixture = savedDefaultsDraftHost(draft, prefetched);
+    fixture.provider.defaultsPath = rules;
+    fixture.provider.defaultContext('claude', prefetched, '');
+    fixture.provider.defaultContext('claude', draft, '');
+    assert.equal(fixture.reads.filter(([agent]) => agent === 'claude').length, reads);
+  },
+);
+
+test('fresh defaults replace carried ones, and a watched settings change keeps the labels while each held key reads again', async () => {
+  const cwd = path.resolve('Fresh-Folder');
+  const fixture = savedDefaultsDraftHost(cwd);
+  fixture.provider.models.claude.push({
+    value: 'sonnet',
+    label: 'Sonnet',
+    description: '',
+    resolvedModel: 'claude-sonnet-5',
+    efforts: [{ value: 'high', label: 'high', description: '' }],
+  });
+  const globalState = memoryState();
+  await new SavedDefaults(globalState, path).save('claude', cwd, '', SAVED_HAIKU);
+  const asks: Array<{ plan: any; resolve: (defaults: unknown) => void }> = [];
+  const watchers: any[] = [];
+  let configuration!: (event: any) => void;
+  const watcher = (pattern: any) => {
+    const made: any = { pattern, dispose() {} };
+    for (const kind of ['Change', 'Create', 'Delete'])
+      made[`onDid${kind}`] = (callback: any) => {
+        made[kind.toLowerCase()] = callback;
+        return { dispose() {} };
+      };
+    watchers.push(made);
+    return made;
+  };
+  const subscriptions: any[] = [];
+  wireDefaultMetadata({ subscriptions, globalState }, fixture.provider, {
+    vscode: {
+      RelativePattern: class {
+        constructor(
+          public base: string,
+          public pattern: string,
+        ) {}
+      },
+      workspace: {
+        onDidGrantWorkspaceTrust: () => ({ dispose() {} }),
+        onDidChangeConfiguration(callback: any) {
+          configuration = callback;
+          return { dispose() {} };
+        },
+        onDidChangeWorkspaceFolders: () => ({ dispose() {} }),
+        createFileSystemWatcher: watcher,
+      },
+    },
+    path,
+    os: { homedir: () => path.resolve('Fresh-Home') },
+    readSetting: () => '',
+    thisMachine: () => ({}),
+    claudeLaunch: () => ({}),
+    codexLaunch: () => ({}),
+    claudeIdlePlan: (_launch: unknown, folder: string, model: string) => ({ agent: 'claude', cwd: folder, model }),
+    codexIdlePlan: (_launch: unknown, options: any) => ({ agent: 'codex', ...options }),
+    CLIENT_INFO: {},
+    askIdleDefaults: (plan: any) => new Promise((resolve) => asks.push({ plan, resolve })),
+    spawner: () => {},
+    unavailableDefaults,
+    settingName: (key: string) => `arc.${key}`,
+    fs: { promises: { stat: () => Promise.reject(new Error('missing')) } },
+    ConfigWatches,
+    privateTools: { refresh: () => Promise.resolve() },
+    snapshotOffer: null,
+    snapshotPanelOpened: false,
+  });
+  try {
+    fixture.provider.pickOnDraft(fixture.session, 'agent', 'claude');
+    assert.deepEqual(fixture.labels(), ['Model: Haiku, for this draft', 'Effort: medium, for this draft']);
+    await vi.waitFor(() => assert.ok(asks.some(({ plan }) => plan.agent === 'claude')));
+    const sonnet = { status: 'ready', model: 'claude-sonnet-5', effort: 'high', reason: '' } as const;
+    asks.find(({ plan }) => plan.agent === 'claude')!.resolve(sonnet);
+    await vi.waitFor(() =>
+      assert.deepEqual(fixture.labels(), ['Model: Sonnet, for this draft', 'Effort: high, for this draft']),
+    );
+    assert.deepEqual(new SavedDefaults(globalState, path).get('claude', cwd, ''), sonnet);
+    const before = asks.length;
+    configuration({ affectsConfiguration: (key: string) => key === 'workbench.colorTheme' });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(asks.length, before, 'an unrelated editor setting started a defaults read');
+    const held = [...fixture.provider.appliedDefaults.values()].map(({ agent, model }: any) => `${agent}:${model}`);
+    // Another window evicted the saved reading. The held value still draws until the fresh answer arrives.
+    globalState.values.clear();
+    watchers.find(({ pattern }) => pattern.pattern === 'settings*.json').change({});
+    assert.deepEqual(fixture.labels(), ['Model: Sonnet, for this draft', 'Effort: high, for this draft']);
+    await vi.waitFor(() => assert.equal(asks.length, before + held.length));
+    assert.deepEqual(
+      asks
+        .slice(before)
+        .map(({ plan }) => `${plan.agent}:${plan.model ?? ''}`)
+        .sort(),
+      held.sort(),
+    );
+    const unavailable = unavailableDefaults('The agent could not report its settings.');
+    asks
+      .slice(before)
+      .find(({ plan }) => plan.agent === 'claude')!
+      .resolve(unavailable);
+    await vi.waitFor(() =>
+      assert.deepEqual(fixture.labels(), [
+        'Model: Model not reported, for this draft',
+        'Effort: Effort not reported, for this draft',
+      ]),
+    );
+    assert.deepEqual(new SavedDefaults(globalState, path).get('claude', cwd, ''), unavailable);
+  } finally {
+    for (const subscription of subscriptions) subscription.dispose();
+  }
+});
+
+test('an invalidation starts no defaults read until a field looks a held key up, and held values draw meanwhile', () => {
+  const cwd = path.resolve('Held-Folder');
+  const fixture = savedDefaultsDraftHost(cwd);
+  fixture.provider.usagePayload = () => ({});
+  const sonnet = { status: 'ready', model: 'claude-sonnet-5', effort: 'high', reason: '' } as const;
+  const codex = unavailableDefaults('The agent could not report its settings.');
+  fixture.provider.setAppliedDefaults('claude', cwd, '', SAVED_HAIKU);
+  fixture.provider.setAppliedDefaults('claude', cwd, 'sonnet', sonnet);
+  fixture.provider.setAppliedDefaults('codex', cwd, '', codex);
+  fixture.provider.clearAppliedDefaults();
+  assert.deepEqual(fixture.reads, [], 'an invalidation started reads for keys no field looked up');
+  const context = fixture.provider.defaultContext('claude', cwd, '');
+  assert.deepEqual(fixture.reads, [['claude', cwd, '']]);
+  assert.deepEqual(context.base, SAVED_HAIKU, 'the carried base value stopped drawing');
+  assert.deepEqual(context.models, { sonnet }, 'a carried model value stopped drawing');
+  fixture.provider.defaultContext('claude', cwd, '');
+  assert.equal(fixture.reads.length, 1, 'a second lookup in one revision started another read');
+  assert.deepEqual(fixture.provider.defaultContext('codex', cwd, '').base, codex);
+  assert.deepEqual(fixture.reads.at(-1), ['codex', cwd, '']);
+});
+
+test('a defaults answer that saved state rejects still reaches the panel and leaves no unhandled rejection', async () => {
+  const unhandled: unknown[] = [];
+  const listener = (reason: unknown) => unhandled.push(reason);
+  process.on('unhandledRejection', listener);
+  const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+  const subscriptions: any[] = [];
+  const accepted: any[] = [];
+  const answers: Array<(value: unknown) => void> = [];
+  const globalState = { ...memoryState(), update: () => Promise.reject(new Error('disk full')) };
+  const panel: any = { clearAppliedDefaults() {}, setAppliedDefaults: (...args: any[]) => accepted.push(args) };
+  const watcher = () => {
+    const made: any = { dispose() {} };
+    for (const kind of ['Change', 'Create', 'Delete']) made[`onDid${kind}`] = () => ({ dispose() {} });
+    return made;
+  };
+  wireDefaultMetadata({ subscriptions, globalState }, panel, {
+    vscode: {
+      RelativePattern: class {
+        constructor(
+          public base: string,
+          public pattern: string,
+        ) {}
+      },
+      workspace: {
+        onDidGrantWorkspaceTrust: () => ({ dispose() {} }),
+        onDidChangeConfiguration: () => ({ dispose() {} }),
+        onDidChangeWorkspaceFolders: () => ({ dispose() {} }),
+        createFileSystemWatcher: watcher,
+      },
+    },
+    path,
+    os: { homedir: () => path.resolve('Rejecting-Home') },
+    readSetting: () => '',
+    thisMachine: () => ({}),
+    claudeLaunch: () => ({}),
+    codexLaunch: () => ({}),
+    claudeIdlePlan: () => ({}),
+    codexIdlePlan: () => ({}),
+    CLIENT_INFO: {},
+    askIdleDefaults: () => new Promise((resolve) => answers.push(resolve)),
+    spawner: () => {},
+    unavailableDefaults,
+    settingName: (key: string) => `arc.${key}`,
+    fs: { promises: { stat: () => Promise.reject(new Error('missing')) } },
+    ConfigWatches,
+    privateTools: { refresh: () => Promise.resolve() },
+    snapshotOffer: null,
+    snapshotPanelOpened: false,
+  });
+  try {
+    const cwd = path.resolve('Rejecting-Folder');
+    panel.onReadDefaults('claude', cwd, '');
+    await vi.waitFor(() => assert.equal(answers.length, 1));
+    answers[0](SAVED_HAIKU);
+    await vi.waitFor(() => assert.ok(warn.mock.calls.length + unhandled.length > 0));
+    assert.deepEqual(unhandled, [], 'a rejected saved-state write became an unhandled rejection');
+    assert.deepEqual(accepted, [['claude', cwd, '', SAVED_HAIKU]]);
+  } finally {
+    for (const subscription of subscriptions) subscription.dispose();
+    warn.mockRestore();
+    process.off('unhandledRejection', listener);
+  }
 });
 
 test('an editor tab only announces a visibility change when its visibility changed', () => {
@@ -13885,6 +14218,7 @@ function catalogRefreshFixture(book?: UsageBook) {
     draftMcpKeys: new Map(),
     mcpSurfaceGeneration: 0,
     workspaceCwd: () => control.cwd,
+    cliPath: () => '',
     idlePlanFor: () => (control.failure === 'plan' ? null : {}),
     spawner() {},
     askIdle: async (
@@ -18585,6 +18919,7 @@ const DRAFT_SENT: LivePress = {
 };
 
 interface DraftPanel {
+  sessionRows: { id: string; agentKey: string; agent: string }[];
   draftProfiles: Record<string, SessionProfile>;
   newDrafts: Record<string, NewSessionDraft>;
   picks: SessionSettingBook;
@@ -18620,6 +18955,7 @@ function draftPanel(
     'sessionSettingsForProfile',
     'unsupportedPromptAsset',
     'attachmentRefusal',
+    'AGENT_NAMES',
     `return function (session, control, value) {\n${methodBody('private pickOnDraft(')}\n};`,
   )(
     draftStarted,
@@ -18629,8 +18965,10 @@ function draftPanel(
     sessionSettingsForProfile,
     unsupportedPromptAsset,
     attachmentRefusal,
+    AGENT_NAMES,
   ) as (this: DraftPanel, session: string, control: string, value: string) => void;
   const panel: DraftPanel = {
+    sessionRows: [{ id: 'd1', agentKey: profile.agent, agent: AGENT_NAMES[profile.agent] }],
     draftProfiles: { d1: { ...profile } },
     newDrafts: { d1: newSessionDraft('d1', DRAFT_CWD, 's1', DRAFT_MADE_AT, profile, DRAFT_FROM_COMMENT) },
     picks: {},
@@ -18851,13 +19189,19 @@ test('a press on a draft rebuilds the rail only where it changes the agent', () 
     'the composer, its tag, its labels and its menus never reach the panel, so the press shows nowhere',
   );
 
-  // Changing the agent refreshes the session list.
+  // Changing the agent refreshes the session list, after the composer is posted from held state.
   const moved = draftPanel(DRAFT_SETUP);
   moved.press('agent', 'codex');
   assert.deepEqual(
     moved.refreshed,
     [true],
     'the rail row goes on naming the agent the reader left, and goes on choosing its catalog',
+  );
+  assert.deepEqual(moved.sessionRows, [{ id: 'd1', agentKey: 'codex', agent: AGENT_NAMES.codex }]);
+  assert.deepEqual(
+    moved.posted,
+    [{ type: 'usage', usage: { composer: 'what the cheap post carries' } }],
+    'the new agent waits behind session discovery',
   );
 });
 

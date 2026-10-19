@@ -45,6 +45,9 @@ import {
   McpChange,
   McpPendingRefreshes,
   ModelBook,
+  SavedDefaults,
+  saveCatalog,
+  savedCatalogs,
   UsageReadQueue,
   askIdle,
   askIdleMcp,
@@ -104,7 +107,7 @@ import { AgentUsage, UsageBook, UsageResetTimer, UsageWriteQueue, USAGE_AGENT_OR
 import { UsageRecorder, USAGE_STORE_DIRECTORY } from './usagerecord';
 import { sameSkillList, withDirectorySkills } from './domain/claude-skills';
 import { normalizeWorkspace } from './projectspend';
-import { ConfigWatches } from './configwatch';
+import { comparableFolder, ConfigWatches, defaultsKey, defaultsKeyParts } from './configwatch';
 import { WindowChannel } from './sessionrequests';
 import { terminalOwnership, localTerminalPlacement } from './terminalownership';
 import { reportWindowTransport, windowTransportErrorCode, type WindowTransportSink } from './windowpipe';
@@ -331,7 +334,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   );
   context.subscriptions.push(usageReads);
   // Retain each agent's reported model catalog. Its freshness window controls when another catalog is requested.
-  const models = new ModelBook();
+  // The catalog saved by an earlier run for the same CLI path draws the fields until this run's first read answers.
+  const cliPath = (agent: string): string => readSetting(agent === 'claude' ? 'claudePath' : 'codexPath');
+  // Each answer is saved under the CLI path that started its read, and only while that path is still configured.
+  const models = new ModelBook(
+    savedCatalogs(context.globalState, cliPath, USAGE_AGENT_ORDER),
+    (agent, list, readPath) => {
+      void saveCatalog(context.globalState, agent, readPath, cliPath(agent), list);
+    },
+  );
   // Retain the latest MCP server list for each draft or recorded session, without a freshness clock.
   const mcp = new McpBook();
   const mcpRefreshes = new McpPendingRefreshes();
@@ -898,6 +909,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     await persistSessionSettings(session, settings);
     publishPicks();
   };
+  // A carried catalog belongs to the CLI path that answered it.
+  context.subscriptions.push(
+    vscode.workspace.onDidChangeConfiguration((event) => {
+      const changed = USAGE_AGENT_ORDER.filter((agent) =>
+        event.affectsConfiguration(settingName(agent === 'claude' ? 'claudePath' : 'codexPath')),
+      );
+      for (const agent of changed) models.dropCarried(agent);
+      if (changed.length) publishPicks();
+    }),
+  );
   const setupProjects = new SetupProjects(nodeGitRunner());
   const setupStore = new ProjectSetupStore(context.globalState);
   let setupGeneration = 0;
@@ -1165,6 +1186,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   let defaultsRevision = 0;
   const defaultRequests = new Map<string, Promise<AppliedDefaults>>();
+  // Applied defaults readings saved across runs. The panel draws a saved reading until the fresh read answers.
+  const savedDefaults = new SavedDefaults(context.globalState, path);
+  panel.savedDefaults = savedDefaults;
   let defaultsDisposed = false;
   const configWatches = new ConfigWatches({
     watch: (base, pattern, listener) => {
@@ -1188,10 +1212,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   });
   panel.onWatchDefaults = (cwds) => {
     if (defaultsDisposed) return;
-    const roots = new Set(cwds.map((cwd) => path.resolve(cwd)));
+    const roots = new Set(cwds.map((cwd) => comparableFolder(cwd, path)));
     for (const key of defaultRequests.keys()) {
-      const [, cwd] = JSON.parse(key) as string[];
-      if (!roots.has(path.resolve(cwd))) defaultRequests.delete(key);
+      const [defaults] = JSON.parse(key) as string[];
+      if (!roots.has(defaultsKeyParts(defaults).folder)) defaultRequests.delete(key);
     }
     configWatches.update(cwds);
   };
@@ -1207,9 +1231,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   panel.onReadDefaults = (agent, cwd, model) => {
     if (defaultsDisposed) return;
     const revision = defaultsRevision;
-    const catalog = models.get(agent)?.models ?? [];
-    const concrete = catalog.find((item) => item.value === model)?.resolvedModel || model;
-    const key = JSON.stringify([agent, cwd, concrete, revision]);
+    const key = JSON.stringify([defaultsKey(agent, cwd, model, path), revision]);
     let request = defaultRequests.get(key);
     if (!request) {
       request = (async () => {
@@ -1235,8 +1257,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       defaultRequests.set(key, request);
     }
     void request.then((defaults) => {
-      if (!defaultsDisposed && revision === defaultsRevision && defaultRequests.get(key) === request)
+      if (!defaultsDisposed && revision === defaultsRevision && defaultRequests.get(key) === request) {
+        void savedDefaults.save(agent, cwd, model, defaults);
         panel.setAppliedDefaults(agent, cwd, model, defaults);
+      }
     });
   };
   const invalidateDefaults = () => {
@@ -1355,10 +1379,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       }
       // Pass the explicit refresh flag to the model catalog. It clears a previous silent failure so the reader can retry.
       if (models.toAsk([session.agent], Date.now(), force).length > 0) {
+        const readPath = cliPath(session.agent);
         try {
           const list = await session.models();
           if (list) {
-            models.note(session.agent, list);
+            models.note(session.agent, list, readPath);
             publishPicks();
           } else {
             models.noteSilent(session.agent);
@@ -1513,6 +1538,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             }
             return;
           }
+          const readPath = cliPath(agent);
           const plan = idlePlanFor(agent, cwd);
           if (!plan) {
             usageReads.result(
@@ -1592,7 +1618,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           commandsAsked.add(agent);
           publishCommands({ agent, commands: answers.commands, complete: false }, commandRevision);
           if (answers.models) {
-            models.note(agent, answers.models);
+            models.note(agent, answers.models, readPath);
             publishPicks();
           } else {
             models.noteSilent(agent);

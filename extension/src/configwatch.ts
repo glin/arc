@@ -58,6 +58,22 @@ function folderKey(folder: string, rules: PlatformPath): string {
   return rules.sep === '\\' ? folder.toLowerCase() : folder;
 }
 
+// A working directory in the form that compares equal for one folder. Windows path rules ignore case.
+export function comparableFolder(cwd: string, rules: PlatformPath): string {
+  return folderKey(rules.resolve(cwd), rules);
+}
+
+// The one key for an applied defaults reading: agent, comparable working directory, and the raw model value.
+// The empty base value and a value with a window suffix stay distinct keys.
+export function defaultsKey(agent: string, cwd: string, model: string, rules: PlatformPath): string {
+  return JSON.stringify([agent, comparableFolder(cwd, rules), model]);
+}
+
+export function defaultsKeyParts(key: string): { agent: string; folder: string; model: string } {
+  const [agent, folder, model] = JSON.parse(key) as string[];
+  return { agent, folder, model };
+}
+
 export class ConfigWatches {
   private readonly folders = new Map<string, FolderWatch>();
   private disposed = false;

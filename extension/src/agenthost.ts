@@ -8,7 +8,9 @@ import { CONTEXT_FRAME_BYTES, CONTEXT_PREFIX_BYTES, type ContextFrameGate } from
 
 import { spawn as nodeSpawn } from 'node:child_process';
 import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, type PlatformPath } from 'node:path';
+import { createHash } from 'node:crypto';
+import { defaultsKey } from './configwatch';
 import { parseEnv } from 'node:util';
 import {
   ClaudeWire,
@@ -2213,14 +2215,27 @@ export class UsageReadQueue {
 export const MODELS_FRESH_MS = 12 * 60 * 60 * 1000;
 
 // Keeps each agent's latest model catalog and suppresses repeated failed automatic reads.
+// A seeded catalog from an earlier run is carried. It draws the fields and offers its rows, but `get` and `pending`
+// treat its agent as pending, so it never rejects a pick. The first fresh catalog replaces it.
 export class ModelBook {
   private readonly byAgent = new Map<string, ModelList>();
+  private readonly carried: Map<string, ModelList>;
   // Agents whose catalog read failed. An explicit refresh clears this suppression.
   private readonly silent = new Set<string>();
 
-  note(agent: string, list: ModelList): void {
+  constructor(
+    seed: Readonly<Record<string, ModelList>> = {},
+    private readonly save: (agent: string, list: ModelList, readPath?: string) => void = () => {},
+  ) {
+    this.carried = new Map(Object.entries(seed));
+  }
+
+  // `readPath` is the CLI path setting when the read that answered `list` started.
+  note(agent: string, list: ModelList, readPath?: string): void {
     this.byAgent.set(agent, list);
+    this.carried.delete(agent);
     this.silent.delete(agent);
+    this.save(agent, list, readPath);
   }
 
   // Suppress automatic retries while retaining the existing catalog.
@@ -2228,22 +2243,31 @@ export class ModelBook {
     this.silent.add(agent);
   }
 
+  // Drop a carried catalog, as when its CLI path changes.
+  dropCarried(agent: string): void {
+    this.carried.delete(agent);
+  }
+
+  // The fresh catalog of this run. A carried catalog answers null, so a pick it lacks is kept.
   get(agent: string): ModelList | null {
     return this.byAgent.get(agent) ?? null;
   }
 
+  // An agent without a fresh catalog is pending while a read can still answer or a carried catalog stands in.
   pending(agent: string): boolean {
-    return !this.byAgent.has(agent) && !this.silent.has(agent);
+    return !this.byAgent.has(agent) && (this.carried.has(agent) || !this.silent.has(agent));
   }
 
-  // Every list, keyed by agent, which is the shape the panel draws its pickers from.
+  // Every list the fields draw from, keyed by agent. A fresh catalog wins over a carried one.
   lists(): Record<string, ModelChoice[]> {
     const out: Record<string, ModelChoice[]> = {};
+    for (const [agent, list] of this.carried) out[agent] = list.models;
     for (const [agent, list] of this.byAgent) out[agent] = list.models;
     return out;
   }
 
   // Selects agents whose catalogs need a refresh. Force clears failure suppression and bypasses the age check.
+  // A carried catalog never counts as read, so the first request of each run reads the CLI.
   toAsk(agents: readonly string[], now: number, force: boolean): string[] {
     if (force) {
       for (const agent of agents) this.silent.delete(agent);
@@ -2256,6 +2280,101 @@ export class ModelBook {
       const list = this.byAgent.get(agent);
       return !list || now - list.readAt > MODELS_FRESH_MS;
     });
+  }
+}
+
+// The saved-state calls the stores below use. `globalState` supplies them.
+export interface SavedStateStorage {
+  get(key: string): unknown;
+  update(key: string, value: unknown): PromiseLike<void>;
+  keys(): readonly string[];
+}
+
+const SAVED_CATALOG_PREFIX = 'arc.savedModelCatalog.v1:';
+
+// Reads the saved catalog of each agent whose saved CLI path matches the configured one.
+export function savedCatalogs(
+  storage: SavedStateStorage,
+  cliPath: (agent: string) => string,
+  agents: readonly string[],
+): Record<string, ModelList> {
+  const out: Record<string, ModelList> = {};
+  for (const agent of agents) {
+    const entry = storage.get(SAVED_CATALOG_PREFIX + agent) as { cliPath?: unknown; list?: ModelList } | undefined;
+    if (entry?.cliPath === cliPath(agent) && Array.isArray(entry.list?.models)) out[agent] = entry.list;
+  }
+  return out;
+}
+
+// Saves one catalog per agent, with the CLI path that started its read. A catalog from another path replaces it.
+// A read that started under a path other than the configured one saves nothing. A failed save is logged.
+export async function saveCatalog(
+  storage: SavedStateStorage,
+  agent: string,
+  readPath: string | undefined,
+  configuredPath: string,
+  list: ModelList,
+): Promise<void> {
+  if (readPath === undefined || readPath !== configuredPath) return;
+  try {
+    await storage.update(SAVED_CATALOG_PREFIX + agent, { cliPath: readPath, list });
+  } catch (error) {
+    console.warn('Arc: the model list was not saved, so the next window reads it again.', error);
+  }
+}
+
+const SAVED_DEFAULTS_PREFIX = 'arc.savedDefaults.v1:';
+// The number of applied defaults readings the store keeps, newest first by save time.
+export const SAVED_DEFAULTS_LIMIT = 64;
+
+interface SavedDefaultsEntry {
+  key: string;
+  defaults: AppliedDefaults;
+  savedAt: number;
+}
+
+function savedDefaultsEntry(raw: unknown): SavedDefaultsEntry | null {
+  const entry = raw as Partial<SavedDefaultsEntry> | undefined;
+  const defaults = entry?.defaults;
+  if (typeof entry?.key !== 'string' || typeof entry.savedAt !== 'number' || !defaults) return null;
+  if (defaults.status !== 'ready' && defaults.status !== 'unavailable') return null;
+  return entry as SavedDefaultsEntry;
+}
+
+// Saved applied defaults readings, one saved-state key per reading, so two windows never overwrite each other.
+// The key name hashes the defaults key. The value holds the key, and a lookup matches it.
+export class SavedDefaults {
+  constructor(
+    private readonly storage: SavedStateStorage,
+    private readonly rules: PlatformPath,
+    private readonly now: () => number = Date.now,
+  ) {}
+
+  private name(key: string): string {
+    return SAVED_DEFAULTS_PREFIX + createHash('sha256').update(key).digest('hex');
+  }
+
+  get(agent: string, cwd: string, model: string): AppliedDefaults | undefined {
+    const key = defaultsKey(agent, cwd, model, this.rules);
+    const entry = savedDefaultsEntry(this.storage.get(this.name(key)));
+    return entry?.key === key ? entry.defaults : undefined;
+  }
+
+  // A failed save is logged and never rejects.
+  async save(agent: string, cwd: string, model: string, defaults: AppliedDefaults): Promise<void> {
+    if (defaults.status === 'loading') return;
+    const key = defaultsKey(agent, cwd, model, this.rules);
+    try {
+      await this.storage.update(this.name(key), { key, defaults, savedAt: this.now() });
+      const saved = this.storage
+        .keys()
+        .filter((name) => name.startsWith(SAVED_DEFAULTS_PREFIX))
+        .map((name) => ({ name, savedAt: savedDefaultsEntry(this.storage.get(name))?.savedAt ?? -1 }))
+        .sort((a, b) => b.savedAt - a.savedAt);
+      await Promise.all(saved.slice(SAVED_DEFAULTS_LIMIT).map(({ name }) => this.storage.update(name, undefined)));
+    } catch (error) {
+      console.warn('Arc: the model and effort defaults were not saved, so the next window reads them again.', error);
+    }
   }
 }
 

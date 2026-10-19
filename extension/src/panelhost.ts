@@ -72,6 +72,8 @@ import { costStateDependency, costStateIdentity, reconcileClaudeCostState } from
 import { claudeCostStateDependencies, invalidateClaudeCostSupplements } from './projectspend';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import type { PlatformPath } from 'node:path';
+import { comparableFolder, defaultsKey, defaultsKeyParts } from './configwatch';
 import * as crypto from 'node:crypto';
 import * as os from 'node:os';
 import { isDeepStrictEqual } from 'node:util';
@@ -1209,6 +1211,16 @@ const READER_INSTRUCTIONS: ReadonlySet<string> = new Set([
   'acceptQueuedEdit',
 ]);
 
+// An applied defaults reading the panel holds, with the request that produced it.
+interface HeldDefaults {
+  agent: 'claude' | 'codex';
+  cwd: string;
+  model: string;
+  defaults: AppliedDefaults;
+  // The invalidation revision whose read this value started or answered. An older revision marks a carried value.
+  revision: number;
+}
+
 export class PanelProvider implements vscode.Disposable {
   private submissionWrites: Promise<void> = Promise.resolve();
   private submissionsInFlight = new Set<string>();
@@ -1409,23 +1421,35 @@ export class PanelProvider implements vscode.Disposable {
   // Model catalogs by agent and prompt settings by session.
   private models: Record<string, ModelChoice[]> = {};
   private pendingModels: readonly string[] = [];
-  private appliedDefaults = new Map<string, AppliedDefaults>();
+  // Held applied defaults by `defaultsKey`. A held value stays drawn until a fresh answer for its key replaces it.
+  private appliedDefaults = new Map<string, HeldDefaults>();
   private appliedDefaultsRevision = 0;
+  // Path rules that decide when two working directories name one folder.
+  private defaultsPath: PlatformPath = path;
   public onReadDefaults: ((agent: 'claude' | 'codex', cwd: string, model: string) => void) | null = null;
   public onWatchDefaults: ((cwds: readonly string[]) => void) | null = null;
+  // The last applied defaults reading saved for a key, from this run or an earlier one.
+  public savedDefaults: { get(agent: string, cwd: string, model: string): AppliedDefaults | undefined } | null = null;
 
-  public setAppliedDefaults(agent: string, cwd: string, model: string, defaults: AppliedDefaults): void {
-    this.appliedDefaults.set(JSON.stringify([agent, cwd, model]), defaults);
+  public setAppliedDefaults(agent: 'claude' | 'codex', cwd: string, model: string, defaults: AppliedDefaults): void {
+    this.appliedDefaults.set(defaultsKey(agent, cwd, model, this.defaultsPath ?? path), {
+      agent,
+      cwd,
+      model,
+      defaults,
+      revision: this.appliedDefaultsRevision,
+    });
     void this.post({ type: 'usage', usage: this.usagePayload() });
   }
 
+  // Keep every held value drawn as a carried value. The next lookup of each key starts its fresh read.
   public clearAppliedDefaults(): void {
-    this.appliedDefaults.clear();
     this.appliedDefaultsRevision++;
     void this.post({ type: 'usage', usage: this.usagePayload() });
   }
 
   private defaultContext(agent: string, cwd: string | null, model = ''): DefaultContext {
+    const rules = this.defaultsPath ?? path;
     if (cwd && this.onWatchDefaults) {
       const folders = new Set<string | undefined>([
         cwd,
@@ -1437,29 +1461,33 @@ export class PanelProvider implements vscode.Disposable {
         if (row) folders.add(this.cwdForSession(row.agentKey, row.id) ?? undefined);
       }
       const cwds = [...folders].filter((folder): folder is string => Boolean(folder));
+      const active = new Set(cwds.map((folder) => comparableFolder(folder, rules)));
       for (const key of this.appliedDefaults?.keys() ?? []) {
-        const [, folder] = JSON.parse(key) as string[];
-        if (!cwds.includes(folder)) this.appliedDefaults.delete(key);
+        if (!active.has(defaultsKeyParts(key).folder)) this.appliedDefaults.delete(key);
       }
       this.onWatchDefaults(cwds);
     }
     if (!cwd || !this.onReadDefaults || (agent !== 'claude' && agent !== 'codex')) return {};
     this.appliedDefaults ??= new Map();
     for (const value of new Set(['', model])) {
-      const key = JSON.stringify([agent, cwd, value]);
-      if (!this.appliedDefaults.has(key)) {
-        this.appliedDefaults.set(key, LOADING_DEFAULTS);
+      const key = defaultsKey(agent, cwd, value, rules);
+      const held = this.appliedDefaults.get(key);
+      if (held?.revision !== this.appliedDefaultsRevision) {
+        // A held or saved reading draws at once as a carried value. The fresh read below replaces it.
+        const defaults = held?.defaults ?? this.savedDefaults?.get(agent, cwd, value) ?? LOADING_DEFAULTS;
+        this.appliedDefaults.set(key, { agent, cwd, model: value, defaults, revision: this.appliedDefaultsRevision });
         this.onReadDefaults?.(agent, cwd, value);
       }
     }
+    const folder = comparableFolder(cwd, rules);
     const rows: Record<string, AppliedDefaults> = {};
-    for (const [key, defaults] of this.appliedDefaults) {
-      const [owner, folder, value] = JSON.parse(key) as string[];
-      if (owner === agent && folder === cwd && value) rows[value] = defaults;
+    for (const [key, held] of this.appliedDefaults) {
+      const parts = defaultsKeyParts(key);
+      if (parts.agent === agent && parts.folder === folder && parts.model) rows[parts.model] = held.defaults;
     }
     return {
       revision: this.appliedDefaultsRevision,
-      base: this.appliedDefaults.get(JSON.stringify([agent, cwd, ''])),
+      base: this.appliedDefaults.get(defaultsKey(agent, cwd, '', rules))?.defaults,
       models: rows,
     };
   }
@@ -5066,7 +5094,12 @@ export class PanelProvider implements vscode.Disposable {
       this.refreshUsageHandler?.(next.agent, false, session, next.agent, draft.cwd);
     }
     // Agent changes require a new session-list row. Other setup changes update only the composer payload.
+    // Publish the composer from held state first, so the new agent's fields do not wait behind session discovery.
     if (next.agent !== profile.agent) {
+      this.sessionRows = this.sessionRows.map((row) =>
+        row.id === session ? { ...row, agentKey: next.agent, agent: AGENT_NAMES[next.agent] } : row,
+      );
+      void this.post({ type: 'usage', usage: this.usagePayload() });
       void this.refresh(true);
       return;
     }

@@ -16,6 +16,11 @@ import {
   McpBook,
   McpPendingRefreshes,
   ModelBook,
+  SAVED_DEFAULTS_LIMIT,
+  SavedDefaults,
+  saveCatalog,
+  savedCatalogs,
+  type SavedStateStorage,
   SessionEvent,
   SessionState,
   UsageReadQueue,
@@ -79,6 +84,7 @@ import {
   withSessionSettings,
 } from './composerview.ts';
 import { USAGE_FRESH_MS, UsageBook, usageBar } from './usageview.ts';
+import { missingSetupValues } from './domain/session-setups.ts';
 import { tempDir } from './temproot.ts';
 import { QuestionRecovery, questionContinuation } from './questionrecovery';
 import { QuestionEvidenceReader } from './questionrecords';
@@ -7500,6 +7506,163 @@ test('catalogs stay pending only before their first answer or failure', () => {
   assert.equal(book.pending('codex'), false);
   book.noteSilent('claude');
   assert.equal(book.pending('claude'), false);
+});
+
+// A saved-state fake with the calls `globalState` supplies.
+function memoryState(): SavedStateStorage & { values: Map<string, unknown> } {
+  const values = new Map<string, unknown>();
+  return {
+    values,
+    get: (key) => values.get(key),
+    update: (key, value) => {
+      if (value === undefined) values.delete(key);
+      else values.set(key, structuredClone(value));
+      return Promise.resolve();
+    },
+    keys: () => [...values.keys()],
+  };
+}
+
+test('a carried catalog draws its rows but rejects no pick until a fresh catalog arrives', () => {
+  const stored = { agent: 'claude' as const, model: 'retired', effort: 'max', permissionMode: 'default' };
+  const agents = (book: ModelBook) => [
+    {
+      value: 'claude',
+      modelsPending: book.pending('claude'),
+      models: (book.lists().claude ?? []).map((item) => ({ value: item.value, efforts: item.efforts })),
+      permissions: [{ value: 'default' }],
+    },
+  ];
+  const book = new ModelBook({ claude: A_MODEL_LIST });
+  assert.deepEqual(book.lists(), { claude: A_MODEL_LIST.models }, 'a carried catalog offers its rows at once');
+  assert.equal(pickedModel('retired', book.get('claude')), 'retired', 'a carried catalog dropped a stored pick');
+  assert.equal(pickedEffort('max', book.get('claude'), 'retired'), 'max');
+  assert.deepEqual(missingSetupValues(stored, agents(book)), [], 'a carried catalog made a saved setup unstartable');
+  book.noteSilent('claude');
+  assert.equal(book.pending('claude'), true, 'a failed fresh read let a carried catalog reject picks');
+  assert.deepEqual(missingSetupValues(stored, agents(book)), []);
+  book.note('claude', { ...A_MODEL_LIST, readAt: 1 });
+  assert.equal(pickedModel('retired', book.get('claude')), '');
+  assert.deepEqual(missingSetupValues(stored, agents(book)), ['model', 'effort']);
+});
+
+test('the first catalog request of a run reads the CLI even with a saved catalog, and a changed CLI path drops it', async () => {
+  const storage = memoryState();
+  const saved: unknown[] = [];
+  const first = new ModelBook({}, (agent, list) => saved.push(agent, list));
+  first.note('claude', { ...A_MODEL_LIST, readAt: 5 });
+  assert.deepEqual(saved, ['claude', { ...A_MODEL_LIST, readAt: 5 }]);
+  await saveCatalog(storage, 'claude', 'C:/Tools/claude.exe', 'C:/Tools/claude.exe', { ...A_MODEL_LIST, readAt: 5 });
+  const seed = savedCatalogs(storage, () => 'C:/Tools/claude.exe', ['claude', 'codex']);
+  assert.deepEqual(Object.keys(seed), ['claude']);
+  const next = new ModelBook(seed);
+  assert.deepEqual(
+    next.toAsk(['claude'], 6, false),
+    ['claude'],
+    'a saved catalog stood in for the first read of this run',
+  );
+  assert.deepEqual(
+    savedCatalogs(storage, () => 'C:/Other/claude.exe', ['claude']),
+    {},
+  );
+  next.dropCarried('claude');
+  assert.deepEqual(next.lists(), {});
+});
+
+test('a catalog answer that arrives after a CLI path change is not saved under the new path', async () => {
+  const storage = memoryState();
+  let configured = 'C:/Old/claude.exe';
+  const saves: Promise<void>[] = [];
+  const book = new ModelBook({}, (agent, list, readPath) =>
+    saves.push(saveCatalog(storage, agent, readPath, configured, list)),
+  );
+  const startedUnder = configured;
+  configured = 'C:/New/claude.exe';
+  book.note('claude', { ...A_MODEL_LIST, readAt: 5 }, startedUnder);
+  await Promise.all(saves);
+  assert.deepEqual(
+    savedCatalogs(storage, () => configured, ['claude']),
+    {},
+    "the old executable's catalog was saved under the new path",
+  );
+  book.note('claude', { ...A_MODEL_LIST, readAt: 6 }, configured);
+  await Promise.all(saves);
+  assert.deepEqual(
+    savedCatalogs(storage, () => configured, ['claude']),
+    { claude: { ...A_MODEL_LIST, readAt: 6 } },
+  );
+  // Every catalog answer carries the path its read started under, and the save compares it with the configured path.
+  const source = fs.readFileSync(path.join(__dirname, 'extension.ts'), 'utf8');
+  const notes = [...source.matchAll(/models\.note\(([^)]*)\)/g)];
+  assert.ok(notes.length > 0);
+  for (const [call, args] of notes)
+    assert.equal(
+      args.split(',').length,
+      3,
+      `a catalog answer is noted without the path its read started under: ${call}`,
+    );
+  assert.match(source, /saveCatalog\(context\.globalState, agent, readPath, cliPath\(agent\), list\)/);
+});
+
+test('a rejected saved-state write is logged, never rejects, and leaves the fresh catalog drawn', async () => {
+  const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+  try {
+    const storage = { ...memoryState(), update: () => Promise.reject(new Error('disk full')) };
+    const saves: Promise<void>[] = [];
+    const book = new ModelBook({}, (agent, list, readPath) =>
+      saves.push(saveCatalog(storage, agent, readPath, 'claude', list)),
+    );
+    book.note('claude', A_MODEL_LIST, 'claude');
+    await Promise.all(saves);
+    assert.deepEqual(book.lists(), { claude: A_MODEL_LIST.models });
+    await new SavedDefaults(storage, path.posix).save('claude', '/Work', '', {
+      status: 'ready',
+      model: 'claude-haiku-5-5',
+      effort: 'medium',
+      reason: '',
+    });
+    assert.equal(warn.mock.calls.length, 2);
+  } finally {
+    warn.mockRestore();
+  }
+});
+
+test('saved defaults from two windows keep both readings and evict to the newest', async () => {
+  const storage = memoryState();
+  let now = 0;
+  const one = new SavedDefaults(storage, path.posix, () => ++now);
+  const two = new SavedDefaults(storage, path.posix, () => ++now);
+  const ready = (model: string) => ({ status: 'ready' as const, model, effort: 'high', reason: '' });
+  await Promise.all([one.save('claude', '/Work/A', '', ready('a')), two.save('claude', '/Work/B', '', ready('b'))]);
+  assert.deepEqual(one.get('claude', '/Work/B', ''), ready('b'));
+  assert.deepEqual(two.get('claude', '/Work/A', ''), ready('a'));
+  assert.equal(one.get('claude', '/work/a', ''), undefined, 'Linux path rules matched a folder that differs in case');
+  assert.equal(one.get('codex', '/Work/A', ''), undefined);
+  assert.equal(one.get('claude', '/Work/A', 'opus'), undefined);
+  for (let index = 0; index < SAVED_DEFAULTS_LIMIT; index++)
+    await (index % 2 ? one : two).save('claude', `/Work/${index}`, '', ready(String(index)));
+  assert.equal(storage.keys().length, SAVED_DEFAULTS_LIMIT);
+  assert.equal(one.get('claude', '/Work/A', ''), undefined);
+  assert.equal(one.get('claude', '/Work/B', ''), undefined);
+  assert.deepEqual(two.get('claude', '/Work/0', ''), ready('0'));
+  assert.deepEqual(two.get('claude', `/Work/${SAVED_DEFAULTS_LIMIT - 1}`, ''), ready(String(SAVED_DEFAULTS_LIMIT - 1)));
+  const windows = new SavedDefaults(storage, path.win32, () => ++now);
+  await windows.save('claude', 'C:\\Work\\Repo', '', ready('w'));
+  assert.deepEqual(
+    windows.get('claude', 'c:\\work\\REPO', ''),
+    ready('w'),
+    'Windows path rules compared folders with case',
+  );
+});
+
+test('a launch whose model the CLI rejects shows the CLI message', async () => {
+  const { host, children } = fakeHost();
+  const starting = host.session('one', claudePlan(CLAUDE, { cwd: WS, model: 'retired-model' }));
+  children[0].complain('There is an issue with the selected model (retired-model). It may not exist.\n');
+  children[0].exit(1);
+  const session = await starting.catch((error: Error) => error);
+  const shown = session instanceof Error ? session.message : (session.state().lastError ?? '');
+  assert.match(shown, /issue with the selected model \(retired-model\)/);
 });
 
 test('a model list is kept far longer than a usage figure, because it turns over on a release', () => {
