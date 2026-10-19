@@ -7,7 +7,7 @@ import * as childProcess from 'node:child_process';
 import { PassThrough } from 'node:stream';
 import { once } from 'node:events';
 import { promisify } from 'node:util';
-import { afterEach, test, vi } from 'vitest';
+import { afterAll, afterEach, test, vi } from 'vitest';
 import { parseRun, runStandalone, runSupervisor } from '../src/run.ts';
 import {
   backgroundIdentity,
@@ -58,6 +58,12 @@ vi.mock('node:child_process', async (importOriginal) => {
       [promisify.custom]: vi.fn<typeof execute>(execute),
     }),
   };
+});
+
+let outputProducerBuild: Promise<string> | undefined;
+let outputProducerHome: string | undefined;
+afterAll(() => {
+  if (outputProducerHome) fs.rmSync(outputProducerHome, { recursive: true, force: true });
 });
 
 const session = 'aaaaaaaa-1111-2222-3333-444444444444';
@@ -245,20 +251,23 @@ function claudePrintFixture() {
   const launch = admitParsed(receipts, parsed);
   return { home, parsed, options, file, receipts, launch, child: providerChild() };
 }
-async function buildOutputEntry(cwd: string) {
-  const entry = path.join(cwd, 'output-entry.cjs');
-  await build({
-    stdin: {
-      contents: `import {produceStandaloneOutput} from './cli/src/standalone.ts';import {DispatchReceipts} from './extension/src/dispatchreceipts.ts';produceStandaloneOutput(new DispatchReceipts(),process.argv[3]).catch(e=>{console.error(e);process.exitCode=1});`,
-      resolveDir: path.resolve('..'),
-    },
-    bundle: true,
-    platform: 'node',
-    format: 'cjs',
-    outfile: entry,
-    logLevel: 'silent',
-  });
-  return entry;
+function buildOutputEntry(): Promise<string> {
+  return (outputProducerBuild ??= (async () => {
+    outputProducerHome = fs.mkdtempSync(path.join(os.tmpdir(), 'arc-output-producer-'));
+    const entry = path.join(outputProducerHome!, 'output-entry.cjs');
+    await build({
+      stdin: {
+        contents: `import {produceStandaloneOutput} from './cli/src/standalone.ts';import {DispatchReceipts} from './extension/src/dispatchreceipts.ts';produceStandaloneOutput(new DispatchReceipts(),process.argv[3]).catch(e=>{console.error(e);process.exitCode=1});`,
+        resolveDir: path.resolve('..'),
+      },
+      bundle: true,
+      platform: 'node',
+      format: 'cjs',
+      outfile: entry,
+      logLevel: 'silent',
+    });
+    return entry;
+  })());
 }
 test.each(['missing', 'different', 'oversized'] as const)(
   'qualified Codex disagreement retains failure for %s reports',
@@ -3830,7 +3839,7 @@ test.each([false, true])(
 const lateFinish=()=>{if(!fs.existsSync(path.join(process.cwd(),'${finalSignalName}')))return;lateWatcher.close();fs.writeFileSync(process.argv[process.argv.indexOf('-o')+1],'Report');fs.writeSync(${stderrEnding ? 2 : 1},${JSON.stringify(terminal)});};
 const lateWatcher=fs.watch(process.cwd(),lateFinish);lateFinish();return;`;
     const { receipts, launch, options, started, release } = workerFixture(extra, 10_000, false, true);
-    const entry = await buildOutputEntry(options.cwd);
+    const entry = await buildOutputEntry();
     const owner = () => artifactJson(receipts, launch.launchId, 'output-owner.json');
     const alias = launch.standalone!.logAlias!;
     const bounds = { frameBytes: 512_000, readBytes: 17, workBytes: 512 };
@@ -4002,7 +4011,7 @@ test('background log continues after observation and recovers without taking a r
     script,
     `const fs=require('node:fs');const args=process.argv.slice(2);fs.appendFileSync(${JSON.stringify(calls)},JSON.stringify({args})+'\\n');if(args.includes('--bg')){process.stdin.resume();process.stdin.on('end',()=>console.log('backgrounded · deadbeef · ${options.name}'));}else if(args[0]==='agents')process.stdout.write(fs.readFileSync(${JSON.stringify(registry)}));else if(args[0]==='logs'){if(args[1]!=='deadbeef')process.exitCode=1;else fs.writeSync(1,fs.readFileSync(${JSON.stringify(native)}));}`,
   );
-  const entry = await buildOutputEntry(options.cwd);
+  const entry = await buildOutputEntry();
   const owner = () => artifactJson(receipts, launch.launchId, 'output-owner.json');
   const capturedNative = receipts.artifact(launch.launchId, 'native.log');
   const bounds = { frameBytes: 512_000, readBytes: 17, workBytes: 512 };

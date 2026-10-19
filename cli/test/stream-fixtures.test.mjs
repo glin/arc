@@ -95,7 +95,12 @@ test('stream expectations keep unavailable evidence unknown', () => {
 test('stream audit rejects changed expected values', () => {
   const temp = mkdtempSync(join(tmpdir(), 'arc-stream-audit-'));
   try {
-    for (const file of readdirSync(directory).filter((name) => /\.jsonl?$/.test(name))) {
+    for (const file of [
+      'one-request.json',
+      'one-request.expected.json',
+      'bedrock-regional.json',
+      'bedrock-regional.expected.json',
+    ]) {
       copyFileSync(join(directory, file), join(temp, file));
     }
     const command = join(temp, 'expected.mjs');
