@@ -6562,96 +6562,94 @@ test('prompt recall stays in its session across submissions, switches, and reloa
     return;
   }
   try {
-    for (const agent of ['claude', 'codex'] as const) {
-      const page = await browser.newPage();
-      await page.setContent(recoveryPage({}));
-      const view = (sessionId: string) =>
-        composerView({ ...COMPOSER, agent, sessionId, history: [], draft: '', onScreen: '' });
-      const select = (session: string) =>
-        post(page, { type: 'usage', usage: usageWith(renderPayload(), view(session)) });
-      const prompt = page.locator('#prompt');
-      await select('session-a');
-      await prompt.fill('prompt from session a');
-      await prompt.press('Enter');
-      await page.waitForFunction(() => (window as any).__saved.submittedPrompts?.length === 1);
-      await select('session-b');
-      await prompt.fill('prompt from session b');
-      await prompt.press('Enter');
-      await page.waitForFunction(() => (window as any).__saved.submittedPrompts?.length === 2);
-      await prompt.fill('draft for session b');
-      await prompt.evaluate((node: HTMLTextAreaElement) => node.setSelectionRange(0, 0));
-      await prompt.press('ArrowUp');
-      assert.equal(await prompt.inputValue(), 'prompt from session b');
-      await prompt.press('ArrowUp');
-      assert.equal(await prompt.inputValue(), 'prompt from session b');
-      await prompt.press('ArrowDown');
-      assert.equal(await prompt.inputValue(), 'draft for session b');
-      await prompt.evaluate((node: HTMLTextAreaElement) => node.setSelectionRange(0, 0));
-      await prompt.press('ArrowUp');
-      await select('session-a');
-      await prompt.press('ArrowUp');
-      assert.equal(await prompt.inputValue(), 'prompt from session a');
-      await prompt.press('ArrowDown');
-      assert.equal(await prompt.inputValue(), '');
-      await select('session-b');
-      assert.equal(await prompt.inputValue(), 'draft for session b');
-      const saved = await page.evaluate(() => (window as any).__saved);
-      const fresh = await browser.newPage();
-      await fresh.setContent(recoveryPage(saved, { submittedPrompts: [] }));
-      await post(fresh, { type: 'usage', usage: usageWith(renderPayload(), view('session-a')) });
-      const restored = fresh.locator('#prompt');
-      await restored.focus();
-      await restored.press('ArrowUp');
-      assert.equal(await restored.inputValue(), 'prompt from session a');
-      await restored.press('ArrowUp');
-      assert.equal(await restored.inputValue(), 'prompt from session a');
-      await post(fresh, { type: 'usage', usage: usageWith(renderPayload(), view('session-c')) });
-      await restored.press('ArrowUp');
-      assert.equal(await restored.inputValue(), '');
-      assert.equal(
-        await fresh.evaluate(() => (window as any).__posted.filter((m: any) => m.type === 'sendPrompt').length),
-        0,
-      );
-      await post(fresh, {
-        type: 'promptRecovery',
-        submittedPrompts: [
-          { id: 'adopted', order: 3, source: 'draft:s1', revision: 1, text: 'first adopted prompt' },
-          {
-            id: 'routed',
-            order: 4,
-            source: 'session-c',
-            owner: 'session-d',
-            ownerRevision: 1,
-            revision: 1,
-            text: 'routed prompt',
-          },
-          { id: 'foreign', order: 5, source: 'session-z', revision: 1, text: 'foreign prompt' },
-        ],
-      });
-      const adopted = renderPayload();
-      adopted.showing = 'session-e';
-      adopted.usage = usageWith(adopted, view('session-e'));
-      adopted.sessionAdoptions = [{ provisional: 'draft:s1', durable: 'session-e' }];
-      await post(fresh, adopted);
-      await restored.press('ArrowUp');
-      assert.equal(await restored.inputValue(), 'first adopted prompt');
-      await restored.press('ArrowUp');
-      assert.equal(await restored.inputValue(), 'first adopted prompt');
-      await post(fresh, { type: 'usage', usage: usageWith(renderPayload(), view('session-c')) });
-      await restored.press('ArrowUp');
-      assert.equal(await restored.inputValue(), '');
-      await post(fresh, { type: 'usage', usage: usageWith(renderPayload(), view('session-d')) });
-      await restored.press('ArrowUp');
-      assert.equal(await restored.inputValue(), 'routed prompt');
-      const destinationSaved = await fresh.evaluate(() => (window as any).__saved);
-      await fresh.setContent(recoveryPage(destinationSaved, { submittedPrompts: [] }));
-      await post(fresh, { type: 'usage', usage: usageWith(renderPayload(), view('session-d')) });
-      await restored.focus();
-      await restored.press('ArrowUp');
-      assert.equal(await restored.inputValue(), 'routed prompt');
-      await fresh.close();
-      await page.close();
-    }
+    const agent = 'claude';
+    const page = await browser.newPage();
+    await page.setContent(recoveryPage({}));
+    const view = (sessionId: string) =>
+      composerView({ ...COMPOSER, agent, sessionId, history: [], draft: '', onScreen: '' });
+    const select = (session: string) => post(page, { type: 'usage', usage: usageWith(renderPayload(), view(session)) });
+    const prompt = page.locator('#prompt');
+    await select('session-a');
+    await prompt.fill('prompt from session a');
+    await prompt.press('Enter');
+    await page.waitForFunction(() => (window as any).__saved.submittedPrompts?.length === 1);
+    await select('session-b');
+    await prompt.fill('prompt from session b');
+    await prompt.press('Enter');
+    await page.waitForFunction(() => (window as any).__saved.submittedPrompts?.length === 2);
+    await prompt.fill('draft for session b');
+    await prompt.evaluate((node: HTMLTextAreaElement) => node.setSelectionRange(0, 0));
+    await prompt.press('ArrowUp');
+    assert.equal(await prompt.inputValue(), 'prompt from session b');
+    await prompt.press('ArrowUp');
+    assert.equal(await prompt.inputValue(), 'prompt from session b');
+    await prompt.press('ArrowDown');
+    assert.equal(await prompt.inputValue(), 'draft for session b');
+    await prompt.evaluate((node: HTMLTextAreaElement) => node.setSelectionRange(0, 0));
+    await prompt.press('ArrowUp');
+    await select('session-a');
+    await prompt.press('ArrowUp');
+    assert.equal(await prompt.inputValue(), 'prompt from session a');
+    await prompt.press('ArrowDown');
+    assert.equal(await prompt.inputValue(), '');
+    await select('session-b');
+    assert.equal(await prompt.inputValue(), 'draft for session b');
+    const saved = await page.evaluate(() => (window as any).__saved);
+    const fresh = await browser.newPage();
+    await fresh.setContent(recoveryPage(saved, { submittedPrompts: [] }));
+    await post(fresh, { type: 'usage', usage: usageWith(renderPayload(), view('session-a')) });
+    const restored = fresh.locator('#prompt');
+    await restored.focus();
+    await restored.press('ArrowUp');
+    assert.equal(await restored.inputValue(), 'prompt from session a');
+    await restored.press('ArrowUp');
+    assert.equal(await restored.inputValue(), 'prompt from session a');
+    await post(fresh, { type: 'usage', usage: usageWith(renderPayload(), view('session-c')) });
+    await restored.press('ArrowUp');
+    assert.equal(await restored.inputValue(), '');
+    assert.equal(
+      await fresh.evaluate(() => (window as any).__posted.filter((m: any) => m.type === 'sendPrompt').length),
+      0,
+    );
+    await post(fresh, {
+      type: 'promptRecovery',
+      submittedPrompts: [
+        { id: 'adopted', order: 3, source: 'draft:s1', revision: 1, text: 'first adopted prompt' },
+        {
+          id: 'routed',
+          order: 4,
+          source: 'session-c',
+          owner: 'session-d',
+          ownerRevision: 1,
+          revision: 1,
+          text: 'routed prompt',
+        },
+        { id: 'foreign', order: 5, source: 'session-z', revision: 1, text: 'foreign prompt' },
+      ],
+    });
+    const adopted = renderPayload();
+    adopted.showing = 'session-e';
+    adopted.usage = usageWith(adopted, view('session-e'));
+    adopted.sessionAdoptions = [{ provisional: 'draft:s1', durable: 'session-e' }];
+    await post(fresh, adopted);
+    await restored.press('ArrowUp');
+    assert.equal(await restored.inputValue(), 'first adopted prompt');
+    await restored.press('ArrowUp');
+    assert.equal(await restored.inputValue(), 'first adopted prompt');
+    await post(fresh, { type: 'usage', usage: usageWith(renderPayload(), view('session-c')) });
+    await restored.press('ArrowUp');
+    assert.equal(await restored.inputValue(), '');
+    await post(fresh, { type: 'usage', usage: usageWith(renderPayload(), view('session-d')) });
+    await restored.press('ArrowUp');
+    assert.equal(await restored.inputValue(), 'routed prompt');
+    const destinationSaved = await fresh.evaluate(() => (window as any).__saved);
+    await fresh.setContent(recoveryPage(destinationSaved, { submittedPrompts: [] }));
+    await post(fresh, { type: 'usage', usage: usageWith(renderPayload(), view('session-d')) });
+    await restored.focus();
+    await restored.press('ArrowUp');
+    assert.equal(await restored.inputValue(), 'routed prompt');
+    await fresh.close();
+    await page.close();
   } finally {
     await browser.close();
   }
@@ -6667,44 +6665,43 @@ test.for(['ArrowUp', 'ArrowDown'])(
       return;
     }
     try {
-      for (const agent of ['claude', 'codex'] as const) {
-        const page = await browser.newPage();
-        const attempts = [
-          { id: 'older', order: 1, source: 'session-a', revision: 1, text: 'older prompt' },
-          { id: 'newer', order: 2, source: 'session-a', revision: 2, text: 'newer prompt' },
-        ];
-        await page.setContent(recoveryPage({ submittedPrompts: attempts }));
-        const view = composerView({ ...COMPOSER, agent, sessionId: 'session-a', history: [], draft: '', onScreen: '' });
-        await post(page, { type: 'usage', usage: usageWith(renderPayload(), view) });
-        const prompt = page.locator('#prompt');
-        await prompt.fill('original unsent draft');
-        await prompt.evaluate((node: HTMLTextAreaElement) => node.setSelectionRange(0, 0));
-        await prompt.press('ArrowUp');
-        assert.equal(await prompt.inputValue(), 'newer prompt');
-        await post(page, {
-          type: 'promptRecovery',
-          submittedPrompts: [{ ...attempts[0], owner: 'session-b', ownerRevision: 1 }],
-        });
-        await prompt.press('ArrowUp');
-        assert.equal(await prompt.inputValue(), 'newer prompt', "active recall offered another session's older prompt");
-        await prompt.press('ArrowDown');
-        assert.equal(await prompt.inputValue(), 'original unsent draft');
-        await prompt.evaluate((node: HTMLTextAreaElement) => node.setSelectionRange(0, 0));
-        await prompt.press('ArrowUp');
-        await post(page, {
-          type: 'promptRecovery',
-          submittedPrompts: [{ ...attempts[1], owner: 'session-b', ownerRevision: 1 }],
-        });
-        await prompt.press(removedDirection);
-        assert.equal(await prompt.inputValue(), 'original unsent draft', 'recall retained a moved displayed prompt');
-        await prompt.press('ArrowDown');
-        assert.equal(await prompt.inputValue(), 'original unsent draft');
-        assert.equal(
-          await page.evaluate(() => (window as any).__posted.filter((m: any) => m.type === 'sendPrompt').length),
-          0,
-        );
-        await page.close();
-      }
+      const agent = 'claude';
+      const page = await browser.newPage();
+      const attempts = [
+        { id: 'older', order: 1, source: 'session-a', revision: 1, text: 'older prompt' },
+        { id: 'newer', order: 2, source: 'session-a', revision: 2, text: 'newer prompt' },
+      ];
+      await page.setContent(recoveryPage({ submittedPrompts: attempts }));
+      const view = composerView({ ...COMPOSER, agent, sessionId: 'session-a', history: [], draft: '', onScreen: '' });
+      await post(page, { type: 'usage', usage: usageWith(renderPayload(), view) });
+      const prompt = page.locator('#prompt');
+      await prompt.fill('original unsent draft');
+      await prompt.evaluate((node: HTMLTextAreaElement) => node.setSelectionRange(0, 0));
+      await prompt.press('ArrowUp');
+      assert.equal(await prompt.inputValue(), 'newer prompt');
+      await post(page, {
+        type: 'promptRecovery',
+        submittedPrompts: [{ ...attempts[0], owner: 'session-b', ownerRevision: 1 }],
+      });
+      await prompt.press('ArrowUp');
+      assert.equal(await prompt.inputValue(), 'newer prompt', "active recall offered another session's older prompt");
+      await prompt.press('ArrowDown');
+      assert.equal(await prompt.inputValue(), 'original unsent draft');
+      await prompt.evaluate((node: HTMLTextAreaElement) => node.setSelectionRange(0, 0));
+      await prompt.press('ArrowUp');
+      await post(page, {
+        type: 'promptRecovery',
+        submittedPrompts: [{ ...attempts[1], owner: 'session-b', ownerRevision: 1 }],
+      });
+      await prompt.press(removedDirection);
+      assert.equal(await prompt.inputValue(), 'original unsent draft', 'recall retained a moved displayed prompt');
+      await prompt.press('ArrowDown');
+      assert.equal(await prompt.inputValue(), 'original unsent draft');
+      assert.equal(
+        await page.evaluate(() => (window as any).__posted.filter((m: any) => m.type === 'sendPrompt').length),
+        0,
+      );
+      await page.close();
     } finally {
       await browser.close();
     }

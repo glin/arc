@@ -3,7 +3,7 @@
 
 import { test } from 'vitest';
 import assert from 'node:assert';
-import { browserOrNone, SETTLED } from '../test/browser.ts';
+import { browserOrNone, pauseClock, SETTLED } from '../test/browser.ts';
 import { CARD_ACTIONS } from './turnview.ts';
 import { formatCacheSpan } from './view/time.ts';
 import { composerView, pickMenu } from './composerview.ts';
@@ -1127,6 +1127,8 @@ test('the next-turn line crosses its own boundaries with no press and no repaint
     await page.evaluate(SETTLED);
     const before = (await page.evaluate(read)) as { state: string; name: string; sent: number };
     assert.equal(before.state, 'warm', 'the line does not open on the warm face the clock says');
+    await pauseClock(page);
+    await page.clock.runFor(3_000);
     await page.waitForFunction(`document.querySelector('.cnextturn').dataset.state !== 'warm'`, undefined, {
       timeout: 15_000,
     });
@@ -1294,6 +1296,8 @@ test(
       await page.evaluate(SETTLED);
       const before = (await page.evaluate(read)) as { text: string; title: string };
       assert.equal(before.text, '30m', `the figure opened on ${before.text} rather than the minute it is in`);
+      await pauseClock(page);
+      await page.clock.runFor(3_000);
       await page.waitForFunction(
         `document.querySelector('.cnextturnface:not(.is-off) .cnextturnspan').textContent !== '30m'`,
         undefined,

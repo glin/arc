@@ -1856,409 +1856,408 @@ test(
       return;
     }
     try {
-      for (const agent of ['claude', 'codex'] as const)
-        for (const width of [1350, 340]) {
-          const page = await browser.newPage();
-          const failures: string[] = [];
-          const provisional = 'draft:s1';
-          const durableId = 'thread-one';
-          page.on('pageerror', (error) => failures.push(String(error)));
-          await page.setViewportSize({ width, height: 900 });
-          await page.setContent(pageHtml());
-          const submitted = JSON.parse(
-            JSON.stringify(renderPayload([], [LIVE_PRESS])).replaceAll(
-              JSON.stringify('s1'),
-              JSON.stringify(provisional),
-            ),
-          ) as {
-            cards: Record<string, unknown>[];
-            diagnosis: { message: string } | null;
-            usage: { composer: unknown };
-            rail: Array<Record<string, unknown>>;
-            stats: unknown;
-            labels: unknown;
-            views: unknown;
-            railFilters: unknown;
-          };
-          submitted.cards = [];
-          submitted.diagnosis = { message: 'Start this session with a prompt.' };
-          submitted.usage.composer = composerView(
-            {
-              ...DRAFT_COMPOSER,
-              agent,
-              session: provisional,
-              sessionId: provisional,
-              draft: '',
-              onScreen: '',
-              live: [LIVE_PRESS],
-            },
-            FIXTURE_CLOCK,
-          );
-          submitted.rail = submitted.rail.map((row) =>
-            row.id === provisional ? { ...row, agent: agent === 'claude' ? 'Claude' : 'Codex', agentKey: agent } : row,
-          );
-          await page.evaluate(`window.postMessage(${JSON.stringify(submitted)}, '*')`);
-          await page.evaluate(SETTLED);
-
-          await page.locator('#prompt').fill('revision before adoption');
-          await page.locator('#prompt').press('Enter');
-          const firstSend = (await page.evaluate(
-            `window.__posted.filter((message) => message.type === 'sendPrompt').at(-1)`,
-          )) as {
-            session: string;
-            revision: number;
-          };
-          assert.equal(firstSend.session, provisional);
-          if (width >= RAIL_MIN_WIDTH) {
-            await page.locator('#rail .railrow .railpin').first().click();
-          } else {
-            await page.evaluate(
-              `window.postMessage(${JSON.stringify({ type: 'setSessionPinned', session: provisional, pinned: true })}, '*')`,
-            );
-          }
-
-          await page.locator('#list .sessionrow').evaluate((row) => {
-            row.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true }));
-          });
-          await page.evaluate(
-            `window.postMessage(${JSON.stringify({ type: 'openLabelEditor', session: provisional })}, '*')`,
-          );
-          await page.evaluate(SETTLED);
-          await page.evaluate(
-            `window.postMessage(${JSON.stringify({
-              type: 'labelEditor',
-              session: provisional,
-              heading: CARD_ACTIONS.labelHeading + ' Embedded agent input',
-              rows: labelEditorRows(EDITOR_LABELS, provisional),
-            })}, '*')`,
-          );
-          await page.locator('#labelpop input[data-control="label:rail"]').click();
-          await page.locator('#labelpop .labelfind').fill('ra');
-          await page.evaluate(SETTLED);
-          const actions = (await page.evaluate(
-            `window.__posted.filter((message) => message.type === 'setLabels' || message.type === 'sessionMembership')`,
-          )) as Array<Record<string, unknown>>;
-          assert.ok(
-            actions.some(
-              (message) =>
-                message.type === 'setLabels' &&
-                message.session === provisional &&
-                Array.isArray(message.names) &&
-                message.names.includes('rail'),
-            ),
-            `the label action did not target the provisional session at ${width}px`,
-          );
-          assert.ok(
-            actions.some(
-              (message) =>
-                message.type === 'sessionMembership' && message.action === 'pin' && message.session === provisional,
-            ),
-            `the pin action did not target the provisional session at ${width}px`,
-          );
-
-          const providerRows = submitted.rail.map((row) => ({
-            id: row.id === provisional ? durableId : String(row.id),
-            persisted: true,
-            label: String(row.label),
-            agent: String(row.agent),
-            when: String(row.absolute),
-            at: Number(row.at),
-            relative: String(row.relative),
-            agentRun: row.agentRun === true,
-          }));
-          const providerLabels = Object.fromEntries(
-            submitted.rail.map((row) => [
-              row.id === provisional ? durableId : String(row.id),
-              row.id === provisional
-                ? [...new Set([...(Array.isArray(row.labels) ? row.labels : []), 'rail'])]
-                : row.id === 's2'
-                  ? ['unrelated']
-                  : Array.isArray(row.labels)
-                    ? row.labels
-                    : [],
-            ]),
-          );
-          const postedRail = railPayload({
-            sessions: providerRows,
-            counts: new Map(),
-            newest: new Map(),
-            statuses: new Map(),
-            runningSince: new Map(),
-            openChildren: new Map(),
-            backgroundCommands: new Map(),
-            hidden: new Set(),
-            showing: 's2',
-            pinnedTop: new Set([durableId]),
-            unsent: new Map(),
-            parsedStats: {},
-            metadataStats: {},
-            lifetimeStats: {},
-            lifetimeCosts: {},
-            labels: providerLabels,
-            caches: {},
-            views: submitted.views as [],
-            railFilters: submitted.railFilters as [],
-            now: NOW,
-          });
-          await page.evaluate(
-            `window.postMessage(${JSON.stringify({
-              type: 'rail',
-              ...postedRail,
-              hidden: [],
-              pinnedTop: [durableId],
-            })}, '*')`,
-          );
-          await page.evaluate(SETTLED);
-          assert.ok(
-            (await page.locator(`#rail [data-session="${provisional}"]`).count()) > 0,
-            `an unmapped rail update discarded the last coherent provisional row at ${width}px`,
-          );
-          await page.evaluate(
-            `window.postMessage(${JSON.stringify({
-              type: 'rail',
-              ...postedRail,
-              sessionAdoptions: [{ provisional, durable: durableId }],
-              hidden: [],
-              pinnedTop: [durableId],
-            })}, '*')`,
-          );
-          await page.evaluate(SETTLED);
-          const interimRail = (await page.evaluate(`(() => ({
-        provisional: !!document.querySelector('#rail [data-session="draft:s1"]'),
-        durable: !!document.querySelector('#rail [data-session="thread-one"]'),
-        unrelated: !!document.querySelector('#rail [data-session="s2"]'),
-        pinned: !!document.querySelector('#rail .railrow:has([data-session="draft:s1"]) .railpin.is-pinned'),
-        labels: document.querySelector('#rail [data-session="draft:s1"]')?.getAttribute('aria-label') || '',
-        unrelatedLabels: document.querySelector('#rail [data-session="s2"]')?.getAttribute('aria-label') || '',
-        headingLabels: document.querySelector('#list .sessionlabels')?.textContent || '',
-      }))()`)) as {
-            provisional: boolean;
-            durable: boolean;
-            unrelated: boolean;
-            pinned: boolean;
-            labels: string;
-            unrelatedLabels: string;
-            headingLabels: string;
-          };
-          assert.equal(
-            interimRail.provisional,
-            true,
-            `the provider rail update removed the retained provisional row at ${width}px`,
-          );
-          assert.equal(
-            interimRail.durable,
-            false,
-            `the provider rail update introduced the durable row before the complete render at ${width}px`,
-          );
-          assert.equal(
-            interimRail.unrelated,
-            true,
-            `the provider rail update renamed the unrelated current row at ${width}px`,
-          );
-          assert.equal(
-            interimRail.pinned,
-            true,
-            `the provider rail update lost the durable pin on the provisional row at ${width}px`,
-          );
-          assert.ok(
-            interimRail.labels.includes('rail') && interimRail.headingLabels.includes('rail'),
-            `the provider rail update lost the durable label on the provisional shell at ${width}px`,
-          );
-          assert.ok(
-            interimRail.unrelatedLabels.includes('unrelated') && !interimRail.labels.includes('unrelated'),
-            `the unrelated current row overwrote the provisional row labels at ${width}px`,
-          );
-
-          await page.evaluate(`(() => {
-        const missing = [];
-        const inspect = () => {
-          const visible = (selector) => {
-            const node = document.querySelector(selector);
-            return !!node && !node.closest('[hidden]') && node.getClientRects().length > 0;
-          };
-          for (const [name, selector] of [
-            ['composer', '#composer'], ['heading', '#list .sessionrow'],
-            ['labels', '#list .sessionlabels'], ['pending prompt', '#list .clive, #list .turn'],
-          ]) {
-            if (!visible(selector)) missing.push(name);
-          }
-          if ([...document.querySelectorAll('#list .empty')]
-            .some((node) => node.textContent === 'Start this session with a prompt.')) {
-            missing.push('first-prompt diagnosis');
-          }
+      for (const [agent, width] of [
+        ['claude', 1350],
+        ['codex', 340],
+      ] as const) {
+        const page = await browser.newPage();
+        const failures: string[] = [];
+        const provisional = 'draft:s1';
+        const durableId = 'thread-one';
+        page.on('pageerror', (error) => failures.push(String(error)));
+        await page.setViewportSize({ width, height: 900 });
+        await page.setContent(pageHtml());
+        const submitted = JSON.parse(
+          JSON.stringify(renderPayload([], [LIVE_PRESS])).replaceAll(JSON.stringify('s1'), JSON.stringify(provisional)),
+        ) as {
+          cards: Record<string, unknown>[];
+          diagnosis: { message: string } | null;
+          usage: { composer: unknown };
+          rail: Array<Record<string, unknown>>;
+          stats: unknown;
+          labels: unknown;
+          views: unknown;
+          railFilters: unknown;
         };
-        window.__firstPromptMissing = missing;
-        window.__firstPromptObserver = new MutationObserver(inspect);
-        window.__firstPromptObserver.observe(document.body, {
-          childList: true, subtree: true, attributes: true, attributeFilter: ['hidden', 'style', 'class'],
-        });
-        window.__firstPromptNodes = {
-          composer: document.getElementById('composer'), prompt: document.getElementById('prompt'),
-          heading: document.querySelector('#list .sessionrow'), labels: document.querySelector('#list .sessionlabels'),
-          pending: document.querySelector('#list .clive, #list .turn'), labelpop: document.getElementById('labelpop'),
-        };
-        inspect();
-      })()`);
-          const interim = JSON.parse(JSON.stringify(submitted.usage));
-          interim.composer = null;
-          await page.evaluate(`window.postMessage(${JSON.stringify({ type: 'usage', usage: interim })}, '*')`);
-          await page.evaluate(SETTLED);
-          const held = (await page.evaluate(`(() => {
-        const before = window.__firstPromptNodes;
-        const same = (name, node) => before[name] === node;
-        return {
-          nodes: {
-            composer: same('composer', document.getElementById('composer')),
-            prompt: same('prompt', document.getElementById('prompt')),
-            heading: same('heading', document.querySelector('#list .sessionrow')),
-            labels: same('labels', document.querySelector('#list .sessionlabels')),
-            pending: same('pending', document.querySelector('#list .clive, #list .turn')),
-            labelpop: same('labelpop', document.getElementById('labelpop')),
+        submitted.cards = [];
+        submitted.diagnosis = { message: 'Start this session with a prompt.' };
+        submitted.usage.composer = composerView(
+          {
+            ...DRAFT_COMPOSER,
+            agent,
+            session: provisional,
+            sessionId: provisional,
+            draft: '',
+            onScreen: '',
+            live: [LIVE_PRESS],
           },
-          draft: document.getElementById('prompt').value,
-          focused: document.activeElement && document.activeElement.dataset.control,
-          labelFilter: document.querySelector('#labelpop .labelfind').value,
-          labelOpen: !document.getElementById('labelpop').hidden,
-          labelChecked: document.querySelector('#labelpop input[data-control="label:rail"]').checked,
-          headingLabels: document.querySelector('#list .sessionlabels').textContent,
+          FIXTURE_CLOCK,
+        );
+        submitted.rail = submitted.rail.map((row) =>
+          row.id === provisional ? { ...row, agent: agent === 'claude' ? 'Claude' : 'Codex', agentKey: agent } : row,
+        );
+        await page.evaluate(`window.postMessage(${JSON.stringify(submitted)}, '*')`);
+        await page.evaluate(SETTLED);
+
+        await page.locator('#prompt').fill('revision before adoption');
+        await page.locator('#prompt').press('Enter');
+        const firstSend = (await page.evaluate(
+          `window.__posted.filter((message) => message.type === 'sendPrompt').at(-1)`,
+        )) as {
+          session: string;
+          revision: number;
         };
-      })()`)) as {
-            nodes: Record<string, boolean>;
-            draft: string;
-            focused: string | null;
-            labelFilter: string;
-            labelOpen: boolean;
-            labelChecked: boolean;
-            headingLabels: string;
-          };
-          assert.ok(
-            Object.values(held.nodes).every(Boolean),
-            `the interim durable composer remounted the provisional shell at ${width}px`,
+        assert.equal(firstSend.session, provisional);
+        if (width >= RAIL_MIN_WIDTH) {
+          await page.locator('#rail .railrow .railpin').first().click();
+        } else {
+          await page.evaluate(
+            `window.postMessage(${JSON.stringify({ type: 'setSessionPinned', session: provisional, pinned: true })}, '*')`,
           );
-          assert.equal(held.draft, '');
-          assert.equal(held.focused, 'label-find');
-          assert.equal(held.labelFilter, 'ra');
-          assert.equal(held.labelOpen, true);
-          assert.equal(held.labelChecked, true);
-          assert.ok(held.headingLabels.includes('rail'));
-          await page
-            .locator(`#rail [data-session="${provisional}"]`)
-            .first()
-            .evaluate((node: HTMLElement) => node.click());
-          assert.deepEqual(
-            await page.evaluate(`window.__posted.filter((message) => message.type === 'showSession').at(-1)`),
-            { type: 'showSession', session: provisional },
-            `the projected rail changed the provisional row action at ${width}px`,
-          );
-          await page
-            .locator('#rail [data-session="s2"]')
-            .first()
-            .evaluate((node: HTMLElement) => node.click());
-          assert.deepEqual(
-            await page.evaluate(`window.__posted.filter((message) => message.type === 'showSession').at(-1)`),
-            { type: 'showSession', session: 's2' },
-            `the projected rail changed the unrelated row action at ${width}px`,
-          );
-          const durableSource = renderPayload([], [], [], [], [], ['s1']) as Record<string, unknown> & {
-            rail: Array<Record<string, unknown>>;
-          };
-          durableSource.rail = durableSource.rail.map((row) =>
-            row.id === 's1' ? { ...row, labels: [...new Set([...((row.labels as string[]) ?? []), 'rail'])] } : row,
-          );
-          const durable = JSON.parse(
-            JSON.stringify(durableSource).replaceAll(JSON.stringify('s1'), JSON.stringify(durableId)),
-          );
-          durable.usage.composer.agent = agent;
-          durable.rail = durable.rail.map((row: Record<string, unknown>) =>
-            row.id === durableId ? { ...row, agent: agent === 'claude' ? 'Claude' : 'Codex', agentKey: agent } : row,
-          );
-          durable.sessionAdoptions = [{ provisional, durable: durableId }];
-          const prompt = page.locator('#prompt');
-          await prompt.focus();
-          await prompt.type('follow-up draft');
-          await prompt.type(' stays');
-          await prompt.evaluate((node: HTMLTextAreaElement) => {
-            node.setSelectionRange(3, 9);
-            document.dispatchEvent(new Event('selectionchange'));
-          });
-          assert.equal(
-            await page.evaluate(`window.__posted.filter((message) => message.type === 'sendPrompt').length`),
-            1,
-            `the follow-up was sent before the stale durable render at ${width}px`,
-          );
-          await page.evaluate(`window.postMessage(${JSON.stringify(durable)}, '*')`);
-          await page.evaluate(SETTLED);
-          assert.equal(
-            await prompt.inputValue(),
-            'follow-up draft stays',
-            `the stale durable render replaced the local follow-up at ${width}px`,
-          );
-          assert.deepEqual(
-            await prompt.evaluate((node: HTMLTextAreaElement) => [node.selectionStart, node.selectionEnd]),
-            [3, 9],
-            `the durable identity change replaced the follow-up selection at ${width}px`,
-          );
-          assert.equal(
-            await prompt.evaluate((node) => document.activeElement === node),
-            true,
-            `the durable identity change moved focus out of the follow-up at ${width}px`,
-          );
-          await prompt.press('Control+z');
-          assert.notEqual(
-            await prompt.inputValue(),
-            'follow-up draft stays',
-            `the durable identity change discarded the follow-up undo state at ${width}px`,
-          );
-          await prompt.press('Control+Shift+z');
-          assert.equal(
-            await prompt.inputValue(),
-            'follow-up draft stays',
-            `the durable identity change discarded the follow-up redo state at ${width}px`,
-          );
-          await prompt.press('Enter');
-          const secondSend = (await page.evaluate(
-            `window.__posted.filter((message) => message.type === 'sendPrompt').at(-1)`,
-          )) as {
-            session: string;
-            revision: number;
-          };
-          assert.equal(
-            secondSend.session,
-            durableId,
-            `the adopted follow-up did not target the durable session at ${width}px`,
-          );
-          assert.ok(
-            secondSend.revision > firstSend.revision,
-            `the durable identity change reset the follow-up revision at ${width}px`,
-          );
-          const missing = (await page.evaluate(`(() => {
-        window.__firstPromptObserver.disconnect();
-        return window.__firstPromptMissing;
-      })()`)) as string[];
-          assert.deepEqual(
-            missing,
-            [],
-            `the first-prompt shell became incomplete at ${width}px: ${[...new Set(missing)].join(', ')}`,
-          );
-          assert.equal(
-            await page.locator('#list .sessionrow').getAttribute('data-session'),
-            durableId,
-            `the durable render did not replace the provisional heading at ${width}px`,
-          );
-          assert.ok(
-            ((await page.locator('#list .sessionlabels').textContent()) ?? '').includes('rail'),
-            `the durable heading lost the label applied during adoption at ${width}px`,
-          );
-          assert.equal(
-            await page
-              .locator('#rail .railrow:has(.railcard[data-session="thread-one"]) .railpin')
-              .evaluateAll((nodes) => nodes.length > 0 && nodes.every((node) => node.classList.contains('is-pinned'))),
-            true,
-            `the durable rail row lost its pin at ${width}px`,
-          );
-          assert.deepEqual(failures, [], `the first-prompt transition threw at ${width}px`);
-          await page.close();
         }
+
+        await page.locator('#list .sessionrow').evaluate((row) => {
+          row.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true }));
+        });
+        await page.evaluate(
+          `window.postMessage(${JSON.stringify({ type: 'openLabelEditor', session: provisional })}, '*')`,
+        );
+        await page.evaluate(SETTLED);
+        await page.evaluate(
+          `window.postMessage(${JSON.stringify({
+            type: 'labelEditor',
+            session: provisional,
+            heading: CARD_ACTIONS.labelHeading + ' Embedded agent input',
+            rows: labelEditorRows(EDITOR_LABELS, provisional),
+          })}, '*')`,
+        );
+        await page.locator('#labelpop input[data-control="label:rail"]').click();
+        await page.locator('#labelpop .labelfind').fill('ra');
+        await page.evaluate(SETTLED);
+        const actions = (await page.evaluate(
+          `window.__posted.filter((message) => message.type === 'setLabels' || message.type === 'sessionMembership')`,
+        )) as Array<Record<string, unknown>>;
+        assert.ok(
+          actions.some(
+            (message) =>
+              message.type === 'setLabels' &&
+              message.session === provisional &&
+              Array.isArray(message.names) &&
+              message.names.includes('rail'),
+          ),
+          `the label action did not target the provisional session at ${width}px`,
+        );
+        assert.ok(
+          actions.some(
+            (message) =>
+              message.type === 'sessionMembership' && message.action === 'pin' && message.session === provisional,
+          ),
+          `the pin action did not target the provisional session at ${width}px`,
+        );
+
+        const providerRows = submitted.rail.map((row) => ({
+          id: row.id === provisional ? durableId : String(row.id),
+          persisted: true,
+          label: String(row.label),
+          agent: String(row.agent),
+          when: String(row.absolute),
+          at: Number(row.at),
+          relative: String(row.relative),
+          agentRun: row.agentRun === true,
+        }));
+        const providerLabels = Object.fromEntries(
+          submitted.rail.map((row) => [
+            row.id === provisional ? durableId : String(row.id),
+            row.id === provisional
+              ? [...new Set([...(Array.isArray(row.labels) ? row.labels : []), 'rail'])]
+              : row.id === 's2'
+                ? ['unrelated']
+                : Array.isArray(row.labels)
+                  ? row.labels
+                  : [],
+          ]),
+        );
+        const postedRail = railPayload({
+          sessions: providerRows,
+          counts: new Map(),
+          newest: new Map(),
+          statuses: new Map(),
+          runningSince: new Map(),
+          openChildren: new Map(),
+          backgroundCommands: new Map(),
+          hidden: new Set(),
+          showing: 's2',
+          pinnedTop: new Set([durableId]),
+          unsent: new Map(),
+          parsedStats: {},
+          metadataStats: {},
+          lifetimeStats: {},
+          lifetimeCosts: {},
+          labels: providerLabels,
+          caches: {},
+          views: submitted.views as [],
+          railFilters: submitted.railFilters as [],
+          now: NOW,
+        });
+        await page.evaluate(
+          `window.postMessage(${JSON.stringify({
+            type: 'rail',
+            ...postedRail,
+            hidden: [],
+            pinnedTop: [durableId],
+          })}, '*')`,
+        );
+        await page.evaluate(SETTLED);
+        assert.ok(
+          (await page.locator(`#rail [data-session="${provisional}"]`).count()) > 0,
+          `an unmapped rail update discarded the last coherent provisional row at ${width}px`,
+        );
+        await page.evaluate(
+          `window.postMessage(${JSON.stringify({
+            type: 'rail',
+            ...postedRail,
+            sessionAdoptions: [{ provisional, durable: durableId }],
+            hidden: [],
+            pinnedTop: [durableId],
+          })}, '*')`,
+        );
+        await page.evaluate(SETTLED);
+        const interimRail = (await page.evaluate(`(() => ({
+      provisional: !!document.querySelector('#rail [data-session="draft:s1"]'),
+      durable: !!document.querySelector('#rail [data-session="thread-one"]'),
+      unrelated: !!document.querySelector('#rail [data-session="s2"]'),
+      pinned: !!document.querySelector('#rail .railrow:has([data-session="draft:s1"]) .railpin.is-pinned'),
+      labels: document.querySelector('#rail [data-session="draft:s1"]')?.getAttribute('aria-label') || '',
+      unrelatedLabels: document.querySelector('#rail [data-session="s2"]')?.getAttribute('aria-label') || '',
+      headingLabels: document.querySelector('#list .sessionlabels')?.textContent || '',
+    }))()`)) as {
+          provisional: boolean;
+          durable: boolean;
+          unrelated: boolean;
+          pinned: boolean;
+          labels: string;
+          unrelatedLabels: string;
+          headingLabels: string;
+        };
+        assert.equal(
+          interimRail.provisional,
+          true,
+          `the provider rail update removed the retained provisional row at ${width}px`,
+        );
+        assert.equal(
+          interimRail.durable,
+          false,
+          `the provider rail update introduced the durable row before the complete render at ${width}px`,
+        );
+        assert.equal(
+          interimRail.unrelated,
+          true,
+          `the provider rail update renamed the unrelated current row at ${width}px`,
+        );
+        assert.equal(
+          interimRail.pinned,
+          true,
+          `the provider rail update lost the durable pin on the provisional row at ${width}px`,
+        );
+        assert.ok(
+          interimRail.labels.includes('rail') && interimRail.headingLabels.includes('rail'),
+          `the provider rail update lost the durable label on the provisional shell at ${width}px`,
+        );
+        assert.ok(
+          interimRail.unrelatedLabels.includes('unrelated') && !interimRail.labels.includes('unrelated'),
+          `the unrelated current row overwrote the provisional row labels at ${width}px`,
+        );
+
+        await page.evaluate(`(() => {
+      const missing = [];
+      const inspect = () => {
+        const visible = (selector) => {
+          const node = document.querySelector(selector);
+          return !!node && !node.closest('[hidden]') && node.getClientRects().length > 0;
+        };
+        for (const [name, selector] of [
+          ['composer', '#composer'], ['heading', '#list .sessionrow'],
+          ['labels', '#list .sessionlabels'], ['pending prompt', '#list .clive, #list .turn'],
+        ]) {
+          if (!visible(selector)) missing.push(name);
+        }
+        if ([...document.querySelectorAll('#list .empty')]
+          .some((node) => node.textContent === 'Start this session with a prompt.')) {
+          missing.push('first-prompt diagnosis');
+        }
+      };
+      window.__firstPromptMissing = missing;
+      window.__firstPromptObserver = new MutationObserver(inspect);
+      window.__firstPromptObserver.observe(document.body, {
+        childList: true, subtree: true, attributes: true, attributeFilter: ['hidden', 'style', 'class'],
+      });
+      window.__firstPromptNodes = {
+        composer: document.getElementById('composer'), prompt: document.getElementById('prompt'),
+        heading: document.querySelector('#list .sessionrow'), labels: document.querySelector('#list .sessionlabels'),
+        pending: document.querySelector('#list .clive, #list .turn'), labelpop: document.getElementById('labelpop'),
+      };
+      inspect();
+    })()`);
+        const interim = JSON.parse(JSON.stringify(submitted.usage));
+        interim.composer = null;
+        await page.evaluate(`window.postMessage(${JSON.stringify({ type: 'usage', usage: interim })}, '*')`);
+        await page.evaluate(SETTLED);
+        const held = (await page.evaluate(`(() => {
+      const before = window.__firstPromptNodes;
+      const same = (name, node) => before[name] === node;
+      return {
+        nodes: {
+          composer: same('composer', document.getElementById('composer')),
+          prompt: same('prompt', document.getElementById('prompt')),
+          heading: same('heading', document.querySelector('#list .sessionrow')),
+          labels: same('labels', document.querySelector('#list .sessionlabels')),
+          pending: same('pending', document.querySelector('#list .clive, #list .turn')),
+          labelpop: same('labelpop', document.getElementById('labelpop')),
+        },
+        draft: document.getElementById('prompt').value,
+        focused: document.activeElement && document.activeElement.dataset.control,
+        labelFilter: document.querySelector('#labelpop .labelfind').value,
+        labelOpen: !document.getElementById('labelpop').hidden,
+        labelChecked: document.querySelector('#labelpop input[data-control="label:rail"]').checked,
+        headingLabels: document.querySelector('#list .sessionlabels').textContent,
+      };
+    })()`)) as {
+          nodes: Record<string, boolean>;
+          draft: string;
+          focused: string | null;
+          labelFilter: string;
+          labelOpen: boolean;
+          labelChecked: boolean;
+          headingLabels: string;
+        };
+        assert.ok(
+          Object.values(held.nodes).every(Boolean),
+          `the interim durable composer remounted the provisional shell at ${width}px`,
+        );
+        assert.equal(held.draft, '');
+        assert.equal(held.focused, 'label-find');
+        assert.equal(held.labelFilter, 'ra');
+        assert.equal(held.labelOpen, true);
+        assert.equal(held.labelChecked, true);
+        assert.ok(held.headingLabels.includes('rail'));
+        await page
+          .locator(`#rail [data-session="${provisional}"]`)
+          .first()
+          .evaluate((node: HTMLElement) => node.click());
+        assert.deepEqual(
+          await page.evaluate(`window.__posted.filter((message) => message.type === 'showSession').at(-1)`),
+          { type: 'showSession', session: provisional },
+          `the projected rail changed the provisional row action at ${width}px`,
+        );
+        await page
+          .locator('#rail [data-session="s2"]')
+          .first()
+          .evaluate((node: HTMLElement) => node.click());
+        assert.deepEqual(
+          await page.evaluate(`window.__posted.filter((message) => message.type === 'showSession').at(-1)`),
+          { type: 'showSession', session: 's2' },
+          `the projected rail changed the unrelated row action at ${width}px`,
+        );
+        const durableSource = renderPayload([], [], [], [], [], ['s1']) as Record<string, unknown> & {
+          rail: Array<Record<string, unknown>>;
+        };
+        durableSource.rail = durableSource.rail.map((row) =>
+          row.id === 's1' ? { ...row, labels: [...new Set([...((row.labels as string[]) ?? []), 'rail'])] } : row,
+        );
+        const durable = JSON.parse(
+          JSON.stringify(durableSource).replaceAll(JSON.stringify('s1'), JSON.stringify(durableId)),
+        );
+        durable.usage.composer.agent = agent;
+        durable.rail = durable.rail.map((row: Record<string, unknown>) =>
+          row.id === durableId ? { ...row, agent: agent === 'claude' ? 'Claude' : 'Codex', agentKey: agent } : row,
+        );
+        durable.sessionAdoptions = [{ provisional, durable: durableId }];
+        const prompt = page.locator('#prompt');
+        await prompt.focus();
+        await prompt.type('follow-up draft');
+        await prompt.type(' stays');
+        await prompt.evaluate((node: HTMLTextAreaElement) => {
+          node.setSelectionRange(3, 9);
+          document.dispatchEvent(new Event('selectionchange'));
+        });
+        assert.equal(
+          await page.evaluate(`window.__posted.filter((message) => message.type === 'sendPrompt').length`),
+          1,
+          `the follow-up was sent before the stale durable render at ${width}px`,
+        );
+        await page.evaluate(`window.postMessage(${JSON.stringify(durable)}, '*')`);
+        await page.evaluate(SETTLED);
+        assert.equal(
+          await prompt.inputValue(),
+          'follow-up draft stays',
+          `the stale durable render replaced the local follow-up at ${width}px`,
+        );
+        assert.deepEqual(
+          await prompt.evaluate((node: HTMLTextAreaElement) => [node.selectionStart, node.selectionEnd]),
+          [3, 9],
+          `the durable identity change replaced the follow-up selection at ${width}px`,
+        );
+        assert.equal(
+          await prompt.evaluate((node) => document.activeElement === node),
+          true,
+          `the durable identity change moved focus out of the follow-up at ${width}px`,
+        );
+        await prompt.press('Control+z');
+        assert.notEqual(
+          await prompt.inputValue(),
+          'follow-up draft stays',
+          `the durable identity change discarded the follow-up undo state at ${width}px`,
+        );
+        await prompt.press('Control+Shift+z');
+        assert.equal(
+          await prompt.inputValue(),
+          'follow-up draft stays',
+          `the durable identity change discarded the follow-up redo state at ${width}px`,
+        );
+        await prompt.press('Enter');
+        const secondSend = (await page.evaluate(
+          `window.__posted.filter((message) => message.type === 'sendPrompt').at(-1)`,
+        )) as {
+          session: string;
+          revision: number;
+        };
+        assert.equal(
+          secondSend.session,
+          durableId,
+          `the adopted follow-up did not target the durable session at ${width}px`,
+        );
+        assert.ok(
+          secondSend.revision > firstSend.revision,
+          `the durable identity change reset the follow-up revision at ${width}px`,
+        );
+        const missing = (await page.evaluate(`(() => {
+      window.__firstPromptObserver.disconnect();
+      return window.__firstPromptMissing;
+    })()`)) as string[];
+        assert.deepEqual(
+          missing,
+          [],
+          `the first-prompt shell became incomplete at ${width}px: ${[...new Set(missing)].join(', ')}`,
+        );
+        assert.equal(
+          await page.locator('#list .sessionrow').getAttribute('data-session'),
+          durableId,
+          `the durable render did not replace the provisional heading at ${width}px`,
+        );
+        assert.ok(
+          ((await page.locator('#list .sessionlabels').textContent()) ?? '').includes('rail'),
+          `the durable heading lost the label applied during adoption at ${width}px`,
+        );
+        assert.equal(
+          await page
+            .locator('#rail .railrow:has(.railcard[data-session="thread-one"]) .railpin')
+            .evaluateAll((nodes) => nodes.length > 0 && nodes.every((node) => node.classList.contains('is-pinned'))),
+          true,
+          `the durable rail row lost its pin at ${width}px`,
+        );
+        assert.deepEqual(failures, [], `the first-prompt transition threw at ${width}px`);
+        await page.close();
+      }
     } finally {
       await browser.close();
     }

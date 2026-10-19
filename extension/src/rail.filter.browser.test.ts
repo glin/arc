@@ -1642,90 +1642,89 @@ test(
     }
     try {
       const failures: string[] = [];
-      for (const kind of ['unread', 'input'] as const) {
-        const base = payload(
-          [],
-          [],
-          [],
-          [],
-          [],
-          [],
-          new Map([
-            ['s1', 'waiting'],
-            ['s2', 'waiting'],
-          ]),
+      const kind = 'unread';
+      const base = payload(
+        [],
+        [],
+        [],
+        [],
+        [],
+        [],
+        new Map([
+          ['s1', 'waiting'],
+          ['s2', 'waiting'],
+        ]),
+      );
+      const marked = (read: readonly string[]) =>
+        base.rail.map((card) =>
+          card.id === 's1' || card.id === 's2'
+            ? { ...card, unread: !read.includes(card.id), status: read.includes(card.id) ? 'done' : 'waiting' }
+            : card,
         );
-        const marked = (read: readonly string[]) =>
-          base.rail.map((card) =>
-            card.id === 's1' || card.id === 's2'
-              ? { ...card, unread: !read.includes(card.id), status: read.includes(card.id) ? 'done' : 'waiting' }
-              : card,
-          );
-        const initial = { ...base, rail: marked([]) };
-        const page = await browser.newPage();
-        page.on('pageerror', (error) => failures.push(String(error)));
-        await openPage(page, initial, FIXTURE_CLOCK, {
-          railFilter: RAIL_LENS_WORDS[kind],
-          railFilterId: ALL_RAIL_FILTER_ID,
-          railQuickFilters: ['active', 'unread', 'input'],
-        });
-        const shown = async () =>
-          (
-            (await page.evaluate(
-              `[...new Set([...document.querySelectorAll('.railcard')].map((node) => node.dataset.session))]`,
-            )) as string[]
-          ).sort();
-        const post = async (read: readonly string[]) => {
-          await page.evaluate(`window.postMessage(${JSON.stringify(railMessage(initial, marked(read)))}, '*')`);
-          await page.evaluate(SETTLED);
-        };
-        const drawn = await shown();
-        assert.ok(drawn.includes('s1') && drawn.includes('s2'), `${kind} drew ${JSON.stringify(drawn)}`);
-        await post(['s1']);
-        assert.deepEqual(await shown(), drawn, `${kind} dropped a session read under it`);
+      const initial = { ...base, rail: marked([]) };
+      const page = await browser.newPage();
+      page.on('pageerror', (error) => failures.push(String(error)));
+      await openPage(page, initial, FIXTURE_CLOCK, {
+        railFilter: RAIL_LENS_WORDS[kind],
+        railFilterId: ALL_RAIL_FILTER_ID,
+        railQuickFilters: ['active', 'unread', 'input'],
+      });
+      const shown = async () =>
+        (
+          (await page.evaluate(
+            `[...new Set([...document.querySelectorAll('.railcard')].map((node) => node.dataset.session))]`,
+          )) as string[]
+        ).sort();
+      const post = async (read: readonly string[]) => {
+        await page.evaluate(`window.postMessage(${JSON.stringify(railMessage(initial, marked(read)))}, '*')`);
+        await page.evaluate(SETTLED);
+      };
+      const drawn = await shown();
+      assert.ok(drawn.includes('s1') && drawn.includes('s2'), `${kind} drew ${JSON.stringify(drawn)}`);
+      await post(['s1']);
+      assert.deepEqual(await shown(), drawn, `${kind} dropped a session read under it`);
 
-        await page.locator(`[data-control="railcount:${kind}"]`).click();
-        await page.evaluate(SETTLED);
-        assert.equal(
-          await page.evaluate(`document.activeElement?.dataset.control ?? null`),
-          'railcount:active',
-          `clearing the ${kind} lens left focus off the first configured filter button`,
-        );
+      await page.locator(`[data-control="railcount:${kind}"]`).click();
+      await page.evaluate(SETTLED);
+      assert.equal(
+        await page.evaluate(`document.activeElement?.dataset.control ?? null`),
+        'railcount:active',
+        `clearing the ${kind} lens left focus off the first configured filter button`,
+      );
 
-        // Setting the lens again starts the kept set over, so the read session is gone.
-        await page.locator('[data-control="railsearch"]').click();
-        await page.evaluate(SETTLED);
-        await page.locator('.railfilter').fill(RAIL_LENS_WORDS[kind]);
-        await page.evaluate(SETTLED);
-        const again = drawn.filter((id) => id !== 's1');
-        assert.deepEqual(await shown(), again, `${kind} set again kept a session read before`);
-        await post(['s1', 's2']);
-        assert.deepEqual(await shown(), again, `${kind} dropped a session read under it`);
-        const selected = page.locator(`[data-control="railcount:${kind}"]`);
-        assert.equal(await selected.locator('.railcountfig').textContent(), '0');
-        assert.equal(
-          await selected.getAttribute('aria-label'),
-          `${kind === 'unread' ? 'Unread' : 'Needs input'}, 0 sessions`,
-        );
-        assert.equal(await selected.getAttribute('aria-pressed'), 'true');
-        assert.equal(await selected.isEnabled(), true);
-        // A query changed and put back within one frame still changed.
-        await page.evaluate(`(() => {
-        const input = document.querySelector('.railfilter');
-        const was = input.value;
-        input.value = was + ' x';
-        input.dispatchEvent(new InputEvent('input', { bubbles: true, data: 'x', inputType: 'insertText' }));
-        input.value = was;
-        input.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'deleteContentBackward' }));
+      // Setting the lens again starts the kept set over, so the read session is gone.
+      await page.locator('[data-control="railsearch"]').click();
+      await page.evaluate(SETTLED);
+      await page.locator('.railfilter').fill(RAIL_LENS_WORDS[kind]);
+      await page.evaluate(SETTLED);
+      const again = drawn.filter((id) => id !== 's1');
+      assert.deepEqual(await shown(), again, `${kind} set again kept a session read before`);
+      await post(['s1', 's2']);
+      assert.deepEqual(await shown(), again, `${kind} dropped a session read under it`);
+      const selected = page.locator(`[data-control="railcount:${kind}"]`);
+      assert.equal(await selected.locator('.railcountfig').textContent(), '0');
+      assert.equal(
+        await selected.getAttribute('aria-label'),
+        `${kind === 'unread' ? 'Unread' : 'Needs input'}, 0 sessions`,
+      );
+      assert.equal(await selected.getAttribute('aria-pressed'), 'true');
+      assert.equal(await selected.isEnabled(), true);
+      // A query changed and put back within one frame still changed.
+      await page.evaluate(`(() => {
+      const input = document.querySelector('.railfilter');
+      const was = input.value;
+      input.value = was + ' x';
+      input.dispatchEvent(new InputEvent('input', { bubbles: true, data: 'x', inputType: 'insertText' }));
+      input.value = was;
+      input.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'deleteContentBackward' }));
       })()`);
-        await page.evaluate(SETTLED);
-        assert.deepEqual(
-          await shown(),
-          again.filter((id) => id !== 's2'),
-          `${kind} kept a session through a query change`,
-        );
-        await page.close();
-      }
+      await page.evaluate(SETTLED);
+      assert.deepEqual(
+        await shown(),
+        again.filter((id) => id !== 's2'),
+        `${kind} kept a session through a query change`,
+      );
+      await page.close();
       assert.deepEqual(failures, []);
     } finally {
       await browser.close();

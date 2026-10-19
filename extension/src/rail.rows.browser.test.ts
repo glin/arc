@@ -6,7 +6,7 @@ import assert from 'node:assert';
 import { browserOrNone, SETTLED } from '../test/browser.ts';
 import { FIXTURE_CLOCK, NOW, pageHtml, themed } from './panelfixture.ts';
 import { ALL_RAIL_FILTER_ID } from './domain/rail-filters.ts';
-import { RAIL_MIN_WIDTH, subagentsHintDetail } from './view/rail.ts';
+import { RAIL_MIN_WIDTH, RAIL_ROW_STEP, subagentsHintDetail } from './view/rail.ts';
 import { formatRelativeShort } from './view/time.ts';
 import { newSessionKeyshortcut } from './view/launcher.ts';
 import {
@@ -182,7 +182,7 @@ test('large session lists return to Search without traversing session rows', { t
   }
   try {
     for (const density of ['comfortable', 'compact']) {
-      for (const count of [100, 1000]) {
+      for (const count of [100, RAIL_ROW_STEP + 50]) {
         const initial = payload();
         initial.views = [];
         initial.rail = Array.from({ length: count }, (_, index) => ({

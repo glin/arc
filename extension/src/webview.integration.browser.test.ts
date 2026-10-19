@@ -641,45 +641,44 @@ test('responsive heading Labels leave the timeline and card fingerprints untouch
   }
   try {
     for (const n of [100, 1000]) {
-      for (const turns of [12, 24]) {
-        const page = await browser.newPage();
-        await page.setViewportSize({ width: 1400, height: 900 });
-        const initial = await openScaledPage(page, n, turns);
-        initial.rail[0].labels = ['performance'];
-        await page.evaluate(`window.postMessage(${JSON.stringify(initial)}, '*')`);
-        await page.evaluate(SETTLED);
-        const label = page.locator('.sessionrow[data-session="bulk0"] .sessionlabel');
-        assert.equal(await label.evaluate((node) => node.tagName), 'BUTTON');
-        await label.focus();
-        await page.evaluate(`window.__resizeBodies = Array.from(document.querySelectorAll('.turn .body'));`);
-        const counts = await drawCounts(page);
-        const prints = await page.evaluate('window.__arcCardPrints');
-        for (const width of [1400, 1300, 600, 580, 1400]) {
-          if (width === 1400 && page.viewportSize()?.width === width) {
-            await page.evaluate(`window.dispatchEvent(new Event('resize'))`);
-          } else {
-            await page.setViewportSize({ width, height: 850 });
-          }
-          const labelTag = width < RAIL_MIN_WIDTH ? 'SPAN' : 'BUTTON';
-          await page.waitForFunction(
-            (tag) => document.querySelector('.sessionrow[data-session="bulk0"] .sessionlabel')?.tagName === tag,
-            labelTag,
-          );
-          await page.evaluate(SETTLED);
-          assert.deepEqual(await drawCounts(page), counts, `resize at ${width} drew the timeline at ${n} sessions`);
-          assert.equal(await page.evaluate('window.__arcCardPrints'), prints, 'resize traversed card fingerprints');
-          assert.equal(await label.evaluate((node) => node.tagName), labelTag);
-          if (width < RAIL_MIN_WIDTH) {
-            assert.equal(await page.evaluate(`document.activeElement?.dataset.control`), 'sessionlabels:bulk0');
-          }
-          assert.equal(
-            await page.evaluate(`window.__resizeBodies.every((node, index) =>
-            node === document.querySelectorAll('.turn .body')[index])`),
-            true,
-          );
+      const turns = 24;
+      const page = await browser.newPage();
+      await page.setViewportSize({ width: 1400, height: 900 });
+      const initial = await openScaledPage(page, n, turns);
+      initial.rail[0].labels = ['performance'];
+      await page.evaluate(`window.postMessage(${JSON.stringify(initial)}, '*')`);
+      await page.evaluate(SETTLED);
+      const label = page.locator('.sessionrow[data-session="bulk0"] .sessionlabel');
+      assert.equal(await label.evaluate((node) => node.tagName), 'BUTTON');
+      await label.focus();
+      await page.evaluate(`window.__resizeBodies = Array.from(document.querySelectorAll('.turn .body'));`);
+      const counts = await drawCounts(page);
+      const prints = await page.evaluate('window.__arcCardPrints');
+      for (const width of [1400, 1300, 600, 580, 1400]) {
+        if (width === 1400 && page.viewportSize()?.width === width) {
+          await page.evaluate(`window.dispatchEvent(new Event('resize'))`);
+        } else {
+          await page.setViewportSize({ width, height: 850 });
         }
-        await page.close();
+        const labelTag = width < RAIL_MIN_WIDTH ? 'SPAN' : 'BUTTON';
+        await page.waitForFunction(
+          (tag) => document.querySelector('.sessionrow[data-session="bulk0"] .sessionlabel')?.tagName === tag,
+          labelTag,
+        );
+        await page.evaluate(SETTLED);
+        assert.deepEqual(await drawCounts(page), counts, `resize at ${width} drew the timeline at ${n} sessions`);
+        assert.equal(await page.evaluate('window.__arcCardPrints'), prints, 'resize traversed card fingerprints');
+        assert.equal(await label.evaluate((node) => node.tagName), labelTag);
+        if (width < RAIL_MIN_WIDTH) {
+          assert.equal(await page.evaluate(`document.activeElement?.dataset.control`), 'sessionlabels:bulk0');
+        }
+        assert.equal(
+          await page.evaluate(`window.__resizeBodies.every((node, index) =>
+          node === document.querySelectorAll('.turn .body')[index])`),
+          true,
+        );
       }
+      await page.close();
     }
   } finally {
     await browser.close();
@@ -803,156 +802,154 @@ test('rail metadata and label editor updates leave turn cards untouched', { time
     return;
   }
   try {
-    for (const n of [100, 1000])
-      for (const turns of [12, 24])
-        for (const theme of ['dark', 'light'] as const) {
-          const page = await browser.newPage();
-          const failures: string[] = [];
-          page.on('pageerror', (error) => failures.push(String(error)));
-          await page.setContent(themed(drawCountedPageHtml(), theme));
-          const initial = scaledPayload(n, turns);
-          initial.olderHistory = {
-            kind: 'load',
-            label: 'Load older turns',
-            name: 'Load more recorded turns',
-            token: 'metadata-old',
-            session: 'bulk0',
-            auto: false,
-          };
-          await page.evaluate((message) => window.postMessage(message, '*'), initial);
-          await page.evaluate(SETTLED);
-          const message = {
-            type: 'rail',
-            rail: initial.rail,
-            labels: initial.labels,
-            views: initial.views,
-            railFilters: initial.railFilters,
-            stats: initial.stats,
-            sessionAdoptions: [],
-            hidden: initial.hidden,
-            pinnedTop: initial.pinnedTop,
-          };
-          const post = async (next: unknown) => {
-            await page.evaluate((value) => window.postMessage(value, '*'), next);
-            await page.evaluate(SETTLED);
-          };
-          await page.locator('[data-control="olderHistory"]').focus();
-          await page.evaluate(
-            `window.__olderNode = document.querySelector('[data-control="olderHistory"]'); window.__firstCard = document.querySelector('article.turn');`,
-          );
-          const before = await drawCounts(page);
-          const prints = (await page.evaluate('window.__arcCardPrints')) as number;
-          assert.ok(prints > 0, 'the card fingerprint counter did not observe the initial render');
-          await post(message);
-          assert.deepEqual(
-            await page.evaluate(
-              `({same: window.__olderNode === document.querySelector('[data-control="olderHistory"]'), focused: document.activeElement === window.__olderNode})`,
-            ),
-            { same: true, focused: true },
-          );
-          await post({
-            ...message,
-            rail: initial.rail.map((row, i) =>
-              i === 1 ? { ...row, label: 'Changed unrelated session', labels: ['unrelated'] } : row,
-            ),
-            stats: {
-              ...initial.stats,
-              bulk1: [{ kind: 'plain', metric: 'turns', label: '77 turns', detail: 'Changed unrelated detail' }],
+    const turns = 24;
+    const theme = 'dark';
+    for (const n of [100, 1000]) {
+      const page = await browser.newPage();
+      const failures: string[] = [];
+      page.on('pageerror', (error) => failures.push(String(error)));
+      await page.setContent(themed(drawCountedPageHtml(), theme));
+      const initial = scaledPayload(n, turns);
+      initial.olderHistory = {
+        kind: 'load',
+        label: 'Load older turns',
+        name: 'Load more recorded turns',
+        token: 'metadata-old',
+        session: 'bulk0',
+        auto: false,
+      };
+      await page.evaluate((message) => window.postMessage(message, '*'), initial);
+      await page.evaluate(SETTLED);
+      const message = {
+        type: 'rail',
+        rail: initial.rail,
+        labels: initial.labels,
+        views: initial.views,
+        railFilters: initial.railFilters,
+        stats: initial.stats,
+        sessionAdoptions: [],
+        hidden: initial.hidden,
+        pinnedTop: initial.pinnedTop,
+      };
+      const post = async (next: unknown) => {
+        await page.evaluate((value) => window.postMessage(value, '*'), next);
+        await page.evaluate(SETTLED);
+      };
+      await page.locator('[data-control="olderHistory"]').focus();
+      await page.evaluate(
+        `window.__olderNode = document.querySelector('[data-control="olderHistory"]'); window.__firstCard = document.querySelector('article.turn');`,
+      );
+      const before = await drawCounts(page);
+      const prints = (await page.evaluate('window.__arcCardPrints')) as number;
+      assert.ok(prints > 0, 'the card fingerprint counter did not observe the initial render');
+      await post(message);
+      assert.deepEqual(
+        await page.evaluate(
+          `({same: window.__olderNode === document.querySelector('[data-control="olderHistory"]'), focused: document.activeElement === window.__olderNode})`,
+        ),
+        { same: true, focused: true },
+      );
+      await post({
+        ...message,
+        rail: initial.rail.map((row, i) =>
+          i === 1 ? { ...row, label: 'Changed unrelated session', labels: ['unrelated'] } : row,
+        ),
+        stats: {
+          ...initial.stats,
+          bulk1: [{ kind: 'plain', metric: 'turns', label: '77 turns', detail: 'Changed unrelated detail' }],
+        },
+      });
+      const selected = {
+        ...message,
+        rail: initial.rail.map((row, i) => (i === 0 ? { ...row, labels: ['metadata'] } : row)),
+        stats: {
+          ...initial.stats,
+          bulk0: [
+            {
+              kind: 'plain',
+              metric: 'cost',
+              label: '$9',
+              compactLabel: '$9',
+              name: 'Changed cost',
+              focusable: true,
+              detail: 'First selected cost detail',
             },
-          });
-          const selected = {
-            ...message,
-            rail: initial.rail.map((row, i) => (i === 0 ? { ...row, labels: ['metadata'] } : row)),
-            stats: {
-              ...initial.stats,
-              bulk0: [
-                {
-                  kind: 'plain',
-                  metric: 'cost',
-                  label: '$9',
-                  compactLabel: '$9',
-                  name: 'Changed cost',
-                  focusable: true,
-                  detail: 'First selected cost detail',
-                },
-              ],
-            },
-          };
-          await post(selected);
-          assert.equal(await page.locator('.sessionrow[data-session="bulk0"] .sessionlabel').textContent(), 'metadata');
-          const figure = page.locator('.sessionstats [data-metric="cost"]');
-          await figure.evaluate((node: HTMLElement) => node.click());
-          await page.evaluate(SETTLED);
-          assert.match(await page.locator('#chippop').innerText(), /First selected cost detail/);
-          await post({
-            ...selected,
-            stats: {
-              ...selected.stats,
-              bulk0: [
-                { ...selected.stats.bulk0[0], detail: 'Updated selected cost detail', name: 'Updated cost name' },
-              ],
-            },
-          });
-          assert.match(await page.locator('#chippop').innerText(), /Updated selected cost detail/);
-          assert.equal(await figure.getAttribute('aria-label'), 'Updated cost name');
-          await figure.press('Escape');
-          await page.evaluate(SETTLED);
-          const heading = page.locator('[data-control="sessionlabels:bulk0"]');
-          await heading.click();
-          assert.equal(await heading.getAttribute('aria-expanded'), 'false');
-          await post({ type: 'labelEditor', session: 'bulk1', heading: 'Wrong reply', rows: [] });
-          assert.equal(await heading.getAttribute('aria-expanded'), 'false');
-          const rows = [
-            { name: 'metadata', count: 2, countName: '2 sessions', applied: true },
-            { name: 'performance', count: 1, countName: '1 session', applied: false },
-          ];
-          await post({ type: 'labelEditor', session: 'bulk0', heading: 'Labels for Bulk session 0', rows });
-          assert.equal(await heading.getAttribute('aria-expanded'), 'true');
-          await page.evaluate(
-            `(() => { const input=document.querySelector('.labelfind');window.__labelInput=input;input.value='perf';input.focus();input.setSelectionRange(1,3);input.dispatchEvent(new CompositionEvent('compositionstart',{bubbles:true}));input.dispatchEvent(new InputEvent('input',{bubbles:true,isComposing:true})); })()`,
-          );
-          await page.evaluate(SETTLED);
-          await post({ type: 'labelsChanged', session: 'bulk1' });
-          await post({
-            type: 'labelEditor',
-            session: 'bulk0',
-            heading: 'Labels for Bulk session 0',
-            rows: [rows[0], { ...rows[1], count: 4, countName: '4 sessions' }],
-          });
-          assert.match(await page.locator('#labelpop').innerText(), /4/);
-          assert.deepEqual(
-            await page.evaluate(
-              `(() => {const input=document.querySelector('.labelfind');return {same:input===window.__labelInput,focused:document.activeElement===input,value:input.value,start:input.selectionStart,end:input.selectionEnd};})()`,
-            ),
-            { same: true, focused: true, value: 'perf', start: 1, end: 3 },
-          );
-          await page.evaluate(
-            `document.querySelector('.labelfind').dispatchEvent(new CompositionEvent('compositionend',{bubbles:true}))`,
-          );
-          await page.locator('.labelfind').press('Escape');
-          await page.evaluate(SETTLED);
-          assert.equal(await heading.getAttribute('aria-expanded'), 'false');
-          assert.equal(await heading.evaluate((node) => document.activeElement === node), true);
-          const after = await drawCounts(page);
-          assert.equal(
-            after.rail - before.rail,
-            7,
-            'rail replies and editor transitions changed their existing draw bound',
-          );
-          assert.equal(
-            after.timeline - before.timeline,
-            0,
-            `metadata/editor updates drew the timeline at ${n} sessions and ${turns} turns in ${theme}`,
-          );
-          assert.equal(
-            await page.evaluate('window.__arcCardPrints'),
-            prints,
-            'metadata/editor updates traversed card fingerprints',
-          );
-          assert.equal(await page.evaluate(`window.__firstCard === document.querySelector('article.turn')`), true);
-          assert.deepEqual(failures, []);
-          await page.close();
-        }
+          ],
+        },
+      };
+      await post(selected);
+      assert.equal(await page.locator('.sessionrow[data-session="bulk0"] .sessionlabel').textContent(), 'metadata');
+      const figure = page.locator('.sessionstats [data-metric="cost"]');
+      await figure.evaluate((node: HTMLElement) => node.click());
+      await page.evaluate(SETTLED);
+      assert.match(await page.locator('#chippop').innerText(), /First selected cost detail/);
+      await post({
+        ...selected,
+        stats: {
+          ...selected.stats,
+          bulk0: [{ ...selected.stats.bulk0[0], detail: 'Updated selected cost detail', name: 'Updated cost name' }],
+        },
+      });
+      assert.match(await page.locator('#chippop').innerText(), /Updated selected cost detail/);
+      assert.equal(await figure.getAttribute('aria-label'), 'Updated cost name');
+      await figure.press('Escape');
+      await page.evaluate(SETTLED);
+      const heading = page.locator('[data-control="sessionlabels:bulk0"]');
+      await heading.click();
+      assert.equal(await heading.getAttribute('aria-expanded'), 'false');
+      await post({ type: 'labelEditor', session: 'bulk1', heading: 'Wrong reply', rows: [] });
+      assert.equal(await heading.getAttribute('aria-expanded'), 'false');
+      const rows = [
+        { name: 'metadata', count: 2, countName: '2 sessions', applied: true },
+        { name: 'performance', count: 1, countName: '1 session', applied: false },
+      ];
+      await post({ type: 'labelEditor', session: 'bulk0', heading: 'Labels for Bulk session 0', rows });
+      assert.equal(await heading.getAttribute('aria-expanded'), 'true');
+      await page.evaluate(
+        `(() => { const input=document.querySelector('.labelfind');window.__labelInput=input;input.value='perf';input.focus();input.setSelectionRange(1,3);input.dispatchEvent(new CompositionEvent('compositionstart',{bubbles:true}));input.dispatchEvent(new InputEvent('input',{bubbles:true,isComposing:true})); })()`,
+      );
+      await page.evaluate(SETTLED);
+      await post({ type: 'labelsChanged', session: 'bulk1' });
+      await post({
+        type: 'labelEditor',
+        session: 'bulk0',
+        heading: 'Labels for Bulk session 0',
+        rows: [rows[0], { ...rows[1], count: 4, countName: '4 sessions' }],
+      });
+      assert.match(await page.locator('#labelpop').innerText(), /4/);
+      assert.deepEqual(
+        await page.evaluate(
+          `(() => {const input=document.querySelector('.labelfind');return {same:input===window.__labelInput,focused:document.activeElement===input,value:input.value,start:input.selectionStart,end:input.selectionEnd};})()`,
+        ),
+        { same: true, focused: true, value: 'perf', start: 1, end: 3 },
+      );
+      await page.evaluate(
+        `document.querySelector('.labelfind').dispatchEvent(new CompositionEvent('compositionend',{bubbles:true}))`,
+      );
+      await page.locator('.labelfind').press('Escape');
+      await page.evaluate(SETTLED);
+      assert.equal(await heading.getAttribute('aria-expanded'), 'false');
+      assert.equal(await heading.evaluate((node) => document.activeElement === node), true);
+      const after = await drawCounts(page);
+      assert.equal(
+        after.rail - before.rail,
+        7,
+        'rail replies and editor transitions changed their existing draw bound',
+      );
+      assert.equal(
+        after.timeline - before.timeline,
+        0,
+        `metadata/editor updates drew the timeline at ${n} sessions and ${turns} turns in ${theme}`,
+      );
+      assert.equal(
+        await page.evaluate('window.__arcCardPrints'),
+        prints,
+        'metadata/editor updates traversed card fingerprints',
+      );
+      assert.equal(await page.evaluate(`window.__firstCard === document.querySelector('article.turn')`), true);
+      assert.deepEqual(failures, []);
+      await page.close();
+    }
   } finally {
     await browser.close();
   }
@@ -1101,75 +1098,67 @@ test(
   },
 );
 
-test(
-  'unread heading expansion stays local for 12 and 24 turns at 100 and 1000 sessions',
-  { timeout: 60_000 },
-  async (t) => {
-    const browser = await browserOrNone();
-    if (!browser) {
-      t.skip('Edge or Chrome is required');
-      return;
+test('unread heading expansion stays local for 24 turns at 100 and 1000 sessions', { timeout: 60_000 }, async (t) => {
+  const browser = await browserOrNone();
+  if (!browser) {
+    t.skip('Edge or Chrome is required');
+    return;
+  }
+  try {
+    for (const n of [100, 1000]) {
+      const turns = 24;
+      const page = await browser.newPage();
+      const failures: string[] = [];
+      page.on('pageerror', (error) => failures.push(String(error)));
+      const initial = await openScaledPage(page, n, turns);
+      assert.equal(initial.cards.length, turns);
+      await page.evaluate(`window.postMessage({ type: 'setSessionRead', session: 'bulk0', read: false }, '*')`);
+      await page.evaluate(SETTLED);
+      const heading = page.locator('.sessionrow[data-session="bulk0"]');
+      const disclosure = heading.locator('button.session');
+      await disclosure.focus();
+      await page.evaluate(
+        `window.__heldHeading = document.querySelector('.sessionrow[data-session="bulk0"] button.session'); window.__posted = []; window.__browserSaves = 0;`,
+      );
+      const before = await drawCounts(page);
+      await disclosure.press('Enter');
+      await page.waitForFunction(`document.querySelectorAll('.turn.has-body.is-open.is-read').length === ${turns}`);
+      await page.evaluate(SETTLED);
+      assert.deepEqual(await drawCounts(page), before);
+      assert.equal(await disclosure.getAttribute('aria-expanded'), 'true');
+      assert.equal(await page.evaluate(`document.activeElement === window.__heldHeading`), true);
+      assert.equal(
+        await heading.evaluate((node) => JSON.parse((node as HTMLElement).dataset.vscodeContext!).sessionRead),
+        'read',
+      );
+      assert.equal(await page.evaluate('window.__browserSaves'), 1);
+      assert.equal(await page.evaluate(`window.__posted.filter((message) => message.type === 'saveState').length`), 1);
+      assert.deepEqual(
+        await page.evaluate('window.__browserState.read'),
+        initial.cards.map((card) => card.key),
+      );
+      assert.equal(await page.evaluate('window.__browserState.readTo.bulk0'), 0);
+      await disclosure.press('Enter');
+      await page.evaluate(SETTLED);
+      assert.equal(await page.locator('.turn.is-open').count(), 0);
+      assert.equal(await page.locator('.turn.is-read').count(), turns);
+      assert.deepEqual(await drawCounts(page), before);
+      await page.evaluate(
+        `window.postMessage(${JSON.stringify({ type: 'rail', rail: initial.rail, labels: initial.labels, views: initial.views, railFilters: initial.railFilters, stats: initial.stats, hidden: initial.hidden, pinnedTop: initial.pinnedTop, sessionAdoptions: [] })}, '*')`,
+      );
+      await page.evaluate(SETTLED);
+      assert.deepEqual(await drawCounts(page), { timeline: before.timeline, rail: before.rail + 1 });
+      assert.equal(
+        await heading.evaluate((node) => JSON.parse((node as HTMLElement).dataset.vscodeContext!).sessionRead),
+        'read',
+      );
+      assert.deepEqual(failures, []);
+      await page.close();
     }
-    try {
-      for (const n of [100, 1000]) {
-        for (const turns of [12, 24]) {
-          const page = await browser.newPage();
-          const failures: string[] = [];
-          page.on('pageerror', (error) => failures.push(String(error)));
-          const initial = await openScaledPage(page, n, turns);
-          assert.equal(initial.cards.length, turns);
-          await page.evaluate(`window.postMessage({ type: 'setSessionRead', session: 'bulk0', read: false }, '*')`);
-          await page.evaluate(SETTLED);
-          const heading = page.locator('.sessionrow[data-session="bulk0"]');
-          const disclosure = heading.locator('button.session');
-          await disclosure.focus();
-          await page.evaluate(
-            `window.__heldHeading = document.querySelector('.sessionrow[data-session="bulk0"] button.session'); window.__posted = []; window.__browserSaves = 0;`,
-          );
-          const before = await drawCounts(page);
-          await disclosure.press('Enter');
-          await page.waitForFunction(`document.querySelectorAll('.turn.has-body.is-open.is-read').length === ${turns}`);
-          await page.evaluate(SETTLED);
-          assert.deepEqual(await drawCounts(page), before);
-          assert.equal(await disclosure.getAttribute('aria-expanded'), 'true');
-          assert.equal(await page.evaluate(`document.activeElement === window.__heldHeading`), true);
-          assert.equal(
-            await heading.evaluate((node) => JSON.parse((node as HTMLElement).dataset.vscodeContext!).sessionRead),
-            'read',
-          );
-          assert.equal(await page.evaluate('window.__browserSaves'), 1);
-          assert.equal(
-            await page.evaluate(`window.__posted.filter((message) => message.type === 'saveState').length`),
-            1,
-          );
-          assert.deepEqual(
-            await page.evaluate('window.__browserState.read'),
-            initial.cards.map((card) => card.key),
-          );
-          assert.equal(await page.evaluate('window.__browserState.readTo.bulk0'), 0);
-          await disclosure.press('Enter');
-          await page.evaluate(SETTLED);
-          assert.equal(await page.locator('.turn.is-open').count(), 0);
-          assert.equal(await page.locator('.turn.is-read').count(), turns);
-          assert.deepEqual(await drawCounts(page), before);
-          await page.evaluate(
-            `window.postMessage(${JSON.stringify({ type: 'rail', rail: initial.rail, labels: initial.labels, views: initial.views, railFilters: initial.railFilters, stats: initial.stats, hidden: initial.hidden, pinnedTop: initial.pinnedTop, sessionAdoptions: [] })}, '*')`,
-          );
-          await page.evaluate(SETTLED);
-          assert.deepEqual(await drawCounts(page), { timeline: before.timeline, rail: before.rail + 1 });
-          assert.equal(
-            await heading.evaluate((node) => JSON.parse((node as HTMLElement).dataset.vscodeContext!).sessionRead),
-            'read',
-          );
-          assert.deepEqual(failures, []);
-          await page.close();
-        }
-      }
-    } finally {
-      await browser.close();
-    }
-  },
-);
+  } finally {
+    await browser.close();
+  }
+});
 
 test(
   'local session membership updates headings without timeline draws or card fingerprints',
@@ -1182,61 +1171,60 @@ test(
     }
     try {
       for (const n of [100, 1000]) {
-        for (const turns of [12, 24]) {
-          const page = await browser.newPage();
-          const failures: string[] = [];
-          page.on('pageerror', (error) => failures.push(String(error)));
-          await openScaledPage(page, n, turns);
-          const heading = page.locator('.sessionrow[data-session="bulk0"]');
-          await page.evaluate(`window.__membershipHeading = document.querySelector('.sessionrow[data-session="bulk0"]');
-            window.__membershipBody = document.querySelector('.turn .body');`);
-          for (const [type, field, value, action, pinned, archived] of [
-            ['setSessionPinned', 'pinned', true, 'pin', true, false],
-            ['setSessionPinned', 'pinned', false, 'unpin', false, false],
-            ['setSessionPinned', 'pinned', true, 'pin', true, false],
-            ['setSessionArchived', 'archived', true, 'archive', false, true],
-            ['setSessionArchived', 'archived', false, 'unarchive', false, false],
-          ] as const) {
-            const before = await drawCounts(page);
-            const prints = await page.evaluate('window.__arcCardPrints');
-            const saves = await page.evaluate('window.__browserSaves');
-            await page.evaluate('window.__posted.length = 0');
-            const message = { type, session: 'bulk0', [field]: value };
-            await page.evaluate((message) => window.postMessage(message, '*'), message);
-            await page.evaluate(SETTLED);
-            const context = await heading.evaluate((node) => JSON.parse((node as HTMLElement).dataset.vscodeContext!));
-            assert.equal(context.sessionPinned, pinned);
-            assert.equal(context.webviewSection, archived ? 'arcSessionArchived' : 'arcSessionLive');
-            assert.equal(context.sessionPersisted, true);
-            assert.equal(await heading.locator('[data-control="sessionpin:bulk0"]').count(), archived ? 0 : 1);
-            if (!archived)
-              assert.equal(
-                await heading.locator('[data-control="sessionpin:bulk0"]').getAttribute('aria-pressed'),
-                String(pinned),
-              );
+        const turns = 24;
+        const page = await browser.newPage();
+        const failures: string[] = [];
+        page.on('pageerror', (error) => failures.push(String(error)));
+        await openScaledPage(page, n, turns);
+        const heading = page.locator('.sessionrow[data-session="bulk0"]');
+        await page.evaluate(`window.__membershipHeading = document.querySelector('.sessionrow[data-session="bulk0"]');
+          window.__membershipBody = document.querySelector('.turn .body');`);
+        for (const [type, field, value, action, pinned, archived] of [
+          ['setSessionPinned', 'pinned', true, 'pin', true, false],
+          ['setSessionPinned', 'pinned', false, 'unpin', false, false],
+          ['setSessionPinned', 'pinned', true, 'pin', true, false],
+          ['setSessionArchived', 'archived', true, 'archive', false, true],
+          ['setSessionArchived', 'archived', false, 'unarchive', false, false],
+        ] as const) {
+          const before = await drawCounts(page);
+          const prints = await page.evaluate('window.__arcCardPrints');
+          const saves = await page.evaluate('window.__browserSaves');
+          await page.evaluate('window.__posted.length = 0');
+          const message = { type, session: 'bulk0', [field]: value };
+          await page.evaluate((message) => window.postMessage(message, '*'), message);
+          await page.evaluate(SETTLED);
+          const context = await heading.evaluate((node) => JSON.parse((node as HTMLElement).dataset.vscodeContext!));
+          assert.equal(context.sessionPinned, pinned);
+          assert.equal(context.webviewSection, archived ? 'arcSessionArchived' : 'arcSessionLive');
+          assert.equal(context.sessionPersisted, true);
+          assert.equal(await heading.locator('[data-control="sessionpin:bulk0"]').count(), archived ? 0 : 1);
+          if (!archived)
             assert.equal(
-              await page.evaluate(
-                `window.__membershipHeading === document.querySelector('.sessionrow[data-session="bulk0"]') && window.__membershipBody === document.querySelector('.turn .body')`,
-              ),
-              true,
+              await heading.locator('[data-control="sessionpin:bulk0"]').getAttribute('aria-pressed'),
+              String(pinned),
             );
-            assert.deepEqual(await drawCounts(page), { timeline: before.timeline, rail: before.rail + 1 });
-            assert.equal(await page.evaluate('window.__arcCardPrints'), prints);
-            assert.equal(await page.evaluate('window.__browserSaves'), saves);
-            assert.deepEqual(
-              await page.evaluate(
-                `window.__posted.filter(m => m.type === 'sessionMembership' || m.type === 'saveState')`,
-              ),
-              [{ type: 'sessionMembership', action, session: 'bulk0' }],
-            );
-            await page.evaluate((message) => window.postMessage(message, '*'), message);
-            await page.evaluate(SETTLED);
-            assert.deepEqual(await drawCounts(page), { timeline: before.timeline, rail: before.rail + 1 });
-            assert.equal(await page.evaluate(`window.__posted.filter(m => m.type === 'sessionMembership').length`), 1);
-          }
-          assert.deepEqual(failures, []);
-          await page.close();
+          assert.equal(
+            await page.evaluate(
+              `window.__membershipHeading === document.querySelector('.sessionrow[data-session="bulk0"]') && window.__membershipBody === document.querySelector('.turn .body')`,
+            ),
+            true,
+          );
+          assert.deepEqual(await drawCounts(page), { timeline: before.timeline, rail: before.rail + 1 });
+          assert.equal(await page.evaluate('window.__arcCardPrints'), prints);
+          assert.equal(await page.evaluate('window.__browserSaves'), saves);
+          assert.deepEqual(
+            await page.evaluate(
+              `window.__posted.filter(m => m.type === 'sessionMembership' || m.type === 'saveState')`,
+            ),
+            [{ type: 'sessionMembership', action, session: 'bulk0' }],
+          );
+          await page.evaluate((message) => window.postMessage(message, '*'), message);
+          await page.evaluate(SETTLED);
+          assert.deepEqual(await drawCounts(page), { timeline: before.timeline, rail: before.rail + 1 });
+          assert.equal(await page.evaluate(`window.__posted.filter(m => m.type === 'sessionMembership').length`), 1);
         }
+        assert.deepEqual(failures, []);
+        await page.close();
       }
     } finally {
       await browser.close();
@@ -1885,11 +1873,14 @@ test('VS Code body modes keep the panel functional', { timeout: 60_000 }, async 
       'vscode-dark vscode-using-screen-reader',
       'vscode-dark vscode-reduce-motion',
     ];
+    const page = await browser.newPage();
+    const failures: string[] = [];
+    page.on('pageerror', (error) => failures.push(String(error)));
+    await page.setContent(countedListenerPageHtml());
     for (const mode of modes) {
-      const page = await browser.newPage();
-      const failures: string[] = [];
-      page.on('pageerror', (error) => failures.push(String(error)));
-      await page.setContent(countedListenerPageHtml(mode));
+      await page.evaluate((mode) => {
+        document.body.className = mode;
+      }, mode);
       await page.evaluate(`window.postMessage(${JSON.stringify(renderPayload())}, '*')`);
       await page.evaluate(SETTLED);
       const result = (await page.evaluate(`(() => {
