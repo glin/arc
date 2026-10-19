@@ -445,7 +445,7 @@ test('npm prefix and extension-directory invocations default to the caller proje
       },
     );
     assert.equal(launch.status, 0, launch.stderr + launch.stdout);
-    assert.ok(launch.stdout.includes(`Project ${cwd}`), launch.stdout);
+    assert.ok(launch.stdout.split(/\r?\n/).includes(`Project ${cwd}`), launch.stdout);
     assert.ok(launch.stdout.includes('0 violations'), launch.stdout);
   }
 });

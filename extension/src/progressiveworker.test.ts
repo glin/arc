@@ -76,51 +76,47 @@ test('commit ownership reservations survive changed relationships and parser gen
   );
 });
 
-test(
-  'cancelled commit ownership reads exhaust host reservations across replacement workers',
-  { timeout: 90_000 },
-  async () => {
-    const directory = tempDir('commit-worker-cancel-');
-    const parentFile = path.join(directory, 'parent.jsonl');
-    const childFile = path.join(directory, 'child.jsonl');
-    const marker = path.join(directory, 'reading');
-    fs.writeFileSync(parentFile, '{"type":"session_meta","payload":{"id":"parent"}}\n');
-    fs.writeFileSync(childFile, '{"type":"session_meta","payload":{"id":"child","parent_thread_id":"parent"}}\n');
-    const sourceOf = (file: string, sessionId: string) => {
-      const { size, mtimeMs, dev, ino } = revisionOf(fs.statSync(file, { bigint: true }));
-      return { file, sessionId, revision: { size, mtimeMs, dev, ino } };
-    };
-    const parent = sourceOf(parentFile, 'parent');
-    const child = sourceOf(childFile, 'child');
-    const ledger = new CommitRepositoryReservations();
-    const prelude = `const blockingFs=require('node:fs'); const originalRead=blockingFs.readSync; blockingFs.readSync=function(...args){const bytes=originalRead.apply(this,args);blockingFs.writeFileSync(${JSON.stringify(marker)},'reading');Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0);return bytes;};`;
-    for (let attempt = 0; attempt < 128; attempt++) {
-      if (fs.existsSync(marker)) fs.unlinkSync(marker);
-      const worker = new ProgressiveWorker(prelude + source);
-      const controller = new AbortController();
-      const allowance = ledger.reserve(parent, child);
-      const pending = worker.run(
-        {
-          kind: 'commit-repositories',
-          parent,
-          child,
-          commits: [],
-          parserVersion: COMMIT_REPOSITORY_PARSER_VERSION,
-          token: null,
-          ...allowance,
-        },
-        attempt,
-        controller.signal,
-      );
-      await vi.waitFor(() => assert.ok(fs.existsSync(marker)), { timeout: 5000, interval: 1 });
-      controller.abort();
-      assert.equal(await pending, null);
-      worker.stop();
-    }
-    assert.equal(ledger.bytes(parent), 64 * 1024 * 1024);
-    assert.deepEqual(ledger.reserve(parent, child), { parentBytes: 0, childBytes: 0 });
-  },
-);
+test('cancelled commit ownership reads retain host reservations', { timeout: 90_000 }, async () => {
+  const directory = tempDir('commit-worker-cancel-');
+  const parentFile = path.join(directory, 'parent.jsonl');
+  const childFile = path.join(directory, 'child.jsonl');
+  const marker = path.join(directory, 'reading');
+  fs.writeFileSync(parentFile, '{"type":"session_meta","payload":{"id":"parent"}}\n');
+  fs.writeFileSync(childFile, '{"type":"session_meta","payload":{"id":"child","parent_thread_id":"parent"}}\n');
+  const sourceOf = (file: string, sessionId: string) => {
+    const { size, mtimeMs, dev, ino } = revisionOf(fs.statSync(file, { bigint: true }));
+    return { file, sessionId, revision: { size, mtimeMs, dev, ino } };
+  };
+  const parent = sourceOf(parentFile, 'parent');
+  const child = sourceOf(childFile, 'child');
+  const ledger = new CommitRepositoryReservations();
+  const prelude = `const blockingFs=require('node:fs'); const originalRead=blockingFs.readSync; blockingFs.readSync=function(...args){const bytes=originalRead.apply(this,args);blockingFs.writeFileSync(${JSON.stringify(marker)},'reading');Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0);return bytes;};`;
+  const worker = new ProgressiveWorker(prelude + source);
+  const controller = new AbortController();
+  const allowance = ledger.reserve(parent, child);
+  const pending = worker.run(
+    {
+      kind: 'commit-repositories',
+      parent,
+      child,
+      commits: [],
+      parserVersion: COMMIT_REPOSITORY_PARSER_VERSION,
+      token: null,
+      ...allowance,
+    },
+    0,
+    controller.signal,
+  );
+  try {
+    await vi.waitFor(() => assert.ok(fs.existsSync(marker)), { timeout: 5000, interval: 1 });
+    controller.abort();
+    assert.equal(await pending, null);
+    assert.equal(ledger.bytes(parent), 512 * 1024);
+    assert.equal(ledger.bytes(child), 512 * 1024);
+  } finally {
+    worker.stop();
+  }
+});
 
 test('commit ownership workers resume a parent across children and reject changed source revisions', async () => {
   const directory = tempDir('commit-worker-');

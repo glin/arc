@@ -4585,17 +4585,17 @@ function titleRollout(directory: string, id: string, title: string, bytes = 0) {
   return { file, sessionId: id, agent: 'codex', ...revisionOf(fs.statSync(file, { bigint: true })), activity: 1 };
 }
 
+const titleWorkerSource = buildSync({
+  entryPoints: [path.join(__dirname, 'progressiveworker-entry.ts')],
+  bundle: true,
+  platform: 'node',
+  format: 'cjs',
+  target: 'node18',
+  write: false,
+}).outputFiles[0].text;
+
 function titleWorker(extraSource = '') {
-  return new ProgressiveWorker(
-    buildSync({
-      entryPoints: [path.join(__dirname, 'progressiveworker-entry.ts')],
-      bundle: true,
-      platform: 'node',
-      format: 'cjs',
-      target: 'node18',
-      write: false,
-    }).outputFiles[0].text + extraSource,
-  );
+  return new ProgressiveWorker(titleWorkerSource + extraSource);
 }
 
 test('a recovered Codex title reaches the rail when later enrichment fails', async () => {
@@ -6232,15 +6232,7 @@ test('a selected excluded-content append keeps loaded older turns after cold rec
       .map((record) => JSON.stringify(record))
       .join('\n') + '\n',
   );
-  const source = buildSync({
-    entryPoints: [path.join(__dirname, 'progressiveworker-entry.ts')],
-    bundle: true,
-    platform: 'node',
-    format: 'cjs',
-    target: 'node18',
-    write: false,
-  }).outputFiles[0].text;
-  const worker = new ProgressiveWorker(source);
+  const worker = titleWorker();
   const input = (): ProgressiveInput => {
     const revision = revisionOf(fs.statSync(file, { bigint: true }));
     return {

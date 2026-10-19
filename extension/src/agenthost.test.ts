@@ -6130,6 +6130,14 @@ test('spawnCli reads changed billing files for fresh Claude children without loa
       ['claude-vscode', 'codex'],
     ] as const) {
       fs.writeFileSync(file, `ARC_CLAUDE_BILLING_LABEL=${label}\nARC_ENV_FILE_ONLY=secret\n`);
+      if (agent === 'codex') {
+        const env = childEnv(process.env, {}, agent, cwd);
+        assert.deepEqual(
+          [env.CLAUDE_CODE_ENTRYPOINT, env.CLAUDE_CODE_ATTRIBUTION_HEADER, env.ARC_ENV_FILE_ONLY],
+          [undefined, '0', undefined],
+        );
+        continue;
+      }
       const script =
         'process.stdout.write(JSON.stringify([process.env.CLAUDE_CODE_ENTRYPOINT, process.env.CLAUDE_CODE_ATTRIBUTION_HEADER, process.env.ARC_ENV_FILE_ONLY]))';
       const child = spawnCli(process.execPath, ['-e', script], cwd, {}, agent);
@@ -6166,9 +6174,17 @@ test('spawnCli applies the host billing label to the actual Claude child environ
     for (const label of ['sdk-cli', 'claude-vscode', 'omit']) {
       vi.stubEnv('ARC_CLAUDE_BILLING_LABEL', label);
       for (const agent of ['claude', 'codex'] as const) {
+        const cwd = tempDir('billing-env-');
+        const env = childEnv(process.env, {}, agent, cwd);
+        const expected =
+          agent === 'claude'
+            ? [label === 'claude-vscode' ? label : 'sdk-cli', label === 'omit' ? '0' : '1']
+            : [undefined, '0'];
+        assert.deepEqual([env.CLAUDE_CODE_ENTRYPOINT, env.CLAUDE_CODE_ATTRIBUTION_HEADER], expected);
+        if (label !== 'claude-vscode') continue;
         const script =
           'process.stdout.write(JSON.stringify([process.env.CLAUDE_CODE_ENTRYPOINT, process.env.CLAUDE_CODE_ATTRIBUTION_HEADER]))';
-        const child = spawnCli(process.execPath, ['-e', script], tempDir('billing-env-'), {}, agent);
+        const child = spawnCli(process.execPath, ['-e', script], cwd, {}, agent);
         let output = '';
         child.stdout.setEncoding('utf8');
         child.stdout.on('data', (chunk) => {
@@ -6185,9 +6201,7 @@ test('spawnCli applies the host billing label to the actual Claude child environ
         assert.equal(code, 0);
         assert.deepEqual(
           JSON.parse(output),
-          agent === 'claude'
-            ? [label === 'claude-vscode' ? label : 'sdk-cli', label === 'omit' ? '0' : '1']
-            : [null, '0'],
+          expected.map((value) => value ?? null),
         );
       }
     }

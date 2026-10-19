@@ -15,7 +15,6 @@ import {
 import { HostedDispatch, type SavedDispatchResponse } from './dispatchhost';
 import { payloadSha256 } from './sessionwrites';
 import type { NativeEvent } from './agentwire';
-import { spawnSync } from 'node:child_process';
 import { savedDispatchResponse, SESSION_READ_LIMITS } from './sessionreads';
 import { revisionOf, type SessionFile } from './transcript';
 import { ClaudeWire } from './claudewire';
@@ -857,14 +856,7 @@ test('dead write owners allow exact claim recovery while live owners remain prot
   const event = report(receipts, launch.launchId);
   const first = receipts.claim(launch.launchId, event.eventId, origin, 'owner') as { token: string };
   const lock = path.join(receipts.root, launch.launchId, 'write.lock');
-  const child = spawnSync(process.execPath, [
-    '-e',
-    "require('node:fs').writeFileSync(process.argv[1], JSON.stringify({pid:process.pid,token:process.argv[2],launchId:process.argv[3]}))",
-    lock,
-    turn,
-    launch.launchId,
-  ]);
-  assert.equal(child.status, 0);
+  fs.writeFileSync(lock, JSON.stringify({ pid: 2147483647, token: turn, launchId: launch.launchId }));
   assert.equal((receipts.claim(launch.launchId, event.eventId, origin, 'owner') as any).token, first.token);
   fs.writeFileSync(
     lock,
@@ -920,16 +912,13 @@ test.each([1, 40])(
     const event = report(receipts, launch.launchId);
     const claim = receipts.claim(launch.launchId, event.eventId, origin, 'owner') as { token: string };
     const directory = path.join(receipts.root, launch.launchId);
-    const child = spawnSync(process.execPath, [
-      '-e',
-      "const fs=require('node:fs'),path=require('node:path'); let owner={pid:process.pid,token:process.argv[2],launchId:process.argv[4]}; fs.writeFileSync(path.join(process.argv[1],'write.lock'),JSON.stringify(owner)); for(let i=0;i<Number(process.argv[5]);i++){const next={...owner,token:String(i).padStart(8,'0')+'-1111-2222-3333-444444444444'}; fs.writeFileSync(path.join(process.argv[1],'write.'+owner.token+'.next.lock'),JSON.stringify(next)); owner=next;}",
-      directory,
-      turn,
-      session,
-      launch.launchId,
-      String(count),
-    ]);
-    assert.equal(child.status, 0);
+    let owner = { pid: 2147483647, token: turn, launchId: launch.launchId };
+    fs.writeFileSync(path.join(directory, 'write.lock'), JSON.stringify(owner));
+    for (let i = 0; i < count; i++) {
+      const next = { ...owner, token: String(i).padStart(8, '0') + '-1111-2222-3333-444444444444' };
+      fs.writeFileSync(path.join(directory, `write.${owner.token}.next.lock`), JSON.stringify(next));
+      owner = next;
+    }
     if (count > 32) assert.throws(() => receipts.claim(launch.launchId, event.eventId, origin, 'owner'), /Try again/);
     assert.equal((receipts.claim(launch.launchId, event.eventId, origin, 'owner') as any).token, claim.token);
     // Use a valid distinct owner token with an inaccessible process.
