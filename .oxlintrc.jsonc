@@ -83,6 +83,5 @@
     "**/shots/**",
     "**/test/fixtures/**",
     "evals/agent-review/fixtures/**",
-    "extension/src/webview/panel.d.ts",
   ],
 }

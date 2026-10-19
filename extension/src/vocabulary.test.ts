@@ -48,9 +48,7 @@ function maskBoundaryTerms(file: string, source: string): string {
 test('product vocabulary uses session outside retained boundaries', () => {
   const extensionRoot = path.join(__dirname, '..');
   const repositoryRoot = path.join(extensionRoot, '..');
-  const documents = shippedSources(path.join(repositoryRoot, 'docs')).filter(
-    (file) => path.extname(file) === '.md' && path.basename(file) !== 'spec.md',
-  );
+  const documents = shippedSources(path.join(repositoryRoot, 'docs')).filter((file) => path.extname(file) === '.md');
   const files = [
     path.join(extensionRoot, 'package.json'),
     ...shippedSources(__dirname),

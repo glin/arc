@@ -39,6 +39,5 @@ export default {
     '**/test/fixtures/**',
     'evals/agent-review/fixtures/**',
     'extension/src/panel-shots.test.ts',
-    'docs/spec.md',
   ],
 };
