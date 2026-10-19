@@ -1254,32 +1254,37 @@ syncBuiltinESMExports();
     }
   });
 
-  test('qualifies tracked bytes and prepares the full experiment without a model', HEAVY, () => {
-    const listed = runPortable('list');
-    assert.equal(listed.status, 0, listed.error);
-    for (const id of ['portable-001', 'portable-023', 'portable-024', 'portable-029'])
-      assert.match(listed.output, new RegExp(`^${id} `, 'm'));
-    const validated = runPortable('validate');
-    assert.equal(validated.status, 0, validated.error);
-    const dry = runPortable('run', '--config', 'evals/agent-review/experiments/effort.json', '--dry-run');
-    assert.equal(dry.status, 0, dry.error);
-    const folder = /^Run directory: (.+)$/m.exec(dry.output)?.[1];
-    assert.ok(folder);
-    try {
-      const cells = JSON.parse(fs.readFileSync(path.join(folder, 'cells.json'), 'utf8'));
-      const registration = JSON.parse(fs.readFileSync(path.join(folder, 'registration.json'), 'utf8'));
-      assert.equal(registration.harness.windows_backend, process.platform === 'win32' ? 'elevated' : null);
-      assert.equal(cells.length, 24);
-      assert.equal(new Set(cells.map((cell) => cell.id)).size, 24);
-      assert.ok(cells.every((cell) => cell.execution === null));
-      const candidate = path.join(folder, 'attempts', cells[0].id, 'workspace');
-      assert.ok(fs.existsSync(candidate));
-      assert.equal(fs.existsSync(path.join(candidate, 'keys')), false);
-      assert.equal(fs.existsSync(path.join(candidate, 'reference')), false);
-    } finally {
-      fs.rmSync(folder, { recursive: true, force: true });
-    }
-  }, 120_000);
+  test(
+    'qualifies tracked bytes and prepares the full experiment without a model',
+    HEAVY,
+    () => {
+      const listed = runPortable('list');
+      assert.equal(listed.status, 0, listed.error);
+      for (const id of ['portable-001', 'portable-023', 'portable-024', 'portable-029'])
+        assert.match(listed.output, new RegExp(`^${id} `, 'm'));
+      const validated = runPortable('validate');
+      assert.equal(validated.status, 0, validated.error);
+      const dry = runPortable('run', '--config', 'evals/agent-review/experiments/effort.json', '--dry-run');
+      assert.equal(dry.status, 0, dry.error);
+      const folder = /^Run directory: (.+)$/m.exec(dry.output)?.[1];
+      assert.ok(folder);
+      try {
+        const cells = JSON.parse(fs.readFileSync(path.join(folder, 'cells.json'), 'utf8'));
+        const registration = JSON.parse(fs.readFileSync(path.join(folder, 'registration.json'), 'utf8'));
+        assert.equal(registration.harness.windows_backend, process.platform === 'win32' ? 'elevated' : null);
+        assert.equal(cells.length, 24);
+        assert.equal(new Set(cells.map((cell) => cell.id)).size, 24);
+        assert.ok(cells.every((cell) => cell.execution === null));
+        const candidate = path.join(folder, 'attempts', cells[0].id, 'workspace');
+        assert.ok(fs.existsSync(candidate));
+        assert.equal(fs.existsSync(path.join(candidate, 'keys')), false);
+        assert.equal(fs.existsSync(path.join(candidate, 'reference')), false);
+      } finally {
+        fs.rmSync(folder, { recursive: true, force: true });
+      }
+    },
+    120_000,
+  );
 
   test('scripted demo can be scored and rejects a changed reply or key', () => {
     const demo = runPortable('demo');
@@ -2394,16 +2399,20 @@ test('registration checks preparation bytes and freezes portable conditions: cha
   }
 });
 
-test('registration checks preparation bytes and freezes portable conditions: changed workspace inventory', HEAVY, () => {
-  const extra = path.join(prepared, 'workspace', 'extra.txt');
-  fs.writeFileSync(extra, 'extra\n');
-  try {
-    assert.match(matrixFile().result.error, /changed workspace inventory/);
-  } finally {
-    fs.unlinkSync(extra);
-  }
-  assert.equal(matrixFile().result.status, 0);
-});
+test(
+  'registration checks preparation bytes and freezes portable conditions: changed workspace inventory',
+  HEAVY,
+  () => {
+    const extra = path.join(prepared, 'workspace', 'extra.txt');
+    fs.writeFileSync(extra, 'extra\n');
+    try {
+      assert.match(matrixFile().result.error, /changed workspace inventory/);
+    } finally {
+      fs.unlinkSync(extra);
+    }
+    assert.equal(matrixFile().result.status, 0);
+  },
+);
 
 test('registration checks preparation bytes and freezes portable conditions: changed prompt condition', HEAVY, () => {
   const wrong = registration({ prompt_hash: '0'.repeat(64) });
