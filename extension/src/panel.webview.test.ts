@@ -1964,6 +1964,7 @@ import { createRequire, syncBuiltinESMExports } from 'node:module';
 import assert from 'node:assert';
 import { parseSessionRequest } from './sessionrequests.ts';
 import {
+  ARCHIVE_COMPLETION_UNAVAILABLE,
   GUARDED_SEND_REASONS,
   GuardedSends,
   SessionWriteRequests,
@@ -3663,19 +3664,19 @@ test('current whole-file facts archive a listed session with no turn, refuse una
     assert.match((await provider.handleSessionRequest(request)).reason, pattern);
   entry.metadataWindow = { whole: false, windowBytes: 1 };
   assert.equal(row().runStatus, 'unknown');
-  await refuse(/unavailable/);
+  await refuse(/cannot tell whether the session finished/);
   entry.metadataWindow = meta.coverage;
   entry.starts = { whole: false, starts: [] };
-  await refuse(/unavailable/);
+  await refuse(/cannot tell whether the session finished/);
   entry.starts = undefined;
-  await refuse(/unavailable/);
+  await refuse(/cannot tell whether the session finished/);
   entry.starts = readSessionTurnStarts(file);
   provider.titles.clear();
-  await refuse(/unavailable/);
+  await refuse(/cannot tell whether the session finished/);
   provider.titles.set(file, entry);
   visible = false;
   assert.deepEqual([row().facts, row().runStatus, row().attention], ['current', 'none', 'unknown']);
-  await refuse(/unavailable/);
+  await refuse(/Arc panel is hidden/);
   visible = true;
   provider.running.add('claude:empty');
   await refuse(/running or needs input/);
@@ -3769,8 +3770,8 @@ test('current whole-file facts archive a listed session with no turn, refuse una
     error: false,
     interrupted: false,
   };
-  for (const [unreadable, state] of [
-    [() => (visible = true), ['unknown', 'unknown', 'stale']],
+  for (const [unreadable, state, refusal] of [
+    [() => (visible = true), ['unknown', 'unknown', 'stale'], ARCHIVE_COMPLETION_UNAVAILABLE],
     [
       () => {
         visible = false;
@@ -3779,6 +3780,7 @@ test('current whole-file facts archive a listed session with no turn, refuse una
         entry.outcome = finished;
       },
       ['done', 'unknown', 'current'],
+      'The Arc panel is hidden, so Arc cannot see whether the session needs input. Show Arc and retry. Use --force only when the reader asked to archive this session or its finished set.',
     ],
   ] as const) {
     assert.equal(
@@ -3789,10 +3791,7 @@ test('current whole-file facts archive a listed session with no turn, refuse una
     unreadable();
     assert.deepEqual([row().runStatus, row().attention, row().facts], state);
     const refused = await provider.handleSessionRequest(request);
-    assert.deepEqual(
-      [refused.status, refused.reason],
-      ['refused', 'The session state is unavailable. Show Arc and retry.'],
-    );
+    assert.deepEqual([refused.status, refused.reason], ['refused', refusal]);
     assert.equal(provider.hidden.has('empty'), false);
     saves.length = 0;
     const result = await provider.handleSessionRequest(forced);
@@ -3994,7 +3993,7 @@ test('window setups advertise launchable keys and exact choices while unavailabl
     provider.handleSessionRequest({ method: 'start', requester: null, params: { prompt: 'review', setup } });
   for (const row of listing.setups) {
     const setup = { kind: 'row' as const, key: row.key };
-    if (row.missingValue) await assert.rejects(start(setup), /unavailable/);
+    if (row.missingValue) await assert.rejects(start(setup), /does not offer that setup/);
     else {
       await start(setup);
       assert.deepEqual(delivered.at(-1), launcherProfile(view, setup));
@@ -4019,13 +4018,13 @@ test('window setups advertise launchable keys and exact choices while unavailabl
   await start({ kind: 'custom', ...profile, model: 'opus[1m]' });
   assert.equal(delivered.at(-1)?.model, 'opus[1m]');
   const count = delivered.length;
-  await assert.rejects(start({ kind: 'custom', ...profile, effort: 'low' }), /unavailable/);
+  await assert.rejects(start({ kind: 'custom', ...profile, effort: 'low' }), /does not offer that setup/);
   view = { ...view, inherited: { ...view.primary!, key: 'current', profile: { ...profile, model: 'retired' } } };
   view.primary = view.inherited;
   const unavailable = await provider.handleSessionRequest({ method: 'setups', params: {}, requester: null });
   assert.equal(unavailable.primary, 'current');
   assert.equal(unavailable.setups[0].missingValue, 'model');
-  await assert.rejects(start({ kind: 'row', key: 'current' }), /unavailable/);
+  await assert.rejects(start({ kind: 'row', key: 'current' }), /does not offer that setup/);
   view = sessionLauncherView(null, [profile], {}, [], {}, ['claude']);
   provider.pendingModels = ['claude'];
   const pending = await provider.handleSessionRequest({ method: 'setups', params: {}, requester: null });
@@ -4168,8 +4167,26 @@ test('window starts adopt both providers and classifications without changing th
           ...request,
           params: { ...request.params, setup: { kind: 'custom', ...profile, model: 'unknown' } },
         }),
-        /unavailable/,
+        /does not offer that setup\. Run arc setups/,
       );
+      const refusedWith = async (patch: Record<string, unknown>, pattern: RegExp) => {
+        const held = Object.fromEntries(Object.keys(patch).map((key) => [key, provider[key]]));
+        Object.assign(provider, patch);
+        try {
+          await assert.rejects(provider.handleSessionRequest(request), pattern);
+        } finally {
+          Object.assign(provider, held);
+        }
+      };
+      await refusedWith({ disposed: true }, /window is closed\. Run arc windows/);
+      await refusedWith({ folders: () => [] }, /no folder open/);
+      await refusedWith(
+        { repositoryScope: { snapshot: () => ({ ready: false, roots: [], revision: 1 }) } },
+        /still loading this window's folders/,
+      );
+      await refusedWith({ readyHosts: new Set() }, /panel is not open in this window/);
+      await refusedWith({ setupProject: null }, /not loaded this window's setups/);
+      await refusedWith({ pendingModels: [agent] }, /still loading that provider's models\. Run arc setups/);
       assert.equal(calls, 1);
       assert.equal(
         messages.some((message) => message.type === 'labelsChanged'),
@@ -4456,8 +4473,15 @@ test('scoped curation awaits saves, rechecks archive at apply, rolls back refusa
   for (const sessionId of ['unknown', 'outside'])
     await assert.rejects(
       provider.handleSessionRequest({ ...request, params: { ...request.params, sessionId } }),
-      /unknown or ambiguous/,
+      /lists no single session with that ID\. Copy a complete ID from arc sessions/,
     );
+  const listed = provider.authoritativeCatalog;
+  provider.authoritativeCatalog = null;
+  await assert.rejects(
+    provider.handleSessionRequest(request),
+    /not finished listing this window's sessions\. Run arc sessions/,
+  );
+  provider.authoritativeCatalog = listed;
   row = { ...row, runStatus: 'done', attention: 'unread' };
   assert.equal(
     (await provider.handleSessionRequest({ ...request, params: { ...request.params, action: 'archive' } })).status,
@@ -4514,6 +4538,16 @@ test('scoped curation awaits saves, rechecks archive at apply, rolls back refusa
     assert.doesNotMatch(result.reason, /--force/);
   }
   assert.equal(provider.hidden.has('known'), false);
+  // A catalog match with no listing row refuses archive with a neutral message.
+  const catalogRequest = provider.readSessionRequest;
+  provider.readSessionRequest = () => ({ sessions: [] });
+  const unlisted = await provider.handleSessionRequest({
+    ...request,
+    params: { ...request.params, action: 'archive', force: true },
+  });
+  assert.equal(unlisted.status, 'refused');
+  assert.equal(unlisted.reason, 'Arc has no listing for that session. List the session again and retry.');
+  provider.readSessionRequest = catalogRequest;
   // A forced archive rechecks admission when it applies, after the earlier save settles.
   provider.memento.update = () => {
     writes++;
@@ -33003,7 +33037,11 @@ test.each(['resolve', 'reject'])(
         assert.ok(request, 'the fresh pin request is invalid');
         return requests.run(request.id, request, () => provider.handleSessionRequest(request));
       };
-      await assert.rejects(curate(), /unknown or ambiguous/, 'delivery alone admitted an uncatalogued session');
+      await assert.rejects(
+        curate(),
+        /(lists no single session with that ID|not finished listing)/,
+        'delivery alone admitted an uncatalogued session',
+      );
       const publication = statementFrom(
         panelHostSource,
         panelHostSource.indexOf('if (!selectedOnly && !metadataAfterRender) {'),

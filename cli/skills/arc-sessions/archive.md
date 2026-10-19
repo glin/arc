@@ -1,0 +1,12 @@
+# Curate a bounded set
+
+Read this before labelling, pinning, or archiving a set of sessions.
+
+1. Start with `arc sessions --window WINDOW_ID --json`. List every page as [List sessions](SKILL.md#list-sessions) describes. When Arc refuses the cursor, discard the rows from that listing and restart once without `--cursor`. Listing changes no state, so retry the same cursor once after a timeout or an unavailable catalog. Then rank known Needs input and unread work before idle sessions. Preserve unknown, stale, and incomplete facts.
+2. Bounded reads leave reader attention unchanged.
+3. Curation accepts an explicit identical-payload retry with the same request ID in the same activation. The commands are `arc label add|remove SESSION_ID --label NAME`, `arc pin SESSION_ID`, `arc unpin SESSION_ID`, and `arc archive SESSION_ID`. Each takes `--dry-run`, `--window`, `--request-id`, and `--json`. Pass `--force` on the dry run of an archive that needs it, because the dry run applies the same archive refusals as the real action. A dry run does not check whether a later save will succeed.
+4. Establish a bounded set from the reader's request and scoped session identities. Establish completion or inactivity from a fresh scoped listing with `facts: current` and `runStatus: done` or `runStatus: none`. Completed turns from `arc session` alone do not establish current run status. When that evidence establishes completion, the force authority in [Manage a bounded set](SKILL.md#manage-a-bounded-set) covers unread sessions and hidden attention. Do not ask the reader to show Arc then.
+5. Arc lists a session as `subagents` or `background` while it has no record that the work ended, and that can outlast a crashed or killed process.
+6. Arc cannot list background work in a session whose state is unavailable. If completion remains unavailable, ask the reader to show Arc and list the session again. A row that still reads `unknown` with Arc shown can hide a resumed subagent or a long background command. Before you force it, ask the reader whether the session still runs a subagent or a long background command. Arc's session list shows a resumed subagent, so the reader can check the list for one. The list stops counting a background command one hour after the command starts, so it cannot show a long command.
+
+Commands curate one session at a time. Archive removes the pin and keeps the current turn and any open question. Unarchive preserves labels and reader state and leaves the session unpinned.

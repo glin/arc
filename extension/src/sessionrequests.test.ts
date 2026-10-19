@@ -69,6 +69,7 @@ vi.mock('./terminalownership.ts', async (importOriginal) => ({
   }),
 }));
 import {
+  ARCHIVE_COMPLETION_UNAVAILABLE,
   GUARDED_SEND_REASONS,
   SessionReadObservations,
   runSessionRead,
@@ -718,18 +719,32 @@ test('archive requires force for live work, completed unread work, and unavailab
   const row = { facts: 'current', runStatus: 'done', attention: 'idle' } as SessionListingRow;
   assert.equal(archiveRefusal(row, false), null);
   assert.equal(archiveRefusal({ ...row, runStatus: 'none' }, false), null);
-  assert.match(archiveRefusal({ ...row, attention: 'unread' }, false)!, /--force/);
+  assert.match(
+    archiveRefusal({ ...row, attention: 'unread' }, false)!,
+    /^The completed session is unread\. Use --force only when the reader asked to archive this session or its finished set\.$/,
+  );
   assert.equal(archiveRefusal({ ...row, attention: 'unread' }, true), null);
   const active = [
     ...(['running', 'waiting'] as const).map((runStatus) => ({ runStatus })),
     ...(['running', 'input'] as const).map((attention) => ({ attention })),
   ];
   for (const live of active) {
-    assert.match(archiveRefusal({ ...row, ...live }, false)!, /running or needs input\. Use --force/);
+    assert.match(
+      archiveRefusal({ ...row, ...live }, false)!,
+      /^The session is running or needs input\. Use --force only when the reader asked to archive this session\.$/,
+    );
     for (const facts of ['current', 'stale', 'unparsed'] as const)
       for (const attention of ['idle', 'unread', 'unknown'] as const)
         assert.equal(archiveRefusal({ ...row, attention, ...live, facts }, true), null, JSON.stringify(live));
   }
+  const HIDDEN_ATTENTION_REFUSAL =
+    'The Arc panel is hidden, so Arc cannot see whether the session needs input. Show Arc and retry. Use --force only when the reader asked to archive this session or its finished set.';
+  // An unavailable completion grants force for the single session only, after the reader confirms no subagent or long background command runs.
+  assert.equal(
+    ARCHIVE_COMPLETION_UNAVAILABLE,
+    'Arc cannot tell whether the session finished. Ask the reader to show Arc, then list the session again. Use --force only when the reader asked to archive this session and confirmed it runs no subagent or long background command.',
+  );
+  assert.doesNotMatch(ARCHIVE_COMPLETION_UNAVAILABLE, /finished set/);
   const unavailable = [
     ...(['stale', 'unparsed'] as const).flatMap((facts) =>
       (['done', 'none', 'unknown'] as const).map((runStatus) => ({ facts, runStatus })),
@@ -743,7 +758,7 @@ test('archive requires force for live work, completed unread work, and unavailab
     const label = JSON.stringify(state);
     assert.equal(
       archiveRefusal({ ...row, ...state }, false),
-      'The session state is unavailable. Show Arc and retry.',
+      Object.keys(state).join() === 'attention' ? HIDDEN_ATTENTION_REFUSAL : ARCHIVE_COMPLETION_UNAVAILABLE,
       label,
     );
     assert.equal(archiveRefusal({ ...row, ...state }, true), null, label);
@@ -760,7 +775,7 @@ test('archive refuses background subagents and background commands with and with
           const label = JSON.stringify({ runStatus, attention, facts, force });
           assert.match(
             reason ?? '',
-            /^Arc cannot tell whether background work in the session ended, and archive can end it\./,
+            /^Arc cannot tell whether background work in the session ended, and archive can end it\. Once the reader confirms the work ended, archive the session from Arc's session list\.$/,
             label,
           );
           assert.doesNotMatch(reason ?? '', /--force/, label);

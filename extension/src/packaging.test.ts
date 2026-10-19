@@ -636,12 +636,12 @@ test('the canonical session skill ships as regular exact files with independent 
   }
 });
 
-test('the session skill stays under the agent read cap and links only to files it ships', () => {
+test('the session skill stays within its per-invocation size budget and links only to files it ships', () => {
   const source = path.join(extensionRoot, '../cli/skills/arc-sessions');
   const definition = fs.readFileSync(path.join(source, 'SKILL.md'), 'utf8');
-  // A Codex skill read stops near 11,000 tokens, so the file the agent reads first stays small.
-  assert.ok(Buffer.byteLength(definition) <= 17_000, 'SKILL.md is over its 17,000 byte limit');
-  const linked = [...definition.matchAll(/\]\(([\w-]+\.md)\)/g)].map((match) => match[1]);
+  // Every invocation pays for SKILL.md in context, so the file the agent reads first stays small and detail lives in reference files.
+  assert.ok(Buffer.byteLength(definition) <= 7_000, 'SKILL.md is over its 7,000 byte limit');
+  const linked = [...definition.matchAll(/\]\(([\w-]+\.md)(?:#[^)]*)?\)/g)].map((match) => match[1]);
   assert.ok(linked.length > 0);
   for (const file of linked) assert.equal(fs.lstatSync(path.join(source, file)).isFile(), true, file);
 });
@@ -659,7 +659,10 @@ test('the bundler refuses a session skill that lacks a file its SKILL.md links',
   fs.cpSync(path.join(extensionRoot, '../cli/skills'), path.join(sourceRoot, 'cli/skills'), { recursive: true });
   const { bundledTools } = await import(pathToFileURL(path.join(extensionRoot, 'scripts/bundled-tools.mjs')).href);
   assert.ok(bundledTools(dist, sourceRoot, {}).identity.files['skills/arc-sessions/compaction.md']);
-  fs.rmSync(path.join(sourceRoot, 'cli/skills/arc-sessions/compaction.md'));
+  const linkedFile = path.join(sourceRoot, 'cli/skills/arc-sessions/compaction.md');
+  fs.rmSync(linkedFile);
+  assert.throws(() => bundledTools(dist, sourceRoot, {}), /lacks compaction\.md/);
+  fs.mkdirSync(linkedFile);
   assert.throws(() => bundledTools(dist, sourceRoot, {}), /lacks compaction\.md/);
 });
 

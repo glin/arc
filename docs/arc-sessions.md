@@ -122,15 +122,15 @@ arc CLI <--- local channel ---> Selected ready Arc window
 4. Start each session through `arc start`. Save accepted session IDs and preserve uncertain request IDs without launching replacements.
 5. Arc's adapters run the native CLIs. Arc reads Claude transcripts and Codex rollouts for recorded turns. The panel shows live process activity, and session listings show live run status.
 6. Read recorded turns through `arc session`. Report each session's result and recorded settings without changing reader attention.
-7. To continue a session the coordinator started, prepare the follow-up from the newest `arc session --json` reply. Send it through `arc send` with that reply's `observation`. After an `unknown` result, report it and send that session nothing more.
-8. Apply only authorized labels and pins, using `--dry-run` first. Archive only authorized sessions. Running, Needs input, unread completed, and unavailable-state sessions refuse archive without `--force`. Pass `--force` for a running, Needs input, or unavailable-state session only when the reader explicitly asked to archive that session. A session whose listing reports background work refuses archive even with `--force`. Archive removes the pin. [Session management](cli.md#session-management) owns what a forced archive admits and keeps.
+7. To continue a session the coordinator started, follow the skill's [follow-up rules](../cli/skills/arc-sessions/followup.md).
+8. Apply only authorized labels and pins, using `--dry-run` first. Archive only sessions that the skill's [archive authority](../cli/skills/arc-sessions/SKILL.md#manage-a-bounded-set) covers. [Session management](cli.md#session-management) owns what a forced archive admits and keeps.
 9. Leave the requested continuation session available. The reader opens it and sends the next prompt through its Prompt box.
 
 `arc start --arc-dispatch` emits the parent-link receipt for `accepted` and `accepted-with-errors` results that include a session ID. Basic starts require no personal dispatch script. Personal dispatch workflow receipts link sessions. Personal dispatch workflows own durable callback claim/ack outside Arc to track callback ownership and acknowledgement. The receipt does not provide that state. Arc supplies neither detached callbacks nor a cross-provider peer inbox.
 
-Python and shell coordinators both invoke the same CLI. Reader-requested starts keep reader ownership by default. Use `--agent-run` for delegated work. Run `arc --help` and `arc COMMAND --help` for command syntax. [CLI contracts](cli-reference.md) define delivery outcomes and session data. [Session management](cli.md#session-management) explains archive rules and uncertain launches.
+Python and shell coordinators both invoke the same CLI. The skill's [command rules](../cli/skills/arc-sessions/SKILL.md#select-the-command) own reader ownership and `--agent-run`. Run `arc --help` and `arc COMMAND --help` for command syntax. [CLI contracts](cli-reference.md) define delivery outcomes and session data. [Session management](cli.md#session-management) explains archive rules and uncertain launches.
 
-Read each result before describing it. Recorded model and effort establish execution settings, while a requested setup only establishes what the caller selected. Keep a session available for reader continuation when that is part of the task.
+The skill's [delivery rules](../cli/skills/arc-sessions/SKILL.md#interpret-delivery) define what a result establishes. Keep a session available for reader continuation when that is part of the task.
 
 Personal `ship` and `dispatch` skills define their own implementation and review workflows. Arc does not package them. The session skill does not automatically review changes, send corrections, rotate coordinator context, or supervise workers continuously. `arc send` delivers one follow-up that the coordinator prepared to a session the coordinator started. [Session management](cli.md#session-management) owns when Arc accepts it.
 
@@ -211,19 +211,7 @@ Hidden or unavailable attention refuses archive without `--force`. Leave the Cod
 
 ## Session cost reports
 
-Arc supplies raw session and cost data. The agent assembles any report by label, parent, or time. Arc has no report dashboard, label accounting, or report schedule.
-
-`arc cost` reads Claude and Codex transcripts from disk and needs no running window. It searches every project and Codex store, not the window's repository scope. List every page first. Then read each listed row once by its exact path:
-
-```text
-arc cost PATH --since START --until END --by-model --json
-```
-
-Take each row's `parent` subtotal. Add each `children[]` entry whose file is not a listed `path`, once across the whole report. These unlisted children include Codex guardian threads and linked print sessions. A child transcript that is also a listed row counts only through its own row. A row's `parent` link appears when Arc knows the edge. The agent chooses whether a child's cost joins its parent's labels. A row whose `path` is `null`, or whose cost read fails, is an explicit unknown cost.
-
-Use an explicit timezone and a half-open interval of request times. Include sessions with requests in that interval, even when they started earlier. Do not select sessions by last activity or creation date alone.
-
-Labels are the reader's current labels, not the labels a session had during the interval. A session with more than one label needs an accounting rule for that report. Keep unlabelled work visible. Keep null full totals, known priced subtotals, legacy estimates, model gaps, and request coverage as Arc reports them. List-price estimates are not subscription charges.
+Arc supplies raw session and cost data. The agent assembles any report by label, parent, or time. Arc has no report dashboard, label accounting, or report schedule. The skill's [cost rules](../cli/skills/arc-sessions/costs.md) define pagination, child costs, intervals, and label accounting.
 
 ## Cache expiry and handoff
 
@@ -233,4 +221,4 @@ A coordinator's handoff must retain the selected window, accepted session IDs, r
 
 ## Read acknowledgments
 
-The session-management skill requires explicit reader authority before marking a bounded set read. Agents read the delivered completed turns and acknowledge only that projection. [CLI read acknowledgments](cli-reference.md#read-acknowledgments) define receipt, retry, source-change, and publication behavior.
+The skill's [read rules](../cli/skills/arc-sessions/read.md) define the reader authority that marking a bounded set read requires. [CLI read acknowledgments](cli-reference.md#read-acknowledgments) define receipt, retry, source-change, and publication behavior.

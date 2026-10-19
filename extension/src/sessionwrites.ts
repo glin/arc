@@ -206,6 +206,9 @@ export class SessionWriteRequests {
   }
 }
 
+export const ARCHIVE_COMPLETION_UNAVAILABLE =
+  'Arc cannot tell whether the session finished. Ask the reader to show Arc, then list the session again. Use --force only when the reader asked to archive this session and confirmed it runs no subagent or long background command.';
+
 // Current no-turn rows use the same archive checks as completed turns.
 // Rows listed as subagents or background refuse archive even with force. The listing reports them while Arc has
 // no end record for that work. The CLI reports idle while that work runs, so archive retirement can end the
@@ -215,12 +218,18 @@ export class SessionWriteRequests {
 // Archive keeps the current turn and open asks, and retirement waits for both to settle.
 export function archiveRefusal(row: SessionListingRow, force: boolean): string | null {
   if (row.runStatus === 'subagents' || row.runStatus === 'background')
-    return 'Arc cannot tell whether background work in the session ended, and archive can end it.';
+    return "Arc cannot tell whether background work in the session ended, and archive can end it. Once the reader confirms the work ended, archive the session from Arc's session list.";
   if (['running', 'waiting'].includes(row.runStatus) || ['running', 'input'].includes(row.attention))
-    return force ? null : 'The session is running or needs input. Use --force to archive it.';
-  if (row.facts !== 'current' || row.attention === 'unknown' || row.runStatus === 'unknown')
-    return force ? null : 'The session state is unavailable. Show Arc and retry.';
-  if (row.attention === 'unread' && !force) return 'The completed session is unread. Use --force to archive it.';
+    return force
+      ? null
+      : 'The session is running or needs input. Use --force only when the reader asked to archive this session.';
+  if (row.facts !== 'current' || row.runStatus === 'unknown') return force ? null : ARCHIVE_COMPLETION_UNAVAILABLE;
+  if (row.attention === 'unknown')
+    return force
+      ? null
+      : 'The Arc panel is hidden, so Arc cannot see whether the session needs input. Show Arc and retry. Use --force only when the reader asked to archive this session or its finished set.';
+  if (row.attention === 'unread' && !force)
+    return 'The completed session is unread. Use --force only when the reader asked to archive this session or its finished set.';
   return null;
 }
 

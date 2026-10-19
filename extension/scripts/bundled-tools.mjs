@@ -38,7 +38,8 @@ export function bundledTools(dist, sourceRoot, build) {
   visit(skills, '', 'skills/arc-sessions', '../cli/skills/arc-sessions');
   const definition = fs.readFileSync(path.join(skills, 'SKILL.md'), 'utf8');
   for (const [, reference] of definition.matchAll(/\]\(([\w-]+\.md)(?:#[^)]*)?\)/g))
-    if (!fs.existsSync(path.join(skills, reference))) throw new Error(`The session skill lacks ${reference}.`);
+    if (!fs.lstatSync(path.join(skills, reference), { throwIfNoEntry: false })?.isFile())
+      throw new Error(`The session skill lacks ${reference}.`);
   copy(path.join(plugin, 'LICENSE'), 'plugin/LICENSE');
   const launchers = {
     arc: '#!/bin/sh\nELECTRON_RUN_AS_NODE=1 exec "$ARC_EDITOR_EXECUTABLE" "${0%/*}/../cli/arc.cjs" "$@"\n',

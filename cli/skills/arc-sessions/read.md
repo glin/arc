@@ -10,6 +10,6 @@ For a supporting window, read each authorized session with `arc session SESSION_
 arc read SESSION_ID --observation READ_OBSERVATION --request-id WINDOW_ID:UUID --window WINDOW_ID --json
 ```
 
-Use `--dry-run` to check admission without saving. Use a different request ID for the later applied action. Preserve identical-payload retry rules from [Interpret delivery](SKILL.md#interpret-delivery). Report `applied`, `dry-run`, `refused`, or `unknown` exactly. Preserve the selected window and request ID after an unknown outcome.
+Use `--dry-run` to check admission without saving. Use a different request ID for the later applied action. Report `applied`, `dry-run`, `refused`, or `unknown` exactly. Preserve the selected window and request ID after an unknown outcome.
 
 Acknowledgment covers only the delivered completed projection. It does not establish full transcript consumption or complete history. Omitted and later work stays outside that acknowledgment. A changed source invalidates its acknowledgment, including an append. After a stale refusal, read again and use a fresh request ID for the new receipt. After an unknown outcome, retry only the identical payload with the same request ID. Never change the ID for that uncertainty retry. Marking read sends no prompt and changes no archive membership, label, or pin.
