@@ -18094,7 +18094,7 @@ function methodBody(marker: string): string {
   assert.ok(body !== undefined, `${marker} has no body this guard can read`);
   const extracted = body.slice(1, -1);
   if (marker === 'private allSessions(') {
-    return `const codexEnumeration = arguments[2];
+    return `const codexEnumeration = arguments[2]; const deferWalk = arguments[3];
       this.walkedSessions = function(roots, workspaceFolders, folderPrint, deferHumanPrompts, codexEnumeration) {
         ${methodBody('private walkedSessions(')}
       };

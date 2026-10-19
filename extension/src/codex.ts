@@ -228,11 +228,13 @@ export class CodexMetaCache {
   // Preserve any non-refusal entry `get` supplies during the read.
   // A missing record keeps its measured size. Later `get` calls retry after growth.
   // Rejected reads leave existing entries unchanged. Return true when a readable opening was added.
+  // An aborted `signal` stops each lane before its next read.
   async prime(
     files: readonly string[],
     readAsync: (file: string, buf: Buffer) => Promise<CodexSessionMeta | null> = readCodexSessionMetaAsync,
     limit = COLD_OPENING_READS,
     sizeAsync: (file: string) => Promise<number | null> = fileSizeAsync,
+    signal?: AbortSignal,
   ): Promise<boolean> {
     const missing = files.filter((file) => this.entries.get(file)?.meta === undefined);
     const before = this.changed;
@@ -240,6 +242,7 @@ export class CodexMetaCache {
     const lane = async (): Promise<void> => {
       const buf = Buffer.allocUnsafe(META_BYTES);
       while (next < missing.length) {
+        if (signal?.aborted) return;
         const file = missing[next++];
         let meta: CodexSessionMeta | null;
         try {
@@ -611,37 +614,135 @@ export function rolloutFiles(root: string): string[] {
   return enumerateRolloutFiles(root).files as string[];
 }
 
-export function enumerateRolloutFiles(root: string): SourceEnumeration {
-  const evidence: SourceEnumeration = { status: 'complete', root, directories: [], files: [], uncertain: [] };
-  const out: string[] = [];
+// The traversal policy that both drivers follow: depth-first order, `WALK_DEPTH`, the rollout
+// filter, directory evidence and uncertainty. A driver calls `collect`, reads the directory in
+// `dir` when one waits there, hands the answer to `read` or `failed`, and repeats until `complete`.
+// The walk keeps its position in an explicit stack, so a driver can await between directory reads
+// and between the entries of one directory.
+class RolloutWalk {
+  // The directory the driver reads next. It is null while entries wait for `collect`, and once the walk is complete.
+  dir: string | null;
   // `depth` counts the levels already descended, so the root itself is zero and a directory
   // is entered while that count is still under the limit.
-  const walk = (dir: string, depth: number) => {
-    let entries: fs.Dirent[] = [];
-    try {
-      entries = fs.readdirSync(dir, { withFileTypes: true });
-    } catch (error) {
-      if (depth === 0 && (error as NodeJS.ErrnoException).code === 'ENOENT') evidence.missingRoot = true;
-      else {
-        evidence.status = depth === 0 ? 'unavailable' : 'incomplete';
-        (evidence.uncertain as string[]).push(dir);
-      }
-      return;
+  private depth = 0;
+  private status: SourceEnumeration['status'] = 'complete';
+  private missingRoot = false;
+  private readonly directories: string[] = [];
+  private readonly files: string[] = [];
+  private readonly uncertain: string[] = [];
+  // Directories whose entries the walk has not finished, innermost last.
+  private readonly open: { dir: string; depth: number; entries: fs.Dirent[]; next: number }[] = [];
+
+  constructor(private readonly root: string) {
+    this.dir = root;
+  }
+
+  get complete(): boolean {
+    return this.dir === null && this.open.length === 0;
+  }
+
+  read(entries: fs.Dirent[]): void {
+    this.directories.push(this.dir!);
+    this.open.push({ dir: this.dir!, depth: this.depth, entries, next: 0 });
+    this.dir = null;
+  }
+
+  failed(error: unknown): void {
+    if (this.depth === 0 && (error as NodeJS.ErrnoException)?.code === 'ENOENT') this.missingRoot = true;
+    else {
+      this.status = this.depth === 0 ? 'unavailable' : 'incomplete';
+      this.uncertain.push(this.dir!);
     }
-    (evidence.directories as string[]).push(dir);
-    for (const entry of entries) {
-      const full = path.join(dir, entry.name);
-      if (entry.isDirectory()) {
-        if (depth < WALK_DEPTH) {
-          walk(full, depth + 1);
+    this.dir = null;
+  }
+
+  result(): SourceEnumeration {
+    const { status, root, directories, files, uncertain } = this;
+    return this.missingRoot
+      ? { status, root, directories, files, uncertain, missingRoot: true }
+      : { status, root, directories, files, uncertain };
+  }
+
+  // Collects rollouts in entry order until the next directory to descend into, which then waits
+  // in `dir`. Rollouts listed after that directory are collected once its subtree is done.
+  // Collection also stops before an entry once `pause` answers true, and the next call resumes there.
+  collect(pause?: () => boolean): void {
+    if (this.dir !== null) return;
+    const open = this.open;
+    while (open.length > 0) {
+      const top = open[open.length - 1];
+      const { dir, depth, entries } = top;
+      while (top.next < entries.length) {
+        if (pause?.()) return;
+        const entry = entries[top.next++];
+        if (entry.isDirectory()) {
+          if (depth < WALK_DEPTH) {
+            this.dir = path.join(dir, entry.name);
+            this.depth = depth + 1;
+            return;
+          }
+        } else if (entry.name.endsWith('.jsonl')) {
+          this.files.push(path.join(dir, entry.name));
         }
-      } else if (entry.name.endsWith('.jsonl')) {
-        out.push(full);
       }
+      open.pop();
     }
-  };
-  walk(root, 0);
-  return { ...evidence, files: out };
+  }
+}
+
+export function enumerateRolloutFiles(root: string): SourceEnumeration {
+  const walk = new RolloutWalk(root);
+  for (walk.collect(); !walk.complete; walk.collect()) {
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(walk.dir!, { withFileTypes: true });
+    } catch (error) {
+      walk.failed(error);
+      continue;
+    }
+    walk.read(entries);
+  }
+  return walk.result();
+}
+
+// How long the asynchronous walk works before it lets the host handle other work.
+const WALK_SLICE_MS = 4;
+
+// Walks the same policy, and yields to the event loop once a slice of `WALK_SLICE_MS` has passed.
+// It checks the time before each directory read and before each entry, so selection and other
+// messages run during the walk. One synchronous directory read cannot be interrupted. The default
+// reader is synchronous: a read on the libuv pool costs more process CPU than the read itself.
+// A canceled walk answers null, which callers must treat as no result rather than as absent rollouts.
+export async function enumerateRolloutFilesAsync(
+  root: string,
+  signal?: AbortSignal,
+  readDirectory: (dir: string) => fs.Dirent[] | Promise<fs.Dirent[]> = (dir) =>
+    fs.readdirSync(dir, { withFileTypes: true }),
+): Promise<SourceEnumeration | null> {
+  const walk = new RolloutWalk(root);
+  let slice = performance.now();
+  const due = () => performance.now() - slice >= WALK_SLICE_MS;
+  for (walk.collect(due); !walk.complete; walk.collect(due)) {
+    if (due()) {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      slice = performance.now();
+      if (signal?.aborted) return null;
+      continue;
+    }
+    if (signal?.aborted) return null;
+    let entries: fs.Dirent[];
+    try {
+      const answer = readDirectory(walk.dir!);
+      entries = answer instanceof Promise ? await answer : answer;
+    } catch (error) {
+      if (signal?.aborted) return null;
+      walk.failed(error);
+      continue;
+    }
+    if (signal?.aborted) return null;
+    walk.read(entries);
+  }
+  return walk.result();
 }
 
 // Workspace sessions and the complete walked rollout list.
@@ -747,16 +848,25 @@ export class CodexStatCache {
 }
 
 // The cold pass supplies traversal evidence and paths to its refresh, plus whether it read missing opening records.
+// A canceled pass supplies no enumeration.
 export interface ColdOpeningPass {
-  enumeration: SourceEnumeration;
+  enumeration: SourceEnumeration | null;
   walked: string[];
   read: boolean;
 }
 
-export async function coldOpeningPass(cache: CodexMetaCache, root: string): Promise<ColdOpeningPass> {
-  const enumeration = enumerateRolloutFiles(root);
+// A canceled pass answers a null enumeration and reads no opening record after the signal fires.
+// Its `read` still reports the records read before cancellation, so the caller can persist them.
+export async function coldOpeningPass(
+  cache: CodexMetaCache,
+  root: string,
+  signal?: AbortSignal,
+): Promise<ColdOpeningPass> {
+  const enumeration = await enumerateRolloutFilesAsync(root, signal);
+  if (!enumeration) return { walked: [], enumeration: null, read: false };
   const walked = [...enumeration.files];
-  return { walked, enumeration, read: await cache.prime(walked) };
+  const read = await cache.prime(walked, undefined, undefined, undefined, signal);
+  return signal?.aborted ? { walked: [], enumeration: null, read } : { walked, enumeration, read };
 }
 
 // List workspace sessions by newest activity, using each opening's recorded cwd for membership.

@@ -159,6 +159,7 @@ import {
   codexSessionFiles,
   isHiddenThread,
   coldOpeningPass,
+  enumerateRolloutFilesAsync,
   type ColdOpeningPass,
   codexSessionIndexPath,
   codexSessionsRoot,
@@ -1312,9 +1313,14 @@ export class PanelProvider implements vscode.Disposable {
   // Saves `codexMetas` into the machine's shared opening records.
   private codexOpenings: CodexOpeningsWriter | null = null;
   // The first catalog refresh primes opening metadata before listing sessions. Refresh and search requests wait for this pass.
-  private codexColdReads: (() => Promise<ColdOpeningPass>) | null = () =>
-    coldOpeningPass(this.codexMetas, codexSessionsRoot());
+  private codexColdReads: ((signal: AbortSignal) => Promise<ColdOpeningPass>) | null = (signal) =>
+    coldOpeningPass(this.codexMetas, codexSessionsRoot(), signal);
   private codexPriming: Promise<ColdOpeningPass> | null = null;
+  // The cold pass in flight. Abandoning the catalog refresh aborts it and returns `reads` to `codexColdReads`.
+  private codexColdPass: {
+    controller: AbortController;
+    reads: (signal: AbortSignal) => Promise<ColdOpeningPass>;
+  } | null = null;
   private sourceEnumerations?: { claude: SourceEnumeration; codex: SourceEnumeration };
   private membershipCoverage?: SessionCoverage;
   private physicalCoverage?: { claude: SessionCoverage; codex: SessionCoverage };
@@ -8235,18 +8241,39 @@ export class PanelProvider implements vscode.Disposable {
       if (coldReads) {
         this.codexColdReads = null;
         primed = true;
-        this.codexPriming = coldReads();
+        const coldGeneration = this.refreshGeneration;
+        const coldRoot = codexSessionsRoot();
+        // The pass owns its cancellation before it walks, because the refresh controller exists only after the pass.
+        const controller = new AbortController();
+        const cold = { controller, reads: coldReads };
+        this.codexColdPass = cold;
+        const priming = coldReads(controller.signal);
+        if (this.codexColdPass === cold) {
+          this.codexPriming = priming;
+        }
         try {
-          const pass = await this.codexPriming;
-          primedEnumeration = pass.enumeration;
+          const pass = await priming;
           // Mark cold-pass metadata for persistence because its reads precede the catalog's revision comparison.
           if (pass.read) {
             this.derivedCacheCheckpointState.markChanged(true);
           }
+          if (pass.enumeration === null) {
+            return;
+          }
+          primedEnumeration = pass.enumeration;
         } finally {
-          this.codexPriming = null;
+          // A canceled pass already handed both fields to the refresh that replaces it.
+          if (this.codexColdPass === cold) {
+            this.codexColdPass = null;
+            this.codexPriming = null;
+          }
         }
         if (!this.anyVisible()) {
+          return;
+        }
+        // An abandoned refresh, a closed last panel or a moved rollout root makes the pass's walk obsolete.
+        // Its opening reads stay cached, and the pending refresh walks the tree again.
+        if (this.refreshGeneration !== coldGeneration || coldRoot !== codexSessionsRoot()) {
           return;
         }
       }
@@ -8269,9 +8296,16 @@ export class PanelProvider implements vscode.Disposable {
         }, CATALOG_REFRESH_DEADLINE_MS);
       }
       const catalogStarted = performance.now();
+      const deferredWalk = { needed: false };
       let all = selectedOnly
         ? (this.authoritativeCatalog ?? [])
-        : this.allSessions(reuseCatalog, true, primedEnumeration);
+        : this.allSessions(reuseCatalog, true, primedEnumeration, deferredWalk);
+      // A held catalog or a supplied enumeration listed above without an await.
+      if (!selectedOnly && deferredWalk.needed) {
+        const walked = await this.walkCatalog(controller.signal, generation);
+        if (!walked) return;
+        all = walked;
+      }
       const humanPromptWork = { bytes: 0, sources: 0, reads: 0, unknown: new Set<string>() };
       if (
         selectedOnly &&
@@ -8347,13 +8381,11 @@ export class PanelProvider implements vscode.Disposable {
         if (controller.signal.aborted || generation !== this.refreshGeneration) return;
         if (changed.length) {
           for (const file of changed) this.codexStats.markChanged(path.dirname(file), path.basename(file));
-          all = await this.prepareHumanPrompts(
-            this.allSessions(false, true),
-            true,
-            controller.signal,
-            humanPromptWork,
-            generation,
-          );
+          const deferred = { needed: false };
+          let relisted: SessionFile[] | null = this.allSessions(false, true, undefined, deferred);
+          if (deferred.needed) relisted = await this.walkCatalog(controller.signal, generation);
+          if (!relisted) return;
+          all = await this.prepareHumanPrompts(relisted, true, controller.signal, humanPromptWork, generation);
           if (controller.signal.aborted || generation !== this.refreshGeneration) return;
           if (this.catalog) this.catalog = { ...this.catalog, sessions: all };
           reuseCatalog = false;
@@ -8958,6 +8990,14 @@ export class PanelProvider implements vscode.Disposable {
     this.refreshGeneration++;
     this.refreshController?.abort();
     this.refreshController = null;
+    // A canceled cold pass stops walking and reading openings. The next refresh starts the pass again instead of waiting.
+    const cold = this.codexColdPass;
+    if (cold) {
+      this.codexColdPass = null;
+      this.codexPriming = null;
+      this.codexColdReads = cold.reads;
+      cold.controller.abort();
+    }
     this.pendingRefresh = null;
     this.refreshOverdue = false;
     if (this.refreshDeadline) {
@@ -10229,11 +10269,33 @@ export class PanelProvider implements vscode.Disposable {
     }
   }
 
+  // List the catalog from an asynchronous walk of the Codex rollout tree, after held and targeted reuse missed.
+  // Selection and other messages run during the walk. The answer is null when the refresh became obsolete
+  // during the walk: canceled, superseded, hidden, or moved to another rollout root.
+  private async walkCatalog(signal: AbortSignal, generation: number): Promise<SessionFile[] | null> {
+    const root = codexSessionsRoot();
+    const enumeration = await enumerateRolloutFilesAsync(root, signal);
+    if (
+      !enumeration ||
+      signal.aborted ||
+      generation !== this.refreshGeneration ||
+      !this.anyVisible() ||
+      codexSessionsRoot() !== root
+    ) {
+      return null;
+    }
+    // Scope resolves again after the walk. A scope that became unresolved lists nothing and discards the walk.
+    return this.allSessions(false, true, enumeration);
+  }
+
   // Enumerate Claude and Codex sessions in repository scope. Accepted metadata supplies the catalog's recorded-activity order.
+  // With `deferWalk`, a missed reuse that has no supplied Codex enumeration sets `deferWalk.needed` and lists
+  // nothing, so the caller can walk the rollout tree asynchronously.
   private allSessions(
     reuseCatalog = false,
     deferHumanPrompts = false,
     codexEnumeration?: SourceEnumeration,
+    deferWalk?: { needed: boolean },
   ): SessionFile[] {
     const workspaceFolders = this.folders();
     const scope = this.repositoryScope.snapshot(workspaceFolders);
@@ -10289,6 +10351,10 @@ export class PanelProvider implements vscode.Disposable {
         this.catalogWalked = false;
         return sorted;
       }
+    }
+    if (deferWalk && !codexEnumeration) {
+      deferWalk.needed = true;
+      return [];
     }
     return this.walkedSessions(scope.roots, workspaceFolders, folderPrint, deferHumanPrompts, codexEnumeration);
   }
@@ -12368,7 +12434,12 @@ export class PanelProvider implements vscode.Disposable {
       const waiting = { sessionId, controller: new AbortController(), generation: ++this.historyGeneration };
       this.historyRequest = waiting;
       void this.refresh(true, true, true, true);
-      await priming.catch(() => undefined);
+      // A canceled pass hands over to the pass that replaces it.
+      let current = this.codexPriming;
+      while (current) {
+        await current.catch(() => undefined);
+        current = this.codexPriming === current ? null : this.codexPriming;
+      }
       if (this.historyRequest !== waiting) {
         return;
       }
@@ -13839,14 +13910,20 @@ export class PanelProvider implements vscode.Disposable {
           const priming = this.codexPriming;
           if (priming) {
             this.waitingSearch = query;
-            void priming
-              .catch(() => undefined)
-              .then(() => {
-                if (this.waitingSearch === query) {
-                  this.waitingSearch = null;
-                  this.answerSearch(query, msg.retained);
-                }
-              });
+            // A canceled pass hands over to the pass that replaces it.
+            const settled = async () => {
+              let current = this.codexPriming;
+              while (current) {
+                await current.catch(() => undefined);
+                current = this.codexPriming === current ? null : this.codexPriming;
+              }
+            };
+            void settled().then(() => {
+              if (this.waitingSearch === query) {
+                this.waitingSearch = null;
+                this.answerSearch(query, msg.retained);
+              }
+            });
             return;
           }
           this.answerSearch(query, msg.retained);

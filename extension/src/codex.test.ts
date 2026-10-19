@@ -56,7 +56,7 @@ test.each(['claude', 'codex'] as const)(
     assert.equal(read(), null, 'an oversized opening bypassed the byte limit');
   },
 );
-import { enumerateRolloutFiles } from './codex';
+import { enumerateRolloutFiles, enumerateRolloutFilesAsync } from './codex';
 import { revisionOf, readQualifiedSessionCwd } from './transcript';
 // extension/src/codex.test.ts
 import { afterAll, afterEach, beforeAll, describe, test, vi } from 'vitest';
@@ -17274,6 +17274,167 @@ test('Codex enumeration retains unread subtree uncertainty and distinguishes mis
     failure.mockRestore();
     syncBuiltinESMExports();
   }
+});
+
+test('asynchronous Codex enumeration matches the synchronous walk for every traversal outcome', async () => {
+  const root = tempDir('codex-enumeration-async-');
+  const write = (relative: string) => {
+    const file = path.join(root, ...relative.split('/'));
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, '{}\n');
+  };
+  for (const relative of [
+    'rollout-root.jsonl',
+    '2026/rollout-Mixed-Case.jsonl',
+    '2026/upper.JSONL',
+    '2026/notes.txt',
+    '2026/10/16/rollout-a.jsonl',
+    '2026/10/16/rollout-b.jsonl',
+    '2026/10/16/deep/rollout-depth-four.jsonl',
+    '2026/10/16/deep/deeper/rollout-beyond-depth.jsonl',
+    '2026/10/17/blocked/rollout-unread.jsonl',
+    '2025/12/01/rollout-c.jsonl',
+  ])
+    write(relative);
+  const blocked = path.join(root, '2026', '10', '17', 'blocked');
+  const native = createRequire(__filename)('node:fs') as typeof fs;
+  const read = native.readdirSync;
+  const fails = (target: string) =>
+    target === blocked ? Object.assign(new Error('unread subtree'), { code: 'EACCES' }) : null;
+  const asyncRead = (target: string) => {
+    const error = fails(target);
+    return error ? Promise.reject(error) : fs.promises.readdir(target, { withFileTypes: true });
+  };
+  const spy = vi.spyOn(native, 'readdirSync').mockImplementation(((target: fs.PathLike, ...args: any[]) => {
+    const error = fails(String(target));
+    if (error) throw error;
+    return (read as any)(target, ...args);
+  }) as typeof fs.readdirSync);
+  syncBuiltinESMExports();
+  let synchronous: ReturnType<typeof enumerateRolloutFiles>;
+  try {
+    synchronous = enumerateRolloutFiles(root);
+  } finally {
+    spy.mockRestore();
+    syncBuiltinESMExports();
+  }
+  // A plain recursive walk: a subdirectory's rollouts come before the rollouts listed after it.
+  const reference = {
+    status: 'incomplete',
+    root,
+    directories: [] as string[],
+    files: [] as string[],
+    uncertain: [] as string[],
+  };
+  const visit = (dir: string, depth: number) => {
+    if (fails(dir)) {
+      reference.uncertain.push(dir);
+      return;
+    }
+    reference.directories.push(dir);
+    for (const entry of read(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        if (depth < 4) visit(full, depth + 1);
+      } else if (entry.name.endsWith('.jsonl')) reference.files.push(full);
+    }
+  };
+  visit(root, 0);
+  assert.deepEqual(synchronous, reference, 'the synchronous walk changed order, filtering, depth or evidence');
+  const asynchronous = await enumerateRolloutFilesAsync(root, undefined, asyncRead);
+  assert.deepEqual(asynchronous, synchronous, 'the asynchronous walk changed order, filtering, depth or evidence');
+  assert.equal(synchronous.status, 'incomplete');
+  assert.deepEqual(synchronous.uncertain, [blocked]);
+  const names = synchronous.files.map((file) => path.basename(file));
+  assert.ok(names.includes('rollout-depth-four.jsonl') && names.includes('rollout-Mixed-Case.jsonl'));
+  assert.ok(!names.includes('rollout-beyond-depth.jsonl'), 'the walk descended past its depth limit');
+  assert.ok(!names.includes('upper.JSONL'), 'the rollout filter matched another letter case');
+  assert.deepEqual(await enumerateRolloutFilesAsync(root), enumerateRolloutFiles(root));
+  const missing = path.join(root, 'missing');
+  assert.deepEqual(await enumerateRolloutFilesAsync(missing), enumerateRolloutFiles(missing));
+  assert.equal((await enumerateRolloutFilesAsync(missing))?.missingRoot, true);
+  const unavailable = await enumerateRolloutFilesAsync(root, undefined, () =>
+    Promise.reject(Object.assign(new Error('I/O failure'), { code: 'EIO' })),
+  );
+  assert.equal(unavailable?.status, 'unavailable');
+  assert.equal(unavailable?.missingRoot, undefined);
+});
+
+test('the asynchronous Codex walk lets other work run between directory reads once its slice has passed', async () => {
+  const root = tempDir('codex-enumeration-yield-');
+  fs.mkdirSync(path.join(root, '2026', '10', '16'), { recursive: true });
+  fs.writeFileSync(path.join(root, '2026', '10', '16', 'rollout-a.jsonl'), '{}\n');
+  let now = 0;
+  const clock = vi.spyOn(performance, 'now').mockImplementation(() => now);
+  const order: string[] = [];
+  try {
+    const walk = enumerateRolloutFilesAsync(root, undefined, (directory) => {
+      order.push('read');
+      now += 1000;
+      return fs.readdirSync(directory, { withFileTypes: true });
+    });
+    setImmediate(() => order.push('other'));
+    assert.equal((await walk)?.files.length, 1);
+  } finally {
+    clock.mockRestore();
+  }
+  assert.equal(order.filter((step) => step === 'read').length, 4);
+  const other = order.indexOf('other');
+  assert.ok(other !== -1 && other < order.lastIndexOf('read'), 'the walk read every directory before other work ran');
+});
+
+test('the asynchronous Codex walk lets other work run between the entries of one wide directory', async () => {
+  const root = tempDir('codex-enumeration-wide-');
+  let now = 0;
+  const clock = vi.spyOn(performance, 'now').mockImplementation(() => now);
+  const order: string[] = [];
+  // Each entry spends a millisecond, so the entries of the root alone outlast several slices.
+  const entries = Array.from({ length: 20 }, (_, index) => ({
+    name: `rollout-${index}.jsonl`,
+    isDirectory: () => {
+      order.push('entry');
+      now += 1;
+      return false;
+    },
+  })) as unknown as fs.Dirent[];
+  try {
+    const walk = enumerateRolloutFilesAsync(root, undefined, () => entries);
+    setImmediate(() => order.push('other'));
+    assert.equal((await walk)?.files.length, entries.length);
+  } finally {
+    clock.mockRestore();
+  }
+  const other = order.indexOf('other');
+  assert.ok(
+    other !== -1 && other < order.lastIndexOf('entry'),
+    'the walk processed every entry of one directory before other work ran',
+  );
+});
+
+test('a canceled asynchronous Codex enumeration answers no result while a directory read is pending', async () => {
+  const root = tempDir('codex-enumeration-cancel-');
+  fs.mkdirSync(path.join(root, '2026'));
+  fs.writeFileSync(path.join(root, '2026', 'rollout-a.jsonl'), '{}\n');
+  const controller = new AbortController();
+  const pending: { directory: string; release: () => void }[] = [];
+  const walk = enumerateRolloutFilesAsync(
+    root,
+    controller.signal,
+    (directory) =>
+      new Promise((resolve, reject) => {
+        pending.push({
+          directory,
+          release: () => void fs.promises.readdir(directory, { withFileTypes: true }).then(resolve, reject),
+        });
+      }),
+  );
+  await vi.waitFor(() => assert.equal(pending.length, 1, 'the walk never requested the root directory'));
+  pending[0].release();
+  await vi.waitFor(() => assert.equal(pending.length, 2, 'the walk never requested the subdirectory'));
+  controller.abort();
+  pending[1].release();
+  assert.equal(await walk, null, 'a canceled walk reported an answer that callers could read as absence');
+  assert.equal(pending.length, 2, 'a canceled walk kept reading directories');
 });
 
 test('Codex unavailable openings and stats leave admitted membership incomplete', () => {

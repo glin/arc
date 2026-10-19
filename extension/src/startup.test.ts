@@ -32,6 +32,7 @@ import {
   readRolloutStat,
   readCodexSessionTitlePair,
   coldOpeningPass,
+  enumerateRolloutFilesAsync,
   codexSubagentFor,
   codexTitleFor,
   codexAgentSpendVersion,
@@ -1186,6 +1187,7 @@ function completeDiscoveryHarness(
     sameSessionRevision,
     outcomesFor,
     replacedCatalogFiles: async () => [],
+    enumerateRolloutFilesAsync,
     ...scope,
   };
   const names = [
@@ -1236,6 +1238,7 @@ function completeDiscoveryHarness(
     );
   }
   if (names.includes('allSessions')) names.push('walkedSessions');
+  names.push('walkCatalog');
   const body = owner.members
     .filter((member) => member.name && names.includes(member.name.getText(file)))
     .map((member) => member.getText(file))
@@ -5615,6 +5618,315 @@ test('a cold handoff accepts the catalog without enumerating the rollout directo
     );
   } finally {
     provider.directoryReads?.mockRestore();
+    syncBuiltinESMExports();
+  }
+});
+
+// A real Codex listing over a temporary rollout root, with every asynchronous walk held until the test releases it.
+function heldWalkHarness(scope: Record<string, unknown> = {}) {
+  const root = tempDir('enumeration-async-');
+  const workspace = path.join(root, 'project');
+  fs.mkdirSync(workspace);
+  const writeRollout = (id: string) => {
+    const file = path.join(root, `rollout-${id}.jsonl`);
+    fs.writeFileSync(
+      file,
+      `${JSON.stringify({
+        timestamp: '2026-10-01T12:00:00.000Z',
+        type: 'session_meta',
+        payload: { id, cwd: workspace, source: 'vscode' },
+      })}\n`,
+    );
+    return file;
+  };
+  const walks: { root: string; release: () => void }[] = [];
+  let currentRoot = root;
+  const { provider, claudeWalk } = bumpedCatalogHarness({
+    codexSessionsRoot: () => currentRoot,
+    codexSessionFiles,
+    readRolloutStat,
+    fs,
+    fileRevisionOf,
+    revalidatedCatalogPaths,
+    path,
+    enumerateRolloutFilesAsync: (walkRoot: string, signal?: AbortSignal) =>
+      new Promise((resolve) => {
+        // An asynchronous reader, so a synchronous read of the tree can only come from the synchronous driver.
+        const reader = (dir: string) => mutableFs.promises.readdir(dir, { withFileTypes: true });
+        walks.push({
+          root: walkRoot,
+          release: () => void enumerateRolloutFilesAsync(walkRoot, signal, reader).then(resolve),
+        });
+      }),
+    ...scope,
+  });
+  claudeWalk.splice(0);
+  provider.claudeChildren = [];
+  provider.codexMetas = new CodexMetaCache();
+  provider.codexStats = new CodexStatCache();
+  provider.codexColdReads = null;
+  provider.folders = () => [workspace];
+  provider.repositoryScope = { snapshot: () => ({ ready: true, roots: [workspace], revision: 1 }) };
+  provider.prepareClaudeChildren = () => {
+    provider.discoveryComplete = {
+      scope: JSON.stringify(provider.repositoryScopeRoots),
+      files: new Set(provider.catalog.sessions.map((session: SessionFile) => session.file)),
+    };
+    return Promise.resolve(true);
+  };
+  provider.prepareMetadata = () => Promise.resolve(true);
+  const files = () => provider.authoritativeCatalog?.map((session: SessionFile) => session.file).sort() ?? null;
+  const releaseAll = async (refresh: Promise<void>) => {
+    let released = 0;
+    const state = { done: false };
+    void refresh.finally(() => (state.done = true));
+    while (!state.done) {
+      await vi.waitFor(() => assert.ok(state.done || walks.length > released, 'the refresh stalled without a walk'));
+      while (walks.length > released) walks[released++].release();
+    }
+    await refresh;
+  };
+  return {
+    provider,
+    root,
+    walks,
+    files,
+    writeRollout,
+    releaseAll,
+    moveRoot: (next: string) => (currentRoot = next),
+    currentRoot: () => currentRoot,
+  };
+}
+
+test('a broad refresh lists Codex rollouts from an asynchronous walk without a synchronous directory read', async () => {
+  const { provider, root, walks, files, writeRollout } = heldWalkHarness();
+  const file = writeRollout('first');
+  const reads = vi.spyOn(mutableFs, 'readdirSync');
+  syncBuiltinESMExports();
+  try {
+    const refresh = provider.refresh(true);
+    await vi.waitFor(() => assert.equal(walks.length, 1, 'the broad refresh did not start an asynchronous walk'));
+    assert.equal(provider.authoritativeCatalog, null, 'the catalog was accepted before the walk finished');
+    walks[0].release();
+    await refresh;
+    assert.deepEqual(files(), [file]);
+    assert.equal(
+      (reads.mock.calls as unknown[][]).filter((call) => String(call[0]).startsWith(root)).length,
+      0,
+      'the broad refresh walked the rollout tree with the synchronous driver',
+    );
+  } finally {
+    reads.mockRestore();
+    syncBuiltinESMExports();
+  }
+});
+
+test.each(['canceled refresh', 'newer generation', 'hidden panel', 'changed root'])(
+  'an asynchronous walk finished after a %s never becomes the catalog',
+  async (change) => {
+    const { provider, root, walks, files, writeRollout, moveRoot } = heldWalkHarness();
+    const earlier = writeRollout('earlier');
+    const first = provider.refresh(true);
+    await vi.waitFor(() => assert.equal(walks.length, 1));
+    walks[0].release();
+    await first;
+    assert.deepEqual(files(), [earlier]);
+    const accepted = provider.authoritativeCatalog;
+    writeRollout('added');
+    const second = provider.refresh(true);
+    await vi.waitFor(() => assert.equal(walks.length, 2));
+    if (change === 'canceled refresh') provider.refreshController.abort();
+    if (change === 'newer generation') provider.refreshGeneration++;
+    if (change === 'hidden panel') provider.anyVisible = () => false;
+    if (change === 'changed root') moveRoot(path.join(root, 'elsewhere'));
+    walks[1].release();
+    await second;
+    assert.equal(provider.authoritativeCatalog, accepted, `a walk that outlived its ${change} replaced the catalog`);
+    assert.equal(walks.length, 2, `the ${change} started another walk inside the obsolete refresh`);
+  },
+);
+
+test.each(['an abandoned refresh', 'a rollout root change', 'the last panel closing and reopening'])(
+  'a cold opening pass finished after %s never becomes the catalog',
+  async (change) => {
+    const { provider, walks, files, writeRollout, moveRoot, currentRoot } = heldWalkHarness();
+    const earlier = writeRollout('earlier');
+    const held: (() => void)[] = [];
+    // The production pass reads the rollout root when it starts. The test holds its finished answer.
+    provider.codexColdReads = (signal: AbortSignal) =>
+      coldOpeningPass(provider.codexMetas, currentRoot(), signal).then(
+        (pass) => new Promise((resolve) => held.push(() => resolve(pass))),
+      );
+    let visible = true;
+    provider.anyVisible = () => visible;
+    const first = provider.refresh(true);
+    await vi.waitFor(() => assert.equal(held.length, 1, 'the cold pass did not finish its walk'));
+    let expected = [earlier, writeRollout('added')].sort();
+    if (change === 'an abandoned refresh') provider.abandonCatalogRefresh();
+    if (change === 'a rollout root change') {
+      const moved = tempDir('enumeration-moved-');
+      moveRoot(moved);
+      const file = path.join(moved, 'rollout-moved.jsonl');
+      fs.writeFileSync(
+        file,
+        `${JSON.stringify({ type: 'session_meta', payload: { id: 'moved', cwd: provider.folders()[0], source: 'vscode' } })}\n`,
+      );
+      expected = [file];
+    }
+    if (change === 'the last panel closing and reopening') {
+      visible = false;
+      provider.abandonCatalogRefresh();
+      visible = true;
+    }
+    // The trigger that follows the change waits behind the cold pass.
+    provider.refreshFrom('watch', true);
+    held[0]();
+    await first;
+    assert.equal(provider.authoritativeCatalog, null, `the cold pass finished after ${change} and became the catalog`);
+    if (change === 'a rollout root change') {
+      await vi.waitFor(() => assert.equal(walks.length, 1, 'the waiting refresh did not walk the rollout tree again'));
+      walks[0].release();
+    } else {
+      // Abandoning the refresh hands the cold pass back, so the next refresh runs it again.
+      await vi.waitFor(() =>
+        assert.equal(held.length, 2, 'the refresh after the cancellation did not start a cold pass'),
+      );
+      held[1]();
+    }
+    await vi.waitFor(() => assert.deepEqual(files(), expected));
+  },
+);
+
+test.each(['closing', 'closing and reopening'])(
+  'the last panel %s during a cold walk stops the pass before its opening reads',
+  async (change) => {
+    const { provider, root, walks, files, writeRollout } = heldWalkHarness();
+    const day = path.join(root, '2026', '10', '16');
+    fs.mkdirSync(day, { recursive: true });
+    const nested = path.join(day, 'rollout-nested.jsonl');
+    fs.writeFileSync(
+      nested,
+      `${JSON.stringify({ type: 'session_meta', payload: { id: 'nested', cwd: provider.folders()[0], source: 'vscode' } })}\n`,
+    );
+    const expected = [writeRollout('top'), nested].sort();
+    const signals: AbortSignal[] = [];
+    provider.codexColdReads = (signal: AbortSignal) => {
+      signals.push(signal);
+      return coldOpeningPass(provider.codexMetas, root, signal);
+    };
+    const primes = vi.spyOn(provider.codexMetas, 'prime');
+    let visible = true;
+    provider.anyVisible = () => visible;
+    const reads: string[] = [];
+    let readsAtClose = -1;
+    let canceled: unknown;
+    let waitedOn: unknown;
+    let reopened: Promise<void> | undefined;
+    const read = mutableFs.readdirSync;
+    // Each read spends a whole slice, so the walk yields after it. The panel closes during the yield after the second read.
+    let now = 0;
+    const clock = vi.spyOn(performance, 'now').mockImplementation(() => now);
+    const close = () => {
+      readsAtClose = reads.length;
+      canceled = provider.codexPriming;
+      visible = false;
+      provider.abandonCatalogRefresh();
+      if (change === 'closing and reopening') {
+        visible = true;
+        reopened = provider.refresh(true);
+        waitedOn = provider.codexPriming;
+      }
+    };
+    const spy = vi.spyOn(mutableFs, 'readdirSync').mockImplementation(((target: fs.PathLike, ...args: any[]) => {
+      const answer = (read as any)(target, ...args);
+      if (!String(target).startsWith(root)) return answer;
+      reads.push(String(target));
+      now += 1000;
+      if (reads.length === 2 && readsAtClose < 0) setImmediate(close);
+      return answer;
+    }) as typeof fs.readdirSync);
+    syncBuiltinESMExports();
+    try {
+      await provider.refresh(true);
+      assert.ok(readsAtClose > 0, 'the panel never closed during the cold walk');
+      if (change === 'closing') {
+        assert.equal(reads.length, readsAtClose, 'the canceled cold walk kept reading directories');
+        assert.equal(primes.mock.calls.length, 0, 'the canceled cold pass read opening records');
+        assert.equal(provider.codexPriming, null, 'the canceled cold pass still held later requests');
+        assert.ok(provider.codexColdReads, 'the canceled cold pass was not handed to the next refresh');
+        return;
+      }
+      assert.ok(waitedOn && waitedOn !== canceled, 'the reopened panel waited behind the canceled cold pass');
+      await reopened;
+      assert.deepEqual(files(), expected);
+      assert.equal(walks.length, 0, 'the reopened panel walked again after its cold pass');
+      assert.deepEqual(
+        primes.mock.calls.map((call) => call[4]),
+        [signals[1]],
+        'opening records were read by a pass other than the reopened one',
+      );
+    } finally {
+      clock.mockRestore();
+      spy.mockRestore();
+      syncBuiltinESMExports();
+    }
+  },
+);
+
+test('targeted reuse avoids the broad walk, and a failed reuse performs exactly one walk', async () => {
+  const { provider, walks, files, writeRollout, releaseAll } = heldWalkHarness();
+  const held = writeRollout('held');
+  await releaseAll(provider.refresh(true));
+  assert.equal(walks.length, 1);
+  fs.appendFileSync(held, '\n');
+  provider.targetedRefreshPaths = [held];
+  await provider.refresh(true);
+  assert.equal(walks.length, 1, 'a successful targeted refresh walked the rollout tree');
+  assert.deepEqual(files(), [held]);
+  const added = writeRollout('added');
+  provider.targetedRefreshPaths = [added];
+  await releaseAll(provider.refresh(true));
+  assert.equal(walks.length, 2, 'a failed targeted refresh did not walk exactly once');
+  assert.deepEqual(files(), [added, held].sort());
+});
+
+test('an unresolved repository scope starts no walk, and the resolved refresh walks once', async () => {
+  const { provider, walks, files, writeRollout, releaseAll } = heldWalkHarness();
+  const file = writeRollout('late');
+  let ready = false;
+  provider.repositoryScope = { snapshot: () => ({ ready, roots: [path.dirname(file)], revision: 1 }) };
+  provider.folders = () => [path.dirname(file)];
+  await provider.refresh(true);
+  assert.equal(walks.length, 0, 'an unresolved scope walked the rollout tree');
+  assert.equal(provider.authoritativeCatalog, null);
+  ready = true;
+  await releaseAll(provider.refresh(true));
+  assert.equal(walks.length, 1);
+  assert.ok(files()?.length, 'the resolved refresh accepted no catalog');
+});
+
+test('replacement recovery lists Codex rollouts through one asynchronous walk', async () => {
+  let replaced: string[] = [];
+  const { provider, root, walks, files, writeRollout, releaseAll } = heldWalkHarness({
+    replacedCatalogFiles: async () => replaced,
+  });
+  const file = writeRollout('replaced');
+  await releaseAll(provider.refresh(true));
+  assert.equal(walks.length, 1);
+  replaced = [file];
+  const reads = vi.spyOn(mutableFs, 'readdirSync');
+  syncBuiltinESMExports();
+  try {
+    await releaseAll(provider.refresh(true, true));
+    assert.equal(walks.length, 2, 'replacement recovery did not walk exactly once');
+    assert.equal(
+      (reads.mock.calls as unknown[][]).filter((call) => String(call[0]).startsWith(root)).length,
+      0,
+      'replacement recovery walked the rollout tree with the synchronous driver',
+    );
+    assert.deepEqual(files(), [file]);
+  } finally {
+    reads.mockRestore();
     syncBuiltinESMExports();
   }
 });

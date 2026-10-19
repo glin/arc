@@ -56,8 +56,8 @@
   },
   "extension/src/codex.test.ts": {
     "reason": "Real Git worktree ownership and descendant source resolution must agree with recorded Codex session relationships.",
-    "cases": 461,
-    "matricesSha256": "426bf2195df8e595b09fd4c3c30d29e21c20b5a13bf9541ed0532987eddc662c"
+    "cases": 465,
+    "matricesSha256": "84767d275283398f025956bacb622871ef2ac81f6c1341e206c233e5cb32397e"
   },
   "extension/src/derivedcache.test.ts": {
     "reason": "Independent writers and host death must preserve shared cache rows and release stale filesystem locks.",
@@ -191,8 +191,8 @@
   },
   "extension/src/startup.test.ts": {
     "reason": "Real title workers must publish recovered metadata through startup ownership and cancellation boundaries.",
-    "cases": 193,
-    "matricesSha256": "a7c3762be54b7339a9ff761ad56b1fa4e9879cb56382562eff3d9a23320f4e6a"
+    "cases": 200,
+    "matricesSha256": "477688194156018bd629407ea1de8dd1e18c81d4093e65edf9f2bc0e055d6d31"
   },
   "extension/src/store.test.ts": {
     "reason": "The real Stop hook must renew retention for useful snapshot stores without changing workspace files.",
