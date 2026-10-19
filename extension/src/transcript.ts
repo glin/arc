@@ -728,7 +728,7 @@ export interface Turn {
   contextTokens: number; // input plus cache of the turn's last real assistant message
   outputRate?: import('./outputrate').OutputRate;
   outputRateModel?: string;
-  // The interval that measured `outputRate`. Absent means the observed stream.
+  // The interval that measured a Claude `outputRate`. An absent Claude basis means the observed stream.
   outputRateBasis?: OutputRateBasis;
   responseIds?: string[];
   // A child read's response ids, kept for request timing alone. Child reads leave `responseIds` unset.

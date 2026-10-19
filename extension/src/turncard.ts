@@ -1099,8 +1099,8 @@ function costRecordList(
 }
 
 // A Claude child has no observed stream, so its own request records time it.
-function agentRateBasis(runner: AgentKind): OutputRateBasis {
-  return runner === 'claude' ? 'request' : 'stream';
+function agentRateBasis(runner: AgentKind): OutputRateBasis | undefined {
+  return runner === 'claude' ? 'request' : undefined;
 }
 
 // Unpriced children display token usage as a separate figure.
