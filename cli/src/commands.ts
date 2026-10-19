@@ -216,7 +216,7 @@ export const COMMANDS: readonly Command[] = [
         ],
         [
           '--attach',
-          'Open a reader-owned session in a supported terminal. Refuses Claude read-only and waited completion.',
+          'Open a reader-owned session in a supported terminal. Refuses Claude read-only, waited completion, and Codex --log, --output, or --report-file.',
         ],
         jsonFlag,
       ],
