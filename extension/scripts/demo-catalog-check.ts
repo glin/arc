@@ -118,8 +118,9 @@ async function main(): Promise<void> {
   for (const agent of ['codex', 'claude'] as const) {
     try {
       await check(agent);
-    } catch {
+    } catch (error) {
       console.error(`${agent}: current catalog evidence is unavailable. Snapshot freshness is unconfirmed.`);
+      console.error(`${agent}: ${error instanceof Error ? error.message : String(error)}`);
       process.exitCode = 2;
     }
   }

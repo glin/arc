@@ -1712,6 +1712,13 @@ export function demoPayload(sessionId: string): Record<string, unknown> {
     })),
     rail,
     railVariants,
+    // The session list resolves id: terms against this identity catalog.
+    queryContext: {
+      identities: rows.map((row) => ({ sessionId: row.id, agent: row.agentKey })),
+      coverage: 'complete' as const,
+      scope: 'demo',
+      revision: 'demo',
+    },
     labels: labelCounts(DEMO_LABELS),
     views: [{ id: 'review', name: 'Review', query: 'label:review', archived: false }],
     railFilters: [],

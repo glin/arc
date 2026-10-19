@@ -84,16 +84,40 @@ export function demoContextReply(
   const messages = Math.floor(used * 0.35);
   const tools = Math.floor(used * 0.38);
   const categories = [
-    { key: 'instructions', name: 'Instructions', tokens: instructions, relationship: 'used' as const },
+    {
+      key: 'instructions',
+      name: provider === 'codex' ? 'Instructions' : 'System prompt',
+      tokens: instructions,
+      relationship: 'used' as const,
+    },
     { key: 'messages', name: 'Messages', tokens: messages, relationship: 'used' as const },
-    { key: 'tools', name: 'Tool results', tokens: tools, relationship: 'used' as const },
+    {
+      key: 'tools',
+      name: provider === 'codex' ? 'Tool results' : 'System tools',
+      tokens: tools,
+      relationship: 'used' as const,
+    },
     {
       key: 'other',
-      name: provider === 'codex' ? 'Unattributed context' : 'Tool definitions',
+      name: provider === 'codex' ? 'Unattributed context' : 'Memory files',
       tokens: used - instructions - messages - tools,
       relationship: 'used' as const,
     },
   ];
+  const toolResults = Math.floor(messages * 0.3);
+  const assistantMessages = Math.floor(messages * 0.25);
+  const toolCalls = Math.floor(messages * 0.2);
+  const userMessages = Math.floor(messages * 0.15);
+  const redirected = Math.floor(messages * 0.07);
+  const messageBreakdown = {
+    toolCallTokens: toolCalls,
+    toolResultTokens: toolResults,
+    attachmentTokens: 0,
+    assistantMessageTokens: assistantMessages,
+    userMessageTokens: userMessages,
+    redirectedContextTokens: redirected,
+    unattributedTokens: messages - toolCalls - toolResults - assistantMessages - userMessages - redirected,
+  };
   const raw =
     provider === 'codex'
       ? {
@@ -114,6 +138,7 @@ export function demoContextReply(
             { name: 'Free space', tokens: Math.max(0, capacity - used - Math.floor(capacity * 0.1)), kind: 'free' },
             { name: 'Compaction buffer', tokens: Math.floor(capacity * 0.1), kind: 'buffer' },
           ],
+          messageBreakdown,
         };
   const detail = normalizeContext(raw, { ...message, provider, model, source: 'demo' }, capturedAt);
   if (!validContextDetail(detail) || detail.status !== 'available') throw new Error('Invalid demo context detail');

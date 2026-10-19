@@ -470,8 +470,16 @@ describe('read-only web demo', () => {
           else await page.locator('[data-control="picker"]').selectOption(session);
           await page.locator('.cctx').focus();
           const detail = page.locator('#composer-context-detail');
-          await expect.poll(() => detail.locator('.context-categories li').count(), { timeout: 5_000 }).toBe(4);
+          await expect.poll(() => detail.locator('.context-categories li').count(), { timeout: 5_000 }).toBe(10);
           expect(await detail.textContent()).not.toContain('Loading');
+          expect(await detail.locator('.context-messages .context-message-children li').allTextContents()).toEqual([
+            expect.stringContaining('Tool results'),
+            expect.stringContaining('Assistant messages'),
+            expect.stringContaining('Tool calls'),
+            expect.stringContaining('User messages'),
+            expect.stringContaining('Redirected context'),
+            expect.stringContaining('Unattributed'),
+          ]);
           if (process.env.ARC_DEMO_SHOTS) {
             fs.mkdirSync(process.env.ARC_DEMO_SHOTS, { recursive: true });
             await page.screenshot({
@@ -545,6 +553,14 @@ describe('read-only web demo', () => {
     expect(await page.locator('#rail .railcard').count()).toBeGreaterThan(0);
     expect(await page.locator('[data-control="rail:arc-read-state"]').count()).toBeGreaterThan(0);
     expect(await page.locator('[data-control="rail:arc-codex-read-state"]').count()).toBe(0);
+    await page.locator('.railfilter').fill('id:arc-read-state OR id:arc-cache-run');
+    await expect
+      .poll(() =>
+        page
+          .locator('[data-control^="rail:"]')
+          .evaluateAll((rows) => [...new Set(rows.map((row) => row.getAttribute('data-control')))].sort()),
+      )
+      .toEqual(['rail:arc-cache-run', 'rail:arc-read-state']);
     await page.locator('[data-control="railclear"]').click();
     await page.locator('[data-control="railcount:running"]').click();
     expect(await page.locator('[data-control="railcount:running"]').getAttribute('aria-pressed')).toBe('true');

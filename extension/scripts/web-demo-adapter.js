@@ -120,6 +120,7 @@
     const original = sample.payloads[selected];
     deliver({
       type: 'rail',
+      queryContext: original.queryContext,
       rail: railRows(),
       labels: labelRules.labelCounts(labels),
       views,
