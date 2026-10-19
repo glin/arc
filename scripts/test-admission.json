@@ -35,9 +35,9 @@
     "matricesSha256": "ee41bd99bc78c90d9caa53af20ec903968f2860939812170f9d5a393eede6a0c"
   },
   "extension/src/agenthost.test.ts": {
-    "reason": "A spawned agent must receive the activation window, editor executable, and command search path.",
-    "cases": 276,
-    "matricesSha256": "ce8ad53ad69350279fdb4c555840c5165003abcd6dc6dd76479cdeca8bab74ec"
+    "reason": "A spawned agent must receive the activation window, editor executable, and command search path. Self-compaction crosses captured completion and workspace scope recovery.",
+    "cases": 278,
+    "matricesSha256": "b5feaf61d874dd16f5e99cd3da9cf39ecc17da64735a42b90f02c06b89eaec35"
   },
   "extension/src/chrome.browser.test.ts": {
     "reason": "Panel controls must preserve native focus, keyboard handling, and browser event delivery.",

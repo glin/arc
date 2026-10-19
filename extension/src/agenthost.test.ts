@@ -1,4 +1,4 @@
-import { afterEach, test, vi } from 'vitest';
+import { afterEach, onTestFinished, test, vi } from 'vitest';
 import assert from 'node:assert';
 import { CONTEXT_FRAME_BYTES, contextFrameId } from './contextframe';
 import * as fs from 'node:fs';
@@ -65,7 +65,18 @@ test('measurement windows refuse agent processes before launch', { tags: ['subpr
   }
 });
 import { ClaudeWire, type PermissionMode } from './claudewire.ts';
-import { CompactHost, promptAsReader, routeCompactionEvent, type CompactChild } from './compactrequest.ts';
+import {
+  COMPACT_LIMITS,
+  CompactHost,
+  promptAsReader,
+  routeCompactionEvent,
+  type CompactChild,
+  type ReplyHolder,
+} from './compactrequest.ts';
+import { livePress } from './turnfixtures.ts';
+import { RepositoryScope } from './repositoryscope';
+import { sessionCoverageMember } from './sessioncoverage';
+import { revisionOf as fileRevisionOf } from './transcript';
 import { RecordedReplies } from './sessionreads.ts';
 import { CODEX_DEADLINE_MS, sandboxPolicy } from './codexwire.ts';
 import { requesterIdentity } from './sessionrequests.ts';
@@ -9485,7 +9496,19 @@ function agentStartedTurns(window: string, ids: readonly string[]) {
   });
 }
 
-function compactionThroughHost() {
+function compactionThroughHost(
+  options: {
+    holder?: ReplyHolder & {
+      noteResponseEnded?: (session: string, outcome: unknown, turnId?: number) => void;
+      flushQueue?: (session: string) => void;
+    };
+    readerWork?: (session: string) => 'none' | 'pending' | 'absent' | 'unknown';
+    now?: () => number;
+    automatic?: boolean;
+    authority?: (provider: 'claude' | 'codex', session: string) => string | null;
+    source?: (provider: 'claude' | 'codex', session: string) => string | null;
+  } = {},
+) {
   const window = 'c'.repeat(24);
   const ids = ['aaaaaaaa-1111-2222-3333-444444444444', 'bbbbbbbb-1111-2222-3333-444444444444'];
   const payload = (id: string) => ({
@@ -9497,30 +9520,43 @@ function compactionThroughHost() {
   const owners: (number | undefined)[] = [];
   const events: { kind: string; turnId: number | undefined }[] = [];
   const replies = new RecordedReplies();
-  const holder = {
+  const holder = options.holder ?? {
     noteRecordedReply: (session: string, sourceId: string, text: string, saved: () => void, wanted: () => boolean) =>
       replies.note(session, { sourceId, text, saved, wanted }),
     noteCompletedReply: () => {},
     settleRecordedReplies: () => {},
   };
   let current: CompactChild | null = null;
-  const compaction = new CompactHost<CompactChild>(window, {
-    find: (_provider, sessionId) => (current?.state().sessionId === sessionId ? current : null),
-    withActivity: async (child, work) => {
-      await work(child);
-      return undefined;
+  const compaction = new CompactHost<CompactChild>(
+    window,
+    {
+      find: (_provider, sessionId) => (current?.state().sessionId === sessionId ? current : null),
+      withActivity: (child, work) => host.withActivity(child.key, work),
+      readerWork: options.readerWork ?? (() => 'none'),
+      authority: options.authority,
+      source: options.source,
     },
-    readerWork: () => 'none',
-  });
-  const { host, children } = fakeHost(undefined, Date.now, {
+    options.now,
+  );
+  const { host, children } = fakeHost(undefined, options.now, {
     onEvent: ({ key, event, turnId }) => {
       const child = host.get(key) as unknown as (CompactChild & { startedByAgent?: (id: number) => boolean }) | null;
       if (!child) return;
       events.push({ kind: event.kind === 'native' ? event.event.kind : event.kind, turnId });
       if (event.kind === 'native' && event.event.kind === 'toolStart') owners.push(turnId);
+      if (event.kind === 'turnEnd')
+        options.holder?.noteResponseEnded?.(child.state().sessionId!, event.outcome, turnId);
       // The window's own routing, with a panel that holds recorded replies.
       routeCompactionEvent(compaction, holder, child, event, turnId);
-      if (event.kind === 'turnEnd') compaction.turnEnded(child);
+      if (event.kind === 'turnEnd') {
+        if (options.automatic) options.holder?.flushQueue?.(child.state().sessionId!);
+        compaction.turnEnded(child);
+      }
+      if (options.automatic && (event.kind === 'turnEnd' || (event.kind === 'sessionState' && event.state === 'idle')))
+        void compaction.drain(child.state().sessionId!);
+    },
+    onStateChange: (state) => {
+      if (options.automatic && !state.busy && !state.exited && state.sessionId) void compaction.drain(state.sessionId);
     },
   });
   return {
@@ -9536,6 +9572,262 @@ function compactionThroughHost() {
     setCurrent: (c: CompactChild) => (current = c),
   };
 }
+
+async function readerCompactionAfterScopeRecovery(queuedReaderInput: boolean) {
+  vi.stubGlobal('PANEL_CSS', '');
+  vi.stubGlobal('PANEL_JS', '');
+  vi.stubGlobal('PANEL_DEV_SERVER_URL', null);
+  const { PanelProvider } = await import('./panelhost.ts');
+  let now = 1_000;
+  const root = tempDir('compact-reader-scope-');
+  const cwd = path.join(root, 'project');
+  const extra = path.join(root, 'extra');
+  fs.mkdirSync(cwd);
+  fs.mkdirSync(extra);
+  const source = path.join(root, 'sess-1.jsonl');
+  fs.writeFileSync(
+    source,
+    JSON.stringify({
+      type: 'user',
+      uuid: 'reader',
+      sessionId: 'sess-1',
+      cwd,
+      message: { role: 'user', content: 'Save the handoff, then compact this session.' },
+    }) + '\n',
+  );
+  const row = {
+    file: source,
+    cwd,
+    sessionId: 'sess-1',
+    agent: 'claude' as const,
+    ...fileRevisionOf(fs.statSync(source, { bigint: true })),
+  };
+  let folders = [cwd];
+  const pendingGit: (() => void)[] = [];
+  let holdGit = false;
+  const listeners = vi.spyOn(PanelProvider.prototype as any, 'wireEditorListeners').mockImplementation(() => {});
+  const holder: any = new PanelProvider(root, { fsPath: root } as any);
+  onTestFinished(() => {
+    for (const resolve of pendingGit.splice(0)) resolve();
+    holder.dispose();
+  });
+  listeners.mockRestore();
+  Object.assign(holder, {
+    folders: () => folders,
+    anyVisible: () => false,
+    live: {},
+    queues: { 'sess-1': [] },
+    showing: 'sess-1',
+    windowStateHandler() {},
+    onSendPrompt() {},
+    stateFor() {
+      return {
+        sessionId: 'sess-1',
+        agent: 'claude',
+        settings: {},
+        queued: this.queues['sess-1'],
+        clearing: false,
+        running: session.state().busy,
+        askMode: 'bypass',
+        effectiveMode: 'bypass',
+        effectivePermissionMode: 'bypassPermissions',
+      };
+    },
+    postReply() {},
+  });
+  holder.repositoryScope.dispose();
+  holder.repositoryScope = new RepositoryScope(
+    {
+      run: async () => {
+        if (holdGit) await new Promise<void>((resolve) => pendingGit.push(resolve));
+        return null;
+      },
+    },
+    () => holder.repositoryScopeChanged(),
+    () => now,
+  );
+  holder.repositoryScope.snapshot(folders);
+  await vi.waitFor(() => assert.equal(holder.repositoryScope.snapshot(folders).ready, true));
+  function acceptCatalog() {
+    const scope = holder.repositoryScope.snapshot(folders);
+    holder.catalog = { folders: folders.join('\n') + '\0' + scope.revision, sessions: [row] };
+    holder.authoritativeCatalog = [row];
+    holder.sourceEnumerations = {
+      claude: { status: 'complete', root, files: [source], directories: [root], uncertain: [] },
+      codex: { status: 'complete', files: [], uncertain: [] },
+    };
+    holder.enumeratedAdmissionComplete = true;
+    holder.enumeratedMembers = new Set([sessionCoverageMember(row)]);
+    holder.claudeChildrenDiscovered = true;
+    holder.authoritativeCatalogScope = JSON.stringify(scope.roots);
+    holder.membershipCoverage = {
+      domain: 'admitted',
+      scope: JSON.stringify(scope.roots),
+      revision: String(holder.coverageRevision),
+      status: 'complete',
+      files: [source],
+      uncertain: [],
+      members: new Set([sessionCoverageMember(row)]),
+    };
+  }
+  acceptCatalog();
+  const through = compactionThroughHost({
+    holder,
+    now: () => now,
+    automatic: true,
+    readerWork: (id) => holder.readerWork(id),
+    authority: (agent, id) => holder.continuationAuthority(agent, id),
+    source: (agent, id) => holder.continuationSource(agent, id),
+  });
+  onTestFinished(() => {
+    through.compaction.dispose();
+    for (const child of through.children) child.exit(0);
+  });
+  holder.onScopeChange = (removed?: ReadonlySet<string>) => through.compaction.scopeChanged(removed);
+  holder.onSessionRowsRefreshed = () => through.compaction.sessionsRefreshed();
+  const opening = through.host.session('one', claudePlan(CLAUDE, { cwd, sessionId: 'sess-1' }));
+  through.children[0].answerHandshake();
+  const session = await opening;
+  through.setCurrent(session);
+  const request = through.payload(through.ids[0]);
+  const completion = fs.readFileSync(
+    path.join(__dirname, '../test/fixtures/claude-reader-completion-2.1.303.jsonl'),
+    'utf8',
+  );
+  const authority = holder.continuationAuthority('claude', 'sess-1');
+  assert.ok(authority, 'the accepted request has physical source authority');
+  let prompts = 0;
+  for (const line of completion.trim().split('\n')) {
+    const event = JSON.parse(line);
+    if (event.type === 'system' && event.subtype === 'session_state_changed' && event.state === 'running') {
+      now++;
+      await session.prompt('Save the handoff, then compact this session.', (turnId) => {
+        through.compaction.submitted(session, turnId);
+        holder.live['sess-1'] = [
+          { ...livePress({ sessionId: 'sess-1', agent: 'claude' }), at: now, ran: true, turnId },
+        ];
+      });
+      prompts++;
+    }
+    const requesting =
+      event.type === 'assistant' && event.message.content.some((block: { type: string }) => block.type === 'tool_use');
+    if (requesting) {
+      const tool = event.message.content.find((block: { type: string }) => block.type === 'tool_use');
+      tool.input.command = `arc compact request --self --after-turn --request-id ${request.requestId} --window ${through.window} --json`;
+    }
+    through.children[0].say(JSON.stringify(event) + '\n');
+    if (requesting) {
+      const admitted = through.compaction.handle({ method: 'compact-request', params: request }) as {
+        state: string;
+        turn: string;
+      };
+      assert.equal(admitted.state, 'queued');
+      assert.equal(admitted.turn, '3');
+      if (queuedReaderInput) {
+        holder.queues['sess-1'] = queueSubmissionAfter(
+          [],
+          'reader-next',
+          'Continue after the handoff.',
+          [],
+          [],
+          now,
+          false,
+          { agent: 'claude', owner: 'sess-1' },
+        );
+        holder.queuedEditReservations.add('reader-next');
+      }
+      holdGit = true;
+      folders = [cwd, extra];
+      holder.workspaceFoldersChanged();
+      folders = [cwd];
+      holder.workspaceFoldersChanged();
+      assert.equal(holder.repositoryScopeReady, false);
+    }
+  }
+  assert.equal(prompts, 3);
+  assert.equal(holder.live['sess-1'][0].reply, 'OK', 'the actual response holder retains the final reply');
+  assert.equal(holder.live['sess-1'][0].completed, true);
+  for (const resolve of pendingGit.splice(0)) resolve();
+  await vi.waitFor(() => assert.equal(holder.repositoryScope.snapshot(folders).ready, true));
+  acceptCatalog();
+  assert.equal(
+    holder.continuationAuthority('claude', 'sess-1'),
+    authority,
+    'the physical target and full authority recover unchanged',
+  );
+  Object.assign(holder, {
+    anyVisible: () => true,
+    prepareHumanPrompts: async (rows: unknown[]) => rows,
+    prepareMetadata: async () => true,
+    prepareClaudeChildren: async () => true,
+    collect: () => [],
+    completeSelectedWindow: async () => {},
+    prepareRailEnrichment: async () => ({ changed: false, progress: false }),
+  });
+  const pendingBeforeRows = holder.pendingQueueDrains.has('sess-1');
+  const queuedBeforeRows = structuredClone(holder.queues['sess-1']);
+  if (queuedReaderInput) {
+    assert.equal(pendingBeforeRows, true, 'unsettled scope retains the nonempty reader queue marker');
+    assert.equal(holder.readerWork('sess-1'), 'pending');
+  }
+  await holder.refresh(true, true);
+  assert.equal(
+    holder.continuationAuthority('claude', 'sess-1'),
+    authority,
+    'the full rows refresh keeps the admitted authority',
+  );
+  if (queuedReaderInput) {
+    assert.deepEqual(
+      holder.queues['sess-1'],
+      queuedBeforeRows,
+      'scope recovery retains the reader prompt being edited',
+    );
+    assert.equal(holder.readerWork('sess-1'), 'pending');
+    await through.compaction.drain('sess-1');
+    const status = through.compaction.handle({
+      method: 'compact-status',
+      params: { requestId: request.requestId },
+    }) as { state: string };
+    return {
+      state: status.state,
+      reason: '',
+      compactWrites: sentTexts(through.children[0]).filter((text) => text === '/compact').length,
+    };
+  }
+  assert.equal(holder.readerWork('sess-1'), 'none');
+  await vi.waitFor(() => assert.equal(sentTexts(through.children[0]).filter((text) => text === '/compact').length, 1));
+  now += COMPACT_LIMITS.admissionMs + 1;
+  const status = through.compaction.handle({
+    method: 'compact-status',
+    params: { requestId: request.requestId },
+  }) as { state: string; reason: string };
+  console.log(
+    JSON.stringify({
+      status,
+      pendingBeforeRows,
+      authorityMatches: authority === holder.continuationAuthority('claude', 'sess-1'),
+      physicalSource: holder.continuationSource('claude', 'sess-1'),
+      compactWrites: sentTexts(through.children[0]).filter((text) => text === '/compact').length,
+    }),
+  );
+  return {
+    state: status.state,
+    reason: status.reason,
+    compactWrites: sentTexts(through.children[0]).filter((text) => text === '/compact').length,
+  };
+}
+
+test('a queued reader self-compaction starts after restored workspace scope and captured completion', async () => {
+  const result = await readerCompactionAfterScopeRecovery(false);
+  assert.notEqual(result.state, 'cancelled', result.reason);
+  assert.equal(result.compactWrites, 1);
+});
+
+test('a queued reader prompt remains pending through workspace scope recovery and blocks self-compaction', async () => {
+  const result = await readerCompactionAfterScopeRecovery(true);
+  assert.equal(result.state, 'queued');
+  assert.equal(result.compactWrites, 0);
+});
 
 // Opens a Claude session, sends the reader prompt, and replays the fixture through the first
 // request line, which runs inside the first turn Claude starts by itself.

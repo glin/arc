@@ -5905,7 +5905,9 @@ export class PanelProvider implements vscode.Disposable {
   public flushQueue(session: string): void {
     // Drain the caller's session, independent of the session displayed in the prompt box.
     if (!this.repositoryScopeReady) {
-      this.pendingQueueDrains.add(session);
+      if (this.queues[session]?.length) {
+        this.pendingQueueDrains.add(session);
+      }
       return;
     }
     const state = this.stateFor(session);
