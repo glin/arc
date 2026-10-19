@@ -5,7 +5,13 @@ import fs from 'node:fs';
 import * as path from 'node:path';
 import { afterEach, test, vi } from 'vitest';
 import { tempDir } from './temproot';
-import { DispatchReceipts, outsideDispatchStorage, safeDispatchPath, type DispatchEvent } from './dispatchreceipts';
+import {
+  DispatchReceipts,
+  outsideDispatchStorage,
+  safeDispatchPath,
+  type DispatchEvent,
+  type StandaloneOptions,
+} from './dispatchreceipts';
 import { HostedDispatch, type SavedDispatchResponse } from './dispatchhost';
 import { payloadSha256 } from './sessionwrites';
 import type { NativeEvent } from './agentwire';
@@ -33,9 +39,13 @@ afterEach(() => {
   vi.useRealTimers();
   for (const home of homes.splice(0)) fs.rmSync(home, { recursive: true, force: true });
 });
+function scratch(prefix: string) {
+  const directory = tempDir(prefix);
+  homes.push(directory);
+  return directory;
+}
 function fixture(completion: 'manual' | 'wait' = 'manual', alias: string | null = null) {
-  const home = tempDir('arc-dispatch-');
-  homes.push(home);
+  const home = scratch('arc-dispatch-');
   const receipts = new DispatchReceipts(home);
   const launch = receipts.reserve({
     origin,
@@ -54,9 +64,142 @@ function report(receipts: DispatchReceipts, id: string, text = 'Report'): Dispat
     text,
   );
 }
+function settings(home: string, standalone: Partial<StandaloneOptions> = {}): StandaloneOptions {
+  const provider = standalone.provider ?? 'codex';
+  return {
+    provider,
+    command: provider,
+    args: [],
+    cwd: home,
+    model: 'test',
+    effort: 'high',
+    name: 'test',
+    agentRun: false,
+    background: false,
+    sessionHint: null,
+    logAlias: path.join(home, 'live.log'),
+    deadlineMs: 10_000,
+    ...standalone,
+  };
+}
+function standaloneFixture(standalone: Partial<StandaloneOptions> = {}) {
+  const fx = fixture();
+  const launch = fx.receipts.reserve({
+    ...fx.launch,
+    transport: 'standalone',
+    standalone: settings(fx.home, standalone),
+  });
+  return { ...fx, standalone: launch };
+}
+const nativeBackground: Partial<StandaloneOptions> = { provider: 'claude', args: ['--bg'], background: true };
+const unloggedAgentRun: Partial<StandaloneOptions> = {
+  model: 'sol',
+  name: '',
+  agentRun: true,
+  logAlias: null,
+  deadlineMs: 1000,
+};
+const largeObservation = {
+  supervisor: { pid: process.pid, token: 'f'.repeat(64) },
+  worker: {
+    pid: process.pid,
+    command: 'c'.repeat(10 * 1024),
+    startedAt: 'native-lifetime',
+    argsSha256: payloadSha256('args'),
+    commandLineSha256: payloadSha256('native\0args\0'),
+  },
+  sessionId: session,
+  exitCode: 0,
+  signal: null,
+  monitor: 'finished' as const,
+};
+function drainAlias(capture: ReturnType<DispatchReceipts['capture']>) {
+  for (let pass = 0; pass < 8 && capture.flushAlias(); pass++) {
+    /* Drain bounded alias writes. */
+  }
+}
+function savedResponse(text: string, extra: Partial<SavedDispatchResponse> = {}): SavedDispatchResponse {
+  return { text, prompt: 'review', promptId: turn, responseIds: [], finished: true, failed: false, ...extra };
+}
+function hosted(
+  receipts: DispatchReceipts,
+  id: string,
+  evidence: () => SavedDispatchResponse | null,
+  {
+    agent = 'codex',
+    exited = false,
+    submitted = true,
+  }: { agent?: 'claude' | 'codex'; exited?: boolean; submitted?: boolean } = {},
+) {
+  const host = new HostedDispatch(receipts, evidence);
+  const child = { key: 'worker', agent, state: () => ({ sessionId: session, exited }) };
+  host.register(id, child);
+  if (submitted) host.submitted(id, 1);
+  return { host, child };
+}
+function failWitness(receipts: DispatchReceipts, id: string) {
+  const witness = path.join(receipts.root, `${id}.accepted.json`);
+  const write = fs.writeFileSync;
+  vi.spyOn(fs, 'writeFileSync').mockImplementation((file, ...args) => {
+    if (String(file) === witness) throw new Error('witness storage unavailable');
+    return (write as any)(file, ...args);
+  });
+  syncBuiltinESMExports();
+  return witness;
+}
+function directoryLink(target: string, link: string) {
+  fs.symlinkSync(target, link, process.platform === 'win32' ? 'junction' : 'dir');
+}
+function sessionSource(
+  home: string,
+  agent: 'claude' | 'codex',
+  text: string,
+  turnId: string,
+  { parts = [text], padding = false }: { parts?: string[]; padding?: boolean } = {},
+) {
+  const at = '2026-01-01T00:00:00Z';
+  const filler = padding ? [{ type: 'progress', padding: 'x'.repeat(600 * 1024) }] : [];
+  const rows =
+    agent === 'claude'
+      ? [
+          { type: 'user', uuid: 'prompt', timestamp: at, message: { role: 'user', content: 'review' } },
+          ...filler,
+          {
+            type: 'assistant',
+            timestamp: at,
+            message: {
+              id: 'response',
+              role: 'assistant',
+              stop_reason: 'end_turn',
+              content: parts.map((part) => ({ type: 'text', text: part })),
+              usage: { input_tokens: 1, output_tokens: 2 },
+            },
+          },
+        ]
+      : [
+          { type: 'session_meta', payload: { id: session, cwd: home, source: 'vscode' } },
+          { type: 'event_msg', timestamp: at, payload: { type: 'task_started', turn_id: turnId } },
+          { type: 'event_msg', timestamp: at, payload: { type: 'user_message', message: 'review' } },
+          ...filler,
+          {
+            type: 'response_item',
+            timestamp: at,
+            payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text }] },
+          },
+          {
+            type: 'event_msg',
+            timestamp: at,
+            payload: { type: 'task_complete', turn_id: turnId, last_agent_message: text },
+          },
+        ];
+  const file = path.join(home, `${agent}.jsonl`);
+  const encoded = rows.map((row) => JSON.stringify(row)).join('\n') + '\n';
+  fs.writeFileSync(file, encoded);
+  const source = { file, agent, sessionId: session, ...revisionOf(fs.statSync(file, { bigint: true })) } as SessionFile;
+  return { rows, source, encoded };
+}
 test('private reports remain independent when output aliases collide', () => {
-  const aliasHome = tempDir('arc-alias-');
-  homes.push(aliasHome);
+  const aliasHome = scratch('arc-alias-');
   const alias = path.join(aliasHome, 'report.md');
   const a = fixture('manual', alias);
   const b = fixture('manual', alias);
@@ -69,25 +212,7 @@ test('private reports remain independent when output aliases collide', () => {
   assert.equal(a.receipts.status(a.launch.launchId).events.length, 1);
 });
 test('concurrent channel captures retain each source byte once across stale cursors', () => {
-  const { receipts, launch, home } = fixture();
-  const standalone = receipts.reserve({
-    ...launch,
-    transport: 'standalone',
-    standalone: {
-      provider: 'codex',
-      command: 'codex',
-      args: [],
-      cwd: home,
-      model: 'test',
-      effort: 'high',
-      name: 'test',
-      agentRun: false,
-      background: false,
-      sessionHint: null,
-      logAlias: path.join(home, 'live.log'),
-      deadlineMs: 10_000,
-    },
-  });
+  const { receipts, standalone } = standaloneFixture();
   const a = receipts.capture(standalone.launchId);
   const b = receipts.capture(standalone.launchId);
   try {
@@ -110,25 +235,7 @@ test('concurrent channel captures retain each source byte once across stale curs
 });
 
 test('native capture reconciles overlapping snapshots and preserves a reused alias', () => {
-  const { receipts, launch, home } = fixture();
-  const standalone = receipts.reserve({
-    ...launch,
-    transport: 'standalone',
-    standalone: {
-      provider: 'claude',
-      command: 'claude',
-      args: ['--bg'],
-      cwd: home,
-      model: 'test',
-      effort: 'high',
-      name: 'test',
-      agentRun: false,
-      background: true,
-      sessionHint: null,
-      logAlias: path.join(home, 'live.log'),
-      deadlineMs: 10_000,
-    },
-  });
+  const { receipts, standalone } = standaloneFixture(nativeBackground);
   const a = receipts.capture(standalone.launchId);
   const b = receipts.capture(standalone.launchId);
   try {
@@ -170,28 +277,10 @@ test.each(
     })),
   ),
 )('failed log alias writes recover complete $kind bytes on $recovery', ({ kind, recovery }) => {
-  const { receipts, launch, home } = fixture();
   const native = kind === 'native';
-  const alias = path.join(home, 'live.log');
+  const { receipts, standalone } = standaloneFixture(native ? nativeBackground : {});
+  const alias = standalone.standalone!.logAlias!;
   const aliasByteBudget = recovery === 'bounded replay' ? 17 : undefined;
-  const standalone = receipts.reserve({
-    ...launch,
-    transport: 'standalone',
-    standalone: {
-      provider: native ? 'claude' : 'codex',
-      command: native ? 'claude' : 'codex',
-      args: native ? ['--bg'] : [],
-      cwd: home,
-      model: 'test',
-      effort: 'high',
-      name: 'test',
-      agentRun: false,
-      background: native,
-      sessionHint: null,
-      logAlias: alias,
-      deadlineMs: 10_000,
-    },
-  });
   let capture = receipts.capture(standalone.launchId, aliasByteBudget);
   const name = native ? 'native-source.log' : 'stdout.log';
   let offset = 0;
@@ -260,18 +349,14 @@ test.each(
         assert.equal(checkpoint.aliasBytes, delivered);
         assert.ok(delivered < captured.length);
       }
-      for (let pass = 0; pass < 8 && capture.flushAlias(); pass++) {
-        /* Continue bounded delivery without new output. */
-      }
+      drainAlias(capture);
       assert.ok(
         fs.readFileSync(alias).equals(replacement ?? captured),
         'resumed alias must contain every captured byte',
       );
     }
     append(tail);
-    for (let pass = 0; pass < 8 && capture.flushAlias(); pass++) {
-      /* Drain the remaining alias bytes. */
-    }
+    drainAlias(capture);
     const complete = Buffer.concat([captured, tail]);
     assert.equal(fs.readFileSync(privateFile).equals(complete), true);
     assert.ok(
@@ -292,26 +377,8 @@ test.each(
 )(
   'concurrent capture replacement remains retryable at $name during $phase with construction=$construction',
   ({ name, phase, construction }) => {
-    const { receipts, launch, home } = fixture();
-    const alias = path.join(home, 'live.log');
-    const standalone = receipts.reserve({
-      ...launch,
-      transport: 'standalone',
-      standalone: {
-        provider: 'codex',
-        command: 'codex',
-        args: [],
-        cwd: home,
-        model: 'test',
-        effort: 'high',
-        name: 'test',
-        agentRun: false,
-        background: false,
-        sessionHint: null,
-        logAlias: alias,
-        deadlineMs: 10_000,
-      },
-    });
+    const { receipts, home, standalone } = standaloneFixture();
+    const alias = standalone.standalone!.logAlias!;
     const id = standalone.launchId;
     const a = receipts.capture(id, 2);
     const b = new DispatchReceipts(home).capture(id, 2);
@@ -369,9 +436,7 @@ test.each(
       syncBuiltinESMExports();
       if (phase === 'read') b.write(Buffer.from('abcdefghij'), 'stdout.log', cursor);
       assert.equal(a.cursor('stdout.log').offset, 10);
-      for (let pass = 0; pass < 8 && a.flushAlias(); pass++) {
-        /* Drain bounded alias writes. */
-      }
+      drainAlias(a);
       assert.equal(fs.readFileSync(alias, 'utf8'), 'abcdefghij');
       assert.equal(fs.readFileSync(receipts.artifact(id, 'worker.log'), 'utf8'), 'abcdefghij');
     } finally {
@@ -388,26 +453,8 @@ test.each(
 test.each([false, true])(
   'idle alias flushes preserve lock history and repair changed files, background %s',
   (background) => {
-    const { receipts, launch, home } = fixture();
-    const alias = path.join(home, 'live.log');
-    const standalone = receipts.reserve({
-      ...launch,
-      transport: 'standalone',
-      standalone: {
-        provider: background ? 'claude' : 'codex',
-        command: background ? 'claude' : 'codex',
-        args: [],
-        cwd: home,
-        model: 'test',
-        effort: 'high',
-        name: 'test',
-        agentRun: false,
-        background,
-        sessionHint: null,
-        logAlias: alias,
-        deadlineMs: 10_000,
-      },
-    });
+    const { receipts, standalone } = standaloneFixture({ provider: background ? 'claude' : 'codex', background });
+    const alias = standalone.standalone!.logAlias!;
     const raw = receipts.artifact(standalone.launchId, 'worker.log');
     const directory = path.dirname(raw);
     const history = () =>
@@ -425,11 +472,7 @@ test.each([false, true])(
       if (background) b.native(Buffer.from(text), cursor);
       else b.write(Buffer.from(text), 'stdout.log', cursor);
     };
-    const drain = () => {
-      for (let pass = 0; pass < 8 && a.flushAlias(); pass++) {
-        /* Drain bounded alias writes. */
-      }
-    };
+    const drain = () => drainAlias(a);
     try {
       append('abcdef');
       drain();
@@ -498,8 +541,7 @@ test('interrupted claims retain their token and acknowledgments retain exactly o
   assert.throws(() => receipts.ack(launch.launchId, event.eventId, origin, 'owner', claim.token, 'Rejected'));
 });
 test('changed report observations remain unread after an older event is consumed', () => {
-  const aliasHome = tempDir('arc-refresh-');
-  homes.push(aliasHome);
+  const aliasHome = scratch('arc-refresh-');
   const alias = path.join(aliasHome, 'report.md');
   const { receipts, launch } = fixture('manual', alias);
   const first = report(receipts, launch.launchId);
@@ -558,10 +600,9 @@ test('authoritative receipt, report and accepted-turn replacements refuse', () =
 });
 test('redirected receipt directories and private report aliases refuse', () => {
   const { receipts, launch, home } = fixture();
-  const target = tempDir('arc-dispatch-target-');
-  homes.push(target);
+  const target = scratch('arc-dispatch-target-');
   const aliasDirectory = path.join(home, 'redirected');
-  fs.symlinkSync(target, aliasDirectory, process.platform === 'win32' ? 'junction' : 'dir');
+  directoryLink(target, aliasDirectory);
   try {
     assert.throws(() => receipts.reserve({ ...launch, alias: path.join(aliasDirectory, 'report.md') }));
   } finally {
@@ -570,7 +611,7 @@ test('redirected receipt directories and private report aliases refuse', () => {
   assert.throws(() => receipts.reserve({ ...launch, alias: path.join(receipts.root, 'alias.md') }));
   const directory = path.join(receipts.root, launch.launchId);
   fs.renameSync(directory, `${directory}.old`);
-  fs.symlinkSync(`${directory}.old`, directory, process.platform === 'win32' ? 'junction' : 'dir');
+  directoryLink(`${directory}.old`, directory);
   try {
     assert.throws(() => receipts.launch(launch.launchId), /redirected|replaced/);
   } finally {
@@ -581,10 +622,7 @@ test('redirected receipt directories and private report aliases refuse', () => {
 test('native successful completion waits for matching saved root evidence', () => {
   const { receipts, launch } = fixture();
   let saved: SavedDispatchResponse | null = null;
-  const host = new HostedDispatch(receipts, () => saved);
-  const child = { key: 'worker', agent: 'codex', state: () => ({ sessionId: session, exited: false }) };
-  host.register(launch.launchId, child);
-  host.submitted(launch.launchId, 1);
+  const { host, child } = hosted(receipts, launch.launchId, () => saved);
   host.observe(child, { kind: 'text', text: 'Final', sourceId: 'response', nativeTurnId: turn }, 1);
   host.observe(child, { kind: 'native', event: { ...ending, sessionId: 'cccccccc-1111-2222-3333-444444444444' } }, 1);
   assert.equal(receipts.status(launch.launchId).events.length, 0);
@@ -592,7 +630,7 @@ test('native successful completion waits for matching saved root evidence', () =
   assert.equal(receipts.status(launch.launchId).events.length, 0);
   host.observe(child, { kind: 'native', event: ending }, 1);
   assert.equal(receipts.status(launch.launchId).events.at(-1)!.availability, 'pending');
-  saved = { text: 'Wrong', prompt: 'review', promptId: turn, responseIds: [], finished: true, failed: false };
+  saved = savedResponse('Wrong');
   host.reconcileAll();
   assert.equal(receipts.status(launch.launchId).events.length, 1);
   saved.text = 'Final';
@@ -604,14 +642,7 @@ test('native successful completion waits for matching saved root evidence', () =
 test('native failure, input requests and unknown process exit remain distinct', () => {
   for (const mode of ['failed', 'needs-input', 'exit']) {
     const { receipts, launch } = fixture();
-    const host = new HostedDispatch(receipts, () => ({
-      text: 'Failure',
-      prompt: 'review',
-      promptId: turn,
-      responseIds: [],
-      finished: false,
-      failed: true,
-    }));
+    const host = new HostedDispatch(receipts, () => savedResponse('Failure', { finished: false, failed: true }));
     const child = {
       key: mode,
       agent: 'codex',
@@ -654,9 +685,7 @@ test('native failure, input requests and unknown process exit remain distinct', 
 test('wait deadline and disconnection retain the exact worker and receipt', async () => {
   vi.useFakeTimers();
   const { receipts, launch } = fixture('wait');
-  const host = new HostedDispatch(receipts, () => null);
-  const child = { key: 'worker', agent: 'codex', state: () => ({ sessionId: session, exited: false }) };
-  host.register(launch.launchId, child);
+  const { host, child } = hosted(receipts, launch.launchId, () => null, { submitted: false });
   const signal = new AbortController();
   const waited = host.wait(launch.launchId, 100, signal.signal);
   signal.abort();
@@ -707,24 +736,7 @@ test.each(['hosted', 'standalone'] as const)(
       ...launch,
       transport,
       policy: { readOnly: true as const, readTools: [''] },
-      ...(transport === 'standalone'
-        ? {
-            standalone: {
-              provider: 'codex' as const,
-              command: 'codex',
-              args: [],
-              cwd: home,
-              model: 'sol',
-              effort: 'high',
-              name: '',
-              agentRun: true,
-              background: false,
-              sessionHint: null,
-              logAlias: null,
-              deadlineMs: 1000,
-            },
-          }
-        : {}),
+      ...(transport === 'standalone' ? { standalone: settings(home, unloggedAgentRun) } : {}),
     };
     const measured = receipts.reserve(input);
     input.policy.readTools[0] = 'x'.repeat(48 * 1024 - Buffer.byteLength(JSON.stringify(measured)));
@@ -736,21 +748,7 @@ test.each(['hosted', 'standalone'] as const)(
       Buffer.byteLength(JSON.stringify(empty)) <= 44 * 1024,
       'an admitted launch needs a readable empty status',
     );
-    if (transport === 'standalone')
-      receipts.observation(large.launchId, {
-        supervisor: { pid: process.pid, token: 'f'.repeat(64) },
-        worker: {
-          pid: process.pid,
-          command: 'c'.repeat(10 * 1024),
-          startedAt: 'native-lifetime',
-          argsSha256: payloadSha256('args'),
-          commandLineSha256: payloadSha256('native\0args\0'),
-        },
-        sessionId: session,
-        exitCode: 0,
-        signal: null,
-        monitor: 'finished',
-      });
+    if (transport === 'standalone') receipts.observation(large.launchId, largeObservation);
     const ids: string[] = [];
     for (let index = 0; index < 4; index++) {
       const event = receipts.publish(
@@ -802,39 +800,8 @@ test.each(['hosted', 'standalone'] as const)(
 );
 
 test('first accepted event advances beside large readable launch and observation metadata', () => {
-  const { receipts, launch, home } = fixture();
-  const standalone = receipts.reserve({
-    ...launch,
-    transport: 'standalone',
-    standalone: {
-      provider: 'codex',
-      command: 'codex',
-      args: ['x'.repeat(14 * 1024)],
-      cwd: home,
-      model: 'sol',
-      effort: 'high',
-      name: '',
-      agentRun: true,
-      background: false,
-      sessionHint: null,
-      logAlias: null,
-      deadlineMs: 1000,
-    },
-  });
-  receipts.observation(standalone.launchId, {
-    supervisor: { pid: process.pid, token: 'f'.repeat(64) },
-    worker: {
-      pid: process.pid,
-      command: 'c'.repeat(10 * 1024),
-      startedAt: 'native-lifetime',
-      argsSha256: payloadSha256('args'),
-      commandLineSha256: payloadSha256('native\0args\0'),
-    },
-    sessionId: session,
-    exitCode: 0,
-    signal: null,
-    monitor: 'finished',
-  });
+  const { receipts, standalone } = standaloneFixture({ ...unloggedAgentRun, args: ['x'.repeat(14 * 1024)] });
+  receipts.observation(standalone.launchId, largeObservation);
   assert.ok(Buffer.byteLength(JSON.stringify(receipts.launch(standalone.launchId))) < 48 * 1024);
   assert.ok(Buffer.byteLength(JSON.stringify(receipts.observation(standalone.launchId))) < 48 * 1024);
   const first = receipts.publish(
@@ -866,25 +833,7 @@ test('first accepted event advances beside large readable launch and observation
 });
 
 test('unreadable observations leave the last readable observation intact', () => {
-  const { receipts, launch, home } = fixture();
-  const standalone = receipts.reserve({
-    ...launch,
-    transport: 'standalone',
-    standalone: {
-      provider: 'codex',
-      command: 'codex',
-      args: [],
-      cwd: home,
-      model: 'sol',
-      effort: 'high',
-      name: '',
-      agentRun: true,
-      background: false,
-      sessionHint: null,
-      logAlias: null,
-      deadlineMs: 1000,
-    },
-  });
+  const { receipts, standalone } = standaloneFixture(unloggedAgentRun);
   const observation = {
     supervisor: { pid: process.pid, token: 'f'.repeat(64) },
     worker: null,
@@ -1001,13 +950,7 @@ test.each(['retry', 'conflict', 'replacement', 'redirect'] as const)(
     const { receipts, launch } = fixture();
     const binding = { provider: 'codex' as const, sessionId: session, submissionId: 1, nativeTurnId: turn };
     const accepted = path.join(receipts.root, launch.launchId, 'accepted.json');
-    const witness = path.join(receipts.root, `${launch.launchId}.accepted.json`);
-    const write = fs.writeFileSync;
-    vi.spyOn(fs, 'writeFileSync').mockImplementation((file, ...args) => {
-      if (String(file) === witness) throw new Error('witness storage unavailable');
-      return (write as any)(file, ...args);
-    });
-    syncBuiltinESMExports();
+    const witness = failWitness(receipts, launch.launchId);
     assert.throws(() => receipts.bind(launch.launchId, binding), /witness storage/);
     assert.ok(fs.existsSync(accepted));
     assert.equal(fs.existsSync(witness), false);
@@ -1016,7 +959,7 @@ test.each(['retry', 'conflict', 'replacement', 'redirect'] as const)(
     if (change === 'replacement' || change === 'redirect') {
       fs.renameSync(accepted, accepted + '.old');
       if (change === 'replacement') fs.copyFileSync(accepted + '.old', accepted);
-      else fs.symlinkSync(path.dirname(accepted), accepted, process.platform === 'win32' ? 'junction' : 'dir');
+      else directoryLink(path.dirname(accepted), accepted);
     }
     if (change !== 'retry') {
       assert.throws(() =>
@@ -1034,24 +977,8 @@ test.each(['retry', 'conflict', 'replacement', 'redirect'] as const)(
 
 test('host reconciliation recovers a witness fault without another submission or worker', () => {
   const { receipts, launch } = fixture();
-  const host = new HostedDispatch(receipts, () => ({
-    text: 'Final',
-    prompt: 'review',
-    promptId: turn,
-    responseIds: [],
-    finished: true,
-    failed: false,
-  }));
-  const child = { key: 'worker', agent: 'codex', state: () => ({ sessionId: session, exited: false }) };
-  host.register(launch.launchId, child);
-  host.submitted(launch.launchId, 1);
-  const witness = path.join(receipts.root, `${launch.launchId}.accepted.json`);
-  const write = fs.writeFileSync;
-  vi.spyOn(fs, 'writeFileSync').mockImplementation((file, ...args) => {
-    if (String(file) === witness) throw new Error('witness storage unavailable');
-    return (write as any)(file, ...args);
-  });
-  syncBuiltinESMExports();
+  const { host, child } = hosted(receipts, launch.launchId, () => savedResponse('Final'));
+  const witness = failWitness(receipts, launch.launchId);
   host.accepted(launch.launchId, turn);
   host.observe(child, { kind: 'text', text: 'Final', sourceId: 'response' }, 1);
   host.observe(child, { kind: 'native', event: ending }, 1);
@@ -1069,18 +996,8 @@ test('host reconciliation recovers a witness fault without another submission or
 
 test('receipt write errors preserve native observation and retry without repeating input', () => {
   const { receipts, launch } = fixture();
-  const saved = {
-    text: 'Final',
-    prompt: 'review',
-    promptId: 'turn-opaque',
-    responseIds: [],
-    finished: true,
-    failed: false,
-  };
-  const host = new HostedDispatch(receipts, () => saved);
-  const child = { key: 'worker', agent: 'codex', state: () => ({ sessionId: session, exited: false }) };
-  host.register(launch.launchId, child);
-  host.submitted(launch.launchId, 1);
+  const saved = savedResponse('Final', { promptId: 'turn-opaque' });
+  const { host, child } = hosted(receipts, launch.launchId, () => saved);
   const bind = vi.spyOn(receipts, 'bind').mockImplementationOnce(() => {
     throw new Error('storage unavailable');
   });
@@ -1100,18 +1017,7 @@ test('receipt write errors preserve native observation and retry without repeati
 
 test('interrupted native endings agree with interrupted saved evidence without becoming failed', () => {
   const { receipts, launch } = fixture();
-  const host = new HostedDispatch(receipts, () => ({
-    text: 'Partial',
-    prompt: 'review',
-    promptId: turn,
-    responseIds: [],
-    finished: true,
-    failed: false,
-    interrupted: true,
-  }));
-  const child = { key: 'worker', agent: 'codex', state: () => ({ sessionId: session, exited: false }) };
-  host.register(launch.launchId, child);
-  host.submitted(launch.launchId, 1);
+  const { host, child } = hosted(receipts, launch.launchId, () => savedResponse('Partial', { interrupted: true }));
   host.observe(child, { kind: 'text', text: 'Partial', sourceId: 'response' }, 1);
   host.observe(child, { kind: 'native', event: { ...ending, success: false } }, 1);
   assert.equal(receipts.latest(launch.launchId), null);
@@ -1126,9 +1032,7 @@ test('interrupted native endings agree with interrupted saved evidence without b
 
 test('startup error observation and subsequent child exit publish one unknown event', () => {
   const { receipts, launch } = fixture();
-  const host = new HostedDispatch(receipts, () => null);
-  const child = { key: 'worker', agent: 'codex', state: () => ({ sessionId: session, exited: true }) };
-  host.register(launch.launchId, child);
+  const { host, child } = hosted(receipts, launch.launchId, () => null, { exited: true, submitted: false });
   host.unavailable(launch.launchId);
   host.exited(child);
   assert.equal(receipts.status(launch.launchId).events.length, 1);
@@ -1138,56 +1042,10 @@ test.each(['claude', 'codex'] as const)(
   'complete large %s evidence retains root identity and full final response',
   (agent) => {
     const { receipts, launch, home } = fixture();
-    const file = path.join(home, 'session.jsonl');
-    const at = '2026-01-01T00:00:00Z';
-    const rows =
-      agent === 'claude'
-        ? [
-            { type: 'user', uuid: 'prompt', timestamp: at, message: { role: 'user', content: 'review' } },
-            { type: 'progress', padding: 'x'.repeat(600 * 1024) },
-            {
-              type: 'assistant',
-              timestamp: at,
-              message: {
-                id: 'response',
-                role: 'assistant',
-                stop_reason: 'end_turn',
-                content: [
-                  { type: 'text', text: 'First' },
-                  { type: 'text', text: ' ' },
-                  { type: 'text', text: 'Second' },
-                ],
-                usage: { input_tokens: 1, output_tokens: 2 },
-              },
-            },
-          ]
-        : [
-            { type: 'session_meta', payload: { id: session, cwd: home, source: 'vscode' } },
-            { type: 'event_msg', timestamp: at, payload: { type: 'task_started', turn_id: 'root-turn' } },
-            { type: 'event_msg', timestamp: at, payload: { type: 'user_message', message: 'review' } },
-            { type: 'progress', padding: 'x'.repeat(600 * 1024) },
-            {
-              type: 'response_item',
-              timestamp: at,
-              payload: {
-                type: 'message',
-                role: 'assistant',
-                content: [{ type: 'output_text', text: 'First\nSecond' }],
-              },
-            },
-            {
-              type: 'event_msg',
-              timestamp: at,
-              payload: { type: 'task_complete', turn_id: 'root-turn', last_agent_message: 'First\nSecond' },
-            },
-          ];
-    fs.writeFileSync(file, rows.map((row) => JSON.stringify(row)).join('\n') + '\n');
-    const source = {
-      file,
-      agent,
-      sessionId: session,
-      ...revisionOf(fs.statSync(file, { bigint: true })),
-    } as SessionFile;
+    const { rows, source } = sessionSource(home, agent, 'First\nSecond', 'root-turn', {
+      parts: ['First', ' ', 'Second'],
+      padding: true,
+    });
     let saved: SavedDispatchResponse | null = null;
     for (let attempts = 0; attempts < 100 && !saved; attempts++)
       saved = savedDispatchResponse(source, agent === 'claude' ? '1' : 'root-turn');
@@ -1196,10 +1054,7 @@ test.each(['claude', 'codex'] as const)(
     assert.equal(saved.prompt, 'review');
     assert.equal(saved.finished, true);
     if (agent === 'claude') assert.deepEqual(saved.responseIds, ['response']);
-    const host = new HostedDispatch(receipts, () => saved);
-    const child = { key: 'worker', agent, state: () => ({ sessionId: session, exited: false }) };
-    host.register(launch.launchId, child);
-    host.submitted(launch.launchId, 1);
+    const { host, child } = hosted(receipts, launch.launchId, () => saved, { agent });
     if (agent === 'claude') {
       const wire = new ClaudeWire({
         send: () => {},
@@ -1234,48 +1089,8 @@ test.each(
   'escaped $agent $escaping final response above four MiB survives bounded saved recovery',
   ({ agent, character, bytes }) => {
     const { receipts, launch, home } = fixture();
-    const file = path.join(home, 'escaped.jsonl');
     const text = String.fromCharCode(character).repeat(bytes);
-    const at = '2026-01-01T00:00:00Z';
-    const rows =
-      agent === 'claude'
-        ? [
-            { type: 'user', uuid: 'prompt', timestamp: at, message: { role: 'user', content: 'review' } },
-            {
-              type: 'assistant',
-              timestamp: at,
-              message: {
-                id: 'response',
-                role: 'assistant',
-                stop_reason: 'end_turn',
-                content: [{ type: 'text', text }],
-                usage: { input_tokens: 1, output_tokens: 2 },
-              },
-            },
-          ]
-        : [
-            { type: 'session_meta', payload: { id: session, cwd: home, source: 'vscode' } },
-            { type: 'event_msg', timestamp: at, payload: { type: 'task_started', turn_id: turn } },
-            { type: 'event_msg', timestamp: at, payload: { type: 'user_message', message: 'review' } },
-            {
-              type: 'response_item',
-              timestamp: at,
-              payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text }] },
-            },
-            {
-              type: 'event_msg',
-              timestamp: at,
-              payload: { type: 'task_complete', turn_id: turn, last_agent_message: text },
-            },
-          ];
-    const encoded = rows.map((row) => JSON.stringify(row)).join('\n') + '\n';
-    fs.writeFileSync(file, encoded, 'utf8');
-    const source = {
-      file,
-      agent,
-      sessionId: session,
-      ...revisionOf(fs.statSync(file, { bigint: true })),
-    } as SessionFile;
+    const { rows, source, encoded } = sessionSource(home, agent, text, turn);
     const native = agent === 'claude' ? '1' : turn;
     let saved: SavedDispatchResponse | null = null;
     const readCallBudget = Math.ceil(Buffer.byteLength(encoded) / SESSION_READ_LIMITS.bytes) + rows.length + 1;
@@ -1287,10 +1102,7 @@ test.each(
     assert.equal(saved.finished, true);
     if (agent === 'claude') assert.deepEqual(saved.responseIds, ['response']);
     else assert.equal(saved.promptId, turn);
-    const host = new HostedDispatch(receipts, () => saved);
-    const child = { key: 'worker', agent, state: () => ({ sessionId: session, exited: false }) };
-    host.register(launch.launchId, child);
-    host.submitted(launch.launchId, 1);
+    const { host, child } = hosted(receipts, launch.launchId, () => saved, { agent });
     host.observe(child, { kind: 'text', text, sourceId: 'response' }, 1);
     host.observe(
       child,
@@ -1333,10 +1145,9 @@ test('physical private parents refuse case variants and replaced private sources
 
 test('trusted system temp roots resolve their physical parents without admitting private aliases', () => {
   const { receipts, launch, home } = fixture();
-  const aliasHome = tempDir('arc-system-temp-');
-  homes.push(aliasHome);
+  const aliasHome = scratch('arc-system-temp-');
   const aliasDirectory = path.join(aliasHome, 'temp');
-  fs.symlinkSync(home, aliasDirectory, process.platform === 'win32' ? 'junction' : 'dir');
+  directoryLink(home, aliasDirectory);
   const temporary = vi.spyOn(os, 'tmpdir').mockReturnValue(aliasDirectory);
   syncBuiltinESMExports();
   try {
