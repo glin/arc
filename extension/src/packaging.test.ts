@@ -21,8 +21,19 @@ import { acquireToolLock, waitForToolLock } from './toolownership.ts';
 import { callSources, declarationSource, sourceDoesNotMatch, sourceMatch } from '../test/source-contract.ts';
 
 const extensionRoot = path.join(__dirname, '..');
+function builtVersion(): string {
+  const identity = JSON.parse(fs.readFileSync(path.join(extensionRoot, 'dist/build-identity.json'), 'utf8'));
+  return `${identity.version} (${identity.sourceCommit?.slice(0, 12) ?? 'unknown'}${identity.dirty ? '-dirty' : ''})`;
+}
 
 function overlayStaticSources(source: string): void {
+  fs.mkdirSync(path.join(source, '../scripts'), { recursive: true });
+  fs.copyFileSync(
+    path.join(extensionRoot, '../scripts/source-identity.mjs'),
+    path.join(source, '../scripts/source-identity.mjs'),
+  );
+  fs.copyFileSync(path.join(extensionRoot, '../cli/src/main.ts'), path.join(source, '../cli/src/main.ts'));
+  fs.copyFileSync(path.join(extensionRoot, '../cli/build.mjs'), path.join(source, '../cli/build.mjs'));
   fs.copyFileSync(
     path.join(extensionRoot, 'scripts/bundled-tools.mjs'),
     path.join(source, 'scripts/bundled-tools.mjs'),
@@ -137,6 +148,7 @@ test('build identity covers host, browser, worker, and version inputs', () => {
         'resources/windowpipe.exe',
         'resources/windowpipe.json',
         '../scripts/windowpipe-build.mjs',
+        '../scripts/source-identity.mjs',
         'scripts/bundled-tools.mjs',
         '../LICENSE',
         '../plugins/arc-hooks/LICENSE',
@@ -225,79 +237,162 @@ test('native bridge correspondence accepts both checkout line endings and reject
   assert.match(drift.stderr, /does not match its source/);
 });
 
-test('extracted source builds without Git and never inherits an enclosing repository identity', () => {
-  const root = tempDir('arc-archive-build-');
-  const archive = path.join(root, 'source.tar');
-  const sourceRoot = path.join(root, 'source');
-  fs.mkdirSync(sourceRoot);
-  const archived = spawnSync('git', ['archive', '--format=tar', '-o', archive, 'HEAD', 'extension', 'cli'], {
-    cwd: path.dirname(extensionRoot),
-    encoding: 'utf8',
-  });
-  assert.equal(archived.status, 0, archived.stderr);
-  const extracted = spawnSync('tar', ['-xf', path.basename(archive), '-C', path.relative(root, sourceRoot)], {
-    cwd: root,
-    encoding: 'utf8',
-  });
-  assert.equal(extracted.status, 0, extracted.stderr);
-  const source = path.join(sourceRoot, 'extension');
-  fs.copyFileSync(path.join(extensionRoot, 'esbuild.mjs'), path.join(source, 'esbuild.mjs'));
-  overlayStaticSources(source);
-  fs.mkdirSync(path.join(sourceRoot, 'scripts'), { recursive: true });
-  fs.copyFileSync(
-    path.join(extensionRoot, '../scripts/windowpipe-build.mjs'),
-    path.join(sourceRoot, 'scripts/windowpipe-build.mjs'),
-  );
-  fs.cpSync(path.join(extensionRoot, 'resources'), path.join(source, 'resources'), { recursive: true });
-  fs.copyFileSync(path.join(extensionRoot, 'src/windowpipe-source.ts'), path.join(source, 'src/windowpipe-source.ts'));
-  fs.symlinkSync(
-    path.join(extensionRoot, 'node_modules'),
-    path.join(source, 'node_modules'),
-    process.platform === 'win32' ? 'junction' : 'dir',
-  );
-  const expected = JSON.parse(fs.readFileSync(path.join(extensionRoot, 'dist/build-identity.json'), 'utf8'));
-  const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^GIT_/i.test(key)));
-  let archiveInputHash: string | undefined;
-  for (const enclosingRepository of [false, true]) {
-    if (enclosingRepository) {
-      for (const args of [
-        ['init'],
-        [
-          '-c',
-          'user.name=Fixture',
-          '-c',
-          'user.email=fixture@example.invalid',
-          '-c',
-          'commit.gpgsign=false',
-          'commit',
-          '--allow-empty',
-          '-m',
-          'fixture',
-        ],
-      ]) {
-        const git = spawnSync('git', args, { cwd: root, encoding: 'utf8', env });
-        assert.equal(git.status, 0, git.stderr);
+test.each([false, true])(
+  'extracted source builds without Git and never inherits an enclosing repository identity (enclosing repository: %s)',
+  (enclosingRepository) => {
+    const root = tempDir('arc-archive-build-');
+    const archive = path.join(root, 'source.tar');
+    const sourceRoot = path.join(root, 'source');
+    fs.mkdirSync(sourceRoot);
+    const archived = spawnSync('git', ['archive', '--format=tar', '-o', archive, 'HEAD', 'extension', 'cli'], {
+      cwd: path.dirname(extensionRoot),
+      encoding: 'utf8',
+    });
+    assert.equal(archived.status, 0, archived.stderr);
+    const extracted = spawnSync('tar', ['-xf', path.basename(archive), '-C', path.relative(root, sourceRoot)], {
+      cwd: root,
+      encoding: 'utf8',
+    });
+    assert.equal(extracted.status, 0, extracted.stderr);
+    const source = path.join(sourceRoot, 'extension');
+    fs.copyFileSync(path.join(extensionRoot, 'esbuild.mjs'), path.join(source, 'esbuild.mjs'));
+    overlayStaticSources(source);
+    fs.mkdirSync(path.join(sourceRoot, 'scripts'), { recursive: true });
+    fs.copyFileSync(
+      path.join(extensionRoot, '../scripts/windowpipe-build.mjs'),
+      path.join(sourceRoot, 'scripts/windowpipe-build.mjs'),
+    );
+    fs.cpSync(path.join(extensionRoot, 'resources'), path.join(source, 'resources'), { recursive: true });
+    fs.copyFileSync(
+      path.join(extensionRoot, 'src/windowpipe-source.ts'),
+      path.join(source, 'src/windowpipe-source.ts'),
+    );
+    fs.symlinkSync(
+      path.join(extensionRoot, 'node_modules'),
+      path.join(source, 'node_modules'),
+      process.platform === 'win32' ? 'junction' : 'dir',
+    );
+    const expected = JSON.parse(fs.readFileSync(path.join(extensionRoot, 'dist/build-identity.json'), 'utf8'));
+    const env = Object.fromEntries(
+      Object.entries(process.env).filter(([key]) => !/^GIT_/i.test(key) && key !== 'ARC_SOURCE_COMMIT'),
+    );
+    const archiveCommit = 'a'.repeat(40);
+    {
+      if (enclosingRepository) {
+        for (const args of [
+          ['init'],
+          [
+            '-c',
+            'user.name=Fixture',
+            '-c',
+            'user.email=fixture@example.invalid',
+            '-c',
+            'commit.gpgsign=false',
+            'commit',
+            '--allow-empty',
+            '-m',
+            'fixture',
+          ],
+        ]) {
+          const git = spawnSync('git', args, { cwd: root, encoding: 'utf8', env });
+          assert.equal(git.status, 0, git.stderr);
+        }
+      }
+      const buildEnv = enclosingRepository ? env : { ...env, PATH: '' };
+      if (!enclosingRepository) assert.ok(spawnSync('git', ['--version'], { env: buildEnv }).error);
+      for (const explicit of [enclosingRepository]) {
+        const identityEnv = explicit ? { ...buildEnv, ARC_SOURCE_COMMIT: archiveCommit } : buildEnv;
+        const built = spawnSync(process.execPath, ['esbuild.mjs'], { cwd: source, encoding: 'utf8', env: identityEnv });
+        assert.equal(built.status, 0, `extracted production build failed:\n${built.stderr}`);
+        const identity = JSON.parse(fs.readFileSync(path.join(source, 'dist/build-identity.json'), 'utf8'));
+        assert.equal(identity.sourceCommit, explicit ? archiveCommit : null);
+        const cliRoot = path.join(sourceRoot, 'cli');
+        if (!fs.existsSync(path.join(cliRoot, 'node_modules')))
+          fs.symlinkSync(
+            path.join(extensionRoot, 'node_modules'),
+            path.join(cliRoot, 'node_modules'),
+            process.platform === 'win32' ? 'junction' : 'dir',
+          );
+        const standaloneBuild = spawnSync(process.execPath, [path.join(cliRoot, 'build.mjs')], {
+          cwd: root,
+          encoding: 'utf8',
+          env: identityEnv,
+        });
+        assert.equal(standaloneBuild.status, 0, standaloneBuild.stderr);
+        const standalone = spawnSync(process.execPath, [path.join(cliRoot, 'dist/arc.cjs'), '--version'], {
+          cwd: root,
+          encoding: 'utf8',
+          env: { ...identityEnv, PATH: '' },
+        });
+        assert.equal(standalone.status, 0, standalone.stderr);
+        assert.equal(
+          standalone.stdout.trim(),
+          `${expected.version} (${explicit ? archiveCommit.slice(0, 12) : 'unknown'})`,
+        );
+        const cli = spawnSync(process.execPath, [path.join(source, 'dist/cli.cjs'), '--version'], {
+          encoding: 'utf8',
+          env: { ...identityEnv, PATH: '' },
+        });
+        assert.equal(cli.status, 0, cli.stderr);
+        assert.equal(cli.stdout.trim(), `${expected.version} (${explicit ? archiveCommit.slice(0, 12) : 'unknown'})`);
+        assert.equal(embeddedHostIdentity(path.join(source, 'dist/extension.js')).sourceCommit, identity.sourceCommit);
+        assert.equal(identity.tools.sourceCommit, identity.sourceCommit);
+        assert.equal(identity.dirty, null);
+        assert.equal(identity.version, expected.version);
+        assert.match(identity.inputsSha256, /^[a-f0-9]{64}$/);
+        assert.equal(
+          identity.extensionSha256,
+          createHash('sha256')
+            .update(fs.readFileSync(path.join(source, 'dist/extension.js')))
+            .digest('hex'),
+        );
       }
     }
-    const buildEnv = enclosingRepository ? env : { ...env, PATH: '' };
-    if (!enclosingRepository) assert.ok(spawnSync('git', ['--version'], { env: buildEnv }).error);
-    const built = spawnSync(process.execPath, ['esbuild.mjs'], { cwd: source, encoding: 'utf8', env: buildEnv });
-    assert.equal(built.status, 0, `extracted production build failed:\n${built.stderr}`);
-    const identity = JSON.parse(fs.readFileSync(path.join(source, 'dist/build-identity.json'), 'utf8'));
-    assert.equal(identity.sourceCommit, null);
-    assert.equal(identity.dirty, null);
-    assert.equal(identity.version, expected.version);
-    assert.match(identity.inputsSha256, /^[a-f0-9]{64}$/);
-    if (archiveInputHash === undefined) archiveInputHash = identity.inputsSha256;
-    else assert.equal(identity.inputsSha256, archiveInputHash);
-    assert.equal(
-      identity.extensionSha256,
-      createHash('sha256')
-        .update(fs.readFileSync(path.join(source, 'dist/extension.js')))
-        .digest('hex'),
-    );
-  }
-}, 90_000);
+
+    if (!enclosingRepository) return;
+    const git = (args: string[]) => {
+      const result = spawnSync('git', args, { cwd: sourceRoot, encoding: 'utf8', env });
+      assert.equal(result.status, 0, result.stderr);
+      return result.stdout.trim();
+    };
+    git(['init']);
+    fs.writeFileSync(path.join(sourceRoot, '.git/info/exclude'), '*\n');
+    git(['add', '-f', 'cli/src/main.ts']);
+    git([
+      '-c',
+      'user.name=Fixture',
+      '-c',
+      'user.email=fixture@example.invalid',
+      '-c',
+      'commit.gpgsign=false',
+      'commit',
+      '-m',
+      'source fixture',
+    ]);
+    const fixtureCommit = git(['rev-parse', 'HEAD']);
+    for (const dirty of [false, true]) {
+      if (dirty) fs.appendFileSync(path.join(sourceRoot, 'cli/src/main.ts'), '\n// Changed source fixture\n');
+      for (const [script, cwd, bundle] of [
+        ['esbuild.mjs', source, path.join(source, 'dist/cli.cjs')],
+        [path.join(sourceRoot, 'cli/build.mjs'), root, path.join(sourceRoot, 'cli/dist/arc.cjs')],
+      ]) {
+        const built = spawnSync(process.execPath, [script], { cwd, encoding: 'utf8', env });
+        assert.equal(built.status, 0, built.stderr);
+        const version = spawnSync(process.execPath, [bundle, '--version'], {
+          cwd: root,
+          encoding: 'utf8',
+          env: { ...env, PATH: '' },
+        });
+        assert.equal(version.status, 0, version.stderr);
+        assert.equal(
+          version.stdout.trim(),
+          `${expected.version} (${fixtureCommit.slice(0, 12)}${dirty ? '-dirty' : ''})`,
+        );
+      }
+    }
+  },
+  90_000,
+);
 
 test('watch startup invalidates identity from a preceding production build', async () => {
   const identity = path.join(extensionRoot, 'dist', 'build-identity.json');
@@ -366,6 +461,24 @@ test('CLI watching survives panel rebuilds and ends when the build closes', asyn
   ]) {
     fs.copyFileSync(path.join(extensionRoot, 'src', file), path.join(source, 'src', file));
   }
+  for (const args of [
+    ['init'],
+    [
+      '-c',
+      'user.name=Fixture',
+      '-c',
+      'user.email=fixture@example.invalid',
+      '-c',
+      'commit.gpgsign=false',
+      'commit',
+      '--allow-empty',
+      '-m',
+      'watch fixture',
+    ],
+  ]) {
+    const git = spawnSync('git', args, { cwd: sourceRoot, encoding: 'utf8' });
+    assert.equal(git.status, 0, git.stderr);
+  }
   const watcher = spawn(process.execPath, ['--input-type=module', '-e', script], {
     cwd: source,
     stdio: ['pipe', 'pipe', 'pipe'],
@@ -400,7 +513,10 @@ test('CLI watching survives panel rebuilds and ends when the build closes', asyn
       );
     const version = launch();
     assert.equal(version.status, 0, version.stderr);
-    assert.equal(version.stdout.trim(), JSON.parse(fs.readFileSync(path.join(source, 'package.json'), 'utf8')).version);
+    assert.equal(
+      version.stdout.trim(),
+      `${JSON.parse(fs.readFileSync(path.join(source, 'package.json'), 'utf8')).version} (unknown)`,
+    );
     await assert.rejects(
       prepareEditorCommands(
         path.join(source, 'dist'),
@@ -424,12 +540,30 @@ test('CLI watching survives panel rebuilds and ends when the build closes', asyn
     }
     fs.appendFileSync(path.join(source, 'src/webview/panel.css'), '\n/* watch fixture */\n');
     await vi.waitFor(() => assert.match(output, /rebuilt: the panel source changed/), { timeout: 15_000 });
+    const committed = spawnSync(
+      'git',
+      [
+        '-c',
+        'user.name=Fixture',
+        '-c',
+        'user.email=fixture@example.invalid',
+        '-c',
+        'commit.gpgsign=false',
+        'commit',
+        '--allow-empty',
+        '-m',
+        'next watch revision',
+      ],
+      { cwd: sourceRoot, encoding: 'utf8' },
+    );
+    assert.equal(committed.status, 0, committed.stderr);
     fs.appendFileSync(path.join(sourceRoot, 'cli/src/main.ts'), "\nconsole.log('cli watch fixture');\n");
     await vi.waitFor(
       () => assert.ok(fs.readFileSync(path.join(source, 'dist/cli.cjs'), 'utf8').includes('cli watch fixture')),
       { timeout: 15_000 },
     );
     assert.match(launch().stdout, /cli watch fixture/);
+    assert.ok(launch().stdout.includes('(unknown)'));
     watcher.stdin.end('close');
     await vi.waitFor(() => assert.equal(watcher.exitCode, 0), { timeout: 15_000 });
   } finally {
@@ -700,10 +834,7 @@ test.each(launcherShells)(
           });
           assert.ifError(result.error);
           assert.equal(result.status, 0, `${shell.command} (${casing}): ${result.stderr}`);
-          assert.equal(
-            result.stdout.trim(),
-            JSON.parse(fs.readFileSync(path.join(extensionRoot, 'package.json'), 'utf8')).version,
-          );
+          assert.equal(result.stdout.trim(), builtVersion());
         }
       }
     } finally {
@@ -726,10 +857,7 @@ test.each(launcherShells)(
       };
       const version = run('arc --version');
       assert.equal(version.status, 0, `${shell.command}: ${version.stderr}`);
-      assert.equal(
-        version.stdout.trim(),
-        JSON.parse(fs.readFileSync(path.join(extensionRoot, 'package.json'), 'utf8')).version,
-      );
+      assert.equal(version.stdout.trim(), builtVersion());
       const windows = run('arc windows --json');
       assert.equal(windows.status, 0, windows.stderr);
       assert.deepEqual(JSON.parse(windows.stdout), { version: 1, windows: [], complete: true });
@@ -1324,10 +1452,7 @@ test('installed absolute commands run offline after their extension payload disa
     };
     const version = run('--version');
     assert.equal(version.status, 0, version.stderr);
-    assert.equal(
-      version.stdout.trim(),
-      JSON.parse(fs.readFileSync(path.join(extensionRoot, 'package.json'), 'utf8')).version,
-    );
+    assert.equal(version.stdout.trim(), builtVersion());
     const status = run('statusline --json', '{}');
     assert.equal(status.status, 0, status.stderr);
     assert.equal(JSON.parse(status.stdout).schemaVersion, 1);
@@ -1986,10 +2111,7 @@ test('private CLI releases retain shared selection and select matching bytes bef
     childEnv(inherited, {}, undefined, root, { directory, editorExecutable: process.execPath, windowId: 'own-window' }),
   );
   assert.equal(child.status, 0, child.stderr);
-  assert.equal(
-    child.stdout.trim(),
-    JSON.parse(fs.readFileSync(path.join(extensionRoot, 'package.json'), 'utf8')).version,
-  );
+  assert.equal(child.stdout.trim(), builtVersion());
   assert.equal(fs.existsSync(inherited.ARC_HOME), false);
 });
 

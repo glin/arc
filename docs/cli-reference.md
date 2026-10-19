@@ -4,6 +4,8 @@ Use the [CLI guide](cli.md) for runnable examples. Run `arc COMMAND --help` for 
 
 ## Invocation
 
+`--version` prints the package version and a twelve-character source commit, for example `0.1.0 (abcdef123456)`. Changed source adds `-dirty` inside the parentheses. Unavailable identity prints `unknown`. Unknown dirty state has no marker and does not establish a clean checkout. The command uses embedded build metadata without Git or the source folder.
+
 `--version` takes precedence over every argument. No arguments, `help`, and `--help` print the overview. Command help supports nested commands. Help reads no stdin and performs no window discovery, network access, or filesystem mutations.
 
 ## Windows

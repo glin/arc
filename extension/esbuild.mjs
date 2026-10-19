@@ -3,9 +3,9 @@ import * as fs from 'node:fs';
 import { brotliCompressSync } from 'node:zlib';
 import * as path from 'node:path';
 import { createHash } from 'node:crypto';
-import { execFileSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { require as tsRequire } from 'tsx/cjs/api';
+import { sourceIdentity } from '../scripts/source-identity.mjs';
 import { copyWindowsPipe } from '../scripts/windowpipe-build.mjs';
 import { bundledTools } from './scripts/bundled-tools.mjs';
 
@@ -59,24 +59,7 @@ function manifestVersion() {
   return JSON.parse(fs.readFileSync(new URL('./package.json', import.meta.url), 'utf8')).version;
 }
 
-function sourceIdentity() {
-  const root = fs.realpathSync(fileURLToPath(new URL('../', import.meta.url)));
-  const unavailable = { sourceCommit: null, dirty: null };
-  if (!fs.existsSync(path.join(root, '.git'))) return unavailable;
-  try {
-    const git = (args) =>
-      execFileSync('git', ['-C', root, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
-    if (fs.realpathSync(git(['rev-parse', '--show-toplevel'])) !== root) return unavailable;
-    return {
-      sourceCommit: git(['rev-parse', 'HEAD']),
-      dirty: git(['status', '--porcelain']) !== '',
-    };
-  } catch {
-    return unavailable;
-  }
-}
-
-async function createBuildContext(developmentServerUrl, watch = false) {
+async function createBuildContext(developmentServerUrl, identity, watch = false) {
   const panel = panelText(developmentServerUrl);
   const context = await esbuild.context({
     entryPoints: ['src/extension.ts'],
@@ -97,7 +80,7 @@ async function createBuildContext(developmentServerUrl, watch = false) {
         JSON.stringify(
           watch
             ? { sourceCommit: null, dirty: null, builtAt: 0, unavailable: 'watch' }
-            : { ...sourceIdentity(), builtAt: Date.now() },
+            : { ...identity, builtAt: Date.now() },
         ),
       ),
     },
@@ -105,7 +88,7 @@ async function createBuildContext(developmentServerUrl, watch = false) {
   return { context, inputs: panel.inputs };
 }
 
-async function createCliContext() {
+async function createCliContext(identity) {
   fs.mkdirSync('dist/bin', { recursive: true });
   fs.writeFileSync(
     'dist/bin/arc',
@@ -127,16 +110,20 @@ async function createCliContext() {
     metafile: true,
     define: {
       ARC_VERSION: JSON.stringify(manifestVersion()),
-      ARC_BUILD_COMMIT: JSON.stringify(sourceIdentity().sourceCommit ?? 'unknown'),
+      ARC_BUILD_COMMIT: JSON.stringify(identity.sourceCommit ?? 'unknown'),
+      ARC_BUILD_DIRTY: JSON.stringify(identity.dirty),
     },
   });
 }
 
 export async function buildExtension({ watch = false, developmentServerUrl = null } = {}) {
+  const identity = watch
+    ? { sourceCommit: null, dirty: null }
+    : sourceIdentity(fileURLToPath(new URL('../', import.meta.url)));
   copyWindowsPipe('dist');
   if (watch) fs.rmSync('dist/build-identity.json', { force: true });
-  const cli = await createCliContext();
-  let current = await createBuildContext(developmentServerUrl, watch);
+  const cli = await createCliContext(identity);
+  let current = await createBuildContext(developmentServerUrl, identity, watch);
   if (!watch) {
     const cliResult = await cli.rebuild();
     const result = await current.context.rebuild();
@@ -151,7 +138,7 @@ export async function buildExtension({ watch = false, developmentServerUrl = nul
     });
     const tools = bundledTools(path.resolve('dist'), path.resolve('..'), {
       extensionVersion: manifestVersion(),
-      sourceCommit: sourceIdentity().sourceCommit,
+      sourceCommit: identity.sourceCommit,
     });
     const inputs = [
       ...new Set(
@@ -166,6 +153,7 @@ export async function buildExtension({ watch = false, developmentServerUrl = nul
           'resources/windowpipe.exe',
           'resources/windowpipe.json',
           '../scripts/windowpipe-build.mjs',
+          '../scripts/source-identity.mjs',
           'scripts/bundled-tools.mjs',
           ...tools.inputs,
         ].map((file) => path.relative(process.cwd(), path.resolve(file)).split(path.sep).join('/')),
@@ -176,7 +164,7 @@ export async function buildExtension({ watch = false, developmentServerUrl = nul
       'dist/build-identity.json',
       JSON.stringify({
         version: manifestVersion(),
-        ...sourceIdentity(),
+        ...identity,
         tools: tools.identity,
         extensionSha256: hash('dist/extension.js'),
         exportViewerScriptSha256: hash('dist/export-viewer.js'),
@@ -205,7 +193,7 @@ export async function buildExtension({ watch = false, developmentServerUrl = nul
   const rebuildPanel = async () => {
     await current.context.dispose();
     try {
-      current = await createBuildContext(developmentServerUrl, watch);
+      current = await createBuildContext(developmentServerUrl, identity, watch);
       await current.context.watch();
       rewatch();
       console.log(`rebuilt: the ${developmentServerUrl === null ? 'panel' : 'worker'} source changed`);

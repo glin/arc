@@ -798,7 +798,20 @@ if (process.env.ARC_TEST_PACKAGE_FAILURE) process.exit(1);
 fs.writeFileSync(process.argv.at(-1), 'fixture VSIX');`,
   );
   const write = (name, text) => fs.writeFileSync(path.join(bin, name), `#!/bin/bash\n${text}\n`, { mode: 0o755 });
-  const utilities = ['awk', 'basename', 'cat', 'chmod', 'dirname', 'gzip', 'mkdir', 'mktemp', 'readlink', 'rm', 'tar'];
+  const utilities = [
+    'awk',
+    'basename',
+    'cat',
+    'chmod',
+    'dirname',
+    'env',
+    'gzip',
+    'mkdir',
+    'mktemp',
+    'readlink',
+    'rm',
+    'tar',
+  ];
   const utilityPaths = bash('for utility in "$@"; do command -v "$utility" || exit 1; done', ...utilities).split('\n');
   for (const [index, name] of utilities.entries()) {
     const command = `#!${absoluteBash()}\nexec '${utilityPaths[index].replaceAll("'", "'\\''")}' "$@"\n`;
@@ -813,7 +826,7 @@ fs.writeFileSync(process.argv.at(-1), 'fixture VSIX');`,
   );
   write(
     'npm',
-    'cat >/dev/null\necho "npm $*" >> "$ARC_TEST_LOG"\nif [ "$1" = ci ] && [ "${ARC_TEST_LOCKED_DEPENDENCY:-0}" = 1 ]; then echo "EPERM: cannot unlink esbuild.exe" >&2; exit 1; fi\nexit "${ARC_TEST_NPM_FAILURE:-0}"',
+    'cat >/dev/null\necho "npm $*" >> "$ARC_TEST_LOG"\nif [ "$*" = "run build" ]; then echo "source revision ${ARC_SOURCE_COMMIT-unset}" >> "$ARC_TEST_LOG"; fi\nif [ "$1" = ci ] && [ "${ARC_TEST_LOCKED_DEPENDENCY:-0}" = 1 ]; then echo "EPERM: cannot unlink esbuild.exe" >&2; exit 1; fi\nexit "${ARC_TEST_NPM_FAILURE:-0}"',
   );
   for (const name of ['code', 'cursor'])
     write(
@@ -1843,6 +1856,22 @@ function exerciseManagedHooks(f) {
   assert.equal(manifest.files[0].path, file);
   assert.equal(fs.readFileSync(manifest.files[0].snapshot, 'utf8'), 'before edit\n');
 }
+
+for (const mode of ['local', 'remote'])
+  test.concurrent(`${mode} installer passes its source revision only to the build`, async () => {
+    const f = installerFixture();
+    try {
+      const result = await f.run(
+        [`--${mode}`, '--no-hooks', '--no-skills', 'code'],
+        { ARC_SOURCE_COMMIT: 'b'.repeat(40) },
+        { cwd: f.source },
+      );
+      assert.equal(result.status, 0, result.stderr);
+      assert.match(result.commands, mode === 'remote' ? /source revision a{40}/ : /source revision unset/);
+    } finally {
+      f.cleanup();
+    }
+  });
 
 for (const mode of ['local', 'remote'])
   test.concurrent(`${mode} installer fixture hooks survive source deletion in a separate archive-managed copy`, async () => {

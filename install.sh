@@ -395,7 +395,11 @@ EOF
   if [ "$ARC_INSTALL_CANCEL" -ne 0 ]; then exit "$ARC_INSTALL_CANCEL"; fi
   chmod +x node_modules/.bin/* 2>/dev/null || true
   if [ "$ARC_INSTALL_CANCEL" -ne 0 ]; then exit "$ARC_INSTALL_CANCEL"; fi
-  run_child npm run build
+  if [ "$local_source" -eq 1 ]; then
+    run_child env -u ARC_SOURCE_COMMIT npm run build
+  else
+    ARC_SOURCE_COMMIT="$sha" run_child npm run build
+  fi
   if [ "$ARC_INSTALL_CANCEL" -ne 0 ]; then exit "$ARC_INSTALL_CANCEL"; fi
   local VSIX="$ARC_INSTALL_TEMP/arc.vsix"
   if ! run_child node scripts/package.mjs --no-dependencies --allow-missing-repository -o "$VSIX"; then

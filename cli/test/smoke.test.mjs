@@ -978,6 +978,7 @@ const packageJson = JSON.parse(readFileSync(new URL('../package.json', import.me
 fixture.prompt_cache.expires_at = Math.ceil(Date.now() / 1000) + 300;
 const input = JSON.stringify(fixture);
 const cli = fileURLToPath(new URL('../dist/arc.cjs', import.meta.url));
+const expectedVersion = execFileSync(process.execPath, [cli, '--version'], { encoding: 'utf8' }).trim();
 const smokeEnv = {
   ...process.env,
   CLAUDE_CODE_SESSION_ID: '',
@@ -1340,9 +1341,12 @@ test('bundled discovery retains registry access denial without leaking errors or
   }
 });
 
-test('the bundled CLI reports the package version', () => {
+test('the bundled CLI reports its package version and source revision', () => {
   const output = execFileSync(process.execPath, [cli, '--version'], { env: smokeEnv, encoding: 'utf8' });
-  assert.equal(output.trim(), packageJson.version);
+  assert.match(
+    output.trim(),
+    new RegExp(`^${packageJson.version.replaceAll('.', '[.]')} [(][a-f0-9]{12}(-dirty)?[)]$`),
+  );
 });
 
 test('every admitted command renders shared help before stdin, discovery, network, or file changes', async () => {
@@ -1395,7 +1399,7 @@ process.stdin[Symbol.asyncIterator] = deny;
     }
     assert.equal(
       (await run(process.execPath, ['--require', preload, cli, 'start', '--help', '--version'], options)).stdout.trim(),
-      packageJson.version,
+      expectedVersion,
     );
   } finally {
     rmSync(home, { recursive: true, force: true });
@@ -2583,6 +2587,7 @@ test('the bundled cost command reads isolated roots and reports failures on stde
     const report = JSON.parse(result.stdout);
     assert.equal(report.schemaVersion, 2);
     assert.match(report.buildCommit, /^[0-9a-f]{40}$/);
+    assert.ok(expectedVersion.includes(report.buildCommit.slice(0, 12)));
     assert.equal(report.source.file, file);
     assert.equal(report.parent.requests, 1);
     assert.equal('modelCosts' in report.parent, false);
@@ -2741,7 +2746,7 @@ test('the packed package installs only arc globally and runs locally offline', (
     );
     const expectedHelp = execFileSync(process.execPath, [cli, '--help'], options);
     for (const command of ['arc']) {
-      assert.equal(installed(prefix, command, ['--version']).trim(), packageJson.version);
+      assert.equal(installed(prefix, command, ['--version']).trim(), expectedVersion);
       assert.equal(installed(prefix, command, ['--help']), expectedHelp);
       assert.deepEqual(
         JSON.parse(installed(prefix, command, ['statusline', '--json'], installedInput)),
@@ -2755,7 +2760,7 @@ test('the packed package installs only arc globally and runs locally offline', (
       assert.deepEqual(fs.readdirSync(folder), ['preserve']);
       assert.equal(readFileSync(join(folder, 'preserve'), 'utf8'), 'native instructions');
     }
-    assert.equal(npm(['exec', '--offline', '--no', '--', 'arc', '--version']).trim(), packageJson.version);
+    assert.equal(npm(['exec', '--offline', '--no', '--', 'arc', '--version']).trim(), expectedVersion);
     assert.deepEqual(JSON.parse(npm(['exec', '--offline', '--no', '--', 'arc', ...costArgs])), expectedCost);
     for (const invoke of [
       (args) => installed(prefix, 'arc', args),

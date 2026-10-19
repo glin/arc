@@ -1,4 +1,5 @@
 .vscodeignore
+CLAUDE.md
 src/**
 resources/**
 test/**

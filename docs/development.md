@@ -268,6 +268,8 @@ The tag starts the `VSIX candidate` workflow. It fails when the tag differs from
 
 ## Build and host constraints
 
+For source archives, set `ARC_SOURCE_COMMIT` using the source identity rules in [Architecture](architecture.md#module-boundaries). Watch builds leave host and bundled CLI source identity unavailable across rebuilds.
+
 - Extension activation must not walk and compare the snapshot store. Registration returns first. Cleanup runs later.
 - `node_modules` cannot be shared across operating systems because esbuild is native. Install dependencies on the machine that runs the build.
 - `packaging.test.ts` spawns `node esbuild.mjs` directly, so everything the build imports must load under plain Node. `esbuild.mjs` loads `panelbundle.ts` through the scoped `tsx/cjs/api` require. Do not register a global TypeScript loader because Node 22 can reject the resulting ESM cycle.

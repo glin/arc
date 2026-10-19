@@ -13,9 +13,13 @@ import { findCommand, renderCommandHelp, renderOverviewHelp } from './commands.t
 import { runSkills } from './skills.ts';
 
 declare const ARC_VERSION: string;
+declare const ARC_BUILD_COMMIT: string;
+declare const ARC_BUILD_DIRTY: boolean | null;
 
 // The build sets `ARC_VERSION` from the package manifest.
 const VERSION = typeof ARC_VERSION === 'string' ? ARC_VERSION : 'unknown';
+const COMMIT = typeof ARC_BUILD_COMMIT === 'string' ? ARC_BUILD_COMMIT.slice(0, 12) : 'unknown';
+const DIRTY = typeof ARC_BUILD_DIRTY === 'boolean' && ARC_BUILD_DIRTY ? '-dirty' : '';
 
 async function readStdin(): Promise<string> {
   process.stdin.setEncoding('utf8');
@@ -47,7 +51,7 @@ async function run(): Promise<void> {
     return;
   }
   if (args.includes('--version')) {
-    process.stdout.write(`${VERSION}\n`);
+    process.stdout.write(`${VERSION} (${COMMIT}${DIRTY})\n`);
     return;
   }
   const command = findCommand(args);
