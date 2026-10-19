@@ -9556,9 +9556,46 @@ test('a Claude subagent speed leaves out unstopped responses, other models, inte
   assert.equal(childRate(launcher), undefined, 'an untimed launcher takes no time from its nested subagent');
 });
 
-test('a dispatched Claude session read keeps no speed for its row', () => {
+test('a dispatched Claude session read times its row from its own turns', () => {
   const file = writeTranscript([userPrompt('work'), requestRecord('req-1', 10), requestBlock('m1', 'req-1', 14, 400)]);
   assert.equal(readSession(file, 'sess').turns[0].outputRateBasis, 'request', 'the session turn itself is timed');
+  const spend = readClaudeAgentSpend(file, [], false);
+  assert.deepEqual(spend.outputRate, { output: 400, milliseconds: 4000 });
+  assert.equal(spend.outputRateModel, 'claude-opus-5');
+});
+
+test('a dispatched Claude session row takes no time from its nested subagent', () => {
+  const folder = tempDir('timed-dispatch-nested-');
+  const session = path.join(folder, 'sess.jsonl');
+  const subagents = path.join(folder, 'sess', 'subagents');
+  fs.mkdirSync(subagents, { recursive: true });
+  const launch = requestBlock('m1', 'req-1', 14, 400);
+  writeRecords(session, [
+    userPrompt('dispatch work', 0),
+    requestRecord('req-1', 10),
+    { ...launch, message: { ...launch.message, content: [...agentLaunch('launch-1'), ...doneText] } },
+  ]);
+  writeSubagentMeta(subagents, 'a1', 'launch-1');
+  writeRecords(path.join(subagents, 'agent-a1.jsonl'), [
+    childTurn('nested', 15),
+    childRequest('req-9', 16),
+    childBlock('m9', 'req-9', 17, 900),
+  ]);
+  const spend = readClaudeAgentSpend(session, [], false);
+  assert.equal(spend.models[0]?.usage.output, 1300, 'the nested subagent adds its spend');
+  assert.deepEqual(spend.outputRate, { output: 400, milliseconds: 4000 });
+  assert.equal(spend.outputRateModel, 'claude-opus-5');
+});
+
+test('a dispatched Claude session timed on two models keeps no speed for its row', () => {
+  const file = writeTranscript([
+    userPrompt('first', 0),
+    requestRecord('req-1', 10),
+    requestBlock('m1', 'req-1', 14, 400),
+    userPrompt('second', 20),
+    requestRecord('req-2', 21),
+    requestBlock('m2', 'req-2', 22, 100, 'end_turn', 'claude-sonnet-5'),
+  ]);
   const spend = readClaudeAgentSpend(file, [], false);
   assert.equal(spend.outputRate, undefined);
   assert.equal(spend.outputRateModel, undefined);

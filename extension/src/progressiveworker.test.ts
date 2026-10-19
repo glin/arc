@@ -1300,6 +1300,60 @@ test('a detected larger same-inode Claude rewrite removes dispatched person and 
   }
 });
 
+test('a quiet dispatched Claude transcript times its row from its own request records', async () => {
+  const directory = tempDir('claude-dispatch-rate-');
+  const id = '4f4bf298-958f-4751-8782-d8688ff808a6';
+  const parentFile = path.join(directory, 'parent.jsonl');
+  const file = path.join(directory, id + '.jsonl');
+  const write = (file: string, rows: unknown[]) =>
+    fs.writeFileSync(file, rows.map((row) => JSON.stringify(row)).join('\n') + '\n');
+  write(parentFile, claudeDispatchTranscript('claude --bg review', 'backgrounded · 4f4bf298 · Review'));
+  const block = (second: number, output: number, stop: string | null) => ({
+    type: 'assistant',
+    requestRef: 'req-1',
+    timestamp: timestamp(second),
+    message: {
+      role: 'assistant',
+      id: 'm1',
+      stop_reason: stop,
+      content: [{ type: 'text', text: `block ${second}` }],
+      model: 'claude-sonnet-4-20250514',
+      usage: { input_tokens: 10, output_tokens: output },
+    },
+  });
+  write(file, [
+    { type: 'user', cwd: directory, timestamp: timestamp(0), message: { role: 'user', content: 'Review' } },
+    { type: 'api-request', sessionId: id, id: 'req-1', timestamp: timestamp(10), version: '2.1.302' },
+    block(12, 5, null),
+    block(14, 400, 'end_turn'),
+  ]);
+  const session = (file: string, sessionId: string) => {
+    const stat = revisionOf(fs.statSync(file, { bigint: true }));
+    return { file, sessionId, agent: 'claude' as const, size: stat.size, mtimeMs: stat.mtimeMs };
+  };
+  const worker = new ProgressiveWorker(source);
+  try {
+    const reply = await completeDiscovery(
+      worker,
+      {
+        kind: 'claude-children' as const,
+        parents: [session(parentFile, 'parent'), session(file, id)],
+        catalog: [session(parentFile, 'parent'), session(file, id)],
+        repositoryRoots: [directory],
+      },
+      1,
+      new AbortController().signal,
+    );
+    assert.ok(reply?.value.kind === 'claude-children');
+    const { spend } = reply.value.dispatchFacts[0];
+    assert.deepEqual(spend.outputRate, { output: 400, milliseconds: 4000 });
+    assert.equal(spend.outputRateModel, 'claude-sonnet-4-20250514');
+  } finally {
+    worker.stop();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test('Claude recursive closure removes deleted descendants and restores later appearances', async () => {
   const directory = tempDir('claude-recursive-closure-');
   const parentFile = path.join(directory, 'parent.jsonl');

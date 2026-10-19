@@ -33,7 +33,7 @@ import {
 } from './turncard';
 import { reduceChildArtifacts, childToolCalls, type ChildArtifacts } from './childartifacts';
 import { heaviestModel, type AgentSpend } from './agentspend';
-import { validRate } from './outputrate';
+import { summedTurnRate } from './outputrate';
 import { sameCommitSha } from './domain/commit-sha';
 import type { CardView } from './webview/payload-contracts';
 import { renderRichMarkdown } from './richtext';
@@ -462,9 +462,9 @@ function turnCard(
   return card;
 }
 
-// A Claude session row shows a speed only as a subagent, so every other Claude rebuild drops the session's request timing.
+// A Claude session row shows a speed as a subagent or a dispatched session, so a reader-started Claude rebuild drops the session's request timing.
 function linkedRowSpend(spend: AgentSpend, kind: ExportRelationship['kind'], agent: 'claude' | 'codex'): AgentSpend {
-  if (kind === 'subagent' || agent !== 'claude') return spend;
+  if (kind !== 'reader-started' || agent !== 'claude') return spend;
   const kept = { ...spend };
   delete kept.outputRate;
   delete kept.outputRateModel;
@@ -492,9 +492,7 @@ async function sessionAgentFacts(
     let state: SessionAgentFacts['state'] = 'open';
     let effort: string | null = null;
     let count = 0;
-    const rate = { output: 0, milliseconds: 0 };
-    let rateModel: string | undefined;
-    let rateQualified = true;
+    const timedTurns: Parameters<typeof summedTurnRate>[0][number][] = [];
     const failedTools: Record<string, number> = Object.create(null);
     const launches = new Map<string, { turn: string; at: number; index: number }>();
     for (const spool of session.pages) {
@@ -542,20 +540,12 @@ async function sessionAgentFacts(
         artifacts = { ...merged, ...(failures ? { failed: { count: failures, byTool: { ...failedTools } } } : {}) };
         // A Claude child row names request time, so only a request-timed Claude turn adds to its speed.
         // A Codex turn records no basis.
-        const timed = session.agent === 'claude' ? value.outputRateBasis === 'request' : true;
-        if (!value.interrupted && value.outputRate && timed) {
-          if (
-            !value.outputRateModel ||
-            !validRate(value.outputRate) ||
-            (rateModel && rateModel !== value.outputRateModel)
-          )
-            rateQualified = false;
-          else {
-            rateModel = value.outputRateModel;
-            rate.output += value.outputRate.output;
-            rate.milliseconds += value.outputRate.milliseconds;
-          }
-        }
+        if (value.outputRate && (session.agent !== 'claude' || value.outputRateBasis === 'request'))
+          timedTurns.push({
+            interrupted: value.interrupted,
+            outputRate: value.outputRate,
+            outputRateModel: value.outputRateModel,
+          });
         count++;
         if (newest === null || value.startedAt > newest) {
           newest = value.startedAt;
@@ -589,9 +579,7 @@ async function sessionAgentFacts(
         effort,
         artifacts,
         commits,
-        ...(rateQualified && rateModel && rate.output > 0 && validRate(rate)
-          ? { outputRate: rate, outputRateModel: rateModel }
-          : {}),
+        ...summedTurnRate(timedTurns),
       },
     });
   }
@@ -867,6 +855,7 @@ export async function projectSessionSite(
                           [],
                           model.capturedAt,
                           target.agent,
+                          edge.kind === 'reader-started' ? 'session' : edge.kind,
                         ),
                       ],
                     }).agents![0]

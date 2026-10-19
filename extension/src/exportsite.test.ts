@@ -591,48 +591,12 @@ test('child and dispatch recorded costs exclude lifetime supplements and retain 
   }
 });
 
-test('an exported Dispatched Claude row shows no speed from request-timed child turns', async () => {
-  const writer = await ExportTransaction.create(tempDir('arc-site-dispatch-rate-'));
-  try {
-    const model = await sessionSiteFixture(writer);
-    const child = model.sessions[1];
-    child.agent = 'claude';
-    const part = costPartOf({
-      role: 'main',
-      model: 'claude-opus-5',
-      provider: null,
-      contextWindow: null,
-      usage: { requests: 1, input: 1000, cacheRead: 0, cacheWrite1h: 0, cacheWrite5m: 0, output: 300, thinking: 0 },
-    });
-    child.numbers = {
-      parts: [part],
-      main: { dollars: 0.1, partial: false },
-      delegated: { dollars: 0, partial: false },
-      combined: { dollars: 0.1, partial: false },
-      coverage: { usage: 'complete', cost: 'complete' },
-    };
-    const childPage = await writer.readSpool<import('./exportdata').ExportPage>(child.pages[0]);
-    const timed = childPage.turns[0];
-    timed.finished = true;
-    timed.model = 'claude-opus-5';
-    timed.outputRate = { output: 300, milliseconds: 2000 };
-    timed.outputRateModel = 'claude-opus-5';
-    timed.outputRateBasis = 'request';
-    child.pages = [await writer.spool(childPage)];
-    model.relationships[0].kind = 'dispatched';
-    model.relationships[0].ownership = 'delegated';
-    await projectSessionSite(model, writer, { script: '', stylesheet: '' });
-    const { manifest, data } = exportedSiteData((await writer.publish(async () => {})).directory);
-    const card = (data.get(manifest.sessions[0].pages[0].cards![0].id) as { card: CardView }).card;
-    assert.ok(card.dispatched?.[0]);
-    assert.doesNotMatch(JSON.stringify(card.dispatched[0]), /tok\/s/);
-  } finally {
-    await writer.dispose();
-  }
-});
-
 // Projects the fixture's one linked row, timed at 150 tok/s, and returns the root card holding it.
-async function linkedRateCard(kind: 'subagent' | 'dispatched' | 'reader-started', agent: 'claude' | 'codex') {
+async function linkedRateCard(
+  kind: 'subagent' | 'dispatched' | 'reader-started',
+  agent: 'claude' | 'codex',
+  rateModel?: string,
+) {
   const writer = await ExportTransaction.create(tempDir('arc-site-linked-rate-'));
   try {
     const model = await sessionSiteFixture(writer);
@@ -659,7 +623,7 @@ async function linkedRateCard(kind: 'subagent' | 'dispatched' | 'reader-started'
       finished: true,
       model: childModel,
       outputRate: { output: 300, milliseconds: 2000 },
-      outputRateModel: childModel,
+      outputRateModel: rateModel ?? childModel,
       ...(agent === 'claude' ? { outputRateBasis: 'request' } : {}),
     });
     child.pages = [await writer.spool(childPage)];
@@ -679,13 +643,41 @@ async function linkedRateCard(kind: 'subagent' | 'dispatched' | 'reader-started'
   }
 }
 
+// The closing sentence of a row's speed title names the kind of row.
+const rowTimedSentence = {
+  subagent: 'Only this subagent is timed.',
+  dispatched: 'Only this dispatched session is timed.',
+  'reader-started': 'Only this session is timed.',
+} as const;
+
+test('an exported Dispatched Claude row shows the speed its request-timed turns measure', async () => {
+  const rows = await linkedRateCard('dispatched', 'claude');
+  assert.match(rows, /150\.0 tok\/s/);
+  assert.ok(
+    rows.includes('Measured model: claude-opus-5. Only this dispatched session is timed. Usage totals include'),
+    rows,
+  );
+});
+
 test('an exported Reader-started Claude row shows no speed from request-timed child turns', async () => {
   assert.doesNotMatch(await linkedRateCard('reader-started', 'claude'), /tok\/s/);
 });
 
 test('an exported Codex row of every relationship kind keeps its measured speed', async () => {
-  for (const kind of ['subagent', 'dispatched', 'reader-started'] as const)
-    assert.match(await linkedRateCard(kind, 'codex'), /150\.0 tok\/s/, kind);
+  for (const kind of ['subagent', 'dispatched', 'reader-started'] as const) {
+    const rows = await linkedRateCard(kind, 'codex');
+    assert.match(rows, /150\.0 tok\/s/, kind);
+    assert.ok(
+      rows.includes(`Measured model: gpt-5.5. ${rowTimedSentence[kind]} Usage totals include any delegated work.`),
+      kind,
+    );
+  }
+});
+
+test('an exported Claude row drops a speed measured on an overlong model name', async () => {
+  const rateModel = 'claude-opus-5'.padEnd(513, 'x');
+  for (const kind of ['subagent', 'dispatched'] as const)
+    assert.doesNotMatch(await linkedRateCard(kind, 'claude', rateModel), /tok\/s/, kind);
 });
 
 test('an exported Claude subagent row shows the speed its request-timed turns measure', async () => {

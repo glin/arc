@@ -9090,7 +9090,7 @@ interface ClaudeOwnSpend {
   effort: string | null;
   finished: boolean;
   record: ClaudeSpendRecord | null;
-  // The summed request timing of this transcript's own turns. Only a subagent transcript has one.
+  // The summed request timing of this transcript's own turns. A subagent read and a dispatched read carry it. A nested read does not.
   outputRate?: OutputRate;
   outputRateModel?: string;
 }
@@ -9237,8 +9237,9 @@ function readClaudeOwnSpend(
     addTurnUsagePart(exact, request);
   }
   const childTurns = child.finish().turns;
-  // A dispatched session row keeps no speed, so only a subagent transcript sums its turns.
-  const measured = childTranscript ? summedTurnRate(childTurns) : undefined;
+  // Only the root read of a row sums its turns, so a nested subagent adds spend and no time.
+  // The root is a subagent or a dispatched session, because only those reads ask for a record.
+  const measured = withRecord ? summedTurnRate(childTurns) : undefined;
   let record: ClaudeSpendRecord | null = null;
   if (withRecord) {
     const span = childTurnSpan(childTurns);

@@ -957,7 +957,13 @@ function hintDetailLine(line: StatDetailLine): string {
 
 // Cost breakdown for a child figure, excluding its displayed total.
 // Coverage-only blocks become standalone lines without headings. Compaction notes go to `notes`.
-function agentCostEntries(agent: TurnAgent, runner: AgentKind, noEnding: boolean, notes: string[]): StatDetailEntry[] {
+function agentCostEntries(
+  agent: TurnAgent,
+  runner: AgentKind,
+  noEnding: boolean,
+  notes: string[],
+  row: TimedRow,
+): StatDetailEntry[] {
   if (!agent.spend.length) {
     return [];
   }
@@ -991,6 +997,7 @@ function agentCostEntries(agent: TurnAgent, runner: AgentKind, noEnding: boolean
       ),
     ),
     agentRateBasis(runner),
+    row,
   );
   if (usage.length) {
     entries.push({ ...usage[0], separateBefore: true }, ...usage.slice(1));
@@ -1084,9 +1091,10 @@ function costRecordList(
   partial: boolean,
   runner: AgentKind,
   noEnding: boolean,
+  row: TimedRow,
 ): Omit<StatDetailList, 'heading'> {
   const notes: string[] = [];
-  const entries = agentCostEntries(agent, runner, noEnding, notes);
+  const entries = agentCostEntries(agent, runner, noEnding, notes, row);
   return notes.length ? { entries, notes } : { entries };
 }
 
@@ -1101,6 +1109,7 @@ function agentTokensFigure(
   agent: TurnAgent,
   priced: boolean,
   runner: AgentKind,
+  row: TimedRow,
   running = false,
   noEnding = false,
 ): AgentFigure | null {
@@ -1137,6 +1146,7 @@ function agentTokensFigure(
               ),
             ),
             agentRateBasis(runner),
+            row,
           ),
           ...(running ? { footer: [noEnding ? AGENT_USAGE_NO_ENDING : AGENT_USAGE_SO_FAR] } : {}),
         },
@@ -1236,6 +1246,7 @@ function agentFigures(
   rowPaths: ReadonlyMap<string, string>,
   now: number,
   runner: AgentKind,
+  row: TimedRow,
 ): AgentFigure[] {
   const figures: AgentFigure[] = [];
   const priced = spendCost(agent);
@@ -1252,11 +1263,11 @@ function agentFigures(
       metric: 'cost',
       compactLabel: `${cost}${partial ? '+' : ''}`,
       name,
-      ...figureRecord(name, costRecordList(agent, partial, runner, noEnding), false),
+      ...figureRecord(name, costRecordList(agent, partial, runner, noEnding, row), false),
     });
   }
   if (running) {
-    const tokens = agentTokensFigure(agent, !!cost, runner, true, noEnding);
+    const tokens = agentTokensFigure(agent, !!cost, runner, row, true, noEnding);
     return tokens ? [...figures, tokens] : figures;
   }
   const ran = agentDurationFigure(agent, now);
@@ -1311,7 +1322,7 @@ function agentFigures(
       ),
     });
   }
-  const tokens = agentTokensFigure(agent, !!cost, runner);
+  const tokens = agentTokensFigure(agent, !!cost, runner, row);
   if (tokens) {
     figures.push(tokens);
   }
@@ -1326,6 +1337,7 @@ function agentCard(
   rowPaths: ReadonlyMap<string, string>,
   now: number,
   runner: AgentKind = 'claude',
+  row: TimedRow = 'subagent',
 ): AgentCard {
   const display = agentDisplay(agent, turnRunning, sessionLive);
   // Only a child with live-process evidence counts up. An open child draws no time.
@@ -1334,7 +1346,7 @@ function agentCard(
     description: agent.description,
     model: shortModel(agentModel(agent)),
     effort: agent.effort,
-    figures: agentFigures(agent, display.state, rowPaths, now, runner),
+    figures: agentFigures(agent, display.state, rowPaths, now, runner, row),
     state: display.state,
     stateWord: display.stateWord,
     since: display.state === 'running' ? agent.startedAt || launch?.step.at || null : null,
@@ -1392,6 +1404,7 @@ export function dispatchedAgentCard(
   folders: string[] = [],
   now: number = Date.now(),
   runner: AgentKind = 'claude',
+  row: TimedRow = 'dispatched',
 ): AgentCard {
   const agent: TurnAgent = {
     id: sessionId,
@@ -1418,7 +1431,16 @@ export function dispatchedAgentCard(
   const live = { session: false, children: state === 'running' ? new Set([sessionId]) : new Set<string>() };
   const files = state === 'running' ? [] : fileCardsOf(spend.artifacts?.files ?? [], folders);
   const commits = state === 'running' ? [] : (spend.commits ?? []).map((commit) => commitCard(commit, now));
-  const card = agentCard(agent, false, live, new Map(), fileRowPathsByKey(spend.artifacts?.files ?? []), now, runner);
+  const card = agentCard(
+    agent,
+    false,
+    live,
+    new Map(),
+    fileRowPathsByKey(spend.artifacts?.files ?? []),
+    now,
+    runner,
+    row,
+  );
   return { ...card, kind: 'dispatch', files, commits, since: state === 'running' ? startedAt : null };
 }
 
@@ -1746,6 +1768,14 @@ function compactUsageParts(usage: Turn['usage']): string[] {
   return parts;
 }
 
+// The kind of row the speed tooltip names. An exported reader-started row is named a session.
+export type TimedRow = 'subagent' | 'dispatched' | 'session';
+const TIMED_ROW_NAMES: Record<TimedRow, string> = {
+  subagent: 'subagent',
+  dispatched: 'dispatched session',
+  session: 'session',
+};
+
 // Shared usage breakdown for turn token figures and child cost records.
 function usageDetailEntries(
   u: Turn['usage'],
@@ -1755,6 +1785,7 @@ function usageDetailEntries(
   measuredModel?: string,
   cacheUsage = u,
   basis: OutputRateBasis = 'stream',
+  row: TimedRow = 'subagent',
 ): StatDetailEntry[] {
   const entries: StatDetailEntry[] = [...lead];
   const input = inputSideTokens(u);
@@ -1773,7 +1804,7 @@ function usageDetailEntries(
       ? [
           {
             text: rate,
-            title: `${rate}. ${title}${measuredModel ? ` Measured model: ${measuredModel}. Only this subagent is timed. Usage totals include any delegated work.` : ''}`,
+            title: `${rate}. ${title}${measuredModel ? ` Measured model: ${measuredModel}. Only this ${TIMED_ROW_NAMES[row]} is timed. Usage totals include any delegated work.` : ''}`,
           },
         ]
       : [];

@@ -222,8 +222,10 @@ test('dispatched Codex usage retains qualified measurement in priced and unprice
     const line = figure.record!.entries.find((entry) => entry.label === 'Output')!.lines![0];
     assert.ok(typeof line === 'object' && 'text' in line);
     assert.equal(line.text, '8.4 tok/s');
-    assert.ok(line.title?.includes('Request time'));
-    assert.ok(line.title?.includes('gpt-6.1-sol'));
+    assert.equal(
+      line.title,
+      '8.4 tok/s. Output tokens per second. Actual output includes reasoning. Request time includes preparation and hooks. Blocking local tool waits and untimed responses are excluded. Measured model: gpt-6.1-sol. Only this dispatched session is timed. Usage totals include any delegated work.',
+    );
     assert.ok(figure.detail?.includes('8.4 tok/s'));
     const unqualified = dispatchedAgentCard(
       'child',
@@ -6213,20 +6215,32 @@ test('an unpriced Claude subagent row names request time in its tokens figure', 
   });
 });
 
-test('a dispatched Claude session row keeps no output speed', () => {
-  const at = (second: number) => new Date(Date.UTC(2026, 0, 1, 0, 0, second)).toISOString();
-  const file = path.join(tempDir('timed-dispatch-'), 'sess.jsonl');
-  fs.writeFileSync(
-    file,
-    timedResponse('claude-haiku-4-5', false, at)
-      .map((record) => JSON.stringify(record))
-      .join('\n') + '\n',
-  );
-  assert.equal(readSession(file, 'sess').turns[0].outputRateBasis, 'request', 'the session turn itself is timed');
-  const spend = readClaudeAgentSpend(file, [], false);
-  const row = dispatchedAgentCard('sess', 'Review the card', spend, 'done', 1000, 65000, 2, [], NOW, 'claude');
-  assert.ok(row.figures.some((figure) => figure.metric === 'cost'));
-  assert.doesNotMatch(JSON.stringify(row), /tok\/s/);
+// The dispatched row's speed names the dispatched session, never a subagent.
+const dispatchedRequestTitle = (model: string) =>
+  childRequestTitle(model).replace('Only this subagent is timed.', 'Only this dispatched session is timed.');
+
+test('a dispatched Claude session row shows the output speed its own request records measure', () => {
+  for (const [model, metric] of [
+    ['claude-haiku-4-5', 'cost'],
+    ['claude-unpriced-9', 'tokens'],
+  ]) {
+    const at = (second: number) => new Date(Date.UTC(2026, 0, 1, 0, 0, second)).toISOString();
+    const file = path.join(tempDir('timed-dispatch-'), 'sess.jsonl');
+    fs.writeFileSync(
+      file,
+      timedResponse(model, false, at)
+        .map((record) => JSON.stringify(record))
+        .join('\n') + '\n',
+    );
+    assert.equal(readSession(file, 'sess').turns[0].outputRateBasis, 'request', 'the session turn itself is timed');
+    const spend = readClaudeAgentSpend(file, [], false);
+    const row = dispatchedAgentCard('sess', 'Review the card', spend, 'done', 1000, 65000, 2, [], NOW, 'claude');
+    assert.equal(
+      row.figures.some((figure) => figure.metric === 'cost'),
+      metric === 'cost',
+    );
+    assert.deepEqual(outputSpeedLine(row, metric), { text: '100.0 tok/s', title: dispatchedRequestTitle(model) });
+  }
 });
 
 test('a completed child with no billed response is an exact zero', () => {
