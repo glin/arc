@@ -154,7 +154,7 @@ try {
   if (process.argv[8] === 'json') process.stdout.write(JSON.stringify(receipt)+'\n');
   else {
     const names = {claude:'Claude Code',codex:'Codex'};
-    const state = value => ({completed:'completed',unattempted:'not attempted','skipped-no-detected-provider':'skipped because no supported agent executable was detected','external-match-preserved':'matching personal copy preserved',unchanged:'already installed'}[value] || value);
+    const state = value => ({completed:'completed',unattempted:'not attempted','skipped-no-detected-provider':'skipped because no supported agent executable was detected','external-match-preserved':'matching personal copy preserved',unchanged:'already installed',linked:'uses the linked skills folder'}[value] || value);
     console.log('Arc installation results:');
     for (const editor of editors) console.log(`  Editor ${editor.editor}: ${editor.status === 'completed' ? 'installed' : state(editor.status)}.`);
     if (!editors.length) console.log(`  Editors: ${state(receipt.components.editors)}.`);

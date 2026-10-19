@@ -301,6 +301,44 @@ test.concurrent.each([[['codex']], [['claude']], [['claude', 'codex']]])(
   },
 );
 
+test.concurrent.each([false, true])(
+  'a Codex skills folder linked to the Claude skills folder installs once and reports the link (JSON %s)',
+  async (json) => {
+    const f = installerFixture();
+    try {
+      fs.mkdirSync(path.join(f.dir, '.claude/skills'), { recursive: true });
+      fs.mkdirSync(path.join(f.dir, '.agents'));
+      fs.symlinkSync(
+        path.join(f.dir, '.claude/skills'),
+        path.join(f.dir, '.agents/skills'),
+        process.platform === 'win32' ? 'junction' : 'dir',
+      );
+      const args = ['--remote', '--no-hooks', '--skill-agent', 'codex', '--skill-agent', 'claude', 'code'];
+      const result = await f.run(args, { CLAUDE_CONFIG_DIR: '' }, { skills: true, json });
+      assert.equal(result.status, 0, result.stdout + result.stderr);
+      assert.doesNotMatch(result.stdout, /failed/i);
+      expectSkillCopy(path.join(f.dir, '.claude/skills/arc-sessions'));
+      if (json) {
+        const receipt = JSON.parse(result.stdout.trim().split('\n').at(-1));
+        assert.deepEqual(
+          receipt.skills.results.map((r) => [r.agent, r.status]),
+          [
+            ['codex', 'linked'],
+            ['claude', 'installed'],
+          ],
+        );
+      } else assert.match(result.stdout, /Codex skill: uses the linked skills folder/);
+    } finally {
+      const link = path.join(f.dir, '.agents/skills');
+      if (fs.existsSync(link)) {
+        if (process.platform === 'win32') fs.rmdirSync(link);
+        else fs.unlinkSync(link);
+      }
+      f.cleanup();
+    }
+  },
+);
+
 test.concurrent('Git Bash cancellation after skill child success retains source until exit and preserves completed receipt', async () => {
   const f = installerFixture();
   try {

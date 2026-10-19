@@ -22,7 +22,7 @@ arc skills update --agent claude --agent codex
 arc skills remove --agent claude --agent codex
 ```
 
-These commands support default personal destinations. [Skill ownership and recovery](../docs/arc-sessions.md#install-the-parts-you-need) defines preserved copies and interruption handling. For a manually maintained custom destination, link the packaged directory. Claude Code uses `~/.claude/skills`. Codex uses `~/.agents/skills`.
+These commands support default personal destinations. [Skill ownership and recovery](../docs/arc-sessions.md#install-the-parts-you-need) defines preserved copies and interruption handling. For a manually maintained custom destination, link the packaged directory. Claude Code uses `~/.claude/skills`. Codex uses `~/.agents/skills`. When one of these folders is a link, such as `~/.agents/skills` linked to `~/.claude/skills`, Arc writes nothing through it. That agent uses the skill at the link's target, so install it there.
 
 For a global Windows installation, run in PowerShell:
 

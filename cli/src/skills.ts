@@ -31,6 +31,7 @@ export interface SkillResult {
     | 'updated'
     | 'removed'
     | 'unchanged'
+    | 'linked'
     | 'external-match-preserved'
     | 'incomplete'
     | 'failed'
@@ -120,6 +121,26 @@ function contains(root: string, file: string): boolean {
   return relative === '' || (!path.isAbsolute(relative) && relative !== '..' && !relative.startsWith(`..${path.sep}`));
 }
 
+const agentNames: Record<SkillAgent, string> = { claude: 'Claude Code', codex: 'Codex' };
+const otherAgent = (agent: SkillAgent): SkillAgent => (agent === 'claude' ? 'codex' : 'claude');
+// A personal skills folder is linked when it resolves anywhere but its own place under the home folder.
+function skillFolder(agent: SkillAgent, nativeHome: string): { input: string; area: string; linked: boolean } {
+  const relative = path.join(agent === 'claude' ? '.claude' : '.agents', 'skills');
+  const input = path.join(nativeHome, relative);
+  const area = canonicalToolPath(input);
+  return { input, area, linked: area !== path.join(canonicalToolPath(nativeHome), relative) };
+}
+function safeSkillFolder(agent: SkillAgent, nativeHome: string): ReturnType<typeof skillFolder> | undefined {
+  try {
+    return skillFolder(agent, nativeHome);
+  } catch {
+    return undefined;
+  }
+}
+export function skillFolderLinked(agent: SkillAgent, nativeHome = os.homedir()): boolean {
+  return safeSkillFolder(agent, nativeHome)?.linked ?? false;
+}
+
 export async function operateSkill(
   action: SkillAction,
   agent: SkillAgent,
@@ -130,8 +151,7 @@ export async function operateSkill(
   const nativeHome = options.home ?? os.homedir();
   if (!path.isAbsolute(nativeHome)) throw new Error('Arc needs an absolute personal home folder.');
   const home = canonicalToolPath(nativeHome);
-  const areaInput = path.join(nativeHome, agent === 'claude' ? '.claude' : '.agents', 'skills');
-  const area = canonicalToolPath(areaInput);
+  const { input: areaInput, area, linked: areaLinked } = skillFolder(agent, nativeHome);
   const destination = path.join(area, 'arc-sessions');
   const control = `${area}.arc-skill-control`;
   const result = (status: SkillResult['status'], reason?: string): SkillResult => ({
@@ -150,6 +170,51 @@ export async function operateSkill(
       'Custom Claude configuration is unsupported. Use the manual skill installation instructions.',
     );
   const files = Object.fromEntries([...payload.files].map(([relative, bytes]) => [relative, digest(bytes)]));
+  const peer = safeSkillFolder(otherAgent(agent), nativeHome);
+  if (areaLinked) {
+    // Arc never writes through a linked skills folder. Whatever is at the target serves this agent.
+    const name = agentNames[agent];
+    const other = otherAgent(agent);
+    const toPeer = peer !== undefined && !peer.linked && peer.area === area;
+    const target = toPeer ? `the ${agentNames[other]} skills folder` : area;
+    const intro = `The ${name} skills folder is linked to ${target}${toPeer ? ` at ${area}` : ''}.`;
+    const present = exists(destination);
+    // The peer commands refuse a copy that Arc does not own, so they are offered only for an absent or Arc-owned copy.
+    const peerOwned = toPeer && exists(path.join(control, 'installed.json'));
+    const peerCommand = toPeer && (!present || peerOwned);
+    if (action === 'remove')
+      return result(
+        'linked',
+        `${intro} Arc left the linked folder unchanged.${
+          present
+            ? peerCommand
+              ? ` Remove the skill there with arc skills remove --agent ${other}.`
+              : ` Arc does not manage that copy. Remove the skill at ${destination} by hand.`
+            : ''
+        }`,
+      );
+    let matches = false;
+    if (present) {
+      try {
+        matches = equalFiles(scan(fs.realpathSync.native(destination)), files);
+      } catch {
+        matches = false;
+      }
+    }
+    if (matches)
+      return result('linked', `${intro} ${name} reads the skill there, and Arc left the linked folder unchanged.`);
+    const verb = present ? 'update' : 'install';
+    return result(
+      'incomplete',
+      `${intro} The skill there is ${present ? 'different from this version' : 'missing'}, and Arc leaves linked folders unchanged. ${
+        peerCommand
+          ? `Run arc skills ${verb} --agent ${other} to ${verb} it there.`
+          : toPeer
+            ? `Arc does not manage the copy at ${destination}. Update it there by hand as described in cli/README.md#session-skill.`
+            : 'Link or copy the skill there as described in cli/README.md#session-skill.'
+      }`,
+    );
+  }
   const metadata = path.join(control, 'installed.json');
   // A read-only match never grants permission to write through redirected discovery folders.
   if (action === 'install' && exists(destination) && !exists(metadata)) {
@@ -372,8 +437,14 @@ export async function operateSkill(
     if (exists(path.join(operation, 'claim.json'))) fs.unlinkSync(path.join(operation, 'claim.json'));
     save(path.join(operation, 'seal.json'), { schema: 1, token, settled: true });
     settled = true;
+    const sharedWith = action === 'remove' && peer?.linked && peer.area === area ? agentNames[otherAgent(agent)] : '';
     return {
-      ...result(action === 'install' ? 'installed' : action === 'update' ? 'updated' : 'removed'),
+      ...result(
+        action === 'install' ? 'installed' : action === 'update' ? 'updated' : 'removed',
+        sharedWith
+          ? `${sharedWith} also read this skill through its linked skills folder, so it no longer finds it.`
+          : undefined,
+      ),
       control,
       operation,
     };
@@ -495,15 +566,23 @@ export async function runSkills(action: string, args: string[]): Promise<void> {
   process.stdout.on('error', ignoreOutputError);
   process.stderr.on('error', ignoreOutputError);
   try {
-    for (const agent of agents) {
+    // A linked folder reads what its target holds, so folders that Arc writes run first. Results keep the flag order.
+    const ordered = [...agents].sort((a, b) => Number(skillFolderLinked(a)) - Number(skillFolderLinked(b)));
+    const byAgent = new Map<SkillAgent, SkillResult>();
+    for (const agent of ordered) {
       if (controller.signal.aborted) {
-        results.push({ agent, destination: '', status: 'cancelled', reason: 'Not attempted after cancellation.' });
+        byAgent.set(agent, {
+          agent,
+          destination: '',
+          status: 'cancelled',
+          reason: 'Not attempted after cancellation.',
+        });
         continue;
       }
       try {
-        results.push(await operateSkill(action as SkillAction, agent, payload, { signal: controller.signal }));
+        byAgent.set(agent, await operateSkill(action as SkillAction, agent, payload, { signal: controller.signal }));
       } catch (error) {
-        results.push({
+        byAgent.set(agent, {
           agent,
           destination: '',
           status: 'failed',
@@ -511,6 +590,7 @@ export async function runSkills(action: string, args: string[]): Promise<void> {
         });
       }
     }
+    for (const agent of agents) results.push(byAgent.get(agent)!);
     process.exitCode =
       cancellation || (results.some((r) => ['failed', 'incomplete', 'cancelled'].includes(r.status)) ? 1 : 0);
     try {
