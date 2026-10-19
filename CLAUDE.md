@@ -25,6 +25,12 @@ Do not line wrap Markdown. One paragraph is one line, and one list item is one l
 
 `docs/criteria.md` is personal first-person prose and does not follow this section. Everything else does.
 
+## CLI
+
+- Design CLI changes for the author and the `arc-sessions` skill.
+- For new or changed CLI output, default to readable text and put structured output behind `--json`. Agent calls must use `--json` when the command supports it.
+- Keep human output, command help, and user docs concise. State the result and any required next step.
+
 ## Feature proposals
 
 Read `docs/design-goals.md` before proposing a feature. State the requirement or reader job the proposal serves. Get author approval before proposing work that serves neither.
