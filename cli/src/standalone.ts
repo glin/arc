@@ -25,6 +25,7 @@ import {
 } from '../../extension/src/transcript.ts';
 import { savedDispatchResponse } from '../../extension/src/sessionreads.ts';
 import { childEnv } from '../../extension/src/agenthost.ts';
+import { shortenTo } from '../../extension/src/domain/text.ts';
 
 const execute = promisify(execFile);
 const REPORT_BYTES = 8 * 1024 * 1024;
@@ -325,6 +326,70 @@ function* logChunks(
   } finally {
     fs.closeSync(fd);
   }
+}
+
+const DIAGNOSTIC_BYTES = 64 * 1024;
+const DIAGNOSTIC_LINE = 300;
+// Each provider prints these refusals before it starts a worker.
+const PROVIDER_REFUSALS = { claude: /^Workspace not trusted\./, codex: /^Not inside a trusted directory/ } as const;
+const FOREGROUND_UNREFUSED = 'The provider ended without a final response.';
+const PROVIDER_MESSAGE = 'Provider message: ';
+const REFUSED_REASON = /^(Claude|Codex) refused the launch\. No worker was started\. Provider message: /;
+
+function leadingLog(receipts: DispatchReceipts, id: string, name: 'stdout.log' | 'stderr.log', readBytes: number) {
+  const file = receipts.artifact(id, name);
+  const parts: Buffer[] = [];
+  let read = 0;
+  let complete = false;
+  try {
+    const chunks = logChunks(file, readBytes, { offset: 0, identity: '' }, DIAGNOSTIC_BYTES);
+    for (let step = chunks.next(); ; step = chunks.next()) {
+      if (step.done) {
+        // Bytes appended during the read were not read, so the read is incomplete.
+        complete = step.value && Number(fs.lstatSync(file).size) === read;
+        break;
+      }
+      read += step.value.length;
+      parts.push(Buffer.from(step.value));
+    }
+  } catch {
+    complete = false;
+  }
+  return { text: Buffer.concat(parts).toString('utf8'), complete };
+}
+
+// Explains a launch that ended without an acknowledgment or a native turn from the first nonblank stderr line.
+// A recognized refusal proves that no worker started only with a nonzero exit, no standard output, and the whole stderr read.
+function providerEnding(
+  receipts: DispatchReceipts,
+  id: string,
+  options: StandaloneOptions,
+  readBytes: number,
+  exitCode: number | null,
+  signal: string | null,
+  unrefused: string,
+): { reason: string; refused: boolean } | null {
+  const stderr = leadingLog(receipts, id, 'stderr.log', readBytes);
+  const found = stderr.text
+    .split('\n')
+    .map((line) => line.replace(/[\u0000-\u001f\u007f]/g, ' ').trim())
+    .find(Boolean);
+  if (!found) return null;
+  const message = `${PROVIDER_MESSAGE}${shortenTo(found, DIAGNOSTIC_LINE, '...')}`;
+  const stdout = leadingLog(receipts, id, 'stdout.log', readBytes);
+  const refused =
+    PROVIDER_REFUSALS[options.provider].test(found) &&
+    exitCode !== null &&
+    exitCode !== 0 &&
+    signal === null &&
+    stderr.complete &&
+    stdout.complete &&
+    !stdout.text.trim();
+  const provider = options.provider === 'claude' ? 'Claude' : 'Codex';
+  return {
+    reason: refused ? `${provider} refused the launch. No worker was started. ${message}` : `${unrefused} ${message}`,
+    refused,
+  };
 }
 
 export async function standaloneProcessIdentity(
@@ -1455,9 +1520,10 @@ export async function superviseStandalone(
   };
   try {
     if (recovery && !retained) return receipts.status(id);
+    // A recognized refusal stays final for any worker identity, without another log read.
     if (
       recovery &&
-      !observation.worker &&
+      (!observation.worker || REFUSED_REASON.test(observation.reason ?? '')) &&
       observation.monitor === 'unavailable' &&
       receipts.latest(id)?.outcome === 'failed'
     )
@@ -1466,6 +1532,10 @@ export async function superviseStandalone(
     if (options.logAlias && !outputEntry && (!recovery || options.background))
       capture = await openCapture(() => liveLogCapture(receipts, id, bounds), observationDeadline, runtime);
     if (recovery && !options.background) {
+      // A saved provider message survives a later pass that cannot read the logs again.
+      const savedEnding = observation.reason?.startsWith(`${FOREGROUND_UNREFUSED} ${PROVIDER_MESSAGE}`)
+        ? observation.reason
+        : undefined;
       const stream = new FrameStream(options, bounds);
       const log = receipts.artifact(id, 'stdout.log');
       const deadline = runtime.now() + options.deadlineMs;
@@ -1486,7 +1556,7 @@ export async function superviseStandalone(
         if (compatible) stream.restore(saved.frames, saved.version === 2 ? saved.pending : undefined);
       } catch {
         observation.monitor = 'unavailable';
-        observation.reason = 'The original worker output is unavailable. No worker was restarted.';
+        observation.reason = savedEnding ?? 'The original worker output is unavailable. No worker was restarted.';
         receipts.observation(id, observation);
         return receipts.status(id);
       }
@@ -1595,6 +1665,7 @@ export async function superviseStandalone(
           continuous = false;
         }
       }
+      const nativeTurn = Boolean(recovered.evidence || last?.nativeEnding);
       if (!continuous)
         recovered = { sessionId: null, outcome: 'unknown', availability: 'pending', text: null, evidence: null };
       if (
@@ -1626,11 +1697,24 @@ export async function superviseStandalone(
         );
       observation.sessionId = recovered.sessionId;
       observation.monitor = incomplete ? 'timed-out' : recovered.text ? 'finished' : 'unavailable';
+      // A launch that ended without a native turn reads its provider message again. Its published outcome stays.
       observation.reason = sourceFailed
-        ? 'The original worker output is unavailable. No worker was restarted.'
+        ? (savedEnding ?? 'The original worker output is unavailable. No worker was restarted.')
         : observation.exitCode === null && observation.signal === null
           ? 'Original worker exit remains unknown. No worker was restarted.'
-          : undefined;
+          : nativeTurn
+            ? undefined
+            : incomplete
+              ? savedEnding
+              : (providerEnding(
+                  receipts,
+                  id,
+                  options,
+                  bounds.readBytes,
+                  observation.exitCode,
+                  observation.signal,
+                  FOREGROUND_UNREFUSED,
+                )?.reason ?? savedEnding);
       return await finishObservation();
     }
     let final: FinalObservation;
@@ -1794,9 +1878,21 @@ export async function superviseStandalone(
           observation.worker = null;
           observation.exitCode = null;
           if (!backgroundId) {
+            const unrefused = 'Claude background launch identity is unavailable. No replacement was started.';
+            const ended = providerEnding(
+              receipts,
+              id,
+              options,
+              bounds.readBytes,
+              ending.exitCode,
+              ending.signal,
+              unrefused,
+            );
             observation.monitor = 'unavailable';
-            observation.reason = 'Claude background launch identity is unavailable. No replacement was started.';
-            final = { sessionId: null, outcome: 'unknown', availability: 'pending', text: null, evidence: null };
+            observation.reason = ended?.reason ?? unrefused;
+            final = ended?.refused
+              ? { sessionId: null, outcome: 'failed', availability: 'unavailable', text: null, evidence: null }
+              : { sessionId: null, outcome: 'unknown', availability: 'pending', text: null, evidence: null };
           } else {
             startBackgroundOutput(receipts, id, outputEntry);
             if (onBackground) {
@@ -1815,6 +1911,22 @@ export async function superviseStandalone(
             options.provider === 'codex' ? readNativeReport(receipts.artifact(id, 'native.md')) : undefined,
           );
           observation.monitor = 'finished';
+          const ended = final.evidence
+            ? null
+            : providerEnding(
+                receipts,
+                id,
+                options,
+                bounds.readBytes,
+                ending.exitCode,
+                ending.signal,
+                FOREGROUND_UNREFUSED,
+              );
+          if (ended) observation.reason = ended.reason;
+          if (ended?.refused) {
+            observation.monitor = 'unavailable';
+            final = { sessionId: null, outcome: 'failed', availability: 'unavailable', text: null, evidence: null };
+          }
         }
       } finally {
         fs.closeSync(stdout);

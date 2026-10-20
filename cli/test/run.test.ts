@@ -1776,6 +1776,24 @@ test(
 );
 
 test(
+  'resumed observation without startup continuity adds no provider message to a native turn',
+  { tags: ['subprocess'] },
+  async () => {
+    const { receipts, launch, release } = workerFixture();
+    fs.writeFileSync(release, 'finish');
+    await superviseStandalone(receipts, launch.launchId, false);
+    const event = receipts.latest(launch.launchId)!;
+    assert.equal(event.outcome, 'succeeded');
+    assert.match(fs.readFileSync(receipts.artifact(launch.launchId, 'stderr.log'), 'utf8'), /Final stderr/);
+    assert.equal(receipts.observation(launch.launchId)?.reason, undefined);
+    receipts.startupRefused(launch.launchId, true);
+    await superviseStandalone(receipts, launch.launchId, true);
+    assert.equal(receipts.latest(launch.launchId)?.eventId, event.eventId);
+    assert.equal(receipts.observation(launch.launchId)?.reason, undefined);
+  },
+);
+
+test(
   'provider spawn error retains failed unavailable start without an invented worker exit',
   { tags: ['subprocess'] },
   async () => {
@@ -3149,6 +3167,144 @@ test.each(['missing', 'ambiguous', 'nonzero', 'signal', 'deadline'] as const)(
     for (const action of ['logs', 'attach', 'stop', 'rm'] as const)
       assert.throws(() => backgroundCommand(receipts, launch.launchId, action), /identity is unavailable/);
     assert.equal(receipts.background(launch.launchId), null);
+  },
+);
+
+const claudeRefusal =
+  'Workspace not trusted. Run `claude` in C:\\work\\new once and accept the trust prompt, then retry.';
+const codexRefusal = 'Not inside a trusted directory and --skip-git-repo-check was not specified.';
+test.each([
+  { name: 'Claude refusal', provider: 'claude', stderr: claudeRefusal, outcome: 'failed' },
+  { name: 'native Codex refusal', provider: 'codex', identity: 'native', stderr: codexRefusal, outcome: 'failed' },
+  { name: 'launcher Codex refusal', provider: 'codex', identity: 'launcher', stderr: codexRefusal, outcome: 'failed' },
+  { name: 'native Codex message', provider: 'codex', identity: 'native', stderr: 'Error: model unavailable' },
+  { name: 'launcher Codex message', provider: 'codex', identity: 'launcher', stderr: 'Error: model unavailable' },
+  { name: 'Claude message', provider: 'claude', stderr: 'Error: login required' },
+  { name: 'acknowledged Claude refusal', provider: 'claude', stderr: claudeRefusal, stdout: 'acknowledged' },
+  { name: 'incomplete Claude refusal', provider: 'claude', stderr: claudeRefusal, tail: 'x'.repeat(65 * 1024) },
+  {
+    name: 'acknowledged native Codex refusal',
+    provider: 'codex',
+    identity: 'native',
+    stderr: codexRefusal,
+    stdout: 'acknowledged',
+  },
+  { name: 'Claude print refusal', provider: 'claude', print: true, stderr: claudeRefusal, outcome: 'failed' },
+  { name: 'signalled Claude refusal', provider: 'claude', stderr: claudeRefusal, signal: 'SIGTERM' },
+  {
+    name: 'Claude refusal acknowledged during the read',
+    provider: 'claude',
+    stderr: claudeRefusal,
+    grow: 'stdout.log',
+  },
+  {
+    name: 'Claude refusal with stderr growing during the read',
+    provider: 'claude',
+    stderr: claudeRefusal,
+    grow: 'stderr.log',
+  },
+] as const)(
+  'provider stderr explains the $name without a worker restart',
+  { tags: ['subprocess'], timeout: PROCESS_CASE },
+  async (fields) => {
+    const { provider, stderr } = fields;
+    const identity = 'identity' in fields ? fields.identity : null;
+    const outcome = 'outcome' in fields ? fields.outcome : 'unknown';
+    const tail = 'tail' in fields ? fields.tail : '';
+    const { receipts, launch, options, script, calls } = backgroundFixture();
+    const acknowledgment = `backgrounded \u00b7 deadbeef \u00b7 ${options.name}\n`;
+    const stdout = 'stdout' in fields ? acknowledgment : '';
+    const written = `\n  ${stderr}\r\n${tail}`;
+    fs.writeFileSync(
+      script,
+      `const fs=require('node:fs');fs.appendFileSync(${JSON.stringify(calls)},'started\\n');process.stdin.resume();process.stdin.on('end',()=>{fs.writeSync(1,${JSON.stringify(stdout)});fs.writeSync(2,${JSON.stringify(written)});process.exit(1);});`,
+    );
+    let id = launch.launchId;
+    if (provider === 'codex') {
+      const codex = parseRun(fixture().args).options;
+      id = admit(receipts, { ...codex, command: process.execPath, args: [script, ...codex.args] }).launchId;
+    }
+    if ('print' in fields) {
+      const print = parseRun([...withProvider(fixture().args, 'claude'), '--read-only']).options;
+      id = admit(receipts, { ...print, command: process.execPath, args: [script, ...print.args] }).launchId;
+    }
+    if ('signal' in fields) {
+      // A process cannot end itself by signal on Windows, so a fake child carries the signal ending.
+      const child = providerChild();
+      vi.mocked(childProcess.spawn).mockImplementationOnce(() => {
+        fs.appendFileSync(calls, 'started\n');
+        fs.appendFileSync(receipts.artifact(id, 'stderr.log'), written);
+        queueMicrotask(() => child.emit('close', null, fields.signal));
+        return child;
+      });
+    }
+    const growth: { mockRestore(): void }[] = [];
+    const grow = 'grow' in fields ? fields.grow : null;
+    if (grow) {
+      // More bytes reach the log after its diagnostic read takes the opening size.
+      // The diagnostic read opens stderr.log first, and no other reader opens it.
+      const target = receipts.artifact(id, grow);
+      const stderrLog = receipts.artifact(id, 'stderr.log');
+      const open = fs.openSync;
+      const fstat = fs.fstatSync;
+      const reading = new Set<number>();
+      let diagnostic = false;
+      let grown = false;
+      growth.push(
+        vi.spyOn(fs, 'openSync').mockImplementation((file, flags, ...rest) => {
+          const descriptor = Reflect.apply(open, fs, [file, flags, ...rest]) as number;
+          if (typeof flags === 'number' && (flags & 3) === 0) {
+            if (String(file) === stderrLog) diagnostic = true;
+            if (diagnostic && String(file) === target) reading.add(descriptor);
+          }
+          return descriptor;
+        }),
+        vi.spyOn(fs, 'fstatSync').mockImplementation(((descriptor: number, ...rest: unknown[]) => {
+          const stat = Reflect.apply(fstat, fs, [descriptor, ...rest]);
+          if (reading.has(descriptor) && !grown) {
+            grown = true;
+            fs.appendFileSync(target, grow === 'stdout.log' ? acknowledgment : 'later line\n');
+          }
+          return stat;
+        }) as typeof fs.fstatSync),
+      );
+      growth.push({ mockRestore: () => assert.ok(grown, 'the log grew during its diagnostic read') });
+    }
+    const runtime = {
+      now: Date.now,
+      identity: async () => ({
+        command: identity === 'native' ? path.join(options.cwd, 'codex.exe') : process.execPath,
+        startedAt: 'refusing-lifetime',
+        commandLine: 'refusing provider',
+      }),
+      yield: async () => {},
+    };
+    await superviseStandalone(receipts, id, false, undefined, runtime);
+    for (const spy of growth) spy.mockRestore();
+    const observation = receipts.observation(id)!;
+    const event = receipts.latest(id)!;
+    assert.equal(event.outcome, outcome);
+    assert.equal(event.availability, outcome === 'failed' ? 'unavailable' : 'pending');
+    assert.ok(observation.reason?.endsWith(`Provider message: ${stderr}`), observation.reason);
+    if (provider === 'codex') {
+      assert.ok(observation[identity === 'native' ? 'worker' : 'launcher']);
+      assert.equal(observation[identity === 'native' ? 'launcher' : 'worker'], null);
+    }
+    const spawned = vi.mocked(childProcess.spawn).mock.calls.length;
+    // Two passes read the logs again, and two more passes find each log unreadable.
+    for (const unreadable of [null, null, 'stderr.log', 'stdout.log'] as const) {
+      const denied = unreadable ? denyOpen(receipts.artifact(id, unreadable)) : null;
+      const resumed = superviseStandalone(receipts, id, true, undefined, runtime);
+      // An unbound Claude background launch has no session to resume, so its recovery refuses.
+      if (provider === 'claude' && outcome !== 'failed' && !('print' in fields))
+        await assert.rejects(resumed, /identity is unavailable/);
+      else await resumed;
+      denied?.mockRestore();
+      assert.equal(receipts.latest(id)?.eventId, event.eventId);
+      assert.equal(receipts.observation(id)?.reason, observation.reason);
+    }
+    assert.equal(vi.mocked(childProcess.spawn).mock.calls.length, spawned);
+    assert.equal(fs.readFileSync(calls, 'utf8'), 'started\n');
   },
 );
 
