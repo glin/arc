@@ -56,6 +56,7 @@ const identity = (file: string): Identity => {
   return { dev: String(stat.dev), ino: String(stat.ino), birth: String(stat.birthtimeNs) };
 };
 const same = (a: unknown, b: unknown): boolean => JSON.stringify(a) === JSON.stringify(b);
+const recovery = 'Follow docs/arc-sessions.md#manual-recovery before retrying.';
 function exists(file: string): boolean {
   try {
     fs.lstatSync(file);
@@ -121,6 +122,31 @@ function contains(root: string, file: string): boolean {
   return relative === '' || (!path.isAbsolute(relative) && relative !== '..' && !relative.startsWith(`..${path.sep}`));
 }
 
+function checkBinding(control: string, binding: unknown): void {
+  if (!same(json(path.join(control, 'ownership.json')), binding))
+    throw new Error(`Unrecognized skill ownership at ${control}. Preserve it for manual review.`);
+}
+function checkOperations(control: string): void {
+  for (const entry of fs.readdirSync(control)) {
+    if (
+      !['ownership.json', 'installed.json', 'software.lock', 'destination.lock'].includes(entry) &&
+      !/^operation-[0-9a-f-]{36}$/.test(entry)
+    )
+      throw new Error(`Unrecognized skill setup files at ${control}. Preserve them for manual review.`);
+    if (entry.startsWith('operation-')) {
+      const folder = path.join(control, entry);
+      identity(folder);
+      if (
+        !exists(path.join(folder, 'seal.json')) ||
+        !same(json(path.join(folder, 'seal.json')), { schema: 1, token: entry.slice(10), settled: true })
+      )
+        throw new Error(`Unfinished skill setup at ${folder}. ${recovery}`);
+      if (fs.readdirSync(folder).some((name) => !['journal.json', 'seal.json'].includes(name)))
+        throw new Error(`Retained skill setup files at ${folder}. ${recovery}`);
+    }
+  }
+}
+
 // Reads the install record and checks it against the copy now at the destination. Throws when Arc does not own that copy.
 function ownedCopy(
   metadata: string,
@@ -151,12 +177,31 @@ function ownsCopy(
   control: string,
   destination: string,
   expected: { home: string; area: string; agent: SkillAgent },
-): boolean {
+): { owned: boolean; recovery?: string } {
+  let controlIdentity: Identity;
   try {
-    ownedCopy(path.join(control, 'installed.json'), destination, { ...expected, control: identity(control) });
-    return true;
+    if (!exists(control)) return { owned: false };
+    admitToolPath(control);
+    controlIdentity = identity(control);
+    const areaIdentity = identity(expected.area);
+    checkBinding(control, {
+      schema: 1,
+      home: expected.home,
+      area: expected.area,
+      areaIdentity,
+      destination,
+      identity: controlIdentity,
+    });
+    checkOperations(control);
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    return { owned: false, recovery: `${reason}${reason.includes(recovery) ? '' : ' ' + recovery}` };
+  }
+  try {
+    ownedCopy(path.join(control, 'installed.json'), destination, { ...expected, control: controlIdentity });
+    return { owned: true };
   } catch {
-    return false;
+    return { owned: false };
   }
 }
 
@@ -218,18 +263,20 @@ export async function operateSkill(
     const target = toPeer ? `the ${agentNames[other]} skills folder` : area;
     const intro = `The ${name} skills folder is linked to ${target}${toPeer ? ` at ${area}` : ''}.`;
     const present = exists(destination);
-    // The peer commands refuse a copy that Arc does not own, so they are offered only for an absent copy or one the peer's install record still matches.
-    const peerOwned = toPeer && present && ownsCopy(control, destination, { home, area, agent: other });
-    const peerCommand = toPeer && (!present || peerOwned);
+    // Peer commands require valid setup storage and an absent or unchanged Arc-owned copy.
+    const peerState = toPeer ? ownsCopy(control, destination, { home, area, agent: other }) : { owned: false };
+    const peerCommand = toPeer && !peerState.recovery && (!present || peerState.owned);
     if (action === 'remove')
       return result(
         'linked',
         `${intro} Arc left the linked folder unchanged.${
-          present
-            ? peerCommand
-              ? ` Remove the skill there with arc skills remove --agent ${other}.`
-              : ` Arc does not manage that copy. Remove the skill at ${destination} by hand.`
-            : ''
+          peerState.recovery
+            ? ` ${peerState.recovery}`
+            : present
+              ? peerCommand
+                ? ` Remove the skill there with arc skills remove --agent ${other}.`
+                : ` Arc does not manage that copy. Remove the skill at ${destination} by hand.`
+              : ''
         }`,
       );
     let matches = false;
@@ -241,16 +288,21 @@ export async function operateSkill(
       }
     }
     if (matches)
-      return result('linked', `${intro} ${name} reads the skill there, and Arc left the linked folder unchanged.`);
+      return result(
+        'linked',
+        `${intro} ${name} reads the skill there, and Arc left the linked folder unchanged.${peerState.recovery ? ' ' + peerState.recovery : ''}`,
+      );
     const verb = present ? 'update' : 'install';
     return result(
       'incomplete',
       `${intro} The skill there is ${present ? 'different from this version' : 'missing'}, and Arc leaves linked folders unchanged. ${
-        peerCommand
-          ? `Run arc skills ${verb} --agent ${other} to ${verb} it there.`
-          : toPeer
-            ? `Arc does not manage the copy at ${destination}. Update it there by hand as described in cli/README.md#session-skill.`
-            : 'Link or copy the skill there as described in cli/README.md#session-skill.'
+        peerState.recovery
+          ? peerState.recovery
+          : peerCommand
+            ? `Run arc skills ${verb} --agent ${other} to ${verb} it there.`
+            : toPeer
+              ? `Arc does not manage the copy at ${destination}. Update it there by hand as described in cli/README.md#session-skill.`
+              : 'Link or copy the skill there as described in cli/README.md#session-skill.'
       }`,
     );
   }
@@ -303,8 +355,7 @@ export async function operateSkill(
   const binding = { schema: 1, home, area, areaIdentity: identity(area), destination, identity: controlIdentity };
   const ownership = path.join(control, 'ownership.json');
   if (created) save(ownership, binding);
-  if (!same(json(ownership), binding))
-    throw new Error(`Unrecognized skill ownership at ${control}. Preserve it for manual review.`);
+  checkBinding(control, binding);
   let software: ReturnType<typeof acquireToolLock> | undefined;
   let lock: ReturnType<typeof acquireToolLock> | undefined;
   let settled = true;
@@ -329,28 +380,7 @@ export async function operateSkill(
   try {
     software = acquireToolLock(path.join(control, 'software.lock'));
     lock = acquireToolLock(path.join(control, 'destination.lock'));
-    for (const entry of fs.readdirSync(control)) {
-      if (
-        !['ownership.json', 'installed.json', 'software.lock', 'destination.lock'].includes(entry) &&
-        !/^operation-[0-9a-f-]{36}$/.test(entry)
-      )
-        throw new Error(`Unrecognized skill setup files at ${control}. Preserve them for manual review.`);
-      if (entry.startsWith('operation-')) {
-        const folder = path.join(control, entry);
-        identity(folder);
-        if (
-          !exists(path.join(folder, 'seal.json')) ||
-          !same(json(path.join(folder, 'seal.json')), { schema: 1, token: entry.slice(10), settled: true })
-        )
-          throw new Error(
-            `Unfinished skill setup at ${folder}. Follow docs/arc-sessions.md#manual-recovery before retrying.`,
-          );
-        if (fs.readdirSync(folder).some((name) => !['journal.json', 'seal.json'].includes(name)))
-          throw new Error(
-            `Retained skill setup files at ${folder}. Follow docs/arc-sessions.md#manual-recovery before retrying.`,
-          );
-      }
-    }
+    checkOperations(control);
     if (exists(metadata)) previous = ownedCopy(metadata, destination, { home, area, agent, control: controlIdentity });
     else if (exists(destination)) throw new Error(`An existing skill is not owned by Arc: ${destination}`);
     if (!previous && action !== 'install') throw new Error(`Arc does not own a skill at ${destination}.`);
@@ -523,7 +553,6 @@ export async function operateSkill(
     }
     const reason = error instanceof Error ? error.message : String(error);
     const retainedLock = (error as Error & { cause?: NodeJS.ErrnoException }).cause?.code === 'EEXIST';
-    const recovery = 'Follow docs/arc-sessions.md#manual-recovery before retrying.';
     return {
       ...result(
         !settled ? 'incomplete' : options.signal.aborted ? 'cancelled' : 'failed',

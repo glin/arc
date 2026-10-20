@@ -637,6 +637,57 @@ test('a linked folder gives manual directions after a person replaces the copy A
   }
 });
 
+test.for(['an invalid ownership binding', 'an unfinished retained operation'])(
+  'a linked folder gives recovery directions for %s',
+  async (state) => {
+    const home = mkdtempSync(join(realpathSync(tmpdir()), 'arc-linked-recovery-'));
+    const payload = readSkillPayload(cli);
+    const files = new Map(payload.files);
+    files.set('SKILL.md', Buffer.concat([files.get('SKILL.md'), Buffer.from('\nprevious version\n')]));
+    const previous = { ...payload, identity: 'previous', files };
+    try {
+      mkdirSync(join(home, '.claude/skills'), { recursive: true });
+      tryLink(join(home, '.claude/skills'), join(home, '.agents/skills'), linkKinds[0]);
+      const installed = await operateSkill('install', 'claude', previous, {
+        home,
+        signal: new AbortController().signal,
+      });
+      assert.equal(installed.status, 'installed', JSON.stringify(installed));
+      if (state === 'an invalid ownership binding') {
+        const ownership = join(installed.control, 'ownership.json');
+        const binding = JSON.parse(readFileSync(ownership, 'utf8'));
+        writeFileSync(ownership, JSON.stringify({ ...binding, destination: join(home, 'different') }));
+      } else {
+        mkdirSync(join(installed.control, 'operation-00000000-0000-0000-0000-000000000000'));
+      }
+      const entries = fs.readdirSync(installed.control, { recursive: true }).sort();
+      const records = skillFiles(installed.control).map((relative) => [
+        relative,
+        readFileSync(join(installed.control, relative)),
+      ]);
+      const directory = fs.lstatSync(installed.destination, { bigint: true }).ino;
+      for (const action of ['install', 'update', 'remove']) {
+        const refused = runSkillCommand(home, action, 'claude');
+        assert.equal(refused.status, 1, JSON.stringify(refused));
+        const linked = runSkillCommand(home, action, 'codex');
+        assert.equal(linked.status, action === 'remove' ? 0 : 1, JSON.stringify(linked));
+        assert.equal(linked.results[0].status, action === 'remove' ? 'linked' : 'incomplete');
+        assert.match(linked.results[0].reason, /docs\/arc-sessions\.md#manual-recovery/);
+        assert.doesNotMatch(linked.results[0].reason, /arc skills/);
+        expectPayloadCopy(installed.destination, previous);
+        assert.equal(fs.lstatSync(installed.destination, { bigint: true }).ino, directory);
+        assert.deepEqual(fs.readdirSync(installed.control, { recursive: true }).sort(), entries);
+        for (const [relative, bytes] of records)
+          assert.deepEqual(readFileSync(join(installed.control, relative)), bytes);
+        assert.equal(fs.existsSync(join(home, '.agents/skills.arc-skill-control')), false);
+      }
+    } finally {
+      unlink(join(home, '.agents/skills'));
+      rmSync(home, { recursive: true, force: true });
+    }
+  },
+);
+
 test('cancelled replacements restore matching originals and retain conflicting destinations and locks', async () => {
   const original = readSkillPayload(cli);
   const files = new Map(original.files);
