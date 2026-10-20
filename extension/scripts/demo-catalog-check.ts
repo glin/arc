@@ -6,6 +6,7 @@ import { createInterface } from 'node:readline';
 import { isDeepStrictEqual } from 'node:util';
 import { claudeLaunch, codexLaunch, type Machine } from '../src/composerview.ts';
 import { ClaudeWire, spawnArgs, readModels as claudeModels } from '../src/claudewire.ts';
+import { childEnv } from '../src/agenthost.ts';
 import { CodexWire, appServerArgs, readModels as codexModels, type CodexDefaultsSnapshot } from '../src/codexwire.ts';
 import type { DefaultContext } from '../src/view/model-picks.ts';
 import { DEMO_DEFAULTS, DEMO_MODELS, codexDefaultContext } from './demo-catalog.ts';
@@ -38,25 +39,36 @@ export function defaultsSnapshot(context: DefaultContext, snapshot: CodexDefault
   return snapshot ? snapshot.configuration : { applied: { model: context.base!.model, effort: context.base!.effort } };
 }
 
+// Model and effort variables that Claude reads, or that a parent Claude session exports, in any family or custom entry.
+// Most of them change the catalog labels, the supported efforts, or the applied defaults. The rest are removed so that a parent session cannot pass them to the check.
+const CLAUDE_MODEL_ENV_PATTERN =
+  /^(ANTHROPIC_((DEFAULT_([A-Z]+_)?|SMALL_FAST_|CUSTOM_)?MODEL(_OPTION)?(_NAME|_DESCRIPTION|_SUPPORTED_CAPABILITIES)?)|CLAUDE_CODE_(EFFORT_LEVEL|SUBAGENT_MODEL|MODEL_CAPABILITIES|MODEL_CATALOG_URL|ALWAYS_ENABLE_EFFORT)|CLAUDE_EFFORT)$/;
+
+// The check reads Claude's defaults without the user settings file or any personal model or effort variable.
+// Project and local settings of the launch folder still apply. Every case variant of a variable is removed, including on Windows.
+export function claudeCheckLaunch(
+  folder: string,
+  inherited: Record<string, string | undefined>,
+  launchEnv: Record<string, string>,
+): { args: string[]; env: Record<string, string | undefined> } {
+  const env = childEnv(inherited, launchEnv, 'claude', folder);
+  for (const key of Object.keys(env)) if (CLAUDE_MODEL_ENV_PATTERN.test(key.toUpperCase())) delete env[key];
+  return { args: [...spawnArgs({ cwd: folder, persistSession: false }), '--setting-sources', 'project,local'], env };
+}
+
 async function check(agent: 'claude' | 'codex'): Promise<void> {
   const launch =
     agent === 'codex'
       ? codexLaunch(process.env.ARC_CODEX_PATH ?? '', machine)
       : claudeLaunch(process.env.ARC_CLAUDE_PATH ?? '', machine);
   if (launch.problem) throw new Error('Configured CLI is unavailable.');
-  const child = spawn(
-    launch.command,
-    [
-      ...launch.leadingArgs,
-      ...(agent === 'codex' ? appServerArgs() : spawnArgs({ cwd: launchFolder, persistSession: false })),
-    ],
-    {
-      cwd: launchFolder,
-      env: { ...process.env, ...launch.env },
-      windowsHide: true,
-      stdio: ['pipe', 'pipe', 'ignore'],
-    },
-  );
+  const claude = agent === 'claude' ? claudeCheckLaunch(launchFolder, process.env, launch.env) : null;
+  const child = spawn(launch.command, [...launch.leadingArgs, ...(claude ? claude.args : appServerArgs())], {
+    cwd: launchFolder,
+    env: claude ? claude.env : { ...process.env, ...launch.env },
+    windowsHide: true,
+    stdio: ['pipe', 'pipe', 'ignore'],
+  });
   const options = { send: (line: string) => child.stdin.write(line), emit: () => {}, deadlineMs: 30_000 };
   const wire =
     agent === 'codex'

@@ -18,7 +18,7 @@ import type { UsageBar } from './usageview.ts';
 import type { ComposerView, SessionLauncherView } from './composerview.ts';
 import { CAPTURE_TIME, DEMO_RAIL_FOLDS } from '../scripts/readme-fixture.ts';
 import { DEMO_DEFAULTS, DEMO_MODELS, codexDefaultContext } from '../scripts/demo-catalog.ts';
-import { defaultsSnapshot } from '../scripts/demo-catalog-check.ts';
+import { claudeCheckLaunch, defaultsSnapshot } from '../scripts/demo-catalog-check.ts';
 import { readDefaultConfiguration, readModels } from './codexwire.ts';
 import { modelPicks, effortPicks } from './view/model-picks.ts';
 import { railSections, RAIL_FOLDS } from './view/rail.ts';
@@ -419,6 +419,24 @@ test('catalog refresh preserves omitted and null effort across models with diffe
     assert.equal(efforts.find((effort) => effort.configuredDefault)!.value, 'medium');
     assert.deepEqual(captured, { config });
   }
+});
+
+test('catalog check launches Claude without user settings or personal model and effort variables', () => {
+  const inherited = {
+    PATH: '/bin',
+    ANTHROPIC_MODEL: 'haiku',
+    anthropic_default_haiku_model: 'haiku',
+    ANTHROPIC_DEFAULT_MODEL: 'haiku',
+    ANTHROPIC_DEFAULT_FABLE_MODEL_NAME: 'Personal',
+    CLAUDE_EFFORT: 'high',
+    Claude_Code_Effort_Level: 'high',
+    CLAUDE_CODE_SESSION_ID: 'parent',
+  };
+  const launch = claudeCheckLaunch(tempDir('catalog-check-'), inherited, { ANTHROPIC_MODEL: 'opus' });
+  const at = launch.args.indexOf('--setting-sources');
+  assert.equal(launch.args[at + 1], 'project,local');
+  assert.deepEqual(Object.keys(launch.env).filter((key) => /model|effort|session_id/i.test(key)), []);
+  assert.equal(launch.env.PATH, '/bin');
 });
 
 // Node builds the Project cost scene and a Chicago browser draws it. The fixture is loaded
