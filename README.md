@@ -118,3 +118,5 @@ After saving the handoff, request compaction of this session after your response
 ## Limitations
 
 Arc only supports Claude Code and Codex for now, and doesn't support every feature of either (e.g. some things like `/remote-control` are not supported).
+
+Pricing for other providers, such as OpenRouter and Google Vertex AI, is not supported.
