@@ -21,7 +21,7 @@
   },
   "cli/test/smoke.bundled-c.test.mjs": {
     "reason": "Compiled CLI commands must preserve window routing, turn limits, and terminal ownership under real IPC.",
-    "cases": 14,
+    "cases": 15,
     "matricesSha256": "15fc52c3af6a79bd19a02bd888c7d0a5c6ffba21c5b67232ffbd2778a6ddb61c"
   },
   "cli/test/smoke.test.mjs": {
@@ -171,8 +171,8 @@
   },
   "extension/src/sessiondiscovery.test.ts": {
     "reason": "Real window listeners and registry discovery must preserve ownership, reachability, and partial listing across native IPC.",
-    "cases": 21,
-    "matricesSha256": "cce452d1b0b6eedeb42ca65ea90c1e2880911f93516b93e5fb89e36cdd0a0f7e"
+    "cases": 22,
+    "matricesSha256": "902389ca5d661c4efc93dd17fa5e069e60b03d45703635758c5477dbb8ed0eda"
   },
   "extension/src/sessionrequests.test.ts": {
     "reason": "Native window channels must preserve authentication, activation identity, recovery, and write admission without replaying accepted writes.",

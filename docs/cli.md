@@ -27,7 +27,7 @@ Check the folders and readiness, then replace `WINDOW_ID` in the examples with t
 
 Remote integrated terminals and incompatible process namespaces require explicit selection. If ownership is unavailable, reload older Arc windows or pass `--window`.
 
-After a reload or reconnection, list windows again and reselect the intended folders. Saved window IDs and inherited `ARC_WINDOW` values retain the old activation. Preserve uncertain writes and their original request IDs before starting another operation.
+After a reload or reconnection, list windows again and reselect the intended folders. Saved window IDs retain the old activation. A running process keeps the `ARC_WINDOW` value it started with. Each session that an Arc window launches receives that window's current ID when the window has a channel, as [Agent protocols](agent-protocols.md) describes. Preserve uncertain writes and their original request IDs before starting another operation.
 
 An empty window list means no verified live window. `complete: false` means discovery is incomplete, even when reachable windows appear. [Window output](cli-reference.md#windows) explains diagnostics and `ARC_HOME`.
 

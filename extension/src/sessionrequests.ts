@@ -1210,10 +1210,14 @@ export async function requestWindow(
       entry = value as unknown as HostRegistration;
     } catch (error) {
       const code = windowFailureCode(error);
-      if (code === 'ENOENT')
+      if (code === 'ENOENT') {
+        const variable = `${ARC_IDENTITY.environmentPrefix}WINDOW`;
+        const current = process.env[variable];
+        const shown = current !== undefined && HOST_ID.test(current) && current !== selected;
         throw new WindowUnavailableError(
-          'The selected Arc window is not registered. Run arc windows and select the intended folders.',
+          `Arc window ${selected} is not registered. ${shown ? `${variable} is ${current} for this command. ` : ''}Run arc windows --json and select the intended folders.`,
         );
+      }
       if (code === 'EACCES' || code === 'EPERM')
         throw new WindowUnavailableError(
           `Local access to Arc window ${selected} failed (${code}). Check that your current permissions allow reading this window's local details.`,

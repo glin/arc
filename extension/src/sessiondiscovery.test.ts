@@ -133,12 +133,32 @@ test(
       vi.stubEnv('ARC_WINDOW', missing);
       await assert.rejects(requestWindow('sessions', {}, inherited ? undefined : missing, home), (error: unknown) => {
         assert.ok(error instanceof WindowUnavailableError);
-        assert.match(error.message, /not registered.*Run arc windows and select the intended folders/);
+        assert.match(error.message, /not registered\. Run arc windows --json and select the intended folders/);
         assert.doesNotMatch(error.message, /EACCES|EPERM|token|address/);
         return true;
       });
     }
     assert.equal((await discoverWindows(home)).windows[0].hostId, channel.hostId);
+  },
+);
+
+test(
+  'a missing explicit window reports the inherited window only when it differs and is well formed',
+  { tags: ['subprocess'] },
+  async () => {
+    const { home } = await fixture();
+    const missing = 'f'.repeat(24);
+    const current = 'e'.repeat(24);
+    vi.stubEnv('ARC_WINDOW', current);
+    await assert.rejects(requestWindow('sessions', {}, missing, home), {
+      message: `Arc window ${missing} is not registered. ARC_WINDOW is ${current} for this command. Run arc windows --json and select the intended folders.`,
+    });
+    for (const omitted of [missing, 'not-an-id', '']) {
+      vi.stubEnv('ARC_WINDOW', omitted);
+      await assert.rejects(requestWindow('sessions', {}, missing, home), {
+        message: `Arc window ${missing} is not registered. Run arc windows --json and select the intended folders.`,
+      });
+    }
   },
 );
 

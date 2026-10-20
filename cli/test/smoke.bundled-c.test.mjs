@@ -767,6 +767,40 @@ test('bundled session commands select one window, reject unknown IDs, and bound 
   }
 }, 60_000);
 
+test('bundled session commands name the inherited window when an explicit window is no longer registered', async () => {
+  const home = mkdtempSync(join(realpathSync(tmpdir()), 'arc-stale-window-smoke-'));
+  const retired = new WindowChannel(home);
+  const run = promisify(execFile);
+  let replacement;
+  try {
+    await retired.update({ folders: [], scopeReady: true, panelReady: false, panelVisible: false });
+    await retired.dispose();
+    replacement = new WindowChannel(home);
+    let requests = 0;
+    replacement.setRequestHandler((request) => {
+      requests++;
+      return { method: request.method };
+    });
+    await replacement.update({ folders: [], scopeReady: true, panelReady: false, panelVisible: false });
+    const env = { ...smokeEnv, ARC_HOME: home, ARC_WINDOW: replacement.hostId, CLAUDE_CODE_SESSION_ID: '' };
+    await assert.rejects(
+      run(process.execPath, [cli, 'sessions', '--window', retired.hostId, '--json'], { env, encoding: 'utf8' }),
+      (error) => {
+        assert.ok(error.stderr.includes(`Arc window ${retired.hostId} is not registered`));
+        assert.ok(error.stderr.includes(`ARC_WINDOW is ${replacement.hostId} for this command`));
+        return true;
+      },
+    );
+    assert.equal(requests, 0);
+    const inherited = await run(process.execPath, [cli, 'sessions', '--json'], { env, encoding: 'utf8' });
+    assert.deepEqual(JSON.parse(inherited.stdout), { method: 'sessions' });
+    assert.equal(requests, 1);
+  } finally {
+    await Promise.all([retired.dispose(), replacement?.dispose()]);
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test('bundled session commands attribute child requests only to their native session identity', async () => {
   const home = mkdtempSync(join(realpathSync(tmpdir()), 'arc-child-requester-smoke-'));
   const channel = new WindowChannel(home);
