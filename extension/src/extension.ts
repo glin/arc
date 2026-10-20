@@ -111,7 +111,7 @@ import { comparableFolder, ConfigWatches, defaultsKey, defaultsKeyParts } from '
 import { WindowChannel } from './sessionrequests';
 import { terminalOwnership, localTerminalPlacement } from './terminalownership';
 import { reportWindowTransport, windowTransportErrorCode, type WindowTransportSink } from './windowpipe';
-import { CompactHost, routeCompactionEvent } from './compactrequest';
+import { CompactHost, promptAsReader, routeCompactionEvent } from './compactrequest';
 import { CompactStore } from './compactstore';
 import {
   GuardedSends,
@@ -1730,13 +1730,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       const turnId = await withExistingSessionActivity(agent as AgentName, sessionId, cwd, async (session) => {
         validateResolvedPromptAssets(prompt.assets);
         // Retain prompt text until the child accepts the turn. The returned promise reports protocol refusals to the retained card.
-        return await session.prompt(
-          prompt,
-          (turnId) => {
-            compaction?.submitted(session, turnId);
-            onSubmitted?.(session.state().sessionId ?? sessionId, turnId);
-          },
-          recoveryPrompts.get(prompt),
+        return await promptAsReader(
+          compaction,
+          session,
+          (submitted, received) => session.prompt(prompt, submitted, recoveryPrompts.get(prompt), received),
+          (turnId) => onSubmitted?.(session.state().sessionId ?? sessionId, turnId),
         );
       });
       if (turnId === null) {
@@ -1768,13 +1766,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             const turnId = await withStartedSessionActivity(
               forkedSession,
               (live) =>
-                live.prompt(
-                  prompt,
-                  (turnId) => {
-                    compaction?.submitted(live, turnId);
-                    onSubmitted?.(continued, turnId);
-                  },
-                  recoveryPrompts.get(prompt),
+                promptAsReader(
+                  compaction,
+                  live,
+                  (submitted, received) => live.prompt(prompt, submitted, recoveryPrompts.get(prompt), received),
+                  (turnId) => onSubmitted?.(continued, turnId),
                 ),
               existingSessionPlan('codex', continued, cwd!),
             );
@@ -1865,12 +1861,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           prompted = live;
           const knownId = live.state().sessionId;
           if (knownId) await savePolicy(knownId, draft.policy);
-          const turnId = await live.prompt(prompt, (turnId) => {
-            if (start?.launchId) dispatch.submitted(start.launchId, turnId);
-            compaction?.submitted(live, turnId);
-            const session = live.state().sessionId;
-            onSubmitted?.(session ?? '', turnId);
-          });
+          const turnId = await promptAsReader(
+            compaction,
+            live,
+            (submitted, received) => live.prompt(prompt, submitted, undefined, received),
+            (turnId) => {
+              if (start?.launchId) dispatch.submitted(start.launchId, turnId);
+              const session = live.state().sessionId;
+              onSubmitted?.(session ?? '', turnId);
+            },
+          );
           const session = live.state().sessionId;
           if (session) accepted = { session, turnId };
           if (start?.launchId) dispatch.accepted(start.launchId, live.nativeTurnIdentity(turnId));

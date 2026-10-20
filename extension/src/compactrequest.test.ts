@@ -1382,6 +1382,7 @@ test('host compaction in a turn Claude starts by itself binds only through the n
     const { host, child } = fixture;
     child.startedByAgent = (turnId) => turnId === 9;
     host.submitted(child, 7);
+    host.read(child, 7);
     host.native(child, launch('one'), 7);
     if (name === 'notice of a launch whose tool failed')
       host.native(
@@ -1393,23 +1394,34 @@ test('host compaction in a turn Claude starts by itself binds only through the n
         }),
         7,
       );
+    // The first notice arrives before the second reader prompt, so it keeps the first submission.
+    if (name === 'notices of two reader turns') host.native(child, wake('one'), undefined);
     if (name === 'notices of two reader turns' || name === 'never-ending launch of an earlier reader turn') {
       host.readerAction('self');
       host.submitted(child, 8);
+      host.read(child, 8);
       host.native(child, launch('two'), 8);
       host.native(child, wake('two'), undefined);
     }
     if (name === 'notice of a launch that capacity dropped') {
       host.readerAction('self');
       host.submitted(child, 8);
+      host.read(child, 8);
       for (let index = 0; index < 32; index++) host.native(child, launch(`later-${index}`), 8);
       host.native(child, wake('later-0'), undefined);
     }
-    if (!['launch without a notice', 'never-ending launch of an earlier reader turn'].includes(name))
+    if (
+      ![
+        'launch without a notice',
+        'never-ending launch of an earlier reader turn',
+        'notices of two reader turns',
+      ].includes(name)
+    )
       host.native(child, wake('one'), name === 'notice inside a running turn' ? 7 : undefined);
     if (name === 'reader acted after the notice') {
       host.readerAction('self');
       host.submitted(child, 8);
+      host.read(child, 8);
     }
     host.native(child, claude('toolStart', { foreground: name !== 'background request' }), 9);
     assert.equal(code(host), expected, name);
@@ -1454,6 +1466,73 @@ test('host compaction in a turn Claude starts by itself binds only through the n
       'already-used',
       name,
     );
+  }
+});
+
+// Catches a reader instruction given while background work runs never admitting the compaction
+// that a turn the work wakes requests, and a reader action that instruction did not see being
+// absorbed into it.
+test('host compaction in a turn that background work wakes carries the latest reader prompt that Claude read', () => {
+  const claude = (extra: Record<string, unknown> = {}) =>
+    compactEvent('toolStart', { provider: 'claude', generation: 1, ...extra });
+  const event = (kind: 'launch' | 'wake'): NativeEvent =>
+    kind === 'launch'
+      ? {
+          provider: 'claude',
+          sessionId: 'self',
+          turnId: null,
+          generation: 1,
+          evidence: {},
+          kind,
+          toolId: 'one',
+          agentId: 'agent-one',
+        }
+      : {
+          provider: 'claude',
+          sessionId: 'self',
+          turnId: null,
+          generation: 1,
+          evidence: {},
+          kind,
+          toolId: 'one',
+          runId: 'run-one',
+        };
+  for (const [name, expected] of [
+    ['reader prompt read while the work runs', undefined],
+    ['reader prompt never read', 'reader-acted'],
+    ['reader acted after the read prompt', 'reader-acted'],
+    ['follow-up after a reader action', 'reader-acted'],
+    ['continuation after a reader action', 'reader-acted'],
+    ['launch that no turn owns after a read prompt', undefined],
+  ] as const) {
+    const { fixture } = compactHostFixture('claude');
+    const { host, child } = fixture;
+    child.startedByAgent = (turnId) => turnId === 9;
+    // Reader turn 7 starts background work and ends.
+    host.submitted(child, 7);
+    host.read(child, 7);
+    if (name !== 'launch that no turn owns after a read prompt') host.native(child, event('launch'), 7);
+    host.turnEnded(child);
+    // The reader sends turn 8 while the work runs, and turn 8 ends.
+    host.readerAction('self');
+    const origin =
+      name === 'follow-up after a reader action'
+        ? 'followup'
+        : name === 'continuation after a reader action'
+          ? 'continuation'
+          : 'reader';
+    host.submitted(child, 8, origin);
+    if (name !== 'reader prompt never read') host.read(child, 8);
+    if (name === 'launch that no turn owns after a read prompt') host.native(child, event('launch'), undefined);
+    host.turnEnded(child);
+    if (name === 'reader acted after the read prompt') host.readerAction('self');
+    // The work reports back while no turn runs, and Claude starts turn 9 by itself.
+    host.native(child, event('wake'), undefined);
+    host.native(child, claude(), 9);
+    const ready = host.handle({ method: 'compact-ready', params: compactPayload }) as { code?: string };
+    assert.equal(ready.code, expected, name);
+    const ack = host.handle({ method: 'compact-request', params: compactPayload }) as { state: string };
+    assert.equal(ack.state, expected ? 'refused' : 'queued', name);
   }
 });
 

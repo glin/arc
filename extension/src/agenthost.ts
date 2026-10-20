@@ -236,7 +236,8 @@ export interface Driver {
   // Completes initialization. Session plans also open a Codex thread after reading skills.
   open(): Promise<PromptEntry[]>;
   // A guarded prompt carries an attempt. The wire marks it written when it writes the input and settles it by its provider receipt.
-  prompt(prompt: AgentPromptInput, guard?: GuardedAttempt): Promise<void | string>;
+  // `received` runs when the provider reports that it read the prompt. Claude reports it by its replay. Codex never reports it.
+  prompt(prompt: AgentPromptInput, guard?: GuardedAttempt, received?: () => void): Promise<void | string>;
   // Whether the provider positively reported that nothing runs. An absent report is not idle.
   idleEvidence?(): boolean;
   compact(beforeWrite?: () => void): Promise<void>;
@@ -364,7 +365,7 @@ export function claudePlan(launch: Launch, options: SpawnOptions): AgentPlan {
         contextFrame: (text) => wire.contextFrame(text),
         contextOverflow: (id) => wire.contextOverflow(id),
         open: () => wire.initialize(),
-        prompt: async (prompt, guard) => wire.prompt(prompt, guard),
+        prompt: async (prompt, guard, received) => wire.prompt(prompt, guard, undefined, undefined, received),
         idleEvidence: () => wire.idleEvidence(),
         compact: async (beforeWrite) => wire.prompt(compactCommand('claude'), undefined, beforeWrite),
         clear: async (_name, beforeWrite, writeAttempted) =>
@@ -983,11 +984,13 @@ export class AgentSession {
     return this.respondingTurns.size === 1 && this.respondingTurns.has(submission);
   }
 
-  // An exited child rejects the prompt and retains the failure in session state.
+  // An exited child rejects the prompt and retains the failure in session state. `onReceived` runs
+  // when the provider reports that it read the prompt, which can be after the prompt resolves.
   async prompt(
     prompt: AgentPromptInput,
     onSubmitted?: (turnId: number) => void,
     guard?: GuardedAttempt,
+    onReceived?: (turnId: number) => void,
   ): Promise<number> {
     if (this.exited) {
       // Retain the opening refusal when its failed child has already closed.
@@ -1026,7 +1029,7 @@ export class AgentSession {
       this.acceptingPrompts += 1;
       let nativeTurnId: void | string;
       try {
-        nativeTurnId = await this.driver.prompt(prompt, guard);
+        nativeTurnId = await this.driver.prompt(prompt, guard, onReceived && (() => onReceived(submitted.id)));
       } finally {
         this.acceptingPrompts -= 1;
       }

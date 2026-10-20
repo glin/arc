@@ -65,7 +65,7 @@ test('measurement windows refuse agent processes before launch', () => {
   }
 });
 import { ClaudeWire, type PermissionMode } from './claudewire.ts';
-import { CompactHost, routeCompactionEvent, type CompactChild } from './compactrequest.ts';
+import { CompactHost, promptAsReader, routeCompactionEvent, type CompactChild } from './compactrequest.ts';
 import { RecordedReplies } from './sessionreads.ts';
 import { CODEX_DEADLINE_MS, sandboxPolicy } from './codexwire.ts';
 import { requesterIdentity } from './sessionrequests.ts';
@@ -9620,6 +9620,108 @@ test('a turn Claude starts after a background notice admits the reader-requested
   assert.equal(sentTexts(children[0]).at(-1), '/compact');
   assert.equal(compaction.requests.deliverable('sess-1').length, 0);
 });
+
+// Opens a Claude session, sends the reader prompt that starts background work, and replays its
+// turn up to its `result`. Arc has not read that `result` yet.
+async function beforeBackgroundResult() {
+  const through = compactionThroughHost();
+  const opening = through.host.session('one', claudePlan(CLAUDE, { cwd: WS, sessionId: 'sess-1' }));
+  through.children[0].answerHandshake();
+  const session = await opening;
+  through.setCurrent(session);
+  await promptAsReader(through.compaction, session, (submitted, received) =>
+    session.prompt('Start the background work, then end the turn.', submitted, undefined, received),
+  );
+  const lines = agentStartedTurns(through.window, through.ids);
+  const launched = lines.findIndex((line) => line.includes('"type":"result"'));
+  for (const line of lines.slice(0, launched)) through.children[0].say(line + '\n');
+  const request = lines.findIndex((line) => line.includes(through.ids[0]));
+  // Claude's replay of the last prompt Arc wrote, which it writes when it reads that prompt.
+  const replay = () => {
+    const prompt = through.children[0]
+      .sent()
+      .filter((line) => line.type === 'user')
+      .at(-1)!;
+    assert.equal(typeof prompt.uuid, 'string', 'a reader prompt carries a client UUID');
+    through.children[0].say(
+      JSON.stringify({
+        type: 'user',
+        isReplay: true,
+        uuid: prompt.uuid,
+        session_id: 'sess-1',
+        parent_tool_use_id: null,
+        message: prompt.message,
+      }) + '\n',
+    );
+  };
+  const idle = () => through.children[0].say(sessionState('idle'));
+  return { ...through, session, lines, launched, request, replay, idle };
+}
+
+// Catches a reader instruction sent while background work runs never admitting the compaction that
+// the turn this work wakes requests, and a reader send that never reached Claude admitting it.
+test.each(['read', 'refused'] as const)('a turn that background work wakes after a %s reader prompt', async (send) => {
+  const { session, lines, launched, request, compaction, children, payload, ids, replay } =
+    await beforeBackgroundResult();
+  children[0].say(lines[launched] + '\n');
+  compaction.readerAction('sess-1');
+  const text = 'After this is done, self compact.';
+  const missing = {
+    id: 'a',
+    name: 'missing.png',
+    mime: 'image/png',
+    size: 1,
+    digest: 'd',
+    path: path.join(WS, 'missing.png'),
+  };
+  const instruction = promptAsReader(compaction, session, (submitted, received) =>
+    session.prompt(send === 'read' ? text : { text, assets: [missing] }, submitted, undefined, received),
+  );
+  if (send === 'refused') await assert.rejects(instruction);
+  else {
+    await instruction;
+    replay();
+    children[0].say(COMPLETED_RESULT);
+  }
+  for (const line of lines.slice(launched + 1, request + 1)) children[0].say(line + '\n');
+  assert.equal(
+    (compaction.handle({ method: 'compact-ready', params: payload(ids[0]) }) as { code?: string }).code,
+    send === 'read' ? undefined : 'reader-acted',
+  );
+});
+
+// Catches a reader prompt that Arc wrote but Claude has not read taking over background work. The
+// launching turn's `result` and `idle` reach Arc after the write and close the reader prompt's turn,
+// so a turn that a notice wakes before Claude reads the prompt has no reader turn to follow. The
+// guarded send, as question recovery makes it, catches a receipt that ends with its guarded attempt,
+// which that same `result` settles before the replay arrives.
+test.each([
+  ['before', 'an ordinary'],
+  ['after', 'an ordinary'],
+  ['after', 'a guarded'],
+] as const)(
+  'a reader prompt takes over background work only once Claude replays it, with the woken turn %s the replay of %s send',
+  async (when, send) => {
+    const { session, lines, launched, request, compaction, children, payload, ids, replay, idle } =
+      await beforeBackgroundResult();
+    compaction.readerAction('sess-1');
+    const guard = send === 'a guarded' ? new GuardedAttempt('6f1c2a1e-0000-4000-8000-000000000003') : undefined;
+    await promptAsReader(compaction, session, (submitted, received) =>
+      session.prompt('After this is done, self compact.', submitted, guard, received),
+    );
+    children[0].say(lines[launched] + '\n');
+    idle();
+    if (when === 'after') {
+      replay();
+      children[0].say(COMPLETED_RESULT);
+      idle();
+    }
+    for (const line of lines.slice(launched + 1, request + 1)) children[0].say(line + '\n');
+    const ready = compaction.handle({ method: 'compact-ready', params: payload(ids[0]) }) as { code?: string };
+    const ack = compaction.handle({ method: 'compact-request', params: payload(ids[0]) }) as { state: string };
+    assert.deepEqual([ready.code, ack.state], when === 'after' ? [undefined, 'queued'] : ['reader-acted', 'refused']);
+  },
+);
 
 // Catches a notice that Claude absorbs into a woken turn before its first tool call staying
 // waiting after that turn, so a later turn with no notice spends the reader's one compaction.

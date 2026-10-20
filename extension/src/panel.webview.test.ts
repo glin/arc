@@ -25469,7 +25469,7 @@ test('only a failed card offers a way out of it, and the press names its session
   );
   const draftHandoffAt = extensionSource.indexOf('panel.onSendDraftPrompt = async');
   const draftHandoff = memberFrom(extensionSource, draftHandoffAt);
-  const acceptedAt = draftHandoff.indexOf('await live.prompt(prompt,');
+  const acceptedAt = draftHandoff.indexOf('live.prompt(prompt');
   const actualAt = draftHandoff.indexOf('liveSession.state().sessionId');
   const recentAt = draftHandoff.indexOf('setupStore.accept(project, draft.profile)');
   assert.ok(

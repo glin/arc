@@ -232,7 +232,7 @@ export class CompactRequests {
   private disposed = false;
   private readonly continuationAssignments = new Set<string>();
   // Reader assignments that admitted a compaction. One assignment admits one, across its own turn
-  // and every turn that work it launched wakes.
+  // and every turn that work it launched or adopted wakes.
   private readonly compactedAssignments = new Set<string>();
   private readonly rejections = new Map<string, CompactRejection>();
   private readonly admissions = new Map<string, Promise<Readonly<CompactObservation>>>();
@@ -976,11 +976,16 @@ interface Submission {
   sessionId: string | null;
   revision: number;
   assignmentId: string;
+  // True for a prompt the reader sent. Only such a prompt adopts background work.
+  reader: boolean;
 }
 
-// A root background launch, the submission whose turn made it, and the subagent it started, if any.
-// The submission is null when that turn had no reader instruction. `woke` holds while its task notice waits for the turn that Claude
-// starts by itself to answer it.
+// A root background launch, the submission that covers it, and the subagent it started, if any.
+// A launch in an owned turn starts with that turn's submission. A launch that no single turn owns starts with the
+// latest reader submission that Claude read in the child. The submission is null when that source supplies no reader
+// instruction: an unbound turn, or a child where Claude has read no reader prompt. Each reader prompt that Claude
+// reads later takes the launch over until its task notice arrives. `woke` holds while that notice waits for the turn
+// that Claude starts by itself to answer it.
 interface Launch {
   submission: Submission | null;
   agentId: string | null;
@@ -1027,6 +1032,8 @@ export class CompactHost<C extends CompactChild> {
   private readonly incomplete = new WeakSet<C>();
   // Turns Claude started by itself that no task notice explains. They never bind.
   private readonly unbound = new WeakMap<C, Set<number>>();
+  // The latest reader submission that Claude read in each child.
+  private readonly latestReader = new WeakMap<C, Submission>();
 
   constructor(
     private readonly activation: string,
@@ -1098,9 +1105,26 @@ export class CompactHost<C extends CompactChild> {
       sessionId,
       revision: sessionId ? this.revision(sessionId) : 0,
       assignmentId: assignment,
+      reader: origin === 'reader',
     });
     if (book.size > SUBMISSIONS_PER_CHILD) book.delete(book.keys().next().value!);
     this.generationOf(child);
+  }
+
+  // Runs when Claude reports that it read a reader prompt. Claude replays a prompt when it reads
+  // it, so output that Claude wrote before then, such as the `result` and `idle` of earlier work,
+  // reaches Arc first. A prompt that Arc wrote but Claude has not read adopts nothing. The reader
+  // saw the background work that still runs, so the prompt takes over every launch whose task
+  // notice has not arrived. A notice that arrived earlier keeps its own submission, because the
+  // reader acted after it. The revision stays the one recorded at submission, so a later reader
+  // action still refuses. A follow-up or a continuation carries no reader instruction and adopts
+  // nothing.
+  read(child: C, turnId: number): void {
+    if (this.disposed) return;
+    const submission = this.submissions.get(child)?.get(turnId);
+    if (!submission?.reader) return;
+    this.latestReader.set(child, submission);
+    for (const launch of this.launches.get(child)?.values() ?? []) if (!launch.woke) launch.submission = submission;
   }
 
   native(child: C, event: NativeEvent, turnId: number | undefined): void {
@@ -1117,8 +1141,10 @@ export class CompactHost<C extends CompactChild> {
       this.wake(child, event.toolId, event.runId, turnId);
       return;
     }
+    // A launch that no single turn owns, such as a delayed result while a reader prompt joined a
+    // running turn, belongs to the latest reader prompt that Claude read in the child.
     if (event.kind === 'launch') {
-      const submission = turnId === undefined ? undefined : this.submissionOf(child, turnId);
+      const submission = turnId === undefined ? this.latestReader.get(child) : this.submissionOf(child, turnId);
       this.recordLaunch(child, event.toolId, submission ?? null, event.agentId);
       return;
     }
@@ -1364,9 +1390,10 @@ export class CompactHost<C extends CompactChild> {
     };
   }
 
-  // A turn Claude starts by itself answers the task notices that arrived while no turn ran. It takes
-  // the submission whose turns launched the work of every such notice. It binds nothing when no
-  // notice waits, when a notice names a launch of a turn without a reader instruction or a dropped
+  // A turn Claude starts by itself answers the task notices that arrived while no turn ran. It
+  // takes the submission that covers the launches of every such notice: the latest reader prompt
+  // that Claude read before the notice, or the launch's first submission. It binds nothing when no
+  // notice waits, when a notice names a launch that no reader instruction covers or a dropped
   // launch, or when the notices name launches of different submissions. The copy keeps the source's
   // session, revision and reader assignment.
   private submissionOf(child: C, turnId: number): Submission | undefined {
@@ -1392,6 +1419,8 @@ export class CompactHost<C extends CompactChild> {
     return entry;
   }
 
+  // Records a root background launch with the submission that covers it when it starts. Capacity
+  // drops the oldest launch, and a notice that names a dropped launch binds nothing.
   private recordLaunch(child: C, toolId: string, submission: Submission | null, agentId: string | null): void {
     const launches = this.launches.get(child) ?? new Map<string, Launch>();
     this.launches.set(child, launches);
@@ -1413,7 +1442,8 @@ export class CompactHost<C extends CompactChild> {
   }
 
   // A task notice inside an owned turn is that turn's to answer, so it releases its launch. Any other
-  // notice waits. The next turn Claude starts by itself binds to it, and the next `result` releases it.
+  // notice waits and fixes the launch's submission. The next turn Claude starts by itself binds to it,
+  // and the next `result` releases it.
   private wake(child: C, toolId: string, runId: string | null, turnId: number | undefined): void {
     const launches = this.launches.get(child) ?? new Map<string, Launch>();
     this.launches.set(child, launches);
@@ -1486,6 +1516,23 @@ export interface ReplyHolder {
   noteRecordedReply(session: string, sourceId: string, text: string, saved: () => void, wanted: () => boolean): void;
   noteCompletedReply(session: string, text: string, sourceId?: string, turnId?: number, saved?: () => void): void;
   settleRecordedReplies(): void;
+}
+
+// Sends one reader prompt and records it for self-compaction. The prompt takes over background work
+// only when the agent reports that it read the prompt. A prompt without that receipt takes over nothing.
+export function promptAsReader<C extends CompactChild>(
+  compaction: CompactHost<C> | null,
+  child: C,
+  send: (onSubmitted: (turnId: number) => void, onReceived: (turnId: number) => void) => Promise<number>,
+  onSubmitted?: (turnId: number) => void,
+): Promise<number> {
+  return send(
+    (turnId) => {
+      compaction?.submitted(child, turnId);
+      onSubmitted?.(turnId);
+    },
+    (turnId) => compaction?.read(child, turnId),
+  );
 }
 
 // Routes the child events that self-compaction reads. Returns true when the event needs no other

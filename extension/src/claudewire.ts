@@ -6,6 +6,7 @@ import { unavailableDefaults, type AppliedDefaults } from './view/model-picks';
 // The transport supplies `send` and forwards inbound lines to `receive`.
 
 import * as fs from 'node:fs';
+import { randomUUID } from 'node:crypto';
 
 // Re-export the shared `agentwire.ts` types for Claude protocol callers.
 export {
@@ -471,8 +472,22 @@ export const CONTROL_DEADLINE_MS = 60_000;
 // The write exchange bound for a guarded prompt, counted from the input write.
 export const GUARDED_RECEIPT_MS = 120_000;
 
+// Ordinary prompts that wait for their replay at once. A prompt whose replay never arrives leaves at this bound.
+const PROMPT_RECEIPTS = 16;
+
 // The origin Claude Code writes on a prompt a person typed. See `ClaudeWire.prompt`.
 const HUMAN_ORIGIN = { kind: 'human' } as const;
+
+// Whether a replayed user message holds exactly this text, as a string or as one text block.
+function replayedText(m: Json, text: string): boolean {
+  const message = obj(m.message);
+  const content = message?.content;
+  const blocks = arr(content);
+  return (
+    message?.role === 'user' &&
+    (content === text || (blocks.length === 1 && obj(blocks[0])?.type === 'text' && obj(blocks[0])?.text === text))
+  );
+}
 
 export interface WireOptions {
   now?(): number;
@@ -541,6 +556,12 @@ export class ClaudeWire {
     text: string;
     timer: ReturnType<typeof setTimeout>;
   } | null = null;
+  // Prompts that wait for their replayed user message to report that Claude read them, by client UUID.
+  // A guarded prompt's receipt also carries its text. A `result` or `idle` that Claude wrote before it
+  // read a prompt ends none of them, and neither does the settlement of a guarded attempt. A Stop that
+  // cancels queued prompts, a change from a known session, and a closed child end all of them. The
+  // oldest leaves at the limit.
+  private readonly receipts = new Map<string, { session: string | null; text?: string; received: () => void }>();
 
   contextFrame(text: string): string | null {
     if (!this.contextRequests.size) return null;
@@ -581,18 +602,21 @@ export class ClaudeWire {
 
   // Sends a prompt and rejects delivery if the wire closes or Stop cancels prompts during attachment preparation.
   // Every prompt carries a human origin. The transcript's `agentRunIn` rule uses it to identify reader-owned sessions across windows.
+  // `received` runs once Claude replays the prompt, which it does when it reads the prompt. An ordinary
+  // prompt with `received` carries a fresh client UUID for that match. A guarded prompt uses its attempt's UUID.
   prompt(
     input: AgentPromptInput,
     guard?: GuardedAttempt,
     beforeWrite?: () => void,
     writeAttempted?: () => void,
+    received?: () => void,
   ): Promise<void> {
     this.responseClock.reset();
     if (this.closed) {
       throw new Error('the agent is no longer running');
     }
     const prompt = normalizeAgentPrompt(input);
-    if (guard) return this.guardedPrompt(prompt.text, prompt.assets.length > 0, guard);
+    if (guard) return this.guardedPrompt(prompt.text, prompt.assets.length > 0, guard, received);
     this.reportedState = null;
     if (!prompt.assets.length && prompt.text) {
       beforeWrite?.();
@@ -602,6 +626,7 @@ export class ClaudeWire {
           type: 'user',
           message: { role: 'user', content: [{ type: 'text', text: prompt.text }] },
           origin: HUMAN_ORIGIN,
+          ...this.awaitReceipt(received),
         },
         writeAttempted,
       );
@@ -617,8 +642,24 @@ export class ClaudeWire {
       }
       beforeWrite?.();
       this.nativeSubmission(prompt.text);
-      this.write({ type: 'user', message: { role: 'user', content }, origin: HUMAN_ORIGIN }, writeAttempted);
+      this.write(
+        { type: 'user', message: { role: 'user', content }, origin: HUMAN_ORIGIN, ...this.awaitReceipt(received) },
+        writeAttempted,
+      );
     });
+  }
+
+  // Registers the receipt of an ordinary prompt and returns the client UUID its frame carries.
+  private awaitReceipt(received: (() => void) | undefined): { uuid?: string } {
+    if (!received) return {};
+    const uuid = randomUUID();
+    this.addReceipt(uuid, { session: this.session, received });
+    return { uuid };
+  }
+
+  private addReceipt(uuid: string, receipt: { session: string | null; text?: string; received: () => void }): void {
+    this.receipts.set(uuid, receipt);
+    if (this.receipts.size > PROMPT_RECEIPTS) this.receipts.delete(this.receipts.keys().next().value!);
   }
 
   // Positive idle evidence: the CLI reported idle after the last prompt write, and no guarded prompt waits.
@@ -628,7 +669,12 @@ export class ClaudeWire {
 
   // Writes a text-only prompt with a client UUID. Only the matching replay accepts it.
   // Every refusal here happens before the write, so the attempt never starts.
-  private guardedPrompt(text: string, hasAssets: boolean, attempt: GuardedAttempt): Promise<void> {
+  private guardedPrompt(
+    text: string,
+    hasAssets: boolean,
+    attempt: GuardedAttempt,
+    received?: () => void,
+  ): Promise<void> {
     if (hasAssets || !text) throw new Error('a guarded prompt carries text only');
     if (this.replayWait) throw new Error('another guarded prompt is still unsettled');
     if (!this.session) throw new Error('the session identity is unknown');
@@ -648,26 +694,35 @@ export class ClaudeWire {
     );
     if (typeof timer === 'object' && typeof timer.unref === 'function') timer.unref();
     this.replayWait = { attempt, session: this.session, text, timer };
+    if (received) this.addReceipt(attempt.clientUuid, { session: this.session, text, received });
     return Promise.resolve();
   }
 
-  // A replay settles the attempt only for the same UUID, session, root scope, and exact text.
+  // A replay settles the guarded attempt only for the same UUID, session, root scope, and exact text.
+  // It reports a prompt's receipt for the same UUID and root scope, in the session the wire follows
+  // now, which must be the session the wire knew at the write when it knew one. A guarded prompt's
+  // receipt also needs the exact text.
   private replay(m: Json): void {
+    if (str(m.type) !== 'user' || (m.parent_tool_use_id !== undefined && m.parent_tool_use_id !== null)) return;
+    const uuid = str(m.uuid);
+    if (!uuid) return;
+    const session = str(m.session_id);
     const wait = this.replayWait;
-    if (!wait || str(m.type) !== 'user' || str(m.uuid) !== wait.attempt.clientUuid) return;
-    if (str(m.session_id) !== wait.session || (m.parent_tool_use_id !== undefined && m.parent_tool_use_id !== null))
+    if (wait && uuid === wait.attempt.clientUuid && session === wait.session && replayedText(m, wait.text)) {
+      clearTimeout(wait.timer);
+      this.replayWait = null;
+      wait.attempt.settle({ outcome: 'accepted', nativeTurnId: null, reason: '' });
+    }
+    const receipt = this.receipts.get(uuid);
+    if (
+      !receipt ||
+      (this.session !== null && session !== this.session) ||
+      (receipt.session !== null && session !== receipt.session) ||
+      (receipt.text !== undefined && !replayedText(m, receipt.text))
+    )
       return;
-    const message = obj(m.message);
-    const content = message?.content;
-    const blocks = arr(content);
-    const exact =
-      message?.role === 'user' &&
-      (content === wait.text ||
-        (blocks.length === 1 && obj(blocks[0])?.type === 'text' && obj(blocks[0])?.text === wait.text));
-    if (!exact) return;
-    clearTimeout(wait.timer);
-    this.replayWait = null;
-    wait.attempt.settle({ outcome: 'accepted', nativeTurnId: null, reason: '' });
+    this.receipts.delete(uuid);
+    receipt.received();
   }
 
   private endReplayWait(reason: string): void {
@@ -716,6 +771,7 @@ export class ClaudeWire {
     this.responseTimingBlocked = true;
     if (cancelQueued) {
       this.promptGeneration += 1;
+      this.receipts.clear();
     }
     await this.request(cancelQueued ? { subtype: 'interrupt', cancel_queued: true } : { subtype: 'interrupt' });
   }
@@ -858,6 +914,8 @@ export class ClaudeWire {
       // Preserve the previous session id for the session-change event.
       const previous = this.session;
       this.session = session;
+      // A replay in a later session never reports a prompt of the earlier one as read.
+      if (previous !== null) this.receipts.clear();
       this.emit({ kind: 'session', sessionId: session, previous });
     }
 
@@ -1053,6 +1111,7 @@ export class ClaudeWire {
     this.responseClock.reset();
     this.contextRequests.clear();
     this.endReplayWait(reason);
+    this.receipts.clear();
     if (this.closed) {
       return;
     }

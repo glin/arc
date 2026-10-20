@@ -2333,6 +2333,121 @@ test('Claude guarded prompts settle only on the matching root replay, and replay
   }
 });
 
+// Catches a reader prompt counting as read before Claude replays it, or on a replay of another
+// prompt, session or scope, a guarded receipt that ends with its attempt, and a receipt that
+// outlives a Stop, a session change or a closed child.
+test('Claude reports a prompt as read only on its own root replay', async () => {
+  const sent: Record<string, any>[] = [];
+  const wire = new ClaudeWire({ send: (line) => sent.push(JSON.parse(line)), emit: () => {}, sessionId: SESSION });
+  const read: string[] = [];
+  const prompt = async (text: string, guard?: GuardedAttempt) => {
+    await wire.prompt(text, guard, undefined, undefined, () => read.push(text));
+    return sent.at(-1)!;
+  };
+  const replay = (frame: Record<string, any>, changes: Record<string, unknown> = {}) =>
+    wire.receive(
+      JSON.stringify({
+        type: 'user',
+        isReplay: true,
+        session_id: SESSION,
+        parent_tool_use_id: null,
+        uuid: frame.uuid,
+        message: frame.message,
+        ...changes,
+      }),
+    );
+  await wire.prompt('plain');
+  assert.equal(sent.at(-1)!.uuid, undefined, 'a prompt without a receipt carries no client UUID');
+  const first = await prompt('first');
+  assert.match(first.uuid, /^[0-9a-f-]{36}$/);
+  // Output that Claude wrote before it read the prompt ends no receipt.
+  wire.receive(JSON.stringify({ type: 'result', subtype: 'success', session_id: SESSION, result: 'done' }));
+  wire.receive(
+    JSON.stringify({ type: 'system', subtype: 'session_state_changed', state: 'idle', session_id: SESSION }),
+  );
+  for (const changes of [
+    { uuid: 'historical-uuid' },
+    { session_id: 'b1f0b8f2-0000-4000-8000-000000000009' },
+    { parent_tool_use_id: 'toolu_nested' },
+    { type: 'assistant' },
+  ])
+    replay(first, changes);
+  assert.deepEqual(read, []);
+  replay(first);
+  replay(first);
+  assert.deepEqual(read, ['first']);
+  const attempt = new GuardedAttempt('6f1c2a1e-0000-4000-8000-000000000002');
+  const guarded = await prompt('guarded', attempt);
+  // The launching turn's `result` settles the guarded attempt before Claude reads the prompt.
+  wire.receive(JSON.stringify({ type: 'result', subtype: 'success', session_id: SESSION, result: 'done' }));
+  assert.equal(attempt.settled?.outcome, 'unknown');
+  replay(guarded, { message: { role: 'user', content: 'other text' } });
+  assert.deepEqual(read, ['first']);
+  replay(guarded);
+  assert.deepEqual(read, ['first', 'guarded']);
+  const stop = async () => {
+    const stopping = wire.interrupt(true);
+    wire.receive(
+      JSON.stringify({
+        type: 'control_response',
+        response: { subtype: 'success', request_id: sent.at(-1)!.request_id, response: {} },
+      }),
+    );
+    await stopping;
+  };
+  const stopped = await prompt('stopped');
+  const stoppedGuarded = await prompt('stopped guarded', new GuardedAttempt('6f1c2a1e-0000-4000-8000-000000000004'));
+  await stop();
+  replay(stopped);
+  replay(stoppedGuarded);
+  const replaced = await prompt('replaced');
+  const replacedGuarded = await prompt('replaced guarded', new GuardedAttempt('6f1c2a1e-0000-4000-8000-000000000005'));
+  const next = 'b1f0b8f2-0000-4000-8000-00000000000a';
+  wire.receive(JSON.stringify({ type: 'system', subtype: 'status', session_id: next }));
+  replay(replaced);
+  replay(replacedGuarded);
+  replay(replaced, { session_id: next });
+  const closed = await prompt('closed');
+  wire.close('closed');
+  replay(closed, { session_id: next });
+  assert.deepEqual(read, ['first', 'guarded']);
+});
+
+// Catches a receipt registered before Claude named the session never reporting the prompt, and
+// such a receipt matching a replay from a session other than the one the wire follows, including
+// after the wire moves on to another session.
+test('Claude reports a prompt written before the session was known on a replay in the established session', async () => {
+  const sent: Record<string, any>[] = [];
+  const wire = new ClaudeWire({ send: (line) => sent.push(JSON.parse(line)), emit: () => {} });
+  const read: string[] = [];
+  const prompt = async (text: string) => {
+    await wire.prompt(text, undefined, undefined, undefined, () => read.push(text));
+    return sent.at(-1)!;
+  };
+  const replay = (frame: Record<string, any>, session: string) =>
+    wire.receive(
+      JSON.stringify({
+        type: 'user',
+        isReplay: true,
+        session_id: session,
+        parent_tool_use_id: null,
+        uuid: frame.uuid,
+        message: frame.message,
+      }),
+    );
+  const first = await prompt('first');
+  const early = await prompt('early');
+  wire.receive(JSON.stringify({ type: 'system', subtype: 'init', session_id: SESSION }));
+  replay(first, 'b1f0b8f2-0000-4000-8000-00000000000b');
+  assert.deepEqual(read, []);
+  replay(first, SESSION);
+  assert.deepEqual(read, ['first']);
+  const next = 'b1f0b8f2-0000-4000-8000-00000000000c';
+  wire.receive(JSON.stringify({ type: 'system', subtype: 'status', session_id: next }));
+  replay(early, next);
+  assert.deepEqual(read, ['first']);
+});
+
 // Catches a guarded follow-up that reuses the previous native generation, so a deferred compaction its turn requests
 // binds to the earlier turn instead.
 test('a Claude guarded prompt starts its own native submission, and its root tool calls carry that generation', async () => {
