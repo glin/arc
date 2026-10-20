@@ -19,16 +19,7 @@ import { fileURLToPath } from 'node:url';
 import { DispatchReceipts } from '../../extension/src/dispatchreceipts.ts';
 import { payloadSha256 } from '../../extension/src/sessionwrites.ts';
 import * as fs from 'node:fs';
-import {
-  skillFiles,
-  fixture,
-  packageJson,
-  input,
-  cli,
-  expectedVersion,
-  smokeEnv,
-  PROCESS_CASE,
-} from './smoke-fixture.ts';
+import { skillFiles, fixture, packageJson, input, cli, expectedVersion, smokeEnv } from './smoke-fixture.ts';
 
 const bundledVersion = expectedVersion();
 
@@ -358,69 +349,65 @@ test('the packed package installs only arc globally and runs locally offline', (
   }
 }, 60_000);
 
-test(
-  'bundled dispatch commands preserve exact event claims and readable private reports without a host',
-  async () => {
-    const home = mkdtempSync(join(realpathSync(tmpdir()), 'arc-dispatch-smoke-'));
-    const receipts = new DispatchReceipts(home);
-    const origin = 'a'.repeat(24);
-    const launch = receipts.reserve({
-      origin,
-      requester: null,
-      policy: null,
-      promptSha256: payloadSha256('review'),
-      completion: 'wait',
-      alias: null,
-    });
-    const event = receipts.publish(
-      launch.launchId,
-      { outcome: 'succeeded', availability: 'available', nativeEnding: null, askId: null },
-      'Saved report',
+test('bundled dispatch commands preserve exact event claims and readable private reports without a host', async () => {
+  const home = mkdtempSync(join(realpathSync(tmpdir()), 'arc-dispatch-smoke-'));
+  const receipts = new DispatchReceipts(home);
+  const origin = 'a'.repeat(24);
+  const launch = receipts.reserve({
+    origin,
+    requester: null,
+    policy: null,
+    promptSha256: payloadSha256('review'),
+    completion: 'wait',
+    alias: null,
+  });
+  const event = receipts.publish(
+    launch.launchId,
+    { outcome: 'succeeded', availability: 'available', nativeEnding: null, askId: null },
+    'Saved report',
+  );
+  const outcome = join(home, 'outcome.md');
+  writeFileSync(outcome, 'Accepted');
+  const run = promisify(execFile);
+  const env = { ...smokeEnv, ARC_HOME: home };
+  const call = async (action, extra = []) =>
+    JSON.parse(
+      (
+        await run(process.execPath, [cli, 'dispatch', action, launch.launchId, ...extra, '--json'], {
+          env,
+          encoding: 'utf8',
+        })
+      ).stdout,
     );
-    const outcome = join(home, 'outcome.md');
-    writeFileSync(outcome, 'Accepted');
-    const run = promisify(execFile);
-    const env = { ...smokeEnv, ARC_HOME: home };
-    const call = async (action, extra = []) =>
-      JSON.parse(
-        (
-          await run(process.execPath, [cli, 'dispatch', action, launch.launchId, ...extra, '--json'], {
-            env,
-            encoding: 'utf8',
-          })
-        ).stdout,
-      );
-    try {
-      assert.equal((await call('result', ['--event', event.eventId])).text, 'Saved report');
-      assert.equal((await call('status')).events[0].eventId, event.eventId);
-      const claim = await call('claim', ['--event', event.eventId, '--origin', origin, '--owner', 'consumer']);
-      const recovered = await call('claim', ['--event', event.eventId, '--origin', origin, '--owner', 'consumer']);
-      assert.equal(recovered.token, claim.token);
-      const ackArgs = [
-        '--event',
-        event.eventId,
-        '--origin',
-        origin,
-        '--owner',
-        'consumer',
-        '--token',
-        claim.token,
-        '--outcome-file',
-        outcome,
-      ];
-      assert.equal((await call('ack', ackArgs)).status, 'consumed');
-      assert.equal((await call('ack', ackArgs)).disposition, 'Accepted');
-      writeFileSync(outcome, 'Rejected');
-      await assert.rejects(call('ack', ackArgs), /different saved disposition/);
-      assert.equal((await call('refresh')).events.length, 1);
-      assert.equal((await call('recover', ['--event', event.eventId])).delivery, 'unavailable');
-      assert.equal((await call('monitor')).state, 'unavailable');
-      assert.equal((await call('wait', ['--deadline-ms', '1'])).state, 'uncertain');
-      await assert.rejects(call('result', ['--event', '../unsafe']));
-      await assert.rejects(call('status', ['--owner', 'unexpected']));
-    } finally {
-      rmSync(home, { recursive: true, force: true });
-    }
-  },
-  PROCESS_CASE,
-);
+  try {
+    assert.equal((await call('result', ['--event', event.eventId])).text, 'Saved report');
+    assert.equal((await call('status')).events[0].eventId, event.eventId);
+    const claim = await call('claim', ['--event', event.eventId, '--origin', origin, '--owner', 'consumer']);
+    const recovered = await call('claim', ['--event', event.eventId, '--origin', origin, '--owner', 'consumer']);
+    assert.equal(recovered.token, claim.token);
+    const ackArgs = [
+      '--event',
+      event.eventId,
+      '--origin',
+      origin,
+      '--owner',
+      'consumer',
+      '--token',
+      claim.token,
+      '--outcome-file',
+      outcome,
+    ];
+    assert.equal((await call('ack', ackArgs)).status, 'consumed');
+    assert.equal((await call('ack', ackArgs)).disposition, 'Accepted');
+    writeFileSync(outcome, 'Rejected');
+    await assert.rejects(call('ack', ackArgs), /different saved disposition/);
+    assert.equal((await call('refresh')).events.length, 1);
+    assert.equal((await call('recover', ['--event', event.eventId])).delivery, 'unavailable');
+    assert.equal((await call('monitor')).state, 'unavailable');
+    assert.equal((await call('wait', ['--deadline-ms', '1'])).state, 'uncertain');
+    await assert.rejects(call('result', ['--event', '../unsafe']));
+    await assert.rejects(call('status', ['--owner', 'unexpected']));
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+}, 30_000);

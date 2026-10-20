@@ -3,11 +3,12 @@ const { EventEmitter } = require('node:events');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const { spawnSync } = require('node:child_process');
 const { pathToFileURL } = require('node:url');
 
 const repositoryRoot = path.join(__dirname, '..');
 const ROOT_TEST_DIRECTORIES = ['plugins', 'scripts', 'test'];
-// Files that import child_process and carry no subprocess tag. Each entry names the reason.
+// Files that reach child_process and carry no subprocess tag. Each entry names the reason.
 const UNTAGGED_PROCESS_FILES = {
   'test/hooks-smoke.test.js': 'The test:smoke lane runs it. Both root lanes exclude it.',
 };
@@ -36,6 +37,22 @@ function importsChildProcess(text) {
   return /(?:require\(|import\(|from\s+)\s*['"](?:node:)?child_process['"]/.test(text);
 }
 
+function reachesChildProcess(file, visited = new Set()) {
+  if (visited.has(file)) return false;
+  visited.add(file);
+  const text = fs.readFileSync(file, 'utf8');
+  if (importsChildProcess(text)) return true;
+  for (const match of text.matchAll(/(?:require\(|import\(|from\s+)\s*['"](\.[^'"]+)['"]/g)) {
+    const base = path.resolve(path.dirname(file), match[1]);
+    if (base.split(path.sep).includes('node_modules')) continue;
+    const dependency = [base, `${base}.js`, `${base}.mjs`, path.join(base, 'index.js')].find(
+      (candidate) => fs.existsSync(candidate) && fs.statSync(candidate).isFile(),
+    );
+    if (dependency && reachesChildProcess(dependency, visited)) return true;
+  }
+  return false;
+}
+
 function hasSubprocessTag(text) {
   return /\/\/\s*@module-tag\s+subprocess\b/.test(text) || /tags:\s*\[\s*'subprocess'/.test(text);
 }
@@ -48,17 +65,69 @@ function excludesOf(command) {
   return [...command.matchAll(/--exclude[= ]\s*(\S+)/g)].map((match) => match[1]);
 }
 
-test('every root test file that imports child_process carries the subprocess tag or is listed with a reason', () => {
+test('every root test file that reaches child_process carries the subprocess tag or is listed with a reason', () => {
   const untagged = [];
   for (const file of rootTestFiles()) {
     const text = fs.readFileSync(path.join(repositoryRoot, file), 'utf8');
-    if (importsChildProcess(text) && !hasSubprocessTag(text) && !(file in UNTAGGED_PROCESS_FILES)) untagged.push(file);
+    if (
+      reachesChildProcess(path.join(repositoryRoot, file)) &&
+      !hasSubprocessTag(text) &&
+      !(file in UNTAGGED_PROCESS_FILES)
+    )
+      untagged.push(file);
   }
   assert.deepEqual(
     untagged,
     [],
     'Tag these files subprocess, or list them in UNTAGGED_PROCESS_FILES with a reason, so test:root stays free of process starts.',
   );
+});
+
+test('command entry points run through a linked checkout', { tags: ['subprocess'] }, () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'arc-entry-'));
+  const linked = path.join(root, 'linked');
+  const physical = path.join(root, 'physical');
+  const write = (file, text) => {
+    const target = path.join(physical, file);
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.writeFileSync(target, text);
+  };
+  try {
+    for (const file of ['scripts/test-subprocess.mjs', 'extension/test.mjs', 'scripts/isolated-editor.mjs']) {
+      write(file, fs.readFileSync(path.join(repositoryRoot, file), 'utf8'));
+    }
+    write(
+      'extension/test/browserlock.mjs',
+      'export async function acquireBrowserLock(){return {release(){}}} export function forwardSignalToChildAndRelease(){return ()=>{}}',
+    );
+    write(
+      'extension/test/browserchannels.mjs',
+      'export async function launchAnyBrowser(){throw Error("unexpected browser")}',
+    );
+    write('extension/src/example.test.ts', '');
+    write('node_modules/vitest/vitest.mjs', 'console.log("subprocess entry reached");process.exitCode=7;');
+    fs.symlinkSync(physical, linked, 'junction');
+    for (const { file, args, status, output } of [
+      { file: 'scripts/test-subprocess.mjs', args: [], status: 7, output: /subprocess entry reached/ },
+      { file: 'extension/test.mjs', args: ['invalid-mode'], status: 1, output: /Unknown test mode/ },
+      { file: 'scripts/isolated-editor.mjs', args: ['invalid-command'], status: 2, output: /Choose a command/ },
+    ]) {
+      const result = spawnSync(process.execPath, [path.join(linked, file), ...args], { encoding: 'utf8' });
+      assert.ifError(result.error);
+      assert.equal(result.status, status, `${file}\n${result.stdout}${result.stderr}`);
+      assert.match(result.stdout + result.stderr, output);
+      const imported = spawnSync(process.execPath, ['--input-type=module', '-'], {
+        input: `await import(${JSON.stringify(pathToFileURL(path.join(linked, file)).href)});console.log('import only');`,
+        encoding: 'utf8',
+      });
+      assert.ifError(imported.error);
+      assert.equal(imported.status, 0, imported.stderr);
+      assert.equal(imported.stdout.trim(), 'import only');
+    }
+  } finally {
+    if (fs.existsSync(linked)) fs.unlinkSync(linked);
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test('every untagged process file is still listed for a reason', () => {

@@ -2,7 +2,8 @@
 // One shared lock in the system temp folder limits the machine to one such lane across checkouts.
 import { spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, join } from 'node:path';
+import { existsSync, realpathSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { acquireBrowserLock, forwardSignalToChildAndRelease } from '../extension/test/browserlock.mjs';
 
@@ -70,7 +71,11 @@ export async function runSubprocessLane(
   }
 }
 
-if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+if (
+  process.argv[1] &&
+  existsSync(process.argv[1]) &&
+  realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url))
+) {
   runSubprocessLane(process.argv.slice(2))
     .then((code) => {
       process.exitCode = code;

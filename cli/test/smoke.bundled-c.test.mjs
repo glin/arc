@@ -23,7 +23,6 @@ import {
   cli,
   smokeEnv,
   setupReply,
-  PROCESS_CASE,
 } from './smoke-fixture.ts';
 
 test('bundled collector routes read-only requests and refuses an invalid flag before transport', async () => {
@@ -663,113 +662,109 @@ test('bundled setups print readable launch values by default and compact JSON on
   }
 });
 
-test(
-  'bundled session commands select one window, reject unknown IDs, and bound turns before sending',
-  async () => {
-    const home = mkdtempSync(join(realpathSync(tmpdir()), 'arc-session-smoke-'));
-    const channel = new WindowChannel(home);
-    const second = new WindowChannel(home);
-    const run = promisify(execFile);
-    let requests = 0;
-    channel.setRequestHandler((request) => {
-      requests++;
-      if (request.method === 'setups') return setupReply;
-      if (request.method === 'session' && request.params.sessionId !== 'known') throw new Error('Unknown session.');
-      return { method: request.method, params: request.params, requester: request.requester };
-    });
-    const env = {
-      ...smokeEnv,
-      ARC_HOME: home,
-      ARC_WINDOW: channel.hostId,
-      CODEX_THREAD_ID: 'requesting-agent',
-      CLAUDE_CODE_SESSION_ID: '',
+test('bundled session commands select one window, reject unknown IDs, and bound turns before sending', async () => {
+  const home = mkdtempSync(join(realpathSync(tmpdir()), 'arc-session-smoke-'));
+  const channel = new WindowChannel(home);
+  const second = new WindowChannel(home);
+  const run = promisify(execFile);
+  let requests = 0;
+  channel.setRequestHandler((request) => {
+    requests++;
+    if (request.method === 'setups') return setupReply;
+    if (request.method === 'session' && request.params.sessionId !== 'known') throw new Error('Unknown session.');
+    return { method: request.method, params: request.params, requester: request.requester };
+  });
+  const env = {
+    ...smokeEnv,
+    ARC_HOME: home,
+    ARC_WINDOW: channel.hostId,
+    CODEX_THREAD_ID: 'requesting-agent',
+    CLAUDE_CODE_SESSION_ID: '',
+  };
+  try {
+    await channel.update({ folders: [], scopeReady: true, panelReady: false, panelVisible: false });
+    await second.update({ folders: [], scopeReady: true, panelReady: false, panelVisible: false });
+    const listing = await run(process.execPath, [cli, 'sessions', '--json'], { env, encoding: 'utf8' });
+    assert.deepEqual(JSON.parse(listing.stdout), { method: 'sessions', params: {}, requester: 'requesting-agent' });
+    const maximum = SESSION_PAGE_LIMITS.rows;
+    assert.equal(maximum, 128);
+    const pageRequest = {
+      sources: [],
+      cursor: null,
+      limit: maximum,
+      catalog: 'complete',
+      fresh: true,
+      scope: 'smoke',
+      secret: Buffer.alloc(32),
+      requester: null,
+      project: () => assert.fail('An empty catalog has no rows to project.'),
     };
-    try {
-      await channel.update({ folders: [], scopeReady: true, panelReady: false, panelVisible: false });
-      await second.update({ folders: [], scopeReady: true, panelReady: false, panelVisible: false });
-      const listing = await run(process.execPath, [cli, 'sessions', '--json'], { env, encoding: 'utf8' });
-      assert.deepEqual(JSON.parse(listing.stdout), { method: 'sessions', params: {}, requester: 'requesting-agent' });
-      const maximum = SESSION_PAGE_LIMITS.rows;
-      assert.equal(maximum, 128);
-      const pageRequest = {
-        sources: [],
-        cursor: null,
-        limit: maximum,
-        catalog: 'complete',
-        fresh: true,
-        scope: 'smoke',
-        secret: Buffer.alloc(32),
-        requester: null,
-        project: () => assert.fail('An empty catalog has no rows to project.'),
-      };
-      assert.equal(sessionListingPage(pageRequest).complete, true);
-      assert.throws(() => sessionListingPage({ ...pageRequest, limit: maximum + 1 }), /Limit must be between/);
-      const wireRequest = {
-        id: 'page-bound',
-        version: 1,
-        token: 'b'.repeat(64),
-        requester: null,
-        method: 'sessions',
-        params: { limit: maximum },
-      };
-      assert.deepEqual(parseSessionRequest(wireRequest), wireRequest);
-      assert.equal(parseSessionRequest({ ...wireRequest, params: { limit: maximum + 1 } }), null);
-      const largest = await run(process.execPath, [cli, 'sessions', '--limit', String(maximum), '--json'], {
-        env,
-        encoding: 'utf8',
-      });
-      assert.deepEqual(JSON.parse(largest.stdout).params, { limit: maximum });
-      const atMaximum = requests;
-      await assert.rejects(
-        run(process.execPath, [cli, 'sessions', '--limit', String(maximum + 1)], { env }),
-        /Limit must be between/,
-      );
-      assert.equal(requests, atMaximum);
-      const detail = await run(
-        process.execPath,
-        [cli, 'session', 'known', '--turns', '2', '--window', channel.hostId, '--json'],
-        { env: { ...env, ARC_WINDOW: second.hostId }, encoding: 'utf8' },
-      );
-      assert.equal(JSON.parse(detail.stdout).params.turns, 2);
-      await assert.rejects(run(process.execPath, [cli, 'session', 'unknown'], { env }), /Unknown session/);
-      const before = requests;
-      await assert.rejects(
-        run(process.execPath, [cli, 'sessions'], { env: { ...env, ARC_WINDOW: '' } }),
-        /Select one Arc window/,
-      );
-      // A built CLI must dispatch to its terminal owner when another authenticated window is live.
-      let competingRequests = 0;
-      second.setRequestHandler(() => {
-        competingRequests++;
-        return { wrongWindow: true };
-      });
-      const roots = [{ processId: Promise.resolve(process.pid) }];
-      channel.setTerminalOwnership(terminalOwnership({ allowed: () => true, terminals: () => roots }));
-      second.setTerminalOwnership(terminalOwnership({ allowed: () => true, terminals: () => [] }));
-      // The CLI gives its own process read two seconds and reports that expiry with its own message.
-      // A loaded machine delays the read, so the call repeats on that message only. Any other failure ends the case.
-      const retryUntil = Date.now() + 60_000;
-      let integrated;
-      while (!integrated) {
-        try {
-          integrated = await run(process.execPath, [cli, 'setups', '--json'], {
-            env: { ...env, ARC_WINDOW: '', TERM_PROGRAM: 'vscode' },
-            encoding: 'utf8',
-          });
-        } catch (error) {
-          if (!/process list took too long/.test(error.stderr ?? '') || Date.now() >= retryUntil) throw error;
-        }
+    assert.equal(sessionListingPage(pageRequest).complete, true);
+    assert.throws(() => sessionListingPage({ ...pageRequest, limit: maximum + 1 }), /Limit must be between/);
+    const wireRequest = {
+      id: 'page-bound',
+      version: 1,
+      token: 'b'.repeat(64),
+      requester: null,
+      method: 'sessions',
+      params: { limit: maximum },
+    };
+    assert.deepEqual(parseSessionRequest(wireRequest), wireRequest);
+    assert.equal(parseSessionRequest({ ...wireRequest, params: { limit: maximum + 1 } }), null);
+    const largest = await run(process.execPath, [cli, 'sessions', '--limit', String(maximum), '--json'], {
+      env,
+      encoding: 'utf8',
+    });
+    assert.deepEqual(JSON.parse(largest.stdout).params, { limit: maximum });
+    const atMaximum = requests;
+    await assert.rejects(
+      run(process.execPath, [cli, 'sessions', '--limit', String(maximum + 1)], { env }),
+      /Limit must be between/,
+    );
+    assert.equal(requests, atMaximum);
+    const detail = await run(
+      process.execPath,
+      [cli, 'session', 'known', '--turns', '2', '--window', channel.hostId, '--json'],
+      { env: { ...env, ARC_WINDOW: second.hostId }, encoding: 'utf8' },
+    );
+    assert.equal(JSON.parse(detail.stdout).params.turns, 2);
+    await assert.rejects(run(process.execPath, [cli, 'session', 'unknown'], { env }), /Unknown session/);
+    const before = requests;
+    await assert.rejects(
+      run(process.execPath, [cli, 'sessions'], { env: { ...env, ARC_WINDOW: '' } }),
+      /Select one Arc window/,
+    );
+    // A built CLI must dispatch to its terminal owner when another authenticated window is live.
+    let competingRequests = 0;
+    second.setRequestHandler(() => {
+      competingRequests++;
+      return { wrongWindow: true };
+    });
+    const roots = [{ processId: Promise.resolve(process.pid) }];
+    channel.setTerminalOwnership(terminalOwnership({ allowed: () => true, terminals: () => roots }));
+    second.setTerminalOwnership(terminalOwnership({ allowed: () => true, terminals: () => [] }));
+    // The CLI gives its own process read two seconds and reports that expiry with its own message.
+    // A loaded machine delays the read, so the call repeats on that message only. Any other failure ends the case.
+    const retryUntil = Date.now() + 60_000;
+    let integrated;
+    while (!integrated) {
+      try {
+        integrated = await run(process.execPath, [cli, 'setups', '--json'], {
+          env: { ...env, ARC_WINDOW: '', TERM_PROGRAM: 'vscode' },
+          encoding: 'utf8',
+        });
+      } catch (error) {
+        if (!/process list took too long/.test(error.stderr ?? '') || Date.now() >= retryUntil) throw error;
       }
-      assert.deepEqual(JSON.parse(integrated.stdout), setupReply);
-      assert.equal(requests, before + 1);
-      assert.equal(competingRequests, 0);
-    } finally {
-      await Promise.all([channel.dispose(), second.dispose()]);
-      rmSync(home, { recursive: true, force: true });
     }
-  },
-  PROCESS_CASE,
-);
+    assert.deepEqual(JSON.parse(integrated.stdout), setupReply);
+    assert.equal(requests, before + 1);
+    assert.equal(competingRequests, 0);
+  } finally {
+    await Promise.all([channel.dispose(), second.dispose()]);
+    rmSync(home, { recursive: true, force: true });
+  }
+}, 60_000);
 
 test('bundled session commands attribute child requests only to their native session identity', async () => {
   const home = mkdtempSync(join(realpathSync(tmpdir()), 'arc-child-requester-smoke-'));

@@ -1555,64 +1555,18 @@ async function railRowContext(page: Page, session: string): Promise<RailRowConte
   ) as RailRowContext;
 }
 
-test(
-  'a saved heading still offers Rename session after a pin and an archive, and the rail card answers the same press',
-  { timeout: 60_000 },
-  async (t) => {
-    const browser = await browserOrNone();
-    if (!browser) {
-      t.skip('no installed Edge or Chrome, so the rail page was not measured');
-      return;
-    }
-    try {
-      const page = await browser.newPage();
-      await openPage(page, payload());
-      assert.equal((await headingContext(page, 's1')).sessionPersisted, true);
-      await postToPage(page, { type: 'setSessionPinned', session: 's1', pinned: true });
-      const pinned = await headingContext(page, 's1');
-      assert.deepEqual(
-        [pinned.sessionPinned, pinned.sessionPersisted],
-        [true, true],
-        'a pin took Rename session off the heading',
-      );
-      // A pin reply updates session list context without requiring a new session list payload.
+test('pin and archive replies update session context until the next full render', { timeout: 60_000 }, async (t) => {
+  const browser = await browserOrNone();
+  if (!browser) {
+    t.skip('no installed Edge or Chrome, so the rail page was not measured');
+    return;
+  }
+  try {
+    const page = await browser.newPage();
+    const initial = payload();
+    await openPage(page, initial);
 
-      assert.equal(
-        (await railRowContext(page, 's1')).sessionPinned,
-        true,
-        'the rail card still offers to pin a session the heading already pinned',
-      );
-      await postToPage(page, { type: 'setSessionArchived', session: 's1', archived: true });
-      const archived = await headingContext(page, 's1');
-      assert.deepEqual(
-        [archived.webviewSection, archived.sessionPersisted],
-        ['arcSessionArchived', true],
-        'an archive took Rename session off the heading',
-      );
-      assert.equal(
-        (await railRowContext(page, 's1')).sessionArchived,
-        true,
-        'the rail card still offers to archive a session the heading already archived',
-      );
-    } finally {
-      await browser.close();
-    }
-  },
-);
-
-test(
-  'the rail card answers a later full render after an optimistic pin patch, not just the patch itself',
-  { timeout: 60_000 },
-  async (t) => {
-    const browser = await browserOrNone();
-    if (!browser) {
-      t.skip('no installed Edge or Chrome, so the rail page was not measured');
-      return;
-    }
-    try {
-      const page = await browser.newPage();
-      const initial = payload();
-      await openPage(page, initial);
+    {
       assert.equal(
         (await railRowContext(page, 's1')).sessionPinned,
         false,
@@ -1636,25 +1590,11 @@ test(
         false,
         'the rail card kept answering an optimistic pin a later render never confirmed',
       );
-    } finally {
-      await browser.close();
     }
-  },
-);
 
-test(
-  'the session heading answers a later full render after an optimistic archive patch, not just the patch itself',
-  { timeout: 60_000 },
-  async (t) => {
-    const browser = await browserOrNone();
-    if (!browser) {
-      t.skip('no installed Edge or Chrome, so the rail page was not measured');
-      return;
-    }
-    try {
-      const page = await browser.newPage();
-      const initial = payload();
-      await openPage(page, initial);
+    await postToPage(page, initial);
+
+    {
       assert.equal(
         (await headingContext(page, 's1')).webviewSection,
         'arcSessionLive',
@@ -1701,11 +1641,43 @@ test(
         'arcSessionLive',
         'the heading kept answering an optimistic archive a later render never confirmed',
       );
-    } finally {
-      await browser.close();
     }
-  },
-);
+
+    await postToPage(page, initial);
+
+    {
+      assert.equal((await headingContext(page, 's1')).sessionPersisted, true);
+      await postToPage(page, { type: 'setSessionPinned', session: 's1', pinned: true });
+      const pinned = await headingContext(page, 's1');
+      assert.deepEqual(
+        [pinned.sessionPinned, pinned.sessionPersisted],
+        [true, true],
+        'a pin took Rename session off the heading',
+      );
+      // A pin reply updates session list context without requiring a new session list payload.
+
+      assert.equal(
+        (await railRowContext(page, 's1')).sessionPinned,
+        true,
+        'the rail card still offers to pin a session the heading already pinned',
+      );
+      await postToPage(page, { type: 'setSessionArchived', session: 's1', archived: true });
+      const archived = await headingContext(page, 's1');
+      assert.deepEqual(
+        [archived.webviewSection, archived.sessionPersisted],
+        ['arcSessionArchived', true],
+        'an archive took Rename session off the heading',
+      );
+      assert.equal(
+        (await railRowContext(page, 's1')).sessionArchived,
+        true,
+        'the rail card still offers to archive a session the heading already archived',
+      );
+    }
+  } finally {
+    await browser.close();
+  }
+});
 
 test(
   'the session heading offers Mark as read or Mark as unread, and follows a read change made on a turn card',

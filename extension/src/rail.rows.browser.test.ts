@@ -5,7 +5,6 @@ import { test } from 'vitest';
 import assert from 'node:assert';
 import { browserOrNone, SETTLED } from '../test/browser.ts';
 import { FIXTURE_CLOCK, NOW, pageHtml, themed } from './panelfixture.ts';
-import { ALL_RAIL_FILTER_ID } from './domain/rail-filters.ts';
 import { RAIL_MIN_WIDTH, RAIL_ROW_STEP, subagentsHintDetail } from './view/rail.ts';
 import { formatRelativeShort } from './view/time.ts';
 import { newSessionKeyshortcut } from './view/launcher.ts';
@@ -70,19 +69,19 @@ test(
   },
 );
 
-for (const start of ['.railact', '.railviewmenu']) {
-  test(
-    `session list arrows from ${start === '.railact' ? 'sibling actions' : 'saved-view menus'} stay local without selection`,
-    { timeout: 60_000 },
-    async (t) => {
-      const browser = await browserOrNone();
-      if (!browser) {
-        t.skip('no installed browser');
-        return;
-      }
-      try {
-        const page = await browser.newPage();
-        await openPage(page, payload(), FIXTURE_CLOCK, { railFilter: '' });
+test(
+  'session list arrows from sibling actions and saved-view menus stay local without selection',
+  { timeout: 60_000 },
+  async (t) => {
+    const browser = await browserOrNone();
+    if (!browser) {
+      t.skip('no installed browser');
+      return;
+    }
+    try {
+      const page = await browser.newPage();
+      await openPage(page, payload(), FIXTURE_CLOCK, { railFilter: '' });
+      for (const start of ['.railact', '.railviewmenu']) {
         const controls = await page
           .locator('#rail .railcard, #rail .railfold, #rail .railmore')
           .evaluateAll((nodes) =>
@@ -123,12 +122,12 @@ for (const start of ['.railact', '.railviewmenu']) {
           ),
           0,
         );
-      } finally {
-        await browser.close();
       }
-    },
-  );
-}
+    } finally {
+      await browser.close();
+    }
+  },
+);
 
 test('Sessions headings label mounted native lists and current session occurrences', { timeout: 60_000 }, async (t) => {
   const browser = await browserOrNone();
@@ -182,6 +181,7 @@ test('large session lists return to Search without traversing session rows', { t
   }
   try {
     for (const density of ['comfortable', 'compact']) {
+      const page = await browser.newPage();
       for (const count of [100, RAIL_ROW_STEP + 50]) {
         const initial = payload();
         initial.views = [];
@@ -194,8 +194,20 @@ test('large session lists return to Search without traversing session rows', { t
           pinnedTop: false,
           current: index === count - 1,
         }));
-        const page = await browser.newPage();
-        await openPage(page, initial, FIXTURE_CLOCK, { railFilter: '', railGroupBy: 'none', railDensity: density });
+        if (count === 100) {
+          await openPage(page, initial, FIXTURE_CLOCK, { railFilter: '', railGroupBy: 'none', railDensity: density });
+        } else {
+          await page.locator('.railfilter').fill('');
+          await page.locator('.railfilter').press('Escape');
+          await page.evaluate(SETTLED);
+          if (await page.locator('.railfilter').count()) await page.locator('.railfilter').press('Escape');
+          await postToPage(page, initial);
+          await page.evaluate(() => {
+            document.body.tabIndex = -1;
+            document.body.focus();
+            document.body.removeAttribute('tabindex');
+          });
+        }
         assert.equal(await page.locator('#rail .railcard').count(), count);
         const headerCount = await page
           .locator('.railtop button, .railtop input')
@@ -276,8 +288,8 @@ test('large session lists return to Search without traversing session rows', { t
             shownBefore + 1,
           );
         }
-        await page.close();
       }
+      await page.close();
     }
   } finally {
     await browser.close();
@@ -636,18 +648,21 @@ test(
       // A workspace with no labels shows the note and no Match line. One whose every label the
       // query negates draws no chip group, and keeps Match, which governs the negation too.
       const labelSection = async (labelsGiven: unknown[], railFilter: string) => {
-        const other = await browser.newPage();
-        other.on('pageerror', (error) => failures.push(String(error)));
         const given = payload();
         given.labels = labelsGiven;
-        await openPage(other, given, undefined, { railFilter, railFilterId: ALL_RAIL_FILTER_ID });
-        await other.locator('[data-control="railfilters"]').click();
-        const seen = await other.evaluate(`(() => ({
+        await postToPage(page, given);
+        if (await page.locator('[data-control="railsearch"]').count()) {
+          await page.locator('[data-control="railsearch"]').click();
+        }
+        await page.locator('.railfilter').fill(railFilter);
+        await page.evaluate(SETTLED);
+        await page.locator('[data-control="railfilters"]').click();
+        const seen = await page.evaluate(`(() => ({
           sections: [...document.querySelectorAll('#railfilterpop .railfiltersectionname')].map((node) => node.textContent),
           empty: document.querySelector('#railfilterpop .labelempty')?.textContent ?? null,
           groups: document.querySelectorAll('#railfilterpop .railfilterlabels').length,
         }))()`);
-        await other.close();
+        await page.keyboard.press('Escape');
         return seen;
       };
       assert.deepEqual(

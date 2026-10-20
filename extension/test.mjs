@@ -1,5 +1,5 @@
 import { spawn, spawnSync } from 'node:child_process';
-import { readdirSync } from 'node:fs';
+import { existsSync, readdirSync, realpathSync } from 'node:fs';
 import { dirname, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { launchAnyBrowser } from './test/browserchannels.mjs';
@@ -343,7 +343,11 @@ export async function main(argv = process.argv.slice(2)) {
   return runTestMode(mode, extraArgs, opts);
 }
 
-if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+if (
+  process.argv[1] &&
+  existsSync(process.argv[1]) &&
+  realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url))
+) {
   main()
     .then((code) => {
       process.exitCode = code;

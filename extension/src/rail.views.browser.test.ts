@@ -927,7 +927,7 @@ test('the filter box offers no completion while it is taking a view name', { tim
   }
 });
 
-test('the save row refuses a query that narrows nothing', { timeout: 60_000 }, async (t) => {
+test('saving and drawing views follows the current filter', { timeout: 60_000 }, async (t) => {
   const browser = await browserOrNone();
   if (!browser) {
     t.skip('no installed Edge or Chrome, so the rail page was not measured');
@@ -938,44 +938,88 @@ test('the save row refuses a query that narrows nothing', { timeout: 60_000 }, a
     const failures: string[] = [];
     page.on('pageerror', (error) => failures.push(String(error)));
     await openPage(page);
-    const box = page.locator('.railfilter');
-    await box.focus();
-    const read = async () =>
-      (await page.evaluate(`(() => {
+
+    {
+      const box = page.locator('.railfilter');
+      await box.focus();
+      const read = async () =>
+        (await page.evaluate(`(() => {
       const row = document.querySelector('[data-control="railviewsave"]');
       if (!row) { return { drawn: false }; }
       return { drawn: true, disabled: row.disabled, name: row.textContent };
     })()`)) as Record<string, unknown>;
 
-    // Search-only words add no filtering term, so Save as view stays hidden.
+      // Search-only words add no filtering term, so Save as view stays hidden.
 
-    for (const query of ['find:needle', 'in:prompt', 'find:needle in:prompt']) {
-      await box.fill(query);
+      for (const query of ['find:needle', 'in:prompt', 'find:needle in:prompt']) {
+        await box.fill(query);
+        await page.evaluate(SETTLED);
+        assert.deepEqual(
+          await read(),
+          { drawn: false },
+          `the save row appeared for a query that narrows nothing: ${query}`,
+        );
+      }
+
+      // Spaces alone are not a filter at all, so there is no row to refuse anything.
+      await box.fill('   ');
       await page.evaluate(SETTLED);
-      assert.deepEqual(
-        await read(),
-        { drawn: false },
-        `the save row appeared for a query that narrows nothing: ${query}`,
+      assert.deepEqual(await read(), { drawn: false });
+
+      // One real term, and the row answers.
+      await box.fill('label:composer');
+      await page.evaluate(SETTLED);
+      assert.deepEqual(await read(), { drawn: true, disabled: false, name: CARD_ACTIONS.railViewSave });
+
+      // A live term saves the way a status term does.
+      for (const query of ['cost:>0.50', 'cache-expiry:>5']) {
+        await box.fill(query);
+        await page.evaluate(SETTLED);
+        assert.deepEqual(await read(), { drawn: true, disabled: false, name: CARD_ACTIONS.railViewSave }, query);
+      }
+      assert.deepEqual(failures, []);
+    }
+
+    {
+      const box = page.locator('.railfilter');
+      for (const query of ['matches-nothing', `${'in:prompt '.repeat(15)}matches-nothing`]) {
+        await box.fill(query);
+        await page.evaluate(SETTLED);
+
+        assert.equal(await page.locator('[data-control="rail:s1"]').count(), 0);
+        assert.equal(await page.locator(`[data-bucket^="${VIEW_FOLD_PREFIX}"]`).count(), 0);
+        assert.equal(await page.locator('.railempty').textContent(), 'No session matches.');
+        assert.equal(await page.locator('#rail .railbucket').count(), 0);
+        assert.equal(await page.locator("section.sessionsection[data-session='s1']").count(), 1);
+      }
+      assert.deepEqual(failures, []);
+    }
+
+    {
+      const box = page.locator('.railfilter');
+      await box.fill('   ');
+      await page.evaluate(SETTLED);
+      assert.equal(
+        await page.locator(`[data-control="${EMPTY_VIEW}"]`).getAttribute('aria-expanded'),
+        'false',
+        'a blank box opened the empty view',
       );
+      assert.equal(await page.locator('.railsectionempty').count(), 0);
+      // Search-only words do not narrow the session list.
+      for (const query of ['find:needle', 'in:prompt']) {
+        await box.fill(query);
+        await page.evaluate(SETTLED);
+        assert.deepEqual(
+          await page.evaluate(`({
+        views: document.querySelectorAll('#rail [data-bucket^="railgroup:view:"]').length,
+        empty: document.querySelectorAll('#rail [data-control="${EMPTY_VIEW}"]').length,
+      })`),
+          { views: 3, empty: 1 },
+          `the rail kept its sections for ${JSON.stringify(query)}`,
+        );
+      }
+      assert.deepEqual(failures, []);
     }
-
-    // Spaces alone are not a filter at all, so there is no row to refuse anything.
-    await box.fill('   ');
-    await page.evaluate(SETTLED);
-    assert.deepEqual(await read(), { drawn: false });
-
-    // One real term, and the row answers.
-    await box.fill('label:composer');
-    await page.evaluate(SETTLED);
-    assert.deepEqual(await read(), { drawn: true, disabled: false, name: CARD_ACTIONS.railViewSave });
-
-    // A live term saves the way a status term does.
-    for (const query of ['cost:>0.50', 'cache-expiry:>5']) {
-      await box.fill(query);
-      await page.evaluate(SETTLED);
-      assert.deepEqual(await read(), { drawn: true, disabled: false, name: CARD_ACTIONS.railViewSave }, query);
-    }
-    assert.deepEqual(failures, []);
   } finally {
     await browser.close();
   }
@@ -1306,7 +1350,7 @@ test('both name boxes point at the note that says what is wrong with the name', 
   }
 });
 
-test('filter hides the current rail card and empty saved views', { timeout: 60_000 }, async (t) => {
+test('saved-view headings retain identity, hints and valid list references', { timeout: 60_000 }, async (t) => {
   const browser = await browserOrNone();
   if (!browser) {
     t.skip('no installed Edge or Chrome, so the rail page was not measured');
@@ -1317,117 +1361,9 @@ test('filter hides the current rail card and empty saved views', { timeout: 60_0
     const failures: string[] = [];
     page.on('pageerror', (error) => failures.push(String(error)));
     await openPage(page);
-    const box = page.locator('.railfilter');
-    for (const query of ['matches-nothing', `${'in:prompt '.repeat(15)}matches-nothing`]) {
-      await box.fill(query);
-      await page.evaluate(SETTLED);
 
-      assert.equal(await page.locator('[data-control="rail:s1"]').count(), 0);
-      assert.equal(await page.locator(`[data-bucket^="${VIEW_FOLD_PREFIX}"]`).count(), 0);
-      assert.equal(await page.locator('.railempty').textContent(), 'No session matches.');
-      assert.equal(await page.locator('#rail .railbucket').count(), 0);
-      assert.equal(await page.locator("section.sessionsection[data-session='s1']").count(), 1);
-    }
-    assert.deepEqual(failures, []);
-  } finally {
-    await browser.close();
-  }
-});
-
-test('a blank filter and ignored search words keep an empty saved-view heading', { timeout: 60_000 }, async (t) => {
-  const browser = await browserOrNone();
-  if (!browser) {
-    t.skip('no installed Edge or Chrome, so the rail page was not measured');
-    return;
-  }
-  try {
-    const page = await browser.newPage();
-    const failures: string[] = [];
-    page.on('pageerror', (error) => failures.push(String(error)));
-    await openPage(page);
-    const box = page.locator('.railfilter');
-    await box.fill('   ');
-    await page.evaluate(SETTLED);
-    assert.equal(
-      await page.locator(`[data-control="${EMPTY_VIEW}"]`).getAttribute('aria-expanded'),
-      'false',
-      'a blank box opened the empty view',
-    );
-    assert.equal(await page.locator('.railsectionempty').count(), 0);
-    // Search-only words do not narrow the session list.
-    for (const query of ['find:needle', 'in:prompt']) {
-      await box.fill(query);
-      await page.evaluate(SETTLED);
-      assert.deepEqual(
-        await page.evaluate(`({
-        views: document.querySelectorAll('#rail [data-bucket^="railgroup:view:"]').length,
-        empty: document.querySelectorAll('#rail [data-control="${EMPTY_VIEW}"]').length,
-      })`),
-        { views: 3, empty: 1 },
-        `the rail kept its sections for ${JSON.stringify(query)}`,
-      );
-    }
-    assert.deepEqual(failures, []);
-  } finally {
-    await browser.close();
-  }
-});
-
-test('a view section that matches nothing writes no aria-controls', { timeout: 60_000 }, async (t) => {
-  const browser = await browserOrNone();
-  if (!browser) {
-    t.skip('no installed Edge or Chrome, so the rail page was not measured');
-    return;
-  }
-  try {
-    const page = await browser.newPage();
-    const failures: string[] = [];
-    page.on('pageerror', (error) => failures.push(String(error)));
-    await openPage(page);
-    const heading = async () =>
-      await page.evaluate(`(() => {
-      const head = document.querySelector('[data-control="${EMPTY_VIEW}"]');
-      return { there: !!head, has: head.hasAttribute('aria-controls'),
-        controls: head.getAttribute('aria-controls'),
-        expanded: head.getAttribute('aria-expanded'),
-        rows: document.querySelectorAll('.railrow[data-rail-bucket="${EMPTY_VIEW}"]').length };
-    })()`);
-
-    // An empty view retains its heading and omits aria-controls because no rows are mounted.
-
-    assert.deepEqual(await heading(), { there: true, has: false, controls: null, expanded: 'false', rows: 0 });
-    await page.locator(`[data-control="${EMPTY_VIEW}"]`).click();
-    await page.evaluate(SETTLED);
-    assert.deepEqual(await heading(), { there: true, has: false, controls: null, expanded: 'true', rows: 0 });
-    // Opened, it says why nothing is under it.
-    assert.equal(await page.locator('.railsectionempty').first().textContent(), CARD_ACTIONS.railViewEmpty);
-
-    // And no heading anywhere on the rail names an empty list.
-    assert.deepEqual(
-      await page.evaluate(`[...document.querySelectorAll('#rail .railfold')]
-      .filter((head) => head.hasAttribute('aria-controls')
-        && !head.getAttribute('aria-controls').trim())
-      .map((head) => head.dataset.bucket)`),
-      [],
-    );
-    assert.deepEqual(failures, []);
-  } finally {
-    await browser.close();
-  }
-});
-
-test('saved-view headings omit aggregate cost while keeping their identity', { timeout: 60_000 }, async (t) => {
-  const browser = await browserOrNone();
-  if (!browser) {
-    t.skip('no installed Edge or Chrome, so the rail page was not measured');
-    return;
-  }
-  try {
-    const page = await browser.newPage();
-    const failures: string[] = [];
-    page.on('pageerror', (error) => failures.push(String(error)));
-    await openPage(page);
-    const heads = (await page.evaluate(`[...document.querySelectorAll('#rail .railfold')].map((head) => ({
+    {
+      const heads = (await page.evaluate(`[...document.querySelectorAll('#rail .railfold')].map((head) => ({
         bucket: head.closest('[data-bucket]').dataset.bucket,
         name: head.getAttribute('aria-label'),
         expanded: head.getAttribute('aria-expanded'),
@@ -1436,43 +1372,30 @@ test('saved-view headings omit aggregate cost while keeping their identity', { t
         count: head.querySelector('.railbucketcount').textContent,
         sort: head.querySelector('.railbucketsort')?.textContent ?? null,
       }))`)) as {
-      bucket: string;
-      name: string;
-      expanded: string;
-      cost: boolean;
-      label: string;
-      count: string;
-      sort: string | null;
-    }[];
-    const views = heads.filter((head) => head.bucket.startsWith(VIEW_FOLD_PREFIX));
-    assert.equal(views.length, savedViews().length);
-    for (const head of views) {
-      assert.equal(head.cost, false);
-      assert.match(head.name, /, \d+ session/);
-      assert.equal(head.label.length > 0, true);
-      assert.match(head.count, /^· \d+$/);
-      assert.ok(head.expanded === 'true' || head.expanded === 'false');
+        bucket: string;
+        name: string;
+        expanded: string;
+        cost: boolean;
+        label: string;
+        count: string;
+        sort: string | null;
+      }[];
+      const views = heads.filter((head) => head.bucket.startsWith(VIEW_FOLD_PREFIX));
+      assert.equal(views.length, savedViews().length);
+      for (const head of views) {
+        assert.equal(head.cost, false);
+        assert.match(head.name, /, \d+ session/);
+        assert.equal(head.label.length > 0, true);
+        assert.match(head.count, /^· \d+$/);
+        assert.ok(head.expanded === 'true' || head.expanded === 'false');
+      }
+      assert.deepEqual(failures, []);
     }
-    assert.deepEqual(failures, []);
-  } finally {
-    await browser.close();
-  }
-});
 
-test('a view heading carries the panel hint and no native title', { timeout: 60_000 }, async (t) => {
-  const browser = await browserOrNone();
-  if (!browser) {
-    t.skip('no installed Edge or Chrome, so the rail page was not measured');
-    return;
-  }
-  try {
-    const page = await browser.newPage();
-    const failures: string[] = [];
-    page.on('pageerror', (error) => failures.push(String(error)));
-    await openPage(page);
-    // Saved view headings use a hint with their full name and count. Built-in headings omit repeated hints. Neither button has a native title.
+    {
+      // Saved view headings use a hint with their full name and count. Built-in headings omit repeated hints. Neither button has a native title.
 
-    const heads = (await page.evaluate(`[...document.querySelectorAll('#rail .railfold')].map((head) => ({
+      const heads = (await page.evaluate(`[...document.querySelectorAll('#rail .railfold')].map((head) => ({
       bucket: head.closest('[data-bucket]').dataset.bucket,
       hint: head.getAttribute('data-hint'),
       detail: head.getAttribute('data-hint-detail'),
@@ -1480,34 +1403,65 @@ test('a view heading carries the panel hint and no native title', { timeout: 60_
       shown: head.querySelector('.railbucketname').textContent,
       name: head.getAttribute('aria-label'),
     }))`)) as {
-      bucket: string;
-      hint: string | null;
-      detail: string | null;
-      title: string | null;
-      shown: string;
-      name: string;
-    }[];
-    const views = heads.filter((head) => head.bucket.startsWith(VIEW_FOLD_PREFIX));
-    const clock = heads.filter((head) => !head.bucket.startsWith(VIEW_FOLD_PREFIX));
-    assert.equal(views.length, savedViews().length, 'the rail no longer draws a heading for every saved view');
-    assert.ok(
-      clock.length > 0,
-      'the rail draws no heading the panel named itself, so the half ' +
-        'of this guard that asks for no hint over one measures nothing',
-    );
-    for (const head of views) {
-      assert.deepEqual(
-        { bucket: head.bucket, hint: head.hint, detail: head.detail, title: head.title },
-        { bucket: head.bucket, hint: head.shown, detail: head.name, title: null },
+        bucket: string;
+        hint: string | null;
+        detail: string | null;
+        title: string | null;
+        shown: string;
+        name: string;
+      }[];
+      const views = heads.filter((head) => head.bucket.startsWith(VIEW_FOLD_PREFIX));
+      const clock = heads.filter((head) => !head.bucket.startsWith(VIEW_FOLD_PREFIX));
+      assert.equal(views.length, savedViews().length, 'the rail no longer draws a heading for every saved view');
+      assert.ok(
+        clock.length > 0,
+        'the rail draws no heading the panel named itself, so the half ' +
+          'of this guard that asks for no hint over one measures nothing',
       );
+      for (const head of views) {
+        assert.deepEqual(
+          { bucket: head.bucket, hint: head.hint, detail: head.detail, title: head.title },
+          { bucket: head.bucket, hint: head.shown, detail: head.name, title: null },
+        );
+      }
+      for (const head of clock) {
+        assert.deepEqual(
+          { bucket: head.bucket, hint: head.hint, detail: head.detail, title: head.title },
+          { bucket: head.bucket, hint: null, detail: null, title: null },
+        );
+      }
+      assert.deepEqual(failures, []);
     }
-    for (const head of clock) {
+
+    {
+      const heading = async () =>
+        await page.evaluate(`(() => {
+      const head = document.querySelector('[data-control="${EMPTY_VIEW}"]');
+      return { there: !!head, has: head.hasAttribute('aria-controls'),
+        controls: head.getAttribute('aria-controls'),
+        expanded: head.getAttribute('aria-expanded'),
+        rows: document.querySelectorAll('.railrow[data-rail-bucket="${EMPTY_VIEW}"]').length };
+    })()`);
+
+      // An empty view retains its heading and omits aria-controls because no rows are mounted.
+
+      assert.deepEqual(await heading(), { there: true, has: false, controls: null, expanded: 'false', rows: 0 });
+      await page.locator(`[data-control="${EMPTY_VIEW}"]`).click();
+      await page.evaluate(SETTLED);
+      assert.deepEqual(await heading(), { there: true, has: false, controls: null, expanded: 'true', rows: 0 });
+      // Opened, it says why nothing is under it.
+      assert.equal(await page.locator('.railsectionempty').first().textContent(), CARD_ACTIONS.railViewEmpty);
+
+      // And no heading anywhere on the rail names an empty list.
       assert.deepEqual(
-        { bucket: head.bucket, hint: head.hint, detail: head.detail, title: head.title },
-        { bucket: head.bucket, hint: null, detail: null, title: null },
+        await page.evaluate(`[...document.querySelectorAll('#rail .railfold')]
+      .filter((head) => head.hasAttribute('aria-controls')
+        && !head.getAttribute('aria-controls').trim())
+      .map((head) => head.dataset.bucket)`),
+        [],
       );
+      assert.deepEqual(failures, []);
     }
-    assert.deepEqual(failures, []);
   } finally {
     await browser.close();
   }

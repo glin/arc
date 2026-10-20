@@ -1374,107 +1374,111 @@ test('a comment editor stays between the sticky heading and the fixed composer',
   }
 });
 
-test('stored offsets choose repeated text and partial words stay unmatched', { timeout: 60_000 }, async (t) => {
-  const browser = await browserOrNone();
-  if (!browser) {
-    t.skip('no Edge, Chrome or bundled Chromium on this machine, so nothing was measured');
-    return;
-  }
-  try {
-    const page = await browser.newPage();
-    const failures: string[] = [];
-    page.on('pageerror', (error) => failures.push(String(error)));
-    await page.setContent(pageHtml());
-    const repeated = 'repeat target words';
-    const middle = 'middle';
-    const payload = renderPayload() as { cards: Record<string, unknown>[] };
-    payload.cards[0].summaryHtml = `<p>${repeated}</p><p>${middle}</p><p>${repeated}</p><p>catalogue</p>`;
-    await page.evaluate(`window.postMessage(${JSON.stringify(payload)}, '*')`);
-    await page.evaluate(SETTLED);
-    await page.evaluate(`document.querySelector('.turn .head').click()`);
-    await page.evaluate(SETTLED);
-    const card = await page
-      .locator('.turn')
-      .first()
-      .evaluate((node) => ({
-        key: (node as HTMLElement).dataset.key || '',
-        session: ((node as HTMLElement).dataset.key || '').split(':')[0],
-        // A saved offset counts the card heading ahead of the response.
-        heading: (node.querySelector('.cardheading')?.textContent || '').replace(/\s+/g, ' ').trim().length + 1,
-      }));
-    const comments = [
+test(
+  'saved offsets and new comments select the correct repeated text without matching partial words',
+  { timeout: 60_000 },
+  async (t) => {
+    const browser = await browserOrNone();
+    if (!browser) {
+      t.skip('no Edge, Chrome or bundled Chromium on this machine, so nothing was measured');
+      return;
+    }
+    try {
+      const page = await browser.newPage();
+      const failures: string[] = [];
+      page.on('pageerror', (error) => failures.push(String(error)));
+      await page.setContent(pageHtml());
+
       {
-        id: 'repeated-offset',
-        sessionId: card.session,
-        turnKey: card.key,
-        part: 'summary',
-        quote: repeated,
-        offset: card.heading + repeated.length + middle.length + 2,
-        note: 'the second copy',
-        headline: '',
-        sessionTitle: '',
-        turnAt: 1,
-        at: 1,
-      },
+        const repeated = 'repeat target words';
+        const middle = 'middle';
+        const payload = renderPayload() as { cards: Record<string, unknown>[] };
+        payload.cards[0].summaryHtml = `<p>${repeated}</p><p>${middle}</p><p>${repeated}</p><p>catalogue</p>`;
+        await page.evaluate(`window.postMessage(${JSON.stringify(payload)}, '*')`);
+        await page.evaluate(SETTLED);
+        await page.evaluate(() => {
+          if ((document.querySelector('.turn .body') as HTMLElement).hidden)
+            (document.querySelector('.turn .head') as HTMLElement).click();
+        });
+        await page.evaluate(SETTLED);
+        const card = await page
+          .locator('.turn')
+          .first()
+          .evaluate((node) => ({
+            key: (node as HTMLElement).dataset.key || '',
+            session: ((node as HTMLElement).dataset.key || '').split(':')[0],
+            // A saved offset counts the card heading ahead of the response.
+            heading: (node.querySelector('.cardheading')?.textContent || '').replace(/\s+/g, ' ').trim().length + 1,
+          }));
+        const comments = [
+          {
+            id: 'repeated-offset',
+            sessionId: card.session,
+            turnKey: card.key,
+            part: 'summary',
+            quote: repeated,
+            offset: card.heading + repeated.length + middle.length + 2,
+            note: 'the second copy',
+            headline: '',
+            sessionTitle: '',
+            turnAt: 1,
+            at: 1,
+          },
+          {
+            id: 'word-boundary',
+            sessionId: card.session,
+            turnKey: card.key,
+            part: 'summary',
+            quote: 'log',
+            note: 'not part of catalogue',
+            headline: '',
+            sessionTitle: '',
+            turnAt: 1,
+            at: 2,
+          },
+        ];
+        await page.evaluate(`window.postMessage(${JSON.stringify({ type: 'notes', comments })}, '*')`);
+        await page.evaluate(SETTLED);
+        const seen = await page
+          .locator('.turn')
+          .first()
+          .evaluate((node) => ({
+            marks: Array.from(node.querySelectorAll('.summary p')).map(
+              (line) => line.querySelectorAll('.linemark').length,
+            ),
+            tints: Array.from(node.querySelectorAll('.summary p')).map(
+              (line) => line.querySelectorAll('.cmark').length,
+            ),
+            offline: node.querySelectorAll('.offlinemark').length,
+          }));
+        assert.deepEqual(seen.marks, [0, 0, 1, 0], 'the repeated quote marked the wrong copy');
+        assert.deepEqual(seen.tints, [0, 0, 1, 0], 'the repeated quote tinted the wrong copy');
+        assert.equal(seen.offline, 1, 'a partial word matched inside catalogue');
+        assert.deepEqual(failures, [], 'the panel threw while resolving comment anchors');
+      }
+
+      await page.evaluate(() => window.postMessage({ type: 'notes', comments: [] }, '*'));
+      await page.evaluate(SETTLED);
+      await page.setViewportSize({ width: 900, height: 900 });
+
+      // Saving and drawing count the same heading and body lines. Otherwise, an offset can select the wrong repeated quote.
       {
-        id: 'word-boundary',
-        sessionId: card.session,
-        turnKey: card.key,
-        part: 'summary',
-        quote: 'log',
-        note: 'not part of catalogue',
-        headline: '',
-        sessionTitle: '',
-        turnAt: 1,
-        at: 2,
-      },
-    ];
-    await page.evaluate(`window.postMessage(${JSON.stringify({ type: 'notes', comments })}, '*')`);
-    await page.evaluate(SETTLED);
-    const seen = await page
-      .locator('.turn')
-      .first()
-      .evaluate((node) => ({
-        marks: Array.from(node.querySelectorAll('.summary p')).map((line) => line.querySelectorAll('.linemark').length),
-        tints: Array.from(node.querySelectorAll('.summary p')).map((line) => line.querySelectorAll('.cmark').length),
-        offline: node.querySelectorAll('.offlinemark').length,
-      }));
-    assert.deepEqual(seen.marks, [0, 0, 1, 0], 'the repeated quote marked the wrong copy');
-    assert.deepEqual(seen.tints, [0, 0, 1, 0], 'the repeated quote tinted the wrong copy');
-    assert.equal(seen.offline, 1, 'a partial word matched inside catalogue');
-    assert.deepEqual(failures, [], 'the panel threw while resolving comment anchors');
-  } finally {
-    await browser.close();
-  }
-});
+        const SAME = 'Same words.';
+        const payload = renderPayload() as { cards: Record<string, unknown>[] };
+        payload.cards[0].summaryHtml = `<p>${SAME}</p><p>${SAME}</p><p>${SAME}</p>`;
+        await page.evaluate(`window.postMessage(${JSON.stringify(payload)}, '*')`);
+        await page.waitForFunction(() => document.querySelector('.turn .head') !== null);
+        await page.evaluate(() => {
+          if ((document.querySelector('.turn .body') as HTMLElement).hidden)
+            (document.querySelector('.turn .head') as HTMLElement).click();
+        });
+        await page.waitForFunction(() => {
+          const body = document.querySelector('.turn .body');
+          return body !== null && !(body as HTMLElement).hidden;
+        });
+        await page.evaluate(SETTLED);
 
-// Saving and drawing count the same heading and body lines. Otherwise, an offset can select the wrong repeated quote.
-
-test('a comment saved on the second of three equal lines draws on the second', { timeout: 60_000 }, async (t) => {
-  const browser = await browserOrNone();
-  if (!browser) {
-    t.skip('no Edge, Chrome or bundled Chromium on this machine, so nothing was measured');
-    return;
-  }
-  try {
-    const page = await browser.newPage();
-    const failures: string[] = [];
-    page.on('pageerror', (error) => failures.push(String(error)));
-    await page.setViewportSize({ width: 900, height: 900 });
-    await page.setContent(pageHtml());
-    const SAME = 'Same words.';
-    const payload = renderPayload() as { cards: Record<string, unknown>[] };
-    payload.cards[0].summaryHtml = `<p>${SAME}</p><p>${SAME}</p><p>${SAME}</p>`;
-    await page.evaluate(`window.postMessage(${JSON.stringify(payload)}, '*')`);
-    await page.waitForFunction(() => document.querySelector('.turn .head') !== null);
-    await page.evaluate(`document.querySelector('.turn .head').click()`);
-    await page.waitForFunction(() => {
-      const body = document.querySelector('.turn .body');
-      return body !== null && !(body as HTMLElement).hidden;
-    });
-    await page.evaluate(SETTLED);
-
-    const out = (await page.evaluate(`(async () => {
+        const out = (await page.evaluate(`(async () => {
       const card = document.querySelector('.turn');
       const lines = card.querySelectorAll('.summary p');
       if (lines.length !== 3) return { error: 'the response drew ' + lines.length + ' lines' };
@@ -1502,18 +1506,20 @@ test('a comment saved on the second of three equal lines draws on the second', {
       };
     })()`)) as { error?: string; marks?: number[]; part?: string; offline?: number };
 
-    assert.equal(out.error, undefined, out.error || '');
-    assert.equal(out.part, 'summary', 'the comment was not saved on the response');
-    assert.deepEqual(
-      [out.marks, out.offline],
-      [[0, 1, 0], 0],
-      `the comment saved on the second line drew on line(s) ${JSON.stringify(out.marks)}`,
-    );
-    assert.deepEqual(failures, [], 'the panel threw while the comment was being saved');
-  } finally {
-    await browser.close();
-  }
-});
+        assert.equal(out.error, undefined, out.error || '');
+        assert.equal(out.part, 'summary', 'the comment was not saved on the response');
+        assert.deepEqual(
+          [out.marks, out.offline],
+          [[0, 1, 0], 0],
+          `the comment saved on the second line drew on line(s) ${JSON.stringify(out.marks)}`,
+        );
+        assert.deepEqual(failures, [], 'the panel threw while the comment was being saved');
+      }
+    } finally {
+      await browser.close();
+    }
+  },
+);
 
 test(
   'a comment tints the words it was left on, and a quote the line lost tints nothing',

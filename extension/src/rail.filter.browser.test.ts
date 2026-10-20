@@ -394,7 +394,7 @@ test('rail filter completes axes and quoted labels without taking composition ke
   }
 });
 
-test('the cost offer writes its axis and a valid threshold filters recorded spend', { timeout: 60_000 }, async (t) => {
+test('cost offers filter recorded spend and invalid queries name their corrections', { timeout: 60_000 }, async (t) => {
   const browser = await browserOrNone();
   if (!browser) {
     t.skip('no installed Edge or Chrome, so the rail page was not measured');
@@ -405,88 +405,61 @@ test('the cost offer writes its axis and a valid threshold filters recorded spen
     const failures: string[] = [];
     page.on('pageerror', (error) => failures.push(String(error)));
     await openPage(page);
-    const box = page.locator('.railfilter');
-    await box.focus();
-    await box.pressSequentially('co');
-    await page.evaluate(SETTLED);
-    assert.deepEqual((await filterSnapshot(page)).names, ['cost:']);
-    await box.press('Enter');
-    await page.evaluate(SETTLED);
-    assert.deepEqual(
-      await page.evaluate(`(() => {
+
+    {
+      const box = page.locator('.railfilter');
+      await box.focus();
+      await box.pressSequentially('co');
+      await page.evaluate(SETTLED);
+      assert.deepEqual((await filterSnapshot(page)).names, ['cost:']);
+      await box.press('Enter');
+      await page.evaluate(SETTLED);
+      assert.deepEqual(
+        await page.evaluate(`(() => {
         const input = document.querySelector('.railfilter');
         return { value: input.value, start: input.selectionStart, end: input.selectionEnd,
           offers: !document.getElementById('filterpop').hidden };
       })()`),
-      { value: 'cost:', start: 5, end: 5, offers: false },
-    );
+        { value: 'cost:', start: 5, end: 5, offers: false },
+      );
 
-    await box.fill('cost:>0.50');
-    await page.evaluate(SETTLED);
-    assert.deepEqual((await filterSnapshot(page)).cards, ['s1']);
-    assert.deepEqual(
-      [...new Set(await page.locator('.railcard .railname').allTextContents())],
-      ['Embedded agent input'],
-    );
-    assert.deepEqual(failures, []);
-  } finally {
-    await browser.close();
-  }
-});
-
-test('an invalid cost query is visible and named by the filter box', { timeout: 60_000 }, async (t) => {
-  const browser = await browserOrNone();
-  if (!browser) {
-    t.skip('no installed Edge or Chrome, so the rail page was not measured');
-    return;
-  }
-  try {
-    const page = await browser.newPage();
-    const failures: string[] = [];
-    page.on('pageerror', (error) => failures.push(String(error)));
-    await openPage(page);
-    const box = page.locator('.railfilter');
-    await box.fill('cost:5.43');
-    await page.evaluate(SETTLED);
-    assert.deepEqual(await describedNote(page, '.railfilter'), {
-      named: ['railcostnote'],
-      answers: [1],
-      roles: ['status'],
-      said: ['cost:5.43 was not understood. Use cost:>5.43 or cost:<5.43.'],
-      invalid: 'true',
-    });
-    assert.deepEqual((await filterSnapshot(page)).cards, []);
-    assert.equal(await page.locator('[data-control="railviewsave"]').count(), 0);
-
-    await box.fill('cost:>5.43');
-    await page.evaluate(SETTLED);
-    assert.deepEqual(await describedNote(page, '.railfilter'), {
-      named: [],
-      answers: [],
-      roles: [],
-      said: [],
-      invalid: null,
-    });
-    assert.deepEqual(failures, []);
-  } finally {
-    await browser.close();
-  }
-});
-
-test(
-  'an invalid cost query and an invalid cache-expiry query both draw and are both named',
-  { timeout: 60_000 },
-  async (t) => {
-    const browser = await browserOrNone();
-    if (!browser) {
-      t.skip('no installed Edge or Chrome, so the rail page was not measured');
-      return;
+      await box.fill('cost:>0.50');
+      await page.evaluate(SETTLED);
+      assert.deepEqual((await filterSnapshot(page)).cards, ['s1']);
+      assert.deepEqual(
+        [...new Set(await page.locator('.railcard .railname').allTextContents())],
+        ['Embedded agent input'],
+      );
+      assert.deepEqual(failures, []);
     }
-    try {
-      const page = await browser.newPage();
-      const failures: string[] = [];
-      page.on('pageerror', (error) => failures.push(String(error)));
-      await openPage(page);
+
+    {
+      const box = page.locator('.railfilter');
+      await box.fill('cost:5.43');
+      await page.evaluate(SETTLED);
+      assert.deepEqual(await describedNote(page, '.railfilter'), {
+        named: ['railcostnote'],
+        answers: [1],
+        roles: ['status'],
+        said: ['cost:5.43 was not understood. Use cost:>5.43 or cost:<5.43.'],
+        invalid: 'true',
+      });
+      assert.deepEqual((await filterSnapshot(page)).cards, []);
+      assert.equal(await page.locator('[data-control="railviewsave"]').count(), 0);
+
+      await box.fill('cost:>5.43');
+      await page.evaluate(SETTLED);
+      assert.deepEqual(await describedNote(page, '.railfilter'), {
+        named: [],
+        answers: [],
+        roles: [],
+        said: [],
+        invalid: null,
+      });
+      assert.deepEqual(failures, []);
+    }
+
+    {
       const box = page.locator('.railfilter');
       await box.fill('cost:5.43 cache-expiry:3');
       await page.evaluate(SETTLED);
@@ -501,11 +474,11 @@ test(
         invalid: 'true',
       });
       assert.deepEqual(failures, []);
-    } finally {
-      await browser.close();
     }
-  },
-);
+  } finally {
+    await browser.close();
+  }
+});
 
 test('rail filter details stack below its field and allow a status view', { timeout: 60_000 }, async (t) => {
   const browser = await browserOrNone();

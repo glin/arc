@@ -1804,10 +1804,11 @@ test(
       // This is the only direct operating-system read. The supervisor reads once more in its own process.
       const native = await standaloneProcessIdentity(owned.pid);
       assert.ok(native?.commandLine.includes(script));
+      let currentIdentity = native;
       // Later recovery passes read this process through the saved native identity while it lives, so they start no shell.
       const runtime = {
         now: Date.now,
-        identity: async (pid: number) => (pid === owned.pid && processAlive(pid) ? native : null),
+        identity: async (pid: number) => (pid === owned.pid && processAlive(pid) ? currentIdentity : null),
         yield: () => new Promise<void>((resolve) => setImmediate(resolve)),
       };
       assert.equal(owned.startedAt, native?.startedAt);
@@ -1818,15 +1819,16 @@ test(
       await closed;
       assert.equal(receipts.latest(launch.launchId), null);
       const retained = receipts.observation(launch.launchId)!;
-      receipts.observation(launch.launchId, {
-        ...retained,
-        launcher: { ...owned, startedAt: 'different-lifetime' },
-      });
+      currentIdentity = { ...native!, startedAt: 'different-lifetime' };
+      assert.equal(processAlive(owned.pid), true);
       await superviseStandalone(receipts, launch.launchId, true, { frameBytes: 256, readBytes: 17 }, runtime);
       assert.equal(receipts.observation(launch.launchId)?.monitor, 'unavailable');
       assert.equal(receipts.latest(launch.launchId), null);
-      assert.equal((await runtime.identity(owned.pid))?.startedAt, owned.startedAt);
+      assert.equal((await runtime.identity(owned.pid))?.startedAt, 'different-lifetime');
+      assert.deepEqual(receipts.observation(launch.launchId)?.launcher, retained.launcher);
+      currentIdentity = native;
       receipts.observation(launch.launchId, retained);
+      assert.equal(receipts.observation(launch.launchId)?.supervisor.pid, supervisor.pid);
       const resumed = superviseStandalone(receipts, launch.launchId, true, { frameBytes: 256, readBytes: 17 }, runtime);
       await vi.waitFor(() => assert.notEqual(receipts.observation(launch.launchId)?.supervisor.pid, supervisor.pid));
       await assert.rejects(superviseStandalone(receipts, launch.launchId, true), /Another process/);

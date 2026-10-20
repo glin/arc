@@ -1,9 +1,12 @@
-// @module-tag subprocess
 const assert = require('node:assert');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { spawn, spawnSync } = require('node:child_process');
+const { EventEmitter } = require('node:events');
+const { PassThrough } = require('node:stream');
+
+const SUBPROCESS = { tags: ['subprocess'] };
 
 const resolver = path.join(__dirname, 'editor-cli.sh');
 const skillSource = path.join(__dirname, '../cli/skills/arc-sessions');
@@ -20,14 +23,16 @@ function expectSkillCopy(directory) {
   for (const file of files(skillSource))
     assert.deepEqual(fs.readFileSync(path.join(directory, file)), fs.readFileSync(path.join(skillSource, file)));
 }
+let bashExecutable;
 function gitBashExecutable() {
+  if (bashExecutable) return bashExecutable;
   if (process.platform !== 'win32') {
     const result = spawnSync('bash', ['-c', 'command -v bash'], { encoding: 'utf8' });
     assert.equal(result.status, 0, result.stderr);
-    return fs.realpathSync(result.stdout.trim());
+    return (bashExecutable = fs.realpathSync(result.stdout.trim()));
   }
   if (process.env.GIT_BASH_PATH && fs.existsSync(process.env.GIT_BASH_PATH)) {
-    return path.resolve(process.env.GIT_BASH_PATH);
+    return (bashExecutable = path.resolve(process.env.GIT_BASH_PATH));
   }
   for (const root of [
     process.env.ProgramFiles,
@@ -36,33 +41,34 @@ function gitBashExecutable() {
   ].filter(Boolean)) {
     for (const relative of ['bin/bash.exe', 'usr/bin/bash.exe']) {
       const candidate = path.join(root, 'Git', relative);
-      if (fs.existsSync(candidate)) return candidate;
+      if (fs.existsSync(candidate)) return (bashExecutable = candidate);
     }
   }
   throw new Error('Git Bash was not found. Set GIT_BASH_PATH to its executable.');
 }
 
-const bashExecutable = gitBashExecutable();
-
 // Compile the actual command once. Every source fixture executes this implementation.
-const skillCLI = require('../extension/node_modules/esbuild').buildSync({
-  entryPoints: [path.join(__dirname, '../cli/src/main.ts')],
-  bundle: true,
-  platform: 'node',
-  format: 'cjs',
-  write: false,
-}).outputFiles[0].contents;
+let skillCLI;
+function compiledSkillCLI() {
+  return (skillCLI ??= require('../extension/node_modules/esbuild').buildSync({
+    entryPoints: [path.join(__dirname, '../cli/src/main.ts')],
+    bundle: true,
+    platform: 'node',
+    format: 'cjs',
+    write: false,
+  }).outputFiles[0].contents);
+}
 const catalogUrl = 'https://github.com/glin/arc/releases/latest/download/arc-marketplace.json';
 // One installer run stops after this time. Git Bash starts every child process of a run.
 // One run with hooks starts about twenty of them. Cases run concurrently, so runs share the machine.
 // On a loaded Windows machine one run can take more than 60 seconds.
-const RUN_TIMEOUT = 120_000;
+const RUN_TIMEOUT = 90_000;
 // A case gets the run budget for each installer run, plus time for its fixture and assertions.
 function runBudget(runs) {
   return runs * RUN_TIMEOUT + 10_000;
 }
 // The describe-level hooks build the installer fixture, which can start a build under load.
-vi.setConfig({ testTimeout: runBudget(1), hookTimeout: runBudget(1) });
+vi.setConfig({ hookTimeout: runBudget(1) });
 
 // Cases with their own fixture run concurrently. Cases in a describe block share one fixture and run in order.
 // Run a child without blocking the worker, so concurrent tests overlap their installer runs.
@@ -84,7 +90,7 @@ const settled = (stopper) => new Promise((resolve) => stopper.on('close', resolv
 async function stopTree(child, marker) {
   if (process.platform === 'win32') {
     await settled(spawn('taskkill', ['/PID', String(child.pid), '/T', '/F'], { stdio: 'ignore' }));
-    await settled(spawn(bashExecutable, ['-c', markedSweep, 'bash', marker], { stdio: 'ignore' }));
+    await settled(spawn(gitBashExecutable(), ['-c', markedSweep, 'bash', marker], { stdio: 'ignore' }));
     return;
   }
   const signal = (name) => {
@@ -95,11 +101,16 @@ async function stopTree(child, marker) {
   signal('SIGTERM');
   setTimeout(() => signal('SIGKILL'), STOP_GRACE);
 }
-function spawnAsync(command, args, { input, timeout, ready, ...options }) {
+function spawnAsync(
+  command,
+  args,
+  { input, timeout, ready, ...options },
+  { spawn: spawnChild = spawn, stop = stopTree } = {},
+) {
   return new Promise((resolve, reject) => {
     const marker = `ARC_TEST_RUN=${process.pid}-${++runCount}`;
     const env = { ...(options.env ?? process.env), ARC_TEST_RUN: marker.slice(marker.indexOf('=') + 1) };
-    const child = spawn(command, args, { ...options, env, stdio: 'pipe', detached: process.platform !== 'win32' });
+    const child = spawnChild(command, args, { ...options, env, stdio: 'pipe', detached: process.platform !== 'win32' });
     const stdout = [];
     const stderr = [];
     let expired = false;
@@ -109,7 +120,7 @@ function spawnAsync(command, args, { input, timeout, ready, ...options }) {
     const closed = new Promise((done) => child.once('close', done));
     const expire = async () => {
       expired = true;
-      await stopTree(child, marker);
+      await stop(child, marker);
       // A process that cleared its environment can still hold a pipe after the sweep.
       // Closing the pipes lets the run close once its own process exits.
       const release = setTimeout(() => {
@@ -153,11 +164,11 @@ function spawnAsync(command, args, { input, timeout, ready, ...options }) {
 
 // A trapped signal or a background child must not keep a run alive past its deadline.
 // The deadline starts once the script prints the background pid, so slow process starts cannot empty stdout.
-test('a run past its deadline stops every process it started and fails', async () => {
+test('a run past its deadline stops every process it started and fails', SUBPROCESS, async () => {
   const script =
     'trap "" TERM; sleep 600 & if [ -r /proc/$!/winpid ]; then cat /proc/$!/winpid; else echo $!; fi; wait';
   const ready = (stdout) => stdout.includes('\n');
-  const failure = await spawnAsync(bashExecutable, ['-c', script], { timeout: 3_000, ready }).then(
+  const failure = await spawnAsync(gitBashExecutable(), ['-c', script], { timeout: 3_000, ready }).then(
     () => assert.fail('the run settled before its deadline'),
     (error) => error,
   );
@@ -174,12 +185,41 @@ test('a run past its deadline stops every process it started and fails', async (
   );
 });
 
+test('a slow run reports captured output before the subprocess case deadline', async () => {
+  const config = fs.readFileSync(path.join(__dirname, '../vitest.config.mts'), 'utf8');
+  const caseTimeout = Number(/\btimeout:\s*([\d_]+)/.exec(config)[1].replaceAll('_', ''));
+  vi.useFakeTimers();
+  try {
+    const caseDeadline = new Promise((_, reject) => {
+      setTimeout(() => reject(new Error('case deadline reached')), caseTimeout);
+    });
+    const child = new EventEmitter();
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    child.stdin = new PassThrough();
+    const stop = vi.fn(async () => child.emit('close', null));
+    const pending = spawnAsync('stub', [], { timeout: RUN_TIMEOUT }, { spawn: () => child, stop });
+    const failure = Promise.race([pending, caseDeadline]).catch((error) => error);
+    child.stdout.write('installer progress');
+    child.stderr.write('installer detail');
+    await vi.advanceTimersByTimeAsync(RUN_TIMEOUT);
+    const error = await failure;
+    assert.equal(error.code, 'ETIMEDOUT');
+    assert.match(error.message, /stdout:\ninstaller progress\nstderr:\ninstaller detail/);
+    assert.equal(stop.mock.calls.length, 1);
+    assert.ok(RUN_TIMEOUT + 2 * STOP_GRACE < caseTimeout);
+  } finally {
+    vi.clearAllTimers();
+    vi.useRealTimers();
+  }
+});
+
 test.concurrent.each(
   ['installed', 'linked', 'external', 'failed', 'skipped', 'hook-failed', 'cancelled'].flatMap((outcome) => [
     [outcome, false],
     [outcome, true],
   ]),
-)('installer output modes retain component outcomes for %s (JSON %s)', async (outcome, json) => {
+)('installer output modes retain component outcomes for %s (JSON %s)', SUBPROCESS, async (outcome, json) => {
   const f = installerFixture();
   try {
     const args = ['--skill-agent', 'claude', '--skill-agent', 'codex', 'code'];
@@ -279,6 +319,7 @@ test.concurrent.each(
 
 test.concurrent.each([[['codex']], [['claude']], [['claude', 'codex']]])(
   'downloaded source installs stable selected skills through the real compiled CLI with independent hooks (%j)',
+  SUBPROCESS,
   async (agents) => {
     const f = installerFixture();
     try {
@@ -305,6 +346,7 @@ test.concurrent.each([[['codex']], [['claude']], [['claude', 'codex']]])(
 
 test.concurrent.each([false, true])(
   'a Codex skills folder linked to the Claude skills folder installs once and reports the link (JSON %s)',
+  SUBPROCESS,
   async (json) => {
     const f = installerFixture();
     try {
@@ -341,42 +383,46 @@ test.concurrent.each([false, true])(
   },
 );
 
-test.concurrent('Git Bash cancellation after skill child success retains source until exit and preserves completed receipt', async () => {
-  const f = installerFixture();
-  try {
-    const script = path.join(f.source, 'install.sh');
-    fs.writeFileSync(
-      script,
-      fs
-        .readFileSync(script, 'utf8')
-        .replaceAll('\r\n', '\n')
-        .replace(
-          '    ARC_INSTALL_CHILD=\'\'\n    return "$status"',
-          () =>
-            '    if [ -f "$ARC_INSTALL_TEMP/skills.json" ]; then\n      kill -TERM "$$"\n      kill -HUP "$$"\n      [ -f "$REPO/extension/dist/cli.cjs" ] || return 98\n      echo child-exit-source-retained >> "$ARC_TEST_LOG"\n    fi\n    ARC_INSTALL_CHILD=\'\'\n    return "$status"',
-        ),
-    );
-    assert.match(fs.readFileSync(script, 'utf8'), /kill -TERM "\$\$"\n      kill -HUP "\$\$"/);
-    const result = await f.run(
-      ['--no-hooks', '--skill-agent', 'codex', 'code'],
-      { CLAUDE_CONFIG_DIR: '' },
-      { skills: true },
-    );
-    assert.equal(result.status, 143, result.stdout + result.stderr);
-    assert.match(result.commands, /child-exit-source-retained/);
-    assert.match(result.stdout, /"skills":"completed"/);
-    assert.match(result.stdout, /"cancellation":143/);
-    assert.deepEqual(fs.readdirSync(f.temporary), []);
-    expectSkillCopy(path.join(f.dir, '.agents/skills/arc-sessions'));
-  } finally {
-    f.cleanup();
-  }
-});
+test.concurrent(
+  'Git Bash cancellation after skill child success retains source until exit and preserves completed receipt',
+  SUBPROCESS,
+  async () => {
+    const f = installerFixture();
+    try {
+      const script = path.join(f.source, 'install.sh');
+      fs.writeFileSync(
+        script,
+        fs
+          .readFileSync(script, 'utf8')
+          .replaceAll('\r\n', '\n')
+          .replace(
+            '    ARC_INSTALL_CHILD=\'\'\n    return "$status"',
+            () =>
+              '    if [ -f "$ARC_INSTALL_TEMP/skills.json" ]; then\n      kill -TERM "$$"\n      kill -HUP "$$"\n      [ -f "$REPO/extension/dist/cli.cjs" ] || return 98\n      echo child-exit-source-retained >> "$ARC_TEST_LOG"\n    fi\n    ARC_INSTALL_CHILD=\'\'\n    return "$status"',
+          ),
+      );
+      assert.match(fs.readFileSync(script, 'utf8'), /kill -TERM "\$\$"\n      kill -HUP "\$\$"/);
+      const result = await f.run(
+        ['--no-hooks', '--skill-agent', 'codex', 'code'],
+        { CLAUDE_CONFIG_DIR: '' },
+        { skills: true },
+      );
+      assert.equal(result.status, 143, result.stdout + result.stderr);
+      assert.match(result.commands, /child-exit-source-retained/);
+      assert.match(result.stdout, /"skills":"completed"/);
+      assert.match(result.stdout, /"cancellation":143/);
+      assert.deepEqual(fs.readdirSync(f.temporary), []);
+      expectSkillCopy(path.join(f.dir, '.agents/skills/arc-sessions'));
+    } finally {
+      f.cleanup();
+    }
+  },
+);
 
 for (const mode of ['local', 'remote'])
   test.concurrent(
     `${mode} handled cancellation before temporary allocation stops without a download failure`,
-    { timeout: runBudget(3) },
+    { ...SUBPROCESS, timeout: runBudget(3) },
     async () => {
       for (const [first, second, status] of [
         ['TERM', 'HUP', 143],
@@ -433,6 +479,7 @@ test.concurrent.each([
   ['version', '  version="$(node -p', /editor|legacy-migration/],
 ])(
   'cancelled %s admission reports cancellation without an unattempted child failure',
+  SUBPROCESS,
   async (phase, boundary, forbidden) => {
     const f = installerFixture();
     try {
@@ -485,6 +532,7 @@ test.concurrent.each([
 
 test.concurrent.each(['before-version', 'version-child', 'validation-child'])(
   'marketplace preflight %s cancellation stops probes and preserves the cancellation receipt',
+  SUBPROCESS,
   async (phase) => {
     const f = installerFixture();
     try {
@@ -546,13 +594,16 @@ test.concurrent.each(['before-version', 'version-child', 'validation-child'])(
   },
 );
 
-test.concurrent('downloaded bundled hook cancellation awaits the acknowledged child before source cleanup', async () => {
-  const f = installerFixture();
-  try {
-    const watcher = path.join(f.dir, 'hook-wait.cjs');
-    fs.writeFileSync(
-      watcher,
-      String.raw`const fs = require('node:fs');
+test.concurrent(
+  'downloaded bundled hook cancellation awaits the acknowledged child before source cleanup',
+  SUBPROCESS,
+  async () => {
+    const f = installerFixture();
+    try {
+      const watcher = path.join(f.dir, 'hook-wait.cjs');
+      fs.writeFileSync(
+        watcher,
+        String.raw`const fs = require('node:fs');
 const path = require('node:path');
 const root = process.env.ARC_TEST_ROOT;
 const release = path.join(root, 'hook-release');
@@ -570,19 +621,19 @@ function check() {
   else if (fs.existsSync(release)) finish('hook-child-settled', 0);
 }
 check();`,
-    );
-    const node = path.join(f.bin, 'node');
-    const originalNode = fs.readFileSync(node, 'utf8');
-    fs.writeFileSync(
-      node,
-      originalNode.replace(
-        'exec "$ARC_TEST_REAL_NODE" "$@"',
-        'if [[ "$1" == */dist/setup.cjs ]]; then "$ARC_TEST_REAL_NODE" "$ARC_TEST_ROOT/hook-wait.cjs" "$1" || exit $?; fi\nexec "$ARC_TEST_REAL_NODE" "$@"',
-      ),
-    );
-    const script = path.join(f.source, 'install.sh');
-    const original = fs.readFileSync(script, 'utf8').replaceAll('\r\n', '\n');
-    const injection = String.raw`    if [[ "$*" == *'/dist/setup.cjs'* ]]; then
+      );
+      const node = path.join(f.bin, 'node');
+      const originalNode = fs.readFileSync(node, 'utf8');
+      fs.writeFileSync(
+        node,
+        originalNode.replace(
+          'exec "$ARC_TEST_REAL_NODE" "$@"',
+          'if [[ "$1" == */dist/setup.cjs ]]; then "$ARC_TEST_REAL_NODE" "$ARC_TEST_ROOT/hook-wait.cjs" "$1" || exit $?; fi\nexec "$ARC_TEST_REAL_NODE" "$@"',
+        ),
+      );
+      const script = path.join(f.source, 'install.sh');
+      const original = fs.readFileSync(script, 'utf8').replaceAll('\r\n', '\n');
+      const injection = String.raw`    if [[ "$*" == *'/dist/setup.cjs'* ]]; then
       boundary_deadline=$((SECONDS + 10))
       while [ ! -f "$ARC_TEST_ROOT/hook-ready" ]; do
         if [ "$SECONDS" -ge "$boundary_deadline" ]; then return 98; fi
@@ -594,26 +645,27 @@ check();`,
       echo released > "$ARC_TEST_ROOT/hook-release"
     fi
 `;
-    const changed = original.replace('    ARC_INSTALL_CHILD=$!\n', () => '    ARC_INSTALL_CHILD=$!\n' + injection);
-    assert.notEqual(changed, original);
-    fs.writeFileSync(script, changed);
-    const result = await f.run(['--remote', 'code'], { CLAUDE_CONFIG_DIR: '' });
-    assert.match(result.commands, /hook-child-settled/);
-    assert.doesNotMatch(result.commands, /hook-source-lost|hook-deadline/);
-    assert.equal(result.status, 143, result.stdout + result.stderr);
-    const receipt = JSON.parse(result.stdout.trim().split('\n').at(-1));
-    assert.equal(receipt.components.hooks, 'completed');
-    assert.equal(receipt.cancellation, 143);
-    assert.equal(fs.readFileSync(path.join(f.dir, 'hook-ready'), 'utf8'), path.join(f.dir, 'unrelated'));
-    assert.deepEqual(fs.readdirSync(f.temporary), []);
-  } finally {
-    f.cleanup();
-  }
-});
+      const changed = original.replace('    ARC_INSTALL_CHILD=$!\n', () => '    ARC_INSTALL_CHILD=$!\n' + injection);
+      assert.notEqual(changed, original);
+      fs.writeFileSync(script, changed);
+      const result = await f.run(['--remote', 'code'], { CLAUDE_CONFIG_DIR: '' });
+      assert.match(result.commands, /hook-child-settled/);
+      assert.doesNotMatch(result.commands, /hook-source-lost|hook-deadline/);
+      assert.equal(result.status, 143, result.stdout + result.stderr);
+      const receipt = JSON.parse(result.stdout.trim().split('\n').at(-1));
+      assert.equal(receipt.components.hooks, 'completed');
+      assert.equal(receipt.cancellation, 143);
+      assert.equal(fs.readFileSync(path.join(f.dir, 'hook-ready'), 'utf8'), path.join(f.dir, 'unrelated'));
+      assert.deepEqual(fs.readdirSync(f.temporary), []);
+    } finally {
+      f.cleanup();
+    }
+  },
+);
 
 test.concurrent(
   'skill selector conflicts refuse before build or native writes',
-  { timeout: runBudget(3) },
+  { ...SUBPROCESS, timeout: runBudget(3) },
   async () => {
     const f = installerFixture();
     try {
@@ -631,6 +683,7 @@ test.concurrent(
 
 test.concurrent.each(['none', 'codex', 'claude', 'both', 'missing-hook', 'old-hook', 'bad-marketplace', 'no-skills'])(
   'detected provider %s retains independent skill and editor outcomes',
+  SUBPROCESS,
   async (mode) => {
     const f = installerFixture();
     try {
@@ -682,6 +735,7 @@ test.concurrent.each([
   '--plugin-report',
 ])(
   'cancellation refuses later build, hook mutations and legacy cleanup after child settlement (%s)',
+  SUBPROCESS,
   async (command) => {
     const f = installerFixture();
     try {
@@ -729,7 +783,7 @@ test.concurrent.each([
   },
 );
 
-test.concurrent('cancelled skill child reports cancellation and prevents later hooks', async () => {
+test.concurrent('cancelled skill child reports cancellation and prevents later hooks', SUBPROCESS, async () => {
   const f = installerFixture();
   try {
     fs.writeFileSync(path.join(f.source, 'extension/dist/cli.cjs'), 'process.exit(130);');
@@ -745,7 +799,7 @@ test.concurrent('cancelled skill child reports cancellation and prevents later h
   }
 });
 
-test.concurrent('missing selected editor refuses globally before build', async () => {
+test.concurrent('missing selected editor refuses globally before build', SUBPROCESS, async () => {
   const f = installerFixture();
   try {
     fs.appendFileSync(
@@ -785,7 +839,7 @@ function fixturePaths(dir) {
 
 let absoluteBashPath;
 function absoluteBash() {
-  absoluteBashPath ??= bashPath(path.dirname(bashExecutable)) + '/' + path.basename(bashExecutable);
+  absoluteBashPath ??= bashPath(path.dirname(gitBashExecutable())) + '/' + path.basename(gitBashExecutable());
   return absoluteBashPath;
 }
 
@@ -896,7 +950,7 @@ echo "editor ${name} $*" >> "$ARC_TEST_LOG"
   assert.equal(built.status, 0, built.stderr);
   const dist = path.join(source, 'extension', 'dist');
   fs.mkdirSync(dist);
-  fs.writeFileSync(path.join(dist, 'cli.cjs'), skillCLI);
+  fs.writeFileSync(path.join(dist, 'cli.cjs'), compiledSkillCLI());
   fs.writeFileSync(path.join(dist, 'windowpipe.exe'), 'fixture helper');
   fs.copyFileSync(path.join(__dirname, '..', 'LICENSE'), path.join(source, 'LICENSE'));
   const setup = require('../extension/node_modules/esbuild').buildSync({
@@ -949,7 +1003,7 @@ new ClaudePluginSetup(run,undefined,read,tools,()=>process.env.ARC_TEST_REAL_NOD
   );
   assert.equal(payload.status, 0, payload.stderr);
   const tarResult = spawnSync(
-    bashExecutable,
+    gitBashExecutable(),
     [
       '-c',
       'tar -czf "$1" -C "$2" "$3"',
@@ -1149,7 +1203,7 @@ function installerFixture() {
         ...(!skills ? ['--no-skills'] : []),
         ...args,
       ];
-      const result = await spawnAsync(bashExecutable, command, {
+      const result = await spawnAsync(gitBashExecutable(), command, {
         cwd,
         input,
         timeout: RUN_TIMEOUT,
@@ -1190,55 +1244,63 @@ function installerFixture() {
 }
 
 for (const missing of ['SKILL.md', 'compaction.md']) {
-  test.concurrent(`source setup refuses an incomplete checkout before building when its session skill lacks ${missing}`, async () => {
-    const f = installerFixture();
-    try {
-      fs.unlinkSync(path.join(f.source, 'cli/skills/arc-sessions', missing));
-      const result = await f.run(['--local', '--no-hooks', 'code']);
-      assert.equal(result.status, 2, result.stderr);
-      assert.match(result.stderr, /--local requires a complete Arc source directory/);
-      assert.doesNotMatch(result.commands, /npm |editor /);
-    } finally {
-      fs.rmSync(f.dir, { recursive: true, force: true });
-    }
-  });
+  test.concurrent(
+    `source setup refuses an incomplete checkout before building when its session skill lacks ${missing}`,
+    SUBPROCESS,
+    async () => {
+      const f = installerFixture();
+      try {
+        fs.unlinkSync(path.join(f.source, 'cli/skills/arc-sessions', missing));
+        const result = await f.run(['--local', '--no-hooks', 'code']);
+        assert.equal(result.status, 2, result.stderr);
+        assert.match(result.stderr, /--local requires a complete Arc source directory/);
+        assert.doesNotMatch(result.commands, /npm |editor /);
+      } finally {
+        fs.rmSync(f.dir, { recursive: true, force: true });
+      }
+    },
+  );
 
-  test.concurrent(`downloaded incomplete source refuses globally before build or native installation when the session skill lacks ${missing}`, async () => {
-    const f = installerFixture();
-    try {
-      fs.unlinkSync(path.join(f.source, 'cli/skills/arc-sessions', missing));
-      const archive = spawnSync(
-        bashExecutable,
-        [
-          '-c',
-          'tar -czf "$1" -C "$2" "$3"',
-          'bash',
-          bashPath(f.dir) + '/source.tar.gz',
-          bashPath(f.dir),
-          path.basename(f.source),
-        ],
-        { encoding: 'utf8' },
-      );
-      assert.equal(archive.status, 0, archive.stderr);
-      const result = await f.run(
-        ['--remote', '--no-hooks', '--skill-agent', 'codex', 'code'],
-        { CLAUDE_CONFIG_DIR: '' },
-        { skills: true },
-      );
-      assert.equal(result.status, 2, result.stdout + result.stderr);
-      assert.match(result.stderr, /downloaded archive lacks required Arc source files/);
-      assert.doesNotMatch(result.commands, /npm|editor/);
-      assert.equal(fs.existsSync(path.join(f.dir, '.agents/skills')), false);
-      assert.deepEqual(fs.readdirSync(f.temporary), []);
-    } finally {
-      f.cleanup();
-    }
-  });
+  test.concurrent(
+    `downloaded incomplete source refuses globally before build or native installation when the session skill lacks ${missing}`,
+    SUBPROCESS,
+    async () => {
+      const f = installerFixture();
+      try {
+        fs.unlinkSync(path.join(f.source, 'cli/skills/arc-sessions', missing));
+        const archive = spawnSync(
+          gitBashExecutable(),
+          [
+            '-c',
+            'tar -czf "$1" -C "$2" "$3"',
+            'bash',
+            bashPath(f.dir) + '/source.tar.gz',
+            bashPath(f.dir),
+            path.basename(f.source),
+          ],
+          { encoding: 'utf8' },
+        );
+        assert.equal(archive.status, 0, archive.stderr);
+        const result = await f.run(
+          ['--remote', '--no-hooks', '--skill-agent', 'codex', 'code'],
+          { CLAUDE_CONFIG_DIR: '' },
+          { skills: true },
+        );
+        assert.equal(result.status, 2, result.stdout + result.stderr);
+        assert.match(result.stderr, /downloaded archive lacks required Arc source files/);
+        assert.doesNotMatch(result.commands, /npm|editor/);
+        assert.equal(fs.existsSync(path.join(f.dir, '.agents/skills')), false);
+        assert.deepEqual(fs.readdirSync(f.temporary), []);
+      } finally {
+        f.cleanup();
+      }
+    },
+  );
 }
 
 test.concurrent(
   'local installation refreshes its directory marketplace and migrates owned legacy hooks after plugin success',
-  { timeout: runBudget(2) },
+  { ...SUBPROCESS, timeout: runBudget(2) },
   async () => {
     const f = installerFixture();
     try {
@@ -1282,7 +1344,7 @@ test.concurrent(
 
 test.concurrent(
   'source installation enables only the disabled user plugin and rejects unsuccessful enablement',
-  { timeout: runBudget(2) },
+  { ...SUBPROCESS, timeout: runBudget(2) },
   async () => {
     const f = installerFixture();
     try {
@@ -1306,7 +1368,7 @@ test.concurrent(
 
 test.concurrent(
   'local installation accepts its canonical directory in flat and nested Claude marketplace metadata',
-  { timeout: runBudget(4) },
+  { ...SUBPROCESS, timeout: runBudget(4) },
   async () => {
     const f = installerFixture();
     try {
@@ -1344,7 +1406,7 @@ test.concurrent(
 
 test.concurrent(
   'local hook ownership failures preserve successful editor installation',
-  { timeout: runBudget(3) },
+  { ...SUBPROCESS, timeout: runBudget(3) },
   async () => {
     const f = installerFixture();
     try {
@@ -1383,23 +1445,28 @@ test.concurrent.each([
     name: 'a hook loading error',
     state: '[{"id":"arc-hooks@arc","scope":"user","enabled":true,"errors":["Failed to load hooks/hooks.json"]}]',
   },
-])('invalid plugin state $name reports partial installation and preserves legacy hooks', async ({ state }) => {
-  const f = installerFixture();
-  try {
-    const r = await f.run(['code'], { ARC_TEST_PLUGIN_LIST: state });
-    assert.equal(r.status, 1, r.stderr);
-    assert.match(r.stderr, /extension is installed, but Claude snapshot plugin setup failed/);
-    assert.equal(fs.readFileSync(f.settings, 'utf8'), f.legacy);
-    assert.equal(fs.readFileSync(path.join(f.dir, 'codex home', 'hooks.json'), 'utf8'), f.legacy);
-    assert.doesNotMatch(r.stdout, /==> Installed Arc\./);
-    assert.doesNotMatch(r.commands, /plugin enable/);
-  } finally {
-    f.cleanup();
-  }
-});
+])(
+  'invalid plugin state $name reports partial installation and preserves legacy hooks',
+  SUBPROCESS,
+  async ({ state }) => {
+    const f = installerFixture();
+    try {
+      const r = await f.run(['code'], { ARC_TEST_PLUGIN_LIST: state });
+      assert.equal(r.status, 1, r.stderr);
+      assert.match(r.stderr, /extension is installed, but Claude snapshot plugin setup failed/);
+      assert.equal(fs.readFileSync(f.settings, 'utf8'), f.legacy);
+      assert.equal(fs.readFileSync(path.join(f.dir, 'codex home', 'hooks.json'), 'utf8'), f.legacy);
+      assert.doesNotMatch(r.stdout, /==> Installed Arc\./);
+      assert.doesNotMatch(r.commands, /plugin enable/);
+    } finally {
+      f.cleanup();
+    }
+  },
+);
 
 test.concurrent.each([[[]], [['--remote']]])(
   '--no-hooks preserves plugin and both legacy settings without requiring Claude (%j)',
+  SUBPROCESS,
   async (mode) => {
     const f = installerFixture();
     try {
@@ -1425,7 +1492,7 @@ for (const failure of [
   'plugin list --json',
   'plugin enable arc-hooks@arc --scope user',
 ])
-  test.concurrent(`hook failures preserve successful editor installation: ${failure}`, async () => {
+  test.concurrent(`hook failures preserve successful editor installation: ${failure}`, SUBPROCESS, async () => {
     const f = installerFixture();
     try {
       if (failure === 'missing') fs.unlinkSync(path.join(f.bin, 'claude'));
@@ -1446,6 +1513,7 @@ const hostedOverride = 'https://staging.example.com/arc.json';
 
 test.concurrent.each(['flat directory', 'nested directory', 'github', 'default catalog'])(
   'hosted catalog override never replaces another marketplace source: %s',
+  SUBPROCESS,
   async (kind) => {
     const f = installerFixture();
     try {
@@ -1476,7 +1544,7 @@ test.concurrent.each(['flat directory', 'nested directory', 'github', 'default c
 
 test.concurrent(
   'hosted catalog override reuses its own marketplace and keeps a directory source without hooks',
-  { timeout: runBudget(3) },
+  { ...SUBPROCESS, timeout: runBudget(3) },
   async () => {
     const f = installerFixture();
     try {
@@ -1507,7 +1575,7 @@ test.concurrent(
 
 test.concurrent(
   'explicit editors retain success and report each failed target without choosing extra editors',
-  { timeout: runBudget(4) },
+  { ...SUBPROCESS, timeout: runBudget(4) },
   async () => {
     const f = installerFixture();
     try {
@@ -1539,7 +1607,7 @@ test.concurrent(
 
 test.concurrent(
   'stdin installation selects local source without Git and children cannot consume script input',
-  { timeout: runBudget(5) },
+  { ...SUBPROCESS, timeout: runBudget(5) },
   async () => {
     const f = installerFixture();
     try {
@@ -1594,7 +1662,7 @@ describe('the current editor receives the extension while other detected editors
     ['positron', 'macos', 'code'],
     ['codium', 'macos'],
   ])
-    test(`${product} on ${layout}`, async () => {
+    test(`${product} on ${layout}`, SUBPROCESS, async () => {
       const editor = f.editor(product, layout, cliName);
       const r = await f.run(['--local', '--no-hooks'], editor.env, { cwd: f.source });
       assert.equal(r.status, 0, r.stderr);
@@ -1609,7 +1677,7 @@ describe('the current editor receives the extension while other detected editors
       assert.doesNotMatch(r.stderr, /Choose editors/);
     });
   for (const pathFormat of process.platform === 'win32' ? ['drive'] : [])
-    test(`Windows ${pathFormat} paths`, async () => {
+    test(`Windows ${pathFormat} paths`, SUBPROCESS, async () => {
       assert.match(editor.env.VSCODE_GIT_ASKPASS_MAIN, /\\/);
       assert.match(editor.env.VSCODE_GIT_ASKPASS_NODE, /\\/);
       const drivePaths = {
@@ -1624,7 +1692,7 @@ describe('the current editor receives the extension while other detected editors
         ['positron'],
       );
     });
-  test('remote stdin installation', async () => {
+  test('remote stdin installation', SUBPROCESS, async () => {
     const piped = await f.run(['--no-hooks'], editor.env, { stdin: true });
     assert.equal(piped.status, 0, piped.stderr);
     assert.match(piped.commands, /curl.*codeload/);
@@ -1634,7 +1702,7 @@ describe('the current editor receives the extension while other detected editors
     );
     assert.match(piped.stdout, /ARC_INSTALL_SCRIPT_TAIL/);
   });
-  test('explicit editors override the current editor', async () => {
+  test('explicit editors override the current editor', SUBPROCESS, async () => {
     const explicit = await f.run(['--local', '--no-hooks', 'code', 'cursor'], editor.env, { cwd: f.source });
     assert.equal(explicit.status, 0, explicit.stderr);
     assert.deepEqual(
@@ -1647,30 +1715,34 @@ describe('the current editor receives the extension while other detected editors
 
 for (const target of ['user', 'system'])
   for (const version of ['', '0123456789'])
-    test.concurrent(`the current editor uses copied askpass scripts for Windows ${target} setups ${version || 'flat'}`, async () => {
-      const f = installerFixture();
-      try {
-        const editor = f.editor('code-insiders', 'windows', 'code-insiders', { copied: true, target, version });
-        const r = await f.run(['--local', '--no-hooks'], editor.env, {
-          stdin: true,
-          cwd: f.source,
-          terminalInput: '\n',
-        });
-        assert.equal(r.status, 0, r.stderr);
-        assert.deepEqual(
-          [...r.commands.matchAll(/editor (\S+) --install-extension/g)].map((match) => match[1]),
-          ['code-insiders'],
-        );
-        assert.match(r.stdout, /==> Current editor:/);
-        assert.doesNotMatch(r.stderr, /Choose editors/);
-      } finally {
-        f.cleanup();
-      }
-    });
+    test.concurrent(
+      `the current editor uses copied askpass scripts for Windows ${target} setups ${version || 'flat'}`,
+      SUBPROCESS,
+      async () => {
+        const f = installerFixture();
+        try {
+          const editor = f.editor('code-insiders', 'windows', 'code-insiders', { copied: true, target, version });
+          const r = await f.run(['--local', '--no-hooks'], editor.env, {
+            stdin: true,
+            cwd: f.source,
+            terminalInput: '\n',
+          });
+          assert.equal(r.status, 0, r.stderr);
+          assert.deepEqual(
+            [...r.commands.matchAll(/editor (\S+) --install-extension/g)].map((match) => match[1]),
+            ['code-insiders'],
+          );
+          assert.match(r.stdout, /==> Current editor:/);
+          assert.doesNotMatch(r.stderr, /Choose editors/);
+        } finally {
+          f.cleanup();
+        }
+      },
+    );
 
 test.concurrent(
   'the current editor uses the outer Windows launcher with versioned resources',
-  { timeout: runBudget(2) },
+  { ...SUBPROCESS, timeout: runBudget(2) },
   async () => {
     const f = installerFixture();
     try {
@@ -1706,6 +1778,7 @@ test.concurrent(
 
 test.concurrent.each(['its executable', 'no executable'])(
   'the current editor accepts a flat installation named with ten hexadecimal digits and %s',
+  SUBPROCESS,
   async (hint) => {
     const f = installerFixture();
     try {
@@ -1734,7 +1807,7 @@ test.concurrent.each(['its executable', 'no executable'])(
 
 test.concurrent(
   'the current editor accepts matching metadata versions and rejects ambiguous copied identities',
-  { timeout: runBudget(4) },
+  { ...SUBPROCESS, timeout: runBudget(4) },
   async () => {
     const f = installerFixture();
     try {
@@ -1820,7 +1893,7 @@ describe('unverified current editor hints retain the all-editor menu and default
     'missing launcher',
     'malformed product metadata',
   ].entries())
-    test(`all editors for ${hint}`, async () => {
+    test(`all editors for ${hint}`, SUBPROCESS, async () => {
       const env = hints[index];
       const r = await f.run(['--local', '--no-hooks'], env, { stdin: true, cwd: f.source, terminalInput: '\n' });
       assert.equal(r.status, 0, r.stderr);
@@ -1838,7 +1911,7 @@ test.concurrent.each([
   ['1\n', ['code', 'cursor']],
   ['2\n', ['code']],
   ['3\n', ['cursor']],
-])('the editor menu choice %j installs %j', async (terminalInput, expected) => {
+])('the editor menu choice %j installs %j', SUBPROCESS, async (terminalInput, expected) => {
   const f = installerFixture();
   try {
     const r = await f.run(['--local', '--no-hooks'], {}, { stdin: true, cwd: f.source, terminalInput });
@@ -1857,6 +1930,7 @@ test.concurrent.each([
 
 test.concurrent.each(['0\n', '4\n', 'invalid\n', '999999999\n'])(
   'the editor menu refuses choice %j before installation',
+  SUBPROCESS,
   async (terminalInput) => {
     const f = installerFixture();
     try {
@@ -1898,7 +1972,7 @@ function exerciseManagedHooks(f) {
 }
 
 for (const mode of ['local', 'remote'])
-  test.concurrent(`${mode} installer passes its source revision only to the build`, async () => {
+  test.concurrent(`${mode} installer passes its source revision only to the build`, SUBPROCESS, async () => {
     const f = installerFixture();
     try {
       const result = await f.run(
@@ -1914,46 +1988,50 @@ for (const mode of ['local', 'remote'])
   });
 
 for (const mode of ['local', 'remote'])
-  test.concurrent(`${mode} installer fixture hooks survive source deletion in a separate archive-managed copy`, async () => {
-    const f = installerFixture();
-    try {
-      const r = await f.run(
-        mode === 'remote'
-          ? ['--remote', '--repo', 'fixture/arc', '--ref', 'feature/test', '--marketplace-url', catalogUrl, 'code']
-          : ['--local', '--marketplace-url', catalogUrl, 'code'],
-        {},
-        { stdin: true, cwd: f.source },
-      );
-      assert.equal(r.status, 0, r.stderr);
-      if (mode === 'remote') {
-        assert.match(r.commands, /npm ci/);
-        assert.doesNotMatch(r.commands, /npm install/);
-        assert.match(r.commands, /api.github.com\/repos\/fixture\/arc\/commits\/feature%2Ftest/);
-        assert.match(r.commands, /codeload.github.com\/fixture\/arc\/tar.gz\/a{40}/);
-        assert.equal(fs.readFileSync(f.settings, 'utf8'), f.legacy);
-        assert.doesNotMatch(r.commands, /legacy-migration/);
-        assert.equal((r.commands.match(/--connect-timeout 15 --max-time 900/g) ?? []).length, 2);
+  test.concurrent(
+    `${mode} installer fixture hooks survive source deletion in a separate archive-managed copy`,
+    SUBPROCESS,
+    async () => {
+      const f = installerFixture();
+      try {
+        const r = await f.run(
+          mode === 'remote'
+            ? ['--remote', '--repo', 'fixture/arc', '--ref', 'feature/test', '--marketplace-url', catalogUrl, 'code']
+            : ['--local', '--marketplace-url', catalogUrl, 'code'],
+          {},
+          { stdin: true, cwd: f.source },
+        );
+        assert.equal(r.status, 0, r.stderr);
+        if (mode === 'remote') {
+          assert.match(r.commands, /npm ci/);
+          assert.doesNotMatch(r.commands, /npm install/);
+          assert.match(r.commands, /api.github.com\/repos\/fixture\/arc\/commits\/feature%2Ftest/);
+          assert.match(r.commands, /codeload.github.com\/fixture\/arc\/tar.gz\/a{40}/);
+          assert.equal(fs.readFileSync(f.settings, 'utf8'), f.legacy);
+          assert.doesNotMatch(r.commands, /legacy-migration/);
+          assert.equal((r.commands.match(/--connect-timeout 15 --max-time 900/g) ?? []).length, 2);
+        }
+        assert.deepEqual(fs.readdirSync(f.temporary), []);
+        assert.equal(fs.existsSync(path.join(f.managed, '.claude-plugin', 'plugin.json')), true);
+        const [marketplace] = JSON.parse(fs.readFileSync(f.marketplaces));
+        assert.deepEqual(marketplace, { name: 'arc', source: 'url', url: catalogUrl });
+        assert.match(
+          r.stdout,
+          /Plugin archive: https:\/\/github.com\/glin\/arc\/releases\/download\/v0.1.0\/arc-hooks-0.1.0.zip/,
+        );
+        assert.match(r.stdout, /Plugin archive digest: [a-f0-9]{64}/);
+        assert.doesNotMatch(r.stdout, /Plugin directory/);
+        fs.rmSync(f.source, { recursive: true });
+        exerciseManagedHooks(f);
+      } finally {
+        f.cleanup();
       }
-      assert.deepEqual(fs.readdirSync(f.temporary), []);
-      assert.equal(fs.existsSync(path.join(f.managed, '.claude-plugin', 'plugin.json')), true);
-      const [marketplace] = JSON.parse(fs.readFileSync(f.marketplaces));
-      assert.deepEqual(marketplace, { name: 'arc', source: 'url', url: catalogUrl });
-      assert.match(
-        r.stdout,
-        /Plugin archive: https:\/\/github.com\/glin\/arc\/releases\/download\/v0.1.0\/arc-hooks-0.1.0.zip/,
-      );
-      assert.match(r.stdout, /Plugin archive digest: [a-f0-9]{64}/);
-      assert.doesNotMatch(r.stdout, /Plugin directory/);
-      fs.rmSync(f.source, { recursive: true });
-      exerciseManagedHooks(f);
-    } finally {
-      f.cleanup();
-    }
-  });
+    },
+  );
 
 test.concurrent(
   'source-main hooks survive downloaded source cleanup without GitHub Releases',
-  { timeout: runBudget(2) },
+  { ...SUBPROCESS, timeout: runBudget(2) },
   async () => {
     const f = installerFixture();
     try {
@@ -1990,7 +2068,7 @@ test.concurrent(
 );
 
 for (const conflict of ['disabled settings', 'project', 'local'])
-  test.concurrent(`source-main hooks preserve caller ${conflict} without plugin mutation`, async () => {
+  test.concurrent(`source-main hooks preserve caller ${conflict} without plugin mutation`, SUBPROCESS, async () => {
     const f = installerFixture();
     try {
       const caller = path.join(f.dir, 'caller project');
@@ -2034,7 +2112,7 @@ for (const conflict of ['disabled settings', 'project', 'local'])
 
 test.concurrent(
   'remote stdin installation from an unrelated directory cleans failures and interruptions',
-  { timeout: runBudget(8) },
+  { ...SUBPROCESS, timeout: runBudget(8) },
   async () => {
     const f = installerFixture();
     try {
@@ -2077,7 +2155,7 @@ test.concurrent.each([
   [['--repo', 'bad']],
   [['--marketplace-url', 'http://example.com/arc.json']],
   [['missing-editor']],
-])('source installer rejects invalid options %j before installation', async (args) => {
+])('source installer rejects invalid options %j before installation', SUBPROCESS, async (args) => {
   const f = installerFixture();
   try {
     const r = await f.run(args);
@@ -2091,7 +2169,7 @@ test.concurrent.each([
 
 test.concurrent(
   'source installer rejects missing tools and old Claude before installation',
-  { timeout: runBudget(4) },
+  { ...SUBPROCESS, timeout: runBudget(4) },
   async () => {
     const f = installerFixture();
     try {
@@ -2118,6 +2196,7 @@ test.concurrent(
 
 test.concurrent.each(['--help', '-h'])(
   'source installer %s omits installation receipts and executable work',
+  SUBPROCESS,
   async (option) => {
     const f = installerFixture();
     try {
@@ -2139,29 +2218,33 @@ test.concurrent.each(['--help', '-h'])(
   },
 );
 
-test.concurrent('missing Node admission omits installation receipts and never attempts the missing executable', async () => {
-  const f = installerFixture();
-  try {
-    fs.unlinkSync(path.join(f.bin, 'node'));
-    const script = path.join(f.source, 'install.sh');
-    fs.writeFileSync(
-      script,
-      'command_not_found_handle() { echo "missing-command $1" >> "$ARC_TEST_LOG"; return 127; }\n' +
-        fs.readFileSync(script, 'utf8'),
-    );
-    const result = await f.run(['--no-hooks', 'code']);
-    assert.equal(result.status, 2, result.stdout + result.stderr);
-    assert.match(result.stderr, /node is required/);
-    assert.equal(result.commands, '');
-    assert.doesNotMatch(result.stdout, /^\{/m);
-    assert.deepEqual(fs.readdirSync(f.temporary), []);
-  } finally {
-    f.cleanup();
-  }
-});
+test.concurrent(
+  'missing Node admission omits installation receipts and never attempts the missing executable',
+  SUBPROCESS,
+  async () => {
+    const f = installerFixture();
+    try {
+      fs.unlinkSync(path.join(f.bin, 'node'));
+      const script = path.join(f.source, 'install.sh');
+      fs.writeFileSync(
+        script,
+        'command_not_found_handle() { echo "missing-command $1" >> "$ARC_TEST_LOG"; return 127; }\n' +
+          fs.readFileSync(script, 'utf8'),
+      );
+      const result = await f.run(['--no-hooks', 'code']);
+      assert.equal(result.status, 2, result.stdout + result.stderr);
+      assert.match(result.stderr, /node is required/);
+      assert.equal(result.commands, '');
+      assert.doesNotMatch(result.stdout, /^\{/m);
+      assert.deepEqual(fs.readdirSync(f.temporary), []);
+    } finally {
+      f.cleanup();
+    }
+  },
+);
 
 function bash(script, ...args) {
-  const result = spawnSync(bashExecutable, ['-c', script, 'bash', ...args], { encoding: 'utf8' });
+  const result = spawnSync(gitBashExecutable(), ['-c', script, 'bash', ...args], { encoding: 'utf8' });
   assert.equal(result.status, 0, result.stderr);
   return result.stdout.trim();
 }
@@ -2176,7 +2259,7 @@ function bashPath(dir) {
   return bash('cd "$1" && pwd -P', dir);
 }
 
-test.concurrent('a Positron desktop command uses the bundled extension CLI', () => {
+test.concurrent('a Positron desktop command uses the bundled extension CLI', SUBPROCESS, () => {
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'arc-positron-'));
   try {
     const app = path.join(temp, 'app');
@@ -2208,7 +2291,7 @@ test.concurrent('the installer resolves each editor CLI before it uses one', () 
 });
 
 for (const product of ['Code', 'Positron']) {
-  test.concurrent(`an editor compatibility failure keeps the ${product} error`, () => {
+  test.concurrent(`an editor compatibility failure keeps the ${product} error`, SUBPROCESS, () => {
     const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'arc-install-'));
     try {
       const editor = path.join(temp, process.platform === 'win32' ? 'positron.exe' : 'positron');
@@ -2222,7 +2305,7 @@ for (const product of ['Code', 'Positron']) {
         { mode: 0o755 },
       );
       const result = spawnSync(
-        bashExecutable,
+        gitBashExecutable(),
         ['-c', 'source "$1"; install_editor_extension "$2" package.vsix', 'bash', resolver, editor],
         { encoding: 'utf8' },
       );
@@ -2239,7 +2322,7 @@ for (const product of ['Code', 'Positron']) {
   });
 }
 
-test.concurrent('a traced DEP0169 warning keeps its stack', () => {
+test.concurrent('a traced DEP0169 warning keeps its stack', SUBPROCESS, () => {
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'arc-deprecation-'));
   try {
     const editor = path.join(temp, process.platform === 'win32' ? 'code.exe' : 'code');
@@ -2251,7 +2334,7 @@ test.concurrent('a traced DEP0169 warning keeps its stack', () => {
       { mode: 0o755 },
     );
     const result = spawnSync(
-      bashExecutable,
+      gitBashExecutable(),
       ['-c', 'source "$1"; install_editor_extension "$2" package.vsix', 'bash', resolver, editor],
       { encoding: 'utf8' },
     );
@@ -2266,7 +2349,7 @@ test.concurrent('a traced DEP0169 warning keeps its stack', () => {
 
 test.concurrent(
   'sourcing the installer from zsh reports the supported invocation',
-  { skip: process.platform === 'win32' },
+  { ...SUBPROCESS, skip: process.platform === 'win32' },
   () => {
     const installer = path.join(__dirname, '..', 'install.sh');
     const result = spawnSync('zsh', ['-c', 'source "$1"', 'zsh', installer], { encoding: 'utf8' });
@@ -2279,7 +2362,7 @@ test.concurrent(
 
 test.concurrent(
   'the installer refuses unsupported packaging Node versions before npm',
-  { timeout: runBudget(8) },
+  { ...SUBPROCESS, timeout: runBudget(8) },
   async () => {
     const f = installerFixture();
     try {

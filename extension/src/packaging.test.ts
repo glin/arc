@@ -1,10 +1,11 @@
 // extension/src/packaging.test.ts
 import { beforeAll, test, vi } from 'vitest';
 import assert from 'node:assert';
-import { spawnSync } from 'node:child_process';
+import { execFile, spawnSync } from 'node:child_process';
+import { promisify } from 'node:util';
 import * as fs from 'node:fs';
 import nativeFs from 'node:fs';
-import { syncBuiltinESMExports } from 'node:module';
+import { createRequire, syncBuiltinESMExports } from 'node:module';
 import { tempDir } from './temproot.ts';
 import * as path from 'node:path';
 import { createHash } from 'node:crypto';
@@ -397,7 +398,7 @@ test.each(launcherShells)(
 
 test.skipIf(process.platform !== 'win32')(
   'long private Windows launchers preserve terminal commands and matching path arguments',
-  async () => {
+  async ({ signal }) => {
     const root = tempDir('arc-long-terminal-');
     const software = path.join(root, 'long software '.repeat(8).trim(), 'long software '.repeat(8).trim());
     const tools = new BundledTools(readToolPackage(path.join(extensionRoot, 'dist')), software);
@@ -435,50 +436,104 @@ test.skipIf(process.platform !== 'win32')(
         process.env.SystemRoot ?? 'C:/Windows',
         'System32/WindowsPowerShell/v1.0/powershell.exe',
       );
-      const run = (command: string, input?: string) =>
-        spawnSync(powershell, ['-NoProfile', '-EncodedCommand', Buffer.from(command, 'utf16le').toString('base64')], {
-          cwd: root,
-          env: terminalEnv,
-          input,
-          encoding: 'utf8',
-          timeout: 15_000,
-        });
-      const status = run('arc statusline --json', '{}');
-      assert.equal(status.status, 0, status.stderr);
-      assert.equal(JSON.parse(status.stdout).schemaVersion, 1);
-      const invalid = run('arc statusline --json', '{invalid');
-      assert.equal(invalid.status, 1, invalid.stderr);
-      assert.match(invalid.stderr, /Claude status input is not valid JSON/);
-      const help = run('arc help');
-      assert.equal(help.status, 0, help.stderr);
-      assert.match(help.stdout, /statusline/);
-      for (const first of [
+      const quote = (value: string) => "'" + value.replaceAll("'", "''") + "'";
+      const argumentsToCheck = [
         launcher,
         commands.directory + '\\arc.cmd',
         'argument with spaces',
         '--arc-launcher-arguments',
-      ]) {
-        const escaped = first.replaceAll("'", "''");
-        for (const command of [`arc '${escaped}'`, `& $env:ComSpec /d /c arc '"${first}"'`]) {
-          const result = run(command);
+      ];
+      const invocations = [
+        "'{}' | arc statusline --json",
+        "'{invalid' | arc statusline --json",
+        'arc help',
+        ...argumentsToCheck.flatMap((first) => [
+          `arc ${quote(first)}`,
+          `& $env:ComSpec /d /c arc ${quote('"' + first + '"')}`,
+        ]),
+        '& $env:ComSpec /d /c "arc windows --json"',
+      ];
+      // One shell runs every invocation. Each command keeps its own output and exit status.
+      const script = `
+[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding
+${invocations
+  .map(
+    (command) => `
+[pscustomobject]@{command=${quote(command)};state='running'} | ConvertTo-Json -Compress
+$captured = & { ${command} } 2>&1
+$status = $LASTEXITCODE
+$output = ($captured | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] } | ForEach-Object { $_.ToString() }) -join "\n"
+$errors = ($captured | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] } | ForEach-Object { $_.ToString() }) -join "\n"
+[pscustomobject]@{command=${quote(command)};status=$status;stdout=$output;stderr=$errors} | ConvertTo-Json -Compress
+`,
+  )
+  .join('')}
+`;
+      const batch = await promisify(execFile)(
+        powershell,
+        ['-NoProfile', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')],
+        {
+          cwd: root,
+          env: terminalEnv,
+          encoding: 'utf8',
+          timeout: 25_000,
+          signal,
+        },
+      ).catch((error: Error & { stdout?: string; stderr?: string }) => {
+        assert.fail(`${error.message}\nstdout:\n${error.stdout ?? ''}\nstderr:\n${error.stderr ?? ''}`);
+      });
+      const results = batch.stdout
+        .trim()
+        .split(/\r?\n/)
+        .map((line) => JSON.parse(line) as { status?: number; stdout: string; stderr: string })
+        .filter((result) => result.status !== undefined);
+      assert.equal(results.length, invocations.length);
+      const [status, invalid, help] = results;
+      assert.equal(status.status, 0, status.stderr);
+      assert.equal(JSON.parse(status.stdout).schemaVersion, 1);
+      assert.equal(invalid.status, 1, invalid.stderr);
+      assert.match(invalid.stderr, /Claude status input is not valid JSON/);
+      assert.equal(help.status, 0, help.stderr);
+      assert.match(help.stdout, /statusline/);
+      const cliPath = path.join(extensionRoot, 'dist/cli.cjs');
+      const cliSource = fs.readFileSync(cliPath, 'utf8');
+      for (const [index, first] of argumentsToCheck.entries()) {
+        for (const result of results.slice(3 + index * 2, 5 + index * 2)) {
           assert.equal(result.status, 1, result.stderr);
           assert.ok(result.stderr.includes(`Unknown command: ${first}`), result.stderr);
         }
-        const standalone = spawnSync(process.execPath, [path.join(extensionRoot, 'dist/cli.cjs'), first], {
-          cwd: root,
+        // The standalone bundle receives the same argument without a launcher.
+        let stderr = '';
+        const cliProcess = {
+          ...process,
+          argv: [process.execPath, cliPath, first],
           env,
-          encoding: 'utf8',
-          timeout: 15_000,
+          exitCode: 0,
+          stderr: {
+            write: (text: string) => {
+              stderr += text;
+            },
+          },
+          stdout: { write: () => {} },
+        };
+        const module = { exports: {} };
+        await vm.runInNewContext(cliSource, {
+          module,
+          exports: module.exports,
+          require: createRequire(cliPath),
+          __dirname: path.dirname(cliPath),
+          __filename: cliPath,
+          process: cliProcess,
+          Buffer,
+          URL,
+          TextDecoder,
+          setTimeout,
+          clearTimeout,
         });
-        assert.equal(standalone.status, 1, standalone.stderr);
-        assert.ok(standalone.stderr.includes(`Unknown command: ${first}`), standalone.stderr);
+        assert.equal(cliProcess.exitCode, 1, stderr);
+        assert.ok(stderr.includes(`Unknown command: ${first}`), stderr);
       }
-      const child = spawnSync(process.env.ComSpec ?? 'cmd.exe', ['/d', '/c', 'arc windows --json'], {
-        cwd: root,
-        env,
-        encoding: 'utf8',
-        timeout: 15_000,
-      });
+      const child = results.at(-1)!;
       assert.equal(child.status, 0, child.stderr);
       assert.deepEqual(JSON.parse(child.stdout), { version: 1, windows: [], complete: true });
       assert.equal(values.get('Path'), ';' + commands.directory);

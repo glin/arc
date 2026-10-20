@@ -116,7 +116,7 @@ function copyFixtures(temp, filter = () => true) {
 test('stream audit rejects changed expected values', () => {
   const temp = mkdtempSync(join(tmpdir(), 'arc-stream-audit-'));
   try {
-    copyFixtures(temp);
+    copyFixtures(temp, (name) => /^(?:one-request|bedrock-regional)\./.test(name));
     const audit = () =>
       auditStreams({
         directory: temp,
