@@ -6,7 +6,7 @@ Install `arc` for saved session costs, a Claude Code status line, and session co
 
 ## Install
 
-The Arc VSIX supplies matching private commands. [Try it](../README.md#try-it) describes integrated terminals and Arc sessions. Standalone installation uses npm.
+The Arc VSIX supplies matching private commands. In an integrated terminal, `arc` selects its owning window, as the [CLI guide](../docs/cli.md#windows) describes. Standalone installation uses npm.
 
 Requires Node.js 18 or later. [Build from source](#build-from-source) and install the local tarball.
 

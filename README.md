@@ -1,157 +1,115 @@
 # Arc
 
-Arc is a VS Code extension for working with Claude Code and Codex. (_Personal software, experimental_)
+Arc is a VS Code extension for running many Claude Code and Codex agents in parallel. It adds what I find missing from both, with one interface for both agents. (_Personal software, experimental_)
 
-[Web demo](https://glin.github.io/arc/)
+[Try the web demo](https://glin.github.io/arc/)
 
-- Keep track of all the agents! Vertical tabs, labels, saved views, filters, links to subagent sessions.
-- Read results, not chat. Arc groups the session into a timeline of turns, each showing the final response, file edits, commits, subagents, and cost.
-- See what a session costs with turn-level breakdowns. Save costs with the prompt cache expiry and next-turn starting price hints.
-- Keep your workflow. Stay in VS Code with your editor, diff viewer, themes, and extensions. Use Arc with or without worktrees, or as a viewer for Claude/Codex CLI and desktop sessions.
+- Keep track of all the agents! Vertical tabs, labels, saved views, filters, and links to subagent sessions.
+- Read results, not chat. Each session is a timeline of turns, each showing the final response, file edits, commits, subagents, and cost.
+- See what every turn costs, including subagents. Save costs with prompt cache expiry and next-turn starting price hints.
+- Stay in VS Code, no prescribed workflow. Use Arc with or without worktrees, or as a viewer for Claude/Codex CLI and desktop sessions.
+- Let agents use Arc. Claude can start a Codex session, or the reverse, and the parent turn shows it with its cost. Agents can also label, pin, and archive sessions, and queue their own compaction.
 
 <a href="docs/images/readme-main.webp"><img src="docs/images/readme-main.webp" alt="Arc open in a VS Code editor tab, with Claude Code and Codex sessions beside a completed turn" width="1186"></a>
 
-## Try it
+## Install
 
-Install from source with Node.js 22+ and npm. On Windows, use Git Bash.
-
-Install [Claude Code](https://code.claude.com/docs/en/setup) and [Codex](https://developers.openai.com/codex/cli/) for the agents you use.
-
-Arc is not on the VS Code Marketplace.
+Requires Node.js 22+ and npm. On Windows, use Git Bash. Install [Claude Code](https://code.claude.com/docs/en/setup), [Codex](https://developers.openai.com/codex/cli/), or both.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/glin/arc/main/install.sh | bash
 ```
 
-The installer installs Arc in your editor and sets up Claude hooks.
+The installer adds Arc to VS Code, sets up the Claude hooks, and installs the [`arc-sessions` skill](#let-agents-use-arc) for the agents it finds. It works with VS Code, VS Code Insiders, Cursor, Positron, and VSCodium. See [CLI installation](cli/README.md#install) for its options and for using `arc` outside VS Code.
 
-It copies the session skill for detected Claude and Codex executables. Repeat `--skill-agent claude` or `--skill-agent codex` to select providers explicitly, including providers absent from PATH. `--no-skills` skips skill setup independently of `--no-hooks`. [Skill installation](docs/arc-sessions.md#install-the-parts-you-need) describes destinations and ownership.
+Reload VS Code, then run **Arc: Open Arc in Editor** from the Command Palette.
 
-Reload VS Code and open a new integrated terminal to use `arc`. Run **Arc: Open Arc in Editor** from the Command Palette.
+Arc runs the installed `claude` and `codex` with their existing sign-in: a Claude or ChatGPT subscription, or an API key. To sign in:
+
+```bash
+claude auth login
+codex login
+```
 
 ### Claude hooks
 
-The optional Claude hooks (plugin) let Arc show file diffs. Restart Claude after installation.
-
-Run **Arc: Set up Claude hooks** in the Command Palette to install them separately. To install Arc without changing Claude hooks, use:
+The optional Claude hooks let Arc show full file diffs. Restart Claude to load them. To install them later, run **Arc: Set up Claude hooks** from the Command Palette. To skip them, add `--no-hooks`:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/glin/arc/main/install.sh | bash -s -- --no-hooks
 ```
 
-### CLI outside VS Code
-
-See [CLI installation](cli/README.md#install) to install `arc` for other terminals.
-
 ### Uninstall
 
-Remove Arc from VS Code's Extensions view. Installed Claude hooks, standalone commands, and personal skills remain available.
+Remove Arc from the VS Code Extensions view. The Claude hooks, the `arc` command, and the session skill stay installed. See [uninstallation](cli/README.md#uninstallation) to remove them.
 
-See [uninstallation](cli/README.md#uninstallation) to remove those separately.
+## Turns, not chat
 
-### Sign in
+Each session is a timeline of turn cards, newest first. A card shows the final response next to the files, diffs, commits, subagents, and cost from that turn. Long sessions stay easy to scan.
 
-Arc works with both Claude/ChatGPT subscriptions and API plans.
-
-Sign in using the Claude Code and Codex CLIs:
-
-```bash
-claude auth login
-
-codex login
-```
-
-Arc runs agents and reads account usage through your installed Claude Code and Codex CLIs, which handle authentication.
-
-## Features
-
-### Session links and export
-
-- Open named session links in agent responses without leaving Arc.
-- Export a saved session and its linked work as HTML for offline review.
-
-### Files and commits
-
-- Review file diffs before the agent commits. Open changed files and their diffs in VS Code.
-- Find sessions in the open project and its registered Git worktrees.
-- See commit branches and worktrees when available, including who made each subagent commit.
-- See fast-forward merges separately from authored commits.
-
-Claude's full current-file diffs require the optional [hooks](#try-it). See [diff limits](docs/timeline.md#diff-selection).
-
-<a href="docs/images/readme-files.webp"><img src="docs/images/readme-files.webp" alt="Files and Commits sections with changed files, authored commits, branch and worktree names, subagent attribution, and a merge into main" width="680"></a>
-
-### Session costs
-
-Arc estimates costs for supported models using published prices. Subscription estimates do not measure your bill or plan limits.
-
-Use [`arc cost`](docs/cli.md#read-a-cost-report) to estimate costs from saved Claude and Codex transcripts.
-
-| Provider       | Models                      |
-| -------------- | --------------------------- |
-| Anthropic      | Claude                      |
-| OpenAI         | GPT                         |
-| Amazon Bedrock | Anthropic and OpenAI models |
-
-#### Cost by agent
-
-<a href="docs/images/readme-cost.webp"><img src="docs/images/readme-cost.webp" alt="Cost details for Claude Opus 5.5 and a Sonnet 5.5 subagent" width="480"></a>
-
-#### Next-turn price
-
-<a href="docs/images/readme-next-turn.webp"><img src="docs/images/readme-next-turn.webp" alt="Cached and uncached next-turn prices with cache time above the prompt box" width="540"></a>
-
-#### Cache expiries
-
-<a href="docs/images/readme-cache-expiry.webp"><img src="docs/images/readme-cache-expiry.webp" alt="Cache expiries with cost added over cache-read price" width="541"></a>
-
-#### Cache use
-
-<a href="docs/images/readme-cache.webp"><img src="docs/images/readme-cache.webp" alt="Low cache reuse warning and cache costs" width="480"></a>
-
-#### Project cost
-
-<a href="docs/images/readme-project-cost.webp"><img src="docs/images/readme-project-cost.webp" alt="Project cost with estimated totals for Claude, Codex, and both agents over today, 7 days, and 30 days" width="340"></a>
-
-#### Account usage
-
-<a href="docs/images/readme-usage.webp"><img src="docs/images/readme-usage.webp" alt="Usage bar with Claude and Codex limits, open to each agent's plan, 5h and 7d use, and reset times" width="308"></a>
-
-### Quality-of-life features
-
-- Save your favorite model setups with effort and permissions per project
-- Find sessions with advanced filters
-- Invoke Codex skills with `/skill`, consistently with Claude
-- Copy responses as Markdown or start a new draft from selected response text
-- Keep unsent drafts across session switches and panel restores
-
-#### Commenting
+Select text in a response to comment on it. Arc sends comments to the agent with the next prompt.
 
 <a href="docs/images/readme-comment-editor.webp"><img src="docs/images/readme-comment-editor.webp" alt="Selected response text with a comment being written beside it" width="970"></a>
 
-### Control Arc with agents
+### Files and commits
 
-Use the [`arc-sessions` skill](docs/arc-sessions.md) to:
+Review file diffs before the agent commits, and open them in VS Code. Commits open in VS Code and show their branch and worktree when known, and which subagent made them. Arc lists fast-forward merges separately from authored commits.
 
-- Start Claude or Codex sessions with labels and pins
-- Read session results and status, then summarize work needing your attention
-- Send follow-ups to sessions the agent started
-- Estimate session and subagent costs with `arc cost`
-- Request compaction of its own session after the turn when asked
+Full file diffs for Claude need the optional [Claude hooks](#claude-hooks).
 
-#### Summarize sessions
+<a href="docs/images/readme-files.webp"><img src="docs/images/readme-files.webp" alt="Files and Commits sections with changed files, authored commits, branch and worktree names, subagent attribution, and a merge into main" width="680"></a>
+
+## Cost on every turn
+
+Every turn shows its estimated cost. Open it to see the main agent and each subagent separately.
+
+<a href="docs/images/readme-cost.webp"><img src="docs/images/readme-cost.webp" alt="Cost details for Claude Opus 5.5 and a Sonnet 5.5 subagent" width="480"></a>
+
+Above the prompt box, Arc shows the next turn's starting price with a warm or cold cache, and the remaining cache time.
+
+<a href="docs/images/readme-next-turn.webp"><img src="docs/images/readme-next-turn.webp" alt="Cached and uncached next-turn prices with cache time above the prompt box" width="540"></a>
+
+When a cache expires between turns, the cost detail shows the extra cost of resending the context.
+
+<a href="docs/images/readme-cache-expiry.webp"><img src="docs/images/readme-cache-expiry.webp" alt="Extra cost of resending context after cache expiry" width="541"></a>
+
+Arc warns when a session reuses little of its cache.
+
+<a href="docs/images/readme-cache.webp"><img src="docs/images/readme-cache.webp" alt="Low cache reuse warning and cache costs" width="480"></a>
+
+Project cost shows Claude and Codex totals for today, 7 days, and 30 days. The usage bar shows each agent's plan limits and reset times.
+
+<a href="docs/images/readme-project-cost.webp"><img src="docs/images/readme-project-cost.webp" alt="Project cost with estimated totals for Claude, Codex, and both agents over today, 7 days, and 30 days" width="340"></a> <a href="docs/images/readme-usage.webp"><img src="docs/images/readme-usage.webp" alt="Usage bar with Claude and Codex limits, open to each agent's plan, 5h and 7d use, and reset times" width="308"></a>
+
+Costs are estimates from published list prices for Claude and GPT models, direct or on Amazon Bedrock. They are not a subscription bill. [`arc cost`](docs/cli.md#read-a-cost-report) gives the same estimates from saved transcripts.
+
+## Many agents at once
+
+Claude and Codex sessions share one session list, one timeline, and one prompt box.
+
+- See which sessions are running, unread, or waiting for input.
+- Pin, label, and archive sessions. Build saved views from labels.
+- Save model setups with agent, model, effort, and permissions per project.
+- Use `/skill` in Codex the same way as in Claude.
+- Keep unsent drafts across session switches.
+
+Arc also shows Claude and Codex sessions started in a terminal or desktop app, from the open project and its git worktrees.
+
+Session links in agent responses open in Arc. Export a session and its linked sessions as one HTML file to share.
+
+## Let agents use Arc
+
+Claude and Codex can start each other's sessions from a shell command. The parent turn lists each dispatched session with its cost, and its name opens that session.
+
+The [`arc-sessions` skill](docs/arc-sessions.md) lets agents start sessions in Arc, read their results, and send follow-ups. Agents can also label, pin, and archive sessions, queue a compaction of their own session for after the turn, and estimate costs with `arc cost`.
 
 ```text
 Use Arc to summarize the sessions labelled Review in this window. Read their completed turns. Report results, blockers, and decisions needing my input.
 ```
 
-#### Start a branch review
-
 ```text
 Use Arc to start a Codex session reviewing this branch. Name it Branch review, apply Review, and pin it. Read its result and summarize its findings.
 ```
-
-#### Request compaction
 
 ```text
 After saving the handoff, request compaction of this session after your response.
@@ -159,4 +117,4 @@ After saving the handoff, request compaction of this session after your response
 
 ## Limitations
 
-Some Claude Code and Codex features, such as starting Remote Control (`/remote-control`), are not implemented in Arc.
+Arc supports Claude Code and Codex because those are the agents I use. It does not cover every feature of either. For example, it cannot start Remote Control (`/remote-control`).

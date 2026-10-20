@@ -1,7 +1,7 @@
 {
   "name": "arc",
   "displayName": "Arc",
-  "description": "Run Claude Code and Codex, review their work turn by turn, and track costs.",
+  "description": "Run many Claude Code and Codex agents in parallel, with per-turn results and costs.",
   "version": "0.1.0",
   "publisher": "glin",
   "engines": {
