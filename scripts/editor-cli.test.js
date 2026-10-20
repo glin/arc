@@ -1243,6 +1243,77 @@ function installerFixture() {
   };
 }
 
+test.concurrent.each([false, true])(
+  'local source installation preserves manifest and lockfile bytes with an unsynchronized manifest (%s)',
+  SUBPROCESS,
+  async (unsynchronized) => {
+    const f = installerFixture();
+    try {
+      const extension = path.join(f.source, 'extension');
+      const manifest = path.join(extension, 'package.json');
+      const lock = path.join(extension, 'package-lock.json');
+      const dependency = path.join(f.source, 'dependency');
+      fs.mkdirSync(dependency);
+      fs.writeFileSync(path.join(dependency, 'package.json'), '{"name":"fixture-dependency","version":"1.0.0"}');
+      const pkg = { name: 'fixture-extension', version: '0.0.9' };
+      fs.writeFileSync(
+        lock,
+        JSON.stringify({ ...pkg, lockfileVersion: 3, requires: true, packages: { '': pkg } }, null, '\t') + '\n',
+      );
+      fs.writeFileSync(
+        manifest,
+        JSON.stringify(
+          { ...pkg, ...(unsynchronized ? { dependencies: { 'fixture-dependency': 'file:../dependency' } } : {}) },
+          null,
+          '\t',
+        ) + '\n',
+      );
+      const before = [manifest, lock].map((file) => fs.readFileSync(file));
+      const npm = bash('command -v npm');
+      // Let npm select its interpreter within the isolated PATH.
+      for (const name of ['bash', 'uname']) {
+        const utility = name === 'bash' ? absoluteBash() : bash('command -v uname');
+        fs.writeFileSync(
+          path.join(f.bin, name),
+          `#!${absoluteBash()}\nexec '${utility.replaceAll("'", "'\\''")}' "$@"\n`,
+          { mode: 0o755 },
+        );
+      }
+      fs.writeFileSync(
+        path.join(f.bin, 'npm'),
+        `#!${absoluteBash()}
+echo "npm $*" >> "$ARC_TEST_LOG"
+if [ "$1" = ci ] || [ "$1" = install ]; then exec '${npm.replaceAll("'", "'\\''")}' --ignore-scripts --no-audit --no-fund "$@"; fi
+`,
+        { mode: 0o755 },
+      );
+      const result = await f.run(['--local', '--no-hooks', 'code'], {
+        npm_config_cache: path.join(f.dir, 'npm-cache'),
+        npm_config_userconfig: path.join(f.dir, 'empty-npmrc'),
+        npm_config_globalconfig: path.join(f.dir, 'empty-global-npmrc'),
+        npm_config_offline: 'true',
+      });
+      for (const [index, file] of [manifest, lock].entries()) assert.deepEqual(fs.readFileSync(file), before[index]);
+      if (unsynchronized) {
+        assert.notEqual(result.status, 0, result.stdout + result.stderr);
+        assert.match(
+          result.stderr,
+          /npm (?:error|ERR!) `npm ci` can only install packages when your package\.json and package-lock\.json/,
+        );
+        assert.match(result.stderr, /rerun install.sh/);
+        assert.doesNotMatch(result.commands, /npm run build|package|editor /);
+      } else {
+        assert.equal(result.status, 0, result.stdout + result.stderr);
+        assert.match(result.commands, /editor code --install-extension/);
+      }
+      assert.doesNotMatch(result.commands, /curl /);
+      assert.deepEqual(fs.readdirSync(f.temporary), []);
+    } finally {
+      f.cleanup();
+    }
+  },
+);
+
 for (const missing of ['SKILL.md', 'compaction.md']) {
   test.concurrent(
     `source setup refuses an incomplete checkout before building when its session skill lacks ${missing}`,
@@ -1305,16 +1376,16 @@ test.concurrent(
     const f = installerFixture();
     try {
       for (let run = 0; run < 2; run++) {
-        const r = await f.run(['code'], { ARC_TEST_LOCKED_DEPENDENCY: '1' });
+        const r = await f.run(['code']);
         assert.equal(r.status, 0, r.stderr);
         assert.match(
           r.commands,
-          /claude plugin marketplace list --json[\s\S]*npm install[\s\S]*editor code --install-extension[\s\S]*claude plugin marketplace update/,
+          /claude plugin marketplace list --json[\s\S]*npm ci[\s\S]*editor code --install-extension[\s\S]*claude plugin marketplace update/,
         );
         assert.equal((r.commands.match(/marketplace add /g) ?? []).length, run ? 0 : 1);
         assert.match(r.commands, /plugin marketplace update arc/);
         assert.match(r.commands, /plugin update arc-hooks@arc --scope user/);
-        assert.doesNotMatch(r.commands, /plugin enable|curl|npm ci/);
+        assert.doesNotMatch(r.commands, /plugin enable|curl|npm install/);
         assert.match(r.stdout, /Built extension version: 0.0.9/);
         assert.match(r.stdout, /Installed plugin version: 0.1.0/);
         assert.ok(
@@ -2387,7 +2458,7 @@ exec "$ARC_TEST_REAL_NODE" "$@"
       ]) {
         const r = await f.run(['--no-hooks', 'code'], { ARC_TEST_NODE_VERSION: version, ARC_TEST_NPM_FAILURE: '99' });
         assert.equal(r.status, supported ? 99 : 2, r.stderr);
-        if (supported) assert.match(r.commands, /npm install/);
+        if (supported) assert.match(r.commands, /npm ci/);
         else {
           assert.match(r.stderr, /installation needs Node.js 22\.12\+/);
           assert.doesNotMatch(r.commands, /npm/);

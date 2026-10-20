@@ -387,11 +387,12 @@ EOF
   fi
   echo '==> Building extension'
   cd "$REPO/extension"
-  if [ "$local_source" -eq 1 ]; then
-    run_child npm install
-  else
-    run_child npm ci
-  fi
+  run_child npm ci || {
+    local dependency_status=$?
+    if [ "$ARC_INSTALL_CANCEL" -ne 0 ]; then exit "$ARC_INSTALL_CANCEL"; fi
+    echo 'error: extension dependency installation failed. Resolve the npm error, including any package.json/package-lock.json mismatch, then rerun install.sh.' >&2
+    exit "$dependency_status"
+  }
   if [ "$ARC_INSTALL_CANCEL" -ne 0 ]; then exit "$ARC_INSTALL_CANCEL"; fi
   chmod +x node_modules/.bin/* 2>/dev/null || true
   if [ "$ARC_INSTALL_CANCEL" -ne 0 ]; then exit "$ARC_INSTALL_CANCEL"; fi
