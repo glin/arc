@@ -1,5 +1,6 @@
 import { unavailableDefaults, type AppliedDefaults } from './view/model-picks';
 import { promptToken } from './domain/composer-editing';
+import { compareVersion, parseVersion } from './domain/version';
 // Adapts Codex app-server messages to the shared agent wire events.
 // JSON-RPC messages travel over stdio as one object per line without the jsonrpc field.
 // Responses have id only, notifications have method only, and server requests have both.
@@ -451,7 +452,7 @@ export class CodexWire {
     return str(obj(params.turn)?.id) ?? str(params.turnId);
   }
 
-  // Limits applied-default reads to server versions with confirmed configuration behavior.
+  // Limits applied-default reads to server versions that pass `codexDefaultsQualified`.
   private defaultsQualified = false;
 
   async initialize(): Promise<Json> {
@@ -461,7 +462,7 @@ export class CodexWire {
       // app-server rejects that field unless the client opted into experimental fields.
       capabilities: { experimentalApi: true },
     });
-    this.defaultsQualified = /\/0\.(?:159\.2|160\.0)(?:\s|$)/.test(str(result.userAgent) ?? '');
+    this.defaultsQualified = codexDefaultsQualified(str(result.userAgent));
     this.notify('initialized', {});
     return result;
   }
@@ -2228,6 +2229,42 @@ export function turnOutcome(turn: Json | null): TurnOutcome {
     turns: null,
     deniedTools: [],
   };
+}
+
+// The first Codex version whose `config/read`, `model/list`, and `configRequirements/read`
+// replies were confirmed to describe the model and effort a new thread applies.
+const CODEX_DEFAULTS_FLOOR = parseVersion('0.159.2')!;
+
+// Codex versions at or above the floor whose replies misdescribe the applied defaults.
+// `last` is the last refused version. A range without `last` refuses every later release,
+// because a change of reply meaning carries forward until native evidence shows a fix.
+export interface CodexVersionRange {
+  first: string;
+  last?: string;
+}
+
+// Each entry names the evidence that refuses its range.
+export const CODEX_DEFAULTS_REFUSED: readonly CodexVersionRange[] = [];
+
+// Reads the version from the first `product/version` token of the server user agent.
+// Codex names the product after the client, so the product name is not checked. A version
+// below the floor, inside a refused range, or not parseable leaves defaults unavailable.
+export function codexDefaultsQualified(
+  userAgent: string | null | undefined,
+  refused: readonly CodexVersionRange[] = CODEX_DEFAULTS_REFUSED,
+): boolean {
+  const token = /^[^\s/]+\/(\S+)/.exec(userAgent?.trim() ?? '');
+  const version = token ? parseVersion(token[1]) : null;
+  if (!version || compareVersion(version, CODEX_DEFAULTS_FLOOR) < 0) return false;
+  return !refused.some((range) => {
+    const first = parseVersion(range.first);
+    const last = range.last === undefined ? null : parseVersion(range.last);
+    // A range is unreadable when a bound does not parse or its last version ranks below its
+    // first. An unreadable range refuses, so a mistyped entry cannot admit a refused version.
+    if (!first || (range.last !== undefined && !last)) return true;
+    if (last && compareVersion(last, first) < 0) return true;
+    return compareVersion(version, first) >= 0 && (!last || compareVersion(version, last) <= 0);
+  });
 }
 
 export interface CodexDefaultsSnapshot {

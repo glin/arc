@@ -7,8 +7,10 @@ import type { Launch } from './composerview';
 import { ARC_IDENTITY } from './identity';
 import { BundledTools, resolveToolRuntime } from './bundledtools';
 import { acquireToolLock, admitToolPath, canonicalToolPath, retainedToolOwnership } from './toolownership';
+import { compareVersion, parseVersion } from './domain/version';
 
 const PLUGIN = 'arc-hooks@arc';
+const CLAUDE_SNAPSHOT_FLOOR = parseVersion('2.1.268')!;
 export const PLUGIN_OUTPUT_BYTES = 64 * 1024;
 export const PLUGIN_READ_MS = 15_000;
 export const PLUGIN_WRITE_MS = 120_000;
@@ -475,8 +477,9 @@ export class ClaudePluginSetup {
       }
       if (state.state !== 'missing' && !updating) throw new Error(state.message);
       const version = await this.command(target, ['--version'], signal);
-      const match = /^(\d+)\.(\d+)\.(\d+)(?:\s+\(Claude Code\))?\s*$/.exec(version.stdout.trim());
-      if (!match || compareVersion(match.slice(1).map(Number), [2, 1, 268]) < 0)
+      const match = /^(\d+\.\d+\.\d+)(?:\s+\(Claude Code\))?\s*$/.exec(version.stdout.trim());
+      const reported = match ? parseVersion(match[1]) : null;
+      if (!reported || compareVersion(reported, CLAUDE_SNAPSHOT_FLOOR) < 0)
         throw new Error('Claude snapshot setup needs Claude Code 2.1.268 or later. Upgrade Claude, then retry.');
       await this.node(target, signal);
       await this.marketplace(target, signal);
@@ -543,11 +546,6 @@ export class ClaudePluginSetup {
       if (!retain) lock.release();
     }
   }
-}
-
-function compareVersion(left: number[], right: number[]): number {
-  for (let i = 0; i < 3; i++) if (left[i] !== right[i]) return left[i] - right[i];
-  return 0;
 }
 
 export function acquirePluginLock(home: string): { file: string; release(): void } {

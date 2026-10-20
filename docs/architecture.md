@@ -143,7 +143,7 @@ The portable review runner in `evals/agent-review/run.mjs` reads tracked case fi
 | Hosted launch restrictions | `${ARC_HOME:-~/.arc}/launch-policies` | Immutable restrictions shared across windows, indexed by hashed session identity, plus one exclusive pending restricted clear or Codex fork |
 | Bounded usage history | `~/.arc/usage/bounded-v1/` | Admitted Claude and Codex account limit readings in thirty fixed UTC-day slots |
 | Legacy usage history | `~/.arc/usage/readings.jsonl` | Preserved experimental readings, outside the bounded store's quota |
-| Applied CLI defaults | Prompt-free Claude `get_settings` and Codex `config/read`, `model/list`, and `configRequirements/read` | Applied model and effort for the launch folder and committed model. Codex 0.159.2 and 0.160.0 support these reads. Other versions report unavailable defaults. The host rejects obsolete configuration replies |
+| Applied CLI defaults | Prompt-free Claude `get_settings` and Codex `config/read`, `model/list`, and `configRequirements/read` | Applied model and effort for the launch folder and committed model. Arc reads Codex defaults from Codex 0.159.2 and later, outside the refused version ranges in `codexwire.ts`. The version comes from the first `product/version` token of the server user agent. A missing or unreadable version and a malformed configuration or policy reply report unavailable defaults. The host rejects obsolete configuration replies |
 | Saved model readings (`arc.savedDefaults.v1:`, `arc.savedModelCatalog.v1:`) | VS Code global state | The last applied defaults answer for each agent, folder, and committed model value, one key per reading, keeping the 64 newest. Each agent's last model catalog with the CLI path that answered it. They draw the Model and Effort fields until a fresh read answers |
 | Project setups (`arc.projectSetups.v1:`) | VS Code global state, keyed by canonical project identity | Reader-local pinned setups and accepted recent setups for one repository or non-Git folder |
 | Legacy pinned setups (`arc.pinnedSetups`) | VS Code global state | Initial pins copied once into each new project entry, retaining their IDs and order |
@@ -414,6 +414,7 @@ The first column is checked against the shipped extension directory by `architec
 | `pathcompletion.ts` | Host-safe immediate directory resolution, filtering, ordering, and completion bounds | no |
 | `domain/labels.ts` | Browser-safe label identity, name ceiling, typed-name warning, label-count wording rules, and the choice of the row Tab applies | no |
 | `domain/model-identity.ts` | Model id comparison shared by transcript turns and the Prompt box: window suffix, snapshot date, Bedrock prefix, and deployment suffix | no |
+| `domain/version.ts` | Release version parsing and semantic-version ordering for the Claude snapshot setup floor and the Codex applied-defaults floor | no |
 | `domain/link-path.ts` | Browser-safe local-path versus URI-scheme classification | no |
 | `domain/file-citation.ts` | Bounded assistant-directive grammar, source masking, and native literal file destination admission | no |
 | `domain/prompt-assets.ts` | Browser-safe prompt attachment count and byte limits and the shared drag type list | no |

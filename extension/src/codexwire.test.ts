@@ -11,6 +11,7 @@ import {
   readModels,
   readAppliedDefaults,
   readDefaultConfiguration,
+  codexDefaultsQualified,
   turnOutcome,
 } from './codexwire.ts';
 import { WireEvent, Ask, RateLimit, GuardedAttempt } from './agentwire.ts';
@@ -3558,17 +3559,22 @@ test('Codex configuration overrides catalog suggestions and TUI-only policy defa
   assert.equal(privateModel.effortStatus, 'unavailable');
 });
 
-test('Codex default metadata uses only configuration and catalog reads on the qualified server', async () => {
-  for (const version of ['0.159.2', '0.160.0']) {
+test('Codex default metadata uses only configuration and catalog reads from the version floor up', async () => {
+  const qualified = ['0.159.2', '0.160.0', '0.160.00', '0.160.1', '0.163.0', '0.164.0-alpha.3', '1.0.0'];
+  for (const userAgent of [
+    ...qualified.map((version) => `codex_cli_rs/${version} (Windows 10.0; x86_64)`),
+    'arc/0.163.0 (Windows 10.0; x86_64) vscode/1.105.1 (arc; 1.2.3)',
+  ]) {
     const h = harness();
     const opening = h.wire.initialize();
-    reply(h, { userAgent: `codex_cli_rs/${version} (Windows 10.0; x86_64)` });
+    reply(h, { userAgent });
     await opening;
     const reading = h.wire.appliedDefaults('C:/project', '');
     const requests = h.parsed().filter((message) => message.id > 1);
     assert.deepEqual(
       requests.map((message) => message.method),
       ['config/read', 'model/list', 'configRequirements/read'],
+      userAgent,
     );
     assert.deepEqual(requests[0].params, { includeLayers: false, cwd: 'C:/project' });
     for (const request of requests) {
@@ -3590,28 +3596,61 @@ test('Codex default metadata uses only configuration and catalog reads on the qu
             : { requirements: null };
       h.wire.receive(JSON.stringify({ id: request.id, result }));
     }
-    assert.equal((await reading).effort, 'high');
+    assert.equal((await reading).effort, 'high', userAgent);
     assert.equal(
       h.parsed().some((message) => message.method === 'thread/start' || message.method === 'turn/start'),
       false,
     );
   }
-  for (const version of ['0.160.1', '0.160.0-dev', '0.160.00', '0.159.20']) {
+  for (const userAgent of [
+    ...['0.159.1', '0.158.9', '0.159.2-alpha.1', '0.0.0', 'garbage'].map((version) => `codex_cli_rs/${version}`),
+    'arc/0.158.9 (Windows 10.0; x86_64) vscode/1.105.1',
+  ]) {
     const other = harness();
     const opening = other.wire.initialize();
-    reply(other, { userAgent: `codex_cli_rs/${version}` });
+    reply(other, { userAgent });
     await opening;
-    assert.equal((await other.wire.appliedDefaults('C:/project', '')).status, 'unavailable');
-    assert.equal(await other.wire.appliedDefaultsSnapshot('C:/project'), null);
+    const reading = other.wire.appliedDefaults('C:/project', '');
+    const snapshot = other.wire.appliedDefaultsSnapshot('C:/project');
     assert.deepEqual(
       other.parsed().filter((message) => message.id > 1),
       [],
+      userAgent,
     );
+    assert.equal((await reading).status, 'unavailable', userAgent);
+    assert.equal(await snapshot, null, userAgent);
   }
   const unknown = harness();
   assert.equal((await unknown.wire.appliedDefaults('C:/project', '')).status, 'unavailable');
   assert.equal(await unknown.wire.appliedDefaultsSnapshot('C:/project'), null);
   assert.equal(unknown.parsed().length, 0);
+  const missing = harness();
+  const opening = missing.wire.initialize();
+  reply(missing, {});
+  await opening;
+  assert.equal(await missing.wire.appliedDefaultsSnapshot('C:/project'), null);
+});
+
+test('Codex refused version ranges leave defaults unavailable inside them', () => {
+  const open = [{ first: '0.163.0' }];
+  assert.equal(codexDefaultsQualified('codex_cli_rs/0.162.9', open), true);
+  assert.equal(codexDefaultsQualified('codex_cli_rs/0.163.0', open), false);
+  assert.equal(codexDefaultsQualified('codex_cli_rs/0.170.2 (Windows 10.0; x86_64)', open), false);
+  const closed = [{ first: '0.161.0', last: '0.162.1' }];
+  assert.equal(codexDefaultsQualified('codex_cli_rs/0.160.9', closed), true);
+  assert.equal(codexDefaultsQualified('codex_cli_rs/0.161.0', closed), false);
+  assert.equal(codexDefaultsQualified('codex_cli_rs/0.162.1', closed), false);
+  assert.equal(codexDefaultsQualified('codex_cli_rs/0.162.2', closed), true);
+  assert.equal(codexDefaultsQualified('codex_cli_rs/0.163.0'), true);
+});
+
+test('Codex refused version ranges that do not read refuse every qualified version', () => {
+  assert.equal(codexDefaultsQualified('codex_cli_rs/0.163.0', [{ first: '0.163' }]), false);
+  assert.equal(codexDefaultsQualified('codex_cli_rs/0.160.0', [{ first: '0.161.0', last: '0.162' }]), false);
+  assert.equal(codexDefaultsQualified('arc/0.163.0', [{ first: '0.163.0', last: '0.162.1' }]), false);
+  assert.equal(codexDefaultsQualified('arc/0.160.0', [{ first: '0.163.0', last: '0.162.1' }]), false);
+  assert.equal(codexDefaultsQualified('arc/0.163.0', [{ first: '0.163.0', last: '0.163.0' }]), false);
+  assert.equal(codexDefaultsQualified('arc/0.163.1', [{ first: '0.163.0', last: '0.163.0' }]), true);
 });
 
 test('Codex default snapshots retain only original model and effort configuration', async () => {
