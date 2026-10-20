@@ -2222,9 +2222,10 @@ test.each([
   },
 );
 test('recovery retries unavailable identity and keeps same-lifetime launcher provenance through command changes', async () => {
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
   const { receipts, launch, launcher } = recoveryFixture();
   let lookups = 0;
-  await superviseStandalone(
+  const pending = superviseStandalone(
     receipts,
     launch.launchId,
     true,
@@ -2243,6 +2244,8 @@ test('recovery retries unavailable identity and keeps same-lifetime launcher pro
       },
     },
   );
+  await vi.runAllTimersAsync();
+  await pending;
   assert.equal(lookups, 3);
   assert.equal(receipts.observation(launch.launchId)?.monitor, 'finished');
   assert.equal(receipts.observation(launch.launchId)?.worker, null);
@@ -2470,17 +2473,20 @@ test.each(['unavailable', 'absent'] as const)(
         launcher: { ...launcher, pid: 2147483647 },
       });
     const log = receipts.artifact(launch.launchId, 'stdout.log');
-    fs.writeFileSync(
-      log,
-      Array.from({ length: 40 }, () => JSON.stringify({ type: 'progress', text: 'x'.repeat(180) }) + '\n').join('') +
-        outputFrames(),
-    );
-    fs.writeFileSync(receipts.artifact(launch.launchId, 'native.md'), 'Report');
+    const output =
+      Array.from({ length: 4 }, () => JSON.stringify({ type: 'progress', text: 'x'.repeat(180) }) + '\n').join('') +
+      outputFrames();
     const bounds = smallBounds();
+    assert.ok(Buffer.byteLength(output) > 2 * bounds.workBytes);
+    fs.writeFileSync(log, output);
+    fs.writeFileSync(receipts.artifact(launch.launchId, 'native.md'), 'Report');
     let now = 0;
     const runtime = {
       now: () => now,
-      identity: async () => null,
+      identity: async () => {
+        now += launch.standalone!.deadlineMs;
+        return null;
+      },
       yield: async () => {
         now += 8_640_000;
       },
@@ -2489,15 +2495,21 @@ test.each(['unavailable', 'absent'] as const)(
     assert.equal(receipts.observation(launch.launchId)?.monitor, 'timed-out');
     assert.equal(receipts.observation(launch.launchId)?.exitCode, null);
     assert.equal(receipts.latest(launch.launchId), null);
-    let position = (receipts.scan(launch.launchId) as any).offset;
+    const first = receipts.scan(launch.launchId) as any;
+    let position = first.offset;
     assert.ok(position > 0 && position <= 170);
+    assert.ok(position < Buffer.byteLength(output.slice(0, output.indexOf('\n') + 1)));
+    assert.equal(Buffer.from(first.pending.data, 'base64').length, position);
+    let observations = 1;
     for (let attempt = 0; attempt < 100 && !receipts.latest(launch.launchId)?.report; attempt++) {
       await superviseStandalone(receipts, launch.launchId, true, bounds, runtime);
+      observations++;
       const saved = receipts.scan(launch.launchId) as any;
       assert.ok(saved.offset > position);
       assert.ok(saved.offset - position <= bounds.workBytes);
       position = saved.offset;
     }
+    assert.ok(observations > 2);
     const event = receipts.latest(launch.launchId)!;
     assert.equal((receipts.result(launch.launchId, event.eventId) as any).text, 'Report');
     const claim = receipts.claim(launch.launchId, event.eventId, 'a'.repeat(24), 'fixture') as any;

@@ -7,7 +7,7 @@
   "cli/test/run.test.ts": {
     "reason": "Standalone workers must retain real output, exit, cancellation, receipt ownership, and recovery across process boundaries.",
     "cases": 87,
-    "matricesSha256": "907100725d285320a1f178da19c1e1497fcefe4d786f6e7bb4938acb17839840"
+    "matricesSha256": "05807c06315134a7724d1a893d58e9566b6cc67a630a48f7bacf64d7c054d673"
   },
   "cli/test/smoke.bundled-a.test.mjs": {
     "reason": "Compiled CLI commands must reach session reads, comments, and saved defaults through an authenticated window channel.",
@@ -271,8 +271,8 @@
   },
   "scripts/agent-review-evals.test.js": {
     "reason": "Review commands must validate real repositories, exports, sandbox receipts, and executable status boundaries.",
-    "cases": 78,
-    "matricesSha256": "a413a286fe6286df2aab2c5a09f43deb4f097418de6f76dc96a2421f6a55bc7b"
+    "cases": 79,
+    "matricesSha256": "8feb27e65df679eb27b71d2c1b9b7bcb276ea3858697da2b254be9a7757146c9"
   },
   "scripts/check-web-demo-site.test.js": {
     "reason": "The site checker executable must reject invalid generated demo output.",
@@ -281,8 +281,8 @@
   },
   "scripts/editor-cli.test.js": {
     "reason": "Editor launch and installer shell commands must preserve quoting, cancellation, native entry selection, manifest and lockfile bytes, and component outcomes.",
-    "cases": 55,
-    "matricesSha256": "90bfb5bb416f6036635fb47013fda362fa0120d4216c2fda998ddaa3b6206d68"
+    "cases": 58,
+    "matricesSha256": "272a32ef37040a201f835c5d434e5e92b8ea93133aa2849e9b29cc4e51dd2205"
   },
   "scripts/extension-test-runner.test.js": {
     "reason": "Real runner commands must classify files, reject invalid selection, and preserve browser readiness status.",
@@ -312,7 +312,7 @@
   "scripts/test-lanes.test.js": {
     "reason": "Linked command entry points must execute and retain process status. Direct checks guard category and admission drift.",
     "cases": 14,
-    "matricesSha256": "9dc2d269ae9ab46c98ec5f7bd118774b94f86f1d111dec984435c0a3a1f8f29a"
+    "matricesSha256": "66d2b7def8efac9fe6104e7cdc896f706f574821cdd41db63a6993d1f4aedce7"
   },
   "scripts/tool-scope.test.js": {
     "reason": "Real tool commands must respect repository scope and reject external configuration or stale packaged content.",

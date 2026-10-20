@@ -108,6 +108,7 @@ test('command entry points run through a linked checkout', { tags: ['subprocess'
       'scripts/test-integration.mjs',
       'extension/test.mjs',
       'scripts/isolated-editor.mjs',
+      'evals/agent-review/cli.mjs',
     ]) {
       write(file, fs.readFileSync(path.join(repositoryRoot, file), 'utf8'));
     }
@@ -125,6 +126,40 @@ test('command entry points run through a linked checkout', { tags: ['subprocess'
       'scripts/typecheck-parallel.js',
       'module.exports = {runChecks: async ([lane]) => { console.log(lane.label); return [lane.label]; }};',
     );
+    write(
+      'catalog/fixture-case.json',
+      JSON.stringify({
+        schema: 'arc-review-case-v1',
+        id: 'fixture-case',
+        source_kind: 'accepted_review',
+        family: 'fixture-family',
+        case_revision: 1,
+        key_revision: 1,
+        source: { base: 'a'.repeat(40), candidate: 'b'.repeat(40), correction: 'c'.repeat(40) },
+        key_state: 'historical-partial',
+        historical_context: { original_prompt: null, plan: null },
+        fixture_paths: ['fixture.txt'],
+        keys: [
+          {
+            id: 'defect-a',
+            severity: 'high',
+            summary: 'Candidate contains a visible defect.',
+            paths: ['fixture.txt'],
+            evidence: {
+              scope: 'Visible fixture defect',
+              reach: 'candidate',
+              mode: 'review',
+              disposition: 'accepted',
+              source: 'fixture correction commit',
+              sha256: 'b'.repeat(64),
+              source_attempt_identity: 'unresolved',
+              exclude_attempt_ids: [],
+            },
+          },
+        ],
+      }),
+    );
+    write('cache/evidence.json', '{}');
     fs.symlinkSync(physical, linked, 'junction');
     for (const { file, args, status, output } of [
       { file: 'scripts/test-subprocess.mjs', args: [], status: 7, output: /subprocess entry reached/ },
@@ -146,6 +181,22 @@ test('command entry points run through a linked checkout', { tags: ['subprocess'
       assert.equal(imported.status, 0, imported.stderr);
       assert.equal(imported.stdout.trim(), 'import only');
     }
+    const review = spawnSync(
+      process.execPath,
+      [
+        path.join(linked, 'evals/agent-review/cli.mjs'),
+        'validate',
+        '--cache',
+        path.join(physical, 'cache'),
+        '--catalog',
+        path.join(physical, 'catalog'),
+      ],
+      { encoding: 'utf8' },
+    );
+    assert.ifError(review.error);
+    assert.equal(review.status, 1, 'Linked review validation must reject the invalid cache.');
+    assert.equal(review.stdout, '');
+    assert.equal(review.stderr, 'cache schema\n');
   } finally {
     if (fs.existsSync(linked)) fs.unlinkSync(linked);
     fs.rmSync(root, { recursive: true, force: true });

@@ -1,4 +1,3 @@
-// @module-tag subprocess
 const assert = require('node:assert/strict');
 const { execFileSync, spawnSync } = require('node:child_process');
 const { createHash } = require('node:crypto');
@@ -146,7 +145,353 @@ function frozenContinuationFixture(folder) {
   return { folder, cells, expected };
 }
 
-describe('frozen continuation', () => {
+function reviewFixtureCase(commits = ['a'.repeat(40), 'b'.repeat(40), 'c'.repeat(40)]) {
+  return {
+    schema: 'arc-review-case-v1',
+    id: 'fixture-case',
+    source_kind: 'accepted_review',
+    family: 'fixture-family',
+    case_revision: 1,
+    key_revision: 1,
+    source: { base: commits[0], candidate: commits[1], correction: commits[2] },
+    key_state: 'historical-partial',
+    historical_context: { original_prompt: null, plan: null },
+    fixture_paths: ['fixture.txt'],
+    keys: [
+      {
+        id: 'defect-a',
+        severity: 'high',
+        summary: 'Candidate contains a visible defect.',
+        paths: ['fixture.txt'],
+        evidence: fixtureEvidence(),
+      },
+      {
+        id: 'defect-b',
+        severity: 'medium',
+        summary: 'Candidate contains another visible defect.',
+        paths: ['fixture.txt'],
+        evidence: fixtureEvidence(),
+      },
+    ],
+  };
+}
+
+function reviewRegistration(fixtureCase, manifest, prepared, cache, overrides = {}) {
+  return {
+    schema: 'arc-review-registration-v1',
+    suite_revision: 'fixture-1',
+    seed: 'a'.repeat(64),
+    tasks: [
+      {
+        case_id: 'fixture-case',
+        case_revision: 1,
+        key_revision: 1,
+        case_hash: digest(json(fixtureCase)),
+        prompt_hash: manifest.prompt_hash,
+        workspace_hash: manifest.workspace_hash,
+        diff_hash: manifest.diff_hash,
+        preparation_path: prepared,
+        cache_path: cache,
+        source_kind: 'accepted_review',
+        family: 'fixture-family',
+        key_state: 'historical-partial',
+        repeats: 2,
+        temporal_blocks: 1,
+        budget_usd: 1,
+        max_attempts: 2,
+        ...overrides,
+      },
+    ],
+    arms: [
+      {
+        id: 'arm-a',
+        model_id: 'model-a',
+        requested_effort: 'high',
+        harness: 'harness-a',
+        observed_effort_required: true,
+      },
+      {
+        id: 'arm-b',
+        model_id: 'model-b',
+        requested_effort: 'high',
+        harness: 'harness-a',
+        observed_effort_required: true,
+      },
+    ],
+  };
+}
+
+function attempt(number = 1, changes = {}) {
+  return {
+    attempt_id: 'attempt-' + number,
+    attempt_number: number,
+    status: 'completed',
+    reason: null,
+    observed_effort: 'high',
+    cost_usd: 0.5,
+    wall_ms: 100,
+    requests: 1,
+    tokens: 10,
+    tool_calls: 0,
+    matched_key_ids: ['defect-a'],
+    novel_findings: [],
+    false_claims: 0,
+    wrong_verdict: false,
+    verdict: null,
+    ...changes,
+  };
+}
+
+describe('frozen review decisions', () => {
+  let decisions;
+  const fixtureCase = reviewFixtureCase();
+  let scoring;
+  beforeAll(async () => {
+    decisions = await import('../evals/agent-review/cli.mjs');
+    decisions.caseCheck(fixtureCase);
+    scoring = matrixFile();
+    assert.equal(scoring.result.status, 0, scoring.result.error);
+  });
+
+  function registration(overrides = {}) {
+    const registered = reviewRegistration(
+      fixtureCase,
+      {
+        prompt_hash: 'd'.repeat(64),
+        workspace_hash: 'e'.repeat(64),
+        diff_hash: 'f'.repeat(64),
+      },
+      undefined,
+      undefined,
+      overrides,
+    );
+    for (const task of registered.tasks)
+      task.prepared = Object.fromEntries([
+        ...['case_id', 'case_revision', 'key_revision', 'case_hash', 'prompt_hash', 'workspace_hash', 'diff_hash'].map(
+          (field) => [field, task[field]],
+        ),
+        ['manifest_hash', '1'.repeat(64)],
+      ]);
+    return registered;
+  }
+
+  function decisionResult(invoke) {
+    try {
+      const value = invoke();
+      return { status: 0, error: '', value };
+    } catch (error) {
+      return { status: 1, error: error.message, value: null };
+    }
+  }
+
+  function matrixFile(registered = registration()) {
+    const result = decisionResult(() => decisions.matrix(registered, false, [fixtureCase]));
+    return { result, matrix: result.value };
+  }
+
+  function summarizeFixture(changes = (cells) => cells, allowPartial = false) {
+    const { matrix } = scoring;
+    const cells = changes(matrix.cells.map((cell) => ({ ...cell, attempts: [attempt()] })));
+    for (const cell of cells)
+      for (const value of cell.attempts) value.attempt_id = 'attempt-' + cell.cell_id + '-' + value.attempt_number;
+    const result = decisionResult(() =>
+      decisions.summarize(matrix, { schema: 'arc-review-cells-v1', cells }, allowPartial, [fixtureCase]),
+    );
+    return { result, summary: result.value };
+  }
+
+  test('matrix rejects zero budgets and unbounded counts', () => {
+    assert.match(matrixFile(registration({ budget_usd: 0 })).result.error, /budget or attempts/);
+    assert.match(matrixFile(registration({ repeats: 1001 })).result.error, /repeat or block count/);
+  });
+
+  test('missing whole tasks cannot contribute a score', () => {
+    assert.match(summarizeFixture(() => []).result.error, /missing cells/);
+  });
+
+  test('changed conditions cannot contribute a score', () => {
+    assert.match(
+      summarizeFixture((cells) => {
+        cells[0].prompt_hash = '0'.repeat(64);
+        return cells;
+      }).result.error,
+      /changed condition/,
+    );
+  });
+
+  test('duplicate cells cannot contribute a score', () => {
+    assert.match(summarizeFixture((cells) => [...cells, cells[0]]).result.error, /duplicate cell/);
+  });
+
+  test('missing cells suppress the partial comparison', () => {
+    const partial = summarizeFixture((cells) => cells.slice(0, 1), true).summary;
+    assert.equal(partial.complete, false);
+    assert.equal(partial.comparison_suppressed, true);
+    assert.equal(partial.missing_cell_ids.length, 3);
+  });
+
+  test('void replacement is charged and a model failure cannot be retried', () => {
+    const valid = summarizeFixture((cells) => {
+      cells[0].attempts = [
+        attempt(1, { status: 'void', reason: 'infrastructure', cost_usd: 0.2, matched_key_ids: [] }),
+        attempt(2, { cost_usd: 0.3 }),
+      ];
+      return cells;
+    }).summary;
+    assert.equal(valid.attempts.void, 1);
+    assert.equal(valid.cost_usd, 2);
+    assert.match(
+      summarizeFixture((cells) => {
+        cells[0].attempts = [attempt(1, { status: 'model-failure' }), attempt(2)];
+        return cells;
+      }).result.error,
+      /retry after terminal/,
+    );
+  });
+
+  test('recall stays bounded and unknown cost stays distinct from zero', () => {
+    assert.match(
+      summarizeFixture((cells) => {
+        cells[0].attempts[0].matched_key_ids = ['defect-a', 'defect-a'];
+        return cells;
+      }).result.error,
+      /duplicate matched key/,
+    );
+    assert.match(
+      summarizeFixture((cells) => {
+        cells[0].attempts[0].matched_key_ids = ['other-defect'];
+        return cells;
+      }).result.error,
+      /unknown or nonserious key/,
+    );
+    const report = summarizeFixture((cells) => {
+      cells[0].attempts[0].cost_usd = null;
+      cells[1].attempts[0].cost_usd = 0;
+      return cells;
+    }).summary;
+    assert.equal(report.results[0].known_key_recall, 0.5);
+    assert.equal(report.cost_usd, null);
+    assert.equal(report.unknown_cost_attempts, 1);
+    assert.equal(report.known_cost_usd, 1);
+  });
+
+  test('a serious novel finding makes every arm exploratory', () => {
+    const report = summarizeFixture((cells) => {
+      cells[0].attempts[0].novel_findings = [{ id: 'novel-a', serious: true, true_finding: true }];
+      return cells;
+    }).summary;
+    assert.equal(report.results.length, 4);
+    assert.ok(report.results.every((row) => row.key_incomplete && row.comparison === 'exploratory'));
+  });
+
+  test('malformed catalogs and false controls fail before matrix and summary: invalid arm', () => {
+    const invalidArm = registration();
+    invalidArm.arms[0].model_id = {};
+    assert.match(matrixFile(invalidArm).result.error, /arm fields/);
+  });
+
+  test('malformed catalogs and false controls fail before matrix and summary: ambiguous effort', () => {
+    const ambiguous = registration();
+    ambiguous.arms[0].unverified_harness = true;
+    assert.match(matrixFile(ambiguous).result.error, /effort readback condition/);
+  });
+
+  test('all-void quality stays missing while terminal failures keep partial credit in pairs', () => {
+    const report = summarizeFixture((cells) => {
+      cells[0].attempts = [
+        attempt(1, {
+          status: 'void',
+          reason: 'infrastructure',
+          matched_key_ids: [],
+          cost_usd: 0.2,
+          requests: null,
+        }),
+      ];
+      cells[2].attempts = [attempt(1, { status: 'model-failure', matched_key_ids: ['defect-a'] })];
+      cells[3].attempts = [attempt(1, { status: 'budget-exhausted', matched_key_ids: [] })];
+      return cells;
+    }).summary;
+    assert.equal(report.results[0].known_key_recall, null);
+    assert.equal(report.results[1].known_key_recall, 0.5);
+    assert.equal(report.results[2].known_key_recall, 0.5);
+    assert.equal(report.results[3].known_key_recall, 0);
+    assert.equal(report.paired_family_means.accepted_review['fixture-family']['arm-a:arm-b'].valid_pairs, 1);
+    assert.equal(report.paired_family_means.accepted_review['fixture-family']['arm-a:arm-b'].missing_valid_pairs, 1);
+    assert.equal(report.usage.requests, null);
+    assert.equal(report.known_usage.requests, 3);
+    assert.equal(report.unknown_usage_attempts.requests, 1);
+    assert.equal(report.attempts['model-failure'], 1);
+    assert.equal(report.attempts['budget-exhausted'], 1);
+    assert.equal(report.attempts.void, 1);
+  });
+
+  test('missing whole arms and replicate blocks remain incomplete', () => {
+    for (const select of [(cell) => cell.arm_id === 'arm-a', (cell) => cell.replicate === 1]) {
+      const report = summarizeFixture((cells) => cells.filter(select), true).summary;
+      assert.equal(report.complete, false);
+      assert.equal(report.comparison_suppressed, true);
+      assert.equal(report.missing_cell_ids.length, 2);
+      assert.deepEqual(report.pair_contrasts, []);
+    }
+  });
+
+  test('identifiers and hashes require primitive strings', () => {
+    for (const value of [['arm-a'], ['a'.repeat(64)]]) {
+      const registered = registration();
+      if (value[0] === 'arm-a') registered.arms[0].id = value;
+      else registered.seed = value;
+      assert.notEqual(matrixFile(registered).result.status, 0);
+    }
+    for (const change of [
+      (item) => {
+        item.id = ['fixture-case'];
+      },
+      (item) => {
+        item.family = ['fixture-family'];
+      },
+      (item) => {
+        item.source.candidate = [fixtureCase.source.candidate];
+      },
+      (item) => {
+        item.keys[0].id = ['defect-a'];
+      },
+      (item) => {
+        item.keys[0].evidence.sha256 = ['b'.repeat(64)];
+      },
+      (item) => {
+        item.keys[0].evidence.exclude_attempt_ids = [['source-attempt']];
+      },
+    ]) {
+      const item = structuredClone(fixtureCase);
+      change(item);
+      assert.notEqual(decisionResult(() => decisions.caseCheck(item)).status, 0);
+    }
+    const { matrix } = matrixFile();
+    for (const changes of [
+      { attempt_id: ['attempt-1'] },
+      { matched_key_ids: [['defect-a']] },
+      { novel_findings: [{ id: ['novel'], serious: true, true_finding: true }] },
+    ]) {
+      const cell = { ...matrix.cells[0], attempts: [attempt(1, changes)] };
+      assert.notEqual(
+        decisionResult(() =>
+          decisions.summarize(
+            matrix,
+            {
+              schema: 'arc-review-cells-v1',
+              cells: [cell],
+            },
+            true,
+            [fixtureCase],
+          ),
+        ).status,
+        0,
+      );
+    }
+  });
+});
+
+describe('frozen continuation', { tags: ['subprocess'] }, () => {
   let continuation;
   beforeAll(async () => {
     continuation = await import('../evals/agent-review/portable/resume.mjs');
@@ -891,7 +1236,7 @@ function oldRunId(folder) {
   return JSON.parse(fs.readFileSync(path.join(folder, 'registration.json'))).run_id;
 }
 
-describe('portable review runner', () => {
+describe('portable review runner', { tags: ['subprocess'] }, () => {
   test('partial production cohort qualifies without Git after archive relocation', HEAVY, async () => {
     const source = fs.mkdtempSync(path.join(os.tmpdir(), 'arc-review-corpus-source-'));
     const relocated = source + '-moved';
@@ -1954,7 +2299,7 @@ const runPortable = (...args) => {
 };
 const git = (cwd, ...args) => execFileSync('git', ['-C', cwd, ...args], { encoding: 'utf8' }).trim();
 
-describe('review repository fixture', () => {
+describe('review repository fixture', { tags: ['subprocess'] }, () => {
   let source;
   let cache;
   let catalog;
@@ -2007,81 +2352,13 @@ describe('review repository fixture', () => {
       '# branch.head fixture',
     ]);
     assert.equal(fs.readFileSync(path.join(source, 'fixture.txt'), 'utf8'), 'corrected\n');
-    fixtureCase = {
-      schema: 'arc-review-case-v1',
-      id: 'fixture-case',
-      source_kind: 'accepted_review',
-      family: 'fixture-family',
-      case_revision: 1,
-      key_revision: 1,
-      source: { base: commits[0], candidate: commits[1], correction: commits[2] },
-      key_state: 'historical-partial',
-      historical_context: { original_prompt: null, plan: null },
-      fixture_paths: ['fixture.txt'],
-      keys: [
-        {
-          id: 'defect-a',
-          severity: 'high',
-          summary: 'Candidate contains a visible defect.',
-          paths: ['fixture.txt'],
-          evidence: fixtureEvidence(),
-        },
-        {
-          id: 'defect-b',
-          severity: 'medium',
-          summary: 'Candidate contains another visible defect.',
-          paths: ['fixture.txt'],
-          evidence: fixtureEvidence(),
-        },
-      ],
-    };
+    fixtureCase = reviewFixtureCase(commits);
     fs.writeFileSync(path.join(catalog, 'fixture-case.json'), json(fixtureCase));
   });
 
   function registration(overrides = {}) {
     const manifest = JSON.parse(fs.readFileSync(path.join(prepared, 'manifest.json'), 'utf8'));
-    return {
-      schema: 'arc-review-registration-v1',
-      suite_revision: 'fixture-1',
-      seed: 'a'.repeat(64),
-      tasks: [
-        {
-          case_id: 'fixture-case',
-          case_revision: 1,
-          key_revision: 1,
-          case_hash: digest(json(fixtureCase)),
-          prompt_hash: manifest.prompt_hash,
-          workspace_hash: manifest.workspace_hash,
-          diff_hash: manifest.diff_hash,
-          preparation_path: prepared,
-          cache_path: cache,
-          source_kind: 'accepted_review',
-          family: 'fixture-family',
-          key_state: 'historical-partial',
-          repeats: 2,
-          temporal_blocks: 1,
-          budget_usd: 1,
-          max_attempts: 2,
-          ...overrides,
-        },
-      ],
-      arms: [
-        {
-          id: 'arm-a',
-          model_id: 'model-a',
-          requested_effort: 'high',
-          harness: 'harness-a',
-          observed_effort_required: true,
-        },
-        {
-          id: 'arm-b',
-          model_id: 'model-b',
-          requested_effort: 'high',
-          harness: 'harness-a',
-          observed_effort_required: true,
-        },
-      ],
-    };
+    return reviewRegistration(fixtureCase, manifest, prepared, cache, overrides);
   }
 
   function matrixFileWithCatalog(registrationValue, folder) {
@@ -2106,47 +2383,6 @@ describe('review repository fixture', () => {
     assert.match(base, /^[a-f0-9]{40}$/);
     assert.match(blob, /^[a-f0-9]{40}$/);
     return { repo, base, blob };
-  }
-
-  function attempt(number = 1, changes = {}) {
-    return {
-      attempt_id: 'attempt-' + number,
-      attempt_number: number,
-      status: 'completed',
-      reason: null,
-      observed_effort: 'high',
-      cost_usd: 0.5,
-      wall_ms: 100,
-      requests: 1,
-      tokens: 10,
-      tool_calls: 0,
-      matched_key_ids: ['defect-a'],
-      novel_findings: [],
-      false_claims: 0,
-      wrong_verdict: false,
-      verdict: null,
-      ...changes,
-    };
-  }
-
-  function summarizeFixture(changes = (cells) => cells, allowPartial = false) {
-    const { matrix, output } = scoring;
-    const cells = changes(matrix.cells.map((cell) => ({ ...cell, attempts: [attempt()] })));
-    for (const cell of cells)
-      for (const value of cell.attempts) value.attempt_id = 'attempt-' + cell.cell_id + '-' + value.attempt_number;
-    const input = path.join(temp, 'cells-' + Math.random().toString(36).slice(2) + '.json');
-    fs.writeFileSync(input, json({ schema: 'arc-review-cells-v1', cells }));
-    const result = run(
-      'summarize',
-      '--matrix',
-      output,
-      '--cells',
-      input,
-      '--catalog',
-      catalog,
-      ...(allowPartial ? ['--allow-partial'] : []),
-    );
-    return { result, summary: result.status === 0 ? JSON.parse(result.output) : null };
   }
 
   describe('captured review fixture', () => {
@@ -2198,87 +2434,6 @@ describe('review repository fixture', () => {
           catalog,
         );
         assert.equal(second.status, 0, second.error);
-      });
-
-      test('matrix rejects zero budgets and unbounded counts', () => {
-        assert.match(matrixFile(registration({ budget_usd: 0 })).result.error, /budget or attempts/);
-        assert.match(matrixFile(registration({ repeats: 1001 })).result.error, /repeat or block count/);
-      });
-
-      test('missing whole tasks cannot contribute a score', () => {
-        assert.match(summarizeFixture(() => []).result.error, /missing cells/);
-      });
-      test('changed conditions cannot contribute a score', () => {
-        assert.match(
-          summarizeFixture((cells) => {
-            cells[0].prompt_hash = '0'.repeat(64);
-            return cells;
-          }).result.error,
-          /changed condition/,
-        );
-      });
-      test('duplicate cells cannot contribute a score', () => {
-        assert.match(summarizeFixture((cells) => [...cells, cells[0]]).result.error, /duplicate cell/);
-      });
-      test('missing cells suppress the partial comparison', () => {
-        const partial = summarizeFixture((cells) => cells.slice(0, 1), true).summary;
-        assert.equal(partial.complete, false);
-        assert.equal(partial.comparison_suppressed, true);
-        assert.equal(partial.missing_cell_ids.length, 3);
-      });
-
-      test('void replacement is charged and a model failure cannot be retried', () => {
-        const valid = summarizeFixture((cells) => {
-          cells[0].attempts = [
-            attempt(1, { status: 'void', reason: 'infrastructure', cost_usd: 0.2, matched_key_ids: [] }),
-            attempt(2, { cost_usd: 0.3 }),
-          ];
-          return cells;
-        }).summary;
-        assert.equal(valid.attempts.void, 1);
-        assert.equal(valid.cost_usd, 2);
-        assert.match(
-          summarizeFixture((cells) => {
-            cells[0].attempts = [attempt(1, { status: 'model-failure' }), attempt(2)];
-            return cells;
-          }).result.error,
-          /retry after terminal/,
-        );
-      });
-
-      test('recall stays bounded and unknown cost stays distinct from zero', () => {
-        assert.match(
-          summarizeFixture((cells) => {
-            cells[0].attempts[0].matched_key_ids = ['defect-a', 'defect-a'];
-            return cells;
-          }).result.error,
-          /duplicate matched key/,
-        );
-        assert.match(
-          summarizeFixture((cells) => {
-            cells[0].attempts[0].matched_key_ids = ['other-defect'];
-            return cells;
-          }).result.error,
-          /unknown or nonserious key/,
-        );
-        const report = summarizeFixture((cells) => {
-          cells[0].attempts[0].cost_usd = null;
-          cells[1].attempts[0].cost_usd = 0;
-          return cells;
-        }).summary;
-        assert.equal(report.results[0].known_key_recall, 0.5);
-        assert.equal(report.cost_usd, null);
-        assert.equal(report.unknown_cost_attempts, 1);
-        assert.equal(report.known_cost_usd, 1);
-      });
-
-      test('a serious novel finding makes every arm exploratory', () => {
-        const report = summarizeFixture((cells) => {
-          cells[0].attempts[0].novel_findings = [{ id: 'novel-a', serious: true, true_finding: true }];
-          return cells;
-        }).summary;
-        assert.equal(report.results.length, 4);
-        assert.ok(report.results.every((row) => row.key_incomplete && row.comparison === 'exploratory'));
       });
 
       describe('a clean control has no recall denominator and exposes a false blocker', () => {
@@ -2517,54 +2672,7 @@ describe('review repository fixture', () => {
         assert.notEqual(matrixFile(registered).result.status, 0);
       });
 
-      test('identifiers and hashes require primitive strings', HEAVY, () => {
-        for (const value of [['arm-a'], ['a'.repeat(64)]]) {
-          const registered = registration();
-          if (value[0] === 'arm-a') registered.arms[0].id = value;
-          else registered.seed = value;
-          assert.notEqual(matrixFile(registered).result.status, 0);
-        }
-        const folder = path.join(temp, 'typed-catalog');
-        fs.mkdirSync(folder);
-        for (const change of [
-          (item) => {
-            item.id = ['fixture-case'];
-          },
-          (item) => {
-            item.family = ['fixture-family'];
-          },
-          (item) => {
-            item.source.candidate = [fixtureCase.source.candidate];
-          },
-          (item) => {
-            item.keys[0].id = ['defect-a'];
-          },
-          (item) => {
-            item.keys[0].evidence.sha256 = ['b'.repeat(64)];
-          },
-          (item) => {
-            item.keys[0].evidence.exclude_attempt_ids = [['source-attempt']];
-          },
-        ]) {
-          const item = structuredClone(fixtureCase);
-          change(item);
-          fs.writeFileSync(path.join(folder, 'fixture-case.json'), json(item));
-          assert.notEqual(run('validate', '--cache', cache, '--catalog', folder).status, 0);
-        }
-        const { matrix, output } = matrixFile();
-        const cellFile = path.join(temp, 'typed-cells.json');
-        for (const changes of [
-          { attempt_id: ['attempt-1'] },
-          { matched_key_ids: [['defect-a']] },
-          { novel_findings: [{ id: ['novel'], serious: true, true_finding: true }] },
-        ]) {
-          const cell = { ...matrix.cells[0], attempts: [attempt(1, changes)] };
-          fs.writeFileSync(cellFile, json({ schema: 'arc-review-cells-v1', cells: [cell] }));
-          assert.notEqual(
-            run('summarize', '--matrix', output, '--cells', cellFile, '--catalog', catalog, '--allow-partial').status,
-            0,
-          );
-        }
+      test('constructor identifiers retain capture preparation matrix and summary wiring', HEAVY, () => {
         const named = structuredClone(fixtureCase);
         named.id = 'constructor';
         named.family = 'constructor';
@@ -2694,60 +2802,6 @@ describe('review repository fixture', () => {
           ).error,
           /dangling fixture path/,
         );
-      });
-
-      test('malformed catalogs and false controls fail before matrix and summary: invalid arm', () => {
-        const invalidArm = registration();
-        invalidArm.arms[0].model_id = {};
-        assert.match(matrixFile(invalidArm).result.error, /arm fields/);
-      });
-
-      test('malformed catalogs and false controls fail before matrix and summary: ambiguous effort', () => {
-        const ambiguous = registration();
-        ambiguous.arms[0].unverified_harness = true;
-        assert.match(matrixFile(ambiguous).result.error, /effort readback condition/);
-      });
-
-      test('all-void quality stays missing while terminal failures keep partial credit in pairs', () => {
-        const report = summarizeFixture((cells) => {
-          cells[0].attempts = [
-            attempt(1, {
-              status: 'void',
-              reason: 'infrastructure',
-              matched_key_ids: [],
-              cost_usd: 0.2,
-              requests: null,
-            }),
-          ];
-          cells[2].attempts = [attempt(1, { status: 'model-failure', matched_key_ids: ['defect-a'] })];
-          cells[3].attempts = [attempt(1, { status: 'budget-exhausted', matched_key_ids: [] })];
-          return cells;
-        }).summary;
-        assert.equal(report.results[0].known_key_recall, null);
-        assert.equal(report.results[1].known_key_recall, 0.5);
-        assert.equal(report.results[2].known_key_recall, 0.5);
-        assert.equal(report.results[3].known_key_recall, 0);
-        assert.equal(report.paired_family_means.accepted_review['fixture-family']['arm-a:arm-b'].valid_pairs, 1);
-        assert.equal(
-          report.paired_family_means.accepted_review['fixture-family']['arm-a:arm-b'].missing_valid_pairs,
-          1,
-        );
-        assert.equal(report.usage.requests, null);
-        assert.equal(report.known_usage.requests, 3);
-        assert.equal(report.unknown_usage_attempts.requests, 1);
-        assert.equal(report.attempts['model-failure'], 1);
-        assert.equal(report.attempts['budget-exhausted'], 1);
-        assert.equal(report.attempts.void, 1);
-      });
-
-      test('missing whole arms and replicate blocks remain incomplete', () => {
-        for (const select of [(cell) => cell.arm_id === 'arm-a', (cell) => cell.replicate === 1]) {
-          const report = summarizeFixture((cells) => cells.filter(select), true).summary;
-          assert.equal(report.complete, false);
-          assert.equal(report.comparison_suppressed, true);
-          assert.equal(report.missing_cell_ids.length, 2);
-          assert.deepEqual(report.pair_contrasts, []);
-        }
       });
 
       describe('source attempts are excluded when identities are known', () => {

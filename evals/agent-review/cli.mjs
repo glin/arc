@@ -15,6 +15,10 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const suite = path.dirname(fileURLToPath(import.meta.url));
+const isCommand =
+  process.argv[1] &&
+  existsSync(process.argv[1]) &&
+  realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url));
 const hex40 = /^[0-9a-f]{40}$/;
 const hex64 = /^[0-9a-f]{64}$/;
 const id = /^[a-z][a-z0-9-]*$/;
@@ -166,7 +170,7 @@ function checkPath(name) {
   );
 }
 
-function caseCheck(item) {
+export function caseCheck(item) {
   required(item.schema === 'arc-review-case-v1' && isId(item.id), 'case schema or id');
   required(
     ['accepted_review', 'escaped_candidate', 'deferred_candidate', 'clean_control'].includes(item.source_kind),
@@ -227,7 +231,7 @@ function caseCheck(item) {
   required(item.historical_context.plan === null, 'historical plan is unverified');
 }
 
-const cases = loadCases(catalogFolder);
+const cases = isCommand ? loadCases(catalogFolder) : [];
 
 // A commit names its tree exactly, so each tree is read once per repository.
 const trees = new Map();
@@ -646,7 +650,7 @@ function preparationCheck(task, item) {
   };
 }
 
-function registrationCheck(registration, verifyPreparation) {
+export function registrationCheck(registration, verifyPreparation = true, catalog = cases) {
   required(registration.schema === 'arc-review-registration-v1', 'registration schema');
   required(typeof registration.suite_revision === 'string' && registration.suite_revision.length > 0, 'suite revision');
   required(
@@ -684,7 +688,7 @@ function registrationCheck(registration, verifyPreparation) {
     );
   }
   for (const task of registration.tasks) {
-    const item = cases.find((entry) => entry.id === task.case_id);
+    const item = catalog.find((entry) => entry.id === task.case_id);
     required(
       item && task.case_revision === item.case_revision && task.key_revision === item.key_revision,
       'task case revision',
@@ -715,9 +719,9 @@ function registrationCheck(registration, verifyPreparation) {
   }
 }
 
-function matrix(input, verifyPreparation = true) {
+export function matrix(input, verifyPreparation = true, catalog = cases) {
   const registration = structuredClone(input);
-  registrationCheck(registration, verifyPreparation);
+  registrationCheck(registration, verifyPreparation, catalog);
   for (const task of registration.tasks) {
     delete task.preparation_path;
     delete task.cache_path;
@@ -767,7 +771,7 @@ function matrix(input, verifyPreparation = true) {
   return { schema: 'arc-review-matrix-v1', registration_hash, registration, cells };
 }
 
-function attemptCheck(attempt, ordinal, expected) {
+export function attemptCheck(attempt, ordinal, expected) {
   required(isId(attempt.attempt_id) && attempt.attempt_number === ordinal, 'attempt identity or order');
   required(['completed', 'model-failure', 'budget-exhausted', 'void'].includes(attempt.status), 'attempt status');
   required(attempt.cost_usd === null || (Number.isFinite(attempt.cost_usd) && attempt.cost_usd >= 0), 'attempt cost');
@@ -798,12 +802,12 @@ function attemptCheck(attempt, ordinal, expected) {
     required(attempt.matched_key_ids.length === 0 && attempt.novel_findings.length === 0, 'void findings');
 }
 
-function summarize(frozen, input, allowPartial) {
+export function summarize(frozen, input, allowPartial, catalog = cases) {
   required(
     frozen.schema === 'arc-review-matrix-v1' && frozen.registration_hash === sha(json(frozen.registration)),
     'matrix hash',
   );
-  const expectedMatrix = matrix(frozen.registration, false);
+  const expectedMatrix = matrix(frozen.registration, false, catalog);
   required(json(expectedMatrix) === json(frozen), 'changed matrix');
   required(input.schema === 'arc-review-cells-v1' && Array.isArray(input.cells), 'cell results schema');
   const expected = new Map(frozen.cells.map((cell) => [cell.cell_id, cell]));
@@ -841,7 +845,7 @@ function summarize(frozen, input, allowPartial) {
       statusCounts[attempt.status]++;
     }
     const selected = result.attempts.find((attempt) => attempt.status !== 'void') ?? null;
-    const item = cases.find((entry) => entry.id === cell.case_id);
+    const item = catalog.find((entry) => entry.id === cell.case_id);
     for (const attempt of result.attempts)
       for (const key of item.keys)
         required(!key.evidence.exclude_attempt_ids.includes(attempt.attempt_id), 'source attempt excluded');
@@ -1104,9 +1108,11 @@ function main() {
   process.stdout.write(json(output));
 }
 
-try {
-  main();
-} catch (error) {
-  process.stderr.write(error.message + '\n');
-  process.exitCode = 1;
+if (isCommand) {
+  try {
+    main();
+  } catch (error) {
+    process.stderr.write(error.message + '\n');
+    process.exitCode = 1;
+  }
 }

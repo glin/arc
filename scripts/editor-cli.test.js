@@ -5,6 +5,8 @@ const path = require('node:path');
 const { spawn, spawnSync } = require('node:child_process');
 const { EventEmitter } = require('node:events');
 const { PassThrough } = require('node:stream');
+const { Console } = require('node:console');
+const { Script } = require('node:vm');
 
 const SUBPROCESS = { tags: ['subprocess'] };
 
@@ -214,43 +216,77 @@ test('a slow run reports captured output before the subprocess case deadline', a
   }
 });
 
-test.concurrent.each(
-  ['installed', 'linked', 'external', 'failed', 'skipped', 'hook-failed', 'cancelled'].flatMap((outcome) => [
-    [outcome, false],
-    [outcome, true],
-  ]),
-)('installer output modes retain component outcomes for %s (JSON %s)', SUBPROCESS, async (outcome, json) => {
+function expectInstallerOutput(result, outcome, json, skillStatuses, directory) {
+  if (json) {
+    const receipt = JSON.parse(result.stdout.trim().split('\n').at(-1));
+    assert.deepEqual(receipt.editors, [{ editor: 'code', status: 'completed' }]);
+    assert.equal(receipt.cancellation, outcome === 'cancelled' ? 130 : null);
+    assert.equal(receipt.components.hooks, outcome === 'hook-failed' ? 'failed' : 'skipped');
+    if (outcome === 'skipped') assert.equal(receipt.components.skills, 'skipped');
+    else if (outcome === 'cancelled') assert.equal(receipt.components.skills, 'cancelled');
+    else
+      assert.deepEqual(
+        receipt.skills.results.map((r) => r.status),
+        skillStatuses,
+      );
+  } else {
+    assert.doesNotMatch(result.stdout, /^\s*\{/m);
+    assert.match(result.stdout, /Editor.*code.*installed/i);
+    assert.match(result.stdout, outcome === 'hook-failed' ? /hooks.*failed/i : /hooks.*skipped/i);
+    if (outcome === 'skipped') assert.match(result.stdout, /skills.*skipped/i);
+    else if (outcome === 'cancelled') {
+      assert.match(result.stdout, /Claude.*cancelled/i);
+      assert.match(result.stdout, /Codex.*cancelled/i);
+      assert.match(result.stdout, /cancelled.*130/i);
+    } else {
+      assert.match(result.stdout, outcome === 'failed' ? /Claude.*failed/i : /Claude.*installed/i);
+      assert.match(
+        result.stdout,
+        outcome === 'linked'
+          ? /Codex.*incomplete/i
+          : outcome === 'external'
+            ? /Codex.*preserved/i
+            : /Codex.*installed/i,
+      );
+      for (const agent of ['claude', 'codex']) {
+        assert.ok(
+          result.stdout
+            .toLowerCase()
+            .includes(
+              path.join(directory, agent === 'claude' ? '.claude' : '.agents', 'skills/arc-sessions').toLowerCase(),
+            ),
+          result.stdout,
+        );
+      }
+    }
+  }
+}
+
+test.concurrent.each([
+  ['installed', false],
+  ['installed', true],
+  ['linked', true],
+  ['failed', true],
+  ['skipped', true],
+  ['hook-failed', true],
+  ['cancelled', true],
+])('installer output modes retain component outcomes for %s (JSON %s)', SUBPROCESS, async (outcome, json) => {
   const f = installerFixture();
   try {
     const args = ['--skill-agent', 'claude', '--skill-agent', 'codex', 'code'];
     const env = { CLAUDE_CONFIG_DIR: '' };
     let status = 0;
     let skillStatuses = ['installed', 'installed'];
-    if (['linked', 'external'].includes(outcome)) {
+    if (outcome === 'linked') {
       const destination = path.join(f.dir, '.agents/skills/arc-sessions');
       fs.mkdirSync(path.dirname(destination), { recursive: true });
-      const payload = path.join(f.source, 'cli/skills/arc-sessions');
-      if (outcome === 'linked') fs.symlinkSync(payload, destination, process.platform === 'win32' ? 'junction' : 'dir');
-      else fs.cpSync(payload, destination, { recursive: true });
-      skillStatuses = ['installed', outcome === 'linked' ? 'incomplete' : 'external-match-preserved'];
-      status = outcome === 'linked' ? 1 : 0;
-      if (outcome === 'external') {
-        // Temporary homes cannot establish stable external storage. Supply that result for presentation coverage.
-        const receipt = {
-          version: 1,
-          action: 'install',
-          results: ['claude', 'codex'].map((agent, index) => ({
-            agent,
-            destination: path.join(f.dir, agent === 'claude' ? '.claude' : '.agents', 'skills/arc-sessions'),
-            status: skillStatuses[index],
-          })),
-          cancellation: null,
-        };
-        fs.writeFileSync(
-          path.join(f.source, 'extension/dist/cli.cjs'),
-          `console.log(${JSON.stringify(JSON.stringify(receipt))});`,
-        );
-      }
+      fs.symlinkSync(
+        path.join(f.source, 'cli/skills/arc-sessions'),
+        destination,
+        process.platform === 'win32' ? 'junction' : 'dir',
+      );
+      skillStatuses = ['installed', 'incomplete'];
+      status = 1;
     }
     if (outcome === 'failed') {
       env.CLAUDE_CONFIG_DIR = path.dirname(f.settings);
@@ -268,52 +304,85 @@ test.concurrent.each(
     }
     const result = await f.run(args, env, { skills: true, json });
     assert.equal(result.status, status, result.stdout + result.stderr);
-    if (json) {
-      const receipt = JSON.parse(result.stdout.trim().split('\n').at(-1));
-      assert.deepEqual(receipt.editors, [{ editor: 'code', status: 'completed' }]);
-      assert.equal(receipt.cancellation, outcome === 'cancelled' ? 130 : null);
-      assert.equal(receipt.components.hooks, outcome === 'hook-failed' ? 'failed' : 'skipped');
-      if (outcome === 'skipped') assert.equal(receipt.components.skills, 'skipped');
-      else if (outcome === 'cancelled') assert.equal(receipt.components.skills, 'cancelled');
-      else
-        assert.deepEqual(
-          receipt.skills.results.map((r) => r.status),
-          skillStatuses,
-        );
-    } else {
-      assert.doesNotMatch(result.stdout, /^\s*\{/m);
-      assert.match(result.stdout, /Editor.*code.*installed/i);
-      assert.match(result.stdout, outcome === 'hook-failed' ? /hooks.*failed/i : /hooks.*skipped/i);
-      if (outcome === 'skipped') assert.match(result.stdout, /skills.*skipped/i);
-      else if (outcome === 'cancelled') {
-        assert.match(result.stdout, /Claude.*cancelled/i);
-        assert.match(result.stdout, /Codex.*cancelled/i);
-        assert.match(result.stdout, /cancelled.*130/i);
-      } else {
-        assert.match(result.stdout, outcome === 'failed' ? /Claude.*failed/i : /Claude.*installed/i);
-        assert.match(
-          result.stdout,
-          outcome === 'linked'
-            ? /Codex.*incomplete/i
-            : outcome === 'external'
-              ? /Codex.*preserved/i
-              : /Codex.*installed/i,
-        );
-        for (const agent of ['claude', 'codex']) {
-          assert.ok(
-            result.stdout
-              .toLowerCase()
-              .includes(
-                path.join(f.dir, agent === 'claude' ? '.claude' : '.agents', 'skills/arc-sessions').toLowerCase(),
-              ),
-            result.stdout,
-          );
-        }
-      }
-    }
+    expectInstallerOutput(result, outcome, json, skillStatuses, f.dir);
     assert.deepEqual(fs.readdirSync(f.temporary), []);
   } finally {
     f.cleanup();
+  }
+});
+
+test.concurrent.each([
+  ['linked', false],
+  ['external', false],
+  ['external', true],
+  ['failed', false],
+  ['skipped', false],
+  ['hook-failed', false],
+  ['cancelled', false],
+])('installer output modes retain component outcomes for %s (JSON %s)', (outcome, json) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'arc-install-receipt-'));
+  try {
+    const skillStatuses = [
+      'installed',
+      { linked: 'incomplete', external: 'external-match-preserved' }[outcome] || 'installed',
+    ];
+    if (outcome === 'failed') skillStatuses[0] = 'failed';
+    const skills = path.join(directory, 'skills.json');
+    fs.writeFileSync(
+      skills,
+      JSON.stringify({
+        version: 1,
+        action: 'install',
+        results: ['claude', 'codex'].map((agent, index) => ({
+          agent,
+          destination: path.join(directory, agent === 'claude' ? '.claude' : '.agents', 'skills/arc-sessions'),
+          status: skillStatuses[index],
+        })),
+        cancellation: null,
+      }),
+    );
+    const stdout = new PassThrough();
+    const stderr = new PassThrough();
+    const result = { stdout: '', stderr: '' };
+    stdout.on('data', (bytes) => {
+      result.stdout += bytes;
+    });
+    stderr.on('data', (bytes) => {
+      result.stderr += bytes;
+    });
+    const source = fs.readFileSync(path.join(__dirname, '../install.sh'), 'utf8');
+    const bodies = [...source.matchAll(/<<'RECEIPT' \|\| true\r?\n([\s\S]*?\r?\n)RECEIPT/g)];
+    assert.equal(bodies.length, 1);
+    new Script(bodies[0][1], { filename: 'install-receipt.js' }).runInNewContext({
+      require,
+      console: new Console({ stdout, stderr }),
+      process: {
+        stdout,
+        stderr,
+        argv: [
+          process.execPath,
+          '-',
+          'completed',
+          outcome === 'cancelled'
+            ? 'cancelled'
+            : outcome === 'skipped'
+              ? 'skipped'
+              : ['linked', 'failed'].includes(outcome)
+                ? 'failed'
+                : 'completed',
+          outcome === 'hook-failed' ? 'failed' : 'skipped',
+          outcome === 'cancelled' ? '130' : '0',
+          outcome === 'cancelled' ? '' : skills,
+          outcome === 'skipped' ? '' : 'claude codex',
+          json ? 'json' : 'human',
+          'code',
+          'completed',
+        ],
+      },
+    });
+    expectInstallerOutput(result, outcome, json, skillStatuses, directory);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
   }
 });
 
@@ -1092,6 +1161,81 @@ else fs.copyFileSync(process.env.ARC_TEST_SOURCE_ARCHIVE,output);
   return dir;
 }
 
+function editorInstallation(
+  dir,
+  product,
+  layout,
+  cliName = product,
+  { copied = false, target, version = '', installationName } = {},
+) {
+  const installation = path.join(
+    dir,
+    installationName ?? `${product}-${layout}${target ? '-' + target : ''}${version ? '-' + version : ''}`,
+  );
+  const root = layout === 'macos' ? path.join(installation, `${product}.app`, 'Contents') : installation;
+  const app = path.join(root, version, layout === 'macos' ? 'Resources' : 'resources', 'app');
+  const askpass = copied
+    ? path.join(dir, 'storage', path.basename(installation), 'askpass', 'a'.repeat(16), 'askpass-main.js')
+    : path.join(app, 'extensions', 'git', 'dist', 'askpass-main.js');
+  const metadata = path.join(app, 'product.json');
+  const executable = path.join(
+    root,
+    ...(layout === 'macos'
+      ? ['Frameworks', `${product} Helper (Plugin).app`, 'Contents', 'MacOS', `${product} Helper (Plugin)`]
+      : [product + (layout === 'windows' ? '.exe' : '')]),
+  );
+  const launcher = path.join(layout === 'windows' ? root : app, 'bin', cliName);
+  for (const file of [askpass, metadata, executable, launcher]) fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(askpass, '');
+  fs.writeFileSync(metadata, JSON.stringify({ applicationName: product, target }));
+  fs.writeFileSync(executable, '');
+  fs.writeFileSync(launcher, `#!/bin/bash\necho "editor ${product} $*" >> "$ARC_TEST_LOG"\n`, { mode: 0o755 });
+  return {
+    env: { TERM_PROGRAM: 'vscode', VSCODE_GIT_ASKPASS_MAIN: askpass, VSCODE_GIT_ASKPASS_NODE: executable },
+    metadata,
+    launcher,
+    executable,
+    root,
+  };
+}
+
+function currentEditorFixture() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'arc-current-editor-'));
+  return {
+    dir,
+    editor: (...args) => editorInstallation(dir, ...args),
+    cleanup: () => fs.rmSync(dir, { recursive: true, force: true }),
+  };
+}
+
+async function currentEditor(env) {
+  const source = fs.readFileSync(path.join(__dirname, '../install.sh'), 'utf8');
+  const entry = [...source.matchAll(/^main\(\) \{\r?$/gm)];
+  assert.equal(entry.length, 1);
+  const result = await spawnAsync(
+    gitBashExecutable(),
+    ['-c', source.slice(0, entry[0].index) + '\ncurrent_editor_cli'],
+    {
+      timeout: RUN_TIMEOUT,
+      env: {
+        ...process.env,
+        PATH: path.dirname(process.execPath) + path.delimiter + process.env.PATH,
+        TERM_PROGRAM: '',
+        VSCODE_GIT_ASKPASS_MAIN: '',
+        VSCODE_GIT_ASKPASS_NODE: '',
+        ...env,
+      },
+    },
+  );
+  assert.equal(result.status, 0, result.stderr);
+  return result.stdout;
+}
+
+function currentEditorIdentity(selected, editor) {
+  const launcher = fixtureBashPath(path.dirname(editor.launcher)) + '/' + path.basename(editor.launcher);
+  return bash('test "$1" -ef "$2" && echo same', selected, launcher);
+}
+
 function installerFixture() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'arc-source-install-'));
   fs.cpSync(fixtureTemplate(), dir, { recursive: true });
@@ -1143,37 +1287,8 @@ function installerFixture() {
     settings,
     temporary,
     legacy,
-    editor(product, layout, cliName = product, { copied = false, target, version = '', installationName } = {}) {
-      const installation = path.join(
-        dir,
-        installationName ?? `${product}-${layout}${target ? '-' + target : ''}${version ? '-' + version : ''}`,
-      );
-      const root = layout === 'macos' ? path.join(installation, `${product}.app`, 'Contents') : installation;
-      const app = path.join(root, version, layout === 'macos' ? 'Resources' : 'resources', 'app');
-      const askpass = copied
-        ? path.join(dir, 'storage', path.basename(installation), 'askpass', 'a'.repeat(16), 'askpass-main.js')
-        : path.join(app, 'extensions', 'git', 'dist', 'askpass-main.js');
-      const metadata = path.join(app, 'product.json');
-      const executable = path.join(
-        root,
-        ...(layout === 'macos'
-          ? ['Frameworks', `${product} Helper (Plugin).app`, 'Contents', 'MacOS', `${product} Helper (Plugin)`]
-          : [product + (layout === 'windows' ? '.exe' : '')]),
-      );
-      const launcher = path.join(layout === 'windows' ? root : app, 'bin', cliName);
-      for (const file of [askpass, metadata, executable, launcher])
-        fs.mkdirSync(path.dirname(file), { recursive: true });
-      fs.writeFileSync(askpass, '');
-      fs.writeFileSync(metadata, JSON.stringify({ applicationName: product, target }));
-      fs.writeFileSync(executable, '');
-      fs.writeFileSync(launcher, `#!/bin/bash\necho "editor ${product} $*" >> "$ARC_TEST_LOG"\n`, { mode: 0o755 });
-      return {
-        env: { TERM_PROGRAM: 'vscode', VSCODE_GIT_ASKPASS_MAIN: askpass, VSCODE_GIT_ASKPASS_NODE: executable },
-        metadata,
-        launcher,
-        executable,
-        root,
-      };
+    editor(...args) {
+      return editorInstallation(dir, ...args);
     },
     async run(
       args = ['code'],
@@ -1790,9 +1905,14 @@ for (const target of ['user', 'system'])
       `the current editor uses copied askpass scripts for Windows ${target} setups ${version || 'flat'}`,
       SUBPROCESS,
       async () => {
-        const f = installerFixture();
+        const fullInstall = target === 'user' && !version;
+        const f = fullInstall ? installerFixture() : currentEditorFixture();
         try {
           const editor = f.editor('code-insiders', 'windows', 'code-insiders', { copied: true, target, version });
+          if (!fullInstall) {
+            assert.equal(currentEditorIdentity(await currentEditor(editor.env), editor), 'same');
+            return;
+          }
           const r = await f.run(['--local', '--no-hooks'], editor.env, {
             stdin: true,
             cwd: f.source,
@@ -1826,21 +1946,7 @@ test.concurrent(
       );
       assert.match(r.stdout, /==> Current editor:/);
       const other = f.editor('code', 'windows');
-      const conflict = await f.run(
-        ['--local', '--no-hooks'],
-        { ...editor.env, VSCODE_GIT_ASKPASS_NODE: other.executable },
-        {
-          stdin: true,
-          cwd: f.source,
-          terminalInput: '\n',
-        },
-      );
-      assert.equal(conflict.status, 0, conflict.stderr);
-      assert.deepEqual(
-        [...conflict.commands.matchAll(/editor (\S+) --install-extension/g)].map((match) => match[1]),
-        ['code', 'cursor'],
-      );
-      assert.doesNotMatch(conflict.stdout, /Current editor/);
+      assert.equal(await currentEditor({ ...editor.env, VSCODE_GIT_ASKPASS_NODE: other.executable }), '');
     } finally {
       f.cleanup();
     }
@@ -1851,25 +1957,14 @@ test.concurrent.each(['its executable', 'no executable'])(
   'the current editor accepts a flat installation named with ten hexadecimal digits and %s',
   SUBPROCESS,
   async (hint) => {
-    const f = installerFixture();
+    const f = currentEditorFixture();
     try {
       const editor = f.editor('code-insiders', 'windows', 'code-insiders', { installationName: '123456abcd' });
       const node = hint === 'its executable' ? editor.executable : '';
-      const r = await f.run(
-        ['--local', '--no-hooks'],
-        { ...editor.env, VSCODE_GIT_ASKPASS_NODE: node },
-        {
-          stdin: true,
-          cwd: f.source,
-          terminalInput: '\n',
-        },
+      assert.equal(
+        currentEditorIdentity(await currentEditor({ ...editor.env, VSCODE_GIT_ASKPASS_NODE: node }), editor),
+        'same',
       );
-      assert.equal(r.status, 0, r.stderr);
-      assert.deepEqual(
-        [...r.commands.matchAll(/editor (\S+) --install-extension/g)].map((match) => match[1]),
-        ['code-insiders'],
-      );
-      assert.match(r.stdout, /==> Current editor:/);
     } finally {
       f.cleanup();
     }
@@ -1880,7 +1975,7 @@ test.concurrent(
   'the current editor accepts matching metadata versions and rejects ambiguous copied identities',
   { ...SUBPROCESS, timeout: runBudget(4) },
   async () => {
-    const f = installerFixture();
+    const f = currentEditorFixture();
     try {
       const editor = f.editor('code-insiders', 'windows', 'code-insiders', { copied: true, target: 'user' });
       const second = path.join(editor.root, '0123456789', 'resources', 'app', 'product.json');
@@ -1893,16 +1988,7 @@ test.concurrent(
           mode: 0o755,
         },
       );
-      const accepted = await f.run(['--local', '--no-hooks'], editor.env, {
-        stdin: true,
-        cwd: f.source,
-        terminalInput: '\n',
-      });
-      assert.equal(accepted.status, 0, accepted.stderr);
-      assert.deepEqual(
-        [...accepted.commands.matchAll(/editor (\S+) --install-extension/g)].map((match) => match[1]),
-        ['code-insiders'],
-      );
+      assert.equal(currentEditorIdentity(await currentEditor(editor.env), editor), 'same');
       for (const [product, env] of [
         [{ applicationName: 'cursor', target: 'user' }, editor.env],
         [{ applicationName: 'code-insiders' }, editor.env],
@@ -1912,19 +1998,61 @@ test.concurrent(
         ],
       ]) {
         fs.writeFileSync(second, JSON.stringify(product));
-        const r = await f.run(['--local', '--no-hooks'], env, { stdin: true, cwd: f.source, terminalInput: '\n' });
-        assert.equal(r.status, 0, r.stderr);
-        assert.deepEqual(
-          [...r.commands.matchAll(/editor (\S+) --install-extension/g)].map((match) => match[1]),
-          ['code', 'cursor'],
-        );
-        assert.doesNotMatch(r.stdout, /Current editor/);
+        assert.equal(await currentEditor(env), '');
       }
     } finally {
       f.cleanup();
     }
   },
 );
+
+test.concurrent('the current editor rejects denied executable access', SUBPROCESS, async () => {
+  const f = currentEditorFixture();
+  try {
+    const editor = f.editor('cursor', 'linux');
+    const preload = path.join(f.dir, 'deny-access.cjs');
+    fs.writeFileSync(
+      preload,
+      `const fs = require('node:fs');
+const access = fs.accessSync;
+fs.accessSync = function(file, mode) {
+  if (file === process.env.ARC_TEST_DENIED_LAUNCHER && mode === fs.constants.X_OK)
+    throw Object.assign(new Error('Executable access denied'), { code: 'EACCES' });
+  return Reflect.apply(access, this, [file, mode]);
+};
+`,
+    );
+    assert.equal(
+      await currentEditor({
+        ...editor.env,
+        ARC_TEST_DENIED_LAUNCHER: fs.realpathSync(editor.launcher),
+        NODE_OPTIONS: [process.env.NODE_OPTIONS, '--require=' + JSON.stringify(preload)].filter(Boolean).join(' '),
+      }),
+      '',
+    );
+  } finally {
+    f.cleanup();
+  }
+});
+
+test.concurrent('the current editor rejects a launcher outside its installation', SUBPROCESS, async () => {
+  const f = currentEditorFixture();
+  let linked;
+  try {
+    const editor = f.editor('cursor', 'linux');
+    const outside = path.join(f.dir, 'outside');
+    fs.mkdirSync(outside);
+    fs.renameSync(editor.launcher, path.join(outside, 'cursor'));
+    const bin = path.dirname(editor.launcher);
+    fs.rmdirSync(bin);
+    fs.symlinkSync(outside, bin, process.platform === 'win32' ? 'junction' : 'dir');
+    linked = bin;
+    assert.equal(await currentEditor(editor.env), '');
+  } finally {
+    if (linked) fs.unlinkSync(linked);
+    f.cleanup();
+  }
+});
 
 describe('unverified current editor hints retain the all-editor menu and default', () => {
   let f;
@@ -1964,8 +2092,12 @@ describe('unverified current editor hints retain the all-editor menu and default
     'missing launcher',
     'malformed product metadata',
   ].entries())
-    test(`all editors for ${hint}`, SUBPROCESS, async () => {
+    test(`${index === 0 ? 'all editors' : 'no current editor'} for ${hint}`, SUBPROCESS, async () => {
       const env = hints[index];
+      if (index !== 0) {
+        assert.equal(await currentEditor(env), '');
+        return;
+      }
       const r = await f.run(['--local', '--no-hooks'], env, { stdin: true, cwd: f.source, terminalInput: '\n' });
       assert.equal(r.status, 0, r.stderr);
       assert.match(r.stderr, /1\) All detected editors \(code, cursor\)/);
