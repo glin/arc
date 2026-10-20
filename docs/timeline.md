@@ -206,6 +206,8 @@ The snapshot baseline represents the file before the session's first edit. It ca
 
 `patchview.ts` builds a per-turn diff only from text the transcript recorded. Whole-file before and after values are preferred. When the source recorded only changed regions, the diff title states that limit. The live file is never used as the after side of a per-turn diff.
 
+A file the snapshot manifest lists opens the current-file diff when the live file still differs from the snapshot. That diff compares the snapshot baseline with the live file. Any other file takes both sides from the transcript alone, so its per-turn diff needs no Claude hooks. Claude Code records the file before an Edit as `originalFile`, only for small files, and records the file after a Write as `content`. The parser keeps `originalFile` from a file's first recorded edit in each turn and keeps each edit's `content`. `sidesFor` replays the turn's edits over that text when the diff opens. The text stays in memory with the parsed turn. The project spend index and the derived session cache do not store it.
+
 Snapshot and transcript paths pass through the shared normalization rule before comparison. Scratch roots are also defined on the hook side and reader side. The shared fixture keeps their path handling aligned.
 
 ## Cost and context
