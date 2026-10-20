@@ -1403,6 +1403,7 @@ if [ "$1" = ci ] || [ "$1" = install ]; then exec '${npm.replaceAll("'", "'\\''"
         { mode: 0o755 },
       );
       const result = await f.run(['--local', '--no-hooks', 'code'], {
+        NODE_COMPILE_CACHE: path.join(f.dir, 'node-compile-cache'),
         npm_config_cache: path.join(f.dir, 'npm-cache'),
         npm_config_userconfig: path.join(f.dir, 'empty-npmrc'),
         npm_config_globalconfig: path.join(f.dir, 'empty-global-npmrc'),
