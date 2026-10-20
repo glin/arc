@@ -2,6 +2,7 @@ import * as fs from 'node:fs';
 import { boundedCommitRepositories, type VerifiedCommitRepository } from './commitrepositories';
 import { writeFileAtomically } from './atomicfile';
 import { storedCodexMetas } from './codexopenings';
+import { compatibleDiscovery, validDiscoveryCheckpoint } from './progressiveworker';
 import {
   replacedTranscript,
   resolveSessionName,
@@ -345,7 +346,16 @@ export function withAgentRunScanProgress(entry: DerivedTitleEntry, scan: AgentRu
 
 export interface DerivedCache {
   commitRepositories?: VerifiedCommitRepository[];
-  reuse?: { reason: string; storedGeneration?: unknown; rejectedRelationships?: number };
+  reuse?: {
+    reason: string;
+    storedGeneration?: unknown;
+    rejectedRelationships?: number;
+    acceptedRelationships?: number;
+    format?: number;
+    source?: string;
+    checkpoint?: string;
+  };
+  migrationPending?: boolean;
   discovery?: import('./progressiveworker').DiscoveryCheckpoint;
   // Legacy workspace Codex opening rows seed a missing shared `codex-openings.json`.
   // Workspace saves omit these rows.
@@ -404,13 +414,14 @@ interface StoredCarriedName extends CarriedName {
 interface StoredCache {
   commitRepositories?: VerifiedCommitRepository[];
   discovery?: import('./progressiveworker').DiscoveryCheckpoint;
-  version: number;
+  formatVersion: 1;
+  metadataVersion: number;
   titles: StoredTitle[];
   claudeChildReferences: StoredChildReferences[];
   carriedNames: StoredCarriedName[];
 }
 
-// Versions stored title and relationship facts. A mismatch discards derived entries but carries session names until metadata replaces them.
+// Versions stored metadata. A mismatch carries session names until metadata replaces them.
 // Bump the version for stored field changes or changed derivation rules, including agent-run classification in transcript.ts and codex.ts.
 // Unchanged files otherwise retain valid-looking stale facts indefinitely.
 // The initial metadata budget, `INITIAL_RAIL_READ_BYTES`, spreads large workspace rebuilds across refreshes.
@@ -1060,105 +1071,108 @@ export function sameClaudeChildReferenceCaches(
   return true;
 }
 
-export function loadDerivedCache(file: string): DerivedCache {
+export function loadDerivedCache(file: string, legacyFile?: string): DerivedCache {
+  let source = 'current';
   try {
-    const parsed: unknown = JSON.parse(fs.readFileSync(file, 'utf8'));
+    let text: string;
+    try {
+      text = fs.readFileSync(file, 'utf8');
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT' || !legacyFile) throw error;
+      source = 'legacy';
+      text = fs.readFileSync(legacyFile, 'utf8');
+    }
+    const parsed: unknown = JSON.parse(text);
     const loaded = empty();
-    loaded.reuse = { reason: 'reused' };
-    // Codex rows answer to their own version, so a `VERSION` bump keeps them.
-    loaded.codexMetas = storedCodexMetas(parsed);
+    loaded.reuse = { reason: 'reused', source, checkpoint: 'missing' };
     if (!record(parsed)) {
-      loaded.reuse = { reason: 'invalid-format' };
+      loaded.reuse.reason = 'invalid-format';
       return loaded;
     }
-    // Keeps carried names until a title row replaces them.
-    // On a version mismatch, title-row names override carried-name rows.
-    carryNames(loaded.carriedNames, parsed.carriedNames, (row) => row);
-    if (parsed.version !== VERSION) {
-      loaded.reuse = { reason: 'generation-mismatch', storedGeneration: parsed.version };
-      carryNames(loaded.carriedNames, parsed.titles, (row) => row.entry);
+    const legacy = source === 'legacy' || (legacyFile === undefined && parsed.formatVersion === undefined);
+    if (
+      !legacy &&
+      (parsed.formatVersion !== 1 ||
+        !Number.isInteger(parsed.metadataVersion) ||
+        (parsed.metadataVersion as number) < 0)
+    ) {
+      loaded.reuse.reason = 'invalid-format';
       return loaded;
     }
-    if (Array.isArray(parsed.commitRepositories)) {
+    const knownLegacy = parsed.version === 63 || parsed.version === 64;
+    if ((!legacy || knownLegacy) && Array.isArray(parsed.commitRepositories)) {
       loaded.commitRepositories = boundedCommitRepositories(parsed.commitRepositories);
     }
-    if (
-      !Array.isArray(parsed.titles) ||
-      (parsed.claudeChildReferences !== undefined && !Array.isArray(parsed.claudeChildReferences))
-    ) {
-      loaded.reuse = { reason: 'invalid-rows' };
-      return loaded;
-    }
-    for (const row of parsed.titles) {
-      if (record(row) && fileName(row.file) && titleEntry(row.entry)) {
-        loaded.titles.set(row.file, row.entry);
-        loaded.carriedNames.delete(row.file);
+    loaded.reuse.format = legacy ? 0 : 1;
+    loaded.codexMetas = legacy ? storedCodexMetas(parsed) : new Map();
+    carryNames(loaded.carriedNames, parsed.carriedNames, (row) => row);
+    const generation = legacy ? parsed.version : parsed.metadataVersion;
+    loaded.reuse.storedGeneration = generation;
+    const compatibleMetadata = generation === VERSION && (!legacy || knownLegacy);
+    if (!compatibleMetadata) {
+      loaded.reuse.reason = 'generation-mismatch';
+      carryNames(loaded.carriedNames, parsed.titles, (row) => row.entry);
+    } else if (!Array.isArray(parsed.titles)) {
+      loaded.reuse.reason = 'invalid-rows';
+    } else {
+      for (const row of parsed.titles) {
+        if (record(row) && fileName(row.file) && titleEntry(row.entry)) {
+          loaded.titles.set(row.file, row.entry);
+          loaded.carriedNames.delete(row.file);
+        }
       }
     }
-    for (const row of parsed.claudeChildReferences ?? []) {
-      if (record(row) && fileName(row.file) && childReferenceEntry(row.entry)) {
+    const relationshipRows = Array.isArray(parsed.claudeChildReferences) ? parsed.claudeChildReferences : [];
+    for (const row of legacy && !knownLegacy ? [] : relationshipRows) {
+      if (
+        record(row) &&
+        fileName(row.file) &&
+        childReferenceEntry(row.entry) &&
+        (!legacy || row.entry.parserVersion === 26)
+      ) {
         loaded.claudeChildReferences.set(normalizeFsPath(row.file), row.entry);
       }
     }
-    loaded.reuse.rejectedRelationships =
-      (parsed.claudeChildReferences?.length ?? 0) - loaded.claudeChildReferences.size;
-    loaded.claudeChildReferences = new Map(limitCodexDispatchCursors(loaded.claudeChildReferences));
+    const admitted = loaded.claudeChildReferences;
+    loaded.claudeChildReferences = new Map(
+      limitCodexDispatchCursors(admitted).slice(0, MAX_CLAUDE_CHILD_REFERENCE_FILES),
+    );
+    loaded.reuse.rejectedRelationships = relationshipRows.length - loaded.claudeChildReferences.size;
+    loaded.reuse.acceptedRelationships = loaded.claudeChildReferences.size;
+    loaded.migrationPending =
+      legacy &&
+      !!(
+        knownLegacy ||
+        loaded.commitRepositories?.length ||
+        loaded.titles.size ||
+        loaded.claudeChildReferences.size ||
+        loaded.carriedNames.size ||
+        loaded.codexMetas.size
+      );
     const pending = parsed.discovery;
     if (
+      !legacy &&
+      loaded.reuse.rejectedRelationships === 0 &&
+      Array.isArray(parsed.claudeChildReferences) &&
+      retainedDiscoveryRelationships(admitted, loaded.claudeChildReferences) &&
       record(pending) &&
-      (pending.epoch === undefined || nonEmptyText(pending.epoch)) &&
-      (pending.parserVersion === undefined || pending.parserVersion === CLAUDE_CHILD_REFERENCE_PARSER_VERSION) &&
-      (pending.spendSources === undefined ||
-        (record(pending.spendSources) &&
-          Array.isArray(pending.spendSources.claude) &&
-          pending.spendSources.claude.every(
-            (source: unknown) =>
-              record(source) &&
-              fileName(source.file) &&
-              nonEmptyText(source.sessionId) &&
-              (source.primary === undefined || typeof source.primary === 'boolean') &&
-              (source.nativeParentFile === undefined || fileName(source.nativeParentFile)) &&
-              (source.dispatchedFrom === undefined || nonEmptyText(source.dispatchedFrom)),
-          ) &&
-          Array.isArray(pending.spendSources.codex) &&
-          pending.spendSources.codex.every((source: unknown) => record(source) && fileName(source.file)) &&
-          Array.isArray(pending.spendSources.children) &&
-          pending.spendSources.children.every(
-            (child: unknown) =>
-              record(child) &&
-              fileName(child.file) &&
-              nonEmptyText(child.threadId) &&
-              (child.parentThreadId === null || nonEmptyText(child.parentThreadId)) &&
-              (child.agentPath === null || typeof child.agentPath === 'string') &&
-              (child.openedAt === null || nonNegative(child.openedAt)) &&
-              (child.startedAt === null || nonNegative(child.startedAt)) &&
-              (child.threadSource === null || typeof child.threadSource === 'string') &&
-              typeof child.backgroundReview === 'boolean',
-          ))) &&
-      Array.isArray(pending.parents) &&
-      Array.isArray(pending.catalog) &&
-      Array.isArray(pending.repositoryRoots) &&
-      pending.repositoryRoots.every(fileName) &&
-      Array.isArray(pending.completed) &&
-      pending.completed.every(fileName) &&
-      nonNegative(pending.position) &&
-      nonNegative(pending.sequence) &&
-      (pending.protectedFile === undefined || fileName(pending.protectedFile)) &&
-      [...pending.parents, ...pending.catalog].every(
-        (row: unknown) =>
-          record(row) &&
-          fileName(row.file) &&
-          nonEmptyText(row.sessionId) &&
-          (row.agent === 'claude' || row.agent === 'codex') &&
-          nonNegative(row.size) &&
-          nonNegative(row.mtimeMs),
-      )
+      compatibleDiscovery(
+        pending as unknown as import('./progressiveworker').DiscoveryCheckpoint,
+        CLAUDE_CHILD_REFERENCE_PARSER_VERSION,
+      ) &&
+      validDiscoveryCheckpoint(pending)
     ) {
-      loaded.discovery = pending as unknown as import('./progressiveworker').DiscoveryCheckpoint;
-      loaded.discovery.completed = loaded.discovery.completed.filter(
-        (file) => loaded.claudeChildReferences.get(file)?.complete === true,
-      );
+      loaded.discovery = pending;
+      if (
+        !loaded.discovery.completed.every((file) => {
+          const entry = loaded.claudeChildReferences.get(normalizeFsPath(file));
+          return entry?.complete === true || entry?.visitedEof === true;
+        })
+      )
+        loaded.discovery = undefined;
+      loaded.reuse.checkpoint = loaded.discovery ? 'reused' : 'invalid';
     }
+    if (pending && !loaded.discovery) loaded.reuse.checkpoint = legacy ? 'incompatible' : 'invalid';
     return loaded;
   } catch (error) {
     return {
@@ -1166,6 +1180,25 @@ export function loadDerivedCache(file: string): DerivedCache {
       reuse: { reason: (error as NodeJS.ErrnoException).code === 'ENOENT' ? 'missing' : 'unreadable' },
     };
   }
+}
+
+// A missing row or unfinished cursor invalidates the scheduler that depended on it.
+function retainedDiscoveryRelationships(
+  before: ReadonlyMap<string, ClaudeChildReferenceCacheEntry>,
+  after: ReadonlyMap<string, ClaudeChildReferenceCacheEntry>,
+): boolean {
+  for (const [file, entry] of before) {
+    const retained = after.get(normalizeFsPath(file));
+    if (!retained || !childReferenceEntry(retained)) return false;
+    if (
+      !entry.complete &&
+      !entry.visitedEof &&
+      ((entry.cursor && !retained.cursor) || (entry.claudeCursor && !retained.claudeCursor))
+    )
+      return false;
+    if ((entry.complete && !retained.complete) || (entry.visitedEof && !retained.visitedEof)) return false;
+  }
+  return true;
 }
 
 export function saveDerivedCache(
@@ -1181,7 +1214,8 @@ export function saveDerivedCache(
     .map(([entryFile, entry]) => ({ file: entryFile, entry }))
     .sort((a, b) => a.file.localeCompare(b.file));
   const titled = new Set(titleRows.map((row) => row.file));
-  const childRows = limitCodexDispatchCursors(claudeChildReferences)
+  const sourceEntries = new Map([...claudeChildReferences].map(([key, entry]) => [normalizeFsPath(key), entry]));
+  const childRows = limitCodexDispatchCursors(sourceEntries)
     .filter(([, entry]) => entry.references.length <= MAX_CLAUDE_CHILD_REFERENCES_PER_FILE)
     .map(([entryFile, entry]) => ({ file: normalizeFsPath(entryFile), entry }))
     .sort(
@@ -1192,8 +1226,16 @@ export function saveDerivedCache(
     );
   const data: StoredCache = {
     commitRepositories: boundedCommitRepositories(commitRepositories),
-    version: VERSION,
-    discovery,
+    formatVersion: 1,
+    metadataVersion: VERSION,
+    discovery:
+      compatibleDiscovery(discovery, CLAUDE_CHILD_REFERENCE_PARSER_VERSION) &&
+      retainedDiscoveryRelationships(
+        sourceEntries,
+        new Map(childRows.slice(0, MAX_CLAUDE_CHILD_REFERENCE_FILES).map((row) => [row.file, row.entry])),
+      )
+        ? discovery
+        : undefined,
     titles: titleRows,
     claudeChildReferences: childRows.slice(0, MAX_CLAUDE_CHILD_REFERENCE_FILES),
     // Persists carried names until a title entry replaces them, including across restarts.

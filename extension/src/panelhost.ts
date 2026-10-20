@@ -1,3 +1,4 @@
+import { compatibleDiscovery, discoveryCompatibility } from './progressiveworker';
 import {
   sessionCoverageMember,
   reconcileSessionCollisions,
@@ -1348,6 +1349,9 @@ export class PanelProvider implements vscode.Disposable {
   // Defer the first metadata checkpoint until after rendering. Later checkpoints use a bounded rate, with a final write during disposal.
   private derivedCacheCheckpointTick: ReturnType<typeof setTimeout> | null = null;
   private derivedCacheCheckpointState = new DerivedCacheCheckpointState(Date.now());
+  private derivedMigrationPending = false;
+  private derivedMigrationRetries = 0;
+  private derivedMigrationNeedsOpenings = false;
   private metadataRecoverySession: string | null = null;
   private metadataRecoveryQueue: string[] = [];
   // Codex session names have a separate index. Renaming a quiet session does not change its rollout revision.
@@ -3043,6 +3047,7 @@ export class PanelProvider implements vscode.Disposable {
     activationAt = performance.now(),
     startupDirectory?: string,
     private readonly health?: HostHealth,
+    private readonly legacyDerivedCacheFile?: string,
   ) {
     this.performanceOutput = performanceOutput ?? null;
     this.responseRates = savedResponseRates(this.memento?.get(STORED_STATE_KEYS.responseRates));
@@ -3053,13 +3058,16 @@ export class PanelProvider implements vscode.Disposable {
       this.settleRecordedReplies();
     });
     this.projectSpendSaveScheduler = this.newProjectSpendSaveScheduler();
-    const cached = this.derivedCacheFile ? loadDerivedCache(this.derivedCacheFile) : null;
+    const cached = this.derivedCacheFile ? loadDerivedCache(this.derivedCacheFile, this.legacyDerivedCacheFile) : null;
     if (cached) {
       this.titles = cached.titles;
       this.claudeChildReferenceEntries = cached.claudeChildReferences;
       this.discoveryCheckpoint = cached.discovery;
       this.carriedNames = cached.carriedNames;
       this.commitRepositories.load(cached.commitRepositories ?? []);
+      this.derivedMigrationPending = cached.migrationPending === true;
+      this.derivedMigrationNeedsOpenings = this.derivedMigrationPending && cached.codexMetas.size > 0;
+      if (this.derivedMigrationPending) this.derivedCacheCheckpointState.markChanged(true);
     }
     this.startupCache = {
       file: this.derivedCacheFile ?? null,
@@ -3068,6 +3076,7 @@ export class PanelProvider implements vscode.Disposable {
       reuse: cached?.reuse ?? { reason: 'unconfigured' },
       loadedTitles: cached?.titles.size ?? 0,
       loadedRelationships: cached?.claudeChildReferences.size ?? 0,
+      migration: this.derivedMigrationPending ? 'unsaved' : 'unneeded',
     };
     if (startupDirectory)
       this.startupHistory = new StartupHistory(
@@ -3096,7 +3105,9 @@ export class PanelProvider implements vscode.Disposable {
     if (this.codexOpeningsFile) {
       const openings = codexOpeningsAtStartup(this.codexOpeningsFile, cached?.codexMetas);
       this.codexMetas.load(openings.rows);
-      this.codexOpenings = new CodexOpeningsWriter(this.codexOpeningsFile, this.codexMetas, openings.seeded);
+      this.codexOpenings = new CodexOpeningsWriter(this.codexOpeningsFile, this.codexMetas, openings.seeded, () => {
+        if (this.derivedMigrationPending) this.checkpointDerivedCache();
+      });
       // Save seeded opening records even when the first walk finds no new entries.
       if (openings.seeded) {
         this.derivedCacheCheckpointState.markChanged(true);
@@ -3132,6 +3143,7 @@ export class PanelProvider implements vscode.Disposable {
     this.draftCommentIds = normalizeDraftCommentIds(this.saved.draftCommentIds);
     this.pendingQueueDrains = new Set(Object.keys(this.queues));
     this.wireEditorListeners();
+    if (this.derivedMigrationPending) this.checkpointDerivedCache();
   }
 
   dispose(): void {
@@ -9021,12 +9033,14 @@ export class PanelProvider implements vscode.Disposable {
     }
   }
 
-  private checkpointDerivedCache(): void {
+  private checkpointDerivedCache(migrationRetry = false): void {
     if (this.disposed) return;
     if (!this.derivedCacheFile && !this.codexOpeningsFile) {
       return;
     }
-    const delay = this.derivedCacheCheckpointState.nextDelay(Date.now(), DERIVED_CACHE_CHECKPOINT_MS);
+    const delay = migrationRetry
+      ? DERIVED_CACHE_CHECKPOINT_MS
+      : this.derivedCacheCheckpointState.nextDelay(Date.now(), DERIVED_CACHE_CHECKPOINT_MS);
     if (delay === null) {
       return;
     }
@@ -9040,6 +9054,9 @@ export class PanelProvider implements vscode.Disposable {
       this.derivedCacheCheckpointTick = null;
       if (this.writeDerivedCache()) {
         this.derivedCacheCheckpointState.markSaved(Date.now());
+      } else if (this.derivedMigrationPending && this.derivedMigrationRetries < 2) {
+        this.derivedMigrationRetries++;
+        this.checkpointDerivedCache(true);
       }
     }, delay);
   }
@@ -9048,6 +9065,7 @@ export class PanelProvider implements vscode.Disposable {
   private writeDerivedCache(): boolean {
     if (this.disposed && !this.cacheShutdownFlushing) return true;
     const openings = this.codexOpenings?.write() ?? true;
+    if (this.derivedMigrationNeedsOpenings && this.codexOpenings?.seedPersisted !== true) return false;
     if (!this.derivedCacheFile) {
       return openings;
     }
@@ -9063,9 +9081,14 @@ export class PanelProvider implements vscode.Disposable {
           this.discoveryCheckpoint,
           this.commitRepositories.snapshot(),
         );
-      if (this.workspaceCache) return this.workspaceCache.write(write, this.cacheShutdownFlushing, file) && openings;
-      write();
-      return openings;
+      const published = this.workspaceCache
+        ? this.workspaceCache.write(write, this.cacheShutdownFlushing, file)
+        : (write(), true);
+      if (published && this.derivedMigrationPending) {
+        this.derivedMigrationPending = false;
+        this.startupCache.migration = 'saved';
+      }
+      return published && openings;
     } catch {
       /* an optional cache must not affect the panel */
     }
@@ -9836,7 +9859,7 @@ export class PanelProvider implements vscode.Disposable {
         rateSources: [],
         indexing: true,
         calculating: true,
-        indexingStatus: 'Updating…',
+        indexingStatus: 'Updatingâ€¦',
       };
     }
     const view = prepareProjectSpendView(this.displayedProjectSpendFiles(), publicProjectSpendPrice, {
@@ -9847,7 +9870,7 @@ export class PanelProvider implements vscode.Disposable {
     return {
       ...view,
       calculating: this.projectSpendBusy() && this.projectSpendVisibleFiles.length === 0,
-      indexingStatus: this.projectSpendBusy() ? 'Updating…' : null,
+      indexingStatus: this.projectSpendBusy() ? 'Updatingâ€¦' : null,
     };
   }
 
@@ -10615,6 +10638,12 @@ export class PanelProvider implements vscode.Disposable {
       this.publishSessionQueryContext();
     }
     const requestOrder = (this.discoveryRequestSequence = (this.discoveryRequestSequence ?? 0) + 1);
+    if (
+      !compatibleDiscovery(this.discoveryCheckpoint, CLAUDE_CHILD_REFERENCE_PARSER_VERSION, this.repositoryScopeRoots)
+    ) {
+      this.discoveryCheckpoint = undefined;
+      this.discoveryCompleted = undefined;
+    }
     const spendSources = this.discoveryCheckpoint?.spendSources ?? this.enumeratedSpendSources;
     const acknowledge = (result: import('./progressiveworker').ProgressiveResult): boolean => {
       const progress = result.value;
@@ -10640,7 +10669,12 @@ export class PanelProvider implements vscode.Disposable {
           (progress.kind === 'claude-children' ? (progress.scope ?? this.repositoryScopeRoots) : []),
       );
       if (scope !== JSON.stringify(this.repositoryScopeRoots)) return false;
-      if (checkpoint?.parserVersion !== undefined && checkpoint.parserVersion !== CLAUDE_CHILD_REFERENCE_PARSER_VERSION)
+      if (
+        checkpoint
+          ? !compatibleDiscovery(checkpoint, CLAUDE_CHILD_REFERENCE_PARSER_VERSION, this.repositoryScopeRoots)
+          : progress.kind !== 'claude-children' ||
+            progress.compatibility !== discoveryCompatibility(CLAUDE_CHILD_REFERENCE_PARSER_VERSION)
+      )
         return false;
       const previous = this.discoveryAcknowledgment;
       if (
@@ -14233,7 +14267,7 @@ export function registerPanel(
     context.extensionUri,
     context.workspaceState,
     projectSpendDirectory(workspaceCache.root),
-    path.join(workspaceCache.root, 'derived-session-cache.json'),
+    path.join(workspaceCache.root, 'derived-session-cache-v1.json'),
     path.join(cacheRoot(), 'codex-openings.json'),
     path.join(context.globalStorageUri.fsPath, 'prompt-assets'),
     output,
@@ -14242,6 +14276,7 @@ export function registerPanel(
     activationAt,
     path.join(arcHome(), 'startup'),
     health,
+    path.join(workspaceCache.root, 'derived-session-cache.json'),
   );
   context.subscriptions.push(
     provider,

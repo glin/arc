@@ -1,6 +1,7 @@
 import { test, vi } from 'vitest';
 import { randomUUID } from 'node:crypto';
 import { CLAUDE_CHILD_REFERENCE_PARSER_VERSION, METADATA_EXHAUSTED_RULE } from './derivedcache';
+import { discoveryCompatibility } from './progressiveworker';
 import { normalizeFsPath, type SessionFile } from './transcript';
 import assert from 'node:assert/strict';
 import { browserOrNone, SETTLED } from '../test/browser';
@@ -367,6 +368,7 @@ test.for([
     const before = await page.locator('#list').textContent();
     const session = { file: 'session.jsonl', sessionId: 'session', agent: 'claude', size: 1, mtimeMs: 1 };
     const checkpoint = {
+      compatibility: discoveryCompatibility(CLAUDE_CHILD_REFERENCE_PARSER_VERSION),
       epoch: randomUUID(),
       parserVersion: CLAUDE_CHILD_REFERENCE_PARSER_VERSION,
       parents: [session],
@@ -627,6 +629,7 @@ test('exhausted sources complete the session list through repeated full source c
     ]);
     const delivered: Promise<unknown>[] = [];
     const checkpoint = () => ({
+      compatibility: discoveryCompatibility(CLAUDE_CHILD_REFERENCE_PARSER_VERSION),
       epoch: randomUUID(),
       parserVersion: CLAUDE_CHILD_REFERENCE_PARSER_VERSION,
       parents: [healthy],

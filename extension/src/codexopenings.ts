@@ -304,12 +304,20 @@ export class CodexOpeningsWriter {
   private savedRevision: number;
   private walk: readonly string[] | null = null;
   private retry: ReturnType<typeof setTimeout> | null = null;
+  private seedDurable: boolean;
+  private readonly onSeedPersisted?: () => void;
 
   // Seeded workspace rows require a first shared save even if the walk adds nothing.
-  constructor(file: string, rows: OpeningRows, seeded: boolean) {
+  constructor(file: string, rows: OpeningRows, seeded: boolean, onSeedPersisted?: () => void) {
     this.file = file;
     this.rows = rows;
     this.savedRevision = seeded ? -1 : rows.revision;
+    this.seedDurable = !seeded;
+    this.onSeedPersisted = onSeedPersisted;
+  }
+
+  get seedPersisted(): boolean {
+    return this.seedDurable;
   }
 
   setWalk(walked: readonly string[]): void {
@@ -331,6 +339,10 @@ export class CodexOpeningsWriter {
     }
     if (saved) {
       this.savedRevision = revision;
+      if (!this.seedDurable) {
+        this.seedDurable = true;
+        this.onSeedPersisted?.();
+      }
     } else {
       this.retry ??= setTimeout(() => {
         this.retry = null;

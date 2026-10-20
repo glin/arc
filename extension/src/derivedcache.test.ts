@@ -1,3 +1,4 @@
+import { discoveryCompatibility } from './progressiveworker';
 import { test, vi } from 'vitest';
 import assert from 'node:assert';
 import * as fs from 'node:fs';
@@ -203,6 +204,7 @@ test('Claude pending cursors survive soft cache pressure and reject corrupt dura
   const parent = { file, sessionId: 'parent', agent: 'claude' as const, ...scan.cursor.revision };
   const discovery = {
     epoch: 'durable-epoch',
+    compatibility: discoveryCompatibility(CLAUDE_CHILD_REFERENCE_PARSER_VERSION),
     parserVersion: CLAUDE_CHILD_REFERENCE_PARSER_VERSION,
     parents: [parent],
     catalog: [parent],
@@ -414,7 +416,23 @@ test('reference cache retains a stable subset above its file cap', () => {
     { length: MAX_CLAUDE_CHILD_REFERENCE_FILES + 1 },
     (_unused, index) => [`/parent-${String(index).padStart(5, '0')}.jsonl`, entry],
   );
-  saveDerivedCache(file, [], rows);
+  const discovery = {
+    compatibility: discoveryCompatibility(CLAUDE_CHILD_REFERENCE_PARSER_VERSION),
+    parserVersion: CLAUDE_CHILD_REFERENCE_PARSER_VERSION,
+    parents: [],
+    catalog: [],
+    repositoryRoots: [],
+    completed: [rows.at(-1)![0]],
+    position: 0,
+    sequence: 1,
+  };
+  saveDerivedCache(file, [], rows, [], undefined, discovery);
+  assert.equal(
+    JSON.parse(fs.readFileSync(file, 'utf8')).discovery,
+    undefined,
+    'evicted relationships persisted dependent scheduling',
+  );
+  assert.equal(loadDerivedCache(file).discovery, undefined, 'evicted relationships retained dependent scheduling');
   const restored = loadDerivedCache(file).claudeChildReferences;
   assert.equal(restored.size, MAX_CLAUDE_CHILD_REFERENCE_FILES);
   assert.ok(restored.has(rows[0][0]));
@@ -2839,7 +2857,7 @@ test('version 42 null Bedrock lifetimes rebuild and persist with unchanged sourc
     assert.equal(persisted?.mtimeMs, before.mtimeMs);
     assert.equal(fs.statSync(source).size, before.size);
     assert.equal(fs.statSync(source).mtimeMs, before.mtimeMs);
-    assert.equal(JSON.parse(fs.readFileSync(cache, 'utf8')).version, VERSION);
+    assert.equal(JSON.parse(fs.readFileSync(cache, 'utf8')).metadataVersion, VERSION);
   }
 });
 
@@ -2911,4 +2929,130 @@ test('derived cache retains global Bedrock request effort without changing prici
   };
   saveDerivedCache(file, [['/session.jsonl', saved]]);
   assert.deepEqual(loadDerivedCache(file).titles.get('/session.jsonl'), saved);
+});
+
+// These families retain different semantic dependencies across quiet-source restarts.
+test('cache family admission and format fallback preserve only qualified facts', async () => {
+  const root = folder();
+  const current = path.join(root, 'derived-session-cache-v1.json');
+  const legacy = path.join(root, 'derived-session-cache.json');
+  const file = path.join(root, 'parent.jsonl');
+  fs.writeFileSync(file, '{"type":"ignored","text":"' + 'x'.repeat(100000) + '"}\n');
+  const scan = await scanClaudeRelationshipQuantum({ file, sessionId: 'parent' }, undefined, 32768);
+  const entry: ClaudeChildReferenceCacheEntry = {
+    parserVersion: CLAUDE_CHILD_REFERENCE_PARSER_VERSION,
+    source: 'claude',
+    sessionId: 'parent',
+    ...scan.cursor.evidence!.provisional,
+    childTranscript: false,
+    references: [],
+    complete: false,
+    claudeCursor: scan.cursor,
+  };
+  saveDerivedCache(current, [[file, title]], [[file, entry]]);
+  const supported = JSON.parse(fs.readFileSync(current, 'utf8'));
+  const old = { version: 63, titles: supported.titles, claudeChildReferences: supported.claudeChildReferences };
+  const legacyBytes = JSON.stringify(old);
+  fs.writeFileSync(legacy, legacyBytes);
+  const read = (value: unknown) => {
+    fs.writeFileSync(current, JSON.stringify(value));
+    return loadDerivedCache(current, legacy);
+  };
+  const mismatch = read({ ...supported, metadataVersion: VERSION - 1 });
+  assert.equal(mismatch.titles.size, 0);
+  assert.equal(mismatch.carriedNames.get(file)?.label, title.label);
+  assert.deepEqual(mismatch.claudeChildReferences.get(normalizeFsPath(file)), entry);
+  assert.equal(read({ ...supported, titles: null }).claudeChildReferences.size, 1);
+  assert.equal(read({ ...supported, claudeChildReferences: null }).titles.size, 1);
+  const discovery = {
+    compatibility: discoveryCompatibility(CLAUDE_CHILD_REFERENCE_PARSER_VERSION),
+    parserVersion: CLAUDE_CHILD_REFERENCE_PARSER_VERSION,
+    epoch: 'qualified',
+    parents: [],
+    catalog: [],
+    repositoryRoots: [root],
+    completed: [],
+    position: 0,
+    sequence: 1,
+  };
+  assert.ok(read({ ...supported, discovery }).discovery);
+  const rejected = read({
+    ...supported,
+    discovery,
+    claudeChildReferences: [{ file, entry: { ...entry, parserVersion: 25 } }],
+  });
+  assert.equal(rejected.titles.size, 1);
+  assert.equal(rejected.claudeChildReferences.size, 0);
+  assert.equal(rejected.discovery, undefined, 'a rejected relationship retained dependent discovery');
+  assert.equal(read({ ...supported, discovery: { ...discovery, compatibility: undefined } }).discovery, undefined);
+  assert.equal(read({ ...supported, formatVersion: 9 }).titles.size, 0);
+  fs.writeFileSync(current, '{');
+  assert.equal(loadDerivedCache(current, legacy).carriedNames.size, 0, 'corruption revived legacy names');
+  assert.equal(loadDerivedCache(current, legacy).titles.size, 0, 'corruption revived legacy metadata');
+  assert.equal(
+    loadDerivedCache(current, legacy).claudeChildReferences.size,
+    0,
+    'corruption revived legacy relationships',
+  );
+  const directory = path.join(root, 'directory');
+  fs.mkdirSync(directory);
+  assert.equal(loadDerivedCache(directory, legacy).titles.size, 0, 'a failed read revived legacy metadata');
+  fs.unlinkSync(current);
+  const imported = loadDerivedCache(current, legacy);
+  assert.equal(imported.migrationPending, true);
+  assert.equal(imported.claudeChildReferences.size, 1);
+  fs.writeFileSync(legacy, JSON.stringify({ ...old, version: 62 }));
+  assert.equal(
+    loadDerivedCache(current, legacy).claudeChildReferences.size,
+    0,
+    'unknown legacy rows acquired compatibility',
+  );
+  fs.writeFileSync(legacy, legacyBytes);
+  saveDerivedCache(current, [], imported.claudeChildReferences);
+  assert.equal(loadDerivedCache(current, legacy).carriedNames.size, 0, 'a removed name returned beside legacy data');
+  assert.equal(fs.readFileSync(legacy, 'utf8'), legacyBytes);
+});
+
+test('Codex cursor eviction discards dependent discovery while retaining the source row', async () => {
+  const root = folder();
+  const file = path.join(root, 'partial.jsonl');
+  const cache = path.join(root, 'cache.json');
+  fs.writeFileSync(file, JSON.stringify({ type: 'ignored', text: 'x'.repeat(100000) }) + '\n');
+  const scan = await scanCodexDispatchReferencesAsync(file, 'parent', null, 32768);
+  assert.ok(scan.cursor.offset > 0 && scan.cursor.offset < fs.statSync(file).size);
+  const entry: ClaudeChildReferenceCacheEntry = {
+    parserVersion: CLAUDE_CHILD_REFERENCE_PARSER_VERSION,
+    source: 'codex',
+    sessionId: 'parent',
+    ...scan.cursor.evidence!.provisional,
+    childTranscript: false,
+    references: [],
+    complete: false,
+    cursor: scan.cursor,
+  };
+  const discovery = {
+    compatibility: discoveryCompatibility(CLAUDE_CHILD_REFERENCE_PARSER_VERSION),
+    parserVersion: CLAUDE_CHILD_REFERENCE_PARSER_VERSION,
+    epoch: 'evicted-cursor',
+    parents: [],
+    catalog: [],
+    repositoryRoots: [root],
+    completed: [],
+    position: 1,
+    sequence: 1,
+  };
+  const serialized = JSON.stringify(scan.cursor);
+  const byteLength = Buffer.byteLength;
+  const size = vi
+    .spyOn(Buffer, 'byteLength')
+    .mockImplementation((value, encoding) => (value === serialized ? 65 * 1024 * 1024 : byteLength(value, encoding)));
+  try {
+    saveDerivedCache(cache, [], [[file, entry]], [], undefined, discovery);
+  } finally {
+    size.mockRestore();
+  }
+  const loaded = loadDerivedCache(cache);
+  assert.equal(loaded.claudeChildReferences.size, 1);
+  assert.equal(loaded.claudeChildReferences.get(normalizeFsPath(file))?.cursor, undefined);
+  assert.equal(loaded.discovery, undefined, 'an evicted partial cursor retained its scheduler');
 });

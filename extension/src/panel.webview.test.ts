@@ -1,4 +1,6 @@
 import { CommitRepositories } from './commitrepositories';
+import { CLAUDE_CHILD_REFERENCE_PARSER_VERSION } from './derivedcache';
+import { discoveryCompatibility } from './progressiveworker';
 import { sessionPageSources } from './sessionreads';
 import { sessionCoverageMember, reconcileSessionCollisions } from './sessioncoverage';
 import { runningKey } from './composerview';
@@ -1976,6 +1978,7 @@ test(
 );
 import {
   normalizeFullSessionTitle,
+  normalizeFsPath,
   normalizeSessionTitle,
   readSession,
   readSessionMeta,
@@ -8904,6 +8907,7 @@ test('dispatch figure posts retain pending revisions until the captured payload 
     run: async (_request: unknown, generation: number) => ({
       generation: stale ? generation - 1 : generation,
       value: {
+        compatibility: discoveryCompatibility(CLAUDE_CHILD_REFERENCE_PARSER_VERSION),
         kind: 'claude-children',
         complete: true,
         references: [],
@@ -10116,7 +10120,7 @@ test('derived session caches load, trim against the walk, and checkpoint after f
   const body = ctor;
   sourceMatch(
     body,
-    /loadDerivedCache\(this\.derivedCacheFile\)/,
+    /loadDerivedCache\(this\.derivedCacheFile, this\.legacyDerivedCacheFile\)/,
     'the provider does not restore the optional derived cache at startup',
   );
   sourceMatch(
@@ -10148,7 +10152,7 @@ test('derived session caches load, trim against the walk, and checkpoint after f
 
   const checkpointBody = memberFrom(
     panelHostSource,
-    panelHostSource.indexOf('private checkpointDerivedCache(): void {'),
+    panelHostSource.indexOf('private checkpointDerivedCache(migrationRetry = false): void {'),
   );
   sourceMatch(
     checkpointBody,
@@ -10176,7 +10180,7 @@ test('derived session caches load, trim against the walk, and checkpoint after f
   );
   sourceMatch(
     body,
-    /new CodexOpeningsWriter\(this\.codexOpeningsFile, this\.codexMetas, openings\.seeded\)/,
+    /new CodexOpeningsWriter\(this\.codexOpeningsFile, this\.codexMetas, openings\.seeded,/,
     'the Codex opening records have no durable write path, or a workspace seed never reaches the shared file',
   );
   sourceMatch(
@@ -10220,7 +10224,7 @@ test('derived session caches load, trim against the walk, and checkpoint after f
   );
   sourceMatch(
     panelHostSource,
-    /path\.join\(workspaceCache.root, 'derived-session-cache\.json'\),\s*path\.join\(cacheRoot\(\), 'codex-openings\.json'\)/,
+    /path\.join\(workspaceCache.root, 'derived-session-cache-v1\.json'\),\s*path\.join\(cacheRoot\(\), 'codex-openings\.json'\)/,
     'the derived cache is not stored in the current workspace cache partition, or the Codex opening records not once per machine',
   );
 });
@@ -11157,6 +11161,7 @@ test("the host counts a dispatched session in its parent's cost once and files i
         run: async () => ({
           generation: 1,
           value: {
+            compatibility: discoveryCompatibility(CLAUDE_CHILD_REFERENCE_PARSER_VERSION),
             kind: 'claude-children',
             complete: !pending,
             continuation: false,
@@ -27360,6 +27365,7 @@ function activityFallbackFixture(directory: string, children: { sessionId: strin
     run: async (_request: unknown, generation: number) => ({
       generation,
       value: {
+        compatibility: discoveryCompatibility(CLAUDE_CHILD_REFERENCE_PARSER_VERSION),
         kind: 'claude-children',
         complete: true,
         references: [],
@@ -32024,7 +32030,7 @@ test('provider registration routes retained-tab counts and build identity into d
   let attached = 0;
   class RegisteredProvider {
     constructor(...args: any[]) {
-      health = args.at(-1);
+      health = args[12];
     }
     healthCounts() {
       return { attached, ready: attached, retainedTabs: 2, panels: [] };
@@ -36186,6 +36192,7 @@ test('catalog prefix resolution suspends through discovery progress failure canc
     }
   };
   const checkpoint = {
+    compatibility: discoveryCompatibility(CLAUDE_CHILD_REFERENCE_PARSER_VERSION),
     epoch: 'query',
     sequence: 1,
     repositoryRoots: roots,
@@ -36208,6 +36215,7 @@ test('catalog prefix resolution suspends through discovery progress failure canc
         : {
             generation: 1,
             value: {
+              compatibility: discoveryCompatibility(CLAUDE_CHILD_REFERENCE_PARSER_VERSION),
               kind: 'claude-children',
               complete: true,
               continuation: false,
@@ -37943,3 +37951,229 @@ test('repository retention resolves a Claude child through its native launch ide
   provider.applyCommitRepositories({ agent: 'claude', sessionId: 'parent', file: 'C:/parent.jsonl' }, [child]);
   assert.deepEqual(files, ['C:/child.jsonl']);
 });
+
+// Legacy relationships and opening seeds must survive host publication without source changes.
+test.each(['early shutdown', 'lock retry', 'replacement retry', 'derived retry', 'bounded failure'])(
+  'legacy migration preserves relationships and its opening seed through %s',
+  async (ending) => {
+    const { CODEX_META_VERSION, CODEX_OPENINGS_RETRY_MS, loadCodexOpenings } = await import('./codexopenings.js');
+    const { CodexMetaCache } = await import('./codex.js');
+    const root = tempDir('legacy-migration-');
+    const current = path.join(root, 'derived-session-cache-v1.json');
+    const legacy = path.join(root, 'derived-session-cache.json');
+    const shared = path.join(root, 'codex-openings.json');
+    const rollout = path.join(root, 'rollout.jsonl');
+    const completed = path.join(root, 'completed.jsonl');
+    const empty = path.join(root, 'empty.jsonl');
+    const partial = path.join(root, 'partial.jsonl');
+    const write = (file: string, records: object[]) =>
+      fs.writeFileSync(file, records.map((record) => JSON.stringify(record) + '\n').join(''));
+    write(rollout, [
+      { type: 'session_meta', timestamp: '2025-12-31T23:59:59Z', payload: { id: 'seed', cwd: root, source: 'vscode' } },
+      {
+        type: 'event_msg',
+        timestamp: '2026-01-01T00:00:00Z',
+        payload: { type: 'task_started', turn_id: 'dispatch-turn' },
+      },
+      {
+        type: 'turn_context',
+        timestamp: '2026-01-01T00:00:00Z',
+        payload: { turn_id: 'dispatch-turn', cwd: root, model: 'gpt-6-astra', effort: 'high' },
+      },
+      {
+        type: 'event_msg',
+        timestamp: '2026-01-01T00:00:01Z',
+        payload: { type: 'item_completed', item: powershellDispatchExecution },
+      },
+      {
+        type: 'event_msg',
+        timestamp: '2026-01-01T00:00:02Z',
+        payload: { type: 'task_complete', turn_id: 'dispatch-turn' },
+      },
+    ]);
+    write(
+      completed,
+      claudeDispatchTranscript(
+        'python dispatch.py --runner claude --arc-dispatch',
+        'ARC_DISPATCH_SESSION={"agent":"claude","session_id":"5a7b07c1-bfcf-4d96-9eb2-8ef1fb609881","name":"Review migration"}',
+      ),
+    );
+    const prompt = {
+      type: 'user',
+      timestamp: '2026-01-01T00:00:00Z',
+      message: { role: 'user', content: 'Read migration inputs' },
+    };
+    write(empty, [prompt]);
+    write(partial, [prompt, { type: 'ignored', text: 'x'.repeat(128 * 1024) }]);
+    const sources = [completed, rollout, empty, partial].map((file, index) => ({
+      file,
+      sessionId: ['completed', 'seed', 'empty', 'partial'][index],
+      agent: file === rollout ? ('codex' as const) : ('claude' as const),
+      ...revisionOf(fs.statSync(file, { bigint: true })),
+    }));
+    const sourceBytes = new Map(sources.map(({ file }) => [file, fs.readFileSync(file)]));
+    const worker = new ProgressiveWorker('performance.now = () => 0;' + progressiveWorkerSource);
+    let relationships: import('./progressiveworker').ProgressiveResult | null | undefined;
+    let metadata: import('./progressiveworker').ProgressiveResult | null | undefined;
+    try {
+      relationships = await worker.run(
+        {
+          kind: 'claude-children',
+          parents: sources,
+          repositoryRoots: [root],
+          quantumBytes: 32768,
+          discoveryBytes: 65536,
+        },
+        1,
+        new AbortController().signal,
+      );
+      metadata = await worker.run({ kind: 'metadata', session: sources[0] }, 1, new AbortController().signal);
+    } finally {
+      worker.stop();
+    }
+    assert.equal(relationships?.value.kind, 'claude-children-progress');
+    assert.equal(metadata?.value.kind, 'metadata');
+    if (relationships?.value.kind !== 'claude-children-progress' || metadata?.value.kind !== 'metadata') return;
+    const label = metadata.value.entry.label;
+    const entries = new Map(
+      relationships.value.referenceEntries.map(([file, entry]) => [
+        file,
+        JSON.parse(JSON.stringify(entry)) as typeof entry,
+      ]),
+    );
+    const entry = (file: string) => entries.get(normalizeFsPath(file))!;
+    assert.equal(entry(completed).complete, true);
+    assert.equal(entry(completed).references[0]?.sessionId, '5a7b07c1-bfcf-4d96-9eb2-8ef1fb609881');
+    assert.equal(entry(rollout).complete, true);
+    assert.equal(entry(rollout).references[0]?.kind, 'dispatch');
+    assert.equal(entry(rollout).references[0]?.sessionId, '3f99580e');
+    assert.deepEqual(entry(rollout).references[0]?.toolUseIds, [powershellDispatchExecution.id]);
+    assert.equal(entry(empty).complete, true);
+    assert.deepEqual(entry(empty).references, []);
+    const offset = entry(partial).claudeCursor!.offset;
+    assert.ok(offset > 0 && offset < sources[3].size);
+    const rows = new CodexMetaCache();
+    const opening = rows.get(rollout);
+    assert.ok(opening);
+    const legacyBytes = JSON.stringify({
+      version: 63,
+      titles: [{ file: completed, entry: metadata.value.entry }],
+      claudeChildReferences: [...entries].map(([file, entry]) => ({ file, entry })),
+      discovery: relationships.value.checkpoint,
+      codexMetaVersion: CODEX_META_VERSION,
+      codexMetas: [{ file: rollout, meta: opening }],
+    });
+    fs.writeFileSync(legacy, legacyBytes);
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-01-01T00:00:00Z'));
+    const listener = vi.spyOn(PanelProvider.prototype as any, 'wireEditorListeners').mockImplementation(() => {});
+    const start = () =>
+      new PanelProvider(
+        '',
+        {} as vscode.Uri,
+        undefined,
+        undefined,
+        current,
+        shared,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        legacy,
+      );
+    let owner = start();
+    let provider = owner as any;
+    const assertRestored = () => {
+      assert.deepEqual(provider.claudeChildReferenceEntries, entries, 'constructor lost legacy relationship work');
+      assert.equal(provider.discoveryCheckpoint, undefined, 'legacy orchestration entered startup');
+      assert.equal(provider.sessionLabel(sources[0]).label, label);
+    };
+    const assertPublished = () => {
+      const reopened = loadDerivedCache(current, legacy);
+      assert.equal(reopened.reuse?.source, 'current');
+      assert.deepEqual(reopened.claudeChildReferences, entries, 'host publication lost legacy relationship work');
+      assert.equal(reopened.discovery, undefined, 'host publication restored legacy orchestration');
+      assert.equal(reopened.claudeChildReferences.get(normalizeFsPath(partial))?.claudeCursor?.offset, offset);
+      assert.equal(fs.readFileSync(legacy, 'utf8'), legacyBytes);
+      for (const [file, bytes] of sourceBytes) assert.deepEqual(fs.readFileSync(file), bytes);
+    };
+    const mutableFs = createRequire(__filename)('node:fs') as typeof fs;
+    let replacement: ReturnType<typeof vi.spyOn> | undefined;
+    try {
+      assertRestored();
+      await vi.advanceTimersByTimeAsync(0);
+      assert.equal(fs.existsSync(current), false, 'a pre-walk writer result hid the only legacy seed');
+      assert.equal(provider.codexOpenings.seedPersisted, false);
+      if (ending === 'early shutdown') {
+        owner.dispose();
+        assert.equal(fs.existsSync(current), false, 'shutdown published before seed durability');
+        owner = start();
+        provider = owner as any;
+        assertRestored();
+        assert.deepEqual(provider.codexMetas.get(rollout), opening);
+        provider.codexOpenings.setWalk([rollout]);
+        await vi.advanceTimersByTimeAsync(0);
+      } else if (ending === 'lock retry') {
+        provider.codexOpenings.setWalk([rollout]);
+        fs.writeFileSync(shared + '.lock', 'other window');
+        assert.equal(provider.writeDerivedCache(), false);
+        assert.equal(fs.existsSync(current), false, 'lock contention lost the legacy seed');
+        fs.unlinkSync(shared + '.lock');
+        await vi.advanceTimersByTimeAsync(CODEX_OPENINGS_RETRY_MS + 1);
+      } else {
+        provider.codexOpenings.setWalk([rollout]);
+        const rename = mutableFs.renameSync;
+        let attempts = 0;
+        replacement = vi.spyOn(mutableFs, 'renameSync').mockImplementation((from, to) => {
+          if (to === (ending === 'derived retry' ? current : shared)) {
+            attempts++;
+            throw Object.assign(new Error('refused shared replacement'), { code: 'EACCES' });
+          }
+          return rename(from, to);
+        });
+        syncBuiltinESMExports();
+        await vi.advanceTimersByTimeAsync(5 * 60 * 1000);
+        assert.equal(fs.existsSync(current), false, 'failed replacement lost the legacy seed');
+        if (ending === 'bounded failure') {
+          await vi.advanceTimersByTimeAsync(20 * 60 * 1000);
+          assert.equal(attempts, 2, 'migration retries exceeded their activation allowance');
+          assert.equal(provider.derivedCacheCheckpointState.dirty, true);
+          assert.equal(provider.startupCache.migration, 'unsaved');
+          replacement.mockRestore();
+          replacement = undefined;
+          syncBuiltinESMExports();
+          owner.dispose();
+          assert.ok(loadCodexOpenings(shared)?.has(rollout));
+          assertPublished();
+          owner = start();
+          provider = owner as any;
+          assertRestored();
+          return;
+        }
+        replacement.mockRestore();
+        replacement = undefined;
+        syncBuiltinESMExports();
+        await vi.advanceTimersByTimeAsync(5 * 60 * 1000);
+      }
+      assert.ok(loadCodexOpenings(shared)?.has(rollout), 'the seed never reached shared atomic storage');
+      assert.equal(provider.codexOpenings.seedPersisted, true);
+      assertPublished();
+      assert.equal(JSON.parse(fs.readFileSync(current, 'utf8')).codexMetas, undefined);
+      assert.equal(provider.startupCache.migration, 'saved');
+      owner.dispose();
+      owner = start();
+      provider = owner as any;
+      assertRestored();
+      assert.deepEqual(provider.codexMetas.get(rollout), opening);
+    } finally {
+      replacement?.mockRestore();
+      syncBuiltinESMExports();
+      owner.dispose();
+      listener.mockRestore();
+      vi.useRealTimers();
+    }
+  },
+);

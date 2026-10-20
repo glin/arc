@@ -1,4 +1,6 @@
 // @module-tag subprocess
+import { sessionStatsFromFacts } from './turncard';
+import { compatibleDiscovery, discoveryCompatibility } from './progressiveworker';
 import { claudeDispatchTranscript } from './turnfixtures';
 import { sessionCoverageMember, sessionPresence, reconcileSessionCollisions } from './sessioncoverage';
 import { sessionSourceKey, sessionPageSources } from './sessionreads';
@@ -368,7 +370,7 @@ test('selection measurement overlays use the real session button and leave untag
 test('selection measurement file traces retain descriptor ownership and available byte counts', () => {
   const tree = tempDir('selection-files');
   fs.writeFileSync(path.join(tree, 'trace.mjs'), TRACE_SOURCE);
-  fs.writeFileSync(path.join(tree, 'first.txt'), 'é');
+  fs.writeFileSync(path.join(tree, 'first.txt'), 'Ã©');
   fs.writeFileSync(path.join(tree, 'second.txt'), 'abc');
   const script = `import fs from 'node:fs'; import './trace.mjs';
     const first=fs.openSync('first.txt','r'); fs.readSync(first,Buffer.alloc(10),0,10,0); fs.closeSync(first);
@@ -1337,6 +1339,8 @@ function completeDiscoveryHarness(
     claudeSubagentMetaReader,
     claudeChildFileFor,
     codexSubagentFor,
+    compatibleDiscovery,
+    discoveryCompatibility,
     sessionCoverageMember,
     reconcileSessionCollisions,
     sessionCatalogMembership,
@@ -1782,7 +1786,7 @@ function metadataHarness(
       codexMetas = { get() { return undefined; } };
       derivedCacheCheckpointState = { markChanged() {} };
       claudeChildReferenceEntries = new Map(); codexOpenings = null; threadNames = { names: new Map(), fullNames: new Map() };
-      progressiveWorker; sessionNames; derivedCacheFile;
+      startupCache = {}; progressiveWorker; sessionNames; derivedCacheFile;
       constructor(run, sessionNames, derivedCacheFile) {
         this.progressiveWorker = { run }; this.sessionNames = sessionNames; this.derivedCacheFile = derivedCacheFile;
         ${restore}
@@ -3224,6 +3228,8 @@ test('pending Claude discovery acknowledges progress without replacing catalog r
   let spendUpdates = 0;
   provider.updateSessionSpendSources = () => spendUpdates++;
   const checkpoint = {
+    compatibility: discoveryCompatibility(CLAUDE_CHILD_REFERENCE_PARSER_VERSION),
+    parserVersion: CLAUDE_CHILD_REFERENCE_PARSER_VERSION,
     parents: rows,
     catalog: rows,
     repositoryRoots: ['project'],
@@ -3278,6 +3284,7 @@ test.each(['win32', 'darwin', 'linux'])('startup progress counts completed Windo
     provider.refreshGeneration = 4;
     const source = { ...claude, file: 'C:\\Users\\Reader\\Projects\\Session.JSONL' };
     const checkpoint = {
+      compatibility: discoveryCompatibility(CLAUDE_CHILD_REFERENCE_PARSER_VERSION),
       epoch: 'counter',
       parserVersion: CLAUDE_CHILD_REFERENCE_PARSER_VERSION,
       parents: [source],
@@ -3319,8 +3326,9 @@ test.each(['win32', 'darwin', 'linux'])(
       provider.refreshGeneration = 4;
       const files = ['C:\\Projects\\Session.JSONL', '/Repo/Session.jsonl', '/repo/session.jsonl'];
       const checkpoint = {
-        epoch: 'aliases',
+        compatibility: discoveryCompatibility(CLAUDE_CHILD_REFERENCE_PARSER_VERSION),
         parserVersion: CLAUDE_CHILD_REFERENCE_PARSER_VERSION,
+        epoch: 'aliases',
         parents: files.map((file) => ({ ...claude, file })),
         catalog: [{ ...claude, file: 'c:/projects/session.jsonl' }],
         repositoryRoots: ['project'],
@@ -3692,8 +3700,9 @@ test('refresh enumeration retains accepted spend sources until a complete Claude
     generation: number,
   ) => {
     const checkpoint = {
-      epoch: 'spend-epoch',
+      compatibility: discoveryCompatibility(CLAUDE_CHILD_REFERENCE_PARSER_VERSION),
       parserVersion: CLAUDE_CHILD_REFERENCE_PARSER_VERSION,
+      epoch: 'spend-epoch',
       parents: request.parents,
       catalog: request.parents,
       repositoryRoots: ['project'],
@@ -3769,8 +3778,9 @@ test('out-of-order complete and pending discovery cannot regress source acknowle
   provider.claudeParents = [claude];
   provider.checkpointDerivedCache = () => {};
   const checkpoint = (sequence: number, scope = 'project', epoch = 'current') => ({
-    epoch,
+    compatibility: discoveryCompatibility(CLAUDE_CHILD_REFERENCE_PARSER_VERSION),
     parserVersion: CLAUDE_CHILD_REFERENCE_PARSER_VERSION,
+    epoch,
     sequence,
     parents: [claude],
     catalog: [claude],
@@ -4337,6 +4347,8 @@ test('opening records the cold pass reads reach the checkpoint and the shared fi
   provider.derivedCacheFile = null;
   // Cached titles leave opening records as the only checkpoint changes.
   const checkpoint = {
+    compatibility: discoveryCompatibility(CLAUDE_CHILD_REFERENCE_PARSER_VERSION),
+    parserVersion: CLAUDE_CHILD_REFERENCE_PARSER_VERSION,
     dirty: false,
     markChanged() {
       this.dirty = true;
@@ -4720,7 +4732,8 @@ function titlePublicationHarness(sessions: any[], run: any, cacheFile?: string):
     discovery: Promise.resolve(true),
     titles: cached?.titles ?? new Map(),
     carriedNames: cached?.carriedNames ?? new Map(),
-    claudeChildReferenceEntries: new Map(),
+    claudeChildReferenceEntries: cached?.claudeChildReferenceEntries ?? new Map(),
+    discoveryCheckpoint: cached?.discoveryCheckpoint,
     sessionNames: new SessionNames(),
     threadNames: { stamp: '', names: new Map(), fullNames: new Map() },
     codexMetas: { get: () => undefined },
@@ -4750,7 +4763,7 @@ function titlePublicationHarness(sessions: any[], run: any, cacheFile?: string):
   return provider;
 }
 
-function titleRollout(directory: string, id: string, title: string, bytes = 0) {
+function titleRollout(directory: string, id: string, title: string, bytes = 0): SessionFile & { activity: number } {
   const file = path.join(directory, `${id}.jsonl`);
   fs.writeFileSync(
     file,
@@ -4763,7 +4776,13 @@ function titleRollout(directory: string, id: string, title: string, bytes = 0) {
       .map((record) => JSON.stringify(record))
       .join('\n') + '\n',
   );
-  return { file, sessionId: id, agent: 'codex', ...revisionOf(fs.statSync(file, { bigint: true })), activity: 1 };
+  return {
+    file,
+    sessionId: id,
+    agent: 'codex' as const,
+    ...revisionOf(fs.statSync(file, { bigint: true })),
+    activity: 1,
+  };
 }
 
 let titleWorkerSource: string;
@@ -5675,6 +5694,7 @@ function bumpedCatalogHarness(scope: Record<string, unknown> = {}) {
         Promise.resolve({
           generation,
           value: {
+            compatibility: discoveryCompatibility(CLAUDE_CHILD_REFERENCE_PARSER_VERSION),
             kind: 'claude-children',
             roots: _request.kind === 'claude-children' ? _request.parents : [],
             complete: true,
@@ -9254,6 +9274,7 @@ test.each([false, true])(
       });
       {
         const checkpoint = {
+          compatibility: discoveryCompatibility(CLAUDE_CHILD_REFERENCE_PARSER_VERSION),
           epoch: randomUUID(),
           parserVersion: CLAUDE_CHILD_REFERENCE_PARSER_VERSION,
           parents: [session],
@@ -9388,8 +9409,9 @@ function exhaustedLoadingHarness(extraMethods: string[] = [], scope: Record<stri
     discovery.before?.(generation, signal);
     if (discovery.fail) return null;
     const checkpoint = {
-      epoch: randomUUID(),
+      compatibility: discoveryCompatibility(CLAUDE_CHILD_REFERENCE_PARSER_VERSION),
       parserVersion: CLAUDE_CHILD_REFERENCE_PARSER_VERSION,
+      epoch: randomUUID(),
       parents: [healthy, ...discovery.more],
       catalog: [healthy, ...discovery.more],
       repositoryRoots: discovery.roots?.() ?? ['project'],
@@ -12739,5 +12761,282 @@ test.each(['selected', 'background'] as const)(
     } finally {
       vi.useRealTimers();
     }
+  },
+);
+
+// A metadata-only generation change must retain qualified relationship work through the startup barrier.
+test('metadata-only upgrade resumes relationships before ordinary startup metadata recovery', async () => {
+  const root = tempDir('metadata-upgrade-');
+  const doneFile = path.join(root, 'done.jsonl');
+  const partialFile = path.join(root, 'pending.jsonl');
+  const user = (id: string) =>
+    JSON.stringify({
+      type: 'user',
+      sessionId: id,
+      uuid: id,
+      timestamp: '2026-01-01T00:00:00Z',
+      message: { role: 'user', content: 'Read ' + id },
+    }) + '\n';
+  fs.writeFileSync(doneFile, user('done'));
+  fs.writeFileSync(
+    partialFile,
+    user('pending') + JSON.stringify({ type: 'ignored', text: 'x'.repeat(2 * 1024 * 1024) }) + '\n',
+  );
+  const source = (file: string, sessionId: string) => ({
+    file,
+    sessionId,
+    agent: 'claude' as const,
+    ...revisionOf(fs.statSync(file, { bigint: true })),
+    activity: 1,
+  });
+  const sources = [
+    source(doneFile, 'done'),
+    titleRollout(root, 'codex', 'Codex completed'),
+    source(partialFile, 'pending'),
+  ];
+  const cache = path.join(root, 'derived-session-cache-v1.json');
+  const quantumClock = 'let tick = 0; performance.now = () => ++tick;';
+  let worker = titleWorker(quantumClock);
+  const { provider: seed } = bumpedCatalogHarness();
+  Object.assign(seed, {
+    refreshGeneration: 4,
+    authoritativeCatalog: sources,
+    catalog: { sessions: sources },
+    claudeParents: sources,
+    repositoryScopeRoots: [root],
+    claudeChildReferenceEntries: new Map(),
+    checkpointDerivedCache() {},
+  });
+  const stop = new AbortController();
+  try {
+    seed.progressiveWorker = {
+      run: (
+        request: ProgressiveRequest,
+        generation: number,
+        signal: AbortSignal,
+        accept: (reply: ProgressiveResult) => boolean,
+      ) =>
+        worker.run(
+          request.kind === 'claude-children' ? { ...request, quantumBytes: 65536 } : request,
+          generation,
+          signal,
+          (reply) => {
+            assert.equal(accept(reply), true);
+            const held = seed.claudeChildReferenceEntries.get(normalizeFsPath(partialFile));
+            if (held?.claudeCursor?.offset > 0 && held.claudeCursor.offset < sources[2].size) stop.abort();
+          },
+        ),
+    };
+    await seed.prepareClaudeChildren(4, stop.signal);
+    const before = seed.claudeChildReferenceEntries.get(normalizeFsPath(partialFile)).claudeCursor.offset;
+    assert.ok(before > 0 && before < sources[2].size);
+    assert.equal(seed.claudeChildReferenceEntries.get(normalizeFsPath(doneFile)).complete, true);
+    const meta = await worker.run({ kind: 'metadata', session: sources[0] }, 4, new AbortController().signal);
+    assert.equal(meta?.value.kind, 'metadata');
+    if (meta?.value.kind !== 'metadata') return;
+    saveDerivedCache(
+      cache,
+      [[doneFile, meta.value.entry]],
+      seed.claudeChildReferenceEntries,
+      [],
+      undefined,
+      seed.discoveryCheckpoint,
+    );
+    const stored = JSON.parse(fs.readFileSync(cache, 'utf8'));
+    stored.metadataVersion = VERSION - 1;
+    fs.writeFileSync(cache, JSON.stringify(stored));
+    worker.stop();
+    worker = titleWorker(quantumClock);
+    const requests: string[] = [];
+    let charged = 0;
+    const run = (
+      request: ProgressiveRequest,
+      generation: number,
+      signal: AbortSignal,
+      accept?: (reply: ProgressiveResult) => boolean,
+    ) => {
+      requests.push(request.kind);
+      let observed = 0;
+      const observe = (reply: ProgressiveResult) => {
+        if (
+          reply.value.kind === 'claude-children' ||
+          reply.value.kind === 'claude-children-progress' ||
+          reply.value.kind === 'claude-children-delta'
+        )
+          observed = Math.max(observed, reply.value.charges?.readBytes ?? 0);
+      };
+      return worker
+        .run(
+          request.kind === 'claude-children' ? { ...request, quantumBytes: 65536 } : request,
+          generation,
+          signal,
+          (reply) => {
+            observe(reply);
+            return accept?.(reply);
+          },
+        )
+        .then((reply) => {
+          if (reply) observe(reply);
+          charged += observed;
+          return reply;
+        });
+    };
+    const first = titlePublicationHarness(sources, run, cache);
+    const configure = (provider: any) =>
+      Object.assign(provider, {
+        prepareClaudeChildren: seed.prepareClaudeChildren,
+        repositoryScopeRoots: [root],
+        claudeParents: sources,
+        claudeChildStatWrites: new Map(),
+        claudeChildren: [],
+        pruneDerivedTitles: () => false,
+        updateSessionSpendSources() {},
+        checkpointDerivedCache() {},
+      });
+    configure(first);
+    first.useSessionStats(sessionStatsFromFacts);
+    assert.equal(first.titles.size, 0, 'rejected metadata entered startup');
+    assert.equal(first.carriedNames.get(doneFile)?.label, meta.value.entry.label);
+    assert.equal(first.claudeChildReferenceEntries.get(normalizeFsPath(partialFile)).claudeCursor.offset, before);
+    await first.refresh(true);
+    const after = first.claudeChildReferenceEntries.get(normalizeFsPath(partialFile)).claudeCursor.offset;
+    assert.ok(after > before, 'the restart replayed partial relationships');
+    assert.equal(requests.includes('metadata'), false, 'metadata passed pending relationship discovery');
+    first.anyVisible = () => false;
+    await vi.waitFor(() => assert.equal(first.refreshController, null));
+    assert.equal(first.writeDerivedCache(), true);
+    worker.stop();
+    worker = titleWorker(quantumClock);
+    const second = titlePublicationHarness(sources, run, cache);
+    configure(second);
+    second.useSessionStats(sessionStatsFromFacts);
+    await second.refresh(true);
+    await vi.waitFor(() => assert.ok(second.titles.has(doneFile), 'ordinary startup never recovered metadata'), {
+      timeout: 10000,
+    });
+    second.anyVisible = () => false;
+    await vi.waitFor(() => assert.equal(second.refreshController, null));
+    assert.ok(
+      charged < sources.reduce((sum, item) => sum + item.size, 0),
+      'the metadata change replayed the whole corpus',
+    );
+    assert.equal(second.writeDerivedCache(), true);
+    assert.ok(loadDerivedCache(cache).titles.has(doneFile));
+    const metadataCalls = requests.filter((kind) => kind === 'metadata').length;
+    second.anyVisible = () => true;
+    await second.refresh(true);
+    assert.equal(
+      requests.filter((kind) => kind === 'metadata').length,
+      metadataCalls,
+      'unchanged recovered metadata was read again',
+    );
+    second.anyVisible = () => false;
+    await vi.waitFor(() => assert.equal(second.refreshController, null));
+    worker.stop();
+    worker = titleWorker(quantumClock);
+    let replayBytes = 0;
+    let complete = false;
+    for (let pass = 0; pass < 128 && !complete; pass++) {
+      const reply = await worker.run(
+        { kind: 'claude-children', parents: sources, repositoryRoots: [root], quantumBytes: 65536 },
+        1,
+        new AbortController().signal,
+      );
+      if (reply?.value.kind === 'claude-children' || reply?.value.kind === 'claude-children-progress') {
+        replayBytes += reply.value.charges?.readBytes ?? 0;
+        complete = reply.value.kind === 'claude-children';
+      }
+    }
+    assert.equal(complete, true);
+    assert.ok(charged < replayBytes, 'retained progress saved no relationship reads');
+    // The replay reference differs only in retained relationship state. Metadata reads are excluded.
+    assert.ok(replayBytes >= sources.reduce((sum, item) => sum + item.size, 0));
+    assert.equal(
+      replayBytes - charged,
+      before + sources[0].size + sources[1].size,
+      'read accounting lost retained source bytes',
+    );
+  } finally {
+    worker.stop();
+  }
+});
+
+test.each(['scope', 'stamp', 'missing stamp'])(
+  'startup rejects stale discovery %s before attaching spend associations',
+  async (failure) => {
+    const { provider, claude } = bumpedCatalogHarness();
+    const current = {
+      claude: [{ file: claude.file, sessionId: 'current-source', primary: true }],
+      codex: [],
+      children: [],
+    };
+    const stale = {
+      claude: [{ file: 'stale.jsonl', sessionId: 'stale-source', primary: true }],
+      codex: [],
+      children: [{ file: 'stale-child.jsonl', threadId: 'stale-child' }],
+    };
+    const fresh = {
+      compatibility: discoveryCompatibility(CLAUDE_CHILD_REFERENCE_PARSER_VERSION),
+      parserVersion: CLAUDE_CHILD_REFERENCE_PARSER_VERSION,
+      epoch: 'fresh',
+      parents: [claude],
+      catalog: [claude],
+      repositoryRoots: ['project'],
+      completed: [],
+      position: 0,
+      sequence: 1,
+    };
+    Object.assign(provider, {
+      refreshGeneration: 4,
+      claudeParents: [claude],
+      enumeratedSpendSources: current,
+      claudeChildStatWrites: new Map(),
+      checkpointDerivedCache() {},
+      discoveryCheckpoint: {
+        ...fresh,
+        epoch: 'stale',
+        repositoryRoots: failure === 'scope' ? ['other'] : ['project'],
+        compatibility: failure === 'stamp' ? 'old' : failure === 'missing stamp' ? undefined : fresh.compatibility,
+        spendSources: stale,
+      },
+    });
+    provider.progressiveWorker.run = async (
+      request: any,
+      generation: number,
+      _signal: AbortSignal,
+      accept: (reply: any) => boolean,
+    ) => {
+      assert.equal(request.discovery, undefined, 'stale scheduling reached the worker');
+      assert.deepEqual(request.codexChildren, current.children, 'stale children reached the worker');
+      assert.equal(
+        accept({
+          generation,
+          value: { kind: 'claude-children-progress', checkpoint: fresh, referenceEntries: [], continuation: true },
+        }),
+        true,
+      );
+      return {
+        generation,
+        value: {
+          kind: 'claude-children',
+          checkpoint: fresh,
+          referenceEntries: [],
+          roots: [claude],
+          children: [],
+          references: [],
+          dispatchFacts: [],
+          complete: true,
+          continuation: false,
+        },
+      };
+    };
+    assert.equal(await provider.prepareClaudeChildren(4, new AbortController().signal), true);
+    assert.deepEqual((fresh as any).spendSources, current, 'a replacement checkpoint captured stale spend sources');
+    assert.deepEqual(
+      provider.claudeSpendSources,
+      current.claude,
+      'installed spend sources retained stale associations',
+    );
+    assert.deepEqual(provider.codexSubagents, []);
   },
 );

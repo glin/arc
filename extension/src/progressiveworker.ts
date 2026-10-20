@@ -1,4 +1,5 @@
 import { Worker } from 'node:worker_threads';
+import { CODEX_META_VERSION } from './codexopenings';
 import { brotliDecompressSync } from 'node:zlib';
 import { CODEX_TITLE_BYTES, type CodexSessionMeta, type CodexSubagentFile } from './codex';
 import type { ClaudeChildReferenceCacheEntry, DerivedTitleEntry } from './derivedcache';
@@ -165,6 +166,7 @@ export interface DispatchSessionFacts {
   person: boolean;
 }
 export interface DiscoveryCheckpoint {
+  compatibility?: string;
   spendSources?: {
     claude: import('./projectspend').SessionSpendSource[];
     codex: { file: string }[];
@@ -180,6 +182,90 @@ export interface DiscoveryCheckpoint {
   sequence: number;
   protectedFile?: string;
 }
+
+const DISCOVERY_ENVELOPE_VERSION = 1;
+// Bump when persisted membership or spend-source admission changes.
+const DISCOVERY_ADMISSION_VERSION = 1;
+
+export function discoveryCompatibility(relationshipVersion: number): string {
+  return JSON.stringify([
+    DISCOVERY_ENVELOPE_VERSION,
+    relationshipVersion,
+    DISCOVERY_ADMISSION_VERSION,
+    CODEX_META_VERSION,
+  ]);
+}
+
+export function compatibleDiscovery(
+  value: DiscoveryCheckpoint | undefined,
+  relationshipVersion: number,
+  roots?: readonly string[],
+): boolean {
+  return (
+    !!value &&
+    value.compatibility === discoveryCompatibility(relationshipVersion) &&
+    value.parserVersion === relationshipVersion &&
+    (roots === undefined || JSON.stringify(value.repositoryRoots) === JSON.stringify(roots))
+  );
+}
+// Validates persisted scheduling before a reader exposes catalog or spend-source fields.
+export function validDiscoveryCheckpoint(value: unknown): value is DiscoveryCheckpoint {
+  const record = (row: unknown): row is Record<string, any> => !!row && typeof row === 'object' && !Array.isArray(row);
+  const nonEmptyText = (row: unknown): row is string => typeof row === 'string' && row.length > 0;
+  const fileName = nonEmptyText;
+  const nonNegative = (row: unknown): row is number => typeof row === 'number' && Number.isFinite(row) && row >= 0;
+  return (
+    record(value) &&
+    (value.epoch === undefined || nonEmptyText(value.epoch)) &&
+    (value.parserVersion === undefined || nonNegative(value.parserVersion)) &&
+    (value.spendSources === undefined ||
+      (record(value.spendSources) &&
+        Array.isArray(value.spendSources.claude) &&
+        value.spendSources.claude.every(
+          (source: unknown) =>
+            record(source) &&
+            fileName(source.file) &&
+            nonEmptyText(source.sessionId) &&
+            (source.primary === undefined || typeof source.primary === 'boolean') &&
+            (source.nativeParentFile === undefined || fileName(source.nativeParentFile)) &&
+            (source.dispatchedFrom === undefined || nonEmptyText(source.dispatchedFrom)),
+        ) &&
+        Array.isArray(value.spendSources.codex) &&
+        value.spendSources.codex.every((source: unknown) => record(source) && fileName(source.file)) &&
+        Array.isArray(value.spendSources.children) &&
+        value.spendSources.children.every(
+          (child: unknown) =>
+            record(child) &&
+            fileName(child.file) &&
+            nonEmptyText(child.threadId) &&
+            (child.parentThreadId === null || nonEmptyText(child.parentThreadId)) &&
+            (child.agentPath === null || typeof child.agentPath === 'string') &&
+            (child.openedAt === null || nonNegative(child.openedAt)) &&
+            (child.startedAt === null || nonNegative(child.startedAt)) &&
+            (child.threadSource === null || typeof child.threadSource === 'string') &&
+            typeof child.backgroundReview === 'boolean',
+        ))) &&
+    Array.isArray(value.parents) &&
+    Array.isArray(value.catalog) &&
+    Array.isArray(value.repositoryRoots) &&
+    value.repositoryRoots.every(fileName) &&
+    Array.isArray(value.completed) &&
+    value.completed.every(fileName) &&
+    nonNegative(value.position) &&
+    nonNegative(value.sequence) &&
+    (value.protectedFile === undefined || fileName(value.protectedFile)) &&
+    [...value.parents, ...value.catalog].every(
+      (row: unknown) =>
+        record(row) &&
+        fileName(row.file) &&
+        nonEmptyText(row.sessionId) &&
+        (row.agent === 'claude' || row.agent === 'codex') &&
+        nonNegative(row.size) &&
+        nonNegative(row.mtimeMs),
+    )
+  );
+}
+
 // `readBytes` counts relationship scan bytes and bounds each request, so the other relationship file work has its own fields.
 // A parent check counts every stat of a candidate source. A file count names each file once per measured pass.
 // The dispatch visit count includes sessions whose held facts read nothing. The reread count excludes them.
@@ -241,6 +327,7 @@ export type ProgressiveValue =
   | ({ kind: 'commit-repositories' } & CommitRepositoryReply)
   | {
       kind: 'claude-children';
+      compatibility?: string;
       references: ClaudeChildSessionReference[];
       children: ClaudeChildSessionFile[];
       referenceEntries: Array<[string, ClaudeChildReferenceCacheEntry]>;

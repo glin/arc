@@ -112,7 +112,13 @@ import type {
   DiscoveryCharges,
 } from './progressiveworker';
 import type { DispatchSessionFacts, WorkerWindowRead } from './progressiveworker';
-import { progressiveTurns, workerErrorIdentity } from './progressiveworker';
+import {
+  progressiveTurns,
+  workerErrorIdentity,
+  discoveryCompatibility,
+  compatibleDiscovery,
+  validDiscoveryCheckpoint,
+} from './progressiveworker';
 import { TURN_QUIET_MS, statusOf } from './turncard';
 
 const agentSpends = new AgentSpendCache();
@@ -351,8 +357,8 @@ async function execute(
     const scope = JSON.stringify(request.repositoryRoots);
     const heldEpoch = discoveryEpoch;
     if (
-      request.discovery &&
-      request.discovery.parserVersion === CLAUDE_CHILD_REFERENCE_PARSER_VERSION &&
+      validDiscoveryCheckpoint(request.discovery) &&
+      compatibleDiscovery(request.discovery, CLAUDE_CHILD_REFERENCE_PARSER_VERSION, request.repositoryRoots) &&
       JSON.stringify(request.discovery.repositoryRoots) === scope &&
       (!discoveryEpoch ||
         (request.discovery.epoch === discoveryEpoch.epoch && request.discovery.sequence >= discoveryEpoch.sequence))
@@ -361,6 +367,7 @@ async function execute(
     if (!discoveryEpoch || JSON.stringify(discoveryEpoch.repositoryRoots) !== scope) {
       discoveryEpoch = {
         epoch: randomUUID(),
+        compatibility: discoveryCompatibility(CLAUDE_CHILD_REFERENCE_PARSER_VERSION),
         parserVersion: CLAUDE_CHILD_REFERENCE_PARSER_VERSION,
         parents: request.parents,
         catalog: request.catalog ?? request.parents,
