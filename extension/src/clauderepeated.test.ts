@@ -983,7 +983,7 @@ describe('bounded readers before the repeated-record map covers their window', (
 
   test(
     'the progressive worker starts from the host map, or completes its own and shows the newest genuine records',
-    { timeout: 60_000 },
+    { tags: ['subprocess'], timeout: 60_000 },
     async () => {
       const source = buildSync({
         entryPoints: [path.join(__dirname, 'progressiveworker-entry.ts')],
@@ -1295,7 +1295,7 @@ describe('repeated-record state follows the file revision', () => {
   ];
   for (const [kindName, build, early] of kinds) {
     for (const [changeName, bytes, after] of changes) {
-      test(`${kindName} after ${changeName} gives the map of the final bytes`, () => {
+      test(`${kindName} after ${changeName} gives the map of the final bytes`, { tags: ['subprocess'] }, () => {
         const expected = reference(bytes);
         const file = fresh();
         fs.writeFileSync(file, v1);

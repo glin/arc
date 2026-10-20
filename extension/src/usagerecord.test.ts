@@ -732,85 +732,95 @@ test('terminal extension shutdown closes recorder admission before draining work
   await result;
 });
 
-test('independent hosts serialize near-cap writes and keep different slots independent', async () => {
-  const { root } = await populated();
-  const script = path.join(tempDir('bounded-process-'), 'writer.cjs');
-  buildSync({
-    stdin: {
-      contents: `const {UsageRecorder}=require(${JSON.stringify(path.join(__dirname, 'usagerecord.ts'))}); const fs=require('node:fs'); let release; const hold=new Promise(r=>release=r); process.on('message', async (message)=>{ if(message==='release'){release();return;} const {root,at,reading,pause}=message; const filesystem={...fs.promises,open:async(...args)=>{const handle=await fs.promises.open(...args); return new Proxy(handle,{get(target,key){ if(pause&&String(args[0]).endsWith('.gz')&&key==='write') return async(...values)=>{process.send('writing'); await hold; return target.write(...values);}; const value=Reflect.get(target,key,target); return typeof value==='function'?value.bind(target):value;}});}}; const recorder=new UsageRecorder(root,{now:()=>at,filesystem}); recorder.record('claude',reading); await recorder.drain(); process.send('done'); process.disconnect(); }); process.send('ready');`,
-      resolveDir: __dirname,
-    },
-    bundle: true,
-    platform: 'node',
-    format: 'cjs',
-    outfile: script,
-  });
-  const files = slotFiles(root);
-  const member = gzipSync(Buffer.from(usageRecordLines('claude', sample()).join('\n') + '\n'));
-  let seed = randomBytes(USAGE_PAYLOAD_BYTES - member.length - 1400);
-  let compressed = gzipSync(seed);
-  const difference = USAGE_PAYLOAD_BYTES - Math.floor(member.length * 1.5) - compressed.length;
-  seed = Buffer.concat([seed, randomBytes(Math.max(0, difference))]).subarray(0, seed.length + difference);
-  compressed = gzipSync(seed);
-  assert.ok(
-    compressed.length + member.length <= USAGE_PAYLOAD_BYTES &&
-      compressed.length + 2 * member.length > USAGE_PAYLOAD_BYTES,
-  );
-  fs.writeFileSync(files.data, compressed);
-  fs.writeFileSync(
-    files.meta,
-    JSON.stringify({ v: 1, day: files.day, generation: randomUUID(), compressed: compressed.length, raw: seed.length }),
-  );
-  const runPair = async (times: number[], pause = false) => {
-    const children = times.map(() => spawn(process.execPath, [script], { stdio: ['ignore', 'pipe', 'pipe', 'ipc'] }));
-    const states = children.map(() => ({ ready: false, writing: false, done: false }));
-    const done = children.map(
-      (child, index) =>
-        new Promise<void>((resolve, reject) => {
-          child.on('message', (message) => {
-            if (message === 'ready') states[index].ready = true;
-            if (message === 'writing') states[index].writing = true;
-            if (message === 'done') states[index].done = true;
-          });
-          child.once('error', reject);
-          child.once('close', (code) => (code === 0 ? resolve() : reject(new Error(`writer exited ${code}`))));
-        }),
+test(
+  'independent hosts serialize near-cap writes and keep different slots independent',
+  { tags: ['subprocess'], timeout: 20_000 },
+  async () => {
+    const { root } = await populated();
+    const script = path.join(tempDir('bounded-process-'), 'writer.cjs');
+    buildSync({
+      stdin: {
+        contents: `const {UsageRecorder}=require(${JSON.stringify(path.join(__dirname, 'usagerecord.ts'))}); const fs=require('node:fs'); let release; const hold=new Promise(r=>release=r); process.on('message', async (message)=>{ if(message==='release'){release();return;} const {root,at,reading,pause}=message; const filesystem={...fs.promises,open:async(...args)=>{const handle=await fs.promises.open(...args); return new Proxy(handle,{get(target,key){ if(pause&&String(args[0]).endsWith('.gz')&&key==='write') return async(...values)=>{process.send('writing'); await hold; return target.write(...values);}; const value=Reflect.get(target,key,target); return typeof value==='function'?value.bind(target):value;}});}}; const recorder=new UsageRecorder(root,{now:()=>at,filesystem}); recorder.record('claude',reading); await recorder.drain(); process.send('done'); process.disconnect(); }); process.send('ready');`,
+        resolveDir: __dirname,
+      },
+      bundle: true,
+      platform: 'node',
+      format: 'cjs',
+      outfile: script,
+    });
+    const files = slotFiles(root);
+    const member = gzipSync(Buffer.from(usageRecordLines('claude', sample()).join('\n') + '\n'));
+    let seed = randomBytes(USAGE_PAYLOAD_BYTES - member.length - 1400);
+    let compressed = gzipSync(seed);
+    const difference = USAGE_PAYLOAD_BYTES - Math.floor(member.length * 1.5) - compressed.length;
+    seed = Buffer.concat([seed, randomBytes(Math.max(0, difference))]).subarray(0, seed.length + difference);
+    compressed = gzipSync(seed);
+    assert.ok(
+      compressed.length + member.length <= USAGE_PAYLOAD_BYTES &&
+        compressed.length + 2 * member.length > USAGE_PAYLOAD_BYTES,
     );
-    try {
-      await vi.waitFor(() => assert.ok(states.every((state) => state.ready)), { timeout: 10_000 });
-      if (pause) {
-        children[0].send({ root, at: times[0], reading: sample(times[0]), pause: true });
-        await vi.waitFor(() => assert.equal(states[0].writing, true));
-        assert.ok(physicalBytes(root) <= USAGE_PAYLOAD_BYTES + USAGE_OVERHEAD_BYTES + 18);
-        children[1].send({ root, at: times[1], reading: sample(times[1], 0.9), pause: true });
-        await vi.waitFor(() => assert.ok(states[1].done || states[1].writing));
-        assert.equal(states[1].writing, false, 'another host entered a slot whose owner is still writing');
-        children[0].send('release');
-      } else {
-        for (let i = 0; i < children.length; i++) children[i].send({ root, at: times[i], reading: sample(times[i]) });
-      }
-      await Promise.all(done);
-    } finally {
-      for (const child of children)
-        if (child.exitCode === null) {
-          if (child.connected) child.send('release');
-          child.kill();
+    fs.writeFileSync(files.data, compressed);
+    fs.writeFileSync(
+      files.meta,
+      JSON.stringify({
+        v: 1,
+        day: files.day,
+        generation: randomUUID(),
+        compressed: compressed.length,
+        raw: seed.length,
+      }),
+    );
+    const runPair = async (times: number[], pause = false) => {
+      const children = times.map(() => spawn(process.execPath, [script], { stdio: ['ignore', 'pipe', 'pipe', 'ipc'] }));
+      const states = children.map(() => ({ ready: false, writing: false, done: false }));
+      const done = children.map(
+        (child, index) =>
+          new Promise<void>((resolve, reject) => {
+            child.on('message', (message) => {
+              if (message === 'ready') states[index].ready = true;
+              if (message === 'writing') states[index].writing = true;
+              if (message === 'done') states[index].done = true;
+            });
+            child.once('error', reject);
+            child.once('close', (code) => (code === 0 ? resolve() : reject(new Error(`writer exited ${code}`))));
+          }),
+      );
+      try {
+        await vi.waitFor(() => assert.ok(states.every((state) => state.ready)), { timeout: 10_000 });
+        if (pause) {
+          children[0].send({ root, at: times[0], reading: sample(times[0]), pause: true });
+          await vi.waitFor(() => assert.equal(states[0].writing, true));
+          assert.ok(physicalBytes(root) <= USAGE_PAYLOAD_BYTES + USAGE_OVERHEAD_BYTES + 18);
+          children[1].send({ root, at: times[1], reading: sample(times[1], 0.9), pause: true });
+          await vi.waitFor(() => assert.ok(states[1].done || states[1].writing));
+          assert.equal(states[1].writing, false, 'another host entered a slot whose owner is still writing');
+          children[0].send('release');
+        } else {
+          for (let i = 0; i < children.length; i++) children[i].send({ root, at: times[i], reading: sample(times[i]) });
         }
-      await Promise.allSettled(done);
-    }
-  };
-  await runPair([READ_AT, READ_AT], true);
-  assert.equal(metadata(root).compressed, compressed.length + member.length);
-  assert.ok(physicalBytes(root) <= USAGE_PAYLOAD_BYTES + USAGE_OVERHEAD_BYTES + 18);
-  const full = fs.readFileSync(files.data);
-  const clipped = new UsageRecorder(root, { now: () => READ_AT });
-  clipped.record('claude', sample());
-  await clipped.drain();
-  assert.deepEqual(fs.readFileSync(files.data), full, 'the next whole member exceeded the remaining daily quota');
-  await runPair([READ_AT + 86_400_000, READ_AT + 2 * 86_400_000]);
-  assert.equal(
-    metadata(root, READ_AT + 86_400_000).raw,
-    Buffer.byteLength(usageRecordLines('claude', sample(READ_AT + 86_400_000)).join('\n') + '\n'),
-  );
-  assert.ok(metadata(root, READ_AT + 2 * 86_400_000).raw > 0);
-}, 20_000);
+        await Promise.all(done);
+      } finally {
+        for (const child of children)
+          if (child.exitCode === null) {
+            if (child.connected) child.send('release');
+            child.kill();
+          }
+        await Promise.allSettled(done);
+      }
+    };
+    await runPair([READ_AT, READ_AT], true);
+    assert.equal(metadata(root).compressed, compressed.length + member.length);
+    assert.ok(physicalBytes(root) <= USAGE_PAYLOAD_BYTES + USAGE_OVERHEAD_BYTES + 18);
+    const full = fs.readFileSync(files.data);
+    const clipped = new UsageRecorder(root, { now: () => READ_AT });
+    clipped.record('claude', sample());
+    await clipped.drain();
+    assert.deepEqual(fs.readFileSync(files.data), full, 'the next whole member exceeded the remaining daily quota');
+    await runPair([READ_AT + 86_400_000, READ_AT + 2 * 86_400_000]);
+    assert.equal(
+      metadata(root, READ_AT + 86_400_000).raw,
+      Buffer.byteLength(usageRecordLines('claude', sample(READ_AT + 86_400_000)).join('\n') + '\n'),
+    );
+    assert.ok(metadata(root, READ_AT + 2 * 86_400_000).raw > 0);
+  },
+);

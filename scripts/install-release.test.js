@@ -169,7 +169,7 @@ test('the candidate workflow prepares the full test prerequisites with read-only
   assert.match(workflow, /sudo apt-get install --yes zsh imagemagick/);
   assert.match(workflow, /sudo tee \/usr\/local\/bin\/magick/);
   assert.match(workflow, /magick -list format \| grep -i webp/);
-  assert.ok(workflow.indexOf('magick -list format') < workflow.indexOf('- run: npm test'));
+  assert.ok(workflow.indexOf('magick -list format') < workflow.indexOf('- run: npm run test:all'));
   assert.match(workflow, /node scripts\/package-claude-plugin\.js release/);
 });
 

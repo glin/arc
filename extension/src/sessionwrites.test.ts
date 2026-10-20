@@ -335,50 +335,54 @@ test('archive refuses background subagents and background commands with and with
         }
 });
 
-test('the authenticated window channel retains write acceptance across a disconnected caller and rejects conflicting retries', async () => {
-  const { channel, home, entry } = await fixture();
-  let calls = 0;
-  let release!: () => void;
-  channel.setRequestHandler(async () => {
-    calls++;
-    await new Promise<void>((resolve) => {
-      release = resolve;
+test(
+  'the authenticated window channel retains write acceptance across a disconnected caller and rejects conflicting retries',
+  { tags: ['subprocess'] },
+  async () => {
+    const { channel, home, entry } = await fixture();
+    let calls = 0;
+    let release!: () => void;
+    channel.setRequestHandler(async () => {
+      calls++;
+      await new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      return { status: 'accepted', sessionId: 'only-launch' };
     });
-    return { status: 'accepted', sessionId: 'only-launch' };
-  });
-  const params = {
-    prompt: 'work',
-    agentRun: false,
-    setup: { kind: 'custom' as const, agent: 'codex', model: '', effort: '', permissionMode: '' },
-  };
-  const id = channel.hostId + ':one';
-  // The binding includes the requester, so the retry runs with the same absent requester as the raw request.
-  vi.stubEnv('CLAUDE_CODE_SESSION_ID', '');
-  vi.stubEnv('CODEX_THREAD_ID', '');
-  const socket =
-    process.platform === 'win32'
-      ? await WindowsPipeServer.connect(
-          entry.address,
-          entry.pid,
-          entry.transportPid!,
-          path.join(home, 'hosts', `${channel.hostId}.json`),
-        )
-      : net.createConnection(entry.address);
-  sockets.push(socket);
-  socket.on('error', () => {});
-  await new Promise<void>((resolve) => socket.once('connect', resolve));
-  socket.write(JSON.stringify(request(entry, { id, method: 'start', params })) + '\n');
-  await vi.waitFor(() => assert.equal(calls, 1));
-  socket.destroy();
-  const retried = requestWindow('start', params, channel.hostId, home, id);
-  release();
-  assert.equal(((await retried) as { sessionId: string }).sessionId, 'only-launch');
-  assert.equal(calls, 1);
-  await assert.rejects(
-    requestWindow('start', { ...params, prompt: 'other' }, channel.hostId, home, id),
-    /different request/,
-  );
-});
+    const params = {
+      prompt: 'work',
+      agentRun: false,
+      setup: { kind: 'custom' as const, agent: 'codex', model: '', effort: '', permissionMode: '' },
+    };
+    const id = channel.hostId + ':one';
+    // The binding includes the requester, so the retry runs with the same absent requester as the raw request.
+    vi.stubEnv('CLAUDE_CODE_SESSION_ID', '');
+    vi.stubEnv('CODEX_THREAD_ID', '');
+    const socket =
+      process.platform === 'win32'
+        ? await WindowsPipeServer.connect(
+            entry.address,
+            entry.pid,
+            entry.transportPid!,
+            path.join(home, 'hosts', `${channel.hostId}.json`),
+          )
+        : net.createConnection(entry.address);
+    sockets.push(socket);
+    socket.on('error', () => {});
+    await new Promise<void>((resolve) => socket.once('connect', resolve));
+    socket.write(JSON.stringify(request(entry, { id, method: 'start', params })) + '\n');
+    await vi.waitFor(() => assert.equal(calls, 1));
+    socket.destroy();
+    const retried = requestWindow('start', params, channel.hostId, home, id);
+    release();
+    assert.equal(((await retried) as { sessionId: string }).sessionId, 'only-launch');
+    assert.equal(calls, 1);
+    await assert.rejects(
+      requestWindow('start', { ...params, prompt: 'other' }, channel.hostId, home, id),
+      /different request/,
+    );
+  },
+);
 
 test('guarded sends refuse other coordinators, old activations, ambiguous requesters, and prompt-box commands with no write', async () => {
   const { policy, coordinator, facts, writes, send } = guardFixture();
@@ -593,59 +597,63 @@ test('reader intervention, retirement, writer conflicts, and unknown or shared-t
   assert.equal(writes.length, 2);
 });
 
-test('the window channel retains guarded sends by requester, provider, target, observation and exact text, and refuses without an owner record', async () => {
-  const { channel, home } = await fixture();
-  const observation = 'b'.repeat(40) + '.' + 'c'.repeat(43);
-  const params = { sessionId: 'worker', prompt: 'Line one\nLínea dos ✓', observation };
-  vi.stubEnv('CLAUDE_CODE_SESSION_ID', 'coordinator');
-  vi.stubEnv('CODEX_THREAD_ID', '');
-  try {
-    const refused = (await requestWindow('send', params, channel.hostId, home, channel.hostId + ':none')) as any;
-    assert.equal(refused.status, 'refused');
-    assert.equal(refused.reason, GUARDED_SEND_REASONS.unrelated);
-    const seen: any[] = [];
-    let release!: () => void;
-    channel.setGuardedSendHandler(async (request) => {
-      seen.push(request);
-      await new Promise<void>((resolve) => (release = resolve));
-      return {
-        version: 1,
-        status: 'accepted',
-        requestId: request.id,
-        payloadSha256: 'x',
-        nativeTurnId: 't',
-        reason: '',
-      };
-    });
-    const id = channel.hostId + ':one';
-    const first = requestWindow('send', params, channel.hostId, home, id);
-    await vi.waitFor(() => assert.equal(seen.length, 1));
-    assert.equal(seen[0].requesterProvider, 'claude');
-    assert.equal(seen[0].params.prompt, params.prompt);
-    const retry = requestWindow('send', params, channel.hostId, home, id);
-    release();
-    assert.deepEqual(await first, await retry);
-    assert.equal(seen.length, 1);
-    await assert.rejects(
-      requestWindow('send', { ...params, prompt: 'Other text' }, channel.hostId, home, id),
-      /different request/,
-    );
-    await assert.rejects(
-      requestWindow('send', { ...params, observation: 'd' + observation.slice(1) }, channel.hostId, home, id),
-      /different request/,
-    );
-    vi.stubEnv('CLAUDE_CODE_SESSION_ID', '');
-    vi.stubEnv('CODEX_THREAD_ID', 'coordinator');
-    await assert.rejects(requestWindow('send', params, channel.hostId, home, id), /different request/);
-    await assert.rejects(
-      requestWindow('send', { ...params, prompt: '"'.repeat(40_000) }, channel.hostId, home, channel.hostId + ':big'),
-      /channel limit/,
-    );
-    assert.equal(seen.length, 1);
-  } finally {
-    vi.unstubAllEnvs();
-  }
-});
+test(
+  'the window channel retains guarded sends by requester, provider, target, observation and exact text, and refuses without an owner record',
+  { tags: ['subprocess'] },
+  async () => {
+    const { channel, home } = await fixture();
+    const observation = 'b'.repeat(40) + '.' + 'c'.repeat(43);
+    const params = { sessionId: 'worker', prompt: 'Line one\nLínea dos ✓', observation };
+    vi.stubEnv('CLAUDE_CODE_SESSION_ID', 'coordinator');
+    vi.stubEnv('CODEX_THREAD_ID', '');
+    try {
+      const refused = (await requestWindow('send', params, channel.hostId, home, channel.hostId + ':none')) as any;
+      assert.equal(refused.status, 'refused');
+      assert.equal(refused.reason, GUARDED_SEND_REASONS.unrelated);
+      const seen: any[] = [];
+      let release!: () => void;
+      channel.setGuardedSendHandler(async (request) => {
+        seen.push(request);
+        await new Promise<void>((resolve) => (release = resolve));
+        return {
+          version: 1,
+          status: 'accepted',
+          requestId: request.id,
+          payloadSha256: 'x',
+          nativeTurnId: 't',
+          reason: '',
+        };
+      });
+      const id = channel.hostId + ':one';
+      const first = requestWindow('send', params, channel.hostId, home, id);
+      await vi.waitFor(() => assert.equal(seen.length, 1));
+      assert.equal(seen[0].requesterProvider, 'claude');
+      assert.equal(seen[0].params.prompt, params.prompt);
+      const retry = requestWindow('send', params, channel.hostId, home, id);
+      release();
+      assert.deepEqual(await first, await retry);
+      assert.equal(seen.length, 1);
+      await assert.rejects(
+        requestWindow('send', { ...params, prompt: 'Other text' }, channel.hostId, home, id),
+        /different request/,
+      );
+      await assert.rejects(
+        requestWindow('send', { ...params, observation: 'd' + observation.slice(1) }, channel.hostId, home, id),
+        /different request/,
+      );
+      vi.stubEnv('CLAUDE_CODE_SESSION_ID', '');
+      vi.stubEnv('CODEX_THREAD_ID', 'coordinator');
+      await assert.rejects(requestWindow('send', params, channel.hostId, home, id), /different request/);
+      await assert.rejects(
+        requestWindow('send', { ...params, prompt: '"'.repeat(40_000) }, channel.hostId, home, channel.hostId + ':big'),
+        /channel limit/,
+      );
+      assert.equal(seen.length, 1);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  },
+);
 
 test('guarded sends keep an observation that a wire refusal before the write left unused, and compose full-sentence reasons', async () => {
   const { policy, coordinator, facts, writes, port, send } = guardFixture();
@@ -1009,132 +1017,140 @@ test('the guarded delivery port recognizes Codex writer conflicts persistently a
   }
 });
 
-test('guarded exhaustion retains same-ID refusals and leaves the independent start and curation allowance usable', async () => {
-  const { channel, home } = await fixture();
-  (channel as any).writes = new SessionWriteRequests(channel.hostId, 2);
-  let handled = 0;
-  channel.setGuardedSendHandler(async (request) => {
-    handled += 1;
-    return {
-      version: 1,
-      status: 'refused',
-      requestId: request.id,
-      payloadSha256: 'x',
-      nativeTurnId: null,
-      reason: GUARDED_SEND_REASONS.busy,
-    };
-  });
-  const starts: unknown[] = [];
-  channel.setRequestHandler((request) => {
-    starts.push(request);
-    return { status: 'accepted' };
-  });
-  const params = { sessionId: 'worker', prompt: 'Next.', observation: 'b'.repeat(40) + '.' + 'c'.repeat(43) };
-  vi.stubEnv('CLAUDE_CODE_SESSION_ID', 'coordinator');
-  vi.stubEnv('CODEX_THREAD_ID', '');
-  try {
-    for (const n of [1, 2])
-      assert.equal(
-        ((await requestWindow('send', params, channel.hostId, home, `${channel.hostId}:busy-${n}`)) as any).reason,
-        GUARDED_SEND_REASONS.busy,
+test(
+  'guarded exhaustion retains same-ID refusals and leaves the independent start and curation allowance usable',
+  { tags: ['subprocess'] },
+  async () => {
+    const { channel, home } = await fixture();
+    (channel as any).writes = new SessionWriteRequests(channel.hostId, 2);
+    let handled = 0;
+    channel.setGuardedSendHandler(async (request) => {
+      handled += 1;
+      return {
+        version: 1,
+        status: 'refused',
+        requestId: request.id,
+        payloadSha256: 'x',
+        nativeTurnId: null,
+        reason: GUARDED_SEND_REASONS.busy,
+      };
+    });
+    const starts: unknown[] = [];
+    channel.setRequestHandler((request) => {
+      starts.push(request);
+      return { status: 'accepted' };
+    });
+    const params = { sessionId: 'worker', prompt: 'Next.', observation: 'b'.repeat(40) + '.' + 'c'.repeat(43) };
+    vi.stubEnv('CLAUDE_CODE_SESSION_ID', 'coordinator');
+    vi.stubEnv('CODEX_THREAD_ID', '');
+    try {
+      for (const n of [1, 2])
+        assert.equal(
+          ((await requestWindow('send', params, channel.hostId, home, `${channel.hostId}:busy-${n}`)) as any).reason,
+          GUARDED_SEND_REASONS.busy,
+        );
+      await assert.rejects(requestWindow('send', params, channel.hostId, home, `${channel.hostId}:busy-3`), /limit/);
+      const again = (await requestWindow('send', params, channel.hostId, home, `${channel.hostId}:busy-1`)) as any;
+      assert.equal(again.reason, GUARDED_SEND_REASONS.busy);
+      assert.equal(handled, 2, 'a same-ID duplicate observes the retained refusal');
+      await assert.rejects(
+        requestWindow('send', { ...params, prompt: 'Other.' }, channel.hostId, home, `${channel.hostId}:busy-1`),
+        /different request/,
       );
-    await assert.rejects(requestWindow('send', params, channel.hostId, home, `${channel.hostId}:busy-3`), /limit/);
-    const again = (await requestWindow('send', params, channel.hostId, home, `${channel.hostId}:busy-1`)) as any;
-    assert.equal(again.reason, GUARDED_SEND_REASONS.busy);
-    assert.equal(handled, 2, 'a same-ID duplicate observes the retained refusal');
-    await assert.rejects(
-      requestWindow('send', { ...params, prompt: 'Other.' }, channel.hostId, home, `${channel.hostId}:busy-1`),
-      /different request/,
-    );
+      const start = {
+        setup: { kind: 'custom' as const, agent: 'claude', model: '', effort: '', permissionMode: '' },
+        prompt: 'Start.',
+        agentRun: true,
+        pinned: false,
+        labels: [] as string[],
+      };
+      assert.equal(
+        ((await requestWindow('start', start, channel.hostId, home, `${channel.hostId}:start-1`)) as any).status,
+        'accepted',
+      );
+      assert.equal(
+        (
+          (await requestWindow(
+            'curate',
+            { sessionId: 'worker', action: 'pin', dryRun: false, force: false },
+            channel.hostId,
+            home,
+            `${channel.hostId}:curate-1`,
+          )) as any
+        ).status,
+        'accepted',
+      );
+      assert.equal(starts.length, 2);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  },
+);
+
+test(
+  'session reads and guarded starts carry the requester provider only to a window that lists it',
+  { tags: ['subprocess'] },
+  async () => {
+    const { channel, home } = await fixture();
+    const seen: any[] = [];
+    channel.setRequestHandler((request) => {
+      seen.push(request);
+      return request.method === 'start' ? { status: 'accepted' } : { state: 'current', turns: [] };
+    });
     const start = {
-      setup: { kind: 'custom' as const, agent: 'claude', model: '', effort: '', permissionMode: '' },
+      setup: { kind: 'custom' as const, agent: 'codex', model: '', effort: '', permissionMode: '' },
       prompt: 'Start.',
-      agentRun: true,
+      agentRun: false,
       pinned: false,
       labels: [] as string[],
     };
-    assert.equal(
-      ((await requestWindow('start', start, channel.hostId, home, `${channel.hostId}:start-1`)) as any).status,
-      'accepted',
-    );
-    assert.equal(
-      (
-        (await requestWindow(
-          'curate',
-          { sessionId: 'worker', action: 'pin', dryRun: false, force: false },
+    vi.stubEnv('CLAUDE_CODE_SESSION_ID', '');
+    vi.stubEnv('CODEX_THREAD_ID', 'coordinator');
+    try {
+      await requestWindow('session', { sessionId: 'worker', turns: 5 }, channel.hostId, home);
+      await requestWindow('start', start, channel.hostId, home, `${channel.hostId}:plain`);
+      await requestWindow('start', start, channel.hostId, home, `${channel.hostId}:guarded`, true);
+      assert.deepEqual(
+        seen.map((request) => [request.method, request.requester, request.requesterProvider]),
+        [
+          ['session', 'coordinator', 'codex'],
+          ['start', 'coordinator', undefined],
+          ['start', 'coordinator', 'codex'],
+        ],
+      );
+      // A window that predates the field refuses it, so the CLI omits it there and refuses send before connecting.
+      const registration = path.join(home, 'hosts', `${channel.hostId}.json`);
+      const listed = JSON.parse(fs.readFileSync(registration, 'utf8'));
+      assert.deepEqual(listed.capabilities, [
+        'requesterProvider',
+        'sessionQuery',
+        'sessionQueryShorthandV1',
+        'launchPolicy',
+      ]);
+      delete listed.capabilities;
+      fs.writeFileSync(registration, JSON.stringify(listed));
+      for (const extra of [{ readOnly: true }, { cwd: home }, { readOnly: true, readTools: ['mcp__server__read'] }]) {
+        const before = seen.length;
+        await assert.rejects(
+          requestWindow('start', { ...start, ...extra }, channel.hostId, home),
+          /does not support read-only starts/,
+        );
+        assert.equal(seen.length, before, 'unsupported launch permissions reached an older window');
+      }
+      await requestWindow('start', start, channel.hostId, home, `${channel.hostId}:old`, true);
+      assert.equal('requesterProvider' in seen.at(-1), false);
+      await assert.rejects(
+        requestWindow(
+          'send',
+          { sessionId: 'worker', prompt: 'Next.', observation: 'b.' + 'c'.repeat(43) },
           channel.hostId,
           home,
-          `${channel.hostId}:curate-1`,
-        )) as any
-      ).status,
-      'accepted',
-    );
-    assert.equal(starts.length, 2);
-  } finally {
-    vi.unstubAllEnvs();
-  }
-});
-
-test('session reads and guarded starts carry the requester provider only to a window that lists it', async () => {
-  const { channel, home } = await fixture();
-  const seen: any[] = [];
-  channel.setRequestHandler((request) => {
-    seen.push(request);
-    return request.method === 'start' ? { status: 'accepted' } : { state: 'current', turns: [] };
-  });
-  const start = {
-    setup: { kind: 'custom' as const, agent: 'codex', model: '', effort: '', permissionMode: '' },
-    prompt: 'Start.',
-    agentRun: false,
-    pinned: false,
-    labels: [] as string[],
-  };
-  vi.stubEnv('CLAUDE_CODE_SESSION_ID', '');
-  vi.stubEnv('CODEX_THREAD_ID', 'coordinator');
-  try {
-    await requestWindow('session', { sessionId: 'worker', turns: 5 }, channel.hostId, home);
-    await requestWindow('start', start, channel.hostId, home, `${channel.hostId}:plain`);
-    await requestWindow('start', start, channel.hostId, home, `${channel.hostId}:guarded`, true);
-    assert.deepEqual(
-      seen.map((request) => [request.method, request.requester, request.requesterProvider]),
-      [
-        ['session', 'coordinator', 'codex'],
-        ['start', 'coordinator', undefined],
-        ['start', 'coordinator', 'codex'],
-      ],
-    );
-    // A window that predates the field refuses it, so the CLI omits it there and refuses send before connecting.
-    const registration = path.join(home, 'hosts', `${channel.hostId}.json`);
-    const listed = JSON.parse(fs.readFileSync(registration, 'utf8'));
-    assert.deepEqual(listed.capabilities, [
-      'requesterProvider',
-      'sessionQuery',
-      'sessionQueryShorthandV1',
-      'launchPolicy',
-    ]);
-    delete listed.capabilities;
-    fs.writeFileSync(registration, JSON.stringify(listed));
-    for (const extra of [{ readOnly: true }, { cwd: home }, { readOnly: true, readTools: ['mcp__server__read'] }]) {
-      const before = seen.length;
-      await assert.rejects(
-        requestWindow('start', { ...start, ...extra }, channel.hostId, home),
-        /does not support read-only starts/,
+          `${channel.hostId}:send`,
+        ),
+        /must reload/,
       );
-      assert.equal(seen.length, before, 'unsupported launch permissions reached an older window');
+    } finally {
+      vi.unstubAllEnvs();
     }
-    await requestWindow('start', start, channel.hostId, home, `${channel.hostId}:old`, true);
-    assert.equal('requesterProvider' in seen.at(-1), false);
-    await assert.rejects(
-      requestWindow(
-        'send',
-        { sessionId: 'worker', prompt: 'Next.', observation: 'b.' + 'c'.repeat(43) },
-        channel.hostId,
-        home,
-        `${channel.hostId}:send`,
-      ),
-      /must reload/,
-    );
-  } finally {
-    vi.unstubAllEnvs();
-  }
-});
+  },
+);

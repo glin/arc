@@ -1456,57 +1456,61 @@ test('a historical landing survives more than 40 later head movements', async ()
   assert.deepEqual(one.landings?.[0].head, { kind: 'branch', name: 'main' });
 });
 
-test('a real fast-forward is read back with its subject and the name the command named', async () => {
-  // Run Git to check that a fast-forward writes its source name into the HEAD reflog.
+test(
+  'a real fast-forward is read back with its subject and the name the command named',
+  { tags: ['subprocess'] },
+  async () => {
+    // Run Git to check that a fast-forward writes its source name into the HEAD reflog.
 
-  const root = tempDir('landing-');
-  const git = (...args: string[]): void => {
-    execFileSync('git', ['-C', root, ...args], { stdio: 'pipe' });
-  };
-  git('init', '-q', '-b', 'main');
-  git('config', 'user.email', 'test@example.com');
-  git('config', 'user.name', 'Test');
-  writeFileSync(join(root, 'a.txt'), 'one\n');
-  git('add', 'a.txt');
-  git('commit', '-q', '-m', 'First');
-  git('checkout', '-q', '-b', 'topic');
-  writeFileSync(join(root, 'a.txt'), 'two\n');
-  git('commit', '-q', '-a', '-m', 'Bundle the panel script');
-  git('checkout', '-q', 'main');
+    const root = tempDir('landing-');
+    const git = (...args: string[]): void => {
+      execFileSync('git', ['-C', root, ...args], { stdio: 'pipe' });
+    };
+    git('init', '-q', '-b', 'main');
+    git('config', 'user.email', 'test@example.com');
+    git('config', 'user.name', 'Test');
+    writeFileSync(join(root, 'a.txt'), 'one\n');
+    git('add', 'a.txt');
+    git('commit', '-q', '-m', 'First');
+    git('checkout', '-q', '-b', 'topic');
+    writeFileSync(join(root, 'a.txt'), 'two\n');
+    git('commit', '-q', '-a', '-m', 'Bundle the panel script');
+    git('checkout', '-q', 'main');
 
-  const from = Date.now();
-  git('merge', '--ff-only', 'topic');
-  const to = Date.now();
+    const from = Date.now();
+    git('merge', '--ff-only', 'topic');
+    const to = Date.now();
 
-  const one = turn({ commits: [], landingIntents: [{ dir: root, from, to, expected: 1 }] });
-  let fill!: () => void;
-  const filled = new Promise<void>((resolve) => {
-    fill = resolve;
-  });
-  const commits = new RepositoryCommits(nodeGitRunner(), fill);
-  commits.apply([one], [root]);
-  await filled;
-  commits.apply([one], [root]);
+    const one = turn({ commits: [], landingIntents: [{ dir: root, from, to, expected: 1 }] });
+    let fill!: () => void;
+    const filled = new Promise<void>((resolve) => {
+      fill = resolve;
+    });
+    const commits = new RepositoryCommits(nodeGitRunner(), fill);
+    commits.apply([one], [root]);
+    await filled;
+    commits.apply([one], [root]);
 
-  assert.equal(one.landings?.length, 1, 'a real fast-forward has to reach the card');
-  assert.equal(one.landings?.[0].subject, 'Bundle the panel script');
-  assert.equal(one.landings?.[0].from, 'topic');
-  assert.deepEqual(one.landings?.[0].head, { kind: 'branch', name: 'main' });
-  const landed = one.landings![0];
-  const exact = await nodeGitRunner(0).run(root, exactCommitArgs(landed.sha));
-  assert.ok(exact);
-  assert.deepEqual(
-    parseCommitLog(exact).map(({ sha, subject, files, added, removed }) => ({
-      sha: sha.slice(0, landed.sha.length),
-      subject,
-      files,
-      added,
-      removed,
-    })),
-    [{ sha: landed.sha, subject: landed.subject, files: 1, added: 1, removed: 1 }],
-  );
-  assert.match(parseCommitLog(exact)[0].sha, /^[0-9a-f]{40}$/);
-});
+    assert.equal(one.landings?.length, 1, 'a real fast-forward has to reach the card');
+    assert.equal(one.landings?.[0].subject, 'Bundle the panel script');
+    assert.equal(one.landings?.[0].from, 'topic');
+    assert.deepEqual(one.landings?.[0].head, { kind: 'branch', name: 'main' });
+    const landed = one.landings![0];
+    const exact = await nodeGitRunner(0).run(root, exactCommitArgs(landed.sha));
+    assert.ok(exact);
+    assert.deepEqual(
+      parseCommitLog(exact).map(({ sha, subject, files, added, removed }) => ({
+        sha: sha.slice(0, landed.sha.length),
+        subject,
+        files,
+        added,
+        removed,
+      })),
+      [{ sha: landed.sha, subject: landed.subject, files: 1, added: 1, removed: 1 }],
+    );
+    assert.match(parseCommitLog(exact)[0].sha, /^[0-9a-f]{40}$/);
+  },
+);
 
 test('a landing keeps the branch its merge named, and a hash is answered by the branches at the commit', () => {
   assert.deepEqual(pointsAtArgs('c36e7b5b'), [

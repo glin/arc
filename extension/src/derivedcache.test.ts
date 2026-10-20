@@ -2581,47 +2581,51 @@ const { takeCodexOpeningsLock } = await import(pathToFileURL(modulePath).href);
 takeCodexOpeningsLock(lock);
 `;
 
-test('a window that dies inside a stale-lock takeover blocks no save past the stale age and leaves no guard', async () => {
-  const { root } = rolloutTree(1);
-  const window = countingCodexMetas();
-  const listing = window.list(root, [root]);
-  const script = path.join(folder(), 'dying-window.mjs');
-  fs.writeFileSync(script, DYING_WINDOW_SCRIPT);
-  const age = (file: string) => {
-    const abandoned = (Date.now() - CODEX_OPENINGS_LOCK_STALE_MS - 1_000) / 1000;
-    fs.utimesSync(file, abandoned, abandoned);
-  };
-  for (const death of ['before', 'after']) {
-    const directory = folder();
-    const shared = path.join(directory, 'codex-openings.json');
-    const lock = `${shared}.lock`;
-    fs.writeFileSync(lock, 'a window that died holding the lock');
-    age(lock);
-    const code = await new Promise<number | null>((resolve, reject) => {
-      const child = spawn(process.execPath, [script, path.join(__dirname, 'codexopenings.ts'), lock, death], {
-        stdio: 'ignore',
+test(
+  'a window that dies inside a stale-lock takeover blocks no save past the stale age and leaves no guard',
+  { tags: ['subprocess'] },
+  async () => {
+    const { root } = rolloutTree(1);
+    const window = countingCodexMetas();
+    const listing = window.list(root, [root]);
+    const script = path.join(folder(), 'dying-window.mjs');
+    fs.writeFileSync(script, DYING_WINDOW_SCRIPT);
+    const age = (file: string) => {
+      const abandoned = (Date.now() - CODEX_OPENINGS_LOCK_STALE_MS - 1_000) / 1000;
+      fs.utimesSync(file, abandoned, abandoned);
+    };
+    for (const death of ['before', 'after']) {
+      const directory = folder();
+      const shared = path.join(directory, 'codex-openings.json');
+      const lock = `${shared}.lock`;
+      fs.writeFileSync(lock, 'a window that died holding the lock');
+      age(lock);
+      const code = await new Promise<number | null>((resolve, reject) => {
+        const child = spawn(process.execPath, [script, path.join(__dirname, 'codexopenings.ts'), lock, death], {
+          stdio: 'ignore',
+        });
+        child.on('error', reject);
+        child.on('exit', resolve);
       });
-      child.on('error', reject);
-      child.on('exit', resolve);
-    });
-    assert.equal(code, 9, `${death}: the window did not die inside the takeover`);
-    // Time passes, and every guard the dead window left ages past the stale age. The lock
-    // keeps its time, because a guard is named for it.
-    for (const name of fs.readdirSync(directory).filter((name) => name.endsWith('.takeover'))) {
-      age(path.join(directory, name));
+      assert.equal(code, 9, `${death}: the window did not die inside the takeover`);
+      // Time passes, and every guard the dead window left ages past the stale age. The lock
+      // keeps its time, because a guard is named for it.
+      for (const name of fs.readdirSync(directory).filter((name) => name.endsWith('.takeover'))) {
+        age(path.join(directory, name));
+      }
+      let saved = false;
+      for (let attempt = 0; attempt < 3 && !saved; attempt++) {
+        saved = saveCodexOpenings(shared, new Map(window.cache.snapshot()), listing.walked);
+      }
+      assert.ok(saved, `${death}: a window that died in a takeover blocked every later save`);
+      assert.deepEqual(
+        fs.readdirSync(directory).filter((name) => name.endsWith('.takeover')),
+        [],
+        `${death}: the guard of a window that died in a takeover stays beside the shared file`,
+      );
     }
-    let saved = false;
-    for (let attempt = 0; attempt < 3 && !saved; attempt++) {
-      saved = saveCodexOpenings(shared, new Map(window.cache.snapshot()), listing.walked);
-    }
-    assert.ok(saved, `${death}: a window that died in a takeover blocked every later save`);
-    assert.deepEqual(
-      fs.readdirSync(directory).filter((name) => name.endsWith('.takeover')),
-      [],
-      `${death}: the guard of a window that died in a takeover stays beside the shared file`,
-    );
-  }
-});
+  },
+);
 
 // One editor window saving the shared file. It loads the file at startup, adds its own new
 // rollout, and saves. The rename that commits its write waits until the other window has read
@@ -2674,7 +2678,7 @@ poll(() => {
 
 test(
   'two windows that read the shared file before either saves both keep their new rows',
-  { timeout: 30_000 },
+  { tags: ['subprocess'], timeout: 30_000 },
   async () => {
     const { root, files } = rolloutTree(4);
     const all = countingCodexMetas();

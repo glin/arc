@@ -63,32 +63,37 @@ test('addresses use Windows pipes and bounded macOS and Linux socket paths', () 
   assert.throws(() => hostAddress('/home', '../other', 'linux'));
 });
 
-test('ARC_HOME selects the registry and independent same-folder hosts retain distinct identities', async () => {
-  const home = tempDir('window-home-');
-  vi.stubEnv('ARC_HOME', home);
-  try {
-    const first = new WindowChannel();
-    const second = new WindowChannel();
-    channels.push(first, second);
-    assert.equal(fs.existsSync(path.join(home, 'hosts')), false);
-    await Promise.all([
-      first.update({ ...state, scopeReady: false, folders: ['C:/MixedCase/Project'] }),
-      second.update({ ...state, folders: ['C:/MixedCase/Project'] }),
-    ]);
-    const { windows: found, complete } = await discoverWindows();
-    assert.equal(complete, true);
-    assert.equal(found.length, 2);
-    assert.notEqual(first.hostId, second.hostId);
-    assert.equal(found.find((window) => window.hostId === first.hostId)?.scopeReady, false);
-    assert.equal(JSON.stringify(found).includes('token'), false);
-    assert.equal(JSON.stringify(found).includes('address'), false);
-  } finally {
-    vi.unstubAllEnvs();
-  }
-});
+test(
+  'ARC_HOME selects the registry and independent same-folder hosts retain distinct identities',
+  { tags: ['subprocess'] },
+  async () => {
+    const home = tempDir('window-home-');
+    vi.stubEnv('ARC_HOME', home);
+    try {
+      const first = new WindowChannel();
+      const second = new WindowChannel();
+      channels.push(first, second);
+      assert.equal(fs.existsSync(path.join(home, 'hosts')), false);
+      await Promise.all([
+        first.update({ ...state, scopeReady: false, folders: ['C:/MixedCase/Project'] }),
+        second.update({ ...state, folders: ['C:/MixedCase/Project'] }),
+      ]);
+      const { windows: found, complete } = await discoverWindows();
+      assert.equal(complete, true);
+      assert.equal(found.length, 2);
+      assert.notEqual(first.hostId, second.hostId);
+      assert.equal(found.find((window) => window.hostId === first.hostId)?.scopeReady, false);
+      assert.equal(JSON.stringify(found).includes('token'), false);
+      assert.equal(JSON.stringify(found).includes('address'), false);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  },
+);
 
 test.each([undefined, ['sessionRead', 'dispatchResults', 'dispatchNotices']] as const)(
   'authenticated discovery retains optional capabilities %j without reply secrets',
+  { tags: ['subprocess'] },
   async (capabilities) => {
     const { home, entry } = await fixture(undefined, (info) => {
       const reply = { ...info, token: 'private-token', address: 'private-address', stack: 'private-stack' };
@@ -110,6 +115,7 @@ test.each([undefined, ['sessionRead', 'dispatchResults', 'dispatchNotices']] as 
 
 test.each([null, [1], Array(17).fill('read'), ['x'.repeat(65)]])(
   'authenticated discovery rejects malformed capabilities %j without diagnosing access denial',
+  { tags: ['subprocess'] },
   async (capabilities) => {
     const { home, entry } = await fixture(undefined, (info) => ({ ...info, capabilities }) as WindowInfo);
     assert.equal(await pingWindow(entry), null);
@@ -117,23 +123,28 @@ test.each([null, [1], Array(17).fill('read'), ['x'.repeat(65)]])(
   },
 );
 
-test('a missing explicit or inherited window requires fresh selection and keeps its error class', async () => {
-  const { home, channel } = await fixture();
-  const missing = 'f'.repeat(24);
-  for (const inherited of [false, true]) {
-    vi.stubEnv('ARC_WINDOW', missing);
-    await assert.rejects(requestWindow('sessions', {}, inherited ? undefined : missing, home), (error: unknown) => {
-      assert.ok(error instanceof WindowUnavailableError);
-      assert.match(error.message, /not registered.*Run arc windows and select the intended folders/);
-      assert.doesNotMatch(error.message, /EACCES|EPERM|token|address/);
-      return true;
-    });
-  }
-  assert.equal((await discoverWindows(home)).windows[0].hostId, channel.hostId);
-});
+test(
+  'a missing explicit or inherited window requires fresh selection and keeps its error class',
+  { tags: ['subprocess'] },
+  async () => {
+    const { home, channel } = await fixture();
+    const missing = 'f'.repeat(24);
+    for (const inherited of [false, true]) {
+      vi.stubEnv('ARC_WINDOW', missing);
+      await assert.rejects(requestWindow('sessions', {}, inherited ? undefined : missing, home), (error: unknown) => {
+        assert.ok(error instanceof WindowUnavailableError);
+        assert.match(error.message, /not registered.*Run arc windows and select the intended folders/);
+        assert.doesNotMatch(error.message, /EACCES|EPERM|token|address/);
+        return true;
+      });
+    }
+    assert.equal((await discoverWindows(home)).windows[0].hostId, channel.hostId);
+  },
+);
 
 test.each(['ENOENT', 'EACCES', 'EPERM', 'EMFILE'] as const)(
   'registry %s retains observed bounded diagnostics and reachable windows',
+  { tags: ['subprocess'] },
   async (code) => {
     const { home, file, entry } = await fixture();
     const reachable = new WindowChannel(home);
@@ -185,7 +196,7 @@ test.each(['ENOENT', 'EACCES', 'EPERM', 'EMFILE'] as const)(
   },
 );
 
-test('discovery accounts for a registration that vanishes before inspection', async () => {
+test('discovery accounts for a registration that vanishes before inspection', { tags: ['subprocess'] }, async () => {
   const { home, file } = await fixture();
   const original = filesystem.lstatSync;
   const stat = vi.spyOn(filesystem, 'lstatSync').mockImplementation((...args) => {
@@ -228,6 +239,7 @@ test('registry access diagnostics stop at their bound without declaring complete
 
 test.each(['linux', 'darwin'] as const)(
   '%s socket errors retain observed causes while write outcomes keep the same identity',
+  { tags: ['subprocess'] },
   async (platform) => {
     const { home, file, entry } = await fixture();
     fs.writeFileSync(file, JSON.stringify({ ...entry, address: hostAddress(home, entry.hostId, platform, '/tmp') }));
@@ -285,6 +297,7 @@ test.each(['linux', 'darwin'] as const)(
 
 test.skipIf(process.platform === 'win32')(
   'POSIX registry and long-path fallback directories and files are private',
+  { tags: ['subprocess'] },
   async () => {
     const home = path.join(tempDir('long-window-home-'), 'LongMixedCase'.repeat(15));
     const channel = new WindowChannel(home);
@@ -301,19 +314,23 @@ test.skipIf(process.platform === 'win32')(
   },
 );
 
-test('ping deadlines reject silent hosts and preserve a replaced registry during stale cleanup', async () => {
-  const { home, file, entry } = await fixture(undefined, () => new Promise(() => {}));
-  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
-  const pending = discoverWindows(home);
-  await vi.waitFor(() => assert.equal(vi.getTimerCount() >= 2, true));
-  const replacement = JSON.stringify({ ...entry, token: 'c'.repeat(64) });
-  fs.writeFileSync(file, replacement);
-  await vi.advanceTimersByTimeAsync(1_000);
-  assert.deepEqual(await pending, { windows: [], complete: false });
-  assert.equal(fs.readFileSync(file, 'utf8'), replacement);
-});
+test(
+  'ping deadlines reject silent hosts and preserve a replaced registry during stale cleanup',
+  { tags: ['subprocess'] },
+  async () => {
+    const { home, file, entry } = await fixture(undefined, () => new Promise(() => {}));
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    const pending = discoverWindows(home);
+    await vi.waitFor(() => assert.equal(vi.getTimerCount() >= 2, true));
+    const replacement = JSON.stringify({ ...entry, token: 'c'.repeat(64) });
+    fs.writeFileSync(file, replacement);
+    await vi.advanceTimersByTimeAsync(1_000);
+    assert.deepEqual(await pending, { windows: [], complete: false });
+    assert.equal(fs.readFileSync(file, 'utf8'), replacement);
+  },
+);
 
-test('a saturated live listener remains discoverable after admission recovers', async () => {
+test('a saturated live listener remains discoverable after admission recovers', { tags: ['subprocess'] }, async () => {
   const { home, file, entry, channel } = await fixture({ ...SESSION_REQUEST_LIMITS, connections: 1 });
   const occupied = await connect(entry.address);
   const unavailable = await discoverWindows(home);
@@ -327,7 +344,7 @@ test('a saturated live listener remains discoverable after admission recovers', 
   assert.equal((await discoverWindows(home)).windows[0]?.hostId, entry.hostId);
 });
 
-test('a ping timeout retains a silent live host until it responds again', async () => {
+test('a ping timeout retains a silent live host until it responds again', { tags: ['subprocess'] }, async () => {
   const handler = vi.fn<(info: WindowInfo) => WindowInfo | Promise<WindowInfo>>(() => new Promise(() => {}));
   const { home, file, entry } = await fixture(undefined, handler);
   vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
@@ -342,7 +359,7 @@ test('a ping timeout retains a silent live host until it responds again', async 
   assert.equal((await discoverWindows(home)).windows[0]?.hostId, entry.hostId);
 });
 
-test('invalid registry prefixes do not consume the live-host allowance', async () => {
+test('invalid registry prefixes do not consume the live-host allowance', { tags: ['subprocess'] }, async () => {
   const { home, entry } = await fixture();
   for (let index = 0; index < 256; index++) {
     fs.writeFileSync(path.join(home, 'hosts', `${index.toString(16).padStart(24, '0')}.json`), '{}');
@@ -389,33 +406,42 @@ test('directory coverage is explicitly incomplete at a bounded iteration limit',
   }
 });
 
-test('a host population beyond the ping allowance returns an explicitly partial list', async () => {
-  const home = tempDir('window-host-limit-');
-  const population = Array.from({ length: WINDOW_DISCOVERY_LIMITS.hosts + 1 }, () => new WindowChannel(home));
-  channels.push(...population);
-  await Promise.all(population.map((channel) => channel.update(state)));
-  const result = await discoverWindows(home);
-  assert.equal(result.complete, false);
-  assert.equal(result.windows.length, WINDOW_DISCOVERY_LIMITS.hosts);
-});
+test(
+  'a host population beyond the ping allowance returns an explicitly partial list',
+  { tags: ['subprocess'] },
+  async () => {
+    const home = tempDir('window-host-limit-');
+    const population = Array.from({ length: WINDOW_DISCOVERY_LIMITS.hosts + 1 }, () => new WindowChannel(home));
+    channels.push(...population);
+    await Promise.all(population.map((channel) => channel.update(state)));
+    const result = await discoverWindows(home);
+    assert.equal(result.complete, false);
+    assert.equal(result.windows.length, WINDOW_DISCOVERY_LIMITS.hosts);
+  },
+);
 
-test('publication never enumerates the shared registry to remove atomic temporaries', async () => {
-  const { channel } = await fixture();
-  const enumerate = vi.spyOn(filesystem, 'readdirSync').mockImplementation(() => {
-    throw new Error('Shared registry enumeration');
-  });
-  syncBuiltinESMExports();
-  try {
-    await channel.update({ ...state, panelReady: true });
-    assert.equal(enumerate.mock.calls.length, 0);
-  } finally {
-    enumerate.mockRestore();
+test(
+  'publication never enumerates the shared registry to remove atomic temporaries',
+  { tags: ['subprocess'] },
+  async () => {
+    const { channel } = await fixture();
+    const enumerate = vi.spyOn(filesystem, 'readdirSync').mockImplementation(() => {
+      throw new Error('Shared registry enumeration');
+    });
     syncBuiltinESMExports();
-  }
-});
+    try {
+      await channel.update({ ...state, panelReady: true });
+      assert.equal(enumerate.mock.calls.length, 0);
+    } finally {
+      enumerate.mockRestore();
+      syncBuiltinESMExports();
+    }
+  },
+);
 
 test.each(['win32', 'darwin', 'linux'] as const)(
   '%s connection creation failure retains live ownership and reports only window failures',
+  { tags: ['subprocess'] },
   async (platform) => {
     const { home, file, entry } = await fixture();
     fs.writeFileSync(
@@ -472,100 +498,112 @@ test.each(['win32', 'darwin', 'linux'] as const)(
   },
 );
 
-test('only confirmed process death removes unchanged registry bytes and never a foreign socket', async () => {
-  const { home, file, entry, channel } = await fixture();
-  await channel.dispose();
-  const dead = JSON.stringify({ ...entry, pid: 424242 });
-  const kill = vi.spyOn(process, 'kill').mockImplementation(() => {
-    throw Object.assign(new Error('Stopped'), { code: 'ESRCH' });
-  });
-  try {
-    fs.writeFileSync(file, dead);
-    const diagnostics =
-      process.platform === 'win32'
-        ? {}
-        : { diagnostics: [{ code: 'ENOENT', stage: 'connection', hostId: entry.hostId }] };
-    assert.deepEqual(await discoverWindows(home), { windows: [], complete: true });
-    assert.equal(fs.existsSync(file), false);
-    fs.writeFileSync(file, dead);
-    kill.mockImplementation(() => {
-      throw Object.assign(new Error('Denied'), { code: 'EPERM' });
-    });
-    assert.deepEqual(await discoverWindows(home), { windows: [], complete: false, ...diagnostics });
-    assert.equal(fs.readFileSync(file, 'utf8'), dead);
-    const replacement = JSON.stringify({ ...entry, pid: 424242, token: 'c'.repeat(64) });
-    kill.mockImplementation(() => {
-      fs.writeFileSync(file, replacement);
+test(
+  'only confirmed process death removes unchanged registry bytes and never a foreign socket',
+  { tags: ['subprocess'] },
+  async () => {
+    const { home, file, entry, channel } = await fixture();
+    await channel.dispose();
+    const dead = JSON.stringify({ ...entry, pid: 424242 });
+    const kill = vi.spyOn(process, 'kill').mockImplementation(() => {
       throw Object.assign(new Error('Stopped'), { code: 'ESRCH' });
     });
-    assert.deepEqual(await discoverWindows(home), { windows: [], complete: false, ...diagnostics });
-    assert.equal(fs.readFileSync(file, 'utf8'), replacement);
-  } finally {
-    kill.mockRestore();
-  }
-});
+    try {
+      fs.writeFileSync(file, dead);
+      const diagnostics =
+        process.platform === 'win32'
+          ? {}
+          : { diagnostics: [{ code: 'ENOENT', stage: 'connection', hostId: entry.hostId }] };
+      assert.deepEqual(await discoverWindows(home), { windows: [], complete: true });
+      assert.equal(fs.existsSync(file), false);
+      fs.writeFileSync(file, dead);
+      kill.mockImplementation(() => {
+        throw Object.assign(new Error('Denied'), { code: 'EPERM' });
+      });
+      assert.deepEqual(await discoverWindows(home), { windows: [], complete: false, ...diagnostics });
+      assert.equal(fs.readFileSync(file, 'utf8'), dead);
+      const replacement = JSON.stringify({ ...entry, pid: 424242, token: 'c'.repeat(64) });
+      kill.mockImplementation(() => {
+        fs.writeFileSync(file, replacement);
+        throw Object.assign(new Error('Stopped'), { code: 'ESRCH' });
+      });
+      assert.deepEqual(await discoverWindows(home), { windows: [], complete: false, ...diagnostics });
+      assert.equal(fs.readFileSync(file, 'utf8'), replacement);
+    } finally {
+      kill.mockRestore();
+    }
+  },
+);
 
-test('POSIX discovery preserves socket ownership after a registered process dies', async () => {
-  const { home, file, entry, channel } = await fixture();
-  await channel.dispose();
-  const address = hostAddress(home, entry.hostId, 'linux', '/Host/Temporary');
-  fs.writeFileSync(file, JSON.stringify({ ...entry, pid: 424242, address }));
-  const platform = Object.getOwnPropertyDescriptor(process, 'platform')!;
-  const lstat = filesystem.lstatSync;
-  const inspection = vi.spyOn(filesystem, 'lstatSync').mockImplementation((target: fs.PathLike) => {
-    assert.notEqual(target, address, 'Discovery cannot establish socket ownership from a stopped PID.');
-    return lstat(target);
-  });
-  const kill = vi.spyOn(process, 'kill').mockImplementation(() => {
-    throw Object.assign(new Error('Stopped'), { code: 'ESRCH' });
-  });
-  Object.defineProperty(process, 'platform', { ...platform, value: 'linux' });
-  syncBuiltinESMExports();
-  try {
-    assert.deepEqual(await discoverWindows(home), {
-      windows: [],
-      complete: true,
+test(
+  'POSIX discovery preserves socket ownership after a registered process dies',
+  { tags: ['subprocess'] },
+  async () => {
+    const { home, file, entry, channel } = await fixture();
+    await channel.dispose();
+    const address = hostAddress(home, entry.hostId, 'linux', '/Host/Temporary');
+    fs.writeFileSync(file, JSON.stringify({ ...entry, pid: 424242, address }));
+    const platform = Object.getOwnPropertyDescriptor(process, 'platform')!;
+    const lstat = filesystem.lstatSync;
+    const inspection = vi.spyOn(filesystem, 'lstatSync').mockImplementation((target: fs.PathLike) => {
+      assert.notEqual(target, address, 'Discovery cannot establish socket ownership from a stopped PID.');
+      return lstat(target);
     });
-    assert.equal(fs.existsSync(file), false);
-    assert.equal(
-      inspection.mock.calls.some(([target]) => target === address),
-      false,
-    );
-  } finally {
-    Object.defineProperty(process, 'platform', platform);
-    inspection.mockRestore();
-    kill.mockRestore();
+    const kill = vi.spyOn(process, 'kill').mockImplementation(() => {
+      throw Object.assign(new Error('Stopped'), { code: 'ESRCH' });
+    });
+    Object.defineProperty(process, 'platform', { ...platform, value: 'linux' });
     syncBuiltinESMExports();
-  }
-});
+    try {
+      assert.deepEqual(await discoverWindows(home), {
+        windows: [],
+        complete: true,
+      });
+      assert.equal(fs.existsSync(file), false);
+      assert.equal(
+        inspection.mock.calls.some(([target]) => target === address),
+        false,
+      );
+    } finally {
+      Object.defineProperty(process, 'platform', platform);
+      inspection.mockRestore();
+      kill.mockRestore();
+      syncBuiltinESMExports();
+    }
+  },
+);
 
-test('discovery uses the published fallback from a different temporary environment', async () => {
-  const { home, file, entry } = await fixture();
-  const longHome = path.join(home, 'MixedCase'.repeat(20));
-  fs.mkdirSync(path.join(longHome, 'hosts'), { recursive: true });
-  const platform = Object.getOwnPropertyDescriptor(process, 'platform')!;
-  const createConnection = net.createConnection;
-  const published = hostAddress(longHome, entry.hostId, 'linux', '/Host/TemporaryMixedCase');
-  assert.equal(published.startsWith('/Host/TemporaryMixedCase/'), true);
-  fs.writeFileSync(
-    path.join(longHome, 'hosts', `${entry.hostId}.json`),
-    JSON.stringify({ ...entry, address: published }),
-  );
-  const connections = vi.spyOn(network, 'createConnection').mockImplementation((address: string) => {
-    assert.equal(address, published);
-    return createConnection(entry.address);
-  });
-  syncBuiltinESMExports();
-  Object.defineProperty(process, 'platform', { ...platform, value: 'linux' });
-  try {
-    vi.stubEnv('TMPDIR', '/Client/OtherTemporary');
-    assert.equal((await discoverWindows(longHome)).windows[0]?.hostId, entry.hostId);
-    assert.equal(connections.mock.calls.length, 1);
-  } finally {
-    Object.defineProperty(process, 'platform', platform);
-    connections.mockRestore();
+test(
+  'discovery uses the published fallback from a different temporary environment',
+  { tags: ['subprocess'] },
+  async () => {
+    const { home, file, entry } = await fixture();
+    const longHome = path.join(home, 'MixedCase'.repeat(20));
+    fs.mkdirSync(path.join(longHome, 'hosts'), { recursive: true });
+    const platform = Object.getOwnPropertyDescriptor(process, 'platform')!;
+    const createConnection = net.createConnection;
+    const published = hostAddress(longHome, entry.hostId, 'linux', '/Host/TemporaryMixedCase');
+    assert.equal(published.startsWith('/Host/TemporaryMixedCase/'), true);
+    fs.writeFileSync(
+      path.join(longHome, 'hosts', `${entry.hostId}.json`),
+      JSON.stringify({ ...entry, address: published }),
+    );
+    const connections = vi.spyOn(network, 'createConnection').mockImplementation((address: string) => {
+      assert.equal(address, published);
+      return createConnection(entry.address);
+    });
     syncBuiltinESMExports();
-    vi.unstubAllEnvs();
-    fs.writeFileSync(file, JSON.stringify(entry));
-  }
-});
+    Object.defineProperty(process, 'platform', { ...platform, value: 'linux' });
+    try {
+      vi.stubEnv('TMPDIR', '/Client/OtherTemporary');
+      assert.equal((await discoverWindows(longHome)).windows[0]?.hostId, entry.hostId);
+      assert.equal(connections.mock.calls.length, 1);
+    } finally {
+      Object.defineProperty(process, 'platform', platform);
+      connections.mockRestore();
+      syncBuiltinESMExports();
+      vi.unstubAllEnvs();
+      fs.writeFileSync(file, JSON.stringify(entry));
+    }
+  },
+);

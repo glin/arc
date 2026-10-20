@@ -740,7 +740,9 @@
     "test:browser": "node test.mjs browser",
     "shots": "tsx scripts/panel-shots.ts",
     "tones": "tsx ../.claude/skills/panel-mockup/snapshot-css.ts shots && tsx ../.claude/skills/panel-mockup/tone-sheet.ts shots",
-    "package": "node scripts/package.mjs --no-dependencies --allow-missing-repository -o arc.vsix"
+    "package": "node scripts/package.mjs --no-dependencies --allow-missing-repository -o arc.vsix",
+    "test:unit": "node test.mjs node --tags-filter=!subprocess",
+    "test:integration": "node test.mjs node --tags-filter=subprocess"
   },
   "devDependencies": {
     "@types/diff": "^5.2.3",

@@ -33,8 +33,8 @@
     "build": "node build.mjs",
     "prepack": "npm run build",
     "typecheck": "tsc --noEmit -p tsconfig.json",
-    "test:unit": "vitest run test/status.test.ts test/stream-fixtures.test.mjs test/cost.test.ts test/run.test.ts test/manage.test.ts",
-    "test:smoke": "npm run build && vitest run test/smoke.test.mjs test/smoke.bundled-a.test.mjs test/smoke.bundled-b.test.mjs test/smoke.bundled-c.test.mjs",
+    "test:unit": "vitest run --tags-filter=!subprocess --exclude \"test/smoke.bundled-*.test.mjs\"",
+    "test:smoke": "npm run build && vitest run --tags-filter=subprocess",
     "test": "npm run typecheck && npm run test:unit && npm run test:smoke"
   },
   "devDependencies": {

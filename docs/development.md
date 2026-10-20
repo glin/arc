@@ -121,7 +121,7 @@ Git writes a text file instead of the link when it cannot create links. Repair t
 
 ## Worktree dependencies
 
-`npm test` from a worktree root needs three dependency trees: `node_modules`, `extension/node_modules`, and `cli/node_modules`. A worktree that has only `extension/node_modules` cannot run the gate.
+`npm run test:all` from a worktree root needs three dependency trees: `node_modules`, `extension/node_modules`, and `cli/node_modules`. A worktree that has only `extension/node_modules` cannot run the gate.
 
 A worktree gets the three trees in one of two ways. It links each tree to the same tree in the main worktree after the main worktree has installed them. Or it runs the install commands in [Dependencies](#dependencies) inside the worktree.
 
@@ -135,7 +135,7 @@ To compare test results between two commits, run both in checkouts set up the sa
 
 ## Fast iteration
 
-Run `npm run test:iterate` while you iterate. It runs typecheck and then the extension node lane.
+Run `npm run test:iterate` while you iterate. It runs the direct unit lanes. Run `npm test` to include static checks.
 
 Run the read-only Claude timeline sweep when a state needs checking:
 
@@ -153,10 +153,10 @@ After all edits, format your changes and run the tests once before handoff. In a
 
 ```bash
 npm run format
-npm test
+npm run test:all
 ```
 
-In a shared checkout, another session can hold unformatted edits in files you do not own. A whole-repository format check then fails on their work. Format and check only your own files, then run the remaining steps of `npm test` one by one:
+In a shared checkout, another session can hold unformatted edits in files you do not own. A whole-repository format check then fails on their work. Format and check only your own files, then run the remaining steps of `npm run test:all` one by one:
 
 ```bash
 npx oxfmt --config .oxfmtrc.mjs extension/src/panelhost.ts extension/src/panel.webview.test.ts
@@ -164,7 +164,8 @@ npx oxfmt --config .oxfmtrc.mjs --check extension/src/panelhost.ts extension/src
 npm run lint
 npm run typecheck
 npm run test:unit
-npm run test:smoke
+npm run test:integration
+npm run test:browser
 ```
 
 Run the full check after the final rebase or merge. Record the tested full commit SHA, checkout path, command, and exit status. A check of an earlier commit does not cover the landing candidate. After landing, run `npm run format:check` and `npm run lint` in the main checkout to check its local files.
@@ -219,10 +220,20 @@ Oxfmt covers root tooling, plugin hooks, CLI source and tests, extension build s
 Run the full test suite:
 
 ```bash
-npm test
+npm run test:all
 ```
 
-`npm test` runs `format:check`, then lint, then typecheck, then the test suite, and stops at the first failing step. The test suite runs `test:unit` and then `test:smoke`. `test:unit` starts with `test:root`, which holds the root Vitest files (`plugins`, `scripts`, `test`) except the tests tagged `subprocess`. The root lane runs its files serially. It then runs `test:subprocess`, `npm run test:panel-mockup`, `extension/test.mjs` in full mode, and the CLI unit tests. `test:panel-mockup` runs the panel-mockup renderer tests from `.claude/skills/panel-mockup/vitest.config.mts`. `extension/test.mjs` runs the extension node lane and then the extension browser lane. `test:smoke` runs the hook smoke test and then the CLI smoke tests. Root tests that start real processes carry the Vitest tag `subprocess`. `vitest.config.mts` defines the tag with a 120 second test budget and sets `strictTags`, so an unknown tag fails the run. A file whose cases all start processes carries the comment `// @module-tag subprocess`. Any other file tags the single test or `describe` with `{ tags: ['subprocess'] }`. A tag budget covers tests and not hooks, so a hook in a tagged file sets its own budget. `test:root` runs with `--tags-filter="!subprocess"`. `test:subprocess` runs `scripts/test-subprocess.mjs`, which takes a machine-wide lock and then runs only the tagged tests, one file at a time and at most two concurrent cases in a file. A second session waits for the lock, so subprocess lanes do not compete with each other. `scripts/test-lanes.test.js` fails when a root test file reaches `child_process` without the tag. It follows direct imports and literal relative helper imports. The guard also fails when the root lanes stop covering every root test file or the GitHub workflow stops running either lane. Run a lane on its own with `npm --prefix extension run test:node` or `npm --prefix extension run test:browser`. The GitHub workflow splits the steps into parallel jobs. One job runs the format check, lint and typecheck. One runs every Node test, which includes `test:root` and `test:subprocess`. Three each run a third of the browser lane files with the Vitest `--shard` flag. The node lane holds every extension test file that is not a browser file and runs it with up to 8 Vitest workers by default. The browser lane holds every `panel.layout*.test.ts` file and every `*.browser.test.ts` file and runs it with up to 4 Vitest workers by default. `extension/test.mjs` uses these defaults unless `VITEST_MAX_WORKERS` supplies the requested cap for both lanes. `extension/vitest.config.ts` sets a default cap of 4 workers for a Vitest run that bypasses `test.mjs`, such as an IDE runner or `npx vitest run` in `extension/`. The lane runner supplies one `--maxWorkers` flag with the requested cap or its lane default. Two limiters bound concurrent headless browsers. The lane lock serializes browser lanes. Sixteen machine-wide slots bound individual browser launches. Direct Vitest runs that bypass `test.mjs`, IDE runners, and the `shots` script also compete for those slots.
+`npm test` runs formatting, lint, typecheck, and direct unit tests in that order. `test:unit` runs root, extension, and CLI units sequentially. The default excludes cases tagged `subprocess`. Excluded discovery defers worker bundle builds. `npm run test:all` runs the default followed by all integration and browser categories. Run the complete command before handoff and after the final rebase or merge.
+
+`npm run test:integration` runs root subprocess tests, extension integration tests, panel-mockup tests, and hook and CLI smoke tests sequentially. `npm run test:browser` runs every extension browser file. The CLI smoke command builds its bundle before running tagged CLI cases. `npm --prefix extension run test:node` runs every extension Node case. `node extension/test.mjs full` runs every extension Node and browser case. Named-file commands retain tagged and untagged cases unless the caller supplies a tag filter.
+
+Root tests that start real processes carry the Vitest tag `subprocess`. The root tag supplies a 120 second test budget. Tagged hooks retain their own budget. A whole file uses `// @module-tag subprocess`. Other files tag individual tests or suites with `{ tags: ['subprocess'] }`. Each package enables strict tags. `test:root` and `test:subprocess` partition the root tests and exclude the hook smoke file. `test:smoke` owns that file. The root subprocess runner takes its machine-wide lock and runs one file at a time, with at most two concurrent cases.
+
+`scripts/test-lanes.test.js` checks category coverage, recursive relative-helper process discovery, deferred worker builds, and expensive-test admission. `scripts/test-admission.json` names each admitted file's failure boundary, case budget, and repetition identity. Added expensive cases and expanded matrices require an explicit admission update. Preserve corruption, installation, extraction, process identity, platform, accessibility, and browser interaction coverage. Input variations belong in direct tests when those tests reach the same failure.
+
+The extension Node lane uses up to eight Vitest workers. The browser lane uses up to four. `VITEST_MAX_WORKERS` overrides both lane caps. Direct extension Vitest runs default to four workers. A machine-wide lock serializes browser lanes. Sixteen shared slots bound browser launches, including direct Vitest, IDE, and screenshot runs. Compare queue wait separately from execution time.
+
+The GitHub workflow runs static checks, Node categories, and browser shards in parallel jobs. Its Node job runs `test:unit` and `test:integration`. Three browser jobs divide the browser files with Vitest's `--shard` flag. The VSIX candidate workflow runs `test:all` before packaging.
 
 Run the readiness check and the stable four-worker browser lane with these commands:
 

@@ -54,7 +54,7 @@ import {
   STOP_ENDING_GRACE_MS,
 } from './agenthost.ts';
 
-test('measurement windows refuse agent processes before launch', () => {
+test('measurement windows refuse agent processes before launch', { tags: ['subprocess'] }, () => {
   const previous = process.env.ARC_MEASURE_BLOCK_AGENTS;
   process.env.ARC_MEASURE_BLOCK_AGENTS = '1';
   try {
@@ -5954,38 +5954,45 @@ test('idle defaults contain constructor failure for both providers without dispo
   }
 });
 
-test('a spawned child receives no inherited window target when this activation has no channel', async () => {
-  vi.stubEnv('ARC_WINDOW', 'another-window');
-  const child = spawnCli(
-    process.execPath,
-    [
-      '-e',
-      'console.log(JSON.stringify({window:process.env.ARC_WINDOW ?? null,path:process.env.PATH,editor:process.env.ARC_EDITOR_EXECUTABLE}));',
-    ],
-    tempDir('arc-spawn-env-'),
-    {},
-    'codex',
-    {
-      directory: 'Arc bin',
-      editorExecutable: process.execPath,
-      windowId: null,
-    },
-  );
-  let output = '';
-  child.stdout.on('data', (chunk) => {
-    output += chunk;
-  });
-  try {
-    await vi.waitFor(() => assert.ok(output.includes('\n')));
-    const env = JSON.parse(output);
-    assert.equal(env.window, null);
-    assert.ok(env.path.startsWith('Arc bin' + path.delimiter));
-    assert.equal(env.editor, process.platform === 'win32' ? process.execPath.replaceAll('\\', '/') : process.execPath);
-  } finally {
-    child.kill();
-    vi.unstubAllEnvs();
-  }
-});
+test(
+  'a spawned child receives no inherited window target when this activation has no channel',
+  { tags: ['subprocess'] },
+  async () => {
+    vi.stubEnv('ARC_WINDOW', 'another-window');
+    const child = spawnCli(
+      process.execPath,
+      [
+        '-e',
+        'console.log(JSON.stringify({window:process.env.ARC_WINDOW ?? null,path:process.env.PATH,editor:process.env.ARC_EDITOR_EXECUTABLE}));',
+      ],
+      tempDir('arc-spawn-env-'),
+      {},
+      'codex',
+      {
+        directory: 'Arc bin',
+        editorExecutable: process.execPath,
+        windowId: null,
+      },
+    );
+    let output = '';
+    child.stdout.on('data', (chunk) => {
+      output += chunk;
+    });
+    try {
+      await vi.waitFor(() => assert.ok(output.includes('\n')));
+      const env = JSON.parse(output);
+      assert.equal(env.window, null);
+      assert.ok(env.path.startsWith('Arc bin' + path.delimiter));
+      assert.equal(
+        env.editor,
+        process.platform === 'win32' ? process.execPath.replaceAll('\\', '/') : process.execPath,
+      );
+    } finally {
+      child.kill();
+      vi.unstubAllEnvs();
+    }
+  },
+);
 
 test('empty and invalid billing labels preserve inherited attribution and launch variables', () => {
   for (const label of [undefined, '', '   ', 'cli', 'sdk-ts', 'CLAUDE-VSCODE', 'unknown']) {
@@ -6124,72 +6131,31 @@ test('Claude billing selection reads only the local selector and preserves edito
   assert.deepEqual(childEnv(inherited, {}, 'codex', cwd), childEnv(inherited, {}, 'codex'));
 });
 
-test('spawnCli reads changed billing files for fresh Claude children without loading other variables', async () => {
-  const cwd = tempDir('billing-spawn-file-');
-  const file = path.join(cwd, '.env');
-  try {
-    vi.stubEnv('ARC_CLAUDE_BILLING_LABEL', undefined);
-    vi.stubEnv('CLAUDE_CODE_ATTRIBUTION_HEADER', '0');
-    for (const [label, agent] of [
-      ['claude-vscode', 'claude'],
-      ['omit', 'claude'],
-      ['claude-vscode', 'codex'],
-    ] as const) {
-      fs.writeFileSync(file, `ARC_CLAUDE_BILLING_LABEL=${label}\nARC_ENV_FILE_ONLY=secret\n`);
-      if (agent === 'codex') {
-        const env = childEnv(process.env, {}, agent, cwd);
-        assert.deepEqual(
-          [env.CLAUDE_CODE_ENTRYPOINT, env.CLAUDE_CODE_ATTRIBUTION_HEADER, env.ARC_ENV_FILE_ONLY],
-          [undefined, '0', undefined],
-        );
-        continue;
-      }
-      const script =
-        'process.stdout.write(JSON.stringify([process.env.CLAUDE_CODE_ENTRYPOINT, process.env.CLAUDE_CODE_ATTRIBUTION_HEADER, process.env.ARC_ENV_FILE_ONLY]))';
-      const child = spawnCli(process.execPath, ['-e', script], cwd, {}, agent);
-      let output = '';
-      child.stdout.setEncoding('utf8');
-      child.stdout.on('data', (chunk) => {
-        output += chunk;
-      });
-      let code: number | null = null;
-      await new Promise<void>((resolve, reject) => {
-        child.on('error', reject);
-        child.on('exit', (value) => {
-          code = value;
-        });
-        child.on('close', resolve);
-      });
-      assert.equal(code, 0);
-      assert.deepEqual(
-        JSON.parse(output),
-        agent === 'claude'
-          ? [label === 'omit' ? 'sdk-cli' : label, label === 'omit' ? '0' : '1', null]
-          : [null, '0', null],
-      );
-    }
-  } finally {
-    vi.unstubAllEnvs();
-  }
-});
-
-test('spawnCli applies the host billing label to the actual Claude child environment', async () => {
-  try {
-    vi.stubEnv('CLAUDE_CODE_ENTRYPOINT', 'cli');
-    vi.stubEnv('CLAUDE_CODE_ATTRIBUTION_HEADER', '0');
-    for (const label of ['sdk-cli', 'claude-vscode', 'omit']) {
-      vi.stubEnv('ARC_CLAUDE_BILLING_LABEL', label);
-      for (const agent of ['claude', 'codex'] as const) {
-        const cwd = tempDir('billing-env-');
-        const env = childEnv(process.env, {}, agent, cwd);
-        const expected =
-          agent === 'claude'
-            ? [label === 'claude-vscode' ? label : 'sdk-cli', label === 'omit' ? '0' : '1']
-            : [undefined, '0'];
-        assert.deepEqual([env.CLAUDE_CODE_ENTRYPOINT, env.CLAUDE_CODE_ATTRIBUTION_HEADER], expected);
-        if (label !== 'claude-vscode') continue;
+test(
+  'spawnCli reads changed billing files for fresh Claude children without loading other variables',
+  { tags: ['subprocess'] },
+  async () => {
+    const cwd = tempDir('billing-spawn-file-');
+    const file = path.join(cwd, '.env');
+    try {
+      vi.stubEnv('ARC_CLAUDE_BILLING_LABEL', undefined);
+      vi.stubEnv('CLAUDE_CODE_ATTRIBUTION_HEADER', '0');
+      for (const [label, agent] of [
+        ['claude-vscode', 'claude'],
+        ['omit', 'claude'],
+        ['claude-vscode', 'codex'],
+      ] as const) {
+        fs.writeFileSync(file, `ARC_CLAUDE_BILLING_LABEL=${label}\nARC_ENV_FILE_ONLY=secret\n`);
+        if (agent === 'codex') {
+          const env = childEnv(process.env, {}, agent, cwd);
+          assert.deepEqual(
+            [env.CLAUDE_CODE_ENTRYPOINT, env.CLAUDE_CODE_ATTRIBUTION_HEADER, env.ARC_ENV_FILE_ONLY],
+            [undefined, '0', undefined],
+          );
+          continue;
+        }
         const script =
-          'process.stdout.write(JSON.stringify([process.env.CLAUDE_CODE_ENTRYPOINT, process.env.CLAUDE_CODE_ATTRIBUTION_HEADER]))';
+          'process.stdout.write(JSON.stringify([process.env.CLAUDE_CODE_ENTRYPOINT, process.env.CLAUDE_CODE_ATTRIBUTION_HEADER, process.env.ARC_ENV_FILE_ONLY]))';
         const child = spawnCli(process.execPath, ['-e', script], cwd, {}, agent);
         let output = '';
         child.stdout.setEncoding('utf8');
@@ -6207,14 +6173,63 @@ test('spawnCli applies the host billing label to the actual Claude child environ
         assert.equal(code, 0);
         assert.deepEqual(
           JSON.parse(output),
-          expected.map((value) => value ?? null),
+          agent === 'claude'
+            ? [label === 'omit' ? 'sdk-cli' : label, label === 'omit' ? '0' : '1', null]
+            : [null, '0', null],
         );
       }
+    } finally {
+      vi.unstubAllEnvs();
     }
-  } finally {
-    vi.unstubAllEnvs();
-  }
-});
+  },
+);
+
+test(
+  'spawnCli applies the host billing label to the actual Claude child environment',
+  { tags: ['subprocess'] },
+  async () => {
+    try {
+      vi.stubEnv('CLAUDE_CODE_ENTRYPOINT', 'cli');
+      vi.stubEnv('CLAUDE_CODE_ATTRIBUTION_HEADER', '0');
+      for (const label of ['sdk-cli', 'claude-vscode', 'omit']) {
+        vi.stubEnv('ARC_CLAUDE_BILLING_LABEL', label);
+        for (const agent of ['claude', 'codex'] as const) {
+          const cwd = tempDir('billing-env-');
+          const env = childEnv(process.env, {}, agent, cwd);
+          const expected =
+            agent === 'claude'
+              ? [label === 'claude-vscode' ? label : 'sdk-cli', label === 'omit' ? '0' : '1']
+              : [undefined, '0'];
+          assert.deepEqual([env.CLAUDE_CODE_ENTRYPOINT, env.CLAUDE_CODE_ATTRIBUTION_HEADER], expected);
+          if (label !== 'claude-vscode') continue;
+          const script =
+            'process.stdout.write(JSON.stringify([process.env.CLAUDE_CODE_ENTRYPOINT, process.env.CLAUDE_CODE_ATTRIBUTION_HEADER]))';
+          const child = spawnCli(process.execPath, ['-e', script], cwd, {}, agent);
+          let output = '';
+          child.stdout.setEncoding('utf8');
+          child.stdout.on('data', (chunk) => {
+            output += chunk;
+          });
+          let code: number | null = null;
+          await new Promise<void>((resolve, reject) => {
+            child.on('error', reject);
+            child.on('exit', (value) => {
+              code = value;
+            });
+            child.on('close', resolve);
+          });
+          assert.equal(code, 0);
+          assert.deepEqual(
+            JSON.parse(output),
+            expected.map((value) => value ?? null),
+          );
+        }
+      }
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  },
+);
 
 test('a reused Claude child keeps its billing label after the host environment changes', async () => {
   const children: FakeChild[] = [];

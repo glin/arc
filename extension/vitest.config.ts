@@ -15,6 +15,8 @@ export default defineConfig({
     maxWorkers: 4,
     testTimeout: 30_000,
     hookTimeout: 30_000,
+    strictTags: true,
+    tags: [{ name: 'subprocess', description: 'Builds bundles or exercises real processes.' }],
     restoreMocks: true,
   },
 });

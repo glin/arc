@@ -110,7 +110,7 @@ test('age alone ends a session, because nothing marks its files kept or reverted
   assert.ok(fs.existsSync(path.join(root, 'recent-and-differing')));
 });
 
-test('read-only Stops renew retention for changed and reverted useful stores', () => {
+test('read-only Stops renew retention for changed and reverted useful stores', { tags: ['subprocess'] }, () => {
   const home = tempDir('stop-retention-');
   const root = path.join(home, 'snapshots');
   const work = tempDir('stop-work-');

@@ -5,6 +5,8 @@ const os = require('node:os');
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
 const { pathToFileURL } = require('node:url');
+const { testFiles, classification, caseBudget } = require('./test-classification.js');
+const { runChecks } = require('./typecheck-parallel.js');
 
 const repositoryRoot = path.join(__dirname, '..');
 const ROOT_TEST_DIRECTORIES = ['plugins', 'scripts', 'test'];
@@ -14,8 +16,14 @@ const UNTAGGED_PROCESS_FILES = {
 };
 
 let lane;
+let defaults;
+let units;
+let integration;
 beforeAll(async () => {
   lane = await import(pathToFileURL(path.join(__dirname, 'test-subprocess.mjs')).href);
+  defaults = await import(pathToFileURL(path.join(__dirname, 'test-default.mjs')).href);
+  units = await import(pathToFileURL(path.join(__dirname, 'test-unit.mjs')).href);
+  integration = await import(pathToFileURL(path.join(__dirname, 'test-integration.mjs')).href);
 });
 
 function rootTestFiles(directory = '') {
@@ -93,7 +101,14 @@ test('command entry points run through a linked checkout', { tags: ['subprocess'
     fs.writeFileSync(target, text);
   };
   try {
-    for (const file of ['scripts/test-subprocess.mjs', 'extension/test.mjs', 'scripts/isolated-editor.mjs']) {
+    for (const file of [
+      'scripts/test-subprocess.mjs',
+      'scripts/test-default.mjs',
+      'scripts/test-unit.mjs',
+      'scripts/test-integration.mjs',
+      'extension/test.mjs',
+      'scripts/isolated-editor.mjs',
+    ]) {
       write(file, fs.readFileSync(path.join(repositoryRoot, file), 'utf8'));
     }
     write(
@@ -106,9 +121,16 @@ test('command entry points run through a linked checkout', { tags: ['subprocess'
     );
     write('extension/src/example.test.ts', '');
     write('node_modules/vitest/vitest.mjs', 'console.log("subprocess entry reached");process.exitCode=7;');
+    write(
+      'scripts/typecheck-parallel.js',
+      'module.exports = {runChecks: async ([lane]) => { console.log(lane.label); return [lane.label]; }};',
+    );
     fs.symlinkSync(physical, linked, 'junction');
     for (const { file, args, status, output } of [
       { file: 'scripts/test-subprocess.mjs', args: [], status: 7, output: /subprocess entry reached/ },
+      { file: 'scripts/test-default.mjs', args: [], status: 1, output: /format:check/ },
+      { file: 'scripts/test-unit.mjs', args: [], status: 1, output: /root units/ },
+      { file: 'scripts/test-integration.mjs', args: [], status: 1, output: /root subprocess/ },
       { file: 'extension/test.mjs', args: ['invalid-mode'], status: 1, output: /Unknown test mode/ },
       { file: 'scripts/isolated-editor.mjs', args: ['invalid-command'], status: 2, output: /Choose a command/ },
     ]) {
@@ -135,6 +157,20 @@ test('every untagged process file is still listed for a reason', () => {
     assert.ok(reason.length > 0, file);
     const text = fs.readFileSync(path.join(repositoryRoot, file), 'utf8');
     assert.ok(importsChildProcess(text) && !hasSubprocessTag(text), `${file} no longer needs its entry.`);
+  }
+});
+
+test('process discovery follows unnamed relative helpers through another helper', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'arc-helper-discovery-'));
+  try {
+    fs.writeFileSync(path.join(root, 'ordinary.test.js'), "require('./ordinary.js');");
+    fs.writeFileSync(path.join(root, 'ordinary.js'), "require('./another.js');");
+    fs.writeFileSync(path.join(root, 'another.js'), "require('node:child_process').spawn('node');");
+    assert.equal(reachesChildProcess(path.join(root, 'ordinary.test.js')), true);
+    fs.writeFileSync(path.join(root, 'another.js'), "require('./ordinary.js');");
+    assert.equal(reachesChildProcess(path.join(root, 'ordinary.test.js')), false);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
   }
 });
 
@@ -165,14 +201,229 @@ test('test:root and test:subprocess together select every root test file', () =>
     excluded,
   );
   assert.match(scripts['test:smoke'], new RegExp(`vitest run ${lane.SMOKE_TEST_FILE.replace(/\./g, '\\.')}`));
-  assert.match(scripts['test:unit'], /npm run test:root && npm run test:subprocess /);
+  assert.equal(scripts['test:unit'], 'node scripts/test-unit.mjs');
 });
 
-test('the GitHub workflow runs both root lanes', () => {
+test('both GitHub workflows retain complete categories', () => {
   const workflow = fs.readFileSync(path.join(repositoryRoot, '.github', 'workflows', 'tests.yml'), 'utf8');
   const commands = [...workflow.matchAll(/^\s*run:\s*(\S.*)$/gm)].map((match) => match[1].trim());
-  assert.ok(commands.includes('npm run test:root'), 'The workflow must run test:root.');
-  assert.ok(commands.includes('npm run test:subprocess'), 'The workflow must run test:subprocess.');
+  assert.ok(commands.includes('npm run test:unit'), 'The workflow must run test:unit.');
+  assert.ok(commands.includes('npm run test:integration'), 'The workflow must run test:integration.');
+  assert.match(workflow, /npm --prefix extension run test:browser/);
+  const candidate = fs.readFileSync(path.join(repositoryRoot, '.github/workflows/vsix-candidate.yml'), 'utf8');
+  assert.match(candidate, /^\s*- run: npm run test:all\s*$/m);
+});
+
+test('the default runs direct units and the complete command adds every integration category', () => {
+  const scripts = readScripts();
+  assert.equal(scripts.test, 'node scripts/test-default.mjs');
+  assert.deepEqual(
+    defaults.defaultLanes(repositoryRoot, 'npm-cli.js').map((entry) => entry.args),
+    [
+      ['npm-cli.js', 'run', 'format:check'],
+      ['npm-cli.js', 'run', 'lint'],
+      ['npm-cli.js', 'run', 'typecheck'],
+      ['npm-cli.js', 'run', 'test:unit'],
+    ],
+  );
+  const lanes = units.unitLanes(repositoryRoot);
+  assert.equal(lanes.length, 3);
+  assert.ok(lanes.every((entry) => entry.args.includes('--tags-filter=!subprocess')));
+  assert.deepEqual(lanes[0].args.slice(2), ['--exclude', lane.SMOKE_TEST_FILE, '--tags-filter=!subprocess']);
+  assert.match(lanes[1].args[0], /extension[\\/]test[.]mjs$/);
+  assert.equal(lanes[1].args[1], 'node');
+  assert.deepEqual(lanes[2].args.slice(2), ['--tags-filter=!subprocess', '--exclude', 'test/smoke.bundled-*.test.mjs']);
+  assert.equal(scripts['test:integration'], 'node scripts/test-integration.mjs');
+  assert.equal(scripts['test:browser'], 'node extension/test.mjs browser');
+  assert.equal(scripts['test:all'], 'npm test && node scripts/test-integration.mjs --browser');
+  const groups = integration.integrationLanes(repositoryRoot, true, 'npm-cli.js');
+  assert.deepEqual(
+    groups.map((entry) => entry.args),
+    [
+      ['npm-cli.js', 'run', 'test:subprocess'],
+      ['npm-cli.js', '--prefix', 'extension', 'run', 'test:integration'],
+      ['npm-cli.js', 'run', 'test:panel-mockup'],
+      ['npm-cli.js', 'run', 'test:smoke'],
+      ['npm-cli.js', 'run', 'test:browser'],
+    ],
+  );
+  assert.deepEqual(integration.integrationLanes(repositoryRoot, false, 'npm-cli.js'), groups.slice(0, -1));
+  const extension = JSON.parse(fs.readFileSync(path.join(repositoryRoot, 'extension/package.json'))).scripts;
+  assert.equal(extension['test:integration'], 'node test.mjs node --tags-filter=subprocess');
+  const cli = JSON.parse(fs.readFileSync(path.join(repositoryRoot, 'cli/package.json'))).scripts;
+  assert.equal(cli['test:unit'], 'vitest run --tags-filter=!subprocess --exclude "test/smoke.bundled-*.test.mjs"');
+  assert.equal(cli['test:smoke'], 'npm run build && vitest run --tags-filter=subprocess');
+});
+
+test('stages run sequentially and stop after a failure', async () => {
+  const started = [];
+  let finish;
+  const first = new Promise((resolve) => {
+    finish = resolve;
+  });
+  const pending = defaults.runLanes([{ label: 'first' }, { label: 'second' }, { label: 'third' }], async ([entry]) => {
+    started.push(entry.label);
+    if (entry.label === 'first') await first;
+    return entry.label === 'second' ? ['second'] : [];
+  });
+  assert.deepEqual(started, ['first']);
+  finish();
+  assert.deepEqual(await pending, ['second']);
+  assert.deepEqual(started, ['first', 'second']);
+});
+
+test.each(['default', 'unit', 'integration'])('%s lanes publish child output before close', async (wrapper) => {
+  const output = [];
+  const errors = [];
+  const children = [];
+  const started = [];
+  const selected =
+    wrapper === 'default'
+      ? defaults.defaultLanes(repositoryRoot, 'npm-cli.js').slice(-1)
+      : wrapper === 'unit'
+        ? units.unitLanes(repositoryRoot)
+        : integration.integrationLanes(repositoryRoot, true, 'npm-cli.js');
+  const run = (entries, options, write, writeError) =>
+    runChecks(entries, {
+      ...options,
+      spawnFn: (_command, args) => {
+        started.push(args);
+        const child = new EventEmitter();
+        child.stdout = new EventEmitter();
+        child.stderr = new EventEmitter();
+        if (args.includes('test:unit')) {
+          defaults
+            .runLanes(units.unitLanes(repositoryRoot), (nested, nestedOptions) =>
+              run(
+                nested,
+                nestedOptions,
+                (chunk) => child.stdout.emit('data', chunk),
+                (chunk) => child.stderr.emit('data', chunk),
+              ),
+            )
+            .then((failed) => child.emit('close', failed.length ? 1 : 0));
+        } else children.push(child);
+        return child;
+      },
+      write,
+      writeError,
+      log: () => {},
+      logError: () => {},
+    });
+  const pending = defaults.runLanes(selected, (entries, options) =>
+    run(
+      entries,
+      options,
+      (chunk) => output.push(chunk),
+      (chunk) => errors.push(chunk),
+    ),
+  );
+  assert.equal(children.length, 1);
+  const active = started.length;
+  children[0].stdout.emit('data', Buffer.from('waiting for subprocess lock\n'));
+  children[0].stderr.emit('data', Buffer.from('child progress\n'));
+  assert.equal(Buffer.concat(output).toString(), 'waiting for subprocess lock\n');
+  assert.equal(Buffer.concat(errors).toString(), 'child progress\n');
+  assert.equal(started.length, active);
+  children[0].emit('close', 7);
+  assert.deepEqual(await pending, [selected[0].label]);
+  assert.equal(started.length, active);
+  assert.equal(Buffer.concat(output).toString(), 'waiting for subprocess lock\n');
+  assert.equal(Buffer.concat(errors).toString(), 'child progress\n');
+});
+
+test('expensive tests retain admitted boundaries and repetition budgets', () => {
+  const admission = JSON.parse(fs.readFileSync(path.join(__dirname, 'test-admission.json'), 'utf8'));
+  const found = {};
+  for (const file of testFiles(repositoryRoot)) {
+    const source = fs.readFileSync(path.join(repositoryRoot, file), 'utf8');
+    if (!Object.values(classification(file, source)).some(Boolean)) continue;
+    assert.ok(admission[file]?.reason, `${file}: name the external failure boundary in scripts/test-admission.json.`);
+    found[file] = { reason: admission[file].reason, ...caseBudget(file, source) };
+  }
+  assert.deepEqual(found, admission, 'Added expensive cases and expanded matrices need an explicit admission change.');
+});
+
+test('admission detects build aliases, process helpers, added cases, and selected matrix growth', () => {
+  for (const source of [
+    "import { build as bundle } from 'esbuild'; test('bundle', () => bundle({}));",
+    "const { build: bundle } = require('esbuild'); test('bundle', () => bundle({}));",
+    "const bundler = await import('esbuild'); test('bundle', () => bundler.build({}));",
+  ])
+    assert.equal(classification('ordinary.test.ts', source).build, true);
+  assert.equal(classification('ordinary.test.ts', "test('child', () => spawnCli('node'));").process, true);
+  assert.equal(classification('ordinary.test.js', "test('child', () => runChecks([]));").process, true);
+  assert.notDeepEqual(caseBudget('ordinary.ts', ''), caseBudget('ordinary.ts', "test('another', () => {});"));
+  for (const [file, needle, replacement] of [
+    [
+      'extension/src/packaging.test.ts',
+      "{ command: '/bin/sh', args: ['-c'] }",
+      "{ command: '/bin/sh', args: ['-c'] }, { command: '/bin/sh', args: ['-c'] }",
+    ],
+    [
+      'scripts/editor-cli.test.js',
+      "{ ARC_TEST_HTTP_FAILURE: 'api.github' },",
+      "{ ARC_TEST_HTTP_FAILURE: 'api.github' }, { ARC_TEST_HTTP_FAILURE: 'api.github' },",
+    ],
+  ]) {
+    const source = fs.readFileSync(path.join(repositoryRoot, file), 'utf8');
+    assert.ok(source.includes(needle), file);
+    assert.notDeepEqual(caseBudget(file, source), caseBudget(file, source.replace(needle, replacement)));
+  }
+});
+
+test('unit discovery defers worker bundle builds until admitted execution', () => {
+  const ts = require('../extension/node_modules/typescript');
+  for (const file of ['progressiveworker.test.ts', 'startup.test.ts', 'panel.webview.test.ts']) {
+    const source = fs.readFileSync(path.join(repositoryRoot, 'extension/src', file), 'utf8');
+    const ast = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true);
+    const eager = [];
+    function visit(node, inFunction = false) {
+      inFunction ||= ts.isArrowFunction(node) || ts.isFunctionExpression(node) || ts.isFunctionDeclaration(node);
+      if (!inFunction && ts.isCallExpression(node) && /(?:^|[.])buildSync$/.test(node.expression.getText(ast)))
+        eager.push(node.expression.getText(ast));
+      ts.forEachChild(node, (child) => visit(child, inFunction));
+    }
+    visit(ast);
+    assert.deepEqual(eager, [], file);
+  }
+  const codex = fs.readFileSync(path.join(repositoryRoot, 'extension/src/codex.test.ts'), 'utf8');
+  assert.match(codex, /describe\('recreated worktree ownership',\s*\{ tags: \['subprocess'\]/);
+});
+
+test('real window-channel and native background fixtures execute in integration', () => {
+  const ts = require('../extension/node_modules/typescript');
+  for (const [file, helper] of [
+    ['extension/src/sessionrequests.test.ts', /\bfixture\(|new (?:WindowChannel|WindowsPipeServer)\(/],
+    ['extension/src/sessiondiscovery.test.ts', /\bfixture\(|new WindowChannel\(/],
+    ['extension/src/sessionwrites.test.ts', /\bfixture\(/],
+    ['extension/src/windowpipe.test.ts', /\bfixture\(/],
+    ['cli/test/run.test.ts', /\bbackgroundFixture\(|absent-provider/],
+    ['extension/src/agenthost.test.ts', /\bspawnCli\(/],
+    ['extension/src/claudeplugin.test.ts', /\.installCommands\(|\bresolveToolRuntime\(/],
+    ['extension/src/panel-shots.test.ts', /ONE_PIXEL_PNG/],
+    ['cli/test/manage.test.ts', /\bhost\(|new WindowChannel\(/],
+    ['cli/test/smoke.test.mjs', /\brunSkillCommand\(/],
+  ]) {
+    const source = fs.readFileSync(path.join(repositoryRoot, file), 'utf8');
+    if (/^\/\/ @module-tag subprocess/m.test(source)) continue;
+    const ast = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true);
+    function visit(node) {
+      if (ts.isCallExpression(node) && /^test(?:\.|$)/.test(node.expression.getText(ast))) {
+        const callback = node.arguments.find((arg) => ts.isArrowFunction(arg) || ts.isFunctionExpression(arg));
+        if (callback && helper.test(callback.getText(ast))) {
+          assert.ok(
+            node.arguments.some(
+              (arg) => ts.isObjectLiteralExpression(arg) && /tags:\s*\[\s*'subprocess'/.test(arg.getText(ast)),
+            ),
+            `${file}: ${node.arguments[0].getText(ast)}`,
+          );
+        }
+      }
+      ts.forEachChild(node, visit);
+    }
+    visit(ast);
+  }
 });
 
 test('the subprocess lane takes its own machine-wide lock around Vitest and releases it with the status', async () => {

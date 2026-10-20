@@ -12,14 +12,17 @@
     "lint:css": "stylelint --config .stylelintrc.cjs --max-warnings 0 \"extension/src/webview/*.css\"",
     "lint:fix": "npm run lint:js -- --fix",
     "release": "node scripts/release-version.js",
-    "test": "npm run format:check && npm run lint && npm run typecheck && npm run test:unit && npm run test:smoke",
-    "test:iterate": "npm run typecheck && npm --prefix extension run test:node",
+    "test": "node scripts/test-default.mjs",
+    "test:iterate": "npm run test:unit",
     "test:panel-mockup": "vitest run --config .claude/skills/panel-mockup/vitest.config.mts",
     "typecheck": "node scripts/typecheck-parallel.js",
     "test:root": "vitest run --exclude test/hooks-smoke.test.js --tags-filter=\"!subprocess\"",
     "test:subprocess": "node scripts/test-subprocess.mjs",
-    "test:unit": "npm run test:root && npm run test:subprocess && npm run test:panel-mockup && npm --prefix extension test && npm --prefix cli run test:unit",
-    "test:smoke": "vitest run test/hooks-smoke.test.js && npm --prefix cli run test:smoke"
+    "test:unit": "node scripts/test-unit.mjs",
+    "test:smoke": "vitest run test/hooks-smoke.test.js && npm --prefix cli run test:smoke",
+    "test:integration": "node scripts/test-integration.mjs",
+    "test:browser": "node extension/test.mjs browser",
+    "test:all": "npm test && node scripts/test-integration.mjs --browser"
   },
   "devDependencies": {
     "oxfmt": "0.67.0",

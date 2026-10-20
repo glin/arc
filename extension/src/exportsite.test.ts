@@ -1542,51 +1542,57 @@ test('demo downloads retain production cost categories and compaction overhead',
   }
 });
 
-test('portable projection retains every body beyond previews and removes post-builder action metadata', async () => {
-  const directory = tempDir('arc-export-site-');
-  const writer = await ExportTransaction.create(directory);
-  const model = await sessionSiteFixture(writer);
-  const assets = exportBrowserAssets();
-  await projectSessionSite(model, writer, assets);
-  const result = await writer.publish(async () => {});
-  const { manifest, data } = exportedSiteData(result.directory);
-  assert.equal((await fs.readdir(result.directory)).length, 2);
-  assert.ok(manifest);
-  assert.equal(manifest.sessions[0].pages.length, 2);
-  assert.equal(manifest.sessions[0].pages[0].keys.length, 20);
-  assert.equal(JSON.stringify(manifest.relationships), JSON.stringify(model.relationships));
-  assert.equal(JSON.stringify(manifest.omissions), JSON.stringify(model.omissions));
-  const cards = manifest.sessions[0].pages[0].cards!.map(
-    (asset) => data.get(asset.id) as { card: CardView; blocks: ExportBlock[] },
-  );
-  assert.equal(cards[0].card.statusWord, 'Unfinished at capture');
-  assert.equal(cards[0].card.fileCount, 1);
-  assert.match(cards[0].card.dispatched![0].description, /Work is not included: missing/);
-  assert.equal(cards[0].card.added, 5);
-  assert.equal(cards[0].card.removed, 2);
-  const blocks = cards[0].blocks;
-  assert.equal(blocks.filter((block) => block.kind === 'prompt').length, 14);
-  const answer = blocks.find((block) => block.kind === 'answer')!;
-  assert.ok(answer.text.endsWith('![image](https://example.invalid/image)'));
-  assert.ok(cards[0].card.summary.includes('final sentinel'));
-  assert.equal(cards[0].card.laterPrompts?.length, 13);
-  assert.equal(cards[0].card.saidMessages?.[0].text, 'Commentary 21');
-  for (const html of [
-    cards[0].card.summaryHtml,
-    ...(cards[0].card.saidMessages ?? []).map((message) => message.summaryHtml),
-  ])
-    assert.doesNotMatch(html ?? '', /<(?:a|button|img|script|iframe)\b|data-(?:link|image|visualization)|on\w+=/i);
-  const unsafe = {
-    ...toCard(turn(), false, model.capturedAt),
-    headlineHtml: '<a href="file:///private">x</a>',
-    resume: '/private',
-    activity: [{ title: '/private/raw-tool' }],
-    chips: [{ kind: 'plain', label: '$1', detail: 'Numeric fact', detailList: { actions: true }, record: '/private' }],
-  };
-  const safe = exportCard(unsafe as unknown as ReturnType<typeof toCard>);
-  assert.doesNotMatch(JSON.stringify(safe), /private|"record"|headlineHtml|resume/);
-  await writer.dispose();
-});
+test(
+  'portable projection retains every body beyond previews and removes post-builder action metadata',
+  { tags: ['subprocess'] },
+  async () => {
+    const directory = tempDir('arc-export-site-');
+    const writer = await ExportTransaction.create(directory);
+    const model = await sessionSiteFixture(writer);
+    const assets = exportBrowserAssets();
+    await projectSessionSite(model, writer, assets);
+    const result = await writer.publish(async () => {});
+    const { manifest, data } = exportedSiteData(result.directory);
+    assert.equal((await fs.readdir(result.directory)).length, 2);
+    assert.ok(manifest);
+    assert.equal(manifest.sessions[0].pages.length, 2);
+    assert.equal(manifest.sessions[0].pages[0].keys.length, 20);
+    assert.equal(JSON.stringify(manifest.relationships), JSON.stringify(model.relationships));
+    assert.equal(JSON.stringify(manifest.omissions), JSON.stringify(model.omissions));
+    const cards = manifest.sessions[0].pages[0].cards!.map(
+      (asset) => data.get(asset.id) as { card: CardView; blocks: ExportBlock[] },
+    );
+    assert.equal(cards[0].card.statusWord, 'Unfinished at capture');
+    assert.equal(cards[0].card.fileCount, 1);
+    assert.match(cards[0].card.dispatched![0].description, /Work is not included: missing/);
+    assert.equal(cards[0].card.added, 5);
+    assert.equal(cards[0].card.removed, 2);
+    const blocks = cards[0].blocks;
+    assert.equal(blocks.filter((block) => block.kind === 'prompt').length, 14);
+    const answer = blocks.find((block) => block.kind === 'answer')!;
+    assert.ok(answer.text.endsWith('![image](https://example.invalid/image)'));
+    assert.ok(cards[0].card.summary.includes('final sentinel'));
+    assert.equal(cards[0].card.laterPrompts?.length, 13);
+    assert.equal(cards[0].card.saidMessages?.[0].text, 'Commentary 21');
+    for (const html of [
+      cards[0].card.summaryHtml,
+      ...(cards[0].card.saidMessages ?? []).map((message) => message.summaryHtml),
+    ])
+      assert.doesNotMatch(html ?? '', /<(?:a|button|img|script|iframe)\b|data-(?:link|image|visualization)|on\w+=/i);
+    const unsafe = {
+      ...toCard(turn(), false, model.capturedAt),
+      headlineHtml: '<a href="file:///private">x</a>',
+      resume: '/private',
+      activity: [{ title: '/private/raw-tool' }],
+      chips: [
+        { kind: 'plain', label: '$1', detail: 'Numeric fact', detailList: { actions: true }, record: '/private' },
+      ],
+    };
+    const safe = exportCard(unsafe as unknown as ReturnType<typeof toCard>);
+    assert.doesNotMatch(JSON.stringify(safe), /private|"record"|headlineHtml|resume/);
+    await writer.dispose();
+  },
+);
 
 test('script JSON preserves literal content', () => {
   const text = '</script><img src=x onerror=alert(1)>\u2028\u2029' + '\u{1f642}\u{1f680}\u20ac'.repeat(20000);
@@ -1611,15 +1617,19 @@ test('projection cancellation stops before publication and removes its staging a
   assert.deepEqual(await fs.readdir(directory), []);
 });
 
-test('static bundle uses the production panel entry and an exhaustive local host policy', () => {
-  const assets = exportBrowserAssets();
-  for (const owner of ['main.ts', 'bootstrap.ts', 'panel.ts', 'export-host.ts'])
-    assert.ok(
-      assets.inputs.some((file) => file.endsWith(path.join('webview', owner))),
-      owner,
-    );
-  assert.ok(!assets.inputs.some((file) => file.endsWith(path.join('webview', 'export-main.ts'))));
-});
+test(
+  'static bundle uses the production panel entry and an exhaustive local host policy',
+  { tags: ['subprocess'] },
+  () => {
+    const assets = exportBrowserAssets();
+    for (const owner of ['main.ts', 'bootstrap.ts', 'panel.ts', 'export-host.ts'])
+      assert.ok(
+        assets.inputs.some((file) => file.endsWith(path.join('webview', owner))),
+        owner,
+      );
+    assert.ok(!assets.inputs.some((file) => file.endsWith(path.join('webview', 'export-main.ts'))));
+  },
+);
 
 test('recorded opening prompts remain complete and later non-response answers cannot replace the response', async () => {
   const writer = await ExportTransaction.create(tempDir('arc-site-response-'));

@@ -130,39 +130,43 @@ test('identity errors retain successful identity and never seed a transient fall
   assert.equal(await identities.resolve('/repo'), 'git:/repo/.git');
 });
 
-test('a checkout, linked worktree, subdirectory and canonical alias share identity while clones differ', async () => {
-  const root = tempDir('setup-projects-');
-  const main = path.join(root, 'main');
-  const linked = path.join(root, 'linked');
-  const separate = path.join(root, 'separate');
-  mkdirSync(main);
-  const git = (folder: string, args: string[]) => execFileSync('git', ['-C', folder, ...args], { windowsHide: true });
-  git(main, ['init', '-q']);
-  git(main, [
-    '-c',
-    'user.name=Setup Test',
-    '-c',
-    'user.email=test@example.invalid',
-    'commit',
-    '--allow-empty',
-    '-qm',
-    'initial',
-  ]);
-  git(main, ['worktree', 'add', '-q', '-b', 'linked', linked]);
-  const subdirectory = path.join(main, 'subdirectory');
-  mkdirSync(subdirectory);
-  mkdirSync(separate);
-  git(separate, ['init', '-q']);
-  const identities = new SetupProjects(nodeGitRunner());
-  const mainIdentity = await identities.resolve(main);
-  assert.ok(mainIdentity?.startsWith('git:'));
-  assert.equal(await identities.resolve(linked), mainIdentity);
-  renameSync(path.join(linked, '.git'), path.join(linked, '.git-saved'));
-  writeFileSync(path.join(linked, '.git'), 'gitdir: missing-git-directory\n');
-  assert.equal(await identities.resolve(linked), mainIdentity, 'an invalid Git directory replaced the known project');
-  assert.equal(await new SetupProjects(nodeGitRunner()).resolve(linked), null);
-  assert.equal(await identities.resolve(subdirectory), mainIdentity);
-  assert.equal(await identities.resolve(path.join(main, 'subdirectory', '..')), mainIdentity);
-  assert.notEqual(await identities.resolve(separate), mainIdentity);
-  assert.ok((await identities.resolve(root))?.startsWith('folder:'));
-});
+test(
+  'a checkout, linked worktree, subdirectory and canonical alias share identity while clones differ',
+  { tags: ['subprocess'] },
+  async () => {
+    const root = tempDir('setup-projects-');
+    const main = path.join(root, 'main');
+    const linked = path.join(root, 'linked');
+    const separate = path.join(root, 'separate');
+    mkdirSync(main);
+    const git = (folder: string, args: string[]) => execFileSync('git', ['-C', folder, ...args], { windowsHide: true });
+    git(main, ['init', '-q']);
+    git(main, [
+      '-c',
+      'user.name=Setup Test',
+      '-c',
+      'user.email=test@example.invalid',
+      'commit',
+      '--allow-empty',
+      '-qm',
+      'initial',
+    ]);
+    git(main, ['worktree', 'add', '-q', '-b', 'linked', linked]);
+    const subdirectory = path.join(main, 'subdirectory');
+    mkdirSync(subdirectory);
+    mkdirSync(separate);
+    git(separate, ['init', '-q']);
+    const identities = new SetupProjects(nodeGitRunner());
+    const mainIdentity = await identities.resolve(main);
+    assert.ok(mainIdentity?.startsWith('git:'));
+    assert.equal(await identities.resolve(linked), mainIdentity);
+    renameSync(path.join(linked, '.git'), path.join(linked, '.git-saved'));
+    writeFileSync(path.join(linked, '.git'), 'gitdir: missing-git-directory\n');
+    assert.equal(await identities.resolve(linked), mainIdentity, 'an invalid Git directory replaced the known project');
+    assert.equal(await new SetupProjects(nodeGitRunner()).resolve(linked), null);
+    assert.equal(await identities.resolve(subdirectory), mainIdentity);
+    assert.equal(await identities.resolve(path.join(main, 'subdirectory', '..')), mainIdentity);
+    assert.notEqual(await identities.resolve(separate), mainIdentity);
+    assert.ok((await identities.resolve(root))?.startsWith('folder:'));
+  },
+);

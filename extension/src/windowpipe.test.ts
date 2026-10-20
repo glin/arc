@@ -268,6 +268,7 @@ test('compiler termination and setup rejection retain reason, operation and exit
 
 test.skipIf(process.platform !== 'win32')(
   'Windows listener errors and native child exit reach bounded Node evidence',
+  { tags: ['subprocess'] },
   async () => {
     const source = replaceNativeLiteral(
       gatedNativeSource(),
@@ -307,6 +308,7 @@ test.skipIf(process.platform !== 'win32')(
 
 test.skipIf(process.platform !== 'win32')(
   'Windows busy opens honor deadline and cancellation before availability returns',
+  { tags: ['subprocess'] },
   async () => {
     const source = gatedNativeSource().replace(
       'if(error != 231 && error != 2)',
@@ -336,6 +338,7 @@ test.skipIf(process.platform !== 'win32')(
 
 test.skipIf(process.platform !== 'win32')(
   'Windows listening survives a disconnect before native acceptance',
+  { tags: ['subprocess'] },
   async () => {
     const native = nativeFixture(gatedNativeSource());
     const address = hostAddress('', crypto.randomBytes(12).toString('hex'));
@@ -363,6 +366,7 @@ test.skipIf(process.platform !== 'win32')(
 
 test.skipIf(process.platform !== 'win32')(
   'Windows close retains the native handle until pending I/O completes',
+  { tags: ['subprocess'] },
   async () => {
     const source = WINDOW_PIPE_SOURCE.replace(/\r\n/g, '\n')
       .replace(
@@ -397,6 +401,7 @@ test.skipIf(process.platform !== 'win32')(
 
 test.skipIf(process.platform !== 'win32')(
   'Windows excludes the machine-name UNC pipe route on each instance',
+  { tags: ['subprocess'] },
   async () => {
     const { entry } = await fixture();
     const unc = entry.address.replace('\\\\.\\pipe\\', `\\\\${process.env.COMPUTERNAME}\\pipe\\`);

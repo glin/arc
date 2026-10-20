@@ -20,7 +20,7 @@ test('tests make scratch directories through temproot.ts, which removes them aft
   assert.deepEqual(offenders, [], `${offenders.join(', ')} calls mkdtemp directly. Use tempDir from temproot.ts.`);
 });
 
-test('every Vitest config in the repository runs inside its own temporary directory', () => {
+test('every Vitest config in the repository runs inside its own temporary directory', { tags: ['subprocess'] }, () => {
   const files = execFileSync('git', ['ls-files', '--cached', '--others', '--exclude-standard'], {
     cwd: REPOSITORY,
     encoding: 'utf8',

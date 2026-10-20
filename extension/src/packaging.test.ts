@@ -1,3 +1,4 @@
+// @module-tag subprocess
 // extension/src/packaging.test.ts
 import { beforeAll, test, vi } from 'vitest';
 import assert from 'node:assert';

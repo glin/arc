@@ -428,7 +428,7 @@ test('project sweep checks later resumed work after a parent process end', async
   );
 });
 
-test('npm prefix and extension-directory invocations default to the caller project', () => {
+test('npm prefix and extension-directory invocations default to the caller project', { tags: ['subprocess'] }, () => {
   const repository = path.resolve(__dirname, '../..');
   const locations = [repository, path.join(repository, 'extension')];
   for (const cwd of locations) {

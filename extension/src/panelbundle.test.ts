@@ -6,7 +6,7 @@ import { browserBundle } from './panelbundle.ts';
 import { fillPanelText, panelValues } from './paneltext.ts';
 import { pageHtml } from './panelfixture.ts';
 
-test('the browser bundle carries the panel and names its source', () => {
+test('the browser bundle carries the panel and names its source', { tags: ['subprocess'] }, () => {
   const bundle = browserBundle();
   const panelPath = path.join(__dirname, 'webview', 'panel.ts');
   const panel = fs.readFileSync(panelPath, 'utf8');
@@ -32,7 +32,7 @@ test('the browser bundle carries the panel and names its source', () => {
   );
 });
 
-test('the page fixture runs the bundle the host build embeds', () => {
+test('the page fixture runs the bundle the host build embeds', { tags: ['subprocess'] }, () => {
   const bundle = browserBundle();
   const filled = fillPanelText(bundle.text, panelValues());
   assert.ok(pageHtml().includes(filled), 'the fixture page does not carry the built bundle');

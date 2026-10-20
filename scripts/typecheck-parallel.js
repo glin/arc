@@ -1,4 +1,4 @@
-// Runs project type checks concurrently. Buffers each result and reports failures by project.
+// Runs checks concurrently and groups output unless streaming is requested.
 const { spawn } = require('node:child_process');
 const fs = require('node:fs');
 const path = require('node:path');
@@ -41,15 +41,15 @@ const checks = [
   },
 ];
 
-function runCheck(check, spawnFn) {
+function runCheck(check, { spawnFn, stream, write, writeError }) {
   return new Promise((resolve) => {
     const chunks = [];
     const child = spawnFn(check.command ?? process.execPath, check.args, {
       cwd: check.cwd,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
-    child.stdout.on('data', (chunk) => chunks.push(chunk));
-    child.stderr.on('data', (chunk) => chunks.push(chunk));
+    child.stdout.on('data', (chunk) => (stream ? write(chunk) : chunks.push(chunk)));
+    child.stderr.on('data', (chunk) => (stream ? writeError(chunk) : chunks.push(chunk)));
     child.on('error', (error) => {
       resolve({ label: check.label, status: 1, output: `${error.message}\n` });
     });
@@ -59,9 +59,21 @@ function runCheck(check, spawnFn) {
   });
 }
 
-// Reports buffered results after all checks finish and returns the failed labels.
-async function runChecks(checksToRun, { spawnFn = spawn, log = console.log, logError = console.error } = {}) {
-  const results = await Promise.all(checksToRun.map((check) => runCheck(check, spawnFn)));
+// Reports results after all checks finish and returns the failed labels.
+async function runChecks(
+  checksToRun,
+  {
+    spawnFn = spawn,
+    log = console.log,
+    logError = console.error,
+    stream = false,
+    write = (chunk) => process.stdout.write(chunk),
+    writeError = (chunk) => process.stderr.write(chunk),
+  } = {},
+) {
+  const results = await Promise.all(
+    checksToRun.map((check) => runCheck(check, { spawnFn, stream, write, writeError })),
+  );
   const failed = [];
   for (const result of results) {
     const status = result.status === 0 ? 'passed' : 'failed';
@@ -74,7 +86,7 @@ async function runChecks(checksToRun, { spawnFn = spawn, log = console.log, logE
     }
   }
   if (failed.length > 0) {
-    logError(`\nType check failed: ${failed.join(', ')}`);
+    logError(`\nChecks failed: ${failed.join(', ')}`);
   }
   return failed;
 }

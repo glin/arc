@@ -155,36 +155,41 @@ test('request schema rejects unsupported versions, methods, identifiers, and par
   }
 });
 
-test('session requests reject paths, extra parameters, and invalid turn counts before dispatch', async () => {
-  for (const key of ['TERM_PROGRAM', 'VSCODE_PID', 'VSCODE_IPC_HOOK_CLI']) vi.stubEnv(key, '');
-  const { home, channel, entry } = await fixture();
-  const valid = request(entry, { method: 'session', params: { sessionId: 'known', turns: 2 } });
-  assert.deepEqual(parseSessionRequest(valid), valid);
-  for (const params of [
-    { sessionId: 'known', turns: 0 },
-    { sessionId: 'known', turns: 21 },
-    { sessionId: 'known', turns: 1.5 },
-    { sessionId: 'known', turns: 1, file: '/other' },
-  ])
-    assert.equal(parseSessionRequest({ ...valid, params }), null);
-  channel.setRequestHandler((value) => {
-    if (value.params.sessionId !== 'known') throw new Error('Unknown session.');
-    return { session: value.params.sessionId, turns: value.params.turns, requester: value.requester };
-  });
-  const result = await requestWindow('session', valid.params, channel.hostId, home);
-  assert.equal((result as any).session, 'known');
-  await assert.rejects(
-    requestWindow('session', { sessionId: '/other/file', turns: 1 }, channel.hostId, home),
-    /Unknown session/,
-  );
-  const second = new WindowChannel(home);
-  channels.push(second);
-  await second.update(state);
-  await assert.rejects(requestWindow('sessions', {}, '', home), /Select one Arc window/);
-});
+test(
+  'session requests reject paths, extra parameters, and invalid turn counts before dispatch',
+  { tags: ['subprocess'] },
+  async () => {
+    for (const key of ['TERM_PROGRAM', 'VSCODE_PID', 'VSCODE_IPC_HOOK_CLI']) vi.stubEnv(key, '');
+    const { home, channel, entry } = await fixture();
+    const valid = request(entry, { method: 'session', params: { sessionId: 'known', turns: 2 } });
+    assert.deepEqual(parseSessionRequest(valid), valid);
+    for (const params of [
+      { sessionId: 'known', turns: 0 },
+      { sessionId: 'known', turns: 21 },
+      { sessionId: 'known', turns: 1.5 },
+      { sessionId: 'known', turns: 1, file: '/other' },
+    ])
+      assert.equal(parseSessionRequest({ ...valid, params }), null);
+    channel.setRequestHandler((value) => {
+      if (value.params.sessionId !== 'known') throw new Error('Unknown session.');
+      return { session: value.params.sessionId, turns: value.params.turns, requester: value.requester };
+    });
+    const result = await requestWindow('session', valid.params, channel.hostId, home);
+    assert.equal((result as any).session, 'known');
+    await assert.rejects(
+      requestWindow('session', { sessionId: '/other/file', turns: 1 }, channel.hostId, home),
+      /Unknown session/,
+    );
+    const second = new WindowChannel(home);
+    channels.push(second);
+    await second.update(state);
+    await assert.rejects(requestWindow('sessions', {}, '', home), /Select one Arc window/);
+  },
+);
 
 test.each(['sessions', 'session', 'setups', 'compact-ready', 'compact-status'] as const)(
   'a busy ready window answers %s reads after the discovery deadline',
+  { tags: ['subprocess'] },
   async (method) => {
     const { home, channel } = await fixture();
     await channel.update({ ...state, panelReady: true, panelVisible: true });
@@ -224,6 +229,7 @@ test.each(['sessions', 'session', 'setups', 'compact-ready', 'compact-status'] a
 
 test.each(['sessions', 'session'] as const)(
   'a silent ready window bounds %s reads and names the timeout',
+  { tags: ['subprocess'] },
   async (method) => {
     const { home, channel, file } = await fixture();
     await channel.update({ ...state, panelReady: true, panelVisible: true });
@@ -249,6 +255,7 @@ test.each(['sessions', 'session'] as const)(
 
 test.runIf(process.platform === 'win32')(
   'a vanished Windows pipe remains unavailable when a session read expires before connecting',
+  { tags: ['subprocess'] },
   async () => {
     const { home, entry } = await fixture();
     const hostId = crypto.randomBytes(12).toString('hex');
@@ -279,101 +286,120 @@ test.runIf(process.platform === 'win32')(
   },
 );
 
-test('a disconnected or unreadable window remains unavailable for session reads', async () => {
-  const { home, channel, file } = await fixture();
-  let admitted = false;
-  channel.setRequestHandler(() => {
-    admitted = true;
-    return new Promise(() => {});
-  });
-  const result = requestWindow('session', { sessionId: 'known', turns: 1 }, channel.hostId, home);
-  const rejection = assert.rejects(result, /The selected Arc window is unavailable\./);
-  await vi.waitFor(() => assert.equal(admitted, true));
-  await channel.dispose();
-  await rejection;
-  fs.writeFileSync(file, '{}');
-  await assert.rejects(requestWindow('sessions', {}, channel.hostId, home), /The selected Arc window is unavailable\./);
-});
-
-test('session replies with valid large window metadata refuse excess envelope bytes without losing the channel', async () => {
-  const data = { content: 'x'.repeat(48 * 1024 - 1000) };
-  const { home, channel } = await fixture();
-  channel.setRequestHandler(() => data);
-  const folders = Array.from({ length: 12 }, (_, n) => `C:/project-${n}/${'folder'.repeat(280)}`);
-  await channel.update({ ...state, folders });
-  for (const method of ['sessions', 'session'] as const) {
+test(
+  'a disconnected or unreadable window remains unavailable for session reads',
+  { tags: ['subprocess'] },
+  async () => {
+    const { home, channel, file } = await fixture();
+    let admitted = false;
+    channel.setRequestHandler(() => {
+      admitted = true;
+      return new Promise(() => {});
+    });
+    const result = requestWindow('session', { sessionId: 'known', turns: 1 }, channel.hostId, home);
+    const rejection = assert.rejects(result, /The selected Arc window is unavailable\./);
+    await vi.waitFor(() => assert.equal(admitted, true));
+    await channel.dispose();
+    await rejection;
+    fs.writeFileSync(file, '{}');
     await assert.rejects(
-      requestWindow(method, method === 'session' ? { sessionId: 'known', turns: 1 } : {}, channel.hostId, home),
-      /session response exceeds.*channel limit/,
+      requestWindow('sessions', {}, channel.hostId, home),
+      /The selected Arc window is unavailable\./,
     );
-  }
-  let replyBytes = 0;
-  let extra = 0;
-  channel.setRequestHandler((request) => {
-    replyBytes = request.replyBytes ?? -1;
-    return { fill: 'x'.repeat(replyBytes - Buffer.byteLength('{"fill":""}') + extra) };
-  });
-  const filled = await requestWindow('sessions', {}, channel.hostId, home);
-  assert.ok(replyBytes > 0 && replyBytes < SESSION_READ_LIMITS.outputBytes);
-  assert.equal(pageBytes(filled), replyBytes);
-  extra = 1;
-  await assert.rejects(requestWindow('sessions', {}, channel.hostId, home), /channel limit/);
-  channel.setRequestHandler((request) => {
-    void channel.update({ ...state, folders: [...folders, 'C:/added-during-the-read'] });
-    return { fill: 'x'.repeat(request.replyBytes! - Buffer.byteLength('{"fill":""}')) };
-  });
-  assert.ok(pageBytes(await requestWindow('sessions', {}, channel.hostId, home)) > 0);
-  await channel.update({ ...state, folders });
-  channel.setRequestHandler((request) => ({ replyBytes: request.replyBytes ?? null }));
-  assert.deepEqual(await requestWindow('session', { sessionId: 'known', turns: 1 }, channel.hostId, home), {
-    replyBytes: null,
-  });
-  const files = Array.from({ length: 300 }, (_, n) => pageFile(n));
-  channel.setRequestHandler((request) => listPage(files, null, { replyBytes: request.replyBytes, row: variedName }));
-  const page = (await requestWindow('sessions', {}, channel.hostId, home)) as SessionPage;
-  assert.ok(page.next && page.sessions.length > 0 && pageBytes(page) <= replyBytes);
-  channel.setRequestHandler(() => ({ complete: false, notes: ['Bounded listing.'] }));
-  assert.deepEqual(await requestWindow('sessions', {}, channel.hostId, home), {
-    complete: false,
-    notes: ['Bounded listing.'],
-  });
-});
+  },
+);
 
-test('folderless hosts publish readiness and visibility changes and disappear on disposal', async () => {
-  const { home, channel, file, entry } = await fixture();
-  assert.deepEqual((await discoverWindows(home)).windows[0].folders, []);
-  await channel.update({ folders: ['/MixedCase/Project'], scopeReady: false, panelReady: true, panelVisible: false });
-  const hidden = (await discoverWindows(home)).windows[0];
-  assert.deepEqual(hidden.folders, ['/MixedCase/Project']);
-  assert.equal(hidden.scopeReady, false);
-  assert.equal(hidden.panelReady, true);
-  assert.equal(hidden.panelVisible, false);
-  await channel.update({ ...state, panelReady: true, panelVisible: true });
-  assert.equal((await pingWindow(entry))?.panelVisible, true);
-  const socket = await connect(entry.address);
-  const ended = closed(socket);
-  await channel.dispose();
-  await ended;
-  assert.equal(fs.existsSync(file), false);
-  assert.equal(await pingWindow(entry), null);
-  assert.deepEqual(await discoverWindows(home), { windows: [], complete: true });
-  if (process.platform !== 'win32') assert.equal(fs.existsSync(entry.address), false);
-});
+test(
+  'session replies with valid large window metadata refuse excess envelope bytes without losing the channel',
+  { tags: ['subprocess'] },
+  async () => {
+    const data = { content: 'x'.repeat(48 * 1024 - 1000) };
+    const { home, channel } = await fixture();
+    channel.setRequestHandler(() => data);
+    const folders = Array.from({ length: 12 }, (_, n) => `C:/project-${n}/${'folder'.repeat(280)}`);
+    await channel.update({ ...state, folders });
+    for (const method of ['sessions', 'session'] as const) {
+      await assert.rejects(
+        requestWindow(method, method === 'session' ? { sessionId: 'known', turns: 1 } : {}, channel.hostId, home),
+        /session response exceeds.*channel limit/,
+      );
+    }
+    let replyBytes = 0;
+    let extra = 0;
+    channel.setRequestHandler((request) => {
+      replyBytes = request.replyBytes ?? -1;
+      return { fill: 'x'.repeat(replyBytes - Buffer.byteLength('{"fill":""}') + extra) };
+    });
+    const filled = await requestWindow('sessions', {}, channel.hostId, home);
+    assert.ok(replyBytes > 0 && replyBytes < SESSION_READ_LIMITS.outputBytes);
+    assert.equal(pageBytes(filled), replyBytes);
+    extra = 1;
+    await assert.rejects(requestWindow('sessions', {}, channel.hostId, home), /channel limit/);
+    channel.setRequestHandler((request) => {
+      void channel.update({ ...state, folders: [...folders, 'C:/added-during-the-read'] });
+      return { fill: 'x'.repeat(request.replyBytes! - Buffer.byteLength('{"fill":""}')) };
+    });
+    assert.ok(pageBytes(await requestWindow('sessions', {}, channel.hostId, home)) > 0);
+    await channel.update({ ...state, folders });
+    channel.setRequestHandler((request) => ({ replyBytes: request.replyBytes ?? null }));
+    assert.deepEqual(await requestWindow('session', { sessionId: 'known', turns: 1 }, channel.hostId, home), {
+      replyBytes: null,
+    });
+    const files = Array.from({ length: 300 }, (_, n) => pageFile(n));
+    channel.setRequestHandler((request) => listPage(files, null, { replyBytes: request.replyBytes, row: variedName }));
+    const page = (await requestWindow('sessions', {}, channel.hostId, home)) as SessionPage;
+    assert.ok(page.next && page.sessions.length > 0 && pageBytes(page) <= replyBytes);
+    channel.setRequestHandler(() => ({ complete: false, notes: ['Bounded listing.'] }));
+    assert.deepEqual(await requestWindow('sessions', {}, channel.hostId, home), {
+      complete: false,
+      notes: ['Bounded listing.'],
+    });
+  },
+);
 
-test('ping refuses the wrong token without calling the handler or changing window state', async () => {
-  const handler = vi.fn<(info: WindowInfo) => WindowInfo>((info) => info);
-  const { entry, file } = await fixture(undefined, handler);
-  const before = fs.readFileSync(file);
-  const socket = await connect(entry.address);
-  const received = reply(socket);
-  socket.write(JSON.stringify(request(entry, { token: '0'.repeat(64) })) + '\n');
-  assert.deepEqual(await received, { id: 'request-1', error: 'Access denied.' });
-  assert.equal(handler.mock.calls.length, 0);
-  assert.deepEqual(fs.readFileSync(file), before);
-  assert.equal((await pingWindow(entry))?.hostId, entry.hostId);
-});
+test(
+  'folderless hosts publish readiness and visibility changes and disappear on disposal',
+  { tags: ['subprocess'] },
+  async () => {
+    const { home, channel, file, entry } = await fixture();
+    assert.deepEqual((await discoverWindows(home)).windows[0].folders, []);
+    await channel.update({ folders: ['/MixedCase/Project'], scopeReady: false, panelReady: true, panelVisible: false });
+    const hidden = (await discoverWindows(home)).windows[0];
+    assert.deepEqual(hidden.folders, ['/MixedCase/Project']);
+    assert.equal(hidden.scopeReady, false);
+    assert.equal(hidden.panelReady, true);
+    assert.equal(hidden.panelVisible, false);
+    await channel.update({ ...state, panelReady: true, panelVisible: true });
+    assert.equal((await pingWindow(entry))?.panelVisible, true);
+    const socket = await connect(entry.address);
+    const ended = closed(socket);
+    await channel.dispose();
+    await ended;
+    assert.equal(fs.existsSync(file), false);
+    assert.equal(await pingWindow(entry), null);
+    assert.deepEqual(await discoverWindows(home), { windows: [], complete: true });
+    if (process.platform !== 'win32') assert.equal(fs.existsSync(entry.address), false);
+  },
+);
 
-test('invalid JSON and schema receive errors', async () => {
+test(
+  'ping refuses the wrong token without calling the handler or changing window state',
+  { tags: ['subprocess'] },
+  async () => {
+    const handler = vi.fn<(info: WindowInfo) => WindowInfo>((info) => info);
+    const { entry, file } = await fixture(undefined, handler);
+    const before = fs.readFileSync(file);
+    const socket = await connect(entry.address);
+    const received = reply(socket);
+    socket.write(JSON.stringify(request(entry, { token: '0'.repeat(64) })) + '\n');
+    assert.deepEqual(await received, { id: 'request-1', error: 'Access denied.' });
+    assert.equal(handler.mock.calls.length, 0);
+    assert.deepEqual(fs.readFileSync(file), before);
+    assert.equal((await pingWindow(entry))?.hostId, entry.hostId);
+  },
+);
+
+test('invalid JSON and schema receive errors', { tags: ['subprocess'] }, async () => {
   const { entry } = await fixture();
   for (const text of ['not JSON', JSON.stringify(request(entry, { version: 2 }))]) {
     const socket = await connect(entry.address);
@@ -384,7 +410,7 @@ test('invalid JSON and schema receive errors', async () => {
   }
 });
 
-test('oversized complete and fragmented UTF-8 lines close before parsing', async () => {
+test('oversized complete and fragmented UTF-8 lines close before parsing', { tags: ['subprocess'] }, async () => {
   const handler = vi.fn<(info: WindowInfo) => WindowInfo>((info) => info);
   const { entry } = await fixture({ ...SESSION_REQUEST_LIMITS, lineBytes: 256 }, handler);
   const complete = JSON.stringify(request(entry, { id: 'a'.repeat(128) })) + '\n';
@@ -401,6 +427,7 @@ test('oversized complete and fragmented UTF-8 lines close before parsing', async
 
 test.each([0, 50])(
   'an unfinished line keeps its original deadline after acceptance delayed by %i ms',
+  { tags: ['subprocess'] },
   async (acceptDelay) => {
     const prototype = process.platform === 'win32' ? WindowsPipeServer.prototype : net.Server.prototype;
     const emit = prototype.emit;
@@ -445,7 +472,7 @@ test.each([0, 50])(
   },
 );
 
-test('open connection bounds refuse excess clients and release closed clients', async () => {
+test('open connection bounds refuse excess clients and release closed clients', { tags: ['subprocess'] }, async () => {
   const { entry } = await fixture({ ...SESSION_REQUEST_LIMITS, connections: 1 });
   const first = await connect(entry.address);
   const second = await connect(entry.address);
@@ -462,7 +489,7 @@ test('open connection bounds refuse excess clients and release closed clients', 
   await vi.waitFor(async () => assert.equal((await pingWindow(entry))?.hostId, entry.hostId));
 });
 
-test('in-flight bounds span connections until pending handlers settle', async () => {
+test('in-flight bounds span connections until pending handlers settle', { tags: ['subprocess'] }, async () => {
   let complete!: (info: WindowInfo) => void;
   const handler = vi.fn<() => Promise<WindowInfo>>(
     () =>
@@ -484,27 +511,35 @@ test('in-flight bounds span connections until pending handlers settle', async ()
   assert.equal((await received).result.hostId, entry.hostId);
 });
 
-test('discovery rejects the wrong ping identity and retains uncertain ownership and arbitrary addresses', async () => {
-  const { home, file, entry } = await fixture(undefined, (info) => ({ ...info, hostId: 'f'.repeat(24) }));
-  assert.deepEqual(await discoverWindows(home), { windows: [], complete: false });
-  assert.equal(fs.existsSync(file), true);
-  const arbitrary = path.join(home, 'retain.txt');
-  fs.writeFileSync(arbitrary, 'keep');
-  fs.writeFileSync(file, JSON.stringify({ ...entry, address: arbitrary }));
-  assert.deepEqual(await discoverWindows(home), { windows: [], complete: true });
-  assert.equal(fs.readFileSync(arbitrary, 'utf8'), 'keep');
-  assert.equal(fs.existsSync(file), true);
-});
+test(
+  'discovery rejects the wrong ping identity and retains uncertain ownership and arbitrary addresses',
+  { tags: ['subprocess'] },
+  async () => {
+    const { home, file, entry } = await fixture(undefined, (info) => ({ ...info, hostId: 'f'.repeat(24) }));
+    assert.deepEqual(await discoverWindows(home), { windows: [], complete: false });
+    assert.equal(fs.existsSync(file), true);
+    const arbitrary = path.join(home, 'retain.txt');
+    fs.writeFileSync(arbitrary, 'keep');
+    fs.writeFileSync(file, JSON.stringify({ ...entry, address: arbitrary }));
+    assert.deepEqual(await discoverWindows(home), { windows: [], complete: true });
+    assert.equal(fs.readFileSync(arbitrary, 'utf8'), 'keep');
+    assert.equal(fs.existsSync(file), true);
+  },
+);
 
 // These guards catch forged liveness and credential disclosure before transcript reads become available.
-test('discovery rejects a forged reply process identity from an otherwise authenticated window', async () => {
-  const { home, file, entry } = await fixture(undefined, (info) => ({ ...info, pid: info.pid + 1 }));
-  assert.equal(await pingWindow(entry), null);
-  assert.deepEqual(await discoverWindows(home), { windows: [], complete: false });
-  assert.equal(fs.existsSync(file), true);
-});
+test(
+  'discovery rejects a forged reply process identity from an otherwise authenticated window',
+  { tags: ['subprocess'] },
+  async () => {
+    const { home, file, entry } = await fixture(undefined, (info) => ({ ...info, pid: info.pid + 1 }));
+    assert.equal(await pingWindow(entry), null);
+    assert.deepEqual(await discoverWindows(home), { windows: [], complete: false });
+    assert.equal(fs.existsSync(file), true);
+  },
+);
 
-test('an endpoint without server knowledge receives no token or requester', async () => {
+test('an endpoint without server knowledge receives no token or requester', { tags: ['subprocess'] }, async () => {
   const { entry } = await fixture();
   const otherId = 'd'.repeat(24);
   const address = hostAddress(tempDir('window-forged-'), otherId);
@@ -534,81 +569,94 @@ test('an endpoint without server knowledge receives no token or requester', asyn
   }
 });
 
-test.skipIf(process.platform !== 'win32')('Windows rejects a forged endpoint before any bytes reach it', async () => {
-  const { entry } = await fixture();
-  const hostId = 'c'.repeat(24);
-  const address = hostAddress('', hostId);
-  const inputs: Buffer[] = [];
-  const server = net.createServer((socket) => {
-    sockets.push(socket);
-    socket.on('data', (bytes) => {
-      inputs.push(bytes);
-      socket.end('{"proof":"' + '0'.repeat(64) + '"}\n');
+test.skipIf(process.platform !== 'win32')(
+  'Windows rejects a forged endpoint before any bytes reach it',
+  { tags: ['subprocess'] },
+  async () => {
+    const { entry } = await fixture();
+    const hostId = 'c'.repeat(24);
+    const address = hostAddress('', hostId);
+    const inputs: Buffer[] = [];
+    const server = net.createServer((socket) => {
+      sockets.push(socket);
+      socket.on('data', (bytes) => {
+        inputs.push(bytes);
+        socket.end('{"proof":"' + '0'.repeat(64) + '"}\n');
+      });
     });
-  });
-  await new Promise<void>((resolve) => server.listen(address, resolve));
-  try {
-    assert.equal(await pingWindow({ ...entry, hostId, address }), null);
-    assert.equal(inputs.length, 0);
-  } finally {
-    for (const socket of sockets) socket.destroy();
-    await new Promise<void>((resolve) => server.close(() => resolve()));
-  }
-});
-
-test.skipIf(process.platform !== 'win32')('eight simultaneous clients reach one Windows listener', async () => {
-  const { entry, file } = await fixture();
-  for (let batch = 0; batch < 5; batch++) {
-    const replies = await Promise.all(Array.from({ length: 8 }, () => pingWindow(entry, 1_000, file)));
-    assert.deepEqual(
-      replies.map((info) => info?.hostId),
-      Array(8).fill(entry.hostId),
-    );
-  }
-});
-
-test('channel disposal reports exact registration ownership outcomes and classified removal failure', async () => {
-  for (const outcome of ['noExpectedBytes', 'ownershipMismatch', 'removed', 'failed'] as const) {
-    const records: WindowTransportRecord[] = [];
-    const home = tempDir('window-removal-evidence-');
-    const channel = new WindowChannel(home);
-    channels.push(channel);
-    channel.setDiagnostics((_event, record) => records.push(record));
-    const file = path.join(home, 'hosts', `${channel.hostId}.json`);
-    if (outcome !== 'noExpectedBytes') await channel.update(state);
-    if (outcome === 'ownershipMismatch') fs.writeFileSync(file, 'private-registration');
-    const unlink = filesystem.unlinkSync;
-    const mocked = vi.spyOn(filesystem, 'unlinkSync').mockImplementation((target) => {
-      if (outcome === 'failed' && target === file)
-        throw Object.assign(new Error('private-registration'), { code: 'EBUSY' });
-      return unlink(target);
-    });
-    syncBuiltinESMExports();
+    await new Promise<void>((resolve) => server.listen(address, resolve));
     try {
-      await channel.dispose();
-      await channel.dispose();
+      assert.equal(await pingWindow({ ...entry, hostId, address }), null);
+      assert.equal(inputs.length, 0);
     } finally {
-      mocked.mockRestore();
-      syncBuiltinESMExports();
+      for (const socket of sockets) socket.destroy();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
     }
-    assert.deepEqual(
-      records
-        .filter((record) => ['channelDispose', 'registrationRemoval'].includes(record.reason))
-        .map((record) => record.reason),
-      ['channelDispose', 'registrationRemoval'],
-    );
-    const removal = records.find((record) => record.reason === 'registrationRemoval')!;
-    assert.equal(removal.outcome, outcome);
-    assert.equal(removal.registrationRemoved, outcome === 'removed');
-    if (outcome === 'failed') assert.deepEqual([removal.stage, removal.errorCode], ['unlink', 'EBUSY']);
-    if (outcome === 'ownershipMismatch') assert.equal(fs.readFileSync(file, 'utf8'), 'private-registration');
-    assert.equal(JSON.stringify(records).includes('private-registration'), false);
-    assert.equal(JSON.stringify(records).includes(home), false);
-  }
-});
+  },
+);
+
+test.skipIf(process.platform !== 'win32')(
+  'eight simultaneous clients reach one Windows listener',
+  { tags: ['subprocess'] },
+  async () => {
+    const { entry, file } = await fixture();
+    for (let batch = 0; batch < 5; batch++) {
+      const replies = await Promise.all(Array.from({ length: 8 }, () => pingWindow(entry, 1_000, file)));
+      assert.deepEqual(
+        replies.map((info) => info?.hostId),
+        Array(8).fill(entry.hostId),
+      );
+    }
+  },
+);
+
+test(
+  'channel disposal reports exact registration ownership outcomes and classified removal failure',
+  { tags: ['subprocess'] },
+  async () => {
+    for (const outcome of ['noExpectedBytes', 'ownershipMismatch', 'removed', 'failed'] as const) {
+      const records: WindowTransportRecord[] = [];
+      const home = tempDir('window-removal-evidence-');
+      const channel = new WindowChannel(home);
+      channels.push(channel);
+      channel.setDiagnostics((_event, record) => records.push(record));
+      const file = path.join(home, 'hosts', `${channel.hostId}.json`);
+      if (outcome !== 'noExpectedBytes') await channel.update(state);
+      if (outcome === 'ownershipMismatch') fs.writeFileSync(file, 'private-registration');
+      const unlink = filesystem.unlinkSync;
+      const mocked = vi.spyOn(filesystem, 'unlinkSync').mockImplementation((target) => {
+        if (outcome === 'failed' && target === file)
+          throw Object.assign(new Error('private-registration'), { code: 'EBUSY' });
+        return unlink(target);
+      });
+      syncBuiltinESMExports();
+      try {
+        await channel.dispose();
+        await channel.dispose();
+      } finally {
+        mocked.mockRestore();
+        syncBuiltinESMExports();
+      }
+      assert.deepEqual(
+        records
+          .filter((record) => ['channelDispose', 'registrationRemoval'].includes(record.reason))
+          .map((record) => record.reason),
+        ['channelDispose', 'registrationRemoval'],
+      );
+      const removal = records.find((record) => record.reason === 'registrationRemoval')!;
+      assert.equal(removal.outcome, outcome);
+      assert.equal(removal.registrationRemoved, outcome === 'removed');
+      if (outcome === 'failed') assert.deepEqual([removal.stage, removal.errorCode], ['unlink', 'EBUSY']);
+      if (outcome === 'ownershipMismatch') assert.equal(fs.readFileSync(file, 'utf8'), 'private-registration');
+      assert.equal(JSON.stringify(records).includes('private-registration'), false);
+      assert.equal(JSON.stringify(records).includes(home), false);
+    }
+  },
+);
 
 test.each(['linux', 'darwin'] as const)(
   '%s disposal reports completed cleanup when the closed listener socket is absent',
+  { tags: ['subprocess'] },
   async (platform) => {
     for (const fallback of [false, true]) {
       for (const errorCode of ['ENOENT', 'EACCES', 'EIO']) {
@@ -654,42 +702,50 @@ test.each(['linux', 'darwin'] as const)(
   },
 );
 
-test('channel setup rejection retains error and disposal evidence before registration exists', async () => {
-  const home = tempDir('window-setup-evidence-');
-  fs.writeFileSync(path.join(home, 'hosts'), 'private-registration');
-  const records: WindowTransportRecord[] = [];
-  const channel = new WindowChannel(home);
-  channels.push(channel);
-  channel.setDiagnostics((_event, record) => records.push(record));
-  await assert.rejects(channel.update(state));
-  await channel.dispose();
-  assert.deepEqual(
-    records.map((record) => record.reason),
-    ['channelSetupRejected', 'channelDispose', 'registrationRemoval'],
-  );
-  assert.equal(JSON.stringify(records).includes('private-registration'), false);
-});
+test(
+  'channel setup rejection retains error and disposal evidence before registration exists',
+  { tags: ['subprocess'] },
+  async () => {
+    const home = tempDir('window-setup-evidence-');
+    fs.writeFileSync(path.join(home, 'hosts'), 'private-registration');
+    const records: WindowTransportRecord[] = [];
+    const channel = new WindowChannel(home);
+    channels.push(channel);
+    channel.setDiagnostics((_event, record) => records.push(record));
+    await assert.rejects(channel.update(state));
+    await channel.dispose();
+    assert.deepEqual(
+      records.map((record) => record.reason),
+      ['channelSetupRejected', 'channelDispose', 'registrationRemoval'],
+    );
+    assert.equal(JSON.stringify(records).includes('private-registration'), false);
+  },
+);
 
-test('channel listener failure records its classified error and leaves diagnostics failure harmless', async () => {
-  const { channel, file } = await fixture();
-  const records: WindowTransportRecord[] = [];
-  channel.setDiagnostics((_event, record) => {
-    records.push(record);
-    throw new Error('secret');
-  });
-  const server = (channel as unknown as { server: net.Server }).server;
-  assert.doesNotThrow(() => server.emit('error', Object.assign(new Error('secret'), { code: 'EIO' })));
-  await channel.dispose();
-  assert.deepEqual(
-    records
-      .filter((record) => record.reason === 'channelError' || record.reason === 'channelDispose')
-      .map((record) => record.reason),
-    ['channelError', 'channelDispose'],
-  );
-  assert.equal(records[0].errorCode, 'EIO');
-  assert.equal(fs.existsSync(file), false);
-  assert.equal(JSON.stringify(records).includes('secret'), false);
-});
+test(
+  'channel listener failure records its classified error and leaves diagnostics failure harmless',
+  { tags: ['subprocess'] },
+  async () => {
+    const { channel, file } = await fixture();
+    const records: WindowTransportRecord[] = [];
+    channel.setDiagnostics((_event, record) => {
+      records.push(record);
+      throw new Error('secret');
+    });
+    const server = (channel as unknown as { server: net.Server }).server;
+    assert.doesNotThrow(() => server.emit('error', Object.assign(new Error('secret'), { code: 'EIO' })));
+    await channel.dispose();
+    assert.deepEqual(
+      records
+        .filter((record) => record.reason === 'channelError' || record.reason === 'channelDispose')
+        .map((record) => record.reason),
+      ['channelError', 'channelDispose'],
+    );
+    assert.equal(records[0].errorCode, 'EIO');
+    assert.equal(fs.existsSync(file), false);
+    assert.equal(JSON.stringify(records).includes('secret'), false);
+  },
+);
 
 test('one activation replaces failed listeners with bounded retries and ignores obsolete errors', async () => {
   const f = await recoveryFixture();
@@ -820,6 +876,7 @@ test('replacement waits for retirement and disposal before initial acknowledgeme
 
 test.skipIf(process.platform !== 'win32')(
   'disposal during native listener submission leaves no listener while a shared peer stays reachable',
+  { tags: ['subprocess'] },
   async () => {
     const peer = await fixture();
     const channel = new WindowChannel(tempDir('window-startup-disposal-'));
@@ -873,6 +930,7 @@ test.skipIf(process.platform !== 'win32')(
 
 test.skipIf(process.platform !== 'win32')(
   'a listener failure retires its connected clients while another helper owner remains reachable',
+  { tags: ['subprocess'] },
   async () => {
     const first = await fixture();
     const other = await fixture();
@@ -893,6 +951,7 @@ test.skipIf(process.platform !== 'win32')(
 
 test.each(['linux', 'darwin'] as const)(
   '%s listener replacement retains current state and removes its owned socket on disposal',
+  { tags: ['subprocess'] },
   async (platform) => {
     const descriptor = Object.getOwnPropertyDescriptor(process, 'platform')!;
     const servers: (EventEmitter & {
@@ -954,6 +1013,7 @@ test.each(['linux', 'darwin'] as const)(
 
 test.skipIf(process.platform !== 'win32')(
   'an external authenticated caller regains the same activation after helper loss without replaying an accepted write',
+  { tags: ['subprocess'] },
   async () => {
     const { channel, home, file, entry } = await fixture();
     const oldServer = (channel as unknown as { windowsServer: WindowsPipeServer }).windowsServer;
@@ -1088,155 +1148,171 @@ test.skipIf(process.platform !== 'win32')(
   },
 );
 
-test('ping identifies Claude and Codex requesters and leaves an absent requester unknown', async () => {
-  const requests: any[] = [];
-  const { entry } = await fixture();
-  const otherId = 'e'.repeat(24);
-  const address = hostAddress(tempDir('window-requester-'), otherId);
-  if (process.platform !== 'win32') fs.mkdirSync(path.dirname(address), { recursive: true });
-  const accepted = (socket: Duplex) => {
-    sockets.push(socket);
-    socket.on('error', () => {});
-    socket.on('data', (bytes) => {
-      const input = JSON.parse(bytes.toString());
-      if (input.challenge) {
-        socket.write(
+test(
+  'ping identifies Claude and Codex requesters and leaves an absent requester unknown',
+  { tags: ['subprocess'] },
+  async () => {
+    const requests: any[] = [];
+    const { entry } = await fixture();
+    const otherId = 'e'.repeat(24);
+    const address = hostAddress(tempDir('window-requester-'), otherId);
+    if (process.platform !== 'win32') fs.mkdirSync(path.dirname(address), { recursive: true });
+    const accepted = (socket: Duplex) => {
+      sockets.push(socket);
+      socket.on('error', () => {});
+      socket.on('data', (bytes) => {
+        const input = JSON.parse(bytes.toString());
+        if (input.challenge) {
+          socket.write(
+            JSON.stringify({
+              proof: crypto.createHmac('sha256', Buffer.from(entry.token, 'hex')).update(input.challenge).digest('hex'),
+            }) + '\n',
+          );
+          return;
+        }
+        requests.push(input);
+        socket.end(
           JSON.stringify({
-            proof: crypto.createHmac('sha256', Buffer.from(entry.token, 'hex')).update(input.challenge).digest('hex'),
+            id: input.id,
+            result: { ...state, hostId: otherId, pid: process.pid, version: 1, token: entry.token, address },
           }) + '\n',
         );
-        return;
-      }
-      requests.push(input);
-      socket.end(
-        JSON.stringify({
-          id: input.id,
-          result: { ...state, hostId: otherId, pid: process.pid, version: 1, token: entry.token, address },
-        }) + '\n',
-      );
-    });
-  };
-  const server = process.platform === 'win32' ? new WindowsPipeServer() : net.createServer(accepted);
-  if (server instanceof WindowsPipeServer) {
-    server.on('connection', accepted);
-    await server.listen(address);
-  } else await new Promise<void>((resolve) => server.listen(address, resolve));
-  try {
-    const cases: [string, string, string | null][] = [
-      ['claude-session', 'codex-session', 'claude-session'],
-      ['', 'codex-session', 'codex-session'],
-      ['', '', null],
-    ];
-    for (const [claude, codex, expected] of cases) {
-      vi.stubEnv('CLAUDE_CODE_SESSION_ID', claude);
-      vi.stubEnv('CODEX_THREAD_ID', codex);
-      const result = await pingWindow({ ...entry, hostId: otherId, address });
-      assert.equal(result?.hostId, otherId);
-      assert.equal('token' in result, false);
-      assert.equal('address' in result, false);
-      assert.equal(requests.at(-1).requester, expected);
-    }
-  } finally {
-    vi.unstubAllEnvs();
-    for (const socket of sockets) socket.destroy();
-    if (server instanceof WindowsPipeServer) await server.close();
-    else await new Promise<void>((resolve) => server.close(() => resolve()));
-  }
-});
-
-test('disposal during listener startup removes the listener without publishing a registry', async () => {
-  const home = tempDir('window-start-close-');
-  const channel = new WindowChannel(home);
-  channels.push(channel);
-  const start = channel.update(state);
-  await channel.dispose();
-  await start;
-  assert.deepEqual(await discoverWindows(home), { windows: [], complete: true });
-  assert.equal(fs.existsSync(hostAddress(home, channel.hostId)), false);
-});
-
-test('constructor failure leaves an activation spawner without a foreign window target', () => {
-  let channel: WindowChannel | null = null;
-  const create = vi.spyOn(network, 'createServer').mockImplementation(() => {
-    throw new Error('Listener unavailable');
-  });
-  syncBuiltinESMExports();
-  try {
-    assert.throws(() => {
-      channel = new WindowChannel(tempDir('window-constructor-failed-'));
-    }, /Listener unavailable/);
-    const spawner = arcCliSpawner(
-      () => ({ directory: 'Arc bin', editorExecutable: '/editor', windowId: channel?.windowId ?? null }),
-      (_command, _args, cwd, wanted, agent, cli) => {
-        assert.equal(childEnv({ ARC_WINDOW: 'foreign-window' }, wanted, agent, cwd, cli).ARC_WINDOW, undefined);
-        return {} as never;
-      },
-    );
-    spawner('unused', [], '.', {});
-  } finally {
-    create.mockRestore();
-    syncBuiltinESMExports();
-  }
-});
-
-test('activation spawners retain their activation target through recoverable startup and later channel failures', async () => {
-  for (const failure of ['directory', 'listener-start', 'publish-start', 'listener-later', 'publish-later']) {
-    const home = tempDir('window-failed-target-');
-    const original = network.createServer;
-    let server: net.Server | null = null;
-    const create = vi
-      .spyOn(network, 'createServer')
-      .mockImplementation((...args: Parameters<typeof network.createServer>) => {
-        server = original(...args);
-        return server;
       });
-    syncBuiltinESMExports();
-    let channel: WindowChannel;
+    };
+    const server = process.platform === 'win32' ? new WindowsPipeServer() : net.createServer(accepted);
+    if (server instanceof WindowsPipeServer) {
+      server.on('connection', accepted);
+      await server.listen(address);
+    } else await new Promise<void>((resolve) => server.listen(address, resolve));
     try {
-      channel = new WindowChannel(home);
-      channels.push(channel);
+      const cases: [string, string, string | null][] = [
+        ['claude-session', 'codex-session', 'claude-session'],
+        ['', 'codex-session', 'codex-session'],
+        ['', '', null],
+      ];
+      for (const [claude, codex, expected] of cases) {
+        vi.stubEnv('CLAUDE_CODE_SESSION_ID', claude);
+        vi.stubEnv('CODEX_THREAD_ID', codex);
+        const result = await pingWindow({ ...entry, hostId: otherId, address });
+        assert.equal(result?.hostId, otherId);
+        assert.equal('token' in result, false);
+        assert.equal('address' in result, false);
+        assert.equal(requests.at(-1).requester, expected);
+      }
+    } finally {
+      vi.unstubAllEnvs();
+      for (const socket of sockets) socket.destroy();
+      if (server instanceof WindowsPipeServer) await server.close();
+      else await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  },
+);
+
+test(
+  'disposal during listener startup removes the listener without publishing a registry',
+  { tags: ['subprocess'] },
+  async () => {
+    const home = tempDir('window-start-close-');
+    const channel = new WindowChannel(home);
+    channels.push(channel);
+    const start = channel.update(state);
+    await channel.dispose();
+    await start;
+    assert.deepEqual(await discoverWindows(home), { windows: [], complete: true });
+    assert.equal(fs.existsSync(hostAddress(home, channel.hostId)), false);
+  },
+);
+
+test(
+  'constructor failure leaves an activation spawner without a foreign window target',
+  { tags: ['subprocess'] },
+  () => {
+    let channel: WindowChannel | null = null;
+    const create = vi.spyOn(network, 'createServer').mockImplementation(() => {
+      throw new Error('Listener unavailable');
+    });
+    syncBuiltinESMExports();
+    try {
+      assert.throws(() => {
+        channel = new WindowChannel(tempDir('window-constructor-failed-'));
+      }, /Listener unavailable/);
+      const spawner = arcCliSpawner(
+        () => ({ directory: 'Arc bin', editorExecutable: '/editor', windowId: channel?.windowId ?? null }),
+        (_command, _args, cwd, wanted, agent, cli) => {
+          assert.equal(childEnv({ ARC_WINDOW: 'foreign-window' }, wanted, agent, cwd, cli).ARC_WINDOW, undefined);
+          return {} as never;
+        },
+      );
+      spawner('unused', [], '.', {});
     } finally {
       create.mockRestore();
       syncBuiltinESMExports();
     }
-    const targets: (string | undefined)[] = [];
-    const spawner = arcCliSpawner(
-      () => ({ directory: 'Arc bin', editorExecutable: '/editor', windowId: channel.windowId }),
-      (_command, _args, cwd, wanted, agent, cli) => {
-        targets.push(childEnv({ ARC_WINDOW: 'foreign-window' }, wanted, agent, cwd, cli).ARC_WINDOW);
-        return {} as never;
-      },
-    );
-    spawner('unused', [], '.', {});
-    const oversized = { ...state, folders: ['x'.repeat(100_000)] };
-    if (failure === 'directory') {
-      fs.writeFileSync(path.join(home, 'hosts'), 'not a directory');
-      await assert.rejects(channel.update(state));
-    } else if (failure === 'listener-start') {
-      const listen =
-        process.platform === 'win32'
-          ? vi.spyOn(WindowsPipeServer.prototype, 'listen').mockRejectedValue(new Error('Listener unavailable'))
-          : vi.spyOn(server!, 'listen').mockImplementation(() => {
-              queueMicrotask(() => server!.emit('error', new Error('Listener unavailable')));
-              return server!;
-            });
+  },
+);
+
+test(
+  'activation spawners retain their activation target through recoverable startup and later channel failures',
+  { tags: ['subprocess'] },
+  async () => {
+    for (const failure of ['directory', 'listener-start', 'publish-start', 'listener-later', 'publish-later']) {
+      const home = tempDir('window-failed-target-');
+      const original = network.createServer;
+      let server: net.Server | null = null;
+      const create = vi
+        .spyOn(network, 'createServer')
+        .mockImplementation((...args: Parameters<typeof network.createServer>) => {
+          server = original(...args);
+          return server;
+        });
+      syncBuiltinESMExports();
+      let channel: WindowChannel;
       try {
-        await assert.rejects(channel.update(state), /Listener unavailable/);
+        channel = new WindowChannel(home);
+        channels.push(channel);
       } finally {
-        listen.mockRestore();
+        create.mockRestore();
+        syncBuiltinESMExports();
       }
-    } else if (failure === 'publish-start') {
-      await assert.rejects(channel.update(oversized), /too large/);
-    } else {
-      await channel.update(state);
-      if (failure === 'publish-later') await assert.rejects(channel.update(oversized), /too large/);
-      else server!.emit('error', new Error('Listener unavailable'));
+      const targets: (string | undefined)[] = [];
+      const spawner = arcCliSpawner(
+        () => ({ directory: 'Arc bin', editorExecutable: '/editor', windowId: channel.windowId }),
+        (_command, _args, cwd, wanted, agent, cli) => {
+          targets.push(childEnv({ ARC_WINDOW: 'foreign-window' }, wanted, agent, cwd, cli).ARC_WINDOW);
+          return {} as never;
+        },
+      );
+      spawner('unused', [], '.', {});
+      const oversized = { ...state, folders: ['x'.repeat(100_000)] };
+      if (failure === 'directory') {
+        fs.writeFileSync(path.join(home, 'hosts'), 'not a directory');
+        await assert.rejects(channel.update(state));
+      } else if (failure === 'listener-start') {
+        const listen =
+          process.platform === 'win32'
+            ? vi.spyOn(WindowsPipeServer.prototype, 'listen').mockRejectedValue(new Error('Listener unavailable'))
+            : vi.spyOn(server!, 'listen').mockImplementation(() => {
+                queueMicrotask(() => server!.emit('error', new Error('Listener unavailable')));
+                return server!;
+              });
+        try {
+          await assert.rejects(channel.update(state), /Listener unavailable/);
+        } finally {
+          listen.mockRestore();
+        }
+      } else if (failure === 'publish-start') {
+        await assert.rejects(channel.update(oversized), /too large/);
+      } else {
+        await channel.update(state);
+        if (failure === 'publish-later') await assert.rejects(channel.update(oversized), /too large/);
+        else server!.emit('error', new Error('Listener unavailable'));
+      }
+      spawner('unused', [], '.', {});
+      assert.deepEqual(targets, [channel.hostId, channel.hostId], failure);
+      await channel.dispose();
     }
-    spawner('unused', [], '.', {});
-    assert.deepEqual(targets, [channel.hostId, channel.hostId], failure);
-    await channel.dispose();
-  }
-});
+  },
+);
 
 test('filter wire requests admit only bounded query payloads and the listing subset', () => {
   const base = { id: 'filter-one', version: 1, token: 'a'.repeat(64), requester: null };
@@ -1258,296 +1334,328 @@ test('filter wire requests admit only bounded query payloads and the listing sub
     assert.equal(parseSessionRequest(request), null);
 });
 
-test('filter channel exchanges wait beyond the read deadline and carry connection cancellation', async () => {
-  const home = tempDir('filter-channel-');
-  const channel = new WindowChannel(home);
-  channels.push(channel);
-  let admitted: any;
-  let finish!: () => void;
-  channel.setRequestHandler((request) => {
-    admitted = request;
-    return new Promise<void>((resolve) => {
-      finish = resolve;
+test(
+  'filter channel exchanges wait beyond the read deadline and carry connection cancellation',
+  { tags: ['subprocess'] },
+  async () => {
+    const home = tempDir('filter-channel-');
+    const channel = new WindowChannel(home);
+    channels.push(channel);
+    let admitted: any;
+    let finish!: () => void;
+    channel.setRequestHandler((request) => {
+      admitted = request;
+      return new Promise<void>((resolve) => {
+        finish = resolve;
+      });
     });
-  });
-  await channel.update({ folders: [], scopeReady: true, panelReady: false, panelVisible: false });
-  vi.useFakeTimers();
-  try {
-    const result = requestWindow('filter', { query: 'session:one' }, channel.hostId, home);
-    await vi.waitFor(() => assert.equal(admitted?.method, 'filter'));
-    assert.equal(admitted.filterContext.signal.aborted, false);
-    assert.ok(admitted.filterContext.deadline > Date.now() + 25_000);
-    await vi.advanceTimersByTimeAsync(2_000);
-    assert.equal(admitted.filterContext.signal.aborted, false);
-    finish();
-    await result;
-  } finally {
-    vi.useRealTimers();
-  }
-});
-
-test('a disconnected filter transport reports an unknown outcome and cancels host admission', async () => {
-  const home = tempDir('filter-disconnect-');
-  const channel = new WindowChannel(home);
-  channels.push(channel);
-  let admitted: any;
-  let finish!: () => void;
-  channel.setRequestHandler((request) => {
-    admitted = request;
-    return new Promise<void>((resolve) => {
-      finish = resolve;
-    });
-  });
-  await channel.update({ folders: [], scopeReady: true, panelReady: true, panelVisible: true });
-  const result = requestWindow('filter', { query: 'session:one' }, channel.hostId, home);
-  await vi.waitFor(() => assert.ok(admitted));
-  await channel.dispose();
-  assert.equal(((await result) as any).status, 'unknown');
-  await vi.waitFor(() => assert.equal(admitted.filterContext.signal.aborted, true));
-  finish();
-});
-
-test('older hosts refuse shorthand before either query route connects and retain exact requests', async () => {
-  const home = tempDir('shorthand-negotiation-');
-  const channel = new WindowChannel(home);
-  const seen: any[] = [];
-  channel.setRequestHandler((request) => {
-    seen.push(request);
-    return {};
-  });
-  await channel.update({ folders: [], scopeReady: true, panelReady: false, panelVisible: false });
-  const registration = path.join(home, 'hosts', `${channel.hostId}.json`);
-  const old = JSON.parse(fs.readFileSync(registration, 'utf8'));
-  old.capabilities = ['requesterProvider'];
-  fs.writeFileSync(registration, JSON.stringify(old));
-  try {
-    for (const method of ['filter', 'sessions'] as const)
-      await assert.rejects(
-        requestWindow(method, { query: 'session:one' }, channel.hostId, home),
-        /must reload before it can accept filter queries/,
-      );
-    assert.equal(seen.length, 0);
-    old.capabilities = ['sessionQuery'];
-    fs.writeFileSync(registration, JSON.stringify(old));
-    for (const method of ['filter', 'sessions'] as const) {
-      for (const query of [
-        'id:01a12cef id:01a12a6b',
-        '-id:claude:abcdefgh',
-        'id:codex:abcdefgh',
-        'session:claude:abcdefgh',
-        '-session:codex:abcdefgh',
-      ])
-        await assert.rejects(requestWindow(method, { query }, channel.hostId, home), /must reload/);
-      assert.equal(seen.length, method === 'filter' ? 0 : 5);
-      for (const query of [
-        'session:one',
-        'session:one session:two',
-        'session:one OR session:two',
-        'session:ef5a03c3-f255-41b6-b57c-c15af453ac8a',
-        '"id:abcdefgh"',
-      ])
-        await requestWindow(method, { query }, channel.hostId, home);
+    await channel.update({ folders: [], scopeReady: true, panelReady: false, panelVisible: false });
+    vi.useFakeTimers();
+    try {
+      const result = requestWindow('filter', { query: 'session:one' }, channel.hostId, home);
+      await vi.waitFor(() => assert.equal(admitted?.method, 'filter'));
+      assert.equal(admitted.filterContext.signal.aborted, false);
+      assert.ok(admitted.filterContext.deadline > Date.now() + 25_000);
+      await vi.advanceTimersByTimeAsync(2_000);
+      assert.equal(admitted.filterContext.signal.aborted, false);
+      finish();
+      await result;
+    } finally {
+      vi.useRealTimers();
     }
-    await requestWindow('filter', { query: '' }, channel.hostId, home);
-    await requestWindow('sessions', {}, channel.hostId, home);
-    assert.equal(seen.length, 12);
-  } finally {
+  },
+);
+
+test(
+  'a disconnected filter transport reports an unknown outcome and cancels host admission',
+  { tags: ['subprocess'] },
+  async () => {
+    const home = tempDir('filter-disconnect-');
+    const channel = new WindowChannel(home);
+    channels.push(channel);
+    let admitted: any;
+    let finish!: () => void;
+    channel.setRequestHandler((request) => {
+      admitted = request;
+      return new Promise<void>((resolve) => {
+        finish = resolve;
+      });
+    });
+    await channel.update({ folders: [], scopeReady: true, panelReady: true, panelVisible: true });
+    const result = requestWindow('filter', { query: 'session:one' }, channel.hostId, home);
+    await vi.waitFor(() => assert.ok(admitted));
     await channel.dispose();
-  }
-});
+    assert.equal(((await result) as any).status, 'unknown');
+    await vi.waitFor(() => assert.equal(admitted.filterContext.signal.aborted, true));
+    finish();
+  },
+);
 
-test('dispatch channel schema, capability admission, bounds and explicit refusals remain distinct', async () => {
-  const { channel, home, entry } = await fixture();
-  const launchId = 'aaaaaaaa-1111-2222-3333-444444444444';
-  const params = { dispatchAction: 'wait' as const, launchId, deadlineMs: 1 };
-  const valid = request(entry, { method: 'dispatch', params });
-  assert.deepEqual(parseSessionRequest(valid), valid);
-  const status = { dispatchAction: 'status', launchId, cursor: `${launchId}:1`, limit: 128 };
-  assert.deepEqual(parseSessionRequest({ ...valid, params: status })?.params, status);
-  for (const changed of [
-    { ...status, launchId: '(' },
-    { ...status, launchId: null },
-    { ...status, cursor: 'bbbbbbbb-1111-2222-3333-444444444444:1' },
-    { ...status, cursor: `${launchId}:12345678901234567` },
-  ]) {
-    assert.doesNotThrow(() => assert.equal(parseSessionRequest({ ...valid, params: changed }), null));
-  }
-  for (const changed of [
-    { ...params, deadlineMs: 0 },
-    { ...params, deadlineMs: 110001 },
-    { ...params, launchId: '../unsafe' },
-    { ...params, eventId: launchId },
-    { ...params, dispatchAction: 'callback' },
-  ])
-    assert.equal(parseSessionRequest({ ...valid, params: changed }), null);
-  await assert.rejects(requestWindow('dispatch', params, channel.hostId, home), /must reload/);
-  const start = {
-    setup: { kind: 'custom' as const, agent: 'codex', model: '', effort: '', permissionMode: '' },
-    prompt: 'review',
-    agentRun: false,
-    dispatch: true,
-    completion: 'manual' as const,
-  };
-  const writes = vi.fn<() => { status: string }>(() => ({ status: 'accepted' }));
-  channel.setRequestHandler(writes);
-  await assert.rejects(requestWindow('start', start, channel.hostId, home), /must reload/);
-  assert.equal(writes.mock.calls.length, 0);
-  const receipts = new DispatchReceipts(home);
-  const host = new HostedDispatch(receipts, () => null);
-  const launch = receipts.reserve({
-    origin: 'b'.repeat(24),
-    requester: null,
-    policy: null,
-    promptSha256: 'a'.repeat(64),
-    completion: 'wait',
-    alias: null,
-  });
-  channel.setDispatchHandler((request) => host.request(channel.hostId, request.params, request.filterContext!.signal));
-  await channel.update(state);
-  await assert.rejects(
-    requestWindow('dispatch', { ...params, launchId: launch.launchId }, channel.hostId, home),
-    /another Arc activation/,
-  );
-  channel.setDispatchHandler(() => ({ text: 'x'.repeat(SESSION_REQUEST_LIMITS.lineBytes + 1) }));
-  await assert.rejects(
-    requestWindow('dispatch', { dispatchAction: 'status', launchId }, channel.hostId, home),
-    /allowance/,
-  );
-  const manual = receipts.reserve({ ...launch, origin: channel.hostId, completion: 'manual' });
-  channel.setDispatchHandler((request) => host.request(channel.hostId, request.params, request.filterContext!.signal));
-  await assert.rejects(
-    requestWindow('dispatch', { ...params, launchId: manual.launchId }, channel.hostId, home),
-    /did not select waited/,
-  );
-  const waited = receipts.reserve({ ...launch, origin: channel.hostId });
-  vi.useFakeTimers();
-  let admitted = false;
-  channel.setDispatchHandler((request) => {
-    admitted = true;
-    return host.request(channel.hostId, request.params, request.filterContext!.signal);
-  });
-  const pending = requestWindow(
-    'dispatch',
-    { ...params, launchId: waited.launchId, deadlineMs: 100 },
-    channel.hostId,
-    home,
-  );
-  await vi.waitFor(() => assert.equal(admitted, true));
-  await vi.advanceTimersByTimeAsync(100);
-  assert.equal(((await pending) as any).state, 'deadline');
-  vi.useRealTimers();
-});
+test(
+  'older hosts refuse shorthand before either query route connects and retain exact requests',
+  { tags: ['subprocess'] },
+  async () => {
+    const home = tempDir('shorthand-negotiation-');
+    const channel = new WindowChannel(home);
+    const seen: any[] = [];
+    channel.setRequestHandler((request) => {
+      seen.push(request);
+      return {};
+    });
+    await channel.update({ folders: [], scopeReady: true, panelReady: false, panelVisible: false });
+    const registration = path.join(home, 'hosts', `${channel.hostId}.json`);
+    const old = JSON.parse(fs.readFileSync(registration, 'utf8'));
+    old.capabilities = ['requesterProvider'];
+    fs.writeFileSync(registration, JSON.stringify(old));
+    try {
+      for (const method of ['filter', 'sessions'] as const)
+        await assert.rejects(
+          requestWindow(method, { query: 'session:one' }, channel.hostId, home),
+          /must reload before it can accept filter queries/,
+        );
+      assert.equal(seen.length, 0);
+      old.capabilities = ['sessionQuery'];
+      fs.writeFileSync(registration, JSON.stringify(old));
+      for (const method of ['filter', 'sessions'] as const) {
+        for (const query of [
+          'id:01a12cef id:01a12a6b',
+          '-id:claude:abcdefgh',
+          'id:codex:abcdefgh',
+          'session:claude:abcdefgh',
+          '-session:codex:abcdefgh',
+        ])
+          await assert.rejects(requestWindow(method, { query }, channel.hostId, home), /must reload/);
+        assert.equal(seen.length, method === 'filter' ? 0 : 5);
+        for (const query of [
+          'session:one',
+          'session:one session:two',
+          'session:one OR session:two',
+          'session:ef5a03c3-f255-41b6-b57c-c15af453ac8a',
+          '"id:abcdefgh"',
+        ])
+          await requestWindow(method, { query }, channel.hostId, home);
+      }
+      await requestWindow('filter', { query: '' }, channel.hostId, home);
+      await requestWindow('sessions', {}, channel.hostId, home);
+      assert.equal(seen.length, 12);
+    } finally {
+      await channel.dispose();
+    }
+  },
+);
 
-test('dispatch wait disconnect cancels the channel subscription and retains its launch identity', async () => {
-  const { channel, home } = await fixture();
-  const receipts = new DispatchReceipts(home);
-  const host = new HostedDispatch(receipts, () => null);
-  const launch = receipts.reserve({
-    origin: channel.hostId,
-    requester: null,
-    policy: null,
-    promptSha256: 'a'.repeat(64),
-    completion: 'wait',
-    alias: null,
-  });
-  let admitted: any;
-  channel.setDispatchHandler((request) => {
-    admitted = request;
-    return host.request(channel.hostId, request.params, request.filterContext!.signal);
-  });
-  await channel.update(state);
-  const launchId = launch.launchId;
-  const pending = requestWindow(
-    'dispatch',
-    { dispatchAction: 'wait', launchId, deadlineMs: 1000 },
-    channel.hostId,
-    home,
-  );
-  await vi.waitFor(() => assert.ok(admitted));
-  await channel.dispose();
-  const result = (await pending) as any;
-  assert.equal(result.state, 'uncertain');
-  assert.equal(result.launchId, launchId);
-  await vi.waitFor(() => assert.equal(admitted.filterContext.signal.aborted, true));
-  assert.equal(receipts.launch(launchId).launchId, launchId);
-});
+test(
+  'dispatch channel schema, capability admission, bounds and explicit refusals remain distinct',
+  { tags: ['subprocess'] },
+  async () => {
+    const { channel, home, entry } = await fixture();
+    const launchId = 'aaaaaaaa-1111-2222-3333-444444444444';
+    const params = { dispatchAction: 'wait' as const, launchId, deadlineMs: 1 };
+    const valid = request(entry, { method: 'dispatch', params });
+    assert.deepEqual(parseSessionRequest(valid), valid);
+    const status = { dispatchAction: 'status', launchId, cursor: `${launchId}:1`, limit: 128 };
+    assert.deepEqual(parseSessionRequest({ ...valid, params: status })?.params, status);
+    for (const changed of [
+      { ...status, launchId: '(' },
+      { ...status, launchId: null },
+      { ...status, cursor: 'bbbbbbbb-1111-2222-3333-444444444444:1' },
+      { ...status, cursor: `${launchId}:12345678901234567` },
+    ]) {
+      assert.doesNotThrow(() => assert.equal(parseSessionRequest({ ...valid, params: changed }), null));
+    }
+    for (const changed of [
+      { ...params, deadlineMs: 0 },
+      { ...params, deadlineMs: 110001 },
+      { ...params, launchId: '../unsafe' },
+      { ...params, eventId: launchId },
+      { ...params, dispatchAction: 'callback' },
+    ])
+      assert.equal(parseSessionRequest({ ...valid, params: changed }), null);
+    await assert.rejects(requestWindow('dispatch', params, channel.hostId, home), /must reload/);
+    const start = {
+      setup: { kind: 'custom' as const, agent: 'codex', model: '', effort: '', permissionMode: '' },
+      prompt: 'review',
+      agentRun: false,
+      dispatch: true,
+      completion: 'manual' as const,
+    };
+    const writes = vi.fn<() => { status: string }>(() => ({ status: 'accepted' }));
+    channel.setRequestHandler(writes);
+    await assert.rejects(requestWindow('start', start, channel.hostId, home), /must reload/);
+    assert.equal(writes.mock.calls.length, 0);
+    const receipts = new DispatchReceipts(home);
+    const host = new HostedDispatch(receipts, () => null);
+    const launch = receipts.reserve({
+      origin: 'b'.repeat(24),
+      requester: null,
+      policy: null,
+      promptSha256: 'a'.repeat(64),
+      completion: 'wait',
+      alias: null,
+    });
+    channel.setDispatchHandler((request) =>
+      host.request(channel.hostId, request.params, request.filterContext!.signal),
+    );
+    await channel.update(state);
+    await assert.rejects(
+      requestWindow('dispatch', { ...params, launchId: launch.launchId }, channel.hostId, home),
+      /another Arc activation/,
+    );
+    channel.setDispatchHandler(() => ({ text: 'x'.repeat(SESSION_REQUEST_LIMITS.lineBytes + 1) }));
+    await assert.rejects(
+      requestWindow('dispatch', { dispatchAction: 'status', launchId }, channel.hostId, home),
+      /allowance/,
+    );
+    const manual = receipts.reserve({ ...launch, origin: channel.hostId, completion: 'manual' });
+    channel.setDispatchHandler((request) =>
+      host.request(channel.hostId, request.params, request.filterContext!.signal),
+    );
+    await assert.rejects(
+      requestWindow('dispatch', { ...params, launchId: manual.launchId }, channel.hostId, home),
+      /did not select waited/,
+    );
+    const waited = receipts.reserve({ ...launch, origin: channel.hostId });
+    vi.useFakeTimers();
+    let admitted = false;
+    channel.setDispatchHandler((request) => {
+      admitted = true;
+      return host.request(channel.hostId, request.params, request.filterContext!.signal);
+    });
+    const pending = requestWindow(
+      'dispatch',
+      { ...params, launchId: waited.launchId, deadlineMs: 100 },
+      channel.hostId,
+      home,
+    );
+    await vi.waitFor(() => assert.equal(admitted, true));
+    await vi.advanceTimersByTimeAsync(100);
+    assert.equal(((await pending) as any).state, 'deadline');
+    vi.useRealTimers();
+  },
+);
+
+test(
+  'dispatch wait disconnect cancels the channel subscription and retains its launch identity',
+  { tags: ['subprocess'] },
+  async () => {
+    const { channel, home } = await fixture();
+    const receipts = new DispatchReceipts(home);
+    const host = new HostedDispatch(receipts, () => null);
+    const launch = receipts.reserve({
+      origin: channel.hostId,
+      requester: null,
+      policy: null,
+      promptSha256: 'a'.repeat(64),
+      completion: 'wait',
+      alias: null,
+    });
+    let admitted: any;
+    channel.setDispatchHandler((request) => {
+      admitted = request;
+      return host.request(channel.hostId, request.params, request.filterContext!.signal);
+    });
+    await channel.update(state);
+    const launchId = launch.launchId;
+    const pending = requestWindow(
+      'dispatch',
+      { dispatchAction: 'wait', launchId, deadlineMs: 1000 },
+      channel.hostId,
+      home,
+    );
+    await vi.waitFor(() => assert.ok(admitted));
+    await channel.dispose();
+    const result = (await pending) as any;
+    assert.equal(result.state, 'uncertain');
+    assert.equal(result.launchId, launchId);
+    await vi.waitFor(() => assert.equal(admitted.filterContext.signal.aborted, true));
+    assert.equal(receipts.launch(launchId).launchId, launchId);
+  },
+);
 
 // Two real channels expose wrong-window dispatch and admission races without editor startup.
-test('integrated setups selects its owning window among competing same-folder channels', async () => {
-  vi.stubEnv('TERM_PROGRAM', 'vscode');
-  for (const key of [
-    'WSL_DISTRO_NAME',
-    'SSH_CONNECTION',
-    'SSH_CLIENT',
-    'REMOTE_CONTAINERS',
-    'VSCODE_REMOTE_CONTAINERS_SESSION',
-  ])
-    vi.stubEnv(key, '');
-  const { home, channel } = await fixture();
-  const competitor = new WindowChannel(home);
-  channels.push(competitor);
-  let roots: TerminalShell[] = [{ processId: Promise.resolve(process.pid) }];
-  const source = { allowed: () => true, terminals: () => roots };
-  channel.setTerminalOwnership(terminalOwnership(source, identities));
-  competitor.setTerminalOwnership(terminalOwnership({ allowed: () => true, terminals: () => [] }, identities));
-  const first = vi.fn<() => Record<string, unknown>>(() => ({ owner: channel.hostId }));
-  const second = vi.fn<() => Record<string, unknown>>(() => ({ owner: competitor.hostId }));
-  channel.setRequestHandler(first);
-  competitor.setRequestHandler(second);
-  await competitor.update(state);
-  assert.deepEqual(await requestWindow('setups', {}, '', home), { owner: channel.hostId });
-  assert.equal(first.mock.calls.length, 1);
-  assert.equal(second.mock.calls.length, 0);
-  vi.stubEnv('ARC_WINDOW', competitor.hostId);
-  assert.deepEqual(await requestWindow('setups', {}, undefined, home), { owner: competitor.hostId });
-  assert.deepEqual(await requestWindow('setups', {}, channel.hostId, home), { owner: channel.hostId });
-  roots = [];
-  await assert.rejects(requestWindow('setups', {}, '', home), /terminal owner is not unique/);
-  assert.equal(first.mock.calls.length, 2);
-  assert.equal(second.mock.calls.length, 1);
-  roots = [{ processId: Promise.resolve(process.pid) }];
-  channel.setRequestHandler(() => {
-    void channel.dispose();
-    return { status: 'started' };
-  });
-  const uncertain = (await requestWindow(
-    'start',
-    {
-      setup: { kind: 'custom', agent: 'codex', model: '', effort: '', permissionMode: '' },
-      agentRun: false,
-      prompt: 'owned test',
-    },
-    '',
-    home,
-  )) as { status: string; window: string };
-  assert.equal(uncertain.status, 'unknown');
-  assert.equal(uncertain.window, channel.hostId);
-  assert.equal(second.mock.calls.length, 1);
-});
+test(
+  'integrated setups selects its owning window among competing same-folder channels',
+  { tags: ['subprocess'] },
+  async () => {
+    vi.stubEnv('TERM_PROGRAM', 'vscode');
+    for (const key of [
+      'WSL_DISTRO_NAME',
+      'SSH_CONNECTION',
+      'SSH_CLIENT',
+      'REMOTE_CONTAINERS',
+      'VSCODE_REMOTE_CONTAINERS_SESSION',
+    ])
+      vi.stubEnv(key, '');
+    const { home, channel } = await fixture();
+    const competitor = new WindowChannel(home);
+    channels.push(competitor);
+    let roots: TerminalShell[] = [{ processId: Promise.resolve(process.pid) }];
+    const source = { allowed: () => true, terminals: () => roots };
+    channel.setTerminalOwnership(terminalOwnership(source, identities));
+    competitor.setTerminalOwnership(terminalOwnership({ allowed: () => true, terminals: () => [] }, identities));
+    const first = vi.fn<() => Record<string, unknown>>(() => ({ owner: channel.hostId }));
+    const second = vi.fn<() => Record<string, unknown>>(() => ({ owner: competitor.hostId }));
+    channel.setRequestHandler(first);
+    competitor.setRequestHandler(second);
+    await competitor.update(state);
+    assert.deepEqual(await requestWindow('setups', {}, '', home), { owner: channel.hostId });
+    assert.equal(first.mock.calls.length, 1);
+    assert.equal(second.mock.calls.length, 0);
+    vi.stubEnv('ARC_WINDOW', competitor.hostId);
+    assert.deepEqual(await requestWindow('setups', {}, undefined, home), { owner: competitor.hostId });
+    assert.deepEqual(await requestWindow('setups', {}, channel.hostId, home), { owner: channel.hostId });
+    roots = [];
+    await assert.rejects(requestWindow('setups', {}, '', home), /terminal owner is not unique/);
+    assert.equal(first.mock.calls.length, 2);
+    assert.equal(second.mock.calls.length, 1);
+    roots = [{ processId: Promise.resolve(process.pid) }];
+    channel.setRequestHandler(() => {
+      void channel.dispose();
+      return { status: 'started' };
+    });
+    const uncertain = (await requestWindow(
+      'start',
+      {
+        setup: { kind: 'custom', agent: 'codex', model: '', effort: '', permissionMode: '' },
+        agentRun: false,
+        prompt: 'owned test',
+      },
+      '',
+      home,
+    )) as { status: string; window: string };
+    assert.equal(uncertain.status, 'unknown');
+    assert.equal(uncertain.window, channel.hostId);
+    assert.equal(second.mock.calls.length, 1);
+  },
+);
 
-test('integrated ownership refuses ambiguous, unsupported and unknown windows without dispatch', async () => {
-  vi.stubEnv('TERM_PROGRAM', 'vscode');
-  const { home, channel } = await fixture();
-  const competitor = new WindowChannel(home);
-  channels.push(competitor);
-  const handler = vi.fn<() => Record<string, unknown>>(() => ({}));
-  channel.setRequestHandler(handler);
-  competitor.setRequestHandler(handler);
-  const roots = [{ processId: Promise.resolve(process.pid) }];
-  channel.setTerminalOwnership(terminalOwnership({ allowed: () => true, terminals: () => roots }));
-  await competitor.update(state);
-  await assert.rejects(requestWindow('setups', {}, '', home), /Reload Arc windows/);
-  competitor.setTerminalOwnership(terminalOwnership({ allowed: () => true, terminals: () => roots }));
-  await assert.rejects(requestWindow('setups', {}, '', home), /not unique/);
-  competitor.setTerminalOwnership(terminalOwnership({ allowed: () => false, terminals: () => [] }));
-  await assert.rejects(requestWindow('setups', {}, '', home), /terminal owner is unavailable/);
-  assert.equal(handler.mock.calls.length, 0);
-});
+test(
+  'integrated ownership refuses ambiguous, unsupported and unknown windows without dispatch',
+  { tags: ['subprocess'] },
+  async () => {
+    vi.stubEnv('TERM_PROGRAM', 'vscode');
+    const { home, channel } = await fixture();
+    const competitor = new WindowChannel(home);
+    channels.push(competitor);
+    const handler = vi.fn<() => Record<string, unknown>>(() => ({}));
+    channel.setRequestHandler(handler);
+    competitor.setRequestHandler(handler);
+    const roots = [{ processId: Promise.resolve(process.pid) }];
+    channel.setTerminalOwnership(terminalOwnership({ allowed: () => true, terminals: () => roots }));
+    await competitor.update(state);
+    await assert.rejects(requestWindow('setups', {}, '', home), /Reload Arc windows/);
+    competitor.setTerminalOwnership(terminalOwnership({ allowed: () => true, terminals: () => roots }));
+    await assert.rejects(requestWindow('setups', {}, '', home), /not unique/);
+    competitor.setTerminalOwnership(terminalOwnership({ allowed: () => false, terminals: () => [] }));
+    await assert.rejects(requestWindow('setups', {}, '', home), /terminal owner is unavailable/);
+    assert.equal(handler.mock.calls.length, 0);
+  },
+);
 
 test.each([
   ['Process collection expired.', /took too long/],
   ['Process unavailable.', /terminal owner is unavailable/],
-])('a terminal process read that fails with "%s" reports %s', async (failure, message) => {
+])('a terminal process read that fails with "%s" reports %s', { tags: ['subprocess'] }, async (failure, message) => {
   vi.stubEnv('TERM_PROGRAM', 'vscode');
   const { home, channel } = await fixture();
   const handler = vi.fn<() => Record<string, unknown>>(() => ({}));
@@ -1563,6 +1671,7 @@ test.each([
 
 test.each(['transfer', 'caller-reuse', 'root-reuse', 'disposed'] as const)(
   'final terminal admission refuses %s before handler effects',
+  { tags: ['subprocess'] },
   async (change) => {
     vi.stubEnv('TERM_PROGRAM', 'vscode');
     const { home, channel } = await fixture();

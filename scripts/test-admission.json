@@ -1,0 +1,332 @@
+{
+  "cli/test/manage.test.ts": {
+    "reason": "CLI management must preserve classification, validation, and read delivery through a real authenticated window channel.",
+    "cases": 8,
+    "matricesSha256": "a7b9886c61ff373920fa25bb4bc0bd9870ca54cd0458e1daed16e5af85e75dbc"
+  },
+  "cli/test/run.test.ts": {
+    "reason": "Standalone workers must retain real output, exit, cancellation, receipt ownership, and recovery across process boundaries.",
+    "cases": 87,
+    "matricesSha256": "907100725d285320a1f178da19c1e1497fcefe4d786f6e7bb4938acb17839840"
+  },
+  "cli/test/smoke.bundled-a.test.mjs": {
+    "reason": "Compiled CLI commands must reach session reads, comments, and saved defaults through an authenticated window channel.",
+    "cases": 8,
+    "matricesSha256": "7202998c02eaeaa1c98bd6f30aeca86170047ea8292499e24ff8bed63ef52921"
+  },
+  "cli/test/smoke.bundled-b.test.mjs": {
+    "reason": "Compiled CLI commands must deliver session actions and streamed responses through the selected window channel.",
+    "cases": 5,
+    "matricesSha256": "70b7921f1164c14f90956abe51409ef3ba367b0821f5a0c38b0f27be948f4d9f"
+  },
+  "cli/test/smoke.bundled-c.test.mjs": {
+    "reason": "Compiled CLI commands must preserve window routing, turn limits, and terminal ownership under real IPC.",
+    "cases": 14,
+    "matricesSha256": "15fc52c3af6a79bd19a02bd888c7d0a5c6ffba21c5b67232ffbd2778a6ddb61c"
+  },
+  "cli/test/smoke.test.mjs": {
+    "reason": "Installed skill directories must preserve foreign files and ownership across executable command and filesystem boundaries.",
+    "cases": 36,
+    "matricesSha256": "9226404c2576a51642df89d8f8e052fe3a34a882f9b9a3b4807e89630a934803"
+  },
+  "cli/test/stream-fixtures.test.mjs": {
+    "reason": "The audit executable must print stream mismatches and return a failing process status.",
+    "cases": 6,
+    "matricesSha256": "ee41bd99bc78c90d9caa53af20ec903968f2860939812170f9d5a393eede6a0c"
+  },
+  "extension/src/agenthost.test.ts": {
+    "reason": "A spawned agent must receive the activation window, editor executable, and command search path.",
+    "cases": 276,
+    "matricesSha256": "ce8ad53ad69350279fdb4c555840c5165003abcd6dc6dd76479cdeca8bab74ec"
+  },
+  "extension/src/chrome.browser.test.ts": {
+    "reason": "Panel controls must preserve native focus, keyboard handling, and browser event delivery.",
+    "cases": 9,
+    "matricesSha256": "50bcd6a32f1546ed35e8f2f3b0eae73ea9ce2f5381ca3bb7edfad11bab2e9b9a"
+  },
+  "extension/src/claudeplugin.test.ts": {
+    "reason": "Bundled command installation must validate real Node executables and preserve owned launchers through partial filesystem failures.",
+    "cases": 63,
+    "matricesSha256": "6280e27ebc1a95a28d441619155e0ee591612ce82f8634f1c7f683d714fa1269"
+  },
+  "extension/src/clauderepeated.test.ts": {
+    "reason": "The real worker must read repeated-record maps and invalidate them after source revision changes.",
+    "cases": 39,
+    "matricesSha256": "d31a98ac2408485ce42317634ac9d33c68436c7051cc4d9f8bef5072483e2b9b"
+  },
+  "extension/src/codex.test.ts": {
+    "reason": "Real Git worktree ownership and descendant source resolution must agree with recorded Codex session relationships.",
+    "cases": 461,
+    "matricesSha256": "426bf2195df8e595b09fd4c3c30d29e21c20b5a13bf9541ed0532987eddc662c"
+  },
+  "extension/src/derivedcache.test.ts": {
+    "reason": "Independent writers and host death must preserve shared cache rows and release stale filesystem locks.",
+    "cases": 86,
+    "matricesSha256": "22aaa6aa6ef5b9d708ed4aba7b4d345915468f3fb820a723e582745423c117c1"
+  },
+  "extension/src/exportsite.browser.test.ts": {
+    "reason": "An offline exported session must retain interactive navigation and safe local browser behavior.",
+    "cases": 7,
+    "matricesSha256": "1729f86a1bedd916432b1d5b354c73bd38b81022bf6d2c2d02bee50398f938ef"
+  },
+  "extension/src/exportsite.test.ts": {
+    "reason": "The production export bundle must retain complete responses and remove host-only actions from portable output.",
+    "cases": 36,
+    "matricesSha256": "46ea953a7f24b22441e46fd7800f05f86c302694d9d6bd966d678ab5a608914a"
+  },
+  "extension/src/gitcommits.test.ts": {
+    "reason": "A real fast-forward must write the reflog source name and retain the landed commit details.",
+    "cases": 59,
+    "matricesSha256": "1ee670f47efdb7ee0df29762e17a79d5e63ea9f5d796411f141cb8afc7655e93"
+  },
+  "extension/src/packaging.source.test.ts": {
+    "reason": "Extracted source must build and watch both CLI bundles offline and reject corrupt or incomplete packaged assets.",
+    "cases": 25,
+    "matricesSha256": "c1fbc77a742732e8bd4685e6d0ae588a026bb07ab6ae295ec073bc6ea3cfe505"
+  },
+  "extension/src/packaging.test.ts": {
+    "reason": "Actual VSIX packaging must preserve archive contents, platform executables, output options, and extracted runtime entry points.",
+    "cases": 20,
+    "matricesSha256": "33c98f3abd3ea3721d7c939e438b567138e829d29c1bcefeadd1ed7d5093e6c9"
+  },
+  "extension/src/panel-shots.test.ts": {
+    "reason": "Screenshot output must pass through the actual image encoder and lossless comparison while preserving its crop.",
+    "cases": 30,
+    "matricesSha256": "ef81df0f693c642dac454f21e8e8feb3e10d99a8de130109706ac74b25fafd6e"
+  },
+  "extension/src/panel.layout.cards.test.ts": {
+    "reason": "Turn-card browser interactions must preserve disclosure, keyboard, selection, and scrolling behavior.",
+    "cases": 47,
+    "matricesSha256": "0b0f4eff8446bec3662a0729c7cb764c108764d067619f1394efeefb1827deb9"
+  },
+  "extension/src/panel.layout.comments.test.ts": {
+    "reason": "Comment controls must preserve native selection, focus, and saved comment interaction.",
+    "cases": 32,
+    "matricesSha256": "88b0863e001ffed443e57cd57ab9c4558af117ec26ab7fd5b666b905956bf3e1"
+  },
+  "extension/src/panel.layout.heading.test.ts": {
+    "reason": "Session headings must retain accessible controls and browser interaction across responsive states.",
+    "cases": 19,
+    "matricesSha256": "46966f6392dfa2120781c74db964f414b662b46d6f76544b2ac0867ac409fc28"
+  },
+  "extension/src/panel.layout.messages.test.ts": {
+    "reason": "Rendered messages must preserve browser selection and interaction for rich content.",
+    "cases": 11,
+    "matricesSha256": "5a7f1f669d2ef76f2fe1a3b9463bf1ae47622acf8e989f1dbdc010c7a5278087"
+  },
+  "extension/src/panel.layout.rail.test.ts": {
+    "reason": "Session-list controls must preserve native browser interaction across layout changes.",
+    "cases": 28,
+    "matricesSha256": "732e76d389921a31b4179a6ea2605c90e3bcfb228bef7ebf53b9d21a47d9bc9c"
+  },
+  "extension/src/panel.layout.test.ts": {
+    "reason": "The built panel must preserve browser interaction, focus, and scrolling across supported viewports.",
+    "cases": 25,
+    "matricesSha256": "5b04d61cb9d18e1eb073a37369de0c1da0cb67facf539e573deea905a1aa5f59"
+  },
+  "extension/src/panel.webview.test.ts": {
+    "reason": "Real progressive workers must deliver bounded recovery and metadata through the production panel host.",
+    "cases": 591,
+    "matricesSha256": "49a315b46ab0cfdd617eeb6b99ebbc97d5de5c2cdbe68dfb7444a5b5503c0bf4"
+  },
+  "extension/src/panelbundle.test.ts": {
+    "reason": "The panel bundle and fixture must contain the production entry, source identity, and substituted text.",
+    "cases": 3,
+    "matricesSha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+  },
+  "extension/src/progressiveworker.test.ts": {
+    "reason": "Worker protocol, cancellation, host death, and bounded transcript reads must survive the actual worker boundary.",
+    "cases": 130,
+    "matricesSha256": "615252b5529303684f46cdc0096e2ee0e6111335e557f9bcdd39e2eb805c4a05"
+  },
+  "extension/src/projectsetups.test.ts": {
+    "reason": "Real Git worktrees and canonical filesystem aliases must share project identity while clones stay distinct.",
+    "cases": 7,
+    "matricesSha256": "5714418215e99183a493c933c96be2fb00c6e0cde83febe319a0f556e0d4169c"
+  },
+  "extension/src/projectspend.browser.test.ts": {
+    "reason": "Project spend controls must preserve rendered interaction, session navigation, and keyboard access.",
+    "cases": 12,
+    "matricesSha256": "adcf7721f1f39de4f7ca5cb9e5813fdf2b2d2f65d84af120edf779202aaa6668"
+  },
+  "extension/src/rail.editors.browser.test.ts": {
+    "reason": "Session-list editors must preserve browser focus, submission, and keyboard cancellation.",
+    "cases": 22,
+    "matricesSha256": "71cb580a33d735a6ed686f55161859e10a293e2a15304227fb94a067dba74020"
+  },
+  "extension/src/rail.filter.browser.test.ts": {
+    "reason": "Session filters must update the rendered list through native input and keyboard events.",
+    "cases": 27,
+    "matricesSha256": "d1bbc1582373905f1fa5cb75e1b7b9a19badc5df50e92fbbdc847b9635bebcd9"
+  },
+  "extension/src/rail.rows.browser.test.ts": {
+    "reason": "Session rows must preserve selection, context actions, and browser focus.",
+    "cases": 25,
+    "matricesSha256": "c9fd2f4fedd95b46052ceb41fd7748ea6a860c0ccc5338db0999d962aec3be79"
+  },
+  "extension/src/rail.views.browser.test.ts": {
+    "reason": "Saved views and filter menus must preserve browser interaction and keyboard focus.",
+    "cases": 21,
+    "matricesSha256": "86b0fd56084f092c79649d8aa3efc9409d65cf28c017600bcd5292f68416fd31"
+  },
+  "extension/src/sessiondiscovery.test.ts": {
+    "reason": "Real window listeners and registry discovery must preserve ownership, reachability, and partial listing across native IPC.",
+    "cases": 21,
+    "matricesSha256": "cce452d1b0b6eedeb42ca65ea90c1e2880911f93516b93e5fb89e36cdd0a0f7e"
+  },
+  "extension/src/sessionrequests.test.ts": {
+    "reason": "Native window channels must preserve authentication, activation identity, recovery, and write admission without replaying accepted writes.",
+    "cases": 45,
+    "matricesSha256": "107c8670380756c889cdc0d9106644b9122e99bf7e7533f559526b9d1011dc9d"
+  },
+  "extension/src/sessionwrites.test.ts": {
+    "reason": "Authenticated window channels must preserve accepted reads, ordered writes, and ownership across native IPC.",
+    "cases": 23,
+    "matricesSha256": "09f64e027254828ec192b70608ce030dfc060f4a09c5c7c944f68a50729ca24e"
+  },
+  "extension/src/startup.browser.test.ts": {
+    "reason": "Startup and restored panel rendering must preserve usable browser state and focus.",
+    "cases": 8,
+    "matricesSha256": "b2a4c3552a9fdd99d3be4a6e1515bc834b857c078f1059c8fbdf75ef50132b39"
+  },
+  "extension/src/startup.test.ts": {
+    "reason": "Real title workers must publish recovered metadata through startup ownership and cancellation boundaries.",
+    "cases": 193,
+    "matricesSha256": "a7c3762be54b7339a9ff761ad56b1fa4e9879cb56382562eff3d9a23320f4e6a"
+  },
+  "extension/src/store.test.ts": {
+    "reason": "The real Stop hook must renew retention for useful snapshot stores without changing workspace files.",
+    "cases": 20,
+    "matricesSha256": "40eef0591ce65de146463325c82bd53ecd890923c4e1fd5aae4d15ab3d436587"
+  },
+  "extension/src/temproot.test.ts": {
+    "reason": "Git-discovered Vitest configurations must install the per-run temporary-directory setup.",
+    "cases": 3,
+    "matricesSha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+  },
+  "extension/src/timeline-renderer.browser.test.ts": {
+    "reason": "Production timeline rendering must preserve native disclosure, selection, navigation, and accessible interaction.",
+    "cases": 66,
+    "matricesSha256": "7180ca88664e4d8431acbbdbb19b8f692f28ca3eb9103fc15e1082c96af06ab0"
+  },
+  "extension/src/timelinecheck.test.ts": {
+    "reason": "Npm and extension-directory invocations must inspect the caller project through the real command environment.",
+    "cases": 20,
+    "matricesSha256": "1049a13f274093ff68a686e18cf4de62f71b6baa4d892ae4d86d35eae6f0d5da"
+  },
+  "extension/src/usagerecord.test.ts": {
+    "reason": "Independent host processes must serialize near-cap usage writes while different day slots remain independent.",
+    "cases": 20,
+    "matricesSha256": "e58d9afdc9625ad44fe51d83443f37758e64a3b844b1f84ea769c30926256e9b"
+  },
+  "extension/src/web-demo.browser.test.ts": {
+    "reason": "The packaged static demo must preserve production menu, comment, navigation, and download interactions.",
+    "cases": 19,
+    "matricesSha256": "88f7347002c19eada031e65026204cd9cef608aae1d5670ee38c043709257871"
+  },
+  "extension/src/webview.integration.browser.test.ts": {
+    "reason": "Host publications must update the mounted production panel while preserving browser interaction and bounded rendering.",
+    "cases": 22,
+    "matricesSha256": "df26d8885a501142ae5432b1e543dfa922a1a0dad314963849f65f519c21381a"
+  },
+  "extension/src/webview/attachments.browser.test.ts": {
+    "reason": "File attachments must preserve native paste, drop, focus, and prompt submission behavior.",
+    "cases": 8,
+    "matricesSha256": "0c1fdb0a50c9811a2ec1319618cd3d166e16f4a9b5496347033715981b05184c"
+  },
+  "extension/src/webview/clock.browser.test.ts": {
+    "reason": "Rendered ages and cache states must update through the browser clock without losing panel state.",
+    "cases": 4,
+    "matricesSha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+  },
+  "extension/src/webview/composer.browser.test.ts": {
+    "reason": "Prompt controls must preserve permissions, saved defaults, completion, history, delayed replies, keyboard access, and focus.",
+    "cases": 81,
+    "matricesSha256": "b2a8890d995aad49c87d8d907d36213684e6d04ad0936fd5c6461de753128605"
+  },
+  "extension/src/webview/queue-live.browser.test.ts": {
+    "reason": "Queued and live prompts must preserve mounted browser input, focus, and submission actions.",
+    "cases": 11,
+    "matricesSha256": "f624b6c8dc19aaf330a07fd0e4bfaebe7031273a1b778365d174116b2f85b944"
+  },
+  "extension/src/webview/search.browser.test.ts": {
+    "reason": "Search must preserve native text input, keyboard navigation, selection, and session opening.",
+    "cases": 12,
+    "matricesSha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+  },
+  "extension/src/windowpipe.test.ts": {
+    "reason": "The native Windows pipe helper must preserve pending I/O, disconnect recovery, deadlines, and child-exit evidence.",
+    "cases": 11,
+    "matricesSha256": "18716bcfc7ef61657917111fadd2fa3b48d8d430b169f3f47b9c96a1435c61f6"
+  },
+  "plugins/arc-hooks/scripts/integration.test.js": {
+    "reason": "Real hook processes must preserve snapshot writes and metadata through the shell environment.",
+    "cases": 4,
+    "matricesSha256": "75dd0338a6f7a51958e22932b540f7a87cadbfc7c7d364ce952be1c9da48102a"
+  },
+  "plugins/arc-hooks/scripts/lib.test.js": {
+    "reason": "Snapshot helpers must preserve Git and filesystem ownership across real command boundaries.",
+    "cases": 26,
+    "matricesSha256": "c21e158b30035bab898901c46a3916474a3e60385879cc1aef43ca655431d8b6"
+  },
+  "scripts/agent-review-evals.test.js": {
+    "reason": "Review commands must validate real repositories, exports, sandbox receipts, and executable status boundaries.",
+    "cases": 78,
+    "matricesSha256": "a413a286fe6286df2aab2c5a09f43deb4f097418de6f76dc96a2421f6a55bc7b"
+  },
+  "scripts/check-web-demo-site.test.js": {
+    "reason": "The site checker executable must reject invalid generated demo output.",
+    "cases": 1,
+    "matricesSha256": "d176bbe24990b6f3c4fb8eddd3dc92fb4a77a6a72acb112d57f36fad6ef88e8b"
+  },
+  "scripts/editor-cli.test.js": {
+    "reason": "Editor launch and installer shell commands must preserve quoting, cancellation, native entry selection, manifest and lockfile bytes, and component outcomes.",
+    "cases": 55,
+    "matricesSha256": "90bfb5bb416f6036635fb47013fda362fa0120d4216c2fda998ddaa3b6206d68"
+  },
+  "scripts/extension-test-runner.test.js": {
+    "reason": "Real runner commands must classify files, reject invalid selection, and preserve browser readiness status.",
+    "cases": 51,
+    "matricesSha256": "9c790969b71119ff15b6ced21c7ecfc637d5fb44b2514b4d717f29f50e933f8d"
+  },
+  "scripts/install-release.test.js": {
+    "reason": "Release installation must extract actual archives and preserve isolated-home hooks, skills, and partial failures.",
+    "cases": 10,
+    "matricesSha256": "7256fe8d641186a37f64477989cf7830385506792054ee995e82dcb773a60fb8"
+  },
+  "scripts/isolated-editor.test.js": {
+    "reason": "The isolated editor launcher must retain owned process receipts and reject cleanup or launch failures.",
+    "cases": 69,
+    "matricesSha256": "9e41154f467e5a06579e70409f12886cec2203339d4d04bbccef20e964e9a8fe"
+  },
+  "scripts/register-hooks.test.js": {
+    "reason": "The registration executable must preserve existing user settings and install the selected hook configuration.",
+    "cases": 7,
+    "matricesSha256": "dfa6e17aa9cfaa19c268e45b3c468ff25ffbf63c1b5b96e3ab0eef487e27200f"
+  },
+  "scripts/source-identity.test.js": {
+    "reason": "Real Git source identity must agree with build inputs and reject inconsistent repository metadata.",
+    "cases": 6,
+    "matricesSha256": "5200b566785d27825dfe168f2f4c5ec283c16d16be2ae229c0126cde5598161f"
+  },
+  "scripts/test-lanes.test.js": {
+    "reason": "Linked command entry points must execute and retain process status. Direct checks guard category and admission drift.",
+    "cases": 14,
+    "matricesSha256": "9dc2d269ae9ab46c98ec5f7bd118774b94f86f1d111dec984435c0a3a1f8f29a"
+  },
+  "scripts/tool-scope.test.js": {
+    "reason": "Real tool commands must respect repository scope and reject external configuration or stale packaged content.",
+    "cases": 13,
+    "matricesSha256": "02e69de3c4fa59862b898fef42bee9b9ae2f4d36001555c465323a979c466b24"
+  },
+  "scripts/typecheck-parallel.test.js": {
+    "reason": "Concurrent check child processes must preserve exit status, spawn errors, and grouped output.",
+    "cases": 5,
+    "matricesSha256": "1a518c6e40f9ad0c5ecef8620c1b9973123855dcf141057081b4c5915565852d"
+  },
+  "test/hooks-smoke.test.js": {
+    "reason": "The installed hook command must capture real first-touch snapshots through the shell entry point.",
+    "cases": 1,
+    "matricesSha256": "ebef8eb46e7e69daafbb5475172390a4573f5dd82b95bb1b1021111d06920091"
+  }
+}

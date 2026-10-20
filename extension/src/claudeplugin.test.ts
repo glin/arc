@@ -1120,32 +1120,40 @@ test('private CLI preparation retains older releases without selecting standalon
   assert.equal(fs.existsSync(path.join(a.tools.root, 'bin')), false);
 });
 
-test('bundled wrapped unsettled mutations retain software and configuration locks and block command setup', async () => {
-  const a = bundledFixture();
-  a.mutation(async () => {
-    throw new Error('Wrapped cancellation', { cause: new PluginProcessError('Unsettled descendants', true) });
-  });
-  await assert.rejects(a.setup.install(a.f.target, a.f.signal), /ownership remains/);
-  assert.equal(fs.existsSync(path.join(a.tools.tools, '.install.lock')), true);
-  assert.equal(fs.existsSync(path.join(a.f.target.home, '.arc-snapshot-setup.lock')), true);
-  await assert.rejects(a.tools.installCommands(process.execPath, a.f.signal), /Another Arc setup/);
-  assert.equal(a.tools.registration(a.f.target.home)?.complete, false);
-});
+test(
+  'bundled wrapped unsettled mutations retain software and configuration locks and block command setup',
+  { tags: ['subprocess'] },
+  async () => {
+    const a = bundledFixture();
+    a.mutation(async () => {
+      throw new Error('Wrapped cancellation', { cause: new PluginProcessError('Unsettled descendants', true) });
+    });
+    await assert.rejects(a.setup.install(a.f.target, a.f.signal), /ownership remains/);
+    assert.equal(fs.existsSync(path.join(a.tools.tools, '.install.lock')), true);
+    assert.equal(fs.existsSync(path.join(a.f.target.home, '.arc-snapshot-setup.lock')), true);
+    await assert.rejects(a.tools.installCommands(process.execPath, a.f.signal), /Another Arc setup/);
+    assert.equal(a.tools.registration(a.f.target.home)?.complete, false);
+  },
+);
 
-test('bundled installed identity mismatch remains incomplete and preserves independent CLI selection', async () => {
-  const a = bundledFixture();
-  await a.tools.installCommands(process.execPath, a.f.signal);
-  const active = fs.readFileSync(path.join(a.tools.tools, 'active.json'));
-  a.mutation(async (command) => {
-    if (!command.args.includes('install')) return undefined;
-    a.f.entries([a.f.entry]);
-    return JSON.stringify({ command: 'install', outcome: 'ok' });
-  });
-  await assert.rejects(a.setup.install(a.f.target, a.f.signal), /different snapshot files/);
-  assert.deepEqual(fs.readFileSync(path.join(a.tools.tools, 'active.json')), active);
-  assert.equal(a.tools.registration(a.f.target.home)?.complete, false);
-  assert.equal(fs.existsSync(path.join(a.tools.tools, '.install.lock')), false);
-});
+test(
+  'bundled installed identity mismatch remains incomplete and preserves independent CLI selection',
+  { tags: ['subprocess'] },
+  async () => {
+    const a = bundledFixture();
+    await a.tools.installCommands(process.execPath, a.f.signal);
+    const active = fs.readFileSync(path.join(a.tools.tools, 'active.json'));
+    a.mutation(async (command) => {
+      if (!command.args.includes('install')) return undefined;
+      a.f.entries([a.f.entry]);
+      return JSON.stringify({ command: 'install', outcome: 'ok' });
+    });
+    await assert.rejects(a.setup.install(a.f.target, a.f.signal), /different snapshot files/);
+    assert.deepEqual(fs.readFileSync(path.join(a.tools.tools, 'active.json')), active);
+    assert.equal(a.tools.registration(a.f.target.home)?.complete, false);
+    assert.equal(fs.existsSync(path.join(a.tools.tools, '.install.lock')), false);
+  },
+);
 
 test('bundled software ownership is acquired before configuration ownership across roots', async () => {
   const a = bundledFixture();
@@ -1174,30 +1182,34 @@ test('bundled software ownership is acquired before configuration ownership acro
   assert.equal(foreign.f.mutations().length, 0);
 });
 
-test('bundled settled failed updates restore the prior catalog and keep the requested registration incomplete', async () => {
-  const a = bundledFixture();
-  await a.tools.installCommands(process.execPath, a.f.signal);
-  await a.setup.install(a.f.target, a.f.signal);
-  const b = bundledFixture('B', a.tools.root);
-  const changed = new ClaudePluginSetup(a.run, undefined, a.f.read, b.tools, () => 'node');
-  a.mutation(async () => {
-    throw new Error('Native update failed after publication.');
-  });
-  await assert.rejects(changed.install(a.f.target, a.f.signal), /Native update failed/);
-  const catalog = JSON.parse(
-    fs.readFileSync(
-      path.join(a.tools.configuration(a.f.target.home).source, '.claude-plugin/marketplace.json'),
-      'utf8',
-    ),
-  );
-  assert.equal(catalog.plugins[0].source, `./releases/${a.bundle.payload.contentId}/plugin`);
-  assert.equal(b.tools.registration(a.f.target.home)?.contentId, b.bundle.payload.contentId);
-  assert.equal(b.tools.registration(a.f.target.home)?.complete, false);
-  assert.equal(
-    JSON.parse(fs.readFileSync(path.join(a.tools.tools, 'active.json'), 'utf8')).contentId,
-    a.bundle.payload.contentId,
-  );
-});
+test(
+  'bundled settled failed updates restore the prior catalog and keep the requested registration incomplete',
+  { tags: ['subprocess'] },
+  async () => {
+    const a = bundledFixture();
+    await a.tools.installCommands(process.execPath, a.f.signal);
+    await a.setup.install(a.f.target, a.f.signal);
+    const b = bundledFixture('B', a.tools.root);
+    const changed = new ClaudePluginSetup(a.run, undefined, a.f.read, b.tools, () => 'node');
+    a.mutation(async () => {
+      throw new Error('Native update failed after publication.');
+    });
+    await assert.rejects(changed.install(a.f.target, a.f.signal), /Native update failed/);
+    const catalog = JSON.parse(
+      fs.readFileSync(
+        path.join(a.tools.configuration(a.f.target.home).source, '.claude-plugin/marketplace.json'),
+        'utf8',
+      ),
+    );
+    assert.equal(catalog.plugins[0].source, `./releases/${a.bundle.payload.contentId}/plugin`);
+    assert.equal(b.tools.registration(a.f.target.home)?.contentId, b.bundle.payload.contentId);
+    assert.equal(b.tools.registration(a.f.target.home)?.complete, false);
+    assert.equal(
+      JSON.parse(fs.readFileSync(path.join(a.tools.tools, 'active.json'), 'utf8')).contentId,
+      a.bundle.payload.contentId,
+    );
+  },
+);
 
 test('bundled enabled project and foreign user entries never change scope or payload', async () => {
   const a = bundledFixture();
@@ -1332,6 +1344,7 @@ test.each([
   [true, false],
 ])(
   'bundled partial command writes preserve selection and permit retry (previous %s, directory locked %s)',
+  { tags: ['subprocess'] },
   async (previous, locked) => {
     const a = bundledFixture();
     if (previous) await a.tools.installCommands(process.execPath, a.f.signal);
@@ -1382,61 +1395,69 @@ test.each([
   },
 );
 
-test('snapshot runtime admission rejects colliding workspace Node without executing it', () => {
-  const root = tempDir('arc-node-shadow-');
-  const project = path.join(root, 'project');
-  const workspaceBin = path.join(project, 'bin');
-  const externalBin = path.join(root, 'external');
-  fs.mkdirSync(workspaceBin, { recursive: true });
-  fs.mkdirSync(externalBin);
-  const executable = process.platform === 'win32' ? 'node.exe' : 'node';
-  fs.writeFileSync(path.join(workspaceBin, executable), 'workspace executable must never run');
-  fs.chmodSync(path.join(workspaceBin, executable), 0o755);
-  fs.copyFileSync(process.execPath, path.join(externalBin, executable));
-  fs.chmodSync(path.join(externalBin, executable), 0o755);
-  const separator = process.platform === 'win32' ? ';' : ':';
-  assert.equal(
-    resolveToolRuntime({ PATH: externalBin }, project),
-    fs.realpathSync.native(path.join(externalBin, executable)),
-  );
-  assert.throws(
-    () => resolveToolRuntime({ PATH: workspaceBin + separator + externalBin }, project),
-    /from this project/,
-  );
-});
-test('bundled command retry retains operation evidence when rollback storage also fails', async () => {
-  const a = bundledFixture();
-  await a.tools.installCommands(process.execPath, a.f.signal);
-  const bin = path.join(a.tools.root, 'bin');
-  const runtime = path.join(a.f.root, 'alternate-node' + (process.platform === 'win32' ? '.exe' : ''));
-  fs.copyFileSync(process.execPath, runtime);
-  fs.chmodSync(runtime, 0o755);
-  const active = fs.readFileSync(path.join(a.tools.tools, 'active.json'));
-  const launcher = fs.readFileSync(path.join(bin, 'arc'));
-  const rename = fs.renameSync;
-  const spy = vi.spyOn(fsBuiltin, 'renameSync').mockImplementation((from, to) => {
-    if (String(to) === path.join(bin, 'arc.cmd')) throw new Error('Persistent storage failure');
-    return rename(from, to);
-  });
-  syncBuiltinESMExports();
-  try {
-    await assert.rejects(a.tools.installCommands(runtime, a.f.signal), /Persistent storage/);
-  } finally {
-    spy.mockRestore();
+test(
+  'snapshot runtime admission rejects colliding workspace Node without executing it',
+  { tags: ['subprocess'] },
+  () => {
+    const root = tempDir('arc-node-shadow-');
+    const project = path.join(root, 'project');
+    const workspaceBin = path.join(project, 'bin');
+    const externalBin = path.join(root, 'external');
+    fs.mkdirSync(workspaceBin, { recursive: true });
+    fs.mkdirSync(externalBin);
+    const executable = process.platform === 'win32' ? 'node.exe' : 'node';
+    fs.writeFileSync(path.join(workspaceBin, executable), 'workspace executable must never run');
+    fs.chmodSync(path.join(workspaceBin, executable), 0o755);
+    fs.copyFileSync(process.execPath, path.join(externalBin, executable));
+    fs.chmodSync(path.join(externalBin, executable), 0o755);
+    const separator = process.platform === 'win32' ? ';' : ':';
+    assert.equal(
+      resolveToolRuntime({ PATH: externalBin }, project),
+      fs.realpathSync.native(path.join(externalBin, executable)),
+    );
+    assert.throws(
+      () => resolveToolRuntime({ PATH: workspaceBin + separator + externalBin }, project),
+      /from this project/,
+    );
+  },
+);
+test(
+  'bundled command retry retains operation evidence when rollback storage also fails',
+  { tags: ['subprocess'] },
+  async () => {
+    const a = bundledFixture();
+    await a.tools.installCommands(process.execPath, a.f.signal);
+    const bin = path.join(a.tools.root, 'bin');
+    const runtime = path.join(a.f.root, 'alternate-node' + (process.platform === 'win32' ? '.exe' : ''));
+    fs.copyFileSync(process.execPath, runtime);
+    fs.chmodSync(runtime, 0o755);
+    const active = fs.readFileSync(path.join(a.tools.tools, 'active.json'));
+    const launcher = fs.readFileSync(path.join(bin, 'arc'));
+    const rename = fs.renameSync;
+    const spy = vi.spyOn(fsBuiltin, 'renameSync').mockImplementation((from, to) => {
+      if (String(to) === path.join(bin, 'arc.cmd')) throw new Error('Persistent storage failure');
+      return rename(from, to);
+    });
     syncBuiltinESMExports();
-  }
-  const journal = path.join(a.tools.tools, 'command-operation.json');
-  assert.equal(fs.existsSync(journal), true);
-  fs.writeFileSync(path.join(bin, 'arc.cmd'), 'foreign bytes');
-  await assert.rejects(a.tools.installCommands(runtime, a.f.signal), /unfamiliar/);
-  assert.equal(fs.readFileSync(path.join(bin, 'arc.cmd'), 'utf8'), 'foreign bytes');
-  assert.deepEqual(fs.readFileSync(path.join(a.tools.tools, 'active.json')), active);
-  const operation = JSON.parse(fs.readFileSync(journal, 'utf8'));
-  fs.writeFileSync(path.join(bin, 'arc.cmd'), operation.previous['arc.cmd']);
-  await a.tools.installCommands(process.execPath, a.f.signal);
-  assert.equal(fs.existsSync(journal), false);
-  assert.deepEqual(fs.readFileSync(path.join(bin, 'arc')), launcher);
-});
+    try {
+      await assert.rejects(a.tools.installCommands(runtime, a.f.signal), /Persistent storage/);
+    } finally {
+      spy.mockRestore();
+      syncBuiltinESMExports();
+    }
+    const journal = path.join(a.tools.tools, 'command-operation.json');
+    assert.equal(fs.existsSync(journal), true);
+    fs.writeFileSync(path.join(bin, 'arc.cmd'), 'foreign bytes');
+    await assert.rejects(a.tools.installCommands(runtime, a.f.signal), /unfamiliar/);
+    assert.equal(fs.readFileSync(path.join(bin, 'arc.cmd'), 'utf8'), 'foreign bytes');
+    assert.deepEqual(fs.readFileSync(path.join(a.tools.tools, 'active.json')), active);
+    const operation = JSON.parse(fs.readFileSync(journal, 'utf8'));
+    fs.writeFileSync(path.join(bin, 'arc.cmd'), operation.previous['arc.cmd']);
+    await a.tools.installCommands(process.execPath, a.f.signal);
+    assert.equal(fs.existsSync(journal), false);
+    assert.deepEqual(fs.readFileSync(path.join(bin, 'arc')), launcher);
+  },
+);
 test.each(['win32', 'linux', 'darwin'] as const)(
   'snapshot Node shadow refusal follows host executable resolution (%s)',
   (platform) => {

@@ -1,3 +1,4 @@
+// @module-tag subprocess
 import { test, vi } from 'vitest';
 import assert from 'node:assert';
 import { spawn, spawnSync } from 'node:child_process';
@@ -14,38 +15,42 @@ import { callSources, sourceDoesNotMatch, sourceMatch } from '../test/source-con
 
 import { extensionRoot, embeddedHostIdentity, extractedExtension } from '../test/packaging.ts';
 
-test('native bridge correspondence accepts both checkout line endings and rejects source drift', () => {
-  const root = tempDir('arc-native-identity-');
-  const source = path.join(root, 'extension/src/windowpipe-source.ts');
-  const resources = path.join(root, 'extension/resources');
-  fs.mkdirSync(path.dirname(source), { recursive: true });
-  fs.mkdirSync(resources, { recursive: true });
-  fs.mkdirSync(path.join(root, 'scripts'));
-  fs.copyFileSync(
-    path.join(extensionRoot, '../scripts/windowpipe-build.mjs'),
-    path.join(root, 'scripts/windowpipe-build.mjs'),
-  );
-  fs.cpSync(path.join(extensionRoot, 'resources'), resources, { recursive: true });
-  const canonical = fs
-    .readFileSync(path.join(extensionRoot, 'src/windowpipe-source.ts'), 'utf8')
-    .replace(/\r\n/g, '\n');
-  const script = "import {copyWindowsPipe} from './scripts/windowpipe-build.mjs'; copyWindowsPipe('./dist');";
-  const copy = () =>
-    spawnSync(process.execPath, ['--input-type=module', '-e', script], { cwd: root, encoding: 'utf8' });
-  for (const ending of ['\n', '\r\n']) {
-    fs.writeFileSync(source, canonical.replace(/\n/g, ending));
-    const result = copy();
-    assert.equal(result.status, 0, result.stderr);
-    assert.deepEqual(
-      fs.readFileSync(path.join(root, 'dist/windowpipe.exe')),
-      fs.readFileSync(path.join(resources, 'windowpipe.exe')),
+test(
+  'native bridge correspondence accepts both checkout line endings and rejects source drift',
+  { tags: ['subprocess'] },
+  () => {
+    const root = tempDir('arc-native-identity-');
+    const source = path.join(root, 'extension/src/windowpipe-source.ts');
+    const resources = path.join(root, 'extension/resources');
+    fs.mkdirSync(path.dirname(source), { recursive: true });
+    fs.mkdirSync(resources, { recursive: true });
+    fs.mkdirSync(path.join(root, 'scripts'));
+    fs.copyFileSync(
+      path.join(extensionRoot, '../scripts/windowpipe-build.mjs'),
+      path.join(root, 'scripts/windowpipe-build.mjs'),
     );
-  }
-  fs.appendFileSync(source, '\n// Different native source\n');
-  const drift = copy();
-  assert.notEqual(drift.status, 0);
-  assert.match(drift.stderr, /does not match its source/);
-});
+    fs.cpSync(path.join(extensionRoot, 'resources'), resources, { recursive: true });
+    const canonical = fs
+      .readFileSync(path.join(extensionRoot, 'src/windowpipe-source.ts'), 'utf8')
+      .replace(/\r\n/g, '\n');
+    const script = "import {copyWindowsPipe} from './scripts/windowpipe-build.mjs'; copyWindowsPipe('./dist');";
+    const copy = () =>
+      spawnSync(process.execPath, ['--input-type=module', '-e', script], { cwd: root, encoding: 'utf8' });
+    for (const ending of ['\n', '\r\n']) {
+      fs.writeFileSync(source, canonical.replace(/\n/g, ending));
+      const result = copy();
+      assert.equal(result.status, 0, result.stderr);
+      assert.deepEqual(
+        fs.readFileSync(path.join(root, 'dist/windowpipe.exe')),
+        fs.readFileSync(path.join(resources, 'windowpipe.exe')),
+      );
+    }
+    fs.appendFileSync(source, '\n// Different native source\n');
+    const drift = copy();
+    assert.notEqual(drift.status, 0);
+    assert.match(drift.stderr, /does not match its source/);
+  },
+);
 
 test.each([false, true])(
   'extracted source builds without Git and never inherits an enclosing repository identity (enclosing repository: %s)',
@@ -173,127 +178,55 @@ test.each([false, true])(
   90_000,
 );
 
-test('watch startup invalidates identity from a preceding production build', async () => {
-  const { source } = extractedExtension('arc-watch-startup-');
-  const identity = path.join(source, 'dist', 'build-identity.json');
-  fs.mkdirSync(path.dirname(identity), { recursive: true });
-  fs.writeFileSync(identity, JSON.stringify({ version: '1.0.0', sourceCommit: 'a'.repeat(40), dirty: false }));
-  assert.ok(fs.existsSync(identity));
-  const watcher = spawn(process.execPath, ['esbuild.mjs', '--watch'], { cwd: source, stdio: 'ignore' });
-  try {
-    await vi.waitFor(() => assert.equal(fs.existsSync(identity), false), { timeout: 15_000 });
-  } finally {
-    const exited =
-      watcher.exitCode !== null
-        ? Promise.resolve()
-        : new Promise<void>((resolve) => watcher.once('exit', () => resolve()));
-    watcher.kill();
-    await exited;
-  }
-}, 30_000);
-
-test('CLI watching survives panel rebuilds and ends when the build closes', async () => {
-  const { root, sourceRoot, source } = extractedExtension('arc-cli-watch-');
-  const script =
-    "import { buildExtension } from './esbuild.mjs'; const close = await buildExtension({watch:true}); console.log('watch ready'); process.stdin.once('data', async () => { await close(); process.stdin.destroy(); });";
-  for (const file of [
-    'panelhost.ts',
-    'turncard.ts',
-    'launchpolicy.ts',
-    'repositoryscope.ts',
-    'sessionfilter.ts',
-    'domain/session-query.ts',
-    'diagnosticslog.ts',
-    'transcript.ts',
-    'exportlimits.ts',
-    'identity.ts',
-    'domain/identity.ts',
-    'domain/session-link.ts',
-    'domain/file-citation.ts',
-  ]) {
-    fs.copyFileSync(path.join(extensionRoot, 'src', file), path.join(source, 'src', file));
-  }
-  for (const args of [
-    ['init'],
-    [
-      '-c',
-      'user.name=Fixture',
-      '-c',
-      'user.email=fixture@example.invalid',
-      '-c',
-      'commit.gpgsign=false',
-      'commit',
-      '--allow-empty',
-      '-m',
-      'watch fixture',
-    ],
-  ]) {
-    const git = spawnSync('git', args, { cwd: sourceRoot, encoding: 'utf8' });
-    assert.equal(git.status, 0, git.stderr);
-  }
-  const watcher = spawn(process.execPath, ['--input-type=module', '-e', script], {
-    cwd: source,
-    stdio: ['pipe', 'pipe', 'pipe'],
-  });
-  let output = '';
-  watcher.stdout.on('data', (chunk) => {
-    output += chunk;
-  });
-  watcher.stderr.on('data', (chunk) => {
-    output += chunk;
-  });
-  try {
-    await vi.waitFor(() => assert.match(output, /watch ready/), { timeout: 15_000 });
-    assert.throws(() => readToolPackage(path.join(source, 'dist')), /ENOENT/);
-    const directory = await prepareEditorCommands(
-      path.join(source, 'dist'),
-      path.join(root, 'software'),
-      new AbortController().signal,
-      true,
-    );
-    assert.equal(directory, path.join(source, 'dist/bin'));
-    const developmentEnv = childEnv(process.env, {}, undefined, root, {
-      directory,
-      editorExecutable: process.execPath,
-      windowId: 'development-window',
-    });
-    const launch = () =>
-      spawnSync(
-        process.platform === 'win32' ? (process.env.ComSpec ?? 'cmd.exe') : '/bin/sh',
-        process.platform === 'win32' ? ['/d', '/c', 'arc --version'] : ['-c', 'arc --version'],
-        { env: developmentEnv, encoding: 'utf8' },
-      );
-    const version = launch();
-    assert.equal(version.status, 0, version.stderr);
-    assert.equal(
-      version.stdout.trim(),
-      `${JSON.parse(fs.readFileSync(path.join(source, 'package.json'), 'utf8')).version} (unknown)`,
-    );
-    await assert.rejects(
-      prepareEditorCommands(
-        path.join(source, 'dist'),
-        path.join(root, 'software'),
-        new AbortController().signal,
-        false,
-      ),
-      /ENOENT/,
-    );
-    const hostBundle = path.join(source, 'dist/extension.js');
-    await vi.waitFor(() => assert.equal(embeddedHostIdentity(hostBundle).unavailable, 'watch'), { timeout: 15_000 });
-    for (const marker of ['host health watch one', 'host health watch two']) {
-      fs.appendFileSync(path.join(source, 'src/diagnosticslog.ts'), `\nconsole.log('${marker}');\n`);
-      await vi.waitFor(() => assert.ok(fs.readFileSync(hostBundle, 'utf8').includes(marker)), { timeout: 15_000 });
-      assert.deepEqual(embeddedHostIdentity(hostBundle), {
-        sourceCommit: null,
-        dirty: null,
-        builtAt: 0,
-        unavailable: 'watch',
-      });
+test(
+  'watch startup invalidates identity from a preceding production build',
+  { tags: ['subprocess'], timeout: 30_000 },
+  async () => {
+    const { source } = extractedExtension('arc-watch-startup-');
+    const identity = path.join(source, 'dist', 'build-identity.json');
+    fs.mkdirSync(path.dirname(identity), { recursive: true });
+    fs.writeFileSync(identity, JSON.stringify({ version: '1.0.0', sourceCommit: 'a'.repeat(40), dirty: false }));
+    assert.ok(fs.existsSync(identity));
+    const watcher = spawn(process.execPath, ['esbuild.mjs', '--watch'], { cwd: source, stdio: 'ignore' });
+    try {
+      await vi.waitFor(() => assert.equal(fs.existsSync(identity), false), { timeout: 15_000 });
+    } finally {
+      const exited =
+        watcher.exitCode !== null
+          ? Promise.resolve()
+          : new Promise<void>((resolve) => watcher.once('exit', () => resolve()));
+      watcher.kill();
+      await exited;
     }
-    fs.appendFileSync(path.join(source, 'src/webview/panel.css'), '\n/* watch fixture */\n');
-    await vi.waitFor(() => assert.match(output, /rebuilt: the panel source changed/), { timeout: 15_000 });
-    const committed = spawnSync(
-      'git',
+  },
+);
+
+test(
+  'CLI watching survives panel rebuilds and ends when the build closes',
+  { tags: ['subprocess'], timeout: 60_000 },
+  async () => {
+    const { root, sourceRoot, source } = extractedExtension('arc-cli-watch-');
+    const script =
+      "import { buildExtension } from './esbuild.mjs'; const close = await buildExtension({watch:true}); console.log('watch ready'); process.stdin.once('data', async () => { await close(); process.stdin.destroy(); });";
+    for (const file of [
+      'panelhost.ts',
+      'turncard.ts',
+      'launchpolicy.ts',
+      'repositoryscope.ts',
+      'sessionfilter.ts',
+      'domain/session-query.ts',
+      'diagnosticslog.ts',
+      'transcript.ts',
+      'exportlimits.ts',
+      'identity.ts',
+      'domain/identity.ts',
+      'domain/session-link.ts',
+      'domain/file-citation.ts',
+    ]) {
+      fs.copyFileSync(path.join(extensionRoot, 'src', file), path.join(source, 'src', file));
+    }
+    for (const args of [
+      ['init'],
       [
         '-c',
         'user.name=Fixture',
@@ -304,28 +237,108 @@ test('CLI watching survives panel rebuilds and ends when the build closes', asyn
         'commit',
         '--allow-empty',
         '-m',
-        'next watch revision',
+        'watch fixture',
       ],
-      { cwd: sourceRoot, encoding: 'utf8' },
-    );
-    assert.equal(committed.status, 0, committed.stderr);
-    fs.appendFileSync(path.join(sourceRoot, 'cli/src/main.ts'), "\nconsole.log('cli watch fixture');\n");
-    await vi.waitFor(
-      () => assert.ok(fs.readFileSync(path.join(source, 'dist/cli.cjs'), 'utf8').includes('cli watch fixture')),
-      { timeout: 15_000 },
-    );
-    assert.match(launch().stdout, /cli watch fixture/);
-    assert.ok(launch().stdout.includes('(unknown)'));
-    watcher.stdin.end('close');
-    await vi.waitFor(() => assert.equal(watcher.exitCode, 0), { timeout: 15_000 });
-  } finally {
-    if (watcher.exitCode === null) {
-      const exited = new Promise<void>((resolve) => watcher.once('exit', () => resolve()));
-      watcher.kill();
-      await exited;
+    ]) {
+      const git = spawnSync('git', args, { cwd: sourceRoot, encoding: 'utf8' });
+      assert.equal(git.status, 0, git.stderr);
     }
-  }
-}, 60_000);
+    const watcher = spawn(process.execPath, ['--input-type=module', '-e', script], {
+      cwd: source,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    let output = '';
+    watcher.stdout.on('data', (chunk) => {
+      output += chunk;
+    });
+    watcher.stderr.on('data', (chunk) => {
+      output += chunk;
+    });
+    try {
+      await vi.waitFor(() => assert.match(output, /watch ready/), { timeout: 15_000 });
+      assert.throws(() => readToolPackage(path.join(source, 'dist')), /ENOENT/);
+      const directory = await prepareEditorCommands(
+        path.join(source, 'dist'),
+        path.join(root, 'software'),
+        new AbortController().signal,
+        true,
+      );
+      assert.equal(directory, path.join(source, 'dist/bin'));
+      const developmentEnv = childEnv(process.env, {}, undefined, root, {
+        directory,
+        editorExecutable: process.execPath,
+        windowId: 'development-window',
+      });
+      const launch = () =>
+        spawnSync(
+          process.platform === 'win32' ? (process.env.ComSpec ?? 'cmd.exe') : '/bin/sh',
+          process.platform === 'win32' ? ['/d', '/c', 'arc --version'] : ['-c', 'arc --version'],
+          { env: developmentEnv, encoding: 'utf8' },
+        );
+      const version = launch();
+      assert.equal(version.status, 0, version.stderr);
+      assert.equal(
+        version.stdout.trim(),
+        `${JSON.parse(fs.readFileSync(path.join(source, 'package.json'), 'utf8')).version} (unknown)`,
+      );
+      await assert.rejects(
+        prepareEditorCommands(
+          path.join(source, 'dist'),
+          path.join(root, 'software'),
+          new AbortController().signal,
+          false,
+        ),
+        /ENOENT/,
+      );
+      const hostBundle = path.join(source, 'dist/extension.js');
+      await vi.waitFor(() => assert.equal(embeddedHostIdentity(hostBundle).unavailable, 'watch'), { timeout: 15_000 });
+      for (const marker of ['host health watch one', 'host health watch two']) {
+        fs.appendFileSync(path.join(source, 'src/diagnosticslog.ts'), `\nconsole.log('${marker}');\n`);
+        await vi.waitFor(() => assert.ok(fs.readFileSync(hostBundle, 'utf8').includes(marker)), { timeout: 15_000 });
+        assert.deepEqual(embeddedHostIdentity(hostBundle), {
+          sourceCommit: null,
+          dirty: null,
+          builtAt: 0,
+          unavailable: 'watch',
+        });
+      }
+      fs.appendFileSync(path.join(source, 'src/webview/panel.css'), '\n/* watch fixture */\n');
+      await vi.waitFor(() => assert.match(output, /rebuilt: the panel source changed/), { timeout: 15_000 });
+      const committed = spawnSync(
+        'git',
+        [
+          '-c',
+          'user.name=Fixture',
+          '-c',
+          'user.email=fixture@example.invalid',
+          '-c',
+          'commit.gpgsign=false',
+          'commit',
+          '--allow-empty',
+          '-m',
+          'next watch revision',
+        ],
+        { cwd: sourceRoot, encoding: 'utf8' },
+      );
+      assert.equal(committed.status, 0, committed.stderr);
+      fs.appendFileSync(path.join(sourceRoot, 'cli/src/main.ts'), "\nconsole.log('cli watch fixture');\n");
+      await vi.waitFor(
+        () => assert.ok(fs.readFileSync(path.join(source, 'dist/cli.cjs'), 'utf8').includes('cli watch fixture')),
+        { timeout: 15_000 },
+      );
+      assert.match(launch().stdout, /cli watch fixture/);
+      assert.ok(launch().stdout.includes('(unknown)'));
+      watcher.stdin.end('close');
+      await vi.waitFor(() => assert.equal(watcher.exitCode, 0), { timeout: 15_000 });
+    } finally {
+      if (watcher.exitCode === null) {
+        const exited = new Promise<void>((resolve) => watcher.once('exit', () => resolve()));
+        watcher.kill();
+        await exited;
+      }
+    }
+  },
+);
 
 // A single-star ignore pattern does not cross directory separators. Excluded file types need recursive patterns.
 
@@ -568,7 +581,7 @@ function vsixNames(root: string, worktrees: string[] = registeredWorktrees(root)
   return names;
 }
 
-test('the product-text list includes tracked and nonignored untracked text', () => {
+test('the product-text list includes tracked and nonignored untracked text', { tags: ['subprocess'] }, () => {
   const root = tempDir('product-files-');
   fs.writeFileSync(path.join(root, '.gitignore'), 'ignored.md\n');
   fs.writeFileSync(path.join(root, 'tracked.md'), 'tracked');
@@ -652,7 +665,7 @@ test.runIf(process.platform === 'win32')(
 const LEGACY_WORDS = ['agent', 'timeline'];
 const LEGACY_NAME = new RegExp(LEGACY_WORDS.join('[ _-]?'), 'gi');
 
-test('the earlier product name appears nowhere', () => {
+test('the earlier product name appears nowhere', { tags: ['subprocess'] }, () => {
   const root = path.join(__dirname, '..', '..');
   const files = repositoryProductFiles(root).text;
   assert.ok(files.length > 40, `only ${files.length} files were read, so this guard measured almost nothing`);
@@ -682,7 +695,7 @@ function staleVsixNames(root: string, worktrees?: string[]): string[] {
   });
 }
 
-test('the VSIX-name scan catches ignored retired packages without reading them', () => {
+test('the VSIX-name scan catches ignored retired packages without reading them', { tags: ['subprocess'] }, () => {
   const root = tempDir('stale-vsix-');
   const stale = path.join(root, 'agent-diff-review.VSIX');
   fs.writeFileSync(path.join(root, '.gitignore'), '*.vsix\n');
@@ -691,7 +704,7 @@ test('the VSIX-name scan catches ignored retired packages without reading them',
   assert.deepEqual(staleVsixNames(root, []), [stale]);
 });
 
-test('no build packaged under the retired name is left in the tree', () => {
+test('no build packaged under the retired name is left in the tree', { tags: ['subprocess'] }, () => {
   const root = path.join(__dirname, '..', '..');
   const named = staleVsixNames(root).map((file) => path.relative(root, file));
   assert.deepEqual(

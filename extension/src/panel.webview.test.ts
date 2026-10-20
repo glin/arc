@@ -1346,408 +1346,438 @@ import {
   webviewPanelState,
 } from './turnview';
 
-test('accepted explicit session reads reopen persisted exhausted metadata recovery', async () => {
-  const directory = tempDir('panel-metadata-explicit-');
-  const file = path.join(directory, 'session.jsonl');
-  const record = (payload: object) =>
-    JSON.stringify({ type: 'event_msg', timestamp: '2026-08-26T13:30:37Z', payload }) + '\n';
-  fs.writeFileSync(
-    file,
-    record({ type: 'task_started', turn_id: 'large' }) +
-      record({ type: 'agent_message', phase: 'commentary', message: 'x'.repeat(1024) }) +
-      (JSON.stringify({ type: 'ignored', body: 'x'.repeat(1024) }) + '\n').repeat(17_000),
-  );
-  const stat = revisionOf(fs.statSync(file, { bigint: true }));
-  const session = { file, sessionId: '0', agent: 'codex', size: stat.size, mtimeMs: stat.mtimeMs };
-  const fixture = metadataEnrichmentFixture([session]);
-  const run = fixture.worker.run.bind(fixture.worker);
-  fixture.worker.run = (request, generation, signal) =>
-    run(request.kind === 'metadata-recovery' ? { ...request, recordBytes: 512 } : request, generation, signal);
-  try {
-    await fixture.pass();
-    assert.equal(fixture.provider.titles.get(file).metadataWindow.exhausted, true);
-    const before = fixture.requests.filter((request) => request.kind === 'metadata-recovery').length;
-    await fixture.pass();
-    assert.equal(fixture.requests.filter((request) => request.kind === 'metadata-recovery').length, before);
-    Object.assign(fixture.provider, {
-      showing: '0',
-      updateHistoryAfterAcceptedWindow() {},
-      progressiveInput: () => ({ session, folders: [], children: [], maxTurns: 40, tailBytes: 4096 }),
-    });
-    let checkpoints = 0;
-    fixture.provider.derivedCacheCheckpointState = {
-      markChanged() {
-        checkpoints++;
-      },
-    };
-    let selected!: Promise<void>;
-    const complete = fixture.provider.completeSelectedWindow.bind(fixture.provider);
-    fixture.provider.completeSelectedWindow = (...args: any[]) => (selected = complete(...args));
-    fixture.provider.show('0');
-    await selected;
-    assert.equal(fixture.provider.titles.get(file).metadataWindow.exhausted, undefined);
-    assert.equal(fixture.provider.metadataReadIntent, null);
-    assert.equal(checkpoints, 1);
-    const cache = path.join(directory, 'derived.json');
-    saveDerivedCache(cache, fixture.provider.titles);
-    fixture.provider.titles = loadDerivedCache(cache).titles;
-    assert.ok(railEnrichmentNeeds(fixture.provider.titles.get(file), session)?.recovery);
-    await fixture.pass();
-    assert.ok(fixture.requests.filter((request) => request.kind === 'metadata-recovery').length > before);
-    assert.equal(fixture.provider.titles.get(file).metadataWindow.exhausted, true);
-    await fixture.provider.completeSelectedWindow('0', fixture.provider.selectionGeneration);
-    assert.equal(fixture.provider.titles.get(file).metadataWindow.exhausted, true);
-  } finally {
-    fixture.worker.stop();
-    fs.rmSync(directory, { recursive: true, force: true });
-  }
-});
-
-test('an entry exhausted under the earlier recovery rule reads once more and then stays exhausted', async () => {
-  const directory = tempDir('panel-metadata-earlier-rule-');
-  const file = path.join(directory, 'session.jsonl');
-  const record = (payload: object) =>
-    JSON.stringify({ type: 'event_msg', timestamp: '2026-08-26T13:30:37Z', payload }) + '\n';
-  fs.writeFileSync(
-    file,
-    record({ type: 'task_started', turn_id: 'large' }) +
-      record({ type: 'agent_message', phase: 'commentary', message: 'x'.repeat(1024) }) +
-      (JSON.stringify({ type: 'ignored', body: 'x'.repeat(1024) }) + '\n').repeat(17_000),
-  );
-  const stat = revisionOf(fs.statSync(file, { bigint: true }));
-  const session = { file, sessionId: '0', agent: 'codex', size: stat.size, mtimeMs: stat.mtimeMs };
-  const fixture = metadataEnrichmentFixture([session]);
-  const run = fixture.worker.run.bind(fixture.worker);
-  fixture.worker.run = (request, generation, signal) =>
-    run(request.kind === 'metadata-recovery' ? { ...request, recordBytes: 512 } : request, generation, signal);
-  const recoveries = () => fixture.requests.filter((request) => request.kind === 'metadata-recovery').length;
-  try {
-    await fixture.pass();
-    const exhausted = fixture.provider.titles.get(file);
-    assert.deepEqual(
-      [exhausted.metadataWindow.exhausted, exhausted.metadataWindow.exhaustedRule],
-      [true, METADATA_EXHAUSTED_RULE],
-    );
-    // A cache saved before the rule field existed carries the bare exhausted flag.
-    const { exhaustedRule: _rule, ...earlier } = exhausted.metadataWindow;
-    fixture.provider.titles.set(file, { ...exhausted, metadataWindow: earlier });
-    const before = recoveries();
-    await fixture.pass();
-    assert.ok(recoveries() > before, 'the earlier exhaustion was not read again');
-    assert.equal(fixture.provider.titles.get(file).metadataWindow.exhaustedRule, METADATA_EXHAUSTED_RULE);
-    const retried = recoveries();
-    await fixture.pass();
-    assert.equal(recoveries(), retried, 'the same revision was read again under the current rule');
-  } finally {
-    fixture.worker.stop();
-    fs.rmSync(directory, { recursive: true, force: true });
-  }
-});
-
-test('restored exhausted selection stays suppressed through an ordinary refresh', async () => {
-  const directory = tempDir('panel-metadata-restored-');
-  const file = path.join(directory, 'session.jsonl');
-  fs.writeFileSync(
-    file,
-    JSON.stringify({ type: 'event_msg', payload: { type: 'task_started', turn_id: 'open' } }) +
-      '\n' +
-      JSON.stringify({
-        type: 'event_msg',
-        payload: { type: 'agent_message', phase: 'commentary', message: 'x'.repeat(1024) },
-      }) +
-      '\n' +
-      (JSON.stringify({ type: 'ignored', body: 'x'.repeat(1024) }) + '\n').repeat(17_000),
-  );
-  const stat = revisionOf(fs.statSync(file, { bigint: true }));
-  const session = { file, sessionId: '0', agent: 'codex', size: stat.size, mtimeMs: stat.mtimeMs };
-  const fixture = metadataEnrichmentFixture([session]);
-  const run = fixture.worker.run.bind(fixture.worker);
-  fixture.worker.run = (request, generation, signal) =>
-    run(request.kind === 'metadata-recovery' ? { ...request, recordBytes: 512 } : request, generation, signal);
-  try {
-    await fixture.pass();
-    assert.equal(fixture.provider.titles.get(file).metadataWindow.exhausted, true);
-    const before = fixture.requests.filter((request) => request.kind === 'metadata-recovery').length;
-    const cache = path.join(directory, 'derived.json');
-    saveDerivedCache(cache, fixture.provider.titles);
-    fixture.provider.titles = loadDerivedCache(cache).titles;
-    Object.assign(fixture.provider, {
-      showing: '0',
-      shownSessions: () => [session],
-      updateHistoryAfterAcceptedWindow() {},
-      progressiveInput: () => ({ session, folders: [], children: [], maxTurns: 40, tailBytes: 4096 }),
-    });
-    let selected!: Promise<void>;
-    const complete = fixture.provider.completeSelectedWindow.bind(fixture.provider);
-    fixture.provider.completeSelectedWindow = (...args: any[]) => (selected = complete(...args));
-    await PanelProvider.prototype.refresh.call(fixture.provider, false, true);
-    await selected;
-    assert.ok(fixture.requests.some((request) => request.kind === 'window'));
-    assert.equal(fixture.provider.titles.get(file).metadataWindow.exhausted, true);
-    await fixture.pass();
-    assert.equal(fixture.requests.filter((request) => request.kind === 'metadata-recovery').length, before);
-  } finally {
-    fixture.worker.stop();
-    fs.rmSync(directory, { recursive: true, force: true });
-  }
-});
-
-test('automatic Claude attachment continuation preserves exhausted metadata after reader acceptance', async () => {
-  const directory = tempDir('panel-metadata-attachment-');
-  const file = path.join(directory, 'session.jsonl');
-  fs.writeFileSync(
-    file,
-    [
-      { type: 'attachment', attachment: { type: 'model', identity: { modelId: 'claude-opus-5-5[1m]' } } },
-      { type: 'user', timestamp: new Date(0).toISOString(), message: { role: 'user', content: 'x'.repeat(1024) } },
-      ...Array.from({ length: 1070 }, () => ({ type: 'ignored', text: 'x'.repeat(16384) })),
-      { type: 'user', timestamp: new Date(1000).toISOString(), message: { role: 'user', content: 'Go' } },
-      {
-        type: 'assistant',
-        timestamp: new Date(2000).toISOString(),
-        message: { role: 'assistant', model: 'claude-opus-5-5', content: [{ type: 'text', text: 'Working' }] },
-      },
-    ]
-      .map((record) => JSON.stringify(record))
-      .join('\n') + '\n',
-  );
-  const stat = revisionOf(fs.statSync(file, { bigint: true }));
-  const session = { file, sessionId: '0', agent: 'claude', size: stat.size, mtimeMs: stat.mtimeMs };
-  const fixture = metadataEnrichmentFixture([session]);
-  const run = fixture.worker.run.bind(fixture.worker);
-  let windows = 0;
-  fixture.worker.run = async (request, generation, signal) => {
-    if (request.kind === 'window' && ++windows === 2) {
-      await fixture.pass();
-      assert.equal(fixture.provider.titles.get(file).metadataWindow.exhausted, true);
-    }
-    return run(request.kind === 'metadata-recovery' ? { ...request, recordBytes: 512 } : request, generation, signal);
-  };
-  try {
-    await fixture.provider.prepareMetadata([session], 1, new AbortController().signal);
-    Object.assign(fixture.provider, {
-      updateHistoryAfterAcceptedWindow() {},
-      progressiveInput: () => ({ session, folders: [], children: [], maxTurns: 40, tailBytes: 2048 }),
-    });
-    const complete = fixture.provider.completeSelectedWindow.bind(fixture.provider);
-    const completions: Promise<void>[] = [];
-    let accepted = 0;
-    fixture.provider.completeSelectedWindow = (...args: any[]) => {
-      const completion = complete(...args).then(() => {
-        accepted++;
-        assert.equal(fixture.provider.metadataReadIntent, null);
-        if (accepted > 1) {
-          assert.equal(fixture.provider.titles.get(file).metadataWindow.exhausted, true);
-        }
-      });
-      completions.push(completion);
-      return completion;
-    };
-    fixture.provider.show('0');
-    await vi.waitFor(
-      () => {
-        assert.ok(accepted > 1);
-        assert.equal(fixture.provider.cache.get(file)?.checkpoint.attachmentRecovery.status, 'complete');
-        assert.equal(fixture.provider.selectionWork, null);
-      },
-      { timeout: 10000 },
-    );
-    await Promise.all(completions);
-    assert.equal(fixture.provider.titles.get(file).metadataWindow.exhausted, true);
-    await fixture.pass();
-    assert.equal(fixture.requests.filter((request) => request.kind === 'metadata-recovery').length, 1);
-  } finally {
-    fixture.worker.stop();
-    fs.rmSync(directory, { recursive: true, force: true });
-  }
-});
-
-test('accepted older history reopens recovery without replacing uncertain current metadata', async () => {
-  const directory = tempDir('panel-metadata-older-');
-  const file = path.join(directory, 'session.jsonl');
-  const record = (payload: object, second: number) => ({
-    type: 'event_msg',
-    timestamp: new Date(second * 1000).toISOString(),
-    payload,
-  });
-  fs.writeFileSync(
-    file,
-    [
-      record({ type: 'task_started', turn_id: 'old' }, 1),
-      record({ type: 'user_message', message: 'Older request' + 'x'.repeat(1024) }, 1),
-      {
-        type: 'turn_context',
-        timestamp: new Date(2000).toISOString(),
-        payload: { model: 'gpt-5-codex', turn_id: 'old' },
-      },
-      record(
-        {
-          type: 'token_count',
-          info: {
-            last_token_usage: { input_tokens: 12000, output_tokens: 50 },
-            total_token_usage: { input_tokens: 12000, output_tokens: 50 },
-            model_context_window: 200000,
-          },
-        },
-        2,
-      ),
-      record({ type: 'task_complete', turn_id: 'old', last_agent_message: 'Finished' }, 3),
-      record({ type: 'task_started', turn_id: 'current' }, 4),
-      record({ type: 'user_message', message: 'Current request' }, 4),
-    ]
-      .map((record) => JSON.stringify(record))
-      .join('\n') +
-      '\n' +
-      (JSON.stringify({ type: 'ignored', body: 'x'.repeat(1024) }) + '\n').repeat(17_000),
-  );
-  const stat = revisionOf(fs.statSync(file, { bigint: true }));
-  const session = { file, sessionId: '0', agent: 'codex', size: stat.size, mtimeMs: stat.mtimeMs };
-  const fixture = metadataEnrichmentFixture([session]);
-  const run = fixture.worker.run.bind(fixture.worker);
-  fixture.worker.run = (request, generation, signal) =>
-    run(request.kind === 'metadata-recovery' ? { ...request, recordBytes: 512 } : request, generation, signal);
-  try {
-    await fixture.pass();
-    assert.equal(fixture.provider.titles.get(file).metadataWindow.exhausted, true);
-    const current = readCodexSession(file, '0', { maxTurns: 1, tailBytes: stat.size });
-    assert.equal(current.turns.at(-1)?.prompt, 'Current request');
-    Object.assign(fixture.provider, {
-      showing: '0',
-      readWindows: new Map([['0', { loadedTurns: 1 }]]),
-      historyGeneration: 0,
-      progressiveInput: () => ({ session, folders: [], children: [], maxTurns: 40, tailBytes: 4096 }),
-    });
-    fixture.provider.cache.set(file, { read: current });
-    await fixture.provider.loadOlderHistory('0');
-    const older = fixture.provider.history.get('0').pages.flatMap((page: any) => page.turns);
-    assert.ok(older.some((turn: any) => turn.prompt.startsWith('Older request') && turn.contextTokens > 0));
-    const accepted = fixture.provider.titles.get(file);
-    assert.equal(accepted.metadataWindow.exhausted, undefined);
-    assert.equal(accepted.stats, null);
-    assert.equal(accepted.outcome, null);
-    assert.equal(railEnrichmentNeeds(accepted, session)?.recovery, true);
-    const cache = path.join(directory, 'derived.json');
-    saveDerivedCache(cache, fixture.provider.titles);
-    const restored = loadDerivedCache(cache).titles.get(file)!;
-    assert.equal(restored.stats, null);
-    assert.equal(restored.outcome, null);
-    assert.equal(railEnrichmentNeeds(restored, session)?.recovery, true);
-  } finally {
-    fixture.worker.stop();
-    fs.rmSync(directory, { recursive: true, force: true });
-  }
-});
-
-test('completed Claude metadata recovery preserves genuine tail background commands', async () => {
-  const directory = tempDir('panel-metadata-command-');
-  const file = path.join(directory, 'session.jsonl');
-  const records = [
-    {
-      type: 'user',
-      promptId: 'p1',
-      timestamp: '2026-08-26T13:30:37Z',
-      message: { role: 'user', content: 'run the suite' },
-    },
-    {
-      type: 'assistant',
-      timestamp: '2026-08-26T13:30:38Z',
-      message: {
-        role: 'assistant',
-        model: 'claude-opus-5',
-        stop_reason: 'tool_use',
-        content: [
-          { type: 'tool_use', id: 'cmd1', name: 'Bash', input: { command: 'npm test', run_in_background: true } },
-        ],
-      },
-    },
-    {
-      type: 'user',
-      timestamp: '2026-08-26T13:30:39Z',
-      message: {
-        role: 'user',
-        content: [{ type: 'tool_result', tool_use_id: 'cmd1', content: 'Command running in background with ID: bg1' }],
-      },
-      toolUseResult: { stdout: '', stderr: '', interrupted: false, backgroundTaskId: 'bg1' },
-    },
-    {
-      type: 'assistant',
-      timestamp: '2026-08-26T13:30:40Z',
-      message: {
-        role: 'assistant',
-        id: 'm1',
-        model: 'claude-opus-5',
-        stop_reason: 'end_turn',
-        content: [{ type: 'text', text: 'The suite runs in the background.' }],
-      },
-    },
-  ];
-  fs.writeFileSync(
-    file,
-    (JSON.stringify({ type: 'ignored', body: 'x'.repeat(1024) }) + '\n').repeat(17_000) +
-      records.map((record) => JSON.stringify(record)).join('\n') +
-      '\n',
-  );
-  const stat = revisionOf(fs.statSync(file, { bigint: true }));
-  const session = { file, sessionId: '0', agent: 'claude', size: stat.size, mtimeMs: stat.mtimeMs };
-  const fixture = metadataEnrichmentFixture([session]);
-  try {
-    await fixture.provider.prepareMetadata([session], 1, new AbortController().signal);
-    const commands = fixture.provider.titles.get(file).outcome.backgroundCommands;
-    assert.equal(commands.length, 1);
-    assert.equal(fixture.provider.titles.get(file).stats?.turns.at(-1).contextWindow, null);
-    for (let pass = 0; pass < 4; pass++) await fixture.pass();
-    const entry = fixture.provider.titles.get(file);
-    assert.equal(entry.expandedStatsRead, true);
-    assert.deepEqual(entry.outcome.backgroundCommands, commands);
-  } finally {
-    fixture.worker.stop();
-    fs.rmSync(directory, { recursive: true, force: true });
-  }
-});
-
-test('persistent recovery admission failures release the provider queue for later sessions', async () => {
-  const directory = tempDir('panel-metadata-fairness-');
-  const files = ['failed', 'healthy'].map((name) => path.join(directory, name + '.jsonl'));
-  const padding = (JSON.stringify({ type: 'ignored', body: 'x'.repeat(1024) }) + '\n').repeat(17_000);
-  for (const file of files)
+test(
+  'accepted explicit session reads reopen persisted exhausted metadata recovery',
+  { tags: ['subprocess'] },
+  async () => {
+    const directory = tempDir('panel-metadata-explicit-');
+    const file = path.join(directory, 'session.jsonl');
+    const record = (payload: object) =>
+      JSON.stringify({ type: 'event_msg', timestamp: '2026-08-26T13:30:37Z', payload }) + '\n';
     fs.writeFileSync(
       file,
-      JSON.stringify({ type: 'event_msg', payload: { type: 'task_started', turn_id: 'empty' } }) + '\n' + padding,
+      record({ type: 'task_started', turn_id: 'large' }) +
+        record({ type: 'agent_message', phase: 'commentary', message: 'x'.repeat(1024) }) +
+        (JSON.stringify({ type: 'ignored', body: 'x'.repeat(1024) }) + '\n').repeat(17_000),
     );
-  const sessions = files.map((file, i) => ({
-    file,
-    sessionId: String(i),
-    agent: 'codex',
-    size: fs.statSync(file).size,
-    mtimeMs: fs.statSync(file).mtimeMs,
-  }));
-  const marker = path.join(directory, 'refuse');
-  const source =
-    progressiveWorkerSource +
-    `\nconst nativeStat = require('node:fs').statSync; require('node:fs').statSync = (...args) => { if (args[0] === ${JSON.stringify(files[0])} && require('node:fs').existsSync(${JSON.stringify(marker)})) throw new Error('refused stat'); return nativeStat(...args); };`;
-  const fixture = metadataEnrichmentFixture(sessions, source);
-  try {
-    await fixture.pass();
-    assert.equal(fixture.provider.metadataRecoverySession, '0');
-    fs.writeFileSync(marker, 'refuse');
-    for (let pass = 0; pass < 7; pass++) await fixture.pass();
-    assert.equal(
-      fixture.provider.titles.get(files[1]).expandedStatsRead,
-      true,
-      'the failed active owner stranded the healthy waiting session',
-    );
-    assert.ok(railEnrichmentNeeds(fixture.provider.titles.get(files[0]), sessions[0])?.recovery);
-    assert.ok(
-      fixture.requests.filter((request) => request.kind === 'metadata-recovery' && request.session.file === files[0])
-        .length > 2,
-    );
-  } finally {
-    fixture.worker.stop();
-    fs.rmSync(directory, { recursive: true, force: true });
-  }
-});
+    const stat = revisionOf(fs.statSync(file, { bigint: true }));
+    const session = { file, sessionId: '0', agent: 'codex', size: stat.size, mtimeMs: stat.mtimeMs };
+    const fixture = metadataEnrichmentFixture([session]);
+    const run = fixture.worker.run.bind(fixture.worker);
+    fixture.worker.run = (request, generation, signal) =>
+      run(request.kind === 'metadata-recovery' ? { ...request, recordBytes: 512 } : request, generation, signal);
+    try {
+      await fixture.pass();
+      assert.equal(fixture.provider.titles.get(file).metadataWindow.exhausted, true);
+      const before = fixture.requests.filter((request) => request.kind === 'metadata-recovery').length;
+      await fixture.pass();
+      assert.equal(fixture.requests.filter((request) => request.kind === 'metadata-recovery').length, before);
+      Object.assign(fixture.provider, {
+        showing: '0',
+        updateHistoryAfterAcceptedWindow() {},
+        progressiveInput: () => ({ session, folders: [], children: [], maxTurns: 40, tailBytes: 4096 }),
+      });
+      let checkpoints = 0;
+      fixture.provider.derivedCacheCheckpointState = {
+        markChanged() {
+          checkpoints++;
+        },
+      };
+      let selected!: Promise<void>;
+      const complete = fixture.provider.completeSelectedWindow.bind(fixture.provider);
+      fixture.provider.completeSelectedWindow = (...args: any[]) => (selected = complete(...args));
+      fixture.provider.show('0');
+      await selected;
+      assert.equal(fixture.provider.titles.get(file).metadataWindow.exhausted, undefined);
+      assert.equal(fixture.provider.metadataReadIntent, null);
+      assert.equal(checkpoints, 1);
+      const cache = path.join(directory, 'derived.json');
+      saveDerivedCache(cache, fixture.provider.titles);
+      fixture.provider.titles = loadDerivedCache(cache).titles;
+      assert.ok(railEnrichmentNeeds(fixture.provider.titles.get(file), session)?.recovery);
+      await fixture.pass();
+      assert.ok(fixture.requests.filter((request) => request.kind === 'metadata-recovery').length > before);
+      assert.equal(fixture.provider.titles.get(file).metadataWindow.exhausted, true);
+      await fixture.provider.completeSelectedWindow('0', fixture.provider.selectionGeneration);
+      assert.equal(fixture.provider.titles.get(file).metadataWindow.exhausted, true);
+    } finally {
+      fixture.worker.stop();
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  },
+);
 
-function metadataEnrichmentFixture(sessions: any[], source = progressiveWorkerSource) {
+test(
+  'an entry exhausted under the earlier recovery rule reads once more and then stays exhausted',
+  { tags: ['subprocess'] },
+  async () => {
+    const directory = tempDir('panel-metadata-earlier-rule-');
+    const file = path.join(directory, 'session.jsonl');
+    const record = (payload: object) =>
+      JSON.stringify({ type: 'event_msg', timestamp: '2026-08-26T13:30:37Z', payload }) + '\n';
+    fs.writeFileSync(
+      file,
+      record({ type: 'task_started', turn_id: 'large' }) +
+        record({ type: 'agent_message', phase: 'commentary', message: 'x'.repeat(1024) }) +
+        (JSON.stringify({ type: 'ignored', body: 'x'.repeat(1024) }) + '\n').repeat(17_000),
+    );
+    const stat = revisionOf(fs.statSync(file, { bigint: true }));
+    const session = { file, sessionId: '0', agent: 'codex', size: stat.size, mtimeMs: stat.mtimeMs };
+    const fixture = metadataEnrichmentFixture([session]);
+    const run = fixture.worker.run.bind(fixture.worker);
+    fixture.worker.run = (request, generation, signal) =>
+      run(request.kind === 'metadata-recovery' ? { ...request, recordBytes: 512 } : request, generation, signal);
+    const recoveries = () => fixture.requests.filter((request) => request.kind === 'metadata-recovery').length;
+    try {
+      await fixture.pass();
+      const exhausted = fixture.provider.titles.get(file);
+      assert.deepEqual(
+        [exhausted.metadataWindow.exhausted, exhausted.metadataWindow.exhaustedRule],
+        [true, METADATA_EXHAUSTED_RULE],
+      );
+      // A cache saved before the rule field existed carries the bare exhausted flag.
+      const { exhaustedRule: _rule, ...earlier } = exhausted.metadataWindow;
+      fixture.provider.titles.set(file, { ...exhausted, metadataWindow: earlier });
+      const before = recoveries();
+      await fixture.pass();
+      assert.ok(recoveries() > before, 'the earlier exhaustion was not read again');
+      assert.equal(fixture.provider.titles.get(file).metadataWindow.exhaustedRule, METADATA_EXHAUSTED_RULE);
+      const retried = recoveries();
+      await fixture.pass();
+      assert.equal(recoveries(), retried, 'the same revision was read again under the current rule');
+    } finally {
+      fixture.worker.stop();
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  'restored exhausted selection stays suppressed through an ordinary refresh',
+  { tags: ['subprocess'] },
+  async () => {
+    const directory = tempDir('panel-metadata-restored-');
+    const file = path.join(directory, 'session.jsonl');
+    fs.writeFileSync(
+      file,
+      JSON.stringify({ type: 'event_msg', payload: { type: 'task_started', turn_id: 'open' } }) +
+        '\n' +
+        JSON.stringify({
+          type: 'event_msg',
+          payload: { type: 'agent_message', phase: 'commentary', message: 'x'.repeat(1024) },
+        }) +
+        '\n' +
+        (JSON.stringify({ type: 'ignored', body: 'x'.repeat(1024) }) + '\n').repeat(17_000),
+    );
+    const stat = revisionOf(fs.statSync(file, { bigint: true }));
+    const session = { file, sessionId: '0', agent: 'codex', size: stat.size, mtimeMs: stat.mtimeMs };
+    const fixture = metadataEnrichmentFixture([session]);
+    const run = fixture.worker.run.bind(fixture.worker);
+    fixture.worker.run = (request, generation, signal) =>
+      run(request.kind === 'metadata-recovery' ? { ...request, recordBytes: 512 } : request, generation, signal);
+    try {
+      await fixture.pass();
+      assert.equal(fixture.provider.titles.get(file).metadataWindow.exhausted, true);
+      const before = fixture.requests.filter((request) => request.kind === 'metadata-recovery').length;
+      const cache = path.join(directory, 'derived.json');
+      saveDerivedCache(cache, fixture.provider.titles);
+      fixture.provider.titles = loadDerivedCache(cache).titles;
+      Object.assign(fixture.provider, {
+        showing: '0',
+        shownSessions: () => [session],
+        updateHistoryAfterAcceptedWindow() {},
+        progressiveInput: () => ({ session, folders: [], children: [], maxTurns: 40, tailBytes: 4096 }),
+      });
+      let selected!: Promise<void>;
+      const complete = fixture.provider.completeSelectedWindow.bind(fixture.provider);
+      fixture.provider.completeSelectedWindow = (...args: any[]) => (selected = complete(...args));
+      await PanelProvider.prototype.refresh.call(fixture.provider, false, true);
+      await selected;
+      assert.ok(fixture.requests.some((request) => request.kind === 'window'));
+      assert.equal(fixture.provider.titles.get(file).metadataWindow.exhausted, true);
+      await fixture.pass();
+      assert.equal(fixture.requests.filter((request) => request.kind === 'metadata-recovery').length, before);
+    } finally {
+      fixture.worker.stop();
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  'automatic Claude attachment continuation preserves exhausted metadata after reader acceptance',
+  { tags: ['subprocess'] },
+  async () => {
+    const directory = tempDir('panel-metadata-attachment-');
+    const file = path.join(directory, 'session.jsonl');
+    fs.writeFileSync(
+      file,
+      [
+        { type: 'attachment', attachment: { type: 'model', identity: { modelId: 'claude-opus-5-5[1m]' } } },
+        { type: 'user', timestamp: new Date(0).toISOString(), message: { role: 'user', content: 'x'.repeat(1024) } },
+        ...Array.from({ length: 1070 }, () => ({ type: 'ignored', text: 'x'.repeat(16384) })),
+        { type: 'user', timestamp: new Date(1000).toISOString(), message: { role: 'user', content: 'Go' } },
+        {
+          type: 'assistant',
+          timestamp: new Date(2000).toISOString(),
+          message: { role: 'assistant', model: 'claude-opus-5-5', content: [{ type: 'text', text: 'Working' }] },
+        },
+      ]
+        .map((record) => JSON.stringify(record))
+        .join('\n') + '\n',
+    );
+    const stat = revisionOf(fs.statSync(file, { bigint: true }));
+    const session = { file, sessionId: '0', agent: 'claude', size: stat.size, mtimeMs: stat.mtimeMs };
+    const fixture = metadataEnrichmentFixture([session]);
+    const run = fixture.worker.run.bind(fixture.worker);
+    let windows = 0;
+    fixture.worker.run = async (request, generation, signal) => {
+      if (request.kind === 'window' && ++windows === 2) {
+        await fixture.pass();
+        assert.equal(fixture.provider.titles.get(file).metadataWindow.exhausted, true);
+      }
+      return run(request.kind === 'metadata-recovery' ? { ...request, recordBytes: 512 } : request, generation, signal);
+    };
+    try {
+      await fixture.provider.prepareMetadata([session], 1, new AbortController().signal);
+      Object.assign(fixture.provider, {
+        updateHistoryAfterAcceptedWindow() {},
+        progressiveInput: () => ({ session, folders: [], children: [], maxTurns: 40, tailBytes: 2048 }),
+      });
+      const complete = fixture.provider.completeSelectedWindow.bind(fixture.provider);
+      const completions: Promise<void>[] = [];
+      let accepted = 0;
+      fixture.provider.completeSelectedWindow = (...args: any[]) => {
+        const completion = complete(...args).then(() => {
+          accepted++;
+          assert.equal(fixture.provider.metadataReadIntent, null);
+          if (accepted > 1) {
+            assert.equal(fixture.provider.titles.get(file).metadataWindow.exhausted, true);
+          }
+        });
+        completions.push(completion);
+        return completion;
+      };
+      fixture.provider.show('0');
+      await vi.waitFor(
+        () => {
+          assert.ok(accepted > 1);
+          assert.equal(fixture.provider.cache.get(file)?.checkpoint.attachmentRecovery.status, 'complete');
+          assert.equal(fixture.provider.selectionWork, null);
+        },
+        { timeout: 10000 },
+      );
+      await Promise.all(completions);
+      assert.equal(fixture.provider.titles.get(file).metadataWindow.exhausted, true);
+      await fixture.pass();
+      assert.equal(fixture.requests.filter((request) => request.kind === 'metadata-recovery').length, 1);
+    } finally {
+      fixture.worker.stop();
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  'accepted older history reopens recovery without replacing uncertain current metadata',
+  { tags: ['subprocess'] },
+  async () => {
+    const directory = tempDir('panel-metadata-older-');
+    const file = path.join(directory, 'session.jsonl');
+    const record = (payload: object, second: number) => ({
+      type: 'event_msg',
+      timestamp: new Date(second * 1000).toISOString(),
+      payload,
+    });
+    fs.writeFileSync(
+      file,
+      [
+        record({ type: 'task_started', turn_id: 'old' }, 1),
+        record({ type: 'user_message', message: 'Older request' + 'x'.repeat(1024) }, 1),
+        {
+          type: 'turn_context',
+          timestamp: new Date(2000).toISOString(),
+          payload: { model: 'gpt-5-codex', turn_id: 'old' },
+        },
+        record(
+          {
+            type: 'token_count',
+            info: {
+              last_token_usage: { input_tokens: 12000, output_tokens: 50 },
+              total_token_usage: { input_tokens: 12000, output_tokens: 50 },
+              model_context_window: 200000,
+            },
+          },
+          2,
+        ),
+        record({ type: 'task_complete', turn_id: 'old', last_agent_message: 'Finished' }, 3),
+        record({ type: 'task_started', turn_id: 'current' }, 4),
+        record({ type: 'user_message', message: 'Current request' }, 4),
+      ]
+        .map((record) => JSON.stringify(record))
+        .join('\n') +
+        '\n' +
+        (JSON.stringify({ type: 'ignored', body: 'x'.repeat(1024) }) + '\n').repeat(17_000),
+    );
+    const stat = revisionOf(fs.statSync(file, { bigint: true }));
+    const session = { file, sessionId: '0', agent: 'codex', size: stat.size, mtimeMs: stat.mtimeMs };
+    const fixture = metadataEnrichmentFixture([session]);
+    const run = fixture.worker.run.bind(fixture.worker);
+    fixture.worker.run = (request, generation, signal) =>
+      run(request.kind === 'metadata-recovery' ? { ...request, recordBytes: 512 } : request, generation, signal);
+    try {
+      await fixture.pass();
+      assert.equal(fixture.provider.titles.get(file).metadataWindow.exhausted, true);
+      const current = readCodexSession(file, '0', { maxTurns: 1, tailBytes: stat.size });
+      assert.equal(current.turns.at(-1)?.prompt, 'Current request');
+      Object.assign(fixture.provider, {
+        showing: '0',
+        readWindows: new Map([['0', { loadedTurns: 1 }]]),
+        historyGeneration: 0,
+        progressiveInput: () => ({ session, folders: [], children: [], maxTurns: 40, tailBytes: 4096 }),
+      });
+      fixture.provider.cache.set(file, { read: current });
+      await fixture.provider.loadOlderHistory('0');
+      const older = fixture.provider.history.get('0').pages.flatMap((page: any) => page.turns);
+      assert.ok(older.some((turn: any) => turn.prompt.startsWith('Older request') && turn.contextTokens > 0));
+      const accepted = fixture.provider.titles.get(file);
+      assert.equal(accepted.metadataWindow.exhausted, undefined);
+      assert.equal(accepted.stats, null);
+      assert.equal(accepted.outcome, null);
+      assert.equal(railEnrichmentNeeds(accepted, session)?.recovery, true);
+      const cache = path.join(directory, 'derived.json');
+      saveDerivedCache(cache, fixture.provider.titles);
+      const restored = loadDerivedCache(cache).titles.get(file)!;
+      assert.equal(restored.stats, null);
+      assert.equal(restored.outcome, null);
+      assert.equal(railEnrichmentNeeds(restored, session)?.recovery, true);
+    } finally {
+      fixture.worker.stop();
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  'completed Claude metadata recovery preserves genuine tail background commands',
+  { tags: ['subprocess'] },
+  async () => {
+    const directory = tempDir('panel-metadata-command-');
+    const file = path.join(directory, 'session.jsonl');
+    const records = [
+      {
+        type: 'user',
+        promptId: 'p1',
+        timestamp: '2026-08-26T13:30:37Z',
+        message: { role: 'user', content: 'run the suite' },
+      },
+      {
+        type: 'assistant',
+        timestamp: '2026-08-26T13:30:38Z',
+        message: {
+          role: 'assistant',
+          model: 'claude-opus-5',
+          stop_reason: 'tool_use',
+          content: [
+            { type: 'tool_use', id: 'cmd1', name: 'Bash', input: { command: 'npm test', run_in_background: true } },
+          ],
+        },
+      },
+      {
+        type: 'user',
+        timestamp: '2026-08-26T13:30:39Z',
+        message: {
+          role: 'user',
+          content: [
+            { type: 'tool_result', tool_use_id: 'cmd1', content: 'Command running in background with ID: bg1' },
+          ],
+        },
+        toolUseResult: { stdout: '', stderr: '', interrupted: false, backgroundTaskId: 'bg1' },
+      },
+      {
+        type: 'assistant',
+        timestamp: '2026-08-26T13:30:40Z',
+        message: {
+          role: 'assistant',
+          id: 'm1',
+          model: 'claude-opus-5',
+          stop_reason: 'end_turn',
+          content: [{ type: 'text', text: 'The suite runs in the background.' }],
+        },
+      },
+    ];
+    fs.writeFileSync(
+      file,
+      (JSON.stringify({ type: 'ignored', body: 'x'.repeat(1024) }) + '\n').repeat(17_000) +
+        records.map((record) => JSON.stringify(record)).join('\n') +
+        '\n',
+    );
+    const stat = revisionOf(fs.statSync(file, { bigint: true }));
+    const session = { file, sessionId: '0', agent: 'claude', size: stat.size, mtimeMs: stat.mtimeMs };
+    const fixture = metadataEnrichmentFixture([session]);
+    try {
+      await fixture.provider.prepareMetadata([session], 1, new AbortController().signal);
+      const commands = fixture.provider.titles.get(file).outcome.backgroundCommands;
+      assert.equal(commands.length, 1);
+      assert.equal(fixture.provider.titles.get(file).stats?.turns.at(-1).contextWindow, null);
+      for (let pass = 0; pass < 4; pass++) await fixture.pass();
+      const entry = fixture.provider.titles.get(file);
+      assert.equal(entry.expandedStatsRead, true);
+      assert.deepEqual(entry.outcome.backgroundCommands, commands);
+    } finally {
+      fixture.worker.stop();
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  'persistent recovery admission failures release the provider queue for later sessions',
+  { tags: ['subprocess'] },
+  async () => {
+    const directory = tempDir('panel-metadata-fairness-');
+    const files = ['failed', 'healthy'].map((name) => path.join(directory, name + '.jsonl'));
+    const padding = (JSON.stringify({ type: 'ignored', body: 'x'.repeat(1024) }) + '\n').repeat(17_000);
+    for (const file of files)
+      fs.writeFileSync(
+        file,
+        JSON.stringify({ type: 'event_msg', payload: { type: 'task_started', turn_id: 'empty' } }) + '\n' + padding,
+      );
+    const sessions = files.map((file, i) => ({
+      file,
+      sessionId: String(i),
+      agent: 'codex',
+      size: fs.statSync(file).size,
+      mtimeMs: fs.statSync(file).mtimeMs,
+    }));
+    const marker = path.join(directory, 'refuse');
+    const source =
+      getProgressiveWorkerSource() +
+      `\nconst nativeStat = require('node:fs').statSync; require('node:fs').statSync = (...args) => { if (args[0] === ${JSON.stringify(files[0])} && require('node:fs').existsSync(${JSON.stringify(marker)})) throw new Error('refused stat'); return nativeStat(...args); };`;
+    const fixture = metadataEnrichmentFixture(sessions, source);
+    try {
+      await fixture.pass();
+      assert.equal(fixture.provider.metadataRecoverySession, '0');
+      fs.writeFileSync(marker, 'refuse');
+      for (let pass = 0; pass < 7; pass++) await fixture.pass();
+      assert.equal(
+        fixture.provider.titles.get(files[1]).expandedStatsRead,
+        true,
+        'the failed active owner stranded the healthy waiting session',
+      );
+      assert.ok(railEnrichmentNeeds(fixture.provider.titles.get(files[0]), sessions[0])?.recovery);
+      assert.ok(
+        fixture.requests.filter((request) => request.kind === 'metadata-recovery' && request.session.file === files[0])
+          .length > 2,
+      );
+    } finally {
+      fixture.worker.stop();
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  },
+);
+
+function metadataEnrichmentFixture(sessions: any[], source = getProgressiveWorkerSource()) {
   const fixture = liveProviderFixture(livePress({ sessionId: 'metadata', agent: 'codex' }));
   const provider = fixture.provider as unknown as Record<string, any>;
   const worker = new ProgressiveWorker(source);
@@ -1823,6 +1853,7 @@ function metadataEnrichmentFixture(sessions: any[], source = progressiveWorkerSo
 
 test.each([13 * 1024 * 1024, 84_686_045])(
   'accepted null Codex metadata stops repeated expanded requests for %i bytes',
+  { tags: ['subprocess'] },
   async (bytes) => {
     const directory = tempDir('panel-metadata-negative-');
     const file = path.join(directory, 'negative.jsonl');
@@ -1887,7 +1918,7 @@ test.each([13 * 1024 * 1024, 84_686_045])(
       saveDerivedCache(cache, fixture.provider.titles);
       fixture.provider.titles = loadDerivedCache(cache).titles;
       fixture.worker.stop();
-      fixture.provider.progressiveWorker = new ProgressiveWorker(progressiveWorkerSource);
+      fixture.provider.progressiveWorker = new ProgressiveWorker(getProgressiveWorkerSource());
       assert.equal((await fixture.pass()).changed, false);
       fixture.provider.progressiveWorker.stop();
     } finally {
@@ -1897,46 +1928,50 @@ test.each([13 * 1024 * 1024, 84_686_045])(
   },
 );
 
-test('ordinary unchanged refresh retries failed metadata and enriches later sessions', async () => {
-  const directory = tempDir('panel-metadata-retry-');
-  const files = ['failed', 'healthy'].map((name) => path.join(directory, name + '.jsonl'));
-  for (const file of files)
-    fs.writeFileSync(
+test(
+  'ordinary unchanged refresh retries failed metadata and enriches later sessions',
+  { tags: ['subprocess'] },
+  async () => {
+    const directory = tempDir('panel-metadata-retry-');
+    const files = ['failed', 'healthy'].map((name) => path.join(directory, name + '.jsonl'));
+    for (const file of files)
+      fs.writeFileSync(
+        file,
+        JSON.stringify({
+          timestamp: '2026-08-26T13:30:37Z',
+          type: 'event_msg',
+          payload: { type: 'task_started', turn_id: 'unfinished' },
+        }) + '\n',
+      );
+    const sessions = files.map((file, i) => ({
       file,
-      JSON.stringify({
-        timestamp: '2026-08-26T13:30:37Z',
-        type: 'event_msg',
-        payload: { type: 'task_started', turn_id: 'unfinished' },
-      }) + '\n',
-    );
-  const sessions = files.map((file, i) => ({
-    file,
-    sessionId: String(i),
-    agent: 'codex',
-    size: fs.statSync(file).size,
-    mtimeMs: fs.statSync(file).mtimeMs,
-  }));
-  const source =
-    `const sourceFs = require('node:fs'); const nativeRead = sourceFs.readSync;
+      sessionId: String(i),
+      agent: 'codex',
+      size: fs.statSync(file).size,
+      mtimeMs: fs.statSync(file).mtimeMs,
+    }));
+    const source =
+      `const sourceFs = require('node:fs'); const nativeRead = sourceFs.readSync;
     let refused = false; sourceFs.readSync = (...args) => {
       if (!refused) { refused = true; throw new Error('transient read refusal'); }
       return nativeRead(...args);
-    };\n` + progressiveWorkerSource;
-  const fixture = metadataEnrichmentFixture(sessions, source);
-  try {
-    await fixture.provider.prepareMetadata(sessions, 1, new AbortController().signal);
-    assert.equal(fixture.provider.titles.has(files[0]), false, 'a failed tail acquired accepted coverage');
-    assert.equal(fixture.provider.titles.has(files[1]), true, 'one metadata failure stopped later work');
-    await PanelProvider.prototype.refresh.call(fixture.provider, false, true);
-    assert.ok(
-      fixture.provider.titles.get(files[0])?.expandedStatsRead,
-      'an unforced refresh stranded retryable metadata behind its unchanged-render decision',
-    );
-  } finally {
-    fixture.worker.stop();
-    fs.rmSync(directory, { recursive: true, force: true });
-  }
-});
+    };\n` + getProgressiveWorkerSource();
+    const fixture = metadataEnrichmentFixture(sessions, source);
+    try {
+      await fixture.provider.prepareMetadata(sessions, 1, new AbortController().signal);
+      assert.equal(fixture.provider.titles.has(files[0]), false, 'a failed tail acquired accepted coverage');
+      assert.equal(fixture.provider.titles.has(files[1]), true, 'one metadata failure stopped later work');
+      await PanelProvider.prototype.refresh.call(fixture.provider, false, true);
+      assert.ok(
+        fixture.provider.titles.get(files[0])?.expandedStatsRead,
+        'an unforced refresh stranded retryable metadata behind its unchanged-render decision',
+      );
+    } finally {
+      fixture.worker.stop();
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  },
+);
 import {
   normalizeFullSessionTitle,
   normalizeSessionTitle,
@@ -2150,7 +2185,7 @@ import { sameCommitSha, listSessionFiles, readTurns } from './transcript.ts';
 import { handoffRefusalMessage, pressIsMidTurn, pressesAfter } from './composerview.ts';
 import { compaction, livePress, powershellDispatchExecution, subagentCommitTurn, turn } from './turnfixtures.ts';
 import { ClaudeWire } from './claudewire.ts';
-import { COMPACT_LIMITS, CompactHost, CompactRequests, type CompactChild } from './compactrequest.ts';
+import { COMPACT_LIMITS, CompactHost, CompactRequests, promptAsReader, type CompactChild } from './compactrequest.ts';
 import { currentRecordsBySession, turnKey } from './turnread.ts';
 import { ProgressiveWorker, acceptsProgressiveResult, type ProgressiveInput } from './progressiveworker.ts';
 import { handleNavigationPress, navigationButton, ROVING_SELECTOR } from './webview/navigation.ts';
@@ -7837,261 +7872,267 @@ test('page-level subjects stay behind their typed owners', () => {
 
 const panelHostSource = fs.readFileSync(path.join(__dirname, 'panelhost.ts'), 'utf8');
 
-test('a Codex launch reaches the host card and the dispatched child heading after a restart', async () => {
-  const directory = tempDir('panel-codex-dispatch-host-');
-  const parentFile = path.join(directory, 'parent.jsonl');
-  const childId = '3f99580e-a054-4ce7-a686-c4e65f32f98a';
-  const childFile = path.join(directory, `${childId}.jsonl`);
-  const at = (second: number) => new Date(Date.UTC(2026, 7, 25, 12, 0, second)).toISOString();
-  const records = [
-    { timestamp: at(0), type: 'session_meta', payload: { id: 'parent', cwd: directory, source: 'cli' } },
-    { timestamp: at(1), type: 'event_msg', payload: { type: 'task_started', turn_id: 'launch' } },
-    { timestamp: at(2), type: 'turn_context', payload: { turn_id: 'launch' } },
-    { timestamp: at(2), type: 'event_msg', payload: { type: 'user_message', message: 'review the change' } },
-    {
-      timestamp: at(3),
-      type: 'event_msg',
-      payload: {
-        type: 'item_completed',
-        item: {
-          ...powershellDispatchExecution,
-        },
-      },
-    },
-  ];
-  fs.writeFileSync(parentFile, records.map((record) => JSON.stringify(record) + '\n').join(''));
-  fs.writeFileSync(
-    childFile,
-    [
+test(
+  'a Codex launch reaches the host card and the dispatched child heading after a restart',
+  { tags: ['subprocess'] },
+  async () => {
+    const directory = tempDir('panel-codex-dispatch-host-');
+    const parentFile = path.join(directory, 'parent.jsonl');
+    const childId = '3f99580e-a054-4ce7-a686-c4e65f32f98a';
+    const childFile = path.join(directory, `${childId}.jsonl`);
+    const at = (second: number) => new Date(Date.UTC(2026, 7, 25, 12, 0, second)).toISOString();
+    const records = [
+      { timestamp: at(0), type: 'session_meta', payload: { id: 'parent', cwd: directory, source: 'cli' } },
+      { timestamp: at(1), type: 'event_msg', payload: { type: 'task_started', turn_id: 'launch' } },
+      { timestamp: at(2), type: 'turn_context', payload: { turn_id: 'launch' } },
+      { timestamp: at(2), type: 'event_msg', payload: { type: 'user_message', message: 'review the change' } },
       {
-        type: 'user',
         timestamp: at(3),
-        entrypoint: 'sdk-cli',
-        cwd: directory,
-        message: { role: 'user', content: 'review' },
-      },
-      {
-        type: 'assistant',
-        timestamp: at(4),
-        message: {
-          role: 'assistant',
-          content: [{ type: 'tool_use', id: 'read', name: 'Read', input: { file_path: 'file.ts' } }],
-          stop_reason: 'tool_use',
+        type: 'event_msg',
+        payload: {
+          type: 'item_completed',
+          item: {
+            ...powershellDispatchExecution,
+          },
         },
       },
-    ]
-      .map((record) => JSON.stringify(record) + '\n')
-      .join(''),
-  );
-  const session = (file: string, sessionId: string, agent: 'codex' | 'claude') => {
-    const stat = revisionOf(fs.statSync(file, { bigint: true }));
-    return { file, sessionId, agent, size: stat.size, mtimeMs: stat.mtimeMs, activity: stat.mtimeMs };
-  };
-  const sessions = [session(parentFile, 'parent', 'codex'), session(childFile, childId, 'claude')];
-  const worker = new ProgressiveWorker('performance.now = () => 0;' + progressiveWorkerSource);
-  const fixture = liveProviderFixture({ ...livePress(), sessionId: 'parent', agent: 'codex' });
-  const provider = fixture.provider as unknown as Record<string, any>;
-  Object.assign(provider, {
-    progressiveWorker: worker,
-    refreshGeneration: 1,
-    claudeParents: [],
-    repositoryScope: { snapshot: () => ({ ready: true, roots: [directory], revision: 1 }) },
-    targetedRefreshPaths: [parentFile],
-    claudeChildReferenceEntries: new Map(),
-    claudeChildStatWrites: new Map(),
-    humanScans: new Map(),
-    claudeChildren: [],
-    codexSubagents: [],
-    titles: new Map(),
-    carriedNames: new Map(),
-    derivedCacheCheckpointState: { markChanged() {} },
-    catalog: { folders: '\0' + 1, sessions },
-    sessionRows: [
-      { id: 'parent', label: 'Parent', agentKey: 'codex' },
-      { id: childId, label: 'Child', agentKey: 'claude' },
-    ],
-    activityFor: (item: { activity: number }) => item.activity,
-    updateSessionSpendSources() {},
-    repositoryCommits: { apply() {} },
-    abandonDraft() {},
-    completeSelectedWindow: async () => {},
-  });
-  try {
-    assert.equal(provider.allSessions().length, 2);
-    assert.deepEqual(
-      new Set(provider.claudeParents.map((session: { sessionId: string }) => session.sessionId)),
-      new Set(['parent', childId]),
+    ];
+    fs.writeFileSync(parentFile, records.map((record) => JSON.stringify(record) + '\n').join(''));
+    fs.writeFileSync(
+      childFile,
+      [
+        {
+          type: 'user',
+          timestamp: at(3),
+          entrypoint: 'sdk-cli',
+          cwd: directory,
+          message: { role: 'user', content: 'review' },
+        },
+        {
+          type: 'assistant',
+          timestamp: at(4),
+          message: {
+            role: 'assistant',
+            content: [{ type: 'tool_use', id: 'read', name: 'Read', input: { file_path: 'file.ts' } }],
+            stop_reason: 'tool_use',
+          },
+        },
+      ]
+        .map((record) => JSON.stringify(record) + '\n')
+        .join(''),
     );
-    assert.equal(await provider.prepareClaudeChildren(1, new AbortController().signal), true);
-    assert.deepEqual(
-      provider.claudeChildReferences.map((reference: { sessionId: string }) => reference.sessionId),
-      [childId],
-    );
-    const cacheFile = path.join(directory, 'cache.json');
-    saveDerivedCache(cacheFile, [], provider.claudeChildReferenceEntries);
-    provider.claudeChildReferenceEntries = loadDerivedCache(cacheFile).claudeChildReferences;
-    worker.stop();
-    provider.progressiveWorker = new ProgressiveWorker('performance.now = () => 0;' + progressiveWorkerSource);
-    assert.equal(await provider.prepareClaudeChildren(1, new AbortController().signal), true);
-    const parentRead = readCodexSession(parentFile, 'parent');
-    const recorded = parentRead.turns[0];
-    assert.deepEqual(recorded.dispatchToolUseIds, [powershellDispatchExecution.id]);
-    const childRead = readSession(childFile, childId);
-    const now = Date.parse(at(5));
-    const statuses = sessionStatusOf(
-      [],
-      new Set(),
-      new Map([
-        ['parent', sessionOutcomeOf(parentRead)],
-        [childId, sessionOutcomeOf(childRead)],
-      ]),
-      now,
-    );
-    assert.equal(statuses.get('parent'), 'running');
-    assert.equal(statuses.get(childId), 'running');
-    const childRun = readSessionMeta(childFile).agentRun;
-    assert.equal(childRun, true);
-    const rail = railSessions(
-      sessions.map((session) => ({
-        id: session.sessionId,
-        label: session.sessionId,
-        agent: session.agent,
-        when: '',
-        at: now,
-        relative: '',
-        agentRun: session.sessionId === childId && childRun === true,
-      })),
-      new Map(),
-      new Map(),
-      statuses,
-      new Set(),
-      null,
-      new Set(),
-      new Map(),
-      {},
-      {},
-      {},
-      {},
-      new Map(),
-      now,
-    );
-    assert.equal(rail.find((row) => row.id === childId)?.runByAgent, true);
-    assert.equal(railCounts(rail, { showArchived: false, showRuns: true }, now).running, 1);
-    const card = provider.renderTurnCard(
-      recorded,
-      false,
-      'Parent',
-      Date.parse(at(5)),
-      [directory],
-      new Set(),
-      new Map(),
-      statuses,
-    );
-    assert.equal(card.dispatched.length, 1);
-    assert.equal(card.dispatched[0].sessionId, childId);
-    assert.equal(card.dispatched[0].state, 'running');
-    assert.equal(card.dispatched[0].stateWord, 'running');
-    assert.equal(detailRowsFor(card, 'dispatched')?.kind, 'dispatched');
-    provider.sessionParentEdges(provider.catalog.sessions);
-    provider.authoritativeCatalog = sessions;
-    provider.trail = visitPlace(emptyTrail(), 'parent');
-    provider.outcomesFor = () => new Map();
-    provider.windows = new Map();
-    provider.glanceAt = () => new Map();
-    provider.evictCache = () => {};
-    provider.collect = () => [];
-    provider.seenTurns = new Map();
-    provider.turnMarks = new Map();
-    provider.unreadCounts = () => new Map();
-    provider.startedHere = new Set();
-    provider.metadataStatFigures = { read: () => ({}) };
-    provider.metadataCacheFigures = { read: () => ({}) };
-    provider.parsedRailCaches = {};
-    provider.railStatuses = () => ({ statuses: new Map(), openChildren: new Map() });
-    provider.railInputFor = (
-      counts: Map<string, unknown>,
-      statuses: Map<string, unknown>,
-      openChildren: Map<string, unknown>,
-      now: number,
-      showing = provider.showing,
-    ) => ({
-      sessions: provider.sessionRows,
-      counts,
-      newest: new Map(),
-      statuses,
-      runningSince: new Map(),
-      openChildren,
-      hidden: new Set(),
-      showing,
-      pinnedTop: new Set(),
-      unsent: new Map(),
-      parsedStats: {},
-      metadataStats: {},
-      lifetimeStats: {},
-      lifetimeCosts: {},
-      labels: {},
-      caches: {},
-      views: [],
-      railFilters: [],
-      now,
+    const session = (file: string, sessionId: string, agent: 'codex' | 'claude') => {
+      const stat = revisionOf(fs.statSync(file, { bigint: true }));
+      return { file, sessionId, agent, size: stat.size, mtimeMs: stat.mtimeMs, activity: stat.mtimeMs };
+    };
+    const sessions = [session(parentFile, 'parent', 'codex'), session(childFile, childId, 'claude')];
+    const worker = new ProgressiveWorker('performance.now = () => 0;' + getProgressiveWorkerSource());
+    const fixture = liveProviderFixture({ ...livePress(), sessionId: 'parent', agent: 'codex' });
+    const provider = fixture.provider as unknown as Record<string, any>;
+    Object.assign(provider, {
+      progressiveWorker: worker,
+      refreshGeneration: 1,
+      claudeParents: [],
+      repositoryScope: { snapshot: () => ({ ready: true, roots: [directory], revision: 1 }) },
+      targetedRefreshPaths: [parentFile],
+      claudeChildReferenceEntries: new Map(),
+      claudeChildStatWrites: new Map(),
+      humanScans: new Map(),
+      claudeChildren: [],
+      codexSubagents: [],
+      titles: new Map(),
+      carriedNames: new Map(),
+      derivedCacheCheckpointState: { markChanged() {} },
+      catalog: { folders: '\0' + 1, sessions },
+      sessionRows: [
+        { id: 'parent', label: 'Parent', agentKey: 'codex' },
+        { id: childId, label: 'Child', agentKey: 'claude' },
+      ],
+      activityFor: (item: { activity: number }) => item.activity,
+      updateSessionSpendSources() {},
+      repositoryCommits: { apply() {} },
+      abandonDraft() {},
+      completeSelectedWindow: async () => {},
     });
-    provider.lifetimeFigures = { answers: () => new Map() };
-    provider.readWindows = new Map();
-    provider.hidden = new Set();
-    provider.pinnedTop = new Set();
-    provider.projectSpendPayload = () => null;
-    provider.icons = { fontFaces: () => [] };
-    provider.checkpointDerivedCache = () => {};
-    provider.ensureProjectSpendWorkspace = () => {};
-    provider.performanceCounters = {
-      registerPanel() {},
-      releasePanel() {},
-      recordRefreshStage() {},
-      recordRefresh() {},
-      recordStartup() {},
-    };
-    const refreshes: unknown[][] = [];
-    provider.refresh = (...args: unknown[]) => {
-      refreshes.push(args);
-      return PanelProvider.prototype.refresh.apply(provider, args as [boolean, boolean, boolean, boolean]);
-    };
-    provider.show(childId, fixture.host);
-    await vi.waitFor(() => assert.ok(refreshes.length > 0));
-    assert.deepEqual(refreshes[0], [true, true, true, true]);
-    await vi.waitFor(() =>
-      assert.ok(fixture.posted.some((message) => message.type === 'selection' && message.showing === childId)),
-    );
-    const childPayload = fixture.posted.find(
-      (message) => message.type === 'selection' && message.showing === childId,
-    ) as {
-      sessions: Array<{ id: string; parent?: { id: string; label: string; relation: string } }>;
-    };
-    const parent = childPayload.sessions.find((row) => row.id === childId)?.parent;
-    assert.deepEqual(parent, {
-      id: 'parent',
-      label: provider.sessionRows.find((row: { id: string }) => row.id === 'parent').label,
-      relation: 'dispatched',
-    });
-    provider.show('parent', fixture.host);
-    await vi.waitFor(() =>
-      assert.ok(fixture.posted.some((message) => message.type === 'selection' && message.showing === 'parent')),
-    );
-    const returned = fixture.posted.find((message) => message.type === 'selection' && message.showing === 'parent') as {
-      sessions: Array<{ id: string; parent?: unknown }>;
-    };
-    assert.equal(returned.sessions.find((row) => row.id === 'parent')?.parent, undefined);
-    saveDerivedCache(cacheFile, [], provider.claudeChildReferenceEntries);
-    provider.claudeChildReferenceEntries = loadDerivedCache(cacheFile).claudeChildReferences;
-    provider.progressiveWorker.stop();
-    provider.progressiveWorker = new ProgressiveWorker('performance.now = () => 0;' + progressiveWorkerSource);
-    assert.equal(await provider.prepareClaudeChildren(1, new AbortController().signal), true);
-    assert.equal(provider.claudeChildReferences.length, 1);
-  } finally {
-    worker.stop();
-    provider.progressiveWorker.stop();
-    fs.rmSync(directory, { recursive: true, force: true });
-  }
-});
+    try {
+      assert.equal(provider.allSessions().length, 2);
+      assert.deepEqual(
+        new Set(provider.claudeParents.map((session: { sessionId: string }) => session.sessionId)),
+        new Set(['parent', childId]),
+      );
+      assert.equal(await provider.prepareClaudeChildren(1, new AbortController().signal), true);
+      assert.deepEqual(
+        provider.claudeChildReferences.map((reference: { sessionId: string }) => reference.sessionId),
+        [childId],
+      );
+      const cacheFile = path.join(directory, 'cache.json');
+      saveDerivedCache(cacheFile, [], provider.claudeChildReferenceEntries);
+      provider.claudeChildReferenceEntries = loadDerivedCache(cacheFile).claudeChildReferences;
+      worker.stop();
+      provider.progressiveWorker = new ProgressiveWorker('performance.now = () => 0;' + getProgressiveWorkerSource());
+      assert.equal(await provider.prepareClaudeChildren(1, new AbortController().signal), true);
+      const parentRead = readCodexSession(parentFile, 'parent');
+      const recorded = parentRead.turns[0];
+      assert.deepEqual(recorded.dispatchToolUseIds, [powershellDispatchExecution.id]);
+      const childRead = readSession(childFile, childId);
+      const now = Date.parse(at(5));
+      const statuses = sessionStatusOf(
+        [],
+        new Set(),
+        new Map([
+          ['parent', sessionOutcomeOf(parentRead)],
+          [childId, sessionOutcomeOf(childRead)],
+        ]),
+        now,
+      );
+      assert.equal(statuses.get('parent'), 'running');
+      assert.equal(statuses.get(childId), 'running');
+      const childRun = readSessionMeta(childFile).agentRun;
+      assert.equal(childRun, true);
+      const rail = railSessions(
+        sessions.map((session) => ({
+          id: session.sessionId,
+          label: session.sessionId,
+          agent: session.agent,
+          when: '',
+          at: now,
+          relative: '',
+          agentRun: session.sessionId === childId && childRun === true,
+        })),
+        new Map(),
+        new Map(),
+        statuses,
+        new Set(),
+        null,
+        new Set(),
+        new Map(),
+        {},
+        {},
+        {},
+        {},
+        new Map(),
+        now,
+      );
+      assert.equal(rail.find((row) => row.id === childId)?.runByAgent, true);
+      assert.equal(railCounts(rail, { showArchived: false, showRuns: true }, now).running, 1);
+      const card = provider.renderTurnCard(
+        recorded,
+        false,
+        'Parent',
+        Date.parse(at(5)),
+        [directory],
+        new Set(),
+        new Map(),
+        statuses,
+      );
+      assert.equal(card.dispatched.length, 1);
+      assert.equal(card.dispatched[0].sessionId, childId);
+      assert.equal(card.dispatched[0].state, 'running');
+      assert.equal(card.dispatched[0].stateWord, 'running');
+      assert.equal(detailRowsFor(card, 'dispatched')?.kind, 'dispatched');
+      provider.sessionParentEdges(provider.catalog.sessions);
+      provider.authoritativeCatalog = sessions;
+      provider.trail = visitPlace(emptyTrail(), 'parent');
+      provider.outcomesFor = () => new Map();
+      provider.windows = new Map();
+      provider.glanceAt = () => new Map();
+      provider.evictCache = () => {};
+      provider.collect = () => [];
+      provider.seenTurns = new Map();
+      provider.turnMarks = new Map();
+      provider.unreadCounts = () => new Map();
+      provider.startedHere = new Set();
+      provider.metadataStatFigures = { read: () => ({}) };
+      provider.metadataCacheFigures = { read: () => ({}) };
+      provider.parsedRailCaches = {};
+      provider.railStatuses = () => ({ statuses: new Map(), openChildren: new Map() });
+      provider.railInputFor = (
+        counts: Map<string, unknown>,
+        statuses: Map<string, unknown>,
+        openChildren: Map<string, unknown>,
+        now: number,
+        showing = provider.showing,
+      ) => ({
+        sessions: provider.sessionRows,
+        counts,
+        newest: new Map(),
+        statuses,
+        runningSince: new Map(),
+        openChildren,
+        hidden: new Set(),
+        showing,
+        pinnedTop: new Set(),
+        unsent: new Map(),
+        parsedStats: {},
+        metadataStats: {},
+        lifetimeStats: {},
+        lifetimeCosts: {},
+        labels: {},
+        caches: {},
+        views: [],
+        railFilters: [],
+        now,
+      });
+      provider.lifetimeFigures = { answers: () => new Map() };
+      provider.readWindows = new Map();
+      provider.hidden = new Set();
+      provider.pinnedTop = new Set();
+      provider.projectSpendPayload = () => null;
+      provider.icons = { fontFaces: () => [] };
+      provider.checkpointDerivedCache = () => {};
+      provider.ensureProjectSpendWorkspace = () => {};
+      provider.performanceCounters = {
+        registerPanel() {},
+        releasePanel() {},
+        recordRefreshStage() {},
+        recordRefresh() {},
+        recordStartup() {},
+      };
+      const refreshes: unknown[][] = [];
+      provider.refresh = (...args: unknown[]) => {
+        refreshes.push(args);
+        return PanelProvider.prototype.refresh.apply(provider, args as [boolean, boolean, boolean, boolean]);
+      };
+      provider.show(childId, fixture.host);
+      await vi.waitFor(() => assert.ok(refreshes.length > 0));
+      assert.deepEqual(refreshes[0], [true, true, true, true]);
+      await vi.waitFor(() =>
+        assert.ok(fixture.posted.some((message) => message.type === 'selection' && message.showing === childId)),
+      );
+      const childPayload = fixture.posted.find(
+        (message) => message.type === 'selection' && message.showing === childId,
+      ) as {
+        sessions: Array<{ id: string; parent?: { id: string; label: string; relation: string } }>;
+      };
+      const parent = childPayload.sessions.find((row) => row.id === childId)?.parent;
+      assert.deepEqual(parent, {
+        id: 'parent',
+        label: provider.sessionRows.find((row: { id: string }) => row.id === 'parent').label,
+        relation: 'dispatched',
+      });
+      provider.show('parent', fixture.host);
+      await vi.waitFor(() =>
+        assert.ok(fixture.posted.some((message) => message.type === 'selection' && message.showing === 'parent')),
+      );
+      const returned = fixture.posted.find(
+        (message) => message.type === 'selection' && message.showing === 'parent',
+      ) as {
+        sessions: Array<{ id: string; parent?: unknown }>;
+      };
+      assert.equal(returned.sessions.find((row) => row.id === 'parent')?.parent, undefined);
+      saveDerivedCache(cacheFile, [], provider.claudeChildReferenceEntries);
+      provider.claudeChildReferenceEntries = loadDerivedCache(cacheFile).claudeChildReferences;
+      provider.progressiveWorker.stop();
+      provider.progressiveWorker = new ProgressiveWorker('performance.now = () => 0;' + getProgressiveWorkerSource());
+      assert.equal(await provider.prepareClaudeChildren(1, new AbortController().signal), true);
+      assert.equal(provider.claudeChildReferences.length, 1);
+    } finally {
+      worker.stop();
+      provider.progressiveWorker.stop();
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  },
+);
 
 test.each([
   ['claude', 'claude'],
@@ -8100,6 +8141,7 @@ test.each([
   ['codex', 'codex'],
 ] as const)(
   '%s parents show a %s dispatched row and from navigation after restart',
+  { tags: ['subprocess'] },
   async (parentAgent, childAgent) => {
     const directory = tempDir('panel-codex-dispatch-host-');
     const parentFile = path.join(directory, 'parent.jsonl');
@@ -8170,7 +8212,7 @@ test.each([
       return { file, sessionId, agent, size: stat.size, mtimeMs: stat.mtimeMs, activity: stat.mtimeMs };
     };
     const sessions = [session(parentFile, 'parent', parentAgent), session(childFile, childId, childAgent)];
-    const worker = new ProgressiveWorker('performance.now = () => 0;' + progressiveWorkerSource);
+    const worker = new ProgressiveWorker('performance.now = () => 0;' + getProgressiveWorkerSource());
     const fixture = liveProviderFixture({ ...livePress(), sessionId: 'parent', agent: parentAgent });
     const provider = fixture.provider as unknown as Record<string, any>;
     Object.assign(provider, {
@@ -8339,7 +8381,7 @@ test.each([
       saveDerivedCache(cacheFile, [], provider.claudeChildReferenceEntries);
       provider.claudeChildReferenceEntries = loadDerivedCache(cacheFile).claudeChildReferences;
       worker.stop();
-      provider.progressiveWorker = new ProgressiveWorker('performance.now = () => 0;' + progressiveWorkerSource);
+      provider.progressiveWorker = new ProgressiveWorker('performance.now = () => 0;' + getProgressiveWorkerSource());
       assert.equal(await provider.prepareClaudeChildren(1, new AbortController().signal), true);
       assert.equal(provider.claudeChildReferences.length, 1);
     } finally {
@@ -8352,6 +8394,7 @@ test.each([
 
 test.each(['failure', 'complete'])(
   'durable health retains acknowledged discovery charges before worker %s',
+  { tags: ['subprocess'] },
   async (terminal) => {
     const directory = tempDir('discovery-health-');
     const file = path.join(directory, 'parent.jsonl');
@@ -8377,7 +8420,7 @@ test.each(['failure', 'complete'])(
         if (!message.diagnosticTerminal) return;
         if (message.diagnosticTerminal === 'failure') throw new TypeError('private failure detail');
         diagnosticPost(diagnosticFinal);
-      });\n` + progressiveWorkerSource,
+      });\n` + getProgressiveWorkerSource(),
       undefined,
       () => {
         finalHeld = true;
@@ -8572,143 +8615,147 @@ function dispatchedRefreshFixture(sessions: any[], worker: ProgressiveWorker, tu
   return { ...fixture, provider, refreshes, collections: () => collections };
 }
 
-test('completion slices post changed figures once on retained and newest launching turns', async () => {
-  const directory = tempDir('dispatch-host-completion-');
-  const parentFile = path.join(directory, 'parent.jsonl');
-  const id = 'aaaaaaaa-1111-1111-1111-111111111111';
-  const childFile = path.join(directory, id + '.jsonl');
-  const clock = path.join(directory, 'clock');
-  const record = (type: string, second: number, payload: object) =>
-    JSON.stringify({ type, timestamp: new Date(NOW + second * 1000).toISOString(), payload }) + '\n';
-  const launch = (name: string, second: number) =>
-    record('event_msg', second, { type: 'task_started', turn_id: name }) +
-    record('turn_context', second + 1, { turn_id: name }) +
-    record('event_msg', second + 1, { type: 'user_message', message: 'review' }) +
-    record('event_msg', second + 2, {
-      type: 'item_completed',
-      item: {
-        type: 'CommandExecution',
-        id: name,
-        status: 'completed',
-        exit_code: 0,
-        parsed_cmd: [{ type: 'unknown', cmd: 'python child.py --arc-dispatch' }],
-        stdout: `ARC_DISPATCH_SESSION={"agent":"codex","session_id":"${id}"}`,
-      },
-    }) +
-    record('event_msg', second + 3, { type: 'task_complete', turn_id: name });
-  fs.writeFileSync(
-    parentFile,
-    record('session_meta', 0, { id: 'parent', cwd: directory, source: 'cli' }) +
-      launch('first', 1) +
-      launch('last', 10),
-  );
-  fs.writeFileSync(
-    childFile,
-    record('session_meta', 0, { id, cwd: directory, source: 'exec', model_provider: 'openai' }) +
-      record('event_msg', 1, { type: 'task_started', turn_id: 'work' }) +
-      record('turn_context', 2, { turn_id: 'work', model: 'gpt-6.1-sol', effort: 'high' }) +
-      record('event_msg', 3, { type: 'agent_message', message: 'x'.repeat(700 * 1024) }) +
-      record('event_msg', 3, { type: 'agent_message', message: 'x'.repeat(700 * 1024) }) +
-      record('event_msg', 4, {
-        type: 'token_count',
-        info: {
-          last_token_usage: { input_tokens: 10, output_tokens: 3 },
-          total_token_usage: { input_tokens: 10, output_tokens: 3 },
+test(
+  'completion slices post changed figures once on retained and newest launching turns',
+  { tags: ['subprocess'] },
+  async () => {
+    const directory = tempDir('dispatch-host-completion-');
+    const parentFile = path.join(directory, 'parent.jsonl');
+    const id = 'aaaaaaaa-1111-1111-1111-111111111111';
+    const childFile = path.join(directory, id + '.jsonl');
+    const clock = path.join(directory, 'clock');
+    const record = (type: string, second: number, payload: object) =>
+      JSON.stringify({ type, timestamp: new Date(NOW + second * 1000).toISOString(), payload }) + '\n';
+    const launch = (name: string, second: number) =>
+      record('event_msg', second, { type: 'task_started', turn_id: name }) +
+      record('turn_context', second + 1, { turn_id: name }) +
+      record('event_msg', second + 1, { type: 'user_message', message: 'review' }) +
+      record('event_msg', second + 2, {
+        type: 'item_completed',
+        item: {
+          type: 'CommandExecution',
+          id: name,
+          status: 'completed',
+          exit_code: 0,
+          parsed_cmd: [{ type: 'unknown', cmd: 'python child.py --arc-dispatch' }],
+          stdout: `ARC_DISPATCH_SESSION={"agent":"codex","session_id":"${id}"}`,
         },
       }) +
-      record('event_msg', 5, { type: 'task_complete', turn_id: 'work' }),
-  );
-  const now = fs.statSync(childFile).mtimeMs + 300_000;
-  fs.writeFileSync(clock, String(now));
-  // Byte limits determine completion slices independently of worker scheduling.
-  const worker = new ProgressiveWorker(
-    'performance.now = () => 0;\n' +
-      progressiveWorkerSource +
-      `\nDate.now = () => Number(require('node:fs').readFileSync(${JSON.stringify(clock)}, 'utf8'));`,
-  );
-  const sessions = [
-    [parentFile, 'parent'],
-    [childFile, id],
-  ].map(([file, sessionId]) => ({
-    file,
-    sessionId,
-    agent: 'codex',
-    size: fs.statSync(file).size,
-    mtimeMs: fs.statSync(file).mtimeMs,
-  }));
-  const turns = readCodexSession(parentFile, 'parent').turns;
-  const fixture = dispatchedRefreshFixture(sessions, worker, turns);
-  const provider = fixture.provider;
-  provider.repositoryScopeRoots = [directory];
-  vi.useFakeTimers({ now, toFake: ['Date', 'setTimeout', 'clearTimeout'] });
-  try {
-    await provider.prepareClaudeChildren(1, new AbortController().signal);
-    assert.equal(provider.dispatchFacts.size, 1);
-    assert.equal(provider.dispatchDiscoveryPending, true);
-    provider.drawnDispatchFiguresRevision = provider.dispatchFiguresRevision;
-    provider.threadNames = readThreadNames(codexSessionIndexPath(), null);
-    provider.lastSignature = listingSignature({
-      showing: 'parent',
-      files: provider.catalog.sessions,
-      threadNames: provider.threadNames.stamp,
-      children: '',
-      sessionParents: '',
-    });
-    await provider.refresh(false, true);
-    assert.equal(fixture.collections(), 0);
-    assert.equal(fixture.posted.filter((message) => message.type === 'render').length, 0);
-    for (let i = 0; i < 8 && provider.dispatchDiscoveryPending; i++) {
-      const before = fixture.refreshes.length;
-      await vi.advanceTimersToNextTimerAsync();
-      assert.ok(fixture.refreshes.length > before);
-      await fixture.refreshes.at(-1);
+      record('event_msg', second + 3, { type: 'task_complete', turn_id: name });
+    fs.writeFileSync(
+      parentFile,
+      record('session_meta', 0, { id: 'parent', cwd: directory, source: 'cli' }) +
+        launch('first', 1) +
+        launch('last', 10),
+    );
+    fs.writeFileSync(
+      childFile,
+      record('session_meta', 0, { id, cwd: directory, source: 'exec', model_provider: 'openai' }) +
+        record('event_msg', 1, { type: 'task_started', turn_id: 'work' }) +
+        record('turn_context', 2, { turn_id: 'work', model: 'gpt-6.1-sol', effort: 'high' }) +
+        record('event_msg', 3, { type: 'agent_message', message: 'x'.repeat(700 * 1024) }) +
+        record('event_msg', 3, { type: 'agent_message', message: 'x'.repeat(700 * 1024) }) +
+        record('event_msg', 4, {
+          type: 'token_count',
+          info: {
+            last_token_usage: { input_tokens: 10, output_tokens: 3 },
+            total_token_usage: { input_tokens: 10, output_tokens: 3 },
+          },
+        }) +
+        record('event_msg', 5, { type: 'task_complete', turn_id: 'work' }),
+    );
+    const now = fs.statSync(childFile).mtimeMs + 300_000;
+    fs.writeFileSync(clock, String(now));
+    // Byte limits determine completion slices independently of worker scheduling.
+    const worker = new ProgressiveWorker(
+      'performance.now = () => 0;\n' +
+        getProgressiveWorkerSource() +
+        `\nDate.now = () => Number(require('node:fs').readFileSync(${JSON.stringify(clock)}, 'utf8'));`,
+    );
+    const sessions = [
+      [parentFile, 'parent'],
+      [childFile, id],
+    ].map(([file, sessionId]) => ({
+      file,
+      sessionId,
+      agent: 'codex',
+      size: fs.statSync(file).size,
+      mtimeMs: fs.statSync(file).mtimeMs,
+    }));
+    const turns = readCodexSession(parentFile, 'parent').turns;
+    const fixture = dispatchedRefreshFixture(sessions, worker, turns);
+    const provider = fixture.provider;
+    provider.repositoryScopeRoots = [directory];
+    vi.useFakeTimers({ now, toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+    try {
+      await provider.prepareClaudeChildren(1, new AbortController().signal);
+      assert.equal(provider.dispatchFacts.size, 1);
+      assert.equal(provider.dispatchDiscoveryPending, true);
+      provider.drawnDispatchFiguresRevision = provider.dispatchFiguresRevision;
+      provider.threadNames = readThreadNames(codexSessionIndexPath(), null);
+      provider.lastSignature = listingSignature({
+        showing: 'parent',
+        files: provider.catalog.sessions,
+        threadNames: provider.threadNames.stamp,
+        children: '',
+        sessionParents: '',
+      });
+      await provider.refresh(false, true);
+      assert.equal(fixture.collections(), 0);
+      assert.equal(fixture.posted.filter((message) => message.type === 'render').length, 0);
+      for (let i = 0; i < 8 && provider.dispatchDiscoveryPending; i++) {
+        const before = fixture.refreshes.length;
+        await vi.advanceTimersToNextTimerAsync();
+        assert.ok(fixture.refreshes.length > before);
+        await fixture.refreshes.at(-1);
+      }
+      assert.equal(fixture.collections(), 1);
+      const renders = fixture.posted.filter((message) => message.type === 'render');
+      assert.equal(renders.length, 1);
+      const cards = renders[0].cards as CardView[];
+      assert.equal(cards.length, 2);
+      for (const card of cards) {
+        assert.ok(card.dispatched);
+        assert.equal(card.dispatched[0].model, 'gpt-6.1-sol');
+        assert.equal(card.dispatched[0].effort, 'high');
+        assert.ok(card.dispatched[0].figures.some((figure) => figure.metric === 'cost'));
+      }
+      await provider.refresh(false, true);
+      assert.equal(fixture.collections(), 1);
+      assert.equal(fixture.posted.filter((message) => message.type === 'render').length, 1);
+      // An unchanged unknown source becomes eligible at its accepted deadline.
+      fs.appendFileSync(childFile, record('event_msg', 6, { type: 'task_started', turn_id: 'resumed' }));
+      Object.assign(sessions[1], { size: fs.statSync(childFile).size, mtimeMs: fs.statSync(childFile).mtimeMs });
+      await provider.refresh(false, true);
+      assert.equal(provider.dispatchDiscoveryPending, false);
+      assert.equal(provider.dispatchFacts.get(id).spend.found, false);
+      const deadline = provider.dispatchFacts.get(id).refreshAt;
+      assert.notEqual(deadline, null);
+      assert.ok(deadline > Date.now());
+      const beforeDeadline = fixture.collections();
+      assert.equal(beforeDeadline, 2);
+      fs.writeFileSync(clock, String(deadline + 1));
+      vi.setSystemTime(deadline + 1);
+      await provider.refresh(false, true);
+      assert.equal(provider.dispatchFacts.get(id).spend.found, true);
+      assert.equal(fixture.collections(), beforeDeadline + 1);
+      const refreshedRender = fixture.posted.filter((message) => message.type === 'render').at(-1);
+      assert.ok(refreshedRender);
+      const refreshedCards = refreshedRender.cards as CardView[];
+      assert.equal(refreshedCards.length, 2);
+      for (const card of refreshedCards) {
+        assert.ok(card.dispatched);
+        assert.ok(card.dispatched[0].figures.some((figure) => figure.metric === 'cost'));
+      }
+      await provider.refresh(false, true);
+      assert.equal(fixture.collections(), beforeDeadline + 1);
+    } finally {
+      vi.useRealTimers();
+      worker.stop();
+      fs.rmSync(directory, { recursive: true, force: true });
     }
-    assert.equal(fixture.collections(), 1);
-    const renders = fixture.posted.filter((message) => message.type === 'render');
-    assert.equal(renders.length, 1);
-    const cards = renders[0].cards as CardView[];
-    assert.equal(cards.length, 2);
-    for (const card of cards) {
-      assert.ok(card.dispatched);
-      assert.equal(card.dispatched[0].model, 'gpt-6.1-sol');
-      assert.equal(card.dispatched[0].effort, 'high');
-      assert.ok(card.dispatched[0].figures.some((figure) => figure.metric === 'cost'));
-    }
-    await provider.refresh(false, true);
-    assert.equal(fixture.collections(), 1);
-    assert.equal(fixture.posted.filter((message) => message.type === 'render').length, 1);
-    // An unchanged unknown source becomes eligible at its accepted deadline.
-    fs.appendFileSync(childFile, record('event_msg', 6, { type: 'task_started', turn_id: 'resumed' }));
-    Object.assign(sessions[1], { size: fs.statSync(childFile).size, mtimeMs: fs.statSync(childFile).mtimeMs });
-    await provider.refresh(false, true);
-    assert.equal(provider.dispatchDiscoveryPending, false);
-    assert.equal(provider.dispatchFacts.get(id).spend.found, false);
-    const deadline = provider.dispatchFacts.get(id).refreshAt;
-    assert.notEqual(deadline, null);
-    assert.ok(deadline > Date.now());
-    const beforeDeadline = fixture.collections();
-    assert.equal(beforeDeadline, 2);
-    fs.writeFileSync(clock, String(deadline + 1));
-    vi.setSystemTime(deadline + 1);
-    await provider.refresh(false, true);
-    assert.equal(provider.dispatchFacts.get(id).spend.found, true);
-    assert.equal(fixture.collections(), beforeDeadline + 1);
-    const refreshedRender = fixture.posted.filter((message) => message.type === 'render').at(-1);
-    assert.ok(refreshedRender);
-    const refreshedCards = refreshedRender.cards as CardView[];
-    assert.equal(refreshedCards.length, 2);
-    for (const card of refreshedCards) {
-      assert.ok(card.dispatched);
-      assert.ok(card.dispatched[0].figures.some((figure) => figure.metric === 'cost'));
-    }
-    await provider.refresh(false, true);
-    assert.equal(fixture.collections(), beforeDeadline + 1);
-  } finally {
-    vi.useRealTimers();
-    worker.stop();
-    fs.rmSync(directory, { recursive: true, force: true });
-  }
-});
+  },
+);
 
 test('dispatch figure posts retain pending revisions until the captured payload is accepted', async () => {
   const directory = tempDir('dispatch-post-revisions-');
@@ -9261,14 +9308,17 @@ const pageStyleSource = fs.readFileSync(path.join(__dirname, 'webview', 'page-st
 const navigationSource = fs.readFileSync(path.join(__dirname, 'webview', 'navigation.ts'), 'utf8');
 const styleSource = fs.readFileSync(path.join(__dirname, 'webview', 'panel.css'), 'utf8');
 const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8'));
-const progressiveWorkerSource = esbuild.buildSync({
-  entryPoints: [path.join(__dirname, 'progressiveworker-entry.ts')],
-  bundle: true,
-  platform: 'node',
-  format: 'cjs',
-  target: 'node18',
-  write: false,
-}).outputFiles[0].text;
+let cachedProgressiveWorkerSource: string | undefined;
+function getProgressiveWorkerSource(): string {
+  return (cachedProgressiveWorkerSource ??= esbuild.buildSync({
+    entryPoints: [path.join(__dirname, 'progressiveworker-entry.ts')],
+    bundle: true,
+    platform: 'node',
+    format: 'cjs',
+    target: 'node18',
+    write: false,
+  }).outputFiles[0].text);
+}
 
 // Combine host, browser, and stylesheet sources for absence checks.
 const panelSource = [
@@ -14802,6 +14852,8 @@ test('draft acceptance survives profile-save and adoption failures until removal
         },
       },
       startFreshSession: async () => live,
+      compaction: null,
+      promptAsReader,
       validateResolvedPromptAssets() {},
       withStartedSessionActivity: (_session: unknown, work: (session: typeof live) => unknown) => work(live),
       resumePlanForDraft() {},
@@ -19868,177 +19920,181 @@ test('a model-only failure never combines the new model with older Composer fact
   );
 });
 
-test('an accepted Claude worker refresh moves the composer price from the newest turn to its compaction', async () => {
-  const rows = [{ id: 'claude', label: 'Claude session', agentKey: 'claude' }];
-  const directory = tempDir('panel-host-compaction-');
-  const file = path.join(directory, 'session.jsonl');
-  const records = [
-    {
-      type: 'user',
-      promptId: 'first',
-      timestamp: new Date(1_000).toISOString(),
-      message: { role: 'user', content: [{ type: 'text', text: 'first request' }] },
-    },
-    {
-      type: 'assistant',
-      timestamp: new Date(1_500).toISOString(),
-      message: {
-        role: 'assistant',
-        id: 'first-answer',
-        model: 'claude-opus-5',
-        stop_reason: 'end_turn',
-        content: [{ type: 'text', text: 'first answer' }],
-        usage: { input_tokens: 166_934, output_tokens: 2_645 },
-      },
-    },
-    {
-      type: 'user',
-      promptId: 'second',
-      timestamp: new Date(3_000).toISOString(),
-      message: { role: 'user', content: [{ type: 'text', text: 'second request' }] },
-    },
-    {
-      type: 'assistant',
-      timestamp: new Date(3_500).toISOString(),
-      message: {
-        role: 'assistant',
-        id: 'second-answer',
-        model: 'claude-opus-5',
-        stop_reason: 'end_turn',
-        content: [{ type: 'text', text: 'second answer' }],
-        usage: { input_tokens: 0, output_tokens: 2_800, cache_creation: { ephemeral_1h_input_tokens: 193_033 } },
-      },
-    },
-  ];
-  fs.writeFileSync(file, records.map((record) => JSON.stringify(record)).join('\n') + '\n');
-  const worker = new ProgressiveWorker(progressiveWorkerSource);
-  const input = (): ProgressiveInput => {
-    const { mtimeMs, size } = revisionOf(fs.statSync(file, { bigint: true }));
-    return {
-      session: { file, sessionId: 'claude', agent: 'claude', mtimeMs, size },
-      folders: [],
-      children: [],
-      maxTurns: 40,
-      tailBytes: 4 * 1024 * 1024,
-    };
-  };
-  try {
-    const initial = await worker.run({ kind: 'window', input: input() }, 1, new AbortController().signal);
-    assert.ok(initial?.value.kind === 'window');
-    if (!initial || initial.value.kind !== 'window') {
-      throw new Error('The worker returned no initial window.');
-    }
-    const acceptedBefore = currentRecordsBySession(initial.value.read.turns, initial.value.read.compactions);
-    const second = initial.value.read.turns.find((turn) => turn.promptId === 'second');
-    assert.ok(second, 'the worker did not retain the second Claude turn');
-    assert.equal(
-      acceptedBefore.newestTurns.get('claude'),
-      second,
-      'the host selected the preceding Claude turn instead of the newer accepted turn',
-    );
-    const before = stateForRow(rows, {}, 'claude', { newest: acceptedBefore.newestTurns });
-    const beforeBasis = before.nextTurn as {
-      tokens: number;
-      outputTokens: number;
-      lastRequestAt: number;
-      afterCompaction: boolean;
-    };
-    assert.deepEqual(
+test(
+  'an accepted Claude worker refresh moves the composer price from the newest turn to its compaction',
+  { tags: ['subprocess'] },
+  async () => {
+    const rows = [{ id: 'claude', label: 'Claude session', agentKey: 'claude' }];
+    const directory = tempDir('panel-host-compaction-');
+    const file = path.join(directory, 'session.jsonl');
+    const records = [
       {
-        tokens: beforeBasis.tokens,
-        outputTokens: beforeBasis.outputTokens,
-        lastRequestAt: beforeBasis.lastRequestAt,
-        afterCompaction: beforeBasis.afterCompaction,
+        type: 'user',
+        promptId: 'first',
+        timestamp: new Date(1_000).toISOString(),
+        message: { role: 'user', content: [{ type: 'text', text: 'first request' }] },
       },
-      { tokens: 193_033, outputTokens: 2_800, lastRequestAt: 3_500, afterCompaction: false },
-    );
-    assert.deepEqual(
-      [composerView(before)?.nextTurn?.cold?.price, composerView(before)?.nextTurn?.warm?.price],
-      ['$1.96', '$0.12'],
-    );
-
-    const appended = [
       {
-        type: 'attachment',
-        timestamp: new Date(4_000).toISOString(),
-        attachment: {
-          type: 'queued_command',
-          commandMode: 'prompt',
-          origin: { kind: 'human' },
-          prompt: [{ type: 'text', text: 'queued after compaction' }],
+        type: 'assistant',
+        timestamp: new Date(1_500).toISOString(),
+        message: {
+          role: 'assistant',
+          id: 'first-answer',
+          model: 'claude-opus-5',
+          stop_reason: 'end_turn',
+          content: [{ type: 'text', text: 'first answer' }],
+          usage: { input_tokens: 166_934, output_tokens: 2_645 },
         },
       },
       {
-        type: 'system',
-        subtype: 'compact_boundary',
-        timestamp: new Date(5_000).toISOString(),
-        compactMetadata: { trigger: 'manual', preTokens: 197_164, postTokens: 11_834 },
-      },
-      {
         type: 'user',
-        timestamp: new Date(5_000).toISOString(),
-        isCompactSummary: true,
-        message: { role: 'user', content: 'carried summary' },
+        promptId: 'second',
+        timestamp: new Date(3_000).toISOString(),
+        message: { role: 'user', content: [{ type: 'text', text: 'second request' }] },
       },
       {
-        type: 'attachment',
-        timestamp: new Date(6_000).toISOString(),
-        attachment: { type: 'task_notification', status: 'completed' },
+        type: 'assistant',
+        timestamp: new Date(3_500).toISOString(),
+        message: {
+          role: 'assistant',
+          id: 'second-answer',
+          model: 'claude-opus-5',
+          stop_reason: 'end_turn',
+          content: [{ type: 'text', text: 'second answer' }],
+          usage: { input_tokens: 0, output_tokens: 2_800, cache_creation: { ephemeral_1h_input_tokens: 193_033 } },
+        },
       },
     ];
-    fs.appendFileSync(file, appended.map((record) => JSON.stringify(record)).join('\n') + '\n');
-    const refreshedInput = input();
-    const result = await worker.run(
-      { kind: 'window', input: refreshedInput, checkpoint: initial.value.checkpoint },
-      2,
-      new AbortController().signal,
-    );
-    assert.ok(result?.value.kind === 'window');
-    if (!result || result.value.kind !== 'window') {
-      throw new Error('The worker returned no refreshed window.');
-    }
-    assert.equal(acceptsProgressiveResult(result, 2, refreshedInput.session), true);
-    const acceptedAfter = currentRecordsBySession(result.value.read.turns, result.value.read.compactions);
-    const after = result.value.read.compactions.at(-1);
-    assert.ok(after, 'the worker checkpoint lost the Claude compaction');
-    assert.equal(
-      turnKey(acceptedAfter.newestTurns.get('claude')!),
-      turnKey(second),
-      'the compaction refresh replaced the newest Claude turn with its predecessor',
-    );
-    assert.equal(
-      acceptedAfter.newestCompactions.get('claude'),
-      after,
-      'the host did not retain the newest Claude compaction identity',
-    );
-    const refreshed = stateForRow(rows, {}, 'claude', {
-      newest: acceptedAfter.newestTurns,
-      compactions: acceptedAfter.newestCompactions,
-    });
-    const refreshedBasis = refreshed.nextTurn as {
-      tokens: number;
-      outputTokens: number;
-      lastRequestAt: number;
-      afterCompaction: boolean;
+    fs.writeFileSync(file, records.map((record) => JSON.stringify(record)).join('\n') + '\n');
+    const worker = new ProgressiveWorker(getProgressiveWorkerSource());
+    const input = (): ProgressiveInput => {
+      const { mtimeMs, size } = revisionOf(fs.statSync(file, { bigint: true }));
+      return {
+        session: { file, sessionId: 'claude', agent: 'claude', mtimeMs, size },
+        folders: [],
+        children: [],
+        maxTurns: 40,
+        tailBytes: 4 * 1024 * 1024,
+      };
     };
-    assert.deepEqual(
-      {
-        tokens: refreshedBasis.tokens,
-        outputTokens: refreshedBasis.outputTokens,
-        lastRequestAt: refreshedBasis.lastRequestAt,
-        afterCompaction: refreshedBasis.afterCompaction,
-      },
-      { tokens: 11_834, outputTokens: 0, lastRequestAt: 5_000, afterCompaction: true },
-    );
-    assert.deepEqual(
-      [composerView(refreshed)?.nextTurn?.cold?.price, composerView(refreshed)?.nextTurn?.warm],
-      ['$0.12', null],
-    );
-  } finally {
-    worker.stop();
-    fs.rmSync(directory, { recursive: true, force: true });
-  }
-});
+    try {
+      const initial = await worker.run({ kind: 'window', input: input() }, 1, new AbortController().signal);
+      assert.ok(initial?.value.kind === 'window');
+      if (!initial || initial.value.kind !== 'window') {
+        throw new Error('The worker returned no initial window.');
+      }
+      const acceptedBefore = currentRecordsBySession(initial.value.read.turns, initial.value.read.compactions);
+      const second = initial.value.read.turns.find((turn) => turn.promptId === 'second');
+      assert.ok(second, 'the worker did not retain the second Claude turn');
+      assert.equal(
+        acceptedBefore.newestTurns.get('claude'),
+        second,
+        'the host selected the preceding Claude turn instead of the newer accepted turn',
+      );
+      const before = stateForRow(rows, {}, 'claude', { newest: acceptedBefore.newestTurns });
+      const beforeBasis = before.nextTurn as {
+        tokens: number;
+        outputTokens: number;
+        lastRequestAt: number;
+        afterCompaction: boolean;
+      };
+      assert.deepEqual(
+        {
+          tokens: beforeBasis.tokens,
+          outputTokens: beforeBasis.outputTokens,
+          lastRequestAt: beforeBasis.lastRequestAt,
+          afterCompaction: beforeBasis.afterCompaction,
+        },
+        { tokens: 193_033, outputTokens: 2_800, lastRequestAt: 3_500, afterCompaction: false },
+      );
+      assert.deepEqual(
+        [composerView(before)?.nextTurn?.cold?.price, composerView(before)?.nextTurn?.warm?.price],
+        ['$1.96', '$0.12'],
+      );
+
+      const appended = [
+        {
+          type: 'attachment',
+          timestamp: new Date(4_000).toISOString(),
+          attachment: {
+            type: 'queued_command',
+            commandMode: 'prompt',
+            origin: { kind: 'human' },
+            prompt: [{ type: 'text', text: 'queued after compaction' }],
+          },
+        },
+        {
+          type: 'system',
+          subtype: 'compact_boundary',
+          timestamp: new Date(5_000).toISOString(),
+          compactMetadata: { trigger: 'manual', preTokens: 197_164, postTokens: 11_834 },
+        },
+        {
+          type: 'user',
+          timestamp: new Date(5_000).toISOString(),
+          isCompactSummary: true,
+          message: { role: 'user', content: 'carried summary' },
+        },
+        {
+          type: 'attachment',
+          timestamp: new Date(6_000).toISOString(),
+          attachment: { type: 'task_notification', status: 'completed' },
+        },
+      ];
+      fs.appendFileSync(file, appended.map((record) => JSON.stringify(record)).join('\n') + '\n');
+      const refreshedInput = input();
+      const result = await worker.run(
+        { kind: 'window', input: refreshedInput, checkpoint: initial.value.checkpoint },
+        2,
+        new AbortController().signal,
+      );
+      assert.ok(result?.value.kind === 'window');
+      if (!result || result.value.kind !== 'window') {
+        throw new Error('The worker returned no refreshed window.');
+      }
+      assert.equal(acceptsProgressiveResult(result, 2, refreshedInput.session), true);
+      const acceptedAfter = currentRecordsBySession(result.value.read.turns, result.value.read.compactions);
+      const after = result.value.read.compactions.at(-1);
+      assert.ok(after, 'the worker checkpoint lost the Claude compaction');
+      assert.equal(
+        turnKey(acceptedAfter.newestTurns.get('claude')!),
+        turnKey(second),
+        'the compaction refresh replaced the newest Claude turn with its predecessor',
+      );
+      assert.equal(
+        acceptedAfter.newestCompactions.get('claude'),
+        after,
+        'the host did not retain the newest Claude compaction identity',
+      );
+      const refreshed = stateForRow(rows, {}, 'claude', {
+        newest: acceptedAfter.newestTurns,
+        compactions: acceptedAfter.newestCompactions,
+      });
+      const refreshedBasis = refreshed.nextTurn as {
+        tokens: number;
+        outputTokens: number;
+        lastRequestAt: number;
+        afterCompaction: boolean;
+      };
+      assert.deepEqual(
+        {
+          tokens: refreshedBasis.tokens,
+          outputTokens: refreshedBasis.outputTokens,
+          lastRequestAt: refreshedBasis.lastRequestAt,
+          afterCompaction: refreshedBasis.afterCompaction,
+        },
+        { tokens: 11_834, outputTokens: 0, lastRequestAt: 5_000, afterCompaction: true },
+      );
+      assert.deepEqual(
+        [composerView(refreshed)?.nextTurn?.cold?.price, composerView(refreshed)?.nextTurn?.warm],
+        ['$0.12', null],
+      );
+    } finally {
+      worker.stop();
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  },
+);
 
 test('an accepted Codex compaction removes the price until a later request supplies its context', () => {
   const rows = [{ id: 'codex', label: 'Codex session', agentKey: 'codex' }];
@@ -30541,162 +30597,170 @@ test('the hint box draws over every popover', () => {
   }
 });
 
-test('a static stopped Codex source continues model recovery through the host without another refresh', async () => {
-  const directory = tempDir('host-stopped-model-');
-  const file = path.join(directory, 'source.jsonl');
-  const record = (type: string, second: number, payload: object) => ({
-    type,
-    timestamp: new Date(second * 1000).toISOString(),
-    payload,
-  });
-  fs.writeFileSync(
-    file,
-    [
-      record('session_meta', 0, { id: 'source', cwd: '/repo' }),
-      record('event_msg', 1, { type: 'task_started', turn_id: 'first' }),
-      record('turn_context', 2, { turn_id: 'first', model: 'gpt-6-astra', effort: 'high' }),
-      record('event_msg', 3, { type: 'task_complete', turn_id: 'first' }),
-      { type: 'ignored', payload: 'x'.repeat(4 * 1024 * 1024) },
-      record('event_msg', 4, { type: 'task_started', turn_id: 'stopped', model_context_window: 258400 }),
-      record('event_msg', 5, { type: 'turn_aborted', turn_id: 'stopped', reason: 'interrupted' }),
-    ]
-      .map((value) => JSON.stringify(value))
-      .join('\n') + '\n',
-  );
-  const stat = fs.statSync(file);
-  const session = { file, sessionId: 'source', agent: 'codex', size: stat.size, mtimeMs: stat.mtimeMs };
-  const fixture = metadataEnrichmentFixture([session]);
-  const provider = fixture.provider;
-  let pendingReplies = 0;
-  const run = fixture.worker.run.bind(fixture.worker);
-  fixture.worker.run = async (request, generation, signal) => {
-    const result = await run(request, generation, signal);
-    if (result?.value.kind === 'window' && result.value.recoveryPending) {
-      pendingReplies++;
-      assert.ok((result.value.recoveryBytes ?? 0) > 0);
-      assert.ok((result.value.recoveryBytes ?? 0) <= 1024 * 1024);
-    }
-    return result;
-  };
-  Object.assign(provider, {
-    showing: 'source',
-    selectionGeneration: 1,
-    updateHistoryAfterAcceptedWindow() {},
-    codexSubagents: [],
-    hydrateCommitRepositories: async () => false,
-    progressiveInput: () => ({ session, folders: [], children: [], maxTurns: 40, tailBytes: 512 }),
-    progressiveCurrent: PanelProvider.prototype['progressiveCurrent'],
-    structuralKey: PanelProvider.prototype['structuralKey'],
-    agentFactsCurrent: () => true,
-    agentSpendKey: () => provider.cache.get(file)?.agentKey ?? '',
-    commitRepositoryContexts: () => [],
-  });
-  provider.hostSessions.set(provider.hosts[0], 'source');
-  try {
-    await provider.completeSelectedWindow('source', 1);
-    assert.equal(provider.attachmentRecoveryPending('source'), false);
-    await vi.waitFor(() => assert.equal(provider.cache.get(file)?.read.lastReportedModel, 'gpt-6-astra'), {
-      timeout: 10000,
+test(
+  'a static stopped Codex source continues model recovery through the host without another refresh',
+  { tags: ['subprocess'] },
+  async () => {
+    const directory = tempDir('host-stopped-model-');
+    const file = path.join(directory, 'source.jsonl');
+    const record = (type: string, second: number, payload: object) => ({
+      type,
+      timestamp: new Date(second * 1000).toISOString(),
+      payload,
     });
-    assert.ok(pendingReplies > 1);
-    const read = provider.cache.get(file).read;
-    const runtime = composerRuntimeBySession(read.turns, new Map(), new Map([['source', read.lastReportedModel]]));
-    const state = stateForRow([{ id: 'source', label: 'Source', agentKey: 'codex' }], {}, 'source', { runtime });
-    assert.equal(composerView(state)!.picks.find((pick) => pick.control === 'model')!.label, 'gpt-6-astra');
-    assert.equal(state.context, null);
-    assert.equal(state.nextTurn, null);
-  } finally {
-    fixture.worker.stop();
-  }
-});
-
-test('a small Claude worker tail carries recovered model evidence through host settings into the inherited setup', async () => {
-  const directory = tempDir('host-attachment-recovery-');
-  const file = path.join(directory, 'source.jsonl');
-  const encode = (records: unknown[]) => records.map((record) => JSON.stringify(record)).join('\n') + '\n';
-  fs.writeFileSync(
-    file,
-    encode([
-      {
-        type: 'attachment',
-        attachment: { type: 'model', identity: { modelId: 'us-gov.anthropic.claude-opus-5-5[1m]' } },
-      },
-      ...Array.from({ length: 160 }, () => ({ type: 'ignored', text: 'x'.repeat(16384) })),
-      { type: 'user', timestamp: new Date(1000).toISOString(), message: { role: 'user', content: 'Go' } },
-      {
-        type: 'assistant',
-        effort: 'high',
-        timestamp: new Date(2000).toISOString(),
-        message: {
-          role: 'assistant',
-          id: 'answer',
-          model: 'claude-opus-5-5',
-          stop_reason: 'end_turn',
-          content: [{ type: 'text', text: 'Done' }],
-        },
-      },
-    ]),
-  );
-  const worker = new ProgressiveWorker(progressiveWorkerSource);
-  const stat = revisionOf(fs.statSync(file, { bigint: true }));
-  const input: ProgressiveInput = {
-    session: { file, sessionId: 'source', agent: 'claude', size: stat.size, mtimeMs: stat.mtimeMs },
-    folders: [],
-    children: [],
-    maxTurns: 40,
-    tailBytes: 2048,
-  };
-  const signal = new AbortController().signal;
-  try {
-    let result = await worker.run({ kind: 'window', input }, 1, signal);
-    assert.ok(result?.value.kind === 'window');
-    assert.equal(result.value.readBytes, 2048);
-    assert.equal(result.value.recoveryPending, true);
-    const deadline = Date.now() + 10000;
-    while (result.value.recoveryPending && Date.now() < deadline) {
-      result = await worker.run({ kind: 'window', input, checkpoint: result.value.checkpoint }, 1, signal);
-      assert.ok(result?.value.kind === 'window');
-    }
-    assert.equal(result.value.recoveryPending, false);
-    let newest = await worker.run({ kind: 'window', input: { ...input, tailBytes: 128 } }, 2, signal);
-    assert.ok(newest?.value.kind === 'window');
-    const newestDeadline = Date.now() + 10000;
-    while (newest.value.recoveryPending && Date.now() < newestDeadline) {
-      newest = await worker.run(
-        { kind: 'window', input: { ...input, tailBytes: 128 }, checkpoint: newest.value.checkpoint },
-        2,
-        signal,
-      );
-      assert.ok(newest?.value.kind === 'window');
-    }
-    assert.equal(newest.value.recoveryPending, false);
-    assert.equal(newest.value.read.turns[0].modelAttachment, 'us-gov.anthropic.claude-opus-5-5[1m]');
-    const runtime = composerRuntimeBySession(result.value.read.turns, new Map());
-    const state = stateForRow([{ id: 'source', label: 'Source', agentKey: 'claude' }], {}, 'source', { runtime });
-    const efforts = [{ value: 'high', label: 'High', description: '' }];
-    const choice = (value: string, resolvedModel: string) => ({
-      value,
-      resolvedModel,
-      label: value,
-      description: '',
-      efforts,
-    });
-    const catalog = [
-      choice('default', 'claude-opus-5-5'),
-      choice('opus', 'claude-opus-5-5'),
-      choice('opus[1m]', 'claude-opus-5-5[1m]'),
-    ];
-    state.models = catalog;
-    assert.equal(state.settings.confirmedModelAttachment, 'us-gov.anthropic.claude-opus-5-5[1m]');
-    assert.equal(
-      launcherProfile(sessionLauncherView(state, [], { claude: catalog }), { kind: 'row', key: 'current' })?.model,
-      'opus[1m]',
+    fs.writeFileSync(
+      file,
+      [
+        record('session_meta', 0, { id: 'source', cwd: '/repo' }),
+        record('event_msg', 1, { type: 'task_started', turn_id: 'first' }),
+        record('turn_context', 2, { turn_id: 'first', model: 'gpt-6-astra', effort: 'high' }),
+        record('event_msg', 3, { type: 'task_complete', turn_id: 'first' }),
+        { type: 'ignored', payload: 'x'.repeat(4 * 1024 * 1024) },
+        record('event_msg', 4, { type: 'task_started', turn_id: 'stopped', model_context_window: 258400 }),
+        record('event_msg', 5, { type: 'turn_aborted', turn_id: 'stopped', reason: 'interrupted' }),
+      ]
+        .map((value) => JSON.stringify(value))
+        .join('\n') + '\n',
     );
-  } finally {
-    worker.stop();
-    fs.rmSync(directory, { recursive: true, force: true });
-  }
-});
+    const stat = fs.statSync(file);
+    const session = { file, sessionId: 'source', agent: 'codex', size: stat.size, mtimeMs: stat.mtimeMs };
+    const fixture = metadataEnrichmentFixture([session]);
+    const provider = fixture.provider;
+    let pendingReplies = 0;
+    const run = fixture.worker.run.bind(fixture.worker);
+    fixture.worker.run = async (request, generation, signal) => {
+      const result = await run(request, generation, signal);
+      if (result?.value.kind === 'window' && result.value.recoveryPending) {
+        pendingReplies++;
+        assert.ok((result.value.recoveryBytes ?? 0) > 0);
+        assert.ok((result.value.recoveryBytes ?? 0) <= 1024 * 1024);
+      }
+      return result;
+    };
+    Object.assign(provider, {
+      showing: 'source',
+      selectionGeneration: 1,
+      updateHistoryAfterAcceptedWindow() {},
+      codexSubagents: [],
+      hydrateCommitRepositories: async () => false,
+      progressiveInput: () => ({ session, folders: [], children: [], maxTurns: 40, tailBytes: 512 }),
+      progressiveCurrent: PanelProvider.prototype['progressiveCurrent'],
+      structuralKey: PanelProvider.prototype['structuralKey'],
+      agentFactsCurrent: () => true,
+      agentSpendKey: () => provider.cache.get(file)?.agentKey ?? '',
+      commitRepositoryContexts: () => [],
+    });
+    provider.hostSessions.set(provider.hosts[0], 'source');
+    try {
+      await provider.completeSelectedWindow('source', 1);
+      assert.equal(provider.attachmentRecoveryPending('source'), false);
+      await vi.waitFor(() => assert.equal(provider.cache.get(file)?.read.lastReportedModel, 'gpt-6-astra'), {
+        timeout: 10000,
+      });
+      assert.ok(pendingReplies > 1);
+      const read = provider.cache.get(file).read;
+      const runtime = composerRuntimeBySession(read.turns, new Map(), new Map([['source', read.lastReportedModel]]));
+      const state = stateForRow([{ id: 'source', label: 'Source', agentKey: 'codex' }], {}, 'source', { runtime });
+      assert.equal(composerView(state)!.picks.find((pick) => pick.control === 'model')!.label, 'gpt-6-astra');
+      assert.equal(state.context, null);
+      assert.equal(state.nextTurn, null);
+    } finally {
+      fixture.worker.stop();
+    }
+  },
+);
+
+test(
+  'a small Claude worker tail carries recovered model evidence through host settings into the inherited setup',
+  { tags: ['subprocess'] },
+  async () => {
+    const directory = tempDir('host-attachment-recovery-');
+    const file = path.join(directory, 'source.jsonl');
+    const encode = (records: unknown[]) => records.map((record) => JSON.stringify(record)).join('\n') + '\n';
+    fs.writeFileSync(
+      file,
+      encode([
+        {
+          type: 'attachment',
+          attachment: { type: 'model', identity: { modelId: 'us-gov.anthropic.claude-opus-5-5[1m]' } },
+        },
+        ...Array.from({ length: 160 }, () => ({ type: 'ignored', text: 'x'.repeat(16384) })),
+        { type: 'user', timestamp: new Date(1000).toISOString(), message: { role: 'user', content: 'Go' } },
+        {
+          type: 'assistant',
+          effort: 'high',
+          timestamp: new Date(2000).toISOString(),
+          message: {
+            role: 'assistant',
+            id: 'answer',
+            model: 'claude-opus-5-5',
+            stop_reason: 'end_turn',
+            content: [{ type: 'text', text: 'Done' }],
+          },
+        },
+      ]),
+    );
+    const worker = new ProgressiveWorker(getProgressiveWorkerSource());
+    const stat = revisionOf(fs.statSync(file, { bigint: true }));
+    const input: ProgressiveInput = {
+      session: { file, sessionId: 'source', agent: 'claude', size: stat.size, mtimeMs: stat.mtimeMs },
+      folders: [],
+      children: [],
+      maxTurns: 40,
+      tailBytes: 2048,
+    };
+    const signal = new AbortController().signal;
+    try {
+      let result = await worker.run({ kind: 'window', input }, 1, signal);
+      assert.ok(result?.value.kind === 'window');
+      assert.equal(result.value.readBytes, 2048);
+      assert.equal(result.value.recoveryPending, true);
+      const deadline = Date.now() + 10000;
+      while (result.value.recoveryPending && Date.now() < deadline) {
+        result = await worker.run({ kind: 'window', input, checkpoint: result.value.checkpoint }, 1, signal);
+        assert.ok(result?.value.kind === 'window');
+      }
+      assert.equal(result.value.recoveryPending, false);
+      let newest = await worker.run({ kind: 'window', input: { ...input, tailBytes: 128 } }, 2, signal);
+      assert.ok(newest?.value.kind === 'window');
+      const newestDeadline = Date.now() + 10000;
+      while (newest.value.recoveryPending && Date.now() < newestDeadline) {
+        newest = await worker.run(
+          { kind: 'window', input: { ...input, tailBytes: 128 }, checkpoint: newest.value.checkpoint },
+          2,
+          signal,
+        );
+        assert.ok(newest?.value.kind === 'window');
+      }
+      assert.equal(newest.value.recoveryPending, false);
+      assert.equal(newest.value.read.turns[0].modelAttachment, 'us-gov.anthropic.claude-opus-5-5[1m]');
+      const runtime = composerRuntimeBySession(result.value.read.turns, new Map());
+      const state = stateForRow([{ id: 'source', label: 'Source', agentKey: 'claude' }], {}, 'source', { runtime });
+      const efforts = [{ value: 'high', label: 'High', description: '' }];
+      const choice = (value: string, resolvedModel: string) => ({
+        value,
+        resolvedModel,
+        label: value,
+        description: '',
+        efforts,
+      });
+      const catalog = [
+        choice('default', 'claude-opus-5-5'),
+        choice('opus', 'claude-opus-5-5'),
+        choice('opus[1m]', 'claude-opus-5-5[1m]'),
+      ];
+      state.models = catalog;
+      assert.equal(state.settings.confirmedModelAttachment, 'us-gov.anthropic.claude-opus-5-5[1m]');
+      assert.equal(
+        launcherProfile(sessionLauncherView(state, [], { claude: catalog }), { kind: 'row', key: 'current' })?.model,
+        'opus[1m]',
+      );
+    } finally {
+      worker.stop();
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  },
+);
 
 test.each(['wide', 'narrow', 'resized', 'replaced', 'missing-wide', 'missing-narrow'])(
   'fresh-project New opens the New session menu at its current visible control: %s',
@@ -33754,6 +33818,7 @@ function draftDeliveryCallback(panel: any, rejected: boolean): void {
     panel,
     startFreshSession: async () => live,
     compaction: null,
+    promptAsReader,
     validateResolvedPromptAssets() {},
     withStartedSessionActivity: (_session: unknown, work: (session: typeof live) => unknown) => work(live),
     resumePlanForDraft() {},

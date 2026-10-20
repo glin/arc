@@ -1,7 +1,8 @@
+// @module-tag subprocess
 import { claudeDispatchTranscript } from './turnfixtures';
 import { sessionCoverageMember, sessionPresence, reconcileSessionCollisions } from './sessioncoverage';
 import { sessionSourceKey, sessionPageSources } from './sessionreads';
-import { test, vi } from 'vitest';
+import { beforeAll, test, vi } from 'vitest';
 import { pendingResponseSessionAdmitted, resolveResponseSession } from './domain/session-link';
 import { createPanelVisibility } from './panelvisibility';
 import { outcomesFor } from './timelinestate';
@@ -4585,14 +4586,17 @@ function titleRollout(directory: string, id: string, title: string, bytes = 0) {
   return { file, sessionId: id, agent: 'codex', ...revisionOf(fs.statSync(file, { bigint: true })), activity: 1 };
 }
 
-const titleWorkerSource = buildSync({
-  entryPoints: [path.join(__dirname, 'progressiveworker-entry.ts')],
-  bundle: true,
-  platform: 'node',
-  format: 'cjs',
-  target: 'node18',
-  write: false,
-}).outputFiles[0].text;
+let titleWorkerSource: string;
+beforeAll(() => {
+  titleWorkerSource = buildSync({
+    entryPoints: [path.join(__dirname, 'progressiveworker-entry.ts')],
+    bundle: true,
+    platform: 'node',
+    format: 'cjs',
+    target: 'node18',
+    write: false,
+  }).outputFiles[0].text;
+});
 
 function titleWorker(extraSource = '') {
   return new ProgressiveWorker(titleWorkerSource + extraSource);

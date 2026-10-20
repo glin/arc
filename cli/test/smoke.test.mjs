@@ -473,6 +473,7 @@ test.for(
   ),
 )(
   'personal skills folders linked to the other agent are left unchanged: %s, %s link, order %j',
+  { tags: ['subprocess'] },
   ([layout, kind, order], context) => {
     const [linkPath, targetPath, real, linked] = linkedLayouts[layout];
     const payload = readSkillPayload(cli);
@@ -505,65 +506,73 @@ test.for(
   },
 );
 
-test('a skills folder linked elsewhere is left unchanged and reports the skill at its target', () => {
-  const payload = readSkillPayload(cli);
-  const home = mkdtempSync(join(realpathSync(tmpdir()), 'arc-linked-elsewhere-'));
-  const target = join(home, 'dotfiles/skills');
-  try {
-    mkdirSync(target, { recursive: true });
-    tryLink(target, join(home, '.agents/skills'), linkKinds[0]);
-    const missing = runSkillCommand(home, 'install', 'codex');
-    assert.equal(missing.status, 1, JSON.stringify(missing));
-    assert.equal(missing.results[0].status, 'incomplete');
-    assert.match(missing.results[0].reason, /linked to .*dotfiles.*missing.*copy or link .* to .*dotfiles/);
-    assert.doesNotMatch(missing.results[0].reason, /README/);
-    assert.deepEqual(fs.readdirSync(target), []);
-    fs.cpSync(payload.directory, join(target, 'arc-sessions'), { recursive: true });
-    for (const action of ['install', 'update']) {
-      const matching = runSkillCommand(home, action, 'codex');
-      assert.equal(matching.status, 0, JSON.stringify(matching));
-      assert.equal(matching.results[0].status, 'linked');
+test(
+  'a skills folder linked elsewhere is left unchanged and reports the skill at its target',
+  { tags: ['subprocess'] },
+  () => {
+    const payload = readSkillPayload(cli);
+    const home = mkdtempSync(join(realpathSync(tmpdir()), 'arc-linked-elsewhere-'));
+    const target = join(home, 'dotfiles/skills');
+    try {
+      mkdirSync(target, { recursive: true });
+      tryLink(target, join(home, '.agents/skills'), linkKinds[0]);
+      const missing = runSkillCommand(home, 'install', 'codex');
+      assert.equal(missing.status, 1, JSON.stringify(missing));
+      assert.equal(missing.results[0].status, 'incomplete');
+      assert.match(missing.results[0].reason, /linked to .*dotfiles.*missing.*copy or link .* to .*dotfiles/);
+      assert.doesNotMatch(missing.results[0].reason, /README/);
+      assert.deepEqual(fs.readdirSync(target), []);
+      fs.cpSync(payload.directory, join(target, 'arc-sessions'), { recursive: true });
+      for (const action of ['install', 'update']) {
+        const matching = runSkillCommand(home, action, 'codex');
+        assert.equal(matching.status, 0, JSON.stringify(matching));
+        assert.equal(matching.results[0].status, 'linked');
+      }
+      writeFileSync(join(target, 'arc-sessions/SKILL.md'), 'reader edit');
+      const changed = runSkillCommand(home, 'update', 'codex');
+      assert.equal(changed.results[0].status, 'incomplete');
+      assert.match(changed.results[0].reason, /different from this version/);
+      assert.equal(readFileSync(join(target, 'arc-sessions/SKILL.md'), 'utf8'), 'reader edit');
+      const removed = runSkillCommand(home, 'remove', 'codex');
+      assert.equal(removed.status, 0, JSON.stringify(removed));
+      assert.equal(removed.results[0].status, 'linked');
+      assert.match(removed.results[0].reason, /by hand/);
+      assert.equal(fs.existsSync(join(target, 'arc-sessions/SKILL.md')), true);
+      assert.equal(fs.existsSync(join(home, '.agents/skills.arc-skill-control')), false);
+    } finally {
+      unlink(join(home, '.agents/skills'));
+      rmSync(home, { recursive: true, force: true });
     }
-    writeFileSync(join(target, 'arc-sessions/SKILL.md'), 'reader edit');
-    const changed = runSkillCommand(home, 'update', 'codex');
-    assert.equal(changed.results[0].status, 'incomplete');
-    assert.match(changed.results[0].reason, /different from this version/);
-    assert.equal(readFileSync(join(target, 'arc-sessions/SKILL.md'), 'utf8'), 'reader edit');
-    const removed = runSkillCommand(home, 'remove', 'codex');
-    assert.equal(removed.status, 0, JSON.stringify(removed));
-    assert.equal(removed.results[0].status, 'linked');
-    assert.match(removed.results[0].reason, /by hand/);
-    assert.equal(fs.existsSync(join(target, 'arc-sessions/SKILL.md')), true);
-    assert.equal(fs.existsSync(join(home, '.agents/skills.arc-skill-control')), false);
-  } finally {
-    unlink(join(home, '.agents/skills'));
-    rmSync(home, { recursive: true, force: true });
-  }
-});
+  },
+);
 
-test('removing from a folder linked to an Arc-owned skill needs no action and leaves the skill in place', () => {
-  const payload = readSkillPayload(cli);
-  const home = mkdtempSync(join(realpathSync(tmpdir()), 'arc-linked-remove-'));
-  try {
-    mkdirSync(join(home, '.claude/skills'), { recursive: true });
-    tryLink(join(home, '.claude/skills'), join(home, '.agents/skills'), linkKinds[0]);
-    assert.equal(runSkillCommand(home, 'install', 'claude').results[0].status, 'installed');
-    const left = runSkillCommand(home, 'remove', 'codex');
-    assert.equal(left.status, 0, JSON.stringify(left));
-    assert.equal(left.results[0].status, 'linked');
-    assert.match(left.results[0].reason, /no action is needed/);
-    assert.doesNotMatch(left.results[0].reason, /arc skills|by hand|README/);
-    expectPayloadCopy(join(home, '.claude/skills/arc-sessions'), payload);
-    const removed = runSkillCommand(home, 'remove', 'claude');
-    assert.equal(removed.status, 0, JSON.stringify(removed));
-    assert.equal(removed.results[0].status, 'removed');
-    assert.match(removed.results[0].reason, /Codex also read this skill/);
-    assert.equal(fs.existsSync(join(home, '.claude/skills/arc-sessions')), false);
-  } finally {
-    unlink(join(home, '.agents/skills'));
-    rmSync(home, { recursive: true, force: true });
-  }
-});
+test(
+  'removing from a folder linked to an Arc-owned skill needs no action and leaves the skill in place',
+  { tags: ['subprocess'] },
+  () => {
+    const payload = readSkillPayload(cli);
+    const home = mkdtempSync(join(realpathSync(tmpdir()), 'arc-linked-remove-'));
+    try {
+      mkdirSync(join(home, '.claude/skills'), { recursive: true });
+      tryLink(join(home, '.claude/skills'), join(home, '.agents/skills'), linkKinds[0]);
+      assert.equal(runSkillCommand(home, 'install', 'claude').results[0].status, 'installed');
+      const left = runSkillCommand(home, 'remove', 'codex');
+      assert.equal(left.status, 0, JSON.stringify(left));
+      assert.equal(left.results[0].status, 'linked');
+      assert.match(left.results[0].reason, /no action is needed/);
+      assert.doesNotMatch(left.results[0].reason, /arc skills|by hand|README/);
+      expectPayloadCopy(join(home, '.claude/skills/arc-sessions'), payload);
+      const removed = runSkillCommand(home, 'remove', 'claude');
+      assert.equal(removed.status, 0, JSON.stringify(removed));
+      assert.equal(removed.results[0].status, 'removed');
+      assert.match(removed.results[0].reason, /Codex also read this skill/);
+      assert.equal(fs.existsSync(join(home, '.claude/skills/arc-sessions')), false);
+    } finally {
+      unlink(join(home, '.agents/skills'));
+      rmSync(home, { recursive: true, force: true });
+    }
+  },
+);
 
 test('a linked folder removal reads nothing inside the skill at the target', async () => {
   const payload = readSkillPayload(cli);
@@ -592,50 +601,58 @@ test('a linked folder removal reads nothing inside the skill at the target', asy
   }
 });
 
-test('a linked folder names the other agent install command only for a skill that is missing there', () => {
-  const home = mkdtempSync(join(realpathSync(tmpdir()), 'arc-linked-userowned-'));
-  try {
-    mkdirSync(join(home, '.claude/skills'), { recursive: true });
-    tryLink(join(home, '.claude/skills'), join(home, '.agents/skills'), linkKinds[0]);
-    const missing = runSkillCommand(home, 'install', 'codex');
-    assert.equal(missing.results[0].status, 'incomplete', JSON.stringify(missing));
-    assert.match(missing.results[0].reason, /arc skills install --agent claude/);
-    assert.equal(fs.existsSync(join(home, '.claude/skills/arc-sessions')), false);
-  } finally {
-    unlink(join(home, '.agents/skills'));
-    rmSync(home, { recursive: true, force: true });
-  }
-});
-
-test('a linked folder needs no action after a person edits or replaces the copy in the other agent folder', () => {
-  const payload = readSkillPayload(cli);
-  const home = mkdtempSync(join(realpathSync(tmpdir()), 'arc-linked-replaced-'));
-  const skill = join(home, '.claude/skills/arc-sessions');
-  try {
-    mkdirSync(join(home, '.claude/skills'), { recursive: true });
-    tryLink(join(home, '.claude/skills'), join(home, '.agents/skills'), linkKinds[0]);
-    assert.equal(runSkillCommand(home, 'install', 'claude').results[0].status, 'installed');
-    for (const scenario of ['an edited Arc install', 'a copy made by hand']) {
-      if (scenario === 'a copy made by hand') {
-        rmSync(skill, { recursive: true, force: true });
-        rmSync(join(home, '.claude/skills.arc-skill-control'), { recursive: true, force: true });
-        fs.cpSync(payload.directory, skill, { recursive: true });
-      }
-      writeFileSync(join(skill, 'SKILL.md'), `reader edit of ${scenario}`);
-      for (const action of ['remove', 'update', 'install']) {
-        const run = runSkillCommand(home, action, 'codex');
-        assert.equal(run.status, 0, `${scenario}, ${action}: ${JSON.stringify(run)}`);
-        assert.equal(run.results[0].status, 'linked', `${scenario}, ${action}`);
-        assert.match(run.results[0].reason, /no action is needed/);
-        assert.doesNotMatch(run.results[0].reason, /arc skills|by hand|README/);
-        assert.equal(readFileSync(join(skill, 'SKILL.md'), 'utf8'), `reader edit of ${scenario}`);
-      }
+test(
+  'a linked folder names the other agent install command only for a skill that is missing there',
+  { tags: ['subprocess'] },
+  () => {
+    const home = mkdtempSync(join(realpathSync(tmpdir()), 'arc-linked-userowned-'));
+    try {
+      mkdirSync(join(home, '.claude/skills'), { recursive: true });
+      tryLink(join(home, '.claude/skills'), join(home, '.agents/skills'), linkKinds[0]);
+      const missing = runSkillCommand(home, 'install', 'codex');
+      assert.equal(missing.results[0].status, 'incomplete', JSON.stringify(missing));
+      assert.match(missing.results[0].reason, /arc skills install --agent claude/);
+      assert.equal(fs.existsSync(join(home, '.claude/skills/arc-sessions')), false);
+    } finally {
+      unlink(join(home, '.agents/skills'));
+      rmSync(home, { recursive: true, force: true });
     }
-  } finally {
-    unlink(join(home, '.agents/skills'));
-    rmSync(home, { recursive: true, force: true });
-  }
-});
+  },
+);
+
+test(
+  'a linked folder needs no action after a person edits or replaces the copy in the other agent folder',
+  { tags: ['subprocess'] },
+  () => {
+    const payload = readSkillPayload(cli);
+    const home = mkdtempSync(join(realpathSync(tmpdir()), 'arc-linked-replaced-'));
+    const skill = join(home, '.claude/skills/arc-sessions');
+    try {
+      mkdirSync(join(home, '.claude/skills'), { recursive: true });
+      tryLink(join(home, '.claude/skills'), join(home, '.agents/skills'), linkKinds[0]);
+      assert.equal(runSkillCommand(home, 'install', 'claude').results[0].status, 'installed');
+      for (const scenario of ['an edited Arc install', 'a copy made by hand']) {
+        if (scenario === 'a copy made by hand') {
+          rmSync(skill, { recursive: true, force: true });
+          rmSync(join(home, '.claude/skills.arc-skill-control'), { recursive: true, force: true });
+          fs.cpSync(payload.directory, skill, { recursive: true });
+        }
+        writeFileSync(join(skill, 'SKILL.md'), `reader edit of ${scenario}`);
+        for (const action of ['remove', 'update', 'install']) {
+          const run = runSkillCommand(home, action, 'codex');
+          assert.equal(run.status, 0, `${scenario}, ${action}: ${JSON.stringify(run)}`);
+          assert.equal(run.results[0].status, 'linked', `${scenario}, ${action}`);
+          assert.match(run.results[0].reason, /no action is needed/);
+          assert.doesNotMatch(run.results[0].reason, /arc skills|by hand|README/);
+          assert.equal(readFileSync(join(skill, 'SKILL.md'), 'utf8'), `reader edit of ${scenario}`);
+        }
+      }
+    } finally {
+      unlink(join(home, '.agents/skills'));
+      rmSync(home, { recursive: true, force: true });
+    }
+  },
+);
 
 const unusablePeerCopies = {
   'an empty folder': (skill) => mkdirSync(skill),
@@ -654,99 +671,112 @@ test.for(
       layout,
     ]),
   ),
-)('a linked folder is incomplete when the other agent folder holds %s: %s', ([copy, layout], context) => {
-  const [linkPath, targetPath, real, linked] = linkedLayouts[layout];
-  const home = mkdtempSync(join(realpathSync(tmpdir()), 'arc-linked-unusable-'));
-  const skill = join(home, targetPath, 'arc-sessions');
-  try {
-    mkdirSync(join(home, targetPath), { recursive: true });
-    if (!tryLink(join(home, targetPath), join(home, linkPath), linkKinds[0]))
-      context.skip('This machine cannot create directory symbolic links.');
-    if (unusablePeerCopies[copy](skill, home) === false) context.skip('This machine cannot create that link.');
-    for (const action of ['install', 'update']) {
-      const run = runSkillCommand(home, action, linked);
-      assert.equal(run.status, 1, `${action}: ${JSON.stringify(run)}`);
-      assert.equal(run.results[0].status, 'incomplete', action);
-      assert.doesNotMatch(run.results[0].reason, /no action is needed|README/);
-      assert.match(run.results[0].reason, /Arc will not replace it/);
-      assert.match(run.results[0].reason, /arc-sessions is (a folder|a file|a link)/);
-      assert.match(run.results[0].reason, new RegExp(`arc skills install --agent ${real}`));
+)(
+  'a linked folder is incomplete when the other agent folder holds %s: %s',
+  { tags: ['subprocess'] },
+  ([copy, layout], context) => {
+    const [linkPath, targetPath, real, linked] = linkedLayouts[layout];
+    const home = mkdtempSync(join(realpathSync(tmpdir()), 'arc-linked-unusable-'));
+    const skill = join(home, targetPath, 'arc-sessions');
+    try {
+      mkdirSync(join(home, targetPath), { recursive: true });
+      if (!tryLink(join(home, targetPath), join(home, linkPath), linkKinds[0]))
+        context.skip('This machine cannot create directory symbolic links.');
+      if (unusablePeerCopies[copy](skill, home) === false) context.skip('This machine cannot create that link.');
+      for (const action of ['install', 'update']) {
+        const run = runSkillCommand(home, action, linked);
+        assert.equal(run.status, 1, `${action}: ${JSON.stringify(run)}`);
+        assert.equal(run.results[0].status, 'incomplete', action);
+        assert.doesNotMatch(run.results[0].reason, /no action is needed|README/);
+        assert.match(run.results[0].reason, /Arc will not replace it/);
+        assert.match(run.results[0].reason, /arc-sessions is (a folder|a file|a link)/);
+        assert.match(run.results[0].reason, new RegExp(`arc skills install --agent ${real}`));
+      }
+      const removed = runSkillCommand(home, 'remove', linked);
+      assert.equal(removed.status, 0, JSON.stringify(removed));
+      assert.equal(removed.results[0].status, 'linked');
+      assert.match(removed.results[0].reason, /skill is not there/);
+      assert.doesNotMatch(removed.results[0].reason, /uses the skill/);
+      assert.equal(fs.lstatSync(skill, { throwIfNoEntry: false }) !== undefined, true);
+      if (copy === 'an empty folder') {
+        rmSync(skill, { recursive: true });
+        assert.equal(runSkillCommand(home, 'install', real).results[0].status, 'installed');
+      }
+    } finally {
+      unlink(join(home, linkPath));
+      rmSync(home, { recursive: true, force: true });
     }
-    const removed = runSkillCommand(home, 'remove', linked);
-    assert.equal(removed.status, 0, JSON.stringify(removed));
-    assert.equal(removed.results[0].status, 'linked');
-    assert.match(removed.results[0].reason, /skill is not there/);
-    assert.doesNotMatch(removed.results[0].reason, /uses the skill/);
-    assert.equal(fs.lstatSync(skill, { throwIfNoEntry: false }) !== undefined, true);
-    if (copy === 'an empty folder') {
-      rmSync(skill, { recursive: true });
-      assert.equal(runSkillCommand(home, 'install', real).results[0].status, 'installed');
-    }
-  } finally {
-    unlink(join(home, linkPath));
-    rmSync(home, { recursive: true, force: true });
-  }
-});
+  },
+);
 
-test('a linked folder names the other agent update command for an older Arc install nobody edited', async () => {
-  const current = readSkillPayload(cli);
-  const files = new Map(current.files);
-  files.set('SKILL.md', Buffer.concat([files.get('SKILL.md'), Buffer.from('\nolder\n')]));
-  const older = { ...current, identity: 'older', files };
-  const home = mkdtempSync(join(realpathSync(tmpdir()), 'arc-linked-older-'));
-  try {
-    mkdirSync(join(home, '.claude/skills'), { recursive: true });
-    tryLink(join(home, '.claude/skills'), join(home, '.agents/skills'), linkKinds[0]);
-    const installed = await operateSkill('install', 'claude', older, {
-      home,
-      signal: new AbortController().signal,
-    });
-    assert.equal(installed.status, 'installed', JSON.stringify(installed));
-    for (const action of ['install', 'update']) {
-      const run = runSkillCommand(home, action, 'codex');
-      assert.equal(run.status, 1, `${action}: ${JSON.stringify(run)}`);
-      assert.equal(run.results[0].status, 'incomplete', action);
-      assert.match(run.results[0].reason, /arc skills update --agent claude/);
+test(
+  'a linked folder names the other agent update command for an older Arc install nobody edited',
+  { tags: ['subprocess'] },
+  async () => {
+    const current = readSkillPayload(cli);
+    const files = new Map(current.files);
+    files.set('SKILL.md', Buffer.concat([files.get('SKILL.md'), Buffer.from('\nolder\n')]));
+    const older = { ...current, identity: 'older', files };
+    const home = mkdtempSync(join(realpathSync(tmpdir()), 'arc-linked-older-'));
+    try {
+      mkdirSync(join(home, '.claude/skills'), { recursive: true });
+      tryLink(join(home, '.claude/skills'), join(home, '.agents/skills'), linkKinds[0]);
+      const installed = await operateSkill('install', 'claude', older, {
+        home,
+        signal: new AbortController().signal,
+      });
+      assert.equal(installed.status, 'installed', JSON.stringify(installed));
+      for (const action of ['install', 'update']) {
+        const run = runSkillCommand(home, action, 'codex');
+        assert.equal(run.status, 1, `${action}: ${JSON.stringify(run)}`);
+        assert.equal(run.results[0].status, 'incomplete', action);
+        assert.match(run.results[0].reason, /arc skills update --agent claude/);
+      }
+      const updated = runSkillCommand(home, 'update', 'claude');
+      assert.equal(updated.results[0].status, 'updated', JSON.stringify(updated));
+      expectPayloadCopy(join(home, '.claude/skills/arc-sessions'), current);
+    } finally {
+      unlink(join(home, '.agents/skills'));
+      rmSync(home, { recursive: true, force: true });
     }
-    const updated = runSkillCommand(home, 'update', 'claude');
-    assert.equal(updated.results[0].status, 'updated', JSON.stringify(updated));
-    expectPayloadCopy(join(home, '.claude/skills/arc-sessions'), current);
-  } finally {
-    unlink(join(home, '.agents/skills'));
-    rmSync(home, { recursive: true, force: true });
-  }
-});
+  },
+);
 
-test('the direction for a skill with no readable SKILL.md leads to a working install after an Arc install', async () => {
-  const home = mkdtempSync(join(realpathSync(tmpdir()), 'arc-linked-deleted-'));
-  try {
-    mkdirSync(join(home, '.claude/skills'), { recursive: true });
-    tryLink(join(home, '.claude/skills'), join(home, '.agents/skills'), linkKinds[0]);
-    const installed = await operateSkill('install', 'claude', readSkillPayload(cli), {
-      home,
-      signal: new AbortController().signal,
-    });
-    assert.equal(installed.status, 'installed', JSON.stringify(installed));
-    rmSync(join(installed.destination, 'SKILL.md'));
-    const linked = runSkillCommand(home, 'install', 'codex');
-    assert.equal(linked.results[0].status, 'incomplete', JSON.stringify(linked));
-    const command = /arc skills (install|update) --agent (claude|codex)/.exec(linked.results[0].reason);
-    assert.ok(command, linked.results[0].reason);
-    // The person follows the direction: move or delete the entry, then run the named command.
-    rmSync(installed.destination, { recursive: true });
-    const named = runSkillCommand(home, command[1], command[2]);
-    assert.equal(named.status, 0, JSON.stringify(named));
-    assert.equal(named.results[0].status, 'installed', JSON.stringify(named));
-    expectPayloadCopy(installed.destination, readSkillPayload(cli));
-    assert.equal(runSkillCommand(home, 'install', 'codex').results[0].status, 'linked');
-  } finally {
-    unlink(join(home, '.agents/skills'));
-    rmSync(home, { recursive: true, force: true });
-  }
-});
+test(
+  'the direction for a skill with no readable SKILL.md leads to a working install after an Arc install',
+  { tags: ['subprocess'] },
+  async () => {
+    const home = mkdtempSync(join(realpathSync(tmpdir()), 'arc-linked-deleted-'));
+    try {
+      mkdirSync(join(home, '.claude/skills'), { recursive: true });
+      tryLink(join(home, '.claude/skills'), join(home, '.agents/skills'), linkKinds[0]);
+      const installed = await operateSkill('install', 'claude', readSkillPayload(cli), {
+        home,
+        signal: new AbortController().signal,
+      });
+      assert.equal(installed.status, 'installed', JSON.stringify(installed));
+      rmSync(join(installed.destination, 'SKILL.md'));
+      const linked = runSkillCommand(home, 'install', 'codex');
+      assert.equal(linked.results[0].status, 'incomplete', JSON.stringify(linked));
+      const command = /arc skills (install|update) --agent (claude|codex)/.exec(linked.results[0].reason);
+      assert.ok(command, linked.results[0].reason);
+      // The person follows the direction: move or delete the entry, then run the named command.
+      rmSync(installed.destination, { recursive: true });
+      const named = runSkillCommand(home, command[1], command[2]);
+      assert.equal(named.status, 0, JSON.stringify(named));
+      assert.equal(named.results[0].status, 'installed', JSON.stringify(named));
+      expectPayloadCopy(installed.destination, readSkillPayload(cli));
+      assert.equal(runSkillCommand(home, 'install', 'codex').results[0].status, 'linked');
+    } finally {
+      unlink(join(home, '.agents/skills'));
+      rmSync(home, { recursive: true, force: true });
+    }
+  },
+);
 
 test.for(['an invalid ownership binding', 'an unfinished retained operation'])(
   'a linked folder gives recovery directions for %s',
+  { tags: ['subprocess'] },
   async (state) => {
     const home = mkdtempSync(join(realpathSync(tmpdir()), 'arc-linked-recovery-'));
     const payload = readSkillPayload(cli);
@@ -1001,6 +1031,7 @@ test('independent software roots reach the same occupied destination lock', asyn
 
 test.each([false, true])(
   'compiled CLI handlers settle repeated cancellation with output failure %s',
+  { tags: ['subprocess'] },
   (outputFailure) => {
     const home = mkdtempSync(join(realpathSync(tmpdir()), 'arc-handler-skill-'));
     try {
@@ -1035,6 +1066,7 @@ const write=process.stdout.write.bind(process.stdout);process.stdout.write=funct
 
 test.runIf(process.platform === 'win32').each(['before-backup', 'backup-cleanup'])(
   'Windows open reader preserves the skill at %s sharing boundary',
+  { tags: ['subprocess'] },
   async (boundary) => {
     const home = mkdtempSync(join(realpathSync(tmpdir()), 'arc-sharing-skill-'));
     const original = readSkillPayload(cli);
@@ -1115,108 +1147,112 @@ test.runIf(process.platform === 'win32').each(['before-backup', 'backup-cleanup'
   },
 );
 
-test('manual recovery retires a stopped unsealed replacement and permits a new operation', async () => {
-  const home = mkdtempSync(join(realpathSync(tmpdir()), 'arc-stopped-skill-'));
-  const payload = readSkillPayload(cli);
-  const options = { home, signal: new AbortController().signal };
-  const destination = canonicalToolPath(join(home, '.agents/skills/arc-sessions'));
-  let child;
-  let stopped;
-  try {
-    assert.equal((await operateSkill('install', 'codex', payload, options)).status, 'installed');
-    const worker = join(home, 'stopped.cjs');
-    const { buildSync } = await import('esbuild');
-    buildSync({
-      stdin: {
-        resolveDir: fileURLToPath(new URL('../src', import.meta.url)),
-        contents: `import {operateSkill} from './skills.ts';
+test(
+  'manual recovery retires a stopped unsealed replacement and permits a new operation',
+  { tags: ['subprocess'] },
+  async () => {
+    const home = mkdtempSync(join(realpathSync(tmpdir()), 'arc-stopped-skill-'));
+    const payload = readSkillPayload(cli);
+    const options = { home, signal: new AbortController().signal };
+    const destination = canonicalToolPath(join(home, '.agents/skills/arc-sessions'));
+    let child;
+    let stopped;
+    try {
+      assert.equal((await operateSkill('install', 'codex', payload, options)).status, 'installed');
+      const worker = join(home, 'stopped.cjs');
+      const { buildSync } = await import('esbuild');
+      buildSync({
+        stdin: {
+          resolveDir: fileURLToPath(new URL('../src', import.meta.url)),
+          contents: `import {operateSkill} from './skills.ts';
 import {readSkillPayload} from './skillfiles.ts';
 const payload=readSkillPayload(${JSON.stringify(cli)});
 const files=new Map(payload.files); files.set('SKILL.md',Buffer.concat([files.get('SKILL.md'),Buffer.from('\\nreplacement\\n')]));
 operateSkill('update','codex',{...payload,identity:'replacement',files},{home:${JSON.stringify(home)},signal:new AbortController().signal,checkpoint:async phase=>{
 if(phase==='backed-up'){process.stdin.resume(); process.stdout.write('backed-up\\n'); await new Promise(resolve=>process.stdin.once('data',resolve));}
 }}).catch(error=>{console.error(error);process.exitCode=1;});`,
-      },
-      outfile: worker,
-      bundle: true,
-      platform: 'node',
-      format: 'cjs',
-    });
-    child = spawn(process.execPath, [worker], { stdio: ['pipe', 'pipe', 'pipe'] });
-    stopped = new Promise((resolve, reject) => {
-      child.once('close', resolve);
-      child.once('error', reject);
-    });
-    await new Promise((resolve, reject) => {
-      let output = '';
-      child.stdout.on('data', (bytes) => {
-        output += bytes;
-        if (output.includes('backed-up\n')) resolve();
+        },
+        outfile: worker,
+        bundle: true,
+        platform: 'node',
+        format: 'cjs',
       });
-      child.once('error', reject);
-      child.once('exit', (code) => reject(new Error(`Replacement exited before acknowledgement: ${code}`)));
-    });
-    child.kill('SIGKILL');
-    await stopped;
-    assert.notEqual(child.exitCode === null && child.signalCode === null, true);
-    const control = canonicalToolPath(join(home, '.agents/skills.arc-skill-control'));
-    const operation = fs
-      .readdirSync(control)
-      .map((name) => join(control, name))
-      .find((folder) => fs.existsSync(join(folder, 'journal.json')) && !fs.existsSync(join(folder, 'seal.json')));
-    assert.ok(operation);
-    const retained = await operateSkill('update', 'codex', payload, options);
-    assert.match(retained.reason, /Another Arc setup/);
-    assert.equal(retained.reason.split('docs/arc-sessions.md#manual-recovery').length - 1, 1);
-    fs.cpSync(control, join(home, 'recovery-copy'), { recursive: true });
-    const journal = JSON.parse(readFileSync(join(operation, 'journal.json')));
-    const id = (folder) => {
-      const stat = fs.lstatSync(folder, { bigint: true });
-      assert.equal(stat.isSymbolicLink(), false);
-      return { dev: String(stat.dev), ino: String(stat.ino), birth: String(stat.birthtimeNs) };
-    };
-    const hashes = (folder) => {
-      const files = {};
-      for (const name of fs.readdirSync(folder)) {
-        assert.equal(fs.lstatSync(join(folder, name)).isFile(), true);
-        files[name] = createHash('sha256')
-          .update(readFileSync(join(folder, name)))
-          .digest('hex');
-      }
-      return files;
-    };
-    assert.equal(journal.token, operation.slice(operation.lastIndexOf('operation-') + 10));
-    assert.equal(journal.destination, destination);
-    assert.equal(journal.stage, join(operation, 'stage'));
-    assert.equal(journal.backup, join(operation, 'backup'));
-    assert.deepEqual(id(control), journal.control);
-    assert.deepEqual(id(journal.backup), journal.previous.directory);
-    assert.deepEqual(hashes(journal.backup), journal.previous.files);
-    assert.deepEqual(id(journal.stage), journal.stageIdentity);
-    assert.deepEqual(hashes(journal.stage), journal.files);
-    assert.equal(fs.existsSync(destination), false);
-    fs.renameSync(journal.backup, destination);
-    assert.deepEqual(JSON.parse(readFileSync(join(control, 'installed.json'))), journal.previous);
-    for (const name of Object.keys(journal.files)) fs.unlinkSync(join(journal.stage, name));
-    fs.rmdirSync(journal.stage);
-    assert.deepEqual(fs.readdirSync(operation), ['journal.json']);
-    fs.unlinkSync(join(operation, 'journal.json'));
-    fs.rmdirSync(operation);
-    for (const lock of Object.values(journal.locks)) {
-      assert.equal(JSON.parse(readFileSync(lock.file)).token, lock.token);
-      fs.unlinkSync(lock.file);
-    }
-    assert.equal((await operateSkill('remove', 'codex', payload, options)).status, 'removed');
-    assert.equal((await operateSkill('install', 'codex', payload, options)).status, 'installed');
-    for (const [relative, bytes] of payload.files) assert.deepEqual(readFileSync(join(destination, relative)), bytes);
-  } finally {
-    if (child && child.exitCode === null && child.signalCode === null) {
+      child = spawn(process.execPath, [worker], { stdio: ['pipe', 'pipe', 'pipe'] });
+      stopped = new Promise((resolve, reject) => {
+        child.once('close', resolve);
+        child.once('error', reject);
+      });
+      await new Promise((resolve, reject) => {
+        let output = '';
+        child.stdout.on('data', (bytes) => {
+          output += bytes;
+          if (output.includes('backed-up\n')) resolve();
+        });
+        child.once('error', reject);
+        child.once('exit', (code) => reject(new Error(`Replacement exited before acknowledgement: ${code}`)));
+      });
       child.kill('SIGKILL');
       await stopped;
+      assert.notEqual(child.exitCode === null && child.signalCode === null, true);
+      const control = canonicalToolPath(join(home, '.agents/skills.arc-skill-control'));
+      const operation = fs
+        .readdirSync(control)
+        .map((name) => join(control, name))
+        .find((folder) => fs.existsSync(join(folder, 'journal.json')) && !fs.existsSync(join(folder, 'seal.json')));
+      assert.ok(operation);
+      const retained = await operateSkill('update', 'codex', payload, options);
+      assert.match(retained.reason, /Another Arc setup/);
+      assert.equal(retained.reason.split('docs/arc-sessions.md#manual-recovery').length - 1, 1);
+      fs.cpSync(control, join(home, 'recovery-copy'), { recursive: true });
+      const journal = JSON.parse(readFileSync(join(operation, 'journal.json')));
+      const id = (folder) => {
+        const stat = fs.lstatSync(folder, { bigint: true });
+        assert.equal(stat.isSymbolicLink(), false);
+        return { dev: String(stat.dev), ino: String(stat.ino), birth: String(stat.birthtimeNs) };
+      };
+      const hashes = (folder) => {
+        const files = {};
+        for (const name of fs.readdirSync(folder)) {
+          assert.equal(fs.lstatSync(join(folder, name)).isFile(), true);
+          files[name] = createHash('sha256')
+            .update(readFileSync(join(folder, name)))
+            .digest('hex');
+        }
+        return files;
+      };
+      assert.equal(journal.token, operation.slice(operation.lastIndexOf('operation-') + 10));
+      assert.equal(journal.destination, destination);
+      assert.equal(journal.stage, join(operation, 'stage'));
+      assert.equal(journal.backup, join(operation, 'backup'));
+      assert.deepEqual(id(control), journal.control);
+      assert.deepEqual(id(journal.backup), journal.previous.directory);
+      assert.deepEqual(hashes(journal.backup), journal.previous.files);
+      assert.deepEqual(id(journal.stage), journal.stageIdentity);
+      assert.deepEqual(hashes(journal.stage), journal.files);
+      assert.equal(fs.existsSync(destination), false);
+      fs.renameSync(journal.backup, destination);
+      assert.deepEqual(JSON.parse(readFileSync(join(control, 'installed.json'))), journal.previous);
+      for (const name of Object.keys(journal.files)) fs.unlinkSync(join(journal.stage, name));
+      fs.rmdirSync(journal.stage);
+      assert.deepEqual(fs.readdirSync(operation), ['journal.json']);
+      fs.unlinkSync(join(operation, 'journal.json'));
+      fs.rmdirSync(operation);
+      for (const lock of Object.values(journal.locks)) {
+        assert.equal(JSON.parse(readFileSync(lock.file)).token, lock.token);
+        fs.unlinkSync(lock.file);
+      }
+      assert.equal((await operateSkill('remove', 'codex', payload, options)).status, 'removed');
+      assert.equal((await operateSkill('install', 'codex', payload, options)).status, 'installed');
+      for (const [relative, bytes] of payload.files) assert.deepEqual(readFileSync(join(destination, relative)), bytes);
+    } finally {
+      if (child && child.exitCode === null && child.signalCode === null) {
+        child.kill('SIGKILL');
+        await stopped;
+      }
+      rmSync(home, { recursive: true, force: true });
     }
-    rmSync(home, { recursive: true, force: true });
-  }
-});
+  },
+);
 
 test('session skill payload selection follows each executing artifact and rejects caller substitutes', () => {
   const root = mkdtempSync(join(realpathSync(tmpdir()), 'arc-skill-layout-'));
@@ -1388,30 +1424,34 @@ test('ordinary skill refusals omit recovery guidance and retained operations nam
   }
 });
 
-test('Windows short temporary-root spellings resolve to their physical directory', ({ skip }) => {
-  if (process.platform !== 'win32') {
-    skip();
-    return;
-  }
-  const root = mkdtempSync(join(realpathSync(tmpdir()), 'arc temporary spaces '));
-  try {
-    const result = spawnSync(process.env.ComSpec ?? 'cmd.exe', ['/d', '/c', 'for %I in (.) do @echo %~fsI'], {
-      cwd: root,
-      encoding: 'utf8',
-    });
-    assert.equal(result.status, 0, result.stderr);
-    const short = result.stdout.trim();
-    if (!short.includes('~')) {
-      skip('This volume supplies no short path alias.');
+test(
+  'Windows short temporary-root spellings resolve to their physical directory',
+  { tags: ['subprocess'] },
+  ({ skip }) => {
+    if (process.platform !== 'win32') {
+      skip();
       return;
     }
-    const entry = skillTemporaryRoots({ TEMP: short }, 'win32', root).find((item) => item.source === 'TEMP');
-    assert.equal(entry.state, 'resolved');
-    assert.equal(entry.canonical, fs.realpathSync.native(root).toLowerCase());
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
+    const root = mkdtempSync(join(realpathSync(tmpdir()), 'arc temporary spaces '));
+    try {
+      const result = spawnSync(process.env.ComSpec ?? 'cmd.exe', ['/d', '/c', 'for %I in (.) do @echo %~fsI'], {
+        cwd: root,
+        encoding: 'utf8',
+      });
+      assert.equal(result.status, 0, result.stderr);
+      const short = result.stdout.trim();
+      if (!short.includes('~')) {
+        skip('This volume supplies no short path alias.');
+        return;
+      }
+      const entry = skillTemporaryRoots({ TEMP: short }, 'win32', root).find((item) => item.source === 'TEMP');
+      assert.equal(entry.state, 'resolved');
+      assert.equal(entry.canonical, fs.realpathSync.native(root).toLowerCase());
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+);
 
 test('command admission requires complete help data', () => {
   checkCommandHelp(COMMANDS);

@@ -4,7 +4,7 @@ on:
   push:
   pull_request:
 
-# The jobs run side by side. Together they run what `npm test` runs in one process.
+# The jobs run side by side. Together they run what `npm run test:all` runs locally.
 jobs:
   checks:
     runs-on: ubuntu-latest
@@ -59,18 +59,10 @@ jobs:
           npm --prefix cli ci
       - name: Install bundled Chromium and system dependencies
         run: node extension/node_modules/playwright-core/cli.js install --with-deps chromium-headless-shell
-      - name: Root tests
-        run: npm run test:root
-      - name: Root subprocess tests
-        run: npm run test:subprocess
-      - name: Panel-mockup tests
-        run: npm run test:panel-mockup
-      - name: Extension node lane
-        run: npm --prefix extension run test:node
-      - name: CLI tests
-        run: npm --prefix cli run test:unit
-      - name: Smoke tests
-        run: npm run test:smoke
+      - name: Direct unit tests
+        run: npm run test:unit
+      - name: Integration and smoke tests
+        run: npm run test:integration
 
   browser:
     runs-on: ubuntu-latest

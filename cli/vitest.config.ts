@@ -8,5 +8,7 @@ export default defineConfig({
     include: ['test/**/*.test.{ts,mjs}'],
     testTimeout: 30_000,
     hookTimeout: 30_000,
+    strictTags: true,
+    tags: [{ name: 'subprocess', description: 'Builds bundles or exercises real processes.' }],
   },
 });

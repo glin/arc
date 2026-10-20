@@ -25,6 +25,8 @@ Question recovery stores captured question payloads, dispositions, settled ident
 
 `cli/src/collect.ts` follows production listing pages and optionally reads turns through the selected window channel. It retains raw observations separately from usable row references and turn outcomes. [Collection output](cli-reference.md#collection) owns recovery, admission limits, and the absence of physical source continuity guarantees.
 
+`scripts/test-default.mjs` runs static checks and direct units sequentially. `scripts/test-unit.mjs` partitions root, extension, and CLI units. `scripts/test-integration.mjs` runs the complete external-boundary categories. `scripts/test-classification.js` identifies admitted expensive tests and their repetition budgets. [Verification](development.md#verification) owns test commands and category coverage.
+
 ## System shape
 
 Arc reads completed work from files, including sessions started in a terminal or another editor window. A child process carries live prompts, questions, and controls.

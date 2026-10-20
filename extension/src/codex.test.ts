@@ -8042,7 +8042,7 @@ test('worktree ownership accepts constant loops and rejects binding or failure a
     assert.equal(worktreeRelationships(changed, 'powershell'), null, changed);
 });
 
-describe('recreated worktree ownership', () => {
+describe('recreated worktree ownership', { tags: ['subprocess'] }, () => {
   const directory = tempDir('recreated-owner-');
   const roots = ['first', 'second'].map((name) => path.join(directory, name).replace(/\\/g, '/'));
   const git = (root: string, ...args: string[]) =>
@@ -11131,240 +11131,268 @@ function nestedCodexCostFixture() {
   return { root, child, grandchild, children, options, task };
 }
 
-test('a root Codex turn includes grandchild cost once beside unchanged session and Project totals', () => {
-  const { root, child, grandchild, children, options } = nestedCodexCostFixture();
-  const [turn] = readCodexSession(root, 'root', options).turns;
-  const records = [root, child, grandchild].map(
-    (file) => indexSpendFile(undefined, file, 'workspace', createCodexUsageLineReducer, 1).record,
-  );
-  const sources = discoverCodexSessionSpendSources([{ sessionId: 'root', file: root }], children);
-  const session = sessionSpendPartsBySession(records, sources).root;
-  const sessionInput = session.reduce((sum, part) => sum + part.bucket.usage.input, 0);
-  const projectInput = records.flatMap((record) => record.buckets).reduce((sum, bucket) => sum + bucket.usage.input, 0);
-  assert.equal(sessionInput, 700_000);
-  assert.equal(projectInput, 700_000);
-  assert.equal(
-    turn.usage.input + turn.agents.flatMap((agent) => agent.spend).reduce((sum, part) => sum + part.usage.input, 0),
-    700_000,
-  );
-  assert.equal(turn.agents[0].effort, 'medium');
-  assert.equal(
-    turnCost(turn).partial,
-    false,
-    JSON.stringify({
-      cost: turnCost(turn),
-      agents: turn.agents.map((agent) => ({ status: agent.status, partial: agent.spendPartial, spend: agent.spend })),
-    }),
-  );
-  assert.equal(turn.agents.length, 1);
-  const sessionDollars = session.reduce((sum, part) => sum + (publicProjectSpendPrice(part.bucket)?.dollars ?? 0), 0);
-  assert.equal(turnCost(turn).dollars, sessionDollars);
-});
+test(
+  'a root Codex turn includes grandchild cost once beside unchanged session and Project totals',
+  { tags: ['subprocess'] },
+  () => {
+    const { root, child, grandchild, children, options } = nestedCodexCostFixture();
+    const [turn] = readCodexSession(root, 'root', options).turns;
+    const records = [root, child, grandchild].map(
+      (file) => indexSpendFile(undefined, file, 'workspace', createCodexUsageLineReducer, 1).record,
+    );
+    const sources = discoverCodexSessionSpendSources([{ sessionId: 'root', file: root }], children);
+    const session = sessionSpendPartsBySession(records, sources).root;
+    const sessionInput = session.reduce((sum, part) => sum + part.bucket.usage.input, 0);
+    const projectInput = records
+      .flatMap((record) => record.buckets)
+      .reduce((sum, bucket) => sum + bucket.usage.input, 0);
+    assert.equal(sessionInput, 700_000);
+    assert.equal(projectInput, 700_000);
+    assert.equal(
+      turn.usage.input + turn.agents.flatMap((agent) => agent.spend).reduce((sum, part) => sum + part.usage.input, 0),
+      700_000,
+    );
+    assert.equal(turn.agents[0].effort, 'medium');
+    assert.equal(
+      turnCost(turn).partial,
+      false,
+      JSON.stringify({
+        cost: turnCost(turn),
+        agents: turn.agents.map((agent) => ({ status: agent.status, partial: agent.spendPartial, spend: agent.spend })),
+      }),
+    );
+    assert.equal(turn.agents.length, 1);
+    const sessionDollars = session.reduce((sum, part) => sum + (publicProjectSpendPrice(part.bucket)?.dollars ?? 0), 0);
+    assert.equal(turnCost(turn).dollars, sessionDollars);
+  },
+);
 
-test('nested Codex spend counts repeated sources once and refuses conflicting ownership and cycles', () => {
-  const { child, grandchild, children } = nestedCodexCostFixture();
-  const duplicated = [...children, ...children];
-  assert.equal(
-    readCodexAgentSpend(child, duplicated).models.reduce((sum, part) => sum + part.usage.input, 0),
-    600_000,
-  );
-  const conflict = [...children, { ...children[1], parentThreadId: 'other' }];
-  const refused = readCodexAgentSpend(child, conflict);
-  assert.equal(
-    refused.models.reduce((sum, part) => sum + part.usage.input, 0),
-    200_000,
-  );
-  assert.equal(refused.partial, true);
-  const cycle = [...children, { ...children[0], parentThreadId: 'grandchild' }];
-  assert.equal(readCodexAgentSpend(child, cycle).partial, true);
-  const saved = fs.readFileSync(child, 'utf8');
-  const lines = saved.trimEnd().split('\n');
-  const opening = JSON.parse(lines[0]);
-  opening.payload.source.subagent.thread_spawn.parent_thread_id = 'grandchild';
-  lines[0] = JSON.stringify(opening);
-  fs.writeFileSync(child, lines.join('\n') + '\n');
-  const cyclic = readCodexAgentSpend(child, [{ ...children[0], parentThreadId: 'grandchild' }, children[1]]);
-  assert.equal(cyclic.partial, true);
-  assert.equal(
-    cyclic.models.reduce((sum, part) => sum + part.usage.input, 0),
-    200_000,
-  );
-  fs.writeFileSync(child, saved);
-  assert.equal(
-    codexSubagentFor(children, 'other', { id: 'grandchild', name: '', path: null, status: 'completed' }),
-    null,
-  );
-  assert.equal(
-    readCodexAgentSpend(grandchild, children).models.reduce((sum, part) => sum + part.usage.input, 0),
-    400_000,
-  );
-});
+test(
+  'nested Codex spend counts repeated sources once and refuses conflicting ownership and cycles',
+  { tags: ['subprocess'] },
+  () => {
+    const { child, grandchild, children } = nestedCodexCostFixture();
+    const duplicated = [...children, ...children];
+    assert.equal(
+      readCodexAgentSpend(child, duplicated).models.reduce((sum, part) => sum + part.usage.input, 0),
+      600_000,
+    );
+    const conflict = [...children, { ...children[1], parentThreadId: 'other' }];
+    const refused = readCodexAgentSpend(child, conflict);
+    assert.equal(
+      refused.models.reduce((sum, part) => sum + part.usage.input, 0),
+      200_000,
+    );
+    assert.equal(refused.partial, true);
+    const cycle = [...children, { ...children[0], parentThreadId: 'grandchild' }];
+    assert.equal(readCodexAgentSpend(child, cycle).partial, true);
+    const saved = fs.readFileSync(child, 'utf8');
+    const lines = saved.trimEnd().split('\n');
+    const opening = JSON.parse(lines[0]);
+    opening.payload.source.subagent.thread_spawn.parent_thread_id = 'grandchild';
+    lines[0] = JSON.stringify(opening);
+    fs.writeFileSync(child, lines.join('\n') + '\n');
+    const cyclic = readCodexAgentSpend(child, [{ ...children[0], parentThreadId: 'grandchild' }, children[1]]);
+    assert.equal(cyclic.partial, true);
+    assert.equal(
+      cyclic.models.reduce((sum, part) => sum + part.usage.input, 0),
+      200_000,
+    );
+    fs.writeFileSync(child, saved);
+    assert.equal(
+      codexSubagentFor(children, 'other', { id: 'grandchild', name: '', path: null, status: 'completed' }),
+      null,
+    );
+    assert.equal(
+      readCodexAgentSpend(grandchild, children).models.reduce((sum, part) => sum + part.usage.input, 0),
+      400_000,
+    );
+  },
+);
 
-test('nested Codex spend retains uncertainty for unresolved, missing, unreadable, truncated, and open descendants', () => {
-  const { child, grandchild, children, task } = nestedCodexCostFixture();
-  assert.equal(readCodexAgentSpend(child, [children[0]]).partial, true);
-  const saved = fs.readFileSync(grandchild);
-  fs.writeFileSync(grandchild, Buffer.concat([saved, Buffer.from('{"type":')]));
-  assert.equal(readCodexAgentSpend(child, children).partial, true);
-  fs.writeFileSync(grandchild, saved);
-  fs.appendFileSync(
-    grandchild,
-    task('resume', 40, 10)
-      .map((record) => JSON.stringify(record))
-      .join('\n') + '\n',
-  );
-  assert.equal(readCodexAgentSpend(child, children).partial, true);
-  fs.writeFileSync(grandchild, saved);
-  const nativeFs = createRequire(__filename)('node:fs') as typeof fs;
-  const open = nativeFs.openSync;
-  const spy = vi.spyOn(nativeFs, 'openSync').mockImplementation(((file: fs.PathLike, ...args: unknown[]) => {
-    if (file === grandchild) throw new Error('read denied');
-    return Reflect.apply(open, nativeFs, [file, ...args]);
-  }) as typeof open);
-  syncBuiltinESMExports();
-  try {
+test(
+  'nested Codex spend retains uncertainty for unresolved, missing, unreadable, truncated, and open descendants',
+  { tags: ['subprocess'] },
+  () => {
+    const { child, grandchild, children, task } = nestedCodexCostFixture();
+    assert.equal(readCodexAgentSpend(child, [children[0]]).partial, true);
+    const saved = fs.readFileSync(grandchild);
+    fs.writeFileSync(grandchild, Buffer.concat([saved, Buffer.from('{"type":')]));
     assert.equal(readCodexAgentSpend(child, children).partial, true);
-  } finally {
-    spy.mockRestore();
+    fs.writeFileSync(grandchild, saved);
+    fs.appendFileSync(
+      grandchild,
+      task('resume', 40, 10)
+        .map((record) => JSON.stringify(record))
+        .join('\n') + '\n',
+    );
+    assert.equal(readCodexAgentSpend(child, children).partial, true);
+    fs.writeFileSync(grandchild, saved);
+    const nativeFs = createRequire(__filename)('node:fs') as typeof fs;
+    const open = nativeFs.openSync;
+    const spy = vi.spyOn(nativeFs, 'openSync').mockImplementation(((file: fs.PathLike, ...args: unknown[]) => {
+      if (file === grandchild) throw new Error('read denied');
+      return Reflect.apply(open, nativeFs, [file, ...args]);
+    }) as typeof open);
     syncBuiltinESMExports();
-  }
-  fs.unlinkSync(grandchild);
-  assert.equal(readCodexAgentSpend(child, children).partial, true);
-});
+    try {
+      assert.equal(readCodexAgentSpend(child, children).partial, true);
+    } finally {
+      spy.mockRestore();
+      syncBuiltinESMExports();
+    }
+    fs.unlinkSync(grandchild);
+    assert.equal(readCodexAgentSpend(child, children).partial, true);
+  },
+);
 
-test('nested Codex spend reuses each own-source scan across aggregates and versions descendant relationships', () => {
-  const { child, grandchild, children } = nestedCodexCostFixture();
-  const unrelated = {
-    ...children[1],
-    file: `${grandchild}-unrelated`,
-    threadId: 'unrelated',
-    parentThreadId: 'elsewhere',
-  };
-  const catalog = [...children, unrelated];
-  const index = codexSpendIndex(catalog);
-  assert.equal(codexSpendIndex(catalog), index);
-  Object.defineProperty(unrelated, 'file', {
-    get: () => {
-      throw new Error('unrelated relationship was scanned');
-    },
-  });
-  const read = codexAgentSpendReader(index);
-  const nativeFs = createRequire(__filename)('node:fs') as typeof fs;
-  const open = nativeFs.openSync;
-  const counts = new Map<string, number>();
-  const spy = vi.spyOn(nativeFs, 'openSync').mockImplementation(((file: fs.PathLike, ...args: unknown[]) => {
-    const name = String(file);
-    counts.set(name, (counts.get(name) ?? 0) + 1);
-    return Reflect.apply(open, nativeFs, [file, ...args]);
-  }) as typeof open);
-  syncBuiltinESMExports();
-  try {
-    read(child);
-    const first = counts.get(grandchild);
-    assert.ok(first && first <= 2);
-    read(grandchild);
-    read(child);
-    assert.equal(counts.get(grandchild), first);
-    const version = codexAgentSpendVersion(child, index);
-    assert.ok(version.includes('grandchild'));
-    assert.notEqual(codexAgentSpendVersion(child, codexSpendIndex([children[0]])), version);
-    assert.equal(counts.get(grandchild), first);
-  } finally {
-    spy.mockRestore();
+test(
+  'nested Codex spend reuses each own-source scan across aggregates and versions descendant relationships',
+  { tags: ['subprocess'] },
+  () => {
+    const { child, grandchild, children } = nestedCodexCostFixture();
+    const unrelated = {
+      ...children[1],
+      file: `${grandchild}-unrelated`,
+      threadId: 'unrelated',
+      parentThreadId: 'elsewhere',
+    };
+    const catalog = [...children, unrelated];
+    const index = codexSpendIndex(catalog);
+    assert.equal(codexSpendIndex(catalog), index);
+    Object.defineProperty(unrelated, 'file', {
+      get: () => {
+        throw new Error('unrelated relationship was scanned');
+      },
+    });
+    const read = codexAgentSpendReader(index);
+    const nativeFs = createRequire(__filename)('node:fs') as typeof fs;
+    const open = nativeFs.openSync;
+    const counts = new Map<string, number>();
+    const spy = vi.spyOn(nativeFs, 'openSync').mockImplementation(((file: fs.PathLike, ...args: unknown[]) => {
+      const name = String(file);
+      counts.set(name, (counts.get(name) ?? 0) + 1);
+      return Reflect.apply(open, nativeFs, [file, ...args]);
+    }) as typeof open);
     syncBuiltinESMExports();
-  }
-});
+    try {
+      read(child);
+      const first = counts.get(grandchild);
+      assert.ok(first && first <= 2);
+      read(grandchild);
+      read(child);
+      assert.equal(counts.get(grandchild), first);
+      const version = codexAgentSpendVersion(child, index);
+      assert.ok(version.includes('grandchild'));
+      assert.notEqual(codexAgentSpendVersion(child, codexSpendIndex([children[0]])), version);
+      assert.equal(counts.get(grandchild), first);
+    } finally {
+      spy.mockRestore();
+      syncBuiltinESMExports();
+    }
+  },
+);
 
-test('nested Codex spend preserves descendant pricing identities and incomplete and unpriced usage', () => {
-  const { child, grandchild, children, task } = nestedCodexCostFixture();
-  fs.appendFileSync(
-    grandchild,
-    [
-      ...task('linked', 40, 10),
-      claudeCommandCompleted(43),
-      event('task_complete', 45, { turn_id: 'linked', last_agent_message: 'done' }),
-    ]
-      .map((record) => JSON.stringify(record))
-      .join('\n') + '\n',
-  );
-  const own = readCodexAgentSpend(grandchild);
-  const nested = readCodexAgentSpend(child, children);
-  for (const part of own.models) {
-    assert.ok(nested.models.some((held) => held.model === part.model && held.costBasis === part.costBasis));
-  }
-  assert.ok(
-    own.models.some(
-      (part) =>
-        part.recordedCost !== undefined && part.costBasis && part.usageParts?.some((usage) => usage.linkedInvocationId),
-    ),
-  );
-  fs.appendFileSync(
-    grandchild,
-    [
-      event('task_started', 50, { turn_id: 'incomplete' }),
-      turnContext(51, 'incomplete', 'unknown-model', 'low'),
-      event('token_count', 52, { info: { total_token_usage: usage({ input_tokens: 100 }) } }),
-      tokens(53, { input_tokens: 100 }),
-      event('task_complete', 54, { turn_id: 'incomplete', last_agent_message: 'done' }),
-    ]
-      .map((record) => JSON.stringify(record))
-      .join('\n') + '\n',
-  );
-  assert.equal(readCodexAgentSpend(child, children).usageIncomplete, true);
-  const { root, options } = nestedCodexCostFixture();
-  const [turn] = readCodexSession(root, 'root', {
-    ...options,
-    agentSpendOf: () => readCodexAgentSpend(child, children),
-  }).turns;
-  assert.equal(turnCost(turn).partial, true);
-});
+test(
+  'nested Codex spend preserves descendant pricing identities and incomplete and unpriced usage',
+  { tags: ['subprocess'] },
+  () => {
+    const { child, grandchild, children, task } = nestedCodexCostFixture();
+    fs.appendFileSync(
+      grandchild,
+      [
+        ...task('linked', 40, 10),
+        claudeCommandCompleted(43),
+        event('task_complete', 45, { turn_id: 'linked', last_agent_message: 'done' }),
+      ]
+        .map((record) => JSON.stringify(record))
+        .join('\n') + '\n',
+    );
+    const own = readCodexAgentSpend(grandchild);
+    const nested = readCodexAgentSpend(child, children);
+    for (const part of own.models) {
+      assert.ok(nested.models.some((held) => held.model === part.model && held.costBasis === part.costBasis));
+    }
+    assert.ok(
+      own.models.some(
+        (part) =>
+          part.recordedCost !== undefined &&
+          part.costBasis &&
+          part.usageParts?.some((usage) => usage.linkedInvocationId),
+      ),
+    );
+    fs.appendFileSync(
+      grandchild,
+      [
+        event('task_started', 50, { turn_id: 'incomplete' }),
+        turnContext(51, 'incomplete', 'unknown-model', 'low'),
+        event('token_count', 52, { info: { total_token_usage: usage({ input_tokens: 100 }) } }),
+        tokens(53, { input_tokens: 100 }),
+        event('task_complete', 54, { turn_id: 'incomplete', last_agent_message: 'done' }),
+      ]
+        .map((record) => JSON.stringify(record))
+        .join('\n') + '\n',
+    );
+    assert.equal(readCodexAgentSpend(child, children).usageIncomplete, true);
+    const { root, options } = nestedCodexCostFixture();
+    const [turn] = readCodexSession(root, 'root', {
+      ...options,
+      agentSpendOf: () => readCodexAgentSpend(child, children),
+    }).turns;
+    assert.equal(turnCost(turn).partial, true);
+  },
+);
 
-test('nested Codex cost survives unreadable ancestors and keeps ownership uncertainty', () => {
-  const { root, child, grandchild, children } = nestedCodexCostFixture();
-  const total = (file = child) => readCodexAgentSpend(file, children);
-  const saved = fs.readFileSync(child);
-  fs.writeFileSync(child, '{"type":');
-  assert.equal(
-    total().models.reduce((sum, part) => sum + part.usage.input, 0),
-    400_000,
-  );
-  assert.equal(total().partial, true);
-  assert.equal(
-    total(root).models.reduce((sum, part) => sum + part.usage.input, 0),
-    500_000,
-  );
-  assert.equal(total(root).partial, true);
-  fs.unlinkSync(child);
-  assert.equal(
-    total().models.reduce((sum, part) => sum + part.usage.input, 0),
-    400_000,
-  );
-  assert.equal(total().partial, true);
-  fs.mkdirSync(child);
-  assert.equal(
-    total().models.reduce((sum, part) => sum + part.usage.input, 0),
-    400_000,
-  );
-  fs.rmdirSync(child);
-  fs.writeFileSync(child, saved);
-  const lines = saved.toString().trimEnd().split('\n');
-  const opening = JSON.parse(lines[0]);
-  opening.payload.source.subagent.thread_spawn.parent_thread_id = 'other';
-  lines[0] = JSON.stringify(opening);
-  fs.writeFileSync(child, lines.join('\n') + '\n');
-  assert.equal(
-    total().models.reduce((sum, part) => sum + part.usage.input, 0),
-    0,
-  );
-  assert.equal(total().partial, true);
-  fs.writeFileSync(child, saved);
-  assert.equal(total(grandchild).partial, false);
-  const conflicting = readCodexAgentSpend(child, [...children, { ...children[0], threadId: 'other' }]);
-  assert.equal(conflicting.models.length, 0);
-  assert.equal(conflicting.partial, true);
-});
+test(
+  'nested Codex cost survives unreadable ancestors and keeps ownership uncertainty',
+  { tags: ['subprocess'] },
+  () => {
+    const { root, child, grandchild, children } = nestedCodexCostFixture();
+    const total = (file = child) => readCodexAgentSpend(file, children);
+    const saved = fs.readFileSync(child);
+    fs.writeFileSync(child, '{"type":');
+    assert.equal(
+      total().models.reduce((sum, part) => sum + part.usage.input, 0),
+      400_000,
+    );
+    assert.equal(total().partial, true);
+    assert.equal(
+      total(root).models.reduce((sum, part) => sum + part.usage.input, 0),
+      500_000,
+    );
+    assert.equal(total(root).partial, true);
+    fs.unlinkSync(child);
+    assert.equal(
+      total().models.reduce((sum, part) => sum + part.usage.input, 0),
+      400_000,
+    );
+    assert.equal(total().partial, true);
+    fs.mkdirSync(child);
+    assert.equal(
+      total().models.reduce((sum, part) => sum + part.usage.input, 0),
+      400_000,
+    );
+    fs.rmdirSync(child);
+    fs.writeFileSync(child, saved);
+    const lines = saved.toString().trimEnd().split('\n');
+    const opening = JSON.parse(lines[0]);
+    opening.payload.source.subagent.thread_spawn.parent_thread_id = 'other';
+    lines[0] = JSON.stringify(opening);
+    fs.writeFileSync(child, lines.join('\n') + '\n');
+    assert.equal(
+      total().models.reduce((sum, part) => sum + part.usage.input, 0),
+      0,
+    );
+    assert.equal(total().partial, true);
+    fs.writeFileSync(child, saved);
+    assert.equal(total(grandchild).partial, false);
+    const conflicting = readCodexAgentSpend(child, [...children, { ...children[0], threadId: 'other' }]);
+    assert.equal(conflicting.models.length, 0);
+    assert.equal(conflicting.partial, true);
+  },
+);
 
-test('nested Codex completion follows the current turn and preserves interruptions', () => {
+test('nested Codex completion follows the current turn and preserves interruptions', { tags: ['subprocess'] }, () => {
   for (const terminal of ['task_complete', 'turn_aborted']) {
     const { child, grandchild, children, task } = nestedCodexCostFixture();
     fs.appendFileSync(
@@ -11383,428 +11411,483 @@ test('nested Codex completion follows the current turn and preserves interruptio
   }
 });
 
-test('root turn cost stays partial until the direct child genuinely finishes its latest turn', () => {
-  for (const state of ['running', 'empty-resume', 'interrupted', 'older-terminal', 'missing-start']) {
-    const { root, child, children, options, task } = nestedCodexCostFixture();
-    const initial = turnCost(readCodexSession(root, 'root', options).turns[0]);
-    const records =
-      state === 'missing-start'
-        ? [JSON.parse(fs.readFileSync(child, 'utf8').split('\n')[0]), event('task_complete', 44, { turn_id: 'resume' })]
-        : [
-            ...(state === 'empty-resume' ? [event('task_started', 40, { turn_id: 'resume' })] : task('resume', 40, 10)),
-            ...(state === 'interrupted' ? [event('turn_aborted', 44, { turn_id: 'resume' })] : []),
-            ...(state === 'older-terminal' ? [event('task_complete', 44, { turn_id: 'child-turn' })] : []),
-          ];
-    const text = records.map((record) => JSON.stringify(record)).join('\n') + '\n';
-    if (state === 'missing-start') fs.writeFileSync(child, text);
-    else fs.appendFileSync(child, text);
-    const cost = turnCost(readCodexSession(root, 'root', options).turns[0]);
-    assert.equal(cost.partial, true, state);
-    assert.equal(readCodexAgentSpend(child, children).partial, true, state);
-    if (state === 'empty-resume') assert.equal(cost.dollars, initial.dollars);
-    if (state !== 'missing-start' && state !== 'interrupted') {
-      fs.appendFileSync(child, JSON.stringify(event('task_complete', 45, { turn_id: 'resume' })) + '\n');
-      assert.equal(turnCost(readCodexSession(root, 'root', options).turns[0]).partial, false, state);
+test(
+  'root turn cost stays partial until the direct child genuinely finishes its latest turn',
+  { tags: ['subprocess'] },
+  () => {
+    for (const state of ['running', 'empty-resume', 'interrupted', 'older-terminal', 'missing-start']) {
+      const { root, child, children, options, task } = nestedCodexCostFixture();
+      const initial = turnCost(readCodexSession(root, 'root', options).turns[0]);
+      const records =
+        state === 'missing-start'
+          ? [
+              JSON.parse(fs.readFileSync(child, 'utf8').split('\n')[0]),
+              event('task_complete', 44, { turn_id: 'resume' }),
+            ]
+          : [
+              ...(state === 'empty-resume'
+                ? [event('task_started', 40, { turn_id: 'resume' })]
+                : task('resume', 40, 10)),
+              ...(state === 'interrupted' ? [event('turn_aborted', 44, { turn_id: 'resume' })] : []),
+              ...(state === 'older-terminal' ? [event('task_complete', 44, { turn_id: 'child-turn' })] : []),
+            ];
+      const text = records.map((record) => JSON.stringify(record)).join('\n') + '\n';
+      if (state === 'missing-start') fs.writeFileSync(child, text);
+      else fs.appendFileSync(child, text);
+      const cost = turnCost(readCodexSession(root, 'root', options).turns[0]);
+      assert.equal(cost.partial, true, state);
+      assert.equal(readCodexAgentSpend(child, children).partial, true, state);
+      if (state === 'empty-resume') assert.equal(cost.dollars, initial.dollars);
+      if (state !== 'missing-start' && state !== 'interrupted') {
+        fs.appendFileSync(child, JSON.stringify(event('task_complete', 45, { turn_id: 'resume' })) + '\n');
+        assert.equal(turnCost(readCodexSession(root, 'root', options).turns[0]).partial, false, state);
+      }
     }
-  }
-});
+  },
+);
 
-test('root turn cost rejects copied completion until a genuine descendant task finishes', () => {
-  for (const shape of ['clock', 'idless-clock', 'repeated-id', 'delayed-date']) {
-    const { root, grandchild, options } = nestedCodexCostFixture();
-    const header = JSON.parse(fs.readFileSync(grandchild, 'utf8').split('\n')[0]);
-    header.timestamp = '2026-08-27T00:26:41.322Z';
-    const replay = replayedSubagentRollout();
-    let copied = replay.slice(2, 7) as { payload: Record<string, unknown> }[];
-    if (shape === 'idless-clock') {
-      copied = structuredClone(copied);
-      for (const record of copied) delete record.payload.turn_id;
+test(
+  'root turn cost rejects copied completion until a genuine descendant task finishes',
+  { tags: ['subprocess'] },
+  () => {
+    for (const shape of ['clock', 'idless-clock', 'repeated-id', 'delayed-date']) {
+      const { root, grandchild, options } = nestedCodexCostFixture();
+      const header = JSON.parse(fs.readFileSync(grandchild, 'utf8').split('\n')[0]);
+      header.timestamp = '2026-08-27T00:26:41.322Z';
+      const replay = replayedSubagentRollout();
+      let copied = replay.slice(2, 7) as { payload: Record<string, unknown> }[];
+      if (shape === 'idless-clock') {
+        copied = structuredClone(copied);
+        for (const record of copied) delete record.payload.turn_id;
+      }
+      if (shape === 'repeated-id') {
+        const own = replay.slice(17) as { payload: Record<string, unknown> }[];
+        copied = [...own, ...structuredClone(own)];
+      }
+      if (shape === 'delayed-date') {
+        copied = structuredClone(copied);
+        delete copied[0].payload.started_at;
+        copied[1].payload.current_date = '2026-08-24';
+        copied.push(copied.splice(1, 1)[0]);
+      }
+      fs.writeFileSync(grandchild, [header, ...copied].map((record) => JSON.stringify(record)).join('\n') + '\n');
+      assert.equal(turnCost(readCodexSession(root, 'root', options).turns[0]).partial, true, shape);
+      const genuine = structuredClone(replay.slice(17)) as { payload: Record<string, unknown> }[];
+      for (const record of genuine) {
+        if (record.payload.turn_id) record.payload.turn_id = 'eventual-own';
+      }
+      fs.appendFileSync(grandchild, genuine.map((record) => JSON.stringify(record)).join('\n') + '\n');
+      const complete = readCodexSession(root, 'root', options).turns[0];
+      assert.equal(turnCost(complete).partial, false, shape);
+      assert.equal(
+        complete.agents[0].spend.reduce((sum, part) => sum + part.usage.input, 0),
+        200_000 + (shape === 'repeated-id' ? 26 : 13),
+        shape,
+      );
     }
-    if (shape === 'repeated-id') {
-      const own = replay.slice(17) as { payload: Record<string, unknown> }[];
-      copied = [...own, ...structuredClone(own)];
-    }
-    if (shape === 'delayed-date') {
-      copied = structuredClone(copied);
-      delete copied[0].payload.started_at;
-      copied[1].payload.current_date = '2026-08-24';
-      copied.push(copied.splice(1, 1)[0]);
-    }
-    fs.writeFileSync(grandchild, [header, ...copied].map((record) => JSON.stringify(record)).join('\n') + '\n');
-    assert.equal(turnCost(readCodexSession(root, 'root', options).turns[0]).partial, true, shape);
-    const genuine = structuredClone(replay.slice(17)) as { payload: Record<string, unknown> }[];
-    for (const record of genuine) {
-      if (record.payload.turn_id) record.payload.turn_id = 'eventual-own';
-    }
-    fs.appendFileSync(grandchild, genuine.map((record) => JSON.stringify(record)).join('\n') + '\n');
-    const complete = readCodexSession(root, 'root', options).turns[0];
-    assert.equal(turnCost(complete).partial, false, shape);
-    assert.equal(
-      complete.agents[0].spend.reduce((sum, part) => sum + part.usage.input, 0),
-      200_000 + (shape === 'repeated-id' ? 26 : 13),
-      shape,
-    );
-  }
-});
+  },
+);
 
-test('genuine failed descendants finish while independent usage uncertainty remains partial', () => {
-  for (const shape of ['priced', 'truncated', 'incomplete', 'unpriced', 'mismatched']) {
-    const { root, grandchild, options, task } = nestedCodexCostFixture();
-    const header = JSON.parse(fs.readFileSync(grandchild, 'utf8').split('\n')[0]);
-    const records = [
-      header,
-      ...task('failed-own', 40, 10),
-      event('task_complete', 45, {
-        turn_id: shape === 'mismatched' ? 'other' : 'failed-own',
-        error: { message: 'failed' },
-      }),
-    ];
-    if (shape === 'incomplete') records.splice(-1, 0, event('token_count', 44, { info: { last_token_usage: null } }));
-    if (shape === 'unpriced') (records[2] as { payload: Record<string, unknown> }).payload.model = 'unknown-model';
+test(
+  'genuine failed descendants finish while independent usage uncertainty remains partial',
+  { tags: ['subprocess'] },
+  () => {
+    for (const shape of ['priced', 'truncated', 'incomplete', 'unpriced', 'mismatched']) {
+      const { root, grandchild, options, task } = nestedCodexCostFixture();
+      const header = JSON.parse(fs.readFileSync(grandchild, 'utf8').split('\n')[0]);
+      const records = [
+        header,
+        ...task('failed-own', 40, 10),
+        event('task_complete', 45, {
+          turn_id: shape === 'mismatched' ? 'other' : 'failed-own',
+          error: { message: 'failed' },
+        }),
+      ];
+      if (shape === 'incomplete') records.splice(-1, 0, event('token_count', 44, { info: { last_token_usage: null } }));
+      if (shape === 'unpriced') (records[2] as { payload: Record<string, unknown> }).payload.model = 'unknown-model';
+      fs.writeFileSync(
+        grandchild,
+        records.map((record) => JSON.stringify(record)).join('\n') + '\n' + (shape === 'truncated' ? '{"type":' : ''),
+      );
+      const cost = turnCost(readCodexSession(root, 'root', options).turns[0]);
+      assert.equal(cost.partial, shape !== 'priced', shape);
+      assert.ok(cost.dollars !== null);
+    }
+  },
+);
+
+test(
+  'unique explicit Codex IDs count sources without parent metadata once and remain partial',
+  { tags: ['subprocess'] },
+  () => {
+    const { child, grandchild, children } = nestedCodexCostFixture();
+    const lines = fs.readFileSync(grandchild, 'utf8').trimEnd().split('\n');
+    const opening = JSON.parse(lines[0]);
+    delete opening.payload.source;
+    opening.payload.thread_source = 'subagent';
+    lines[0] = JSON.stringify(opening);
+    fs.writeFileSync(grandchild, lines.join('\n') + '\n');
+    const catalog = [children[0], { ...children[1], parentThreadId: null }];
+    const ref = { id: 'grandchild', name: '', path: null, status: 'completed' };
+    assert.equal(codexSubagentFor(catalog, 'child', ref)?.file, grandchild);
+    const childLines = fs.readFileSync(child, 'utf8').trimEnd().split('\n');
+    const completion = childLines.pop();
     fs.writeFileSync(
-      grandchild,
-      records.map((record) => JSON.stringify(record)).join('\n') + '\n' + (shape === 'truncated' ? '{"type":' : ''),
-    );
-    const cost = turnCost(readCodexSession(root, 'root', options).turns[0]);
-    assert.equal(cost.partial, shape !== 'priced', shape);
-    assert.ok(cost.dollars !== null);
-  }
-});
-
-test('unique explicit Codex IDs count sources without parent metadata once and remain partial', () => {
-  const { child, grandchild, children } = nestedCodexCostFixture();
-  const lines = fs.readFileSync(grandchild, 'utf8').trimEnd().split('\n');
-  const opening = JSON.parse(lines[0]);
-  delete opening.payload.source;
-  opening.payload.thread_source = 'subagent';
-  lines[0] = JSON.stringify(opening);
-  fs.writeFileSync(grandchild, lines.join('\n') + '\n');
-  const catalog = [children[0], { ...children[1], parentThreadId: null }];
-  const ref = { id: 'grandchild', name: '', path: null, status: 'completed' };
-  assert.equal(codexSubagentFor(catalog, 'child', ref)?.file, grandchild);
-  const childLines = fs.readFileSync(child, 'utf8').trimEnd().split('\n');
-  const completion = childLines.pop();
-  fs.writeFileSync(
-    child,
-    childLines.join('\n') +
-      '\n' +
-      [
-        item('function_call', 26, { name: 'spawn_agent', call_id: 'explicit', arguments: '{}' }),
-        item('function_call_output', 27, {
-          call_id: 'explicit',
-          output: JSON.stringify({ agent_id: 'grandchild', nickname: 'grandchild' }),
-        }),
-        item('function_call', 28, { name: 'spawn_agent', call_id: 'repeat', arguments: '{}' }),
-        item('function_call_output', 29, {
-          call_id: 'repeat',
-          output: JSON.stringify({ agent_id: 'grandchild', nickname: 'grandchild' }),
-        }),
-      ]
-        .map((record) => JSON.stringify(record))
-        .join('\n') +
-      '\n' +
-      completion +
-      '\n',
-  );
-  const spend = readCodexAgentSpend(child, catalog);
-  assert.equal(
-    spend.models.reduce((sum, part) => sum + part.usage.input, 0),
-    600_000,
-  );
-  assert.equal(spend.partial, true);
-});
-
-test('explicit Codex child IDs retain transcript links when parent metadata is absent', () => {
-  const { root, child, children } = nestedCodexCostFixture();
-  const childRecords = fs
-    .readFileSync(child, 'utf8')
-    .trimEnd()
-    .split('\n')
-    .map((line) => JSON.parse(line));
-  delete childRecords[0].payload.source;
-  childRecords[0].payload.thread_source = 'subagent';
-  fs.writeFileSync(child, childRecords.map((record) => JSON.stringify(record)).join('\n') + '\n');
-  const rootRecords = fs
-    .readFileSync(root, 'utf8')
-    .trimEnd()
-    .split('\n')
-    .map((line) => JSON.parse(line));
-  const acknowledgment = rootRecords.find((record) => record.payload.type === 'function_call_output');
-  acknowledgment.payload.output = JSON.stringify({ agent_id: 'child', nickname: 'child' });
-  fs.writeFileSync(root, rootRecords.map((record) => JSON.stringify(record)).join('\n') + '\n');
-  const catalog = [{ ...children[0], parentThreadId: null }, children[1]];
-  const addFacts = () =>
-    fs.appendFileSync(
       child,
+      childLines.join('\n') +
+        '\n' +
+        [
+          item('function_call', 26, { name: 'spawn_agent', call_id: 'explicit', arguments: '{}' }),
+          item('function_call_output', 27, {
+            call_id: 'explicit',
+            output: JSON.stringify({ agent_id: 'grandchild', nickname: 'grandchild' }),
+          }),
+          item('function_call', 28, { name: 'spawn_agent', call_id: 'repeat', arguments: '{}' }),
+          item('function_call_output', 29, {
+            call_id: 'repeat',
+            output: JSON.stringify({ agent_id: 'grandchild', nickname: 'grandchild' }),
+          }),
+        ]
+          .map((record) => JSON.stringify(record))
+          .join('\n') +
+        '\n' +
+        completion +
+        '\n',
+    );
+    const spend = readCodexAgentSpend(child, catalog);
+    assert.equal(
+      spend.models.reduce((sum, part) => sum + part.usage.input, 0),
+      600_000,
+    );
+    assert.equal(spend.partial, true);
+  },
+);
+
+test(
+  'explicit Codex child IDs retain transcript links when parent metadata is absent',
+  { tags: ['subprocess'] },
+  () => {
+    const { root, child, children } = nestedCodexCostFixture();
+    const childRecords = fs
+      .readFileSync(child, 'utf8')
+      .trimEnd()
+      .split('\n')
+      .map((line) => JSON.parse(line));
+    delete childRecords[0].payload.source;
+    childRecords[0].payload.thread_source = 'subagent';
+    fs.writeFileSync(child, childRecords.map((record) => JSON.stringify(record)).join('\n') + '\n');
+    const rootRecords = fs
+      .readFileSync(root, 'utf8')
+      .trimEnd()
+      .split('\n')
+      .map((line) => JSON.parse(line));
+    const acknowledgment = rootRecords.find((record) => record.payload.type === 'function_call_output');
+    acknowledgment.payload.output = JSON.stringify({ agent_id: 'child', nickname: 'child' });
+    fs.writeFileSync(root, rootRecords.map((record) => JSON.stringify(record)).join('\n') + '\n');
+    const catalog = [{ ...children[0], parentThreadId: null }, children[1]];
+    const addFacts = () =>
+      fs.appendFileSync(
+        child,
+        [
+          event('task_started', 40, { turn_id: 'facts' }),
+          turnContext(40, 'facts', 'gpt-5.6-sol', 'high'),
+          ...ordinaryTurn().slice(3, -2),
+          item('custom_tool_call', 41, { name: 'exec', call_id: 'failed' }),
+          toolOutput(42, 'failed', 'Script error: ReferenceError: missing value'),
+          event('token_count', 43, { info: { last_token_usage: null } }),
+          commandCompleted(43, 'git commit -m visible', 0, 'completed', 'printed', {
+            stdout: '[main f572f41] Add the camera plan\n 1 file changed, 186 insertions(+)\n',
+          }),
+          event('task_complete', 44, { turn_id: 'facts' }),
+        ]
+          .map((record) => JSON.stringify(record))
+          .join('\n') + '\n',
+      );
+    const [turn] = readCodexSession(root, 'root', {
+      structuralChildren: catalog,
+      agentSpendOf: (ref) => {
+        const target = codexSubagentFor(catalog, 'root', ref);
+        return target
+          ? readCodexAgentSpend(target.file, catalog)
+          : { models: [], found: false, partial: false, effort: null };
+      },
+    }).turns;
+    assert.equal(turn.agents[0].childSessionId, 'child');
+    assert.equal(turnCost(turn).partial, true);
+    assert.equal(
+      turn.agents[0].spend.reduce((sum, part) => sum + part.usage.input, 0),
+      600_000,
+    );
+    addFacts();
+    const own = readCodexDispatchedSpend([child], [catalog[0], catalog[1]], Date.now() + 6000);
+    const dispatched = readCodexDispatchedSpend([root], catalog, Date.now() + 6000);
+    assert.equal(dispatched.usageIncomplete, true);
+    assert.equal(dispatched.partial, true);
+    assert.equal(dispatched.artifacts?.complete, false);
+    assert.deepEqual(dispatched.artifacts?.files, own.artifacts?.files);
+    assert.deepEqual(dispatched.artifacts?.commits, ['f572f41']);
+    assert.deepEqual(dispatched.commits, own.commits);
+    assert.deepEqual(dispatched.artifacts?.failed, own.artifacts?.failed);
+    assert.ok((dispatched.artifacts?.failed?.count ?? 0) > 0);
+    assert.equal(dispatched.artifacts?.turnCount, (own.artifacts?.turnCount ?? 1) + 1);
+    assert.equal(dispatched.toolUses, (own.toolUses ?? 0) + 1);
+  },
+);
+
+test(
+  'dispatched Codex facts exclude valid-looking descendants under a rejected ancestor',
+  { tags: ['subprocess'] },
+  () => {
+    const { root, child, grandchild, children } = nestedCodexCostFixture();
+    const rootOwn = readCodexDispatchedSpend([root], [], Date.now() + 6000);
+    const records = fs
+      .readFileSync(child, 'utf8')
+      .trimEnd()
+      .split('\n')
+      .map((line) => JSON.parse(line));
+    records[0].payload.id = 'different-session';
+    fs.writeFileSync(child, records.map((record) => JSON.stringify(record)).join('\n') + '\n');
+    fs.appendFileSync(
+      grandchild,
       [
-        event('task_started', 40, { turn_id: 'facts' }),
-        turnContext(40, 'facts', 'gpt-5.6-sol', 'high'),
+        event('task_started', 40, { turn_id: 'bad' }),
         ...ordinaryTurn().slice(3, -2),
         item('custom_tool_call', 41, { name: 'exec', call_id: 'failed' }),
         toolOutput(42, 'failed', 'Script error: ReferenceError: missing value'),
-        event('token_count', 43, { info: { last_token_usage: null } }),
-        commandCompleted(43, 'git commit -m visible', 0, 'completed', 'printed', {
-          stdout: '[main f572f41] Add the camera plan\n 1 file changed, 186 insertions(+)\n',
-        }),
-        event('task_complete', 44, { turn_id: 'facts' }),
+        event('task_complete', 43, { turn_id: 'bad' }),
       ]
         .map((record) => JSON.stringify(record))
         .join('\n') + '\n',
     );
-  const [turn] = readCodexSession(root, 'root', {
-    structuralChildren: catalog,
-    agentSpendOf: (ref) => {
+    const spend = readCodexDispatchedSpend([root, child, grandchild], children, Date.now() + 6000);
+    assert.equal(spend.partial, true);
+    assert.equal(spend.artifacts?.complete, false);
+    assert.deepEqual(spend.artifacts?.tools, rootOwn.artifacts?.tools);
+    assert.deepEqual(spend.artifacts?.files, rootOwn.artifacts?.files);
+    assert.equal(spend.artifacts?.failed, undefined);
+    assert.equal(spend.artifacts?.turnCount, undefined);
+    assert.deepEqual(spend.commits, rootOwn.commits);
+    assert.deepEqual(spend.models, rootOwn.models);
+  },
+);
+
+test(
+  'nested Codex spend merges equal pricing identities without changing exact usage parts',
+  { tags: ['subprocess'] },
+  () => {
+    const { child, grandchild, children, task } = nestedCodexCostFixture();
+    const own = [readCodexAgentSpend(child), readCodexAgentSpend(grandchild)];
+    const spend = readCodexAgentSpend(child, children);
+    assert.equal(spend.models.length, 1);
+    assert.equal(spend.models[0].usage.input, 600_000);
+    assert.deepEqual(
+      spend.models[0].usageParts,
+      own.flatMap((value) => value.models.flatMap((part) => part.usageParts ?? [])),
+    );
+    const result = claudePrintResult({
+      usage: { input_tokens: 20, cache_creation_input_tokens: 100, cache_read_input_tokens: 300, output_tokens: 40 },
+    });
+    for (const [file, id] of [
+      [child, 'child-invocation'],
+      [grandchild, 'grandchild-invocation'],
+    ]) {
+      fs.appendFileSync(
+        file,
+        [
+          ...task('linked', 40, 10),
+          claudeCommandCompleted(43, 'shared-invocation', result),
+          claudeCommandCompleted(44, id, result),
+          event('task_complete', 45, { turn_id: 'linked', last_agent_message: 'done' }),
+        ]
+          .map((record) => JSON.stringify(record))
+          .join('\n') + '\n',
+      );
+    }
+    const linked = readCodexAgentSpend(child, children);
+    const parts = [readCodexAgentSpend(child), readCodexAgentSpend(grandchild)].flatMap((value) => value.models);
+    const shared = linked.models.filter((part) =>
+      part.usageParts?.some((usage) => usage.linkedInvocationId?.startsWith('shared-invocation:')),
+    );
+    assert.equal(shared.length, 2);
+    assert.equal(shared.find((part) => part.model === 'claude-opus-5')?.recordedCost, 6.48);
+    assert.equal(shared.find((part) => part.model === 'claude-opus-5')?.unclassifiedCacheWrite, 200);
+    assert.equal(linked.models.filter((part) => part.model === 'claude-opus-5').length, 3);
+    for (const part of shared) {
+      const expected = parts.filter(
+        (value) =>
+          value.model === part.model &&
+          value.usageParts?.some((usage) => usage.linkedInvocationId?.startsWith('shared-invocation:')),
+      );
+      assert.deepEqual(
+        part.usageParts,
+        expected.flatMap((value) => value.usageParts ?? []),
+      );
+    }
+  },
+);
+
+test(
+  'serialized Codex catalogs reuse canonical resolution until their relationships change',
+  { tags: ['subprocess'] },
+  () => {
+    const { child, children } = nestedCodexCostFixture();
+    const index = codexSpendIndex(children);
+    const nativeFs = createRequire(__filename)('node:fs') as typeof fs;
+    const spy = vi.spyOn(nativeFs.realpathSync, 'native');
+    try {
+      assert.equal(codexSpendIndex(structuredClone(children)), index);
+      assert.equal(spy.mock.calls.length, 0);
+      const changed = structuredClone(children);
+      changed[1].parentThreadId = 'other';
+      const next = codexSpendIndex(changed);
+      assert.notEqual(next, index);
+      assert.equal(next.resolve('child', { id: 'grandchild', name: '', path: null, status: 'completed' }), null);
+      const movedRoot = structuredClone(children);
+      movedRoot[0].parentThreadId = 'other-root';
+      assert.notEqual(codexAgentSpendVersion(child, index), codexAgentSpendVersion(child, codexSpendIndex(movedRoot)));
+    } finally {
+      spy.mockRestore();
+    }
+  },
+);
+
+test(
+  'dispatched Codex dependency revisions stay bounded and retain catalog and source invalidation',
+  { tags: ['subprocess'] },
+  () => {
+    const { child, grandchild, children } = nestedCodexCostFixture();
+    const now = ms(90);
+    fs.utimesSync(child, now / 1000, now / 1000);
+    fs.utimesSync(grandchild, now / 1000, now / 1000);
+    const catalog = [
+      ...children,
+      ...Array.from({ length: 256 }, (_, index) => ({
+        ...children[1],
+        file: `${grandchild}-unrelated-${index}`,
+        threadId: `unrelated-${index}`,
+        parentThreadId: 'elsewhere',
+      })),
+    ];
+    const version = (entries = catalog, dependencies = [grandchild]) =>
+      codexAgentSpendVersion(child, codexSpendIndex(entries), 'child', dependencies);
+    const first = version();
+    const savedWrongOwnershipVersion = first.replace(/commit-repositories:[0-9]+/, 'commit-repositories:3');
+    assert.notEqual(
+      first,
+      savedWrongOwnershipVersion,
+      'literal navigation generation 3 kept a wrong ownership decision',
+    );
+    assert.ok(first.length < 1024, `a dispatched dependency revision retained ${first.length} characters`);
+    assert.equal(version([...catalog].reverse()), first);
+    assert.equal(version([...catalog, { ...children[1] }]), first);
+    const alias = `${path.dirname(grandchild)}${path.sep}.${path.sep}${path.basename(grandchild)}`;
+    assert.equal(version([...catalog, { ...children[1], file: alias }]), first);
+    assert.equal(version(catalog, [grandchild, grandchild, alias]), first);
+    const empty = version([]);
+    assert.equal(childSpendRevisionKey('completed', empty, now), empty, 'an empty catalog gained a refresh band');
+    const key = childSpendRevisionKey('completed', first, now);
+    assert.ok(key.startsWith('open:'), 'recent native writes lost their refresh band');
+    for (const field of ['threadId', 'parentThreadId', 'agentPath', 'file'] as const) {
+      const changed = structuredClone(catalog);
+      changed[1][field] = `${changed[1][field]}-changed`;
+      const next = version(changed);
+      assert.notEqual(next, first, `${field} changed without invalidating dispatched spend`);
+      assert.notEqual(childSpendRevisionKey('completed', next, now), key, `${field} disappeared from the refresh band`);
+    }
+    assert.notEqual(version(catalog.slice(0, 1)), first, 'a late native child kept its previous dependency revision');
+    assert.notEqual(
+      version([...catalog, { ...children[1], threadId: 'conflict' }]),
+      first,
+      'an ambiguous source kept its previous dependency revision',
+    );
+    fs.appendFileSync(grandchild, '\n');
+    assert.notEqual(version(), first, 'descendant growth kept its previous dependency revision');
+    assert.notEqual(codexAgentSpendVersion(child, codexSpendIndex(catalog), 'other-child', [grandchild]), version());
+  },
+);
+
+test(
+  'retained inferred Codex task associations reconsider catalog ambiguity after serialization',
+  { tags: ['subprocess'] },
+  () => {
+    const { root, children, options } = nestedCodexCostFixture();
+    const retained = structuredClone(readCodexSession(root, 'root', options).turns);
+    const catalog = [...children, { ...children[0], threadId: 'other-child', file: `${children[0].file}-other` }];
+    const lookup = (ref: import('./agentspend').AgentSpendRef) => {
       const target = codexSubagentFor(catalog, 'root', ref);
       return target
         ? readCodexAgentSpend(target.file, catalog)
         : { models: [], found: false, partial: false, effort: null };
-    },
-  }).turns;
-  assert.equal(turn.agents[0].childSessionId, 'child');
-  assert.equal(turnCost(turn).partial, true);
-  assert.equal(
-    turn.agents[0].spend.reduce((sum, part) => sum + part.usage.input, 0),
-    600_000,
-  );
-  addFacts();
-  const own = readCodexDispatchedSpend([child], [catalog[0], catalog[1]], Date.now() + 6000);
-  const dispatched = readCodexDispatchedSpend([root], catalog, Date.now() + 6000);
-  assert.equal(dispatched.usageIncomplete, true);
-  assert.equal(dispatched.partial, true);
-  assert.equal(dispatched.artifacts?.complete, false);
-  assert.deepEqual(dispatched.artifacts?.files, own.artifacts?.files);
-  assert.deepEqual(dispatched.artifacts?.commits, ['f572f41']);
-  assert.deepEqual(dispatched.commits, own.commits);
-  assert.deepEqual(dispatched.artifacts?.failed, own.artifacts?.failed);
-  assert.ok((dispatched.artifacts?.failed?.count ?? 0) > 0);
-  assert.equal(dispatched.artifacts?.turnCount, (own.artifacts?.turnCount ?? 1) + 1);
-  assert.equal(dispatched.toolUses, (own.toolUses ?? 0) + 1);
-});
-
-test('dispatched Codex facts exclude valid-looking descendants under a rejected ancestor', () => {
-  const { root, child, grandchild, children } = nestedCodexCostFixture();
-  const rootOwn = readCodexDispatchedSpend([root], [], Date.now() + 6000);
-  const records = fs
-    .readFileSync(child, 'utf8')
-    .trimEnd()
-    .split('\n')
-    .map((line) => JSON.parse(line));
-  records[0].payload.id = 'different-session';
-  fs.writeFileSync(child, records.map((record) => JSON.stringify(record)).join('\n') + '\n');
-  fs.appendFileSync(
-    grandchild,
-    [
-      event('task_started', 40, { turn_id: 'bad' }),
-      ...ordinaryTurn().slice(3, -2),
-      item('custom_tool_call', 41, { name: 'exec', call_id: 'failed' }),
-      toolOutput(42, 'failed', 'Script error: ReferenceError: missing value'),
-      event('task_complete', 43, { turn_id: 'bad' }),
-    ]
-      .map((record) => JSON.stringify(record))
-      .join('\n') + '\n',
-  );
-  const spend = readCodexDispatchedSpend([root, child, grandchild], children, Date.now() + 6000);
-  assert.equal(spend.partial, true);
-  assert.equal(spend.artifacts?.complete, false);
-  assert.deepEqual(spend.artifacts?.tools, rootOwn.artifacts?.tools);
-  assert.deepEqual(spend.artifacts?.files, rootOwn.artifacts?.files);
-  assert.equal(spend.artifacts?.failed, undefined);
-  assert.equal(spend.artifacts?.turnCount, undefined);
-  assert.deepEqual(spend.commits, rootOwn.commits);
-  assert.deepEqual(spend.models, rootOwn.models);
-});
-
-test('nested Codex spend merges equal pricing identities without changing exact usage parts', () => {
-  const { child, grandchild, children, task } = nestedCodexCostFixture();
-  const own = [readCodexAgentSpend(child), readCodexAgentSpend(grandchild)];
-  const spend = readCodexAgentSpend(child, children);
-  assert.equal(spend.models.length, 1);
-  assert.equal(spend.models[0].usage.input, 600_000);
-  assert.deepEqual(
-    spend.models[0].usageParts,
-    own.flatMap((value) => value.models.flatMap((part) => part.usageParts ?? [])),
-  );
-  const result = claudePrintResult({
-    usage: { input_tokens: 20, cache_creation_input_tokens: 100, cache_read_input_tokens: 300, output_tokens: 40 },
-  });
-  for (const [file, id] of [
-    [child, 'child-invocation'],
-    [grandchild, 'grandchild-invocation'],
-  ]) {
-    fs.appendFileSync(
-      file,
-      [
-        ...task('linked', 40, 10),
-        claudeCommandCompleted(43, 'shared-invocation', result),
-        claudeCommandCompleted(44, id, result),
-        event('task_complete', 45, { turn_id: 'linked', last_agent_message: 'done' }),
-      ]
-        .map((record) => JSON.stringify(record))
-        .join('\n') + '\n',
-    );
-  }
-  const linked = readCodexAgentSpend(child, children);
-  const parts = [readCodexAgentSpend(child), readCodexAgentSpend(grandchild)].flatMap((value) => value.models);
-  const shared = linked.models.filter((part) =>
-    part.usageParts?.some((usage) => usage.linkedInvocationId?.startsWith('shared-invocation:')),
-  );
-  assert.equal(shared.length, 2);
-  assert.equal(shared.find((part) => part.model === 'claude-opus-5')?.recordedCost, 6.48);
-  assert.equal(shared.find((part) => part.model === 'claude-opus-5')?.unclassifiedCacheWrite, 200);
-  assert.equal(linked.models.filter((part) => part.model === 'claude-opus-5').length, 3);
-  for (const part of shared) {
-    const expected = parts.filter(
-      (value) =>
-        value.model === part.model &&
-        value.usageParts?.some((usage) => usage.linkedInvocationId?.startsWith('shared-invocation:')),
-    );
+    };
+    refreshCodexStructuralAgents(retained, 'root', catalog, lookup);
+    const fresh = readCodexSession(root, 'root', { structuralChildren: catalog, agentSpendOf: lookup }).turns;
+    assert.deepEqual(turnCost(retained[0]), turnCost(fresh[0]));
     assert.deepEqual(
-      part.usageParts,
-      expected.flatMap((value) => value.usageParts ?? []),
+      retained[0].agents.map((agent) => [agent.id, agent.childSessionId]),
+      fresh[0].agents.map((agent) => [agent.id, agent.childSessionId]),
     );
-  }
-});
+  },
+);
 
-test('serialized Codex catalogs reuse canonical resolution until their relationships change', () => {
-  const { child, children } = nestedCodexCostFixture();
-  const index = codexSpendIndex(children);
-  const nativeFs = createRequire(__filename)('node:fs') as typeof fs;
-  const spy = vi.spyOn(nativeFs.realpathSync, 'native');
-  try {
-    assert.equal(codexSpendIndex(structuredClone(children)), index);
-    assert.equal(spy.mock.calls.length, 0);
-    const changed = structuredClone(children);
-    changed[1].parentThreadId = 'other';
-    const next = codexSpendIndex(changed);
-    assert.notEqual(next, index);
-    assert.equal(next.resolve('child', { id: 'grandchild', name: '', path: null, status: 'completed' }), null);
-    const movedRoot = structuredClone(children);
-    movedRoot[0].parentThreadId = 'other-root';
-    assert.notEqual(codexAgentSpendVersion(child, index), codexAgentSpendVersion(child, codexSpendIndex(movedRoot)));
-  } finally {
-    spy.mockRestore();
-  }
-});
-
-test('dispatched Codex dependency revisions stay bounded and retain catalog and source invalidation', () => {
-  const { child, grandchild, children } = nestedCodexCostFixture();
-  const now = ms(90);
-  fs.utimesSync(child, now / 1000, now / 1000);
-  fs.utimesSync(grandchild, now / 1000, now / 1000);
-  const catalog = [
-    ...children,
-    ...Array.from({ length: 256 }, (_, index) => ({
-      ...children[1],
-      file: `${grandchild}-unrelated-${index}`,
-      threadId: `unrelated-${index}`,
-      parentThreadId: 'elsewhere',
-    })),
-  ];
-  const version = (entries = catalog, dependencies = [grandchild]) =>
-    codexAgentSpendVersion(child, codexSpendIndex(entries), 'child', dependencies);
-  const first = version();
-  const savedWrongOwnershipVersion = first.replace(/commit-repositories:[0-9]+/, 'commit-repositories:3');
-  assert.notEqual(first, savedWrongOwnershipVersion, 'literal navigation generation 3 kept a wrong ownership decision');
-  assert.ok(first.length < 1024, `a dispatched dependency revision retained ${first.length} characters`);
-  assert.equal(version([...catalog].reverse()), first);
-  assert.equal(version([...catalog, { ...children[1] }]), first);
-  const alias = `${path.dirname(grandchild)}${path.sep}.${path.sep}${path.basename(grandchild)}`;
-  assert.equal(version([...catalog, { ...children[1], file: alias }]), first);
-  assert.equal(version(catalog, [grandchild, grandchild, alias]), first);
-  const empty = version([]);
-  assert.equal(childSpendRevisionKey('completed', empty, now), empty, 'an empty catalog gained a refresh band');
-  const key = childSpendRevisionKey('completed', first, now);
-  assert.ok(key.startsWith('open:'), 'recent native writes lost their refresh band');
-  for (const field of ['threadId', 'parentThreadId', 'agentPath', 'file'] as const) {
-    const changed = structuredClone(catalog);
-    changed[1][field] = `${changed[1][field]}-changed`;
-    const next = version(changed);
-    assert.notEqual(next, first, `${field} changed without invalidating dispatched spend`);
-    assert.notEqual(childSpendRevisionKey('completed', next, now), key, `${field} disappeared from the refresh band`);
-  }
-  assert.notEqual(version(catalog.slice(0, 1)), first, 'a late native child kept its previous dependency revision');
-  assert.notEqual(
-    version([...catalog, { ...children[1], threadId: 'conflict' }]),
-    first,
-    'an ambiguous source kept its previous dependency revision',
-  );
-  fs.appendFileSync(grandchild, '\n');
-  assert.notEqual(version(), first, 'descendant growth kept its previous dependency revision');
-  assert.notEqual(codexAgentSpendVersion(child, codexSpendIndex(catalog), 'other-child', [grandchild]), version());
-});
-
-test('retained inferred Codex task associations reconsider catalog ambiguity after serialization', () => {
-  const { root, children, options } = nestedCodexCostFixture();
-  const retained = structuredClone(readCodexSession(root, 'root', options).turns);
-  const catalog = [...children, { ...children[0], threadId: 'other-child', file: `${children[0].file}-other` }];
-  const lookup = (ref: import('./agentspend').AgentSpendRef) => {
-    const target = codexSubagentFor(catalog, 'root', ref);
-    return target
-      ? readCodexAgentSpend(target.file, catalog)
-      : { models: [], found: false, partial: false, effort: null };
-  };
-  refreshCodexStructuralAgents(retained, 'root', catalog, lookup);
-  const fresh = readCodexSession(root, 'root', { structuralChildren: catalog, agentSpendOf: lookup }).turns;
-  assert.deepEqual(turnCost(retained[0]), turnCost(fresh[0]));
-  assert.deepEqual(
-    retained[0].agents.map((agent) => [agent.id, agent.childSessionId]),
-    fresh[0].agents.map((agent) => [agent.id, agent.childSessionId]),
-  );
-});
-
-test('serialized parent-recorded Codex rows match fresh status and cost after direct child resume', () => {
-  for (const identity of ['inferred', 'explicit', 'parent-terminal']) {
-    const { root, child, children, options } = nestedCodexCostFixture();
-    if (identity !== 'inferred') {
-      const records = fs
-        .readFileSync(root, 'utf8')
-        .trimEnd()
-        .split('\n')
-        .map((line) => JSON.parse(line));
-      const output = records.find((record) => record.payload.type === 'function_call_output');
-      output.payload.output = JSON.stringify({ agent_id: 'child', nickname: '/root/child' });
-      if (identity === 'parent-terminal')
-        records.splice(
-          -1,
-          0,
-          item('agent_message', 28, {
-            author: '/root/child',
-            recipient: '/root',
-            content: [{ type: 'input_text', text: 'Message Type: FINAL_ANSWER\nSender: /root/child\nPayload:\nDone' }],
-          }),
-        );
-      fs.writeFileSync(root, records.map((record) => JSON.stringify(record)).join('\n') + '\n');
-    }
-    let retained = structuredClone(readCodexSession(root, 'root', options).turns);
-    const originalId = retained[0].agents[0].id;
-    const facts = (turns: typeof retained) => ({
-      cost: turnCost(turns[0]),
-      rows: turns[0].agents.map((agent) => [
-        agent.id,
-        agent.status,
-        agent.durationMs,
-        agent.childSessionId,
-        agent.spendPartial,
-      ]),
-    });
-    for (const [index, records] of [
-      [event('task_started', 40, { turn_id: 'resume' })],
-      [event('task_complete', 41, { turn_id: 'child-turn' })],
-      [event('task_complete', 45, { turn_id: 'resume' })],
-    ].entries()) {
-      fs.appendFileSync(child, records.map((record) => JSON.stringify(record)).join('\n') + '\n');
-      retained = structuredClone(retained);
-      refreshCodexStructuralAgents(retained, 'root', children, options.agentSpendOf);
-      const fresh = readCodexSession(root, 'root', options).turns;
-      assert.deepEqual(facts(retained), facts(fresh), identity);
-      assert.equal(retained[0].agents[0].id, originalId);
-      if (identity === 'parent-terminal') {
-        assert.equal(retained[0].agents[0].status, 'completed');
-        assert.equal(retained[0].agents[0].durationMs, index === 2 ? 39_000 : null);
+test(
+  'serialized parent-recorded Codex rows match fresh status and cost after direct child resume',
+  { tags: ['subprocess'] },
+  () => {
+    for (const identity of ['inferred', 'explicit', 'parent-terminal']) {
+      const { root, child, children, options } = nestedCodexCostFixture();
+      if (identity !== 'inferred') {
+        const records = fs
+          .readFileSync(root, 'utf8')
+          .trimEnd()
+          .split('\n')
+          .map((line) => JSON.parse(line));
+        const output = records.find((record) => record.payload.type === 'function_call_output');
+        output.payload.output = JSON.stringify({ agent_id: 'child', nickname: '/root/child' });
+        if (identity === 'parent-terminal')
+          records.splice(
+            -1,
+            0,
+            item('agent_message', 28, {
+              author: '/root/child',
+              recipient: '/root',
+              content: [
+                { type: 'input_text', text: 'Message Type: FINAL_ANSWER\nSender: /root/child\nPayload:\nDone' },
+              ],
+            }),
+          );
+        fs.writeFileSync(root, records.map((record) => JSON.stringify(record)).join('\n') + '\n');
+      }
+      let retained = structuredClone(readCodexSession(root, 'root', options).turns);
+      const originalId = retained[0].agents[0].id;
+      const facts = (turns: typeof retained) => ({
+        cost: turnCost(turns[0]),
+        rows: turns[0].agents.map((agent) => [
+          agent.id,
+          agent.status,
+          agent.durationMs,
+          agent.childSessionId,
+          agent.spendPartial,
+        ]),
+      });
+      for (const [index, records] of [
+        [event('task_started', 40, { turn_id: 'resume' })],
+        [event('task_complete', 41, { turn_id: 'child-turn' })],
+        [event('task_complete', 45, { turn_id: 'resume' })],
+      ].entries()) {
+        fs.appendFileSync(child, records.map((record) => JSON.stringify(record)).join('\n') + '\n');
+        retained = structuredClone(retained);
+        refreshCodexStructuralAgents(retained, 'root', children, options.agentSpendOf);
+        const fresh = readCodexSession(root, 'root', options).turns;
+        assert.deepEqual(facts(retained), facts(fresh), identity);
+        assert.equal(retained[0].agents[0].id, originalId);
+        if (identity === 'parent-terminal') {
+          assert.equal(retained[0].agents[0].status, 'completed');
+          assert.equal(retained[0].agents[0].durationMs, index === 2 ? 39_000 : null);
+        }
       }
     }
-  }
-});
+  },
+);
 
 test('a parent turn attaches child spend by the thread id its activity recorded', () => {
   const records = ordinaryTurn();
@@ -16157,7 +16240,7 @@ test('native Codex attachment preserves cached commit objects and clears refresh
   assert.equal(child.commitIntents, undefined);
 });
 
-test('native Codex descendant commits stay owned by their direct source', () => {
+test('native Codex descendant commits stay owned by their direct source', { tags: ['subprocess'] }, () => {
   const fixture = nestedCodexCostFixture();
   const commit = commandCompleted(23, 'git commit -m nested', 0, 'completed', 'nested-commit', {
     stdout: '[main def5678] Nested fix',

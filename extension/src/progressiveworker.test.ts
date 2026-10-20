@@ -1,5 +1,6 @@
+// @module-tag subprocess
 import { revisionOf } from './transcript';
-import { test, vi } from 'vitest';
+import { beforeAll, test, vi } from 'vitest';
 import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
 import { tempDir } from './temproot.ts';
@@ -1596,14 +1597,17 @@ test.each(['missing', 'changed', 'refused', 'pruned', 'cancelled', 'stopped'] as
   },
 );
 
-const source = buildSync({
-  entryPoints: [path.join(__dirname, 'progressiveworker-entry.ts')],
-  bundle: true,
-  platform: 'node',
-  format: 'cjs',
-  target: 'node18',
-  write: false,
-}).outputFiles[0].text;
+let source: string;
+beforeAll(() => {
+  source = buildSync({
+    entryPoints: [path.join(__dirname, 'progressiveworker-entry.ts')],
+    bundle: true,
+    platform: 'node',
+    format: 'cjs',
+    target: 'node18',
+    write: false,
+  }).outputFiles[0].text;
+});
 const timestamp = (at: number) => new Date(Date.UTC(2026, 0, 1, 0, 0, at)).toISOString();
 
 for (const terminal of ['throw', 'exit'] as const) {

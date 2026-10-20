@@ -529,7 +529,7 @@ const ONE_PIXEL_PNG = Buffer.from(
   'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==',
   'base64');
 
-test('a screenshot stays clear of the browser scrollbar edge and lands as a lossless WebP', async () => {
+test('a screenshot stays clear of the browser scrollbar edge and lands as a lossless WebP', { tags: ['subprocess'] }, async () => {
   const directory = tempDir('panel-shot-');
   let captured: Record<string, unknown> | undefined;
   const page = {

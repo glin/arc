@@ -142,7 +142,7 @@ test('stream audit rejects changed expected values', () => {
   }
 });
 
-test('stream audit command prints each mismatch and exits with the failure status', () => {
+test('stream audit command prints each mismatch and exits with the failure status', { tags: ['subprocess'] }, () => {
   const temp = mkdtempSync(join(tmpdir(), 'arc-stream-audit-cli-'));
   try {
     copyFixtures(temp, (name) => name.startsWith('one-request'));
