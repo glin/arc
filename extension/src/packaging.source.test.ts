@@ -367,6 +367,38 @@ test('the session skill stays within its per-invocation size budget and links on
   for (const file of linked) assert.equal(fs.lstatSync(path.join(source, file)).isFile(), true, file);
 });
 
+test.each([false, true])(
+  'rebuilding bundled tools leaves no scratch folders and preserves link targets (redirected output: %s)',
+  async (redirected) => {
+    const root = tempDir('arc-tool-rebuild-');
+    const dist = path.join(root, 'extension/dist');
+    const destination = path.join(dist, 'tools');
+    const retained = path.join(root, 'retained');
+    fs.mkdirSync(dist, { recursive: true });
+    fs.mkdirSync(retained);
+    fs.writeFileSync(path.join(dist, 'cli.cjs'), 'first CLI');
+    fs.writeFileSync(path.join(dist, 'windowpipe.exe'), 'pipe');
+    const { bundledTools } = await import(pathToFileURL(path.join(extensionRoot, 'scripts/bundled-tools.mjs')).href);
+    bundledTools(dist, path.dirname(extensionRoot), {});
+    if (redirected) {
+      fs.rmSync(destination, { recursive: true });
+      fs.symlinkSync(retained, destination, process.platform === 'win32' ? 'junction' : 'dir');
+    }
+    fs.writeFileSync(path.join(destination, 'obsolete'), 'old output');
+    fs.writeFileSync(path.join(dist, 'cli.cjs'), 'second CLI');
+    bundledTools(dist, path.dirname(extensionRoot), {});
+    assert.equal(fs.readFileSync(path.join(destination, 'cli/arc.cjs'), 'utf8'), 'second CLI');
+    assert.equal(fs.existsSync(path.join(destination, 'obsolete')), false);
+    assert.equal(fs.lstatSync(destination).isSymbolicLink(), false);
+    assert.deepEqual(fs.readdirSync(path.dirname(dist)), ['dist']);
+    assert.deepEqual(fs.readdirSync(retained), redirected ? ['obsolete'] : []);
+    fs.rmSync(path.join(dist, 'windowpipe.exe'));
+    assert.throws(() => bundledTools(dist, path.dirname(extensionRoot), {}), /ENOENT/);
+    assert.deepEqual(fs.readdirSync(path.dirname(dist)), ['dist']);
+    assert.deepEqual(fs.readdirSync(retained), redirected ? ['obsolete'] : []);
+  },
+);
+
 test('the bundler refuses a session skill that lacks a file its SKILL.md links', async () => {
   const root = tempDir('arc-skill-links-');
   const sourceRoot = path.join(root, 'source');

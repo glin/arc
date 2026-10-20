@@ -1,11 +1,10 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash } from 'node:crypto';
 
 export function bundledTools(dist, sourceRoot, build) {
   const destination = path.join(dist, 'tools');
-  if (fs.existsSync(destination))
-    fs.renameSync(destination, path.join(path.dirname(dist), '.tmp-tools-' + randomUUID()));
+  fs.rmSync(destination, { recursive: true, force: true, maxRetries: 5 });
   fs.mkdirSync(destination, { recursive: true });
   const inputs = ['../LICENSE', '../plugins/arc-hooks/LICENSE'];
   const files = {};
