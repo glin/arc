@@ -117,4 +117,4 @@ After saving the handoff, request compaction of this session after your response
 
 ## Limitations
 
-Arc supports Claude Code and Codex because those are the agents I use. It does not cover every feature of either. For example, it cannot start Remote Control (`/remote-control`).
+Arc only supports Claude Code and Codex for now, and doesn't support every feature of either (e.g. some things like `/remote-control` are not supported).
