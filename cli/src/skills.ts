@@ -121,6 +121,45 @@ function contains(root: string, file: string): boolean {
   return relative === '' || (!path.isAbsolute(relative) && relative !== '..' && !relative.startsWith(`..${path.sep}`));
 }
 
+// Reads the install record and checks it against the copy now at the destination. Throws when Arc does not own that copy.
+function ownedCopy(
+  metadata: string,
+  destination: string,
+  expected: { home: string; area: string; agent: SkillAgent; control: Identity },
+): Owned {
+  const value = json(metadata) as Owned;
+  if (
+    Object.keys(value).sort().join(',') !==
+      'agent,area,control,destination,directory,files,home,schema,settled,source,token' ||
+    value.schema !== 1 ||
+    value.home !== expected.home ||
+    value.area !== expected.area ||
+    value.destination !== destination ||
+    value.agent !== expected.agent ||
+    !value.settled ||
+    !same(value.control, expected.control) ||
+    typeof value.token !== 'string' ||
+    typeof value.files !== 'object' ||
+    !value.files ||
+    !value.directory
+  )
+    throw new Error(`Unrecognized skill ownership at ${metadata}. Preserve it for manual review.`);
+  check(destination, value.directory, value.files);
+  return value;
+}
+function ownsCopy(
+  control: string,
+  destination: string,
+  expected: { home: string; area: string; agent: SkillAgent },
+): boolean {
+  try {
+    ownedCopy(path.join(control, 'installed.json'), destination, { ...expected, control: identity(control) });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 const agentNames: Record<SkillAgent, string> = { claude: 'Claude Code', codex: 'Codex' };
 const otherAgent = (agent: SkillAgent): SkillAgent => (agent === 'claude' ? 'codex' : 'claude');
 // A personal skills folder is linked when it resolves anywhere but its own place under the home folder.
@@ -179,8 +218,8 @@ export async function operateSkill(
     const target = toPeer ? `the ${agentNames[other]} skills folder` : area;
     const intro = `The ${name} skills folder is linked to ${target}${toPeer ? ` at ${area}` : ''}.`;
     const present = exists(destination);
-    // The peer commands refuse a copy that Arc does not own, so they are offered only for an absent or Arc-owned copy.
-    const peerOwned = toPeer && exists(path.join(control, 'installed.json'));
+    // The peer commands refuse a copy that Arc does not own, so they are offered only for an absent copy or one the peer's install record still matches.
+    const peerOwned = toPeer && present && ownsCopy(control, destination, { home, area, agent: other });
     const peerCommand = toPeer && (!present || peerOwned);
     if (action === 'remove')
       return result(
@@ -312,27 +351,8 @@ export async function operateSkill(
           );
       }
     }
-    if (exists(metadata)) {
-      const value = json(metadata) as Owned;
-      if (
-        Object.keys(value).sort().join(',') !==
-          'agent,area,control,destination,directory,files,home,schema,settled,source,token' ||
-        value.schema !== 1 ||
-        value.home !== home ||
-        value.area !== area ||
-        value.destination !== destination ||
-        value.agent !== agent ||
-        !value.settled ||
-        !same(value.control, controlIdentity) ||
-        typeof value.token !== 'string' ||
-        typeof value.files !== 'object' ||
-        !value.files ||
-        !value.directory
-      )
-        throw new Error(`Unrecognized skill ownership at ${metadata}. Preserve it for manual review.`);
-      check(destination, value.directory, value.files);
-      previous = value;
-    } else if (exists(destination)) throw new Error(`An existing skill is not owned by Arc: ${destination}`);
+    if (exists(metadata)) previous = ownedCopy(metadata, destination, { home, area, agent, control: controlIdentity });
+    else if (exists(destination)) throw new Error(`An existing skill is not owned by Arc: ${destination}`);
     if (!previous && action !== 'install') throw new Error(`Arc does not own a skill at ${destination}.`);
     if (previous && action !== 'remove' && equalFiles(previous.files, files)) return result('unchanged');
     token = randomUUID();

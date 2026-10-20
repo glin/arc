@@ -613,6 +613,30 @@ test('a linked folder points at the other agent only when Arc owns or can create
   }
 });
 
+test('a linked folder gives manual directions after a person replaces the copy Arc installed', () => {
+  const home = mkdtempSync(join(realpathSync(tmpdir()), 'arc-linked-replaced-'));
+  try {
+    mkdirSync(join(home, '.claude/skills'), { recursive: true });
+    tryLink(join(home, '.claude/skills'), join(home, '.agents/skills'), linkKinds[0]);
+    assert.equal(runSkillCommand(home, 'install', 'claude').results[0].status, 'installed');
+    writeFileSync(join(home, '.claude/skills/arc-sessions/SKILL.md'), 'reader replacement');
+    const peerRefusals = ['update', 'remove'].map((action) => runSkillCommand(home, action, 'claude'));
+    for (const refusal of peerRefusals) assert.equal(refusal.results[0].status, 'failed', JSON.stringify(refusal));
+    const removed = runSkillCommand(home, 'remove', 'codex');
+    assert.equal(removed.results[0].status, 'linked');
+    assert.match(removed.results[0].reason, /by hand/);
+    assert.doesNotMatch(removed.results[0].reason, /arc skills/);
+    const updated = runSkillCommand(home, 'update', 'codex');
+    assert.equal(updated.results[0].status, 'incomplete');
+    assert.match(updated.results[0].reason, /by hand/);
+    assert.doesNotMatch(updated.results[0].reason, /arc skills/);
+    assert.equal(readFileSync(join(home, '.claude/skills/arc-sessions/SKILL.md'), 'utf8'), 'reader replacement');
+  } finally {
+    unlink(join(home, '.agents/skills'));
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test('cancelled replacements restore matching originals and retain conflicting destinations and locks', async () => {
   const original = readSkillPayload(cli);
   const files = new Map(original.files);
