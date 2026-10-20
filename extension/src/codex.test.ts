@@ -67,7 +67,7 @@ import * as os from 'node:os';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { EXPORT_LIMITS, ExportLimitError } from './exportlimits.ts';
-import { RepositoryCommits, nodeGitRunner } from './gitcommits.ts';
+import { RepositoryCommits } from './gitcommits.ts';
 import { createRequire, syncBuiltinESMExports } from 'node:module';
 import { tempDir } from './temproot.ts';
 import type { BackwardRangeReader, TurnAgent } from './transcript.ts';
@@ -154,6 +154,7 @@ import {
   powershellDispatchExecution,
   throughStructuredClone,
   worktreeCreationCommand,
+  candidateGitRunner,
   turn as fixtureTurn,
 } from './turnfixtures.ts';
 import { retainedTurnLimit, turnKey } from './turnread.ts';
@@ -7900,25 +7901,7 @@ test('native Codex loop commits in separate repositories recover exact owners af
     root.replace(/\\/g, '/'),
   );
   const outer = path.join(directory, 'outer').replace(/\\/g, '/');
-  const git = (root: string, ...args: string[]) =>
-    execFileSync('git', ['-C', root, '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', ...args], {
-      encoding: 'utf8',
-    }).trim();
-  const hashes: string[] = [];
-  for (const [index, root] of [...roots, outer].entries()) {
-    fs.mkdirSync(root);
-    git(root, 'init', '-q');
-    fs.writeFileSync(path.join(root, 'file.txt'), 'base');
-    git(root, 'add', 'file.txt');
-    git(root, 'commit', '-q', '-m', `Base ${index}`);
-    if (index === 2) continue;
-    const worktree = root + '/.claude/worktrees/worker';
-    git(root, 'worktree', 'add', '-q', '-b', 'ship/worker', worktree);
-    fs.writeFileSync(path.join(worktree, 'file.txt'), `changed ${index}`);
-    git(worktree, 'commit', '-q', '-am', `Actual ${index}`);
-    hashes.push(git(worktree, 'rev-parse', 'HEAD'));
-    git(root, 'worktree', 'remove', worktree, '--force');
-  }
+  const hashes = ['a'.repeat(40), 'b'.repeat(40)];
   const fixture = ownershipRecords(roots, hashes);
   fixture.parent.splice(
     3,
@@ -8022,7 +8005,13 @@ test('native Codex loop commits in separate repositories recover exact owners af
   const filled = new Promise<void>((resolve) => {
     fill = resolve;
   });
-  const resolver = new RepositoryCommits(nodeGitRunner(0), fill);
+  const resolver = new RepositoryCommits(
+    candidateGitRunner({
+      [normalizeFsPath(outer)]: null,
+      ...Object.fromEntries(roots.map((root, index) => [normalizeFsPath(root), { sha: hashes[index] }])),
+    }),
+    fill,
+  );
   resolver.apply([owner], [outer]);
   await filled;
   resolver.apply([owner], [outer]);

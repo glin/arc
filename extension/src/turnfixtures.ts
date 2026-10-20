@@ -3,7 +3,51 @@ import * as path from 'node:path';
 import type { SiteManifest } from './webview/export-model';
 // Shared turn and session fixtures for tests. Production code must not import this module.
 // Keep a builder in its test file until another test file or shared builder needs it.
-import { Compaction, ToolCounts, Turn, TurnAgent, TurnCommit, TurnLanding, TurnSkillUse } from './transcript.ts';
+import {
+  Compaction,
+  ToolCounts,
+  Turn,
+  TurnAgent,
+  TurnCommit,
+  TurnLanding,
+  TurnSkillUse,
+  HEX_SHA,
+  normalizeFsPath,
+} from './transcript.ts';
+import { type GitRunner, IDENTITY_ARGS, exactCommitArgs } from './gitcommits.ts';
+
+export function candidateGitRunner(
+  matches: Record<string, { sha: string; common?: string } | null | undefined>,
+  reads: string[] = [],
+): GitRunner {
+  return {
+    async run(dir, args) {
+      const key = normalizeFsPath(dir);
+      reads.push(`${key} ${args.join(' ')}`);
+      if (!(key in matches)) return null;
+      const match = matches[key];
+      if (args.length === IDENTITY_ARGS.length && args.every((arg, index) => arg === IDENTITY_ARGS[index])) {
+        const common = match?.common ?? `${key}/.git`;
+        return `${common}\n${common}\n${dir}\n`;
+      }
+      if (args.length === 2 && args[0] === 'rev-parse' && args[1].startsWith('--disambiguate=')) {
+        const sha = args[1].slice('--disambiguate='.length);
+        if (!HEX_SHA.test(sha)) return null;
+        return match?.sha.startsWith(sha) ? match.sha : '';
+      }
+      const sha = args.at(-2) ?? '';
+      const exact = exactCommitArgs(sha);
+      if (
+        !HEX_SHA.test(sha) ||
+        !match?.sha.startsWith(sha) ||
+        args.length !== exact.length ||
+        !args.every((arg, index) => arg === exact[index])
+      )
+        return null;
+      return `\x1e${match.sha}\x002026-09-02T04:08:19Z\x00Repository subject\n\n 1 file changed, 1 insertion(+), 1 deletion(-)\n`;
+    },
+  };
+}
 
 export const SESSION_LINK_RESPONSE =
   String.raw`Launched [code\-coordinate\-1\-native\-session\-skills\-sol](${ARC_IDENTITY.sessionScheme}01a137a5-3d93-71d0-9492-965abeb0fa32), pinned under **packaging**.` +

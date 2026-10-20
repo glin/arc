@@ -19,9 +19,11 @@ import {
 } from './transcript.ts';
 import {
   GitRunner,
+  IDENTITY_ARGS,
   RepositoryCommits,
   chooseCommits,
   chooseLandings,
+  exactCommitArgs,
   intentKey,
   landingKey,
   landingReflogArgs,
@@ -38,7 +40,7 @@ import {
   mergedBranchOf,
   pointsAtArgs,
 } from './gitcommits.ts';
-import { turn } from './turnfixtures.ts';
+import { candidateGitRunner as candidateRunner, turn } from './turnfixtures.ts';
 import { commitCard } from './turncard.ts';
 import { tempDir } from './temproot.ts';
 import { readCodexAgentSpend, refreshCodexStructuralAgents } from './codex.ts';
@@ -1490,6 +1492,20 @@ test('a real fast-forward is read back with its subject and the name the command
   assert.equal(one.landings?.[0].subject, 'Bundle the panel script');
   assert.equal(one.landings?.[0].from, 'topic');
   assert.deepEqual(one.landings?.[0].head, { kind: 'branch', name: 'main' });
+  const landed = one.landings![0];
+  const exact = await nodeGitRunner(0).run(root, exactCommitArgs(landed.sha));
+  assert.ok(exact);
+  assert.deepEqual(
+    parseCommitLog(exact).map(({ sha, subject, files, added, removed }) => ({
+      sha: sha.slice(0, landed.sha.length),
+      subject,
+      files,
+      added,
+      removed,
+    })),
+    [{ sha: landed.sha, subject: landed.subject, files: 1, added: 1, removed: 1 }],
+  );
+  assert.match(parseCommitLog(exact)[0].sha, /^[0-9a-f]{40}$/);
 });
 
 test('a landing keeps the branch its merge named, and a hash is answered by the branches at the commit', () => {
@@ -1584,25 +1600,37 @@ test('a failed read of the branches at a merged hash is asked again', async () =
 });
 
 const candidateSha = 'abc1234a' + '1'.repeat(32);
-function candidateRunner(
-  matches: Record<string, { sha: string; common?: string } | null | undefined>,
-  reads: string[] = [],
-): GitRunner {
-  return {
-    async run(dir, args) {
-      const key = normalizeFsPath(dir);
-      reads.push(`${key} ${args.join(' ')}`);
-      if (!(key in matches)) return null;
-      const match = matches[key];
-      if (args.includes('--git-common-dir')) {
-        const common = match?.common ?? `${key}/.git`;
-        return `${common}\n${common}\n${dir}\n`;
-      }
-      if (args[0] === 'rev-parse') return match?.sha ?? '';
-      return match ? record(match.sha, 'Repository subject', '2026-09-02T04:08:19Z') : null;
-    },
-  };
-}
+
+test('candidate Git fixture rejects malformed requests and objects absent from the repository', async () => {
+  const otherSha = 'def4567b' + '2'.repeat(32);
+  const runner = candidateRunner({
+    'c:/notes': { sha: candidateSha },
+    'c:/plans': { sha: otherSha },
+    'c:/empty': null,
+  });
+  assert.equal(await runner.run('C:/notes', [...IDENTITY_ARGS]), 'c:/notes/.git\nc:/notes/.git\nC:/notes\n');
+  assert.equal(await runner.run('C:/notes', ['rev-parse', '--disambiguate=abc1234a']), candidateSha);
+  const object = await runner.run('C:/notes', exactCommitArgs(candidateSha));
+  assert.equal(parseCommitLog(object!)[0].sha, candidateSha);
+  for (const args of [
+    ['rev-parse', '--disambiguate=abc1234a', '--verify'],
+    ['rev-parse', '--verify'],
+    ['rev-parse', 'HEAD'],
+    ['rev-parse', '--git-common-dir'],
+    [...IDENTITY_ARGS, '--verify'],
+    ['rev-parse', '--disambiguate=not-a-hash'],
+    ['rev-parse', '--disambiguate=abc'],
+    ['show', candidateSha],
+    [...exactCommitArgs(candidateSha), '--verify'],
+    exactCommitArgs(otherSha),
+  ])
+    assert.equal(await runner.run('C:/notes', args), null, args.join(' '));
+  assert.equal(await runner.run('C:/plans', ['rev-parse', '--disambiguate=abc1234a']), '');
+  assert.equal(await runner.run('C:/empty', ['rev-parse', '--disambiguate=abc1234a']), '');
+  assert.equal(await runner.run('C:/plans', exactCommitArgs(candidateSha)), null);
+  assert.equal(await runner.run('C:/missing', [...IDENTITY_ARGS]), null);
+});
+
 function candidateTurn(command = 'git -C C:/notes commit -m first; git -C C:/plans commit -m second') {
   const one = turn({ commits: [] });
   recordCommits(one, '[main abc1234a] Printed subject\n 1 file changed, 2 insertions(+)', 1, {
