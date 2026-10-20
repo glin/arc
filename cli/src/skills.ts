@@ -147,8 +147,8 @@ function checkOperations(control: string): void {
   }
 }
 
-// Reads the install record and checks it against the copy now at the destination. Throws when Arc does not own that copy.
-function ownedCopy(
+// Reads the install record and checks that it belongs to this destination. Throws when the record is not Arc's.
+function installRecord(
   metadata: string,
   destination: string,
   expected: { home: string; area: string; agent: SkillAgent; control: Identity },
@@ -170,6 +170,15 @@ function ownedCopy(
     !value.directory
   )
     throw new Error(`Unrecognized skill ownership at ${metadata}. Preserve it for manual review.`);
+  return value;
+}
+// Reads the install record and checks it against the copy now at the destination. Throws when Arc does not own that copy.
+function ownedCopy(
+  metadata: string,
+  destination: string,
+  expected: { home: string; area: string; agent: SkillAgent; control: Identity },
+): Owned {
+  const value = installRecord(metadata, destination, expected);
   check(destination, value.directory, value.files);
   return value;
 }
@@ -202,6 +211,28 @@ function ownsCopy(
     return { owned: true };
   } catch {
     return { owned: false };
+  }
+}
+
+// A skill is usable only when its folder holds a readable SKILL.md file. Opening the file honors permissions that a mode check misses, and no contents are read.
+function hasSkillDefinition(destination: string): boolean {
+  try {
+    const definition = path.join(destination, 'SKILL.md');
+    if (!fs.statSync(definition).isFile()) return false;
+    fs.closeSync(fs.openSync(definition, 'r'));
+    return true;
+  } catch {
+    return false;
+  }
+}
+// Names what sits where the skill folder belongs, for a message to a person.
+function describeEntry(destination: string): string {
+  try {
+    const stat = fs.statSync(destination);
+    if (stat.isDirectory()) return 'a folder without a readable SKILL.md file';
+    return 'a file, not a skill folder';
+  } catch {
+    return 'a link that leads nowhere';
   }
 }
 
@@ -263,21 +294,19 @@ export async function operateSkill(
     const target = toPeer ? `the ${agentNames[other]} skills folder` : area;
     const intro = `The ${name} skills folder is linked to ${target}${toPeer ? ` at ${area}` : ''}.`;
     const present = exists(destination);
-    // Peer commands require valid setup storage and an absent or unchanged Arc-owned copy.
-    const peerState = toPeer ? ownsCopy(control, destination, { home, area, agent: other }) : { owned: false };
-    const peerCommand = toPeer && !peerState.recovery && (!present || peerState.owned);
+    const usable = present && hasSkillDefinition(destination);
+    const reads = `${name} uses the skill there.`;
+    // Removal names no command for the other agent's folder, so blocked setup storage does not matter there.
     if (action === 'remove')
       return result(
         'linked',
-        `${intro} Arc left the linked folder unchanged.${
-          peerState.recovery
-            ? ` ${peerState.recovery}`
-            : present
-              ? peerCommand
-                ? ` Remove the skill there with arc skills remove --agent ${other}.`
-                : ` Arc does not manage that copy. Remove the skill at ${destination} by hand.`
-              : ''
-        }`,
+        toPeer
+          ? usable
+            ? `${intro} ${reads} Arc changed nothing and no action is needed.`
+            : `${intro} The skill is not there. Arc changed nothing and no action is needed.`
+          : `${intro} Arc left the linked folder unchanged.${
+              present ? ` Arc does not manage that copy. Remove the skill at ${destination} by hand.` : ''
+            }`,
       );
     let matches = false;
     if (present) {
@@ -287,10 +316,23 @@ export async function operateSkill(
         matches = false;
       }
     }
-    if (matches)
+    if (matches) return result('linked', `${intro} ${reads} Arc changed nothing and no action is needed.`);
+    // The other agent's commands need valid setup storage and an absent or unchanged Arc-owned copy.
+    const peerState: { owned: boolean; recovery?: string } = toPeer
+      ? ownsCopy(control, destination, { home, area, agent: other })
+      : { owned: false };
+    // Neither agent has a skill when the target holds no readable SKILL.md, and the other agent's commands refuse to replace what is there.
+    if (toPeer && present && !usable)
+      return result(
+        'incomplete',
+        `${intro} ${name} cannot use the skill there, because ${destination} is ${describeEntry(destination)}. Arc will not replace it. ${
+          peerState.recovery ?? `Move or delete it, then run arc skills install --agent ${other}.`
+        }`,
+      );
+    if (toPeer && present && !peerState.recovery && !peerState.owned)
       return result(
         'linked',
-        `${intro} ${name} reads the skill there, and Arc left the linked folder unchanged.${peerState.recovery ? ' ' + peerState.recovery : ''}`,
+        `${intro} ${reads} Arc does not manage that copy, so it changed nothing and no action is needed.`,
       );
     const verb = present ? 'update' : 'install';
     return result(
@@ -298,11 +340,9 @@ export async function operateSkill(
       `${intro} The skill there is ${present ? 'different from this version' : 'missing'}, and Arc leaves linked folders unchanged. ${
         peerState.recovery
           ? peerState.recovery
-          : peerCommand
+          : toPeer
             ? `Run arc skills ${verb} --agent ${other} to ${verb} it there.`
-            : toPeer
-              ? `Arc does not manage the copy at ${destination}. Update it there by hand as described in cli/README.md#session-skill.`
-              : 'Link or copy the skill there as described in cli/README.md#session-skill.'
+            : `To ${verb} it, copy or link ${payload.directory} to ${destination}.`
       }`,
     );
   }
@@ -367,6 +407,7 @@ export async function operateSkill(
   let claimed: Identity | undefined;
   let backupIdentity: Identity | undefined;
   let previous: Owned | undefined;
+  let copyGone = false;
   const published: Files = {};
   let stage = '';
   let stagingIdentity: Identity | undefined;
@@ -381,10 +422,16 @@ export async function operateSkill(
     software = acquireToolLock(path.join(control, 'software.lock'));
     lock = acquireToolLock(path.join(control, 'destination.lock'));
     checkOperations(control);
-    if (exists(metadata)) previous = ownedCopy(metadata, destination, { home, area, agent, control: controlIdentity });
-    else if (exists(destination)) throw new Error(`An existing skill is not owned by Arc: ${destination}`);
+    if (exists(metadata)) {
+      const expected = { home, area, agent, control: controlIdentity };
+      // A person may have moved or deleted the copy that this record describes. The record then owns nothing, and an install replaces it.
+      if (action === 'install' && !exists(destination)) {
+        previous = installRecord(metadata, destination, expected);
+        copyGone = true;
+      } else previous = ownedCopy(metadata, destination, expected);
+    } else if (exists(destination)) throw new Error(`An existing skill is not owned by Arc: ${destination}`);
     if (!previous && action !== 'install') throw new Error(`Arc does not own a skill at ${destination}.`);
-    if (previous && action !== 'remove' && equalFiles(previous.files, files)) return result('unchanged');
+    if (previous && !copyGone && action !== 'remove' && equalFiles(previous.files, files)) return result('unchanged');
     token = randomUUID();
     operation = path.join(control, `operation-${token}`);
     fs.mkdirSync(operation, { mode: 0o700 });
@@ -427,7 +474,7 @@ export async function operateSkill(
     journaled = true;
     await checkpoint('prepared');
     check(stage, stagingIdentity, files);
-    if (previous) {
+    if (previous && !copyGone) {
       check(destination, previous.directory, previous.files);
       fs.renameSync(destination, backup);
       backupIdentity = previous.directory;
