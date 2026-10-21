@@ -22,7 +22,7 @@ curl -fsSL https://raw.githubusercontent.com/glin/arc/main/install.sh | bash
 
 The installer adds Arc to VS Code, sets up the Claude hooks, and installs the [`arc-sessions` skill](#let-agents-use-arc) for the agents it finds. It works with VS Code, VS Code Insiders, Cursor, Positron, and VSCodium. See [CLI installation](cli/README.md#install) for its options and for using `arc` outside VS Code.
 
-Reload VS Code, then run **Arc: Open Arc in Editor** from the Command Palette.
+Reload VS Code. Use the Arc icon in the editor toolbar or **Arc: Open Arc in Editor** in the Command Palette.
 
 Arc runs the installed `claude` and `codex` with their existing sign-in: a Claude or ChatGPT subscription, or an API key. To sign in:
 
