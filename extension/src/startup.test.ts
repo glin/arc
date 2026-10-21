@@ -70,7 +70,13 @@ import {
   withSessionName,
 } from './derivedcache';
 import {
+  aggregateUsageEvents,
+  type UsageEvent,
   projectSpendDisplayFiles,
+  prepareProjectSpendViewSteps,
+  truncateProjectSpendView,
+  projectSpendWindows,
+  publicProjectSpendPrice,
   projectSpendHistoryCutoff,
   projectSpendOfferDecision,
   projectSpendSourceOfferDue,
@@ -1341,6 +1347,7 @@ function completeDiscoveryHarness(
     codexSubagentFor,
     compatibleDiscovery,
     discoveryCompatibility,
+    projectSpendWindows,
     sessionCoverageMember,
     reconcileSessionCollisions,
     sessionCatalogMembership,
@@ -1368,6 +1375,7 @@ function completeDiscoveryHarness(
     'drainInitialCatalogRefresh',
     'cancelProjectSpendHydration',
     'scheduleProjectSpendHydration',
+    'scheduleNextProjectSpendFile',
     'sessionParentsOf',
     'sessionParentEdges',
     'acceptSessionCoverage',
@@ -1431,7 +1439,7 @@ function completeDiscoveryHarness(
     const resumeCommand = () => ''; const formatWhen = () => ''; const formatRelative = () => '';
     let sessionStatsFromFacts = (facts) => facts; const railCacheMarkOf = railCacheMark; const derivedTitleCacheStats = cacheStats;
     const newestTurnLoading = () => ({}); const emptyTimeline = () => null;
-    const readSetting = () => 3; const isLightColourTheme = () => false;
+    const readSetting = ${scope.snapshotHistoryDays ? 'snapshotHistoryDays' : '() => 3'}; const isLightColourTheme = () => false;
     const sessionLabelOf = (name, id) => ({ label: name?.label || 'Session ' + id.slice(0, 8), fullLabel: name?.fullLabel || name?.label || 'Session ' + id.slice(0, 8) });
     const storedSessionName = ${scope.realStoredSessionName ? 'realStoredSessionName' : '() => null'};
     const shortenTo = (line, limit, ellipsis) => line.length <= limit ? line : line.slice(0, Math.max(0, limit - ellipsis.length)) + ellipsis;
@@ -1473,6 +1481,11 @@ function completeDiscoveryHarness(
       projectSpendHydrated = true; projectSpendHydrationReady = true; projectSpendHydrationTick = null;
       projectSpendIndexing = false; projectSpendOffers = new Set(); readWindows = new Map(); history = new Map(); historyRequest = null;
       projectSpendFiles = []; projectSpendVisibleFiles = [];
+      projectSpendEpoch = 0; projectSpendSnapshot = null; projectSpendTomorrow = null;
+      projectSpendSnapshotDate = null; projectSpendSnapshotPrice = null;
+      projectSpendRebuild = null; projectSpendBuild = null;
+      invalidateProjectSpendSnapshot() {} cancelProjectSpendRebuild() {}
+      unknownProjectSpendSnapshot() { return null; }
       historyStructuralKeys = new Map(); dropped = 0; live = {};
       posts = []; markStartedPresses() {} postAcceptedResponses() {}
       post(message) { this.posts.push(message); return Promise.resolve(); }
@@ -1544,6 +1557,7 @@ function completeDiscoveryHarness(
       useListingSignature(sign) { listingSignature = sign; }
       useSpendSignature(sign) { spendSourceSignature = sign; }
       useSpendOfferGate(gate) { projectSpendSourceOfferDue = gate; }
+      useSnapshotPrice(price) { publicProjectSpendPrice = price; }
       ${body}
     }`,
     { loader: 'ts', format: 'cjs' },
@@ -13040,3 +13054,485 @@ test.each(['scope', 'stamp', 'missing stamp'])(
     assert.deepEqual(provider.codexSubagents, []);
   },
 );
+
+const PROJECT_SPEND_SNAPSHOT_METHODS = [
+  'projectSpendPayload',
+  'postProjectSpend',
+  'unknownProjectSpendSnapshot',
+  'invalidateProjectSpendSnapshot',
+  'cancelProjectSpendRebuild',
+  'displayedProjectSpendFiles',
+];
+
+function snapshotSpendFile(dollars: number, date = '2026-10-21', requests = 1): SpendFileIndex {
+  const at = new Date(`${date}T12:00:00`).getTime();
+  const buckets = aggregateUsageEvents([
+    {
+      timestamp: at,
+      agent: 'Claude',
+      provider: 'anthropic',
+      model: 'model',
+      contextWindow: null,
+      billingClass: 'metered',
+      inferenceClass: null,
+      serviceTier: null,
+      reportedCost: dollars / requests,
+      usage: { input: 1, output: 1, thinking: 0, cacheWrite1h: 0, cacheWrite5m: 0, cacheRead: 0 },
+    } as UsageEvent,
+  ]);
+  return {
+    file: 'source.jsonl',
+    workspace: 'project',
+    size: 1,
+    mtimeMs: at,
+    offset: 1,
+    trailing: '',
+    complete: true,
+    indexedAt: at,
+    buckets: Array.from({ length: requests }, () => ({ ...buckets[0] })),
+  };
+}
+
+function projectSpendSnapshotHarness(scope: Record<string, unknown> = {}, extraMethods: string[] = []): any {
+  const provider = paintHarness(
+    [...PROJECT_SPEND_SNAPSHOT_METHODS, 'setUsage', 'projectSpendHistoryCutoff', ...extraMethods],
+    {
+      prepareProjectSpendViewSteps,
+      projectSpendWindows,
+      projectSpendDisplayFiles,
+      truncateProjectSpendView,
+      projectSpendHistoryCutoff,
+      publicProjectSpendPrice,
+      ...scope,
+    },
+  );
+  provider.disposed = false;
+  provider.projectSpendWorkspace = 'project';
+  provider.projectSpendRevision = 0;
+  provider.projectSpendSnapshot = provider.unknownProjectSpendSnapshot();
+  provider.projectSpendSnapshotPrice = publicProjectSpendPrice;
+  provider.projectSpendFiles = [snapshotSpendFile(5)];
+  provider.projectSpendVisibleFiles = provider.projectSpendFiles;
+  return provider;
+}
+
+test('Project cost snapshot reads and repeated selections never advance a pending background build', async () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(new Date('2026-10-21T12:00:00'));
+  try {
+    let steps = 0;
+    let bucketReads = 0;
+    const provider = projectSpendSnapshotHarness({
+      prepareProjectSpendViewSteps: function* (...args: Parameters<typeof prepareProjectSpendViewSteps>) {
+        const build = prepareProjectSpendViewSteps(...args);
+        for (;;) {
+          const before = bucketReads;
+          const result = build.next();
+          assert.ok(bucketReads - before <= 1, 'one aggregation step traversed multiple usage buckets');
+          if (result.done) return result.value;
+          steps++;
+          yield;
+        }
+      },
+    });
+    const file = snapshotSpendFile(5, '2026-10-21', 2000);
+    file.buckets = new Proxy(file.buckets, {
+      get(target, key, receiver) {
+        if (typeof key === 'string' && /^[0-9]+$/.test(key)) bucketReads++;
+        return Reflect.get(target, key, receiver);
+      },
+    });
+    provider.projectSpendFiles = [file];
+    provider.projectSpendVisibleFiles = provider.projectSpendFiles;
+    const invalidatedAt = Date.now();
+    provider.invalidateProjectSpendSnapshot();
+    assert.equal(steps, 0);
+    vi.advanceTimersToNextTimer();
+    assert.ok(Date.now() - invalidatedAt <= 1000, 'the rebuild did not start within one second');
+    assert.ok(steps > 0 && steps <= 128, 'the first background slice exceeded its explicit work budget');
+    const afterSlice = steps;
+    for (let repeat = 0; repeat < 3; repeat++) {
+      await provider.refresh(true, true, true, true);
+      provider.setUsage([]);
+      provider.projectSpendPayload();
+    }
+    assert.equal(steps, afterSlice, 'a panel action resumed project-wide aggregation');
+    assert.ok(provider.projectSpendBuild, 'the fixture finished before the panel actions ran');
+    await vi.runAllTimersAsync();
+    assert.ok(Math.abs(provider.projectSpendPayload().windows[0].dollars - 5) < 1e-9);
+    assert.equal(provider.projectSpendPayload().indexing, false);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test.each(['resumable updates', 'unchanged completed index passes'])(
+  'Project cost snapshot publishes unchanged complete history during continuing %s',
+  (activity) => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-10-21T12:00:00'));
+    try {
+      const provider = projectSpendSnapshotHarness(
+        { pruneSpendFilesWithResult: (files: SpendFileIndex[]) => ({ files, pruned: false }) },
+        ['finishProjectSpendIndex'],
+      );
+      provider.postRailIfSpendPendingMoved = () => {};
+      provider.projectSpendVisibleFiles = [snapshotSpendFile(5, '2026-10-21', 2000)];
+      provider.projectSpendFiles =
+        activity === 'resumable updates'
+          ? [{ ...snapshotSpendFile(9), complete: false }]
+          : provider.projectSpendVisibleFiles.slice();
+      provider.projectSpendIndexing = true;
+      provider.invalidateProjectSpendSnapshot();
+      let updates = 0;
+      while (provider.projectSpendPayload().windows[0].dollars === null && updates < 1000) {
+        vi.advanceTimersToNextTimer();
+        updates++;
+        if (activity === 'resumable updates') {
+          provider.projectSpendFiles[0] = { ...provider.projectSpendFiles[0], offset: updates };
+          provider.projectSpendRevision++;
+          provider.invalidateProjectSpendSnapshot();
+        } else {
+          provider.projectSpendIndexing = true;
+          provider.finishProjectSpendIndex();
+        }
+      }
+      assert.ok(updates > 1, 'the fixture did not span continuing progress');
+      assert.ok(
+        provider.posts.some(
+          (post: any) => post.type === 'projectSpend' && post.projectSpend.windows[0].dollars !== null,
+        ),
+        'continuing progress prevented publication',
+      );
+      assert.ok(Math.abs(provider.projectSpendPayload().windows[0].dollars - 5) < 1e-9);
+      assert.equal(provider.projectSpendPayload().indexing, true);
+      if (activity === 'resumable updates') {
+        assert.ok(provider.projectSpendRebuild, 'the newer revision lost its owed rebuild');
+      }
+      provider.cancelProjectSpendRebuild();
+    } finally {
+      vi.useRealTimers();
+    }
+  },
+);
+
+test('Project cost snapshot discards a revision invalidated during aggregation', async () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(new Date('2026-10-21T12:00:00'));
+  try {
+    const provider = projectSpendSnapshotHarness();
+    provider.projectSpendFiles = [snapshotSpendFile(5, '2026-10-21', 2000)];
+    provider.projectSpendVisibleFiles = provider.projectSpendFiles;
+    provider.invalidateProjectSpendSnapshot();
+    vi.advanceTimersToNextTimer();
+    provider.projectSpendFiles = [snapshotSpendFile(8)];
+    provider.projectSpendVisibleFiles = provider.projectSpendFiles;
+    provider.projectSpendRevision++;
+    provider.invalidateProjectSpendSnapshot();
+    await vi.runAllTimersAsync();
+    assert.equal(provider.projectSpendPayload().windows[0].dollars, 8);
+    assert.ok(
+      provider.posts
+        .filter((post: any) => post.type === 'projectSpend')
+        .every((post: any) => post.projectSpend.windows[0].dollars === 8),
+      'an obsolete amount published before the owed revision',
+    );
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('Project cost snapshot switches A to B to A without accepting the earlier A build or offer', async () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(new Date('2026-10-21T12:00:00'));
+  try {
+    const timer = vi.spyOn(globalThis, 'setTimeout');
+    const provider = spendOfferHarness({
+      prepareProjectSpendViewSteps,
+      projectSpendWindows,
+      projectSpendHistoryCutoff,
+      publicProjectSpendPrice,
+    });
+    const actual = projectSpendSnapshotHarness();
+    for (const method of PROJECT_SPEND_SNAPSHOT_METHODS) provider[method] = actual[method];
+    provider.projectSpendSnapshot = provider.unknownProjectSpendSnapshot();
+    provider.projectSpendStorageDir = undefined;
+    provider.projectSpendFiles = [snapshotSpendFile(3)];
+    provider.projectSpendVisibleFiles = provider.projectSpendFiles;
+    provider.invalidateProjectSpendSnapshot();
+    await vi.runAllTimersAsync();
+    assert.equal(provider.projectSpendPayload().windows[0].dollars, 3);
+    provider.projectSpendFiles = [snapshotSpendFile(5, '2026-10-21', 2000)];
+    provider.projectSpendVisibleFiles = provider.projectSpendFiles;
+    provider.invalidateProjectSpendSnapshot();
+    vi.advanceTimersToNextTimer();
+    const staleBuild = provider.projectSpendBuild;
+    const staleSlice = timer.mock.calls.at(-1)![0];
+    let offers = 0;
+    let indexed = 0;
+    provider.indexNextProjectSpendFile = () => indexed++;
+    provider.scheduleNextProjectSpendFile();
+    const staleIndex = timer.mock.calls.at(-1)![0];
+    provider.queueProjectSpendIndex = () => offers++;
+    provider.scheduleProjectSpendIndex(new Map(), null);
+    const staleOffer = timer.mock.calls.at(-1)![0];
+    provider.useFolders(['B']);
+    provider.ensureProjectSpendWorkspace();
+    assert.equal(provider.projectSpendPayload().windows[0].dollars, null);
+    provider.useFolders(['project']);
+    provider.ensureProjectSpendWorkspace();
+    assert.equal(provider.projectSpendPayload().windows[0].dollars, null);
+    provider.projectSpendFiles = [snapshotSpendFile(11)];
+    provider.projectSpendVisibleFiles = provider.projectSpendFiles;
+    provider.projectSpendRevision++;
+    provider.invalidateProjectSpendSnapshot();
+    while (!staleBuild.next().done) {
+      /* Complete the old generator before its queued callback. */
+    }
+    staleSlice();
+    staleOffer();
+    staleIndex();
+    timer.mockRestore();
+    await vi.runAllTimersAsync();
+    assert.equal(provider.projectSpendPayload().windows[0].dollars, 11);
+    assert.equal(offers, 0, 'a prior workspace offer reached the returned workspace');
+    assert.equal(indexed, 0, 'a prior workspace index slice reached the returned workspace');
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('Project cost snapshot publishes the new calendar date inside the midnight callback', async () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(new Date('2026-10-21T23:59:59'));
+  try {
+    const provider = projectSpendSnapshotHarness({}, ['scheduleProjectSpendMidnight']);
+    provider.invalidateProjectSpendSnapshot();
+    await vi.runAllTimersAsync();
+    assert.equal(provider.projectSpendPayload().windows[0].dollars, 5);
+    provider.scheduleProjectSpendMidnight();
+    vi.advanceTimersToNextTimer();
+    const published = provider.posts.at(-1).projectSpend;
+    assert.equal(published.windows[0].dollars, 0, 'midnight published yesterday as today');
+    assert.equal(published.windows[1].dollars, 5);
+    assert.ok(provider.projectSpendRebuild, 'the next projection was never requested');
+    provider.cancelProjectSpendRebuild();
+    clearTimeout(provider.projectSpendMidnight);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('Project cost snapshot publishes current truncation when midnight arrives late and rebuilding remains pending', async () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(new Date('2026-10-21T23:59:59'));
+  try {
+    const provider = projectSpendSnapshotHarness({ snapshotHistoryDays: () => 6 }, ['scheduleProjectSpendMidnight']);
+    provider.invalidateProjectSpendSnapshot();
+    await vi.runAllTimersAsync();
+    const timer = vi.spyOn(globalThis, 'setTimeout');
+    provider.scheduleProjectSpendMidnight();
+    const callback = timer.mock.calls.at(-1)![0];
+    clearTimeout(provider.projectSpendMidnight);
+    vi.setSystemTime(new Date('2026-10-22T00:00:00.001'));
+    callback();
+    const published = provider.posts.at(-1).projectSpend;
+    assert.equal(published.windows[0].dollars, 0);
+    assert.equal(published.windows[1].dollars, 5);
+    assert.equal(published.windows[1].status, 'atLeast');
+    assert.equal(published.windows[1].partial, true);
+    assert.match(published.windows[1].display, /^At least /);
+    assert.equal(published.categories[0].windows[1].status, 'atLeast');
+    assert.ok(provider.projectSpendRebuild, 'the callback finished rebuilding before publication');
+    provider.cancelProjectSpendRebuild();
+    clearTimeout(provider.projectSpendMidnight);
+    timer.mockRestore();
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('Project cost snapshot hydration replaces an interrupted build without counting the restored source twice', async () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(new Date('2026-10-21T12:00:00'));
+  try {
+    const restored = [snapshotSpendFile(11)];
+    const provider = projectSpendSnapshotHarness(
+      {
+        loadSpendLedger: () => ({ files: restored, completeFiles: restored }),
+        pruneSpendFilesWithResult: (files: SpendFileIndex[]) => ({ files, pruned: false }),
+      },
+      ['hydrateProjectSpend'],
+    );
+    provider.projectSpendStorageDir = 'storage';
+    provider.projectSpendFiles = [snapshotSpendFile(5, '2026-10-21', 2000)];
+    provider.projectSpendVisibleFiles = provider.projectSpendFiles;
+    provider.scheduleProjectSpendMidnight = () => {};
+    provider.scheduleProjectSpendIndex = () => {};
+    provider.scheduleProjectSpendSave = () => {};
+    provider.postRail = () => {};
+    provider.invalidateProjectSpendSnapshot();
+    vi.advanceTimersToNextTimer();
+    provider.projectSpendHydrated = false;
+    provider.scheduleProjectSpendHydration(provider.refreshGeneration);
+    await vi.runAllTimersAsync();
+    assert.equal(provider.projectSpendFiles.length, 1);
+    assert.equal(provider.projectSpendPayload().windows[0].dollars, 11);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('Project cost snapshot rejects hydration from an earlier workspace epoch after A to B to A', () => {
+  vi.useFakeTimers();
+  try {
+    const timer = vi.spyOn(globalThis, 'setTimeout');
+    let loads = 0;
+    const provider = projectSpendSnapshotHarness(
+      {
+        pruneSpendFilesWithResult: (files: SpendFileIndex[]) => ({ files, pruned: false }),
+        loadSpendLedger: () => {
+          loads++;
+          return { files: [], completeFiles: [] };
+        },
+      },
+      ['hydrateProjectSpend'],
+    );
+    provider.projectSpendStorageDir = 'storage';
+    provider.projectSpendHydrated = false;
+    provider.scheduleProjectSpendMidnight = () => {};
+    provider.scheduleProjectSpendIndex = () => {};
+    provider.scheduleProjectSpendSave = () => {};
+    provider.postRail = () => {};
+    provider.scheduleProjectSpendHydration(provider.refreshGeneration);
+    const stale = timer.mock.calls.at(-1)![0];
+    provider.projectSpendEpoch += 2;
+    stale();
+    assert.equal(loads, 0, 'a hydration callback used only the matching workspace name');
+    timer.mockRestore();
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test.each(['pricing', 'history', 'period truncation'])(
+  'Project cost snapshot retains an independent %s change during a slice',
+  async (change) => {
+    vi.useFakeTimers();
+    const midnight = new Date('2026-10-21T00:00:00');
+    vi.setSystemTime(change === 'period truncation' ? midnight : new Date('2026-10-21T12:00:00'));
+    try {
+      let history = change === 'history' ? 3 : change === 'period truncation' ? 6 : 0;
+      const provider = projectSpendSnapshotHarness({ snapshotHistoryDays: () => history });
+      const file = snapshotSpendFile(5, '2026-10-21', 2000);
+      const quote = (dollars: number) => () => ({
+        dollars,
+        source: 'Configured rate',
+        effectiveDate: null,
+        estimated: true,
+        provenance: 'configured' as const,
+      });
+      if (change === 'pricing') {
+        file.buckets = file.buckets.map((bucket) => ({ ...bucket, reportedCost: null }));
+        provider.useSnapshotPrice(quote(0.0025));
+      }
+      provider.projectSpendFiles = [file];
+      provider.projectSpendVisibleFiles = [file];
+      provider.invalidateProjectSpendSnapshot();
+      vi.advanceTimersToNextTimer();
+      if (change === 'pricing') provider.useSnapshotPrice(quote(0.005));
+      if (change === 'history') history = 0;
+      if (change === 'period truncation') {
+        // Start exactly at the boundary, then move the clock without running another slice.
+        provider.cancelProjectSpendRebuild();
+        vi.setSystemTime(midnight);
+        provider.invalidateProjectSpendSnapshot();
+        vi.setSystemTime(new Date(midnight.getTime() - 100));
+        vi.advanceTimersToNextTimer();
+        vi.setSystemTime(new Date(midnight.getTime() + 1));
+      }
+      provider.invalidateProjectSpendSnapshot();
+      await vi.runAllTimersAsync();
+      const view = provider.projectSpendPayload();
+      assert.ok(Math.abs(view.windows[0].dollars - (change === 'pricing' ? 10 : 5)) < 1e-8);
+      assert.equal(view.windows[1].status, change === 'period truncation' ? 'atLeast' : 'exact');
+      if (change === 'pricing') {
+        assert.equal(view.rateSources[0].source, 'Configured rate');
+        assert.ok(
+          provider.posts.every(
+            (post: any) => post.type !== 'projectSpend' || Math.abs(post.projectSpend.windows[0].dollars - 10) < 1e-8,
+          ),
+          'the obsolete price published before the current price',
+        );
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  },
+);
+
+test('Project cost snapshot reads complete display files while the index retains resumable progress', async () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(new Date('2026-10-21T12:00:00'));
+  try {
+    const provider = projectSpendSnapshotHarness();
+    provider.projectSpendFiles = [{ ...snapshotSpendFile(9), complete: false }];
+    provider.projectSpendVisibleFiles = [snapshotSpendFile(5)];
+    provider.projectSpendIndexing = true;
+    provider.invalidateProjectSpendSnapshot();
+    await vi.runAllTimersAsync();
+    assert.equal(provider.projectSpendPayload().windows[0].dollars, 5);
+    assert.equal(provider.projectSpendPayload().indexing, true);
+    assert.equal(provider.projectSpendFiles[0].complete, false);
+    provider.projectSpendFiles = [snapshotSpendFile(9)];
+    provider.projectSpendVisibleFiles = provider.projectSpendFiles;
+    provider.projectSpendIndexing = false;
+    provider.projectSpendRevision++;
+    provider.invalidateProjectSpendSnapshot();
+    assert.equal(provider.projectSpendPayload().windows[0].dollars, 5);
+    await vi.runAllTimersAsync();
+    assert.equal(provider.projectSpendPayload().windows[0].dollars, 9);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test.each([
+  ['2026-10-21T00:00:00', '2026-10-21T00:00:00.001'],
+  ['2026-03-09T00:30:00', '2026-03-09T01:00:00.001'],
+])('Project cost snapshot schedules period truncation from %s across local clock changes', async (start, boundary) => {
+  const priorTimezone = process.env.TZ;
+  process.env.TZ = 'America/Chicago';
+  vi.useFakeTimers();
+  vi.setSystemTime(new Date(start));
+  try {
+    let history = 0;
+    const provider = projectSpendSnapshotHarness({ snapshotHistoryDays: () => history }, [
+      'scheduleProjectSpendMidnight',
+      'restartProjectSpendOffer',
+    ]);
+    provider.projectSpendQueue = [];
+    provider.projectSpendQueued = new Set();
+    provider.queueProjectSpendIndex = () => {};
+    provider.invalidateProjectSpendSnapshot();
+    await vi.runAllTimersAsync();
+    vi.setSystemTime(new Date(start));
+    provider.scheduleProjectSpendMidnight();
+    history = 6;
+    provider.restartProjectSpendOffer();
+    const deadline = new Date(boundary).getTime();
+    vi.advanceTimersByTime(deadline - Date.now() - 1);
+    assert.equal(provider.projectSpendPayload().windows[1].status, 'exact');
+    vi.advanceTimersByTime(1);
+    assert.equal(Date.now(), deadline);
+    const published = provider.posts.at(-1).projectSpend;
+    assert.equal(published.windows[1].status, 'atLeast');
+    assert.equal(published.categories[0].windows[1].status, 'atLeast');
+    provider.cancelProjectSpendRebuild();
+    clearTimeout(provider.projectSpendMidnight);
+  } finally {
+    vi.useRealTimers();
+    if (priorTimezone === undefined) delete process.env.TZ;
+    else process.env.TZ = priorTimezone;
+  }
+});

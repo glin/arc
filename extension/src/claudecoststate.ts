@@ -271,18 +271,34 @@ export function matchingCostSupplement(
   supplement: ClaudeCostSupplement | undefined,
   records: ReadonlyMap<string, SpendFileIndex>,
 ): supplement is ClaudeCostSupplement {
+  const steps = matchingCostSupplementSteps(supplement, records);
+  let result = steps.next();
+  while (!result.done) result = steps.next();
+  return result.value;
+}
+
+export function* matchingCostSupplementSteps(
+  supplement: ClaudeCostSupplement | undefined,
+  records: ReadonlyMap<string, SpendFileIndex>,
+): Generator<void, boolean> {
   if (!supplement) return false;
-  return supplement.dependencies.every((dependency, index) => {
+  for (let index = 0; index < supplement.dependencies.length; index++) {
+    yield;
+    const dependency = supplement.dependencies[index];
     const file = records.get(dependency.file);
-    return (
-      file &&
-      file.complete !== false &&
-      !file.missingAt &&
-      !file.trailing &&
-      !file.trailingBytes &&
-      JSON.stringify(costStateDependency(file, index)) === JSON.stringify(dependency)
-    );
-  });
+    if (
+      !(
+        file &&
+        file.complete !== false &&
+        !file.missingAt &&
+        !file.trailing &&
+        !file.trailingBytes &&
+        JSON.stringify(costStateDependency(file, index)) === JSON.stringify(dependency)
+      )
+    )
+      return false;
+  }
+  return true;
 }
 
 export interface Allocation {

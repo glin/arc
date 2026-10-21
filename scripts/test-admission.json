@@ -190,9 +190,9 @@
     "matricesSha256": "b2a4c3552a9fdd99d3be4a6e1515bc834b857c078f1059c8fbdf75ef50132b39"
   },
   "extension/src/startup.test.ts": {
-    "reason": "Real title workers must publish recovered metadata through startup ownership and cancellation boundaries.",
-    "cases": 208,
-    "matricesSha256": "492f9723aaa53f91e683cd54b78ff6d734345b66da3ca9f5b936c9f3d25aa9b6"
+    "reason": "Real title workers must publish recovered metadata through startup ownership and cancellation boundaries. Project cost snapshots must preserve workspace, revision, and calendar ownership during background slices.",
+    "cases": 219,
+    "matricesSha256": "e5ca69f554f4de512a1b23ffd13173881cfd976018e21ac6e21a990c6cad1826"
   },
   "extension/src/store.test.ts": {
     "reason": "The real Stop hook must renew retention for useful snapshot stores without changing workspace files.",

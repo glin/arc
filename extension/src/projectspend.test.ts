@@ -1,6 +1,7 @@
 import { describe, test, vi } from 'vitest';
 import {
   costStateDependency,
+  matchingCostSupplementSteps,
   reconcileClaudeCostState,
   CLAUDE_COST_STATE_SNAPSHOTS,
   CLAUDE_COST_STATE_MODELS,
@@ -483,6 +484,13 @@ test('shared child supplements reject either parent-child recency direction afte
       estimated: false,
       provenance: 'public' as const,
     });
+    const dependencySteps = matchingCostSupplementSteps(
+      files[0].costStateSupplement,
+      new Map(files.map((file) => [file.file, file])),
+    );
+    assert.equal(dependencySteps.next().done, false);
+    assert.equal(dependencySteps.next().done, false);
+    assert.deepEqual(dependencySteps.next(), { done: true, value: true });
     assert.equal(prepareProjectSpendView(files, price, { now }).windows[0].dollars, 2);
     const changed = files.map((file) => (file.file === child.file ? { ...file, mtimeMs: file.mtimeMs + 1 } : file));
     assert.equal(prepareProjectSpendView(changed, price, { now }).windows[0].dollars, 0);

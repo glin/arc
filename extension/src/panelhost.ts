@@ -504,8 +504,10 @@ import {
   loadSpendLedger,
   normalizeSpendFile,
   normalizeWorkspace,
-  prepareProjectSpendView,
+  prepareProjectSpendViewSteps,
+  type ProjectSpendView,
   projectSpendDisplayFiles,
+  truncateProjectSpendView,
   pruneSpendFilesWithResult,
   projectSpendHistoryCutoff,
   projectSpendOfferDecision,
@@ -1956,6 +1958,13 @@ export class PanelProvider implements vscode.Disposable {
   // Periodic spend-source checks supplement watcher events. Changed listings offer their sources immediately.
   private projectSpendLastOfferAt = 0;
   private projectSpendRevision = 0;
+  private projectSpendEpoch = 0;
+  private projectSpendSnapshot: ProjectSpendView | null = null;
+  private projectSpendSnapshotDate: string | null = null;
+  private projectSpendSnapshotPrice = publicProjectSpendPrice;
+  private projectSpendTomorrow: { date: string; view: ProjectSpendView } | null = null;
+  private projectSpendRebuild: ReturnType<typeof setTimeout> | null = null;
+  private projectSpendBuild: Generator<void, ProjectSpendView> | null = null;
   private lifetimeFigures = new SessionFiguresCache<SessionHeldFigures, LifetimeFigures>();
   private dispatchedCardPrints = new Map<string, string>();
   // The cache-expiry warning each drawn turn card shows, by card key.
@@ -3223,6 +3232,7 @@ export class PanelProvider implements vscode.Disposable {
     }
     this.cancelProjectSpendHydration();
     this.cancelProjectSpendOffers();
+    this.cancelProjectSpendRebuild();
     this.flushProjectSpendSave();
     this.cancelProjectSpendSaveRetry();
     // Save pending draft text when disposal cancels its timer.
@@ -9766,7 +9776,12 @@ export class PanelProvider implements vscode.Disposable {
       clearTimeout(this.projectSpendMidnight);
       this.projectSpendMidnight = null;
     }
+    this.cancelProjectSpendRebuild();
+    this.projectSpendEpoch++;
     this.projectSpendWorkspace = workspace;
+    this.projectSpendSnapshot = workspace ? this.unknownProjectSpendSnapshot() : null;
+    this.projectSpendSnapshotDate = projectSpendWindows(Date.now())[0].start;
+    this.projectSpendTomorrow = null;
     this.projectSpendHydrated = !workspace || !this.projectSpendStorageDir;
     this.projectSpendHydrationReady = false;
     this.projectSpendLastOfferAt = 0;
@@ -9777,6 +9792,7 @@ export class PanelProvider implements vscode.Disposable {
     this.projectSpendIndexing = false;
     this.projectSpendFiles = [];
     this.projectSpendVisibleFiles = [];
+    this.invalidateProjectSpendSnapshot();
     if (this.projectSpendHydrated) {
       this.scheduleProjectSpendMidnight();
     }
@@ -9796,7 +9812,16 @@ export class PanelProvider implements vscode.Disposable {
       return;
     }
     this.cancelProjectSpendHydration();
-    const tick = setTimeout(() => this.hydrateProjectSpend(workspace, generation, tick), 0);
+    const epoch = this.projectSpendEpoch;
+    const revision = this.projectSpendRevision;
+    const tick = setTimeout(() => {
+      if (epoch !== this.projectSpendEpoch) return;
+      if (revision !== this.projectSpendRevision) {
+        this.scheduleProjectSpendHydration(this.refreshGeneration);
+        return;
+      }
+      this.hydrateProjectSpend(workspace, generation, tick);
+    }, 0);
     this.projectSpendHydrationTick = tick;
   }
 
@@ -9813,13 +9838,20 @@ export class PanelProvider implements vscode.Disposable {
     ) {
       return;
     }
+    const epoch = this.projectSpendEpoch;
+    const revision = this.projectSpendRevision;
     const ledger = loadSpendLedger(this.projectSpendStorageDir, workspace);
+    if (epoch !== this.projectSpendEpoch || revision !== this.projectSpendRevision) {
+      this.scheduleProjectSpendHydration(this.refreshGeneration);
+      return;
+    }
     const resumable = pruneSpendFilesWithResult(ledger.files);
     const visible = pruneSpendFilesWithResult(ledger.completeFiles);
     this.projectSpendFiles = resumable.files;
     this.projectSpendVisibleFiles = visible.files;
     this.projectSpendHydrated = true;
     this.projectSpendRevision++;
+    this.invalidateProjectSpendSnapshot();
     if (resumable.pruned || visible.pruned) {
       this.scheduleProjectSpendSave();
     }
@@ -9836,45 +9868,126 @@ export class PanelProvider implements vscode.Disposable {
     return projectSpendDisplayFiles(this.projectSpendBusy(), this.projectSpendFiles, this.projectSpendVisibleFiles);
   }
 
-  private projectSpendPayload(): unknown {
-    if (!this.projectSpendWorkspace) {
-      return null;
-    }
-    if (!this.projectSpendHydrated) {
-      return {
-        name: 'Project cost',
-        windows: projectSpendWindows(Date.now()).map((window) => ({
-          id: window.id,
-          label: window.label,
-          dollars: null,
-          display: 'Unknown',
-          status: 'unknown',
-          partial: false,
-          pricedRequests: 0,
-          unpricedRequests: 0,
-        })),
-        categories: [],
-        earliestRecord: null,
-        lastIndexedAt: null,
-        rateSources: [],
-        indexing: true,
-        calculating: true,
-        indexingStatus: 'Updating…',
-      };
-    }
-    const view = prepareProjectSpendView(this.displayedProjectSpendFiles(), publicProjectSpendPrice, {
-      name: 'Project cost',
-      indexing: this.projectSpendBusy(),
-      historyCutoff: this.projectSpendHistoryCutoff(),
-    });
+  private unknownProjectSpendSnapshot(): ProjectSpendView {
     return {
-      ...view,
-      calculating: this.projectSpendBusy() && this.projectSpendVisibleFiles.length === 0,
-      indexingStatus: this.projectSpendBusy() ? 'Updating…' : null,
+      name: 'Project cost',
+      windows: projectSpendWindows(Date.now()).map((window) => ({
+        id: window.id,
+        label: window.label,
+        dollars: null,
+        display: 'Unknown',
+        status: 'unknown',
+        partial: false,
+        pricedRequests: 0,
+        unpricedRequests: 0,
+      })),
+      categories: [],
+      earliestRecord: null,
+      lastIndexedAt: null,
+      rateSources: [],
+      indexing: false,
     };
   }
 
+  private projectSpendPayload(): unknown {
+    const view = this.projectSpendSnapshot;
+    if (!view) return null;
+    const busy = this.projectSpendBusy() || this.projectSpendBuild !== null || this.projectSpendRebuild !== null;
+    return {
+      ...view,
+      indexing: busy,
+      calculating: busy && view.lastIndexedAt === null,
+      indexingStatus: busy ? 'Updating…' : null,
+    };
+  }
+
+  private cancelProjectSpendRebuild(): void {
+    if (this.projectSpendRebuild) clearTimeout(this.projectSpendRebuild);
+    this.projectSpendRebuild = null;
+    this.projectSpendBuild = null;
+  }
+
+  // Each slice checks its four-millisecond deadline between steps and advances at most 128 steps.
+  private invalidateProjectSpendSnapshot(): void {
+    if (this.disposed || !this.projectSpendWorkspace || !this.projectSpendHydrated) return;
+    if (this.projectSpendRebuild) return;
+    const epoch = this.projectSpendEpoch;
+    const start = (): void => {
+      if (this.disposed || epoch !== this.projectSpendEpoch) return;
+      this.projectSpendRebuild = null;
+      const revision = this.projectSpendRevision;
+      const now = Date.now();
+      const historyDays = readSetting('projectCost.historyDays');
+      const price = publicProjectSpendPrice;
+      const date = projectSpendWindows(now)[0].start;
+      const truncation = (at: number): string => {
+        const cutoff = projectSpendHistoryCutoff(historyDays, at);
+        return projectSpendWindows(at)
+          .map((window) => cutoff !== null && new Date(`${window.start}T00:00:00`).getTime() < cutoff)
+          .join(',');
+      };
+      const periodKey = truncation(now);
+      const tomorrow = new Date(now);
+      tomorrow.setHours(0, 0, 0, 0);
+      tomorrow.setDate(tomorrow.getDate() + 1);
+      // Complete display arrays remain stable while resumable indexing replaces its records.
+      const files = this.projectSpendVisibleFiles;
+      const build = prepareProjectSpendViewSteps(files, price, {
+        now,
+        historyCutoff: projectSpendHistoryCutoff(historyDays, now),
+      });
+      this.projectSpendBuild = build;
+      let current: ProjectSpendView | null = null;
+      let projection: Generator<void, ProjectSpendView> = build;
+      const slice = (): void => {
+        if (this.disposed || epoch !== this.projectSpendEpoch || this.projectSpendBuild !== build) return;
+        this.projectSpendRebuild = null;
+        if (
+          files !== this.projectSpendVisibleFiles ||
+          historyDays !== readSetting('projectCost.historyDays') ||
+          price !== publicProjectSpendPrice ||
+          date !== projectSpendWindows(Date.now())[0].start ||
+          periodKey !== truncation(Date.now())
+        ) {
+          this.projectSpendBuild = null;
+          this.invalidateProjectSpendSnapshot();
+          return;
+        }
+        const deadline = performance.now() + 4;
+        for (let work = 0; work < 128; work++) {
+          const result = projection.next();
+          if (result.done) {
+            if (!current) {
+              current = result.value;
+              projection = prepareProjectSpendViewSteps(files, price, {
+                now: tomorrow.getTime(),
+                historyCutoff: projectSpendHistoryCutoff(historyDays, tomorrow.getTime()),
+              });
+            } else {
+              this.projectSpendSnapshot = Object.freeze(current);
+              this.projectSpendSnapshotDate = date;
+              this.projectSpendSnapshotPrice = price;
+              this.projectSpendTomorrow = {
+                date: projectSpendWindows(tomorrow.getTime())[0].start,
+                view: Object.freeze(result.value),
+              };
+              this.projectSpendBuild = null;
+              this.postProjectSpend();
+              if (revision !== this.projectSpendRevision) this.invalidateProjectSpendSnapshot();
+              return;
+            }
+          }
+          if (performance.now() >= deadline) break;
+        }
+        this.projectSpendRebuild = setTimeout(slice, 0);
+      };
+      slice();
+    };
+    this.projectSpendRebuild = setTimeout(start, 100);
+  }
+
   private postProjectSpend(): void {
+    if (this.projectSpendSnapshotPrice !== publicProjectSpendPrice) this.invalidateProjectSpendSnapshot();
     void this.post({ type: 'projectSpend', projectSpend: this.projectSpendPayload() });
   }
 
@@ -9989,12 +10102,37 @@ export class PanelProvider implements vscode.Disposable {
       this.projectSpendMidnight = null;
       return;
     }
-    const next = new Date();
+    const now = Date.now();
+    const next = new Date(now);
     next.setHours(0, 0, 0, 0);
     next.setDate(next.getDate() + 1);
+    const cutoff = this.projectSpendHistoryCutoff(now);
+    if (cutoff !== null) {
+      for (const window of projectSpendWindows(now)) {
+        const boundary = now + new Date(`${window.start}T00:00:00`).getTime() - cutoff + 1;
+        if (boundary > now && boundary < next.getTime()) next.setTime(boundary);
+      }
+    }
     this.projectSpendMidnight = setTimeout(
       () => {
         this.projectSpendMidnight = null;
+        const date = projectSpendWindows(Date.now())[0].start;
+        if (this.projectSpendSnapshotDate !== date) {
+          this.projectSpendSnapshot =
+            this.projectSpendTomorrow?.date === date
+              ? this.projectSpendTomorrow.view
+              : this.unknownProjectSpendSnapshot();
+          this.projectSpendSnapshotDate = date;
+          this.projectSpendTomorrow = null;
+        }
+        if (this.projectSpendSnapshot) {
+          this.projectSpendSnapshot = truncateProjectSpendView(
+            this.projectSpendSnapshot,
+            Date.now(),
+            this.projectSpendHistoryCutoff(),
+          );
+        }
+        this.invalidateProjectSpendSnapshot();
         this.postProjectSpend();
         this.scheduleProjectSpendMidnight();
       },
@@ -10009,12 +10147,17 @@ export class PanelProvider implements vscode.Disposable {
   ): void {
     // Capture workspace, sources, and revisions before deferral so later workspace changes cannot mix ledger inputs.
     const workspace = this.projectSpendWorkspace;
+    const epoch = this.projectSpendEpoch;
+    const revision = this.projectSpendRevision;
     const sources = this.projectSpendSources();
     const tick = setTimeout(() => {
       this.projectSpendOffers.delete(tick);
-      if (this.projectSpendWorkspace === workspace) {
-        this.queueProjectSpendIndex(listedRevisions, onlyFiles, sources);
+      if (this.projectSpendEpoch !== epoch || this.projectSpendWorkspace !== workspace) return;
+      if (revision !== this.projectSpendRevision) {
+        this.scheduleProjectSpendIndex(new Map(), onlyFiles);
+        return;
       }
+      this.queueProjectSpendIndex(listedRevisions, onlyFiles, sources);
       // Publish settled Project cost when an offer queues no work.
       if (!this.projectSpendBusy()) {
         this.postProjectSpend();
@@ -10118,7 +10261,7 @@ export class PanelProvider implements vscode.Disposable {
     }
     this.projectSpendIndexing = true;
     this.postProjectSpend();
-    this.projectSpendTick = setTimeout(() => this.indexNextProjectSpendFile(), 0);
+    this.scheduleNextProjectSpendFile();
   }
 
   private projectSpendHistoryCutoff(now = Date.now()): number | null {
@@ -10127,11 +10270,20 @@ export class PanelProvider implements vscode.Disposable {
 
   // Re-offer queued sources under the changed history cutoff.
   private restartProjectSpendOffer(): void {
+    this.scheduleProjectSpendMidnight();
+    this.invalidateProjectSpendSnapshot();
     this.projectSpendQueue = [];
     this.projectSpendQueued.clear();
     this.projectSpendLastOfferAt = Date.now();
     this.queueProjectSpendIndex();
     this.postProjectSpend();
+  }
+
+  private scheduleNextProjectSpendFile(): void {
+    const epoch = this.projectSpendEpoch;
+    this.projectSpendTick = setTimeout(() => {
+      if (!this.disposed && epoch === this.projectSpendEpoch) this.indexNextProjectSpendFile();
+    }, 0);
   }
 
   private indexNextProjectSpendFile(): void {
@@ -10144,7 +10296,7 @@ export class PanelProvider implements vscode.Disposable {
     }
     if (!next) {
       if (this.indexNextClaudeCostState()) {
-        this.projectSpendTick = setTimeout(() => this.indexNextProjectSpendFile(), 0);
+        this.scheduleNextProjectSpendFile();
       } else this.finishProjectSpendIndex();
       return;
     }
@@ -10169,6 +10321,7 @@ export class PanelProvider implements vscode.Disposable {
     }
     if (result.record !== previous) {
       this.projectSpendRevision++;
+      this.invalidateProjectSpendSnapshot();
     }
     if (result.stateChanged) {
       this.scheduleProjectSpendSave();
@@ -10201,7 +10354,7 @@ export class PanelProvider implements vscode.Disposable {
     } else {
       this.projectSpendQueue.push(next);
     }
-    this.projectSpendTick = setTimeout(() => this.indexNextProjectSpendFile(), 0);
+    this.scheduleNextProjectSpendFile();
   }
 
   private indexNextClaudeCostState(): boolean {
@@ -10221,6 +10374,7 @@ export class PanelProvider implements vscode.Disposable {
           const { costStateSupplement: _supplement, ...baseline } = record;
           this.projectSpendFiles[at] = baseline;
           this.projectSpendRevision++;
+          this.invalidateProjectSpendSnapshot();
           this.scheduleProjectSpendSave();
         }
         if (
@@ -10271,6 +10425,7 @@ export class PanelProvider implements vscode.Disposable {
       ...(result.supplement ? { costStateSupplement: result.supplement } : {}),
     };
     this.projectSpendRevision++;
+    this.invalidateProjectSpendSnapshot();
     this.scheduleProjectSpendSave();
     if (result.progress.reason)
       this.diagnostics.warn('claudeCostStateWithheld', { file: key, reason: result.progress.reason });
@@ -10287,14 +10442,16 @@ export class PanelProvider implements vscode.Disposable {
       pruned.pruned ||
       this.projectSpendVisibleFiles.length !== this.projectSpendFiles.length ||
       this.projectSpendVisibleFiles.some((file, at) => file !== this.projectSpendFiles[at]);
-    this.projectSpendVisibleFiles = this.projectSpendFiles.slice();
     // Advance the ledger revision when displayed files change. Schedule persistence so repeated appends still share bounded saves.
     if (displayMoved) {
+      this.projectSpendVisibleFiles = this.projectSpendFiles.slice();
       this.projectSpendRevision++;
+      this.invalidateProjectSpendSnapshot();
       this.scheduleProjectSpendSave();
     }
     if (this.projectSpendIndexing) {
       this.projectSpendIndexing = false;
+      this.invalidateProjectSpendSnapshot();
       this.postProjectSpend();
       const railOwed = this.projectSpendRailOwed || displayMoved;
       this.projectSpendRailOwed = false;
@@ -10620,10 +10777,12 @@ export class PanelProvider implements vscode.Disposable {
       this.projectSpendVisibleFiles = invalidatedVisible;
       this.projectSpendCostQueue = null;
       this.projectSpendRevision++;
+      this.invalidateProjectSpendSnapshot();
       this.scheduleProjectSpendSave();
     }
     if (this.sessionSpendSourceIndex.revision !== revision) {
       this.projectSpendRevision++;
+      this.invalidateProjectSpendSnapshot();
       this.postDispatchedCostsIfMoved();
     }
   }

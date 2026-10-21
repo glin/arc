@@ -15,6 +15,7 @@ import {
 } from './clauderepeated';
 import {
   matchingCostSupplement,
+  matchingCostSupplementSteps,
   costStateDependency,
   costStateIdentity,
   type ClaudeCostProgress,
@@ -2391,28 +2392,40 @@ function priceBucket(bucket: ProjectUsageBucket, pricer: ProjectSpendPricer): Pr
   return pricer(bucket);
 }
 
-function directClaudeSources(files: readonly SpendFileIndex[]): {
-  usableSessions: Set<string>;
-  ignoredFiles: Set<string>;
-} {
-  const linked = new Set(
-    files.flatMap((file) => file.buckets.flatMap((bucket) => (bucket.linkedSessionId ? [bucket.linkedSessionId] : []))),
-  );
+function* directClaudeSourceSteps(files: readonly SpendFileIndex[]): Generator<
+  void,
+  {
+    usableSessions: Set<string>;
+    ignoredFiles: Set<string>;
+  }
+> {
+  const linked = new Set<string>();
+  for (const file of files) {
+    yield;
+    for (const bucket of file.buckets) {
+      yield;
+      if (bucket.linkedSessionId) linked.add(bucket.linkedSessionId);
+    }
+  }
   const usableSessions = new Set<string>();
   const ignoredFiles = new Set<string>();
   for (const file of files) {
+    yield;
     const name = path.basename(file.file).replace(/\.jsonl$/i, '');
-    if (!linked.has(name)) {
-      continue;
-    }
+    if (!linked.has(name)) continue;
     const complete = file.complete !== false && !file.trailing && !file.trailingBytes;
-    const usable =
-      complete && file.buckets.some((bucket) => !bucket.linkedSessionId && !bucket.incomplete && bucket.requests > 0);
-    if (usable) {
-      usableSessions.add(name);
-    } else {
-      ignoredFiles.add(file.file);
+    let usable = false;
+    if (complete) {
+      for (const bucket of file.buckets) {
+        yield;
+        if (!bucket.linkedSessionId && !bucket.incomplete && bucket.requests > 0) {
+          usable = true;
+          break;
+        }
+      }
     }
+    if (usable) usableSessions.add(name);
+    else ignoredFiles.add(file.file);
   }
   return { usableSessions, ignoredFiles };
 }
@@ -2469,11 +2482,52 @@ function spendAgent(agent: string): 'claude' | 'codex' | null {
   return normalized === 'claude' || normalized === 'codex' ? normalized : null;
 }
 
+// Calendar callbacks update fixed-size period metadata before background aggregation finishes.
+export function truncateProjectSpendView(view: ProjectSpendView, now: number, cutoff: number | null): ProjectSpendView {
+  if (cutoff === null) return view;
+  const truncated = new Set(
+    projectSpendWindows(now)
+      .filter((window) => new Date(`${window.start}T00:00:00`).getTime() < cutoff)
+      .map((window) => window.id),
+  );
+  const windows = (values: ProjectSpendWindow[]): ProjectSpendWindow[] =>
+    Object.freeze(
+      values.map((window) =>
+        !truncated.has(window.id) || window.partial
+          ? window
+          : Object.freeze({
+              ...window,
+              partial: true,
+              status: window.dollars === null ? ('unknown' as const) : ('atLeast' as const),
+              display: window.dollars === null ? window.display : `At least ${formatProjectCost(window.dollars)}`,
+            }),
+      ),
+    ) as ProjectSpendWindow[];
+  return Object.freeze({
+    ...view,
+    windows: windows(view.windows),
+    categories: Object.freeze(
+      view.categories.map((category) => Object.freeze({ ...category, windows: windows(category.windows) })),
+    ) as ProjectSpendCategory[],
+  });
+}
+
 export function prepareProjectSpendView(
   files: readonly SpendFileIndex[],
   pricer: ProjectSpendPricer,
   options: { now?: number; name?: string; indexing?: boolean; historyCutoff?: number | null } = {},
 ): ProjectSpendView {
+  const steps = prepareProjectSpendViewSteps(files, pricer, options);
+  let result = steps.next();
+  while (!result.done) result = steps.next();
+  return result.value;
+}
+
+export function* prepareProjectSpendViewSteps(
+  files: readonly SpendFileIndex[],
+  pricer: ProjectSpendPricer,
+  options: { now?: number; name?: string; indexing?: boolean; historyCutoff?: number | null } = {},
+): Generator<void, ProjectSpendView> {
   const now = options.now ?? Date.now();
   const windows = projectSpendWindows(now);
   const cutoff = options.historyCutoff ?? null;
@@ -2486,12 +2540,17 @@ export function prepareProjectSpendView(
   );
   const evidencedAgents = new Set<'claude' | 'codex'>();
   const rateSources = new Map<string, { effectiveDate: string | null; provenance: ProjectSpendProvenance }>();
-  const contributingDates: string[] = [];
-  const records = new Map(files.map((file) => [file.file, file]));
-  const directClaude = directClaudeSources(files);
+  let earliestRecord: string | null = null;
+  const records = new Map<string, SpendFileIndex>();
+  for (const file of files) {
+    yield;
+    records.set(file.file, file);
+  }
+  const directClaude = yield* directClaudeSourceSteps(files);
   const incomplete = new Map(windows.map((window) => [window.id, { total: false, claude: false, codex: false }]));
   let lastIndexedAt: number | null = null;
   for (const file of files) {
+    yield;
     lastIndexedAt = lastIndexedAt === null ? file.indexedAt : Math.max(lastIndexedAt, file.indexedAt);
     const unresolvedOwnership = spendRecordUsagePending(file);
     if (unresolvedOwnership) evidencedAgents.add('codex');
@@ -2510,6 +2569,7 @@ export function prepareProjectSpendView(
       }
     }
     for (const bucket of file.lifetimeBuckets ?? file.buckets) {
+      yield;
       const agent = spendAgent(bucket.agent);
       if (agent) {
         evidencedAgents.add(agent);
@@ -2518,70 +2578,79 @@ export function prepareProjectSpendView(
     if (directClaude.ignoredFiles.has(file.file)) {
       continue;
     }
-    for (const bucket of [
-      ...file.buckets,
-      ...(matchingCostSupplement(file.costStateSupplement, records) ? file.costStateSupplement.dated : []),
-    ]) {
-      if (bucket.linkedSessionId && directClaude.usableSessions.has(bucket.linkedSessionId)) {
-        continue;
-      }
-      const agent = spendAgent(bucket.agent);
-      if (agent) evidencedAgents.add(agent);
-      if (bucket.localDate > windows[0].start) {
-        continue;
-      }
-      if (bucket.localDate >= windows[2].start) {
-        contributingDates.push(bucket.localDate);
-      }
-      const price = priceBucket(bucket, pricer);
-      for (const window of windows) {
-        if (bucket.localDate < window.start) {
+    const supplement = file.costStateSupplement;
+    const supplemental = (yield* matchingCostSupplementSteps(supplement, records)) ? supplement!.dated : [];
+    for (const buckets of [file.buckets, supplemental]) {
+      for (const bucket of buckets) {
+        yield;
+        if (bucket.linkedSessionId && directClaude.usableSessions.has(bucket.linkedSessionId)) {
           continue;
         }
-        addBucket(totals.get(window.id)!, bucket, price);
-        if (agent) {
-          addBucket(agentTotals.get(agent)!.get(window.id)!, bucket, price);
+        const agent = spendAgent(bucket.agent);
+        if (agent) evidencedAgents.add(agent);
+        if (bucket.localDate > windows[0].start) {
+          continue;
         }
-      }
-      if (price && bucket.localDate >= windows[2].start) {
-        rateSources.set(`${price.source}\u0000${price.effectiveDate ?? ''}\u0000${price.provenance}`, {
-          effectiveDate: price.effectiveDate,
-          provenance: price.provenance,
-        });
+        if (bucket.localDate >= windows[2].start) {
+          if (earliestRecord === null || bucket.localDate < earliestRecord) earliestRecord = bucket.localDate;
+        }
+        const price = priceBucket(bucket, pricer);
+        for (const window of windows) {
+          if (bucket.localDate < window.start) {
+            continue;
+          }
+          addBucket(totals.get(window.id)!, bucket, price);
+          if (agent) {
+            addBucket(agentTotals.get(agent)!.get(window.id)!, bucket, price);
+          }
+        }
+        if (price && bucket.localDate >= windows[2].start) {
+          rateSources.set(`${price.source}\u0000${price.effectiveDate ?? ''}\u0000${price.provenance}`, {
+            effectiveDate: price.effectiveDate,
+            provenance: price.provenance,
+          });
+        }
       }
     }
   }
   const viewWindows = windows.map((window) =>
     displayWindow(totals.get(window.id)!, incomplete.get(window.id)!.total, window, truncated.get(window.id)),
   );
-  const earliestRecord = contributingDates.reduce<string | null>(
-    (earliest, date) => (earliest === null || date < earliest ? date : earliest),
-    null,
-  );
+  const viewSources: ProjectSpendView['rateSources'] = [];
+  for (const [key, metadata] of rateSources) {
+    yield;
+    viewSources.push(Object.freeze({ source: key.split('\u0000')[0], ...metadata }));
+  }
+  for (const window of viewWindows) Object.freeze(window);
+  Object.freeze(viewWindows);
+  Object.freeze(viewSources);
+  const categories = (['claude', 'codex'] as const)
+    .filter((agent) => evidencedAgents.has(agent))
+    .map((agent) => ({
+      id: agent,
+      label: `${agent === 'claude' ? 'Claude' : 'Codex'} spend`,
+      windows: windows.map((window) =>
+        displayWindow(
+          agentTotals.get(agent)!.get(window.id)!,
+          incomplete.get(window.id)![agent],
+          window,
+          truncated.get(window.id),
+        ),
+      ),
+    }));
+  for (const category of categories) {
+    for (const window of category.windows) Object.freeze(window);
+    Object.freeze(category.windows);
+    Object.freeze(category);
+  }
+  Object.freeze(categories);
   return {
     name: options.name ?? 'Project cost',
     windows: viewWindows,
-    categories: (['claude', 'codex'] as const)
-      .filter((agent) => evidencedAgents.has(agent))
-      .map((agent) => ({
-        id: agent,
-        label: `${agent === 'claude' ? 'Claude' : 'Codex'} spend`,
-        windows: windows.map((window) =>
-          displayWindow(
-            agentTotals.get(agent)!.get(window.id)!,
-            incomplete.get(window.id)![agent],
-            window,
-            truncated.get(window.id),
-          ),
-        ),
-      })),
+    categories,
     earliestRecord,
     lastIndexedAt,
-    rateSources: [...rateSources.entries()].map(([key, metadata]) => ({
-      source: key.split('\u0000')[0],
-      effectiveDate: metadata.effectiveDate,
-      provenance: metadata.provenance,
-    })),
+    rateSources: viewSources,
     indexing: Boolean(options.indexing),
   };
 }
