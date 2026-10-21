@@ -104,15 +104,20 @@ Claude and Codex can start each other's sessions from a shell command. The paren
 The [`arc-sessions` skill](docs/arc-sessions.md) lets agents start sessions in Arc, read their results, and send follow-ups. Agents can also label, pin, and archive sessions, queue a compaction of their own session for after the turn, and estimate costs with `arc cost`.
 
 ```text
-Use Arc to summarize the sessions labelled Review in this window. Read their completed turns. Report results, blockers, and decisions needing my input.
+Use Arc to summarize the sessions labelled Review in this window.
+Read their completed turns.
+Report results, blockers, and decisions needing my input.
 ```
 
 ```text
-Use Arc to start a Codex session reviewing this branch. Name it Branch review, apply Review, and pin it. Read its result and summarize its findings.
+Use Arc to start a Codex session reviewing this branch.
+Name it Branch review, apply Review, and pin it.
+Read its result and summarize its findings.
 ```
 
 ```text
-After saving the handoff, request compaction of this session after your response.
+After saving the handoff,
+request compaction of this session after your response.
 ```
 
 ## Limitations
