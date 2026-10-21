@@ -5,7 +5,7 @@
 import { test, vi } from 'vitest';
 import assert from 'node:assert';
 import { execFileSync } from 'node:child_process';
-import { writeFileSync, mkdirSync, renameSync, rmdirSync, appendFileSync } from 'node:fs';
+import { writeFileSync, mkdirSync, renameSync, rmdirSync, appendFileSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
   CommitIntent,
@@ -1346,7 +1346,16 @@ test.each(['printed', 'quiet'] as const)(
       { timeout: 10000 },
     );
     saveDerivedCache(cache, [], [], [], undefined, undefined, retained.snapshot());
-    const saved = loadDerivedCache(cache).commitRepositories!;
+    const stored = JSON.parse(readFileSync(cache, 'utf8'));
+    delete stored.formatVersion;
+    delete stored.metadataVersion;
+    stored.version = 64;
+    writeFileSync(cache, JSON.stringify(stored));
+    const migrated = loadDerivedCache(cache);
+    assert.equal(migrated.migrationPending, true);
+    const current = cache + '-v1';
+    saveDerivedCache(current, [], [], [], undefined, undefined, migrated.commitRepositories);
+    const saved = loadDerivedCache(current).commitRepositories!;
     assert.equal(saved[0].sha, sha);
     git(foreign, 'worktree', 'remove', tree);
     git(directory, 'clone', '-q', foreign, clone);

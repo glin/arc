@@ -9859,7 +9859,7 @@ export class PanelProvider implements vscode.Disposable {
         rateSources: [],
         indexing: true,
         calculating: true,
-        indexingStatus: 'Updatingâ€¦',
+        indexingStatus: 'Updating…',
       };
     }
     const view = prepareProjectSpendView(this.displayedProjectSpendFiles(), publicProjectSpendPrice, {
@@ -9870,7 +9870,7 @@ export class PanelProvider implements vscode.Disposable {
     return {
       ...view,
       calculating: this.projectSpendBusy() && this.projectSpendVisibleFiles.length === 0,
-      indexingStatus: this.projectSpendBusy() ? 'Updatingâ€¦' : null,
+      indexingStatus: this.projectSpendBusy() ? 'Updating…' : null,
     };
   }
 

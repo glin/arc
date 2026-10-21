@@ -370,7 +370,7 @@ test('selection measurement overlays use the real session button and leave untag
 test('selection measurement file traces retain descriptor ownership and available byte counts', () => {
   const tree = tempDir('selection-files');
   fs.writeFileSync(path.join(tree, 'trace.mjs'), TRACE_SOURCE);
-  fs.writeFileSync(path.join(tree, 'first.txt'), 'Ã©');
+  fs.writeFileSync(path.join(tree, 'first.txt'), 'é');
   fs.writeFileSync(path.join(tree, 'second.txt'), 'abc');
   const script = `import fs from 'node:fs'; import './trace.mjs';
     const first=fs.openSync('first.txt','r'); fs.readSync(first,Buffer.alloc(10),0,10,0); fs.closeSync(first);

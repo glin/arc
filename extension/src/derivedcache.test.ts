@@ -3001,6 +3001,11 @@ test('cache family admission and format fallback preserve only qualified facts',
   const imported = loadDerivedCache(current, legacy);
   assert.equal(imported.migrationPending, true);
   assert.equal(imported.claudeChildReferences.size, 1);
+  assert.equal(imported.titles.size, 0, 'legacy metadata 63 survived generation 64');
+  fs.writeFileSync(legacy, JSON.stringify({ ...old, version: 64 }));
+  const main64 = loadDerivedCache(current, legacy);
+  assert.equal(main64.titles.size, 1);
+  assert.equal(main64.claudeChildReferences.size, 1);
   fs.writeFileSync(legacy, JSON.stringify({ ...old, version: 62 }));
   assert.equal(
     loadDerivedCache(current, legacy).claudeChildReferences.size,

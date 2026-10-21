@@ -1,3 +1,4 @@
+import { commitSourceStamp } from './transcript';
 import { CommitRepositories } from './commitrepositories';
 import { CLAUDE_CHILD_REFERENCE_PARSER_VERSION } from './derivedcache';
 import { discoveryCompatibility } from './progressiveworker';
@@ -37953,7 +37954,7 @@ test('repository retention resolves a Claude child through its native launch ide
 });
 
 // Legacy relationships and opening seeds must survive host publication without source changes.
-test.each(['early shutdown', 'lock retry', 'replacement retry', 'derived retry', 'bounded failure'])(
+test.each(['early shutdown', 'lock retry', 'replacement retry', 'derived retry', 'bounded failure', 'version 64'])(
   'legacy migration preserves relationships and its opening seed through %s',
   { tags: ['subprocess'] },
   async (ending) => {
@@ -38056,8 +38057,26 @@ test.each(['early shutdown', 'lock retry', 'replacement retry', 'derived retry',
     const rows = new CodexMetaCache();
     const opening = rows.get(rollout);
     assert.ok(opening);
+    const repositoryIdentity = fs.statSync(root, { bigint: true });
+    const repositories =
+      ending === 'version 64'
+        ? [
+            {
+              version: 2 as const,
+              file: completed,
+              stamp: commitSourceStamp(completed)!,
+              dir: root,
+              occurrence: '1'.repeat(64),
+              sha: 'a'.repeat(40),
+              root: { path: root, dev: String(repositoryIdentity.dev), ino: String(repositoryIdentity.ino) },
+              command: { path: root, dev: String(repositoryIdentity.dev), ino: String(repositoryIdentity.ino) },
+              common: { path: root, dev: String(repositoryIdentity.dev), ino: String(repositoryIdentity.ino) },
+            },
+          ]
+        : [];
     const legacyBytes = JSON.stringify({
-      version: 63,
+      version: ending === 'version 64' ? 64 : 63,
+      commitRepositories: repositories,
       titles: [{ file: completed, entry: metadata.value.entry }],
       claudeChildReferences: [...entries].map(([file, entry]) => ({ file, entry })),
       discovery: relationships.value.checkpoint,
@@ -38088,6 +38107,7 @@ test.each(['early shutdown', 'lock retry', 'replacement retry', 'derived retry',
     let owner = start();
     let provider = owner as any;
     const assertRestored = () => {
+      assert.deepEqual(provider.commitRepositories.snapshot(), repositories);
       assert.deepEqual(provider.claudeChildReferenceEntries, entries, 'constructor lost legacy relationship work');
       assert.equal(provider.discoveryCheckpoint, undefined, 'legacy orchestration entered startup');
       assert.equal(provider.sessionLabel(sources[0]).label, label);
@@ -38095,6 +38115,7 @@ test.each(['early shutdown', 'lock retry', 'replacement retry', 'derived retry',
     const assertPublished = () => {
       const reopened = loadDerivedCache(current, legacy);
       assert.equal(reopened.reuse?.source, 'current');
+      assert.deepEqual(reopened.commitRepositories, repositories);
       assert.deepEqual(reopened.claudeChildReferences, entries, 'host publication lost legacy relationship work');
       assert.equal(reopened.discovery, undefined, 'host publication restored legacy orchestration');
       assert.equal(reopened.claudeChildReferences.get(normalizeFsPath(partial))?.claudeCursor?.offset, offset);
@@ -38108,7 +38129,7 @@ test.each(['early shutdown', 'lock retry', 'replacement retry', 'derived retry',
       await vi.advanceTimersByTimeAsync(0);
       assert.equal(fs.existsSync(current), false, 'a pre-walk writer result hid the only legacy seed');
       assert.equal(provider.codexOpenings.seedPersisted, false);
-      if (ending === 'early shutdown') {
+      if (ending === 'early shutdown' || ending === 'version 64') {
         owner.dispose();
         assert.equal(fs.existsSync(current), false, 'shutdown published before seed durability');
         owner = start();
@@ -38169,6 +38190,26 @@ test.each(['early shutdown', 'lock retry', 'replacement retry', 'derived retry',
       provider = owner as any;
       assertRestored();
       assert.deepEqual(provider.codexMetas.get(rollout), opening);
+      if (ending === 'version 64') {
+        vi.useRealTimers();
+        const resumed = new ProgressiveWorker('performance.now = () => 0;' + getProgressiveWorkerSource());
+        try {
+          const reply = await resumed.run(
+            {
+              kind: 'claude-children',
+              parents: sources.filter((source) => source.file === completed || source.file === empty),
+              repositoryRoots: [root],
+              referenceEntries: [...loadDerivedCache(current, legacy).claudeChildReferences],
+            },
+            1,
+            new AbortController().signal,
+          );
+          assert.equal(reply?.value.kind, 'claude-children');
+          if (reply?.value.kind === 'claude-children') assert.equal(reply.value.charges?.readBytes, 0);
+        } finally {
+          resumed.stop();
+        }
+      }
     } finally {
       replacement?.mockRestore();
       syncBuiltinESMExports();
