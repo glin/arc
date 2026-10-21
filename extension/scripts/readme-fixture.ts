@@ -66,6 +66,7 @@ const readStateTurn: Turn = turn({
   summary:
     'Finished sessions stay unread until you open their results. Switching views keeps that mark in place.\n\nOpening one result clears only its own mark. The regression test checks both paths.',
   model: 'gpt-6-astra',
+  outputRate: { output: 7_200, milliseconds: 120_000 },
   effort: 'high',
   files: [],
   commits: [
@@ -98,6 +99,8 @@ const readStateTurn: Turn = turn({
       childSessionId: 'arc-sol-read-state',
       description: 'Preserve unread state across views',
       model: 'gpt-6-sol',
+      outputRate: { output: 8_400, milliseconds: 120_000 },
+      outputRateModel: 'gpt-6-sol',
       effort: 'medium',
       spend: [
         {
@@ -143,6 +146,8 @@ const readStateTurn: Turn = turn({
       id: 'luna-tests',
       description: 'Check the view-switching test',
       model: 'gpt-6-luna',
+      outputRate: { output: 8_400, milliseconds: 40_000 },
+      outputRateModel: 'gpt-6-luna',
       effort: 'medium',
       spend: [
         {
@@ -185,6 +190,8 @@ const readStateTurn: Turn = turn({
       id: 'background-review',
       description: 'Background review',
       model: 'codex-auto-review',
+      outputRate: { output: 1_000, milliseconds: 20_000 },
+      outputRateModel: 'codex-auto-review',
       effort: 'low',
       spend: [
         {
@@ -273,6 +280,8 @@ const changesTurn: Turn = turn({
   prompt: 'Let me open a changed file or the full turn diff from the review card. Cover restored session tabs.',
   summary: 'File names and Open the changes remain available after restoring a session tab.',
   model: 'claude-opus-5-5',
+  outputRate: { output: 6_000, milliseconds: 120_000 },
+  outputRateBasis: 'request',
   files: [
     file('extension/src/webview/card-rows.ts', 27, 8),
     file('extension/src/webview/card.ts', 14, 5),
@@ -296,6 +305,8 @@ const changesTurn: Turn = turn({
       id: 'changes-check',
       description: 'Check file and diff navigation',
       model: 'claude-sonnet-5-5',
+      outputRate: { output: 4_200, milliseconds: 60_000 },
+      outputRateModel: 'claude-sonnet-5-5',
       spend: [
         {
           model: 'claude-sonnet-5-5',
@@ -334,6 +345,7 @@ const changesTurn: Turn = turn({
 const nextTurn: Turn = {
   ...changesTurn,
   model: 'claude-fable-5-1',
+  outputRate: { output: 50, milliseconds: 1_000 },
   contextTokens: 198_000,
   contextWindow: 1_000_000,
   usage: { ...emptyUsage(), requests: 1, cacheWrite1h: 198_000, output: 50 },
@@ -357,6 +369,8 @@ const beforeExpiry: Turn = turn({
   prompt: 'Inspect file and diff navigation in the review card before changing restored tabs.',
   summary: 'The file and full diff actions open the editor from an active session tab.',
   model: changesTurn.model,
+  outputRate: { output: 1_000, milliseconds: 20_000 },
+  outputRateBasis: 'request',
   usage: {
     requests: 1,
     input: 2_000,
@@ -379,7 +393,12 @@ const expiryUsage = {
   output: 2_300,
   thinking: 0,
 };
-const expiryTurn: Turn = { ...changesTurn, usage: expiryUsage, contextTokens: 162_000 };
+const expiryTurn: Turn = {
+  ...changesTurn,
+  usage: expiryUsage,
+  contextTokens: 162_000,
+  outputRate: { output: 2_300, milliseconds: 46_000 },
+};
 const expiryHistory: Turn[] = [
   expiryTurn,
   { ...beforeExpiry, usage: expiryUsage, contextTokens: 162_000 },
@@ -401,6 +420,7 @@ const expiryHistory: Turn[] = [
   },
 ].map((item) => ({
   ...item,
+  outputRate: { output: item.usage.output, milliseconds: item.usage.output * 20 },
   openingResponseId: `demo-${item.promptId}`,
   contextRequest: {
     at: item.startedAt,
@@ -484,6 +504,7 @@ const cacheTurn: Turn = turn({
   summary:
     'This run recorded repeated cache writes with little reuse. The cost detail shows how much went to cache writes.',
   model: 'openai.gpt-6-sol',
+  outputRate: { output: 12_000, milliseconds: 200_000 },
   provider: 'amazon-bedrock',
   effort: 'medium',
   usage: { ...cacheUsage, byContextBand: { short: { ...cacheUsage } } },
@@ -767,12 +788,19 @@ const demoReadStateTurn: Turn = {
   ...demoCodexReadStateTurn,
   agent: 'claude',
   model: 'claude-opus-5-5',
+  outputRate: { output: 6_000, milliseconds: 120_000 },
+  outputRateBasis: 'request',
   contextWindow: 1_000_000,
   agents: demoCodexReadStateTurn.agents.map((agent) => {
     const model = agent.id === 'background-review' ? 'claude-haiku-4-5-20251001' : 'claude-sonnet-5-5';
     return {
       ...agent,
       model,
+      outputRate: {
+        output: agent.id === 'background-review' ? 1_000 : agent.id === 'luna-tests' ? 2_800 : 8_400,
+        milliseconds: agent.id === 'background-review' ? 8_000 : agent.id === 'luna-tests' ? 40_000 : 120_000,
+      },
+      outputRateModel: model,
       effort: agent.id === 'background-review' ? null : 'high',
       spend: agent.spend.map((part) => ({ ...part, model })),
     };
@@ -823,6 +851,7 @@ export const DEMO_TURNS: Record<string, Turn[]> = {
       sessionId: 'arc-read-state',
       sessionTitle: readStateTurn.sessionTitle,
       promptId: 'inspect-unread-reproduction',
+      outputRate: { output: 900, milliseconds: 15_000 },
       startedAt: start - 35 * 60_000,
       endedAt: start - 28 * 60_000,
       prompt: 'Reproduce the unread mark disappearing after switching views.',
@@ -846,6 +875,7 @@ export const DEMO_TURNS: Record<string, Turn[]> = {
       sessionId: 'arc-read-state',
       sessionTitle: readStateTurn.sessionTitle,
       promptId: 'map-unread-behavior',
+      outputRate: { output: 700, milliseconds: 12_000 },
       startedAt: start - 65 * 60_000,
       endedAt: start - 58 * 60_000,
       prompt: 'Map how opening a result changes its session unread state.',
@@ -902,6 +932,8 @@ export const DEMO_TURNS: Record<string, Turn[]> = {
       sessionId: 'arc-luna-read-state-tests',
       sessionTitle: 'Check the view-switching test',
       promptId: 'subagent-read-state-test-turn',
+      outputRate: demoTestAgent.outputRate,
+      outputRateBasis: 'request',
       startedAt: demoTestEndedAt - demoTestAgent.durationMs!,
       endedAt: demoTestEndedAt,
       prompt: 'Check the view-switching regression test in the read-state worktree.',
@@ -922,6 +954,8 @@ export const DEMO_TURNS: Record<string, Turn[]> = {
       sessionId: 'arc-sol-read-state',
       sessionTitle: 'Preserve unread state',
       promptId: 'subagent-read-state-turn',
+      outputRate: demoReadStateTurn.agents[0].outputRate,
+      outputRateBasis: 'request',
       startedAt: demoSolStartedAt,
       endedAt: CAPTURE_TIME,
       finished: false,
@@ -942,6 +976,8 @@ export const DEMO_TURNS: Record<string, Turn[]> = {
       sessionId: 'delegated-cost',
       sessionTitle: 'Count delegated work once',
       promptId: 'delegated-cost-turn',
+      outputRate: expiryTurn.outputRate,
+      outputRateBasis: 'request',
       startedAt: expiryTurn.startedAt,
       endedAt: CAPTURE_TIME - 4 * 60_000,
       prompt: 'Show main-agent and subagent costs separately. Check file navigation after restoring a session tab.',
@@ -980,6 +1016,7 @@ export const DEMO_TURNS: Record<string, Turn[]> = {
       sessionId: 'arc-demo-sketch',
       sessionTitle: 'Review unread result changes',
       promptId: 'unread-code-review',
+      outputRate: { output: 4_000, milliseconds: 50_000 },
       startedAt: start + 12.6 * 60_000,
       endedAt: start + 13.5 * 60_000,
       prompt:
@@ -999,6 +1036,8 @@ export const DEMO_TURNS: Record<string, Turn[]> = {
       sessionId: 'arc-demo-dispatch',
       sessionTitle: 'Review the web demo',
       promptId: 'demo-dispatch-prompt',
+      outputRate: { output: 2_500, milliseconds: 50_000 },
+      outputRateBasis: 'request',
       startedAt: start - 18 * 60_000,
       endedAt: start - 4 * 60_000,
       prompt: 'Ask Codex to review the web demo. Report any behavior that needs a follow-up.',
@@ -1032,6 +1071,7 @@ export const DEMO_TURNS: Record<string, Turn[]> = {
       sessionId: 'arc-demo-review',
       sessionTitle: 'Check the demo read state',
       promptId: 'demo-review-prompt',
+      outputRate: { output: 4_000, milliseconds: 60_000 },
       startedAt: start - 16 * 60_000,
       endedAt: start - 5 * 60_000,
       prompt: 'Review the web demo without changing files. Check response read marks and the Unread filter.',
@@ -1077,6 +1117,8 @@ export const DEMO_TURNS: Record<string, Turn[]> = {
       sessionId: 'arc-demo-continuation',
       sessionTitle: 'Check unread marks in fresh context',
       promptId: 'demo-continuation-prompt',
+      outputRate: { output: 1_500, milliseconds: 30_000 },
+      outputRateBasis: 'request',
       startedAt: start + 2 * 60_000,
       endedAt: start + 10 * 60_000,
       prompt:
@@ -1131,6 +1173,8 @@ DEMO_TURNS['arc-read-state'] = DEMO_TURNS['arc-read-state'].map((item, index) =>
         ...item,
         agent: 'claude',
         model: 'claude-opus-5-5',
+        outputRate: { output: item.usage.output, milliseconds: item.usage.output * 20 },
+        outputRateBasis: 'request',
         contextWindow: 1_000_000,
         startedAt: item.startedAt - (index === 2 ? 60 * 60_000 : 0),
         endedAt: item.endedAt - (index === 2 ? 60 * 60_000 : 0),

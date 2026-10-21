@@ -96,7 +96,7 @@
   },
   "extension/src/panel.layout.cards.test.ts": {
     "reason": "Turn-card browser interactions must preserve disclosure, keyboard, selection, and scrolling behavior.",
-    "cases": 47,
+    "cases": 48,
     "matricesSha256": "0b0f4eff8446bec3662a0729c7cb764c108764d067619f1394efeefb1827deb9"
   },
   "extension/src/panel.layout.comments.test.ts": {
