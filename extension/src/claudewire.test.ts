@@ -103,6 +103,158 @@ test('Claude native evidence retains root envelopes, successful tool settlement 
   wire.close('finished');
 });
 
+test('Claude results retain native local command identity while slash skills and older results end model work', async () => {
+  const events: WireEvent[] = [];
+  const wire = new ClaudeWire({
+    send() {},
+    emit: (event) => events.push(event),
+    sessionId: SESSION,
+  });
+  const result = {
+    type: 'result',
+    session_id: SESSION,
+    uuid: 'command-result',
+    result_index: 0,
+    num_turns: 0,
+    subtype: 'success',
+    is_error: false,
+    terminal_reason: 'completed',
+  };
+  for (const [prompt, localCommand] of [
+    ['/effort low', 'effort'],
+    ['/compact Keep the handoff.', 'compact'],
+    ['/handoff Finish the work.', undefined],
+  ] as const) {
+    await wire.prompt(prompt);
+    wire.receive(
+      JSON.stringify({
+        ...result,
+        local_command: localCommand,
+        num_turns: localCommand ? 0 : 1,
+      }),
+    );
+    const ending = events.filter((event) => event.kind === 'turnEnd').at(-1);
+    assert.equal(ending?.localCommand, localCommand);
+    const native = events.at(-2);
+    assert.equal(native?.kind === 'native' && native.event.kind === 'rootEnd', !localCommand);
+  }
+  wire.receive(JSON.stringify({ type: 'result', subtype: 'success', num_turns: 1 }));
+  assert.equal(events.filter((event) => event.kind === 'turnEnd').at(-1)?.localCommand, undefined);
+  wire.close('finished');
+});
+
+test('Claude distinguishes acknowledged model input from local replay before model output', async () => {
+  const writes: string[] = [];
+  const accepted: string[] = [];
+  const read: string[] = [];
+  const events: WireEvent[] = [];
+  const wire = new ClaudeWire({
+    send: (line) => writes.push(line),
+    emit: (event) => events.push(event),
+    sessionId: SESSION,
+  });
+  const send = async (name: string) => {
+    await wire.prompt(
+      '/' + name,
+      undefined,
+      undefined,
+      undefined,
+      () => read.push(name),
+      () => accepted.push(name),
+    );
+    return JSON.parse(writes.at(-1)!);
+  };
+  const replay = (frame: Record<string, unknown>) =>
+    wire.receive(
+      JSON.stringify({
+        ...frame,
+        isReplay: true,
+        parent_tool_use_id: null,
+        session_id: SESSION,
+      }),
+    );
+  const local = (name: string) =>
+    wire.receive(
+      JSON.stringify({
+        type: 'result',
+        session_id: SESSION,
+        local_command: name,
+        subtype: 'success',
+        num_turns: 0,
+      }),
+    );
+  const first = await send('effort');
+  const second = await send('effort');
+  replay(first);
+  local('effort');
+  local('effort');
+  replay(second);
+  const skill = await send('handoff');
+  replay(skill);
+  assert.deepEqual(read, ['effort', 'effort', 'handoff']);
+  assert.deepEqual(accepted, []);
+  wire.receive(
+    JSON.stringify({
+      type: 'assistant',
+      parent_tool_use_id: null,
+      session_id: SESSION,
+      local_command_source: '<local-command-stdout>Changed.</local-command-stdout>',
+      message: {
+        role: 'assistant',
+        content: [{ type: 'text', text: 'Changed.' }],
+      },
+    }),
+  );
+  assert.deepEqual(accepted, []);
+  const pending = await send('effort');
+  replay(pending);
+  wire.receive(
+    JSON.stringify({
+      type: 'assistant',
+      parent_tool_use_id: null,
+      session_id: SESSION,
+      user_message_uuid: 'old-input',
+      user_message_uuids: ['old-input'],
+      message: { content: [] },
+    }),
+  );
+  assert.deepEqual(accepted, []);
+  wire.receive(
+    JSON.stringify({
+      type: 'stream_event',
+      user_message_uuid: skill.uuid,
+      user_message_uuids: [skill.uuid],
+      parent_tool_use_id: null,
+      session_id: SESSION,
+      event: {
+        type: 'message_start',
+        message: { id: 'skill-response', role: 'assistant', content: [] },
+      },
+    }),
+  );
+  assert.deepEqual(accepted, ['handoff']);
+  for (const rejected of [false, true]) {
+    const frame = rejected ? await send('rejected') : pending;
+    if (rejected) replay(frame);
+    wire.receive(
+      JSON.stringify({
+        type: 'result',
+        session_id: SESSION,
+        num_turns: 0,
+        user_message_uuid: frame.uuid,
+        user_message_uuids: [frame.uuid],
+        subtype: rejected ? 'error_during_execution' : 'success',
+        is_error: rejected,
+        terminal_reason: rejected ? 'aborted_streaming' : undefined,
+      }),
+    );
+    assert.deepEqual(accepted, ['handoff']);
+    const ending = events.filter((event) => event.kind === 'turnEnd').at(-1);
+    assert.ok(ending?.inputGenerations?.length);
+  }
+  wire.close('finished');
+});
+
 test('Claude response speed uses final actual output and commits only a stopped main response', () => {
   const events: WireEvent[] = [];
   let clock = 1000;
@@ -2336,6 +2488,54 @@ test('Claude guarded prompts settle only on the matching root replay, and replay
 // Catches a reader prompt counting as read before Claude replays it, or on a replay of another
 // prompt, session or scope, a guarded receipt that ends with its attempt, and a receipt that
 // outlives a Stop, a session change or a closed child.
+test.each(['a', 'b'])('Claude 2.1.304 joined prompt fixture retains the client UUID in case %s', async (name) => {
+  const { readFileSync } = await import('node:fs');
+  const path = await import('node:path');
+  const entries = readFileSync(
+    path.join(__dirname, `../test/fixtures/claude-joined-case-${name}-2.1.304.jsonl`),
+    'utf8',
+  )
+    .trim()
+    .split('\n')
+    .map((line) => JSON.parse(line));
+  const prompts = entries.filter((entry) => entry.direction === 'stdin' && entry.frame.type === 'user');
+  assert.equal(prompts.length, 2);
+  assert.notEqual(prompts[0].frame.uuid, prompts[1].frame.uuid);
+  const replay = entries.find(
+    (entry) =>
+      entry.direction === 'stdout' && entry.frame.type === 'user' && entry.frame.uuid === prompts[1].frame.uuid,
+  );
+  assert.ok(replay, 'the recorded replay preserves the outgoing UUID');
+  assert.equal(replay.frame.parent_tool_use_id, null);
+  const firstResult = entries.find((entry) => entry.direction === 'stdout' && entry.frame.type === 'result');
+  assert.ok(prompts[1].index < replay.index && replay.index < firstResult.index);
+  const writes: Record<string, any>[] = [];
+  const identities = new Map<string, string>();
+  const read: number[] = [];
+  const wire = new ClaudeWire({
+    sessionId: replay.frame.session_id,
+    send: (line) => writes.push(JSON.parse(line)),
+    emit: () => {},
+  });
+  for (const entry of entries) {
+    if (entry.direction === 'stdin' && entry.frame.type === 'user') {
+      await wire.prompt(entry.frame.message.content[0].text, undefined, undefined, undefined, () =>
+        read.push(entry.index),
+      );
+      identities.set(entry.frame.uuid, writes.at(-1)!.uuid);
+    } else if (entry.direction === 'stdout') {
+      const frame = { ...entry.frame };
+      if (identities.has(frame.uuid)) frame.uuid = identities.get(frame.uuid);
+      wire.receive(JSON.stringify(frame));
+    }
+  }
+  assert.deepEqual(
+    read,
+    prompts.map((entry) => entry.index),
+  );
+  wire.close('fixture complete');
+});
+
 test('Claude reports a prompt as read only on its own root replay', async () => {
   const sent: Record<string, any>[] = [];
   const wire = new ClaudeWire({ send: (line) => sent.push(JSON.parse(line)), emit: () => {}, sessionId: SESSION });

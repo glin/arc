@@ -237,7 +237,14 @@ export interface Driver {
   open(): Promise<PromptEntry[]>;
   // A guarded prompt carries an attempt. The wire marks it written when it writes the input and settles it by its provider receipt.
   // `received` runs when the provider reports that it read the prompt. Claude reports it by its replay. Codex never reports it.
-  prompt(prompt: AgentPromptInput, guard?: GuardedAttempt, received?: () => void): Promise<void | string>;
+  // `modelAccepted` distinguishes acknowledged slash input that starts model work from a local command.
+  prompt(
+    prompt: AgentPromptInput,
+    guard?: GuardedAttempt,
+    received?: () => void,
+    modelAccepted?: () => void,
+    written?: (generation: number) => void,
+  ): Promise<void | string>;
   // Whether the provider positively reported that nothing runs. An absent report is not idle.
   idleEvidence?(): boolean;
   compact(beforeWrite?: () => void): Promise<void>;
@@ -365,7 +372,8 @@ export function claudePlan(launch: Launch, options: SpawnOptions): AgentPlan {
         contextFrame: (text) => wire.contextFrame(text),
         contextOverflow: (id) => wire.contextOverflow(id),
         open: () => wire.initialize(),
-        prompt: async (prompt, guard, received) => wire.prompt(prompt, guard, undefined, undefined, received),
+        prompt: async (prompt, guard, received, modelAccepted, written) =>
+          wire.prompt(prompt, guard, undefined, undefined, received, modelAccepted, written),
         idleEvidence: () => wire.idleEvidence(),
         compact: async (beforeWrite) => wire.prompt(compactCommand('claude'), undefined, beforeWrite),
         clear: async (_name, beforeWrite, writeAttempted) =>
@@ -827,8 +835,11 @@ export class AgentSession {
   private readonly promptsBehindEffort = new Set<{ id: number }>();
   private readonly preparingTurns = new Set<{ id: number }>();
   private readonly openTurns = new Set<{ id: number }>();
+  private readonly commandTurns = new WeakSet<{ id: number }>();
+  // A slash input is only a command candidate until Claude names it in a local result.
+  private readonly commandNames = new WeakMap<{ id: number }, string>();
   // The owner of a turn Claude starts by itself, such as one a background task notice wakes.
-  // It opens at the first root event after a `result` while no Arc turn is open or being prepared.
+  // It opens at the first root event after a `result` while no live Arc turn is open or being prepared.
   private agentTurn: { id: number } | null = null;
   private readonly agentTurnIds = new Set<number>();
   private resultSeen = false;
@@ -838,15 +849,18 @@ export class AgentSession {
   private readonly responseRateOwners = new Map<string, number>();
   private readonly pendingResponses: WireEvent[] = [];
   private acceptingPrompts = 0;
+  private readonly modelInputs = new WeakSet();
+  private readonly inputGenerations = new WeakMap<object, number>();
+  private readonly settledInputs = new WeakSet();
   // Turn ends this child reported. Guarded observations use it to tell tracked source growth from outside change.
   private turnEnds = 0;
   // Claude reported `running` and has not reported `idle` since. It keeps the session busy
   // through a turn the CLI started by itself. It also covers a prompt that reached the CLI
   // just after its last `result` but before Arc read that `result`, which the `idle` after it settles.
   private agentRunning = false;
-  // How many `result` events have ended a turn here, and how many had when each open turn
-  // reached the child. A turn can join only work that a later `result` ends, so an `idle`
-  // report settles only turns that were open when one arrived.
+  // Model turn endings and the count when each open turn reached the child.
+  // A local command result ends only its command. It does not complete following prompts.
+  // An idle report settles joined turns only after their model work ends.
   private turnEndings = 0;
   private readonly openedAtEnding = new WeakMap<{ id: number }, number>();
   private interruptedTurnEnds = 0;
@@ -1001,6 +1015,8 @@ export class AgentSession {
     this.lastError = null;
     const submitted = { id: ++sessionTurnSequence };
     onSubmitted?.(submitted.id);
+    const command = /^\/(\S+)/.exec((typeof prompt === 'string' ? prompt : prompt.text).trim())?.[1];
+    if (command) this.commandNames.set(submitted, command);
     if (!this.driver.hasOpenTurns) {
       this.preparingTurns.add(submitted);
     }
@@ -1029,7 +1045,21 @@ export class AgentSession {
       this.acceptingPrompts += 1;
       let nativeTurnId: void | string;
       try {
-        nativeTurnId = await this.driver.prompt(prompt, guard, onReceived && (() => onReceived(submitted.id)));
+        this.openedAtEnding.set(submitted, this.turnEndings);
+        nativeTurnId = await this.driver.prompt(
+          prompt,
+          guard,
+          onReceived && (() => onReceived(submitted.id)),
+          command
+            ? () => {
+                if (this.readerTurnOwner(submitted.id) !== undefined) {
+                  this.modelInputs.add(submitted);
+                  this.agentTurn = null;
+                }
+              }
+            : undefined,
+          (generation) => this.inputGenerations.set(submitted, generation),
+        );
       } finally {
         this.acceptingPrompts -= 1;
       }
@@ -1043,11 +1073,11 @@ export class AgentSession {
         if (!this.preparingTurns.delete(submitted)) {
           throw new Error('the prompt was stopped before it reached the agent');
         }
-        this.openTurn(submitted);
-        this.busy = true;
+        if (!this.settledInputs.has(submitted)) this.openTurn(submitted);
+        this.busy = this.countedBusy();
         this.changed();
       }
-      this.respondingTurns.add(submitted.id);
+      if (!this.settledInputs.has(submitted)) this.respondingTurns.add(submitted.id);
       const pending = this.pendingResponses.splice(0);
       for (const event of pending) this.handle(event);
       return submitted.id;
@@ -1118,6 +1148,7 @@ export class AgentSession {
 
   async compact(beforeWrite?: () => void): Promise<number> {
     return this.commandTurn(() => this.driver.compact(beforeWrite), {
+      command: 'compact',
       gone: 'the agent is no longer running, so the session was not compacted',
       lost: 'the compaction was stopped before it reached the agent',
       refused: 'compact the session',
@@ -1129,7 +1160,7 @@ export class AgentSession {
   // Reader commands clear the diagnostic. A successful held effort change retains the refusal that left the session idle.
   private async commandTurn(
     run: () => Promise<void>,
-    words: { gone: string; lost: string; refused: string },
+    words: { command: string; gone: string; lost: string; refused: string },
     clearsDiagnostic = true,
   ): Promise<number> {
     if (this.exited) {
@@ -1141,6 +1172,8 @@ export class AgentSession {
       this.lastError = null;
     }
     const submitted = { id: ++sessionTurnSequence };
+    this.commandTurns.add(submitted);
+    this.commandNames.set(submitted, words.command);
     if (!this.driver.hasOpenTurns) {
       this.preparingTurns.add(submitted);
     }
@@ -1187,6 +1220,8 @@ export class AgentSession {
     }
     this.lastError = null;
     const submitted = { id: ++sessionTurnSequence };
+    this.commandTurns.add(submitted);
+    this.commandNames.set(submitted, 'clear');
     if (!this.driver.hasOpenTurns) {
       this.preparingTurns.add(submitted);
     }
@@ -1381,6 +1416,7 @@ export class AgentSession {
     return this.commandTurn(
       () => this.driver.setEffort!(effort),
       {
+        command: 'effort',
         gone: 'the agent is no longer running, so the effort level was not changed',
         lost: 'the effort change was stopped before it reached the agent',
         refused: 'change the effort level',
@@ -1429,13 +1465,37 @@ export class AgentSession {
     return this.agentTurnIds.has(turnId);
   }
 
+  // Joined model submissions share the first live owner. Pending local inputs wait behind confirmed model work.
+  private liveClaudeTurn(): { id: number } | undefined {
+    const live = [...this.openTurns].filter(
+      (turn) => (this.openedAtEnding.get(turn) ?? this.turnEndings) >= this.turnEndings,
+    );
+    return (
+      live.find((turn) => !this.commandNames.has(turn) || this.commandTurns.has(turn) || this.modelInputs.has(turn)) ??
+      live[0]
+    );
+  }
+
+  // A receipt can arrive before prompt preparation resolves. Only membership in this live group permits rebinding.
+  readerTurnOwner(submittedTurnId: number): number | undefined {
+    if (this.agent !== 'claude' || this.driver.hasOpenTurns) return undefined;
+    const submission = [...this.openTurns, ...this.preparingTurns].find((turn) => turn.id === submittedTurnId);
+    if (
+      !submission ||
+      this.settledInputs.has(submission) ||
+      (this.openedAtEnding.get(submission) ?? -1) < this.turnEndings
+    )
+      return undefined;
+    return this.liveClaudeTurn()?.id ?? submission.id;
+  }
+
   // Opens the owner of a turn Claude started by itself, when the event can start one, and returns its ID.
   private openAgentTurn(): number | undefined {
     if (
       this.agent !== 'claude' ||
       this.driver.hasOpenTurns ||
       !this.resultSeen ||
-      this.openTurns.size > 0 ||
+      this.liveClaudeTurn() !== undefined ||
       this.preparingTurns.size > 0
     )
       return undefined;
@@ -1446,18 +1506,17 @@ export class AgentSession {
     return this.agentTurn.id;
   }
 
-  // A reader prompt that opens or joins a turn retires the owner of a turn Claude started by itself.
-  // Its events then follow the reader turn, as they do for any joined prompt.
+  // Ordinary reader input retires an agent-started owner. Slash input waits for native model acceptance.
   private openTurn(turn: { id: number }): void {
     this.openTurns.add(turn);
-    this.agentTurn = null;
+    if (!this.commandNames.has(turn)) this.agentTurn = null;
     this.resultSeen = false;
     this.openedAtEnding.set(turn, this.turnEndings);
   }
 
-  // Claude's `idle` report ends, in one pass, every prompt or command turn that was open when
-  // a `result` arrived. A joined prompt gets no `result`, so this is the only ending it gets.
-  // A turn that reached the child after the latest `result` cannot have joined the work it
+  // Claude's `idle` report ends every prompt or command turn that was open when model work
+  // ended. A joined prompt gets no `result`, so this is the only ending it gets.
+  // A turn that reached the child after the latest model result cannot have joined the work it
   // ended. It waits for its own `result`, so an `idle` written before the CLI took it settles
   // nothing. The aborted `result` of a Stop does not count, because nothing joins a stopped
   // turn. Prompts still being prepared have not reached the child and stay open. A Stop ending
@@ -1470,8 +1529,7 @@ export class AgentSession {
       settled.push(turn.id);
     }
     for (const id of settled) this.respondingTurns.delete(id);
-    this.agentTurn = null;
-    this.agentRunning = false;
+    if (!this.agentTurn) this.agentRunning = false;
     this.interruptedTurnEnds = 0;
     this.stoppedSubmission = null;
     this.busy = this.countedBusy();
@@ -1538,13 +1596,12 @@ export class AgentSession {
   private handle(event: WireEvent): void {
     if (this.exited) return;
     if (event.kind === 'responseStarted') {
+      const owner = this.agentTurn ?? this.liveClaudeTurn();
       if (
         this.agent === 'claude' &&
-        !this.acceptingPrompts &&
-        this.openTurns.size === 1 &&
-        this.preparingTurns.size === 0
+        owner &&
+        (this.agentTurn || (!this.acceptingPrompts && this.preparingTurns.size === 0))
       ) {
-        const owner = this.openTurns.values().next().value;
         if (owner && !this.responseRateOwners.has(event.sourceId)) {
           this.responseRateOwners.set(event.sourceId, owner.id);
           if (this.responseRateOwners.size > 512)
@@ -1558,9 +1615,8 @@ export class AgentSession {
       this.responseRateOwners.delete(event.sourceId);
       if (
         owner !== undefined &&
-        [...this.openTurns].some((turn) => turn.id === owner) &&
-        this.openTurns.size === 1 &&
-        this.preparingTurns.size === 0
+        (this.liveClaudeTurn()?.id === owner || this.agentTurn?.id === owner) &&
+        (this.agentTurn?.id === owner || this.preparingTurns.size === 0)
       )
         this.report(event, owner);
       return;
@@ -1606,11 +1662,9 @@ export class AgentSession {
           ? this.nativeTurnOwners.get(native.turnId)
           : undefined
         : this.agentTurn
-          ? this.openTurns.size === 0 && this.preparingTurns.size === 0
-            ? this.agentTurn.id
-            : undefined
-          : this.openTurns.size === 1 && this.preparingTurns.size === 0
-            ? this.openTurns.values().next().value?.id
+          ? this.agentTurn.id
+          : this.liveClaudeTurn() && this.preparingTurns.size === 0
+            ? this.liveClaudeTurn()!.id
             : ['toolStart', 'toolEnd', 'rootEnd', 'launch'].includes(native.kind)
               ? this.openAgentTurn()
               : undefined;
@@ -1646,6 +1700,7 @@ export class AgentSession {
     }
     let endedTurnId: number | undefined;
     let dispatchTurnId: number | undefined;
+    let inputOnly = false;
     if (event.kind === 'delta' || event.kind === 'text' || event.kind === 'turnEnd') {
       if (this.driver.hasOpenTurns) {
         endedTurnId = event.nativeTurnId ? this.nativeTurnOwners.get(event.nativeTurnId) : undefined;
@@ -1656,11 +1711,11 @@ export class AgentSession {
       } else if (event.kind !== 'turnEnd') {
         endedTurnId = event.sourceId ? this.responseOwners.get(event.sourceId) : undefined;
         endedTurnId ??= this.agentTurn
-          ? this.openTurns.size === 0 && this.preparingTurns.size === 0
-            ? this.agentTurn.id
-            : undefined
+          ? this.agentTurn.id
           : // Subagent text arrives between turns too, so only a root event opens a turn Claude started by itself.
-            this.openTurns.values().next().value?.id;
+            this.preparingTurns.size === 0
+            ? this.liveClaudeTurn()?.id
+            : undefined;
         if (event.sourceId && endedTurnId !== undefined) this.responseOwners.set(event.sourceId, endedTurnId);
       }
     }
@@ -1694,7 +1749,24 @@ export class AgentSession {
     if (event.kind === 'turnEnd') {
       if (this.driver.hasOpenTurns) {
         this.busy = this.driver.hasOpenTurns();
+      } else if (event.inputGenerations) {
+        const inputs = [...this.openTurns, ...this.preparingTurns].filter((turn) => {
+          const generation = this.inputGenerations.get(turn);
+          return generation !== undefined && event.inputGenerations!.includes(generation);
+        });
+        const owner = this.liveClaudeTurn() ?? this.preparingTurns.values().next().value;
+        const ownsWork = !this.agentTurn && inputs.some((turn) => turn.id === owner?.id);
+        inputOnly = !ownsWork || [...this.openTurns, ...this.preparingTurns].some((turn) => !inputs.includes(turn));
+        if (ownsWork) this.resultSeen = true;
+        for (const turn of inputs) {
+          endedTurnId ??= turn.id;
+          this.settledInputs.add(turn);
+          this.openTurns.delete(turn);
+          this.respondingTurns.delete(turn.id);
+        }
+        this.busy = this.countedBusy();
       } else if (
+        !event.localCommand &&
         event.outcome.status === 'interrupted' &&
         this.interruptedTurnEnds > 0 &&
         this.now() - this.interruptedTurnEndAt <= STOP_ENDING_GRACE_MS
@@ -1711,10 +1783,12 @@ export class AgentSession {
           this.interruptedTurnEnds = 0;
           this.stoppedSubmission = null;
         }
-        this.turnEndings += 1;
-        this.resultSeen = true;
-        const first = this.openTurns.values().next().value;
-        if (this.agentTurn) {
+        const first = event.localCommand
+          ? [...this.openTurns].find((turn) => this.commandNames.get(turn) === event.localCommand)
+          : (this.liveClaudeTurn() ?? this.openTurns.values().next().value);
+        if (!event.localCommand && (this.agentTurn || !first || !this.commandTurns.has(first))) this.turnEndings += 1;
+        if (!event.localCommand) this.resultSeen = true;
+        if (this.agentTurn && !event.localCommand) {
           endedTurnId = this.agentTurn.id;
           this.agentTurn = null;
         } else if (first) {
@@ -1726,7 +1800,7 @@ export class AgentSession {
       // Remove asks whose driver no longer waits for an answer after the turn ends.
       // Keep asks that the driver identifies as outliving their turn.
       for (const id of [...this.asks.keys()]) {
-        if (!this.driver.outlivesTurn?.(id)) {
+        if (!event.localCommand && !inputOnly && !this.driver.outlivesTurn?.(id)) {
           this.asks.delete(id);
         }
       }

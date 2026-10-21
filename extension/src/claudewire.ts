@@ -561,7 +561,19 @@ export class ClaudeWire {
   // read a prompt ends none of them, and neither does the settlement of a guarded attempt. A Stop that
   // cancels queued prompts, a change from a known session, and a closed child end all of them. The
   // oldest leaves at the limit.
-  private readonly receipts = new Map<string, { session: string | null; text?: string; received: () => void }>();
+  private readonly receipts = new Map<
+    string,
+    {
+      session: string | null;
+      text?: string;
+      received?: () => void;
+      modelAccepted?: () => void;
+      command?: string;
+      acknowledged?: boolean;
+      localSettled?: boolean;
+      generation: number;
+    }
+  >();
 
   contextFrame(text: string): string | null {
     if (!this.contextRequests.size) return null;
@@ -610,23 +622,26 @@ export class ClaudeWire {
     beforeWrite?: () => void,
     writeAttempted?: () => void,
     received?: () => void,
+    modelAccepted?: () => void,
+    written?: (generation: number) => void,
   ): Promise<void> {
     this.responseClock.reset();
     if (this.closed) {
       throw new Error('the agent is no longer running');
     }
     const prompt = normalizeAgentPrompt(input);
-    if (guard) return this.guardedPrompt(prompt.text, prompt.assets.length > 0, guard, received);
+    if (guard)
+      return this.guardedPrompt(prompt.text, prompt.assets.length > 0, guard, received, modelAccepted, written);
     this.reportedState = null;
     if (!prompt.assets.length && prompt.text) {
       beforeWrite?.();
-      this.nativeSubmission(prompt.text);
+      this.nativeSubmission(prompt.text, written);
       this.write(
         {
           type: 'user',
           message: { role: 'user', content: [{ type: 'text', text: prompt.text }] },
           origin: HUMAN_ORIGIN,
-          ...this.awaitReceipt(received),
+          ...this.awaitReceipt(received, modelAccepted, prompt.text),
         },
         writeAttempted,
       );
@@ -641,23 +656,34 @@ export class ClaudeWire {
         throw new Error('the prompt was stopped before it reached the agent');
       }
       beforeWrite?.();
-      this.nativeSubmission(prompt.text);
+      this.nativeSubmission(prompt.text, written);
       this.write(
-        { type: 'user', message: { role: 'user', content }, origin: HUMAN_ORIGIN, ...this.awaitReceipt(received) },
+        {
+          type: 'user',
+          message: { role: 'user', content },
+          origin: HUMAN_ORIGIN,
+          ...this.awaitReceipt(received, modelAccepted, prompt.text),
+        },
         writeAttempted,
       );
     });
   }
 
   // Registers the receipt of an ordinary prompt and returns the client UUID its frame carries.
-  private awaitReceipt(received: (() => void) | undefined): { uuid?: string } {
-    if (!received) return {};
+  private awaitReceipt(received: (() => void) | undefined, modelAccepted?: () => void, text = ''): { uuid?: string } {
+    if (!received && !modelAccepted) return {};
     const uuid = randomUUID();
-    this.addReceipt(uuid, { session: this.session, received });
+    this.addReceipt(uuid, {
+      session: this.session,
+      generation: this.nativeGeneration,
+      received,
+      modelAccepted,
+      command: /^\/(\S+)/.exec(text.trim())?.[1],
+    });
     return { uuid };
   }
 
-  private addReceipt(uuid: string, receipt: { session: string | null; text?: string; received: () => void }): void {
+  private addReceipt(uuid: string, receipt: NonNullable<ReturnType<typeof this.receipts.get>>): void {
     this.receipts.set(uuid, receipt);
     if (this.receipts.size > PROMPT_RECEIPTS) this.receipts.delete(this.receipts.keys().next().value!);
   }
@@ -674,13 +700,15 @@ export class ClaudeWire {
     hasAssets: boolean,
     attempt: GuardedAttempt,
     received?: () => void,
+    modelAccepted?: () => void,
+    written?: (generation: number) => void,
   ): Promise<void> {
     if (hasAssets || !text) throw new Error('a guarded prompt carries text only');
     if (this.replayWait) throw new Error('another guarded prompt is still unsettled');
     if (!this.session) throw new Error('the session identity is unknown');
     // Like an ordinary prompt, the write starts a native submission, so a deferred compaction it requests binds to it.
     attempt.prepareWrite();
-    this.nativeSubmission(text);
+    this.nativeSubmission(text, written);
     this.write({
       type: 'user',
       message: { role: 'user', content: [{ type: 'text', text }] },
@@ -694,7 +722,15 @@ export class ClaudeWire {
     );
     if (typeof timer === 'object' && typeof timer.unref === 'function') timer.unref();
     this.replayWait = { attempt, session: this.session, text, timer };
-    if (received) this.addReceipt(attempt.clientUuid, { session: this.session, text, received });
+    if (received || modelAccepted)
+      this.addReceipt(attempt.clientUuid, {
+        session: this.session,
+        generation: this.nativeGeneration,
+        text,
+        received,
+        modelAccepted,
+        command: /^\/(\S+)/.exec(text.trim())?.[1],
+      });
     return Promise.resolve();
   }
 
@@ -721,8 +757,47 @@ export class ClaudeWire {
       (receipt.text !== undefined && !replayedText(m, receipt.text))
     )
       return;
-    this.receipts.delete(uuid);
-    receipt.received();
+    if (receipt.acknowledged) return;
+    receipt.acknowledged = true;
+    if (receipt.localSettled) this.receipts.delete(uuid);
+    receipt.received?.();
+  }
+
+  // Exact input UUIDs distinguish model participation from unrelated root output.
+  private classifyModelInput(message: Json): number[] | undefined {
+    if (message.parent_tool_use_id !== undefined && message.parent_tool_use_id !== null) return undefined;
+    const local = message.type === 'result' ? str(message.local_command) : undefined;
+    if (local) {
+      const match = [...this.receipts].find(([, receipt]) => receipt.command === local && !receipt.localSettled);
+      if (match) {
+        const [uuid, receipt] = match;
+        receipt.localSettled = true;
+        if (receipt.acknowledged) this.receipts.delete(uuid);
+      }
+      return undefined;
+    }
+    const model =
+      message.parent_tool_use_id === null &&
+      ((message.type === 'assistant' &&
+        message.local_command_source === undefined &&
+        message.local_command_run === undefined) ||
+        message.type === 'stream_event');
+    const participants = [message.user_message_uuid, ...arr(message.user_message_uuids)];
+    const negative = message.type === 'result' && message.num_turns === 0;
+    const positive =
+      model || (message.type === 'result' && typeof message.num_turns === 'number' && message.num_turns > 0);
+    const generations: number[] = [];
+    for (const [uuid, receipt] of this.receipts) {
+      if (receipt.localSettled || !participants.includes(uuid)) continue;
+      if (negative) {
+        generations.push(receipt.generation);
+        this.receipts.delete(uuid);
+      } else if (positive && receipt.acknowledged) {
+        this.receipts.delete(uuid);
+        receipt.modelAccepted?.();
+      }
+    }
+    return generations.length ? generations : undefined;
   }
 
   private endReplayWait(reason: string): void {
@@ -919,6 +994,7 @@ export class ClaudeWire {
       this.emit({ kind: 'session', sessionId: session, previous });
     }
 
+    const inputGenerations = this.classifyModelInput(m);
     this.nativeMessage(m);
     switch (str(m.type)) {
       case 'control_response':
@@ -940,10 +1016,20 @@ export class ClaudeWire {
         this.partial(obj(m.event));
         return;
       case 'result':
-        this.endReplayWait('The agent finished a turn without confirming the prompt.');
-        this.responseClock.reset();
-        this.responseTimingBlocked = false;
-        this.emit({ kind: 'turnEnd', outcome: readOutcome(m) });
+        {
+          const localCommand = str(m.local_command);
+          if (!localCommand && !inputGenerations) {
+            this.endReplayWait('The agent finished a turn without confirming the prompt.');
+            this.responseClock.reset();
+            this.responseTimingBlocked = false;
+          }
+          this.emit({
+            kind: 'turnEnd',
+            outcome: readOutcome(m),
+            ...(localCommand ? { localCommand } : {}),
+            ...(inputGenerations ? { inputGenerations } : {}),
+          });
+        }
         return;
       case 'rate_limit_event':
         this.rateLimit(obj(m.rate_limit_info));
@@ -986,8 +1072,9 @@ export class ClaudeWire {
     }
   }
 
-  private nativeSubmission(text: string): void {
+  private nativeSubmission(text: string, written?: (generation: number) => void): void {
     this.nativeGeneration++;
+    written?.(this.nativeGeneration);
     if (this.session)
       this.emit({
         kind: 'native',

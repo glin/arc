@@ -949,6 +949,8 @@ export interface CompactChild {
   compactionUnresolved(): boolean;
   // True for a turn Claude started by itself, such as one a background task notice woke.
   startedByAgent?(turnId: number): boolean;
+  // The live shared Claude owner of this submission, including a joined prompt awaiting preparation settlement.
+  readerTurnOwner?(submittedTurnId: number): number | undefined;
   compact(beforeWrite: () => void): Promise<unknown>;
   guardedIdle?(): string | null;
   guardedPrompt?(
@@ -1118,11 +1120,13 @@ export class CompactHost<C extends CompactChild> {
   // notice has not arrived. A notice that arrived earlier keeps its own submission, because the
   // reader acted after it. The revision stays the one recorded at submission, so a later reader
   // action still refuses. A follow-up or a continuation carries no reader instruction and adopts
-  // nothing.
+  // nothing. A joined reader receipt binds its live shared owner to that same original submission.
   read(child: C, turnId: number): void {
     if (this.disposed) return;
     const submission = this.submissions.get(child)?.get(turnId);
     if (!submission?.reader) return;
+    const owner = child.readerTurnOwner?.(turnId);
+    if (owner !== undefined) this.submissions.get(child)!.set(owner, submission);
     this.latestReader.set(child, submission);
     for (const launch of this.launches.get(child)?.values() ?? []) if (!launch.woke) launch.submission = submission;
   }
@@ -1141,8 +1145,8 @@ export class CompactHost<C extends CompactChild> {
       this.wake(child, event.toolId, event.runId, turnId);
       return;
     }
-    // A launch that no single turn owns, such as a delayed result while a reader prompt joined a
-    // running turn, belongs to the latest reader prompt that Claude read in the child.
+    // A launch that no live turn owns, such as a delayed result during prompt preparation,
+    // belongs to the latest reader prompt that Claude read in the child.
     if (event.kind === 'launch') {
       const submission = turnId === undefined ? this.latestReader.get(child) : this.submissionOf(child, turnId);
       this.recordLaunch(child, event.toolId, submission ?? null, event.agentId);

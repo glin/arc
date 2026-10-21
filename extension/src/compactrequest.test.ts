@@ -1472,6 +1472,79 @@ test('host compaction in a turn Claude starts by itself binds only through the n
 // Catches a reader instruction given while background work runs never admitting the compaction
 // that a turn the work wakes requests, and a reader action that instruction did not see being
 // absorbed into it.
+test.each(['reader', 'followup', 'continuation', 'later action'] as const)(
+  'joined receipt rebinds only its reader assignment with its original revision, %s',
+  (origin) => {
+    const { fixture } = compactHostFixture('claude');
+    const { host, child } = fixture;
+    const owner = vi.fn<() => number>(() => 7);
+    child.readerTurnOwner = owner;
+    child.startedByAgent = (turn) => turn === 9;
+    host.submitted(child, 7);
+    host.readerAction('self');
+    host.submitted(child, 8, origin === 'later action' ? 'reader' : origin);
+    if (origin === 'later action') host.readerAction('self');
+    host.read(child, 8);
+    assert.equal(owner.mock.calls.length, origin === 'followup' || origin === 'continuation' ? 0 : 1);
+    const start = compactEvent('toolStart', { provider: 'claude', generation: 1 }) as Extract<
+      NativeEvent,
+      { kind: 'toolStart' }
+    >;
+    host.native(child, start, 7);
+    const ready = host.handle({ method: 'compact-ready', params: compactPayload }) as { code?: string };
+    const request = host.handle({ method: 'compact-request', params: compactPayload }) as { state: string };
+    assert.deepEqual(
+      [ready.code, request.state],
+      origin === 'reader' ? [undefined, 'queued'] : ['reader-acted', 'refused'],
+    );
+    if (origin !== 'reader') return;
+    const joined = { ...compactPayload, requestId: compactWindow + ':cccccccc-1111-2222-3333-444444444444' };
+    host.native(
+      child,
+      { ...start, toolId: 'joined', command: compactLiteral.replace(compactPayload.requestId, joined.requestId) },
+      8,
+    );
+    assert.equal((host.handle({ method: 'compact-ready', params: joined }) as { code?: string }).code, 'already-used');
+    // A new notice-woken turn retains the same assignment's consumed allowance.
+    host.native(
+      child,
+      {
+        provider: 'claude',
+        sessionId: 'self',
+        turnId: null,
+        generation: 1,
+        evidence: {},
+        kind: 'launch',
+        toolId: 'work',
+        agentId: null,
+      },
+      7,
+    );
+    host.native(
+      child,
+      {
+        provider: 'claude',
+        sessionId: 'self',
+        turnId: null,
+        generation: 1,
+        evidence: {},
+        kind: 'wake',
+        toolId: 'work',
+        runId: 'work-run',
+      },
+      undefined,
+    );
+    const second = { ...compactPayload, requestId: compactWindow + ':bbbbbbbb-1111-2222-3333-444444444444' };
+    host.native(
+      child,
+      { ...start, toolId: 'second', command: compactLiteral.replace(compactPayload.requestId, second.requestId) },
+      9,
+    );
+    assert.equal((host.handle({ method: 'compact-ready', params: second }) as { code?: string }).code, 'already-used');
+    assert.equal((host.handle({ method: 'compact-request', params: second }) as { state: string }).state, 'refused');
+  },
+);
+
 test('host compaction in a turn that background work wakes carries the latest reader prompt that Claude read', () => {
   const claude = (extra: Record<string, unknown> = {}) =>
     compactEvent('toolStart', { provider: 'claude', generation: 1, ...extra });

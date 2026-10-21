@@ -1802,7 +1802,7 @@ test.each(['closed wire', 'pre-write refusal', 'unknown write', 'preparation fai
   },
 );
 
-test('Claude response speed requires a sole prompt owner established at response start', async () => {
+test('Claude response speed follows the shared owner established at response start', async () => {
   const SESSION = 'speed-session';
   const { host, children, events } = fakeHost();
   const opening = host.session('speed', claudePlan(CLAUDE, { cwd: WS, sessionId: SESSION }));
@@ -1825,7 +1825,8 @@ test('Claude response speed requires a sole prompt owner established at response
   handle({ kind: 'responseStarted', sourceId: 'steered' });
   await session.prompt('second');
   handle({ ...rate, sourceId: 'steered' });
-  assert.equal(events.filter((entry) => entry.event.kind === 'responseRate').length, 1);
+  assert.equal(events.filter((entry) => entry.event.kind === 'responseRate').length, 2);
+  assert.equal(events.filter((entry) => entry.event.kind === 'responseRate').at(-1)?.turnId, id);
 });
 
 test('LineReader keeps a line whole across the chunks it arrives in', () => {
@@ -3184,10 +3185,11 @@ test('Codex native turn identity binds early and obsolete response events to acc
   await disposing;
 });
 
-// Catches a Claude native event credited to a turn while another prompt is preparing or another turn is open.
-test('Claude native events name their submission only while one open turn owns them', async () => {
+// Preparation cannot grant ownership. Joined submissions retain the first live turn's owner.
+test('Claude native events follow the shared owner after prompt preparation ends', async () => {
   let emit!: (event: WireEvent) => void;
   let accept!: () => void;
+  let received: (() => void) | undefined;
   const plan: AgentPlan = {
     agent: 'claude',
     sessionId: 'session',
@@ -3200,9 +3202,10 @@ test('Claude native events name their submission only while one open turn owns t
       return {
         receive: () => undefined,
         open: () => Promise.resolve([]),
-        prompt: () =>
+        prompt: (_input, _guard, onReceived) =>
           new Promise<void>((resolve) => {
             accept = resolve;
+            received = onReceived;
           }),
         compact: () => Promise.resolve(),
         clear: () => Promise.resolve(),
@@ -3237,18 +3240,27 @@ test('Claude native events name their submission only while one open turn owns t
       foreground: true,
     },
   };
-  const opening = session.prompt('first');
+  const receiptOwners: (number | undefined)[] = [];
+  const opening = session.prompt('first', undefined, undefined, (id) =>
+    receiptOwners.push(session.readerTurnOwner(id)),
+  );
+  received!();
   accept();
   const first = await opening;
+  assert.deepEqual(receiptOwners, [first]);
   emit(native);
   assert.equal(reported.at(-1)?.turnId, first);
-  const joining = session.prompt('second');
+  const joining = session.prompt('second', undefined, undefined, (id) =>
+    receiptOwners.push(session.readerTurnOwner(id)),
+  );
+  received!();
+  assert.deepEqual(receiptOwners, [first, first]);
   emit(native);
   assert.equal(reported.at(-1)?.turnId, undefined, 'a preparing prompt leaves the owner unknown');
   accept();
   await joining;
   emit(native);
-  assert.equal(reported.at(-1)?.turnId, undefined, 'two open turns leave the owner unknown');
+  assert.equal(reported.at(-1)?.turnId, first, 'joined prompts share the first live owner');
   const disposing = session.dispose();
   child.exit(0);
   await disposing;
@@ -9599,6 +9611,863 @@ function compactionThroughHost(
     setCurrent: (c: CompactChild) => (current = c),
   };
 }
+
+// Replays a real joined reader receipt through the same host and compaction routing as a window.
+async function joinedCompaction(options: Parameters<typeof compactionThroughHost>[0] = {}, knownSession = true) {
+  const through = compactionThroughHost(options);
+  const opening = through.host.session(
+    'one',
+    claudePlan(CLAUDE, { cwd: WS, ...(knownSession ? { sessionId: 'sess-1' } : {}) }),
+  );
+  through.children[0].answerHandshake();
+  const session = await opening;
+  through.setCurrent(session);
+  const frames = fs
+    .readFileSync(path.join(__dirname, '../test/fixtures/claude-joined-case-b-2.1.304.jsonl'), 'utf8')
+    .trim()
+    .split('\n')
+    .map((line) => JSON.parse(line));
+  const receipt = frames.find((entry) => entry.index === 34).frame;
+  const replay = (
+    prompt = through.children[0]
+      .sent()
+      .filter((line) => line.type === 'user')
+      .at(-1)!,
+  ) => {
+    through.children[0].say(
+      JSON.stringify({ ...receipt, uuid: prompt.uuid, session_id: 'sess-1', message: prompt.message }) + '\n',
+    );
+  };
+  const send = (text: string) => {
+    if (session.state().sessionId) through.compaction.readerAction('sess-1');
+    return promptAsReader(through.compaction, session, (submitted, received) =>
+      session.prompt(text, submitted, undefined, received),
+    );
+  };
+  const tool = (id: string, command: string, input?: unknown) =>
+    through.children[0].say(
+      JSON.stringify({
+        type: 'assistant',
+        parent_tool_use_id: null,
+        uuid: `uuid-${id}`,
+        user_message_uuid: input,
+        user_message_uuids: input ? [input] : undefined,
+        session_id: 'sess-1',
+        message: {
+          role: 'assistant',
+          content: [{ type: 'tool_use', name: 'Bash', id, caller: { type: 'direct' }, input: { command } }],
+        },
+      }) + '\n',
+    );
+  const literal = (id: string) =>
+    `arc compact request --self --after-turn --request-id ${through.window}:${id} --window ${through.window} --json`;
+  const admission = (id: string) => {
+    const ready = through.compaction.handle({ method: 'compact-ready', params: through.payload(id) }) as {
+      code?: string;
+    };
+    const request = through.compaction.handle({ method: 'compact-request', params: through.payload(id) }) as {
+      state: string;
+    };
+    return [ready.code, request.state];
+  };
+  return { ...through, session, replay, send, tool, literal, admission };
+}
+
+test.each(['effort', 'compact', 'clear', 'typed effort', 'typed compact'] as const)(
+  'a reader prompt after a local %s result retains compaction and response ownership',
+  async (command) => {
+    const responses: { text: string; sourceId?: string; turnId?: number }[] = [];
+    const h = await joinedCompaction({
+      holder: {
+        noteRecordedReply: () => assert.fail('the reader response has an ordinary turn card'),
+        noteCompletedReply: (_session, text, sourceId, turnId, saved) => {
+          responses.push({ text, sourceId, turnId });
+          saved?.();
+        },
+        settleRecordedReplies: () => {},
+      },
+    });
+    const child = h.children[0];
+    const first = await h.send('Finish the first task.');
+    h.replay();
+    const ending = JSON.parse(agentStartedTurns(h.window, h.ids).find((line) => line.includes('"type":"result"'))!);
+    let resultIndex = 0;
+    const result = (uuid: string, local?: string) =>
+      child.say(
+        JSON.stringify({
+          ...ending,
+          uuid,
+          result_index: resultIndex++,
+          ...(local ? { local_command: local, num_turns: 0 } : {}),
+        }) + '\n',
+      );
+    let following: Promise<number>;
+    if (command === 'effort') {
+      await h.session.setEffort('low');
+      following = h.send('Do the next task, then compact yourself.');
+      result('first-result');
+    } else {
+      result('first-result');
+      if (command.startsWith('typed '))
+        await h.send(command === 'typed effort' ? '/effort low' : '/compact Keep the handoff.');
+      else if (command === 'compact') await h.session.compact();
+      else await h.session.clear();
+      following = h.send('Do the next task, then compact yourself.');
+    }
+    const reader = await following;
+    assert.equal(h.events.filter((event) => event.kind === 'turnEnd').at(-1)?.turnId, first);
+    assert.deepEqual(sentTexts(child).slice(-2), [
+      command === 'effort' || command === 'typed effort'
+        ? '/effort low'
+        : command === 'typed compact'
+          ? '/compact Keep the handoff.'
+          : command === 'compact'
+            ? '/compact'
+            : '/clear',
+      'Do the next task, then compact yourself.',
+    ]);
+    h.replay();
+    result('command-result', command.replace('typed ', ''));
+    assert.notEqual(h.events.filter((event) => event.kind === 'turnEnd').at(-1)?.turnId, reader);
+    assert.equal(h.session.state().busy, true);
+    h.tool('compact-after-command', h.literal(h.ids[0]));
+    assert.deepEqual(h.admission(h.ids[0]), [undefined, 'queued']);
+    assert.equal(h.owners.at(-1), reader);
+    assert.equal(h.session.startedByAgent(reader), false);
+    child.say(
+      JSON.stringify({
+        type: 'user',
+        parent_tool_use_id: null,
+        session_id: 'sess-1',
+        tool_use_result: { interrupted: false },
+        message: {
+          role: 'user',
+          content: [{ type: 'tool_result', tool_use_id: 'compact-after-command', content: 'queued', is_error: false }],
+        },
+      }) + '\n',
+    );
+    child.say(
+      JSON.stringify({
+        type: 'assistant',
+        session_id: 'sess-1',
+        parent_tool_use_id: null,
+        uuid: 'reader-final',
+        message: {
+          id: 'reader-final',
+          role: 'assistant',
+          stop_reason: 'end_turn',
+          content: [{ type: 'text', text: 'Next task complete.' }],
+        },
+      }) + '\n',
+    );
+    result('reader-result');
+    assert.equal(h.events.filter((event) => event.kind === 'rootEnd').at(-1)?.turnId, reader);
+    assert.deepEqual(responses.at(-1), { text: 'Next task complete.', sourceId: 'reader-final', turnId: reader });
+    assert.equal(h.events.filter((event) => event.kind === 'turnEnd').at(-1)?.turnId, reader);
+    assert.equal(h.compaction.requests.deliverable('sess-1').length, 1);
+    assert.equal(h.session.state().busy, false);
+    child.say(sessionState('idle'));
+    await h.compaction.drain('sess-1');
+    assert.equal(sentTexts(child).at(-1), '/compact');
+  },
+);
+
+test('a typed local command preserves concurrent model work and its native owner', async () => {
+  const h = await joinedCompaction();
+  const model = await h.send('/handoff Finish the work.');
+  h.replay();
+  h.tool('model-work', 'echo working');
+  const command = await h.send('/effort low');
+  h.replay();
+  const ending = JSON.parse(agentStartedTurns(h.window, h.ids).find((line) => line.includes('"type":"result"'))!);
+  h.children[0].say(JSON.stringify({ ...ending, local_command: 'effort', num_turns: 0 }) + '\n');
+  assert.equal(h.events.filter((event) => event.kind === 'turnEnd').at(-1)?.turnId, command);
+  h.children[0].say(sessionState('idle'));
+  assert.equal(h.session.state().busy, true);
+  h.tool('still-model-work', 'echo continuing');
+  assert.equal(h.owners.at(-1), model);
+  h.children[0].say(JSON.stringify({ ...ending, uuid: 'model-ending', result_index: 1 }) + '\n');
+  assert.equal(h.events.filter((event) => event.kind === 'rootEnd').at(-1)?.turnId, model);
+  assert.equal(h.events.filter((event) => event.kind === 'turnEnd').at(-1)?.turnId, model);
+  assert.equal(h.session.state().busy, false);
+});
+
+test.each([
+  'acknowledged slash skill',
+  'correlated slash skill',
+  'ordinary reader input',
+  'failed slash preparation',
+] as const)('background-woken model ownership follows %s', async (input) => {
+  const h = await joinedCompaction();
+  await h.send('Start work.');
+  h.replay();
+  h.children[0].say(COMPLETED_RESULT);
+  h.children[0].say(sessionState('idle'));
+  h.children[0].say(sessionState('running'));
+  h.tool('agent-work', 'echo working');
+  const model = h.owners.at(-1)!;
+  assert.equal(h.session.startedByAgent(model), true);
+  let expected = model;
+  if (input === 'correlated slash skill') {
+    await h.send('/effort low');
+    h.replay();
+  }
+  if (input === 'failed slash preparation') {
+    await assert.rejects(
+      h.session.prompt({
+        text: '/handoff Finish work.',
+        assets: [
+          {
+            id: 'missing-image',
+            size: 1,
+            digest: 'missing',
+            path: path.join(WS, 'missing-slash-image.png'),
+            name: 'missing.png',
+            mime: 'image/png',
+          },
+        ],
+      }),
+    );
+  } else {
+    expected = await h.send(input.includes('slash skill') ? '/handoff Finish work.' : 'Finish work.');
+    h.replay();
+  }
+  h.tool(
+    'following-work',
+    'echo continuing',
+    h.children[0]
+      .sent()
+      .filter((line) => line.type === 'user')
+      .at(-1)?.uuid,
+  );
+  assert.equal(h.owners.at(-1), expected);
+  if (input === 'correlated slash skill') {
+    h.children[0].say(
+      JSON.stringify({
+        type: 'result',
+        session_id: 'sess-1',
+        local_command: 'effort',
+        num_turns: 0,
+        subtype: 'success',
+      }) + '\n',
+    );
+    h.tool('skill-after-local', 'echo skill');
+    assert.equal(h.owners.at(-1), expected);
+  }
+  h.children[0].say(COMPLETED_RESULT);
+  assert.equal(h.events.filter((event) => event.kind === 'turnEnd').at(-1)?.turnId, expected);
+  h.children[0].say(sessionState('idle'));
+  assert.equal(h.session.state().busy, false);
+});
+
+test.each([true, false])('negative input settles with overlapping preparation, known session %s', async (known) => {
+  const h = fakeHost();
+  const opening = h.host.session('one', claudePlan(CLAUDE, { cwd: WS, ...(known ? { sessionId: 'sess-1' } : {}) }));
+  const child = h.children[0];
+  child.answerHandshake();
+  const session = await opening;
+  const first = session.prompt('Continue the model work.');
+  let submitted = 0;
+  let receiptOwner: number | undefined;
+  const second = session.prompt(
+    '/effort low',
+    (id) => {
+      submitted = id;
+    },
+    undefined,
+    () => {
+      receiptOwner = session.readerTurnOwner(submitted);
+    },
+  );
+  const frame = child
+    .sent()
+    .filter((line) => line.type === 'user')
+    .at(-1)!;
+  child.say(
+    JSON.stringify({
+      type: 'result',
+      session_id: 'sess-1',
+      num_turns: 0,
+      subtype: 'error_during_execution',
+      is_error: true,
+      terminal_reason: 'aborted_streaming',
+      user_message_uuid: frame.uuid,
+      user_message_uuids: [frame.uuid],
+    }) + '\n',
+  );
+  child.say(JSON.stringify({ ...frame, isReplay: true, parent_tool_use_id: null, session_id: 'sess-1' }) + '\n');
+  assert.equal(receiptOwner, undefined);
+  const firstOwner = await first;
+  const secondOwner = await second;
+  assert.equal(h.events.filter((entry) => entry.event.kind === 'turnEnd').at(-1)?.turnId, secondOwner);
+  assert.equal(session.readerTurnOwner(secondOwner), undefined);
+  assert.equal(session.state().busy, true);
+  child.say(COMPLETED_RESULT);
+  assert.equal(h.events.filter((entry) => entry.event.kind === 'turnEnd').at(-1)?.turnId, firstOwner);
+  child.say(sessionState('idle'));
+  assert.equal(session.state().busy, false);
+});
+
+test.each(['before idle', 'after idle'] as const)(
+  'rejecting one ordinary input preserves the following reader replay %s',
+  async (ordering) => {
+    const replies: { text: string; turnId?: number }[] = [];
+    const h = await joinedCompaction({
+      holder: {
+        noteRecordedReply: () => assert.fail('the reader reply retains its turn card'),
+        noteCompletedReply: (_session, text, _source, turnId, saved) => {
+          replies.push({ text, turnId });
+          saved?.();
+        },
+        settleRecordedReplies: () => {},
+      },
+    });
+    const child = h.children[0];
+    const rejected = await h.send('Check this input.');
+    const first = child
+      .sent()
+      .filter((line) => line.type === 'user')
+      .at(-1)!;
+    const reader = await h.send('Finish the work, then compact yourself.');
+    child.say(questionRequest());
+    child.say(
+      JSON.stringify({
+        type: 'result',
+        session_id: 'sess-1',
+        parent_tool_use_id: null,
+        num_turns: 0,
+        subtype: 'error_during_execution',
+        is_error: true,
+        terminal_reason: 'aborted_streaming',
+        user_message_uuid: first.uuid,
+        user_message_uuids: [first.uuid],
+      }) + '\n',
+    );
+    assert.equal(h.events.filter((event) => event.kind === 'turnEnd').at(-1)?.turnId, rejected);
+    if (ordering === 'before idle') h.replay();
+    child.say(sessionState('idle'));
+    if (ordering === 'after idle') h.replay();
+    assert.equal(h.session.state().asks.length, 1);
+    assert.equal(
+      h.host.answer('one', 'request', {
+        decision: 'answer',
+        answers: { 'Which option?': { labels: ['One'], written: '' } },
+      }),
+      true,
+    );
+    await vi.waitFor(() => assert.equal(h.session.state().asks.length, 0));
+    h.tool('following-compact', h.literal(h.ids[0]));
+    assert.equal(h.owners.at(-1), reader);
+    assert.deepEqual(h.admission(h.ids[0]), [undefined, 'queued']);
+    child.say(
+      JSON.stringify({
+        type: 'user',
+        parent_tool_use_id: null,
+        session_id: 'sess-1',
+        tool_use_result: { interrupted: false },
+        message: {
+          role: 'user',
+          content: [{ type: 'tool_result', tool_use_id: 'following-compact', content: 'queued', is_error: false }],
+        },
+      }) + '\n',
+    );
+    child.say(
+      JSON.stringify({
+        type: 'assistant',
+        session_id: 'sess-1',
+        parent_tool_use_id: null,
+        uuid: 'following-final',
+        message: {
+          id: 'following-final',
+          role: 'assistant',
+          stop_reason: 'end_turn',
+          content: [{ type: 'text', text: 'Work complete.' }],
+        },
+      }) + '\n',
+    );
+    assert.deepEqual(replies.at(-1), { text: 'Work complete.', turnId: reader });
+    child.say(agentStartedTurns(h.window, h.ids).find((line) => line.includes('"type":"result"'))! + '\n');
+    assert.equal(h.events.filter((event) => event.kind === 'turnEnd').at(-1)?.turnId, reader);
+    child.say(sessionState('idle'));
+    assert.equal(h.session.state().busy, false);
+    assert.equal(h.compaction.requests.deliverable('sess-1').length, 1);
+    await h.compaction.drain('sess-1');
+    assert.equal(sentTexts(child).at(-1), '/compact');
+  },
+);
+
+test.each([
+  ['negative', true, 'retained'],
+  ['negative', false, 'retained'],
+  ['negative', true, 'later'],
+  ['negative', false, 'later'],
+  ['received first', true, 'retained'],
+  ['local result first', true, 'retained'],
+  ['valid unbound', false, 'retained'],
+] as const)('background adoption after %s replay, known session %s, launch %s', async (ordering, known, launch) => {
+  const h = await joinedCompaction({}, known);
+  const child = h.children[0];
+  // A launch can be observed before a reader submission or a settled session identity.
+  h.compaction.native(
+    h.session,
+    {
+      provider: 'claude',
+      sessionId: 'sess-1',
+      turnId: null,
+      generation: null,
+      evidence: {},
+      kind: 'launch',
+      toolId: 'retained-launch',
+      agentId: null,
+    },
+    undefined,
+  );
+  const overlapping = h.send('Continue the earlier work.');
+  const pending = h.send(ordering === 'local result first' ? '/effort low' : 'Compact after the background work.');
+  const frame = child
+    .sent()
+    .filter((line) => line.type === 'user')
+    .at(-1)!;
+  if (ordering === 'received first' || ordering === 'valid unbound') h.replay(frame);
+  if (ordering !== 'valid unbound')
+    child.say(
+      JSON.stringify({
+        type: 'result',
+        session_id: 'sess-1',
+        parent_tool_use_id: null,
+        num_turns: 0,
+        subtype: ordering === 'local result first' ? 'success' : 'error_during_execution',
+        is_error: ordering !== 'local result first',
+        ...(ordering === 'local result first'
+          ? { local_command: 'effort' }
+          : {
+              terminal_reason: 'aborted_streaming',
+              user_message_uuid: frame.uuid,
+              user_message_uuids: [frame.uuid],
+            }),
+      }) + '\n',
+    );
+  h.replay(frame);
+  await Promise.all([overlapping, pending]);
+  child.say(COMPLETED_RESULT);
+  child.say(sessionState('idle'));
+  const accepted = ordering !== 'negative';
+  const wake = (tool: string, run: string) =>
+    child.say(
+      JSON.stringify({
+        type: 'system',
+        subtype: 'task_notification',
+        session_id: 'sess-1',
+        tool_use_id: tool,
+        task_id: run,
+        status: 'completed',
+      }) + '\n',
+    );
+  if (launch === 'retained') {
+    wake('retained-launch', 'retained-run');
+    h.tool('retained-request', h.literal(h.ids[0]));
+    assert.deepEqual(h.admission(h.ids[0]), accepted ? [undefined, 'queued'] : ['no-reader-instruction', 'refused']);
+    child.say(COMPLETED_RESULT);
+    child.say(sessionState('idle'));
+  }
+  // A later unowned launch also exercises the latest acknowledged reader submission.
+  const preparing = h.session.prompt('Continue without a new reader instruction.');
+  child.say(
+    JSON.stringify({
+      type: 'user',
+      parent_tool_use_id: null,
+      session_id: 'sess-1',
+      tool_use_result: { status: 'async_launched', agentId: 'later-agent' },
+      message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'later-launch', content: '' }] },
+    }) + '\n',
+  );
+  assert.equal(h.events.filter((event) => event.kind === 'launch').at(-1)?.turnId, undefined);
+  await preparing;
+  child.say(COMPLETED_RESULT);
+  child.say(sessionState('idle'));
+  wake('later-launch', 'later-run');
+  h.tool('later-request', h.literal(h.ids[1]));
+  assert.deepEqual(
+    h.admission(h.ids[1]),
+    accepted ? ['already-used', 'refused'] : ['no-reader-instruction', 'refused'],
+  );
+});
+
+test('a correlated zero-turn result completes its owning ordinary input', async () => {
+  const h = await joinedCompaction();
+  const owner = await h.send('Check this input.');
+  h.replay();
+  const frame = h.children[0]
+    .sent()
+    .filter((line) => line.type === 'user')
+    .at(-1)!;
+  h.children[0].say(
+    JSON.stringify({
+      type: 'result',
+      session_id: 'sess-1',
+      num_turns: 0,
+      subtype: 'success',
+      user_message_uuid: frame.uuid,
+      user_message_uuids: [frame.uuid],
+    }) + '\n',
+  );
+  assert.equal(h.events.filter((event) => event.kind === 'turnEnd').at(-1)?.turnId, owner);
+  h.children[0].say(sessionState('idle'));
+  assert.equal(h.session.state().busy, false);
+  h.tool('next-background-work', 'echo awake');
+  assert.equal(h.session.startedByAgent(h.owners.at(-1)!), true);
+});
+
+test.each([
+  'two pending local commands',
+  'model completion before local settlement',
+  'acknowledged pending command',
+  'zero-model rejection',
+  'zero-model nonquery',
+] as const)('background-woken ownership survives %s', async (ordering) => {
+  const h = await joinedCompaction({
+    holder: {
+      noteRecordedReply: () => {},
+      noteCompletedReply: (_session, _text, _sourceId, _turnId, saved) => saved?.(),
+      settleRecordedReplies: () => {},
+    },
+  });
+  const child = h.children[0];
+  await h.send('Start the background work, then end the turn.');
+  h.replay();
+  const backgroundInput = child
+    .sent()
+    .filter((line) => line.type === 'user')
+    .at(-1)!.uuid;
+  const lines = agentStartedTurns(h.window, h.ids);
+  const result = lines.findIndex((line) => line.includes('"type":"result"'));
+  const notice = lines.findIndex(
+    (line, index) => index > result && line.includes('task_notification') && line.includes('"tool_use_id":"tool-8"'),
+  );
+  for (const line of lines.slice(0, result + 1)) child.say(line + '\n');
+  child.say(sessionState('idle'));
+  for (const line of lines.slice(result + 1, notice + 1)) child.say(line + '\n');
+  child.say(sessionState('running'));
+  h.tool('woken-work', 'echo awake');
+  const owner = h.owners.at(-1)!;
+  assert.equal(h.session.startedByAgent(owner), true);
+  const command = await h.send('/effort low');
+  const ending = JSON.parse(lines[result]);
+  const commandFrame = child
+    .sent()
+    .filter((line) => line.type === 'user')
+    .at(-1)!;
+  if (ordering === 'acknowledged pending command' || ordering.startsWith('zero-model')) {
+    child.say(
+      JSON.stringify({
+        type: 'assistant',
+        session_id: 'sess-1',
+        parent_tool_use_id: null,
+        local_command_source: '<local-command-stdout>Changed.</local-command-stdout>',
+        local_command_run: { command: 'effort', args: 'low' },
+        message: { role: 'assistant', content: [{ type: 'text', text: 'Changed.' }] },
+      }) + '\n',
+    );
+    h.replay(commandFrame);
+    if (ordering.startsWith('zero-model')) {
+      child.say(
+        JSON.stringify({
+          ...ending,
+          uuid: 'negative-input',
+          result_index: 1,
+          num_turns: 0,
+          user_message_uuid: commandFrame.uuid,
+          user_message_uuids: [commandFrame.uuid],
+          subtype: ordering === 'zero-model rejection' ? 'error_during_execution' : 'success',
+          is_error: ordering === 'zero-model rejection',
+          terminal_reason: ordering === 'zero-model rejection' ? 'aborted_streaming' : undefined,
+          errors:
+            ordering === 'zero-model rejection'
+              ? ['prompt_check: the turn was stopped before its prompt was checked']
+              : undefined,
+        }) + '\n',
+      );
+      assert.equal(h.events.filter((event) => event.kind === 'turnEnd').at(-1)?.turnId, command);
+    }
+  }
+  const localResult = (uuid: string, index: number) =>
+    child.say(JSON.stringify({ ...ending, uuid, result_index: index, local_command: 'effort', num_turns: 0 }) + '\n');
+  const second = ordering === 'two pending local commands' ? await h.send('/effort high') : undefined;
+  if (second !== undefined) {
+    const firstCommand = child
+      .sent()
+      .filter((line) => line.type === 'user')
+      .at(-2)!;
+    h.replay(firstCommand);
+    localResult('local-effort-one', 1);
+    assert.equal(h.events.filter((event) => event.kind === 'turnEnd').at(-1)?.turnId, command);
+    child.say(sessionState('idle'));
+  }
+  assert.equal(h.session.state().busy, true, 'pending local input cannot end the background-woken model work');
+  h.tool('continued-woken-work', h.literal(h.ids[0]), backgroundInput);
+  assert.equal(h.owners.at(-1), owner, 'pending slash inputs cannot replace the active model owner');
+  assert.deepEqual(h.admission(h.ids[0]), ['reader-acted', 'refused']);
+  child.say(
+    JSON.stringify({
+      type: 'assistant',
+      session_id: 'sess-1',
+      parent_tool_use_id: null,
+      uuid: 'woken-final',
+      user_message_uuid: backgroundInput,
+      user_message_uuids: [backgroundInput],
+      message: {
+        id: 'woken-final',
+        role: 'assistant',
+        stop_reason: 'end_turn',
+        content: [{ type: 'text', text: 'Work complete.' }],
+      },
+    }) + '\n',
+  );
+  assert.equal(h.events.filter((event) => event.kind === 'text').at(-1)?.turnId, owner);
+  if (second !== undefined) {
+    localResult('local-effort-two', 2);
+    assert.equal(h.events.filter((event) => event.kind === 'turnEnd').at(-1)?.turnId, second);
+    h.replay();
+  }
+  const wokenEnding = JSON.parse(lines.find((line) => line.includes('"runId":"run-11"'))!);
+  child.say(JSON.stringify({ ...wokenEnding, result_index: 3 }) + '\n');
+  assert.equal(h.events.filter((event) => event.kind === 'rootEnd').at(-1)?.turnId, owner);
+  assert.equal(h.events.filter((event) => event.kind === 'turnEnd').at(-1)?.turnId, owner);
+  if (second === undefined && !ordering.startsWith('zero-model')) {
+    localResult('late-local-effort', 4);
+    assert.equal(h.events.filter((event) => event.kind === 'turnEnd').at(-1)?.turnId, command);
+    h.replay();
+  }
+  child.say(sessionState('idle'));
+  assert.equal(h.session.state().busy, false);
+
+  const reader = await h.send('Compact yourself after confirming the work.');
+  h.replay();
+  h.tool('authorized-compact', h.literal(h.ids[1]));
+  assert.deepEqual(h.admission(h.ids[1]), [undefined, 'queued']);
+  assert.equal(h.owners.at(-1), reader);
+  child.say(
+    JSON.stringify({
+      type: 'user',
+      parent_tool_use_id: null,
+      session_id: 'sess-1',
+      tool_use_result: { interrupted: false },
+      message: {
+        role: 'user',
+        content: [{ type: 'tool_result', tool_use_id: 'authorized-compact', content: 'queued', is_error: false }],
+      },
+    }) + '\n',
+  );
+  child.say(
+    JSON.stringify({
+      type: 'assistant',
+      session_id: 'sess-1',
+      parent_tool_use_id: null,
+      uuid: 'authorized-final',
+      message: {
+        id: 'authorized-final',
+        role: 'assistant',
+        stop_reason: 'end_turn',
+        content: [{ type: 'text', text: 'Confirmed.' }],
+      },
+    }) + '\n',
+  );
+  child.say(JSON.stringify({ ...ending, uuid: 'authorized-ending', result_index: 5 }) + '\n');
+  child.say(sessionState('idle'));
+  assert.equal(h.compaction.requests.deliverable('sess-1').length, 1);
+  await h.compaction.drain('sess-1');
+  assert.equal(sentTexts(child).at(-1), '/compact');
+});
+
+// Admission protects the reader's authority. Readiness alone does not prove the request was queued.
+test.each([true, false])('joined reader compaction in the shared running turn, acknowledged %s', async (read) => {
+  const h = await joinedCompaction();
+  const first = await h.send('Finish the work.');
+  h.replay();
+  h.tool('foreground', 'echo working');
+  await h.send('then compact yourself');
+  if (read) h.replay();
+  h.tool('compact', h.literal(h.ids[0]));
+  assert.deepEqual(h.admission(h.ids[0]), read ? [undefined, 'queued'] : ['reader-acted', 'refused']);
+  assert.equal(h.owners.at(-1), first, 'the running work keeps its shared owner');
+  h.children[0].say(
+    JSON.stringify({
+      type: 'user',
+      parent_tool_use_id: null,
+      session_id: 'sess-1',
+      tool_use_result: { interrupted: false },
+      message: {
+        role: 'user',
+        content: [{ type: 'tool_result', tool_use_id: 'compact', content: 'queued', is_error: false }],
+      },
+    }) + '\n',
+  );
+  if (read) h.compaction.replyRetained(h.session, first);
+  const result = agentStartedTurns(h.window, h.ids).find((line) => line.includes('"type":"result"'))!;
+  h.children[0].say(result + '\n');
+  assert.equal(h.events.filter((event) => event.kind === 'turnEnd').at(-1)?.turnId, first);
+  if (read) {
+    assert.equal(
+      h.compaction.requests.deliverable('sess-1').length,
+      1,
+      'the request follows its successful shared ending',
+    );
+    h.children[0].say(sessionState('idle'));
+    await h.compaction.drain('sess-1');
+    assert.equal(sentTexts(h.children[0]).at(-1), '/compact');
+  }
+});
+
+test.each([
+  ['before notice', true],
+  ['after notice', true],
+  ['after wake', true],
+  ['after notice', false],
+] as const)('joined reader compaction after background work, idle %s, acknowledged %s', async (idle, read) => {
+  const h = await joinedCompaction();
+  const first = await h.send('Start the background work, then end the turn.');
+  h.replay();
+  const lines = agentStartedTurns(h.window, h.ids);
+  const result = lines.findIndex((line) => line.includes('"type":"result"'));
+  const notice = lines.findIndex(
+    (line, index) => index > result && line.includes('task_notification') && line.includes('"tool_use_id":"tool-8"'),
+  );
+  for (const line of lines.slice(0, result)) h.children[0].say(line + '\n');
+  await h.send('then compact yourself');
+  if (read) h.replay();
+  h.children[0].say(lines[result] + '\n');
+  if (idle === 'before notice') h.children[0].say(sessionState('idle'));
+  for (const line of lines.slice(result + 1, notice + 1)) h.children[0].say(line + '\n');
+  if (idle === 'after notice') h.children[0].say(sessionState('idle'));
+  h.children[0].say(sessionState('running'));
+  h.tool('compact', h.literal(h.ids[1]));
+  const owner = h.owners.at(-1)!;
+  if (idle === 'after wake') h.children[0].say(sessionState('idle'));
+  assert.deepEqual(h.admission(h.ids[1]), read ? [undefined, 'queued'] : ['reader-acted', 'refused']);
+  if (!read) return;
+  assert.equal(h.session.startedByAgent(owner), true);
+  assert.equal(
+    h.events.filter((event) => event.kind === 'wake').at(-1)?.turnId,
+    undefined,
+    'the completed joined submission cannot absorb the notice',
+  );
+  h.children[0].say(
+    JSON.stringify({
+      type: 'assistant',
+      session_id: 'sess-1',
+      parent_tool_use_id: null,
+      message: {
+        id: 'msg-20',
+        role: 'assistant',
+        stop_reason: 'end_turn',
+        content: [{ type: 'text', text: 'launched' }],
+      },
+    }) + '\n',
+  );
+  assert.equal(
+    h.events.filter((event) => event.kind === 'text').at(-1)?.turnId,
+    first,
+    'an established response ID retains its original owner',
+  );
+  h.children[0].say(
+    JSON.stringify({
+      type: 'user',
+      parent_tool_use_id: null,
+      session_id: 'sess-1',
+      tool_use_result: { interrupted: false },
+      message: {
+        role: 'user',
+        content: [{ type: 'tool_result', tool_use_id: 'compact', content: 'queued', is_error: false }],
+      },
+    }) + '\n',
+  );
+  h.children[0].say(
+    JSON.stringify({
+      type: 'assistant',
+      session_id: 'sess-1',
+      parent_tool_use_id: null,
+      uuid: 'final',
+      message: {
+        id: 'joined-final',
+        role: 'assistant',
+        stop_reason: 'end_turn',
+        content: [{ type: 'text', text: 'Work complete.' }],
+      },
+    }) + '\n',
+  );
+  assert.equal(
+    h.events.filter((event) => event.kind === 'text').at(-1)?.turnId,
+    owner,
+    'the final response belongs to the woken turn',
+  );
+  const ending = JSON.parse(lines.find((line) => line.includes('"runId":"run-11"'))!);
+  h.children[0].say(JSON.stringify(ending) + '\n');
+  assert.equal(h.events.filter((event) => event.kind === 'turnEnd').at(-1)?.turnId, owner);
+  assert.equal(h.compaction.requests.deliverable('sess-1').length, 0, 'the final response must be retained first');
+  h.replies.settle('sess-1', [{ finalResponse: { text: 'Work complete.', sourceId: 'joined-final' } }]);
+  assert.equal(h.compaction.requests.deliverable('sess-1').length, 1);
+  h.children[0].say(sessionState('idle'));
+  await h.compaction.drain('sess-1');
+  assert.equal(sentTexts(h.children[0]).at(-1), '/compact');
+});
+
+test.each(['Stop', 'queue', 'setting', 'unread send', 'answer'] as const)(
+  'joined reader compaction retains the reader-action guard after %s',
+  async (action) => {
+    const h = await joinedCompaction();
+    await h.send('Finish the work.');
+    h.replay();
+    await h.send('then compact yourself');
+    h.replay();
+    h.compaction.readerAction('sess-1', action === 'answer');
+    if (action === 'unread send') await h.send('New work.');
+    h.tool('compact', h.literal(h.ids[0]));
+    assert.deepEqual(h.admission(h.ids[0]), action === 'answer' ? [undefined, 'queued'] : ['reader-acted', 'refused']);
+  },
+);
+
+test('joined reader compaction keeps observed command bindings frozen across a receipt', async () => {
+  const h = await joinedCompaction();
+  await h.send('Finish the work.');
+  h.replay();
+  await h.send('then compact yourself');
+  h.tool('before-read', h.literal(h.ids[0]));
+  h.replay();
+  assert.deepEqual(h.admission(h.ids[0]), ['reader-acted', 'refused']);
+  h.tool('after-read', h.literal(h.ids[1]));
+  assert.deepEqual(h.admission(h.ids[1]), [undefined, 'queued']);
+});
+
+test('a stale joined reader receipt cannot rebind a newer reader turn or an agent-started turn', async () => {
+  const h = await joinedCompaction();
+  const first = await h.send('Finish the work.');
+  h.replay();
+  const joined = await h.send('then compact yourself');
+  const oldPrompt = h.children[0]
+    .sent()
+    .filter((line) => line.type === 'user')
+    .at(-1)!;
+  assert.equal(h.session.readerTurnOwner(joined), first);
+  h.children[0].say(COMPLETED_RESULT);
+  assert.equal(h.session.readerTurnOwner(joined), undefined);
+  h.tool('agent-started', 'echo awake');
+  const agentOwner = h.owners.at(-1)!;
+  h.replay(oldPrompt);
+  assert.equal(h.session.readerTurnOwner(joined), undefined);
+  assert.equal(h.session.startedByAgent(agentOwner), true);
+  h.children[0].say(COMPLETED_RESULT);
+  h.children[0].say(sessionState('idle'));
+  const newer = await h.send('New work.');
+  h.replay(oldPrompt);
+  assert.equal(h.session.readerTurnOwner(joined), undefined);
+  assert.equal(h.session.readerTurnOwner(newer), newer);
+  h.tool('compact', h.literal(h.ids[0]));
+  assert.deepEqual(h.admission(h.ids[0]), [undefined, 'queued']);
+  const stopping = h.session.interrupt();
+  h.children[0].answerControl('interrupt', {});
+  await stopping;
+  assert.equal(h.session.readerTurnOwner(newer), undefined);
+});
 
 async function readerCompactionAfterScopeRecovery(queuedReaderInput: boolean) {
   vi.stubGlobal('PANEL_CSS', '');
