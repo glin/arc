@@ -5,7 +5,7 @@ const path = require('node:path');
 const { spawnSync } = require('node:child_process');
 const { removeLegacyHooks } = require('./register-hooks.js');
 
-// Tests that start real processes run in the locked test:subprocess lane.
+// Tests that start real processes run in the test:subprocess lane.
 const SUBPROCESS = { tags: ['subprocess'] };
 
 const legacyDir = path.join(__dirname, '..', 'hooks').replace(/\\/g, '/');

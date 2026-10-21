@@ -286,8 +286,8 @@
   },
   "scripts/extension-test-runner.test.js": {
     "reason": "Real runner commands must classify files, reject invalid selection, and preserve browser readiness status.",
-    "cases": 65,
-    "matricesSha256": "2e494ce91c3bbeae5ad96aff67f7d3d713dff260a33978b6f3f333440d9baebd"
+    "cases": 68,
+    "matricesSha256": "0b198ae340bfe94c7701b26ffe6e624b39e81f6e14a1327f75ffef3f2c33a982"
   },
   "scripts/install-release.test.js": {
     "reason": "Release installation must extract actual archives and preserve isolated-home hooks, skills, and partial failures.",
@@ -311,8 +311,8 @@
   },
   "scripts/test-lanes.test.js": {
     "reason": "Linked command entry points must execute and retain process status. Direct checks guard category and admission drift.",
-    "cases": 20,
-    "matricesSha256": "fa9795d7e35b09d28a7cd6b60823e4f00992fc29f13d04eac82813d640b94240"
+    "cases": 14,
+    "matricesSha256": "1534f730defe590f469b50f85242e0a4e41a5ec178fd4444d132614ebd47346d"
   },
   "scripts/tool-scope.test.js": {
     "reason": "Real tool commands must respect repository scope and reject external configuration or stale packaged content.",

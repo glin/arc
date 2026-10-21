@@ -9,7 +9,7 @@ const { createRequire } = require('node:module');
 const { packageClaudePlugin } = require('./package-claude-plugin.js');
 const yauzl = createRequire(path.join(__dirname, '..', 'extension', 'package.json'))('yauzl');
 
-// Tests that start real processes run in the locked test:subprocess lane.
+// Tests that start real processes run in the test:subprocess lane.
 const SUBPROCESS = { tags: ['subprocess'] };
 
 const installer = path.join(__dirname, 'install-release.sh');

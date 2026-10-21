@@ -345,11 +345,11 @@ function killProcessTree(child, signal) {
 }
 
 // Both parent and child receive Ctrl+C on Windows.
-// Forward the signal and retain the lock until the child closes.
-// A deadline releases the lock and exits if shutdown hangs.
+// Forward the signal and retain any lock until the child closes.
+// A deadline exits if shutdown hangs.
 export function forwardSignalToChildAndRelease(
   child,
-  lock,
+  lock = null,
   {
     processEmitter = process,
     killTree = killProcessTree,
@@ -372,12 +372,12 @@ export function forwardSignalToChildAndRelease(
       observation?.event('run', 'cancellation', { signal });
       const fallbackTimer = scheduleFallback(() => {
         observation?.event('cleanup', 'shutdown-fallback', { signal, childClosed: false });
-        lock.release();
+        lock?.release();
         processEmitter.exit(SIGNAL_EXIT_CODES[signal]);
       }, hardFallbackMs);
       child.once('close', () => {
         cancelFallback(fallbackTimer);
-        lock.release();
+        lock?.release();
         processEmitter.exit(SIGNAL_EXIT_CODES[signal]);
       });
       killTree(child, signal);

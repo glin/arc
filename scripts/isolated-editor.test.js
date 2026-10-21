@@ -5,7 +5,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { pathToFileURL } = require('node:url');
 
-// Tests that start real processes run in the locked test:subprocess lane.
+// Tests that start real processes run in the test:subprocess lane.
 const SUBPROCESS = { tags: ['subprocess'] };
 
 let editor;

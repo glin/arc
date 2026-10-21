@@ -19,25 +19,12 @@ let lane;
 let defaults;
 let units;
 let integration;
-let browserLock;
 beforeAll(async () => {
   lane = await import(pathToFileURL(path.join(__dirname, 'test-subprocess.mjs')).href);
   defaults = await import(pathToFileURL(path.join(__dirname, 'test-default.mjs')).href);
   units = await import(pathToFileURL(path.join(__dirname, 'test-unit.mjs')).href);
   integration = await import(pathToFileURL(path.join(__dirname, 'test-integration.mjs')).href);
-  browserLock = await import('../extension/test/browserlock.mjs');
 });
-
-function admissionFixture() {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'arc-subprocess-admission-'));
-  return {
-    root,
-    lockPath: path.join(root, 'legacy.lock'),
-    slotRootPath: path.join(root, 'slots'),
-    legacyOptions: { scheduleHeartbeat: () => null, cancelHeartbeat: () => {} },
-    slotOptions: { isProcessAlive: () => true },
-  };
-}
 
 function rootTestFiles(directory = '') {
   const files = [];
@@ -202,6 +189,9 @@ test('command entry points run through a linked checkout', { tags: ['subprocess'
         assert.equal(terminal.exitCode, 7);
         assert.equal(terminal.parentRunId, 'linked-parent');
         assert.equal(terminal.complete, true);
+        assert.equal(terminal.capacity, null);
+        assert.equal(terminal.intervals.queue.durationMs, null);
+        assert.ok(events.every((event) => !Object.hasOwn(event, 'released')));
         assert.ok(terminal.intervals.execution.durationMs >= 0);
         assert.match(result.stdout, /Test timings: .*\.jsonl/);
       }
@@ -515,252 +505,35 @@ test('real window-channel and native background fixtures execute in integration'
   }
 });
 
-test('the subprocess lane holds a machine-wide place around Vitest and releases it with the status', async () => {
+test('independent subprocess launches start while earlier children remain pending and retain their statuses', async () => {
   const events = [];
-  const child = new EventEmitter();
-  const code = await lane.runSubprocessLane(['scripts/example.test.js'], {
+  const children = [];
+  const admission = Promise.withResolvers();
+  const options = {
     testRoot: repositoryRoot,
-    acquireLock: async (options) => {
-      events.push(['acquired', options.lockPath, options.deadlineMs, options.label]);
-      return {
-        release() {
-          events.push(['released']);
-          return true;
-        },
-      };
-    },
+    acquireLock: () => admission.promise,
     spawn: (command, args) => {
       events.push(['spawned', args.at(-1)]);
-      queueMicrotask(() => child.emit('close', 7));
+      const child = new EventEmitter();
+      children.push(child);
       return child;
     },
-  });
-  assert.equal(code, 7);
-  assert.deepEqual(events, [
-    ['acquired', lane.SUBPROCESS_LOCK_PATH, lane.SUBPROCESS_LOCK_DEADLINE_MS, 'subprocess'],
-    ['spawned', 'scripts/example.test.js'],
-    ['released'],
-  ]);
-  assert.ok(
-    lane.SUBPROCESS_LOCK_DEADLINE_MS >= 3 * 60 * 60_000,
-    'A queue of lanes on a loaded machine waits for hours.',
-  );
-  assert.notEqual(lane.SUBPROCESS_LOCK_PATH, path.join(os.tmpdir(), 'arc-browser-tests.lock'));
-});
-
-test('three subprocess lanes enter and a fourth waits without replacing live owners', async () => {
-  assert.equal(lane.SUBPROCESS_LANE_COUNT, 3);
-  const fixture = admissionFixture();
-  const permits = [];
-  let clock = 0;
-  let polls = 0;
+  };
+  const requests = [
+    lane.runSubprocessLane(['scripts/first.test.js'], options),
+    lane.runSubprocessLane(['scripts/second.test.js'], options),
+  ];
+  let statuses;
   try {
-    for (let index = 0; index < 3; index++) permits.push(await lane.acquireSubprocessSlot(fixture));
-    const legacyText = fs.readFileSync(fixture.lockPath, 'utf8');
-    const lastOwner = fs.readFileSync(path.join(fixture.slotRootPath, 'slot-2', 'owner.json'), 'utf8');
-    permits.push(
-      await lane.acquireSubprocessSlot({
-        ...fixture,
-        monotonicNow: () => clock,
-        waitForPoll: async (milliseconds) => {
-          polls++;
-          assert.equal(fs.readFileSync(fixture.lockPath, 'utf8'), legacyText);
-          assert.equal(fs.readFileSync(path.join(fixture.slotRootPath, 'slot-2', 'owner.json'), 'utf8'), lastOwner);
-          permits[1].release();
-          clock += milliseconds;
-        },
-      }),
-    );
-    assert.equal(polls, 1);
-    assert.equal(permits[3].index, 1);
+    assert.deepEqual(events, [
+      ['spawned', 'scripts/first.test.js'],
+      ['spawned', 'scripts/second.test.js'],
+    ]);
   } finally {
-    for (const permit of permits) permit.release();
-    fs.rmSync(fixture.root, { recursive: true, force: true });
+    admission.resolve({ release: () => true });
+    await Promise.resolve();
+    children.forEach((child, index) => child.emit('close', index === 0 ? 7 : 0));
+    statuses = await Promise.all(requests);
   }
+  assert.deepEqual(statuses, [7, 0]);
 });
-
-test('an owned legacy entry point consumes one place alongside two new subprocess lanes', async () => {
-  const fixture = admissionFixture();
-  const permits = [];
-  let polls = 0;
-  try {
-    permits.push(await browserLock.acquireBrowserLock({ ...fixture.legacyOptions, lockPath: fixture.lockPath }));
-    permits.push(await lane.acquireSubprocessSlot(fixture), await lane.acquireSubprocessSlot(fixture));
-    permits.push(
-      await lane.acquireSubprocessSlot({
-        ...fixture,
-        waitForPoll: async () => {
-          polls++;
-          permits[0].release();
-        },
-      }),
-    );
-    assert.equal(polls, 1);
-    assert.equal(permits[3].index, undefined);
-    assert.equal(fs.existsSync(fixture.lockPath), true);
-  } finally {
-    for (const permit of permits) permit.release();
-    fs.rmSync(fixture.root, { recursive: true, force: true });
-  }
-});
-
-test('a subprocess counted place recovers a dead owner without retiring an existing legacy lock', async () => {
-  const fixture = admissionFixture();
-  const legacyText = JSON.stringify({ pid: 12345, cwd: '/legacy', startedAt: 'earlier' });
-  fs.writeFileSync(fixture.lockPath, legacyText);
-  const slot = path.join(fixture.slotRootPath, 'slot-1');
-  fs.mkdirSync(slot, { recursive: true });
-  fs.writeFileSync(path.join(slot, 'owner.json'), JSON.stringify({ pid: 23456, token: 'dead' }));
-  let permit;
-  try {
-    permit = await lane.acquireSubprocessSlot({
-      ...fixture,
-      legacyOptions: { ...fixture.legacyOptions, isProcessAlive: () => false },
-      slotOptions: { isProcessAlive: () => false },
-    });
-    assert.equal(permit.index, 1);
-    assert.equal(fs.readFileSync(fixture.lockPath, 'utf8'), legacyText);
-    assert.equal(JSON.parse(fs.readFileSync(path.join(slot, 'owner.json'), 'utf8')).pid, process.pid);
-  } finally {
-    permit?.release();
-    fs.rmSync(fixture.root, { recursive: true, force: true });
-  }
-});
-
-test.each(['publication', 'claim'])('subprocess admission preserves an ambiguous counted %s', async (state) => {
-  const fixture = admissionFixture();
-  const permits = [];
-  const slot = path.join(fixture.slotRootPath, 'slot-2');
-  try {
-    permits.push(await lane.acquireSubprocessSlot(fixture), await lane.acquireSubprocessSlot(fixture));
-    fs.mkdirSync(slot);
-    if (state === 'claim') {
-      fs.writeFileSync(path.join(slot, 'owner.json'), JSON.stringify({ pid: 1300, token: 'dead' }));
-      fs.mkdirSync(path.join(slot, '.claim-stale-dead'));
-    }
-    const before = fs.readdirSync(slot);
-    await assert.rejects(
-      lane.acquireSubprocessSlot({
-        ...fixture,
-        deadlineMs: 0,
-        slotOptions: { now: () => Date.now() + 10_000, isProcessAlive: (pid) => pid !== 1300 },
-      }),
-      /Timed out waiting for one of 3 subprocess test places/,
-    );
-    assert.deepEqual(fs.readdirSync(slot), before);
-    if (state === 'claim')
-      assert.equal(JSON.parse(fs.readFileSync(path.join(slot, 'owner.json'), 'utf8')).token, 'dead');
-  } finally {
-    for (const permit of permits) permit.release();
-    fs.rmSync(fixture.root, { recursive: true, force: true });
-  }
-});
-
-test.each(['live', 'dead', 'incomplete'])(
-  'a full subprocess pool preserves a %s legacy lock through the monotonic deadline',
-  async (owner) => {
-    const fixture = admissionFixture();
-    const permits = [];
-    let clock = 0;
-    const waits = [];
-    try {
-      const legacyText = owner === 'incomplete' ? '' : JSON.stringify({ pid: 12345 });
-      fs.writeFileSync(fixture.lockPath, legacyText);
-      for (let index = 0; index < 2; index++) permits.push(await lane.acquireSubprocessSlot(fixture));
-      await assert.rejects(
-        lane.acquireSubprocessSlot({
-          ...fixture,
-          deadlineMs: 750,
-          monotonicNow: () => clock,
-          legacyOptions: { ...fixture.legacyOptions, isProcessAlive: () => owner === 'live' },
-          waitForPoll: async (milliseconds) => {
-            waits.push(milliseconds);
-            clock += milliseconds;
-          },
-        }),
-        /Timed out waiting for one of 3 subprocess test places/,
-      );
-      assert.deepEqual(waits, [500, 250]);
-      assert.equal(fs.readFileSync(fixture.lockPath, 'utf8'), legacyText);
-    } finally {
-      for (const permit of permits) permit.release();
-      fs.rmSync(fixture.root, { recursive: true, force: true });
-    }
-  },
-);
-
-test.each(['legacy', 'counted', 'legacy-replaced', 'counted-replaced', 'timeout', 'cancelled'])(
-  'combined subprocess admission retains one queue interval and resource events for %s',
-  async (mode) => {
-    const fixture = admissionFixture();
-    const permits = [];
-    const events = [];
-    let clock = 0;
-    const observation = {
-      begin: (phase, detail) => events.push(['begin', phase, detail]),
-      end: (phase, detail) => events.push(['end', phase, detail]),
-      event: (phase, event, detail) => events.push([event, phase, detail]),
-    };
-    try {
-      const waiting = mode === 'timeout' || mode === 'cancelled';
-      const counted = mode.startsWith('counted');
-      const occupied = waiting ? 3 : counted ? 1 : 0;
-      for (let index = 0; index < occupied; index++) permits.push(await lane.acquireSubprocessSlot(fixture));
-      const acquire = lane.acquireSubprocessSlot({
-        ...fixture,
-        observation,
-        monotonicNow: () => clock,
-        now: () => 1_700_000_000_000 + clock,
-        deadlineMs: 750,
-        waitForPoll: async (milliseconds) => {
-          if (mode === 'cancelled') throw new Error('Admission cancelled');
-          clock += milliseconds;
-        },
-      });
-      if (waiting) {
-        await assert.rejects(acquire, mode === 'cancelled' ? /Admission cancelled/ : /Timed out/);
-        const holderEvents = events.filter(([event]) => event === 'holders');
-        assert.equal(holderEvents.length, 1);
-        assert.equal(holderEvents[0][2].holders.length, 3);
-        assert.equal(holderEvents[0][2].queuePosition, null);
-        assert.ok(holderEvents[0][2].holders.every(({ owner }) => owner.pid === process.pid));
-        assert.equal(events.filter(([event]) => event === 'acquired' || event === 'release').length, 0);
-        assert.match(events.find(([event]) => event === 'end')[2].error, /cancelled|Timed out/);
-      } else {
-        const permit = await acquire;
-        permits.push(permit);
-        if (mode.endsWith('replaced')) {
-          if (counted)
-            fs.writeFileSync(
-              path.join(fixture.slotRootPath, 'slot-1', 'owner.json'),
-              JSON.stringify({ pid: process.pid, token: 'replacement' }),
-            );
-          else fs.writeFileSync(fixture.lockPath, JSON.stringify({ pid: process.pid + 1 }));
-        }
-        assert.equal(permit.release(), !mode.endsWith('replaced'));
-        assert.equal(permit.release(), false);
-        const resources = events.filter(([, phase]) => phase === 'resource');
-        assert.deepEqual(
-          resources.map(([event]) => event),
-          ['acquired', 'release'],
-        );
-        assert.equal(resources[1][2].released, !mode.endsWith('replaced'));
-        assert.equal(resources[1][2].heldMs, 0);
-        assert.equal(
-          counted ? resources[0][2].rootPath : resources[0][2].lockPath,
-          counted ? fixture.slotRootPath : fixture.lockPath,
-        );
-      }
-      assert.deepEqual(
-        events
-          .filter(([, phase]) => phase === 'queue')
-          .filter(([event]) => event === 'begin' || event === 'end')
-          .map(([event]) => event),
-        ['begin', 'end'],
-      );
-    } finally {
-      for (const permit of permits) permit.release();
-      fs.rmSync(fixture.root, { recursive: true, force: true });
-    }
-  },
-);

@@ -2,7 +2,7 @@ const assert = require('node:assert/strict');
 const { EventEmitter } = require('node:events');
 const { runChecks } = require('./typecheck-parallel.js');
 
-// Tests that start real processes run in the locked test:subprocess lane.
+// Tests that start real processes run in the test:subprocess lane.
 const SUBPROCESS = { tags: ['subprocess'] };
 
 // A check that exits with the given code and prints a line naming itself, so a test can tell

@@ -5,19 +5,21 @@ const path = require('node:path');
 const { spawnSync } = require('node:child_process');
 const { EventEmitter } = require('node:events');
 
-// Tests that start real processes run in the counted test:subprocess lane.
+// Tests that start real processes run in the test:subprocess lane.
 const SUBPROCESS = { tags: ['subprocess'] };
 
 let runner;
 let browserChannels;
 let browserLock;
 let observations;
+let subprocessLane;
 beforeAll(async () => {
-  [runner, browserChannels, browserLock, observations] = await Promise.all([
+  [runner, browserChannels, browserLock, observations, subprocessLane] = await Promise.all([
     import('../extension/test.mjs'),
     import('../extension/test/browserchannels.mjs'),
     import('../extension/test/browserlock.mjs'),
     import('../extension/test/observations.mjs'),
+    import('./test-subprocess.mjs'),
   ]);
 });
 
@@ -45,6 +47,68 @@ function timingFixture(options = {}) {
   });
   return { observation, events, errors, notices, emitter, advance: (milliseconds) => (clock += milliseconds) };
 }
+
+test('subprocess observations retain child outcomes without queue or release claims', async () => {
+  const reportError = vi.spyOn(console, 'error').mockImplementation(() => {});
+  for (const outcome of [
+    { code: 0, signal: null, expected: 0, result: 'success' },
+    { code: 7, signal: null, expected: 7, result: 'failure' },
+    { code: null, signal: 'SIGTERM', expected: 1, result: 'cancelled' },
+    { error: new Error('spawn EPERM'), expected: 1, result: 'failure' },
+  ]) {
+    const timing = timingFixture({ lane: 'subprocess', workerCap: subprocessLane.SUBPROCESS_WORKERS });
+    const child = new EventEmitter();
+    child.pid = 42;
+    const request = subprocessLane.runSubprocessLane([], {
+      testRoot: '/fixture',
+      observation: timing.observation,
+      spawn: (_command, _args, options) => {
+        assert.equal(options.env.ARC_TEST_OBSERVATION_RUN_ID, 'fixture-run');
+        return child;
+      },
+    });
+    if (outcome.error) child.emit('error', outcome.error);
+    child.emit('close', outcome.code ?? null, outcome.signal);
+    assert.equal(await request, outcome.expected);
+    const result = timing.events.at(-1);
+    assert.equal(result.event, 'result');
+    assert.equal(result.outcome, outcome.result);
+    assert.equal(result.exitCode, outcome.error ? 1 : outcome.code);
+    assert.equal(result.signal, outcome.signal ?? null);
+    assert.equal(result.reason, outcome.error?.message ?? null);
+    assert.equal(result.capacity, null);
+    assert.equal(result.complete, true);
+    assert.equal(result.intervals.queue.durationMs, null);
+    assert.match(result.intervals.queue.reason, /no shared admission queue/);
+    assert.equal(timing.events.filter((event) => event.event === 'release').length, 0);
+    assert.ok(timing.events.every((event) => !Object.hasOwn(event, 'released')));
+    assert.equal(timing.events.filter((event) => event.event === 'child-start')[0].childPid, 42);
+    assert.equal(timing.events.filter((event) => event.phase === 'execution' && event.event === 'end').length, 1);
+  }
+  assert.equal(reportError.mock.calls.length, 1);
+});
+
+test('a thrown subprocess start retains the failure and marks unattached cleanup unavailable', async () => {
+  const timing = timingFixture({ lane: 'subprocess' });
+  await assert.rejects(
+    subprocessLane.runSubprocessLane([], {
+      observation: timing.observation,
+      spawn: () => {
+        throw new Error('spawn unavailable');
+      },
+    }),
+    /spawn unavailable/,
+  );
+  const result = timing.events.at(-1);
+  assert.equal(result.outcome, 'failure');
+  assert.equal(result.reason, 'spawn unavailable');
+  assert.equal(result.complete, true);
+  assert.equal(result.intervals.cleanup.durationMs, null);
+  assert.equal(
+    timing.events.find((event) => event.phase === 'execution' && event.event === 'end').error,
+    'spawn unavailable',
+  );
+});
 
 test('timing records keep monotonic stages, whole wall, identities and nested runs separate', () => {
   const { observation, events, advance, emitter } = timingFixture({
@@ -1331,6 +1395,58 @@ test('forwarding a signal kills the child, releases the lock only after it close
   assert.deepEqual(exitCodes, [130]);
   detach();
   assert.equal(processEmitter.listenerCount('SIGINT'), baseline);
+});
+
+test('signal forwarding without a lock retains child shutdown and mapped exits', () => {
+  for (const [signal, expected] of [
+    ['SIGHUP', 129],
+    ['SIGINT', 130],
+    ['SIGTERM', 143],
+  ]) {
+    for (const fallback of [false, true]) {
+      const processEmitter = new EventEmitter();
+      const child = new EventEmitter();
+      const killed = [];
+      const exited = [];
+      const cancelled = [];
+      const events = [];
+      let scheduled;
+      processEmitter.exit = (code) => exited.push(code);
+      const detach = browserLock.forwardSignalToChildAndRelease(child, null, {
+        processEmitter,
+        killTree: (target, receivedSignal) => {
+          assert.equal(target, child);
+          killed.push(receivedSignal);
+        },
+        scheduleFallback: (callback, milliseconds) => {
+          assert.equal(milliseconds, 5_000);
+          scheduled = callback;
+          return 'fallback';
+        },
+        cancelFallback: (timer) => cancelled.push(timer),
+        observation: { event: (...event) => events.push(event) },
+      });
+      try {
+        processEmitter.emit(signal);
+        processEmitter.emit(signal);
+        assert.deepEqual(killed, [signal]);
+        assert.deepEqual(exited, []);
+        assert.deepEqual(events[0], ['run', 'cancellation', { signal }]);
+        if (fallback) {
+          scheduled();
+          assert.deepEqual(events[1], ['cleanup', 'shutdown-fallback', { signal, childClosed: false }]);
+          assert.deepEqual(cancelled, []);
+        } else {
+          child.emit('close');
+          assert.deepEqual(cancelled, ['fallback']);
+        }
+        assert.deepEqual(exited, [expected]);
+      } finally {
+        detach();
+      }
+      assert.equal(processEmitter.listenerCount(signal), 0);
+    }
+  }
 });
 
 test('the browser lane fails without a browser and releases the lock after detection', async () => {

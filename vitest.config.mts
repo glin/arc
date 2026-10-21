@@ -16,7 +16,7 @@ export default defineConfig({
       {
         name: 'subprocess',
         description:
-          'Starts real processes such as Git Bash, git, node, or an installer. These tests run in the locked test:subprocess lane.',
+          'Starts real processes such as Git Bash, git, node, or an installer. These tests run in the test:subprocess lane.',
         // One process start costs 0.4 to 1.2 s on a loaded Windows machine, and one installer run starts about twenty.
         timeout: 120_000,
       },
