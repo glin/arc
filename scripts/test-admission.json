@@ -191,8 +191,8 @@
   },
   "extension/src/startup.test.ts": {
     "reason": "Real title workers must publish recovered metadata through startup ownership and cancellation boundaries.",
-    "cases": 201,
-    "matricesSha256": "477688194156018bd629407ea1de8dd1e18c81d4093e65edf9f2bc0e055d6d31"
+    "cases": 206,
+    "matricesSha256": "928f2866c87c91c100ac0fda2afad6ef9060526f06fbf725509096d0d3a52c55"
   },
   "extension/src/store.test.ts": {
     "reason": "The real Stop hook must renew retention for useful snapshot stores without changing workspace files.",
@@ -282,7 +282,7 @@
   "scripts/editor-cli.test.js": {
     "reason": "Editor launch and installer shell commands must preserve quoting, cancellation, native entry selection, manifest and lockfile bytes, and component outcomes.",
     "cases": 58,
-    "matricesSha256": "272a32ef37040a201f835c5d434e5e92b8ea93133aa2849e9b29cc4e51dd2205"
+    "matricesSha256": "3b0c500866ba7648bec9d1165c25895ce1740d940c2003f8d133f96a29a399d6"
   },
   "scripts/extension-test-runner.test.js": {
     "reason": "Real runner commands must classify files, reject invalid selection, and preserve browser readiness status.",
