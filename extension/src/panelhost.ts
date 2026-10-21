@@ -175,6 +175,7 @@ import {
 } from './codex';
 import { AgentSpendRef, spendFileVersion, type AgentSpend } from './agentspend';
 import { RepositoryCommits, nodeGitRunner, type GitRunner } from './gitcommits';
+import { CommitRepositories } from './commitrepositories';
 import { CommitRepositoryReservations, commitRepositorySourceKey } from './progressiveworker';
 import {
   COMMIT_REPOSITORY_PARSER_VERSION,
@@ -1295,6 +1296,11 @@ export class PanelProvider implements vscode.Disposable {
   private cache = new Map<string, CacheEntry>();
   // Background commit reads refresh affected turns without delaying the initial render.
   private repositoryCommits = new RepositoryCommits(nodeGitRunner(), () => void this.refresh(true));
+  private commitRepositories = new CommitRepositories(nodeGitRunner(), () => {
+    this.derivedCacheCheckpointState.markChanged();
+    this.checkpointDerivedCache();
+    void this.refresh(true);
+  });
   private readonly repositoryScope: RepositoryScope;
   private repositoryScopeReady = false;
   private repositoryScopeRoots: string[] = [];
@@ -3053,6 +3059,7 @@ export class PanelProvider implements vscode.Disposable {
       this.claudeChildReferenceEntries = cached.claudeChildReferences;
       this.discoveryCheckpoint = cached.discovery;
       this.carriedNames = cached.carriedNames;
+      this.commitRepositories.load(cached.commitRepositories ?? []);
     }
     this.startupCache = {
       file: this.derivedCacheFile ?? null,
@@ -9054,6 +9061,7 @@ export class PanelProvider implements vscode.Disposable {
           this.carriedNames,
           undefined,
           this.discoveryCheckpoint,
+          this.commitRepositories.snapshot(),
         );
       if (this.workspaceCache) return this.workspaceCache.write(write, this.cacheShutdownFlushing, file) && openings;
       write();
@@ -10970,10 +10978,12 @@ export class PanelProvider implements vscode.Disposable {
     return 'unknown';
   }
 
-  // Drop names only when physical coverage proves the source absent.
-  // True when anything was dropped, so the caller marks the cache for its next save.
+  // Drop cached source facts only when physical coverage proves the source absent.
+  // True when saved rows were dropped, so the caller marks the cache for its next save.
   private pruneDerivedTitles(listed: ReadonlySet<string>): boolean {
-    let dropped = false;
+    let dropped = this.commitRepositories.prune(
+      (file) => !listed.has(file) && this.physicalMembershipOf(file) === 'absent',
+    );
     for (const held of [this.titles, this.carriedNames]) {
       for (const file of held.keys()) {
         if (!listed.has(file) && this.physicalMembershipOf(file) === 'absent') {
@@ -11753,7 +11763,7 @@ export class PanelProvider implements vscode.Disposable {
     }
     const turns = this.commitRepositoryTurns(session, hit.read.turns);
     this.applyCommitRepositoryEvidence(session, turns);
-    this.repositoryCommits.apply(turns, this.folders());
+    this.applyCommitRepositories(session, turns);
     return { read: hit.read, maxTurns: Math.max(maxTurns, hit.read.turns.length), revision: hit.revision };
   }
 
@@ -11762,6 +11772,30 @@ export class PanelProvider implements vscode.Disposable {
       ...turns,
       ...historyRecordsOutside(this.history?.get(session.sessionId)?.pages ?? [], { turns, compactions: [] }).turns,
     ];
+  }
+
+  private applyCommitRepositories(session: SessionFile, turns: Turn[]): void {
+    const metas = claudeSubagentMetaReader();
+    const fileOf = (agent?: import('./transcript').TurnAgent) =>
+      agent
+        ? this.agentFile(
+            session,
+            {
+              id: agent.id,
+              toolUseId: agent.toolUseId,
+              name: agent.description,
+              path: agent.agentType,
+              status: agent.status,
+            },
+            metas,
+          )
+        : session.file;
+    this.repositoryCommits.apply(
+      turns,
+      this.folders(),
+      (commit, identities, _turn, agent) => this.commitRepositories.apply(commit, fileOf(agent), identities),
+      (intent, identities, _turn, agent) => this.commitRepositories.restore(intent, fileOf(agent), identities),
+    );
   }
 
   private commitRepositoryContexts(
@@ -12268,7 +12302,7 @@ export class PanelProvider implements vscode.Disposable {
       if (this.cache.get(current.file)?.read !== result.value.read) return;
       const turns = this.commitRepositoryTurns(enriched, result.value.read.turns);
       this.applyCommitRepositoryEvidence(enriched, turns);
-      this.repositoryCommits.apply(turns, this.folders());
+      this.applyCommitRepositories(enriched, turns);
       // Completion requires the owning panel to accept this window and its enriched commit rows.
       const visible = new Set(this.cards.filter((card) => 'commits' in card).map((card) => card.key));
       const sender = work.host ? this.rowSenders?.get(work.host) : undefined;

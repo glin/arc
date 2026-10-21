@@ -62,6 +62,8 @@ import {
   discoverClaudeChildSessions,
   discoverClaudeNewestTurn,
   normalizeFsPath,
+  commitSourceStamp,
+  bindCommitSources,
   readClaudeAgentSpend,
   resolveClaudeDispatchReferences,
   scanClaudeRelationshipQuantum,
@@ -1232,6 +1234,7 @@ async function execute(
     };
   }
   if (request.kind === 'page') {
+    const sourceStamp = commitSourceStamp(session.file);
     if (request.cursor) {
       request.cursor.fragment = Buffer.from(request.cursor.fragment);
     }
@@ -1251,6 +1254,7 @@ async function execute(
             { signal, targetTurns: 20 },
             options,
           );
+    if (result.kind === 'page') bindCommitSources(result.page.turns, session.file, sourceStamp);
     return {
       kind: 'page',
       recoveryBytes: result.kind === 'page' ? (result.page.recoveryBytes ?? 0) : 0,
@@ -1293,6 +1297,7 @@ async function execute(
   const retainedBytes = checkpoint
     ? Math.max(tailBytes, Number(JSON.parse(checkpoint.parserKey).tailBytes) || tailBytes)
     : tailBytes;
+  const sourceStamp = commitSourceStamp(session.file);
   let result = await read(retainedBytes);
   if (!result.read) {
     return { kind: 'stale', recoveryBytes };
@@ -1331,6 +1336,8 @@ async function execute(
     session.agent === 'codex'
       ? children.filter((child) => child.parentThreadId === session.sessionId).map((child) => child.file)
       : [];
+  if (!result.checkpoint.lineFragment.length && !result.checkpoint.discardUntilNewline)
+    bindCommitSources(result.read.turns, session.file, sourceStamp);
   return {
     kind: 'window',
     read: result.read,

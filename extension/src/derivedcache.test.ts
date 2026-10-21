@@ -5,6 +5,74 @@ import { tempDir } from './temproot.ts';
 import * as path from 'node:path';
 import { normalizeFsPath, scanClaudeRelationshipQuantum, RelationshipReader } from './transcript';
 import { scanCodexDispatchReferencesAsync } from './codex';
+import { commitSourceStamp } from './transcript';
+import {
+  MAX_COMMIT_REPOSITORIES,
+  MAX_SOURCE_COMMIT_REPOSITORIES,
+  MAX_COMMIT_REPOSITORY_BYTES,
+  boundedCommitRepositories,
+  type VerifiedCommitRepository,
+} from './commitrepositories';
+
+test('verified commit cache bounds and validates its independent observation format', () => {
+  const directory = folder();
+  const file = path.join(directory, 'source.jsonl');
+  const cache = path.join(directory, 'cache.json');
+  fs.writeFileSync(file, '{}\n');
+  const row: VerifiedCommitRepository = {
+    version: 2,
+    file,
+    stamp: commitSourceStamp(file)!,
+    dir: directory,
+    occurrence: '1'.repeat(64),
+    sha: 'a'.repeat(40),
+    root: { path: directory, dev: '1', ino: '2' },
+    command: { path: directory, dev: '1', ino: '2' },
+    common: { path: path.join(directory, '.git'), dev: '1', ino: '3' },
+  };
+  const rows = Array.from({ length: MAX_SOURCE_COMMIT_REPOSITORIES + 1 }, (_, index) => ({
+    ...row,
+    occurrence: index.toString(16).padStart(64, '0'),
+  }));
+  saveDerivedCache(cache, [], [], [], undefined, undefined, [...rows, row]);
+  assert.equal(loadDerivedCache(cache).commitRepositories?.length, MAX_SOURCE_COMMIT_REPOSITORIES);
+  const stored = JSON.parse(fs.readFileSync(cache, 'utf8'));
+  for (const invalid of [
+    { ...row, version: 1 },
+    { ...row, sha: 'a'.repeat(8) },
+    { ...row, stamp: { ...row.stamp, mtimeNs: '0' } },
+    { ...row, root: { ...row.root, ino: '0' } },
+    {
+      ...row,
+      recovered: {
+        intent: 'quiet',
+        commit: { sha: 'b'.repeat(8), subject: 'Fix', at: 1, files: 1, added: 1, removed: 0 },
+      },
+    },
+    {
+      ...row,
+      recovered: {
+        intent: 'quiet',
+        commit: { sha: 'a'.repeat(8), subject: 'Fix', at: 1, files: -1, added: 1, removed: 0 },
+      },
+    },
+  ]) {
+    stored.commitRepositories = [invalid];
+    fs.writeFileSync(cache, JSON.stringify(stored));
+    assert.deepEqual(loadDerivedCache(cache).commitRepositories, []);
+  }
+  const many = Array.from({ length: MAX_COMMIT_REPOSITORIES + 1 }, (_, index) => ({
+    ...row,
+    file: path.join(directory, `${index}.jsonl`),
+  }));
+  assert.equal(boundedCommitRepositories(many).length, MAX_COMMIT_REPOSITORIES);
+  const large = many.map((item) => ({ ...item, dir: 'x'.repeat(4096) }));
+  const bounded = boundedCommitRepositories(large);
+  assert.ok(bounded.length < large.length);
+  assert.ok(
+    bounded.reduce((bytes, item) => bytes + Buffer.byteLength(JSON.stringify(item)), 0) <= MAX_COMMIT_REPOSITORY_BYTES,
+  );
+});
 
 test('Codex skipped relationship records retain incomplete coverage through cache reload', () => {
   const directory = folder();

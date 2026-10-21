@@ -52,6 +52,8 @@ import {
   isEphemeralPath,
   folderMatcher,
   normalizeFsPath,
+  commitSourceStamp,
+  bindCommitSources,
   sameCommitSha,
   revisionOf,
   readQualifiedOpening,
@@ -4238,6 +4240,7 @@ function* readCodexOwnSpendIncremental(file: string): Generator<{ bytes: number;
   let effort: string | null = null;
   let incompleteRequests = 0;
   let lastLine = '';
+  const sourceStamp = commitSourceStamp(file);
   const revision = spendFileVersion(file);
   const child = createCodexSessionReducer(
     meta?.sessionId ?? path.basename(file, path.extname(file)),
@@ -4323,6 +4326,7 @@ function* readCodexOwnSpendIncremental(file: string): Generator<{ bytes: number;
   partial ||= Object.keys(usageState.pendingClaudeResults).length > 0;
   const usageIncomplete = incompleteRequests > 0;
   const turns = child.finish(0).turns;
+  if (found && lastLineWhole(lastLine)) bindCommitSources(turns, file, sourceStamp);
   // Only the child's own turns are timed. Turns of other sessions in the rollout add nothing.
   const measured = summedTurnRate(turns.filter((turn) => turn.sessionId === meta?.sessionId));
   const artifacts = reduceChildArtifacts(

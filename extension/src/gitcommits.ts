@@ -12,6 +12,8 @@ import {
   HEX_SHA,
   LandingIntent,
   Turn,
+  TurnCommit,
+  TurnAgent,
   isInside,
   normalizeFsPath,
   parseStatLine,
@@ -384,13 +386,28 @@ export class RepositoryCommits {
   private readonly attempts = new Map<string, number>();
   private readonly asking = new Set<string>();
   private work: Promise<void> = Promise.resolve();
+  private openFolders: string[] = [];
 
   constructor(
     private readonly runner: GitRunner,
     private readonly onFilled: () => void,
   ) {}
 
-  apply(turns: Turn[], folders: string[]): void {
+  apply(
+    turns: Turn[],
+    folders: string[],
+    retained?: (commit: TurnCommit, identities: string[], turn: Turn, agent?: TurnAgent) => boolean,
+    restore?: (intent: CommitIntent, identities: string[], turn: Turn, agent?: TurnAgent) => TurnCommit[] | null,
+  ): void {
+    const nextFolders = folders.map(normalizeFsPath).sort();
+    if (JSON.stringify(nextFolders) !== JSON.stringify(this.openFolders)) {
+      for (const folder of [...this.openFolders, ...nextFolders]) {
+        this.identities.delete(folder);
+        this.attempts.delete(folder);
+      }
+      this.exactAnswers.clear();
+      this.openFolders = nextFolders;
+    }
     let cleared = false;
     const wanted: CommitIntent[] = [];
     const merged: LandingIntent[] = [];
@@ -402,18 +419,36 @@ export class RepositoryCommits {
       const owners = [
         turn,
         ...turn.agents.map((agent) => ({
+          childAgent: agent,
           commits: (agent.commits ??= []),
           commitIntents: agent.commitIntents,
         })),
       ];
       for (const owner of owners) {
+        const restoredCommits = new Set<TurnCommit>();
         for (const intent of owner.commitIntents ?? []) {
+          const restored = restore?.(
+            intent,
+            folderIdentities,
+            turn,
+            'childAgent' in owner ? owner.childAgent : undefined,
+          );
+          if (restored != null) {
+            for (const commit of restored) {
+              if (!owner.commits.some((one) => sameCommitSha(one.sha, commit.sha))) {
+                owner.commits.push(commit);
+                restoredCommits.add(commit);
+              }
+            }
+            owner.commits.sort((a, b) => a.at - b.at);
+            continue;
+          }
           const exact =
             intent.witnessedSha === undefined || !this.unknownIdentity(intent.dir)
               ? undefined
               : this.exactAnswers.get(exactKey(intent.witnessedSha, folders));
           if (exact !== undefined) {
-            this.adopt(owner, { found: [exact.commit], head: null }, exact.dir, folderIdentities, folders);
+            this.adopt(owner, { found: [exact.commit], head: null }, exact.dir, folderIdentities, folders, intent);
             continue;
           }
           const key = intentKey(intent);
@@ -436,10 +471,17 @@ export class RepositoryCommits {
             this.want(intent.dir, dirs);
             continue;
           }
-          this.adopt(owner, answer, intent.dir, folderIdentities, folders);
+          this.adopt(owner, answer, intent.dir, folderIdentities, folders, intent);
+          for (const commit of owner.commits) {
+            if (intent.source && answer.found.some((one) => sameCommitSha(one.sha, commit.sha)))
+              commit.source = intent.source;
+          }
         }
         // Classify printed commits by repository identity as well as path, so linked worktrees retain their project's ownership.
         for (const commit of owner.commits) {
+          if (restoredCommits.has(commit)) continue;
+          if (retained?.(commit, folderIdentities, turn, 'childAgent' in owner ? owner.childAgent : undefined))
+            continue;
           if (commit.candidates) {
             const evidence = commit.candidates;
             if (!evidence.complete) {
@@ -588,6 +630,7 @@ export class RepositoryCommits {
     dir: string,
     folderIdentities: string[],
     folders: string[],
+    intent?: CommitIntent,
   ): void {
     const identity = this.identities.get(normalizeFsPath(dir)) ?? UNKNOWN_PLACE;
     const place = placeOf(dir, identity, folderIdentities, folders);
@@ -599,6 +642,7 @@ export class RepositoryCommits {
         continue;
       }
       turn.commits.push({
+        ...(intent?.source ? { intent: intentKey(intent), source: intent.source } : {}),
         sha,
         subject: one.subject,
         head: answer.head,

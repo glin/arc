@@ -6107,6 +6107,58 @@ for (const agent of ['claude', 'codex'] as const) {
   });
 }
 
+test.each(['claude', 'codex'] as const)('%s history page commits retain accepted source identity', async (agent) => {
+  const directory = tempDir('commit-page-source-');
+  const file = path.join(directory, 'session.jsonl');
+  const command = 'git commit -m "Fix"';
+  const stdout = '[topic abc12345] Fix\n 1 file changed, 1 insertion(+)';
+  const records: object[] = [
+    ...(agent === 'codex' ? opening(agent).slice(0, 1) : []),
+    ...detailedTurn(agent, 1, true, command),
+  ];
+  records.splice(
+    records.length - 1,
+    0,
+    agent === 'claude'
+      ? {
+          type: 'user',
+          timestamp: timestamp(6),
+          message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tool-1', content: stdout }] },
+          toolUseResult: { stdout, stderr: '', gitOperation: 'commit' },
+        }
+      : {
+          type: 'response_item',
+          timestamp: timestamp(6),
+          payload: {
+            type: 'function_call_output',
+            call_id: 'tool-1',
+            output: 'Process exited with code 0\nFinal output:\n' + stdout,
+          },
+        },
+  );
+  fs.writeFileSync(file, records.map((row) => JSON.stringify({ ...row, cwd: 'C:/repo' })).join('\n') + '\n');
+  const { mtimeMs, size } = revisionOf(fs.statSync(file, { bigint: true }));
+  const input: ProgressiveInput = {
+    session: { file, sessionId: 'session', agent, mtimeMs, size },
+    folders: [],
+    children: [],
+    maxTurns: 40,
+    tailBytes: 2048,
+  };
+  const worker = new ProgressiveWorker(source);
+  try {
+    const result = await worker.run({ kind: 'page', input, cursor: null }, 1, new AbortController().signal);
+    assert.ok(result?.value.kind === 'page' && result.value.page.kind === 'page');
+    const commits = result.value.page.turns.flatMap((turn) => turn.commits);
+    assert.equal(commits.length, 1, JSON.stringify(result.value.page));
+    assert.equal(commits[0].source?.file, file);
+    assert.equal(commits[0].source?.stamp.size, size);
+  } finally {
+    worker.stop();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test('the Claude worker preserves the exact child close time', async () => {
   const directory = tempDir('panel-progressive-claude-close-');
   const file = path.join(directory, 'session.jsonl');

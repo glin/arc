@@ -1,3 +1,4 @@
+import { CommitRepositories } from './commitrepositories';
 import { sessionPageSources } from './sessionreads';
 import { sessionCoverageMember, reconcileSessionCollisions } from './sessioncoverage';
 import { runningKey } from './composerview';
@@ -1793,6 +1794,7 @@ function metadataEnrichmentFixture(sessions: any[], source = getProgressiveWorke
     metadataRevision: 0,
     drawnMetadataRevision: 0,
     codexMetas: new Map(),
+    commitRepositories: new CommitRepositories({ run: async () => null }, () => {}),
     carriedNames: new Map(),
     refreshGeneration: 1,
     metadataRecoverySession: null,
@@ -3351,6 +3353,7 @@ test('command-only admission removes pending rows through every catalog path and
       claudeChildren: [],
       titles: new Map(),
       sessionNames: new SessionNames(),
+      commitRepositories: new CommitRepositories({ run: async () => null }, () => {}),
       carriedNames: new Map(),
       hidden: new Set(['command']),
       pinnedTop: new Set(),
@@ -4020,6 +4023,7 @@ test('window session reads leave reader state and live capabilities unchanged an
     catalog: { folders: 'held', sessions: [source] },
     catalogWalked: false,
     titles: new Map(),
+    commitRepositories: new CommitRepositories({ run: async () => null }, () => {}),
     carriedNames: new Map([['held', 'Held title']]),
     enumeratedSpendSources: { claude: [source], codex: [], children: [] },
   };
@@ -8066,6 +8070,7 @@ test(
       claudeChildren: [],
       codexSubagents: [],
       titles: new Map(),
+      commitRepositories: new CommitRepositories({ run: async () => null }, () => {}),
       carriedNames: new Map(),
       derivedCacheCheckpointState: { markChanged() {} },
       catalog: { folders: '\0' + 1, sessions },
@@ -8352,6 +8357,7 @@ test.each([
       claudeChildren: [],
       codexSubagents: [],
       titles: new Map(),
+      commitRepositories: new CommitRepositories({ run: async () => null }, () => {}),
       carriedNames: new Map(),
       derivedCacheCheckpointState: { markChanged() {} },
       catalog: { folders: '\0' + 1, sessions },
@@ -8634,6 +8640,7 @@ function dispatchedRefreshFixture(sessions: any[], worker: ProgressiveWorker, tu
     authoritativeCatalog: sessions,
     repositoryScopeRoots: [],
     titles: new Map(),
+    commitRepositories: new CommitRepositories({ run: async () => null }, () => {}),
     carriedNames: new Map(),
     startedHere: new Set(),
     derivedCacheCheckpointState: { markChanged() {} },
@@ -10164,7 +10171,7 @@ test('derived session caches load, trim against the walk, and checkpoint after f
   sourceMatch(disposeBody, /this\.writeDerivedCache\(\)/, 'shutdown does not flush a checkpoint that is still waiting');
   sourceMatch(
     panelHostSource,
-    /saveDerivedCache\(file, this\.titles, this\.claudeChildReferenceEntries, this\.carriedNames, undefined, this\.discoveryCheckpoint\)/,
+    /saveDerivedCache\(file, this\.titles, this\.claudeChildReferenceEntries, this\.carriedNames, undefined, this\.discoveryCheckpoint, this\.commitRepositories\.snapshot\(\)\)/,
     'the derived cache has no durable write path',
   );
   sourceMatch(
@@ -16635,6 +16642,7 @@ test('the live Codex subagent route keeps each panel on the place its shared tra
     historyRequest: null,
     walkedClaude: [] as string[],
     titles: new Map(),
+    commitRepositories: new CommitRepositories({ run: async () => null }, () => {}),
     carriedNames: new Map(),
     cwds: new Map(),
     humanScans: new Map(),
@@ -29194,6 +29202,7 @@ function namedSessionProvider(
   Object.assign(provider, {
     sessionNames: new SessionNames(),
     titles,
+    commitRepositories: new CommitRepositories({ run: async () => null }, () => {}),
     carriedNames: new Map(),
     derivedCacheCheckpointState: { markChanged: () => undefined },
   });
@@ -36114,6 +36123,7 @@ test('catalog prefix resolution suspends through discovery progress failure canc
     catalog: { sessions: sources },
     claudeChildReferenceEntries: new Map(),
     claudeChildStatWrites: new Map(),
+    commitRepositories: new CommitRepositories({ run: async () => null }, () => {}),
     carriedNames: new Map(),
     derivedCacheCheckpointState: { markChanged() {} },
     progressiveWorker: {
@@ -36506,6 +36516,7 @@ async function coverageEnumerationFixture() {
     coverageRevision: 0,
     derivedCacheCheckpointState: { markChanged() {} },
     titles: new Map(),
+    commitRepositories: new CommitRepositories({ run: async () => null }, () => {}),
     carriedNames: new Map(),
     corpus: new Map(),
     hidden: new Set(),
@@ -36830,6 +36841,7 @@ test('unread membership retains selection navigation derived caches exit corpus 
       history: new Map([['retained', { pages: [], usedAt: 1 }]]),
       historyStructuralKeys: new Map(),
       titles: new Map([[file, { title: 'Retained name' }]]),
+      commitRepositories: new CommitRepositories({ run: async () => null }, () => {}),
       carriedNames: new Map([[file, { label: 'Retained name' }]]),
       cwds: new Map([[file, { cwd: root }]]),
       humanScans: new Map([[file, { found: true }]]),
@@ -37877,3 +37889,57 @@ test.each([false, true])(
       }
   },
 );
+
+test('repository retention resolves a Claude child through its native launch identity', () => {
+  const child = turn({
+    agents: [
+      {
+        id: 'child',
+        toolUseId: 'launch-child',
+        description: 'Worker',
+        agentType: 'general-purpose',
+        status: 'completed',
+        model: null,
+        effort: null,
+        spend: [],
+        spendFound: true,
+        spendPartial: false,
+        durationMs: 1,
+        tokens: null,
+        toolUses: 1,
+        commits: [
+          {
+            sha: 'abcdef12',
+            subject: 'Fix',
+            files: null,
+            added: null,
+            removed: null,
+            at: 1,
+            dir: 'C:/worker',
+            place: null,
+          },
+        ],
+      },
+    ],
+  });
+  const files: Array<string | null> = [];
+  const provider: any = Object.assign(Object.create(PanelProvider.prototype), {
+    folders: () => [],
+    claudeChildReferences: [
+      { parentSessionId: 'parent', sessionId: 'child', file: 'C:/child.jsonl', toolUseIds: ['launch-child'] },
+    ],
+    repositoryCommits: {
+      apply(turns: any[], _folders: string[], retained: any) {
+        retained(turns[0].agents[0].commits[0], [], turns[0], turns[0].agents[0]);
+      },
+    },
+    commitRepositories: {
+      apply(_commit: unknown, file: string | null) {
+        files.push(file);
+        return false;
+      },
+    },
+  });
+  provider.applyCommitRepositories({ agent: 'claude', sessionId: 'parent', file: 'C:/parent.jsonl' }, [child]);
+  assert.deepEqual(files, ['C:/child.jsonl']);
+});

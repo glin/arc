@@ -2,10 +2,10 @@
 //
 // Parser fixtures cover Git log, repository identity, and HEAD reflog output.
 
-import { test } from 'vitest';
+import { test, vi } from 'vitest';
 import assert from 'node:assert';
 import { execFileSync } from 'node:child_process';
-import { writeFileSync } from 'node:fs';
+import { writeFileSync, mkdirSync, renameSync, rmdirSync, appendFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
   CommitIntent,
@@ -16,6 +16,7 @@ import {
   normalizeFsPath,
   recordCommits,
   inspectCommitCommand,
+  commitSourceStamp,
 } from './transcript.ts';
 import {
   GitRunner,
@@ -41,7 +42,15 @@ import {
   pointsAtArgs,
 } from './gitcommits.ts';
 import { candidateGitRunner as candidateRunner, turn } from './turnfixtures.ts';
-import { commitCard } from './turncard.ts';
+import { commitCard, commitRowsOf } from './turncard.ts';
+import {
+  COMMIT_REPOSITORY_CHECK_MS,
+  MAX_COMMIT_REPOSITORIES,
+  MAX_SOURCE_COMMIT_REPOSITORIES,
+  MAX_COMMIT_REPOSITORY_BYTES,
+  CommitRepositories,
+} from './commitrepositories.ts';
+import { loadDerivedCache, saveDerivedCache } from './derivedcache.ts';
 import { tempDir } from './temproot.ts';
 import { readCodexAgentSpend, refreshCodexStructuralAgents } from './codex.ts';
 
@@ -1162,7 +1171,10 @@ test('a commit read back for a child joins the child figures its own record left
   ];
   writeFileSync(file, records.map((record) => JSON.stringify(record)).join('\n') + '\n');
   const spend = readCodexAgentSpend(file);
-  assert.deepEqual(spend.commitIntents, [quiet]);
+  assert.deepEqual(
+    spend.commitIntents?.map(({ source: _source, ...intent }) => intent),
+    [quiet],
+  );
   const read = {
     files: [{ path: 'c:/repo/a.ts', added: 1, removed: 0, isNew: false }],
     commits: [] as string[],
@@ -1212,6 +1224,629 @@ test('a commit read back for a child joins the child figures its own record left
 });
 
 const LANDED = 'f338b37f338b37f338b37f338b37f338b37f3383';
+
+test.each(['printed', 'quiet'] as const)(
+  'verified foreign child commits survive cache reload and worktree removal (%s)',
+  { tags: ['subprocess'], timeout: 120000 },
+  async (mode) => {
+    const directory = tempDir('verified-child-repository-');
+    const arc = join(directory, 'arc');
+    const foreign = join(directory, 'skills');
+    const tree = join(directory, 'worker');
+    const file = join(directory, 'child.jsonl');
+    const cache = join(directory, 'derived-session-cache.json');
+    const clone = join(directory, 'clone');
+    let commitAt = '2026-09-02T04:08:17Z';
+    const git = (cwd: string, ...args: string[]): string =>
+      execFileSync('git', ['-C', cwd, ...args], {
+        encoding: 'utf8',
+        stdio: 'pipe',
+        env: { ...process.env, GIT_COMMITTER_DATE: commitAt, GIT_AUTHOR_DATE: commitAt },
+      }).trim();
+    for (const root of [arc, foreign]) {
+      mkdirSync(root);
+      git(root, 'init', '-q', '-b', 'main');
+      git(root, 'config', 'user.email', 'test@example.com');
+      git(root, 'config', 'user.name', 'Test');
+    }
+    git(foreign, 'commit', '--allow-empty', '-q', '-m', 'First');
+    git(foreign, 'worktree', 'add', '-q', '-b', 'topic', tree);
+    writeFileSync(join(tree, 'a.txt'), 'child\n');
+    git(tree, 'add', 'a.txt');
+    commitAt = '2026-09-02T04:08:18Z';
+    git(tree, 'commit', '-q', '-m', 'Child fix');
+    const sha = git(tree, 'rev-parse', 'HEAD');
+    const records = [
+      { type: 'session_meta', payload: { id: 'child', cwd: tree, source: 'vscode' } },
+      { type: 'event_msg', payload: { type: 'task_started', turn_id: 'child-turn' } },
+      { type: 'event_msg', payload: { type: 'user_message', message: 'Commit the child fix.' } },
+      {
+        type: 'event_msg',
+        payload: {
+          type: 'item_completed',
+          item: {
+            type: 'CommandExecution',
+            id: 'commit',
+            command: ['bash', '-c', `git commit ${mode === 'quiet' ? '-q ' : ''}-m "Child fix"`],
+            parsed_cmd: [{ type: 'unknown', cmd: `git commit ${mode === 'quiet' ? '-q ' : ''}-m "Child fix"` }],
+            cwd: tree,
+            status: 'completed',
+            exit_code: 0,
+            stdout:
+              mode === 'quiet'
+                ? ''
+                : `[topic ${sha.slice(0, 8)}] Printed child subject\n 1 file changed, 1 insertion(+)\n`,
+            started_at_ms: AT('2026-09-02T04:08:18Z'),
+            completed_at_ms: AT('2026-09-02T04:08:19Z'),
+          },
+        },
+      },
+      { type: 'event_msg', payload: { type: 'task_complete', turn_id: 'child-turn' } },
+    ].map((record, index) => ({
+      ...record,
+      timestamp: new Date(AT('2026-09-02T04:08:17Z') + index * 1000).toISOString(),
+    }));
+    writeFileSync(file, records.map((record) => JSON.stringify(record)).join('\n') + '\n');
+    const parent = (): Turn => {
+      const one = turn({
+        agents: [
+          {
+            id: 'child',
+            description: 'Worker',
+            agentType: 'general-purpose',
+            model: null,
+            effort: null,
+            spend: [],
+            spendFound: true,
+            spendPartial: false,
+            durationMs: 1,
+            tokens: null,
+            toolUses: 1,
+            status: 'completed',
+          },
+        ],
+      });
+      const spend = readCodexAgentSpend(file);
+      refreshCodexStructuralAgents(
+        [one],
+        'parent',
+        [
+          {
+            file,
+            threadId: 'child',
+            parentThreadId: 'parent',
+            agentPath: 'general-purpose',
+            openedAt: null,
+            startedAt: null,
+            threadSource: 'subagent',
+            backgroundReview: false,
+          },
+        ],
+        () => spend,
+      );
+      assert.ok((one.agents[0].commits?.[0] ?? one.agents[0].commitIntents?.[0])?.source, JSON.stringify(spend));
+      return one;
+    };
+    const runner = nodeGitRunner();
+    const retained = new CommitRepositories(runner, () => {});
+    const resolver = new RepositoryCommits(runner, () => {});
+    const apply = (reader: RepositoryCommits, proofs: CommitRepositories, one: Turn, folders = [arc]) =>
+      reader.apply(
+        [one],
+        folders,
+        (commit, identities, _turn, agent) => proofs.apply(commit, agent?.id === 'child' ? file : null, identities),
+        (intent, identities, _turn, agent) => proofs.restore(intent, agent?.id === 'child' ? file : null, identities),
+      );
+    const first = parent();
+    await vi.waitFor(
+      () => {
+        apply(resolver, retained, first);
+        assert.equal(retained.snapshot().length, 1);
+      },
+      { timeout: 10000 },
+    );
+    saveDerivedCache(cache, [], [], [], undefined, undefined, retained.snapshot());
+    const saved = loadDerivedCache(cache).commitRepositories!;
+    assert.equal(saved[0].sha, sha);
+    git(foreign, 'worktree', 'remove', tree);
+    git(directory, 'clone', '-q', foreign, clone);
+
+    const fresh = async (gitRunner = runner, folders = [arc]) => {
+      let answered = false;
+      const proofs = new CommitRepositories(gitRunner, () => {
+        answered = true;
+      });
+      proofs.load(saved);
+      const reader = new RepositoryCommits(gitRunner, () => {});
+      const one = parent();
+      apply(reader, proofs, one, folders);
+      await vi.waitFor(() => assert.equal(answered, true), { timeout: 10000 });
+      apply(reader, proofs, one, folders);
+      return { one, reader, proofs };
+    };
+    const restored = await fresh();
+    const card = commitRowsOf(restored.one, 1, [arc]).commits[0];
+    assert.deepEqual(card.repository, { key: normalizeFsPath(join(foreign, '.git')), name: 'skills', own: false });
+    assert.equal(card.madeBySession, 'child');
+    assert.equal(card.madeBy, 'Worker');
+    assert.equal(restored.one.agents[0].commits![0].dir, normalizeFsPath(foreign));
+    assert.deepEqual(
+      ['subject', 'head', 'files', 'added', 'removed', 'at'].map(
+        (key) => restored.one.agents[0].commits![0][key as keyof TurnCommit],
+      ),
+      ['subject', 'head', 'files', 'added', 'removed', 'at'].map(
+        (key) => first.agents[0].commits![0][key as keyof TurnCommit],
+      ),
+    );
+    // Child spend recreates its rows. The same saved occurrence must still enrich the parent.
+    const rebuilt = parent();
+    apply(restored.reader, restored.proofs, rebuilt);
+    assert.equal(commitRowsOf(rebuilt, 1, [arc]).commits[0].repository?.name, 'skills');
+    await vi.waitFor(
+      () => {
+        apply(restored.reader, restored.proofs, rebuilt, [arc, foreign]);
+        assert.equal(rebuilt.agents[0].commits![0].repository?.own, true);
+      },
+      { timeout: 10000 },
+    );
+    apply(restored.reader, restored.proofs, rebuilt, [arc]);
+    assert.equal(rebuilt.agents[0].commits![0].repository?.own, false);
+
+    // A clone with the same object cannot replace the saved checkout's missing object.
+    const missing: GitRunner = {
+      run: (dir, args) =>
+        normalizeFsPath(dir) === normalizeFsPath(foreign) && args.includes('--no-walk')
+          ? Promise.resolve(null)
+          : runner.run(dir, args),
+    };
+    assert.ok(!(await fresh(missing, [arc, clone])).one.agents[0].commits?.some((commit) => commit.repository));
+    const common = join(foreign, '.git');
+    const movedCommon = join(foreign, '.git-saved');
+    renameSync(common, movedCommon);
+    mkdirSync(common);
+    const replacedCommon = new CommitRepositories(runner, () => {});
+    replacedCommon.load(saved);
+    const commonRow = parent();
+    apply(new RepositoryCommits(runner, () => {}), replacedCommon, commonRow);
+    assert.ok(!commonRow.agents[0].commits?.some((commit) => commit.repository));
+    rmdirSync(common);
+    renameSync(movedCommon, common);
+    const movedRoot = join(directory, 'skills-saved');
+    renameSync(foreign, movedRoot);
+    git(directory, 'clone', '-q', clone, foreign);
+    const replacedRoot = new CommitRepositories(runner, () => {});
+    replacedRoot.load(saved);
+    const rootRow = parent();
+    apply(new RepositoryCommits(runner, () => {}), replacedRoot, rootRow);
+    assert.ok(!rootRow.agents[0].commits?.some((commit) => commit.repository));
+    renameSync(foreign, join(directory, 'replacement'));
+    renameSync(movedRoot, foreign);
+    appendFileSync(file, '{}\n');
+    const changedSource = new CommitRepositories(runner, () => {});
+    changedSource.load(saved);
+    const changedRow = parent();
+    apply(new RepositoryCommits(runner, () => {}), changedSource, changedRow);
+    assert.ok(!changedRow.agents[0].commits?.some((commit) => commit.repository));
+  },
+);
+// File identities remain real while Git responses and the validation clock stay controlled.
+function observedRepository() {
+  const directory = tempDir('observed-repository-');
+  const root = join(directory, 'skills');
+  const command = join(directory, 'worker');
+  const common = join(root, '.git');
+  mkdirSync(root);
+  mkdirSync(command);
+  mkdirSync(common);
+  const file = join(directory, 'source.jsonl');
+  writeFileSync(file, '{}\n');
+  const sha = 'a'.repeat(40);
+  let unavailable = false;
+  let association = common;
+  let race = false;
+  let calls = 0;
+  const runner: GitRunner = {
+    run: async (dir, args) => {
+      calls++;
+      if (args[0] === 'rev-parse')
+        return `${normalizeFsPath(association)}\n${normalizeFsPath(association)}\n${normalizeFsPath(dir)}\n`;
+      if (args[0] === 'worktree') return `worktree ${root}\0HEAD ${sha}\0branch refs/heads/main\0\0`;
+      if (race && normalizeFsPath(dir) === normalizeFsPath(root)) {
+        race = false;
+        appendFileSync(file, '{}\n');
+      }
+      return unavailable ? null : record(sha, 'Child fix', '2026-09-02T04:08:18Z');
+    },
+  };
+  const fresh = (): TurnCommit => ({
+    sha: sha.slice(0, 8),
+    subject: 'Child fix',
+    head: { kind: 'branch', name: 'topic' },
+    files: 1,
+    added: 1,
+    removed: 0,
+    at: AT('2026-09-02T04:08:19Z'),
+    dir: command,
+    place: null,
+    source: { file, stamp: commitSourceStamp(file)! },
+  });
+  return {
+    file,
+    root,
+    command,
+    common,
+    runner,
+    fresh,
+    calls: () => calls,
+    race: () => {
+      race = true;
+    },
+    remove: () => {
+      unavailable = true;
+    },
+    recover: () => {
+      unavailable = false;
+    },
+    retarget: () => {
+      association = join(directory, 'another.git');
+    },
+  };
+}
+
+test('an accepted source append refreshes proof and preserves a live foreign commit', async () => {
+  const f = observedRepository();
+  const proofs = new CommitRepositories(f.runner, () => {});
+  const reader = new RepositoryCommits(f.runner, () => {});
+  const apply = (commit: TurnCommit) =>
+    reader.apply([turn({ commits: [commit] })], [], (one, ids) => proofs.apply(one, f.file, ids));
+  const first = f.fresh();
+  apply(first);
+  await vi.waitFor(() => assert.equal(proofs.snapshot().length, 1));
+  appendFileSync(f.file, '{}\n');
+  const fresh = f.fresh();
+  await vi.waitFor(() => {
+    apply(fresh);
+    assert.equal(fresh.repository?.root, normalizeFsPath(f.root));
+  });
+  assert.deepEqual(proofs.snapshot()[0].stamp, fresh.source!.stamp);
+  // A recreated command path cannot supply fresh evidence for the saved occurrence.
+  renameSync(f.command, f.command + '-old');
+  mkdirSync(f.command);
+  appendFileSync(f.file, '{}\n');
+  const replacement = f.fresh();
+  apply(replacement);
+  await settle();
+  apply(replacement);
+  assert.equal(replacement.repository, null);
+});
+
+test('a source race retries once at a newly accepted revision', async () => {
+  const f = observedRepository();
+  f.race();
+  let completed = 0;
+  const proofs = new CommitRepositories(f.runner, () => {
+    completed++;
+  });
+  const first = f.fresh();
+  proofs.apply(first, f.file, []);
+  await vi.waitFor(() => assert.equal(completed, 1));
+  assert.equal(proofs.snapshot().length, 0);
+  const before = f.calls();
+  proofs.apply(first, f.file, []);
+  await settle();
+  assert.equal(f.calls(), before);
+  const next = f.fresh();
+  proofs.apply(next, f.file, []);
+  await vi.waitFor(() => assert.equal(proofs.snapshot().length, 1));
+  proofs.apply(next, f.file, []);
+  assert.equal(next.repository?.root, normalizeFsPath(f.root));
+});
+
+// Mocked Git keeps collection limits independent of repository creation and subprocess cost.
+test.each(['source', 'global'] as const)('a full %s collection refreshes a live commit after append', async (limit) => {
+  const f = observedRepository();
+  const initial = new CommitRepositories(f.runner, () => {});
+  initial.apply(f.fresh(), f.file, []);
+  await vi.waitFor(() => assert.equal(initial.snapshot().length, 1));
+  const saved = initial.snapshot()[0];
+  const count = limit === 'source' ? MAX_SOURCE_COMMIT_REPOSITORIES : MAX_COMMIT_REPOSITORIES;
+  const rows = Array.from({ length: count }, (_, i) => ({
+    ...saved,
+    file: i < MAX_SOURCE_COMMIT_REPOSITORIES ? f.file : `/source/${Math.floor(i / MAX_SOURCE_COMMIT_REPOSITORIES)}`,
+    occurrence: i === 0 ? saved.occurrence : i.toString(16).padStart(64, '0'),
+  }));
+  let completed = 0;
+  const proofs = new CommitRepositories(f.runner, () => {
+    completed++;
+  });
+  proofs.load(rows);
+  assert.equal(proofs.snapshot().length, count);
+  appendFileSync(f.file, '{}\n');
+  const fresh = f.fresh();
+  const one = turn({ commits: [fresh] });
+  const reader = new RepositoryCommits(f.runner, () => {});
+  await vi.waitFor(() => {
+    reader.apply([one], [], (commit, ids) => proofs.apply(commit, f.file, ids));
+    assert.equal(commitRowsOf(one, 1, []).commits[0].repository?.name, 'skills');
+  });
+  assert.equal(fresh.repository?.root, normalizeFsPath(f.root));
+  assert.deepEqual(proofs.snapshot()[0].stamp, fresh.source!.stamp);
+  assert.equal(proofs.snapshot().length, count);
+  assert.ok(Buffer.byteLength(JSON.stringify(proofs.snapshot())) <= MAX_COMMIT_REPOSITORY_BYTES);
+  const additional = { ...f.fresh(), at: fresh.at + 1 };
+  const additionalTurn = turn({ commits: [additional] });
+  await vi.waitFor(() => {
+    reader.apply([additionalTurn], [], (commit, ids) => proofs.apply(commit, f.file, ids));
+    assert.equal(additional.repository?.key, normalizeFsPath(f.common));
+  });
+  assert.equal(proofs.snapshot().length, count);
+  f.remove();
+  appendFileSync(f.file, '{}\n');
+  const missing = f.fresh();
+  proofs.apply(missing, f.file, []);
+  await vi.waitFor(() => assert.equal(completed, 2));
+  const before = f.calls();
+  for (let i = 0; i < 20; i++) proofs.apply(missing, f.file, []);
+  await settle();
+  assert.equal(f.calls(), before);
+  assert.equal(missing.repository, null);
+});
+
+test('capture exhaustion refuses repeated work until a newly accepted source revision', async () => {
+  const f = observedRepository();
+  f.remove();
+  let completed = 0;
+  const proofs = new CommitRepositories(f.runner, () => {
+    completed++;
+  });
+  const refused = Array.from({ length: MAX_SOURCE_COMMIT_REPOSITORIES + 1 }, (_, i) => ({
+    ...f.fresh(),
+    at: f.fresh().at + i,
+  }));
+  for (const commit of refused) proofs.apply(commit, f.file, []);
+  await vi.waitFor(() => assert.equal(completed, MAX_SOURCE_COMMIT_REPOSITORIES));
+  assert.equal(proofs.snapshot().length, 0);
+  const before = f.calls();
+  for (let i = 0; i < 20; i++) {
+    for (const commit of refused) proofs.apply(commit, f.file, []);
+  }
+  await settle();
+  assert.equal(f.calls(), before);
+  assert.equal(completed, MAX_SOURCE_COMMIT_REPOSITORIES);
+  // New revisions replace the allowance instead of accumulating a lifetime query count.
+  for (let i = 0; i < MAX_SOURCE_COMMIT_REPOSITORIES; i++) {
+    appendFileSync(f.file, '{}\n');
+    proofs.apply(f.fresh(), f.file, []);
+    await vi.waitFor(() => assert.equal(completed, MAX_SOURCE_COMMIT_REPOSITORIES + i + 1));
+  }
+  f.recover();
+  appendFileSync(f.file, '{}\n');
+  const fresh = f.fresh();
+  const one = turn({ commits: [fresh] });
+  const reader = new RepositoryCommits(f.runner, () => {});
+  await vi.waitFor(() => {
+    reader.apply([one], [], (commit, ids) => proofs.apply(commit, f.file, ids));
+    assert.equal(commitRowsOf(one, 1, []).commits[0].repository?.name, 'skills');
+  });
+});
+
+test('global failed checks release admission after source revision and removal', async () => {
+  const f = observedRepository();
+  f.remove();
+  let completed = 0;
+  const proofs = new CommitRepositories(f.runner, () => {
+    completed++;
+  });
+  const files = Array.from({ length: MAX_COMMIT_REPOSITORIES / MAX_SOURCE_COMMIT_REPOSITORIES }, (_, i) => {
+    const file = i === 0 ? f.file : f.file + i;
+    writeFileSync(file, '{}\n');
+    return file;
+  });
+  const failed = files.flatMap((file) => {
+    const source = { file, stamp: commitSourceStamp(file)! };
+    return Array.from({ length: MAX_SOURCE_COMMIT_REPOSITORIES }, (_, i) => ({
+      ...f.fresh(),
+      source,
+      at: f.fresh().at + i,
+    }));
+  });
+  for (const commit of failed) proofs.apply(commit, commit.source.file, []);
+  await vi.waitFor(() => assert.equal(completed, MAX_COMMIT_REPOSITORIES));
+  assert.equal(proofs.snapshot().length, 0);
+  const before = f.calls();
+  for (const commit of failed) proofs.apply(commit, commit.source.file, []);
+  await settle();
+  assert.equal(f.calls(), before);
+
+  f.recover();
+  appendFileSync(f.file, '{}\n');
+  proofs.apply(f.fresh(), f.file, []);
+  await vi.waitFor(() => assert.equal(proofs.snapshot().length, 1));
+  const cache = f.file + '-cache';
+  saveDerivedCache(cache, [], [], [], undefined, undefined, proofs.snapshot());
+  rmdirSync(f.command);
+  const restored = new CommitRepositories(f.runner, () => {});
+  restored.load(loadDerivedCache(cache).commitRepositories!);
+  const one = turn({ commits: [f.fresh()] });
+  const reader = new RepositoryCommits(f.runner, () => {});
+  await vi.waitFor(() => {
+    reader.apply([one], [], (commit, ids) => restored.apply(commit, f.file, ids));
+    assert.equal(commitRowsOf(one, 1, []).commits[0].repository?.name, 'skills');
+  });
+
+  mkdirSync(f.command);
+  f.remove();
+  for (let i = 1; i < MAX_SOURCE_COMMIT_REPOSITORIES; i++)
+    proofs.apply({ ...f.fresh(), at: f.fresh().at + i }, f.file, []);
+  await vi.waitFor(() => assert.equal(completed, MAX_COMMIT_REPOSITORIES + MAX_SOURCE_COMMIT_REPOSITORIES));
+  const newFile = f.file + '-new';
+  writeFileSync(newFile, '{}\n');
+  const next = { ...f.fresh(), source: { file: newFile, stamp: commitSourceStamp(newFile)! } };
+  const saturated = f.calls();
+  proofs.apply(next, newFile, []);
+  await settle();
+  assert.equal(f.calls(), saturated);
+  // Failed-only sources release their admission metadata when coverage proves them absent.
+  proofs.prune((file) => normalizeFsPath(file) !== normalizeFsPath(f.file));
+  f.recover();
+  proofs.apply(next, newFile, []);
+  await vi.waitFor(() => assert.equal(proofs.snapshot().length, 2));
+});
+
+test('byte-evicted validation checks share admission with saved and pending occurrences', async () => {
+  const f = observedRepository();
+  const initial = new CommitRepositories(f.runner, () => {});
+  initial.apply(f.fresh(), f.file, []);
+  await vi.waitFor(() => assert.equal(initial.snapshot().length, 1));
+  const saved = initial.snapshot()[0];
+  const lastFile = f.file + '-last';
+  writeFileSync(lastFile, '{}\n');
+  const rows = Array.from({ length: MAX_SOURCE_COMMIT_REPOSITORIES }, (_, i) => ({
+    ...saved,
+    file: i === 0 ? f.file : `/source/${Math.floor(i / MAX_SOURCE_COMMIT_REPOSITORIES)}`,
+    occurrence: i === 0 ? saved.occurrence : i.toString(16).padStart(64, '0'),
+    recovered: {
+      intent: '',
+      commit: { sha: saved.sha, subject: '', head: null, files: 1, added: 1, removed: 0, at: 0 },
+    },
+  }));
+  Object.assign(rows.at(-1)!, { file: lastFile, occurrence: saved.occurrence, stamp: commitSourceStamp(lastFile)! });
+  let remaining =
+    MAX_COMMIT_REPOSITORY_BYTES - rows.reduce((sum, row) => sum + Buffer.byteLength(JSON.stringify(row)), 0);
+  assert.ok(remaining > 0);
+  for (const row of rows) {
+    const size = Math.min(remaining, 65536);
+    row.recovered.commit.subject = 'x'.repeat(size);
+    remaining -= size;
+  }
+  assert.equal(remaining, 0);
+  let completed = 0;
+  let release!: () => void;
+  let hold = false;
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const proofs = new CommitRepositories(
+    {
+      run: async (dir, args) => {
+        if (hold) await held;
+        return f.runner.run(dir, args);
+      },
+    },
+    () => {
+      completed++;
+    },
+  );
+  proofs.load(rows);
+  const last = { ...f.fresh(), source: { file: lastFile, stamp: commitSourceStamp(lastFile)! } };
+  proofs.apply(last, lastFile, []);
+  await vi.waitFor(() => assert.equal(completed, 1));
+  appendFileSync(f.file, ' '.repeat(1000));
+  proofs.apply(f.fresh(), f.file, []);
+  await vi.waitFor(() => assert.equal(completed, 2));
+  assert.equal(proofs.snapshot().length, rows.length - 1);
+  assert.ok(!proofs.snapshot().some((row) => row.file === lastFile));
+  const before = f.calls();
+  proofs.apply(last, lastFile, []);
+  await settle();
+  assert.equal(f.calls(), before);
+  f.remove();
+  const count = MAX_COMMIT_REPOSITORIES - rows.length;
+  const files = Array.from({ length: count / MAX_SOURCE_COMMIT_REPOSITORIES }, (_, i) => {
+    const file = f.file + '-failed-' + i;
+    writeFileSync(file, '{}\n');
+    return file;
+  });
+  const failed = files.flatMap((file) =>
+    Array.from({ length: MAX_SOURCE_COMMIT_REPOSITORIES }, (_, i) => ({
+      ...f.fresh(),
+      at: f.fresh().at + i,
+      source: { file, stamp: commitSourceStamp(file)! },
+    })),
+  );
+  for (const commit of failed.slice(0, -1)) proofs.apply(commit, commit.source.file, []);
+  await vi.waitFor(() => assert.equal(completed, count + 1));
+  hold = true;
+  const pending = failed.at(-1)!;
+  proofs.apply(pending, pending.source.file, []);
+  const refusedFile = f.file + '-refused';
+  writeFileSync(refusedFile, '{}\n');
+  const refused = { ...f.fresh(), source: { file: refusedFile, stamp: commitSourceStamp(refusedFile)! } };
+  proofs.apply(refused, refusedFile, []);
+  release();
+  await vi.waitFor(() => assert.equal(completed, count + 2));
+  await settle();
+  assert.equal(completed, count + 2);
+  proofs.prune((file) => file === rows[1].file);
+  f.recover();
+  appendFileSync(files[0], '{}\n');
+  const revised = { ...f.fresh(), source: { file: files[0], stamp: commitSourceStamp(files[0])! } };
+  proofs.apply(revised, files[0], []);
+  await vi.waitFor(() => assert.equal(completed, count + 3));
+  proofs.apply(refused, refusedFile, []);
+  await vi.waitFor(() => assert.equal(completed, count + 4));
+  assert.ok(proofs.snapshot().some((row) => row.file === refusedFile));
+});
+
+test('pruning an in-flight capture prevents the absent source from returning', async () => {
+  const f = observedRepository();
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let started = false;
+  let completed = 0;
+  const proofs = new CommitRepositories(
+    {
+      run: async (dir, args) => {
+        started = true;
+        await held;
+        return f.runner.run(dir, args);
+      },
+    },
+    () => {
+      completed++;
+    },
+  );
+  proofs.apply(f.fresh(), f.file, []);
+  await vi.waitFor(() => assert.ok(started));
+  proofs.prune(() => true);
+  release();
+  await vi.waitFor(() => assert.equal(completed, 1));
+  assert.equal(proofs.snapshot().length, 0);
+});
+
+test.each(['object', 'association'] as const)(
+  'successful proof expires after a changed repository %s',
+  async (change) => {
+    const f = observedRepository();
+    let now = 1_000_000;
+    vi.spyOn(Date, 'now').mockImplementation(() => now);
+    let completed = 0;
+    const proofs = new CommitRepositories(f.runner, () => {
+      completed++;
+    });
+    const first = f.fresh();
+    proofs.apply(first, f.file, []);
+    await vi.waitFor(() => assert.equal(completed, 1));
+    proofs.apply(first, f.file, []);
+    assert.ok(first.repository);
+    const before = f.calls();
+    if (change === 'object') f.remove();
+    else f.retarget();
+    for (let i = 0; i < 20; i++) proofs.apply(first, f.file, []);
+    assert.equal(f.calls(), before);
+    now += COMMIT_REPOSITORY_CHECK_MS;
+    proofs.apply(first, f.file, []);
+    proofs.apply(first, f.file, []);
+    assert.equal(first.repository, null);
+    await vi.waitFor(() => assert.equal(completed, 2));
+    proofs.apply(first, f.file, []);
+    assert.equal(first.repository, null);
+    assert.equal(f.calls() - before, 2);
+  },
+);
+
 const LANDED_SUBJECT = 'Bundle the panel script from a TypeScript entry';
 
 const merge = (over: Partial<LandingIntent> = {}): LandingIntent => ({

@@ -1,4 +1,5 @@
 import * as fs from 'node:fs';
+import { boundedCommitRepositories, type VerifiedCommitRepository } from './commitrepositories';
 import { writeFileAtomically } from './atomicfile';
 import { storedCodexMetas } from './codexopenings';
 import {
@@ -343,6 +344,7 @@ export function withAgentRunScanProgress(entry: DerivedTitleEntry, scan: AgentRu
 }
 
 export interface DerivedCache {
+  commitRepositories?: VerifiedCommitRepository[];
   reuse?: { reason: string; storedGeneration?: unknown; rejectedRelationships?: number };
   discovery?: import('./progressiveworker').DiscoveryCheckpoint;
   // Legacy workspace Codex opening rows seed a missing shared `codex-openings.json`.
@@ -400,6 +402,7 @@ interface StoredCarriedName extends CarriedName {
   file: string;
 }
 interface StoredCache {
+  commitRepositories?: VerifiedCommitRepository[];
   discovery?: import('./progressiveworker').DiscoveryCheckpoint;
   version: number;
   titles: StoredTitle[];
@@ -413,7 +416,7 @@ interface StoredCache {
 // The initial metadata budget, `INITIAL_RAIL_READ_BYTES`, spreads large workspace rebuilds across refreshes.
 // Targeted invalidation avoids a full rebuild when affected entries are identifiable at load.
 // Codex opening rows use `CODEX_META_VERSION` from codexopenings.ts and survive this version change.
-export const VERSION = 63;
+export const VERSION = 64;
 
 export class DerivedCacheCheckpointState {
   private generation = 0;
@@ -1076,6 +1079,9 @@ export function loadDerivedCache(file: string): DerivedCache {
       carryNames(loaded.carriedNames, parsed.titles, (row) => row.entry);
       return loaded;
     }
+    if (Array.isArray(parsed.commitRepositories)) {
+      loaded.commitRepositories = boundedCommitRepositories(parsed.commitRepositories);
+    }
     if (
       !Array.isArray(parsed.titles) ||
       (parsed.claudeChildReferences !== undefined && !Array.isArray(parsed.claudeChildReferences))
@@ -1169,6 +1175,7 @@ export function saveDerivedCache(
   carriedNames: Iterable<[string, CarriedName]> = [],
   replace: (temporary: string, target: string) => void = fs.renameSync,
   discovery?: import('./progressiveworker').DiscoveryCheckpoint,
+  commitRepositories: Iterable<VerifiedCommitRepository> = [],
 ): void {
   const titleRows = [...titles]
     .map(([entryFile, entry]) => ({ file: entryFile, entry }))
@@ -1184,6 +1191,7 @@ export function saveDerivedCache(
         a.file.localeCompare(b.file),
     );
   const data: StoredCache = {
+    commitRepositories: boundedCommitRepositories(commitRepositories),
     version: VERSION,
     discovery,
     titles: titleRows,

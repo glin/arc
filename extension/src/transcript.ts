@@ -199,6 +199,8 @@ export type CommitPlace =
 export type CommitHead = { kind: 'branch'; name: string } | { kind: 'detached' } | null;
 
 export interface TurnCommit {
+  intent?: string;
+  source?: CommitSource;
   sha: string;
   printedSha?: string;
   candidates?: { dirs: string[]; complete: boolean };
@@ -236,6 +238,7 @@ export { HEX_SHA, sameCommitSha };
 // Calls issued by one record share its timestamp because they can run concurrently.
 // Their windows overlap. Repository recovery rejects a window whose candidate count differs from `expected`.
 export interface CommitIntent {
+  source?: CommitSource;
   dir: string; // the one repository the command named
   from: number;
   to: number;
@@ -3886,6 +3889,31 @@ const RELATIONSHIP_BLOCK_BYTES = 4096;
 export interface RelationshipStamp extends FileRevision {
   mtimeNs: string;
   ctimeNs: string;
+}
+
+export interface CommitSource {
+  file: string;
+  stamp: RelationshipStamp;
+}
+
+export function commitSourceStamp(file: string): RelationshipStamp | null {
+  try {
+    const stat = fs.statSync(file, { bigint: true });
+    return stat.isFile() && supportedFileIdentity(revisionOf(stat)) ? relationshipStamp(stat) : null;
+  } catch {
+    return null;
+  }
+}
+
+// Bind only the source's own occurrences after an unchanged read. Child rows retain their own source.
+export function bindCommitSources(turns: readonly Turn[], file: string, before: RelationshipStamp | null): void {
+  const after = commitSourceStamp(file);
+  if (!after || !sameRelationshipStamp(before, after)) return;
+  const source = { file, stamp: after };
+  for (const turn of turns) {
+    for (const commit of turn.commits) commit.source = source;
+    for (const intent of turn.commitIntents ?? []) intent.source = source;
+  }
 }
 
 export interface RelationshipDigest {
@@ -9134,6 +9162,7 @@ function readClaudeOwnSpend(
     folders,
     maxTurns: Number.MAX_SAFE_INTEGER,
   });
+  const sourceStamp = commitSourceStamp(file);
   const repeated = createClaudeRepeatedFilter();
   const found = scanLines(file, (line) => {
     if (repeated(line)) {
@@ -9237,6 +9266,7 @@ function readClaudeOwnSpend(
     addTurnUsagePart(exact, request);
   }
   const childTurns = child.finish().turns;
+  if (found && lastLineWhole(lastLine)) bindCommitSources(childTurns, file, sourceStamp);
   // Only the root read of a row sums its turns, so a nested subagent adds spend and no time.
   // The root is a subagent or a dispatched session, because only those reads ask for a record.
   const measured = withRecord ? summedTurnRate(childTurns) : undefined;

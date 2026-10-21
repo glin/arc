@@ -194,6 +194,7 @@ import {
 import { countedDispatchedCosts, pendingAskPosition, toCard, TURN_QUIET_MS } from './turncard';
 import { COMMIT_REPOSITORY_PARSER_VERSION, commitRepositoryOccurrence } from './codexhistory';
 import { RepositoryCommits } from './gitcommits';
+import { CommitRepositories } from './commitrepositories';
 import { railCacheMarkOf, sessionStatusOf, stableRailOrder } from './turnrail';
 import { storedAssetsForPrompt } from './promptassets';
 import { emptyTrail, renamePlace, visitPlace } from './turnplaces';
@@ -1331,6 +1332,11 @@ function completeDiscoveryHarness(
   );
   assert.ok(owner);
   scope = {
+    CommitRepositories,
+    RepositoryCommits,
+    claudeSubagentMetaReader,
+    claudeChildFileFor,
+    codexSubagentFor,
     sessionCoverageMember,
     reconcileSessionCollisions,
     sessionCatalogMembership,
@@ -1376,6 +1382,8 @@ function completeDiscoveryHarness(
     'sourceCountOf',
     'failSessionLoading',
     'noteSessionRead',
+    'applyCommitRepositories',
+    'agentFile',
     'unresolvedLoadingFailure',
     ...extraMethods,
   ];
@@ -1435,6 +1443,8 @@ function completeDiscoveryHarness(
       failSessionLoading() {}
       noteSessionRead() {}
       loadingLine = new SessionLoadingLine((event, record) => this.diagnostics.warn(event, record));
+      commitRepositories = new CommitRepositories({ run: async () => null }, () => {});
+      repositoryCommits = new RepositoryCommits({ run: async () => null }, () => {});
       _showing = null; selections = []; messages = []; partial = []; catalog = null; drawnCards = [];
       coverageRevision = 0; enumeratedAdmissionComplete = true;
       authoritativeCatalog = null; attachmentHandoffs = new Set(); titles = new Map();
@@ -1767,6 +1777,7 @@ function metadataHarness(
       failSessionLoading() {}
       noteSessionRead() {}
       titles = new Map(); carriedNames = new Map(); refreshGeneration = 1; metadataRevision = 0;
+      commitRepositories = new CommitRepositories({ run: async () => null }, () => {});
       revision = ${derivedCacheFile ? 'null' : '{ size: 11, mtimeMs: 11, dev: 1, ino: 2 }'};
       codexMetas = { get() { return undefined; } };
       derivedCacheCheckpointState = { markChanged() {} };
@@ -1786,6 +1797,7 @@ function metadataHarness(
   ).code;
   const module = { exports: {} as any };
   const scope = {
+    CommitRepositories,
     INITIAL_RAIL_READ_BYTES,
     metadataReadBudget,
     sameSessionRevision,
@@ -1829,6 +1841,8 @@ function selectedWindowHarness(
     'commitRepositoryTurns',
     'commitRepositoryContexts',
     'applyCommitRepositoryEvidence',
+    'applyCommitRepositories',
+    'agentFile',
     'hydrateCommitRepositories',
     'acceptExplicitMetadataRead',
     'storeTitleEntry',
@@ -1870,6 +1884,8 @@ function selectedWindowHarness(
       trail = { places: [], at: -1 };
       settleRailSeed() {}
       cache = new Map(); refreshes = 0; published = []; dropped = 0; lastError = null;
+      commitRepositories = new CommitRepositories({ run: async () => null }, () => {});
+      repositoryCommits = new RepositoryCommits({ run: async () => null }, () => {});
       history = new Map(); historyStructuralKeys = new Map(); structural = ''; historyRequest = null;
       session = { file: 'selected.jsonl', sessionId: 'selected', agent: 'claude', size: 10, mtimeMs: 10, dev: 1, ino: 2 };
       catalog = null; refreshResults = [];
@@ -1929,6 +1945,8 @@ function selectedWindowHarness(
     'codexAgentSpendVersion',
     'codexSpendIndex',
     'withMetadataCoverage',
+    'CommitRepositories',
+    'RepositoryCommits',
     compiled,
   )(
     module,
@@ -1959,6 +1977,8 @@ function selectedWindowHarness(
     codexAgentSpendVersion,
     codexSpendIndex,
     withMetadataCoverage,
+    CommitRepositories,
+    RepositoryCommits,
   );
   return new module.exports.Harness(run);
 }
@@ -2262,6 +2282,8 @@ async function selectedPublicationFixture(
   const repositories = new RepositoryCommits({ run: async () => null }, () => {});
   provider.repositoryCommits = repositories;
   const repo = repositories as any;
+  repositories.apply([], provider.folders());
+  await repo.work;
   const destination = path.join(directory, 'verified');
   const key = `candidates|exact|abc1234|${[destination, 'project'].map(normalizeFsPath).sort().join('|')}`;
   repo.exactAnswers.set(key, { dir: destination });
