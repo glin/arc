@@ -64,7 +64,11 @@ test('verified commit cache bounds and validates its independent observation for
   }
   const many = Array.from({ length: MAX_COMMIT_REPOSITORIES + 1 }, (_, index) => ({
     ...row,
-    file: path.join(directory, `${index}.jsonl`),
+    file: `/source/${index}`,
+    dir: '/repo',
+    root: { ...row.root, path: '/repo' },
+    command: { ...row.command, path: '/repo' },
+    common: { ...row.common, path: '/repo/.git' },
   }));
   assert.equal(boundedCommitRepositories(many).length, MAX_COMMIT_REPOSITORIES);
   const large = many.map((item) => ({ ...item, dir: 'x'.repeat(4096) }));

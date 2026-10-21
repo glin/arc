@@ -285,6 +285,16 @@ test('the lens figure equals what its press draws, with and without a query', ()
     testCard('ui-running', { status: 'running', at: recent, labels: ['ui'] }),
     testCard('perf-unread', { status: 'done', unread: true, at: recent, labels: ['perf'] }),
     testCard('plain-read', { status: 'done', unread: false, at: recent }),
+    ...(['waiting', 'running', 'done'] as const).map((status) =>
+      testCard(`ui-unknown-${status}`, {
+        status,
+        unread: true,
+        at: recent,
+        labels: ['ui'],
+        runByAgent: null,
+        cache: { expiresAt: now + 60_000, nearlyGoneAt: null },
+      }),
+    ),
     testCard('ui-stale-unread', { status: 'done', unread: true, at: stale, labels: ['ui'] }),
     testCard('ui-warm-stale', {
       status: 'done',
@@ -320,6 +330,7 @@ test('the lens figure equals what its press draws, with and without a query', ()
       }
     }
   }
+  assert.equal(railLensHolds({ at: recent, runByAgent: null }, now), false);
   // The rail holds exactly what both keep.
   assert.deepEqual(drawnUnderLens(cards, 'label:ui', 'active', RAIL_SHOWN_BUCKETS, now), [
     'pinned-ui-unread',
@@ -384,6 +395,7 @@ test('the Unread and Needs input lenses keep what they drew until the query chan
     assert.deepEqual(ids(railShownCards(change({ labels: ['perf'] }), rail, now, false, kept)), [], lens);
     assert.deepEqual(ids(railShownCards(change({ archived: true }), rail, now, false, kept)), [], lens);
     assert.deepEqual(ids(railShownCards(change({ runByAgent: true }), rail, now, false, kept)), [], lens);
+    assert.deepEqual(ids(railShownCards(change({ runByAgent: null }), rail, now, false, kept)), [], lens);
     const perf = { query: withRailLens('label:ui label:perf', lens) };
     assert.deepEqual(ids(railShownCards(read, perf, now, false, kept)), [], lens);
     const other = { query: withRailLens('label:ui', lens === 'unread' ? 'input' : 'unread') };

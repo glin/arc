@@ -3276,6 +3276,7 @@ test('command-only admission removes pending rows through every catalog path and
     readThreadNames: () => ({ stamp: '', names: new Map() }),
     projectsRoot: () => directory,
     codexSessionsRoot: () => directory,
+    enumerateClaudeChildSources: renameTranscripts.enumerateClaudeChildSources,
     enumerateSessionFilesFor: () => ({
       sessions: sources,
       files: sources.map((source) => source.file),
@@ -5413,6 +5414,7 @@ test('window session pages lose coverage when a served transcript is replaced at
       projectsRoot: () => '',
       codexSessionsRoot: () => '',
       // The full walk stats every source again.
+      enumerateClaudeChildSources: renameTranscripts.enumerateClaudeChildSources,
       enumerateSessionFilesFor: () => ({
         sessions: sources.map((source) => ({ ...source, ...revisionOf(fs.statSync(source.file, { bigint: true })) })),
         files: sources.map((source) => source.file),
@@ -9983,6 +9985,141 @@ test('the selected session is the progressive read target', () => {
 });
 
 // Worker metadata carries the agent-run classification to session list rows.
+test(
+  'malformed small Claude classification stays unknown through metadata acceptance and restart',
+  { tags: ['subprocess'] },
+  async () => {
+    const directory = tempDir('classification-unknown-');
+    const file = path.join(directory, 'unknown.jsonl');
+    const at = new Date('2026-10-21T12:00:00.000Z');
+    const prompt =
+      JSON.stringify({
+        type: 'user',
+        cwd: directory,
+        timestamp: at.toISOString(),
+        message: { role: 'user', content: 'Read inputs' },
+      }) + '\n';
+    fs.writeFileSync(file, 'broken\n' + prompt);
+    fs.utimesSync(file, at, at);
+    const session = {
+      agent: 'claude' as const,
+      file,
+      sessionId: 'unknown',
+      ...revisionOf(fs.statSync(file, { bigint: true })),
+    };
+    assert.ok(session.size < 262144);
+    assert.equal(readSessionMeta(file).agentRun, null);
+    const fixture = metadataEnrichmentFixture([session]);
+    const provider = fixture.provider;
+    Object.assign(provider, {
+      saved: {},
+      startedHere: new Set(),
+      dispatchFacts: new Map(),
+      dispatchDiscoveryPending: false,
+    });
+    const classification = () => provider.agentRunFor(session, new Map());
+    const check = () => {
+      assert.equal(classification(), null);
+      for (const query of ['is:agentrun', '-is:agentrun'])
+        assert.deepEqual(
+          matchSessions([{ id: session.sessionId, label: '', agent: 'Claude', runByAgent: classification() }], query),
+          [],
+        );
+    };
+    try {
+      await provider.prepareMetadata([session], provider.refreshGeneration, new AbortController().signal);
+      check();
+      const cache = path.join(directory, 'cache.json');
+      const legacy = { ...provider.titles.get(file), agentRun: false };
+      saveDerivedCache(cache, [[file, legacy]]);
+      const restart = () => {
+        const listener = vi.spyOn(PanelProvider.prototype as any, 'wireEditorListeners').mockImplementation(() => {});
+        let restarted: InstanceType<typeof PanelProvider> | undefined;
+        try {
+          restarted = new PanelProvider('', {} as vscode.Uri, undefined, undefined, cache);
+          provider.titles = (restarted as any).titles;
+        } finally {
+          restarted?.dispose();
+          listener.mockRestore();
+        }
+      };
+      restart();
+      check();
+      await provider.prepareMetadata([session], provider.refreshGeneration, new AbortController().signal);
+      check();
+      saveDerivedCache(cache, provider.titles);
+      const stored = JSON.parse(fs.readFileSync(cache, 'utf8')).titles[0].entry;
+      assert.equal(stored.agentRun, false);
+      assert.equal(stored.label, provider.titles.get(file).label);
+      restart();
+      check();
+      await provider.prepareMetadata([session], provider.refreshGeneration, new AbortController().signal);
+      check();
+      fs.writeFileSync(file, prompt);
+      fs.utimesSync(file, at, new Date(at.getTime() + 1000));
+      Object.assign(session, revisionOf(fs.statSync(file, { bigint: true })));
+      check();
+      await provider.prepareMetadata([session], provider.refreshGeneration, new AbortController().signal);
+      assert.equal(classification(), false);
+    } finally {
+      fixture.worker.stop();
+    }
+  },
+);
+
+test('EOF-covered agent-run classification survives host acceptance of an unfinished final record', () => {
+  const directory = tempDir('classification-eof-');
+  const file = path.join(directory, 'eof.jsonl');
+  const at = new Date('2026-10-21T12:00:00.000Z');
+  const prompt =
+    JSON.stringify({
+      type: 'user',
+      entrypoint: 'sdk-cli',
+      timestamp: at.toISOString(),
+      message: { role: 'user', content: 'Read inputs' },
+    }) + '\n';
+  const padding = JSON.stringify({ type: 'ignored', text: '' }) + '\n';
+  fs.writeFileSync(
+    file,
+    prompt +
+      padding.replace('"text":""', '"text":"' + 'x'.repeat(299960 - prompt.length - padding.length) + '"') +
+      '{"unfinished":"' +
+      'x'.repeat(25),
+  );
+  fs.utimesSync(file, at, at);
+  const session = { agent: 'claude', file, sessionId: 'eof', ...revisionOf(fs.statSync(file, { bigint: true })) };
+  assert.equal(session.size, 300000);
+  const scan = renameTranscripts.scanForAgentRun(file, session.size);
+  assert.equal(scan.bytes, 299960);
+  assert.equal(scan.end, session.size);
+  const entry = {
+    ...session,
+    sourceIdentity: { dev: session.dev, ino: session.ino },
+    agentRun: renameTranscripts.agentRunOfScan(scan, session.size),
+    agentRunScan: scan,
+  };
+  const provider: any = Object.assign(Object.create(PanelProvider.prototype), {
+    saved: {},
+    startedHere: new Set(),
+    dispatchFacts: new Map(),
+    dispatchDiscoveryPending: false,
+    metaFor: () => entry,
+  });
+  const classify = () => provider.agentRunFor(session, new Map());
+  assert.equal(classify(), true);
+  assert.deepEqual(
+    matchSessions([{ id: 'eof', label: '', agent: 'Claude', runByAgent: classify() }], 'is:agentrun').map(
+      (row) => row.id,
+    ),
+    ['eof'],
+  );
+  delete (scan as { end?: number }).end;
+  assert.equal(classify(), null);
+  scan.end = 300000;
+  entry.mtimeMs++;
+  assert.equal(classify(), null);
+});
+
 test('worker metadata carries the agent-run mark to the host', () => {
   const rowsAt = panelHostSource.indexOf('this.sessionRows = all.map(');
   assert.notEqual(rowsAt, -1, 'panelhost.ts no longer builds the rail rows, so this guard reads nothing');
@@ -9993,12 +10130,12 @@ test('worker metadata carries the agent-run mark to the host', () => {
   );
   sourceMatch(
     panelHostSource,
-    /private agentRunFor\(session: SessionFile, edges: ReadonlyMap<string, SessionParentEdge>\): boolean \{[^}]*return agentRunAnswer\(\s*this\.metaFor\(session\)\.agentRun,/,
+    /private agentRunFor\(session: SessionFile, edges: ReadonlyMap<string, SessionParentEdge>\): boolean \| null \{[^}]*return agentRunAnswer\(\s*guessed,/,
     'the host does not apply the reader-owned override to worker metadata',
   );
   sourceMatch(
     fs.readFileSync(path.join(__dirname, 'progressiveworker-entry.ts'), 'utf8'),
-    /agentRun: session\.agentRun === true \|\| claude\?\.agentRun === true/,
+    /agentRun: session\.agentRun === true \? true : claude \? claude\.agentRun : false/,
     'the worker drops the transcript agent-run fact before the host can apply that override',
   );
 });
@@ -10020,7 +10157,7 @@ test('a session this window started overrides what its transcript suggests', () 
   assert.notEqual(readAt, -1, 'the agent-run answer is no longer read in one place');
   sourceMatch(
     memberFrom(panelHostSource, readAt),
-    /agentRunAnswer\(\s*this\.metaFor\(session\)\.agentRun, session\.sessionId, this\.startedHere, session\.childTranscript === true,\s*dispatched, dispatched && \(edge\.owned === true \|\| this\.dispatchFacts\.get\(session\.sessionId\)\?\.person === true\)\s*\)/,
+    /agentRunAnswer\(\s*guessed, session\.sessionId, this\.startedHere, session\.childTranscript === true,\s*dispatched \? true : this\.dispatchDiscoveryPending \? null : false, dispatched && \(edge\.owned === true \|\| this\.dispatchFacts\.get\(session\.sessionId\)\?\.person === true\)\s*\)/,
     'the one seam every caller reads takes the transcript guess alone',
   );
 
@@ -11327,7 +11464,7 @@ test('Claude child mode reaches metadata, enrichment, selection, and search read
   sourceMatch(workerEntry, /readSessionTurnStarts\([^;]*session\.childTranscript === true\)/);
   sourceMatch(
     workerEntry,
-    /agentRun: session\.agentRun === true \|\| claude\?\.agentRun === true/,
+    /agentRun: session\.agentRun === true \? true : claude \? claude\.agentRun : false/,
     'metadata enrichment can erase structural child classification',
   );
   sourceMatch(
@@ -33495,6 +33632,66 @@ test.each(['queued', 'accepted'])(
   },
 );
 
+test('a failed first child stat blocks accepted direct and queued delivery until pathname absence', async () => {
+  const { provider, workspace, projects } = await coverageEnumerationFixture();
+  const directory = path.join(projects, renameTranscripts.projectSlug(workspace));
+  fs.mkdirSync(directory, { recursive: true });
+  const at = new Date('2026-10-21T12:00:00.000Z');
+  const write = (file: string) => {
+    fs.writeFileSync(file, JSON.stringify({ type: 'user', cwd: workspace }) + '\n');
+    fs.utimesSync(file, at, at);
+  };
+  write(path.join(directory, 'shared.jsonl'));
+  write(path.join(directory, 'parent.jsonl'));
+  const scope = JSON.stringify([
+    workspace,
+    ...provider.repositoryScopeRoots.filter((root: string) => root !== workspace),
+  ]);
+  provider.authoritativeCatalogScope = scope;
+  provider.authoritativeCatalog = provider.acceptSessionCoverage(provider.allSessions(), scope);
+  assert.equal(provider.membershipOf('shared'), 'present');
+  const child = path.join(directory, 'parent', 'subagents', 'agent-shared.jsonl');
+  fs.mkdirSync(path.dirname(child), { recursive: true });
+  write(child);
+  const mutableFs = createRequire(__filename)('node:fs') as typeof fs;
+  const original = mutableFs.statSync;
+  const refused = vi.spyOn(mutableFs, 'statSync').mockImplementation(((...args: any[]) => {
+    if (args[0] === child) throw Object.assign(new Error('unavailable child stat'), { code: 'EACCES' });
+    return (original as any)(...args);
+  }) as typeof fs.statSync);
+  syncBuiltinESMExports();
+  try {
+    for (let pass = 0; pass < 2; pass++) {
+      const observed = provider.allSessions();
+      assert.ok(!observed.some((source: any) => source.file === child));
+      assert.equal(provider.membershipOf('shared'), 'unknown');
+      assert.equal(provider.stateFor('shared'), null);
+      assert.equal(provider.readerWork('shared'), 'unknown');
+    }
+    const host = { webview: {} };
+    provider.hosts = [host];
+    provider.hostSessions = new Map([[host, 'shared']]);
+    const sent: string[] = [];
+    provider.onSendPrompt = async () => {
+      sent.push('shared');
+      return { delivered: true };
+    };
+    await provider.acceptSubmission('Continue', 'shared', 1, 'shared', host);
+    provider.queues.shared = queueSubmissionAfter([], 'failed-stat-queued', 'Continue', [], [], 1, false, {
+      agent: 'claude',
+      owner: 'shared',
+    });
+    provider.flushQueue('shared');
+    assert.deepEqual(sent, []);
+  } finally {
+    refused.mockRestore();
+    syncBuiltinESMExports();
+  }
+  fs.unlinkSync(child);
+  provider.authoritativeCatalog = provider.acceptSessionCoverage(provider.allSessions(), scope);
+  assert.equal(provider.membershipOf('shared'), 'present');
+});
+
 test.each([false, true])(
   'submitted recovery reconstruction and two-panel replacement retain readable attempts (failed storage %s)',
   async (failed) => {
@@ -37979,7 +38176,7 @@ test.each([false, true])(
   async (admitted) => {
     const enumeration = methodBody('private walkedSessions(');
     const quarantineSource = ts.transpileModule(
-      `function quarantine(claude, codex, scope, sourceObservations = []) { const roots = scope.roots; const physicalContext = { domain: "physical", scope: JSON.stringify(scope.roots), revision: String(this.coverageRevision) }; const walkedSessions = [...claude, ...codex]; ${enumeration.slice(enumeration.indexOf('this.enumeratedMembers ='), enumeration.indexOf('this.catalog = { folders: folderPrint', enumeration.indexOf('this.enumeratedMembers =')))} }`,
+      `function quarantine(claude, codex, scope, sourceObservations = [], childSources = []) { const roots = scope.roots; const physicalContext = { domain: "physical", scope: JSON.stringify(scope.roots), revision: String(this.coverageRevision) }; const walkedSessions = [...claude, ...codex]; ${enumeration.slice(enumeration.indexOf('this.enumeratedMembers ='), enumeration.indexOf('this.catalog = { folders: folderPrint', enumeration.indexOf('this.enumeratedMembers =')))} }`,
       { compilerOptions: { target: ts.ScriptTarget.ES2022 } },
     ).outputText;
     const quarantine = new Function(
@@ -38062,9 +38259,11 @@ test.each([false, true])(
         };
         quarantine.call(
           provider,
-          [source, collision].filter((entry) => entry.agent === 'claude'),
+          [source].filter((entry) => entry.agent === 'claude'),
           [source, collision].filter((entry) => entry.agent === 'codex'),
           { roots: [root] },
+          [],
+          agent === 'claude' ? [{ ...collision, childTranscript: true }] : [],
         );
         assert.equal(provider.membershipOf(source.sessionId), 'unknown');
         assert.equal(provider.stateFor(source.sessionId), null);

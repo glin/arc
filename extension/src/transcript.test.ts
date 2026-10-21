@@ -1,6 +1,6 @@
 import { test, vi } from 'vitest';
 import { agentRunAnswer } from './turnrail';
-import { enumerateSessionFiles, enumerateSessionFilesFor } from './transcript';
+import { enumerateClaudeChildSources, enumerateSessionFiles, enumerateSessionFilesFor } from './transcript';
 import { createRequire, syncBuiltinESMExports } from 'node:module';
 import { EXPORT_LIMITS, ExportLimitError } from './exportlimits.ts';
 import {
@@ -16738,4 +16738,45 @@ test('Claude candidate stat failure remains incomplete instead of successful emp
     spy.mockRestore();
     syncBuiltinESMExports();
   }
+});
+
+test('physical child census retains unreferenced identity competitors across source changes', () => {
+  const root = tempDir('claude-identity-census-');
+  const parents = ['parent-a', 'parent-b'].map((sessionId) => ({
+    agent: 'claude' as const,
+    sessionId,
+    file: path.join(root, sessionId + '.jsonl'),
+    size: 1,
+    mtimeMs: 1,
+  }));
+  const files = parents.map((parent) => path.join(root, parent.sessionId, 'subagents', 'agent-shared-child.jsonl'));
+  const bytes = (cwd: string) => JSON.stringify({ cwd }) + String.fromCharCode(10);
+  for (const file of files) {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, bytes('c:/repo'));
+    fs.utimesSync(file, new Date('2026-10-21T12:00:00Z'), new Date('2026-10-21T12:00:00Z'));
+  }
+  const read = () => enumerateClaudeChildSources(parents);
+  assert.deepEqual(
+    read().sessions.map((source) => source.sessionId),
+    ['shared-child', 'shared-child'],
+  );
+  assert.equal(read().status, 'complete');
+  const before = read().sessions[0];
+  fs.writeFileSync(files[0], bytes('d:/repo'));
+  fs.utimesSync(files[0], new Date('2026-10-21T12:00:01Z'), new Date('2026-10-21T12:00:01Z'));
+  assert.equal(read().sessions[0].cwd, 'd:/repo');
+  assert.notEqual(read().sessions[0].mtimeMs, before.mtimeMs);
+  fs.appendFileSync(files[0], '{}' + String.fromCharCode(10));
+  assert.ok(read().sessions[0].size > before.size);
+  fs.writeFileSync(files[0], '{}' + String.fromCharCode(10));
+  assert.equal(read().status, 'incomplete');
+  assert.equal(read().sessions[0].sessionId, 'shared-child');
+  assert.equal(read().sessions[0].cwd, undefined);
+  fs.unlinkSync(files[0]);
+  assert.deepEqual(
+    read().sessions.map((source) => source.file),
+    [files[1]],
+  );
+  assert.ok(read().directories?.includes(path.dirname(files[0])));
 });

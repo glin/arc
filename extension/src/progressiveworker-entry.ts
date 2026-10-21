@@ -1101,7 +1101,7 @@ async function execute(
         label,
         fullLabel: title?.full || claude?.fullTitle || '',
         activityMs: meta.activityMs,
-        agentRun: session.agentRun === true || claude?.agentRun === true,
+        agentRun: session.agentRun === true ? true : claude ? claude.agentRun : false,
         outcome: meta.outcome,
         stats: meta.stats ?? null,
         ...(claude?.backgroundCommands ? { backgroundCommands: claude.backgroundCommands } : {}),

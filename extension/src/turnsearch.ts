@@ -67,7 +67,7 @@ function termHolds(term: FilterTerm, entry: SearchEntry): boolean {
     null,
     false,
     false,
-    entry.runByAgent === true,
+    entry.runByAgent === null ? null : entry.runByAgent === true,
     entry.archived === true,
     false,
     null,
@@ -94,7 +94,7 @@ export interface SearchEntry {
   // Session archived and agent-run facts supplied at search time.
   // Missing facts do not match `is:archived` or `is:agentrun`.
   archived?: boolean;
-  runByAgent?: boolean;
+  runByAgent?: boolean | null;
 }
 
 export interface SearchHit {

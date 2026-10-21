@@ -39,6 +39,7 @@ import {
   isInside,
   replacedCatalogFiles,
   ClaudeChildSessionCache,
+  enumerateClaudeChildSources,
   revisionOf as fileRevisionOf,
   revalidatedCatalogPaths,
 } from './transcript';
@@ -1391,6 +1392,7 @@ function completeDiscoveryHarness(
     outcomesFor,
     replacedCatalogFiles: async () => [],
     enumerateRolloutFilesAsync,
+    enumerateClaudeChildSources,
     ...scope,
   };
   const names = [
@@ -1489,7 +1491,7 @@ function completeDiscoveryHarness(
       commitRepositories = new CommitRepositories({ run: async () => null }, () => {});
       repositoryCommits = new RepositoryCommits({ run: async () => null }, () => {});
       _showing = null; selections = []; messages = []; partial = []; catalog = null; drawnCards = [];
-      coverageRevision = 0; enumeratedAdmissionComplete = true;
+      coverageRevision = 0; enumeratedAdmissionComplete = true; claudeChildren = [];
       authoritativeCatalog = null; attachmentHandoffs = new Set(); titles = new Map();
       metadataRevision = 0; drawnMetadataRevision = 0; startupProgressAt = 0;
       derivedCacheCheckpointState = { markChanged() {} };
@@ -5555,7 +5557,7 @@ test('the first rail gives back the prompt head a titled session did not read', 
 function bumpedDerivedCache() {
   const cacheFile = path.join(tempDir('derived-names-'), 'derived-session-cache.json');
   const codex = {
-    file: 'codex.jsonl',
+    file: 'fixture/codex.jsonl',
     sessionId: '01a08461-0000-7000-8000-000000000001',
     agent: 'codex' as const,
     size: 1000,
@@ -5563,7 +5565,7 @@ function bumpedDerivedCache() {
     ino: 2,
   };
   const claude = {
-    file: 'claude.jsonl',
+    file: 'fixture/claude.jsonl',
     sessionId: '6f2c1d9e-0000-4000-8000-000000000002',
     agent: 'claude' as const,
     size: 1000,
@@ -5571,7 +5573,7 @@ function bumpedDerivedCache() {
     ino: 2,
   };
   const child = {
-    file: 'claude-child.jsonl',
+    file: 'fixture/claude-child.jsonl',
     sessionId: 'agent-child',
     agent: 'claude' as const,
     childTranscript: true,
@@ -5694,6 +5696,16 @@ function bumpedCatalogHarness(scope: Record<string, unknown> = {}) {
         status: 'complete',
         uncertain: [],
       }),
+      enumerateClaudeChildSources: (parents: SessionFile[]) => {
+        const sessions = parents.filter((session) => session.childTranscript);
+        return {
+          sessions,
+          files: sessions.map((session) => session.file),
+          directories: ['fixture'],
+          status: 'complete',
+          uncertain: [],
+        };
+      },
       CLAUDE_CHILD_REFERENCE_PARSER_VERSION,
       codexSessionsRoot: () => 'sessions',
       codexSessionFiles: () => ({

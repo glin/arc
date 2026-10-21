@@ -717,3 +717,10 @@ test('ID shorthand resolves unions and collisions against complete catalog ident
   ])
     assert.ok(!sessionQueryNeedsShorthand(query));
 });
+
+test('unknown agent-run classification matches neither polarity', () => {
+  const rows = [{ id: 'unknown', agent: 'Claude', label: 'unknown', runByAgent: null }];
+  assert.deepEqual(matchSessions(rows, 'is:agentrun'), []);
+  assert.deepEqual(matchSessions(rows, '-is:agentrun'), []);
+  assert.deepEqual(matchSessions(rows, ''), rows);
+});

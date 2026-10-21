@@ -62,7 +62,7 @@
   "extension/src/derivedcache.test.ts": {
     "reason": "Independent writers and host death must preserve shared cache rows and release stale filesystem locks.",
     "cases": 89,
-    "matricesSha256": "7f2dc2c5d52f8fdadbbcbb0571b1f94766fccdf5c2b8dbe703091d3791832a8c"
+    "matricesSha256": "55da9f9b63e6e59531ede691941eea3b7eaaed01debbccc5b7174a6d01e191af"
   },
   "extension/src/exportsite.browser.test.ts": {
     "reason": "An offline exported session must retain interactive navigation and safe local browser behavior.",
@@ -126,8 +126,8 @@
   },
   "extension/src/panel.webview.test.ts": {
     "reason": "Real progressive workers must deliver bounded recovery and metadata through the production panel host.",
-    "cases": 605,
-    "matricesSha256": "2b7b3edc338b6d40564775b0aff9bf5285f7264bb8a7b9160b0290bb8328e386"
+    "cases": 608,
+    "matricesSha256": "63fd2a0aa0ebf609ba2d08cb849d86ffb9d15491f8b4523b9c887ecfd5d6e4d7"
   },
   "extension/src/panelbundle.test.ts": {
     "reason": "The panel bundle and fixture must contain the production entry, source identity, and substituted text.",
@@ -192,7 +192,7 @@
   "extension/src/startup.test.ts": {
     "reason": "Real title workers must publish recovered metadata through startup ownership and cancellation boundaries. Project cost snapshots must preserve workspace, revision, and calendar ownership during background slices. Agent messages must preserve durable admission, settlement wakeups, native delivery authority, and retained retries.",
     "cases": 233,
-    "matricesSha256": "50bb86015d2d5cac8abb46e86715ee9927379b72f82593fd5d8ea308c20243ee"
+    "matricesSha256": "b1e62e224043da67fa869548dbad7cdb3463b0d726f9309192cf06a6d5451599"
   },
   "extension/src/store.test.ts": {
     "reason": "The real Stop hook must renew retention for useful snapshot stores without changing workspace files.",

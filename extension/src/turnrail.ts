@@ -390,7 +390,7 @@ export interface RailCard {
   agentRun: boolean;
   // The `agentRun` fact, independent of its bucket. Archiving does not change it.
   // Lens figures and `is:agentrun` exclude agent runs whether or not the Archived switch is on.
-  runByAgent: boolean;
+  runByAgent: boolean | null;
   // Agent wording for the card meta row. Pinned agent runs use the agent-run phrase.
   agentWord: string;
   // The newest turn's status, or null when unknown.
@@ -1057,14 +1057,32 @@ export function agentRunAnswer(
   startedHere: ReadonlySet<string>,
   childTranscript: boolean,
   dispatched: boolean,
+  readerOwned?: boolean,
+): boolean;
+export function agentRunAnswer(
+  guessed: boolean | null,
+  sessionId: string,
+  startedHere: ReadonlySet<string>,
+  childTranscript: boolean,
+  dispatched: boolean | null,
+  readerOwned?: boolean,
+): boolean | null;
+export function agentRunAnswer(
+  guessed: boolean | null,
+  sessionId: string,
+  startedHere: ReadonlySet<string>,
+  childTranscript: boolean,
+  dispatched: boolean | null,
   readerOwned = false,
-): boolean {
+): boolean | null {
   if (childTranscript) {
     return true;
   }
   if (startedHere.has(sessionId) || (dispatched && readerOwned)) {
     return false;
   }
+  if (dispatched === null)
+    return guessed === false && readerOwned ? false : guessed === true && !readerOwned ? true : null;
   return dispatched || guessed;
 }
 
@@ -1088,7 +1106,7 @@ export function railSessions(
     when: string;
     at: number;
     relative: string;
-    agentRun?: boolean;
+    agentRun?: boolean | null;
   }[],
   counts: ReadonlyMap<string, NewCount>,
   newest: ReadonlyMap<string, number>,
@@ -1130,7 +1148,7 @@ export function railSessions(
     // Archiving and pinning take precedence over inferred session origins. Archived runs stay in Archived. Pinned runs stay at the top.
     // Only pinned runs need the origin phrase because they appear without a heading that supplies it.
     const agentRun = s.agentRun === true && !archived;
-    const runByAgent = s.agentRun === true;
+    const runByAgent = s.agentRun === null ? null : s.agentRun === true;
     const status = statuses.get(s.id) ?? null;
     const runningSince = status === 'running' ? (runningSinceById.get(s.id) ?? null) : null;
     const runningSinceWhen = runningSince === null ? null : formatWhen(runningSince, now);

@@ -199,7 +199,7 @@ export interface RailCardView extends Record<string, unknown> {
   agentRun?: boolean;
   // Agent-run identity independent of the displayed bucket, including archived sessions.
   // The host must supply it for agent-run counts and filters.
-  runByAgent?: boolean;
+  runByAgent?: boolean | null;
   status: 'background' | 'done' | 'failed' | 'interrupted' | 'running' | 'stopped' | 'subagents' | 'waiting' | null;
   subagents: number | null;
   commands: number | null;

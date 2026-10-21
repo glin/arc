@@ -625,6 +625,7 @@ test('a content search reads the archived and agent-run facts its entries carry'
     entry({ key: 'mine', sessionId: 'mine', summary: 'about the patch' }),
     entry({ key: 'away', sessionId: 'away', summary: 'about the patch', archived: true }),
     entry({ key: 'agent', sessionId: 'agent', summary: 'about the patch', runByAgent: true }),
+    entry({ key: 'unknown', sessionId: 'unknown', summary: 'about the patch', runByAgent: null }),
   ];
   const keys = (query: string): string[] =>
     searchTurns(entries, query)
@@ -633,7 +634,7 @@ test('a content search reads the archived and agent-run facts its entries carry'
   assert.deepEqual(keys('is:archived find: patch'), ['away']);
   assert.deepEqual(keys('is:agentrun find: patch'), ['agent']);
   assert.deepEqual(keys('-is:archived -is:agentrun find: patch'), ['mine']);
-  assert.deepEqual(keys('find: patch'), ['agent', 'away', 'mine']);
+  assert.deepEqual(keys('find: patch'), ['agent', 'away', 'mine', 'unknown']);
 });
 
 test('naming a session and searching it is one question, not two', () => {

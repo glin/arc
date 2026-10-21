@@ -113,6 +113,7 @@ import {
   FileRevision,
   projectsRoot,
   enumerateSessionFilesFor,
+  enumerateClaudeChildSources,
   readSession,
   scanSessionCwd,
   readQualifiedSessionCwd,
@@ -564,6 +565,7 @@ import {
   DerivedCacheCheckpointState,
   DerivedTitleEntry,
   agentRunScanUnread,
+  needsAgentRunScan,
   carryDerivedTitleFacts,
   derivedTitleCacheRevision,
   derivedTitleCacheStats,
@@ -1885,7 +1887,7 @@ export class PanelProvider implements vscode.Disposable {
     shown: boolean;
     at: number;
     relative: string;
-    agentRun: boolean;
+    agentRun: boolean | null;
   }>[] = [];
   // The session rows each panel holds from its last render and session list messages. Created on first use.
   private rowSenders: WeakMap<PanelHost, PanelRowSender> | undefined;
@@ -3138,6 +3140,10 @@ export class PanelProvider implements vscode.Disposable {
     const cached = this.derivedCacheFile ? loadDerivedCache(this.derivedCacheFile, this.legacyDerivedCacheFile) : null;
     if (cached) {
       this.titles = cached.titles;
+      // Cached negative answers require current classifier evidence after restart.
+      for (const [file, entry] of this.titles) {
+        if (entry.agentRun === false) this.titles.set(file, { ...entry, agentRun: null, foldedLabel: undefined });
+      }
       this.claudeChildReferenceEntries = cached.claudeChildReferences;
       this.discoveryCheckpoint = cached.discovery;
       this.carriedNames = cached.carriedNames;
@@ -10954,6 +10960,19 @@ export class PanelProvider implements vscode.Disposable {
       undefined,
       codexEnumeration,
     );
+    const census = enumerateClaudeChildSources([...claude, ...this.claudeChildren]);
+    const childSources = census.sessions.filter((source) => !source.cwd || inRoots(source.cwd));
+    claudeListing.files = [...claudeListing.files, ...census.files];
+    claudeListing.directories = [...(claudeListing.directories ?? []), ...(census.directories ?? [])];
+    claudeListing.uncertain = [...claudeListing.uncertain, ...census.uncertain];
+    if (census.status !== 'complete') claudeListing.status = 'incomplete';
+    for (const source of census.sessions)
+      if (source.cwd)
+        sourceObservations.push({
+          ...physicalContext,
+          source,
+          excluded: !inRoots(source.cwd),
+        });
     this.sourceEnumerations = { claude: claudeListing, codex: listing.enumeration };
     // Only a cached file that the walk missed needs this, so a refresh with none builds no path sets.
     let physical: SessionCoverage | undefined;
@@ -11018,7 +11037,7 @@ export class PanelProvider implements vscode.Disposable {
       this.activityFor(session),
     );
     this.enumeratedMembers = new Set();
-    const enumeratedSources = sessionPageSources([...claude, ...codex]);
+    const enumeratedSources = sessionPageSources([...claude, ...childSources, ...codex]);
     this.enumeratedCollisions = reconcileSessionCollisions(
       enumeratedSources,
       this.enumeratedCollisions,
@@ -11375,8 +11394,9 @@ export class PanelProvider implements vscode.Disposable {
       current
         .filter(
           (source) =>
-            this.enumeratedMembers?.has(sessionCoverageMember(source)) ||
-            (source.childTranscript === true && !this.dispatchDiscoveryPending),
+            !this.enumeratedAmbiguousIds?.has(source.sessionId) &&
+            (this.enumeratedMembers?.has(sessionCoverageMember(source)) ||
+              (source.childTranscript === true && !this.dispatchDiscoveryPending)),
         )
         .map(sessionCoverageMember),
     );
@@ -11444,7 +11464,7 @@ export class PanelProvider implements vscode.Disposable {
     file?: string,
   ): import('./sessioncoverage').SessionPresence {
     const scope = JSON.stringify(this.repositoryScopeRoots ?? []);
-    if (!this.repositoryScopeReady) return 'unknown';
+    if (!this.repositoryScopeReady || this.enumeratedAmbiguousIds?.has(sessionId)) return 'unknown';
     const matches = (this.authoritativeCatalog ?? []).filter(
       (source) =>
         source.sessionId === sessionId && (!agent || source.agent === agent) && (!file || source.file === file),
@@ -12210,16 +12230,28 @@ export class PanelProvider implements vscode.Disposable {
   }
 
   // Apply reader-started and parent ownership to cached agent-run classification without changing the shared metadata fact.
-  private agentRunFor(session: SessionFile, edges: ReadonlyMap<string, SessionParentEdge>): boolean {
+  private agentRunFor(session: SessionFile, edges: ReadonlyMap<string, SessionParentEdge>): boolean | null {
     if (this.saved.agentRuns?.includes(session.sessionId)) return true;
     const edge = edges.get(session.sessionId);
     const dispatched = edge?.relation === 'dispatched';
+    const meta = this.metaFor(session);
+    const guessed =
+      meta.size < 0 ||
+      (meta.size >= 0 && !sameSessionRevision(meta, session)) ||
+      (meta.sourceIdentity !== undefined &&
+        (String(meta.sourceIdentity.dev) !== String(session.dev) ||
+          String(meta.sourceIdentity.ino) !== String(session.ino))) ||
+      (needsAgentRunScan(session) &&
+        agentRunScanUnread(session, meta.agentRunScan) > 0 &&
+        meta.agentRunScan?.end !== session.size)
+        ? null
+        : meta.agentRun;
     return agentRunAnswer(
-      this.metaFor(session).agentRun,
+      guessed,
       session.sessionId,
       this.startedHere,
       session.childTranscript === true,
-      dispatched,
+      dispatched ? true : this.dispatchDiscoveryPending ? null : false,
       dispatched && (edge.owned === true || this.dispatchFacts.get(session.sessionId)?.person === true),
     );
   }
@@ -13824,14 +13856,12 @@ export class PanelProvider implements vscode.Disposable {
     const archived = this.archivedSessions();
     const sessions = retainedSessions ?? this.allSessions(true);
     const parentEdges = this.sessionParentEdges(sessions).edges;
-    const runs = new Set(
-      sessions.filter((session) => this.agentRunFor(session, parentEdges)).map((session) => session.sessionId),
-    );
+    const runs = new Map(sessions.map((session) => [session.sessionId, this.agentRunFor(session, parentEdges)]));
     const labelled = scope.entries.map((e) => ({
       ...e,
       labels: labelsOf(this.saved.labels, e.sessionId),
       archived: archived.has(e.sessionId),
-      runByAgent: runs.has(e.sessionId),
+      runByAgent: runs.get(e.sessionId) ?? null,
     }));
     const hits = searchTurns(labelled, query, Date.now(), this.sessionQueryContext());
     void this.post({ type: 'results', query, hits, scope: searchScopeName(scope) });

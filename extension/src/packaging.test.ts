@@ -1177,7 +1177,7 @@ test('copied bundled hooks capture baselines and publish Stop after the extensio
 test('packaged tool modes pass Unix payload admission from archive attributes', () => {
   const root = tempDir('arc-vsix-modes-');
   const archive = path.join(root, 'arc.vsix');
-  const packaged = spawnSync(process.execPath, ['scripts/package.mjs', '--out', archive], {
+  const packaged = spawnSync(process.execPath, ['scripts/package.mjs', '--no-dependencies', '--out', archive], {
     cwd: extensionRoot,
     encoding: 'utf8',
   });

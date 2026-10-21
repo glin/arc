@@ -42,7 +42,7 @@ export interface DerivedTitleEntry {
   label: string;
   fullLabel: string;
   activityMs: number | null;
-  agentRun: boolean;
+  agentRun: boolean | null;
   outcome: TurnOutcome | null;
   // Background commands found by a tail read without a typed prompt.
   // `outcome` can still hold the lifetime outcome of that turn.
@@ -1211,7 +1211,10 @@ export function saveDerivedCache(
   commitRepositories: Iterable<VerifiedCommitRepository> = [],
 ): void {
   const titleRows = [...titles]
-    .map(([entryFile, entry]) => ({ file: entryFile, entry }))
+    .map(([entryFile, entry]) => ({
+      file: entryFile,
+      entry: entry.agentRun === null ? { ...entry, agentRun: false } : entry,
+    }))
     .sort((a, b) => a.file.localeCompare(b.file));
   const titled = new Set(titleRows.map((row) => row.file));
   const sourceEntries = new Map([...claudeChildReferences].map(([key, entry]) => [normalizeFsPath(key), entry]));

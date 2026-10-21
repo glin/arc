@@ -28,7 +28,7 @@ export interface PayloadSessionRow {
   when: string;
   at: number;
   relative: string;
-  agentRun?: boolean;
+  agentRun?: boolean | null;
 }
 
 export interface RailPayloadInput {

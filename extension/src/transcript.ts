@@ -3656,6 +3656,77 @@ export function enumerateSessionFiles(dir: string): SourceEnumeration & { sessio
   return { ...evidence, sessions: out.sort((a, b) => b.mtimeMs - a.mtimeMs) };
 }
 
+// Physical child identities reserve competition even without accepted relationship edges.
+export function enumerateClaudeChildSources(
+  parents: readonly SessionFile[],
+): SourceEnumeration & { sessions: SessionFile[] } {
+  const census: SourceEnumeration & { sessions: SessionFile[] } = {
+    status: 'complete',
+    files: [],
+    directories: [],
+    uncertain: [],
+    sessions: [],
+  };
+  const directories = new Set(
+    parents
+      .filter((parent) => parent.agent === 'claude')
+      .map((parent) =>
+        parent.childTranscript
+          ? path.dirname(parent.file)
+          : path.join(path.dirname(parent.file), parent.sessionId, 'subagents'),
+      ),
+  );
+  for (const directory of directories) {
+    const listing = enumerateSessionFiles(directory);
+    (census.directories as string[]).push(directory);
+    (census.files as string[]).push(...listing.files);
+    (census.uncertain as string[]).push(...listing.uncertain);
+    if (listing.status !== 'complete') census.status = 'incomplete';
+    for (const file of listing.uncertain) {
+      const name = path.basename(file);
+      if (path.dirname(file) !== directory || !name.startsWith('agent-') || !name.endsWith('.jsonl')) continue;
+      census.sessions.push({
+        agent: 'claude',
+        file,
+        sessionId: name.slice(6, -'.jsonl'.length),
+        size: -1,
+        mtimeMs: -1,
+        childTranscript: true,
+        agentRun: true,
+      });
+    }
+    for (const source of listing.sessions) {
+      if (!source.sessionId.startsWith('agent-')) continue;
+      const opening = readQualifiedSessionCwd(source.file);
+      if (
+        !opening ||
+        source.dev !== opening.revision.dev ||
+        source.ino !== opening.revision.ino ||
+        source.size !== opening.revision.size ||
+        source.mtimeMs !== opening.revision.mtimeMs
+      ) {
+        census.status = 'incomplete';
+        (census.uncertain as string[]).push(source.file);
+        census.sessions.push({
+          ...source,
+          sessionId: source.sessionId.slice(6),
+          childTranscript: true,
+          agentRun: true,
+        });
+        continue;
+      }
+      census.sessions.push({
+        ...source,
+        sessionId: source.sessionId.slice(6),
+        cwd: opening.value,
+        childTranscript: true,
+        agentRun: true,
+      });
+    }
+  }
+  return census;
+}
+
 // Reads the parent-owned identity edge without retaining the parent's turns. The result is
 // independent of the bounded selected-session cache, so old launches remain available after
 // that cache is evicted or after the extension host restarts.

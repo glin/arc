@@ -571,7 +571,7 @@ function plainTermHolds(
   status?: string | null,
   unread = false,
   cacheWarm = false,
-  runByAgent = false,
+  runByAgent: boolean | null = false,
   archived = false,
   active = false,
   // The exact count of cache-expiry returns from lifetime indexed facts. Null where the
@@ -623,7 +623,7 @@ function plainTermHolds(
     // The plain fact that an agent started this session. A card's own bucket flag gives way
     // to archiving, so the caller hands in the fact rather than the bucket.
     if (term.needle === 'agentrun') {
-      return runByAgent;
+      return runByAgent === true;
     }
     // The reader's own recency window, answered by the caller against its own clock the same
     // way `warm` is above.
@@ -656,7 +656,7 @@ export function sessionTermHolds(
   status?: string | null,
   unread = false,
   cacheWarm = false,
-  runByAgent = false,
+  runByAgent: boolean | null = false,
   archived = false,
   active = false,
   cacheExpiryCount: number | null = null,
@@ -664,7 +664,8 @@ export function sessionTermHolds(
   sessionId = '',
   readKnown = true,
 ): boolean {
-  if (term.invalid || term.unresolved) return false;
+  if (term.invalid || term.unresolved || (term.field === 'status' && term.needle === 'agentrun' && runByAgent === null))
+    return false;
   if (!readKnown && term.field === 'status' && (term.needle === 'read' || term.needle === 'unread')) return false;
   if (!readKnown && term.field === 'status' && term.needle === 'needsyou' && active && status !== 'waiting')
     return false;
@@ -733,7 +734,7 @@ export function matchSessions<
     cacheWarm?: boolean;
     // Whether an agent runs this session, which `is:agentrun` answers. A card's own bucket flag
     // turns this off when the session is archived, so the caller must hand in the plain fact.
-    runByAgent?: boolean;
+    runByAgent?: boolean | null;
     // Whether the reader archived this session, which `is:archived` answers, whether or not
     // the caller's own Show-archived switch draws the session.
     archived?: boolean;
@@ -769,7 +770,7 @@ export function matchSessions<
         session.status,
         session.unread === true,
         session.cacheWarm === true,
-        session.runByAgent === true,
+        session.runByAgent === null ? null : session.runByAgent === true,
         session.archived === true,
         session.active === true,
         session.cacheExpiryCount ?? null,

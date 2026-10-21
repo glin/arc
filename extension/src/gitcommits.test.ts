@@ -1560,7 +1560,15 @@ test.each(['source', 'global'] as const)('a full %s collection refreshes a live 
   const saved = initial.snapshot()[0];
   const count = limit === 'source' ? MAX_SOURCE_COMMIT_REPOSITORIES : MAX_COMMIT_REPOSITORIES;
   const rows = Array.from({ length: count }, (_, i) => ({
-    ...saved,
+    ...(i === 0
+      ? saved
+      : {
+          ...saved,
+          dir: '/repo',
+          root: { path: '/repo', dev: '1', ino: '2' },
+          command: { path: '/command', dev: '1', ino: '3' },
+          common: { path: '/repo/.git', dev: '1', ino: '4' },
+        }),
     file: i < MAX_SOURCE_COMMIT_REPOSITORIES ? f.file : `/source/${Math.floor(i / MAX_SOURCE_COMMIT_REPOSITORIES)}`,
     occurrence: i === 0 ? saved.occurrence : i.toString(16).padStart(64, '0'),
   }));

@@ -228,12 +228,12 @@ export function railCardActive(card: RailActiveCard, now: number): boolean {
 // The parts of a card the Active lens reads beyond recency: the reader's own filing.
 export interface RailLensCard extends RailActiveCard {
   archived?: boolean;
-  runByAgent?: boolean;
+  runByAgent?: boolean | null;
 }
 
 // The Active lens excludes archived sessions and agent runs, matching its -is:archived and -is:agentrun terms.
 export function railLensHolds(card: RailLensCard, now: number): boolean {
-  return !card.archived && !card.runByAgent && railCardActive(card, now);
+  return !card.archived && card.runByAgent !== null && !card.runByAgent && railCardActive(card, now);
 }
 
 // The parts of a rail card whose wording moves with the clock alone.
@@ -490,7 +490,7 @@ export interface RailBucketCard {
   pinnedTop: boolean;
   current: boolean;
   archived: boolean;
-  agentRun?: boolean;
+  agentRun?: boolean | null;
 }
 
 export function railBuckets<T extends RailBucketCard>(
@@ -593,7 +593,7 @@ export interface RailSectionCard extends RailBucketCard {
   // clock the caller passes in.
   cache?: RailCacheSpan | null;
   // Agent-run identity remains true when archiving clears agentRun presentation. Counts and cache matching use this identity.
-  runByAgent?: boolean;
+  runByAgent?: boolean | null;
 }
 
 // Figures for session list filter buttons and the View menu. Hidden buckets do not contribute.
@@ -655,7 +655,7 @@ export function railCounts(
       continue;
     }
     // All lenses exclude agent runs and archived sessions, even when Show settings draw them.
-    if (card.runByAgent || card.archived || !inQuery(card)) {
+    if (card.runByAgent === null || card.runByAgent || card.archived || !inQuery(card)) {
       continue;
     }
     if (railStatusRuns(card.status)) {
@@ -731,7 +731,9 @@ export function railShownCards<Card extends RailSectionCard>(
   const matched = new Set(matchSessions(rest, RAIL_LENS_WORDS[lens]).map((card) => card.id));
   const still = kept && kept.query === rail.query && railKeepingQuery(rail.query) ? kept.ids : null;
   return rest.filter(
-    (card) => matched.has(card.id) || (still !== null && still.has(card.id) && !card.archived && !card.runByAgent),
+    (card) =>
+      matched.has(card.id) ||
+      (still !== null && still.has(card.id) && !card.archived && card.runByAgent !== null && !card.runByAgent),
   );
 }
 
