@@ -209,6 +209,7 @@ export async function acquireBrowserLock({
   cancelHeartbeat = clearInterval,
   rename = renameSync,
   observation = null,
+  tryOnly = false,
 } = {}) {
   const lockName = `${label} test lock`;
   const heading = `${label[0].toUpperCase()}${label.slice(1)} tests`;
@@ -236,9 +237,10 @@ export async function acquireBrowserLock({
       queuePosition: null,
     };
     observation.event('queue', 'holder', detail);
-    console.log(
-      `${heading} holder observed at ${detail.observedAt}: ${describeHolder(owner)}. Observed for ${Math.round(detail.observedHolderMs)} ms. Queue position unavailable.`,
-    );
+    if (!tryOnly)
+      console.log(
+        `${heading} holder observed at ${detail.observedAt}: ${describeHolder(owner)}. Observed for ${Math.round(detail.observedHolderMs)} ms. Queue position unavailable.`,
+      );
   };
   try {
     while (true) {
@@ -287,6 +289,11 @@ export async function acquireBrowserLock({
         };
       }
       const { text: currentText, mtimeMs, owner: current } = readLock(lockPath);
+      if (tryOnly) {
+        observeHolder(current, currentText, mtimeMs);
+        observation?.end('queue', { lockPath, acquired: false });
+        return null;
+      }
       if (currentText === null) {
         staleObservation = null;
         continue; // The lock vanished between our publish attempt and our read.

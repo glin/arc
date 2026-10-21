@@ -5,7 +5,7 @@ const path = require('node:path');
 const { spawnSync } = require('node:child_process');
 const { EventEmitter } = require('node:events');
 
-// Tests that start real processes run in the locked test:subprocess lane.
+// Tests that start real processes run in the counted test:subprocess lane.
 const SUBPROCESS = { tags: ['subprocess'] };
 
 let runner;
@@ -603,6 +603,84 @@ test('a browser slot gives an incomplete owner record a grace period', async () 
     assert.deepEqual(readSlotOwner(root, 1), { pid: 707, token: 'after-grace' });
   } finally {
     permit?.release();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('conservative slots retain an interrupted publisher when it resumes after a contender', async () => {
+  const root = slotFixture();
+  const options = {
+    rootPath: root,
+    slotCount: 1,
+    conservativeRecovery: true,
+    tryOnly: true,
+    isProcessAlive: () => true,
+  };
+  let contender = Promise.resolve(null);
+  let publisher;
+  try {
+    publisher = await browserChannels.acquireBrowserSlot({
+      ...options,
+      pid: 1101,
+      token: 'publisher',
+      afterSlotCreated: () => {
+        contender = browserChannels.acquireBrowserSlot({
+          ...options,
+          pid: 1102,
+          token: 'contender',
+          now: () => Date.now() + 10_000,
+        });
+      },
+    });
+    assert.equal(await contender, null);
+    assert.deepEqual(readSlotOwner(root, 1), { pid: 1101, token: 'publisher' });
+    assert.equal(await browserChannels.acquireBrowserSlot({ ...options, pid: 1103, token: 'extra' }), null);
+    assert.equal(publisher.release(), true);
+    const successor = await browserChannels.acquireBrowserSlot({ ...options, pid: 1102, token: 'contender' });
+    assert.equal(successor.release(), true);
+  } finally {
+    publisher?.release();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('conservative slots retain a paused live reclaimer through its final removal', async () => {
+  const root = slotFixture();
+  const slot = path.join(root, 'slot-1');
+  fs.mkdirSync(slot);
+  fs.writeFileSync(path.join(slot, 'owner.json'), JSON.stringify({ pid: 1200, token: 'dead' }));
+  const options = {
+    rootPath: root,
+    slotCount: 1,
+    conservativeRecovery: true,
+    tryOnly: true,
+    isProcessAlive: (pid) => pid !== 1200,
+  };
+  let contender = Promise.resolve(null);
+  let reclaimer;
+  try {
+    reclaimer = await browserChannels.acquireBrowserSlot({
+      ...options,
+      pid: 1201,
+      token: 'reclaimer',
+      beforeSlotRemoval: () => {
+        contender = browserChannels.acquireBrowserSlot({
+          ...options,
+          pid: 1202,
+          token: 'contender',
+          now: () => Date.now() + 10_000,
+        });
+        assert.equal(fs.existsSync(path.join(slot, '.claim-stale-dead')), true);
+      },
+    });
+    assert.equal(await contender, null);
+    assert.deepEqual(readSlotOwner(root, 1), { pid: 1201, token: 'reclaimer' });
+    assert.equal(await browserChannels.acquireBrowserSlot({ ...options, pid: 1203, token: 'extra' }), null);
+    assert.equal(reclaimer.release(), true);
+    const successor = await browserChannels.acquireBrowserSlot({ ...options, pid: 1202, token: 'contender' });
+    assert.equal(successor.release(), true);
+  } finally {
+    reclaimer?.release();
     fs.rmSync(root, { recursive: true, force: true });
   }
 });

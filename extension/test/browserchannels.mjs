@@ -93,7 +93,7 @@ function removeClaim(claimPath) {
   }
 }
 
-function removeMatchingSlot(slotPath, token, action, afterValidation) {
+function removeMatchingSlot(slotPath, token, action, afterValidation, beforeRemoval) {
   const claimPath = join(slotPath, claimName(action, token));
   try {
     mkdirSync(claimPath);
@@ -112,6 +112,7 @@ function removeMatchingSlot(slotPath, token, action, afterValidation) {
     removeClaim(claimPath);
     return false;
   }
+  beforeRemoval?.();
   rmSync(slotPath, { recursive: true, force: true });
   return true;
 }
@@ -170,6 +171,10 @@ export async function acquireBrowserSlot({
   incompleteGraceMs = BROWSER_SLOT_INCOMPLETE_GRACE_MS,
   pollMs = BROWSER_SLOT_POLL_MS,
   observation = null,
+  tryOnly = false,
+  conservativeRecovery = false,
+  afterSlotCreated,
+  beforeSlotRemoval,
 } = {}) {
   observation?.begin('queue', { rootPath, deadlineMs, slotCount, queuePosition: null });
   try {
@@ -187,6 +192,7 @@ export async function acquireBrowserSlot({
         try {
           mkdirSync(slotPath);
           try {
+            afterSlotCreated?.(slotPath);
             publishOwner(slotPath, { pid, token });
           } catch (error) {
             rmSync(slotPath, { recursive: true, force: true });
@@ -229,12 +235,12 @@ export async function acquireBrowserSlot({
           holders.push({ index, owner, observedHolderMs: at - since });
         }
         if (owner && !isProcessAlive(owner.pid)) {
-          recoverAbandonedClaim(slotPath, owner.token, 'stale', now(), incompleteGraceMs);
-          if (removeMatchingSlot(slotPath, owner.token, 'stale')) {
+          if (!conservativeRecovery) recoverAbandonedClaim(slotPath, owner.token, 'stale', now(), incompleteGraceMs);
+          if (removeMatchingSlot(slotPath, owner.token, 'stale', undefined, beforeSlotRemoval)) {
             index--;
             continue;
           }
-        } else if (!owner) {
+        } else if (!owner && !conservativeRecovery) {
           const firstMtime = slotMtime(slotPath);
           if (firstMtime !== null && now() - firstMtime >= incompleteGraceMs) {
             const secondOwner = readSlotOwner(slotPath);
@@ -260,12 +266,17 @@ export async function acquireBrowserSlot({
             queuePosition: null,
             holderDuration: 'before first observation unavailable',
           });
-          console.log(
-            `Browser slot holders observed at ${observedAt}: ${holders.map(({ index, owner, observedHolderMs }) => `${index}=PID ${owner?.pid ?? 'unavailable'} observed ${Math.round(observedHolderMs)} ms`).join(', ')}. Queue position unavailable.`,
-          );
+          if (!tryOnly)
+            console.log(
+              `Browser slot holders observed at ${observedAt}: ${holders.map(({ index, owner, observedHolderMs }) => `${index}=PID ${owner?.pid ?? 'unavailable'} observed ${Math.round(observedHolderMs)} ms`).join(', ')}. Queue position unavailable.`,
+            );
         }
       }
 
+      if (tryOnly) {
+        observation?.end('queue', { rootPath, acquired: false });
+        return null;
+      }
       if (!reportedWait) {
         console.log(`Browser launch waiting for one of ${slotCount} test slots.`);
         reportedWait = true;

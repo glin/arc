@@ -5,3 +5,10 @@ export function acquireBrowserLock(options?: {
   label?: string;
   observation?: TestObservation | null;
 }): Promise<{ release(): boolean }>;
+
+export function acquireBrowserLock(options: {
+  deadlineMs?: number;
+  label?: string;
+  observation?: TestObservation | null;
+  tryOnly: true;
+}): Promise<{ release(): boolean } | null>;
