@@ -516,7 +516,10 @@ describe('read-only web demo', () => {
     await page.goto(`${base}/arc-vscode/`);
     await page.locator('[data-control="rail:arc-read-state"]').first().waitFor();
     const failedRun = page.locator('.activitysec button.actrow.run[data-control$=":run:17"]');
+    await page.locator('.activitysec .actviewaction').click();
     await failedRun.waitFor();
+    expect(await failedRun.getAttribute('aria-expanded')).toBe('false');
+    await failedRun.click();
     expect(await failedRun.getAttribute('aria-expanded')).toBe('true');
     if (process.env.ARC_DEMO_SHOTS) {
       fs.mkdirSync(process.env.ARC_DEMO_SHOTS, { recursive: true });
@@ -774,7 +777,7 @@ describe('read-only web demo', () => {
       page.on('request', (request) => requests.push(request.url()));
       await page.goto(`${base}/`);
       await page.locator('[data-control="picker"]').waitFor();
-      await page.locator('.activitysec button.actrow.run[data-control$=":run:17"][aria-expanded="true"]').waitFor();
+      await page.locator('#list .turn .cardrecord').first().waitFor();
       if (process.env.ARC_DEMO_SHOTS) {
         fs.mkdirSync(process.env.ARC_DEMO_SHOTS, { recursive: true });
         await page.screenshot({ path: path.join(process.env.ARC_DEMO_SHOTS, 'narrow.png'), fullPage: true });
@@ -926,13 +929,17 @@ describe('read-only web demo', () => {
     expect(await page.locator('[data-control="rail:arc-cache-run"]').count()).toBeGreaterThan(0);
     await page.locator('[data-control="raillens:all"]').click();
     await page.keyboard.press('Escape');
+    await page.locator('[data-control="rail:arc-cache-run"]').first().click();
     await page.locator('[data-control="railsearch"]').click();
     await page.locator('.railfilter').fill('label:review');
     await page.waitForFunction(() => document.querySelector('.railfilter')?.getAttribute('aria-invalid') !== 'true');
     await page.locator('[data-control="railviewsave"]').click();
     await page.locator('.railfilter').fill('Review work');
     await page.locator('.railfilter').press('Enter');
-    await page.locator('[data-control="rail:arc-demo-review"]').first().click();
+    await page.locator('[data-control="rail:arc-read-state"]').first().click();
+    await page.waitForFunction(() =>
+      document.querySelector('.sessionheading')?.textContent?.includes('Keep unread results visible'),
+    );
     expect(await page.locator('.railfilter').inputValue()).toBe('label:review');
     await page.locator('[data-control="railclear"]').click();
     expect(await page.locator('.railbucket').filter({ hasText: 'Review work' }).count()).toBeGreaterThan(0);
@@ -996,9 +1003,15 @@ describe('read-only web demo', () => {
     await page.keyboard.press('Escape');
     await page.locator('#labelpop').waitFor({ state: 'hidden' });
 
+    await page.locator('[data-control="railruns"]').click();
     await page.locator('[data-control="rail:arc-demo-review"]').first().hover();
     await page.locator('[data-control="raillabels:arc-demo-review"]').first().click();
     const review = page.locator('#labelpop input[data-control="label:review"]');
+    expect(await review.isChecked()).toBe(false);
+    await review.click();
+    await page.keyboard.press('Escape');
+    await page.locator('[data-control="rail:arc-demo-review"]').first().hover();
+    await page.locator('[data-control="raillabels:arc-demo-review"]').first().click();
     expect(await review.isChecked()).toBe(true);
     await review.click();
     await page.waitForFunction(
@@ -1009,8 +1022,6 @@ describe('read-only web demo', () => {
           ?.includes('review'),
     );
     await page.keyboard.press('Escape');
-    await page.locator('[data-control="railruns"]').click();
-
     await page.locator('[data-control="rail:arc-demo-review"]').first().click();
     await page.waitForFunction(() => document.querySelector('[data-control="sessionlabels:arc-demo-review"]'));
     expect(await headingLabels.count()).toBe(0);
@@ -1205,7 +1216,7 @@ describe('read-only web demo', () => {
     await page.locator('[data-control="view-name"]').fill('Navigation work');
     await page.locator('[data-control="view-order"]').selectOption('cost-desc');
     await page.locator('[data-control="view-save"]').click();
-    await page.locator('[data-control="rail:arc-demo-review"]').first().click();
+    await page.locator('[data-control="rail:arc-cache-run"]').first().click();
     await page.locator('[data-control="viewmenu:review"]').click();
     await page.locator('.demo-menu').getByRole('menuitem', { name: 'Edit view', exact: false }).click();
     expect(await page.locator('[data-control="view-name"]').inputValue()).toBe('Navigation work');

@@ -33,7 +33,6 @@ import { DEMO_DEFAULTS, DEMO_MODELS } from './demo-catalog.ts';
 import type { PinnedSetup } from '../src/domain/session-setups.ts';
 import type { RailCard, RailStatus, SessionParentEdge } from '../src/turnrail.ts';
 import { RAIL_FOLDS } from '../src/view/rail.ts';
-import type { Ask } from '../src/agentwire.ts';
 import { addUsage } from '../src/agentspend.ts';
 
 export const CAPTURE_TIME = Date.parse('2026-09-15T14:42:00-05:00');
@@ -672,16 +671,19 @@ const README_USAGE: AgentUsage[] = [
 
 const DEMO_SKILL_PATH = `${ROOT}/.claude/skills/review-changes/SKILL.md`;
 
+const readStateAgents: Turn['agents'] = readStateTurn.agents.map((agent) =>
+  agent.id === 'luna-tests'
+    ? { ...agent, childSessionId: 'arc-luna-read-state-tests' }
+    : agent.id === 'sol-implementation'
+      ? { ...agent, status: 'running', startedAt: demoSolStartedAt, spendPartial: true, durationMs: null }
+      : agent,
+);
+
 const demoCodexReadStateTurn: Turn = {
   ...readStateTurn,
-  agents: readStateTurn.agents.map((agent) =>
-    agent.id === 'luna-tests'
-      ? { ...agent, childSessionId: 'arc-luna-read-state-tests' }
-      : agent.id === 'sol-implementation'
-        ? { ...agent, status: 'running', startedAt: demoSolStartedAt, spendPartial: true, durationMs: null }
-        : agent,
-  ),
-  summary: `${readStateTurn.summary}\n\n| Check | Result |\n| --- | --- |\n| Switch views | Unread mark stays visible |\n| Open a result | Only that result becomes read |`,
+  agents: readStateAgents.filter((agent) => agent.id !== 'background-review'),
+  summary:
+    'Finished sessions stay unread when you switch views. Opening a result clears only its own unread mark.\n\nRegression tests cover both behaviors.',
   steps: [
     { ordinal: 16, name: 'rg', detail: 'read-state view-switching test', at: start + 3 * 60_000, status: 'done' },
     {
@@ -699,16 +701,15 @@ const demoCodexReadStateTurn: Turn = {
       status: 'done',
     },
     { ordinal: 19, name: 'npm test', detail: 'read-state test passed', at: start + 8 * 60_000, status: 'done' },
-    { ordinal: 20, name: 'Agent', detail: 'Check view-switching behavior', at: start + 9 * 60_000, status: 'done' },
     {
-      ordinal: 21,
+      ordinal: 20,
       name: 'Send message',
       detail: 'Review the read-state result',
       at: start + 11 * 60_000,
       status: 'done',
     },
     {
-      ordinal: 22,
+      ordinal: 21,
       name: 'Read',
       detail: 'extension/src/webview/read-state.test.ts',
       at: start + 12 * 60_000,
@@ -716,7 +717,7 @@ const demoCodexReadStateTurn: Turn = {
     },
     // Codex reads SKILL.md through a command. The fixture includes that command and its best-effort skill use.
     {
-      ordinal: 23,
+      ordinal: 22,
       name: 'exec_command',
       detail: `Get-Content ${DEMO_SKILL_PATH}`,
       at: start + 12.5 * 60_000,
@@ -734,8 +735,8 @@ const demoCodexReadStateTurn: Turn = {
     }),
   ],
   skillUseCount: 1,
-  toolUses: 23,
-  toolCounts: { ...readStateTurn.toolCounts, commands: readStateTurn.toolCounts.commands + 1 },
+  toolUses: 22,
+  toolCounts: { ...readStateTurn.toolCounts, commands: readStateTurn.toolCounts.commands + 1, agents: 2 },
   updates: [
     {
       sourceId: 'demo-read-state-start',
@@ -754,7 +755,7 @@ const demoCodexReadStateTurn: Turn = {
       status: 'done',
     },
   ],
-  stepCount: 23,
+  stepCount: 22,
   stepKinds: [
     'edits',
     'edits',
@@ -775,7 +776,6 @@ const demoCodexReadStateTurn: Turn = {
     'commands',
     'edits',
     'commands',
-    'agents',
     'coordination',
     'reads',
     'commands',
@@ -792,7 +792,7 @@ const demoReadStateTurn: Turn = {
   outputRateBasis: 'request',
   contextWindow: 1_000_000,
   agents: demoCodexReadStateTurn.agents.map((agent) => {
-    const model = agent.id === 'background-review' ? 'claude-haiku-4-5-20251001' : 'claude-sonnet-5-5';
+    const model = 'claude-sonnet-5-5';
     return {
       ...agent,
       model,
@@ -801,20 +801,20 @@ const demoReadStateTurn: Turn = {
         milliseconds: agent.id === 'background-review' ? 8_000 : agent.id === 'luna-tests' ? 40_000 : 120_000,
       },
       outputRateModel: model,
-      effort: agent.id === 'background-review' ? null : 'high',
+      effort: 'high',
       spend: agent.spend.map((part) => ({ ...part, model })),
     };
   }),
   steps: [
     ...demoCodexReadStateTurn.steps.map((step) =>
-      step.ordinal === 23
+      step.ordinal === 22
         ? { ...step, name: 'Skill', detail: 'review-changes' }
         : step.ordinal === 16
           ? { ...step, name: 'Read', detail: 'extension/src/webview/read-state.test.ts' }
           : step,
     ),
     {
-      ordinal: 24,
+      ordinal: 23,
       name: 'Bash',
       detail: 'codex exec --json --model gpt-6.1-sol -c model_reasoning_effort=high "Review the read-state change"',
       at: start + 12.6 * 60_000,
@@ -824,14 +824,14 @@ const demoReadStateTurn: Turn = {
   skillUses: demoCodexReadStateTurn.skillUses.map((use) =>
     skillUse({ sourceId: use.sourceId, name: use.name, description: use.description, path: use.path, at: use.at }),
   ),
-  stepCount: 24,
+  stepCount: 23,
   stepKinds: [
     ...demoCodexReadStateTurn.stepKinds.map((kind, index) =>
-      index === 22 ? SKILL_STEP_KIND : kind === 'searches' ? 'reads' : kind,
+      index === 21 ? SKILL_STEP_KIND : kind === 'searches' ? 'reads' : kind,
     ),
     'commands',
   ],
-  toolUses: 24,
+  toolUses: 23,
   toolCounts: {
     ...demoCodexReadStateTurn.toolCounts,
     reads: demoCodexReadStateTurn.toolCounts.reads + demoCodexReadStateTurn.toolCounts.searches,
@@ -997,11 +997,13 @@ export const DEMO_TURNS: Record<string, Turn[]> = {
       usage: expiryUsage,
       finished: true,
       // Remove these subagent links so only the unread-results session opens Preserve unread state.
-      agents: readStateTurn.agents.map((agent) => {
-        const unlinked = { ...agent };
-        delete unlinked.childSessionId;
-        return unlinked;
-      }),
+      agents: readStateTurn.agents
+        .filter((agent) => agent.id !== 'background-review')
+        .map((agent) => {
+          const unlinked = { ...agent };
+          delete unlinked.childSessionId;
+          return unlinked;
+        }),
       files: [file('extension/src/turncard.ts', 28, 6)],
     }),
     ...expiryHistory.slice(1).map((item) => ({
@@ -1451,28 +1453,8 @@ export const DEMO_LABELS: Readonly<Record<string, readonly string[]>> = {
   'delegated-cost': ['cost'],
   'arc-demo-sketch': [],
   'arc-demo-dispatch': ['demo'],
-  'arc-demo-review': ['review'],
+  'arc-demo-review': [],
   'arc-demo-continuation': ['demo'],
-};
-
-const DEMO_NAVIGATION_QUESTION: Ask = {
-  kind: 'question',
-  id: 'restored-tab-navigation',
-  toolUseId: 'restored-tab-navigation',
-  input: {},
-  questions: [
-    {
-      id: 'navigation-case',
-      question: 'Which file navigation case do you want checked next?',
-      header: 'File navigation',
-      options: [
-        { label: 'Restored session tab', description: 'Check file navigation after reopening the session tab.' },
-        { label: 'Active session tab', description: 'Check file navigation in the open session tab.' },
-      ],
-      multiSelect: false,
-      secret: false,
-    },
-  ],
 };
 
 export function demoPayload(sessionId: string): Record<string, unknown> {
@@ -1528,7 +1510,6 @@ export function demoPayload(sessionId: string): Record<string, unknown> {
     : sessionParentOf(rows, demoParentEdges, selected);
   const sketch = DEMO_TURNS['arc-demo-sketch'][0];
   const statuses = new Map<string, RailStatus>([
-    ['delegated-cost', 'waiting'],
     ['arc-read-state', 'subagents'],
     ['arc-sol-read-state', 'running'],
     ['arc-cache-run', 'running'],
@@ -1628,8 +1609,8 @@ export function demoPayload(sessionId: string): Record<string, unknown> {
     onScreen: draft,
     queued: [],
     history: [],
-    running: !item.finished || selected === 'delegated-cost',
-    asks: selected === 'delegated-cost' ? [DEMO_NAVIGATION_QUESTION] : [],
+    running: !item.finished,
+    asks: [],
     comments,
     sessionId: selected,
     models: DEMO_MODELS[item.agent],
@@ -1795,7 +1776,7 @@ export function readmePayload(scene: (typeof README_SCENES)[number] = 'main'): R
           : scene === 'cache'
             ? cacheTurn
             : scene === 'review'
-              ? { ...readStateTurn, agents: demoCodexReadStateTurn.agents }
+              ? { ...readStateTurn, agents: readStateAgents }
               : scene === 'files'
                 ? readmeFilesTurn
                 : readStateTurn;

@@ -217,6 +217,9 @@ test('demo samples keep dispatched costs and reader-started usage separate from 
   };
   const before = README_SCENES.map((scene) => readmePayload(scene));
   const samples = DEMO_SESSION_IDS.map((id) => demoPayload(id) as DemoPayload);
+  assert.ok(Object.values(DEMO_TURNS).flat().every((item) => item.agents.every((agent) => agent.id !== 'background-review')));
+  assert.equal(DEMO_TURNS['arc-read-state'][0].agents.filter((agent) => agent.status === 'running').length, 1);
+  assert.ok(DEMO_TURNS['arc-read-state'][0].agents.some((agent) => agent.status !== 'running' && agent.artifacts?.files.length && agent.commits?.length));
   assert.deepEqual(DEMO_SESSION_IDS.slice(-3), ['arc-demo-dispatch', 'arc-demo-review', 'arc-demo-continuation']);
   assert.equal(samples[0].showing, 'arc-read-state');
   assert.equal(samples[0].cards[0].agent, 'Claude');
@@ -297,7 +300,7 @@ test('demo selections keep available setups, cache facts, and their own prompt t
   }
   const main = demoPayload('arc-read-state') as Payload;
   assert.equal(main.usage.launcher.primary!.profile.model, 'opus');
-  assert.match(main.cards[0].summaryHtml, /<table>/);
+  assert.doesNotMatch(main.cards[0].summaryHtml, /<table>/);
   assert.deepEqual(DEMO_SESSION_IDS.filter((id) => id === 'arc-open-changes' || id === 'session-search'), []);
   const cost = demoPayload('delegated-cost') as Payload;
   assert.equal(cost.cards.length, 4);
@@ -305,7 +308,7 @@ test('demo selections keep available setups, cache facts, and their own prompt t
 });
 
 test('default demo review command supports direct Codex dispatch recognition', () => {
-  const launch = DEMO_TURNS['arc-read-state'][0].steps.find((step) => step.ordinal === 24);
+  const launch = DEMO_TURNS['arc-read-state'][0].steps.find((step) => step.ordinal === 23);
   assert.ok(launch);
   assert.deepEqual(claudeLaunchKind(launch.detail, 'bash'), { kind: 'codex-native', count: 1 });
 });
@@ -387,7 +390,7 @@ test('demo catalogs, permissions, groups and running children match production i
   assert.equal(review.stats['arc-read-state'].find((chip) => chip.metric === 'cost')!.label, review.cards[0].chips.find((chip) => chip.metric === 'cost')!.label);
   assert.equal(review.rail.find((row) => row.id === 'arc-sol-read-state')!.runningSince, child.cards[0].startedAt);
   const waiting = main.rail.filter((row) => row.status === 'waiting');
-  assert.deepEqual(waiting.map((row) => row.id), ['delegated-cost']);
+  assert.deepEqual(waiting.map((row) => row.id), []);
   for (const row of main.rail) {
     const selected = demoPayload(row.id) as { showing: string; usage: { composer: ComposerView } };
     assert.equal(selected.showing, row.id);
@@ -699,7 +702,6 @@ test('default demo history keeps distinct turns and provider-scoped expiry evide
   assert.equal(DEMO_TURNS['arc-demo-sketch'][0].model, 'gpt-6.1-sol');
   assert.equal(DEMO_TURNS['arc-demo-sketch'][0].effort, 'high');
   assert.ok(DEMO_TURNS['arc-read-state'][0].agents.some((agent) => agent.model === 'claude-sonnet-5-5'));
-  assert.ok(DEMO_TURNS['arc-read-state'][0].agents.some((agent) => agent.model?.startsWith('claude-haiku-4-5')));
   assert.ok(child.cards[0].startedAt >= main.cards[0].startedAt);
   assert.ok(child.cards[0].endedAt <= main.cards[0].endedAt);
   const dollars = main.stats['arc-read-state'].find((chip) => chip.metric === 'cost')!.dollars!;

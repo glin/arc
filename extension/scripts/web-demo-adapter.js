@@ -35,24 +35,6 @@
     document.body.style.setProperty('--demo-header-height', `${header.getBoundingClientRect().height}px`);
   new ResizeObserver(headerSize).observe(header);
   headerSize();
-  let activityOpened = false;
-  let failedRunOpened = false;
-  const activityObserver = new MutationObserver(() => {
-    if (selected !== 'arc-read-state') return;
-    if (!activityOpened) {
-      const showAll = document.querySelector('.activitysec .actviewaction');
-      if (!showAll) return;
-      activityOpened = true;
-      showAll.click();
-    }
-    if (failedRunOpened) return;
-    const failedRun = document.querySelector('.activitysec button.actrow.run[data-control$=":run:17"]');
-    if (!failedRun) return;
-    failedRunOpened = true;
-    failedRun.click();
-    activityObserver.disconnect();
-  });
-  activityObserver.observe(document.getElementById('list'), { childList: true, subtree: true });
   const RealDate = Date;
   window.Date = class SampleDate extends RealDate {
     constructor(...args) {

@@ -28393,7 +28393,7 @@ test('selection and accepted worker results avoid unnecessary catalog walks', ()
   );
   sourceMatch(
     refresh,
-    /const payload = selectedOnly\s*\? selectionPayload\(\{ \.\.\.payloadInput, previousShowing: hostPreviousSession \}\)\s*:\s*renderPayload\(payloadInput\);/,
+    /const payload = selectedOnly\s*\? selectionPayload\(\{ \.\.\.payloadInput, previousShowing: hostPreviousSession \}\)\s*:\s*renderPayload\(\{ \.\.\.payloadInput, projectSpend: this\.projectSpendPayload\(\) \}\);/,
     'a selected-session update still sends fields that choosing another session cannot change',
   );
   assert.equal(
