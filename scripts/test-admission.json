@@ -36,8 +36,8 @@
   },
   "extension/src/agenthost.test.ts": {
     "reason": "A spawned agent must receive the activation window, editor executable, and command search path. Self-compaction crosses captured completion and workspace scope recovery.",
-    "cases": 278,
-    "matricesSha256": "0db44cbc5bf349022882972f8d0e8d7c01a941afe63632e3b4ab233f5c81c3bb"
+    "cases": 291,
+    "matricesSha256": "351bb37947538b68cedbed4aa33f1f6a5e44d9240731b377cfc5b4dd2fdba9e0"
   },
   "extension/src/chrome.browser.test.ts": {
     "reason": "Panel controls must preserve native focus, keyboard handling, and browser event delivery.",
