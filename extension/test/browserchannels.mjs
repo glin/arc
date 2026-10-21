@@ -4,6 +4,7 @@ import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writ
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { performance } from 'node:perf_hooks';
+import { createTestObservation } from './observations.mjs';
 
 // Edge and Chrome 152 and later on Windows call LogonUser with an invalid password on every launch.
 // Each call counts as a failed sign-in for the Windows account. One browser lane run starts about
@@ -168,68 +169,118 @@ export async function acquireBrowserSlot({
   deadlineMs = BROWSER_SLOT_DEADLINE_MS,
   incompleteGraceMs = BROWSER_SLOT_INCOMPLETE_GRACE_MS,
   pollMs = BROWSER_SLOT_POLL_MS,
+  observation = null,
 } = {}) {
-  mkdirSync(rootPath, { recursive: true });
-  const waitStartedAt = monotonicNow();
-  const deadline = waitStartedAt + deadlineMs;
-  let reportedWait = false;
-  while (true) {
-    for (let index = 1; index <= slotCount; index++) {
-      const slotPath = join(rootPath, `slot-${index}`);
-      try {
-        mkdirSync(slotPath);
+  observation?.begin('queue', { rootPath, deadlineMs, slotCount, queuePosition: null });
+  try {
+    mkdirSync(rootPath, { recursive: true });
+    const waitStartedAt = monotonicNow();
+    const deadline = waitStartedAt + deadlineMs;
+    let reportedWait = false;
+    const seenHolders = new Map();
+    let lastNotice = -Infinity;
+    let previousHolders = null;
+    while (true) {
+      const holders = [];
+      for (let index = 1; index <= slotCount; index++) {
+        const slotPath = join(rootPath, `slot-${index}`);
         try {
-          publishOwner(slotPath, { pid, token });
+          mkdirSync(slotPath);
+          try {
+            publishOwner(slotPath, { pid, token });
+          } catch (error) {
+            rmSync(slotPath, { recursive: true, force: true });
+            throw error;
+          }
+          if (reportedWait) {
+            console.log(`Browser test slot wait: ${Math.round(monotonicNow() - waitStartedAt)} ms.`);
+          }
+          observation?.end('queue', { rootPath, index });
+          const acquiredAt = observation ? monotonicNow() : null;
+          observation?.event('resource', 'acquired', { rootPath, index, observedAt: new Date(now()).toISOString() });
+          let released = false;
+          return {
+            index,
+            release() {
+              if (released) return false;
+              released = true;
+              const removed = removeMatchingSlot(slotPath, token, 'release');
+              observation?.event('resource', 'release', {
+                rootPath,
+                index,
+                released: removed,
+                heldMs: monotonicNow() - acquiredAt,
+                descendants: 'unobserved',
+              });
+              return removed;
+            },
+          };
         } catch (error) {
-          rmSync(slotPath, { recursive: true, force: true });
-          throw error;
+          if (error.code !== 'EEXIST') throw error;
         }
-        if (reportedWait) {
-          console.log(`Browser test slot wait: ${Math.round(monotonicNow() - waitStartedAt)} ms.`);
-        }
-        let released = false;
-        return {
-          index,
-          release() {
-            if (released) return false;
-            released = true;
-            return removeMatchingSlot(slotPath, token, 'release');
-          },
-        };
-      } catch (error) {
-        if (error.code !== 'EEXIST') throw error;
-      }
 
-      const owner = readSlotOwner(slotPath);
-      if (owner && !isProcessAlive(owner.pid)) {
-        recoverAbandonedClaim(slotPath, owner.token, 'stale', now(), incompleteGraceMs);
-        if (removeMatchingSlot(slotPath, owner.token, 'stale')) {
-          index--;
-          continue;
+        const owner = readSlotOwner(slotPath);
+        if (observation) {
+          const at = monotonicNow();
+          const key = owner ? `${owner.pid}:${owner.token}` : null;
+          const previous = seenHolders.get(index);
+          const since = previous?.key === key ? previous.since : at;
+          seenHolders.set(index, { key, since });
+          holders.push({ index, owner, observedHolderMs: at - since });
         }
-      } else if (!owner) {
-        const firstMtime = slotMtime(slotPath);
-        if (firstMtime !== null && now() - firstMtime >= incompleteGraceMs) {
-          const secondOwner = readSlotOwner(slotPath);
-          const secondMtime = slotMtime(slotPath);
-          if (!secondOwner && secondMtime === firstMtime && removeIncompleteSlot(slotPath, firstMtime, token)) {
+        if (owner && !isProcessAlive(owner.pid)) {
+          recoverAbandonedClaim(slotPath, owner.token, 'stale', now(), incompleteGraceMs);
+          if (removeMatchingSlot(slotPath, owner.token, 'stale')) {
             index--;
+            continue;
+          }
+        } else if (!owner) {
+          const firstMtime = slotMtime(slotPath);
+          if (firstMtime !== null && now() - firstMtime >= incompleteGraceMs) {
+            const secondOwner = readSlotOwner(slotPath);
+            const secondMtime = slotMtime(slotPath);
+            if (!secondOwner && secondMtime === firstMtime && removeIncompleteSlot(slotPath, firstMtime, token)) {
+              index--;
+            }
           }
         }
       }
-    }
 
-    if (!reportedWait) {
-      console.log(`Browser launch waiting for one of ${slotCount} test slots.`);
-      reportedWait = true;
+      if (observation) {
+        const at = monotonicNow();
+        const signature = JSON.stringify(holders.map(({ index, owner }) => [index, owner]));
+        if (signature !== previousHolders || at - lastNotice >= 30_000) {
+          previousHolders = signature;
+          lastNotice = at;
+          const observedAt = new Date(now()).toISOString();
+          observation.event('queue', 'holders', {
+            rootPath,
+            observedAt,
+            holders,
+            queuePosition: null,
+            holderDuration: 'before first observation unavailable',
+          });
+          console.log(
+            `Browser slot holders observed at ${observedAt}: ${holders.map(({ index, owner, observedHolderMs }) => `${index}=PID ${owner?.pid ?? 'unavailable'} observed ${Math.round(observedHolderMs)} ms`).join(', ')}. Queue position unavailable.`,
+          );
+        }
+      }
+
+      if (!reportedWait) {
+        console.log(`Browser launch waiting for one of ${slotCount} test slots.`);
+        reportedWait = true;
+      }
+      const remaining = deadline - monotonicNow();
+      if (remaining <= 0) throw new Error(`Timed out waiting for one of ${slotCount} browser test slots.`);
+      await waitForPoll(Math.min(pollMs, remaining));
     }
-    const remaining = deadline - monotonicNow();
-    if (remaining <= 0) throw new Error(`Timed out waiting for one of ${slotCount} browser test slots.`);
-    await waitForPoll(Math.min(pollMs, remaining));
+  } catch (error) {
+    observation?.end('queue', { rootPath, error: error.message });
+    throw error;
   }
 }
 
-function releaseOnClose(browser, permit) {
+function releaseOnClose(browser, permit, observation) {
   const close = browser.close.bind(browser);
   let closed = false;
   Object.defineProperty(browser, 'close', {
@@ -237,11 +288,28 @@ function releaseOnClose(browser, permit) {
     async value(...args) {
       if (closed) return;
       closed = true;
+      observation?.begin('cleanup');
+      let failure = null;
+      let closeFailure;
+      let closeFailed = false;
       try {
         await close(...args);
-      } finally {
-        permit.release();
+      } catch (error) {
+        failure = error.message;
+        closeFailure = error;
+        closeFailed = true;
       }
+      let released = false;
+      try {
+        released = permit.release();
+      } catch (error) {
+        failure = error.message;
+        throw error;
+      } finally {
+        observation?.end('cleanup', { released, error: failure, descendants: 'unobserved' });
+        observation?.finish({ outcome: failure ? 'failure' : 'success', reason: failure });
+      }
+      if (closeFailed) throw closeFailure;
     },
   });
   return browser;
@@ -253,32 +321,75 @@ export async function launchAnyBrowser({
   args = [],
   acquireSlot = acquireBrowserSlot,
   loadChromium = async () => (await import('playwright-core')).chromium,
+  observationParent = null,
+  observation = acquireSlot === acquireBrowserSlot && (observationParent || process.env.ARC_TEST_OBSERVATIONS_DIR)
+    ? createTestObservation({
+        lane: 'browser launch',
+        capacity: BROWSER_SLOT_COUNT,
+        ...(observationParent ? { env: observationParent.childEnvironment() } : {}),
+        announce: () => {},
+      })
+    : null,
 } = {}) {
-  let chromium;
+  observation?.unavailable('build', 'Browser launch builds no test bundle.');
+  observation?.unavailable('execution', 'Browser usage occurs outside the launch request.');
+  let handedOff = false;
+  let failure = null;
+  let permit = null;
   try {
-    chromium = await loadChromium();
-  } catch {
-    return null;
-  }
-  const permit = await acquireSlot();
-  for (const channel of BROWSER_CHANNELS) {
-    const channelArgs = channel ? [...args, EDGE_SIGN_IN_WORKAROUND] : args;
+    let chromium;
     try {
-      const browser = await chromium.launch({
-        headless: true,
-        timeout: BROWSER_LAUNCH_TIMEOUT_MS,
-        ...(channelArgs.length ? { args: channelArgs } : {}),
-        ...(channel ? { channel } : {}),
-      });
+      chromium = await loadChromium();
+    } catch (error) {
+      failure = error.message;
+      observation?.unavailable('queue', 'Playwright is unavailable.');
+      observation?.unavailable('cleanup', 'No browser or slot was acquired.');
+      return null;
+    }
+    permit = await acquireSlot({ observation });
+    observation?.begin('launch');
+    for (const channel of BROWSER_CHANNELS) {
+      const channelArgs = channel ? [...args, EDGE_SIGN_IN_WORKAROUND] : args;
       try {
-        return { browser: releaseOnClose(browser, permit), channel };
+        const browser = await chromium.launch({
+          headless: true,
+          timeout: BROWSER_LAUNCH_TIMEOUT_MS,
+          ...(channelArgs.length ? { args: channelArgs } : {}),
+          ...(channel ? { channel } : {}),
+        });
+        try {
+          let browserVersion = null;
+          try {
+            browserVersion = browser.version?.() ?? null;
+          } catch {
+            // Version lookup supplies no launch or lifetime authority.
+          }
+          const wrapped = releaseOnClose(browser, permit, observation);
+          observation?.end('launch', { browser: channel ?? 'bundled Chromium', browserVersion });
+          handedOff = true;
+          return { browser: wrapped, channel };
+        } catch {
+          await browser.close().catch(() => {});
+        }
       } catch {
-        await browser.close().catch(() => {});
+        // Try the next browser already available on this machine.
       }
-    } catch {
-      // Try the next browser already available on this machine.
+    }
+    observation?.end('launch', { available: false });
+    observation?.begin('cleanup');
+    const released = permit.release();
+    observation?.end('cleanup', { released, descendants: 'unobserved' });
+    return null;
+  } catch (error) {
+    failure = error.message;
+    throw error;
+  } finally {
+    if (!handedOff) {
+      if (!permit) observation?.unavailable('cleanup', 'No browser or slot was acquired.');
+      observation?.finish({
+        outcome: failure ? 'failure' : 'unavailable',
+        reason: failure ?? 'No supported browser launched.',
+      });
     }
   }
-  permit.release();
-  return null;
 }

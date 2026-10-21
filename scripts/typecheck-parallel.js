@@ -47,13 +47,17 @@ function runCheck(check, { spawnFn, stream, write, writeError }) {
     const child = spawnFn(check.command ?? process.execPath, check.args, {
       cwd: check.cwd,
       stdio: ['ignore', 'pipe', 'pipe'],
+      ...(check.env ? { env: check.env } : {}),
     });
+    check.observe?.({ childPid: child.pid ?? null, started: true });
     child.stdout.on('data', (chunk) => (stream ? write(chunk) : chunks.push(chunk)));
     child.stderr.on('data', (chunk) => (stream ? writeError(chunk) : chunks.push(chunk)));
     child.on('error', (error) => {
+      check.observe?.({ exitCode: null, error: error.message });
       resolve({ label: check.label, status: 1, output: `${error.message}\n` });
     });
-    child.on('close', (code) => {
+    child.on('close', (code, signal) => {
+      check.observe?.({ exitCode: code, signal: signal ?? null });
       resolve({ label: check.label, status: code ?? 1, output: Buffer.concat(chunks).toString('utf8') });
     });
   });

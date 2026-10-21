@@ -66,24 +66,46 @@ async function removeAbandoned(runs: string): Promise<void> {
 }
 
 export default async function setup(): Promise<() => void> {
-  const saved = new Map(MOVED.map((name) => [name, process.env[name]]));
-  const machineTemp = process.env[MACHINE_TEMP] || os.tmpdir();
-  const runs = path.join(machineTemp, RUNS);
-  fs.mkdirSync(runs, { recursive: true });
-  await removeAbandoned(runs);
-  const runTemp = fs.mkdtempSync(path.join(runs, `${process.pid}-`));
-  Object.assign(process.env, {
-    TEMP: runTemp,
-    TMP: runTemp,
-    TMPDIR: runTemp,
-    [MACHINE_TEMP]: machineTemp,
-    [RUN_TEMP]: runTemp,
-  });
-  return () => {
-    for (const [name, value] of saved) {
-      if (value === undefined) delete process.env[name];
-      else process.env[name] = value;
-    }
-    removeTree(runTemp);
-  };
+  const observations = process.env.ARC_TEST_OBSERVATIONS_DIR ? await import('./observations.mjs') : null;
+  const observation = observations?.createTestObservation({ lane: 'temporary directory', announce: () => {} });
+  observation?.unavailable('queue', 'Temporary-directory setup takes no machine resource.');
+  observation?.unavailable('build', 'The test runner owns builds.');
+  observation?.unavailable('execution', 'The test runner owns execution.');
+  observation?.begin('prepare');
+  try {
+    const saved = new Map(MOVED.map((name) => [name, process.env[name]]));
+    const machineTemp = process.env[MACHINE_TEMP] || os.tmpdir();
+    const runs = path.join(machineTemp, RUNS);
+    fs.mkdirSync(runs, { recursive: true });
+    await removeAbandoned(runs);
+    const runTemp = fs.mkdtempSync(path.join(runs, `${process.pid}-`));
+    Object.assign(process.env, {
+      TEMP: runTemp,
+      TMP: runTemp,
+      TMPDIR: runTemp,
+      [MACHINE_TEMP]: machineTemp,
+      [RUN_TEMP]: runTemp,
+    });
+    observation?.end('prepare', { machineTemp, runTemp, coordination: observations?.coordinationEnvironment() });
+    return () => {
+      observation?.begin('cleanup');
+      let failure: string | null = null;
+      try {
+        for (const [name, value] of saved) {
+          if (value === undefined) delete process.env[name];
+          else process.env[name] = value;
+        }
+        removeTree(runTemp);
+      } catch (error) {
+        failure = error instanceof Error ? error.message : String(error);
+        throw error;
+      } finally {
+        observation?.end('cleanup', { error: failure, coordination: observations?.coordinationEnvironment() });
+        observation?.finish({ outcome: failure ? 'failure' : 'success', reason: failure });
+      }
+    };
+  } catch (error) {
+    observation?.finish({ outcome: 'failure', reason: error instanceof Error ? error.message : String(error) });
+    throw error;
+  }
 }

@@ -27,6 +27,8 @@ Question recovery stores captured question payloads, dispositions, settled ident
 
 `scripts/test-default.mjs` runs static checks and direct units sequentially. `scripts/test-unit.mjs` partitions root, extension, and CLI units. `scripts/test-integration.mjs` runs the complete external-boundary categories. `scripts/test-classification.js` identifies admitted expensive tests and their repetition budgets. [Verification](development.md#verification) owns test commands and category coverage.
 
+`extension/test/observations.mjs` writes bounded JSONL timing files for test launchers and their existing resource boundaries. Parent run identities connect nested commands without combining their intervals. Lock and browser-slot observations retain the effective coordination paths and timestamped holders. Temporary-directory setup records environment changes. [Test timing](development.md#test-timing) owns the schema, commands, and observation limits.
+
 ## System shape
 
 Arc reads completed work from files, including sessions started in a terminal or another editor window. A child process carries live prompts, questions, and controls.

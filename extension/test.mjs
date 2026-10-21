@@ -4,6 +4,7 @@ import { dirname, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { launchAnyBrowser } from './test/browserchannels.mjs';
 import { acquireBrowserLock, forwardSignalToChildAndRelease } from './test/browserlock.mjs';
+import { createTestObservation } from './test/observations.mjs';
 
 // Default injected runners acquire no machine lock. The CLI entry point supplies the real acquireBrowserLock.
 async function noopAcquireLock() {
@@ -160,10 +161,18 @@ function vitestArgs(mode, extraArgs, selected, testRoot) {
   ];
 }
 
-function spawnLane(mode, selected, extraArgs, testRoot, spawn) {
+function spawnLane(mode, selected, extraArgs, testRoot, spawn, observation) {
+  observation?.begin('execution', { boundary: 'Vitest child lifetime, including collection, builds and teardown' });
   const result = spawn(process.execPath, vitestArgs(mode, extraArgs, selected, testRoot), {
     cwd: testRoot,
     stdio: 'inherit',
+    ...(observation ? { env: observation.childEnvironment() } : {}),
+  });
+  observation?.event('execution', 'child-start', { childPid: result.pid ?? null });
+  observation?.end('execution', {
+    exitCode: result.status ?? null,
+    signal: result.signal ?? null,
+    error: result.error?.message ?? null,
   });
   if (result.error) {
     console.error(`Could not start Vitest: ${result.error.message}`);
@@ -172,12 +181,20 @@ function spawnLane(mode, selected, extraArgs, testRoot, spawn) {
   return result.status ?? 1;
 }
 
-async function spawnBrowserLane(selected, extraArgs, testRoot, spawnChild, lock) {
+async function spawnBrowserLane(selected, extraArgs, testRoot, spawnChild, lock, observation) {
+  observation?.begin('execution', { boundary: 'Vitest child lifetime, including collection, builds and teardown' });
   const result = spawnChild(process.execPath, vitestArgs('browser', extraArgs, selected, testRoot), {
     cwd: testRoot,
     stdio: 'inherit',
+    ...(observation ? { env: observation.childEnvironment() } : {}),
   });
+  observation?.event('execution', 'child-start', { childPid: result.pid ?? null });
   if (typeof result?.once !== 'function') {
+    observation?.end('execution', {
+      exitCode: result.status ?? null,
+      signal: result.signal ?? null,
+      error: result.error?.message ?? null,
+    });
     if (result.error) {
       console.error(`Could not start Vitest: ${result.error.message}`);
       return 1;
@@ -185,19 +202,21 @@ async function spawnBrowserLane(selected, extraArgs, testRoot, spawnChild, lock)
     return result.status ?? 1;
   }
   // Forward signals only while the child runs, then remove its handlers.
-  const detachSignalForwarding = forwardSignalToChildAndRelease(result, lock);
+  const detachSignalForwarding = forwardSignalToChildAndRelease(result, lock, { observation });
   try {
     return await new Promise((resolveStatus) => {
       let settled = false;
       result.once('error', (error) => {
         if (settled) return;
         settled = true;
+        observation?.end('execution', { exitCode: null, error: error.message });
         console.error(`Could not start Vitest: ${error.message}`);
         resolveStatus(1);
       });
-      result.once('close', (status) => {
+      result.once('close', (status, signal) => {
         if (settled) return;
         settled = true;
+        observation?.end('execution', { exitCode: status, signal: signal ?? null });
         resolveStatus(status ?? 1);
       });
     });
@@ -206,34 +225,46 @@ async function spawnBrowserLane(selected, extraArgs, testRoot, spawnChild, lock)
   }
 }
 
-export function runTestMode(mode, extraArgs, { testRoot = root, spawn = spawnSync } = {}) {
-  let selected;
+export function runTestMode(mode, extraArgs, { testRoot = root, spawn = spawnSync, observationFactory } = {}) {
+  const observation = observationFactory?.(mode, testRoot, extraArgs);
+  observation?.unavailable('queue', 'The Node lane takes no machine resource.');
+  observation?.unavailable('build', 'Builds inside Vitest are not separate launcher intervals.');
+  observation?.unavailable('cleanup', 'Vitest teardown is included in its child lifetime.');
+  let status = null;
   try {
-    selected = selectForLane(mode, testRoot);
-  } catch (error) {
-    console.error(error.message);
-    return 1;
-  }
-  const { passthrough, files } = partitionArgs(extraArgs);
-  if (files.length > 0) {
+    let selected;
     try {
-      selected = narrowSelection(files, selected, testRoot, mode);
+      selected = selectForLane(mode, testRoot);
     } catch (error) {
       console.error(error.message);
-      return 1;
+      return (status = 1);
     }
+    const { passthrough, files } = partitionArgs(extraArgs);
+    if (files.length > 0) {
+      try {
+        selected = narrowSelection(files, selected, testRoot, mode);
+      } catch (error) {
+        console.error(error.message);
+        return (status = 1);
+      }
+    }
+    reportSelection(mode, selected);
+    if (selected.length === 0) {
+      console.error(`No test files selected for ${mode} mode.`);
+      return (status = 1);
+    }
+    return (status = spawnLane(mode, selected, passthrough, testRoot, spawn, observation));
+  } finally {
+    observation?.finish({
+      exitCode: status,
+      outcome: status === null ? 'incomplete' : status === 0 ? 'success' : 'failure',
+    });
   }
-  reportSelection(mode, selected);
-  if (selected.length === 0) {
-    console.error(`No test files selected for ${mode} mode.`);
-    return 1;
-  }
-  return spawnLane(mode, selected, passthrough, testRoot, spawn);
 }
 
 // Detect the browser using the test fixture's channel order. Download no browser.
-export async function detectBrowser(_testRoot = root) {
-  const result = await launchAnyBrowser();
+export async function detectBrowser(_testRoot = root, observation = null) {
+  const result = await launchAnyBrowser({ observationParent: observation });
   if (!result) {
     return null;
   }
@@ -248,42 +279,68 @@ export async function runBrowserLane(
     spawn: spawnChild = spawn,
     detectBrowser: detect = detectBrowser,
     acquireLock = noopAcquireLock,
+    observationFactory,
   } = {},
 ) {
-  let selected;
+  const observation = observationFactory?.('browser', testRoot, extraArgs);
+  observation?.unavailable('build', 'Builds inside Vitest are not separate launcher intervals.');
+  let status = null;
+  let lock = null;
+  let failure = null;
   try {
-    selected = selectForLane('browser', testRoot);
-  } catch (error) {
-    console.error(error.message);
-    return 1;
-  }
-  const { passthrough, files } = partitionArgs(extraArgs);
-  if (files.length > 0) {
+    let selected;
     try {
-      selected = narrowSelection(files, selected, testRoot, 'browser');
+      selected = selectForLane('browser', testRoot);
     } catch (error) {
       console.error(error.message);
-      return 1;
+      return (status = 1);
     }
-  }
-  reportSelection('browser', selected);
-  if (selected.length === 0) {
-    console.error('No test files selected for browser mode.');
-    return 1;
-  }
-  // Acquire the machine-wide browser-lane lock before detection so waiting sessions launch no detection browser.
-  // Release it on every exit, including failed browser detection.
-  const lock = await acquireLock({ cwd: testRoot });
-  try {
-    const browserName = await detect(testRoot);
-    if (!browserName) {
-      console.error('Browser tests cannot run: no supported browser is available.');
-      return 1;
+    const { passthrough, files } = partitionArgs(extraArgs);
+    if (files.length > 0) {
+      try {
+        selected = narrowSelection(files, selected, testRoot, 'browser');
+      } catch (error) {
+        console.error(error.message);
+        return (status = 1);
+      }
     }
-    console.log(`Browser executable: ${browserName}`);
-    return await spawnBrowserLane(selected, passthrough, testRoot, spawnChild, lock);
+    reportSelection('browser', selected);
+    if (selected.length === 0) {
+      console.error('No test files selected for browser mode.');
+      return (status = 1);
+    }
+    // Acquire the machine-wide browser-lane lock before detection so waiting sessions launch no detection browser.
+    // Release it on every exit, including failed browser detection.
+    lock = await acquireLock({ cwd: testRoot, observation });
+    try {
+      observation?.begin('detection');
+      const browserName = await detect(testRoot, observation);
+      observation?.end('detection', { browser: browserName });
+      if (!browserName) {
+        console.error('Browser tests cannot run: no supported browser is available.');
+        observation?.unavailable('execution', 'No supported browser is available.');
+        return (status = 1);
+      }
+      console.log(`Browser executable: ${browserName}`);
+      return (status = await spawnBrowserLane(selected, passthrough, testRoot, spawnChild, lock, observation));
+    } finally {
+      observation?.begin('cleanup');
+      const released = lock.release();
+      observation?.end('cleanup', { released, descendants: 'unobserved' });
+    }
+  } catch (error) {
+    failure = error.message;
+    throw error;
   } finally {
-    lock.release();
+    if (!lock) {
+      observation?.unavailable('execution', 'No browser lane child was started.');
+      observation?.unavailable('cleanup', 'No acquired lock or child.');
+    }
+    observation?.finish({
+      exitCode: status,
+      outcome: status === 0 ? 'success' : failure ? 'failure' : status === null ? 'incomplete' : 'failure',
+      reason: failure,
+    });
   }
 }
 
@@ -333,7 +390,17 @@ export async function runFull(extraArgs, opts = {}) {
 
 export async function main(argv = process.argv.slice(2)) {
   const [mode = 'full', ...extraArgs] = argv;
-  const opts = { acquireLock: acquireBrowserLock };
+  const opts = {
+    acquireLock: acquireBrowserLock,
+    observationFactory: (lane, cwd, args) =>
+      createTestObservation({
+        lane: `extension ${lane}`,
+        cwd,
+        command: [process.execPath, join(root, 'test.mjs'), lane, ...args],
+        workerCap: process.env.VITEST_MAX_WORKERS || LANE_WORKERS[lane] || null,
+        capacity: lane === 'browser' ? 1 : null,
+      }),
+  };
   if (mode === 'full') {
     return runFull(extraArgs, opts);
   }

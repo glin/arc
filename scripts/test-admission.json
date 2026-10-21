@@ -37,7 +37,7 @@
   "extension/src/agenthost.test.ts": {
     "reason": "A spawned agent must receive the activation window, editor executable, and command search path. Self-compaction crosses captured completion and workspace scope recovery.",
     "cases": 278,
-    "matricesSha256": "b5feaf61d874dd16f5e99cd3da9cf39ecc17da64735a42b90f02c06b89eaec35"
+    "matricesSha256": "0db44cbc5bf349022882972f8d0e8d7c01a941afe63632e3b4ab233f5c81c3bb"
   },
   "extension/src/chrome.browser.test.ts": {
     "reason": "Panel controls must preserve native focus, keyboard handling, and browser event delivery.",
@@ -201,8 +201,8 @@
   },
   "extension/src/temproot.test.ts": {
     "reason": "Git-discovered Vitest configurations must install the per-run temporary-directory setup.",
-    "cases": 3,
-    "matricesSha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+    "cases": 4,
+    "matricesSha256": "a57840a3b4ee247ae373a65dd819c58c06cb65c68838cc772d9e5493f0487317"
   },
   "extension/src/timeline-renderer.browser.test.ts": {
     "reason": "Production timeline rendering must preserve native disclosure, selection, navigation, and accessible interaction.",
@@ -286,8 +286,8 @@
   },
   "scripts/extension-test-runner.test.js": {
     "reason": "Real runner commands must classify files, reject invalid selection, and preserve browser readiness status.",
-    "cases": 51,
-    "matricesSha256": "9c790969b71119ff15b6ced21c7ecfc637d5fb44b2514b4d717f29f50e933f8d"
+    "cases": 63,
+    "matricesSha256": "2e494ce91c3bbeae5ad96aff67f7d3d713dff260a33978b6f3f333440d9baebd"
   },
   "scripts/install-release.test.js": {
     "reason": "Release installation must extract actual archives and preserve isolated-home hooks, skills, and partial failures.",
@@ -312,7 +312,7 @@
   "scripts/test-lanes.test.js": {
     "reason": "Linked command entry points must execute and retain process status. Direct checks guard category and admission drift.",
     "cases": 14,
-    "matricesSha256": "66d2b7def8efac9fe6104e7cdc896f706f574821cdd41db63a6993d1f4aedce7"
+    "matricesSha256": "a736b77353cf4ff62ac6b282ba494a2a5e782cbdff2a0004a5e7ec6d25412530"
   },
   "scripts/tool-scope.test.js": {
     "reason": "Real tool commands must respect repository scope and reject external configuration or stale packaged content.",

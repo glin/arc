@@ -2,6 +2,7 @@ import { existsSync, realpathSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { runLanes } from './test-default.mjs';
+import { createTestObservation } from '../extension/test/observations.mjs';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -31,5 +32,8 @@ if (
   existsSync(process.argv[1]) &&
   realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url))
 ) {
-  process.exitCode = (await runLanes(unitLanes())).length ? 1 : 0;
+  process.exitCode = (await runLanes(unitLanes(), undefined, createTestObservation({ lane: 'units', cwd: root })))
+    .length
+    ? 1
+    : 0;
 }

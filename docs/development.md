@@ -248,6 +248,22 @@ The shared browser launcher tries bundled Chromium, Edge, and Chrome in that ord
 
 A browser lane that waits for the machine-wide lock prints one line naming the PID, the extension directory, and the start time of the run holding it, once, when the wait begins. The lane prints a second line once it resumes, naming how long it waited. An immediate acquisition prints neither line.
 
+### Test timing
+
+The default, unit, integration, subprocess, and extension launchers print `Test timings: <path>` when each observed command ends. Isolated editor runs and panel startup measurements also report their timing file. Existing test commands retain their stage order and exit behavior.
+
+`ARC_TEST_OBSERVATIONS_DIR` selects the artifact directory. Otherwise, artifacts use `arc-test-observations` under `ARC_TEST_MACHINE_TEMP` or the platform temporary directory. Nested commands inherit the selected artifact directory. Each request writes one JSONL file with its PID and run identity. Browser launches and temporary-directory setup write nested files without separate completion notices.
+
+Each event carries `schemaVersion`, `runId`, `parentRunId`, `commit`, `cwd`, `lane`, `phase`, `event`, `elapsedMs`, `pid`, `command`, `workerCap`, `capacity`, and `exitCode`. The identity event records Node, platform, lockfile hashes, configuration hashes, browser registry metadata, and temporary-directory variables. Missing identities remain null. Browser launch events record the selected channel and available version. Registry metadata does not identify the executable of a fallback channel.
+
+Queue, observed build, child lifetime, and cleanup intervals use monotonic clocks. A Vitest execution interval includes collection, internal builds, and teardown. Delegated stage walls also include nested waiting and startup. Unobserved build and execution boundaries remain unavailable. `wholeCommandWallMs` covers one observed request. Nested and overlapping durations must not be summed or subtracted to calculate pure execution.
+
+Holder notices include their observation timestamp and duration since that holder was first observed. Earlier notices remain historical when the holder changes. Holder payload timestamps do not establish total holder duration. Queue order and position remain unavailable. Release events report lock or slot removal, without confirming descendant termination. Cleanup errors retain their observed result.
+
+Coordination observations preserve `ARC_TEST_MACHINE_TEMP`, `TEMP`, `TMP`, and `TMPDIR`, including absent and empty values. Lane locks use `os.tmpdir()`. Browser slots use `ARC_TEST_MACHINE_TEMP` or `os.tmpdir()`. Vitest setup redirects temporary variables for its run while preserving its machine temporary directory. A nested lane lock that resolves inside a run directory excludes only callers using that directory. Windows, macOS, and Linux retain their existing temporary-path resolution.
+
+Each file permits 1024 events and one MiB, including reserved terminal space. Oversized events and recording failures produce an explicit incomplete or unavailable report. Commands longer than 4096 bytes omit their text and mark recording incomplete. Recording failure preserves the test result. A writer that exits before settlement records an incomplete result when its exit handler runs. A killed writer supplies no terminal proof. Missing stages, failed cleanup, and unobserved descendants remain limits on interpretation.
+
 The browser tests build the panel and measure it in bundled Chromium, Edge, or Chrome. The browser runner names the executable before the lane runs. If no supported browser launches, browser mode and full mode fail. Node mode remains available for iteration without a browser. Direct Vitest runs bypass this check and skip individual tests when no browser launches.
 
 Build before opening the panel after changing its stylesheet, browser script, browser entry, or bundle input:

@@ -6,6 +6,7 @@ import { dirname, join } from 'node:path';
 import { existsSync, realpathSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { acquireBrowserLock, forwardSignalToChildAndRelease } from '../extension/test/browserlock.mjs';
+import { createTestObservation } from '../extension/test/observations.mjs';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -34,40 +35,73 @@ export function subprocessVitestArgs(testRoot = root, extraArgs = []) {
 
 export async function runSubprocessLane(
   extraArgs = [],
-  { testRoot = root, spawn: spawnChild = spawn, acquireLock = acquireBrowserLock } = {},
+  { testRoot = root, spawn: spawnChild = spawn, acquireLock = acquireBrowserLock, observation = null } = {},
 ) {
-  const lock = await acquireLock({
-    lockPath: SUBPROCESS_LOCK_PATH,
-    cwd: testRoot,
-    deadlineMs: SUBPROCESS_LOCK_DEADLINE_MS,
-    label: 'subprocess',
-  });
+  observation?.unavailable('build', 'Builds inside Vitest are not separate launcher intervals.');
+  let status = null;
+  let signal = null;
+  let failure = null;
+  let lock;
   try {
-    const child = spawnChild(process.execPath, subprocessVitestArgs(testRoot, extraArgs), {
+    lock = await acquireLock({
+      lockPath: SUBPROCESS_LOCK_PATH,
       cwd: testRoot,
-      stdio: 'inherit',
+      deadlineMs: SUBPROCESS_LOCK_DEADLINE_MS,
+      label: 'subprocess',
+      observation,
     });
-    const detachSignalForwarding = forwardSignalToChildAndRelease(child, lock);
     try {
-      return await new Promise((resolveStatus) => {
-        let settled = false;
-        child.once('error', (error) => {
-          if (settled) return;
-          settled = true;
-          console.error(`Could not start Vitest: ${error.message}`);
-          resolveStatus(1);
-        });
-        child.once('close', (status) => {
-          if (settled) return;
-          settled = true;
-          resolveStatus(status ?? 1);
-        });
+      observation?.begin('execution', { boundary: 'Vitest child lifetime, including collection and teardown' });
+      const child = spawnChild(process.execPath, subprocessVitestArgs(testRoot, extraArgs), {
+        cwd: testRoot,
+        stdio: 'inherit',
+        ...(observation ? { env: observation.childEnvironment() } : {}),
       });
+      observation?.event('execution', 'child-start', { childPid: child.pid ?? null });
+      const detachSignalForwarding = forwardSignalToChildAndRelease(child, lock, { observation });
+      try {
+        return await new Promise((resolveStatus) => {
+          let settled = false;
+          child.once('error', (error) => {
+            if (settled) return;
+            settled = true;
+            failure = error.message;
+            status = 1;
+            observation?.end('execution', { exitCode: null, error: failure });
+            console.error(`Could not start Vitest: ${error.message}`);
+            resolveStatus(1);
+          });
+          child.once('close', (code, childSignal) => {
+            if (settled) return;
+            settled = true;
+            status = code;
+            signal = childSignal ?? null;
+            observation?.end('execution', { exitCode: code, signal });
+            resolveStatus(code ?? 1);
+          });
+        });
+      } finally {
+        detachSignalForwarding();
+      }
     } finally {
-      detachSignalForwarding();
+      observation?.begin('cleanup');
+      const released = lock.release();
+      observation?.end('cleanup', { released, descendants: 'unobserved' });
     }
+  } catch (error) {
+    failure = error.message;
+    throw error;
   } finally {
-    lock.release();
+    if (!lock) {
+      observation?.unavailable('execution', 'Capacity was not acquired.');
+      observation?.unavailable('cleanup', 'No acquired lock or child.');
+    }
+    observation?.finish({
+      exitCode: status,
+      signal,
+      outcome: failure ? 'failure' : signal ? 'cancelled' : status === 0 ? 'success' : 'failure',
+      reason: failure,
+    });
   }
 }
 
@@ -76,7 +110,9 @@ if (
   existsSync(process.argv[1]) &&
   realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url))
 ) {
-  runSubprocessLane(process.argv.slice(2))
+  runSubprocessLane(process.argv.slice(2), {
+    observation: createTestObservation({ lane: 'subprocess', cwd: root, workerCap: SUBPROCESS_WORKERS, capacity: 1 }),
+  })
     .then((code) => {
       process.exitCode = code;
     })

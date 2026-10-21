@@ -14,6 +14,7 @@ import { createRequire } from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { createTestObservation } from '../extension/test/observations.mjs';
 
 const ownRepository = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -1263,6 +1264,17 @@ function stopTree(pid) {
 
 // Runs the extension build in the baseline tree. The run stops the build child when it ends before the build does.
 function buildTree(session, tree) {
+  const observation = session.observation
+    ? createTestObservation({
+        lane: 'isolated editor baseline build',
+        cwd: tree,
+        env: session.observation.childEnvironment(),
+      })
+    : null;
+  observation?.unavailable('queue', 'The editor already holds its browser lane lock.');
+  observation?.unavailable('execution', 'This request builds the baseline only.');
+  observation?.unavailable('cleanup', 'The editor run owns baseline cleanup.');
+  observation?.begin('build');
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, ['esbuild.mjs'], {
       cwd: path.join(tree, 'extension'),
@@ -1282,8 +1294,18 @@ function buildTree(session, tree) {
     } catch {
       // The build goes on without this record, and stopping the run still stops the child.
     }
-    child.on('error', reject);
-    child.on('close', (code) => {
+    child.on('error', (error) => {
+      observation?.end('build', { exitCode: null, error: error.message });
+      observation?.finish({ outcome: 'failure', reason: error.message });
+      reject(error);
+    });
+    child.on('close', (code, signal) => {
+      observation?.end('build', { exitCode: code, signal: signal ?? null });
+      observation?.finish({
+        exitCode: code,
+        signal: signal ?? null,
+        outcome: signal ? 'cancelled' : code === 0 ? 'success' : 'failure',
+      });
       session.stopBuild = null;
       if (code === 0) resolve();
       else reject(new Error(`The baseline build failed with exit code ${code}.\n${output.trim()}`));
@@ -1532,19 +1554,34 @@ export async function runCommand(
     cleanupOptions = {},
     write = (text) => process.stdout.write(text),
     work = (context) => scriptWork(context, launch),
+    observation = acquireLock
+      ? null
+      : createTestObservation({ lane: 'isolated editor', cwd: ownRepository, capacity: 1 }),
   } = {},
 ) {
   acquireLock ??= (await import(pathToFileURL(path.join(ownRepository, 'extension', 'test', 'browserlock.mjs')).href))
     .acquireBrowserLock;
   const result = { ok: false, run: null, mainPid: null, value: null, screenshot: null, errors: [], cleanup: null };
   let lock = null;
-  const session = { manifest: null, app: null };
+  const session = { manifest: null, app: null, observation };
+  observation?.unavailable(
+    'build',
+    'A baseline build records its own nested request. Other builds are outside this command.',
+  );
+  let executionStarted = false;
   const cleanup = onceCleanup(session, cleanupOptions);
   let finished = null;
   const finish = (reason) =>
     (finished ??= (async () => {
       session.cancelled = true;
       if (reason) result.errors.push(reason);
+      const signal = Object.keys(SIGNALS).find((signal) => reason === `Stopped by ${signal}.`) ?? null;
+      if (reason) observation?.event('run', 'cancellation', { signal });
+      if (executionStarted) {
+        observation?.incomplete('execution', 'Driver work did not settle before cleanup.');
+        executionStarted = false;
+      }
+      observation?.begin('cleanup');
       try {
         if (session.manifest) result.cleanup = await cleanup();
       } catch (error) {
@@ -1553,16 +1590,30 @@ export async function runCommand(
         lock?.release();
       }
       result.ok = result.errors.length === 0 && (result.cleanup?.ok ?? true);
+      observation?.end('cleanup', { cleanup: result.cleanup, errors: result.errors, descendants: 'unobserved' });
+      observation?.finish({
+        exitCode: signal ? SIGNALS[signal] : result.ok ? 0 : 1,
+        outcome: reason ? 'cancelled' : result.ok ? 'success' : 'failure',
+      });
       write(`${JSON.stringify(result)}\n`);
     })());
   const detach = handleSignals(finish);
   try {
-    lock = await acquireLock({ deadlineMs: LOCK_DEADLINE_MS });
+    lock = await acquireLock({ deadlineMs: LOCK_DEADLINE_MS, observation });
+    observation?.begin('execution', { boundary: 'Driver work await. Cleanup reports process settlement separately.' });
+    executionStarted = true;
     const running = work({ options, session, result });
     // After a timeout, cleanup closes the editor and the abandoned work stops at its next step or when its editor closes.
     // Its error is already reported.
-    running.catch(() => {});
+    running.catch((error) => {
+      if (executionStarted) {
+        observation?.end('execution', { error: String(error?.message ?? error) });
+        executionStarted = false;
+      }
+    });
     await withDeadline('the run to finish', running, options.timeoutSeconds * 1000);
+    observation?.end('execution');
+    executionStarted = false;
   } catch (error) {
     result.errors.push(String(error?.message ?? error));
     // A screenshot of the failure shows what the driver saw.

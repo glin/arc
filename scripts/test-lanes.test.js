@@ -107,6 +107,7 @@ test('command entry points run through a linked checkout', { tags: ['subprocess'
       'scripts/test-unit.mjs',
       'scripts/test-integration.mjs',
       'extension/test.mjs',
+      'extension/test/observations.mjs',
       'scripts/isolated-editor.mjs',
       'evals/agent-review/cli.mjs',
     ]) {
@@ -114,7 +115,7 @@ test('command entry points run through a linked checkout', { tags: ['subprocess'
     }
     write(
       'extension/test/browserlock.mjs',
-      'export async function acquireBrowserLock(){return {release(){}}} export function forwardSignalToChildAndRelease(){return ()=>{}}',
+      'export async function acquireBrowserLock({observation}={}){observation?.begin("queue");observation?.end("queue");return {release(){return true}}} export function forwardSignalToChildAndRelease(){return ()=>{}}',
     );
     write(
       'extension/test/browserchannels.mjs',
@@ -169,17 +170,41 @@ test('command entry points run through a linked checkout', { tags: ['subprocess'
       { file: 'extension/test.mjs', args: ['invalid-mode'], status: 1, output: /Unknown test mode/ },
       { file: 'scripts/isolated-editor.mjs', args: ['invalid-command'], status: 2, output: /Choose a command/ },
     ]) {
-      const result = spawnSync(process.execPath, [path.join(linked, file), ...args], { encoding: 'utf8' });
+      const timings = path.join(root, 'timings', path.basename(file));
+      const env = { ...process.env, ARC_TEST_OBSERVATIONS_DIR: timings, ARC_TEST_OBSERVATION_RUN_ID: 'linked-parent' };
+      const result = spawnSync(process.execPath, [path.join(linked, file), ...args], { encoding: 'utf8', env });
       assert.ifError(result.error);
       assert.equal(result.status, status, `${file}\n${result.stdout}${result.stderr}`);
       assert.match(result.stdout + result.stderr, output);
+      const recorded = fs.existsSync(timings) ? fs.readdirSync(timings) : [];
+      if (file === 'scripts/test-subprocess.mjs') {
+        assert.equal(recorded.length, 1);
+        const events = fs
+          .readFileSync(path.join(timings, recorded[0]), 'utf8')
+          .trim()
+          .split('\n')
+          .map((line) => JSON.parse(line));
+        const terminal = events.at(-1);
+        assert.equal(terminal.event, 'result');
+        assert.equal(terminal.exitCode, 7);
+        assert.equal(terminal.parentRunId, 'linked-parent');
+        assert.equal(terminal.complete, true);
+        assert.ok(terminal.intervals.execution.durationMs >= 0);
+        assert.match(result.stdout, /Test timings: .*\.jsonl/);
+      }
       const imported = spawnSync(process.execPath, ['--input-type=module', '-'], {
         input: `await import(${JSON.stringify(pathToFileURL(path.join(linked, file)).href)});console.log('import only');`,
         encoding: 'utf8',
+        env,
       });
       assert.ifError(imported.error);
       assert.equal(imported.status, 0, imported.stderr);
       assert.equal(imported.stdout.trim(), 'import only');
+      assert.deepEqual(
+        fs.existsSync(timings) ? fs.readdirSync(timings) : [],
+        recorded,
+        'Importing a linked command must create no timing run.',
+      );
     }
     const review = spawnSync(
       process.execPath,

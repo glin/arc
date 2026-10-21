@@ -809,22 +809,44 @@ export async function pollStartup(
 // Selection runs also measure session switching. Editor failure or timeout ends an incomplete run.
 async function measure(commandLine: string, workspace: string, timeoutMs: number): Promise<Outcome> {
   const { acquireBrowserLock } = await import('../../test/browserlock.mjs');
-  const lock = await acquireBrowserLock({ deadlineMs: timeoutMs });
-  const logs = path.join(ARC_STORE, DIAGNOSTICS_LOG_DIRECTORY);
-  const reader = new LogReader(logs);
-  const launch = launchEditor(commandLine, workspace);
+  const { createTestObservation } = await import('../../test/observations.mjs');
+  const observation = createTestObservation({ lane: 'panel startup measurement', cwd: REPOSITORY, capacity: 1 });
+  observation.unavailable('build', 'The measured build is prepared before this request.');
+  let failure: string | null = null;
+  let complete = false;
+  let lock;
   try {
-    const outcome = await pollStartup(() => reader.read(), launch, timeoutMs, MEASUREMENT_RUN, expectedSelection);
-    if (outcome.complete && selectionRequested) {
-      const result = responseRequested
-        ? await measureResponse(SCRATCH, timeoutMs)
-        : await measureSelection(SCRATCH, timeoutMs);
-      return { ...outcome, note: result.note, complete: result.complete };
+    lock = await acquireBrowserLock({ deadlineMs: timeoutMs, observation });
+    const logs = path.join(ARC_STORE, DIAGNOSTICS_LOG_DIRECTORY);
+    const reader = new LogReader(logs);
+    const launch = launchEditor(commandLine, workspace);
+    observation.begin('execution', { boundary: 'Startup and selection measurement await' });
+    try {
+      const outcome = await pollStartup(() => reader.read(), launch, timeoutMs, MEASUREMENT_RUN, expectedSelection);
+      if (outcome.complete && selectionRequested) {
+        const result = responseRequested
+          ? await measureResponse(SCRATCH, timeoutMs)
+          : await measureSelection(SCRATCH, timeoutMs);
+        complete = result.complete;
+        return { ...outcome, note: result.note, complete: result.complete };
+      }
+      complete = outcome.complete;
+      return outcome;
+    } finally {
+      observation.end('execution');
+      observation.begin('cleanup');
+      stopEditor();
+      lock?.release();
+      observation.end('cleanup', { descendants: 'unobserved' });
     }
-    return outcome;
+  } catch (error) {
+    failure = error instanceof Error ? error.message : String(error);
+    throw error;
   } finally {
-    stopEditor();
-    lock?.release();
+    observation.finish({
+      outcome: failure ? 'failure' : complete ? 'success' : 'incomplete',
+      reason: failure ?? (complete ? null : 'Startup measurement remained incomplete.'),
+    });
   }
 }
 

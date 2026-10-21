@@ -3,6 +3,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
+const { EventEmitter } = require('node:events');
 
 // Tests that start real processes run in the locked test:subprocess lane.
 const SUBPROCESS = { tags: ['subprocess'] };
@@ -10,12 +11,439 @@ const SUBPROCESS = { tags: ['subprocess'] };
 let runner;
 let browserChannels;
 let browserLock;
+let observations;
 beforeAll(async () => {
-  [runner, browserChannels, browserLock] = await Promise.all([
+  [runner, browserChannels, browserLock, observations] = await Promise.all([
     import('../extension/test.mjs'),
     import('../extension/test/browserchannels.mjs'),
     import('../extension/test/browserlock.mjs'),
+    import('../extension/test/observations.mjs'),
   ]);
+});
+
+function timingFixture(options = {}) {
+  let clock = 0;
+  const events = [];
+  const errors = [];
+  const notices = [];
+  const emitter = new EventEmitter();
+  const observation = observations.createTestObservation({
+    lane: 'fixture',
+    cwd: '/fixture',
+    command: ['node', 'fixture'],
+    identity: { commit: 'a'.repeat(40), node: 'fixture' },
+    env: {},
+    outputDirectory: '/unused',
+    runId: 'fixture-run',
+    monotonicNow: () => clock,
+    wallNow: () => 'fixture-wall-time',
+    append: (line) => events.push(JSON.parse(line)),
+    announce: (line) => notices.push(line),
+    reportError: (line) => errors.push(line),
+    processEmitter: emitter,
+    ...options,
+  });
+  return { observation, events, errors, notices, emitter, advance: (milliseconds) => (clock += milliseconds) };
+}
+
+test('timing records keep monotonic stages, whole wall, identities and nested runs separate', () => {
+  const { observation, events, advance, emitter } = timingFixture({
+    parentRunId: 'parent-run',
+    workerCap: 4,
+    capacity: 1,
+  });
+  for (const [phase, milliseconds] of [
+    ['queue', 10],
+    ['build', 5],
+    ['execution', 20],
+    ['cleanup', 2],
+  ]) {
+    observation.begin(phase);
+    advance(milliseconds);
+    observation.end(phase);
+  }
+  observation.finish({ exitCode: 7, outcome: 'failure' });
+  const result = events.at(-1);
+  assert.equal(events.filter((event) => event.event === 'identity').length, 1);
+  assert.equal(result.complete, true);
+  assert.equal(result.wholeCommandWallMs, 37);
+  assert.deepEqual(result.intervals, {
+    queue: { durationMs: 10 },
+    build: { durationMs: 5 },
+    execution: { durationMs: 20 },
+    cleanup: { durationMs: 2 },
+  });
+  assert.deepEqual(result.unobserved, []);
+  for (const event of events) {
+    assert.equal(event.schemaVersion, 1);
+    for (const key of [
+      'schemaVersion',
+      'runId',
+      'parentRunId',
+      'commit',
+      'cwd',
+      'lane',
+      'phase',
+      'event',
+      'elapsedMs',
+      'pid',
+      'command',
+      'workerCap',
+      'capacity',
+      'exitCode',
+    ])
+      assert.ok(key in event, key);
+    assert.equal(event.parentRunId, 'parent-run');
+    assert.equal(event.commit, 'a'.repeat(40));
+  }
+  const child = observation.childEnvironment({ TEMP: 'nested', ARC_TEST_MACHINE_TEMP: 'machine' });
+  assert.equal(child.ARC_TEST_OBSERVATION_RUN_ID, observation.runId);
+  assert.equal(child.TEMP, 'nested');
+  assert.equal(child.ARC_TEST_MACHINE_TEMP, 'machine');
+  assert.equal(emitter.listenerCount('exit'), 0);
+});
+
+test('missing and overlapping timing stages cannot produce a complete result', () => {
+  const missing = timingFixture();
+  for (const phase of ['queue', 'build', 'cleanup']) missing.observation.unavailable(phase, 'outside fixture');
+  missing.observation.finish({ outcome: 'success' });
+  assert.equal(missing.events.at(-1).complete, false, 'A missing execution interval must remain incomplete.');
+  assert.deepEqual(missing.events.at(-1).unobserved, ['execution']);
+  const overlap = timingFixture();
+  overlap.observation.begin('queue');
+  overlap.observation.begin('execution');
+  overlap.observation.end('queue');
+  for (const phase of ['build', 'execution', 'cleanup']) overlap.observation.unavailable(phase, 'outside fixture');
+  overlap.observation.finish({ outcome: 'success' });
+  assert.equal(overlap.events.at(-1).complete, false, 'Overlapping stage starts must remain incomplete.');
+  assert.equal(overlap.events.filter((event) => event.event === 'invalid-stage').length, 1);
+});
+
+test('timing recording errors and volume limits stay explicit without throwing', () => {
+  const broken = timingFixture({
+    append: () => {
+      throw new Error('disk unavailable');
+    },
+  });
+  broken.observation.finish({ exitCode: 23, outcome: 'failure' });
+  assert.equal(broken.errors.length, 1);
+  assert.match(broken.errors[0], /disk unavailable/);
+  assert.match(broken.notices[0], /unavailable/);
+  const bounded = timingFixture();
+  for (let index = 0; index < 1200; index++) bounded.observation.event('queue', 'holder', { index });
+  bounded.observation.finish({ outcome: 'incomplete' });
+  assert.ok(bounded.events.length <= 1024);
+  assert.equal(bounded.events.at(-1).event, 'result');
+  assert.equal(bounded.events.at(-1).recordingComplete, false);
+  assert.match(bounded.errors[0], /limit reached/);
+  const byteBounded = timingFixture();
+  for (let index = 0; index < 100; index++)
+    byteBounded.observation.event('queue', 'holder', { payload: 'x'.repeat(12_000) });
+  byteBounded.observation.finish({ outcome: 'incomplete' });
+  assert.ok(Buffer.byteLength(byteBounded.events.map((event) => JSON.stringify(event) + '\n').join('')) <= 1024 * 1024);
+  assert.equal(byteBounded.events.at(-1).recordingComplete, false);
+  const oversized = timingFixture({ command: ['x'.repeat(5000)] });
+  oversized.observation.event('queue', 'holder', { payload: 'x'.repeat(20_000) });
+  oversized.observation.finish({ reason: 'x'.repeat(20_000) });
+  assert.ok(oversized.events.every((event) => Buffer.byteLength(JSON.stringify(event) + '\n') <= 16 * 1024));
+  assert.equal(oversized.events.at(-1).recordingComplete, false);
+  assert.equal(oversized.events.at(-1).command, null);
+});
+
+test('an exiting timing writer records cancellation and identifies the unobserved ending', () => {
+  const { observation, events, emitter } = timingFixture();
+  observation.begin('execution');
+  observation.event('run', 'cancellation', { signal: 'SIGTERM' });
+  emitter.emit('exit', 143);
+  const result = events.at(-1);
+  assert.equal(result.event, 'result');
+  assert.equal(result.outcome, 'incomplete');
+  assert.equal(result.exitCode, 143);
+  assert.equal(result.signal, 'SIGTERM');
+  assert.ok(result.unobserved.includes('execution ending'));
+  assert.equal(emitter.listenerCount('SIGTERM'), 0);
+});
+
+test('coordination observations retain absent and empty variables on every platform', () => {
+  const cases = [
+    ['Windows', 'C:\\Temp', { TEMP: 'C:\\Run', TMP: '', ARC_TEST_MACHINE_TEMP: 'C:\\Machine' }],
+    ['macOS', '/private/tmp', { TMPDIR: '/private/run/', ARC_TEST_MACHINE_TEMP: '/private/machine' }],
+    ['Linux', '/tmp', { TMPDIR: '/run', TMP: '/alternate' }],
+  ];
+  for (const [platform, temporary, env] of cases) {
+    const result = observations.coordinationEnvironment(env, temporary);
+    assert.equal(result.temporary, temporary, platform);
+    for (const name of ['ARC_TEST_MACHINE_TEMP', 'TEMP', 'TMP', 'TMPDIR'])
+      assert.equal(result.variables[name], env[name] ?? null, `${platform}: ${name}`);
+  }
+});
+
+test('lock observations follow changing holders and measure only time actually observed', async () => {
+  const lockPath = lockFixture();
+  const timing = timingFixture();
+  const logs = [];
+  const original = console.log;
+  console.log = (line) => logs.push(line);
+  let polls = 0;
+  fs.writeFileSync(lockPath, JSON.stringify({ pid: 601, cwd: '/first', startedAt: 'historical' }));
+  try {
+    const lock = await browserLock.acquireBrowserLock({
+      lockPath,
+      pid: 602,
+      observation: timing.observation,
+      now: () => 100_000 + polls,
+      monotonicNow: () => polls * 2,
+      pollMs: 2,
+      isProcessAlive: () => true,
+      waitForPoll: async () => {
+        polls++;
+        timing.advance(2);
+        if (polls === 1) fs.writeFileSync(lockPath, JSON.stringify({ pid: 603, cwd: '/second', startedAt: 'later' }));
+        else fs.unlinkSync(lockPath);
+      },
+    });
+    const holders = timing.events.filter((event) => event.event === 'holder');
+    assert.deepEqual(
+      holders.map((event) => event.holder.pid),
+      [601, 603],
+    );
+    assert.deepEqual(
+      holders.map((event) => event.observedHolderMs),
+      [0, 0],
+    );
+    assert.ok(holders.every((event) => event.observedAt && event.queuePosition === null));
+    assert.equal(timing.events.find((event) => event.phase === 'queue' && event.event === 'end').durationMs, 4);
+    assert.ok(logs.some((line) => /holder observed.*PID 603/.test(line)));
+    timing.observation.begin('cleanup');
+    assert.equal(lock.release(), true);
+    timing.observation.end('cleanup');
+    timing.observation.unavailable('execution', 'fixture');
+    timing.observation.unavailable('build', 'fixture');
+    timing.observation.finish({ outcome: 'success' });
+    assert.equal(timing.events.find((event) => event.event === 'release').released, true);
+  } finally {
+    timing.observation.finish();
+    console.log = original;
+    fs.rmSync(path.dirname(lockPath), { recursive: true, force: true });
+  }
+});
+
+test('unavailable browser capacity ends the queued request without launching a child', async () => {
+  const root = fixture();
+  const lockPath = lockFixture();
+  const timing = timingFixture();
+  fs.writeFileSync(lockPath, JSON.stringify({ pid: 801, cwd: '/holder' }));
+  try {
+    await assert.rejects(
+      runner.runBrowserLane([], {
+        testRoot: root,
+        observationFactory: () => timing.observation,
+        acquireLock: (options) =>
+          browserLock.acquireBrowserLock({
+            ...options,
+            lockPath,
+            deadlineMs: 0,
+            monotonicNow: () => 0,
+            isProcessAlive: () => true,
+          }),
+        spawn: () => assert.fail('Unavailable capacity must start no child.'),
+      }),
+      /Timed out waiting/,
+    );
+    const result = timing.events.at(-1);
+    assert.equal(result.event, 'result');
+    assert.equal(result.outcome, 'failure');
+    assert.equal(result.intervals.queue.durationMs, 0);
+    assert.equal(result.intervals.execution.durationMs, null);
+    assert.equal(readLockOwner(lockPath).pid, 801);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(path.dirname(lockPath), { recursive: true, force: true });
+  }
+});
+
+test('browser launch observations separate slot wait, launch and failed close', async () => {
+  const root = slotFixture();
+  const timing = timingFixture();
+  const browser = {
+    close: async () => {
+      timing.advance(3);
+      throw new Error('close failed');
+    },
+    version: () => 'fixture-version',
+  };
+  const result = await browserChannels.launchAnyBrowser({
+    observation: timing.observation,
+    acquireSlot: (options) => browserChannels.acquireBrowserSlot({ ...options, rootPath: root, slotCount: 1 }),
+    loadChromium: async () => ({
+      launch: async () => {
+        timing.advance(5);
+        return browser;
+      },
+    }),
+  });
+  try {
+    assert.equal(timing.events.filter((event) => event.event === 'result').length, 0);
+    await assert.rejects(result.browser.close(), /close failed/);
+    const terminal = timing.events.at(-1);
+    assert.equal(terminal.outcome, 'failure');
+    assert.equal(terminal.intervals.queue.durationMs, 0);
+    assert.equal(terminal.intervals.launch.durationMs, 5);
+    assert.equal(terminal.intervals.cleanup.durationMs, 3);
+    assert.equal(terminal.intervals.execution.durationMs, null);
+    assert.equal(fs.existsSync(path.join(root, 'slot-1')), false);
+  } finally {
+    timing.observation.finish();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a signalled Node child retains its signal and normalized command status', () => {
+  const root = fixture();
+  const timing = timingFixture();
+  try {
+    assert.equal(
+      runner.runTestMode('node', [], {
+        testRoot: root,
+        observationFactory: () => timing.observation,
+        spawn: () => ({ status: null, signal: 'SIGTERM' }),
+      }),
+      1,
+    );
+    const terminal = timing.events.at(-1);
+    assert.equal(terminal.signal, 'SIGTERM');
+    assert.equal(terminal.outcome, 'cancelled');
+    assert.equal(terminal.exitCode, 1);
+    const execution = timing.events.find((event) => event.phase === 'execution' && event.event === 'end');
+    assert.equal(execution.exitCode, null);
+    assert.equal(execution.signal, 'SIGTERM');
+  } finally {
+    timing.observation.finish();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('browser cleanup errors retain the failed release', async () => {
+  const timing = timingFixture();
+  const launched = await browserChannels.launchAnyBrowser({
+    observation: timing.observation,
+    acquireSlot: async () => {
+      timing.observation.begin('queue');
+      timing.observation.end('queue');
+      return {
+        release: () => {
+          throw new Error('release failed');
+        },
+      };
+    },
+    loadChromium: async () => ({ launch: async () => ({ close: async () => {} }) }),
+  });
+  await assert.rejects(launched.browser.close(), /release failed/);
+  const terminal = timing.events.at(-1);
+  assert.equal(terminal.outcome, 'failure');
+  assert.equal(terminal.reason, 'release failed');
+  assert.equal(timing.events.find((event) => event.phase === 'cleanup' && event.event === 'end').released, false);
+});
+
+test('isolated editor timing distinguishes settled work failure from unfinished work', async () => {
+  const editor = await import('./isolated-editor.mjs');
+  const timing = timingFixture();
+  const lines = [];
+  let released = false;
+  const status = await editor.runCommand(
+    { timeoutSeconds: 30 },
+    {
+      observation: timing.observation,
+      acquireLock: async () => {
+        timing.observation.begin('queue');
+        timing.observation.end('queue');
+        return { release: () => (released = true) };
+      },
+      work: async () => {
+        timing.advance(6);
+        throw new Error('driver failed');
+      },
+      write: (line) => lines.push(line),
+    },
+  );
+  assert.equal(status, 1);
+  assert.equal(released, true);
+  assert.deepEqual(JSON.parse(lines.at(-1)).errors, ['driver failed']);
+  const terminal = timing.events.at(-1);
+  assert.equal(terminal.outcome, 'failure');
+  assert.equal(terminal.complete, true);
+  assert.equal(terminal.intervals.execution.durationMs, 6);
+  assert.equal(
+    timing.events.find((event) => event.phase === 'execution' && event.event === 'end').error,
+    'driver failed',
+  );
+});
+
+test('isolated editor signal timing retains each mapped process exit code', async () => {
+  const editor = await import('./isolated-editor.mjs');
+  const signals = [
+    ['SIGHUP', 129],
+    ['SIGINT', 130],
+    ['SIGTERM', 143],
+  ];
+  for (const [signal, expectedCode] of signals) {
+    const timing = timingFixture();
+    const started = Promise.withResolvers();
+    const work = Promise.withResolvers();
+    const exited = Promise.withResolvers();
+    const handlersBefore = new Map(signals.map(([name]) => [name, process.listeners(name)]));
+    const exit = vi.spyOn(process, 'exit').mockImplementation((code) => exited.resolve(code));
+    const lines = [];
+    let released = false;
+    let command;
+    try {
+      command = editor.runCommand(
+        { timeoutSeconds: 30 },
+        {
+          observation: timing.observation,
+          acquireLock: async () => {
+            timing.observation.begin('queue');
+            timing.observation.end('queue');
+            return { release: () => (released = true) };
+          },
+          work: () => {
+            started.resolve();
+            return work.promise;
+          },
+          write: (line) => lines.push(line),
+        },
+      );
+      await started.promise;
+      const handlers = process.listeners(signal).filter((handler) => !handlersBefore.get(signal).includes(handler));
+      assert.equal(handlers.length, 1);
+      handlers[0]();
+      assert.equal(await exited.promise, expectedCode, `${signal} must exit with its mapped code.`);
+      const terminal = timing.events.at(-1);
+      assert.equal(terminal.event, 'result');
+      assert.equal(
+        terminal.exitCode,
+        expectedCode,
+        'Isolated editor signal timing must report the mapped process exit code.',
+      );
+      assert.equal(terminal.signal, signal);
+      assert.equal(terminal.outcome, 'cancelled');
+      assert.equal(terminal.intervals.execution.durationMs, null);
+      assert.equal(terminal.intervals.execution.reason, 'Driver work did not settle before cleanup.');
+      assert.equal(terminal.complete, false);
+      assert.equal(released, true);
+      assert.deepEqual(JSON.parse(lines.at(-1)).errors, [`Stopped by ${signal}.`]);
+      assert.equal(timing.events.filter((event) => event.event === 'result').length, 1);
+    } finally {
+      work.resolve();
+      try {
+        if (command) assert.equal(await command, 1);
+      } finally {
+        timing.observation.finish();
+        exit.mockRestore();
+        for (const [name] of signals) assert.deepEqual(process.listeners(name), handlersBefore.get(name));
+      }
+    }
+  }
 });
 
 function fixture() {

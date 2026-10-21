@@ -208,6 +208,7 @@ export async function acquireBrowserLock({
   scheduleHeartbeat = defaultScheduleHeartbeat,
   cancelHeartbeat = clearInterval,
   rename = renameSync,
+  observation = null,
 } = {}) {
   const lockName = `${label} test lock`;
   const heading = `${label[0].toUpperCase()}${label.slice(1)} tests`;
@@ -215,71 +216,114 @@ export async function acquireBrowserLock({
   let staleObservation = null;
   const waitStartedAt = monotonicNow();
   const deadline = waitStartedAt + deadlineMs;
-  while (true) {
-    // Refresh startedAt for each attempt so the acquired lock records acquisition time.
-    const text = JSON.stringify({ pid, cwd, startedAt: new Date(now()).toISOString() });
-    if (publishLock(lockPath, text, pid)) {
-      if (announced) {
-        console.log(`${heading} resumed after ${Math.round(monotonicNow() - waitStartedAt)} ms waiting.`);
-      }
-      const heartbeat = startHeartbeat(lockPath, pid, scheduleHeartbeat, heartbeatMs, now);
-      let released = false;
-      return {
-        release() {
-          if (released) return false;
-          released = true;
-          cancelHeartbeat(heartbeat);
-          let current;
-          try {
-            current = readLock(lockPath).owner;
-          } catch (error) {
-            console.error(`Could not release the ${lockName}: ${error.message}`);
-            return false;
-          }
-          if (!current || current.pid !== pid) return false;
-          try {
-            rmSync(lockPath, { force: true });
-          } catch (error) {
-            console.error(`Could not release the ${lockName}: ${error.message}`);
-            return false;
-          }
-          return true;
-        },
-      };
-    }
-    const { text: currentText, mtimeMs, owner: current } = readLock(lockPath);
-    if (currentText === null) {
-      staleObservation = null;
-      continue; // The lock vanished between our publish attempt and our read.
-    }
-    const step = stepStaleObservation(
-      staleObservation,
-      current,
+  observation?.begin('queue', { lockPath, deadlineMs, queuePosition: null });
+  let holder = null;
+  let lastHolderNotice = -Infinity;
+  const observeHolder = (owner, text, mtimeMs) => {
+    if (!observation) return;
+    const at = monotonicNow();
+    const changed = holder?.text !== text;
+    if (changed) holder = { text, since: at };
+    if (!changed && at - lastHolderNotice < 30_000) return;
+    lastHolderNotice = at;
+    const detail = {
+      lockPath,
+      observedAt: new Date(now()).toISOString(),
+      holder: owner,
       mtimeMs,
-      monotonicNow,
-      isProcessAlive,
-      staleAfterMs,
-      pollMs,
+      observedHolderMs: at - holder.since,
+      holderDuration: 'before first observation unavailable',
+      queuePosition: null,
+    };
+    observation.event('queue', 'holder', detail);
+    console.log(
+      `${heading} holder observed at ${detail.observedAt}: ${describeHolder(owner)}. Observed for ${Math.round(detail.observedHolderMs)} ms. Queue position unavailable.`,
     );
-    staleObservation = step.observation;
-    if (step.stale) {
-      // Retry immediately after a race because the lock content has changed.
-      // EPERM, EACCES, and EBUSY leave the path in place. Poll instead of spinning until the deadline.
-      const reason = retireStaleLock(lockPath, currentText, pid, { rename });
-      if (reason !== 'busy') {
-        staleObservation = null;
-        continue;
+  };
+  try {
+    while (true) {
+      // Refresh startedAt for each attempt so the acquired lock records acquisition time.
+      const text = JSON.stringify({ pid, cwd, startedAt: new Date(now()).toISOString() });
+      if (publishLock(lockPath, text, pid)) {
+        observation?.end('queue', { lockPath });
+        const acquiredAt = observation ? monotonicNow() : null;
+        observation?.event('resource', 'acquired', { lockPath, observedAt: new Date(now()).toISOString() });
+        if (announced) {
+          console.log(`${heading} resumed after ${Math.round(monotonicNow() - waitStartedAt)} ms waiting.`);
+        }
+        const heartbeat = startHeartbeat(lockPath, pid, scheduleHeartbeat, heartbeatMs, now);
+        let released = false;
+        return {
+          release() {
+            if (released) return false;
+            released = true;
+            cancelHeartbeat(heartbeat);
+            const result = (releasedLock, reason = null) => {
+              observation?.event('resource', 'release', {
+                lockPath,
+                released: releasedLock,
+                reason,
+                heldMs: monotonicNow() - acquiredAt,
+                descendants: 'unobserved',
+              });
+              return releasedLock;
+            };
+            let current;
+            try {
+              current = readLock(lockPath).owner;
+            } catch (error) {
+              console.error(`Could not release the ${lockName}: ${error.message}`);
+              return result(false, error.message);
+            }
+            if (!current || current.pid !== pid) return result(false, 'Current holder differs or is unavailable.');
+            try {
+              rmSync(lockPath, { force: true });
+            } catch (error) {
+              console.error(`Could not release the ${lockName}: ${error.message}`);
+              return result(false, error.message);
+            }
+            return result(true);
+          },
+        };
       }
+      const { text: currentText, mtimeMs, owner: current } = readLock(lockPath);
+      if (currentText === null) {
+        staleObservation = null;
+        continue; // The lock vanished between our publish attempt and our read.
+      }
+      observeHolder(current, currentText, mtimeMs);
+      const step = stepStaleObservation(
+        staleObservation,
+        current,
+        mtimeMs,
+        monotonicNow,
+        isProcessAlive,
+        staleAfterMs,
+        pollMs,
+      );
+      staleObservation = step.observation;
+      if (step.stale) {
+        // Retry immediately after a race because the lock content has changed.
+        // EPERM, EACCES, and EBUSY leave the path in place. Poll instead of spinning until the deadline.
+        const reason = retireStaleLock(lockPath, currentText, pid, { rename });
+        if (reason !== 'busy') {
+          staleObservation = null;
+          continue;
+        }
+      }
+      if (!announced) {
+        console.log(`${heading} are waiting for another run to finish: held by ${describeHolder(current)}.`);
+        announced = true;
+      }
+      const remaining = deadline - monotonicNow();
+      if (remaining <= 0) {
+        throw new Error(`Timed out waiting for the ${lockName} held by ${describeHolder(current)}.`);
+      }
+      await waitForPoll(Math.min(pollMs, remaining));
     }
-    if (!announced) {
-      console.log(`${heading} are waiting for another run to finish: held by ${describeHolder(current)}.`);
-      announced = true;
-    }
-    const remaining = deadline - monotonicNow();
-    if (remaining <= 0) {
-      throw new Error(`Timed out waiting for the ${lockName} held by ${describeHolder(current)}.`);
-    }
-    await waitForPoll(Math.min(pollMs, remaining));
+  } catch (error) {
+    observation?.end('queue', { lockPath, error: error.message });
+    throw error;
   }
 }
 
@@ -309,6 +353,7 @@ export function forwardSignalToChildAndRelease(
       return timer;
     },
     cancelFallback = clearTimeout,
+    observation = null,
   } = {},
 ) {
   // Signal listeners receive no signal argument. Capture each signal name in its handler.
@@ -317,7 +362,9 @@ export function forwardSignalToChildAndRelease(
     const handler = () => {
       if (handled) return;
       handled = true;
+      observation?.event('run', 'cancellation', { signal });
       const fallbackTimer = scheduleFallback(() => {
+        observation?.event('cleanup', 'shutdown-fallback', { signal, childClosed: false });
         lock.release();
         processEmitter.exit(SIGNAL_EXIT_CODES[signal]);
       }, hardFallbackMs);

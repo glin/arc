@@ -474,19 +474,32 @@ test.each([0, 50])(
 
 test('open connection bounds refuse excess clients and release closed clients', { tags: ['subprocess'] }, async () => {
   const { entry } = await fixture({ ...SESSION_REQUEST_LIMITS, connections: 1 });
-  const first = await connect(entry.address);
-  const second = await connect(entry.address);
-  const outcome = new Promise<string>((resolve) => {
-    second.once('data', () => resolve('reply'));
-    second.once('close', () => resolve('closed'));
-  });
-  second.write(JSON.stringify(request(entry)) + '\n');
-  assert.equal(await outcome, 'closed');
-  assert.equal(first.destroyed, false);
-  const firstClosed = closed(first);
-  first.destroy();
-  await firstClosed;
-  await vi.waitFor(async () => assert.equal((await pingWindow(entry))?.hostId, entry.hostId));
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+  try {
+    const first = await connect(entry.address);
+    const received = reply(first);
+    const firstRequest = request(entry);
+    first.write(JSON.stringify(firstRequest) + '\n');
+    const response = await received;
+    assert.equal(response.id, firstRequest.id);
+    assert.equal(response.result.hostId, entry.hostId);
+    assert.equal(response.result.pid, entry.pid);
+    const second = await connect(entry.address);
+    const outcome = new Promise<string>((resolve) => {
+      second.once('data', () => resolve('reply'));
+      second.once('close', () => resolve('closed'));
+    });
+    second.write(JSON.stringify(request(entry)) + '\n');
+    assert.equal(await outcome, 'closed');
+    assert.equal(first.destroyed, false);
+    const firstClosed = closed(first);
+    first.destroy();
+    await firstClosed;
+    vi.useRealTimers();
+    await vi.waitFor(async () => assert.equal((await pingWindow(entry))?.hostId, entry.hostId));
+  } finally {
+    vi.useRealTimers();
+  }
 });
 
 test('in-flight bounds span connections until pending handlers settle', { tags: ['subprocess'] }, async () => {

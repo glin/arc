@@ -5970,6 +5970,9 @@ test(
   { tags: ['subprocess'] },
   async () => {
     vi.stubEnv('ARC_WINDOW', 'another-window');
+    onTestFinished(() => {
+      vi.unstubAllEnvs();
+    });
     const child = spawnCli(
       process.execPath,
       [
@@ -5985,23 +5988,47 @@ test(
         windowId: null,
       },
     );
+    let closed = false;
+    const completion = new Promise<void>((resolve) => {
+      child.on('close', () => {
+        closed = true;
+        resolve();
+      });
+    });
+    onTestFinished(async () => {
+      if (!closed) child.kill();
+      await completion;
+    });
     let output = '';
+    let stderr = '';
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
     child.stdout.on('data', (chunk) => {
       output += chunk;
     });
-    try {
-      await vi.waitFor(() => assert.ok(output.includes('\n')));
-      const env = JSON.parse(output);
-      assert.equal(env.window, null);
-      assert.ok(env.path.startsWith('Arc bin' + path.delimiter));
-      assert.equal(
-        env.editor,
-        process.platform === 'win32' ? process.execPath.replaceAll('\\', '/') : process.execPath,
-      );
-    } finally {
-      child.kill();
-      vi.unstubAllEnvs();
-    }
+    child.stderr.on('data', (chunk) => {
+      stderr += chunk;
+    });
+    let code: number | null = null;
+    let signal: string | null = null;
+    await new Promise<void>((resolve, reject) => {
+      child.on('error', (error) => {
+        reject(new Error(`Child launch failed: ${error.message}\nstderr: ${stderr}`, { cause: error }));
+      });
+      child.on('exit', (value, stoppedBy) => {
+        code = value;
+        signal = stoppedBy;
+      });
+      child.on('close', resolve);
+    });
+    const diagnostics = `stdout: ${output}\nstderr: ${stderr}`;
+    assert.equal(signal, null, diagnostics);
+    assert.equal(code, 0, diagnostics);
+    assert.ok(output.includes('\n'), diagnostics);
+    const env = JSON.parse(output);
+    assert.equal(env.window, null);
+    assert.ok(env.path.startsWith('Arc bin' + path.delimiter));
+    assert.equal(env.editor, process.platform === 'win32' ? process.execPath.replaceAll('\\', '/') : process.execPath);
   },
 );
 
