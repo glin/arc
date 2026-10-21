@@ -196,7 +196,7 @@ test('clicked local links open outside workspace folders through their existing 
     [
       'win32',
       ['C:/Workspace/App', 'C:/Workspace/Lib'],
-      'C:/Users/Reader/Notes/.claude/skills/arc-session-digest/SKILL.md',
+      'C:/Users/Reader/Notes/.claude/skills/sample-skill/SKILL.md',
       'D:/Notes/Mixed.ts',
       'C:/Workspace/Outside.ts',
     ],

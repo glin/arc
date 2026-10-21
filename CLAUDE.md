@@ -43,7 +43,7 @@ When a design goal blocks valuable work, state the conflict and its cost. The au
 
 ## Development workflow
 
-Use `/ship` for repository changes. Implement in a worktree. Run `/pre-commit-review` before landing.
+Implement repository changes in a worktree. Review changes before landing.
 
 Before committing, check changed documentation, comments, and product messages against the writing rules. Check code claims against the relevant code. Reviewers must repeat these checks.
 
