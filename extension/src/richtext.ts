@@ -183,8 +183,7 @@ function visitCitationMarkdown(text: string, consume: (start: number) => number)
   const tokenizer = new marked.Tokenizer() as marked.Tokenizer & marked.TokenizerThis;
   const lexer = new marked.Lexer({ gfm: true, breaks: true, tokenizer });
   tokenizer.lexer = lexer;
-  // Only source extents and reference destinations are needed here.
-  lexer.inline = (_source, tokens = []) => tokens;
+  // Preserve Marked's inline queue for block-token merges. Skip inline parsing.
   lexer.inlineTokens = (_source, tokens = []) => tokens;
   lexer.blockTokens(text, []);
   // Marked's declaration names an array here, but its runtime accepts the link registry.

@@ -27,6 +27,35 @@ import {
 } from './panelfixture.ts';
 import { STEP_DETAIL_LIMIT } from './transcript.ts';
 
+test('continued response lists retain Markdown without a code-block Copy action', { timeout: 60_000 }, async (t) => {
+  const browser = await browserOrNone();
+  if (!browser) {
+    t.skip('no browser installed');
+    return;
+  }
+  try {
+    const page = await browser.newPage();
+    await page.setContent(themed(pageHtml()));
+    const payload = renderPayload() as { cards: Record<string, any>[] };
+    const card = payload.cards[LONG_TURN_INDEX];
+    payload.cards = [card];
+    card.summaryHtml = renderRichMarkdown(
+      '**Waiting on you**\n- **Approve or reject** this:\n  [plan.md](C:/x/plan.md)\n  More text.',
+    );
+    await page.evaluate((value) => window.postMessage(value, '*'), payload);
+    await page.locator('.turn .head').click();
+    const response = page.locator('.turn .summary').first();
+    await page.waitForFunction(() => document.querySelector('.turn .summary')?.textContent?.includes('More text.'));
+    assert.equal(await response.locator('pre').count(), 0, 'response became a single code block');
+    assert.equal(await response.locator('button.copy').count(), 0, 'response gained a code-block Copy action');
+    assert.equal(await response.locator('ul > li').count(), 1);
+    assert.equal(await response.locator('strong').count(), 2);
+    assert.equal(await response.locator('li a[data-link="C:/x/plan.md"]').count(), 1);
+  } finally {
+    await browser.close();
+  }
+});
+
 test(
   'native response disclosures retain open state and focus while routing descendant actions',
   { timeout: 60_000 },

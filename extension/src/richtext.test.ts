@@ -35,6 +35,37 @@ const citationPath = (name: string) => (process.platform === 'win32' ? `C:/outsi
 const citation = (file = citationPath('file.csv'), attributes = '') =>
   `:codex-file-citation{path='${file}' ${attributes}}`;
 
+test.each([
+  ['unordered list', '- a:\n  b'],
+  ['ordered list', '1. a:\n   b'],
+  ['lazy continuation', '- a\nb:'],
+  ['blockquote list', '> - a\n>   b:'],
+  ['colon before list', 'x:\n\n- a\n  b'],
+  ['no colon', '- a\n  b'],
+])('continued %s retains Markdown structure', (_name, source) => {
+  const html = renderRichMarkdown(source);
+  assert.doesNotMatch(html, /<pre\b/, html);
+  assert.match(html, /<(?:ul|ol)>\s*<li>/, html);
+});
+
+test('continued list citations retain file destinations', () => {
+  const actual = process.platform;
+  try {
+    for (const platform of ['win32', 'linux', 'darwin']) {
+      Object.defineProperty(process, 'platform', { value: platform });
+      const file = citationPath('list.csv');
+      const source = `- Read this:\n  ${citation(file, 'purpose=source')}\n  More text.`;
+      const html = renderRichMarkdown(source);
+      assert.match(html, /<ul>\s*<li>/, `${platform}: ${html}`);
+      assert.ok(html.includes(`data-link="${file}"`), `${platform}: ${html}`);
+      assert.match(html, /data-link-kind="file-citation"/, html);
+      assert.doesNotMatch(html, /<pre\b|codex-file-citation\{/, html);
+    }
+  } finally {
+    Object.defineProperty(process, 'platform', { value: actual });
+  }
+});
+
 test('ordinary prose keeps HTTP autolinks beside citation candidates', () => {
   for (const source of ['See https://example.com', 'Read http://example.com/a.', '*See https://example.com*']) {
     assert.match(renderRichMarkdown(source), /data-link="https?:\/\/example.com/);
