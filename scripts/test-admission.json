@@ -61,8 +61,8 @@
   },
   "extension/src/derivedcache.test.ts": {
     "reason": "Independent writers and host death must preserve shared cache rows and release stale filesystem locks.",
-    "cases": 87,
-    "matricesSha256": "f38400f8ec76a1c2390bdd30eae7ed4f6fcfd76c661c858535a249ac4d86a2f5"
+    "cases": 89,
+    "matricesSha256": "7f2dc2c5d52f8fdadbbcbb0571b1f94766fccdf5c2b8dbe703091d3791832a8c"
   },
   "extension/src/exportsite.browser.test.ts": {
     "reason": "An offline exported session must retain interactive navigation and safe local browser behavior.",
@@ -126,8 +126,8 @@
   },
   "extension/src/panel.webview.test.ts": {
     "reason": "Real progressive workers must deliver bounded recovery and metadata through the production panel host.",
-    "cases": 593,
-    "matricesSha256": "50348754fd6d7dbb1e0ef595f1012dc706968ae2316c4461a9f5955bbd85b697"
+    "cases": 594,
+    "matricesSha256": "467407007f177370ba08f4375518a59d22dc128753001b7e529f298ffb51339f"
   },
   "extension/src/panelbundle.test.ts": {
     "reason": "The panel bundle and fixture must contain the production entry, source identity, and substituted text.",
@@ -191,8 +191,8 @@
   },
   "extension/src/startup.test.ts": {
     "reason": "Real title workers must publish recovered metadata through startup ownership and cancellation boundaries.",
-    "cases": 206,
-    "matricesSha256": "928f2866c87c91c100ac0fda2afad6ef9060526f06fbf725509096d0d3a52c55"
+    "cases": 208,
+    "matricesSha256": "492f9723aaa53f91e683cd54b78ff6d734345b66da3ca9f5b936c9f3d25aa9b6"
   },
   "extension/src/store.test.ts": {
     "reason": "The real Stop hook must renew retention for useful snapshot stores without changing workspace files.",
