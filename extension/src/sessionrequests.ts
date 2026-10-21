@@ -488,6 +488,7 @@ export class WindowChannel {
   // Without a handler, every send refuses before input because no session has a recorded owner.
   setGuardedSendHandler(handler: (request: SessionRequest) => Promise<GuardedSendResult>): void {
     this.guardedSendHandler = handler;
+    if (this.listening) this.publish();
   }
 
   constructor(
@@ -555,6 +556,7 @@ export class WindowChannel {
         'launchPolicy',
         ...(this.dispatchHandler ? ['dispatchResults'] : []),
         ...(this.guardedReadHandler ? [SESSION_READ_CAPABILITY] : []),
+        ...(this.guardedSendHandler ? ['agentMessageQueue'] : []),
       ],
     };
   }
@@ -1229,6 +1231,12 @@ export async function requestWindow(
       throw new Error(`Request ${requestId} has an unknown outcome in this activation.`);
     if (method === 'send' && !providerCapable(entry))
       throw new Error('The selected Arc window must reload before it can accept send. No prompt was sent.');
+    if (
+      method === 'send' &&
+      !Object.prototype.hasOwnProperty.call(params, 'observation') &&
+      !entry.capabilities?.includes('agentMessageQueue')
+    )
+      throw new Error('The selected Arc window must reload before it can queue messages. No prompt was sent.');
     if (
       (method === 'dispatch' || (method === 'start' && params.dispatch)) &&
       !entry.capabilities?.includes('dispatchResults')

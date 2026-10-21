@@ -8317,3 +8317,28 @@ test('parsed Claude effort commands preserve the priced request and both Bedrock
     assert.ok(composerView({ ...state, nextTurn: newerBasis })?.nextTurn?.warm);
   }
 });
+
+test('reset retains agent messages on the original session while reader entries follow the successor', () => {
+  const agent = { ...queued('  literal message  '), id: 'agent-message', origin: 'agent' as const };
+  const reader = queued('reader message');
+  const moved = succeedSession(
+    {
+      drafts: {},
+      queues: { old: [agent, reader] },
+      live: {},
+      settings: {},
+      profiles: {},
+      railOrder: [],
+      showing: 'old',
+    },
+    'old',
+    'new',
+  );
+  assert.equal(moved.queues.old[0].origin, 'agent');
+  assert.equal(moved.queues.old[0].text, agent.text);
+  assert.equal(moved.queues.old[0].delivery.phase, 'recovery');
+  assert.deepEqual(moved.queues.new, [reader]);
+  const edited = queueEdit([agent], agent.id, null)!;
+  assert.equal(edited.submission.text, agent.text);
+  assert.deepEqual(edited.queued, []);
+});

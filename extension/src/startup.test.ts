@@ -1,9 +1,34 @@
+import { normalizePromptAssetBook } from './promptassets';
+import {
+  GuardedSends,
+  SessionWriteRequests,
+  agentMessageBinding,
+  guardedRefusal,
+  guardedPromptRefusal,
+  requesterOf,
+  payloadSha256,
+} from './sessionwrites';
+import { GuardedAttempt } from './agentwire';
+import {
+  queueSubmissionAfter,
+  commentsForQueuedSubmission,
+  queueCanDrain,
+  queueEdit,
+  queuedSubmission,
+  sentPromptsToSave,
+} from './composerview';
+import {
+  normalizeQueuedSubmissions,
+  queuedSubmissionBookFits,
+  normalizeDrafts,
+  normalizeDraftCommentIds,
+} from './turnview';
 // @module-tag subprocess
 import { sessionStatsFromFacts } from './turncard';
 import { compatibleDiscovery, discoveryCompatibility } from './progressiveworker';
 import { claudeDispatchTranscript } from './turnfixtures';
 import { sessionCoverageMember, sessionPresence, reconcileSessionCollisions } from './sessioncoverage';
-import { sessionSourceKey, sessionPageSources } from './sessionreads';
+import { sessionSourceKey, sessionPageSources, guardedSourceRevision } from './sessionreads';
 import { beforeAll, test, vi } from 'vitest';
 import { pendingResponseSessionAdmitted, resolveResponseSession } from './domain/session-link';
 import { createPanelVisibility } from './panelvisibility';
@@ -45,7 +70,13 @@ import { tempDir } from './temproot.ts';
 import { buildSync, transformSync } from 'esbuild';
 import { messageByteBudget, PanelPerformanceCounters, serializedMessageBytes } from './performancediagnostics';
 import { SessionLoadingLine } from './sessionloadingline';
-import { HostReadPersistence, preserveHostRead, projectAgentRead } from './domain/read.ts';
+import {
+  HostReadPersistence,
+  ReadPersistenceUnknownError,
+  ReadPublicationError,
+  preserveHostRead,
+  projectAgentRead,
+} from './domain/read.ts';
 import { sessionCatalogMembership, sessionDiscoveryMembership } from './sessionreads.ts';
 import { REPOSITORY_SCOPE_CONFIRM_MS, REPOSITORY_SCOPE_REFRESH_MS, RepositoryScope } from './repositoryscope';
 import {
@@ -1524,7 +1555,7 @@ function completeDiscoveryHarness(
       glanceAt() { return new Map(); } dropSpentPresses() { return false; } evictCache() {}
       collect() { return this.drawnCards; } unreadCounts() { return new Map(); } titleFor() { return null; } fullTitleFor() { return null; }
       sessionLabel(session) { return sessionLabelOf(null, session.sessionId); }
-      agentRunFor() { return false; } drainPendingQueues() {} metaFor() { return { stats: null, starts: undefined }; }
+      agentRunFor() { return false; } drainPendingQueues() {} flushAgentQueue() {} metaFor() { return { stats: null, starts: undefined }; }
       runningSessions() { return []; } waitingSessions() { return []; } runningSince() { return new Map(); } liveOpenChildren() { return new Map(); } liveBackgroundCommands() { return new Map(); } pruneExits() {}
       railStatuses() { return { statuses: new Map(), openChildren: new Map() }; }
       heldLifetime = { stats: {}, costs: {}, contextDetails: {} };
@@ -6490,6 +6521,8 @@ async function sentPromptPosts(every: number | null): Promise<string | null> {
   vi.useFakeTimers(STREAM_TIMERS);
   const provider = streamedCatalogHarness(false, ['send', 'noteLive', 'adoptDraft', 'livePressAnswered'], SEND_SCOPE);
   Object.assign(provider, {
+    newDrafts: {},
+    awaitingSessionRecords: {},
     saved: { comments: [], labels: {} },
     trail: emptyTrail(),
     sentPrompts: {},
@@ -13535,4 +13568,604 @@ test.each([
     if (priorTimezone === undefined) delete process.env.TZ;
     else process.env.TZ = priorTimezone;
   }
+});
+
+// Exercise the production host drain with a native receipt writer and no visible target selection.
+function agentMessageHost(agent: 'claude' | 'codex') {
+  const file = ts.createSourceFile(
+    'panelhost.ts',
+    fs.readFileSync(path.join(__dirname, 'panelhost.ts'), 'utf8'),
+    ts.ScriptTarget.Latest,
+    true,
+  );
+  const owner = file.statements.find(
+    (one): one is ts.ClassDeclaration => ts.isClassDeclaration(one) && one.name?.text === 'PanelProvider',
+  )!;
+  const names = [
+    'queueAgentMessage',
+    'flushAgentMessage',
+    'recoverAgentMessage',
+    'flushQueue',
+    'flushAgentQueue',
+    'dequeue',
+    'readerWork',
+    'continuationWork',
+    'guardedTargetFacts',
+    'releaseStaging',
+    'livePressAnswered',
+    'forgetLivePress',
+    'requestQueuedEdit',
+    'acceptQueuedEdit',
+    'releaseQueuedEditOffer',
+    'writeDrafts',
+    'persistHostState',
+  ];
+  const body = owner.members
+    .filter((one) => one.name && names.includes(one.name.getText(file)))
+    .map((one) => one.getText(file))
+    .join('\n');
+  const scope = {
+    crypto: { randomUUID },
+    ReadPersistenceUnknownError,
+    ReadPublicationError,
+    queuedSubmission,
+    guardedRefusal,
+    guardedPromptRefusal,
+    requesterOf,
+    payloadSha256,
+    queueSubmissionAfter,
+    queuedSubmissionBookFits,
+    normalizeQueuedSubmissions,
+    normalizeDrafts,
+    normalizeDraftCommentIds,
+    normalizePromptAssetBook,
+    sentPromptsToSave,
+    preserveHostRead,
+    queueCanDrain,
+    queueEdit,
+    guardedSourceRevision,
+    ACTIVE_RAIL_STATUSES: new Set(['running', 'waiting', 'subagents', 'background']),
+    commentsForActiveSubmission,
+    pressesAfterHandoff,
+    clearRequest: () => null,
+    compactSubmission,
+    clearSubmission,
+    queueAfterAcceptedRecovery,
+    commentsForQueuedSubmission,
+    queueWithout: (entries: any[], id: string) => entries.filter((one) => one.id !== id),
+    queueAfterClearRecovery: (_agent: string, entries: any[]) => entries,
+  };
+  const compiled = transformSync(`class Host { ${body} }; return Host`, { loader: 'ts', format: 'cjs' }).code;
+  const Host = new Function(...Object.keys(scope), compiled)(...Object.values(scope));
+  const host: any = new Host();
+  const reads: string[] = [];
+  const text = '  exact message\n\twith whitespace  \n';
+  let busy = true;
+  let exited = false;
+  let asks = false;
+  let control = false;
+  let replacement = false;
+  let outcome: 'accepted' | 'refused' | 'unknown' = 'accepted';
+  let beforeNative: (() => void) | undefined;
+  let persist: (() => Promise<void>) | undefined;
+  const child = {
+    key: 'original-child',
+    agent,
+    state: () => ({ sessionId: 'target', exited, lastError: null }),
+    guardedTurnEnds: () => 0,
+    guardedIdle: () => (busy || asks || control ? 'busy' : null),
+    guardedPrompt: (value: string, uuid: string, submitted?: (turn: number) => void, beforeWrite?: () => void) => {
+      const attempt = new GuardedAttempt(uuid, beforeWrite);
+      submitted?.(7);
+      busy = true; // Native preparation belongs to this attempt and must not refuse itself.
+      beforeNative?.();
+      try {
+        attempt.prepareWrite();
+        reads.push(value);
+        attempt.markWritten();
+        attempt.settle({ outcome, nativeTurnId: 'native-7', reason: outcome });
+      } catch (error) {
+        attempt.settle({ outcome: 'unknown', nativeTurnId: null, reason: String(error) });
+      }
+      return attempt;
+    },
+  };
+  const live = () => (replacement || exited ? null : child);
+  const policy = new GuardedSends<typeof child>('window', () => live());
+  const binding = () =>
+    agentMessageBinding(
+      policy,
+      child,
+      { find: live, withActivity: async (_key, work) => work(child) },
+      () => false,
+      randomUUID,
+    );
+  Object.assign(host, {
+    repositoryScopeReady: true,
+    hostSaveGeneration: 0,
+    hidden: new Set(),
+    membershipOf: () => 'present',
+    queues: {},
+    agentMessages: new Map(),
+    queueHandoffs: new Set(),
+    queuedEditReservations: new Set(),
+    pendingQueueDrains: new Set(),
+    clearSettlements: new Map(),
+    live: {},
+    livePressHosts: new Map(),
+    hosts: [],
+    staging: new Set(),
+    stagingTokens: new Map(),
+    assetHandoffs: new Set(),
+    assetIdsInHandoff: new Set(),
+    submissionsInFlight: new Set(),
+    submittingDrafts: new Map(),
+    assets: {},
+    draftCommentIds: {},
+    queuedEditOffers: new Map(),
+    panelSession: (session: string) => session,
+    holdDraft: (session: string, text: string) => {
+      host.drafts[session] = text;
+    },
+    sendToHost: async () => true,
+    postAcceptedResponses: () => {},
+    markStartedPresses: () => {},
+    dropSpentPresses: () => {},
+    attachmentStorageDir: null,
+    newDrafts: {},
+    awaitingSessionRecords: {},
+    saved: { comments: [{ id: 'unclaimed', sessionId: 'target', text: 'private reader comment' }] },
+    drafts: { target: 'reader draft' },
+    stateFor: () => ({
+      sessionId: 'target',
+      agent,
+      running: busy,
+      clearing: false,
+      asks: asks ? [{}] : [],
+      draft: host.drafts.target,
+      assets: [],
+      queued: host.queues.target ?? [],
+      comments: host.saved.comments,
+    }),
+    composerStateFor: () => host.stateFor(),
+    guardedTargetFacts: () => ({
+      current: true,
+      archived: false,
+      scope: 'scope',
+      sourceRevision: null,
+      latestTurn: null,
+      queued: host.queues.target?.length ?? 0,
+      pendingSubmissions: 0,
+      pendingControls: Number(control),
+      background: busy,
+      writerConflict: false,
+    }),
+    writeDrafts: async () => {
+      host.hostSaveGeneration++;
+      host.stored = normalizeQueuedSubmissions(host.queues);
+      await persist?.();
+    },
+    post: async () => {},
+    usagePayload: () => ({}),
+    onReaderAction: () => assert.fail('agent message entered reader action'),
+    onReaderDirected: () => assert.fail('agent message granted reader direction'),
+    onSendPrompt: () => assert.fail('agent message entered ordinary send'),
+    send: () => assert.fail('agent message assembled reader input'),
+  });
+  const request = {
+    id: 'window:message',
+    requester: 'unrelated-reader-agent',
+    requesterProvider: 'codex' as const,
+    params: { sessionId: 'target', prompt: text },
+  };
+  return {
+    host,
+    child,
+    policy,
+    reads,
+    text,
+    request,
+    binding,
+    setBusy: (value: boolean) => {
+      busy = value;
+    },
+    setAsks: (value: boolean) => {
+      asks = value;
+    },
+    setControl: (value: boolean) => {
+      control = value;
+    },
+    replace: () => {
+      replacement = true;
+    },
+    exit: () => {
+      exited = true;
+    },
+    setOutcome: (value: typeof outcome) => {
+      outcome = value;
+    },
+    beforeNative: (work: () => void) => {
+      beforeNative = work;
+    },
+    persist: (work: () => Promise<void>) => {
+      persist = work;
+    },
+  };
+}
+
+for (const agent of ['claude', 'codex'] as const) {
+  test(`${agent} queues an explicit message to an unrelated busy offscreen target with unparsed history and unclaimed comments`, async () => {
+    const f = agentMessageHost(agent);
+    const requests = new SessionWriteRequests('window');
+    let release!: () => void;
+    f.persist(
+      () =>
+        new Promise<void>((resolve) => {
+          release = resolve;
+        }),
+    );
+    let returned = false;
+    const admit = requests
+      .runGuarded(f.request.id, f.request, () => f.host.queueAgentMessage(f.request, f.binding()))
+      .then((result: any) => {
+        returned = true;
+        return result;
+      });
+    await vi.waitFor(() => assert.ok(release));
+    assert.equal(returned, false);
+    assert.deepEqual(f.reads, []);
+    assert.equal(f.host.stored.target[0].origin, 'agent');
+    assert.equal(f.host.stored.target[0].delivery.phase, 'recovery');
+    release();
+    f.persist(async () => {});
+    const admitted = await admit;
+    assert.equal(admitted.status, 'queued');
+    assert.equal(admitted.payloadSha256, payloadSha256(f.text));
+    assert.deepEqual(f.reads, []);
+    assert.equal(f.host.agentMessages.size, 1);
+    f.setBusy(false);
+    f.host.flushQueue('target');
+    await vi.waitFor(() => assert.equal(f.host.agentMessages.size, 0));
+    assert.deepEqual(f.reads, [f.text]);
+    assert.deepEqual(f.host.queues.target, []);
+    assert.equal(f.host.drafts.target, 'reader draft');
+    assert.equal(f.host.saved.comments.length, 1);
+    assert.deepEqual(
+      await requests.runGuarded(f.request.id, f.request, () => assert.fail('retry recreated queue entry')),
+      admitted,
+    );
+  });
+  test(`${agent} retains unknown messages and blocks another requester without granting parent ownership`, async () => {
+    const f = agentMessageHost(agent);
+    f.setOutcome('unknown');
+    await f.host.queueAgentMessage(f.request, f.binding());
+    f.setBusy(false);
+    f.host.flushQueue('target');
+    await vi.waitFor(() => assert.equal(f.host.queues.target[0].delivery.phase, 'recovery'));
+    assert.equal(f.host.agentMessages.size, 0);
+    assert.equal(f.policy.owner('target'), null);
+    const next = await f.host.queueAgentMessage(
+      { ...f.request, id: 'window:other', requester: 'another-agent' },
+      f.binding(),
+    );
+    assert.equal(next.status, 'refused');
+    assert.match(next.reason, /unknown outcome/);
+    assert.deepEqual(f.reads, [f.text]);
+    f.policy.invalidate('target');
+    assert.ok(f.policy.messageRefusal('target'));
+    f.policy.intervene('target');
+    assert.equal(f.policy.messageRefusal('target'), null);
+  });
+  test(`${agent} never sends a retained message to a replacement child or across a final native ownership change`, async () => {
+    for (const change of ['before-drain', 'before-write'] as const) {
+      const f = agentMessageHost(agent);
+      await f.host.queueAgentMessage(f.request, f.binding());
+      if (change === 'before-drain') f.replace();
+      else f.beforeNative(() => f.replace());
+      f.setBusy(false);
+      f.host.flushQueue('target');
+      await vi.waitFor(() => assert.equal(f.host.queues.target[0].delivery.phase, 'recovery'));
+      assert.deepEqual(f.reads, []);
+      assert.equal(f.host.agentMessages.size, 0);
+    }
+  });
+  test(`${agent} keeps messages waiting for asks and controls and preserves FIFO`, async () => {
+    const f = agentMessageHost(agent);
+    f.host.queues.target = queueSubmissionAfter([], randomUUID(), 'earlier reader', [], [], 1, false, {
+      agent,
+      owner: 'target',
+    });
+    await f.host.queueAgentMessage(f.request, f.binding());
+    f.host.queues.target = queueSubmissionAfter(f.host.queues.target, randomUUID(), 'later reader', [], [], 2, false, {
+      agent,
+      owner: 'target',
+    });
+    assert.deepEqual(
+      f.host.queues.target.map((one: any) => one.text),
+      ['earlier reader', f.text, 'later reader'],
+    );
+    f.host.queues.target.shift();
+    f.setBusy(false);
+    f.setAsks(true);
+    f.host.flushQueue('target');
+    assert.deepEqual(f.reads, []);
+    f.setAsks(false);
+    f.setControl(true);
+    f.host.flushQueue('target');
+    assert.deepEqual(f.reads, []);
+    f.setControl(false);
+    f.host.flushQueue('target');
+    await vi.waitFor(() => assert.deepEqual(f.reads, [f.text]));
+    assert.equal(f.host.queues.target[0].text, 'later reader');
+  });
+}
+
+test('message save refusal releases admission while uncertain publication retains recovery', async () => {
+  for (const uncertain of [false, true]) {
+    const f = agentMessageHost('claude');
+    f.persist(async () => {
+      throw uncertain ? new ReadPersistenceUnknownError() : new Error('storage refused');
+    });
+    const result = await f.host.queueAgentMessage(f.request, f.binding());
+    assert.equal(result.status, uncertain ? 'unknown' : 'refused');
+    assert.equal(f.host.agentMessages.size, 0);
+    assert.equal(f.host.queues.target.length, uncertain ? 1 : 0);
+    if (uncertain) assert.equal(f.host.queues.target[0].delivery.phase, 'recovery');
+    assert.deepEqual(f.reads, []);
+  }
+});
+
+test('Drop removes message authority and an identical request never recreates the dropped entry', async () => {
+  const f = agentMessageHost('claude');
+  const requests = new SessionWriteRequests('window');
+  const result: any = await requests.runGuarded(f.request.id, f.request, () =>
+    f.host.queueAgentMessage(f.request, f.binding()),
+  );
+  let directed = 0;
+  f.host.onReaderDirected = () => directed++;
+  f.host.dequeue(result.queuedSubmissionId, 'target');
+  assert.equal(directed, 1);
+  assert.equal(f.host.agentMessages.size, 0);
+  assert.equal(f.host.queues.target, undefined);
+  assert.deepEqual(
+    await requests.runGuarded(f.request.id, f.request, () => assert.fail('Drop recreated message')),
+    result,
+  );
+  assert.deepEqual(f.reads, []);
+});
+
+test('self messages, archived or absent scope, reset and capacity never gain a queue entry', async () => {
+  for (const blocked of ['self', 'scope', 'membership', 'archived', 'reset', 'capacity']) {
+    const f = agentMessageHost('codex');
+    if (blocked === 'self') f.request.requester = 'target';
+    if (blocked === 'scope') f.host.repositoryScopeReady = false;
+    if (blocked === 'membership') f.host.membershipOf = () => 'unknown';
+    if (blocked === 'archived') {
+      const facts = f.host.guardedTargetFacts;
+      f.host.guardedTargetFacts = () => ({ ...facts(), archived: true });
+    }
+    if (blocked === 'reset') f.host.clearSettlements.set('target', {});
+    if (blocked === 'capacity')
+      for (let i = 0; i < 100; i++)
+        f.host.queues.target = queueSubmissionAfter(
+          f.host.queues.target ?? [],
+          randomUUID(),
+          'reader',
+          [],
+          [],
+          1,
+          false,
+          { agent: 'codex', owner: 'target' },
+        );
+    const result = await f.host.queueAgentMessage(f.request, f.binding());
+    assert.equal(result.status, 'refused', blocked);
+    assert.equal(f.host.agentMessages.size, 0);
+    assert.deepEqual(f.reads, []);
+  }
+});
+
+test('a queued message clears the reader-work wait before deferred compaction without granting reader authority', async () => {
+  const f = agentMessageHost('codex');
+  await f.host.queueAgentMessage(f.request, f.binding());
+  // Deferred compaction consults this production port before acquiring native input.
+  assert.equal(f.host.readerWork('target'), 'pending');
+  f.setBusy(false);
+  f.host.flushQueue('target');
+  await vi.waitFor(() => assert.equal(f.host.agentMessages.size, 0));
+  assert.equal(f.host.readerWork('target'), 'none');
+  assert.deepEqual(f.reads, [f.text]);
+  assert.equal(f.policy.owner('target'), null);
+});
+
+test('proven message-save refusal cannot return through an overlapping unrelated save and restored queues', async () => {
+  for (const cleanupUnknown of [false, true]) {
+    const f = agentMessageHost('claude');
+    Object.assign(f.host, { assets: {}, draftCommentIds: {}, sentPrompts: {}, promptsBySession: new Map() });
+    f.host.saved = { read: [], readTo: {}, since: 0, queues: {}, comments: f.host.saved.comments };
+    let durable: any = structuredClone(f.host.saved);
+    let rejectAdmission!: (error: Error) => void;
+    let saves = 0;
+    const owner = new HostReadPersistence<any>(
+      durable,
+      async (state) => {
+        saves++;
+        if (saves === 1)
+          await new Promise<void>((_resolve, reject) => {
+            rejectAdmission = reject;
+          });
+        durable = structuredClone(state);
+        return saves === 3 && cleanupUnknown ? { status: 'unknown' as const } : undefined;
+      },
+      async () => {},
+    );
+    f.host.readOwner = () => owner;
+    delete f.host.writeDrafts;
+    const admission = f.host.queueAgentMessage(f.request, f.binding());
+    await vi.waitFor(() => assert.ok(rejectAdmission));
+    f.host.saved.comments.push({ id: 'later-comment', sessionId: 'target', text: 'unrelated reader change' });
+    const overlapping = f.host.persistHostState();
+    rejectAdmission(new Error('storage refused'));
+    const result = await admission;
+    await overlapping;
+    assert.equal(result.status, cleanupUnknown ? 'unknown' : 'refused');
+    assert.deepEqual(f.reads, []);
+    assert.equal(durable.comments.length, 2);
+    if (cleanupUnknown) {
+      assert.equal(f.host.queues.target[0].text, f.text);
+      assert.equal(f.host.queues.target[0].delivery.phase, 'recovery');
+      assert.equal(f.host.saved.queues.target[0].text, f.text);
+      assert.equal(f.host.saved.queues.target[0].delivery.phase, 'recovery');
+    } else {
+      assert.deepEqual(normalizeQueuedSubmissions(durable.queues), {});
+      assert.deepEqual(f.host.saved.queues, {});
+    }
+    assert.equal(f.host.agentMessages.size, 0);
+  }
+});
+
+test('idle agent messages wait for production panel staging and control facts until their settlement', async () => {
+  for (const blocker of ['staging', 'control']) {
+    const f = agentMessageHost('codex');
+    f.setBusy(false);
+    const source = { sessionId: 'target', agent: 'codex', file: __filename };
+    Object.assign(f.host, {
+      readScopeKey: () => 'scope',
+      folders: () => [],
+      repositoryScope: { snapshot: () => ({ roots: [] }) },
+      authoritativeCatalogScope: '[]',
+      authoritativeCatalog: [source],
+      sessionPageIndexFor: () => ({ scoped: [source] }),
+      railStatuses: () => ({ statuses: new Map([['target', 'idle']]) }),
+    });
+    delete f.host.guardedTargetFacts;
+    if (blocker === 'staging') {
+      f.host.staging.add('target');
+      f.host.stagingTokens.set('target', 'attachment');
+    } else f.host.live.target = [{ kind: 'compact', at: 1, text: '' }];
+    let attempts = 0;
+    f.persist(async () => {
+      if (f.host.queues.target?.[0]?.delivery.phase === 'delivery') attempts++;
+    });
+    const result = await f.host.queueAgentMessage(f.request, f.binding());
+    assert.equal(result.status, 'queued');
+    assert.equal(f.host.queues.target[0].delivery.phase, 'queued');
+    assert.equal(attempts, 0);
+    assert.equal(f.host.agentMessages.size, 1);
+    assert.deepEqual(f.reads, []);
+    if (blocker === 'staging') f.host.releaseStaging('target', 'attachment');
+    else f.host.livePressAnswered('target', 1, { delivered: false, reason: 'control ended' });
+    await vi.waitFor(() => assert.equal(f.host.agentMessages.size, 0));
+    assert.equal(attempts, 1);
+    assert.deepEqual(f.reads, [f.text]);
+  }
+});
+
+test('hosted child exit leaves an ordinary reader queue entry waiting without a launch', async () => {
+  const f = agentMessageHost('claude');
+  f.host.queues.target = queueSubmissionAfter([], randomUUID(), 'reader message', [], [], 1, false, {
+    agent: 'claude',
+    owner: 'target',
+  });
+  let launches = 0;
+  f.host.onReaderAction = () => {};
+  f.host.onReaderDirected = () => {};
+  f.host.send = () => {
+    launches++;
+  };
+  const file = ts.createSourceFile(
+    'extension.ts',
+    fs.readFileSync(path.join(__dirname, 'extension.ts'), 'utf8'),
+    ts.ScriptTarget.Latest,
+    true,
+  );
+  let callback!: ts.Expression;
+  const visit = (node: ts.Node) => {
+    if (ts.isPropertyAssignment(node) && node.name.getText(file) === 'onStateChange') callback = node.initializer;
+    ts.forEachChild(node, visit);
+  };
+  visit(file);
+  assert.ok(callback);
+  const scope = {
+    panel: f.host,
+    policyMoves: new Map(),
+    policies: { forgetClear: () => {} },
+    compaction: undefined,
+    commandStateChanges: new Set(),
+    updateAgentAffordance: () => {},
+    usageReads: { failDeferred: () => {} },
+    publishHostedSessions: () => {
+      f.setBusy(false);
+    },
+  };
+  f.host.invalidateContext = () => {};
+  f.host.releaseDeliveredPromptAssets = () => {};
+  const compiled = transformSync(`return (${callback.getText(file)})`, { loader: 'ts', format: 'cjs' }).code;
+  const onStateChange = new Function(...Object.keys(scope), compiled)(...Object.values(scope));
+  f.exit();
+  onStateChange({ key: 'original-child', sessionId: 'target', agent: 'claude', busy: false, exited: true });
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.equal(launches, 0);
+  assert.equal(f.host.queues.target[0].delivery.phase, 'queued');
+});
+
+test('recovery and Drop release drain markers and unblock compaction and continuation after terminal cleanup', async () => {
+  for (const outcome of ['refused', 'unknown'] as const) {
+    const f = agentMessageHost('claude');
+    f.setOutcome(outcome);
+    const result = await f.host.queueAgentMessage(f.request, f.binding());
+    f.setBusy(false);
+    f.host.flushQueue('target');
+    await vi.waitFor(() => assert.equal(f.host.queues.target[0].delivery.phase, 'recovery'));
+    assert.equal(f.host.pendingQueueDrains.has('target'), false);
+    f.host.pendingQueueDrains.add('target');
+    f.host.onReaderDirected = () => f.policy.intervene('target');
+    f.host.dequeue(result.queuedSubmissionId, 'target');
+    assert.equal(f.host.readerWork('target'), 'none');
+    assert.equal(f.host.continuationWork('target'), 'none');
+    assert.equal(f.policy.messageRefusal('target'), null);
+  }
+  const f = agentMessageHost('claude');
+  const result = await f.host.queueAgentMessage(f.request, f.binding());
+  f.host.queues.target = queueSubmissionAfter(f.host.queues.target, randomUUID(), 'later reader', [], [], 1, false, {
+    agent: 'claude',
+    owner: 'target',
+  });
+  f.host.recoverAgentMessage('target', result.queuedSubmissionId, 'needs reader');
+  assert.equal(f.host.pendingQueueDrains.has('target'), true);
+  assert.equal(f.host.queues.target[1].text, 'later reader');
+});
+
+test('Edit releases agent message authority and retained retry preserves the original admission without queue recreation', async () => {
+  const f = agentMessageHost('codex');
+  f.host.drafts.target = '';
+  f.host.saved.comments = [];
+  const requests = new SessionWriteRequests('window');
+  const result: any = await requests.runGuarded(f.request.id, f.request, () =>
+    f.host.queueAgentMessage(f.request, f.binding()),
+  );
+  const browser = {};
+  const offers: any[] = [];
+  f.host.sendToHost = async (_host: unknown, message: unknown) => {
+    offers.push(message);
+    return true;
+  };
+  f.host.onReaderDirected = () => {};
+  f.host.requestQueuedEdit(result.queuedSubmissionId, 'target', 1, browser);
+  assert.equal(offers[0].text, f.text);
+  f.host.acceptQueuedEdit(result.queuedSubmissionId, 'target', 1, 2, true, browser);
+  assert.equal(f.host.agentMessages.size, 0);
+  assert.equal(f.host.drafts.target, f.text);
+  assert.equal(f.host.queues.target, undefined);
+  const [reader] = queueSubmissionAfter([], randomUUID(), f.host.drafts.target, [], [], 1, false, {
+    agent: 'codex',
+    owner: 'target',
+  });
+  assert.equal(reader.origin, undefined);
+  assert.deepEqual(
+    await requests.runGuarded(f.request.id, f.request, () => assert.fail('Edit recreated message')),
+    result,
+  );
+  assert.equal(f.host.queues.target, undefined);
+  assert.deepEqual(f.reads, []);
 });

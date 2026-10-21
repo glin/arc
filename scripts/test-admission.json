@@ -1,8 +1,8 @@
 {
   "cli/test/manage.test.ts": {
     "reason": "CLI management must preserve classification, validation, and read delivery through a real authenticated window channel.",
-    "cases": 8,
-    "matricesSha256": "a7b9886c61ff373920fa25bb4bc0bd9870ca54cd0458e1daed16e5af85e75dbc"
+    "cases": 9,
+    "matricesSha256": "c42a9dc7deef57b354e987b4e3353319415b4a377794651d8422050b78b0f94c"
   },
   "cli/test/run.test.ts": {
     "reason": "Standalone workers must retain real output, exit, cancellation, receipt ownership, and recovery across process boundaries.",
@@ -126,8 +126,8 @@
   },
   "extension/src/panel.webview.test.ts": {
     "reason": "Real progressive workers must deliver bounded recovery and metadata through the production panel host.",
-    "cases": 594,
-    "matricesSha256": "0fc9fac7553f2ee6dddd466e05430035f6bbcabb52aad1931bf2cc02fd809def"
+    "cases": 595,
+    "matricesSha256": "901a1c0bd004922235d5d37617f89b802b9edd7cc8c6446b2f542f83b6bf5cc9"
   },
   "extension/src/panelbundle.test.ts": {
     "reason": "The panel bundle and fixture must contain the production entry, source identity, and substituted text.",
@@ -181,8 +181,8 @@
   },
   "extension/src/sessionwrites.test.ts": {
     "reason": "Authenticated window channels must preserve accepted reads, ordered writes, and ownership across native IPC.",
-    "cases": 23,
-    "matricesSha256": "09f64e027254828ec192b70608ce030dfc060f4a09c5c7c944f68a50729ca24e"
+    "cases": 24,
+    "matricesSha256": "da9c1bc4e784ac3d912da595add36d2fc767df399befb227dde8796e1586823e"
   },
   "extension/src/startup.browser.test.ts": {
     "reason": "Startup and restored panel rendering must preserve usable browser state and focus.",
@@ -190,9 +190,9 @@
     "matricesSha256": "b2a4c3552a9fdd99d3be4a6e1515bc834b857c078f1059c8fbdf75ef50132b39"
   },
   "extension/src/startup.test.ts": {
-    "reason": "Real title workers must publish recovered metadata through startup ownership and cancellation boundaries. Project cost snapshots must preserve workspace, revision, and calendar ownership during background slices.",
-    "cases": 219,
-    "matricesSha256": "e5ca69f554f4de512a1b23ffd13173881cfd976018e21ac6e21a990c6cad1826"
+    "reason": "Real title workers must publish recovered metadata through startup ownership and cancellation boundaries. Project cost snapshots must preserve workspace, revision, and calendar ownership during background slices. Agent messages must preserve durable admission, settlement wakeups, native delivery authority, and retained retries.",
+    "cases": 232,
+    "matricesSha256": "7e34e4361437a31cd850882f5ece5e9eef5db0f46cb7163a728b4fe0725c7e2d"
   },
   "extension/src/store.test.ts": {
     "reason": "The real Stop hook must renew retention for useful snapshot stores without changing workspace files.",

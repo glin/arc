@@ -1154,3 +1154,51 @@ test(
     }
   },
 );
+
+test(
+  'queue sends negotiate capability before transport and retain the observation-free shape',
+  { tags: ['subprocess'] },
+  async () => {
+    const { channel, home, entry } = await fixture();
+    vi.stubEnv('CLAUDE_CODE_SESSION_ID', 'unrelated');
+    vi.stubEnv('CODEX_THREAD_ID', '');
+    const params = { sessionId: 'target', prompt: '  exact\nmessage  ' };
+    const id = channel.hostId + ':queue';
+    await assert.rejects(requestWindow('send', params, channel.hostId, home, id), /reload.*queue messages/);
+    let calls = 0;
+    channel.setGuardedSendHandler(async (request) => {
+      calls++;
+      return {
+        version: 1,
+        status: 'queued',
+        requestId: request.id,
+        payloadSha256: 'digest',
+        nativeTurnId: null,
+        queuedSubmissionId: 'entry',
+        reason: '',
+      };
+    });
+    const admitted: any = await requestWindow('send', params, channel.hostId, home, id);
+    assert.equal(admitted.status, 'queued');
+    assert.deepEqual(await requestWindow('send', params, channel.hostId, home, id), admitted);
+    assert.equal(calls, 1);
+    const observation = 'a'.repeat(40) + '.' + 'b'.repeat(43);
+    await assert.rejects(
+      requestWindow('send', { ...params, observation }, channel.hostId, home, id),
+      /different request/,
+    );
+    for (const observation of ['', 'malformed', undefined])
+      assert.equal(
+        parseSessionRequest({
+          id: channel.hostId + ':bad',
+          version: 1,
+          token: entry.token,
+          method: 'send',
+          requester: 'unrelated',
+          requesterProvider: 'claude',
+          params: { ...params, observation },
+        }),
+        null,
+      );
+  },
+);

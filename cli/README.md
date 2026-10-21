@@ -207,3 +207,5 @@ Stop every process using copied releases before removing owned `tools` storage. 
 ## Standalone launches
 
 Use `arc run --help` for explicit standalone launch settings. The [CLI guide](../docs/cli.md#standalone-launches) describes native receipts, completion, reports, management, and recovery.
+
+`arc send` without `--observation` queues a literal reader-requested message to an existing live session. Supply `--observation` for a parent-only follow-up. [Session management](../docs/cli.md#follow-ups) defines both forms.

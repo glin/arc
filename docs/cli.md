@@ -126,7 +126,13 @@ A disconnected or timed-out write returns `unknown` with its request ID when del
 
 ### Follow-ups
 
-`send` delivers one prompt to an idle session the requesting agent started with `start --arc-dispatch` in the same activation. Read it first:
+`send` queues a literal reader-requested message when `--observation` is absent. The destination must have an existing live child in the selected scope. Busy destinations wait in FIFO order. `queued` confirms admission, not delivery.
+
+```bash
+arc send SESSION_ID --prompt-file message.txt --request-id WINDOW_ID:message --window WINDOW_ID --json
+```
+
+With `--observation`, `send` delivers one prompt to an idle session the requester started with `start --arc-dispatch`. Read it first:
 
 ```sh
 arc session SESSION_ID --window WINDOW_ID --json

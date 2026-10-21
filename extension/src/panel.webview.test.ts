@@ -17409,18 +17409,27 @@ test('rejected sends and queued edits reply to the retained browser identity', a
   };
   const acceptQueuedEdit = new Function(
     'queueEdit',
+    'queueCanDrain',
     'queueAfterClearRecovery',
     'queueSubmissionAfter',
     'commentsForActiveSubmission',
     'queuedSubmissionBookFits',
     `return function (id, session, revision, currentRevision, accepted, host) {\n${methodBody('private acceptQueuedEdit(')}\n};`,
-  )(queueEdit, queueAfterClearRecovery, queueSubmissionAfter, commentsForActiveSubmission, queuedSubmissionBookFits);
+  )(
+    queueEdit,
+    queueCanDrain,
+    queueAfterClearRecovery,
+    queueSubmissionAfter,
+    commentsForActiveSubmission,
+    queuedSubmissionBookFits,
+  );
   const dequeue = new Function(
     'queuedSubmission',
+    'queueCanDrain',
     'queueWithout',
     'queueAfterClearRecovery',
     `return function (id, session) {\n${methodBody('private dequeue(')}\n};`,
-  )(queuedSubmission, queueWithout, queueAfterClearRecovery);
+  )(queuedSubmission, queueCanDrain, queueWithout, queueAfterClearRecovery);
   const flushQueue = extractedFlushQueue();
 
   requestQueuedEdit.call(edited, 'q1', 'provisional', 17, host, 'provisional');
@@ -17552,12 +17561,20 @@ test('a queued edit keeps a newer draft written from another panel', () => {
   )();
   const acceptQueuedEdit = new Function(
     'queueEdit',
+    'queueCanDrain',
     'queueAfterClearRecovery',
     'queueSubmissionAfter',
     'commentsForActiveSubmission',
     'queuedSubmissionBookFits',
     `return function (id, session, revision, currentRevision, accepted, host) {\n${methodBody('private acceptQueuedEdit(')}\n};`,
-  )(queueEdit, queueAfterClearRecovery, queueSubmissionAfter, commentsForActiveSubmission, queuedSubmissionBookFits);
+  )(
+    queueEdit,
+    queueCanDrain,
+    queueAfterClearRecovery,
+    queueSubmissionAfter,
+    commentsForActiveSubmission,
+    queuedSubmissionBookFits,
+  );
   const setDraft = new Function(
     'hasUnsentPrompt',
     `return function (text, keep, session) {\n${methodBody('private setDraft(')}\n};`,
@@ -17673,12 +17690,20 @@ test('a queued edit retains an attachment that finishes after the offer', () => 
   )();
   const acceptQueuedEdit = new Function(
     'queueEdit',
+    'queueCanDrain',
     'queueAfterClearRecovery',
     'queueSubmissionAfter',
     'commentsForActiveSubmission',
     'queuedSubmissionBookFits',
     `return function (id, session, revision, currentRevision, accepted, host) {\n${methodBody('private acceptQueuedEdit(')}\n};`,
-  )(queueEdit, queueAfterClearRecovery, queueSubmissionAfter, commentsForActiveSubmission, queuedSubmissionBookFits);
+  )(
+    queueEdit,
+    queueCanDrain,
+    queueAfterClearRecovery,
+    queueSubmissionAfter,
+    commentsForActiveSubmission,
+    queuedSubmissionBookFits,
+  );
   const lateAsset = {
     id: '00000000-0000-4000-8000-000000000001',
     name: 'late.txt',
@@ -17761,12 +17786,20 @@ test('releasing a rejected or abandoned queued edit resumes eligible delivery', 
   )();
   const acceptQueuedEdit = new Function(
     'queueEdit',
+    'queueCanDrain',
     'queueAfterClearRecovery',
     'queueSubmissionAfter',
     'commentsForActiveSubmission',
     'queuedSubmissionBookFits',
     `return function (id, session, revision, currentRevision, accepted, host) {\n${methodBody('private acceptQueuedEdit(')}\n};`,
-  )(queueEdit, queueAfterClearRecovery, queueSubmissionAfter, commentsForActiveSubmission, queuedSubmissionBookFits);
+  )(
+    queueEdit,
+    queueCanDrain,
+    queueAfterClearRecovery,
+    queueSubmissionAfter,
+    commentsForActiveSubmission,
+    queuedSubmissionBookFits,
+  );
   const flushQueue = extractedFlushQueue();
   const delivered: string[] = [];
   const provider = {
@@ -18881,6 +18914,7 @@ test('a failed fresh-session launch keeps its reader parent for a successful ret
     livePressHosts: new Map(),
     writeDrafts: () => Promise.resolve(),
     flushQueue() {},
+    flushAgentQueue() {},
     refresh: () => Promise.resolve(),
     sessionOrigins: {} as Record<string, unknown>,
     onSendDraftPrompt() {
@@ -25120,10 +25154,11 @@ test('a refused queued clear removes the command and resumes later source prompt
 test('dropping a restored clear releases the prompts it kept off the source session', async () => {
   const dequeue = new Function(
     'queuedSubmission',
+    'queueCanDrain',
     'queueWithout',
     'queueAfterClearRecovery',
     `return function (id, session) {\n${methodBody('private dequeue(')}\n};`,
-  )(queuedSubmission, queueWithout, queueAfterClearRecovery);
+  )(queuedSubmission, queueCanDrain, queueWithout, queueAfterClearRecovery);
   const clear = { id: 'clear', text: '/clear', commentIds: [], assets: [], at: 1, attempted: true };
   const followUp = {
     id: 'follow-up',

@@ -1752,7 +1752,24 @@ export function succeedSession(state: SessionIdentityState, source: string, succ
   return {
     drafts: { ...state.drafts },
     assets: move(state.assets ?? {}),
-    queues: move(state.queues),
+    queues: {
+      ...move(state.queues),
+      ...(state.queues[source]?.some((entry) => entry.origin === 'agent')
+        ? {
+            [source]: state.queues[source]
+              .filter((entry) => entry.origin === 'agent')
+              .map((entry) => ({
+                ...entry,
+                delivery: {
+                  phase: 'recovery' as const,
+                  owner: source,
+                  reason: 'The session was reset before this message was delivered.',
+                },
+              })),
+            [successor]: (state.queues[source] ?? []).filter((entry) => entry.origin !== 'agent'),
+          }
+        : {}),
+    },
     live,
     settings: copy(state.settings),
     profiles: copy(state.profiles),
@@ -2868,9 +2885,9 @@ export function queueSubmissionAfter(
   assets: readonly StoredPromptAsset[],
   at: number,
   heldForClear = false,
-  ownership?: { agent: string; owner: string },
+  ownership?: { agent: string; owner: string; origin?: 'agent' },
 ): QueuedSubmission[] {
-  const one = ownership?.agent === 'codex' ? text : text.trim();
+  const one = ownership?.origin === 'agent' || ownership?.agent === 'codex' ? text : text.trim();
   if (
     queued.length >= QUEUED_SUBMISSION_LIMIT ||
     one.length > DRAFT_TEXT_LIMIT ||
@@ -2905,6 +2922,7 @@ export function queueSubmissionAfter(
         ...queued,
         {
           id,
+          ...(ownership?.origin === 'agent' ? { origin: 'agent' as const } : {}),
           text: one,
           commentIds: own,
           assets: assets.map((asset) => ({ ...asset })),
@@ -2921,6 +2939,7 @@ export function commentsForQueuedSubmission(
   next: QueuedSubmission,
   later: readonly QueuedSubmission[],
 ): TurnComment[] {
+  if (next.origin === 'agent') return [];
   const own = new Set(next.commentIds);
   const laterIds = new Set(later.flatMap((entry) => entry.commentIds));
   const draftIds = new Set(state.draftCommentIds ?? []);

@@ -78,6 +78,8 @@ Clear uses a hidden transition because it starts no turn. Codex `/new` uses that
 
 Sending during Codex compaction transfers the complete submission only when the local queue can persist it without truncation or eviction. Attachment-only submissions follow the same path. A waiting record owns its staged files across repaint, session changes, and window reload. Reload restores the queue before attempting to drain it. Before a drain crosses the agent boundary, it persists the delivery state. A restored active attempt becomes recovery and is not submitted again automatically. Edit is the explicit retry path. Drop removes staged data only after no active draft, waiting record, or handoff refers to it. Delivery refusal retains the record, its owner, its files, and the reason. Delivery acceptance transfers file cleanup to the accepted turn. That exact turn releases the files when it ends.
 
+Agent messages share the waiting queue and preserve exact text. They carry no comments or attachments and leave drafts and prompt history unchanged. Edit returns their text to the reader draft. Drop removes them. Stop retains waiting entries. Reset and reload retain agent messages in recovery on the original session.
+
 ## Pending cards
 
 A press creates a temporary card immediately so the reader can see what the panel is waiting on before the record catches up. The card carries the exact prompt sent, its session, and its state.

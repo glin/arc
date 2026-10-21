@@ -1,4 +1,8 @@
-# Send a follow-up
+# Send a message or follow-up
+
+For an explicit reader request naming the destination and message, omit `--observation` to queue that exact text. Use the full scoped session ID and an existing live child in the selected window. No newest-turn read is required. A busy destination keeps its FIFO position. `queued` confirms durable admission, not native delivery. `queuedSubmissionId` names the waiting entry. A retained retry describes the original admission even after delivery, Edit, or Drop. Reload and child replacement retain the text for recovery without sending it automatically.
+
+For an autonomous parent follow-up, use the observation contract below.
 
 Read the session first with `arc session SESSION_ID --turns 5 --window WINDOW_ID --json`. Write the follow-up from that reply's turns. Copy the reply's `observation` string unchanged into `--observation`. A reply without `observation` means Arc accepts no follow-up for that session now. The prompt file follows the same rules as the prompt file in Start a session in `start.md`. Use the fresh request-ID rule from [Interpret delivery](SKILL.md#interpret-delivery).
 

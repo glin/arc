@@ -26,6 +26,10 @@ import { createPanelVisibility } from './panelvisibility';
 import type { WindowState } from './sessionrequests';
 import {
   archiveRefusal,
+  guardedPromptRefusal,
+  guardedRefusal,
+  payloadSha256,
+  type AgentMessageBinding,
   guardedStartContext,
   type AttributedRequest,
   type GuardedDelivery,
@@ -464,6 +468,8 @@ import { fillPanelText, panelValues } from './paneltext';
 import { dispatchPanelToHost, parsePanelToHost } from './webview/protocol.ts';
 import {
   HostReadPersistence,
+  ReadPersistenceUnknownError,
+  ReadPublicationError,
   preserveHostRead,
   readMovedOnlyFor,
   projectAgentRead,
@@ -1773,6 +1779,8 @@ export class PanelProvider implements vscode.Disposable {
   private queues: Record<string, QueuedSubmission[]> = {};
   private draftCommentIds: Record<string, string[]> = {};
   private queueHandoffs = new Set<string>();
+  private agentMessages = new Map<string, AgentMessageBinding>();
+  private hostSaveGeneration = 0;
   // Queues restored from storage or paused while their session is outside repository
   // scope. Each gets one drain attempt after its row and handoff callback are available.
   private pendingQueueDrains = new Set<string>();
@@ -2112,6 +2120,7 @@ export class PanelProvider implements vscode.Disposable {
   }
 
   private persistHostState(): Promise<void> {
+    this.hostSaveGeneration = (this.hostSaveGeneration ?? 0) + 1;
     const snapshot = structuredClone(this.saved);
     return this.readOwner().saveHost((current) => preserveHostRead(current, snapshot));
   }
@@ -5349,6 +5358,9 @@ export class PanelProvider implements vscode.Disposable {
     if (!source || !successor || source === successor) {
       return;
     }
+    for (const entry of this.queues[source] ?? [])
+      if (entry.origin === 'agent')
+        this.recoverAgentMessage(source, entry.id, 'The session was reset before this message was delivered.');
     const snapshot = this.responseSnapshots?.get(source);
     if (snapshot) {
       const retained = new Set((this.live[source] ?? []).filter((press) => press.completed).map((press) => press.at));
@@ -5872,6 +5884,7 @@ export class PanelProvider implements vscode.Disposable {
     this.markStartedPresses();
     this.dropSpentPresses();
     void this.post({ type: 'usage', usage: this.usagePayload() });
+    this.flushAgentQueue(session);
   }
 
   private forgetLivePress(session: string, at: number): void {
@@ -5882,6 +5895,7 @@ export class PanelProvider implements vscode.Disposable {
     } else {
       delete this.live[session];
     }
+    this.flushAgentQueue(session);
   }
 
   // Dismiss only failed live activity of the requested kind. Pending deliveries remain visible.
@@ -5937,7 +5951,206 @@ export class PanelProvider implements vscode.Disposable {
     return state.clearing || state.queued.length > 0 || this.pendingQueueDrains.has(session) ? 'pending' : 'none';
   }
 
-  // Deliver the session's oldest eligible queued submission when it is idle.
+  // Admit literal text without acquiring reader ownership or consuming prompt-box state.
+  public async queueAgentMessage(
+    request: AttributedRequest,
+    binding: AgentMessageBinding | null,
+  ): Promise<GuardedSendResult> {
+    const session = request.params.sessionId ?? '';
+    const text = request.params.prompt ?? '';
+    const refuse = (reason: string) => ({ ...guardedRefusal(request.id, text, reason), queuedSubmissionId: null });
+    const requester = requesterOf(request);
+    if (!requester || requester.id === session || guardedPromptRefusal(text))
+      return refuse('Supply a message from another native session.');
+    const facts = this.guardedTargetFacts(session);
+    const state = this.stateFor(session);
+    if (
+      !this.repositoryScopeReady ||
+      !facts?.current ||
+      this.membershipOf(session) !== 'present' ||
+      this.enumeratedAmbiguousIds?.has(session) ||
+      facts.archived ||
+      !state ||
+      state.clearing ||
+      this.clearSettlements.has(session) ||
+      !binding?.current() ||
+      binding.agent !== state.agent ||
+      binding.sessionId !== session
+    )
+      return refuse('The destination session is unavailable. No message was queued.');
+    const blocked = binding.refusal();
+    if (blocked) return refuse(blocked);
+    const id = crypto.randomUUID();
+    const queued = queueSubmissionAfter(state.queued, id, text, [], [], Date.now(), false, {
+      agent: state.agent,
+      owner: session,
+      origin: 'agent',
+    });
+    if (queued.length !== state.queued.length + 1 || !queuedSubmissionBookFits(this.queues, session, queued))
+      return refuse('The waiting queue is full. No message was queued.');
+    this.queues[session] = queued;
+    this.agentMessages.set(id, binding);
+    this.queueHandoffs.add(id);
+    binding.invalidate();
+    const saveGeneration = this.hostSaveGeneration;
+    try {
+      await this.writeDrafts();
+    } catch (error) {
+      let failure = error;
+      if (!(error instanceof ReadPersistenceUnknownError) && !(error instanceof ReadPublicationError)) {
+        this.agentMessages.delete(id);
+        this.queues[session] = (this.queues[session] ?? []).filter((entry) => entry.id !== id);
+        this.saved.queues = normalizeQueuedSubmissions(this.queues);
+        try {
+          if (this.hostSaveGeneration > saveGeneration + 1) {
+            // Earlier snapshots can still contain this admission. Remove only its entry after those saves settle.
+            await this.readOwner().saveHost((current) => {
+              const queues = { ...current.queues };
+              const remaining = (queues[session] ?? []).filter((entry) => entry.id !== id);
+              if (remaining.length) queues[session] = remaining;
+              else delete queues[session];
+              return { ...current, queues };
+            });
+          }
+          return refuse('The message could not be saved. No message was queued.');
+        } catch (cleanupError) {
+          const remaining = this.queues[session] ?? [];
+          remaining.splice(Math.min(state.queued.length, remaining.length), 0, queued.at(-1)!);
+          this.queues[session] = remaining;
+          failure = cleanupError;
+        }
+      }
+      this.recoverAgentMessage(
+        session,
+        id,
+        failure instanceof Error ? failure.message : 'The message save outcome is unknown.',
+      );
+      this.saved.queues = normalizeQueuedSubmissions(this.queues);
+      return {
+        ...refuse('The message save outcome is unknown. Arc will not send it automatically.'),
+        status: 'unknown',
+        queuedSubmissionId: id,
+      };
+    } finally {
+      this.queueHandoffs.delete(id);
+    }
+    this.pendingQueueDrains.add(session);
+    this.flushQueue(session);
+    void this.post({ type: 'usage', usage: this.usagePayload() });
+    return {
+      version: 1,
+      status: 'queued',
+      requestId: request.id,
+      payloadSha256: payloadSha256(text),
+      queuedSubmissionId: id,
+      nativeTurnId: null,
+      reason: 'The message is queued. This confirms admission, not delivery.',
+    };
+  }
+
+  private recoverAgentMessage(session: string, id: string, reason: string): void {
+    this.agentMessages.delete(id);
+    this.queueHandoffs.delete(id);
+    this.queues[session] = (this.queues[session] ?? []).map((entry) =>
+      entry.id === id
+        ? {
+            ...entry,
+            reason,
+            delivery: { phase: 'recovery', owner: session, reason },
+          }
+        : entry,
+    );
+    if (!(this.queues[session] ?? []).some(queueCanDrain)) this.pendingQueueDrains.delete(session);
+  }
+
+  public flushAgentQueue(session: string): void {
+    if (this.queues[session]?.[0]?.origin === 'agent') this.flushQueue(session);
+  }
+
+  private async flushAgentMessage(session: string, next: QueuedSubmission): Promise<void> {
+    const binding = this.agentMessages.get(next.id);
+    if (!binding?.current()) {
+      this.recoverAgentMessage(session, next.id, 'The original agent is no longer available.');
+      await this.writeDrafts();
+      return;
+    }
+    const blocked = binding.refusal();
+    if (blocked) {
+      this.recoverAgentMessage(session, next.id, blocked);
+      await this.writeDrafts();
+      return;
+    }
+    const facts = this.guardedTargetFacts(session);
+    if (
+      binding.idle() !== null ||
+      (this.stateFor(session)?.asks?.length ?? 0) > 0 ||
+      (facts?.pendingSubmissions ?? 0) > 0 ||
+      (facts?.pendingControls ?? 0) > Number(this.pendingQueueDrains.has(session))
+    ) {
+      this.pendingQueueDrains.add(session);
+      return;
+    }
+    this.queueHandoffs.add(next.id);
+    this.queues[session] = (this.queues[session] ?? []).map((entry) =>
+      entry.id === next.id
+        ? {
+            ...entry,
+            delivery: { phase: 'delivery', owner: session },
+          }
+        : entry,
+    );
+    const beforeWrite = () => {
+      const state = this.stateFor(session);
+      const facts = this.guardedTargetFacts(session);
+      if (
+        !this.repositoryScopeReady ||
+        !binding.current() ||
+        binding.refusal() ||
+        !facts?.current ||
+        this.membershipOf(session) !== 'present' ||
+        this.enumeratedAmbiguousIds?.has(session) ||
+        facts.archived ||
+        !state ||
+        state.agent !== binding.agent ||
+        state.clearing ||
+        (state.asks?.length ?? 0) > 0 ||
+        this.clearSettlements.has(session) ||
+        state.queued[0]?.id !== next.id ||
+        !this.queueHandoffs.has(next.id) ||
+        this.queuedEditReservations.has(next.id) ||
+        facts.pendingSubmissions > 0 ||
+        facts.pendingControls > Number(this.pendingQueueDrains.has(session))
+      )
+        throw new Error('The destination changed before this message was sent.');
+    };
+    try {
+      await this.writeDrafts();
+      beforeWrite();
+      binding.invalidate();
+      const receipt = await binding.deliver(next.text, beforeWrite);
+      if (receipt.outcome === 'accepted') {
+        this.queues[session] = queueAfterAcceptedRecovery(
+          (this.queues[session] ?? []).filter((entry) => entry.id !== next.id),
+          next,
+        );
+        this.agentMessages.delete(next.id);
+        if (!this.queues[session].length) this.pendingQueueDrains.delete(session);
+      } else this.recoverAgentMessage(session, next.id, receipt.reason || 'Message delivery needs recovery.');
+      await this.writeDrafts();
+    } catch (error) {
+      this.recoverAgentMessage(
+        session,
+        next.id,
+        error instanceof Error ? error.message : 'Message delivery needs recovery.',
+      );
+      await this.writeDrafts().catch(() => {});
+    } finally {
+      this.queueHandoffs.delete(next.id);
+      void this.post({ type: 'usage', usage: this.usagePayload() });
+    }
+    this.flushQueue(session);
+  }
+
   public flushQueue(session: string): void {
     // Drain the caller's session, independent of the session displayed in the prompt box.
     if (!this.repositoryScopeReady) {
@@ -5958,6 +6171,10 @@ export class PanelProvider implements vscode.Disposable {
     }
     const [next, ...rest] = state.queued;
     if (!queueCanDrain(next) || this.queueHandoffs.has(next.id) || this.queuedEditReservations.has(next.id)) {
+      return;
+    }
+    if (next.origin === 'agent') {
+      void this.flushAgentMessage(session, next).catch(() => {});
       return;
     }
     const carried = commentsForQueuedSubmission(state, next, rest);
@@ -6147,6 +6364,7 @@ export class PanelProvider implements vscode.Disposable {
     }
     this.stagingTokens.delete(session);
     this.staging.delete(session);
+    this.flushAgentQueue(session);
   }
 
   private openStagingOperation(
@@ -6672,6 +6890,7 @@ export class PanelProvider implements vscode.Disposable {
         this.submissionsInFlight.delete(session);
         this.submittingDrafts.delete(session);
         for (const asset of assets) if (!this.assetHandoffs.has(session)) this.assetIdsInHandoff.delete(asset.id);
+        this.flushAgentQueue(session);
       }
     } finally {
       if (sending) this.health?.settle(sending, result);
@@ -7114,6 +7333,7 @@ export class PanelProvider implements vscode.Disposable {
         if (queued) {
           this.queueHandoffs.delete(queued.id);
         }
+        this.flushAgentQueue(state.sessionId);
       });
     void this.post({ type: 'usage', usage: this.usagePayload() });
   }
@@ -7454,10 +7674,12 @@ export class PanelProvider implements vscode.Disposable {
       return;
     }
     this.onReaderDirected?.(state.sessionId);
+    if (removed.origin === 'agent') this.agentMessages.delete(id);
     this.queues[state.sessionId] = queueAfterClearRecovery(state.agent, queueWithout(state.queued, id), removed);
     if (!this.queues[state.sessionId].length) {
       delete this.queues[state.sessionId];
     }
+    if (!(this.queues[state.sessionId] ?? []).some(queueCanDrain)) this.pendingQueueDrains.delete(state.sessionId);
     void this.writeDrafts().then(() => {
       this.flushQueue(state.sessionId);
       if (!this.attachmentStorageDir || !removed.assets.length) {
@@ -7629,11 +7851,13 @@ export class PanelProvider implements vscode.Disposable {
       return;
     }
     const wanted = swap.submission;
+    if (wanted.origin === 'agent') this.agentMessages.delete(id);
     this.onReaderDirected?.(state.sessionId);
     this.queues[state.sessionId] = swap.queued;
     if (!swap.queued.length) {
       delete this.queues[state.sessionId];
     }
+    if (!swap.queued.some(queueCanDrain)) this.pendingQueueDrains.delete(state.sessionId);
     if (wanted.assets.length) {
       this.assets[state.sessionId] = wanted.assets.map((asset) => ({ ...asset }));
     } else {

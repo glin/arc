@@ -209,11 +209,11 @@ export async function runManagement(command: string, args: string[]): Promise<st
     );
   }
   if (command === 'send') {
-    if (sessions.length !== 1 || !options.has('--prompt-file') || !options.has('--observation') || !requestId)
+    if (sessions.length !== 1 || !options.has('--prompt-file') || !requestId)
       throw new Error(
-        'Usage: arc send ID --prompt-file FILE --observation OBSERVATION --request-id WINDOW:REQUEST [--window WINDOW] [--json]',
+        'Usage: arc send ID --prompt-file FILE [--observation OBSERVATION] --request-id WINDOW:REQUEST [--window WINDOW] [--json]',
       );
-    if (!SESSION_OBSERVATION.test(options.get('--observation')!))
+    if (options.has('--observation') && !SESSION_OBSERVATION.test(options.get('--observation')!))
       throw new Error('The observation is invalid. Copy it from arc session --json.');
     const identity = requesterIdentity();
     if (identity.ambiguous)
@@ -223,7 +223,11 @@ export async function runManagement(command: string, args: string[]): Promise<st
     if (!identity.provider) throw new Error('Run send from a Claude Code or Codex session. No prompt was sent.');
     const prompt = readPromptFile(options.get('--prompt-file')!);
     if (guardedPromptRefusal(prompt)) throw new Error('Supply a nonempty prompt without a prompt-box command.');
-    const params: SessionWriteParams = { sessionId: sessions[0], prompt, observation: options.get('--observation')! };
+    const params: SessionWriteParams = {
+      sessionId: sessions[0],
+      prompt,
+      ...(options.has('--observation') ? { observation: options.get('--observation')! } : {}),
+    };
     const result = (await requestWindow('send', params, window, undefined, requestId)) as {
       status: string;
       reason: string;

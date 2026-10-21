@@ -548,25 +548,25 @@ export const COMMANDS: readonly Command[] = [
     route: 'management',
     action: 'send',
     help: {
-      summary: 'Deliver one follow-up to an idle session this requester started with --arc-dispatch.',
-      synopsis: 'arc send ID --prompt-file PATH --observation OBSERVATION --request-id ID [--window ID] [--json]',
+      summary: 'Queue a requested message or deliver an observed follow-up.',
+      synopsis: 'arc send ID --prompt-file PATH [--observation OBSERVATION] --request-id ID [--window ID] [--json]',
       flags: [
         ['--prompt-file PATH', 'Required. Read a regular UTF-8 file up to 48 KiB.'],
         [
           '--observation OBSERVATION',
-          'Required. Copy from the newest eligible session --json reply to this requester.',
+          'Select parent-only continuation. Omit to queue a literal reader-requested message.',
         ],
         requestFlag,
         windowFlag,
         ['--json', 'Print delivery fields instead of the reason and request ID.'],
       ],
       output: [
-        'JSON: version when supplied by the host, status, requestId, payloadSha256, nativeTurnId, reason.',
-        'Accepted confirms prompt receipt. Refused means no input. Unknown blocks further sends until reader intervention.',
+        'JSON: version, status, requestId, payloadSha256, nativeTurnId, reason. Queue results also include queuedSubmissionId.',
+        'Queued confirms durable admission. Accepted confirms prompt receipt. Unknown blocks further agent input until accepted reader direction.',
       ],
       refusals: [
-        'One session ID, prompt file, observation, and explicit request ID are required.',
-        'Missing or ambiguous native requester identity, stale observations, unavailable ownership, or a busy session refuses input.',
+        'One session ID, prompt file, and explicit request ID are required.',
+        'Missing or ambiguous native requester identity refuses input. With --observation, stale observations, unavailable ownership, or a busy session refuses input.',
         'Empty prompts, slash commands, oversized files or encoded requests refuse.',
         windowRefusal,
       ],

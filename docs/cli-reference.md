@@ -159,19 +159,21 @@ Write JSON includes `requestId` and `status`. Unknown delivery omits accepted-re
 
 Forced archive replies include `evaluatedRunStatus` before membership changes, or null without a listing row. [Archive safety](cli.md#session-management) applies independently of that observation. [Child ownership and shutdown](agent-protocols.md#child-ownership-and-shutdown) define hosted process retirement.
 
-Each activation retains at most 256 shared write results for starts, curation, and accepted or unknown guarded sends. Guarded sends separately admit at most 256 distinct IDs, including refused outcomes. Capacity never returns. Refused guarded sends preserve shared-result capacity. Exact retained retries precede capacity checks. Starts and curation consume no guarded units.
+Each activation retains at most 256 shared write results for starts, curation, and queued, accepted, or unknown sends. Guarded sends separately admit at most 256 distinct IDs, including refused outcomes. Capacity never returns. Refused guarded sends preserve shared-result capacity. Exact retained retries precede capacity checks. Starts and curation consume no guarded units.
 
 ## Follow-ups
 
-`send` requires exactly one native requester identity, from `CLAUDE_CODE_SESSION_ID` or `CODEX_THREAD_ID`. That requester must have started the target with `--arc-dispatch` in the same activation. Labels, parent links, and supplied IDs establish no ownership. A window without follow-up capability refuses before connection and requires a reload.
+`send` requires exactly one native requester identity, from `CLAUDE_CODE_SESSION_ID` or `CODEX_THREAD_ID`. Without `--observation`, the request queues exact literal text to another existing live child. The CLI requires the window to advertise `agentMessageQueue` before sending. The host saves the entry durably before returning `queued`. The result also includes `queuedSubmissionId`. Admission creates no parent relationship or reader ownership. A retained retry returns its original admission result.
+
+With `--observation`, that requester must have started the target with `--arc-dispatch` in the same activation. Labels, parent links, and supplied IDs establish no ownership. A window without follow-up capability refuses before connection and requires a reload.
 
 Only the owning requester receives `observation`, from a current read containing the newest turn. It binds source revision, newest turn, scope, and assignment. Arc consumes it when attempting input.
 
 Reader input makes observations stale by panel acceptance. This includes prompts, queue changes, answers, Stop, compaction, clear, and setting picks. The same input to the requester invalidates observations for every session it started. A new request ID never revalidates an old observation. Read again before preparing another follow-up.
 
-Admission requires a ready, idle process without asks, queued prompts, pending submissions or controls, deferred self-compaction, or known background work. Missing or contradictory state refuses. Work absent from native reports and panel state remains invisible.
+Observed follow-up admission requires a ready, idle process without asks, queued prompts, pending submissions or controls, deferred self-compaction, or known background work. Missing or contradictory state refuses. Work absent from native reports and panel state remains invisible.
 
-Delivery uses the existing process in the owning window. It never resumes or forks another copy. Observed ownership conflicts and unexplained source changes refuse. Independent resumes outside that window remain possible.
+Delivery uses the existing process in the owning window. It never resumes or forks another copy. Observed ownership conflicts refuse both input forms. Unexplained source changes refuse observed follow-ups. Independent resumes outside that window remain possible.
 
 Results include `status`, `requestId`, `payloadSha256`, `nativeTurnId`, and `reason`. The [guide](cli.md#follow-ups) defines delivery statuses. The CLI's 120-second timeout also reports `unknown`. After unknown delivery, later sends refuse until panel input reaches that session. Prompts, queue changes, answers, Stop, compaction, and clear remove the block. Setting picks invalidate observations but preserve the block.
 

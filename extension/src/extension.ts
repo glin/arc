@@ -116,6 +116,7 @@ import { CompactStore } from './compactstore';
 import {
   GuardedSends,
   guardedChannelSend,
+  agentMessageBinding,
   guardedDeliveryPort,
   guardedFactsWithCompaction,
   guardedPanelPorts,
@@ -656,6 +657,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           new Error(`${state.agent} usage refresh failed: the agent stopped before it could read usage`),
         );
       }
+      if ((!state.busy || state.exited) && state.sessionId) panel.flushAgentQueue(state.sessionId);
     },
   });
   panel.onDispatchEvent = (key, event, submission) => {
@@ -2459,7 +2461,23 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // The channel's send reaches the guarded mode of the wrapped `onSendPrompt`, which skips reader intervention.
   channel?.setGuardedReadHandler((request) => panel.guardedReadRequest(request));
   channel?.setGuardedSendHandler((request) =>
-    guardedChannelSend(guardedSends, request, (...args) => panel.onSendPrompt?.(...args) ?? Promise.resolve({})),
+    Object.prototype.hasOwnProperty.call(request.params, 'observation')
+      ? guardedChannelSend(guardedSends, request, (...args) => panel.onSendPrompt?.(...args) ?? Promise.resolve({}))
+      : (() => {
+          const sessionId = request.params.sessionId ?? '';
+          const source = panel.guardedTargetFacts(sessionId);
+          const claude = host.find('claude', sessionId);
+          const codex = host.find('codex', sessionId);
+          const child = source?.current && !(claude && codex) ? (claude ?? codex) : null;
+          return panel.queueAgentMessage(
+            request,
+            child
+              ? agentMessageBinding(guardedSends, child, host, activeWriterFailure, randomUUID, (live, turnId) =>
+                  compaction?.submitted(live, turnId, 'followup'),
+                )
+              : null,
+          );
+        })(),
   );
   updateAgentAffordance();
 }

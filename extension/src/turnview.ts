@@ -141,6 +141,7 @@ export type QueueDelivery =
   | { phase: 'successor-recovery'; owner: string; source: string; successor: string; resetId: string; reason: string };
 
 export interface QueuedSubmission {
+  origin?: 'agent';
   recoveryId?: string;
   id: string;
   text: string;
@@ -615,7 +616,15 @@ export function normalizeQueuedSubmissions(raw: unknown): Record<string, QueuedS
           ...(barrier ? { barrier } : {}),
         };
       }
+      if ('origin' in entry) {
+        delivery = {
+          phase: 'recovery',
+          owner: session,
+          reason: storedReason || 'This message needs recovery after reload.',
+        };
+      }
       entries.push({
+        ...('origin' in entry ? { origin: 'agent' as const } : {}),
         id,
         text,
         commentIds,

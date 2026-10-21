@@ -2162,3 +2162,33 @@ test('reader parent identity follows both ends and abandonment removes incoming 
   assert.deepEqual(remapReaderParents({ child: 'draft' }, 'draft', 'child'), {});
   assert.deepEqual(parents, { child: 'draft', draft: 'ancestor', sibling: 'ancestor' });
 });
+
+test('saved agent messages retain complete text and always recover without live authority', () => {
+  for (const phase of ['queued', 'delivery', 'recovery']) {
+    const text = '  exact whitespace\n\tend  \n';
+    const raw = {
+      target: [
+        {
+          id: 'agent-message',
+          text,
+          origin: 'agent',
+          commentIds: [],
+          assets: [],
+          at: 1,
+          delivery: { phase, owner: 'target' },
+        },
+      ],
+    };
+    const saved = normalizeQueuedSubmissions(raw);
+    assert.equal(saved.target[0].origin, 'agent');
+    assert.equal(saved.target[0].text, text);
+    assert.equal(saved.target[0].delivery.phase, 'recovery');
+    assert.equal(queuedSubmissionBookFits({}, 'target', raw.target as any), true);
+    const { origin: _origin, ...legacy } = saved.target[0];
+    assert.equal(normalizeQueuedSubmissions({ target: [legacy] }).target[0].delivery.phase, 'recovery');
+  }
+  const malformed = normalizeQueuedSubmissions({
+    target: [{ id: 'malformed-agent', origin: 'unexpected', text: 'message', at: 1 }],
+  });
+  assert.equal(malformed.target[0].delivery.phase, 'recovery');
+});

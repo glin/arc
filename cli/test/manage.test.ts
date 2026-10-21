@@ -166,7 +166,7 @@ test('send refuses invalid flags, identities and prompt content before the host 
   ];
   try {
     for (const [refused, identity, pattern] of [
-      [args.filter((arg) => arg !== '--observation' && arg !== observation), {}, /Usage: arc send/],
+      [args.map((arg) => (arg === observation ? '' : arg)), {}, /observation is invalid/],
       [args.slice(0, -2), {}, /Usage: arc send/],
       [args.map((arg) => (arg === observation ? 'stale' : arg)), {}, /observation is invalid/],
       [[...args, '--agent-run=false'], {}, /unavailable for send/],
@@ -431,5 +431,24 @@ test('human session reads preserve delivered text, identity, and uncertainty wit
   } finally {
     await channel.dispose();
     rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('send without an observation transports exact literal text and a distinct queue parameter shape', async () => {
+  const fixture = await host();
+  try {
+    const text = '  literal message\n\tend  \n';
+    writeFileSync(fixture.prompt, text);
+    await runManagement('send', [
+      'worker',
+      '--prompt-file',
+      fixture.prompt,
+      '--request-id',
+      `${fixture.channel.hostId}:queue`,
+      '--json',
+    ]);
+    assert.deepEqual(fixture.requests[0].params, { sessionId: 'worker', prompt: text });
+  } finally {
+    await fixture.close();
   }
 });

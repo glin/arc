@@ -63,12 +63,12 @@ export function validSessionWrite(method: string, params: Record<string, unknown
     );
   if (method === 'send')
     return (
-      Object.keys(params).sort().join(',') === 'observation,prompt,sessionId' &&
+      ['observation,prompt,sessionId', 'prompt,sessionId'].includes(Object.keys(params).sort().join(',')) &&
       text(params.sessionId, 256) &&
       !!params.sessionId &&
       text(params.prompt, 48 * 1024) &&
-      typeof params.observation === 'string' &&
-      SESSION_OBSERVATION.test(params.observation)
+      (!Object.prototype.hasOwnProperty.call(params, 'observation') ||
+        (typeof params.observation === 'string' && SESSION_OBSERVATION.test(params.observation)))
     );
   if (method === 'start') {
     const setup = params.setup as Record<string, unknown> | undefined;
@@ -506,11 +506,23 @@ export interface GuardedSendRequest {
 
 export interface GuardedSendResult {
   version: 1;
-  status: 'accepted' | 'refused' | 'unknown';
+  status: 'accepted' | 'queued' | 'refused' | 'unknown';
   requestId: string;
   payloadSha256: string;
   nativeTurnId: string | null;
   reason: string;
+  queuedSubmissionId?: string | null;
+}
+
+// Activation-local binding to one existing child. Saved queues never retain this authority.
+export interface AgentMessageBinding {
+  readonly agent: string;
+  readonly sessionId: string;
+  current(): boolean;
+  idle(): string | null;
+  refusal(): string | null;
+  invalidate(): void;
+  deliver(text: string, beforeWrite: () => void): Promise<GuardedReceipt>;
 }
 
 // Delivery-mode port. The host supplies the live writer, the activity lease, and the input write.
@@ -560,6 +572,8 @@ function sameRequester(a: RequesterIdentity, b: RequesterIdentity): boolean {
 export class GuardedSends<C extends GuardedChild = GuardedChild> {
   private readonly secret = randomBytes(32);
   private readonly workers = new Map<string, WorkerRecord<C>>();
+  private readonly blocked = new Set<string>();
+  private readonly conflicts = new Set<string>();
   // A coordinator's steering revision. Reader input to a coordinator invalidates observations for its workers.
   private readonly steering = new Map<string, number>();
   facts: GuardedFactsPort | null = null;
@@ -591,6 +605,7 @@ export class GuardedSends<C extends GuardedChild = GuardedChild> {
   // before any provider operation. It is the only place that clears the block an unknown attempt left.
   intervene(sessionId: string): void {
     this.invalidate(sessionId);
+    this.blocked.delete(sessionId);
     const worker = this.workers.get(sessionId);
     if (worker?.attempt === 'blocked') worker.attempt = 'none';
   }
@@ -609,8 +624,16 @@ export class GuardedSends<C extends GuardedChild = GuardedChild> {
 
   // An observed writer-lock failure refuses every later guarded send to that worker in this activation.
   noteWriterConflict(sessionId: string): void {
+    this.conflicts.add(sessionId);
     const worker = this.workers.get(sessionId);
     if (worker) worker.conflict = true;
+  }
+
+  messageRefusal(sessionId: string): string | null {
+    if (this.blocked.has(sessionId)) return GUARDED_SEND_REASONS.blocked;
+    if (this.conflicts.has(sessionId)) return GUARDED_SEND_REASONS.ownership;
+    if (this.workers.get(sessionId)?.attempt === 'unsettled') return GUARDED_SEND_REASONS.unsettled;
+    return null;
   }
 
   // Signs the read facts for the owning requester. Any other requester receives no observation.
@@ -675,6 +698,8 @@ export class GuardedSends<C extends GuardedChild = GuardedChild> {
       observation.steering !== (this.steering.get(worker.owner.requester.id) ?? 0)
     )
       return GUARDED_SEND_REASONS.stale;
+    const blocked = this.messageRefusal(request.sessionId);
+    if (blocked) return blocked;
     if (worker.attempt === 'unsettled') return GUARDED_SEND_REASONS.unsettled;
     if (worker.attempt === 'blocked') return GUARDED_SEND_REASONS.blocked;
     return null;
@@ -727,6 +752,7 @@ export class GuardedSends<C extends GuardedChild = GuardedChild> {
   // Host-owned settlement. An unknown outcome blocks guarded sends to the worker until reader input.
   // A shared turn also invalidates the assignment, because the input joined work Arc did not admit.
   settle(sessionId: string, receipt: GuardedReceipt): void {
+    if (receipt.outcome === 'unknown') this.blocked.add(sessionId);
     const worker = this.workers.get(sessionId);
     if (!worker) return;
     worker.attempt = receipt.outcome === 'unknown' ? 'blocked' : 'none';
@@ -900,7 +926,76 @@ export function interveneOnReaderInput(
 // The live child as the delivery port reads it. `AgentSession` implements it.
 export interface GuardedWriter extends GuardedChild {
   readonly agent: string;
-  guardedPrompt(text: string, clientUuid: string, onSubmitted?: (turnId: number) => void): GuardedAttempt;
+  guardedPrompt(
+    text: string,
+    clientUuid: string,
+    onSubmitted?: (turnId: number) => void,
+    beforeWrite?: () => void,
+  ): GuardedAttempt;
+}
+
+export function agentMessageBinding<C extends GuardedWriter>(
+  policy: GuardedSends<C>,
+  child: C,
+  host: {
+    find(agent: C['agent'], sessionId: string): C | null;
+    withActivity<T>(key: string, work: (live: C) => Promise<T>): Promise<T | null>;
+  },
+  writerFailure: (error: unknown) => boolean,
+  clientUuid: () => string,
+  submitted?: (child: C, turnId: number) => void,
+): AgentMessageBinding {
+  const session = child.state().sessionId ?? '';
+  const current = () =>
+    !!session &&
+    host.find(child.agent, session) === child &&
+    !child.state().exited &&
+    child.state().sessionId === session;
+  const refusal = () => {
+    if (writerFailure(child.state().lastError)) policy.noteWriterConflict(session);
+    return policy.messageRefusal(session);
+  };
+  return {
+    agent: child.agent,
+    sessionId: session,
+    current,
+    idle: () => child.guardedIdle(),
+    refusal,
+    invalidate: () => policy.invalidate(session),
+    deliver: async (text, beforeWrite) => {
+      let receipt: GuardedReceipt;
+      try {
+        receipt = (await host.withActivity(child.key, async (live) => {
+          if (live !== child || !current() || refusal() || child.guardedIdle() !== null)
+            return {
+              outcome: 'refused' as const,
+              nativeTurnId: null,
+              reason: 'The original agent cannot receive this message.',
+            };
+          beforeWrite();
+          const attempt = child.guardedPrompt(
+            text,
+            clientUuid(),
+            (turnId) => submitted?.(child, turnId),
+            () => {
+              if (!current() || refusal()) throw new Error('The original agent no longer owns this message.');
+              beforeWrite();
+            },
+          );
+          return attempt.receipt;
+        })) ?? { outcome: 'refused', nativeTurnId: null, reason: 'The original agent is no longer available.' };
+      } catch (error) {
+        receipt = {
+          outcome: 'unknown',
+          nativeTurnId: null,
+          reason: error instanceof Error ? error.message : 'Message delivery is unknown.',
+        };
+      }
+      if (receipt.outcome !== 'accepted' && writerFailure(receipt.reason)) policy.noteWriterConflict(session);
+      policy.settle(session, receipt);
+      return receipt;
+    },
+  };
 }
 
 // Delivery-mode port over the host's retained children. It never opens a child.
