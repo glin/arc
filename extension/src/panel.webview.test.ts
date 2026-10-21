@@ -34243,6 +34243,73 @@ test('a drawn Claude card redraws with its cache-expiry warning when the session
   assert.equal(restored?.warnings?.length, 1, 'crossing back above $1 did not restore the sign');
 });
 
+test('native child coverage moves an existing warning between drawn parents after source reassignment', () => {
+  const { turn: fixtureTurn, expiry } = cacheExpiryReturnTurn();
+  const turns = ['first-parent', 'second-parent'].map((sessionId) => ({
+    ...fixtureTurn,
+    sessionId,
+    startedAt: NOW - 20 * 60_000,
+    endedAt: NOW - 19 * 60_000,
+    responseIds: [],
+    openingResponseId: undefined,
+    finished: true,
+  }));
+  const empty = { ...expiry, counts: { '5m': 0, '30m': 0, '1h': 0 }, returns: [], childSources: [] };
+  const child = {
+    source: 'agent-moving.jsonl',
+    revision: {},
+    outcome: null,
+    endedAt: NOW - 10 * 60_000,
+    facts: {
+      ...expiry,
+      truncated: false,
+      counts: { '5m': 0, '30m': 0, '1h': 1 },
+      returns: expiry.returns.map((item) => ({ ...item, timestamp: NOW - 10 * 60_000 })),
+    },
+  };
+  let sources: Record<string, any> = {
+    [turns[0].sessionId]: { ...empty, counts: child.facts.counts, childSources: [child] },
+    [turns[1].sessionId]: empty,
+  };
+  const sent: any[] = [];
+  const host = Object.assign(Object.create(PanelProvider.prototype), {
+    live: {},
+    liveActivity: {},
+    turnsByKey: new Map(turns.map((turn) => [turnKey(turn), turn])),
+    newestBySession: new Map(),
+    sessionNames: new SessionNames(),
+    sessionOutcomes: new Map(),
+    hosts: [{ webview: {} }],
+    projectSpendHydrated: true,
+    lifetimeFiguresBySession: () => ({ cacheExpiryFacts: sources }),
+    dispatchedTurnCosts: () => ({}),
+    dispatchedCostsForTurn: () => [],
+    folders: () => [],
+    runningSessions: () => new Set(),
+    liveOpenChildren: () => new Map(),
+    railStatuses: () => ({ statuses: new Map(), openChildren: new Map() }),
+    themedFor: (cards: unknown[]) => cards,
+    sendToHost: (_host: unknown, message: unknown) => sent.push(message),
+  });
+  host.cards = turns.map((turn) => host.renderTurnCard(turn, false, 'Child cache expiry', NOW));
+  const signed = () =>
+    host.cards.map((card: any) =>
+      Boolean(
+        card.chips
+          .find((chip: any) => chip.metric === 'cost')
+          ?.warnings?.some((warning: any) => warning.scope === 'cache-expiry'),
+      ),
+    );
+  assert.deepEqual(signed(), [true, false]);
+  sources = {
+    [turns[0].sessionId]: empty,
+    [turns[1].sessionId]: { ...empty, counts: child.facts.counts, childSources: [child] },
+  };
+  host.postDispatchedCostsIfMoved();
+  assert.deepEqual(signed(), [false, true]);
+  assert.ok(sent.some((message) => message.cards?.length === 2));
+});
+
 test('a child-only warning survives quiet expiry, exit, completion and saved-source reload', () => {
   vi.useFakeTimers();
   try {

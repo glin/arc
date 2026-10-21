@@ -1,4 +1,4 @@
-import { test } from 'vitest';
+import { test, vi } from 'vitest';
 import assert from 'node:assert';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -6,6 +6,7 @@ import {
   CacheExpiryScan,
   cacheExpiryExtraCost,
   classifyCacheExpiry,
+  discoverClaudeSessionSpendSources,
   PROJECT_SPEND_PARSER_GENERATION,
   emptyCacheExpiryLedger,
   indexSpendFile,
@@ -1659,6 +1660,250 @@ test('real Claude sidechain returns count on the session and warn on their paren
   );
   assert.equal(rebuilt.rebuilt, true);
   assert.equal(facts(rebuilt.record).counts['5m'], 1);
+});
+
+function indexedNativeExpiry(id: string, model = 'claude-sonnet-5'): SpendFileIndex {
+  return indexed(
+    [
+      claudePrompt(0, id),
+      claudeResponse(1, { id: `${id}-before`, model, write5m: 4_000_000 }),
+      claudeResponse(10, { id: `${id}-return`, model, input: 4_000_000 }),
+    ].map((line) => JSON.stringify({ ...JSON.parse(line), isSidechain: true })),
+    (state: ClaudeUsageReducerState | undefined) => createClaudeUsageLineReducer(state, { childTranscript: true }),
+  );
+}
+
+test('native child coverage follows nested ownership through indexed expiry facts', () => {
+  const main = indexed([claudePrompt(0, 'root'), claudeResponse(1, { id: 'root', input: 100 })], claudeReducer);
+  const folder = dir();
+  const directory = path.join(folder, 'root', 'subagents');
+  fs.mkdirSync(directory, { recursive: true });
+  const records = [main, indexedNativeExpiry('child'), indexedNativeExpiry('grandchild')].map((record, at) => {
+    const file = at === 0 ? path.join(folder, 'root.jsonl') : path.join(directory, `agent-${at}.jsonl`);
+    fs.copyFileSync(record.file, file);
+    return { ...record, file };
+  });
+  const sources = discoverClaudeSessionSpendSources([
+    { sessionId: 'root', file: records[0].file },
+    { sessionId: 'child', file: records[1].file, parentSessionId: 'root' },
+    { sessionId: 'grandchild', file: records[2].file, parentSessionId: 'child' },
+  ]);
+  const cache = sessionCacheFactsBySession(records, sources);
+  assert.deepEqual(
+    ['root', 'child', 'grandchild'].map((id) => cache[id].expiry.counts['5m']),
+    [2, 2, 1],
+  );
+  assert.deepEqual(
+    ['root', 'child', 'grandchild'].map((id) => cache[id].expiry.childSources?.length),
+    [2, 1, 0],
+  );
+  const turns = ['root', 'child'].map((sessionId) => ({ ...readSession(main.file, 'root').turns[0], sessionId }));
+  const costs = new ChildCacheExpiryAttribution().read(
+    turns,
+    Object.fromEntries(Object.entries(cache).map(([id, value]) => [id, value.expiry])),
+    BASE + 20 * MINUTE,
+  );
+  assert.deepEqual(
+    turns.map((turn) => costs.get(turnKey(turn))?.count),
+    [2, 1],
+  );
+  for (const turn of turns) {
+    const warning = turnCacheExpiryWarning(turn, cache[turn.sessionId].expiry, costs.get(turnKey(turn)));
+    assert.ok(
+      toCard(turn, false, BASE + 20 * MINUTE, [], null, false, new Set(), [], warning).chips.find(
+        (chip) => chip.metric === 'cost',
+      )?.warnings?.length,
+    );
+  }
+});
+
+test('native child coverage keeps independent mixed-case alias expectations for each platform', () => {
+  const main = indexed([claudePrompt(0, 'root'), claudeResponse(1, { id: 'root' })], claudeReducer);
+  const child = indexedNativeExpiry('case');
+  const original = Object.getOwnPropertyDescriptor(process, 'platform')!;
+  try {
+    for (const [platform, expected] of [
+      ['win32', 1],
+      ['darwin', 2],
+      ['linux', 2],
+    ] as const) {
+      Object.defineProperty(process, 'platform', { ...original, value: platform });
+      const folder = dir();
+      const files = ['Agent-Case.jsonl', 'agent-case.jsonl'].map((name) => path.join(folder, name));
+      const records = [main, ...files.map((file) => ({ ...child, file }))];
+      const cache = sessionCacheFactsBySession(records, [
+        { sessionId: 'root', file: main.file, primary: true },
+        ...files.map((file) => ({ sessionId: 'root', file, primary: false })),
+      ]).root.expiry;
+      assert.equal(cache.counts['5m'], expected, platform);
+      assert.equal(cache.childSources?.length, expected, platform);
+      const turn = { ...readSession(main.file, 'root').turns[0], sessionId: 'root' };
+      assert.equal(
+        new ChildCacheExpiryAttribution().read([turn], { root: cache }, BASE + 20 * MINUTE).get(turnKey(turn))?.count,
+        expected,
+        platform,
+      );
+    }
+  } finally {
+    Object.defineProperty(process, 'platform', original);
+  }
+});
+
+test('native child coverage withholds an unfinished return and admits its completed line', () => {
+  const main = indexed([claudePrompt(0, 'root'), claudeResponse(1, { id: 'root' })], claudeReducer);
+  const child = indexedNativeExpiry('partial');
+  const text = fs.readFileSync(child.file, 'utf8');
+  fs.writeFileSync(child.file, text.slice(0, -8));
+  const reducer: UsageReducerFactory<ClaudeUsageReducerState> = (state) =>
+    createClaudeUsageLineReducer(state, { childTranscript: true });
+  const partial = indexSpendFile(undefined, child.file, 'w', reducer, BASE, stillClock).record;
+  const sources = [
+    { sessionId: 'root', file: main.file, primary: true },
+    { sessionId: 'root', file: child.file, primary: false },
+  ];
+  const turn = { ...readSession(main.file, 'root').turns[0], sessionId: 'root' };
+  const before = sessionCacheFactsBySession([main, partial], sources).root.expiry;
+  assert.equal(before.counts['5m'], 0);
+  assert.equal(before.incompleteSources, 1);
+  assert.equal(new ChildCacheExpiryAttribution().read([turn], { root: before }, BASE + 20 * MINUTE).size, 0);
+  fs.appendFileSync(child.file, text.slice(-8));
+  const complete = indexSpendFile(partial, child.file, 'w', reducer, BASE, stillClock).record;
+  const after = sessionCacheFactsBySession([main, complete], sources).root.expiry;
+  assert.equal(after.counts['5m'], 1);
+  assert.equal(after.incompleteSources, 0);
+  const cost = new ChildCacheExpiryAttribution().read([turn], { root: after }, BASE + 20 * MINUTE).get(turnKey(turn));
+  assert.equal(turnCacheExpiryWarning(turn, after, cost)?.children?.count, 1);
+});
+
+test('native child coverage refuses a return with an invalid request clock', () => {
+  const main = indexed([claudePrompt(0, 'root'), claudeResponse(1, { id: 'root' })], claudeReducer);
+  const invalid = JSON.parse(claudeResponse(10, { id: 'invalid-return', input: 4_000_000 }));
+  invalid.timestamp = 'invalid';
+  const child = indexed(
+    [claudePrompt(0, 'child'), claudeResponse(1, { id: 'before', write5m: 4_000_000 }), JSON.stringify(invalid)].map(
+      (line) => JSON.stringify({ ...JSON.parse(line), isSidechain: true }),
+    ),
+    (state: ClaudeUsageReducerState | undefined) => createClaudeUsageLineReducer(state, { childTranscript: true }),
+  );
+  const expiry = sessionCacheFactsBySession(
+    [main, child],
+    [
+      { sessionId: 'root', file: main.file, primary: true },
+      { sessionId: 'root', file: child.file, primary: false },
+    ],
+  ).root.expiry;
+  assert.equal(expiry.counts['5m'], 0);
+  assert.ok(expiry.unavailable > 0);
+  const turn = { ...readSession(main.file, 'root').turns[0], sessionId: 'root' };
+  const cost = new ChildCacheExpiryAttribution().read([turn], { root: expiry }, BASE + 20 * MINUTE).get(turnKey(turn));
+  assert.equal(turnCacheExpiryWarning(turn, expiry, cost), null);
+});
+
+test('native child coverage signs a known material floor with an unpriced return', () => {
+  const main = indexed([claudePrompt(0, 'root'), claudeResponse(1, { id: 'root' })], claudeReducer);
+  const known = indexedNativeExpiry('known');
+  const unknown = indexedNativeExpiry('unknown', 'claude-unlisted');
+  const expiry = sessionCacheFactsBySession(
+    [main, known, unknown],
+    [
+      { sessionId: 'root', file: main.file, primary: true },
+      ...[known, unknown].map((record) => ({ sessionId: 'root', file: record.file, primary: false })),
+    ],
+  ).root.expiry;
+  const turn = { ...readSession(main.file, 'root').turns[0], sessionId: 'root' };
+  const cost = new ChildCacheExpiryAttribution().read([turn], { root: expiry }, BASE + 20 * MINUTE).get(turnKey(turn))!;
+  assert.equal(cost.count, 2);
+  assert.equal(cost.status, 'atLeast');
+  assert.ok(cost.dollars! >= 1);
+  assert.equal(cost.dollars, cacheExpiryExtraCost(facts(known), publicProjectSpendPrice).dollars);
+  const warning = turnCacheExpiryWarning(turn, expiry, cost);
+  const chip = toCard(turn, false, BASE + 20 * MINUTE, [], null, false, new Set(), [], warning).chips.find(
+    (item) => item.metric === 'cost',
+  )!;
+  assert.ok(chip.warnings?.length);
+  assert.match(chip.detail, /at least/);
+});
+
+test('native child coverage keeps colliding main and child request IDs separate', () => {
+  const main = indexed(
+    [
+      claudePrompt(0, 'main'),
+      claudeResponse(1, { id: 'shared-before', write5m: 100_000 }),
+      claudePrompt(10, 'return'),
+      claudeResponse(10, { id: 'shared-return', input: 100_000 }),
+    ],
+    claudeReducer,
+  );
+  const child = indexedNativeExpiry('shared');
+  const expiry = sessionCacheFactsBySession(
+    [main, child],
+    [
+      { sessionId: 'root', file: main.file, primary: true },
+      { sessionId: 'root', file: child.file, primary: false },
+    ],
+  ).root.expiry;
+  assert.equal(expiry.returns[0].requestKey, facts(child).returns[0].requestKey);
+  assert.equal(expiry.counts['5m'], 2);
+  assert.equal(expiry.returns.length, 1);
+  const turn = { ...readSession(main.file, 'root').turns[1], sessionId: 'root' };
+  const cost = new ChildCacheExpiryAttribution().read([turn], { root: expiry }, BASE + 20 * MINUTE).get(turnKey(turn))!;
+  const warning = turnCacheExpiryWarning(turn, expiry, cost)!;
+  assert.equal(warning.children?.count, 1);
+  assert.ok(warning.main && warning.main.dollars !== null && warning.main.dollars < 1);
+  assert.equal(warning.children?.dollars, cacheExpiryExtraCost(facts(child), publicProjectSpendPrice).dollars);
+  assert.ok(
+    toCard(turn, false, BASE + 20 * MINUTE, [], null, false, new Set(), [], warning).chips.find(
+      (chip) => chip.metric === 'cost',
+    )?.warnings?.length,
+  );
+});
+
+test('native child coverage transfers counts and warnings without repricing an unchanged source', () => {
+  const parents = ['first', 'second'].map((id) =>
+    indexed([claudePrompt(0, id), claudeResponse(1, { id })], claudeReducer),
+  );
+  const child = indexedNativeExpiry('moving');
+  const turns = parents.map((record, at) => ({
+    ...readSession(record.file, `parent-${at}`).turns[0],
+    sessionId: `parent-${at}`,
+  }));
+  const attribution = new ChildCacheExpiryAttribution();
+  const quote = vi.fn<typeof publicProjectSpendPrice>(publicProjectSpendPrice);
+  for (const owner of [0, 1]) {
+    const cache = sessionCacheFactsBySession(
+      [...parents, child],
+      [
+        ...parents.map((record, at) => ({ sessionId: `parent-${at}`, file: record.file, primary: true })),
+        { sessionId: `parent-${owner}`, file: child.file, primary: false },
+      ],
+    );
+    const facts = Object.fromEntries(Object.entries(cache).map(([id, value]) => [id, value.expiry]));
+    const costs = attribution.read(turns, facts, BASE + 20 * MINUTE, new Map(), new Set(), quote);
+    assert.deepEqual(
+      turns.map((turn) => facts[turn.sessionId].counts['5m']),
+      owner === 0 ? [1, 0] : [0, 1],
+    );
+    assert.deepEqual(
+      turns.map((turn) =>
+        Boolean(
+          toCard(
+            turn,
+            false,
+            BASE + 20 * MINUTE,
+            [],
+            null,
+            false,
+            new Set(),
+            [],
+            turnCacheExpiryWarning(turn, facts[turn.sessionId], costs.get(turnKey(turn))),
+          ).chips.find((chip) => chip.metric === 'cost')?.warnings?.length,
+        ),
+      ),
+      owner === 0 ? [true, false] : [false, true],
+    );
+    assert.equal(quote.mock.calls.length, owner === 0 ? 2 : 0);
+    quote.mockClear();
+  }
 });
 
 test('native Codex same-turn requests qualify while primary requests keep their turn boundary', () => {
