@@ -37955,6 +37955,7 @@ test('repository retention resolves a Claude child through its native launch ide
 // Legacy relationships and opening seeds must survive host publication without source changes.
 test.each(['early shutdown', 'lock retry', 'replacement retry', 'derived retry', 'bounded failure'])(
   'legacy migration preserves relationships and its opening seed through %s',
+  { tags: ['subprocess'] },
   async (ending) => {
     const { CODEX_META_VERSION, CODEX_OPENINGS_RETRY_MS, loadCodexOpenings } = await import('./codexopenings.js');
     const { CodexMetaCache } = await import('./codex.js');
@@ -38012,7 +38013,7 @@ test.each(['early shutdown', 'lock retry', 'replacement retry', 'derived retry',
       ...revisionOf(fs.statSync(file, { bigint: true })),
     }));
     const sourceBytes = new Map(sources.map(({ file }) => [file, fs.readFileSync(file)]));
-    const worker = new ProgressiveWorker('performance.now = () => 0;' + progressiveWorkerSource);
+    const worker = new ProgressiveWorker('performance.now = () => 0;' + getProgressiveWorkerSource());
     let relationships: import('./progressiveworker').ProgressiveResult | null | undefined;
     let metadata: import('./progressiveworker').ProgressiveResult | null | undefined;
     try {
