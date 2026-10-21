@@ -166,7 +166,7 @@ test('bounded session reads preserve native provider turns and reject stale scop
     }
     fs.writeFileSync(file, records.map((record) => JSON.stringify(record)).join('\n') + '\n');
     const stat = revisionOf(fs.statSync(file, { bigint: true }));
-    const source = { agent, file, sessionId: 'known', size: stat.size, mtimeMs: stat.mtimeMs, ino: stat.ino };
+    const source = { agent, file, sessionId: 'known', cwd: directory, ...stat };
     const window = openReadWindow();
     const result = boundedSessionRead(source, 2, () => 'scope', 'local-agent', [directory]);
     const tally = closeReadWindow(window);
@@ -227,6 +227,89 @@ test('bounded session reads preserve native provider turns and reject stale scop
       'stale',
     );
     assert.equal(boundedSessionRead(source, 2, () => 'scope', null, [path.join(directory, 'other')]).state, 'stale');
+    // Current opening checks must distinguish identity and directory changes from an append.
+    const original = fs.readFileSync(file);
+    for (const change of ['identity', 'missing identity', 'directory', 'outside'] as const) {
+      const altered = structuredClone(head);
+      const opening = agent === 'codex' ? (altered as any).payload : (altered as any);
+      if (change === 'identity') opening[agent === 'codex' ? 'id' : 'sessionId'] = 'other';
+      else if (change === 'missing identity') delete opening[agent === 'codex' ? 'id' : 'sessionId'];
+      else
+        opening.cwd = change === 'directory' ? path.join(directory, 'nested') : path.join(directory, '..', 'outside');
+      fs.writeFileSync(
+        file,
+        [altered, ...records.slice(1), { type: 'ignored', text: 'x'.repeat(512) }]
+          .map((record) => JSON.stringify(record))
+          .join('\n') + '\n',
+      );
+      const refused = boundedSessionRead(source, 2, () => 'scope', null, [directory]);
+      assert.equal(refused.state, 'stale');
+      assert.deepEqual(refused.turns, []);
+      assert.match(
+        refused.notes.join(' '),
+        change === 'identity'
+          ? /different session/
+          : change === 'missing identity'
+            ? /unavailable/
+            : change === 'directory'
+              ? /working directory changed/
+              : /repository scope/,
+      );
+      fs.writeFileSync(file, original);
+    }
+    fs.renameSync(file, `${file}.retained`);
+    fs.writeFileSync(file, original);
+    const replaced = boundedSessionRead(source, 2, () => 'scope', null, [directory]);
+    assert.equal(replaced.state, 'stale');
+    assert.match(replaced.notes.join(' '), /replaced/);
+    fs.unlinkSync(file);
+    fs.renameSync(`${file}.retained`, file);
+    const openingRead = filesystem.openSync;
+    const unavailable = vi.spyOn(filesystem, 'openSync').mockImplementation((...args: any[]) => {
+      if (args[0] === file) throw Object.assign(new Error('unread opening'), { code: 'EACCES' });
+      return (openingRead as any)(...args);
+    });
+    syncBuiltinESMExports();
+    try {
+      const refused = boundedSessionRead(source, 2, () => 'scope', null, [directory]);
+      assert.equal(refused.state, 'stale');
+      assert.match(refused.notes.join(' '), /opening is unavailable/);
+    } finally {
+      unavailable.mockRestore();
+      syncBuiltinESMExports();
+    }
+    const clock = vi
+      .spyOn(performance, 'now')
+      .mockReturnValueOnce(0)
+      .mockReturnValueOnce(SESSION_READ_LIMITS.qualificationMs + 1);
+    try {
+      const refused = boundedSessionRead(source, 2, () => 'scope', null, [directory]);
+      assert.equal(refused.state, 'stale');
+      assert.match(refused.notes.join(' '), /time limit/);
+    } finally {
+      clock.mockRestore();
+    }
+    const nativeRead = filesystem.readSync;
+    let wrote = false;
+    const writing = vi.spyOn(filesystem, 'readSync').mockImplementation((...args: any[]) => {
+      const bytes = (nativeRead as any)(...args);
+      if (!wrote) {
+        wrote = true;
+        fs.appendFileSync(file, '\n');
+      }
+      return bytes;
+    });
+    syncBuiltinESMExports();
+    try {
+      const refused = boundedSessionRead(source, 2, () => 'scope', null, [directory]);
+      assert.equal(refused.state, 'stale');
+      assert.deepEqual(refused.turns, []);
+      assert.match(refused.notes.join(' '), /changed during qualification/);
+    } finally {
+      writing.mockRestore();
+      syncBuiltinESMExports();
+      fs.writeFileSync(file, original);
+    }
     let calls = 0;
     const stale = boundedSessionRead(source, 2, () => (++calls === 1 ? 'before' : 'after'), null, [directory]);
     assert.equal(stale.state, 'stale');
@@ -236,7 +319,7 @@ test('bounded session reads preserve native provider turns and reject stale scop
       source,
       2,
       () => {
-        if (++calls === 2) fs.appendFileSync(file, '\n');
+        if (++calls === 3) fs.appendFileSync(file, '\n');
         return 'scope';
       },
       null,

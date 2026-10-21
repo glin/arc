@@ -79,6 +79,8 @@ Claude reports `none` with current whole-file metadata, known empty turn starts,
 
 `session --json` returns `version`, `requester`, `id`, `provider`, `state`, `turns`, `partial`, `readByteLimit`, and `notes`. Eligible replies also supply `observation` for follow-ups and `readObservation` for read acknowledgments.
 
+Each explicit read qualifies the selected accepted source's current opening without advancing discovery. Valid growth remains readable. Unknown membership, competing sources, replacement, changed opening identity or working directory, and unavailable qualification refuse the read. A source change during qualification or parsing returns no turns. Notes identify the failed condition.
+
 The default is five newest turns, with 1 through 20 permitted. Reads allow 512 KiB, including directory checks and Codex opening reads. Output stays below 48 KiB and names excluded turns. Oversized turns are excluded. Exceeding the window's full reply allowance fails explicitly.
 
 `partial` identifies bounded history. `state` is `current`, `stale`, or `unparsed`. Stale reads contain no turns. Unparsed reads do not establish empty history. Turn fields include `promptId`, `startedAt`, `endedAt`, `prompt`, `summary`, `model`, `effort`, `finished`, `interrupted`, and `error`.

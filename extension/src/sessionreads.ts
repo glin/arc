@@ -2,14 +2,15 @@ import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
 import {
   readCodexSession,
-  readCodexSessionMeta,
+  readQualifiedCodexOpening,
   CODEX_OPENING_BYTES,
   createCodexSessionReducer,
   openingRecordOf,
 } from './codex.ts';
 import {
   readSession,
-  readSessionCwd,
+  readQualifiedOpening,
+  normalizeFsPath,
   isInside,
   sameSessionRevision,
   revisionOf,
@@ -31,7 +32,12 @@ import { createClaudeRepeatedFilter } from './clauderepeated.ts';
 import { meterRead } from './readmeter.ts';
 import { beginForwardSessionRecovery, type IncrementalSessionResult, type ForwardRecoveryControl } from './history';
 
-export const SESSION_READ_LIMITS = { turns: 20, bytes: 512 * 1024, outputBytes: 48 * 1024 } as const;
+export const SESSION_READ_LIMITS = {
+  turns: 20,
+  bytes: 512 * 1024,
+  outputBytes: 48 * 1024,
+  qualificationMs: 1000,
+} as const;
 
 const dispatchEvidence = new Map<
   string,
@@ -756,6 +762,56 @@ export function guardedSourceIdentity(source: Pick<SessionFile, 'file' | 'agent'
   }
 }
 
+// Qualify one accepted candidate without changing catalog membership or its retained revision.
+function qualifySessionReadSource(source: SessionFile, roots: readonly string[]): SessionFile | string {
+  const deadline = performance.now() + SESSION_READ_LIMITS.qualificationMs;
+  const opening =
+    source.agent === 'codex'
+      ? readQualifiedCodexOpening(source.file)
+      : readQualifiedOpening(source.file, (fd) => {
+          const buffer = Buffer.allocUnsafe(64 * 1024);
+          const bytes = meterRead(source.file, fs.readSync(fd, buffer, 0, buffer.length, 0));
+          for (const line of buffer.subarray(0, bytes).toString('utf8').split('\n')) {
+            try {
+              const record = JSON.parse(line);
+              if (typeof record.cwd !== 'string' || !record.cwd) continue;
+              return {
+                cwd: record.cwd as string,
+                sessionId: source.childTranscript
+                  ? (record.agentId ??
+                    ('parentSessionId' in source && record.sessionId === source.parentSessionId
+                      ? source.sessionId
+                      : null))
+                  : record.sessionId,
+              };
+            } catch {
+              /* An incomplete line supplies no opening metadata. */
+            }
+          }
+          return null;
+        });
+  if (!opening) return 'The session opening is unavailable or changed during qualification. Retry the command.';
+  if (performance.now() > deadline) return 'The session opening exceeded the read time limit. Retry the command.';
+  if (
+    (source.dev !== undefined && source.dev !== opening.revision.dev) ||
+    (source.ino !== undefined && source.ino !== opening.revision.ino)
+  )
+    return 'The session source was replaced. Retry after session discovery.';
+  if (!sessionSourceAdmitted(source, opening.revision))
+    return 'The session source revision does not match supported growth. Retry after session discovery.';
+  if (typeof opening.value.sessionId !== 'string' || !opening.value.sessionId)
+    return 'The session opening identity is unavailable. Retry the command.';
+  if (opening.value.sessionId !== source.sessionId)
+    return 'The session opening identifies a different session. Retry after session discovery.';
+  const cwd = opening.value.cwd;
+  if (!cwd) return 'The session working directory is unavailable. Retry the command.';
+  if (!isInside(cwd, [...roots]))
+    return 'The session source no longer matches this repository scope. Retry the command.';
+  if (source.cwd && normalizeFsPath(source.cwd) !== normalizeFsPath(cwd))
+    return 'The session working directory changed. Retry after session discovery.';
+  return { ...source, ...opening.revision, cwd };
+}
+
 export const AGENT_SOURCE_LIMITS = {
   bytes: 8 * 1024 * 1024,
   chunkBytes: 256 * 1024,
@@ -783,16 +839,10 @@ export class AgentReadSources {
     if (cached && (cached.sourceRevision !== before || cached.source !== identity || cached.scope !== beforeScope))
       this.held.delete(key);
     if (expectedRevision !== undefined && expectedRevision !== before) return null;
-    const [dev, ino, size, mtimeMs] = JSON.parse(before) as [string, string, number, number];
-    if (
-      size !== source.size ||
-      mtimeMs !== source.mtimeMs ||
-      (source.dev !== undefined && dev !== source.dev) ||
-      (source.ino !== undefined && ino !== source.ino)
-    )
-      return null;
-    const cwd = source.agent === 'codex' ? readCodexSessionMeta(source.file)?.cwd : readSessionCwd(source.file);
-    if (!cwd || !isInside(cwd, [...roots])) return null;
+    const qualified = qualifySessionReadSource(source, roots);
+    if (typeof qualified === 'string' || guardedSourceRevision(source.file) !== before) return null;
+    source = qualified;
+    const size = source.size;
     const current = () =>
       scope() === beforeScope &&
       guardedSourceRevision(source.file) === before &&
@@ -913,18 +963,16 @@ export function boundedSessionRead(
     result.notes.push('The session source or repository scope is unavailable.');
     return result;
   }
-  const [dev, ino, size, mtimeMs] = JSON.parse(before) as [FileRevision['dev'], FileRevision['ino'], number, number];
-  const cwd = source.agent === 'codex' ? readCodexSessionMeta(source.file)?.cwd : readSessionCwd(source.file);
-  if (
-    size !== source.size ||
-    mtimeMs !== source.mtimeMs ||
-    (source.dev !== undefined && dev !== source.dev) ||
-    (source.ino !== undefined && ino !== source.ino) ||
-    !cwd ||
-    !isInside(cwd, [...roots])
-  ) {
+  const qualified = qualifySessionReadSource(source, roots);
+  if (typeof qualified === 'string') {
     result.state = 'stale';
-    result.notes.push('The session source no longer matches this repository scope. Retry the command.');
+    result.notes.push(qualified);
+    return result;
+  }
+  source = qualified;
+  if (beforeScope !== scope() || before !== revision(source.file)) {
+    result.state = 'stale';
+    result.notes.push('The session or repository scope changed during qualification. Retry the command.');
     return result;
   }
   const read =

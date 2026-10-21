@@ -2109,7 +2109,8 @@ export class PanelProvider implements vscode.Disposable {
           (one) => one.sessionId === record.sessionId,
         )
       : [];
-    if (matches.length !== 1 || matches[0].agent !== record.provider) return null;
+    if (matches.length !== 1 || matches[0].agent !== record.provider || !this.sessionReadAdmitted(matches[0]))
+      return null;
     const facts = this.agentReadSources.resolve(matches[0], () => this.readScopeKey(), roots);
     if (facts) {
       this.admittedReadSources.delete(record.sessionId);
@@ -2142,6 +2143,7 @@ export class PanelProvider implements vscode.Disposable {
         : [];
     return matches.length === 1 &&
       matches[0].agent === facts.provider &&
+      this.sessionReadAdmitted(matches[0]) &&
       guardedSourceIdentity(matches[0]) === facts.source &&
       guardedSourceRevision(matches[0].file) === facts.sourceRevision
       ? facts
@@ -2504,6 +2506,10 @@ export class PanelProvider implements vscode.Disposable {
     return scope.ready ? JSON.stringify([folders, scope.roots, scope.revision]) : null;
   }
 
+  private sessionReadAdmitted(source: SessionFile): boolean {
+    return !this.enumeratedAmbiguousIds?.has(source.sessionId) && this.membershipOf(source.sessionId) === 'present';
+  }
+
   // Keeps the facts of a current session read and returns the observation the policy signs for them, if any.
   private observeGuardedRead(request: AttributedRequest, facts: GuardedObservationFacts): string | null {
     if (request.params.sessionId) (this.guardedReads ??= new Map()).set(request.params.sessionId, facts);
@@ -2737,6 +2743,8 @@ export class PanelProvider implements vscode.Disposable {
       if (!index) throw new Error(SESSION_PAGE_ERRORS.catalog);
       const matches = index.scoped.filter((source) => source.sessionId === request.params.sessionId);
       if (matches.length !== 1) throw new Error('The session ID is unknown or ambiguous in this window.');
+      if (!this.sessionReadAdmitted(matches[0]))
+        throw new Error('The session membership is unavailable or ambiguous. Retry after session discovery.');
       return boundedSessionRead(
         matches[0],
         request.params.turns!,

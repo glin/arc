@@ -126,8 +126,8 @@
   },
   "extension/src/panel.webview.test.ts": {
     "reason": "Real progressive workers must deliver bounded recovery and metadata through the production panel host.",
-    "cases": 591,
-    "matricesSha256": "cb595d947c388240d277abebb386a8ccaf4bbf13e8b879e594b0ec409b6a4cd3"
+    "cases": 592,
+    "matricesSha256": "c90b0194c134e5dd9fc8c0d3a507e20679271fdc5bbd4bc66a92cb111def1808"
   },
   "extension/src/panelbundle.test.ts": {
     "reason": "The panel bundle and fixture must contain the production entry, source identity, and substituted text.",

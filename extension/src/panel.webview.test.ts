@@ -2946,7 +2946,7 @@ test('production aggregate read projections validate each shared source once', (
   assert.equal(checks, 1);
 });
 
-function hostReadReceiptFixture() {
+function hostReadReceiptFixture(agent: 'claude' | 'codex' = 'codex') {
   const f = orderedHostReadFixture();
   const directory = tempDir('host-read-source-');
   const file = path.join(directory, 'worker.jsonl');
@@ -2969,11 +2969,38 @@ function hostReadReceiptFixture() {
       },
     );
   }
+  if (agent === 'claude') {
+    records.length = 0;
+    for (let n = 1; n <= 3; n++) {
+      records.push(
+        {
+          type: 'user',
+          sessionId: 'worker',
+          promptId: `turn-${n}`,
+          cwd: directory,
+          timestamp: `2026-10-08T12:00:0${n}Z`,
+          message: { role: 'user', content: `prompt ${n}` },
+        },
+        {
+          type: 'assistant',
+          timestamp: `2026-10-08T12:00:0${n}Z`,
+          message: {
+            id: `reply-${n}`,
+            role: 'assistant',
+            model: 'claude-opus-5-5',
+            content: [{ type: 'text', text: `answer ${n}` }],
+            stop_reason: 'end_turn',
+            usage: { input_tokens: 1, output_tokens: 1 },
+          },
+        },
+      );
+    }
+  }
   fs.writeFileSync(file, records.map((record) => JSON.stringify(record)).join('\n') + '\n');
   const alias = path.join(directory, 'worker-alias.jsonl');
   fs.linkSync(file, alias);
   const source = {
-    agent: 'codex',
+    agent,
     sessionId: 'worker',
     cwd: directory,
     file,
@@ -2983,8 +3010,19 @@ function hostReadReceiptFixture() {
     authoritativeCatalog: [source],
     authoritativeCatalogScope: JSON.stringify([directory]),
     folders: () => [directory],
+    repositoryScopeReady: true,
+    repositoryScopeRoots: [directory],
+    coverageRevision: 1,
+    membershipCoverage: {
+      domain: 'admitted',
+      scope: JSON.stringify([directory]),
+      revision: '1',
+      status: 'complete',
+      files: [file],
+      uncertain: [],
+      members: new Set([sessionCoverageMember(source)]),
+    },
     repositoryScope: { snapshot: () => ({ roots: [directory], ready: true }) },
-    sessionPageIndexFor: () => ({ scoped: [source] }),
   });
   const reply = f.provider.readSessionRequest({
     id: 'lookup',
@@ -3004,6 +3042,83 @@ function hostReadReceiptFixture() {
   };
   return { ...f, source, file, alias, request };
 }
+
+test.each(['claude', 'codex'] as const)(
+  'session reads qualify appended %s turns without republishing the catalog',
+  async (agent) => {
+    const f = hostReadReceiptFixture(agent);
+    const catalog = f.provider.authoritativeCatalog;
+    const request = {
+      id: 'lookup-grown',
+      method: 'session',
+      params: { sessionId: 'worker', turns: 1 },
+      requester: 'reader',
+      requesterProvider: 'claude',
+    };
+    const timestamp = '2026-10-08T12:00:04Z';
+    const records =
+      agent === 'codex'
+        ? [
+            { type: 'event_msg', timestamp, payload: { type: 'task_started', turn_id: 'turn-4' } },
+            { type: 'event_msg', timestamp, payload: { type: 'user_message', message: 'prompt 4' } },
+            {
+              type: 'event_msg',
+              timestamp,
+              payload: { type: 'task_complete', turn_id: 'turn-4', last_agent_message: 'answer 4' },
+            },
+          ]
+        : [
+            {
+              type: 'user',
+              sessionId: 'worker',
+              promptId: 'turn-4',
+              cwd: path.dirname(f.file),
+              timestamp,
+              message: { role: 'user', content: 'prompt 4' },
+            },
+            {
+              type: 'assistant',
+              timestamp,
+              message: {
+                id: 'reply-4',
+                role: 'assistant',
+                model: 'claude-opus-5-5',
+                content: [{ type: 'text', text: 'answer 4' }],
+                stop_reason: 'end_turn',
+                usage: { input_tokens: 1, output_tokens: 1 },
+              },
+            },
+          ];
+    fs.appendFileSync(f.file, records.map((record) => JSON.stringify(record)).join('\n') + '\n');
+    assert.equal((await f.provider.guardedReadRequest(f.request)).status, 'refused');
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const reply = f.provider.readSessionRequest(request);
+      assert.equal(reply.state, 'current', JSON.stringify(reply));
+      assert.equal(reply.turns[0].summary, 'answer 4');
+      assert.ok(reply.readObservation);
+      assert.equal(
+        (
+          await f.provider.guardedReadRequest({
+            ...f.request,
+            id: `read-grown:${attempt}`,
+            params: { sessionId: 'worker', observation: reply.readObservation },
+          })
+        ).status,
+        'applied',
+      );
+    }
+    assert.equal(f.provider.authoritativeCatalog, catalog);
+    assert.equal(f.source.size < fs.statSync(f.file).size, true);
+    f.provider.membershipCoverage.members.clear();
+    assert.throws(() => f.provider.readSessionRequest(request), /membership is unavailable/);
+    assert.equal(f.provider.readSynchronization().agentRead.length, 0);
+    f.provider.membershipCoverage.members.add(sessionCoverageMember(f.source));
+    f.provider.enumeratedAmbiguousIds = new Set(['worker']);
+    assert.throws(() => f.provider.readSessionRequest(request), /membership is unavailable or ambiguous/);
+    assert.equal(f.provider.readSynchronization().agentRead.length, 0);
+    fs.unlinkSync(f.alias);
+  },
+);
 
 test.each(['storage', 'publication'])(
   'queued production receipts refuse bytes appended during earlier %s',
@@ -3887,7 +4002,7 @@ test('window session reads leave reader state and live capabilities unchanged an
       .join('\n') + '\n',
   );
   const stat = revisionOf(fs.statSync(file, { bigint: true }));
-  const source = { agent: 'claude', sessionId: 'known', file, size: stat.size, mtimeMs: stat.mtimeMs };
+  const source = { agent: 'claude' as const, sessionId: 'known', file, ...stat };
   const saved = {
     labels: { known: ['Review'] },
     readerParents: { known: 'parent' },
@@ -3912,10 +4027,20 @@ test('window session reads leave reader state and live capabilities unchanged an
     disposed: false,
     folders: () => [directory],
     repositoryScopeRoots: [directory],
+    repositoryScopeReady: true,
+    coverageRevision: 1,
     completeCatalogScope: JSON.stringify([directory]),
     repositoryScope: { snapshot: () => ({ ready: true, roots: [directory], revision: 1 }) },
     authoritativeCatalog: [source],
-    membershipCoverage: { status: 'complete' },
+    membershipCoverage: {
+      domain: 'admitted',
+      scope: JSON.stringify([directory]),
+      revision: '1',
+      status: 'complete',
+      files: [file],
+      uncertain: [],
+      members: new Set([sessionCoverageMember(source)]),
+    },
     authoritativeCatalogScope: JSON.stringify([directory]),
     pendingWatch: { snapshot: () => ({ eventCount: 0, broadRequired: false }) },
     exitedSinceKeys: new Map(),
