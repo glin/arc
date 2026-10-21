@@ -269,10 +269,9 @@ export function costStateDependency(file: SpendFileIndex, index = 0): CostStateD
 }
 export function matchingCostSupplement(
   supplement: ClaudeCostSupplement | undefined,
-  files: readonly SpendFileIndex[],
+  records: ReadonlyMap<string, SpendFileIndex>,
 ): supplement is ClaudeCostSupplement {
   if (!supplement) return false;
-  const records = new Map(files.map((file) => [file.file, file]));
   return supplement.dependencies.every((dependency, index) => {
     const file = records.get(dependency.file);
     return (
@@ -476,6 +475,7 @@ export function reconcileClaudeCostState(
   budget: SpendIndexBudget & { maxWorkingSetBytes?: number } = {},
 ): { progress: ClaudeCostProgress; supplement?: ClaudeCostSupplement; complete: boolean; invalidated?: boolean } {
   const clock = budget.now ?? Date.now;
+  const records = new Map(dependencies.map((file) => [file.file, file]));
   const deadline = clock() + (budget.maxMilliseconds ?? BACKGROUND_SCAN_MILLISECONDS);
   let remaining = budget.maxBytes ?? BACKGROUND_SCAN_BYTES;
   const frozen = dependencies.map(costStateDependency);
@@ -550,7 +550,7 @@ export function reconcileClaudeCostState(
     if (file.complete === false || file.missingAt || file.trailing || file.trailingBytes)
       return { progress, complete: false };
     const childCapture = (file.parserState as { costState?: ClaudeCostCapture } | undefined)?.costState;
-    if (childCapture?.snapshots.length && !matchingCostSupplement(file.costStateSupplement, dependencies)) {
+    if (childCapture?.snapshots.length && !matchingCostSupplement(file.costStateSupplement, records)) {
       if (file.costStateProgress?.reason) {
         progress.reason = 'native child accounting withheld';
         return { progress, complete: true };

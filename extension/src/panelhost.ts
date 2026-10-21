@@ -4361,7 +4361,6 @@ export class PanelProvider implements vscode.Disposable {
   public setUsage(usage: AgentUsage[]): void {
     this.usage = usage;
     void this.post({ type: 'usage', usage: this.usagePayload() });
-    this.postProjectSpend();
   }
 
   public setUsageRefresh(refresh: UsageRefresh): void {
@@ -8812,12 +8811,11 @@ export class PanelProvider implements vscode.Disposable {
             promptPosition: readSetting('timeline.promptPosition'),
           },
           olderHistory,
-          projectSpend: this.projectSpendPayload(),
           diagnosis,
         };
         const payload = selectedOnly
           ? selectionPayload({ ...payloadInput, previousShowing: hostPreviousSession })
-          : renderPayload(payloadInput);
+          : renderPayload({ ...payloadInput, projectSpend: this.projectSpendPayload() });
         if (!selectedOnly) {
           for (const route of this.clearRoutes?.values() ?? []) {
             if (route.hosts.has(host)) {

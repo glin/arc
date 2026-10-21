@@ -191,7 +191,7 @@
   },
   "extension/src/startup.test.ts": {
     "reason": "Real title workers must publish recovered metadata through startup ownership and cancellation boundaries.",
-    "cases": 200,
+    "cases": 201,
     "matricesSha256": "477688194156018bd629407ea1de8dd1e18c81d4093e65edf9f2bc0e055d6d31"
   },
   "extension/src/store.test.ts": {

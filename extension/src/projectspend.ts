@@ -2487,6 +2487,7 @@ export function prepareProjectSpendView(
   const evidencedAgents = new Set<'claude' | 'codex'>();
   const rateSources = new Map<string, { effectiveDate: string | null; provenance: ProjectSpendProvenance }>();
   const contributingDates: string[] = [];
+  const records = new Map(files.map((file) => [file.file, file]));
   const directClaude = directClaudeSources(files);
   const incomplete = new Map(windows.map((window) => [window.id, { total: false, claude: false, codex: false }]));
   let lastIndexedAt: number | null = null;
@@ -2519,7 +2520,7 @@ export function prepareProjectSpendView(
     }
     for (const bucket of [
       ...file.buckets,
-      ...(matchingCostSupplement(file.costStateSupplement, files) ? file.costStateSupplement.dated : []),
+      ...(matchingCostSupplement(file.costStateSupplement, records) ? file.costStateSupplement.dated : []),
     ]) {
       if (bucket.linkedSessionId && directClaude.usableSessions.has(bucket.linkedSessionId)) {
         continue;
@@ -2553,7 +2554,10 @@ export function prepareProjectSpendView(
   const viewWindows = windows.map((window) =>
     displayWindow(totals.get(window.id)!, incomplete.get(window.id)!.total, window, truncated.get(window.id)),
   );
-  const earliestRecord = contributingDates.sort()[0] ?? null;
+  const earliestRecord = contributingDates.reduce<string | null>(
+    (earliest, date) => (earliest === null || date < earliest ? date : earliest),
+    null,
+  );
   return {
     name: options.name ?? 'Project cost',
     windows: viewWindows,
@@ -3127,6 +3131,7 @@ export function sessionSpendPartsBySession(
   coverageBySession?: Map<string, SessionSpendCoverage>,
 ): Record<string, SessionSpendPart[]> {
   const records = new Map(files.map((record) => [normalizeWorkspace(record.file), record]));
+  const costRecords = new Map(files.map((record) => [record.file, record]));
   const whole = ({ record }: { record: SpendFileIndex | undefined }) => spendRecordWhole(record);
   const out: Record<string, SessionSpendPart[]> = {};
   for (const [sessionId, groups] of groupedSpendSources(sources, records, (source) => source.sessionId)) {
@@ -3172,7 +3177,7 @@ export function sessionSpendPartsBySession(
     }
     coverageBySession?.set(sessionId, coverage);
     const supplements = found.flatMap(({ record, primary }) =>
-      matchingCostSupplement(record?.costStateSupplement, files)
+      matchingCostSupplement(record?.costStateSupplement, costRecords)
         ? record.costStateSupplement.lifetime.map((bucket) => ({
             bucket,
             role: primary ? ('main' as const) : ('delegated' as const),

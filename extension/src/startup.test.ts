@@ -5995,6 +5995,7 @@ test('a selection-only render keeps the authoritative rail when selected revalid
     };
     const peer = { file: 'peer.jsonl', sessionId: 'peer', agent: 'codex', activity: 1, size: 1, mtimeMs: 1 };
     provider._showing = 'selected';
+    provider.projectSpendPayload = vi.fn<() => null>(() => null);
     provider.partial = scenario === 'newer held catalog' ? [peer] : [selected, peer];
     provider.authoritativeCatalog = [selected, peer];
     await provider.refresh(true, true, true, true);
@@ -6005,7 +6006,25 @@ test('a selection-only render keeps the authoritative rail when selected revalid
       `${scenario} sent unchanged session rows in the selection patch`,
     );
     assert.equal(payload.showing, 'selected', `${scenario} replaced the reader's selection`);
+    assert.equal(
+      provider.projectSpendPayload.mock.calls.length,
+      0,
+      `${scenario} aggregated Project cost without rendering it`,
+    );
   }
+});
+
+test('an account usage update does not aggregate Project cost', () => {
+  const provider = paintHarness(['setUsage', 'postProjectSpend']);
+  provider.post = vi.fn<() => Promise<void>>(() => Promise.resolve());
+  provider.usagePayload = vi.fn<() => null>(() => null);
+  provider.projectSpendPayload = vi.fn<() => null>(() => null);
+  provider.setUsage([]);
+  assert.equal(
+    provider.projectSpendPayload.mock.calls.length,
+    0,
+    'an account usage update aggregated unrelated Project cost',
+  );
 });
 
 test('selection failure reaches the provider payload as history status or diagnosis', async () => {

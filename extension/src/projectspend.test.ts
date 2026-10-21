@@ -1,5 +1,6 @@
 import { describe, test, vi } from 'vitest';
 import {
+  costStateDependency,
   reconcileClaudeCostState,
   CLAUDE_COST_STATE_SNAPSHOTS,
   CLAUDE_COST_STATE_MODELS,
@@ -449,6 +450,43 @@ test('held lifetime figures copy the record list, which the ledger edits in plac
   files[0] = lifetimeRecord('a.jsonl', 2);
   assert.notEqual(read(files, sources), first);
   assert.deepEqual(calculated, ['a', 'a']);
+});
+
+test('shared child supplements reject either parent-child recency direction after the child changes', () => {
+  const now = stamp('2026-08-31T12:00:00');
+  const [bucket] = aggregateUsageEvents([event(stamp('2026-08-31T10:00:00'))]);
+  const supplement = (parent: SpendFileIndex, child: SpendFileIndex) => ({
+    identity: `${parent.file}:${child.file}`,
+    dependencies: [costStateDependency(parent), costStateDependency(child, 1)],
+    snapshots: [],
+    lifetime: [],
+    dated: [bucket],
+    lifetimeAllocations: [],
+    datedAllocations: [],
+  });
+  for (const [parentMtime, childMtime] of [
+    [2, 1],
+    [1, 2],
+  ]) {
+    const child = lifetimeRecord('shared-child.jsonl', childMtime);
+    const left = lifetimeRecord(`left-${parentMtime}-${childMtime}.jsonl`, parentMtime);
+    const right = lifetimeRecord(`right-${parentMtime}-${childMtime}.jsonl`, parentMtime + 10);
+    const files = [
+      { ...left, costStateSupplement: supplement(left, child) },
+      { ...right, costStateSupplement: supplement(right, child) },
+      child,
+    ];
+    const price = () => ({
+      dollars: 1,
+      source: 'test',
+      effectiveDate: null,
+      estimated: false,
+      provenance: 'public' as const,
+    });
+    assert.equal(prepareProjectSpendView(files, price, { now }).windows[0].dollars, 2);
+    const changed = files.map((file) => (file.file === child.file ? { ...file, mtimeMs: file.mtimeMs + 1 } : file));
+    assert.equal(prepareProjectSpendView(changed, price, { now }).windows[0].dollars, 0);
+  }
 });
 
 // Queue changes recalculate sessions with unread dispatched sources. Other unread sources retain their existing figures.
