@@ -354,7 +354,7 @@ function ProjectSpendDialog({ owner }: { owner: ProjectSpendRenderer }): Compone
       if ((word || spend.lastIndexedAt) && meta.length) {
         meta.push('\u00a0· ');
       }
-      if (word) {
+      if (word && !spend.lastIndexedAt) {
         meta.push(h('span', { class: 'projectspendupdating', key: 'status' }, word));
       } else if (spend.lastIndexedAt) {
         const at = spend.lastIndexedAt;

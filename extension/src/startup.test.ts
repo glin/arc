@@ -1,3 +1,5 @@
+import * as spendConsumers from './projectspend';
+import * as cardConsumers from './turncard';
 import { normalizePromptAssetBook } from './promptassets';
 import {
   GuardedSends,
@@ -25,6 +27,7 @@ import {
 } from './turnview';
 // @module-tag subprocess
 import { sessionStatsFromFacts } from './turncard';
+import { runningKey } from './composerview';
 import { compatibleDiscovery, discoveryCompatibility } from './progressiveworker';
 import { claudeDispatchTranscript } from './turnfixtures';
 import { sessionCoverageMember, sessionPresence, reconcileSessionCollisions } from './sessioncoverage';
@@ -55,6 +58,7 @@ import ts from 'typescript';
 import { agentSpendIsOpen, spendFileVersion, spendTokens } from './agentspend';
 import {
   CodexMetaCache,
+  createCodexUsageLineReducer,
   CodexStatCache,
   codexSessionFiles,
   readRolloutStat,
@@ -118,6 +122,10 @@ import {
   PROJECT_SPEND_SAVE_RETRIES,
   projectSpendSaveRetryDelay,
   SessionFiguresCache,
+  SpendCoverage,
+  spendRecordAgent,
+  spendSourceHeld,
+  pruneSpendFilesWithResult,
   sessionLifetimeDisplayFiles,
   spendRecordChangesRail,
   spendRecordHoldsLongLine,
@@ -241,7 +249,12 @@ import { emptyTrail, renamePlace, visitPlace } from './turnplaces';
 import { adoptLabelSession, labelsOf } from './turnlabels';
 import { isSearch, searchScope, searchScopeName, searchTurns } from './turnsearch.ts';
 import { dispatchPanelToHost, parsePanelToHost } from './webview/protocol.ts';
-import { BoundedTrailingScheduler, CATALOG_REFRESH_DEADLINE_MS, mergeRefreshRequests } from './scheduler';
+import {
+  BoundedTrailingScheduler,
+  IntegrityScheduler,
+  CATALOG_REFRESH_DEADLINE_MS,
+  mergeRefreshRequests,
+} from './scheduler';
 import { compaction, turn, subagent, claudeCostState } from './turnfixtures';
 import {
   selectionCoverage,
@@ -1386,10 +1399,14 @@ function completeDiscoveryHarness(
     sessionPageSources,
     sessionPresence,
     sessionSourceKey,
+    fs,
+    fileRevisionOf,
+    SpendCoverage,
     projectsRoot: () => 'projects',
     codexSessionsRoot: () => 'sessions',
     sameSessionRevision,
     outcomesFor,
+    runningKey,
     replacedCatalogFiles: async () => [],
     enumerateRolloutFilesAsync,
     enumerateClaudeChildSources,
@@ -8549,6 +8566,27 @@ test('opening a session leaves the rail to the render that selection asked for',
   assert.equal(provider.rails().length, 2, 'a read mark made once the selection settled never reaches the rail');
 });
 
+test('session selection reads cached spend signatures without enumerating sources', async () => {
+  const provider = paintHarness();
+  provider.lastSpendSourceSignature = 'accepted catalog';
+  let signatures = 0;
+  provider.useSpendSignature(() => {
+    signatures++;
+    return 'unwanted enumeration';
+  });
+  provider.useListingSignature(listingSignature);
+  provider.projectSpendSources = () => {
+    throw new Error('selection enumerated spend sources');
+  };
+  provider.updateProjectSpendIntegrity = () => {
+    throw new Error('selection rebuilt spend catalog');
+  };
+  await provider.refresh(true, true, false, true);
+  await provider.refresh(true, true, false, true);
+  assert.equal(signatures, 0);
+  assert.equal(provider.messages.filter((message: any) => message.type === 'selection').length, 2);
+});
+
 // The harness retains the refresh stages that precede the render post.
 function paintHarness(extraMethods: string[] = [], scope: Record<string, unknown> = {}): any {
   const session = {
@@ -8578,6 +8616,7 @@ test('a refresh posts the render the panel paints from before it offers a spend 
   const provider = paintHarness(['scheduleProjectSpendIndex']);
   const order: string[] = [];
   provider.useSpendOfferGate(() => true);
+  provider.useSpendSignature(() => 'changed source');
   provider.queueProjectSpendIndex = () => {
     order.push('spend sources offered');
   };
@@ -9064,6 +9103,670 @@ function markedOffer(provider: any, mark: string): void {
   provider.scheduleProjectSpendIndex(new Map([['mark', mark]]), null);
 }
 
+// Production ownership supplies checking, indexing, publication, and panel lifecycle.
+function integrityHostHarness(scope: Record<string, unknown> = {}, extraMethods: string[] = []): any {
+  const provider = railPostHarness(
+    [
+      'updateProjectSpendIntegrity',
+      'checkProjectSpendSources',
+      'publishProjectSpendCoverage',
+      'queueProjectSpendIndex',
+      'indexNextProjectSpendFile',
+      'finishProjectSpendIndex',
+      'projectSpendHistoryCutoff',
+      'scheduleProjectSpendIndex',
+      'invalidateProjectSpendSnapshot',
+      'projectSpendPayload',
+      'postProjectSpend',
+      'projectSpendBusy',
+      'startPolling',
+      'stopPolling',
+      'watchDirectories',
+      'wakeFromWatch',
+      ...extraMethods,
+    ],
+    {
+      normalizeSpendFile: (file: string) => file,
+      spendRecordAgent,
+      spendSourceHeld,
+      IntegrityScheduler,
+      projectSpendHistoryCutoff,
+      projectSpendOfferDecision,
+      spendRecordChangesRail,
+      spendRecordHoldsLongLine,
+      releaseSpendHeldLine,
+      createClaudeUsageLineReducer,
+      createCodexUsageLineReducer,
+      indexSpendFile,
+      invalidateSpendFileNormalization: () => {},
+      prepareProjectSpendViewSteps,
+      publicProjectSpendPrice,
+      POLL_INTERVAL_MILLISECONDS: 1000,
+      ...scope,
+    },
+  );
+  Object.assign(provider, {
+    projectSpendWorkspace: 'project',
+    projectSpendStorageDir: 'storage',
+    projectSpendRevision: 0,
+    projectSpendSnapshotPrice: publicProjectSpendPrice,
+    projectSpendQueue: [],
+    projectSpendQueued: new Set(),
+    projectSpendTick: null,
+    sessionSpendSources: [],
+    hostSessions: new Map(),
+    running: new Set(),
+    spendSourcesByFile: new Map(),
+    spendRecordsByFile: new Map(),
+    spendChecks: new SpendCoverage(),
+    spendCoverageAt: null,
+    sourceEnumerations: { claude: { status: 'complete' }, codex: { status: 'complete' } },
+    membershipCoverage: { status: 'complete' },
+    catalogWalked: true,
+    codexStats: new CodexStatCache(),
+    watchers: new Map(),
+    pendingWatch: {
+      clear() {},
+      noteFileEvent() {
+        return true;
+      },
+    },
+    watchScheduler: { cancel() {}, offer() {} },
+    poll: null,
+  });
+  provider.projectSpendSources = () => [];
+  provider.scheduleProjectSpendSave = () => {};
+  if (!extraMethods.includes('postRailIfSpendPendingMoved')) provider.postRailIfSpendPendingMoved = () => {};
+  if (!extraMethods.includes('postDispatchedCostsIfMoved')) provider.postDispatchedCostsIfMoved = () => {};
+  provider.indexNextClaudeCostState = () => false;
+  return provider;
+}
+
+test.each(['stat', 'open', 'read'])(
+  'failed %s after a replacement slice retains complete published cost and age',
+  async (failure) => {
+    vi.useFakeTimers();
+    const root = tempDir('spend-partial-failure-');
+    const file = normalizeSpendFile(path.join(root, 'session.jsonl'));
+    const event = (dollars: number): UsageEvent => ({
+      timestamp: Date.now(),
+      agent: 'Codex',
+      provider: 'openai',
+      model: 'gpt-6.1-sol',
+      contextWindow: null,
+      billingClass: 'metered',
+      inferenceClass: null,
+      serviceTier: null,
+      reportedCost: dollars,
+      reportedCostBasis: 'list',
+      requestKey: null,
+      usage: { input: 0, output: 0, thinking: 0, cacheRead: 0, cacheWrite1h: 0, cacheWrite5m: 0 },
+    });
+    const reducer = () => ({
+      parserKind: 'codex' as const,
+      pushLine: (line: string) => [JSON.parse(line) as UsageEvent],
+      snapshot: () => ({}),
+    });
+    fs.writeFileSync(file, JSON.stringify({ ...event(10), padding: 'x'.repeat(2048) }) + '\n');
+    const complete = indexSpendFile(undefined, file, 'project', reducer).record;
+    const firstLine = JSON.stringify(event(1)) + '\n';
+    fs.writeFileSync(file, firstLine + JSON.stringify(event(2)) + '\n');
+    const provider = integrityHostHarness(
+      {
+        sessionLifetimeDisplayFiles,
+        sessionSpendPartsBySession,
+        sessionTurnStatsBySession: spendConsumers.sessionTurnStatsBySession,
+        sessionCacheFactsBySession: spendConsumers.sessionCacheFactsBySession,
+        dispatchedSpendPartsBySession: spendConsumers.dispatchedSpendPartsBySession,
+        sessionCostUsageOf: cardConsumers.sessionCostUsageOf,
+        sessionCostProjection: cardConsumers.sessionCostProjection,
+        sessionTurnStats: cardConsumers.sessionTurnStats,
+        sessionCacheExpiryStats: cardConsumers.sessionCacheExpiryStats,
+        sessionCompactionContextDetail: cardConsumers.sessionCompactionContextDetail,
+        priceDispatchedParts: cardConsumers.priceDispatchedParts,
+        createCodexUsageLineReducer: reducer,
+        indexSpendFile: (...args: Parameters<typeof indexSpendFile>) =>
+          indexSpendFile(args[0], args[1], args[2], args[3], {
+            maxBytes: Buffer.byteLength(firstLine),
+            maxMilliseconds: Infinity,
+          }),
+      },
+      [
+        'lifetimeFiguresBySession',
+        'lifetimeDisplayFiles',
+        'projectSpendHolds',
+        'dispatchedTurnCosts',
+        'postRailIfSpendPendingMoved',
+      ],
+    );
+    provider.lifetimeFigures = new SessionFiguresCache();
+    provider.sessionSpendSources = [
+      { sessionId: 'session-a', file, primary: true },
+      { sessionId: 'parent', file, primary: true, dispatchedVia: 'tool', dispatchedFrom: 'session-a' },
+    ];
+    provider.sessionRows = [
+      {
+        id: 'session-a',
+        label: 'A',
+        agent: 'Codex',
+        agentKey: 'codex',
+        when: '',
+        shown: true,
+        at: 1,
+        relative: '',
+        agentRun: false,
+      },
+    ];
+    provider.useRailPayload(railPayload);
+    Object.assign(provider, {
+      projectSpendFiles: [complete],
+      projectSpendVisibleFiles: [complete],
+      projectSpendIndexing: true,
+      spendRecordsByFile: new Map([[complete.file, 0]]),
+      projectSpendQueue: [{ file, agent: 'codex' }],
+      projectSpendQueued: new Set([complete.file]),
+    });
+    provider.spendChecks.set(complete, 50);
+    provider.spendChecks.discover([complete.file], 80);
+    provider.spendChecks.account(complete.file);
+    provider.spendChecks.publish();
+    Array.from(provider.spendChecks.prepare([complete]));
+    provider.publishProjectSpendCoverage();
+    provider.postRail(false);
+    const heldDispatched = provider.dispatchedTurnCosts();
+    assert.ok(Object.keys(heldDispatched).length, 'the fixture has no dispatched contribution');
+    provider.indexNextProjectSpendFile();
+    const partial = provider.projectSpendFiles[0];
+    assert.equal(partial.complete, false);
+    assert.equal(partial.buckets[0].reportedCost, 1);
+    partial.newestTurnStartedAt = 200;
+    const method = failure === 'stat' ? 'statSync' : failure === 'open' ? 'openSync' : 'readSync';
+    const spy = vi.spyOn(mutableFs, method as 'statSync').mockImplementation(() => {
+      throw Object.assign(new Error('held'), { code: 'EACCES' });
+    });
+    syncBuiltinESMExports();
+    try {
+      await vi.advanceTimersByTimeAsync(500);
+      assert.equal(provider.projectSpendFiles[0], partial, 'retry progress was lost');
+      assert.equal(provider.projectSpendVisibleFiles[0], complete, 'partial cost replaced complete cost');
+      assert.equal(provider.spendCoverageAt, 50, 'failure renewed or erased successful age');
+      const published = provider.messages.filter((post: any) => post.type === 'projectSpend').at(-1).projectSpend;
+      assert.equal(published.windows[0].dollars, 10);
+      assert.equal(published.lastIndexedAt, 50);
+      provider.postRail(true);
+      assert.equal(provider.rails().at(-1).rail[0].costDollars, 10, 'the session list lost complete lifetime cost');
+      const dispatched = provider.dispatchedTurnCosts();
+      const held = Object.values(heldDispatched).flatMap((value: any) => Object.values(value)) as any[];
+      const current = Object.values(dispatched).flatMap((value: any) => Object.values(value)) as any[];
+      assert.deepEqual(
+        current.map((value) => value.costs),
+        held.map((value) => value.costs),
+        'dispatched money changed to partial usage',
+      );
+      assert.ok(
+        current.every((value) => value.ownSettledAt === null),
+        'failed replacement exposed a settled timestamp',
+      );
+    } finally {
+      spy.mockRestore();
+      syncBuiltinESMExports();
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  },
+);
+
+test('source addition backlog retains published age until its accounting reaches publication', async () => {
+  vi.useFakeTimers();
+  try {
+    const provider = integrityHostHarness();
+    const a = { file: 'a', size: 1, mtimeMs: 1, sourceIdentity: '1:2', complete: true, buckets: [] };
+    provider.projectSpendFiles = [a];
+    provider.projectSpendVisibleFiles = [a];
+    provider.spendChecks.discover(['a'], 100);
+    provider.spendChecks.account('a');
+    provider.spendChecks.set(a, 100);
+    provider.spendChecks.publish();
+    Array.from(provider.spendChecks.prepare([a]));
+    provider.publishProjectSpendCoverage();
+    provider.projectSpendSources = () => [
+      { file: 'a', agent: 'codex' },
+      { file: 'b', agent: 'codex' },
+    ];
+    vi.setSystemTime(200);
+    provider.updateProjectSpendIntegrity([]);
+    provider.spendChecks.set(a, 200);
+    provider.publishProjectSpendCoverage();
+    assert.equal(provider.spendCoverageAt, 100);
+    const partial = { ...a, file: 'b', complete: false };
+    provider.projectSpendFiles = [a, partial];
+    provider.spendRecordsByFile = new Map([
+      ['a', 0],
+      ['b', 1],
+    ]);
+    provider.projectSpendQueue = [{ file: 'b', agent: 'codex' }];
+    provider.projectSpendQueued.add('b');
+    provider.projectSpendIndexing = true;
+    const denied = vi.spyOn(mutableFs, 'statSync').mockImplementation(() => {
+      throw Object.assign(new Error('held'), { code: 'EACCES' });
+    });
+    syncBuiltinESMExports();
+    try {
+      provider.indexNextProjectSpendFile();
+    } finally {
+      denied.mockRestore();
+      syncBuiltinESMExports();
+    }
+    await vi.advanceTimersByTimeAsync(500);
+    assert.equal(provider.spendCoverageAt, 100, 'failed partial accounting accepted new source membership');
+    const b = { ...a, file: 'b' };
+    provider.projectSpendFiles = [a, b];
+    provider.spendChecks.set(b, 200);
+    provider.spendChecks.account('b');
+    Array.from(provider.spendChecks.prepare([a]));
+    provider.spendChecks.account('a', true);
+    provider.publishProjectSpendCoverage();
+    assert.equal(provider.spendCoverageAt, 100, 'unchanged accounting renewed a snapshot omitting completed work');
+    provider.projectSpendIndexing = true;
+    provider.finishProjectSpendIndex();
+    assert.equal(provider.spendCoverageAt, 100, 'completion advanced age before publication');
+    await vi.advanceTimersByTimeAsync(500);
+    assert.equal(provider.spendCoverageAt, 200);
+    const c = { ...a, file: 'c' };
+    provider.spendChecks.discover(['a', 'b', 'c'], 300);
+    for (const record of [a, b, c]) provider.spendChecks.set(record, 300);
+    provider.spendChecks.account('c');
+    const preparing = provider.spendChecks.prepare([a, b]);
+    preparing.next();
+    provider.spendChecks.publish();
+    Array.from(preparing);
+    provider.spendChecks.account('a', true);
+    provider.publishProjectSpendCoverage();
+    assert.equal(provider.spendCoverageAt, 200, 'preparation adopted membership published after it started');
+  } finally {
+    vi.clearAllTimers();
+    vi.useRealTimers();
+  }
+});
+
+test('successful empty discovery publishes age without aggregation and failed discovery retains it', () => {
+  vi.useFakeTimers();
+  try {
+    const provider = integrityHostHarness();
+    provider.invalidateProjectSpendSnapshot = () => {
+      throw new Error('empty discovery aggregated');
+    };
+    vi.setSystemTime(100);
+    provider.updateProjectSpendIntegrity([]);
+    assert.equal(provider.spendCoverageAt, 100);
+    vi.setSystemTime(200);
+    provider.updateProjectSpendIntegrity([]);
+    assert.equal(provider.spendCoverageAt, 200);
+    provider.sourceEnumerations.codex.status = 'partial';
+    vi.setSystemTime(300);
+    provider.updateProjectSpendIntegrity([]);
+    assert.equal(provider.spendCoverageAt, 200);
+    assert.equal(provider.messages.filter((post: any) => post.type === 'projectSpend').length, 2);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('host integrity callbacks maintain coverage without rescanning displayed history', async () => {
+  const provider = integrityHostHarness({
+    fs: {
+      promises: {
+        stat: async () => ({
+          size: 1n,
+          mtimeMs: 1n,
+          dev: 1n,
+          ino: 2n,
+          isFile: () => true,
+        }),
+      },
+    },
+  });
+  const records = Array.from({ length: 1024 }, (_, index) => ({
+    file: String(index),
+    size: 1,
+    mtimeMs: 1,
+    sourceIdentity: '1:2',
+    complete: true,
+  }));
+  provider.projectSpendFiles = records;
+  provider.spendRecordsByFile = new Map(records.map((record, index) => [record.file, index]));
+  provider.spendSourcesByFile = new Map(records.map((record) => [record.file, { file: record.file, agent: 'claude' }]));
+  provider.spendChecks.discover(
+    records.map((record) => record.file),
+    100,
+  );
+  for (const record of records) {
+    provider.spendChecks.set(record, 50);
+    provider.spendChecks.account(record.file);
+  }
+  provider.spendChecks.publish();
+  Array.from(provider.spendChecks.prepare(records));
+  let reads = 0;
+  provider.projectSpendVisibleFiles = new Proxy(records, {
+    get(target, key, receiver) {
+      if (typeof key === 'string' && /^\d+$/.test(key)) reads++;
+      return Reflect.get(target, key, receiver);
+    },
+  });
+  provider.queueProjectSpendIndex = () => {};
+  const get = vi.spyOn(provider.spendChecks, 'get');
+  for (let offset = 0; offset < records.length; offset += 16)
+    await provider.checkProjectSpendSources(
+      records.slice(offset, offset + 16).map((record) => record.file),
+      () => true,
+    );
+  assert.equal(reads, 0, 'bounded callbacks traversed unrelated display records');
+  assert.ok(get.mock.calls.length <= records.length, 'coverage lookups grew faster than checked sources');
+  assert.equal(provider.spendCoverageAt, 100);
+});
+
+test.each(['win32', 'darwin', 'linux'])(
+  'integrity preserves exact large physical identity through %s listing admission and indexing',
+  async (platform) => {
+    const inode = 149181737659217462n;
+    const file = normalizeSpendFile(path.join(tempDir('spend-large-inode-'), 'source.jsonl'));
+    fs.writeFileSync(file, '');
+    const physical = { size: 0n, mtimeMs: 20n, dev: 1n, ino: inode, isFile: () => true };
+    const normalized = new Function('process', `return (${normalizeFsPath.toString()});`)({ platform });
+    assert.equal(normalized('/Mixed/Source'), platform === 'win32' ? '/mixed/source' : '/Mixed/Source');
+    let indexingError: unknown;
+    const provider = integrityHostHarness({
+      indexSpendFile: (...args: Parameters<typeof indexSpendFile>) => {
+        try {
+          return indexSpendFile(...args);
+        } catch (error) {
+          indexingError = error;
+          throw error;
+        }
+      },
+      fs: {
+        statSync: (_file: string, options: unknown) => {
+          assert.deepEqual(options, { bigint: true });
+          return physical;
+        },
+        promises: {
+          stat: async (_file: string, options: any) =>
+            options?.bigint ? physical : { ...physical, size: 0, mtimeMs: 20, dev: 1, ino: Number(inode) },
+        },
+      },
+    });
+    provider.spendSourcesByFile.set(file, { file, agent: 'codex' });
+    provider.codexStats = new CodexStatCache(
+      () => {
+        throw new Error('held listing stat was not accepted');
+      },
+      () => 1_000_000,
+    );
+    provider.queueProjectSpendIndex = () => {};
+    await provider.checkProjectSpendSources([file], () => true);
+    const held = provider.codexStats.get(file)!;
+    assert.equal(held.ino, '149181737659217462');
+    assert.deepEqual(
+      await replacedCatalogFiles([{ file, ...held } as SessionFile], new AbortController().signal, async () =>
+        fileRevisionOf(physical as unknown as fs.BigIntStats),
+      ),
+      [],
+    );
+    const original = mutableFs.statSync;
+    const spy = vi.spyOn(mutableFs, 'statSync').mockImplementation(((target: fs.PathLike, options: unknown) => {
+      if (String(target) === file) {
+        assert.deepEqual(options, { bigint: true });
+        return physical;
+      }
+      return original(target, options as any);
+    }) as typeof fs.statSync);
+    syncBuiltinESMExports();
+    try {
+      const indexed = indexSpendFile(undefined, file, 'project', createCodexUsageLineReducer);
+      assert.equal(indexed.record.sourceIdentity, '1:149181737659217462');
+      provider.projectSpendFiles = [indexed.record];
+      provider.spendRecordsByFile.set(file, 0);
+      provider.projectSpendQueue = [{ file, agent: 'codex' }];
+      provider.projectSpendQueued.add(file);
+      provider.scheduleNextProjectSpendFile = () => {};
+      provider.indexNextProjectSpendFile();
+      assert.ifError(indexingError);
+      assert.equal(
+        provider.projectSpendQueue.length,
+        0,
+        'exact post-read identity falsely requeued an unchanged source',
+      );
+      assert.equal(typeof provider.spendChecks.get(provider.projectSpendFiles[0]), 'number');
+    } finally {
+      spy.mockRestore();
+      syncBuiltinESMExports();
+    }
+  },
+);
+
+test('accounting-only pruning and normalized hydration retain revision-qualified successful coverage', () => {
+  const at = Date.now();
+  const record = {
+    file: 'source',
+    size: 10,
+    mtimeMs: 20,
+    sourceIdentity: '1:2',
+    complete: true,
+    buckets: [{ localDate: '2000-01-01' }, { localDate: projectSpendWindows(at)[0].start }],
+  } as SpendFileIndex;
+  const coverage = new SpendCoverage();
+  coverage.discover(['source'], 100);
+  coverage.account('source');
+  coverage.publish();
+  coverage.set(record, 50);
+  Array.from(coverage.prepare([record]));
+  const pruned = pruneSpendFilesWithResult([record], at).files[0];
+  assert.notEqual(pruned, record);
+  Array.from(coverage.prepare([pruned]));
+  assert.equal(coverage.oldest(null), 50);
+  const normalized = { ...pruned, pendingBytes: undefined, trailing: '' };
+  Array.from(coverage.prepare([normalized]));
+  assert.equal(coverage.oldest(null), 50);
+  Array.from(coverage.prepare([{ ...normalized, sourceIdentity: '1:3' }]));
+  assert.equal(coverage.oldest(null), null, 'replacement inherited old physical evidence');
+  for (let cycle = 0; cycle < 32; cycle++) {
+    const removed = { ...record, file: `removed-${cycle}` };
+    coverage.discover([removed.file], 200 + cycle);
+    coverage.account(removed.file);
+    coverage.set(removed, 200 + cycle);
+    coverage.publish();
+    Array.from(coverage.prepare([removed]));
+    coverage.discover([], 300 + cycle);
+    coverage.publish();
+    const empty = coverage.prepare([]);
+    while (!empty.next().done) {
+      assert.equal(coverage.get(removed), 200 + cycle, 'cleanup lost evidence supporting the displayed snapshot');
+    }
+    assert.equal(coverage.oldest(null), 300 + cycle);
+    assert.equal((coverage as any).latest.size, 0, 'removed source identities accumulated');
+    assert.equal((coverage as any).checks.size, 0, 'removed source evidence accumulated');
+  }
+});
+
+test('warm demotion racing a late append recovers through host checking and reopening', async () => {
+  vi.useFakeTimers();
+  try {
+    const file = normalizeSpendFile(path.join(tempDir('spend-demotion-'), 'source.jsonl'));
+    fs.writeFileSync(file, '');
+    const indexed = indexSpendFile(undefined, file, 'project', createCodexUsageLineReducer).record;
+    const old = Date.now() - 8 * 86_400_000;
+    fs.utimesSync(file, old / 1000, old / 1000);
+    indexed.mtimeMs = readRolloutStat(file)!.mtimeMs;
+    const provider = integrityHostHarness();
+    provider.projectSpendFiles = [indexed];
+    provider.projectSpendVisibleFiles = [indexed];
+    provider.projectSpendSources = () => [{ file, agent: 'codex' }];
+    provider.sessionSpendSources = [{ file, sessionId: 'session-a' }];
+    provider.showing = 'session-a';
+    provider.updateProjectSpendIntegrity([{ file, sessionId: 'session-a', agent: 'codex' }]);
+    provider.startPolling();
+    await vi.advanceTimersByTimeAsync(10);
+    provider.showing = null;
+    provider.updateProjectSpendIntegrity([{ file, sessionId: 'session-a', agent: 'codex' }]);
+    fs.appendFileSync(file, '{}\n');
+    await vi.advanceTimersByTimeAsync(15 * 60_000 + 500);
+    await vi.waitFor(() =>
+      assert.equal(provider.projectSpendVisibleFiles[0].size, 3, 'cold rotation lost the late append'),
+    );
+    provider.stopPolling();
+    fs.appendFileSync(file, '{}\n');
+    provider.show('session-a');
+    await vi.advanceTimersByTimeAsync(10);
+    assert.equal(provider.projectSpendFiles[0].size, 3, 'hidden promotion ran before reopening');
+    provider.startPolling();
+    await vi.advanceTimersByTimeAsync(500);
+    await vi.waitFor(() => assert.equal(provider.projectSpendVisibleFiles[0].size, 6, 'reopening lost promoted work'));
+    provider.stopPolling();
+  } finally {
+    vi.clearAllTimers();
+    vi.useRealTimers();
+  }
+});
+
+test('mixed warm and cold Codex folder retains its watcher and recovers missed child-directory discovery', async () => {
+  vi.useFakeTimers();
+  const nativeWatch = vi.spyOn(mutableFs, 'watch').mockImplementation((() => ({
+    on() {
+      return this;
+    },
+    close() {},
+  })) as any);
+  syncBuiltinESMExports();
+  try {
+    const root = tempDir('spend-mixed-folder-');
+    const folder = path.join(root, '2026', '10', '01');
+    fs.mkdirSync(folder, { recursive: true });
+    const warm = normalizeSpendFile(path.join(folder, 'rollout-warm.jsonl'));
+    const cold = normalizeSpendFile(path.join(folder, 'rollout-cold.jsonl'));
+    for (const file of [warm, cold]) fs.writeFileSync(file, '{}\n');
+    const records = [warm, cold].map(
+      (file) => indexSpendFile(undefined, file, 'project', createCodexUsageLineReducer).record,
+    );
+    const old = Date.now() - 8 * 86_400_000;
+    fs.utimesSync(cold, old / 1000, old / 1000);
+    records[1].mtimeMs = readRolloutStat(cold)!.mtimeMs;
+    const provider = integrityHostHarness();
+    provider.projectSpendFiles = records;
+    provider.projectSpendVisibleFiles = records;
+    let files = [warm, cold];
+    provider.projectSpendSources = () => files.map((file) => ({ file, agent: 'codex' }));
+    provider.showing = 'warm';
+    const sessions = () => files.map((file) => ({ file, sessionId: file === warm ? 'warm' : 'cold', agent: 'codex' }));
+    provider.updateProjectSpendIntegrity(sessions());
+    provider.watchDirectories([folder]);
+    provider.startPolling();
+    await vi.advanceTimersByTimeAsync(20);
+    assert.ok(provider.watchers.has(folder), 'cold membership removed a mixed-folder watcher');
+    const nested = path.join(folder, 'shard');
+    fs.mkdirSync(nested);
+    const discovered = normalizeSpendFile(path.join(nested, 'rollout-new.jsonl'));
+    fs.writeFileSync(discovered, '{}\n');
+    fs.appendFileSync(cold, '{}\n');
+    let discoveries = 0;
+    provider.refreshFrom = async (reason: string) => {
+      if (reason !== 'project-spend-discovery') return;
+      discoveries++;
+      const enumeration = await enumerateRolloutFilesAsync(root);
+      files = [...enumeration!.files];
+      provider.updateProjectSpendIntegrity(sessions());
+      provider.scheduleProjectSpendIndex(new Map(files.map((file) => [file, readRolloutStat(file)!])), null);
+    };
+    await vi.advanceTimersByTimeAsync(15 * 60_000 + 500);
+    await vi.waitFor(() => assert.equal(discoveries, 1));
+    await vi.advanceTimersByTimeAsync(500);
+    assert.ok(provider.projectSpendVisibleFiles.some((record: SpendFileIndex) => record.file === discovered));
+    assert.equal(provider.projectSpendVisibleFiles.find((record: SpendFileIndex) => record.file === cold).size, 6);
+    assert.ok(provider.watchers.has(folder));
+    provider.stopPolling();
+  } finally {
+    nativeWatch.mockRestore();
+    syncBuiltinESMExports();
+    vi.clearAllTimers();
+    vi.useRealTimers();
+  }
+});
+
+test('successful integrity coverage includes unchanged dependencies and survives failures without aggregation', async () => {
+  const record = { file: 'source', size: 10, mtimeMs: 20, sourceIdentity: '1:2', complete: true };
+  const dependency = { ...record, file: 'dependency' };
+  let error: string | null = null;
+  let release: (() => void) | undefined;
+  const provider = completeDiscoveryHarness(
+    undefined,
+    false,
+    ['checkProjectSpendSources', 'publishProjectSpendCoverage'],
+    {
+      normalizeSpendFile: (file: string) => file,
+      fs: {
+        promises: {
+          stat: async () => {
+            if (release !== undefined)
+              await new Promise<void>((resolve) => {
+                release = resolve;
+              });
+            if (error) throw Object.assign(new Error(error), { code: error });
+            return { size: 10, mtimeMs: 20, dev: 1, ino: 2, isFile: () => true };
+          },
+        },
+      },
+    },
+  );
+  provider.spendChecks = new SpendCoverage();
+  provider.spendChecks.set(dependency, 50);
+  provider.spendChecks.discover(['source', 'dependency'], 80);
+  provider.spendChecks.account('source');
+  provider.spendChecks.account('dependency');
+  provider.spendChecks.publish();
+  for (const _step of provider.spendChecks.prepare([record, dependency] as SpendFileIndex[])) {
+  }
+  provider.spendSourcesByFile = new Map([['source', { file: 'source', agent: 'claude' }]]);
+  provider.spendRecordsByFile = new Map([['source', 0]]);
+  provider.projectSpendFiles = [record];
+  provider.projectSpendVisibleFiles = [record, dependency];
+  provider.spendCoverageAt = null;
+  const offers: unknown[] = [];
+  provider.queueProjectSpendIndex = (...args: unknown[]) => offers.push(args);
+  provider.invalidateProjectSpendSnapshot = () => {
+    throw new Error('unchanged checks aggregated');
+  };
+  await provider.checkProjectSpendSources(['source'], () => true);
+  assert.equal(provider.spendCoverageAt, 50);
+  const checked = provider.spendChecks.get(record);
+  error = 'EACCES';
+  await provider.checkProjectSpendSources(['source'], () => true);
+  assert.equal(provider.spendChecks.get(record), checked);
+  assert.equal(provider.spendCoverageAt, 50);
+  assert.equal((offers.at(-1) as any[])[2].length, 0, 'an unreadable source reached indexing');
+  error = 'ENOENT';
+  await provider.checkProjectSpendSources(['source'], () => true);
+  assert.equal((offers.at(-1) as any[])[0].get('source'), null);
+  assert.equal(provider.spendChecks.get(record), checked);
+  error = null;
+  let valid = true;
+  release = () => {};
+  const waiting = provider.checkProjectSpendSources(['source'], () => valid);
+  valid = false;
+  release();
+  const count = offers.length;
+  await waiting;
+  assert.equal(offers.length, count, 'a disposed queue admitted a completed stat');
+  for (const _step of provider.spendChecks.prepare([dependency] as SpendFileIndex[])) {
+  }
+  provider.projectSpendVisibleFiles = [{ ...record }];
+  provider.publishProjectSpendCoverage();
+  assert.equal(provider.spendCoverageAt, 50, 'a waiting rebuild renewed the coverage of the displayed snapshot');
+  for (const _step of provider.spendChecks.prepare([])) {
+  }
+  provider.projectSpendVisibleFiles = [];
+  provider.publishProjectSpendCoverage();
+  assert.equal(provider.spendCoverageAt, 80, 'an empty ledger must use successful discovery coverage');
+});
+
 // Replaces the harness's inert ledger save with the production save methods and scheduler.
 function useLedgerSave(provider: any): void {
   delete provider.flushProjectSpendSave;
@@ -9205,19 +9908,32 @@ for (const ending of ['a changed workspace', 'a disposed provider']) {
   });
 }
 
-test('a hidden panel and a shut tab leave a spend offer running', async () => {
-  const provider = spendOfferHarness();
-  const ran: string[] = [];
-  provider.queueProjectSpendIndex = (revisions: Map<string, string>) => {
-    ran.push(String(revisions.get('mark')));
-  };
-  markedOffer(provider, 'offered');
-  // Hiding or closing a panel leaves workspace spend indexing active.
-
-  provider.hosts = [{ webview: {}, visible: () => false }];
-  provider.readyHosts = new Set();
-
-  await vi.waitFor(() => assert.deepEqual(ran, ['offered']));
+test('a hidden panel retains targeted integrity work until reopening', async () => {
+  vi.useFakeTimers();
+  try {
+    const provider = spendOfferHarness();
+    const ran: string[] = [];
+    provider.spendIntegrity = new IntegrityScheduler(
+      async (files) => {
+        ran.push(...files);
+      },
+      () => {},
+    );
+    provider.queueProjectSpendIndex = () => {
+      throw new Error('hidden integrity work reached indexing');
+    };
+    markedOffer(provider, 'offered');
+    provider.hosts = [{ webview: {}, visible: () => false }];
+    provider.readyHosts = new Set();
+    await vi.advanceTimersByTimeAsync(1);
+    assert.deepEqual(ran, []);
+    provider.spendIntegrity.start();
+    await vi.advanceTimersByTimeAsync(1);
+    assert.deepEqual(ran, ['mark']);
+    provider.spendIntegrity.pause();
+  } finally {
+    vi.useRealTimers();
+  }
 });
 
 test('a restart with an unfinished ledger keeps its settled figures until the offer has run', async () => {
@@ -11527,8 +12243,8 @@ test('the lifetime figures a pass built from settled files do not outlive the pa
   provider.projectSpendIndexing = false;
   assert.deepEqual(
     provider.lifetimeRailFacts(),
-    { a: walking },
-    'the figures a pass built from the files it had settled are served after the pass ends',
+    { a: settled },
+    'incomplete replacement figures remain held after the pass ends',
   );
 });
 
@@ -12111,7 +12827,7 @@ test('a spend pass that settles a new cost posts a rail with that cost', () => {
   }
 });
 
-test('running agents that only grow their transcripts start no refresh from a spend pass and save on the maximum wait', () => {
+test('running agents that only grow their transcripts start no refresh from a spend pass and save on the maximum wait', async () => {
   vi.useFakeTimers();
   try {
     // Three sessions append while five remain idle. The simulated disk supplies current stats and complete reads.
@@ -12160,6 +12876,7 @@ test('running agents that only grow their transcripts start no refresh from a sp
         createClaudeUsageLineReducer: () => null,
         createCodexUsageLineReducer: () => null,
         fs: {
+          promises: { stat: async (file: string) => ({ ...disk.get(file)! }) },
           statSync: (file: string) => {
             const stat = disk.get(file);
             assert.ok(stat, `the indexer stated ${file}, which no agent writes`);
@@ -12248,7 +12965,7 @@ test('running agents that only grow their transcripts start no refresh from a sp
     // Startup restores the ledger, and its first pass reads every transcript once.
     provider.hydrateProjectSpend('project', provider.refreshGeneration, null);
     // No agent writes yet, so every timer left is the pass and the ledger save it offered.
-    vi.runAllTimers();
+    await vi.runAllTimersAsync();
     assert.equal(provider.projectSpendBusy(), false, 'the first pass after the ledger was restored never settled');
     assert.equal(
       passRefreshes,
@@ -12278,7 +12995,7 @@ test('running agents that only grow their transcripts start no refresh from a sp
     const [savesBefore, changesBefore] = [saves, changes.length];
     const [lifetimeBefore, railBefore] = [lifetimeRecalculated.length, railRecalculated.length];
     const appendsFrom = Date.now();
-    vi.advanceTimersByTime(seconds * 1_000);
+    await vi.advanceTimersByTimeAsync(seconds * 1_000);
     const perSecond = (count: number) => (count / seconds).toFixed(1);
     assert.ok(events >= seconds * 9, `the agents appended only ${events} times`);
     assert.equal(
@@ -13581,6 +14298,7 @@ test.each([
     provider.projectSpendQueue = [];
     provider.projectSpendQueued = new Set();
     provider.queueProjectSpendIndex = () => {};
+    provider.scheduleProjectSpendIndex = () => {};
     provider.invalidateProjectSpendSnapshot();
     await vi.runAllTimersAsync();
     vi.setSystemTime(new Date(start));

@@ -1,3 +1,4 @@
+import { revisionOf } from './transcript';
 import { meterRead } from './readmeter';
 import { combineCacheExpirySummaries, combineCacheExpiryAmounts } from './cacheexpirysummary';
 import crypto from 'node:crypto';
@@ -140,6 +141,7 @@ export interface ProjectUsageBucket {
 }
 
 export interface SpendFileIndex {
+  sourceIdentity?: string;
   costStateSupplement?: ClaudeCostSupplement;
   costStateProgress?: ClaudeCostProgress;
   file: string;
@@ -504,6 +506,7 @@ export function projectSpendHistoryCutoff(historyDays: number, now: number): num
 }
 
 export interface SpendSourceRevision {
+  sourceIdentity?: string;
   size: number;
   mtimeMs: number;
 }
@@ -1986,13 +1989,27 @@ export function indexSpendFile<State>(
   const normalizedWorkspace = normalizeWorkspace(workspace);
   const emptyReducer = makeReducer(undefined);
   const parserKind = emptyReducer.parserKind;
-  let stat: fs.Stats;
+  let stat: ReturnType<typeof revisionOf>;
   try {
-    stat = fs.statSync(file);
-    if (!stat.isFile()) {
+    const physical = fs.statSync(file, { bigint: true });
+    stat = revisionOf(physical);
+    if (!physical.isFile()) {
       throw new Error('not a file');
     }
-  } catch {
+  } catch (error) {
+    if (!['ENOENT', 'ENOTDIR'].includes((error as NodeJS.ErrnoException).code ?? '')) {
+      if (previous)
+        return {
+          record: previous,
+          totalsChanged: false,
+          stateChanged: false,
+          changed: false,
+          rebuilt: false,
+          found: false,
+          complete: true,
+        };
+      throw error;
+    }
     invalidateSpendFileNormalization(file);
     const record =
       previous && previous.file === normalizedFile
@@ -2025,12 +2042,14 @@ export function indexSpendFile<State>(
     previous &&
     previous.file === normalizedFile &&
     previous.workspace === normalizedWorkspace &&
-    (parserKind === undefined || previous.parserKind === parserKind);
+    (parserKind === undefined || previous.parserKind === parserKind) &&
+    (previous.sourceIdentity === undefined || previous.sourceIdentity === `${stat.dev}:${stat.ino}`);
   const lifetimeReady = reusable && spendRecordHasLifetimeFacts(previous);
   const policyChanged =
     parserKind === 'claude' && previous?.cacheExpiryChildPolicy !== (emptyReducer.nativeChildRequests?.() === true);
   const unchanged =
     lifetimeReady &&
+    previous.sourceIdentity === `${stat.dev}:${stat.ino}` &&
     previous.complete !== false &&
     previous.missingAt === undefined &&
     (parserKind !== 'claude' || previous.cacheExpiryChildPolicy === (emptyReducer.nativeChildRequests?.() === true)) &&
@@ -2101,6 +2120,7 @@ export function indexSpendFile<State>(
   }
   const buckets = scanned.buckets;
   const record: SpendFileIndex = {
+    sourceIdentity: `${stat.dev}:${stat.ino}`,
     file: normalizedFile,
     workspace: normalizedWorkspace,
     size: stat.size,
@@ -3595,6 +3615,127 @@ export function sessionRailFactsBySession(
   return out;
 }
 
+// Successful evidence survives accounting-only copies of the same physical revision.
+export class SpendCoverage {
+  private checks = new Map<string, number>();
+  private latest = new Map<string, string>();
+  private displayed = { heap: [] as { key: string; at: number }[], positions: new Map<string, number>() };
+  private preparing: typeof this.displayed | null = null;
+  private members = new Set<string>();
+  private pending = new Set<string>();
+  private membership = 0;
+  private displayedMembership = 0;
+  private publishedMembership = 0;
+  private needsPublication = false;
+  discoveryAt: number | null = null;
+
+  private key(record: SpendFileIndex): string {
+    return JSON.stringify([record.file, record.sourceIdentity, record.size, record.mtimeMs, record.missingAt]);
+  }
+
+  get(record: SpendFileIndex): number | undefined {
+    const key = this.key(record);
+    const position = this.displayed.positions.get(key);
+    const displayed = position === undefined ? undefined : this.displayed.heap[position].at;
+    return this.checks.get(key) ?? (displayed === -Infinity ? undefined : displayed);
+  }
+
+  set(record: SpendFileIndex, at: number): void {
+    const key = this.key(record);
+    const previous = this.latest.get(record.file);
+    if (previous && !this.displayed.positions.has(previous) && !this.preparing?.positions.has(previous))
+      this.checks.delete(previous);
+    this.latest.set(record.file, key);
+    this.checks.set(key, at);
+    for (const index of [this.displayed, this.preparing]) {
+      if (index?.positions.has(key)) this.update(index, key, at);
+    }
+  }
+
+  discover(files: Iterable<string>, at: number): void {
+    const members = new Set(files);
+    if (members.size !== this.members.size || [...members].some((file) => !this.members.has(file))) {
+      this.membership++;
+      for (const file of members) if (!this.members.has(file)) this.pending.add(file);
+      for (const file of this.pending) if (!members.has(file)) this.pending.delete(file);
+      this.members = members;
+    }
+    this.discoveryAt = at;
+  }
+
+  account(file: string, omitted = false): void {
+    if (this.pending.delete(file) && !omitted) this.needsPublication = true;
+    if (!this.pending.size && !this.needsPublication) {
+      this.publishedMembership = this.membership;
+      this.displayedMembership = this.membership;
+    }
+  }
+
+  publish(): void {
+    if (!this.pending.size) this.publishedMembership = this.membership;
+  }
+
+  *prepare(files: readonly SpendFileIndex[]): Generator<void> {
+    const membership = this.publishedMembership;
+    const index: typeof this.displayed = { heap: [], positions: new Map() };
+    this.preparing = index;
+    for (const record of files) {
+      this.update(index, this.key(record), this.get(record) ?? -Infinity);
+      yield;
+    }
+    const latest = new Set<string>();
+    for (const [file, key] of this.latest) {
+      if (this.members.has(file) || index.positions.has(key)) latest.add(key);
+      else this.latest.delete(file);
+      yield;
+    }
+    for (const key of this.checks.keys()) {
+      if (!index.positions.has(key) && !latest.has(key)) this.checks.delete(key);
+      yield;
+    }
+    this.displayed = index;
+    this.preparing = null;
+    if (!this.pending.size) {
+      this.displayedMembership = membership;
+      if (membership === this.membership) this.needsPublication = false;
+    }
+  }
+
+  oldest(previous: number | null): number | null {
+    if (this.displayedMembership !== this.membership) return previous;
+    const at = Math.min(this.discoveryAt ?? -Infinity, this.displayed.heap[0]?.at ?? Infinity);
+    return Number.isFinite(at) ? at : null;
+  }
+
+  private update(index: typeof this.displayed, key: string, at: number): void {
+    let position: number = index.positions.get(key) ?? index.heap.length;
+    if (position === index.heap.length) {
+      index.heap.push({ key, at });
+      index.positions.set(key, position);
+    } else index.heap[position].at = at;
+    const swap = (a: number, b: number): void => {
+      [index.heap[a], index.heap[b]] = [index.heap[b], index.heap[a]];
+      index.positions.set(index.heap[a].key, a);
+      index.positions.set(index.heap[b].key, b);
+    };
+    while (position > 0) {
+      const parent = (position - 1) >>> 1;
+      if (index.heap[parent].at <= index.heap[position].at) break;
+      swap(parent, position);
+      position = parent;
+    }
+    for (;;) {
+      const left = position * 2 + 1;
+      if (left >= index.heap.length) break;
+      const right = left + 1;
+      const child = right < index.heap.length && index.heap[right].at < index.heap[left].at ? right : left;
+      if (index.heap[position].at <= index.heap[child].at) break;
+      swap(position, child);
+      position = child;
+    }
+  }
+}
+
 export function projectSpendDisplayFiles(
   indexing: boolean,
   resumable: readonly SpendFileIndex[],
@@ -3604,13 +3745,10 @@ export function projectSpendDisplayFiles(
 }
 
 export function sessionLifetimeDisplayFiles(
-  indexing: boolean,
+  _indexing: boolean,
   resumable: readonly SpendFileIndex[],
   complete: readonly SpendFileIndex[],
 ): readonly SpendFileIndex[] {
-  if (!indexing) {
-    return resumable;
-  }
   const fallback = new Map(complete.map((record) => [record.file, record]));
   return resumable.map((record) => (record.complete === false ? (fallback.get(record.file) ?? record) : record));
 }

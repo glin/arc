@@ -1,4 +1,6 @@
+import { syncBuiltinESMExports } from 'node:module';
 import { describe, test, vi } from 'vitest';
+import { IntegrityScheduler } from './scheduler';
 import {
   costStateDependency,
   matchingCostSupplementSteps,
@@ -162,6 +164,67 @@ const reducer: UsageReducerFactory<ClaudeUsageReducerState> = (state) => {
     }),
   };
 };
+
+test('a cold archived source gains terminal usage after a missed watcher append', async () => {
+  vi.useFakeTimers();
+  try {
+    vi.setSystemTime(new Date('2026-10-21T12:00:00Z'));
+    const root = tempDir('spend-cold-resume-');
+    const file = path.join(root, 'session.jsonl');
+    const at = Date.now();
+    fs.writeFileSync(file, JSON.stringify(event(at, { reportedCost: 1 })) + '\n');
+    fs.utimesSync(file, (at - 8 * 86_400_000) / 1000, (at - 8 * 86_400_000) / 1000);
+    let record = indexSpendFile(undefined, file, root, reducer, at).record;
+    let checks = 0;
+    const scheduler = new IntegrityScheduler(
+      async (files, current) => {
+        for (const source of files) {
+          await fs.promises.stat(source);
+          if (!current()) return;
+          record = indexSpendFile(record, source, root, reducer).record;
+          checks++;
+        }
+      },
+      () => {},
+    );
+    scheduler.update([{ file, warm: false }]);
+    scheduler.start();
+    await vi.advanceTimersByTimeAsync(1);
+    fs.appendFileSync(file, JSON.stringify(event(at + 1000, { reportedCost: 2 })) + '\n');
+    fs.utimesSync(file, (at + 1000) / 1000, (at + 1000) / 1000);
+    await vi.advanceTimersByTimeAsync(15 * 60_000);
+    await vi.waitFor(() => assert.equal(checks, 1));
+    assert.equal(
+      record.buckets.reduce((sum, bucket) => sum + (bucket.reportedCost ?? 0), 0),
+      3,
+    );
+    scheduler.pause();
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test.each(['EACCES', 'EPERM', 'EBUSY', 'EIO'])(
+  'a %s source check retains completed spend without reporting absence',
+  (code) => {
+    const root = tempDir('spend-locked-');
+    const file = path.join(root, 'session.jsonl');
+    fs.writeFileSync(file, '');
+    const previous = indexSpendFile(undefined, file, root, reducer, 100).record;
+    const stat = vi.spyOn(fs, 'statSync').mockImplementation(() => {
+      throw Object.assign(new Error(code), { code });
+    });
+    try {
+      const result = indexSpendFile(previous, file, root, reducer, 200);
+      assert.equal(result.record, previous);
+      assert.equal(result.record.missingAt, undefined);
+      assert.equal(result.stateChanged, false);
+      assert.equal(result.found, false);
+    } finally {
+      stat.mockRestore();
+    }
+  },
+);
 const stamp = (value: string) => new Date(value).getTime();
 
 test('literal native spend generation 30 rebuilds an unchanged zero-usage decision', () => {
@@ -5877,6 +5940,104 @@ describe('Claude background cost accounting', () => {
       maxWorkingSetBytes: 1 << 20,
     };
   };
+
+  test.each(['win32', 'darwin', 'linux'] as const)(
+    'dependency replacement with unchanged size and time rejects supplement on %s',
+    (platform) => {
+      const fixture = indexCompactionSession([clock(), snapshot(120)], [answer('child', at, 100, true)]);
+      const dependency = fixture.records[1];
+      const originalPath = dependency.file;
+      const acceptedPath =
+        platform === 'win32'
+          ? 'C:/Work/Child.jsonl'
+          : platform === 'darwin'
+            ? '/Users/Work/Child.jsonl'
+            : '/home/Work/Child.jsonl';
+      const identityA = '9007199254740992';
+      const identityB = '9007199254740993';
+      dependency.file = acceptedPath;
+      dependency.sourceIdentity = `1:${identityA}`;
+      const originalStat = fs.statSync;
+      const originalOpen = fs.openSync;
+      const originalFstat = fs.fstatSync;
+      const acceptedPhysical = originalStat(originalPath, { bigint: true });
+      const originalBytes = fs.readFileSync(originalPath, 'utf8');
+      const replacementBytes = originalBytes.replace('"input_tokens":100', '"input_tokens":900');
+      assert.notEqual(replacementBytes, originalBytes);
+      assert.equal(Buffer.byteLength(replacementBytes), dependency.size);
+      let replacement = false;
+      let replaceAtClose = false;
+      const descriptorFiles = new Map<number, string>();
+      const revision = (_file: string) => ({
+        size: acceptedPhysical.size,
+        mtimeMs: acceptedPhysical.mtimeMs,
+        mtimeNs: acceptedPhysical.mtimeNs,
+        dev: 1n,
+        ino: BigInt(replacement ? identityB : identityA),
+        isFile: () => true,
+      });
+      const stat = vi.spyOn(fs, 'statSync').mockImplementation(((file: any, options: any) =>
+        file === acceptedPath
+          ? options?.bigint
+            ? revision(originalPath)
+            : {
+                size: dependency.size,
+                mtimeMs: dependency.mtimeMs,
+                dev: 1,
+                ino: Number(replacement ? identityB : identityA),
+              }
+          : originalStat(file, options)) as typeof fs.statSync);
+      const open = vi.spyOn(fs, 'openSync').mockImplementation(((file: any, flags: any) => {
+        const fd = originalOpen(file === acceptedPath ? originalPath : file, flags);
+        descriptorFiles.set(fd, String(file));
+        return fd;
+      }) as typeof fs.openSync);
+      const fstat = vi
+        .spyOn(fs, 'fstatSync')
+        .mockImplementation(((fd: number, options: any) =>
+          descriptorFiles.get(fd) === acceptedPath
+            ? revision(originalPath)
+            : originalFstat(fd, options)) as typeof fs.fstatSync);
+      const originalClose = fs.closeSync;
+      const close = vi.spyOn(fs, 'closeSync').mockImplementation((fd) => {
+        originalClose(fd);
+        if (replaceAtClose && descriptorFiles.get(fd) === acceptedPath) {
+          replacement = true;
+          fs.writeFileSync(originalPath, replacementBytes);
+        }
+        descriptorFiles.delete(fd);
+      });
+      syncBuiltinESMExports();
+      try {
+        const accepted = replay(fixture);
+        assert.ok(accepted.supplement, 'accepted identity A did not publish');
+        const complete = fixture.records[0];
+        const total = tokens(sessionSpendPartsBySession(fixture.records, fixture.sources).s.map((part) => part.bucket));
+        fs.writeFileSync(originalPath, replacementBytes);
+        replacement = true;
+        const rejected = replay(fixture);
+        assert.equal(rejected.invalidated, true, 'identity B bytes were admitted under identity A');
+        assert.equal(rejected.supplement, undefined);
+        assert.equal(fixture.records[0], complete);
+        assert.equal(
+          tokens(sessionSpendPartsBySession(fixture.records, fixture.sources).s.map((part) => part.bucket)),
+          total,
+        );
+        fs.writeFileSync(originalPath, originalBytes);
+        replacement = false;
+        replaceAtClose = true;
+        const changedAfterRead = replay(fixture);
+        assert.equal(changedAfterRead.invalidated, true, 'final dependency admission missed replacement B');
+        assert.equal(changedAfterRead.supplement, undefined);
+      } finally {
+        stat.mockRestore();
+        open.mockRestore();
+        fstat.mockRestore();
+        close.mockRestore();
+        syncBuiltinESMExports();
+      }
+    },
+  );
 
   test('an expired cost-state slice advances without buffering the transcript', () => {
     const filler = Array.from({ length: 5000 }, (_, index) => clock(at - 10_000 + index));

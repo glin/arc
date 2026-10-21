@@ -56,8 +56,8 @@
   },
   "extension/src/codex.test.ts": {
     "reason": "Real Git worktree ownership and descendant source resolution must agree with recorded Codex session relationships.",
-    "cases": 465,
-    "matricesSha256": "84767d275283398f025956bacb622871ef2ac81f6c1341e206c233e5cb32397e"
+    "cases": 466,
+    "matricesSha256": "e8b360871686a25bae853883283a692915c94df4c22f707dcc3b8ba71f8da1a0"
   },
   "extension/src/derivedcache.test.ts": {
     "reason": "Independent writers and host death must preserve shared cache rows and release stale filesystem locks.",
@@ -127,7 +127,7 @@
   "extension/src/panel.webview.test.ts": {
     "reason": "Real progressive workers must deliver bounded recovery and metadata through the production panel host.",
     "cases": 608,
-    "matricesSha256": "63fd2a0aa0ebf609ba2d08cb849d86ffb9d15491f8b4523b9c887ecfd5d6e4d7"
+    "matricesSha256": "9d83819839f0d2cd60b938b7805630bb40d3810c4a06bb2fae1e00458a8a77e0"
   },
   "extension/src/panelbundle.test.ts": {
     "reason": "The panel bundle and fixture must contain the production entry, source identity, and substituted text.",
@@ -147,7 +147,7 @@
   "extension/src/projectspend.browser.test.ts": {
     "reason": "Project spend controls must preserve rendered interaction, session navigation, and keyboard access.",
     "cases": 12,
-    "matricesSha256": "adcf7721f1f39de4f7ca5cb9e5813fdf2b2d2f65d84af120edf779202aaa6668"
+    "matricesSha256": "f48c3736bef89a0129bd694e3c08a43f81d0446dc6512c67a93f44c6f72ea356"
   },
   "extension/src/rail.editors.browser.test.ts": {
     "reason": "Session-list editors must preserve browser focus, submission, and keyboard cancellation.",
@@ -171,7 +171,7 @@
   },
   "extension/src/sessiondiscovery.test.ts": {
     "reason": "Real window listeners and registry discovery must preserve ownership, reachability, and partial listing across native IPC.",
-    "cases": 22,
+    "cases": 23,
     "matricesSha256": "902389ca5d661c4efc93dd17fa5e069e60b03d45703635758c5477dbb8ed0eda"
   },
   "extension/src/sessionrequests.test.ts": {
@@ -190,9 +190,9 @@
     "matricesSha256": "b2a4c3552a9fdd99d3be4a6e1515bc834b857c078f1059c8fbdf75ef50132b39"
   },
   "extension/src/startup.test.ts": {
-    "reason": "Real title workers must publish recovered metadata through startup ownership and cancellation boundaries. Project cost snapshots must preserve workspace, revision, and calendar ownership during background slices. Agent messages must preserve durable admission, settlement wakeups, native delivery authority, and retained retries.",
-    "cases": 233,
-    "matricesSha256": "b1e62e224043da67fa869548dbad7cdb3463b0d726f9309192cf06a6d5451599"
+    "reason": "Real title workers must publish recovered metadata through startup ownership and cancellation boundaries. Project cost snapshots must preserve workspace, revision, and calendar ownership during background slices. Agent messages must preserve durable admission, settlement wakeups, native delivery authority, and retained retries. Host integrity checks must preserve complete cost, discovery membership, exact revisions, and bounded coverage across failures and panel lifecycle changes.",
+    "cases": 243,
+    "matricesSha256": "3f6adc5a1becd731c08180e5391a723ed38da9941cb5dd244dd48284bf8bd213"
   },
   "extension/src/store.test.ts": {
     "reason": "The real Stop hook must renew retention for useful snapshot stores without changing workspace files.",

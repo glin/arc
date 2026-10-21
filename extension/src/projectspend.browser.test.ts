@@ -1299,7 +1299,13 @@ test('the indexing word waits for a run worth reading and then holds the box sti
       indexingStatus: string | null = PROJECT_SPEND_INDEXING_WORD,
       moved: Record<string, unknown> = {},
     ): Promise<void> => {
-      const spend = { ...PROJECT_SPEND, indexing, indexingStatus, ...moved };
+      const spend = {
+        ...PROJECT_SPEND,
+        lastIndexedAt: indexing ? null : PROJECT_SPEND.lastIndexedAt,
+        indexing,
+        indexingStatus,
+        ...moved,
+      };
       await page.evaluate(`window.postMessage(${JSON.stringify({ type: 'projectSpend', projectSpend: spend })}, '*')`);
       await page.evaluate(SETTLED);
     };
@@ -1391,7 +1397,7 @@ test('the indexing word waits for a run worth reading and then holds the box sti
 
     // The indexing word outlasts a drained queue to prevent flicker between transcript writes.
 
-    await post(false, null);
+    await post(false, null, { lastIndexedAt: null });
     const drained = (await page.evaluate(READ)) as Meta;
     assert.equal(
       drained.word,
@@ -1401,6 +1407,7 @@ test('the indexing word waits for a run worth reading and then holds the box sti
 
     await page.clock.fastForward(INDEXING_HOLD_MS + 300);
     await page.evaluate(SETTLED);
+    await post(false, null);
     const quiet = (await page.evaluate(READ)) as Meta;
     assert.equal(
       quiet.word,
@@ -1460,7 +1467,7 @@ test('the indexing word waits for a run worth reading and then holds the box sti
     assert.equal(second.word, sent, `the popover says "${second.word}" while the extension is sending "${sent}"`);
     // Retain the host's last indexing wording while the hold remains active after indexing ends.
 
-    await post(false, '', { earliestRecord: '2026-08-04' });
+    await post(false, '', { earliestRecord: '2026-08-04', lastIndexedAt: null });
     const held = (await page.evaluate(READ)) as Meta;
     assert.equal(held.word, sent, `the popover holds "${held.word}" after a run the extension last worded "${sent}"`);
 
@@ -1529,7 +1536,7 @@ test('a Project cost message that moved nothing leaves both surfaces standing', 
     page.on('pageerror', (e) => failures.push(String(e)));
     await page.setContent(pageHtml());
     await layoutAt(page, 1350);
-    // Disable indexing so its timer cannot alter the dialog between payload checks.
+    await page.clock.install({ time: NOW });
 
     const still = { ...PROJECT_SPEND, indexing: false };
     const post = async (spend: unknown): Promise<void> => {
@@ -1584,6 +1591,23 @@ test('a Project cost message that moved nothing leaves both surfaces standing', 
       /^Updated (?:now|\d+(?:m|h|d|w|mo|y) ago)$/,
       `the age reads "${after.text}" after an index time arrived on a box that was not rebuilt`,
     );
+
+    for (const indexing of [true, false, true]) {
+      await post({
+        ...still,
+        indexing,
+        indexingStatus: indexing ? PROJECT_SPEND_INDEXING_WORD : null,
+        lastIndexedAt: indexedAt,
+      });
+      await page.clock.fastForward(INDEXING_SHOW_MS + INDEXING_HOLD_MS + 1);
+      await page.waitForFunction(
+        `document.querySelector('#projectspendpop [data-project-spend-at]')?.getAttribute('data-project-spend-at') === '${indexedAt}'`,
+        undefined,
+        { timeout: 1000 },
+      );
+      assert.equal((await page.evaluate<Age>(AGE)).at, String(indexedAt));
+      assert.deepEqual(await page.evaluate(MARKS), { face: 'face', box: 'box', age: 'age' });
+    }
 
     // A changed cost updates the text while retaining keyed elements.
 

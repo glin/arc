@@ -10879,7 +10879,7 @@ test("the host counts a dispatched session in its parent's cost once and files i
     projectSpendQueued: Set<string>;
     projectSpendTick: unknown;
     scheduleProjectSpendIndex(listed: ReadonlyMap<string, unknown>, only: null): void;
-    queueProjectSpendIndex(): void;
+    queueProjectSpendIndex(revisions?: ReadonlyMap<string, { size: number; mtimeMs: number }>): void;
     restartProjectSpendOffer(): void;
   };
   const whole = { dollars: parent, partial: false };
@@ -10887,15 +10887,17 @@ test("the host counts a dispatched session in its parent's cost once and files i
   (waiting as unknown as { postRail(): void }).postRail();
   assert.deepEqual(rail, [whole], 'the rail drew a lower bound for a skipped child while an offer waited');
   await vi.waitFor(() => assert.equal(waiting.projectSpendOffers.size, 0));
+  await vi.waitFor(() => assert.equal(waiting.projectSpendTick, null));
   assert.equal(waiting.projectSpendQueued.size, 0, 'the offer queued a child the history limit skips');
   assert.deepEqual(rail, [whole], 'the offer redrew the rail with no figure moved');
   // Hold the queued child by supplying an existing tick.
   waiting.projectSpendTick = {};
   age('child', cutoff * 2);
-  waiting.queueProjectSpendIndex();
+  waiting.queueProjectSpendIndex(new Map(records.map((record) => [record.file, fs.statSync(record.file)])));
   assert.deepEqual(rail.at(-1), { dollars: parent, partial: true }, 'a queued child drew no lower bound on the rail');
   age('child', cutoff / 10);
   waiting.restartProjectSpendOffer();
+  await vi.waitFor(() => assert.deepEqual(rail.at(-1), whole));
   assert.deepEqual(rail.at(-1), whole, 'the rail kept the lower bound after the ledger let the child go');
 
   // Finishing ledger indexing refreshes the session list after a selection render reads the changed figures.
@@ -14032,7 +14034,7 @@ test('a history-limit change restarts the project cost offer pass', () => {
   );
   sourceMatch(
     panelHostSource,
-    /private restartProjectSpendOffer\(\): void \{[\s\S]*?projectSpendQueue = \[\];[\s\S]*?queueProjectSpendIndex\(\);/,
+    /private restartProjectSpendOffer\(\): void \{[\s\S]*?projectSpendQueue = \[\];[\s\S]*?scheduleProjectSpendIndex\(new Map\(\), null\);/,
     'restartProjectSpendOffer does not clear and requeue the project cost offer pass',
   );
 });
@@ -27721,8 +27723,7 @@ test('a parent activity refresh that finds grown child usage still offers the ch
     });
     await provider.refresh(true, true);
     await Promise.all(fixture.refreshes);
-    await vi.advanceTimersByTimeAsync(10);
-    assert.ok(indexed.includes(childFile), 'the first offer skipped the child transcript');
+    await vi.waitFor(() => assert.ok(indexed.includes(childFile), 'the first offer skipped the child transcript'));
     indexed.length = 0;
 
     // The child appends usage. Parent activity refreshes first, and its discovery reads the
@@ -27732,10 +27733,13 @@ test('a parent activity refresh that finds grown child usage still offers the ch
     await wake();
     provider.wakeFromWatch(directory, 'child.jsonl', 'change');
     await wake();
-    assert.ok(
-      indexed.includes(childFile),
-      'child usage that a parent refresh discovered never reached Project cost indexing',
+    await vi.waitFor(() =>
+      assert.ok(
+        indexed.includes(childFile),
+        'child usage that a parent refresh discovered never reached Project cost indexing',
+      ),
     );
+    provider.spendIntegrity?.pause();
   } finally {
     vi.useRealTimers();
     vi.unstubAllEnvs();
@@ -27926,7 +27930,9 @@ test('the panel watches transcript paths and hands each burst to the bounded sch
 test('quiet polls do not walk every Project cost source', () => {
   const refresh = memberFrom(panelHostSource, panelHostSource.indexOf('async refresh('));
   const body = refresh;
-  const signature = body.indexOf('const sourceSignature = spendSourceSignature(listed);');
+  const signature = body.indexOf(
+    'const sourceSignature = selectedOnly ? this.lastSpendSourceSignature : spendSourceSignature(listed);',
+  );
   const queue = body.indexOf('this.scheduleProjectSpendIndex(');
   assert.ok(
     signature >= 0 && queue > signature,
@@ -27934,13 +27940,13 @@ test('quiet polls do not walk every Project cost source', () => {
   );
   sourceMatch(
     body,
-    /if \(projectSpendSourceOfferDue\(sourcesMoved, now, this\.projectSpendLastOfferAt\)\) \{[\s\S]*this\.scheduleProjectSpendIndex\(/,
+    /if \(this\.projectSpendHydrated && sourcesMoved\) \{[\s\S]*this\.scheduleProjectSpendIndex\(/,
     'an unchanged poll still offers every Project cost source',
   );
   // Spend-source scheduling uses spendSourceSignature rather than listingSignature.
   sourceMatch(
     body,
-    /const sourceSignature = spendSourceSignature\(listed\);\s*const signature = listingSignature\(listed\);/,
+    /const sourceSignature = selectedOnly \? this\.lastSpendSourceSignature : spendSourceSignature\(listed\);\s*listed\.sourceSignature = sourceSignature;\s*const signature = listingSignature\(listed\);/,
     'the two signatures no longer read the same facts, so they can disagree about what moved',
   );
   // Supply trustedListedRevisions with catalog-walk status and selected identity.
@@ -27957,7 +27963,7 @@ test('quiet polls do not walk every Project cost source', () => {
   const completed = indexer.slice(completedAt, completedEnd);
   sourceMatch(
     completed,
-    /fs\.statSync\(next\.file\)/,
+    /fs\.statSync\(next\.file, \{ bigint: true \}\)/,
     'a source that grows during its bounded read waits for the broad integrity pass',
   );
   sourceDoesNotMatch(completed, /queueProjectSpendIndex/, 'completing one source walks every source again');

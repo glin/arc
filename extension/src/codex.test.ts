@@ -17695,3 +17695,13 @@ test('expired dispatched Codex deadlines grant one useful advancement across sho
     retainCodexDispatchSpendRoots(new Set());
   }
 });
+test('fresh integrity revisions replace held cold listing stats', () => {
+  const stale = { size: 1, mtimeMs: 1, isFile: true };
+  const fresh = { size: 2, mtimeMs: 2, isFile: true };
+  const read = vi.fn<() => typeof stale>(() => stale);
+  const cache = new CodexStatCache(read, () => 1_000_000);
+  assert.equal(cache.get('cold.jsonl'), stale);
+  cache.accept('cold.jsonl', fresh);
+  assert.equal(cache.get('cold.jsonl'), fresh);
+  assert.equal(read.mock.calls.length, 1);
+});

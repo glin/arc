@@ -9,7 +9,37 @@ import { syncBuiltinESMExports } from 'node:module';
 import * as path from 'node:path';
 import { afterEach, test, vi } from 'vitest';
 import { tempDir } from './temproot.ts';
+import { IntegrityScheduler } from './scheduler';
+import { enumerateRolloutFilesAsync } from './codex';
 import { requestWindow } from './sessionrequests.ts';
+
+test('cold integrity discovery finds a new directory after missed watcher events', async () => {
+  vi.useFakeTimers();
+  try {
+    const root = tempDir('cold-discovery-');
+    let discovery: Promise<Awaited<ReturnType<typeof enumerateRolloutFilesAsync>>> | undefined;
+    const scheduler = new IntegrityScheduler(
+      async () => {},
+      () => {
+        discovery = enumerateRolloutFilesAsync(root);
+      },
+    );
+    scheduler.start();
+    await vi.advanceTimersByTimeAsync(1);
+    const directory = path.join(root, '2026', '01', '01', 'Shard');
+    fs.mkdirSync(directory, { recursive: true });
+    const file = path.join(directory, 'rollout-terminal-resume.jsonl');
+    fs.writeFileSync(file, '{}\n');
+    await vi.advanceTimersByTimeAsync(15 * 60_000);
+    assert.ok(discovery);
+    const result = await discovery;
+    assert.equal(result?.status, 'complete');
+    assert.deepEqual(result?.files, [file]);
+    scheduler.pause();
+  } finally {
+    vi.useRealTimers();
+  }
+});
 import {
   discoverWindows,
   hostAddress,

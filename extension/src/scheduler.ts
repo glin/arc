@@ -99,6 +99,132 @@ export class BoundedTrailingScheduler {
   }
 }
 
+export interface IntegritySource {
+  file: string;
+  warm: boolean;
+}
+
+// Periodic passes retain their position while targeted work arrives. All lanes share one batch.
+export class IntegrityScheduler {
+  private sources: readonly IntegritySource[] = [];
+  private promoted = new Map<string, number>();
+  private pending = new Set<string>();
+  private passes: ({ files: string[]; offset: number; owed: boolean } | undefined)[] = [];
+  private deadlines = [0, 0];
+  private timer: unknown | null = null;
+  private active = false;
+  private generation = 0;
+  private running = false;
+  private lane = 0;
+
+  constructor(
+    private readonly check: (files: readonly string[], current: () => boolean) => Promise<void>,
+    private readonly discover: () => void,
+    private readonly clock: SchedulerClock = systemClock,
+    private readonly batchSize = 16,
+  ) {}
+
+  update(sources: readonly IntegritySource[]): void {
+    this.sources = sources;
+  }
+
+  promote(files: Iterable<string>): void {
+    for (const file of files) {
+      this.promoted.set(file, this.clock.now());
+      this.pending.add(file);
+    }
+    if (this.timer !== null) this.clock.clearTimer(this.timer);
+    this.timer = null;
+    this.wake();
+  }
+
+  start(): void {
+    if (this.active) return;
+    this.active = true;
+    this.deadlines = [this.clock.now(), this.clock.now() + 15 * 60_000];
+    this.wake();
+  }
+
+  pause(): void {
+    this.active = false;
+    this.generation++;
+    if (this.timer !== null) this.clock.clearTimer(this.timer);
+    this.timer = null;
+    this.passes = [];
+  }
+
+  private warm(source: IntegritySource): boolean {
+    return source.warm || this.clock.now() - (this.promoted.get(source.file) ?? -Infinity) < 7 * 86_400_000;
+  }
+
+  private wake(): void {
+    if (!this.active || this.timer !== null || this.running) return;
+    this.timer = this.clock.setTimer(() => {
+      this.timer = null;
+      void this.run();
+    }, 0);
+  }
+
+  private async run(): Promise<void> {
+    if (!this.active || this.running) return;
+    this.running = true;
+    const generation = this.generation;
+    const current = () => this.active && generation === this.generation;
+    try {
+      for (let lane = 0; lane < 2; lane++) {
+        if (this.clock.now() < this.deadlines[lane]) continue;
+        this.deadlines[lane] = this.clock.now() + (lane === 0 ? 30_000 : 15 * 60_000);
+        const pass = this.passes[lane];
+        if (pass) pass.owed = true;
+        else this.passes[lane] = this.pass(lane);
+        if (lane === 1) this.discover();
+      }
+      let files: string[] = [];
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const lane = this.lane++ % 3;
+        if (lane === 2) {
+          for (const file of this.pending) {
+            files.push(file);
+            this.pending.delete(file);
+            if (files.length === this.batchSize) break;
+          }
+        } else {
+          const pass = this.passes[lane];
+          if (!pass) continue;
+          files = pass.files.slice(pass.offset, pass.offset + this.batchSize);
+          pass.offset += files.length;
+          if (pass.offset >= pass.files.length) {
+            this.passes[lane] = undefined;
+            if (pass.owed) this.passes[lane] = this.pass(lane);
+          }
+        }
+        if (files.length) break;
+      }
+      if (files.length) await this.check(files, current);
+    } finally {
+      this.running = false;
+      if (this.active) {
+        const work = this.pending.size > 0 || this.passes.some(Boolean);
+        this.timer = this.clock.setTimer(
+          () => {
+            this.timer = null;
+            void this.run();
+          },
+          work ? 0 : Math.max(0, Math.min(...this.deadlines) - this.clock.now()),
+        );
+      }
+    }
+  }
+
+  private pass(lane: number): { files: string[]; offset: number; owed: boolean } {
+    return {
+      files: this.sources.filter((source) => this.warm(source) === (lane === 0)).map((source) => source.file),
+      offset: 0,
+      owed: false,
+    };
+  }
+}
+
 export type WatcherWakeReason = 'transcript' | 'activity-fallback';
 
 export interface WatcherWakeBatch {

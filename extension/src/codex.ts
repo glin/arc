@@ -825,6 +825,10 @@ export class CodexStatCache {
     return stat;
   }
 
+  accept(file: string, stat: RolloutStat): void {
+    this.entries.set(file, { stat, readAt: this.now() });
+  }
+
   // A watcher event with no file name stands for every file in its directory.
   markChanged(directory: string, filename: unknown): void {
     if (typeof filename === 'string') {

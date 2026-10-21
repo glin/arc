@@ -1239,6 +1239,7 @@ function spendRecord(
     ...(persistedParserGeneration === undefined ? {} : { parserGeneration: persistedParserGeneration }),
     ...(parserKind === undefined ? {} : { parserKind }),
     indexedAt: value.indexedAt,
+    ...(typeof value.sourceIdentity === 'string' ? { sourceIdentity: value.sourceIdentity } : {}),
     ...(currentParser && parserKind !== undefined && value.parserState !== undefined
       ? { parserState: value.parserState }
       : {}),

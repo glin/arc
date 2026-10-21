@@ -500,6 +500,7 @@ import {
   type SpendPendingAnswers,
   type SpendSourcePending,
   SessionFiguresCache,
+  SpendCoverage,
   type SessionRailFacts,
   SubagentDirectoryCache,
   discoverClaudeSessionSpendSources,
@@ -520,7 +521,6 @@ import {
   projectSpendOfferDecision,
   projectSpendWindows,
   type SpendSourceRevision,
-  projectSpendSourceOfferDue,
   publicProjectSpendPrice,
   saveSpendLedger,
   sessionSpendPartsBySession,
@@ -607,6 +607,7 @@ import { ClaudeHistoryCursor } from './claudehistory';
 import { CodexHistoryCursor, type CodexForwardCheckpoint } from './codexhistory';
 import {
   BoundedTrailingScheduler,
+  IntegrityScheduler,
   CATALOG_REFRESH_DEADLINE_MS,
   mergeRefreshRequests,
   listedFilesFor,
@@ -1969,8 +1970,14 @@ export class PanelProvider implements vscode.Disposable {
   private projectSpendHydrated = false;
   private projectSpendHydrationReady = false;
   private projectSpendHydrationTick: ReturnType<typeof setTimeout> | null = null;
-  // Periodic spend-source checks supplement watcher events. Changed listings offer their sources immediately.
-  private projectSpendLastOfferAt = 0;
+  // Integrity queues supplement targeted source events with independent periodic checks.
+  private spendIntegrity?: IntegrityScheduler;
+  private spendSourcesByFile = new Map<string, { file: string; agent: AgentKind; primary?: boolean }>();
+  private spendFilesBySession = new Map<string, string[]>();
+  private spendNativeChildren = new Set<string>();
+  private spendRecordsByFile = new Map<string, number>();
+  private spendChecks = new SpendCoverage();
+  private spendCoverageAt: number | null = null;
   private projectSpendRevision = 0;
   private projectSpendEpoch = 0;
   private projectSpendSnapshot: ProjectSpendView | null = null;
@@ -3339,6 +3346,8 @@ export class PanelProvider implements vscode.Disposable {
   // Poll while the panel is visible to detect transcript changes without a watcher event.
   private startPolling(): void {
     this.watching = true;
+    this.spendIntegrity?.start();
+    if (this.projectSpendQueue?.length && !this.projectSpendTick) this.scheduleNextProjectSpendFile();
     if (this.poll) {
       return;
     }
@@ -3347,6 +3356,9 @@ export class PanelProvider implements vscode.Disposable {
 
   // Clear held rollout stats when polling stops. The next read must obtain fresh file revisions.
   private stopPolling(): void {
+    this.spendIntegrity?.pause();
+    if (this.projectSpendTick) clearTimeout(this.projectSpendTick);
+    this.projectSpendTick = null;
     if (this.poll) {
       clearInterval(this.poll);
       this.poll = null;
@@ -3411,6 +3423,7 @@ export class PanelProvider implements vscode.Disposable {
       return;
     }
     this.codexStats.markChanged(directory, filename);
+    if (typeof filename === 'string') this.spendIntegrity?.promote([normalizeFsPath(path.join(directory, filename))]);
     if (!this.pendingWatch.noteFileEvent(directory, filename, kind, normalizeFsPath)) {
       return;
     }
@@ -5245,6 +5258,10 @@ export class PanelProvider implements vscode.Disposable {
   // Update running sessions by `runningKey`. An agent can run several sessions simultaneously.
   public setRunning(keys: readonly string[], hosted: readonly HostedSessionObservation[] = []): void {
     if (hosted.length) this.observeHostedSessions(hosted);
+    for (const session of this.catalog?.sessions ?? []) {
+      if (keys.includes(runningKey(session.agent, session.sessionId)))
+        this.spendIntegrity?.promote(this.spendFilesBySession?.get(session.sessionId) ?? []);
+    }
     const next = new Set(keys);
     const moved = next.size !== this.running.size || [...next].some((key) => !this.running.has(key));
     // New running keys receive a start time. Removed keys discard it before a later run.
@@ -8138,6 +8155,7 @@ export class PanelProvider implements vscode.Disposable {
       pinnedTop.delete(target);
     } else if (action === 'unarchive') {
       hidden.delete(target);
+      this.spendIntegrity?.promote(this.spendFilesBySession?.get(target) ?? []);
     } else if (action === 'pin' && !hidden.has(target)) {
       pinnedTop.add(target);
     } else if (action === 'unpin') {
@@ -8446,6 +8464,7 @@ export class PanelProvider implements vscode.Disposable {
     }
     this.previousSelection = previousSelection;
     this.showing = session;
+    if (session) this.spendIntegrity?.promote(this.spendFilesBySession?.get(session) ?? []);
     const selectedAgent = session
       ? (this.newDrafts?.[session]?.profile.agent ??
         this.sessionRows?.find((row) => row.id === session)?.agentKey ??
@@ -8468,7 +8487,7 @@ export class PanelProvider implements vscode.Disposable {
       this.selectionWork = null;
     }
     this.selectionFailure = null;
-    // Selection refreshes reuse the catalog because navigation changes no transcript.
+    // Selection reuses the catalog and promotes its sources for integrity checks.
     const seeded = this.selectionGeneration;
     this.railSeedOwedFor = seeded;
     this.railSeedSkipped = false;
@@ -8867,7 +8886,7 @@ export class PanelProvider implements vscode.Disposable {
       // Read the Codex name index before computing the listing signature. Renames do not change rollout revisions.
       this.threadNames = readThreadNames(codexSessionIndexPath(), this.threadNames);
       const children = this.agentListingStamp(sessions);
-      // Listing signatures include selection. Spend-source signatures exclude selection so navigation alone starts no source integrity pass.
+      // Selection reuses the catalog spend signature and promotes only its session sources for checking.
       const parentEdges = this.sessionParentEdges(all);
       const listed: ListingFacts = {
         showing: this.showing,
@@ -8876,16 +8895,16 @@ export class PanelProvider implements vscode.Disposable {
         children,
         sessionParents: parentEdges.key,
       };
-      const sourceSignature = spendSourceSignature(listed);
+      const sourceSignature = selectedOnly ? this.lastSpendSourceSignature : spendSourceSignature(listed);
+      listed.sourceSignature = sourceSignature;
       const signature = listingSignature(listed);
       const sourcesMoved = sourceSignature !== this.lastSpendSourceSignature;
       this.lastSpendSourceSignature = sourceSignature;
-      const signedRows = this.spendSourceRows;
-      this.spendSourceRows = all;
-      if (projectSpendSourceOfferDue(sourcesMoved, now, this.projectSpendLastOfferAt)) {
-        this.projectSpendLastOfferAt = now;
-        const targeted = targetedRefreshPaths ? new Set(targetedRefreshPaths.map(normalizeFsPath)) : null;
-        if (targeted && sourcesMoved) {
+      const signedRows = this.spendSourceRows ?? [];
+      if (!selectedOnly) this.spendSourceRows = all;
+      if (!selectedOnly) {
+        const targeted = new Set((targetedRefreshPaths ?? []).map(normalizeFsPath));
+        if (sourcesMoved) {
           // Child discovery can advance rows the refresh did not name. The signature now includes
           // them, so no later offer sees them move. This offer names every row that moved.
           const signed = new Map(signedRows.map((session) => [session.file, session]));
@@ -8896,15 +8915,16 @@ export class PanelProvider implements vscode.Disposable {
             }
           }
         }
-        const listedRevisions = targeted
+        const listedRevisions = targeted.size
           ? new Map(
               all
                 .filter((session) => targeted.has(normalizeFsPath(session.file)))
                 .map((session) => [session.file, { mtimeMs: session.mtimeMs, size: session.size }]),
             )
           : trustedListedRevisions(all, this.catalogWalked, this.showing);
-        if (this.projectSpendHydrated) {
-          this.scheduleProjectSpendIndex(listedRevisions, sourcesMoved ? targeted : null);
+        this.updateProjectSpendIntegrity?.(all);
+        if (this.projectSpendHydrated && sourcesMoved) {
+          this.scheduleProjectSpendIndex(listedRevisions, targeted);
         }
       }
       // Newly enriched metadata can change unread answers without changing transcript revisions.
@@ -9597,7 +9617,7 @@ export class PanelProvider implements vscode.Disposable {
     return JSON.stringify([this.saved.read, this.saved.readTo]);
   }
 
-  // During indexing, retain the last settled record for sources whose new reads remain incomplete.
+  // Retain the last complete lifetime figures until a replacement read completes.
   private lifetimeDisplayFiles(): readonly SpendFileIndex[] {
     return sessionLifetimeDisplayFiles(this.projectSpendBusy(), this.projectSpendFiles, this.projectSpendVisibleFiles);
   }
@@ -9859,10 +9879,15 @@ export class PanelProvider implements vscode.Disposable {
     );
   }
 
-  // Whether the ledger still holds a dispatched source, by `spendSourceHeld` against the
-  // ledger's queue and the history limit now.
+  // Incomplete replacements keep dispatched completion pending, including after a failed read drains the queue.
+  // Complete records also follow queued, unfinished-line, open-turn, and history-limit rules.
   private projectSpendHolds(file: string, record: SpendFileIndex | undefined): boolean {
-    return spendSourceHeld(record, this.projectSpendQueued.has(file), this.projectSpendHistoryCutoff());
+    const at = this.spendRecordsByFile?.get(file);
+    const current = at === undefined ? record : this.projectSpendFiles[at];
+    return (
+      (current?.complete === false && current.missingAt === undefined) ||
+      spendSourceHeld(record, this.projectSpendQueued.has(file), this.projectSpendHistoryCutoff())
+    );
   }
 
   // Refresh session-list figures when dispatched-source pending state changes, including changes since the last list payload.
@@ -10081,6 +10106,14 @@ export class PanelProvider implements vscode.Disposable {
       this.projectSpendMidnight = null;
     }
     this.cancelProjectSpendRebuild();
+    this.spendIntegrity?.pause();
+    this.spendIntegrity = undefined;
+    this.spendSourcesByFile = new Map();
+    this.spendFilesBySession = new Map();
+    this.spendNativeChildren = new Set();
+    this.spendRecordsByFile = new Map();
+    this.spendChecks = new SpendCoverage();
+    this.spendCoverageAt = null;
     this.projectSpendEpoch++;
     this.projectSpendWorkspace = workspace;
     this.projectSpendSnapshot = workspace ? this.unknownProjectSpendSnapshot() : null;
@@ -10088,7 +10121,6 @@ export class PanelProvider implements vscode.Disposable {
     this.projectSpendTomorrow = null;
     this.projectSpendHydrated = !workspace || !this.projectSpendStorageDir;
     this.projectSpendHydrationReady = false;
-    this.projectSpendLastOfferAt = 0;
     this.projectSpendRevision++;
     this.projectSpendQueue = [];
     this.projectSpendQueued.clear();
@@ -10153,7 +10185,9 @@ export class PanelProvider implements vscode.Disposable {
     const visible = pruneSpendFilesWithResult(ledger.completeFiles);
     this.projectSpendFiles = resumable.files;
     this.projectSpendVisibleFiles = visible.files;
+    this.spendRecordsByFile = new Map(this.projectSpendFiles.map((record, index) => [record.file, index]));
     this.projectSpendHydrated = true;
+    if (this.watching) this.spendIntegrity?.start();
     this.projectSpendRevision++;
     this.invalidateProjectSpendSnapshot();
     if (resumable.pruned || visible.pruned) {
@@ -10199,6 +10233,7 @@ export class PanelProvider implements vscode.Disposable {
     const busy = this.projectSpendBusy() || this.projectSpendBuild !== null || this.projectSpendRebuild !== null;
     return {
       ...view,
+      lastIndexedAt: this.spendChecks ? this.spendCoverageAt : view.lastIndexedAt,
       indexing: busy,
       calculating: busy && view.lastIndexedAt === null,
       indexingStatus: busy ? 'Updating…' : null,
@@ -10263,12 +10298,18 @@ export class PanelProvider implements vscode.Disposable {
           if (result.done) {
             if (!current) {
               current = result.value;
-              projection = prepareProjectSpendViewSteps(files, price, {
-                now: tomorrow.getTime(),
-                historyCutoff: projectSpendHistoryCutoff(historyDays, tomorrow.getTime()),
-              });
+              const checks = this.spendChecks;
+              projection = (function* () {
+                const next = yield* prepareProjectSpendViewSteps(files, price, {
+                  now: tomorrow.getTime(),
+                  historyCutoff: projectSpendHistoryCutoff(historyDays, tomorrow.getTime()),
+                });
+                if (checks) yield* checks.prepare(files);
+                return next;
+              })();
             } else {
               this.projectSpendSnapshot = Object.freeze(current);
+              this.publishProjectSpendCoverage?.(false);
               this.projectSpendSnapshotDate = date;
               this.projectSpendSnapshotPrice = price;
               this.projectSpendTomorrow = {
@@ -10444,7 +10485,127 @@ export class PanelProvider implements vscode.Disposable {
     );
   }
 
-  // Defer spend-source checks until after the render, keeping filesystem work outside the immediate rendering path.
+  // Cache catalog work outside selection. Archive membership does not change integrity priority.
+  private updateProjectSpendIntegrity(sessions: readonly SessionFile[]): void {
+    if (!this.projectSpendStorageDir) return;
+    const sources = this.projectSpendSources();
+    this.spendSourcesByFile = new Map(sources.map((source) => [normalizeFsPath(source.file), source]));
+    for (const record of this.projectSpendFiles) {
+      const key = normalizeFsPath(record.file);
+      if (!this.spendSourcesByFile.has(key))
+        this.spendSourcesByFile.set(key, { file: record.file, agent: spendRecordAgent(record) });
+    }
+    this.spendRecordsByFile = new Map(this.projectSpendFiles.map((record, index) => [record.file, index]));
+    this.spendNativeChildren = new Set(
+      this.sessionSpendSources
+        .filter((source) => source.nativeParentFile !== undefined)
+        .map((source) => normalizeSpendFile(source.file)),
+    );
+    this.spendFilesBySession = new Map();
+    for (const source of this.sessionSpendSources) {
+      const files = this.spendFilesBySession.get(source.sessionId) ?? [];
+      files.push(normalizeFsPath(source.file));
+      this.spendFilesBySession.set(source.sessionId, files);
+    }
+    const opened = new Set([this.showing, ...this.hostSessions.values()]);
+    const active = new Set(
+      sessions
+        .filter(
+          (session) => opened.has(session.sessionId) || this.running.has(runningKey(session.agent, session.sessionId)),
+        )
+        .map((session) => normalizeFsPath(session.file)),
+    );
+    const records = new Map(this.projectSpendFiles.map((record) => [normalizeFsPath(record.file), record]));
+    this.spendIntegrity ??= new IntegrityScheduler(
+      (files, current) => this.checkProjectSpendSources(files, current),
+      () => this.refreshFrom('project-spend-discovery'),
+    );
+    this.spendIntegrity.update(
+      [...this.spendSourcesByFile.keys()].map((file) => {
+        const record = records.get(file);
+        return {
+          file,
+          warm:
+            active.has(file) ||
+            !record ||
+            record.complete === false ||
+            spendSourceHeld(record, false, null) ||
+            record.mtimeMs >= Date.now() - 7 * 86_400_000,
+        };
+      }),
+    );
+    if (
+      this.catalogWalked &&
+      this.sourceEnumerations?.claude.status === 'complete' &&
+      this.sourceEnumerations.codex.status === 'complete' &&
+      this.membershipCoverage?.status === 'complete' &&
+      !this.dispatchDiscoveryPending
+    ) {
+      this.spendChecks.discover(
+        sources.map((source) => normalizeSpendFile(source.file)),
+        Date.now(),
+      );
+      this.publishProjectSpendCoverage();
+    }
+    if (this.watching && this.projectSpendHydrated) this.spendIntegrity.start();
+  }
+
+  private async checkProjectSpendSources(files: readonly string[], current: () => boolean): Promise<void> {
+    const epoch = this.projectSpendEpoch;
+    const sources = files.map((file) => this.spendSourcesByFile.get(file)).filter((source) => source !== undefined);
+    const accepted = await Promise.all(
+      sources.map(async (source) => {
+        try {
+          const physical = await fs.promises.stat(source.file, { bigint: true });
+          return physical.isFile() ? { source, stat: fileRevisionOf(physical) } : null;
+        } catch (error) {
+          return ['ENOENT', 'ENOTDIR'].includes((error as NodeJS.ErrnoException).code ?? '')
+            ? { source, stat: null }
+            : null;
+        }
+      }),
+    );
+    if (!current() || this.disposed || epoch !== this.projectSpendEpoch) return;
+    const revisions = new Map<string, SpendSourceRevision | null>();
+    const ready: typeof sources = [];
+    for (const checked of accepted) {
+      if (!checked) continue;
+      const { source, stat } = checked;
+      const at = this.spendRecordsByFile.get(normalizeSpendFile(source.file));
+      const record = at === undefined ? undefined : this.projectSpendFiles[at];
+      if (!stat && record?.missingAt !== undefined) this.spendChecks.set(record, Date.now());
+      if (stat && source.agent === 'codex') this.codexStats.accept(source.file, { ...stat, isFile: true });
+      if (
+        stat &&
+        record &&
+        record.complete !== false &&
+        record.missingAt === undefined &&
+        record.size === stat.size &&
+        record.mtimeMs === stat.mtimeMs &&
+        record.sourceIdentity === `${stat.dev}:${stat.ino}`
+      ) {
+        this.spendChecks.set(record, Date.now());
+      }
+      revisions.set(
+        source.file,
+        stat ? { size: stat.size, mtimeMs: stat.mtimeMs, sourceIdentity: `${stat.dev}:${stat.ino}` } : null,
+      );
+      ready.push(source);
+    }
+    this.queueProjectSpendIndex(revisions, new Set(ready.map((source) => normalizeFsPath(source.file))), ready);
+    this.publishProjectSpendCoverage();
+  }
+
+  private publishProjectSpendCoverage(post = true): void {
+    if (!this.spendChecks) return;
+    const oldest = this.spendChecks.oldest(this.spendCoverageAt);
+    if (oldest !== this.spendCoverageAt) {
+      this.spendCoverageAt = oldest;
+      if (post) this.postProjectSpend();
+    }
+  }
+
+  // Defer targeted source offers until the current render has posted.
   private scheduleProjectSpendIndex(
     listedRevisions: ReadonlyMap<string, { size: number; mtimeMs: number }>,
     onlyFiles: ReadonlySet<string> | null,
@@ -10454,19 +10615,51 @@ export class PanelProvider implements vscode.Disposable {
     const epoch = this.projectSpendEpoch;
     const revision = this.projectSpendRevision;
     const sources = this.projectSpendSources();
-    const tick = setTimeout(() => {
+    const run = async () => {
       this.projectSpendOffers.delete(tick);
       if (this.projectSpendEpoch !== epoch || this.projectSpendWorkspace !== workspace) return;
+      if (this.spendIntegrity) {
+        const files = onlyFiles ?? new Set(listedRevisions.keys());
+        this.spendIntegrity.promote([...files].map(normalizeFsPath));
+        return;
+      }
       if (revision !== this.projectSpendRevision) {
         this.scheduleProjectSpendIndex(new Map(), onlyFiles);
         return;
       }
-      this.queueProjectSpendIndex(listedRevisions, onlyFiles, sources);
+      const revisions = new Map<string, SpendSourceRevision | null>(listedRevisions);
+      for (let offset = 0; offset < sources.length; offset += 16) {
+        await Promise.all(
+          sources.slice(offset, offset + 16).map(async (source) => {
+            if (revisions.has(source.file) || (onlyFiles && !onlyFiles.has(normalizeFsPath(source.file)))) return;
+            try {
+              const stat = fileRevisionOf(await fs.promises.stat(source.file, { bigint: true }));
+              revisions.set(source.file, {
+                size: stat.size,
+                mtimeMs: stat.mtimeMs,
+                sourceIdentity: `${stat.dev}:${stat.ino}`,
+              });
+            } catch (error) {
+              if (['ENOENT', 'ENOTDIR'].includes((error as NodeJS.ErrnoException).code ?? ''))
+                revisions.set(source.file, null);
+            }
+          }),
+        );
+        if (this.disposed || this.projectSpendEpoch !== epoch || this.projectSpendWorkspace !== workspace) return;
+      }
+      this.queueProjectSpendIndex(
+        revisions,
+        onlyFiles,
+        sources.filter((source) => revisions.has(source.file)),
+      );
       // Publish settled Project cost when an offer queues no work.
       if (!this.projectSpendBusy()) {
         this.postProjectSpend();
         this.postDispatchedCostsIfMoved();
       }
+    };
+    const tick = setTimeout(() => {
+      void run();
     }, 0);
     this.projectSpendOffers.add(tick);
   }
@@ -10501,7 +10694,7 @@ export class PanelProvider implements vscode.Disposable {
   }
 
   private queueProjectSpendIndex(
-    listedRevisions: ReadonlyMap<string, { size: number; mtimeMs: number }> = new Map(),
+    listedRevisions: ReadonlyMap<string, SpendSourceRevision | null> = new Map(),
     onlyFiles: ReadonlySet<string> | null = null,
     listedSources: readonly { file: string; agent: AgentKind; primary?: boolean }[] = this.projectSpendSources(),
   ): void {
@@ -10511,7 +10704,7 @@ export class PanelProvider implements vscode.Disposable {
     }
     const sources = listedSources.filter((source) => !onlyFiles || onlyFiles.has(normalizeFsPath(source.file)));
     const found = new Set<string>();
-    const existing = new Map(this.projectSpendFiles.map((file) => [file.file, file]));
+    this.spendRecordsByFile ??= new Map(this.projectSpendFiles.map((file, index) => [file.file, index]));
     const cutoff = this.projectSpendHistoryCutoff();
     const offer = (file: string, agent: AgentKind, primary?: boolean): void => {
       const key = normalizeSpendFile(file);
@@ -10519,29 +10712,26 @@ export class PanelProvider implements vscode.Disposable {
         return;
       }
       found.add(key);
-      const previous = existing.get(key);
-      // A new source needs file facts only when a history limit can skip it.
-      let revision: SpendSourceRevision | null | undefined = listedRevisions.get(file);
-      if (!revision && (previous || cutoff !== null)) {
-        try {
-          const stat = fs.statSync(file);
-          revision = { size: stat.size, mtimeMs: stat.mtimeMs };
-        } catch {
-          invalidateSpendFileNormalization(file);
-          revision = null;
-        }
-      }
+      const at = this.spendRecordsByFile.get(key);
+      const previous = at === undefined ? undefined : this.projectSpendFiles[at];
+      // Offers reuse revisions from asynchronous integrity checks or accepted catalog reads.
+      const revision: SpendSourceRevision | null | undefined = listedRevisions.get(file);
       const childPolicy =
         agent === 'claude' &&
         (primary === false ||
-          this.sessionSpendSources.some(
-            (source) => source.nativeParentFile !== undefined && normalizeSpendFile(source.file) === key,
-          ));
-      const decision = projectSpendOfferDecision(previous, revision, cutoff);
+          (this.spendNativeChildren ??= new Set(
+            this.sessionSpendSources
+              .filter((source) => source.nativeParentFile !== undefined)
+              .map((source) => normalizeSpendFile(source.file)),
+          )).has(key));
+      let decision = projectSpendOfferDecision(previous, revision, cutoff);
+      if (decision !== 'skip' && revision?.sourceIdentity && previous?.sourceIdentity !== revision.sourceIdentity)
+        decision = 'queue';
       if (
         decision === 'skip' ||
         (decision !== 'queue' && (agent !== 'claude' || (previous?.cacheExpiryChildPolicy ?? false) === childPolicy))
       ) {
+        this.spendChecks?.account(key, true);
         return;
       }
       this.projectSpendQueued.add(key);
@@ -10550,7 +10740,7 @@ export class PanelProvider implements vscode.Disposable {
     for (const source of sources) {
       offer(source.file, source.agent, source.primary);
     }
-    this.projectSpendCostQueue = null;
+    if (this.projectSpendQueue.length) this.projectSpendCostQueue = null;
     if (!onlyFiles) {
       for (const record of this.projectSpendFiles) {
         if (found.has(record.file)) {
@@ -10560,6 +10750,10 @@ export class PanelProvider implements vscode.Disposable {
       }
     }
     this.postRailIfSpendPendingMoved();
+    if (!this.projectSpendQueue.length && !this.projectSpendIndexing) {
+      this.postDispatchedCostsIfMoved();
+      return;
+    }
     if (this.projectSpendTick) {
       return;
     }
@@ -10578,8 +10772,8 @@ export class PanelProvider implements vscode.Disposable {
     this.invalidateProjectSpendSnapshot();
     this.projectSpendQueue = [];
     this.projectSpendQueued.clear();
-    this.projectSpendLastOfferAt = Date.now();
-    this.queueProjectSpendIndex();
+    if (this.spendIntegrity) this.spendIntegrity.promote(this.spendSourcesByFile.keys());
+    else this.scheduleProjectSpendIndex(new Map(), null);
     this.postProjectSpend();
   }
 
@@ -10605,22 +10799,33 @@ export class PanelProvider implements vscode.Disposable {
       return;
     }
     const key = normalizeSpendFile(next.file);
-    const at = this.projectSpendFiles.findIndex((record) => record.file === key);
+    this.spendRecordsByFile ??= new Map(this.projectSpendFiles.map((record, index) => [record.file, index]));
+    const at = this.spendRecordsByFile.get(key) ?? -1;
     const previous = at >= 0 ? this.projectSpendFiles[at] : undefined;
     const makeReducer =
       next.agent === 'claude'
         ? (state: unknown) =>
             createClaudeUsageLineReducer(state as Parameters<typeof createClaudeUsageLineReducer>[0], {
               childTranscript: next.primary === false,
-              nativeChildRequests: this.sessionSpendSources.some(
-                (source) => source.nativeParentFile !== undefined && normalizeSpendFile(source.file) === key,
-              ),
+              nativeChildRequests: (this.spendNativeChildren ??= new Set(
+                this.sessionSpendSources
+                  .filter((source) => source.nativeParentFile !== undefined)
+                  .map((source) => normalizeSpendFile(source.file)),
+              )).has(key),
             })
         : (state: unknown) => createCodexUsageLineReducer(state as Parameters<typeof createCodexUsageLineReducer>[0]);
-    const result = indexSpendFile(previous, next.file, workspace, makeReducer);
+    let result: ReturnType<typeof indexSpendFile>;
+    try {
+      result = indexSpendFile(previous, next.file, workspace, makeReducer);
+    } catch {
+      this.projectSpendQueued.delete(key);
+      this.scheduleNextProjectSpendFile();
+      return;
+    }
     if (at >= 0) {
       this.projectSpendFiles[at] = result.record;
     } else {
+      this.spendRecordsByFile.set(key, this.projectSpendFiles.length);
       this.projectSpendFiles.push(result.record);
     }
     if (result.record !== previous) {
@@ -10634,16 +10839,28 @@ export class PanelProvider implements vscode.Disposable {
       this.projectSpendRailOwed = true;
     }
     if (result.complete) {
+      if (result.record.complete !== false || result.record.missingAt !== undefined) this.spendChecks?.account(key);
       this.projectSpendQueued.delete(key);
       // Requeue this file if it grew during indexing instead of waiting for the next integrity pass.
       try {
-        const stat = fs.statSync(next.file);
-        if (stat.size !== result.record.size || stat.mtimeMs !== result.record.mtimeMs) {
+        const stat = fileRevisionOf(fs.statSync(next.file, { bigint: true }));
+        if (
+          stat.size !== result.record.size ||
+          stat.mtimeMs !== result.record.mtimeMs ||
+          (result.record.sourceIdentity !== undefined && result.record.sourceIdentity !== `${stat.dev}:${stat.ino}`)
+        ) {
           this.projectSpendQueued.add(key);
           this.projectSpendQueue.push(next);
+        } else if (result.found && this.spendChecks) {
+          this.spendChecks.set(result.record, Date.now());
         }
-      } catch {
+      } catch (error) {
         invalidateSpendFileNormalization(next.file);
+        if (
+          result.record.missingAt !== undefined &&
+          ['ENOENT', 'ENOTDIR'].includes((error as NodeJS.ErrnoException).code ?? '')
+        )
+          this.spendChecks?.set(result.record, Date.now());
         // The integrity pass marks the disappeared source in the ledger.
       }
     } else if (spendRecordHoldsLongLine(result.record)) {
@@ -10677,6 +10894,8 @@ export class PanelProvider implements vscode.Disposable {
         if (record.costStateSupplement?.identity !== identity && record.costStateSupplement) {
           const { costStateSupplement: _supplement, ...baseline } = record;
           this.projectSpendFiles[at] = baseline;
+          const checked = this.spendChecks?.get(record);
+          if (checked !== undefined) this.spendChecks.set(baseline, checked);
           this.projectSpendRevision++;
           this.invalidateProjectSpendSnapshot();
           this.scheduleProjectSpendSave();
@@ -10720,7 +10939,9 @@ export class PanelProvider implements vscode.Disposable {
     );
     if (result.invalidated) {
       this.projectSpendCostQueue = null;
-      this.queueProjectSpendIndex();
+      if (this.spendIntegrity)
+        this.spendIntegrity.promote(dependencies.map((dependency) => normalizeFsPath(dependency.file)));
+      else this.scheduleProjectSpendIndex(new Map(), null);
       return true;
     }
     this.projectSpendFiles[at] = {
@@ -10728,6 +10949,8 @@ export class PanelProvider implements vscode.Disposable {
       costStateProgress: result.progress,
       ...(result.supplement ? { costStateSupplement: result.supplement } : {}),
     };
+    const checked = this.spendChecks?.get(record);
+    if (checked !== undefined) this.spendChecks.set(this.projectSpendFiles[at], checked);
     this.projectSpendRevision++;
     this.invalidateProjectSpendSnapshot();
     this.scheduleProjectSpendSave();
@@ -10742,13 +10965,23 @@ export class PanelProvider implements vscode.Disposable {
     this.projectSpendCostQueue = null;
     const pruned = pruneSpendFilesWithResult(this.projectSpendFiles);
     this.projectSpendFiles = pruned.files;
+    this.spendRecordsByFile = new Map(this.projectSpendFiles.map((record, index) => [record.file, index]));
+    this.spendChecks?.publish();
+    const previousDisplay = new Map(this.projectSpendVisibleFiles.map((record) => [record.file, record]));
+    const displayFiles = this.projectSpendFiles.flatMap((record) =>
+      record.complete === false
+        ? previousDisplay.has(record.file)
+          ? [previousDisplay.get(record.file)!]
+          : []
+        : [record],
+    );
     const displayMoved =
       pruned.pruned ||
-      this.projectSpendVisibleFiles.length !== this.projectSpendFiles.length ||
-      this.projectSpendVisibleFiles.some((file, at) => file !== this.projectSpendFiles[at]);
+      this.projectSpendVisibleFiles.length !== displayFiles.length ||
+      this.projectSpendVisibleFiles.some((file, at) => file !== displayFiles[at]);
     // Advance the ledger revision when displayed files change. Schedule persistence so repeated appends still share bounded saves.
     if (displayMoved) {
-      this.projectSpendVisibleFiles = this.projectSpendFiles.slice();
+      this.projectSpendVisibleFiles = displayFiles;
       this.projectSpendRevision++;
       this.invalidateProjectSpendSnapshot();
       this.scheduleProjectSpendSave();
@@ -10765,6 +10998,7 @@ export class PanelProvider implements vscode.Disposable {
         this.postRailIfSpendPendingMoved();
       }
       this.postDispatchedCostsIfMoved();
+      this.publishProjectSpendCoverage?.();
       // Publish Project cost, session-list, and card updates without a catalog refresh that would offer sources again.
     }
   }
@@ -11090,6 +11324,18 @@ export class PanelProvider implements vscode.Disposable {
       invalidated.some((file, at) => file !== this.projectSpendFiles[at]) ||
       invalidatedVisible.some((file, at) => file !== this.projectSpendVisibleFiles[at])
     ) {
+      this.spendIntegrity?.promote(
+        invalidated.filter((file, at) => file !== this.projectSpendFiles[at]).map((file) => normalizeFsPath(file.file)),
+      );
+      for (const [before, after] of [
+        [this.projectSpendFiles, invalidated],
+        [this.projectSpendVisibleFiles, invalidatedVisible],
+      ]) {
+        after.forEach((record, at) => {
+          const checked = this.spendChecks?.get(before[at]);
+          if (checked !== undefined) this.spendChecks.set(record, checked);
+        });
+      }
       this.projectSpendFiles = invalidated;
       this.projectSpendVisibleFiles = invalidatedVisible;
       this.projectSpendCostQueue = null;

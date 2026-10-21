@@ -1,7 +1,8 @@
-import { test } from 'vitest';
+import { test, vi } from 'vitest';
 import assert from 'node:assert';
 import {
   BoundedTrailingScheduler,
+  IntegrityScheduler,
   listedFilesFor,
   mergeRefreshRequests,
   PendingWatcherWake,
@@ -9,6 +10,121 @@ import {
   SchedulerClock,
   watcherRefreshDecision,
 } from './scheduler.ts';
+
+test('integrity deadlines survive continuous targeted work and cold discovery includes mixed folders', async () => {
+  vi.useFakeTimers();
+  try {
+    const checked: { file: string; at: number }[] = [];
+    const discoveries: number[] = [];
+    const scheduler = new IntegrityScheduler(
+      async (files) => {
+        checked.push(...files.map((file) => ({ file, at: Date.now() })));
+      },
+      () => discoveries.push(Date.now()),
+      undefined,
+      1,
+    );
+    scheduler.update([
+      { file: '/mixed/warm', warm: true },
+      { file: '/mixed/cold', warm: false },
+      { file: '/old/archived', warm: false },
+    ]);
+    scheduler.start();
+    const start = Date.now();
+    for (let second = 0; second < 910; second += 10) {
+      scheduler.promote(['/targeted']);
+      await vi.advanceTimersByTimeAsync(10_000);
+    }
+    assert.ok(checked.some((check) => check.file === '/mixed/warm' && check.at >= start + 30_000));
+    assert.ok(checked.some((check) => check.file === '/mixed/cold'));
+    assert.ok(checked.some((check) => check.file === '/old/archived'));
+    assert.equal(discoveries.length, 1);
+    scheduler.pause();
+    assert.equal(vi.getTimerCount(), 0);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('integrity passes retain progress and one global batch through slow checks and disposal', async () => {
+  vi.useFakeTimers();
+  try {
+    let release!: () => void;
+    let current!: () => boolean;
+    const visits: string[] = [];
+    let active = 0;
+    let maximum = 0;
+    const scheduler = new IntegrityScheduler(
+      async (files, valid) => {
+        active++;
+        maximum = Math.max(maximum, active);
+        visits.push(...files);
+        current = valid;
+        await new Promise<void>((resolve) => {
+          release = resolve;
+        });
+        active--;
+      },
+      () => {},
+      undefined,
+      1,
+    );
+    scheduler.update([
+      { file: 'a', warm: true },
+      { file: 'b', warm: true },
+    ]);
+    scheduler.start();
+    await vi.advanceTimersByTimeAsync(1);
+    assert.deepEqual(visits, ['a']);
+    scheduler.promote(['a']);
+    await vi.advanceTimersByTimeAsync(90_000);
+    assert.deepEqual(visits, ['a']);
+    release();
+    await vi.advanceTimersByTimeAsync(1);
+    assert.equal(visits[1], 'a');
+    release();
+    await vi.advanceTimersByTimeAsync(1);
+    assert.equal(visits[2], 'b');
+    scheduler.pause();
+    assert.equal(current(), false);
+    release();
+    await vi.advanceTimersByTimeAsync(1);
+    assert.equal(maximum, 1);
+    assert.equal(vi.getTimerCount(), 0);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('targeted integrity extraction visits only its admitted batch', async () => {
+  vi.useFakeTimers();
+  try {
+    let visited = 0;
+    class CountedSet extends Set<string> {
+      override *[Symbol.iterator](): SetIterator<string> {
+        for (const file of super[Symbol.iterator]()) {
+          visited++;
+          yield file;
+        }
+      }
+    }
+    const scheduler = new IntegrityScheduler(
+      async (files) => {
+        assert.equal(files.length, 16);
+        scheduler.pause();
+      },
+      () => {},
+    );
+    (scheduler as unknown as { pending: Set<string> }).pending = new CountedSet();
+    scheduler.promote(Array.from({ length: 1024 }, (_, index) => String(index)));
+    scheduler.start();
+    await vi.advanceTimersByTimeAsync(1);
+    assert.equal(visited, 16, 'taking a small batch traversed the targeted backlog');
+  } finally {
+    vi.clearAllTimers();
+    vi.useRealTimers();
+  }
+});
 
 class FakeClock implements SchedulerClock {
   private nextId = 1;

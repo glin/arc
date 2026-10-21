@@ -1,3 +1,5 @@
+import { revisionOf } from './filerevision';
+export { revisionOf } from './filerevision';
 import type { SourceEnumeration } from './sessioncoverage';
 import * as fs from 'node:fs';
 import { ExportLimitError, type ExportRelationshipLimits } from './exportlimits';
@@ -5077,28 +5079,6 @@ export interface TailRead {
 export interface MetadataCoverage {
   whole: boolean;
   windowBytes: number;
-}
-
-export function revisionOf(stat: fs.Stats | fs.BigIntStats): FileRevision {
-  const size =
-    typeof stat.size === 'bigint'
-      ? stat.size >= 0n && stat.size <= BigInt(Number.MAX_SAFE_INTEGER)
-        ? Number(stat.size)
-        : -1
-      : stat.size;
-  const ns = (stat as fs.BigIntStats).mtimeNs;
-  const mtimeMs =
-    typeof stat.mtimeMs === 'bigint'
-      ? ns === undefined
-        ? Number(stat.mtimeMs)
-        : Number(ns / 1_000_000n) + Number(ns % 1_000_000n) / 1_000_000
-      : stat.mtimeMs;
-  return {
-    size,
-    mtimeMs,
-    dev: typeof stat.dev === 'bigint' ? stat.dev.toString() : stat.dev,
-    ino: typeof stat.ino === 'bigint' ? stat.ino.toString() : stat.ino,
-  };
 }
 
 export function fileIdentityValue(value: unknown, positive = false): boolean {

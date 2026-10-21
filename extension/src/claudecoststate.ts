@@ -1,3 +1,4 @@
+import { revisionOf } from './filerevision';
 import fs from 'node:fs';
 import { meterRead } from './readmeter';
 import { createHash } from 'node:crypto';
@@ -72,6 +73,7 @@ export interface ClaudeCostCapture {
 }
 export interface CostStateDependency {
   file: string;
+  sourceIdentity?: string;
   size: number;
   mtimeMs: number;
   parserGeneration: number;
@@ -255,6 +257,7 @@ export function costStateIdentity(dependencies: readonly CostStateDependency[]):
 export function costStateDependency(file: SpendFileIndex, index = 0): CostStateDependency {
   return {
     file: file.file,
+    ...(file.sourceIdentity === undefined ? {} : { sourceIdentity: file.sourceIdentity }),
     size: file.size,
     mtimeMs: file.mtimeMs,
     parserGeneration: file.parserGeneration ?? 0,
@@ -573,13 +576,20 @@ export function reconcileClaudeCostState(
       }
       return { progress, complete: false };
     }
-    let fd: number;
+    let fd: number | undefined;
     try {
-      const stat = fs.statSync(file.file);
-      if (stat.size !== file.size || stat.mtimeMs !== file.mtimeMs)
-        return { progress, complete: false, invalidated: true };
       fd = fs.openSync(file.file, 'r');
+      const stat = revisionOf(fs.fstatSync(fd, { bigint: true }));
+      if (
+        stat.size !== file.size ||
+        stat.mtimeMs !== file.mtimeMs ||
+        (file.sourceIdentity !== undefined && file.sourceIdentity !== `${stat.dev}:${stat.ino}`)
+      ) {
+        fs.closeSync(fd);
+        return { progress, complete: false, invalidated: true };
+      }
     } catch {
+      if (fd !== undefined) fs.closeSync(fd);
       return { progress, complete: false, invalidated: true };
     }
     const reducer = factory(progress.reducer);
@@ -728,8 +738,12 @@ export function reconcileClaudeCostState(
   if (complete)
     for (const file of dependencies) {
       try {
-        const stat = fs.statSync(file.file);
-        if (stat.size !== file.size || stat.mtimeMs !== file.mtimeMs)
+        const stat = revisionOf(fs.statSync(file.file, { bigint: true }));
+        if (
+          stat.size !== file.size ||
+          stat.mtimeMs !== file.mtimeMs ||
+          (file.sourceIdentity !== undefined && file.sourceIdentity !== `${stat.dev}:${stat.ino}`)
+        )
           return { progress, complete: false, invalidated: true };
       } catch {
         return { progress, complete: false, invalidated: true };

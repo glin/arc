@@ -757,12 +757,13 @@ export interface ListingFacts {
   // Each session another session started, that session and the relation, as
   // `sessionParentsKey` spells them.
   sessionParents: string;
+  sourceSignature?: string;
 }
 
 // Signs listed source revisions, child discovery, session names, parent relationships, and selection.
 // Name and parent updates can change the drawn panel without changing a transcript.
 export function listingSignature(now: ListingFacts): string {
-  return `${now.showing}|${now.threadNames}|${now.sessionParents}|${spendSourceSignature(now)}`;
+  return `${now.showing}|${now.threadNames}|${now.sessionParents}|${now.sourceSignature ?? spendSourceSignature(now)}`;
 }
 
 // Signs source revisions and child discovery for Project cost offers.
