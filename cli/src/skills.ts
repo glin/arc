@@ -239,7 +239,7 @@ function describeEntry(destination: string): string {
 const agentNames: Record<SkillAgent, string> = { claude: 'Claude Code', codex: 'Codex' };
 const otherAgent = (agent: SkillAgent): SkillAgent => (agent === 'claude' ? 'codex' : 'claude');
 // A personal skills folder is linked when it resolves anywhere but its own place under the home folder.
-function skillFolder(agent: SkillAgent, nativeHome: string): { input: string; area: string; linked: boolean } {
+export function skillFolder(agent: SkillAgent, nativeHome: string): { input: string; area: string; linked: boolean } {
   const relative = path.join(agent === 'claude' ? '.claude' : '.agents', 'skills');
   const input = path.join(nativeHome, relative);
   const area = canonicalToolPath(input);

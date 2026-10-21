@@ -34,19 +34,11 @@ install_claude_hooks() {
   echo "==> Setting up Claude snapshot plugin"
   check_claude_marketplace "$repo" "$catalog" "$source_type" >/dev/null || return 1
   marketplace_state="$ARC_CLAUDE_MARKETPLACE_STATE"
-  if [ "$source_type" = directory ]; then
-    echo "==> Local plugin source: $catalog"
-  else
-    echo "==> Plugin catalog: $catalog"
-  fi
+  echo "==> Plugin catalog: $catalog"
   if [ "$marketplace_state" = missing ]; then
     if ! run_claude_hook_command "$claude_cli" plugin marketplace add "$catalog" </dev/null; then
       if [ "${ARC_INSTALL_CANCEL:-0}" -ne 0 ]; then return "$ARC_INSTALL_CANCEL"; fi
-      if [ "$source_type" = directory ]; then
-        echo "error: Claude rejected the local plugin source: $catalog. Check its marketplace and plugin files." >&2
-      else
-        echo "error: hosted catalog is unavailable or Claude rejected it: $catalog. Published HTTPS catalog and plugin assets are required." >&2
-      fi
+      echo "error: hosted catalog is unavailable or Claude rejected it: $catalog. Published HTTPS catalog and plugin assets are required." >&2
       return 1
     fi
   fi

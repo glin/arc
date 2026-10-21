@@ -828,7 +828,7 @@ test.concurrent.each([
         assert.notEqual(changedHelper, originalHelper);
         fs.writeFileSync(helper, changedHelper);
       }
-      const result = await f.run(['code']);
+      const result = await f.run(['--marketplace-url', catalogUrl, 'code']);
       assert.equal(result.status, 143, result.stdout + result.stderr);
       assert.match(result.commands, /cancelled-after-child/);
       assert.doesNotMatch(
@@ -1030,10 +1030,11 @@ import path from 'node:path';
 import {spawnSync} from 'node:child_process';
 import {BundledTools, readToolPackage} from './src/bundledtools';
 import {ClaudePluginSetup, pluginTarget} from './src/claudeplugin';
-if (process.argv.slice(2).join(' ') !== '--snapshots') throw Error('Unexpected setup operation');
+if (process.argv[2] !== '--snapshots') throw Error('Unexpected setup operation');
 const tools = new BundledTools(readToolPackage(__dirname), process.env.ARC_HOME);
 const target = pluginTarget(process.cwd(), process.env.CLAUDE_CONFIG_DIR,
   {command:process.env.ARC_TEST_REAL_NODE,leadingArgs:[process.env.ARC_TEST_CLAUDE_FIXTURE],env:{},problem:null},'fixture');
+target.checkout = process.argv[3] === '--checkout' ? process.argv[4] : undefined;
 const run = async command => {
   if(command.args.join(' ') === '--version' && command.command === process.env.ARC_TEST_REAL_NODE && command.args.length === 1) return {stdout:process.version,stderr:''};
   const result = spawnSync(command.command,command.args,{cwd:command.cwd,env:command.env,input:'',encoding:'utf8'});
@@ -1486,7 +1487,7 @@ for (const missing of ['SKILL.md', 'compaction.md']) {
 }
 
 test.concurrent(
-  'local installation refreshes its directory marketplace and migrates owned legacy hooks after plugin success',
+  'local installation reuses managed plugin bytes and cleans owned legacy hooks after plugin success',
   { ...SUBPROCESS, timeout: runBudget(2) },
   async () => {
     const f = installerFixture();
@@ -1496,33 +1497,68 @@ test.concurrent(
         assert.equal(r.status, 0, r.stderr);
         assert.match(
           r.commands,
-          /claude plugin marketplace list --json[\s\S]*npm ci[\s\S]*editor code --install-extension[\s\S]*claude plugin marketplace update/,
+          /npm ci[\s\S]*editor code --install-extension[\s\S]*claude plugin marketplace list --json/,
         );
         assert.equal((r.commands.match(/marketplace add /g) ?? []).length, run ? 0 : 1);
-        assert.match(r.commands, /plugin marketplace update arc/);
-        assert.match(r.commands, /plugin update arc-hooks@arc --scope user/);
+        if (!run) assert.match(r.commands, /plugin marketplace update arc/);
+        else assert.doesNotMatch(r.commands, /plugin (?:install|update) /);
         assert.doesNotMatch(r.commands, /plugin enable|curl|npm install/);
         assert.match(r.stdout, /Built extension version: 0.0.9/);
-        assert.match(r.stdout, /Installed plugin version: 0.1.0/);
-        assert.ok(
-          r.stdout.includes(`Plugin directory: ${path.join(fs.realpathSync(f.source), 'plugins', 'arc-hooks')}`),
-          r.stdout,
-        );
-        assert.doesNotMatch(r.stdout, /Plugin archive/);
+        assert.match(r.stdout, /snapshot plugin is installed and enabled/);
         const [marketplace] = JSON.parse(fs.readFileSync(f.marketplaces));
         assert.equal(marketplace.source, 'directory');
-        assert.equal(fs.realpathSync(marketplace.path), fs.realpathSync(f.source));
+        assert.ok(path.relative(path.join(f.dir, 'arc home'), marketplace.path).startsWith('tools'));
         assert.equal(fs.existsSync(f.managed), false);
         assert.deepEqual(fs.readdirSync(f.temporary), []);
       }
       assert.equal(JSON.parse(fs.readFileSync(f.settings)).hooks, undefined);
       assert.equal(JSON.parse(fs.readFileSync(path.join(f.dir, 'codex home', 'hooks.json'))).hooks, undefined);
       const [plugin] = JSON.parse(fs.readFileSync(f.plugins));
-      assert.equal(
-        fs.realpathSync(plugin.readFromFolder),
-        fs.realpathSync(path.join(f.source, 'plugins', 'arc-hooks')),
-      );
+      assert.match(plugin.readFromFolder, /releases[\\/][a-f0-9]{64}[\\/]plugin$/);
       exerciseManagedHooks({ ...f, managed: plugin.readFromFolder });
+    } finally {
+      f.cleanup();
+    }
+  },
+);
+
+// Two three-step runs catch the source collision and same-version stale bytes at the installer boundary.
+// Their subprocess cost covers routing that the existing bundled helper tests cannot reach.
+test.concurrent.each(['local', 'remote'])(
+  'simulated download source transitions select changed same-version bytes starting with %s',
+  { ...SUBPROCESS, timeout: runBudget(3) },
+  async (first) => {
+    const f = installerFixture();
+    try {
+      const { bundledTools } = await import('./../extension/scripts/bundled-tools.mjs');
+      const capture = path.join(f.source, 'plugins/arc-hooks/scripts/stop-manifest.cjs');
+      fs.appendFileSync(capture, '\n// Local source fixture.\n');
+      const dist = path.join(f.source, 'extension/dist');
+      const { identity } = bundledTools(dist, f.source, {});
+      fs.writeFileSync(path.join(dist, 'build-identity.json'), JSON.stringify({ tools: identity }));
+      const wanted = require('node:crypto').createHash('sha256').update(fs.readFileSync(capture)).digest('hex');
+      let marketPath;
+      const identities = [];
+      for (const source of [first, first === 'local' ? 'remote' : 'local', first]) {
+        const result = await f.run([`--${source}`, 'code']);
+        assert.equal(result.status, 0, result.stdout + result.stderr);
+        const [market] = JSON.parse(fs.readFileSync(f.marketplaces));
+        if (marketPath) assert.equal(market.path, marketPath);
+        marketPath = market.path;
+        const [plugin] = JSON.parse(fs.readFileSync(f.plugins));
+        assert.equal(plugin.version, '0.1.0');
+        const digest = require('node:crypto')
+          .createHash('sha256')
+          .update(fs.readFileSync(path.join(plugin.readFromFolder, 'scripts/stop-manifest.cjs')))
+          .digest('hex');
+        assert.equal(digest === wanted, source === 'local');
+        assert.doesNotMatch(result.commands, /marketplace remove|plugin enable/);
+        identities.push(plugin.readFromFolder);
+      }
+      assert.equal(identities[0], identities[2]);
+      assert.notEqual(identities[0], identities[1]);
+      assert.ok(path.relative(path.join(f.dir, 'arc home'), marketPath).startsWith('tools'));
+      assert.deepEqual(fs.readdirSync(f.temporary), []);
     } finally {
       f.cleanup();
     }
@@ -1543,7 +1579,7 @@ test.concurrent(
             { id: 'arc-hooks@arc', scope: 'user', enabled: false },
           ]),
         );
-        const r = await f.run(['code'], { ARC_TEST_STILL_DISABLED: stillDisabled });
+        const r = await f.run(['--marketplace-url', catalogUrl, 'code'], { ARC_TEST_STILL_DISABLED: stillDisabled });
         assert.equal(r.status, stillDisabled ? 1 : 0, r.stderr);
         assert.match(r.commands, /plugin enable arc-hooks@arc --scope user/);
       }
@@ -1554,7 +1590,7 @@ test.concurrent(
 );
 
 test.concurrent(
-  'local installation accepts its canonical directory in flat and nested Claude marketplace metadata',
+  'local installation preserves its canonical legacy checkout and explains managed setup',
   { ...SUBPROCESS, timeout: runBudget(4) },
   async () => {
     const f = installerFixture();
@@ -1580,9 +1616,13 @@ test.concurrent(
       for (const entry of entries) {
         fs.writeFileSync(f.marketplaces, JSON.stringify([entry]));
         const r = await f.run();
-        assert.equal(r.status, 0, r.stderr);
+        assert.equal(r.status, 1, r.stderr);
         assert.doesNotMatch(r.commands, /marketplace (?:add|remove)|curl/);
-        assert.match(r.commands, /plugin marketplace update arc/);
+        assert.match(r.stderr, /uses this checkout/);
+        assert.match(r.stderr, /Expected source: .*tools/);
+        assert.ok(r.stderr.toLowerCase().includes(path.dirname(f.settings).toLowerCase()));
+        assert.match(r.stderr, /--no-hooks.*compatibility/);
+        assert.equal(fs.readFileSync(f.settings, 'utf8'), f.legacy);
         assert.deepEqual(JSON.parse(fs.readFileSync(f.marketplaces)), [entry]);
       }
     } finally {
@@ -1605,11 +1645,8 @@ test.concurrent(
         fs.writeFileSync(f.marketplaces, JSON.stringify([entry]));
         const r = await f.run();
         assert.equal(r.status, 1, r.stderr);
-        assert.match(r.stderr, /marketplace belongs to another source/);
-        assert.ok(
-          r.stderr.includes(`Expected local directory: ${f.source.replaceAll(String.fromCharCode(92), '/')}`),
-          r.stderr,
-        );
+        assert.match(r.stderr, /marketplace uses another source/);
+        assert.ok(r.stderr.includes('Expected source: '), r.stderr);
         const source = typeof entry.source === 'object' ? entry.source : entry;
         assert.ok(r.stderr.includes(source.path ?? source.url), r.stderr);
         assert.doesNotMatch(r.commands, /plugin (?:marketplace (?:add|update|remove)|install|update|enable)/);
@@ -1784,7 +1821,7 @@ test.concurrent(
       assert.equal(receipt.components.editors, 'partial');
       const failed = await f.run(['code'], { ARC_TEST_FAIL_EDITOR: 'code' });
       assert.equal(failed.status, 1);
-      assert.match(failed.commands, /claude plugin marketplace list --json/);
+      assert.doesNotMatch(failed.commands, /claude plugin/);
       assert.doesNotMatch(failed.commands, /plugin (?:marketplace (?:add|update|remove)|install|update|enable|list)/);
     } finally {
       f.cleanup();
@@ -1805,7 +1842,7 @@ test.concurrent(
       const current = await f.run(['code'], {}, { cwd: f.source, scriptFile: bashPath(f.dir) + '/standalone.sh' });
       assert.equal(current.status, 0, current.stderr);
       assert.doesNotMatch(current.commands, /curl/);
-      assert.match(current.stdout, /Local plugin source:/);
+      assert.match(current.commands, /source-snapshot-setup/);
       const r = await f.run(['--local', 'code'], {}, { stdin: true, cwd: f.source });
       assert.equal(r.status, 0, r.stderr);
       assert.doesNotMatch(r.commands, /curl/);
@@ -2372,7 +2409,7 @@ test.concurrent.each([
 });
 
 test.concurrent(
-  'source installer rejects missing tools and old Claude before installation',
+  'source installer reports missing tools and unsupported Claude',
   { ...SUBPROCESS, timeout: runBudget(4) },
   async () => {
     const f = installerFixture();
@@ -2385,7 +2422,8 @@ test.concurrent(
       assert.match(oldRemote.stderr, /needs Claude Code 2.1.268/);
       assert.match(oldRemote.commands, /curl[\s\S]*npm[\s\S]*editor/);
       const local = await f.run(['code'], { ARC_TEST_CLAUDE_VERSION: '2.1.223' });
-      assert.equal(local.status, 0, local.stderr);
+      assert.equal(local.status, 1, local.stderr);
+      assert.match(local.stderr, /needs Claude Code 2.1.268/);
       assert.equal(bash('PATH="$1"; command -v npm', bashPath(f.hostBin)), bashPath(f.hostBin) + '/npm');
       const npm = path.join(f.bin, 'npm');
       fs.unlinkSync(npm);

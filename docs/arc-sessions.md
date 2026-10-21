@@ -17,9 +17,9 @@ Bundled files are part of an artifact. An installed skill exists in an agent's s
 
 ## Install the parts you need
 
-`install.sh` builds and installs the editor extension. It also sets up the optional Claude plugin unless passed `--no-hooks`. A local source installation uses the checkout's code. A remote source installation resolves the selected ref before downloading it.
+`install.sh` builds and installs the editor extension. It also sets up the optional Claude plugin unless passed `--no-hooks`. Both default source installations copy matching plugin bytes into managed storage. Local source selects the checkout bytes. Remote source resolves its ref before downloading. Existing checkout marketplaces require [one-time recovery](development.md#legacy-checkout-plugin-recovery).
 
-A VSIX installs the extension. Claude marketplace installation selects `arc-hooks`, not the CLI or session skill. [Development setup](development.md#dependencies) owns local plugin commands. Session commands use Arc's local window channel without requiring Claude hooks. Codex records come from its rollouts.
+A VSIX installs the extension. Claude marketplace installation selects `arc-hooks`, not the CLI or session skill. [Installer testing](development.md#isolated-installer-tests) owns local plugin commands. Session commands use Arc's local window channel without requiring Claude hooks. Codex records come from its rollouts.
 
 Arc has no editor command named **Arc: Install CLI**. To update the standalone CLI, build a current source checkout and install its tarball. [CLI installation](../cli/README.md#install) owns the commands and Node requirements. npm publication is deferred, so a registry `latest` install is not an available release path.
 

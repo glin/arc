@@ -44,6 +44,8 @@ beforeAll(async () => {
 
 test('source identity follows the clean physical checkout', () => {
   assert.deepEqual(sourceIdentity(root), { sourceCommit: expected, dirty: false });
+  assert.deepEqual(sourceIdentity(root, expected, 'false'), { sourceCommit: expected, dirty: false });
+  assert.throws(() => sourceIdentity(root, expected, 'true'), /conflicts with the source checkout state/);
 });
 
 test('source identity includes untracked checkout changes and accepts the matching uppercase revision', () => {
@@ -72,10 +74,64 @@ test('archive identity ignores an enclosing repository and validates explicit re
   const supplied = 'a'.repeat(40);
   assert.deepEqual(sourceIdentity(archive), { sourceCommit: null, dirty: null });
   assert.deepEqual(sourceIdentity(archive, supplied), { sourceCommit: supplied, dirty: null });
+  assert.deepEqual(sourceIdentity(archive, supplied, 'true'), { sourceCommit: supplied, dirty: true });
+  assert.deepEqual(sourceIdentity(archive, supplied, 'false'), { sourceCommit: supplied, dirty: false });
+  assert.throws(() => sourceIdentity(archive, undefined, 'true'), /requires ARC_SOURCE_COMMIT/);
+  assert.throws(() => sourceIdentity(archive, supplied, 'unknown'), /true or false/);
   for (const invalid of ['', 'HEAD', 'a'.repeat(39), 'g'.repeat(40), supplied + '\n']) {
     assert.throws(() => sourceIdentity(archive, invalid), /full forty-character hexadecimal source revision/);
   }
   assert.throws(() => sourceIdentity(root, supplied), /conflicts with the source checkout revision/);
+});
+
+// This build crosses the installer's environment clearing and the staged tree's missing Git metadata.
+test('staged local builds retain the selected commit and tracked dirty state', async () => {
+  const driver = await import('./test-installer.mjs');
+  const checkout = fixture();
+  const run = driver.createSandbox();
+  try {
+    const identityModule = require('node:url').pathToFileURL(path.join(__dirname, 'source-identity.mjs')).href;
+    fs.writeFileSync(path.join(checkout, 'package.json'), JSON.stringify({ scripts: { build: 'node build.mjs' } }));
+    const build = path.join(checkout, 'build.mjs');
+    fs.writeFileSync(
+      build,
+      `import {sourceIdentity} from ${JSON.stringify(identityModule)}; console.log(JSON.stringify(sourceIdentity(import.meta.dirname)));`,
+    );
+    git(checkout, 'add', '.');
+    commit(checkout);
+    const expected = git(checkout, 'rev-parse', 'HEAD');
+    fs.writeFileSync(path.join(checkout, 'untracked.txt'), 'private fixture');
+    for (const dirty of [false, true]) {
+      if (dirty) fs.appendFileSync(build, '\n// Changed source fixture.\n');
+      const source = driver.stageSource(run, checkout);
+      assert.equal(fs.existsSync(path.join(source, '.git')), false);
+      assert.equal(fs.existsSync(path.join(source, 'untracked.txt')), false);
+      await driver.npmWrapper(run);
+      const text = await driver.execute(
+        run,
+        driver.bashExecutable(),
+        [
+          '-c',
+          'env -u ARC_SOURCE_COMMIT -u ARC_SOURCE_DIRTY npm run build; status=$?; echo "npm notice fixture trailing stderr" >&2; exit "$status"',
+        ],
+        { cwd: source },
+      );
+      assert.ok(text.includes('npm notice fixture trailing stderr'), text);
+      const identities = text.split('\n').filter((line) => line.startsWith('{"sourceCommit":'));
+      assert.equal(identities.length, 1, text);
+      assert.deepEqual(JSON.parse(identities[0]), { sourceCommit: expected, dirty });
+    }
+    fs.unlinkSync(build);
+    const source = driver.stageSource(run, checkout, { include: ['untracked.txt'] });
+    assert.equal(fs.existsSync(path.join(source, 'build.mjs')), false);
+    assert.equal(fs.readFileSync(path.join(source, 'untracked.txt'), 'utf8'), 'private fixture');
+    driver.stageSource(run, checkout, { baseline: expected });
+    assert.equal(fs.existsSync(path.join(source, 'build.mjs')), true);
+    assert.equal(fs.existsSync(path.join(source, 'untracked.txt')), false);
+  } finally {
+    driver.cleanupSandbox(run, { list: () => [] });
+    fs.rmSync(checkout, { recursive: true, force: true });
+  }
 });
 
 test('unreadable checkout identity remains unavailable and refuses an unchecked override', async () => {

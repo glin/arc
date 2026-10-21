@@ -281,8 +281,8 @@
   },
   "scripts/editor-cli.test.js": {
     "reason": "Editor launch and installer shell commands must preserve quoting, cancellation, native entry selection, manifest and lockfile bytes, and component outcomes.",
-    "cases": 58,
-    "matricesSha256": "3b0c500866ba7648bec9d1165c25895ce1740d940c2003f8d133f96a29a399d6"
+    "cases": 59,
+    "matricesSha256": "75679719329c35f609ca0169962fe5ec3ae4e235dcc94cbd0860ac57558404c6"
   },
   "scripts/extension-test-runner.test.js": {
     "reason": "Real runner commands must classify files, reject invalid selection, and preserve browser readiness status.",
@@ -306,8 +306,13 @@
   },
   "scripts/source-identity.test.js": {
     "reason": "Real Git source identity must agree with build inputs and reject inconsistent repository metadata.",
-    "cases": 6,
-    "matricesSha256": "5200b566785d27825dfe168f2f4c5ec283c16d16be2ae229c0126cde5598161f"
+    "cases": 7,
+    "matricesSha256": "ff749e50ac0cfa0af68286b97109e3d450614791f00bd63b02e4956e93608a0b"
+  },
+  "scripts/test-installer.test.js": {
+    "reason": "Printed checkout launchers must preserve active external Claude sessions, terminal receipts, detached descendants, and PID reuse alongside installer identity and alias boundaries.",
+    "cases": 10,
+    "matricesSha256": "c45cd0f994ca1400a09e483d3ee8f9a481b2e700743e54003ef4da9b4f77ad41"
   },
   "scripts/test-lanes.test.js": {
     "reason": "Linked command entry points must execute and retain process status. Direct checks guard category and admission drift.",

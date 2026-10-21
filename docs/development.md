@@ -19,7 +19,7 @@ The last command installs Playwright's bundled Chromium in the per-user Playwrig
 
 `esbuild` is native. Install dependencies on the operating system that runs the commands. A `node_modules` tree copied from another operating system will not run it.
 
-The source installer builds and installs the editor extension from local or temporary downloaded source. Its Claude plugin setup and legacy hook cleanup are described in [Snapshot model](architecture.md#snapshot-model). To exercise the optional Claude plugin from a checkout, run `claude --plugin-dir ./plugins/arc-hooks`. Validate the plugin and marketplace with `claude plugin validate --strict ./plugins/arc-hooks` and `claude plugin validate --strict .`.
+The source installer builds and installs the editor extension from local or temporary downloaded source. Its Claude plugin setup and legacy hook cleanup are described in [Snapshot model](architecture.md#snapshot-model). [Isolated installer tests](#isolated-installer-tests) supplies the checkout plugin workflow. Validate the plugin and marketplace with `claude plugin validate --strict ./plugins/arc-hooks` and `claude plugin validate --strict .`.
 
 The panel shots and their test write WebP files with the ImageMagick 7 `magick` command. Put `magick` on the `PATH` before running the full test suite.
 
@@ -30,9 +30,87 @@ node extension/dist/setup.cjs --commands
 node extension/dist/setup.cjs --snapshots
 ```
 
-The source installer uses the checkout marketplace for local development. Downloaded source uses the built snapshot helper to preserve matching hooks in durable storage. `--remote` forces download for development testing. `--repo` and `--ref` select the downloaded source. `--marketplace-url` explicitly selects an independently published HTTPS catalog. `--no-hooks` skips Claude plugin setup and legacy cleanup. Skill selection is independent and uses the matching built CLI. [Skill installation](arc-sessions.md#install-the-parts-you-need) owns its selectors and destinations.
+Both default source routes use the built snapshot helper to preserve matching hooks in durable storage. Installed local builds use frozen plugin bytes. Rebuild and reinstall to select changed files. `--remote` forces download for development testing. `--repo` and `--ref` select the downloaded source. `--marketplace-url` explicitly selects an independently published HTTPS catalog. `--no-hooks` skips Claude plugin setup and legacy cleanup. Skill selection is independent and uses the matching built CLI. [Skill installation](arc-sessions.md#install-the-parts-you-need) owns its selectors and destinations.
 
 When the installer reports component outcomes, it uses readable text by default. `--json` renders those outcomes as the final structured output line. Help and early argument or prerequisite refusals omit that result. Hook-only preflight failures preserve admitted editor and skill work. Exit 0 means selected work succeeded or preserved an exact stable external skill. Exit 2 means global argument or prerequisite refusal before installation. Exit 1 means incomplete requested work. Delivered HUP, INT, and TERM preserve statuses 129, 130, and 143. The shell records cancellation and awaits its unreaped skill child before deleting temporary source. No platform/runtime forwarding branch has native graceful-delivery acceptance, so handlers wait without forwarding. Automated disposable-home checks do not establish authenticated native skill discovery.
+
+## Isolated installer tests
+
+Use `scripts/test-installer.mjs` to test source installation without writing to daily editor, agent, or Arc directories. Pass the installed editor directory explicitly. The driver creates a fresh sandbox under the physical temporary directory and prints its absolute path.
+
+```bash
+node scripts/test-installer.mjs install --source local --checkout /absolute/arc --editor /absolute/editor-install
+node scripts/test-installer.mjs install --source remote --repo glin/arc --ref PUBLISHED_SHA --editor /absolute/editor-install
+node scripts/test-installer.mjs sequence --first local --checkout /absolute/arc --repo glin/arc --ref PUBLISHED_SHA --editor /absolute/editor-install
+node scripts/test-installer.mjs sequence --first remote --checkout /absolute/arc --repo glin/arc --ref PUBLISHED_SHA --editor /absolute/editor-install
+```
+
+A sequence installs the first source, the other source, then the first source again in one sandbox. Independent install commands use separate sandboxes. A remote ref must already exist on GitHub. Unpublished candidate tests use substituted download fixtures and establish simulated source switching only. Source revision, network, archive, build, and plugin failures retain separate evidence. The manifest records the bootstrap digest independently of the downloaded commit.
+
+Installed workflows copy tracked working source into the sandbox without Git metadata, dependencies, or private agent folders. Repeat `--include RELATIVE_FILE` to select an untracked source file. Its source manifest records the original commit, tracked modifications, selected extra files, and each file digest. Staged builds retain that commit and dirty state through the existing build identity helper. The extension version remains separate from the commit. Installed checks require one Arc extension identity and match its bundled payload and plugin digests against the selected managed plugin. Installed extension identities and selected plugin digests live in `installer-run.json`. Every child command retains a private log under `evidence`.
+
+The driver resolves actual Node home, Arc storage, Claude configuration, Codex home, and both skill destinations before installation. Its editor wrapper always supplies isolated user-data and extension directories. Private npm caches, application-data directories, XDG directories, and temporary files remain in the sandbox. Executable discovery retains the caller's tool search path.
+
+Test an independently hosted catalog in its own sandbox:
+
+```bash
+node scripts/test-installer.mjs install --source local --checkout /absolute/arc --marketplace-url HTTPS_CATALOG --editor /absolute/editor-install
+```
+
+The hosted catalog selects its plugin independently of the extension revision. The manifest records Claude's selected plugin metadata and file digests. A successful bundled-plugin test does not establish hosted catalog availability.
+
+For live checkout hooks, prepare a fresh Claude home and run the printed scoped launcher:
+
+```bash
+node scripts/test-installer.mjs checkout-plugin --checkout /absolute/arc
+```
+
+That launcher loads the selected live checkout's plugin with `--plugin-dir`. Later sessions load later checkout edits. The checkout remains a read-only source outside cleanup ownership. The launcher enters the private workspace and keeps home, Claude, Arc, and Codex state inside the sandbox. Windows launchers convert executable discovery paths through Git Bash before restoring the private environment. The driver checks that workspace and refuses an installed `arc-hooks@arc` in its home. This workflow requires no installed editor artifacts. Never combine installed hooks and `--plugin-dir` hooks in one session.
+
+Check registration and selected bytes, then remove a stopped run:
+
+```bash
+node scripts/test-installer.mjs check-plugin --run-root /absolute/owned-run
+node scripts/test-installer.mjs cleanup --run-root /absolute/owned-run
+```
+
+Cleanup refuses unknown manifests, running or unsettled children, changed root identity, and unfamiliar or external links. Checkout launches retain process creation identities and require a terminal receipt even when their executable and plugin paths sit outside the sandbox. An interrupted launcher or a surviving observed descendant leaves its launch unsettled. It unlinks admitted aliases before removing their targets. Keep failed runs until their private evidence has been reviewed.
+
+Filesystem isolation does not isolate Keychain, credential-manager, keyring, or editor secret storage. Perform authenticated acceptance in a disposable operating-system account or virtual machine with separate credentials. An alternative credential boundary requires explicit approval and an inventory of external state and cleanup. Do not sign in from a disposable home until that boundary is settled. The driver makes no model calls and reports registration evidence only.
+
+Native acceptance requires real Claude on Windows, macOS, and Linux. Run both sequences with two payloads whose plugin versions remain `0.1.0`. Check reported paths and selected file digests after every step. In a fresh scratch repository, exercise PreToolUse with an existing file and Stop after an edit. Check original baseline bytes, the manifest, and the trigger for installed local, installed downloaded, and checkout-plugin sessions. Registration alone does not establish snapshot capture.
+
+## Legacy checkout plugin recovery
+
+An existing checkout marketplace remains user-owned. A local reinstall preserves it and reports incomplete hook setup until migration. The diagnostic names the checkout, expected managed source, and Claude home. `--no-hooks` permits extension updates while skipping hook refresh and compatibility checks. This does not establish compatibility between arbitrary older hooks and the new extension. Matching managed payloads are the supported source-switching path.
+
+Rehearse the same-path upgrade in disposable state before changing a daily installation:
+
+```bash
+node scripts/test-installer.mjs legacy-upgrade --baseline 048538a873d1c5edfa096aa5d759f6135e12c128 --checkout /absolute/arc --editor /absolute/editor-install
+node scripts/test-installer.mjs legacy-upgrade --baseline 048538a873d1c5edfa096aa5d759f6135e12c128 --checkout /absolute/arc --editor /absolute/editor-install --via-link
+```
+
+The driver registers the baseline with real Claude, then overlays candidate files at the same path. It checks the legacy refusal and `--no-hooks`, enabled and disabled backup restoration, managed migration, and exact-path direct-hook cleanup. A simulated interruption after declaration removal exercises restoration. The physical checkout's direct hook must disappear. Unrelated hooks and alias-string hooks must survive. The alias variant uses a Windows junction or Unix directory symlink inside its owned sandbox. Native rehearsal results remain required on each target platform.
+
+For a daily migration, first obtain explicit authorization for that machine. Stop every affected Claude session. List the current marketplaces and plugins:
+
+```bash
+claude plugin marketplace list --json
+claude plugin list --json
+```
+
+Record the original source, plugin version, user scope, enabled state, selected path, and selected file digests. Stop if any `arc` plugin has project, local, managed, duplicate, policy-controlled, or unfamiliar ownership. Back up the complete selected Claude configuration, affected marketplace cache, plugin registration, and plugin data into a private location. Preserve Arc snapshots and direct legacy hook settings. Rehearse byte-for-byte restoration with that platform's disposable fixture before removing anything.
+
+After ownership, backup, and restoration checks succeed, remove only the known user plugin and declaration:
+
+```bash
+claude plugin uninstall arc-hooks@arc --scope user --keep-data --json
+claude plugin marketplace remove arc --scope user --json
+bash install.sh --local
+```
+
+If the plugin was disabled, preserve that choice. Complete managed installation under explicit migration authority, then disable `arc-hooks@arc` at user scope before restarting sessions. Check selected bytes, scope, and enabled state after installation. A failed migration requires restoring the private backup of the original owned configuration before daily sessions restart. Preserve the backup until a fresh Claude session passes functional acceptance. Subsequent local and downloaded builds reuse the same managed root.
 
 ## Panel screenshots
 

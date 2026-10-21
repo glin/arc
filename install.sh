@@ -215,7 +215,7 @@ RECEIPT
         echo 'Build Arc from local or temporary downloaded source and install its Claude plugin.'
         echo 'Auto mode uses a complete local checkout, otherwise downloads glin/arc main.'
         echo '--remote forces source download for development testing.'
-        echo 'Downloaded source copies matching hooks into durable Arc storage.'
+        echo 'Local and downloaded source copy matching hooks into durable Arc storage.'
         echo '--marketplace-url explicitly selects an independently published catalog.'
         echo '--no-hooks preserves all Claude plugin and legacy hook settings.'
         echo 'Skills default to detected Claude and Codex executables. Repeat --skill-agent to select explicitly.'
@@ -325,12 +325,7 @@ EOF
   fi
   hook_source="$marketplace_url"
   if [ "$marketplace_override" -eq 0 ]; then
-    if [ "$local_source" -eq 1 ]; then
-      hook_source="$REPO"
-      hook_source_type=directory
-    else
-      hook_source_type=bundled
-    fi
+    hook_source_type=bundled
   fi
   if [ "$setup_hooks" -eq 1 ] && [ "$hooks_ready" -eq 1 ] && [ "$hook_source_type" = url ] && [ "$ARC_INSTALL_CANCEL" -eq 0 ]; then
     version="$("$claude_cli" --version || true)"
@@ -397,9 +392,9 @@ EOF
   chmod +x node_modules/.bin/* 2>/dev/null || true
   if [ "$ARC_INSTALL_CANCEL" -ne 0 ]; then exit "$ARC_INSTALL_CANCEL"; fi
   if [ "$local_source" -eq 1 ]; then
-    run_child env -u ARC_SOURCE_COMMIT npm run build
+    run_child env -u ARC_SOURCE_COMMIT -u ARC_SOURCE_DIRTY npm run build
   else
-    ARC_SOURCE_COMMIT="$sha" run_child npm run build
+    ARC_SOURCE_COMMIT="$sha" run_child env -u ARC_SOURCE_DIRTY npm run build
   fi
   if [ "$ARC_INSTALL_CANCEL" -ne 0 ]; then exit "$ARC_INSTALL_CANCEL"; fi
   local VSIX="$ARC_INSTALL_TEMP/arc.vsix"
@@ -453,7 +448,11 @@ EOF
     ARC_INSTALL_HOOKS=completed
     if ! {
       if [ "$hook_source_type" = bundled ]; then
-        run_child "$BASH" -c 'cd "$1" && exec node "$2" --snapshots' bash "$invocation_cwd" "$REPO/extension/dist/setup.cjs"
+        if [ "$local_source" -eq 1 ]; then
+          run_child "$BASH" -c 'cd "$1" && exec node "$2" --snapshots --checkout "$3"' bash "$invocation_cwd" "$REPO/extension/dist/setup.cjs" "$REPO"
+        else
+          run_child "$BASH" -c 'cd "$1" && exec node "$2" --snapshots' bash "$invocation_cwd" "$REPO/extension/dist/setup.cjs"
+        fi
       else
         install_claude_hooks "$REPO" "$hook_source" "$hook_source_type"
       fi

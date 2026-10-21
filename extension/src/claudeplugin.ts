@@ -23,9 +23,12 @@ export interface PluginTarget {
   launch: Launch;
   env: NodeJS.ProcessEnv;
   runtime?: string;
+  checkout?: string;
 }
 
-export const canonicalPluginPath = canonicalToolPath;
+export function canonicalPluginPath(value: string, platform = process.platform): string {
+  return canonicalToolPath(platform === 'win32' ? value.replace(/^\/([a-z])\//i, '$1:/') : value, platform);
+}
 
 export function pluginTarget(cwd: string, home: string, launch: Launch, host: string): PluginTarget {
   const folder = canonicalPluginPath(cwd);
@@ -419,10 +422,22 @@ export class ClaudePluginSetup {
         typeof source.path === 'string' &&
         canonicalPluginPath(source.path) ===
           canonicalPluginPath(this.tools?.configuration(target.home).source ?? this.expectedDirectory!));
-    if (!owned)
+    if (!owned) {
+      const actual = `${String(type)} (${String(source.path ?? source.url ?? source.repo ?? 'location unavailable')})`;
+      const expected = this.tools?.configuration(target.home).source ?? this.expectedDirectory ?? 'glin/arc';
+      const sameCheckout =
+        this.tools &&
+        target.checkout &&
+        type === 'directory' &&
+        typeof source.path === 'string' &&
+        canonicalPluginPath(source.path) === canonicalPluginPath(target.checkout);
       throw new Error(
-        'The arc marketplace uses another source. Preserve that setup and resolve its source in Claude before retrying. Use the local source supplied by this Arc setup.',
+        `${sameCheckout ? 'The arc marketplace uses this checkout. Local installation requires managed plugin storage.' : 'The arc marketplace uses another source.'} ` +
+          `Actual source: ${actual}. Expected source: ${expected}. Claude home: ${target.home}. ` +
+          'Existing hooks are preserved. Use --no-hooks to update the extension without refreshing or checking hook compatibility. ' +
+          'For one-time migration choices, see docs/development.md#legacy-checkout-plugin-recovery.',
       );
+    }
     return true;
   }
 
