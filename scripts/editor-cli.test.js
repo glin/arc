@@ -1708,7 +1708,7 @@ test.concurrent.each(['flat directory', 'nested directory', 'github', 'default c
       const entry = {
         'flat directory': { name: 'arc', source: 'directory', path: f.source },
         'nested directory': { name: 'arc', source: { source: 'directory', path: f.source } },
-        github: { name: 'arc', source: 'github', repo: 'glin/agent-diff-review' },
+        github: { name: 'arc', source: 'github', repo: 'example/other-marketplace' },
         'default catalog': { name: 'arc', source: 'url', url: catalogUrl },
       }[kind];
       fs.writeFileSync(f.marketplaces, JSON.stringify([entry]));

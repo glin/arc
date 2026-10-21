@@ -1496,7 +1496,7 @@ test('a subagent files figure that is a floor draws no partial word or mark', ()
 });
 
 test('a long subagent name keeps its complete hover and accessible text', () => {
-  const description = 'code_implement_2_deslop_tests_first_remaining_sol_retry_2';
+  const description = 'Review configuration parsing and document remaining compatibility limits';
   for (const sessionId of ['child-session', null]) {
     const agent: AgentRowView = {
       description,

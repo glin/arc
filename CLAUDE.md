@@ -43,8 +43,6 @@ When a design goal blocks valuable work, state the conflict and its cost. The au
 
 ## Development workflow
 
-Implement repository changes in a worktree. Review changes before landing.
-
 Before committing, check changed documentation, comments, and product messages against the writing rules. Check code claims against the relevant code. Reviewers must repeat these checks.
 
 Read `docs/development.md` before installing dependencies, repairing the panel-mockup link, linking worktree dependencies, or profiling.

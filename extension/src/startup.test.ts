@@ -213,6 +213,7 @@ import {
 } from '../scripts/panel-startup-measure/selection';
 import type { ClaudeUsageReducerState } from './transcript';
 import { costStateDependency, costStateIdentity, reconcileClaudeCostState } from './claudecoststate';
+import { measurementBuildPath, removeMeasurementTree } from '../scripts/panel-startup-measure/cleanup';
 import {
   frozenPath,
   frozenFixturePaths,
@@ -684,14 +685,14 @@ test('isolated startup rejects late completion and caps its final poll at the de
   }
 });
 
-test('isolated startup never retries cleanup after the linked target preservation check fails', () => {
+test('isolated startup propagates cleanup refusal without retrying', () => {
   const source = ts.createSourceFile(
     'measure.ts',
     fs.readFileSync(path.join(__dirname, '../scripts/panel-startup-measure/measure.ts'), 'utf8'),
     ts.ScriptTarget.Latest,
     true,
   );
-  const functions = ['run', 'removeTree'].map((name) =>
+  const functions = ['removeTree'].map((name) =>
     source.statements
       .find(
         (statement): statement is ts.FunctionDeclaration =>
@@ -701,25 +702,21 @@ test('isolated startup never retries cleanup after the linked target preservatio
   );
   let calls = 0;
   const deps = {
-    process: { platform: 'win32', env: {}, stderr: { write() {} } },
-    spawnSync: () => {
+    removeMeasurementTree: (repository: string, scratch: string, tree: string) => {
       calls++;
-      return { status: calls === 1 ? 1 : 0 };
+      assert.equal(repository, 'owned-repository');
+      assert.equal(scratch, 'owned-scratch');
+      assert.equal(tree, 'owned-build');
+      throw new Error('Cleanup refused.');
     },
-    fs: { existsSync: () => true },
-    os: { homedir: () => 'C:/home' },
-    path,
+    SCRATCH: 'owned-scratch',
     BUILD_TREE: 'owned-build',
     REPOSITORY: 'owned-repository',
-    quoted: (text: string) => text,
-    stop: (message: string) => {
-      throw new Error(message);
-    },
   };
   const code = transformSync(`const {${Object.keys(deps).join(',')}} = deps; ${functions.join('\n')} removeTree();`, {
     loader: 'ts',
   }).code;
-  assert.throws(() => new Function('deps', code)(deps), /exited with 1/);
+  assert.throws(() => new Function('deps', code)(deps), /Cleanup refused/);
   assert.equal(calls, 1);
 });
 
@@ -960,6 +957,164 @@ test('isolated startup protects baseline registrations without replacing their c
       assert.equal(fs.readFileSync(path.join(source, 'extension.ts'), 'utf8'), unsupported);
     }
   }
+});
+
+test('measurement cleanup limits build paths on Windows, macOS, and Linux', () => {
+  for (const platform of ['win32', 'darwin', 'linux'] as const) {
+    const paths = platform === 'win32' ? path.win32 : path.posix;
+    const scratch = platform === 'win32' ? 'C:\\Temp\\Measure' : '/tmp/Measure';
+    const build = paths.join(scratch, 'build');
+    assert.equal(measurementBuildPath(scratch, build, platform), true);
+    assert.equal(measurementBuildPath(scratch, build.toLowerCase(), platform), platform === 'win32');
+    for (const other of [
+      scratch,
+      `${build}-sibling`,
+      paths.join(build, 'nested'),
+      paths.join(scratch, '..', 'build'),
+    ]) {
+      assert.equal(measurementBuildPath(scratch, other, platform), false);
+    }
+  }
+});
+
+test('measurement cleanup removes its detached build while preserving linked dependency targets', () => {
+  const scratch = tempDir('startup-cleanup');
+  const repository = path.join(scratch, 'repository');
+  const build = path.join(scratch, 'build');
+  const target = path.join(scratch, 'dependencies');
+  fs.mkdirSync(repository);
+  fs.mkdirSync(target);
+  fs.writeFileSync(path.join(target, 'keep.txt'), 'dependency contents');
+  const git = (args: string[], cwd = repository) => execFileSync('git', ['-C', cwd, ...args], { encoding: 'utf8' });
+  git(['init']);
+  git(['-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '--allow-empty', '-m', 'fixture']);
+  git(['worktree', 'add', '-b', 'measurement-fixture', build]);
+  assert.throws(() => removeMeasurementTree(repository, scratch, build), /detached worktree/);
+  git(['checkout', '--detach'], build);
+  const nested = path.join(build, 'nested');
+  fs.mkdirSync(nested);
+  fs.mkdirSync(path.join(nested, '.Git'));
+  assert.throws(() => removeMeasurementTree(repository, scratch, build), /nested checkout/);
+  fs.rmdirSync(path.join(nested, '.Git'));
+  const links = [path.join(build, 'node_modules'), path.join(nested, 'node_modules')];
+  for (const link of links) fs.symlinkSync(target, link, process.platform === 'win32' ? 'junction' : 'dir');
+  if (process.platform !== 'win32') {
+    fs.symlinkSync(path.join(target, 'keep.txt'), path.join(build, 'linked-file'));
+    fs.symlinkSync(path.join(target, 'missing'), path.join(build, 'dangling-file'));
+  }
+  fs.writeFileSync(path.join(nested, 'generated.txt'), 'disposable output');
+  try {
+    removeMeasurementTree(repository, scratch, build);
+    assert.equal(fs.existsSync(build), false);
+    assert.deepEqual(fs.readdirSync(target), ['keep.txt']);
+    assert.equal(fs.readFileSync(path.join(target, 'keep.txt'), 'utf8'), 'dependency contents');
+    assert.equal(git(['worktree', 'list', '--porcelain']).includes(build.replaceAll(path.sep, '/')), false);
+    removeMeasurementTree(repository, scratch, build);
+  } finally {
+    for (const link of links) if (fs.existsSync(link)) fs.unlinkSync(link);
+  }
+});
+
+test('measurement cleanup preserves an unrelated missing worktree registration and index', () => {
+  const scratch = tempDir('startup-cleanup-registration');
+  const repository = path.join(scratch, 'repository');
+  const build = path.join(scratch, 'build');
+  const other = path.join(scratch, 'other');
+  fs.mkdirSync(repository);
+  const git = (args: string[], cwd = repository) => execFileSync('git', ['-C', cwd, ...args], { encoding: 'utf8' });
+  git(['init']);
+  git(['-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '--allow-empty', '-m', 'fixture']);
+  git(['worktree', 'add', '--detach', build]);
+  git(['worktree', 'add', '--detach', other]);
+  fs.writeFileSync(path.join(other, 'retained.txt'), 'staged work');
+  git(['add', 'retained.txt'], other);
+  const metadata = git(['rev-parse', '--absolute-git-dir'], other).trim();
+  const index = fs.readFileSync(path.join(metadata, 'index'));
+  const retained = path.join(scratch, 'temporarily-moved');
+  fs.renameSync(other, retained);
+  try {
+    removeMeasurementTree(repository, scratch, build);
+    assert.equal(fs.existsSync(build), false);
+    assert.ok(git(['worktree', 'list', '--porcelain']).includes(other.replaceAll(path.sep, '/')));
+    assert.deepEqual(fs.readFileSync(path.join(metadata, 'index')), index);
+  } finally {
+    fs.renameSync(retained, other);
+  }
+});
+
+test.for(['directory', 'file link'] as const)(
+  'measurement cleanup refuses a redirected %s marker and preserves both checkouts',
+  (kind, { skip }) => {
+    const scratch = tempDir('startup-cleanup-marker');
+    const repository = path.join(scratch, 'repository');
+    const build = path.join(scratch, 'build');
+    const other = path.join(scratch, 'other');
+    fs.mkdirSync(repository);
+    const git = (args: string[], cwd = repository) => execFileSync('git', ['-C', cwd, ...args], { encoding: 'utf8' });
+    git(['init']);
+    git(['-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '--allow-empty', '-m', 'fixture']);
+    git(['worktree', 'add', '--detach', build]);
+    git(['worktree', 'add', '--detach', other]);
+    const checkouts = [build, other].map((checkout) => {
+      fs.writeFileSync(path.join(checkout, 'retained.txt'), `staged work in ${path.basename(checkout)}`);
+      git(['add', 'retained.txt'], checkout);
+      const registration = git(['rev-parse', '--absolute-git-dir'], checkout).trim();
+      return {
+        checkout,
+        registration,
+        index: fs.readFileSync(path.join(registration, 'index')),
+        sentinel: fs.readFileSync(path.join(checkout, 'retained.txt')),
+      };
+    });
+    const marker = path.join(build, '.git');
+    const contents = fs.readFileSync(marker);
+    fs.unlinkSync(marker);
+    try {
+      if (kind === 'directory') fs.mkdirSync(marker);
+      else {
+        try {
+          fs.symlinkSync(path.join(other, '.git'), marker, 'file');
+        } catch (error) {
+          if (process.platform !== 'win32' || (error as NodeJS.ErrnoException).code !== 'EPERM') throw error;
+          skip();
+          return;
+        }
+      }
+      assert.throws(() => removeMeasurementTree(repository, scratch, build), /Git marker is not a plain file/);
+      const inventory = git(['worktree', 'list', '--porcelain']);
+      for (const { checkout, registration, index, sentinel } of checkouts) {
+        assert.ok(inventory.includes(checkout.replaceAll(path.sep, '/')));
+        assert.ok(fs.existsSync(registration));
+        assert.deepEqual(fs.readFileSync(path.join(registration, 'index')), index);
+        assert.deepEqual(fs.readFileSync(path.join(checkout, 'retained.txt')), sentinel);
+      }
+    } finally {
+      if (fs.existsSync(marker)) {
+        if (fs.lstatSync(marker).isDirectory()) fs.rmdirSync(marker);
+        else fs.unlinkSync(marker);
+      }
+      fs.writeFileSync(marker, contents);
+    }
+  },
+);
+
+test('measurement cleanup refuses redirected, unregistered, and unrelated directories', () => {
+  const scratch = tempDir('startup-cleanup-refusal');
+  const target = tempDir('startup-cleanup-kept');
+  const build = path.join(scratch, 'build');
+  fs.writeFileSync(path.join(target, 'keep.txt'), 'keep');
+  fs.symlinkSync(target, build, process.platform === 'win32' ? 'junction' : 'dir');
+  try {
+    assert.throws(() => removeMeasurementTree(target, scratch, build), /plain directory/);
+    assert.equal(fs.readFileSync(path.join(target, 'keep.txt'), 'utf8'), 'keep');
+  } finally {
+    fs.unlinkSync(build);
+  }
+  fs.mkdirSync(build);
+  assert.throws(() => removeMeasurementTree(target, scratch, target), /outside the measurement build/);
+  execFileSync('git', ['-C', target, 'init']);
+  assert.throws(() => removeMeasurementTree(target, scratch, build), /detached worktree/);
+  assert.equal(fs.existsSync(build), true);
 });
 
 test('isolated startup removes pending agent actions and rejects external frozen inputs', () => {

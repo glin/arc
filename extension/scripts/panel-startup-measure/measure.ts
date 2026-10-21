@@ -4,6 +4,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import { createHash, randomUUID } from 'node:crypto';
 import * as path from 'node:path';
+import { removeMeasurementTree } from './cleanup';
 import { instrumentSelection, measureSelection, instrumentResponse, measureResponse } from './selection';
 import { codexSessionFiles, codexSessionsRoot } from '../../src/codex.ts';
 import { DIAGNOSTICS_LOG_DIRECTORY } from '../../src/diagnosticslog.ts';
@@ -247,14 +248,7 @@ function prepareTree(commit: string): string {
 }
 
 function removeTree(): void {
-  if (!fs.existsSync(BUILD_TREE)) return;
-  const helper = path.join(os.homedir(), '.claude', 'skills', 'references', 'scripts', 'remove-worktree.py');
-  if (!fs.existsSync(helper)) throw new Error(`Cleanup helper is missing. Keep ${BUILD_TREE}.`);
-  run(
-    process.platform === 'win32' ? 'python' : 'python3',
-    [helper, '--repository', REPOSITORY, '--force', BUILD_TREE],
-    REPOSITORY,
-  );
+  removeMeasurementTree(REPOSITORY, SCRATCH, BUILD_TREE);
 }
 
 export function sanitizeMeasurementState(raw: Record<string, unknown>): Record<string, unknown> {
