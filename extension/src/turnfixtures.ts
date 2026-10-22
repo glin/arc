@@ -239,6 +239,100 @@ export async function sessionSiteFixture(writer: ExportTransaction): Promise<Ses
   };
 }
 
+// Records that carry a subagent's returned text into a Claude parent session, one per shape.
+// The hand-back attachment follows Claude Code 2.1.304, whose tool result then holds only a pointer.
+export const claudeSubagentResult = {
+  // A finished foreground `Agent` call: its tool result is the returned text.
+  foreground(at: string, launchId: string, agentId: string, description: string, text: string) {
+    return {
+      type: 'user',
+      timestamp: at,
+      message: {
+        role: 'user',
+        content: [{ type: 'tool_result', tool_use_id: launchId, content: [{ type: 'text', text }] }],
+      },
+      toolUseResult: {
+        agentId,
+        status: 'completed',
+        description,
+        totalToolUseCount: 3,
+        totalTokens: 1000,
+        totalDurationMs: 1000,
+        content: [{ type: 'text', text }],
+      },
+    };
+  },
+  // A background subagent's completion notice, written as a user record.
+  notice(at: string, launchId: string, taskId: string, result: string) {
+    return {
+      type: 'user',
+      timestamp: at,
+      origin: { kind: 'task-notification' },
+      message: {
+        role: 'user',
+        content: `<task-notification><tool-use-id>${launchId}</tool-use-id><task-id>${taskId}</task-id><status>completed</status><result>${result}</result></task-notification>`,
+      },
+    };
+  },
+  // A `SubagentHandback` report queued while the parent works. `rendered` holds the frame the
+  // request carried around the report.
+  handbackAttachment(at: string, from: string, name: string, report: string, uuid?: string) {
+    return {
+      type: 'attachment',
+      timestamp: at,
+      ...(uuid ? { uuid } : {}),
+      rendered: [
+        {
+          content: `<system-reminder id="r1">
+Another Claude session sent a message while you were working:
+<agent-message from="${from}">
+${report}
+</agent-message>
+</system-reminder id="r1">`,
+        },
+      ],
+      attachment: {
+        type: 'queued_command',
+        prompt: `<agent-message from="${from}">
+${report}
+</agent-message>`,
+        commandMode: 'prompt',
+        origin: {
+          kind: 'peer',
+          from,
+          senderTaskId: from,
+          name,
+          body: report,
+          handback: true,
+          handbackReportText: report,
+        },
+        isMeta: true,
+      },
+    };
+  },
+  // A `SubagentHandback` report delivered while the parent is idle.
+  handbackMeta(at: string, from: string, report: string, uuid?: string) {
+    return {
+      type: 'user',
+      timestamp: at,
+      ...(uuid ? { uuid } : {}),
+      isMeta: true,
+      origin: { kind: 'peer', from, body: report, handback: true },
+      message: {
+        role: 'user',
+        content: [
+          {
+            type: 'text',
+            text: `<agent-message from="${from}">
+${report}
+</agent-message>`,
+          },
+        ],
+      },
+    };
+  },
+};
+
 // Synthetic clocks reproduce transcript closure, delayed writes, and resumed work.
 export function timelineCheckRecords(
   cwd: string,

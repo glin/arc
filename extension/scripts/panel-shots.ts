@@ -43,6 +43,7 @@ import {
   pageHtml,
   renderPayload,
   statPopoverPayload,
+  type SubagentContextCase,
   themed,
 } from '../src/panelfixture.ts';
 import type { RailStatus } from '../src/turnrail.ts';
@@ -69,6 +70,7 @@ export interface Shot {
   state?: 'first-project-empty' | 'first-project-draft';
   openCustom?: boolean;
   stats?: boolean;
+  subagentContext?: SubagentContextCase; // Load the popover fixture with this subagent results case.
   draft?: boolean; // Load a draft into the prompt box.
   unsent?: boolean; // Load a session list card with unsent reader input.
   subagents?: boolean; // Load sessions and the long turn card with running background subagents.
@@ -191,6 +193,40 @@ export const SHOTS: Shot[] = [
     escape: true,
     stats: true,
     click: '.chips .statchip:has-text("no file changes")',
+  },
+  ...(['board', 'measured', 'longest', 'many', 'partial', 'removed', 'unattributed', 'missing'] as const).map(
+    (subagentContext): Shot => ({
+      name: `wide-stat-turn-context-subagents-${subagentContext}`,
+      width: 1350,
+      escape: true,
+      stats: true,
+      subagentContext,
+      click: '.chips .statchip:has-text("ctx")',
+    }),
+  ),
+  ...(['board', 'removed'] as const).map((subagentContext): Shot => ({
+    name: `wide-stat-context-subagents-${subagentContext}`,
+    width: 1350,
+    escape: true,
+    stats: true,
+    subagentContext,
+    click: '.sessionstats .statchip:has-text("ctx")',
+  })),
+  {
+    name: 'narrow-stat-turn-context-subagents-board',
+    width: 340,
+    escape: true,
+    stats: true,
+    subagentContext: 'board',
+    click: '.chips .statchip:has-text("ctx")',
+  },
+  {
+    name: 'narrow-stat-context-subagents-board',
+    width: 340,
+    escape: true,
+    stats: true,
+    subagentContext: 'board',
+    click: '.sessionstats .statchip:has-text("ctx")',
   },
   {
     name: 'narrow-stat-context',
@@ -1021,9 +1057,8 @@ export async function shoot(
     }
   }
   if (shot.stats !== undefined) {
-    await page.evaluate(
-      `window.postMessage(${JSON.stringify(shot.stats ? statPopoverPayload() : renderPayload())}, '*')`,
-    );
+    const payload = shot.stats ? statPopoverPayload(shot.subagentContext) : renderPayload();
+    await page.evaluate(`window.postMessage(${JSON.stringify(payload)}, '*')`);
     await page.evaluate(SETTLED);
   }
   if (shot.pinned) {

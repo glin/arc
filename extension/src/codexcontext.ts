@@ -2,6 +2,7 @@ import * as fs from 'node:fs';
 import { readPreviousLines, type BackwardLineCursor, type FileRevision } from './transcript';
 import { contextNumber, type ContextCategory, type ContextUnavailableReason } from './domain/context-detail';
 import { codexRetainedContextTokens } from './codex';
+import { estimateTextTokens } from './subagentcontext';
 
 export const CODEX_CONTEXT_BYTES = 16 * 1024 * 1024;
 export const CODEX_CONTEXT_ITEMS = 4096;
@@ -196,7 +197,7 @@ export function inspectCodexContext(records: readonly unknown[], session: string
   if (incomplete || used === null || capacity === null || !model || !contextNumber(used)) return null;
   const tokens = new Map<string, number>();
   const text = (name: string, value: string) => {
-    tokens.set(name, (tokens.get(name) ?? 0) + Math.ceil(Buffer.byteLength(value, 'utf8') / 4));
+    tokens.set(name, (tokens.get(name) ?? 0) + estimateTextTokens(value));
   };
   const calls = new Map<string, number>();
   const outputs = new Set<string>();

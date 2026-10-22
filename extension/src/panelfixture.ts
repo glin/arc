@@ -48,6 +48,7 @@ import { fillPanelText, panelValues } from './paneltext.ts';
 import { browserBundle, browserStylesheet } from './panelbundle.ts';
 import { renderRichMarkdown } from './richtext.ts';
 import type { Compaction } from './transcript.ts';
+import type { SubagentContextFigure } from './subagentcontext.ts';
 
 // Fill the browser bundle and stylesheet with the panel's text values.
 let builtScript: string | null = null;
@@ -1785,17 +1786,75 @@ export function themed(html: string, kind: FixtureTheme = 'dark'): string {
     .replace('</head>', `<style>${tables[kind]}</style></head>`);
 }
 
+// The subagent results cases of the context chip popover, as the approved board draws them.
+export type SubagentContextCase =
+  | 'board'
+  | 'measured'
+  | 'longest'
+  | 'many'
+  | 'partial'
+  | 'removed'
+  | 'unattributed'
+  | 'missing';
+
+// The context level every subagent results case shares, about 118k as on the board.
+const SUBAGENT_CASE_CONTEXT = 117_000;
+const BOARD_SUBAGENTS = [
+  { name: 'Survey every caller of renderPayload and list the fields each one reads', tokens: 6200 },
+  { name: 'Fix the stale cache key in the usage reducer', tokens: 3800 },
+  { name: 'Check the plan for steps that name no file', tokens: 1600 },
+  { name: 'Delete the scratch worktree', tokens: 800 },
+];
+const subagentFigure = (agents: Array<{ name: string; tokens: number }>, extra = 0): SubagentContextFigure => ({
+  tokens: agents.reduce((sum, line) => sum + line.tokens, extra),
+  partial: false,
+  removed: false,
+  agents,
+});
+
+export const SUBAGENT_CONTEXT_CASES: Record<SubagentContextCase, SubagentContextFigure | undefined> = {
+  board: subagentFigure(BOARD_SUBAGENTS),
+  measured: subagentFigure([
+    { name: 'Review the parser', tokens: 1000 },
+    { name: 'Find the fixtures', tokens: 520 },
+    { name: 'List the session files', tokens: 280 },
+  ]),
+  longest: subagentFigure([
+    {
+      name: 'Read every caller of the usage reducer, trace how each one keys its cache, and report the callers that pass a stale session path',
+      tokens: 5100,
+    },
+  ]),
+  many: subagentFigure([
+    BOARD_SUBAGENTS[0],
+    BOARD_SUBAGENTS[1],
+    BOARD_SUBAGENTS[2],
+    { name: 'Read the oversized tool output and summarize the failures', tokens: 900 },
+    BOARD_SUBAGENTS[3],
+    ...Array.from({ length: 7 }, (_, index) => ({ name: `Check fixture ${index + 1}`, tokens: 300 })),
+  ]),
+  partial: { ...subagentFigure(BOARD_SUBAGENTS), partial: true },
+  removed: { tokens: 0, partial: false, removed: true, agents: [] },
+  // A wait output with two receivers counts in the value and in no line.
+  unattributed: subagentFigure(BOARD_SUBAGENTS.slice(0, 2), 1200),
+  missing: undefined,
+};
+
 // Popovers use the same builders as the panel, with a partial history and recorded cache lifetimes.
-export function statPopoverPayload(): Record<string, unknown> {
+// A subagent results case gives both turns its figure and draws the session context chip from them.
+export function statPopoverPayload(subagents?: SubagentContextCase): Record<string, unknown> {
   const payload = renderPayload();
+  const figure = subagents ? SUBAGENT_CONTEXT_CASES[subagents] : undefined;
   const turns = FIXTURE_TURNS.slice(0, 2).map((turn) => ({
     ...turn,
     finished: true,
     outputRate: { output: 84, milliseconds: 10000 },
     usage: { ...turn.usage, requests: 22, thinking: 1200, cacheWrite1h: 12500, cacheWrite30m: 5400 },
+    ...(subagents ? { contextTokens: SUBAGENT_CASE_CONTEXT } : {}),
+    ...(figure ? { subagentContext: figure } : {}),
   }));
   const session = sessionStats(turns, []);
-  const fixtureContext = RAIL_STATS.s1.find((chip) => chip.metric === 'context');
+  const fixtureContext = (subagents ? session : RAIL_STATS.s1).find((chip) => chip.metric === 'context');
   const expiry = RAIL_STATS.s1.find((chip) => chip.metric === 'cache-expiry');
   return {
     ...payload,

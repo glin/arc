@@ -12242,7 +12242,7 @@ test('a prior Codex parser state rebuilds child identity and exact compaction us
 
   const reset = readCodexSessionIncremental(file, 'sess', initial.checkpoint, options);
   assert.equal(reset.kind, 'reset');
-  assert.equal(reset.checkpoint?.parserState.version, 22);
+  assert.equal(reset.checkpoint?.parserState.version, 24);
   assert.deepEqual(
     reset.read?.turns[0].agents.map((row) => [row.id, row.description]),
     [[child.threadId, 'astra_implementer']],
@@ -17704,4 +17704,182 @@ test('fresh integrity revisions replace held cold listing stats', () => {
   cache.accept('cold.jsonl', fresh);
   assert.equal(cache.get('cold.jsonl'), fresh);
   assert.equal(read.mock.calls.length, 1);
+});
+
+const subagentEstimate = (text: string) => Math.ceil(Buffer.byteLength(text, 'utf8') / 4);
+
+function codexSubagentTurn(extra: object[]): object[] {
+  const records = ordinaryTurn();
+  records.splice(
+    5,
+    0,
+    item('function_call', 4, {
+      name: 'spawn_agent',
+      call_id: 'call_review',
+      arguments: JSON.stringify({ task_name: 'review_sol' }),
+    }),
+    item('function_call', 4, {
+      name: 'spawn_agent',
+      call_id: 'call_tests',
+      arguments: JSON.stringify({ task_name: 'tests_sol' }),
+    }),
+    ...extra,
+  );
+  return records;
+}
+
+test('a Codex subagent notice and final answer count toward the subagent results in context', () => {
+  const notice = currentChildNotification(5, '/root/review_sol', { completed: 'The parser keys its cache by path.' });
+  const final = item('agent_message', 6, {
+    author: '/root/tests_sol',
+    recipient: '/root',
+    content: [
+      { type: 'input_text', text: 'Message Type: FINAL_ANSWER\nSender: /root/tests_sol\nPayload:\nAll tests pass.' },
+    ],
+  });
+  const { turns } = readCodexSession(writeRollout(codexSubagentTurn([notice, final])), 'sess');
+  const noticeText = (notice.payload as unknown as { content: Array<{ text: string }> }).content[0].text;
+  const finalText = 'Message Type: FINAL_ANSWER\nSender: /root/tests_sol\nPayload:\nAll tests pass.';
+  assert.deepEqual(turns[0].subagentContext, {
+    tokens: subagentEstimate(noticeText) + subagentEstimate(finalText),
+    partial: false,
+    removed: false,
+    agents: [
+      { name: 'review_sol', tokens: subagentEstimate(noticeText) },
+      { name: 'tests_sol', tokens: subagentEstimate(finalText) },
+    ].sort((a, b) => b.tokens - a.tokens),
+  });
+});
+
+test('a Codex wait output counts in the subagent results and in no subagent line', () => {
+  // The recorded `wait_agent` call names no receiver, and its output holds no report text.
+  const output = JSON.stringify({ message: 'Wait completed.', timed_out: false });
+  const { turns } = readCodexSession(
+    writeRollout(
+      codexSubagentTurn([
+        item('function_call', 5, {
+          name: 'wait_agent',
+          namespace: 'collaboration',
+          call_id: 'call_wait',
+          arguments: JSON.stringify({ timeout_ms: 60000 }),
+        }),
+        item('function_call_output', 6, { call_id: 'call_wait', output }),
+      ]),
+    ),
+    'sess',
+  );
+  assert.deepEqual(turns[0].subagentContext, {
+    tokens: subagentEstimate(output),
+    partial: false,
+    removed: false,
+    agents: [],
+  });
+});
+
+test('a Codex compaction keeps the subagent results its replacement history holds', () => {
+  const kept = 'The parser keys its cache by path.';
+  const dropped = 'All tests pass.';
+  const keptNotice = currentChildNotification(5, '/root/review_sol', { completed: kept });
+  const compaction = {
+    timestamp: at(6),
+    type: 'compacted',
+    payload: { replacement_history: [keptNotice.payload] },
+  };
+  const { turns } = readCodexSession(
+    writeRollout(
+      codexSubagentTurn([
+        keptNotice,
+        currentChildNotification(5, '/root/tests_sol', { completed: dropped }),
+        compaction,
+      ]),
+    ),
+    'sess',
+  );
+  const keptText = (keptNotice.payload as unknown as { content: Array<{ text: string }> }).content[0].text;
+  assert.deepEqual(turns[0].subagentContext, {
+    tokens: subagentEstimate(keptText),
+    partial: false,
+    removed: false,
+    agents: [{ name: 'review_sol', tokens: subagentEstimate(keptText) }],
+  });
+});
+
+// The records of a later turn, moved `shift` seconds on and given their own turn id.
+function laterCodexTurn(records: object[], turnId: string, shift: number): object[] {
+  return records.slice(1).map((record) => {
+    const moved = JSON.parse(JSON.stringify(record).replaceAll(TURN, turnId)) as { timestamp: string };
+    return { ...moved, timestamp: new Date(Date.parse(moved.timestamp) + shift * 1000).toISOString() };
+  });
+}
+const SECOND_TURN = '01a032c9-1e07-78b2-ae0c-dc76f2dd7902';
+const childFinalAnswer = (second: number, text: string) =>
+  item('agent_message', second, {
+    author: '/root/tests_sol',
+    recipient: '/root',
+    content: [{ type: 'input_text', text }],
+  });
+const noticeTextOf = (record: object) =>
+  (record as { payload: { content: Array<{ text: string }> } }).payload.content[0].text;
+
+test('a Codex compaction after the last request keeps the results its replacement history holds', () => {
+  const kept = currentChildNotification(5, '/root/review_sol', { completed: 'The parser keys its cache by path.' });
+  const compaction = { timestamp: at(9), type: 'compacted', payload: { replacement_history: [kept.payload] } };
+  const read = readCodexSession(writeRollout([...codexSubagentTurn([kept]), compaction]), 'sess');
+  const tokens = subagentEstimate(noticeTextOf(kept));
+  const figure = { tokens, partial: false, removed: false, agents: [{ name: 'review_sol', tokens }] };
+  assert.deepEqual(read.turns[0].subagentContext, figure);
+  assert.deepEqual(read.compactions[0].subagentContext, figure);
+  assert.deepEqual(sessionStatFactsOf(read)?.compactions[0].subagentContext, figure);
+});
+
+test('two Codex final answers with the same text count twice', () => {
+  const text = 'Message Type: FINAL_ANSWER\nSender: /root/tests_sol\nPayload:\nAll tests pass.';
+  const { turns } = readCodexSession(
+    writeRollout(codexSubagentTurn([childFinalAnswer(5, text), childFinalAnswer(6, text)])),
+    'sess',
+  );
+  assert.equal(turns[0].subagentContext?.tokens, 2 * subagentEstimate(text));
+});
+
+test('a Codex result recorded after the last request of a turn counts in the next turn', () => {
+  const text = 'Message Type: FINAL_ANSWER\nSender: /root/tests_sol\nPayload:\nAll tests pass.';
+  const first = codexSubagentTurn([]);
+  first.splice(first.length - 1, 0, childFinalAnswer(7, text));
+  const { turns } = readCodexSession(
+    writeRollout([...first, ...laterCodexTurn(ordinaryTurn(), SECOND_TURN, 20)]),
+    'sess',
+  );
+  assert.equal(turns[0].subagentContext, undefined, 'no request of the first turn read the answer');
+  assert.equal(turns[1].subagentContext?.tokens, subagentEstimate(text));
+});
+
+test('a Codex tail read that starts after the start of the record marks the subagent figure partial', () => {
+  const notice = currentChildNotification(5, '/root/review_sol', { completed: 'The parser keys its cache by path.' });
+  const records = codexSubagentTurn([notice]);
+  records[0] = meta({ padding: 'x'.repeat(8192) });
+  const file = writeRollout(records);
+  assert.equal(readCodexSession(file, 'sess').turns[0].subagentContext?.partial, false);
+  const tail = readCodexSession(file, 'sess', { tailBytes: fs.statSync(file).size - 4096 });
+  assert.equal(tail.turns[0].subagentContext?.tokens, subagentEstimate(noticeTextOf(notice)));
+  assert.equal(tail.turns[0].subagentContext?.partial, true);
+});
+
+test('a Codex read that skips appended bytes restarts the subagent figure as partial', () => {
+  const reducer = createCodexSessionReducer('sess');
+  let start = 0;
+  const push = (records: object[]) => {
+    for (const record of records) {
+      const text = JSON.stringify(record);
+      reducer.pushLine({ text, start, end: start + Buffer.byteLength(text) });
+      start += Buffer.byteLength(text) + 1;
+    }
+  };
+  push(codexSubagentTurn([currentChildNotification(5, '/root/review_sol', { completed: 'First result.' })]));
+  reducer.skipped();
+  start += 4096;
+  const later = currentChildNotification(5, '/root/tests_sol', { completed: 'Second result.' });
+  push(laterCodexTurn(codexSubagentTurn([later]), SECOND_TURN, 20));
+  const figure = reducer.finish().turns.at(-1)?.subagentContext;
+  assert.equal(figure?.tokens, subagentEstimate(noticeTextOf(later)));
+  assert.equal(figure?.partial, true);
 });

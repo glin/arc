@@ -74,6 +74,21 @@ import { ARC_IDENTITY } from './identity';
 import { arcHome } from './store';
 import { claudeConfigHome, codexHome } from './agentpaths';
 import { RESPONSE_RATE_LIMIT, summedTurnRate, validRate, type OutputRate, type OutputRateBasis } from './outputrate';
+import {
+  addSubagentResult,
+  clearSubagentContext,
+  commitSubagentContext,
+  emptySubagentContext,
+  estimateClaudeSubagentTokens,
+  knownSubagentLaunch,
+  noteSubagentContextLine,
+  noteSubagentLaunch,
+  noteUnqualifiedSubagentResult,
+  skipSubagentContext,
+  subagentContextFigure,
+  type SubagentContextFigure,
+  type SubagentContextState,
+} from './subagentcontext';
 
 export { describeToolInput } from './activitydetail';
 export { shortenTo } from './domain/text.ts';
@@ -731,6 +746,9 @@ export interface Turn {
   usage: TurnUsage;
   usageParts?: TurnUsagePart[];
   contextTokens: number; // input plus cache of the turn's last real assistant message
+  // Estimated text that subagents returned into the session's context, as it stood at the end
+  // of the turn. Absent when no subagent result entered context in the read.
+  subagentContext?: SubagentContextFigure;
   outputRate?: import('./outputrate').OutputRate;
   outputRateModel?: string;
   // The interval that measured a Claude `outputRate`. An absent Claude basis means the observed stream.
@@ -1034,6 +1052,9 @@ export interface Compaction {
   // The cache read plus cache write of the first request in the Claude transcript, from `claudeFirstRequestCachedTokens`.
   // Absent where the head of the file holds no request.
   firstRequestCachedTokens?: number;
+  // Estimated text that subagents returned and that stayed in context after the compaction.
+  // Absent when no subagent result entered context in the read.
+  subagentContext?: SubagentContextFigure;
 }
 
 // Compaction metadata from a Claude system record.
@@ -1082,12 +1103,14 @@ export interface SessionStatTurnFacts {
   // The metadata pass deliberately does not read child transcripts. Their presence makes
   // the parent-only cost a floor until the ordinary parser supplies the complete figure.
   childSpendPartial: boolean;
+  subagentContext?: SubagentContextFigure;
 }
 
 export interface SessionStatCompactionFacts {
   at: number;
   contextAfter: number;
   retainedContext?: Compaction['retainedContext'];
+  subagentContext?: SubagentContextFigure;
   trigger: string;
   model: string | null;
 }
@@ -1141,10 +1164,26 @@ export function sessionStatFactsOf(read: SessionRead): SessionStatFacts | null {
       contextWindow: turn.contextWindow,
       contextRequest: turn.contextRequest ? { ...turn.contextRequest } : null,
       childSpendPartial: turn.agents.length > 0,
+      ...(turn.subagentContext
+        ? {
+            subagentContext: {
+              ...turn.subagentContext,
+              agents: turn.subagentContext.agents.map((line) => ({ ...line })),
+            },
+          }
+        : {}),
     })),
     compactions: read.compactions.map((compaction) => ({
       at: compaction.at,
       ...(compaction.retainedContext ? { retainedContext: { ...compaction.retainedContext } } : {}),
+      ...(compaction.subagentContext
+        ? {
+            subagentContext: {
+              ...compaction.subagentContext,
+              agents: compaction.subagentContext.agents.map((line) => ({ ...line })),
+            },
+          }
+        : {}),
       contextAfter: compaction.contextAfter,
       trigger: compaction.trigger,
       model: compaction.model,
@@ -9623,7 +9662,9 @@ interface RecordedTitleState {
 }
 
 export interface ClaudeSessionParserState {
-  version: 9;
+  version: 11;
+  // Text that subagents returned into this session's context since the newest compaction.
+  subagents: SubagentContextState;
   turns: Turn[];
   turnRanges: Array<{ start: number; end: number }>;
   turnMembershipStarts: number[];
@@ -9769,7 +9810,8 @@ function emptyClaudeSessionParserState(opts: ReadOptions): ClaudeSessionParserSt
   const suppliedTitle = normalizeSessionTitle(opts.sessionTitle);
   const suppliedFullTitle = normalizeFullSessionTitle(opts.sessionTitle);
   return {
-    version: 9,
+    version: 11,
+    subagents: emptySubagentContext(),
     turns: [],
     turnRanges: [],
     turnMembershipStarts: [],
@@ -9834,6 +9876,14 @@ function emptyClaudeSessionParserState(opts: ReadOptions): ClaudeSessionParserSt
 
 function emitClaudeTurn(state: ClaudeSessionParserState, turn: SourcedBuilding, maxTurns: number): void {
   const emitted: Turn = { ...turn, files: [...turn.files.values()] };
+  // A turn with a request keeps the figure its last request read. A compaction before the next
+  // prompt clears the live figure, and it does not change the amount at the end of this turn.
+  const subagentContext = turn.contextRequest ? turn.subagentContext : subagentContextFigure(state.subagents);
+  if (subagentContext) {
+    emitted.subagentContext = subagentContext;
+  } else {
+    delete emitted.subagentContext;
+  }
   const rate = claudeRequestRate(state, emitted);
   if (rate && emitted.model) {
     emitted.outputRate = rate;
@@ -10153,7 +10203,12 @@ function withdrawClaudeSkillUse(state: ClaudeSessionParserState, id: string): vo
 }
 
 // Applies completion status, child ID, and usage figures to the row identified by its launch call. Unknown launch IDs create no row.
-function applyClaudeTaskNotification(state: ClaudeSessionParserState, raw: string, at: number): void {
+function applyClaudeTaskNotification(
+  state: ClaudeSessionParserState,
+  raw: string,
+  at: number,
+  delivery: ClaudeDelivery,
+): void {
   const id = /<tool-use-id>([^<]+)<\/tool-use-id>/.exec(raw);
   const task = /<task-id>([^<]+)<\/task-id>/.exec(raw);
   setClaudeRepeatNotice(state, task !== null && state.handbacks.get(task[1]) === true && !state.workedSinceReply);
@@ -10161,6 +10216,26 @@ function applyClaudeTaskNotification(state: ClaudeSessionParserState, raw: strin
   // after a `SubagentHandback` call stays a receipt. A later report arrives as a second call.
   const status = /<status>([^<]+)<\/status>/.exec(raw);
   const agent = id ? state.launched.get(id[1]) : undefined;
+  // A finished subagent's notice enters context whole, its frame included. A notice whose call
+  // launched no subagent, such as a background command, is not subagent text.
+  if (status && status[1] !== 'running') {
+    if (id && knownSubagentLaunch(state.subagents, id[1])) {
+      const key = task?.[1] ?? id[1];
+      const frame = raw.includes('<system-reminder>') ? 0 : CLAUDE_NOTICE_FRAME_BYTES;
+      const name = agent?.description ?? claudeAgentName(state, key);
+      addSubagentResult(
+        state.subagents,
+        key,
+        name,
+        estimateClaudeSubagentTokens(raw, frame),
+        delivery.form,
+        delivery.id,
+        raw,
+      );
+    } else if (raw.includes('<result>')) {
+      noteUnqualifiedSubagentResult(state.subagents);
+    }
+  }
   if (agent && status) {
     agent.status = status[1];
     if (status[1] !== 'running') {
@@ -10192,7 +10267,12 @@ function applyClaudeTaskNotification(state: ClaudeSessionParserState, raw: strin
 
 // A nested launch's text-only result, applied to the row its launch drew. A background launch
 // only names its child here and stays open for its completion notice.
-function applyClaudeAgentResultText(state: ClaudeSessionParserState, id: string, content: unknown): void {
+function applyClaudeAgentResultText(
+  state: ClaudeSessionParserState,
+  id: string,
+  content: unknown,
+  delivery: ClaudeDelivery,
+): void {
   const agent = state.launched.get(id);
   if (!agent) {
     return;
@@ -10204,6 +10284,9 @@ function applyClaudeAgentResultText(state: ClaudeSessionParserState, id: string,
   if (result.background) {
     return;
   }
+  const text = textOf(content);
+  const tokens = estimateClaudeSubagentTokens(text);
+  addSubagentResult(state.subagents, agent.id ?? id, agent.description, tokens, 'result', `${delivery.id}:${id}`, text);
   agent.status = 'completed';
   if (result.tokens !== null) {
     agent.tokens = result.tokens;
@@ -10532,6 +10615,7 @@ function reduceClaudeSessionLine(
   const sourceStart = typeof input === 'string' ? 0 : (input.start ?? 0);
   const sourceEnd = typeof input === 'string' ? sourceStart : (input.end ?? sourceStart);
   const maxTurns = opts.maxTurns ?? 40;
+  noteSubagentContextLine(state.subagents, sourceStart, typeof input !== 'string' && input.reduced === true);
   if (line.length < 20) {
     return;
   }
@@ -10677,14 +10761,24 @@ function reduceClaudeSessionLine(
       }
       // A subagent's handback that arrives while the agent works is queued here with a peer
       // origin, rather than written as a meta user record.
-      if (attachmentLine && !o.isSidechain && attachment?.commandMode === 'prompt' && state.cur) {
-        applyClaudePeerMessage(state, attachment.origin);
+      if (attachmentLine && !o.isSidechain && attachment?.commandMode === 'prompt') {
+        const deliveryId = typeof attachment.delivery_id === 'string' && attachment.delivery_id;
+        noteClaudeHandback(state, attachment.origin, claudeRenderedText(o) ?? textOf(attachment.prompt), {
+          form: 'attachment',
+          id: deliveryId || claudeDeliveryId(o, sourceStart),
+        });
+        if (state.cur) {
+          applyClaudePeerMessage(state, attachment.origin);
+        }
       }
       // Queued task notifications update the background child and turn timing without adding a prompt.
       const notice = attachmentLine && !o.isSidechain ? taskNotificationText(o) : null;
       if (notice !== null && state.cur) {
         const at = claudeRecordAt(o);
-        applyClaudeTaskNotification(state, notice, at);
+        applyClaudeTaskNotification(state, notice, at, {
+          form: 'notice-attachment',
+          id: claudeDeliveryId(o, sourceStart),
+        });
         state.cur.endedAt = Math.max(state.cur.endedAt, at);
         extendSourceRange(state.cur, sourceStart, sourceEnd);
       }
@@ -10799,6 +10893,7 @@ function reduceClaudeSessionLine(
   // Handled before the no-open-turn guard below, because a compaction can be the first
   // thing in the tail window and is worth reporting even with no turn to attach it to.
   if (isUser && o.isCompactSummary) {
+    clearSubagentContext(state.subagents);
     const content = (o.message as { content?: unknown } | undefined)?.content;
     const compaction: Compaction = {
       sessionId,
@@ -10826,6 +10921,10 @@ function reduceClaudeSessionLine(
       summaryChars: compactSummaryChars(o),
       summary: stripCompactPreamble(typeof content === 'string' ? content : textOf(content)),
     };
+    const subagentContext = subagentContextFigure(state.subagents);
+    if (subagentContext) {
+      compaction.subagentContext = subagentContext;
+    }
     state.compactions.push(compaction);
     state.compactionRanges.push({ start: sourceStart, end: sourceEnd });
     state.compactionMetadataRanges.push(null);
@@ -10984,11 +11083,15 @@ function reduceClaudeSessionLine(
     const notice = taskNotificationText(o);
     if (notice !== null) {
       const at = stamp(o.timestamp);
-      applyClaudeTaskNotification(state, notice, at);
+      applyClaudeTaskNotification(state, notice, at, { form: 'notice-user', id: claudeDeliveryId(o, sourceStart) });
       cur.endedAt = Math.max(cur.endedAt, at);
       return;
     }
     if (o.isMeta) {
+      noteClaudeHandback(state, o.origin, textOf((o.message as { content?: unknown } | undefined)?.content), {
+        form: 'meta',
+        id: claudeDeliveryId(o, sourceStart),
+      });
       applyClaudePeerMessage(state, o.origin);
     }
     if (state.curToolEnded && claudeWakeMessage(o)) {
@@ -11044,7 +11147,10 @@ function reduceClaudeSessionLine(
             recordCallAndTextEvidence(state, cur, toolId, b.content, stamp(o.timestamp), opts.folders ?? []);
           }
           if (opts.childTranscript === true && toolId && result?.totalToolUseCount == null) {
-            applyClaudeAgentResultText(state, toolId, b.content);
+            applyClaudeAgentResultText(state, toolId, b.content, {
+              form: 'result',
+              id: claudeDeliveryId(o, sourceStart),
+            });
           }
           continue;
         }
@@ -11108,12 +11214,26 @@ function reduceClaudeSessionLine(
         status: String(result.status || 'completed'),
       };
       // Update the existing launched child row rather than adding another row.
-      const existing = state.launched.get(toolUseIdOf(o.message));
+      const launchId = toolUseIdOf(o.message);
+      const existing = state.launched.get(launchId);
       if (existing) {
         Object.assign(existing, row);
         delete existing.toolUsesFromArtifacts;
       } else {
         cur.agents.push(row);
+      }
+      // A finished foreground subagent's result text enters context. A background launch
+      // returns only a receipt, and its result arrives later as a completion notice.
+      if (row.status !== 'running' && result.isAsync !== true && Array.isArray(blocks)) {
+        const block = (blocks as { type?: string; tool_use_id?: string; content?: unknown }[]).find(
+          (b) => b.type === 'tool_result' && b.tool_use_id === launchId,
+        );
+        if (block) {
+          const text = textOf(block.content);
+          const tokens = estimateClaudeSubagentTokens(text);
+          const identity = `${claudeDeliveryId(o, sourceStart)}:${launchId}`;
+          addSubagentResult(state.subagents, row.id ?? launchId, row.description, tokens, 'result', identity, text);
+        }
       }
     } else {
       const existing = state.launched.get(toolUseIdOf(o.message));
@@ -11198,6 +11318,15 @@ function reduceClaudeSessionLine(
     // The reducer measured the context from the response's last executor pass.
     const context = state.usageState.lastRequest;
     cur.contextTokens = context?.tokens ?? usage.input + usage.cacheRead + usage.cacheWrite1h + usage.cacheWrite5m;
+    // This request read every subagent result recorded before it. A result recorded after it
+    // waits for the next request.
+    commitSubagentContext(state.subagents);
+    const subagentContext = subagentContextFigure(state.subagents);
+    if (subagentContext) {
+      cur.subagentContext = subagentContext;
+    } else {
+      delete cur.subagentContext;
+    }
     const wrote = usageEvent.cacheLifetime ?? null;
     if (usage.cacheWrite1h + usage.cacheWrite5m > 0) {
       state.lastLifetime = wrote;
@@ -11379,6 +11508,7 @@ function reduceClaudeSessionLine(
             Object.defineProperty(row, 'toolUseId', { value: block.id });
           }
           state.launched.set(block.id, row);
+          noteSubagentLaunch(state.subagents, block.id);
           cur.agents.push(row);
         }
         // A nonempty SubagentHandback message supplies the response and marks subsequent replies as nonresponses until another prompt or message.
@@ -11576,6 +11706,75 @@ function reduceClaudeSessionLine(
 function setClaudeRepeatNotice(state: ClaudeSessionParserState, repeat: boolean): void {
   state.repeatNotice = repeat;
   state.repeatReplyId = null;
+}
+
+// The name a subagent's row shows, found by the child id the parent recorded.
+function claudeAgentName(state: ClaudeSessionParserState, id: string): string | null {
+  for (const agent of state.launched.values()) {
+    if (agent.id === id) {
+      return agent.description;
+    }
+  }
+  const turns: Array<{ agents: TurnAgent[] }> = state.cur ? [...state.turns, state.cur] : state.turns;
+  for (let index = turns.length - 1; index >= 0; index--) {
+    const agent = turns[index].agents.find((row) => row.id === id);
+    if (agent) {
+      return agent.description;
+    }
+  }
+  return null;
+}
+
+// The record form of one subagent delivery and its identity: the record uuid, or the record's
+// offset in the file when it has none.
+interface ClaudeDelivery {
+  form: string;
+  id: string;
+}
+
+function claudeDeliveryId(record: Record<string, unknown>, start: number): string {
+  return typeof record.uuid === 'string' && record.uuid ? record.uuid : `at:${start}`;
+}
+
+// The UTF-8 size of the system-reminder frame around a background completion notice in the
+// request. The stored notice lacks it. Request captures of Claude Code 2.1.301 to 2.1.304 show it.
+const CLAUDE_NOTICE_FRAME_BYTES = 535;
+
+// A subagent's hand-back report enters context as a queued attachment or a meta user record.
+function noteClaudeHandback(
+  state: ClaudeSessionParserState,
+  origin: unknown,
+  text: string,
+  delivery: ClaudeDelivery,
+): void {
+  if (!origin || typeof origin !== 'object') {
+    return;
+  }
+  const o = origin as Record<string, unknown>;
+  if (o.kind !== 'peer' || o.handback !== true || !text) {
+    return;
+  }
+  const sender = typeof o.senderTaskId === 'string' && o.senderTaskId ? o.senderTaskId : o.from;
+  const key = typeof sender === 'string' && sender ? sender : null;
+  const named = typeof o.name === 'string' && o.name ? o.name : null;
+  const name = (key && claudeAgentName(state, key)) ?? named;
+  // Both forms carry the report body in their origin.
+  const body = typeof o.body === 'string' && o.body ? o.body : text;
+  addSubagentResult(state.subagents, key, name, estimateClaudeSubagentTokens(text), delivery.form, delivery.id, body);
+}
+
+// The text a queued attachment rendered into the request, frame included.
+function claudeRenderedText(record: Record<string, unknown>): string | null {
+  const rendered = record.rendered;
+  if (!Array.isArray(rendered) || rendered.length === 0) {
+    return null;
+  }
+  return rendered
+    .map((part) => {
+      const content = part && typeof part === 'object' ? (part as { content?: unknown }).content : undefined;
+      return typeof content === 'string' ? content : '';
+    })
+    .join('\n');
 }
 
 // A message from another session wakes the agent. A subagent's handback is one, and its sender
@@ -11863,7 +12062,7 @@ export function createClaudeSessionReducer(
   restored?: ClaudeSessionParserState,
 ): ClaudeSessionReducer {
   const state = restored ? cloneParserState(restored) : emptyClaudeSessionParserState(opts);
-  if (state.version !== 9) {
+  if (state.version !== 11) {
     throw new Error('Incompatible Claude parser state');
   }
   applyHiddenParserState(claudeHiddenSlots(state), state.hidden, CLAUDE_HIDDEN_POLICY);
@@ -11929,6 +12128,7 @@ export function createClaudeSessionReducer(
     retainedPayloadScan: () => retainedParserPayloadScan(state),
     trimBefore: (offset) => trimClaudeBefore(state, offset, opts.maxTurns ?? 40),
     skipped: () => {
+      skipSubagentContext(state.subagents);
       state.modelAttachment = null;
       state.attachmentBoundary = { open: true, model: null, turns: [] };
     },

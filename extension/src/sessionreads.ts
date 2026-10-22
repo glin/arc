@@ -20,7 +20,9 @@ import {
   type Turn,
   type TurnOutcome,
   type FileRevision,
+  type SessionRead,
 } from './transcript.ts';
+import { currentContextOf } from './turncard.ts';
 import type { RailStatus, SessionParentEdge } from './turnrail.ts';
 import { liveBackgroundCommands, sessionStatusOf } from './turnrail.ts';
 import type { SessionStatus } from './domain/session-query.ts';
@@ -954,6 +956,7 @@ export function boundedSessionRead(
     provider: source.agent,
     state: 'unparsed' as 'current' | 'stale' | 'unparsed',
     turns: [] as SessionTurn[],
+    subagentContext: null as SessionSubagentContext | null,
     partial: false,
     readByteLimit: SESSION_READ_LIMITS.bytes,
     notes: [] as string[],
@@ -997,6 +1000,7 @@ export function boundedSessionRead(
   result.state = read.turns.length ? 'current' : 'unparsed';
   result.partial = read.readBytes < source.size || read.turnLimitReached;
   const latest = read.turns.at(-1);
+  result.subagentContext = sessionSubagentContext(read, read.readBytes < source.size);
   const observation =
     observe && result.state === 'current' && latest
       ? observe({ scope: beforeScope, sourceRevision: before, latestTurn: latest.promptId ?? null })
@@ -1042,6 +1046,38 @@ export function boundedSessionRead(
   if (result.state === 'unparsed')
     result.notes.push('No turns were parsed in the bounded window. This does not establish an empty session.');
   return result;
+}
+
+export interface SessionSubagentContext {
+  tokens: number;
+  share: number | null;
+  partial: boolean;
+}
+
+// The estimated text that subagents returned into the current context. A read that saw no
+// subagent result reports zero, partial when the read started after the start of the record.
+function sessionSubagentContext(
+  read: Pick<SessionRead, 'turns' | 'compactions'>,
+  tailRead: boolean,
+): SessionSubagentContext | null {
+  const newest = read.turns.at(-1);
+  if (!newest) {
+    return null;
+  }
+  const compaction = read.compactions.reduce<SessionRead['compactions'][number] | null>(
+    (latest, one) => (!latest || one.at > latest.at ? one : latest),
+    null,
+  );
+  const current = currentContextOf({ ...newest, error: newest.error !== null }, compaction);
+  // After a compaction, the results in context are the ones the compaction kept.
+  const afterCompaction = compaction !== null && compaction.at > newest.endedAt;
+  const figure = afterCompaction ? compaction.subagentContext : newest.subagentContext;
+  const tokens = figure?.tokens ?? 0;
+  return {
+    tokens,
+    share: current ? tokens / current.tokens : null,
+    partial: figure ? figure.partial : !afterCompaction && tailRead,
+  };
 }
 
 export const RECORDED_REPLY_LIMITS = { perSession: 4, sessions: 32, turns: 4, tailBytes: 1024 * 1024 } as const;

@@ -399,6 +399,7 @@ import {
   advisorResponseRecords,
   bgAwaySummaryTranscript,
   claudeCompactionTranscript,
+  claudeSubagentResult,
   COMPACTION_SAMPLES,
   bgSessionTranscript,
   bgWorkerFollowUpTranscript,
@@ -16779,4 +16780,311 @@ test('physical child census retains unreferenced identity competitors across sou
     [files[1]],
   );
   assert.ok(read().directories?.includes(path.dirname(files[0])));
+});
+
+// Claude subagent results cost about 2.79 UTF-8 bytes a token, frame included.
+const estimate = (text: string) => Math.ceil(Buffer.byteLength(text, 'utf8') / 2.79);
+// The system-reminder frame a request carries around a stored completion notice.
+const NOTICE_FRAME_BYTES = 535;
+const rendered = (from: string, report: string) =>
+  `<system-reminder id="r1">\nAnother Claude session sent a message while you were working:\n<agent-message from="${from}">\n${report}\n</agent-message>\n</system-reminder id="r1">`;
+function asyncLaunch(second: number, launchId: string, agentId: string, description: string) {
+  return {
+    type: 'user',
+    timestamp: at(second),
+    message: {
+      role: 'user',
+      content: [{ type: 'tool_result', tool_use_id: launchId, content: 'Async agent launched' }],
+    },
+    toolUseResult: { agentId, status: 'async_launched', isAsync: true, description },
+  };
+}
+const SUBAGENT_USAGE = { input_tokens: 2, cache_read_input_tokens: 39_998, output_tokens: 10 };
+const HANDBACK_REPORT = `## Report\n${'The usage reducer keys its cache by the session path. '.repeat(160)}`.slice(
+  0,
+  8192,
+);
+const SAVED_PATH = 'Report saved to C:/work/.claude/runs/reviewer/report-2026.md';
+const HANDBACK_POINTER =
+  'This agent\'s report was delivered to you as a message from "agent-report" (its SubagentHandback call).';
+
+function twoSubagentSession() {
+  return [
+    userPrompt('Review the parser and list the fixtures', 0),
+    assistantTool('Agent', 1, 'tu-report', { description: 'Review the parser', subagent_type: 'general-purpose' }),
+    assistantTool('Agent', 2, 'tu-path', { description: 'List the fixtures', subagent_type: 'general-purpose' }),
+    claudeSubagentResult.foreground(at(3), 'tu-path', 'agent-path', 'List the fixtures', SAVED_PATH),
+    claudeSubagentResult.foreground(at(4), 'tu-report', 'agent-report', 'Review the parser', HANDBACK_POINTER),
+    claudeSubagentResult.handbackAttachment(at(5), 'agent-report', 'general-purpose', HANDBACK_REPORT),
+    assistantText('Both subagents finished.', 6, SUBAGENT_USAGE, undefined, 'end_turn'),
+  ];
+}
+
+test('a Claude session counts each subagent result in context, its hand-back report included', () => {
+  assert.equal(SAVED_PATH.length, 60);
+  const read = readSession(writeTranscript(twoSubagentSession()), 'sess');
+  const report = estimate(HANDBACK_POINTER) + estimate(rendered('agent-report', HANDBACK_REPORT));
+  const total = report + estimate(SAVED_PATH);
+  assert.ok(report > 2000, 'the 8 KB hand-back report counts');
+  assert.equal(read.turns[0].contextTokens, 40_000);
+  assert.deepEqual(read.turns[0].subagentContext, {
+    tokens: total,
+    partial: false,
+    removed: false,
+    agents: [
+      { name: 'Review the parser', tokens: report },
+      { name: 'List the fixtures', tokens: 22 },
+    ],
+  });
+  assert.deepEqual(sessionStatFactsOf(read)?.turns[0].subagentContext, read.turns[0].subagentContext);
+});
+
+test('a Claude background notice and an idle hand-back each count once', () => {
+  const report = 'The fixtures live in turnfixtures.ts.';
+  const notice = claudeSubagentResult.notice(at(3), 'tu-bg', 'agent-bg', 'Delivered as a message.');
+  const read = readSession(
+    writeTranscript([
+      userPrompt('Find the fixtures', 0),
+      assistantTool('Agent', 1, 'tu-bg', { description: 'Find the fixtures', run_in_background: true }),
+      {
+        type: 'user',
+        timestamp: at(2),
+        message: {
+          role: 'user',
+          content: [{ type: 'tool_result', tool_use_id: 'tu-bg', content: 'Async agent launched' }],
+        },
+        toolUseResult: {
+          agentId: 'agent-bg',
+          status: 'async_launched',
+          isAsync: true,
+          description: 'Find the fixtures',
+        },
+      },
+      notice,
+      claudeSubagentResult.handbackAttachment(at(4), 'agent-bg', 'general-purpose', report),
+      claudeSubagentResult.handbackMeta(at(5), 'agent-bg', report),
+      assistantText('Found them.', 6, SUBAGENT_USAGE, undefined, 'end_turn'),
+    ]),
+    'sess',
+  );
+  const noticeBytes = Buffer.byteLength(notice.message.content, 'utf8') + NOTICE_FRAME_BYTES;
+  const tokens = Math.ceil(noticeBytes / 2.79) + estimate(rendered('agent-bg', report));
+  assert.deepEqual(read.turns[0].subagentContext, {
+    tokens,
+    partial: false,
+    removed: false,
+    agents: [{ name: 'Find the fixtures', tokens }],
+  });
+});
+
+test('a Claude compaction removes earlier subagent results and splits the turn it falls in', () => {
+  const summary = [
+    { type: 'system', subtype: 'compact_boundary', timestamp: at(5), compactMetadata: { trigger: 'auto' } },
+    { ...userPrompt('summary', 6), isCompactSummary: true, message: { role: 'user', content: 'summary' } },
+  ];
+  const before = [
+    userPrompt('Run two reviews', 0),
+    assistantTool('Agent', 1, 'tu-a', { description: 'First review' }),
+    claudeSubagentResult.foreground(at(2), 'tu-a', 'agent-a', 'First review', 'First review found nothing.'),
+  ];
+  const removed = readSession(
+    writeTranscript([...before, ...summary, assistantText('Done.', 7, SUBAGENT_USAGE, undefined, 'end_turn')]),
+    'sess',
+  );
+  assert.deepEqual(removed.turns[0].subagentContext, { tokens: 0, partial: false, removed: true, agents: [] });
+
+  const split = readSession(
+    writeTranscript([
+      ...before,
+      ...summary,
+      assistantTool('Agent', 8, 'tu-b', { description: 'Second review' }),
+      claudeSubagentResult.foreground(at(9), 'tu-b', 'agent-b', 'Second review', 'Second review found one defect.'),
+      assistantText('Done.', 10, SUBAGENT_USAGE, undefined, 'end_turn'),
+    ]),
+    'sess',
+  );
+  const tokens = estimate('Second review found one defect.');
+  assert.deepEqual(split.turns[0].subagentContext, {
+    tokens,
+    partial: false,
+    removed: false,
+    agents: [{ name: 'Second review', tokens }],
+  });
+});
+
+test('a Claude subagent figure read from a tail or a cut record is partial', () => {
+  const file = writeTranscript([
+    userPrompt('Earlier work', 0, { padding: 'x'.repeat(8192) }),
+    assistantText('Earlier answer.', 1, SUBAGENT_USAGE, undefined, 'end_turn'),
+    ...twoSubagentSession().map((record, index) => ({ ...record, timestamp: at(10 + index) })),
+  ]);
+  assert.equal(readSession(file, 'sess').turns.at(-1)?.subagentContext?.partial, false);
+  const tail = readSession(file, 'sess', { tailBytes: fs.statSync(file).size - 4096 }).turns.at(-1);
+  assert.equal(tail?.subagentContext?.partial, true, 'the tail started after the start of the record');
+
+  const reducer = createClaudeSessionReducer('sess');
+  let start = 0;
+  for (const record of twoSubagentSession()) {
+    const text = JSON.stringify(record);
+    reducer.pushLine({
+      text,
+      start,
+      end: start + text.length,
+      ...(record.type === 'attachment' ? { reduced: true } : {}),
+    });
+    start += text.length + 1;
+  }
+  assert.equal(reducer.finish().turns[0].subagentContext?.partial, true, 'the hand-back record was cut');
+});
+
+test('a completed background command notice is not subagent text', () => {
+  const read = readSession(
+    writeTranscript([
+      userPrompt('Run the build', 0),
+      assistantTool('Bash', 1, 'tu-sh', { command: 'npm run build', run_in_background: true }),
+      {
+        type: 'user',
+        timestamp: at(2),
+        message: {
+          role: 'user',
+          content: [{ type: 'tool_result', tool_use_id: 'tu-sh', content: 'Running in the background.' }],
+        },
+      },
+      claudeSubagentResult.notice(at(3), 'tu-sh', 'b1', 'Build finished.'),
+      assistantText('Built.', 4, SUBAGENT_USAGE, undefined, 'end_turn'),
+    ]),
+    'sess',
+  );
+  assert.equal(read.turns[0].subagentContext, undefined);
+});
+
+test('two hand-backs with the same text count twice, and one record read twice counts once', () => {
+  const report = 'No defects found.';
+  const read = readSession(
+    writeTranscript([
+      userPrompt('Review twice', 0),
+      claudeSubagentResult.handbackMeta(at(1), 'agent-r', report, 'u-1'),
+      claudeSubagentResult.handbackMeta(at(2), 'agent-r', report, 'u-2'),
+      claudeSubagentResult.handbackMeta(at(2), 'agent-r', report, 'u-2'),
+      assistantText('Done.', 3, SUBAGENT_USAGE, undefined, 'end_turn'),
+    ]),
+    'sess',
+  );
+  const one = estimate(`<agent-message from="agent-r">\n${report}\n</agent-message>`);
+  assert.equal(read.turns[0].subagentContext?.tokens, 2 * one);
+});
+
+test('a subagent result recorded after the last request of a turn counts in the next turn', () => {
+  const notice = claudeSubagentResult.notice(at(4), 'tu-late', 'agent-late', 'The cache key is stale.');
+  const read = readSession(
+    writeTranscript([
+      userPrompt('Start a review', 0),
+      assistantTool('Agent', 1, 'tu-late', { description: 'Late review', run_in_background: true }),
+      asyncLaunch(2, 'tu-late', 'agent-late', 'Late review'),
+      assistantText('Started.', 3, SUBAGENT_USAGE, undefined, 'end_turn'),
+      notice,
+      userPrompt('What did it find?', 5),
+      assistantText('A stale key.', 6, SUBAGENT_USAGE, undefined, 'end_turn'),
+    ]),
+    'sess',
+  );
+  assert.equal(read.turns.length, 2);
+  assert.equal(read.turns[0].subagentContext, undefined, 'the last request of the first turn never read the notice');
+  const tokens = Math.ceil((Buffer.byteLength(notice.message.content, 'utf8') + NOTICE_FRAME_BYTES) / 2.79);
+  assert.equal(read.turns[1].subagentContext?.tokens, tokens);
+});
+
+test('a later compaction leaves the subagent results at the end of an earlier turn', () => {
+  const report = 'First review found nothing.';
+  const read = readSession(
+    writeTranscript([
+      userPrompt('Run a review', 0),
+      assistantTool('Agent', 1, 'tu-a', { description: 'First review' }),
+      claudeSubagentResult.foreground(at(2), 'tu-a', 'agent-a', 'First review', report),
+      assistantText('Reviewed.', 3, SUBAGENT_USAGE, undefined, 'end_turn'),
+      { type: 'system', subtype: 'compact_boundary', timestamp: at(4), compactMetadata: { trigger: 'manual' } },
+      { ...userPrompt('summary', 5), isCompactSummary: true, message: { role: 'user', content: 'summary' } },
+      userPrompt('Next task', 6),
+      assistantText('Next.', 7, SUBAGENT_USAGE, undefined, 'end_turn'),
+    ]),
+    'sess',
+  );
+  const tokens = estimate(report);
+  assert.deepEqual(read.turns[0].subagentContext, {
+    tokens,
+    partial: false,
+    removed: false,
+    agents: [{ name: 'First review', tokens }],
+  });
+  const removed = { tokens: 0, partial: false, removed: true, agents: [] };
+  assert.deepEqual(read.turns.at(-1)?.subagentContext, removed);
+  assert.deepEqual(read.compactions[0].subagentContext, removed);
+});
+
+test('subagent results that no request read stay out of the figure, and an overflow marks it partial', () => {
+  const report = 'No defects found.';
+  const waiting = Array.from({ length: 1025 }, (_, index) =>
+    claudeSubagentResult.handbackMeta(at(4), 'agent-r', report, `u-${index}`),
+  );
+  const read = readSession(
+    writeTranscript([
+      userPrompt('Start the reviews', 0),
+      assistantText('Started.', 3, SUBAGENT_USAGE, undefined, 'end_turn'),
+      ...waiting,
+      userPrompt('What did they find?', 5),
+      assistantText('Nothing.', 6, SUBAGENT_USAGE, undefined, 'end_turn'),
+    ]),
+    'sess',
+  );
+  const one = estimate(`<agent-message from="agent-r">\n${report}\n</agent-message>`);
+  assert.equal(read.turns[0].subagentContext, undefined, 'no request of the first turn read the results');
+  assert.equal(read.turns[1].subagentContext?.tokens, 1024 * one);
+  assert.equal(read.turns[1].subagentContext?.partial, true, 'the oldest waiting result was dropped');
+});
+
+test('a completion notice for a launch the read no longer holds marks the figure partial', () => {
+  const launches = Array.from({ length: 1025 }, (_, index) =>
+    assistantTool('Agent', 1, `tu-${index}`, { description: `Review ${index}`, run_in_background: true }),
+  );
+  const read = readSession(
+    writeTranscript([
+      userPrompt('Run many reviews', 0),
+      ...launches,
+      claudeSubagentResult.notice(at(2), 'tu-0', 'agent-0', 'The oldest review finished.'),
+      claudeSubagentResult.foreground(at(3), 'tu-1024', 'agent-last', 'Review 1024', 'The newest review finished.'),
+      assistantText('Done.', 4, SUBAGENT_USAGE, undefined, 'end_turn'),
+    ]),
+    'sess',
+  );
+  assert.equal(read.turns[0].subagentContext?.tokens, estimate('The newest review finished.'));
+  assert.equal(read.turns[0].subagentContext?.partial, true);
+});
+
+test('a Claude read that skips appended bytes restarts the subagent figure as partial', () => {
+  const reducer = createClaudeSessionReducer('sess');
+  let start = 0;
+  const push = (records: object[]) => {
+    for (const record of records) {
+      const text = JSON.stringify(record);
+      reducer.pushLine({ text, start, end: start + Buffer.byteLength(text) });
+      start += Buffer.byteLength(text) + 1;
+    }
+  };
+  push(twoSubagentSession());
+  reducer.skipped();
+  start += 4096;
+  const report = 'Third review found nothing.';
+  push([
+    userPrompt('Run the third review', 20),
+    assistantTool('Agent', 21, 'tu-c', { description: 'Third review' }),
+    claudeSubagentResult.foreground(at(22), 'tu-c', 'agent-c', 'Third review', report),
+    assistantText('Done.', 23, SUBAGENT_USAGE, undefined, 'end_turn'),
+  ]);
+  const tokens = estimate(report);
+  assert.deepEqual(reducer.finish().turns.at(-1)?.subagentContext, {
+    tokens,
+    partial: true,
+    removed: false,
+    agents: [{ name: 'Third review', tokens }],
+  });
 });

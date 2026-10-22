@@ -15,6 +15,9 @@ import {
   type VerifiedCommitRepository,
 } from './commitrepositories';
 
+// The newest generation the legacy cache format was written at.
+const LEGACY_GENERATION = 64;
+
 test('verified commit cache bounds and validates its independent observation format', () => {
   const directory = folder();
   const file = path.join(directory, 'source.jsonl');
@@ -955,7 +958,7 @@ test('derived cache rejects child references from another parser generation', ()
   fs.writeFileSync(
     file,
     JSON.stringify({
-      version: VERSION,
+      version: LEGACY_GENERATION,
       codexMetas: [],
       titles: [],
       claudeChildReferences: [
@@ -987,7 +990,7 @@ test('derived cache rescans an unchanged parent after the receipt parser upgrade
     fs.writeFileSync(
       file,
       JSON.stringify({
-        version: VERSION,
+        version: LEGACY_GENERATION,
         codexMetas: [],
         titles: [],
         claudeChildReferences: [
@@ -1016,7 +1019,7 @@ test('derived cache rescans an unchanged parent after the receipt parser upgrade
     fs.writeFileSync(
       file,
       JSON.stringify({
-        version: VERSION,
+        version: LEGACY_GENERATION,
         codexMetaVersion: CODEX_META_VERSION,
         codexMetas: [{ file: '/opening.jsonl', meta: codexMeta }],
         titles: [{ file: '/unrelated.jsonl', entry: title }],
@@ -1047,7 +1050,7 @@ test('derived cache rescans an unchanged parent after the receipt parser upgrade
       0,
       `a parser 18 ${complete ? 'complete' : 'visited-EOF'} entry survived`,
     );
-    assert.deepEqual(loaded.titles.get('/unrelated.jsonl'), title);
+    assert.equal(loaded.carriedNames.get('/unrelated.jsonl')?.label, title.label);
     assert.deepEqual(loaded.codexMetas.get('/opening.jsonl'), codexMeta);
   }
   fs.writeFileSync(
@@ -1441,7 +1444,7 @@ test('invalid rows and old title entries are discarded without losing valid rows
   fs.writeFileSync(
     file,
     JSON.stringify({
-      version: VERSION,
+      version: LEGACY_GENERATION,
       codexMetaVersion: CODEX_META_VERSION,
       codexMetas: [
         { file: '/good-rollout.jsonl', meta: codexMeta },
@@ -1511,8 +1514,11 @@ test('invalid rows and old title entries are discarded without losing valid rows
       ],
     }),
   );
+  // The legacy format carries Codex openings. Only the current format holds the current generation.
+  assert.equal(loadDerivedCache(file).codexMetas.size, 1);
+  const rows = JSON.parse(fs.readFileSync(file, 'utf8'));
+  fs.writeFileSync(file, JSON.stringify({ formatVersion: 1, metadataVersion: VERSION, titles: rows.titles }));
   const loaded = loadDerivedCache(file);
-  assert.equal(loaded.codexMetas.size, 1);
   assert.deepEqual(loaded.titles.get('/good-session.jsonl'), title);
   assert.equal(loaded.titles.has('/old-session.jsonl'), false);
   assert.equal(loaded.titles.has('/bad-session.jsonl'), false);
@@ -3005,10 +3011,11 @@ test('cache family admission and format fallback preserve only qualified facts',
   const imported = loadDerivedCache(current, legacy);
   assert.equal(imported.migrationPending, true);
   assert.equal(imported.claudeChildReferences.size, 1);
-  assert.equal(imported.titles.size, 0, 'legacy metadata 63 survived generation 64');
-  fs.writeFileSync(legacy, JSON.stringify({ ...old, version: 64 }));
+  assert.equal(imported.titles.size, 0, `legacy metadata 63 survived generation ${VERSION}`);
+  fs.writeFileSync(legacy, JSON.stringify({ ...old, version: LEGACY_GENERATION }));
   const main64 = loadDerivedCache(current, legacy);
-  assert.equal(main64.titles.size, 1);
+  assert.equal(main64.titles.size, 0, `legacy metadata ${LEGACY_GENERATION} survived generation ${VERSION}`);
+  assert.equal(main64.carriedNames.size, 1);
   assert.equal(main64.claudeChildReferences.size, 1);
   fs.writeFileSync(legacy, JSON.stringify({ ...old, version: 62 }));
   assert.equal(

@@ -77,7 +77,9 @@ Claude reports `none` with current whole-file metadata, known empty turn starts,
 
 ### Turn reads
 
-`session --json` returns `version`, `requester`, `id`, `provider`, `state`, `turns`, `partial`, `readByteLimit`, and `notes`. Eligible replies also supply `observation` for follow-ups and `readObservation` for read acknowledgments.
+`session --json` returns `version`, `requester`, `id`, `provider`, `state`, `turns`, `subagentContext`, `partial`, `readByteLimit`, and `notes`. Eligible replies also supply `observation` for follow-ups and `readObservation` for read acknowledgments.
+
+`subagentContext` estimates the text that subagents returned into the current context, as `{ tokens, share, partial }`. `tokens` estimates from UTF-8 size, at approximately 2.79 bytes per token for Claude and four for Codex. `share` divides `tokens` by the recorded current context, or is `null` when that context is unknown. A share above 1 stays as computed. `partial` is `true` when the read could not reach every result the figure covers. `tokens` is `0` when the read shows no subagent result. The field is `null` when the read returns no current turns.
 
 Each explicit read qualifies the selected accepted source's current opening without advancing discovery. Valid growth remains readable. Unknown membership, competing sources, replacement, changed opening identity or working directory, and unavailable qualification refuse the read. A source change during qualification or parsing returns no turns. Notes identify the failed condition.
 

@@ -504,7 +504,6 @@ test('a cancelled commit ownership request keeps its child cursor for the retry'
 import {
   CLAUDE_METADATA_TAIL_BYTES,
   CLAUDE_CHILD_REFERENCE_PARSER_VERSION,
-  VERSION,
   carryAgentRunScan,
   loadDerivedCache,
   limitCodexDispatchCursors,
@@ -4990,10 +4989,8 @@ test('a restart rediscovers PowerShell receipts from old complete and visited-EO
       references: [],
     };
     const cacheFile = path.join(directory, 'cache.json');
-    fs.writeFileSync(
-      cacheFile,
-      JSON.stringify({ version: VERSION, titles: [], claudeChildReferences: [{ file, entry }] }),
-    );
+    // Generation 64 is the newest the legacy cache format was written at.
+    fs.writeFileSync(cacheFile, JSON.stringify({ version: 64, titles: [], claudeChildReferences: [{ file, entry }] }));
     const restored = loadDerivedCache(cacheFile).claudeChildReferences;
     for (const referenceEntries of [[[file, entry]], [...restored]] as Array<
       Array<[string, import('./derivedcache').ClaudeChildReferenceCacheEntry]>

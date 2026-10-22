@@ -130,6 +130,7 @@ function* frameRecovery<State>(
       return;
     }
     let bytes: Buffer;
+    const reduced = oversized !== null && oversized !== undefined;
     if (oversized) {
       control.oversized = null;
       // A record that reduces to incomplete JSON passes on, and the parser drops it as it drops any unparseable line.
@@ -151,6 +152,7 @@ function* frameRecovery<State>(
         text: control.retain ? control.retain(text) : text,
         start: appliedThrough,
         end: baseOffset + end,
+        ...(reduced ? { reduced: true } : {}),
       });
     }
     control.fragments = [];

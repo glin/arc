@@ -6,6 +6,7 @@ import { outputRateText, type OutputRate, type OutputRateBasis } from './outputr
 
 import { mayHaveUnrecordedEdits, TOOL_KIND as CODEX_TOOL_KIND } from './codex';
 import { TOOL_KIND as CLAUDE_TOOL_KIND } from './transcript';
+import type { SubagentContextFigure } from './subagentcontext';
 import { FileIcon, iconFor } from './fileicons';
 import {
   cacheExpiryExtraCost,
@@ -3099,7 +3100,12 @@ export function withSessionContextDetail(
     if (chip.metric !== metric || !chip.detailList) {
       return chip;
     }
-    const entries = [...chip.detailList.entries, ...addition.entries];
+    // The subagent results entry stays last.
+    const last = chip.detailList.entries.at(-1);
+    const entries =
+      last?.label === SUBAGENT_RESULTS_LABEL
+        ? [...chip.detailList.entries.slice(0, -1), ...addition.entries, last]
+        : [...chip.detailList.entries, ...addition.entries];
     const detailList: StatDetailList = {
       ...chip.detailList,
       layout: 'economics',
@@ -3393,7 +3399,43 @@ export function bandForPercent(percent: number): { at: number; level: ContextLev
 export { wholePercent } from './view/tokens.ts';
 
 // Context fields used to resolve a recorded window or model fallback.
-type ContextTurn = Pick<Turn, 'contextWindow' | 'model' | 'provider' | 'contextTokens' | 'usage'>;
+type ContextTurn = Pick<Turn, 'contextWindow' | 'model' | 'provider' | 'contextTokens' | 'usage' | 'subagentContext'>;
+
+const SUBAGENT_RESULTS_LABEL = 'Subagent results';
+const SUBAGENT_RESULT_LINES = 5;
+
+// A share of context in whole percent at 10% or more, and with one decimal below it.
+function subagentSharePercent(tokens: number, context: number): string {
+  const percent = (tokens / context) * 100;
+  if (percent === 0) {
+    return '0%';
+  }
+  return percent >= 10 ? `${Math.round(percent)}%` : `${Number(percent.toFixed(1))}%`;
+}
+
+// How much of the context holds text that subagents returned, with one line per subagent.
+function subagentContextEntry(figure: SubagentContextFigure | undefined, context: number): StatDetailEntry | null {
+  if (!figure || !context) {
+    return null;
+  }
+  const part = (tokens: number) => `${formatTokens(tokens)} tokens (${subagentSharePercent(tokens, context)})`;
+  const shown = figure.agents.slice(0, SUBAGENT_RESULT_LINES);
+  const rest = figure.agents.slice(SUBAGENT_RESULT_LINES);
+  const restTokens = rest.reduce((sum, line) => sum + line.tokens, 0);
+  const share = `${subagentSharePercent(figure.tokens, context)} (${formatTokens(figure.tokens)})`;
+  return {
+    label: SUBAGENT_RESULTS_LABEL,
+    value: figure.partial ? `at least ${share}` : share,
+    valueTitle: `${figure.tokens.toLocaleString()} tokens, estimate`,
+    lines: [
+      ...shown.map((line) => `${line.name}: ${part(line.tokens)}`),
+      ...(rest.length ? [`${rest.length} more: ${part(restTokens)}`] : []),
+      ...(figure.removed ? ['The latest compaction removed earlier results.'] : []),
+      ...(figure.partial ? ['Part of the session record was not read.'] : []),
+      'Estimated from text size.',
+    ],
+  };
+}
 
 export function windowFor(turn: ContextTurn): number | null {
   return turn.contextWindow ?? contextWindowFor(turn.model, turn.provider ?? null);
@@ -3411,10 +3453,15 @@ function contextShare(turn: ContextTurn): number | null {
   return turn.contextTokens / window;
 }
 
-function contextChip(turn: ContextTurn, when = 'Context at the end of the turn'): StatChip | null {
+function contextChip(
+  turn: ContextTurn,
+  when = 'Context at the end of the turn',
+  subagents = turn.subagentContext,
+): StatChip | null {
   if (!turn.contextTokens) {
     return null;
   }
+  const subagentEntry = subagentContextEntry(subagents, turn.contextTokens);
   const window = windowFor(turn);
   const share = contextShare(turn);
   const percent = share === null ? null : wholePercent(share);
@@ -3430,6 +3477,7 @@ function contextChip(turn: ContextTurn, when = 'Context at the end of the turn')
         value: `${turn.contextTokens.toLocaleString()} tokens`,
         ...(word ? { lines: [bandSentence(word)] } : {}),
       },
+      ...(subagentEntry ? [subagentEntry] : []),
     ],
     ...(window && share !== null
       ? turn.contextWindow
@@ -5755,16 +5803,25 @@ function sessionFigureStats(
   const lastCompaction = inside.length ? inside.reduce((a, b) => (b.at > a.at ? b : a)) : null;
   const current = currentContextOf(newest, lastCompaction);
   const contextTurn = current ? { ...newest, contextTokens: current.tokens, contextWindow: current.window } : newest;
-  const ctx = current
-    ? contextChip(
-        contextTurn,
-        current.afterCompaction ? 'Context after the latest compaction' : 'Latest recorded context',
-      )
-    : null;
+  const contextLabel = current?.afterCompaction ? 'Context after the latest compaction' : 'Latest recorded context';
+  // After a compaction, the results in context are the ones the compaction kept.
+  const subagentFigure = current?.afterCompaction
+    ? (lastCompaction?.subagentContext ??
+      (newest.subagentContext
+        ? {
+            tokens: 0,
+            partial: false,
+            removed: newest.subagentContext.tokens > 0 || newest.subagentContext.removed,
+            agents: [],
+          }
+        : undefined))
+    : newest.subagentContext;
+  const ctx = current ? contextChip(contextTurn, contextLabel, subagentFigure) : null;
   if (ctx && current) {
     const share = contextShare(contextTurn);
     const detailList = ctx.detailList!;
-    const contextEntry = detailList.entries[detailList.entries.length - 1];
+    // Handoff advice belongs to the context level, not to an entry added after it.
+    const contextEntry = detailList.entries.find((entry) => entry.label === contextLabel)!;
     contextEntry.lines = [
       ...(contextEntry.lines ?? []),
       ...(ctx.level && HANDOFF_LEVELS.includes(ctx.level) ? [HANDOFF_SENTENCE] : []),
@@ -5773,7 +5830,8 @@ function sessionFigureStats(
     if (facts.entries.length) {
       facts.entries[0].separateBefore = true;
     }
-    detailList.entries.push(...facts.entries);
+    // The facts follow the context level, and the subagent results entry stays last.
+    detailList.entries.splice(detailList.entries.indexOf(contextEntry) + 1, 0, ...facts.entries);
     detailList.notes = [
       'Context measures the current level, not cumulative token usage.',
       ...(facts.notes ?? []),
@@ -5783,7 +5841,11 @@ function sessionFigureStats(
       ...ctx,
       metric: 'context',
       compactLabel: share === null ? ctx.label : `${wholePercent(share)}% ctx`,
-      detail: flatDetailList(detailList).join('\n'),
+      // The session list shows this text, and the subagent results stay in the popover alone.
+      detail: flatDetailList({
+        ...detailList,
+        entries: detailList.entries.filter((entry) => entry.label !== SUBAGENT_RESULTS_LABEL),
+      }).join('\n'),
       detailList,
     });
   }

@@ -85,6 +85,17 @@ import {
   type ClaudeDispatchSessionReference,
 } from './transcript';
 import {
+  addSubagentResult,
+  clearSubagentContext,
+  commitSubagentContext,
+  emptySubagentContext,
+  estimateTextTokens,
+  noteSubagentContextLine,
+  skipSubagentContext,
+  subagentContextFigure,
+  type SubagentContextState,
+} from './subagentcontext';
+import {
   AgentSpend,
   openSpendBand,
   AgentSpendLookup,
@@ -1028,7 +1039,14 @@ export function readCodexSessionActivity(
     ...(statsFor
       ? {
           stats: sessionStatFactsOf(
-            readCodexSessionLines(tail.lines, statsFor.sessionId, { maxTurns: 40 }, tail.readBytes, statsFor.meta),
+            readCodexSessionLines(
+              tail.lines,
+              statsFor.sessionId,
+              { maxTurns: 40 },
+              tail.readBytes,
+              statsFor.meta,
+              tail.offset,
+            ),
           ),
         }
       : {}),
@@ -2956,6 +2974,119 @@ function finalChildMessage(record: Entry): boolean {
 }
 
 type ChildTerminalStatus = 'completed' | 'failed' | 'interrupted';
+
+// The tool that waits for subagents. Its output enters context, but its call names no
+// receiver, so the output counts toward no single subagent. The `wait` tool waits for a
+// code cell, not a subagent.
+const CODEX_WAIT_TOOL = 'wait_agent';
+
+function noteCodexWaitCall(state: CodexSessionParserState, callId: string): void {
+  state.waitCalls.push(callId);
+  if (state.waitCalls.length > 64) {
+    state.waitCalls.shift();
+  }
+}
+
+// The subagent row a path or name identifies, from the newest turn back.
+function codexSubagentRow(state: CodexSessionParserState, key: string): TurnAgent | null {
+  const name = key.slice(key.lastIndexOf('/') + 1);
+  const turns: Array<{ agents: TurnAgent[] }> = state.open ? [...state.turns, state.open] : state.turns;
+  for (let index = turns.length - 1; index >= 0; index--) {
+    const row = turns[index].agents.find((agent) => agent.id === key);
+    if (row) {
+      return row;
+    }
+  }
+  return state.byName.get(name) ?? null;
+}
+
+// Codex keeps four bytes a token. The result waits until a request reads it.
+function noteCodexKeyedResult(
+  state: CodexSessionParserState,
+  key: string | null,
+  text: string,
+  form: string,
+  identity: string,
+) {
+  const row = key ? codexSubagentRow(state, key) : null;
+  addSubagentResult(
+    state.subagents,
+    row?.id ?? key,
+    row?.description ?? null,
+    estimateTextTokens(text),
+    form,
+    identity,
+    text,
+  );
+}
+
+// The delivery a record makes: its item id, then its source offset. A read without offsets
+// falls back to the delivered text.
+function codexDeliveryIdentity(state: CodexSessionParserState, record: Entry, text: string): string {
+  const id = str(record.payload.id);
+  if (id) {
+    return `id:${id}`;
+  }
+  return state.subagents.line === null ? `text:${text}` : `at:${state.subagents.line}`;
+}
+
+// A completed subagent notification or a subagent's final answer to its parent enters the
+// parent's context whole. One delivery written as both an event and a response item counts once.
+function noteCodexSubagentResult(state: CodexSessionParserState, record: Entry, identity?: string): void {
+  const form = `${record.wrapper ?? ''}:${record.kind}`;
+  if (record.kind === 'agent_message') {
+    const recipient = str(record.payload.recipient);
+    if (!finalChildMessage(record) || (recipient && recipient !== (state.agentPath ?? '/root'))) {
+      return;
+    }
+    const text = blocksText(record.payload.content);
+    noteCodexKeyedResult(
+      state,
+      str(record.payload.author),
+      text,
+      form,
+      identity ?? codexDeliveryIdentity(state, record, text),
+    );
+    return;
+  }
+  const notification = subagentNotification(record);
+  if (!notification || notification.status !== 'completed') {
+    return;
+  }
+  const text = (record.payload.content as Array<{ text?: unknown }>)
+    .map((item) => (typeof item?.text === 'string' ? item.text : ''))
+    .join('');
+  noteCodexKeyedResult(state, notification.id, text, form, identity ?? codexDeliveryIdentity(state, record, text));
+}
+
+// A `wait_agent` output enters context and counts in the total only.
+function noteCodexWaitOutput(state: CodexSessionParserState, callId: string, text: string): void {
+  const index = state.waitCalls.indexOf(callId);
+  if (index < 0 || !text) {
+    return;
+  }
+  state.waitCalls.splice(index, 1);
+  noteCodexKeyedResult(state, null, text, 'wait', `call:${callId}`);
+}
+
+// Results that a compaction's replacement history keeps, read from its response items. The
+// replacement history is the context after the compaction, so they count at once.
+function noteCodexRetainedSubagentResults(state: CodexSessionParserState, items: unknown[]): void {
+  for (const [index, item] of items.entries()) {
+    if (!isRecord(item)) {
+      continue;
+    }
+    const kind = str(item.type) ?? '';
+    if (kind === 'function_call' && str(item.name) === CODEX_WAIT_TOOL && str(item.call_id)) {
+      noteCodexWaitCall(state, str(item.call_id)!);
+    } else if (kind === 'function_call_output') {
+      noteCodexWaitOutput(state, str(item.call_id) ?? '', outputText(item.output));
+    } else {
+      noteCodexSubagentResult(state, { kind, wrapper: 'replacement', at: 0, payload: item }, `kept:${index}`);
+    }
+  }
+  commitSubagentContext(state.subagents);
+}
 
 function subagentNotification(record: Entry): { id: string; status: ChildTerminalStatus } | null {
   if (record.kind !== 'message' || str(record.payload.role) !== 'user') {
@@ -5485,7 +5616,7 @@ export function readCodexSession(file: string, sessionId: string, opts: CodexRea
   // An outer Codex exec call can run several commands, so its output cannot be paired with
   // one command. The session cwd remains a safe repository hint for opening that output.
   const meta = readCodexSessionMeta(file);
-  const read = readCodexSessionLines(tail.lines, sessionId, opts, tail.readBytes, meta);
+  const read = readCodexSessionLines(tail.lines, sessionId, opts, tail.readBytes, meta, tail.offset);
   if (
     opts.prepareNewestTurnDiscovery &&
     !tail.whole &&
@@ -5514,7 +5645,11 @@ export function discoverCodexNewestTurn(
 }
 
 export interface CodexSessionParserState {
-  version: 22;
+  version: 24;
+  // Text that subagents returned into this session's context, and the `wait_agent` calls
+  // whose output has not arrived.
+  subagents: SubagentContextState;
+  waitCalls: string[];
   responseClock: CodexResponseClock;
   turns: Turn[];
   turnRanges: Array<{ start: number; end: number }>;
@@ -5586,6 +5721,8 @@ export interface CodexSessionReducer {
   retainedPayloadScan(): Generator<void, number>;
   pushLine(line: string | ParserLine): void;
   trimBefore(offset: number): boolean;
+  // Invalidate state affected by bytes omitted before the resumed read.
+  skipped(): void;
   snapshot(): CodexSessionParserState;
   read(readBytes?: number): CodexSessionRead;
   // Finalizes and returns the reducer's owned state without cloning.
@@ -5601,7 +5738,9 @@ function emptyCodexSessionParserState(meta: CodexSessionMeta | null): CodexSessi
   const replayBoundaryAt = meta?.replayBoundaryAt ?? null;
   const openingSessionId = meta?.sessionId ?? null;
   return {
-    version: 22,
+    version: 24,
+    subagents: emptySubagentContext(),
+    waitCalls: [],
     responseClock: emptyCodexResponseClock(),
     turns: [],
     turnRanges: [],
@@ -5998,7 +6137,8 @@ function closeCodexTurn(state: CodexSessionParserState, maxTurns: number, at = 0
     }
   }
   const { files, fileChanges: _fileChanges, ...turn } = open;
-  state.turns.push({ ...turn, files: [...files.values()] });
+  const subagentContext = subagentContextFigure(state.subagents);
+  state.turns.push({ ...turn, files: [...files.values()], ...(subagentContext ? { subagentContext } : {}) });
   const range = { start: open[CODEX_SOURCE_START] ?? 0, end: open[CODEX_SOURCE_END] ?? 0 };
   state.turnRanges.push(range);
   state.turnMembershipStarts.push(open[CODEX_MEMBERSHIP_START] ?? range.start);
@@ -6061,6 +6201,8 @@ function addCodexRequest(
   modelSource?: { start: number; end: number } | null,
   turnStart = source.start,
 ): void {
+  // This request read every subagent result recorded before it.
+  commitSubagentContext(state.subagents, source.start);
   const hasCompactionUsage = turn.usageParts?.some((part) => part.compactionUsage) === true;
   if (event.compactionUsage) {
     if ((turn.usage.requests ?? 0) > 0 || hasCompactionUsage) addTurnUsagePart(turn, event);
@@ -6131,6 +6273,11 @@ function reduceCodexSessionLine(
   const sourceStart = typeof input === 'string' ? 0 : (input.start ?? 0);
   const sourceEnd = typeof input === 'string' ? sourceStart : (input.end ?? sourceStart);
   const hasSourceOffset = typeof input !== 'string' && input.start !== undefined;
+  noteSubagentContextLine(
+    state.subagents,
+    hasSourceOffset ? sourceStart : null,
+    typeof input !== 'string' && input.reduced === true,
+  );
   if (line.length < 20 || !carriesRecord(line)) {
     return;
   }
@@ -6373,6 +6520,14 @@ function reduceCodexSessionLine(
             range?.start,
           );
         }
+        // The delayed requests read results the turn could not count when it closed. Only the
+        // newest closed turn takes the live figure, because an older one closed before later results.
+        if (usageEvents.length > 0 && closedIndex === state.turns.length - 1) {
+          const subagentContext = subagentContextFigure(state.subagents);
+          if (subagentContext) {
+            closed.subagentContext = subagentContext;
+          }
+        }
       } else {
         state.contexts.set(id, context);
       }
@@ -6443,6 +6598,13 @@ function reduceCodexSessionLine(
   }
 
   if (kind === 'compacted') {
+    // The replacement history is the context after the compaction, so the results it keeps stay.
+    clearSubagentContext(state.subagents);
+    // A cut record loses its replacement history, so the results it kept are unknown.
+    state.subagents.reduced = state.subagents.lineReduced;
+    if (Array.isArray(payload.replacement_history)) {
+      noteCodexRetainedSubagentResults(state, payload.replacement_history);
+    }
     // Replacement history can include opaque summaries. The card reports the compaction
     // without treating encrypted content as readable summary text.
     const exactUsage = codexRequestUsage(
@@ -6460,6 +6622,7 @@ function reduceCodexSessionLine(
     const model = state.lastModel;
     const turnId = state.usageState.currentTurnId;
     const contextWindow = turnId ? (state.usageState.turnWindows[turnId] ?? null) : null;
+    const subagentContext = subagentContextFigure(state.subagents);
     state.compactions.push({
       sessionId,
       at,
@@ -6474,6 +6637,7 @@ function reduceCodexSessionLine(
       ),
       model: exactUsage ? null : model,
       summary: '',
+      ...(subagentContext ? { subagentContext } : {}),
       ...((str(payload.compaction_response_id) ??
       (isRecord(payload.latest_token_usage_record) ? str(payload.latest_token_usage_record.response_id) : null))
         ? {
@@ -6589,6 +6753,7 @@ function reduceCodexSessionLine(
     case 'user_message':
     case 'message': {
       const notification = subagentNotification(record);
+      noteCodexSubagentResult(state, record);
       if (notification) {
         const row = turn.agents.find((agent) => agent.id === notification.id);
         if (row) {
@@ -6677,6 +6842,9 @@ function reduceCodexSessionLine(
       }
       if (id && name) {
         state.toolNames.set(id, name);
+      }
+      if (id && name === CODEX_WAIT_TOOL) {
+        noteCodexWaitCall(state, id);
       }
       const command = recordedName === 'exec' ? wrappedCommand(payload.input) : null;
       const detail = command
@@ -6887,6 +7055,7 @@ function reduceCodexSessionLine(
       turn.endedAt = Math.max(turn.endedAt, at);
       const text = outputText(payload.output);
       const callId = str(payload.call_id) ?? '';
+      noteCodexWaitOutput(state, callId, text);
       const ran = state.stepById.get(callId);
       const expanded = state.pendingExec.get(callId)?.expanded === true;
       // Outer JavaScript output has no reliable association with one completed command.
@@ -6973,6 +7142,7 @@ function reduceCodexSessionLine(
       if (!finalChildMessage(record)) {
         break;
       }
+      noteCodexSubagentResult(state, record);
       const author = str(payload.author) as string;
       const row = state.byName.get(author.slice(author.lastIndexOf('/') + 1));
       if (row) {
@@ -7372,7 +7542,7 @@ export function createCodexSessionReducer(
   restored?: CodexSessionParserState,
 ): CodexSessionReducer {
   const state = restored ? cloneParserState(restored) : emptyCodexSessionParserState(meta);
-  if (state.version !== 22) {
+  if (state.version !== 24) {
     throw new Error('Incompatible Codex parser state');
   }
   applyHiddenParserState(codexHiddenSlots(state), state.hidden, CODEX_HIDDEN_POLICY);
@@ -7411,6 +7581,7 @@ export function createCodexSessionReducer(
     retainedBytes: () => retainedParserPayload(state),
     retainedPayloadScan: () => retainedParserPayloadScan(state),
     trimBefore: (offset) => trimCodexBefore(state, offset, opts.maxTurns ?? 40),
+    skipped: () => skipSubagentContext(state.subagents),
     snapshot: () => codexSnapshot(state),
     read: (readBytes = 0) => materializeCodexSession(state, opts, readBytes),
     finish: (readBytes = 0) => finishCodexSession(state, opts, readBytes),
@@ -7521,10 +7692,18 @@ function readCodexSessionLines(
   opts: CodexReadOptions,
   readBytes: number,
   meta: CodexSessionMeta | null,
+  offset?: number,
 ): CodexSessionRead {
   const reducer = createCodexSessionReducer(sessionId, opts, meta);
+  let start = offset ?? 0;
   for (const line of lines) {
-    reducer.pushLine(line);
+    if (offset === undefined) {
+      reducer.pushLine(line);
+      continue;
+    }
+    const end = start + Buffer.byteLength(line);
+    reducer.pushLine({ text: line, start, end });
+    start = end + 1;
   }
   return reducer.finish(readBytes);
 }

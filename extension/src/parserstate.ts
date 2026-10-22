@@ -5,6 +5,8 @@ export interface ParserLine {
   text: string;
   start?: number;
   end?: number;
+  // The reader cut bytes out of this record before the parse.
+  reduced?: boolean;
 }
 
 export function retainedParserPayload(value: unknown): number {

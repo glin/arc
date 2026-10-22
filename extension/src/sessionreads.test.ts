@@ -14,6 +14,7 @@ import { syncBuiltinESMExports } from 'node:module';
 import * as path from 'node:path';
 import { afterEach, test, vi } from 'vitest';
 import { tempDir } from './temproot.ts';
+import { claudeSubagentResult } from './turnfixtures.ts';
 import {
   boundedSessionRead,
   encodeSessionCursor,
@@ -894,4 +895,243 @@ test('accepted no-turn commands retain positive status until qualified process c
   assert.equal(status(false, false, 200, false), 'background');
   assert.equal(status(false, false, 99), 'background');
   assert.equal(status(false, false, 149), 'background');
+});
+
+test('the session read reports the subagent text in the current context', () => {
+  const directory = tempDir('session-subagents-');
+  const timestamp = (second: number) => new Date(Date.UTC(2026, 9, 22, 10, 0, second)).toISOString();
+  const report = 'The reducer keys its cache by path.';
+  const records = (subagent: boolean) => [
+    { type: 'user', timestamp: timestamp(0), cwd: directory, message: { role: 'user', content: 'Review the reducer' } },
+    ...(subagent
+      ? [
+          {
+            type: 'assistant',
+            timestamp: timestamp(1),
+            message: {
+              role: 'assistant',
+              model: 'claude-opus-5',
+              content: [{ type: 'tool_use', id: 'tu', name: 'Agent', input: { description: 'Review' } }],
+            },
+          },
+          claudeSubagentResult.foreground(timestamp(2), 'tu', 'agent-review', 'Review', report),
+        ]
+      : []),
+    {
+      type: 'assistant',
+      timestamp: timestamp(3),
+      message: {
+        role: 'assistant',
+        id: 'm1',
+        model: 'claude-opus-5',
+        stop_reason: 'end_turn',
+        content: [{ type: 'text', text: 'Reviewed.' }],
+        usage: { input_tokens: 1000, output_tokens: 1 },
+      },
+    },
+  ];
+  const read = (lines: object[], name: string, scope: string | null = 'scope') => {
+    const file = path.join(directory, `${name}.jsonl`);
+    const stamped = lines.map((record) => ({ ...record, sessionId: name }));
+    fs.writeFileSync(file, stamped.map((record) => JSON.stringify(record)).join('\n') + '\n');
+    const stat = revisionOf(fs.statSync(file, { bigint: true }));
+    const source = { agent: 'claude' as const, file, sessionId: name, cwd: directory, ...stat };
+    return boundedSessionRead(source, 2, () => scope, 'local-agent', [directory]);
+  };
+  const tokens = Math.ceil(Buffer.byteLength(report) / 2.79);
+  const figure = read(records(true), 'figure');
+  assert.deepEqual(figure.subagentContext, { tokens, share: tokens / 1000, partial: false }, JSON.stringify(figure));
+  assert.deepEqual(read(records(false), 'none').subagentContext, { tokens: 0, share: 0, partial: false });
+  assert.equal(read(records(true), 'stale', null).subagentContext, null);
+});
+
+test('the session read marks the subagent text partial when the only result lost its launch', () => {
+  const directory = tempDir('session-dropped-launch-');
+  const timestamp = (second: number) => new Date(Date.UTC(2026, 9, 22, 10, 0, second)).toISOString();
+  const launches = Array.from({ length: 1025 }, (_, index) => ({
+    type: 'assistant',
+    timestamp: timestamp(1),
+    message: {
+      role: 'assistant',
+      model: 'claude-opus-5',
+      content: [
+        {
+          type: 'tool_use',
+          id: `tu-${index}`,
+          name: 'Agent',
+          input: { description: `Review ${index}`, run_in_background: true },
+        },
+      ],
+    },
+  }));
+  const lines = [
+    { type: 'user', timestamp: timestamp(0), cwd: directory, message: { role: 'user', content: 'Run many reviews' } },
+    ...launches,
+    claudeSubagentResult.notice(timestamp(2), 'tu-0', 'agent-0', 'The oldest review finished.'),
+    {
+      type: 'assistant',
+      timestamp: timestamp(3),
+      message: {
+        role: 'assistant',
+        id: 'm1',
+        model: 'claude-opus-5',
+        stop_reason: 'end_turn',
+        content: [{ type: 'text', text: 'Reviewed.' }],
+        usage: { input_tokens: 1000, output_tokens: 1 },
+      },
+    },
+  ].map((record) => ({ ...record, sessionId: 'dropped' }));
+  const file = path.join(directory, 'dropped.jsonl');
+  fs.writeFileSync(file, lines.map((record) => JSON.stringify(record)).join('\n') + '\n');
+  const stat = revisionOf(fs.statSync(file, { bigint: true }));
+  const source = { agent: 'claude' as const, file, sessionId: 'dropped', cwd: directory, ...stat };
+  const read = boundedSessionRead(source, 2, () => 'scope', 'local-agent', [directory]);
+  assert.deepEqual(read.subagentContext, { tokens: 0, share: 0, partial: true });
+});
+
+test('the session read keeps the subagent text a Codex compaction retained', () => {
+  const directory = tempDir('session-codex-subagents-');
+  const timestamp = (second: number) => new Date(Date.UTC(2026, 9, 22, 10, 0, second)).toISOString();
+  const turnId = '01a032c9-1e07-78b2-ae0c-dc76f2dd7901';
+  const sessionId = '01a032c9-1a92-7931-845c-723117d24dbe';
+  const notification = {
+    type: 'message',
+    role: 'user',
+    content: [
+      {
+        type: 'input_text',
+        text: `<subagent_notification>\n${JSON.stringify({ agent_path: '/root/review_sol', status: { completed: 'The reducer keys its cache by path.' } })}\n</subagent_notification>`,
+      },
+    ],
+    internal_chat_message_metadata_passthrough: { content_item_kinds: ['multi_agent.subagent_notification'] },
+  };
+  const counts = { input_tokens: 1000, cached_input_tokens: 0, output_tokens: 10, reasoning_output_tokens: 0 };
+  const records = (kept: object[]) => [
+    {
+      timestamp: timestamp(0),
+      type: 'session_meta',
+      payload: { id: sessionId, session_id: sessionId, cwd: directory, originator: 'codex_vscode', source: 'vscode' },
+    },
+    { timestamp: timestamp(1), type: 'event_msg', payload: { type: 'task_started', turn_id: turnId } },
+    {
+      timestamp: timestamp(2),
+      type: 'turn_context',
+      payload: { turn_id: turnId, cwd: directory, model: 'gpt-5.6-sol' },
+    },
+    { timestamp: timestamp(3), type: 'event_msg', payload: { type: 'user_message', message: 'Review the reducer' } },
+    {
+      timestamp: timestamp(4),
+      type: 'response_item',
+      payload: {
+        type: 'function_call',
+        name: 'spawn_agent',
+        call_id: 'call_review',
+        arguments: JSON.stringify({ task_name: 'review_sol' }),
+      },
+    },
+    { timestamp: timestamp(5), type: 'response_item', payload: notification },
+    {
+      timestamp: timestamp(6),
+      type: 'event_msg',
+      payload: {
+        type: 'token_count',
+        info: { last_token_usage: counts, total_token_usage: counts, model_context_window: 258400 },
+      },
+    },
+    { timestamp: timestamp(7), type: 'event_msg', payload: { type: 'task_complete', turn_id: turnId } },
+    { timestamp: timestamp(8), type: 'compacted', payload: { replacement_history: kept } },
+    // The context the compaction kept, measured before any later request.
+    {
+      timestamp: timestamp(9),
+      type: 'event_msg',
+      payload: {
+        type: 'token_count',
+        info: {
+          last_token_usage: { ...counts, input_tokens: 0, output_tokens: 0, total_tokens: 400 },
+          model_context_window: 258400,
+        },
+      },
+    },
+  ];
+  const read = (lines: object[], name: string) => {
+    const file = path.join(directory, `rollout-2026-10-22T10-00-00-${name}.jsonl`);
+    fs.writeFileSync(file, lines.map((record) => JSON.stringify(record)).join('\n') + '\n');
+    const stat = revisionOf(fs.statSync(file, { bigint: true }));
+    const source = { agent: 'codex' as const, file, sessionId, cwd: directory, ...stat };
+    return boundedSessionRead(source, 2, () => 'scope', 'local-agent', [directory]);
+  };
+  const tokens = Math.ceil(Buffer.byteLength(notification.content[0].text) / 4);
+  const kept = read(records([notification]), 'kept').subagentContext;
+  assert.deepEqual(kept, { tokens, share: tokens / 400, partial: false });
+  assert.deepEqual(read(records([]), 'removed').subagentContext, { tokens: 0, share: 0, partial: false });
+});
+
+test('the session read keeps the subagent text a delayed Codex turn context reports', () => {
+  const directory = tempDir('session-codex-delayed-subagents-');
+  const timestamp = (second: number) => new Date(Date.UTC(2026, 9, 22, 10, 0, second)).toISOString();
+  const turnId = '01a032c9-1e07-78b2-ae0c-dc76f2dd7902';
+  const sessionId = '01a032c9-1a92-7931-845c-723117d24dbf';
+  const text = `<subagent_notification>\n${JSON.stringify({ agent_path: '/root/review_sol', status: { completed: 'The reducer keys its cache by path.' } })}\n</subagent_notification>`;
+  const counts = { input_tokens: 1000, cached_input_tokens: 0, output_tokens: 10, reasoning_output_tokens: 0 };
+  const lines = [
+    {
+      timestamp: timestamp(0),
+      type: 'session_meta',
+      payload: { id: sessionId, session_id: sessionId, cwd: directory, originator: 'codex_vscode', source: 'vscode' },
+    },
+    { timestamp: timestamp(1), type: 'event_msg', payload: { type: 'task_started', turn_id: turnId } },
+    { timestamp: timestamp(2), type: 'event_msg', payload: { type: 'user_message', message: 'Review the reducer' } },
+    {
+      timestamp: timestamp(3),
+      type: 'response_item',
+      payload: {
+        type: 'function_call',
+        name: 'spawn_agent',
+        call_id: 'call_review',
+        arguments: JSON.stringify({ task_name: 'review_sol' }),
+      },
+    },
+    {
+      timestamp: timestamp(4),
+      type: 'response_item',
+      payload: {
+        type: 'message',
+        role: 'user',
+        content: [{ type: 'input_text', text }],
+        internal_chat_message_metadata_passthrough: { content_item_kinds: ['multi_agent.subagent_notification'] },
+      },
+    },
+    {
+      timestamp: timestamp(5),
+      type: 'response_item',
+      payload: {
+        type: 'message',
+        role: 'assistant',
+        phase: 'final_answer',
+        content: [{ type: 'output_text', text: 'Reviewed.' }],
+      },
+    },
+    {
+      timestamp: timestamp(6),
+      type: 'event_msg',
+      payload: {
+        type: 'token_count',
+        info: { last_token_usage: counts, total_token_usage: counts, model_context_window: 258400 },
+      },
+    },
+    { timestamp: timestamp(7), type: 'event_msg', payload: { type: 'task_complete', turn_id: turnId } },
+    // The turn context arrives after the turn closed, so it bills the request the turn already holds.
+    {
+      timestamp: timestamp(8),
+      type: 'turn_context',
+      payload: { turn_id: turnId, cwd: directory, model: 'gpt-5.6-sol' },
+    },
+  ];
+  const file = path.join(directory, 'rollout-2026-10-22T10-00-00-delayed.jsonl');
+  fs.writeFileSync(file, lines.map((record) => JSON.stringify(record)).join('\n') + '\n');
+  const stat = revisionOf(fs.statSync(file, { bigint: true }));
+  const source = { agent: 'codex' as const, file, sessionId, cwd: directory, ...stat };
+  const tokens = Math.ceil(Buffer.byteLength(text) / 4);
+  const read = boundedSessionRead(source, 2, () => 'scope', 'local-agent', [directory]);
+  assert.deepEqual(read.subagentContext, { tokens, share: tokens / 1000, partial: false });
 });

@@ -102,7 +102,7 @@ import {
   withoutLeadingSymbol,
 } from './turncard.ts';
 import { turnMenuContext } from './view/card-menu.ts';
-import type { SessionCostUsage, SessionOverheads, StatDetailLine, TurnCard } from './turncard.ts';
+import type { SessionCostUsage, SessionOverheads, StatDetailLine, StatDetailList, TurnCard } from './turncard.ts';
 import type { TurnStep } from './transcript.ts';
 import { answerPart, commentAnchorText } from './turncomments.ts';
 import { formatTokens, formatWhen } from './turnformat.ts';
@@ -11448,4 +11448,148 @@ test('the next-turn basis reads request effort independently of later turn effor
   assert.equal(nextTurnBasisOf(held, null)?.effort, 'high');
   assert.equal(nextTurnBasisOf(held, null)?.bedrock, true);
   assert.equal(nextTurnBasisOf({ ...held, contextRequest: CONTEXT_REQUEST }, null)?.effort, null);
+});
+
+function subagentResultsEntry(chips: readonly { metric?: string; detailList?: StatDetailList }[]) {
+  const entries = chips.find((chip) => chip.metric === 'context')?.detailList?.entries ?? [];
+  return { entries, entry: entries.find((entry) => entry.label === 'Subagent results') };
+}
+
+test('the context chip shows the subagent results in context at the end of each turn', () => {
+  const lines = [
+    { name: 'Fix the stale cache key in the usage reducer', tokens: 3800 },
+    { name: 'Review the parser', tokens: 1000 },
+    { name: 'Find the fixtures', tokens: 800 },
+  ];
+  const card = toCard(
+    turn({
+      contextTokens: 120_000,
+      contextWindow: 200_000,
+      subagentContext: { tokens: 12_400, partial: false, removed: false, agents: lines },
+    }),
+    false,
+    Date.now(),
+  );
+  const { entries, entry } = subagentResultsEntry(card.chips);
+  assert.equal(entries.at(-1), entry, 'the entry is last');
+  assert.deepEqual(entry, {
+    label: 'Subagent results',
+    value: '10% (12k)',
+    valueTitle: '12,400 tokens, estimate',
+    lines: [
+      'Fix the stale cache key in the usage reducer: 4k tokens (3.2%)',
+      'Review the parser: 1k tokens (0.8%)',
+      'Find the fixtures: 800 tokens (0.7%)',
+      'Estimated from text size.',
+    ],
+  });
+
+  const none = toCard(turn({ contextTokens: 120_000, contextWindow: 200_000 }), false, Date.now());
+  assert.equal(subagentResultsEntry(none.chips).entry, undefined, 'a session without subagents shows no entry');
+});
+
+test('the subagent results entry caps its lines, marks a partial figure and reports a compaction', () => {
+  const agents = Array.from({ length: 12 }, (_, index) => ({
+    name: `Subagent ${index + 1}`,
+    tokens: 2000 - index * 100,
+  }));
+  const many = toCard(
+    turn({
+      contextTokens: 120_000,
+      contextWindow: 200_000,
+      subagentContext: { tokens: 18_600, partial: true, removed: false, agents },
+    }),
+    false,
+    Date.now(),
+  );
+  const { entry } = subagentResultsEntry(many.chips);
+  assert.equal(entry?.value, 'at least 16% (19k)');
+  assert.deepEqual(entry?.lines, [
+    'Subagent 1: 2k tokens (1.7%)',
+    'Subagent 2: 2k tokens (1.6%)',
+    'Subagent 3: 2k tokens (1.5%)',
+    'Subagent 4: 2k tokens (1.4%)',
+    'Subagent 5: 2k tokens (1.3%)',
+    '7 more: 8k tokens (7%)',
+    'Part of the session record was not read.',
+    'Estimated from text size.',
+  ]);
+
+  const compacted = toCard(
+    turn({
+      contextTokens: 30_000,
+      contextWindow: 200_000,
+      subagentContext: { tokens: 0, partial: false, removed: true, agents: [] },
+    }),
+    false,
+    Date.now(),
+  );
+  assert.deepEqual(subagentResultsEntry(compacted.chips).entry?.value, '0% (0)');
+  assert.deepEqual(subagentResultsEntry(compacted.chips).entry?.lines, [
+    'The latest compaction removed earlier results.',
+    'Estimated from text size.',
+  ]);
+});
+
+test('the session heading context chip shows the current subagent results last', () => {
+  const figure = { tokens: 4000, partial: false, removed: false, agents: [{ name: 'Reviewer', tokens: 4000 }] };
+  const older = turn({ startedAt: 1000, endedAt: 2000, contextTokens: 50_000, contextWindow: 200_000 });
+  const newest = turn({
+    startedAt: 3000,
+    endedAt: 4000,
+    contextTokens: 80_000,
+    contextWindow: 200_000,
+    subagentContext: figure,
+  });
+  const chips = withSessionContextDetail(sessionStats([older, newest], []), {
+    entries: [{ label: 'Latest compaction', value: 'Automatic' }],
+  });
+  const { entries, entry } = subagentResultsEntry(chips);
+  assert.equal(entries.at(-1), entry, 'the entry stays after the latest compaction');
+  assert.equal(entry?.value, '5% (4k)', 'the share is of the current context');
+  assert.deepEqual(entry?.lines, ['Reviewer: 4k tokens (5%)', 'Estimated from text size.']);
+
+  const after = sessionStats([newest], [compaction({ at: 5000, contextAfter: 20_000 })]);
+  assert.equal(subagentResultsEntry(after).entry?.value, '0% (0)', 'a later compaction removed the results');
+});
+
+test('the session heading keeps handoff advice on the context level, above the subagent results', () => {
+  const window = 1_000_000;
+  const held = turn({
+    contextTokens: Math.round(window * 0.8),
+    startedAt: 9_000,
+    endedAt: 9_500,
+    summary: '- The work landed.',
+    subagentContext: { tokens: 6000, partial: false, removed: false, agents: [{ name: 'Reviewer', tokens: 6000 }] },
+  });
+  const { entries, entry } = subagentResultsEntry(sessionStats([held], []));
+  const level = entries.find((item) => item.label === 'Latest recorded context');
+  assert.ok(level?.lines?.includes(COMPACT_HERE), 'the advice stays on the context level');
+  assert.equal(entries.at(-1), entry, 'the subagent results entry stays last');
+  assert.ok(!entry?.lines?.includes(COMPACT_HERE), 'the advice is not under the subagent results');
+});
+
+test('the session heading keeps the subagent results a later compaction retained', () => {
+  const newest = turn({
+    startedAt: 3000,
+    endedAt: 4000,
+    contextTokens: 80_000,
+    contextWindow: 200_000,
+    subagentContext: { tokens: 4000, partial: false, removed: false, agents: [{ name: 'Reviewer', tokens: 4000 }] },
+  });
+  const kept = { tokens: 27, partial: false, removed: false, agents: [{ name: 'Reviewer', tokens: 27 }] };
+  const chips = sessionStats([newest], [compaction({ at: 5000, contextAfter: 20_000, subagentContext: kept })]);
+  const { entry } = subagentResultsEntry(chips);
+  assert.equal(entry?.value, '0.1% (27)');
+  assert.deepEqual(entry?.lines, ['Reviewer: 27 tokens (0.1%)', 'Estimated from text size.']);
+});
+
+test('the session list hover text leaves out the subagent results', () => {
+  const figure = { tokens: 4000, partial: false, removed: false, agents: [{ name: 'Reviewer', tokens: 4000 }] };
+  const chips = sessionStats([turn({ contextTokens: 80_000, contextWindow: 200_000, subagentContext: figure })], []);
+  const context = chips.find((chip) => chip.metric === 'context');
+  assert.ok(subagentResultsEntry(chips).entry, 'the context chip popover keeps the entry');
+  assert.ok(context?.detail?.includes('Latest recorded context'));
+  assert.ok(!context?.detail?.includes('Subagent results'), context?.detail);
+  assert.ok(!context?.detail?.includes('Reviewer'), context?.detail);
 });
