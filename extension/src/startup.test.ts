@@ -45,6 +45,7 @@ import {
   enumerateClaudeChildSources,
   revisionOf as fileRevisionOf,
   revalidatedCatalogPaths,
+  watchDirs,
 } from './transcript';
 import { randomUUID } from 'node:crypto';
 import assert from 'node:assert/strict';
@@ -1479,7 +1480,7 @@ function completeDiscoveryHarness(
     const withSessionSettings = (picks, session, settings) => ({ ...picks, [session]: settings });
     const sessionSettingsForProfile = (profile) => profile;
     const AGENT_NAMES = { claude: 'Claude', codex: 'Codex' }; const DRAFT_SESSION_PREFIX = 'draft:';
-    const watchDirs = () => []; const readThreadNames = (_path, names) => names;
+    const watchDirs = ${scope.productionWatchDirs ? 'productionWatchDirs' : '() => []'}; const readThreadNames = (_path, names) => names;
     const codexSessionIndexPath = () => 'index'; const spendFileVersion = () => 'unchanged';
     let spendSourceSignature = () => ''; let listingSignature = () => 'catalog';
     let projectSpendSourceOfferDue = () => false; const normalizeFsPath = ${scope.productionNormalizeFsPath ? 'productionNormalizeFsPath' : '(value) => value'};
@@ -8568,6 +8569,12 @@ test('opening a session leaves the rail to the render that selection asked for',
 
 test('session selection reads cached spend signatures without enumerating sources', async () => {
   const provider = paintHarness();
+  provider.watching = true;
+  provider.spendIntegrity = {
+    warmFiles() {
+      throw new Error('selection enumerated watch priorities');
+    },
+  };
   provider.lastSpendSourceSignature = 'accepted catalog';
   let signatures = 0;
   provider.useSpendSignature(() => {
@@ -9623,6 +9630,93 @@ test('warm demotion racing a late append recovers through host checking and reop
     await vi.waitFor(() => assert.equal(provider.projectSpendVisibleFiles[0].size, 6, 'reopening lost promoted work'));
     provider.stopPolling();
   } finally {
+    vi.clearAllTimers();
+    vi.useRealTimers();
+  }
+});
+
+test('unwatched transcript appends beyond the cap recover in one warm or cold pass', async () => {
+  vi.useFakeTimers();
+  let openWatches = 0;
+  let maximumWatches = 0;
+  const nativeWatch = vi.spyOn(mutableFs, 'watch').mockImplementation((() => {
+    maximumWatches = Math.max(maximumWatches, ++openWatches);
+    return {
+      on() {
+        return this;
+      },
+      close: vi.fn<() => void>(() => {
+        openWatches--;
+      }),
+    };
+  }) as any);
+  syncBuiltinESMExports();
+  const provider = integrityHostHarness();
+  try {
+    const root = tempDir('spend-watch-cap-');
+    const files = Array.from({ length: 258 }, (_, index) => {
+      const folder = path.join(root, String(index).padStart(4, '0'));
+      fs.mkdirSync(folder);
+      const file = normalizeSpendFile(path.join(folder, 'session.jsonl'));
+      fs.writeFileSync(file, '{}\n');
+      return file;
+    });
+    const records = files.map((file) => indexSpendFile(undefined, file, 'project', createCodexUsageLineReducer).record);
+    const cold = files[257];
+    const old = Date.now() - 8 * 86_400_000;
+    fs.utimesSync(cold, old / 1000, old / 1000);
+    records[257].mtimeMs = readRolloutStat(cold)!.mtimeMs;
+    const sessions = files.map((file, index) => ({
+      file,
+      sessionId: `session-${index}`,
+      agent: 'codex',
+      ...readRolloutStat(file)!,
+    }));
+    provider.projectSpendFiles = records;
+    provider.projectSpendVisibleFiles = records;
+    provider.projectSpendSources = () => files.map((file) => ({ file, agent: 'codex' }));
+    provider.sessionSpendSources = sessions;
+    provider.partial = sessions;
+    provider.catalog = { sessions };
+    provider.refresh = paintHarness([], { productionWatchDirs: watchDirs }).refresh;
+    provider.discovery = Promise.resolve(true);
+    provider.startPolling();
+    await provider.refresh(true);
+    await vi.advanceTimersByTimeAsync(500);
+    assert.equal(provider.watchers.size, 256);
+    const warm = files[256];
+    assert.equal(provider.watchers.has(path.dirname(warm)), false);
+    assert.equal(provider.watchers.has(path.dirname(cold)), false);
+    fs.appendFileSync(warm, '{}\n');
+    fs.appendFileSync(cold, '{}\n');
+    provider.refreshFrom = () => {};
+    await vi.advanceTimersByTimeAsync(30_000);
+    await vi.waitFor(() =>
+      assert.equal(provider.projectSpendVisibleFiles.find((record: SpendFileIndex) => record.file === warm).size, 6),
+    );
+    assert.equal(provider.projectSpendVisibleFiles.find((record: SpendFileIndex) => record.file === cold).size, 3);
+    await vi.advanceTimersByTimeAsync(15 * 60_000 - 30_000);
+    await vi.waitFor(() =>
+      assert.equal(provider.projectSpendVisibleFiles.find((record: SpendFileIndex) => record.file === cold).size, 6),
+    );
+    for (const record of provider.projectSpendFiles) {
+      fs.utimesSync(record.file, old / 1000, old / 1000);
+      record.mtimeMs = readRolloutStat(record.file)!.mtimeMs;
+    }
+    provider.spendIntegrity.promote([cold]);
+    await provider.refresh(true);
+    assert.equal(provider.watchers.size, 256);
+    assert.equal(provider.watchers.has(path.dirname(cold)), true, 'promotion did not receive watch priority');
+    assert.equal(provider.watchers.has(path.dirname(files[255])), false, 'promotion kept the displaced watcher');
+    provider.stopPolling();
+    assert.equal(provider.watchers.size, 0);
+    assert.equal(openWatches, 0);
+    assert.equal(maximumWatches, 256, 'replacement opened watchers before releasing their allocation');
+    assert.ok(nativeWatch.mock.results.every((result) => result.value.close.mock.calls.length === 1));
+  } finally {
+    provider.stopPolling();
+    nativeWatch.mockRestore();
+    syncBuiltinESMExports();
     vi.clearAllTimers();
     vi.useRealTimers();
   }

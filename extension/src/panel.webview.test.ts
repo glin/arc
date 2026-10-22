@@ -27884,7 +27884,7 @@ test('the panel watches transcript paths and hands each burst to the bounded sch
     'nothing watches the transcripts, so the panel is back to waiting for the poll',
   );
   assert.ok(
-    /watchDirectories\(watchDirs\(all\)\)/.test(panelHostSource),
+    /watchDirectories\(watchDirs\(all, this\.spendIntegrity\?\.warmFiles\(\)\)\)/.test(panelHostSource),
     'the panel picks its own directories to watch rather than taking the tested answer',
   );
 

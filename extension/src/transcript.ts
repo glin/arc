@@ -12721,14 +12721,18 @@ export function agentIsRunning(agent: TurnAgent): boolean {
 // Quiet interval for gathering transcript append events before refreshing the panel.
 export const TRANSCRIPT_WAKE_MS = 200;
 
-// Sorted unique parent directories for the supplied source files, excluding bare filenames without a directory.
-export function watchDirs(files: { file: string }[]): string[] {
-  const dirs = new Set<string>();
+export const TRANSCRIPT_WATCH_LIMIT = 256;
+
+// Allocate unique parent directories to warm sources first, with stable ordering within each tier.
+export function watchDirs(files: readonly { file: string }[], warmFiles: ReadonlySet<string> = new Set()): string[] {
+  const dirs = new Map<string, boolean>();
   for (const one of files) {
     const dir = path.dirname(one.file);
     if (dir && dir !== '.') {
-      dirs.add(dir);
+      dirs.set(dir, dirs.get(dir) === true || warmFiles.has(normalizeFsPath(one.file)));
     }
   }
-  return [...dirs].sort();
+  return [...dirs.keys()]
+    .sort((a, b) => Number(dirs.get(b)) - Number(dirs.get(a)) || (a < b ? -1 : a > b ? 1 : 0))
+    .slice(0, TRANSCRIPT_WATCH_LIMIT);
 }

@@ -191,8 +191,8 @@
   },
   "extension/src/startup.test.ts": {
     "reason": "Real title workers must publish recovered metadata through startup ownership and cancellation boundaries. Project cost snapshots must preserve workspace, revision, and calendar ownership during background slices. Agent messages must preserve durable admission, settlement wakeups, native delivery authority, and retained retries. Host integrity checks must preserve complete cost, discovery membership, exact revisions, and bounded coverage across failures and panel lifecycle changes.",
-    "cases": 243,
-    "matricesSha256": "3f6adc5a1becd731c08180e5391a723ed38da9941cb5dd244dd48284bf8bd213"
+    "cases": 244,
+    "matricesSha256": "5e0d8f748abe77a61f765ebf19956b89e923f1787e26e7753fc14d23bc670c1c"
   },
   "extension/src/store.test.ts": {
     "reason": "The real Stop hook must renew retention for useful snapshot stores without changing workspace files.",

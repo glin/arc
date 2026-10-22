@@ -11,6 +11,25 @@ import {
   watcherRefreshDecision,
 } from './scheduler.ts';
 
+test('watch priorities retain promotions for the same lifetime as integrity checks', () => {
+  const clock = new FakeClock();
+  const scheduler = new IntegrityScheduler(
+    async () => {},
+    () => {},
+    clock,
+  );
+  scheduler.update([
+    { file: 'warm', warm: true },
+    { file: 'cold', warm: false },
+  ]);
+  assert.deepEqual([...scheduler.warmFiles()], ['warm']);
+  scheduler.promote(['cold']);
+  clock.time = 7 * 86_400_000 - 1;
+  assert.deepEqual([...scheduler.warmFiles()], ['warm', 'cold']);
+  clock.time++;
+  assert.deepEqual([...scheduler.warmFiles()], ['warm']);
+});
+
 test('integrity deadlines survive continuous targeted work and cold discovery includes mixed folders', async () => {
   vi.useFakeTimers();
   try {

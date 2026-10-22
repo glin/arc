@@ -342,6 +342,7 @@ import {
   TURN_START_BYTES,
   TURN_START_MAX_BYTES,
   watchDirs,
+  TRANSCRIPT_WATCH_LIMIT,
   TRANSCRIPT_WAKE_MS,
   TURN_STEP_LIMIT,
   STEP_DETAIL_LIMIT,
@@ -14526,6 +14527,27 @@ test('the panel watches directories rather than files, so a new session is seen'
     path.join('C:', 'a'),
     path.join('C:', 'b'),
   ]);
+});
+
+test('transcript watches stay bounded and prefer every folder with a warm source', () => {
+  assert.equal(TRANSCRIPT_WATCH_LIMIT, 256);
+  const files = Array.from({ length: 1024 }, (_, index) => ({
+    file: path.join('transcripts', String(index).padStart(4, '0'), 'session.jsonl'),
+  }));
+  const mixed = { file: path.join('transcripts', '1023', 'warm.jsonl') };
+  const warm = new Set([normalizeFsPath(mixed.file), normalizeFsPath(files[1022].file)]);
+  const allocated = watchDirs([...files, mixed, { file: 'bare.jsonl' }], warm);
+  assert.equal(allocated.length, 256);
+  assert.deepEqual(allocated.slice(0, 2), [path.dirname(files[1022].file), path.dirname(mixed.file)]);
+  assert.deepEqual(
+    allocated.slice(2),
+    files.slice(0, 254).map((source) => path.dirname(source.file)),
+  );
+  assert.deepEqual(watchDirs([mixed, ...files].reverse(), warm), allocated);
+  assert.deepEqual(
+    watchDirs(files, new Set(files.map((source) => normalizeFsPath(source.file)))),
+    files.slice(0, 256).map((source) => path.dirname(source.file)),
+  );
 });
 
 test('a burst of appends is gathered before the panel reads again', () => {

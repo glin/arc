@@ -1811,8 +1811,7 @@ export class PanelProvider implements vscode.Disposable {
   private activitySessions = new Set<string>();
   // Batches streamed reply chunks before posting them to the panel.
   private replyPost: ReturnType<typeof setTimeout> | null = null;
-  // One watcher per directory a transcript is written to, so an append wakes the panel in
-  // step with the agent rather than at the next poll.
+  // Bounded directory watches wake the panel on appends. Integrity passes check unwatched sources.
   private watchers = new Map<string, fs.FSWatcher>();
   private readonly pendingWatch = new PendingWatcherWake();
   private readonly watchScheduler: BoundedTrailingScheduler;
@@ -8834,10 +8833,6 @@ export class PanelProvider implements vscode.Disposable {
           !all.some((source) => source.sessionId === pending.sessionId),
       );
       this.ensureProjectSpendWorkspace();
-      // Update watched directories when discovery finds new sessions.
-      if (this.watching) {
-        this.watchDirectories(watchDirs(all));
-      }
       // Settle selection before requesting a window or building cards. The rail and payload use
       // the same selection. Newest activity selects the default session.
       const reachable = [
@@ -8923,6 +8918,9 @@ export class PanelProvider implements vscode.Disposable {
             )
           : trustedListedRevisions(all, this.catalogWalked, this.showing);
         this.updateProjectSpendIntegrity?.(all);
+        if (this.watching) {
+          this.watchDirectories(watchDirs(all, this.spendIntegrity?.warmFiles()));
+        }
         if (this.projectSpendHydrated && sourcesMoved) {
           this.scheduleProjectSpendIndex(listedRevisions, targeted);
         }

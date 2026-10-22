@@ -128,6 +128,10 @@ export class IntegrityScheduler {
     this.sources = sources;
   }
 
+  warmFiles(): ReadonlySet<string> {
+    return new Set(this.sources.filter((source) => this.warm(source)).map((source) => source.file));
+  }
+
   promote(files: Iterable<string>): void {
     for (const file of files) {
       this.promoted.set(file, this.clock.now());
