@@ -26,6 +26,8 @@ Pass `--arc-dispatch` when this session will send follow-ups to the session it s
 
 `accepted` means the prompt reached an agent. `accepted-with-errors` means the same, but naming or saved metadata failed. Report those errors without starting another session.
 
+After either result, give the reader a link to each new session in the reply, in the form [links.md](links.md) defines. Pass `--name` on every start, because the link label is the requested name. Where links.md forbids a link, say why.
+
 `refused` means no accepted launch. A timeout, disconnect, malformed response, or missing acknowledgment leaves delivery unknown. Preserve the window, request ID, prompt, and settings. Never launch a replacement, resume the session, or switch transports after an unknown outcome.
 
 Save a fresh `WINDOW_ID:UUID` before each new start, curation action, read acknowledgment, or follow-up. `WINDOW_ID` is the selected window's `hostId`. `UUID` is a fresh lowercase UUID. Pass that ID through `--request-id` on the first attempt. Arc retains results by ID and refuses conflicting payloads. A reload changes the activation and leaves the old outcome unknown. Never change the ID to retry. Do not retry automatically.
