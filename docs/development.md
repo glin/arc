@@ -17,6 +17,8 @@ npm --prefix extension exec -- playwright-core install chromium-headless-shell
 
 The last command installs Playwright's bundled Chromium in the per-user Playwright cache, outside the repository. The browser tests and screenshot scripts use it first. [Verification](#verification) gives the reason.
 
+`npm install` reuses existing dependencies and updates the lockfile when needed. Replacing an in-use package still conflicts with running tests on Windows.
+
 `esbuild` is native. Install dependencies on the operating system that runs the commands. A `node_modules` tree copied from another operating system will not run it.
 
 The source installer builds and installs the editor extension from local or temporary downloaded source. Its Claude plugin setup and legacy hook cleanup are described in [Snapshot model](architecture.md#snapshot-model). [Isolated installer tests](#isolated-installer-tests) supplies the checkout plugin workflow. Validate the plugin and marketplace with `claude plugin validate --strict ./plugins/arc-hooks` and `claude plugin validate --strict .`.

@@ -155,8 +155,8 @@ Replace `SESSION_ID` with a saved Claude Code or Codex session ID. See the [CLI 
 Source builds use Node.js 20.19+ (20.x) or 22.12+. From the [Arc repository](https://github.com/glin/arc), run:
 
 ```sh
-npm --prefix extension ci
-npm --prefix cli ci
+npm --prefix extension install
+npm --prefix cli install
 npm --prefix cli test
 npm pack ./cli
 ```

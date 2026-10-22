@@ -42,9 +42,9 @@ jobs:
             | sudo tee /usr/local/bin/magick > /dev/null
           sudo chmod +x /usr/local/bin/magick
           magick -list format | grep -i webp
-      - run: npm ci
-      - run: npm --prefix extension ci
-      - run: npm --prefix cli ci
+      - run: npm install
+      - run: npm --prefix extension install
+      - run: npm --prefix cli install
       - name: Install bundled Chromium and system dependencies
         run: node extension/node_modules/playwright-core/cli.js install --with-deps chromium-headless-shell
       - run: npm run test:all

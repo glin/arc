@@ -18,8 +18,8 @@ jobs:
           node-version: 22
       - name: Install dependencies
         run: |
-          npm ci
-          npm --prefix extension ci
+          npm install
+          npm --prefix extension install
       - name: Build static demo
         run: npx tsx extension/scripts/web-demo.ts .scratch-web-demo/site
       - name: Inspect static demo

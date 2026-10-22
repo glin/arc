@@ -1360,7 +1360,7 @@ function installerFixture() {
 }
 
 test.concurrent.each([false, true])(
-  'local source installation preserves manifest and lockfile bytes with an unsynchronized manifest (%s)',
+  'local source installation retains existing dependencies and reconciles an unsynchronized manifest (%s)',
   SUBPROCESS,
   async (unsynchronized) => {
     const f = installerFixture();
@@ -1384,7 +1384,10 @@ test.concurrent.each([false, true])(
           '\t',
         ) + '\n',
       );
-      const before = [manifest, lock].map((file) => fs.readFileSync(file));
+      const before = fs.readFileSync(manifest);
+      const retained = path.join(extension, 'node_modules', '.existing-dependency');
+      fs.mkdirSync(path.dirname(retained), { recursive: true });
+      fs.writeFileSync(retained, 'existing dependency bytes');
       const npm = bash('command -v npm');
       // Let npm select its interpreter within the isolated PATH.
       for (const name of ['bash', 'uname']) {
@@ -1410,18 +1413,22 @@ if [ "$1" = ci ] || [ "$1" = install ]; then exec '${npm.replaceAll("'", "'\\''"
         npm_config_globalconfig: path.join(f.dir, 'empty-global-npmrc'),
         npm_config_offline: 'true',
       });
-      for (const [index, file] of [manifest, lock].entries()) assert.deepEqual(fs.readFileSync(file), before[index]);
+      assert.equal(result.status, 0, result.stdout + result.stderr);
+      assert.deepEqual(fs.readFileSync(manifest), before);
+      assert.equal(fs.readFileSync(retained, 'utf8'), 'existing dependency bytes');
+      assert.match(result.commands, /npm install/);
+      assert.doesNotMatch(result.commands, /npm ci/);
+      assert.match(result.commands, /editor code --install-extension/);
       if (unsynchronized) {
-        assert.notEqual(result.status, 0, result.stdout + result.stderr);
-        assert.match(
-          result.stderr,
-          /npm (?:error|ERR!) `npm ci` can only install packages when your package\.json and package-lock\.json/,
+        assert.equal(
+          JSON.parse(fs.readFileSync(lock, 'utf8')).packages[''].dependencies['fixture-dependency'],
+          'file:../dependency',
         );
-        assert.match(result.stderr, /rerun install.sh/);
-        assert.doesNotMatch(result.commands, /npm run build|package|editor /);
-      } else {
-        assert.equal(result.status, 0, result.stdout + result.stderr);
-        assert.match(result.commands, /editor code --install-extension/);
+        assert.equal(
+          JSON.parse(fs.readFileSync(path.join(extension, 'node_modules/fixture-dependency/package.json'), 'utf8'))
+            .version,
+          '1.0.0',
+        );
       }
       assert.doesNotMatch(result.commands, /curl /);
       assert.deepEqual(fs.readdirSync(f.temporary), []);
@@ -1497,12 +1504,12 @@ test.concurrent(
         assert.equal(r.status, 0, r.stderr);
         assert.match(
           r.commands,
-          /npm ci[\s\S]*editor code --install-extension[\s\S]*claude plugin marketplace list --json/,
+          /npm install[\s\S]*editor code --install-extension[\s\S]*claude plugin marketplace list --json/,
         );
         assert.equal((r.commands.match(/marketplace add /g) ?? []).length, run ? 0 : 1);
         if (!run) assert.match(r.commands, /plugin marketplace update arc/);
         else assert.doesNotMatch(r.commands, /plugin (?:install|update) /);
-        assert.doesNotMatch(r.commands, /plugin enable|curl|npm install/);
+        assert.doesNotMatch(r.commands, /plugin enable|curl|npm ci/);
         assert.match(r.stdout, /Built extension version: 0.0.9/);
         assert.match(r.stdout, /snapshot plugin is installed and enabled/);
         const [marketplace] = JSON.parse(fs.readFileSync(f.marketplaces));
@@ -2218,7 +2225,7 @@ for (const mode of ['local', 'remote'])
     try {
       const result = await f.run(
         [`--${mode}`, '--no-hooks', '--no-skills', 'code'],
-        { ARC_SOURCE_COMMIT: 'b'.repeat(40) },
+        { ARC_SOURCE_COMMIT: 'b'.repeat(40), ARC_TEST_LOCKED_DEPENDENCY: '1' },
         { cwd: f.source },
       );
       assert.equal(result.status, 0, result.stderr);
@@ -2244,8 +2251,8 @@ for (const mode of ['local', 'remote'])
         );
         assert.equal(r.status, 0, r.stderr);
         if (mode === 'remote') {
-          assert.match(r.commands, /npm ci/);
-          assert.doesNotMatch(r.commands, /npm install/);
+          assert.match(r.commands, /npm install/);
+          assert.doesNotMatch(r.commands, /npm ci/);
           assert.match(r.commands, /api.github.com\/repos\/fixture\/arc\/commits\/feature%2Ftest/);
           assert.match(r.commands, /codeload.github.com\/fixture\/arc\/tar.gz\/a{40}/);
           assert.equal(fs.readFileSync(f.settings, 'utf8'), f.legacy);
@@ -2629,7 +2636,7 @@ exec "$ARC_TEST_REAL_NODE" "$@"
       ]) {
         const r = await f.run(['--no-hooks', 'code'], { ARC_TEST_NODE_VERSION: version, ARC_TEST_NPM_FAILURE: '99' });
         assert.equal(r.status, supported ? 99 : 2, r.stderr);
-        if (supported) assert.match(r.commands, /npm ci/);
+        if (supported) assert.match(r.commands, /npm install/);
         else {
           assert.match(r.stderr, /installation needs Node.js 22\.12\+/);
           assert.doesNotMatch(r.commands, /npm/);

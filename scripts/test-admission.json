@@ -280,9 +280,9 @@
     "matricesSha256": "d176bbe24990b6f3c4fb8eddd3dc92fb4a77a6a72acb112d57f36fad6ef88e8b"
   },
   "scripts/editor-cli.test.js": {
-    "reason": "Editor launch and installer shell commands must preserve quoting, cancellation, native entry selection, manifest and lockfile bytes, and component outcomes.",
+    "reason": "Editor launch and installer shell commands must preserve quoting, cancellation, native entry selection, existing dependencies, lockfile reconciliation, and component outcomes.",
     "cases": 59,
-    "matricesSha256": "75679719329c35f609ca0169962fe5ec3ae4e235dcc94cbd0860ac57558404c6"
+    "matricesSha256": "a7ea5c3eae9eeced267906cac051a2325dbc73e1e2fbe23d249765b203a4f0b0"
   },
   "scripts/extension-test-runner.test.js": {
     "reason": "Real runner commands must classify files, reject invalid selection, and preserve browser readiness status.",
