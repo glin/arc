@@ -21,6 +21,7 @@ import {
   HOST_HEALTH_EVENT_BYTES,
   HOST_HEALTH_KEPT_RUNS,
   HOST_HEALTH_IN_FLIGHT,
+  HOST_HEALTH_SLOW_MS,
 } from './diagnosticslog.ts';
 
 test('health evidence precedes an abrupt stop and a replacement preserves unknown termination', () => {
@@ -266,6 +267,40 @@ test('health retains bounded settled outcomes when unrelated events exhaust admi
     assert.ok(fs.statSync(health.file).size <= 16 * 1024);
     assert.ok(readLines(health.file.replace('.json', '.jsonl')).length <= 8);
     clock = 5000;
+  } finally {
+    health.dispose();
+  }
+});
+
+test('health records work without a begin only when it is slow or does not return', () => {
+  const directory = tempDir('host-health-observed');
+  let clock = 0;
+  const health = new HostHealth({
+    directory,
+    workspace: 'test',
+    build: { sourceCommit: null, dirty: null, builtAt: 1 },
+    now: () => clock,
+  });
+  try {
+    health.observe('refresh', HOST_HEALTH_SLOW_MS - 1);
+    health.observe('sessionIndex', HOST_HEALTH_SLOW_MS);
+    health.observe('hostSave', 0, 'rejected');
+    clock = 5000;
+    health.sample();
+    const record = JSON.parse(fs.readFileSync(health.file, 'utf8'));
+    assert.deepEqual(
+      record.outcomes.map(({ phase, outcome, durationMs }: any) => [phase, outcome, durationMs]),
+      [
+        ['sessionIndex', 'returned', HOST_HEALTH_SLOW_MS],
+        ['hostSave', 'rejected', 0],
+      ],
+    );
+    assert.equal(record.outcomeCounts.refresh, undefined);
+    const lines = readLines(health.file.replace('.json', '.jsonl'));
+    assert.deepEqual(
+      lines.filter((line) => line.event === 'settled').map((line) => line.phase),
+      ['sessionIndex', 'hostSave'],
+    );
   } finally {
     health.dispose();
   }

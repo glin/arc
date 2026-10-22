@@ -1947,6 +1947,10 @@ export class PanelProvider implements vscode.Disposable {
     sources: SessionPageSource[];
     discovery: string;
   };
+  // Scope membership of each recorded working directory under one scope roots string. It outlives each catalog, because a refresh
+  // publishes a new catalog array while sources share few working directories. The key is the exact recorded string, so platform
+  // case rules stay inside `folderMatcher`.
+  private sessionScopeMembers?: { roots: string; inScope: (cwd: string) => boolean; members: Map<string, boolean> };
   // The file and kind of each failed session read that is logged. A failed metadata, turn start, enrichment, or recovery read is logged
   // once per file and kind until that kind of read succeeds, and it never keeps the session list loading.
   private sessionReadFailures = new Set<string>();
@@ -2121,9 +2125,55 @@ export class PanelProvider implements vscode.Disposable {
 
   private persistHostState(): Promise<void> {
     this.hostSaveGeneration = (this.hostSaveGeneration ?? 0) + 1;
-    const snapshot = structuredClone(this.saved);
-    return this.readOwner().saveHost((current) => preserveHostRead(current, snapshot));
+    return this.saveHostState((stored) => {
+      const snapshot = structuredClone(this.saved);
+      return this.readOwner().saveHost((current) => stored(preserveHostRead(current, snapshot)));
+    });
   }
+
+  // Every save of the whole panel state runs through here. `save` passes the state it stores through `stored`, so the stored sent
+  // book follows each save that reaches storage. Host health times each save from this call to its settlement and counts unsettled saves.
+  private saveHostState<T>(save: (stored: (state: PanelState) => PanelState) => Promise<T>): Promise<T> {
+    const started = performance.now();
+    const key = (this.hostSaveSequence = (this.hostSaveSequence ?? 0) + 1);
+    const pending = (this.pendingHostSaves ??= new Map());
+    pending.set(key, started);
+    let sentPrompts: string | undefined;
+    let saving: Promise<T>;
+    try {
+      saving = save((state) => {
+        sentPrompts = JSON.stringify(state.sentPrompts ?? {});
+        return state;
+      });
+    } catch (error) {
+      pending.delete(key);
+      throw error;
+    }
+    // These handlers run before the caller's, so a caller that compares with the stored sent book reads this save's book.
+    void saving.then(
+      () => {
+        pending.delete(key);
+        if (sentPrompts !== undefined) this.storedSentPrompts = sentPrompts;
+        this.health?.observe('hostSave', performance.now() - started);
+      },
+      (error: unknown) => {
+        pending.delete(key);
+        // A publication failure follows a successful store, so storage holds this save's book.
+        if (error instanceof ReadPublicationError && sentPrompts !== undefined) this.storedSentPrompts = sentPrompts;
+        const refused = error instanceof Error && error.message === 'The read save limit was reached.';
+        this.health?.observe('hostSave', performance.now() - started, refused ? 'rejected' : 'failed');
+      },
+    );
+    return saving;
+  }
+
+  private hostSaveSequence?: number;
+  // Start times of host saves that have not settled.
+  private pendingHostSaves?: Map<number, number>;
+  // The sent book that storage holds from the last host save, as JSON.
+  private storedSentPrompts?: string;
+  // The pruned sent book of the pruning save in flight, as JSON.
+  private savingSentPrompts?: string;
 
   private currentReadSource(record: AgentReadRecord): AgentReadSource | null {
     const held = this.projectedReadFacts(record);
@@ -2960,8 +3010,16 @@ export class PanelProvider implements vscode.Disposable {
   private sessionPageIndexFor(accepted: SessionFile[], roots: string, scopeRoots: string[]) {
     const held = this.sessionPageIndex;
     if (held?.catalog === accepted && held.roots === roots) return held;
-    const inScope = folderMatcher(scopeRoots);
-    const scoped = accepted.filter((source) => !source.cwd || inScope(source.cwd));
+    const started = performance.now();
+    if (this.sessionScopeMembers?.roots !== roots)
+      this.sessionScopeMembers = { roots, inScope: folderMatcher(scopeRoots), members: new Map() };
+    const { inScope, members } = this.sessionScopeMembers;
+    const scoped = accepted.filter((source) => {
+      if (!source.cwd) return true;
+      let member = members.get(source.cwd);
+      if (member === undefined) members.set(source.cwd, (member = inScope(source.cwd)));
+      return member;
+    });
     this.sessionPageIndex = {
       catalog: accepted,
       roots,
@@ -2971,6 +3029,7 @@ export class PanelProvider implements vscode.Disposable {
       sources: sessionPageSources(scoped),
       discovery: sessionCatalogMembership(roots, accepted),
     };
+    this.health?.observe('sessionIndex', performance.now() - started);
     return this.sessionPageIndex;
   }
 
@@ -3154,6 +3213,7 @@ export class PanelProvider implements vscode.Disposable {
     this.drafts = { ...this.saved.drafts };
     // Restore submitted prompts that the transcript has not recorded yet.
     this.sentPrompts = restoredSentPrompts(this.saved);
+    this.storedSentPrompts = JSON.stringify(this.saved.sentPrompts ?? {});
     // Restore sessions started here before metadata classifies their agent runs.
     this.startedHere = new Set(this.saved.started);
     this.assets = normalizePromptAssetBook(this.saved.assets);
@@ -3782,6 +3842,7 @@ export class PanelProvider implements vscode.Disposable {
     }
     this.authoritativeCatalog = null;
     this.sessionPageIndex = undefined;
+    this.sessionScopeMembers = undefined;
     this.authoritativeCatalogScope = undefined;
     this.completeCatalogScope = undefined;
     this.sessionReadDiscoveryRevision = undefined;
@@ -3889,6 +3950,12 @@ export class PanelProvider implements vscode.Disposable {
             completed: this.discoveryCheckpoint.completed.length,
           }
         : null,
+      hostSaves: {
+        pending: this.pendingHostSaves?.size ?? 0,
+        oldestAgeMs: this.pendingHostSaves?.size
+          ? Math.max(0, performance.now() - Math.min(...this.pendingHostSaves.values()))
+          : null,
+      },
     };
   }
 
@@ -6004,13 +6071,15 @@ export class PanelProvider implements vscode.Disposable {
         try {
           if (this.hostSaveGeneration > saveGeneration + 1) {
             // Earlier snapshots can still contain this admission. Remove only its entry after those saves settle.
-            await this.readOwner().saveHost((current) => {
-              const queues = { ...current.queues };
-              const remaining = (queues[session] ?? []).filter((entry) => entry.id !== id);
-              if (remaining.length) queues[session] = remaining;
-              else delete queues[session];
-              return { ...current, queues };
-            });
+            await this.saveHostState((stored) =>
+              this.readOwner().saveHost((current) => {
+                const queues = { ...current.queues };
+                const remaining = (queues[session] ?? []).filter((entry) => entry.id !== id);
+                if (remaining.length) queues[session] = remaining;
+                else delete queues[session];
+                return stored({ ...current, queues });
+              }),
+            );
           }
           return refuse('The message could not be saved. No message was queued.');
         } catch (cleanupError) {
@@ -8301,23 +8370,27 @@ export class PanelProvider implements vscode.Disposable {
     this.trail = emptyTrail();
     const resetState = structuredClone(this.saved);
     const owner = this.readOwner();
-    const resetSaved = owner.readerEvent(
-      {
-        id: `reset:${++this.readSequence}`,
-        namespace: 'host',
-        observedRevision: owner.operations.snapshot().revision,
-        action: 'reset',
-        since: resetState.since,
-      },
-      this.readFacts(),
-      undefined,
-      (current) =>
-        preserveHostRead(current, {
-          ...resetState,
-          hidden: [...this.hidden],
-          pinnedTop: [...this.pinnedTop],
-          railFolds: this.saved.railFolds,
-        }),
+    const resetSaved = this.saveHostState((stored) =>
+      owner.readerEvent(
+        {
+          id: `reset:${++this.readSequence}`,
+          namespace: 'host',
+          observedRevision: owner.operations.snapshot().revision,
+          action: 'reset',
+          since: resetState.since,
+        },
+        this.readFacts(),
+        undefined,
+        (current) =>
+          stored(
+            preserveHostRead(current, {
+              ...resetState,
+              hidden: [...this.hidden],
+              pinnedTop: [...this.pinnedTop],
+              railFolds: this.saved.railFolds,
+            }),
+          ),
+      ),
     );
     this.filterRequests ??= new SessionFilterRequests();
     await this.filterRequests.reset(async () => {
@@ -9210,6 +9283,7 @@ export class PanelProvider implements vscode.Disposable {
         }
       }
       this.performanceCounters.recordRefresh(refreshReason, performance.now() - refreshStarted);
+      this.health?.observe('refresh', performance.now() - refreshStarted);
       // Run triggers retained during opening reads even when refresh ended before acquiring its controller.
       if (owned || (primed && !this.refreshController)) {
         this.runPendingRefresh();
@@ -13396,10 +13470,17 @@ export class PanelProvider implements vscode.Disposable {
       );
     }
     // Prune recorded submissions from persisted recall. Keep the in-memory submitted text for this provider's remaining lifetime.
+    // The in-memory book keeps recorded prompts, so compare the pruned book with the stored book. A book whose save is in flight
+    // is not saved again, and a failed save is retried on the next refresh.
     if (Object.keys(this.sentPrompts).length) {
       const prunedSent = prunedSentPrompts(this.sentPrompts, this.promptsBySession);
-      if (JSON.stringify(prunedSent) !== JSON.stringify(this.sentPrompts)) {
-        void this.writeDrafts();
+      const pruned = JSON.stringify(normalizeSentPrompts(prunedSent));
+      if (pruned !== this.storedSentPrompts && pruned !== this.savingSentPrompts) {
+        this.savingSentPrompts = pruned;
+        const settled = () => {
+          if (this.savingSentPrompts === pruned) this.savingSentPrompts = undefined;
+        };
+        void this.writeDrafts().then(settled, settled);
       }
     }
     this.newestCompactionBySession = currentRecords.newestCompactions;
@@ -14546,43 +14627,45 @@ export class PanelProvider implements vscode.Disposable {
     });
     const pinnedFoldRevision = this.hostPinnedFoldRevision ?? 0;
     const resetRevision = this.preferenceResetRevision ?? 0;
-    return owner.saveHost((accepted) => {
-      if (!canPersist()) throw new Error('The filter outcome is unknown.');
-      const current = this.saved;
-      const snapshot = resetRevision === (this.preferenceResetRevision ?? 0) ? preferences : current;
-      const saved = preserveHostRead(
-        accepted,
-        normalizePanelState(
-          {
-            ...current,
-            ...snapshot,
-            hidden: [...this.hidden],
-            pinnedTop: [...this.pinnedTop],
-            comments: current.comments,
-            drafts: current.drafts,
-            sentPrompts: current.sentPrompts,
-            submittedPrompts: current.submittedPrompts,
-            draftCommentIds: current.draftCommentIds,
-            started: current.started,
-            agentRuns: current.agentRuns,
-            labels: current.labels,
-            readerParents: current.readerParents,
-            views: current.views,
-            railFilters: current.railFilters,
-            showing: this.showing ?? '',
-            assets: current.assets,
-            queues: current.queues,
-            railFolds:
-              pinnedFoldRevision === (this.hostPinnedFoldRevision ?? 0)
-                ? snapshot.railFolds
-                : { ...snapshot.railFolds, [RAIL_FOLDS.top]: current.railFolds[RAIL_FOLDS.top] },
-          },
-          current.railFilters,
-        ),
-      );
-      this.saved = saved;
-      return saved;
-    });
+    return this.saveHostState((stored) =>
+      owner.saveHost((accepted) => {
+        if (!canPersist()) throw new Error('The filter outcome is unknown.');
+        const current = this.saved;
+        const snapshot = resetRevision === (this.preferenceResetRevision ?? 0) ? preferences : current;
+        const saved = preserveHostRead(
+          accepted,
+          normalizePanelState(
+            {
+              ...current,
+              ...snapshot,
+              hidden: [...this.hidden],
+              pinnedTop: [...this.pinnedTop],
+              comments: current.comments,
+              drafts: current.drafts,
+              sentPrompts: current.sentPrompts,
+              submittedPrompts: current.submittedPrompts,
+              draftCommentIds: current.draftCommentIds,
+              started: current.started,
+              agentRuns: current.agentRuns,
+              labels: current.labels,
+              readerParents: current.readerParents,
+              views: current.views,
+              railFilters: current.railFilters,
+              showing: this.showing ?? '',
+              assets: current.assets,
+              queues: current.queues,
+              railFolds:
+                pinnedFoldRevision === (this.hostPinnedFoldRevision ?? 0)
+                  ? snapshot.railFolds
+                  : { ...snapshot.railFolds, [RAIL_FOLDS.top]: current.railFolds[RAIL_FOLDS.top] },
+            },
+            current.railFilters,
+          ),
+        );
+        this.saved = saved;
+        return stored(saved);
+      }),
+    );
   }
 
   private shell(webview: vscode.Webview): string {

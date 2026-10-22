@@ -126,8 +126,8 @@
   },
   "extension/src/panel.webview.test.ts": {
     "reason": "Real progressive workers must deliver bounded recovery and metadata through the production panel host.",
-    "cases": 595,
-    "matricesSha256": "901a1c0bd004922235d5d37617f89b802b9edd7cc8c6446b2f542f83b6bf5cc9"
+    "cases": 605,
+    "matricesSha256": "2b7b3edc338b6d40564775b0aff9bf5285f7264bb8a7b9160b0290bb8328e386"
   },
   "extension/src/panelbundle.test.ts": {
     "reason": "The panel bundle and fixture must contain the production entry, source identity, and substituted text.",
@@ -191,8 +191,8 @@
   },
   "extension/src/startup.test.ts": {
     "reason": "Real title workers must publish recovered metadata through startup ownership and cancellation boundaries. Project cost snapshots must preserve workspace, revision, and calendar ownership during background slices. Agent messages must preserve durable admission, settlement wakeups, native delivery authority, and retained retries.",
-    "cases": 232,
-    "matricesSha256": "7e34e4361437a31cd850882f5ece5e9eef5db0f46cb7163a728b4fe0725c7e2d"
+    "cases": 233,
+    "matricesSha256": "50bb86015d2d5cac8abb46e86715ee9927379b72f82593fd5d8ea308c20243ee"
   },
   "extension/src/store.test.ts": {
     "reason": "The real Stop hook must renew retention for useful snapshot stores without changing workspace files.",

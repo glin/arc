@@ -5,7 +5,7 @@ import { discoveryCompatibility } from './progressiveworker';
 import { sessionPageSources } from './sessionreads';
 import { sessionCoverageMember, reconcileSessionCollisions } from './sessioncoverage';
 import { runningKey } from './composerview';
-import { preserveHostRead } from './domain/read.ts';
+import { HostReadPersistence, preserveHostRead } from './domain/read.ts';
 import { LaunchPolicyStore } from './launchpolicystore';
 import { SessionFilterRequests, FILTER_LIMITS } from './sessionfilter.ts';
 import { createSavedState } from './webview/state.ts';
@@ -17925,6 +17925,7 @@ test('a delayed panel save keeps the durable selected session after adoption', a
   } as any;
 
   Object.assign(provider, {
+    saveHostState: (PanelProvider.prototype as any).saveHostState,
     readOwner: () => ({
       snapshot: () => structuredClone(provider.saved),
       saveHost: async (update: (state: any) => any) => {
@@ -18159,6 +18160,7 @@ test('a delayed browser save preserves durable provider memberships', async () =
     },
   };
   Object.assign(provider, {
+    saveHostState: (PanelProvider.prototype as any).saveHostState,
     readOwner: () => ({
       snapshot: () => structuredClone(provider.saved),
       saveHost: async (update: (state: any) => any) => {
@@ -18211,6 +18213,7 @@ test('a browser save on a saved filter keeps its selection and lens words throug
     },
   };
   Object.assign(provider, {
+    saveHostState: (PanelProvider.prototype as any).saveHostState,
     readOwner: () => ({
       snapshot: () => structuredClone(provider.saved),
       saveHost: async (update: (state: any) => any) => {
@@ -27862,7 +27865,7 @@ test('the unsent prompts reach storage and come back out of it', () => {
   );
   sourceMatch(
     forget,
-    /this\.saved\.comments = acceptedComments[\s\S]*const resetState = structuredClone\(this\.saved\)[\s\S]*const resetSaved = owner\.readerEvent\([\s\S]*await resetSaved/,
+    /this\.saved\.comments = acceptedComments[\s\S]*const resetState = structuredClone\(this\.saved\)[\s\S]*const resetSaved = this\.saveHostState\(\(stored\) =>\s*owner\.readerEvent\([\s\S]*await resetSaved/,
     'a comments-only waiting submission disappears when panel preferences are forgotten',
   );
 
@@ -28367,7 +28370,7 @@ test('the provider carries the walk between its two books and the composer', () 
   const pruneBody = panelHostSource.slice(pruneAt, pruneEnd);
   sourceMatch(
     pruneBody,
-    /void this\.writeDrafts\(\);/,
+    /void this\.writeDrafts\(\)/,
     'the pruned projection never reaches storage, so a restart brings back a prompt the transcript already recorded',
   );
   // holdDraft updates boxText as well as the retained draft.
@@ -28396,6 +28399,248 @@ test('the provider carries the walk between its two books and the composer', () 
   const press = declarationSource(panelHostSource, 'sendPrompt');
   sourceMatch(press, /^private sendPrompt\(/, 'the press this guard reads is not the sendPrompt method');
   sourceDoesNotMatch(press, /sentAfter\(/, 'the press files the prompt as well, before anything knows whether it goes');
+});
+
+// A provider whose collect reads one turn that records `recorded`, and whose host saves go through `persist` and `publish`.
+function sentPromptRefreshFixture(
+  recorded: string,
+  persist: (state: any) => Promise<void>,
+  publish: () => void = () => {},
+) {
+  const provider: any = Object.create(PanelProvider.prototype);
+  const saved = normalizePanelState(null);
+  const turn = fixtureTurn({ sessionId: 'session', prompt: recorded, startedAt: 1000 });
+  Object.assign(provider, {
+    saved,
+    readPersistence: new HostReadPersistence(saved, persist, publish),
+    sentPrompts: { session: [recorded, 'still waiting'] },
+    drafts: {},
+    assets: {},
+    queues: {},
+    draftCommentIds: {},
+    showing: null,
+    readWindows: new Map(),
+    turnsByKey: new Map(),
+    history: new Map(),
+    newestBySession: new Map(),
+    promptsBySession: new Map(),
+    membershipOf: () => 'present',
+    trimOlderHistory() {},
+    readFor: () => ({
+      read: { turns: [turn], compactions: [], readBytes: 0, turnLimitReached: false, lastReportedModel: null },
+      revision: { mtimeMs: 1, size: 1 },
+      maxTurns: 10,
+    }),
+    observeParsedNames() {},
+    headingTitle: () => '',
+    folders: () => [],
+    drawTurnCards: () => [],
+  });
+  const refresh = () => provider.collect([{ sessionId: 'session', agent: 'claude', file: 'session.jsonl' }]);
+  return { provider, refresh };
+}
+
+test('refreshes after a sent prompt reaches its transcript leave room for the save that Send makes', async () => {
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => (release = resolve));
+  const stored: any[] = [];
+  const { provider, refresh } = sentPromptRefreshFixture('recorded prompt', async (state) => {
+    await gate;
+    stored.push(state);
+  });
+  // More refreshes than the 256 saves the host save queue admits, all while the first save waits on storage.
+  for (let n = 0; n < 300; n++) refresh();
+  provider.sentPrompts.session.push('sent now');
+  const send = provider.writeDrafts().then(
+    () => 'saved',
+    (error: Error) => error.message,
+  );
+  release();
+  assert.equal(await send, 'saved', 'Send waits on a save the full queue refuses');
+  assert.deepEqual(
+    stored.map((state) => state.sentPrompts),
+    [{ session: ['still waiting'] }, { session: ['still waiting', 'sent now'] }],
+    'each refresh queued another save of the same pruned book',
+  );
+  refresh();
+  await vi.waitFor(() => assert.equal(provider.savingSentPrompts, undefined));
+  assert.equal(stored.length, 2, 'a refresh saves a book that storage already holds');
+});
+
+test('a failed pruning save is retried on the next refresh', async () => {
+  let attempts = 0;
+  const stored: any[] = [];
+  const { provider, refresh } = sentPromptRefreshFixture('recorded prompt', async (state) => {
+    if (++attempts === 1) throw new Error('The disk is full.');
+    stored.push(state);
+  });
+  refresh();
+  await vi.waitFor(() => assert.equal(attempts, 1));
+  await vi.waitFor(() => assert.equal(provider.savingSentPrompts, undefined));
+  refresh();
+  await vi.waitFor(() => assert.equal(attempts, 2, 'the refresh after a failed save never retries it'));
+  await vi.waitFor(() => assert.equal(stored.length, 1));
+  assert.deepEqual(stored[0].sentPrompts, { session: ['still waiting'] });
+});
+
+// Gives a sentPromptRefreshFixture provider what forgetState needs, and returns a reset that the reader confirms.
+function confirmedReset(provider: any): () => Promise<void> {
+  Object.assign(provider, {
+    hidden: new Set(),
+    pinnedTop: new Set(),
+    hostSessions: new Set(),
+    hostPreviousSessions: new Set(),
+    startedHere: new Set(),
+    trail: emptyTrail(),
+    onArchivedSessionsChange: null,
+    readFacts: () => () => null,
+    post: async () => {},
+    refresh: async () => {},
+  });
+  return async () => {
+    const warning = (vscode.window as any).showWarningMessage;
+    (vscode.window as any).showWarningMessage = async () => 'Reset';
+    try {
+      await provider.forgetState();
+    } finally {
+      (vscode.window as any).showWarningMessage = warning;
+    }
+  };
+}
+
+test('a refresh after a workspace reset prunes the sent book that the reset stored', async () => {
+  const stored: any[] = [];
+  const { provider, refresh } = sentPromptRefreshFixture('recorded prompt', async (state) => {
+    stored.push(state);
+  });
+  const reset = confirmedReset(provider);
+  refresh();
+  await vi.waitFor(() => assert.equal(stored.length, 1));
+  await vi.waitFor(() => assert.equal(provider.savingSentPrompts, undefined));
+  await reset();
+  assert.deepEqual(stored.at(-1).sentPrompts, { session: ['recorded prompt', 'still waiting'] });
+  refresh();
+  await vi.waitFor(() =>
+    assert.deepEqual(
+      stored.at(-1).sentPrompts,
+      { session: ['still waiting'] },
+      'storage keeps a prompt the transcript recorded, so a restart brings it back',
+    ),
+  );
+});
+
+test('a refresh after a workspace reset whose publication fails prunes the sent book that the reset stored', async () => {
+  const stored: any[] = [];
+  let publication = 'works';
+  const { provider, refresh } = sentPromptRefreshFixture(
+    'recorded prompt',
+    async (state) => {
+      stored.push(state);
+    },
+    () => {
+      if (publication === 'fails') throw new Error('The panel closed.');
+    },
+  );
+  const reset = confirmedReset(provider);
+  refresh();
+  await vi.waitFor(() => assert.equal(stored.length, 1));
+  await vi.waitFor(() => assert.equal(provider.savingSentPrompts, undefined));
+  publication = 'fails';
+  await assert.rejects(reset(), { message: 'The saved read state could not be published.' });
+  publication = 'works';
+  assert.deepEqual(stored.at(-1).sentPrompts, { session: ['recorded prompt', 'still waiting'] });
+  refresh();
+  await vi.waitFor(() =>
+    assert.deepEqual(
+      stored.at(-1).sentPrompts,
+      { session: ['still waiting'] },
+      'storage keeps a prompt the transcript recorded after a reset whose publication failed',
+    ),
+  );
+});
+
+// A save that bypasses saveHostState leaves the stored sent book stale and hides the save from host health.
+test('every host save in the panel host runs through saveHostState', () => {
+  const calls = [...panelHostSource.matchAll(/\.saveHost\(/g)].map((match) => match.index);
+  assert.ok(calls.length >= 3);
+  for (const at of calls) {
+    const boundary = panelHostSource.lastIndexOf('this.saveHostState((stored) =>', at);
+    assert.ok(boundary >= 0 && at - boundary < 200, `a host save at offset ${at} bypasses saveHostState`);
+  }
+});
+
+test('a host save records the time it spends copying the panel state', async () => {
+  const provider: any = Object.create(PanelProvider.prototype);
+  const saved = normalizePanelState(null);
+  const observed: unknown[][] = [];
+  let clock = 0;
+  const clone = structuredClone;
+  vi.spyOn(performance, 'now').mockImplementation(() => clock);
+  // Copying the panel state takes 500 ms on this clock.
+  vi.stubGlobal('structuredClone', (value: unknown, options?: StructuredSerializeOptions) => {
+    if (value === saved) clock += 500;
+    return clone(value, options);
+  });
+  try {
+    Object.assign(provider, {
+      saved,
+      readPersistence: new HostReadPersistence(
+        saved,
+        async () => {},
+        () => {},
+      ),
+      health: { observe: (...args: unknown[]) => observed.push(args) },
+    });
+    await provider.persistHostState();
+    assert.deepEqual(
+      observed.map(([phase, elapsed]) => [phase, elapsed]),
+      [['hostSave', 500]],
+      'the recorded save left out the copy that precedes it',
+    );
+  } finally {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  }
+});
+
+test.each([
+  ['panel state', (provider: any) => provider.persistHostState()],
+  ['preference', (provider: any) => provider.saveState({})],
+])('host health shows a waiting %s save and records a refused one as rejected', async (_path, save) => {
+  const provider: any = Object.create(PanelProvider.prototype);
+  const saved = normalizePanelState(null);
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => (release = resolve));
+  const observed: unknown[][] = [];
+  Object.assign(provider, {
+    saved,
+    readPersistence: new HostReadPersistence(
+      saved,
+      () => gate,
+      () => {},
+      1,
+    ),
+    health: { observe: (...args: unknown[]) => observed.push(args) },
+    progressiveWorker: { snapshot: () => null },
+    performanceCounters: { discoverySnapshot: () => null },
+    hidden: new Set(),
+    pinnedTop: new Set(),
+    showing: null,
+  });
+  const waiting = save(provider);
+  await assert.rejects(save(provider), /The read save limit was reached\./);
+  assert.deepEqual(
+    observed.map(([phase, , outcome]) => [phase, outcome]),
+    [['hostSave', 'rejected']],
+  );
+  const work = provider.healthWork();
+  assert.equal(work.hostSaves.pending, 1);
+  assert.ok(work.hostSaves.oldestAgeMs >= 0);
+  release();
+  await waiting;
+  await vi.waitFor(() => assert.equal(provider.healthWork().hostSaves.pending, 0));
+  assert.equal(provider.healthWork().hostSaves.oldestAgeMs, null);
+  assert.deepEqual(observed.at(-1)?.[0], 'hostSave');
 });
 
 test('startup selection preserves configured filters until the workspace catalog arrives', () => {
@@ -36193,6 +36438,75 @@ test('filter acknowledgment cannot start storage for another request or after di
   assert.equal((await result).status, 'unknown');
   f.acknowledge();
   assert.equal(f.writes.length, 0);
+});
+
+// normalizeFsPath calls replace on its argument first, so a counting replace sees each normalization.
+function countedPath(value: string, onRead: () => void): string {
+  return {
+    replace: (...args: [RegExp, string]) => {
+      onRead();
+      return value.replace(...args);
+    },
+  } as unknown as string;
+}
+
+test('session page indexes for successive catalogs normalize each shared working directory once', () => {
+  const provider: any = Object.create(PanelProvider.prototype);
+  const cwds = ['c:\\repo', 'C:/repo/packages/app', 'c:\\repo-other', 'd:\\elsewhere', 'c:\\repo\\'];
+  let reads = 0;
+  // One object per distinct working directory, shared by every source that records it.
+  const targets = cwds.map((cwd) => countedPath(cwd, () => reads++));
+  const catalog = (count: number) =>
+    Array.from({ length: count }, (_, n) => ({
+      agent: n % 2 ? 'codex' : 'claude',
+      sessionId: `session-${n}`,
+      file: `/sessions/${n}.jsonl`,
+      cwd: targets[n % cwds.length],
+    }));
+  const roots = ['c:\\repo', 'd:\\trees\\topic'];
+  const first = provider.sessionPageIndexFor(catalog(500), JSON.stringify(roots), roots);
+  const second = provider.sessionPageIndexFor(catalog(600), JSON.stringify(roots), roots);
+  assert.notEqual(second, first, 'a new catalog array builds a new index');
+  assert.equal(reads, cwds.length, 'each distinct working directory is normalized once across both catalogs');
+  // Indexes 0, 1 and 4 of the working directory list sit inside the first root.
+  assert.equal(second.scoped.length, 360);
+  assert.ok(second.scoped.every((source: any) => [0, 1, 4].includes(targets.indexOf(source.cwd))));
+});
+
+// Scope membership is remembered by the exact recorded string, so it must keep the platform's case rule.
+test.each([
+  ['linux', 3],
+  ['darwin', 3],
+  ['win32', 6],
+])('session page indexes keep case-different working directories apart as %s path rules do', (platform, members) => {
+  vi.stubGlobal('process', { ...process, platform });
+  try {
+    const provider: any = Object.create(PanelProvider.prototype);
+    const catalog = Array.from({ length: 6 }, (_, n) => ({
+      agent: 'claude',
+      sessionId: `session-${n}`,
+      file: `/sessions/${n}.jsonl`,
+      cwd: n % 2 ? '/srv/repo/a' : '/srv/Repo/a',
+    }));
+    const index = provider.sessionPageIndexFor(catalog, JSON.stringify(['/srv/Repo']), ['/srv/Repo']);
+    assert.equal(index.scoped.length, members);
+    assert.ok(index.scoped.some((source: any) => source.cwd === '/srv/Repo/a'));
+  } finally {
+    vi.unstubAllGlobals();
+  }
+});
+
+test('a session page index after a scope roots change drops sources whose working directory left the scope', () => {
+  const provider: any = Object.create(PanelProvider.prototype);
+  const catalog = () => [
+    { agent: 'claude', sessionId: 'kept', file: '/sessions/kept.jsonl', cwd: '/work/kept' },
+    { agent: 'claude', sessionId: 'left', file: '/sessions/left.jsonl', cwd: '/work/left' },
+  ];
+  const before = ['/work/kept', '/work/left'];
+  const ids = (index: any) => index.scoped.map((source: any) => source.sessionId);
+  assert.deepEqual(ids(provider.sessionPageIndexFor(catalog(), JSON.stringify(before), before)), ['kept', 'left']);
+  const after = ['/work/kept'];
+  assert.deepEqual(ids(provider.sessionPageIndexFor(catalog(), JSON.stringify(after), after)), ['kept']);
 });
 
 test('qualified listing selectors preserve duplicate-source ambiguity across providers', () => {

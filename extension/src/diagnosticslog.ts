@@ -237,6 +237,8 @@ export const HOST_HEALTH_EVENT_BYTES = 64 * 1024;
 export const HOST_HEALTH_KEPT_RUNS = 20;
 export const HOST_HEALTH_EVENT_RATE = 8;
 export const HOST_HEALTH_IN_FLIGHT = 32;
+// Duration below which `observe` drops a returned operation.
+export const HOST_HEALTH_SLOW_MS = 100;
 const HEALTH_NAME = /^health-[a-f0-9-]{36}\.(json|json\.next|jsonl|previous\.jsonl)$/;
 const HEALTH_PHASES = [
   'select',
@@ -247,6 +249,9 @@ const HEALTH_PHASES = [
   'ledgerSave',
   'serializer',
   'shutdown',
+  'refresh',
+  'sessionIndex',
+  'hostSave',
 ] as const;
 export type HostHealthPhase = (typeof HEALTH_PHASES)[number];
 const HEALTH_EVENTS = [
@@ -296,6 +301,7 @@ export interface HostHealthOptions {
         discoveryPending: boolean;
         loadingFailed: boolean;
         checkpoint: { position: number; sequence: number; sources: number; completed: number } | null;
+        hostSaves?: { pending: number; oldestAgeMs: number | null };
       }
     | undefined;
 }
@@ -471,16 +477,32 @@ export class HostHealth {
   settle(request: number, outcome: HostHealthOutcome = 'returned'): void {
     const work = this.active.get(request);
     if (!work) return;
+    this.active.delete(request);
+    this.record(request, work.panel, work.phase, outcome, this.now() - work.started);
+  }
+
+  // Records an operation that finished without a `begin`. A returned operation shorter than HOST_HEALTH_SLOW_MS leaves no record.
+  observe(phase: HostHealthPhase, elapsedMs: number, outcome: HostHealthOutcome = 'returned', panel = 0): void {
+    if (this.clean || !HEALTH_PHASES.includes(phase)) return;
+    if (outcome === 'returned' && !(elapsedMs >= HOST_HEALTH_SLOW_MS)) return;
+    this.record(++this.sequence, Number.isSafeInteger(panel) && panel >= 0 ? panel : 0, phase, outcome, elapsedMs);
+  }
+
+  private record(
+    request: number,
+    panel: number,
+    phase: HostHealthPhase,
+    outcome: HostHealthOutcome,
+    elapsedMs: number,
+  ): void {
     const result = ['returned', 'failed', 'pending', 'rejected'].includes(outcome) ? outcome : 'failed';
-    const elapsedMs = this.now() - work.started;
     const durationMs = Number.isFinite(elapsedMs) ? Math.max(0, elapsedMs) : 0;
-    this.outcomes.push({ request, panel: work.panel, phase: work.phase, outcome: result, durationMs });
+    this.outcomes.push({ request, panel, phase, outcome: result, durationMs });
     if (this.outcomes.length > 16) this.outcomes.shift();
-    const counts = (this.outcomeCounts[work.phase] ??= {});
+    const counts = (this.outcomeCounts[phase] ??= {});
     counts[result] = Math.min(Number.MAX_SAFE_INTEGER, (counts[result] ?? 0) + 1);
     const suppressed = this.suppressed;
-    this.event('settled', work.panel, work.phase, request, result, durationMs);
-    this.active.delete(request);
+    this.event('settled', panel, phase, request, result, durationMs);
     if (this.suppressed !== suppressed && this.now() - this.outcomeSnapshotAt >= 1000) {
       this.outcomeSnapshotAt = this.now();
       this.sample('unknown', false);

@@ -6749,6 +6749,28 @@ test('a workspace folder change abandons the catalog refresh in flight', async (
   assert.equal(provider.messages.length, before, 'a refresh started under the previous folders rendered its catalog');
 });
 
+test('a workspace folder change makes the next session page index test each working directory again', () => {
+  let tests = 0;
+  const provider = completeDiscoveryHarness(undefined, false, ['workspaceFoldersChanged', 'sessionPageIndexFor'], {
+    scopeInside: () => {
+      tests++;
+      return true;
+    },
+  });
+  provider.repositoryScope = { snapshot() {} };
+  provider.allowThemeFiles = () => {};
+  const catalog = () => [{ agent: 'claude', sessionId: 'one', file: '/sessions/one.jsonl', cwd: '/work/repo' }];
+  const roots = ['/work/repo'];
+  const index = () => provider.sessionPageIndexFor(catalog(), JSON.stringify(roots), roots);
+  index();
+  assert.equal(tests, 1);
+  index();
+  assert.equal(tests, 1, 'a new catalog tested a working directory whose membership was known');
+  provider.workspaceFoldersChanged();
+  assert.equal(index().scoped.length, 1);
+  assert.equal(tests, 2, 'scope membership from the previous folders outlived the folder change');
+});
+
 test('a selected record that keeps growing retries without publishing unstable windows', async () => {
   let provider: any;
   let attempts = 0;
@@ -13599,6 +13621,7 @@ function agentMessageHost(agent: 'claude' | 'codex') {
     'releaseQueuedEditOffer',
     'writeDrafts',
     'persistHostState',
+    'saveHostState',
   ];
   const body = owner.members
     .filter((one) => one.name && names.includes(one.name.getText(file)))
