@@ -75,6 +75,14 @@ export interface StandaloneStartup {
   bytes: number;
   sha256: string;
 }
+export interface StandaloneSourceBaseline {
+  root: string;
+  ancestor: string;
+  directory: string;
+  cwd: string;
+  state: 'ready' | 'unavailable';
+  binary?: { file: string; identity: string; bytes: number; count: number; sha256: string };
+}
 export interface DispatchEvent {
   launchId: string;
   eventId: string;
@@ -316,6 +324,7 @@ export class DispatchReceipts {
   artifact(
     id: string,
     name:
+      | 'source-paths.bin'
       | 'stdout.log'
       | 'stderr.log'
       | 'worker.log'
@@ -645,6 +654,74 @@ export class DispatchReceipts {
     }
     return fs.existsSync(file) ? JSON.parse(read(file, limit, true)) : null;
   }
+  sourceBaseline(id: string, evidence?: StandaloneSourceBaseline): StandaloneSourceBaseline | null {
+    if (this.launch(id).transport !== 'standalone') return null;
+    const file = this.file(id, 'source-baseline.json');
+    if (!evidence && !fs.existsSync(file)) {
+      if (
+        fs.existsSync(path.join(this.root, `${id}.source-baseline.json`)) ||
+        fs.existsSync(path.join(this.root, `${id}.source-baseline.accepting.json`))
+      )
+        throw new Error('The original session source is unavailable.');
+      return null;
+    }
+    if (!evidence && !fs.existsSync(path.join(this.root, `${id}.source-baseline.json`)))
+      throw new Error('The original session source is unavailable.');
+    const binding = evidence ? { launchId: id, ...evidence } : JSON.parse(read(file));
+    if (
+      binding.launchId !== id ||
+      ![binding.root, binding.ancestor, binding.cwd].every(
+        (value) => typeof value === 'string' && path.isAbsolute(value),
+      ) ||
+      !/^\d+:\d+$/.test(binding.directory) ||
+      !['ready', 'unavailable'].includes(binding.state) ||
+      (binding.state === 'ready' &&
+        (!binding.binary ||
+          binding.binary.file !== this.file(id, 'source-paths.bin') ||
+          !/^\d+:\d+$/.test(binding.binary.identity) ||
+          !Number.isSafeInteger(binding.binary.count) ||
+          binding.binary.count < 0 ||
+          binding.binary.bytes !== binding.binary.count * 32 ||
+          !TOKEN.test(binding.binary.sha256))) ||
+      Buffer.byteLength(JSON.stringify(binding)) > JSON_BYTES
+    )
+      throw new Error('The original session source is invalid.');
+    this.bindIdentity(id, 'source-baseline', binding);
+    this.bindIdentity(id, 'source-baseline-witness', {
+      launchId: id,
+      identity: identity(path.join(this.root, `${id}.source-baseline.json`)),
+    });
+    return binding;
+  }
+  sourceCandidate(id: string, evidence?: StandaloneStartup): StandaloneStartup | null {
+    const file = this.file(id, 'source-candidate.json');
+    if (!evidence && !fs.existsSync(file)) {
+      if (
+        fs.existsSync(path.join(this.root, `${id}.source-candidate.json`)) ||
+        fs.existsSync(path.join(this.root, `${id}.source-candidate.accepting.json`))
+      )
+        throw new Error('The original session source is unavailable.');
+      return null;
+    }
+    if (!evidence && !fs.existsSync(path.join(this.root, `${id}.source-candidate.json`)))
+      throw new Error('The original session source is unavailable.');
+    const binding = evidence ? { launchId: id, ...evidence } : JSON.parse(read(file));
+    if (
+      binding.launchId !== id ||
+      ![binding.file, binding.ancestor, binding.cwd].every(
+        (value) => typeof value === 'string' && path.isAbsolute(value),
+      ) ||
+      ![binding.identity, binding.directory].every((value) => typeof value === 'string' && /^\d+:\d+$/.test(value)) ||
+      !TOKEN.test(binding.sha256) ||
+      Buffer.byteLength(JSON.stringify(binding)) > JSON_BYTES ||
+      !Number.isSafeInteger(binding.bytes) ||
+      binding.bytes < 1 ||
+      binding.bytes > 49 * 1024 * 1024
+    )
+      throw new Error('The original session source is invalid.');
+    this.bindIdentity(id, 'source-candidate', binding);
+    return binding;
+  }
   startup(id: string, evidence?: StandaloneStartup): StandaloneStartup | null {
     if (this.launch(id).transport !== 'standalone') return null;
     const file = this.file(id, 'startup.json');
@@ -694,7 +771,10 @@ export class DispatchReceipts {
     this.bindIdentity(id, 'startup-refused', { launchId: id });
     return true;
   }
-  monitor(id: string, channel: 'monitor' | 'output-monitor' = 'monitor'): { token: string; release: () => void } {
+  monitor(
+    id: string,
+    channel: 'monitor' | 'output-monitor' = 'monitor',
+  ): { token: string; releaseNative: () => void; release: () => void } {
     if (this.launch(id).transport !== 'standalone') throw new Error('Hosted dispatch has no standalone monitor.');
     const file = this.file(id, `${channel}.json`);
     const token = randomUUID();
@@ -706,7 +786,12 @@ export class DispatchReceipts {
           const owner = JSON.parse(read(file));
           if (!Number.isSafeInteger(owner.pid) || owner.pid < 1 || !DISPATCH_ID.test(owner.token))
             throw new Error('The dispatch monitor identity is unavailable.');
-          if (!owner.released) {
+          if (
+            owner.phase !== undefined &&
+            (owner.phase !== 'witness-pending' || owner.released !== true || channel !== 'monitor')
+          )
+            throw new Error('The dispatch monitor identity is unavailable.');
+          if (!owner.released || owner.phase === 'witness-pending') {
             let dead = false;
             try {
               process.kill(owner.pid, 0);
@@ -720,19 +805,30 @@ export class DispatchReceipts {
       },
       lock,
     );
+    const release = (pending: boolean) => {
+      if (pending && channel !== 'monitor') throw new Error('This dispatch capture has no pending session source.');
+      this.lock(
+        id,
+        () => {
+          const owner = JSON.parse(read(file));
+          if (owner.pid !== process.pid || owner.token !== token)
+            throw new Error('The dispatch monitor owner changed.');
+          const { phase: _phase, ...native } = owner;
+          writeFileAtomically(
+            file,
+            JSON.stringify({ ...native, released: true, ...(pending ? { phase: 'witness-pending' } : {}) }),
+            undefined,
+            0o600,
+            false,
+          );
+        },
+        lock,
+      );
+    };
     return {
       token,
-      release: () =>
-        this.lock(
-          id,
-          () => {
-            const owner = JSON.parse(read(file));
-            if (owner.pid !== process.pid || owner.token !== token)
-              throw new Error('The dispatch monitor owner changed.');
-            writeFileAtomically(file, JSON.stringify({ ...owner, released: true }), undefined, 0o600, false);
-          },
-          lock,
-        ),
+      releaseNative: () => release(true),
+      release: () => release(false),
     };
   }
   bind(
@@ -791,6 +887,7 @@ export class DispatchReceipts {
     if (launch.transport !== 'standalone' || !options) throw new Error('This launch has no standalone session.');
     const file = this.file(id, 'accepted.json');
     if (sessionId === undefined && !fs.existsSync(file)) return null;
+    const startup = fs.existsSync(file) ? null : this.startup(id);
     const binding =
       sessionId === undefined
         ? JSON.parse(read(file))
@@ -800,7 +897,9 @@ export class DispatchReceipts {
             sessionId,
             submissionId: 1,
             nativeTurnId: null,
-            ...(this.startup(id) ? { startupRequired: true as const } : {}),
+            ...((fs.existsSync(file) ? JSON.parse(read(file)).startupRequired : startup)
+              ? { startupRequired: true as const }
+              : {}),
           };
     if (
       binding.launchId !== id ||
@@ -822,7 +921,14 @@ export class DispatchReceipts {
   }
   private bindIdentity(
     id: string,
-    kind: 'accepted' | 'background' | 'startup' | 'startup-refused',
+    kind:
+      | 'accepted'
+      | 'background'
+      | 'startup'
+      | 'startup-refused'
+      | 'source-baseline'
+      | 'source-candidate'
+      | 'source-baseline-witness',
     binding: unknown,
   ): void {
     const file = this.file(id, `${kind}.json`);

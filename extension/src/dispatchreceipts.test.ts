@@ -90,7 +90,141 @@ function standaloneFixture(standalone: Partial<StandaloneOptions> = {}) {
   });
   return { ...fx, standalone: launch };
 }
+
+test.each(['live', 'uncertain', 'dead', 'legacy', 'malformed'] as const)(
+  'native release retains exclusive pending witness ownership: %s',
+  (mode) => {
+    const { receipts, standalone } = standaloneFixture();
+    const id = standalone.launchId;
+    const file = path.join(receipts.root, id, 'monitor.json');
+    const owner = receipts.monitor(id);
+    owner.releaseNative();
+    const pending = JSON.parse(fs.readFileSync(file, 'utf8'));
+    assert.deepEqual(pending, { pid: process.pid, token: owner.token, released: true, phase: 'witness-pending' });
+    const output = receipts.monitor(id, 'output-monitor');
+    assert.throws(() => output.releaseNative(), /no pending session source/);
+    assert.throws(() => receipts.monitor(id, 'output-monitor'), /Another process/);
+    output.release();
+    if (mode === 'legacy') {
+      const { phase: _phase, ...legacy } = pending;
+      fs.writeFileSync(file, JSON.stringify(legacy));
+    }
+    if (mode === 'malformed') {
+      pending.phase = 'unknown';
+      fs.writeFileSync(file, JSON.stringify(pending));
+    }
+    const kill = vi.spyOn(process, 'kill').mockImplementation(() => {
+      if (mode === 'uncertain') throw Object.assign(new Error('Unavailable.'), { code: 'EPERM' });
+      if (mode === 'dead') throw Object.assign(new Error('Gone.'), { code: 'ESRCH' });
+      return true;
+    });
+    if (mode === 'dead' || mode === 'legacy') {
+      const next = receipts.monitor(id);
+      assert.notEqual(next.token, owner.token);
+      assert.throws(() => owner.release(), /owner changed/);
+      assert.throws(() => owner.releaseNative(), /owner changed/);
+      next.release();
+    } else {
+      assert.throws(() => receipts.monitor(id), mode === 'malformed' ? /identity is unavailable/ : /Another process/);
+      assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')), pending);
+      if (mode === 'malformed') assert.equal(kill.mock.calls.length, 0);
+      owner.release();
+      const next = receipts.monitor(id);
+      next.release();
+    }
+  },
+);
+
+test('monitor transitions refuse acquisition before and after atomic native and witness release', () => {
+  const { receipts, standalone } = standaloneFixture();
+  const id = standalone.launchId;
+  const file = path.join(receipts.root, id, 'monitor.json');
+  const owner = receipts.monitor(id);
+  const rename = fs.renameSync;
+  let transitions = 0;
+  vi.spyOn(fs, 'renameSync').mockImplementation((source, destination) => {
+    if (String(destination) !== file) return rename(source, destination);
+    assert.throws(() => receipts.monitor(id), /Another process holds this dispatch write/);
+    rename(source, destination);
+    transitions++;
+    assert.throws(() => receipts.monitor(id), /Another process holds this dispatch write/);
+  });
+  syncBuiltinESMExports();
+  owner.releaseNative();
+  assert.throws(() => receipts.monitor(id), /Another process is observing/);
+  owner.release();
+  assert.equal(transitions, 2);
+  vi.restoreAllMocks();
+  syncBuiltinESMExports();
+  const next = receipts.monitor(id);
+  next.release();
+});
 const nativeBackground: Partial<StandaloneOptions> = { provider: 'claude', args: ['--bg'], background: true };
+test.each([false, true])('standalone accepted identity preserves startup requirement %s', (initialStartup) => {
+  const { home, receipts, standalone } = standaloneFixture();
+  const id = standalone.launchId;
+  const file = path.join(home, 'native.jsonl');
+  fs.writeFileSync(file, 'x');
+  const source = fs.statSync(file, { bigint: true });
+  const parent = fs.statSync(home, { bigint: true });
+  const evidence = {
+    file,
+    identity: `${source.dev}:${source.ino}`,
+    ancestor: home,
+    directory: `${parent.dev}:${parent.ino}`,
+    cwd: home,
+    bytes: 1,
+    sha256: payloadSha256('x'),
+  };
+  if (initialStartup) receipts.startup(id, evidence);
+  assert.equal(receipts.standaloneSession(id, session), session);
+  const accepted = path.join(receipts.root, id, 'accepted.json');
+  const original = fs.readFileSync(accepted);
+  assert.equal(JSON.parse(original.toString('utf8')).startupRequired, initialStartup ? true : undefined);
+  if (!initialStartup) receipts.startup(id, evidence);
+  assert.doesNotThrow(() => assert.equal(receipts.standaloneSession(id, session), session));
+  assert.deepEqual(fs.readFileSync(accepted), original);
+  receipts.startupRefused(id, true);
+  assert.equal(receipts.standaloneSession(id), session);
+  assert.deepEqual(fs.readFileSync(accepted), original);
+});
+test.each(['sourceBaseline', 'sourceCandidate'] as const)(
+  'standalone %s refuses missing or replaced retained evidence',
+  (kind) => {
+    for (const change of ['missing', 'replaced']) {
+      const { home, receipts, standalone } = standaloneFixture();
+      const stat = fs.statSync(home, { bigint: true });
+      const directory = `${stat.dev}:${stat.ino}`;
+      if (kind === 'sourceBaseline')
+        receipts.sourceBaseline(standalone.launchId, {
+          root: home,
+          ancestor: home,
+          directory,
+          cwd: home,
+          state: 'unavailable',
+        });
+      else
+        receipts.sourceCandidate(standalone.launchId, {
+          file: path.join(home, 'native.jsonl'),
+          identity: directory,
+          ancestor: home,
+          directory,
+          cwd: home,
+          bytes: 1,
+          sha256: payloadSha256('x'),
+        });
+      const file = path.join(
+        receipts.root,
+        standalone.launchId,
+        kind === 'sourceBaseline' ? 'source-baseline.json' : 'source-candidate.json',
+      );
+      const original = fs.readFileSync(file);
+      fs.renameSync(file, file + '.original');
+      if (change === 'replaced') fs.writeFileSync(file, original);
+      assert.throws(() => receipts[kind](standalone.launchId), /unavailable|cannot change|replaced/);
+    }
+  },
+);
 const unloggedAgentRun: Partial<StandaloneOptions> = {
   model: 'sol',
   name: '',

@@ -12,10 +12,12 @@ const invalidTheme = `<!doctype html>
 <body><section data-shot="one">one</section></body>
 </html>`;
 
-function stopPidTree(pid: number) {
+function stopPidTrees(pids: number[]) {
   if (process.platform === 'win32') {
-    spawnSync('taskkill', ['/pid', String(pid), '/t', '/f'], { windowsHide: true });
-  } else {
+    if (pids.length) spawnSync('taskkill', [...pids.flatMap((pid) => ['/pid', String(pid)]), '/t', '/f'], { windowsHide: true });
+    return;
+  }
+  for (const pid of pids) {
     try {
       process.kill(-pid, 'SIGKILL');
     } catch {
@@ -72,10 +74,10 @@ function waitForFirstLine(file: string, deadlineMs: number) {
   });
 }
 
-function stopOwnedProcesses(child: ChildProcess, ownershipFile: string, stop = stopPidTree) {
+function stopOwnedProcesses(child: ChildProcess, ownershipFile: string, stop = stopPidTrees) {
   const pids = new Set(readOwnedPids(ownershipFile));
   if (child.pid) pids.add(child.pid);
-  for (const pid of [...pids].reverse()) stop(pid);
+  stop([...pids].reverse());
 }
 
 function waitForExit(child: ChildProcess, deadlineMs: number, ownershipFile: string) {

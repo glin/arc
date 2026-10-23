@@ -25,6 +25,9 @@ import {
   standaloneProcessIdentity,
   produceStandaloneOutput,
   standaloneEnvironment,
+  nativeSourceWitness,
+  ObservationWork,
+  sourceDigest,
 } from '../src/standalone.ts';
 import {
   DispatchReceipts,
@@ -46,6 +49,10 @@ vi.mock('node:fs', async (importOriginal) => {
 vi.mock('node:os', async (importOriginal) => {
   const original = await importOriginal<typeof import('node:os')>();
   return { ...original, homedir: vi.fn<typeof original.homedir>(original.homedir) };
+});
+vi.mock('node:path', async (importOriginal) => {
+  const original = await importOriginal<typeof import('node:path')>();
+  return { ...original, isAbsolute: vi.fn<typeof original.isAbsolute>(original.isAbsolute) };
 });
 vi.mock('node:child_process', async (importOriginal) => {
   const original = await importOriginal<typeof import('node:child_process')>();
@@ -379,6 +386,703 @@ test.each(['complete', 'budget', 'denied', 'transient', 'busy', 'busy-budget', '
     else assert.ok(fs.statSync(alias).size < stdout.length + stderr.length);
     assert.equal(status.observation.exitCode, 0);
     assert.equal(vi.mocked(childProcess.spawn).mock.calls.length, 0);
+  },
+);
+
+test.each(['win32', 'darwin', 'linux'] as const)('native pathname exclusion preserves %s path rules', (platform) => {
+  const root = platform === 'win32' ? 'C:/MiXeD/Native' : '/MiXeD/Native';
+  const first = `${root}/rollout-AbCd.jsonl`;
+  const variant = `${root.toLowerCase()}/rollout-abcd.jsonl`;
+  assert.equal(sourceDigest(first, platform).equals(sourceDigest(variant, platform)), platform === 'win32');
+  if (platform === 'win32')
+    assert.deepEqual(
+      sourceDigest(first, platform),
+      sourceDigest(first.replaceAll('/', String.fromCharCode(92)), platform),
+    );
+  assert.notDeepEqual(sourceDigest(first, platform), sourceDigest(`${root}/other.jsonl`, platform));
+});
+
+test.each(['win32', 'darwin', 'linux'] as const)(
+  'native source qualification preserves %s filesystem rules',
+  async (platform) => {
+    const actualFs = await vi.importActual<typeof import('node:fs')>('node:fs');
+    const actualPath = await vi.importActual<typeof import('node:path')>('node:path');
+    for (const state of ['relative selector', 'different cwd', 'redirected ancestor', 'case exclusion'] as const) {
+      const { home, args } = fixture();
+      const paths = platform === 'win32' ? path.win32 : path.posix;
+      const nativeCwd = platform === 'win32' ? 'Z:\\WoRk' : '/WoRk';
+      const parsed = parseRun(args, { CODEX_BIN: process.execPath });
+      const receipts = new DispatchReceipts(home);
+      const { launchId: id } = admitParsed(receipts, parsed);
+      const nativeId = session.replace('aaaaaaaa', 'AbCdEfAb');
+      const selector = platform === 'win32' ? '.\\MiXeD-Native' : './MiXeD-Native';
+      const nativeRoot = paths.join(nativeCwd, 'MiXeD-Native', projectSlug(nativeCwd));
+      const physicalRoot = path.join(home, 'MiXeD-Native', projectSlug(nativeCwd));
+      const other = path.join(home, 'Other-Cwd');
+      fs.mkdirSync(physicalRoot, { recursive: true });
+      fs.mkdirSync(other);
+      const options: StandaloneOptions = {
+        ...parsed.options,
+        provider: 'claude',
+        background: true,
+        cwd: nativeCwd,
+        env: { ...parsed.options.env, ARC_PROJECTS_ROOT: selector },
+      };
+      const file = paths.join(nativeRoot, `${nativeId}.jsonl`);
+      const physicalFile = path.join(physicalRoot, `${nativeId}.jsonl`);
+      const nativePath = (value: unknown) => {
+        const text = String(value);
+        return platform === 'win32'
+          ? text.toLowerCase().startsWith('z:')
+          : text === '/WoRk' || text.startsWith('/WoRk/');
+      };
+      const mapped = (value: fs.PathLike) => {
+        if (!nativePath(value)) return value;
+        const relative = paths.relative(nativeCwd, String(value));
+        return path.join(home, ...relative.split(paths.sep));
+      };
+      const exists = actualFs.existsSync;
+      const stat = actualFs.statSync;
+      const lstat = actualFs.lstatSync;
+      const open = actualFs.openSync;
+      const realpath = actualFs.realpathSync.native;
+      const absolute = actualPath.isAbsolute;
+      let before = true;
+      const substitutions = [
+        vi.spyOn(fs, 'existsSync').mockImplementation((target) => exists(mapped(target))),
+        vi
+          .spyOn(fs, 'statSync')
+          .mockImplementation((target, ...rest) => Reflect.apply(stat, fs, [mapped(target), ...rest])),
+        vi.spyOn(fs, 'lstatSync').mockImplementation((target, ...rest) => {
+          const actual = Reflect.apply(lstat, fs, [mapped(target), ...rest]);
+          if (actual && !before && state === 'redirected ancestor' && String(target) === nativeRoot) {
+            const redirected = Object.create(actual);
+            redirected.isSymbolicLink = () => true;
+            return redirected;
+          }
+          return actual;
+        }),
+        vi
+          .spyOn(fs, 'openSync')
+          .mockImplementation((target, ...rest) => Reflect.apply(open, fs, [mapped(target), ...rest])),
+        vi
+          .spyOn(fs.realpathSync, 'native')
+          .mockImplementation((target, ...rest) => Reflect.apply(realpath, fs.realpathSync, [mapped(target), ...rest])),
+        vi
+          .spyOn(path, 'isAbsolute')
+          .mockImplementation((target) => (nativePath(target) ? paths.isAbsolute(target) : absolute(target))),
+        vi.spyOn(fs.promises, 'opendir').mockImplementation(
+          async () =>
+            ({
+              async *[Symbol.asyncIterator]() {
+                if (!before || state === 'case exclusion')
+                  yield {
+                    name: before ? `${nativeId.toLowerCase()}.jsonl` : `${nativeId}.jsonl`,
+                    isFile: () => true,
+                    isDirectory: () => false,
+                    isSymbolicLink: () => false,
+                  };
+              },
+              close: async () => {},
+            }) as unknown as fs.Dir,
+        ),
+      ];
+      const bounds = { frameBytes: 128 * 1024, readBytes: 8192, workBytes: 1024 * 1024 };
+      const runtime = { ...frozenRuntime(), platform };
+      try {
+        const work = new ObservationWork(1000, runtime, bounds.workBytes);
+        const observe = await nativeSourceWitness(
+          receipts,
+          id,
+          options,
+          parsed.prompt,
+          bounds,
+          runtime,
+          1000,
+          false,
+          work,
+        );
+        const baseline = receipts.sourceBaseline(id);
+        assert.ok(baseline, 'Source preparation must retain its native root.');
+        assert.equal(baseline.root, nativeRoot);
+        before = false;
+        fs.writeFileSync(
+          physicalFile,
+          jsonLines([
+            {
+              ...claudeUser(parsed.prompt),
+              sessionId: nativeId,
+              cwd: state === 'different cwd' ? paths.join(nativeCwd, 'Other-Cwd') : nativeCwd,
+            },
+          ]),
+        );
+        const expected =
+          state === 'relative selector' || (state === 'case exclusion' && platform !== 'win32')
+            ? 'ready'
+            : state === 'case exclusion' || state === 'different cwd'
+              ? 'refused'
+              : 'pending';
+        assert.equal(await observe(nativeId), expected, `${platform}: ${state}`);
+        assert.equal(!!receipts.startup(id), expected === 'ready');
+        if (expected === 'ready') assert.equal(receipts.startup(id)!.file, file);
+        assert.equal(vi.mocked(childProcess.spawn).mock.calls.length, 0);
+      } finally {
+        for (const substitution of substitutions.reverse()) substitution.mockRestore();
+      }
+    }
+  },
+);
+
+test.each(['large', 'partial append', 'partial replaced', 'partial digest'] as const)(
+  'foreground Claude opening preserves %s evidence through recovery',
+  async (state) => {
+    vi.useFakeTimers();
+    const { home, options, file, receipts, child } = claudePrintFixture();
+    options.deadlineMs = 1000;
+    const prompt = 'x'.repeat(32 * 1024);
+    const opening =
+      JSON.stringify({
+        ...claudeUser(prompt),
+        sessionId: options.sessionHint,
+        cwd: home,
+        padding: ' '.repeat(40 * 1024),
+      }) + '\n';
+    const launch = admit(receipts, options, { prompt });
+    vi.mocked(childProcess.spawn).mockImplementationOnce((_command, _args, _settings) => {
+      fs.writeFileSync(file, state === 'large' ? opening : opening.slice(0, 10));
+      return child;
+    });
+    const bounds = { frameBytes: 128 * 1024, readBytes: 8192, workBytes: 8 * 1024 * 1024 };
+    const active = superviseStandalone(receipts, launch.launchId, false, bounds, frozenRuntime());
+    await vi.waitFor(() => assert.ok(receipts.sourceCandidate(launch.launchId)));
+    if (state === 'large') {
+      await vi.waitFor(() => assert.equal(receipts.standaloneSession(launch.launchId), options.sessionHint));
+      assert.ok(receipts.startup(launch.launchId)!.bytes > 65536);
+    }
+    await vi.advanceTimersByTimeAsync(options.deadlineMs);
+    await active;
+    if (state === 'partial replaced') {
+      fs.renameSync(file, file + '.old');
+      fs.writeFileSync(file, opening);
+    } else fs.writeFileSync(file, state === 'partial digest' ? opening.replace('{', '{ ') : opening);
+    fs.appendFileSync(receipts.artifact(launch.launchId, 'stdout.log'), claudeResult(options.sessionHint));
+    child.emit('close', 0, null);
+    await superviseStandalone(new DispatchReceipts(home), launch.launchId, true, bounds, frozenRuntime());
+    const valid = state === 'large' || state === 'partial append';
+    assert.equal(receipts.latest(launch.launchId)?.availability, valid ? 'available' : 'pending');
+    assert.equal(!!receipts.startup(launch.launchId), valid);
+    assert.equal(vi.mocked(childProcess.spawn).mock.calls.length, 1);
+    if (!valid) assert.equal(receipts.latest(launch.launchId)?.report, null);
+    assert.equal(fs.existsSync(receipts.artifact(launch.launchId, 'source-paths.bin')), false);
+  },
+);
+
+test.each([
+  'large opening',
+  'partial replacement',
+  'partial digest',
+  'manifest missing',
+  'manifest replaced',
+  'binary missing',
+  'binary replaced',
+  'binary digest',
+  'candidate missing',
+  'candidate replaced',
+  'root witness missing',
+  'root witness replaced',
+  'root witness content',
+  'accepted missing',
+  'accepted exhausted',
+  'exhaustion',
+] as const)('native source observer qualifies %s under one allowance', async (mode) => {
+  const { home, args } = fixture();
+  const root = path.join(home, 'native');
+  fs.mkdirSync(root);
+  const parsed = parseRun(args, { CODEX_BIN: process.execPath, ARC_CODEX_ROOT: root });
+  const receipts = new DispatchReceipts(home);
+  const launch = admitParsed(receipts, parsed);
+  const id = launch.launchId;
+  const file = path.join(root, `rollout-${session}.jsonl`);
+  const opening =
+    JSON.stringify({ type: 'session_meta', payload: { id: session, cwd: home, instructions: 'x'.repeat(70 * 1024) } }) +
+    '\n';
+  if (mode === 'binary digest') fs.writeFileSync(path.join(root, 'prior.jsonl'), '');
+  const bounds = { frameBytes: 128 * 1024, readBytes: 8192, workBytes: mode === 'exhaustion' ? 1024 : 1024 * 1024 };
+  const runtime = frozenRuntime();
+  const work = new ObservationWork(1000, runtime, bounds.workBytes);
+  const observe = await nativeSourceWitness(
+    receipts,
+    id,
+    parsed.options,
+    parsed.prompt,
+    bounds,
+    runtime,
+    1000,
+    false,
+    work,
+  );
+  fs.writeFileSync(
+    file,
+    mode === 'large opening' || mode === 'exhaustion' || mode.startsWith('accepted ') ? opening : opening.slice(0, 10),
+  );
+  const first = await observe(session);
+  if (mode === 'accepted missing' || mode === 'accepted exhausted') {
+    assert.equal(first, 'ready');
+    const accepted = receipts.startup(id);
+    if (mode === 'accepted missing') fs.unlinkSync(file);
+    else work.remaining = 0;
+    assert.equal(await observe(session), mode === 'accepted missing' ? 'pending' : 'exhausted');
+    assert.deepEqual(receipts.startup(id), accepted);
+    assert.equal(receipts.startupRefused(id), false);
+    assert.equal(vi.mocked(childProcess.spawn).mock.calls.length, 0);
+    return;
+  }
+  if (mode === 'large opening') {
+    assert.equal(first, 'ready');
+    assert.ok(receipts.startup(id)!.bytes > 65536);
+    assert.ok(work.remaining < bounds.workBytes - opening.length * 2);
+    assert.ok(fs.statSync(path.join(receipts.root, id, 'startup.json')).size < 48 * 1024);
+    return;
+  }
+  if (mode === 'exhaustion') {
+    assert.equal(first, 'exhausted');
+    assert.equal(receipts.startup(id), null);
+    return;
+  }
+  assert.equal(first, 'pending');
+  if (mode === 'partial replacement') {
+    fs.renameSync(file, file + '.old');
+    fs.writeFileSync(file, opening);
+  } else if (mode === 'partial digest') fs.writeFileSync(file, opening.replace('{', '{ '));
+  else {
+    const target = mode.startsWith('manifest')
+      ? path.join(receipts.root, id, 'source-baseline.json')
+      : mode.startsWith('binary')
+        ? path.join(receipts.root, id, 'source-paths.bin')
+        : mode.startsWith('candidate')
+          ? path.join(receipts.root, id, 'source-candidate.json')
+          : path.join(receipts.root, `${id}.source-baseline.json`);
+    const bytes = fs.readFileSync(target);
+    fs.renameSync(target, target + '.old');
+    if (mode.endsWith('replaced')) fs.writeFileSync(target, bytes);
+    if (mode === 'root witness content') {
+      fs.renameSync(target + '.old', target);
+      const witness = JSON.parse(bytes.toString('utf8'));
+      witness.sha256 = '0'.repeat(64);
+      fs.writeFileSync(target, JSON.stringify(witness));
+    }
+    if (mode === 'binary digest') {
+      fs.renameSync(target + '.old', target);
+      const fd = fs.openSync(target, 'r+');
+      fs.writeSync(fd, Buffer.from([bytes[0] ^ 255]), 0, 1, 0);
+      fs.closeSync(fd);
+    }
+    fs.writeFileSync(file, opening);
+  }
+  const recovered = await nativeSourceWitness(
+    receipts,
+    id,
+    parsed.options,
+    parsed.prompt,
+    bounds,
+    runtime,
+    1000,
+    true,
+    work,
+  );
+  assert.notEqual(await recovered(session), 'ready');
+  assert.equal(receipts.startup(id), null);
+  assert.equal(vi.mocked(childProcess.spawn).mock.calls.length, 0);
+});
+
+test.each(['fresh', 'preexisting', 'exhausted'] as const)(
+  'exact exclusion admits a 100,000-entry %s source',
+  async (mode) => {
+    const { home, args } = fixture();
+    const root = path.join(home, 'native');
+    fs.mkdirSync(root);
+    const parsed = parseRun(args, { CODEX_BIN: process.execPath, ARC_CODEX_ROOT: root });
+    const receipts = new DispatchReceipts(home);
+    const { launchId: id } = admitParsed(receipts, parsed);
+    const file = path.join(root, `rollout-${session}.jsonl`);
+    const names = Array.from({ length: 100000 }, (_, n) => `rollout-${String(n).padStart(36, '0')}.jsonl`);
+    names[71681] = path.basename(file);
+    const catalog = vi.spyOn(fs.promises, 'opendir').mockImplementation(
+      async () =>
+        ({
+          async *[Symbol.asyncIterator]() {
+            for (const name of names)
+              yield { name, isFile: () => true, isDirectory: () => false, isSymbolicLink: () => false };
+          },
+          close: async () => {},
+        }) as unknown as fs.Dir,
+    );
+    if (mode !== 'preexisting') names[71681] = 'rollout-independently-selected-preexisting.jsonl';
+    const bound =
+      3 * names.reduce((total, name) => total + 128 + Buffer.byteLength(path.join(root, name)), 0) +
+      3 * 32 * names.length +
+      1024 * 1024;
+    if (mode === 'exhausted') {
+      const entryBytes = 128 + Buffer.byteLength(path.join(root, names[0]));
+      for (let n = names.length; n <= Math.ceil(bound / entryBytes) + 1; n++)
+        names.push(`rollout-${String(n).padStart(36, '0')}.jsonl`);
+    }
+    const bounds = { frameBytes: 128 * 1024, readBytes: 65536, workBytes: bound };
+    const runtime = frozenRuntime();
+    const work = new ObservationWork(1000, runtime, bound);
+    const observe = await nativeSourceWitness(
+      receipts,
+      id,
+      parsed.options,
+      parsed.prompt,
+      bounds,
+      runtime,
+      1000,
+      false,
+      work,
+    );
+    fs.writeFileSync(file, JSON.stringify({ type: 'session_meta', payload: { id: session, cwd: home } }) + '\n');
+    if (mode === 'exhausted') {
+      assert.equal(receipts.sourceBaseline(id)!.state, 'unavailable');
+      assert.equal(await observe(session), 'exhausted');
+      assert.equal(receipts.startupRefused(id), false);
+      assert.equal(receipts.startup(id), null);
+      assert.ok(work.remaining >= 0);
+      const recovered = await nativeSourceWitness(
+        receipts,
+        id,
+        parsed.options,
+        parsed.prompt,
+        bounds,
+        runtime,
+        1000,
+        true,
+        new ObservationWork(1000, runtime, bound),
+      );
+      assert.equal(await recovered(session), 'exhausted');
+      assert.equal(vi.mocked(childProcess.spawn).mock.calls.length, 0);
+      catalog.mockRestore();
+      return;
+    }
+    if (mode === 'fresh') names.push(path.basename(file));
+    assert.equal(await observe(session), mode === 'fresh' ? 'ready' : 'refused');
+    assert.equal(receipts.sourceBaseline(id)!.binary!.bytes, 3200000);
+    assert.ok(work.remaining >= 0);
+    catalog.mockRestore();
+  },
+);
+
+test.each(
+  (['claude', 'codex'] as const).flatMap((provider) =>
+    [
+      'valid',
+      'preexisting',
+      'delayed',
+      'partial replaced',
+      'partial digest',
+      'replaced',
+      'digest',
+      'ambiguous',
+      'early replaced',
+      'exhausted',
+      'many chunks',
+    ].map((state) => ({ provider, state })),
+  ),
+)(
+  'native $provider $state sources retain original evidence across observation recovery',
+  async ({ provider, state }) => {
+    const { home, args } = fixture();
+    const root = path.join(home, 'native');
+    const parsed = parseRun(withProvider(args, provider), {
+      CLAUDE_BIN: process.execPath,
+      CODEX_BIN: process.execPath,
+      ARC_PROJECTS_ROOT: root,
+      ARC_CODEX_ROOT: root,
+    });
+    const options = parsed.options;
+    const dir = provider === 'claude' ? path.join(root, projectSlug(home)) : root;
+    fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, provider === 'claude' ? `${session}.jsonl` : `rollout-${session}.jsonl`);
+    const opening =
+      JSON.stringify(
+        provider === 'claude'
+          ? { ...claudeUser(parsed.prompt), sessionId: session, cwd: home }
+          : { type: 'session_meta', payload: { id: session, cwd: home } },
+      ) + '\n';
+    if (state === 'preexisting') fs.writeFileSync(file, opening);
+    if (state === 'exhausted' || state === 'many chunks')
+      for (let n = 0; n < 20; n++) fs.writeFileSync(path.join(dir, `prior-${n}.jsonl`), '');
+    const receipts = new DispatchReceipts(home);
+    const launch = admitParsed(receipts, parsed);
+    const child = providerChild();
+    vi.spyOn(child, 'unref').mockImplementation(() => {});
+    vi.mocked(childProcess.spawn).mockImplementationOnce((_command, _args, settings) => {
+      if (state !== 'delayed') fs.writeFileSync(file, state.startsWith('partial ') ? opening.slice(0, 10) : opening);
+      if (state === 'ambiguous' && provider === 'codex')
+        fs.writeFileSync(path.join(dir, `other-${session}.jsonl`), opening);
+      const stdout = (settings.stdio as number[])[1];
+      fs.writeSync(
+        stdout,
+        provider === 'claude'
+          ? `backgrounded · deadbeef · ${options.name}\n`
+          : jsonLines([
+              { type: 'thread.started', thread_id: session },
+              { type: 'turn.started' },
+              { type: 'item.completed', item: { type: 'agent_message', id: 'item_1', text: 'Report' } },
+              { type: 'turn.completed' },
+            ]),
+      );
+      if (provider === 'codex') fs.writeFileSync(receipts.artifact(launch.launchId, 'native.md'), 'Report');
+      queueMicrotask(() => child.emit('close', 0, null));
+      return child;
+    });
+    nativeRegistry().mockImplementation(() =>
+      registryReply(JSON.stringify([{ id: 'deadbeef', sessionId: session, state: 'stopped' }])),
+    );
+    const bounds = {
+      frameBytes: 65536,
+      readBytes: state === 'early replaced' || state === 'many chunks' ? 64 : 65536,
+      workBytes: state === 'exhausted' ? 1024 : state === 'many chunks' ? 65536 : 16 * 1024,
+    };
+    let ticks = 0;
+    let replacedEarly = false;
+    const runtime = {
+      ...frozenRuntime(),
+      now: () => ticks,
+      yield: async () => {
+        ticks++;
+        if (state === 'early replaced' && !replacedEarly && receipts.sourceCandidate(launch.launchId)) {
+          replacedEarly = true;
+          fs.renameSync(file, file + '.original');
+          fs.writeFileSync(file, opening);
+        }
+        if (state === 'delayed' && receipts.sourceBaseline(launch.launchId) && ticks > 2)
+          fs.writeFileSync(file, opening);
+      },
+    };
+    const launchCalls = vi.mocked(childProcess.spawn).mock.calls.length;
+    if (state === 'exhausted') {
+      await superviseStandalone(receipts, launch.launchId, true, bounds, runtime);
+      assert.equal(vi.mocked(childProcess.spawn).mock.calls.length, launchCalls);
+      assert.equal(receipts.sourceBaseline(launch.launchId), null);
+    }
+    Object.assign(runtime, { wait: runtime.yield });
+    await superviseStandalone(receipts, launch.launchId, false, bounds, runtime);
+    assert.equal(vi.mocked(childProcess.spawn).mock.calls.length, launchCalls + 1);
+    if (state === 'exhausted') assert.equal(receipts.sourceBaseline(launch.launchId)?.state, 'unavailable');
+    const accepted =
+      !state.startsWith('partial ') &&
+      !['preexisting', 'exhausted', 'early replaced'].includes(state) &&
+      !(state === 'ambiguous' && provider === 'codex');
+    assert.equal(!!receipts.startup(launch.launchId), accepted, `${provider} ${state}`);
+    assert.equal(receipts.standaloneSession(launch.launchId), session);
+    if (state === 'exhausted') {
+      assert.equal(receipts.latest(launch.launchId)?.outcome, provider === 'codex' ? 'succeeded' : 'interrupted');
+      if (provider === 'codex') assert.equal(receipts.latest(launch.launchId)?.availability, 'available');
+    }
+    if (state === 'many chunks' && provider === 'codex') {
+      assert.equal(receipts.latest(launch.launchId)?.availability, 'available');
+      assert.equal(receipts.latest(launch.launchId)?.outcome, 'succeeded');
+    }
+    if (state === 'early replaced') {
+      assert.equal(replacedEarly, true);
+      assert.equal(receipts.startupRefused(launch.launchId), true);
+    }
+    if (state === 'delayed') fs.writeFileSync(file, opening);
+    if (state === 'partial replaced') {
+      fs.renameSync(file, file + '.original');
+      fs.writeFileSync(file, opening);
+    }
+    if (state === 'partial digest') fs.writeFileSync(file, opening.replace('{', '{ '));
+    if (state === 'replaced') {
+      fs.renameSync(file, file + '.original');
+      fs.writeFileSync(file, opening);
+    }
+    if (state === 'digest') {
+      fs.writeFileSync(file, opening.replace('session', 'sessioN'));
+      fs.utimesSync(file, 1000, 1000);
+    }
+    await superviseStandalone(receipts, launch.launchId, true, bounds, runtime);
+    assert.equal(vi.mocked(childProcess.spawn).mock.calls.length, launchCalls + 1);
+    if (state === 'delayed') assert.ok(receipts.startup(launch.launchId));
+    if (state === 'replaced' || state === 'digest' || state.startsWith('partial '))
+      assert.equal(receipts.startupRefused(launch.launchId), true);
+    nativeRegistry().mockReset();
+  },
+);
+
+test.each(['arrives', 'qualification fails', 'deadline', 'cancelled'] as const)(
+  'foreground native ending publishes before a missing source settles: %s',
+  async (state) => {
+    const { home, args } = fixture();
+    const root = path.join(home, 'native');
+    fs.mkdirSync(root, { recursive: true });
+    const parsed = parseRun(withProvider(args, 'codex'), { CODEX_BIN: process.execPath, ARC_CODEX_ROOT: root });
+    const file = path.join(root, `rollout-${session}.jsonl`);
+    const opening = JSON.stringify({ type: 'session_meta', payload: { id: session, cwd: home } }) + '\n';
+    const receipts = new DispatchReceipts(home);
+    const launch = admitParsed(receipts, parsed);
+    const child = providerChild();
+    vi.spyOn(child, 'unref').mockImplementation(() => {});
+    let closed = false;
+    vi.mocked(childProcess.spawn).mockImplementationOnce((_command, _args, settings) => {
+      fs.writeSync(
+        (settings.stdio as number[])[1],
+        jsonLines([
+          { type: 'thread.started', thread_id: session },
+          { type: 'turn.started' },
+          { type: 'item.completed', item: { type: 'agent_message', id: 'item_1', text: 'Report' } },
+          { type: 'turn.completed' },
+        ]),
+      );
+      fs.writeFileSync(receipts.artifact(launch.launchId, 'native.md'), 'Report');
+      queueMicrotask(() => {
+        closed = true;
+        child.emit('close', 0, null);
+      });
+      return child;
+    });
+    const controller = new AbortController();
+    const waits: unknown[] = [];
+    let markPaused!: () => void;
+    let resume!: () => void;
+    const paused = new Promise<void>((resolve) => {
+      markPaused = resolve;
+    });
+    const resumed = new Promise<void>((resolve) => {
+      resume = resolve;
+    });
+    const bounds = { frameBytes: 65536, readBytes: 65536, workBytes: 65536 };
+    const workValues = new Set<ObservationWork>();
+    const reserve = ObservationWork.prototype.reserve;
+    let remaining = bounds.workBytes;
+    let lastRequested = 0;
+    let initialDeadline: number | undefined;
+    vi.spyOn(ObservationWork.prototype, 'reserve').mockImplementation(function (this: ObservationWork, bytes) {
+      workValues.add(this);
+      initialDeadline ??= this.deadline;
+      assert.equal(this.deadline, initialDeadline, 'Native release must retain the original deadline.');
+      assert.equal(this.remaining, remaining, 'Native release must not replenish the work allowance.');
+      lastRequested = bytes;
+      const accepted = reserve.call(this, bytes);
+      if (accepted) remaining -= bytes;
+      return accepted;
+    });
+    const read = fs.readSync;
+    let stdoutBytes = 0;
+    let failedBytes = 0;
+    vi.spyOn(fs, 'readSync').mockImplementation((...values) => {
+      const actual = fs.fstatSync(values[0], { bigint: true });
+      const matches = (target: string) => {
+        if (!fs.existsSync(target)) return false;
+        const expected = fs.statSync(target, { bigint: true });
+        return actual.dev === expected.dev && actual.ino === expected.ino;
+      };
+      const requested = (values as unknown as number[])[3];
+      if (matches(path.join(receipts.root, launch.launchId, 'stdout.log'))) {
+        assert.equal(lastRequested, requested, 'Stdout must charge requested bytes before reading.');
+        stdoutBytes += requested;
+      }
+      if (state === 'qualification fails' && !failedBytes && matches(file)) {
+        assert.equal(lastRequested, requested, 'Failed qualification must charge requested bytes before reading.');
+        failedBytes += requested;
+        throw Object.assign(new Error('Source read denied.'), { code: 'EACCES' });
+      }
+      return Reflect.apply(read, fs, values);
+    });
+    let ticks = 0;
+    const runtime = {
+      ...frozenRuntime(),
+      signal: controller.signal,
+      now: () => ticks,
+      yield: async () => {
+        ticks++;
+      },
+      wait: async () => {
+        ticks++;
+        if (!closed) return;
+        const observed = receipts.observation(launch.launchId);
+        waits.push({
+          event: receipts.latest(launch.launchId)?.outcome,
+          exitCode: observed?.exitCode,
+          monitor: observed?.monitor,
+          ...JSON.parse(fs.readFileSync(path.join(receipts.root, launch.launchId, 'monitor.json'), 'utf8')),
+        });
+        if (waits.length === 1) {
+          markPaused();
+          await resumed;
+        }
+        if (waits.length < 3) return;
+        if (state === 'arrives' || state === 'qualification fails') fs.writeFileSync(file, opening);
+        if (state === 'deadline') ticks = Number.MAX_SAFE_INTEGER;
+        if (state === 'cancelled') controller.abort();
+      },
+    };
+    const launchCalls = vi.mocked(childProcess.spawn).mock.calls.length;
+    const argv = process.argv;
+    const dedicated = state === 'qualification fails';
+    process.argv =
+      state === 'deadline'
+        ? [process.execPath, argv[1], 'dispatch', 'monitor', launch.launchId]
+        : dedicated || state === 'cancelled'
+          ? [
+              process.execPath,
+              argv[1],
+              '__standalone-supervise',
+              launch.launchId,
+              ...(state === 'cancelled' ? ['--attended'] : []),
+            ]
+          : argv;
+    const chdir = vi.spyOn(process, 'chdir').mockImplementation(() => {});
+    const pending = superviseStandalone(receipts, launch.launchId, false, bounds, runtime);
+    try {
+      await Promise.race([
+        paused,
+        pending.then(() => assert.fail('The original source observation must remain pending.')),
+      ]);
+      const catalogs = vi.spyOn(fs.promises, 'opendir');
+      const reservations = vi.mocked(ObservationWork.prototype.reserve).mock.calls.length;
+      const owner = JSON.parse(fs.readFileSync(path.join(receipts.root, launch.launchId, 'monitor.json'), 'utf8'));
+      assert.equal(owner.released, true, 'Native completion must precede pending source settlement.');
+      assert.equal(owner.phase, 'witness-pending');
+      assert.deepEqual(
+        chdir.mock.calls,
+        dedicated ? [[fs.realpathSync.native(path.parse(process.execPath).root)]] : [],
+      );
+      await assert.rejects(superviseStandalone(receipts, launch.launchId, true, bounds, runtime), /Another process/);
+      assert.equal(catalogs.mock.calls.length, 0, 'Concurrent recovery must refuse before reading a source.');
+      assert.equal(vi.mocked(ObservationWork.prototype.reserve).mock.calls.length, reservations);
+    } finally {
+      resume();
+      try {
+        await pending;
+      } finally {
+        process.argv = argv;
+      }
+    }
+    assert.equal(vi.mocked(childProcess.spawn).mock.calls.length, launchCalls + 1);
+    assert.ok(waits.length >= 3);
+    for (const wait of waits)
+      assert.deepEqual(wait, {
+        event: 'succeeded',
+        exitCode: 0,
+        monitor: 'finished',
+        pid: process.pid,
+        token: receipts.observation(launch.launchId)!.supervisor.token,
+        released: true,
+        phase: 'witness-pending',
+      });
+    assert.equal(workValues.size, 1, 'Source settlement must retain the original work object.');
+    assert.ok(stdoutBytes > 0, 'The combined allowance must include stdout reads.');
+    if (state === 'qualification fails') assert.equal(failedBytes, Buffer.byteLength(opening));
+    assert.equal(receipts.latest(launch.launchId)?.availability, 'available');
+    assert.equal(receipts.standaloneSession(launch.launchId), session);
+    assert.equal(!!receipts.startup(launch.launchId), state === 'arrives' || state === 'qualification fails');
+    assert.equal(receipts.startupRefused(launch.launchId), false);
+    const owner = JSON.parse(fs.readFileSync(path.join(receipts.root, launch.launchId, 'monitor.json'), 'utf8'));
+    assert.equal(owner.phase, undefined);
+    const next = receipts.monitor(launch.launchId);
+    next.release();
   },
 );
 
@@ -1743,6 +2447,7 @@ test(
       yield: async () => {},
     });
     const rejected = assert.rejects(pending, /Temporary observation replacement failure/);
+    await vi.waitFor(() => assert.equal(vi.mocked(childProcess.spawn).mock.calls.length, 1));
     await vi.advanceTimersByTimeAsync(100);
     await rejected;
     assert.equal(vi.mocked(childProcess.spawn).mock.calls.length, 1);
@@ -1926,13 +2631,21 @@ test(
   'observation timeout preserves both output routes for later same-worker recovery',
   { tags: ['subprocess'], timeout: 30_000 },
   async () => {
-    const { receipts, launch, release, started, markerRelease } = workerFixture('', 10, true);
+    const { receipts, launch, release, started, markerRelease, script } = workerFixture('', 10, true);
+    const native = { command: process.execPath, commandLine: script, startedAt: 'original-worker-lifetime' };
+    let identityPid: number | undefined;
+    const identity = async (pid: number) => {
+      if (!processAlive(pid)) return null;
+      identityPid ??= pid;
+      assert.equal(pid, identityPid);
+      return native;
+    };
     let worker: NonNullable<ReturnType<DispatchReceipts['observation']>>['worker'] = null;
     try {
       await superviseStandalone(receipts, launch.launchId, false, undefined, {
         now: Date.now,
         yield: () => Promise.resolve(),
-        identity: (pid) => standaloneProcessIdentity(pid),
+        identity,
       });
       const timed = receipts.observation(launch.launchId)!;
       worker = timed.worker ?? timed.launcher ?? null;
@@ -1943,7 +2656,7 @@ test(
       fs.writeFileSync(markerRelease, 'ready');
       await marker;
       assert.equal(worker.pid, Number(fs.readFileSync(started, 'utf8').trim()));
-      assert.equal((await standaloneProcessIdentity(worker.pid))?.startedAt, worker.startedAt);
+      assert.equal((await identity(worker.pid))?.startedAt, worker.startedAt);
       fs.writeFileSync(release, 'finish');
       await vi.waitFor(() => {
         assert.match(fs.readFileSync(receipts.artifact(launch.launchId, 'stdout.log'), 'utf8'), /turn.completed/);
@@ -1954,7 +2667,7 @@ test(
         launch.launchId,
         true,
         { frameBytes: 256, readBytes: 17 },
-        { now: () => 0, identity: standaloneProcessIdentity, yield: () => Promise.resolve() },
+        { ...frozenRuntime(), identity },
       );
       const event = receipts.latest(launch.launchId)!;
       assert.equal(event.outcome, 'unknown');
@@ -1964,12 +2677,21 @@ test(
       fs.writeFileSync(markerRelease, 'ready');
       fs.writeFileSync(release, 'finish');
       if (worker)
-        await vi.waitFor(async () => assert.equal(await standaloneProcessIdentity(worker!.pid), null), {
+        await vi.waitFor(() => assert.equal(processAlive(worker!.pid), false), {
           timeout: 10_000,
         });
     }
   },
 );
+
+test('standalone process identity reads the current native lifetime', { tags: ['subprocess'] }, async () => {
+  const first = await standaloneProcessIdentity(process.pid);
+  assert.ok(first);
+  assert.match(path.basename(first.command), /^node(?:\.exe)?$/i);
+  assert.match(first.commandLine, /node(?:\.exe)?/i);
+  assert.match(first.startedAt, /\S/);
+  assert.deepEqual(await standaloneProcessIdentity(process.pid), first);
+});
 
 test('empty recovery overlaps the original start without occupying its monitor', { tags: ['subprocess'] }, async () => {
   const { receipts, launch, release, started } = workerFixture();
@@ -2205,7 +2927,17 @@ test.each([
   async (type, exitCode, signal, outcome) => {
     const { receipts, launch } = workerFixture('', 3);
     const child = providerChild();
-    vi.mocked(childProcess.spawn).mockReturnValue(child);
+    const log = receipts.artifact(launch.launchId, 'stdout.log');
+    vi.mocked(childProcess.spawn).mockImplementation(() => {
+      queueMicrotask(() => {
+        fs.writeFileSync(
+          log,
+          jsonLines([{ type: 'thread.started', thread_id: session }, { type: 'turn.started' }, { type }]),
+        );
+        child.emit('close', exitCode, signal);
+      });
+      return child;
+    });
     let now = 0;
     const bounds = smallBounds();
     const initial = superviseStandalone(receipts, launch.launchId, false, bounds, {
@@ -2215,12 +2947,6 @@ test.each([
         now += launch.standalone!.deadlineMs;
       },
     });
-    const log = receipts.artifact(launch.launchId, 'stdout.log');
-    fs.writeFileSync(
-      log,
-      jsonLines([{ type: 'thread.started', thread_id: session }, { type: 'turn.started' }, { type }]),
-    );
-    child.emit('close', exitCode, signal);
     await initial;
     assert.equal(receipts.observation(launch.launchId)?.monitor, 'timed-out');
     assert.equal(receipts.latest(launch.launchId)?.outcome, 'unknown');
@@ -2369,7 +3095,13 @@ test('absent launcher retains a valid JSON prefix for continuing original output
 test('supervisor timeout retains captured signal and output-read reason', { tags: ['subprocess'] }, async () => {
   const { receipts, launch } = workerFixture('', 3);
   const child = providerChild();
-  vi.spyOn(childProcess, 'spawn').mockReturnValue(child);
+  vi.spyOn(childProcess, 'spawn').mockImplementation(() => {
+    queueMicrotask(() => {
+      fs.writeFileSync(receipts.artifact(launch.launchId, 'stdout.log'), '{"type":"progress"}\n'.repeat(40));
+      child.emit('close', null, 'SIGTERM');
+    });
+    return child;
+  });
   let now = 0;
   const supervised = superviseStandalone(receipts, launch.launchId, false, smallBounds(), {
     now: () => now,
@@ -2378,8 +3110,6 @@ test('supervisor timeout retains captured signal and output-read reason', { tags
       now++;
     },
   });
-  fs.writeFileSync(receipts.artifact(launch.launchId, 'stdout.log'), '{"type":"progress"}\n'.repeat(40));
-  child.emit('close', null, 'SIGTERM');
   await supervised;
   const observation = receipts.observation(launch.launchId)!;
   assert.equal(observation.monitor, 'timed-out');
@@ -3494,7 +4224,9 @@ test.each([
     await supervised;
     const unknown =
       timedOut ||
-      ['replaced after acceptance', 'conflicting final', 'malformed final', 'duplicate final'].includes(state);
+      ['replaced', 'replaced after acceptance', 'conflicting final', 'malformed final', 'duplicate final'].includes(
+        state,
+      );
     assert.equal(receipts.latest(launch.launchId)?.outcome, unknown ? 'unknown' : 'succeeded');
     assert.equal(receipts.latest(launch.launchId)?.report === null, unknown);
     if (timedOut || state === 'replaced after acceptance') {
@@ -3777,9 +4509,10 @@ test.each([
     if (exhausted || state === 'recovered zero progress') {
       assert.equal(receipts.startupRefused(launch.launchId), false);
       if (state.includes('cumulative') || state.includes('unqualified')) {
-        assert.equal(nativeBytes, bounds.workBytes);
+        const frameBytes = Buffer.byteLength(claudeResult(options.sessionHint));
+        assert.equal(nativeBytes + frameBytes, bounds.workBytes);
         assert.equal(
-          nativeReads.reduce((sum, bytes) => sum + bytes, 0),
+          nativeReads.reduce((sum, bytes) => sum + bytes, frameBytes),
           bounds.workBytes,
         );
         assert.ok(changes > 1);
@@ -4113,13 +4846,25 @@ test.each([false, true])(
     const extra = `fs.writeSync(1,${JSON.stringify(stdoutPrefix)});fs.writeSync(2,Buffer.alloc(${diagnostic.length},255));
 const lateFinish=()=>{if(!fs.existsSync(path.join(process.cwd(),'${finalSignalName}')))return;lateWatcher.close();fs.writeFileSync(process.argv[process.argv.indexOf('-o')+1],'Report');fs.writeSync(${stderrEnding ? 2 : 1},${JSON.stringify(terminal)});};
 const lateWatcher=fs.watch(process.cwd(),lateFinish);lateFinish();return;`;
-    const { receipts, launch, options, started, release } = workerFixture(extra, 10_000, false, true);
+    const { receipts, launch, options, started, release, script } = workerFixture(extra, 10_000, false, true);
+    const native = { command: process.execPath, commandLine: script, startedAt: 'original-worker-lifetime' };
+    let identityPid: number | undefined;
+    const runtime = {
+      ...frozenRuntime(),
+      now: Date.now,
+      identity: async (pid: number) => {
+        if (!processAlive(pid)) return null;
+        identityPid ??= pid;
+        assert.equal(pid, identityPid);
+        return native;
+      },
+    };
     const entry = await outputEntry();
     const owner = () => artifactJson(receipts, launch.launchId, 'output-owner.json');
     const alias = launch.standalone!.logAlias!;
     const bounds = { frameBytes: 512_000, readBytes: 17, workBytes: 512 };
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
-    const pending = superviseStandalone(receipts, launch.launchId, false, bounds, undefined, undefined, false, entry);
+    const pending = superviseStandalone(receipts, launch.launchId, false, bounds, runtime, undefined, false, entry);
     let secondCapture: ReturnType<DispatchReceipts['capture']> | undefined;
     try {
       await vi.waitFor(
@@ -4139,6 +4884,8 @@ const lateWatcher=fs.watch(process.cwd(),lateFinish);lateFinish();return;`;
       assert.notEqual(owner().pid, nativePid);
       const observed = receipts.observation(launch.launchId)!;
       assert.equal((observed.worker ?? observed.launcher)?.pid, nativePid);
+      assert.equal(observed.worker, null);
+      assert.equal(observed.launcher?.startedAt, native.startedAt);
       let frozen: ReturnType<DispatchReceipts['publish']> | undefined;
       await vi.waitFor(() => {
         frozen ??= publishAvailable(receipts, launch.launchId, 'unknown', 'Frozen report');
@@ -4508,5 +5255,664 @@ test(
     assert.deepEqual(invoked.find((row) => row.args[0] === 'logs').args, ['logs', 'deadbeef']);
     assert.equal(receipts.observation(launch.launchId)?.exitCode, null);
     assert.equal(receipts.latest(launch.launchId)?.availability, 'pending');
+  },
+);
+
+test('source observation cancellation stops further reservations', () => {
+  const controller = new AbortController();
+  const work = new ObservationWork(1000, { ...frozenRuntime(), signal: controller.signal }, 100);
+  assert.equal(work.reserve(1), true);
+  controller.abort();
+  assert.equal(work.reserve(1), false);
+  assert.equal(work.remaining, 99);
+});
+
+test.each(['replacement', 'rewrite'] as const)(
+  'completed background %s refuses report publication after source binding',
+  async (change) => {
+    const { home, args } = fixture();
+    const root = path.join(home, 'native');
+    const parsed = parseRun(withProvider(args, 'claude'), { CLAUDE_BIN: process.execPath, ARC_PROJECTS_ROOT: root });
+    const receipts = new DispatchReceipts(home);
+    const { launchId: id } = admitParsed(receipts, parsed);
+    const dir = path.join(root, projectSlug(home));
+    fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, `${session}.jsonl`);
+    const text = jsonLines([{ ...claudeUser(parsed.prompt), sessionId: session, cwd: home }, claudeAnswer('Report')]);
+    const child = providerChild();
+    vi.mocked(childProcess.spawn).mockImplementationOnce((_command, _args, settings) => {
+      fs.writeFileSync(file, text);
+      fs.writeSync((settings.stdio as number[])[1], `backgrounded · deadbeef · ${parsed.options.name}\n`);
+      queueMicrotask(() => child.emit('close', 0, null));
+      return child;
+    });
+    nativeRegistry().mockImplementation(() =>
+      registryReply(JSON.stringify([{ id: 'deadbeef', sessionId: session, state: 'stopped' }])),
+    );
+    const bind = receipts.standaloneSession.bind(receipts);
+    let changed = false;
+    vi.spyOn(receipts, 'standaloneSession').mockImplementation((launchId, nativeId) => {
+      const accepted = bind(launchId, nativeId);
+      if (nativeId && receipts.startup(id) && !changed) {
+        changed = true;
+        if (change === 'replacement') fs.renameSync(file, file + '.original');
+        fs.writeFileSync(file, change === 'rewrite' ? text.replace('{', '{ ') : text);
+      }
+      return accepted;
+    });
+    const bounds = { frameBytes: 65536, readBytes: 1024, workBytes: 128 * 1024 };
+    await superviseStandalone(receipts, id, false, bounds, frozenRuntime());
+    assert.equal(changed, true, 'The completed source changed after binding.');
+    assert.equal(receipts.startupRefused(id), true);
+    assert.equal(receipts.latest(id)?.availability, 'pending');
+    assert.equal(receipts.latest(id)?.report, null);
+    assert.equal(receipts.standaloneSession(id), session);
+    const accepted = JSON.parse(fs.readFileSync(path.join(receipts.root, id, 'accepted.json'), 'utf8'));
+    assert.equal(accepted.startupRequired, true);
+    assert.equal(vi.mocked(childProcess.spawn).mock.calls.length, 1);
+  },
+);
+
+test.each(['replacement', 'rewrite', 'append'] as const)(
+  'candidate completion preserves the first prefix across boundary %s',
+  async (change) => {
+    const { home, args } = fixture();
+    const root = path.join(home, 'native');
+    fs.mkdirSync(root);
+    const parsed = parseRun(args, { CODEX_BIN: process.execPath, ARC_CODEX_ROOT: root });
+    const receipts = new DispatchReceipts(home);
+    const { launchId: id } = admitParsed(receipts, parsed);
+    const file = path.join(root, `rollout-${session}.jsonl`);
+    const opening = JSON.stringify({ type: 'session_meta', payload: { id: session, cwd: home } }) + '\n';
+    const bounds = { frameBytes: 65536, readBytes: 1024, workBytes: 128 * 1024 };
+    const runtime = frozenRuntime();
+    const work = new ObservationWork(1000, runtime, bounds.workBytes);
+    const initial = await nativeSourceWitness(
+      receipts,
+      id,
+      parsed.options,
+      parsed.prompt,
+      bounds,
+      runtime,
+      1000,
+      false,
+      work,
+    );
+    fs.writeFileSync(file, opening.slice(0, 10));
+    assert.equal(await initial(session), 'pending');
+    const first = receipts.sourceCandidate(id);
+    assert.ok(first);
+    fs.appendFileSync(file, opening.slice(10));
+    const open = fs.openSync;
+    let sourceOpens = 0;
+    let changed = false;
+    vi.spyOn(fs, 'openSync').mockImplementation((target, ...rest) => {
+      if (String(target) === file && ++sourceOpens === 3) {
+        changed = true;
+        if (change === 'replacement') fs.renameSync(file, file + '.original');
+        if (change === 'append') fs.appendFileSync(file, '\n');
+        else fs.writeFileSync(file, change === 'rewrite' ? opening.replace('{', '{ ') : opening);
+      }
+      return Reflect.apply(open, fs, [target, ...rest]);
+    });
+    const recovered = await nativeSourceWitness(
+      receipts,
+      id,
+      parsed.options,
+      parsed.prompt,
+      bounds,
+      runtime,
+      1000,
+      true,
+      work,
+    );
+    const result = await recovered(session);
+    assert.equal(changed, true, 'The source changed on the opening after two validation opens.');
+    assert.equal(result, change === 'append' ? 'ready' : 'refused');
+    assert.equal(!!receipts.startup(id), change === 'append');
+    assert.deepEqual(receipts.sourceCandidate(id), first);
+    assert.equal(vi.mocked(childProcess.spawn).mock.calls.length, 0);
+  },
+);
+
+test.each(['live', 'recovery'] as const)(
+  'multi-chunk %s observation bounds witness reads and delivers the native report',
+  async (mode) => {
+    const { home, args } = fixture();
+    const root = path.join(home, 'native');
+    fs.mkdirSync(root);
+    for (let index = 0; index < 100; index++) fs.writeFileSync(path.join(root, `prior-${index}.jsonl`), '');
+    const parsed = parseRun(args, { CODEX_BIN: process.execPath, ARC_CODEX_ROOT: root });
+    const receipts = new DispatchReceipts(home);
+    const { launchId: id } = admitParsed(receipts, parsed);
+    const file = path.join(root, `rollout-${session}.jsonl`);
+    const opening = JSON.stringify({ type: 'session_meta', payload: { id: session, cwd: home } }) + '\n';
+    const output = jsonLines([
+      { type: 'thread.started', thread_id: session },
+      { type: 'turn.started' },
+      ...Array.from({ length: 100 }, (_, index) => ({
+        type: 'item.started',
+        item: { id: String(index), type: 'reasoning', text: 'x'.repeat(80) },
+      })),
+      { type: 'item.completed', item: { id: 'answer', type: 'agent_message', text: 'Report' } },
+      { type: 'turn.completed' },
+    ]);
+    const bounds = { frameBytes: 1024, readBytes: 128, workBytes: 256 * 1024 };
+    const runtime = frozenRuntime();
+    if (mode === 'recovery') {
+      await nativeSourceWitness(
+        receipts,
+        id,
+        parsed.options,
+        parsed.prompt,
+        bounds,
+        runtime,
+        1000,
+        false,
+        new ObservationWork(1000, runtime, bounds.workBytes),
+      );
+      receipts.observation(id, {
+        supervisor: { pid: process.pid, token: 'test' },
+        worker: null,
+        sessionId: null,
+        exitCode: 0,
+        signal: null,
+        monitor: 'observing',
+      });
+      fs.writeFileSync(receipts.artifact(id, 'stdout.log'), output);
+      fs.writeFileSync(receipts.artifact(id, 'stderr.log'), '');
+      fs.writeFileSync(file, opening);
+      fs.writeFileSync(receipts.artifact(id, 'native.md'), 'Report');
+    } else {
+      const child = providerChild();
+      vi.mocked(childProcess.spawn).mockImplementationOnce((_command, _args, settings) => {
+        fs.writeFileSync(file, opening);
+        fs.writeFileSync(receipts.artifact(id, 'native.md'), 'Report');
+        fs.writeSync((settings.stdio as number[])[1], output);
+        queueMicrotask(() => child.emit('close', 0, null));
+        return child;
+      });
+    }
+    const binary = path.join(receipts.root, id, 'source-paths.bin');
+    const read = fs.readSync;
+    let binaryBytes = 0;
+    vi.spyOn(fs, 'readSync').mockImplementation((...values) => {
+      if (fs.existsSync(binary)) {
+        const expected = fs.statSync(binary, { bigint: true });
+        const actual = fs.fstatSync(values[0], { bigint: true });
+        if (actual.dev === expected.dev && actual.ino === expected.ino)
+          binaryBytes += (values as unknown as number[])[3];
+      }
+      return Reflect.apply(read, fs, values);
+    });
+    const reserve = ObservationWork.prototype.reserve;
+    let requested = 0;
+    vi.spyOn(ObservationWork.prototype, 'reserve').mockImplementation(function (this: ObservationWork, bytes) {
+      requested += bytes;
+      return reserve.call(this, bytes);
+    });
+    await superviseStandalone(receipts, id, mode === 'recovery', bounds, runtime);
+    assert.ok(binaryBytes <= 2 * 100 * 32, `Repeated frames charged ${binaryBytes} binary bytes.`);
+    assert.ok(requested <= bounds.workBytes, `The observation requested ${requested} bytes.`);
+    assert.equal(receipts.latest(id)?.availability, 'available');
+    assert.equal(receipts.latest(id)?.outcome, 'succeeded');
+    assert.ok(receipts.startup(id));
+    assert.equal(vi.mocked(childProcess.spawn).mock.calls.length, mode === 'live' ? 1 : 0);
+  },
+);
+
+test.each(
+  (['claude', 'codex'] as const).flatMap((provider) =>
+    (['ready', 'unavailable'] as const).flatMap((preparation) =>
+      [60, 100].map((consumed) => ({ provider, preparation, consumed })),
+    ),
+  ),
+)(
+  'native $provider $preparation worker timer retains the deadline consumed by preparation at $consumed ms',
+  async ({ provider, preparation, consumed }) => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const { home, args } = fixture();
+    const root = path.join(home, 'native');
+    const parsed = parseRun(withProvider(args, provider), {
+      CLAUDE_BIN: process.execPath,
+      CODEX_BIN: process.execPath,
+      ARC_PROJECTS_ROOT: root,
+      ARC_CODEX_ROOT: root,
+    });
+    parsed.options.deadlineMs = 100;
+    const dir = provider === 'claude' ? path.join(root, projectSlug(home)) : root;
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'prior.jsonl'), '');
+    const receipts = new DispatchReceipts(home);
+    const { launchId: id } = admitParsed(receipts, parsed);
+    const child = providerChild();
+    vi.spyOn(child, 'unref').mockImplementation(() => {});
+    let started!: () => void;
+    const spawnReady = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    vi.mocked(childProcess.spawn).mockImplementationOnce(() => {
+      started();
+      return child;
+    });
+    let prepared = false;
+    if (preparation === 'unavailable')
+      vi.spyOn(fs.promises, 'opendir').mockImplementationOnce(async () => {
+        prepared = true;
+        await vi.advanceTimersByTimeAsync(consumed);
+        throw Object.assign(new Error('Session source directory is unavailable.'), { code: 'EACCES' });
+      });
+    const runtime = {
+      ...frozenRuntime(),
+      now: () => Date.now(),
+      yield: async () => {
+        if (!prepared) {
+          prepared = true;
+          await vi.advanceTimersByTimeAsync(consumed);
+        }
+      },
+    };
+    let finished = false;
+    const pending = superviseStandalone(
+      receipts,
+      id,
+      false,
+      { frameBytes: 1024, readBytes: 128, workBytes: 65536 },
+      runtime,
+    ).then((status) => {
+      finished = true;
+      return status;
+    });
+    await spawnReady;
+    assert.equal(Date.now(), consumed);
+    assert.equal(receipts.sourceBaseline(id)?.state, preparation);
+    if (consumed < 100) await vi.advanceTimersByTimeAsync(100 - consumed - 1);
+    assert.equal(finished, false);
+    await vi.advanceTimersByTimeAsync(consumed < 100 ? 1 : 0);
+    assert.equal(finished, true, 'The open worker must stop observation at the original deadline.');
+    await pending;
+    assert.equal(receipts.observation(id)?.monitor, 'timed-out');
+    assert.equal(vi.mocked(childProcess.spawn).mock.calls.length, 1);
+  },
+);
+
+test.each([
+  'source arrives',
+  'cancelled',
+  'receipt removed',
+  'receipt removed at release',
+  'anchor removed',
+  'receipt replaced',
+  'receipt redirected',
+] as const)('pending source observation handles %s through bounded wakeups after provider exit', async (mode) => {
+  const { home, args } = fixture();
+  const root = path.join(home, 'native');
+  fs.mkdirSync(root);
+  const parsed = parseRun(args, { CODEX_BIN: process.execPath, ARC_CODEX_ROOT: root });
+  parsed.options.deadlineMs = 500;
+  const receipts = new DispatchReceipts(home);
+  const { launchId: id } = admitParsed(receipts, parsed);
+  const file = path.join(root, `rollout-${session}.jsonl`);
+  const child = providerChild();
+  vi.mocked(childProcess.spawn).mockImplementationOnce((_command, _args, settings) => {
+    fs.writeFileSync(receipts.artifact(id, 'native.md'), 'Report');
+    fs.writeSync(
+      (settings.stdio as number[])[1],
+      jsonLines([
+        { type: 'thread.started', thread_id: session },
+        { type: 'turn.started' },
+        { type: 'item.completed', item: { id: 'answer', type: 'agent_message', text: 'Report' } },
+        { type: 'turn.completed' },
+      ]),
+    );
+    queueMicrotask(() => child.emit('close', 0, null));
+    return child;
+  });
+  const controller = new AbortController();
+  let clock = 0;
+  let wakes = 0;
+  let settled = false;
+  const directory = path.join(receipts.root, id);
+  const monitor = path.join(directory, 'monitor.json');
+  let retainedMonitor: Buffer | undefined;
+  let retainedFiles: string[] | undefined;
+  const lstat = fs.lstatSync;
+  if (mode === 'receipt removed at release') {
+    const monitorClaim = receipts.monitor.bind(receipts);
+    vi.spyOn(receipts, 'monitor').mockImplementation((...values) => {
+      const owner = monitorClaim(...values);
+      return {
+        ...owner,
+        release: () => {
+          fs.unlinkSync(path.join(directory, 'receipt.json'));
+          settled = true;
+          retainedMonitor = fs.readFileSync(monitor);
+          retainedFiles = fs.readdirSync(directory).sort();
+          owner.release();
+        },
+      };
+    });
+  }
+  if (mode === 'receipt redirected')
+    vi.spyOn(fs, 'lstatSync').mockImplementation((target, ...rest) => {
+      const result = Reflect.apply(lstat, fs, [target, ...rest]);
+      return settled && String(target) === directory
+        ? Object.assign(Object.create(result!), { isSymbolicLink: () => true })
+        : result;
+    });
+  const opendir = fs.promises.opendir;
+  let catalogReadsAfterCancel = 0;
+  vi.spyOn(fs.promises, 'opendir').mockImplementation(async (...values) => {
+    if (controller.signal.aborted || settled) catalogReadsAfterCancel++;
+    return Reflect.apply(opendir, fs.promises, values);
+  });
+  const runtime = {
+    ...frozenRuntime(),
+    signal: controller.signal,
+    now: () => clock,
+    yield: async () => {
+      clock += 10;
+    },
+    wait: async (duration: number) => {
+      wakes++;
+      clock += duration;
+      assert.ok(duration > 0 && duration <= 100);
+      if (mode === 'source arrives' || mode === 'receipt removed at release')
+        fs.writeFileSync(file, JSON.stringify({ type: 'session_meta', payload: { id: session, cwd: home } }) + '\n');
+      else if (mode === 'cancelled') {
+        controller.abort();
+        if (wakes > 1) clock = 500;
+      } else {
+        const receipt = path.join(directory, 'receipt.json');
+        if (mode === 'receipt removed') fs.unlinkSync(receipt);
+        if (mode === 'anchor removed') fs.unlinkSync(path.join(receipts.root, `${id}.json`));
+        if (mode === 'receipt replaced') {
+          const bytes = fs.readFileSync(receipt);
+          fs.renameSync(receipt, receipt + '.original');
+          fs.writeFileSync(receipt, bytes);
+        }
+        settled = true;
+        retainedMonitor = fs.readFileSync(monitor);
+        retainedFiles = fs.readdirSync(directory).sort();
+      }
+    },
+  };
+  const pending = superviseStandalone(
+    receipts,
+    id,
+    false,
+    { frameBytes: 1024, readBytes: 128, workBytes: 65536 },
+    runtime,
+  );
+  if (mode === 'receipt replaced') await assert.rejects(pending, /authoritative dispatch receipt was replaced/);
+  else if (mode === 'receipt redirected') await assert.rejects(pending, /dispatch path is redirected/);
+  else await pending;
+  if (settled) {
+    assert.deepEqual(
+      fs.readFileSync(monitor),
+      retainedMonitor,
+      'Missing or replaced receipt evidence grants no ownership writes.',
+    );
+    assert.deepEqual(
+      fs.readdirSync(directory).sort(),
+      retainedFiles,
+      'The private witness tail must not recreate receipt artifacts.',
+    );
+  } else assert.equal(!!receipts.startup(id), mode === 'source arrives');
+  assert.equal(catalogReadsAfterCancel, 0, 'Cancellation must stop source enumeration.');
+  assert.equal(wakes, 1, 'Pending source observation must use one runtime wakeup.');
+  if (mode === 'source arrives') assert.equal(receipts.latest(id)?.availability, 'available');
+  assert.equal(vi.mocked(childProcess.spawn).mock.calls.length, 1);
+});
+
+test.each(['source arrives', 'receipt removed'] as const)(
+  'dedicated supervisor releases its working folder during pending readiness: %s',
+  { tags: ['subprocess'], timeout: PROCESS_CASE },
+  async (mode) => {
+    const { home, args } = fixture();
+    const directory = path.join(home, 'working');
+    const root = path.join(home, 'native');
+    fs.mkdirSync(directory);
+    fs.mkdirSync(root);
+    const parsed = parseRun(
+      args.map((value) => (value === home ? directory : value)),
+      {
+        CODEX_BIN: process.execPath,
+        ARC_CODEX_ROOT: root,
+      },
+    );
+    const receipts = new DispatchReceipts(directory);
+    const output = jsonLines([
+      { type: 'thread.started', thread_id: session },
+      { type: 'turn.started' },
+      { type: 'item.completed', item: { id: 'answer', type: 'agent_message', text: 'Report' } },
+      { type: 'turn.completed' },
+    ]);
+    parsed.options.args = [
+      '-e',
+      `const fs=require('fs'),path=require('path');const [receipt]=fs.readdirSync('dispatch',{withFileTypes:true}).filter(entry=>entry.isDirectory());fs.writeFileSync(path.join('dispatch',receipt.name,'native.md'),'Report');process.stdout.write(${JSON.stringify(output)})`,
+      '--',
+    ];
+    const admitted = admitParsed(receipts, parsed);
+    const entry = await bundled(
+      'pending-supervisor.cjs',
+      `
+      import fs from 'node:fs';
+      import {DispatchReceipts} from './extension/src/dispatchreceipts.ts';
+      import {superviseStandalone,standaloneProcessIdentity} from './cli/src/standalone.ts';
+      const receipts=new DispatchReceipts();
+      const id=process.argv[3];
+      const runtime={now:()=>Date.now(),identity:standaloneProcessIdentity,yield:()=>new Promise(r=>setImmediate(r)),
+        wait:()=>new Promise(resolve=>{
+          const descriptor=fs.fstatSync(2,{bigint:true});
+          process.stderr.write('pending diagnostic\\n');
+          process.send({kind:'pending',cwd:process.cwd(),pid:process.pid,descriptor:descriptor.dev+':'+descriptor.ino});
+          process.once('message',()=>resolve());
+        })};
+      superviseStandalone(receipts,id,false,undefined,runtime).then(()=>{
+        process.stderr.write('tail diagnostic\\n');
+        process.send({kind:'settled',ready:fs.existsSync(receipts.root)?!!receipts.startup(id):null});
+        process.disconnect();
+      }).catch(error=>{console.error(error);process.exitCode=1;process.disconnect()});
+    `,
+    );
+    const diagnostic = receipts.artifact(admitted.launchId, 'stderr.log');
+    const inherited = fs.openSync(diagnostic, 'a', 0o600);
+    const observed = fs.openSync(diagnostic, 'r');
+    const identity = fs.fstatSync(inherited, { bigint: true });
+    const messages: any[] = [];
+    const child = spawn(process.execPath, [entry, '__standalone-supervise', admitted.launchId], {
+      cwd: directory,
+      env: { ...process.env, ARC_HOME: directory },
+      windowsHide: true,
+      detached: true,
+      stdio: ['ignore', 'ignore', inherited, 'ipc'],
+    });
+    fs.closeSync(inherited);
+    child.on('message', (message) => messages.push(message));
+    const closed = once(child, 'close');
+    try {
+      await vi.waitFor(
+        () => assert.ok(messages.some((message) => message.kind === 'pending') || child.exitCode !== null),
+        PROCESS_WAIT,
+      );
+      const pending = messages.find((message) => message.kind === 'pending');
+      assert.ok(pending, fs.readFileSync(diagnostic, 'utf8'));
+      const pid = child.pid;
+      assert.ok(pid);
+      assert.equal(processAlive(pid), true);
+      assert.equal(pending.pid, pid);
+      assert.equal(pending.descriptor, `${identity.dev}:${identity.ino}`);
+      const owner = JSON.parse(fs.readFileSync(path.join(receipts.root, admitted.launchId, 'monitor.json'), 'utf8'));
+      assert.equal(owner.released, true);
+      assert.equal(owner.phase, 'witness-pending');
+      assert.equal(receipts.latest(admitted.launchId)?.outcome, 'succeeded');
+      if (mode === 'receipt removed') {
+        assert.equal(path.dirname(directory), home);
+        fs.rmSync(directory, { recursive: true });
+        assert.equal(processAlive(pid), true, 'The pending supervisor must stay alive while its folder is removed.');
+      } else {
+        fs.writeFileSync(
+          path.join(root, `rollout-${session}.jsonl`),
+          JSON.stringify({
+            type: 'session_meta',
+            payload: { id: session, cwd: directory },
+          }) + '\n',
+        );
+      }
+      assert.equal(pending.cwd, fs.realpathSync.native(path.parse(process.execPath).root));
+      child.send('resume');
+      await vi.waitFor(() => assert.ok(messages.some((message) => message.kind === 'settled')), PROCESS_WAIT);
+      const result = messages.find((message) => message.kind === 'settled');
+      assert.equal(result.ready, mode === 'source arrives' ? true : null);
+      assert.deepEqual(await closed, [0, null]);
+      const bytes = Buffer.alloc(Number(fs.fstatSync(observed).size));
+      fs.readSync(observed, bytes, 0, bytes.length, 0);
+      assert.equal(bytes.toString(), 'pending diagnostic\ntail diagnostic\n');
+      if (mode === 'receipt removed') assert.equal(fs.existsSync(directory), false);
+    } finally {
+      if (child.exitCode === null && child.signalCode === null) {
+        if (child.connected) child.send('resume');
+        child.kill();
+        await closed;
+      }
+      fs.closeSync(observed);
+    }
+  },
+);
+
+test.each(['missing drive', 'redirected ancestor', 'unavailable cwd'] as const)(
+  'preparation retains unavailable evidence for %s and launches one ordinary worker',
+  async (mode) => {
+    const { home, args } = fixture();
+    const root = mode === 'missing drive' ? 'Z:\\ArcUnavailable' : path.join(home, 'native');
+    if (mode !== 'missing drive') fs.mkdirSync(root);
+    const parsed = parseRun(args, { CODEX_BIN: process.execPath, ARC_CODEX_ROOT: root });
+    const receipts = new DispatchReceipts(home);
+    const { launchId: id } = admitParsed(receipts, parsed);
+    let missingChecks = 0;
+    if (mode === 'missing drive') {
+      const exists = fs.existsSync;
+      vi.spyOn(fs, 'existsSync').mockImplementation((target) => {
+        if (String(target).toLowerCase().startsWith('z:')) return ++missingChecks > 3;
+        return exists(target);
+      });
+    } else if (mode === 'redirected ancestor') {
+      const lstat = fs.lstatSync;
+      vi.spyOn(fs, 'lstatSync').mockImplementation((target, ...rest) => {
+        const result = Reflect.apply(lstat, fs, [target, ...rest]);
+        if (String(target) === root) return Object.assign(Object.create(result!), { isSymbolicLink: () => true });
+        return result;
+      });
+    } else {
+      const realpath = fs.realpathSync.native;
+      let unavailable = true;
+      vi.spyOn(fs.realpathSync, 'native').mockImplementation((target, ...rest) => {
+        if (String(target) === home && unavailable) {
+          unavailable = false;
+          throw Object.assign(new Error('Working directory is unavailable.'), { code: 'ENOENT' });
+        }
+        return Reflect.apply(realpath, fs.realpathSync, [target, ...rest]);
+      });
+    }
+    const child = providerChild();
+    vi.mocked(childProcess.spawn).mockImplementationOnce((_command, _args, settings) => {
+      fs.writeFileSync(receipts.artifact(id, 'native.md'), 'Report');
+      fs.writeSync(
+        (settings.stdio as number[])[1],
+        jsonLines([
+          { type: 'thread.started', thread_id: session },
+          { type: 'turn.started' },
+          { type: 'item.completed', item: { id: 'answer', type: 'agent_message', text: 'Report' } },
+          { type: 'turn.completed' },
+        ]),
+      );
+      queueMicrotask(() => child.emit('close', 0, null));
+      return child;
+    });
+    await superviseStandalone(
+      receipts,
+      id,
+      false,
+      { frameBytes: 1024, readBytes: 128, workBytes: 65536 },
+      { ...frozenRuntime(), platform: 'win32' },
+    );
+    assert.equal(receipts.sourceBaseline(id)?.state, 'unavailable');
+    if (mode === 'missing drive')
+      assert.equal(missingChecks, 2, 'The missing drive root must stop at its fixed point.');
+    assert.equal(receipts.latest(id)?.availability, 'available');
+    assert.equal(receipts.latest(id)?.outcome, 'succeeded');
+    assert.equal(receipts.startup(id), null);
+    assert.equal(vi.mocked(childProcess.spawn).mock.calls.length, 1);
+    await superviseStandalone(
+      receipts,
+      id,
+      true,
+      { frameBytes: 1024, readBytes: 128, workBytes: 65536 },
+      frozenRuntime(),
+    );
+    assert.equal(vi.mocked(childProcess.spawn).mock.calls.length, 1);
+  },
+);
+
+test.each(['ready', 'unavailable'] as const)(
+  'background requests and wakeups retain the deadline consumed by preparation with %s evidence',
+  async (preparation) => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const { home, args } = fixture();
+    const root = path.join(home, 'native');
+    const parsed = parseRun(withProvider(args, 'claude'), { CLAUDE_BIN: process.execPath, ARC_PROJECTS_ROOT: root });
+    parsed.options.deadlineMs = 100;
+    const dir = path.join(root, projectSlug(home));
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'prior.jsonl'), '');
+    const receipts = new DispatchReceipts(home);
+    const { launchId: id } = admitParsed(receipts, parsed);
+    const child = providerChild();
+    vi.mocked(childProcess.spawn).mockImplementationOnce((_command, _args, settings) => {
+      fs.writeFileSync(
+        path.join(dir, `${session}.jsonl`),
+        jsonLines([{ ...claudeUser(parsed.prompt), sessionId: session, cwd: home }]),
+      );
+      fs.writeSync((settings.stdio as number[])[1], `backgrounded · deadbeef · ${parsed.options.name}\n`);
+      queueMicrotask(() => child.emit('close', 0, null));
+      return child;
+    });
+    const timeouts: number[] = [];
+    nativeRegistry().mockImplementation((_command, _args, settings) => {
+      timeouts.push(Number((settings as childProcess.ExecFileOptions).timeout));
+      return registryReply(JSON.stringify([{ id: 'deadbeef', sessionId: session, state: 'working' }]));
+    });
+    let prepared = false;
+    if (preparation === 'unavailable')
+      vi.spyOn(fs.promises, 'opendir').mockImplementationOnce(async () => {
+        prepared = true;
+        await vi.advanceTimersByTimeAsync(60);
+        throw Object.assign(new Error('Session source directory is unavailable.'), { code: 'EACCES' });
+      });
+    const wakes: number[] = [];
+    const runtime = {
+      ...frozenRuntime(),
+      now: () => Date.now(),
+      yield: async () => {
+        if (!prepared) {
+          prepared = true;
+          await vi.advanceTimersByTimeAsync(60);
+        }
+      },
+      wait: async (duration: number) => {
+        wakes.push(duration);
+        await vi.advanceTimersByTimeAsync(duration);
+      },
+    };
+    await superviseStandalone(receipts, id, false, { frameBytes: 1024, readBytes: 128, workBytes: 65536 }, runtime);
+    assert.deepEqual(timeouts, [40], 'Registry requests must use only the original remaining duration.');
+    assert.deepEqual(wakes, [40], 'Background waiting must end at the original deadline.');
+    assert.equal(Date.now(), 100);
+    assert.equal(receipts.sourceBaseline(id)?.state, preparation);
+    assert.equal(receipts.observation(id)?.monitor, 'timed-out');
+    assert.equal(vi.mocked(childProcess.spawn).mock.calls.length, 1);
   },
 );

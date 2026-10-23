@@ -26,6 +26,7 @@ import {
 import { savedDispatchResponse } from '../../extension/src/sessionreads.ts';
 import { childEnv } from '../../extension/src/agenthost.ts';
 import { shortenTo } from '../../extension/src/domain/text.ts';
+import { enumerateRolloutFilesAsync, openingRecordOf, CODEX_OPENING_BYTES } from '../../extension/src/codex.ts';
 
 const execute = promisify(execFile);
 const REPORT_BYTES = 8 * 1024 * 1024;
@@ -33,6 +34,9 @@ const FRAME_BYTES = 49 * 1024 * 1024;
 const READ_BYTES = 64 * 1024;
 type ReadBounds = { frameBytes: number; readBytes: number; workBytes?: number };
 interface ObservationRuntime {
+  wait?: (milliseconds: number) => Promise<void>;
+  signal?: AbortSignal;
+  platform?: NodeJS.Platform;
   now: () => number;
   identity: typeof standaloneProcessIdentity;
   yield: () => Promise<void>;
@@ -66,18 +70,23 @@ const CONTEXT_KEYS = [
   'CLAUDE_CODE_PROMPT_CACHE_TTL',
 ];
 
-export function standaloneContext(env: NodeJS.ProcessEnv, cwd: string): Record<string, string | null> {
+export function standaloneContext(
+  env: NodeJS.ProcessEnv,
+  cwd: string,
+  platform = process.platform,
+): Record<string, string | null> {
+  const paths = platform === 'win32' ? path.win32 : path.posix;
   const context = Object.fromEntries(
     CONTEXT_KEYS.map((key) => [key, env[Object.keys(env).find((name) => name.toUpperCase() === key) ?? key] ?? null]),
   );
-  const home = context[process.platform === 'win32' ? 'USERPROFILE' : 'HOME'] || os.homedir();
-  if (context.CLAUDE_CONFIG_DIR) context.CLAUDE_CONFIG_DIR = path.resolve(cwd, context.CLAUDE_CONFIG_DIR);
-  context.CODEX_HOME = path.resolve(cwd, context.CODEX_HOME || path.join(home, '.codex'));
-  context.ARC_PROJECTS_ROOT = path.resolve(
+  const home = context[platform === 'win32' ? 'USERPROFILE' : 'HOME'] || os.homedir();
+  if (context.CLAUDE_CONFIG_DIR) context.CLAUDE_CONFIG_DIR = paths.resolve(cwd, context.CLAUDE_CONFIG_DIR);
+  context.CODEX_HOME = paths.resolve(cwd, context.CODEX_HOME || paths.join(home, '.codex'));
+  context.ARC_PROJECTS_ROOT = paths.resolve(
     cwd,
-    context.ARC_PROJECTS_ROOT || path.join(context.CLAUDE_CONFIG_DIR || path.join(home, '.claude'), 'projects'),
+    context.ARC_PROJECTS_ROOT || paths.join(context.CLAUDE_CONFIG_DIR || paths.join(home, '.claude'), 'projects'),
   );
-  context.ARC_CODEX_ROOT = path.resolve(cwd, context.ARC_CODEX_ROOT || path.join(context.CODEX_HOME, 'sessions'));
+  context.ARC_CODEX_ROOT = paths.resolve(cwd, context.ARC_CODEX_ROOT || paths.join(context.CODEX_HOME, 'sessions'));
   return context;
 }
 
@@ -298,6 +307,7 @@ function* logChunks(
   readBytes: number,
   cursor = { offset: 0, identity: '' },
   workBytes = Infinity,
+  observationWork?: ObservationWork,
 ): Generator<Buffer, boolean> {
   safeDispatchPath(file);
   const fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
@@ -310,7 +320,9 @@ function* logChunks(
     const end = Math.min(Number(stat.size), cursor.offset + workBytes);
     const buffer = Buffer.alloc(readBytes);
     while (cursor.offset < end) {
-      const count = fs.readSync(fd, buffer, 0, Math.min(buffer.length, end - cursor.offset), cursor.offset);
+      const length = Math.min(buffer.length, end - cursor.offset, observationWork?.remaining ?? Infinity);
+      if (length <= 0 || (observationWork && !observationWork.reserve(length))) return false;
+      const count = fs.readSync(fd, buffer, 0, length, cursor.offset);
       if (!count) throw new Error('The provider output changed during the read.');
       cursor.offset += count;
       yield buffer.subarray(0, count);
@@ -639,12 +651,375 @@ export function readNativeReport(file: string): string | null {
   }
 }
 
+export class ObservationWork {
+  remaining: number;
+  exhausted = false;
+  cancelled = false;
+  constructor(
+    readonly deadline: number,
+    readonly runtime: ObservationRuntime,
+    bytes: number,
+  ) {
+    this.remaining = bytes;
+    runtime.signal?.addEventListener(
+      'abort',
+      () => {
+        this.cancelled = true;
+      },
+      { once: true },
+    );
+    this.cancelled = runtime.signal?.aborted ?? false;
+  }
+  reserve(bytes: number): boolean {
+    if (this.cancelled || this.exhausted || this.runtime.now() >= this.deadline || bytes > this.remaining) {
+      this.exhausted = true;
+      return false;
+    }
+    this.remaining -= bytes;
+    return true;
+  }
+}
+type WitnessState = 'pending' | 'ready' | 'refused' | 'exhausted';
+export function sourceDigest(file: string, platform = process.platform): Buffer {
+  const paths = platform === 'win32' ? path.win32 : path.posix;
+  const resolved = paths.resolve(file);
+  return createHash('sha256')
+    .update(platform === 'win32' ? resolved.toLowerCase() : resolved)
+    .digest();
+}
+
+export async function nativeSourceWitness(
+  receipts: DispatchReceipts,
+  id: string,
+  options: StandaloneOptions,
+  prompt: string,
+  bounds: ReadBounds,
+  runtime: ObservationRuntime,
+  deadline: number,
+  recovery: boolean,
+  work: ObservationWork,
+) {
+  const foreground = options.provider === 'claude' && !options.background;
+  if (foreground && !recovery) return async (_sessionId: string): Promise<WitnessState> => 'ready';
+  const paths = (runtime.platform ?? process.platform) === 'win32' ? path.win32 : path.posix;
+  const context = standaloneContext(standaloneEnvironment(options), options.cwd, runtime.platform);
+  const root =
+    options.provider === 'claude'
+      ? paths.join(context.ARC_PROJECTS_ROOT!, projectSlug(options.cwd))
+      : context.ARC_CODEX_ROOT!;
+  const spend = (bytes: number) => {
+    if (!work.reserve(bytes)) throw new Error('Session source observation reached its limit.');
+  };
+  const catalog = async () => {
+    const readDirectory = async (dir: string) => {
+      const entries: fs.Dirent[] = [];
+      const handle = await fs.promises.opendir(dir);
+      try {
+        for await (const entry of handle) {
+          spend(128 + Buffer.byteLength(paths.join(dir, entry.name)));
+          entries.push(entry);
+        }
+      } finally {
+        await handle.close().catch(() => {});
+      }
+      return entries;
+    };
+    if (options.provider === 'codex') {
+      const found = await enumerateRolloutFilesAsync(root, undefined, readDirectory);
+      if (!found || found.status !== 'complete' || work.exhausted || runtime.now() >= deadline)
+        throw new Error('Session sources are unavailable.');
+      return [...found.files];
+    }
+    try {
+      return (await readDirectory(root))
+        .filter((entry) => entry.isFile() && entry.name.endsWith('.jsonl'))
+        .map((entry) => paths.join(root, entry.name));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+      throw error;
+    }
+  };
+  let baseline: ReturnType<DispatchReceipts['sourceBaseline']> = null;
+  try {
+    baseline = receipts.sourceBaseline(id);
+    if (!baseline && !recovery && !foreground) {
+      const preparation = { root, ancestor: root, directory: '0:0', cwd: options.cwd };
+      try {
+        let ancestor = root;
+        while (!fs.existsSync(ancestor)) {
+          const parent = paths.dirname(ancestor);
+          if (parent === ancestor) throw new Error('Session source root is unavailable.');
+          ancestor = parent;
+        }
+        safeDispatchPath(ancestor, runtime.platform);
+        const stat = fs.statSync(ancestor, { bigint: true });
+        preparation.ancestor = ancestor;
+        preparation.directory = `${stat.dev}:${stat.ino}`;
+        preparation.cwd = fs.realpathSync.native(options.cwd);
+        safeDispatchPath(root, runtime.platform);
+        const files = await catalog();
+        const file = receipts.artifact(id, 'source-paths.bin');
+        const fd = fs.openSync(file, 'wx', 0o600);
+        const digest = createHash('sha256');
+        try {
+          for (let index = 0; index < files.length; index++) {
+            spend(Buffer.byteLength(files[index]) + 32);
+            const bytes = sourceDigest(files[index], runtime.platform);
+            fs.writeSync(fd, bytes);
+            digest.update(bytes);
+            if (index % 256 === 0) await runtime.yield();
+          }
+          const binary = fs.fstatSync(fd, { bigint: true });
+          baseline = {
+            ...preparation,
+            state: 'ready',
+            binary: {
+              file,
+              identity: `${binary.dev}:${binary.ino}`,
+              bytes: files.length * 32,
+              count: files.length,
+              sha256: digest.digest('hex'),
+            },
+          };
+        } finally {
+          fs.closeSync(fd);
+        }
+        receipts.sourceBaseline(id, baseline);
+      } catch {
+        baseline = { ...preparation, state: 'unavailable' };
+        receipts.sourceBaseline(id, baseline);
+      }
+    }
+  } catch {
+    // A missing retained witness supplies no historical exclusion evidence.
+    baseline = null;
+  }
+  if (foreground) {
+    try {
+      if (receipts.startup(id)) return async (_sessionId: string): Promise<WitnessState> => 'ready';
+      const held = receipts.sourceCandidate(id);
+      if (held) baseline = { root, ancestor: held.ancestor, directory: held.directory, cwd: held.cwd, state: 'ready' };
+    } catch {
+      baseline = null;
+    }
+  }
+  const excluded = async (file: string) => {
+    const held = baseline?.binary;
+    if (!held) throw new Error('The original session source is unavailable.');
+    safeDispatchPath(held.file);
+    const fd = fs.openSync(held.file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+    try {
+      const before = fs.fstatSync(fd, { bigint: true });
+      if (`${before.dev}:${before.ino}` !== held.identity || Number(before.size) !== held.bytes)
+        throw new Error('The original session source was replaced.');
+      const digest = createHash('sha256');
+      const needle = sourceDigest(file, runtime.platform);
+      const buffer = Buffer.alloc(READ_BYTES);
+      let found = false;
+      for (let offset = 0; offset < held.bytes;) {
+        const length = Math.min(buffer.length, held.bytes - offset);
+        spend(length);
+        const count = fs.readSync(fd, buffer, 0, length, offset);
+        if (count !== length) throw new Error('The original session source changed.');
+        digest.update(buffer.subarray(0, count));
+        for (let at = 0; at < count; at += 32) if (buffer.subarray(at, at + 32).equals(needle)) found = true;
+        offset += count;
+        await runtime.yield();
+      }
+      const after = fs.lstatSync(held.file, { bigint: true });
+      if (!isDeepStrictEqual(revisionOf(before), revisionOf(after)) || digest.digest('hex') !== held.sha256)
+        throw new Error('The original session source changed.');
+      return found;
+    } finally {
+      fs.closeSync(fd);
+    }
+  };
+  let pending = Promise.resolve();
+  let validated = false;
+  return (sessionId: string): Promise<WitnessState> => {
+    const check = async () => {
+      validated = false;
+      if (!baseline || baseline.state !== 'ready' || work.exhausted || receipts.startupRefused(id)) return;
+      try {
+        if (!foreground) receipts.sourceBaseline(id);
+        const parent = fs.statSync(baseline.ancestor, { bigint: true });
+        safeDispatchPath(root, runtime.platform);
+        if (
+          baseline.root !== root ||
+          `${parent.dev}:${parent.ino}` !== baseline.directory ||
+          fs.realpathSync.native(options.cwd) !== baseline.cwd
+        ) {
+          receipts.startupRefused(id, true);
+          return;
+        }
+        const accepted = receipts.startup(id);
+        if (accepted) {
+          receipts.sourceCandidate(id);
+          if (!foreground && (await excluded(accepted.file))) return;
+          validated = true;
+          return;
+        }
+        const files = (foreground ? [paths.join(root, `${sessionId}.jsonl`)] : await catalog()).filter((file) =>
+          options.provider === 'claude'
+            ? paths.basename(file) === `${sessionId}.jsonl`
+            : file.toLowerCase().endsWith(`-${sessionId.toLowerCase()}.jsonl`),
+        );
+        if (files.length > 1) {
+          receipts.startupRefused(id, true);
+          return;
+        }
+        const file = files[0];
+        if (!file) return;
+        if (!foreground && (await excluded(file))) {
+          receipts.startupRefused(id, true);
+          return;
+        }
+        safeDispatchPath(file, runtime.platform);
+        const ancestor = paths.dirname(file);
+        const directory = fs.statSync(ancestor, { bigint: true });
+        const candidate = receipts.sourceCandidate(id);
+        if (candidate && !(await startupContinuous(receipts, id, options, bounds, runtime, deadline, candidate, work)))
+          return;
+        const limit = options.provider === 'codex' ? CODEX_OPENING_BYTES : bounds.frameBytes;
+        let bytes = Buffer.alloc(0);
+        let identity = '';
+        let revision: ReturnType<typeof revisionOf> | null = null;
+        let matches = false;
+        while (bytes.length < limit) {
+          const qualified = readQualifiedOpening(file, (fd) => {
+            const stat = fs.fstatSync(fd, { bigint: true });
+            const length = Math.min(
+              bounds.readBytes,
+              READ_BYTES,
+              limit - bytes.length,
+              Math.max(0, Number(stat.size) - bytes.length),
+            );
+            spend(length);
+            const buffer = Buffer.alloc(length);
+            const count = fs.readSync(fd, buffer, 0, length, bytes.length);
+            return { identity: `${stat.dev}:${stat.ino}`, bytes: buffer.subarray(0, count), size: Number(stat.size) };
+          });
+          if (!qualified) return;
+          if (revision && !isDeepStrictEqual(revision, qualified.revision)) return;
+          revision = qualified.revision;
+          identity = qualified.value.identity;
+          bytes = Buffer.concat([bytes, qualified.value.bytes]);
+          if (!candidate && bytes.length && !receipts.sourceCandidate(id))
+            receipts.sourceCandidate(id, {
+              file,
+              identity,
+              ancestor,
+              directory: `${directory.dev}:${directory.ino}`,
+              cwd: baseline.cwd,
+              bytes: bytes.length,
+              sha256: createHash('sha256').update(bytes).digest('hex'),
+            });
+          if (!qualified.value.bytes.length) return;
+          const end = bytes.indexOf(10);
+          if (options.provider === 'codex') {
+            if (end >= 0 || (bytes.length === qualified.value.size && bytes.length < CODEX_OPENING_BYTES)) {
+              try {
+                const meta = openingRecordOf(
+                  new TextDecoder('utf8', { fatal: true }).decode(end >= 0 ? bytes.subarray(0, end) : bytes),
+                );
+                matches =
+                  meta?.sessionId === sessionId && !!meta.cwd && fs.realpathSync.native(meta.cwd) === baseline.cwd;
+              } catch {
+                return;
+              }
+              break;
+            }
+          } else if (end >= 0) {
+            for (const line of bytes.subarray(0, bytes.lastIndexOf(10)).toString('utf8').split('\n')) {
+              const row = JSON.parse(line);
+              if (row.type !== 'user') continue;
+              const content = row.message?.content;
+              const text =
+                typeof content === 'string'
+                  ? content
+                  : Array.isArray(content) &&
+                      content.every((part) => part?.type === 'text' && typeof part.text === 'string')
+                    ? content.map((part) => part.text).join('\n')
+                    : null;
+              matches =
+                row.sessionId === sessionId &&
+                row.message?.role === 'user' &&
+                !row.isSidechain &&
+                !row.isMeta &&
+                !!row.uuid &&
+                typeof row.cwd === 'string' &&
+                fs.realpathSync.native(row.cwd) === baseline.cwd &&
+                text === prompt;
+              if (!matches) receipts.startupRefused(id, true);
+              break;
+            }
+            if (matches) break;
+          }
+          if (bytes.length >= qualified.value.size) return;
+          await runtime.yield();
+        }
+        if (!matches) return;
+        const first = candidate ?? receipts.sourceCandidate(id);
+        if (
+          first &&
+          (identity !== first.identity ||
+            bytes.length < first.bytes ||
+            createHash('sha256').update(bytes.subarray(0, first.bytes)).digest('hex') !== first.sha256)
+        ) {
+          receipts.startupRefused(id, true);
+          return;
+        }
+        const complete = {
+          file,
+          identity,
+          ancestor,
+          directory: `${directory.dev}:${directory.ino}`,
+          cwd: baseline.cwd,
+          bytes: bytes.length,
+          sha256: createHash('sha256').update(bytes).digest('hex'),
+        };
+        if (await startupContinuous(receipts, id, options, bounds, runtime, deadline, complete, work)) {
+          receipts.startup(id, complete);
+          validated = true;
+        }
+      } catch {
+        /* Missing or incomplete sources retain pending evidence. */
+      }
+    };
+    pending = pending
+      .then(async () => {
+        await check();
+        if (receipts.startup(id))
+          validated =
+            (await startupContinuous(receipts, id, options, bounds, runtime, deadline, undefined, work)) && validated;
+      })
+      .catch(() => {});
+    return pending.then(() => {
+      try {
+        return receipts.startupRefused(id)
+          ? 'refused'
+          : work.exhausted || work.remaining <= 0 || runtime.now() >= deadline
+            ? 'exhausted'
+            : receipts.startup(id) && validated
+              ? 'ready'
+              : baseline?.state === 'ready'
+                ? 'pending'
+                : 'exhausted';
+      } catch {
+        return 'exhausted';
+      }
+    });
+  };
+}
+
 // A new native user record binds the print launch before its final stdout arrives.
 function claudeStartup(
   options: StandaloneOptions,
   prompt: string,
   bounds: ReadBounds,
   retain: (evidence: StandaloneStartup) => void,
+  work?: ObservationWork,
+  retainCandidate?: (evidence: StandaloneStartup) => void,
 ) {
   if (options.provider !== 'claude' || options.background || !options.sessionHint || !options.env?.ARC_PROJECTS_ROOT)
     return null;
@@ -696,14 +1071,16 @@ function claudeStartup(
         const buffer = Buffer.alloc(Math.min(bounds.readBytes, READ_BYTES));
         let offset = 0;
         while (offset < opening.length) {
-          const count = fs.readSync(fd, buffer, 0, Math.min(buffer.length, opening.length - offset), offset);
+          const length = Math.min(buffer.length, opening.length - offset);
+          if (work && !work.reserve(length)) return { refused: false };
+          const count = fs.readSync(fd, buffer, 0, length, offset);
           if (!count || !buffer.subarray(0, count).equals(opening.subarray(offset, offset + count)))
             return { refused: true };
           offset += count;
         }
-        const count = accepted
-          ? 0
-          : fs.readSync(fd, buffer, 0, Math.min(buffer.length, Number(stat.size) - offset), offset);
+        const length = Math.min(buffer.length, Number(stat.size) - offset);
+        if (!accepted && work && !work.reserve(length)) return { refused: false };
+        const count = accepted ? 0 : fs.readSync(fd, buffer, 0, length, offset);
         return { refused: false, identity: current, bytes: Buffer.from(buffer.subarray(0, count)) };
       });
       safeDispatchPath(file);
@@ -712,9 +1089,22 @@ function claudeStartup(
         refused = true;
         return null;
       }
-      identity = qualified.value.identity!;
+      if (!qualified.value.identity || !qualified.value.bytes) return null;
+      identity = qualified.value.identity;
       if (accepted) return options.sessionHint;
       opening = Buffer.concat([opening, qualified.value.bytes!]);
+      if (opening.length && retainCandidate) {
+        retainCandidate({
+          file,
+          identity,
+          ancestor,
+          directory,
+          cwd,
+          bytes: opening.length,
+          sha256: createHash('sha256').update(opening).digest('hex'),
+        });
+        retainCandidate = undefined;
+      }
       if (opening.length > bounds.frameBytes) {
         refused = true;
         return null;
@@ -769,6 +1159,8 @@ async function startupContinuous(
   bounds: ReadBounds,
   runtime: ObservationRuntime,
   deadline: number,
+  candidate?: StandaloneStartup,
+  sharedWork?: ObservationWork,
 ): Promise<boolean> {
   const refuse = () => {
     receipts.startupRefused(id, true);
@@ -776,19 +1168,18 @@ async function startupContinuous(
   };
   try {
     if (receipts.startupRefused(id)) return false;
-    const held = receipts.startup(id);
+    const held = candidate ?? receipts.startup(id) ?? receipts.sourceCandidate(id);
     if (!held) return true;
     const checkPaths = () => {
-      safeDispatchPath(held.file);
+      safeDispatchPath(held.file, runtime.platform);
       const parent = fs.statSync(held.ancestor, { bigint: true });
       return `${parent.dev}:${parent.ino}` === held.directory && fs.realpathSync.native(options.cwd) === held.cwd;
     };
     if (!checkPaths()) return refuse();
     const buffer = Buffer.alloc(Math.min(bounds.readBytes, READ_BYTES));
-    const workBytes = bounds.workBytes ?? 64 * 1024 * 1024;
-    let work = 0;
+    const work = sharedWork ?? new ObservationWork(deadline, runtime, bounds.workBytes ?? 64 * 1024 * 1024);
     while (runtime.now() < deadline) {
-      if (work >= workBytes) return false;
+      if (work.exhausted || work.remaining <= 0) return false;
       const digest = createHash('sha256');
       let offset = 0;
       let refused = false;
@@ -803,10 +1194,10 @@ async function startupContinuous(
             return false;
           }
           if (runtime.now() >= deadline) return false;
-          const length = Math.min(buffer.length, held.bytes - offset, workBytes - work);
+          const length = Math.min(buffer.length, held.bytes - offset, work.remaining);
           if (length <= 0) return false;
           // Reserve every requested byte, including reads whose source qualification fails.
-          work += length;
+          if (!work.reserve(length)) return false;
           count = fs.readSync(fd, buffer, 0, length, offset);
           if (!count) return false;
           digest.update(buffer.subarray(0, count));
@@ -840,7 +1231,7 @@ async function startupContinuous(
           return digest.digest('hex') === held.sha256 || refuse();
         }
       }
-      if (work >= workBytes) return false;
+      if (work.exhausted || work.remaining <= 0) return false;
       await runtime.yield();
     }
     return false;
@@ -860,6 +1251,8 @@ export async function observeProcess(
   bounds = READ_BOUNDS,
   runtime = OBSERVATION_RUNTIME,
   startupIdentity?: (() => string | null) | null,
+  sharedWork?: ObservationWork,
+  originalDeadline?: number,
 ): Promise<{
   exitCode: number | null;
   signal: string | null;
@@ -913,7 +1306,7 @@ export async function observeProcess(
           }
         }, 100)
       : null;
-  const deadline = runtime.now() + options.deadlineMs;
+  const deadline = originalDeadline ?? sharedWork?.deadline ?? runtime.now() + options.deadlineMs;
   return new Promise((resolve, reject) => {
     let settled = false;
     let ending: { exitCode: number | null; signal: string | null } | null = null;
@@ -931,7 +1324,7 @@ export async function observeProcess(
         timedOut: true,
       });
     };
-    const timer = readLogs ? setTimeout(timeout, options.deadlineMs) : null;
+    const timer = readLogs ? setTimeout(timeout, Math.max(0, deadline - runtime.now())) : null;
     child.once('error', (error) => {
       if (identityTimer) clearInterval(identityTimer);
       if (timer) clearTimeout(timer);
@@ -975,7 +1368,7 @@ export async function observeProcess(
   });
 }
 
-async function registry(options: StandaloneOptions): Promise<string | { error: string }> {
+async function registry(options: StandaloneOptions, remaining = 20_000): Promise<string | { error: string }> {
   requireBackgroundContext(options);
   // The launch's leading package script remains part of registry commands.
   const offset = options.args.findIndex((arg) => arg === '--bg');
@@ -985,7 +1378,7 @@ async function registry(options: StandaloneOptions): Promise<string | { error: s
         cwd: options.cwd,
         env: standaloneEnvironment(options),
         windowsHide: true,
-        timeout: 20_000,
+        timeout: Math.max(1, Math.min(20_000, remaining)),
         maxBuffer: 4 * 1024 * 1024,
         encoding: 'utf8',
       })
@@ -1047,15 +1440,20 @@ async function observeBackground(
   options: StandaloneOptions,
   prompt: string,
   publishObservation: () => Promise<boolean>,
-  capture?: ReturnType<typeof liveLogCapture>,
+  capture: ReturnType<typeof liveLogCapture> | undefined,
+  witness: ((sessionId: string) => Promise<WitnessState>) | undefined,
+  runtime: ObservationRuntime,
+  deadline: number,
+  work: ObservationWork,
 ): Promise<FinalObservation> {
   const backgroundId = receipts.background(id);
   if (!backgroundId) throw new Error('The Claude background launch identity is unavailable.');
-  const started = Date.now();
+  const started = runtime.now();
   const state: RegistryClock = { started, seen: false, blockedAt: null, errors: 0 };
   let delay = 2_000;
-  while (Date.now() - started < options.deadlineMs) {
-    const step = registryStep(state, await registry(options), backgroundId, Date.now());
+  while (runtime.now() < deadline && !work.cancelled) {
+    const step = registryStep(state, await registry(options, deadline - runtime.now()), backgroundId, runtime.now());
+    if (runtime.now() >= deadline || work.cancelled) break;
     if (capture) {
       const plan = backgroundCommand(receipts, id, 'logs');
       try {
@@ -1063,7 +1461,7 @@ async function observeBackground(
           cwd: plan.cwd,
           env: standaloneEnvironment(options),
           windowsHide: true,
-          timeout: 20_000,
+          timeout: Math.max(1, Math.min(20_000, deadline - runtime.now())),
           maxBuffer: 64 * 1024 * 1024,
           encoding: 'buffer',
         });
@@ -1072,9 +1470,13 @@ async function observeBackground(
         /* Native diagnostics establish no final response or worker exit. */
       }
     }
-    if (step.entry && typeof step.entry.sessionId === 'string' && DISPATCH_ID.test(step.entry.sessionId))
+    if (runtime.now() >= deadline || work.cancelled) break;
+    if (step.entry && typeof step.entry.sessionId === 'string' && DISPATCH_ID.test(step.entry.sessionId)) {
+      await witness?.(step.entry.sessionId);
       observation.sessionId = receipts.standaloneSession(id, step.entry.sessionId);
+    }
     // Registry PIDs alone establish no process ownership. No registry process is terminated.
+    if (runtime.now() >= deadline || work.cancelled) break;
     const saved = savedBackground(options, observation.sessionId, prompt);
     if (saved) {
       observation.monitor = 'finished';
@@ -1093,7 +1495,7 @@ async function observeBackground(
         evidence: null,
       };
     }
-    await pause(Math.min(delay, options.deadlineMs - (Date.now() - started)));
+    await (runtime.wait ?? pause)(Math.min(delay, deadline - runtime.now()));
     delay = Math.min(delay * 2, 30_000);
   }
   observation.monitor = 'timed-out';
@@ -1474,6 +1876,15 @@ export async function superviseStandalone(
     }
   }
   if (recovery && !receipts.observation(id)) return receipts.status(id);
+  const dedicatedDirectory =
+    !recovery &&
+    !attended &&
+    !onBackground &&
+    process.argv.length === 4 &&
+    process.argv[2] === '__standalone-supervise' &&
+    process.argv[3] === id
+      ? fs.realpathSync.native(path.parse(process.execPath).root)
+      : null;
   const lease = receipts.monitor(id);
   const retained = receipts.observation(id);
   const observation: StandaloneObservation = retained ?? {
@@ -1486,6 +1897,7 @@ export async function superviseStandalone(
   };
   observation.supervisor = { pid: process.pid, token: lease.token };
   const observationDeadline = runtime.now() + options.deadlineMs;
+  const observationWork = new ObservationWork(observationDeadline, runtime, bounds.workBytes ?? 64 * 1024 * 1024);
   let publicationError: unknown;
   const publishObservation = async () => {
     while (true) {
@@ -1507,6 +1919,29 @@ export async function superviseStandalone(
     }
   };
   let capture: ReturnType<typeof liveLogCapture> | undefined;
+  let pendingWitness: (() => Promise<unknown>) | undefined;
+  let witnessTail = false;
+  let receiptMissing = false;
+  const retainReceipt = () => {
+    if (receiptMissing) return false;
+    try {
+      receipts.launch(id);
+      return true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      receiptMissing = true;
+      observationWork.cancelled = true;
+      return false;
+    }
+  };
+  const releaseMonitor = () => {
+    if (witnessTail && !retainReceipt()) return;
+    try {
+      lease.release();
+    } catch (error) {
+      if (!witnessTail || (error as NodeJS.ErrnoException).code !== 'ENOENT' || retainReceipt()) throw error;
+    }
+  };
   const finishObservation = async () => {
     const current = capture;
     capture = undefined;
@@ -1516,7 +1951,17 @@ export async function superviseStandalone(
     }
     await publishObservation();
     if (publicationError) throw publicationError;
-    return receipts.status(id);
+    // Pending source readiness continues after the native ending publishes, within the same work and deadline.
+    const settle = pendingWitness;
+    pendingWitness = undefined;
+    const status = receipts.status(id);
+    if (settle) {
+      if (dedicatedDirectory) process.chdir(dedicatedDirectory);
+      lease.releaseNative();
+      witnessTail = true;
+      await settle();
+    }
+    return witnessTail && !retainReceipt() ? status : receipts.status(id);
   };
   try {
     if (recovery && !retained) return receipts.status(id);
@@ -1529,6 +1974,41 @@ export async function superviseStandalone(
     )
       return receipts.status(id);
     const prompt = receipts.input(id);
+    const witness = await nativeSourceWitness(
+      receipts,
+      id,
+      options,
+      prompt,
+      bounds,
+      runtime,
+      observationDeadline,
+      recovery,
+      observationWork,
+    );
+    const witnessed = new Map<string, Promise<WitnessState>>();
+    const witnessOnce = (sessionId: string) => {
+      let held = witnessed.get(sessionId);
+      if (!held) {
+        held = witness(sessionId);
+        witnessed.set(sessionId, held);
+      }
+      return held;
+    };
+    const settleWitness = async (sessionId: string): Promise<WitnessState> => {
+      if (!retainReceipt()) return 'exhausted';
+      let state = await witness(sessionId);
+      while (state === 'pending' && observationWork.reserve(1)) {
+        await (runtime.wait ?? pause)(Math.min(100, observationDeadline - runtime.now()));
+        if (!retainReceipt() || !observationWork.reserve(0)) break;
+        state = await witness(sessionId);
+      }
+      return state;
+    };
+    // Foreground delivery takes one witness attempt and leaves a pending source to finishObservation.
+    const attemptWitness = async (sessionId: string) => {
+      const state = await witness(sessionId);
+      pendingWitness = state === 'pending' ? () => settleWitness(sessionId) : undefined;
+    };
     if (options.logAlias && !outputEntry && (!recovery || options.background))
       capture = await openCapture(() => liveLogCapture(receipts, id, bounds), observationDeadline, runtime);
     if (recovery && !options.background) {
@@ -1538,7 +2018,7 @@ export async function superviseStandalone(
         : undefined;
       const stream = new FrameStream(options, bounds);
       const log = receipts.artifact(id, 'stdout.log');
-      const deadline = runtime.now() + options.deadlineMs;
+      const deadline = observationDeadline;
       const saved = receipts.scan(id) as {
         version: number;
         offset: number;
@@ -1581,6 +2061,7 @@ export async function superviseStandalone(
             bounds.readBytes,
             cursor,
             Math.max(0, (bounds.workBytes ?? 64 * 1024 * 1024) - work),
+            observationWork,
           )) {
             if (runtime.now() >= deadline || work + bytes.length > (bounds.workBytes ?? 64 * 1024 * 1024)) {
               cursor.offset -= bytes.length;
@@ -1589,11 +2070,19 @@ export async function superviseStandalone(
               break;
             }
             stream.push(bytes);
+            const early = stream.checkpoint();
+            if (!early.invalid && !early.conflict && early.sessionId) await witnessOnce(early.sessionId);
             work += bytes.length;
             await runtime.yield();
           }
           if (cursor.offset < fs.statSync(log).size) {
-            if (work < (bounds.workBytes ?? 64 * 1024 * 1024) && runtime.now() < deadline) continue;
+            if (
+              !observationWork.exhausted &&
+              observationWork.remaining > 0 &&
+              work < (bounds.workBytes ?? 64 * 1024 * 1024) &&
+              runtime.now() < deadline
+            )
+              continue;
             complete = false;
             incomplete = true;
           }
@@ -1657,7 +2146,17 @@ export async function superviseStandalone(
           pending: unflushed?.pending ?? stream.partial(),
         });
       const last = receipts.latest(id);
-      let continuous = await startupContinuous(receipts, id, options, bounds, runtime, deadline);
+      if (recovered.sessionId) await attemptWitness(recovered.sessionId);
+      let continuous = await startupContinuous(
+        receipts,
+        id,
+        options,
+        bounds,
+        runtime,
+        deadline,
+        undefined,
+        observationWork,
+      );
       if (continuous && !sourceFailed && !incomplete && recovered.sessionId && recovered.evidence) {
         try {
           receipts.standaloneSession(id, recovered.sessionId);
@@ -1666,8 +2165,7 @@ export async function superviseStandalone(
         }
       }
       const nativeTurn = Boolean(recovered.evidence || last?.nativeEnding);
-      if (!continuous)
-        recovered = { sessionId: null, outcome: 'unknown', availability: 'pending', text: null, evidence: null };
+
       if (
         continuous &&
         !sourceFailed &&
@@ -1722,9 +2220,24 @@ export async function superviseStandalone(
       if (!receipts.background(id))
         throw new Error('The background session identity is unavailable. No worker was restarted.');
       startBackgroundOutput(receipts, id, outputEntry);
-      if (receipts.latest(id)?.availability === 'available') return await finishObservation();
+      if (receipts.latest(id)?.availability === 'available') {
+        if (observation.sessionId) await witness(observation.sessionId);
+        return await finishObservation();
+      }
       observation.monitor = 'observing';
-      final = await observeBackground(receipts, id, observation, options, prompt, publishObservation, capture);
+      final = await observeBackground(
+        receipts,
+        id,
+        observation,
+        options,
+        prompt,
+        publishObservation,
+        capture,
+        witnessOnce,
+        runtime,
+        observationDeadline,
+        observationWork,
+      );
     } else {
       if (retained) throw new Error('This standalone launch already started. No worker was restarted.');
       receipts.observation(id, observation);
@@ -1767,7 +2280,14 @@ export async function superviseStandalone(
         ];
         // Worker output uses inherited files, so an observation deadline does not close its output pipes.
         const observerDeadline = observationDeadline;
-        const startup = claudeStartup(options, prompt, bounds, (evidence) => receipts.startup(id, evidence));
+        const startup = claudeStartup(
+          options,
+          prompt,
+          bounds,
+          (evidence) => receipts.startup(id, evidence),
+          observationWork,
+          (evidence) => receipts.sourceCandidate(id, evidence),
+        );
         const producer =
           outputEntry && options.logAlias && !options.background
             ? outputProducer(receipts, id, outputEntry, stdout, stderr)
@@ -1787,6 +2307,7 @@ export async function superviseStandalone(
           worker,
           options,
           (sessionId) => {
+            void witnessOnce(sessionId);
             if (observation.sessionId === sessionId) return;
             observation.sessionId = receipts.standaloneSession(id, sessionId);
           },
@@ -1799,11 +2320,14 @@ export async function superviseStandalone(
               bounds.readBytes,
               cursor,
               Math.max(0, (bounds.workBytes ?? 64 * 1024 * 1024) - (cursor?.offset ?? 0)),
+              receipts.sourceBaseline(id)?.state === 'unavailable' ? undefined : observationWork,
             );
           },
           bounds,
           runtime,
           startup,
+          receipts.sourceBaseline(id)?.state === 'unavailable' ? undefined : observationWork,
+          observationDeadline,
         );
         worker.stdin?.on('error', () => {
           /* Exit and final evidence determine the observation. */
@@ -1902,7 +2426,19 @@ export async function superviseStandalone(
                 fs.writeSync(stderr, 'The terminal did not open. Use arc dispatch attach with this launch ID.\n');
               }
             }
-            final = await observeBackground(receipts, id, observation, options, prompt, publishObservation, capture);
+            final = await observeBackground(
+              receipts,
+              id,
+              observation,
+              options,
+              prompt,
+              publishObservation,
+              capture,
+              witnessOnce,
+              runtime,
+              observationDeadline,
+              observationWork,
+            );
           }
         } else {
           final = ending.frames.finish(
@@ -1910,6 +2446,7 @@ export async function superviseStandalone(
             ending.signal,
             options.provider === 'codex' ? readNativeReport(receipts.artifact(id, 'native.md')) : undefined,
           );
+          if (final.sessionId) await attemptWitness(final.sessionId);
           observation.monitor = 'finished';
           const ended = final.evidence
             ? null
@@ -1933,11 +2470,24 @@ export async function superviseStandalone(
         fs.closeSync(stderr);
       }
     }
-    if (!options.background) {
-      if (!(await startupContinuous(receipts, id, options, bounds, runtime, observationDeadline)))
+    const backgroundWitness = options.background && final.sessionId ? await settleWitness(final.sessionId) : null;
+    {
+      if (
+        (options.background && receipts.sourceBaseline(id)?.state === 'ready' && backgroundWitness !== 'ready') ||
+        !(await startupContinuous(
+          receipts,
+          id,
+          options,
+          bounds,
+          runtime,
+          observationDeadline,
+          undefined,
+          observationWork,
+        ))
+      )
         final = { sessionId: null, outcome: 'unknown', availability: 'pending', text: null, evidence: null };
-      if (final.sessionId && final.evidence) receipts.standaloneSession(id, final.sessionId);
-      if (observation.monitor === 'finished') observation.sessionId = final.sessionId;
+      if (!options.background && final.sessionId && final.evidence) receipts.standaloneSession(id, final.sessionId);
+      if (observation.monitor === 'finished' && final.sessionId) observation.sessionId = final.sessionId;
     }
     const last = receipts.latest(id);
     if (
@@ -1958,7 +2508,7 @@ export async function superviseStandalone(
     try {
       await capture?.close(observationDeadline, runtime);
     } finally {
-      lease.release();
+      releaseMonitor();
     }
   }
 }
