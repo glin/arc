@@ -9,12 +9,13 @@ import { childEnv } from '../../extension/src/agenthost.ts';
 import { mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { test, vi } from 'vitest';
+import { afterEach, test, vi } from 'vitest';
 import { fileURLToPath } from 'node:url';
 import { DispatchReceipts } from '../../extension/src/dispatchreceipts.ts';
 import { payloadSha256 } from '../../extension/src/sessionwrites.ts';
 import { projectSlug } from '../../extension/src/transcript.ts';
 import * as fs from 'node:fs';
+import { WINDOW_PIPE_SOURCE } from '../../extension/src/windowpipe-source.ts';
 import {
   skillFiles,
   collectRow,
@@ -25,6 +26,44 @@ import {
   smokeEnv,
   setupReply,
 } from './smoke-fixture.ts';
+
+afterEach(() => vi.useRealTimers());
+
+function discoveryCommand(home, channels, deniedFile) {
+  const preload = join(home, 'discovery.cjs');
+  // Transport deadline tests advance clocks in sessionrequests.test.ts.
+  let setup = `require('node:test').mock.timers.enable({ apis: ['setTimeout'] }); const fs = require('node:fs');`;
+  if (process.platform === 'win32') {
+    // Keep process-table latency outside the authenticated discovery deadline.
+    // windowpipe.test.ts checks the real parent read through a native connection without an exchange deadline.
+    const parents = channels.map((channel) => {
+      const entry = JSON.parse(readFileSync(join(home, 'hosts', `${channel.hostId}.json`), 'utf8'));
+      return `if (pid == ${entry.transportPid}) return ${entry.pid};`;
+    });
+    const parent = /static uint Parent\(uint pid\) \{[\s\S]*?\n  \}/;
+    assert.match(WINDOW_PIPE_SOURCE, parent);
+    const source = WINDOW_PIPE_SOURCE.replace(
+      parent,
+      `static uint Parent(uint pid) { ${parents.join(' ')} throw new IOException("Process unavailable"); }`,
+    );
+    const input = join(home, 'discovery.cs');
+    const executable = join(home, 'discovery.exe');
+    writeFileSync(input, source);
+    const built = spawnSync(
+      join(process.env.SystemRoot ?? 'C:/Windows', 'Microsoft.NET/Framework64/v4.0.30319/csc.exe'),
+      ['/nologo', '/optimize+', '/target:exe', `/out:${executable}`, input],
+      { encoding: 'utf8', windowsHide: true },
+    );
+    assert.equal(built.status, 0, built.stdout + built.stderr);
+    const packaged = join(cli, '..', 'windowpipe.exe');
+    setup += `const cp = require('node:child_process'); const spawn = cp.spawn; cp.spawn = function(file, ...args) { return spawn.call(this, file === ${JSON.stringify(packaged)} ? ${JSON.stringify(executable)} : file, ...args); };`;
+  }
+  if (deniedFile) {
+    setup += `const original = fs.lstatSync; fs.lstatSync = function(file, ...args) { if (file === ${JSON.stringify(deniedFile)}) throw Object.assign(new Error('secret-token-address-stack'), { code: 'EACCES' }); return original.call(this, file, ...args); };`;
+  }
+  writeFileSync(preload, setup);
+  return ['--require', preload, cli];
+}
 
 test('bundled collector routes read-only requests and refuses an invalid flag before transport', async () => {
   const home = mkdtempSync(join(realpathSync(tmpdir()), 'arc collect & smoke '));
@@ -107,13 +146,17 @@ test('the compiled skill CLI validates selectors before destination writes and r
   }
 });
 
-test('the bundled windows command reaches authenticated hosts and keeps secrets out of both output formats', async () => {
+test('the bundled windows command reaches authenticated hosts and keeps secrets out of both output formats', async ({
+  signal,
+}) => {
   const home = mkdtempSync(join(realpathSync(tmpdir()), 'arc-windows-smoke-'));
   const first = new WindowChannel(home);
   const second = new WindowChannel(home);
   const env = { ...smokeEnv, ARC_HOME: home };
+  const options = { env, encoding: 'utf8', signal };
   const run = promisify(execFile);
   try {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
     first.setGuardedReadHandler(async () => {
       throw new Error('Discovery sends no read acknowledgment.');
     });
@@ -127,7 +170,8 @@ test('the bundled windows command reaches authenticated hosts and keeps secrets 
       panelVisible: false,
     });
     await second.update({ folders: [], scopeReady: false, panelReady: false, panelVisible: false });
-    const json = await run(process.execPath, [cli, 'windows', '--json'], { env, encoding: 'utf8' });
+    const command = discoveryCommand(home, [first, second]);
+    const json = await run(process.execPath, [...command, 'windows', '--json'], options);
     const report = JSON.parse(json.stdout);
     assert.equal(report.version, 1);
     assert.equal(report.complete, true);
@@ -142,7 +186,7 @@ test('the bundled windows command reaches authenticated hosts and keeps secrets 
     );
     assert.equal(json.stdout.includes('token'), false);
     assert.equal(json.stdout.includes('address'), false);
-    const human = await run(process.execPath, [cli, 'windows'], { env, encoding: 'utf8' });
+    const human = await run(process.execPath, [...command, 'windows'], options);
     assert.match(human.stdout, /scope ready  panel hidden  "C:\/Project With Spaces"/);
     assert.match(human.stdout, /scope loading  panel not ready  \(no folders\)/);
     for (const channel of [first, second]) {
@@ -150,39 +194,38 @@ test('the bundled windows command reaches authenticated hosts and keeps secrets 
       assert.equal(human.stdout.includes(JSON.parse(registration).token), false);
     }
     await Promise.all([first.dispose(), second.dispose()]);
-    const empty = await run(process.execPath, [cli, 'windows', '--json'], { env, encoding: 'utf8' });
+    const empty = await run(process.execPath, [...command, 'windows', '--json'], options);
     assert.deepEqual(JSON.parse(empty.stdout), { version: 1, windows: [], complete: true });
     for (let index = 0; index <= 1024; index++) {
       writeFileSync(join(home, 'hosts', `unrelated-${index}`), '');
     }
-    const incomplete = await run(process.execPath, [cli, 'windows', '--json'], { env, encoding: 'utf8' });
+    const incomplete = await run(process.execPath, [...command, 'windows', '--json'], options);
     assert.deepEqual(JSON.parse(incomplete.stdout), { version: 1, windows: [], complete: false });
-    const partial = await run(process.execPath, [cli, 'windows'], { env, encoding: 'utf8' });
+    const partial = await run(process.execPath, [...command, 'windows'], options);
     assert.match(partial.stdout, /discovery is incomplete/);
     assert.equal(partial.stdout.includes('No Arc windows are open.'), false);
-    await assert.rejects(run(process.execPath, [cli, 'windows', '--unknown'], { env }), /Usage: arc windows/);
+    await assert.rejects(run(process.execPath, [...command, 'windows', '--unknown'], options), /Usage: arc windows/);
   } finally {
     await Promise.all([first.dispose(), second.dispose()]);
     rmSync(home, { recursive: true, force: true });
   }
 });
 
-test('bundled discovery retains registry access denial without leaking errors or failing partial output', async () => {
+test('bundled discovery retains registry access denial without leaking errors or failing partial output', async ({
+  signal,
+}) => {
   const home = mkdtempSync(join(realpathSync(tmpdir()), 'arc-window-access-'));
   const reachable = new WindowChannel(home);
   const denied = 'f'.repeat(24);
   const deniedFile = join(home, 'hosts', denied + '.json');
-  const preload = join(home, 'access.cjs');
   const run = promisify(execFile);
   try {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
     await reachable.update({ folders: [], scopeReady: true, panelReady: false, panelVisible: false });
     writeFileSync(deniedFile, '{}');
-    writeFileSync(
-      preload,
-      `const fs = require('node:fs'); const original = fs.lstatSync; fs.lstatSync = function(file, ...args) { if (file === ${JSON.stringify(deniedFile)}) throw Object.assign(new Error('secret-token-address-stack'), { code: 'EACCES' }); return original.call(this, file, ...args); };`,
-    );
-    const options = { env: { ...smokeEnv, ARC_HOME: home }, encoding: 'utf8' };
-    const json = await run(process.execPath, ['--require', preload, cli, 'windows', '--json'], options);
+    const command = discoveryCommand(home, [reachable], deniedFile);
+    const options = { env: { ...smokeEnv, ARC_HOME: home }, encoding: 'utf8', signal };
+    const json = await run(process.execPath, [...command, 'windows', '--json'], options);
     const report = JSON.parse(json.stdout);
     assert.equal(report.version, 1);
     assert.equal(report.complete, false);
@@ -192,7 +235,7 @@ test('bundled discovery retains registry access denial without leaking errors or
     );
     assert.deepEqual(report.diagnostics, [{ code: 'EACCES', stage: 'registry', hostId: denied }]);
     assert.doesNotMatch(json.stdout, /secret|token|address|stack/);
-    const human = await run(process.execPath, ['--require', preload, cli, 'windows'], options);
+    const human = await run(process.execPath, [...command, 'windows'], options);
     assert.match(human.stdout, /discovery is incomplete/);
     assert.match(human.stdout, /Window details f{24}: EACCES\./);
     assert.doesNotMatch(human.stdout, /secret|token|address|stack/);

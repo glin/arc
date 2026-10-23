@@ -22,12 +22,12 @@
   "cli/test/smoke.bundled-c.test.mjs": {
     "reason": "Compiled CLI commands must preserve window routing, turn limits, and terminal ownership under real IPC.",
     "cases": 15,
-    "matricesSha256": "15fc52c3af6a79bd19a02bd888c7d0a5c6ffba21c5b67232ffbd2778a6ddb61c"
+    "matricesSha256": "92c3069e70bb2e52da8e85ca7c83afd856a8435fdb8309ea3eedcc02e8ffb1f2"
   },
   "cli/test/smoke.test.mjs": {
-    "reason": "Installed skill directories must preserve foreign files and ownership across executable command and filesystem boundaries.",
-    "cases": 36,
-    "matricesSha256": "9226404c2576a51642df89d8f8e052fe3a34a882f9b9a3b4807e89630a934803"
+    "reason": "Installed skill directories must preserve foreign files and ownership across executable command and filesystem boundaries. Bundled commands must update personal copies from every supported artifact layout.",
+    "cases": 38,
+    "matricesSha256": "a54083ee57c02594e6b555edbd0002cf003d8b8f598cdb041a23470381c4af38"
   },
   "cli/test/stream-fixtures.test.mjs": {
     "reason": "The audit executable must print stream mismatches and return a failing process status.",
@@ -86,8 +86,8 @@
   },
   "extension/src/packaging.test.ts": {
     "reason": "Actual VSIX packaging must preserve archive contents, platform executables, output options, and extracted runtime entry points.",
-    "cases": 20,
-    "matricesSha256": "33c98f3abd3ea3721d7c939e438b567138e829d29c1bcefeadd1ed7d5093e6c9"
+    "cases": 27,
+    "matricesSha256": "9220c5f1f90cd64fc0d5cb2086ab5161102f95ddf8a18a75b8ea93644e059eee"
   },
   "extension/src/panel-shots.test.ts": {
     "reason": "Screenshot output must pass through the actual image encoder and lossless comparison while preserving its crop.",

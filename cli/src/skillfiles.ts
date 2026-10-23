@@ -3,6 +3,7 @@ import * as path from 'node:path';
 import * as os from 'node:os';
 import { createHash } from 'node:crypto';
 import { canonicalToolPath } from '../../extension/src/toolownership.ts';
+import { validateToolFiles, type ToolPayload } from '../../extension/src/bundledtools.ts';
 
 export interface SkillPayload {
   directory: string;
@@ -11,7 +12,7 @@ export interface SkillPayload {
 }
 
 // Each executing artifact owns one layout. Caller directories never select instructions.
-export function readSkillPayload(executable: string): SkillPayload {
+export function readSkillPayload(executable: string, platform = process.platform): SkillPayload {
   if (!path.isAbsolute(executable)) throw new Error('Arc needs an absolute command path to find its session skill.');
   const folder = path.dirname(executable);
   let directory: string;
@@ -23,6 +24,23 @@ export function readSkillPayload(executable: string): SkillPayload {
     path.basename(path.dirname(folder)) === 'tools'
   ) {
     directory = path.join(folder, '../skills/arc-sessions');
+  } else if (path.basename(executable) === 'arc.cjs' && path.basename(folder) === 'cli') {
+    const release = path.dirname(folder);
+    const payload = JSON.parse(fs.readFileSync(path.join(release, 'release.json'), 'utf8')) as ToolPayload;
+    const { contentId, ...content } = payload;
+    if (
+      payload.schemaVersion !== 1 ||
+      payload.nodeMinimum !== 18 ||
+      payload.plugin?.name !== 'arc-hooks' ||
+      !Array.isArray(payload.platforms) ||
+      !payload.platforms.includes(platform) ||
+      !payload.files?.['cli/arc.cjs'] ||
+      !payload.files?.['skills/arc-sessions/SKILL.md'] ||
+      contentId !== createHash('sha256').update(JSON.stringify(content)).digest('hex')
+    )
+      throw new Error('Arc cannot identify this command release. Rebuild or reinstall Arc.');
+    validateToolFiles(release, payload.files, ['release.json']);
+    directory = path.join(release, 'skills/arc-sessions');
   } else if (path.basename(executable) === 'arc.cjs' && path.basename(folder) === 'dist') {
     const manifest = JSON.parse(fs.readFileSync(path.join(folder, '../package.json'), 'utf8'));
     if (manifest.name !== '@glin/arc') throw new Error('Arc cannot identify this command package.');

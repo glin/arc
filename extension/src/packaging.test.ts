@@ -2,14 +2,16 @@
 // extension/src/packaging.test.ts
 import { beforeAll, test, vi } from 'vitest';
 import assert from 'node:assert';
-import { execFile, spawnSync } from 'node:child_process';
+import { execFile, spawn, spawnSync } from 'node:child_process';
 import { promisify } from 'node:util';
 import * as fs from 'node:fs';
 import nativeFs from 'node:fs';
 import { createRequire, syncBuiltinESMExports } from 'node:module';
-import { tempDir } from './temproot.ts';
+import { tempDir, type TempDirectoryFiles } from './temproot.ts';
 import * as path from 'node:path';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
+import { createServer, type Socket } from 'node:net';
+import { EventEmitter } from 'node:events';
 import { buildSync, transformSync } from 'esbuild';
 import { inflateRawSync } from 'node:zlib';
 import * as vm from 'node:vm';
@@ -204,6 +206,82 @@ test('the extension package contains exactly the intended files', () => {
   );
 });
 
+async function runLauncherCommand(
+  command: string,
+  args: string[],
+  options: { cwd: string; env: NodeJS.ProcessEnv; windowsVerbatimArguments?: boolean; signal: AbortSignal },
+  input?: string,
+): Promise<{ status: number; stdout: string; stderr: string }> {
+  const { signal, ...launchOptions } = options;
+  signal.throwIfAborted();
+  const child = spawn(command, args, { ...launchOptions, detached: process.platform !== 'win32', stdio: 'pipe' });
+  let stdout = '';
+  let stderr = '';
+  let failure: Error | undefined;
+  child.stdout.setEncoding('utf8');
+  child.stderr.setEncoding('utf8');
+  child.stdout.on('data', (data) => {
+    stdout += data;
+  });
+  child.stderr.on('data', (data) => {
+    stderr += data;
+  });
+  child.once('error', (error) => {
+    failure = error;
+  });
+  const closed = new Promise<number | null>((resolve) => child.once('close', resolve));
+  let termination: Promise<unknown> | undefined;
+  const abort = () => {
+    if (!child.pid || child.exitCode !== null) return;
+    // Keep the shell alive until taskkill has captured its descendants.
+    termination =
+      process.platform === 'win32'
+        ? promisify(execFile)(path.join(process.env.SystemRoot ?? 'C:/Windows', 'System32/taskkill.exe'), [
+            '/pid',
+            String(child.pid),
+            '/T',
+            '/F',
+          ])
+        : Promise.resolve().then(() => {
+            try {
+              process.kill(-child.pid!, 'SIGKILL');
+            } catch (error) {
+              if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error;
+            }
+          });
+    void termination.catch(() => {});
+  };
+  signal.addEventListener('abort', abort, { once: true });
+  if (signal.aborted) abort();
+  child.stdin.end(input);
+  try {
+    const status = await closed;
+    await termination;
+    signal.throwIfAborted();
+    if (failure) throw failure;
+    if (status === null) throw new Error(`Launcher terminated without an exit status: ${command}`);
+    return { status, stdout, stderr };
+  } finally {
+    signal.removeEventListener('abort', abort);
+  }
+}
+
+async function runLauncherCommands<T>(commands: (() => Promise<T>)[], signal: AbortSignal): Promise<T[]> {
+  const results: T[] = new Array(commands.length);
+  let next = 0;
+  const workers = await Promise.allSettled(
+    Array.from({ length: Math.min(3, commands.length) }, async () => {
+      while (next < commands.length) {
+        signal.throwIfAborted();
+        const index = next++;
+        results[index] = await commands[index]();
+      }
+    }),
+  );
+  for (const worker of workers) if (worker.status === 'rejected') throw worker.reason;
+  return results;
+}
+
 const launcherShells =
   process.platform === 'win32'
     ? [
@@ -230,9 +308,487 @@ const launcherShells =
         { command: 'bash', args: ['--noprofile', '--norc', '-c'] },
       ];
 
-test.each(launcherShells)(
+function readLauncherIdentity(bytes: string, token: string): { token: string; pid: number } | undefined {
+  try {
+    const value = JSON.parse(bytes);
+    if (value?.token === token && Object.keys(value).length === 2 && Number.isSafeInteger(value.pid) && value.pid > 0)
+      return value;
+  } catch {}
+  return undefined;
+}
+
+interface LauncherConnection {
+  pid: number;
+  closed: boolean;
+  socket: { destroy: () => unknown };
+}
+
+function launcherPublicationReady(bytes: string, token: string, connection?: LauncherConnection): boolean {
+  const identity = readLauncherIdentity(bytes, token);
+  return identity !== undefined && connection !== undefined && !connection.closed && identity.pid === connection.pid;
+}
+
+function assertLauncherConnectionsClosed(connections: Iterable<LauncherConnection>): void {
+  for (const connection of connections) {
+    assert.equal(connection.closed, true, `copied launcher child ${connection.pid} survived cancellation`);
+  }
+}
+
+async function withLauncherCleanup(
+  body: () => Promise<void>,
+  actions: (() => unknown | Promise<unknown>)[],
+): Promise<void> {
+  let failed = false;
+  let original: unknown;
+  try {
+    await body();
+  } catch (error) {
+    failed = true;
+    original = error;
+  }
+  const failures: unknown[] = [];
+  for (const action of actions) {
+    try {
+      await action();
+    } catch (error) {
+      failures.push(error);
+    }
+  }
+  if (failed) throw original;
+  if (failures.length) throw new AggregateError(failures, 'Launcher fixture cleanup failed');
+}
+
+function launcherEndpoint(
+  root: string,
+  cleanup: (() => unknown)[],
+  platform: NodeJS.Platform = process.platform,
+  files: TempDirectoryFiles = fs,
+): string {
+  if (platform === 'win32') return `\\\\.\\pipe\\arc-launcher-${randomUUID()}`;
+  const normal = path.posix.join(root, 'control.sock');
+  if (Buffer.byteLength(normal) < 104) return normal;
+  const directory = tempDir('arc-lc-', { root: '/tmp', cleanup, files });
+  const endpoint = path.posix.join(directory, 's');
+  assert.ok(Buffer.byteLength(endpoint) < 104, `Launcher socket path is too long: ${endpoint}`);
+  return endpoint;
+}
+
+test('launcher endpoints bound complete UTF8 paths and retain private Unix allocations', () => {
+  const removed: string[] = [];
+  const modes: [string, number][] = [];
+  let allocations = 0;
+  const files = {
+    mkdtempSync: (prefix: string) => `${prefix}${++allocations}`,
+    lstatSync: () => ({ dev: 1, ino: 2, isDirectory: () => true, isSymbolicLink: () => false }),
+    chmodSync: (directory: string, mode: number) => {
+      modes.push([directory, mode]);
+    },
+    rmdirSync: (directory: string) => {
+      removed.push(directory);
+    },
+  };
+  const cleanup: (() => unknown)[] = [];
+  assert.equal(launcherEndpoint('/short', cleanup, 'linux', files), '/short/control.sock');
+  assert.equal(launcherEndpoint('/' + 'a'.repeat(89), cleanup, 'darwin', files).length, 103);
+  assert.equal(allocations, 0);
+  const mac =
+    '/var/folders/ab/abcdefghijklmnopqrstuvwxyz012345/T/arc-test-runs/12345-ABCDEF/arc-test-ABCDEF/arc-launcher-cancel-ABCDEF';
+  assert.equal(Buffer.byteLength(path.posix.join(mac, 'control.sock')), 133);
+  const roots = [mac, '/tmp/' + 'a'.repeat(120), '/' + 'a'.repeat(90), '/' + 'é'.repeat(50)];
+  const endpoints = roots.map((root) => launcherEndpoint(root, cleanup, 'darwin', files));
+  assert.equal(new Set(endpoints).size, roots.length);
+  assert.ok(endpoints.every((endpoint) => endpoint.startsWith('/tmp/arc-lc-') && Buffer.byteLength(endpoint) < 104));
+  assert.deepEqual(
+    modes,
+    endpoints.map((endpoint) => [path.posix.dirname(endpoint), 0o700]),
+  );
+  assert.match(launcherEndpoint(mac, cleanup, 'win32', files), /^\\\\\.\\pipe\\arc-launcher-/);
+  assert.equal(allocations, roots.length);
+  assert.equal(cleanup.length, roots.length);
+  cleanup.forEach((action) => action());
+  assert.deepEqual(
+    removed,
+    endpoints.map((endpoint) => path.posix.dirname(endpoint)),
+  );
+});
+
+test('launcher endpoint cleanup covers setup and bind failures after server settlement', async () => {
+  for (const phase of ['allocation', 'permissions', 'length', 'write', 'bind', 'success']) {
+    const events: string[] = [];
+    const original = new Error(phase);
+    const cleanup: (() => unknown)[] = [];
+    const files = {
+      mkdtempSync: (prefix: string) => {
+        events.push('allocate');
+        if (phase === 'allocation') throw original;
+        return prefix + (phase === 'length' ? 'a'.repeat(100) : 'owned');
+      },
+      lstatSync: () => ({ dev: 1, ino: 2, isDirectory: () => true, isSymbolicLink: () => false }),
+      chmodSync: () => {
+        if (phase === 'permissions') throw original;
+      },
+      rmdirSync: () => {
+        events.push('remove owned directory');
+      },
+    };
+    const body = () =>
+      withLauncherCleanup(async () => {
+        launcherEndpoint('/' + 'a'.repeat(120), cleanup, 'linux', files);
+        events.push('write');
+        if (phase === 'write') throw original;
+        events.push('bind');
+        if (phase === 'bind') throw original;
+      }, [
+        () => {
+          events.push('abort');
+        },
+        () => {
+          events.push('settle launcher');
+        },
+        () => {
+          events.push('close server');
+        },
+        () => {
+          events.push('settle connections');
+        },
+        () => {
+          events.push('settle server');
+        },
+        () => {
+          cleanup.forEach((action) => action());
+        },
+      ]);
+    if (phase === 'success') await body();
+    else if (phase === 'length') await assert.rejects(body, /socket path is too long/);
+    else await assert.rejects(body, (error) => error === original);
+    assert.deepEqual(events.slice(phase === 'allocation' ? -5 : -6), [
+      'abort',
+      'settle launcher',
+      'close server',
+      'settle connections',
+      'settle server',
+      ...(phase === 'allocation' ? [] : ['remove owned directory']),
+    ]);
+  }
+});
+
+test('launcher endpoint cleanup refuses replaced or occupied private directories', async () => {
+  for (const replacement of ['inode', 'device', 'symlink', 'file', 'occupied']) {
+    const cleanup: (() => unknown)[] = [];
+    let changed = false;
+    const remove = vi.fn<(directory: string) => void>(() => {
+      if (replacement === 'occupied') throw new Error('directory not empty');
+    });
+    const files = {
+      mkdtempSync: () => '/tmp/arc-lc-owned',
+      lstatSync: () => ({
+        dev: changed && replacement === 'device' ? 3 : 1,
+        ino: changed && replacement === 'inode' ? 3 : 2,
+        isDirectory: () => !(changed && replacement === 'file'),
+        isSymbolicLink: () => changed && replacement === 'symlink',
+      }),
+      chmodSync: () => {},
+      rmdirSync: remove,
+    };
+    launcherEndpoint('/' + 'a'.repeat(120), cleanup, 'linux', files);
+    changed = true;
+    const original = new Error('original assertion');
+    let finalAction = false;
+    await assert.rejects(
+      withLauncherCleanup(async () => {
+        throw original;
+      }, [
+        ...cleanup,
+        () => {
+          finalAction = true;
+        },
+      ]),
+      (error) => error === original,
+    );
+    assert.equal(finalAction, true);
+    assert.deepEqual(remove.mock.calls, replacement === 'occupied' ? [['/tmp/arc-lc-owned']] : []);
+    assert.throws(cleanup[0], replacement === 'occupied' ? /directory not empty/ : /ownership changed/);
+  }
+});
+
+const launcherChildSource = `
+const control = require('node:net').createConnection(process.env.ARC_CONTROL);
+control.on('error', () => process.exit(1));
+control.on('close', () => process.exit(0));
+control.on('connect', () => control.write(JSON.stringify({ token: process.env.ARC_TOKEN, pid: process.pid }) + '\\n'));
+let reply = '';
+control.on('data', (bytes) => {
+  reply += bytes.toString();
+  if (!reply.endsWith('\\n')) return;
+  if (reply !== 'ready\\n') return process.exit(1);
+  const fs = require('node:fs');
+  const file = process.env.ARC_READY;
+  fs.writeFileSync(file + '.pending', JSON.stringify({ token: process.env.ARC_TOKEN, pid: process.pid }));
+  fs.renameSync(file + '.pending', file);
+});
+`;
+
+test('launcher readiness requires complete publication and its authenticated live connection', () => {
+  const kill = vi.spyOn(process, 'kill').mockImplementation(() => {
+    throw new Error('unexpected signal');
+  });
+  const token = 'this-launch';
+  const connection = { pid: 123, closed: false, socket: { destroy: vi.fn<() => void>() } };
+  const publication = JSON.stringify({ token, pid: 123 });
+  for (const bytes of [
+    '',
+    '1',
+    '{',
+    '{}',
+    'null',
+    '123',
+    publication.slice(0, -1),
+    ...[0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1, '123', 456].map((pid) => JSON.stringify({ token, pid })),
+    JSON.stringify({ token: 'previous-launch', pid: 123 }),
+  ]) {
+    assert.equal(launcherPublicationReady(bytes, token, connection), false, bytes);
+  }
+  assert.equal(launcherPublicationReady(publication, token), false, 'publication preceded connection');
+  assert.equal(launcherPublicationReady(publication, token, connection), true);
+  assert.equal(launcherPublicationReady(publication, token, { ...connection, closed: true }), false);
+  assert.equal(kill.mock.calls.length, 0);
+});
+
+test('launcher control closure distinguishes ended fixtures from executing children without PID reads', () => {
+  const kill = vi.spyOn(process, 'kill').mockImplementation(() => true);
+  const connection = { pid: 123, closed: true, socket: { destroy: vi.fn<() => void>() } };
+  // Signal zero also succeeds for an unreaped zombie or an unrelated process with a reused PID.
+  assertLauncherConnectionsClosed([connection]);
+  assert.throws(() => assertLauncherConnectionsClosed([{ ...connection, closed: false }]), /survived cancellation/);
+  assert.equal(kill.mock.calls.length, 0);
+});
+
+test('launcher cleanup attempts every action and preserves assertion failures across publication states', async () => {
+  const kill = vi.spyOn(process, 'kill').mockImplementation(() => {
+    throw new Error('unexpected signal');
+  });
+  for (const phase of ['before connection', 'during publication', 'after publication']) {
+    const events: string[] = [];
+    const original = new Error(phase);
+    const control = Object.assign(new EventEmitter(), { write: vi.fn<(bytes: string) => void>() });
+    const exited = new Error('fixture exited');
+    const exit = vi.fn<(status: number) => never>(() => {
+      throw exited;
+    });
+    let published = false;
+    vm.runInNewContext(launcherChildSource, {
+      require: (module: string) =>
+        module === 'node:net'
+          ? { createConnection: () => control }
+          : {
+              writeFileSync: () => {
+                if (phase === 'during publication') control.emit('close');
+              },
+              renameSync: () => {
+                published = true;
+              },
+            },
+      process: { pid: 123, env: { ARC_TOKEN: 'this-launch', ARC_READY: 'fixture', ARC_CONTROL: 'private-pipe' }, exit },
+    });
+    if (phase === 'before connection') {
+      assert.throws(
+        () => control.emit('error', new Error('connection refused')),
+        (error) => error === exited,
+      );
+      assert.deepEqual(exit.mock.calls, [[1]]);
+    } else {
+      control.emit('connect');
+      control.emit('data', Buffer.from('rea'));
+      assert.equal(published, false);
+      if (phase === 'during publication') {
+        assert.throws(
+          () => control.emit('data', Buffer.from('dy\n')),
+          (error) => error === exited,
+        );
+      } else {
+        control.emit('data', Buffer.from('dy\n'));
+        assert.equal(published, true);
+        assert.throws(
+          () => control.emit('close'),
+          (error) => error === exited,
+        );
+      }
+      assert.deepEqual(exit.mock.calls, [[0]]);
+    }
+    assert.equal(published, phase === 'after publication');
+    await assert.rejects(
+      withLauncherCleanup(async () => {
+        throw original;
+      }, [
+        () => {
+          events.push('abort');
+        },
+        async () => {
+          events.push('settle');
+          throw new Error('settlement failure');
+        },
+        () => {
+          events.push('close server');
+        },
+        () => {
+          events.push('close connections');
+        },
+      ]),
+      (error) => error === original,
+    );
+    assert.deepEqual(events, ['abort', 'settle', 'close server', 'close connections']);
+  }
+  assert.equal(kill.mock.calls.length, 0);
+});
+
+test.for(launcherShells)(
+  'canceled launchers terminate copied children before releasing commands ($command)',
+  async (shell) => {
+    const root = tempDir('arc-launcher-cancel-');
+    const tools = new BundledTools(
+      readToolPackage(path.join(extensionRoot, 'dist')),
+      path.join(root, 'software with spaces'),
+    );
+    const installed = tools.stage();
+    const editor = path.join(root, process.platform === 'win32' ? 'Code.exe' : 'editor');
+    fs.copyFileSync(process.execPath, editor);
+    fs.chmodSync(editor, 0o755);
+    const ready = Array.from({ length: 3 }, (_, index) => ({
+      file: path.join(root, String(index)),
+      token: randomUUID(),
+    }));
+    const connections = new Map<string, LauncherConnection>();
+    const sockets = new Set<Socket>();
+    const control = createServer((socket) => {
+      sockets.add(socket);
+      let connection: LauncherConnection | undefined;
+      let bytes = '';
+      socket.on('error', () => socket.destroy());
+      socket.once('close', () => {
+        sockets.delete(socket);
+        if (connection) connection.closed = true;
+      });
+      socket.on('data', (chunk) => {
+        if (connection) {
+          socket.destroy();
+          return;
+        }
+        bytes += chunk.toString('utf8');
+        if (Buffer.byteLength(bytes) > 512) {
+          socket.destroy();
+          return;
+        }
+        if (!bytes.endsWith('\n')) return;
+        const identity = ready.map(({ token }) => readLauncherIdentity(bytes, token)).find(Boolean);
+        if (!identity || connections.has(identity.token)) {
+          socket.destroy();
+          return;
+        }
+        connection = { pid: identity.pid, closed: false, socket };
+        connections.set(identity.token, connection);
+        socket.write('ready\n');
+        return;
+      });
+    });
+    const endpointCleanup: (() => unknown)[] = [];
+    const controller = new AbortController();
+    let queued = false;
+    const command = 'arc';
+    const script = shell.args.includes('-EncodedCommand')
+      ? Buffer.from(command, 'utf16le').toString('base64')
+      : command;
+    let settled: Promise<PromiseSettledResult<unknown>[]> = Promise.resolve([]);
+    let controlClosed: Promise<void> = Promise.resolve();
+    await withLauncherCleanup(async () => {
+      const endpoint = launcherEndpoint(root, endpointCleanup);
+      fs.writeFileSync(path.join(installed, 'cli/arc.cjs'), launcherChildSource);
+      await new Promise<void>((resolve, reject) => {
+        control.once('error', reject);
+        control.listen(endpoint, resolve);
+      });
+      const pending = runLauncherCommands(
+        [
+          ...ready.map(
+            ({ file, token }) =>
+              () =>
+                runLauncherCommand(shell.command, [...shell.args, script], {
+                  cwd: root,
+                  env: childEnv(
+                    process.env,
+                    { ARC_READY: file, ARC_TOKEN: token, ARC_CONTROL: endpoint },
+                    undefined,
+                    undefined,
+                    {
+                      directory: path.join(installed, 'launchers'),
+                      editorExecutable: editor,
+                      windowId: 'cancel-fixture',
+                    },
+                  ),
+                  windowsVerbatimArguments: shell.args.includes('/c'),
+                  signal: controller.signal,
+                }),
+          ),
+          async () => {
+            queued = true;
+            return { status: 0, stdout: '', stderr: '' };
+          },
+        ],
+        controller.signal,
+      );
+      settled = Promise.allSettled([pending]);
+      const deadline = Date.now() + 10_000;
+      await vi.waitFor(
+        () => {
+          assert.ok(
+            ready.every(
+              ({ file, token }) =>
+                fs.existsSync(file) &&
+                launcherPublicationReady(fs.readFileSync(file, 'utf8'), token, connections.get(token)),
+            ),
+            'copied launcher children did not become ready',
+          );
+        },
+        { timeout: Math.max(1, deadline - Date.now()) },
+      );
+      controller.abort();
+      const [result] = await settled;
+      assert.equal(result.status, 'rejected');
+      // The fixture retains its control connection until exit, independently of process reaping.
+      await vi.waitFor(() => assertLauncherConnectionsClosed(connections.values()), {
+        timeout: Math.max(1, deadline - Date.now()),
+      });
+      assert.equal(queued, false, 'cancellation admitted a queued launcher');
+      fs.renameSync(editor, editor + '.released');
+    }, [
+      () => controller.abort(),
+      () => settled,
+      () => {
+        controlClosed = new Promise<void>((resolve) => {
+          control.close(() => resolve());
+        });
+      },
+      async () => {
+        await Promise.allSettled(
+          [...sockets].map(
+            (socket) =>
+              new Promise<void>((resolve) => {
+                socket.once('close', resolve);
+                socket.destroy();
+              }),
+          ),
+        );
+      },
+      () => controlClosed,
+      () => {
+        endpointCleanup.forEach((action) => action());
+      },
+    ]);
+  },
+);
+
+test.for(launcherShells)(
   'bare arc launchers preserve arguments, stdin, exit status, and window targeting with spaced paths ($command)',
-  async (selectedShell) => {
+  async (selectedShell, { signal }) => {
     const root = tempDir('arc-launchers-');
     const tools = new BundledTools(
       readToolPackage(path.join(extensionRoot, 'dist')),
@@ -307,6 +863,7 @@ test.each(launcherShells)(
     await vm.runInNewContext('(async () => {' + compiled + '})()', scope);
     try {
       await vi.waitFor(() => assert.equal(values.size, 2, 'activation did not publish terminal commands'));
+      const terminalChecks: (() => Promise<void>)[] = [];
       for (const casing of process.platform === 'win32' ? ['PATH', 'Path', 'path'] : ['PATH']) {
         const terminalEnv: NodeJS.ProcessEnv = {};
         for (const [key, value] of Object.entries(process.env)) {
@@ -327,21 +884,23 @@ test.each(launcherShells)(
         assert.equal(terminalEnv.ARC_WINDOW, undefined);
         assert.equal(terminalEnv.ELECTRON_RUN_AS_NODE, undefined);
         for (const shell of shells) {
-          const command = 'arc --version';
-          const script = shell.args.includes('-EncodedCommand')
-            ? Buffer.from(command, 'utf16le').toString('base64')
-            : command;
-          const result = spawnSync(shell.command, [...shell.args, script], {
-            cwd: root,
-            env: terminalEnv,
-            encoding: 'utf8',
-            windowsVerbatimArguments: shell.args.includes('/c'),
+          terminalChecks.push(async () => {
+            const command = 'arc --version';
+            const script = shell.args.includes('-EncodedCommand')
+              ? Buffer.from(command, 'utf16le').toString('base64')
+              : command;
+            const result = await runLauncherCommand(shell.command, [...shell.args, script], {
+              cwd: root,
+              env: terminalEnv,
+              windowsVerbatimArguments: shell.args.includes('/c'),
+              signal,
+            });
+            assert.equal(result.status, 0, result.stderr);
+            assert.equal(result.stdout.trim(), builtVersion());
           });
-          assert.ifError(result.error);
-          assert.equal(result.status, 0, `${shell.command} (${casing}): ${result.stderr}`);
-          assert.equal(result.stdout.trim(), builtVersion());
         }
       }
+      await runLauncherCommands(terminalChecks, signal);
     } finally {
       subscriptions.forEach((owner) => owner.dispose());
     }
@@ -350,33 +909,40 @@ test.each(launcherShells)(
         const script = shell.args.includes('-EncodedCommand')
           ? Buffer.from(command, 'utf16le').toString('base64')
           : command;
-        const result = spawnSync(shell.command, [...shell.args, script], {
-          cwd: root,
-          env,
+        return runLauncherCommand(
+          shell.command,
+          [...shell.args, script],
+          {
+            cwd: root,
+            env,
+            windowsVerbatimArguments: shell.args.includes('/c'),
+            signal,
+          },
           input,
-          encoding: 'utf8',
-          windowsVerbatimArguments: shell.args.includes('/c'),
-        });
-        assert.ifError(result.error);
-        return result;
+        );
       };
-      const version = run('arc --version');
+      const [version, windows, status, cost, failure] = await runLauncherCommands(
+        [
+          () => run('arc --version'),
+          () => run('arc windows --json'),
+          () => run('arc statusline --json', '{}'),
+          () => run(`arc cost "${transcript.replaceAll('\\', '/')}" --source-only --by-model --json`),
+          () => run('arc "unknown command"'),
+        ],
+        signal,
+      );
       assert.equal(version.status, 0, `${shell.command}: ${version.stderr}`);
       assert.equal(version.stdout.trim(), builtVersion());
-      const windows = run('arc windows --json');
       assert.equal(windows.status, 0, windows.stderr);
       assert.deepEqual(JSON.parse(windows.stdout), { version: 1, windows: [], complete: true });
-      const status = run('arc statusline --json', '{}');
       assert.equal(status.status, 0, status.stderr);
       assert.equal(JSON.parse(status.stdout).schemaVersion, 1);
-      const cost = run(`arc cost "${transcript.replaceAll('\\', '/')}" --source-only --by-model --json`);
       assert.equal(cost.status, 0, cost.stderr);
       const report = JSON.parse(cost.stdout);
       assert.equal(report.schemaVersion, 2);
       assert.equal(report.parent.requests, 1);
       assert.equal(report.parent.modelCosts[0].model, 'claude-opus-5');
       assert.match(report.buildCommit, /^[0-9a-f]{40}$/);
-      const failure = run('arc "unknown command"');
       assert.equal(failure.status, 1, failure.stderr);
       assert.match(failure.stderr, /Unknown command: unknown command/);
     }
@@ -458,40 +1024,33 @@ test.skipIf(process.platform !== 'win32')(
         ]),
         '& $env:ComSpec /d /c "arc windows --json"',
       ];
-      // One shell runs every invocation. Each command keeps its own output and exit status.
-      const script = `
+      const batchSignal = AbortSignal.any([signal, AbortSignal.timeout(25_000)]);
+      const results = await runLauncherCommands(
+        invocations.map((command) => async () => {
+          const script = `
 [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding
-${invocations
-  .map(
-    (command) => `
-[pscustomobject]@{command=${quote(command)};state='running'} | ConvertTo-Json -Compress
 $captured = & { ${command} } 2>&1
 $status = $LASTEXITCODE
 $output = ($captured | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] } | ForEach-Object { $_.ToString() }) -join "\n"
 $errors = ($captured | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] } | ForEach-Object { $_.ToString() }) -join "\n"
 [pscustomobject]@{command=${quote(command)};status=$status;stdout=$output;stderr=$errors} | ConvertTo-Json -Compress
-`,
-  )
-  .join('')}
 `;
-      const batch = await promisify(execFile)(
-        powershell,
-        ['-NoProfile', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')],
-        {
-          cwd: root,
-          env: terminalEnv,
-          encoding: 'utf8',
-          timeout: 25_000,
-          signal,
-        },
-      ).catch((error: Error & { stdout?: string; stderr?: string }) => {
-        assert.fail(`${error.message}\nstdout:\n${error.stdout ?? ''}\nstderr:\n${error.stderr ?? ''}`);
-      });
-      const results = batch.stdout
-        .trim()
-        .split(/\r?\n/)
-        .map((line) => JSON.parse(line) as { status?: number; stdout: string; stderr: string })
-        .filter((result) => result.status !== undefined);
+          const batch = await runLauncherCommand(
+            powershell,
+            ['-NoProfile', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')],
+            {
+              cwd: root,
+              env: terminalEnv,
+              signal: batchSignal,
+            },
+          ).catch((error: Error & { stdout?: string; stderr?: string }) => {
+            assert.fail(`${command}\n${error.message}\nstdout:\n${error.stdout ?? ''}\nstderr:\n${error.stderr ?? ''}`);
+          });
+          assert.equal(batch.status, 0, `${command}\n${batch.stderr}`);
+          return JSON.parse(batch.stdout.trim()) as { status: number; stdout: string; stderr: string };
+        }),
+        batchSignal,
+      );
       assert.equal(results.length, invocations.length);
       const [status, invalid, help] = results;
       assert.equal(status.status, 0, status.stderr);

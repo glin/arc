@@ -15,6 +15,7 @@ import { runInNewContext } from 'node:vm';
 import ts from 'typescript';
 import { declarationSource } from '../../extension/test/source-contract.ts';
 import { validContinuationPath } from '../../extension/src/compactrequest.ts';
+import { bundledTools } from '../../extension/scripts/bundled-tools.mjs';
 import { readSkillPayload, skillTemporaryRoots } from '../src/skillfiles.ts';
 import { operateSkill } from '../src/skills.ts';
 import { runCollect } from '../src/collect.ts';
@@ -423,7 +424,7 @@ test('foreign, changed, added and linked skills remain unchanged for explicit op
 // Runs the compiled command with a fixture home and returns its exit status and receipt.
 function runSkillCommand(home, action, ...agents) {
   const child = spawnSync(process.execPath, [cli, 'skills', action, ...agents.flatMap((agent) => ['--agent', agent])], {
-    env: { ...process.env, HOME: home, USERPROFILE: home, CLAUDE_CONFIG_DIR: '' },
+    env: { ...process.env, HOME: home, USERPROFILE: home, ARC_HOME: join(home, '.arc'), CLAUDE_CONFIG_DIR: '' },
     encoding: 'utf8',
   });
   assert.ok(child.stdout, child.stderr);
@@ -1253,6 +1254,150 @@ if(phase==='backed-up'){process.stdin.resume(); process.stdout.write('backed-up\
     }
   },
 );
+
+function releaseSkillFixture(root) {
+  const dist = join(root, 'dist');
+  mkdirSync(dist, { recursive: true });
+  fs.copyFileSync(cli, join(dist, 'cli.cjs'));
+  fs.copyFileSync(join(cli, '../windowpipe.exe'), join(dist, 'windowpipe.exe'));
+  const { identity } = bundledTools(dist, fileURLToPath(new URL('../../', import.meta.url)), {
+    extensionVersion: '0.1.0',
+    sourceCommit: 'a'.repeat(40),
+  });
+  const release = join(root, 'installed release');
+  fs.renameSync(join(dist, 'tools'), release);
+  writeFileSync(join(release, 'release.json'), JSON.stringify(identity));
+  return { release, identity };
+}
+
+test.each(['extension', 'bundled', 'npm', 'release'])(
+  'skills update replaces both personal copies from the %s command layout',
+  { tags: ['subprocess'] },
+  (layout) => {
+    const root = mkdtempSync(join(realpathSync(tmpdir()), 'arc-skill-command-layout-'));
+    const home = join(root, 'home');
+    mkdirSync(home);
+    try {
+      const installed = runSkillCommand(home, 'install', 'claude', 'codex');
+      assert.equal(installed.status, 0, JSON.stringify(installed));
+      assert.deepEqual(
+        installed.results.map((one) => one.status),
+        ['installed', 'installed'],
+      );
+      let executable;
+      let source;
+      if (layout === 'release') {
+        const { release } = releaseSkillFixture(root);
+        executable = join(release, 'cli/arc.cjs');
+        source = join(release, 'skills/arc-sessions');
+      } else {
+        const [command, payload] = {
+          extension: ['extension/dist/cli.cjs', 'extension/dist/tools/skills/arc-sessions'],
+          bundled: ['extension/dist/tools/cli/arc.cjs', 'extension/dist/tools/skills/arc-sessions'],
+          npm: ['npm/dist/arc.cjs', 'npm/skills/arc-sessions'],
+        }[layout];
+        executable = join(root, command);
+        source = join(root, payload);
+        mkdirSync(join(executable, '..'), { recursive: true });
+        fs.copyFileSync(cli, executable);
+        fs.cpSync(new URL('../skills/arc-sessions', import.meta.url), source, { recursive: true });
+        if (layout === 'npm') writeFileSync(join(root, 'npm/package.json'), '{"name":"@glin/arc"}');
+      }
+      writeFileSync(join(source, 'layout-resource.txt'), 'updated resource');
+      if (layout === 'release') {
+        const manifestPath = join(executable, '../../release.json');
+        const { contentId: _, ...manifest } = JSON.parse(readFileSync(manifestPath, 'utf8'));
+        manifest.files['skills/arc-sessions/layout-resource.txt'] = {
+          sha256: createHash('sha256').update('updated resource').digest('hex'),
+          mode: 0o644,
+        };
+        fs.chmodSync(join(source, 'layout-resource.txt'), 0o644);
+        writeFileSync(
+          manifestPath,
+          JSON.stringify({
+            ...manifest,
+            contentId: createHash('sha256').update(JSON.stringify(manifest)).digest('hex'),
+          }),
+        );
+      }
+      const child = spawnSync(
+        process.execPath,
+        [executable, 'skills', 'update', '--agent', 'claude', '--agent', 'codex'],
+        {
+          cwd: home,
+          env: { ...process.env, HOME: home, USERPROFILE: home, ARC_HOME: join(home, '.arc'), CLAUDE_CONFIG_DIR: '' },
+          encoding: 'utf8',
+        },
+      );
+      assert.equal(child.status, 0, child.stderr || child.stdout);
+      const receipt = JSON.parse(child.stdout);
+      assert.deepEqual(
+        receipt.results.map((one) => one.status),
+        ['updated', 'updated'],
+      );
+      if (layout === 'release') {
+        const env = {
+          ...process.env,
+          HOME: home,
+          USERPROFILE: home,
+          ARC_HOME: join(home, '.arc'),
+          CLAUDE_CONFIG_DIR: '',
+          ARC_EDITOR_EXECUTABLE: process.execPath,
+        };
+        for (const key of Object.keys(env)) if (key.toUpperCase() === 'PATH') delete env[key];
+        env.PATH =
+          join(executable, '../../launchers') +
+          (process.platform === 'win32' ? ';' : ':') +
+          (process.env.PATH ?? process.env.Path ?? '');
+        const launched = spawnSync(
+          process.platform === 'win32' ? (process.env.ComSpec ?? 'cmd.exe') : '/bin/sh',
+          process.platform === 'win32'
+            ? ['/d', '/c', 'arc skills update --agent claude --agent codex']
+            : ['-c', 'arc skills update --agent claude --agent codex'],
+          { cwd: home, env, encoding: 'utf8' },
+        );
+        assert.equal(launched.status, 0, launched.stderr || launched.stdout);
+        assert.deepEqual(
+          JSON.parse(launched.stdout).results.map((one) => one.status),
+          ['unchanged', 'unchanged'],
+        );
+      }
+      const payload = readSkillPayload(executable);
+      for (const folder of ['.claude', '.agents'])
+        expectPayloadCopy(join(home, folder, 'skills/arc-sessions'), payload);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+);
+
+test('release skill selection requires its complete artifact identity', { tags: ['subprocess'] }, () => {
+  const root = mkdtempSync(join(realpathSync(tmpdir()), 'arc-skill-release-'));
+  try {
+    const { release, identity } = releaseSkillFixture(root);
+    const executable = join(release, 'cli/arc.cjs');
+    for (const platform of ['win32', 'darwin', 'linux'])
+      assert.equal(
+        readSkillPayload(executable, platform).directory,
+        canonicalToolPath(join(release, 'skills/arc-sessions')),
+      );
+    assert.throws(() => readSkillPayload(executable, 'freebsd'), /cannot identify this command release/);
+    const manifest = join(release, 'release.json');
+    writeFileSync(manifest, '{}');
+    assert.throws(() => readSkillPayload(executable), /cannot identify this command release/);
+    writeFileSync(manifest, JSON.stringify({ ...identity, contentId: '0'.repeat(64) }));
+    assert.throws(() => readSkillPayload(executable), /cannot identify this command release/);
+    writeFileSync(manifest, JSON.stringify(identity));
+    fs.appendFileSync(executable, '\n// changed command bytes\n');
+    assert.throws(() => readSkillPayload(executable), /cli\/arc.cjs is damaged/);
+    fs.unlinkSync(manifest);
+    const hashFolder = join(root, 'b'.repeat(64));
+    fs.renameSync(release, hashFolder);
+    assert.throws(() => readSkillPayload(join(hashFolder, 'cli/arc.cjs')), /ENOENT/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test('session skill payload selection follows each executing artifact and rejects caller substitutes', () => {
   const root = mkdtempSync(join(realpathSync(tmpdir()), 'arc-skill-layout-'));
