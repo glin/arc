@@ -28,6 +28,7 @@ import { SCHEME } from './uris';
 import { relativePath, nativePath, linkTarget, resolveLink, projectsRoot, sessionFileFor } from './transcript';
 import { nativeCitationPath } from './domain/file-citation';
 import { sessionRenameTitle } from './sessionrename';
+import { watchInitialCodexName } from './codex';
 import { registerPanel, PanelProvider } from './panelhost';
 import { readSetting } from './config';
 import { STORED_STATE_KEYS } from './identity';
@@ -634,6 +635,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       void panel.refresh();
     },
     onStateChange: (state) => {
+      panel.initialNamesChanged();
       if (state.exited) panel.onDispatchExit?.(state.key);
       if (state.exited) {
         policyMoves.delete(state.key);
@@ -2115,7 +2117,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         });
       },
     });
-  panel.onRenameStartedSession = async (agent, sessionId, cwd, rawTitle) => {
+  panel.onRenameStartedSession = async (agent, sessionId, cwd, rawTitle, current) => {
     const title = sessionRenameTitle(rawTitle);
     if (!title) throw new Error('Enter a session name.');
     await renameAgentSession(host, {
@@ -2124,11 +2126,23 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       title,
       file: '',
       initial: true,
+      current,
       sourceFile: () => sessionFileFor(projectsRoot(), [cwd], sessionId) ?? '',
       idlePlan: () => {
         throw new Error('The new session is no longer connected.');
       },
     });
+  };
+  panel.onInitialNameReadiness = (session, cwd, wake) => {
+    const child = host.find('codex', session);
+    const subscription = watchInitialCodexName(session, cwd, wake);
+    return {
+      current: () => {
+        const ready = subscription.current();
+        return { ...ready, current: ready.current && child !== null && host.find('codex', session) === child };
+      },
+      dispose: () => subscription.dispose(),
+    };
   };
   const withStartedSessionActivity = async <T>(
     session: AgentSession,

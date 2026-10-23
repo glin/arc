@@ -35,9 +35,9 @@
     "matricesSha256": "ee41bd99bc78c90d9caa53af20ec903968f2860939812170f9d5a393eede6a0c"
   },
   "extension/src/agenthost.test.ts": {
-    "reason": "A spawned agent must receive the activation window, editor executable, and command search path. Self-compaction crosses native background settlement, response retention for provider turns, and workspace scope recovery.",
-    "cases": 298,
-    "matricesSha256": "f8514938eaed94232208028a11f4c52c7ee1215f4e6a72bdaf9a97d31428de08"
+    "reason": "A spawned agent must receive the activation window, editor executable, and command search path. Self-compaction crosses native background settlement, response retention for provider turns, and workspace scope recovery. Initial naming must recheck ownership after host waits and serialize after reader renames.",
+    "cases": 300,
+    "matricesSha256": "b2368dbc583d692f9ca154239b9a467dd098cf5edc61a39ce9b5d817cbeb3f35"
   },
   "extension/src/chrome.browser.test.ts": {
     "reason": "Panel controls must preserve native focus, keyboard handling, and browser event delivery.",
@@ -56,8 +56,8 @@
   },
   "extension/src/codex.test.ts": {
     "reason": "Real Git worktree ownership and descendant source resolution must agree with recorded Codex session relationships.",
-    "cases": 474,
-    "matricesSha256": "a3a1ae1d6f3769f9cb44997e3490db5401ecc50408d727245465f7a4d5c83a73"
+    "cases": 475,
+    "matricesSha256": "ad69cc6ea25cca704d249c0663044b9dfb2fc3a1989229e8b14005c126f506cf"
   },
   "extension/src/derivedcache.test.ts": {
     "reason": "Independent writers and host death must preserve shared cache rows and release stale filesystem locks.",
@@ -125,9 +125,9 @@
     "matricesSha256": "5b04d61cb9d18e1eb073a37369de0c1da0cb67facf539e573deea905a1aa5f59"
   },
   "extension/src/panel.webview.test.ts": {
-    "reason": "Real progressive workers must deliver bounded recovery and metadata through the production panel host.",
-    "cases": 609,
-    "matricesSha256": "4d5022f04fcf144b148b91bc1d15fbf90d58062e05c45fa4d42554e7a3d2921f"
+    "reason": "Real progressive workers must deliver bounded recovery and metadata through the production panel host. Start metadata must survive storage delays, hidden panels, preference resets, and reloads.",
+    "cases": 612,
+    "matricesSha256": "3e1027e3d8cd75e61898476fa5ff7f3295b33437899ffac142cc683a37bee3cf"
   },
   "extension/src/panelbundle.test.ts": {
     "reason": "The panel bundle and fixture must contain the production entry, source identity, and substituted text.",

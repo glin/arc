@@ -1333,6 +1333,7 @@ function policyCallbacks(host: AgentHost, policies: LaunchPolicyStore) {
   const modes: unknown[] = [];
   const errors: string[] = [];
   const panel: any = {
+    initialNamesChanged() {},
     refresh() {},
     noteSessionMoved: (source: string, next: string) => moves.push([source, next]),
     setCodexEffectiveMode: (...args: unknown[]) => modes.push(args),
@@ -9562,6 +9563,58 @@ test('an idle Codex session renames through a handshake-only child and never ope
   assert.equal(child.sent().some(MODEL_TURN), false);
 });
 
+test.each(['reader-first', 'initial-first'] as const)(
+  'a reader rename wins across the host rename queue with %s',
+  async (order) => {
+    const { host, children } = fakeHost();
+    const opening = host.session('cx', codexPlan(CODEX, { cwd: WS, clientInfo: CODEX_CLIENT, resume: 'thread-7' }));
+    const child = children[0];
+    await answerCodexHandshake(child);
+    child.reply({ thread: { id: 'thread-7' } });
+    await opening;
+    const openedFrames = child.sent().length;
+    let current = true;
+    const first = host.renameSession(
+      'codex',
+      'thread-7',
+      order === 'reader-first' ? 'Reader name' : 'Initial name',
+      NO_IDLE_PLAN,
+    );
+    await vi.waitFor(() => assert.equal(child.sent().at(-1)?.method, 'thread/name/set'));
+    const before = child.sent().filter((frame) => frame.method === 'thread/name/set').length;
+    const second = host.renameSession(
+      'codex',
+      'thread-7',
+      order === 'reader-first' ? 'Initial name' : 'Reader name',
+      NO_IDLE_PLAN,
+      order === 'reader-first' ? () => current : undefined,
+    );
+    const outcome = second.catch((error) => error);
+    current = false;
+    child.reply({});
+    await first;
+    if (order === 'reader-first') {
+      assert.match((await outcome).message, /cancelled/);
+      assert.equal(child.sent().filter((frame) => frame.method === 'thread/name/set').length, before);
+    } else {
+      await vi.waitFor(() => assert.equal((child.sent().at(-1)?.params as any)?.name, 'Reader name'));
+      child.reply({});
+      await second;
+      assert.equal(
+        (
+          child
+            .sent()
+            .filter((frame) => frame.method === 'thread/name/set')
+            .at(-1)?.params as any
+        )?.name,
+        'Reader name',
+      );
+    }
+    assert.equal(children.length, 1);
+    assert.equal(child.sent().slice(openedFrames).some(MODEL_TURN), false);
+  },
+);
+
 test('an idle Codex rename rejects with the server refusal', async () => {
   const { host, children } = fakeHost();
   const renamed = host.renameSession('codex', 'thread-7', 'Complete name', codexRenameChild);
@@ -9573,6 +9626,42 @@ test('an idle Codex rename rejects with the server refusal', async () => {
   child.exit(0);
   await assert.rejects(renamed, /name refused/);
   assert.equal(child.sent().some(MODEL_TURN), false);
+});
+
+test('initial-name validity is checked after the child activity wait immediately before writing', async () => {
+  const { host, children } = fakeHost();
+  const opening = host.session('cx', codexPlan(CODEX, { cwd: WS, clientInfo: CODEX_CLIENT, resume: 'thread-7' }));
+  const child = children[0];
+  await answerCodexHandshake(child);
+  child.reply({ thread: { id: 'thread-7' } });
+  await opening;
+  const activity = host.withActivity.bind(host);
+  let release = () => {};
+  let entered = false;
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const wait = vi.spyOn(host, 'withActivity').mockImplementation(async (key, work) => {
+    entered = true;
+    await held;
+    return activity(key, work);
+  });
+  let current = true;
+  const renamed = host.renameSession('codex', 'thread-7', 'Initial name', NO_IDLE_PLAN, () => current);
+  const refused = assert.rejects(renamed, /cancelled/);
+  try {
+    await vi.waitFor(() => assert.equal(entered, true));
+    current = false;
+    release();
+    await refused;
+    assert.equal(
+      child.sent().some((frame) => frame.method === 'thread/name/set'),
+      false,
+    );
+  } finally {
+    release();
+    wait.mockRestore();
+  }
 });
 
 test('Codex live input preserves dispatch root ownership and adds no completion', async () => {

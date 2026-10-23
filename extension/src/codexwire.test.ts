@@ -15,6 +15,7 @@ import {
   turnOutcome,
 } from './codexwire.ts';
 import { WireEvent, Ask, RateLimit, GuardedAttempt } from './agentwire.ts';
+import { SessionNameUncertain } from './sessionrename.ts';
 
 // App-server fixtures retain protocol fields, including request ID 0. A truthiness check must not discard that ID.
 
@@ -579,6 +580,20 @@ test('a Codex rename rejects with the server refusal', async () => {
   const renamed = h.wire.renameThread(THREAD, 'Complete name');
   h.wire.receive(JSON.stringify({ id: h.parsed()[0].id, error: { code: -32000, message: 'name rejected' } }));
   await assert.rejects(renamed, /name rejected/);
+});
+
+test.each(['deadline', 'lost child'])('a Codex rename retains uncertainty after %s', async (loss) => {
+  vi.useFakeTimers();
+  try {
+    const h = harness(10);
+    const result = h.wire.renameThread(THREAD, 'Complete name').catch((error) => error);
+    if (loss === 'deadline') await vi.advanceTimersByTimeAsync(10);
+    else h.wire.close('transport ended');
+    assert.ok((await result) instanceof SessionNameUncertain);
+    assert.equal(h.parsed().length, 1);
+  } finally {
+    vi.useRealTimers();
+  }
 });
 
 test('compaction uses the app-server thread control and never starts a model turn', async () => {

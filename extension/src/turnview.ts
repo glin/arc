@@ -1,4 +1,5 @@
 import { DRAFT_SESSION_PREFIX, normalizeSessionLabels, sweepDraftLabels } from './turnlabels';
+import { normalizeInitialSessionNames } from './sessionrename';
 import { PROMPT_TEXT_CHARS } from './domain/prompt-text.ts';
 import { normalizeSavedViews, type SavedView } from './domain/views.ts';
 import { normalizeRailSort, type RailSort } from './domain/rail-sort.ts';
@@ -155,6 +156,7 @@ export interface QueuedSubmission {
 import { mergeSubmittedPrompts, type SubmittedPrompt } from './webview/state';
 
 export interface PanelState {
+  initialNames?: Record<string, import('./sessionrename').InitialSessionName>;
   readerParents: Record<string, string>;
   submittedPrompts?: SubmittedPrompt[];
   open: string[];
@@ -315,6 +317,9 @@ export function normalizePanelState(raw: unknown, heldRailFilters?: readonly Sav
     // itself to their ceilings, and files every name under one spelling.
     labels: normalizeSessionLabels(src.labels),
     readerParents: normalizeReaderParents(src.readerParents),
+    ...(src.initialNames === undefined
+      ? {}
+      : { initialNames: normalizeInitialSessionNames(src.initialNames, SESSION_LIMIT) }),
     // Rebuilt by the module that owns them, which cuts the list to its ceiling and drops an
     // entry it cannot read.
     views,
@@ -388,13 +393,14 @@ export function withSweptDraftLabels(raw: unknown): unknown {
 // Session cards carry the displayed label fields. Other panel-owned fields pass through.
 export function webviewPanelState(
   state: PanelState,
-): Omit<PanelState, 'labels' | 'railFilters' | 'readerParents' | 'agentRead'> {
+): Omit<PanelState, 'labels' | 'railFilters' | 'readerParents' | 'agentRead' | 'initialNames'> {
   const served: Partial<PanelState> = { ...state };
+  delete served.initialNames;
   delete served.labels;
   delete served.readerParents;
   delete served.agentRead;
   delete served.railFilters;
-  return served as Omit<PanelState, 'labels' | 'railFilters' | 'readerParents' | 'agentRead'>;
+  return served as Omit<PanelState, 'labels' | 'railFilters' | 'readerParents' | 'agentRead' | 'initialNames'>;
 }
 
 // How many folds the record keeps. Saved views have no reader-facing limit, so this ceiling

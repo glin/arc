@@ -1,4 +1,5 @@
 import { unavailableDefaults, type AppliedDefaults } from './view/model-picks';
+import { SessionNameUncertain } from './sessionrename';
 import { promptToken } from './domain/composer-editing';
 import { compareVersion, parseVersion } from './domain/version';
 // Adapts Codex app-server messages to the shared agent wire events.
@@ -1094,7 +1095,12 @@ export class CodexWire {
   // Names a thread through the server, which writes the name where every Codex client reads
   // it. A refusal rejects with the server's own message.
   async renameThread(threadId: string, name: string): Promise<void> {
-    await this.request('thread/name/set', { threadId, name });
+    try {
+      await this.request('thread/name/set', { threadId, name });
+    } catch (error) {
+      if (error instanceof RequestRefused) throw error;
+      throw new SessionNameUncertain(error instanceof Error ? error.message : String(error));
+    }
   }
 
   async listThreads(limit = 20): Promise<Json[]> {

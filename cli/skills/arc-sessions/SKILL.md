@@ -24,7 +24,7 @@ Pass `--arc-dispatch` when this session will send follow-ups to the session it s
 
 ## Interpret delivery
 
-`accepted` means the prompt reached an agent. `accepted-with-errors` means the same, but naming or saved metadata failed. Report those errors without starting another session.
+`accepted` means the prompt reached an agent. `accepted-with-errors` means the same, with metadata errors or uncertain saves. Report those errors without starting another session.
 
 After either result, link each new session in the reply as [links.md](links.md) defines. Pass `--name` on every start, because the link label is the requested name. Where links.md forbids a link, say why.
 

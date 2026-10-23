@@ -140,6 +140,11 @@ async function host() {
           status: 'accepted',
           provider: request.params.setup?.kind === 'custom' ? request.params.setup.agent : 'claude',
           sessionId: 'accepted',
+          metadata: {
+            labels: { state: 'saved', values: request.params.labels ?? [] },
+            pinned: { state: 'saved', value: request.params.pinned === true },
+            name: { state: 'pending', requested: request.params.name },
+          },
         }
       : { method: request.method, params: request.params };
   });
@@ -224,6 +229,11 @@ test('start preserves classification and dispatch ownership for both providers',
           '--pinned',
         ];
         const output = await runManagement('start', args);
+        assert.deepEqual(JSON.parse(output).metadata, {
+          labels: { state: 'saved', values: ['Initial'] },
+          pinned: { state: 'saved', value: true },
+          name: { state: 'pending', requested: 'Review' },
+        });
         assert.equal(output.includes('ARC_DISPATCH_SESSION='), false);
         assert.equal(requests.at(-1)!.params.agentRun, agentRun);
         assert.equal(requests.at(-1)!.params.prompt, 'Review this project.');

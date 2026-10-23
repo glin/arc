@@ -98,32 +98,230 @@ export async function confirmClaudeRename(
   throw new Error('Claude Code did not save the new session name.');
 }
 
-// Retry only metadata that the accepted Codex rollout has not written yet.
-export async function renameInitialCodexSession(
-  sessionId: string,
-  rename: () => Promise<void>,
-  options: { attempts?: number; pause?: () => Promise<void> } = {},
-): Promise<void> {
-  const attempts = options.attempts ?? 40;
-  const deadline = performance.now() + 2000;
-  const pause = options.pause ?? (() => new Promise<void>((resolve) => setTimeout(resolve, 50)));
-  for (let attempt = 0; attempt < attempts; attempt++) {
+export function emptyCodexRollout(error: unknown, sessionId: string): boolean {
+  const message = error instanceof Error ? error.message : '';
+  return (
+    message.startsWith('failed to set thread name:') &&
+    message.includes(`failed to update thread metadata ${sessionId}:`) &&
+    message.includes(': rollout at ') &&
+    message.endsWith(`-${sessionId}.jsonl is empty`)
+  );
+}
+
+export interface InitialSessionName {
+  provider: 'codex';
+  session: string;
+  activation: string;
+  cwd: string;
+  requested: string;
+  revision: string;
+  state: 'pending' | 'saved' | 'failed' | 'cancelled' | 'uncertain';
+  attempts: number;
+  possibleWrite: boolean;
+  error?: string;
+}
+
+export interface InitialNameReadiness {
+  evidence: string;
+  source: string;
+  title?: string;
+  current: boolean;
+}
+
+export interface InitialNameSubscription {
+  current(): InitialNameReadiness;
+  dispose(): void;
+}
+
+export class InitialNameCancelled extends Error {
+  constructor() {
+    super('The initial session name was cancelled.');
+  }
+}
+
+export class SessionNameUncertain extends Error {}
+
+export function normalizeInitialSessionNames(raw: unknown, limit: number): Record<string, InitialSessionName> {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
+  const entries: [string, InitialSessionName][] = [];
+  for (const [key, value] of Object.entries(raw)) {
+    if (!value || typeof value !== 'object') continue;
+    const item = value as InitialSessionName;
+    if (
+      item.provider !== 'codex' ||
+      key !== item.session ||
+      !['activation', 'cwd', 'revision'].every(
+        (field) =>
+          typeof item[field as keyof InitialSessionName] === 'string' && item[field as keyof InitialSessionName],
+      ) ||
+      !sessionRenameTitle(item.requested) ||
+      item.requested !== sessionRenameTitle(item.requested) ||
+      !['pending', 'saved', 'failed', 'cancelled', 'uncertain'].includes(item.state) ||
+      !Number.isInteger(item.attempts) ||
+      item.attempts < 0 ||
+      item.attempts > 40 ||
+      typeof item.possibleWrite !== 'boolean'
+    )
+      continue;
+    entries.push([
+      key,
+      {
+        provider: 'codex',
+        session: key,
+        activation: item.activation,
+        cwd: item.cwd,
+        requested: item.requested,
+        revision: item.revision,
+        state: item.state,
+        attempts: item.attempts,
+        possibleWrite: item.possibleWrite,
+        ...(typeof item.error === 'string' ? { error: item.error.slice(0, 4096) } : {}),
+      },
+    ]);
+  }
+  return Object.fromEntries(entries.slice(-limit));
+}
+
+// A saved possible write survives loss of the activation without granting another write.
+export function restoreInitialSessionNames(book: Record<string, InitialSessionName>): void {
+  for (const item of Object.values(book)) {
+    if (item.state === 'pending') item.state = item.possibleWrite ? 'uncertain' : 'cancelled';
+  }
+}
+
+// One activation owns each operation. Readiness changes never duplicate an in-flight request.
+export class InitialNameOperation {
+  private subscription: InitialNameSubscription | null = null;
+  private running = false;
+  private stopped = false;
+  private evidence = '';
+  private source = '';
+  private first = true;
+
+  constructor(
+    private readonly read: () => InitialSessionName,
+    private readonly persist: () => Promise<void>,
+    private readonly valid: () => boolean,
+    private readonly rename: (current: () => boolean) => Promise<void>,
+  ) {}
+
+  start(subscribe: (wake: () => void) => InitialNameSubscription): void {
+    this.subscription = subscribe(() => {
+      void this.wake();
+    });
+    void this.wake();
+  }
+
+  cancel(): void {
+    if (this.stopped) return;
+    this.stopped = true;
+    this.subscription?.dispose();
+    const item = this.read();
+    if (item.state === 'pending') {
+      item.state = item.possibleWrite ? 'uncertain' : 'cancelled';
+      void this.persist().catch(() => {});
+    }
+  }
+
+  changed(): void {
+    if (!this.current()) this.cancel();
+    else void this.wake();
+  }
+
+  private current = (): boolean =>
+    !this.stopped &&
+    this.valid() &&
+    this.read().state === 'pending' &&
+    (!this.subscription ||
+      (this.subscription.current().current && (!this.source || this.subscription.current().source === this.source)));
+
+  private writable = (): boolean => this.current() && !this.subscription?.current().title;
+
+  private async finishUnsent(): Promise<void> {
+    const item = this.read();
+    item.possibleWrite = false;
+    const saved = this.current() && this.subscription?.current().title === item.requested;
+    await this.finish(saved ? 'saved' : 'cancelled');
+  }
+
+  private async finish(state: InitialSessionName['state'], error?: string): Promise<void> {
+    const item = this.read();
+    item.state = state;
+    if (error) item.error = error;
+    this.stopped = true;
+    this.subscription?.dispose();
+    await this.persist();
+  }
+
+  private async wake(): Promise<void> {
+    if (this.running || this.stopped || !this.subscription) return;
+    this.running = true;
     try {
-      await rename();
-      return;
-    } catch (error) {
-      const message = error instanceof Error ? error.message : '';
-      if (
-        attempt + 1 === attempts ||
-        performance.now() >= deadline ||
-        !message.startsWith('failed to set thread name:') ||
-        !message.includes(`failed to update thread metadata ${sessionId}:`) ||
-        !message.includes(': rollout at ') ||
-        !message.endsWith(`-${sessionId}.jsonl is empty`)
-      )
-        throw error;
-      await pause();
-      if (performance.now() >= deadline) throw error;
+      while (this.current()) {
+        const ready = this.subscription.current();
+        if (!ready.current || (this.source && ready.source !== this.source)) {
+          this.cancel();
+          return;
+        }
+        if (ready.source) this.source = ready.source;
+        const item = this.read();
+        if (ready.title) {
+          await this.finish(ready.title === item.requested ? 'saved' : 'cancelled');
+          return;
+        }
+        if (item.attempts >= 40) {
+          await this.finish('failed', 'Codex did not save the initial session name.');
+          return;
+        }
+        if (!this.first && (!ready.evidence || ready.evidence === this.evidence)) return;
+        this.first = false;
+        this.evidence = ready.evidence;
+        item.attempts++;
+        item.possibleWrite = true;
+        await this.persist();
+        if (!this.writable()) {
+          await this.finishUnsent();
+          return;
+        }
+        try {
+          await this.rename(this.writable);
+        } catch (error) {
+          if (error instanceof InitialNameCancelled) {
+            await this.finishUnsent();
+            return;
+          }
+          if (emptyCodexRollout(error, item.session)) {
+            this.read().possibleWrite = false;
+            await this.persist();
+            if (!this.current()) {
+              await this.finish('cancelled');
+              return;
+            }
+            continue;
+          }
+          const message = error instanceof Error ? error.message : String(error);
+          // Lost control replies leave the saved-name outcome unknown.
+          await this.finish(
+            error instanceof SessionNameUncertain ||
+              /timeout|timed out|did not answer|closed|stopped|disconnected|exit/i.test(message)
+              ? 'uncertain'
+              : 'failed',
+            message,
+          );
+          return;
+        }
+        this.read().possibleWrite = false;
+        await this.finish(this.current() ? 'saved' : 'cancelled');
+        return;
+      }
+      this.cancel();
+    } catch {
+      const item = this.read();
+      item.state = 'uncertain';
+      this.stopped = true;
+      this.subscription?.dispose();
+    } finally {
+      this.running = false;
     }
   }
 }

@@ -2219,6 +2219,7 @@ import {
 import { StartupThresholdWatch, createDiagnosticsLog, HostHealth } from './diagnosticslog.ts';
 import { reportWindowTransport, windowTransportErrorCode, type WindowTransportRecord } from './windowpipe.ts';
 import { answerSessionRename, sessionRenameTitle } from './sessionrename.ts';
+import { watchInitialCodexName } from './codex.ts';
 import * as renameTranscripts from './transcript.ts';
 import { claudeSkillPath } from './claudeskillpath.ts';
 import { GuardedAttempt, type PromptEntry } from './agentwire.ts';
@@ -4364,7 +4365,7 @@ test('window starts adopt both providers and classifications without changing th
       );
       assert.equal(
         messages.some((message) => message.type === 'initialName'),
-        true,
+        agent === 'claude',
       );
     }
 });
@@ -18126,6 +18127,7 @@ test('archive and unarchive are bounded membership updates', () => {
   const archiveChanges: string[][] = [];
   const persisted: unknown[] = [];
   const provider = {
+    cancelInitialName() {},
     persistHostState() {
       return Promise.resolve(Reflect.apply(this.memento.update, this.memento, ['arc.panelState', this.saved]));
     },
@@ -18180,6 +18182,71 @@ test('archive and unarchive are bounded membership updates', () => {
   assert.equal(provider.railPosts, 2);
   assert.equal(provider.refreshes, 0);
   assert.equal(provider.enumerations, 0);
+});
+
+test('queued browser preferences and reset preserve initial-name operations while reload never replays possible writes', async () => {
+  const f = orderedHostReadFixture();
+  Object.assign(f.provider, {
+    queues: {},
+    draftCommentIds: {},
+    drafts: {},
+    sentPrompts: {},
+    startedHere: new Set(),
+    assets: {},
+    hostSessions: new Map(),
+    hostPreviousSessions: new Map(),
+    refresh: async () => {},
+  });
+  const warning = (vscode.window as any).showWarningMessage;
+  (vscode.window as any).showWarningMessage = async () => 'Reset';
+  const record = (session: string, possibleWrite: boolean) => ({
+    provider: 'codex' as const,
+    session,
+    cwd: 'C:/workspace',
+    activation: 'ended',
+    requested: 'Initial name',
+    revision: session,
+    state: 'pending' as const,
+    attempts: possibleWrite ? 1 : 0,
+    possibleWrite,
+  });
+  let release = () => {};
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const blocker = f.provider.readOwner().operations.serialize(() => held);
+  const preferences = f.provider.saveState({ initialNames: { forged: record('forged', false) } });
+  f.provider.saved.initialNames = { unsent: record('unsent', false), submitted: record('submitted', true) };
+  const retained = structuredClone(f.provider.saved.initialNames);
+  try {
+    release();
+    await blocker;
+    await preferences;
+    assert.deepEqual(f.provider.saved.initialNames, retained);
+    assert.deepEqual(f.writes.at(-1).initialNames, retained);
+    assert.equal('initialNames' in webviewPanelState(f.provider.saved), false);
+    await f.provider.forgetState();
+    assert.deepEqual(f.provider.saved.initialNames, retained);
+    assert.deepEqual(f.writes.at(-1).initialNames, retained);
+    const listener = vi.spyOn(PanelProvider.prototype as any, 'wireEditorListeners').mockImplementation(() => {});
+    let fresh: any;
+    try {
+      fresh = new PanelProvider(
+        '',
+        {} as vscode.Uri,
+        { get: () => ({ initialNames: retained }), update: async () => {} } as unknown as vscode.Memento,
+      );
+      assert.equal(fresh.saved.initialNames.unsent.state, 'cancelled');
+      assert.equal(fresh.saved.initialNames.submitted.state, 'uncertain');
+      assert.equal(fresh.initialNameOperations, undefined);
+    } finally {
+      fresh?.dispose();
+      listener.mockRestore();
+    }
+  } finally {
+    release();
+    (vscode.window as any).showWarningMessage = warning;
+  }
 });
 
 test('pinning persists the opened pinned section with the membership write', () => {
@@ -33860,7 +33927,7 @@ test('initial Claude naming reads only the accepted transcript and confirms its 
 });
 
 test.each([false, true])(
-  'initial Codex naming retries empty rollout after one accepted launch with agentRun=%s',
+  'initial Codex naming recovers a late empty rollout after one accepted launch with agentRun=%s',
   async (agentRun) => {
     vi.useFakeTimers();
     try {
@@ -33869,14 +33936,17 @@ test.each([false, true])(
       const session = '01a11dea-0d57-7c20-aae4-73e85aa349a5';
       const calls: unknown[] = [];
       let durable = '';
+      let refuse: (error: Error) => void = () => {};
+      let evidence = '';
+      let wake = () => {};
       const rename = initialRenameCallback(
         {
           renameSession: async (agent: string, id: string, name: string) => {
             calls.push([agent, id, name]);
             if (calls.length === 1)
-              throw new Error(
-                `failed to set thread name: Fatal error: failed to update thread metadata ${id}: thread-store internal error: failed to read session metadata C:/sessions/rollout-${id}.jsonl: rollout at C:/sessions/rollout-${id}.jsonl is empty`,
-              );
+              await new Promise<void>((_resolve, reject) => {
+                refuse = reject;
+              });
             durable = name;
           },
         },
@@ -33898,6 +33968,13 @@ test.each([false, true])(
           return { delivered: true, session, reason: '' };
         },
         onRenameStartedSession: rename,
+        onInitialNameReadiness: (_session: string, _cwd: string, changed: () => void) => {
+          wake = changed;
+          return {
+            current: () => ({ current: true, evidence, source: evidence ? 'accepted-source' : '' }),
+            dispose() {},
+          };
+        },
         saved: normalizePanelState({ showing: 'reader', readTo: { reader: 9 } }),
         drafts: { reader: 'unsent' },
         pinnedTop: new Set(),
@@ -33916,11 +33993,23 @@ test.each([false, true])(
           prompt: 'work',
           name: 'Initial Codex name',
           agentRun,
+          labels: ['introspection'],
           setup: { kind: 'custom', agent: 'codex', model: '', effort: '', permissionMode: '' },
         },
       });
-      await vi.runAllTimersAsync();
       const result = await pending;
+      assert.deepEqual(result.metadata.labels, { state: 'saved', values: ['introspection'] });
+      assert.equal(result.metadata.name.state, 'pending');
+      await vi.waitFor(() => assert.equal(calls.length, 1));
+      await vi.advanceTimersByTimeAsync(2100);
+      evidence = 'qualified-opening';
+      wake();
+      refuse(
+        new Error(
+          `failed to set thread name: Fatal error: failed to update thread metadata ${session}: thread-store internal error: failed to read session metadata C:/sessions/rollout-${session}.jsonl: rollout at C:/sessions/rollout-${session}.jsonl is empty`,
+        ),
+      );
+      await vi.waitFor(() => assert.equal(provider.saved.initialNames[session].state, 'saved'));
       assert.equal(result.status, 'accepted', JSON.stringify(result.errors));
       assert.equal(result.sessionId, session);
       assert.equal(durable, 'Initial Codex name');
@@ -33939,6 +34028,147 @@ test.each([false, true])(
     }
   },
 );
+
+test.each(['named', 'filename-free'] as const)(
+  'hidden-panel Codex naming wakes on a %s creation event after the last native event',
+  async (event) => {
+    const variable = 'ARC_CODEX_ROOT';
+    const previous = process.env[variable];
+    const root = path.join(tempDir('initial-name-hidden-'), 'sessions');
+    const day = path.join(root, ...new Date().toISOString().slice(0, 10).split('-'));
+    fs.mkdirSync(day, { recursive: true });
+    const callbacks = new Map<string, (kind: string, filename: string | null) => void>();
+    const mutableFs = createRequire(__filename)('node:fs') as typeof fs;
+    const watcher = vi.spyOn(mutableFs, 'watch').mockImplementation(((
+      directory: string,
+      _options: unknown,
+      callback: (kind: string, filename: string | null) => void,
+    ) => {
+      callbacks.set(directory, callback);
+      return {
+        on() {
+          return this;
+        },
+        close() {},
+      };
+    }) as unknown as typeof fs.watch);
+    syncBuiltinESMExports();
+    process.env[variable] = root;
+    const session = '01a11dea-0d57-7c20-aae4-73e85aa349a5';
+    const provider: any = liveProviderFixture(livePress({ sessionId: 'reader', agent: 'codex' })).provider;
+    let attempts = 0;
+    let durable = '';
+    Object.assign(provider, {
+      setupProject: 'project',
+      pendingModels: [],
+      models: {},
+      folders: () => ['C:/workspace'],
+      repositoryScope: { snapshot: () => ({ ready: true, roots: ['C:/workspace'] }) },
+      launcherFor: () => ({ view: sessionLauncherView(null, [], {}) }),
+      adoptDraft() {},
+      hidden: new Set(),
+      anyVisible: () => false,
+      pinnedTop: new Set(),
+      startedHere: new Set(),
+      onSessionSettingsAdopted: async () => {},
+      onSendDraftPrompt: async () => ({ delivered: true, session, reason: '' }),
+      onInitialNameReadiness: watchInitialCodexName,
+      onRenameStartedSession: async (_agent: string, id: string, _cwd: string, title: string) => {
+        attempts++;
+        if (attempts === 1)
+          throw new Error(
+            `failed to set thread name: failed to update thread metadata ${id}: rollout at C:/sessions/rollout-${id}.jsonl is empty`,
+          );
+        durable = title;
+      },
+    });
+    try {
+      const result = await provider.handleSessionRequest({
+        method: 'start',
+        requester: null,
+        params: {
+          prompt: 'work',
+          name: 'Saved initial name',
+          labels: ['introspection'],
+          setup: { kind: 'custom', agent: 'codex', model: '', effort: '', permissionMode: '' },
+        },
+      });
+      assert.equal(result.status, 'accepted');
+      await vi.waitFor(() => assert.equal(attempts, 1));
+      fs.writeFileSync(
+        path.join(day, `rollout-test-${session}.jsonl`),
+        JSON.stringify({ type: 'session_meta', payload: { id: session, cwd: 'C:/workspace' } }) + '\n',
+      );
+      assert.ok(callbacks.has(day), 'the accepted directory has no retained watcher');
+      callbacks.get(day)!('rename', event === 'named' ? `rollout-test-${session}.jsonl` : null);
+      await vi.waitFor(() => assert.equal(durable, 'Saved initial name'));
+      assert.equal(attempts, 2);
+      assert.equal(provider.saved.initialNames[session].state, 'saved');
+    } finally {
+      provider.cancelInitialName(session);
+      watcher.mockRestore();
+      syncBuiltinESMExports();
+      if (previous === undefined) delete process.env[variable];
+      else process.env[variable] = previous;
+    }
+  },
+);
+
+test.each([false, true])('start confirms saved labels only after storage settles with refusal=%s', async (rejected) => {
+  const provider: any = liveProviderFixture(livePress({ sessionId: 'reader', agent: 'codex' })).provider;
+  let entered = false;
+  let release = () => {};
+  let reject = (_error: Error) => {};
+  const storage = new Promise<void>((resolve, refuse) => {
+    release = resolve;
+    reject = refuse;
+  });
+  Object.assign(provider, {
+    setupProject: 'project',
+    pendingModels: [],
+    models: {},
+    folders: () => ['C:/workspace'],
+    repositoryScope: { snapshot: () => ({ ready: true, roots: ['C:/workspace'] }) },
+    launcherFor: () => ({ view: sessionLauncherView(null, [], {}) }),
+    adoptDraft() {},
+    pinnedTop: new Set(),
+    startedHere: new Set(),
+    authoritativeCatalog: [],
+    onSessionSettingsAdopted: async () => {},
+    onSendDraftPrompt: async () => ({ delivered: true, session: 'accepted', reason: '' }),
+    memento: {
+      update: async () => {
+        entered = true;
+        await storage;
+      },
+    },
+  });
+  let acknowledgment: any;
+  const pending = provider
+    .handleSessionRequest({
+      method: 'start',
+      requester: null,
+      params: {
+        prompt: 'work',
+        labels: ['introspection'],
+        pinned: true,
+        setup: { kind: 'custom', agent: 'codex', model: '', effort: '', permissionMode: '' },
+      },
+    })
+    .then((result: any) => {
+      acknowledgment = result;
+      return result;
+    });
+  await vi.waitFor(() => assert.equal(entered, true));
+  assert.equal(acknowledgment, undefined);
+  if (rejected) reject(new Error('Saving failed'));
+  else release();
+  const result = await pending;
+  assert.equal(result.status, rejected ? 'accepted-with-errors' : 'accepted');
+  assert.deepEqual(result.metadata.labels, { state: rejected ? 'uncertain' : 'saved', values: ['introspection'] });
+  assert.deepEqual(result.metadata.pinned, { state: rejected ? 'uncertain' : 'saved', value: true });
+  assert.deepEqual(provider.authoritativeCatalog, []);
+});
 
 test.each(['settings-first', 'curation-first'])(
   'a failed curation pin preserves an independently accepted initial pin through a later save at %s',

@@ -51,7 +51,7 @@ import {
   compactCommand,
   effortChoices,
 } from './composerview';
-import { confirmClaudeRename, renameInitialCodexSession } from './sessionrename';
+import { confirmClaudeRename, InitialNameCancelled } from './sessionrename';
 import {
   readCustomTitleSidecar,
   readInitialCustomTitle,
@@ -638,6 +638,7 @@ export interface SessionRenameRequest {
   file: string;
   sourceFile?: () => string;
   initial?: boolean;
+  current?: () => boolean;
   // The rename-only child, asked for only when no child runs the session.
   idlePlan: () => AgentPlan;
 }
@@ -647,9 +648,7 @@ export async function renameAgentSession(
   request: SessionRenameRequest,
   confirm: { attempts?: number; pause?: () => Promise<void> } = {},
 ): Promise<void> {
-  const rename = () => host.renameSession(request.agent, request.sessionId, request.title, request.idlePlan);
-  if (request.agent === 'codex' && request.initial) await renameInitialCodexSession(request.sessionId, rename, confirm);
-  else await rename();
+  await host.renameSession(request.agent, request.sessionId, request.title, request.idlePlan, request.current);
   if (request.agent === 'claude') {
     await confirmClaudeRename(
       request.title,
@@ -3064,7 +3063,13 @@ export class AgentHost {
 
   // Renames through the running child or a rename-only child.
   // Wait for opening, retirement, and earlier renames of the session before starting another writer.
-  async renameSession(agent: AgentName, sessionId: string, title: string, idlePlan: () => AgentPlan): Promise<void> {
+  async renameSession(
+    agent: AgentName,
+    sessionId: string,
+    title: string,
+    idlePlan: () => AgentPlan,
+    current: () => boolean = () => true,
+  ): Promise<void> {
     const identity = this.sessionIdentity(agent, sessionId);
     for (;;) {
       this.assertActive();
@@ -3083,10 +3088,12 @@ export class AgentHost {
       }
       await Promise.allSettled(pending);
     }
+    if (!current()) throw new InitialNameCancelled();
     const live = this.find(agent, sessionId);
     if (live) {
       await this.whileRenaming(identity, async () => {
         const renamed = await this.withActivity(live.key, async (child) => {
+          if (!current()) throw new InitialNameCancelled();
           await child.rename(sessionId, title);
           return true;
         });

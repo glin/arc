@@ -1,4 +1,5 @@
 import type { SourceEnumeration } from './sessioncoverage';
+import type { InitialNameSubscription } from './sessionrename';
 import * as fs from 'node:fs';
 import { ExportLimitError, type ExportRelationshipLimits } from './exportlimits';
 import {
@@ -716,6 +717,132 @@ export function enumerateRolloutFiles(root: string): SourceEnumeration {
     walk.read(entries);
   }
   return walk.result();
+}
+
+// Pending operations share one name index per path and release it with the last subscription.
+const initialNameIndexes = new Map<string, { users: number; revision: string; names: ThreadNames | null }>();
+
+// Observe accepted-session metadata independently of panel visibility and catalog admission.
+export function watchInitialCodexName(session: string, cwd: string, wake: () => void): InitialNameSubscription {
+  const root = codexSessionsRoot();
+  const files = new Set<string>();
+  const directories = new Set<string>([path.dirname(root), root]);
+  // Fresh rollouts use UTC calendar directories. Adjacent dates cover midnight during startup.
+  for (const offset of [-1, 0, 1]) {
+    const date = new Date(Date.now() + offset * 86400000).toISOString().slice(0, 10).split('-');
+    let directory = root;
+    for (const part of date) {
+      directory = path.join(directory, part);
+      directories.add(directory);
+    }
+  }
+  const watchers = new Map<string, fs.FSWatcher>();
+  let stopped = false;
+  let failed = false;
+  const indexFile = codexSessionIndexPath();
+  const index = initialNameIndexes.get(indexFile) ?? { users: 0, revision: '', names: null };
+  index.users++;
+  initialNameIndexes.set(indexFile, index);
+  const addFile = (file: string) => {
+    if (files.has(file)) return;
+    if (files.size >= 2) failed = true;
+    else files.add(file);
+  };
+  const admittedDirectory = (directory: string): boolean => {
+    if (directory === path.dirname(root)) return true;
+    const relative = path.relative(root, directory);
+    if (relative.startsWith('..') || path.isAbsolute(relative)) return false;
+    const parts = relative ? relative.split(path.sep) : [];
+    if (parts.length > WALK_DEPTH) return false;
+    let current = root;
+    for (const part of parts) {
+      current = path.join(current, part);
+      try {
+        if (!fs.lstatSync(current).isDirectory()) return false;
+      } catch {
+        return false;
+      }
+    }
+    return true;
+  };
+  const inspect = (rescan = false) => {
+    if (stopped) return;
+    for (const directory of directories) {
+      if ((!rescan && watchers.has(directory)) || !admittedDirectory(directory)) continue;
+      try {
+        if (!watchers.has(directory)) {
+          const watcher = fs.watch(directory, { persistent: false }, (_kind, name) => {
+            const filename = name?.toString();
+            if (directory !== path.dirname(root) && filename && ROLLOUT_NAME.exec(filename)?.[1] === session)
+              addFile(path.join(directory, filename));
+            if (
+              !filename ||
+              directories.has(path.join(directory, filename)) ||
+              ROLLOUT_NAME.exec(filename)?.[1] === session ||
+              filename === 'session_index.jsonl'
+            ) {
+              inspect(!filename);
+              wake();
+            }
+          });
+          watcher.on('error', () => {
+            failed = true;
+            wake();
+          });
+          watchers.set(directory, watcher);
+        }
+        if (directory !== path.dirname(root)) {
+          for (const name of fs.readdirSync(directory)) {
+            if (ROLLOUT_NAME.exec(name)?.[1] === session) addFile(path.join(directory, name));
+          }
+        }
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') failed = true;
+      }
+    }
+  };
+  inspect();
+  return {
+    current: () => {
+      const openings = [...files]
+        .filter((file) => admittedDirectory(path.dirname(file)) && path.dirname(file) !== path.dirname(root))
+        .map((file) => ({ file, opening: readQualifiedCodexOpening(file) }))
+        .filter((item) => item.opening?.value.sessionId === session);
+      let indexRevision = '';
+      try {
+        indexRevision = JSON.stringify(revisionOf(fs.statSync(indexFile, { bigint: true })));
+      } catch {
+        /* no index on this machine yet */
+      }
+      if (!index.names || index.revision !== indexRevision) {
+        index.names = readThreadNames(indexFile, null);
+        index.revision = index.names.stamp ? indexRevision : '';
+      }
+      const item = openings.length === 1 ? openings[0] : null;
+      const revision = item?.opening?.revision;
+      return {
+        current:
+          !stopped &&
+          !failed &&
+          root === codexSessionsRoot() &&
+          openings.length <= 1 &&
+          (!item || folderMatcher([cwd])(item.opening!.value.cwd!)),
+        evidence: revision ? JSON.stringify([item.file, revision]) : '',
+        source: revision ? JSON.stringify([item.file, revision.dev, revision.ino]) : '',
+        title: index.names.fullNames.get(session),
+      };
+    },
+    dispose: () => {
+      if (stopped) return;
+      stopped = true;
+      if (--index.users === 0) {
+        initialNameIndexes.delete(indexFile);
+        index.names = null;
+      }
+      for (const watcher of watchers.values()) watcher.close();
+      watchers.clear();
+    },
+  };
 }
 
 // How long the asynchronous walk works before it lets the host handle other work.

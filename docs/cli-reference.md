@@ -157,6 +157,8 @@ Prompt files must be regular and at most 48 KiB. Empty prompts and slash command
 | `refused` | Request refused, with its reason. |
 | `unknown` | Delivery is uncertain. Retain the request ID and original activation. |
 
+Start JSON includes additive `metadata.labels` and `metadata.pinned` results. Their `state` is `saved` only after persistence succeeds, otherwise `uncertain`. Labels include normalized `values`, and pin state includes `value`. Requested names include `metadata.name.requested` and a `state` of `pending`, `saved`, `failed`, `cancelled`, or `uncertain`. A known naming error also includes `error`. Durable pending naming permits `accepted`. Known metadata failure produces `accepted-with-errors`. Detailed session JSON exposes retained name state after ordinary catalog admission. Catalog visibility remains eventual. The start result supplies no catalog membership or observed model evidence.
+
 Write JSON includes `requestId` and `status`. Unknown delivery omits accepted-result and curation details. Fresh IDs use the selected `hostId` followed by a colon and caller ID. Identical-payload retries return the retained result. Conflicting payloads refuse. Reloads invalidate the activation. The CLI never retries writes automatically.
 
 Forced archive replies include `evaluatedRunStatus` before membership changes, or null without a listing row. [Archive safety](cli.md#session-management) applies independently of that observation. [Child ownership and shutdown](agent-protocols.md#child-ownership-and-shutdown) define hosted process retirement.

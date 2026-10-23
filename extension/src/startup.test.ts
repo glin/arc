@@ -8605,6 +8605,7 @@ function paintHarness(extraMethods: string[] = [], scope: Record<string, unknown
     mtimeMs: 1,
   };
   const provider = completeDiscoveryHarness(undefined, false, extraMethods, scope);
+  provider.initialNamesChanged = () => {};
   provider.partial = [session];
   provider.catalog = { sessions: [session] };
   provider.discovery = Promise.resolve(true);
@@ -15147,6 +15148,7 @@ test('hosted child exit leaves an ordinary reader queue entry waiting without a 
   };
   f.host.invalidateContext = () => {};
   f.host.releaseDeliveredPromptAssets = () => {};
+  f.host.initialNamesChanged = () => {};
   const compiled = transformSync(`return (${callback.getText(file)})`, { loader: 'ts', format: 'cjs' }).code;
   const onStateChange = new Function(...Object.keys(scope), compiled)(...Object.values(scope));
   f.exit();

@@ -116,6 +116,7 @@ import {
   codexTitleFor,
   parseThreadNames,
   readThreadNames,
+  watchInitialCodexName,
   codexPrompt,
   hunksFromUnifiedDiff,
   scriptFailure,
@@ -15588,6 +15589,68 @@ test('a Codex session takes up the name Codex gives it, whenever that lands', ()
 
   // An index that has not moved is not read again: the answer already held comes back.
   assert.equal(readThreadNames(index, cleared), cleared);
+});
+
+test('pending initial names share index reads across unrelated updates and release the final cache', () => {
+  const directory = tempDir('initial-name-index-');
+  const root = path.join(directory, 'sessions');
+  fs.mkdirSync(root);
+  vi.stubEnv('ARC_CODEX_ROOT', root);
+  const file = codexSessionIndexPath();
+  fs.writeFileSync(file, JSON.stringify({ id: 'unrelated', thread_name: 'Unrelated name' }) + '\n');
+  const nativeFs = createRequire(__filename)('node:fs') as typeof fs;
+  const original = nativeFs.readFileSync;
+  let reads = 0;
+  const read = vi.spyOn(nativeFs, 'readFileSync').mockImplementation(((target: fs.PathLike, ...args: any[]) => {
+    if (target === file) reads++;
+    return (original as any)(target, ...args);
+  }) as typeof fs.readFileSync);
+  const callbacks: Array<() => void> = [];
+  const watch = vi.spyOn(nativeFs, 'watch').mockImplementation(((
+    _directory: string,
+    _options: unknown,
+    changed: (kind: string, name: string) => void,
+  ) => {
+    callbacks.push(() => changed('change', 'session_index.jsonl'));
+    return {
+      on() {
+        return this;
+      },
+      close() {},
+    };
+  }) as unknown as typeof fs.watch);
+  syncBuiltinESMExports();
+  const subscriptions: ReturnType<typeof watchInitialCodexName>[] = [];
+  try {
+    for (const id of ['pending-a', 'pending-b', 'pending-c']) {
+      let subscription: ReturnType<typeof watchInitialCodexName>;
+      subscription = watchInitialCodexName(id, directory, () => subscription.current());
+      subscriptions.push(subscription);
+      assert.equal(subscription.current().title, undefined);
+    }
+    assert.equal(reads, 1, 'pending operations reread one unchanged global index');
+    fs.appendFileSync(file, JSON.stringify({ id: 'unrelated', thread_name: 'An updated unrelated name' }) + '\n');
+    callbacks.forEach((changed) => changed());
+    assert.equal(reads, 2, 'one unrelated update reread the index for every pending operation');
+    fs.appendFileSync(file, JSON.stringify({ id: 'pending-b', thread_name: 'Saved B' }) + '\n');
+    callbacks.forEach((changed) => changed());
+    assert.deepEqual(
+      subscriptions.map((item) => item.current().title),
+      [undefined, 'Saved B', undefined],
+    );
+    assert.equal(reads, 3);
+    subscriptions.forEach((item) => item.dispose());
+    subscriptions[0].dispose();
+    const next = watchInitialCodexName('pending-b', directory, () => {});
+    subscriptions.push(next);
+    assert.equal(next.current().title, 'Saved B');
+    assert.equal(reads, 4, 'the last disposed subscription retained its global index');
+  } finally {
+    subscriptions.forEach((item) => item.dispose());
+    read.mockRestore();
+    watch.mockRestore();
+    syncBuiltinESMExports();
+  }
 });
 
 test('the thread index survives whatever is written into it', () => {

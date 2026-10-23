@@ -554,6 +554,11 @@ import {
 import { SessionNames, sessionLabelOf, storedSessionName, transcriptIdentity, type SessionName } from './sessionnames';
 import {
   answerSessionRename,
+  InitialNameOperation,
+  restoreInitialSessionNames,
+  sessionRenameTitle,
+  type InitialSessionName,
+  type InitialNameSubscription,
   requestSessionRename,
   sessionRenameOpening,
   type SessionRenameResult,
@@ -1683,8 +1688,53 @@ export class PanelProvider implements vscode.Disposable {
     | ((agent: AgentKind, session: string, cwd: string | null, title: string, file: string) => Promise<void>)
     | null = null;
   public onRenameStartedSession:
-    | ((agent: AgentKind, session: string, cwd: string, title: string) => Promise<void>)
+    | ((agent: AgentKind, session: string, cwd: string, title: string, current?: () => boolean) => Promise<void>)
     | null = null;
+  public onInitialNameReadiness: ((session: string, cwd: string, wake: () => void) => InitialNameSubscription) | null =
+    null;
+  private initialNameOperations?: Map<string, InitialNameOperation>;
+  private initialNameActivation?: string;
+
+  private cancelInitialName(session: string): void {
+    this.initialNameOperations?.get(session)?.cancel();
+    this.initialNameOperations?.delete(session);
+  }
+
+  public initialNamesChanged(): void {
+    for (const operation of this.initialNameOperations?.values() ?? []) operation.changed();
+  }
+
+  private startInitialName(item: InitialSessionName): void {
+    const revision = item.revision;
+    const read = () =>
+      this.saved.initialNames?.[item.session]?.revision === revision ? this.saved.initialNames[item.session] : item;
+    const valid = () => {
+      const scope = this.repositoryScope.snapshot(this.folders());
+      return (
+        !this.disposed &&
+        scope.ready &&
+        isInside(item.cwd, scope.roots) &&
+        !this.hidden?.has(item.session) &&
+        this.saved.initialNames?.[item.session]?.revision === revision
+      );
+    };
+    const operation = new InitialNameOperation(
+      read,
+      async () => {
+        await this.writeDrafts();
+        if (read().state !== 'pending' && this.saved.initialNames?.[item.session]?.revision === revision)
+          this.initialNameOperations?.delete(item.session);
+      },
+      valid,
+      (current) => this.onRenameStartedSession!('codex', item.session, item.cwd, item.requested, current),
+    );
+    (this.initialNameOperations ??= new Map()).set(item.session, operation);
+    operation.start((wake) =>
+      this.onInitialNameReadiness
+        ? this.onInitialNameReadiness(item.session, item.cwd, wake)
+        : { current: () => ({ current: true, evidence: '', source: '' }), dispose() {} },
+    );
+  }
   public onClear:
     | ((agent: string, session: string, cwd: string | null, name: string) => Promise<PromptDelivery>)
     | null = null;
@@ -2446,6 +2496,16 @@ export class PanelProvider implements vscode.Disposable {
       };
     const session = delivery.session;
     const errors: string[] = delivery.reason ? [delivery.reason] : [];
+    const metadata: {
+      labels: { state: 'saved' | 'uncertain'; values: string[] };
+      pinned: { state: 'saved' | 'uncertain'; value: boolean };
+      name?: { requested: string; state: InitialSessionName['state']; error?: string };
+    } = {
+      labels: { state: 'uncertain', values: [] },
+      pinned: { state: 'uncertain', value: params.pinned === true },
+      ...(params.name ? { name: { requested: params.name, state: 'uncertain' as const } } : {}),
+    };
+    let initialName: InitialSessionName | undefined;
     try {
       this.adoptDraft(draft.draftId, session, draft, undefined, true);
       this.picks = withSessionSettings(
@@ -2460,6 +2520,27 @@ export class PanelProvider implements vscode.Disposable {
       }
       await this.onSessionSettingsAdopted?.(session, { ...this.picks[session] });
       this.saved.labels = setSessionLabels(this.saved.labels, session, params.labels ?? []);
+      metadata.labels.values = labelsOf(this.saved.labels, session);
+      if (params.name && profile.agent === 'codex') {
+        this.cancelInitialName(session);
+        initialName = {
+          provider: 'codex',
+          session,
+          cwd: draft.cwd,
+          requested: sessionRenameTitle(params.name)!,
+          activation: (this.initialNameActivation ??= crypto.randomUUID()),
+          revision: crypto.randomUUID(),
+          state: 'pending',
+          attempts: 0,
+          possibleWrite: false,
+        };
+        this.saved.initialNames = Object.fromEntries(
+          Object.entries({ ...this.saved.initialNames, [session]: initialName }).slice(-SESSION_LIMIT),
+        );
+        for (const retained of this.initialNameOperations?.keys() ?? []) {
+          if (!this.saved.initialNames[retained]) this.cancelInitialName(retained);
+        }
+      }
       const initialPinWrite = params.pinned ? { persisted: Promise.resolve() } : undefined;
       if (params.pinned) {
         (this.membershipWrites ??= new Map()).set(session, initialPinWrite!);
@@ -2475,12 +2556,35 @@ export class PanelProvider implements vscode.Disposable {
       } else {
         await persisted;
       }
+      metadata.labels.state = 'saved';
+      metadata.pinned.state = 'saved';
       if (params.name) {
         if (!this.onRenameStartedSession) throw new Error('The new session cannot be named.');
-        await this.onRenameStartedSession(profile.agent, session, draft.cwd, params.name);
+        if (initialName) this.startInitialName(initialName);
+        else {
+          await this.onRenameStartedSession(profile.agent, session, draft.cwd, params.name);
+          metadata.name = { requested: params.name, state: 'saved' };
+        }
       }
     } catch (error) {
-      errors.push(error instanceof Error ? error.message : String(error));
+      const reason = error instanceof Error ? error.message : String(error);
+      errors.push(reason);
+      if (metadata.name) metadata.name.error = reason;
+      if (initialName) {
+        initialName.state = metadata.labels.state === 'saved' ? 'failed' : 'uncertain';
+        initialName.error = reason;
+        await this.writeDrafts().catch(() => {});
+      }
+    }
+    if (initialName) {
+      const stored = this.saved.initialNames?.[session] ?? initialName;
+      metadata.name = {
+        requested: stored.requested,
+        state: stored.state,
+        ...(stored.error ? { error: stored.error } : {}),
+      };
+      if (['failed', 'uncertain', 'cancelled'].includes(stored.state) && !errors.length)
+        errors.push(stored.error ?? 'The initial session name was not saved.');
     }
     void this.post({ type: 'labelsChanged', session });
     this.postRail(true);
@@ -2494,6 +2598,7 @@ export class PanelProvider implements vscode.Disposable {
       agentRun: params.agentRun,
       requester: request.requester,
       errors,
+      metadata,
       ...(start.launchId ? { launchId: start.launchId } : {}),
     };
   }
@@ -2831,7 +2936,7 @@ export class PanelProvider implements vscode.Disposable {
       if (matches.length !== 1) throw new Error('The session ID is unknown or ambiguous in this window.');
       if (!this.sessionReadAdmitted(matches[0]))
         throw new Error('The session membership is unavailable or ambiguous. Retry after session discovery.');
-      return boundedSessionRead(
+      const result = boundedSessionRead(
         matches[0],
         request.params.turns!,
         scopeKey,
@@ -2845,6 +2950,15 @@ export class PanelProvider implements vscode.Disposable {
             : null;
         },
       );
+      const name = this.saved.initialNames?.[matches[0].sessionId];
+      return name && matches[0].agent === name.provider
+        ? {
+            ...result,
+            metadata: {
+              name: { requested: name.requested, state: name.state, ...(name.error ? { error: name.error } : {}) },
+            },
+          }
+        : result;
     }
     // Only the internal archive read sets sessionId. It filters before paging.
     const target = request.params.sessionId;
@@ -3213,6 +3327,7 @@ export class PanelProvider implements vscode.Disposable {
     // Remove abandoned provisional-session labels before normalization.
     // Normalization also runs during writes, when active drafts must retain their labels.
     this.saved = normalizePanelState(withSweptDraftLabels(stored));
+    restoreInitialSessionNames(this.saved.initialNames ?? {});
     // Initialize the unread floor only when the workspace has no saved state. Existing work then starts as read.
     // Save the floor immediately so reopening the window does not mark intervening turns as read.
     if (stored === undefined) {
@@ -3275,6 +3390,8 @@ export class PanelProvider implements vscode.Disposable {
   private disposeOwned(): void {
     this.startupHistory?.dispose();
     this.disposed = true;
+    for (const operation of this.initialNameOperations?.values() ?? []) operation.cancel();
+    this.initialNameOperations?.clear();
     this.windowStateHandler = null;
     for (const controller of this.attachmentHandoffs) controller.abort();
     this.attachmentHandoffs.clear();
@@ -3812,6 +3929,7 @@ export class PanelProvider implements vscode.Disposable {
 
   // Runs on first scope readiness and whenever the repository scope roots change.
   private repositoryScopeChanged(): void {
+    this.initialNamesChanged();
     this.onScopeChange?.();
     // A catalog listed under the previous roots cannot render the current scope.
     for (const work of this.selectionWorks.values()) work.controller.abort();
@@ -8145,6 +8263,7 @@ export class PanelProvider implements vscode.Disposable {
 
   // Publish a renamed session only after the agent confirms success. Its ID remains unchanged.
   private async renameSession(sessionId: string, rawTitle: string): Promise<SessionRenameResult> {
+    this.cancelInitialName(sessionId);
     const session = this.catalog?.sessions.find((candidate) => candidate.sessionId === sessionId) ?? null;
     const result = await requestSessionRename(rawTitle, session !== null, async (title) => {
       if (!session || !this.onRenameSession) {
@@ -8257,6 +8376,7 @@ export class PanelProvider implements vscode.Disposable {
     const pinnedTop = new Set(this.pinnedTop);
     const target = this.panelSession(session);
     if (action === 'archive') {
+      this.cancelInitialName(target);
       hidden.add(target);
       pinnedTop.delete(target);
     } else if (action === 'unarchive') {
@@ -8459,6 +8579,7 @@ export class PanelProvider implements vscode.Disposable {
     const readerParents = this.saved.readerParents;
     const submittedPrompts = this.saved.submittedPrompts;
     const agentRuns = this.saved.agentRuns;
+    const initialNames = this.saved.initialNames;
     this.preferenceResetRevision = (this.preferenceResetRevision ?? 0) + 1;
     for (const waiter of this.filterReady ?? []) {
       waiter.operation.cancel();
@@ -8483,6 +8604,7 @@ export class PanelProvider implements vscode.Disposable {
     // Preserve reader-started session ownership across preference resets.
     this.saved.started = [...this.startedHere].slice(-SESSION_LIMIT);
     this.saved.agentRuns = agentRuns;
+    this.saved.initialNames = initialNames;
     this.saved.assets = normalizePromptAssetBook(this.assets);
     // Waiting submissions are user-authored content, like the draft and its files above.
     // Forgetting panel preferences must not cancel work the reader already submitted.
@@ -8518,6 +8640,7 @@ export class PanelProvider implements vscode.Disposable {
               hidden: [...this.hidden],
               pinnedTop: [...this.pinnedTop],
               railFolds: this.saved.railFolds,
+              initialNames: this.saved.initialNames,
             }),
           ),
       ),
@@ -14998,6 +15121,7 @@ export class PanelProvider implements vscode.Disposable {
       draftCommentIds: current.draftCommentIds,
       started: current.started,
       agentRuns: current.agentRuns,
+      initialNames: current.initialNames,
       labels: current.labels,
       readerParents: current.readerParents,
       views: current.views,
@@ -15028,6 +15152,7 @@ export class PanelProvider implements vscode.Disposable {
               draftCommentIds: current.draftCommentIds,
               started: current.started,
               agentRuns: current.agentRuns,
+              initialNames: current.initialNames,
               labels: current.labels,
               readerParents: current.readerParents,
               views: current.views,

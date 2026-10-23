@@ -525,7 +525,7 @@ export const COMMANDS: readonly Command[] = [
         jsonFlag,
       ],
       output: [
-        'JSON includes status, requestId, and accepted sessionId. Save launchId for dispatch retrieval and errors for metadata failures.',
+        'JSON includes status, requestId, and accepted sessionId. Save launchId for dispatch retrieval. Metadata reports saved labels, pin state, and pending or completed naming.',
         'Host status is accepted, accepted-with-errors, or refused. Requested settings do not establish observed execution.',
         'Unknown delivery retains requestId, window, and reason. Preserve them without launching a replacement.',
         '--arc-dispatch adds ARC_DISPATCH_SESSION after an accepted result with a session ID. Reader-owned receipts include owned: true.',

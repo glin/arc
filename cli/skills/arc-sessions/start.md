@@ -9,3 +9,7 @@ Run `arc setups --window WINDOW_ID` before choosing settings. Use a returned set
 Start requires a regular UTF-8 prompt file, at most 48 KiB, with nonempty text that does not begin with a slash command. Omitted model, effort, and permissions retain provider defaults.
 
 Start accepts an explicit identical-payload retry with the same request ID in the same activation.
+
+Confirm initial labels from `metadata.labels.state: saved` and its normalized `values`. Confirm pins from `metadata.pinned.state: saved` and `value`. A missing catalog row does not invalidate these save results.
+
+Read `metadata.name.state` separately from launch acceptance. `pending` retains naming work in this activation. `saved` confirms the requested name. Report `failed`, `cancelled`, or `uncertain` without launching another session or resending the prompt. Later detailed session JSON reports retained name state after catalog admission. Older hosts omit metadata.
