@@ -225,7 +225,7 @@ The following flags provide stream framing, permission requests, and partial res
 
 ### Claude attribution selection
 
-Arc reads `ARC_CLAUDE_BILLING_LABEL` from the extension host environment when starting each Claude child. If that variable is absent, Arc reads it from `.env` in the child's working directory. Arc reads only this selector from the file and does not change the editor environment. It trims surrounding whitespace and accepts only these lowercase values:
+Arc omits the attribution block by default for Claude children. Arc reads `ARC_CLAUDE_BILLING_LABEL` from the extension host environment when starting each Claude child. If that variable is absent, Arc reads it from `.env` in the child's working directory. Arc reads only this selector from the file and does not change the editor environment. It trims surrounding whitespace and accepts only these lowercase values:
 
 | Value           | `CLAUDE_CODE_ENTRYPOINT` | `CLAUDE_CODE_ATTRIBUTION_HEADER` |
 | --------------- | ------------------------ | -------------------------------- |
@@ -233,11 +233,11 @@ Arc reads `ARC_CLAUDE_BILLING_LABEL` from the extension host environment when st
 | `claude-vscode` | `claude-vscode`          | `1`                              |
 | `omit`          | `sdk-cli`                | `0`                              |
 
-Unset, empty, whitespace-only, and unsupported values preserve ordinary launch behavior, including inherited attribution settings. Recognized selections replace conflicting inherited and launch values for both vendor keys. Arc removes all their case variants before writing canonical names. The selector name also accepts case variants. Launch variables cannot select the mode. Codex launch behavior stays unchanged.
+Unset, empty, whitespace-only, and unsupported values select `omit`. Explicit `sdk-cli` and `claude-vscode` selections restore attribution. Every Claude selection replaces conflicting inherited and launch values for both vendor keys. Arc removes all their case variants before writing canonical names. The selector name also accepts case variants. Launch variables cannot select the mode. Codex launch behavior stays unchanged.
 
 The selection applies to fresh and resumed sessions, provisional draft children, renames, idle account and model reads, and metadata-default reads. Existing children keep their captured environment, including a provisional child reused for its first prompt. Arc does not restart children to apply a selection.
 
-Changes to `.env` apply when Arc starts another Claude child. Arc does not search parent directories. Missing files preserve ordinary launch behavior. Other file-read errors prevent the Claude child from starting. Close the relevant editor processes and restart them to change the extension host environment. Changing a terminal's environment does not update an already running editor. These values select request attribution and provide no subscription-rate guarantee.
+Changes to `.env` apply when Arc starts another Claude child. Arc does not search parent directories. Missing files select `omit`. Other file-read errors prevent the Claude child from starting. Close the relevant editor processes and restart them to change the extension host environment. Changing a terminal's environment does not update an already running editor. These values select request attribution and provide no subscription-rate guarantee.
 
 **Codex**, the app-server protocol:
 

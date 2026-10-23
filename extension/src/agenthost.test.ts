@@ -6044,14 +6044,14 @@ test(
   },
 );
 
-test('empty and invalid billing labels preserve inherited attribution and launch variables', () => {
+test('absent, empty and invalid billing labels omit Claude attribution and preserve Codex launch variables', () => {
   for (const label of [undefined, '', '   ', 'cli', 'sdk-ts', 'CLAUDE-VSCODE', 'unknown']) {
     const inherited = {
       ARC_CLAUDE_BILLING_LABEL: label,
       CLAUDE_CODE_ENTRYPOINT: 'cli',
       Claude_Code_Entrypoint: 'claude-vscode',
-      CLAUDE_CODE_ATTRIBUTION_HEADER: '0',
-      Claude_Code_Attribution_Header: '0',
+      CLAUDE_CODE_ATTRIBUTION_HEADER: '1',
+      Claude_Code_Attribution_Header: '1',
       PATH: '/bin',
     };
     for (const agent of ['claude', 'codex'] as const) {
@@ -6059,11 +6059,12 @@ test('empty and invalid billing labels preserve inherited attribution and launch
       assert.deepEqual(
         childEnv(inherited, wanted, agent),
         {
-          CLAUDE_CODE_ATTRIBUTION_HEADER: '0',
-          Claude_Code_Attribution_Header: '0',
           PATH: '/bin',
           ...wanted,
           ELECTRON_RUN_AS_NODE: '1',
+          ...(agent === 'claude'
+            ? { CLAUDE_CODE_ENTRYPOINT: 'sdk-cli', CLAUDE_CODE_ATTRIBUTION_HEADER: '0' }
+            : { CLAUDE_CODE_ATTRIBUTION_HEADER: '1', Claude_Code_Attribution_Header: '1' }),
         },
         `${agent}: ${String(label)}`,
       );
@@ -6071,7 +6072,7 @@ test('empty and invalid billing labels preserve inherited attribution and launch
   }
 });
 
-test('recognized billing labels reach every Claude child and preserve Codex environments', () => {
+test('billing defaults and recognized labels reach every Claude child and preserve Codex environments', () => {
   const launch = {
     ...CLAUDE,
     env: {
@@ -6094,13 +6095,13 @@ test('recognized billing labels reach every Claude child and preserve Codex envi
     codexIdlePlan(launch, codexClient),
     codexRenamePlan(launch, { ...codexClient, threadId: 'thread', title: 'Named' }),
   ];
-  for (const label of ['sdk-cli', 'claude-vscode', 'omit']) {
+  for (const label of [undefined, '', '   ', 'unknown', 'sdk-cli', 'claude-vscode', 'omit']) {
     for (const selectorKey of ['ARC_CLAUDE_BILLING_LABEL', 'Arc_Claude_Billing_Label']) {
       const inherited = {
-        [selectorKey]: ` ${label} `,
+        [selectorKey]: label === undefined ? undefined : ` ${label} `,
         CLAUDE_CODE_ENTRYPOINT: 'cli',
         Claude_Code_Entrypoint: 'inherited-other-label',
-        CLAUDE_CODE_ATTRIBUTION_HEADER: '0',
+        CLAUDE_CODE_ATTRIBUTION_HEADER: '1',
         Claude_Code_Attribution_Header: 'inherited-other-attribution',
         Claude_Agent_Sdk_Version: 'other-version',
         CLAUDE_AGENT_SDK_CLIENT_APP: 'other-client',
@@ -6137,7 +6138,10 @@ test('recognized billing labels reach every Claude child and preserve Codex envi
           continue;
         }
         assert.equal(finalEnv.CLAUDE_CODE_ENTRYPOINT, label === 'claude-vscode' ? label : 'sdk-cli');
-        assert.equal(finalEnv.CLAUDE_CODE_ATTRIBUTION_HEADER, label === 'omit' ? '0' : '1');
+        assert.equal(
+          finalEnv.CLAUDE_CODE_ATTRIBUTION_HEADER,
+          label === 'sdk-cli' || label === 'claude-vscode' ? '1' : '0',
+        );
         assert.equal('Claude_Code_Entrypoint' in finalEnv, false);
         assert.equal('Claude_Code_Attribution_Header' in finalEnv, false);
         assert.ok(plan.args.includes('-p'));
@@ -6164,10 +6168,7 @@ test('Claude billing selection reads only the local selector and preserves edito
     const env = childEnv(inherited, {}, 'claude', cwd);
     assert.equal(env.PATH, '/bin');
     assert.equal(env.Arc_Claude_Billing_Label, undefined);
-    assert.equal(
-      env.CLAUDE_CODE_ENTRYPOINT,
-      label === 'claude-vscode' ? label : label === 'sdk-cli' || label === 'omit' ? 'sdk-cli' : undefined,
-    );
+    assert.equal(env.CLAUDE_CODE_ENTRYPOINT, label === 'claude-vscode' ? label : 'sdk-cli');
     assert.equal(env.CLAUDE_CODE_ATTRIBUTION_HEADER, label === 'sdk-cli' || label === 'claude-vscode' ? '1' : '0');
     assert.deepEqual(childEnv(inherited, {}, 'codex', cwd), childEnv(inherited, {}, 'codex'));
     for (const editorLabel of ['omit', '', 'unknown']) {
@@ -6189,18 +6190,20 @@ test(
     const file = path.join(cwd, '.env');
     try {
       vi.stubEnv('ARC_CLAUDE_BILLING_LABEL', undefined);
-      vi.stubEnv('CLAUDE_CODE_ATTRIBUTION_HEADER', '0');
+      vi.stubEnv('CLAUDE_CODE_ATTRIBUTION_HEADER', '1');
       for (const [label, agent] of [
+        [undefined, 'claude'],
         ['claude-vscode', 'claude'],
         ['omit', 'claude'],
         ['claude-vscode', 'codex'],
       ] as const) {
-        fs.writeFileSync(file, `ARC_CLAUDE_BILLING_LABEL=${label}\nARC_ENV_FILE_ONLY=secret\n`);
+        if (label !== undefined)
+          fs.writeFileSync(file, `ARC_CLAUDE_BILLING_LABEL=${label}\nARC_ENV_FILE_ONLY=secret\n`);
         if (agent === 'codex') {
           const env = childEnv(process.env, {}, agent, cwd);
           assert.deepEqual(
             [env.CLAUDE_CODE_ENTRYPOINT, env.CLAUDE_CODE_ATTRIBUTION_HEADER, env.ARC_ENV_FILE_ONLY],
-            [undefined, '0', undefined],
+            [undefined, '1', undefined],
           );
           continue;
         }
@@ -6224,8 +6227,8 @@ test(
         assert.deepEqual(
           JSON.parse(output),
           agent === 'claude'
-            ? [label === 'omit' ? 'sdk-cli' : label, label === 'omit' ? '0' : '1', null]
-            : [null, '0', null],
+            ? [label === 'claude-vscode' ? label : 'sdk-cli', label === 'claude-vscode' ? '1' : '0', null]
+            : [null, '1', null],
         );
       }
     } finally {
@@ -6240,18 +6243,21 @@ test(
   async () => {
     try {
       vi.stubEnv('CLAUDE_CODE_ENTRYPOINT', 'cli');
-      vi.stubEnv('CLAUDE_CODE_ATTRIBUTION_HEADER', '0');
-      for (const label of ['sdk-cli', 'claude-vscode', 'omit']) {
+      vi.stubEnv('CLAUDE_CODE_ATTRIBUTION_HEADER', '1');
+      for (const label of [undefined, 'sdk-cli', 'claude-vscode', 'omit']) {
         vi.stubEnv('ARC_CLAUDE_BILLING_LABEL', label);
         for (const agent of ['claude', 'codex'] as const) {
           const cwd = tempDir('billing-env-');
           const env = childEnv(process.env, {}, agent, cwd);
           const expected =
             agent === 'claude'
-              ? [label === 'claude-vscode' ? label : 'sdk-cli', label === 'omit' ? '0' : '1']
-              : [undefined, '0'];
+              ? [
+                  label === 'claude-vscode' ? label : 'sdk-cli',
+                  label === 'sdk-cli' || label === 'claude-vscode' ? '1' : '0',
+                ]
+              : [undefined, '1'];
           assert.deepEqual([env.CLAUDE_CODE_ENTRYPOINT, env.CLAUDE_CODE_ATTRIBUTION_HEADER], expected);
-          if (label !== 'claude-vscode') continue;
+          if (label === 'omit' || (agent === 'codex' && label === 'sdk-cli')) continue;
           const script =
             'process.stdout.write(JSON.stringify([process.env.CLAUDE_CODE_ENTRYPOINT, process.env.CLAUDE_CODE_ATTRIBUTION_HEADER]))';
           const child = spawnCli(process.execPath, ['-e', script], cwd, {}, agent);

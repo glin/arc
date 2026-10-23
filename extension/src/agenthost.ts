@@ -100,7 +100,7 @@ export function unstartable(command: string, platform: string): string | null {
 // These variables affect request attribution, session links, generated titles, and child-session behavior.
 // Every case variant is removed, including on Windows.
 // `childEnv` sets `ELECTRON_RUN_AS_NODE` so VS Code's Electron executable can run a package script.
-// Launch variables restore package-specific settings. An explicit Claude billing label can override attribution.
+// Launch variables restore package-specific settings. Claude billing selection overrides attribution for Claude children.
 const HOST_IDENTITY_ENV_NAMES = [
   'CLAUDE_CODE_ENTRYPOINT',
   'CLAUDE_AGENT_SDK_VERSION',
@@ -169,14 +169,14 @@ export function childEnv(
       if (code !== 'ENOENT' && code !== 'ENOTDIR') throw error;
     }
   }
-  if (agent === 'claude' && (label === 'sdk-cli' || label === 'claude-vscode' || label === 'omit')) {
+  if (agent === 'claude') {
     for (const key of Object.keys(env)) {
       if (key.toUpperCase() === 'CLAUDE_CODE_ENTRYPOINT' || key.toUpperCase() === 'CLAUDE_CODE_ATTRIBUTION_HEADER') {
         delete env[key];
       }
     }
     env.CLAUDE_CODE_ENTRYPOINT = label === 'claude-vscode' ? label : 'sdk-cli';
-    env.CLAUDE_CODE_ATTRIBUTION_HEADER = label === 'omit' ? '0' : '1';
+    env.CLAUDE_CODE_ATTRIBUTION_HEADER = label === 'sdk-cli' || label === 'claude-vscode' ? '1' : '0';
   }
   return env;
 }
