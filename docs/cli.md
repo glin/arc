@@ -126,7 +126,7 @@ A disconnected or timed-out write returns `unknown` with its request ID when del
 
 ### Follow-ups
 
-`send` queues a literal reader-requested message when `--observation` is absent. The destination must have an existing live child in the selected scope. Busy destinations wait in FIFO order. `queued` confirms admission, not delivery.
+`send` delivers literal reader-requested text when `--observation` is absent. The destination must have an existing live child in the selected scope. Eligible idle sessions start a prompt. Eligible running sessions receive live input. Add `--queue` or `-q` for intentional next-turn delivery. Older queued messages retain FIFO precedence. Open requests, pending work, and unsupported live delivery defer the message. `queued` confirms admission, not delivery.
 
 ```bash
 arc send SESSION_ID --prompt-file message.txt --request-id WINDOW_ID:message --window WINDOW_ID --json

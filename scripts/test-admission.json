@@ -2,7 +2,7 @@
   "cli/test/manage.test.ts": {
     "reason": "CLI management must preserve classification, validation, and read delivery through a real authenticated window channel.",
     "cases": 14,
-    "matricesSha256": "ee1ac1813a1142510ff011bbaee97367caf03b827ed1af3282e7edb7c189ac77"
+    "matricesSha256": "c328a1149f1d972f2857fd832edd54c89ada6740d716a3177b14ab484b026ebc"
   },
   "cli/test/run.test.ts": {
     "reason": "Standalone workers must retain real output, exit, cancellation, receipt ownership, and recovery across process boundaries.",
@@ -17,7 +17,7 @@
   "cli/test/smoke.bundled-b.test.mjs": {
     "reason": "Compiled CLI commands must deliver session actions and streamed responses through the selected window channel.",
     "cases": 5,
-    "matricesSha256": "1872859950c63df4185ba31996417baaf34272825e890b49ea65ef82bc32e5e3"
+    "matricesSha256": "7471b91677ded56b18f88c50459ffeb6997728ab57ba1c4dcf91b395a56ec6b2"
   },
   "cli/test/smoke.bundled-c.test.mjs": {
     "reason": "Compiled CLI commands must preserve window routing, turn limits, and terminal ownership under real IPC.",
@@ -36,8 +36,8 @@
   },
   "extension/src/agenthost.test.ts": {
     "reason": "A spawned agent must receive the activation window, editor executable, and command search path. Self-compaction crosses native background settlement, response retention for provider turns, and workspace scope recovery.",
-    "cases": 296,
-    "matricesSha256": "761c3fa256ebb0ab9f858a7228732042eaefceaddb8d2737df88f41511579809"
+    "cases": 298,
+    "matricesSha256": "f8514938eaed94232208028a11f4c52c7ee1215f4e6a72bdaf9a97d31428de08"
   },
   "extension/src/chrome.browser.test.ts": {
     "reason": "Panel controls must preserve native focus, keyboard handling, and browser event delivery.",
@@ -182,7 +182,7 @@
   "extension/src/sessionwrites.test.ts": {
     "reason": "Authenticated window channels must preserve accepted reads, ordered writes, and ownership across native IPC.",
     "cases": 24,
-    "matricesSha256": "da9c1bc4e784ac3d912da595add36d2fc767df399befb227dde8796e1586823e"
+    "matricesSha256": "96fa69c0c9ecdb3f91b22b590bab681b634885dc400ddbdd69911a3687ce72b3"
   },
   "extension/src/startup.browser.test.ts": {
     "reason": "Startup and restored panel rendering must preserve usable browser state and focus.",
@@ -190,9 +190,9 @@
     "matricesSha256": "b2a4c3552a9fdd99d3be4a6e1515bc834b857c078f1059c8fbdf75ef50132b39"
   },
   "extension/src/startup.test.ts": {
-    "reason": "Real title workers must publish recovered metadata through startup ownership and cancellation boundaries. Project cost snapshots must preserve workspace, revision, and calendar ownership during background slices. Agent messages must preserve durable admission, settlement wakeups, native delivery authority, and retained retries. Host integrity checks must preserve complete cost, discovery membership, exact revisions, and bounded coverage across failures and panel lifecycle changes.",
-    "cases": 244,
-    "matricesSha256": "5e0d8f748abe77a61f765ebf19956b89e923f1787e26e7753fc14d23bc670c1c"
+    "reason": "Real title workers must publish recovered metadata through startup ownership and cancellation boundaries. Project cost snapshots must preserve workspace, revision, and calendar ownership during background slices. Agent messages must preserve durable admission, settlement wakeups, native delivery authority, and retained retries. Host integrity checks must preserve complete cost, discovery membership, exact revisions, and bounded coverage across failures and panel lifecycle changes. Ordinary corrections must cross CLI parsing and the authenticated channel before busy target work finishes, preserving native receipts, reservations, and final admission. Pending ordinary receipts retain target exclusion across caller disconnect and wake eligible queued heads only after settlement.",
+    "cases": 249,
+    "matricesSha256": "cb3bb8bb255ac1ab3d7f40968eef45d2e650be33ac7d726af61754fa1f65fe18"
   },
   "extension/src/store.test.ts": {
     "reason": "The real Stop hook must renew retention for useful snapshot stores without changing workspace files.",

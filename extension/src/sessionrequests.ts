@@ -556,7 +556,7 @@ export class WindowChannel {
         'launchPolicy',
         ...(this.dispatchHandler ? ['dispatchResults'] : []),
         ...(this.guardedReadHandler ? [SESSION_READ_CAPABILITY] : []),
-        ...(this.guardedSendHandler ? ['agentMessageQueue'] : []),
+        ...(this.guardedSendHandler ? ['agentMessageQueue', 'agentMessageSend'] : []),
       ],
     };
   }
@@ -1231,8 +1231,11 @@ export async function requestWindow(
       throw new Error(`Request ${requestId} has an unknown outcome in this activation.`);
     if (method === 'send' && !providerCapable(entry))
       throw new Error('The selected Arc window must reload before it can accept send. No prompt was sent.');
+    if (method === 'send' && params.delivery === 'auto' && !entry.capabilities?.includes('agentMessageSend'))
+      throw new Error('The selected Arc window must reload before it can deliver messages. No prompt was sent.');
     if (
       method === 'send' &&
+      params.delivery !== 'auto' &&
       !Object.prototype.hasOwnProperty.call(params, 'observation') &&
       !entry.capabilities?.includes('agentMessageQueue')
     )

@@ -547,20 +547,19 @@ export const COMMANDS: readonly Command[] = [
     route: 'management',
     action: 'send',
     help: {
-      summary: 'Queue a requested message or deliver an observed follow-up.',
-      synopsis: 'arc send ID --prompt-file PATH [--observation OBSERVATION] --request-id ID [--window ID] [--json]',
+      summary: 'Deliver a requested message or an observed follow-up.',
+      synopsis:
+        'arc send ID --prompt-file PATH [--queue | --observation OBSERVATION] --request-id ID [--window ID] [--json]',
       flags: [
         ['--prompt-file PATH', 'Required. Read a regular UTF-8 file up to 48 KiB.'],
-        [
-          '--observation OBSERVATION',
-          'Select parent-only continuation. Omit to queue a literal reader-requested message.',
-        ],
+        ['--queue, -q', 'Queue the message for idle delivery. Cannot combine with --observation.'],
+        ['--observation OBSERVATION', 'Select parent-only continuation. Omit for ordinary reader-requested delivery.'],
         requestFlag,
         windowFlag,
         ['--json', 'Print delivery fields instead of the reason and request ID.'],
       ],
       output: [
-        'JSON: version, status, requestId, payloadSha256, nativeTurnId, reason. Queue results also include queuedSubmissionId.',
+        'JSON: version, status, requestId, payloadSha256, nativeTurnId, reason. Ordinary receipts include delivery. Queue results include queuedSubmissionId.',
         'Queued confirms durable admission. Accepted confirms prompt receipt. Unknown blocks further agent input until accepted reader direction.',
       ],
       refusals: [

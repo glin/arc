@@ -132,7 +132,7 @@ Python and shell coordinators both invoke the same CLI. The skill's [command rul
 
 The skill's [delivery rules](../cli/skills/arc-sessions/SKILL.md#interpret-delivery) define what a result establishes. Keep a session available for reader continuation when that is part of the task.
 
-Personal `ship` and `dispatch` skills define their own implementation and review workflows. Arc does not package them. The session skill does not automatically review changes, send corrections, rotate coordinator context, or supervise workers continuously. `arc send` queues an explicit reader-requested message or delivers an observed follow-up to a session the requester started. [Session management](cli.md#session-management) owns when Arc accepts it.
+Personal `ship` and `dispatch` skills define their own implementation and review workflows. Arc does not package them. The session skill does not automatically review changes, send corrections, rotate coordinator context, or supervise workers continuously. `arc send` delivers an explicit reader-requested message or an observed follow-up to a session the requester started. [Session management](cli.md#session-management) owns when Arc accepts it.
 
 ## Named session links
 

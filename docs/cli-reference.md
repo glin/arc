@@ -165,7 +165,9 @@ Each activation retains at most 256 shared write results for starts, curation, a
 
 ## Follow-ups
 
-`send` requires exactly one native requester identity, from `CLAUDE_CODE_SESSION_ID` or `CODEX_THREAD_ID`. Without `--observation`, the request queues exact literal text to another existing live child. The CLI requires the window to advertise `agentMessageQueue` before sending. The host saves the entry durably before returning `queued`. The result also includes `queuedSubmissionId`. Admission creates no parent relationship or reader ownership. A retained retry returns its original admission result.
+`send` requires exactly one native requester identity, from `CLAUDE_CODE_SESSION_ID` or `CODEX_THREAD_ID`. Without `--observation`, ordinary delivery requires `agentMessageSend` capability and transmits `delivery: "auto"`. Older windows refuse before transmission. Explicit `--queue` or `-q` requires `agentMessageQueue` and omits `delivery`. Upgraded hosts preserve queue-only behavior for legacy requests that omit both `delivery` and `observation`.
+
+Ordinary accepted results include `delivery`: `turn` for idle prompt receipt, `steer` for exact-turn Codex acknowledgment, or `live` for Claude UUID replay. Receipt confirms neither completed work nor Claude consumption before the original turn ends. Queue admission includes `queuedSubmissionId` after durable saving. Admission creates no parent relationship or reader ownership. A retained retry returns its original result. Changing delivery mode under that request ID refuses.
 
 With `--observation`, that requester must have started the target with `--arc-dispatch` in the same activation. Labels, parent links, and supplied IDs establish no ownership. A window without follow-up capability refuses before connection and requires a reload.
 
@@ -177,7 +179,7 @@ Observed follow-up admission requires a ready, idle process without asks, queued
 
 Delivery uses the existing process in the owning window. It never resumes or forks another copy. Observed ownership conflicts refuse both input forms. Unexplained source changes refuse observed follow-ups. Independent resumes outside that window remain possible.
 
-Results include `status`, `requestId`, `payloadSha256`, `nativeTurnId`, and `reason`. The [guide](cli.md#follow-ups) defines delivery statuses. The CLI's 120-second timeout also reports `unknown`. After unknown delivery, later sends refuse until panel input reaches that session. Prompts, queue changes, answers, Stop, compaction, and clear remove the block. Setting picks invalidate observations but preserve the block.
+Results include `status`, `requestId`, `payloadSha256`, `nativeTurnId`, and `reason`. The [guide](cli.md#follow-ups) defines delivery statuses. The CLI's 120-second timeout reports transport `unknown` while the bounded host attempt continues. An identical retained retry retrieves that attempt without writing again. A client timeout does not release its target reservation. Terminal host `unknown` blocks later sends until panel input reaches that session. Prompts, queue changes, answers, Stop, compaction, and clear remove the block. Setting picks invalidate observations but preserve the block.
 
 ## Compaction
 

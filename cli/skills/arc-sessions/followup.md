@@ -1,6 +1,6 @@
 # Send a message or follow-up
 
-For an explicit reader request naming the destination and message, omit `--observation` to queue that exact text. Use the full scoped session ID and an existing live child in the selected window. No newest-turn read is required. A busy destination keeps its FIFO position. `queued` confirms durable admission, not native delivery. `queuedSubmissionId` names the waiting entry. A retained retry describes the original admission even after delivery, Edit, or Drop. Reload and child replacement retain the text for recovery without sending it automatically.
+For an explicit reader request naming the destination and message, omit `--observation` to send that exact text. Use the full scoped session ID and an existing live child in the selected window. No newest-turn read is required. Ordinary sending starts idle work or reaches eligible running work. Use `--queue` or `-q` for intentional next-turn delivery. Older waiting messages retain FIFO precedence. Open requests and pending controls also defer delivery. `accepted` confirms receipt, with `delivery` equal to `turn`, `steer`, or `live`. Claude live receipt does not guarantee consumption before the original turn ends. `queued` confirms durable admission, not native delivery. `queuedSubmissionId` names the waiting entry. A retained retry describes the original result even after delivery, Edit, or Drop. Reload and child replacement retain queued text for recovery without sending it automatically.
 
 For an autonomous parent follow-up, use the observation contract below.
 

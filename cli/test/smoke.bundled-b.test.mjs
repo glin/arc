@@ -62,7 +62,7 @@ test('bundled read validates bounded attribution and capability before retaining
   }
 });
 
-test('bundled send reads Unicode multiline prompt files, requires observations and request IDs, and refuses ambiguity before sending', async () => {
+test('bundled send preserves Unicode text, ordinary delivery, explicit queueing, observations, and retained IDs', async () => {
   const home = mkdtempSync(join(realpathSync(tmpdir()), 'arc send smoke '));
   const channel = new WindowChannel(home);
   const run = promisify(execFile);
@@ -102,8 +102,30 @@ test('bundled send reads Unicode multiline prompt files, requires observations a
     const retried = await run(process.execPath, args, { env, encoding: 'utf8' });
     assert.match(retried.stdout, /received the prompt\. Request ID: /);
     assert.equal(sends.length, 1);
+    for (const [index, flags] of [[], ['--queue'], ['-q']].entries()) {
+      const ordinary = [
+        cli,
+        'send',
+        'worker',
+        '--prompt-file',
+        prompt,
+        '--request-id',
+        `${channel.hostId}:mode-${index}`,
+        ...flags,
+        '--json',
+      ];
+      assert.equal(
+        JSON.parse((await run(process.execPath, ordinary, { env, encoding: 'utf8' })).stdout).status,
+        'accepted',
+      );
+      assert.deepEqual(sends.at(-1).params, {
+        sessionId: 'worker',
+        prompt: text,
+        ...(index === 0 ? { delivery: 'auto' } : {}),
+      });
+    }
     await assert.rejects(run(process.execPath, [...args, '--agent-run=false'], { env }), /unavailable for send/);
-    assert.equal(sends.length, 1);
+    assert.equal(sends.length, 4);
   } finally {
     await channel.dispose();
     rmSync(home, { recursive: true, force: true });

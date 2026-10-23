@@ -109,7 +109,15 @@ const CODEX_COMMANDS: readonly PromptEntry[] = [
 ];
 
 // A server error alone does not establish whether the request took effect.
-class RequestRefused extends Error {}
+class RequestRefused extends Error {
+  constructor(
+    message: string,
+    readonly code?: unknown,
+    readonly data?: unknown,
+  ) {
+    super(message);
+  }
+}
 
 // The server did not answer a request before the deadline. The request can still have
 // taken effect.
@@ -380,6 +388,8 @@ export class CodexWire {
   private readonly runningRootTurns = new Set<string>();
   // Native compaction ownership does not require an attributable request generation.
   private readonly runningCompactionTurns = new Set<string>();
+  // Completed items retain root-ending attribution without blocking later ordinary work.
+  private readonly activeCompactionItems = new Map<string, Set<string>>();
   private endedRootTurns = 0;
   // Permission overrides selected by the reader travel together on the next turn/start.
   // The server applies them to that turn and subsequent turns.
@@ -875,6 +885,47 @@ export class CodexWire {
     }
   }
 
+  // Exactly one established root can receive live input outside compaction.
+  steerable(): boolean {
+    return (
+      !this.closed &&
+      !!this.thread &&
+      this.runningRootTurns.size === 1 &&
+      !this.compaction &&
+      !this.compactionUnresolved() &&
+      !this.activeCompactionItems.size &&
+      !this.preparing &&
+      !this.pendingPrompts.size &&
+      this.turns.every((turn) => turn.id !== null)
+    );
+  }
+
+  // Live input never creates a turn or retries an uncertain request.
+  async steer(text: string, attempt: GuardedAttempt): Promise<void> {
+    try {
+      if (!this.steerable()) throw new Error('The session has no eligible running turn.');
+      const turnId = [...this.runningRootTurns][0];
+      const result = await this.request(
+        'turn/steer',
+        {
+          threadId: this.thread,
+          expectedTurnId: turnId,
+          input: [{ type: 'text', text }],
+        },
+        () => {
+          attempt.prepareWrite();
+          if (!this.steerable() || !this.runningRootTurns.has(turnId))
+            throw new Error('The running turn changed before delivery.');
+        },
+        () => attempt.markWritten(),
+      );
+      if (str(result.turnId) !== turnId) throw new Error('The agent did not confirm the expected running turn.');
+      attempt.settle({ outcome: 'accepted', nativeTurnId: turnId, reason: '' });
+    } catch (error) {
+      attempt.settle({ outcome: 'unknown', nativeTurnId: null, reason: (error as Error).message });
+    }
+  }
+
   // Stores permission overrides for the next prompt and subsequent turns.
   async setApproval(policy: ApprovalPolicy, sandbox: SandboxMode, reviewer: ApprovalsReviewer): Promise<void> {
     this.approval = { policy, reviewer, sandbox };
@@ -1149,6 +1200,7 @@ export class CodexWire {
     }
     this.unanswered = [];
     this.runningCompactionTurns.clear();
+    this.activeCompactionItems.clear();
     this.lostCompactionIdentity = false;
     this.ambiguousCompaction = false;
     for (const [, waiting] of this.waiting) {
@@ -1186,6 +1238,7 @@ export class CodexWire {
       this.ambiguousCompaction = false;
       this.runningRootTurns.clear();
       this.runningCompactionTurns.clear();
+      this.activeCompactionItems.clear();
     }
     // An answer to a question asked on another thread must never reach this one. A cleared
     // session starts a new thread, so its open questions close with it.
@@ -1628,7 +1681,14 @@ export class CodexWire {
         });
     }
     if (item.type === 'contextCompaction') {
-      if (this.runningRootTurns.has(turnId)) this.runningCompactionTurns.add(turnId);
+      if (this.runningRootTurns.has(turnId)) {
+        this.runningCompactionTurns.add(turnId);
+        const items = this.activeCompactionItems.get(turnId) ?? new Set<string>();
+        if (completed) items.delete(toolId);
+        else items.add(toolId);
+        if (items.size) this.activeCompactionItems.set(turnId, items);
+        else this.activeCompactionItems.delete(turnId);
+      }
       const generation = this.compactionTurn(turnId);
       this.emit({
         kind: 'native',
@@ -1665,6 +1725,7 @@ export class CodexWire {
     this.seeTurn(turnId);
     this.runningRootTurns.delete(turnId);
     this.runningCompactionTurns.delete(turnId);
+    this.activeCompactionItems.delete(turnId);
 
     this.endedRootTurns += 1;
     if (!this.compaction && !this.unanswered.length && !this.runningRootTurns.size) this.ambiguousCompaction = false;
@@ -2016,7 +2077,9 @@ export class CodexWire {
     }
     const failure = obj(message.error);
     if (failure) {
-      waiting.reject(new RequestRefused(str(failure.message) ?? 'the agent refused the request'));
+      waiting.reject(
+        new RequestRefused(str(failure.message) ?? 'the agent refused the request', failure.code, failure.data),
+      );
     } else waiting.resolve(obj(message.result) ?? {});
   }
 

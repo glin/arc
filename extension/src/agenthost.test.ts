@@ -9575,6 +9575,78 @@ test('an idle Codex rename rejects with the server refusal', async () => {
   assert.equal(child.sent().some(MODEL_TURN), false);
 });
 
+test('Codex live input preserves dispatch root ownership and adds no completion', async () => {
+  const f = fakeHost();
+  const opening = f.host.session('steer-root', codexPlan(CODEX, { cwd: WS, clientInfo: CODEX_CLIENT }));
+  const child = f.children[0];
+  await answerCodexHandshake(child);
+  child.reply({ thread: { id: 'thread-live' } });
+  const session = await opening;
+  const prompting = session.prompt('original work');
+  await vi.waitFor(() => assert.equal(child.sent().at(-1)?.method, 'turn/start'));
+  child.reply({ turn: { id: 'root-live' } });
+  child.say(
+    JSON.stringify({ method: 'turn/started', params: { threadId: 'thread-live', turn: { id: 'root-live' } } }) + '\n',
+  );
+  const owner = await prompting;
+  assert.equal(session.guardedLiveReason(), null);
+  const attempt = session.guardedLive('reader correction', 'uuid-steer', () =>
+    assert.fail('steer created another submission'),
+  );
+  assert.equal(child.sent().at(-1)?.method, 'turn/steer');
+  child.reply({ turnId: 'root-live' });
+  assert.equal((await attempt.receipt).outcome, 'accepted');
+  assert.equal(session.nativeTurnIdentity(owner), 'root-live');
+  assert.equal(session.dispatchRootActive(owner), true);
+  child.say(
+    JSON.stringify({
+      method: 'turn/completed',
+      params: { threadId: 'thread-live', turn: { id: 'root-live', status: 'completed', items: [] } },
+    }) + '\n',
+  );
+  assert.equal(session.state().busy, false);
+  assert.equal(session.guardedTurnEnds(), 1);
+  f.host.dispose();
+});
+
+test('Claude live input retains native generations through joined completion and the turn-end replay race', async () => {
+  const f = fakeHost();
+  const opening = f.host.session('live-claude', claudePlan(CLAUDE, { cwd: WS, sessionId: 'live-claude' }));
+  const child = f.children[0];
+  child.answerHandshake();
+  const session = await opening;
+  await session.prompt('original work');
+  child.say(sessionState('running'));
+  assert.equal(session.guardedLiveReason(), null);
+  let submission: number | undefined;
+  const live = session.guardedLive('reader correction', 'uuid-live', (id) => {
+    submission = id;
+  });
+  await live.written;
+  assert.ok(submission);
+  await vi.waitFor(() => assert.equal(session.guardedLiveReason(), null));
+  child.say(
+    JSON.stringify({ type: 'result', subtype: 'success', result: 'original finished', session_id: 'live-claude' }) +
+      '\n',
+  );
+  assert.equal(live.settled, null);
+  child.say(
+    JSON.stringify({
+      type: 'user',
+      isReplay: true,
+      uuid: 'uuid-live',
+      session_id: 'live-claude',
+      parent_tool_use_id: null,
+      message: { role: 'user', content: [{ type: 'text', text: 'reader correction' }] },
+    }) + '\n',
+  );
+  assert.equal((await live.receipt).outcome, 'accepted');
+  child.say(sessionState('idle'));
+  assert.equal(session.state().busy, false);
+  assert.equal(session.guardedTurnEnds(), 1);
+  f.host.dispose();
+});
+
 test('an ordinary Claude child acknowledges guarded continuation, requires idle evidence, and never reopens after retirement', async () => {
   const fake = fakeHost();
   const starting = fake.host.session('guarded', claudePlan(CLAUDE, { cwd: WS, sessionId: 'worker-session' }));

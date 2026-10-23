@@ -110,11 +110,20 @@ export async function runManagement(command: string, args: string[]): Promise<st
     '--completion',
     '--report-file',
   ]);
-  const switches = new Set(['--read-only', '--json', '--pinned', '--arc-dispatch', '--dry-run', '--force']);
+  const switches = new Set([
+    '--read-only',
+    '--json',
+    '--pinned',
+    '--arc-dispatch',
+    '--dry-run',
+    '--force',
+    '--queue',
+    '-q',
+  ]);
   let agentRun = false;
   let agentRunSeen = false;
   for (let at = 0; at < args.length; at++) {
-    const arg = args[at];
+    const arg = args[at] === '-q' ? '--queue' : args[at];
     if (arg === '--agent-run' || arg.startsWith('--agent-run=')) {
       if (agentRunSeen) throw new Error('Repeated argument: --agent-run');
       const value = arg === '--agent-run' ? 'true' : arg.slice('--agent-run='.length);
@@ -137,7 +146,7 @@ export async function runManagement(command: string, args: string[]): Promise<st
     command === 'setups'
       ? ['--window', '--json']
       : command === 'send'
-        ? ['--window', '--request-id', '--prompt-file', '--observation', '--json']
+        ? ['--window', '--request-id', '--prompt-file', '--observation', '--queue', '--json']
         : command === 'read'
           ? ['--window', '--request-id', '--observation', '--dry-run', '--json']
           : command === 'start'
@@ -211,8 +220,10 @@ export async function runManagement(command: string, args: string[]): Promise<st
   if (command === 'send') {
     if (sessions.length !== 1 || !options.has('--prompt-file') || !requestId)
       throw new Error(
-        'Usage: arc send ID --prompt-file FILE [--observation OBSERVATION] --request-id WINDOW:REQUEST [--window WINDOW] [--json]',
+        'Usage: arc send ID --prompt-file FILE [--queue | --observation OBSERVATION] --request-id WINDOW:REQUEST [--window WINDOW] [--json]',
       );
+    if (flags.has('--queue') && options.has('--observation'))
+      throw new Error('--queue cannot combine with --observation.');
     if (options.has('--observation') && !SESSION_OBSERVATION.test(options.get('--observation')!))
       throw new Error('The observation is invalid. Copy it from arc session --json.');
     const identity = requesterIdentity();
@@ -226,7 +237,11 @@ export async function runManagement(command: string, args: string[]): Promise<st
     const params: SessionWriteParams = {
       sessionId: sessions[0],
       prompt,
-      ...(options.has('--observation') ? { observation: options.get('--observation')! } : {}),
+      ...(options.has('--observation')
+        ? { observation: options.get('--observation')! }
+        : flags.has('--queue')
+          ? {}
+          : { delivery: 'auto' as const }),
     };
     const result = (await requestWindow('send', params, window, undefined, requestId)) as {
       status: string;

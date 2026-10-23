@@ -1165,6 +1165,10 @@ test(
     const params = { sessionId: 'target', prompt: '  exact\nmessage  ' };
     const id = channel.hostId + ':queue';
     await assert.rejects(requestWindow('send', params, channel.hostId, home, id), /reload.*queue messages/);
+    await assert.rejects(
+      requestWindow('send', { ...params, delivery: 'auto' }, channel.hostId, home, id),
+      /reload.*deliver messages/,
+    );
     let calls = 0;
     channel.setGuardedSendHandler(async (request) => {
       calls++;
@@ -1182,7 +1186,36 @@ test(
     assert.equal(admitted.status, 'queued');
     assert.deepEqual(await requestWindow('send', params, channel.hostId, home, id), admitted);
     assert.equal(calls, 1);
+    const auto: any = await requestWindow(
+      'send',
+      { ...params, delivery: 'auto' },
+      channel.hostId,
+      home,
+      channel.hostId + ':auto',
+    );
+    assert.equal(auto.status, 'queued');
+    await assert.rejects(
+      requestWindow('send', params, channel.hostId, home, channel.hostId + ':auto'),
+      /different request/,
+    );
     const observation = 'a'.repeat(40) + '.' + 'b'.repeat(43);
+    for (const invalid of [
+      { ...params, delivery: 'queue' },
+      { ...params, delivery: undefined },
+      { ...params, delivery: 'auto', observation },
+    ])
+      assert.equal(
+        parseSessionRequest({
+          id: channel.hostId + ':bad',
+          version: 1,
+          token: entry.token,
+          method: 'send',
+          requester: 'unrelated',
+          requesterProvider: 'claude',
+          params: invalid,
+        }),
+        null,
+      );
     await assert.rejects(
       requestWindow('send', { ...params, observation }, channel.hostId, home, id),
       /different request/,

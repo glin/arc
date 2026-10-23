@@ -551,20 +551,41 @@ test('human session reads preserve delivered text, identity, and uncertainty wit
   }
 });
 
-test('send without an observation transports exact literal text and a distinct queue parameter shape', async () => {
+test('ordinary send and both explicit queue spellings retain their distinct delivery intent', async () => {
   const fixture = await host();
   try {
     const text = '  literal message\n\tend  \n';
     writeFileSync(fixture.prompt, text);
-    await runManagement('send', [
-      'worker',
-      '--prompt-file',
-      fixture.prompt,
-      '--request-id',
-      `${fixture.channel.hostId}:queue`,
-      '--json',
-    ]);
-    assert.deepEqual(fixture.requests[0].params, { sessionId: 'worker', prompt: text });
+    for (const [index, mode] of [[], ['--queue'], ['-q']].entries()) {
+      await runManagement('send', [
+        'worker',
+        '--prompt-file',
+        fixture.prompt,
+        '--request-id',
+        `${fixture.channel.hostId}:send-${index}`,
+        ...mode,
+        '--json',
+      ]);
+      assert.deepEqual(fixture.requests[index].params, {
+        sessionId: 'worker',
+        prompt: text,
+        ...(index === 0 ? { delivery: 'auto' } : {}),
+      });
+    }
+    for (const flag of ['--queue', '-q'])
+      await assert.rejects(
+        runManagement('send', [
+          'worker',
+          '--prompt-file',
+          fixture.prompt,
+          '--request-id',
+          `${fixture.channel.hostId}:conflict`,
+          flag,
+          '--observation',
+          'a.' + 'b'.repeat(43),
+        ]),
+        /cannot combine/,
+      );
   } finally {
     await fixture.close();
   }

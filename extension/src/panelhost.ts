@@ -6038,13 +6038,117 @@ export class PanelProvider implements vscode.Disposable {
   }
 
   // Admit literal text without acquiring reader ownership or consuming prompt-box state.
+  public async sendAgentMessage(
+    request: AttributedRequest,
+    binding: AgentMessageBinding | null,
+  ): Promise<GuardedSendResult> {
+    if (request.params.delivery !== 'auto') return this.queueAgentMessage(request, binding);
+    const session = request.params.sessionId ?? '';
+    const text = request.params.prompt ?? '';
+    const refuse = (reason: string) => guardedRefusal(request.id, text, reason);
+    const requester = requesterOf(request);
+    if (!requester || requester.id === session || guardedPromptRefusal(text))
+      return refuse('Supply a message from another native session.');
+    if (!binding?.current()) return refuse('The destination session is unavailable. No message was sent.');
+    const release = binding.reserve?.();
+    if (binding.reserve && !release) return refuse('Another message is still being delivered. No message was sent.');
+    const check = () => {
+      const state = this.stateFor(session);
+      const facts = this.guardedTargetFacts(session);
+      if (
+        !this.repositoryScopeReady ||
+        !facts?.current ||
+        facts.archived ||
+        this.membershipOf(session) !== 'present' ||
+        this.enumeratedAmbiguousIds?.has(session) ||
+        !state ||
+        state.clearing ||
+        this.clearSettlements.has(session) ||
+        !binding.current() ||
+        binding.agent !== state.agent ||
+        binding.sessionId !== session
+      )
+        return 'The destination session is unavailable. No message was sent.';
+      return binding.refusal();
+    };
+    const waiting = () => {
+      const state = this.stateFor(session)!;
+      const facts = this.guardedTargetFacts(session)!;
+      if (state.queued.length) return 'Earlier messages are waiting.';
+      if (state.asks?.length) return 'The session is waiting for an answer.';
+      // Accepted running prompts remain visible until completion. They do not represent preparation.
+      const activePrompts = (this.live[session] ?? []).filter(
+        (press) => press.kind === 'prompt' && press.ran && press.started && !press.completed && !press.failed,
+      ).length;
+      if (facts.pendingSubmissions > activePrompts || facts.pendingControls > 0 || binding.pendingControl?.())
+        return 'The session has pending work.';
+      return null;
+    };
+    try {
+      const blocked = check();
+      if (blocked) return refuse(blocked);
+      const idle = binding.idle();
+      const queueReason =
+        waiting() ??
+        (idle === null ? null : binding.liveReason ? binding.liveReason() : 'The session cannot receive live input.');
+      if (queueReason) {
+        const queued = await this.queueAgentMessage(request, binding, true);
+        return queued.status === 'queued' ? { ...queued, reason: `${queueReason} ${queued.reason}` } : queued;
+      }
+      const live = idle !== null;
+      const beforeWrite = () => {
+        const reason = check() ?? waiting();
+        if (reason) throw new Error(reason);
+      };
+      beforeWrite();
+      binding.invalidate();
+      const receipt = await (live ? binding.deliverLive!(text, beforeWrite) : binding.deliver(text, beforeWrite));
+      if (receipt.outcome === 'refused' && receipt.unwritten) {
+        const blocked = check();
+        if (blocked) return refuse(blocked);
+        const queued = await this.queueAgentMessage(request, binding, true);
+        return queued.status === 'queued'
+          ? { ...queued, reason: `The destination changed before delivery. ${queued.reason}` }
+          : queued;
+      }
+      return {
+        version: 1,
+        status: receipt.outcome,
+        requestId: request.id,
+        payloadSha256: payloadSha256(text),
+        nativeTurnId: receipt.nativeTurnId,
+        delivery: live ? (binding.agent === 'codex' ? 'steer' : 'live') : 'turn',
+        reason:
+          receipt.outcome === 'accepted'
+            ? 'The session received the message. This confirms receipt, not completed work.'
+            : receipt.outcome === 'unknown'
+              ? 'Message delivery is unknown. Arc will not resend it.'
+              : 'The message was not sent. ' + receipt.reason,
+      };
+    } finally {
+      release?.();
+      this.flushAgentQueue(session);
+    }
+  }
+
   public async queueAgentMessage(
     request: AttributedRequest,
     binding: AgentMessageBinding | null,
+    reserved = false,
   ): Promise<GuardedSendResult> {
     const session = request.params.sessionId ?? '';
     const text = request.params.prompt ?? '';
     const refuse = (reason: string) => ({ ...guardedRefusal(request.id, text, reason), queuedSubmissionId: null });
+    if (!reserved && binding?.reserve) {
+      const release = binding.reserve();
+      if (!release) return refuse('Another message is still being delivered. No message was queued.');
+      try {
+        return await this.queueAgentMessage(request, binding, true);
+      } finally {
+        release();
+        this.flushAgentQueue(session);
+      }
+    }
     const requester = requesterOf(request);
     if (!requester || requester.id === session || guardedPromptRefusal(text))
       return refuse('Supply a message from another native session.');
@@ -6178,6 +6282,11 @@ export class PanelProvider implements vscode.Disposable {
       this.pendingQueueDrains.add(session);
       return;
     }
+    const release = binding.reserve?.();
+    if (binding.reserve && !release) {
+      this.pendingQueueDrains.add(session);
+      return;
+    }
     this.queueHandoffs.add(next.id);
     this.queues[session] = (this.queues[session] ?? []).map((entry) =>
       entry.id === next.id
@@ -6233,6 +6342,7 @@ export class PanelProvider implements vscode.Disposable {
       );
       await this.writeDrafts().catch(() => {});
     } finally {
+      release?.();
       this.queueHandoffs.delete(next.id);
       void this.post({ type: 'usage', usage: this.usagePayload() });
     }

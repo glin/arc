@@ -802,7 +802,8 @@ export class ClaudeWire {
     return generations.length ? generations : undefined;
   }
 
-  private endReplayWait(reason: string): void {
+  private endReplayWait(reason: string, turnEnded = false): void {
+    if (turnEnded && this.replayWait?.attempt.liveInput) return;
     const wait = this.replayWait;
     if (!wait) return;
     clearTimeout(wait.timer);
@@ -1021,7 +1022,7 @@ export class ClaudeWire {
         {
           const localCommand = str(m.local_command);
           if (!localCommand && !inputGenerations) {
-            this.endReplayWait('The agent finished a turn without confirming the prompt.');
+            this.endReplayWait('The agent finished a turn without confirming the prompt.', true);
             this.responseClock.reset();
             this.responseTimingBlocked = false;
           }
@@ -1049,7 +1050,7 @@ export class ClaudeWire {
         if (subtype === 'session_state_changed') {
           const state = str(m.state);
           if (state === 'idle') {
-            this.endReplayWait('The agent went idle without confirming the prompt.');
+            this.endReplayWait('The agent went idle without confirming the prompt.', true);
             this.reportedState = 'idle';
             this.emit({ kind: 'sessionState', state: 'idle' });
           } else if (state === 'running' || state === 'requires_action') {

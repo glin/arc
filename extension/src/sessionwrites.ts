@@ -41,6 +41,7 @@ export interface SessionWriteParams {
   limit?: number;
   // A guarded follow-up names the observation that its prompt continues.
   observation?: string;
+  delivery?: 'auto';
 }
 
 // An opaque observation is base64url text with one dot. The host signs it, and the CLI passes it through unread.
@@ -63,7 +64,10 @@ export function validSessionWrite(method: string, params: Record<string, unknown
     );
   if (method === 'send')
     return (
-      ['observation,prompt,sessionId', 'prompt,sessionId'].includes(Object.keys(params).sort().join(',')) &&
+      ['delivery,prompt,sessionId', 'observation,prompt,sessionId', 'prompt,sessionId'].includes(
+        Object.keys(params).sort().join(','),
+      ) &&
+      (!Object.prototype.hasOwnProperty.call(params, 'delivery') || params.delivery === 'auto') &&
       text(params.sessionId, 256) &&
       !!params.sessionId &&
       text(params.prompt, 48 * 1024) &&
@@ -512,6 +516,7 @@ export interface GuardedSendResult {
   nativeTurnId: string | null;
   reason: string;
   queuedSubmissionId?: string | null;
+  delivery?: 'turn' | 'steer' | 'live';
 }
 
 // Activation-local binding to one existing child. Saved queues never retain this authority.
@@ -522,6 +527,10 @@ export interface AgentMessageBinding {
   idle(): string | null;
   refusal(): string | null;
   invalidate(): void;
+  reserve?(): (() => void) | null;
+  liveReason?(): string | null;
+  pendingControl?(): boolean;
+  deliverLive?(text: string, beforeWrite: () => void): Promise<GuardedReceipt>;
   deliver(text: string, beforeWrite: () => void): Promise<GuardedReceipt>;
 }
 
@@ -570,6 +579,7 @@ function sameRequester(a: RequesterIdentity, b: RequesterIdentity): boolean {
 // Ownership, assignment revisions, and retained attempts for guarded follow-ups in one activation.
 // Every decision here is synchronous, so admission and the input write share one turn of the event loop.
 export class GuardedSends<C extends GuardedChild = GuardedChild> {
+  private readonly reservations = new Set<string>();
   private readonly secret = randomBytes(32);
   private readonly workers = new Map<string, WorkerRecord<C>>();
   private readonly blocked = new Set<string>();
@@ -599,6 +609,19 @@ export class GuardedSends<C extends GuardedChild = GuardedChild> {
 
   owner(sessionId: string): GuardedOwner<C> | null {
     return this.workers.get(sessionId)?.owner ?? null;
+  }
+
+  // A reservation covers admission through receipt, including targets with no worker association.
+  reserve(sessionId: string): (() => void) | null {
+    if (this.reservations.has(sessionId)) return null;
+    this.reservations.add(sessionId);
+    let held = true;
+    return () => {
+      if (held) {
+        held = false;
+        this.reservations.delete(sessionId);
+      }
+    };
   }
 
   // Reader intervention port for accepted input. The host calls it once it knows it accepted directing input,
@@ -781,33 +804,40 @@ export async function runGuardedSend<C extends GuardedChild>(
   });
   const early = policy.precheck(request);
   if (early) return result('refused', early);
-  const owner = policy.owner(request.sessionId)!;
-  const child = port.live(owner);
-  if (!child || child !== owner.child) return result('refused', GUARDED_SEND_REASONS.ownership);
-  const held: { attempt: GuardedAttempt | null; refusal: string | null } = { attempt: null, refusal: null };
+  const release = policy.reserve(request.sessionId);
+  if (!release) return result('refused', GUARDED_SEND_REASONS.unsettled);
   try {
-    // The lease covers only the final admission and the input write.
-    const leased = await port.withLease(child, async () => {
-      held.refusal = policy.admit(request, port.live(owner), policy.facts?.(request.sessionId) ?? null);
-      if (held.refusal) return true;
-      held.attempt = port.write(child, request.prompt);
-      void held.attempt.written.then(() => policy.attempted(request));
-      await Promise.race([held.attempt.written, held.attempt.receipt]);
-      return true;
-    });
-    if (leased === null && !held.attempt) held.refusal = GUARDED_SEND_REASONS.ownership;
-  } catch (error) {
-    if (held.attempt) held.attempt.settle({ outcome: 'unknown', nativeTurnId: null, reason: (error as Error).message });
-    else held.refusal ??= GUARDED_SEND_REASONS.unavailable;
+    const owner = policy.owner(request.sessionId)!;
+    const child = port.live(owner);
+    if (!child || child !== owner.child) return result('refused', GUARDED_SEND_REASONS.ownership);
+    const held: { attempt: GuardedAttempt | null; refusal: string | null } = { attempt: null, refusal: null };
+    try {
+      // The lease covers only the final admission and the input write.
+      const leased = await port.withLease(child, async () => {
+        held.refusal = policy.admit(request, port.live(owner), policy.facts?.(request.sessionId) ?? null);
+        if (held.refusal) return true;
+        held.attempt = port.write(child, request.prompt);
+        void held.attempt.written.then(() => policy.attempted(request));
+        await Promise.race([held.attempt.written, held.attempt.receipt]);
+        return true;
+      });
+      if (leased === null && !held.attempt) held.refusal = GUARDED_SEND_REASONS.ownership;
+    } catch (error) {
+      if (held.attempt)
+        held.attempt.settle({ outcome: 'unknown', nativeTurnId: null, reason: (error as Error).message });
+      else held.refusal ??= GUARDED_SEND_REASONS.unavailable;
+    }
+    if (held.refusal || !held.attempt) return result('refused', held.refusal ?? GUARDED_SEND_REASONS.unavailable);
+    const receipt = await held.attempt.receipt;
+    policy.settle(request.sessionId, receipt);
+    if (receipt.outcome === 'accepted') return result('accepted', GUARDED_SEND_REASONS.accepted, receipt.nativeTurnId);
+    const reason = sentence(receipt.reason);
+    if (receipt.outcome === 'refused')
+      return result('refused', NOT_SENT.test(reason) ? reason : `${reason} No prompt was sent.`.trim());
+    return result('unknown', `${reason} ${GUARDED_SEND_REASONS.unknown}`.trim(), receipt.nativeTurnId);
+  } finally {
+    release();
   }
-  if (held.refusal || !held.attempt) return result('refused', held.refusal ?? GUARDED_SEND_REASONS.unavailable);
-  const receipt = await held.attempt.receipt;
-  policy.settle(request.sessionId, receipt);
-  if (receipt.outcome === 'accepted') return result('accepted', GUARDED_SEND_REASONS.accepted, receipt.nativeTurnId);
-  const reason = sentence(receipt.reason);
-  if (receipt.outcome === 'refused')
-    return result('refused', NOT_SENT.test(reason) ? reason : `${reason} No prompt was sent.`.trim());
-  return result('unknown', `${reason} ${GUARDED_SEND_REASONS.unknown}`.trim(), receipt.nativeTurnId);
 }
 
 const NOT_SENT = /\b(?:prompt was not sent|No prompt was sent)\b/i;
@@ -926,6 +956,13 @@ export function interveneOnReaderInput(
 // The live child as the delivery port reads it. `AgentSession` implements it.
 export interface GuardedWriter extends GuardedChild {
   readonly agent: string;
+  guardedLiveReason?(): string | null;
+  guardedLive?(
+    text: string,
+    clientUuid: string,
+    onSubmitted?: (turnId: number) => void,
+    beforeWrite?: () => void,
+  ): GuardedAttempt;
   guardedPrompt(
     text: string,
     clientUuid: string,
@@ -962,40 +999,54 @@ export function agentMessageBinding<C extends GuardedWriter>(
     idle: () => child.guardedIdle(),
     refusal,
     invalidate: () => policy.invalidate(session),
-    deliver: async (text, beforeWrite) => {
-      let receipt: GuardedReceipt;
-      try {
-        receipt = (await host.withActivity(child.key, async (live) => {
-          if (live !== child || !current() || refusal() || child.guardedIdle() !== null)
-            return {
-              outcome: 'refused' as const,
-              nativeTurnId: null,
-              reason: 'The original agent cannot receive this message.',
-            };
-          beforeWrite();
-          const attempt = child.guardedPrompt(
-            text,
-            clientUuid(),
-            (turnId) => submitted?.(child, turnId),
-            () => {
-              if (!current() || refusal()) throw new Error('The original agent no longer owns this message.');
-              beforeWrite();
-            },
-          );
-          return attempt.receipt;
-        })) ?? { outcome: 'refused', nativeTurnId: null, reason: 'The original agent is no longer available.' };
-      } catch (error) {
-        receipt = {
-          outcome: 'unknown',
-          nativeTurnId: null,
-          reason: error instanceof Error ? error.message : 'Message delivery is unknown.',
-        };
-      }
-      if (receipt.outcome !== 'accepted' && writerFailure(receipt.reason)) policy.noteWriterConflict(session);
-      policy.settle(session, receipt);
-      return receipt;
-    },
+    reserve: () => policy.reserve(session),
+    liveReason: () => (child.guardedLiveReason ? child.guardedLiveReason() : 'This agent cannot receive live input.'),
+    pendingControl: () => (policy.facts?.(session)?.pendingControls ?? 0) > 0,
+    deliverLive: (text, beforeWrite) => deliver(text, beforeWrite, true),
+    deliver: (text, beforeWrite) => deliver(text, beforeWrite, false),
   };
+  async function deliver(text: string, beforeWrite: () => void, liveInput: boolean): Promise<GuardedReceipt> {
+    let receipt: GuardedReceipt;
+    let attempt: GuardedAttempt | null = null;
+    try {
+      receipt = (await host.withActivity(child.key, async (live) => {
+        if (
+          live !== child ||
+          !current() ||
+          refusal() ||
+          (liveInput ? child.guardedLiveReason?.() !== null : child.guardedIdle() !== null)
+        )
+          return {
+            outcome: 'refused' as const,
+            nativeTurnId: null,
+            reason: 'The original agent cannot receive this message.',
+          };
+        beforeWrite();
+        const write = liveInput ? child.guardedLive!.bind(child) : child.guardedPrompt.bind(child);
+        attempt = write(
+          text,
+          clientUuid(),
+          (turnId) => submitted?.(child, turnId),
+          () => {
+            if (!current() || refusal()) throw new Error('The original agent no longer owns this message.');
+            beforeWrite();
+          },
+        );
+        return attempt.receipt;
+      })) ?? { outcome: 'refused', nativeTurnId: null, reason: 'The original agent is no longer available.' };
+    } catch (error) {
+      receipt = {
+        outcome: (attempt as GuardedAttempt | null)?.inputWritten ? 'unknown' : 'refused',
+        nativeTurnId: null,
+        reason: error instanceof Error ? error.message : 'Message delivery is unknown.',
+      };
+    }
+    if (receipt.outcome !== 'accepted' && writerFailure(receipt.reason)) policy.noteWriterConflict(session);
+    if (receipt.outcome === 'refused' && !(attempt as GuardedAttempt | null)?.inputWritten)
+      receipt = { ...receipt, unwritten: true };
+    policy.settle(session, receipt);
+    return receipt;
+  }
 }
 
 // Delivery-mode port over the host's retained children. It never opens a child.

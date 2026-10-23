@@ -248,6 +248,8 @@ export interface Driver {
   ): Promise<void | string>;
   // Whether the provider positively reported that nothing runs. An absent report is not idle.
   idleEvidence?(): boolean;
+  steerable?(): boolean;
+  steer?(text: string, attempt: GuardedAttempt): Promise<void>;
   compact(beforeWrite?: () => void): Promise<void>;
   clear(name?: string, beforeWrite?: () => void, writeAttempted?: () => void): Promise<void>;
   answer(id: string, answer: AskAnswer): boolean;
@@ -493,6 +495,8 @@ export function codexPlan(launch: Launch, options: CodexPlanOptions): AgentPlan 
           return commands;
         },
         prompt: (prompt, guard) => wire.prompt(prompt, guard),
+        steerable: () => wire.steerable(),
+        steer: (text, attempt) => wire.steer(text, attempt),
         idleEvidence: () => wire.idleEvidence(),
         compact: (beforeWrite) => wire.compact(beforeWrite),
         clear: async (name, beforeWrite, writeAttempted) => {
@@ -1125,6 +1129,51 @@ export class AgentSession {
 
   guardedTurnEnds(): number {
     return this.turnEnds;
+  }
+
+  guardedLiveReason(): string | null {
+    if (this.exited || !this.ready || this.childTerminated) return 'The agent is unavailable.';
+    if (
+      !this.busy ||
+      this.asks.size ||
+      this.delivering.size ||
+      this.heldEffort !== null ||
+      this.effortSent !== null ||
+      this.preparingTurns.size ||
+      this.acceptingPrompts ||
+      this.compactionUnresolved() ||
+      [...this.openTurns].some((turn) => this.commandNames.has(turn) && !this.modelInputs.has(turn))
+    )
+      return 'The agent is waiting for pending work.';
+    return this.agent === 'claude' || this.driver.steerable?.() === true
+      ? null
+      : 'The running turn cannot receive live input.';
+  }
+
+  guardedLive(
+    text: string,
+    clientUuid: string,
+    onSubmitted?: (turnId: number) => void,
+    beforeWrite?: () => void,
+  ): GuardedAttempt {
+    if (this.agent === 'claude') {
+      const attempt = new GuardedAttempt(clientUuid, beforeWrite, true);
+      this.prompt({ text, assets: [] }, onSubmitted, attempt).catch((error: unknown) =>
+        attempt.settle({ outcome: 'unknown', nativeTurnId: null, reason: (error as Error).message }),
+      );
+      return attempt;
+    }
+    const attempt = new GuardedAttempt(clientUuid, beforeWrite);
+    if (this.guardedLiveReason() || !this.driver.steer) {
+      attempt.settle({ outcome: 'refused', nativeTurnId: null, reason: 'The running turn cannot receive live input.' });
+    } else {
+      void this.driver
+        .steer(text, attempt)
+        .catch((error: unknown) =>
+          attempt.settle({ outcome: 'unknown', nativeTurnId: null, reason: (error as Error).message }),
+        );
+    }
+    return attempt;
   }
 
   // Writes one guarded text prompt through the ordinary prompt accounting. The attempt's

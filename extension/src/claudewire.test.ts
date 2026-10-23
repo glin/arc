@@ -2382,6 +2382,31 @@ test('Claude default metadata sends a control request without a prompt', async (
   );
 });
 
+test('Claude live receipts survive the original result and idle until their exact replay arrives', () => {
+  const wire = new ClaudeWire({ send: () => {}, emit: () => {}, sessionId: SESSION });
+  const attempt = new GuardedAttempt('live-race', undefined, true);
+  void wire.prompt('live correction', attempt);
+  wire.receive(
+    JSON.stringify({ type: 'result', subtype: 'success', session_id: SESSION, result: 'original work finished' }),
+  );
+  wire.receive(
+    JSON.stringify({ type: 'system', subtype: 'session_state_changed', state: 'idle', session_id: SESSION }),
+  );
+  assert.equal(attempt.settled, null);
+  wire.receive(
+    JSON.stringify({
+      type: 'user',
+      isReplay: true,
+      session_id: SESSION,
+      parent_tool_use_id: null,
+      uuid: 'live-race',
+      message: { role: 'user', content: [{ type: 'text', text: 'live correction' }] },
+    }),
+  );
+  assert.equal(attempt.settled?.outcome, 'accepted');
+  wire.close('done');
+});
+
 test('Claude guarded prompts settle only on the matching root replay, and replay frames stay out of display and session tracking', () => {
   vi.useFakeTimers();
   try {

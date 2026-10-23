@@ -855,6 +855,7 @@ test('an isolated timed-out compaction retains its own late turn and an acknowle
     await manual;
     assert.equal(h.wire.hasOpenTurns(), false, 'unknown completion must release the pending caller');
     assert.equal(h.wire.compactionUnresolved(), true);
+    assert.equal(h.wire.steerable(), false);
     h.wire.close('finished');
   } finally {
     vi.useRealTimers();
@@ -3788,6 +3789,10 @@ test('a Codex compaction with no answer withholds idle evidence and refuses a gu
     const send = (method: string, params: Record<string, unknown>) =>
       h.wire.receive(JSON.stringify({ method, params }));
     send('turn/started', { threadId: THREAD, turn: { id: 'late' } });
+    const live = new GuardedAttempt('uuid-live-compaction');
+    await h.wire.steer('No compaction input.', live);
+    assert.equal(live.settled?.outcome, 'refused');
+    assert.equal(h.parsed().length, written);
     send('turn/completed', { threadId: THREAD, turn: { id: 'late', status: 'completed' } });
     assert.equal(h.wire.compactionUnresolved(), false);
     assert.equal(h.wire.idleEvidence(), true, 'the late turn ending restores idle evidence');
@@ -3795,6 +3800,132 @@ test('a Codex compaction with no answer withholds idle evidence and refuses a gu
   } finally {
     vi.useRealTimers();
   }
+});
+
+test('Codex guarded live input requires exactly one root and accepts only its correlated steer receipt', async () => {
+  vi.useFakeTimers();
+  try {
+    const h = harness(50);
+    const starting = h.wire.startThread({ cwd: 'C:/ws' });
+    reply(h, { thread: { id: THREAD, path: 'C:/rollout.jsonl' } });
+    await starting;
+    const idle = new GuardedAttempt('idle');
+    const before = h.sent.length;
+    await h.wire.steer('idle input', idle);
+    assert.equal(idle.settled?.outcome, 'refused');
+    assert.equal(h.sent.length, before);
+    const notify = (method: string, id = TURN) =>
+      h.wire.receive(JSON.stringify({ method, params: { threadId: THREAD, turn: { id, status: 'completed' } } }));
+    notify('turn/started');
+    for (const outcome of ['accepted', 'mismatch', 'rpc', 'deadline', 'close']) {
+      const attempt = new GuardedAttempt(outcome);
+      const pending = h.wire.steer('correction', attempt);
+      const sent = h.parsed().at(-1)!;
+      assert.equal(sent.method, 'turn/steer');
+      assert.equal(sent.params.expectedTurnId, TURN);
+      assert.deepEqual(sent.params.input, [{ type: 'text', text: 'correction' }]);
+      if (outcome === 'accepted') reply(h, { turnId: TURN });
+      if (outcome === 'mismatch') reply(h, { turnId: 'other' });
+      if (outcome === 'rpc')
+        h.wire.receive(
+          JSON.stringify({ id: sent.id, error: { code: -32600, message: 'refused', data: { reason: 'unknown' } } }),
+        );
+      if (outcome === 'deadline') await vi.advanceTimersByTimeAsync(50);
+      if (outcome === 'close') h.wire.close('closed');
+      await pending;
+      assert.equal(attempt.settled?.outcome, outcome === 'accepted' ? 'accepted' : 'unknown');
+      assert.equal(h.parsed().filter((frame) => frame.method === 'turn/start').length, 0);
+      if (outcome === 'deadline') {
+        reply(h, { turnId: TURN });
+        assert.equal(attempt.settled?.outcome, 'unknown');
+      }
+    }
+    const roots = harness();
+    const open = roots.wire.startThread({ cwd: 'C:/ws' });
+    reply(roots, { thread: { id: THREAD } });
+    await open;
+    for (const id of ['one', 'two'])
+      roots.wire.receive(JSON.stringify({ method: 'turn/started', params: { threadId: THREAD, turn: { id } } }));
+    assert.equal(roots.wire.steerable(), false);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('Codex ordinary corrections resume after automatic compaction while retaining exact root-ending evidence', async () => {
+  const h = harness();
+  const starting = h.wire.startThread({ cwd: 'C:/ws' });
+  reply(h, { thread: { id: THREAD } });
+  await starting;
+  const send = (method: string, params: Record<string, unknown>) =>
+    h.wire.receive(JSON.stringify({ method, params: { threadId: THREAD, ...params } }));
+  send('turn/started', { turn: { id: TURN } });
+  assert.equal(h.wire.steerable(), true);
+  const item = (method: string, id: string, turnId = TURN) =>
+    send(method, { turnId, item: { id, type: 'contextCompaction' } });
+  item('item/started', 'automatic');
+  item('item/started', 'overlapping');
+  const written = h.sent.length;
+  const blocked = new GuardedAttempt('during-automatic');
+  await h.wire.steer('Wait for compaction.', blocked);
+  assert.equal(blocked.settled?.outcome, 'refused');
+  assert.equal(h.sent.length, written);
+  item('item/completed', 'automatic');
+  item('item/completed', 'overlapping', 'other-root');
+  assert.equal(h.wire.steerable(), false, "another root cannot complete this root's compaction");
+  item('item/completed', 'overlapping');
+  send('item/started', { turnId: TURN, item: { id: 'continued', type: 'agentMessage', text: 'Working.' } });
+  const correction = new GuardedAttempt('after-automatic');
+  const correcting = h.wire.steer('Correct the remaining work.', correction);
+  assert.equal(h.parsed().at(-1)?.method, 'turn/steer');
+  assert.equal(h.parsed().at(-1)?.params.expectedTurnId, TURN);
+  reply(h, { turnId: TURN });
+  await correcting;
+  assert.equal(correction.settled?.outcome, 'accepted');
+  send('turn/completed', { turn: { id: TURN, status: 'completed' } });
+  assert.ok(
+    h.events.some(
+      (event) =>
+        event.kind === 'native' &&
+        event.event.kind === 'compact' &&
+        event.event.stage === 'turnEnd' &&
+        event.event.turnId === TURN,
+    ),
+  );
+  assert.equal(h.wire.idleEvidence(), true);
+  h.wire.close('finished');
+});
+
+test('Codex manual compaction retains exclusion between native item completion and root completion', async () => {
+  const h = harness();
+  const starting = h.wire.startThread({ cwd: 'C:/ws' });
+  reply(h, { thread: { id: THREAD } });
+  await starting;
+  const compacting = h.wire.compact();
+  const requestId = h.parsed().at(-1)!.id;
+  const send = (method: string, params: Record<string, unknown>) =>
+    h.wire.receive(JSON.stringify({ method, params: { threadId: THREAD, ...params } }));
+  const refuse = async () => {
+    assert.equal(h.wire.steerable(), false, 'manual compaction must keep ordinary input ineligible');
+    const written = h.sent.length;
+    const correction = new GuardedAttempt('manual-compaction');
+    await h.wire.steer('Ordinary correction.', correction);
+    assert.equal(correction.settled?.outcome, 'refused');
+    assert.equal(h.sent.length, written);
+  };
+  await refuse();
+  h.wire.receive(JSON.stringify({ id: requestId, result: {} }));
+  send('turn/started', { turn: { id: TURN, items: [], status: 'inProgress', error: null } });
+  await refuse();
+  send('item/started', { turnId: TURN, item: { type: 'contextCompaction', id: 'compact-item' } });
+  await refuse();
+  send('item/completed', { turnId: TURN, item: { type: 'contextCompaction', id: 'compact-item' } });
+  await refuse();
+  send('turn/completed', { turn: { id: TURN, items: [], status: 'completed', error: null } });
+  await compacting;
+  assert.equal(h.wire.compactionUnresolved(), false);
+  assert.equal(h.wire.idleEvidence(), true);
+  h.wire.close('finished');
 });
 
 test('Codex guarded prompts accept only their own correlated turn and settle shared, failed, and silent starts as unknown', async () => {

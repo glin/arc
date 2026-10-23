@@ -2466,14 +2466,18 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   channel?.setGuardedReadHandler((request) => panel.guardedReadRequest(request));
   channel?.setGuardedSendHandler((request) =>
     Object.prototype.hasOwnProperty.call(request.params, 'observation')
-      ? guardedChannelSend(guardedSends, request, (...args) => panel.onSendPrompt?.(...args) ?? Promise.resolve({}))
+      ? guardedChannelSend(
+          guardedSends,
+          request,
+          (...args) => panel.onSendPrompt?.(...args) ?? Promise.resolve({}),
+        ).finally(() => panel.flushAgentQueue(request.params.sessionId ?? ''))
       : (() => {
           const sessionId = request.params.sessionId ?? '';
           const source = panel.guardedTargetFacts(sessionId);
           const claude = host.find('claude', sessionId);
           const codex = host.find('codex', sessionId);
           const child = source?.current && !(claude && codex) ? (claude ?? codex) : null;
-          return panel.queueAgentMessage(
+          return panel.sendAgentMessage(
             request,
             child
               ? agentMessageBinding(guardedSends, child, host, activeWriterFailure, randomUUID, (live, turnId) =>

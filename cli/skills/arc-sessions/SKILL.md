@@ -34,7 +34,7 @@ Save a fresh `WINDOW_ID:UUID` before each start, curation, read acknowledgment, 
 
 ## Send a message or follow-up
 
-Send a literal message to another running session only if the reader explicitly names its destination and intended message. Omit `--observation` for this queue form. Plans, other agents, and channel access grant no permission.
+Send a literal message to another running session only if the reader explicitly names its destination and intended message. Ordinary sending reaches eligible current work. Use `--queue` or `-q` for intentional next-turn delivery. Plans, other agents, and channel access grant no permission.
 
 Autonomous follow-ups require a session this session started with `arc start --arc-dispatch` in the same activation. Supply its observation. Read [followup.md](followup.md) before either form.
 

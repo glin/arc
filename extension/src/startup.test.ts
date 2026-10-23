@@ -14428,6 +14428,7 @@ function agentMessageHost(agent: 'claude' | 'codex') {
     (one): one is ts.ClassDeclaration => ts.isClassDeclaration(one) && one.name?.text === 'PanelProvider',
   )!;
   const names = [
+    'sendAgentMessage',
     'queueAgentMessage',
     'flushAgentMessage',
     'recoverAgentMessage',
@@ -14493,6 +14494,7 @@ function agentMessageHost(agent: 'claude' | 'codex') {
   let control = false;
   let replacement = false;
   let outcome: 'accepted' | 'refused' | 'unknown' = 'accepted';
+  let receipt: ((attempt: GuardedAttempt) => void) | undefined;
   let beforeNative: (() => void) | undefined;
   let persist: (() => Promise<void>) | undefined;
   const child = {
@@ -14501,6 +14503,9 @@ function agentMessageHost(agent: 'claude' | 'codex') {
     state: () => ({ sessionId: 'target', exited, lastError: null }),
     guardedTurnEnds: () => 0,
     guardedIdle: () => (busy || asks || control ? 'busy' : null),
+    guardedLiveReason: () => (asks || control ? 'Waiting for pending work.' : busy ? null : 'No running work.'),
+    guardedLive: (value: string, uuid: string, submitted?: (turn: number) => void, beforeWrite?: () => void) =>
+      child.guardedPrompt(value, uuid, agent === 'claude' ? submitted : undefined, beforeWrite),
     guardedPrompt: (value: string, uuid: string, submitted?: (turn: number) => void, beforeWrite?: () => void) => {
       const attempt = new GuardedAttempt(uuid, beforeWrite);
       submitted?.(7);
@@ -14510,7 +14515,8 @@ function agentMessageHost(agent: 'claude' | 'codex') {
         attempt.prepareWrite();
         reads.push(value);
         attempt.markWritten();
-        attempt.settle({ outcome, nativeTurnId: 'native-7', reason: outcome });
+        if (receipt) receipt(attempt);
+        else attempt.settle({ outcome, nativeTurnId: 'native-7', reason: outcome });
       } catch (error) {
         attempt.settle({ outcome: 'unknown', nativeTurnId: null, reason: String(error) });
       }
@@ -14631,6 +14637,9 @@ function agentMessageHost(agent: 'claude' | 'codex') {
     setOutcome: (value: typeof outcome) => {
       outcome = value;
     },
+    receipt: (work?: (attempt: GuardedAttempt) => void) => {
+      receipt = work;
+    },
     beforeNative: (work: () => void) => {
       beforeNative = work;
     },
@@ -14641,6 +14650,198 @@ function agentMessageHost(agent: 'claude' | 'codex') {
 }
 
 for (const agent of ['claude', 'codex'] as const) {
+  test(`${agent} ordinary reader corrections reach busy targets before current work finishes and retain the exact receipt`, async () => {
+    const f = agentMessageHost(agent);
+    const book = new SessionWriteRequests('window');
+    const request = { ...f.request, params: { ...f.request.params, delivery: 'auto' as const } };
+    // The accepted original turn still owns a visible prompt while it works.
+    f.host.live.target = [{ kind: 'prompt', ran: true, started: true }];
+    const facts = f.host.guardedTargetFacts;
+    f.host.guardedTargetFacts = () => ({ ...facts(), pendingSubmissions: 1 });
+    const { WindowChannel } = await import('./sessionrequests.ts');
+    const { runManagement } = await import('../../cli/src/manage.ts');
+    const home = tempDir('ordinary-send-');
+    const channel = new WindowChannel(home);
+    channel.setGuardedSendHandler((incoming) => f.host.sendAgentMessage(incoming, f.binding()));
+    await channel.update({ folders: [home], scopeReady: true, panelReady: true, panelVisible: true });
+    const prompt = path.join(home, 'correction.txt');
+    fs.writeFileSync(prompt, f.text);
+    const names = ['ARC_HOME', 'CLAUDE_CODE_SESSION_ID', 'CODEX_THREAD_ID'];
+    const prior = names.map((name) => process.env[name]);
+    let accepted: any;
+    try {
+      process.env.ARC_HOME = home;
+      process.env.CLAUDE_CODE_SESSION_ID = 'reader-agent';
+      delete process.env.CODEX_THREAD_ID;
+      accepted = JSON.parse(
+        await runManagement('send', [
+          'target',
+          '--prompt-file',
+          prompt,
+          '--request-id',
+          channel.hostId + ':correction',
+          '--window',
+          channel.hostId,
+          '--json',
+        ]),
+      );
+    } finally {
+      names.forEach((name, index) => {
+        if (prior[index] === undefined) delete process.env[name];
+        else process.env[name] = prior[index];
+      });
+      await channel.dispose();
+    }
+    assert.equal(accepted.status, 'accepted');
+    assert.equal(accepted.delivery, agent === 'codex' ? 'steer' : 'live');
+    assert.deepEqual(f.reads, [f.text]);
+    assert.equal(f.host.stateFor().running, true, 'the original work has not finished');
+    assert.equal(f.host.queues.target, undefined);
+    assert.equal(f.policy.owner('target'), null);
+    assert.equal(f.host.drafts.target, 'reader draft');
+    assert.equal(f.host.saved.comments.length, 1);
+    await book.runGuarded(request.id, request, () => accepted);
+    assert.deepEqual(await book.runGuarded(request.id, request, () => assert.fail('retry wrote again')), accepted);
+    await assert.rejects(
+      book.runGuarded(request.id, f.request, () => assert.fail('changed mode wrote again')),
+      /different request/,
+    );
+  });
+  test(`${agent} ordinary sends start idle work and preserve pending-work and FIFO queue admission`, async () => {
+    const idle = agentMessageHost(agent);
+    idle.setBusy(false);
+    const request = { ...idle.request, params: { ...idle.request.params, delivery: 'auto' as const } };
+    assert.equal((await idle.host.sendAgentMessage(request, idle.binding())).delivery, 'turn');
+    assert.deepEqual(idle.reads, [idle.text]);
+    for (const blocker of ['ask', 'control', 'preparing', 'queue']) {
+      const f = agentMessageHost(agent);
+      if (blocker === 'ask') f.setAsks(true);
+      if (blocker === 'control') f.setControl(true);
+      if (blocker === 'preparing') {
+        f.host.live.target = [{ kind: 'prompt', ran: false, started: false }];
+        const facts = f.host.guardedTargetFacts;
+        f.host.guardedTargetFacts = () => ({ ...facts(), pendingSubmissions: 1 });
+      }
+      if (blocker === 'queue')
+        f.host.queues.target = queueSubmissionAfter([], 'older', 'older text', [], [], 1, false, {
+          agent,
+          owner: 'target',
+        });
+      const result = await f.host.sendAgentMessage(request, f.binding());
+      assert.equal(result.status, 'queued', blocker);
+      assert.deepEqual(f.reads, [], blocker);
+    }
+  });
+  test(`${agent} retains a pending ordinary receipt through caller disconnect and wakes the queued head on settlement`, async () => {
+    const f = agentMessageHost(agent);
+    let attempt: GuardedAttempt | undefined;
+    const attempts: GuardedAttempt[] = [];
+    f.receipt((value) => {
+      attempt = value;
+      attempts.push(value);
+    });
+    const { WindowChannel } = await import('./sessionrequests.ts');
+    const net = await import('node:net');
+    const home = tempDir('pending-ordinary-send-');
+    const channel = new WindowChannel(home);
+    let settled = false;
+    channel.setGuardedSendHandler(async (request) => {
+      const result = await f.host.sendAgentMessage(request, f.binding());
+      settled = true;
+      return result;
+    });
+    await channel.update({ folders: [home], scopeReady: true, panelReady: true, panelVisible: false });
+    const entry = JSON.parse(fs.readFileSync(path.join(home, 'hosts', channel.hostId + '.json'), 'utf8'));
+    const socket = net.createConnection(entry.address);
+    const request = {
+      ...f.request,
+      id: channel.hostId + ':pending',
+      version: 1,
+      token: entry.token,
+      method: 'send',
+      params: { ...f.request.params, delivery: 'auto' as const },
+    };
+    try {
+      await new Promise<void>((resolve, reject) => {
+        socket.once('connect', resolve);
+        socket.once('error', reject);
+      });
+      socket.write(JSON.stringify(request) + '\n');
+      await vi.waitFor(() => assert.ok(attempt?.inputWritten));
+      const disconnected = new Promise<void>((resolve) => socket.once('close', () => resolve()));
+      socket.destroy();
+      await disconnected;
+      await vi.waitFor(() => assert.equal((channel as unknown as { sockets: Set<unknown> }).sockets.size, 0));
+      const competing = { ...f.request, id: 'window:competing', requester: 'another-reader', params: request.params };
+      let refused: { status: string; reason: string } | undefined;
+      const competingSend = f.host.sendAgentMessage(competing, f.binding()).then((result: typeof refused) => {
+        refused = result;
+      });
+      await vi.waitFor(() => assert.ok(refused || attempts.length > 1));
+      assert.equal(attempts.length, 1, 'another requester wrote before the first receipt settled');
+      assert.equal(refused!.status, 'refused');
+      assert.match(refused!.reason, /still being delivered/);
+      await competingSend;
+      assert.equal((await f.host.queueAgentMessage(competing, f.binding())).status, 'refused');
+      assert.equal(settled, false, 'caller disconnection must not settle the host attempt');
+      assert.deepEqual(f.reads, [f.text]);
+      // A queued head can become eligible while the provider still owes the earlier receipt.
+      const queued = queueSubmissionAfter([], 'queued-after-write', 'queued next', [], [], 1, false, {
+        agent,
+        owner: 'target',
+        origin: 'agent',
+      });
+      f.host.queues.target = queued;
+      f.host.agentMessages.set(queued[0].id, f.binding());
+      f.setBusy(false);
+      f.host.flushAgentQueue('target');
+      assert.deepEqual(f.reads, [f.text], 'the queued head cannot overtake the pending receipt');
+      f.receipt();
+      attempt!.settle({ outcome: 'accepted', nativeTurnId: 'native-7', reason: '' });
+      await vi.waitFor(() => assert.deepEqual(f.reads, [f.text, 'queued next']));
+      await vi.waitFor(() => assert.equal(f.host.agentMessages.size, 0));
+      assert.equal(settled, true);
+      assert.deepEqual(f.host.queues.target, []);
+    } finally {
+      for (const pending of attempts)
+        pending.settle({ outcome: 'unknown', nativeTurnId: null, reason: 'fixture cleanup' });
+      socket.destroy();
+      await channel.dispose();
+    }
+  });
+  test(`${agent} blocks unknown ordinary delivery without queue fallback`, async () => {
+    const f = agentMessageHost(agent);
+    const release = f.policy.reserve('target')!;
+    const request = { ...f.request, params: { ...f.request.params, delivery: 'auto' as const } };
+    assert.equal((await f.host.sendAgentMessage(request, f.binding())).status, 'refused');
+    assert.equal((await f.host.queueAgentMessage(f.request, f.binding())).status, 'refused');
+    release();
+    f.setOutcome('unknown');
+    assert.equal((await f.host.sendAgentMessage(request, f.binding())).status, 'unknown');
+    assert.equal(
+      (await f.host.sendAgentMessage({ ...request, id: 'window:next', requester: 'other' }, f.binding())).status,
+      'refused',
+    );
+    assert.deepEqual(f.reads, [f.text]);
+    assert.equal(f.host.queues.target, undefined);
+  });
+  test(`${agent} ordinary sends recheck native ownership and pending controls before writing`, async () => {
+    for (const change of ['replacement', 'ask', 'control']) {
+      const f = agentMessageHost(agent);
+      f.beforeNative(() => {
+        if (change === 'replacement') f.replace();
+        if (change === 'ask') f.setAsks(true);
+        if (change === 'control') f.setControl(true);
+      });
+      const result = await f.host.sendAgentMessage(
+        { ...f.request, params: { ...f.request.params, delivery: 'auto' } },
+        f.binding(),
+      );
+      assert.equal(result.status, change === 'replacement' ? 'refused' : 'queued');
+      assert.deepEqual(f.reads, []);
+      assert.equal(f.policy.messageRefusal('target'), null, 'a proven pre-write change creates no uncertainty block');
+    }
+  });
   test(`${agent} queues an explicit message to an unrelated busy offscreen target with unparsed history and unclaimed comments`, async () => {
     const f = agentMessageHost(agent);
     const requests = new SessionWriteRequests('window');

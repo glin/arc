@@ -285,6 +285,8 @@ export interface GuardedReceipt {
   reason: string;
   // Codex returned a turn that already existed, so the input joined work in progress.
   sharedTurn?: boolean;
+  // The retained writer established that no input write was attempted.
+  unwritten?: boolean;
 }
 
 // One guarded prompt from the input write to its provider receipt. The first settlement wins.
@@ -300,6 +302,7 @@ export class GuardedAttempt {
   constructor(
     readonly clientUuid: string,
     private readonly beforeWrite?: () => void,
+    readonly liveInput = false,
   ) {
     this.written = new Promise((resolve) => (this.resolveWritten = resolve));
     this.receipt = new Promise((resolve) => (this.resolveReceipt = resolve));
@@ -312,6 +315,10 @@ export class GuardedAttempt {
   // The host reads a shared-turn receipt here, because the wire settles it before the prompt call returns.
   get settled(): GuardedReceipt | null {
     return this.result;
+  }
+
+  get inputWritten(): boolean {
+    return this.wrote;
   }
 
   markWritten(): void {
