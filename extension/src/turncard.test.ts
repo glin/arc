@@ -11528,7 +11528,8 @@ test('the subagent results entry caps its lines, marks a partial figure and repo
     Date.now(),
   );
   const { entry } = subagentResultsEntry(many.chips);
-  assert.equal(entry?.value, 'at least 16% (19k)');
+  assert.equal(entry?.value, '16% (19k)');
+  assert.equal(entry?.valueTitle, '18,600 tokens, estimate');
   assert.deepEqual(entry?.lines, [
     'Subagent 1: 2k tokens (1.7%)',
     'Subagent 2: 2k tokens (1.6%)',
@@ -11549,6 +11550,7 @@ test('the subagent results entry caps its lines, marks a partial figure and repo
     Date.now(),
   );
   assert.deepEqual(subagentResultsEntry(compacted.chips).entry?.value, '0% (0)');
+  assert.equal(subagentResultsEntry(compacted.chips).entry?.valueTitle, 'No subagent results in context');
   assert.deepEqual(subagentResultsEntry(compacted.chips).entry?.lines, [
     'The latest compaction removed earlier results.',
   ]);

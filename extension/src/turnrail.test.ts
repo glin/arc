@@ -771,6 +771,49 @@ test('rail context falls back beyond the parse cut while lifetime figures never 
   });
 });
 
+test('the session list context hover excludes subagent results when compaction details rebuild it', () => {
+  const sessionId = 'compacted';
+  const parsed = statsBySession(
+    [
+      turn({
+        sessionId,
+        startedAt: 3_000,
+        endedAt: 4_000,
+        contextTokens: 80_000,
+        contextWindow: 200_000,
+        subagentContext: {
+          tokens: 4_000,
+          partial: false,
+          removed: false,
+          agents: [{ name: 'Reviewer', tokens: 4_000 }],
+        },
+      }),
+    ],
+    [compaction({ sessionId, at: 1_000, contextAfter: 20_000 })],
+  );
+  const projected = sessionStatsOf(
+    parsed,
+    {},
+    {},
+    {
+      [sessionId]: { entries: [{ label: 'Latest compaction', value: 'Automatic' }] },
+    },
+  );
+  const context = projected[sessionId].find((chip) => chip.metric === 'context');
+  assert.ok(context);
+  assert.match(context.detail, /Latest recorded context: 80,000 tokens/);
+  assert.match(context.detail, /Latest compaction: Automatic/);
+  assert.match(context.detail, /Context measures the current level, not cumulative token usage\./);
+  assert.doesNotMatch(context.detail, /Subagent results|Reviewer|Estimated from text size\./);
+  assert.deepEqual(context.detailList?.entries.at(-1), {
+    label: 'Subagent results',
+    value: '5% (4k)',
+    valueTitle: '4,000 tokens, estimate',
+    lines: ['Reviewer: 4k tokens (5%)'],
+  });
+  assert.ok(context.detailList?.notes?.includes('Estimated from text size.'));
+});
+
 test('the latest indexed compaction trigger attaches to turns when current context is unavailable', () => {
   const sessionId = 'compacted';
   const parsed = statsBySession(

@@ -3112,7 +3112,11 @@ export function withSessionContextDetail(
       entries,
       footer: [...(chip.detailList.footer ?? []), ...(addition.footer ?? [])],
     };
-    return { ...chip, detailList, detail: flatDetailList(detailList).join('\n') };
+    return {
+      ...chip,
+      detailList,
+      detail: metric === 'context' ? sessionContextHover(detailList) : flatDetailList(detailList).join('\n'),
+    };
   });
 }
 
@@ -3426,8 +3430,11 @@ function subagentContextEntry(figure: SubagentContextFigure | undefined, context
   const share = `${subagentSharePercent(figure.tokens, context)} (${formatTokens(figure.tokens)})`;
   return {
     label: SUBAGENT_RESULTS_LABEL,
-    value: figure.partial ? `at least ${share}` : share,
-    valueTitle: `${figure.tokens.toLocaleString()} tokens, estimate`,
+    value: share,
+    valueTitle:
+      figure.removed && figure.tokens === 0
+        ? 'No subagent results in context'
+        : `${figure.tokens.toLocaleString()} tokens, estimate`,
     lines: [
       ...shown.map((line) => `${line.name}: ${part(line.tokens)}`),
       ...(rest.length ? [`${rest.length} more: ${part(restTokens)}`] : []),
@@ -5778,6 +5785,15 @@ export function sessionTurnStats(stats: SessionTurnStats | null | undefined): Se
   ];
 }
 
+// The session list hover omits subagent results while the popover keeps them.
+function sessionContextHover(detailList: StatDetailList): string {
+  return flatDetailList({
+    ...detailList,
+    entries: detailList.entries.filter((entry) => entry.label !== SUBAGENT_RESULTS_LABEL),
+    notes: detailList.notes?.filter((note) => note !== SUBAGENT_RESULTS_ESTIMATE_NOTE),
+  }).join('\n');
+}
+
 function sessionFigureStats(
   turns: readonly SessionFigureTurn[],
   compactions: readonly SessionFigureCompaction[],
@@ -5844,12 +5860,7 @@ function sessionFigureStats(
       ...ctx,
       metric: 'context',
       compactLabel: share === null ? ctx.label : `${wholePercent(share)}% ctx`,
-      // The session list shows this text, and the subagent results stay in the popover alone.
-      detail: flatDetailList({
-        ...detailList,
-        entries: detailList.entries.filter((entry) => entry.label !== SUBAGENT_RESULTS_LABEL),
-        notes: detailList.notes?.filter((note) => note !== SUBAGENT_RESULTS_ESTIMATE_NOTE),
-      }).join('\n'),
+      detail: sessionContextHover(detailList),
       detailList,
     });
   }
