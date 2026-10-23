@@ -33,6 +33,7 @@ export class CompactStore implements CompactPersistence {
     private readonly now = Date.now,
     private readonly endedProcess = dead,
     private readonly pid = process.pid,
+    private readonly limits = { records: COMPACT_LIMITS.records as number, bytes: 16 * 1024 * 1024 },
   ) {
     if (!activationValid(activation)) throw new Error('Continuation storage is unavailable.');
     this.root = path.resolve(root);
@@ -243,13 +244,10 @@ export class CompactStore implements CompactPersistence {
     }
   }
   private expired(receipt: CompactReceipt): boolean {
-    return (
-      this.now() >= receipt.admittedAt + 90 * 60_000 ||
-      (receipt.terminalAt !== null && this.now() >= receipt.terminalAt + COMPACT_LIMITS.retentionMs)
-    );
+    return receipt.terminalAt !== null && this.now() >= receipt.terminalAt + COMPACT_LIMITS.retentionMs;
   }
   private records(): { file: string; receipt: CompactReceipt; bytes: number }[] {
-    return this.names(this.root, COMPACT_LIMITS.records + 1)
+    return this.names(this.root, this.limits.records + 1)
       .filter((name) => name !== 'leases')
       .map((name) => {
         // Unpublished staging files are never execution authority. They still consume byte capacity.
@@ -273,7 +271,7 @@ export class CompactStore implements CompactPersistence {
             ({ receipt }) =>
               receipt.owner !== this.activation &&
               (['waiting', 'preparing', 'attempting'].includes(receipt.observation.continuation!.state) ||
-                (reclaim && receipt.terminalAt !== null && this.expired(receipt))),
+                (reclaim && receipt.terminalAt !== null)),
           )
           .map(({ receipt }) => receipt.owner),
       );
@@ -333,16 +331,30 @@ export class CompactStore implements CompactPersistence {
         if (
           this.expired(entry.receipt) &&
           entry.receipt.terminalAt !== null &&
+          entry.receipt.observation.continuation!.write !== 'unknown' &&
           (entry.receipt.owner === this.activation || ended.has(entry.receipt.owner))
         )
           fs.unlinkSync(entry.file);
       records = this.records();
-      if (
-        records.length >= COMPACT_LIMITS.records ||
+      const eligible = records
+        .filter(
+          ({ receipt }) =>
+            receipt.terminalAt !== null &&
+            !['waiting', 'preparing', 'attempting'].includes(receipt.observation.continuation!.state) &&
+            receipt.observation.continuation!.write !== 'unknown' &&
+            (receipt.owner === this.activation || ended.has(receipt.owner)),
+        )
+        .sort((a, b) => a.receipt.terminalAt! - b.receipt.terminalAt!);
+      const full = () =>
+        records.length >= this.limits.records ||
         records.reduce((sum, entry) => sum + entry.bytes, Buffer.byteLength(text) + this.leaseBytes()) >
-          16 * 1024 * 1024
-      )
-        throw new Error('Saved continuations are full.');
+          this.limits.bytes;
+      for (const entry of eligible) {
+        if (!full()) break;
+        fs.unlinkSync(entry.file);
+        records = records.filter((current) => current !== entry);
+      }
+      if (full()) throw new Error('Saved continuations are full.');
       this.publish(this.file(receipt.observation.requestId), receipt);
     }, true);
   }

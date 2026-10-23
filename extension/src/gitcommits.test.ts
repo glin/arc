@@ -1328,8 +1328,16 @@ test.each(['printed', 'quiet'] as const)(
       return one;
     };
     const runner = nodeGitRunner();
-    const retained = new CommitRepositories(runner, () => {});
-    const resolver = new RepositoryCommits(runner, () => {});
+    let captured!: () => void;
+    const capture = new Promise<void>((resolve) => {
+      captured = resolve;
+    });
+    let recovered!: () => void;
+    const recovery = new Promise<void>((resolve) => {
+      recovered = resolve;
+    });
+    const retained = new CommitRepositories(runner, captured);
+    const resolver = new RepositoryCommits(runner, recovered);
     const apply = (reader: RepositoryCommits, proofs: CommitRepositories, one: Turn, folders = [arc]) =>
       reader.apply(
         [one],
@@ -1338,13 +1346,11 @@ test.each(['printed', 'quiet'] as const)(
         (intent, identities, _turn, agent) => proofs.restore(intent, agent?.id === 'child' ? file : null, identities),
       );
     const first = parent();
-    await vi.waitFor(
-      () => {
-        apply(resolver, retained, first);
-        assert.equal(retained.snapshot().length, 1);
-      },
-      { timeout: 10000 },
-    );
+    apply(resolver, retained, first);
+    await recovery;
+    apply(resolver, retained, first);
+    await capture;
+    assert.equal(retained.snapshot().length, 1);
     saveDerivedCache(cache, [], [], [], undefined, undefined, retained.snapshot());
     const stored = JSON.parse(readFileSync(cache, 'utf8'));
     delete stored.formatVersion;
@@ -1416,8 +1422,10 @@ test.each(['printed', 'quiet'] as const)(
     const replacedCommon = new CommitRepositories(runner, () => {});
     replacedCommon.load(saved);
     const commonRow = parent();
-    apply(new RepositoryCommits(runner, () => {}), replacedCommon, commonRow);
-    assert.ok(!commonRow.agents[0].commits?.some((commit) => commit.repository));
+    await new Promise<void>((resolve) => {
+      apply(new RepositoryCommits(runner, resolve), replacedCommon, commonRow);
+      assert.ok(!commonRow.agents[0].commits?.some((commit) => commit.repository));
+    });
     rmdirSync(common);
     renameSync(movedCommon, common);
     const movedRoot = join(directory, 'skills-saved');
@@ -1426,16 +1434,20 @@ test.each(['printed', 'quiet'] as const)(
     const replacedRoot = new CommitRepositories(runner, () => {});
     replacedRoot.load(saved);
     const rootRow = parent();
-    apply(new RepositoryCommits(runner, () => {}), replacedRoot, rootRow);
-    assert.ok(!rootRow.agents[0].commits?.some((commit) => commit.repository));
+    await new Promise<void>((resolve) => {
+      apply(new RepositoryCommits(runner, resolve), replacedRoot, rootRow);
+      assert.ok(!rootRow.agents[0].commits?.some((commit) => commit.repository));
+    });
     renameSync(foreign, join(directory, 'replacement'));
     renameSync(movedRoot, foreign);
     appendFileSync(file, '{}\n');
     const changedSource = new CommitRepositories(runner, () => {});
     changedSource.load(saved);
     const changedRow = parent();
-    apply(new RepositoryCommits(runner, () => {}), changedSource, changedRow);
-    assert.ok(!changedRow.agents[0].commits?.some((commit) => commit.repository));
+    await new Promise<void>((resolve) => {
+      apply(new RepositoryCommits(runner, resolve), changedSource, changedRow);
+      assert.ok(!changedRow.agents[0].commits?.some((commit) => commit.repository));
+    });
   },
 );
 // File identities remain real while Git responses and the validation clock stay controlled.

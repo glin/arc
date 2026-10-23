@@ -32,6 +32,7 @@ import {
 } from './codexwire';
 import {
   WireEvent,
+  NativeEvent,
   Ask,
   AskAnswer,
   McpServer,
@@ -675,6 +676,8 @@ export interface HostOptions {
   now?: () => number;
   // Publishes events and state changes to the panel.
   onEvent(event: SessionEvent): void;
+  // Captures native command context before turn ownership waits for a prompt receipt.
+  onNativeObservation?(key: string, event: NativeEvent): void;
   onStateChange(state: SessionState): void;
 }
 
@@ -844,6 +847,7 @@ export class AgentSession {
   private readonly agentTurnIds = new Set<number>();
   private resultSeen = false;
   private readonly nativeTurnOwners = new Map<string, number>();
+  private readonly nativeToolOwners = new Map<string, { owner: number; background: boolean }>();
   private readonly respondingTurns = new Set<number>();
   private readonly responseOwners = new Map<string, number>();
   private readonly responseRateOwners = new Map<string, number>();
@@ -888,6 +892,7 @@ export class AgentSession {
     // Tests inject the clock to control Stop-ending expiry.
     private readonly now: () => number = Date.now,
     retainedBackground?: ClaudeBackgroundWork,
+    private readonly observeNative?: (event: NativeEvent) => void,
   ) {
     if (plan.sessionId && retainedBackground) this.background.set(plan.sessionId, retainedBackground);
     this.key = key;
@@ -1078,10 +1083,10 @@ export class AgentSession {
         this.changed();
       }
       if (!this.settledInputs.has(submitted)) this.respondingTurns.add(submitted.id);
-      const pending = this.pendingResponses.splice(0);
-      for (const event of pending) this.handle(event);
+      this.drainPendingResponses();
       return submitted.id;
     } catch (error) {
+      this.drainPendingResponses();
       if (this.driver.hasOpenTurns) {
         this.busy = this.driver.hasOpenTurns();
       } else {
@@ -1460,7 +1465,7 @@ export class AgentSession {
     return this.preparingTurns.size > 0 || this.openTurns.size > 0 || this.agentRunning;
   }
 
-  // Whether Claude started this turn by itself rather than for an Arc submission.
+  // Whether the provider started this turn without an Arc submission.
   startedByAgent(turnId: number): boolean {
     return this.agentTurnIds.has(turnId);
   }
@@ -1494,7 +1499,7 @@ export class AgentSession {
     if (
       this.agent !== 'claude' ||
       this.driver.hasOpenTurns ||
-      !this.resultSeen ||
+      (!this.resultSeen && !this.agentRunning) ||
       this.liveClaudeTurn() !== undefined ||
       this.preparingTurns.size > 0
     )
@@ -1593,8 +1598,27 @@ export class AgentSession {
     return this.disposePromise;
   }
 
-  private handle(event: WireEvent): void {
+  private drainPendingResponses(): void {
+    if (this.acceptingPrompts) return;
+    const pending = this.pendingResponses.splice(0);
+    for (const event of pending) this.handle(event, true);
+  }
+
+  private handle(event: WireEvent, replay = false): void {
     if (this.exited) return;
+    if (!replay && event.kind === 'native') this.observeNative?.(event.event);
+    if (
+      !replay &&
+      this.pendingResponses.length &&
+      this.acceptingPrompts &&
+      (event.kind === 'text' ||
+        event.kind === 'delta' ||
+        event.kind === 'turnEnd' ||
+        (event.kind === 'native' && ['toolStart', 'toolEnd', 'rootEnd'].includes(event.event.kind)))
+    ) {
+      this.pendingResponses.push(event);
+      return;
+    }
     if (event.kind === 'responseStarted') {
       const owner = this.agentTurn ?? this.liveClaudeTurn();
       if (
@@ -1637,7 +1661,7 @@ export class AgentSession {
       this.changed();
       return;
     }
-    // A native event names its accepted submission only when one owner is identifiable.
+    // Native events retain one exact live turn owner.
     if (event.kind === 'native') {
       const native = event.event;
       if (native.kind === 'background') {
@@ -1657,17 +1681,27 @@ export class AgentSession {
         this.busy = this.driver.hasOpenTurns();
         this.changed();
       }
-      let owner = this.driver.hasOpenTurns
-        ? native.turnId
-          ? this.nativeTurnOwners.get(native.turnId)
-          : undefined
-        : this.agentTurn
-          ? this.agentTurn.id
-          : this.liveClaudeTurn() && this.preparingTurns.size === 0
-            ? this.liveClaudeTurn()!.id
-            : ['toolStart', 'toolEnd', 'rootEnd', 'launch'].includes(native.kind)
-              ? this.openAgentTurn()
-              : undefined;
+      const toolKey =
+        native.kind === 'toolStart' || native.kind === 'toolEnd'
+          ? `${native.provider}:${native.sessionId}:${native.turnId ?? native.generation}:${native.toolId}`
+          : null;
+      const retainedTool = native.kind === 'toolEnd' && toolKey ? this.nativeToolOwners.get(toolKey) : undefined;
+      const toolOwner =
+        native.kind === 'toolEnd' && (native.background || retainedTool?.background) ? retainedTool?.owner : undefined;
+      let owner =
+        toolOwner ??
+        (this.driver.hasOpenTurns
+          ? native.turnId
+            ? this.nativeTurnOwners.get(native.turnId)
+            : undefined
+          : this.agentTurn
+            ? this.agentTurn.id
+            : this.liveClaudeTurn() && this.preparingTurns.size === 0
+              ? this.liveClaudeTurn()!.id
+              : ['toolStart', 'toolEnd', 'rootEnd', 'launch'].includes(native.kind)
+                ? this.openAgentTurn()
+                : undefined);
+      if (native.kind === 'toolEnd' && toolKey) this.nativeToolOwners.delete(toolKey);
       let dispatchTurnId: number | undefined;
       if (
         !this.driver.hasOpenTurns &&
@@ -1695,6 +1729,22 @@ export class AgentSession {
         this.pendingResponses.push(event);
         return;
       }
+      if (
+        owner === undefined &&
+        rooted &&
+        this.driver.hasOpenTurns &&
+        native.turnId &&
+        native.provider === this.agent &&
+        native.sessionId === this.driver.sessionId() &&
+        native.kind === 'toolStart' &&
+        native.initiating
+      ) {
+        owner = ++sessionTurnSequence;
+        this.nativeTurnOwners.set(native.turnId, owner);
+        this.agentTurnIds.add(owner);
+      }
+      if (native.kind === 'toolStart' && toolKey && owner !== undefined)
+        this.nativeToolOwners.set(toolKey, { owner, background: native.background === true });
       this.report(event, owner, dispatchTurnId);
       return;
     }
@@ -1828,6 +1878,7 @@ export class AgentSession {
     this.openTurns.clear();
     this.agentTurn = null;
     this.nativeTurnOwners.clear();
+    this.nativeToolOwners.clear();
     this.respondingTurns.clear();
     this.responseOwners.clear();
     this.responseRateOwners.clear();
@@ -2928,6 +2979,7 @@ export class AgentHost {
       this.options.exitGraceMs,
       this.options.now,
       retainedBackground,
+      (event) => this.options.onNativeObservation?.(key, event),
     );
     this.sessions.set(key, session);
     await session.start();

@@ -6,6 +6,7 @@ import {
   CLAUDE_REPEATED_CHECK_BYTES,
   CLAUDE_REPEATED_CHECKPOINT_BYTES,
   ClaudeRepeatedDetector,
+  ClaudeRepeatedPrefix,
   blankClaudeRepeated,
   claudeRecordIdentity,
   createClaudeRepeatedFilter,
@@ -23,6 +24,7 @@ import {
 import { indexSpendFile, type IndexSpendFileResult, type SpendFileIndex } from './projectspend';
 import { tempDir } from './temproot';
 import { closeReadWindow, openReadWindow } from './readmeter';
+import { retainedParserPayload } from './parserstate';
 import { readClaudeHistoryPage, readClaudeSessionIncrementalAsync } from './claudehistory';
 import {
   createClaudeSessionReducer,
@@ -40,6 +42,46 @@ import { buildSync } from 'esbuild';
 
 const root = tempDir('claude-repeated-');
 afterEach(() => vi.restoreAllMocks());
+
+test('prefix duplicate lookup resumes through oversized lines without retaining historical identities', () => {
+  const record = (uuid: string, timestamp: string, text = '') =>
+    JSON.stringify({ uuid, timestamp, type: 'progress', text }) + '\n';
+  const old = record('old', '2026-01-01T00:00:00Z');
+  const newer = record('new', '2026-01-02T00:00:00Z');
+  const body = Buffer.from(old + record('large', '2026-01-01T00:00:01Z', 'x'.repeat(2 * 1024 * 1024)) + newer);
+  let bytes = 0;
+  const offsets: number[] = [];
+  const repeated = new ClaudeRepeatedPrefix((offset, length) => {
+    bytes += length;
+    offsets.push(offset);
+    return body.subarray(offset, offset + length);
+  });
+  const first = repeated.repeated(newer.trim(), body.length - Buffer.byteLength(newer));
+  assert.deepEqual(first.next(), { done: true, value: false });
+  const unique = record('older-unique', '2026-01-01T00:00:00Z').trim();
+  const lookup = repeated.repeated(unique, body.length);
+  let passes = 0;
+  for (;;) {
+    const before = bytes;
+    const next = lookup.next();
+    assert.ok(bytes - before <= 64 * 1024);
+    if (next.done) {
+      assert.equal(next.value, false);
+      break;
+    }
+    passes++;
+  }
+  assert.ok(passes > 32, 'lookup passes continue within a large irrelevant record');
+  assert.ok(offsets.every((offset, index) => index === 0 || offset > offsets[index - 1]));
+  const duplicate = repeated.repeated(old.trim(), body.length);
+  assert.equal(duplicate.next().done, false);
+  assert.deepEqual(duplicate.next(), { done: true, value: true });
+  for (let index = 3; index < 3000; index++) {
+    const line = record(`unique-${index}`, new Date(Date.UTC(2026, 0, index)).toISOString()).trim();
+    assert.deepEqual(repeated.repeated(line, body.length).next(), { done: true, value: false });
+  }
+  assert.ok(retainedParserPayload(repeated) < 4096, 'actual classifier fields remain bounded after unique identities');
+});
 
 let written = 0;
 function write(records: object[]): string {

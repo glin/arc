@@ -2191,7 +2191,7 @@ import { sameCommitSha, listSessionFiles, readTurns } from './transcript.ts';
 import { handoffRefusalMessage, pressIsMidTurn, pressesAfter } from './composerview.ts';
 import { compaction, livePress, powershellDispatchExecution, subagentCommitTurn, turn } from './turnfixtures.ts';
 import { ClaudeWire } from './claudewire.ts';
-import { COMPACT_LIMITS, CompactHost, CompactRequests, promptAsReader, type CompactChild } from './compactrequest.ts';
+import { CompactHost, CompactRequests, promptAsReader, type CompactChild } from './compactrequest.ts';
 import { currentRecordsBySession, turnKey } from './turnread.ts';
 import { ProgressiveWorker, acceptsProgressiveResult, type ProgressiveInput } from './progressiveworker.ts';
 import { handleNavigationPress, navigationButton, ROVING_SELECTOR } from './webview/navigation.ts';
@@ -26871,6 +26871,42 @@ function recordedReplyFixture(prefix: string) {
   return { provider, record, note, saves };
 }
 
+test('recorded reply polling reaches a waiting session beyond the per-pass budget and stops after settlement', async () => {
+  vi.useFakeTimers();
+  const { provider, record } = recordedReplyFixture('recorded-reply-rotation-');
+  let active = true;
+  let saved = false;
+  try {
+    for (let index = 0; index < 32; index++)
+      provider.recordedReplies.note(`other-${index}`, {
+        sourceId: 'unrecorded',
+        text: 'Waiting.',
+        wanted: () => active,
+        saved: () => {},
+      });
+    provider.recordedReplies.note('woken', {
+      sourceId: 'rotated-final',
+      text: 'Saved.',
+      wanted: () => !saved,
+      saved: () => {
+        saved = true;
+      },
+    });
+    record('Finish.', 'rotated-final', 'Saved.');
+    provider.settleRecordedReplies();
+    assert.equal(saved, false, 'the first pass keeps its bounded session budget');
+    await vi.advanceTimersToNextTimerAsync();
+    assert.equal(saved, true, 'the next pass reaches the retained session');
+    active = false;
+    await vi.advanceTimersToNextTimerAsync();
+    assert.equal(provider.recordedReplyRetry, null);
+  } finally {
+    provider.disposed = true;
+    if (provider.recordedReplyRetry) clearTimeout(provider.recordedReplyRetry);
+    vi.useRealTimers();
+  }
+});
+
 test('a recorded reply of a session no panel shows settles through its own transcript read', () => {
   const { provider, record, note, saves } = recordedReplyFixture('recorded-reply-unshown-');
   note('msg-woken', 'The tests pass.');
@@ -26902,9 +26938,8 @@ test('a recorded reply settles without panel polling when the transcript records
   }
 });
 
-// Catches hidden-window reads repeating every second after the compaction request's deadline,
-// when the transcript never records the response and no other event expires the request.
-test('recorded reply reads stop at the compaction request deadline when the transcript never records the response', () => {
+// Response reads continue for active requests and stop after lifecycle invalidation.
+test('recorded reply reads survive long waits and stop when their request is invalidated', () => {
   vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
   try {
     const window = 'b'.repeat(24);
@@ -26933,7 +26968,7 @@ test('recorded reply reads stop at the compaction request deadline when the tran
       kind: 'toolStart',
       toolId: 'call',
       command: `arc compact request --self --after-turn --request-id ${payload.requestId} --window ${window} --json`,
-      foreground: true,
+      initiating: true,
     });
     assert.equal(requests.admit(payload, () => true).state, 'queued');
     const { provider, note, saves } = recordedReplyFixture('recorded-reply-deadline-');
@@ -26943,9 +26978,12 @@ test('recorded reply reads stop at the compaction request deadline when the tran
     provider.settleRecordedReplies();
     vi.runOnlyPendingTimers();
     assert.equal(vi.getTimerCount(), 1, 'the request still waits, so the reads continue');
-    vi.setSystemTime(Date.now() + COMPACT_LIMITS.admissionMs);
+    vi.setSystemTime(Date.now() + 91 * 60_000);
     vi.runOnlyPendingTimers();
-    assert.equal(vi.getTimerCount(), 0, 'the deadline passed, so the reads stop');
+    assert.equal(vi.getTimerCount(), 1, 'active requests retain response reads beyond admission age');
+    requests.invalidate(() => true, 'The child ended.');
+    vi.runOnlyPendingTimers();
+    assert.equal(vi.getTimerCount(), 0, 'invalidated requests stop their response reads');
     assert.deepEqual(saves, []);
   } finally {
     vi.useRealTimers();
@@ -26963,12 +27001,14 @@ test('a recorded reply matches its own assistant message, not an earlier turn wi
   assert.deepEqual(saves, ['msg-second']);
 });
 
-test('a recorded reply settles when a newer turn is recorded before the next read', () => {
+test('a recorded reply settles beyond four newer turns and the bounded transcript tail', () => {
   const { provider, record, note, saves } = recordedReplyFixture('recorded-reply-newer-');
   note('msg-earlier', 'Done with the build.');
   record('build notice', 'msg-earlier', 'Done with the build.');
-  record('review notice', 'msg-later', 'The review is clean.');
-  provider.settleRecordedReplies();
+  const file = provider.catalog.sessions[0].file;
+  fs.appendFileSync(file, (JSON.stringify({ type: 'unrelated', text: 'x'.repeat(4096) }) + '\n').repeat(270));
+  for (let index = 0; index < 5; index++) record('review notice', `msg-later-${index}`, 'The review is clean.');
+  for (let pass = 0; pass < 12 && !saves.length; pass++) provider.settleRecordedReplies();
   assert.deepEqual(saves, ['msg-earlier']);
 });
 

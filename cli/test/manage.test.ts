@@ -5,12 +5,129 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, test, vi } from 'vitest';
 import { WindowChannel, type SessionRequest } from '../../extension/src/sessionrequests.ts';
+import * as sessionRequests from '../../extension/src/sessionrequests.ts';
 import { runManagement } from '../src/manage.ts';
 import { runCompact } from '../src/compact.ts';
 import { runSessions } from '../src/sessions.ts';
 import { collectRow, collectPage, collectTurns, smokeEnv } from './smoke-fixture.ts';
 
-afterEach(() => vi.unstubAllEnvs());
+afterEach(() => {
+  vi.unstubAllEnvs();
+  vi.restoreAllMocks();
+  vi.useRealTimers();
+});
+
+const compactWindow = 'b'.repeat(24);
+const compactArgs = [
+  'request',
+  '--self',
+  '--after-turn',
+  '--request-id',
+  compactWindow + ':aaaaaaaa-1111-2222-3333-444444444444',
+  '--window',
+  compactWindow,
+  '--json',
+];
+
+test('compact readiness spaces four negative reads and preserves their reason without admission', async () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(0);
+  const times: number[] = [];
+  const request = vi.spyOn(sessionRequests, 'requestWindow').mockImplementation(async (method) => {
+    assert.equal(method, 'compact-ready');
+    times.push(Date.now());
+    return { ready: false, code: 'not-observed', reason: 'Not seen yet.' };
+  });
+  const pending = runCompact(compactArgs);
+  await vi.advanceTimersByTimeAsync(499);
+  assert.deepEqual(times, [0]);
+  await vi.advanceTimersByTimeAsync(1);
+  assert.deepEqual(times, [0, 500]);
+  await vi.advanceTimersByTimeAsync(1000);
+  const result = JSON.parse(await pending);
+  assert.deepEqual(times, [0, 500, 1000, 1500]);
+  assert.equal(request.mock.calls.length, 4);
+  assert.deepEqual([result.state, result.reason], ['refused', 'Not seen yet.']);
+});
+
+test('compact readiness stops new reads after a delayed negative exchange exhausts the deadline', async () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(0);
+  let release!: () => void;
+  const reply = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const request = vi.spyOn(sessionRequests, 'requestWindow').mockImplementation(async (method) => {
+    assert.equal(method, 'compact-ready');
+    await reply;
+    return { ready: false, reason: 'Still waiting.' };
+  });
+  const pending = runCompact(compactArgs);
+  await vi.advanceTimersByTimeAsync(1600);
+  release();
+  await vi.advanceTimersByTimeAsync(0);
+  await vi.advanceTimersByTimeAsync(500);
+  const result = JSON.parse(await pending);
+  assert.equal(request.mock.calls.length, 1);
+  assert.deepEqual([result.state, result.reason], ['refused', 'Still waiting.']);
+});
+
+test('compact readiness terminal reasons end polling without admission', async () => {
+  vi.useFakeTimers();
+  const request = vi.spyOn(sessionRequests, 'requestWindow');
+  for (const code of ['reader-acted', 'request-used', 'withdrawn']) {
+    request.mockResolvedValue({ ready: false, code, reason: `Reason for ${code}.` });
+    const pending = runCompact(compactArgs);
+    await vi.runAllTimersAsync();
+    const result = JSON.parse(await pending);
+    assert.deepEqual([result.state, result.reason], ['refused', `Reason for ${code}.`]);
+    assert.deepEqual(
+      request.mock.calls.map(([method]) => method),
+      ['compact-ready'],
+    );
+    request.mockClear();
+  }
+});
+
+test('compact readiness admits once when an unseen command becomes ready', async () => {
+  vi.useFakeTimers();
+  const request = vi
+    .spyOn(sessionRequests, 'requestWindow')
+    .mockResolvedValueOnce({ ready: false, code: 'not-observed' })
+    .mockResolvedValueOnce({ ready: true })
+    .mockResolvedValueOnce({ state: 'queued' });
+  const pending = runCompact(compactArgs);
+  await vi.advanceTimersByTimeAsync(500);
+  assert.equal(JSON.parse(await pending).state, 'queued');
+  assert.deepEqual(
+    request.mock.calls.map(([method]) => method),
+    ['compact-ready', 'compact-ready', 'compact-request'],
+  );
+});
+
+test('compact readiness accepts a positive in-flight reply after the read-start deadline', async () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(0);
+  let release!: () => void;
+  const reply = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const request = vi.spyOn(sessionRequests, 'requestWindow').mockImplementation(async (method) => {
+    if (method === 'compact-ready') {
+      await reply;
+      return { ready: true };
+    }
+    return { state: 'queued' };
+  });
+  const pending = runCompact(compactArgs);
+  await vi.advanceTimersByTimeAsync(2100);
+  release();
+  assert.equal(JSON.parse(await pending).state, 'queued');
+  assert.deepEqual(
+    request.mock.calls.map(([method]) => method),
+    ['compact-ready', 'compact-request'],
+  );
+});
 
 async function host() {
   const home = mkdtempSync(join(realpathSync(tmpdir()), 'arc-management-unit-'));

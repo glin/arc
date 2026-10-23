@@ -64,7 +64,6 @@ import {
   SESSION_PAGE_ERRORS,
   SESSION_PAGE_LIMITS,
   RecordedReplies,
-  recordedReplyTurns,
   type SessionCursorBody,
   type SessionListingRow,
   type SessionPageSource,
@@ -3237,6 +3236,7 @@ export class PanelProvider implements vscode.Disposable {
   }
 
   dispose(): void {
+    this.recordedReplies?.clear();
     if (this.disposed) return;
     this.readerPages = undefined;
     this.filterRequests?.dispose();
@@ -5717,7 +5717,7 @@ export class PanelProvider implements vscode.Disposable {
       void this.completeSelectedWindow(session, this.selectionGeneration);
   }
 
-  // A turn Claude started by itself has no response card. Its final response is held for reader
+  // A provider-originated turn has no response card. Its final response is held for reader
   // review once a recorded turn of the session carries the same assistant message.
   public noteRecordedReply(
     session: string,
@@ -5725,29 +5725,20 @@ export class PanelProvider implements vscode.Disposable {
     text: string,
     saved: () => void,
     wanted: () => boolean,
+    identity?: { provider: 'claude' | 'codex'; nativeTurnId?: string; ownerTurnId?: number },
   ): void {
     if (this.disposed) return;
-    if (this.recordedReplies.note(session, { sourceId, text, saved, wanted })) this.settleRecordedReplies();
+    if (this.recordedReplies.note(session, { sourceId, text, saved, wanted, ...identity }))
+      this.settleRecordedReplies();
   }
 
-  // The panel's own reads omit final responses, so each session with a waiting response gets a
-  // separate bounded read, whether or not a panel shows it.
+  // The panel's own reads omit final responses. Recovery shares one bounded source job
+  // across waiting sessions, whether or not a panel shows them.
   public settleRecordedReplies(): void {
     if (this.disposed) return;
     const sessions = this.catalog?.sessions ?? this.authoritativeCatalog ?? [];
-    for (const session of this.recordedReplies.sessions()) {
-      const source = sessions.find((one) => one.agent === 'claude' && one.sessionId === session);
-      if (!source) continue;
-      let turns: Turn[];
-      try {
-        turns = recordedReplyTurns(source);
-      } catch {
-        continue;
-      }
-      this.recordedReplies.settle(session, turns);
-    }
-    // The reads repeat until no request waits for a recorded response. A request stops waiting at
-    // its deadline, so the reads stop then even when the transcript never records the response.
+    this.recordedReplies.poll(sessions);
+    // Repeat bounded reads while a live request still waits for its recorded response.
     if (this.recordedReplyRetry) clearTimeout(this.recordedReplyRetry);
     this.recordedReplyRetry = this.recordedReplies.sessions().length
       ? setTimeout(() => {

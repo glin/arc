@@ -2092,33 +2092,13 @@ export class ClaudeBackgroundWork {
         }
       }
     }
-    const notice = taskNotificationText(record);
-    if (notice === null) return;
-    const tags = (name: string) => {
-      const occurrences = [...notice.matchAll(new RegExp(`</?${name}(?=[^a-zA-Z0-9_-]|$)[^>]*(?:>|$)`, 'g'))];
-      if (occurrences.length !== 2 || occurrences[0][0] !== `<${name}>` || occurrences[1][0] !== `</${name}>`)
-        return [];
-      const value = new RegExp(`<${name}>([^<>]+)</${name}>`).exec(notice)?.[1];
-      return value?.trim() ? [value] : [];
-    };
-    const statuses = tags('status'),
-      tools = tags('tool-use-id'),
-      tasks = tags('task-id');
-    if (
-      statuses.length !== 1 ||
-      !['completed', 'failed', 'killed'].includes(statuses[0]) ||
-      tools.length !== 1 ||
-      tasks.length !== 1 ||
-      !/^\s*<task-notification>[\s\S]*<\/task-notification>\s*$/.test(notice) ||
-      (notice.match(/<task-notification>/g)?.length ?? 0) !== 1 ||
-      (notice.match(/<\/task-notification>/g)?.length ?? 0) !== 1
-    )
-      return;
-    const tool = `tool:${tools[0]}`,
-      child = `child:${tasks[0]}`;
-    const mapped = this.tasks.get(tasks[0]);
+    const notice = claudeTaskNotification(record);
+    if (!notice) return;
+    const tool = `tool:${notice.toolId}`,
+      child = `child:${notice.taskId}`;
+    const mapped = this.tasks.get(notice.taskId);
     const mappedTask = this.toolTasks.get(tool);
-    if ((mapped !== undefined && mapped !== tool) || (mappedTask !== undefined && mappedTask !== tasks[0])) return;
+    if ((mapped !== undefined && mapped !== tool) || (mappedTask !== undefined && mappedTask !== notice.taskId)) return;
     for (const key of [tool, child]) {
       if (this.open.has(key) && !this.ambiguous.has(key)) {
         this.open.delete(key);
@@ -5451,6 +5431,34 @@ function readerQueuedAsk(
         at: stamp(attachment?.timestamp ?? record.timestamp),
       }
     : null;
+}
+
+// Reads terminal task identities from Claude user notices and queued task notifications.
+export function claudeTaskNotification(
+  record: Record<string, unknown>,
+): { toolId: string; taskId: string; status: string } | null {
+  const notice = taskNotificationText(record);
+  if (notice === null) return null;
+  const tags = (name: string) => {
+    const occurrences = [...notice.matchAll(new RegExp(`</?${name}(?=[^a-zA-Z0-9_-]|$)[^>]*(?:>|$)`, 'g'))];
+    if (occurrences.length !== 2 || occurrences[0][0] !== `<${name}>` || occurrences[1][0] !== `</${name}>`) return [];
+    const value = new RegExp(`<${name}>([^<>]+)</${name}>`).exec(notice)?.[1];
+    return value?.trim() ? [value] : [];
+  };
+  const statuses = tags('status'),
+    tools = tags('tool-use-id'),
+    tasks = tags('task-id');
+  if (
+    statuses.length !== 1 ||
+    !['completed', 'failed', 'killed'].includes(statuses[0]) ||
+    tools.length !== 1 ||
+    tasks.length !== 1 ||
+    !/^\s*<task-notification>[\s\S]*<\/task-notification>\s*$/.test(notice) ||
+    (notice.match(/<task-notification>/g)?.length ?? 0) !== 1 ||
+    (notice.match(/<\/task-notification>/g)?.length ?? 0) !== 1
+  )
+    return null;
+  return { toolId: tools[0], taskId: tasks[0], status: statuses[0] };
 }
 
 // Raw task-notification text from a user record's content or a queued attachment's prompt.

@@ -205,8 +205,8 @@ export type NativeEvent = {
   generation: number | null;
   evidence: Json;
 } & (
-  | { kind: 'toolStart'; toolId: string; command: string; foreground: boolean }
-  | { kind: 'toolEnd'; toolId: string; success: boolean }
+  | { kind: 'toolStart'; toolId: string; command: string; initiating: boolean; background?: boolean }
+  | { kind: 'toolEnd'; toolId: string; success: boolean; background?: boolean }
   | { kind: 'rootEnd'; success: boolean }
   | { kind: 'background' }
   // A root tool call that runs on after its turn, and the task notice that names that call when its work ends.

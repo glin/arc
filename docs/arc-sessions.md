@@ -72,7 +72,7 @@ Authorize a session with a specific task:
 Use Arc to start a Codex session reviewing this branch. Name it Branch review, apply Review, and pin it. Read its result and summarize its findings.
 ```
 
-Request compaction after saving a handoff:
+Direct the agent to save a handoff before compaction:
 
 ```text
 After saving the handoff, request compaction of this session after your response.

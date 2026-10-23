@@ -6787,7 +6787,7 @@ function reduceCodexSessionLine(
       }
       const answer = parsedFinalAnswer(payload, opts.captureSessionText);
       if (answer) {
-        recordAnswer(turn, state.answerById, answer, at, ++state.updateSequence);
+        recordAnswer(turn, state.answerById, answer, at, ++state.updateSequence, opts.dispatchResponse);
         turn.endedAt = Math.max(turn.endedAt, at);
       }
       break;
@@ -7045,7 +7045,7 @@ function reduceCodexSessionLine(
       }
       const answer = parsedFinalAnswer(payload, opts.captureSessionText);
       if (answer) {
-        recordAnswer(turn, state.answerById, answer, at, ++state.updateSequence);
+        recordAnswer(turn, state.answerById, answer, at, ++state.updateSequence, opts.dispatchResponse);
         turn.endedAt = Math.max(turn.endedAt, at);
       }
       break;
@@ -7135,7 +7135,7 @@ function reduceCodexSessionLine(
       }
       const answer = parsedFinalAnswer(payload, opts.captureSessionText);
       if (answer) {
-        recordAnswer(turn, state.answerById, answer, at, ++state.updateSequence);
+        recordAnswer(turn, state.answerById, answer, at, ++state.updateSequence, opts.dispatchResponse);
         turn.endedAt = Math.max(turn.endedAt, at);
       }
       // Senderless assistant commentary is not a child-answer message.
@@ -7161,7 +7161,7 @@ function reduceCodexSessionLine(
       }
       const answer = parsedFinalAnswer(payload, opts.captureSessionText);
       if (answer) {
-        recordAnswer(turn, state.answerById, answer, at, ++state.updateSequence);
+        recordAnswer(turn, state.answerById, answer, at, ++state.updateSequence, opts.dispatchResponse);
         turn.endedAt = Math.max(turn.endedAt, at);
       }
       break;
@@ -7905,7 +7905,13 @@ function recordAnswer(
   parsed: { sourceId: string | null; text: string },
   at: number,
   sequence: number,
+  retainResponse = false,
 ): void {
+  if (retainResponse)
+    turn.finalResponse = {
+      text: parsed.text,
+      sourceId: parsed.sourceId ?? (turn.finalResponse?.text === parsed.text ? turn.finalResponse.sourceId : null),
+    };
   const sourceId = parsed.sourceId ?? `${turn.promptId}:answer:${at}:${sequence}`;
   const held = byId.get(sourceId) ?? recentMatchingAnswer(turn, parsed.text, at);
   if (held) {

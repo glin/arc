@@ -181,25 +181,27 @@ Results include `status`, `requestId`, `payloadSha256`, `nativeTurnId`, and `rea
 
 ## Compaction
 
+The observed root command supplies compaction intent. Reader delegation, submission ancestry, and foreground execution are not admission requirements. Notification and continuation turns can request repeated compaction without renewing task or spending authority. New reader activity after observation cancels unsubmitted work and suppresses continuation.
+
 Request IDs use `WINDOW:UUID` with a lowercase UUID. Request window values must match the same activation. Requests begin up to four readiness reads across two seconds, then attempt admission once. Each read waits at most five seconds. Missing compaction support returns `refused`.
 
 Results include `requestId` and `state`: `queued`, `started`, `completed`, `cancelled`, `refused`, `failed`, `uncertain`, or `unavailable`. Lost admission replies return `uncertain`. Observe the original ID without retrying or switching transports. `compact status` submits no work. Missing records and unanswered status requests return `unavailable`.
 
 ### Continuation files
 
-Add `--continuation-file 'ABSOLUTE_PATH' --continuation-sha256 SHA256` immediately after `--after-turn`. Include both literal values in the foreground command.
+Add `--continuation-file 'ABSOLUTE_PATH' --continuation-sha256 SHA256` immediately after `--after-turn`. Include both literal values in the native shell command.
 
 Files require 1 through 8192 exact UTF-8 bytes. BOM, NUL, invalid UTF-8, whitespace-only input, and leading slash commands refuse. The digest is lowercase SHA-256 for those bytes. Arc reads the regular file once without deleting or rereading it.
 
 Windows paths must be drive-absolute. POSIX paths must begin `/`. Use forward slashes and single quotes. Filenames accept ASCII letters, digits, spaces, underscore, period, hyphen, parentheses, and slash. Empty or dot segments, repeated slashes, shell expansion, and paths above 1024 characters refuse.
 
-Arc saves the instruction before admission succeeds. One admitted continuation consumes the originating reader submission's allowance and bypasses the ordinary prompt queue. Its separate observation retains `state`, `sequence`, exact `text`, `sha256`, `write`, `nativeTurnId`, and `reason`. States are `waiting`, `preparing`, `attempting`, `accepted`, `cancelled`, `refused`, and `uncertain`.
+Arc saves the instruction before admission succeeds. Each completed compaction delivers its explicit continuation once outside the ordinary prompt queue. Its separate observation retains `state`, `sequence`, exact `text`, `sha256`, `write`, `nativeTurnId`, and `reason`. States are `waiting`, `preparing`, `attempting`, `accepted`, `cancelled`, `refused`, and `uncertain`.
 
 Completed compaction does not establish continuation acceptance. Accepted continuation confirms prompt acknowledgment, not task completion. The prompt is agent-authored and uses the provider's ordinary format.
 
-Continuation requires attributable native completion, settled controls, positive idle evidence, and current reader authority on the retained child. Reader input, questions, queued work, changed source or settings, archive, and scope loss suppress delivery. Arc saves possible input before its final authority check. Uncertain writes never retry automatically.
+Continuation requires attributable native completion, settled controls, positive idle evidence, and unchanged reader revision on the retained child. Reader input, questions, queued work, changed source or settings, archive, and scope loss suppress delivery. Arc saves possible input before its final authority check. Uncertain writes never retry automatically.
 
-Authority expires after thirty minutes. Readiness after completed compaction has two minutes within that deadline. Saved status includes `originWindow` and `servedByWindow`. Only the same workspace and exact currently admitted source expose instruction text. Ended origins cancel unattempted work or expose possible input as uncertain. Status writes nothing and restarts no work. Terminal receipts persist one hour, with visibility ending ninety minutes after admission.
+Active requests and continuations wait for their prerequisites without execution deadlines. Saved status includes `originWindow` and `servedByWindow`. Only the same workspace and exact currently admitted source expose instruction text. Ended origins cancel unattempted work or expose possible input as uncertain. Status writes nothing and restarts no work. Terminal status remains visible for up to one hour after settlement. Capacity pressure evicts eligible terminal receipts sooner. Active receipts and possible writes remain protected.
 
 ## Dispatch results
 

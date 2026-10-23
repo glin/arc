@@ -143,7 +143,7 @@ Copy `observation` from the eligible reply. `accepted` confirms prompt receipt, 
 
 ### Compaction
 
-An agent can request its own compaction after the current turn:
+A hosted main agent can request its own compaction after the current turn:
 
 ```sh
 arc compact request --self --after-turn --request-id WINDOW_ID:UUID --window WINDOW_ID --json

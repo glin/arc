@@ -43,6 +43,8 @@ export interface ForwardParserCheckpoint<State> {
 }
 
 export interface ForwardSessionReducer<State> {
+  // A suspended classification must finish before this record advances the parser.
+  acceptsLine?(line: ParserLine): Generator<void, boolean>;
   retainedBytes?(): number;
   retainedPayloadScan?(): Generator<void, number>;
   pushLine(line: string | ParserLine): void;
@@ -72,6 +74,9 @@ export interface ForwardReadOptions {
 }
 
 export interface ForwardRecoveryControl {
+  actualReadBytes?: number;
+  // Finish this finite extent before considering later appends.
+  targetRevision?: FileRevision;
   through: number;
   readBytes: number;
   retainedCharge: number;
@@ -148,12 +153,13 @@ function* frameRecovery<State>(
       const charge = bytes.length * 8 + 256;
       yield* reserve(charge);
       control.retainedCharge += charge;
-      reducer.pushLine({
+      const line = {
         text: control.retain ? control.retain(text) : text,
         start: appliedThrough,
         end: baseOffset + end,
         ...(reduced ? { reduced: true } : {}),
-      });
+      };
+      if (!reducer.acceptsLine || (yield* reducer.acceptsLine(line))) reducer.pushLine(line);
     }
     control.fragments = [];
     control.fragmentBytes = 0;
@@ -279,7 +285,7 @@ function revisionFor(file: string): FileRevision | null {
   }
 }
 
-function readStableRange(file: string, start: number, length: number, revision: FileRevision): Buffer | null {
+export function readStableRange(file: string, start: number, length: number, revision: FileRevision): Buffer | null {
   let fd = -1;
   try {
     fd = fs.openSync(file, 'r');
@@ -394,9 +400,24 @@ function* scanForwardSession<State>(
   maxReadBytes = DEFAULT_FORWARD_BYTES,
   work: ForwardReadOptions = {},
 ): Generator<void, IncrementalSessionResult<State>> {
+  if (work.recovery) {
+    const originalRead = readRange;
+    readRange = (...args) => {
+      const bytes = originalRead(...args);
+      work.recovery!.actualReadBytes = (work.recovery!.actualReadBytes ?? 0) + (bytes?.length ?? 0);
+      return bytes;
+    };
+  }
   let revision = revisionFor(file);
   if (!revision) {
     return { kind: 'missing', read: null, checkpoint: null, readBytes: 0 };
+  }
+  const target = work.recovery?.targetRevision?.size ?? Number.POSITIVE_INFINITY;
+  if (
+    work.recovery?.targetRevision &&
+    (!sameIdentity(work.recovery.targetRevision, revision) || revision.size < target)
+  ) {
+    return { kind: 'stale', read: null, checkpoint: null, readBytes: 0 };
   }
   const compatible =
     checkpoint &&
@@ -511,11 +532,15 @@ function* scanForwardSession<State>(
         revision = current;
       }
     }
-    if (offset >= revision.size) break;
+    if (offset >= Math.min(revision.size, target)) break;
     if (work.signal?.aborted) {
       return { kind: 'cancelled', read: null, checkpoint: null, readBytes };
     }
-    const length = Math.min(work.recovery ? (work.chunkBytes ?? chunkBytes) : chunkBytes, revision.size - offset);
+    const length = Math.min(
+      work.recovery ? (work.chunkBytes ?? chunkBytes) : chunkBytes,
+      revision.size - offset,
+      target - offset,
+    );
     const body = readRange(file, offset, length, revision);
     if (!body) {
       return { kind: 'stale', read: null, checkpoint: null, readBytes };
@@ -554,8 +579,9 @@ function* scanForwardSession<State>(
   }
   if (work.recovery?.fragmentBytes) {
     const control = work.recovery;
-    yield* frameRecovery(reducer, Buffer.from('\n'), revision.size, control);
-    framed.appliedThrough = revision.size;
+    const end = Math.min(revision.size, target);
+    yield* frameRecovery(reducer, Buffer.from('\n'), end, control);
+    framed.appliedThrough = end;
   }
   if (kind === 'appended') {
     coveredFrom = Math.max(coveredFrom, revision.size - Math.max(0, Math.floor(maxReadBytes)));
@@ -586,7 +612,7 @@ function* scanForwardSession<State>(
     sessionId,
     parserKey,
     fileIdentity: { dev: revision.dev, ino: revision.ino },
-    revision,
+    revision: work.recovery?.targetRevision ?? revision,
     coveredFrom,
     skippedFragment,
     reducedFrom:
@@ -601,7 +627,7 @@ function* scanForwardSession<State>(
   };
   return {
     kind,
-    read: materialize(reducer, next, revision.size - coveredFrom),
+    read: materialize(reducer, next, Math.min(revision.size, target) - coveredFrom),
     checkpoint: next,
     readBytes,
     appendFrom: kind === 'appended' && checkpoint ? checkpoint.revision : null,

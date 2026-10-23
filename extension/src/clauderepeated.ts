@@ -555,6 +555,38 @@ export function createClaudeRepeatedFilter(): (line: string) => boolean {
   };
 }
 
+// A forward reader trades prefix reads for fixed identity storage. A pending lookup keeps
+// its line until every earlier byte has been classified or a matching identity is found.
+export class ClaudeRepeatedPrefix {
+  private newest = 0;
+
+  constructor(private readonly read: (start: number, length: number) => Buffer | null) {}
+
+  *repeated(line: string, start: number): Generator<void, boolean> {
+    const wanted = claudeRecordIdentity(line);
+    if (!wanted) return false;
+    if (wanted.timestamp > this.newest) {
+      this.newest = wanted.timestamp;
+      return false;
+    }
+    const identity = new LineIdentity(false);
+    for (let offset = 0; offset < start;) {
+      const bytes = this.read(offset, Math.min(64 * 1024, start - offset));
+      if (!bytes?.length) throw new Error('Repeated-record source changed');
+      yield;
+      let from = 0;
+      for (let newline = bytes.indexOf(0x0a); newline >= 0; newline = bytes.indexOf(0x0a, from)) {
+        const prior = identity.finish(bytes.subarray(from, newline));
+        if (prior?.uuid === wanted.uuid && prior.timestamp === wanted.timestamp) return true;
+        from = newline + 1;
+      }
+      identity.add(bytes.subarray(from));
+      offset += bytes.length;
+    }
+    return false;
+  }
+}
+
 export function emptyClaudeRepeatedState(): ClaudeRepeatedState {
   return { through: 0, newest: 0, checkpoints: [], runs: [], origin: 0, searched: 0 };
 }

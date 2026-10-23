@@ -40,7 +40,7 @@ Autonomous follow-ups require a session this session started with `arc start --a
 
 ## Execute requested follow-ups
 
-An explicit request to run follow-ups authorizes the named steps and their session selection. A request for thoughts, a plan, or consultation grants no execution authority. Preserve phase-only restrictions and every implementation, review, request, token, and dollar limit. Compaction and session transfer renew none of them. A request to run follow-ups delegates compaction for this turn, under the rules in [compaction.md](compaction.md).
+An explicit request to run follow-ups authorizes the named steps and their session selection. A request for thoughts, a plan, or consultation grants no execution authority. Preserve phase-only restrictions and every implementation, review, request, token, and dollar limit. Compaction and session transfer renew none of them. Read [compaction.md](compaction.md) for same-session context maintenance.
 
 Continue in this session while its context serves the work. Native compaction during ongoing work does not end the task. Read [successor.md](successor.md) before transferring work to a fresh session.
 

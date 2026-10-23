@@ -66,7 +66,6 @@ test('measurement windows refuse agent processes before launch', { tags: ['subpr
 });
 import { ClaudeWire, type PermissionMode } from './claudewire.ts';
 import {
-  COMPACT_LIMITS,
   CompactHost,
   promptAsReader,
   routeCompactionEvent,
@@ -1279,6 +1278,7 @@ function fakeHost(
     timer?: AgentHostTimer;
     exitGraceMs?: number;
     onEvent?: (event: SessionEvent) => void;
+    onNativeObservation?: import('./agenthost').HostOptions['onNativeObservation'];
     onStateChange?: (state: SessionState) => void;
   } = {},
 ): {
@@ -1299,6 +1299,7 @@ function fakeHost(
     now,
     recovery: lifecycle.recovery,
     onRecoveryFailure: lifecycle.onRecoveryFailure,
+    onNativeObservation: lifecycle.onNativeObservation,
     idleDurationMs: lifecycle.idleDurationMs ?? 60_000,
     timer: lifecycle.timer,
     exitGraceMs: lifecycle.exitGraceMs,
@@ -3100,6 +3101,94 @@ test.each(['none', 'later', 'expired', 'idle', 'failed'] as const)(
   },
 );
 
+test.each(['live', 'settled', 'reader-acted'] as const)(
+  'Codex rejected prompt drains an early native command with %s evidence in arrival order',
+  async (mode) => {
+    const h = compactionThroughHost();
+    let emit!: (event: WireEvent) => void;
+    let reject!: (error: Error) => void;
+    let accept!: (turn: string) => void;
+    const plan: AgentPlan = {
+      agent: 'codex',
+      sessionId: 'session',
+      command: 'c',
+      args: [],
+      cwd: WS,
+      env: {},
+      driver: (_send, report) => {
+        emit = report;
+        return {
+          receive() {},
+          open: async () => [],
+          prompt: () =>
+            new Promise<string>((resolve, refuse) => {
+              accept = resolve;
+              reject = refuse;
+            }),
+          compact: async () => {},
+          clear: async () => {},
+          answer: () => false,
+          interrupt: async () => {},
+          sessionId: () => 'session',
+          close() {},
+          hasOpenTurns: () => false,
+        };
+      },
+    };
+    const session = await h.host.session('deferred-native', plan);
+    h.setCurrent(session);
+    onTestFinished(() => {
+      h.compaction.dispose();
+      h.children[0].exit(0);
+    });
+    const pending = session.prompt('Competing input.');
+    const refused = assert.rejects(pending, /competing start refused/);
+    const native = {
+      provider: 'codex' as const,
+      sessionId: 'session',
+      turnId: 'native-command',
+      generation: null,
+      evidence: {},
+    };
+    emit({
+      kind: 'native',
+      event: {
+        ...native,
+        kind: 'toolStart',
+        toolId: 'request-call',
+        initiating: true,
+        command: `arc compact request --self --after-turn --request-id ${h.window}:${h.ids[0]} --window ${h.window} --json`,
+      },
+    });
+    const end = () => {
+      emit({ kind: 'native', event: { ...native, kind: 'toolEnd', toolId: 'request-call', success: true } });
+      emit({ kind: 'text', nativeTurnId: native.turnId, sourceId: 'native-final', text: 'Saved.' });
+      emit({ kind: 'native', event: { ...native, kind: 'rootEnd', success: true } });
+    };
+    if (mode === 'settled') end();
+    if (mode === 'reader-acted') h.compaction.readerAction('session');
+    reject(new Error('competing start refused'));
+    await refused;
+    assert.equal(h.owners.length, 1, 'rejection resolves the native owner without another prompt');
+    const request = h.payload(h.ids[0]);
+    const admitted = h.compaction.handle({ method: 'compact-request', params: request }) as { state: string };
+    assert.equal(admitted.state, mode === 'live' ? 'queued' : 'refused');
+    if (mode === 'live') end();
+    h.replies.settle(
+      'session',
+      [{ promptId: native.turnId, finalResponse: { sourceId: 'native-final', text: 'Saved.' } }],
+      'codex',
+    );
+    assert.equal(h.compaction.requests.deliverable('session').length, mode === 'live' ? 1 : 0);
+    h.compaction.readerAction('session');
+    const next = session.prompt('New directing input.');
+    accept('reader-next');
+    await next;
+    assert.equal(h.owners.length, 1, 'a later accepted start never replays a settled command');
+    assert.equal(h.compaction.requests.deliverable('session').length, 0);
+  },
+);
+
 test('Codex native turn identity binds early and obsolete response events to accepted submissions', async () => {
   let emit!: (event: WireEvent) => void;
   let accept!: (id: string) => void;
@@ -3157,7 +3246,7 @@ test('Codex native turn identity binds early and obsolete response events to acc
       kind: 'toolStart',
       toolId: 'call',
       command: 'arc',
-      foreground: true,
+      initiating: true,
     },
   });
   accept('native-first');
@@ -3166,8 +3255,30 @@ test('Codex native turn identity binds early and obsolete response events to acc
   assert.equal(reported.at(-1)?.turnId, first);
   assert.equal(reported.find(({ event }) => event.kind === 'native')?.turnId, first);
   const next = session.prompt('second');
+  emit({
+    kind: 'native',
+    event: {
+      provider: 'codex',
+      sessionId: 'session',
+      turnId: 'early-notice',
+      generation: null,
+      evidence: {},
+      kind: 'toolStart',
+      toolId: 'notice-call',
+      command: 'arc',
+      initiating: true,
+    },
+  });
   accept('native-second');
   const second = await next;
+  const notice = reported.find(({ event }) => event.kind === 'native' && event.event.turnId === 'early-notice');
+  assert.equal(typeof notice?.turnId, 'number');
+  assert.notEqual(notice!.turnId, second);
+  assert.equal(
+    session.startedByAgent(notice!.turnId!),
+    true,
+    'an early unrelated native turn retains its own response owner',
+  );
   emit({ kind: 'delta', text: 'Second', nativeTurnId: 'native-second' });
   emit({
     kind: 'turnEnd',
@@ -3237,7 +3348,7 @@ test('Claude native events follow the shared owner after prompt preparation ends
       kind: 'toolStart',
       toolId: 'call',
       command: 'arc',
-      foreground: true,
+      initiating: true,
     },
   };
   const receiptOwners: (number | undefined)[] = [];
@@ -9566,8 +9677,14 @@ function compactionThroughHost(
   const events: { kind: string; turnId: number | undefined }[] = [];
   const replies = new RecordedReplies();
   const holder = options.holder ?? {
-    noteRecordedReply: (session: string, sourceId: string, text: string, saved: () => void, wanted: () => boolean) =>
-      replies.note(session, { sourceId, text, saved, wanted }),
+    noteRecordedReply: (
+      session: string,
+      sourceId: string,
+      text: string,
+      saved: () => void,
+      wanted: () => boolean,
+      identity?: { provider: 'claude' | 'codex'; nativeTurnId?: string; ownerTurnId?: number },
+    ) => replies.note(session, { sourceId, text, saved, wanted, ...identity }),
     noteCompletedReply: () => {},
     settleRecordedReplies: () => {},
   };
@@ -9584,6 +9701,10 @@ function compactionThroughHost(
     options.now,
   );
   const { host, children } = fakeHost(undefined, options.now, {
+    onNativeObservation: (key, event) => {
+      const child = host.get(key);
+      if (child) compaction.observeNative(child, event);
+    },
     onEvent: ({ key, event, turnId }) => {
       const child = host.get(key) as unknown as (CompactChild & { startedByAgent?: (id: number) => boolean }) | null;
       if (!child) return;
@@ -10010,7 +10131,7 @@ test.each([
   ['received first', true, 'retained'],
   ['local result first', true, 'retained'],
   ['valid unbound', false, 'retained'],
-] as const)('background adoption after %s replay, known session %s, launch %s', async (ordering, known, launch) => {
+] as const)('native compaction after %s replay, known session %s, launch %s', async (ordering, known, launch) => {
   const h = await joinedCompaction({}, known);
   const child = h.children[0];
   // A launch can be observed before a reader submission or a settled session identity.
@@ -10057,7 +10178,6 @@ test.each([
   await Promise.all([overlapping, pending]);
   child.say(COMPLETED_RESULT);
   child.say(sessionState('idle'));
-  const accepted = ordering !== 'negative';
   const wake = (tool: string, run: string) =>
     child.say(
       JSON.stringify({
@@ -10072,11 +10192,11 @@ test.each([
   if (launch === 'retained') {
     wake('retained-launch', 'retained-run');
     h.tool('retained-request', h.literal(h.ids[0]));
-    assert.deepEqual(h.admission(h.ids[0]), accepted ? [undefined, 'queued'] : ['no-reader-instruction', 'refused']);
+    assert.deepEqual(h.admission(h.ids[0]), [undefined, 'queued']);
     child.say(COMPLETED_RESULT);
     child.say(sessionState('idle'));
   }
-  // A later unowned launch also exercises the latest acknowledged reader submission.
+  // A later launch needs no retained reader submission.
   const preparing = h.session.prompt('Continue without a new reader instruction.');
   child.say(
     JSON.stringify({
@@ -10093,10 +10213,7 @@ test.each([
   child.say(sessionState('idle'));
   wake('later-launch', 'later-run');
   h.tool('later-request', h.literal(h.ids[1]));
-  assert.deepEqual(
-    h.admission(h.ids[1]),
-    accepted ? ['already-used', 'refused'] : ['no-reader-instruction', 'refused'],
-  );
+  assert.deepEqual(h.admission(h.ids[1]), [undefined, 'queued']);
 });
 
 test('a correlated zero-turn result completes its owning ordinary input', async () => {
@@ -10212,7 +10329,7 @@ test.each([
   assert.equal(h.session.state().busy, true, 'pending local input cannot end the background-woken model work');
   h.tool('continued-woken-work', h.literal(h.ids[0]), backgroundInput);
   assert.equal(h.owners.at(-1), owner, 'pending slash inputs cannot replace the active model owner');
-  assert.deepEqual(h.admission(h.ids[0]), ['reader-acted', 'refused']);
+  assert.deepEqual(h.admission(h.ids[0]), [undefined, 'queued']);
   child.say(
     JSON.stringify({
       type: 'assistant',
@@ -10294,7 +10411,7 @@ test.each([true, false])('joined reader compaction in the shared running turn, a
   await h.send('then compact yourself');
   if (read) h.replay();
   h.tool('compact', h.literal(h.ids[0]));
-  assert.deepEqual(h.admission(h.ids[0]), read ? [undefined, 'queued'] : ['reader-acted', 'refused']);
+  assert.deepEqual(h.admission(h.ids[0]), [undefined, 'queued']);
   assert.equal(h.owners.at(-1), first, 'the running work keeps its shared owner');
   h.children[0].say(
     JSON.stringify({
@@ -10349,7 +10466,7 @@ test.each([
   h.tool('compact', h.literal(h.ids[1]));
   const owner = h.owners.at(-1)!;
   if (idle === 'after wake') h.children[0].say(sessionState('idle'));
-  assert.deepEqual(h.admission(h.ids[1]), read ? [undefined, 'queued'] : ['reader-acted', 'refused']);
+  assert.deepEqual(h.admission(h.ids[1]), [undefined, 'queued']);
   if (!read) return;
   assert.equal(h.session.startedByAgent(owner), true);
   assert.equal(
@@ -10418,7 +10535,7 @@ test.each([
 });
 
 test.each(['Stop', 'queue', 'setting', 'unread send', 'answer'] as const)(
-  'joined reader compaction retains the reader-action guard after %s',
+  'joined reader compaction accepts a command observed after %s',
   async (action) => {
     const h = await joinedCompaction();
     await h.send('Finish the work.');
@@ -10428,20 +10545,24 @@ test.each(['Stop', 'queue', 'setting', 'unread send', 'answer'] as const)(
     h.compaction.readerAction('sess-1', action === 'answer');
     if (action === 'unread send') await h.send('New work.');
     h.tool('compact', h.literal(h.ids[0]));
-    assert.deepEqual(h.admission(h.ids[0]), action === 'answer' ? [undefined, 'queued'] : ['reader-acted', 'refused']);
+    assert.deepEqual(h.admission(h.ids[0]), [undefined, 'queued']);
   },
 );
 
-test('joined reader compaction keeps observed command bindings frozen across a receipt', async () => {
+test('joined reader compaction keeps one pending request across a receipt', async () => {
   const h = await joinedCompaction();
   await h.send('Finish the work.');
   h.replay();
   await h.send('then compact yourself');
   h.tool('before-read', h.literal(h.ids[0]));
   h.replay();
-  assert.deepEqual(h.admission(h.ids[0]), ['reader-acted', 'refused']);
+  assert.deepEqual(h.admission(h.ids[0]), [undefined, 'queued']);
   h.tool('after-read', h.literal(h.ids[1]));
-  assert.deepEqual(h.admission(h.ids[1]), [undefined, 'queued']);
+  assert.deepEqual(
+    h.admission(h.ids[1]),
+    [undefined, 'refused'],
+    'one exact turn still permits only one pending operation',
+  );
 });
 
 test('a stale joined reader receipt cannot rebind a newer reader turn or an agent-started turn', async () => {
@@ -10698,7 +10819,7 @@ async function readerCompactionAfterScopeRecovery(queuedReaderInput: boolean) {
   }
   assert.equal(holder.readerWork('sess-1'), 'none');
   await vi.waitFor(() => assert.equal(sentTexts(through.children[0]).filter((text) => text === '/compact').length, 1));
-  now += COMPACT_LIMITS.admissionMs + 1;
+  now += 91 * 60_000;
   const status = through.compaction.handle({
     method: 'compact-status',
     params: { requestId: request.requestId },
@@ -10789,7 +10910,7 @@ test('Stop during a turn Claude started by itself leaves the next reader prompt 
   assert.ok(next !== undefined && later.every((one) => one.turnId === next), JSON.stringify(later));
 });
 
-test('a turn Claude starts after a background notice admits the reader-requested compaction once', async () => {
+test('provider notification turns admit later compaction requests under the same reader task', async () => {
   const { window, ids, payload, owners, replies, compaction, host, children, setCurrent } = compactionThroughHost();
   const opening = host.session('one', claudePlan(CLAUDE, { cwd: WS, sessionId: 'sess-1' }));
   children[0].answerHandshake();
@@ -10817,9 +10938,7 @@ test('a turn Claude starts after a background notice admits the reader-requested
   for (const line of lines.slice(firstEnd + 1, secondRequest)) children[0].say(line + '\n');
   children[0].say(lines[secondRequest] + '\n');
   assert.deepEqual(compaction.handle({ method: 'compact-ready', params: payload(ids[1]) }), {
-    ready: false,
-    code: 'already-used',
-    reason: "The reader's instruction already requested compaction once. No compaction was queued.",
+    ready: true,
   });
   for (const line of lines.slice(secondRequest + 1)) children[0].say(line + '\n');
   assert.equal(new Set(owners).size, 3, 'each turn Claude started by itself has its own owner');
@@ -10895,46 +11014,38 @@ test.each(['read', 'refused'] as const)('a turn that background work wakes after
   for (const line of lines.slice(launched + 1, request + 1)) children[0].say(line + '\n');
   assert.equal(
     (compaction.handle({ method: 'compact-ready', params: payload(ids[0]) }) as { code?: string }).code,
-    send === 'read' ? undefined : 'reader-acted',
+    undefined,
   );
 });
 
-// Catches a reader prompt that Arc wrote but Claude has not read taking over background work. The
-// launching turn's `result` and `idle` reach Arc after the write and close the reader prompt's turn,
-// so a turn that a notice wakes before Claude reads the prompt has no reader turn to follow. The
-// guarded send, as question recovery makes it, catches a receipt that ends with its guarded attempt,
-// which that same `result` settles before the replay arrives.
+// Native command admission does not depend on acknowledgment of a pending prompt.
 test.each([
   ['before', 'an ordinary'],
   ['after', 'an ordinary'],
   ['after', 'a guarded'],
-] as const)(
-  'a reader prompt takes over background work only once Claude replays it, with the woken turn %s the replay of %s send',
-  async (when, send) => {
-    const { session, lines, launched, request, compaction, children, payload, ids, replay, idle } =
-      await beforeBackgroundResult();
-    compaction.readerAction('sess-1');
-    const guard = send === 'a guarded' ? new GuardedAttempt('6f1c2a1e-0000-4000-8000-000000000003') : undefined;
-    await promptAsReader(compaction, session, (submitted, received) =>
-      session.prompt('After this is done, self compact.', submitted, guard, received),
-    );
-    children[0].say(lines[launched] + '\n');
+] as const)('a woken turn admits compaction %s the replay of %s send', async (when, send) => {
+  const { session, lines, launched, request, compaction, children, payload, ids, replay, idle } =
+    await beforeBackgroundResult();
+  compaction.readerAction('sess-1');
+  const guard = send === 'a guarded' ? new GuardedAttempt('6f1c2a1e-0000-4000-8000-000000000003') : undefined;
+  await promptAsReader(compaction, session, (submitted, received) =>
+    session.prompt('After this is done, self compact.', submitted, guard, received),
+  );
+  children[0].say(lines[launched] + '\n');
+  idle();
+  if (when === 'after') {
+    replay();
+    children[0].say(COMPLETED_RESULT);
     idle();
-    if (when === 'after') {
-      replay();
-      children[0].say(COMPLETED_RESULT);
-      idle();
-    }
-    for (const line of lines.slice(launched + 1, request + 1)) children[0].say(line + '\n');
-    const ready = compaction.handle({ method: 'compact-ready', params: payload(ids[0]) }) as { code?: string };
-    const ack = compaction.handle({ method: 'compact-request', params: payload(ids[0]) }) as { state: string };
-    assert.deepEqual([ready.code, ack.state], when === 'after' ? [undefined, 'queued'] : ['reader-acted', 'refused']);
-  },
-);
+  }
+  for (const line of lines.slice(launched + 1, request + 1)) children[0].say(line + '\n');
+  const ready = compaction.handle({ method: 'compact-ready', params: payload(ids[0]) }) as { code?: string };
+  const ack = compaction.handle({ method: 'compact-request', params: payload(ids[0]) }) as { state: string };
+  assert.deepEqual([ready.code, ack.state], [undefined, 'queued']);
+});
 
-// Catches a notice that Claude absorbs into a woken turn before its first tool call staying
-// waiting after that turn, so a later turn with no notice spends the reader's one compaction.
-test('a notice absorbed before the woken turn has an owner binds no later turn', async () => {
+// Later native turns retain their own command intent after earlier notices settle.
+test('a provider turn needs no preceding task notice to request compaction', async () => {
   const { window, ids, payload, compaction, host, children, setCurrent } = compactionThroughHost();
   const opening = host.session('one', claudePlan(CLAUDE, { cwd: WS, sessionId: 'sess-1' }));
   children[0].answerHandshake();
@@ -10966,6 +11077,465 @@ test('a notice absorbed before the woken turn has an owner binds no later turn',
     children[0].say(JSON.stringify(line) + '\n');
   assert.equal(
     (compaction.handle({ method: 'compact-ready', params: payload(ids[0]) }) as { code?: string }).code,
-    'no-reader-instruction',
+    undefined,
   );
+});
+
+test('Codex provider-originated compaction retains its exact recorded native response without a reader submission', async () => {
+  vi.stubGlobal('PANEL_CSS', '');
+  vi.stubGlobal('PANEL_JS', '');
+  vi.stubGlobal('PANEL_DEV_SERVER_URL', null);
+  const { PanelProvider } = await import('./panelhost.ts');
+  const root = tempDir('compact-codex-native-');
+  const file = path.join(root, 'rollout.jsonl');
+  const sessionId = 'native-codex';
+  const nativeTurnId = 'notice-turn';
+  fs.writeFileSync(file, '');
+  const holder: any = Object.assign(Object.create(PanelProvider.prototype), {
+    disposed: false,
+    showing: 'other',
+    hostSessions: new Map(),
+    newestBySession: new Map(),
+    catalog: { folders: '', sessions: [{ agent: 'codex', sessionId, file }] },
+    recordedReplies: new RecordedReplies(),
+    noteResponseEnded: () => {},
+  });
+  const h = compactionThroughHost({ holder });
+  const opening = h.host.session('codex-native', codexPlan(CODEX, { cwd: root, clientInfo: CODEX_CLIENT }));
+  const child = h.children[0];
+  await answerCodexHandshake(child);
+  child.reply({ thread: { id: sessionId } });
+  const session = await opening;
+  h.setCurrent(session);
+  onTestFinished(() => {
+    holder.disposed = true;
+    if (holder.recordedReplyRetry) clearTimeout(holder.recordedReplyRetry);
+    h.compaction.dispose();
+    child.exit(0);
+  });
+  const send = (method: string, params: object) => child.say(JSON.stringify({ method, params }) + '\n');
+  send('turn/started', { threadId: sessionId, turn: { id: nativeTurnId } });
+  const item = {
+    type: 'commandExecution',
+    id: 'request-call',
+    command: `arc compact request --self --after-turn --request-id ${h.window}:${h.ids[0]} --window ${h.window} --json`,
+    status: 'inProgress',
+    source: 'unifiedExecStartup',
+    processId: '425',
+  };
+  send('item/started', { threadId: sessionId, turnId: nativeTurnId, item });
+  assert.equal(typeof h.owners.at(-1), 'number');
+  assert.equal(session.startedByAgent(h.owners.at(-1)!), true);
+  const request = h.payload(h.ids[0]);
+  assert.equal(
+    (h.compaction.handle({ method: 'compact-request', params: request }) as { state: string }).state,
+    'queued',
+  );
+  send('item/completed', {
+    threadId: sessionId,
+    turnId: nativeTurnId,
+    item: { ...item, status: 'completed', exitCode: 0 },
+  });
+  send('item/completed', {
+    threadId: sessionId,
+    turnId: nativeTurnId,
+    item: { type: 'agentMessage', id: 'native-final', phase: 'final_answer', text: 'Saved the handoff.' },
+  });
+  send('turn/completed', { threadId: sessionId, turn: { id: nativeTurnId, status: 'completed' } });
+  assert.equal(h.compaction.requests.deliverable(sessionId).length, 0);
+  const records = (turn: string) =>
+    [
+      { type: 'session_meta', payload: { id: sessionId, cwd: root, originator: 'codex_vscode', source: 'vscode' } },
+      { type: 'event_msg', payload: { type: 'task_started', turn_id: turn } },
+      {
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          id: 'native-final',
+          role: 'assistant',
+          phase: 'final_answer',
+          content: [{ type: 'output_text', text: 'Saved the handoff.' }],
+        },
+      },
+      {
+        type: 'event_msg',
+        payload: { type: 'task_complete', turn_id: turn, last_agent_message: 'Saved the handoff.' },
+      },
+    ].map((record, index) => ({ ...record, timestamp: new Date(Date.UTC(2026, 9, 22, 0, 0, index)).toISOString() }));
+  const record = (turn: string) =>
+    fs.writeFileSync(
+      file,
+      records(turn)
+        .map((entry) => JSON.stringify(entry))
+        .join('\n') + '\n',
+    );
+  record('foreign-turn');
+  holder.settleRecordedReplies();
+  assert.equal(
+    h.compaction.requests.deliverable(sessionId).length,
+    0,
+    'the same response ID in another native turn cannot retain this response',
+  );
+  record(nativeTurnId);
+  holder.settleRecordedReplies();
+  assert.equal(h.compaction.requests.deliverable(sessionId).length, 1);
+  const drain = h.compaction.drain(sessionId);
+  await vi.waitFor(() => assert.equal(child.sent().at(-1)?.method, 'thread/compact/start'));
+  child.reply({});
+  send('turn/started', { threadId: sessionId, turn: { id: 'native-compact' } });
+  send('item/started', {
+    threadId: sessionId,
+    turnId: 'native-compact',
+    item: { type: 'contextCompaction', id: 'compact-item' },
+  });
+  send('item/completed', {
+    threadId: sessionId,
+    turnId: 'native-compact',
+    item: { type: 'contextCompaction', id: 'compact-item' },
+  });
+  send('turn/completed', { threadId: sessionId, turn: { id: 'native-compact', status: 'completed' } });
+  await drain;
+  assert.equal(
+    (h.compaction.handle({ method: 'compact-status', params: { requestId: request.requestId } }) as { state: string })
+      .state,
+    'completed',
+  );
+});
+
+test('Claude provider-originated root background commands compact without a reader submission', async () => {
+  const h = compactionThroughHost();
+  const opening = h.host.session('claude-native', claudePlan(CLAUDE, { cwd: WS, sessionId: 'sess-1' }));
+  const child = h.children[0];
+  child.answerHandshake();
+  const session = await opening;
+  h.setCurrent(session);
+  onTestFinished(() => {
+    h.compaction.dispose();
+    child.exit(0);
+  });
+  child.say(sessionState('running'));
+  child.say(
+    JSON.stringify({
+      type: 'assistant',
+      parent_tool_use_id: null,
+      session_id: 'sess-1',
+      message: {
+        role: 'assistant',
+        content: [
+          {
+            type: 'tool_use',
+            id: 'native-request',
+            name: 'Bash',
+            caller: { type: 'direct' },
+            input: {
+              command: `arc compact request --self --after-turn --request-id ${h.window}:${h.ids[0]} --window ${h.window} --json`,
+              run_in_background: true,
+            },
+          },
+        ],
+      },
+    }) + '\n',
+  );
+  const request = h.payload(h.ids[0]);
+  assert.equal(typeof h.owners.at(-1), 'number');
+  assert.equal(
+    (h.compaction.handle({ method: 'compact-request', params: request }) as { state: string }).state,
+    'queued',
+  );
+});
+
+test.each([
+  ['system', true, 'completed'],
+  ['user', true, 'completed'],
+  ['system', false, 'completed'],
+  ['user', false, 'completed'],
+  ['system', false, 'failed'],
+  ['user', false, 'failed'],
+] as const)(
+  'Claude %s background compaction with flag %s and terminal %s retains its original owner',
+  async (form, flagged, terminal) => {
+    const h = compactionThroughHost();
+    const opening = h.host.session('claude-background', claudePlan(CLAUDE, { cwd: WS, sessionId: 'sess-1' }));
+    const child = h.children[0];
+    child.answerHandshake();
+    const session = await opening;
+    h.setCurrent(session);
+    onTestFinished(() => {
+      h.compaction.dispose();
+      child.exit(0);
+    });
+    const send = (record: object) => child.say(JSON.stringify({ session_id: 'sess-1', ...record }) + '\n');
+    child.say(sessionState('running'));
+    send({
+      type: 'assistant',
+      parent_tool_use_id: null,
+      message: {
+        role: 'assistant',
+        content: [
+          {
+            type: 'tool_use',
+            id: 'background-request',
+            name: 'Bash',
+            caller: { type: 'direct' },
+            input: {
+              command: `arc compact request --self --after-turn --request-id ${h.window}:${h.ids[0]} --window ${h.window} --json`,
+              ...(flagged ? { run_in_background: true } : {}),
+            },
+          },
+        ],
+      },
+    });
+    const originalOwner = h.owners.at(-1)!;
+    send({
+      type: 'user',
+      parent_tool_use_id: null,
+      message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'background-request', is_error: false }] },
+      tool_use_result: { backgroundTaskId: 'exact-job', interrupted: false },
+    });
+    assert.equal(
+      h.events.filter((event) => event.kind === 'toolEnd').length,
+      0,
+      'launch acknowledgment cannot settle the command',
+    );
+    send({
+      type: 'assistant',
+      parent_tool_use_id: null,
+      message: {
+        id: 'background-final',
+        role: 'assistant',
+        stop_reason: 'end_turn',
+        content: [{ type: 'text', text: 'Saved the handoff.' }],
+      },
+    });
+    send({
+      type: 'result',
+      uuid: 'background-root-end',
+      result_index: 0,
+      num_turns: 1,
+      subtype: 'success',
+      is_error: false,
+      terminal_reason: 'completed',
+    });
+    child.say(sessionState('idle'));
+    h.replies.settle('sess-1', [{ finalResponse: { sourceId: 'background-final', text: 'Saved the handoff.' } }]);
+    const request = h.payload(h.ids[0]);
+    assert.equal(
+      (h.compaction.handle({ method: 'compact-request', params: request }) as { state: string }).state,
+      'queued',
+    );
+    await h.compaction.drain('sess-1');
+    assert.equal(sentTexts(child).includes('/compact'), false);
+    const notice = (task: string, extra: object = {}, suffix = '') =>
+      send(
+        form === 'user'
+          ? {
+              type: 'user',
+              parent_tool_use_id: null,
+              origin: { kind: 'task-notification' },
+              message: {
+                content: `<task-notification><tool-use-id>background-request</tool-use-id><task-id>${task}</task-id><status>completed</status>${suffix}</task-notification>`,
+              },
+              ...extra,
+            }
+          : {
+              type: 'system',
+              subtype: 'task_notification',
+              tool_use_id: 'background-request',
+              task_id: task,
+              status: 'completed',
+              ...extra,
+            },
+      );
+    notice('unrelated-job');
+    await h.compaction.drain('sess-1');
+    assert.equal(sentTexts(child).includes('/compact'), false, 'an unrelated completion supplies no tool success');
+    notice('exact-job', { parent_tool_use_id: 'subagent' });
+    await h.compaction.drain('sess-1');
+    assert.equal(sentTexts(child).includes('/compact'), false, 'subagent envelopes cannot settle the root command');
+    notice('exact-job', { session_id: 'foreign-session' });
+    await h.compaction.drain('sess-1');
+    assert.equal(sentTexts(child).includes('/compact'), false, 'foreign sessions cannot settle the root command');
+    if (form === 'user') {
+      for (const field of ['status', 'tool-use-id', 'task-id']) {
+        for (const suffix of [`<${field}/>`, `<${field}>duplicate</${field}>`, `<${field} invalid="yes"></${field}>`]) {
+          notice('exact-job', {}, suffix);
+          await h.compaction.drain('sess-1');
+          assert.equal(sentTexts(child).includes('/compact'), false, 'malformed tags cannot settle the root command');
+        }
+      }
+      notice('exact-job', { parent_tool_use_id: undefined });
+      notice('exact-job', { origin: { kind: 'peer' } });
+      await h.compaction.drain('sess-1');
+      assert.equal(
+        sentTexts(child).includes('/compact'),
+        false,
+        'user notices require an exact root notification envelope',
+      );
+    }
+    await session.prompt('A later owner turn.');
+    send({
+      type: 'result',
+      uuid: 'later-end',
+      result_index: 1,
+      num_turns: 1,
+      subtype: 'success',
+      is_error: false,
+      terminal_reason: 'completed',
+    });
+    child.say(sessionState('idle'));
+    notice(
+      'exact-job',
+      form === 'system'
+        ? { status: terminal }
+        : {
+            message: {
+              content: `<task-notification><tool-use-id>background-request</tool-use-id><task-id>exact-job</task-id><status>${terminal}</status></task-notification>`,
+            },
+          },
+    );
+    assert.equal(h.events.filter((event) => event.kind === 'toolEnd').at(-1)?.turnId, originalOwner);
+    await h.compaction.drain('sess-1');
+    assert.equal(sentTexts(child).at(-1) === '/compact', terminal === 'completed');
+    if (terminal === 'failed')
+      assert.equal(
+        (
+          h.compaction.handle({ method: 'compact-status', params: { requestId: request.requestId } }) as {
+            state: string;
+          }
+        ).state,
+        'failed',
+      );
+  },
+);
+
+// Crosses active retention limits through the host route and bounded recorded-response reads.
+test('recorded compaction responses survive 33 sessions and five native turns with fair bounded recovery', async () => {
+  const h = compactionThroughHost();
+  const root = tempDir('compact-recorded-capacity-');
+  const sessions: Array<{ session: AgentSession; emit: (event: WireEvent) => void; file: string; sessionId: string }> =
+    [];
+  let deliveries = 0;
+  onTestFinished(() => {
+    h.compaction.dispose();
+    for (const child of h.children) child.exit(0);
+  });
+  for (let index = 0; index < 33; index++) {
+    const sessionId = `capacity-${index}`;
+    let emit!: (event: WireEvent) => void;
+    const plan: AgentPlan = {
+      agent: 'codex',
+      sessionId,
+      command: 'c',
+      args: [],
+      cwd: root,
+      env: {},
+      driver: (_send, report) => {
+        emit = report;
+        return {
+          receive() {},
+          open: async () => [],
+          prompt: async () => 'reader',
+          compact: async (beforeWrite) => {
+            beforeWrite?.();
+            deliveries++;
+          },
+          clear: async () => {},
+          answer: () => false,
+          interrupt: async () => {},
+          sessionId: () => sessionId,
+          close() {},
+          hasOpenTurns: () => false,
+        };
+      },
+    };
+    const session = await h.host.session(sessionId, plan);
+    const file = path.join(root, `${sessionId}.jsonl`);
+    fs.writeFileSync(
+      file,
+      JSON.stringify({
+        type: 'session_meta',
+        payload: { id: sessionId, cwd: root, source: 'vscode', originator: 'codex_vscode' },
+      }) + '\n',
+    );
+    sessions.push({ session, emit, file, sessionId });
+  }
+  let operation = 0;
+  for (const [index, row] of sessions.entries()) {
+    h.setCurrent(row.session);
+    for (let turn = 0; turn < (index === 0 ? 5 : 1); turn++) {
+      const id = `00000000-0000-4000-8000-${String(++operation).padStart(12, '0')}`;
+      const nativeTurnId = `turn-${turn}`;
+      const sourceId = `response-${operation}`;
+      const base = {
+        provider: 'codex' as const,
+        sessionId: row.sessionId,
+        turnId: nativeTurnId,
+        generation: null,
+        evidence: {},
+      };
+      row.emit({
+        kind: 'native',
+        event: {
+          ...base,
+          kind: 'toolStart',
+          toolId: id,
+          initiating: true,
+          command: `arc compact request --self --after-turn --request-id ${h.window}:${id} --window ${h.window} --json`,
+        },
+      });
+      assert.equal(
+        (h.compaction.handle({ method: 'compact-request', params: h.payload(id) }) as { state: string }).state,
+        'queued',
+      );
+      row.emit({ kind: 'native', event: { ...base, kind: 'toolEnd', toolId: id, success: true } });
+      row.emit({ kind: 'text', text: 'Saved.', sourceId, nativeTurnId });
+      row.emit({ kind: 'native', event: { ...base, kind: 'rootEnd', success: true } });
+      row.emit({
+        kind: 'turnEnd',
+        nativeTurnId,
+        outcome: { status: 'ok', text: '', costUsd: null, turns: null, deniedTools: [] },
+      });
+      const records = [
+        { type: 'event_msg', payload: { type: 'task_started', turn_id: nativeTurnId } },
+        {
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            id: sourceId,
+            role: 'assistant',
+            phase: 'final_answer',
+            content: [{ type: 'output_text', text: 'Saved.' }],
+          },
+        },
+        { type: 'event_msg', payload: { type: 'task_complete', turn_id: nativeTurnId, last_agent_message: 'Saved.' } },
+      ];
+      fs.appendFileSync(
+        row.file,
+        records
+          .map((record, offset) =>
+            JSON.stringify({ ...record, timestamp: new Date(Date.UTC(2026, 9, 22, 0, turn, offset)).toISOString() }),
+          )
+          .join('\n') + '\n',
+      );
+      if (index === 0 && turn === 0)
+        fs.appendFileSync(row.file, (JSON.stringify({ type: 'unrelated', text: 'x'.repeat(4096) }) + '\n').repeat(270));
+    }
+  }
+  assert.equal(h.replies.sessions().length, 33);
+  const first = h.replies.pollingSessions();
+  const second = h.replies.pollingSessions();
+  assert.equal(first.length, 32);
+  assert.ok(new Set([...first, ...second]).size === 33, 'polling reaches every retained session');
+  for (let pass = 0; pass < 12 && h.replies.sessions().length; pass++) {
+    for (const sessionId of h.replies.pollingSessions()) {
+      const row = sessions.find((one) => one.sessionId === sessionId)!;
+      h.replies.read({ agent: 'codex', sessionId, file: row.file } as any);
+    }
+  }
+  assert.deepEqual(h.replies.sessions(), [], 'the first response remains recoverable beyond the bounded tail');
+  for (const row of sessions) {
+    h.setCurrent(row.session);
+    await h.compaction.drain(row.sessionId);
+  }
+  assert.equal(deliveries, 37, 'every admitted operation reaches its original child');
 });

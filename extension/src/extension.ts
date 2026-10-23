@@ -457,6 +457,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     onRecoveryFailure: recoveryFailure,
     spawner,
     idleDurationMs: readSetting('agentIdleMinutes') * 60_000,
+    onNativeObservation: (key, event) => {
+      const child = host.get(key);
+      if (child) compaction?.observeNative(child, event);
+    },
     onEvent: ({ key, event, turnId, dispatchTurnId }) => {
       panel.onDispatchEvent?.(key, event, dispatchTurnId ?? turnId);
       if (event.kind === 'responseRate') {

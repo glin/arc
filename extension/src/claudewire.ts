@@ -58,6 +58,7 @@ import {
 } from './agentwire';
 import { agentTakesAsset, validatePromptAssetBytes } from './promptassets';
 import { ClaudeResponseClock } from './outputrate';
+import { claudeTaskNotification } from './transcript';
 
 type ClaudePromptBlock = Record<string, unknown>;
 
@@ -545,6 +546,7 @@ export class ClaudeWire {
   private counter = 0;
   private promptGeneration = 0;
   private nativeGeneration = 0;
+  private readonly backgroundCommands = new Map<string, { generation: number; taskId?: string }>();
   private closed = false;
   private readonly contextRequests = new Set<string>();
   // The last session state the CLI reported. Every user-frame write clears it until the CLI reports again.
@@ -1125,11 +1127,20 @@ export class ClaudeWire {
           obj(tool.caller)?.type === 'direct' &&
           command &&
           toolId
-        )
+        ) {
+          this.backgroundCommands.set(`${sessionId}:${toolId}`, { generation: this.nativeGeneration });
           this.emit({
             kind: 'native',
-            event: { ...base, kind: 'toolStart', toolId, command, foreground: input?.run_in_background !== true },
+            event: {
+              ...base,
+              kind: 'toolStart',
+              toolId,
+              command,
+              initiating: true,
+              ...(input?.run_in_background === true ? { background: true } : {}),
+            },
           });
+        }
         if (
           tool?.type === 'tool_use' &&
           ['Bash', 'Agent', 'Task'].includes(String(tool.name)) &&
@@ -1148,16 +1159,31 @@ export class ClaudeWire {
             kind: 'native',
             event: { ...base, kind: 'launch', toolId, agentId: str(backgroundResult.agentId) },
           });
-        if (tool?.type === 'tool_result' && toolId)
+        if (tool?.type === 'tool_result' && toolId) {
+          const key = `${sessionId}:${toolId}`;
+          const background = this.backgroundCommands.get(key);
+          if (
+            (str(backgroundResult?.backgroundTaskId) ||
+              ['async_launched', 'launched'].includes(String(backgroundResult?.status))) &&
+            tool.is_error === false &&
+            backgroundResult?.interrupted === false
+          ) {
+            if (background && str(backgroundResult?.backgroundTaskId))
+              background.taskId = str(backgroundResult.backgroundTaskId)!;
+            continue;
+          }
+          this.backgroundCommands.delete(key);
           this.emit({
             kind: 'native',
             event: {
               ...base,
+              ...(background ? { generation: background.generation } : {}),
               kind: 'toolEnd',
               toolId,
               success: tool.is_error === false && obj(message.tool_use_result)?.interrupted === false,
             },
           });
+        }
       }
     }
     if (
@@ -1179,13 +1205,41 @@ export class ClaudeWire {
           },
         });
     }
-    // Claude Code reports the end of background work as a system notice that names the launching
-    // tool call. A notice that arrives while no turn runs precedes the turn Claude starts by itself.
-    if (message.type === 'system' && message.subtype === 'task_notification' && str(message.tool_use_id))
+    const userNotice =
+      message.type === 'user' && message.parent_tool_use_id === null ? claudeTaskNotification(message) : null;
+    const systemNotice =
+      message.type === 'system' &&
+      message.subtype === 'task_notification' &&
+      (message.parent_tool_use_id === undefined || message.parent_tool_use_id === null) &&
+      ['completed', 'failed', 'stopped'].includes(String(message.status))
+        ? { toolId: str(message.tool_use_id), taskId: str(message.task_id), status: message.status }
+        : null;
+    const notice = userNotice ?? systemNotice;
+    if (notice?.toolId && notice.taskId) {
+      const key = `${sessionId}:${notice.toolId}`;
+      const background = this.backgroundCommands.get(key);
+      if (background?.taskId === notice.taskId) {
+        this.backgroundCommands.delete(key);
+        this.emit({
+          kind: 'native',
+          event: {
+            ...base,
+            generation: background.generation,
+            kind: 'toolEnd',
+            background: true,
+            toolId: notice.toolId,
+            success: notice.status === 'completed',
+          },
+        });
+      }
+    }
+    // A system task notice precedes the turn Claude starts when no turn is running.
+    if (message.type === 'system' && message.subtype === 'task_notification' && str(message.tool_use_id)) {
       this.emit({
         kind: 'native',
         event: { ...base, kind: 'wake', toolId: str(message.tool_use_id)!, runId: str(message.run_id) },
       });
+    }
     if (message.type === 'system' && (message.subtype === 'status' || message.subtype === 'compact_boundary'))
       this.emit({
         kind: 'native',
@@ -1196,6 +1250,7 @@ export class ClaudeWire {
   // Rejects pending control requests and clears asks when the child exits.
   close(reason: string): void {
     this.responseClock.reset();
+    this.backgroundCommands.clear();
     this.contextRequests.clear();
     this.endReplayWait(reason);
     this.receipts.clear();

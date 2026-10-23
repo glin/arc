@@ -5,6 +5,8 @@ import {
   AgentReadSources,
   AGENT_SOURCE_LIMITS,
   sessionSourceAdmitted,
+  RecordedReplies,
+  RECORDED_REPLY_LIMITS,
 } from './sessionreads';
 import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
@@ -28,6 +30,7 @@ import {
   SESSION_READ_LIMITS,
 } from './sessionreads.ts';
 import { openReadWindow, closeReadWindow } from './readmeter.ts';
+import * as repeatedRecords from './clauderepeated.ts';
 import { projectAgentRead, currentAgentRead, type AgentReadRecord } from './domain/read.ts';
 
 import { PageOptions, pageFile, pageBytes, variedName, createSessionPages } from '../test/session-pages';
@@ -38,6 +41,325 @@ const { pageSecret, pageScope, listPage, traverse } = createSessionPages(() => p
 afterEach(async () => {
   vi.useRealTimers();
   vi.unstubAllEnvs();
+  vi.restoreAllMocks();
+});
+
+test('recorded Claude recovery keeps pending duplicate searches and rejects old repeated identities', () => {
+  const root = tempDir('recorded-prefix-recovery-');
+  const file = path.join(root, 'session.jsonl');
+  const at = (index: number) => new Date(Date.UTC(2026, 0, 1, 0, 0, index)).toISOString();
+  const assistant = (id: string, uuid: string) => ({
+    type: 'assistant',
+    uuid,
+    timestamp: at(1),
+    message: { role: 'assistant', id, stop_reason: 'end_turn', content: [{ type: 'text', text: 'Saved.' }] },
+  });
+  const records = [
+    { type: 'user', timestamp: at(0), message: { role: 'user', content: 'Finish.' } },
+    { type: 'progress', uuid: 'repeated', timestamp: at(1) },
+    { type: 'progress', uuid: 'huge', timestamp: at(2), text: 'x'.repeat(2 * 1024 * 1024) },
+    ...Array.from({ length: 3000 }, (_, index) => ({
+      type: 'progress',
+      uuid: `unique-${index}`,
+      timestamp: at(index + 3),
+    })),
+    assistant('duplicate-answer', 'repeated'),
+    assistant('unique-answer', 'older-unique'),
+  ];
+  fs.writeFileSync(
+    file,
+    records.map((record) => JSON.stringify(record)).join('\n') +
+      '\n' +
+      (JSON.stringify({ type: 'progress', text: 'x'.repeat(4096) }) + '\n').repeat(800),
+  );
+  const source = {
+    agent: 'claude',
+    sessionId: 'wanted',
+    file,
+    ...revisionOf(fs.statSync(file, { bigint: true })),
+  } as SessionFile;
+  let localChecks = 0;
+  const original = repeatedRecords.createClaudeRepeatedFilter;
+  vi.spyOn(repeatedRecords, 'createClaudeRepeatedFilter').mockImplementation(() => {
+    const filter = original();
+    return (line) => {
+      localChecks++;
+      return filter(line);
+    };
+  });
+  const replies = new RecordedReplies();
+  const saved: string[] = [];
+  for (const sourceId of ['duplicate-answer', 'unique-answer'])
+    replies.note('wanted', {
+      provider: 'claude',
+      sourceId,
+      text: 'Saved.',
+      wanted: () => !saved.includes(sourceId),
+      saved: () => {
+        saved.push(sourceId);
+      },
+    });
+  let lastBytes = 0;
+  let passes = 0;
+  let paused = false;
+  let previousThrough = -1;
+  for (; passes < 80 && !saved.length; passes++) {
+    const window = openReadWindow();
+    replies.poll([source]);
+    assert.ok(closeReadWindow(window).bytes <= RECORDED_REPLY_LIMITS.tailBytes + 128 * 1024);
+    const held = [...((replies as any).scans as Map<string, any>).values()][0];
+    if (!held) continue;
+    assert.ok(held.control.actualReadBytes >= lastBytes);
+    if (held.control.through === previousThrough && held.control.actualReadBytes > lastBytes) paused = true;
+    lastBytes = held.control.actualReadBytes;
+    previousThrough = held.control.through;
+  }
+  assert.deepEqual(saved, ['unique-answer']);
+  assert.ok(passes > 3 && paused, 'the same pending record waits while its prefix lookup advances');
+  assert.equal(localChecks, 0, 'recovery must not populate a hidden local identity collection');
+  assert.deepEqual(replies.sessions(), ['wanted'], 'the rejected duplicate callback remains wanted');
+  replies.clear();
+});
+
+test('recorded recovery covers replies registered after their turns passed without restarting active work', () => {
+  const root = tempDir('recorded-generation-');
+  const file = path.join(root, 'session.jsonl');
+  const records = Array.from({ length: 8 }, (_, index) => [
+    {
+      type: 'user',
+      promptId: `prompt-${index}`,
+      timestamp: new Date(Date.UTC(2026, 9, 1, 0, 0, index * 2)).toISOString(),
+      message: { role: 'user', content: `Finish ${index}.` },
+    },
+    {
+      type: 'assistant',
+      timestamp: new Date(Date.UTC(2026, 9, 1, 0, 0, index * 2 + 1)).toISOString(),
+      message: {
+        role: 'assistant',
+        id: `answer-${index}`,
+        stop_reason: 'end_turn',
+        content: [{ type: 'text', text: 'Saved.' }],
+      },
+    },
+  ]).flat();
+  const turns = records.map((record) => JSON.stringify(record)).join('\n') + '\n';
+  fs.writeFileSync(file, turns + (JSON.stringify({ type: 'progress', text: 'x'.repeat(4096) }) + '\n').repeat(1400));
+  const source = {
+    agent: 'claude',
+    sessionId: 'wanted',
+    file,
+    ...revisionOf(fs.statSync(file, { bigint: true })),
+  } as SessionFile;
+  const replies = new RecordedReplies();
+  const saved: string[] = [];
+  const note = (sourceId: string, nativeTurnId: string) =>
+    replies.note('wanted', {
+      provider: 'claude',
+      sourceId,
+      nativeTurnId,
+      text: 'Saved.',
+      wanted: () => true,
+      saved: () => {
+        saved.push(nativeTurnId);
+      },
+    });
+  const poll = () => {
+    const window = openReadWindow();
+    replies.poll([source]);
+    const tally = closeReadWindow(window);
+    assert.ok(tally.bytes <= RECORDED_REPLY_LIMITS.tailBytes + 128 * 1024);
+    const scans = (replies as any).scans as Map<string, any>;
+    assert.ok(scans.size <= 1);
+    return [...scans.values()][0];
+  };
+  note('missing', 'unresolved');
+  const active = poll();
+  assert.ok(active.control.through > Buffer.byteLength(turns), 'all eight turns passed before registration');
+  note('answer-1', 'prompt-1');
+  note('answer-2', 'wrong-turn');
+  const through = active.control.through;
+  assert.equal(poll(), active, 'registration preserves the active finite job');
+  assert.ok(active.control.through > through);
+  note('answer-2', 'prompt-2');
+  assert.equal(poll(), active, 'another registration preserves forward progress');
+  for (let pass = 0; pass < 40 && saved.length < 2; pass++) poll();
+  assert.deepEqual(saved, ['prompt-1', 'prompt-2']);
+  for (let pass = 0; pass < 16; pass++) poll();
+  assert.deepEqual(saved, ['prompt-1', 'prompt-2'], 'unchanged evidence settles each exact callback once');
+  assert.deepEqual(replies.sessions(), ['wanted'], 'unresolved and wrong-turn callbacks remain wanted');
+  replies.clear();
+});
+
+test('recorded recovery stops at its finite extent and defers unchanged payload-limit failures', () => {
+  const root = tempDir('recorded-finite-extent-');
+  const file = path.join(root, 'session.jsonl');
+  const chunk = (JSON.stringify({ type: 'progress', text: 'x'.repeat(4096) }) + '\n').repeat(300);
+  fs.writeFileSync(file, chunk + chunk);
+  const source = {
+    agent: 'claude',
+    sessionId: 'wanted',
+    file,
+    ...revisionOf(fs.statSync(file, { bigint: true })),
+  } as SessionFile;
+  const replies = new RecordedReplies();
+  let saves = 0;
+  replies.note('wanted', {
+    sourceId: 'missing',
+    text: 'Saved.',
+    wanted: () => true,
+    saved: () => {
+      saves++;
+    },
+  });
+  replies.poll([source]);
+  const held = [...((replies as any).scans as Map<string, any>).values()][0];
+  for (let pass = 0; pass < 12 && [...(replies as any).scans.values()].includes(held); pass++) {
+    fs.appendFileSync(file, chunk + chunk);
+    replies.poll([source]);
+  }
+  assert.equal(
+    [...(replies as any).scans.values()].includes(held),
+    false,
+    'append growth does not extend the admitted target',
+  );
+  replies.clear();
+  replies.note('wanted', {
+    sourceId: 'missing',
+    text: 'Saved.',
+    wanted: () => true,
+    saved: () => {
+      saves++;
+    },
+  });
+  replies.poll([source]);
+  const limited = [...((replies as any).scans as Map<string, any>).values()][0];
+  limited.control.retainedLimit = 0;
+  replies.poll([source]);
+  const window = openReadWindow();
+  for (let pass = 0; pass < 5; pass++) replies.poll([source]);
+  assert.equal(closeReadWindow(window).bytes, 0, 'unchanged limited evidence never restarts the same prefix');
+  assert.deepEqual(replies.sessions(), ['wanted']);
+  assert.equal(saves, 0);
+  replies.clear();
+});
+
+test('recorded recovery releases absent, replaced and ineligible sources while callbacks remain wanted', () => {
+  const root = tempDir('recorded-source-reconcile-');
+  const file = path.join(root, 'a.jsonl');
+  fs.writeFileSync(file, (JSON.stringify({ type: 'progress', text: 'x'.repeat(4096) }) + '\n').repeat(800));
+  const source = {
+    agent: 'claude',
+    sessionId: 'wanted',
+    file,
+    ...revisionOf(fs.statSync(file, { bigint: true })),
+  } as SessionFile;
+  const replies = new RecordedReplies();
+  let saved = false;
+  replies.note('wanted', {
+    provider: 'claude',
+    sourceId: 'answer',
+    text: 'Saved.',
+    wanted: () => !saved,
+    saved: () => {
+      saved = true;
+    },
+  });
+  const scans = () => (replies as any).scans as Map<string, unknown>;
+  replies.poll([source]);
+  assert.equal(scans().size, 1);
+  replies.poll([{ ...source, agent: 'codex' }]);
+  assert.equal(scans().size, 0, 'provider mismatch releases recovery without retiring its callback');
+  assert.deepEqual(replies.sessions(), ['wanted']);
+  replies.poll([source]);
+  fs.renameSync(file, path.join(root, 'old.jsonl'));
+  fs.writeFileSync(file, '');
+  replies.poll([source]);
+  assert.equal(scans().size, 0, 'the catalog cannot retain the replaced physical file');
+  const replacement = { ...source, ...revisionOf(fs.statSync(file, { bigint: true })) };
+  replies.poll([replacement]);
+  replies.poll([]);
+  assert.equal(scans().size, 0, 'temporary absence releases recovery independently of callback lifetime');
+  fs.writeFileSync(
+    file,
+    [
+      { type: 'user', timestamp: '2026-10-01T00:00:00Z', message: { role: 'user', content: 'Finish.' } },
+      {
+        type: 'assistant',
+        timestamp: '2026-10-01T00:00:01Z',
+        message: {
+          role: 'assistant',
+          id: 'answer',
+          stop_reason: 'end_turn',
+          content: [{ type: 'text', text: 'Saved.' }],
+        },
+      },
+    ]
+      .map((record) => JSON.stringify(record))
+      .join('\n') + '\n',
+  );
+  replies.poll([{ ...replacement, ...revisionOf(fs.statSync(file, { bigint: true })) }]);
+  assert.equal(saved, true, 'a current source can still settle the original callback');
+});
+
+test('recorded recovery shares source work and resident slots across matching files', () => {
+  const root = tempDir('recorded-source-budget-');
+  const padding = (JSON.stringify({ type: 'progress', text: 'x'.repeat(4096) }) + '\n').repeat(800);
+  const sources = Array.from({ length: 9 }, (_, index): SessionFile => {
+    const file = path.join(root, `${index}.jsonl`);
+    const records =
+      index === 8
+        ? [
+            { type: 'user', timestamp: '2026-10-01T00:00:00Z', message: { role: 'user', content: 'Finish.' } },
+            {
+              type: 'assistant',
+              timestamp: '2026-10-01T00:00:01Z',
+              message: {
+                role: 'assistant',
+                id: 'answer',
+                stop_reason: 'end_turn',
+                content: [{ type: 'text', text: 'Saved.' }],
+              },
+            },
+          ]
+            .map((record) => JSON.stringify(record))
+            .join('\n') + '\n'
+        : '';
+    fs.writeFileSync(file, records + padding);
+    return {
+      agent: 'claude',
+      sessionId: 'wanted',
+      file,
+      ...revisionOf(fs.statSync(file, { bigint: true })),
+    };
+  });
+  const replies = new RecordedReplies();
+  let saves = 0;
+  replies.note('wanted', {
+    provider: 'claude',
+    sourceId: 'answer',
+    text: 'Saved.',
+    wanted: () => saves === 0,
+    saved: () => {
+      saves++;
+    },
+  });
+  const visited = new Set<string>();
+  for (let pass = 0; pass < 200; pass++) {
+    if (saves !== 0) break;
+    const window = openReadWindow();
+    replies.poll(sources);
+    const tally = closeReadWindow(window);
+    assert.ok(tally.bytes <= RECORDED_REPLY_LIMITS.tailBytes + 128 * 1024, `aggregate source reads ${tally.bytes}`);
+    assert.ok(tally.files <= 1, 'one source receives the read quantum');
+    const scans = (replies as any).scans as Map<string, { source: SessionFile }>;
+    assert.ok(scans.size <= RECORDED_REPLY_LIMITS.sources);
+    for (const held of scans.values()) visited.add(held.source.file);
+  }
+  assert.equal(saves, 1, 'a later source receives service beyond the resident slots');
+  assert.ok(visited.size > RECORDED_REPLY_LIMITS.sources);
+  replies.clear();
+  assert.deepEqual(replies.sessions(), []);
+  assert.equal((replies as any).scans.size, 0);
 });
 
 test('read receipts contain only completed turns retained after the bounded response budget', () => {

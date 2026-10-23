@@ -30,9 +30,15 @@ import { railStatusRuns } from './domain/session-query.ts';
 import { onlyGrew } from './derivedcache.ts';
 import { READ_OBSERVATION_BYTES, type ReadObservationFacts } from './sessionwrites.ts';
 import { READ_LIMIT, type AgentReadSource } from './domain/read.ts';
-import { createClaudeRepeatedFilter } from './clauderepeated.ts';
+import { createClaudeRepeatedFilter, ClaudeRepeatedPrefix } from './clauderepeated.ts';
 import { meterRead } from './readmeter.ts';
-import { beginForwardSessionRecovery, type IncrementalSessionResult, type ForwardRecoveryControl } from './history';
+import {
+  beginForwardSessionRecovery,
+  readStableRange,
+  ForwardRecoveryLimit,
+  type IncrementalSessionResult,
+  type ForwardRecoveryControl,
+} from './history';
 
 export const SESSION_READ_LIMITS = {
   turns: 20,
@@ -1080,9 +1086,12 @@ function sessionSubagentContext(
   };
 }
 
-export const RECORDED_REPLY_LIMITS = { perSession: 4, sessions: 32, turns: 4, tailBytes: 1024 * 1024 } as const;
+export const RECORDED_REPLY_LIMITS = { sessions: 32, turns: 4, tailBytes: 1024 * 1024, sources: 1 } as const;
 
 export interface RecordedReply {
+  provider?: 'claude' | 'codex';
+  nativeTurnId?: string;
+  ownerTurnId?: number;
   // The assistant message id of the final response.
   sourceId: string;
   text: string;
@@ -1092,19 +1101,50 @@ export interface RecordedReply {
   wanted: () => boolean;
 }
 
-// Final responses of turns Claude started by itself. Such a turn has no response card, so its
+// Final responses of provider-originated turns. Such a turn has no response card, so its
 // response counts as held once a recorded turn of the session carries the same assistant message.
 export class RecordedReplies {
   private waiting = new Map<string, RecordedReply[]>();
+  private sourceCursor = 0;
+  private cycleSources = 0;
+  private cycleRevision: string | null = null;
+  private completedRevision: string | null = null;
+  private wantedGeneration = 0;
+  private cycleGeneration = 0;
+  private cycleHadFailure = false;
+  private sourceFinished = false;
+  private scans = new Map<
+    string,
+    {
+      session: string;
+      source: SessionFile;
+      generation: number;
+      revision: string | null;
+      scan: Generator<void, IncrementalSessionResult<unknown>>;
+      control: ForwardRecoveryControl;
+      matches: Map<string, Pick<Turn, 'finalResponse' | 'promptId'>>;
+    }
+  >();
 
   // Holds a response until a recorded turn carries it. Returns false for an empty id or text,
   // or for a response nothing waits for.
   note(session: string, reply: RecordedReply): boolean {
     if (!reply.sourceId || !reply.text.trim() || !reply.wanted()) return false;
-    const held = (this.waiting.get(session) ?? []).filter((one) => one.sourceId !== reply.sourceId && one.wanted());
+    const held = (this.waiting.get(session) ?? []).filter(
+      (one) =>
+        (one.provider !== reply.provider ||
+          (reply.ownerTurnId !== undefined
+            ? one.ownerTurnId !== reply.ownerTurnId
+            : one.sourceId !== reply.sourceId || one.nativeTurnId !== reply.nativeTurnId)) &&
+        one.wanted(),
+    );
     this.waiting.delete(session);
-    this.waiting.set(session, [...held, reply].slice(-RECORDED_REPLY_LIMITS.perSession));
-    while (this.waiting.size > RECORDED_REPLY_LIMITS.sessions) this.waiting.delete(this.waiting.keys().next().value!);
+    this.waiting.set(session, [...held, reply]);
+    this.wantedGeneration++;
+    this.completedRevision = null;
+    this.cycleRevision = null;
+    this.cycleSources = 0;
+    this.cycleHadFailure = false;
     return true;
   }
 
@@ -1115,22 +1155,261 @@ export class RecordedReplies {
       if (wanted.length) this.waiting.set(session, wanted);
       else this.waiting.delete(session);
     }
+    for (const [key, scan] of this.scans) if (!this.waiting.has(scan.session)) this.scans.delete(key);
     return [...this.waiting.keys()];
+  }
+
+  // Rotates the bounded polling budget without deleting wanted responses.
+  pollingSessions(): string[] {
+    const sessions = this.sessions().slice(0, RECORDED_REPLY_LIMITS.sessions);
+    for (const session of sessions) {
+      const held = this.waiting.get(session)!;
+      this.waiting.delete(session);
+      this.waiting.set(session, held);
+    }
+    return sessions;
+  }
+
+  // Reconcile the current catalog before one finite source job advances.
+  poll(sources: readonly SessionFile[]): void {
+    const sessions = new Set(this.pollingSessions());
+    const active = this.scans.entries().next().value;
+    const hash = crypto.createHash('sha256');
+    let count = 0;
+    let selected: { key: string; source: SessionFile } | null = null;
+    let currentActive: SessionFile | null = null;
+    for (let index = 0; index < sources.length; index++) {
+      const source = sources[index];
+      if (!this.waiting.get(source.sessionId)?.some((reply) => !reply.provider || reply.provider === source.agent))
+        continue;
+      if (
+        sources.findIndex(
+          (one) =>
+            one.agent === source.agent &&
+            one.sessionId === source.sessionId &&
+            normalizeFsPath(one.file) === normalizeFsPath(source.file),
+        ) !== index
+      )
+        continue;
+      const key = guardedSourceIdentity(source);
+      if (!key) continue;
+      try {
+        const revision = revisionOf(fs.statSync(source.file, { bigint: true }));
+        if (source.size !== undefined && !sessionSourceAdmitted(source, revision)) continue;
+        hash.update(JSON.stringify([key, revision.size, revision.mtimeMs]));
+      } catch {
+        continue;
+      }
+      if (active?.[0] === key) currentActive = source;
+      if (count === this.sourceCursor) selected = { key, source };
+      count++;
+    }
+    const revision = hash.digest('hex');
+    if (active && !currentActive) {
+      active[1].scan.return?.(undefined as never);
+      this.scans.delete(active[0]);
+    }
+    if (this.cycleRevision !== revision || this.cycleGeneration !== this.wantedGeneration) {
+      this.cycleRevision = revision;
+      this.cycleGeneration = this.wantedGeneration;
+      this.cycleSources = 0;
+      this.cycleHadFailure = false;
+    }
+    if (!count) return;
+    if (!selected) {
+      this.sourceCursor = 0;
+      this.completedRevision = null;
+      return;
+    }
+    if (this.scans.size) {
+      selected = { key: active![0], source: currentActive! };
+    } else if (this.completedRevision === revision || !sessions.has(selected.source.sessionId)) return;
+    const coverage = this.scans.get(selected.key);
+    const generation = coverage?.generation ?? this.wantedGeneration;
+    const coveredRevision = coverage?.revision ?? revision;
+    this.sourceFinished = false;
+    try {
+      this.read(selected.source, selected.key);
+    } catch {
+      this.scans.delete(selected.key);
+    }
+    if (!this.scans.has(selected.key)) {
+      this.sourceCursor = (this.sourceCursor + 1) % count;
+      if (generation !== this.wantedGeneration || coveredRevision !== revision) return;
+      if (!this.sourceFinished) this.cycleHadFailure = true;
+      if (++this.cycleSources >= count) {
+        if (!this.cycleHadFailure) this.completedRevision = revision;
+        this.cycleSources = 0;
+        this.cycleHadFailure = false;
+      }
+    }
+  }
+
+  clear(): void {
+    for (const held of this.scans.values()) held.scan.return?.(undefined as never);
+    this.scans.clear();
+    this.waiting.clear();
+  }
+
+  // One resumable source read reaches both recent and older wanted replies.
+  read(source: SessionFile, sourceKey?: string): void {
+    const session = source.sessionId;
+    if (!this.waiting.get(session)?.some((reply) => !reply.provider || reply.provider === source.agent)) return;
+    const key = sourceKey ?? guardedSourceIdentity(source);
+    if (!key) return;
+    let held = this.scans.get(key);
+    if (!held) {
+      if (this.scans.size >= RECORDED_REPLY_LIMITS.sources) return;
+      const matches = new Map<string, Pick<Turn, 'finalResponse' | 'promptId'>>();
+      const control: ForwardRecoveryControl = {
+        targetRevision: revisionOf(fs.statSync(source.file, { bigint: true })),
+        through: 0,
+        readBytes: 0,
+        retainedCharge: 0,
+        retainedLimit: 8 * RECORDED_REPLY_LIMITS.tailBytes,
+        recordLimit: RECORDED_REPLY_LIMITS.tailBytes,
+        reduceAbove: RECORDED_REPLY_LIMITS.tailBytes,
+        accepts: () => true,
+        fragments: [],
+        fragmentBytes: 0,
+      };
+      const options = {
+        maxTurns: RECORDED_REPLY_LIMITS.turns,
+        turnsOnly: true,
+        dispatchResponse: true,
+        childTranscript: source.childTranscript === true,
+        repeatedRecord: () => false,
+      };
+      const repeated =
+        source.agent === 'claude'
+          ? new ClaudeRepeatedPrefix((start, length) => {
+              if (guardedSourceIdentity(source) !== key) return null;
+              const bytes = readStableRange(
+                source.file,
+                start,
+                length,
+                revisionOf(fs.statSync(source.file, { bigint: true })),
+              );
+              control.actualReadBytes = (control.actualReadBytes ?? 0) + (bytes?.length ?? 0);
+              return bytes;
+            })
+          : null;
+      const scan = beginForwardSessionRecovery<unknown>(
+        source.file,
+        source.agent,
+        session,
+        () => {
+          const reducer =
+            source.agent === 'codex'
+              ? createCodexSessionReducer(session, options)
+              : createClaudeSessionReducer(session, options);
+          return {
+            ...reducer,
+            acceptsLine: repeated
+              ? function* (line) {
+                  return !(yield* repeated.repeated(line.text, line.start ?? 0));
+                }
+              : undefined,
+            pushLine: (line) => {
+              reducer.pushLine(line);
+              const text = typeof line === 'string' ? line : line.text;
+              const wanted = this.waiting.get(session) ?? [];
+              if (
+                !wanted.some(
+                  (one) => (!one.provider || one.provider === source.agent) && text.includes(one.sourceId),
+                ) &&
+                !text.includes('task_complete') &&
+                !/"type"\s*:\s*"user"/.test(text)
+              )
+                return;
+              for (const turn of reducer.read().turns) {
+                if (
+                  wanted.some(
+                    (one) =>
+                      turn.finalResponse?.sourceId === one.sourceId &&
+                      (!one.nativeTurnId || one.nativeTurnId === turn.promptId),
+                  )
+                )
+                  matches.set(JSON.stringify([turn.promptId, turn.finalResponse!.sourceId]), {
+                    promptId: turn.promptId,
+                    finalResponse: {
+                      sourceId: turn.finalResponse!.sourceId,
+                      text: turn.finalResponse!.text.trim() ? '.' : '',
+                    },
+                  });
+              }
+            },
+          };
+        },
+        { chunkBytes: 64 * 1024, recovery: control },
+      );
+      held = {
+        session,
+        source,
+        generation: this.wantedGeneration,
+        revision: this.cycleRevision,
+        scan,
+        control,
+        matches,
+      };
+      this.scans.set(key, held);
+    }
+    const before = held.control.actualReadBytes ?? 0;
+    try {
+      for (
+        let steps = 0;
+        steps < 512 && (held.control.actualReadBytes ?? 0) - before < RECORDED_REPLY_LIMITS.tailBytes;
+        steps++
+      ) {
+        const next = held.scan.next();
+        if (guardedSourceIdentity(source) !== key) {
+          held.scan.return?.(undefined as never);
+          this.scans.delete(key);
+          return;
+        }
+        this.settle(session, [...held.matches.values()], source.agent);
+        held.matches.clear();
+        if (!this.waiting.has(session)) {
+          this.sourceFinished = true;
+          this.scans.delete(key);
+          return;
+        }
+        if (!next.done) continue;
+        this.sourceFinished =
+          next.value.kind !== 'missing' && next.value.kind !== 'stale' && next.value.kind !== 'cancelled';
+        this.scans.delete(key);
+        if (next.value.read) this.settle(session, next.value.read.turns, source.agent);
+        break;
+      }
+    } catch (error) {
+      this.sourceFinished = error instanceof ForwardRecoveryLimit;
+      this.scans.delete(key);
+    }
   }
 
   // Settles each waiting response that one of the session's recorded turns holds as its final
   // response, with nonempty text. Any turn counts, so a newer turn recorded first does not hide it.
-  settle(session: string, turns: readonly Pick<Turn, 'finalResponse'>[]): void {
+  settle(
+    session: string,
+    turns: readonly (Pick<Turn, 'finalResponse'> & Partial<Pick<Turn, 'promptId'>>)[],
+    provider?: 'claude' | 'codex',
+  ): void {
     const held = this.waiting.get(session);
     if (!held) return;
-    const recorded = new Set<string>();
-    for (const turn of turns)
-      if (turn.finalResponse?.sourceId && turn.finalResponse.text.trim()) recorded.add(turn.finalResponse.sourceId);
+    const recorded = turns.filter((turn) => turn.finalResponse?.sourceId && turn.finalResponse.text.trim());
     const left: RecordedReply[] = [];
     const settled: RecordedReply[] = [];
     for (const one of held) {
       if (!one.wanted()) continue;
-      (recorded.has(one.sourceId) ? settled : left).push(one);
+      (recorded.some(
+        (turn) =>
+          turn.finalResponse!.sourceId === one.sourceId &&
+          (!one.provider || !provider || one.provider === provider) &&
+          (!one.nativeTurnId || turn.promptId === one.nativeTurnId),
+      )
+        ? settled
+        : left
+      ).push(one);
     }
     if (left.length) this.waiting.set(session, left);
     else this.waiting.delete(session);
@@ -1138,10 +1417,10 @@ export class RecordedReplies {
   }
 }
 
-// The newest turns of one Claude transcript with their final responses. The read is bounded and
+// The newest recorded turns with their final responses. The read is bounded and
 // does not depend on a panel showing the session.
 export function recordedReplyTurns(source: SessionFile): Turn[] {
-  return readSession(source.file, source.sessionId, {
+  return (source.agent === 'codex' ? readCodexSession : readSession)(source.file, source.sessionId, {
     maxTurns: RECORDED_REPLY_LIMITS.turns,
     tailBytes: RECORDED_REPLY_LIMITS.tailBytes,
     turnsOnly: true,

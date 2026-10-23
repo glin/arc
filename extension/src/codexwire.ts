@@ -1620,7 +1620,7 @@ export class CodexWire {
             kind: 'toolStart',
             toolId,
             command: str(item.command)!,
-            foreground:
+            initiating:
               item.status === 'inProgress' &&
               ((item.source === 'agent' && item.processId === null) ||
                 (item.source === 'unifiedExecStartup' && typeof item.processId === 'string')),

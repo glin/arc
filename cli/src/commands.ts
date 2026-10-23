@@ -137,9 +137,8 @@ function compact(action: 'request' | 'status'): Command {
         'All synopsis flags are required. Window and UUID syntax must match.',
         ...(request
           ? [
-              'Admission requires this live foreground tool call in the hosted main session, with no open asks or queued reader input.',
-              'A turn Claude starts by itself admits a request only when task notices from background work of one reader turn woke it.',
-              'One reader instruction admits one compaction. A refusal reason names the missing condition.',
+              'Admission requires this live native tool call in the hosted main session, with no open asks or queued reader input.',
+              'Each turn holds one pending request. Repeated requests use fresh IDs and preserve existing task limits.',
               'Missing readiness or reader intervention refuses or cancels compaction.',
             ]
           : ['A missing request or unavailable window reports unavailable.']),

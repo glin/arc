@@ -239,14 +239,10 @@ test('bundled self compaction uses read-only readiness, one admission and observ
   const channel = new WindowChannel(home);
   const run = promisify(execFile);
   const requests = [];
-  let ready = true;
-  let terminal = null;
   let loseReply = false;
-  const readyTimes = [];
   channel.setCompactRequestHandler(async (request) => {
     requests.push(request);
-    if (request.method === 'compact-ready') readyTimes.push(Date.now());
-    if (request.method === 'compact-ready') return ready ? { ready } : (terminal ?? { ready });
+    if (request.method === 'compact-ready') return { ready: true };
     if (request.method === 'compact-request' && loseReply) {
       await channel.dispose();
       return {};
@@ -322,39 +318,6 @@ test('bundled self compaction uses read-only readiness, one admission and observ
     const before = requests.length;
     await assert.rejects(run(process.execPath, [...args, '--session'], { env }));
     assert.equal(requests.length, before);
-    ready = false;
-    const readsBefore = readyTimes.length;
-    const refused = JSON.parse((await run(process.execPath, args, { env })).stdout);
-    assert.equal(refused.state, 'refused');
-    // Back-to-back reads would end before a late native tool start reaches the window.
-    const reads = readyTimes.slice(readsBefore);
-    assert.ok(reads.length >= 2, 'readiness reads more than once');
-    assert.ok(reads.at(-1) - reads[0] >= 450 * (reads.length - 1), 'readiness reads are spread across its deadline');
-    assert.equal(
-      requests.slice(before).every((r) => r.method === 'compact-ready'),
-      true,
-    );
-    // A terminal readiness code ends polling at once and reports the window's reason.
-    for (const code of [
-      'no-reader-instruction',
-      'reader-acted',
-      'background',
-      'already-used',
-      'request-used',
-      'withdrawn',
-    ]) {
-      terminal = { ready: false, code, reason: `Reason for ${code}.` };
-      const readsBeforeCode = readyTimes.length;
-      const coded = JSON.parse((await run(process.execPath, args, { env })).stdout);
-      assert.deepEqual([coded.state, coded.reason], ['refused', `Reason for ${code}.`]);
-      assert.equal(readyTimes.length - readsBeforeCode, 1, code);
-    }
-    terminal = { ready: false, code: 'not-observed', reason: 'Not seen yet.' };
-    const readsBeforeUnseen = readyTimes.length;
-    assert.equal(JSON.parse((await run(process.execPath, args, { env })).stdout).reason, 'Not seen yet.');
-    assert.ok(readyTimes.length - readsBeforeUnseen >= 2, 'readiness keeps polling while the command is unseen');
-    terminal = null;
-    ready = true;
     loseReply = true;
     const writesBefore = requests.filter((r) => r.method === 'compact-request').length;
     const uncertain = JSON.parse((await run(process.execPath, args, { env })).stdout);

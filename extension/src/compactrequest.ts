@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import type { GuardedAttempt, NativeEvent, WireEvent } from './agentwire';
 
-export const COMPACT_LIMITS = { records: 256, admissionMs: 15 * 60_000, retentionMs: 60 * 60_000 } as const;
+export const COMPACT_LIMITS = { records: 256, retentionMs: 60 * 60_000 } as const;
 export interface CompactPayload {
   requestId: string;
   window: string;
@@ -10,7 +10,7 @@ export interface CompactPayload {
   continuation?: { text: string; sha256: string };
 }
 export type CompactCommand = Omit<CompactPayload, 'continuation'> & { continuation?: { sha256: string } };
-export const CONTINUATION_LIMITS = { bytes: 8192, assignmentMs: 30 * 60_000, readyMs: 2 * 60_000 } as const;
+export const CONTINUATION_LIMITS = { bytes: 8192 } as const;
 export interface ContinuationObservation {
   state: 'waiting' | 'preparing' | 'attempting' | 'accepted' | 'cancelled' | 'refused' | 'uncertain';
   sequence: number;
@@ -60,21 +60,12 @@ export function validContinuationPath(file: string, platform = process.platform)
   );
 }
 // Why `compact-ready` holds no live call for a payload. Only `not-observed` can still change.
-export type CompactRejection =
-  | 'not-observed'
-  | 'no-reader-instruction'
-  | 'reader-acted'
-  | 'background'
-  | 'already-used'
-  | 'request-used'
-  | 'withdrawn';
+export type CompactRejection = 'not-observed' | 'reader-acted' | 'request-used' | 'capacity' | 'withdrawn';
 export const COMPACT_REJECTIONS: Record<CompactRejection, string> = {
   'not-observed': 'Arc has not seen this command run in the session yet. No compaction was queued.',
-  'no-reader-instruction': "Arc cannot connect this request to the reader's instructions. No compaction was queued.",
-  'reader-acted': 'The reader acted in this session after giving the instruction. No compaction was queued.',
-  background: 'The command ran in the background. Arc accepts only a foreground command. No compaction was queued.',
-  'already-used': "The reader's instruction already requested compaction once. No compaction was queued.",
+  'reader-acted': 'The reader acted in this session after the command. No compaction was queued.',
   'request-used': 'This request ID was already used in this Arc window. No compaction was queued.',
+  capacity: 'Too many compaction requests are active in this Arc window. No compaction was queued.',
   withdrawn: 'The session changed or closed before Arc could accept the request. No compaction was queued.',
 };
 export type CompactReadiness = { ready: true } | { ready: false; code: CompactRejection; reason: string };
@@ -113,7 +104,6 @@ interface Assignment {
   payload: CompactPayload;
   binding: Readonly<CompactBinding>;
   toolId: string;
-  deadline: number;
   toolSucceeded: boolean;
   turnSucceeded: boolean;
   finalRetained: boolean;
@@ -124,10 +114,12 @@ interface Assignment {
   operation?: NativeCompactOperation;
   admittedAt: number;
   persisted: boolean;
-  continuationDeadline?: number;
   possibleWrite?: boolean;
+  retired?: boolean;
 }
 interface Call {
+  turnSucceeded: boolean;
+  finalRetained: boolean;
   payload: CompactCommand;
   binding: Readonly<CompactBinding>;
   toolId: string;
@@ -228,16 +220,12 @@ export class CompactRequests {
   private calls = new Map<string, Call>();
   private assignments = new Map<string, Assignment>();
   private seenCalls = new Set<string>();
-  // Request IDs admitted in this activation. Each admission consumes a recorded call, so seenCalls bounds this set.
+  // Replay identities remain until this window closes, independently of active capacity.
   private consumed = new Set<string>();
   // The assignment whose provider command is being written. The adapter emits its submission
   // event synchronously after the write callback, and that event names the operation's generation.
   private claiming: Assignment | null = null;
   private disposed = false;
-  private readonly continuationAssignments = new Set<string>();
-  // Reader assignments that admitted a compaction. One assignment admits one, across its own turn
-  // and every turn that work it launched or adopted wakes.
-  private readonly compactedAssignments = new Set<string>();
   private readonly rejections = new Map<string, CompactRejection>();
   private readonly admissions = new Map<string, Promise<Readonly<CompactObservation>>>();
   constructor(
@@ -259,19 +247,35 @@ export class CompactRequests {
     if (event.kind === 'toolStart') {
       const payload = compactCommandPayload(event.command);
       if (
-        event.foreground &&
+        event.initiating &&
         payload?.window === this.activation &&
         !this.seenCalls.has(key) &&
-        this.seenCalls.size < this.capacity &&
         ![...this.assignments.values()].some((a) => sameBinding(a.binding, binding) && a.toolId === event.toolId)
       ) {
         this.seenCalls.add(key);
-        this.calls.set(key, { payload, binding: Object.freeze({ ...binding }), toolId: event.toolId });
+        if (this.calls.size < this.capacity)
+          this.calls.set(key, {
+            payload,
+            binding: Object.freeze({ ...binding }),
+            toolId: event.toolId,
+            turnSucceeded: false,
+            finalRetained: false,
+          });
+        else this.rejectPayload(payload, 'capacity');
       }
     }
     if (event.kind === 'toolEnd') this.calls.delete(key);
     if (event.kind === 'rootEnd') {
-      for (const [id, call] of this.calls) if (sameBinding(call.binding, binding)) this.calls.delete(id);
+      for (const [id, call] of this.calls)
+        if (sameBinding(call.binding, binding)) {
+          if (!event.success) {
+            this.calls.delete(id);
+            this.rejectPayload(call.payload, 'withdrawn');
+            continue;
+          }
+          call.turnSucceeded = event.success;
+          call.finalRetained = finalRetained;
+        }
     }
     for (const assignment of this.assignments.values()) {
       if (
@@ -287,7 +291,7 @@ export class CompactRequests {
       if (event.kind === 'rootEnd') {
         assignment.turnSucceeded = event.success;
         assignment.finalRetained = finalRetained;
-        if (!event.success || !assignment.toolSucceeded || !finalRetained)
+        if (!event.success || !finalRetained)
           this.change(assignment, 'failed', 'The requesting turn or its saved response is unavailable.');
       }
     }
@@ -298,6 +302,7 @@ export class CompactRequests {
   observeSubmitted(event: NativeEvent, childGeneration: number): void {
     const owns = (assignment: Assignment) =>
       assignment.submitted &&
+      !assignment.retired &&
       assignment.binding.provider === event.provider &&
       assignment.binding.sessionId === event.sessionId &&
       assignment.binding.childGeneration === childGeneration;
@@ -350,16 +355,13 @@ export class CompactRequests {
       .map(([id, a]) => ({ id, binding: a.binding }));
   }
 
-  // Whether an unsubmitted assignment that matches still waits for its final response. An
-  // assignment past its deadline no longer waits, even before prune records the expiry.
+  // Whether an unsubmitted operation still waits for its final response.
   awaitsReply(predicate: (binding: Readonly<CompactBinding>) => boolean): boolean {
-    return [...this.assignments.values()].some(
-      (a) =>
-        !a.submitted &&
-        a.observation.state === 'queued' &&
-        !a.finalRetained &&
-        this.now() < a.deadline &&
-        predicate(a.binding),
+    return (
+      [...this.calls.values()].some((call) => !call.finalRetained && predicate(call.binding)) ||
+      [...this.assignments.values()].some(
+        (a) => !a.submitted && a.observation.state === 'queued' && !a.finalRetained && predicate(a.binding),
+      )
     );
   }
 
@@ -372,8 +374,6 @@ export class CompactRequests {
     if (this.disposed) return refuse('not-observed');
     const live = [...this.calls.values()].find((call) => payloadKey(call.payload) === payloadKey(payload));
     if (this.consumed.has(payload.requestId)) return refuse('request-used');
-    if (live?.binding.assignmentId !== undefined && this.compactedAssignments.has(live.binding.assignmentId))
-      return refuse('already-used');
     if (live) return { ready: true };
     return refuse(this.rejections.get(payloadKey(payload)) ?? 'not-observed');
   }
@@ -401,6 +401,7 @@ export class CompactRequests {
     this.prune();
     const live = [...this.calls].find(([, call]) => payloadKey(call.payload) === payloadKey(payload));
     const existing = this.assignments.get(payload.requestId);
+    this.reclaim();
     if (existing && payloadKey(existing.payload) !== payloadKey(payload))
       throw new Error('This compaction request ID has different arguments.');
     if (this.consumed.has(payload.requestId)) {
@@ -424,36 +425,23 @@ export class CompactRequests {
       throw new Error(readiness.ready ? COMPACT_REJECTIONS['not-observed'] : readiness.reason);
     }
     const [key, call] = live;
-    if (call.binding.assignmentId !== undefined && this.compactedAssignments.has(call.binding.assignmentId)) {
-      this.calls.delete(key);
-      this.rejectPayload(payload, 'already-used');
-      throw new Error(COMPACT_REJECTIONS['already-used']);
-    }
     if (!eligible(call.binding))
       throw new Error('The session has an open question or queued reader input. No compaction was queued.');
-    if (
-      payload.continuation &&
-      (!this.persistence ||
-        !call.binding.authority ||
-        !call.binding.assignmentId ||
-        this.continuationAssignments.has(call.binding.assignmentId))
-    )
-      throw new Error('This reader assignment cannot admit another continuation.');
+    if (payload.continuation && (!this.persistence || !call.binding.authority || !call.binding.assignmentId))
+      throw new Error('This continuation cannot be saved for the session.');
     if (
       [...this.assignments.values()].some(
         (a) =>
           a.binding.sessionId === call.binding.sessionId &&
           a.binding.childGeneration === call.binding.childGeneration &&
           a.binding.turn === call.binding.turn &&
-          a.binding.submissionId === call.binding.submissionId &&
+          (call.binding.provider === 'codex' || a.binding.submissionId === call.binding.submissionId) &&
           ['queued', 'started', 'uncertain'].includes(a.observation.state),
       )
     )
       throw new Error('This turn already has a pending compaction request.');
     this.calls.delete(key);
     this.consumed.add(payload.requestId);
-    if (call.binding.assignmentId !== undefined) this.compactedAssignments.add(call.binding.assignmentId);
-    if (payload.continuation) this.continuationAssignments.add(call.binding.assignmentId!);
     const acknowledgement = Object.freeze({
       requestId: payload.requestId,
       admission: 'queued' as const,
@@ -485,10 +473,9 @@ export class CompactRequests {
       payload: { ...payload },
       binding: call.binding,
       toolId: call.toolId,
-      deadline: this.now() + COMPACT_LIMITS.admissionMs,
       toolSucceeded: false,
-      turnSucceeded: false,
-      finalRetained: false,
+      turnSucceeded: call.turnSucceeded,
+      finalRetained: call.finalRetained,
       submitted: false,
       delivering: false,
       terminalAt: null,
@@ -543,13 +530,7 @@ export class CompactRequests {
   }
 
   private readyAssignment(assignment: Assignment): boolean {
-    return (
-      !this.disposed &&
-      !assignment.toolSucceeded &&
-      !assignment.turnSucceeded &&
-      assignment.observation.state === 'queued' &&
-      this.now() < assignment.deadline
-    );
+    return !this.disposed && assignment.observation.state === 'queued';
   }
 
   private continuationPending(assignment: Assignment): boolean {
@@ -594,8 +575,6 @@ export class CompactRequests {
       !this.disposed &&
       assignment.observation.state === 'completed' &&
       this.continuationPending(assignment) &&
-      this.now() <
-        Math.min(assignment.admittedAt + CONTINUATION_LIMITS.assignmentMs, assignment.continuationDeadline ?? 0) &&
       delivery.eligible(assignment.binding, writing);
     if (!check(false)) return;
     assignment.delivering = true;
@@ -624,7 +603,8 @@ export class CompactRequests {
         assignment.possibleWrite = true;
       });
       const receipt = await attempt.receipt;
-      if (cancelled || !entered)
+      if (assignment.retired) this.cancelContinuation(assignment, 'The agent process ended during continuation.');
+      else if (cancelled || !entered)
         this.cancelContinuation(assignment, receipt.reason || 'The continuation was not written.');
       else
         this.continuationChange(
@@ -698,25 +678,7 @@ export class CompactRequests {
       (assignment.terminalAt !== null && this.now() - assignment.terminalAt >= COMPACT_LIMITS.retentionMs)
     )
       return null;
-    const observation = structuredClone(assignment.observation);
-    if (!assignment.submitted && observation.state === 'queued' && this.now() >= assignment.deadline) {
-      observation.state = 'cancelled';
-      observation.reason = 'The compaction request expired before it started.';
-      observation.sequence++;
-    }
-    if (
-      observation.continuation &&
-      this.continuationPending(assignment) &&
-      !assignment.delivering &&
-      this.now() >=
-        Math.min(assignment.admittedAt + CONTINUATION_LIMITS.assignmentMs, assignment.continuationDeadline ?? Infinity)
-    ) {
-      observation.continuation.state = 'cancelled';
-      observation.continuation.reason = 'The continuation request expired.';
-      observation.continuation.write = 'not-written';
-      observation.continuation.sequence++;
-    }
-    return observation;
+    return structuredClone(assignment.observation);
   }
 
   // Cancels unsubmitted assignments that match. Live calls that match also lose their authority unless keepCalls is set.
@@ -725,6 +687,7 @@ export class CompactRequests {
     reason: string,
     keepCalls = false,
     code?: CompactRejection,
+    retire = false,
   ): void {
     if (!keepCalls)
       for (const [key, call] of this.calls)
@@ -735,6 +698,14 @@ export class CompactRequests {
     for (const assignment of this.assignments.values()) {
       if (!predicate(assignment.binding)) continue;
       const previous = assignment.observation;
+      if (retire && assignment.submitted) assignment.retired = true;
+      if (retire && assignment.submitted && ['started', 'uncertain'].includes(assignment.observation.state)) {
+        this.cancelContinuation(assignment, reason);
+        this.change(assignment, 'uncertain', 'The agent process ended. The compaction outcome is unknown.');
+        assignment.terminalAt = this.now();
+        if (assignment.persisted && assignment.observation.continuation) void this.persist(assignment).catch(() => {});
+        continue;
+      }
       this.cancelContinuation(assignment, reason);
       if (!assignment.submitted && assignment.observation.state === 'queued')
         this.change(assignment, 'cancelled', reason);
@@ -744,7 +715,7 @@ export class CompactRequests {
   }
 
   dispose(): void {
-    this.invalidate(() => true, 'The Arc window closed before compaction started.');
+    this.invalidate(() => true, 'The Arc window closed before compaction started.', false, undefined, true);
     this.disposed = true;
     this.calls.clear();
   }
@@ -763,12 +734,11 @@ export class CompactRequests {
     )
       return;
     // Reader actions, child changes and scope changes cancel through invalidate. A failed check here
-    // only means the session is not ready yet, or the deadline passed and prune reports expiry.
+    // only means the session is not ready yet.
     const check = () =>
       !this.disposed &&
       !assignment.submitted &&
       assignment.observation.state === 'queued' &&
-      this.now() < assignment.deadline &&
       delivery.eligible(assignment.binding);
     if (!check()) {
       this.prune();
@@ -791,7 +761,7 @@ export class CompactRequests {
       if (!assignment.submitted && state === 'queued') {
         if (!(error instanceof NotReady))
           this.change(assignment, 'refused', error instanceof Error ? error.message : 'Compaction was refused.');
-      } else if (assignment.submitted && state === 'uncertain')
+      } else if (assignment.submitted && !assignment.retired && state === 'uncertain')
         this.change(
           assignment,
           'uncertain',
@@ -810,7 +780,7 @@ export class CompactRequests {
     reason = '',
   ): void {
     const assignment = this.assignments.get(id);
-    if (!assignment?.submitted || !sameBinding(assignment.binding, binding)) return;
+    if (!assignment?.submitted || assignment.retired || !sameBinding(assignment.binding, binding)) return;
     const previous = assignment.observation.state;
     if (previous === state) return;
     if (previous === 'completed' || previous === 'failed') {
@@ -823,8 +793,6 @@ export class CompactRequests {
     if (state === 'failed' || state === 'uncertain')
       this.cancelContinuation(assignment, 'Native compaction did not complete conclusively.');
     this.change(assignment, state, reason);
-    if (state === 'completed' && assignment.observation.continuation)
-      assignment.continuationDeadline = this.now() + CONTINUATION_LIMITS.readyMs;
   }
 
   private change(assignment: Assignment, state: CompactState, reason: string): void {
@@ -841,23 +809,27 @@ export class CompactRequests {
     if (assignment.persisted && assignment.observation.continuation) void this.persist(assignment).catch(() => {});
   }
   private prune(): void {
-    for (const [id, assignment] of this.assignments) {
+    for (const [id, assignment] of this.assignments)
       if (
-        this.continuationPending(assignment) &&
-        !assignment.delivering &&
-        this.now() >=
-          Math.min(
-            assignment.admittedAt + CONTINUATION_LIMITS.assignmentMs,
-            assignment.continuationDeadline ?? Infinity,
-          )
-      ) {
-        this.cancelContinuation(assignment, 'The continuation request expired.');
-        if (assignment.persisted) void this.persist(assignment).catch(() => {});
-      }
-      if (!assignment.submitted && assignment.observation.state === 'queued' && this.now() >= assignment.deadline)
-        this.change(assignment, 'cancelled', 'The compaction request expired before it started.');
-      if (assignment.terminalAt !== null && this.now() - assignment.terminalAt >= COMPACT_LIMITS.retentionMs)
+        assignment.terminalAt !== null &&
+        (!assignment.delivering || assignment.retired) &&
+        this.now() - assignment.terminalAt >= COMPACT_LIMITS.retentionMs
+      )
         this.assignments.delete(id);
+  }
+
+  private reclaim(): void {
+    const terminal = [...this.assignments]
+      .filter(
+        ([, a]) =>
+          a.terminalAt !== null &&
+          (!a.delivering || a.retired) &&
+          (!a.possibleWrite || a.observation.continuation?.state === 'accepted'),
+      )
+      .sort((a, b) => a[1].terminalAt! - b[1].terminalAt!);
+    for (const [id] of terminal) {
+      if (this.assignments.size < this.capacity) break;
+      this.assignments.delete(id);
     }
   }
 }
@@ -980,38 +952,6 @@ export interface CompactHostPort<C extends CompactChild> {
 
 interface Submission {
   sessionId: string | null;
-  revision: number;
-  assignmentId: string;
-  // True for a prompt the reader sent. Only such a prompt adopts background work.
-  reader: boolean;
-}
-
-// A root background launch, the submission that covers it, and the subagent it started, if any.
-// A launch in an owned turn starts with that turn's submission. A launch that no single turn owns starts with the
-// latest reader submission that Claude read in the child. The submission is null when that source supplies no reader
-// instruction: an unbound turn, or a child where Claude has read no reader prompt. Each reader prompt that Claude
-// reads later takes the launch over until its task notice arrives. `woke` holds while that notice waits for the turn
-// that Claude starts by itself to answer it.
-interface Launch {
-  submission: Submission | null;
-  agentId: string | null;
-  runId: string | null;
-  woke: boolean;
-}
-
-function launchFailed(evidence: unknown, toolId: string): boolean {
-  const content = (evidence as { message?: { content?: unknown } } | null)?.message?.content;
-  return (
-    Array.isArray(content) &&
-    content.some(
-      (block: { type?: unknown; tool_use_id?: unknown; is_error?: unknown } | null) =>
-        block?.type === 'tool_result' && block.tool_use_id === toolId && block.is_error === true,
-    )
-  );
-}
-
-function lineageKey(submission: Submission): string {
-  return `${submission.sessionId}:${submission.revision}:${submission.assignmentId}`;
 }
 
 const SUBMISSIONS_PER_CHILD = 32;
@@ -1024,22 +964,17 @@ export class CompactHost<C extends CompactChild> {
   private readonly generations = new WeakMap<C, number>();
   private readonly children = new Map<string, C>();
   private readonly submissions = new WeakMap<C, Map<number, Submission>>();
+  private readonly bindings = new WeakMap<C, Map<string, CompactBinding>>();
   private readonly replies = new WeakMap<C, Set<number>>();
   private readonly endings = new WeakMap<C, Map<number, { binding: CompactBinding; event: NativeEvent }>>();
+  private readonly observations = new WeakMap<
+    NativeEvent,
+    Pick<CompactBinding, 'childGeneration' | 'readerRevision' | 'authority' | 'sourceIdentity'>
+  >();
   private generation = 0;
   // True from a scope change until the panel's session rows reflect the new scope.
   private settling = false;
   private disposed = false;
-  private readonly assignments = new WeakMap<C, string>();
-  private readonly launches = new WeakMap<C, Map<string, Launch>>();
-  // Launches that capacity dropped from `launches`. A task notice that names one explains nothing.
-  private readonly evicted = new WeakMap<C, Set<string>>();
-  // Children whose dropped launches also overflowed `evicted`. They bind nothing until both are empty.
-  private readonly incomplete = new WeakSet<C>();
-  // Turns Claude started by itself that no task notice explains. They never bind.
-  private readonly unbound = new WeakMap<C, Set<number>>();
-  // The latest reader submission that Claude read in each child.
-  private readonly latestReader = new WeakMap<C, Submission>();
 
   constructor(
     private readonly activation: string,
@@ -1091,48 +1026,38 @@ export class CompactHost<C extends CompactChild> {
     for (const sessionId of this.requests.waitingSessions()) void this.drain(sessionId);
   }
 
-  // Records the reader revision of a prompt the child accepted for writing.
+  // Retains the session identity of an Arc submission without requiring one for native turns.
   submitted(
     child: C,
     turnId: number,
-    origin: 'reader' | 'followup' | 'continuation' = 'reader',
-    assignmentId?: string,
+    _origin: 'reader' | 'followup' | 'continuation' = 'reader',
+    _operationId?: string,
   ): void {
     if (this.disposed) return;
-    const sessionId = child.state().sessionId;
     const book = this.submissions.get(child) ?? new Map<number, Submission>();
-    const assignment =
-      origin === 'reader'
-        ? `${this.generationOf(child)}:${turnId}`
-        : (assignmentId ?? this.assignments.get(child) ?? `${this.generationOf(child)}:${turnId}`);
-    this.assignments.set(child, assignment);
     this.submissions.set(child, book);
-    book.set(turnId, {
-      sessionId,
-      revision: sessionId ? this.revision(sessionId) : 0,
-      assignmentId: assignment,
-      reader: origin === 'reader',
-    });
+    book.set(turnId, { sessionId: child.state().sessionId });
     if (book.size > SUBMISSIONS_PER_CHILD) book.delete(book.keys().next().value!);
     this.generationOf(child);
   }
 
-  // Runs when Claude reports that it read a reader prompt. Claude replays a prompt when it reads
-  // it, so output that Claude wrote before then, such as the `result` and `idle` of earlier work,
-  // reaches Arc first. A prompt that Arc wrote but Claude has not read adopts nothing. The reader
-  // saw the background work that still runs, so the prompt takes over every launch whose task
-  // notice has not arrived. A notice that arrived earlier keeps its own submission, because the
-  // reader acted after it. The revision stays the one recorded at submission, so a later reader
-  // action still refuses. A follow-up or a continuation carries no reader instruction and adopts
-  // nothing. A joined reader receipt binds its live shared owner to that same original submission.
+  // Joined reader input uses the same live response owner.
   read(child: C, turnId: number): void {
-    if (this.disposed) return;
     const submission = this.submissions.get(child)?.get(turnId);
-    if (!submission?.reader) return;
     const owner = child.readerTurnOwner?.(turnId);
-    if (owner !== undefined) this.submissions.get(child)!.set(owner, submission);
-    this.latestReader.set(child, submission);
-    for (const launch of this.launches.get(child)?.values() ?? []) if (!launch.woke) launch.submission = submission;
+    if (submission && owner !== undefined) this.submissions.get(child)!.set(owner, submission);
+  }
+
+  // Freezes command context at arrival, before an early native turn has a response owner.
+  observeNative(child: C, event: NativeEvent): void {
+    if (this.disposed || event.kind !== 'toolStart' || !event.initiating || !compactCommandPayload(event.command))
+      return;
+    this.observations.set(event, {
+      childGeneration: this.generationOf(child),
+      readerRevision: this.revision(event.sessionId),
+      authority: this.port.authority?.(event.provider, event.sessionId) ?? undefined,
+      sourceIdentity: (this.port.source ?? this.port.authority)?.(event.provider, event.sessionId) ?? undefined,
+    });
   }
 
   native(child: C, event: NativeEvent, turnId: number | undefined): void {
@@ -1145,31 +1070,9 @@ export class CompactHost<C extends CompactChild> {
         queueMicrotask(() => void this.drain(event.sessionId));
       return;
     }
-    if (event.kind === 'wake') {
-      this.wake(child, event.toolId, event.runId, turnId);
-      return;
-    }
-    // A launch that no live turn owns, such as a delayed result during prompt preparation,
-    // belongs to the latest reader prompt that Claude read in the child.
-    if (event.kind === 'launch') {
-      const submission = turnId === undefined ? this.latestReader.get(child) : this.submissionOf(child, turnId);
-      this.recordLaunch(child, event.toolId, submission ?? null, event.agentId);
-      return;
-    }
-    // A launch whose tool reported an error never sends a task notice. A launched task's result
-    // carries no interruption field, so `success` alone cannot tell it from a failed launch.
-    if (event.kind === 'toolEnd' && launchFailed(event.evidence, event.toolId)) this.release(child, event.toolId);
+    if (event.kind === 'wake' || event.kind === 'launch' || event.kind === 'background') return;
     const binding = this.binding(child, event, turnId);
-    if (event.kind === 'toolStart') {
-      if (!event.foreground) this.requests.reject(event.command, 'background');
-      else if (!binding) this.requests.reject(event.command, 'no-reader-instruction');
-      else if (binding.readerRevision !== this.revision(binding.sessionId)) {
-        this.requests.reject(event.command, 'reader-acted');
-        return;
-      }
-    }
-    if (event.kind === 'rootEnd' && !this.answered(child, event, turnId) && binding)
-      event = { ...event, success: false };
+    if (event.kind === 'toolStart' && (!binding || !event.initiating)) this.requests.reject(event.command, 'withdrawn');
     if (!binding || turnId === undefined) return;
     const replies = this.replies.get(child) ?? new Set<number>();
     this.replies.set(child, replies);
@@ -1180,7 +1083,6 @@ export class CompactHost<C extends CompactChild> {
         const endings = this.endings.get(child) ?? new Map<number, { binding: CompactBinding; event: NativeEvent }>();
         this.endings.set(child, endings);
         endings.set(turnId, { binding, event });
-        if (endings.size > SUBMISSIONS_PER_CHILD) endings.delete(endings.keys().next().value!);
       }
       return;
     }
@@ -1194,7 +1096,10 @@ export class CompactHost<C extends CompactChild> {
     const replies = this.replies.get(child) ?? new Set<number>();
     this.replies.set(child, replies);
     replies.add(turnId);
-    if (replies.size > SUBMISSIONS_PER_CHILD) replies.delete(replies.values().next().value!);
+    for (const reply of replies) {
+      if (replies.size <= SUBMISSIONS_PER_CHILD) break;
+      if (!this.awaitsRecordedReply(child, reply)) replies.delete(reply);
+    }
     const endings = this.endings.get(child);
     const ending = endings?.get(turnId);
     if (!ending) return;
@@ -1212,8 +1117,7 @@ export class CompactHost<C extends CompactChild> {
   }
 
   // A child turn ended. Root endings still waiting for a saved response fail, except the successful
-  // ending of a turn Claude started by itself. That turn has no response card, so its ending waits
-  // until the panel reads the recorded turn, or until the assignment deadline.
+  // ending of a provider-originated turn. Its response waits for the recorded turn.
   turnEnded(child: C): void {
     const endings = this.endings.get(child);
     if (!endings) return;
@@ -1232,6 +1136,9 @@ export class CompactHost<C extends CompactChild> {
     this.requests.invalidate(
       (binding) => binding.childGeneration === generation,
       'The agent process ended before compaction started.',
+      false,
+      undefined,
+      true,
     );
   }
 
@@ -1365,6 +1272,7 @@ export class CompactHost<C extends CompactChild> {
       generation = ++this.generation;
       this.generations.set(child, generation);
     }
+    if (this.children.has(child.key) && this.children.get(child.key) !== child) this.childGone(child.key);
     this.children.set(child.key, child);
     return generation;
   }
@@ -1373,120 +1281,38 @@ export class CompactHost<C extends CompactChild> {
     const provider = child.agent;
     if (turnId === undefined || (provider !== 'claude' && provider !== 'codex') || event.provider !== provider)
       return null;
-    const submission = this.submissionOf(child, turnId);
+    const submission = this.submissions.get(child)?.get(turnId);
     const turn = provider === 'claude' ? (event.generation === null ? null : String(event.generation)) : event.turnId;
     if (
-      !submission ||
       !turn ||
+      child.state().exited ||
       child.state().sessionId !== event.sessionId ||
-      (submission.sessionId !== null && submission.sessionId !== event.sessionId)
+      (submission?.sessionId != null && submission.sessionId !== event.sessionId)
     )
       return null;
-    return {
+    const book = this.bindings.get(child) ?? new Map<string, CompactBinding>();
+    this.bindings.set(child, book);
+    const key = `${turnId}:${turn}`;
+    const known = book.get(key);
+    if (event.kind !== 'toolStart' || !event.initiating || !compactCommandPayload(event.command)) return known ?? null;
+    const generation = this.generationOf(child);
+    const binding: CompactBinding = {
       activation: this.activation,
       provider,
       sessionId: event.sessionId,
-      childGeneration: this.generationOf(child),
+      childGeneration: generation,
       turn,
       submissionId: String(turnId),
-      readerRevision: submission.revision,
-      assignmentId: submission.assignmentId,
+      readerRevision: this.revision(event.sessionId),
+      assignmentId: `${generation}:${turn}:${turnId}`,
       ...(this.port.authority ? { authority: this.port.authority(provider, event.sessionId) ?? undefined } : {}),
       ...((this.port.source ?? this.port.authority)
         ? { sourceIdentity: (this.port.source ?? this.port.authority)!(provider, event.sessionId) ?? undefined }
         : {}),
     };
-  }
-
-  // A turn Claude starts by itself answers the task notices that arrived while no turn ran. It
-  // takes the submission that covers the launches of every such notice: the latest reader prompt
-  // that Claude read before the notice, or the launch's first submission. It binds nothing when no
-  // notice waits, when a notice names a launch that no reader instruction covers or a dropped
-  // launch, or when the notices name launches of different submissions. The copy keeps the source's
-  // session, revision and reader assignment.
-  private submissionOf(child: C, turnId: number): Submission | undefined {
-    const book = this.submissions.get(child);
-    const known = book?.get(turnId);
-    if (known || !child.startedByAgent?.(turnId) || this.unbound.get(child)?.has(turnId)) return known;
-    const sources = new Map<string, Submission | null>();
-    for (const launch of this.launches.get(child)?.values() ?? [])
-      if (launch.woke) sources.set(launch.submission ? lineageKey(launch.submission) : '', launch.submission);
-    const source = sources.size === 1 ? [...sources.values()][0] : null;
-    if (!source || this.incomplete.has(child)) {
-      const unbound = this.unbound.get(child) ?? new Set<number>();
-      this.unbound.set(child, unbound);
-      unbound.add(turnId);
-      if (unbound.size > SUBMISSIONS_PER_CHILD) unbound.delete(unbound.values().next().value!);
-      return undefined;
-    }
-    const entry = { ...source };
-    const target = book ?? new Map<number, Submission>();
-    this.submissions.set(child, target);
-    target.set(turnId, entry);
-    if (target.size > SUBMISSIONS_PER_CHILD) target.delete(target.keys().next().value!);
-    return entry;
-  }
-
-  // Records a root background launch with the submission that covers it when it starts. Capacity
-  // drops the oldest launch, and a notice that names a dropped launch binds nothing.
-  private recordLaunch(child: C, toolId: string, submission: Submission | null, agentId: string | null): void {
-    const launches = this.launches.get(child) ?? new Map<string, Launch>();
-    this.launches.set(child, launches);
-    const known = launches.get(toolId);
-    if (known) {
-      known.agentId ??= agentId;
-      return;
-    }
-    launches.set(toolId, { submission, agentId, runId: null, woke: false });
-    if (launches.size <= SUBMISSIONS_PER_CHILD) return;
-    const dropped = launches.keys().next().value!;
-    launches.delete(dropped);
-    const evicted = this.evicted.get(child) ?? new Set<string>();
-    this.evicted.set(child, evicted);
-    evicted.add(dropped);
-    if (evicted.size <= SUBMISSIONS_PER_CHILD) return;
-    evicted.delete(evicted.values().next().value!);
-    this.incomplete.add(child);
-  }
-
-  // A task notice inside an owned turn is that turn's to answer, so it releases its launch. Any other
-  // notice waits and fixes the launch's submission. The next turn Claude starts by itself binds to it,
-  // and the next `result` releases it.
-  private wake(child: C, toolId: string, runId: string | null, turnId: number | undefined): void {
-    const launches = this.launches.get(child) ?? new Map<string, Launch>();
-    this.launches.set(child, launches);
-    if (this.evicted.get(child)?.delete(toolId))
-      launches.set(toolId, { submission: null, agentId: null, runId, woke: false });
-    const launch = launches.get(toolId);
-    if (!launch) return;
-    if (turnId !== undefined) this.release(child, toolId);
-    else Object.assign(launch, { runId, woke: true });
-  }
-
-  private release(child: C, toolId: string): void {
-    const launches = this.launches.get(child);
-    launches?.delete(toolId);
-    if (!launches?.size && !this.evicted.get(child)?.size) this.incomplete.delete(child);
-  }
-
-  // Releases every waiting notice at a turn's `result`. Claude answers each notice that reaches a
-  // running turn inside that turn, also one that arrives before the turn's first tool call, when
-  // the turn has no owner yet. False when the bound turn Claude started by itself has an `origin`
-  // that names no waiting notice of its submission. The origin names a run for a task notice and a
-  // subagent for a hand-back.
-  private answered(child: C, event: NativeEvent, turnId: number | undefined): boolean {
-    const waiting = [...(this.launches.get(child) ?? [])].filter(([, launch]) => launch.woke);
-    for (const [toolId] of waiting) this.release(child, toolId);
-    const agentStarted = turnId !== undefined && !!child.startedByAgent?.(turnId);
-    const origin = event.evidence.origin as { kind?: unknown; runId?: unknown; from?: unknown } | undefined;
-    if (!agentStarted || !origin || typeof origin !== 'object') return true;
-    const named = waiting.find(([, launch]) =>
-      origin.kind === 'peer'
-        ? launch.agentId !== null && launch.agentId === origin.from
-        : origin.kind === 'task-notification' && launch.runId !== null && launch.runId === origin.runId,
-    );
-    const bound = this.submissions.get(child)?.get(turnId);
-    return !bound || (!!named?.[1].submission && lineageKey(named[1].submission) === lineageKey(bound));
+    Object.assign(binding, this.observations.get(event));
+    book.set(key, binding);
+    return binding;
   }
 
   // Asks and queued reader input, including a queued `/compact`, block admission and delivery.
@@ -1521,13 +1347,19 @@ export class CompactHost<C extends CompactChild> {
 
 // The panel calls that hold a final response for the compaction its turn requested.
 export interface ReplyHolder {
-  noteRecordedReply(session: string, sourceId: string, text: string, saved: () => void, wanted: () => boolean): void;
+  noteRecordedReply(
+    session: string,
+    sourceId: string,
+    text: string,
+    saved: () => void,
+    wanted: () => boolean,
+    identity?: { provider: 'claude' | 'codex'; nativeTurnId?: string; ownerTurnId?: number },
+  ): void;
   noteCompletedReply(session: string, text: string, sourceId?: string, turnId?: number, saved?: () => void): void;
   settleRecordedReplies(): void;
 }
 
-// Sends one reader prompt and records it for self-compaction. The prompt takes over background work
-// only when the agent reports that it read the prompt. A prompt without that receipt takes over nothing.
+// Sends a reader prompt and retains its live session and shared response owner.
 export function promptAsReader<C extends CompactChild>(
   compaction: CompactHost<C> | null,
   child: C,
@@ -1544,7 +1376,7 @@ export function promptAsReader<C extends CompactChild>(
 }
 
 // Routes the child events that self-compaction reads. Returns true when the event needs no other
-// handling. A turn Claude started by itself has no response card, so its final response waits for a
+// handling. A provider-originated turn has no response card, so its final response waits for a
 // recorded turn while a compaction request of that turn waits for it.
 export function routeCompactionEvent<C extends CompactChild>(
   compaction: CompactHost<C> | null,
@@ -1568,6 +1400,11 @@ export function routeCompactionEvent<C extends CompactChild>(
           event.text,
           () => compaction.replyRetained(child, turnId),
           () => compaction.awaitsRecordedReply(child, turnId),
+          {
+            provider: child.agent as 'claude' | 'codex',
+            ownerTurnId: turnId,
+            ...(child.agent === 'codex' && event.nativeTurnId ? { nativeTurnId: event.nativeTurnId } : {}),
+          },
         );
     } else
       replies.noteCompletedReply(where, event.text, event.sourceId, turnId, () => {

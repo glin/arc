@@ -288,12 +288,12 @@ test.each([false, true])(
         for (const event of native) book.observe(binding, event);
         assert.deepEqual(
           {
-            foreground: native[0].kind === 'toolStart' && native[0].foreground,
+            initiating: native[0].kind === 'toolStart' && native[0].initiating,
             payload: compactCommandPayload(command),
             readiness: book.readiness(expected),
           },
           {
-            foreground: true,
+            initiating: true,
             payload: continuation ? { ...payload, continuation: { sha256 } } : payload,
             readiness: { ready: true },
           },
@@ -334,7 +334,7 @@ test('Codex native evidence requires exact thread fields and separates command e
     ['toolStart', 'toolEnd', 'rootEnd'],
   );
   assert.equal(native[0].evidence.threadId, THREAD);
-  assert.equal(native[0].kind === 'toolStart' && native[0].foreground, true);
+  assert.equal(native[0].kind === 'toolStart' && native[0].initiating, true);
   assert.equal(native[1].kind === 'toolEnd' && native[1].success, true);
   let checks = 0;
   const pending = h.wire.compact(() => {

@@ -1,8 +1,8 @@
 {
   "cli/test/manage.test.ts": {
     "reason": "CLI management must preserve classification, validation, and read delivery through a real authenticated window channel.",
-    "cases": 9,
-    "matricesSha256": "c42a9dc7deef57b354e987b4e3353319415b4a377794651d8422050b78b0f94c"
+    "cases": 14,
+    "matricesSha256": "ee1ac1813a1142510ff011bbaee97367caf03b827ed1af3282e7edb7c189ac77"
   },
   "cli/test/run.test.ts": {
     "reason": "Standalone workers must retain real output, exit, cancellation, receipt ownership, and recovery across process boundaries.",
@@ -17,7 +17,7 @@
   "cli/test/smoke.bundled-b.test.mjs": {
     "reason": "Compiled CLI commands must deliver session actions and streamed responses through the selected window channel.",
     "cases": 5,
-    "matricesSha256": "70b7921f1164c14f90956abe51409ef3ba367b0821f5a0c38b0f27be948f4d9f"
+    "matricesSha256": "1872859950c63df4185ba31996417baaf34272825e890b49ea65ef82bc32e5e3"
   },
   "cli/test/smoke.bundled-c.test.mjs": {
     "reason": "Compiled CLI commands must preserve window routing, turn limits, and terminal ownership under real IPC.",
@@ -35,9 +35,9 @@
     "matricesSha256": "ee41bd99bc78c90d9caa53af20ec903968f2860939812170f9d5a393eede6a0c"
   },
   "extension/src/agenthost.test.ts": {
-    "reason": "A spawned agent must receive the activation window, editor executable, and command search path. Self-compaction crosses captured completion and workspace scope recovery.",
-    "cases": 291,
-    "matricesSha256": "0f546b578f12fa4bb25264065b6b80263d3fd5f4a833ed05598f68efcab6cce0"
+    "reason": "A spawned agent must receive the activation window, editor executable, and command search path. Self-compaction crosses native background settlement, response retention for provider turns, and workspace scope recovery.",
+    "cases": 296,
+    "matricesSha256": "761c3fa256ebb0ab9f858a7228732042eaefceaddb8d2737df88f41511579809"
   },
   "extension/src/chrome.browser.test.ts": {
     "reason": "Panel controls must preserve native focus, keyboard handling, and browser event delivery.",
@@ -51,8 +51,8 @@
   },
   "extension/src/clauderepeated.test.ts": {
     "reason": "The real worker must read repeated-record maps and invalidate them after source revision changes.",
-    "cases": 39,
-    "matricesSha256": "d31a98ac2408485ce42317634ac9d33c68436c7051cc4d9f8bef5072483e2b9b"
+    "cases": 40,
+    "matricesSha256": "7233dd3ad393a62ecbd4ba987f2c6c489196504ddb484835419dcff9134eb053"
   },
   "extension/src/codex.test.ts": {
     "reason": "Real Git worktree ownership and descendant source resolution must agree with recorded Codex session relationships.",
@@ -126,8 +126,8 @@
   },
   "extension/src/panel.webview.test.ts": {
     "reason": "Real progressive workers must deliver bounded recovery and metadata through the production panel host.",
-    "cases": 608,
-    "matricesSha256": "9d83819839f0d2cd60b938b7805630bb40d3810c4a06bb2fae1e00458a8a77e0"
+    "cases": 609,
+    "matricesSha256": "4d5022f04fcf144b148b91bc1d15fbf90d58062e05c45fa4d42554e7a3d2921f"
   },
   "extension/src/panelbundle.test.ts": {
     "reason": "The panel bundle and fixture must contain the production entry, source identity, and substituted text.",

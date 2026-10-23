@@ -17,6 +17,7 @@ import {
   GUARDED_RECEIPT_MS,
 } from './claudewire.ts';
 import { GuardedAttempt } from './agentwire.ts';
+import { CompactRequests } from './compactrequest.ts';
 import { createHash } from 'node:crypto';
 
 // Protocol fixtures retain the fields consumed by the wire adapter, including the unified context window.
@@ -2740,3 +2741,146 @@ test('recorded task notices and hand-backs name the launch that the woken result
   assert.equal(named.length, 1);
   assert.ok(runs.includes(named[0]!));
 });
+
+test.each([false, true])(
+  'Claude root Bash compaction admits background=%s without a reader submission',
+  (background) => {
+    const window = 'b'.repeat(24);
+    const payload = {
+      requestId: window + ':aaaaaaaa-1111-2222-3333-444444444444',
+      window,
+      self: true as const,
+      afterTurn: true as const,
+    };
+    const book = new CompactRequests(window);
+    const binding = {
+      activation: window,
+      provider: 'claude' as const,
+      sessionId: SESSION,
+      childGeneration: 1,
+      turn: '0',
+      submissionId: 'native',
+      readerRevision: 0,
+    };
+    const wire = new ClaudeWire({
+      send() {},
+      sessionId: SESSION,
+      emit: (event) => {
+        if (event.kind === 'native') book.observe(binding, event.event, event.event.kind === 'rootEnd');
+      },
+    });
+    const tool = {
+      type: 'tool_use',
+      id: 'background-compact',
+      name: 'Bash',
+      caller: { type: 'direct' },
+      input: {
+        command: `arc compact request --self --after-turn --request-id ${payload.requestId} --window ${window} --json`,
+        run_in_background: background,
+      },
+    };
+    const send = (record: object) => wire.receive(JSON.stringify({ session_id: SESSION, ...record }));
+    send({ type: 'assistant', parent_tool_use_id: 'subagent', message: { content: [tool] } });
+    assert.equal(book.ready(payload), false);
+    send({ type: 'assistant', parent_tool_use_id: null, message: { content: [tool] } });
+    assert.equal(book.admit(payload, () => true).state, 'queued');
+    send({
+      type: 'result',
+      uuid: 'root-end',
+      result_index: 0,
+      subtype: 'success',
+      is_error: false,
+      terminal_reason: 'completed',
+      num_turns: 1,
+    });
+    assert.equal(book.deliverable(SESSION).length, 0);
+    send({
+      type: 'user',
+      parent_tool_use_id: null,
+      message: { content: [{ type: 'tool_result', tool_use_id: tool.id, is_error: false }] },
+      tool_use_result: { interrupted: false },
+    });
+    assert.equal(
+      book.deliverable(SESSION).length,
+      1,
+      'successful tool settlement can arrive after exact-turn settlement',
+    );
+    wire.close('finished');
+  },
+);
+
+test.each([
+  ['user', 'completed', true, true],
+  ['user', 'completed', true, false],
+  ['user', 'failed', false, false],
+  ['system', 'completed', true, false],
+  ['system', 'failed', false, false],
+  ['user', 'failed', false],
+  ['user', 'killed', false],
+  ['user', 'stopped', null],
+  ['system', 'completed', true],
+  ['system', 'failed', false],
+  ['system', 'stopped', false],
+  ['system', 'killed', null],
+])(
+  'Claude %s background terminal status %s retains the launching generation',
+  async (form, status, success, flagged = true) => {
+    const events: WireEvent[] = [];
+    const wire = new ClaudeWire({ send() {}, sessionId: SESSION, emit: (event) => events.push(event) });
+    const send = (record: object) => wire.receive(JSON.stringify({ session_id: SESSION, ...record }));
+    send({
+      type: 'assistant',
+      parent_tool_use_id: null,
+      message: {
+        content: [
+          {
+            type: 'tool_use',
+            id: 'background-command',
+            name: 'Bash',
+            caller: { type: 'direct' },
+            input: {
+              command: 'arc compact request --self --after-turn --json',
+              ...(flagged ? { run_in_background: true } : {}),
+            },
+          },
+        ],
+      },
+    });
+    send({
+      type: 'user',
+      parent_tool_use_id: null,
+      message: { content: [{ type: 'tool_result', tool_use_id: 'background-command', is_error: false }] },
+      tool_use_result: { backgroundTaskId: 'exact-task', interrupted: false },
+    });
+    await wire.prompt('Continue the authorized work.');
+    const notice =
+      form === 'user'
+        ? {
+            type: 'user',
+            parent_tool_use_id: null,
+            origin: { kind: 'task-notification' },
+            message: {
+              content: `<task-notification><task-id>exact-task</task-id><tool-use-id>background-command</tool-use-id><status>${status}</status></task-notification>`,
+            },
+          }
+        : {
+            type: 'system',
+            subtype: 'task_notification',
+            tool_use_id: 'background-command',
+            task_id: 'exact-task',
+            status,
+          };
+    send(notice);
+    send(notice);
+    const ended = events.flatMap((event) =>
+      event.kind === 'native' && event.event.kind === 'toolEnd' ? [event.event] : [],
+    );
+    assert.equal(ended.length, success === null ? 0 : 1);
+    if (success !== null) {
+      assert.equal(ended[0].success, success);
+      assert.equal(ended[0].generation, 0);
+      assert.equal(ended[0].toolId, 'background-command');
+    }
+    wire.close('finished');
+  },
+);
