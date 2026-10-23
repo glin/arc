@@ -3402,6 +3402,7 @@ export { wholePercent } from './view/tokens.ts';
 type ContextTurn = Pick<Turn, 'contextWindow' | 'model' | 'provider' | 'contextTokens' | 'usage' | 'subagentContext'>;
 
 const SUBAGENT_RESULTS_LABEL = 'Subagent results';
+const SUBAGENT_RESULTS_ESTIMATE_NOTE = 'Estimated from text size.';
 const SUBAGENT_RESULT_LINES = 5;
 
 // A share of context in whole percent at 10% or more, and with one decimal below it.
@@ -3432,7 +3433,6 @@ function subagentContextEntry(figure: SubagentContextFigure | undefined, context
       ...(rest.length ? [`${rest.length} more: ${part(restTokens)}`] : []),
       ...(figure.removed ? ['The latest compaction removed earlier results.'] : []),
       ...(figure.partial ? ['Part of the session record was not read.'] : []),
-      'Estimated from text size.',
     ],
   };
 }
@@ -3485,6 +3485,9 @@ function contextChip(
         : { footer: [`Window size from the model fallback for ${shortModel(turn.model)}.`] }
       : {}),
   };
+  if (subagentEntry) {
+    detailList.notes = [...(detailList.notes ?? []), SUBAGENT_RESULTS_ESTIMATE_NOTE];
+  }
   return {
     kind: 'plain',
     metric: 'context',
@@ -5845,6 +5848,7 @@ function sessionFigureStats(
       detail: flatDetailList({
         ...detailList,
         entries: detailList.entries.filter((entry) => entry.label !== SUBAGENT_RESULTS_LABEL),
+        notes: detailList.notes?.filter((note) => note !== SUBAGENT_RESULTS_ESTIMATE_NOTE),
       }).join('\n'),
       detailList,
     });

@@ -11480,12 +11480,37 @@ test('the context chip shows the subagent results in context at the end of each 
       'Fix the stale cache key in the usage reducer: 4k tokens (3.2%)',
       'Review the parser: 1k tokens (0.8%)',
       'Find the fixtures: 800 tokens (0.7%)',
-      'Estimated from text size.',
     ],
   });
 
   const none = toCard(turn({ contextTokens: 120_000, contextWindow: 200_000 }), false, Date.now());
   assert.equal(subagentResultsEntry(none.chips).entry, undefined, 'a session without subagents shows no entry');
+  for (const context of [
+    { contextWindow: 200_000 },
+    { contextWindow: null, model: 'claude-sonnet-5' },
+    { contextWindow: null, model: 'unknown' },
+    { contextWindow: 100_000 },
+    { contextWindow: 200_000, contextTokens: 0 },
+  ]) {
+    for (const subagentContext of [undefined, { tokens: 12_400, partial: false, removed: false, agents: lines }]) {
+      const chips = toCard(turn({ contextTokens: 120_000, ...context, subagentContext }), false, Date.now()).chips;
+      const list = chips.find((chip) => chip.metric === 'context')?.detailList;
+      const { entry } = subagentResultsEntry(chips);
+      assert.equal(!!list?.notes?.includes('Estimated from text size.'), !!entry);
+      if (list) {
+        const recorded = context.contextWindow === 200_000;
+        const notes = [
+          ...(recorded ? ['Recorded context window size.'] : []),
+          ...(entry ? ['Estimated from text size.'] : []),
+        ];
+        assert.deepEqual(list.notes, notes.length ? notes : undefined);
+        assert.deepEqual(
+          list.footer,
+          context.model === 'claude-sonnet-5' ? ['Window size from the model fallback for sonnet-5.'] : undefined,
+        );
+      }
+    }
+  }
 });
 
 test('the subagent results entry caps its lines, marks a partial figure and reports a compaction', () => {
@@ -11512,7 +11537,6 @@ test('the subagent results entry caps its lines, marks a partial figure and repo
     'Subagent 5: 2k tokens (1.3%)',
     '7 more: 8k tokens (7%)',
     'Part of the session record was not read.',
-    'Estimated from text size.',
   ]);
 
   const compacted = toCard(
@@ -11527,7 +11551,6 @@ test('the subagent results entry caps its lines, marks a partial figure and repo
   assert.deepEqual(subagentResultsEntry(compacted.chips).entry?.value, '0% (0)');
   assert.deepEqual(subagentResultsEntry(compacted.chips).entry?.lines, [
     'The latest compaction removed earlier results.',
-    'Estimated from text size.',
   ]);
 });
 
@@ -11547,7 +11570,8 @@ test('the session heading context chip shows the current subagent results last',
   const { entries, entry } = subagentResultsEntry(chips);
   assert.equal(entries.at(-1), entry, 'the entry stays after the latest compaction');
   assert.equal(entry?.value, '5% (4k)', 'the share is of the current context');
-  assert.deepEqual(entry?.lines, ['Reviewer: 4k tokens (5%)', 'Estimated from text size.']);
+  assert.deepEqual(entry?.lines, ['Reviewer: 4k tokens (5%)']);
+  assert.equal(chips.find((chip) => chip.metric === 'context')?.detailList?.notes?.at(-1), 'Estimated from text size.');
 
   const after = sessionStats([newest], [compaction({ at: 5000, contextAfter: 20_000 })]);
   assert.equal(subagentResultsEntry(after).entry?.value, '0% (0)', 'a later compaction removed the results');
@@ -11581,7 +11605,7 @@ test('the session heading keeps the subagent results a later compaction retained
   const chips = sessionStats([newest], [compaction({ at: 5000, contextAfter: 20_000, subagentContext: kept })]);
   const { entry } = subagentResultsEntry(chips);
   assert.equal(entry?.value, '0.1% (27)');
-  assert.deepEqual(entry?.lines, ['Reviewer: 27 tokens (0.1%)', 'Estimated from text size.']);
+  assert.deepEqual(entry?.lines, ['Reviewer: 27 tokens (0.1%)']);
 });
 
 test('the session list hover text leaves out the subagent results', () => {
@@ -11592,4 +11616,5 @@ test('the session list hover text leaves out the subagent results', () => {
   assert.ok(context?.detail?.includes('Latest recorded context'));
   assert.ok(!context?.detail?.includes('Subagent results'), context?.detail);
   assert.ok(!context?.detail?.includes('Reviewer'), context?.detail);
+  assert.ok(!context?.detail?.includes('Estimated from text size.'), context?.detail);
 });
