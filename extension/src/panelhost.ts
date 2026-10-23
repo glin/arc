@@ -1298,6 +1298,7 @@ export class PanelProvider implements vscode.Disposable {
   } | null = null;
   // The editor tab that the open command reveals on subsequent presses.
   private editorPanel: vscode.WebviewPanel | null = null;
+  private readonly editorIconPaths: { light: vscode.Uri; dark: vscode.Uri };
   // The tab's adoption origin. Revealing the tab preserves this value.
   private editorPanelOrigin: PanelOrigin | null = null;
   // The column used by the last beside-opened diff. `besideColumn` checks whether it remains usable.
@@ -3133,6 +3134,10 @@ export class PanelProvider implements vscode.Disposable {
     private readonly health?: HostHealth,
     private readonly legacyDerivedCacheFile?: string,
   ) {
+    this.editorIconPaths = {
+      light: vscode.Uri.joinPath(this.extensionUri, 'icons', 'agent-light.svg'),
+      dark: vscode.Uri.joinPath(this.extensionUri, 'icons', 'agent-dark.svg'),
+    };
     this.performanceOutput = performanceOutput ?? null;
     this.responseRates = savedResponseRates(this.memento?.get(STORED_STATE_KEYS.responseRates));
     this.repositoryScope = this.createRepositoryScope(nodeGitRunner());
@@ -3702,6 +3707,7 @@ export class PanelProvider implements vscode.Disposable {
 
   // Adopt a created or restored editor tab and log its source for startup diagnostics.
   adoptPanel(panel: vscode.WebviewPanel, origin: PanelOrigin): void {
+    panel.iconPath = this.editorIconPaths;
     if (this.editorPanel && this.editorPanel !== panel) {
       const previous = this.editorPanel;
       const previousHost = this.hosts?.find((host) => host.webview === previous.webview);

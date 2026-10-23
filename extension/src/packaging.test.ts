@@ -182,6 +182,10 @@ test('the extension package contains exactly the intended files', () => {
     packaged,
     [
       'LICENSE',
+      'icons/LICENSE',
+      'icons/README.md',
+      'icons/agent-dark.svg',
+      'icons/agent-light.svg',
       'dist/build-identity.json',
       'dist/extension.js',
       'dist/cli.cjs',
