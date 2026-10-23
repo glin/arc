@@ -1,7 +1,7 @@
 import { test, vi } from 'vitest';
 import assert from 'node:assert';
 import { createHash } from 'node:crypto';
-import { CompactRequests, type CompactBinding } from './compactrequest.ts';
+import { CompactRequests, compactCommandPayload, type CompactBinding } from './compactrequest.ts';
 import {
   CodexWire,
   SandboxMode,
@@ -232,6 +232,81 @@ test('Codex foreground shell evidence admits self-compaction only while the exac
     h.wire.close('finished');
   }
 });
+
+test.each([false, true])(
+  'Codex POSIX foreground commands reach self-compaction readiness with continuation=%s',
+  async (continuation) => {
+    const window = 'b'.repeat(24);
+    const text = 'Continue the assigned work.';
+    const sha256 = createHash('sha256').update(text).digest('hex');
+    const payload = {
+      requestId: `${window}:bbbbbbbb-1111-2222-3333-444444444444`,
+      window,
+      self: true as const,
+      afterTurn: true as const,
+    };
+    const binding: CompactBinding = {
+      activation: window,
+      provider: 'codex',
+      sessionId: THREAD,
+      childGeneration: 1,
+      turn: TURN,
+      submissionId: 'reader',
+      readerRevision: 1,
+    };
+    const platform = Object.getOwnPropertyDescriptor(process, 'platform')!;
+    try {
+      Object.defineProperty(process, 'platform', { value: 'linux' });
+      const expected = continuation ? { ...payload, continuation: { text, sha256 } } : payload;
+      const literal = `arc compact request --self --after-turn${continuation ? ` --continuation-file '/tmp/arc notes (draft)/resume.txt' --continuation-sha256 ${sha256}` : ''} --request-id ${payload.requestId} --window ${window} --json`;
+      const command = continuation ? `/bin/sh -c "${literal}"` : `/bin/sh -c '${literal}'`;
+      const h = harness();
+      try {
+        const starting = h.wire.startThread({ cwd: '/tmp/work' });
+        reply(h, { thread: { id: THREAD } });
+        await starting;
+        const book = new CompactRequests(window);
+        h.wire.receive(
+          JSON.stringify({
+            method: 'item/started',
+            params: {
+              threadId: THREAD,
+              turnId: TURN,
+              item: {
+                type: 'commandExecution',
+                id: 'posix-command',
+                command,
+                source: 'unifiedExecStartup',
+                processId: '35702',
+                status: 'inProgress',
+              },
+            },
+          }),
+        );
+        const native = h.events.flatMap((event) => (event.kind === 'native' ? [event.event] : []));
+        assert.equal(native.length, 1);
+        for (const event of native) book.observe(binding, event);
+        assert.deepEqual(
+          {
+            foreground: native[0].kind === 'toolStart' && native[0].foreground,
+            payload: compactCommandPayload(command),
+            readiness: book.readiness(expected),
+          },
+          {
+            foreground: true,
+            payload: continuation ? { ...payload, continuation: { sha256 } } : payload,
+            readiness: { ready: true },
+          },
+          command,
+        );
+      } finally {
+        h.wire.close('finished');
+      }
+    } finally {
+      Object.defineProperty(process, 'platform', platform);
+    }
+  },
+);
 
 test('Codex native evidence requires exact thread fields and separates command exit, compaction acceptance and completion', async () => {
   const h = harness();

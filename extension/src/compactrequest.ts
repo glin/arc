@@ -166,9 +166,13 @@ export function validCompactPayload(input: unknown): input is CompactPayload {
 const POWERSHELL_WRAPPER =
   /^(?:"(?:[A-Za-z]:[A-Za-z0-9 _.()\\-]*\\)?(?:powershell|pwsh)\.exe"|(?:powershell|pwsh)\.exe)(?: -NoProfile)? -Command (?:"([^"\r\n]*)"|'([^'\r\n]*)')$/;
 
+// Codex quotes one /bin/sh script. The inner grammar excludes expansion and escape characters.
+const POSIX_WRAPPER = /^\/bin\/sh -c (?:"([^"\r\n]*)"|'([^'\r\n]*)')$/;
+
 // Exact literal commands exclude shell composition and inherited selectors.
 export function compactCommandPayload(command: string): CompactCommand | null {
-  const wrapped = POWERSHELL_WRAPPER.exec(command);
+  if (/[\r\n\u2028\u2029]/.test(command)) return null;
+  const wrapped = POWERSHELL_WRAPPER.exec(command) ?? POSIX_WRAPPER.exec(command);
   const literal = wrapped ? (wrapped[1] ?? wrapped[2]) : command;
   const match =
     /^arc compact request --self --after-turn(?: --continuation-file '([^'\r\n]+)' --continuation-sha256 ([a-f0-9]{64}))? --request-id ([a-f0-9]{24}:[a-f0-9-]{36}) --window ([a-f0-9]{24}) --json$/.exec(

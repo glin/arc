@@ -434,9 +434,76 @@ test('self compaction admits only exact literal POSIX or Windows foreground comm
     assert.equal(compactCommandPayload(literal), null, literal);
 });
 
-// Catches a refused Windows Codex request. The Codex app-server reports these exact command strings for a bare
-// literal with no single quote: the path keeps doubled backslashes, the script sits in single quotes, and
-// `-NoProfile` sometimes precedes `-Command`.
+test('self compaction admits one literal POSIX script and rejects shell composition at either layer', () => {
+  const file = `${process.platform === 'win32' ? 'C:' : ''}/tmp/arc notes (draft)/resume.txt`;
+  const sha256 = 'a'.repeat(64);
+  const continuation = compactLiteral.replace(
+    '--after-turn',
+    `--after-turn --continuation-file '${file}' --continuation-sha256 ${sha256}`,
+  );
+  const quoted = `/bin/sh -c '${compactLiteral}'`;
+  for (const command of [quoted, `/bin/sh -c "${compactLiteral}"`])
+    assert.deepEqual(compactCommandPayload(command), compactPayload, command);
+  assert.deepEqual(compactCommandPayload(`/bin/sh -c "${continuation}"`), {
+    ...compactPayload,
+    continuation: { sha256 },
+  });
+  for (const suffix of [
+    '; true',
+    ' && true',
+    ' || true',
+    ' &',
+    ' | cat',
+    ' > result',
+    ' < input',
+    ' 2> error',
+    ' extra',
+  ]) {
+    assert.equal(compactCommandPayload(quoted + suffix), null, suffix);
+    for (const quote of ["'", '"']) {
+      const command = `/bin/sh -c ${quote}${compactLiteral}${suffix}${quote}`;
+      assert.equal(compactCommandPayload(command), null, command);
+    }
+  }
+  for (const command of [
+    `/bin/sh -c ${compactLiteral}`,
+    `/bin/sh -c '${compactLiteral}"`,
+    `/bin/sh -c '${compactLiteral}`,
+    `/bin/sh -c "${compactLiteral}'`,
+    `/bin/sh -c '${compactLiteral}' ''`,
+    `/bin/sh -c '${compactLiteral}' -x`,
+    `/bin/sh -lc '${compactLiteral}'`,
+    `/bin/sh -c -e '${compactLiteral}'`,
+    `/bin/sh  -c '${compactLiteral}'`,
+    `/bin/sh -c "$(echo ${compactLiteral})"`,
+    '/bin/sh -c "`' + compactLiteral + '`"',
+    `/bin/sh -c "${compactLiteral.replace(compactWindow, '$ARC_WINDOW')}"`,
+    `/bin/sh -c "${compactLiteral.replace('--json', '--json --quiet')}"`,
+    `/bin/sh -c '${continuation}'`,
+    `/bin/sh -c "${continuation.replace(file, file + '$HOME')}"`,
+    `/bin/sh -c "${continuation.replace(file, file + String.fromCharCode(92) + 'x')}"`,
+    `/bin/sh -c "${quoted}"`,
+    `powershell.exe -Command "${quoted}"`,
+    `/bin/sh -c "powershell.exe -Command '${compactLiteral}'"`,
+    `/bin/sh -c 'arc'" compact request"' --self --after-turn'`,
+  ])
+    assert.equal(compactCommandPayload(command), null, command);
+  for (const shell of ['sh', '/bin/bash', '/bin/zsh', '/bin/fish', '/usr/bin/sh'])
+    assert.equal(compactCommandPayload(`${shell} -c '${compactLiteral}'`), null, shell);
+  for (const ending of ['\n', '\r', '\r\n', '\u2028', '\u2029'])
+    for (const command of [
+      compactLiteral,
+      quoted,
+      `/bin/sh -c "${continuation}"`,
+      `powershell.exe -Command '${compactLiteral}'`,
+    ]) {
+      assert.equal(compactCommandPayload(command + ending), null, JSON.stringify(command + ending));
+      assert.equal(compactCommandPayload(`/bin/sh -c '${compactLiteral}${ending}'`), null);
+    }
+});
+
+// Codex reports doubled backslashes in the executable path and either outer quote form.
+// `-NoProfile` optionally precedes `-Command`.
 test('self compaction admits the PowerShell wrappers Codex reports and nothing composed around them', () => {
   const executable = String.raw`"C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"`;
   for (const command of [
@@ -1423,7 +1490,16 @@ test('host compaction in a turn Claude starts by itself binds only through the n
       host.submitted(child, 8);
       host.read(child, 8);
     }
-    host.native(child, claude('toolStart', { foreground: name !== 'background request' }), 9);
+    host.native(
+      child,
+      claude('toolStart', {
+        foreground: name !== 'background request',
+        command: ['launch without a notice', 'reader acted after the notice', 'background request'].includes(name)
+          ? `/bin/sh -c '${compactLiteral}'`
+          : compactLiteral,
+      }),
+      9,
+    );
     assert.equal(code(host), expected, name);
   }
   // A bound turn's ending fails when its origin names no waiting notice of its submission, or when
