@@ -212,6 +212,8 @@ A file the snapshot manifest lists opens the current-file diff when the live fil
 
 Snapshot and transcript paths pass through the shared normalization rule before comparison. Scratch roots are also defined on the hook side and reader side. The shared fixture keeps their path handling aligned.
 
+A file row whose live file is missing opens the recorded change for that path in its turn. The editor title says `recorded turn changes` and identifies hunk-only content. Missing or ambiguous recorded diffs produce an unavailable-file message. Dispatched rows identify a session without a specific turn, so they cannot supply this fallback. Arc never substitutes another checkout's current file.
+
 ## Cost and context
 
 Usage is grouped by provider and model before pricing. Claude usage repeats on each content block for the same response, so the reader counts a response once. Codex input usage includes cache reads and cache writes. The reader splits all three categories before they reach the shared estimator. `Cached input reads` means input tokens served from the provider's prompt cache and priced at the cache-read rate. [`agent-cost-guide.md`](agent-cost-guide.md) owns the reasoning.

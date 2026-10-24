@@ -12,6 +12,8 @@ import { createSavedState } from './webview/state.ts';
 import type { QueuedSubmission, TurnComment } from './turnview.ts';
 import { resolveResponseSession, pendingResponseSessionAdmitted, sessionLinkContext } from './domain/session-link';
 import { nativeCitationPath } from './domain/file-citation';
+import { recordedFileSides } from './patchview';
+import { fileDiffersOnDisk } from './store';
 
 test('native Copy Path and Copy Relative Path retain citation filename suffixes', async () => {
   const { linkTarget, resolveLink, relativePath, nativePath } = await import('./transcript.js');
@@ -1993,6 +1995,7 @@ import {
   revalidatedCatalog,
   revalidatedCatalogPaths,
   shortenTo,
+  type EditRecord,
 } from './transcript.ts';
 import {
   codexSessionIndexPath,
@@ -16039,7 +16042,9 @@ test('dispatched file presses open the child snapshot, including a path the pare
     `async function lifted(msg, cardFor, vscode, path, baselineUri) {${handlerBody(panelHostSource, 'openFile')}}`,
     { loader: 'ts' },
   ).code;
-  const run = new Function(`${lifted}; return lifted;`)() as (this: unknown, ...args: unknown[]) => Promise<void>;
+  const run = new Function('fs', `${lifted}; return lifted;`)({
+    statSync: () => ({ isFile: () => true }),
+  }) as (this: unknown, ...args: unknown[]) => Promise<void>;
   for (const file of [only, shared]) {
     await run.call(
       provider,
@@ -16067,6 +16072,128 @@ test('dispatched file presses open the child snapshot, including a path the pare
     baselineUri,
   );
   assert.equal(calls.length, before);
+});
+
+test('a file press retains the recorded change after its worktree directory is removed', async () => {
+  const root = tempDir('removed-file-worktree-');
+  const worktree = path.join(root, 'worktree');
+  fs.mkdirSync(worktree);
+  const file = path.join(worktree, 'CLAUDE.md');
+  const current = path.join(root, 'CLAUDE.md');
+  const snapshot = path.join(root, 'baseline');
+  fs.writeFileSync(snapshot, 'before\n');
+  fs.writeFileSync(file, 'after\n');
+  fs.writeFileSync(current, 'unrelated current checkout\n');
+  const entry = { path: file, snapshot, isNew: false };
+  const edit: EditRecord = {
+    originalFile: 'before\n',
+    content: 'after\n',
+    isCreate: false,
+    hunks: [{ oldStart: 1, oldLines: 1, newStart: 1, newLines: 1, lines: ['-before', '+after'] }],
+  };
+  const files = [{ path: file, added: 1, removed: 1, isNew: false, edits: [edit] }];
+  const card = { key: 'session:1', kind: 'turn', dispatched: [{ sessionId: 'child', files: [{ path: file }] }] };
+  const calls: unknown[][] = [];
+  const notices: string[] = [];
+  const texts = new Map<string, string>();
+  let accessError = false;
+  const provider = {
+    column: () => 7,
+    turnsByKey: new Map([[card.key, { files }]]),
+    pendingEntry: () => (fileDiffersOnDisk(entry) ? entry : null),
+    sideUri: (target: string, side: string, text: string) => `recorded:${target}?${side}=${encodeURIComponent(text)}`,
+    keepSides: (sides: { key: string; text: string }[]) => sides.forEach(({ key, text }) => texts.set(key, text)),
+  };
+  const vscode = {
+    ViewColumn: { Beside: 99 },
+    Uri: { file: (target: string) => `file:${target}` },
+    commands: {
+      executeCommand: async (...args: unknown[]) => {
+        calls.push(args);
+      },
+    },
+    window: {
+      showInformationMessage: (notice: string) => {
+        notices.push(notice);
+      },
+    },
+  };
+  const compiled = esbuild.transformSync(`async function lifted(msg) {${handlerBody(panelHostSource, 'openFile')}}`, {
+    loader: 'ts',
+  }).code;
+  const run = new Function(
+    'cardFor',
+    'vscode',
+    'fs',
+    'path',
+    'baselineUri',
+    'recordedFileSides',
+    `${compiled}; return lifted;`,
+  )(
+    () => ({ card, sessionId: 'session' }),
+    vscode,
+    {
+      statSync: (target: string) => {
+        if (accessError) throw Object.assign(new Error('access refused'), { code: 'EACCES' });
+        return fs.statSync(target);
+      },
+    },
+    path,
+    () => 'baseline',
+    recordedFileSides,
+  ) as (this: unknown, msg: unknown) => Promise<void>;
+  const press = (extra = {}) => run.call(provider, { key: card.key, path: file, ...extra });
+
+  fs.writeFileSync(file, 'before\n');
+  await press();
+  assert.deepEqual(calls.pop(), ['vscode.open', `file:${file}`, { viewColumn: 7 }]);
+  fs.writeFileSync(file, 'after\n');
+  await press();
+  assert.deepEqual(calls.pop(), [
+    'vscode.diff',
+    'baseline',
+    `file:${file}`,
+    'CLAUDE.md',
+    { viewColumn: 7, preserveFocus: false },
+  ]);
+  fs.unlinkSync(file);
+  fs.rmdirSync(worktree);
+  assert.equal(fs.existsSync(worktree), false);
+  await press({ beside: true });
+  const opened = calls.pop()!;
+  assert.equal(opened[0], 'vscode.diff');
+  assert.equal(texts.get(String(opened[1])), 'before\n');
+  assert.equal(texts.get(String(opened[2])), 'after\n');
+  assert.equal(opened[3], 'CLAUDE.md - recorded turn changes');
+  assert.deepEqual(opened[4], { viewColumn: 99, preserveFocus: false });
+  assert.equal(notices.length, 0);
+
+  edit.originalFile = null;
+  edit.content = null;
+  await press();
+  const partial = calls.pop()!;
+  assert.equal(partial[3], 'CLAUDE.md - recorded turn changes (hunks only)');
+  assert.equal(texts.get(String(partial[1])), '@@ -1,1 +1,1 @@\nbefore');
+  assert.equal(texts.get(String(partial[2])), '@@ -1,1 +1,1 @@\nafter');
+
+  for (const rejected of [
+    { files: [], extra: {} },
+    { files: [{ ...files[0], path: current }], extra: {} },
+    { files: [files[0], { ...files[0] }], extra: {} },
+    { files: [{ ...files[0], edits: [] }], extra: {} },
+    { files, extra: { sourceSessionId: 'child' } },
+  ]) {
+    provider.turnsByKey.set(card.key, { files: rejected.files });
+    await press(rejected.extra);
+    assert.equal(calls.length, 0, 'an unavailable or ambiguous change opened another file');
+    assert.ok(notices.pop()?.includes(file));
+  }
+  assert.equal(fs.readFileSync(current, 'utf8'), 'unrelated current checkout\n');
+  assert.equal(fs.readFileSync(snapshot, 'utf8'), 'before\n');
+  accessError = true;
+  await press();
+  assert.equal(calls.length, 0, 'an access error must not substitute a recorded change');
+  assert.ok(notices.pop()?.includes('access refused'));
 });
 
 test('the page fixture carries every skill row a picture has to show', () => {
