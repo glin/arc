@@ -108,6 +108,9 @@ export function emptyCodexRollout(error: unknown, sessionId: string): boolean {
   );
 }
 
+// Name states in which Arc cannot confirm that the agent holds the requested name.
+export const NAME_STATES_WITHOUT_NAME: readonly InitialSessionName['state'][] = ['failed', 'uncertain', 'cancelled'];
+
 export interface InitialSessionName {
   provider: 'codex';
   session: string;

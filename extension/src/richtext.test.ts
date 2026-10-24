@@ -1,7 +1,7 @@
 import { test, vi } from 'vitest';
 import assert from 'node:assert';
 import * as path from 'path';
-import { formatSessionLink, parseSessionLink } from './domain/session-link';
+import { formatNamedSessionLink, formatSessionLabel, formatSessionLink, parseSessionLink } from './domain/session-link';
 import { citationScanner, nativeCitationPath } from './domain/file-citation';
 import { marked } from 'marked';
 
@@ -421,6 +421,33 @@ test('malformed citation scanning shares a four-code-unit allowance across retri
   assert.doesNotMatch(renderRichMarkdown(source), /data-link-kind/);
   const many = Array.from({ length: 300 }, (_, index) => citation(citationPath(`${index}.csv`))).join(' ');
   assert.equal((renderRichMarkdown(many).match(/data-link-kind/g) || []).length, 300);
+});
+
+test('session link formatters encode every character the reporting contract names and escape labels', () => {
+  assert.equal(formatSessionLink('literal%2f'), 'arc-session:literal%252f');
+  assert.equal(formatSessionLink('a-b_c.d~e'), 'arc-session:a-b_c.d~e');
+  for (const [char, encoded] of [
+    ['!', '%21'],
+    ["'", '%27'],
+    ['(', '%28'],
+    [')', '%29'],
+    ['*', '%2A'],
+  ]) {
+    const href = formatSessionLink(`a${char}b`)!;
+    assert.equal(href, `arc-session:a${encoded}b`);
+    assert.deepEqual(parseSessionLink(href), { kind: 'session', session: `a${char}b` });
+    // The unencoded form still resolves.
+    assert.deepEqual(parseSessionLink(`arc-session:a${char}b`), { kind: 'session', session: `a${char}b` });
+  }
+  assert.deepEqual(parseSessionLink("arc-session:a!b'c(d)e*f"), { kind: 'session', session: "a!b'c(d)e*f" });
+  assert.equal(formatSessionLabel('Plan **[draft](notes)**'), String.raw`Plan \*\*\[draft\]\(notes\)\*\*`);
+  assert.equal(formatSessionLabel('é 日本 plain 123'), 'é 日本 plain 123');
+  assert.equal(formatSessionLabel(String.fromCharCode(92)), String.fromCharCode(92, 92));
+  for (const name of ['', 'two\nlines', 'a\rb', 'tab\there', 'nul\u0000', 'del\u007f', 'next\u0085line', 'sep\u2028x'])
+    assert.equal(formatSessionLabel(name), null);
+  assert.equal(formatNamedSessionLink('Name', 'id-1'), '[Name](arc-session:id-1)');
+  assert.equal(formatNamedSessionLink('Name', 'bad/id'), null);
+  assert.equal(formatNamedSessionLink('two\nlines', 'id-1'), null);
 });
 
 test('named session links decode once, reject malformed destinations, and keep exports inert', () => {

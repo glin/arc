@@ -1,8 +1,8 @@
 {
   "cli/test/manage.test.ts": {
     "reason": "CLI management must preserve classification, validation, and read delivery through a real authenticated window channel.",
-    "cases": 14,
-    "matricesSha256": "c328a1149f1d972f2857fd832edd54c89ada6740d716a3177b14ab484b026ebc"
+    "cases": 15,
+    "matricesSha256": "6ef3df980cf57dc7abf0fc39ac4a35e005dd7e7fff10940fa2b2cd066a9d90fa"
   },
   "cli/test/run.test.ts": {
     "reason": "Standalone workers must retain real output, exit, cancellation, receipt ownership, and recovery across process boundaries.",

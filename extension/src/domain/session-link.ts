@@ -19,13 +19,31 @@ export function parseSessionLink(href: string): SessionLink {
   }
 }
 
+// Percent-encodes every character outside ASCII letters, digits, hyphen, underscore, period, and tilde.
 export function formatSessionLink(session: string): string | null {
   if (!validTarget(session)) return null;
   try {
-    return ARC_IDENTITY.sessionScheme + encodeURIComponent(session);
+    const encoded = encodeURIComponent(session).replace(
+      /[!'()*]/g,
+      (char) => '%' + char.charCodeAt(0).toString(16).toUpperCase(),
+    );
+    return ARC_IDENTITY.sessionScheme + encoded;
   } catch {
     return null;
   }
+}
+
+// Backslash-escapes every ASCII punctuation character so the label displays the name as written.
+// A name that is empty or holds a line break or control character has no one-line label.
+export function formatSessionLabel(name: string): string | null {
+  if (!name || /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/u.test(name)) return null;
+  return name.replace(/[!-/:-@[-`{-~]/g, '\\$&');
+}
+
+export function formatNamedSessionLink(name: string, session: string): string | null {
+  const label = formatSessionLabel(name);
+  const target = formatSessionLink(session);
+  return label === null || target === null ? null : `[${label}](${target})`;
 }
 
 export function sessionLinkContext(link: string) {

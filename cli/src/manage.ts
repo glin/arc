@@ -5,6 +5,9 @@ import { launchPolicy } from '../../extension/src/launchpolicy.ts';
 import type { SetupListing } from '../../extension/src/view/launcher.ts';
 import * as fs from 'node:fs';
 import { requestWindow, requesterIdentity } from '../../extension/src/sessionrequests.ts';
+import { ARC_IDENTITY } from '../../extension/src/domain/identity.ts';
+import { formatNamedSessionLink } from '../../extension/src/domain/session-link.ts';
+import { NAME_STATES_WITHOUT_NAME, sessionRenameTitle } from '../../extension/src/sessionrename.ts';
 import {
   SESSION_OBSERVATION,
   READ_OBSERVATION,
@@ -34,6 +37,25 @@ export function readPromptFile(file: string): string {
   } finally {
     fs.closeSync(fd);
   }
+}
+
+// The link names the session by its requested name. It is null unless all of these hold.
+// The selected window is the invoking window, which ARC_WINDOW in this process establishes.
+// The name shows visible text on one line.
+// The name state is not failed, uncertain, or cancelled, and carries no error.
+// The session ID is a valid link target.
+function startLink(
+  sessionId: string,
+  metadata: { name?: { state?: string; error?: unknown } } | undefined,
+  name: string | undefined,
+  window: string | undefined,
+): string | null {
+  const invoking = process.env[`${ARC_IDENTITY.environmentPrefix}WINDOW`];
+  const selected = window === undefined ? invoking : window;
+  if (!invoking || selected !== invoking || name === undefined || sessionRenameTitle(name) === null) return null;
+  const state = metadata?.name;
+  if (state && (NAME_STATES_WITHOUT_NAME.some((blocked) => blocked === state.state) || state.error)) return null;
+  return formatNamedSessionLink(name, sessionId);
 }
 
 export function readContinuationFile(file: string, sha256: string): { text: string; sha256: string } {
@@ -307,9 +329,14 @@ export async function runManagement(command: string, args: string[]): Promise<st
       sessionId?: string;
       provider?: string;
       launchId?: string;
+      metadata?: { name?: { state?: string; error?: unknown } };
     };
-    const json = JSON.stringify(result);
-    if (!guarded || !result.sessionId || !result.status.startsWith('accepted')) return json;
+    const sessionId = result.sessionId;
+    const accepted = !!sessionId && result.status.startsWith('accepted');
+    const json = JSON.stringify(
+      accepted ? { ...result, link: startLink(sessionId, result.metadata, options.get('--name'), window) } : result,
+    );
+    if (!guarded || !accepted) return json;
 
     return `${json}\nARC_DISPATCH_SESSION=${JSON.stringify({ agent: result.provider, session_id: result.sessionId, ...(options.has('--name') ? { name: options.get('--name') } : {}), ...(params.agentRun ? {} : { owned: true }) })}`;
   }

@@ -559,6 +559,7 @@ import { SessionNames, sessionLabelOf, storedSessionName, transcriptIdentity, ty
 import {
   answerSessionRename,
   InitialNameOperation,
+  NAME_STATES_WITHOUT_NAME,
   restoreInitialSessionNames,
   sessionRenameTitle,
   type InitialSessionName,
@@ -2594,7 +2595,7 @@ export class PanelProvider implements vscode.Disposable {
         state: stored.state,
         ...(stored.error ? { error: stored.error } : {}),
       };
-      if (['failed', 'uncertain', 'cancelled'].includes(stored.state) && !errors.length)
+      if (NAME_STATES_WITHOUT_NAME.includes(stored.state) && !errors.length)
         errors.push(stored.error ?? 'The initial session name was not saved.');
     }
     void this.post({ type: 'labelsChanged', session });

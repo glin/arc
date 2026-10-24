@@ -526,6 +526,7 @@ export const COMMANDS: readonly Command[] = [
       ],
       output: [
         'JSON includes status, requestId, and accepted sessionId. Save launchId for dispatch retrieval. Metadata reports saved labels, pin state, and pending or completed naming.',
+        'An accepted start with a session ID also includes link, a Markdown session link labeled with the requested name, or null. The link is null unless four things hold. The selected window is ARC_WINDOW. The name shows visible text on one line. The name state is not failed, uncertain, or cancelled, and carries no error. The session ID is a valid link target.',
         'Host status is accepted, accepted-with-errors, or refused. Requested settings do not establish observed execution.',
         'Unknown delivery retains requestId, window, and reason. Preserve them without launching a replacement.',
         '--arc-dispatch adds ARC_DISPATCH_SESSION after an accepted result with a session ID. Reader-owned receipts include owned: true.',

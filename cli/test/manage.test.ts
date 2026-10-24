@@ -248,6 +248,176 @@ test('start preserves classification and dispatch ownership for both providers',
   }
 });
 
+test('start returns a session link only for the invoking window with a usable name', async () => {
+  const home = mkdtempSync(join(realpathSync(tmpdir()), 'arc-start-link-'));
+  const prompt = join(home, 'prompt.txt');
+  writeFileSync(prompt, 'Review this project.');
+  const invoking = 'a'.repeat(24);
+  const other = 'c'.repeat(24);
+  const accepted = (name: object | undefined, sessionId = 'saved-id', status = 'accepted') => ({
+    status,
+    provider: 'claude',
+    sessionId,
+    metadata: { name },
+  });
+  const saved = { state: 'saved', requested: 'Review' };
+  const pending = { state: 'pending', requested: 'Review' };
+  const link = '[Review](arc-session:saved-id)';
+  const cases: Array<{
+    title: string;
+    reply: object;
+    link: string | null | undefined;
+    args?: string[];
+    env?: string | null;
+    name?: string | null;
+  }> = [
+    { title: 'ARC_WINDOW without --window', reply: accepted(saved), link },
+    {
+      title: '--window equal to ARC_WINDOW',
+      reply: accepted(saved),
+      args: ['--window', invoking],
+      link,
+    },
+    {
+      title: 'accepted-with-errors',
+      reply: accepted(saved, 'saved-id', 'accepted-with-errors'),
+      link,
+    },
+    { title: 'pending name', reply: accepted(pending), link },
+    {
+      title: '--window naming another window',
+      reply: accepted(saved),
+      args: ['--window', other],
+      link: null,
+    },
+    {
+      title: 'an empty --window',
+      reply: accepted(saved),
+      args: ['--window', ''],
+      link: null,
+    },
+    {
+      title: 'an empty ARC_WINDOW',
+      reply: accepted(saved),
+      env: '',
+      link: null,
+    },
+    {
+      title: 'no ARC_WINDOW',
+      reply: accepted(saved),
+      env: null,
+      link: null,
+    },
+    {
+      title: '--window with no ARC_WINDOW',
+      reply: accepted(saved),
+      env: null,
+      args: ['--window', invoking],
+      link: null,
+    },
+    { title: 'no --name', reply: accepted(undefined), name: null, link: null },
+    {
+      title: 'failed name',
+      reply: accepted({ ...saved, state: 'failed' }),
+      link: null,
+    },
+    {
+      title: 'uncertain name',
+      reply: accepted({ ...saved, state: 'uncertain' }),
+      link: null,
+    },
+    {
+      title: 'cancelled name',
+      reply: accepted({ ...saved, state: 'cancelled' }),
+      link: null,
+    },
+    {
+      title: 'naming error',
+      reply: accepted({ ...saved, error: 'The name was refused.' }),
+      link: null,
+    },
+    {
+      title: 'name with a line break',
+      reply: accepted(saved),
+      name: 'Two\nlines',
+      link: null,
+    },
+    {
+      title: 'name with a control character',
+      reply: accepted(saved),
+      name: 'Bell\u0007',
+      link: null,
+    },
+    { title: 'empty name', reply: accepted(saved), name: '', link: null },
+    { title: 'whitespace-only name', reply: accepted(pending), name: ' ', link: null },
+    { title: 'zero-width-space name', reply: accepted(pending), name: '\u200b', link: null },
+    {
+      title: 'punctuation and Unicode',
+      reply: accepted(saved),
+      name: 'Plan **[draft](notes)** é 日本',
+      link: String.raw`[Plan \*\*\[draft\]\(notes\)\*\* é 日本](arc-session:saved-id)`,
+    },
+    {
+      title: 'an ID with a percent sign',
+      reply: accepted(saved, 'literal%2f'),
+      link: '[Review](arc-session:literal%252f)',
+    },
+    {
+      title: 'an ID with !' + "'" + '()*',
+      reply: accepted(saved, "a!b'c(d)e*f"),
+      link: '[Review](arc-session:a%21b%27c%28d%29e%2Af)',
+    },
+    {
+      title: 'an ID the parser rejects',
+      reply: accepted(saved, 'bad/id'),
+      link: null,
+    },
+    {
+      title: 'a refused start',
+      reply: { status: 'refused', reason: 'No.' },
+      link: undefined,
+    },
+    {
+      title: 'an unknown delivery',
+      reply: { status: 'unknown', requestId: 'r', window: invoking },
+      link: undefined,
+    },
+    {
+      title: 'an accepted start without a session ID',
+      reply: { status: 'accepted' },
+      link: undefined,
+    },
+  ];
+  try {
+    for (const entry of cases) {
+      vi.stubEnv('ARC_WINDOW', entry.env === null ? undefined : (entry.env ?? invoking));
+      vi.stubEnv('CLAUDE_CODE_SESSION_ID', 'coordinator');
+      vi.stubEnv('CODEX_THREAD_ID', '');
+      vi.spyOn(sessionRequests, 'requestWindow').mockResolvedValue(entry.reply);
+      const name = entry.name === undefined ? 'Review' : entry.name;
+      const args = [
+        '--provider',
+        'claude',
+        '--prompt-file',
+        prompt,
+        ...(name === null ? [] : ['--name', name]),
+        ...(entry.args ?? []),
+      ];
+      const output = await runManagement('start', args);
+      const result = JSON.parse(output);
+      assert.equal('link' in result, entry.link !== undefined, entry.title);
+      if (entry.link !== undefined) assert.equal(result.link, entry.link, entry.title);
+      assert.equal(output.includes('\n'), false, entry.title);
+      const tagged = (await runManagement('start', [...args, '--arc-dispatch'])).trim().split('\n');
+      const receiptAt = tagged.findIndex((line) => line.startsWith('ARC_DISPATCH_SESSION='));
+      assert.equal(receiptAt, entry.link === undefined ? -1 : tagged.length - 1, entry.title);
+      assert.equal(JSON.parse(tagged[0]).link, entry.link, entry.title);
+    }
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test('start refuses invalid classification and launch flags before the host receives a request', async () => {
   const fixture = await host();
   try {
