@@ -188,7 +188,7 @@ test.each([
     const virtualHome =
       platform === 'win32' ? (temporary ? 'C:/tmp/ArcHome' : 'C:/ArcHome') : temporary ? '/tmp/ArcHome' : '/ArcHome';
     const virtualRoot = paths.join(virtualHome, 'dispatch');
-    const virtualSource = paths.join(virtualHome, 'native.jsonl');
+    const virtualSource = paths.join(virtualHome, platform === 'win32' && mixed ? 'NATIVE.jsonl' : 'native.jsonl');
     const receiptFile = path.join(fx.receipts.root, fx.launch.launchId, 'receipt.json');
     const receipt = JSON.parse(fs.readFileSync(receiptFile, 'utf8'));
     receipt.standalone.cwd = virtualHome;
@@ -207,16 +207,25 @@ test.each([
     fs.writeFileSync(witnessFile, JSON.stringify(witness));
     const catalog = [
       { ...fx.catalog[0], file: paths.join(virtualHome, 'parent.jsonl') },
-      { ...fx.catalog[1], file: paths.join(virtualHome, mixed ? 'NATIVE.jsonl' : 'native.jsonl') },
+      {
+        ...fx.catalog[1],
+        file: paths.join(virtualHome, mixed && platform !== 'win32' ? 'NATIVE.jsonl' : 'native.jsonl'),
+      },
     ];
     const unmapped: string[] = [];
+    const physicalTargets: string[] = [];
+    const sourceOpens: string[] = [];
+    const logicalSourceOpens: string[] = [];
     const translate = (file: fs.PathLike) => {
       const value = String(file);
-      if (paths.resolve(value) === paths.parse(paths.resolve(virtualHome)).root) return path.parse(fx.home).root;
+      if (paths.resolve(value) === paths.parse(paths.resolve(virtualHome)).root) return path.dirname(fx.home);
       const relative = paths.relative(virtualHome, value);
       if (relative.startsWith('..') || paths.isAbsolute(relative)) unmapped.push(value);
       assert.ok(relative === '' || (!relative.startsWith('..') && !paths.isAbsolute(relative)), value);
-      return path.join(fx.home, ...relative.split(paths.sep));
+      return path.join(
+        fx.home,
+        ...relative.split(paths.sep).map((part) => (platform === 'win32' ? part.toLowerCase() : part)),
+      );
     };
     const stat = fs.lstatSync;
     const open = fs.openSync;
@@ -226,16 +235,30 @@ test.each([
     vi.spyOn(os, 'homedir').mockReturnValue(platform === 'win32' ? 'C:/Reader' : '/reader');
     vi.spyOn(os, 'tmpdir').mockReturnValue(platform === 'win32' ? 'C:/ConfiguredTemp' : '/configured/temp');
     vi.spyOn(fs, 'lstatSync').mockImplementation(((file: fs.PathLike, options: any) => {
+      const target = String(file) === temporaryRoot ? fx.home : translate(file);
+      physicalTargets.push(target);
+      const held = stat(target, options);
       if (String(file) === temporaryRoot) {
         aliasChecks++;
-        const held = stat(fx.home, options);
         return Object.assign(Object.create(Object.getPrototypeOf(held)), held, { isSymbolicLink: () => true });
       }
-      return stat(translate(file), options);
+      return held;
     }) as typeof fs.lstatSync);
-    vi.spyOn(fs, 'openSync').mockImplementation((file, ...args) => open(translate(file), ...args));
-    vi.spyOn(fs, 'opendirSync').mockImplementation(((file: fs.PathLike, options: any) =>
-      openDirectory(translate(file), options)) as typeof fs.opendirSync);
+    vi.spyOn(fs, 'openSync').mockImplementation((file, ...args) => {
+      const target = translate(file);
+      physicalTargets.push(target);
+      const basename = paths.basename(String(file));
+      if ((platform === 'win32' ? basename.toLowerCase() : basename) === 'native.jsonl') {
+        logicalSourceOpens.push(String(file));
+        sourceOpens.push(target);
+      }
+      return open(target, ...args);
+    });
+    vi.spyOn(fs, 'opendirSync').mockImplementation(((file: fs.PathLike, options: any) => {
+      const target = translate(file);
+      physicalTargets.push(target);
+      return openDirectory(target, options);
+    }) as typeof fs.opendirSync);
     vi.spyOn(fs.realpathSync, 'native').mockImplementation((file) => {
       if (String(file) === '/tmp') {
         aliasChecks++;
@@ -248,8 +271,22 @@ test.each([
     assert.equal(receipts.root, virtualRoot);
     const references = drainRelationships(receipts.relationships(catalog), 31);
     assert.deepEqual(unmapped, []);
+    for (const target of physicalTargets) {
+      const relative = path.relative(fx.home, target);
+      assert.ok(
+        target === path.dirname(fx.home) ||
+          relative === '' ||
+          (!relative.startsWith('..') && !path.isAbsolute(relative)),
+        `Receipt fixture accessed an unowned path: ${target}`,
+      );
+    }
     assert.equal(references.length, expected);
-    if (expected) assert.equal(references[0].file, catalog[1].file);
+    if (expected) {
+      assert.equal(references[0].file, catalog[1].file);
+      assert.deepEqual([...new Set(sourceOpens)], [fx.file]);
+    }
+    if (platform === 'win32' && mixed)
+      assert.deepEqual([...new Set(logicalSourceOpens)], [paths.join(virtualHome, 'NATIVE.jsonl')]);
     if (temporary) assert.ok(aliasChecks > 0);
   },
 );

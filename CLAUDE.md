@@ -70,9 +70,13 @@ Never wait a fixed time in a test. Poll for the condition the test needs, and fa
 
 Control clocks and filesystem timestamps in expiry and cache-band tests. Inject operating-system process reads in tests of code that has a deadline. Test the real read separately, without that deadline. Set explicit byte budgets in cancellation and incremental-read tests. Test path rules with mixed-case fixtures and independent Windows, macOS, and Linux expectations.
 
+Tests that simulate platform paths must produce the same results on every host. Map reached paths, including roots and ancestors, into owned fixtures. Apply the case rules the code uses for that platform. Record unmapped paths and check them after the call, including when the code catches filesystem errors.
+
 Add a test to the existing file for its subject and reuse that file's setup and helpers.
 
 Review each changed timing test's trigger, time-dependent fixture setup, and controlled clock or awaited state. Before a test timing change lands, run the test several times on the old commit and on the new commit.
+
+Review changed tests that simulate a platform or pass virtual paths to replaced filesystem, operating-system, or process functions. Check host calls against fixture boundaries, including in cases that expect rejection.
 
 ## Code boundaries
 
