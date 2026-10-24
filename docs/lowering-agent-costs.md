@@ -78,6 +78,31 @@ Claude Code's [prompt-caching guide](https://code.claude.com/docs/en/prompt-cach
 
 See Anthropic's [prompt-caching guide](https://code.claude.com/docs/en/prompt-caching) and OpenAI's [prompt-caching guide](https://developers.openai.com/api/docs/guides/prompt-caching).
 
+## Wait without repeated model requests
+
+Codex's built-in guidance limits blocking waits and asks for frequent commentary. A parent can follow that guidance by repeatedly sleeping while its subagent runs. Each return creates another model request with the retained context.
+
+For Codex's v2 subagents, combine a native timeout floor with additional developer instructions. Put the root setting before table headings in `~/.codex/config.toml`. Merge existing developer text into that setting, because configuration precedence selects one value.
+
+```toml
+# Select native waiting and exempt it from periodic commentary.
+developer_instructions = "When only a native subagent remains active, wait through collaboration.wait_agent using its configured default timeout. Native waits return for subagent completion and messages. Do not use clock.sleep, shell sleeps, background reads, periodic status checks, or commentary-only wakeups to wait for that subagent. This native-wait rule is an exception to the general 60-second blocking-wait and commentary guidance. It does not restrict a child explicitly instructed to sleep. Tell native children to send only their final answer or one blocker."
+
+# Clamp short requests after the model selects the v2 wait tool.
+[features.multi_agent_v2]
+min_wait_timeout_ms = 1500000
+default_wait_timeout_ms = 1500000
+max_wait_timeout_ms = 3600000
+```
+
+The instruction adds guidance without replacing the built-in prompt. It depends on model compliance and reaches descendants. It leaves a child explicitly asked to sleep free to do so. Completion, messages, and steering still end a v2 wait early. The floor controls the requested timeout, not the minimum elapsed wait. It does not reach a parent that chooses a sleep or shell command.
+
+Check a fresh process and session after installation. Confirm that its developer message contains the text and that its parent uses native waiting.
+
+The table configures the v2 protocol only. A v1 session needs its exposed native wait tool and an explicit long timeout within that tool's limits. The exact instruction above names the v2 tool and is not a tested Bedrock v1 recipe. Provider identity alone does not establish the active protocol. Check the effective model catalog. [The versioned v1 handler](https://github.com/openai/codex/blob/rust-v0.163.0/codex-rs/core/src/tools/handlers/multi_agents/wait.rs) uses fixed timeout constants. [The v2 handler](https://github.com/openai/codex/blob/rust-v0.163.0/codex-rs/core/src/tools/handlers/multi_agents_v2/wait.rs) reads the configured floor.
+
+The [configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference) defines the additive instruction setting. [A community experiment](https://github.com/openai/codex/issues/35108#issuecomment-5552457213) reports the same developer-level exception. Check these version-sensitive wait settings after upgrading Codex.
+
 ## Compact or hand off at clear boundaries (split up long tasks)
 
 To `/compact` or hand off?

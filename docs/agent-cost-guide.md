@@ -131,7 +131,7 @@ The warning stays absent until the scope is complete and every required cache-wr
 
 `Waiting on subagents took 55% of this session's cost` means the main session's requests that read a `wait_agent` return cost at least a quarter of the session's estimated total. At least five such requests must cost at least $1 in total. The line names the wait cost against the session total, the number of waits, and how many of them timed out.
 
-A timed-out wait is a request that brought back no news. Lengthen the wait floor as [Lower the cost of waiting on subagents](#lower-the-cost-of-waiting-on-subagents) describes. Tell subagents to send only a final answer or one blocker message. A request after a subagent message or completion also carries the parent's reasoning and reply, so the share overstates pure waiting.
+A timed-out wait is a request that brought back no news. [Lower agent costs](lowering-agent-costs.md#wait-without-repeated-model-requests) explains native wait configuration and its limits. A request after a subagent message or completion also carries the parent's reasoning and reply, so the share overstates pure waiting.
 
 The line stays absent until the main session and the session total are complete and every main-session request has a supported price.
 
@@ -141,16 +141,9 @@ A parent agent pays one model request each time it wakes while a subagent runs. 
 
 Claude Code resumes the parent once, when the subagent completes. The parent makes no request while it waits. A wait longer than the prompt cache lifetime costs one cache write on the next request, which the next-turn starting price shows as the cold price.
 
-Codex has no completion event. The parent calls `wait_agent`, and the call returns when the subagent completes, when it sends a message, or when the call's timeout passes. The Codex model asks for a 60 second timeout on every call, so a silent subagent wakes the parent once a minute. Set a floor in `~/.codex/config.toml` to lengthen the wait. Keep the floor under the model's prompt cache lifetime, so each timeout return stays a cached request:
+Codex native waits return on child completion or timeout. Its v2 wait also returns on child messages. The parent also receives pending results through other tool returns, including timer returns. Repeated short waits or sleeps create extra model requests. [Lower agent costs](lowering-agent-costs.md#wait-without-repeated-model-requests) owns the configuration guidance.
 
-```toml
-[features.multi_agent_v2]
-min_wait_timeout_ms = 1500000
-default_wait_timeout_ms = 1500000
-max_wait_timeout_ms = 3600000
-```
-
-The default must be at least the minimum. The wait still returns at once on completion or on a message, so the floor adds no idle time. Each progress message from a subagent wakes the parent, so tell subagents to send only a final answer or one blocker message. `arc cost <path> --by-tool` shows how much of a session went to requests that read each tool's results. Its `wait` row shows the requests that read `wait_agent`, `wait`, and `write_stdin` returns.
+`arc cost <path> --by-tool` shows requests that read each tool's results. Its `wait` row includes `wait_agent`, `wait`, and `write_stdin` returns. A parent using `clock.sleep` instead requires checking that tool's row too.
 
 ## Arc message delivery
 
