@@ -1441,6 +1441,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     revision: number,
     generation: number,
   ): Promise<boolean> => {
+    if (generation !== mcpSurfaceGeneration || revision !== mcp.revision(owner)) {
+      return false;
+    }
     const plan = idlePlanFor(agent, cwd);
     if (!plan) {
       return false;

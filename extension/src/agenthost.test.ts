@@ -7872,6 +7872,187 @@ const SOME_SERVERS: McpServer[] = [
   },
 ];
 
+function idleMcpDiscovery(agent: 'claude' | 'codex', cwd: string) {
+  const source = fs.readFileSync(path.join(__dirname, 'extension.ts'), 'utf8');
+  const mcp = new McpBook();
+  const usageReads = new UsageReadQueue();
+  const children: FakeChild[] = [];
+  const directories: string[] = [];
+  const publications: string[] = [];
+  const models = new ModelBook();
+  let releaseModels!: (models: ModelList) => void;
+  const catalog = new Promise<ModelList>((resolve) => {
+    releaseModels = resolve;
+  });
+  let releaseServers!: (servers: McpServer[] | null) => void;
+  let serverAnswer: Promise<McpServer[] | null> = Promise.resolve(SOME_SERVERS);
+  const scope = {
+    mcp,
+    usageReads,
+    models,
+    askIdle,
+    askIdleMcp,
+    liveMcpTarget,
+    usage: new UsageBook(),
+    commandsAsked: new Set<string>(),
+    commandLists: { revision: () => 0 },
+    workspaceCwd: () => cwd,
+    cliPath: () => '',
+    publishUsage: () => publications.push('usage'),
+    publishPicks: () => publications.push('models'),
+    publishCommands: () => publications.push('commands'),
+    publishMcp: () => publications.push('MCP'),
+    host: { states: () => [], retireSession: () => Promise.resolve() },
+    draftMcpKeys: new Map<string, string>(),
+    acceptedDrafts: new Set<string>(),
+    mcpRefreshes: new McpPendingRefreshes(),
+    USAGE_AGENT_ORDER: ['claude', 'codex'],
+    freshHostKey,
+    retireDraftProfile,
+    idlePlanFor: (_agent: string, directory: string) => {
+      const plan = answeringPlan({
+        usage: async () => ({
+          plan: 'pro',
+          limits: [],
+          complete: true,
+          spend: null,
+          creditResetsAtSeconds: null,
+          readAt: Date.now(),
+        }),
+        models: () => catalog,
+      });
+      const driver = plan.driver;
+      return {
+        ...plan,
+        agent,
+        cwd: directory,
+        driver: (...args: Parameters<typeof driver>) => ({
+          ...driver(...args),
+          usageSupported: async () => true,
+          mcpStatus: () => serverAnswer,
+        }),
+      };
+    },
+    spawner: (_command: string, _args: string[], directory: string) => {
+      directories.push(directory);
+      const child = new FakeChild();
+      children.push(child);
+      return child;
+    },
+    readMcpFrom: async () => {},
+    readFrom: async () => {},
+    refreshUsage: vi.fn<(agent: string, force: boolean, owner: string, ownerAgent: string, cwd: string) => void>(),
+    panel: {} as Record<string, (...args: unknown[]) => void>,
+  };
+  const statements = [
+    'const noteMcp =',
+    'const readIdleMcp =',
+    'const askAgent =',
+    'panel.onSelectionChanged =',
+    'panel.onDraftRemoved =',
+    'panel.onDraftProfileChanged =',
+    'panel.onDraftAdopted =',
+    'panel.onPanelsClosed =',
+  ].map((needle) => statementFrom(source, source.indexOf(needle)));
+  const code = esbuild.transformSync(
+    `let mcpSurfaceGeneration = 0; let activeMcpOwner = 'owner-a';
+    ${statements.join('\n')}
+    return { askAgent, readIdleMcp };`,
+    { loader: 'ts' },
+  ).code;
+  const compiled = runInNewContext(`(() => { ${code} })()`, scope) as {
+    askAgent(agent: string, force: boolean, owner: string, cwd: string): Promise<void>;
+    readIdleMcp(agent: string, cwd: string, owner: string, revision: number, generation: number): Promise<boolean>;
+  };
+  onTestFinished(() => {
+    usageReads.dispose();
+    scope.mcpRefreshes.dispose();
+    for (const child of children) child.exit(0);
+  });
+  return {
+    ...scope,
+    ...compiled,
+    children,
+    directories,
+    publications,
+    releaseModels: () => releaseModels(A_MODEL_LIST),
+    holdServers: () => {
+      serverAnswer = new Promise((resolve) => {
+        releaseServers = resolve;
+      });
+    },
+    releaseServers: (servers: McpServer[] | null) => releaseServers(servers),
+  };
+}
+
+for (const agent of ['claude', 'codex'] as const) {
+  for (const next of ['owner-b', 'draft-new']) {
+    test(`${agent} selection to ${next} skips obsolete initial MCP startup after catalogs settle`, async () => {
+      const fixture = idleMcpDiscovery(agent, 'D:/Work/Owner-A');
+      const older = fixture.askAgent(agent, false, 'owner-a', 'D:/Work/Owner-A');
+      await vi.waitFor(() => assert.ok(fixture.publications.includes('usage')));
+      assert.deepEqual(fixture.directories, ['D:/Work/Owner-A']);
+      fixture.panel.onSelectionChanged(next, agent, '/work/owner-b');
+      assert.deepEqual(fixture.refreshUsage.mock.calls, [[agent, false, next, agent, '/work/owner-b']]);
+      fixture.releaseModels();
+      await older;
+      assert.deepEqual(fixture.directories, ['D:/Work/Owner-A'], 'obsolete discovery started another child');
+      assert.ok(fixture.publications.includes('commands'));
+      assert.ok(fixture.publications.includes('models'));
+      assert.equal(fixture.mcp.get('owner-a'), null);
+      assert.equal(fixture.mcp.needsInitialRead('owner-a'), true);
+      const finalOwner = next === 'owner-b' ? 'owner-a' : next;
+      const finalCwd = next === 'owner-b' ? 'D:/Work/Owner-A' : '/work/owner-b';
+      fixture.panel.onSelectionChanged(finalOwner, agent, finalCwd);
+      await fixture.askAgent(agent, false, finalOwner, finalCwd);
+      await vi.waitFor(() => assert.deepEqual(fixture.mcp.get(finalOwner), SOME_SERVERS));
+      assert.equal(fixture.directories.at(-1), finalCwd);
+    });
+  }
+
+  test(`${agent} idle MCP admission preserves refresh and retry across owner and panel replacement`, async () => {
+    const fixture = idleMcpDiscovery(agent, '/Users/reader/Work');
+    fixture.releaseModels();
+    for (const invalidate of [
+      () => fixture.mcp.change('owner-a'),
+      () => fixture.panel.onDraftRemoved({ draftId: 'owner-a' }),
+      () => fixture.panel.onDraftProfileChanged({ draftId: 'owner-a', profile: { agent } }),
+      () => fixture.panel.onDraftAdopted('owner-a', 'actual'),
+      () => fixture.panel.onPanelsClosed(),
+    ]) {
+      const revision = fixture.mcp.change('owner-a');
+      invalidate();
+      assert.equal(await fixture.readIdleMcp(agent, '/Users/reader/Work', 'owner-a', revision, 0), false);
+    }
+    assert.equal(fixture.children.length, 0, 'invalidated work started an MCP child');
+    // A new panel has its own generation after the close above.
+    fixture.holdServers();
+    const current = fixture.mcp.beginInitialRead('owner-b')!;
+    const pending = fixture.readIdleMcp(agent, '/Users/reader/Work', 'owner-b', current, 1);
+    await vi.waitFor(() => assert.equal(fixture.children.length, 1));
+    const newer = fixture.mcp.change('owner-b');
+    fixture.releaseServers(SOME_SERVERS);
+    assert.equal(await pending, false, 'an in-flight stale answer replaced current state');
+    fixture.mcp.finishInitialRead('owner-b', current, false);
+    assert.equal(fixture.mcp.get('owner-b'), null);
+    fixture.holdServers();
+    const refresh = fixture.readIdleMcp(agent, '/Users/reader/Work', 'owner-b', newer, 1);
+    await vi.waitFor(() => assert.equal(fixture.children.length, 2));
+    fixture.releaseServers(null);
+    assert.equal(await refresh, false);
+    assert.equal(fixture.mcp.needsInitialRead('owner-b'), true);
+    fixture.holdServers();
+    const retryRevision = fixture.mcp.beginInitialRead('owner-b')!;
+    const retry = fixture.readIdleMcp(agent, '/Users/reader/Work', 'owner-b', retryRevision, 1);
+    await vi.waitFor(() => assert.equal(fixture.children.length, 3));
+    fixture.releaseServers([]);
+    assert.equal(await retry, true);
+    assert.deepEqual(fixture.mcp.get('owner-b'), []);
+    assert.equal(fixture.mcp.needsInitialRead('owner-b'), false);
+    assert.deepEqual(fixture.directories, Array(3).fill('/Users/reader/Work'));
+  });
+}
+
 test('the MCP servers kept for an agent are whatever it last said, and none for one nobody asked', () => {
   const book = new McpBook();
   assert.equal(

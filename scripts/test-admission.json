@@ -36,8 +36,8 @@
   },
   "extension/src/agenthost.test.ts": {
     "reason": "A spawned agent must receive the activation window, editor executable, and command search path. Self-compaction crosses native background settlement, response retention for provider turns, and workspace scope recovery. Initial naming must recheck ownership after host waits and serialize after reader renames.",
-    "cases": 300,
-    "matricesSha256": "b2368dbc583d692f9ca154239b9a467dd098cf5edc61a39ce9b5d817cbeb3f35"
+    "cases": 302,
+    "matricesSha256": "8baa39e51d53bf87f676624c1a512739a7a274b6478d3dcc19853b57dbf3bd3c"
   },
   "extension/src/chrome.browser.test.ts": {
     "reason": "Panel controls must preserve native focus, keyboard handling, and browser event delivery.",
