@@ -3102,18 +3102,6 @@ function finalChildMessage(record: Entry): boolean {
 
 type ChildTerminalStatus = 'completed' | 'failed' | 'interrupted';
 
-// The tool that waits for subagents. Its output enters context, but its call names no
-// receiver, so the output counts toward no single subagent. The `wait` tool waits for a
-// code cell, not a subagent.
-const CODEX_WAIT_TOOL = 'wait_agent';
-
-function noteCodexWaitCall(state: CodexSessionParserState, callId: string): void {
-  state.waitCalls.push(callId);
-  if (state.waitCalls.length > 64) {
-    state.waitCalls.shift();
-  }
-}
-
 // The subagent row a path or name identifies, from the newest turn back.
 function codexSubagentRow(state: CodexSessionParserState, key: string): TurnAgent | null {
   const name = key.slice(key.lastIndexOf('/') + 1);
@@ -3186,16 +3174,6 @@ function noteCodexSubagentResult(state: CodexSessionParserState, record: Entry, 
   noteCodexKeyedResult(state, notification.id, text, form, identity ?? codexDeliveryIdentity(state, record, text));
 }
 
-// A `wait_agent` output enters context and counts in the total only.
-function noteCodexWaitOutput(state: CodexSessionParserState, callId: string, text: string): void {
-  const index = state.waitCalls.indexOf(callId);
-  if (index < 0 || !text) {
-    return;
-  }
-  state.waitCalls.splice(index, 1);
-  noteCodexKeyedResult(state, null, text, 'wait', `call:${callId}`);
-}
-
 // Results that a compaction's replacement history keeps, read from its response items. The
 // replacement history is the context after the compaction, so they count at once.
 function noteCodexRetainedSubagentResults(state: CodexSessionParserState, items: unknown[]): void {
@@ -3204,13 +3182,7 @@ function noteCodexRetainedSubagentResults(state: CodexSessionParserState, items:
       continue;
     }
     const kind = str(item.type) ?? '';
-    if (kind === 'function_call' && str(item.name) === CODEX_WAIT_TOOL && str(item.call_id)) {
-      noteCodexWaitCall(state, str(item.call_id)!);
-    } else if (kind === 'function_call_output') {
-      noteCodexWaitOutput(state, str(item.call_id) ?? '', outputText(item.output));
-    } else {
-      noteCodexSubagentResult(state, { kind, wrapper: 'replacement', at: 0, payload: item }, `kept:${index}`);
-    }
+    noteCodexSubagentResult(state, { kind, wrapper: 'replacement', at: 0, payload: item }, `kept:${index}`);
   }
   commitSubagentContext(state.subagents);
 }
@@ -5772,11 +5744,9 @@ export function discoverCodexNewestTurn(
 }
 
 export interface CodexSessionParserState {
-  version: 24;
-  // Text that subagents returned into this session's context, and the `wait_agent` calls
-  // whose output has not arrived.
+  version: 25;
+  // Text that subagents returned into this session's context.
   subagents: SubagentContextState;
-  waitCalls: string[];
   responseClock: CodexResponseClock;
   turns: Turn[];
   turnRanges: Array<{ start: number; end: number }>;
@@ -5865,9 +5835,8 @@ function emptyCodexSessionParserState(meta: CodexSessionMeta | null): CodexSessi
   const replayBoundaryAt = meta?.replayBoundaryAt ?? null;
   const openingSessionId = meta?.sessionId ?? null;
   return {
-    version: 24,
+    version: 25,
     subagents: emptySubagentContext(),
-    waitCalls: [],
     responseClock: emptyCodexResponseClock(),
     turns: [],
     turnRanges: [],
@@ -6970,9 +6939,6 @@ function reduceCodexSessionLine(
       if (id && name) {
         state.toolNames.set(id, name);
       }
-      if (id && name === CODEX_WAIT_TOOL) {
-        noteCodexWaitCall(state, id);
-      }
       const command = recordedName === 'exec' ? wrappedCommand(payload.input) : null;
       const detail = command
         ? { detail: stepDetail({ command }), fullDetail: command }
@@ -7182,7 +7148,6 @@ function reduceCodexSessionLine(
       turn.endedAt = Math.max(turn.endedAt, at);
       const text = outputText(payload.output);
       const callId = str(payload.call_id) ?? '';
-      noteCodexWaitOutput(state, callId, text);
       const ran = state.stepById.get(callId);
       const expanded = state.pendingExec.get(callId)?.expanded === true;
       // Outer JavaScript output has no reliable association with one completed command.
@@ -7669,7 +7634,7 @@ export function createCodexSessionReducer(
   restored?: CodexSessionParserState,
 ): CodexSessionReducer {
   const state = restored ? cloneParserState(restored) : emptyCodexSessionParserState(meta);
-  if (state.version !== 24) {
+  if (state.version !== 25) {
     throw new Error('Incompatible Codex parser state');
   }
   applyHiddenParserState(codexHiddenSlots(state), state.hidden, CODEX_HIDDEN_POLICY);

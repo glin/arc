@@ -12243,7 +12243,7 @@ test('a prior Codex parser state rebuilds child identity and exact compaction us
 
   const reset = readCodexSessionIncremental(file, 'sess', initial.checkpoint, options);
   assert.equal(reset.kind, 'reset');
-  assert.equal(reset.checkpoint?.parserState.version, 24);
+  assert.equal(reset.checkpoint?.parserState.version, 25);
   assert.deepEqual(
     reset.read?.turns[0].agents.map((row) => [row.id, row.description]),
     [[child.threadId, 'astra_implementer']],
@@ -17814,8 +17814,7 @@ test('a Codex subagent notice and final answer count toward the subagent results
   });
 });
 
-test('a Codex wait output counts in the subagent results and in no subagent line', () => {
-  // The recorded `wait_agent` call names no receiver, and its output holds no report text.
+test('a Codex wait output does not count as a subagent result', () => {
   const output = JSON.stringify({ message: 'Wait completed.', timed_out: false });
   const { turns } = readCodexSession(
     writeRollout(
@@ -17831,12 +17830,70 @@ test('a Codex wait output counts in the subagent results and in no subagent line
     ),
     'sess',
   );
-  assert.deepEqual(turns[0].subagentContext, {
-    tokens: subagentEstimate(output),
-    partial: false,
-    removed: false,
-    agents: [],
-  });
+  assert.equal(turns[0].subagentContext, undefined);
+});
+
+test('saved Codex figures exclude wait output after rebuilding unchanged rollout bytes', async () => {
+  const { deserialize, serialize } = await import('node:v8');
+  const { loadDerivedCache, saveDerivedCache } = await import('./derivedcache.ts');
+  const text = 'Message Type: FINAL_ANSWER\nSender: /root/tests_sol\nPayload:\nAll tests pass.';
+  const output = JSON.stringify({ message: 'Wait completed.', timed_out: false });
+  const file = writeRollout(
+    codexSubagentTurn([
+      childFinalAnswer(5, text),
+      item('function_call', 5, { name: 'wait_agent', call_id: 'saved_wait', arguments: '{}' }),
+      item('function_call_output', 6, { call_id: 'saved_wait', output }),
+    ]),
+  );
+  const original = fs.readFileSync(file);
+  const stamp = fs.statSync(file);
+  const initial = readCodexSessionIncremental(file, 'sess');
+  assert.ok(initial.checkpoint);
+  const expected = subagentEstimate(text);
+  assert.equal(initial.read?.turns[0].subagentContext?.tokens, expected);
+  const storage = tempDir('saved-subagent-results-');
+  const checkpointFile = path.join(storage, 'checkpoint.bin');
+  for (const owner of ['parser state', 'forward checkpoint']) {
+    const stale = throughStructuredClone(initial.checkpoint);
+    stale.parserState.turns[0].subagentContext!.tokens += subagentEstimate(output);
+    if (owner === 'parser state') {
+      (stale.parserState as { version: number }).version = 24;
+    } else {
+      stale.parserKey = JSON.stringify({ ...JSON.parse(stale.parserKey), version: 13 });
+    }
+    fs.writeFileSync(checkpointFile, serialize(stale));
+    const restored = deserialize(fs.readFileSync(checkpointFile)) as typeof stale;
+    const rebuilt = readCodexSessionIncremental(file, 'sess', restored);
+    assert.equal(rebuilt.kind, 'reset', owner);
+    assert.equal(rebuilt.read?.turns[0].subagentContext?.tokens, expected, owner);
+    const reused = readCodexSessionIncremental(file, 'sess', rebuilt.checkpoint ?? undefined);
+    assert.equal(reused.kind, 'reused');
+    assert.equal(reused.read?.turns[0].subagentContext?.tokens, expected);
+  }
+  const cacheFile = path.join(storage, 'metadata.json');
+  const stats = sessionStatFactsOf(initial.read)!;
+  stats.turns[0].subagentContext!.tokens += subagentEstimate(output);
+  const entry = {
+    mtimeMs: stamp.mtimeMs,
+    size: stamp.size,
+    label: 'Saved results',
+    fullLabel: 'Saved results',
+    activityMs: null,
+    agentRun: false,
+    outcome: null,
+    stats,
+  };
+  saveDerivedCache(cacheFile, [[file, entry]]);
+  const stale = JSON.parse(fs.readFileSync(cacheFile, 'utf8'));
+  stale.metadataVersion = 65;
+  fs.writeFileSync(cacheFile, JSON.stringify(stale));
+  const loaded = loadDerivedCache(cacheFile);
+  assert.equal(loaded.titles.size, 0);
+  assert.equal(loaded.reuse?.reason, 'generation-mismatch');
+  saveDerivedCache(cacheFile, [[file, { ...entry, stats: sessionStatFactsOf(readCodexSession(file, 'sess')) }]]);
+  assert.equal(loadDerivedCache(cacheFile).titles.get(file)?.stats?.turns[0].subagentContext?.tokens, expected);
+  assert.deepEqual(fs.readFileSync(file), original);
+  assert.equal(fs.statSync(file).mtimeMs, stamp.mtimeMs);
 });
 
 test('a Codex compaction keeps the subagent results its replacement history holds', () => {
@@ -17846,7 +17903,16 @@ test('a Codex compaction keeps the subagent results its replacement history hold
   const compaction = {
     timestamp: at(6),
     type: 'compacted',
-    payload: { replacement_history: [keptNotice.payload] },
+    payload: {
+      replacement_history: [
+        item('function_call', 5, { name: 'wait_agent', call_id: 'kept_wait', arguments: '{}' }).payload,
+        item('function_call_output', 5, {
+          call_id: 'kept_wait',
+          output: JSON.stringify({ message: 'Wait completed.', timed_out: false }),
+        }).payload,
+        keptNotice.payload,
+      ],
+    },
   };
   const { turns } = readCodexSession(
     writeRollout(

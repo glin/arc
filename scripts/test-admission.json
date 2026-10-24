@@ -56,8 +56,8 @@
   },
   "extension/src/codex.test.ts": {
     "reason": "Real Git worktree ownership and descendant source resolution must agree with recorded Codex session relationships.",
-    "cases": 475,
-    "matricesSha256": "ad69cc6ea25cca704d249c0663044b9dfb2fc3a1989229e8b14005c126f506cf"
+    "cases": 476,
+    "matricesSha256": "1bca233b48072a6996ccf7244a608ba59dd93e84493949297237014fba39e920"
   },
   "extension/src/derivedcache.test.ts": {
     "reason": "Independent writers and host death must preserve shared cache rows and release stale filesystem locks.",
