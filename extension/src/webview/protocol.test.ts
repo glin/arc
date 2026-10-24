@@ -933,6 +933,20 @@ test('context wire preserves valid Messages partitions and drops only invalid op
   }
 });
 
+test('context wire preserves the Claude no-source reason only for unavailable Claude detail', () => {
+  const detail = { ...CONTEXT_DETAIL, reason: 'claude-no-live-session' };
+  assert.deepEqual(parseHostToPanel({ type: 'contextDetail', detail }), { type: 'contextDetail', detail });
+  for (const invalid of [
+    { ...detail, provider: 'codex' },
+    ...['loading', 'available', 'mismatch', 'stale'].map((status) => ({ ...detail, status })),
+  ]) {
+    const parsed = parseHostToPanel({ type: 'contextDetail', detail: invalid });
+    assert.ok(parsed?.type === 'contextDetail');
+    assert.equal(parsed.detail.status, 'unavailable');
+    assert.equal(parsed.detail.reason, undefined);
+  }
+});
+
 test('context wire preserves bounded active reasons and rejects invented explanations', () => {
   const identity = { ...CONTEXT_DETAIL, provider: 'codex' as const };
   for (const reason of ['pending-tools', 'awaiting-measurement']) {

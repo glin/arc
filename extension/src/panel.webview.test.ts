@@ -24040,18 +24040,25 @@ test('active Context feedback explains its measurement boundary and preserves re
       return node;
     },
   } as unknown as Document;
-  for (const reason of ['pending-tools', 'awaiting-measurement'] as const) {
+  for (const [provider, reason, loading, expected] of [
+    ['codex', 'pending-tools', false, /tool calls.*pending/i],
+    ['codex', 'awaiting-measurement', false, /measur.*new input/i],
+    ['claude', 'claude-no-live-session', false, /Send a message to see the context breakdown\./],
+    ['claude', undefined, false, /^Category breakdown unavailable\.$/],
+    ['codex', undefined, false, /^Category breakdown unavailable\.$/],
+    ['claude', 'claude-no-live-session', true, /^Loading context details/],
+  ] as const) {
     const host = document.createElement('div');
     let compacted = false;
     drawContextDetail(document, host, {
       used: 209_336,
       capacity: 258_400,
-      loading: false,
+      loading,
       compact: true,
       detail: {
         ...unavailableContext({
           session: 's1',
-          provider: 'codex',
+          provider,
           model: 'gpt-6.1-sol',
           source: 'rollout',
           request: 1,
@@ -24066,7 +24073,7 @@ test('active Context feedback explains its measurement boundary and preserves re
     const rendered = host as unknown as FakeElement;
     const note = fakeFind(rendered, '.context-note')!.textContent;
     assert.doesNotMatch(note, /saved context/i);
-    assert.match(note, reason === 'pending-tools' ? /tool calls.*pending/i : /measur.*new input/i);
+    assert.match(note, expected);
     assert.equal(fakeFind(rendered, '.chippopvalue')!.textContent, '81% of 258k (209k)');
     const remaining = fakeFind(rendered, '.context-remaining')!;
     assert.equal(fakeFind(remaining, '.chippopvalue')!.textContent, '49k');
@@ -26417,6 +26424,66 @@ test('Codex host preserves active reasons and restores categories after a measur
   assert.equal(fixture.posted.length, posted, 'a changed source published obsolete categories');
 });
 
+test('Claude context explains no source and restores categories after a send refreshes its generation', async () => {
+  const fixture = liveProviderFixture(livePress());
+  const provider = fixture.provider as unknown as Record<string, any>;
+  const session = provider.showing;
+  const state = provider.stateFor(session);
+  state.context = { used: 100, max: 200 };
+  provider.stateFor = (id: string) => (id === session ? state : null);
+  provider.contextDemands = new WeakMap();
+  provider.contextRequests = new WeakMap();
+  let connected = false;
+  let reads = 0;
+  provider.contextSource = () =>
+    connected
+      ? {
+          id: 'child',
+          current: () => connected,
+          read: async () => {
+            reads++;
+            return {
+              totalTokens: 100,
+              rawMaxTokens: 200,
+              model: 'native',
+              categories: [{ name: 'Messages', kind: 'used', tokens: 100 }],
+            };
+          },
+        }
+      : null;
+  await provider.requestContext(fixture.host, session, 1, 0);
+  assert.deepEqual(fixture.posted.at(-1)!.detail, {
+    ...unavailableContext({ session, provider: 'claude', model: '', source: '', request: 1, generation: 0 }),
+    capturedAt: (fixture.posted.at(-1)!.detail as any).capturedAt,
+    reason: 'claude-no-live-session',
+  });
+  assert.equal(reads, 0);
+  provider.onSendPrompt = () => new Promise(() => {});
+  fixture.call.send(state, 'hello');
+  assert.equal(provider.contextGenerations.get(session), 1);
+  await provider.requestContext(fixture.host, session, 2, 1);
+  assert.equal((fixture.posted.at(-1)!.detail as any).reason, 'claude-no-live-session');
+  connected = true;
+  provider.invalidateContext(session);
+  assert.equal(provider.contextGenerations.get(session), 2);
+  const published = fixture.posted.filter((message) => message.type === 'contextDetail').length;
+  await provider.requestContext(fixture.host, session, 3, 1);
+  assert.equal(fixture.posted.filter((message) => message.type === 'contextDetail').length, published);
+  await provider.requestContext(fixture.host, session, 4, 2);
+  const recovered = fixture.posted.at(-1)!.detail as any;
+  assert.equal(recovered.status, 'available');
+  assert.equal(recovered.generation, 2);
+  assert.equal(recovered.source, 'child');
+  assert.equal(recovered.reason, undefined);
+  assert.equal(recovered.categories[0].name, 'Messages');
+  assert.equal(reads, 1);
+  assert.deepEqual(state.context, { used: 100, max: 200 });
+  state.agent = 'codex';
+  connected = false;
+  await provider.requestContext(fixture.host, session, 5, 2);
+  assert.equal((fixture.posted.at(-1)!.detail as any).reason, undefined);
+});
+
 test('context host rejects obsolete identity and malformed replies and settles disconnected demand', async () => {
   for (const change of ['model', 'selection', 'child', 'generation', 'malformed', 'disconnected']) {
     const fixture = liveProviderFixture(livePress());
@@ -26460,6 +26527,10 @@ test('context host rejects obsolete identity and malformed replies and settles d
     await pending;
     if (change === 'malformed' || change === 'disconnected') {
       assert.equal((fixture.posted.at(-1)!.detail as any).status, 'unavailable');
+      assert.equal(
+        (fixture.posted.at(-1)!.detail as any).reason,
+        change === 'disconnected' ? 'claude-no-live-session' : undefined,
+      );
       if (change === 'malformed') {
         const retry = provider.requestContext(fixture.host, session, 2, 0);
         await Promise.resolve();
@@ -26474,6 +26545,29 @@ test('context host rejects obsolete identity and malformed replies and settles d
         assert.equal((fixture.posted.at(-1)!.detail as any).status, 'available');
       }
     } else assert.equal(fixture.posted.length, 0, change);
+  }
+});
+
+test('Claude context read failures retain generic unavailable detail', async () => {
+  for (const failure of ['rejected', 'failed', 'timed-out', 'canceled']) {
+    const fixture = liveProviderFixture(livePress());
+    const provider = fixture.provider as unknown as Record<string, any>;
+    const session = provider.showing;
+    provider.contextDemands = new WeakMap();
+    provider.contextRequests = new WeakMap();
+    provider.contextSource = () => ({
+      id: 'child',
+      current: () => true,
+      read: () => {
+        if (failure === 'failed') throw new Error(failure);
+        return Promise.reject(new Error(failure));
+      },
+    });
+    await provider.requestContext(fixture.host, session, 1, 0);
+    const detail = fixture.posted.at(-1)!.detail as any;
+    assert.equal(detail.status, 'unavailable', failure);
+    assert.equal(detail.reason, undefined, failure);
+    assert.equal(detail.source, 'child', failure);
   }
 });
 

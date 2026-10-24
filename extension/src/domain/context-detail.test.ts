@@ -114,6 +114,24 @@ test('optional Messages failures leave honest categories available instead of hi
   assert.equal(validContextDetail({ ...detail, provider: 'codex' }), false);
 });
 
+test('Claude no-source reason belongs only to unavailable Claude detail', () => {
+  const detail = { ...unavailableContext(identity), reason: 'claude-no-live-session' };
+  assert.equal(validContextDetail(detail), true);
+  assert.equal(validContextDetail({ ...detail, provider: 'codex' }), false);
+  for (const status of ['loading', 'available', 'mismatch', 'stale'])
+    assert.equal(validContextDetail({ ...detail, status }), false);
+  for (const reason of ['unknown', '', null, ['claude-no-live-session']])
+    assert.equal(validContextDetail({ ...detail, reason }), false);
+  const codex = { ...identity, provider: 'codex' as const };
+  assert.equal(
+    normalizeContext(
+      { kind: 'codex-context-unavailable', session: 's1', model: identity.model, reason: detail.reason },
+      codex,
+    ).reason,
+    undefined,
+  );
+});
+
 test('Codex unavailable reasons stay bounded and recover from the same context demand', async () => {
   const codex = { ...identity, provider: 'codex' as const, model: 'gpt-6.1-sol' };
   const demand = new ContextDemand();

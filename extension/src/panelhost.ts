@@ -1674,7 +1674,10 @@ export class PanelProvider implements vscode.Disposable {
           () => source.read(),
           current,
         )
-      : unavailableContext(identity);
+      : {
+          ...unavailableContext(identity),
+          ...(state.agent === 'claude' ? { reason: 'claude-no-live-session' as const } : {}),
+        };
     if (!current() || detail.status === 'stale' || this.contextRequests.get(host) !== request) return;
     const reply = { ...detail, request };
     await this.sendToHost(host, {

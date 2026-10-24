@@ -126,8 +126,8 @@
   },
   "extension/src/panel.webview.test.ts": {
     "reason": "Real progressive workers must deliver bounded recovery and metadata through the production panel host. Start metadata must survive storage delays, hidden panels, preference resets, and reloads.",
-    "cases": 612,
-    "matricesSha256": "3e1027e3d8cd75e61898476fa5ff7f3295b33437899ffac142cc683a37bee3cf"
+    "cases": 614,
+    "matricesSha256": "4a14a152784c711855700e65a2abe6ea63a5f788de0cc14c74721428ab3f94f0"
   },
   "extension/src/panelbundle.test.ts": {
     "reason": "The panel bundle and fixture must contain the production entry, source identity, and substituted text.",

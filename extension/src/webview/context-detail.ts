@@ -126,7 +126,9 @@ export function drawContextDetail(document: Document, host: HTMLElement, value: 
                 ? 'Category breakdown unavailable while tool calls are pending.'
                 : value.detail?.reason === 'awaiting-measurement'
                   ? 'Category breakdown unavailable until Codex measures the new input.'
-                  : 'Category breakdown unavailable.',
+                  : value.detail?.reason === 'claude-no-live-session'
+                    ? 'Send a message to see the context breakdown.'
+                    : 'Category breakdown unavailable.',
       ),
     );
     host.append(notes);

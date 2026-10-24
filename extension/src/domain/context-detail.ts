@@ -35,6 +35,7 @@ export interface ContextMessage {
 }
 
 export type ContextUnavailableReason = 'pending-tools' | 'awaiting-measurement';
+export type ClaudeContextUnavailableReason = 'claude-no-live-session';
 
 export function contextUnavailableReason(value: unknown): value is ContextUnavailableReason {
   return value === 'pending-tools' || value === 'awaiting-measurement';
@@ -45,7 +46,7 @@ export interface ContextDetail extends ContextIdentity {
   capturedAt: number;
   measurement: 'provider-estimate' | 'local-estimate';
   basis?: 'request' | 'retained-estimate';
-  reason?: ContextUnavailableReason;
+  reason?: ContextUnavailableReason | ClaudeContextUnavailableReason;
   used: number | null;
   capacity: number | null;
   remaining: number | null;
@@ -222,7 +223,10 @@ export function validContextDetail(value: unknown): value is ContextDetail {
   if (
     !['loading', 'available', 'mismatch', 'unavailable', 'stale'].includes(row.status) ||
     (row.reason !== undefined &&
-      (row.status !== 'unavailable' || row.provider !== 'codex' || !contextUnavailableReason(row.reason))) ||
+      (row.status !== 'unavailable' ||
+        (row.provider === 'codex'
+          ? !contextUnavailableReason(row.reason)
+          : row.reason !== 'claude-no-live-session'))) ||
     !contextNumber(row.capturedAt) ||
     !['provider-estimate', 'local-estimate'].includes(row.measurement) ||
     (row.measurement === 'local-estimate' && (row.provider !== 'codex' || row.reserve !== null)) ||

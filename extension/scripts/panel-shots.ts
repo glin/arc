@@ -11,7 +11,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { estimateCodexContext } from '../src/codexcontext.ts';
-import { normalizeContext } from '../src/domain/context-detail.ts';
+import { normalizeContext, unavailableContext, type ContextIdentity } from '../src/domain/context-detail.ts';
 import { codexContextRecords } from '../src/turnfixtures.ts';
 import type { Browser, Page } from 'playwright-core';
 import { composerView, sessionLauncherView, type LivePress } from '../src/composerview.ts';
@@ -52,7 +52,7 @@ import { toCard } from '../src/turncard.ts';
 
 // Capture options for one panel state. Shots share page state, so `escape` closes popovers before the next capture.
 export interface Shot {
-  contextDetail?: 'claude' | 'codex' | 'codex-compacted';
+  contextDetail?: 'claude' | 'claude-unavailable' | 'codex' | 'codex-compacted';
   name: string; // Output filename without the extension.
   width?: number; // Viewport width before capture.
   height?: number; // Viewport height when setting the width.
@@ -145,7 +145,7 @@ const LONG_CARD_AGENTS_CHIP = `#list [data-key="${turnKey(FIXTURE_TURNS[LONG_TUR
 
 export const SHOTS: Shot[] = [
   { name: 'wide', width: 1350 },
-  ...(['claude', 'codex', 'codex-compacted'] as const).flatMap((contextDetail) =>
+  ...(['claude', 'claude-unavailable', 'codex', 'codex-compacted'] as const).flatMap((contextDetail) =>
     [1350, 340].map((width) => ({
       name: `${width === 1350 ? 'wide' : 'narrow'}-composer-context-${contextDetail}`,
       width,
@@ -1371,7 +1371,7 @@ export async function shoot(
   }
   // Supply provider-specific context detail for the prompt box popover.
   if (shot.contextDetail) {
-    const provider = shot.contextDetail === 'claude' ? 'claude' : 'codex';
+    const provider = shot.contextDetail.startsWith('claude') ? 'claude' : 'codex';
     const payload = renderPayload();
     const composer = (payload.usage as { composer: any }).composer;
     composer.agent = provider;
@@ -1402,7 +1402,11 @@ export async function shoot(
           { name: 'Compaction reserve', kind: 'buffer', tokens: 2_900 },
         ],
       };
-    const detail = normalizeContext(raw, { session: 's1', provider, model: '', source: 'capture', ...request });
+    const identity: ContextIdentity = { session: 's1', provider, model: '', source: 'capture', ...request };
+    const detail =
+      shot.contextDetail === 'claude-unavailable'
+        ? { ...unavailableContext({ ...identity, source: '' }), reason: 'claude-no-live-session' as const }
+        : normalizeContext(raw, identity);
     await page.evaluate((message) => window.postMessage(message, '*'), { type: 'contextDetail', detail });
     await page.evaluate(SETTLED);
   }
