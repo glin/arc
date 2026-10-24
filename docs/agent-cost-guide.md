@@ -127,6 +127,23 @@ Check whether the provider changed cache keys, cache duration, routing, or reque
 
 The warning stays absent until the scope is complete and every required cache-write category has a supported price. A normal high cached-input share does not trigger it.
 
+## Lower the cost of waiting on subagents
+
+A parent agent pays one model request each time it wakes while a subagent runs. The two clients wake a parent differently.
+
+Claude Code resumes the parent once, when the subagent completes. The parent makes no request while it waits. A wait longer than the prompt cache lifetime costs one cache write on the next request, which the next-turn starting price shows as the cold price.
+
+Codex has no completion event. The parent calls `wait_agent`, and the call returns when the subagent completes, when it sends a message, or when the call's timeout passes. The Codex model asks for a 60 second timeout on every call, so a silent subagent wakes the parent once a minute. Set a floor in `~/.codex/config.toml` to lengthen the wait. Keep the floor under the model's prompt cache lifetime, so each timeout return stays a cached request:
+
+```toml
+[features.multi_agent_v2]
+min_wait_timeout_ms = 1500000
+default_wait_timeout_ms = 1500000
+max_wait_timeout_ms = 3600000
+```
+
+The default must be at least the minimum. The wait still returns at once on completion or on a message, so the floor adds no idle time. Each progress message from a subagent wakes the parent, so tell subagents to send only a final answer or one blocker message. `arc cost <path> --by-tool-kind` shows how much of a session went to requests that read tool results, but it reports every Codex request as `no tool result`.
+
 ## Arc message delivery
 
 Arc forwards each busy-time message to the selected agent's protocol. It preserves separate submissions and does not combine a rapid burst. For Claude, it writes each message to Claude Code immediately. Claude Code queues the message, then chooses a same-turn tool boundary or a later turn. Arc's Stop action differs from Claude Code's Escape key because Stop clears messages that Claude Code still holds.
