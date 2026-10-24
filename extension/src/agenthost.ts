@@ -19,6 +19,8 @@ import {
   readUsageResult,
   readModels as readClaudeModels,
   spawnArgs,
+  type RemoteControlResult,
+  type RemoteControlState,
 } from './claudewire';
 import {
   CodexWire,
@@ -283,6 +285,9 @@ export interface Driver {
   setAskMode?(mode: AskMode): Promise<void>;
   // Changes the session model. Claude applies a control request immediately. Codex sends the model on the next turn.
   setModel?(model: string): Promise<void>;
+  // Claude Remote Control on this child. A child without these operations does not support it.
+  toggleRemoteControl?(observer: (result: RemoteControlResult) => void): Promise<RemoteControlResult>;
+  remoteControlState?(): RemoteControlState;
   // Changes reasoning effort. Codex sends the level beside the model on the next turn.
   // Claude uses `/effort` because its control channel has no effort-level subtype.
   setEffort?(effort: string): Promise<void>;
@@ -408,6 +413,8 @@ export function claudePlan(launch: Launch, options: SpawnOptions): AgentPlan {
             );
           await wire.setModel(model);
         },
+        toggleRemoteControl: (observer) => wire.toggleRemoteControl(observer),
+        remoteControlState: () => wire.remoteControlState(),
         setEffort: (effort) => wire.effortCommand(effort),
         effortStartsTurn: true,
         mcpStatus: () => wire.mcpStatus(),
@@ -1410,6 +1417,20 @@ export class AgentSession {
     if (this.driver.setAskMode) {
       await this.driver.setAskMode(mode);
     }
+  }
+
+  // Toggles Claude Remote Control on this child. `observer` receives late settlements and connection failures.
+  // A fixed launch policy refuses it, because a remote client would steer a child whose permissions Arc fixed at launch.
+  async toggleRemoteControl(observer: (result: RemoteControlResult) => void): Promise<RemoteControlResult> {
+    if (this.policy) return { outcome: 'policy' };
+    return this.driver.toggleRemoteControl
+      ? await this.driver.toggleRemoteControl(observer)
+      : { outcome: 'unsupported', available: null };
+  }
+
+  // Connecting, connected, disconnecting, and uncertain Remote Control hold the child against ordinary idle retirement.
+  remoteControlHeld(): boolean {
+    return (this.driver.remoteControlState?.() ?? 'off') !== 'off';
   }
 
   // The model this session runs on, from now on.
@@ -2980,6 +3001,9 @@ export class AgentHost {
       plan,
       this.spawner,
       (event, turnId, dispatchTurnId) => {
+        // A released Remote Control hold starts a new idle window. Later events see the child's settled state.
+        if (event.kind === 'remoteControl' && event.state === 'off')
+          queueMicrotask(() => this.applyRetirementEligibility(key, session));
         const state = this.sessions.get(key)?.state();
         if (this.recovery && state?.sessionId) {
           const askKey = `${key}:${event.kind === 'ask' ? event.ask.id : event.kind === 'askResolved' ? event.id : ''}`;
@@ -3662,6 +3686,19 @@ export class AgentHost {
     }
   }
 
+  // Toggles Remote Control on the exact live child for `key`. It starts no process. A retiring or exited child answers null.
+  async remoteControl(
+    key: string,
+    observer: (result: RemoteControlResult) => void,
+  ): Promise<RemoteControlResult | null> {
+    if (this.targetedRetirements.has(key) || this.retiringKeys.has(key)) return null;
+    const session = this.sessions.get(key);
+    if (!session || session.state().exited) return null;
+    return await this.withActivity(key, (child) =>
+      child === session ? child.toggleRemoteControl(observer) : Promise.resolve(null),
+    );
+  }
+
   private applyTargetedRetirementEligibility(key: string, session: AgentSession, state = session.state()): boolean {
     if (this.sessions.get(key) !== session) {
       return false;
@@ -3687,6 +3724,7 @@ export class AgentHost {
   }
 
   private scheduleRetirement(key: string, session: AgentSession): void {
+    if (session.remoteControlHeld()) return;
     let timer: unknown;
     timer = this.timer.set(() => {
       if (this.retirementTimers.get(key) !== timer) {
@@ -3697,7 +3735,7 @@ export class AgentHost {
         return;
       }
       const state = session.state();
-      if (!this.canRetire(key, session, state)) {
+      if (!this.canRetire(key, session, state) || (session.remoteControlHeld() && !this.isArchived(state))) {
         if (this.isArchived(state)) {
           this.pendingArchiveRetirement.add(key);
         }

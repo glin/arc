@@ -2909,3 +2909,172 @@ test.each([
     wire.close('finished');
   },
 );
+
+// Shapes captured from Claude Code 2.1.310 with Arc's launch flags. The link values are placeholders.
+async function remoteHarness(available: unknown = true, deadlineMs?: number) {
+  const h = harness(deadlineMs);
+  const opened = h.wire.initialize();
+  h.wire.receive(
+    JSON.stringify({
+      type: 'control_response',
+      response: {
+        subtype: 'success',
+        request_id: 'arc_1',
+        response: {
+          commands: [],
+          ...(available === 'absent' ? {} : { remote_control_available: available }),
+          remote_control_auto_enable: true,
+          ide_rc_auto_enable_gate: true,
+        },
+      },
+    }),
+  );
+  await opened;
+  const reply = (id: string, response?: Record<string, unknown>, error?: string) =>
+    h.wire.receive(
+      JSON.stringify({
+        type: 'control_response',
+        response: error
+          ? { subtype: 'error', request_id: id, error }
+          : { subtype: 'success', request_id: id, ...(response ? { response } : {}) },
+      }),
+    );
+  const enabled = (url = 'https://example.test/session') => ({
+    session_url: url,
+    connect_url: 'https://example.test/connect',
+    environment_id: '',
+    bridge_epoch: 1,
+    bridge_session_id: 'bridge-identity',
+  });
+  return { ...h, reply, enabled };
+}
+
+test('Remote Control toggles on the live child through control requests and writes no prompt', async () => {
+  const h = await remoteHarness();
+  assert.equal(h.sent.length, 1, 'initialize auto-enable fields must not send a Remote Control request');
+  const later: unknown[] = [];
+  const on = h.wire.toggleRemoteControl((result) => later.push(result));
+  assert.deepEqual(h.parsed()[1], {
+    type: 'control_request',
+    request_id: 'arc_2',
+    request: { subtype: 'remote_control', enabled: true },
+  });
+  assert.equal(h.wire.remoteControlState(), 'connecting');
+  h.reply('arc_2', h.enabled());
+  assert.deepEqual(await on, { outcome: 'connected', url: 'https://example.test/session', late: false });
+  assert.equal(h.wire.sessionId(), null, 'the bridge identity must not replace the local session');
+  const off = h.wire.toggleRemoteControl((result) => later.push(result));
+  assert.deepEqual(h.parsed()[2].request, { subtype: 'remote_control', enabled: false });
+  h.reply('arc_3');
+  assert.deepEqual(await off, { outcome: 'disconnected', late: false });
+  assert.equal(h.wire.remoteControlState(), 'off');
+  assert.deepEqual(
+    h.parsed().filter((frame) => frame.type === 'user'),
+    [],
+  );
+  assert.deepEqual(
+    h.events.flatMap((event) => (event.kind === 'remoteControl' ? [event.state] : [])),
+    ['connecting', 'connected', 'disconnecting', 'off'],
+  );
+  assert.deepEqual(later, []);
+});
+
+test('Remote Control needs reported availability before it sends a request', async () => {
+  for (const [available, expected] of [
+    ['absent', null],
+    [false, false],
+    ['yes', null],
+  ] as const) {
+    const h = await remoteHarness(available);
+    assert.deepEqual(await h.wire.toggleRemoteControl(() => {}), { outcome: 'unsupported', available: expected });
+    assert.equal(h.sent.length, 1);
+  }
+});
+
+test('Remote Control refusal and success without a link report truthful state', async () => {
+  const h = await remoteHarness();
+  const refused = h.wire.toggleRemoteControl(() => {});
+  h.reply('arc_2', undefined, 'Remote Control is disabled by your organization');
+  assert.deepEqual(await refused, {
+    outcome: 'refused',
+    reason: 'Remote Control is disabled by your organization',
+    late: false,
+  });
+  assert.equal(h.wire.remoteControlState(), 'off');
+  const bare = h.wire.toggleRemoteControl(() => {});
+  h.reply('arc_3', {});
+  assert.deepEqual(await bare, { outcome: 'connected', url: null, late: false });
+  assert.equal(h.wire.remoteControlState(), 'connected', 'a connection without a link must remain able to disconnect');
+});
+
+test('an unanswered Remote Control request stays uncertain until its late reply settles it', async () => {
+  vi.useFakeTimers();
+  try {
+    const h = await remoteHarness(true, 1000);
+    const later: unknown[] = [];
+    const on = h.wire.toggleRemoteControl((result) => later.push(result));
+    await vi.advanceTimersByTimeAsync(1000);
+    assert.deepEqual(await on, { outcome: 'uncertain' });
+    assert.equal(h.wire.remoteControlState(), 'uncertain');
+    assert.deepEqual(await h.wire.toggleRemoteControl(() => {}), { outcome: 'busy', state: 'uncertain' });
+    assert.equal(h.sent.length, 2, 'an uncertain toggle must not send a duplicate request');
+    h.reply('arc_9', h.enabled('https://example.test/other'));
+    assert.deepEqual(later, [], 'a reply to another request id settled the toggle');
+    h.reply('arc_2', h.enabled());
+    assert.deepEqual(later, [{ outcome: 'connected', url: 'https://example.test/session', late: true }]);
+    assert.equal(h.wire.remoteControlState(), 'connected');
+    h.reply('arc_2', undefined, 'repeated');
+    assert.equal(h.wire.remoteControlState(), 'connected', 'a repeated late reply changed the settled state');
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('closing the child ends an uncertain Remote Control request without a late result', async () => {
+  vi.useFakeTimers();
+  try {
+    const h = await remoteHarness(true, 1000);
+    const later: unknown[] = [];
+    const on = h.wire.toggleRemoteControl((result) => later.push(result));
+    await vi.advanceTimersByTimeAsync(1000);
+    await on;
+    h.wire.close('the agent exited');
+    assert.equal(h.wire.remoteControlState(), 'off');
+    h.reply('arc_2', h.enabled());
+    assert.deepEqual(later, []);
+    assert.deepEqual(await h.wire.toggleRemoteControl(() => {}), { outcome: 'closed' });
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('a failed bridge ends only the connection of its epoch', async () => {
+  const h = await remoteHarness();
+  const later: unknown[] = [];
+  const on = h.wire.toggleRemoteControl((result) => later.push(result));
+  h.wire.receive(JSON.stringify({ type: 'system', subtype: 'bridge_state', state: 'ready', session_id: 's' }));
+  h.reply('arc_2', h.enabled());
+  await on;
+  const bridge = (state: string, epoch?: number) =>
+    h.wire.receive(
+      JSON.stringify({
+        type: 'system',
+        subtype: 'bridge_state',
+        state,
+        detail: 'Network lost',
+        failure_kind: 'terminal',
+        ...(epoch === undefined ? {} : { bridge_epoch: epoch }),
+      }),
+    );
+  bridge('connected', 1);
+  bridge('failed', 0);
+  assert.equal(h.wire.remoteControlState(), 'connected', 'an old epoch ended the current connection');
+  bridge('failed', 1);
+  assert.equal(h.wire.remoteControlState(), 'off');
+  assert.deepEqual(later, [{ outcome: 'ended', reason: 'Network lost' }]);
+  const again = h.wire.toggleRemoteControl(() => {});
+  h.reply('arc_3', h.enabled());
+  await again;
+  bridge('policy_disabled');
+  assert.equal(h.wire.remoteControlState(), 'off', 'a failure without an epoch must end the connection');
+});

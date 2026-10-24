@@ -17110,3 +17110,25 @@ test('a Claude read that skips appended bytes restarts the subagent figure as pa
     agents: [{ name: 'Third review', tokens }],
   });
 });
+
+test('a Remote Control bridge record changes no turn, title, or metadata', () => {
+  const records = [userPrompt('check the build', 0), assistantText('the build passes', 30)];
+  const bridge = {
+    type: 'bridge-session',
+    bridgeSessionId: 'bridge-identity-7',
+    ownerAccountUuid: 'account-identity-7',
+    ownerOrganizationUuid: 'organization-identity-7',
+  };
+  const plain = writeTranscript(records);
+  const bridged = writeTranscript([records[0], bridge, records[1], bridge]);
+  const read = (file: string) =>
+    JSON.stringify({ turns: readTurns(file, 's'), meta: readSessionMeta(file), activity: readSessionActivity(file) })
+      .replaceAll(plain, 'FILE')
+      .replaceAll(bridged, 'FILE');
+  const result = read(bridged);
+  assert.doesNotMatch(result, /identity-7/, 'a bridge identifier reached session data');
+  assert.equal(
+    result.replace(/"(start|end|size|offset|bytes)":\d+/g, ''),
+    read(plain).replace(/"(start|end|size|offset|bytes)":\d+/g, ''),
+  );
+});

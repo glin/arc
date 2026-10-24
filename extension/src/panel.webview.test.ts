@@ -2025,6 +2025,7 @@ import { turnMenuContext } from './view/card-menu.ts';
 import * as path from 'node:path';
 import * as esbuild from 'esbuild';
 import * as ts from 'typescript';
+import { mergePromptAssets } from './promptassets.ts';
 import {
   TURN_MENU_SECTIONS,
   RAIL_MENU_SECTIONS,
@@ -2091,6 +2092,8 @@ import {
   clearSubmission,
   compactSubmission,
   renameRequest,
+  remoteControlRequest,
+  REMOTE_CONTROL_ARGUMENTS,
   sendAction,
   sentPromptsToSave,
   pressesAfterLocalAnswer,
@@ -17439,6 +17442,7 @@ test('rejected sends and queued edits reply to the retained browser identity', a
   const sendPrompt = new Function(
     'vscode',
     'renameRequest',
+    'remoteControlRequest',
     `return function (text, session, revision, browserSession = session, captured, capturedAssets, capturedDraft, recoveryId) {\n${methodBody('private sendPrompt(')}\n};`,
   )(
     {
@@ -17447,6 +17451,7 @@ test('rejected sends and queued edits reply to the retained browser identity', a
       },
     },
     renameRequest,
+    remoteControlRequest,
   );
   const rejected = {
     assetHandoffs: new Set<string>(),
@@ -18544,6 +18549,8 @@ ${methodBody('public flushQueue(')}
     'queueCanDrain',
     'queueResetInFlight',
     'queueSuccessorDelivery',
+    'remoteControlRequest',
+    'REMOTE_CONTROL_ARGUMENTS',
     compiled,
   )(
     module,
@@ -18556,6 +18563,8 @@ ${methodBody('public flushQueue(')}
     queueCanDrain,
     queueResetInFlight,
     queueSuccessorDelivery,
+    remoteControlRequest,
+    REMOTE_CONTROL_ARGUMENTS,
   );
   return module.exports.flushQueue;
 }
@@ -39204,3 +39213,245 @@ test.each(['early shutdown', 'lock retry', 'replacement retry', 'derived retry',
     }
   },
 );
+
+// Compiles one PanelProvider method body from panelhost.ts with the module bindings it names.
+function compiledProviderMethod(head: string, marker: string, bindings: Record<string, unknown> = {}): any {
+  const code = esbuild.transformSync(`module.exports = ${head} {\n${methodBody(marker)}\n};`, {
+    loader: 'ts',
+    format: 'cjs',
+    target: 'esnext',
+  }).code;
+  const module: { exports: unknown } = { exports: null };
+  new Function('module', ...Object.keys(bindings), code)(module, ...Object.values(bindings));
+  return module.exports;
+}
+
+const remoteFile = (id: string, size = 5) => ({
+  id,
+  name: `${id}.txt`,
+  mime: 'text/plain',
+  size,
+  digest: 'a'.repeat(64),
+});
+
+const remoteQueued = (id: string, text: string, owner: string, extra: Record<string, unknown> = {}) => ({
+  id,
+  text,
+  assets: [],
+  commentIds: [],
+  delivery: { phase: 'queued', owner },
+  ...extra,
+});
+
+// The submission and queue half of PanelProvider. The Remote Control toggle and prompt delivery are recorded.
+function remoteControlProvider() {
+  const sendPrompt = new Function(
+    'vscode',
+    'renameRequest',
+    'remoteControlRequest',
+    `return function (text, session, revision, browserSession = session, captured, capturedAssets, capturedDraft, recoveryId) {\n${methodBody('private sendPrompt(')}\n};`,
+  )({ window: { showInformationMessage() {} } }, renameRequest, remoteControlRequest);
+  const drainRemoteControl = compiledProviderMethod(
+    'function (sessionId, entry, rest)',
+    'private drainRemoteControl(',
+    { queueAfterAcceptedRecovery, mergePromptAssets },
+  );
+  const flushQueue = extractedFlushQueue();
+  const toggled: string[] = [];
+  const notices: unknown[] = [];
+  const delivered: string[] = [];
+  const deliveredComments: Record<string, string[]> = {};
+  const provider = {
+    repositoryScopeReady: true,
+    pendingQueueDrains: new Set<string>(),
+    queueHandoffs: new Set<string>(),
+    queuedEditReservations: new Set<string>(),
+    assetHandoffs: new Set<string>(),
+    // Staging files must not hold a payload-free toggle.
+    staging: new Set(['s1']),
+    queues: {} as Record<string, any[]>,
+    drafts: { s1: '/rc' } as Record<string, string>,
+    assets: {} as Record<string, unknown[]>,
+    comments: {} as Record<string, { id: string; sessionId: string }[]>,
+    draftCommentIds: {} as Record<string, string[]>,
+    attachmentStorageDir: null,
+    posted: [] as unknown[],
+    confirmed: [] as unknown[],
+    stateFor(session: string) {
+      return {
+        sessionId: session,
+        agent: 'claude',
+        running: false,
+        comments: this.comments[session] ?? [],
+        draftCommentIds: this.draftCommentIds[session] ?? [],
+        queued: this.queues[session] ?? [],
+        draft: this.drafts[session] ?? '',
+      };
+    },
+    holdDraft(session: string, text: string) {
+      this.drafts[session] = text;
+    },
+    confirmPromptOwner(id: string, owner: string, accepted: boolean) {
+      this.confirmed.push([id, owner, accepted]);
+    },
+    post(message: unknown) {
+      this.posted.push(message);
+      return Promise.resolve();
+    },
+    writeDrafts() {
+      return Promise.resolve();
+    },
+    remoteControlFromComposer(session: string) {
+      toggled.push(session);
+      return Promise.resolve();
+    },
+    showRemoteControlNotice(result: unknown) {
+      notices.push(result);
+    },
+    usagePayload() {
+      return {};
+    },
+    drainRemoteControl(...args: unknown[]) {
+      return drainRemoteControl.apply(this, args);
+    },
+    flushQueue(session: string) {
+      flushQueue.call(this, session);
+    },
+    send(state: { comments: { id: string }[] }, _text: string, queued: { id: string }) {
+      delivered.push(queued.id);
+      deliveredComments[queued.id] = state.comments.map((comment) => comment.id);
+    },
+  } as any;
+  return { provider, sendPrompt, toggled, notices, delivered, deliveredComments };
+}
+
+test('Remote Control runs from a fresh submission, a queue flush, and a restored entry, and never as a prompt', async () => {
+  const { provider, sendPrompt, toggled, notices, delivered } = remoteControlProvider();
+  const file = remoteFile('file-1');
+
+  sendPrompt.call(provider, '/rc', 's1', 3, 's1', undefined, undefined, undefined, 'attempt-1');
+  assert.deepEqual(toggled, ['s1'], 'a fresh /rc submission did not toggle Remote Control');
+  assert.deepEqual(
+    provider.confirmed,
+    [['attempt-1', 's1', true]],
+    'the submitted record stays recoverable as a prompt',
+  );
+  assert.equal(provider.drafts.s1, '');
+  assert.deepEqual(provider.posted, []);
+
+  sendPrompt.call(provider, '/rc now', 's1', 4);
+  assert.deepEqual(toggled, ['s1'], 'a command with arguments toggled Remote Control');
+  assert.deepEqual(notices, [{ outcome: 'arguments' }]);
+  assert.deepEqual(provider.posted, [{ type: 'restoreDraft', session: 's1', text: '/rc now', revision: 4 }]);
+
+  provider.queues.s2 = [
+    remoteQueued('q-rc', '/remote-control', 's2', { assets: [file] }),
+    remoteQueued('q-next', 'after the toggle', 's2'),
+  ];
+  provider.flushQueue('s2');
+  assert.deepEqual(toggled, ['s1', 's2'], 'a queued /remote-control did not toggle Remote Control');
+  await vi.waitFor(() =>
+    assert.deepEqual(delivered, ['q-next'], 'a queued Remote Control command was delivered as a prompt'),
+  );
+  assert.deepEqual(provider.assets.s2, [file], 'the queued command dropped its file');
+
+  // A queue record saved before delivery phases existed, restored the way the host loads saved queues.
+  provider.queues.s3 = normalizeQueuedSubmissions({
+    s3: [{ id: 'restored', text: '/RC', assets: [], commentIds: [], at: 1 }],
+  }).s3;
+  assert.equal(provider.queues.s3.length, 1, 'the restored record did not survive loading');
+  provider.flushQueue('s3');
+  assert.deepEqual(toggled, ['s1', 's2', 's3'], 'a restored /rc did not toggle Remote Control');
+  assert.deepEqual(delivered, ['q-next'], 'a restored Remote Control command was delivered as a prompt');
+  assert.deepEqual(provider.queues.s3, []);
+
+  // A queued command with arguments waits with its reason and holds the prompt behind it.
+  provider.queues.s4 = [remoteQueued('q-args', '/rc now', 's4'), remoteQueued('q-held', 'held', 's4')];
+  provider.flushQueue('s4');
+  provider.flushQueue('s4');
+  await Promise.resolve();
+  assert.deepEqual(toggled, ['s1', 's2', 's3'], 'a queued command with arguments toggled Remote Control');
+  assert.deepEqual(delivered, ['q-next'], 'a queued command with arguments or the prompt behind it was delivered');
+  assert.deepEqual(
+    provider.queues.s4.map((entry: { id: string; reason?: string }) => [entry.id, entry.reason]),
+    [
+      ['q-args', REMOTE_CONTROL_ARGUMENTS],
+      ['q-held', undefined],
+    ],
+  );
+});
+
+test('a queued Remote Control command hands its comment claims to the prompt box', async () => {
+  const { provider, toggled, delivered, deliveredComments } = remoteControlProvider();
+  provider.comments.s5 = [
+    { id: 'own', sessionId: 's5' },
+    { id: 'moved', sessionId: 'elsewhere' },
+  ];
+  provider.queues.s5 = [
+    remoteQueued('q-rc', '/rc', 's5', { commentIds: ['own', 'moved'] }),
+    remoteQueued('q-next', 'an unrelated prompt', 's5'),
+  ];
+  provider.flushQueue('s5');
+  assert.deepEqual(toggled, ['s5']);
+  await vi.waitFor(() => assert.deepEqual(delivered, ['q-next']));
+  assert.deepEqual(deliveredComments['q-next'], [], 'the next queued prompt took the comments the toggle claimed');
+  assert.deepEqual(provider.draftCommentIds.s5, ['own', 'moved'], 'the prompt box lost the comment claims');
+});
+
+test('a queued Remote Control command stays queued when its files exceed the prompt box limits', async () => {
+  const megabytes = 1024 * 1024;
+  for (const [limit, draft, file] of [
+    ['count', Array.from({ length: 8 }, (_, index) => remoteFile(`draft-${index}`)), remoteFile('queued')],
+    [
+      'bytes',
+      [remoteFile('draft-a', 7 * megabytes), remoteFile('draft-b', 7 * megabytes)],
+      remoteFile('queued', 7 * megabytes),
+    ],
+  ] as const) {
+    const { provider, toggled, delivered } = remoteControlProvider();
+    provider.assets.s6 = [...draft];
+    provider.queues.s6 = [remoteQueued('q-rc', '/rc', 's6', { assets: [file] }), remoteQueued('q-held', 'held', 's6')];
+    provider.flushQueue('s6');
+    provider.flushQueue('s6');
+    await Promise.resolve();
+    assert.deepEqual(toggled, [], `files over the ${limit} limit toggled Remote Control`);
+    assert.deepEqual(provider.assets.s6, draft, `the prompt box files changed at the ${limit} limit`);
+    assert.deepEqual(
+      provider.queues.s6.map((entry: { id: string; assets: { id: string }[] }) => [
+        entry.id,
+        entry.assets.map((asset) => asset.id),
+      ]),
+      [
+        ['q-rc', ['queued']],
+        ['q-held', []],
+      ],
+      `the queued files were not kept at the ${limit} limit`,
+    );
+    assert.match(provider.queues.s6[0].reason, /Edit or drop this prompt\.$/);
+    assert.deepEqual(delivered, [], `the prompt behind the held command was delivered at the ${limit} limit`);
+  }
+});
+
+test('Remote Control refuses a draft and an agent-run session without reaching a Claude process', async () => {
+  const remoteControlFromComposer = compiledProviderMethod(
+    'async function (sessionId)',
+    'private async remoteControlFromComposer(',
+  );
+  const reached: string[] = [];
+  const notices: unknown[] = [];
+  const provider = {
+    newDrafts: { draft: {} },
+    saved: { agentRuns: ['run'] },
+    isAgentRunLaunch: compiledProviderMethod('function (session)', 'public isAgentRunLaunch('),
+    async onRemoteControl(session: string) {
+      reached.push(session);
+      return { outcome: 'disconnected', late: false };
+    },
+    showRemoteControlNotice(result: unknown) {
+      notices.push(result);
+    },
+  };
+  for (const session of ['draft', 'run', 'live']) await remoteControlFromComposer.call(provider, session);
+  assert.deepEqual(reached, ['live'], 'a draft or agent-run session reached the Claude process callback');
+  assert.deepEqual(notices, [{ outcome: 'draft' }, { outcome: 'agentRun' }, { outcome: 'disconnected', late: false }]);
+});

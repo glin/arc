@@ -411,7 +411,7 @@ The first column is checked against the shipped extension directory by `architec
 | `webview/export-model.ts` | Static viewer contracts and exhaustive capability policy | no |
 | `view/static-themes.ts` | Dark Modern, Light Modern and One Dark Pro Darker colors shared by static pages and browser fixtures | no |
 | `webview/context-detail.ts` | Semantic context categories, decorative chart, optional Messages disclosure, mismatch table, measurement disclosure, and Compact action. `webview/stat-detail.ts` retains disclosure state through refreshes and places the popover after disclosure toggles | no |
-| `claudewire.ts` | Claude stream-json and control-channel adapter | no |
+| `claudewire.ts` | Claude stream-json and control-channel adapter, including the per-child Remote Control state | no |
 | `compactrequest.ts` | Digest-bound self-compaction commands, native operation bindings, separate continuation observations, durable admission ports, exact-child guarded delivery, and native completion evidence | no |
 | `compactstore.ts` | Workspace continuation receipts, exclusive immutable recovery leases, bounded storage, pure status reads, and ended-owner evidence | no |
 | `codexwire.ts` | Codex app-server JSON-RPC adapter, ordered cancellable prompt preparation, and child-local skill discovery authority for native prompt attachments | no |
@@ -420,12 +420,12 @@ The first column is checked against the shipped extension directory by `architec
 | `questionrecords.ts` | Bounded exact-source reconciliation for captured question identities, with independent read cursors | no |
 | `launchpolicystore.ts` | Shared authoritative session restrictions, bounded per-session reads, atomic policy writes, and exclusive durable clear admission | no |
 | `launchpolicy.ts` | Immutable read-only launch policy, exact MCP read tools, Claude tool and git restrictions, model permission-mode eligibility, and standalone model aliases. Codex provider selection reads the top-level `model_provider` in `CODEX_HOME/config.toml` or `~/.codex/config.toml` | no |
-| `agenthost.ts` | Child ownership, packaged CLI environment and window targeting, launch environment, immutable read-only permissions and Claude attribution selection, line framing, lifecycle, durable question capture and restoration, accepted-turn identity, control-read scheduling, explicit usage attempt ownership, and session state after model changes | no |
+| `agenthost.ts` | Child ownership, packaged CLI environment and window targeting, launch environment, immutable read-only permissions and Claude attribution selection, line framing, lifecycle, durable question capture and restoration, accepted-turn identity, control-read scheduling, explicit usage attempt ownership, session state after model changes, and the Remote Control hold on idle retirement | no |
 | `composerview.ts` | Prompt box, agent-request, and new-session view data, bounded question Markdown reuse, wording, settings, queue behavior, answers, prompt assembly, completion rows, and the walk back through earlier prompts | no |
 | `domain/ask-answer.ts` | Browser-safe completion and answer assembly rules for agent questions | no |
 | `domain/claude-skills.ts` | Browser-safe Claude skill-highlight decision, the per-working-directory skill-list cache reducer, and the safe-folder-name check the host skill-path lookup runs first | no |
 | `domain/commit-sha.ts` | Browser-safe commit identity: two recorded shas name one commit when either is the prefix of the other, and the lower-case hex pattern that tells a commit hash from a ref name | no |
-| `domain/composer-editing.ts` | Browser-safe prompt-history key decisions, the platform send chord, completion token parsing, and command matching | no |
+| `domain/composer-editing.ts` | Browser-safe prompt-history key decisions, the platform send chord, completion token parsing, command matching, and Remote Control command recognition | no |
 | `pathcompletion.ts` | Host-safe immediate directory resolution, filtering, ordering, and completion bounds | no |
 | `domain/labels.ts` | Browser-safe label identity, name ceiling, typed-name warning, label-count wording rules, and the choice of the row Tab applies | no |
 | `domain/model-identity.ts` | Model id comparison shared by transcript turns and the Prompt box: window suffix, snapshot date, Bedrock prefix, and deployment suffix | no |

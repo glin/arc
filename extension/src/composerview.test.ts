@@ -95,6 +95,7 @@ import {
   clearRequest,
   clearSubmission,
   renameRequest,
+  remoteControlRequest,
   clearAction,
   compactCommand,
   compactSubmission,
@@ -8341,4 +8342,30 @@ test('reset retains agent messages on the original session while reader entries 
   const edited = queueEdit([agent], agent.id, null)!;
   assert.equal(edited.submission.text, agent.text);
   assert.deepEqual(edited.queued, []);
+});
+
+test('Claude Remote Control commands are recognized only as bare Claude commands', () => {
+  for (const text of ['/remote-control', '/rc', '  /RC  ', '/Remote-Control\n'])
+    assert.equal(remoteControlRequest('claude', text), 'toggle', text);
+  for (const text of ['/rc on', '/remote-control status', '/rc\nplease'])
+    assert.equal(remoteControlRequest('claude', text), 'arguments', text);
+  for (const text of ['/remote control', '/rcx', '/rc/file', '/plugin:rc', 'run /rc', '/remote-controls'])
+    assert.equal(remoteControlRequest('claude', text), null, text);
+  assert.equal(remoteControlRequest('codex', '/rc'), null);
+});
+
+test('a Remote Control toggle sends at once and answers no pending request', () => {
+  const running = composerState({
+    draft: '/rc',
+    running: true,
+    asks: [QUESTION],
+    onScreen: '/rc',
+    queued: [queued('later', { id: 'q1' })],
+  });
+  assert.equal(sendAction({ ...running, onScreen: '/rc' }), 'send');
+  const view = composerView(running);
+  assert.equal(view?.sendOverAsk, '');
+  assert.doesNotMatch(view?.box.actionName ?? '', /answers the request|Queue/);
+  assert.equal(sendAction({ ...running, asks: [], onScreen: 'later too' }), 'queue');
+  assert.equal(sendAction({ ...running, asks: [] }), 'send', 'a toggle waited behind the queue');
 });

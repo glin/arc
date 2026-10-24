@@ -1986,6 +1986,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         await readIdleMcp(which, directory, owner, revision, mcpSurfaceGeneration);
       }
     });
+  // Remote Control acts only on this window's running, reader-started Claude process for the session. It starts no child.
+  panel.onRemoteControl = async (session, observer) => {
+    const live = host.find('claude', session);
+    if (!live) return { outcome: 'stopped' };
+    return (await host.remoteControl(live.key, observer)) ?? { outcome: 'stopped' };
+  };
   const openPanelControl = panel.onPanelCommand;
   panel.onPanelCommand = (owner, agent, control, draft, cwd) => {
     if (control === 'mcp') {

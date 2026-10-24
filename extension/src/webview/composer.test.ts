@@ -45,3 +45,9 @@ test('the send press checks sendWaitsForStaging before it posts sendPrompt', () 
     'the send press keeps a staging check beside sendWaitsForStaging instead of only inside it',
   );
 });
+
+test('a Claude Remote Control toggle sends while a file stages', () => {
+  assert.equal(sendWaitsForStaging('claude', '/rc', true), false);
+  assert.equal(sendWaitsForStaging('claude', '/remote-control', true), false);
+  assert.equal(sendWaitsForStaging('claude', 'use /rc', true), true);
+});

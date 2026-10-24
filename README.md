@@ -135,6 +135,6 @@ Your prompts and skills control when to hand off. Arc does not automatically sta
 
 ## Limitations
 
-Arc only supports Claude Code and Codex for now, and doesn't support every feature of either (e.g. some things like `/remote-control` are not supported).
+Arc only supports Claude Code and Codex for now, and doesn't support every feature of either. In a running Claude session, `/remote-control` and `/rc` turn Claude Remote Control on or off. Arc does not support prompts or permission answers from a connected browser or phone client.
 
 Pricing for other providers, such as OpenRouter and Google Vertex AI, is not supported.

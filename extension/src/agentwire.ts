@@ -256,6 +256,8 @@ export type WireEvent =
   // The wire emits it without `settledTurnIds`. The host adds the prompt and command turns the report closed.
   | { kind: 'sessionState'; state: 'idle' | 'running'; settledTurnIds?: readonly number[] }
   | { kind: 'rateLimit'; limit: RateLimit | null; creditResetsAtSeconds: number | null }
+  // Claude Remote Control state on one child. The event carries no session link.
+  | { kind: 'remoteControl'; state: 'off' | 'connecting' | 'connected' | 'disconnecting' | 'uncertain' }
   | { kind: 'error'; message: string };
 
 // Unknown JSON objects read one field at a time by both wire adapters.

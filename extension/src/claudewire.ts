@@ -466,9 +466,36 @@ interface Waiting {
   timer: ReturnType<typeof setTimeout> | null;
 }
 
+// Remote Control on one Claude child. `uncertain` follows a request that passed its deadline without a reply.
+// Every state except `off` holds the child against ordinary idle retirement.
+export type RemoteControlState = 'off' | 'connecting' | 'connected' | 'disconnecting' | 'uncertain';
+
+// The settled result of one Remote Control toggle. `url` is null when Claude reported success without a session link.
+export type RemoteControlResult =
+  | { outcome: 'connected'; url: string | null; late: boolean }
+  | { outcome: 'disconnected'; late: boolean }
+  | { outcome: 'ended'; reason: string }
+  | { outcome: 'refused'; reason: string; late: boolean }
+  | { outcome: 'busy'; state: RemoteControlState }
+  | { outcome: 'unsupported'; available: boolean | null }
+  | { outcome: 'policy' }
+  | { outcome: 'uncertain' }
+  | { outcome: 'closed' };
+
 // Control requests expire after one minute so unanswered reads do not block later reads indefinitely.
 // Turn events have no control-request deadline.
 export const CONTROL_DEADLINE_MS = 60_000;
+
+// A bridge event and a connection name the same bridge when either one names no epoch.
+function sameBridgeEpoch(event: number | null, connection: number | null): boolean {
+  return event === null || connection === null || event === connection;
+}
+
+class ControlDeadline extends Error {
+  constructor() {
+    super('the agent did not answer');
+  }
+}
 
 // The write exchange bound for a guarded prompt, counted from the input write.
 export const GUARDED_RECEIPT_MS = 120_000;
@@ -549,6 +576,14 @@ export class ClaudeWire {
   private readonly backgroundCommands = new Map<string, { generation: number; taskId?: string }>();
   private closed = false;
   private readonly contextRequests = new Set<string>();
+  // `remote_control_available` from the initialize reply. Null when the CLI did not report it.
+  private remoteAvailable: boolean | null = null;
+  private remoteState: RemoteControlState = 'off';
+  private remoteEpoch: number | null = null;
+  // Receives settlements that arrive after the caller's deadline and failures of a live connection.
+  private remoteObserver: ((result: RemoteControlResult) => void) | null = null;
+  // The last connection failure Claude reported while a toggle waited for its reply or stayed uncertain.
+  private remoteFailure: { epoch: number | null; reason: string } | null = null;
   // The last session state the CLI reported. Every user-frame write clears it until the CLI reports again.
   private reportedState: 'idle' | 'running' | null = null;
   // The guarded prompt that waits for its replayed user message.
@@ -609,6 +644,9 @@ export class ClaudeWire {
   // Empty `supportedDialogKinds` leaves unsupported dialogs to the CLI.
   async initialize(): Promise<PromptEntry[]> {
     const response = await this.request({ subtype: 'initialize', supportedDialogKinds: [] });
+    // The reply also carries auto-enable fields. Arc reads only availability and never connects on its own.
+    const available = response.remote_control_available;
+    this.remoteAvailable = typeof available === 'boolean' ? available : null;
     const commands = readCommands(response.commands);
     this.emit({ kind: 'ready', commands });
     return commands;
@@ -858,6 +896,93 @@ export class ClaudeWire {
     await this.request({ subtype: 'set_model', model });
   }
 
+  remoteControlState(): RemoteControlState {
+    return this.remoteState;
+  }
+
+  // Connects Remote Control when it is off and disconnects it when it is connected. The control request starts no turn.
+  // Only an initialize reply with `remote_control_available: true` admits the request.
+  // A request that passes its deadline leaves the state uncertain. Its request id stays registered, so a late reply
+  // still settles the state and reaches `observer`. Further toggles are refused until that reply or the child's exit.
+  async toggleRemoteControl(observer: (result: RemoteControlResult) => void): Promise<RemoteControlResult> {
+    if (this.closed) return { outcome: 'closed' };
+    if (this.remoteAvailable !== true) return { outcome: 'unsupported', available: this.remoteAvailable };
+    const from = this.remoteState;
+    if (from !== 'off' && from !== 'connected') return { outcome: 'busy', state: from };
+    const enabled = from === 'off';
+    this.remoteObserver = observer;
+    this.remoteFailure = null;
+    this.setRemoteState(enabled ? 'connecting' : 'disconnecting');
+    // A failure reported before the reply settles the toggle still ends the connection the reply would leave.
+    const settle = (response: Json | Error, late: boolean): RemoteControlResult => {
+      if (this.closed) return { outcome: 'closed' };
+      const failure = this.remoteFailure;
+      this.remoteFailure = null;
+      if (response instanceof Error && enabled) {
+        this.setRemoteState('off');
+        return { outcome: 'refused', reason: response.message, late };
+      }
+      if (!(response instanceof Error) && !enabled) {
+        this.remoteEpoch = null;
+        this.setRemoteState('off');
+        return { outcome: 'disconnected', late };
+      }
+      const epoch = response instanceof Error ? this.remoteEpoch : num(response.bridge_epoch);
+      if (failure && sameBridgeEpoch(failure.epoch, epoch)) {
+        this.remoteEpoch = null;
+        this.setRemoteState('off');
+        return { outcome: 'ended', reason: failure.reason };
+      }
+      this.remoteEpoch = epoch;
+      this.setRemoteState('connected');
+      return response instanceof Error
+        ? { outcome: 'refused', reason: response.message, late }
+        : { outcome: 'connected', url: str(response.session_url) || null, late };
+    };
+    const lateReply = (response: Json | Error) => {
+      const result = settle(response, true);
+      if (result.outcome !== 'closed') this.remoteObserver?.(result);
+    };
+    try {
+      return settle(
+        await this.request({ subtype: 'remote_control', enabled }, this.deadlineMs, false, lateReply),
+        false,
+      );
+    } catch (error) {
+      if (this.closed) return { outcome: 'closed' };
+      if (error instanceof ControlDeadline) {
+        this.setRemoteState('uncertain');
+        return { outcome: 'uncertain' };
+      }
+      return settle(error instanceof Error ? error : new Error(String(error)), false);
+    }
+  }
+
+  private setRemoteState(state: RemoteControlState): void {
+    if (this.remoteState === state) return;
+    this.remoteState = state;
+    this.emit({ kind: 'remoteControl', state });
+  }
+
+  // `failed` and `policy_disabled` end a connection unless the event and the connection both name an epoch and differ.
+  // While a toggle waits for its reply or stays uncertain, the failure waits for that reply to settle the state.
+  // Other bridge states carry no settled meaning here.
+  private bridgeState(m: Json): void {
+    const state = str(m.state);
+    if (state !== 'failed' && state !== 'policy_disabled') return;
+    if (this.remoteState === 'off') return;
+    const epoch = num(m.bridge_epoch);
+    const reason = str(m.detail) ?? '';
+    if (this.remoteState !== 'connected') {
+      this.remoteFailure = { epoch, reason };
+      return;
+    }
+    if (!sameBridgeEpoch(epoch, this.remoteEpoch)) return;
+    this.remoteEpoch = null;
+    this.setRemoteState('off');
+    this.remoteObserver?.({ outcome: 'ended', reason });
+  }
+
   async setPermissionMode(mode: PermissionMode): Promise<void> {
     await this.request({ subtype: 'set_permission_mode', mode });
   }
@@ -1044,6 +1169,7 @@ export class ClaudeWire {
         if (subtype === 'thinking_tokens') {
           this.emit({ kind: 'thinking' });
         }
+        if (subtype === 'bridge_state') this.bridgeState(m);
         // Sent only when the child runs with `CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS`. `idle` follows
         // the last `result` once no prompt waits in the CLI, and it does not wait for background
         // tasks. `requires_action` is a running turn that waits on a permission answer.
@@ -1259,6 +1385,14 @@ export class ClaudeWire {
       return;
     }
     this.closed = true;
+    // A closed child ends its Remote Control connection with it.
+    this.remoteEpoch = null;
+    this.remoteObserver = null;
+    this.remoteFailure = null;
+    if (this.remoteState !== 'off') {
+      this.remoteState = 'off';
+      this.emit({ kind: 'remoteControl', state: 'off' });
+    }
     for (const [, waiting] of this.waiting) {
       if (waiting.timer) {
         clearTimeout(waiting.timer);
@@ -1503,7 +1637,13 @@ export class ClaudeWire {
     return waiting;
   }
 
-  private request(request: Json, deadline = this.deadlineMs, context = false): Promise<Json> {
+  // `afterDeadline` keeps the request id registered past its deadline and receives a late reply or the closing error.
+  private request(
+    request: Json,
+    deadline = this.deadlineMs,
+    context = false,
+    afterDeadline?: (response: Json | Error) => void,
+  ): Promise<Json> {
     if (this.closed) {
       return Promise.reject(new Error('the agent is no longer running'));
     }
@@ -1513,7 +1653,8 @@ export class ClaudeWire {
       const timer = setTimeout(() => {
         const late = this.take(id);
         if (late) {
-          late.reject(new Error('the agent did not answer'));
+          if (afterDeadline) this.waiting.set(id, { resolve: afterDeadline, reject: afterDeadline, timer: null });
+          late.reject(afterDeadline ? new ControlDeadline() : new Error('the agent did not answer'));
         }
       }, deadline);
       // The deadline timer must not keep the extension host process running.

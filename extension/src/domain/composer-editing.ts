@@ -232,6 +232,20 @@ export function renameRequest(agent: string, text: string): string | null {
   return matched ? (matched[1] ?? '').trim() : null;
 }
 
+// Claude `/remote-control` and its `/rc` alias toggle Claude Remote Control. The host sends the toggle as a control
+// request, so neither form reaches the model. `toggle` is the bare command, ignoring case and surrounding whitespace.
+// `arguments` is any other text after the name, including a line break, and the host refuses it.
+// Qualified names such as `/plugin:rc` and paths such as `/rc/file` stay prompt text. Codex answers null.
+//
+// The host and the webview Composer both call this one function, as for `renameRequest`.
+export function remoteControlRequest(agent: string, text: string): 'toggle' | 'arguments' | null {
+  const trimmed = text.trim();
+  if (agent !== 'claude') return null;
+  const matched = /^\/(?:remote-control|rc)(?=\s|$)/i.exec(trimmed);
+  if (!matched) return null;
+  return matched[0].length === trimmed.length ? 'toggle' : 'arguments';
+}
+
 export function promptToken(agent: string, text: string, caret: number): PromptToken | null {
   const at = Math.max(0, Math.min(caret, text.length));
   let start = at;

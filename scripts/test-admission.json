@@ -36,8 +36,8 @@
   },
   "extension/src/agenthost.test.ts": {
     "reason": "A spawned agent must receive the activation window, editor executable, and command search path. Self-compaction crosses native background settlement, response retention for provider turns, and workspace scope recovery. Initial naming must recheck ownership after host waits and serialize after reader renames.",
-    "cases": 302,
-    "matricesSha256": "8baa39e51d53bf87f676624c1a512739a7a274b6478d3dcc19853b57dbf3bd3c"
+    "cases": 309,
+    "matricesSha256": "3bc9dad06b3cdee0911b04176aaa669d8c380a8ca67c85833fd97f5c5af72c80"
   },
   "extension/src/chrome.browser.test.ts": {
     "reason": "Panel controls must preserve native focus, keyboard handling, and browser event delivery.",
@@ -126,8 +126,8 @@
   },
   "extension/src/panel.webview.test.ts": {
     "reason": "Real progressive workers must deliver bounded recovery and metadata through the production panel host. Start metadata must survive storage delays, hidden panels, preference resets, and reloads.",
-    "cases": 614,
-    "matricesSha256": "4a14a152784c711855700e65a2abe6ea63a5f788de0cc14c74721428ab3f94f0"
+    "cases": 618,
+    "matricesSha256": "4ce7b18293896991f1e1da259cc807841f572b88a3ca4b909a80fa1d55d9cbc0"
   },
   "extension/src/panelbundle.test.ts": {
     "reason": "The panel bundle and fixture must contain the production entry, source identity, and substituted text.",

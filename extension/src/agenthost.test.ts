@@ -64,7 +64,7 @@ test('measurement windows refuse agent processes before launch', { tags: ['subpr
     else process.env.ARC_MEASURE_BLOCK_AGENTS = previous;
   }
 });
-import { ClaudeWire, type PermissionMode } from './claudewire.ts';
+import { ClaudeWire, CONTROL_DEADLINE_MS, type PermissionMode } from './claudewire.ts';
 import {
   CompactHost,
   promptAsReader,
@@ -101,7 +101,7 @@ import { QuestionEvidenceReader } from './questionrecords';
 import { askCard, queueSubmissionAfter } from './composerview';
 import { normalizeQueuedSubmissions } from './turnview';
 import { asyncQuestionId, buildQuestionReply } from './codexreply';
-import { launchPolicy } from './launchpolicy.ts';
+import { launchPolicy, type LaunchPolicy } from './launchpolicy.ts';
 import { DispatchReceipts } from './dispatchreceipts';
 import { HostedDispatch, type SavedDispatchResponse } from './dispatchhost';
 import { payloadSha256 } from './sessionwrites';
@@ -11880,4 +11880,188 @@ test('recorded compaction responses survive 33 sessions and five native turns wi
     await h.compaction.drain(row.sessionId);
   }
   assert.equal(deliveries, 37, 'every admitted operation reaches its original child');
+});
+
+const remoteControlRequests = (child: FakeChild) =>
+  child.sent().filter((m) => (m.request as { subtype?: string } | undefined)?.subtype === 'remote_control');
+
+// Answers the child's newest Remote Control request once it has `count` of them. `after` rides in the same output chunk.
+async function answerRemoteControl(
+  child: FakeChild,
+  count: number,
+  response: Record<string, unknown> = {},
+  after = '',
+): Promise<void> {
+  await vi.waitFor(() => assert.equal(remoteControlRequests(child).length, count));
+  child.say(
+    JSON.stringify({
+      type: 'control_response',
+      response: { subtype: 'success', request_id: remoteControlRequests(child).at(-1)!.request_id, response },
+    }) +
+      '\n' +
+      after,
+  );
+}
+
+async function openRemoteControlChild(fixture: ReturnType<typeof fakeHost>, key: string, sessionId: string) {
+  const starting = fixture.host.session(key, claudePlan(CLAUDE, { cwd: WS, sessionId }));
+  fixture.children.at(-1)!.answerControl('initialize', { commands: [], remote_control_available: true });
+  await starting;
+  return fixture.children.at(-1)!;
+}
+
+async function remoteControlChild(timer: FakeAgentHostTimer, policy?: LaunchPolicy) {
+  const fixture = fakeHost(undefined, undefined, { idleDurationMs: 120, timer });
+  const starting = fixture.host.session('one', claudePlan(CLAUDE, { cwd: WS, sessionId: 'sess-1', policy }));
+  fixture.children[0].answerControl('initialize', { commands: [], remote_control_available: true });
+  await starting;
+  const child = fixture.children[0];
+  const requests = () => remoteControlRequests(child);
+  const toggle = async (response: Record<string, unknown> = {}) => {
+    const count = requests().length + 1;
+    const result = fixture.host.remoteControl('one', () => {});
+    await answerRemoteControl(child, count, response);
+    return await result;
+  };
+  return { ...fixture, child, requests, toggle };
+}
+
+// The extension's Remote Control callback, run against this host.
+function extensionRemoteControl(host: AgentHost) {
+  const source = fs.readFileSync(path.join(__dirname, 'extension.ts'), 'utf8');
+  const at = source.indexOf('  panel.onRemoteControl = async (session, observer) => {');
+  assert.notEqual(at, -1, 'extension.ts no longer wires Remote Control where this test reads it');
+  const end = source.indexOf('\n  };\n', at) + '\n  };\n'.length;
+  const panel: { onRemoteControl?: (session: string, observer: () => void) => Promise<unknown> } = {};
+  runInNewContext(source.slice(at, end), { host, panel });
+  return panel.onRemoteControl!;
+}
+
+function fireActiveTimers(timer: FakeAgentHostTimer): void {
+  for (const [index, task] of timer.tasks.entries()) if (!task.cleared) timer.fire(index);
+}
+
+test('connected Remote Control holds a child past its idle window until it disconnects', async () => {
+  const timer = new FakeAgentHostTimer();
+  const { host, child, toggle } = await remoteControlChild(timer);
+  assert.equal((await toggle({ session_url: 'https://example.test/s', bridge_epoch: 1 }))?.outcome, 'connected');
+  settle(host, 'one');
+  assert.equal(timer.activeCount(), 0, 'a connected child received an ordinary idle deadline');
+  assert.equal((await toggle())?.outcome, 'disconnected');
+  await tick();
+  assert.equal(timer.activeCount(), 1);
+  timer.fire(timer.tasks.length - 1);
+  assert.equal(host.get('one'), null);
+  assert.equal(child.ended, true);
+});
+
+test('a Remote Control failure releases the idle hold', async () => {
+  const timer = new FakeAgentHostTimer();
+  const { host, child, toggle } = await remoteControlChild(timer);
+  await toggle({ session_url: 'https://example.test/s', bridge_epoch: 1 });
+  settle(host, 'one');
+  assert.equal(timer.activeCount(), 0);
+  child.say(JSON.stringify({ type: 'system', subtype: 'bridge_state', state: 'failed', bridge_epoch: 1 }) + '\n');
+  await tick();
+  assert.equal(timer.activeCount(), 1, 'a failed connection kept the child from idle retirement');
+});
+
+test('archive retires a connected Remote Control child', async () => {
+  const timer = new FakeAgentHostTimer();
+  const { host, child, toggle } = await remoteControlChild(timer);
+  await toggle({ session_url: 'https://example.test/s', bridge_epoch: 1 });
+  settle(host, 'one');
+  host.setArchived(['sess-1']);
+  assert.equal(host.get('one'), null);
+  assert.equal(child.ended, true);
+});
+
+test('a read-only launch policy refuses Remote Control without a request', async () => {
+  const timer = new FakeAgentHostTimer();
+  const { host, requests } = await remoteControlChild(timer, launchPolicy('claude', true));
+  assert.deepEqual(await host.remoteControl('one', () => {}), { outcome: 'policy' });
+  assert.equal(requests().length, 0);
+  assert.equal(await host.remoteControl('missing', () => {}), null, 'a missing child must not start a process');
+});
+
+test('a Remote Control failure in the same output chunk as the enable reply ends the connection', async () => {
+  const timer = new FakeAgentHostTimer();
+  const { host, child } = await remoteControlChild(timer);
+  const later: unknown[] = [];
+  const pending = host.remoteControl('one', (result) => later.push(result));
+  const failure = {
+    type: 'system',
+    subtype: 'bridge_state',
+    state: 'failed',
+    bridge_epoch: 1,
+    detail: 'Network lost.',
+  };
+  await answerRemoteControl(
+    child,
+    1,
+    { session_url: 'https://example.test/s', bridge_epoch: 1 },
+    JSON.stringify(failure) + '\n',
+  );
+  assert.deepEqual(await pending, { outcome: 'ended', reason: 'Network lost.' }, 'the failure was dropped');
+  assert.deepEqual(later, []);
+  settle(host, 'one');
+  await tick();
+  assert.equal(timer.activeCount(), 1, 'a failed connection kept the child from idle retirement');
+});
+
+test('Remote Control holds a child past its idle deadline while connecting and while uncertain', async () => {
+  const timer = new FakeAgentHostTimer();
+  const { host, child, requests } = await remoteControlChild(timer);
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+  try {
+    const pending = host.remoteControl('one', () => {});
+    await vi.waitFor(() => assert.equal(requests().length, 1));
+    settle(host, 'one');
+    fireActiveTimers(timer);
+    assert.notEqual(host.get('one'), null, 'a connecting child was retired');
+    await vi.advanceTimersByTimeAsync(CONTROL_DEADLINE_MS);
+    assert.deepEqual(await pending, { outcome: 'uncertain' });
+    settle(host, 'one');
+    await vi.advanceTimersByTimeAsync(0);
+    fireActiveTimers(timer);
+    assert.notEqual(host.get('one'), null, 'an uncertain child was retired');
+    assert.equal(child.ended, false);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('Remote Control reaches only the live child of its own session, before and after a Claude clear', async () => {
+  const timer = new FakeAgentHostTimer();
+  const fixture = fakeHost(undefined, undefined, { idleDurationMs: 120, timer });
+  const { host, children } = fixture;
+  const first = await openRemoteControlChild(fixture, 'one', 'sess-1');
+  const second = await openRemoteControlChild(fixture, 'two', 'sess-2');
+  const toggle = extensionRemoteControl(host);
+  const on = toggle('sess-2', () => {});
+  await answerRemoteControl(second, 1, { session_url: 'https://example.test/two', bridge_epoch: 2 });
+  assert.deepEqual(await on, { outcome: 'connected', url: 'https://example.test/two', late: false });
+  assert.equal(remoteControlRequests(first).length, 0, "another session's child received the toggle");
+  const firstOn = toggle('sess-1', () => {});
+  await answerRemoteControl(first, 1, { bridge_epoch: 1 });
+  assert.deepEqual(await firstOn, { outcome: 'connected', url: null, late: false });
+  const firstOff = toggle('sess-1', () => {});
+  await answerRemoteControl(first, 2);
+  assert.deepEqual(await firstOff, { outcome: 'disconnected', late: false });
+  assert.equal(remoteControlRequests(second).length, 1, "another session's child received the toggle");
+  // Claude /clear gives the connected child a new local session id.
+  second.say(JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sess-2b' }) + '\n');
+  assert.deepEqual(await toggle('sess-2', () => {}), { outcome: 'stopped' });
+  settle(host, 'one');
+  settle(host, 'two');
+  await tick();
+  fireActiveTimers(timer);
+  assert.equal(host.get('one'), null);
+  assert.notEqual(host.get('two'), null, 'the session id change lost the connection hold');
+  const off = toggle('sess-2b', () => {});
+  await answerRemoteControl(second, 2);
+  assert.deepEqual(await off, { outcome: 'disconnected', late: false });
+  assert.deepEqual(await toggle('sess-1', () => {}), { outcome: 'stopped' });
+  assert.deepEqual(await toggle('missing', () => {}), { outcome: 'stopped' });
+  assert.equal(children.length, 2, 'a Remote Control toggle started a process');
 });

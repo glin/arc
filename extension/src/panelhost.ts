@@ -337,6 +337,10 @@ import {
   pickMenu,
   panelCommand,
   renameRequest,
+  REMOTE_CONTROL_ARGUMENTS,
+  remoteControlNotice,
+  remoteControlRequest,
+  type RemoteControlOutcome,
   sendAction,
   agentPromptToSend,
   commentsForActiveSubmission,
@@ -1554,6 +1558,10 @@ export class PanelProvider implements vscode.Disposable {
     | ((owner: string, agent: string, control: string, draft: NewSessionDraft | null, cwd: string | null) => void)
     | null = null;
   public onDraftRemoved: ((draft: NewSessionDraft) => void) | null = null;
+  // Toggles Remote Control on the session's running Claude process. `observer` receives later results.
+  public onRemoteControl:
+    | ((session: string, observer: (result: RemoteControlOutcome) => void) => Promise<RemoteControlOutcome>)
+    | null = null;
   public onDraftProfileChanged: ((draft: NewSessionDraft) => void) | null = null;
   public onDraftAdopted: ((provisional: string, actual: string) => void) | null = null;
   public onSelectionChanged: ((session: string | null, agent?: AgentKind | null, cwd?: string | null) => void) | null =
@@ -6512,6 +6520,24 @@ export class PanelProvider implements vscode.Disposable {
     }
     const ready = { ...state, queued: [], assets, comments: carried };
     const text = next.text;
+    // A queued or restored Remote Control command runs as the toggle and never as a prompt. Its comments stay
+    // with the draft for the next submission, and its files return to the prompt box. A command with arguments
+    // stays in the queue with its reason and holds later entries until the reader edits or drops it.
+    const remote = remoteControlRequest(state.agent, text);
+    if (remote === 'arguments') {
+      if (next.reason !== REMOTE_CONTROL_ARGUMENTS) {
+        this.queues[state.sessionId] = state.queued.map((entry) =>
+          entry.id === next.id ? { ...entry, reason: REMOTE_CONTROL_ARGUMENTS } : entry,
+        );
+        void this.writeDrafts();
+        void this.post({ type: 'usage', usage: this.usagePayload() });
+      }
+      return;
+    }
+    if (remote === 'toggle') {
+      if (this.drainRemoteControl(state.sessionId, next, rest)) this.flushQueue(session);
+      return;
+    }
     if (!text.trim() && !carried.length && !assets.length) {
       // The reader removed the comments while they waited. Do not turn that cancellation
       // into an empty prompt, and continue to the next real submission if there is one.
@@ -7246,6 +7272,20 @@ export class PanelProvider implements vscode.Disposable {
     if (renamed !== null) {
       this.holdDraft(state.sessionId, '');
       void this.renameFromComposer(state.sessionId, renamed, text, browserSession, revision);
+      return;
+    }
+    // Run a Claude Remote Control toggle outside prompt delivery, before staging, attachments, and queueing.
+    // Comments and files stay with the draft. The submitted record is settled, so it is never recovered as a prompt.
+    const remote = remoteControlRequest(state.agent, text);
+    if (remote === 'arguments') {
+      this.showRemoteControlNotice({ outcome: 'arguments' });
+      void this.post({ type: 'restoreDraft', session: browserSession, text, revision });
+      return;
+    }
+    if (remote === 'toggle') {
+      this.holdDraft(state.sessionId, '');
+      if (recoveryId) this.confirmPromptOwner(recoveryId, state.sessionId, true);
+      void this.remoteControlFromComposer(state.sessionId);
       return;
     }
     if (this.assetHandoffs.has(state.sessionId)) {
@@ -8284,6 +8324,53 @@ export class PanelProvider implements vscode.Disposable {
       this.sessionRenamed(session, result.title);
     }
     return result;
+  }
+
+  // Removes a queued Remote Control command and runs it. Its comments and files return to the prompt box.
+  // When its files do not fit beside the prompt box's files, it stays in the queue with the reason and holds
+  // later entries. Answers whether the command ran.
+  private drainRemoteControl(sessionId: string, entry: QueuedSubmission, rest: QueuedSubmission[]): boolean {
+    let assets: StoredPromptAsset[];
+    try {
+      assets = mergePromptAssets(this.assets[sessionId] ?? [], entry.assets);
+    } catch (error) {
+      const reason = `This prompt's files do not fit in the prompt box. ${(error as Error).message} Edit or drop this prompt.`;
+      if (entry.reason !== reason) {
+        this.queues[sessionId] = (this.queues[sessionId] ?? []).map((one) =>
+          one.id === entry.id ? { ...one, reason } : one,
+        );
+        void this.writeDrafts();
+        void this.post({ type: 'usage', usage: this.usagePayload() });
+      }
+      return false;
+    }
+    if (assets.length) this.assets[sessionId] = assets;
+    if (entry.commentIds.length)
+      this.draftCommentIds[sessionId] = [...new Set([...(this.draftCommentIds[sessionId] ?? []), ...entry.commentIds])];
+    this.queues[sessionId] = queueAfterAcceptedRecovery(rest, entry);
+    void this.writeDrafts();
+    void this.remoteControlFromComposer(sessionId);
+    return true;
+  }
+
+  private async remoteControlFromComposer(sessionId: string): Promise<void> {
+    let result: RemoteControlOutcome;
+    if (Object.prototype.hasOwnProperty.call(this.newDrafts, sessionId)) result = { outcome: 'draft' };
+    else if (this.isAgentRunLaunch(sessionId)) result = { outcome: 'agentRun' };
+    else if (!this.onRemoteControl) result = { outcome: 'stopped' };
+    else
+      try {
+        result = await this.onRemoteControl(sessionId, (later) => this.showRemoteControlNotice(later));
+      } catch (error) {
+        result = { outcome: 'refused', reason: (error as Error).message || 'unknown error', late: false };
+      }
+    this.showRemoteControlNotice(result);
+  }
+
+  private showRemoteControlNotice(result: RemoteControlOutcome): void {
+    const notice = remoteControlNotice(result);
+    if (notice.level === 'info') void vscode.window.showInformationMessage(notice.text);
+    else void vscode.window.showWarningMessage(notice.text);
   }
 
   // Restore a failed typed rename only while its submission revision still owns the draft.

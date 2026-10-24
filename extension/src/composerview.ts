@@ -36,17 +36,24 @@ import {
   MAX_PROMPT_ASSET_TOTAL_BYTES,
 } from './promptassets';
 import { formatMegabytes } from './turnformat';
-import { PermissionMode } from './claudewire';
+import { PermissionMode, type RemoteControlResult } from './claudewire';
 // `mcpview.ts` prepares the Servers control and menu. This module places the control
 // on the row. Type-only imports there prevent a runtime dependency cycle.
 import { mcpMenu, mcpPick } from './mcpview';
 import { WINDOW_SUFFIX, modelWindowOf, sameModelIdentity } from './domain/model-identity';
 import { AgentKind, Turn, cleanPrompt } from './transcript';
-import { LINE_BREAK, matchCommandNames, renameRequest } from './domain/composer-editing';
+import { LINE_BREAK, matchCommandNames, remoteControlRequest, renameRequest } from './domain/composer-editing';
 import { isLocalLinkPath } from './domain/link-path';
 import { completedQuestionAnswer } from './domain/ask-answer';
 import { escapeHtml, renderRichMarkdown, renderInlineMarkdown, visibleTextOf } from './richtext';
-export { historyPress, matchCommandNames, pathToken, promptToken, renameRequest } from './domain/composer-editing';
+export {
+  historyPress,
+  matchCommandNames,
+  pathToken,
+  promptToken,
+  remoteControlRequest,
+  renameRequest,
+} from './domain/composer-editing';
 export type { HistoryPress, PathToken, PromptToken } from './domain/composer-editing';
 export { HISTORY_SAID_CHARS, historySaid } from './view/composer-editing';
 import {
@@ -2519,6 +2526,8 @@ export type SendMeaning = 'send' | 'queue' | 'nothing';
 
 export function sendAction(state: ComposerState): SendMeaning {
   const typed = state.onScreen.trim();
+  // The host runs a Remote Control toggle at once, beside running work and the queue.
+  if (remoteControlRequest(state.agent, typed) !== null) return 'send';
   // Codex compaction and clear controls hold new submissions in the panel queue.
   const compacting =
     state.agent === 'codex' &&
@@ -3676,7 +3685,7 @@ function liveCards(state: ComposerState, name: string, now: number): ComposerLiv
   return cards;
 }
 
-// The Send control names queued prompts when a Codex session control delays submission. Otherwise, it identifies comments and attached files when the prompt text field is empty.
+// The Send control names queued prompts when a Codex session control delays submission. A Remote Control command names the toggle. Otherwise, the control identifies comments and attached files when the prompt text field is empty.
 function sendName(state: ComposerState, name: string, enabled: boolean): string {
   const compacting =
     state.agent === 'codex' &&
@@ -3684,6 +3693,9 @@ function sendName(state: ComposerState, name: string, enabled: boolean): string 
   // A Codex `/rename` runs at once beside the session control, so it waits in no queue.
   if (compacting && enabled && renameRequest(state.agent, state.onScreen) === null) {
     return `Queue this prompt for ${name}. Arc will send it after the session control. ${SEND_HINT}.`;
+  }
+  if (remoteControlRequest(state.agent, state.onScreen) === 'toggle') {
+    return `Turn Claude Remote Control on or off for ${name}. ${SEND_HINT}.`;
   }
   const comments = state.onScreen.trim() ? 0 : commentsForActiveSubmission(state).length;
   const files = state.onScreen.trim() ? 0 : (state.assets?.length ?? 0);
@@ -3718,8 +3730,12 @@ function sendOverAskLine(state: ComposerState): string {
   if (stopping || !enabled) {
     return '';
   }
-  // Panel commands and Codex rename requests do not answer pending requests.
-  if (panelCommand(state.onScreen) || renameRequest(state.agent, state.onScreen) !== null) {
+  // Panel commands, Codex rename requests, and Remote Control toggles do not answer pending requests.
+  if (
+    panelCommand(state.onScreen) ||
+    renameRequest(state.agent, state.onScreen) !== null ||
+    remoteControlRequest(state.agent, state.onScreen) !== null
+  ) {
     return '';
   }
   const subject = waiting === 1 ? 'the request above' : `the ${waiting} requests above`;
@@ -4657,6 +4673,86 @@ export function availableCommands(commands: readonly ComposerPromptEntry[]): Com
     }
   }
   return available;
+}
+
+// The reason a queued Remote Control command with arguments waits for the reader.
+export const REMOTE_CONTROL_ARGUMENTS =
+  'Send /remote-control or /rc by itself, with nothing after it. Edit or drop this prompt.';
+
+// A Remote Control toggle's result, including the refusals the panel decides before it reaches a Claude process.
+// `stopped` covers a session without a running Claude process in this window, including one that runs elsewhere.
+export type RemoteControlOutcome =
+  | RemoteControlResult
+  | { outcome: 'arguments' }
+  | { outcome: 'draft' }
+  | { outcome: 'agentRun' }
+  | { outcome: 'stopped' };
+
+// The notification for a Remote Control result. The session link appears in the text.
+// Arc opens no browser and leaves the clipboard unchanged.
+export function remoteControlNotice(result: RemoteControlOutcome): { level: 'info' | 'warning'; text: string } {
+  const again = 'Run /remote-control again to turn it off.';
+  const reload =
+    "To end the connection for certain, run Developer: Reload Window, which stops this window's Claude processes.";
+  switch (result.outcome) {
+    case 'connected':
+      return {
+        level: 'info',
+        text: result.url
+          ? `Arc: Claude Remote Control is on for this session. Open ${result.url} in a browser or the Claude app. ${again}`
+          : `Arc: Claude Remote Control is on for this session, but Claude did not report its link. ${again}`,
+      };
+    case 'disconnected':
+      return { level: 'info', text: 'Arc: Claude Remote Control is off for this session.' };
+    case 'ended':
+      return {
+        level: 'warning',
+        text: `Arc: Claude Remote Control ended for this session.${result.reason ? ` ${result.reason}` : ''}`,
+      };
+    case 'refused':
+      return { level: 'warning', text: `Arc: Claude did not change Remote Control: ${result.reason}` };
+    case 'busy':
+      return {
+        level: 'warning',
+        text:
+          result.state === 'uncertain'
+            ? `Arc: Claude has not answered the last Remote Control request. Arc reports the result if Claude answers. ${reload}`
+            : 'Arc: Claude Remote Control is still changing for this session. Wait for its result.',
+      };
+    case 'uncertain':
+      return {
+        level: 'warning',
+        text: `Arc: Claude did not answer the Remote Control request in time. Arc reports the result if Claude answers. ${reload}`,
+      };
+    case 'unsupported':
+      return {
+        level: 'warning',
+        text:
+          result.available === false
+            ? 'Arc: Claude Code reports that Remote Control is not available for this account or setup.'
+            : 'Arc: this Claude Code version did not report Remote Control support. Update Claude Code to use /remote-control.',
+      };
+    case 'policy':
+      return {
+        level: 'warning',
+        text: 'Arc: Remote Control is not available for a session that runs with fixed read-only permissions.',
+      };
+    case 'arguments':
+      return { level: 'warning', text: 'Arc: send /remote-control or /rc by itself, with nothing after it.' };
+    case 'draft':
+      return {
+        level: 'warning',
+        text: 'Arc: Remote Control needs a running session. Send a first prompt, then run /remote-control again.',
+      };
+    case 'agentRun':
+      return { level: 'warning', text: 'Arc: Remote Control is not available for a session that an agent started.' };
+    // `stopped` and `closed`.
+    default:
+      return {
+        level: 'warning',
+        text: 'Arc: Remote Control needs this session to run in this window. No Claude process runs this session here.',
+      };
+  }
 }
 
 // Return the panel control for a slash command, ignoring its arguments. Agent commands return null.
