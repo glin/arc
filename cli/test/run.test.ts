@@ -556,7 +556,13 @@ test.each(['large', 'partial append', 'partial replaced', 'partial digest'] as c
     const active = superviseStandalone(receipts, launch.launchId, false, bounds, frozenRuntime());
     await vi.waitFor(() => assert.ok(receipts.sourceCandidate(launch.launchId)));
     if (state === 'large') {
-      await vi.waitFor(() => assert.equal(receipts.standaloneSession(launch.launchId), options.sessionHint));
+      for (
+        let elapsed = 0;
+        elapsed < options.deadlineMs && receipts.standaloneSession(launch.launchId) !== options.sessionHint;
+        elapsed += 100
+      )
+        await vi.advanceTimersByTimeAsync(100);
+      assert.equal(receipts.standaloneSession(launch.launchId), options.sessionHint);
       assert.ok(receipts.startup(launch.launchId)!.bytes > 65536);
     }
     await vi.advanceTimersByTimeAsync(options.deadlineMs);
