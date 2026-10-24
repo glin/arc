@@ -962,6 +962,51 @@ test('linked Subagents and Dispatched rows retain recorded child cost and durati
   }
 });
 
+test('a saved session keeps subagent wait usage and shows the wait-share line', async () => {
+  const writer = await ExportTransaction.create(tempDir('arc-site-wait-share-'));
+  try {
+    const model = await sessionSiteFixture(writer);
+    const usage = (requests: number, input: number) => ({
+      requests,
+      input,
+      cacheRead: 0,
+      cacheWrite1h: 0,
+      cacheWrite5m: 0,
+      cacheWrite30m: 0,
+      output: 0,
+      thinking: 0,
+    });
+    // claude-sonnet-5 input costs $2 per million tokens.
+    const part = costPartOf({
+      role: 'main',
+      model: 'claude-sonnet-5',
+      provider: null,
+      contextWindow: null,
+      usage: usage(20, 2_000_000),
+      waits: { requests: 5, timedOut: 2, usage: usage(5, 1_000_000) },
+    });
+    assert.deepEqual(part.waits, { requests: 5, timedOut: 2, usage: usage(5, 1_000_000) });
+    model.sessions[0].numbers = {
+      parts: [part],
+      main: { dollars: 4, partial: false },
+      delegated: { dollars: 0, partial: false },
+      combined: { dollars: 4, partial: false },
+      coverage: { usage: 'complete', cost: 'complete' },
+    };
+    await projectSessionSite(model, writer, { script: '', stylesheet: '' });
+    const { manifest } = exportedSiteData((await writer.publish(async () => {})).directory);
+    const cost = manifest.stats[model.sessions[0].key].find((stat) => stat.metric === 'cost') as unknown as {
+      detailList: { entries: { label: string; lines?: unknown[] }[] };
+    };
+    assert.deepEqual(cost.detailList.entries[0].lines?.[0], {
+      text: "Waiting on subagents took 50% of this session's cost: $2.00 of $4.00 went to 5 waits, 2 of them timed out",
+      warning: true,
+    });
+  } finally {
+    await writer.dispose();
+  }
+});
+
 test('nested child artifacts and unavailable or unfinished figures retain their qualifications', async () => {
   for (const unfinished of [true, false]) {
     const writer = await ExportTransaction.create(tempDir('arc-site-nested-figures-'));
@@ -1500,6 +1545,7 @@ test('demo downloads retain production cost categories and compaction overhead',
           recordedCost: part.recordedCost ?? undefined,
           costBasis: part.costBasis ?? undefined,
           requestCountExact: part.requestCountExact ? undefined : (false as const),
+          waits: undefined,
           usage: {
             ...part.usage,
             requests: part.usage.requests ?? undefined,

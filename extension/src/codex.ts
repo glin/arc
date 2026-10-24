@@ -1513,8 +1513,15 @@ export interface CodexUsageReducerState {
     matched?: true;
     explicitSnapshot?: true;
     suppressedSnapshot?: UsageEvent;
+    // Set when this response read a `wait_agent` return. Its usage event carries it.
+    waitTimedOut?: boolean;
   }>;
   recentRequestEvents: UsageEvent[];
+  // Open `wait_agent` call ids, newest last.
+  waitCallIds?: string[];
+  // The `wait_agent` returns since the last billing record, with the turn that recorded them. The
+  // next billing record of that turn read them.
+  pendingWaitReturns?: { turnId: string; count: number; timedOut: number } | null;
   compactionResponseIds: string[];
   // The very first non-copied turn's startedAt, epoch milliseconds. Set once and never moved.
   firstTurnAt: number | null;
@@ -1987,10 +1994,71 @@ function sameCodexRequestUsage(left: TurnUsage, right: TurnUsage): boolean {
 }
 
 function removeCodexRequest(event: UsageEvent): UsageEvent {
+  const negated = (usage: TurnUsage) =>
+    Object.fromEntries(Object.entries(usage).map(([key, value]) => [key, -value])) as unknown as TurnUsage;
   return {
     ...event,
-    usage: Object.fromEntries(Object.entries(event.usage).map(([key, value]) => [key, -value])) as unknown as TurnUsage,
+    ...(event.waits
+      ? {
+          waits: {
+            requests: -event.waits.requests,
+            timedOut: -event.waits.timedOut,
+            usage: negated(event.waits.usage),
+          },
+        }
+      : {}),
+    usage: negated(event.usage),
   };
+}
+
+// The tool that waits for subagents. The `wait` tool waits for a code cell, not a subagent.
+const CODEX_WAIT_TOOL = 'wait_agent';
+
+// Whether a `wait_agent` return reports a timeout. A JSON output answers with its top-level
+// `timed_out`, so a subagent message that quotes the field does not count. Other output falls
+// back to the field's text.
+function codexWaitTimedOut(text: string): boolean {
+  try {
+    const parsed = JSON.parse(text) as unknown;
+    return isRecord(parsed) && parsed.timed_out === true;
+  } catch {
+    return /"timed_out"\s*:\s*true/.test(text);
+  }
+}
+
+// Tracks `wait_agent` calls and their returns in turns this session may own. A copied turn
+// records none. A return waits for the next billing record of its turn, which is the request
+// that read it. A turn whose ownership is unresolved keeps its returns until its own billing
+// record settles it. The `token_count` event just after a return belongs to the request that
+// made the call.
+function noteCodexWaitRecord(state: CodexUsageReducerState, kind: string, payload: Record<string, unknown>): void {
+  const turnId = state.currentTurnId;
+  if (
+    !turnId ||
+    state.foreignSessionMeta ||
+    state.datedCopiedTurnIds[turnId] ||
+    (state.currentTurnCopied && !state.pendingOwnership[turnId])
+  )
+    return;
+  if (kind === 'function_call' || kind === 'custom_tool_call') {
+    const recordedName = str(payload.name) ?? '';
+    const name = recordedName === 'exec' ? (nestedToolName(payload.input) ?? recordedName) : recordedName;
+    const id = str(payload.call_id);
+    if (name !== CODEX_WAIT_TOOL || !id) return;
+    const held = (state.waitCallIds ??= []);
+    if (held.includes(id)) return;
+    held.push(id);
+    held.splice(0, Math.max(0, held.length - CODEX_USAGE_ASSOCIATION_LIMIT));
+    return;
+  }
+  if (kind !== 'function_call_output' && kind !== 'custom_tool_call_output') return;
+  const index = state.waitCallIds?.indexOf(str(payload.call_id) ?? '') ?? -1;
+  if (index < 0) return;
+  state.waitCallIds!.splice(index, 1);
+  if (state.pendingWaitReturns?.turnId !== turnId) state.pendingWaitReturns = { turnId, count: 0, timedOut: 0 };
+  const held = state.pendingWaitReturns;
+  held.count++;
+  if (codexWaitTimedOut(outputText(payload.output))) held.timedOut++;
 }
 
 export function reduceCodexUsageEvents(state: CodexUsageReducerState, record: CodexUsageRecord): readonly UsageEvent[] {
@@ -2030,9 +2098,12 @@ function reduceCodexUsageEventsInner(state: CodexUsageReducerState, record: Code
     state.provider = str(payload.model_provider) ?? state.provider;
     return [];
   }
+  noteCodexWaitRecord(state, kind, payload);
   if (kind === 'token_usage_record') {
     const corrections: UsageEvent[] = [];
     const turnId = str(payload.turn_id);
+    const waitReturns = state.pendingWaitReturns?.turnId === turnId ? state.pendingWaitReturns : null;
+    state.pendingWaitReturns = null;
     const responseId = str(payload.response_id);
     const usage = codexRequestUsage(payload.usage);
     if (
@@ -2044,7 +2115,12 @@ function reduceCodexUsageEventsInner(state: CodexUsageReducerState, record: Code
       (!state.openingSessionId || !str(payload.thread_id) || str(payload.thread_id) === state.openingSessionId)
     ) {
       const prior = state.recentResponseUsage.find((item) => item.responseId === responseId);
-      const association = prior ?? { responseId, turnId, usage };
+      const association = prior ?? {
+        responseId,
+        turnId,
+        usage,
+        ...(waitReturns ? { waitTimedOut: waitReturns.timedOut === waitReturns.count } : {}),
+      };
       if (!prior) state.recentResponseUsage.push(association);
       state.recentResponseUsage.splice(
         0,
@@ -2643,10 +2719,14 @@ function reduceCodexUsageEventsInner(state: CodexUsageReducerState, record: Code
       ))
       ? { requestCountExact: false as const }
       : {}),
+    ...(identified?.waitTimedOut !== undefined
+      ? { waits: { requests: 1, timedOut: identified.waitTimedOut ? 1 : 0, usage: { ...usage } } }
+      : {}),
     usage,
     requestKey: provisional?.requestKey ?? `codex:${turnId}:${record.timestamp ?? ''}:${state.requestNumber}`,
     ...(responseId ? { responseId } : {}),
   };
+  if (identified) delete identified.waitTimedOut;
   if (responseId && state.compactionResponseIds.includes(responseId)) {
     if (association && !explicitResponseId) association.suppressedSnapshot = event;
     return [];
@@ -8182,7 +8262,7 @@ function wrappedToolInput(name: string, raw: string): Record<string, unknown> {
 
 // Extract a nested tool name when a custom exec wrapper names exactly one tool kind.
 // Completed items supply command and edit details. Calls without completed items retain this wrapper-derived name.
-function nestedToolName(raw: unknown): string | null {
+export function nestedToolName(raw: unknown): string | null {
   if (typeof raw !== 'string') {
     return null;
   }
@@ -8200,7 +8280,7 @@ function nestedToolName(raw: unknown): string | null {
 // Some client command wrappers have no completed CommandExecution item. Their first
 // argument is still a JSON-compatible object, so read a directly written double-quoted
 // command without evaluating the surrounding JavaScript.
-function wrappedCommand(raw: unknown): string | null {
+export function wrappedCommand(raw: unknown): string | null {
   if (typeof raw !== 'string') {
     return null;
   }

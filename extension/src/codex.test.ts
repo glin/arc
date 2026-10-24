@@ -18012,3 +18012,128 @@ test('a Codex read that skips appended bytes restarts the subagent figure as par
   assert.equal(figure?.tokens, subagentEstimate(noticeTextOf(later)));
   assert.equal(figure?.partial, true);
 });
+
+test('Codex usage events carry wait_agent returns to the request that read them and count timeouts', () => {
+  const thread = '01a032c9-1a92-7931-845c-723117d24dbe';
+  const bill = (second: number, response: string, input: number) => ({
+    timestamp: at(second),
+    type: 'token_usage_record',
+    payload: {
+      thread_id: thread,
+      turn_id: 'waits',
+      response_id: response,
+      usage: usage({ input_tokens: input, output_tokens: input / 100 }),
+    },
+  });
+  const records = [
+    meta(),
+    event('task_started', 1, { turn_id: 'waits' }),
+    turnContext(2, 'waits', 'gpt-6-sol', 'high'),
+    bill(3, 'issuer', 1000),
+    item('function_call', 4, { name: 'wait_agent', call_id: 'timeout', arguments: '{"timeout_ms":1000}' }),
+    item('function_call_output', 5, { call_id: 'timeout', output: '{"timed_out":true}' }),
+    // This snapshot belongs to the request that made the call.
+    tokens(6, { input_tokens: 1000, output_tokens: 10 }),
+    bill(7, 'first-reader', 2000),
+    item('custom_tool_call', 8, { name: 'exec', call_id: 'wrapped', input: 'await tools.wait_agent({});' }),
+    toolOutput(9, 'wrapped', '{"status":{"completed":"done"}}'),
+    tokens(10, { input_tokens: 2000, output_tokens: 20 }),
+    bill(11, 'second-reader', 3000),
+    item('function_call', 12, { name: 'exec_command', call_id: 'command', arguments: '{"cmd":"ls"}' }),
+    item('function_call_output', 13, { call_id: 'command', output: '{"timed_out":true}' }),
+    tokens(14, { input_tokens: 3000, output_tokens: 30 }),
+    bill(15, 'command-reader', 4000),
+    tokens(16, { input_tokens: 4000, output_tokens: 40 }),
+  ];
+  const first = createCodexUsageLineReducer();
+  const events = records.slice(0, 9).flatMap((record) => first.pushLine(JSON.stringify(record)));
+  const resumed = createCodexUsageLineReducer(first.snapshot());
+  events.push(...records.slice(9).flatMap((record) => resumed.pushLine(JSON.stringify(record))));
+  assert.deepEqual(
+    events.map((event) => [event.responseId, event.waits?.requests, event.waits?.timedOut]),
+    [
+      ['issuer', undefined, undefined],
+      ['first-reader', 1, 1],
+      ['second-reader', 1, 0],
+      ['command-reader', undefined, undefined],
+    ],
+  );
+  for (const event of events.filter((event) => event.waits)) assert.deepEqual(event.waits!.usage, event.usage);
+  const [bucket] = aggregateUsageEvents(events);
+  assert.deepEqual([bucket.waits?.requests, bucket.waits?.timedOut, bucket.waits?.usage.input], [2, 1, 5000]);
+});
+
+test('Codex wait_agent records in copied history never reach a later live request', () => {
+  const thread = '01a032c9-1a92-7931-845c-723117d24dbe';
+  const records = [
+    meta(),
+    event('task_started', 1, { turn_id: 'copied', started_at: ms(0) / 1000 - 3600 }),
+    turnContext(1, 'copied', 'gpt-6-sol', 'high'),
+    item('function_call', 2, { name: 'wait_agent', call_id: 'copied-wait', arguments: '{}' }),
+    item('function_call_output', 3, { call_id: 'copied-wait', output: '{"timed_out":true}' }),
+    event('task_complete', 4, { turn_id: 'copied', last_agent_message: 'copied answer' }),
+    event('task_started', 5, { turn_id: 'live', started_at: ms(5) / 1000 }),
+    turnContext(6, 'live', 'gpt-6-sol', 'high'),
+    {
+      timestamp: at(7),
+      type: 'token_usage_record',
+      payload: {
+        thread_id: thread,
+        turn_id: 'live',
+        response_id: 'live-reader',
+        usage: usage({ input_tokens: 1000, output_tokens: 10 }),
+      },
+    },
+    tokens(8, { input_tokens: 1000, output_tokens: 10 }),
+  ];
+  const reducer = createCodexUsageLineReducer();
+  const events = records.flatMap((record) => reducer.pushLine(JSON.stringify(record)));
+  assert.deepEqual(
+    events.map((event) => [event.responseId, event.waits]),
+    [['live-reader', undefined]],
+  );
+});
+
+test('a Codex wait_agent return times out only by its own top-level timed_out field', () => {
+  const thread = '01a032c9-1a92-7931-845c-723117d24dbe';
+  const bill = (second: number, response: string, input: number) => ({
+    timestamp: at(second),
+    type: 'token_usage_record',
+    payload: {
+      thread_id: thread,
+      turn_id: 'waits',
+      response_id: response,
+      usage: usage({ input_tokens: input, output_tokens: input / 100 }),
+    },
+  });
+  const quoted = JSON.stringify({
+    message: 'Wait completed.',
+    status: { reviewer: { completed: { report: { timed_out: true } } } },
+    timed_out: false,
+  });
+  const records = [
+    meta(),
+    event('task_started', 1, { turn_id: 'waits' }),
+    turnContext(2, 'waits', 'gpt-6-sol', 'high'),
+    bill(3, 'issuer', 1000),
+    item('function_call', 4, { name: 'wait_agent', call_id: 'quoted', arguments: '{}' }),
+    item('function_call_output', 5, { call_id: 'quoted', output: quoted }),
+    tokens(6, { input_tokens: 1000, output_tokens: 10 }),
+    bill(7, 'quoted-reader', 2000),
+    item('function_call', 8, { name: 'wait_agent', call_id: 'text', arguments: '{}' }),
+    item('function_call_output', 9, { call_id: 'text', output: 'Wait ended: "timed_out": true' }),
+    tokens(10, { input_tokens: 2000, output_tokens: 20 }),
+    bill(11, 'text-reader', 3000),
+    tokens(12, { input_tokens: 3000, output_tokens: 30 }),
+  ];
+  const reducer = createCodexUsageLineReducer();
+  const events = records.flatMap((record) => reducer.pushLine(JSON.stringify(record)));
+  assert.deepEqual(
+    events.map((event) => [event.responseId, event.waits?.timedOut]),
+    [
+      ['issuer', undefined],
+      ['quoted-reader', 0],
+      ['text-reader', 1],
+    ],
+  );
+});

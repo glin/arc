@@ -48,10 +48,11 @@ import type {
   TurnUsage,
   UsageInferenceClass,
   UsageOrigin,
+  UsageWaits,
 } from './transcript';
 import { normalizeFsPath } from './transcript';
 import { ExportLimitError } from './exportlimits';
-import { addUsage as addPricedUsage } from './agentspend';
+import { addUsage as addPricedUsage, addUsageWaits } from './agentspend';
 
 export interface UsageCounts {
   requests?: number;
@@ -109,6 +110,8 @@ export interface UsageEvent {
   compactionSignal?: CompactionSignal;
   // A Claude advisor consultation. It counts in cost and requests and stays out of cache adjacency.
   usageOrigin?: 'claude-advisor';
+  // Set when this request read a `wait_agent` return. Its usage equals the request's usage.
+  waits?: UsageWaits;
   usage: TurnUsage;
   requestKey: string | null;
   responseId?: string;
@@ -136,6 +139,8 @@ export interface ProjectUsageBucket {
   // These buckets estimate compaction requests without recorded request usage.
   compactionEstimate?: true;
   compactionUsage?: true;
+  // The bucket's requests that read a `wait_agent` return.
+  waits?: UsageWaits;
   usage: TurnUsage;
   requests: number;
 }
@@ -489,7 +494,7 @@ export function projectSpendSaveRetryDelay(retries: number): number | null {
 }
 // Saved source records require a rebuild when their parser generation differs.
 // Increase this when a stored field changes the conclusions consumers draw from it.
-export const PROJECT_SPEND_PARSER_GENERATION = 61;
+export const PROJECT_SPEND_PARSER_GENERATION = 62;
 
 export function projectSpendSourceOfferDue(listingMoved: boolean, now: number, lastOfferAt: number): boolean {
   return listingMoved || now - lastOfferAt >= PROJECT_SPEND_INTEGRITY_MILLISECONDS;
@@ -877,10 +882,17 @@ export function projectSpendWindows(
 function usageBandEvents(event: UsageEvent): UsageEvent[] {
   const bands = event.usage.byContextBand;
   if (!bands || event.reportedCost !== null) return [event];
-  return (['short', 'long'] as const).flatMap((contextBand) => {
-    const usage = bands[contextBand];
-    return usage ? [{ ...event, contextBand, usage: { ...usage } }] : [];
-  });
+  // Wait requests stay on the first band's slice, so a split event counts them once.
+  return (['short', 'long'] as const)
+    .flatMap((contextBand) => {
+      const usage = bands[contextBand];
+      return usage ? [{ ...event, contextBand, usage: { ...usage } }] : [];
+    })
+    .map((slice, index) => {
+      if (index === 0 || !slice.waits) return slice;
+      const { waits: _waits, ...rest } = slice;
+      return rest;
+    });
 }
 
 function requestInputTokens(usage: UsageCounts): number {
@@ -948,6 +960,7 @@ export function aggregateUsageEvents(
     if (!bucket.unclassifiedCacheWrite) {
       delete bucket.unclassifiedCacheWrite;
     }
+    addUsageWaits(bucket, event.waits);
     bucket.requests += event.usage.requests ?? 1;
     if (event.reportedCost !== null) {
       bucket.reportedCost = (bucket.reportedCost ?? 0) + event.reportedCost;
@@ -1794,6 +1807,7 @@ function readIncremental(
       if (!bucket.unclassifiedCacheWrite) {
         delete bucket.unclassifiedCacheWrite;
       }
+      addUsageWaits(bucket, event.waits);
       bucket.requests += event.usage.requests ?? 1;
       if (event.reportedCost !== null) {
         bucket.reportedCost = (bucket.reportedCost ?? 0) + event.reportedCost;

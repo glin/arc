@@ -2,7 +2,15 @@ import fs from 'node:fs';
 import { meterRead } from './readmeter';
 import { StringDecoder } from 'node:string_decoder';
 import type { ChildArtifacts } from './childartifacts';
-import type { CommitIntent, TurnCommit, TurnUsage, TurnUsagePart, UsageContextBand, UsageCounts } from './transcript';
+import type {
+  CommitIntent,
+  TurnCommit,
+  TurnUsage,
+  TurnUsagePart,
+  UsageContextBand,
+  UsageCounts,
+  UsageWaits,
+} from './transcript';
 
 // One agent's billed usage under one model. Model changes retain separate counts for each model.
 export interface ModelSpend {
@@ -121,6 +129,20 @@ export function addUsage(into: TurnUsage, add: TurnUsage, contextBand: UsageCont
     addUsageCounts(held, bandUsage);
     (into.byContextBand ??= {})[band] = held;
   }
+}
+
+// Adds wait requests into a holder without changing the holder's earlier object, which a copied
+// bucket can still share. A negative addition removes requests, and the field leaves at zero.
+export function addUsageWaits(target: { waits?: UsageWaits }, add: UsageWaits | undefined): void {
+  if (!add) return;
+  const held = target.waits
+    ? { ...target.waits, usage: { ...target.waits.usage } }
+    : { requests: 0, timedOut: 0, usage: emptyUsage() };
+  held.requests += add.requests;
+  held.timedOut += add.timedOut;
+  addUsageCounts(held.usage, add.usage);
+  if (held.requests > 0) target.waits = held;
+  else delete target.waits;
 }
 
 export function usageTokens(usage: TurnUsage): number {

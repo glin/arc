@@ -313,6 +313,48 @@ test('literal native spend generation 30 rebuilds an unchanged zero-usage decisi
   }
 });
 
+test('saved spend buckets keep subagent wait requests across a reload', () => {
+  const folder = dir();
+  const file = path.join(folder, 'rollout-2026-09-26T00-00-00-waits.jsonl');
+  const at = (second: number) => new Date(Date.UTC(2026, 8, 26, 0, 0, second)).toISOString();
+  const usage = (input: number) => ({ input_tokens: input, cached_input_tokens: 0, output_tokens: 10 });
+  const bill = (second: number, response: string, input: number) => ({
+    type: 'token_usage_record',
+    timestamp: at(second),
+    payload: { thread_id: 'waits', turn_id: 'turn', response_id: response, usage: usage(input) },
+  });
+  const snapshot = (second: number, input: number) => ({
+    type: 'event_msg',
+    timestamp: at(second),
+    payload: { type: 'token_count', info: { last_token_usage: usage(input), total_token_usage: usage(input) } },
+  });
+  const records = [
+    { type: 'session_meta', timestamp: at(0), payload: { id: 'waits', source: 'cli', model_provider: 'openai' } },
+    { type: 'event_msg', timestamp: at(1), payload: { type: 'task_started', turn_id: 'turn' } },
+    { type: 'turn_context', timestamp: at(2), payload: { turn_id: 'turn', model: 'gpt-6-sol' } },
+    bill(3, 'issuer', 1000),
+    { type: 'response_item', timestamp: at(4), payload: { type: 'function_call', name: 'wait_agent', call_id: 'w' } },
+    {
+      type: 'response_item',
+      timestamp: at(5),
+      payload: { type: 'function_call_output', call_id: 'w', output: '{"timed_out":true}' },
+    },
+    snapshot(6, 1000),
+    bill(7, 'reader', 2000),
+    snapshot(8, 2000),
+  ];
+  fs.writeFileSync(file, records.map((record) => JSON.stringify(record)).join('\n') + '\n');
+  const current = indexSpendFile(undefined, file, 'workspace', createCodexUsageLineReducer, Date.parse(at(9))).record;
+  const waits = (buckets: readonly ProjectUsageBucket[] | undefined) => buckets?.map((bucket) => bucket.waits);
+  const expected = [{ requests: 1, timedOut: 1, usage: { ...current.buckets[0].waits!.usage } }];
+  assert.deepEqual(waits(current.buckets), expected);
+  assert.equal(expected[0].usage.input, 2000);
+  saveSpendLedger(folder, 'workspace', [current]);
+  const [loaded] = loadSpendLedger(folder, 'workspace').files;
+  assert.deepEqual(waits(loaded.buckets), expected);
+  assert.deepEqual(waits(loaded.lifetimeBuckets), expected);
+});
+
 test('unconfirmed native spend keeps project totals unknown through a saved checkpoint', () => {
   const folder = dir();
   const file = path.join(folder, 'native.jsonl');

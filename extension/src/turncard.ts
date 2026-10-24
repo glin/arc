@@ -76,6 +76,7 @@ import {
   sameCommitSha,
   shortenTo,
   type UsageOrigin,
+  type UsageWaits,
 } from './transcript';
 import { formatClock, formatDuration, formatRelative, formatTokens, formatWhen, shortModel } from './turnformat';
 import { turnKey } from './turnread';
@@ -2076,6 +2077,7 @@ export function sessionCostUsageOf({ bucket, role, scopeId }: SessionSpendPart):
     ...(bucket.requestCountExact === false ? { requestCountExact: false as const } : {}),
     ...(bucket.compactionEstimate ? { compactionEstimate: true as const } : {}),
     ...(bucket.compactionUsage ? { compactionUsage: true as const } : {}),
+    ...(bucket.waits ? { waits: bucket.waits } : {}),
     usage: bucket.usage,
   };
 }
@@ -2798,9 +2800,21 @@ function warningLine(warning: CacheWriteWarning): StatDetailLine {
   };
 }
 
-function withCostWarnings(entry: StatDetailEntry, warnings: readonly CacheWriteWarning[]): StatDetailEntry {
-  if (warnings.length) {
-    entry.lines = [...warnings.map(warningLine), ...(entry.lines ?? [])];
+function waitShareLine(warning: WaitShareWarning): StatDetailLine {
+  return {
+    text: `Waiting on subagents took ${Math.round(warning.share * 100)}% of this session's cost: ${formatCost(warning.waitCost)} of ${formatCost(warning.sessionCost)} went to ${warning.requests} waits, ${warning.timedOut} of them timed out`,
+    warning: true,
+  };
+}
+
+// Cache warnings come first, then the wait-share warning.
+function withCostWarnings(
+  entry: StatDetailEntry,
+  warnings: readonly CacheWriteWarning[],
+  waitWarnings: readonly WaitShareWarning[] = [],
+): StatDetailEntry {
+  if (warnings.length || waitWarnings.length) {
+    entry.lines = [...warnings.map(warningLine), ...waitWarnings.map(waitShareLine), ...(entry.lines ?? [])];
   }
   return entry;
 }
@@ -4887,6 +4901,7 @@ export interface SessionCostUsage {
   // Estimated compaction requests, which the source recorded no usage for.
   compactionEstimate?: true;
   compactionUsage?: true;
+  waits?: UsageWaits;
   usage: Turn['usage'];
 }
 
@@ -4967,6 +4982,47 @@ export function cacheWriteWarnings(scopes: readonly CacheWriteScope[]): CacheWri
       ];
     })
     .sort((left, right) => Number(left.scope === 'delegated') - Number(right.scope === 'delegated'));
+}
+
+export interface WaitShareWarning {
+  requests: number;
+  timedOut: number;
+  waitCost: number;
+  sessionCost: number;
+  share: number;
+}
+
+// The main session's requests that read a subagent wait return, against the whole session's cost.
+// The main scope and the session total must be complete and priced.
+export function waitShareWarnings(main: CacheWriteScope, total: SessionCostTotal): WaitShareWarning[] {
+  if (main.incomplete || total.partial || total.dollars === null || !(total.dollars > 0)) {
+    return [];
+  }
+  let requests = 0;
+  let timedOut = 0;
+  let waitCost = 0;
+  for (const part of main.parts) {
+    const priced = priceSessionCost(part);
+    if (priced.partial || priced.dollars === null) {
+      return [];
+    }
+    if (!part.waits) {
+      continue;
+    }
+    const { recordedCost: _recordedCost, costBasis: _costBasis, ...unrecorded } = part;
+    const wait = priceSessionCost({ ...unrecorded, usage: part.waits.usage });
+    if (wait.partial || wait.dollars === null) {
+      return [];
+    }
+    requests += part.waits.requests;
+    timedOut += part.waits.timedOut;
+    waitCost += wait.dollars;
+  }
+  const share = waitCost / total.dollars;
+  if (requests < 5 || waitCost < 1 || share < 0.25) {
+    return [];
+  }
+  return [{ requests, timedOut, waitCost, sessionCost: total.dollars, share }];
 }
 
 export interface SessionCostProjection {
@@ -5592,7 +5648,10 @@ export function sessionCostProjection(
     })),
   ];
   const warnings = cacheWriteWarnings(warningScopes);
+  const waitWarnings = waitShareWarnings(warningScopes[0], total);
   const hasAutoReview = delegated.some((cost) => cost.part.model === 'codex-auto-review');
+  // Only a cache warning selects the per-scope layout. A wait warning joins the main entry of
+  // whichever layout applies and changes nothing else.
   const entries = warnings.length
     ? [
         ...(main.length || mainShort
@@ -5607,6 +5666,7 @@ export function sessionCostProjection(
                   lines: usageCategoryLines(main, true, mainShort),
                 },
                 warnings.filter((warning) => warning.scope === 'main'),
+                waitWarnings,
               ),
             ]
           : []),
@@ -5634,7 +5694,9 @@ export function sessionCostProjection(
     : delegated.length || short || mainShort
       ? hasAutoReview
         ? [
-            ...sessionCostIdentityEntries(main, 'main', () => mainShort),
+            ...sessionCostIdentityEntries(main, 'main', () => mainShort).map((entry, index) =>
+              index === 0 ? withCostWarnings(entry, [], waitWarnings) : entry,
+            ),
             ...(mainShort && !main.length ? [{ label: 'Main agent', value: 'cost unavailable' }] : []),
             ...sessionCostIdentityEntries(delegated, 'delegated', delegatedShort),
             ...(short ? [otherDelegatedEntry([], short)] : []),
@@ -5642,14 +5704,18 @@ export function sessionCostProjection(
         : [
             ...(main.length || mainShort
               ? [
-                  {
-                    label: costLabelWithModels(
-                      'Main agent',
-                      main.map((cost) => cost.part.model),
-                    ),
-                    value: sessionCostValue(captured ? [captured.main] : main, captured ? false : mainShort),
-                    lines: usageCategoryLines(main, true, mainShort),
-                  },
+                  withCostWarnings(
+                    {
+                      label: costLabelWithModels(
+                        'Main agent',
+                        main.map((cost) => cost.part.model),
+                      ),
+                      value: sessionCostValue(captured ? [captured.main] : main, captured ? false : mainShort),
+                      lines: usageCategoryLines(main, true, mainShort),
+                    },
+                    [],
+                    waitWarnings,
+                  ),
                 ]
               : []),
             ...(delegated.length || short
@@ -5663,13 +5729,17 @@ export function sessionCostProjection(
               : []),
           ]
       : [
-          {
-            label: costLabelWithModels(
-              'Cost by usage',
-              main.map((cost) => cost.part.model),
-            ),
-            lines: usageCategoryLines(main),
-          },
+          withCostWarnings(
+            {
+              label: costLabelWithModels(
+                'Cost by usage',
+                main.map((cost) => cost.part.model),
+              ),
+              lines: usageCategoryLines(main),
+            },
+            [],
+            waitWarnings,
+          ),
         ];
   const compactionCount = overheads.compactionCount ?? 0;
   const expiryCount = overheads.expiry ? cacheExpiryReturnCount(overheads.expiry).count : 0;

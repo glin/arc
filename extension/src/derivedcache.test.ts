@@ -1146,6 +1146,29 @@ test('derived cache round trips request pricing bands', () => {
   assert.deepEqual(loadDerivedCache(file).titles.get('/session.jsonl'), banded);
 });
 
+test('derived cache round trips subagent wait usage and drops an impossible timeout count', () => {
+  const file = path.join(folder(), 'cache.json');
+  const turn = stats.turns[0];
+  const waitPart = (timedOut: number) => ({
+    model: 'gpt-6-sol',
+    provider: 'openai',
+    contextWindow: null,
+    contextBand: null,
+    inferenceClass: null,
+    serviceTier: null,
+    waits: { requests: 2, timedOut, usage: { ...turn.usage, requests: 2 } },
+    usage: { ...turn.usage, requests: 3 },
+  });
+  const waited = (timedOut: number): DerivedTitleEntry => ({
+    ...title,
+    stats: { turns: [{ ...turn, model: 'gpt-6-sol', usageParts: [waitPart(timedOut)] }], compactions: [] },
+  });
+  saveDerivedCache(file, [['/session.jsonl', waited(1)]]);
+  assert.deepEqual(loadDerivedCache(file).titles.get('/session.jsonl'), waited(1));
+  saveDerivedCache(file, [['/session.jsonl', waited(3)]]);
+  assert.equal(loadDerivedCache(file).titles.get('/session.jsonl'), undefined);
+});
+
 test('derived cache round trips a regional Bedrock request', () => {
   const file = path.join(folder(), 'cache.json');
   const turn = stats.turns[0];

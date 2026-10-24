@@ -127,6 +127,14 @@ Check whether the provider changed cache keys, cache duration, routing, or reque
 
 The warning stays absent until the scope is complete and every required cache-write category has a supported price. A normal high cached-input share does not trigger it.
 
+### Respond to a high wait share
+
+`Waiting on subagents took 55% of this session's cost` means the main session's requests that read a `wait_agent` return cost at least a quarter of the session's estimated total. At least five such requests must cost at least $1 in total. The line names the wait cost against the session total, the number of waits, and how many of them timed out.
+
+A timed-out wait is a request that brought back no news. Lengthen the wait floor as [Lower the cost of waiting on subagents](#lower-the-cost-of-waiting-on-subagents) describes. Tell subagents to send only a final answer or one blocker message. A request after a subagent message or completion also carries the parent's reasoning and reply, so the share overstates pure waiting.
+
+The line stays absent until the main session and the session total are complete and every main-session request has a supported price.
+
 ## Lower the cost of waiting on subagents
 
 A parent agent pays one model request each time it wakes while a subagent runs. The two clients wake a parent differently.
@@ -142,7 +150,7 @@ default_wait_timeout_ms = 1500000
 max_wait_timeout_ms = 3600000
 ```
 
-The default must be at least the minimum. The wait still returns at once on completion or on a message, so the floor adds no idle time. Each progress message from a subagent wakes the parent, so tell subagents to send only a final answer or one blocker message. `arc cost <path> --by-tool-kind` shows how much of a session went to requests that read tool results, but it reports every Codex request as `no tool result`.
+The default must be at least the minimum. The wait still returns at once on completion or on a message, so the floor adds no idle time. Each progress message from a subagent wakes the parent, so tell subagents to send only a final answer or one blocker message. `arc cost <path> --by-tool` shows how much of a session went to requests that read each tool's results. Its `wait` row shows the requests that read `wait_agent`, `wait`, and `write_stdin` returns.
 
 ## Arc message delivery
 

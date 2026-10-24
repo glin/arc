@@ -147,7 +147,7 @@ test('the bundled cost command reads isolated roots and reports failures on stde
     const result = spawnSync(process.execPath, [cli, 'cost', 'session-1', '--json'], { env, encoding: 'utf8' });
     assert.equal(result.status, 0, result.stderr);
     const report = JSON.parse(result.stdout);
-    assert.equal(report.schemaVersion, 2);
+    assert.equal(report.schemaVersion, 3);
     assert.match(report.buildCommit, /^[0-9a-f]{40}$/);
     assert.ok(bundledVersion.includes(report.buildCommit.slice(0, 12)));
     assert.equal(report.source.file, file);
@@ -155,11 +155,11 @@ test('the bundled cost command reads isolated roots and reports failures on stde
     assert.equal('modelCosts' in report.parent, false);
     const human = spawnSync(
       process.execPath,
-      [cli, 'cost', 'session-1', '--by-model', '--by-tool-kind', '--until-text', 'absent'],
+      [cli, 'cost', 'session-1', '--by-model', '--by-tool', '--until-text', 'absent'],
       { env, encoding: 'utf8' },
     );
     assert.equal(human.status, 0, human.stderr);
-    for (const detail of ['Parent', 'Combined', '$0.0002', 'By model:', 'By tool kind', 'Matched: false'])
+    for (const detail of ['Parent', 'Combined', '$0.0002', 'By model:', 'By tool', 'Matched: false'])
       assert.ok(human.stdout.includes(detail), detail);
     const native = readFileSync(file, 'utf8');
     const stream = [

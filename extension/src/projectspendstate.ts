@@ -21,7 +21,7 @@ import type {
   SpendLedger,
   UsageCounts,
 } from './projectspend';
-import type { ReducerCompaction } from './transcript';
+import type { ReducerCompaction, UsageWaits } from './transcript';
 import {
   RETAINED_CACHE_EXPIRY_RETURNS,
   RETAINED_COMPACTION_PARENTS,
@@ -120,6 +120,8 @@ const CODEX_STATE_KEYS = {
   pendingCompactionBilling: true,
   recentResponseUsage: true,
   recentRequestEvents: true,
+  waitCallIds: true,
+  pendingWaitReturns: true,
   compactionResponseIds: true,
   firstTurnAt: true,
   lastTurnAt: true,
@@ -213,6 +215,17 @@ function turnUsage(value: unknown): value is TurnUsage {
   return ['short', 'long'].every((band) => bands[band] === undefined || usageCounts(bands[band]));
 }
 
+function usageWaits(value: unknown): value is UsageWaits {
+  return (
+    record(value) &&
+    nonNegativeInteger(value.requests) &&
+    value.requests > 0 &&
+    nonNegativeInteger(value.timedOut) &&
+    value.timedOut <= value.requests &&
+    turnUsage(value.usage)
+  );
+}
+
 function transcriptUsageEvent(value: unknown, expectedAgent: 'claude' | 'codex'): value is TranscriptUsageEvent {
   if (!record(value)) {
     return false;
@@ -254,6 +267,7 @@ function transcriptUsageEvent(value: unknown, expectedAgent: 'claude' | 'codex')
       value.cacheLifetime === '1h') &&
     (value.compactionsBefore === undefined || nonNegativeInteger(value.compactionsBefore)) &&
     (value.usageOrigin === undefined || value.usageOrigin === 'claude-advisor') &&
+    (value.waits === undefined || usageWaits(value.waits)) &&
     turnUsage(value.usage) &&
     nonEmptyText(value.requestKey)
   );
@@ -537,7 +551,18 @@ function codexState(value: unknown): value is CodexUsageReducerState {
         turnUsage(item.usage) &&
         (item.matched === undefined || item.matched === true) &&
         (item.explicitSnapshot === undefined || item.explicitSnapshot === true) &&
-        (item.suppressedSnapshot === undefined || transcriptUsageEvent(item.suppressedSnapshot, 'codex')),
+        (item.suppressedSnapshot === undefined || transcriptUsageEvent(item.suppressedSnapshot, 'codex')) &&
+        (item.waitTimedOut === undefined || typeof item.waitTimedOut === 'boolean'),
+    ) ||
+    !(value.waitCallIds === undefined || boundedIdentityList(value.waitCallIds)) ||
+    !(
+      value.pendingWaitReturns === undefined ||
+      value.pendingWaitReturns === null ||
+      (record(value.pendingWaitReturns) &&
+        nonEmptyText(value.pendingWaitReturns.turnId) &&
+        nonNegativeInteger(value.pendingWaitReturns.count) &&
+        nonNegativeInteger(value.pendingWaitReturns.timedOut) &&
+        value.pendingWaitReturns.timedOut <= value.pendingWaitReturns.count)
     ) ||
     !Array.isArray(value.recentRequestEvents) ||
     value.recentRequestEvents.length > CODEX_USAGE_ASSOCIATION_LIMIT ||
@@ -721,6 +746,7 @@ function bucket(value: unknown): ProjectUsageBucket | null {
         !record(value.usage) ||
         value.usage.requests !== 0 ||
         value.compactionEstimate !== undefined)) ||
+    (value.waits !== undefined && !usageWaits(value.waits)) ||
     !turnUsage(value.usage) ||
     !nonNegativeInteger(value.requests)
   ) {
@@ -748,6 +774,7 @@ function bucket(value: unknown): ProjectUsageBucket | null {
     ...(value.usageOrigin === 'claude-cost-state' || value.usageOrigin === 'claude-advisor'
       ? { usageOrigin: value.usageOrigin }
       : {}),
+    ...(value.waits === undefined ? {} : { waits: structuredClone(value.waits) }),
     usage: {
       requests: value.usage.requests,
       ...(value.usage.byContextBand === undefined ? {} : { byContextBand: structuredClone(value.usage.byContextBand) }),

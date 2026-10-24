@@ -12,7 +12,7 @@
   "cli/test/smoke.bundled-a.test.mjs": {
     "reason": "Compiled CLI commands must reach session reads, comments, and saved defaults through an authenticated window channel.",
     "cases": 8,
-    "matricesSha256": "7202998c02eaeaa1c98bd6f30aeca86170047ea8292499e24ff8bed63ef52921"
+    "matricesSha256": "13ee9104d450f4defe21afa9658577661810c8aef9203b38b77427d0c22105a0"
   },
   "cli/test/smoke.bundled-b.test.mjs": {
     "reason": "Compiled CLI commands must deliver session actions and streamed responses through the selected window channel.",
@@ -56,12 +56,12 @@
   },
   "extension/src/codex.test.ts": {
     "reason": "Real Git worktree ownership and descendant source resolution must agree with recorded Codex session relationships.",
-    "cases": 476,
-    "matricesSha256": "1bca233b48072a6996ccf7244a608ba59dd93e84493949297237014fba39e920"
+    "cases": 479,
+    "matricesSha256": "28a9d9159bc8306f0036866898b73e7ae72f5b5ab9138af0c8297e388be86511"
   },
   "extension/src/derivedcache.test.ts": {
     "reason": "Independent writers and host death must preserve shared cache rows and release stale filesystem locks.",
-    "cases": 89,
+    "cases": 90,
     "matricesSha256": "55da9f9b63e6e59531ede691941eea3b7eaaed01debbccc5b7174a6d01e191af"
   },
   "extension/src/exportsite.browser.test.ts": {
@@ -71,7 +71,7 @@
   },
   "extension/src/exportsite.test.ts": {
     "reason": "The production export bundle must retain complete responses and remove host-only actions from portable output.",
-    "cases": 36,
+    "cases": 37,
     "matricesSha256": "46ea953a7f24b22441e46fd7800f05f86c302694d9d6bd966d678ab5a608914a"
   },
   "extension/src/gitcommits.test.ts": {

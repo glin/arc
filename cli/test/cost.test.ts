@@ -15,11 +15,12 @@ import { afterEach, beforeEach, test, vi } from 'vitest';
 import { runCost as costOutput } from '../src/cost.ts';
 
 const runCost = (args: string[]) => costOutput([...args, '--json']);
+const round = (value: number) => Math.round(value * 10_000) / 10_000;
 
 test('human cost preserves unknown totals and requested detail while JSON drops only invariant notes', () => {
   const { root, file } = fixture();
   try {
-    const args = [file, '--source-only', '--by-model', '--by-tool-kind', '--until-text', 'no match'];
+    const args = [file, '--source-only', '--by-model', '--by-tool', '--until-text', 'no match'];
     const report = JSON.parse(runCost(args));
     const human = costOutput(args);
     for (const value of [
@@ -27,15 +28,15 @@ test('human cost preserves unknown totals and requested detail while JSON drops 
       'Combined',
       '$0.0002',
       'By model:',
-      'By tool kind',
+      'By tool',
       'Matched: false',
       report.untilText.note,
     ])
       assert.ok(human.includes(value), value);
     assert.equal(report.untilText.matched, false);
     assert.equal('cacheExpiryNote' in report, false);
-    assert.equal('requestsNote' in report.byToolKind, false);
-    assert.equal('requestsNote' in report.untilText.byToolKind, false);
+    assert.equal('requestsNote' in report.byTool, false);
+    assert.equal('requestsNote' in report.untilText.byTool, false);
     const record = JSON.parse(fs.readFileSync(file, 'utf8'));
     record.message.model = 'unpriced-future-model';
     fs.writeFileSync(file, JSON.stringify(record) + '\n');
@@ -92,7 +93,7 @@ function sourceOnlyParity(file: string, flags: string[] = []): void {
   assert.deepEqual(direct.combined, quantities);
   assert.equal('coverageDefect' in direct.combined, false);
   assert.equal(coverageDefect === undefined || typeof coverageDefect.cause === 'string', true);
-  for (const key of ['source', 'window', 'byToolKind', 'untilText', 'parentWindow'])
+  for (const key of ['source', 'window', 'byTool', 'untilText', 'parentWindow'])
     assert.deepEqual(direct[key], ordinary[key]);
   assert.equal('modelCosts' in ordinary.parent, false);
   const detail = JSON.parse(runCost([file, ...flags, '--source-only', '--by-model']));
@@ -101,7 +102,7 @@ function sourceOnlyParity(file: string, flags: string[] = []): void {
   assert.equal(Array.isArray(modelCosts), true);
   assert.deepEqual(detail.children, []);
   assert.deepEqual(detail.combined, quantities);
-  for (const key of ['source', 'window', 'byToolKind', 'untilText', 'parentWindow'])
+  for (const key of ['source', 'window', 'byTool', 'untilText', 'parentWindow'])
     assert.deepEqual(detail[key], ordinary[key]);
 }
 
@@ -487,7 +488,7 @@ test('cost resolves an id with explicit roots and prints the versioned JSON repo
   const { root, projects, codex, file } = fixture();
   try {
     const report = JSON.parse(runCost(['session-1', '--projects', projects, '--codex-sessions', codex]));
-    assert.equal(report.schemaVersion, 2);
+    assert.equal(report.schemaVersion, 3);
     assert.equal(typeof report.buildCommit, 'string');
     assert.equal(report.source.file, file);
     assert.equal(report.parent.requests, 1);
@@ -543,7 +544,7 @@ test('cost JSON exposes reconciled recorded totals and retains empty windows wit
   try {
     fs.writeFileSync(file, records.map((record) => JSON.stringify(record)).join('\n') + '\n');
     const report = JSON.parse(runCost([file, ...flags]));
-    assert.equal(report.schemaVersion, 2);
+    assert.equal(report.schemaVersion, 3);
     assert.equal(report.parent.coverage, 'recorded-reconciled');
     assert.equal(report.parent.costUsd, 0.003);
     assert.equal(report.parent.pricedCostUsd, 0.003);
@@ -805,7 +806,7 @@ test('cost JSON separates identified Codex bills from anonymous snapshots', () =
   );
   try {
     const report = JSON.parse(runCost(['billed', '--projects', projects, '--codex-sessions', codex]));
-    assert.equal(report.schemaVersion, 2);
+    assert.equal(report.schemaVersion, 3);
     assert.equal(report.parent.requests, 1);
     assert.equal(report.parent.snapshotEvidence.count, 1);
     assert.equal(report.parent.coverage, 'billed-with-unknown-coverage');
@@ -1020,29 +1021,21 @@ test('cost attributes failed tools and launch windows to the requests that made 
         .join('\n') + '\n',
     );
     const report = JSON.parse(
-      runCost([file, '--by-tool-kind', '--until-text', 'FINDING', '--window-agent', 'a1', '--until', at(4)]),
+      runCost([file, '--by-tool', '--until-text', 'FINDING', '--window-agent', 'a1', '--until', at(4)]),
     );
     assert.equal(report.parent.failedToolCalls, 1);
     assert.equal(report.parent.failedToolCallRequests, 1);
     assert.ok(report.parent.failedToolCallCostUsd > 0);
-    assert.equal(report.byToolKind.rows.find((row: { kind: string }) => row.kind === 'git').requests, 1);
-    assert.equal(report.byToolKind.rows.find((row: { kind: string }) => row.kind === 'subagent launch').requests, 1);
+    assert.equal(report.byTool.rows.find((row: { kind: string }) => row.kind === 'git').requests, 1);
+    assert.equal(report.byTool.rows.find((row: { kind: string }) => row.kind === 'subagent launch').requests, 1);
     assert.equal(report.untilText.matched, true);
-    assert.equal(report.untilText.byToolKind.rows.length, 1);
+    assert.equal(report.untilText.byTool.rows.length, 1);
     assert.equal(report.parentWindow.requests, 2);
     assert.equal(report.parentWindow.contextAtStart, 100);
     assert.equal(report.parentWindow.contextAtPeak, 100);
-    assert.equal('requestsNote' in report.parentWindow.byToolKind, false);
-    const human = costOutput([
-      file,
-      '--source-only',
-      '--by-tool-kind',
-      '--until-text',
-      'FINDING',
-      '--window-agent',
-      'a1',
-    ]);
-    for (const detail of ['Failed tools: 1', 'Matched: true', 'Agent window:', 'Agent window tool kinds'])
+    assert.equal('requestsNote' in report.parentWindow.byTool, false);
+    const human = costOutput([file, '--source-only', '--by-tool', '--until-text', 'FINDING', '--window-agent', 'a1']);
+    for (const detail of ['Failed tools: 1', 'Matched: true', 'Agent window:', 'Agent window tools'])
       assert.ok(human.includes(detail), detail);
     const exclusive = JSON.parse(runCost([file, '--window-agent', 'a1', '--until', at(3)]));
     assert.equal(exclusive.parent.requests, 1);
@@ -1052,13 +1045,13 @@ test('cost attributes failed tools and launch windows to the requests that made 
       const flags = [
         ...(mask & 1 ? ['--since', at(1)] : []),
         ...(mask & 2 ? ['--until', at(3)] : []),
-        ...(mask & 4 ? ['--by-tool-kind'] : []),
+        ...(mask & 4 ? ['--by-tool'] : []),
         ...(mask & 8 ? ['--until-text', 'FINDING'] : []),
         ...(mask & 16 ? ['--window-agent', 'a1'] : []),
       ];
       sourceOnlyParity(file, flags);
     }
-    assert.throws(() => runCost([file, '--source-only', '--until-text', 'finding']), /requires --by-tool-kind/);
+    assert.throws(() => runCost([file, '--source-only', '--until-text', 'finding']), /requires --by-tool[.]/);
     assert.throws(() => runCost([file, '--source-only', '--window-agent', 'missing']), /No Agent launch found/);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
@@ -1071,9 +1064,9 @@ test('until-text accepts Python global case, multiline, and dotall flags', () =>
     const record = JSON.parse(fs.readFileSync(file, 'utf8'));
     record.message.content = [{ type: 'text', text: 'noise\nFound\na bug' }];
     fs.writeFileSync(file, JSON.stringify(record) + '\n');
-    const report = JSON.parse(runCost([file, '--by-tool-kind', '--until-text', '(?ims)^found.a bug']));
+    const report = JSON.parse(runCost([file, '--by-tool', '--until-text', '(?ims)^found.a bug']));
     assert.equal(report.untilText.matched, true);
-    assert.throws(() => runCost([file, '--by-tool-kind', '--until-text', '(?x)found']), /Invalid --until-text pattern/);
+    assert.throws(() => runCost([file, '--by-tool', '--until-text', '(?x)found']), /Invalid --until-text pattern/);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
@@ -1327,7 +1320,7 @@ test('cost resolves an Agent launch from subagent metadata when its result has n
     sourceOnlyParity(file, [
       '--window-agent',
       'fallback',
-      '--by-tool-kind',
+      '--by-tool',
       '--until-text',
       'never',
       '--since',
@@ -1358,7 +1351,7 @@ test('cost resolves an Agent launch from subagent metadata when its result has n
       syncBuiltinESMExports();
     }
     assert.throws(() => runCost([file, '--window-agent', 'missing']), /No Agent launch found/);
-    assert.throws(() => runCost([file, '--until-text', 'finding']), /requires --by-tool-kind/);
+    assert.throws(() => runCost([file, '--until-text', 'finding']), /requires --by-tool[.]/);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
@@ -1418,7 +1411,91 @@ test('window-agent uses structured launch identity before metadata and quoted te
   }
 });
 
-test('tool-kind classification keeps redirected cat and its heredoc opening line', () => {
+test('tool report groups tools under their kind and the former flag name gives the same report', () => {
+  const { root, file } = fixture();
+  try {
+    const usage = (output: number) => ({
+      input_tokens: 1000,
+      output_tokens: output,
+      cache_read_input_tokens: 0,
+      cache_creation_input_tokens: 0,
+    });
+    const assistant = (
+      id: string,
+      second: number,
+      output: number,
+      tools: { id: string; name: string; input: object }[],
+    ) => ({
+      type: 'assistant',
+      timestamp: `2026-09-26T00:00:0${second}Z`,
+      message: {
+        id,
+        model: 'claude-opus-5',
+        usage: usage(output),
+        content: tools.map((tool) => ({ type: 'tool_use', ...tool })),
+      },
+    });
+    const results = (...ids: string[]) => ({
+      type: 'user',
+      message: { content: ids.map((id) => ({ type: 'tool_result', tool_use_id: id, content: 'done' })) },
+    });
+    fs.writeFileSync(
+      file,
+      [
+        assistant('search', 1, 10, [
+          { id: 'grep-call', name: 'Grep', input: { pattern: 'x' } },
+          { id: 'glob-call', name: 'Glob', input: { pattern: '*.ts' } },
+          { id: 'second-grep-call', name: 'Grep', input: { pattern: 'y' } },
+        ]),
+        results('grep-call', 'glob-call', 'second-grep-call'),
+        assistant('read', 2, 400, [{ id: 'git-call', name: 'Bash', input: { command: 'git status' } }]),
+        results('git-call'),
+        assistant('final', 3, 4000, []),
+      ]
+        .map((record) => JSON.stringify(record))
+        .join('\n') + '\n',
+    );
+    const report = JSON.parse(runCost([file, '--by-tool']));
+    const search = report.byTool.rows.find((row: { kind: string }) => row.kind === 'search');
+    assert.deepEqual(
+      search.tools.map((tool: { tool: string; requests: number }) => [tool.tool, tool.requests]),
+      [
+        ['Grep', 1],
+        ['Glob', 1],
+      ],
+    );
+    assert.equal(search.tools[0].costUsd, round(search.costUsd * (2 / 3)));
+    for (const row of report.byTool.rows) {
+      const toolShare = row.tools.reduce((sum: number, tool: { shareOfCost: number }) => sum + tool.shareOfCost, 0);
+      assert.ok(Math.abs(toolShare - (row.tools.length ? row.shareOfCost : 0)) < 0.0002, row.kind);
+    }
+    assert.deepEqual(report.byTool.rows.find((row: { kind: string }) => row.kind === 'no tool result').tools, []);
+    assert.equal(report.byTool.rows.find((row: { kind: string }) => row.kind === 'git').tools[0].tool, 'Bash git');
+    const { buildCommit: _build, ...current } = report;
+    const { buildCommit: _formerBuild, ...former } = JSON.parse(runCost([file, '--by-tool-kind']));
+    assert.deepEqual(former, current);
+    const table = costOutput([file, '--by-tool']).split('\n');
+    const start = table.indexOf('By tool') + 1;
+    const rows = table.slice(
+      start,
+      table.findIndex((line, index) => index > start && line.startsWith('Unpriced')),
+    );
+    assert.deepEqual(
+      rows.map((line) => line.trim().split(/\s{2,}/)[0]),
+      ['Tool', 'git', 'Bash git', 'search', 'Grep', 'Glob', 'no tool result'],
+    );
+    assert.ok(rows.filter((line) => line.startsWith('  ')).length === 3);
+    assert.equal(new Set(rows.map((line) => line.length)).size, 1);
+    for (const column of ['Requests', 'Attributed cost', 'Share']) {
+      const end = rows[0].indexOf(column) + column.length;
+      for (const line of rows) assert.notEqual(line[end - 1], ' ', `${column}: ${line}`);
+    }
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('tool classification keeps redirected cat and its heredoc opening line', () => {
   const { root, file } = fixture();
   try {
     const usage = { input_tokens: 10, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 };
@@ -1452,10 +1529,10 @@ test('tool-kind classification keeps redirected cat and its heredoc opening line
         .map((record) => JSON.stringify(record))
         .join('\n') + '\n',
     );
-    const report = JSON.parse(runCost([file, '--by-tool-kind']));
-    assert.equal(report.byToolKind.rows.find((row: { kind: string }) => row.kind === 'other').requests, 1);
+    const report = JSON.parse(runCost([file, '--by-tool']));
+    assert.equal(report.byTool.rows.find((row: { kind: string }) => row.kind === 'other').requests, 1);
     assert.equal(
-      report.byToolKind.rows.find((row: { kind: string }) => row.kind === 'file read'),
+      report.byTool.rows.find((row: { kind: string }) => row.kind === 'file read'),
       undefined,
     );
   } finally {

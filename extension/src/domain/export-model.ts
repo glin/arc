@@ -65,6 +65,8 @@ export interface ExportCostPart {
   estimated: boolean;
   compactionUsage?: true;
   origin: 'recorded' | 'claude-cost-state' | 'claude-advisor';
+  // The requests that read a subagent wait return, and their usage.
+  waits?: { requests: number; timedOut: number; usage: ExportUsage };
   usage: ExportUsage;
 }
 export interface ExportCost {

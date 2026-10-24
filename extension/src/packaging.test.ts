@@ -939,7 +939,7 @@ test.for(launcherShells)(
       assert.equal(JSON.parse(status.stdout).schemaVersion, 1);
       assert.equal(cost.status, 0, cost.stderr);
       const report = JSON.parse(cost.stdout);
-      assert.equal(report.schemaVersion, 2);
+      assert.equal(report.schemaVersion, 3);
       assert.equal(report.parent.requests, 1);
       assert.equal(report.parent.modelCosts[0].model, 'claude-opus-5');
       assert.match(report.buildCommit, /^[0-9a-f]{40}$/);

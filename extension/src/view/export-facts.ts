@@ -53,6 +53,8 @@ const LABELS: Record<string, string> = {
   requestCountExact: 'Exact request count',
   estimated: 'Estimated usage',
   compactionUsage: 'Recorded compaction usage',
+  waits: 'Subagent waits',
+  timedOut: 'Timed-out waits',
   origin: 'Usage source',
   requests: 'Model requests',
   input: 'Uncached input tokens',

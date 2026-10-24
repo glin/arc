@@ -238,7 +238,7 @@ Unavailable source facts project no marks. Reader boundaries remain separate, an
 
 ## Cost reports
 
-Cost prints readable summaries by default. `--json` prints one structured object. Neither format reads stdin. `schemaVersion: 2` identifies the contract. `buildCommit` identifies the bundled commit, or `unknown` without build identity. `rateNote` describes pricing.
+Cost prints readable summaries by default. `--json` prints one structured object. Neither format reads stdin. `schemaVersion: 3` identifies the contract. `buildCommit` identifies the bundled commit, or `unknown` without build identity. `rateNote` describes pricing.
 
 ### Source selection
 
@@ -301,15 +301,17 @@ Model quantities reconcile with source billing before rounding. Full costs requi
 
 ### Supplementary results
 
-`--by-tool-kind` splits Claude request prices across the first tool results they read. Codex requests use `no tool result`. Requests can touch several kinds, so row request counts can exceed the parent total. Top-level `byToolKind` uses the main parent window.
+`--by-tool` splits each parent request's price evenly across the tool results it reads. A Claude request reads the results recorded before it. A Codex request reads the outputs recorded before its billing record, which is the first `token_usage_record` after each output. A Codex rollout without billing records reports every request as `no tool result`. Codex `wait_agent`, `wait`, and `write_stdin` calls form the `wait` kind.
 
-`--until-text REGEX` requires `--by-tool-kind`. Its separate `untilText.byToolKind` excludes the first matching parent request and all later requests within the main window. No match includes every parent request in that window. `untilText.matched` reports whether one exists. This result changes no other summary.
+Each `byTool.rows[]` row names a kind and lists its `tools[]`. A tool is the tool name, or the tool and its program for a shell command, such as `Bash git` or `exec_command rg`. Tool shares use the same total as kind shares, so the tools of a kind sum to that kind. Text output indents each tool under its kind. A request counts once for every kind and every tool it touches, so row request counts can exceed the parent total. Top-level `byTool` uses the main parent window. `--by-tool-kind` is an alias of `--by-tool`.
+
+`--until-text REGEX` requires `--by-tool`. Its separate `untilText.byTool` excludes the first matching parent request and all later requests within the main window. No match includes every parent request in that window. `untilText.matched` reports whether one exists. This result changes no other summary.
 
 Matching searches Claude assistant text and tool input. Codex supplies empty text. Patterns requiring characters never match Codex. Empty-text patterns also match Codex and empty Claude requests. Multiline `^$` also matches blank Claude lines, including the separator before tool input without assistant text. A literal empty argument refuses.
 
 Regex matching is multiline. Leading `(?i)`, `(?m)`, and `(?s)` select case-insensitive, multiline, and dot-all behavior. `\A` and `\Z` match input boundaries. Unsupported syntax fails.
 
-`--window-agent ID` resolves launches from structured results, exact adjacent metadata, or launch-result text. The `agent-` prefix and `.jsonl` suffix are optional. Its separate `parentWindow` starts with the parent request launching that Agent. It ignores `--since`, includes requests at `--until`, and excludes children. With `--by-tool-kind`, it includes its own tool-kind result.
+`--window-agent ID` resolves launches from structured results, exact adjacent metadata, or launch-result text. The `agent-` prefix and `.jsonl` suffix are optional. Its separate `parentWindow` starts with the parent request launching that Agent. It ignores `--since`, includes requests at `--until`, and excludes children. With `--by-tool`, it includes its own tool result.
 
 ## Status line
 

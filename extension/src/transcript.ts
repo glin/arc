@@ -25,6 +25,7 @@ import {
   ModelSpend,
   addModelUsage,
   addUsage,
+  addUsageWaits,
   emptyUsage,
   agentSpendIsOpen,
   heaviestModel,
@@ -334,6 +335,15 @@ export interface TurnUsagePart {
   compactionEstimate?: true;
   compactionUsage?: true;
   usageOrigin?: UsageOrigin;
+  waits?: UsageWaits;
+  usage: TurnUsage;
+}
+
+// The requests that read a `wait_agent` return, which is a subagent wait, and their summed usage.
+// `timedOut` counts the requests whose every wait return was a timeout.
+export interface UsageWaits {
+  requests: number;
+  timedOut: number;
   usage: TurnUsage;
 }
 
@@ -365,6 +375,7 @@ function addPricedUsagePart(parts: TurnUsagePart[], add: TurnUsagePart): void {
   const same = parts.find((part) => samePricedPart(part, add));
   if (same) {
     addUsage(same.usage, add.usage);
+    addUsageWaits(same, add.waits);
     return;
   }
   const usage = { ...add.usage };
@@ -373,7 +384,7 @@ function addPricedUsagePart(parts: TurnUsagePart[], add: TurnUsagePart): void {
       Object.entries(add.usage.byContextBand).map(([band, held]) => [band, { ...held }]),
     );
   }
-  parts.push({ ...add, usage });
+  parts.push({ ...add, ...(add.waits ? { waits: { ...add.waits, usage: { ...add.waits.usage } } } : {}), usage });
 }
 
 export function addTurnUsagePart(turn: Pick<Turn, 'usageParts'>, event: UsageEvent): void {
@@ -381,6 +392,7 @@ export function addTurnUsagePart(turn: Pick<Turn, 'usageParts'>, event: UsageEve
   const same = parts.find((part) => samePricedPart(part, event));
   if (same) {
     addUsage(same.usage, event.usage, event.contextBand);
+    addUsageWaits(same, event.waits);
     if (Object.values(same.usage).every((value) => typeof value !== 'number' || value === 0))
       parts.splice(parts.indexOf(same), 1);
     return;
@@ -405,6 +417,7 @@ export function addTurnUsagePart(turn: Pick<Turn, 'usageParts'>, event: UsageEve
     ...(event.compactionEstimate ? { compactionEstimate: true as const } : {}),
     ...(event.compactionUsage ? { compactionUsage: true as const } : {}),
     ...(event.usageOrigin ? { usageOrigin: event.usageOrigin } : {}),
+    ...(event.waits ? { waits: { ...event.waits, usage: { ...event.waits.usage } } } : {}),
     usage,
   });
 }
@@ -493,6 +506,8 @@ export interface UsageEvent {
   // bills as its own request of the advisor model and can record cache reads and writes.
   // It counts in cost and request totals, outside executor context, cache-expiry adjacency, and compaction figures.
   usageOrigin?: 'claude-advisor';
+  // Set when this request read a `wait_agent` return. Its usage equals the request's usage.
+  waits?: UsageWaits;
 }
 
 // One compaction in request order, for the cache-expiry scan.

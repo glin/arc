@@ -288,6 +288,9 @@ function sessionCostUsage(part: ExportCostPart): SessionCostUsage & TurnUsagePar
     ...(part.estimated ? { compactionEstimate: true as const } : {}),
     ...(part.compactionUsage ? { compactionUsage: true as const } : {}),
     ...(part.origin === 'claude-cost-state' || part.origin === 'claude-advisor' ? { usageOrigin: part.origin } : {}),
+    ...(part.waits
+      ? { waits: { requests: part.waits.requests, timedOut: part.waits.timedOut, usage: usage(part.waits.usage) } }
+      : {}),
     usage: usage(part.usage),
   };
 }

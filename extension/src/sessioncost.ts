@@ -7,11 +7,13 @@ import {
   codexRequestUsage,
   codexSessionsRoot,
   createCodexUsageLineReducer,
+  nestedToolName,
   openingRecordOf,
   readCodexSessionMeta,
   recordedDatePredatesOpening,
   rolloutFiles,
   scanCodexDispatchReferences,
+  wrappedCommand,
 } from './codex';
 import {
   CACHE_LIFETIME_MS,
@@ -65,6 +67,8 @@ export interface SessionRequest extends UsageEvent {
   toolOnly?: true;
   failedToolCalls?: number;
   toolKinds?: string[];
+  // The tool behind each entry of toolKinds, such as `Grep` or `exec_command rg`.
+  toolLabels?: string[];
   ownText?: string;
   launchedAgentIds?: string[];
   agentToolCallIds?: string[];
@@ -178,8 +182,8 @@ export interface SessionCostReport {
   parent: SessionCostSummary;
   children: (Pick<SessionSource, 'kind' | 'file' | 'sessionId' | 'agent' | 'invocationId'> & SessionCostSummary)[];
   combined: SessionCostSummary;
-  byToolKind?: ToolKindReport;
-  untilText?: { pattern: string; matched: boolean; byToolKind: ToolKindReport; note?: string };
+  byTool?: ToolReport;
+  untilText?: { pattern: string; matched: boolean; byTool: ToolReport; note?: string };
   parentWindow?: {
     agentIdStartRequest: string;
     until: string | null;
@@ -187,14 +191,20 @@ export interface SessionCostReport {
     costUsd: number | null;
     contextAtStart: number | null;
     contextAtPeak: number | null;
-    byToolKind?: ToolKindReport;
+    byTool?: ToolReport;
   };
   rateNote: string;
   cacheExpiryNote: string;
 }
 
-interface ToolKindReport {
-  rows: { kind: string; requests: number; costUsd: number; shareOfCost: number | null }[];
+interface ToolCostRow {
+  requests: number;
+  costUsd: number;
+  shareOfCost: number | null;
+}
+
+interface ToolReport {
+  rows: (ToolCostRow & { kind: string; tools: (ToolCostRow & { tool: string })[] })[];
   unpricedRequests: number;
   requestsNote: string;
 }
@@ -750,7 +760,7 @@ export function sessionCostReport(
     since?: string | number;
     until?: string | number;
     roots?: SessionRoots;
-    byToolKind?: boolean;
+    byTool?: boolean;
     untilText?: string;
     windowAgent?: string;
     byModel?: boolean;
@@ -866,7 +876,7 @@ export function sessionCostReport(
   }
   combinedSummary.cacheExpiry.largest.sort((a, b) => (b.inputCostUsd ?? -1) - (a.inputCostUsd ?? -1));
   combinedSummary.cacheExpiry.largest = combinedSummary.cacheExpiry.largest.slice(0, 5);
-  const byToolKind = options.byToolKind ? toolKindCosts(parentRequests) : undefined;
+  const byTool = options.byTool ? toolCosts(parentRequests) : undefined;
   let untilText: SessionCostReport['untilText'];
   if (options.untilText) {
     const matcher = untilTextMatcher(options.untilText);
@@ -874,7 +884,7 @@ export function sessionCostReport(
     untilText = {
       pattern: options.untilText,
       matched: cutoff >= 0,
-      byToolKind: toolKindCosts(cutoff < 0 ? parentRequests : parentRequests.slice(0, cutoff)),
+      byTool: toolCosts(cutoff < 0 ? parentRequests : parentRequests.slice(0, cutoff)),
       ...(cutoff < 0 ? { note: 'No assistant text matched the pattern, so every request is counted.' } : {}),
     };
   }
@@ -916,7 +926,7 @@ export function sessionCostReport(
         : null,
       contextAtStart: contexts.length ? contexts[0] : null,
       contextAtPeak: contexts.length ? contexts.reduce((peak, tokens) => Math.max(peak, tokens), 0) : null,
-      ...(options.byToolKind ? { byToolKind: toolKindCosts(rows) } : {}),
+      ...(options.byTool ? { byTool: toolCosts(rows) } : {}),
     };
   }
   return {
@@ -932,7 +942,7 @@ export function sessionCostReport(
     parent: parentSummary,
     children: childReports,
     combined: combinedSummary,
-    ...(byToolKind ? { byToolKind } : {}),
+    ...(byTool ? { byTool } : {}),
     ...(untilText ? { untilText } : {}),
     ...(parentWindow ? { parentWindow } : {}),
     rateNote: `List-price estimate, not a subscription charge.${sol ? ` GPT-5.6 Sol uses its promotional rate through ${sol.until}.` : ''}`,
@@ -1030,7 +1040,17 @@ function claudeToolIds(line: string): {
   }
 }
 
-const TOOL_KINDS = ['git', 'file read', 'search', 'test or build', 'subagent launch', 'other', 'no tool result'];
+const TOOL_KINDS = [
+  'git',
+  'file read',
+  'file edit',
+  'search',
+  'test or build',
+  'subagent launch',
+  'wait',
+  'other',
+  'no tool result',
+];
 
 function shellWords(segment: string): string[] {
   const words: string[] = [];
@@ -1057,7 +1077,8 @@ function shellWords(segment: string): string[] {
   return words;
 }
 
-function shellKind(command: string): string {
+// The kind of a shell command line, and the program of the segment that decided it.
+function shellCommand(command: string): { kind: string; program: string | null } {
   const segments = command
     .replace(/(<<-?\s*['"]?(\w+)['"]?[^\n]*\n)[\s\S]*?^\s*\2\s*$/gm, '$1')
     .split(/&&|\|\||;|\r?\n/);
@@ -1074,33 +1095,103 @@ function shellKind(command: string): string {
       .toLowerCase();
     if (!program || program === 'cd' || program === 'set-location') continue;
     const args = words.slice(index + 1);
-    if (program === 'git') return 'git';
-    if (['cat', 'head', 'tail', 'less', 'type', 'get-content'].includes(program))
-      return program === 'cat' && args.some((word) => word.startsWith('>')) ? 'other' : 'file read';
-    if (['rg', 'grep', 'find', 'ls', 'select-string', 'get-childitem'].includes(program)) return 'search';
-    if (['npm', 'npx', 'pnpm', 'yarn', 'pytest', 'vitest', 'tsc', 'make', 'cargo', 'dotnet'].includes(program))
-      return 'test or build';
-    if (program === 'sed') return args.includes('-n') ? 'file read' : 'other';
-    if (program === 'python' || program === 'python3')
-      return args[0] === '-m' && ['pytest', 'unittest'].includes(args[1]) ? 'test or build' : 'other';
-    if (program === 'go') return args[0] === 'test' ? 'test or build' : 'other';
-    if (program === 'node') return args.includes('--test') ? 'test or build' : 'other';
-    return 'other';
+    return { kind: programKind(program, args), program };
   }
+  return { kind: 'other', program: null };
+}
+
+function programKind(program: string, args: readonly string[]): string {
+  if (program === 'git') return 'git';
+  if (['cat', 'head', 'tail', 'less', 'type', 'get-content'].includes(program))
+    return program === 'cat' && args.some((word) => word.startsWith('>')) ? 'other' : 'file read';
+  if (['rg', 'grep', 'find', 'ls', 'select-string', 'get-childitem'].includes(program)) return 'search';
+  if (['npm', 'npx', 'pnpm', 'yarn', 'pytest', 'vitest', 'tsc', 'make', 'cargo', 'dotnet'].includes(program))
+    return 'test or build';
+  if (program === 'sed') return args.includes('-n') ? 'file read' : 'other';
+  if (program === 'python' || program === 'python3')
+    return args[0] === '-m' && ['pytest', 'unittest'].includes(args[1]) ? 'test or build' : 'other';
+  if (program === 'go') return args[0] === 'test' ? 'test or build' : 'other';
+  if (program === 'node') return args.includes('--test') ? 'test or build' : 'other';
   return 'other';
 }
 
-function toolKind(name: string, input: unknown): string {
-  if (name === 'Agent' || name === 'Task') return 'subagent launch';
-  if (name === 'Read') return 'file read';
-  if (name === 'Grep' || name === 'Glob') return 'search';
+interface ToolResult {
+  kind: string;
+  label: string;
+}
+
+// A labelled shell result, such as `Bash git`. A command without a program keeps the bare tool name.
+function shellResult(tool: string, command: string): ToolResult {
+  const { kind, program } = shellCommand(command);
+  return { kind, label: program ? `${tool} ${program}` : tool };
+}
+
+function toolKind(name: string, input: unknown): ToolResult {
+  if (name === 'Agent' || name === 'Task') return { kind: 'subagent launch', label: name };
+  if (name === 'Read') return { kind: 'file read', label: name };
+  if (['Edit', 'Write', 'MultiEdit', 'NotebookEdit'].includes(name)) return { kind: 'file edit', label: name };
+  if (name === 'Grep' || name === 'Glob') return { kind: 'search', label: name };
   if (name === 'Bash' || name === 'PowerShell')
-    return shellKind(
+    return shellResult(
+      name,
       typeof input === 'object' && input !== null && 'command' in input && typeof input.command === 'string'
         ? input.command
         : '',
     );
-  return 'other';
+  return { kind: 'other', label: name };
+}
+
+// The command line of a Codex `shell` argument array, without its shell wrapper.
+function codexShellArray(command: readonly unknown[]): string {
+  const words = command.filter((word): word is string => typeof word === 'string');
+  const shell = words[0]
+    ?.replaceAll('\\', '/')
+    .split('/')
+    .at(-1)
+    ?.replace(/\.exe$/i, '')
+    .toLowerCase();
+  const flag = words[1]?.toLowerCase();
+  if (
+    ((shell === 'bash' || shell === 'sh' || shell === 'zsh') && (flag === '-lc' || flag === '-c')) ||
+    ((shell === 'powershell' || shell === 'pwsh') && flag === '-command')
+  )
+    return words.slice(2).join(' ');
+  return words.join(' ');
+}
+
+// A Codex tool call's kind. An `exec` wrapper call maps like the one tool it wraps.
+function codexToolKind(recordedName: string, input: unknown): ToolResult {
+  const wrapped = recordedName === 'exec' ? wrappedCommand(input) : null;
+  const name =
+    recordedName === 'exec'
+      ? (nestedToolName(input) ?? (wrapped === null ? recordedName : 'exec_command'))
+      : recordedName;
+  if (name === 'wait_agent' || name === 'wait' || name === 'write_stdin') return { kind: 'wait', label: name };
+  if (name === 'spawn_agent') return { kind: 'subagent launch', label: name };
+  if (name === 'apply_patch') return { kind: 'file edit', label: name };
+  if (name === 'exec_command' || name === 'shell') {
+    if (wrapped !== null) return shellResult(name, wrapped);
+    let parsed: unknown = input;
+    if (typeof input === 'string') {
+      try {
+        parsed = JSON.parse(input);
+      } catch {
+        parsed = null;
+      }
+    }
+    const fields =
+      typeof parsed === 'object' && parsed !== null ? (parsed as { cmd?: unknown; command?: unknown }) : {};
+    const command =
+      typeof fields.cmd === 'string'
+        ? fields.cmd
+        : typeof fields.command === 'string'
+          ? fields.command
+          : Array.isArray(fields.command)
+            ? codexShellArray(fields.command)
+            : '';
+    return shellResult(name, command);
+  }
+  return { kind: 'other', label: name || 'other' };
 }
 
 function stringLeaves(value: unknown): string[] {
@@ -1110,20 +1201,45 @@ function stringLeaves(value: unknown): string[] {
   return [];
 }
 
-function toolKindCosts(requests: readonly SessionRequest[]): ToolKindReport {
-  const totals = new Map(TOOL_KINDS.map((kind) => [kind, { requests: 0, cost: 0 }]));
+function toolCosts(requests: readonly SessionRequest[]): ToolReport {
+  const totals = new Map(
+    TOOL_KINDS.map((kind) => [
+      kind,
+      { requests: 0, cost: 0, tools: new Map<string, { requests: number; cost: number }>() },
+    ]),
+  );
   let unpricedRequests = 0;
   for (const request of requests.filter((row) => !row.evidenceOnly)) {
     const kinds = request.toolKinds?.length ? request.toolKinds : ['no tool result'];
+    // A request without a tool result has no tool rows.
+    const labels = request.toolKinds?.length ? kinds.map((kind, index) => request.toolLabels?.[index] ?? kind) : [];
     for (const kind of new Set(kinds)) totals.get(kind)!.requests++;
+    const touched = new Set<string>();
+    labels.forEach((label, index) => {
+      const kind = kinds[index];
+      const key = JSON.stringify([kind, label]);
+      if (touched.has(key)) return;
+      touched.add(key);
+      const tools = totals.get(kind)!.tools;
+      const tool = tools.get(label) ?? { requests: 0, cost: 0 };
+      tool.requests++;
+      tools.set(label, tool);
+    });
     const quote = requestQuote(request);
     if (!quote) {
       unpricedRequests++;
       continue;
     }
-    for (const kind of kinds) totals.get(kind)!.cost += quote.cost / kinds.length;
+    // Each result occurrence carries one kind and one tool, so tool costs sum to their kind.
+    kinds.forEach((kind, index) => {
+      const share = quote.cost / kinds.length;
+      const row = totals.get(kind)!;
+      row.cost += share;
+      if (labels.length) row.tools.get(labels[index])!.cost += share;
+    });
   }
   const total = [...totals.values()].reduce((sum, row) => sum + row.cost, 0);
+  const shareOf = (cost: number) => (total ? round(cost / total, 4) : null);
   return {
     rows: TOOL_KINDS.flatMap((kind) => {
       const row = totals.get(kind)!;
@@ -1133,31 +1249,58 @@ function toolKindCosts(requests: readonly SessionRequest[]): ToolKindReport {
               kind,
               requests: row.requests,
               costUsd: round(row.cost, 4),
-              shareOfCost: total ? round(row.cost / total, 4) : null,
+              shareOfCost: shareOf(row.cost),
+              tools: [...row.tools]
+                .sort(
+                  ([leftName, left], [rightName, right]) =>
+                    right.cost - left.cost || right.requests - left.requests || leftName.localeCompare(rightName),
+                )
+                .map(([tool, held]) => ({
+                  tool,
+                  requests: held.requests,
+                  costUsd: round(held.cost, 4),
+                  shareOfCost: shareOf(held.cost),
+                })),
             },
           ]
         : [];
     }),
     unpricedRequests,
     requestsNote:
-      'Requests counts a request once for every kind it touches, so counts across kinds can exceed the request total.',
+      'Requests counts a request once for every kind and every tool it touches, so counts across rows can exceed the request total.',
   };
 }
 
-function codexToolCall(line: string): { id: string; timestamp: number } | null {
+function codexToolCall(line: string): { id: string; timestamp: number; name: string; arguments: unknown } | null {
   if (!/"(?:custom_tool_call|function_call|web_search_call)"/.test(line)) return null;
   try {
     const record = JSON.parse(line) as {
       type?: string;
       timestamp?: string;
-      payload?: { type?: string; call_id?: string; id?: string };
+      payload?: { type?: string; call_id?: string; id?: string; name?: string; arguments?: unknown; input?: unknown };
     };
     const kind = record.type === 'event_msg' || record.type === 'response_item' ? record.payload?.type : record.type;
     return kind === 'custom_tool_call' || kind === 'function_call' || kind === 'web_search_call'
       ? {
           id: record.payload?.call_id ?? record.payload?.id ?? line,
           timestamp: Date.parse(record.timestamp ?? '') || 0,
+          name: kind === 'web_search_call' ? 'web_search' : (record.payload?.name ?? ''),
+          arguments: record.payload?.arguments ?? record.payload?.input ?? null,
         }
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+// The call a Codex tool output answers.
+function codexToolOutputId(line: string): string | null {
+  if (!/"(?:custom_tool_call_output|function_call_output)"/.test(line)) return null;
+  try {
+    const record = JSON.parse(line) as { type?: string; payload?: { type?: string; call_id?: string } };
+    return record.type === 'response_item' &&
+      (record.payload?.type === 'function_call_output' || record.payload?.type === 'custom_tool_call_output')
+      ? (record.payload.call_id ?? null)
       : null;
   } catch {
     return null;
@@ -1749,10 +1892,19 @@ export function readSessionRequests(
   const toolDetails = new Map<string, { name: string; input: unknown }>();
   const seenResults = new Set<string>();
   const pendingResults: string[] = [];
+  const resultEvidence = (results: readonly ToolResult[]) => ({
+    toolKinds: results.map((result) => result.kind),
+    toolLabels: results.map((result) => result.label),
+  });
+  // Codex outputs wait for the first billing record after them, which is the request that read them.
+  // The token_count event logged just after an output belongs to the request that made the call.
+  const codexCalls = new Map<string, ToolResult>();
+  const pendingCodexResults: ToolResult[] = [];
   const requestEvidence = new Map<
     string,
     {
       toolKinds: string[];
+      toolLabels: string[];
       ownText: string;
       failedToolCalls: number;
       launchedAgentIds: string[];
@@ -2049,6 +2201,7 @@ export function readSessionRequests(
               ...(completeBill ? {} : { incomplete: true }),
             };
             billed.toolCalls = consumeCodexTools({ ...billed, requestKey: `codex:${turnId}:billing` });
+            if (pendingCodexResults.length) Object.assign(billed, resultEvidence(pendingCodexResults));
             billingRecords.set(raw.payload.response_id, {
               turnId,
               request: billed,
@@ -2060,7 +2213,13 @@ export function readSessionRequests(
               turn: turnVector,
               observations: [{ order: sourceOrder, segment: costSegment, thread: threadVector }],
             });
+          } else if (previousBill && acceptedScope && pendingCodexResults.length) {
+            const held = previousBill.request;
+            const added = resultEvidence(pendingCodexResults);
+            held.toolKinds = [...(held.toolKinds ?? []), ...added.toolKinds];
+            held.toolLabels = [...(held.toolLabels ?? []), ...added.toolLabels];
           }
+          pendingCodexResults.length = 0;
         }
       } catch {
         // A malformed record cannot establish a billed request.
@@ -2076,10 +2235,12 @@ export function readSessionRequests(
     if (claudeTools && !(claudeTools.sidechain && role !== 'claude-subagent' && !spendFileIsClaudeChild(file))) {
       const held = toolIds.get(claudeTools.key) ?? new Set<string>();
       const evidence = requestEvidence.get(claudeTools.key) ?? {
-        toolKinds: pendingResults.map((id) => {
-          const tool = toolDetails.get(id);
-          return tool ? toolKind(tool.name, tool.input) : 'other';
-        }),
+        ...resultEvidence(
+          pendingResults.map((id) => {
+            const tool = toolDetails.get(id);
+            return tool ? toolKind(tool.name, tool.input) : { kind: 'other', label: 'other' };
+          }),
+        ),
         ownText: '',
         failedToolCalls: 0,
         launchedAgentIds: [],
@@ -2106,7 +2267,14 @@ export function readSessionRequests(
         const held = codexTools.get(turnId) ?? new Map<string, number>();
         held.set(codexTool.id, codexTool.timestamp);
         codexTools.set(turnId, held);
+        codexCalls.set(codexTool.id, codexToolKind(codexTool.name, codexTool.arguments));
       }
+    }
+    const codexOutput = codex ? codexToolOutputId(line) : null;
+    const codexResult = codexOutput === null ? undefined : codexCalls.get(codexOutput);
+    if (codexResult) {
+      codexCalls.delete(codexOutput!);
+      pendingCodexResults.push(codexResult);
     }
     const priorRequestNumber =
       codex && record?.kind === 'token_count'

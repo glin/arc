@@ -419,6 +419,9 @@ export function costPartOf(part: SessionCostUsage, scope: string | null = null):
     estimated: part.compactionEstimate === true,
     ...(part.compactionUsage ? { compactionUsage: true as const } : {}),
     origin: part.usageOrigin ?? 'recorded',
+    ...(part.waits
+      ? { waits: { requests: part.waits.requests, timedOut: part.waits.timedOut, usage: usageOf(part.waits.usage) } }
+      : {}),
     usage: usageOf(part.usage),
   };
 }
@@ -438,9 +441,15 @@ export function costPartsOf(part: SessionCostUsage, scope: string | null = null)
   ] as const;
   if (!counts.every((key) => (part.usage[key] ?? 0) === (bands.short?.[key] ?? 0) + (bands.long?.[key] ?? 0)))
     return [costPartOf(part, scope)];
-  return (['short', 'long'] as const).flatMap((contextBand) =>
-    bands[contextBand] ? [costPartOf({ ...part, contextBand, usage: bands[contextBand] }, scope)] : [],
-  );
+  // Wait requests stay on the first band's part, so a split part counts them once.
+  return (['short', 'long'] as const)
+    .filter((contextBand) => bands[contextBand])
+    .map((contextBand, index) =>
+      costPartOf(
+        { ...part, contextBand, usage: bands[contextBand]!, waits: index === 0 ? part.waits : undefined },
+        scope,
+      ),
+    );
 }
 function blocksOf(turn: Turn, key: string): ExportBlock[] {
   const entries: Array<Omit<ExportBlock, 'key'> & { sequence: number }> = [];

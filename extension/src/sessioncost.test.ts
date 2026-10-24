@@ -2668,12 +2668,12 @@ test('until-text Python absolute anchors ignore inner lines and trailing newline
     textRequest('end', 3, 'Before\nFound'),
     textRequest('both', 4, 'Found'),
   ]);
-  const start = sessionCostReport(file, { byToolKind: true, untilText: '(?i)\\Afound' });
-  const end = sessionCostReport(file, { byToolKind: true, untilText: '(?i)found\\Z' });
+  const start = sessionCostReport(file, { byTool: true, untilText: '(?i)\\Afound' });
+  const end = sessionCostReport(file, { byTool: true, untilText: '(?i)found\\Z' });
   assert.equal(start.untilText?.matched, true);
   assert.equal(end.untilText?.matched, true);
-  assert.equal(start.untilText?.byToolKind.rows[0]?.requests, 1);
-  assert.equal(end.untilText?.byToolKind.rows[0]?.requests, 2);
+  assert.equal(start.untilText?.byTool.rows[0]?.requests, 1);
+  assert.equal(end.untilText?.byTool.rows[0]?.requests, 2);
 });
 
 test('request prices use the request context band, regional rate, and service tier', () => {
@@ -3012,6 +3012,167 @@ test('a sidechain response does not consume the next parent request tool result'
     requests.map((request) => request.toolKinds),
     [[], ['other']],
   );
+});
+
+function codexToolRecords(f: ReturnType<typeof cumulativeCostFixture>) {
+  const call = (second: number, id: string, name: string, args: unknown, type = 'function_call') => ({
+    type: 'response_item',
+    timestamp: f.at(second),
+    payload: {
+      type,
+      name,
+      call_id: id,
+      ...(type === 'custom_tool_call' ? { input: args } : { arguments: JSON.stringify(args) }),
+    },
+  });
+  const output = (second: number, id: string, text: string, type = 'function_call_output') => ({
+    type: 'response_item',
+    timestamp: f.at(second),
+    payload: { type, call_id: id, output: text },
+  });
+  return { call, output };
+}
+
+test('a Codex tool output belongs to the first billing record after it, not the token_count event after it', () => {
+  const f = cumulativeCostFixture();
+  const { call, output } = codexToolRecords(f);
+  const file = f.save([
+    ...f.start,
+    f.bill('issuer', 3, 1),
+    call(4, 'wait-1', 'wait_agent', { timeout_ms: 1000 }),
+    output(5, 'wait-1', JSON.stringify({ timed_out: true })),
+    f.snapshot(6, 1),
+    f.bill('reader', 7, 2),
+    f.snapshot(8, 2),
+  ]);
+  const requests = readSessionRequests(file);
+  const billed = (id: string) => requests.find((request) => request.requestKey === `codex-billing:${id}`)!;
+  assert.equal(billed('issuer').toolKinds, undefined);
+  assert.deepEqual(billed('reader').toolKinds, ['wait']);
+  assert.deepEqual(billed('reader').toolLabels, ['wait_agent']);
+  const rows = sessionCostReport(file, { byTool: true, sourceOnly: true }).byTool!.rows;
+  assert.deepEqual(
+    rows.map((row) => [row.kind, row.requests, row.tools.map((tool) => tool.tool)]),
+    [
+      ['wait', 1, ['wait_agent']],
+      ['no tool result', 1, []],
+    ],
+  );
+});
+
+test('Codex tool calls map to kinds on every shell form and through the exec wrapper', () => {
+  const f = cumulativeCostFixture();
+  const { call, output } = codexToolRecords(f);
+  const cases: [object, string, string][] = [
+    [call(0, 'shell-git', 'shell', { command: ['bash', '-lc', 'git status'] }), 'git', 'shell git'],
+    [
+      call(0, 'shell-search', 'shell', {
+        command: [
+          'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe',
+          '-Command',
+          'Select-String -Path a.ts -Pattern x',
+        ],
+      }),
+      'search',
+      'shell select-string',
+    ],
+    [
+      call(0, 'windows-read', 'exec_command', { cmd: 'Get-Content C:\\repo\\src\\a.ts -TotalCount 20' }),
+      'file read',
+      'exec_command get-content',
+    ],
+    [call(0, 'posix-test', 'exec_command', { cmd: 'cd /repo && npm test' }), 'test or build', 'exec_command npm'],
+    [call(0, 'patch', 'apply_patch', '*** Begin Patch', 'custom_tool_call'), 'file edit', 'apply_patch'],
+    [
+      call(0, 'wrapped-wait', 'exec', 'await tools.wait_agent({ timeout_ms: 1000 });', 'custom_tool_call'),
+      'wait',
+      'wait_agent',
+    ],
+    [
+      call(
+        0,
+        'wrapped-command',
+        'exec',
+        'const r = await tools.exec_command({ "cmd": "rg -n foo src" });',
+        'custom_tool_call',
+      ),
+      'search',
+      'exec_command rg',
+    ],
+    [call(0, 'stdin', 'write_stdin', { session_id: 1, chars: '' }), 'wait', 'write_stdin'],
+    [call(0, 'cell', 'wait', { cell_id: 1 }), 'wait', 'wait'],
+    [call(0, 'spawn', 'spawn_agent', { task_name: 'worker' }), 'subagent launch', 'spawn_agent'],
+    [call(0, 'message', 'send_message', { target: 'worker' }), 'other', 'send_message'],
+    [call(0, 'mcp', 'mcp__github__get_issue', { number: 1 }), 'other', 'mcp__github__get_issue'],
+  ];
+  const records: object[] = [...f.start];
+  cases.forEach(([held], index) => {
+    const second = 3 + index * 3;
+    const id = (held as { payload: { call_id: string; type: string } }).payload;
+    records.push(
+      f.bill(`r${index}`, second, index + 1),
+      { ...held, timestamp: f.at(second + 1) },
+      output(
+        second + 2,
+        id.call_id,
+        'done',
+        id.type === 'custom_tool_call' ? 'custom_tool_call_output' : 'function_call_output',
+      ),
+    );
+  });
+  records.push(f.bill(`r${cases.length}`, 3 + cases.length * 3, cases.length + 1));
+  const requests = readSessionRequests(f.save(records));
+  cases.forEach(([, kind, label], index) => {
+    const reader = requests.find((request) => request.requestKey === `codex-billing:r${index + 1}`)!;
+    assert.deepEqual([reader.toolKinds, reader.toolLabels], [[kind], [label]], label);
+  });
+});
+
+test('a Codex rollout without billing records keeps every request at no tool result', () => {
+  const f = cumulativeCostFixture();
+  const { call, output } = codexToolRecords(f);
+  const file = f.save([
+    ...f.start,
+    call(3, 'read', 'exec_command', { cmd: 'cat a.ts' }),
+    output(4, 'read', 'text'),
+    f.snapshot(5, 1),
+    f.snapshot(6, 2),
+  ]);
+  const rows = sessionCostReport(file, { byTool: true, sourceOnly: true }).byTool!.rows;
+  assert.deepEqual(
+    rows.map((row) => row.kind),
+    ['no tool result'],
+  );
+});
+
+test('Claude edits and a macOS program path map to their kinds and labels', () => {
+  const usage = { input_tokens: 10, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 };
+  const file = write(path.join(directory(), 'parent.jsonl'), [
+    {
+      type: 'assistant',
+      timestamp: '2026-09-26T00:00:01Z',
+      message: {
+        id: 'first',
+        model: 'claude-opus-5',
+        usage,
+        content: [
+          { type: 'tool_use', id: 'search', name: 'Bash', input: { command: '/opt/homebrew/bin/rg -n foo src' } },
+          { type: 'tool_use', id: 'edit', name: 'Edit', input: { file_path: '/Users/me/a.ts' } },
+          { type: 'tool_use', id: 'write', name: 'Write', input: { file_path: '/Users/me/b.ts' } },
+        ],
+      },
+    },
+    {
+      type: 'user',
+      message: {
+        content: ['search', 'edit', 'write'].map((id) => ({ type: 'tool_result', tool_use_id: id, content: 'ok' })),
+      },
+    },
+    { ...claudeRequest('next', 2), timestamp: '2026-09-26T00:00:03Z' },
+  ]);
+  const next = readSessionRequests(file).at(-1)!;
+  assert.deepEqual(next.toolKinds, ['search', 'file edit', 'file edit']);
+  assert.deepEqual(next.toolLabels, ['Bash rg', 'Edit', 'Write']);
 });
 
 test('partial summaries retain known cost and mark unknown models', () => {

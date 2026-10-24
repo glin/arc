@@ -10,20 +10,20 @@ declare const ARC_BUILD_COMMIT: string;
 
 function costJSON(report: SessionCostReport) {
   const { cacheExpiryNote: _cacheExpiryNote, ...output } = report;
-  const toolKinds = (detail: NonNullable<SessionCostReport['byToolKind']>) => {
+  const tools = (detail: NonNullable<SessionCostReport['byTool']>) => {
     const { requestsNote: _requestsNote, ...values } = detail;
     return values;
   };
   return {
-    schemaVersion: 2,
+    schemaVersion: 3,
     buildCommit: typeof ARC_BUILD_COMMIT === 'string' ? ARC_BUILD_COMMIT : 'unknown',
     ...output,
-    ...(report.byToolKind && { byToolKind: toolKinds(report.byToolKind) }),
-    ...(report.untilText && { untilText: { ...report.untilText, byToolKind: toolKinds(report.untilText.byToolKind) } }),
+    ...(report.byTool && { byTool: tools(report.byTool) }),
+    ...(report.untilText && { untilText: { ...report.untilText, byTool: tools(report.untilText.byTool) } }),
     ...(report.parentWindow && {
       parentWindow: {
         ...report.parentWindow,
-        ...(report.parentWindow.byToolKind && { byToolKind: toolKinds(report.parentWindow.byToolKind) }),
+        ...(report.parentWindow.byTool && { byTool: tools(report.parentWindow.byTool) }),
       },
     }),
   };
@@ -71,19 +71,37 @@ function costText(report: SessionCostReport): string {
       for (const model of value.modelCosts) summary(model.model ?? '(model unavailable)', model);
     }
   }
-  const tools = (name: string, detail: NonNullable<SessionCostReport['byToolKind']>) => {
-    lines.push('', name, 'Tool kind  Requests  Attributed cost  Share');
-    for (const row of detail.rows)
+  // Kind rows start at column one with their tools indented below. Numeric columns align right.
+  const tools = (name: string, detail: NonNullable<SessionCostReport['byTool']>) => {
+    const share = (value: number | null) => (value === null ? 'unknown' : `${(value * 100).toFixed(1)}%`);
+    const cells = [
+      ['Tool', 'Requests', 'Attributed cost', 'Share'],
+      ...detail.rows.flatMap((row) => [
+        [label(row.kind), String(row.requests), money(row.costUsd), share(row.shareOfCost)],
+        ...row.tools.map((tool) => [
+          `  ${label(tool.tool)}`,
+          String(tool.requests),
+          money(tool.costUsd),
+          share(tool.shareOfCost),
+        ]),
+      ]),
+    ];
+    const widths = cells[0].map((_, column) => Math.max(...cells.map((cell) => cell[column].length)));
+    lines.push('', name);
+    for (const cell of cells)
       lines.push(
-        `${label(row.kind)}  ${row.requests}  ${money(row.costUsd)}  ${row.shareOfCost === null ? 'unknown' : `${(row.shareOfCost * 100).toFixed(1)}%`}`,
+        cell
+          .map((value, column) => (column === 0 ? value.padEnd(widths[0]) : value.padStart(widths[column])))
+          .join('  ')
+          .trimEnd(),
       );
     lines.push(`Unpriced requests: ${detail.unpricedRequests}`);
   };
-  if (report.byToolKind) tools('By tool kind', report.byToolKind);
+  if (report.byTool) tools('By tool', report.byTool);
   if (report.untilText) {
     lines.push('', `Until text: ${label(report.untilText.pattern)}. Matched: ${report.untilText.matched}`);
     if (report.untilText.note) lines.push(report.untilText.note);
-    tools('Until text tool kinds', report.untilText.byToolKind);
+    tools('Until text tools', report.untilText.byTool);
   }
   if (report.parentWindow) {
     const window = report.parentWindow;
@@ -93,7 +111,7 @@ function costText(report: SessionCostReport): string {
       `Until: ${window.until ?? '(unbounded)'}. Requests: ${window.requests}. Full cost: ${money(window.costUsd)}`,
       `Context at start: ${window.contextAtStart ?? 'unknown'}. Peak: ${window.contextAtPeak ?? 'unknown'}`,
     );
-    if (window.byToolKind) tools('Agent window tool kinds', window.byToolKind);
+    if (window.byTool) tools('Agent window tools', window.byTool);
   }
   return lines.join('\n');
 }
@@ -103,7 +121,7 @@ export function runCost(args: string[]): string {
   let target: string | undefined;
   let since: string | undefined;
   let until: string | undefined;
-  let byToolKind = false;
+  let byTool = false;
   let byModel = false;
   let sourceOnly = false;
   let untilText: string | undefined;
@@ -123,8 +141,9 @@ export function runCost(args: string[]): string {
       sourceOnly = true;
       continue;
     }
-    if (arg === '--by-tool-kind') {
-      byToolKind = true;
+    // `--by-tool-kind` is the former name of `--by-tool`.
+    if (arg === '--by-tool' || arg === '--by-tool-kind') {
+      byTool = true;
       continue;
     }
     if (['--since', '--until', '--projects', '--codex-sessions', '--until-text', '--window-agent'].includes(arg)) {
@@ -143,13 +162,13 @@ export function runCost(args: string[]): string {
     target = arg;
   }
   if (!target) throw new Error('Cost needs a session id or transcript path.');
-  if (untilText && !byToolKind) throw new Error('--until-text requires --by-tool-kind.');
+  if (untilText && !byTool) throw new Error('--until-text requires --by-tool.');
   const file = findSessionTranscript(target, roots, sourceOnly);
   const report = sessionCostReport(file, {
     since,
     until,
     roots,
-    byToolKind,
+    byTool,
     untilText,
     windowAgent,
     byModel,

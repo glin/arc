@@ -215,7 +215,7 @@ Use a saved Claude Code or Codex ID, or an existing transcript or rollout path. 
 
 A null cost never counts as zero. These estimates use [supported list prices](agent-cost-guide.md#supported-pricing), not subscription charges. Recorded reconciliation does not prove that the provider logged every request.
 
-Run `arc cost --help` for model, tool-kind, text-boundary, and Agent-window options. [Cost output](cli-reference.md#cost-reports) defines coverage, quantities, supplementary results, and custom source roots.
+Run `arc cost --help` for model, tool, text-boundary, and Agent-window options. [Cost output](cli-reference.md#cost-reports) defines coverage, quantities, supplementary results, and custom source roots.
 
 ## Status line
 
