@@ -209,12 +209,14 @@ test.each([
       { ...fx.catalog[0], file: paths.join(virtualHome, 'parent.jsonl') },
       { ...fx.catalog[1], file: paths.join(virtualHome, mixed ? 'NATIVE.jsonl' : 'native.jsonl') },
     ];
+    const unmapped: string[] = [];
     const translate = (file: fs.PathLike) => {
       const value = String(file);
+      if (paths.resolve(value) === paths.parse(paths.resolve(virtualHome)).root) return path.parse(fx.home).root;
       const relative = paths.relative(virtualHome, value);
-      return relative === '' || (!relative.startsWith('..') && !paths.isAbsolute(relative))
-        ? path.join(fx.home, ...relative.split(paths.sep))
-        : value;
+      if (relative.startsWith('..') || paths.isAbsolute(relative)) unmapped.push(value);
+      assert.ok(relative === '' || (!relative.startsWith('..') && !paths.isAbsolute(relative)), value);
+      return path.join(fx.home, ...relative.split(paths.sep));
     };
     const stat = fs.lstatSync;
     const open = fs.openSync;
@@ -245,6 +247,7 @@ test.each([
     const receipts = new DispatchReceipts(virtualHome, platform);
     assert.equal(receipts.root, virtualRoot);
     const references = drainRelationships(receipts.relationships(catalog), 31);
+    assert.deepEqual(unmapped, []);
     assert.equal(references.length, expected);
     if (expected) assert.equal(references[0].file, catalog[1].file);
     if (temporary) assert.ok(aliasChecks > 0);
