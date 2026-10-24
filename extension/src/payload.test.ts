@@ -48,12 +48,12 @@ const CEILINGS = {
 
   renderTotal: 3_103_033,
   renderRail: 1_146_658,
-  renderStats: 1_476_262,
+  renderStats: 1_476_250,
   renderSessions: 305_000,
   // The card ceiling includes commit branches, repository paths, and author sessions.
 
   renderCards: 113_000,
-  selectionTotal: 8_070,
+  selectionTotal: 8_066,
   railMessageTotal: 2_676_966,
   railRow: 1_255,
   duplicateWaste: 243_665,
