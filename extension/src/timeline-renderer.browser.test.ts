@@ -733,6 +733,9 @@ test('session heading labels filter the visible rail and keep the reader on a st
     await line.locator('button.sessionlabel').focus();
 
     await page.setViewportSize({ width: 600, height: 700 });
+    await page.waitForFunction(
+      () => document.querySelector('section.sessionsection[data-session="s1"] .sessionlabel')?.tagName === 'SPAN',
+    );
     await page.evaluate(SETTLED);
     assert.deepEqual(
       await line.locator('.sessionlabel').evaluateAll((nodes) =>
@@ -750,6 +753,9 @@ test('session heading labels filter the visible rail and keep the reader on a st
     await line.locator('button.sessionlabel').focus();
     await page.locator('#prompt').focus();
     await page.setViewportSize({ width: 600, height: 700 });
+    await page.waitForFunction(
+      () => document.querySelector('section.sessionsection[data-session="s1"] .sessionlabel')?.tagName === 'SPAN',
+    );
     await page.evaluate(SETTLED);
     assert.equal(await page.locator('#prompt').evaluate((node) => document.activeElement === node), true);
     assert.deepEqual(
