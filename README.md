@@ -101,7 +101,7 @@ Session links in agent responses open in Arc. Export a session and its linked se
 
 ## Let agents use Arc
 
-Claude and Codex can start each other's sessions from a shell command. The parent turn lists each dispatched session with its cost, and its name opens that session.
+Either agent can start Claude Code or Codex sessions from a shell command. The parent turn lists each dispatched session with its cost, and its name opens that session.
 
 The [`arc-sessions` skill](docs/arc-sessions.md) lets agents start sessions in Arc, read their results, and send follow-ups. Agents can also label, pin, and archive sessions, queue a compaction of their own session for after the turn, and estimate costs with `arc cost`.
 
@@ -121,6 +121,17 @@ Read its result and summarize its findings.
 After saving the handoff,
 request compaction of this session after your response.
 ```
+
+### Hand off to a fresh session
+
+An agent can pass a saved handoff to a fresh Claude Code or Codex session.
+
+```text
+Save the task, decisions, and remaining work in a handoff.
+Use Arc to start a fresh Codex session with that handoff.
+```
+
+Your prompts and skills control when to hand off. Arc does not automatically start a successor when context fills.
 
 ## Limitations
 
