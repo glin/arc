@@ -9,7 +9,6 @@ import {
   PROJECT_SPEND_INDEXING_SHOW_MS as INDEXING_SHOW_MS,
 } from './view/projectspend.ts';
 import { RAIL_MIN_WIDTH, RAIL_WIDTH_DEFAULT, RAIL_WIDTH_MIN } from './turnview.ts';
-import { PROJECT_SPEND_SHORT_LABEL } from './webview/projectspend.ts';
 import { formatProjectCost, prepareProjectSpendView, projectSpendWindows } from './projectspend.ts';
 import type { ProjectUsageBucket } from './projectspend.ts';
 import {
@@ -1140,7 +1139,7 @@ test(
   },
 );
 
-test('the compact Project cost face gives up a word before it gives up the figure', { timeout: 60_000 }, async (t) => {
+test('the compact Project cost face shows the figure alone and keeps its name', { timeout: 60_000 }, async (t) => {
   const browser = await browserOrNone();
   if (!browser) {
     t.skip('no Edge, Chrome or bundled Chromium on this machine, so nothing was measured');
@@ -1151,32 +1150,19 @@ test('the compact Project cost face gives up a word before it gives up the figur
     const failures: string[] = [];
     page.on('pageerror', (e) => failures.push(String(e)));
     await page.setContent(pageHtml());
-    assert.ok(
-      PROJECT_SPEND_SHORT_LABEL < RAIL_MIN_WIDTH,
-      `the short label starts at ${PROJECT_SPEND_SHORT_LABEL}px and the rail leaves at ${RAIL_MIN_WIDTH}px, ` +
-        'so no width measured here has a compact face at all',
-    );
-    // Check both sides of the short-label boundary and the named wide and narrow widths.
-
-    const widths: [number, string][] = [
-      [640, 'Project cost'],
-      [PROJECT_SPEND_SHORT_LABEL, 'Project cost'],
-      [PROJECT_SPEND_SHORT_LABEL - 1, 'Cost'],
-      [340, 'Cost'],
-    ];
-    for (const [width, label] of widths) {
+    // The bar exists only below the rail's minimum, so both widths draw a compact face.
+    for (const width of [RAIL_MIN_WIDTH - 60, 340]) {
       await layoutAt(page, width);
       const face = (await page.evaluate(`(() => {
         const button = document.querySelector('.projectspendcompacthost .projectspendbutton');
         if (!button) return null;
-        return { label: button.querySelector('.projectspendname').textContent,
+        return { labelled: !!button.querySelector('.projectspendname'),
           name: button.getAttribute('aria-label'),
           overflow: document.documentElement.scrollWidth - innerWidth };
-      })()`)) as { label: string; name: string; overflow: number } | null;
+      })()`)) as { labelled: boolean; name: string; overflow: number } | null;
       assert.ok(face, `the ${width}px panel drew no compact Project cost face`);
-      assert.equal(face.label, label, `the compact face reads "${face.label}" at ${width}px`);
-      // The accessible name retains Project cost when the visible label shortens.
-
+      assert.equal(face.labelled, false, `the compact face draws a visible label at ${width}px`);
+      // The visible face omits the Project cost words, so the accessible name carries them.
       assert.match(
         face.name,
         /^Project cost, /,

@@ -874,10 +874,13 @@ body {
   min-width: 0;
   font: inherit;
   font-size: 0.92em;
-  padding: 3px 4px;
+  /* The end padding holds the native caret, so the name ends before it. The border is the panel's own
+     hairline: a theme can paint its dropdown border in the bar's colour, and the box then
+     vanishes. */
+  padding: 3px 1.4em 3px 4px;
   color: var(--vscode-dropdown-foreground, var(--vscode-foreground));
   background: var(--vscode-dropdown-background, transparent);
-  border: 1px solid var(--vscode-dropdown-border, var(--edge));
+  border: 1px solid var(--edge);
   border-radius: 3px;
 }
 /* The frame holds the two buttons below. Those read at the small step, not at the panel's
@@ -5448,35 +5451,28 @@ body {
   right: 8px;
   top: 6px;
 }
+/* The compact face shows the figure alone, at the end of the bar. A hairline parts it from
+   the picker, between the picker's caret and the figure. With one session there is no
+   picker, and the figure keeps the end of the row. */
 .projectspendcompacthost {
   display: flex;
-  flex: 0 1 auto;
-  min-width: 0;
-  max-width: 55%;
+  flex: none;
+  position: static;
+}
+.controls select + .projectspendcompacthost {
+  margin-left: 2px;
+  padding-left: 6px;
+  border-left: 1px solid var(--edge);
 }
 .projectspendcompacthost.projectspendonly {
   flex: 1 1 auto;
-  max-width: none;
+  justify-content: flex-end;
 }
 .projectspendcompacthost .projectspendbutton {
   width: auto;
+  gap: 5px;
   padding: 3px 4px;
   border-radius: 3px;
-}
-.projectspendcompacthost.projectspendonly .projectspendbutton {
-  width: 100%;
-}
-.projectspendcompacthost .projectspendname {
-  flex: 1 1 auto;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.projectspendcompacthost .projectspendamount {
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.projectspendcompacthost {
-  position: static;
 }
 .railempty {
   margin: 0;

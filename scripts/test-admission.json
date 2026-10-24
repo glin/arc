@@ -147,7 +147,7 @@
   "extension/src/projectspend.browser.test.ts": {
     "reason": "Project spend controls must preserve rendered interaction, session navigation, and keyboard access.",
     "cases": 12,
-    "matricesSha256": "f48c3736bef89a0129bd694e3c08a43f81d0446dc6512c67a93f44c6f72ea356"
+    "matricesSha256": "44281deec04ef81623b14cc1bd8018cd185eddaa40e05274b5dcf09d61e8fe66"
   },
   "extension/src/rail.editors.browser.test.ts": {
     "reason": "Session-list editors must preserve browser focus, submission, and keyboard cancellation.",

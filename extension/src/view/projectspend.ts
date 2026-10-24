@@ -73,9 +73,10 @@ export function projectSpendFace(
   spend: Pick<ProjectSpend, 'name' | 'calculating'>,
   window: ProjectSpendWindow,
   place: string,
-  short: boolean,
 ): ProjectSpendFace {
-  const label = place === 'compact' && short ? 'Cost' : spend.name;
+  // The compact bar shows the figure alone. The dollar sign names it, and the button's
+  // accessible name carries the full label.
+  const label = place === 'compact' ? '' : spend.name;
   if (spend.calculating) {
     return { label, value: 'Calculating…', when: '', quiet: true };
   }

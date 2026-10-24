@@ -18,8 +18,6 @@ import {
 import { formatCompactRelative } from '../view/time.ts';
 import type { Clock } from './clock.ts';
 
-export const PROJECT_SPEND_SHORT_LABEL = 480;
-
 interface ProjectSpendEvents {
   document(
     type: string,
@@ -48,7 +46,6 @@ interface ProjectSpendSnapshot {
   pricingOpen: boolean;
   place: ProjectSpendPlace;
   railVisible: boolean;
-  short: boolean;
   indexingWord: string;
   age: string;
   twist: string;
@@ -96,7 +93,7 @@ function ProjectSpendFaceView({
   useLayoutEffect(() => owner.subscribe(() => redraw((revision) => revision + 1)), [owner]);
   const snapshot = owner.snapshot();
   const window = selectedWindow(snapshot);
-  const face = snapshot.spend && window ? projectSpendFace(snapshot.spend, window, place, snapshot.short) : null;
+  const face = snapshot.spend && window ? projectSpendFace(snapshot.spend, window, place) : null;
   let button: HTMLButtonElement | null = null;
   useLayoutEffect(() => owner.focusAfterFaceRender(place, button));
   return h(
@@ -121,7 +118,7 @@ function ProjectSpendFaceView({
             onClick: () => owner.toggle(place),
           },
           [
-            h('span', { class: 'projectspendname' }, face.label),
+            face.label ? h('span', { class: 'projectspendname' }, face.label) : null,
             h('span', { class: `projectspendamount${face.quiet ? ' quiet' : ''}` }, [
               face.value,
               face.when ? h(Fragment, {}, [' ', h('span', { class: 'projectspendwhen' }, face.when)]) : null,
@@ -404,7 +401,6 @@ function ProjectSpendDialog({ owner }: { owner: ProjectSpendRenderer }): Compone
 export function createProjectSpendRenderer(options: ProjectSpendOptions): ProjectSpendRenderer {
   const listeners = new Set<Listener>();
   const faces: Record<ProjectSpendPlace, HTMLElement | null> = { rail: null, compact: null };
-  const shortMedia = window.matchMedia(`(max-width: ${PROJECT_SPEND_SHORT_LABEL - 1}px)`);
   const dialogMount = options.document.createElement('div');
   options.document.body.appendChild(dialogMount);
   let dialog: HTMLElement | null = null;
@@ -415,8 +411,6 @@ export function createProjectSpendRenderer(options: ProjectSpendOptions): Projec
   let pricingOpen = false;
   let place: ProjectSpendPlace = 'rail';
   let railVisible = false;
-  let short = shortMedia.matches;
-  let displayedShort = short;
   let indexingStatus = '';
   let busySince = 0;
   let wordAt = 0;
@@ -443,7 +437,6 @@ export function createProjectSpendRenderer(options: ProjectSpendOptions): Projec
     pricingOpen,
     place,
     railVisible,
-    short: displayedShort,
     indexingWord: displayedIndexingWord,
     age: ageText,
     twist: options.twist,
@@ -495,7 +488,6 @@ export function createProjectSpendRenderer(options: ProjectSpendOptions): Projec
     scheduleWord(now);
   };
   const acceptVisibleTiming = (now: number) => {
-    displayedShort = short;
     displayedIndexingWord = wordShown ? indexingStatus : '';
     const indexedAt = Number(drawn?.lastIndexedAt);
     ageText = drawn?.lastIndexedAt && Number.isFinite(indexedAt) ? formatCompactRelative(indexedAt, now) : '';
@@ -720,15 +712,6 @@ export function createProjectSpendRenderer(options: ProjectSpendOptions): Projec
     }
   });
 
-  shortMedia.addEventListener('change', () => {
-    short = shortMedia.matches;
-    if (withinSubject()) {
-      repaintOwed = true;
-    } else {
-      displayedShort = short;
-      notify();
-    }
-  });
   options.events.document('selectionchange', () => owner.releaseSelection());
   options.events.document('keydown', (event) => {
     const key = event as KeyboardEvent;

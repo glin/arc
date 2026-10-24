@@ -19,48 +19,47 @@ const SEVEN_DAYS = PROJECT_SPEND.windows[1] as ProjectSpendWindow;
 const THIRTY_DAYS = PROJECT_SPEND.windows[2] as ProjectSpendWindow;
 
 test('the Project cost face names its period without ever breaking its label', () => {
-  assert.deepEqual(projectSpendFace(PROJECT_SPEND, TODAY, 'rail', false), {
+  assert.deepEqual(projectSpendFace(PROJECT_SPEND, TODAY, 'rail'), {
     label: 'Project cost',
     value: '$4.82',
     when: 'today',
     quiet: false,
   });
-  assert.deepEqual(projectSpendFace(PROJECT_SPEND, SEVEN_DAYS, 'rail', false), {
+  assert.deepEqual(projectSpendFace(PROJECT_SPEND, SEVEN_DAYS, 'rail'), {
     label: 'Project cost',
     value: 'At least $18.24',
     when: '· 7d',
     quiet: false,
   });
-  assert.deepEqual(projectSpendFace(PROJECT_SPEND, THIRTY_DAYS, 'rail', false), {
+  assert.deepEqual(projectSpendFace(PROJECT_SPEND, THIRTY_DAYS, 'rail'), {
     label: 'Project cost',
     value: 'At least $52.10',
     when: '· 30d',
     quiet: false,
   });
-  assert.deepEqual(projectSpendFace({ ...PROJECT_SPEND, calculating: true }, SEVEN_DAYS, 'rail', false), {
+  assert.deepEqual(projectSpendFace({ ...PROJECT_SPEND, calculating: true }, SEVEN_DAYS, 'rail'), {
     label: 'Project cost',
     value: 'Calculating…',
     when: '',
     quiet: true,
   });
-  assert.deepEqual(projectSpendFace({ ...PROJECT_SPEND, calculating: true }, TODAY, 'compact', true), {
-    label: 'Cost',
+  assert.deepEqual(projectSpendFace({ ...PROJECT_SPEND, calculating: true }, TODAY, 'compact'), {
+    label: '',
     value: 'Calculating…',
     when: '',
     quiet: true,
   });
-  assert.equal(projectSpendFace(PROJECT_SPEND, TODAY, 'compact', true).label, 'Cost');
-  assert.equal(projectSpendFace(PROJECT_SPEND, TODAY, 'compact', false).label, 'Project cost');
-  assert.equal(projectSpendFace(PROJECT_SPEND, TODAY, 'rail', true).label, 'Project cost');
+  assert.equal(projectSpendFace(PROJECT_SPEND, TODAY, 'compact').label, '');
+  assert.equal(projectSpendFace(PROJECT_SPEND, TODAY, 'rail').label, 'Project cost');
 
   const unknown = { ...TODAY, display: 'Cost unknown', status: 'unknown' };
-  assert.deepEqual(projectSpendFace(PROJECT_SPEND, unknown, 'rail', false), {
+  assert.deepEqual(projectSpendFace(PROJECT_SPEND, unknown, 'rail'), {
     label: 'Project cost',
     value: 'Cost unknown',
     when: 'today',
     quiet: true,
   });
-  assert.equal(projectSpendFace(PROJECT_SPEND, { ...TODAY, id: 'ninetyDays' }, 'rail', false).when, '');
+  assert.equal(projectSpendFace(PROJECT_SPEND, { ...TODAY, id: 'ninetyDays' }, 'rail').when, '');
   assert.deepEqual(
     Object.keys(PROJECT_SPEND_WHEN),
     projectSpendWindows().map((window) => window.id),
