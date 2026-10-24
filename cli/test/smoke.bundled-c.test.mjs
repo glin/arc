@@ -29,6 +29,43 @@ import {
 
 afterEach(() => vi.useRealTimers());
 
+// A failed launch smoke case deletes its home, so print the dispatch receipts first.
+// The helper never throws, so it cannot replace the failure it reports or skip the cleanup.
+function printDispatchReceipts(home) {
+  try {
+    const root = join(home, 'dispatch');
+    if (!fs.existsSync(root)) return console.error(`No dispatch directory under ${home}`);
+    for (const launch of fs.readdirSync(root)) {
+      const directory = join(root, launch);
+      let names;
+      try {
+        names = fs.readdirSync(directory);
+      } catch {
+        continue;
+      }
+      const wanted = names.filter(
+        (name) =>
+          ['stderr.log', 'observation.json', 'monitor.json'].includes(name) ||
+          /^state(\.\d+)?\.json$/.test(name) ||
+          /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(\.anchor)?\.json$/.test(name) ||
+          name.endsWith('.consumption.json'),
+      );
+      for (const name of wanted) {
+        try {
+          const bytes = readFileSync(join(directory, name));
+          const tail = bytes.subarray(Math.max(0, bytes.length - 16 * 1024));
+          console.error(`--- dispatch/${launch}/${name} (${bytes.length} bytes) ---
+${tail.toString('utf8')}`);
+        } catch (error) {
+          console.error(`--- dispatch/${launch}/${name} unreadable: ${error.message} ---`);
+        }
+      }
+    }
+  } catch (error) {
+    console.error(`Dispatch receipts unavailable under ${home}: ${error.message}`);
+  }
+}
+
 function discoveryCommand(home, channels, deniedFile) {
   const preload = join(home, 'discovery.cjs');
   // Transport deadline tests advance clocks in sessionrequests.test.ts.
@@ -326,6 +363,7 @@ process.stdin.on('end',()=>{
     CLAUDE_BIN: process.platform === 'win32' ? shim : script,
   };
   let launchId;
+  let passed = false;
   try {
     const launched = await run(
       process.execPath,
@@ -405,7 +443,9 @@ process.stdin.on('end',()=>{
     assert.equal(readFileSync(alias, 'utf8'), 'Original report');
     assert.equal(readFileSync(log, 'utf8'), readFileSync(receipts.artifact(launchId, 'worker.log'), 'utf8'));
     assert.match(readFileSync(log, 'utf8'), /Original worker is running/);
+    passed = true;
   } finally {
+    if (!passed) printDispatchReceipts(home);
     writeFileSync(release, 'complete');
     if (!launchId && fs.existsSync(join(home, 'dispatch')))
       launchId = fs
@@ -462,6 +502,7 @@ for(const row of [{type:'thread.started',thread_id:'${id}'},{type:'turn.started'
     CODEX_BIN: process.execPath,
     NODE_OPTIONS: [smokeEnv.NODE_OPTIONS, `--require ${JSON.stringify(preloader)}`].filter(Boolean).join(' '),
   };
+  let passed = false;
   try {
     const result = await run(
       process.execPath,
@@ -483,7 +524,7 @@ for(const row of [{type:'thread.started',thread_id:'${id}'},{type:'turn.started'
         '--completion',
         'wait',
       ],
-      { env, encoding: 'utf8' },
+      { env, encoding: 'utf8', timeout: 20_000 },
     );
     const lines = result.stdout.trim().split('\n');
     assert.equal(lines.length, 2);
@@ -505,7 +546,9 @@ for(const row of [{type:'thread.started',thread_id:'${id}'},{type:'turn.started'
     const help = await run(process.execPath, [cli, 'dispatch', 'rm', '--help'], { env, encoding: 'utf8' });
     assert.match(help.stdout, /preservation is established/);
     await assert.rejects(run(process.execPath, [cli, 'dispatch', 'rm', launch.launchId, '--force'], { env }), /Usage:/);
+    passed = true;
   } finally {
+    if (!passed) printDispatchReceipts(home);
     rmSync(home, { recursive: true, force: true });
   }
 });

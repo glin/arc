@@ -22,7 +22,7 @@
   "cli/test/smoke.bundled-c.test.mjs": {
     "reason": "Compiled CLI commands must preserve window routing, turn limits, and terminal ownership under real IPC.",
     "cases": 15,
-    "matricesSha256": "92c3069e70bb2e52da8e85ca7c83afd856a8435fdb8309ea3eedcc02e8ffb1f2"
+    "matricesSha256": "0b1e0e137758ffde2242d78c9dd83f00b397409117da1d500746802dd457ad0a"
   },
   "cli/test/smoke.test.mjs": {
     "reason": "Installed skill directories must preserve foreign files and ownership across executable command and filesystem boundaries. Bundled commands must update personal copies from every supported artifact layout.",
