@@ -11,6 +11,7 @@ import { produceStandaloneOutput } from './standalone.ts';
 import { DispatchReceipts } from '../../extension/src/dispatchreceipts.ts';
 import { findCommand, renderCommandHelp, renderOverviewHelp } from './commands.ts';
 import { runSkills } from './skills.ts';
+import { setImmediate as yieldIO } from 'node:timers/promises';
 
 declare const ARC_VERSION: string;
 declare const ARC_BUILD_COMMIT: string;
@@ -74,9 +75,31 @@ async function run(): Promise<void> {
     case 'dispatch':
       process.stdout.write(`${await runDispatch(command.action!, commandArgs)}\n`);
       return;
-    case 'cost':
-      process.stdout.write(`${runCost(commandArgs)}\n`);
+    case 'cost': {
+      const controller = new AbortController();
+      const handlers = new Map<NodeJS.Signals, () => void>();
+      for (const [signal, status] of [
+        ['SIGINT', 130],
+        ['SIGTERM', 143],
+      ] as const) {
+        const cancel = () => {
+          if (controller.signal.aborted) return;
+          process.exitCode = status;
+          controller.abort(new Error('Cost report cancelled.'));
+        };
+        handlers.set(signal, cancel);
+        process.once(signal, cancel);
+      }
+      try {
+        const output = await runCost(commandArgs, controller.signal);
+        await yieldIO();
+        controller.signal.throwIfAborted();
+        process.stdout.write(`${output}\n`);
+      } finally {
+        for (const [signal, cancel] of handlers) process.off(signal, cancel);
+      }
       return;
+    }
     case 'windows':
       process.stdout.write(`${await runWindows(commandArgs)}\n`);
       return;

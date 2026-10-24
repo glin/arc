@@ -325,9 +325,9 @@ Text rounds positive next-turn starting prices below $10 upward to cents. Prices
 
 ## Errors
 
-Successful commands exit 0. Errors print one `arc:`-prefixed line to stderr, exit 1, and produce no stdout report. Returned outcomes such as `refused` and `unknown` are command output, distinct from CLI errors.
+Successful commands exit 0. Unless stated otherwise below, errors print one `arc:`-prefixed line to stderr, exit 1, and produce no stdout report. Returned outcomes such as `refused` and `unknown` are command output, distinct from CLI errors.
 
-Cost rejects unknown options, missing values, multiple targets, invalid times or regexes, unreadable transcripts, and unresolved Agent launches. JSON arrays, identifiable Claude stream logs, empty files, and files without native transcript records fail. Metadata-only native sessions and empty request windows remain valid. Repeated cost options use their last value.
+Cost rejects unknown options, missing values, multiple targets, invalid times or regexes, unreadable transcripts, and unresolved Agent launches. JSON arrays, identifiable Claude stream logs, empty files, and files without native transcript records fail. Metadata-only native sessions and empty request windows remain valid. Repeated cost options use their last value. When cost handles `SIGINT` or `SIGTERM` cancellation, it exits 130 or 143, respectively, and produces no stdout report.
 
 Status-line input rejects empty stdin, malformed JSON, and non-object values. `--json` and `--next-turn` cannot combine. Other unknown status-line arguments are ignored.
 

@@ -1,6 +1,6 @@
 import {
-  findSessionTranscript,
-  sessionCostReport,
+  findSessionTranscriptAsync,
+  sessionCostReportAsync,
   type SessionRoots,
   type SessionCostReport,
   type SessionCostSummary,
@@ -116,7 +116,7 @@ function costText(report: SessionCostReport): string {
   return lines.join('\n');
 }
 
-export function runCost(args: string[]): string {
+export async function runCost(args: string[], signal?: AbortSignal): Promise<string> {
   const roots: SessionRoots = {};
   let target: string | undefined;
   let since: string | undefined;
@@ -163,16 +163,20 @@ export function runCost(args: string[]): string {
   }
   if (!target) throw new Error('Cost needs a session id or transcript path.');
   if (untilText && !byTool) throw new Error('--until-text requires --by-tool.');
-  const file = findSessionTranscript(target, roots, sourceOnly);
-  const report = sessionCostReport(file, {
-    since,
-    until,
-    roots,
-    byTool,
-    untilText,
-    windowAgent,
-    byModel,
-    sourceOnly,
-  });
+  const file = await findSessionTranscriptAsync(target, roots, sourceOnly, signal);
+  const report = await sessionCostReportAsync(
+    file,
+    {
+      since,
+      until,
+      roots,
+      byTool,
+      untilText,
+      windowAgent,
+      byModel,
+      sourceOnly,
+    },
+    signal,
+  );
   return json ? JSON.stringify(costJSON(report)) : costText(report);
 }

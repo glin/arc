@@ -17,13 +17,16 @@ import { createRequire, syncBuiltinESMExports } from 'node:module';
 import { afterEach, beforeEach, test, vi } from 'vitest';
 import { tempDir } from './temproot';
 import { quoteUsage } from './pricing';
+import * as pricing from './pricing';
 import * as projectSpend from './projectspend';
 import * as codexReader from './codex';
 import {
   findSessionTranscript,
   readSessionRequests,
   sessionCostReport,
+  sessionCostReportAsync,
   sessionSources,
+  sessionSourcesAsync,
   summarizeRequests,
   type SessionRequest,
 } from './sessioncost';
@@ -2643,6 +2646,60 @@ test('a report filters request clocks and omits children outside the window', ()
   assert.deepEqual(empty.combined, empty.parent);
 });
 
+test('a windowed async report summarizes each native child before reading the next child history', async () => {
+  const root = directory();
+  const parent = write(path.join(root, 'parent.jsonl'), [claudeRequest('parent', 2)]);
+  const outputs = new Map<string, number>();
+  for (const [id, output] of [
+    ['first', 111],
+    ['second', 222],
+  ] as const) {
+    const file = write(path.join(root, 'parent', 'subagents', `agent-${id}.jsonl`), [
+      { ...claudeRequest(`${id}-old`, output), timestamp: '2026-09-25T00:00:00Z' },
+      claudeRequest(`${id}-selected`, output),
+    ]);
+    outputs.set(file, output);
+  }
+  const options = { since: '2026-09-26T00:00:00Z', byModel: true };
+  const expected = sessionCostReport(parent, options);
+  const nativeFs = createRequire(__filename)('node:fs') as typeof fs;
+  const originalOpen = nativeFs.openSync;
+  const originalQuote = pricing.quoteUsage;
+  const opens = new Map<string, number>();
+  const priced = new Set<number>();
+  let lastUsage: string | undefined;
+  let summarizedBeforeNextRead = true;
+  const read = vi.spyOn(nativeFs, 'openSync').mockImplementation((...args: Parameters<typeof fs.openSync>) => {
+    const file = String(args[0]);
+    if (outputs.has(file)) {
+      const count = (opens.get(file) ?? 0) + 1;
+      opens.set(file, count);
+      if (count === 2) {
+        if (lastUsage) summarizedBeforeNextRead &&= priced.has(outputs.get(lastUsage)!);
+        lastUsage = file;
+      }
+    }
+    return originalOpen(...args);
+  });
+  const quote = vi.spyOn(pricing, 'quoteUsage').mockImplementation((input) => {
+    priced.add(input.usage.output);
+    return originalQuote(input);
+  });
+  syncBuiltinESMExports();
+  try {
+    assert.deepEqual(await sessionCostReportAsync(parent, options), expected);
+    assert.equal(opens.size, 2);
+    assert.ok([...opens.values()].every((count) => count === 2));
+    assert.equal(summarizedBeforeNextRead, true, 'Each child must be summarized before the next history is read.');
+    assert.equal(expected.children.length, 2);
+    assert.ok(expected.children.every((child) => child.requests === 1));
+  } finally {
+    read.mockRestore();
+    quote.mockRestore();
+    syncBuiltinESMExports();
+  }
+});
+
 test('a report rejects impossible ISO window dates, times, and offsets', () => {
   const file = write(path.join(directory(), 'parent.jsonl'), [claudeRequest('one', 2)]);
   for (const since of ['2026-02-30T00:00:00Z', '2026-09-26T25:00:00Z', '2026-09-26T00:00:00+24:00']) {
@@ -3533,7 +3590,7 @@ test('the public Codex cost sources include one Claude session launched by a she
   assert.deepEqual(report.children.map((child) => child.outputTokens).sort(), [3, 7]);
 });
 
-test('a Codex session reports a linked multi-request Claude print result without per-request context', () => {
+test('a Codex session reports a linked multi-request Claude print result without per-request context', async () => {
   const root = directory();
   const sessions = path.join(root, 'sessions');
   const at = (second: number) => new Date(Date.UTC(2026, 8, 26, 0, 0, second)).toISOString();
@@ -3638,6 +3695,19 @@ test('a Codex session reports a linked multi-request Claude print result without
       sourceOnly: true,
       byModel: true,
     });
+    assert.deepEqual(
+      await sessionCostReportAsync(file, { ...window, roots: { codexSessions: sessions }, byModel: true }),
+      ordinary,
+    );
+    assert.deepEqual(
+      await sessionCostReportAsync(file, {
+        ...window,
+        roots: { codexSessions: sessions },
+        sourceOnly: true,
+        byModel: true,
+      }),
+      direct,
+    );
     assert.deepEqual(direct.parent, ordinary.parent);
     assert.deepEqual(direct.children, []);
     // The coverage diagnostic belongs to source summaries only.
@@ -3894,7 +3964,7 @@ test('a dispatched Claude session and its child join the source tree', () => {
   );
 });
 
-test('a dispatched Claude session in another project includes its descendants', () => {
+test('a dispatched Claude session in another project includes its descendants', async () => {
   const root = directory();
   const projects = path.join(root, 'projects');
   const parent = write(path.join(projects, 'project-a', 'parent.jsonl'), [
@@ -3936,6 +4006,9 @@ test('a dispatched Claude session in another project includes its descendants', 
         ['claude-subagent', 'grandchild'],
       ],
     );
+    const roots = { projects, codexSessions };
+    assert.deepEqual(await sessionSourcesAsync(parent, roots), sessionSources(parent, roots));
+    assert.deepEqual(await sessionCostReportAsync(parent, { roots }), sessionCostReport(parent, { roots }));
     assert.equal(reads.mock.calls.filter(([file]) => String(file) === codexSessions).length, 0);
   } finally {
     reads.mockRestore();
@@ -4047,7 +4120,7 @@ test('an id matching two stores reports both paths', () => {
   );
 });
 
-test('mixed dispatched source chains include Codex native descendants once from either parent agent', () => {
+test('mixed dispatched source chains include Codex native descendants once from either parent agent', async () => {
   for (const parentAgent of ['claude', 'codex']) {
     const root = directory();
     const projects = path.join(root, 'projects');
@@ -4134,6 +4207,13 @@ test('mixed dispatched source chains include Codex native descendants once from 
       new Set([parentId, childId, 'native', claudeId]),
     );
     assert.equal(sources.length, 4);
+    assert.deepEqual(await sessionSourcesAsync(parent, roots), sources);
+    for (const options of [
+      { roots, byModel: true },
+      { roots, byModel: true, since: '2026-09-26T00:00:02Z', until: '2026-09-26T00:00:05Z' },
+      { roots, sourceOnly: true, byModel: true },
+    ])
+      assert.deepEqual(await sessionCostReportAsync(parent, options), sessionCostReport(parent, options));
     assert.equal(sources.find((source) => source.sessionId === childId)?.kind, 'codex-thread');
     assert.equal(sessionCostReport(parent, { roots }).combined.outputTokens, parentAgent === 'codex' ? 17 : 22);
   }

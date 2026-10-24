@@ -14,15 +14,338 @@ import { createRequire, syncBuiltinESMExports } from 'node:module';
 import { afterEach, beforeEach, test, vi } from 'vitest';
 import { runCost as costOutput } from '../src/cost.ts';
 
-const runCost = (args: string[]) => costOutput([...args, '--json']);
+const runCost = async (args: string[]) => await costOutput([...args, '--json']);
 const round = (value: number) => Math.round(value * 10_000) / 10_000;
 
-test('human cost preserves unknown totals and requested detail while JSON drops only invariant notes', () => {
+test.each([
+  'codex catalog',
+  'claude catalog',
+  'id lookup',
+  'native child admission',
+  'claude relationships',
+  'codex relationships',
+  'claude usage',
+  'codex usage',
+])('cost cancels during %s before discovery or reading finishes', async (stage) => {
+  const { root, projects, codex, file: claude } = fixture();
+  const controller = new AbortController();
+  const reason = new Error('cancel selected cost read');
+  const entries = 80;
+  const transcriptBytes = 1024 * 1024;
+  const readBudget = 512 * 1024;
+  const flags = ['--projects', projects, '--codex-sessions', codex, '--json'];
+  let target = claude;
+  if (stage.startsWith('codex')) {
+    target = path.join(codex, 'rollout-parent.jsonl');
+    fs.writeFileSync(target, JSON.stringify({ type: 'session_meta', payload: { id: 'parent', source: 'cli' } }) + '\n');
+  }
+  if (stage === 'codex catalog') {
+    for (let index = 0; index < entries; index++)
+      fs.writeFileSync(
+        path.join(codex, `rollout-${index}.jsonl`),
+        JSON.stringify({ type: 'session_meta', payload: { id: `unrelated-${index}`, source: 'cli' } }) + '\n',
+      );
+  } else if (stage === 'claude catalog') {
+    fs.appendFileSync(
+      target,
+      claudeDispatchTranscript(
+        'python launch.py --arc-dispatch',
+        'ARC_DISPATCH_SESSION={"agent":"claude","session_id":"aaaaaaaa-1111-2222-3333-444444444444"}',
+      )
+        .map((record) => JSON.stringify(record))
+        .join('\n') + '\n',
+    );
+    for (let index = 0; index < entries; index++)
+      fs.copyFileSync(claude, path.join(path.dirname(claude), `unrelated-${index}.jsonl`));
+  } else if (stage === 'id lookup') {
+    target = 'wanted';
+    for (let index = 0; index < entries; index++) fs.mkdirSync(path.join(projects, `project-${index}`));
+    fs.copyFileSync(claude, path.join(projects, 'project-0', 'wanted.jsonl'));
+  } else if (stage === 'native child admission') {
+    const directory = path.join(path.dirname(claude), 'session-1', 'subagents');
+    fs.mkdirSync(directory, { recursive: true });
+    for (let index = 0; index < entries; index++) fs.copyFileSync(claude, path.join(directory, `agent-${index}.jsonl`));
+  } else {
+    fs.appendFileSync(target, '\n'.repeat(transcriptBytes));
+    if (stage.endsWith('usage')) flags.push('--source-only');
+  }
+  const nativeFs: typeof fs = createRequire(import.meta.url)('node:fs');
+  const originalOpen = nativeFs.openSync;
+  const originalRead = nativeFs.readSync;
+  const originalClose = nativeFs.closeSync;
+  const originalStat = nativeFs.statSync;
+  const originalExists = nativeFs.existsSync;
+  const originalRealpathNative = nativeFs.realpathSync.native;
+  const descriptors = new Map<number, string>();
+  let work = 0;
+  let observed: number | undefined;
+  let scheduled: NodeJS.Immediate | undefined;
+  const interrupt = () => {
+    if (scheduled) return;
+    scheduled = setImmediate(() => {
+      observed = work;
+      controller.abort(reason);
+    });
+  };
+  const spies = [
+    vi.spyOn(nativeFs.realpathSync, 'native').mockImplementation(((
+      ...args: Parameters<typeof fs.realpathSync.native>
+    ) => {
+      if (stage === 'native child admission' && path.basename(String(args[0])).startsWith('agent-')) {
+        work++;
+        interrupt();
+      }
+      return originalRealpathNative(...args);
+    }) as typeof fs.realpathSync.native),
+    vi.spyOn(nativeFs, 'openSync').mockImplementation(((...args: Parameters<typeof fs.openSync>) => {
+      const fd = originalOpen(...args);
+      descriptors.set(fd, String(args[0]));
+      return fd;
+    }) as typeof fs.openSync),
+    vi.spyOn(nativeFs, 'closeSync').mockImplementation((fd) => {
+      descriptors.delete(fd);
+      originalClose(fd);
+    }),
+    vi.spyOn(nativeFs, 'readSync').mockImplementation(((...args: Parameters<typeof fs.readSync>) => {
+      const bytes = originalRead(...args);
+      if (
+        stage !== 'id lookup' &&
+        !stage.endsWith('catalog') &&
+        descriptors.get(args[0]) === target &&
+        bytes >= 64 * 1024
+      ) {
+        work += bytes;
+        interrupt();
+      }
+      return bytes;
+    }) as typeof fs.readSync),
+    vi.spyOn(nativeFs, 'statSync').mockImplementation(((...args: Parameters<typeof fs.statSync>) => {
+      const name = String(args[0]);
+      if (
+        stage.endsWith('catalog') &&
+        name.startsWith(stage === 'codex catalog' ? codex : path.dirname(claude)) &&
+        /^(?:unrelated-|rollout-\d)/.test(path.basename(name))
+      ) {
+        work++;
+        interrupt();
+      }
+      return originalStat(...args);
+    }) as typeof fs.statSync),
+    vi.spyOn(nativeFs, 'existsSync').mockImplementation((file) => {
+      if (stage === 'id lookup' && String(file).startsWith(projects) && String(file).endsWith('wanted.jsonl')) {
+        work++;
+        interrupt();
+      }
+      return originalExists(file);
+    }),
+  ];
+  syncBuiltinESMExports();
+  try {
+    await assert.rejects(costOutput([target, ...flags], controller.signal), (error) => error === reason);
+    assert.ok(observed !== undefined && observed > 0, 'An event-loop callback must run during the selected work.');
+    assert.ok(
+      work <
+        (stage.endsWith('catalog') || stage === 'id lookup' || stage === 'native child admission'
+          ? entries
+          : readBudget),
+      `${work} completed work before cancellation`,
+    );
+    assert.equal(descriptors.size, 0, 'Cancellation must close every opened transcript.');
+  } finally {
+    if (scheduled) clearImmediate(scheduled);
+    for (const spy of spies) spy.mockRestore();
+    syncBuiltinESMExports();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test.each([1, 2])(
+  'cost reads a large dispatch catalog across %i project directories without argument expansion',
+  async (projectCount) => {
+    const { root, projects, codex, file } = fixture();
+    const entries = 160_000;
+    const perProject = entries / projectCount;
+    const directories = Array.from({ length: projectCount }, (_, index) => path.join(projects, `catalog-${index}`));
+    const names = Array<string>(perProject).fill('unrelated.jsonl');
+    fs.appendFileSync(
+      file,
+      claudeDispatchTranscript(
+        'python launch.py --arc-dispatch',
+        'ARC_DISPATCH_SESSION={"agent":"claude","session_id":"aaaaaaaa-1111-2222-3333-444444444444"}',
+      )
+        .map((record) => JSON.stringify(record))
+        .join('\n') + '\n',
+    );
+    const nativeFs: typeof fs = createRequire(import.meta.url)('node:fs');
+    const originalRead = nativeFs.readdirSync;
+    const originalStat = nativeFs.statSync;
+    const stat = originalStat(file, { bigint: true });
+    let admitted = 0;
+    const reads = vi.spyOn(nativeFs, 'readdirSync').mockImplementation(((
+      ...args: Parameters<typeof fs.readdirSync>
+    ) => {
+      const name = String(args[0]);
+      if (name === projects)
+        return directories.map((directory) => ({ name: path.basename(directory), isDirectory: () => true }));
+      if (directories.includes(name)) return names;
+      return originalRead(...args);
+    }) as typeof fs.readdirSync);
+    const stats = vi.spyOn(nativeFs, 'statSync').mockImplementation(((...args: Parameters<typeof fs.statSync>) => {
+      if (directories.includes(path.dirname(String(args[0])))) {
+        admitted++;
+        return stat;
+      }
+      return originalStat(...args);
+    }) as typeof fs.statSync);
+    syncBuiltinESMExports();
+    try {
+      const report = JSON.parse(await runCost([file, '--projects', projects, '--codex-sessions', codex]));
+      assert.equal(admitted, entries);
+      assert.equal(report.parent.requests, 1);
+      assert.deepEqual(report.children, []);
+    } finally {
+      reads.mockRestore();
+      stats.mockRestore();
+      syncBuiltinESMExports();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  },
+);
+
+test.each(['SIGINT', 'SIGTERM'] as const)('main awaits cost and cancels its active scan on %s', async (signal) => {
+  const { root, file } = fixture();
+  fs.appendFileSync(file, '\n'.repeat(1024 * 1024));
+  const argv = process.argv;
+  const exitCode = process.exitCode;
+  const listenerCounts = ['SIGINT', 'SIGTERM'].map((name) => process.listenerCount(name));
+  const nativeFs: typeof fs = createRequire(import.meta.url)('node:fs');
+  const originalRead = nativeFs.readSync;
+  const originalOpen = nativeFs.openSync;
+  const originalClose = nativeFs.closeSync;
+  const descriptors = new Map<number, string>();
+  let readBytes = 0;
+  let observed = false;
+  let scheduled: NodeJS.Immediate | undefined;
+  vi.resetModules();
+  const command = await import('../src/cost.ts');
+  const originalCost = command.runCost;
+  let pending: Promise<string> | undefined;
+  const cost = vi.spyOn(command, 'runCost').mockImplementation((...args) => {
+    pending = originalCost(...args);
+    return pending;
+  });
+  const opens = vi.spyOn(nativeFs, 'openSync').mockImplementation(((...args: Parameters<typeof fs.openSync>) => {
+    const fd = originalOpen(...args);
+    descriptors.set(fd, String(args[0]));
+    return fd;
+  }) as typeof fs.openSync);
+  const closes = vi.spyOn(nativeFs, 'closeSync').mockImplementation((fd) => {
+    descriptors.delete(fd);
+    originalClose(fd);
+  });
+  const reads = vi.spyOn(nativeFs, 'readSync').mockImplementation(((...args: Parameters<typeof fs.readSync>) => {
+    const bytes = originalRead(...args);
+    if (descriptors.get(args[0]) === file && bytes >= 64 * 1024) {
+      readBytes += bytes;
+      if (!scheduled)
+        scheduled = setImmediate(() => {
+          observed = true;
+          process.emit(signal);
+        });
+    }
+    return bytes;
+  }) as typeof fs.readSync);
+  syncBuiltinESMExports();
+  const stdout = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+  const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+  process.argv = [process.execPath, argv[1], 'cost', file, '--source-only', '--json'];
+  try {
+    await import('../src/main.ts');
+    assert.ok(pending, 'main must call the production cost command.');
+    await pending.catch(() => {});
+    await vi.waitFor(() => assert.ok(stderr.mock.calls.length || stdout.mock.calls.length));
+    assert.equal(observed, true);
+    assert.ok(readBytes < 128 * 1024, `${readBytes} transcript bytes read before cancellation`);
+    assert.equal(descriptors.size, 0);
+    assert.deepEqual(stdout.mock.calls, [], 'A cancelled cost command must publish no completed report.');
+    assert.match(stderr.mock.calls.map(([text]) => String(text)).join(''), /Cost report cancelled/);
+    assert.deepEqual(
+      ['SIGINT', 'SIGTERM'].map((name) => process.listenerCount(name)),
+      listenerCounts,
+    );
+    assert.equal(process.exitCode, signal === 'SIGINT' ? 130 : 143);
+  } finally {
+    if (scheduled) clearImmediate(scheduled);
+    process.argv = argv;
+    process.exitCode = exitCode;
+    cost.mockRestore();
+    reads.mockRestore();
+    opens.mockRestore();
+    closes.mockRestore();
+    stdout.mockRestore();
+    stderr.mockRestore();
+    syncBuiltinESMExports();
+    vi.resetModules();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test.each(['SIGINT', 'SIGTERM'] as const)(
+  'main honours a %s callback queued after cost rendering before publishing stdout',
+  async (signal) => {
+    const { root, file } = fixture();
+    const argv = process.argv;
+    const exitCode = process.exitCode;
+    const listenerCounts = ['SIGINT', 'SIGTERM'].map((name) => process.listenerCount(name));
+    let scheduled: NodeJS.Immediate | undefined;
+    let observed = false;
+    let callback!: () => void;
+    const callbackFinished = new Promise<void>((resolve) => (callback = resolve));
+    vi.resetModules();
+    const command = await import('../src/cost.ts');
+    const originalCost = command.runCost;
+    const cost = vi.spyOn(command, 'runCost').mockImplementation(async (...args) => {
+      const output = await originalCost(...args);
+      scheduled = setImmediate(() => {
+        observed = process.emit(signal);
+        callback();
+      });
+      return output;
+    });
+    const stdout = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    process.argv = [process.execPath, argv[1], 'cost', file, '--source-only', '--json'];
+    try {
+      await import('../src/main.ts');
+      await callbackFinished;
+      await vi.waitFor(() => assert.ok(stderr.mock.calls.length || stdout.mock.calls.length));
+      assert.equal(observed, true, 'The queued callback must reach the active cancellation listener.');
+      assert.deepEqual(stdout.mock.calls, [], 'A cancelled cost command must publish no completed report.');
+      assert.match(stderr.mock.calls.map(([text]) => String(text)).join(''), /Cost report cancelled/);
+      assert.equal(process.exitCode, signal === 'SIGINT' ? 130 : 143);
+      assert.deepEqual(
+        ['SIGINT', 'SIGTERM'].map((name) => process.listenerCount(name)),
+        listenerCounts,
+      );
+    } finally {
+      if (scheduled) clearImmediate(scheduled);
+      process.argv = argv;
+      process.exitCode = exitCode;
+      cost.mockRestore();
+      stdout.mockRestore();
+      stderr.mockRestore();
+      vi.resetModules();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  },
+);
+
+test('human cost preserves unknown totals and requested detail while JSON drops only invariant notes', async () => {
   const { root, file } = fixture();
   try {
     const args = [file, '--source-only', '--by-model', '--by-tool', '--until-text', 'no match'];
-    const report = JSON.parse(runCost(args));
-    const human = costOutput(args);
+    const report = JSON.parse(await runCost(args));
+    const human = await costOutput(args);
     for (const value of [
       'Parent',
       'Combined',
@@ -40,10 +363,10 @@ test('human cost preserves unknown totals and requested detail while JSON drops 
     const record = JSON.parse(fs.readFileSync(file, 'utf8'));
     record.message.model = 'unpriced-future-model';
     fs.writeFileSync(file, JSON.stringify(record) + '\n');
-    const unknown = costOutput([file, '--source-only']);
+    const unknown = await costOutput([file, '--source-only']);
     assert.match(unknown, /Parent\s+1\s+unknown/);
     assert.ok(unknown.includes('unpriced-future-model'));
-    const zero = costOutput([file, '--source-only', '--since', '2027-01-01T00:00:00Z']);
+    const zero = await costOutput([file, '--source-only', '--since', '2027-01-01T00:00:00Z']);
     assert.match(zero, /Parent\s+0\s+unknown/);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
@@ -83,9 +406,9 @@ function fixture() {
   return { root, projects, codex, file };
 }
 
-function sourceOnlyParity(file: string, flags: string[] = []): void {
-  const ordinary = JSON.parse(runCost([file, ...flags]));
-  const direct = JSON.parse(runCost([file, ...flags, '--source-only']));
+async function sourceOnlyParity(file: string, flags: string[] = []): Promise<void> {
+  const ordinary = JSON.parse(await runCost([file, ...flags]));
+  const direct = JSON.parse(await runCost([file, ...flags, '--source-only']));
   assert.deepEqual(direct.parent, ordinary.parent);
   assert.deepEqual(direct.children, []);
   // The coverage diagnostic belongs to source summaries only.
@@ -96,7 +419,7 @@ function sourceOnlyParity(file: string, flags: string[] = []): void {
   for (const key of ['source', 'window', 'byTool', 'untilText', 'parentWindow'])
     assert.deepEqual(direct[key], ordinary[key]);
   assert.equal('modelCosts' in ordinary.parent, false);
-  const detail = JSON.parse(runCost([file, ...flags, '--source-only', '--by-model']));
+  const detail = JSON.parse(await runCost([file, ...flags, '--source-only', '--by-model']));
   const { modelCosts, ...parent } = detail.parent;
   assert.deepEqual(parent, ordinary.parent);
   assert.equal(Array.isArray(modelCosts), true);
@@ -106,7 +429,7 @@ function sourceOnlyParity(file: string, flags: string[] = []): void {
     assert.deepEqual(detail[key], ordinary[key]);
 }
 
-test('per-pass pricing reaches arc cost for the e2a025b8 response', () => {
+test('per-pass pricing reaches arc cost for the e2a025b8 response', async () => {
   const { file, projects, codex } = fixture();
   fs.writeFileSync(
     file,
@@ -115,7 +438,7 @@ test('per-pass pricing reaches arc cost for the e2a025b8 response', () => {
       .join('\n') + '\n',
   );
   const { parent } = JSON.parse(
-    runCost([file, '--projects', projects, '--codex-sessions', codex, '--by-model', '--json']),
+    await runCost([file, '--projects', projects, '--codex-sessions', codex, '--by-model', '--json']),
   );
   assert.equal(parent.costUsd, 0.1537);
   assert.equal(parent.requests, 2);
@@ -127,7 +450,7 @@ test('per-pass pricing reaches arc cost for the e2a025b8 response', () => {
   );
 });
 
-test('cost rejects unsupported formats before applying an empty request window', () => {
+test('cost rejects unsupported formats before applying an empty request window', async () => {
   const { root, file } = fixture();
   const assistant = JSON.parse(fs.readFileSync(file, 'utf8'));
   const init = { type: 'system', subtype: 'init', session_id: 'stream-session', tools: [] };
@@ -154,7 +477,7 @@ test('cost rejects unsupported formats before applying an empty request window',
       fs.writeFileSync(file, content);
       for (const flags of [[], ['--source-only'], ['--since', '2027-01-01T00:00:00Z']]) {
         try {
-          assert.throws(() => runCost([file, ...flags]), error, content);
+          await assert.rejects(async () => await runCost([file, ...flags]), error, content);
         } catch (failure) {
           failures.push(`Case ${index}, flags ${flags.join(' ')}: ${String(failure)}`);
         }
@@ -166,19 +489,19 @@ test('cost rejects unsupported formats before applying an empty request window',
   }
 });
 
-test('cost preserves native usage, metadata-only sessions, and incomplete trailing lines', () => {
+test('cost preserves native usage, metadata-only sessions, and incomplete trailing lines', async () => {
   const { root, file, codex, projects } = fixture();
   try {
     const native = fs.readFileSync(file, 'utf8');
     fs.appendFileSync(file, '{"type":"assistant","message":');
-    assert.equal(JSON.parse(runCost([file, '--source-only'])).parent.requests, 1);
-    assert.equal(JSON.parse(runCost([file, '--since', '2027-01-01T00:00:00Z'])).parent.requests, 0);
+    assert.equal(JSON.parse(await runCost([file, '--source-only'])).parent.requests, 1);
+    assert.equal(JSON.parse(await runCost([file, '--since', '2027-01-01T00:00:00Z'])).parent.requests, 0);
     fs.writeFileSync(file, JSON.stringify({ type: 'custom-title', sessionId: 'session-1', customTitle: 'Saved' }));
-    assert.equal(JSON.parse(runCost([file])).parent.requests, 0);
+    assert.equal(JSON.parse(await runCost([file])).parent.requests, 0);
     const child = path.join(projects, 'sample', 'session-1', 'subagents', 'agent-child.jsonl');
     fs.mkdirSync(path.dirname(child), { recursive: true });
     fs.writeFileSync(child, native);
-    const withChild = JSON.parse(runCost([file, '--projects', projects, '--codex-sessions', codex]));
+    const withChild = JSON.parse(await runCost([file, '--projects', projects, '--codex-sessions', codex]));
     assert.equal(withChild.children.length, 1);
     assert.equal(withChild.combined.requests, 1);
     const rollout = path.join(codex, 'rollout-metadata.jsonl');
@@ -186,7 +509,7 @@ test('cost preserves native usage, metadata-only sessions, and incomplete traili
       rollout,
       JSON.stringify({ type: 'session_meta', payload: { id: 'metadata', cwd: root, source: 'cli' } }),
     );
-    assert.equal(JSON.parse(runCost([rollout, '--source-only'])).parent.requests, 0);
+    assert.equal(JSON.parse(await runCost([rollout, '--source-only'])).parent.requests, 0);
     fs.writeFileSync(
       rollout,
       JSON.stringify({ type: 'session_meta', payload: { session_id: 'native-session', source: 'cli' } }),
@@ -197,7 +520,7 @@ test('cost preserves native usage, metadata-only sessions, and incomplete traili
     try {
       for (const flags of [[], ['--source-only']]) {
         reads.mockClear();
-        const report = JSON.parse(runCost([rollout, ...flags]));
+        const report = JSON.parse(await runCost([rollout, ...flags]));
         assert.deepEqual(
           reads.mock.calls.map(([directory]) => String(directory)),
           flags.length ? [] : [defaultRoots.codex],
@@ -215,7 +538,7 @@ test('cost preserves native usage, metadata-only sessions, and incomplete traili
   }
 });
 
-test('standalone receipts price each original child once through both native parent formats', () => {
+test('standalone receipts price each original child once through both native parent formats', async () => {
   for (const parentAgent of ['claude', 'codex'])
     for (const childAgent of ['claude', 'codex']) {
       const { root, projects, codex, file } = fixture();
@@ -296,8 +619,8 @@ test('standalone receipts price each original child once through both native par
         fs.writeFileSync(path.join(root, 'copied-report.jsonl'), fs.readFileSync(child));
         fs.writeFileSync(path.join(root, 'receipt-output.txt'), marker);
         const roots = ['--projects', projects, '--codex-sessions', codex, '--by-model'];
-        const original = JSON.parse(runCost([child, '--source-only', ...roots]));
-        const report = JSON.parse(runCost([parent, ...roots]));
+        const original = JSON.parse(await runCost([child, '--source-only', ...roots]));
+        const report = JSON.parse(await runCost([parent, ...roots]));
         assert.equal(original.parent.requests, 1, childAgent);
         assert.equal(report.children.length, 1, `${parentAgent}/${childAgent}`);
         assert.equal(report.children[0].file, child);
@@ -311,7 +634,7 @@ test('standalone receipts price each original child once through both native par
     }
 });
 
-test('cost attributes a delayed native child once through colliding parent session ids', () => {
+test('cost attributes a delayed native child once through colliding parent session ids', async () => {
   const { root, projects, codex } = fixture();
   try {
     const at = (second: number) => new Date(Date.UTC(2026, 8, 26, 0, 0, second)).toISOString();
@@ -381,12 +704,12 @@ test('cost attributes a delayed native child once through colliding parent sessi
     ];
     fs.writeFileSync(child, records.map((record) => JSON.stringify(record)).join('\n') + '\n');
     const roots = ['--projects', projects, '--codex-sessions', codex];
-    const direct = JSON.parse(runCost([child, '--source-only', '--by-model', ...roots]));
+    const direct = JSON.parse(await runCost([child, '--source-only', '--by-model', ...roots]));
     assert.equal(direct.parent.requests, 1);
     assert.equal(direct.parent.modelCosts[0].model, 'gpt-6-astra');
     assert.equal(direct.parent.costUsd, 0.015);
     assert.deepEqual(direct.children, []);
-    const combined = JSON.parse(runCost([parent, '--by-model', ...roots]));
+    const combined = JSON.parse(await runCost([parent, '--by-model', ...roots]));
     assert.equal(combined.children.length, 1);
     assert.equal(combined.children[0].sessionId, 'native-child');
     assert.equal(combined.combined.requests, 1);
@@ -425,7 +748,7 @@ test('cost attributes a delayed native child once through colliding parent sessi
         child,
         [...original, ...scenario.tail].map((record) => JSON.stringify(record)).join('\n') + '\n',
       );
-      const report = JSON.parse(runCost([child, '--source-only', '--by-model', ...roots])).parent;
+      const report = JSON.parse(await runCost([child, '--source-only', '--by-model', ...roots])).parent;
       assert.equal(report.requests, 1);
       assert.equal(report.costUsd, scenario.cost);
       assert.equal(report.coverage, scenario.coverage);
@@ -472,7 +795,7 @@ test('cost attributes a delayed native child once through colliding parent sessi
         ? [...original, print, print, { ...bill, timestamp: at(20) }]
         : [...original, { ...bill, timestamp: at(20) }, print, print];
       fs.writeFileSync(child, ordered.map((record) => JSON.stringify(record)).join('\n') + '\n');
-      const report = JSON.parse(runCost([child, '--by-model', ...roots]));
+      const report = JSON.parse(await runCost([child, '--by-model', ...roots]));
       assert.equal(report.children.length, 1);
       assert.equal(report.children[0].sessionId, 'printed');
       assert.equal(report.children[0].costUsd, 0.01);
@@ -484,20 +807,20 @@ test('cost attributes a delayed native child once through colliding parent sessi
   }
 });
 
-test('cost resolves an id with explicit roots and prints the versioned JSON report by default', () => {
+test('cost resolves an id with explicit roots and prints the versioned JSON report by default', async () => {
   const { root, projects, codex, file } = fixture();
   try {
-    const report = JSON.parse(runCost(['session-1', '--projects', projects, '--codex-sessions', codex]));
+    const report = JSON.parse(await runCost(['session-1', '--projects', projects, '--codex-sessions', codex]));
     assert.equal(report.schemaVersion, 3);
     assert.equal(typeof report.buildCommit, 'string');
     assert.equal(report.source.file, file);
     assert.equal(report.parent.requests, 1);
     assert.deepEqual(report.parent.models, ['claude-opus-5']);
     assert.equal(report.combined.requests, 1);
-    sourceOnlyParity(file, ['--projects', projects, '--codex-sessions', codex]);
-    sourceOnlyParity(path.relative(process.cwd(), file), ['--projects', projects, '--codex-sessions', codex]);
-    assert.throws(
-      () => runCost(['session-1', '--source-only', '--projects', projects, '--codex-sessions', codex]),
+    await sourceOnlyParity(file, ['--projects', projects, '--codex-sessions', codex]);
+    await sourceOnlyParity(path.relative(process.cwd(), file), ['--projects', projects, '--codex-sessions', codex]);
+    await assert.rejects(
+      async () => await runCost(['session-1', '--source-only', '--projects', projects, '--codex-sessions', codex]),
       /requires an existing transcript file path/,
     );
   } finally {
@@ -505,7 +828,7 @@ test('cost resolves an id with explicit roots and prints the versioned JSON repo
   }
 });
 
-test('cost JSON exposes reconciled recorded totals and retains empty windows with missing bills', () => {
+test('cost JSON exposes reconciled recorded totals and retains empty windows with missing bills', async () => {
   const { root, projects, codex } = fixture();
   const file = path.join(codex, 'rollout-2026-09-26T00-00-00-child.jsonl');
   const at = (second: number) => new Date(Date.UTC(2026, 8, 26, 0, 0, second)).toISOString();
@@ -543,7 +866,7 @@ test('cost JSON exposes reconciled recorded totals and retains empty windows wit
   const flags = ['--projects', projects, '--codex-sessions', codex, '--by-model', '--source-only'];
   try {
     fs.writeFileSync(file, records.map((record) => JSON.stringify(record)).join('\n') + '\n');
-    const report = JSON.parse(runCost([file, ...flags]));
+    const report = JSON.parse(await runCost([file, ...flags]));
     assert.equal(report.schemaVersion, 3);
     assert.equal(report.parent.coverage, 'recorded-reconciled');
     assert.equal(report.parent.costUsd, 0.003);
@@ -563,7 +886,7 @@ test('cost JSON exposes reconciled recorded totals and retains empty windows wit
         },
       }) + '\n',
     );
-    const gap = JSON.parse(runCost([file, ...flags, '--since', at(5), '--until', at(6)]));
+    const gap = JSON.parse(await runCost([file, ...flags, '--since', at(5), '--until', at(6)]));
     assert.equal(gap.parent.coverage, 'recorded-gaps');
     assert.equal(gap.parent.requests, 0);
     assert.equal(gap.parent.costUsd, null);
@@ -601,7 +924,7 @@ test('cost JSON exposes reconciled recorded totals and retains empty windows wit
         .map((record) => JSON.stringify(record))
         .join('\n') + '\n',
     );
-    const unresolved = JSON.parse(runCost([file, ...flags, '--since', at(8), '--until', at(10)]));
+    const unresolved = JSON.parse(await runCost([file, ...flags, '--since', at(8), '--until', at(10)]));
     assert.equal(unresolved.parent.coverage, 'billed-with-unknown-coverage');
     assert.equal(unresolved.parent.costUsd, null);
     assert.equal(unresolved.parent.pricedCostUsd, 0.003);
@@ -624,13 +947,13 @@ test('cost JSON exposes reconciled recorded totals and retains empty windows wit
         .map((record) => JSON.stringify(record))
         .join('\n') + '\n',
     );
-    const reset = JSON.parse(runCost([file, ...flags, '--since', at(7), '--until', at(8)]));
+    const reset = JSON.parse(await runCost([file, ...flags, '--since', at(7), '--until', at(8)]));
     assert.equal(reset.parent.requests, 0);
     assert.equal(reset.parent.coverage, 'billed-with-unknown-coverage');
     assert.equal(reset.parent.costUsd, null);
     assert.equal(reset.parent.requestCountExact, false);
     assert.equal(reset.combined.costUsd, null);
-    const recovery = JSON.parse(runCost([file, ...flags, '--since', at(12), '--until', at(14)]));
+    const recovery = JSON.parse(await runCost([file, ...flags, '--since', at(12), '--until', at(14)]));
     assert.equal(recovery.parent.coverage, 'recorded-reconciled');
     assert.equal(recovery.parent.costUsd, 0.003);
     assert.equal(recovery.parent.modelCosts[0].costUsd, 0.003);
@@ -640,7 +963,7 @@ test('cost JSON exposes reconciled recorded totals and retains empty windows wit
   }
 });
 
-test('cost selects the explicit Codex sessions root over the environment root', () => {
+test('cost selects the explicit Codex sessions root over the environment root', async () => {
   const { root, projects, codex } = fixture();
   const environmentRoot = path.join(root, 'environment-sessions');
   const relativeFile = path.join('2026', '09', '26', 'rollout-2026-09-26T00-00-00-codex-session.jsonl');
@@ -669,7 +992,7 @@ test('cost selects the explicit Codex sessions root over the environment root', 
   fs.writeFileSync(environmentFile, JSON.stringify(records[0]) + '\n');
   process.env.ARC_CODEX_ROOT = environmentRoot;
   try {
-    const report = JSON.parse(runCost(['codex-session', '--projects', projects, '--codex-sessions', codex]));
+    const report = JSON.parse(await runCost(['codex-session', '--projects', projects, '--codex-sessions', codex]));
     assert.equal(report.source.file, explicitFile);
     assert.equal(report.parent.requests, 1);
     assert.deepEqual(report.parent.models, ['gpt-6-sol']);
@@ -680,7 +1003,7 @@ test('cost selects the explicit Codex sessions root over the environment root', 
   }
 });
 
-test('cost prices recorded Bedrock GPT-6.1 Sol requests and cache categories', () => {
+test('cost prices recorded Bedrock GPT-6.1 Sol requests and cache categories', async () => {
   for (const [model, expected] of [
     ['openai.gpt-6.1-sol', 1.76],
     ['us.openai.gpt-6.1-sol', 1.76],
@@ -729,7 +1052,7 @@ test('cost prices recorded Bedrock GPT-6.1 Sol requests and cache categories', (
       ];
       fs.mkdirSync(path.dirname(file), { recursive: true });
       fs.writeFileSync(file, records.map((record) => JSON.stringify(record)).join('\n') + '\n');
-      const report = JSON.parse(runCost(['bedrock-sol', '--projects', projects, '--codex-sessions', codex]));
+      const report = JSON.parse(await runCost(['bedrock-sol', '--projects', projects, '--codex-sessions', codex]));
       assert.equal(report.parent.requests, 3);
       assert.deepEqual(report.parent.models, [model]);
       assert.ok(Math.abs(report.parent.pricedCostUsd - expected) < 1e-12);
@@ -739,7 +1062,7 @@ test('cost prices recorded Bedrock GPT-6.1 Sol requests and cache categories', (
   }
 });
 
-test('cost JSON separates identified Codex bills from anonymous snapshots', () => {
+test('cost JSON separates identified Codex bills from anonymous snapshots', async () => {
   const { root, projects, codex } = fixture();
   const file = path.join(codex, '2026', '09', '26', 'rollout-2026-09-26T00-00-00-billed.jsonl');
   const usage = {
@@ -805,7 +1128,7 @@ test('cost JSON separates identified Codex bills from anonymous snapshots', () =
       .join('\n') + '\n',
   );
   try {
-    const report = JSON.parse(runCost(['billed', '--projects', projects, '--codex-sessions', codex]));
+    const report = JSON.parse(await runCost(['billed', '--projects', projects, '--codex-sessions', codex]));
     assert.equal(report.schemaVersion, 3);
     assert.equal(report.parent.requests, 1);
     assert.equal(report.parent.snapshotEvidence.count, 1);
@@ -814,8 +1137,8 @@ test('cost JSON separates identified Codex bills from anonymous snapshots', () =
     assert.equal(report.parent.cacheExpiry.inputCostAfterExpiryUsd, null);
     assert.equal(report.parent.costUsd, null);
     assert.ok(report.parent.pricedCostUsd > 0);
-    sourceOnlyParity(file, ['--projects', projects, '--codex-sessions', codex]);
-    const detail = JSON.parse(runCost([file, '--projects', projects, '--codex-sessions', codex, '--by-model']));
+    await sourceOnlyParity(file, ['--projects', projects, '--codex-sessions', codex]);
+    const detail = JSON.parse(await runCost([file, '--projects', projects, '--codex-sessions', codex, '--by-model']));
     assert.equal(detail.parent.modelCosts[0].coverage, 'billed-with-unknown-coverage');
     assert.equal(detail.children[0].modelCosts[0].coverage, 'legacy-snapshots');
     assert.equal(detail.children[0].modelCosts[0].estimatedCostUsd, detail.children[0].estimatedCostUsd);
@@ -834,7 +1157,7 @@ test('cost JSON separates identified Codex bills from anonymous snapshots', () =
   }
 });
 
-test('cost groups empty compaction and absent model identities in one null row', () => {
+test('cost groups empty compaction and absent model identities in one null row', async () => {
   const { root, projects, codex } = fixture();
   const file = path.join(codex, 'rollout-2026-09-26T00-00-00-empty-model.jsonl');
   const at = (second: number) => new Date(Date.UTC(2026, 8, 26, 0, 0, second)).toISOString();
@@ -888,11 +1211,11 @@ test('cost groups empty compaction and absent model identities in one null row',
   try {
     fs.writeFileSync(file, records.map((record) => JSON.stringify(record)).join('\n') + '\n');
     const flags = [file, '--projects', projects, '--codex-sessions', codex];
-    const ordinary = JSON.parse(runCost(flags));
+    const ordinary = JSON.parse(await runCost(flags));
     assert.deepEqual(ordinary.parent.models, ['future-model', 'gpt-6-sol']);
     assert.deepEqual(ordinary.parent.unpricedModels, ['', 'future-model', 'unknown']);
-    sourceOnlyParity(file, flags.slice(1));
-    const detail = JSON.parse(runCost([...flags, '--source-only', '--by-model']));
+    await sourceOnlyParity(file, flags.slice(1));
+    const detail = JSON.parse(await runCost([...flags, '--source-only', '--by-model']));
     const { modelCosts, ...parent } = detail.parent;
     assert.deepEqual(parent, ordinary.parent);
     assert.deepEqual(
@@ -936,14 +1259,14 @@ test('cost groups empty compaction and absent model identities in one null row',
   }
 });
 
-test('cost reads environment roots and applies an exclusive until time', () => {
+test('cost reads environment roots and applies an exclusive until time', async () => {
   const { root, projects, codex } = fixture();
   const previousProjects = process.env.ARC_PROJECTS_ROOT;
   const previousCodex = process.env.ARC_CODEX_ROOT;
   process.env.ARC_PROJECTS_ROOT = projects;
   process.env.ARC_CODEX_ROOT = codex;
   try {
-    const report = JSON.parse(runCost(['session-1', '--until', '2026-09-26T00:00:01Z', '--json']));
+    const report = JSON.parse(await runCost(['session-1', '--until', '2026-09-26T00:00:01Z', '--json']));
     assert.equal(report.parent.requests, 0);
     assert.equal(report.window.until, '2026-09-26T00:00:01.000Z');
   } finally {
@@ -955,23 +1278,23 @@ test('cost reads environment roots and applies an exclusive until time', () => {
   }
 });
 
-test('cost rejects missing targets, bad times, and ambiguous ids', () => {
+test('cost rejects missing targets, bad times, and ambiguous ids', async () => {
   const { root, projects, codex, file } = fixture();
   try {
     const flags = ['--projects', projects, '--codex-sessions', codex];
-    assert.throws(() => runCost(['missing', ...flags]), /No transcript found/);
-    assert.throws(() => runCost([file, '--since', 'yesterday', ...flags]), /Invalid since time/);
-    assert.throws(() => runCost([file, '--unexpected', ...flags]), /Unknown cost option/);
+    await assert.rejects(async () => await runCost(['missing', ...flags]), /No transcript found/);
+    await assert.rejects(async () => await runCost([file, '--since', 'yesterday', ...flags]), /Invalid since time/);
+    await assert.rejects(async () => await runCost([file, '--unexpected', ...flags]), /Unknown cost option/);
     const second = path.join(projects, 'other', 'session-1.jsonl');
     fs.mkdirSync(path.dirname(second), { recursive: true });
     fs.copyFileSync(file, second);
-    assert.throws(() => runCost(['session-1', ...flags]), /More than one transcript matched/);
+    await assert.rejects(async () => await runCost(['session-1', ...flags]), /More than one transcript matched/);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
 
-test('cost attributes failed tools and launch windows to the requests that made them', () => {
+test('cost attributes failed tools and launch windows to the requests that made them', async () => {
   const { root, file } = fixture();
   try {
     const at = (minute: number) => new Date(Date.UTC(2026, 8, 26, 0, minute)).toISOString();
@@ -1021,7 +1344,7 @@ test('cost attributes failed tools and launch windows to the requests that made 
         .join('\n') + '\n',
     );
     const report = JSON.parse(
-      runCost([file, '--by-tool', '--until-text', 'FINDING', '--window-agent', 'a1', '--until', at(4)]),
+      await runCost([file, '--by-tool', '--until-text', 'FINDING', '--window-agent', 'a1', '--until', at(4)]),
     );
     assert.equal(report.parent.failedToolCalls, 1);
     assert.equal(report.parent.failedToolCallRequests, 1);
@@ -1034,10 +1357,18 @@ test('cost attributes failed tools and launch windows to the requests that made 
     assert.equal(report.parentWindow.contextAtStart, 100);
     assert.equal(report.parentWindow.contextAtPeak, 100);
     assert.equal('requestsNote' in report.parentWindow.byTool, false);
-    const human = costOutput([file, '--source-only', '--by-tool', '--until-text', 'FINDING', '--window-agent', 'a1']);
+    const human = await costOutput([
+      file,
+      '--source-only',
+      '--by-tool',
+      '--until-text',
+      'FINDING',
+      '--window-agent',
+      'a1',
+    ]);
     for (const detail of ['Failed tools: 1', 'Matched: true', 'Agent window:', 'Agent window tools'])
       assert.ok(human.includes(detail), detail);
-    const exclusive = JSON.parse(runCost([file, '--window-agent', 'a1', '--until', at(3)]));
+    const exclusive = JSON.parse(await runCost([file, '--window-agent', 'a1', '--until', at(3)]));
     assert.equal(exclusive.parent.requests, 1);
     assert.equal(exclusive.parentWindow.requests, 2);
     for (let mask = 0; mask < 32; mask++) {
@@ -1049,30 +1380,39 @@ test('cost attributes failed tools and launch windows to the requests that made 
         ...(mask & 8 ? ['--until-text', 'FINDING'] : []),
         ...(mask & 16 ? ['--window-agent', 'a1'] : []),
       ];
-      sourceOnlyParity(file, flags);
+      await sourceOnlyParity(file, flags);
     }
-    assert.throws(() => runCost([file, '--source-only', '--until-text', 'finding']), /requires --by-tool[.]/);
-    assert.throws(() => runCost([file, '--source-only', '--window-agent', 'missing']), /No Agent launch found/);
+    await assert.rejects(
+      async () => await runCost([file, '--source-only', '--until-text', 'finding']),
+      /requires --by-tool[.]/,
+    );
+    await assert.rejects(
+      async () => await runCost([file, '--source-only', '--window-agent', 'missing']),
+      /No Agent launch found/,
+    );
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
 
-test('until-text accepts Python global case, multiline, and dotall flags', () => {
+test('until-text accepts Python global case, multiline, and dotall flags', async () => {
   const { root, file } = fixture();
   try {
     const record = JSON.parse(fs.readFileSync(file, 'utf8'));
     record.message.content = [{ type: 'text', text: 'noise\nFound\na bug' }];
     fs.writeFileSync(file, JSON.stringify(record) + '\n');
-    const report = JSON.parse(runCost([file, '--by-tool', '--until-text', '(?ims)^found.a bug']));
+    const report = JSON.parse(await runCost([file, '--by-tool', '--until-text', '(?ims)^found.a bug']));
     assert.equal(report.untilText.matched, true);
-    assert.throws(() => runCost([file, '--by-tool', '--until-text', '(?x)found']), /Invalid --until-text pattern/);
+    await assert.rejects(
+      async () => await runCost([file, '--by-tool', '--until-text', '(?x)found']),
+      /Invalid --until-text pattern/,
+    );
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
 
-test('cost JSON uses the Python context mean for an even tie', () => {
+test('cost JSON uses the Python context mean for an even tie', async () => {
   const { root, file } = fixture();
   try {
     const first = JSON.parse(fs.readFileSync(file, 'utf8'));
@@ -1083,7 +1423,7 @@ test('cost JSON uses the Python context mean for an even tie', () => {
       message: { ...first.message, id: 'request-2', usage: { ...first.message.usage, input_tokens: 29_325 } },
     };
     fs.writeFileSync(file, [first, second].map((record) => JSON.stringify(record)).join('\n') + '\n');
-    const report = JSON.parse(runCost([file]));
+    const report = JSON.parse(await runCost([file]));
     assert.equal(report.parent.contextMean, 29_324);
     assert.equal(report.combined.contextMean, 29_324);
   } finally {
@@ -1106,7 +1446,7 @@ test.each(
   ),
 )(
   'cost reports generic cache lifetime for $model with $read reads and $written writes',
-  ({ provider, model, read, written, cost }) => {
+  async ({ provider, model, read, written, cost }) => {
     const { root, projects, codex } = fixture();
     const file = path.join(codex, 'rollout-session.jsonl');
     try {
@@ -1142,7 +1482,7 @@ test.each(
         );
       }
       fs.writeFileSync(file, records.map((record) => JSON.stringify(record)).join('\n') + '\n');
-      const report = JSON.parse(runCost([file, '--projects', projects, '--codex-sessions', codex]));
+      const report = JSON.parse(await runCost([file, '--projects', projects, '--codex-sessions', codex]));
       assert.equal(report.parent.pricedRequests, 2);
       assert.equal(report.parent.uncachedInputTokens, 30_000);
       assert.equal(report.parent.cachedInputTokens, read);
@@ -1163,7 +1503,7 @@ test.each(
 
 test.each(['5m', '1h'])(
   'cost reports fast-mode gaps and explicit %s cache expiry from adjacent priced requests',
-  (lifetime) => {
+  async (lifetime) => {
     const { root, file } = fixture();
     try {
       const usage = (speed: string) => ({
@@ -1200,7 +1540,7 @@ test.each(['5m', '1h'])(
           .map((record) => JSON.stringify(record))
           .join('\n') + '\n',
       );
-      const report = JSON.parse(runCost([file]));
+      const report = JSON.parse(await runCost([file]));
       assert.equal(report.parent.fastModeUnpricedRequests, 1);
       assert.equal(report.parent.cacheExpiry.returns, 1);
       assert.equal(report.parent.cacheExpiry.coverage, 'complete');
@@ -1213,7 +1553,7 @@ test.each(['5m', '1h'])(
   },
 );
 
-test('cost keeps Codex tool failures without assigning their cost to a request', () => {
+test('cost keeps Codex tool failures without assigning their cost to a request', async () => {
   const { root, codex } = fixture();
   const file = path.join(codex, '2026', '09', '26', 'rollout-2026-09-26T00-00-00-failed.jsonl');
   const child = path.join(codex, '2026', '09', '26', 'rollout-2026-09-26T00-00-00-failed-child.jsonl');
@@ -1254,7 +1594,15 @@ test('cost keeps Codex tool failures without assigning their cost to a request',
         .join('\n') + '\n',
     );
     const report = JSON.parse(
-      runCost([file, '--codex-sessions', codex, '--since', '2026-09-26T00:00:01Z', '--until', '2026-09-26T00:00:03Z']),
+      await runCost([
+        file,
+        '--codex-sessions',
+        codex,
+        '--since',
+        '2026-09-26T00:00:01Z',
+        '--until',
+        '2026-09-26T00:00:03Z',
+      ]),
     );
     assert.equal(report.parent.requests, 0);
     assert.equal(report.parent.failedToolCalls, 1);
@@ -1265,7 +1613,7 @@ test('cost keeps Codex tool failures without assigning their cost to a request',
     assert.equal(report.children[0].failedToolCalls, 1);
     assert.equal(report.combined.failedToolCalls, 2);
     assert.equal(report.combined.failedToolCallCostUsd, null);
-    sourceOnlyParity(file, [
+    await sourceOnlyParity(file, [
       '--codex-sessions',
       codex,
       '--since',
@@ -1274,7 +1622,7 @@ test('cost keeps Codex tool failures without assigning their cost to a request',
       '2026-09-26T00:00:03Z',
     ]);
     const direct = JSON.parse(
-      runCost([
+      await runCost([
         file,
         '--source-only',
         '--by-model',
@@ -1294,7 +1642,7 @@ test('cost keeps Codex tool failures without assigning their cost to a request',
   }
 });
 
-test('cost resolves an Agent launch from subagent metadata when its result has no id', () => {
+test('cost resolves an Agent launch from subagent metadata when its result has no id', async () => {
   const { root, file } = fixture();
   try {
     const meta = path.join(path.dirname(file), 'session-1', 'subagents', 'agent-fallback.meta.json');
@@ -1314,10 +1662,10 @@ test('cost resolves an Agent launch from subagent metadata when its result has n
         },
       }) + '\n',
     );
-    const report = JSON.parse(runCost([file, '--window-agent', 'fallback']));
+    const report = JSON.parse(await runCost([file, '--window-agent', 'fallback']));
     assert.equal(report.parentWindow.agentIdStartRequest, 'launch');
     assert.equal(report.parentWindow.requests, 1);
-    sourceOnlyParity(file, [
+    await sourceOnlyParity(file, [
       '--window-agent',
       'fallback',
       '--by-tool',
@@ -1336,7 +1684,7 @@ test('cost resolves an Agent launch from subagent metadata when its result has n
     const opens = vi.spyOn(nativeFs, 'openSync');
     syncBuiltinESMExports();
     try {
-      const direct = JSON.parse(runCost([file, '--source-only', '--by-model', '--window-agent', 'fallback']));
+      const direct = JSON.parse(await runCost([file, '--source-only', '--by-model', '--window-agent', 'fallback']));
       assert.equal(direct.parentWindow.agentIdStartRequest, 'launch');
       assert.equal(enumeration.mock.calls.length, 0);
       assert.deepEqual(
@@ -1350,14 +1698,14 @@ test('cost resolves an Agent launch from subagent metadata when its result has n
       opens.mockRestore();
       syncBuiltinESMExports();
     }
-    assert.throws(() => runCost([file, '--window-agent', 'missing']), /No Agent launch found/);
-    assert.throws(() => runCost([file, '--until-text', 'finding']), /requires --by-tool[.]/);
+    await assert.rejects(async () => await runCost([file, '--window-agent', 'missing']), /No Agent launch found/);
+    await assert.rejects(async () => await runCost([file, '--until-text', 'finding']), /requires --by-tool[.]/);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
 
-test('window-agent uses structured launch identity before metadata and quoted text', () => {
+test('window-agent uses structured launch identity before metadata and quoted text', async () => {
   const { root, file } = fixture();
   try {
     const usage = { input_tokens: 10, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 };
@@ -1396,22 +1744,22 @@ test('window-agent uses structured launch identity before metadata and quoted te
     const meta = path.join(path.dirname(file), 'session-1', 'subagents', 'agent-target.meta.json');
     fs.mkdirSync(path.dirname(meta), { recursive: true });
     fs.writeFileSync(meta, JSON.stringify({ toolUseId: 'quoted-call' }));
-    const report = JSON.parse(runCost([file, '--window-agent', 'target']));
+    const report = JSON.parse(await runCost([file, '--window-agent', 'target']));
     assert.equal(report.parentWindow.agentIdStartRequest, 'structured');
     fs.writeFileSync(
       path.join(path.dirname(meta), 'agent-fallback.meta.json'),
       JSON.stringify({ toolUseId: 'structured-call' }),
     );
-    const fallback = JSON.parse(runCost([file, '--window-agent', 'fallback']));
+    const fallback = JSON.parse(await runCost([file, '--window-agent', 'fallback']));
     assert.equal(fallback.parentWindow.agentIdStartRequest, 'structured');
-    sourceOnlyParity(file, ['--window-agent', 'target']);
-    sourceOnlyParity(file, ['--window-agent', 'fallback']);
+    await sourceOnlyParity(file, ['--window-agent', 'target']);
+    await sourceOnlyParity(file, ['--window-agent', 'fallback']);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
 
-test('tool report groups tools under their kind and the former flag name gives the same report', () => {
+test('tool report groups tools under their kind and the former flag name gives the same report', async () => {
   const { root, file } = fixture();
   try {
     const usage = (output: number) => ({
@@ -1455,7 +1803,7 @@ test('tool report groups tools under their kind and the former flag name gives t
         .map((record) => JSON.stringify(record))
         .join('\n') + '\n',
     );
-    const report = JSON.parse(runCost([file, '--by-tool']));
+    const report = JSON.parse(await runCost([file, '--by-tool']));
     const search = report.byTool.rows.find((row: { kind: string }) => row.kind === 'search');
     assert.deepEqual(
       search.tools.map((tool: { tool: string; requests: number }) => [tool.tool, tool.requests]),
@@ -1472,9 +1820,9 @@ test('tool report groups tools under their kind and the former flag name gives t
     assert.deepEqual(report.byTool.rows.find((row: { kind: string }) => row.kind === 'no tool result').tools, []);
     assert.equal(report.byTool.rows.find((row: { kind: string }) => row.kind === 'git').tools[0].tool, 'Bash git');
     const { buildCommit: _build, ...current } = report;
-    const { buildCommit: _formerBuild, ...former } = JSON.parse(runCost([file, '--by-tool-kind']));
+    const { buildCommit: _formerBuild, ...former } = JSON.parse(await runCost([file, '--by-tool-kind']));
     assert.deepEqual(former, current);
-    const table = costOutput([file, '--by-tool']).split('\n');
+    const table = (await costOutput([file, '--by-tool'])).split('\n');
     const start = table.indexOf('By tool') + 1;
     const rows = table.slice(
       start,
@@ -1495,7 +1843,7 @@ test('tool report groups tools under their kind and the former flag name gives t
   }
 });
 
-test('tool classification keeps redirected cat and its heredoc opening line', () => {
+test('tool classification keeps redirected cat and its heredoc opening line', async () => {
   const { root, file } = fixture();
   try {
     const usage = { input_tokens: 10, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 };
@@ -1529,7 +1877,7 @@ test('tool classification keeps redirected cat and its heredoc opening line', ()
         .map((record) => JSON.stringify(record))
         .join('\n') + '\n',
     );
-    const report = JSON.parse(runCost([file, '--by-tool']));
+    const report = JSON.parse(await runCost([file, '--by-tool']));
     assert.equal(report.byTool.rows.find((row: { kind: string }) => row.kind === 'other').requests, 1);
     assert.equal(
       report.byTool.rows.find((row: { kind: string }) => row.kind === 'file read'),
@@ -1540,7 +1888,7 @@ test('tool classification keeps redirected cat and its heredoc opening line', ()
   }
 });
 
-test('cost prices Bedrock Astra parent and native Plato without counting shared billing twice', () => {
+test('cost prices Bedrock Astra parent and native Plato without counting shared billing twice', async () => {
   const { root, projects, codex } = fixture();
   try {
     for (const [id, child] of [
@@ -1554,7 +1902,7 @@ test('cost prices Bedrock Astra parent and native Plato without counting shared 
           .join('\n') + '\n',
       );
     const report = JSON.parse(
-      runCost(['bedrock-astra-parent', '--projects', projects, '--codex-sessions', codex, '--by-model']),
+      await runCost(['bedrock-astra-parent', '--projects', projects, '--codex-sessions', codex, '--by-model']),
     );
     assert.equal(report.children.length, 1);
     for (const [row, count, cost] of [

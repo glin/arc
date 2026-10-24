@@ -1,11 +1,12 @@
 import fs from 'node:fs';
 import { combineCacheExpirySummaries, combineCacheExpiryAmounts } from './cacheexpirysummary';
 import path from 'node:path';
-import { scanLines } from './agentspend';
+import { scanLinesIncremental } from './agentspend';
 import { createClaudeRepeatedFilter } from './clauderepeated';
 import {
   codexRequestUsage,
   codexSessionsRoot,
+  enumerateRolloutFilesAsync,
   createCodexUsageLineReducer,
   nestedToolName,
   openingRecordOf,
@@ -14,6 +15,7 @@ import {
   rolloutFiles,
   scanCodexDispatchReferences,
   wrappedCommand,
+  scanCodexDispatchReferencesAsync,
 } from './codex';
 import {
   CACHE_LIFETIME_MS,
@@ -26,13 +28,65 @@ import {
 import { cacheExpiryRebuiltUsage, discoverClaudeSessionSpendSources, spendFileIsClaudeChild } from './projectspend';
 import {
   createClaudeUsageLineReducer,
-  listSessionFiles,
+  createClaudeRelationshipReducer,
   normalizeFsPath,
   projectsRoot,
-  readClaudeChildSessionReferences,
   resolveClaudeDispatchReferences,
+  revisionOf,
   type UsageEvent,
 } from './transcript';
+
+interface CostRead {
+  sync(): unknown;
+  async(): Promise<unknown>;
+}
+
+type CostSteps<T> = Generator<void | CostRead, T, unknown>;
+
+function* costRead<T>(sync: () => T, async: () => Promise<T>): CostSteps<T> {
+  return (yield { sync, async }) as T;
+}
+
+function drainCostSteps<T>(steps: CostSteps<T>): T {
+  try {
+    let next = steps.next();
+    while (!next.done) next = steps.next(next.value?.sync());
+    return next.value;
+  } finally {
+    steps.return(undefined as T);
+  }
+}
+
+async function drainCostStepsAsync<T>(steps: CostSteps<T>, signal?: AbortSignal): Promise<T> {
+  try {
+    signal?.throwIfAborted();
+    let next = steps.next();
+    while (!next.done) {
+      const value = await next.value?.async();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      signal?.throwIfAborted();
+      next = steps.next(value);
+    }
+    signal?.throwIfAborted();
+    return next.value;
+  } finally {
+    steps.return(undefined as T);
+  }
+}
+
+function* costScanLines(file: string, visit: (line: string) => unknown): CostSteps<boolean> {
+  const steps = scanLinesIncremental(file, visit);
+  try {
+    let next = steps.next();
+    while (!next.done) {
+      yield;
+      next = steps.next();
+    }
+    return next.value;
+  } finally {
+    steps.return(false);
+  }
+}
 
 export interface SessionRoots {
   projects?: string;
@@ -754,29 +808,51 @@ function windowTime(value: string | number | undefined, name: string): number | 
   return parsed;
 }
 
-export function sessionCostReport(
-  file: string,
-  options: {
-    since?: string | number;
-    until?: string | number;
-    roots?: SessionRoots;
-    byTool?: boolean;
-    untilText?: string;
-    windowAgent?: string;
-    byModel?: boolean;
-    sourceOnly?: boolean;
-  } = {},
-): SessionCostReport {
+interface SessionCostOptions {
+  since?: string | number;
+  until?: string | number;
+  roots?: SessionRoots;
+  byTool?: boolean;
+  untilText?: string;
+  windowAgent?: string;
+  byModel?: boolean;
+  sourceOnly?: boolean;
+}
+
+function costWindow(options: SessionCostOptions): { since: number | null; until: number | null } {
   const since = windowTime(options.since, 'since');
   const until = windowTime(options.until, 'until');
   if (since !== null && until !== null && until < since) throw new Error('Until must be at or after since');
-  const sources = sessionSources(file, options.roots, options.sourceOnly);
+  return { since, until };
+}
+
+export function sessionCostReport(file: string, options: SessionCostOptions = {}): SessionCostReport {
+  const window = costWindow(options);
+  return drainCostSteps(assembleCostReport(sessionSources(file, options.roots, options.sourceOnly), options, window));
+}
+
+export async function sessionCostReportAsync(
+  file: string,
+  options: SessionCostOptions = {},
+  signal?: AbortSignal,
+): Promise<SessionCostReport> {
+  const window = costWindow(options);
+  const sources = await sessionSourcesAsync(file, options.roots, options.sourceOnly, signal);
+  return drainCostStepsAsync(assembleCostReport(sources, options, window), signal);
+}
+
+function* assembleCostReport(
+  sources: SessionSource[],
+  options: SessionCostOptions,
+  { since, until }: { since: number | null; until: number | null },
+): CostSteps<SessionCostReport> {
   const inWindow = (request: SessionRequest) =>
     request.coverageDefect
       ? (since === null || request.coverageDefect.until > since) && (until === null || request.timestamp < until)
       : (since === null || request.timestamp >= since) && (until === null || request.timestamp < until);
-  const allRequestsFor = (source: SessionSource) =>
-    source.requests ?? readSessionRequests(source.file, source.kind, source.invocationId);
+  function* allRequestsFor(source: SessionSource): CostSteps<SessionRequest[]> {
+    return source.requests ?? (yield* sessionRequestSteps(source.file, source.kind, source.invocationId));
+  }
   const failureCount = (source: SessionSource) =>
     source.failedToolTimestamps?.filter((at) => (since === null || at >= since) && (until === null || at < until))
       .length;
@@ -798,20 +874,22 @@ export function sessionCostReport(
     return unknown ? 'unknown' : (previous ?? undefined);
   };
   const parent = sources[0];
-  const allParentRequests = allRequestsFor(parent);
+  const allParentRequests = yield* allRequestsFor(parent);
   const parentRequests = allParentRequests.filter(inWindow);
-  const children = sources.slice(1).map((source) => {
-    const all = allRequestsFor(source);
-    return { source, requests: all.filter(inWindow), predecessor: expiryPredecessor(all) };
-  });
+  const retained: { source: SessionSource; requests: SessionRequest[]; summary: SessionCostSummary }[] = [];
+  for (const source of sources.slice(1)) {
+    const all = yield* allRequestsFor(source);
+    const requests = all.filter(inWindow);
+    if ((since !== null || until !== null) && !requests.length && !(failureCount(source) ?? 0)) continue;
+    retained.push({
+      source,
+      requests,
+      summary: summarizeRequests(requests, failureCount(source), options.byModel, expiryPredecessor(all)),
+    });
+  }
   const firstRequestTime = (requests: readonly SessionRequest[]) =>
     requests.reduce((first, request) => Math.min(first, request.timestamp), Infinity);
-  const retained = children
-    .filter(
-      ({ source, requests }) =>
-        (since === null && until === null) || requests.length > 0 || (failureCount(source) ?? 0) > 0,
-    )
-    .sort((left, right) => firstRequestTime(left.requests) - firstRequestTime(right.requests));
+  retained.sort((left, right) => firstRequestTime(left.requests) - firstRequestTime(right.requests));
   const all = options.sourceOnly
     ? parentRequests
     : [...parentRequests, ...retained.flatMap(({ requests }) => requests)].sort(
@@ -824,13 +902,13 @@ export function sessionCostReport(
     options.byModel,
     expiryPredecessor(allParentRequests),
   );
-  const childReports = retained.map(({ source, requests, predecessor }) => ({
+  const childReports = retained.map(({ source, summary }) => ({
     kind: source.kind,
     file: source.file,
     sessionId: source.sessionId,
     ...(source.agent ? { agent: source.agent } : {}),
     ...(source.invocationId ? { invocationId: source.invocationId } : {}),
-    ...summarizeRequests(requests, failureCount(source), options.byModel, predecessor),
+    ...summary,
   }));
   const combinedFailureCount = [parent, ...retained.map(({ source }) => source)].map(failureCount);
   const combinedSummary = summarizeRequests(
@@ -959,6 +1037,35 @@ function codexStore(roots: SessionRoots): string {
 }
 
 export function findSessionTranscript(target: string, roots: SessionRoots = {}, sourceOnly = false): string {
+  return drainCostSteps(sessionTranscriptSteps(target, roots, sourceOnly));
+}
+
+export async function findSessionTranscriptAsync(
+  target: string,
+  roots: SessionRoots = {},
+  sourceOnly = false,
+  signal?: AbortSignal,
+): Promise<string> {
+  return drainCostStepsAsync(sessionTranscriptSteps(target, roots, sourceOnly, signal), signal);
+}
+
+function* rolloutPaths(root: string, signal?: AbortSignal): CostSteps<readonly string[]> {
+  return yield* costRead(
+    () => rolloutFiles(root),
+    async () => {
+      const listing = await enumerateRolloutFilesAsync(root, signal);
+      signal?.throwIfAborted();
+      return listing?.files ?? [];
+    },
+  );
+}
+
+function* sessionTranscriptSteps(
+  target: string,
+  roots: SessionRoots,
+  sourceOnly: boolean,
+  signal?: AbortSignal,
+): CostSteps<string> {
   const direct = path.resolve(target);
   if (fs.existsSync(direct)) {
     if (!fs.statSync(direct).isFile()) {
@@ -970,6 +1077,7 @@ export function findSessionTranscript(target: string, roots: SessionRoots = {}, 
   const matches: string[] = [];
   try {
     for (const project of fs.readdirSync(projectStore(roots), { withFileTypes: true })) {
+      yield;
       if (project.isDirectory()) {
         const candidate = path.join(projectStore(roots), project.name, `${target}.jsonl`);
         if (fs.existsSync(candidate)) matches.push(candidate);
@@ -978,7 +1086,8 @@ export function findSessionTranscript(target: string, roots: SessionRoots = {}, 
   } catch {
     // An absent store contributes no matches.
   }
-  for (const file of rolloutFiles(codexStore(roots))) {
+  for (const file of yield* rolloutPaths(codexStore(roots), signal)) {
+    yield;
     if (path.basename(file).endsWith(`-${target}.jsonl`)) matches.push(file);
   }
   if (matches.length === 0) throw new Error(`No transcript found for ${target}`);
@@ -1879,6 +1988,15 @@ export function readSessionRequests(
   invocationId?: string,
   failedToolTimestamps?: number[],
 ): SessionRequest[] {
+  return drainCostSteps(sessionRequestSteps(file, role, invocationId, failedToolTimestamps));
+}
+
+function* sessionRequestSteps(
+  file: string,
+  role: SessionSourceKind,
+  invocationId?: string,
+  failedToolTimestamps?: number[],
+): CostSteps<SessionRequest[]> {
   const codex =
     role === 'codex' || role === 'codex-thread' || role === 'claude-print' || (role === 'claude' && isCodex(file));
   const reducer = codex
@@ -1949,7 +2067,7 @@ export function readSessionRequests(
   };
   // A Claude repeated record adds no request, tool or turn.
   const repeated = codex ? null : createClaudeRepeatedFilter();
-  const complete = scanLines(file, (line) => {
+  const complete = yield* costScanLines(file, (line) => {
     if (!line.trim() || unsupported || repeated?.(line)) return;
     if (sourceOrder === 0 && line.trimStart().startsWith('[')) {
       unsupported = 'array';
@@ -2685,6 +2803,48 @@ export function readSessionRequests(
 }
 
 export function sessionSources(file: string, roots: SessionRoots = {}, sourceOnly = false): SessionSource[] {
+  return drainCostSteps(sessionSourceSteps(file, roots, sourceOnly));
+}
+
+export async function sessionSourcesAsync(
+  file: string,
+  roots: SessionRoots = {},
+  sourceOnly = false,
+  signal?: AbortSignal,
+): Promise<SessionSource[]> {
+  return drainCostStepsAsync(sessionSourceSteps(file, roots, sourceOnly, signal), signal);
+}
+
+// Match enumerateSessionFiles in transcript.ts for eligibility, revisions and newest-first ordering.
+function* costSessionFiles(directory: string): CostSteps<import('./transcript').SessionFile[]> {
+  let names: string[];
+  try {
+    names = fs.readdirSync(directory);
+  } catch {
+    return [];
+  }
+  const sessions: import('./transcript').SessionFile[] = [];
+  for (const name of names) {
+    yield;
+    if (!name.endsWith('.jsonl')) continue;
+    const file = path.join(directory, name);
+    try {
+      const stat = fs.statSync(file, { bigint: true });
+      if (!stat.isFile() || stat.size === 0n || stat.size > BigInt(Number.MAX_SAFE_INTEGER)) continue;
+      sessions.push({ agent: 'claude', file, sessionId: name.slice(0, -'.jsonl'.length), ...revisionOf(stat) });
+    } catch {
+      /* An unavailable transcript contributes no catalog entry. */
+    }
+  }
+  return sessions.sort((left, right) => right.mtimeMs - left.mtimeMs);
+}
+
+function* sessionSourceSteps(
+  file: string,
+  roots: SessionRoots,
+  sourceOnly: boolean,
+  signal?: AbortSignal,
+): CostSteps<SessionSource[]> {
   const absolute = path.resolve(file);
   let codexFiles: Array<
     import('./transcript').SessionFile & { meta: NonNullable<ReturnType<typeof readCodexSessionMeta>> }
@@ -2693,25 +2853,25 @@ export function sessionSources(file: string, roots: SessionRoots = {}, sourceOnl
     string,
     Array<import('./transcript').SessionFile & { meta: NonNullable<ReturnType<typeof readCodexSessionMeta>> }>
   >();
-  const codexCatalog = () => {
+  function* codexCatalog(): CostSteps<NonNullable<typeof codexFiles>> {
     if (codexFiles) return codexFiles;
-    codexFiles = rolloutFiles(codexStore(roots)).flatMap((file) => {
+    codexFiles = [];
+    for (const file of yield* rolloutPaths(codexStore(roots), signal)) {
+      yield;
       const meta = readCodexSessionMeta(file);
-      if (!meta?.sessionId) return [];
+      if (!meta?.sessionId) continue;
       const stat = fs.statSync(file);
-      return [
-        {
-          size: stat.size,
-          mtimeMs: stat.mtimeMs,
-          file,
-          sessionId: meta.sessionId,
-          agent: 'codex' as const,
-          activity: stat.mtimeMs,
-          meta,
-        },
-      ];
-    });
+      codexFiles.push({
+        size: stat.size,
+        mtimeMs: stat.mtimeMs,
+        file,
+        sessionId: meta.sessionId,
+        agent: 'codex',
+        meta,
+      });
+    }
     for (const entry of codexFiles) {
+      yield;
       const parent = entry.meta.parentThreadId;
       if (!parent) continue;
       const direct = nativeByParent.get(parent) ?? [];
@@ -2719,17 +2879,17 @@ export function sessionSources(file: string, roots: SessionRoots = {}, sourceOnl
       nativeByParent.set(parent, direct);
     }
     return codexFiles;
-  };
+  }
   let catalog: import('./transcript').SessionFile[] | null = null;
-  const dispatchCatalog = (agent: 'claude' | 'codex') => {
-    if (agent === 'codex') return codexCatalog();
+  function* dispatchCatalog(agent: 'claude' | 'codex'): CostSteps<import('./transcript').SessionFile[]> {
+    if (agent === 'codex') return yield* codexCatalog();
     if (catalog) return catalog;
-    let directories: string[] = [];
+    const directories: string[] = [];
     try {
-      directories = fs
-        .readdirSync(projectStore(roots), { withFileTypes: true })
-        .filter((entry) => entry.isDirectory())
-        .map((entry) => path.join(projectStore(roots), entry.name));
+      for (const entry of fs.readdirSync(projectStore(roots), { withFileTypes: true })) {
+        yield;
+        if (entry.isDirectory()) directories.push(path.join(projectStore(roots), entry.name));
+      }
     } catch {
       /* A supplied file can sit outside the configured stores. */
     }
@@ -2744,9 +2904,15 @@ export function sessionSources(file: string, roots: SessionRoots = {}, sourceOnl
       )
         directories.push(local);
     }
-    catalog = directories.flatMap(listSessionFiles);
+    catalog = [];
+    for (const directory of directories) {
+      for (const file of yield* costSessionFiles(directory)) {
+        yield;
+        catalog.push(file);
+      }
+    }
     return catalog;
-  };
+  }
   const sources: SessionSource[] = [];
   const seen = new Set<string>();
   const add = (source: SessionSource) => {
@@ -2769,15 +2935,15 @@ export function sessionSources(file: string, roots: SessionRoots = {}, sourceOnl
     file: absolute,
     sessionId: meta?.sessionId ?? claudeSourceId(absolute),
   });
-  const codexRequests = (source: SessionSource) => {
+  function* codexRequests(source: SessionSource): CostSteps<SessionRequest[]> {
     const failed: number[] = [];
-    const requests = readSessionRequests(source.file, source.kind, '*', failed);
+    const requests = yield* sessionRequestSteps(source.file, source.kind, '*', failed);
     source.failedToolTimestamps = failed;
     source.requests = requests.filter((request) => !request.linkedInvocationId);
     return requests;
-  };
+  }
   if (sourceOnly) {
-    if (codex) codexRequests(sources[0]);
+    if (codex) yield* codexRequests(sources[0]);
     return sources;
   }
   for (let index = 0; index < sources.length; index++) {
@@ -2785,8 +2951,9 @@ export function sessionSources(file: string, roots: SessionRoots = {}, sourceOnl
     if (source.kind === 'claude-print') continue;
     const isCodexSource = source.kind === 'codex' || source.kind === 'codex-thread';
     if (isCodexSource) {
-      codexCatalog();
+      yield* codexCatalog();
       for (const child of nativeByParent.get(source.sessionId) ?? []) {
+        yield;
         const childMeta = child.meta;
         add({
           kind: 'codex-thread',
@@ -2798,23 +2965,62 @@ export function sessionSources(file: string, roots: SessionRoots = {}, sourceOnl
         });
       }
     } else {
-      for (const child of discoverClaudeSessionSpendSources([{ file: source.file, sessionId: source.sessionId }])) {
-        if (!child.primary) add({ kind: 'claude-subagent', file: child.file, sessionId: claudeSourceId(child.file) });
+      // Match projectspend.ts subagentDirectoryOf and readSubagentFiles for the native child directory and file rules.
+      const directory = path.join(path.dirname(source.file), source.sessionId, 'subagents');
+      const files: string[] = [];
+      let entries: fs.Dirent[] = [];
+      try {
+        entries = fs.readdirSync(directory, { withFileTypes: true });
+      } catch {
+        /* A session without a subagent directory has no native children. */
+      }
+      for (const entry of entries) {
+        yield;
+        if (entry.isFile() && entry.name.endsWith('.jsonl')) files.push(path.join(directory, entry.name));
+      }
+      for (const file of files) {
+        yield;
+        for (const child of discoverClaudeSessionSpendSources([{ file: source.file, sessionId: source.sessionId }], {
+          files: (candidate) => (candidate === directory ? [file] : []),
+        })) {
+          if (!child.primary) add({ kind: 'claude-subagent', file: child.file, sessionId: claudeSourceId(child.file) });
+        }
       }
     }
-    const references = isCodexSource
-      ? scanCodexDispatchReferences(source.file, source.sessionId).references
-      : readClaudeChildSessionReferences({
-          file: source.file,
-          sessionId: source.sessionId,
-          childTranscript: source.kind === 'claude-subagent',
-        });
-    for (const reference of resolveClaudeDispatchReferences(
-      references,
-      [...new Set(references.flatMap((reference) => (reference.kind === 'dispatch' ? [reference.agent] : [])))].flatMap(
-        dispatchCatalog,
-      ),
+    let references: import('./transcript').ClaudeChildSessionReference[];
+    if (isCodexSource) {
+      const scan = yield* costRead(
+        () => scanCodexDispatchReferences(source.file, source.sessionId),
+        () =>
+          scanCodexDispatchReferencesAsync(
+            source.file,
+            source.sessionId,
+            null,
+            Number.POSITIVE_INFINITY,
+            () => signal?.aborted === true,
+          ),
+      );
+      references = scan.references;
+    } else {
+      const reducer = createClaudeRelationshipReducer({
+        file: source.file,
+        sessionId: source.sessionId,
+        childTranscript: source.kind === 'claude-subagent',
+      });
+      yield* costScanLines(source.file, reducer.apply);
+      references = reducer.references();
+    }
+    const dispatchFiles: import('./transcript').SessionFile[] = [];
+    for (const agent of new Set(
+      references.flatMap((reference) => (reference.kind === 'dispatch' ? [reference.agent] : [])),
     )) {
+      for (const file of yield* dispatchCatalog(agent)) {
+        yield;
+        dispatchFiles.push(file);
+      }
+    }
+    for (const reference of resolveClaudeDispatchReferences(references, dispatchFiles)) {
+      yield;
       if (!reference.file || !fs.existsSync(reference.file)) continue;
       add({
         kind:
@@ -2828,7 +3034,7 @@ export function sessionSources(file: string, roots: SessionRoots = {}, sourceOnl
       });
     }
     if (!isCodexSource) continue;
-    const requests = codexRequests(source);
+    const requests = yield* codexRequests(source);
     const prints = new Map<string, SessionRequest[]>();
     for (const request of requests) {
       if (!request.linkedInvocationId) continue;
