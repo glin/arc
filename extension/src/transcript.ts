@@ -221,7 +221,8 @@ export interface TurnCommit {
   source?: CommitSource;
   sha: string;
   printedSha?: string;
-  candidates?: { dirs: string[]; complete: boolean };
+  // Awaiting is set while the host waits for the evidence reply of a changed revision. The commit keeps its group until the reply arrives.
+  candidates?: { dirs: string[]; complete: boolean; awaiting?: boolean };
   repositoryEvidence?: { dirs: string[]; at: number; turnId: string; complete: boolean };
   subject: string;
   head?: CommitHead; // null or omitted when the source did not print a recognizable ref
@@ -232,10 +233,10 @@ export interface TurnCommit {
   // reported it. One read back from the repository carries git's own committer time.
   at: number;
   place: CommitPlace; // where it landed, carried only for a commit made outside the open folders
-  dir: string | null; // repository directory, for opening the commit in the editor
+  dir: string | null; // repository directory, for opening the commit in the editor. Null while a repository check is pending or has failed.
   // The repository the commit is in, once git has named it: its common git directory, which a
   // linked worktree shares with the tree it came from, and the top of the tree the commit was
-  // made in. Null or omitted until then.
+  // made in. Null or omitted until then. A commit with a repository proof, or with child evidence, keeps it while its repository is checked again and when a window read replaces the commit, so its group holds.
   repository?: CommitRepository | null;
 }
 

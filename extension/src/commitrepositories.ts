@@ -134,11 +134,18 @@ export function boundedCommitRepositories(rows: Iterable<VerifiedCommitRepositor
   return result;
 }
 
+// A source that only grew keeps its device and inode and gains bytes.
+function grewFrom(before: RelationshipStamp, now: RelationshipStamp): boolean {
+  return before.dev === now.dev && before.ino === now.ino && now.size > before.size;
+}
+
 // Retain direct observations only. A saved occurrence never rebinds to a replacement command directory or matching clone.
 export class CommitRepositories {
   private rows = new Map<string, VerifiedCommitRepository>();
   private readonly occurrences = new WeakMap<TurnCommit, string>();
   private readonly checked = new Map<string, { stamp: RelationshipStamp; valid: boolean; until: number }>();
+  // Occurrences whose latest check failed. A later passing check clears them, and a new source revision does not.
+  private readonly failed = new Set<string>();
   private readonly pending = new Set<string>();
   private readonly sourceRevisions = new Map<string, { stamp: RelationshipStamp }>();
   private work: Promise<void> = Promise.resolve();
@@ -168,8 +175,11 @@ export class CommitRepositories {
     for (const file of this.sourceRevisions.keys()) {
       if (absent(file)) this.sourceRevisions.delete(file);
     }
-    for (const key of this.checked.keys()) {
-      if (absent(key.slice(0, key.lastIndexOf('|')))) this.checked.delete(key);
+    for (const key of [...this.checked.keys(), ...this.failed]) {
+      if (absent(key.slice(0, key.lastIndexOf('|')))) {
+        this.checked.delete(key);
+        this.failed.delete(key);
+      }
     }
     return changed;
   }
@@ -194,7 +204,7 @@ export class CommitRepositories {
       };
       this.occurrences.set(commit, row.occurrence);
       this.apply(commit, file, identities);
-      if (commit.repository) commits.push(commit);
+      if (commit.dir) commits.push(commit);
     }
     return commits.length === intent.expected ? commits : [];
   }
@@ -242,32 +252,38 @@ export class CommitRepositories {
     const sameCheckRevision = checked && accepted && sameRelationshipStamp(checked.stamp, source.stamp);
     const currentCheck = sameCheckRevision && Date.now() < checked.until;
     if (row) {
-      const valid =
-        accepted && sameRelationshipStamp(row.stamp, now) && sameDirectory(row.root) && sameDirectory(row.common);
-      if (valid && currentCheck && checked.valid) {
-        commit.dir = row.root.path;
-        commit.repository = { key: row.common.path, root: row.root.path, own: identities.includes(row.common.path) };
-        commit.place = commit.repository.own ? null : { kind: 'named', dir: row.root.path };
-      } else {
-        commit.repository = null;
-        commit.place = null;
-        commit.dir = null;
-        if (valid && !currentCheck)
-          this.queue(key, file, source.stamp, async (current) => {
-            const valid = await this.validate(row);
-            if (current()) this.mark(key, source.stamp, valid);
-          });
-        else if (
-          accepted &&
-          !sameRelationshipStamp(row.stamp, now) &&
-          !sameCheckRevision &&
-          sameDirectory(row.command) &&
-          sameDirectory(row.root) &&
-          sameDirectory(row.common)
-        ) {
-          this.captureRow(key, file, source.stamp, occurrence, row.dir, row.sha, commit, row);
-        }
-      }
+      const sameDirs = sameDirectory(row.root) && sameDirectory(row.common);
+      const valid = accepted && sameRelationshipStamp(row.stamp, now) && sameDirs;
+      const rebind =
+        accepted &&
+        !sameRelationshipStamp(row.stamp, now) &&
+        !sameCheckRevision &&
+        sameDirectory(row.command) &&
+        sameDirs;
+      // A commit parsed from an earlier revision of a source that only grew still names its proof. The rebuilt commit follows.
+      const grew =
+        !accepted &&
+        !!source &&
+        !!now &&
+        normalizeFsPath(source.file) === normalizeFsPath(file) &&
+        grewFrom(source.stamp, now) &&
+        sameRelationshipStamp(row.stamp, source.stamp) &&
+        sameDirs;
+      // The row keeps its group while the repository is checked again. A failed check removes the group until a later check passes.
+      const proven = valid && currentCheck && checked.valid;
+      const held = ((valid && !currentCheck) || rebind || grew) && !this.failed.has(key);
+      commit.repository =
+        proven || held
+          ? { key: row.common.path, root: row.root.path, own: identities.includes(row.common.path) }
+          : null;
+      commit.place = commit.repository && !commit.repository.own ? { kind: 'named', dir: row.root.path } : null;
+      commit.dir = proven ? row.root.path : null;
+      if (valid && !currentCheck)
+        void this.queue(key, file, source.stamp, async (current) => {
+          const valid = await this.validate(row);
+          if (current()) this.mark(key, source.stamp, valid);
+        });
+      else if (rebind) this.captureRow(key, file, source.stamp, occurrence, row.dir, row.sha, commit, row);
       return true;
     }
     if (!accepted || !commit.dir || commit.candidates || sameCheckRevision || !this.canCapture(file)) return false;
@@ -275,6 +291,56 @@ export class CommitRepositories {
     const sha = commit.printedSha ?? commit.sha;
     this.captureRow(key, file, source.stamp, occurrence, dir, sha, commit);
     return false;
+  }
+
+  // The directory a proven commit opens in right now. Null when its proof is pending, failed, or no longer matches its source or directories.
+  // Undefined when the commit holds no proof, so the caller keeps the directory it resolved from Git.
+  openableDir(commit: TurnCommit): string | null | undefined {
+    const occurrence = this.occurrences.get(commit);
+    const file = commit.source?.file;
+    const row = occurrence && file ? this.rows.get(this.key(file, occurrence)) : undefined;
+    if (!row || !file || !commit.source) return undefined;
+    const now = commitSourceStamp(file);
+    const checked = this.checked.get(this.key(file, occurrence!));
+    return now &&
+      sameRelationshipStamp(commit.source.stamp, now) &&
+      sameRelationshipStamp(row.stamp, now) &&
+      checked?.valid &&
+      sameRelationshipStamp(checked.stamp, now) &&
+      Date.now() < checked.until &&
+      sameDirectory(row.root) &&
+      sameDirectory(row.common)
+      ? row.root.path
+      : null;
+  }
+
+  // The directory a proven commit opens in once its repository check has passed. An expired check, or a source that only grew, is checked first.
+  // Null when the check fails. Undefined when the commit holds no proof.
+  async openable(commit: TurnCommit): Promise<string | null | undefined> {
+    const current = this.openableDir(commit);
+    if (current !== null) return current;
+    const occurrence = this.occurrences.get(commit);
+    const source = commit.source;
+    const row = occurrence && source ? this.rows.get(this.key(source.file, occurrence)) : undefined;
+    const now = source && commitSourceStamp(source.file);
+    if (!occurrence || !source || !row || !now) return null;
+    const key = this.key(source.file, occurrence);
+    const grown = grewFrom(source.stamp, now);
+    const intact =
+      !this.failed.has(key) &&
+      sameRelationshipStamp(row.stamp, source.stamp) &&
+      (grown || sameRelationshipStamp(source.stamp, now)) &&
+      sameDirectory(row.root) &&
+      sameDirectory(row.common);
+    if (!intact) return null;
+    await this.queue(key, source.file, source.stamp, async (live) => {
+      const valid = await this.validate(row, grown);
+      if (live()) this.mark(key, source.stamp, valid);
+    });
+    const checked = this.checked.get(key);
+    return checked?.valid && sameRelationshipStamp(checked.stamp, source.stamp) && Date.now() < checked.until
+      ? row.root.path
+      : null;
   }
 
   private canCapture(file: string): boolean {
@@ -288,6 +354,10 @@ export class CommitRepositories {
 
   private mark(key: string, stamp: RelationshipStamp, valid: boolean): void {
     this.checked.set(key, { stamp, valid, until: Date.now() + COMMIT_REPOSITORY_CHECK_MS });
+    this.failed.delete(key);
+    if (valid) return;
+    this.failed.add(key);
+    if (this.failed.size > MAX_COMMIT_REPOSITORIES) this.failed.delete(this.failed.values().next().value!);
   }
 
   private captureRow(
@@ -302,7 +372,7 @@ export class CommitRepositories {
   ): void {
     if (this.pending.has(key)) return;
     // Saved occurrences refresh once per accepted revision, independently of admission for additional observations.
-    this.queue(key, file, stamp, async (current) => {
+    void this.queue(key, file, stamp, async (current) => {
       const found = await this.capture(file, stamp, occurrence, dir, sha);
       if (!current()) return;
       const valid =
@@ -335,8 +405,8 @@ export class CommitRepositories {
     file: string,
     stamp: RelationshipStamp,
     read: (current: () => boolean) => Promise<void>,
-  ): void {
-    if (this.pending.has(key)) return;
+  ): Promise<void> {
+    if (this.pending.has(key)) return this.work;
     const source = normalizeFsPath(file);
     let revision = this.sourceRevisions.get(source);
     if (!revision) {
@@ -357,6 +427,7 @@ export class CommitRepositories {
         if (!this.pending.size) this.reads.clear();
         this.changed();
       });
+    return this.work;
   }
 
   private read(dir: string, args: readonly string[]): Promise<string | null> {
@@ -376,7 +447,8 @@ export class CommitRepositories {
     return answer;
   }
 
-  private async validate(row: VerifiedCommitRepository): Promise<boolean> {
+  // A grown source keeps the commit it printed, so its saved stamp is compared with the stamp the commit was parsed from by the caller.
+  private async validate(row: VerifiedCommitRepository, grown = false): Promise<boolean> {
     if (!sameDirectory(row.root) || !sameDirectory(row.common)) return false;
     const place = parseIdentity(await this.read(row.root.path, IDENTITY_ARGS));
     const found = parseCommitLog((await this.read(row.root.path, exactCommitArgs(row.sha))) ?? '');
@@ -388,8 +460,7 @@ export class CommitRepositories {
       found[0].sha.toLowerCase() === row.sha &&
       sameDirectory(row.root) &&
       sameDirectory(row.common) &&
-      !!stamp &&
-      sameRelationshipStamp(row.stamp, stamp)
+      (grown || (!!stamp && sameRelationshipStamp(row.stamp, stamp)))
     );
   }
 

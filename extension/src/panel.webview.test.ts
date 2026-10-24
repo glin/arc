@@ -1,4 +1,8 @@
 import { commitSourceStamp } from './transcript';
+import { RepositoryCommits } from './gitcommits';
+import { commitCard, landingCard } from './turncard';
+import { groupCommitRows } from './view/card-presentation';
+import { candidateGitRunner } from './turnfixtures';
 import { CommitRepositories } from './commitrepositories';
 import { CLAUDE_CHILD_REFERENCE_PARSER_VERSION } from './derivedcache';
 import { discoveryCompatibility } from './progressiveworker';
@@ -6323,12 +6327,15 @@ test('commit repository replies expire on parent-only changes and reject stale o
     repositoryEvidence: { dirs: ['C:/first/worktree'], at: 6, turnId: 'turn', complete: true },
   };
   const turns = [turn({ commits: [commit] })];
+  // A window read returns commits as new objects that carry only the parsed fields.
+  const reread = () => [turn({ commits: [JSON.parse(JSON.stringify(commit))] })];
   const provider: any = Object.create(PanelProvider.prototype);
   provider.codexSubagents = [child];
   provider.allSessions = () => [parent];
   provider.commitRepositoryReplies = new Map();
   provider.commitRepositoryReservations = new CommitRepositoryReservations();
   let alter = () => {};
+  let replyStatus = 'complete';
   provider.progressiveWorker = {
     async run(request: any, generation: number) {
       alter();
@@ -6337,7 +6344,7 @@ test('commit repository replies expire on parent-only changes and reject stale o
         revision: request.parent.revision,
         value: {
           kind: 'commit-repositories',
-          status: 'complete',
+          status: replyStatus,
           token: 'complete',
           parent: request.parent,
           child: request.child,
@@ -6364,10 +6371,97 @@ test('commit repository replies expire on parent-only changes and reject stale o
   await provider.hydrateCommitRepositories(session, turns, 1, new AbortController().signal);
   provider.applyCommitRepositoryEvidence(session, turns);
   assert.deepEqual(turns[0].commits[0].candidates, { dirs: ['C:/first'], complete: true });
+  // The commit resolves through the repository reader. The pane keeps its headers and order while a reply is awaited and drops them once a reply fails.
+  const reader = new RepositoryCommits(
+    candidateGitRunner({ 'c:/work': null, 'c:/first': { sha: commit.printedSha } }),
+    () => {},
+  );
+  provider.repositoryCommits = reader;
+  const place = (list: any[] = turns) => {
+    provider.applyCommitRepositoryEvidence(session, list);
+    reader.apply(list, ['C:/work']);
+  };
+  const landing = {
+    id: 'owned',
+    sha: 'bbbbbbbb',
+    subject: 'Owned landing',
+    from: 'main',
+    head: { kind: 'branch', name: 'main' },
+    at: 1,
+    dir: 'C:/work',
+    place: null,
+    repository: { key: 'C:/work/.git', root: 'C:/work', own: true },
+  };
+  const pane = (list: any[] = turns) => {
+    const grouping = groupCommitRows([
+      landingCard(landing as any, [], 1),
+      ...list[0].commits.map((one: any) => commitCard(one, 1, null, null, [])),
+    ]);
+    return {
+      single: grouping.single,
+      groups: grouping.groups.map((group) => ({ own: group.repository.own, rows: group.rows.map((row) => row.at) })),
+    };
+  };
+  await vi.waitFor(() => {
+    place();
+    assert.equal(turns[0].commits[0].dir, 'c:/first');
+  });
+  const grouped = pane();
+  assert.equal(grouped.single, false);
+  assert.deepEqual(grouped.groups, [
+    { own: true, rows: [1] },
+    { own: false, rows: [5] },
+  ]);
+  // A parent append leaves the reply for the changed revision pending. The row keeps its group and loses navigation.
   fs.appendFileSync(parentFile, ' changed');
-  provider.applyCommitRepositoryEvidence(session, turns);
+  place();
   assert.equal(turns[0].commits[0].candidates?.complete, false);
   assert.equal(turns[0].commits[0].dir, null);
+  assert.deepEqual(pane(), grouped);
+  // The reply for the changed revision returns navigation with the same pane.
+  await provider.hydrateCommitRepositories(session, turns, 4, new AbortController().signal);
+  await vi.waitFor(() => {
+    place();
+    assert.equal(turns[0].commits[0].dir, 'c:/first');
+  });
+  assert.deepEqual(pane(), grouped);
+  // A parent append reads the window again into new commit objects. They keep the group while the reply is awaited and when it succeeds.
+  fs.appendFileSync(parentFile, ' reread');
+  const second = reread();
+  provider.carryCommitRepositories(session, turns, second);
+  place(second);
+  assert.equal(second[0].commits[0].candidates?.complete, false);
+  assert.equal(second[0].commits[0].dir, null);
+  assert.deepEqual(pane(second), grouped);
+  await provider.hydrateCommitRepositories(session, second, 6, new AbortController().signal);
+  await vi.waitFor(() => {
+    place(second);
+    assert.equal(second[0].commits[0].dir, 'c:/first');
+  });
+  assert.deepEqual(pane(second), grouped);
+  // A reply that fails for a later read removes the group from the new objects.
+  fs.appendFileSync(parentFile, ' rereadfailed');
+  const third = reread();
+  provider.carryCommitRepositories(session, second, third);
+  place(third);
+  assert.deepEqual(pane(third), grouped);
+  replyStatus = 'exhausted';
+  await provider.hydrateCommitRepositories(session, third, 7, new AbortController().signal);
+  place(third);
+  assert.equal(third[0].commits[0].repository, null);
+  assert.equal(third[0].commits[0].dir, null);
+  assert.ok(pane(third).groups.every((group) => group.own));
+  replyStatus = 'complete';
+  // A reply that fails removes the group, so the foreign header goes.
+  fs.appendFileSync(parentFile, ' failed');
+  replyStatus = 'exhausted';
+  await provider.hydrateCommitRepositories(session, turns, 5, new AbortController().signal);
+  place();
+  assert.equal(turns[0].commits[0].repository, null);
+  assert.equal(turns[0].commits[0].place, null);
+  assert.equal(turns[0].commits[0].dir, null);
+  assert.ok(pane().groups.every((group) => group.own));
+  replyStatus = 'complete';
   alter = () => fs.appendFileSync(parentFile, ' stale');
   await provider.hydrateCommitRepositories(session, turns, 2, new AbortController().signal);
   provider.applyCommitRepositoryEvidence(session, turns);
@@ -6381,6 +6475,93 @@ test('commit repository replies expire on parent-only changes and reject stale o
   provider.codexSubagents = [{ ...child, parentThreadId: 'other' }];
   provider.applyCommitRepositoryEvidence(session, turns);
   assert.equal(turns[0].commits[0].candidates?.complete, false);
+});
+
+test('an open-commit request opens the commit only in the directory the host holds, after its repository check', async () => {
+  const sha = 'a'.repeat(40);
+  const commit = (over: any) => ({ sha: sha.slice(0, 8), printedSha: sha, subject: 's', at: 1, place: null, ...over });
+  const provider: any = Object.create(PanelProvider.prototype);
+  let openable: Promise<string | null | undefined> | null = null;
+  provider.commitRepositories = { openable: () => openable };
+  const held = commit({ dir: 'C:/work/repo' });
+  const child = commit({ dir: 'C:/work/child', sha: 'b'.repeat(8), printedSha: undefined });
+  provider.turnsByKey = new Map([
+    [
+      'session:1',
+      turn({
+        commits: [held],
+        agents: [{ commits: [child] }] as any,
+        landings: [{ id: 'l', sha: 'c'.repeat(8), dir: 'C:/work/landed' }] as any,
+      }),
+    ],
+  ]);
+  provider.canOpenCommit = null;
+  const commands: unknown[][] = [];
+  const notices: string[] = [];
+  // The shared editor stub starts without these members, so each is restored or removed afterwards.
+  const stubbed: Array<[Record<string, any>, string]> = [
+    [vscode.commands, 'getCommands'],
+    [vscode.commands, 'executeCommand'],
+    [vscode.window, 'showInformationMessage'],
+    [vscode.Uri, 'file'],
+  ];
+  const originals = stubbed.map(([target, key]) => [key in target, target[key]] as const);
+  try {
+    Object.assign(vscode.commands, {
+      getCommands: async () => ['git.viewCommit'],
+      executeCommand: async (...args: unknown[]) => {
+        commands.push(args);
+      },
+    });
+    Object.assign(vscode.window, { showInformationMessage: (message: string) => notices.push(message) });
+    Object.assign(vscode.Uri, { file: (dir: string) => ({ fsPath: dir }) });
+    const open = async (key: string | null, hash: string, dir: string | null) => {
+      commands.length = 0;
+      notices.length = 0;
+      await provider.openCommit(key, hash, dir);
+      return commands.map((command) => command[0]);
+    };
+    // A commit without a proof opens in the directory Git resolved, and a landing or child commit opens too.
+    openable = Promise.resolve(undefined);
+    assert.deepEqual(await open('session:1', sha, 'C:/work/repo'), ['git.openRepository', 'git.viewCommit']);
+    assert.deepEqual(await open('session:1', 'b'.repeat(8), 'C:/work/child'), ['git.openRepository', 'git.viewCommit']);
+    assert.deepEqual(await open('session:1', 'c'.repeat(8), 'C:/work/landed'), [
+      'git.openRepository',
+      'git.viewCommit',
+    ]);
+    // A message sent before the host replaced the directory, or before it resolved one, opens nothing.
+    for (const [key, dir] of [
+      ['session:1', 'C:/work/old'],
+      ['session:1', null],
+      ['session:missing', 'C:/work/repo'],
+      [null, 'C:/work/repo'],
+    ] as const) {
+      assert.deepEqual(await open(key, sha, dir), []);
+      if (key) assert.equal(notices.at(-1), 'Arc: The repository for this commit could not be identified.');
+    }
+    // A proven commit opens after its check passes, and not before.
+    let pass!: (dir: string | null) => void;
+    openable = new Promise((resolve) => {
+      pass = resolve;
+    });
+    const waiting = open('session:1', sha, 'C:/work/repo');
+    await Promise.resolve();
+    assert.deepEqual(commands, []);
+    pass('C:/work/repo');
+    assert.deepEqual(await waiting, ['git.openRepository', 'git.viewCommit']);
+    // A check that fails, or that names another directory, opens nothing.
+    openable = Promise.resolve(null);
+    assert.deepEqual(await open('session:1', sha, 'C:/work/repo'), []);
+    assert.equal(notices.at(-1), 'Arc: The repository for this commit could not be identified.');
+    openable = Promise.resolve('C:/work/elsewhere');
+    assert.deepEqual(await open('session:1', sha, 'C:/work/repo'), []);
+  } finally {
+    stubbed.forEach(([target, key], index) => {
+      const [had, value] = originals[index];
+      if (had) target[key] = value;
+      else delete target[key];
+    });
+  }
 });
 
 // Gives a commit allowance host the selection state that completeSelectedWindow reads, and counts its redraws.

@@ -42,7 +42,8 @@ import {
   pointsAtArgs,
 } from './gitcommits.ts';
 import { candidateGitRunner as candidateRunner, turn } from './turnfixtures.ts';
-import { commitCard, commitRowsOf } from './turncard.ts';
+import { commitCard, commitRowsOf, landingCard } from './turncard.ts';
+import { groupCommitRows } from './view/card-presentation.ts';
 import {
   COMMIT_REPOSITORY_CHECK_MS,
   MAX_COMMIT_REPOSITORIES,
@@ -1527,8 +1528,9 @@ test('an accepted source append refreshes proof and preserves a live foreign com
   const fresh = f.fresh();
   await vi.waitFor(() => {
     apply(fresh);
-    assert.equal(fresh.repository?.root, normalizeFsPath(f.root));
+    assert.equal(fresh.dir, normalizeFsPath(f.root));
   });
+  assert.equal(fresh.repository?.root, normalizeFsPath(f.root));
   assert.deepEqual(proofs.snapshot()[0].stamp, fresh.source!.stamp);
   // A recreated command path cannot supply fresh evidence for the saved occurrence.
   renameSync(f.command, f.command + '-old');
@@ -1596,8 +1598,9 @@ test.each(['source', 'global'] as const)('a full %s collection refreshes a live 
   const reader = new RepositoryCommits(f.runner, () => {});
   await vi.waitFor(() => {
     reader.apply([one], [], (commit, ids) => proofs.apply(commit, f.file, ids));
-    assert.equal(commitRowsOf(one, 1, []).commits[0].repository?.name, 'skills');
+    assert.equal(commitRowsOf(one, 1, []).commits[0].dir, normalizeFsPath(f.root));
   });
+  assert.equal(commitRowsOf(one, 1, []).commits[0].repository?.name, 'skills');
   assert.equal(fresh.repository?.root, normalizeFsPath(f.root));
   assert.deepEqual(proofs.snapshot()[0].stamp, fresh.source!.stamp);
   assert.equal(proofs.snapshot().length, count);
@@ -1868,11 +1871,292 @@ test.each(['object', 'association'] as const)(
     now += COMMIT_REPOSITORY_CHECK_MS;
     proofs.apply(first, f.file, []);
     proofs.apply(first, f.file, []);
-    assert.equal(first.repository, null);
+    // The row keeps its group while the check runs, and navigation waits for it.
+    assert.ok(first.repository);
+    assert.equal(first.dir, null);
     await vi.waitFor(() => assert.equal(completed, 2));
     proofs.apply(first, f.file, []);
     assert.equal(first.repository, null);
+    assert.equal(first.dir, null);
     assert.equal(f.calls() - before, 2);
+  },
+);
+
+// The pane shape a reader sees: each group's repository name, branch and row order, or one headerless list.
+function paneShape(commits: TurnCommit[], owned: TurnLanding) {
+  const cards = [landingCard(owned, [], 1), ...commits.map((commit) => commitCard(commit, 1, null, null, []))];
+  const grouping = groupCommitRows(cards);
+  return {
+    cards: cards.slice(1),
+    shape: {
+      single: grouping.single,
+      groups: grouping.groups.map((group) => ({
+        repository: group.repository.name,
+        own: group.repository.own,
+        rows: group.rows.map((row) => row.at),
+      })),
+    },
+  };
+}
+
+const foreignGroup = (commits: TurnCommit[], owned: TurnLanding) =>
+  paneShape(commits, owned).shape.groups.some((group) => !group.own);
+
+// A held Git check keeps the pending state open. The injected clock and the real source stamp decide when a check is due.
+function heldRepository() {
+  const f = observedRepository();
+  let gate: Promise<void> | null = null;
+  let release = () => {};
+  let completed = 0;
+  const proofs = new CommitRepositories(
+    {
+      run: async (dir, args) => {
+        if (gate) await gate;
+        return f.runner.run(dir, args);
+      },
+    },
+    () => {
+      completed++;
+    },
+  );
+  const reader = new RepositoryCommits(f.runner, () => {});
+  const owned: TurnLanding = {
+    id: 'owned',
+    sha: 'bbbbbbbb',
+    subject: 'Owned landing',
+    from: 'topic',
+    head: { kind: 'branch', name: 'main' },
+    at: AT('2026-09-02T04:08:10Z'),
+    dir: '/owned',
+    place: null,
+    repository: { key: '/owned/.git', root: '/owned', own: true },
+  };
+  const make = () => [f.fresh(), { ...f.fresh(), at: AT('2026-09-02T04:08:30Z') }];
+  const apply = (commits: TurnCommit[]) =>
+    reader.apply([turn({ commits })], [], (one, ids) => proofs.apply(one, f.file, ids));
+  return {
+    f,
+    owned,
+    make,
+    apply,
+    proofs,
+    completed: () => completed,
+    hold: () => {
+      gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+    },
+    release: () => {
+      release();
+      gate = null;
+    },
+  };
+}
+
+test.each(['expiry', 'append'] as const)('a commit group survives a repository check after %s', async (change) => {
+  const h = heldRepository();
+  let now = 1_000_000;
+  vi.spyOn(Date, 'now').mockImplementation(() => now);
+  try {
+    let commits = h.make();
+    h.apply(commits);
+    await vi.waitFor(() => assert.equal(h.completed(), 2));
+    h.apply(commits);
+    const before = paneShape(commits, h.owned);
+    assert.equal(before.shape.single, false);
+    assert.deepEqual(
+      before.shape.groups.map((group) => group.rows.length),
+      [1, 2],
+    );
+    assert.ok(before.cards.every((card) => card.dir !== null));
+    h.hold();
+    if (change === 'expiry') now += COMMIT_REPOSITORY_CHECK_MS;
+    else {
+      appendFileSync(h.f.file, '{}\n');
+      // The commits parsed before the append still render while the grown source is read again.
+      h.apply(commits);
+      const grown = paneShape(commits, h.owned);
+      assert.deepEqual(grown.shape, before.shape);
+      assert.ok(grown.cards.every((card) => card.dir === null));
+      commits = h.make();
+    }
+    h.apply(commits);
+    h.apply(commits);
+    const pending = paneShape(commits, h.owned);
+    assert.deepEqual(pending.shape, before.shape);
+    // Navigation waits for the check.
+    assert.ok(pending.cards.every((card) => card.dir === null));
+    h.release();
+    await vi.waitFor(() => assert.equal(h.completed(), 4));
+    h.apply(commits);
+    const after = paneShape(commits, h.owned);
+    assert.deepEqual(after.shape, before.shape);
+    assert.ok(after.cards.every((card) => card.dir !== null));
+  } finally {
+    vi.restoreAllMocks();
+  }
+});
+
+test('a commit group is lost once its repository check fails and stays lost while the next check runs', async () => {
+  const h = heldRepository();
+  let now = 1_000_000;
+  vi.spyOn(Date, 'now').mockImplementation(() => now);
+  try {
+    const commits = h.make();
+    h.apply(commits);
+    await vi.waitFor(() => assert.equal(h.completed(), 2));
+    h.apply(commits);
+    assert.equal(foreignGroup(commits, h.owned), true);
+    h.f.remove();
+    now += COMMIT_REPOSITORY_CHECK_MS;
+    h.hold();
+    h.apply(commits);
+    assert.equal(foreignGroup(commits, h.owned), true);
+    h.release();
+    await vi.waitFor(() => assert.equal(h.completed(), 4));
+    h.apply(commits);
+    const failed = paneShape(commits, h.owned);
+    assert.equal(
+      failed.shape.groups.some((group) => !group.own),
+      false,
+    );
+    assert.ok(failed.cards.every((card) => card.dir === null || card.repository?.own));
+    // The next check also runs without the group, so a failing row never regroups for it.
+    now += COMMIT_REPOSITORY_CHECK_MS;
+    h.hold();
+    h.apply(commits);
+    h.apply(commits);
+    assert.equal(foreignGroup(commits, h.owned), false);
+    h.release();
+    await vi.waitFor(() => assert.equal(h.completed(), 6));
+    // A source append rebinds the row, and the earlier failure keeps its group away until a check passes.
+    appendFileSync(h.f.file, '{}\n');
+    const rebuilt = h.make();
+    h.hold();
+    h.apply(rebuilt);
+    h.apply(rebuilt);
+    assert.equal(foreignGroup(rebuilt, h.owned), false);
+    h.release();
+    await vi.waitFor(() => assert.equal(h.completed(), 8));
+    h.apply(rebuilt);
+    assert.equal(foreignGroup(rebuilt, h.owned), false);
+  } finally {
+    vi.restoreAllMocks();
+  }
+});
+
+test.each(['pending', 'expired', 'pruned', 'retargeted', 'replaced'] as const)(
+  'a delayed open of a proven commit is refused while its proof is %s',
+  async (state) => {
+    const f = observedRepository();
+    let now = 1_000_000;
+    vi.spyOn(Date, 'now').mockImplementation(() => now);
+    let completed = 0;
+    const proofs = new CommitRepositories(f.runner, () => {
+      completed++;
+    });
+    const commit = f.fresh();
+    proofs.apply(commit, f.file, []);
+    assert.equal(proofs.openableDir(commit), undefined);
+    await vi.waitFor(() => assert.equal(completed, 1));
+    if (state === 'pending') {
+      // A saved proof holds no passing check until the host checks it again.
+      const loaded = new CommitRepositories(f.runner, () => {});
+      loaded.load(proofs.snapshot());
+      const again = f.fresh();
+      loaded.apply(again, f.file, []);
+      assert.equal(loaded.openableDir(again), null);
+      // A commit without a recorded proof keeps the directory Git resolved.
+      assert.equal(proofs.openableDir(f.fresh()), undefined);
+      return;
+    }
+    proofs.apply(commit, f.file, []);
+    assert.equal(proofs.openableDir(commit), normalizeFsPath(f.root));
+    if (state === 'pruned') f.remove();
+    else if (state === 'retargeted') f.retarget();
+    else if (state === 'replaced') {
+      renameSync(f.root, f.root + '-old');
+      mkdirSync(f.root);
+    }
+    if (state === 'expired' || state === 'pruned' || state === 'retargeted') now += COMMIT_REPOSITORY_CHECK_MS;
+    // The proof gives no directory until a check passes.
+    assert.equal(proofs.openableDir(commit), null);
+    if (state === 'pruned' || state === 'retargeted') {
+      proofs.apply(commit, f.file, []);
+      await vi.waitFor(() => assert.equal(completed, 2));
+      assert.equal(proofs.openableDir(commit), null);
+    }
+  },
+);
+
+test.each(['pending', 'failed'] as const)(
+  'a recovered commit waits for its repository check after a restart and never appears when the check is %s',
+  async (state) => {
+    const f = observedRepository();
+    const recovering: CommitIntent = {
+      dir: f.command,
+      from: 1,
+      to: 2,
+      expected: 1,
+      source: { file: f.file, stamp: commitSourceStamp(f.file)! },
+    };
+    let completed = 0;
+    const proofs = new CommitRepositories(f.runner, () => {
+      completed++;
+    });
+    proofs.apply({ ...f.fresh(), intent: intentKey(recovering) }, f.file, []);
+    await vi.waitFor(() => assert.equal(completed, 1));
+    const restarted = new CommitRepositories(f.runner, () => {
+      completed++;
+    });
+    restarted.load(proofs.snapshot());
+    if (state === 'failed') f.remove();
+    const ask = () => restarted.restore(recovering, f.file, []);
+    // Nothing is returned before the check, and a repeated read starts no second check.
+    assert.deepEqual(ask(), []);
+    assert.deepEqual(ask(), []);
+    await vi.waitFor(() => assert.equal(completed, 2));
+    if (state === 'failed') assert.deepEqual(ask(), []);
+    else assert.equal(ask()?.[0].dir, normalizeFsPath(f.root));
+  },
+);
+
+test.each(['expired', 'grown'] as const)(
+  'opening a proven commit waits for the repository check after its proof is %s',
+  async (state) => {
+    const f = observedRepository();
+    let now = 1_000_000;
+    vi.spyOn(Date, 'now').mockImplementation(() => now);
+    try {
+      let completed = 0;
+      const proofs = new CommitRepositories(f.runner, () => {
+        completed++;
+      });
+      const commit = f.fresh();
+      proofs.apply(commit, f.file, []);
+      await vi.waitFor(() => assert.equal(completed, 1));
+      proofs.apply(commit, f.file, []);
+      assert.equal(await proofs.openable(commit), normalizeFsPath(f.root));
+      const lapse = () => {
+        if (state === 'expired') now += COMMIT_REPOSITORY_CHECK_MS;
+        else appendFileSync(f.file, '{}\n');
+      };
+      lapse();
+      assert.equal(proofs.openableDir(commit), null);
+      const before = f.calls();
+      // The click starts the check and opens once it passes.
+      assert.equal(await proofs.openable(commit), normalizeFsPath(f.root));
+      assert.ok(f.calls() > before);
+      // A check that fails refuses the open, and the failure keeps later opens refused.
+      f.remove();
+      if (state === 'expired') now += COMMIT_REPOSITORY_CHECK_MS;
+      assert.equal(await proofs.openable(commit), null);
+      f.recover();
+      now += COMMIT_REPOSITORY_CHECK_MS;
+      assert.equal(await proofs.openable(commit), null);
+    } finally {
+      vi.restoreAllMocks();
+    }
   },
 );
 
@@ -2518,6 +2802,35 @@ test('incomplete nested evidence refuses hidden competing matches and unrelated 
     assert.equal(one.commits[0].dir, null);
     assert.equal(reads.filter((s) => s.includes('--disambiguate')).length, 0);
   }
+});
+
+test('a resolved candidate row keeps its group while its answer is asked again, and loses it once the answer fails', async () => {
+  const one = candidateTurn();
+  const matches: Record<string, { sha: string } | null | undefined> = {
+    'c:/repo': null,
+    'c:/notes': { sha: candidateSha },
+    'c:/plans': null,
+  };
+  const commits = reader(candidateRunner(matches), () => {});
+  commits.apply([one], ['C:/repo']);
+  await settle();
+  commits.apply([one], ['C:/repo']);
+  const grouped = one.commits[0].repository;
+  assert.equal(one.commits[0].dir, 'c:/notes');
+  assert.ok(grouped);
+  // The held answer goes away and the repository no longer names the commit.
+  commits['exactAnswers'].clear();
+  matches['c:/notes'] = null;
+  commits.apply([one], ['C:/repo']);
+  assert.equal(one.commits[0].dir, null);
+  assert.deepEqual(one.commits[0].repository, grouped);
+  for (let i = 0; i < 8 && one.commits[0].repository; i++) {
+    await settle();
+    commits.apply([one], ['C:/repo']);
+    assert.equal(one.commits[0].dir, null);
+  }
+  assert.equal(one.commits[0].repository, null);
+  assert.equal(one.commits[0].place, null);
 });
 
 test('retained candidate rows clear navigation when current evidence has no exact answer', async () => {

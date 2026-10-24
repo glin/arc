@@ -4990,6 +4990,7 @@ export class PanelProvider implements vscode.Disposable {
         }
         const value = result.value;
         this.updateHistoryAfterAcceptedWindow(sessionId, held, result, sessionId === this.showing);
+        this.carryCommitRepositories(session, held?.read.turns, value.read.turns);
         this.cache.set(session.file, {
           key: transcriptReadCacheKey(session, TRANSCRIPT_TURN_LIMIT, TRANSCRIPT_TAIL_BYTES, this.folders()),
           agentKey: value.agentKey,
@@ -12965,11 +12966,79 @@ export class PanelProvider implements vscode.Disposable {
     });
   }
 
+  // The directory a card's commit or landing opens in right now, or null. A commit with a repository proof waits for a passing check.
+  private async openableCommitDir(cardKey: string, sha: string, requested: string | null): Promise<string | null> {
+    const turn = this.turnsByKey.get(cardKey);
+    if (!turn || !requested) return null;
+    const commits = [...(turn.commits ?? []), ...(turn.agents ?? []).flatMap((agent) => agent.commits ?? [])];
+    for (const commit of commits) {
+      if (!sameCommitSha(commit.printedSha ?? commit.sha, sha) && !sameCommitSha(commit.sha, sha)) continue;
+      const proven = await this.commitRepositories.openable(commit);
+      const dir = proven === undefined ? commit.dir : proven;
+      if (dir && normalizeFsPath(dir) === normalizeFsPath(requested)) return requested;
+    }
+    for (const landing of turn.landings ?? []) {
+      if (sameCommitSha(landing.sha, sha) && landing.dir && normalizeFsPath(landing.dir) === normalizeFsPath(requested))
+        return requested;
+    }
+    return null;
+  }
+
+  // Opens a commit in the repository the host holds for it now. The message can predate a repository check, so the host waits for the check.
+  private async openCommit(cardKey: string | null, sha: string, requested: string | null): Promise<void> {
+    if (!cardKey || !sha) return;
+    if (this.canOpenCommit === null) {
+      try {
+        this.canOpenCommit = (await vscode.commands.getCommands(true)).includes('git.viewCommit');
+      } catch {
+        this.canOpenCommit = false;
+      }
+    }
+    if (!this.canOpenCommit) {
+      void vscode.window.showInformationMessage('Arc: This version of VS Code cannot open commits.');
+      return;
+    }
+    const folder = await this.openableCommitDir(cardKey, sha, requested);
+    if (!folder) {
+      void vscode.window.showInformationMessage('Arc: The repository for this commit could not be identified.');
+      return;
+    }
+    try {
+      // Register the resolved repository before `git.viewCommit`, which uses repositories known to the built-in Git extension.
+      await vscode.commands.executeCommand('git.openRepository', folder);
+      await vscode.commands.executeCommand('git.viewCommit', vscode.Uri.file(folder), sha);
+    } catch {
+      void vscode.window.showInformationMessage('Arc: This commit is no longer in the repository.');
+    }
+  }
+
+  // A window read returns new commit objects. A child evidence commit takes the group of the commit it replaces, matched by its occurrence in the child's history, so the group holds until its reply returns.
+  private carryCommitRepositories(session: SessionFile, from: Turn[] | undefined, to: Turn[]): void {
+    if (!from || !this.repositoryCommits) return;
+    const earlier = new Map<string, import('./transcript').TurnCommit>();
+    for (const context of this.commitRepositoryContexts(session, from))
+      for (const [index, commit] of context.commits.entries())
+        earlier.set(context.child.file + commitRepositoryOccurrence(context.wanted[index]), commit);
+    for (const context of this.commitRepositoryContexts(session, to))
+      for (const [index, commit] of context.commits.entries()) {
+        const before = earlier.get(context.child.file + commitRepositoryOccurrence(context.wanted[index]));
+        if (!before || before === commit || !this.repositoryCommits.inherit(before, commit)) continue;
+        commit.place = before.place;
+        commit.repository = before.repository;
+      }
+  }
+
   private applyCommitRepositoryEvidence(session: SessionFile, turns: Turn[]): void {
     turns = this.commitRepositoryTurns(session, turns);
+    // A commit keeps its group while its evidence reply is awaited or complete. A failed or changed reply drops it.
+    const grouped = new Map<
+      import('./transcript').TurnCommit,
+      Pick<import('./transcript').TurnCommit, 'place' | 'repository'>
+    >();
     for (const turn of turns)
       for (const commit of [...(turn.commits ?? []), ...(turn.agents ?? []).flatMap((agent) => agent.commits ?? [])]) {
         if (!commit.repositoryEvidence) continue;
+        grouped.set(commit, { place: commit.place, repository: commit.repository });
         commit.candidates = { dirs: commit.repositoryEvidence.dirs, complete: false };
         commit.dir = null;
         commit.place = null;
@@ -12977,13 +13046,25 @@ export class PanelProvider implements vscode.Disposable {
       }
     for (const context of this.commitRepositoryContexts(session, turns)) {
       const held = this.commitRepositoryReplies.get(context.child.file);
-      if (held?.key !== context.key || held.reply.status !== 'complete') continue;
+      if (held?.key !== context.key || held.reply.status === 'pending') {
+        // The reply for the current revision is still to come. Navigation waits for it.
+        for (const commit of context.commits) {
+          if (!this.repositoryCommits?.resolved(commit)) continue;
+          commit.candidates = { dirs: commit.repositoryEvidence!.dirs, complete: false, awaiting: true };
+          Object.assign(commit, grouped.get(commit));
+        }
+        continue;
+      }
+      if (held.reply.status !== 'complete') continue;
       for (const [index, commit] of context.commits.entries()) {
         const target = held.reply.targets.find(
           (target) =>
             target.sha === commit.printedSha && target.occurrence === commitRepositoryOccurrence(context.wanted[index]),
         );
-        if (target) commit.candidates = { dirs: target.dirs, complete: true };
+        if (target) {
+          commit.candidates = { dirs: target.dirs, complete: true };
+          Object.assign(commit, grouped.get(commit));
+        }
       }
     }
   }
@@ -13356,6 +13437,7 @@ export class PanelProvider implements vscode.Disposable {
       }
       this.updateHistoryAfterAcceptedWindow(sessionId, previous, result, true);
       this.acceptSelectedMetadataRead(current, generation);
+      this.carryCommitRepositories(current, previous?.read.turns, result.value.read.turns);
       this.cache.set(current.file, {
         key: transcriptReadCacheKey(current, TRANSCRIPT_TURN_LIMIT, TRANSCRIPT_TAIL_BYTES, this.folders()),
         agentKey: result.value.agentKey,
@@ -13527,6 +13609,7 @@ export class PanelProvider implements vscode.Disposable {
         return false;
       }
       this.updateHistoryAfterAcceptedWindow(session.sessionId, previous, result, false);
+      this.carryCommitRepositories(session, previous?.read.turns, result.value.read.turns);
       this.cache.set(session.file, {
         key: transcriptReadCacheKey(session, TRANSCRIPT_TURN_LIMIT, TRANSCRIPT_TAIL_BYTES, this.folders()),
         agentKey: result.value.agentKey,
@@ -15105,32 +15188,8 @@ export class PanelProvider implements vscode.Disposable {
           }
         },
         openCommit: async (msg) => {
-          if (!cardFor(msg.key) || !msg.sha) {
-            return;
-          }
-          if (this.canOpenCommit === null) {
-            try {
-              this.canOpenCommit = (await vscode.commands.getCommands(true)).includes('git.viewCommit');
-            } catch {
-              this.canOpenCommit = false;
-            }
-          }
-          if (!this.canOpenCommit) {
-            void vscode.window.showInformationMessage('Arc: This version of VS Code cannot open commits.');
-            return;
-          }
-          const folder = msg.dir;
-          if (!folder) {
-            void vscode.window.showInformationMessage('Arc: The repository for this commit could not be identified.');
-            return;
-          }
-          try {
-            // Register the resolved repository before `git.viewCommit`, which uses repositories known to the built-in Git extension.
-            await vscode.commands.executeCommand('git.openRepository', folder);
-            await vscode.commands.executeCommand('git.viewCommit', vscode.Uri.file(folder), msg.sha);
-          } catch {
-            void vscode.window.showInformationMessage('Arc: This commit is no longer in the repository.');
-          }
+          const found = cardFor(msg.key);
+          if (found) await this.openCommit(found.card.key, msg.sha, msg.dir);
         },
         openFile: async (msg) => {
           const found = cardFor(msg.key);

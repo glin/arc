@@ -385,6 +385,7 @@ export class RepositoryCommits {
   private readonly identities = new Map<string, RepositoryPlace>();
   private readonly attempts = new Map<string, number>();
   private readonly asking = new Set<string>();
+  private readonly resolvedBy = new WeakMap<TurnCommit, string>();
   private work: Promise<void> = Promise.resolve();
   private openFolders: string[] = [];
 
@@ -392,6 +393,19 @@ export class RepositoryCommits {
     private readonly runner: GitRunner,
     private readonly onFilled: () => void,
   ) {}
+
+  // True once candidate resolution has placed the commit, so a group it holds came from a repository answer.
+  resolved(commit: TurnCommit): boolean {
+    return this.resolvedBy.has(commit);
+  }
+
+  // Gives a commit read again the placement of the commit it replaces, so its group holds until the answer returns. False when the earlier commit was never placed.
+  inherit(from: TurnCommit, to: TurnCommit): boolean {
+    const key = this.resolvedBy.get(from);
+    if (key === undefined) return false;
+    this.resolvedBy.set(to, key);
+    return true;
+  }
 
   apply(
     turns: Turn[],
@@ -485,25 +499,34 @@ export class RepositoryCommits {
           if (commit.candidates) {
             const evidence = commit.candidates;
             if (!evidence.complete) {
-              cleared ||= commit.dir !== null || commit.place != null || commit.repository != null;
+              // A commit whose reply is still awaited keeps its group. Navigation waits for the reply.
+              const awaiting = evidence.awaiting === true;
+              cleared ||= commit.dir !== null || (!awaiting && (commit.place != null || commit.repository != null));
               commit.dir = null;
-              commit.place = null;
-              commit.repository = null;
+              if (!awaiting) {
+                commit.place = null;
+                commit.repository = null;
+              }
               continue;
             }
             const query = { sha: commit.printedSha ?? commit.sha, folders: [...evidence.dirs, ...folders] };
             const key = candidateKey(query);
             const exact = this.exactAnswers.get(key);
             if (exact) {
+              this.resolvedBy.set(commit, key);
               commit.dir = exact.dir;
               const found = this.identities.get(normalizeFsPath(exact.dir)) ?? UNKNOWN_PLACE;
               commit.place = placeOf(exact.dir, found, folderIdentities, folders);
               commit.repository = repositoryOf(exact.dir, found, folderIdentities);
             } else {
-              cleared ||= commit.dir !== null || commit.place != null || commit.repository != null;
+              // A commit resolved from this same query keeps its group while the answer is awaited again. Navigation waits for it.
+              const awaiting = this.resolvedBy.get(commit) === key && (this.asking.has(key) || this.wants(key));
+              cleared ||= commit.dir !== null || (!awaiting && (commit.place != null || commit.repository != null));
               commit.dir = null;
-              commit.place = null;
-              commit.repository = null;
+              if (!awaiting) {
+                commit.place = null;
+                commit.repository = null;
+              }
               if (this.wants(key) && !candidates.some((one) => candidateKey(one) === key)) {
                 candidates.push(query);
                 for (const dir of query.folders) this.want(dir, dirs);

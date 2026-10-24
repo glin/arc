@@ -76,8 +76,8 @@
   },
   "extension/src/gitcommits.test.ts": {
     "reason": "A real fast-forward must retain its reflog details. Verified foreign child commits must retain their repository across cache reload and worktree removal.",
-    "cases": 68,
-    "matricesSha256": "88ef56e8dd943331d5a4d2d5e480cc064a78c5ea029e818f7ae24d1e6b9bcfa7"
+    "cases": 74,
+    "matricesSha256": "66db16b7d2d9769f216ad98f9e148e8e96e2a208e462e1a7adc44780655aeb4c"
   },
   "extension/src/packaging.source.test.ts": {
     "reason": "Extracted source must build and watch both CLI bundles offline and reject corrupt or incomplete packaged assets.",
@@ -126,8 +126,8 @@
   },
   "extension/src/panel.webview.test.ts": {
     "reason": "Real progressive workers must deliver bounded recovery and metadata through the production panel host. Start metadata must survive storage delays, hidden panels, preference resets, and reloads.",
-    "cases": 618,
-    "matricesSha256": "4ce7b18293896991f1e1da259cc807841f572b88a3ca4b909a80fa1d55d9cbc0"
+    "cases": 619,
+    "matricesSha256": "f9932de645a7de270227d09875c1b8c4464fea2b3fff25f6c2c78976af3ccc8b"
   },
   "extension/src/panelbundle.test.ts": {
     "reason": "The panel bundle and fixture must contain the production entry, source identity, and substituted text.",
