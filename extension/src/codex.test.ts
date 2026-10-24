@@ -18063,6 +18063,125 @@ test('Codex usage events carry wait_agent returns to the request that read them 
   assert.deepEqual([bucket.waits?.requests, bucket.waits?.timedOut, bucket.waits?.usage.input], [2, 1, 5000]);
 });
 
+test('a Codex snapshot that arrives before its billing record keeps the wait_agent returns it read', () => {
+  const thread = '01a032c9-1a92-7931-845c-723117d24dbe';
+  const bill = (second: number, response: string, input: number) => ({
+    timestamp: at(second),
+    type: 'token_usage_record',
+    payload: {
+      thread_id: thread,
+      turn_id: 'waits',
+      response_id: response,
+      usage: usage({ input_tokens: input, output_tokens: input / 100 }),
+    },
+  });
+  const context = turnContext(2, 'waits', 'gpt-6-sol', 'high');
+  // Each batch lists whether each return timed out, then the timed-out count of the request that read them.
+  const batches: Array<[boolean[], number]> = [
+    [[false], 0],
+    [[true], 1],
+    [[false, true], 0],
+    [[true, true], 1],
+  ];
+  for (const [returns, timedOut] of batches) {
+    for (const responseId of [undefined, 'reader']) {
+      const snapshot = tokens(7, { input_tokens: 2000, output_tokens: 20 });
+      const records = [
+        ...returns.map((_, n) =>
+          item('function_call', 3, { name: 'wait_agent', call_id: `wait-${n}`, arguments: '{"timeout_ms":1000}' }),
+        ),
+        tokens(4, { input_tokens: 1000, output_tokens: 10 }),
+        bill(5, 'issuer', 1000),
+        ...returns.map((timeout, n) =>
+          item('function_call_output', 6, {
+            call_id: `wait-${n}`,
+            output: timeout ? '{"timed_out":true}' : '{"status":{"completed":"done"}}',
+          }),
+        ),
+        responseId ? { ...snapshot, payload: { ...snapshot.payload, response_id: responseId } } : snapshot,
+        bill(8, 'reader', 2000),
+      ];
+      // The first order releases the reader's snapshot before its bill. The second holds it until the turn's model arrives.
+      for (const [order, records_] of [
+        ['released', [meta(), event('task_started', 1, { turn_id: 'waits' }), context, ...records]],
+        ['held', [meta(), event('task_started', 1, { turn_id: 'waits' }), ...records, context]],
+      ] as const) {
+        const label = `${returns.join('+')} ${responseId ?? 'anonymous'} ${order}`;
+        const reducer = createCodexUsageLineReducer();
+        const events = records_.flatMap((record) => reducer.pushLine(JSON.stringify(record)));
+        const [bucket] = aggregateUsageEvents(events);
+        assert.deepEqual(
+          [bucket.usage.requests, bucket.waits?.requests, bucket.waits?.timedOut, bucket.waits?.usage.input],
+          [2, 1, timedOut, 2000],
+          label,
+        );
+        assert.deepEqual(
+          events.filter((event) => event.waits).map((event) => event.responseId),
+          ['reader'],
+          label,
+        );
+      }
+    }
+  }
+});
+
+test('a Codex snapshot that a compaction suppressed keeps its wait_agent return when an ordinary bill restores it', () => {
+  const thread = '01a032c9-1a92-7931-845c-723117d24dbe';
+  const read = usage({ input_tokens: 2000, output_tokens: 20 });
+  const records = [
+    item('function_call', 3, { name: 'wait_agent', call_id: 'wait', arguments: '{"timeout_ms":1000}' }),
+    item('function_call_output', 4, { call_id: 'wait', output: '{"timed_out":true}' }),
+    tokens(5, { input_tokens: 2000, output_tokens: 20 }),
+    {
+      timestamp: at(6),
+      type: 'compacted',
+      payload: {
+        message: '',
+        replacement_history: [],
+        latest_token_usage_record: { response_id: 'compact', usage: read },
+      },
+    },
+    {
+      timestamp: at(7),
+      type: 'token_usage_record',
+      payload: { thread_id: thread, turn_id: 'waits', response_id: 'reader', usage: read },
+    },
+  ];
+  // A later snapshot with the same usage replaces the restored event.
+  const later = event('token_count', 8, {
+    info: {
+      last_token_usage: read,
+      total_token_usage: usage({ input_tokens: 4000, output_tokens: 40 }),
+      model_context_window: 258400,
+    },
+  });
+  const context = turnContext(2, 'waits', 'gpt-6-sol', 'high');
+  for (const replaced of [false, true]) {
+    const tail = replaced ? [...records, later] : records;
+    for (const [order, records_] of [
+      ['released', [meta(), event('task_started', 1, { turn_id: 'waits' }), context, ...tail]],
+      ['held', [meta(), event('task_started', 1, { turn_id: 'waits' }), ...tail, context]],
+    ] as const) {
+      const label = `${replaced ? 'replaced' : 'restored'} ${order}`;
+      const reducer = createCodexUsageLineReducer();
+      const events = records_.flatMap((record) => reducer.pushLine(JSON.stringify(record)));
+      const buckets = aggregateUsageEvents(events);
+      const total = (pick: (bucket: (typeof buckets)[number]) => number | undefined) =>
+        buckets.reduce((sum, bucket) => sum + (pick(bucket) ?? 0), 0);
+      assert.deepEqual(
+        [
+          events.reduce((sum, event) => sum + (event.compactionUsage ? 0 : (event.usage.requests ?? 1)), 0),
+          total((bucket) => bucket.waits?.requests),
+          total((bucket) => bucket.waits?.timedOut),
+          total((bucket) => bucket.waits?.usage.input),
+        ],
+        [1, 1, 1, 2000],
+        label,
+      );
+    }
+  }
+});
+
 test('Codex wait_agent records in copied history never reach a later live request', () => {
   const thread = '01a032c9-1a92-7931-845c-723117d24dbe';
   const records = [

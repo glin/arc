@@ -1250,6 +1250,63 @@ function toolKind(name: string, input: unknown): ToolResult {
   return { kind: 'other', label: name };
 }
 
+// PowerShell startup options that take a value, by full name and alias.
+const POWERSHELL_VALUE_OPTIONS = new Set([
+  'configurationfile',
+  'configurationname',
+  'config',
+  'custompipename',
+  'executionpolicy',
+  'ex',
+  'ep',
+  'inputformat',
+  'inp',
+  'if',
+  'outputformat',
+  'o',
+  'of',
+  'psconsolefile',
+  'settingsfile',
+  'version',
+  'v',
+  'windowstyle',
+  'w',
+  'workingdirectory',
+  'wd',
+]);
+// PowerShell startup switches that take no value, by full name and alias.
+const POWERSHELL_SWITCHES = new Set([
+  'interactive',
+  'i',
+  'login',
+  'l',
+  'mta',
+  'noexit',
+  'noe',
+  'nologo',
+  'noninteractive',
+  'noni',
+  'noprofile',
+  'nop',
+  'noprofileloadtime',
+  'sta',
+]);
+
+// The command text after a PowerShell `-Command` switch. Only the leading startup options are read.
+// Any other word ends them, such as `-File`, `-EncodedCommand`, an unknown option, or a script path.
+function powerShellCommand(words: readonly string[]): string | null {
+  for (let at = 1; at < words.length; at++) {
+    const option = /^-([a-z]+)(:.*)?$/i.exec(words[at]);
+    if (!option) return null;
+    const name = option[1].toLowerCase();
+    if (name === 'c' || name === 'command') return option[2] ? null : words.slice(at + 1).join(' ');
+    if (POWERSHELL_VALUE_OPTIONS.has(name)) {
+      if (!option[2]) at++;
+    } else if (!POWERSHELL_SWITCHES.has(name)) return null;
+  }
+  return null;
+}
+
 // The command line of a Codex `shell` argument array, without its shell wrapper.
 function codexShellArray(command: readonly unknown[]): string {
   const words = command.filter((word): word is string => typeof word === 'string');
@@ -1260,11 +1317,9 @@ function codexShellArray(command: readonly unknown[]): string {
     ?.replace(/\.exe$/i, '')
     .toLowerCase();
   const flag = words[1]?.toLowerCase();
-  if (
-    ((shell === 'bash' || shell === 'sh' || shell === 'zsh') && (flag === '-lc' || flag === '-c')) ||
-    ((shell === 'powershell' || shell === 'pwsh') && flag === '-command')
-  )
+  if ((shell === 'bash' || shell === 'sh' || shell === 'zsh') && (flag === '-lc' || flag === '-c'))
     return words.slice(2).join(' ');
+  if (shell === 'powershell' || shell === 'pwsh') return powerShellCommand(words) ?? words.join(' ');
   return words.join(' ');
 }
 
@@ -1278,7 +1333,7 @@ function codexToolKind(recordedName: string, input: unknown): ToolResult {
   if (name === 'wait_agent' || name === 'wait' || name === 'write_stdin') return { kind: 'wait', label: name };
   if (name === 'spawn_agent') return { kind: 'subagent launch', label: name };
   if (name === 'apply_patch') return { kind: 'file edit', label: name };
-  if (name === 'exec_command' || name === 'shell') {
+  if (name === 'exec_command' || name === 'shell' || name === 'shell_command') {
     if (wrapped !== null) return shellResult(name, wrapped);
     let parsed: unknown = input;
     if (typeof input === 'string') {

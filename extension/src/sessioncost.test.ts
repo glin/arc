@@ -3134,6 +3134,35 @@ test('Codex tool calls map to kinds on every shell form and through the exec wra
       'shell select-string',
     ],
     [
+      call(0, 'shell-switches', 'shell', {
+        command: ['PowerShell.EXE', '-noprofile', '-NonInteractive', '-Command', 'Get-ChildItem -Recurse src'],
+      }),
+      'search',
+      'shell get-childitem',
+    ],
+    [
+      call(0, 'shell-policy', 'shell', {
+        command: ['C:/Program Files/PowerShell/7/PWSH.exe', '-NoLogo', '-ExecutionPolicy', 'Bypass', '-C', 'git log'],
+      }),
+      'git',
+      'shell git',
+    ],
+    // PowerShell runs build.ps1 here, and passes `-c` to the script.
+    [
+      call(0, 'shell-file', 'shell', { command: ['pwsh', '-NoProfile', '-File', './build.ps1', '-c', 'git status'] }),
+      'other',
+      'shell pwsh',
+    ],
+    [
+      call(0, 'shell-encoded', 'shell', {
+        command: ['powershell', '-NoProfile', '-EncodedCommand', 'ZwBpAHQAIABzAHQAYQB0AHUAcwA=', '-c', 'git status'],
+      }),
+      'other',
+      'shell powershell',
+    ],
+    [call(0, 'shell-no-switch', 'shell', { command: ['pwsh', '-NoLogo', 'git', 'status'] }), 'other', 'shell pwsh'],
+    [call(0, 'shell-command', 'shell_command', { command: 'npm run build' }), 'test or build', 'shell_command npm'],
+    [
       call(0, 'windows-read', 'exec_command', { cmd: 'Get-Content C:\\repo\\src\\a.ts -TotalCount 20' }),
       'file read',
       'exec_command get-content',

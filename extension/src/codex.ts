@@ -1993,6 +1993,11 @@ function sameCodexRequestUsage(left: TurnUsage, right: TurnUsage): boolean {
   );
 }
 
+// The wait share of one request that read `wait_agent` returns. `timedOut` is true when every return it read timed out.
+function codexRequestWaits(timedOut: boolean, usage: TurnUsage): NonNullable<UsageEvent['waits']> {
+  return { requests: 1, timedOut: timedOut ? 1 : 0, usage: { ...usage } };
+}
+
 function removeCodexRequest(event: UsageEvent): UsageEvent {
   const negated = (usage: TurnUsage) =>
     Object.fromEntries(Object.entries(usage).map(([key, value]) => [key, -value])) as unknown as TurnUsage;
@@ -2161,6 +2166,10 @@ function reduceCodexUsageEventsInner(state: CodexUsageReducerState, record: Code
             responseId,
             requestKey: `codex-response:${responseId}`,
             requestCountExact: false as const,
+            // The association keeps `waitTimedOut` so a later snapshot that replaces this event carries it too.
+            ...(association.waitTimedOut !== undefined
+              ? { waits: codexRequestWaits(association.waitTimedOut, held.suppressedSnapshot.usage) }
+              : {}),
           };
           restored.model ??= state.turnModels[turnId] ?? null;
           restored.contextBand = contextBandForRequest(
@@ -2179,6 +2188,20 @@ function reduceCodexUsageEventsInner(state: CodexUsageReducerState, record: Code
                 end: record.sourceEnd ?? record.sourceStart,
               };
           } else corrections.push(restored);
+        }
+      }
+      // A snapshot that arrived before this billing record carries no wait data. A held event takes
+      // it in place. A released event is replaced under the same request key.
+      if (waitReturns && !state.compactionResponseIds.includes(responseId)) {
+        const held = state.pendingRequests[turnId]?.find((event) => event.responseId === responseId);
+        const snapshot =
+          held ?? [...state.recentRequestEvents].reverse().find((event) => event.responseId === responseId);
+        if (snapshot && !snapshot.waits) {
+          const waits = codexRequestWaits(waitReturns.timedOut === waitReturns.count, snapshot.usage);
+          if (held) held.waits = waits;
+          else corrections.push(removeCodexRequest(snapshot), { ...snapshot, waits });
+          // An unmatched association keeps `waitTimedOut` for a later snapshot of this request.
+          if (association.matched) delete association.waitTimedOut;
         }
       }
     }
@@ -2719,9 +2742,7 @@ function reduceCodexUsageEventsInner(state: CodexUsageReducerState, record: Code
       ))
       ? { requestCountExact: false as const }
       : {}),
-    ...(identified?.waitTimedOut !== undefined
-      ? { waits: { requests: 1, timedOut: identified.waitTimedOut ? 1 : 0, usage: { ...usage } } }
-      : {}),
+    ...(identified?.waitTimedOut !== undefined ? { waits: codexRequestWaits(identified.waitTimedOut, usage) } : {}),
     usage,
     requestKey: provisional?.requestKey ?? `codex:${turnId}:${record.timestamp ?? ''}:${state.requestNumber}`,
     ...(responseId ? { responseId } : {}),
