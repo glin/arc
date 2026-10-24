@@ -6229,7 +6229,7 @@ button.railfilterlabel:focus-visible {
 }
 .context-bound .cpick {
   flex: none;
-  margin-left: auto;
+  margin-right: auto;
 }
 .context-remaining {
   white-space: nowrap;

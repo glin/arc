@@ -193,7 +193,6 @@ export function drawContextDetail(document: Document, host: HTMLElement, value: 
     amount.append(el('span', 'sr-only', ` (${remaining.toLocaleString('en-US')} tokens)`));
   }
   remainder.append(...inlineText([el('span', 'context-remaining-label', 'Remaining'), amount]));
-  bound.append(remainder);
   if (value.compact) {
     const button = el('button', 'cpick', 'Compact');
     button.type = 'button';
@@ -205,5 +204,6 @@ export function drawContextDetail(document: Document, host: HTMLElement, value: 
     });
     bound.append(button);
   }
+  bound.append(remainder);
   host.append(bound);
 }
