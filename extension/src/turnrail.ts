@@ -774,7 +774,7 @@ export interface SessionParentEdge {
 
 // Indexes parent relationships by child session id.
 // Dispatch references, resolved Claude child files, and Codex children supply edges.
-// Exclude unresolved Claude references because copied launch results cannot establish a child file.
+// Claude subagent edges require resolved child files. Unresolved dispatch claims still participate in conflicts.
 // Codex background reviews supply no session edge.
 // Duplicate claims with the same parent and relation combine reader ownership.
 // Conflicting parents or relations remove the edge.
@@ -817,6 +817,35 @@ export function sessionParentIndex(
     }
   }
   return parents;
+}
+
+// Resolved dispatch references share the heading's conflict and ownership policy.
+export function admittedDispatchReferences(
+  references: readonly import('./transcript').ClaudeChildSessionReference[],
+  claudeChildren: readonly { sessionId: string; parentSessionId: string }[] = [],
+  codexChildren: readonly { threadId: string; parentThreadId: string | null; backgroundReview: boolean }[] = [],
+): import('./transcript').ClaudeChildSessionReference[] {
+  const resolved = references.filter((reference) => reference.kind !== 'dispatch' || reference.file !== null);
+  const parents = sessionParentIndex(references, claudeChildren, codexChildren);
+  const duplicatesBySession = new Map<string, import('./transcript').ClaudeDispatchSessionReference[]>();
+  for (const reference of resolved) {
+    if (reference.kind !== 'dispatch') continue;
+    const duplicates = duplicatesBySession.get(reference.sessionId) ?? [];
+    duplicates.push(reference);
+    duplicatesBySession.set(reference.sessionId, duplicates);
+  }
+  const seen = new Set<string>();
+  return resolved.flatMap<import('./transcript').ClaudeChildSessionReference>((reference) => {
+    if (reference.kind !== 'dispatch') return [reference];
+    const edge = parents.get(reference.sessionId);
+    if (edge?.relation !== 'dispatched' || edge.parent !== reference.parentSessionId || seen.has(reference.sessionId))
+      return [];
+    seen.add(reference.sessionId);
+    const duplicates = duplicatesBySession.get(reference.sessionId)!;
+    if (new Set(duplicates.map((item) => item.file)).size !== 1) return [];
+    const toolUseIds = [...new Set(duplicates.flatMap((item) => item.toolUseIds))].sort();
+    return [{ ...reference, toolUseIds, owned: edge.owned === true }];
+  });
 }
 
 // Parent edges whose child and parent both have session rows. Missing endpoints affect no heading or session list card.

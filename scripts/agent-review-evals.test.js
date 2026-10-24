@@ -1180,10 +1180,10 @@ describe('frozen continuation', { tags: ['subprocess'] }, () => {
     fs.mkdirSync(attempt);
     const worker = path.join(attempt, 'fake-worker.cjs');
     const descendant = path.join(attempt, 'descendant.cjs');
-    fs.writeFileSync(descendant, "require('node:net').createServer().listen(0);\n");
+    fs.writeFileSync(descendant, 'setInterval(() => {}, 2 ** 30);\n');
     fs.writeFileSync(
       worker,
-      `const fs=require('node:fs');const {spawn}=require('node:child_process');const child=spawn(process.execPath,[${JSON.stringify(descendant)}],{stdio:'ignore'});fs.writeFileSync(${JSON.stringify(path.join(attempt, 'descendant.json.tmp'))},JSON.stringify({pid:child.pid,workerPid:process.pid}));fs.renameSync(${JSON.stringify(path.join(attempt, 'descendant.json.tmp'))},${JSON.stringify(path.join(attempt, 'descendant.json'))});require('node:net').createServer().listen(0);`,
+      `const fs=require('node:fs');const {spawn}=require('node:child_process');const child=spawn(process.execPath,[${JSON.stringify(descendant)}],{stdio:'ignore'});fs.writeFileSync(${JSON.stringify(path.join(attempt, 'descendant.json.tmp'))},JSON.stringify({pid:child.pid,workerPid:process.pid}));fs.renameSync(${JSON.stringify(path.join(attempt, 'descendant.json.tmp'))},${JSON.stringify(path.join(attempt, 'descendant.json'))});setInterval(() => {}, 2 ** 30);`,
     );
     const runnerFile = path.join(attempt, 'runner.mjs');
     fs.writeFileSync(

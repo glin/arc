@@ -14,10 +14,12 @@ import {
 } from './dispatchreceipts';
 import { HostedDispatch, type SavedDispatchResponse } from './dispatchhost';
 import { payloadSha256 } from './sessionwrites';
+import { openReadWindow, closeReadWindow } from './readmeter';
 import type { NativeEvent } from './agentwire';
 import { savedDispatchResponse, SESSION_READ_LIMITS } from './sessionreads';
 import { revisionOf, type SessionFile } from './transcript';
 import { ClaudeWire } from './claudewire';
+import type { DispatchRelationshipAllowance, DispatchRelationshipStep } from './dispatchreceipts';
 
 const origin = 'a'.repeat(24);
 const session = 'aaaaaaaa-1111-2222-3333-444444444444';
@@ -90,6 +92,684 @@ function standaloneFixture(standalone: Partial<StandaloneOptions> = {}) {
   });
   return { ...fx, standalone: launch };
 }
+
+function relationshipFixture(
+  parentProvider: 'claude' | 'codex' = 'codex',
+  childProvider: 'claude' | 'codex' = 'codex',
+  agentRun = false,
+) {
+  const fx = fixture();
+  const launch = fx.receipts.reserve({
+    ...fx.launch,
+    transport: 'standalone',
+    requester: { provider: parentProvider, id: session },
+    standalone: settings(fx.home, { provider: childProvider, agentRun }),
+  });
+  const file = path.join(fx.home, 'native.jsonl');
+  const opening = Buffer.from(JSON.stringify({ sessionId: turn, cwd: fx.home }) + '\n' + 'x'.repeat(2048));
+  fs.writeFileSync(file, opening);
+  const stat = fs.statSync(file, { bigint: true });
+  const directory = fs.statSync(fx.home, { bigint: true });
+  fx.receipts.startup(launch.launchId, {
+    file,
+    identity: `${stat.dev}:${stat.ino}`,
+    ancestor: fx.home,
+    directory: `${directory.dev}:${directory.ino}`,
+    cwd: fs.realpathSync.native(fx.home),
+    bytes: opening.length,
+    sha256: payloadSha256(opening.toString()),
+  });
+  fx.receipts.standaloneSession(launch.launchId, turn);
+  const catalog: SessionFile[] = [
+    { agent: parentProvider, sessionId: session, file: path.join(fx.home, 'parent.jsonl'), size: 0, mtimeMs: 0 },
+    { agent: childProvider, sessionId: turn, file, ...revisionOf(stat) },
+  ];
+  return { ...fx, launch, catalog, file, opening };
+}
+
+function drainRelationships(
+  scan: Generator<DispatchRelationshipStep, unknown, DispatchRelationshipAllowance>,
+  bytes = 37,
+) {
+  const references: NonNullable<DispatchRelationshipStep['reference']>[] = [];
+  const allowance = { bytes, entries: 1, checks: 1 };
+  for (let steps = 0; steps < 100_000; steps++) {
+    const next = scan.next(allowance);
+    if (next.done) return references;
+    assert.ok(next.value.bytes <= bytes && next.value.entries <= 1 && next.value.checks <= 1);
+    if (next.value.reference) references.push(next.value.reference);
+  }
+  scan.return(undefined);
+  return assert.fail('The bounded receipt scan did not finish.');
+}
+
+test.each(['claude', 'codex'] as const)('receipt relationships retain reader ownership for %s parents', (parent) => {
+  for (const child of ['claude', 'codex'] as const) {
+    const fx = relationshipFixture(parent, child);
+    const writers = ['writeFileSync', 'linkSync', 'renameSync', 'mkdirSync', 'unlinkSync'] as const;
+    for (const name of writers)
+      vi.spyOn(fs, name).mockImplementation(() => {
+        throw new Error('Receipt reads must not write.');
+      });
+    syncBuiltinESMExports();
+    const references = drainRelationships(fx.receipts.relationships(fx.catalog));
+    assert.equal(references.length, 1);
+    assert.deepEqual(references[0], {
+      kind: 'dispatch',
+      agent: child,
+      parentSessionId: session,
+      sessionId: turn,
+      file: fx.file,
+      toolUseIds: [],
+      name: 'test',
+      owned: true,
+    });
+    vi.restoreAllMocks();
+    syncBuiltinESMExports();
+  }
+});
+
+test.each([
+  { platform: 'win32', mixed: false, temporary: false, canonical: false, expected: 1 },
+  { platform: 'linux', mixed: false, temporary: false, canonical: false, expected: 1 },
+  { platform: 'darwin', mixed: false, temporary: false, canonical: false, expected: 1 },
+  { platform: 'win32', mixed: true, temporary: false, canonical: false, expected: 1 },
+  { platform: 'linux', mixed: true, temporary: false, canonical: false, expected: 0 },
+  { platform: 'darwin', mixed: true, temporary: false, canonical: false, expected: 0 },
+  { platform: 'win32', mixed: false, temporary: true, canonical: true, expected: 0 },
+  { platform: 'linux', mixed: false, temporary: true, canonical: true, expected: 0 },
+  { platform: 'darwin', mixed: false, temporary: true, canonical: true, expected: 1 },
+  { platform: 'darwin', mixed: false, temporary: true, canonical: false, expected: 0 },
+] as const)(
+  'receipt reader uses $platform path rules for mixed=$mixed temporary=$temporary canonical=$canonical',
+  ({ platform, mixed, temporary, canonical, expected }) => {
+    const fx = relationshipFixture();
+    const paths = platform === 'win32' ? path.win32 : path.posix;
+    const virtualHome =
+      platform === 'win32' ? (temporary ? 'C:/tmp/ArcHome' : 'C:/ArcHome') : temporary ? '/tmp/ArcHome' : '/ArcHome';
+    const virtualRoot = paths.join(virtualHome, 'dispatch');
+    const virtualSource = paths.join(virtualHome, 'native.jsonl');
+    const receiptFile = path.join(fx.receipts.root, fx.launch.launchId, 'receipt.json');
+    const receipt = JSON.parse(fs.readFileSync(receiptFile, 'utf8'));
+    receipt.standalone.cwd = virtualHome;
+    fs.writeFileSync(receiptFile, JSON.stringify(receipt));
+    const anchorFile = path.join(fx.receipts.root, `${fx.launch.launchId}.json`);
+    const anchor = JSON.parse(fs.readFileSync(anchorFile, 'utf8'));
+    anchor.sha256 = payloadSha256(JSON.stringify(receipt));
+    fs.writeFileSync(anchorFile, JSON.stringify(anchor));
+    const startupFile = path.join(fx.receipts.root, fx.launch.launchId, 'startup.json');
+    const startup = JSON.parse(fs.readFileSync(startupFile, 'utf8'));
+    Object.assign(startup, { file: virtualSource, ancestor: virtualHome, cwd: virtualHome });
+    fs.writeFileSync(startupFile, JSON.stringify(startup));
+    const witnessFile = path.join(fx.receipts.root, `${fx.launch.launchId}.startup.json`);
+    const witness = JSON.parse(fs.readFileSync(witnessFile, 'utf8'));
+    witness.sha256 = payloadSha256(JSON.stringify(startup));
+    fs.writeFileSync(witnessFile, JSON.stringify(witness));
+    const catalog = [
+      { ...fx.catalog[0], file: paths.join(virtualHome, 'parent.jsonl') },
+      { ...fx.catalog[1], file: paths.join(virtualHome, mixed ? 'NATIVE.jsonl' : 'native.jsonl') },
+    ];
+    const translate = (file: fs.PathLike) => {
+      const value = String(file);
+      const relative = paths.relative(virtualHome, value);
+      return relative === '' || (!relative.startsWith('..') && !paths.isAbsolute(relative))
+        ? path.join(fx.home, ...relative.split(paths.sep))
+        : value;
+    };
+    const stat = fs.lstatSync;
+    const open = fs.openSync;
+    const openDirectory = fs.opendirSync;
+    const temporaryRoot = platform === 'win32' ? paths.normalize('C:/tmp') : '/tmp';
+    let aliasChecks = 0;
+    vi.spyOn(os, 'homedir').mockReturnValue(platform === 'win32' ? 'C:/Reader' : '/reader');
+    vi.spyOn(os, 'tmpdir').mockReturnValue(platform === 'win32' ? 'C:/ConfiguredTemp' : '/configured/temp');
+    vi.spyOn(fs, 'lstatSync').mockImplementation(((file: fs.PathLike, options: any) => {
+      if (String(file) === temporaryRoot) {
+        aliasChecks++;
+        const held = stat(fx.home, options);
+        return Object.assign(Object.create(Object.getPrototypeOf(held)), held, { isSymbolicLink: () => true });
+      }
+      return stat(translate(file), options);
+    }) as typeof fs.lstatSync);
+    vi.spyOn(fs, 'openSync').mockImplementation((file, ...args) => open(translate(file), ...args));
+    vi.spyOn(fs, 'opendirSync').mockImplementation(((file: fs.PathLike, options: any) =>
+      openDirectory(translate(file), options)) as typeof fs.opendirSync);
+    vi.spyOn(fs.realpathSync, 'native').mockImplementation((file) => {
+      if (String(file) === '/tmp') {
+        aliasChecks++;
+        return canonical ? '/private/tmp' : '/redirected/tmp';
+      }
+      return String(file);
+    });
+    syncBuiltinESMExports();
+    const receipts = new DispatchReceipts(virtualHome, platform);
+    assert.equal(receipts.root, virtualRoot);
+    const references = drainRelationships(receipts.relationships(catalog), 31);
+    assert.equal(references.length, expected);
+    if (expected) assert.equal(references[0].file, catalog[1].file);
+    if (temporary) assert.ok(aliasChecks > 0);
+  },
+);
+
+test('resumable receipt paths refuse redirected ancestors', () => {
+  const fx = relationshipFixture();
+  const stat = fs.lstatSync;
+  let reached = false;
+  vi.spyOn(fs, 'lstatSync').mockImplementation(((file: fs.PathLike, options: any) => {
+    const held = stat(file, options);
+    if (String(file) !== fx.home) return held;
+    reached = true;
+    return Object.assign(Object.create(Object.getPrototypeOf(held)), held, { isSymbolicLink: () => true });
+  }) as typeof fs.lstatSync);
+  syncBuiltinESMExports();
+  assert.deepEqual(drainRelationships(fx.receipts.relationships(fx.catalog), 11), []);
+  assert.equal(reached, true);
+});
+
+test('directory entry charges survive partial launch abandonment', () => {
+  const fx = relationshipFixture();
+  const openDirectory = fs.opendirSync;
+  const read = fs.readSync;
+  let entries = 0;
+  let bodyReads = 0;
+  let directoryClosed = false;
+  vi.spyOn(fs, 'opendirSync').mockImplementation((...args) => {
+    const directory = Reflect.apply(openDirectory, fs, args);
+    const next = directory.readSync.bind(directory);
+    const close = directory.closeSync.bind(directory);
+    vi.spyOn(directory, 'readSync').mockImplementation(() => {
+      entries++;
+      return next();
+    });
+    vi.spyOn(directory, 'closeSync').mockImplementation(() => {
+      directoryClosed = true;
+      close();
+    });
+    return directory;
+  });
+  vi.spyOn(fs, 'readSync').mockImplementation(((
+    ...args: [number, NodeJS.ArrayBufferView, number, number, number | null]
+  ) => {
+    bodyReads++;
+    return Reflect.apply(read, fs, args);
+  }) as typeof fs.readSync);
+  syncBuiltinESMExports();
+  const scan = fx.receipts.relationships(fx.catalog);
+  let charged = 0;
+  for (let step = 0; step < 10_000; step++) {
+    const before = entries;
+    const next = scan.next({ entries: 1, bytes: 11, checks: 1 });
+    assert.equal(next.done, false);
+    if (next.done) break;
+    assert.equal(next.value.entries, entries - before);
+    charged += next.value.entries;
+    if (bodyReads) break;
+  }
+  assert.ok(entries > 0 && bodyReads > 0);
+  assert.equal(charged, entries);
+  scan.return();
+  assert.equal(directoryClosed, true);
+});
+
+test('receipt byte grants bound physical reads and retain partial source validation', () => {
+  const fx = relationshipFixture();
+  const originalRead = fs.readSync;
+  let supplied = 0;
+  let returned = 0;
+  let entries = 0;
+  const openDirectory = fs.opendirSync;
+  vi.spyOn(fs, 'opendirSync').mockImplementation((...args) => {
+    const directory = Reflect.apply(openDirectory, fs, args);
+    const readEntry = directory.readSync.bind(directory);
+    vi.spyOn(directory, 'readSync').mockImplementation(() => {
+      entries++;
+      return readEntry();
+    });
+    return directory;
+  });
+  vi.spyOn(fs, 'readSync').mockImplementation(((
+    ...args: [number, NodeJS.ArrayBufferView, number, number, number | null]
+  ) => {
+    assert.ok(typeof args[3] === 'number' && args[3] <= supplied, 'A physical read exceeded the remaining byte grant.');
+    const count = Reflect.apply(originalRead, fs, args) as number;
+    returned += count;
+    return count;
+  }) as typeof fs.readSync);
+  syncBuiltinESMExports();
+  const scan = fx.receipts.relationships(fx.catalog);
+  const references = [];
+  for (let step = 0; step < 100_000; step++) {
+    supplied = step % 3 === 0 ? 0 : 13;
+    const before = returned;
+    const beforeEntries = entries;
+    const entryGrant = step % 2;
+    const next = scan.next({ bytes: supplied, entries: entryGrant, checks: 1 });
+    assert.ok(returned - before <= supplied);
+    if (next.done) break;
+    assert.equal(next.value.entries, entries - beforeEntries);
+    assert.ok(next.value.entries <= entryGrant);
+    if (next.value.reference) references.push(next.value.reference);
+  }
+  assert.equal(references.length, 1);
+  assert.ok(returned >= fx.opening.length);
+});
+
+test.each(['startup', 'accepted'] as const)(
+  'receipt reads refuse missing or replaced %s witnesses without recovery',
+  (kind) => {
+    const fx = relationshipFixture();
+    const witness = path.join(fx.receipts.root, `${fx.launch.launchId}.${kind}.json`);
+    const original = fs.readFileSync(witness);
+    fs.unlinkSync(witness);
+    assert.deepEqual(drainRelationships(fx.receipts.relationships(fx.catalog)), []);
+    assert.equal(fs.existsSync(witness), false);
+    fs.writeFileSync(witness, original);
+    const binding = path.join(fx.receipts.root, fx.launch.launchId, `${kind}.json`);
+    const bytes = fs.readFileSync(binding);
+    fs.renameSync(binding, binding + '.old');
+    fs.writeFileSync(binding, bytes);
+    assert.deepEqual(drainRelationships(fx.receipts.relationships(fx.catalog)), []);
+  },
+);
+
+test.each(['source', 'ancestor', 'malformed', 'refused', 'legacy', 'collision'] as const)(
+  'receipt relationships refuse invalid %s evidence',
+  (failure) => {
+    const fx = relationshipFixture();
+    if (failure === 'source') {
+      fs.renameSync(fx.file, fx.file + '.old');
+      fs.writeFileSync(fx.file, fx.opening);
+    }
+    if (failure === 'ancestor') {
+      const old = fx.home + '.old';
+      fs.renameSync(fx.home, old);
+      homes.push(old);
+      fs.mkdirSync(fx.home);
+      for (const entry of fs.readdirSync(old)) fs.renameSync(path.join(old, entry), path.join(fx.home, entry));
+    }
+    if (failure === 'malformed') fs.writeFileSync(path.join(fx.receipts.root, `${fx.launch.launchId}.json`), '{}');
+    if (failure === 'refused') fx.receipts.startupRefused(fx.launch.launchId, true);
+    if (failure === 'legacy') {
+      fs.unlinkSync(path.join(fx.receipts.root, fx.launch.launchId, 'startup.json'));
+      fs.unlinkSync(path.join(fx.receipts.root, `${fx.launch.launchId}.startup.json`));
+    }
+    if (failure === 'collision') fx.catalog.push({ ...fx.catalog[1], file: fx.file + '.other' });
+    assert.deepEqual(drainRelationships(fx.receipts.relationships(fx.catalog)), []);
+  },
+);
+
+test('receipt scans revisit delayed bindings, new store tails and changed scope', () => {
+  const delayed = relationshipFixture();
+  const deferredLaunch = delayed.receipts.reserve({ ...delayed.launch });
+  const { launchId: _deferredId, ...deferredStartup } = JSON.parse(
+    fs.readFileSync(path.join(delayed.receipts.root, delayed.launch.launchId, 'startup.json'), 'utf8'),
+  );
+  delayed.receipts.startup(deferredLaunch.launchId, deferredStartup);
+  assert.deepEqual(drainRelationships(delayed.receipts.relationship(deferredLaunch.launchId, delayed.catalog)), []);
+  delayed.receipts.standaloneSession(deferredLaunch.launchId, turn);
+  assert.equal(drainRelationships(delayed.receipts.relationship(deferredLaunch.launchId, delayed.catalog)).length, 1);
+  const fx = relationshipFixture('claude', 'codex', true);
+  assert.deepEqual(drainRelationships(fx.receipts.relationships([fx.catalog[0]])), []);
+  assert.equal(drainRelationships(fx.receipts.relationships(fx.catalog))[0].owned, false);
+  const binding = path.join(fx.receipts.root, fx.launch.launchId, 'accepted.json');
+  const original = fs.readFileSync(binding);
+  fs.unlinkSync(binding);
+  assert.deepEqual(drainRelationships(fx.receipts.relationships(fx.catalog)), []);
+  fs.writeFileSync(binding, original);
+  // Replacement cannot recover an accepted witness. A fresh launch remains discoverable.
+  const tail = fx.receipts.reserve({ ...fx.launch });
+  const { launchId: _launchId, ...startup } = JSON.parse(
+    fs.readFileSync(path.join(fx.receipts.root, fx.launch.launchId, 'startup.json'), 'utf8'),
+  );
+  fx.receipts.startup(tail.launchId, startup);
+  fx.receipts.standaloneSession(tail.launchId, turn);
+  assert.equal(drainRelationships(fx.receipts.relationships(fx.catalog)).length, 1);
+});
+
+test('receipt source digests reject stable same-identity rewrites', () => {
+  const fx = relationshipFixture();
+  const original = fs.readFileSync(fx.file);
+  fs.writeFileSync(fx.file, Buffer.alloc(original.length, 120));
+  assert.deepEqual(drainRelationships(fx.receipts.relationships(fx.catalog)), []);
+});
+
+test('publication rechecks changed catalog scope', () => {
+  const fx = relationshipFixture();
+  let lookups = 0;
+  assert.deepEqual(
+    drainRelationships(fx.receipts.relationships(() => (++lookups === 1 ? fx.catalog : [fx.catalog[0]]))),
+    [],
+  );
+  assert.equal(drainRelationships(fx.receipts.relationships(fx.catalog)).length, 1);
+});
+
+test('receipt readers recheck early evidence after partial source reads', () => {
+  const fx = relationshipFixture();
+  const original = fs.readSync;
+  const source = fs.statSync(fx.file, { bigint: true });
+  let changed = false;
+  vi.spyOn(fs, 'readSync').mockImplementation(((
+    ...args: [number, NodeJS.ArrayBufferView, number, number, number | null]
+  ) => {
+    const count = Reflect.apply(original, fs, args) as number;
+    if (!changed && fs.fstatSync(args[0], { bigint: true }).ino === source.ino) {
+      changed = true;
+      fs.writeFileSync(path.join(fx.receipts.root, `${fx.launch.launchId}.accepted.json`), '{}');
+    }
+    return count;
+  }) as typeof fs.readSync);
+  syncBuiltinESMExports();
+  assert.deepEqual(drainRelationships(fx.receipts.relationships(fx.catalog)), []);
+  assert.equal(changed, true);
+});
+
+test.each(
+  (['claude', 'codex'] as const).flatMap((provider) =>
+    (['append', 'siblings', 'rewrite', 'rewrite-growth', 'shrink', 'replace', 'cwd', 'redirect'] as const).map(
+      (mode) => ({ provider, mode }),
+    ),
+  ),
+)('receipt reader preserves $provider source evidence for $mode', ({ provider, mode }) => {
+  const current = relationshipFixture('codex', provider);
+  const sourceStat = fs.statSync(current.file, { bigint: true });
+  const read = fs.readSync;
+  let touched = false;
+  vi.spyOn(fs, 'readSync').mockImplementation(((
+    ...args: [number, NodeJS.ArrayBufferView, number, number, number | null]
+  ) => {
+    const count = Reflect.apply(read, fs, args) as number;
+    if (!touched && count > 0 && fs.fstatSync(args[0], { bigint: true }).ino === sourceStat.ino) {
+      touched = true;
+      if (mode === 'append') fs.appendFileSync(current.file, 'appended');
+      if (mode === 'siblings') {
+        fs.writeFileSync(path.join(current.receipts.root, 'parallel.lock'), 'lock');
+        fs.writeFileSync(path.join(current.receipts.root, current.launch.launchId, 'checkpoint.json'), '{}');
+      }
+      if (mode === 'rewrite' || mode === 'rewrite-growth') {
+        const fd = fs.openSync(current.file, 'r+');
+        fs.writeSync(fd, Buffer.from('!'), 0, 1, 0);
+        fs.closeSync(fd);
+        if (mode === 'rewrite-growth') fs.appendFileSync(current.file, 'growth');
+      }
+      if (mode === 'shrink') fs.truncateSync(current.file, current.opening.length - 1);
+      if (mode === 'replace') {
+        fs.renameSync(current.file, current.file + '.old');
+        fs.writeFileSync(current.file, current.opening);
+      }
+      if (mode === 'redirect') {
+        fs.renameSync(current.file, current.file + '.old');
+        fs.symlinkSync(current.file + '.old', current.file);
+      }
+    }
+    return count;
+  }) as typeof fs.readSync);
+  if (mode === 'cwd') {
+    const realpath = fs.realpathSync.native;
+    vi.spyOn(fs.realpathSync, 'native').mockImplementation((file) =>
+      String(file) === current.home ? current.home + '.different' : realpath(file),
+    );
+  }
+  syncBuiltinESMExports();
+  const references = drainRelationships(current.receipts.relationships(current.catalog), 11);
+  assert.equal(references.length, mode === 'siblings' ? 1 : 0, `${provider} ${mode}`);
+  if (mode !== 'cwd') assert.equal(touched, true);
+  vi.restoreAllMocks();
+  syncBuiltinESMExports();
+});
+
+test.each(['changing', 'other-launch', 'later-quiet'] as const)('source deferral permits %s progress', (assertion) => {
+  const growing = relationshipFixture();
+  const other = relationshipFixture();
+  const otherId = 'f1234567-1234-1234-1234-123456789abc';
+  const later = growing.receipts.reserve({ ...other.launch });
+  const { launchId: _otherLaunch, ...startup } = JSON.parse(
+    fs.readFileSync(path.join(other.receipts.root, other.launch.launchId, 'startup.json'), 'utf8'),
+  );
+  growing.receipts.startup(later.launchId, startup);
+  growing.receipts.standaloneSession(later.launchId, otherId);
+  const catalog = [...growing.catalog, { ...other.catalog[1], sessionId: otherId }];
+  const sourceStat = fs.statSync(growing.file, { bigint: true });
+  const originalRead = fs.readSync;
+  let appends = 0;
+  vi.spyOn(fs, 'readSync').mockImplementation(((
+    ...args: [number, NodeJS.ArrayBufferView, number, number, number | null]
+  ) => {
+    const count = Reflect.apply(originalRead, fs, args) as number;
+    if (count > 0 && fs.fstatSync(args[0], { bigint: true }).ino === sourceStat.ino) {
+      fs.appendFileSync(growing.file, 'x');
+      appends++;
+    }
+    return count;
+  }) as typeof fs.readSync);
+  syncBuiltinESMExports();
+  const references = drainRelationships(growing.receipts.relationships(catalog), 11);
+  assert.ok(appends > 0);
+  if (assertion === 'changing')
+    assert.equal(
+      references.some((reference) => reference.sessionId === turn),
+      false,
+    );
+  if (assertion === 'other-launch')
+    assert.equal(
+      references.some((reference) => reference.sessionId === otherId),
+      true,
+    );
+  vi.restoreAllMocks();
+  syncBuiltinESMExports();
+  if (assertion === 'later-quiet')
+    assert.equal(drainRelationships(growing.receipts.relationships(catalog), 11).length, 2);
+});
+
+test.each(['short', 'throw', 'unqualified'] as const)('requested byte charges survive %s reads', (mode) => {
+  const fx = relationshipFixture();
+  const originalRead = fs.readSync;
+  const readWindow = openReadWindow();
+  let requested = 0;
+  let returned = 0;
+  let attempts = 0;
+  vi.spyOn(fs, 'readSync').mockImplementation(((
+    ...args: [number, NodeJS.ArrayBufferView, number, number, number | null]
+  ) => {
+    requested += args[3];
+    attempts++;
+    if (mode === 'throw') throw new Error('injected read failure');
+    const count = Reflect.apply(originalRead, fs, [args[0], args[1], args[2], Math.min(args[3], 1), args[4]]) as number;
+    returned += count;
+    if (mode === 'unqualified') (args[1] as Buffer).fill(33, args[2], args[2] + count);
+    return count;
+  }) as typeof fs.readSync);
+  syncBuiltinESMExports();
+  const scan = fx.receipts.relationship(fx.launch.launchId, fx.catalog);
+  const references = [];
+  let completed = false;
+  for (let step = 0; step < 100_000; step++) {
+    const before = requested;
+    const next = scan.next({ bytes: 13, entries: 1, checks: 1 });
+    if (next.done) {
+      completed = true;
+      break;
+    }
+    assert.equal(next.value.bytes, requested - before);
+    if (next.value.reference) references.push(next.value.reference);
+  }
+  scan.return(null);
+  assert.equal(completed, true);
+  assert.ok(attempts > 0);
+  assert.ok(requested > returned);
+  assert.equal(closeReadWindow(readWindow).bytes, returned);
+  assert.equal(references.length, mode === 'short' ? 1 : 0);
+});
+
+test('receipt anchor digests reject same-identity receipt edits', () => {
+  const fx = relationshipFixture();
+  const file = path.join(fx.receipts.root, fx.launch.launchId, 'receipt.json');
+  const receipt = JSON.parse(fs.readFileSync(file, 'utf8'));
+  receipt.standalone.name = 'changed name';
+  fs.writeFileSync(file, JSON.stringify(receipt));
+  assert.deepEqual(drainRelationships(fx.receipts.relationships(fx.catalog)), []);
+});
+
+test('receipt readers reject changed committed digests', () => {
+  const fx = relationshipFixture();
+  const file = path.join(fx.receipts.root, `${fx.launch.launchId}.accepted.json`);
+  const witness = JSON.parse(fs.readFileSync(file, 'utf8'));
+  fs.writeFileSync(file, JSON.stringify({ ...witness, sha256: '0'.repeat(64) }));
+  assert.deepEqual(drainRelationships(fx.receipts.relationships(fx.catalog)), []);
+});
+
+test('opened receipt descriptors enforce the JSON limit before body reads', () => {
+  const fx = relationshipFixture();
+  const originalOpen = fs.openSync;
+  const originalStat = fs.fstatSync;
+  const originalRead = fs.readSync;
+  const anchor = path.join(fx.receipts.root, `${fx.launch.launchId}.json`);
+  let descriptor: number | undefined;
+  let oversized = false;
+  let bodyReads = 0;
+  vi.spyOn(fs, 'openSync').mockImplementation((file, ...args) => {
+    const fd = originalOpen(file, ...args);
+    if (String(file) === anchor) descriptor = fd;
+    return fd;
+  });
+  vi.spyOn(fs, 'fstatSync').mockImplementation(((fd: number, options: any) => {
+    const stat = originalStat(fd, options);
+    if (fd !== descriptor) return stat;
+    oversized = true;
+    return Object.assign(Object.create(Object.getPrototypeOf(stat)), stat, {
+      size: BigInt(48 * 1024 + 1),
+      isFile: () => true,
+    });
+  }) as typeof fs.fstatSync);
+  vi.spyOn(fs, 'readSync').mockImplementation(((
+    ...args: [number, NodeJS.ArrayBufferView, number, number, number | null]
+  ) => {
+    if (args[0] === descriptor) bodyReads++;
+    return Reflect.apply(originalRead, fs, args);
+  }) as typeof fs.readSync);
+  syncBuiltinESMExports();
+  assert.deepEqual(drainRelationships(fx.receipts.relationship(fx.launch.launchId, fx.catalog), 64 * 1024), []);
+  assert.equal(oversized, true);
+  assert.equal(bodyReads, 0);
+});
+
+test.each(['directory', 'receipt'] as const)(
+  'cancellation during %s opening closes the returned resource',
+  (resource) => {
+    const fx = relationshipFixture();
+    const controller = new AbortController();
+    const originalDirectory = fs.opendirSync;
+    const originalOpen = fs.openSync;
+    const originalClose = fs.closeSync;
+    let directoryClosed = false;
+    let receiptClosed = false;
+    let target: number | undefined;
+    vi.spyOn(fs, 'opendirSync').mockImplementation((...args) => {
+      const directory = Reflect.apply(originalDirectory, fs, args);
+      const close = directory.closeSync.bind(directory);
+      vi.spyOn(directory, 'closeSync').mockImplementation(() => {
+        directoryClosed = true;
+        close();
+      });
+      if (resource === 'directory') controller.abort();
+      return directory;
+    });
+    vi.spyOn(fs, 'openSync').mockImplementation((...args) => {
+      const fd = Reflect.apply(originalOpen, fs, args);
+      if (resource === 'receipt') {
+        target = fd;
+        controller.abort();
+      }
+      return fd;
+    });
+    vi.spyOn(fs, 'closeSync').mockImplementation((fd) => {
+      if (fd === target) receiptClosed = true;
+      originalClose(fd);
+    });
+    syncBuiltinESMExports();
+    const scan = fx.receipts.relationships(fx.catalog, controller.signal);
+    for (let step = 0; step < 10_000 && !controller.signal.aborted; step++)
+      scan.next({ entries: 1, bytes: 11, checks: 1 });
+    const closedWhenCanceled = resource === 'directory' ? directoryClosed : receiptClosed;
+    scan.return();
+    assert.equal(controller.signal.aborted, true);
+    assert.equal(closedWhenCanceled, true);
+  },
+);
+
+test('an already canceled scan performs no bounded filesystem step', () => {
+  const fx = relationshipFixture();
+  const controller = new AbortController();
+  const stat = vi.spyOn(fs, 'lstatSync');
+  syncBuiltinESMExports();
+  const scan = fx.receipts.relationships(fx.catalog, controller.signal);
+  controller.abort();
+  assert.deepEqual(drainRelationships(scan, 11), []);
+  assert.equal(stat.mock.calls.length, 0);
+});
+
+test('cancellation at the final catalog lookup suppresses publication', () => {
+  const fx = relationshipFixture();
+  const controller = new AbortController();
+  let lookups = 0;
+  const catalog = () => {
+    if (++lookups === 2) controller.abort();
+    return fx.catalog;
+  };
+  assert.deepEqual(drainRelationships(fx.receipts.relationships(catalog, controller.signal), 11), []);
+  assert.equal(lookups, 2);
+});
+
+test.each([false, true])('cancellation closes partial descriptors for native source=%s', (source) => {
+  const fx = relationshipFixture();
+  const controller = new AbortController();
+  const originalOpen = fs.openSync;
+  const opened = new Set<number>();
+  const closed = new Set<number>();
+  let target: number | undefined;
+  let partial = false;
+  let reads = 0;
+  vi.spyOn(fs, 'openSync').mockImplementation((file, ...args) => {
+    const fd = Reflect.apply(originalOpen, fs, [file, ...args]);
+    opened.add(fd);
+    closed.delete(fd);
+    if ((String(file) === fx.file) === source) target = fd;
+    return fd;
+  });
+  const originalClose = fs.closeSync;
+  const originalRead = fs.readSync;
+  vi.spyOn(fs, 'readSync').mockImplementation(((
+    ...args: [number, NodeJS.ArrayBufferView, number, number, number | null]
+  ) => {
+    reads++;
+    const count = Reflect.apply(originalRead, fs, args) as number;
+    if (args[0] === target && count > 0) partial = true;
+    return count;
+  }) as typeof fs.readSync);
+  vi.spyOn(fs, 'closeSync').mockImplementation((fd) => {
+    closed.add(fd);
+    originalClose(fd);
+  });
+  syncBuiltinESMExports();
+  const scan = fx.receipts.relationships(fx.catalog, controller.signal);
+  for (let steps = 0; steps < 100_000; steps++) {
+    scan.next({ bytes: 11, checks: 1, entries: 1 });
+    if (partial) break;
+  }
+  assert.notEqual(target, undefined);
+  assert.equal(partial, true);
+  const beforeAbort = reads;
+  controller.abort();
+  const closedAtAbort = closed.has(target!);
+  const remaining = drainRelationships(scan, 11);
+  const readsAfterAbort = reads;
+  scan.return();
+  assert.ok(closedAtAbort);
+  assert.deepEqual(remaining, []);
+  assert.equal(readsAfterAbort, beforeAbort);
+  assert.ok([...opened].every((fd) => closed.has(fd)));
+  vi.restoreAllMocks();
+  syncBuiltinESMExports();
+});
 
 test.each(['live', 'uncertain', 'dead', 'legacy', 'malformed'] as const)(
   'native release retains exclusive pending witness ownership: %s',

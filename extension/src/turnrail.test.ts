@@ -11,6 +11,7 @@ import {
   agentRunAnswer,
   clampRailWidth,
   dispatchedParents,
+  admittedDispatchReferences,
   sessionParentEdgesAmong,
   sessionParentIndex,
   sessionParentsKey,
@@ -2395,6 +2396,68 @@ test('a session this window started stays parsed while the reader reads another'
     cut,
     ['sess-new', 'sess-mine'],
     'a session the panel started leaves the cut as soon as the reader looks at another',
+  );
+});
+
+test('receipt admission shares parent conflicts, duplicate ownership and self-link policy', () => {
+  const reference = {
+    kind: 'dispatch' as const,
+    agent: 'codex' as const,
+    parentSessionId: 'parent',
+    sessionId: 'child',
+    file: '/child.jsonl',
+    toolUseIds: [],
+    name: 'worker',
+    owned: false,
+  };
+  assert.deepEqual(admittedDispatchReferences([reference, { ...reference, owned: true }]), [
+    { ...reference, owned: true },
+  ]);
+  assert.deepEqual(admittedDispatchReferences([reference, { ...reference, parentSessionId: 'other' }]), []);
+  assert.deepEqual(admittedDispatchReferences([{ ...reference, parentSessionId: 'child' }]), []);
+  assert.deepEqual(admittedDispatchReferences([reference], [{ sessionId: 'child', parentSessionId: 'parent' }]), []);
+  assert.deepEqual(
+    admittedDispatchReferences(
+      [reference],
+      [],
+      [{ threadId: 'child', parentThreadId: 'parent', backgroundReview: false }],
+    ),
+    [],
+  );
+  assert.deepEqual(admittedDispatchReferences([{ ...reference, file: null }]), []);
+  const subagent = {
+    parentSessionId: 'native-parent',
+    sessionId: 'native-child',
+    file: '/native.jsonl',
+    toolUseIds: ['native-tool'],
+  };
+  assert.deepEqual(admittedDispatchReferences([subagent, reference]), [subagent, reference]);
+  assert.equal(admittedDispatchReferences([subagent])[0], subagent);
+  const unresolved = { ...reference, file: null, parentSessionId: 'unresolved-parent' };
+  assert.deepEqual(admittedDispatchReferences([reference, unresolved]), []);
+  assert.deepEqual(admittedDispatchReferences([unresolved, reference]), []);
+  const native = { ...reference, name: 'native name', toolUseIds: ['native-one'] };
+  for (const pair of [
+    [reference, native],
+    [native, reference],
+  ]) {
+    const admitted = admittedDispatchReferences(pair)[0];
+    assert.deepEqual(admitted.toolUseIds, ['native-one']);
+    assert.ok(admitted.kind === 'dispatch');
+    assert.equal(admitted.name, pair[0].name);
+    assert.deepEqual(admittedDispatchReferences([...pair, { ...native, toolUseIds: ['native-two'] }])[0].toolUseIds, [
+      'native-one',
+      'native-two',
+    ]);
+    assert.deepEqual(admittedDispatchReferences([...pair, { ...native, file: '/other.jsonl' }]), []);
+  }
+  assert.equal(
+    admittedDispatchReferences(
+      [reference],
+      [],
+      [{ threadId: 'child', parentThreadId: 'parent', backgroundReview: true }],
+    ).length,
+    1,
   );
 });
 

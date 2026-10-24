@@ -1,12 +1,14 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
-import { randomBytes, randomUUID } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { writeFileAtomically } from './atomicfile';
 import { arcHome } from './store';
 import { payloadSha256, type RequesterIdentity } from './sessionwrites';
 import type { LaunchPolicy } from './launchpolicy';
 import { canonicalToolPath } from './toolownership';
+import { meterRead } from './readmeter';
+import type { ClaudeDispatchSessionReference, SessionFile } from './transcript';
 
 export const DISPATCH_ID = /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/;
 export const DISPATCH_TEXT_LIMIT = 16_000;
@@ -116,9 +118,11 @@ function equalIdentity(a: FileIdentity, b: FileIdentity): boolean {
 }
 export function safeDispatchPath(file: string, platform = process.platform): void {
   const paths = platform === 'win32' ? path.win32 : path.posix;
+  const normalized = (value: string) =>
+    platform === 'win32' ? paths.resolve(value).toLowerCase() : paths.resolve(value);
   let current = paths.resolve(file);
   while (true) {
-    if ([os.homedir(), os.tmpdir()].some((base) => current === paths.resolve(base))) break;
+    if ([os.homedir(), os.tmpdir()].some((base) => normalized(current) === normalized(base))) break;
     if (platform === 'darwin' && current === '/tmp' && fs.realpathSync.native(current) === '/private/tmp') break;
     const stat = fs.lstatSync(current);
     if (stat.isSymbolicLink()) throw new Error('The dispatch path is redirected.');
@@ -189,11 +193,335 @@ function statusLaunch(launch: DispatchLaunch) {
   };
 }
 
+export interface DispatchRelationshipAllowance {
+  entries: number;
+  bytes: number;
+  checks: number;
+}
+export interface DispatchRelationshipStep extends DispatchRelationshipAllowance {
+  reference?: ClaudeDispatchSessionReference;
+}
+type RelationshipScan<T> = Generator<DispatchRelationshipStep, T, DispatchRelationshipAllowance>;
+const emptyRelationshipStep = (): DispatchRelationshipStep => ({ entries: 0, bytes: 0, checks: 0 });
+
+// Each next call grants one filesystem operation. Zero grants preserve its position.
+class RelationshipReader {
+  progress = emptyRelationshipStep();
+  readonly revisions = new Map<string, string | null>();
+  private readonly descriptors = new Set<number>();
+  constructor(
+    readonly signal?: AbortSignal,
+    readonly platform = process.platform,
+  ) {
+    signal?.addEventListener('abort', this.close, { once: true });
+  }
+  close = (): void => {
+    for (const fd of this.descriptors) fs.closeSync(fd);
+    this.descriptors.clear();
+  };
+  dispose(): void {
+    this.signal?.removeEventListener('abort', this.close);
+    this.close();
+  }
+  *operation<T>(kind: keyof DispatchRelationshipAllowance, work: (allowance: number) => T): RelationshipScan<T> {
+    let allowance = yield this.progress;
+    this.progress = emptyRelationshipStep();
+    while (!this.signal?.aborted && (!allowance || !Number.isSafeInteger(allowance[kind]) || allowance[kind] < 1))
+      allowance = yield emptyRelationshipStep();
+    if (this.signal?.aborted) throw new Error('The dispatch relationship scan stopped.');
+    if (kind !== 'bytes') this.progress[kind] = 1;
+    return work(allowance[kind]);
+  }
+  *stat(file: string): RelationshipScan<fs.BigIntStats | null> {
+    const stat = yield* this.operation('checks', () => {
+      try {
+        return fs.lstatSync(file, { bigint: true });
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+        throw error;
+      }
+    });
+    if (stat?.isSymbolicLink()) throw new Error('The dispatch path is redirected.');
+    const revision = stat
+      ? stat.isDirectory()
+        ? `${stat.dev}:${stat.ino}:directory`
+        : `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`
+      : null;
+    if (this.revisions.has(file) && this.revisions.get(file) !== revision)
+      throw new Error('The dispatch relationship evidence changed.');
+    this.revisions.set(file, revision);
+    return stat;
+  }
+  *path(file: string): RelationshipScan<void> {
+    // safeDispatchPath owns the synchronous counterpart of this resumable path contract.
+    const paths = this.platform === 'win32' ? path.win32 : path.posix;
+    const normalized = (value: string) =>
+      this.platform === 'win32' ? paths.resolve(value).toLowerCase() : paths.resolve(value);
+    for (let current = paths.resolve(file); ; current = paths.dirname(current)) {
+      if ([os.homedir(), os.tmpdir()].some((base) => normalized(current) === normalized(base))) break;
+      if (this.platform === 'darwin' && current === '/tmp') {
+        const physical = yield* this.operation('checks', () => fs.realpathSync.native(current));
+        if (physical === '/private/tmp') break;
+      }
+      if (!(yield* this.stat(current))) throw new Error('The dispatch relationship path is unavailable.');
+      if (current === paths.dirname(current)) break;
+    }
+  }
+  *read(file: string, prefix?: StandaloneStartup): RelationshipScan<string> {
+    yield* this.path(file);
+    const before = yield* this.stat(file);
+    if (!before?.isFile() || (!prefix && before.size > BigInt(JSON_BYTES)))
+      throw new Error('The dispatch relationship file is unavailable.');
+    const fd = yield* this.operation('checks', () => {
+      const opened = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+      this.descriptors.add(opened);
+      if (this.signal?.aborted) {
+        this.close();
+        throw new Error('The dispatch relationship scan stopped.');
+      }
+      return opened;
+    });
+    try {
+      const stat = yield* this.operation('checks', () => fs.fstatSync(fd, { bigint: true }));
+      if (stat.dev !== before.dev || stat.ino !== before.ino || !stat.isFile())
+        throw new Error('The dispatch relationship file was replaced.');
+      if (!prefix && stat.size > BigInt(JSON_BYTES)) throw new Error('The dispatch relationship file is unavailable.');
+      const length = prefix ? prefix.bytes : Number(stat.size);
+      if (prefix && (`${stat.dev}:${stat.ino}` !== prefix.identity || stat.size < BigInt(length)))
+        throw new Error('The original dispatch source changed.');
+      if (prefix && (stat.size !== before.size || stat.mtimeNs !== before.mtimeNs || stat.ctimeNs !== before.ctimeNs))
+        throw new Error('The dispatch relationship file changed during validation.');
+      const chunks: Buffer[] = [];
+      const digest = createHash('sha256');
+      let position = 0;
+      while (position < length) {
+        const bytes = yield* this.operation('bytes', (remaining) => {
+          const buffer = Buffer.allocUnsafe(Math.min(remaining, 64 * 1024, length - position));
+          this.progress.bytes = buffer.length;
+          const count = fs.readSync(fd, buffer, 0, buffer.length, position);
+          meterRead(file, count, position);
+          return buffer.subarray(0, count);
+        });
+        if (!bytes.length) throw new Error('The dispatch relationship file ended during validation.');
+        position += bytes.length;
+        digest.update(bytes);
+        if (!prefix) chunks.push(bytes);
+      }
+      const after = yield* this.operation('checks', () => fs.fstatSync(fd, { bigint: true }));
+      if (
+        !after.isFile() ||
+        after.dev !== stat.dev ||
+        after.ino !== stat.ino ||
+        stat.size !== after.size ||
+        stat.mtimeNs !== after.mtimeNs ||
+        stat.ctimeNs !== after.ctimeNs
+      )
+        throw new Error('The dispatch relationship file changed during validation.');
+      if (prefix && digest.digest('hex') !== prefix.sha256) throw new Error('The original dispatch source changed.');
+      yield* this.stat(file);
+      return prefix ? '' : new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(Buffer.concat(chunks));
+    } finally {
+      if (this.descriptors.delete(fd)) fs.closeSync(fd);
+    }
+  }
+  *recheck(): RelationshipScan<void> {
+    for (const file of this.revisions.keys()) yield* this.stat(file);
+  }
+}
+
 // Native records supply response and usage evidence. These files retain launch and consumption identity only.
 export class DispatchReceipts {
   readonly root: string;
-  constructor(home = arcHome()) {
-    this.root = path.join(path.resolve(home), 'dispatch');
+  constructor(
+    home = arcHome(),
+    readonly platform = process.platform,
+  ) {
+    const paths = platform === 'win32' ? path.win32 : path.posix;
+    this.root = paths.join(paths.resolve(home), 'dispatch');
+  }
+  // The first next call yields without reading. Each later call needs a remaining work allowance.
+  *relationship(
+    id: string,
+    catalog: readonly SessionFile[] | (() => readonly SessionFile[]),
+    signal?: AbortSignal,
+  ): RelationshipScan<ClaudeDispatchSessionReference | null> {
+    const reader = new RelationshipReader(signal, this.platform);
+    try {
+      const reference = yield* this.readRelationship(id, catalog, reader);
+      yield { ...reader.progress, ...(reference ? { reference } : {}) };
+      reader.progress = emptyRelationshipStep();
+      return reference;
+    } catch {
+      yield reader.progress;
+      return null;
+    } finally {
+      reader.dispose();
+    }
+  }
+  // Each iterator is one epoch. New epochs revisit delayed bindings and changed catalog scope.
+  *relationships(
+    catalog: readonly SessionFile[] | (() => readonly SessionFile[]),
+    signal?: AbortSignal,
+  ): RelationshipScan<void> {
+    const reader = new RelationshipReader(signal, this.platform);
+    let directory: fs.Dir | undefined;
+    const close = () => {
+      if (directory) {
+        directory.closeSync();
+        directory = undefined;
+      }
+    };
+    signal?.addEventListener('abort', close, { once: true });
+    try {
+      yield* reader.path(this.root);
+      directory = yield* reader.operation('checks', () => {
+        const opened = fs.opendirSync(this.root, { bufferSize: 1 });
+        directory = opened;
+        if (signal?.aborted) {
+          close();
+          throw new Error('The dispatch relationship scan stopped.');
+        }
+        return opened;
+      });
+      for (;;) {
+        const entry = yield* reader.operation('entries', () => directory!.readSync());
+        yield reader.progress;
+        reader.progress = emptyRelationshipStep();
+        if (!entry) break;
+        if (!entry.isDirectory() || !DISPATCH_ID.test(entry.name)) continue;
+        yield* this.relationship(entry.name, catalog, signal);
+      }
+      yield reader.progress;
+    } catch {
+      yield reader.progress;
+    } finally {
+      signal?.removeEventListener('abort', close);
+      close();
+      reader.dispose();
+    }
+  }
+  private *readRelationship(
+    id: string,
+    catalog: readonly SessionFile[] | (() => readonly SessionFile[]),
+    reader: RelationshipReader,
+  ): RelationshipScan<ClaudeDispatchSessionReference | null> {
+    validId(id);
+    const paths = this.platform === 'win32' ? path.win32 : path.posix;
+    const directory = paths.join(this.root, id);
+    const file = paths.join(directory, 'receipt.json');
+    const anchor = JSON.parse(yield* reader.read(paths.join(this.root, `${id}.json`))) as Anchor;
+    const text = yield* reader.read(file);
+    const folder = yield* reader.stat(directory);
+    const receipt = yield* reader.stat(file);
+    if (
+      !folder?.isDirectory() ||
+      !receipt ||
+      anchor.launchId !== id ||
+      !equalIdentity(anchor.directory, { dev: String(folder.dev), ino: String(folder.ino) }) ||
+      !equalIdentity(anchor.receipt, { dev: String(receipt.dev), ino: String(receipt.ino) }) ||
+      payloadSha256(text) !== anchor.sha256
+    )
+      return null;
+    const launch = JSON.parse(text) as DispatchLaunch;
+    const options = launch.standalone;
+    if (
+      launch.launchId !== id ||
+      !/^[a-f0-9]{24}$/.test(launch.origin) ||
+      launch.transport !== 'standalone' ||
+      !options ||
+      !launch.requester ||
+      !DISPATCH_ID.test(launch.requester.id) ||
+      !['claude', 'codex'].includes(launch.requester.provider) ||
+      !['claude', 'codex'].includes(options.provider) ||
+      typeof options.agentRun !== 'boolean'
+    )
+      return null;
+    const binding = function* (kind: 'accepted' | 'startup'): RelationshipScan<Record<string, unknown>> {
+      const boundFile = paths.join(directory, `${kind}.json`);
+      const boundText = yield* reader.read(boundFile);
+      const witness = JSON.parse(yield* reader.read(paths.join(paths.dirname(directory), `${id}.${kind}.json`)));
+      const stat = yield* reader.stat(boundFile);
+      const value = JSON.parse(boundText);
+      if (
+        !stat ||
+        witness.launchId !== id ||
+        witness.sha256 !== payloadSha256(boundText) ||
+        !equalIdentity(witness.identity, { dev: String(stat.dev), ino: String(stat.ino) }) ||
+        value.launchId !== id
+      )
+        throw new Error('The committed dispatch identity changed.');
+      return value;
+    };
+    for (const refused of [
+      paths.join(directory, 'startup-refused.json'),
+      paths.join(this.root, `${id}.startup-refused.json`),
+      paths.join(this.root, `${id}.startup-refused.accepting.json`),
+    ])
+      if (yield* reader.stat(refused)) return null;
+    const accepted = yield* binding('accepted');
+    if (
+      accepted.provider !== options.provider ||
+      typeof accepted.sessionId !== 'string' ||
+      !DISPATCH_ID.test(accepted.sessionId) ||
+      accepted.submissionId !== 1 ||
+      accepted.nativeTurnId !== null ||
+      (options.sessionHint !== null && options.sessionHint !== accepted.sessionId)
+    )
+      return null;
+    // Either provider needs the producer's durable opening, including older accepted bindings.
+    const startup = (yield* binding('startup')) as unknown as StandaloneStartup;
+    if (
+      ![startup.file, startup.ancestor, startup.cwd].every(
+        (value) => typeof value === 'string' && paths.isAbsolute(value),
+      ) ||
+      ![startup.identity, startup.directory].every((value) => typeof value === 'string' && /^\d+:\d+$/.test(value)) ||
+      !Number.isSafeInteger(startup.bytes) ||
+      startup.bytes < 1 ||
+      startup.bytes > 49 * 1024 * 1024 ||
+      !TOKEN.test(startup.sha256)
+    )
+      return null;
+    const lookup = () => {
+      const sessions = typeof catalog === 'function' ? catalog() : catalog;
+      const parents = sessions.filter(
+        (value) => value.agent === launch.requester!.provider && value.sessionId === launch.requester!.id,
+      );
+      const children = sessions.filter(
+        (value) => value.agent === options.provider && value.sessionId === accepted.sessionId,
+      );
+      return parents.length === 1 && children.length === 1 ? { parent: parents[0], child: children[0] } : null;
+    };
+    const scoped = lookup();
+    if (!scoped || scoped.child.childTranscript || scoped.parent.sessionId === accepted.sessionId) return null;
+    const normalize = (value: string) =>
+      this.platform === 'win32' ? paths.resolve(value).toLowerCase() : paths.resolve(value);
+    if (normalize(startup.file) !== normalize(scoped.child.file)) return null;
+    yield* reader.path(startup.ancestor);
+    const ancestor = yield* reader.stat(startup.ancestor);
+    yield* reader.path(options.cwd);
+    const cwd = yield* reader.operation('checks', () => fs.realpathSync.native(options.cwd));
+    if (!ancestor?.isDirectory() || `${ancestor.dev}:${ancestor.ino}` !== startup.directory || cwd !== startup.cwd)
+      return null;
+    yield* reader.read(startup.file, startup);
+    yield* reader.recheck();
+    const current = lookup();
+    if (
+      reader.signal?.aborted ||
+      !current ||
+      current.child.childTranscript ||
+      normalize(current.child.file) !== normalize(scoped.child.file)
+    )
+      return null;
+    return {
+      kind: 'dispatch',
+      agent: options.provider,
+      parentSessionId: current.parent.sessionId,
+      sessionId: accepted.sessionId,
+      file: current.child.file,
+      toolUseIds: [],
+      name: options.name,
+      owned: !options.agentRun,
+    };
   }
   reserve(
     input: Omit<DispatchLaunch, 'launchId' | 'transport'> & { transport?: DispatchLaunch['transport'] },
