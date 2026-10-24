@@ -1,28 +1,62 @@
 # Arc CLI
 
-The Arc CLI is experimental. npm publication is deferred.
-
-Install `arc` for saved session costs, a Claude Code status line, and session commands through a running Arc window. The [CLI guide](https://github.com/glin/arc/blob/main/docs/cli.md) provides command examples and troubleshooting. The [CLI reference](https://github.com/glin/arc/blob/main/docs/cli-reference.md) defines output contracts and limits.
+Arc CLI lets you start, inspect, and organize Claude Code and Codex sessions from your terminal. It also reports saved session costs and supplies a Claude Code status line.
 
 ## Install
 
-The Arc VSIX supplies matching private commands. In a local integrated terminal, `arc` can select its owning window without `--window` or `ARC_WINDOW`, as the [CLI guide](../docs/cli.md#windows) describes. Standalone installation uses npm.
+The Arc extension includes `arc` for sessions it starts and new integrated terminals. For other terminals, [build and install the standalone package](#build-from-source). The installed command requires Node.js 18 or later.
 
-Requires Node.js 18 or later. [Build from source](#build-from-source) and install the local tarball.
+## Commands
 
-The package installs the `arc` command.
+List sessions in a running Arc window, then read one:
+
+```sh
+arc windows --json
+arc sessions --window WINDOW_ID --json
+arc session SESSION_ID --window WINDOW_ID --json
+```
+
+Replace `WINDOW_ID` with the intended window's `hostId` and `SESSION_ID` with an ID from its session list. Local integrated terminals select their owning window automatically. See [window selection](../docs/cli.md#windows) for external shells and explicit selectors.
+
+Read a saved session's costs without an Arc window:
+
+```sh
+arc cost SESSION_ID --by-model
+```
+
+Use a Claude Code or Codex session ID. Cost reports also accept a transcript or rollout file path.
+
+For session management and standalone launches, start with command help:
+
+```sh
+arc --help
+arc start --help
+arc run --help
+```
+
+`arc start` uses a running Arc window. `arc run` launches an agent without one. The [CLI guide](https://github.com/glin/arc/blob/main/docs/cli.md) covers examples and troubleshooting. The [CLI reference](https://github.com/glin/arc/blob/main/docs/cli-reference.md) defines JSON fields and command limits.
 
 ## Session skill
 
-The package includes the canonical `skills/arc-sessions` directory and its resources. npm installation does not write native agent configuration. Install independent copies explicitly:
+Install the bundled `arc-sessions` skill to let Claude Code and Codex agents manage sessions through Arc:
 
 ```sh
 arc skills install --agent claude --agent codex
-arc skills update --agent claude --agent codex
-arc skills remove --agent claude --agent codex
 ```
 
-These commands support default personal destinations. [Skill ownership and recovery](../docs/arc-sessions.md#install-the-parts-you-need) defines preserved copies and interruption handling. For a manually maintained custom destination, link the packaged directory. Claude Code uses `~/.claude/skills`. Codex uses `~/.agents/skills`. When one of these folders is a link, such as `~/.agents/skills` linked to `~/.claude/skills`, Arc writes nothing through it. That agent uses the skill at the link's target, so install it there.
+After updating the CLI, update its installed skill copies:
+
+```sh
+arc skills update --agent claude --agent codex
+```
+
+These commands use `~/.claude/skills` for Claude Code and `~/.agents/skills` for Codex. If either folder links to the other, install at the link's target. Arc never writes through linked skill folders. Restart the agent session to load the skill.
+
+Installation preserves existing manual copies and links. See [skill installation and recovery](../docs/arc-sessions.md#install-the-parts-you-need) for ownership rules and interrupted operations.
+
+### Manual links
+
+For a custom installation, link the packaged `skills/arc-sessions` directory into your agent's skill folder.
 
 For a global Windows installation, run in PowerShell:
 
@@ -42,7 +76,7 @@ ln -s "$arc_skill" ~/.claude/skills/arc-sessions
 ln -s "$arc_skill" ~/.agents/skills/arc-sessions
 ```
 
-A source checkout supplies the same skill under `cli/skills/arc-sessions`. A project-local package supplies it under `node_modules/@glin/arc/skills/arc-sessions`. Use that absolute directory as the link target. Existing links require a separate removal before replacement. Restart the agent session to load the skill.
+A source checkout provides `cli/skills/arc-sessions`. A project-local package provides `node_modules/@glin/arc/skills/arc-sessions`. Use the directory's absolute path as the link target. Remove an existing link before replacing it.
 
 ## Status-line setup
 
@@ -58,27 +92,27 @@ Add `statusLine` to your Claude Code settings in `~/.claude/settings.json`:
 }
 ```
 
-The command reads Claude Code's JSON from stdin. Available figures include the model, workspace, context, cache expiry, session cost, duration, and account limits.
+The status line shows available model, workspace, context, cache, cost, duration, and account-limit information from Claude Code.
 
-| Option            | Output                                                               |
-| ----------------- | -------------------------------------------------------------------- |
-| `--next-turn`     | Only the next turn's starting price, for use in another status line. |
-| `--json`          | A JSON snapshot with schema version 1.                               |
-| `--width COLUMNS` | Less text detail for a narrower terminal.                            |
+| Option            | Output                                 |
+| ----------------- | -------------------------------------- |
+| `--next-turn`     | Only the next-turn starting price.     |
+| `--json`          | A JSON snapshot with schema version 1. |
+| `--width COLUMNS` | Less detail for a narrower terminal.   |
 
-Use either `--next-turn` or `--json`. Width also reads the `COLUMNS` environment variable. Required figures can exceed the requested width.
+Do not combine `--next-turn` and `--json`. Width defaults to the `COLUMNS` environment variable. Required figures can exceed the requested width.
 
-The next-turn price estimates the minimum cost of sending the existing context again, including the latest answer. It excludes your next prompt and the model's next answer. An unknown cache state uses the uncached estimate. Missing cache fields show an unknown state. Session cost comes from Claude Code.
+The next-turn starting price estimates the minimum cost of resending existing context, including the latest answer. It excludes your next prompt and the model's next answer. Unknown cache state uses the uncached estimate. See [status-line output](../docs/cli-reference.md#status-line) for unavailable figures and rounding.
 
-If Claude Code cannot find `arc`, use the npm-installed bundle's absolute path or a source build. Use forward slashes on Windows. Quote the path to support folders with spaces. The examples below are shell command strings for the `command` setting.
+### When Claude Code cannot find arc
 
-For a global package installation, find the prefix:
+Use an absolute bundle path in the `command` setting. For a global npm installation, find its prefix:
 
 ```sh
 npm prefix --global
 ```
 
-Call the bundle with Node.js. On Windows:
+On Windows, use forward slashes:
 
 ```text
 node "C:/path/to/npm-prefix/node_modules/@glin/arc/dist/arc.cjs" statusline
@@ -90,19 +124,19 @@ On macOS and Linux:
 node "/path/to/npm-prefix/lib/node_modules/@glin/arc/dist/arc.cjs" statusline
 ```
 
-For a source build, install dependencies as described in [Build from source](#build-from-source). Run this command in the checkout:
+For a source checkout, [install dependencies](#build-from-source), then build the bundle:
 
 ```sh
 npm --prefix cli run build
 ```
 
-Call the bundle with Node.js on Windows, macOS, or Linux:
+Use its absolute path on Windows, macOS, or Linux:
 
 ```text
 node "/path/to/checkout/cli/dist/arc.cjs" statusline
 ```
 
-Escape each double quote as `\"` inside the JSON command string. For example:
+Keep the path quoted for folders with spaces. Escape those quotes as `\"` inside JSON:
 
 ```json
 {
@@ -116,9 +150,9 @@ Escape each double quote as `\"` inside the JSON command string. For example:
 
 ### Show the next-turn price in another status line
 
-`arc statusline --next-turn` prints one segment, for example `next turn starts at $0.47`. A status line tool that runs a command with Claude Code's JSON on stdin can show it beside its own segments.
+`arc statusline --next-turn` prints a segment such as `next turn starts at $0.47`. Your status line tool must pass Claude Code's JSON to the command's stdin.
 
-ccstatusline runs a `custom-command` widget this way. Point Claude Code at ccstatusline in `~/.claude/settings.json`:
+For ccstatusline, set the command in `~/.claude/settings.json`:
 
 ```json
 {
@@ -129,7 +163,7 @@ ccstatusline runs a `custom-command` widget this way. Point Claude Code at ccsta
 }
 ```
 
-Then add the widget to a line in `~/.config/ccstatusline/settings.json`. If ccstatusline cannot find `arc`, use an absolute `node` command from above in `commandPath`:
+Add this widget to a line in `~/.config/ccstatusline/settings.json`:
 
 ```json
 {
@@ -140,19 +174,11 @@ Then add the widget to a line in `~/.config/ccstatusline/settings.json`. If ccst
 }
 ```
 
-## Commands
-
-```sh
-arc --help
-arc cost SESSION_ID --by-model
-arc windows --json
-```
-
-Replace `SESSION_ID` with a saved Claude Code or Codex session ID. See the [CLI guide](https://github.com/glin/arc/blob/main/docs/cli.md) for time windows, partial costs, window selection, and session management.
+If ccstatusline cannot find `arc`, use an [absolute bundle command](#when-claude-code-cannot-find-arc) in `commandPath`.
 
 ## Build from source
 
-Source builds use Node.js 20.19+ (20.x) or 22.12+. From the [Arc repository](https://github.com/glin/arc), run:
+Source builds require Node.js 20.19+ (20.x) or 22.12+. From an [Arc repository](https://github.com/glin/arc) checkout, run:
 
 ```sh
 npm --prefix extension install
@@ -161,7 +187,7 @@ npm --prefix cli test
 npm pack ./cli
 ```
 
-`npm pack` builds the bundle and prints the tarball filename. Install that file:
+`npm pack` builds the bundle and prints its tarball filename. Replace `<version>` below with that file's version:
 
 ```sh
 npm install --global ./glin-arc-<version>.tgz
@@ -178,7 +204,15 @@ The offline command uses the installed package without a registry download.
 
 ## Uninstallation
 
-For an npm-installed standalone CLI, run:
+Before uninstalling the CLI, remove skill copies that Arc installed:
+
+```sh
+arc skills remove --agent claude --agent codex
+```
+
+Remove manual `arc-sessions` links yourself. Preserve unfamiliar skill directories.
+
+For a global npm installation:
 
 ```sh
 npm uninstall --global @glin/arc
@@ -190,22 +224,18 @@ For a project-local installation, run in that project:
 npm uninstall @glin/arc
 ```
 
-Remove only the `arc-sessions` links you created in your agents' skill directories. Preserve unfamiliar skill directories.
-
 Remove Claude hooks through its plugin manager:
 
 ```sh
 claude plugin uninstall arc-hooks@arc --scope user
 ```
 
-Remove the `arc` marketplace only when no installed plugin uses it. Local source marketplaces refer to their checkout. Downloaded source and VSIX setup keep owned copies under `${ARC_HOME:-~/.arc}/tools`.
+Remove the `arc` marketplace only when no installed plugin uses it.
 
-Source command setup writes launchers to the selected Arc home's `bin` directory. Remove its owned `arc`, `arc.cmd`, and `run.cjs` files. Remove that exact directory entry from your shell configuration or Windows user PATH if you added it.
+### Source and extension commands
 
-Stop every process using copied releases before removing owned `tools` storage. Confirm its `ownership.json` names the selected Arc home. Preserve unfamiliar files, snapshots, logs, caches, and other user data. Never delete the complete Arc home directory.
+The source setup script installs launchers under the selected Arc home's `bin` directory. Remove its Arc-owned `arc`, `arc.cmd`, and `run.cjs` files. If you added that directory to your shell configuration or Windows user PATH, remove that entry.
 
-## Standalone launches
+Downloaded source and VSIX setup keep copies under the Arc home's `tools` directory. The Arc home defaults to `~/.arc` unless `ARC_HOME` is set. Local source marketplaces refer to their checkout.
 
-Use `arc run --help` for explicit standalone launch settings. The [CLI guide](../docs/cli.md#standalone-launches) describes native receipts, completion, reports, management, and recovery.
-
-`arc send` without `--observation` delivers a literal reader-requested message to an existing live session. Add `--queue` or `-q` for next-turn delivery. Supply `--observation` for a parent-only follow-up. [Session management](../docs/cli.md#follow-ups) defines both forms.
+Stop every process using those copies before removing them. Confirm `tools/ownership.json` names the selected Arc home. Preserve unfamiliar files, snapshots, logs, caches, and other user data. Never delete the complete Arc home directory.
