@@ -1102,12 +1102,17 @@ test.skipIf(process.platform !== 'win32')(
     const requestId = channel.hostId + ':recovery';
     let replacementPid = 0;
     try {
-      const discovered = await response(send('discover'));
-      assert.equal(discovered.data.windows[0].hostId, channel.hostId);
+      await vi.waitFor(
+        async () => {
+          const discovered = await response(send('discover'));
+          assert.equal(discovered.data.windows[0].hostId, channel.hostId);
+        },
+        { timeout: 15_000 },
+      );
       const accepted = send('start', params, requestId);
       await firstWrite;
       assert.equal(writes, 1);
-      process.kill(entry.transportPid!);
+      oldOwner.child.kill();
       const disconnected = await response(accepted);
       assert.equal(disconnected.data.status, 'unknown');
       await vi.waitFor(
