@@ -95,13 +95,15 @@ default_wait_timeout_ms = 1500000
 max_wait_timeout_ms = 3600000
 ```
 
+Keep the floor below your model's documented cache lifetime to reduce expiry risk. Set the default at or above the minimum.
+
 The instruction adds guidance without replacing the built-in prompt. It depends on model compliance and reaches descendants. It leaves a child explicitly asked to sleep free to do so. Completion, messages, and steering still end a v2 wait early. The floor controls the requested timeout, not the minimum elapsed wait. It does not reach a parent that chooses a sleep or shell command.
 
 Check a fresh process and session after installation. Confirm that its developer message contains the text and that its parent uses native waiting.
 
 The table configures the v2 protocol only. A v1 session needs its exposed native wait tool and an explicit long timeout within that tool's limits. The exact instruction above names the v2 tool and is not a tested Bedrock v1 recipe. Provider identity alone does not establish the active protocol. Check the effective model catalog. [The versioned v1 handler](https://github.com/openai/codex/blob/rust-v0.163.0/codex-rs/core/src/tools/handlers/multi_agents/wait.rs) uses fixed timeout constants. [The v2 handler](https://github.com/openai/codex/blob/rust-v0.163.0/codex-rs/core/src/tools/handlers/multi_agents_v2/wait.rs) reads the configured floor.
 
-The [configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference) defines the additive instruction setting. [A community experiment](https://github.com/openai/codex/issues/35108#issuecomment-5552457213) reports the same developer-level exception. Check these version-sensitive wait settings after upgrading Codex.
+The [configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference) defines the additive instruction setting. [A community experiment](https://github.com/openai/codex/issues/35108#issuecomment-5552457213) reports a similar developer-level exception. Check these version-sensitive wait settings after upgrading Codex.
 
 ## Compact or hand off at clear boundaries (split up long tasks)
 

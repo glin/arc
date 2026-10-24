@@ -143,7 +143,7 @@ Claude Code resumes the parent once, when the subagent completes. The parent mak
 
 Codex native waits return on child completion or timeout. Its v2 wait also returns on child messages. The parent also receives pending results through other tool returns, including timer returns. Repeated short waits or sleeps create extra model requests. [Lower agent costs](lowering-agent-costs.md#wait-without-repeated-model-requests) owns the configuration guidance.
 
-`arc cost <path> --by-tool` shows requests that read each tool's results. Its `wait` row includes `wait_agent`, `wait`, and `write_stdin` returns. A parent using `clock.sleep` instead requires checking that tool's row too.
+`arc cost <path> --by-tool` shows requests that read each tool's results. Its `wait` row includes `wait_agent`, `wait`, and `write_stdin` returns. A `clock.sleep` call belongs to `other`. Check that category and the transcript when the parent uses timers.
 
 ## Arc message delivery
 
