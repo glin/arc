@@ -3370,18 +3370,6 @@ export const CONTEXT_BANDS: readonly { at: number; level: ContextLevel; word: st
   { at: 0.9, level: 'nearlyFull', word: 'context nearly full' },
 ];
 
-// Handoff guidance for the newest session-heading context figure.
-// It appears in the top two context bands, selected from the shared band table.
-// Historical turn cards carry no handoff guidance.
-const HANDOFF_SENTENCE = 'This is a place to compact, or to hand the work to a fresh session.';
-
-const HANDOFF_LEVELS: readonly ContextLevel[] = CONTEXT_BANDS.slice(1).map((b) => b.level);
-
-// Converts the shared context-band phrase into hover wording.
-function bandSentence(word: string): string {
-  return `The window is ${word.replace(/^context /, '')}.`;
-}
-
 // Returns the highest context band reached, or null below the first threshold.
 export function bandFor(share: number): { at: number; level: ContextLevel; word: string } | null {
   let found = null;
@@ -3482,7 +3470,6 @@ function contextChip(
       {
         label: when,
         value: `${turn.contextTokens.toLocaleString()} tokens`,
-        ...(word ? { lines: [bandSentence(word)] } : {}),
       },
       ...(subagentEntry ? [subagentEntry] : []),
     ],
@@ -5839,17 +5826,12 @@ function sessionFigureStats(
   if (ctx && current) {
     const share = contextShare(contextTurn);
     const detailList = ctx.detailList!;
-    // Handoff advice belongs to the context level, not to an entry added after it.
     const contextEntry = detailList.entries.find((entry) => entry.label === contextLabel)!;
-    contextEntry.lines = [
-      ...(contextEntry.lines ?? []),
-      ...(ctx.level && HANDOFF_LEVELS.includes(ctx.level) ? [HANDOFF_SENTENCE] : []),
-    ];
     const facts = contextDetailFacts(newest, !current.afterCompaction);
     if (facts.entries.length) {
       facts.entries[0].separateBefore = true;
     }
-    // The facts follow the context level, and the subagent results entry stays last.
+    // The facts follow the recorded context, and the subagent results entry stays last.
     detailList.entries.splice(detailList.entries.indexOf(contextEntry) + 1, 0, ...facts.entries);
     detailList.notes = [
       'Context measures the current level, not cumulative token usage.',

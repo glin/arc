@@ -1632,24 +1632,6 @@ const closingCard = (rows: string[]) => {
 const statOf = (chips: { label: string; detail: string; added?: number; removed?: number }[], starts: string) =>
   chips.find((c) => c.label.startsWith(starts));
 
-// The session-heading context figure carries compaction advice from the second context band upward.
-
-const COMPACT_HERE = 'This is a place to compact, or to hand the work to a fresh session.';
-
-const sessionCtxDetail = (share: number) => {
-  const window = 1_000_000; // opus-5
-  const held = turn({
-    contextTokens: Math.round(window * share),
-    startedAt: 9_000,
-    endedAt: 9_500,
-    summary: '- The work landed.',
-  });
-  return sessionStats([held], [])
-    .find((c) => c.label.includes('ctx'))!
-    .detail.split('\n')
-    .map((line) => line.trim());
-};
-
 // Read the session-heading context detail.
 
 const ctxDetail = (turns: Turn[], compactions: Compaction[] = []) =>
@@ -2882,13 +2864,11 @@ test('the share is rounded down, so 100% is not claimed while the window has roo
   const full = ctxChip(toCard(turn({ contextTokens: 1_000_000, model: 'claude-opus-5' }), false, NOW))!;
   assert.equal(full.label, '100% of 1M ctx (1M)', 'a turn exactly at the window is full');
   assert.match(full.detail, /100% of 1M/);
-  // A full window keeps the highest context band and changes its word and tooltip.
+  // A full window keeps the highest context band and changes its accessible name.
 
   assert.equal(full.level, 'nearlyFull', 'the full window changed band as well as wording');
   assert.equal(full.word, 'context full');
-  assert.match(full.detail, /^\s*The window is full\.$/m);
   assert.equal(nearly.word, 'context nearly full', '99% is not full, and must not be worded as it');
-  assert.match(nearly.detail, /^\s*The window is nearly full\.$/m);
 });
 
 test('the context chip stays a bare count when the model has no known window', () => {
@@ -2928,22 +2908,17 @@ test('the context chip takes its band at each threshold, and stays plain under t
 
   // Context bands travel in level while the figure's kind remains plain.
 
-  const edges: [number, string, string, string][] = [
-    [0.5, 'filling', 'context filling up', 'The window is filling up.'],
-    [0.75, 'gettingFull', 'context getting full', 'The window is getting full.'],
-    [0.9, 'nearlyFull', 'context nearly full', 'The window is nearly full.'],
+  const edges: [number, string, string][] = [
+    [0.5, 'filling', 'context filling up'],
+    [0.75, 'gettingFull', 'context getting full'],
+    [0.9, 'nearlyFull', 'context nearly full'],
   ];
   const below = ['filling', 'gettingFull'];
   for (let i = 0; i < edges.length; i += 1) {
-    const [at, level, word, sentence] = edges[i];
+    const [at, level, word] = edges[i];
     const on = bandAt(at);
     assert.equal(on.level, level, `${at} of the window is not in the ${level} band`);
     assert.equal(on.word, word, `${at} of the window is worded wrong`);
-    assert.match(
-      on.detail,
-      new RegExp('^\\s*' + sentence.replace(/\./g, '\\.') + '$', 'm'),
-      `${at} of the window does not say so on its hover`,
-    );
     assert.equal(on.kind, 'plain', 'the band reached kind, which every other chip is drawn from');
     // One point under, which is the band below, or none at all under the first.
     const under = bandAt(at - 0.01);
@@ -9590,45 +9565,8 @@ test('a turn that spent nothing is not a hole in the total, so the figure keeps 
   assert.doesNotMatch(cost!.detail, /floor/);
 });
 
-test('a crowded session heading says where a boundary could go, from the second band up', () => {
-  // Verbatim, and on a line of its own, on the top two bands.
-  for (const share of [CONTEXT_BANDS[1].at, CONTEXT_BANDS[2].at, 0.99]) {
-    assert.ok(
-      sessionCtxDetail(share).includes(COMPACT_HERE),
-      `a window ${share} full does not say where a boundary could go`,
-    );
-  }
-  // Below the second context band, the session heading omits compaction advice.
-
-  for (const share of [0.1, CONTEXT_BANDS[0].at, CONTEXT_BANDS[1].at - 0.01]) {
-    assert.ok(
-      !sessionCtxDetail(share).includes(COMPACT_HERE),
-      `a window ${share} full is told to compact while most of it is still free`,
-    );
-  }
-  // Session context detail includes no forecast of remaining turns.
-
-  assert.doesNotMatch(sessionCtxDetail(0.95).join('\n'), /turns? (left|remaining)|per turn|room for/);
-});
-
-test('the compaction sentence stays off a turn card, where the moment is already behind the reader', () => {
-  const card = toCard(
-    turn({
-      contextTokens: 800_000,
-      model: 'claude-opus-5',
-      summary: '- The work landed.',
-    }),
-    false,
-    NOW,
-  );
-  assert.equal(
-    ctxChip(card)!.level,
-    'gettingFull',
-    'the fixture is not crowded, so nothing below can see the sentence withheld',
-  );
-  for (const chip of card.chips) {
-    assert.ok(!chip.detail.includes(COMPACT_HERE), 'a turn card names a boundary the reader has already gone past');
-  }
+test('the session context detail includes no forecast of remaining turns', () => {
+  assert.doesNotMatch(ctxDetail([turn({ contextTokens: 950_000 })]), /turns? (left|remaining)|per turn|room for/);
 });
 
 test('the context hover says what the newest turn paid for cached input reads', () => {
@@ -11577,22 +11515,6 @@ test('the session heading context chip shows the current subagent results last',
 
   const after = sessionStats([newest], [compaction({ at: 5000, contextAfter: 20_000 })]);
   assert.equal(subagentResultsEntry(after).entry?.value, '0% (0)', 'a later compaction removed the results');
-});
-
-test('the session heading keeps handoff advice on the context level, above the subagent results', () => {
-  const window = 1_000_000;
-  const held = turn({
-    contextTokens: Math.round(window * 0.8),
-    startedAt: 9_000,
-    endedAt: 9_500,
-    summary: '- The work landed.',
-    subagentContext: { tokens: 6000, partial: false, removed: false, agents: [{ name: 'Reviewer', tokens: 6000 }] },
-  });
-  const { entries, entry } = subagentResultsEntry(sessionStats([held], []));
-  const level = entries.find((item) => item.label === 'Latest recorded context');
-  assert.ok(level?.lines?.includes(COMPACT_HERE), 'the advice stays on the context level');
-  assert.equal(entries.at(-1), entry, 'the subagent results entry stays last');
-  assert.ok(!entry?.lines?.includes(COMPACT_HERE), 'the advice is not under the subagent results');
 });
 
 test('the session heading keeps the subagent results a later compaction retained', () => {
