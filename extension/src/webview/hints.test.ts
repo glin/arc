@@ -88,6 +88,7 @@ afterEach(() => {
 
 function service() {
   vi.stubGlobal('Element', FakeElement);
+  let observed: { callback: MutationCallback; filter: string[] } | null = null;
   const listeners = new Map<string, (event: unknown) => void>();
   const body = new FakeElement();
   const document = {
@@ -105,14 +106,23 @@ function service() {
       },
       window() {},
     },
-    observe() {},
+    observe(_target, callback, init) {
+      observed = { callback, filter: init.attributeFilter ?? [] };
+    },
     setDelay: () => 0 as unknown as ReturnType<typeof setTimeout>,
     clearDelay() {},
   });
   const popover = hints.element as unknown as FakeElement;
   const [title, detail, hintBody] = popover.children as FakeElement[];
   const focus = (anchor: FakeElement): void => listeners.get('focusin')!({ target: anchor });
-  return { hints, popover, title, detail, hintBody, focus };
+  // Report an attribute change on a node the way the browser does: only for an attribute the service observes.
+  const changed = (node: FakeElement, attribute: string): void => {
+    if (observed?.filter.includes(attribute)) {
+      const record = { type: 'attributes', target: node, attributeName: attribute } as unknown as MutationRecord;
+      observed.callback([record], {} as MutationObserver);
+    }
+  };
+  return { hints, popover, title, detail, hintBody, focus, changed };
 }
 
 function anchor(dataset: Record<string, string>): FakeElement {
@@ -308,4 +318,68 @@ test('a rail card waits the editor hover delay of each platform, and a plain hin
     assert.equal(timers.at(-1)?.ms, HINT_DELAY_MS, `a plain hint on ${platform} waited ${timers.at(-1)?.ms} ms`);
     assert.ok(cardDelay > HINT_DELAY_MS);
   }
+});
+
+// Draw a title's parts in order: text as itself, a wbr element as a bar, and a key span in brackets.
+const titleParts = (title: FakeElement): string =>
+  title.children
+    .map((child) =>
+      child instanceof FakeElement
+        ? child.className === 'hintkey'
+          ? `[${child.textContent}]`
+          : '|'
+        : child.textContent,
+    )
+    .join('');
+
+// A session name is the reader's text. It keeps its parenthesis and breaks after a path separator inside a word.
+test('a name hint keeps its parenthesis and breaks a path after its separators', () => {
+  const { popover, title, focus } = service();
+  focus(anchor({ hint: 'C:/work/arc\\plans/x.md /review it now (urgent)', hintKind: 'name' }));
+  assert.ok(popover.classList.contains('hintprose'), popover.className);
+  assert.equal(titleParts(title), 'C:/|work/|arc\\|plans/|x.md /review it now (urgent)');
+
+  focus(anchor({ hint: 'Fix the build (urgent)', hintKind: 'name' }));
+  assert.equal(titleParts(title), 'Fix the build (urgent)', 'the name lost its parenthesis to a key');
+
+  // A control hint keeps the bold title, the key split, and no path breaks.
+  focus(anchor({ hint: 'Open a/b (Ctrl+O)' }));
+  assert.equal(popover.classList.contains('hintprose'), false, popover.className);
+  assert.equal(titleParts(title), 'Open a/b[ (Ctrl+O)]');
+});
+
+// A press that pins an anchor's own figure popover leaves no hint over it.
+test('an anchor whose figure popover is pinned shows no hint', () => {
+  const { popover, focus } = service();
+  const pinned = anchor({ hint: 'Session name', hintKind: 'name' });
+  pinned.classList.add('has-detail');
+  pinned.setAttribute('aria-pressed', 'true');
+  focus(pinned);
+  assert.equal(popover.hidden, true);
+  pinned.setAttribute('aria-pressed', 'false');
+  focus(pinned);
+  assert.equal(popover.hidden, false);
+});
+
+// An open hint redraws when its anchor changes kind, with no new focus or hover.
+test('an open hint follows its anchor between the name and control kinds', () => {
+  const { popover, title, focus, changed } = service();
+  const node = anchor({ hint: 'Open a/b (Ctrl+O)' });
+  focus(node);
+  node.isConnected = true;
+  assert.equal(titleParts(title), 'Open a/b[ (Ctrl+O)]');
+
+  node.dataset.hintKind = 'name';
+  changed(node, 'data-hint-kind');
+  assert.ok(popover.classList.contains('hintprose'), 'the hint kept the control title after its anchor became a name');
+  assert.equal(titleParts(title), 'Open a/|b (Ctrl+O)', 'the name kept the key split or lost its path break');
+
+  delete node.dataset.hintKind;
+  changed(node, 'data-hint-kind');
+  assert.equal(
+    popover.classList.contains('hintprose'),
+    false,
+    'the prose class stayed after the anchor became a control',
+  );
+  assert.equal(titleParts(title), 'Open a/b[ (Ctrl+O)]', 'the control title kept the path break or lost its key');
 });

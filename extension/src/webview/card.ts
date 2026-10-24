@@ -86,8 +86,10 @@ export interface CardWords {
   logLineHide: string;
   session: string;
   sessionNothingNew: string;
-  expandAllTurns: string;
-  collapseAllTurns: string;
+  expandTurn: string;
+  collapseTurn: string;
+  expandShownDetail: string;
+  collapseShownDetail: string;
   sessionActions: string;
   sessionActionsDetail: string;
   railPinHint: string;
@@ -1657,6 +1659,15 @@ interface CardOpenState {
   isExpanded(): boolean;
   setExpanded(expanded: boolean): void;
   expandedChanged(): void;
+  // Opens or closes every turn the card's session shows. Absent where the card stands alone.
+  toggleShown?(): void;
+  // Whether every shown turn with a body is open, which turns the Shift press into a collapse.
+  everyShownOpen?(): boolean;
+}
+
+// The turn head hint's line for the Shift press, worded for what the press does next.
+export function shownTurnsDetail(everyOpen: boolean): string {
+  return everyOpen ? cardWords().collapseShownDetail : cardWords().expandShownDetail;
 }
 
 // Attach the card's record arrays to the chip detail list without a second host payload copy.
@@ -1739,6 +1750,8 @@ function Card({
     }
   });
 
+  // Set while Shift with Enter or Space runs the session-wide press, so the click it raises does nothing more.
+  const headKeyed = useRef(false);
   const toggle = () => {
     const next = !expanded;
     openState.setExpanded(next);
@@ -1774,15 +1787,50 @@ function Card({
         ])
       : null,
   ];
+  const status = options.readonlyBody ? card.statusWord : options.comments!.headTitle(card);
+  const toggleShown = !options.readonlyBody && expandable ? openState.toggleShown : undefined;
+  const shownLine = toggleShown ? shownTurnsDetail(openState.everyShownOpen?.() ?? false) : '';
+  // A turn head that opens is a button, so its status and its two presses go in the panel hint.
+  // The hint names the plain press first, then the status and the Shift press on their own lines.
   const headProps = {
     class: expandable ? 'head' : 'head statichead',
     ref: head,
-    title: options.readonlyBody ? card.statusWord : options.comments!.headTitle(card),
+    title: expandable ? undefined : status,
     'aria-label': expandable ? card.label : undefined,
     'aria-controls': expandable ? bodyId : undefined,
     'aria-expanded': expandable ? String(expanded) : undefined,
     'data-control': expandable ? `card:${card.key}` : undefined,
-    onClick: expandable ? toggle : undefined,
+    'data-hint': expandable ? (expanded ? cardWords().collapseTurn : cardWords().expandTurn) : undefined,
+    'data-hint-detail': expandable ? [status, shownLine].filter(Boolean).join('\n') : undefined,
+    'data-hint-lines': expandable ? '' : undefined,
+    onClick: expandable
+      ? (event: MouseEvent) => {
+          if (headKeyed.current) return;
+          if (event.shiftKey && toggleShown) toggleShown();
+          else toggle();
+        }
+      : undefined,
+    onKeyDown: toggleShown
+      ? (event: KeyboardEvent) => {
+          if ((event.key !== 'Enter' && event.key !== ' ') || !event.shiftKey) return;
+          event.preventDefault();
+          event.stopPropagation();
+          headKeyed.current = true;
+          toggleShown();
+        }
+      : undefined,
+    onKeyUp: toggleShown
+      ? (event: KeyboardEvent) => {
+          if (event.key === ' ' && event.shiftKey) event.preventDefault();
+          headKeyed.current = false;
+        }
+      : undefined,
+    // Clear suppression on focus departure because keyup can arrive outside this control.
+    onBlur: toggleShown
+      ? () => {
+          headKeyed.current = false;
+        }
+      : undefined,
   };
   const doing = card.doing
     ? [

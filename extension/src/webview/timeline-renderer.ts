@@ -8,6 +8,7 @@ import {
   cardHasBody,
   cardHeadingId,
   cardWords,
+  shownTurnsDetail,
   type CardHost,
   type CardRenderer,
   type CardRendererOptions,
@@ -74,11 +75,13 @@ interface TimelineRendererOptions {
   cardOptions: CardRendererOptions;
   open: Set<string>;
   saveOpen(): void;
-  twist: { open: string; shut: string };
   cardPrint(card: CardView): string;
   interactions: CommentRenderer;
   beforeCardDraw(host: CardHost): void;
-  rowContext(sessionId: string, persisted: boolean): string;
+  // The heading's native-menu context. Turns names which bulk turn entries would change something.
+  rowContext(sessionId: string, persisted: boolean, turns: ShownTurns): string;
+  // Closes the hint over a pressed control, so the popover the press opens is not covered.
+  quietHint(target: EventTarget | null): void;
   // Pin state, or null when pinning is unavailable, including archived sessions.
   pinned(sessionId: string): boolean | null;
   setPinned(sessionId: string, pinned: boolean): void;
@@ -105,6 +108,12 @@ interface SessionView {
   row?: SessionRow;
   stats: SessionStat[];
   labels: string[];
+}
+
+// Whether some shown turn with a body is shut, and whether some is open.
+export interface ShownTurns {
+  shut: boolean;
+  open: boolean;
 }
 
 function stableId(prefix: string, value: string): string {
@@ -160,24 +169,71 @@ function allOpen(cards: CardView[], open: Set<string>): boolean {
   return keys.length > 0 && keys.every((key) => open.has(key));
 }
 
-function headingLabel(
-  session: SessionView,
-  options: TimelineRendererOptions,
-): { expanded: boolean; label: string; hint: string; action: string; detail: string } {
-  const expanded = allOpen(session.cards, options.open);
-  const action = expanded ? cardWords().collapseAllTurns : cardWords().expandAllTurns;
-  // The heading's hint detail includes the last activity's full local time before the disclosure action.
+function shownTurns(cards: CardView[], open: Set<string>): ShownTurns {
+  const keys = expandableKeys(cards);
+  return { shut: keys.some((key) => !open.has(key)), open: keys.some((key) => open.has(key)) };
+}
+
+function headingContext(session: SessionView, options: TimelineRendererOptions): string {
+  return options.rowContext(session.id, session.row?.persisted === true, shownTurns(session.cards, options.open));
+}
+
+function headingLabel(session: SessionView): { label: string; hint: string; detail: string } {
+  // The heading's hint detail is the last activity's full local time, since the heading draws no age.
   const when = session.row?.when;
-  const detail = when ? `${cardWords().lastActive} ${when}. ${action}` : action;
+  const detail = when ? `${cardWords().lastActive} ${when}` : '';
   const hint = session.row?.fullLabel || session.row?.label || session.title;
   const context = contextWord(session.stats);
-  return {
-    expanded,
-    hint,
-    action,
-    detail,
-    label: `${cardWords().session} ${hint}` + (context ? `, ${context}` : '') + `, ${action}`,
-  };
+  return { hint, detail, label: `${cardWords().session} ${hint}` + (context ? `, ${context}` : '') };
+}
+
+// Opens or closes every shown turn with a body. Opening marks the drawn cards read.
+// Without a direction it closes them when every one is open, and opens them otherwise.
+function setShownTurns(
+  cards: CardView[],
+  hosts: Map<string, CardHost>,
+  options: TimelineRendererOptions,
+  open?: boolean,
+): void {
+  const keys = expandableKeys(cards);
+  const shutting = open === undefined ? keys.length > 0 && keys.every((key) => options.open.has(key)) : !open;
+  for (const key of keys) {
+    if (shutting) {
+      options.open.delete(key);
+    } else {
+      options.open.add(key);
+    }
+  }
+  const marked =
+    !shutting &&
+    options.cardOptions.read.markMany(
+      cards
+        .filter((card) => cardHasBody(card) && hosts.has(card.key) && options.cardOptions.read.canMark(card))
+        .map((card) => card.key),
+    );
+  for (const key of keys) {
+    const host = hosts.get(key);
+    if (host) {
+      options.cardRenderer.refresh(host);
+    }
+  }
+  options.cardOptions.comments.refreshSelection();
+  if (!marked) {
+    options.saveOpen();
+  }
+}
+
+// Rewords the Shift line in each drawn turn head of a session after one turn opened or closed,
+// without drawing the cards again.
+function syncShownLines(cards: CardView[], hosts: Map<string, CardHost>, open: Set<string>): void {
+  const everyOpen = allOpen(cards, open);
+  const line = shownTurnsDetail(everyOpen);
+  const stale = shownTurnsDetail(!everyOpen);
+  for (const card of cards) {
+    const head = hosts.get(card.key)?.querySelector<HTMLElement>('.cardheading > button.head');
+    const detail = head?.dataset.hintDetail;
+    if (head && detail?.endsWith(stale)) head.dataset.hintDetail = detail.slice(0, -stale.length) + line;
+  }
 }
 
 // Stroked gear for Timeline layout. Its larger drawing keeps the strokes visible beside the menu dots.
@@ -387,6 +443,7 @@ function CardMount({
   options,
   hosts,
   redraws,
+  toggles,
   onOpenChange,
 }: {
   card: CardView;
@@ -394,6 +451,7 @@ function CardMount({
   options: TimelineRendererOptions;
   hosts: Map<string, CardHost>;
   redraws: CardRedraws;
+  toggles: ShownToggles;
   onOpenChange(): void;
 }) {
   const host = useRef<CardHost>(null);
@@ -422,6 +480,10 @@ function CardMount({
           onOpenChange();
         },
         expandedChanged: onOpenChange,
+        toggleShown() {
+          toggles.get(card.sessionId)?.toggle();
+        },
+        everyShownOpen: () => toggles.get(card.sessionId)?.everyOpen() ?? false,
       });
       options.cardRenderer.refreshClock(node, next);
     };
@@ -457,6 +519,14 @@ function CardMount({
 
 type HeadingRedraws = Map<string, Set<(stats?: SessionStat[], card?: CardView) => void>>;
 
+// The bulk turn press of each mounted session heading, which reads the heading's current cards.
+interface ShownToggle {
+  toggle(open?: boolean): void;
+  everyOpen(): boolean;
+  turns(): ShownTurns;
+}
+type ShownToggles = Map<string, ShownToggle>;
+
 function headingPrint(session: SessionView, options: TimelineRendererOptions): string {
   return JSON.stringify([
     session.id,
@@ -464,8 +534,8 @@ function headingPrint(session: SessionView, options: TimelineRendererOptions): s
     session.row,
     session.stats,
     session.labels,
-    headingLabel(session, options),
-    options.rowContext(session.id, session.row?.persisted === true),
+    headingLabel(session),
+    headingContext(session, options),
     options.pinned(session.id),
     options.labelOpen(session.id),
     options.filterable(),
@@ -478,12 +548,14 @@ function SessionHeading({
   hosts,
   headings,
   pins,
+  toggles,
 }: {
   session: SessionView;
   options: TimelineRendererOptions;
   hosts: Map<string, CardHost>;
   headings: HeadingRedraws;
   pins: PinRedraws;
+  toggles: ShownToggles;
 }) {
   const [, setRevision] = useState(0);
   const source = useRef(supplied);
@@ -567,14 +639,13 @@ function SessionHeading({
     if (displaced) fallback?.focus({ preventScroll: true });
     heldFocus.current = null;
   });
-  const groupId = stableId('session-turns', session.id);
-  const state = headingLabel(session, options);
+  const state = headingLabel(session);
   const turns = session.cards.filter((card) => card.kind !== 'compaction');
   const title = session.title;
   useLayoutEffect(() => {
     const reconcile = () => {
       if (row.current) {
-        row.current.dataset.vscodeContext = options.rowContext(session.id, session.row?.persisted === true);
+        row.current.dataset.vscodeContext = headingContext(current.current, options);
       }
       setRevision((value) => value + 1);
     };
@@ -582,52 +653,40 @@ function SessionHeading({
     reconcile();
     return unsubscribe;
   }, [session.id, session.row?.persisted, options]);
-  const toggle = () => {
-    const keys = expandableKeys(session.cards);
-    const shutting = keys.length > 0 && keys.every((key) => options.open.has(key));
-    for (const key of keys) {
-      if (shutting) {
-        options.open.delete(key);
-      } else {
-        options.open.add(key);
-      }
-    }
-    const marked =
-      !shutting &&
-      options.cardOptions.read.markMany(
-        session.cards
-          .filter((card) => cardHasBody(card) && hosts.has(card.key) && options.cardOptions.read.canMark(card))
-          .map((card) => card.key),
-      );
-    for (const key of keys) {
-      const host = hosts.get(key);
-      if (host) {
-        options.cardRenderer.refresh(host);
-      }
-    }
-    const next = headingLabel(session, options);
-    if (button.current) {
-      button.current.setAttribute('aria-expanded', String(next.expanded));
-      button.current.setAttribute('aria-label', next.label);
-      button.current.setAttribute('data-hint-detail', next.detail);
-      const twist = button.current.querySelector('.twist');
-      if (twist) {
-        twist.textContent = next.expanded ? options.twist.open : options.twist.shut;
-      }
-    }
-    options.cardOptions.comments.refreshSelection();
-    if (!marked) {
-      options.saveOpen();
-    }
-    setRevision((value) => value + 1);
-  };
+  useLayoutEffect(() => {
+    const own: ShownToggle = {
+      toggle(open) {
+        setShownTurns(current.current.cards, hosts, options, open);
+        setRevision((value) => value + 1);
+      },
+      everyOpen: () => allOpen(current.current.cards, options.open),
+      turns: () => shownTurns(current.current.cards, options.open),
+    };
+    toggles.set(supplied.id, own);
+    return () => {
+      if (toggles.get(supplied.id) === own) toggles.delete(supplied.id);
+    };
+  }, [supplied.id, options, hosts, toggles]);
+  // Every heading draw follows a change in which shown turns are open, so the Shift lines follow it here.
+  useLayoutEffect(() => {
+    syncShownLines(current.current.cards, hosts, options.open);
+  });
+  // A press on the name pins the whole name open in the figure popover, where it scrolls and selects.
+  const nameDetail = [state.hint, state.detail].filter(Boolean).join('\n');
+  useLayoutEffect(() => {
+    const node = button.current;
+    return node ? options.cardOptions.statDetails.mount(node, true, true) : undefined;
+  }, [options]);
+  useLayoutEffect(() => {
+    if (button.current) options.cardOptions.statDetails.update(button.current, nameDetail, null);
+  });
   return h(
     'div',
     {
       class: 'sessionrow',
       ref: row,
       'data-session': session.id,
-      'data-vscode-context': options.rowContext(session.id, session.row?.persisted === true),
+      'data-vscode-context': headingContext(session, options),
     },
     [
       h('h2', { class: 'sessionheading', id: headingId }, [
@@ -637,17 +696,15 @@ function SessionHeading({
             class: 'session',
             ref: button,
             'data-hint': state.hint,
-            'data-hint-detail': state.detail,
+            'data-hint-detail': state.detail || undefined,
+            'data-hint-kind': 'name',
             'data-control': `session:${session.id}`,
-            'aria-expanded': String(state.expanded),
-            'aria-controls': groupId,
             'aria-label': state.label,
-            onClick: toggle,
+            onClick(event: MouseEvent) {
+              options.quietHint(event.currentTarget);
+            },
           },
-          [
-            h('span', { class: 'twist' }, state.expanded ? options.twist.open : options.twist.shut),
-            h('span', { class: 'name' }, title),
-          ],
+          h('span', { class: 'name' }, title),
         ),
         h(SessionPin, { session: session.id, title, options, pins }),
         h(
@@ -698,6 +755,7 @@ function Session({
   prints,
   pins,
   headings,
+  toggles,
 }: {
   session: SessionView;
   options: TimelineRendererOptions;
@@ -706,6 +764,7 @@ function Session({
   prints: Map<string, string>;
   pins: PinRedraws;
   headings: HeadingRedraws;
+  toggles: ShownToggles;
 }) {
   const redrawHeading = () => headings.get(session.id)?.forEach((redraw) => redraw());
   return h(
@@ -716,7 +775,7 @@ function Session({
       'aria-labelledby': stableId('session-heading', session.id),
     },
     [
-      h(SessionHeading, { session, options, hosts, pins, headings }),
+      h(SessionHeading, { session, options, hosts, pins, headings, toggles }),
       h('div', { class: 'group', id: stableId('session-turns', session.id), 'data-session': session.id }, [
         h('div', { class: 'transientcards', 'data-session': session.id }),
         ...session.cards.map((card) =>
@@ -726,6 +785,7 @@ function Session({
             options,
             hosts,
             redraws,
+            toggles,
             onOpenChange: redrawHeading,
             key: card.key,
           }),
@@ -743,6 +803,7 @@ function Timeline({
   prints,
   pins,
   headings,
+  toggles,
 }: {
   sessions: SessionView[];
   options: TimelineRendererOptions;
@@ -751,6 +812,7 @@ function Timeline({
   prints: Map<string, string>;
   pins: PinRedraws;
   headings: HeadingRedraws;
+  toggles: ShownToggles;
 }) {
   return h(
     'div',
@@ -764,6 +826,7 @@ function Timeline({
         prints,
         pins,
         headings,
+        toggles,
         key: session.id,
       }),
     ),
@@ -847,6 +910,8 @@ export interface TimelineRenderer {
   settled(): boolean;
   refreshLayout(): void;
   drawRowContext(session: string): void;
+  // Opens or closes every shown turn of a drawn session, the way a Shift press on its turn head does.
+  setShownTurns(session: string, open: boolean): void;
   refreshHeadings(stats?: Record<string, SessionStat[]>): void;
   update(view: TimelineView, footers?: Node[]): void;
   updateCard(session: string, card: CardView): boolean;
@@ -887,6 +952,7 @@ export function createTimelineRenderer(options: TimelineRendererOptions): Timeli
   const deferredCards = new Map<string, CardView>();
   const pins: PinRedraws = new Map();
   const headings: HeadingRedraws = new Map();
+  const toggles: ShownToggles = new Map();
   const renderedCards = new Map<string, CardView>();
   const renderedPrints = new Map<string, string>();
   // Latest host-supplied session figures, independent of the drawn view.
@@ -1061,7 +1127,7 @@ export function createTimelineRenderer(options: TimelineRendererOptions): Timeli
     }
     const shown = { ...view, cards: view.cards.map((card) => nextCards.get(card.key)!) };
     const sessions = sessionsOf(shown, sessionStats, options);
-    render(h(Timeline, { sessions, options, hosts, redraws, prints, pins, headings }), tree);
+    render(h(Timeline, { sessions, options, hosts, redraws, prints, pins, headings, toggles }), tree);
     options.onDraw?.();
     options.syncDetails(
       shown.sessions.map((row) =>
@@ -1391,7 +1457,8 @@ export function createTimelineRenderer(options: TimelineRendererOptions): Timeli
       // A pin or an archive changes the menu, never whether the session is saved.
       const persisted =
         (JSON.parse(row.dataset.vscodeContext ?? '{}') as { sessionPersisted?: unknown }).sessionPersisted === true;
-      row.dataset.vscodeContext = options.rowContext(session, persisted);
+      const turns = toggles.get(session)?.turns() ?? { shut: false, open: false };
+      row.dataset.vscodeContext = options.rowContext(session, persisted, turns);
     }
     // Update Preact props with the native context. Otherwise a reversal can preserve an outdated optimistic attribute.
     headings.get(session)?.forEach((redraw) => redraw());
@@ -1408,6 +1475,9 @@ export function createTimelineRenderer(options: TimelineRendererOptions): Timeli
       }
     },
     drawRowContext,
+    setShownTurns(session, open) {
+      toggles.get(session)?.toggle(open);
+    },
     refreshHeadings,
     settled: () => !pendingView && !pendingCard && !pendingRefresh,
     update,

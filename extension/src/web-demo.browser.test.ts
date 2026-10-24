@@ -1080,7 +1080,7 @@ describe('read-only web demo', () => {
     const heading = page.locator('#list .turn h3.cardheading button.head').first();
     await heading.waitFor();
     await expect.poll(cacheUnread).toBe(false);
-    await expect.poll(() => heading.getAttribute('title')).not.toContain('unread');
+    await expect.poll(() => heading.getAttribute('data-hint-detail')).not.toContain('unread');
     expect(await unreadFilter.count()).toBe(0);
     await heading.click({ button: 'right' });
     await menu.getByRole('menuitem', { name: 'Mark as unread' }).click();

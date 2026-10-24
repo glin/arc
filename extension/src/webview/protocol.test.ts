@@ -380,6 +380,10 @@ const HOST: Array<{ raw: unknown; parsed: HostToPanel }> = [
     parsed: { type: 'setSessionPinned', session: 's1', pinned: true },
   },
   {
+    raw: { type: 'setSessionTurnsOpen', session: 's1', open: true },
+    parsed: { type: 'setSessionTurnsOpen', session: 's1', open: true },
+  },
+  {
     raw: { type: 'setComposerHidden', hidden: true },
     parsed: { type: 'setComposerHidden', hidden: true },
   },
@@ -705,6 +709,7 @@ function hostRecorder(seen: string[]): HostToPanelHandlers {
     setSessionRead: take('setSessionRead'),
     setSessionArchived: take('setSessionArchived'),
     setSessionPinned: take('setSessionPinned'),
+    setSessionTurnsOpen: take('setSessionTurnsOpen'),
     setComposerHidden: take('setComposerHidden'),
     results: take('results'),
     selection: take('selection'),

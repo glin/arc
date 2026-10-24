@@ -740,12 +740,6 @@ body {
 .session:hover {
   color: var(--vscode-textLink-foreground);
 }
-.session .twist {
-  flex: none;
-  width: 0.8em;
-  color: var(--idle);
-  font-size: var(--t-body);
-}
 .session .name {
   overflow: hidden;
   text-overflow: ellipsis;
@@ -3942,6 +3936,21 @@ button.cctx:hover {
   overflow-wrap: anywhere;
   font-weight: 600;
 }
+/* A session name is the reader's own prose, often a whole first prompt. It reads at a measure of
+   its own, at regular weight, and wraps after the slashes the hint service marks. Eight lines
+   show while the pointer rests, and a press on the heading opens the whole name in the figure
+   popover. */
+#hintpop.hintprose {
+  max-width: min(56ch, calc(100vw - 12px));
+}
+.hintprose .hinttitle {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 8;
+  overflow: hidden;
+  overflow-wrap: break-word;
+  font-weight: 400;
+}
 .hintkey {
   font-weight: 400;
   color: var(--idle);
@@ -4010,6 +4019,12 @@ button.cctx:hover {
 .chippopline:first-child {
   color: var(--vscode-foreground);
   font-weight: 600;
+}
+/* A pinned session name reads as its hint reads: regular weight, and wrapping between words or
+   after the slashes the name writer marks. */
+.chippopline.chippopname {
+  font-weight: 400;
+  overflow-wrap: break-word;
 }
 .chippopline.gap {
   height: 6px;

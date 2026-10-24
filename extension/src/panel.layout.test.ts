@@ -1342,8 +1342,8 @@ test(
           `the clipped session heading does not put its full title first at ${width}px`,
         );
         assert.ok(
-          ((await page.locator('#hintpop .hintdetail').textContent()) ?? '').endsWith(CARD_ACTIONS.expandAllTurns),
-          `the clipped session heading does not put its action second at ${width}px`,
+          ((await page.locator('#hintpop .hintdetail').textContent()) ?? '').startsWith(CARD_ACTIONS.lastActive),
+          `the clipped session heading does not put its last activity time second at ${width}px`,
         );
         assert.match(
           (await sessionHeading.getAttribute('aria-label')) || '',

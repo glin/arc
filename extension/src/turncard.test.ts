@@ -1948,8 +1948,8 @@ test('every control the panel can be operated with has something to be called', 
     }
     assert.match(label, /\S/, `${key} would be read out as nothing`);
   }
-  assert.equal(CARD_ACTIONS.expandAllTurns, 'Expand every shown turn');
-  assert.equal(CARD_ACTIONS.collapseAllTurns, 'Collapse every shown turn');
+  assert.equal(CARD_ACTIONS.expandShownDetail, 'Shift+click or Shift+Enter expands every shown turn');
+  assert.equal(CARD_ACTIONS.collapseShownDetail, 'Shift+click or Shift+Enter collapses every shown turn');
 });
 
 // Closing rows distinguish reader actions from explicit statements that nothing remains open.

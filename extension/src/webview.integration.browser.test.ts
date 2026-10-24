@@ -1115,17 +1115,21 @@ test('unread heading expansion stays local for 24 turns at 100 and 1000 sessions
       await page.evaluate(`window.postMessage({ type: 'setSessionRead', session: 'bulk0', read: false }, '*')`);
       await page.evaluate(SETTLED);
       const heading = page.locator('.sessionrow[data-session="bulk0"]');
-      const disclosure = heading.locator('button.session');
-      await disclosure.focus();
+      // Shift+Enter on a turn head opens every shown turn.
+      const turnHead = page.locator('.sessionsection[data-session="bulk0"] .turn button.head').first();
+      await turnHead.focus();
       await page.evaluate(
-        `window.__heldHeading = document.querySelector('.sessionrow[data-session="bulk0"] button.session'); window.__posted = []; window.__browserSaves = 0;`,
+        `window.__heldHeading = document.querySelector('.sessionsection[data-session="bulk0"] .turn button.head'); window.__posted = []; window.__browserSaves = 0;`,
       );
       const before = await drawCounts(page);
-      await disclosure.press('Enter');
+      await turnHead.press('Shift+Enter');
       await page.waitForFunction(`document.querySelectorAll('.turn.has-body.is-open.is-read').length === ${turns}`);
       await page.evaluate(SETTLED);
       assert.deepEqual(await drawCounts(page), before);
-      assert.equal(await disclosure.getAttribute('aria-expanded'), 'true');
+      assert.equal(
+        await heading.evaluate((node) => JSON.parse((node as HTMLElement).dataset.vscodeContext!).sessionTurnsShut),
+        undefined,
+      );
       assert.equal(await page.evaluate(`document.activeElement === window.__heldHeading`), true);
       assert.equal(
         await heading.evaluate((node) => JSON.parse((node as HTMLElement).dataset.vscodeContext!).sessionRead),
@@ -1138,7 +1142,7 @@ test('unread heading expansion stays local for 24 turns at 100 and 1000 sessions
         initial.cards.map((card) => card.key),
       );
       assert.equal(await page.evaluate('window.__browserState.readTo.bulk0'), 0);
-      await disclosure.press('Enter');
+      await turnHead.press('Shift+Enter');
       await page.evaluate(SETTLED);
       assert.equal(await page.locator('.turn.is-open').count(), 0);
       assert.equal(await page.locator('.turn.is-read').count(), turns);
@@ -1776,7 +1780,10 @@ test('browser state survives page destruction and is written to both owners', { 
     })()`);
     const ownCard = evicted.locator(`.turn[data-key="${older.key}"]`);
     assert.equal(await ownCard.evaluate((node) => node.classList.contains('is-read')), true);
-    assert.equal((await ownCard.locator('.head').getAttribute('title'))?.toLowerCase().includes('unread'), false);
+    assert.equal(
+      (await ownCard.locator('.head').getAttribute('data-hint-detail'))?.toLowerCase().includes('unread'),
+      false,
+    );
     assert.equal(
       await ownCard.evaluate((node) =>
         [node, ...Array.from(node.querySelectorAll('[data-vscode-context]'))].some((element) => {

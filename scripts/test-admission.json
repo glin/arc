@@ -126,8 +126,8 @@
   },
   "extension/src/panel.webview.test.ts": {
     "reason": "Real progressive workers must deliver bounded recovery and metadata through the production panel host. Start metadata must survive storage delays, hidden panels, preference resets, and reloads. File presses must preserve recorded changes after their worktree disappears.",
-    "cases": 621,
-    "matricesSha256": "e6cdc61fd9c25180918b632a8ab8ae22cde8b9190d14d5bbc0f1d9313cf55298"
+    "cases": 624,
+    "matricesSha256": "fac78af8abcc98046bd947931c52b175c540e0758beb22429b59a9749a8e7673"
   },
   "extension/src/panelbundle.test.ts": {
     "reason": "The panel bundle and fixture must contain the production entry, source identity, and substituted text.",
@@ -206,8 +206,8 @@
   },
   "extension/src/timeline-renderer.browser.test.ts": {
     "reason": "Production timeline rendering must preserve native disclosure, selection, navigation, and accessible interaction.",
-    "cases": 66,
-    "matricesSha256": "7180ca88664e4d8431acbbdbb19b8f692f28ca3eb9103fc15e1082c96af06ab0"
+    "cases": 70,
+    "matricesSha256": "4744ae8fac8ad0e95b520b70ae502d3fdaa70c8bd28d3fd0b58304ce2deb675e"
   },
   "extension/src/timelinecheck.test.ts": {
     "reason": "Npm and extension-directory invocations must inspect the caller project through the real command environment.",

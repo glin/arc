@@ -76,6 +76,10 @@ export interface SessionContextExtra {
   sessionRead?: 'read' | 'unread';
   // Set only when the session has labels for New session with the same labels to copy.
   sessionLabeled?: boolean;
+  // Set only when some shown turn is shut, for Expand every shown turn.
+  sessionTurnsShut?: boolean;
+  // Set only when some shown turn is open, for Collapse every shown turn.
+  sessionTurnsOpen?: boolean;
 }
 
 function strings(value: unknown): string[] {
@@ -256,6 +260,12 @@ export function createPanelSessionState(options: SessionStateOptions): PanelSess
       }
       if (extra?.sessionLabeled) {
         out.sessionLabeled = true;
+      }
+      if (extra?.sessionTurnsShut) {
+        out.sessionTurnsShut = true;
+      }
+      if (extra?.sessionTurnsOpen) {
+        out.sessionTurnsOpen = true;
       }
       return JSON.stringify(out);
     },

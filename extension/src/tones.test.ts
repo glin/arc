@@ -871,7 +871,6 @@ const SUBAGENT_ROW_OTHER_COLOURS = [
   '.railstatus.running { color: var(--busy) }',
   '.row .ficon { color: var(--idle) }',
   '.running .glyph { color: var(--busy) }',
-  '.session .twist { color: var(--idle) }',
   '.session { color: var(--vscode-foreground) }',
   '.session:hover { color: var(--vscode-textLink-foreground) }',
   '.sessiondetails dt { color: var(--idle) }',

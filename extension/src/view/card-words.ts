@@ -73,8 +73,7 @@ export const CARD_ACTIONS = {
   // Long messages have separate expansion and collapse labels. Each state names the action that the next press performs.
   saidMore: 'Show all',
   saidLess: 'Show less',
-  // What a plain press on the section head does. It is the last clause of the head's spoken
-  // name, the way a session heading's name ends on its own action.
+  // What a plain press on the section head does. It is the last clause of the head's spoken name.
   saidCollapse: 'Collapse this section',
   saidExpand: 'Expand this section',
   // What a press with Shift held does, which is the head's second job and the section's only
@@ -92,12 +91,16 @@ export const CARD_ACTIONS = {
   laterAsksShow: 'more asked while it ran',
   laterAsksHide: 'Hide what was asked while it ran',
   picker: 'Session to show',
-  // Session heading actions name whether the next press expands or collapses the shown turns.
-  expandAllTurns: 'Expand every shown turn',
+  // What a plain press on a turn head does, which leads the head's hint.
+  expandTurn: 'Expand this turn',
+  collapseTurn: 'Collapse this turn',
+  // What a press with Shift held on a turn head does to every turn the session shows. The
+  // collapsing form appears once every shown turn is open.
+  expandShownDetail: 'Shift+click or Shift+Enter expands every shown turn',
+  collapseShownDetail: 'Shift+click or Shift+Enter collapses every shown turn',
   // Leads the heading hint's second line with the full local time of the session's last
   // activity, since the heading draws no age.
   lastActive: 'Last active',
-  collapseAllTurns: 'Collapse every shown turn',
   // The session heading's menu offers pin, archive, labels, rename and details actions.
   sessionActions: 'Session actions',
   sessionActionsDetail: 'Pin, archive, labels, rename, and details',

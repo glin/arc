@@ -8448,6 +8448,17 @@ export class PanelProvider implements vscode.Disposable {
     void this.post({ type: 'setSessionRead', session: this.panelSession(session), read });
   }
 
+  // Open or close every shown turn only in the panel that opened the native menu. Open turns are that panel's own view, and opening one marks it read.
+  public setSessionTurnsOpen(session: string, open: boolean): void {
+    session = this.panelSession(session);
+    const arm = this.detailsMenuArm;
+    this.detailsMenuArm = null;
+    if (!arm || arm.session !== session || Date.now() - arm.at > 30_000 || !this.hosts.includes(arm.host)) {
+      return;
+    }
+    void this.sendToHost(arm.host, { type: 'setSessionTurnsOpen', session: arm.browserSession, open });
+  }
+
   // Update durable archive membership through the provider, including actions targeting a provisional session ID.
   public setSessionArchived(session: string, archived: boolean): void {
     void Promise.resolve(this.updateSessionMembership(archived ? 'archive' : 'unarchive', session)).catch((error) => {

@@ -1,4 +1,5 @@
 import { element, placeFloat } from './dom.ts';
+import { appendNameText } from './inline-text.ts';
 
 export interface HintEvents {
   document(
@@ -87,6 +88,12 @@ export function createHints(options: {
     popover.hidden = true;
     return hadHint;
   };
+  // A name title is the reader's own text, so a trailing parenthesis stays in it and a path
+  // breaks between its folders.
+  const writeName = (text: string): void => {
+    title.textContent = '';
+    appendNameText(options.document, title, text);
+  };
   const writeTitle = (text: string): void => {
     title.textContent = '';
     const key = /^(.*?)( \([^)]+\))$/.exec(text);
@@ -106,7 +113,8 @@ export function createHints(options: {
     const hint = node.dataset.hint ?? '';
     const hintDetail = node.dataset.hintDetail ?? '';
     const hintDescription = node.dataset.hintDescription;
-    if (!hint) {
+    // An anchor whose own figure popover is pinned open shows no hint over it.
+    if (!hint || (node.classList.contains('has-detail') && node.getAttribute('aria-pressed') === 'true')) {
       hide();
       return;
     }
@@ -119,7 +127,10 @@ export function createHints(options: {
     if (node.classList.contains('has-detail')) {
       node.classList.add('detail-pinned');
     }
-    writeTitle(hint);
+    const name = node.dataset.hintKind === 'name';
+    popover.classList.toggle('hintprose', name);
+    if (name) writeName(hint);
+    else writeTitle(hint);
     detail.textContent = hintDetail;
     // data-hint-lines preserves line breaks. Other detail text wraps normally.
     detail.classList.toggle('lines', node.dataset.hintLines !== undefined);
@@ -289,7 +300,14 @@ export function createHints(options: {
     childList: true,
     subtree: true,
     attributes: true,
-    attributeFilter: ['data-hint', 'data-hint-detail', 'data-hint-lines', 'data-hint-description', 'data-hint-body'],
+    attributeFilter: [
+      'data-hint',
+      'data-hint-detail',
+      'data-hint-kind',
+      'data-hint-lines',
+      'data-hint-description',
+      'data-hint-body',
+    ],
   });
   return {
     element: popover,

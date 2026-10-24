@@ -7872,7 +7872,7 @@ test('rail and launcher controls use the panel body typography', () => {
   );
 });
 
-test('the session heading press gives its panel hint the full title and next action', () => {
+test('the session heading press gives its panel hint the full name and the last activity time', () => {
   const session = declarationSource(outerPanelHostSource, 'SessionHeading');
   assert.ok(session.length > 500, 'the session heading renderer is absent, so its hint cannot be checked');
   sourceDoesNotMatch(
@@ -7892,18 +7892,18 @@ test('the session heading press gives its panel hint the full title and next act
   );
   sourceMatch(
     outerPanelHostSource,
-    /const detail = when \? `\$\{cardWords\(\)\.lastActive\} \$\{when\}\. \$\{action\}` : action/,
-    'the session heading hint does not carry the full local time of the last activity before its action',
+    /const detail = when \? `\$\{cardWords\(\)\.lastActive\} \$\{when\}` : ''/,
+    'the session heading hint does not carry the full local time of the last activity alone',
   );
   sourceMatch(
     session,
-    /'data-hint-detail': state\.detail/,
-    'the session heading press does not put its initial action on the hint second line',
+    /'data-hint-detail': state\.detail \|\| undefined/,
+    'the session heading press does not put the last activity time on the hint second line',
   );
   sourceMatch(
     session,
-    /button\.current\.setAttribute\('data-hint-detail', next\.detail\)/,
-    'the session heading hint does not follow its next action after an in-place toggle',
+    /'data-hint-kind': 'name'/,
+    'the session heading hint draws its name as a control title, bold and with a parenthesis taken as a key',
   );
 });
 
@@ -21640,7 +21640,6 @@ const FIGURE_SIZES = [
   '.quoteact { font-size: var(--t-body) }',
   '.quotekey { font-size: var(--t-small) }',
   '.session { font-size: 0.95em }',
-  '.session .twist { font-size: var(--t-body) }',
   '.sessionmenu { font: inherit }',
   '.sessionmenu { font-size: var(--t-body) }',
   '.controls select { font: inherit }',
@@ -21700,7 +21699,6 @@ const FIGURE_SIZES = [
   '.noteclose { font-size: 1.05em }',
   '.notearea { font: inherit }',
   '.notearea { font-size: 0.92em }',
-  '.cask .twist { font-size: var(--t-body) }',
   '#prompt { font: inherit }',
   '#prompt { font-size: 0.95em }',
   '.cfile { font-size: var(--t-small) }',
@@ -22520,7 +22518,7 @@ test('read changes belong to mounted headings without a full timeline refresh', 
   const timelineSource = fs.readFileSync(path.join(__dirname, 'webview', 'timeline-renderer.ts'), 'utf8');
   sourceMatch(
     timelineSource,
-    /const reconcile = \(\) => \{[\s\S]*?row\.current\.dataset\.vscodeContext = options\.rowContext\(session\.id, session\.row\?\.persisted === true\);[\s\S]*?setRevision[\s\S]*?const unsubscribe = options\.cardOptions\.read\.subscribe\(reconcile\);\s*reconcile\(\);\s*return unsubscribe;/,
+    /const reconcile = \(\) => \{[\s\S]*?row\.current\.dataset\.vscodeContext = headingContext\(current\.current, options\);[\s\S]*?setRevision[\s\S]*?const unsubscribe = options\.cardOptions\.read\.subscribe\(reconcile\);\s*reconcile\(\);\s*return unsubscribe;/,
     'mounted headings no longer own current native context and remembered Preact props',
   );
 });
@@ -22628,6 +22626,59 @@ test('the rail card and the session heading offer Copy session ID beside details
   sourceMatch(
     panelHandler('showSessionDetails'),
     /sessionDetails\.openById\(composerRenderer\.sessionIdentity\(msg\.session\), anchor\);/,
+  );
+});
+
+test('the session heading offers Expand and Collapse every shown turn after triage, and neither is in the palette', () => {
+  const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8'));
+  const commands = manifest.contributes.commands as { command: string; title: string; category?: string }[];
+  assert.deepEqual(
+    commands.find((command) => command.command === 'arc.expandShownTurns'),
+    { command: 'arc.expandShownTurns', title: 'Expand every shown turn', category: 'Arc Session' },
+  );
+  assert.deepEqual(
+    commands.find((command) => command.command === 'arc.collapseShownTurns'),
+    { command: 'arc.collapseShownTurns', title: 'Collapse every shown turn', category: 'Arc Session' },
+  );
+  const menu = manifest.contributes.menus['webview/context'] as { command: string; when: string; group: string }[];
+  const heading = `(webviewSection == '${SESSION_MENU_SECTIONS.live}' || webviewSection == '${SESSION_MENU_SECTIONS.archived}')`;
+  const expand = menu.filter((entry) => entry.command === 'arc.expandShownTurns');
+  const collapse = menu.filter((entry) => entry.command === 'arc.collapseShownTurns');
+  // Each entry is offered only on a session heading, and only while it would change a shown turn.
+  assert.deepEqual(
+    expand.map((entry) => entry.when),
+    [`${heading} && sessionTurnsShut`],
+  );
+  assert.deepEqual(
+    collapse.map((entry) => entry.when),
+    [`${heading} && sessionTurnsOpen`],
+  );
+  const section = (group: string) => group.split('@')[0];
+  const triage = menu.filter((entry) => section(entry.group) === '1_triage');
+  const rename = menu.find((entry) => entry.command === 'arc.renameSession');
+  assert.ok(triage.length > 0 && rename, 'the triage or editing entries this order is checked against are gone');
+  assert.equal(expand[0].group, '1_turns@1', 'Expand every shown turn does not lead its own group');
+  assert.equal(collapse[0].group, '1_turns@2', 'Collapse every shown turn does not follow Expand every shown turn');
+  assert.ok(
+    triage.every((entry) => section(entry.group) < section(expand[0].group)),
+    `the turn entries in ${expand[0].group} draw above triage`,
+  );
+  assert.ok(
+    section(expand[0].group) < section(rename.group),
+    `the turn entries in ${expand[0].group} draw below the editing group ${rename.group}`,
+  );
+  const palette = manifest.contributes.menus.commandPalette as { command: string; when: string }[];
+  for (const command of ['arc.expandShownTurns', 'arc.collapseShownTurns']) {
+    assert.ok(
+      palette.some((entry) => entry.command === command && entry.when === 'false'),
+      `${command} is available in the command palette`,
+    );
+  }
+  const extensionSource = fs.readFileSync(path.join(__dirname, 'extension.ts'), 'utf8');
+  sourceMatch(extensionSource, /reg\('arc\.expandShownTurns', \(arg\) => setSessionTurnsOpen\(panel, arg, true\)\);/);
+  sourceMatch(
+    extensionSource,
+    /reg\('arc\.collapseShownTurns', \(arg\) => setSessionTurnsOpen\(panel, arg, false\)\);/,
   );
 });
 
@@ -22819,6 +22870,65 @@ test('session details returns only to the panel that opened its native menu', ()
   };
   showSessionDetails.call(provider, 's1');
   assert.equal(sent.length, 1, 'an expired native-menu arm opens a stale dialog instead of being discarded');
+});
+
+test('expanding or collapsing every shown turn reaches only the panel that opened its native menu', () => {
+  const from = panelHostSource.indexOf('public setSessionTurnsOpen(session: string, open: boolean): void {');
+  assert.notEqual(from, -1, 'the provider no longer exposes the native bulk turn command');
+  const rest = memberFrom(panelHostSource, from);
+  const end = rest.lastIndexOf('}');
+  assert.notEqual(end, -1, 'the native bulk turn command no longer has a readable body');
+  const body = rest.slice(rest.indexOf('{') + 1, end);
+  const setSessionTurnsOpen = new Function(`return function setSessionTurnsOpen(session, open) {${body}\n}`)() as (
+    this: {
+      detailsMenuArm: { host: object; session: string; browserSession: string; at: number } | null;
+      hosts: object[];
+      sendToHost: (host: object, message: unknown) => void;
+      post: (message: unknown) => void;
+    },
+    session: string,
+    open: boolean,
+  ) => void;
+  const firstPanel = {};
+  const secondPanel = {};
+  const sent: Array<{ host: object; message: unknown }> = [];
+  const provider = {
+    detailsMenuArm: { host: secondPanel, session: 's1', browserSession: 'draft-1', at: Date.now() } as {
+      host: object;
+      session: string;
+      browserSession: string;
+      at: number;
+    } | null,
+    hosts: [firstPanel, secondPanel],
+    sendToHost(host: object, message: unknown) {
+      sent.push({ host, message });
+    },
+    post(message: unknown) {
+      for (const host of this.hosts) {
+        this.sendToHost(host, message);
+      }
+    },
+    panelSession(session: string) {
+      return session;
+    },
+  };
+
+  setSessionTurnsOpen.call(provider, 's1', true);
+  assert.deepEqual(
+    sent,
+    [{ host: secondPanel, message: { type: 'setSessionTurnsOpen', session: 'draft-1', open: true } }],
+    'the command opens and marks read the turns of every panel instead of the panel whose menu it came from',
+  );
+  setSessionTurnsOpen.call(provider, 's1', false);
+  assert.equal(sent.length, 1, 'one native menu opening changes a panel twice');
+
+  provider.detailsMenuArm = { host: firstPanel, session: 's2', browserSession: 's2', at: Date.now() };
+  setSessionTurnsOpen.call(provider, 's1', false);
+  assert.equal(sent.length, 1, 'a menu armed on another session changes the turns of this one');
+
+  provider.detailsMenuArm = { host: firstPanel, session: 's1', browserSession: 's1', at: Date.now() - 30_001 };
+  setSessionTurnsOpen.call(provider, 's1', false);
+  assert.equal(sent.length, 1, 'an expired native-menu arm changes a panel after its menu has closed');
 });
 
 test('the rail card and the session heading both offer pinning, and none of it in the palette', () => {
@@ -31679,6 +31789,32 @@ test('one rule truncates a commit row subject, and one rule truncates its maker 
     ).length;
   assert.equal(setting('.commitrow .name'), 1, 'a second rule sets how a commit subject truncates');
   assert.equal(setting('.commitrow .commitmakerlink'), 1, 'a second rule sets how a maker name truncates');
+});
+
+// A session name hint fits a narrow panel, reads at regular weight, and stops at a line count so a
+// whole first prompt never runs past the box. The heading is the only anchor that asks for it.
+// The pinned name reads at the same weight and wraps between words.
+test('the name hint fits the panel, reads at regular weight, and clamps a long name', () => {
+  const css = styleSource.replace(/\/\*[\s\S]*?\*\//g, '');
+  const box = /(?:^|\n)#hintpop\.hintprose \{([^}]*)\}/.exec(css);
+  assert.ok(box, 'panel.css has no rule for the name hint box');
+  assert.match(box[1], /max-width:\s*min\(\d+ch, calc\(100vw - 12px\)\)/, 'the name hint can run past a narrow panel');
+  const name = /(?:^|\n)\.hintprose \.hinttitle \{([^}]*)\}/.exec(css);
+  assert.ok(name, 'panel.css has no rule for the name hint title');
+  assert.match(name[1], /font-weight:\s*400/, 'the name hint draws the name bold');
+  assert.match(name[1], /-webkit-line-clamp:\s*\d+/, 'the name hint shows a long name whole');
+  assert.match(name[1], /overflow:\s*hidden/, 'the clamped name runs out of the box');
+  const anchors = [...outerPanelHostSource.matchAll(/'data-hint-kind': 'name'/g)].length;
+  assert.equal(anchors, 1, 'a control other than the session heading draws its hint as a name');
+  const pinned = /(?:^|\n)\.chippopline\.chippopname \{([^}]*)\}/.exec(css);
+  assert.ok(pinned, 'panel.css has no rule for the pinned name');
+  assert.match(pinned[1], /font-weight:\s*400/, 'the pinned name draws bold');
+  assert.match(pinned[1], /overflow-wrap:\s*break-word/, 'the pinned name breaks inside words');
+  // Both rules have the same specificity, so the later one wins.
+  assert.ok(
+    css.indexOf(pinned[0]) > css.search(/(?:^|\n)\.chippopline:first-child \{/),
+    'the bold first-line rule comes after the pinned name rule and wins',
+  );
 });
 
 // Require the hint box's stylesheet z-index to exceed every other declared z-index.

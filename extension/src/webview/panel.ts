@@ -927,7 +927,6 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
     cardOptions,
     open,
     saveOpen,
-    twist: TWIST,
     // A closed card draws no layout-dependent body. Keep its print while the layout changes.
     cardPrint: (card) =>
       `${open.has(card.key) ? `${layout.cardLayout}:${layout.promptPosition}` : ''}:${cardPrint(card)}`,
@@ -935,11 +934,16 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
     beforeCardDraw(node) {
       commentsRenderer.beforeCardDraw(node);
     },
-    rowContext: (session, persisted) =>
+    rowContext: (session, persisted, turns) =>
       sessionState.context(session, persisted, {
         sessionRead: sessionReadState(session),
         sessionLabeled: sessionLabeled(session),
+        sessionTurnsShut: turns.shut,
+        sessionTurnsOpen: turns.open,
       }),
+    quietHint(target) {
+      hints.press(target);
+    },
     // Heading pins share session-state membership with session list pins and native menus.
     // Membership changes refresh mounted headings, including headings retained behind a replacement view.
     pinned: (session) => (sessionState.hidden.has(session) ? null : sessionState.pinnedTop.has(session)),
@@ -1433,6 +1437,10 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
       // Applies session pin membership through the session-state owner.
       setSessionPinned: function (msg) {
         sessionState.setPinned(msg.session, msg.pinned);
+      },
+      // Opens or closes every shown turn of the session through its heading's bulk turn press.
+      setSessionTurnsOpen: function (msg) {
+        timelineRenderer.setShownTurns(msg.session, msg.open);
       },
       setComposerHidden: function (msg) {
         setComposerHidden(msg.hidden);

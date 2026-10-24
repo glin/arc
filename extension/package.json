@@ -215,6 +215,16 @@
         "category": "Arc Session"
       },
       {
+        "command": "arc.expandShownTurns",
+        "title": "Expand every shown turn",
+        "category": "Arc Session"
+      },
+      {
+        "command": "arc.collapseShownTurns",
+        "title": "Collapse every shown turn",
+        "category": "Arc Session"
+      },
+      {
         "command": "arc.hideComposer",
         "title": "Collapse prompt box"
       },
@@ -452,6 +462,16 @@
           "group": "1_triage@3"
         },
         {
+          "command": "arc.expandShownTurns",
+          "when": "(webviewSection == 'arcSessionLive' || webviewSection == 'arcSessionArchived') && sessionTurnsShut",
+          "group": "1_turns@1"
+        },
+        {
+          "command": "arc.collapseShownTurns",
+          "when": "(webviewSection == 'arcSessionLive' || webviewSection == 'arcSessionArchived') && sessionTurnsOpen",
+          "group": "1_turns@2"
+        },
+        {
           "command": "arc.renameSession",
           "when": "sessionPersisted && (webviewSection == 'arcSessionLive' || webviewSection == 'arcSessionArchived')",
           "group": "2_edit@1"
@@ -641,6 +661,14 @@
         },
         {
           "command": "arc.copySessionId",
+          "when": "false"
+        },
+        {
+          "command": "arc.expandShownTurns",
+          "when": "false"
+        },
+        {
+          "command": "arc.collapseShownTurns",
           "when": "false"
         },
         {

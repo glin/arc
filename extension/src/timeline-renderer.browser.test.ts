@@ -280,12 +280,10 @@ test('the production page exposes the semantic Timeline hierarchy and accessible
       const heading = session.locator(':scope > .sessionrow > h2');
       assert.equal(await heading.count(), 1);
       assert.equal(await heading.getAttribute('id'), labelledBy);
-      const disclosure = heading.locator(':scope > button.session[aria-expanded][aria-controls]');
-      assert.equal(await disclosure.count(), 1);
-      const controls = await disclosure.getAttribute('aria-controls');
-      assert.ok(controls);
-      assert.equal(await page.locator(`[id=${JSON.stringify(controls)}]`).count(), 1);
-      // The menu button sits beside the disclosure and opens the row's context menu.
+      // The name button names the session and folds nothing, so it claims no turn list.
+      const name = heading.locator(':scope > button.session:not([aria-expanded]):not([aria-controls])');
+      assert.equal(await name.count(), 1);
+      // The menu button sits beside the name button and opens the row's context menu.
 
       const menu = heading.locator(':scope > button.sessionmenu:not(.sessionlayout):not(.sessionpin)');
       assert.equal(await menu.count(), 1);
@@ -369,7 +367,11 @@ test('the production page exposes the semantic Timeline hierarchy and accessible
       1,
     );
 
-    await page.locator('section.sessionsection[data-session="s1"] button.session').click();
+    // Shift on a turn head opens every shown card, the compaction among them.
+    await page
+      .locator('section.sessionsection[data-session="s1"] article.turn button.head')
+      .first()
+      .click({ modifiers: ['Shift'] });
     await page.evaluate(SETTLED);
     assert.equal(await compaction.locator('button.head').getAttribute('aria-expanded'), 'true');
     assert.equal(await compaction.locator('.body').isHidden(), false);
@@ -932,7 +934,7 @@ test('a selected range across cards waits for a reorder to release it', async (t
 
 for (const gainsBody of [true, false]) {
   for (const held of [false, true]) {
-    test(`a session heading follows ${held ? 'deferred' : 'local'} Activity body ${gainsBody ? 'arrival' : 'removal'}`, async (t) => {
+    test(`the bulk turn press follows ${held ? 'deferred' : 'local'} Activity body ${gainsBody ? 'arrival' : 'removal'}`, async (t) => {
       const browser = await browserOrNone();
       if (!browser) {
         t.skip('Edge or Chrome is required');
@@ -944,11 +946,16 @@ for (const gainsBody of [true, false]) {
         const { payload, original, changed, peer } = interruptedActivityPayload();
         if (!gainsBody) payload.cards[0] = changed;
         await post(page, payload);
-        const heading = page.locator(`[data-control=${JSON.stringify(`session:${peer.sessionId}`)}]`);
+        const row = page.locator(`.sessionrow[data-session=${JSON.stringify(peer.sessionId)}]`);
+        // Whether the session menu offers Expand every shown turn, which it does while some turn is shut.
+        const offersExpand = async () =>
+          (JSON.parse((await row.getAttribute('data-vscode-context')) ?? '{}') as { sessionTurnsShut?: boolean })
+            .sessionTurnsShut === true;
         const newest = page.locator(`[data-key=${JSON.stringify(original.key)}]`);
         const older = page.locator(`[data-key=${JSON.stringify(peer.key)}]`);
+        const shiftPress = () => older.locator('button.head').click({ modifiers: ['Shift'] });
         if (!gainsBody) await older.locator('button.head').click();
-        assert.equal(await heading.getAttribute('aria-expanded'), 'false');
+        assert.equal(await offersExpand(), true);
         if (held) {
           await newest.locator('.headline').evaluate((node) => {
             const range = document.createRange();
@@ -960,11 +967,7 @@ for (const gainsBody of [true, false]) {
         }
         await post(page, { type: 'activity', session: original.sessionId, card: gainsBody ? changed : original });
         if (held) {
-          assert.equal(
-            await heading.getAttribute('aria-expanded'),
-            'false',
-            'held Activity changed heading disclosure before publication',
-          );
+          assert.equal(await offersExpand(), true, 'held Activity changed the session menu before publication');
           await page.evaluate(() => {
             getSelection()!.removeAllRanges();
             document.dispatchEvent(new Event('selectionchange'));
@@ -972,31 +975,38 @@ for (const gainsBody of [true, false]) {
           await page.evaluate(SETTLED);
         }
         assert.equal(
-          await heading.getAttribute('aria-expanded'),
-          String(!gainsBody),
-          'published Activity left stale heading body availability',
+          await offersExpand(),
+          gainsBody,
+          'published Activity left stale body availability in the session menu',
         );
-        const action = gainsBody ? CARD_ACTIONS.expandAllTurns : CARD_ACTIONS.collapseAllTurns;
-        assert.ok((await heading.getAttribute('aria-label'))!.includes(action));
-        assert.ok((await heading.getAttribute('data-hint-detail'))!.includes(action));
+        const line = gainsBody ? CARD_ACTIONS.expandShownDetail : CARD_ACTIONS.collapseShownDetail;
+        assert.ok((await older.locator('button.head').getAttribute('data-hint-detail'))!.endsWith(line));
         if (gainsBody) {
-          await heading.click();
+          await shiftPress();
           assert.equal(
             await newest.locator('button.head').getAttribute('aria-expanded'),
             'true',
-            'Expand all turns omitted the first Activity body',
+            'Shift on a turn head omitted the first Activity body',
           );
           assert.equal(await older.locator('button.head').getAttribute('aria-expanded'), 'true');
           assert.equal(await newest.locator('.body').isVisible(), true);
           assert.equal(await older.locator('.body').isVisible(), true);
-          assert.equal(await heading.getAttribute('aria-expanded'), 'true');
-          assert.ok((await heading.getAttribute('aria-label'))!.includes(CARD_ACTIONS.collapseAllTurns));
+          assert.equal(await offersExpand(), false);
+          assert.ok(
+            (await older.locator('button.head').getAttribute('data-hint-detail'))!.endsWith(
+              CARD_ACTIONS.collapseShownDetail,
+            ),
+          );
         }
-        await heading.click();
+        await shiftPress();
         assert.equal(await older.locator('button.head').getAttribute('aria-expanded'), 'false');
         if (gainsBody) assert.equal(await newest.locator('button.head').getAttribute('aria-expanded'), 'false');
-        assert.equal(await heading.getAttribute('aria-expanded'), 'false');
-        assert.ok((await heading.getAttribute('aria-label'))!.includes(CARD_ACTIONS.expandAllTurns));
+        assert.equal(await offersExpand(), true);
+        assert.ok(
+          (await older.locator('button.head').getAttribute('data-hint-detail'))!.endsWith(
+            CARD_ACTIONS.expandShownDetail,
+          ),
+        );
       } finally {
         await browser.close();
       }
@@ -1653,7 +1663,7 @@ test('a folded card draws inline markdown in its headline, and a plain update dr
   }
 });
 
-test('marking one of the fully open turns unread refreshes its session disclosure', async (t) => {
+test('the session menu entries open and close every shown turn and follow each read change', async (t) => {
   const browser = await browserOrNone();
   if (!browser) {
     t.skip('Edge or Chrome is required');
@@ -1663,41 +1673,268 @@ test('marking one of the fully open turns unread refreshes its session disclosur
   try {
     await page.setContent(pageHtml());
     const payload = renderPayload() as Payload;
-    const fullTitle = 'A complete session name that belongs in the session-heading hint';
-    payload.sessions[0].fullLabel = fullTitle;
     await post(page, payload);
     const session = page.locator('section.sessionsection').first();
-    const disclosure = session.locator('button.session');
-    await disclosure.click();
-    await page.evaluate(SETTLED);
-    assert.equal(await disclosure.getAttribute('aria-expanded'), 'true');
-    assert.equal(
-      await disclosure.getAttribute('data-hint'),
-      fullTitle,
-      'the fully open session disclosure does not put the full title first in its hint',
-    );
-    assert.match(
-      (await disclosure.getAttribute('data-hint-detail')) ?? '',
-      /Collapse every shown turn$/,
-      'the fully open session disclosure does not put its action second in its hint',
+    const id = (await session.getAttribute('data-session'))!;
+    const row = session.locator('.sessionrow');
+    const offers = async () => {
+      const context = JSON.parse((await row.getAttribute('data-vscode-context')) ?? '{}') as Record<string, unknown>;
+      return { expand: context.sessionTurnsShut === true, collapse: context.sessionTurnsOpen === true };
+    };
+    const lastHead = session.locator('article.turn button.head').last();
+    assert.deepEqual(
+      await offers(),
+      { expand: true, collapse: false },
+      'the menu offers a collapse with every turn shut',
     );
 
-    const openCard = session.locator('article.turn.is-open.is-read').first();
-    const key = await openCard.getAttribute('data-key');
+    // Expand every shown turn arrives from the native menu as a host message.
+    await post(page, { type: 'setSessionTurnsOpen', session: id, open: true });
+    await page.evaluate(SETTLED);
+    const bodies = await session.locator('article.turn.has-body').count();
+    assert.ok(bodies > 1, `the session drew ${bodies} turns with a body, so this measures nothing`);
+    assert.equal(await session.locator('article.turn.has-body.is-open').count(), bodies, 'Expand left a turn shut');
+    assert.equal(
+      await session.locator('article.turn.has-body.is-open:not(.running)').count(),
+      await session.locator('article.turn.has-body.is-open.is-read:not(.running)').count(),
+      'Expand opened turns without marking them read',
+    );
+    assert.deepEqual(
+      await offers(),
+      { expand: false, collapse: true },
+      'the menu still offers Expand with every turn open',
+    );
+    assert.ok((await lastHead.getAttribute('data-hint-detail'))!.endsWith(CARD_ACTIONS.collapseShownDetail));
+
+    // Marking one open turn unread closes it, so the menu offers Expand again and the Shift line says so.
+    const key = await session.locator('article.turn.is-open.is-read').first().getAttribute('data-key');
     assert.ok(key);
     await post(page, { type: 'setRead', key, read: false });
-    const state = await disclosure.evaluate((node) => ({
-      expanded: node.getAttribute('aria-expanded'),
-      label: node.getAttribute('aria-label'),
-      hint: node.getAttribute('data-hint'),
-      hintDetail: node.getAttribute('data-hint-detail'),
-      title: node.getAttribute('title'),
-    }));
-    assert.equal(state.expanded, 'false');
-    assert.match(state.label || '', /Expand every shown turn/);
-    assert.equal(state.hint, fullTitle);
-    assert.match(state.hintDetail ?? '', /Expand every shown turn$/);
-    assert.equal(state.title, null, 'the session disclosure still carries a native browser title');
+    await page.evaluate(SETTLED);
+    assert.deepEqual(await offers(), { expand: true, collapse: true });
+    assert.ok(
+      (await lastHead.getAttribute('data-hint-detail'))!.endsWith(CARD_ACTIONS.expandShownDetail),
+      'a turn head still offers to collapse every turn after one of them closed',
+    );
+
+    // Collapse every shown turn closes the rest.
+    await post(page, { type: 'setSessionTurnsOpen', session: id, open: false });
+    await page.evaluate(SETTLED);
+    assert.equal(await session.locator('article.turn.is-open').count(), 0, 'Collapse left a turn open');
+    assert.deepEqual(
+      await offers(),
+      { expand: true, collapse: false },
+      'the menu offers Collapse with every turn shut',
+    );
+  } finally {
+    await browser.close();
+  }
+});
+
+// A session named by a long first prompt, with a path, slash commands and a closing parenthesis.
+const LONG_NAME =
+  'C:/Users/greg/Documents/arc/.claude/plans/2026/10/2026-10-24-arc-start-session-link/plan.md /review this plan again, ' +
+  'get a sol high review too then /ship it if it makes sense. also see claude sesion 10d8aebf-803c-465d-b2ed-365386af7d7c ' +
+  '/close-session and archive it if everyhthing there is done, you were taking over (urgent)';
+
+test('a press on the session heading pins its whole name open, and the chip close rules shut it', async (t) => {
+  const browser = await browserOrNone();
+  if (!browser) {
+    t.skip('Edge or Chrome is required');
+    return;
+  }
+  const page = await browser.newPage();
+  try {
+    await page.setContent(pageHtml());
+    const payload = renderPayload() as Payload;
+    payload.sessions[0].fullLabel = LONG_NAME;
+    await post(page, payload);
+    const heading = page.locator('#list button.session').first();
+    const pop = page.locator('#chippop');
+    const hint = page.locator('#hintpop');
+
+    // Focus shows the name hint, drawn as prose: the parenthesis stays in the name and the path breaks at its slashes.
+    await heading.focus();
+    await page.waitForFunction(() => !document.querySelector<HTMLElement>('#hintpop')!.hidden);
+    assert.equal(await hint.getAttribute('class').then((name) => /\bhintprose\b/.test(name ?? '')), true);
+    assert.equal(await hint.locator('.hintkey').count(), 0, 'the hint drew "(urgent)" as a shortcut key');
+    assert.ok(((await hint.locator('.hinttitle').textContent()) ?? '').endsWith('(urgent)'));
+    assert.ok(
+      (await hint.locator('.hinttitle wbr').count()) > 5,
+      'the hint gave the path no break between its folders',
+    );
+    assert.equal(await pop.isHidden(), true, 'focus opened the figure popover on the heading');
+
+    // Enter pins the whole name. The hint closes so it does not cover the pinned box.
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => document.querySelector('#chippop')?.classList.contains('pinned') === true);
+    assert.equal(await pop.isHidden(), false);
+    assert.ok(((await pop.textContent()) ?? '').includes(LONG_NAME), 'the pinned box does not hold the whole name');
+    assert.ok(
+      (await pop.locator('.chippopname wbr').count()) > 5,
+      'the pinned name gave the path no break between its folders',
+    );
+    assert.equal(await heading.getAttribute('aria-pressed'), 'true');
+    assert.equal(await hint.isHidden(), true, 'the name hint stays open over the pinned box');
+    assert.equal(await page.locator('#list article.turn.is-open').count(), 0, 'the heading press opened turns');
+
+    // Escape closes it and focus returns to the heading.
+    await page.keyboard.press('Escape');
+    await page.waitForFunction(() => document.querySelector<HTMLElement>('#chippop')!.hidden);
+    assert.equal(await heading.getAttribute('aria-pressed'), 'false');
+    assert.equal(await heading.evaluate((node) => node === document.activeElement), true, 'focus left the heading');
+
+    // A second press closes it, and a press elsewhere closes it too.
+    await heading.click();
+    await page.waitForFunction(() => document.querySelector('#chippop')?.classList.contains('pinned') === true);
+    await heading.click();
+    await page.waitForFunction(() => document.querySelector<HTMLElement>('#chippop')!.hidden);
+    await heading.click();
+    await page.waitForFunction(() => document.querySelector('#chippop')?.classList.contains('pinned') === true);
+    await page.locator('#list article.turn .headline').first().click();
+    await page.waitForFunction(() => document.querySelector<HTMLElement>('#chippop')!.hidden);
+    assert.equal(await heading.getAttribute('aria-pressed'), 'false');
+  } finally {
+    await browser.close();
+  }
+});
+
+test('the keyboard reaches the end of a pinned 4,094-character name after the shared box drew Context detail', async (t) => {
+  const browser = await browserOrNone();
+  if (!browser) {
+    t.skip('Edge or Chrome is required');
+    return;
+  }
+  const page = await browser.newPage();
+  try {
+    await page.setContent(pageHtml());
+    const payload = renderPayload() as Payload;
+    const name = LONG_NAME.repeat(Math.ceil(4094 / LONG_NAME.length)).slice(0, 4094);
+    payload.sessions[0].fullLabel = name;
+    await post(page, payload);
+    const heading = page.locator('#list button.session').first();
+    const pop = page.locator('#chippop');
+    // The Context detail leaves the shared box focusable only by script, outside the Tab order.
+    await pop.evaluate((node) => {
+      node.tabIndex = -1;
+    });
+    // The prompt box follows the timeline in the panel, so the box at the end of the body is never the next Tab stop.
+    await page.evaluate(() => {
+      const after = document.createElement('button');
+      after.textContent = 'After the timeline';
+      document.querySelector('#list')!.after(after);
+    });
+
+    await heading.focus();
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => document.querySelector('#chippop')?.classList.contains('pinned') === true);
+    assert.equal(await pop.locator('.chippopname').textContent(), name, 'the pinned box does not hold the whole name');
+    assert.ok(
+      await pop.evaluate((node) => node.scrollHeight > node.clientHeight),
+      'the pinned name fits in the box, so this measures no scrolling',
+    );
+
+    // Tab enters the box. Down scrolls it a step, and End scrolls it to the end of the name.
+    await page.keyboard.press('Tab');
+    await page.waitForFunction(() => document.activeElement?.id === 'chippop');
+    await page.keyboard.press('ArrowDown');
+    await page.waitForFunction(() => document.querySelector<HTMLElement>('#chippop')!.scrollTop > 0);
+    await page.keyboard.press('End');
+    await page.waitForFunction(() => {
+      const node = document.querySelector<HTMLElement>('#chippop')!;
+      return node.scrollTop > 0 && node.scrollTop + node.clientHeight >= node.scrollHeight - 1;
+    });
+
+    // Tab leaves the box for the next control, and the box closes.
+    await page.keyboard.press('Tab');
+    await page.waitForFunction(() => document.querySelector<HTMLElement>('#chippop')!.hidden);
+    assert.equal(
+      await page.evaluate(() => document.activeElement !== document.body),
+      true,
+      'Tab from the pinned name dropped focus',
+    );
+  } finally {
+    await browser.close();
+  }
+});
+
+test('Shift with Space or Enter on a turn head opens or closes every shown turn, whichever key lifts first', async (t) => {
+  const browser = await browserOrNone();
+  if (!browser) {
+    t.skip('Edge or Chrome is required');
+    return;
+  }
+  const page = await browser.newPage();
+  try {
+    await page.setContent(pageHtml());
+    await post(page, renderPayload());
+    const session = page.locator('section.sessionsection').first();
+    const bodies = await session.locator('article.turn.has-body').count();
+    assert.ok(bodies > 1, `the session drew ${bodies} turns with a body, so this measures nothing`);
+    const open = () => session.locator('article.turn.has-body.is-open').count();
+    const head = session.locator('article.turn.has-body button.head').last();
+    await head.focus();
+
+    await page.keyboard.down('Shift');
+    await page.keyboard.press('Space');
+    await page.keyboard.up('Shift');
+    await page.waitForFunction(
+      (count) => document.querySelectorAll('article.turn.has-body.is-open').length === count,
+      bodies,
+    );
+
+    await page.keyboard.press('Shift+Enter');
+    await page.waitForFunction(() => document.querySelectorAll('article.turn.has-body.is-open').length === 0);
+
+    // Shift lifts before Space. The Space keyup still belongs to the Shift press and toggles no single turn.
+    await page.keyboard.down('Shift');
+    await page.keyboard.down('Space');
+    await page.keyboard.up('Shift');
+    await page.keyboard.up('Space');
+    await page.evaluate(SETTLED);
+    assert.equal(await open(), bodies, 'the Space keyup after Shift lifted toggled the focused turn again');
+
+    // A plain Space still toggles the focused turn alone.
+    await page.keyboard.press('Space');
+    await page.waitForFunction(
+      (count) => document.querySelectorAll('article.turn.has-body.is-open').length === count - 1,
+      bodies,
+    );
+    assert.equal(await head.getAttribute('aria-expanded'), 'false');
+  } finally {
+    await browser.close();
+  }
+});
+
+test('a session with no last activity time gives its name hint and its pinned name no detail line', async (t) => {
+  const browser = await browserOrNone();
+  if (!browser) {
+    t.skip('Edge or Chrome is required');
+    return;
+  }
+  const page = await browser.newPage();
+  try {
+    await page.setContent(pageHtml());
+    const payload = renderPayload() as Payload;
+    payload.sessions[0].fullLabel = 'Greeting and location inquiry';
+    payload.sessions[0].when = '';
+    await post(page, payload);
+    const heading = page.locator('#list button.session').first();
+    assert.equal(await heading.getAttribute('data-hint-detail'), null);
+    await heading.focus();
+    await page.waitForFunction(() => !document.querySelector<HTMLElement>('#hintpop')!.hidden);
+    assert.equal(
+      await page.locator('#hintpop .hintdetail').isHidden(),
+      true,
+      'the name hint drew an empty detail line',
+    );
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => document.querySelector('#chippop')?.classList.contains('pinned') === true);
+    assert.deepEqual(
+      await page.locator('#chippop .chippopline').allTextContents(),
+      ['Greeting and location inquiry'],
+      'the pinned name drew a detail line with no time in it',
+    );
   } finally {
     await browser.close();
   }
@@ -4389,7 +4626,14 @@ test('heading read and membership context survive reversals while a comment hold
     await post(page, next);
     const heading = page.locator('.sessionrow[data-session="s1"]');
     assert.notEqual(await heading.locator('button.session .name').textContent(), 'Replacement session title');
-    const context = () => heading.evaluate((node) => JSON.parse((node as HTMLElement).dataset.vscodeContext!));
+    // This check compares the read and membership context alone. The turn entries follow open turns, and marking a turn unread closes it.
+    const context = () =>
+      heading.evaluate((node) => {
+        const parsed = JSON.parse((node as HTMLElement).dataset.vscodeContext!) as Record<string, unknown>;
+        delete parsed.sessionTurnsShut;
+        delete parsed.sessionTurnsOpen;
+        return parsed;
+      });
     const initialContext = await context();
     for (const value of [false, true, false, true]) {
       await post(page, { type: 'setSessionRead', session: 's1', read: value });

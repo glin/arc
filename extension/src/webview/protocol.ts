@@ -347,6 +347,7 @@ export type HostToPanel =
   | { type: 'setSessionRead'; session: string; read: boolean }
   | { type: 'setSessionArchived'; session: string; archived: boolean }
   | { type: 'setSessionPinned'; session: string; pinned: boolean }
+  | { type: 'setSessionTurnsOpen'; session: string; open: boolean }
   | { type: 'setComposerHidden'; hidden: boolean }
   | { type: 'results'; query: string; hits: SearchHit[]; scope: string }
   | RenderMessage;
@@ -396,6 +397,7 @@ const HOST_TO_PANEL_KINDS: Record<HostToPanel['type'], true> = {
   setSessionRead: true,
   setSessionArchived: true,
   setSessionPinned: true,
+  setSessionTurnsOpen: true,
   setComposerHidden: true,
   results: true,
   render: true,
@@ -987,6 +989,8 @@ export function parseHostToPanel(raw: unknown): HostToPanel | null {
         : null;
     case 'setSessionPinned':
       return isString(m.session) ? { type: 'setSessionPinned', session: m.session, pinned: m.pinned === true } : null;
+    case 'setSessionTurnsOpen':
+      return isString(m.session) ? { type: 'setSessionTurnsOpen', session: m.session, open: m.open === true } : null;
     case 'setComposerHidden':
       return { type: 'setComposerHidden', hidden: m.hidden === true };
     case 'results':
@@ -1496,6 +1500,8 @@ export function dispatchHostToPanel(message: HostToPanel, handlers: HostToPanelH
       return handlers.setSessionArchived(message);
     case 'setSessionPinned':
       return handlers.setSessionPinned(message);
+    case 'setSessionTurnsOpen':
+      return handlers.setSessionTurnsOpen(message);
     case 'setComposerHidden':
       return handlers.setComposerHidden(message);
     case 'results':

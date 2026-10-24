@@ -3,6 +3,7 @@ import { cacheHitText, diffHalves, type CacheHitDetail } from '../view/stat-deta
 import { ARRIVAL_WORD } from '../view/card-presentation.ts';
 import type { DetailRows } from './card-rows.ts';
 import { drawContextDetail, type ContextDetailView } from './context-detail.ts';
+import { appendNameText } from './inline-text.ts';
 
 // Delay after the pointer leaves a chip or popover. This lets the pointer cross the gap without pinning.
 export const HOVER_GRACE_MS = 150;
@@ -141,7 +142,8 @@ export interface StatDetailRenderer {
   attachNested(nested: StatDetailRenderer): void;
   // Pin the current popover without changing its anchor. Clear focus return to avoid targeting a hidden outer popover.
   pinCurrent(): void;
-  mount(node: HTMLElement, ownStop?: boolean): () => void;
+  // A press-only anchor opens its popover pinned on a press, and a hover or focus opens nothing.
+  mount(node: HTMLElement, ownStop?: boolean, pressOnly?: boolean): () => void;
   update(
     node: HTMLElement,
     detail: CurrentDetail<string | null | undefined>,
@@ -152,6 +154,7 @@ export interface StatDetailRenderer {
     detail: CurrentDetail<string | null | undefined>,
     detailList: CurrentDetail<StatDetailList | null | undefined>,
     ownStop?: boolean,
+    pressOnly?: boolean,
   ): void;
   retarget(
     within: HTMLElement,
@@ -490,6 +493,8 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
       if (messages) messages.open = contextMessagesOpen;
       return;
     }
+    // Only the Context detail is a focus target of its own. Every other drawing starts unfocusable.
+    pop.removeAttribute('tabindex');
     pop.classList.toggle('chippop-stacked', listValue?.layout === 'stacked');
     pop.classList.toggle('chippop-tools', listValue?.layout === 'tool-breakdown');
     pop.classList.toggle('chippop-skills', listValue?.layout === 'skills');
@@ -591,9 +596,17 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
       appendNotes(listValue.notes);
       return;
     }
-    for (const line of (detail || '').split(/\r?\n/)) {
+    // The first line of a name anchor's detail is the name. It draws as the name hint draws it.
+    const named = anchor?.dataset.hintKind === 'name';
+    (detail || '').split(/\r?\n/).forEach((line, at) => {
+      if (named && at === 0 && line) {
+        const row = el('div', 'chippopline chippopname');
+        appendNameText(document, row, line);
+        pop.appendChild(row);
+        return;
+      }
       pop.appendChild(el('div', line ? 'chippopline' : 'chippopline gap', line || ' '));
-    }
+    });
   };
   // Ignore focus departure during redraws. Removing focused rows does not represent reader navigation.
   let redrawing = false;
@@ -752,7 +765,7 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
     markPinned(node);
     options.onPin?.(node);
   };
-  const mount = (node: HTMLElement, ownStop = false) => {
+  const mount = (node: HTMLElement, ownStop = false, pressOnly = false) => {
     const existing = cleanups.get(node);
     if (existing) {
       return existing;
@@ -792,6 +805,7 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
     };
     // Body-mounted popovers sit outside the anchor's document order.
     // Tab enters at the first Tab stop. ArrowDown enters at the first button.
+    // A pinned drawing taller than the box with neither enters the box itself, which the keys then scroll.
     const keydown = (event: KeyboardEvent) => {
       // Record rows can contain controls without declaring actions. Inspect the drawn controls.
       if ((!pinned && !options.actionAnchor) || anchor !== node) {
@@ -800,19 +814,24 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
       if (event.key !== 'ArrowDown' && (event.key !== 'Tab' || event.shiftKey)) {
         return;
       }
-      const first = event.key === 'Tab' ? tabStops()[0] : actionButtons()[0];
+      const stop = event.key === 'Tab' ? tabStops()[0] : actionButtons()[0];
+      const scrolls = pinned && !tabStops().length && pop.scrollHeight > pop.clientHeight;
+      const first = stop ?? (scrolls ? pop : null);
       if (!first) {
         return;
       }
       event.preventDefault();
       event.stopPropagation();
+      if (first === pop) pop.tabIndex = -1;
       first.focus();
     };
     node.addEventListener('keydown', keydown);
-    node.addEventListener('pointerenter', enter);
-    node.addEventListener('pointerleave', leave);
+    if (!pressOnly) {
+      node.addEventListener('pointerenter', enter);
+      node.addEventListener('pointerleave', leave);
+      node.addEventListener('focus', focus);
+    }
     node.addEventListener('pointercancel', away);
-    node.addEventListener('focus', focus);
     node.addEventListener('blur', away);
     node.addEventListener('click', click);
     const cleanup = () => {
@@ -862,8 +881,8 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
       }
     }
   };
-  const connect: StatDetailRenderer['connect'] = (node, detail, detailList, ownStop) => {
-    mount(node, ownStop);
+  const connect: StatDetailRenderer['connect'] = (node, detail, detailList, ownStop, pressOnly) => {
+    mount(node, ownStop, pressOnly);
     update(node, detail, detailList);
   };
   const layout: StatDetailRenderer['layout'] = (node, visible) => {

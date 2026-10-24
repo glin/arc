@@ -294,6 +294,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // Forward pin changes from the session heading menu. This menu remains available when the session list is hidden.
   reg('arc.pinSession', (arg) => setSessionPinned(panel, arg, true));
   reg('arc.unpinSession', (arg) => setSessionPinned(panel, arg, false));
+  // Forward the session heading menu's bulk turn entries to the webview, which owns open turns.
+  reg('arc.expandShownTurns', (arg) => setSessionTurnsOpen(panel, arg, true));
+  reg('arc.collapseShownTurns', (arg) => setSessionTurnsOpen(panel, arg, false));
   reg('arc.copySessionId', (arg) => copySessionId(panel, arg));
   reg('arc.showSessionDetails', (arg) => showSessionDetails(panel, arg));
   reg('arc.exportSession', (arg) => {
@@ -2566,6 +2569,14 @@ function setSessionPinned(panel: PanelProvider, arg: unknown, pinned: boolean): 
     return;
   }
   panel.setSessionPinned(session, pinned);
+}
+
+function setSessionTurnsOpen(panel: PanelProvider, arg: unknown, open: boolean): void {
+  const session = sessionIdFrom(arg);
+  if (!session) {
+    return;
+  }
+  panel.setSessionTurnsOpen(session, open);
 }
 
 function copySessionId(panel: PanelProvider, arg: unknown): void {

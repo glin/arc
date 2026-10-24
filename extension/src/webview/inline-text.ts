@@ -18,3 +18,12 @@ export function inlineText<T extends ComponentChild | Node>(
   }
   return children;
 }
+
+// Appends a name as text with a line break opportunity after each path separator that has a
+// word on both sides, so a path wraps between its folders and `/review` stays whole.
+export function appendNameText(document: Document, parent: Node, text: string): void {
+  text.split(/(?<=\S[/\\])(?=\S)/).forEach((part, index) => {
+    if (index > 0) parent.appendChild(document.createElement('wbr'));
+    parent.appendChild(document.createTextNode(part));
+  });
+}

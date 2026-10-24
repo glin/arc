@@ -74,6 +74,7 @@ export interface Shot {
   subagentContext?: SubagentContextCase; // Load the popover fixture with this subagent results case.
   draft?: boolean; // Load a draft into the prompt box.
   unsent?: boolean; // Load a session list card with unsent reader input.
+  longName?: boolean; // Name the first session with a long prompt that holds a path and slash commands.
   subagents?: boolean; // Load sessions and the long turn card with running background subagents.
   // Load live requests. `true` supplies a permission request and one question.
   // `three` supplies tabbed questions. `six` supplies questions spanning more than two rows.
@@ -303,7 +304,12 @@ export const SHOTS: Shot[] = [
     railDensity: 'compact',
     hover: '#rail .railcard',
   },
-  { name: 'wide-session-heading-hint', width: 1350, hover: '.session' },
+  // The narrow state comes first, so the wide one restores the width the states after it inherit.
+  { name: 'narrow-session-heading-hint', width: 340, longName: true, hover: '.session' },
+  { name: 'wide-session-heading-hint', width: 1350, longName: true, hover: '.session' },
+  // A press pins the whole name open. A second press closes it before the next state.
+  { name: 'narrow-session-heading-pinned', width: 340, longName: true, click: '.session', after: '.session' },
+  { name: 'wide-session-heading-pinned', width: 1350, longName: true, click: '.session', after: '.session' },
   { name: 'wide-rail-hint', hover: '.railrow .railhide' },
   { name: 'wide-launcher-menu-hint', hover: '#rail .railnewmenu' },
   { name: 'wide-project-cost', click: '.projectspendrailhost .projectspendbutton' },
@@ -773,6 +779,16 @@ function unsentPayload(): Record<string, unknown> {
   return payload;
 }
 
+// A session named by its first prompt, with a path, slash commands and a session ID in it.
+const LONG_SESSION_NAME =
+  'C:/Users/greg/Documents/arc/.claude/plans/2026/10/2026-10-24-arc-start-session-link/plan.md /review this plan again, get a sol high review too then /ship it if it makes sense. also see claude sesion 10d8aebf-803c-465d-b2ed-365386af7d7c /close-session and archive it if everyhthing there is done, you were taking over';
+
+function longNamePayload(): Record<string, unknown> {
+  const payload = renderPayload() as { sessions: Record<string, unknown>[] };
+  payload.sessions[0] = { ...payload.sessions[0], label: LONG_SESSION_NAME, fullLabel: LONG_SESSION_NAME };
+  return payload;
+}
+
 function waitingPayload(): Record<string, unknown> {
   const payload = renderPayload() as {
     cards: Record<string, unknown>[];
@@ -1140,6 +1156,10 @@ export async function shoot(
     await page.evaluate(`window.postMessage(${JSON.stringify(draftRenderPayload())}, '*')`);
     await page.evaluate(SETTLED);
   }
+  if (shot.longName) {
+    await page.evaluate(`window.postMessage(${JSON.stringify(longNamePayload())}, '*')`);
+    await page.evaluate(SETTLED);
+  }
   if (shot.unsent) {
     await page.evaluate(`window.postMessage(${JSON.stringify(unsentPayload())}, '*')`);
     await page.evaluate(SETTLED);
@@ -1476,7 +1496,14 @@ export async function shoot(
     await page.evaluate(SETTLED);
   }
   // Restore the default payload after captures that replace its layout, sessions, or prompt box state.
-  if (shot.layout || shot.pinned || shot.railLens || shot.launcherPins !== undefined || shot.contextDetail) {
+  if (
+    shot.layout ||
+    shot.pinned ||
+    shot.longName ||
+    shot.railLens ||
+    shot.launcherPins !== undefined ||
+    shot.contextDetail
+  ) {
     await page.evaluate(`window.postMessage(${JSON.stringify(renderPayload())}, '*')`);
     await page.evaluate(SETTLED);
   }

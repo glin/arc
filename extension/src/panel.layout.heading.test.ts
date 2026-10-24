@@ -165,7 +165,7 @@ test('a draft draws its tag over four enabled pickers and no window figure', { t
 });
 
 test(
-  'a press on the session heading opens every turn, and never leaves the heading over nothing',
+  'a Shift press on a turn head opens every shown turn, and never leaves the session over nothing',
   { timeout: 60_000 },
   async (t) => {
     const browser = await browserOrNone();
@@ -187,20 +187,21 @@ test(
       const READING = `(() => {
       const head = document.querySelector('#list .session');
       const group = document.querySelector('#list .group');
+      const turnHead = group.querySelector('.turn button.head');
       const bodies = [...group.querySelectorAll(':scope > .turn > .body, :scope > .compaction > .body')];
       return {
-        twist: head.querySelector('.twist').textContent,
+        twists: head.querySelectorAll('.twist').length,
         hint: head.dataset.hint,
-        hintDetail: head.dataset.hintDetail,
+        hintDetail: head.dataset.hintDetail ?? '',
         nativeTitle: head.getAttribute('title'),
         label: head.getAttribute('aria-label'),
         expanded: head.getAttribute('aria-expanded'),
         controls: head.getAttribute('aria-controls'),
-        groupId: group.id,
+        turnDetail: turnHead.dataset.hintDetail ?? '',
+        turnTitle: turnHead.getAttribute('title'),
         headHeight: head.getBoundingClientRect().height,
         groupHeight: group.getBoundingClientRect().height,
         cards: group.querySelectorAll(':scope > .turn, :scope > .compaction').length,
-        turns: group.querySelectorAll(':scope > .turn').length,
         bodies: bodies.length,
         shown: bodies.filter((b) => b.getBoundingClientRect().height > 0).length,
         read: group.querySelectorAll(':scope > .turn.is-read, :scope > .compaction.is-read').length,
@@ -210,20 +211,24 @@ test(
         turnsChipText: document.querySelector('#list .sessionstats [data-metric="turns"]')?.textContent ?? null,
       };
     })()`;
-      const pressHeading = `(() => { document.querySelector('#list .session').click(); })()`;
+      const shiftPress = () =>
+        page
+          .locator('#list .turn button.head')
+          .last()
+          .click({ modifiers: ['Shift'] });
       interface Reading {
-        twist: string;
+        twists: number;
         hint: string;
         hintDetail: string;
         nativeTitle: string | null;
         label: string;
         expanded: string | null;
         controls: string | null;
-        groupId: string;
+        turnDetail: string;
+        turnTitle: string | null;
         headHeight: number;
         groupHeight: number;
         cards: number;
-        turns: number;
         bodies: number;
         shown: number;
         read: number;
@@ -261,108 +266,63 @@ test(
           null,
           `the session heading press still carries a native browser title at ${width}px`,
         );
+        assert.equal(shut.turnTitle, null, `the turn head still carries a native browser title at ${width}px`);
         assert.equal(
           shut.hint,
           fullTitle,
-          `the heading hint offers "${shut.hint}" instead of the full session title at ${width}px while every turn under it is shut`,
+          `the heading hint offers "${shut.hint}" instead of the full name at ${width}px`,
+        );
+        // The heading is a name, not a disclosure. Nothing on it says it folds the turns.
+        assert.equal(shut.twists, 0, `the session heading still draws a twist at ${width}px`);
+        assert.equal(shut.expanded, null, `the session heading still says aria-expanded at ${width}px`);
+        assert.equal(shut.controls, null, `the session heading still names the turn list at ${width}px`);
+        assert.doesNotMatch(
+          `${shut.label} ${shut.hintDetail}`,
+          /every shown turn/,
+          `the session heading still offers the bulk turn action at ${width}px`,
         );
         assert.ok(
-          shut.hintDetail.endsWith(CARD_ACTIONS.expandAllTurns),
-          `the heading hint second line offers "${shut.hintDetail}" at ${width}px while every turn under it is shut`,
+          shut.turnDetail.endsWith(CARD_ACTIONS.expandShownDetail),
+          `the turn head hint ends "${shut.turnDetail}" at ${width}px while every turn is shut`,
         );
         await page.locator('#list .session').hover();
         await page.clock.fastForward(350);
         assert.equal(
           await page.locator('#hintpop .hinttitle').textContent(),
           fullTitle,
-          `hovering the session heading does not show its full title first at ${width}px`,
-        );
-        assert.ok(
-          ((await page.locator('#hintpop .hintdetail').textContent()) ?? '').endsWith(CARD_ACTIONS.expandAllTurns),
-          `hovering the session heading does not show its action second at ${width}px while every turn is shut`,
-        );
-        // The heading exposes the turn group and its expansion state to screen readers.
-
-        assert.ok(shut.groupId, `the group of turns has no id at ${width}px, so nothing can name it`);
-        assert.equal(
-          shut.controls,
-          shut.groupId,
-          `the heading names "${shut.controls}" at ${width}px rather than the turns under it`,
-        );
-        assert.equal(
-          shut.expanded,
-          'false',
-          `the heading says aria-expanded="${shut.expanded}" at ${width}px while every turn under it is collapsed`,
+          `hovering the session heading does not show its full name first at ${width}px`,
         );
 
-        await page.evaluate(pressHeading);
+        await shiftPress();
         await page.evaluate(SETTLED);
         const open = (await page.evaluate(READING)) as Reading;
         assert.deepEqual(failures, [], 'the panel threw while opening every turn');
         // Opening all turns must make every body visible and increase the group height.
 
-        assert.equal(open.shown, open.bodies, `the press opened ${open.shown} of ${open.bodies} turns at ${width}px`);
+        assert.equal(
+          open.shown,
+          open.bodies,
+          `the Shift press opened ${open.shown} of ${open.bodies} turns at ${width}px`,
+        );
         assert.equal(
           open.read,
           open.markable,
-          `the group press marked ${open.read} of ${open.markable} eligible cards read at ${width}px`,
+          `the Shift press marked ${open.read} of ${open.markable} eligible cards read at ${width}px`,
         );
         assert.ok(
           open.groupHeight > shut.groupHeight,
           `the turns opened and the session is still ${Math.round(open.groupHeight)}px tall at ${width}px`,
         );
-        // The heading and cards remain visible after expansion.
-
         assert.ok(open.headHeight > 0, `the heading has no height of its own at ${width}px`);
         assert.equal(open.cards, shut.cards, `the press took cards off the list at ${width}px`);
-        assert.equal(
-          open.hint,
-          fullTitle,
-          `the heading hint loses the full session title at ${width}px while every turn under it is open`,
-        );
         assert.ok(
-          open.hintDetail.endsWith(CARD_ACTIONS.collapseAllTurns),
-          `the heading hint second line offers "${open.hintDetail}" at ${width}px while every turn under it is open`,
-        );
-        assert.equal(
-          await page.locator('#hintpop').isHidden(),
-          false,
-          `the open session heading closes its already-open hint at ${width}px`,
-        );
-        assert.equal(
-          await page.locator('#hintpop .hinttitle').textContent(),
-          fullTitle,
-          `the already-open hint loses the full title at ${width}px after opening every turn`,
-        );
-        assert.ok(
-          ((await page.locator('#hintpop .hintdetail').textContent()) ?? '').endsWith(CARD_ACTIONS.collapseAllTurns),
-          `the already-open hint does not update its action at ${width}px after opening every turn`,
-        );
-        await page.locator('#list .session').hover();
-        await page.clock.fastForward(350);
-        assert.equal(
-          await page.locator('#hintpop .hinttitle').textContent(),
-          fullTitle,
-          `hovering the open session heading does not show its full title first at ${width}px`,
-        );
-        assert.ok(
-          ((await page.locator('#hintpop .hintdetail').textContent()) ?? '').endsWith(CARD_ACTIONS.collapseAllTurns),
-          `hovering the open session heading does not show its action second at ${width}px`,
-        );
-        assert.equal(
-          open.expanded,
-          'true',
-          `the heading says aria-expanded="${open.expanded}" at ${width}px while every turn under it is expanded`,
-        );
-        assert.notEqual(open.twist, shut.twist, `the twist is drawn the same way open and shut at ${width}px`);
-        assert.ok(
-          open.label.endsWith(CARD_ACTIONS.collapseAllTurns),
-          `the heading is announced as "${open.label}" at ${width}px, which does not say what the next press does`,
+          open.turnDetail.endsWith(CARD_ACTIONS.collapseShownDetail),
+          `the turn head hint ends "${open.turnDetail}" at ${width}px while every turn is open`,
         );
 
         // Collapsing all turns keeps the heading and cards in the session.
 
-        await page.evaluate(pressHeading);
+        await shiftPress();
         await page.evaluate(SETTLED);
         const again = (await page.evaluate(READING)) as Reading;
         assert.deepEqual(failures, [], 'the panel threw while shutting every turn');
@@ -372,35 +332,21 @@ test(
           again.groupHeight > 0,
           `the second press folded the session away at ${width}px, leaving the heading over nothing`,
         );
-        assert.ok(
-          again.hintDetail.endsWith(CARD_ACTIONS.expandAllTurns),
-          `the heading hint second line offers "${again.hintDetail}" at ${width}px after shutting every turn under it`,
-        );
 
-        // Opening one turn independently must leave the heading action set to expand all turns.
+        // A plain press opens one turn alone, and the Shift line still offers to expand every turn.
 
-        await page.evaluate(`document.querySelector('#list .turn .head').click()`);
+        await page.locator('#list .turn button.head').first().click();
         await page.evaluate(SETTLED);
         const one = (await page.evaluate(READING)) as Reading;
         assert.equal(one.shown, 1, `opening one turn by its own head row drew ${one.shown} of them at ${width}px`);
-        assert.equal(
-          one.twist,
-          again.twist,
-          `one turn of ${one.bodies} is open at ${width}px and the twist already points the way it does when all of them are`,
-        );
         assert.ok(
-          one.hintDetail.endsWith(CARD_ACTIONS.expandAllTurns),
-          `the heading hint second line offers "${one.hintDetail}" at ${width}px while one turn of many is open`,
+          one.turnDetail.endsWith(CARD_ACTIONS.expandShownDetail),
+          `the turn head hint ends "${one.turnDetail}" at ${width}px while one turn of many is open`,
         );
-        assert.equal(
-          one.expanded,
-          'false',
-          `one turn of ${one.bodies} is expanded at ${width}px and the heading already says aria-expanded="${one.expanded}"`,
-        );
-        await page.evaluate(`document.querySelector('#list .turn .head').click()`);
+        await page.locator('#list .turn button.head').first().click();
         await page.evaluate(SETTLED);
       }
-      assert.deepEqual(failures, [], 'the panel threw while the heading was being pressed');
+      assert.deepEqual(failures, [], 'the panel threw while the turn heads were being pressed');
     } finally {
       await browser.close();
     }
@@ -619,7 +565,7 @@ test('a press on the heading row past the title leaves the session as it was', {
     await page.setContent(pageHtml());
     await layoutAt(page, 1350);
     const before = (await page.evaluate(
-      `document.querySelector('#list .session').getAttribute('aria-expanded')`,
+      `document.querySelector('#list .session').getAttribute('aria-pressed')`,
     )) as string;
     // Click halfway between the title text and layout gear. A stretched title button captures this empty-row press.
 
@@ -638,25 +584,25 @@ test('a press on the heading row past the title leaves the session as it was', {
     await page.mouse.click(point.x, point.y);
     await page.evaluate(SETTLED);
     const afterOutside = (await page.evaluate(
-      `document.querySelector('#list .session').getAttribute('aria-expanded')`,
+      `document.querySelector('#list .session').getAttribute('aria-pressed')`,
     )) as string;
     assert.equal(
       afterOutside,
       before,
-      `a press on the heading row past the title's own text changed aria-expanded from "${before}" to "${afterOutside}", ` +
-        'so the row toggled the session outside its title',
+      `a press on the heading row past the title's own text changed aria-pressed from "${before}" to "${afterOutside}", ` +
+        'so the row pinned the name outside its title',
     );
-    // Also press the title to distinguish a working toggle from a row that ignores every press.
+    // Also press the title to distinguish a working pin from a row that ignores every press.
 
     await page.evaluate(`document.querySelector('#list .session').click()`);
     await page.evaluate(SETTLED);
     const afterTitle = (await page.evaluate(
-      `document.querySelector('#list .session').getAttribute('aria-expanded')`,
+      `document.querySelector('#list .session').getAttribute('aria-pressed')`,
     )) as string;
     assert.notEqual(
       afterTitle,
       before,
-      `pressing the title left aria-expanded at "${before}", so this guard cannot tell a working toggle from a dead row`,
+      `pressing the title left aria-pressed at "${before}", so this guard cannot tell a working pin from a dead row`,
     );
   } finally {
     await browser.close();
@@ -687,7 +633,7 @@ test(
       assert.ok(found.fullTime, 'the heading carries no hidden full local time for its last activity');
       // The heading hint exposes the full local time to pointer users.
       assert.ok(
-        found.detail.startsWith(`${CARD_ACTIONS.lastActive} ${found.fullTime}. `),
+        found.detail === `${CARD_ACTIONS.lastActive} ${found.fullTime}`,
         `the heading hint's second line is "${found.detail}", which drops the full local time "${found.fullTime}"`,
       );
       const name = await axName(page, '#list .sessionheading');

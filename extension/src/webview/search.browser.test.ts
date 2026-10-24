@@ -111,8 +111,8 @@ async function pageFor(t: TestContext): Promise<{ page: Page; close(): Promise<v
     const cardRenderer = createCardRenderer(cardOptions);
     const timeline = createTimelineRenderer({
       document, events, list, retained, cardRenderer, cardOptions, open, saveOpen() {},
-      twist: { open: '\u25be', shut: '\u25b8' }, cardPrint, interactions: comments,
-      beforeCardDraw(node) { comments.beforeCardDraw(node); }, rowContext: () => '{}',
+      cardPrint, interactions: comments,
+      beforeCardDraw(node) { comments.beforeCardDraw(node); }, rowContext: () => '{}', quietHint() {},
       pinned: () => false, setPinned() {}, labels: () => [],
       labelOpen: () => false, filterable: () => false, filterByLabel() {}, toggleLabelEditor() {}, toggleLayoutDialog() {},
       syncDetails() {}, setRoving: navigation.setRoving, allControls: navigation.allControls,
