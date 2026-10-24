@@ -1221,6 +1221,50 @@ test('a rail card keeps warning metadata, full detail, and every condition in it
   assert.match(railCardName(card), /whole session cost \$8\.02, Low cache reuse in this session/);
 });
 
+test('a rail card names a wait warning on its cost figure', () => {
+  const s = { id: 'a', label: 'Session a', agent: 'Codex', when: '2:32 PM', at: 4200, relative: '3 hours ago' };
+  const usage = (requests: number, input: number) => ({
+    requests,
+    input,
+    cacheWrite1h: 0,
+    cacheWrite5m: 0,
+    cacheRead: 0,
+    output: 0,
+    thinking: 0,
+  });
+  // claude-sonnet-5 input costs $2 per million tokens.
+  const projection = sessionCostProjection([
+    {
+      role: 'main',
+      model: 'claude-sonnet-5',
+      provider: null,
+      contextWindow: null,
+      usage: usage(20, 2_000_000),
+      waits: { requests: 5, timedOut: 2, usage: usage(5, 1_000_000) },
+    },
+  ]);
+  const [card] = railSessions(
+    [s],
+    new Map(),
+    new Map(),
+    new Map(),
+    new Set(),
+    null,
+    new Set(),
+    new Map(),
+    { a: projection.stats },
+    {},
+    {},
+    { a: projection.total },
+  );
+  const cost = railStatChips(projection.stats).find((chip) => chip.metric === 'cost')!;
+  assert.equal(cost.warnings?.length, 1);
+  assert.match(
+    railCardName(card),
+    /whole session cost \$4\.00, Waiting on subagents took 50% of the main agent's cost/,
+  );
+});
+
 test('a rail cache mark counts down a fast session where the model publishes a fast rate', () => {
   const requestAt = 1_000_000;
   const newest = (model: string, serviceTier: string): SessionStatFacts => ({

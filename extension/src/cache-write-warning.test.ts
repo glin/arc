@@ -318,38 +318,68 @@ const waited = (requests: number, input: number, timedOut = 0) => ({
   usage: counts({ requests, input }),
 });
 
-test('wait-share warning requires five waits, one dollar, and a quarter of the whole session cost', () => {
-  const flaggedWaits = (waits: ReturnType<typeof waited>, mainInput: number, delegatedInput = 0) => {
-    const owner = part({ role: 'main', usage: counts({ requests: 20, input: mainInput }), waits });
-    const delegated = delegatedInput
-      ? [part({ role: 'delegated', scopeId: 'child', usage: counts({ requests: 1, input: delegatedInput }) })]
-      : [];
-    return waitShareWarnings(main(owner), sessionCostProjection([owner, ...delegated]).total);
-  };
+test('wait-share warning requires five waits, one dollar, and a fifth of the main agent cost', () => {
+  const flaggedWaits = (waits: ReturnType<typeof waited>, mainInput: number) =>
+    waitShareWarnings(main(part({ role: 'main', usage: counts({ requests: 20, input: mainInput }), waits })));
   assert.equal(flaggedWaits(waited(4, 1_000_000), 2_000_000).length, 0);
   assert.deepEqual(flaggedWaits(waited(5, 1_000_000, 3), 2_000_000), [
-    { requests: 5, timedOut: 3, waitCost: 2, sessionCost: 4, share: 0.5 },
+    { scope: 'wait', requests: 5, timedOut: 3, waitCost: 2, mainCost: 4, share: 0.5 },
   ]);
   assert.equal(flaggedWaits(waited(5, 495_000), 1_000_000).length, 0);
   assert.equal(flaggedWaits(waited(5, 500_000), 1_000_000).length, 1);
-  assert.equal(flaggedWaits(waited(5, 1_000_000), 4_100_000).length, 0);
-  assert.equal(flaggedWaits(waited(5, 1_000_000), 4_000_000).length, 1);
-  // The main scope alone is half waiting, but delegated work keeps the session share under a quarter.
-  assert.equal(flaggedWaits(waited(5, 1_000_000), 2_000_000, 2_100_000).length, 0);
+  assert.equal(flaggedWaits(waited(5, 1_000_000), 5_100_000).length, 0);
+  assert.equal(flaggedWaits(waited(5, 1_000_000), 5_000_000).length, 1);
 });
 
-test('wait-share warning stays silent unless the main scope and the session total are complete and priced', () => {
+test('delegated work does not dilute the wait-share warning on the session cost figure', () => {
+  // The waits are a fifth of the main agent's cost and a tenth of the whole session's cost.
+  const owner = part({ role: 'main', usage: counts({ requests: 20, input: 5_000_000 }), waits: waited(5, 1_000_000) });
+  const child = part({ role: 'delegated', scopeId: 'child', usage: counts({ requests: 1, input: 5_000_000 }) });
+  const chip = sessionCostProjection([owner, child]).stats[0];
+  assert.equal(chip.label, '$20');
+  assert.deepEqual(
+    chip.warnings?.map((warning) => warning.scope),
+    ['wait'],
+  );
+  assert.deepEqual(chip.detailList!.entries[0].lines?.[0], {
+    text: "Waiting on subagents took 20% of the main agent's cost: $2.00 of $10 went to 5 waits, 0 of them timed out",
+    warning: true,
+  });
+});
+
+test('wait-share warning stays silent unless the main scope is complete and priced', () => {
   const owner = part({ role: 'main', usage: counts({ requests: 20, input: 2_000_000 }), waits: waited(5, 1_000_000) });
-  const total = sessionCostProjection([owner]).total;
-  assert.equal(waitShareWarnings(main(owner), total).length, 1);
-  assert.deepEqual(waitShareWarnings({ ...main(owner), incomplete: true }, total), []);
-  assert.deepEqual(waitShareWarnings(main({ ...owner, incomplete: true }), total), []);
-  assert.deepEqual(waitShareWarnings(main(owner, part({ role: 'main', model: 'unknown' })), total), []);
-  assert.deepEqual(waitShareWarnings(main(owner), { ...total, partial: true }), []);
-  assert.deepEqual(waitShareWarnings(main(owner), { dollars: null, partial: false }), []);
+  assert.equal(waitShareWarnings(main(owner)).length, 1);
+  assert.deepEqual(waitShareWarnings({ ...main(owner), incomplete: true }), []);
+  assert.deepEqual(waitShareWarnings(main({ ...owner, incomplete: true })), []);
+  assert.deepEqual(waitShareWarnings(main(owner, part({ role: 'main', model: 'unknown' }))), []);
+  assert.deepEqual(waitShareWarnings(main()), []);
+  const unsplit = sessionCostProjection([owner], { main: true, delegated: false, delegatedScopeIds: new Set() })
+    .stats[0];
+  assert.equal(unsplit.warnings, undefined);
 });
 
-test('the wait-share line sits under the main agent entry after the cache line and leaves the chip unchanged', () => {
+test('unpriced or incomplete delegated work keeps the wait-share warning on a partial session cost', () => {
+  const owner = part({ role: 'main', usage: counts({ requests: 20, input: 2_000_000 }), waits: waited(5, 1_000_000) });
+  const child = part({ role: 'delegated', scopeId: 'child', usage: counts({ requests: 1, input: 1_000_000 }) });
+  const sentence =
+    "Waiting on subagents took 50% of the main agent's cost: $2.00 of $4.00 went to 5 waits, 0 of them timed out";
+  for (const projection of [
+    sessionCostProjection([owner, { ...child, model: 'unknown' }]),
+    sessionCostProjection([owner, child], { main: false, delegated: true, delegatedScopeIds: new Set(['child']) }),
+  ]) {
+    const chip = projection.stats[0];
+    assert.equal(projection.total.partial, true);
+    assert.match(chip.label, /\+$/);
+    assert.deepEqual(
+      chip.warnings?.map((warning) => warning.scope),
+      ['wait'],
+    );
+    assert.deepEqual(chip.detailList!.entries[0].lines?.[0], { text: sentence, warning: true });
+  }
+});
+
+test('the wait-share line sits under the main agent entry after the cache line and signs the figure', () => {
   const writeHeavy = counts({ requests: 5, cacheWrite1h: 2_000_000, cacheRead: 100_000 });
   const waits = { requests: 5, timedOut: 2, usage: counts({ requests: 5, cacheWrite1h: 1_000_000 }) };
   const plain = sessionCostProjection([part({ role: 'main', usage: writeHeavy })]).stats[0];
@@ -359,23 +389,37 @@ test('the wait-share line sits under the main agent entry after the cache line a
   assert.deepEqual(entry.lines?.slice(0, 2), [
     { text: 'Low cache reuse in this session: $8.00 of $8.02 went to cache writes', warning: true },
     {
-      text: "Waiting on subagents took 50% of this session's cost: $4.00 of $8.02 went to 5 waits, 2 of them timed out",
+      text: "Waiting on subagents took 50% of the main agent's cost: $4.00 of $8.02 went to 5 waits, 2 of them timed out",
       warning: true,
     },
   ]);
   assert.deepEqual(entry.lines?.slice(2), plain.detailList!.entries[0].lines?.slice(1));
-  // The chip keeps its label and warning sign. Its accessible name reads the detail, line included.
-  assert.deepEqual([chip.label, chip.warnings], [plain.label, plain.warnings]);
+  // The figure keeps its label and adds the wait warning. Its accessible name reads the detail, line included.
+  assert.equal(chip.label, plain.label);
+  assert.deepEqual(
+    chip.warnings?.map((warning) => warning.scope),
+    ['main', 'wait'],
+  );
   assert.ok(chip.name?.includes('Waiting on subagents took 50%'));
   const alone = sessionCostProjection([
     part({ role: 'main', usage: counts({ requests: 20, input: 2_000_000 }), waits: waited(5, 1_000_000, 1) }),
   ]).stats[0];
   assert.equal(alone.detailList!.entries[0].label, 'Cost by usage · sonnet-5');
   assert.deepEqual(alone.detailList!.entries[0].lines?.[0], {
-    text: "Waiting on subagents took 50% of this session's cost: $2.00 of $4.00 went to 5 waits, 1 of them timed out",
+    text: "Waiting on subagents took 50% of the main agent's cost: $2.00 of $4.00 went to 5 waits, 1 of them timed out",
     warning: true,
   });
-  assert.equal(alone.warnings, undefined);
+  assert.deepEqual(
+    alone.warnings?.map((warning) => warning.scope),
+    ['wait'],
+  );
+  assert.equal(alone.headDetail, true);
+  assert.ok(alone.name?.includes('Waiting on subagents took 50%'));
+  const under = sessionCostProjection([
+    part({ role: 'main', usage: counts({ requests: 20, input: 2_000_000 }), waits: waited(4, 1_000_000) }),
+  ]).stats[0];
+  assert.equal(under.warnings, undefined);
+  assert.equal(under.name, undefined);
 });
 
 test('a wait-share line without a cache warning keeps the delegated work entry', () => {
@@ -387,7 +431,7 @@ test('a wait-share line without a cache warning keeps the delegated work entry',
     ['Main agent · sonnet-5', 'Delegated work'],
   );
   assert.deepEqual(entries[0].lines?.[0], {
-    text: "Waiting on subagents took 33% of this session's cost: $2.00 of $6.00 went to 5 waits, 0 of them timed out",
+    text: "Waiting on subagents took 50% of the main agent's cost: $2.00 of $4.00 went to 5 waits, 0 of them timed out",
     warning: true,
   });
 });

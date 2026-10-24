@@ -129,11 +129,11 @@ The warning stays absent until the scope is complete and every required cache-wr
 
 ### Respond to a high wait share
 
-`Waiting on subagents took 55% of this session's cost` means the main session's requests that read a `wait_agent` return cost at least a quarter of the session's estimated total. At least five such requests must cost at least $1 in total. The line names the wait cost against the session total, the number of waits, and how many of them timed out.
+`Waiting on subagents took 27% of the main agent's cost` reports the cost of waiting. The main agent's requests that read a `wait_agent` return cost at least a fifth of the main agent's estimated cost. At least five such requests must cost at least $1 in total. Delegated work does not enter the share. The line names the wait cost against the main agent's cost, the number of waits, and how many of them timed out. A turn's line reads `this turn's main agent cost` and applies the same numbers to that turn alone. The turn, session heading, and Session list cost figures carry the warning sign.
 
 A timed-out wait is a request that brought back no news. [Lower agent costs](lowering-agent-costs.md#wait-without-repeated-model-requests) explains native wait configuration and its limits. A request after a subagent message or completion also carries the parent's reasoning and reply, so the share overstates pure waiting.
 
-The line stays absent until the main session and the session total are complete and every main-session request has a supported price.
+The line stays absent until the main agent's usage is complete and every main-agent request has a supported price. Claude records no waits, so a Claude session never shows the line.
 
 ## Lower the cost of waiting on subagents
 

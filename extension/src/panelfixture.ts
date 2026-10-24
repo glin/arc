@@ -1575,6 +1575,73 @@ export function cacheWriteWarningPayload(): Record<string, unknown> {
   };
 }
 
+// A Codex coordinator whose main agent spent over a fifth of its cost reading subagent wait returns.
+// Delegated work keeps the waits under a quarter of the whole session's cost.
+export function waitWarningPayload(): Record<string, unknown> {
+  const payload = renderPayload();
+  const usage = (over: Partial<Turn['usage']>): Turn['usage'] => {
+    const counts = {
+      requests: 1,
+      input: 0,
+      cacheWrite1h: 0,
+      cacheWrite5m: 0,
+      cacheWrite30m: 0,
+      cacheRead: 0,
+      output: 0,
+      thinking: 0,
+      ...over,
+    };
+    return { ...counts, byContextBand: { short: { ...counts } } };
+  };
+  const part = {
+    model: 'gpt-6.1-sol',
+    provider: 'openai',
+    contextWindow: 1_050_000,
+    contextBand: 'short' as const,
+    inferenceClass: null,
+    serviceTier: null,
+  };
+  const ran = usage({ requests: 160, input: 900_000, cacheRead: 30_000_000, output: 240_000 });
+  const waits = {
+    requests: 42,
+    timedOut: 30,
+    usage: usage({ requests: 42, input: 60_000, cacheRead: 13_000_000, output: 9_000 }),
+  };
+  const turn: Turn = {
+    ...FIXTURE_TURNS[1],
+    agent: 'codex',
+    model: part.model,
+    provider: part.provider,
+    sessionTitle: 'Subagent waits',
+    contextWindow: part.contextWindow,
+    usage: ran,
+    usageParts: [{ ...part, usage: ran, waits }],
+    agents: [],
+    files: [],
+  };
+  const delegated = usage({ requests: 220, input: 1_400_000, cacheRead: 40_000_000, output: 380_000 });
+  const stats = {
+    s1: [
+      ...sessionCostProjection([
+        { agent: 'codex', role: 'main', ...part, usage: ran, waits },
+        { agent: null, role: 'delegated', scopeId: 'worker', ...part, usage: delegated },
+      ]).stats,
+      ...sessionTurnStats({ turnCount: 1, firstTurnAt: turn.startedAt, lastTurnAt: turn.endedAt, compactionCount: 0 }),
+    ],
+  };
+  const sessions = (payload.sessions as Parameters<typeof railSessions>[0])
+    .filter((session) => session.id === 's1')
+    .map((session) => ({ ...session, label: turn.sessionTitle!, agent: 'Codex', agentKey: 'codex' }));
+  return {
+    ...payload,
+    sessions,
+    stats,
+    views: [],
+    cards: [{ ...toCard(turn, false, NOW), summaryHtml: '<p>Waited on two reviewers.</p>' }],
+    rail: railSessions(sessions, new Map(), new Map(), new Map(), new Set(), 's1', new Set(), new Map(), stats, {}),
+  };
+}
+
 // Build compaction cards and render their summaries as Markdown, matching the host payload.
 export function compactionSummaryPayload(): Record<string, unknown> {
   const payload = renderPayload() as Record<string, unknown> & { cards: Record<string, unknown>[] };

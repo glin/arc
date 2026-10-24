@@ -170,8 +170,8 @@ export interface StatChip {
   level?: ContextLevel;
   word?: string;
   // Each warning draws the warning sign on the figure. A turn's cache expiry joins only at
-  // `CACHE_EXPIRY_SIGN_DOLLARS` or more. Session figures carry cache-write warnings only.
-  warnings?: (CacheWriteWarning | CacheExpiryWarning)[];
+  // `CACHE_EXPIRY_SIGN_DOLLARS` or more. Session figures carry cache-write and wait warnings only.
+  warnings?: (CacheWriteWarning | CacheExpiryWarning | WaitShareWarning)[];
 }
 
 // A turn whose first request returned to an expired cache.
@@ -2664,6 +2664,7 @@ function costDetailList(
     agentState(agent, statusOf(turn, true, turn.endedAt) === 'running', NO_AGENT_LIFE) === 'open',
   shares: readonly DispatchedShare[] = [],
   expiry: CacheExpiryWarning | null = null,
+  waitWarnings: readonly WaitShareWarning[] = [],
 ): StatDetailList {
   const total = cardCostOf(turn, shares);
   const sharedCosts = shares.flatMap((share) => share.costs);
@@ -2767,12 +2768,17 @@ function costDetailList(
     ) ||
     sharedCosts.some((cost) => cost.part.model === 'codex-auto-review' && cost.publiclyPriced);
   const expiryText = expiry ? cacheExpiryWarningText(expiry) : '';
+  // The wait sentence follows the cache-expiry sentence as its own entry, so their dollars never add.
+  const leading: StatDetailEntry[] = [
+    ...(expiryText ? [{ label: expiryText, warning: true }] : []),
+    ...waitWarnings.map((warning) => ({ label: waitShareText(warning, 'turn'), warning: true })),
+  ];
   return {
     heading: {
       label: 'Estimated total',
       value: totalLabel ? `${totalLabel}${total.partial ? '+' : ''}` : 'cost unavailable',
     },
-    entries: [...(expiryText ? [{ label: expiryText, warning: true }] : []), ...entries, ...included],
+    entries: [...leading, ...entries, ...included],
     // The compaction notes say part of the cost is a modelled estimate, so they stay visible.
     ...(mainEstimated || compactionNote || childCompactionNotes.length
       ? {
@@ -2800,11 +2806,17 @@ function warningLine(warning: CacheWriteWarning): StatDetailLine {
   };
 }
 
+// "Waiting on subagents took 27% of the main agent's cost", which the session list also reads.
+export function waitShareCondition(warning: WaitShareWarning, basis: 'session' | 'turn' = 'session'): string {
+  return `Waiting on subagents took ${Math.round(warning.share * 100)}% of ${basis === 'turn' ? "this turn's main agent cost" : "the main agent's cost"}`;
+}
+
+function waitShareText(warning: WaitShareWarning, basis: 'session' | 'turn'): string {
+  return `${waitShareCondition(warning, basis)}: ${formatCost(warning.waitCost)} of ${formatCost(warning.mainCost)} went to ${warning.requests} waits, ${warning.timedOut} of them timed out`;
+}
+
 function waitShareLine(warning: WaitShareWarning): StatDetailLine {
-  return {
-    text: `Waiting on subagents took ${Math.round(warning.share * 100)}% of this session's cost: ${formatCost(warning.waitCost)} of ${formatCost(warning.sessionCost)} went to ${warning.requests} waits, ${warning.timedOut} of them timed out`,
-    warning: true,
-  };
+  return { text: waitShareText(warning, 'session'), warning: true };
 }
 
 // Cache warnings come first, then the wait-share warning.
@@ -3656,15 +3668,18 @@ function chipsOf(
   // Keep a dispatched cost figure even when the parsed turn has no priced usage.
   const cost = formatCost(total.dollars) ?? (shares.length ? ZERO_COST : null);
   if (cost) {
-    const writeWarnings = cacheWriteWarnings(turnCacheWriteScopes(turn, turn.finished));
+    const scopes = turnCacheWriteScopes(turn, turn.finished);
+    const writeWarnings = cacheWriteWarnings(scopes);
+    const waitWarnings = waitShareWarnings(scopes[0]);
     const detailList = costDetailList(
       turn,
       writeWarnings,
       (agent) => agentState(agent, status === 'running', sessionLive) === 'open',
       shares,
       expiry,
+      waitWarnings,
     );
-    const warnings: (CacheWriteWarning | CacheExpiryWarning)[] = [
+    const warnings: (CacheWriteWarning | CacheExpiryWarning | WaitShareWarning)[] = [
       ...(expiry &&
       ((expiry.dollars !== null && expiry.dollars >= CACHE_EXPIRY_SIGN_DOLLARS) ||
         (expiry.main?.dollars !== null &&
@@ -3672,6 +3687,7 @@ function chipsOf(
           expiry.main.dollars >= CACHE_EXPIRY_SIGN_DOLLARS))
         ? [expiry]
         : []),
+      ...waitWarnings,
       ...writeWarnings,
     ];
     const detail = flatDetailList(detailList).join('\n');
@@ -4985,27 +5001,36 @@ export function cacheWriteWarnings(scopes: readonly CacheWriteScope[]): CacheWri
 }
 
 export interface WaitShareWarning {
+  scope: 'wait';
   requests: number;
   timedOut: number;
   waitCost: number;
-  sessionCost: number;
+  mainCost: number;
   share: number;
 }
 
-// The main session's requests that read a subagent wait return, against the whole session's cost.
-// The main scope and the session total must be complete and priced.
-export function waitShareWarnings(main: CacheWriteScope, total: SessionCostTotal): WaitShareWarning[] {
-  if (main.incomplete || total.partial || total.dollars === null || !(total.dollars > 0)) {
+// The wait warning's floors and share. A session's main agent and one turn's main agent both
+// need this many wait-reading requests, this many dollars of them, and this share of their cost.
+export const WAIT_WARNING_MIN_REQUESTS = 5;
+export const WAIT_WARNING_MIN_DOLLARS = 1;
+export const WAIT_WARNING_MIN_SHARE = 0.2;
+
+// The main agent's requests that read a subagent wait return, against the main agent's own cost.
+// Only Codex wait returns record waits. The main scope must be complete and priced.
+export function waitShareWarnings(main: CacheWriteScope): WaitShareWarning[] {
+  if (main.incomplete) {
     return [];
   }
   let requests = 0;
   let timedOut = 0;
   let waitCost = 0;
+  let mainCost = 0;
   for (const part of main.parts) {
     const priced = priceSessionCost(part);
     if (priced.partial || priced.dollars === null) {
       return [];
     }
+    mainCost += priced.dollars;
     if (!part.waits) {
       continue;
     }
@@ -5018,11 +5043,14 @@ export function waitShareWarnings(main: CacheWriteScope, total: SessionCostTotal
     timedOut += part.waits.timedOut;
     waitCost += wait.dollars;
   }
-  const share = waitCost / total.dollars;
-  if (requests < 5 || waitCost < 1 || share < 0.25) {
+  if (!(mainCost > 0)) {
     return [];
   }
-  return [{ requests, timedOut, waitCost, sessionCost: total.dollars, share }];
+  const share = waitCost / mainCost;
+  if (requests < WAIT_WARNING_MIN_REQUESTS || waitCost < WAIT_WARNING_MIN_DOLLARS || share < WAIT_WARNING_MIN_SHARE) {
+    return [];
+  }
+  return [{ scope: 'wait', requests, timedOut, waitCost, mainCost, share }];
 }
 
 export interface SessionCostProjection {
@@ -5648,10 +5676,10 @@ export function sessionCostProjection(
     })),
   ];
   const warnings = cacheWriteWarnings(warningScopes);
-  const waitWarnings = waitShareWarnings(warningScopes[0], total);
+  const waitWarnings = waitShareWarnings(warningScopes[0]);
   const hasAutoReview = delegated.some((cost) => cost.part.model === 'codex-auto-review');
   // Only a cache warning selects the per-scope layout. A wait warning joins the main entry of
-  // whichever layout applies and changes nothing else.
+  // whichever layout applies, and the figure's sign.
   const entries = warnings.length
     ? [
         ...(main.length || mainShort
@@ -5787,8 +5815,8 @@ export function sessionCostProjection(
   };
   chip.detailList = detailList;
   chip.detail = flatDetailList(detailList).join('\n');
-  if (warnings.length) {
-    chip.warnings = warnings;
+  if (warnings.length || waitWarnings.length) {
+    chip.warnings = [...warnings, ...waitWarnings];
     chip.name = chip.detail;
     chip.headDetail = true;
   }

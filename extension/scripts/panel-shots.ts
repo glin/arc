@@ -39,6 +39,7 @@ import {
   compactionSummaryPayload,
   cacheWriteWarningPayload,
   costOverheadsPayload,
+  waitWarningPayload,
   nextTurnPayload,
   pageHtml,
   renderPayload,
@@ -96,6 +97,7 @@ export interface Shot {
   compactionSummary?: 'collapsed' | 'expanded';
   cacheWriteWarning?: boolean;
   costOverheads?: boolean;
+  waitWarning?: boolean;
   composerSkill?: boolean;
   raisedComposer?: boolean;
   launcherPins?: number | 'unavailable'; // Pinned setups for the New session menu fixture, beside ten recent setups.
@@ -708,6 +710,20 @@ export const SHOTS: Shot[] = [
         costOverheads: true,
         click: '.chips [data-metric="cost"]',
       },
+      {
+        name: `${size}-wait-warning-session`,
+        width,
+        escape: true,
+        waitWarning: true,
+        click: '.sessionstats [data-metric="cost"]',
+      },
+      {
+        name: `${size}-wait-warning-turn`,
+        width,
+        escape: true,
+        waitWarning: true,
+        click: '.chips [data-metric="cost"]',
+      },
     ];
   }),
 ];
@@ -1167,7 +1183,7 @@ export async function shoot(
       await page.evaluate(SETTLED);
     }
   }
-  if (shot.cacheWriteWarning || shot.costOverheads) {
+  if (shot.cacheWriteWarning || shot.costOverheads || shot.waitWarning) {
     // Clear the session list query a preceding capture left, open or closed, so the list draws
     // the fixture's session. The clear control also closes the box.
     if (await page.locator('[data-control="railsearch"]').isVisible()) {
@@ -1185,6 +1201,10 @@ export async function shoot(
   }
   if (shot.costOverheads) {
     await page.evaluate(`window.postMessage(${JSON.stringify(costOverheadsPayload())}, '*')`);
+    await page.evaluate(SETTLED);
+  }
+  if (shot.waitWarning) {
+    await page.evaluate(`window.postMessage(${JSON.stringify(waitWarningPayload())}, '*')`);
     await page.evaluate(SETTLED);
   }
   if (shot.composerSkill) {

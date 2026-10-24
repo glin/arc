@@ -102,7 +102,14 @@ import {
   withoutLeadingSymbol,
 } from './turncard.ts';
 import { turnMenuContext } from './view/card-menu.ts';
-import type { SessionCostUsage, SessionOverheads, StatDetailLine, StatDetailList, TurnCard } from './turncard.ts';
+import type {
+  SessionCostUsage,
+  SessionOverheads,
+  SessionStatChip,
+  StatDetailLine,
+  StatDetailList,
+  TurnCard,
+} from './turncard.ts';
 import type { TurnStep } from './transcript.ts';
 import { answerPart, commentAnchorText } from './turncomments.ts';
 import { formatTokens, formatWhen } from './turnformat.ts';
@@ -131,7 +138,7 @@ import { applyHiddenTurnFields, hiddenTurnFields } from './parserstate.ts';
 import type { ChildArtifacts } from './childartifacts.ts';
 import { normalizeFsPath, sameCommitSha } from './transcript.ts';
 // Shared panel fixture for screenshots and measurements.
-import { FIXTURE_CLOCK, FIXTURE_TURNS, LONG_TURN_INDEX } from './panelfixture.ts';
+import { FIXTURE_CLOCK, FIXTURE_TURNS, LONG_TURN_INDEX, waitWarningPayload } from './panelfixture.ts';
 
 test('turn token detail places qualified measurement under Output before Thinking', () => {
   for (const provider of ['claude', 'codex'] as const) {
@@ -905,6 +912,83 @@ test('a turn that returned to an expired cache warns in its cost popover and fig
   assert.equal(gap(11), 'Cache expired after an 11m gap and added $1.00');
   assert.equal(gap(18 * 60), 'Cache expired after an 18h 0m gap and added $1.00');
   assert.equal(gap(61), 'Cache expired after a 1h 1m gap and added $1.00');
+});
+
+test('a Codex turn whose main agent spent a fifth of its cost on waits warns in its cost popover and figure', () => {
+  // claude-sonnet-5 input costs $2 per million tokens, so these fixtures price in whole dollars.
+  const waited = (requests: number, input: number, mainInput: number, over: Partial<Turn> = {}) => {
+    const usage = tokenUsage({ requests: 20, input: mainInput });
+    const waits = { requests, timedOut: 1, usage: tokenUsage({ requests, input }) };
+    return turn({
+      agent: 'codex',
+      finished: true,
+      model: 'claude-sonnet-5',
+      usage,
+      usageParts: [{ ...sonnetPart, usage, waits }],
+      ...over,
+    });
+  };
+  const cost = (ran: Turn, expiry: CacheExpiryWarning | null = null) =>
+    toCard(ran, false, NOW, [], null, false, new Set(), [], expiry).chips.find((chip) => chip.metric === 'cost')!;
+  const sentence =
+    "Waiting on subagents took 20% of this turn's main agent cost: $2.00 of $10 went to 5 waits, 1 of them timed out";
+  const signed = cost(waited(5, 1_000_000, 5_000_000));
+  assert.deepEqual(signed.detailList?.entries[0], { label: sentence, warning: true });
+  assert.deepEqual(
+    signed.warnings?.map((warning) => warning.scope),
+    ['wait'],
+  );
+  assert.ok(signed.name?.includes(sentence), 'the accessible name carries the full sentence');
+  const plainUsage = tokenUsage({ requests: 20, input: 5_000_000 });
+  const plain = cost(
+    turn({
+      agent: 'codex',
+      finished: true,
+      model: 'claude-sonnet-5',
+      usage: plainUsage,
+      usageParts: [{ ...sonnetPart, usage: plainUsage }],
+    }),
+  );
+  assert.equal(signed.label, plain.label, 'the warning changed the total');
+  assert.deepEqual(signed.detailList?.entries.slice(1), plain.detailList?.entries);
+  // Under any one floor, the turn shows neither the sentence nor the sign.
+  for (const under of [
+    waited(4, 1_000_000, 5_000_000),
+    waited(5, 495_000, 1_000_000),
+    waited(5, 1_000_000, 5_100_000),
+    waited(5, 1_000_000, 5_000_000, { finished: false }),
+  ]) {
+    const chip = cost(under);
+    assert.equal(chip.warnings, undefined);
+    assert.ok(!chip.detail.includes('Waiting on subagents'));
+    assert.ok(!chip.detailList?.entries.some((entry) => entry.warning));
+  }
+  // A cache-expiry sentence leads, and the wait sentence follows as its own entry.
+  const both = cost(waited(5, 1_000_000, 5_000_000), { scope: 'cache-expiry', gapMs: 72 * 60 * 1000, dollars: 2.34 });
+  assert.deepEqual(both.detailList?.entries.slice(0, 2), [
+    { label: 'Cache expired after a 1h 12m gap and added $2.34', warning: true },
+    { label: sentence, warning: true },
+  ]);
+  assert.deepEqual(
+    both.warnings?.map((warning) => warning.scope),
+    ['cache-expiry', 'wait'],
+  );
+});
+
+test('wait warning fixture signs the turn and session cost figures under a quarter of the session total', () => {
+  const payload = waitWarningPayload() as { cards: TurnCard[]; stats: Record<string, SessionStatChip[]> };
+  const turnFigure = payload.cards[0].chips.find((chip) => chip.metric === 'cost')!;
+  assert.deepEqual(
+    turnFigure.warnings?.map((warning) => warning.scope),
+    ['wait'],
+  );
+  assert.match(
+    String(turnFigure.detailList?.entries[0].label),
+    /^Waiting on subagents took 21% of this turn's main agent cost/,
+  );
+  const sessionCost = payload.stats.s1.find((chip) => chip.metric === 'cost')!;
+  const wait = sessionCost.warnings?.find((warning) => warning.scope === 'wait');
+  assert.ok(wait?.scope === 'wait' && wait.waitCost / Number(sessionCost.dollars) < 0.25);
 });
 
 test('a turn that holds a compaction names it under Included above', () => {
