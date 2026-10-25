@@ -188,7 +188,7 @@ Clicked local links can open files outside every workspace folder. Absolute path
 
 A commit row in a turn card's Commits section or commits chip popover shows the hash as a button only with a known repository directory. An unresolvable repository leaves the hash as text rather than opening the wrong tree. Pressing the button runs `git.openRepository` for that directory and then `git.viewCommit` for the commit. Arc shows an information message when VS Code has no `git.viewCommit` command or when the commit is no longer in the repository. A commit made outside the open workspace carries its repository name.
 
-When Git reports the ref that created a commit, the row shows its named branch or says that the commit was detached. This distinguishes a temporary isolated-checkout commit from a later branch commit without merging rows that merely share a subject and statistics. A commit made in a worktree whose directory is named for that branch shows the branch and no place, and its hover still names the worktree.
+A commit row keeps the branch read beside its commit details, or reports a detached HEAD. This distinguishes a temporary isolated-checkout commit from a later branch commit without merging rows that merely share a subject and statistics. A commit made in a worktree whose directory is named for that branch shows the branch and no place, and its hover still names the worktree.
 
 The file icon comes from the active icon theme when it can be resolved safely. `fileicons.ts` supplies a text badge fallback. The icon is decorative. The accessible name comes from the file row text.
 

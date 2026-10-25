@@ -18,7 +18,7 @@ Root selection follows [Environment overrides](development.md#environment-overri
 | Claude status-line JSON | CLI stdin | Current model, effort, context size and use, prompt-cache state and expiry, and session cost metadata |
 | CLI transcript target | `arc cost` path or session id | Windowed request usage and list-price cost for one session and its children |
 | Window registry | `${ARC_HOME:-~/.arc}/hosts/<host-id>.json` | Activation identity, process id, workspace folders, repository scope readiness, panel readiness and visibility, protocol version, accepted request capabilities, channel address, and authentication token |
-| Claude snapshots | `${ARC_HOME:-~/.arc}/snapshots/<session_id>/` | File content before the session first changed it, plus the files that still differ |
+| Claude snapshots | `${ARC_HOME:-~/.arc}/snapshots/<session_id>/` | File content before the session first changed it, plus manifest entries for new files and existing files that differ |
 | Claude transcripts | `<resolved Claude projects root>/<cwd-slug>/<session_id>.jsonl` | Prompts, responses, tool activity, usage, model attachments that name the context window, commits, subagent commits and subagent file changes, subagent results that entered context, including hand-back reports in queued `attachment` records and meta `user` records, recorded edits, shell-command file changes inside a git repository, paired Bash dispatch receipts, durable process-invocation ends, background command launches, their end records and their stop calls, and session names from `custom-title` and `ai-title` records |
 | Claude child transcripts | `<transcript directory>/<parent_session_id>/subagents/agent-<agent_id>.jsonl`, and `agent-<agent_id>.jsonl` beside a child transcript for the subagents that child launched | A subagent's own usage and output speed, the commits it wrote, the files it changed with their line counts, its own tool and failed-call counts by name, when it started and ended, and whether its record reaches the end |
 | Claude subagent meta files | `agent-<agent_id>.meta.json` beside each child transcript | Which subagent launched a nested subagent, through `parentAgentId`. The launch call in `toolUseId` locates a child's transcript for its row's cost and effort before child discovery lists that child |
@@ -71,7 +71,8 @@ The store contains:
 
 ```text
 baseline/<sha1(abspath)>   first-touch content
+pending-baselines/<hash>/   published baseline bytes and path, cwd, and new-file facts awaiting index completion
 index.json                 hash-to-path entries and the session cwd
-manifest.json              files that currently differ from the baseline
+manifest.json              new files and existing files that differ from the baseline
 trigger                    watcher signal
 ```

@@ -545,6 +545,7 @@ test('the card a press opens stands at the top of the column and widens nothing'
     page.on('pageerror', (e) => failures.push(String(e)));
     // Capture interval handles so the test can stop the panel ticker.
 
+    // Insert pre-script hooks into the HTML. Playwright addInitScript does not run for setContent.
     await page.setContent(
       pageHtml().replace(
         '<script>',
