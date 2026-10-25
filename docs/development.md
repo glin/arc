@@ -26,6 +26,18 @@ npm run format
 npm run test:all
 ```
 
+## Source commits
+
+Use the assigned topic branch for initial candidates and correction commits. Stage only the task's changes, then run this command from that checkout:
+
+```bash
+node scripts/commit-topic.mjs <assigned-topic> -- -m "fix(scope): describe the change"
+```
+
+`scripts/commit-topic.mjs` checks the checkout's attached branch against the assigned topic before running `git commit`. It refuses `main`, including an assignment to `main`, detached checkouts, mismatched branches, and Git environment overrides for checkout or index paths. Arguments after `--` pass directly to `git commit`. The existing quality hook still runs. Keep test and acceptance decisions at [landing](testing.md#checks-and-lanes).
+
+This command protects commits made through this workflow. Raw Git commands and direct fast-forward merges bypass it. Topic delivery still requires the existing landing preflight against the exact candidate and current target. The private plans repository uses its separate commit policy.
+
 ## Subject guides
 
 Use [Installation and packaging](installation.md) for installer checks and bundled tools. Use [Performance diagnostics](performance.md#performance-capture) before profiling.

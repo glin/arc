@@ -279,6 +279,11 @@
     "cases": 1,
     "matricesSha256": "d176bbe24990b6f3c4fb8eddd3dc92fb4a77a6a72acb112d57f36fad6ef88e8b"
   },
+  "scripts/commit-topic.test.js": {
+    "reason": "The source commit command must refuse main, detached and mismatched branches while preserving commit arguments, hooks, and topic delivery.",
+    "cases": 5,
+    "matricesSha256": "ab124092ca0c860179f1a2382da66c9f1c6588f6f3dda1f4598f2f2f981c6427"
+  },
   "scripts/editor-cli.test.js": {
     "reason": "Editor launch and installer shell commands must preserve quoting, cancellation, native entry selection, existing dependencies, lockfile reconciliation, and component outcomes.",
     "cases": 59,
