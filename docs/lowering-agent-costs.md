@@ -104,7 +104,26 @@ The instruction adds guidance without replacing the built-in prompt. It depends 
 
 Check a fresh process and session after installation. Confirm that its developer message contains the text and that its parent uses native waiting.
 
-The table configures the v2 protocol only. A v1 session needs its exposed native wait tool and an explicit long timeout within that tool's limits. The exact instruction above names the v2 tool and is not a tested Bedrock v1 recipe. Provider identity alone does not establish the active protocol. Check the effective model catalog. [The versioned v1 handler](https://github.com/openai/codex/blob/rust-v0.163.0/codex-rs/core/src/tools/handlers/multi_agents/wait.rs) uses fixed timeout constants. [The v2 handler](https://github.com/openai/codex/blob/rust-v0.163.0/codex-rs/core/src/tools/handlers/multi_agents_v2/wait.rs) reads the configured floor.
+The table configures the v2 protocol only. [The versioned v1 handler](https://github.com/openai/codex/blob/rust-v0.163.0/codex-rs/core/src/tools/handlers/multi_agents/wait.rs) uses fixed timeout constants. [The v2 handler](https://github.com/openai/codex/blob/rust-v0.163.0/codex-rs/core/src/tools/handlers/multi_agents_v2/wait.rs) reads the configured floor.
+
+### Native waiting with v1
+
+A v1 session needs its exposed native wait tool and an explicit long timeout within that tool's limits. For a session exposing `multi_agent_v1.wait_agent` with required `targets`, use this root setting instead of the v2 instruction:
+
+```toml
+# Request long native waits despite the built-in minute guidance.
+developer_instructions = """
+For native subagents, use multi_agent_v1.wait_agent with their targets. Request timeout_ms=1500000 only when the tool schema accepts it. Otherwise use the schema's supported maximum. Native waiting is exempt from the built-in 60-second wait limit and commentary guidance. Do not shorten or interrupt a native wait to send progress. Do not substitute timer sleeps, shell sleeps, status queries, or background reads for native waiting. Preserve any explicitly requested child sleep. If the wait returns timed_out=true and work remains, repeat the native wait.
+"""
+```
+
+Merge existing developer text into the same value. This instruction depends on model compliance and reaches descendants. It does not create an enforced v1 timeout floor. Check default loading in a fresh process and session, without per-run instruction overrides.
+
+Check the effective model catalog and exposed tools before choosing either recipe. Provider identity and `features.multi_agent_v2=false` alone do not establish the active protocol. For Bedrock setups requiring v1, confirm that the selected model's effective `multi_agent_version` is `v1`.
+
+When that catalog entry selects the wrong protocol, preserve the effective catalog and change only the required entry. Configure its absolute path through the root setting `model_catalog_json`. Preserve existing catalog overrides. A snapshot freezes provider metadata, so regenerate it and recheck the protocol after CLI upgrades. No catalog override is needed when the effective entry already selects the required protocol.
+
+These instructions do not establish steering, cancellation, or resumed-session behavior for v1. Check those paths separately when your workflow needs them.
 
 The [configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference) defines the additive instruction setting. [A community experiment](https://github.com/openai/codex/issues/35108#issuecomment-5552457213) reports a similar developer-level exception. Check these version-sensitive wait settings after upgrading Codex.
 
