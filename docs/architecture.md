@@ -87,7 +87,7 @@ The extension never writes a file the agent changed. Hooks write only under the 
 
 Recorded work and host-owned live processes have separate authority. [Card sources](timeline.md#card-sources) defines their reconciliation. Reader-owned state survives independently of rebuildable parsing and spend caches. [Cache ownership](timeline.md#cache-ownership) defines those lifetimes. Receipt relationship scans supply neither billing evidence nor delivery authority. [Relationship discovery](timeline.md#relationship-discovery-contracts) defines their admission.
 
-The local channel addresses one extension-host activation. Authentication and terminal ancestry do not transfer the reader's authority to a caller. [Window contracts](window-channel.md) define the distinct read, write, and observation capabilities. [Standalone observation](agent-protocols.md#standalone-observation-contracts) defines launch management separately from transcript identity.
+The local channel addresses one extension-host activation. Requester names supply attribution alone. [Window contracts](window-channel.md) define the distinct read, write, and observation capabilities. [Standalone observation](agent-protocols.md#standalone-observation-contracts) defines launch management separately from transcript identity.
 
 Filesystem validation establishes observed agreement within each reader's contract. It does not establish an atomic snapshot or protect against every concurrent replacement. Preserve the qualifications in [relationship validation](timeline.md#relationship-discovery-contracts), [catalog reads](window-channel.md#accepted-catalog-reads), and [export publication](export-session.md#capture-and-projection-contracts) when changing those paths.
 
