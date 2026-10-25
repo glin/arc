@@ -11,6 +11,57 @@ Let agents use Arc from the command line:
 
 The Arc extension includes `arc` for sessions it starts and new integrated terminals. For other terminals, [build and install the standalone package](#build-from-source). The installed command requires Node.js 18 or later.
 
+## Session skill
+
+Use the `arc-sessions` skill to give your agents Arc's CLI instructions. Ask your agent to use Arc, or invoke `/arc-sessions` in Claude Code or `$arc-sessions` in Codex.
+
+The source installer installs the skill for detected Claude Code and Codex agents. Pass `--no-skills` to skip skill setup.
+
+If you installed only the VSIX or standalone CLI package, install the bundled skill:
+
+```sh
+arc skills install --agent claude --agent codex
+```
+
+After updating the CLI, update its installed skill copies:
+
+```sh
+arc skills update --agent claude --agent codex
+```
+
+Restart the agent session after installing or updating the skill.
+
+Claude Code reads `~/.claude/skills` and Codex reads `~/.agents/skills`. Arc preserves manual copies and links. For linked skill folders and interrupted setup, see [skill installation and recovery](../docs/arc-sessions.md#install-the-parts-you-need).
+
+<details>
+<summary>Manual skill links</summary>
+
+### Manual links
+
+For a custom installation, link the packaged `skills/arc-sessions` directory into your agent's skill folder.
+
+For a global Windows installation, run in PowerShell:
+
+```powershell
+$arcSkill = Join-Path (npm prefix --global) 'node_modules/@glin/arc/skills/arc-sessions'
+New-Item -ItemType Directory -Path "$HOME/.claude/skills", "$HOME/.agents/skills" -Force
+New-Item -ItemType Junction -Path "$HOME/.claude/skills/arc-sessions" -Target $arcSkill
+New-Item -ItemType Junction -Path "$HOME/.agents/skills/arc-sessions" -Target $arcSkill
+```
+
+For a global macOS or Linux installation, run:
+
+```sh
+arc_skill="$(npm prefix --global)/lib/node_modules/@glin/arc/skills/arc-sessions"
+mkdir -p ~/.claude/skills ~/.agents/skills
+ln -s "$arc_skill" ~/.claude/skills/arc-sessions
+ln -s "$arc_skill" ~/.agents/skills/arc-sessions
+```
+
+A source checkout provides `cli/skills/arc-sessions`. A project-local package provides `node_modules/@glin/arc/skills/arc-sessions`. Use the directory's absolute path as the link target. Remove an existing link before replacing it.
+
+</details>
+
 ## Commands
 
 ### Read sessions
@@ -68,48 +119,6 @@ arc cost SESSION_ID --by-model
 Use a Claude Code or Codex session ID. Cost reports also accept a transcript or rollout file path. See [cost figures](../docs/agent-cost-guide.md#read-the-estimate) for supported usage and partial estimates.
 
 The [CLI guide](https://github.com/glin/arc/blob/main/docs/cli.md) covers examples and troubleshooting. The [CLI reference](https://github.com/glin/arc/blob/main/docs/cli-reference.md) defines JSON fields and command limits.
-
-## Session skill
-
-Install the bundled `arc-sessions` skill to let Claude Code and Codex agents manage sessions through Arc:
-
-```sh
-arc skills install --agent claude --agent codex
-```
-
-After updating the CLI, update its installed skill copies:
-
-```sh
-arc skills update --agent claude --agent codex
-```
-
-These commands use `~/.claude/skills` for Claude Code and `~/.agents/skills` for Codex. If either folder links to the other, install at the link's target. Arc never writes through linked skill folders. Restart the agent session to load the skill.
-
-Installation preserves existing manual copies and links. See [skill installation and recovery](../docs/arc-sessions.md#install-the-parts-you-need) for ownership rules and interrupted operations.
-
-### Manual links
-
-For a custom installation, link the packaged `skills/arc-sessions` directory into your agent's skill folder.
-
-For a global Windows installation, run in PowerShell:
-
-```powershell
-$arcSkill = Join-Path (npm prefix --global) 'node_modules/@glin/arc/skills/arc-sessions'
-New-Item -ItemType Directory -Path "$HOME/.claude/skills", "$HOME/.agents/skills" -Force
-New-Item -ItemType Junction -Path "$HOME/.claude/skills/arc-sessions" -Target $arcSkill
-New-Item -ItemType Junction -Path "$HOME/.agents/skills/arc-sessions" -Target $arcSkill
-```
-
-For a global macOS or Linux installation, run:
-
-```sh
-arc_skill="$(npm prefix --global)/lib/node_modules/@glin/arc/skills/arc-sessions"
-mkdir -p ~/.claude/skills ~/.agents/skills
-ln -s "$arc_skill" ~/.claude/skills/arc-sessions
-ln -s "$arc_skill" ~/.agents/skills/arc-sessions
-```
-
-A source checkout provides `cli/skills/arc-sessions`. A project-local package provides `node_modules/@glin/arc/skills/arc-sessions`. Use the directory's absolute path as the link target. Remove an existing link before replacing it.
 
 ## Build from source
 
