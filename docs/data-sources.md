@@ -32,7 +32,7 @@ Root selection follows [Environment overrides](development.md#environment-overri
 | Claude print results in Codex commands | The completed `CommandExecution` inside its parent Codex rollout | Shell-child ownership, recorded model usage, duration, session identity, and list-price cost |
 | Agent child stdio | Process owned by the current extension host | Temporary live narration and activity before the disk record catches up, and the live session's busy state and turn endings |
 | Claude main-response stream events | The connected child's identified `message_start`, terminal `message_delta`, and `message_stop` | Actual output tokens and observed response time for one unambiguous submitted prompt. Workspace state retains bounded measurements by session and response identity |
-| Claude attribution selection | Editor environment or `.env` in the child's working directory | The local request attribution selection described in [Agent launch commands](agent-protocols.md#claude-attribution-selection) |
+| Claude attribution selection | Editor environment or `.env` in the child's working directory | The local request attribution selection described in [Agent launch commands](agent-launches.md#claude-attribution-selection) |
 | Panel launch record | VS Code workspace state, beside the saved panel state | Which sessions the reader started from this panel |
 | Codex session index | `session_index.jsonl` beside the resolved Codex sessions root, defaulting to `~/.codex/session_index.jsonl` | Thread names, which may arrive after a rollout stops changing |
 | Local git repository | The folder a command changed, and each open workspace folder | Registered worktree roots, commit details whose output printed none, and fast-forward landings from the head log |

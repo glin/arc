@@ -32,7 +32,7 @@ Claude records a queued prompt when the agent picks it up. Delivery owners must 
 
 Codex records task starts and terminals directly. Copied parent history supplies no own turn, completion, or request. Delayed `turn_context` evidence can retract a turn after its apparent completion. Preserve that classification through append checkpoints and older-page reads.
 
-Codex final answers can arrive through `item_completed`, phased `response_item` messages, or root `agent_message` events. `recordAnswer` joins matching identities first. Its fallback joins identical text from the latest answer within two seconds, only when no later prompt intervenes. An aborted turn retains its recorded final answer as its summary. [Agent protocols](agent-protocols.md) owns asynchronous delivery, which supplies no final answer.
+Codex final answers can arrive through `item_completed`, phased `response_item` messages, or root `agent_message` events. `recordAnswer` joins matching identities first. Its fallback joins identical text from the latest answer within two seconds, only when no later prompt intervenes. An aborted turn retains its recorded final answer as its summary. [Questions and recovery](question-recovery.md#codex-asynchronous-questions) owns asynchronous delivery, which supplies no final answer.
 
 ## Card sources
 

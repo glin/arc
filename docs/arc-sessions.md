@@ -21,7 +21,7 @@ Supported Arc-launched sessions receive the matching session skill through nativ
 
 Claude delivery preserves matching manual definitions, including readable links. A customized definition, another `arc-session-tools` plugin, explicit disablement, or unsupported configuration prevents automatic delivery. Codex delivery refuses another `arc-sessions` definition, including an identical or disabled copy. Disabling an admitted earlier Arc release also prevents delivery at a newer path. Arc never enables a disabled definition.
 
-Known static conflicts allow ordinary startup and manual native discovery. An unexpected native refusal stops startup or further delivery without launching another child or replaying prompts. [Runtime admission](agent-protocols.md#native-session-skill-admission) defines provider compatibility and refresh behavior. Catalog discovery establishes availability, not that a model read the instructions. Standalone sessions use the personal installation below.
+Known static conflicts allow ordinary startup and manual native discovery. An unexpected native refusal stops startup or further delivery without launching another child or replaying prompts. [Runtime admission](native-skills.md#native-session-skill-admission) defines provider compatibility and refresh behavior. Catalog discovery establishes availability, not that a model read the instructions. Standalone sessions use the personal installation below.
 
 ## Install the parts you need
 
@@ -72,7 +72,7 @@ Retire the stopped operation only after restoration and every identity and byte 
 
 Ordinary `claude -p` loads the same configured context as an interactive session, including available skills unless disabled. By default, `--bare` skips automatic skill discovery. [Claude programmatic guidance](https://code.claude.com/docs/en/headless) owns bare-mode exceptions. Context use depends on listed metadata and activated instructions. Loading the skill does not authorize session starts or create an automatic workflow. The agent must receive a request authorizing the work it starts.
 
-An ordinary CLI session can coordinate work when its shell finds `arc` and the intended Arc window is ready. The extension supplies its own launcher environment to panel-started agents. [Agent runtime](agent-protocols.md#runtime-shape) owns that environment.
+An ordinary CLI session can coordinate work when its shell finds `arc` and the intended Arc window is ready. The extension supplies its own launcher environment to panel-started agents. [Agent runtime](agent-launches.md#runtime-shape) owns that environment.
 
 ## Example requests
 

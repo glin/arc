@@ -25,6 +25,11 @@
     "docs/prompt-entries.md",
     "docs/account-usage.md",
     "docs/agent-protocols.md",
+    "docs/agent-launches.md",
+    "docs/native-skills.md",
+    "docs/question-recovery.md",
+    "docs/session-compaction.md",
+    "docs/standalone-sessions.md",
     "docs/ui-design.md"
   ]
 }
