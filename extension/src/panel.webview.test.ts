@@ -2333,7 +2333,14 @@ import { sameCommitSha, listSessionFiles, readTurns } from './transcript.ts';
 import { handoffRefusalMessage, pressIsMidTurn, pressesAfter } from './composerview.ts';
 import { compaction, livePress, powershellDispatchExecution, subagentCommitTurn, turn } from './turnfixtures.ts';
 import { ClaudeWire } from './claudewire.ts';
-import { CompactHost, CompactRequests, promptAsReader, readerCarry, type CompactChild } from './compactrequest.ts';
+import {
+  CompactHost,
+  CompactRequests,
+  promptAsReader,
+  readerCarry,
+  readerPrompt,
+  type CompactChild,
+} from './compactrequest.ts';
 import { currentRecordsBySession, turnKey } from './turnread.ts';
 import { ProgressiveWorker, acceptsProgressiveResult, type ProgressiveInput } from './progressiveworker.ts';
 import { handleNavigationPress, navigationButton, ROVING_SELECTOR } from './webview/navigation.ts';
@@ -33535,6 +33542,382 @@ test.each(['opens', 'closes'] as const)(
     }
   },
 );
+
+function heldCompactionProvider(agent: 'claude' | 'codex' = 'codex') {
+  const { provider } = queueRecoveryProvider();
+  const host = { webview: {} };
+  const window = 'b'.repeat(24);
+  const requestId = `${window}:aaaaaaaa-1111-2222-3333-444444444444`;
+  const payload = { requestId, window, self: true, afterTurn: true };
+  const state = { sessionId: 'source', busy: true, asks: [], ready: true, exited: false };
+  let writes = 0;
+  let available = true;
+  const child: CompactChild = {
+    key: 'held-reader',
+    agent,
+    readerTurnOwner: agent === 'claude' ? () => 7 : undefined,
+    state: () => state,
+    compactionUnresolved: () => false,
+    compact: async (check) => {
+      check();
+      writes++;
+    },
+  };
+  Object.assign(provider, {
+    hosts: [host],
+    readyHosts: new Set([host]),
+    hostSessions: new Map([[host, 'source']]),
+    pendingResponseOwners: new Map(),
+    pendingResponsePosts: new Map(),
+    submissionsInFlight: new Set(),
+    sendToHost: async () => true,
+    membershipOf: () => (available ? 'present' : 'absent'),
+    stateFor: () =>
+      available
+        ? {
+            ...COMPOSER_STATE,
+            sessionId: 'source',
+            running: state.busy,
+            queued: provider.queues.source ?? [],
+            draft: provider.drafts.source ?? '',
+          }
+        : null,
+    composerStateFor: () => provider.stateFor('source'),
+    flushAgentQueue() {},
+  });
+  const owner = new CompactHost<CompactChild>(window, {
+    find: () => child,
+    withActivity: async (_child, work) => {
+      await work(child);
+      return undefined;
+    },
+    readerWork: () => provider.readerWork('source'),
+  });
+  const extensionSource = fs.readFileSync(path.join(__dirname, 'extension.ts'), 'utf8');
+  const routing = ['panel.onReaderAction =', 'panel.onReaderUnsent =']
+    .filter((needle) => extensionSource.includes(needle))
+    .map((needle) => statementFrom(extensionSource, extensionSource.indexOf(needle)))
+    .join('\n');
+  new Function('panel', 'owner', esbuild.transformSync(routing, { loader: 'ts' }).code)(provider, owner);
+  const native = (kind: 'toolStart' | 'toolEnd' | 'rootEnd', turnId = 'root', submission = 7, success = true) =>
+    owner.native(
+      child,
+      {
+        kind,
+        provider: agent,
+        sessionId: 'source',
+        turnId,
+        generation: agent === 'claude' ? Number(turnId === 'root' ? 1 : turnId) : null,
+        evidence: {},
+        toolId: 'request',
+        command: `arc compact request --self --after-turn --request-id ${requestId} --window ${window} --json`,
+        initiating: true,
+        success,
+      },
+      submission,
+    );
+  owner.submitted(child, 7);
+  native('toolStart');
+  assert.equal((owner.handle({ method: 'compact-request', params: payload }) as { state: string }).state, 'queued');
+  native('toolEnd');
+  const finish = async (turnId = 'root', submission = 7) => {
+    owner.replyRetained(child, submission);
+    native('rootEnd', turnId, submission);
+    state.busy = false;
+    await owner.drain('source');
+  };
+  const send = (text: string, revision = 1) =>
+    provider.onMessage(
+      {
+        type: 'sendPrompt',
+        session: 'source',
+        text,
+        revision,
+        attempt: { id: `held-${revision}`, order: revision, source: 'source', revision, text },
+      },
+      host,
+    );
+  return {
+    provider,
+    host,
+    owner,
+    child,
+    requestId,
+    native,
+    finish,
+    send,
+    state,
+    writes: () => writes,
+    vanish: () => {
+      available = false;
+    },
+  };
+}
+
+test.each(['claude', 'codex failed', 'codex unretained'] as const)(
+  'accepted %s reader input keeps compaction held until native answering evidence after settlement',
+  async (ending) => {
+    const agent = ending === 'claude' ? 'claude' : 'codex';
+    const h = heldCompactionProvider(agent);
+    const delivered: string[] = [];
+    h.provider.onSendPrompt = async (_agent: string, _session: string, _cwd: string, prompt: { text: string }) => {
+      delivered.push(readerPrompt(h.owner, 'source', prompt).text);
+      if (delivered.length > 1) {
+        try {
+          await promptAsReader(h.owner, h.child, async (submitted) => {
+            submitted(9);
+            throw new Error('refused');
+          });
+        } catch {
+          return { delivered: false, reason: 'refused' };
+        }
+      }
+      const turnId = await promptAsReader(h.owner, h.child, async (submitted, received) => {
+        submitted(8);
+        h.state.busy = true;
+        received(8);
+        return 8;
+      });
+      return { delivered: true, reason: '', turnId };
+    };
+    await h.send('Accepted direction.');
+    await vi.waitFor(() => assert.equal(h.provider.readerDeliveries.size, 0));
+    if (agent === 'codex') await h.finish();
+    assert.ok(h.owner.carriedLine('source'), 'acceptance released the native answering hold');
+    await h.send('Rejected overlapping direction.', 2);
+    await vi.waitFor(() => assert.equal(h.provider.readerDeliveries.size, 0));
+    assert.ok(h.owner.carriedLine('source'), 'the rejected send released accepted input');
+    h.provider.membershipOf = () => 'unknown';
+    h.owner.unsent('source');
+    h.provider.membershipOf = () => 'present';
+    h.owner.sessionsRefreshed();
+    assert.ok(h.owner.carriedLine('source'), 'scope recovery released accepted input');
+    assert.equal(h.writes(), 0);
+    assert.match(delivered[0], /Accepted direction\.[\s\S]*Arc: compaction request/);
+    const answering = agent === 'claude' ? '2' : 'answer';
+    const submission = agent === 'claude' ? 7 : 8;
+    h.native('toolStart', answering, submission);
+    h.native('toolEnd', answering, submission);
+    const status = () =>
+      h.owner.handle({ method: 'compact-status', params: { requestId: h.requestId } }) as {
+        turn: string;
+        submissionId: string;
+        state: string;
+      };
+    assert.equal(status().turn, answering);
+    assert.equal(status().submissionId, String(submission));
+    if (agent === 'claude') {
+      await h.finish(answering, submission);
+      assert.equal(h.writes(), 1);
+    } else {
+      h.native('rootEnd', answering, submission, ending === 'codex unretained');
+      h.state.busy = false;
+      await h.owner.drain('source');
+      assert.equal(
+        h.writes(),
+        0,
+        'old turn evidence authorized compaction before a successful saved answering response',
+      );
+      assert.equal(status().state, 'queued');
+    }
+  },
+);
+
+test('a reader rejection during unknown scope releases compaction when present scope refreshes', async () => {
+  const h = heldCompactionProvider();
+  let reject!: (error: Error) => void;
+  const pending = new Promise<number>((_resolve, refused) => {
+    reject = refused;
+  });
+  h.provider.onSendPrompt = async () => {
+    try {
+      const turnId = await promptAsReader(h.owner, h.child, async (submitted) => {
+        submitted(8);
+        return pending;
+      });
+      return { delivered: true, reason: '', turnId };
+    } catch {
+      return { delivered: false, reason: 'refused' };
+    }
+  };
+  await h.send('Unaccepted direction.');
+  await vi.waitFor(() => assert.equal(h.provider.readerDeliveries.size, 1));
+  await h.finish();
+  h.provider.membershipOf = () => 'unknown';
+  reject(new Error('refused'));
+  await vi.waitFor(() => assert.equal(h.provider.readerDeliveries.size, 0));
+  assert.ok(h.owner.carriedLine('source'));
+  assert.equal(h.writes(), 0);
+  h.provider.membershipOf = () => 'present';
+  h.owner.sessionsRefreshed();
+  await vi.waitFor(() => assert.equal(h.writes(), 1));
+  assert.equal(h.owner.carriedLine('source'), null);
+});
+
+test.each([
+  'retention',
+  'vanished',
+  'handoff',
+  'staging',
+  'unsupported',
+  'unreadable',
+  'empty',
+  'delivery',
+  'sync delivery',
+] as const)('held compaction resumes after a reader send is dropped at %s', async (failure) => {
+  const h = heldCompactionProvider();
+  const p = h.provider;
+  if (failure === 'retention')
+    p.importPromptRecovery = async () => {
+      throw new Error('save refused');
+    };
+  if (failure === 'vanished') p.importPromptRecovery = async () => h.vanish();
+  if (failure === 'staging') p.staging.add('source');
+  if (failure === 'handoff') p.assetHandoffs.add('source');
+  if (failure === 'unsupported' || failure === 'unreadable') {
+    p.assets.source = [
+      {
+        id: 'asset',
+        name: 'file.bin',
+        mime: failure === 'unsupported' ? 'application/octet-stream' : 'image/png',
+        size: 1,
+        digest: '0'.repeat(64),
+      },
+    ];
+    if (failure === 'unsupported') {
+      const current = p.stateFor;
+      p.stateFor = () => ({ ...current(), agent: 'claude' });
+    }
+    if (failure === 'unreadable') p.attachmentStorageDir = tempDir('held-unreadable-');
+  }
+  if (failure === 'delivery') p.onSendPrompt = async () => ({ delivered: false, reason: 'refused' });
+  if (failure === 'sync delivery')
+    p.onSendPrompt = () => {
+      throw new Error('refused');
+    };
+  await h.send(failure === 'empty' ? '' : 'Reader direction.');
+  await h.finish();
+  if (failure === 'vanished') {
+    await vi.waitFor(() =>
+      assert.equal(
+        (h.owner.handle({ method: 'compact-status', params: { requestId: h.requestId } }) as { state: string }).state,
+        'cancelled',
+      ),
+    );
+    assert.equal(h.owner.carriedLine('source'), null);
+  } else await vi.waitFor(() => assert.equal(h.writes(), 1));
+});
+
+test.each(['retention', 'delivery'] as const)(
+  'a rejected overlapping send preserves the first send during %s',
+  async (phase) => {
+    const h = heldCompactionProvider();
+    let release!: () => void;
+    const wait = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const sent: string[] = [];
+    h.provider.importPromptRecovery = async () => {
+      if (phase === 'retention') await wait;
+    };
+    h.provider.onSendPrompt = async (_agent: string, _session: string, _cwd: string, prompt: { text: string }) => {
+      sent.push(readerPrompt(h.owner, 'source', prompt).text);
+      if (phase === 'delivery') await wait;
+      return { delivered: false, reason: 'refused' };
+    };
+    const first = h.send('First reader direction.');
+    await vi.waitFor(() =>
+      assert.equal(phase === 'retention' ? h.provider.submissionsInFlight.has('source') : sent.length === 1, true),
+    );
+    if (phase === 'delivery') await first;
+    h.provider.staging.add('source');
+    await h.send('Rejected direction.', 2);
+    await h.finish();
+    assert.equal(h.writes(), 0);
+    assert.ok(h.owner.carriedLine('source'), 'the rejected send released surviving input');
+    h.provider.staging.delete('source');
+    release();
+    await first;
+    await vi.waitFor(() => assert.equal(h.writes(), 1));
+    assert.equal(sent.length, 1);
+    assert.match(sent[0], /First reader direction\.[\s\S]*Arc: compaction request/);
+  },
+);
+
+test.each(['remove', 'empty edit', 'empty queued prompt'] as const)(
+  'held compaction drains when its final queued send disappears through %s',
+  async (action) => {
+    const h = heldCompactionProvider();
+    h.provider.queues.source = queueSubmissionAfter([], 'waiting', 'Queued direction.', [], [], 1, false, {
+      agent: 'codex',
+      owner: 'source',
+    });
+    if (action === 'empty queued prompt') {
+      h.provider.queues.source[0].text = '';
+      h.provider.queues.source[0].commentIds = ['removed-comment'];
+    }
+    h.owner.readerAction('source', false, 'send');
+    await h.finish();
+    assert.equal(h.writes(), 0);
+    if (action === 'remove')
+      await h.provider.onMessage({ type: 'dequeue', session: 'source', value: 'waiting' }, h.host);
+    else if (action === 'empty queued prompt') h.provider.flushQueue('source');
+    else {
+      h.provider.requestQueuedEdit('waiting', 'source', 1, h.host);
+      h.provider.acceptQueuedEdit('waiting', 'source', 1, 2, true, h.host);
+    }
+    await vi.waitFor(() => assert.equal(h.writes(), 1));
+    assert.equal(h.provider.queues.source?.length ?? 0, 0);
+  },
+);
+
+test('a dropped send keeps queued reader prompts in order and compacts after their answering turn', async () => {
+  const h = heldCompactionProvider();
+  h.provider.queues.source = queueSubmissionAfter([], 'first', 'First queued.', [], [], 1, false, {
+    agent: 'codex',
+    owner: 'source',
+  });
+  h.provider.queues.source = queueSubmissionAfter(
+    h.provider.queues.source,
+    'second',
+    'Second queued.',
+    [],
+    [],
+    2,
+    false,
+    { agent: 'codex', owner: 'source' },
+  );
+  h.owner.readerAction('source', false, 'send');
+  h.provider.staging.add('source');
+  await h.send('Rejected direction.');
+  await h.finish();
+  assert.equal(h.writes(), 0);
+  assert.ok(h.owner.carriedLine('source'));
+  h.provider.staging.delete('source');
+  const delivered: string[] = [];
+  h.provider.onSendPrompt = async (_agent: string, _session: string, _cwd: string, prompt: { text: string }) => {
+    delivered.push(readerPrompt(h.owner, 'source', prompt).text);
+    const submission = 7 + delivered.length;
+    h.owner.submitted(h.child, submission);
+    h.state.busy = true;
+    h.native('toolStart', `answer-${submission}`, submission);
+    h.native('toolEnd', `answer-${submission}`, submission);
+    return { delivered: true, reason: '', turnId: submission };
+  };
+  h.provider.flushQueue('source');
+  await vi.waitFor(() => assert.equal(delivered.length, 1));
+  await vi.waitFor(() => assert.equal(h.provider.queueHandoffs.size, 0));
+  assert.match(delivered[0], /^First queued\.[\s\S]*Arc: compaction request/);
+  assert.equal(h.provider.queues.source[0].text, 'Second queued.');
+  h.state.busy = false;
+  h.provider.flushQueue('source');
+  await vi.waitFor(() => assert.equal(delivered.length, 2));
+  await vi.waitFor(() => assert.equal(h.provider.queueHandoffs.size, 0));
+  assert.match(delivered[1], /^Second queued\.[\s\S]*Arc: compaction request/);
+  assert.equal(h.writes(), 0);
+  await h.finish('answer-9', 9);
+  assert.equal(h.writes(), 1);
+});
 
 function catalogSendProvider(agent: 'claude' | 'codex') {
   const root = tempDir('catalog-send-');

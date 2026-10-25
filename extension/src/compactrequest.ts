@@ -1105,10 +1105,11 @@ const SUBMISSIONS_PER_CHILD = 32;
 
 // Joins host observations to deferred assignments for one window activation.
 // The reader revision advances synchronously at each reader action. A reader message carries unsubmitted work
-// to the turn that answers it, and every other reader action cancels it.
+// to the turn that answers it. Queue changes keep it, and other reader actions cancel it.
 export class CompactHost<C extends CompactChild> {
   readonly requests: CompactRequests;
   private readonly revisions = new Map<string, number>();
+  private readonly deferredReleases = new Set<string>();
   private readonly generations = new WeakMap<C, number>();
   private readonly children = new Map<string, C>();
   private readonly submissions = new WeakMap<C, Map<number, Submission>>();
@@ -1161,12 +1162,28 @@ export class CompactHost<C extends CompactChild> {
     );
   }
 
-  // A reader message that never reached the agent leaves held work on its own turn under the new revision.
-  unsent(child: C): void {
-    const sessionId = child.state().sessionId;
+  // Rejected submissions lose their turn. Accepted input keeps its hold until native answering evidence arrives.
+  // Unknown scope defers the release check until session rows refresh.
+  unsent(child: C | string, rejectedTurn?: number): void {
+    const sessionId = typeof child === 'string' ? child : child.state().sessionId;
     if (!sessionId || this.disposed) return;
-    for (const held of this.requests.carriable(sessionId))
-      if (held.carry) this.rebind(held.id, held.binding, { readerRevision: this.revision(sessionId) });
+    const heldRequests = this.requests.carriable(sessionId);
+    if (rejectedTurn !== undefined) for (const held of heldRequests) held.carry?.delete(String(rejectedTurn));
+    const work = this.port.readerWork(sessionId);
+    if (work === 'unknown') {
+      if (heldRequests.some((held) => held.carry)) this.deferredReleases.add(sessionId);
+      else this.deferredReleases.delete(sessionId);
+      return;
+    }
+    this.deferredReleases.delete(sessionId);
+    if (work === 'pending') return;
+    let released = false;
+    for (const held of heldRequests)
+      if (held.carry && !held.carry.size) {
+        this.rebind(held.id, held.binding, { readerRevision: this.revision(sessionId) });
+        released = true;
+      }
+    if (released) queueMicrotask(() => void this.drain(sessionId));
   }
 
   // Names the request Arc reports in reader text delivered to the session, while one is held.
@@ -1195,6 +1212,7 @@ export class CompactHost<C extends CompactChild> {
     if (this.disposed) return;
     this.settling = false;
     this.requests.invalidate((binding) => this.port.readerWork(binding.sessionId) === 'absent', COMPACT_LOSSES.scope);
+    for (const sessionId of this.deferredReleases) this.unsent(sessionId);
     for (const sessionId of this.requests.waitingSessions()) void this.drain(sessionId);
   }
 
@@ -1276,8 +1294,9 @@ export class CompactHost<C extends CompactChild> {
     const generation = this.generations.get(child);
     const turn =
       child.agent === 'claude' ? (event.generation === null ? null : String(event.generation)) : event.turnId;
+    if (generation === undefined || !turn) return;
     const state = child.state();
-    if (generation === undefined || !turn || state.exited || state.sessionId !== event.sessionId) return;
+    if (state.exited || state.sessionId !== event.sessionId) return;
     const submission = String(turnId);
     for (const held of this.requests.carriable(event.sessionId)) {
       const binding = held.binding;
@@ -1315,16 +1334,9 @@ export class CompactHost<C extends CompactChild> {
       return;
     }
     const payload = compactCancelPayload(event.command);
+    if (!payload || !event.initiating || payload.window !== this.activation || child.agent !== event.provider) return;
     const state = child.state();
-    if (
-      !payload ||
-      !event.initiating ||
-      payload.window !== this.activation ||
-      child.agent !== event.provider ||
-      state.exited ||
-      state.sessionId !== event.sessionId
-    )
-      return;
+    if (state.exited || state.sessionId !== event.sessionId) return;
     this.cancels.delete(key);
     this.cancels.set(key, {
       requestId: payload.requestId,
@@ -1527,6 +1539,7 @@ export class CompactHost<C extends CompactChild> {
   dispose(): void {
     this.disposed = true;
     this.cancels.clear();
+    this.deferredReleases.clear();
     this.requests.dispose();
     this.persistence?.release();
   }
@@ -1643,14 +1656,16 @@ export function promptAsReader<C extends CompactChild>(
   send: (onSubmitted: (turnId: number) => void, onReceived: (turnId: number) => void) => Promise<number>,
   onSubmitted?: (turnId: number) => void,
 ): Promise<number> {
+  let submittedTurn: number | undefined;
   return send(
     (turnId) => {
+      submittedTurn = turnId;
       compaction?.submitted(child, turnId);
       onSubmitted?.(turnId);
     },
     (turnId) => compaction?.read(child, turnId),
   ).catch((error: unknown) => {
-    compaction?.unsent(child);
+    compaction?.unsent(child, submittedTurn);
     throw error;
   });
 }

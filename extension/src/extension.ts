@@ -697,6 +697,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     );
     compaction = owner;
     panel.onReaderAction = (session, answer, carry) => owner.readerAction(session, answer, carry);
+    panel.onReaderUnsent = (session) => owner.unsent(session);
     panel.onScopeChange = (outOfScope) => owner.scopeChanged(outOfScope);
     panel.onSessionRowsRefreshed = () => owner.sessionsRefreshed();
     channel.setCompactRequestHandler((request) => owner.handle(request));

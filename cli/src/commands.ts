@@ -168,7 +168,7 @@ function compact(action: 'request' | 'status' | 'cancel'): Command {
           ? [
               'Admission requires this live native tool call in the hosted main session, with no open asks or queued reader input.',
               'Each turn holds one pending request. Repeated requests use fresh IDs and preserve existing task limits.',
-              'Missing readiness refuses compaction. A reader prompt carries an admitted request to the turn that answers it, and other reader intervention cancels it.',
+              'Missing readiness refuses compaction. A reader prompt carries an admitted request to the turn that answers it. Queue changes keep it. Stop and other cancelling reader actions cancel it.',
               'compact cancel drops an admitted request.',
             ]
           : ['A missing request or unavailable window reports unavailable.']),

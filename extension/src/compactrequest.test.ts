@@ -19,6 +19,7 @@ import {
 } from './sessionwrites.ts';
 import {
   CompactHost,
+  promptAsReader,
   CompactRequests,
   compactCancelPayload,
   compactCarryLine,
@@ -1652,6 +1653,29 @@ test.each([
   await host.drain('self');
   assert.deepEqual([fixture.writes, compactState(host)], [0, 'cancelled']);
   assert.equal(readerPrompt(host, 'self', { text: 'x' }).text, 'x');
+});
+
+test('a queue change keeps admitted compaction on its answered turn', async () => {
+  const { fixture } = compactHostFixture();
+  admittedCompaction(fixture);
+  fixture.host.readerAction('self', false, readerCarry('dequeue'));
+  await finishRequest(fixture);
+  assert.equal(fixture.writes, 1);
+});
+
+test('a rejected reader prompt releases held compaction without another event', async () => {
+  const { fixture } = compactHostFixture();
+  admittedCompaction(fixture);
+  fixture.host.readerAction('self', false, 'send');
+  await finishRequest(fixture);
+  assert.equal(fixture.writes, 0);
+  await assert.rejects(
+    promptAsReader(fixture.host, fixture.child, async () => {
+      throw new Error('refused');
+    }),
+    /refused/,
+  );
+  await vi.waitFor(() => assert.equal(fixture.writes, 1));
 });
 
 // Catches a worktree change or a failed Git read cancelling a request whose session never left the window's scope.

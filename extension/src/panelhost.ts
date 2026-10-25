@@ -1268,6 +1268,7 @@ interface HeldDefaults {
 export class PanelProvider implements vscode.Disposable {
   private submissionWrites: Promise<void> = Promise.resolve();
   private submissionsInFlight = new Set<string>();
+  private readerDeliveries = new Map<string, number>();
   private submittingDrafts = new Map<
     string,
     { revision: number; commentIds: readonly string[]; assets: readonly StoredPromptAsset[] }
@@ -1800,6 +1801,8 @@ export class PanelProvider implements vscode.Disposable {
   // Runs synchronously when the reader sends, queues, edits a queued prompt, stops, compacts, answers or picks a setting,
   // and when the panel delivers a queued prompt. `answer` marks an answer to an ask.
   public onReaderAction: ((session: string, answer: boolean, carry?: 'send' | 'queue' | null) => void) | null = null;
+  // Recheck held compaction after reader retention, delivery or queue removal settles.
+  public onReaderUnsent: ((session: string) => void) | null = null;
   // Guarded follow-up ports, which `extension.ts` assigns from the window's follow-up policy.
   // Signs the facts of a current session read for the requester that started the session.
   public guardedObservation: ((request: AttributedRequest, facts: GuardedObservationFacts) => string | null) | null =
@@ -6185,14 +6188,20 @@ export class PanelProvider implements vscode.Disposable {
     return state.queued.some((entry) => this.queueHandoffs.has(entry.id));
   }
 
-  // Unknown membership holds deferred compaction. Queued prompts and a clear in progress are pending.
+  // Unknown membership holds deferred compaction. Reader retention, delivery, queued prompts and a clear remain pending.
   public readerWork(session: string): 'none' | 'pending' | 'absent' | 'unknown' {
     const membership =
       this.newDrafts[session] || this.awaitingSessionRecords[session] ? 'present' : this.membershipOf(session);
     if (membership === 'unknown') return 'unknown';
     const state = this.stateFor(session);
     if (!state) return membership === 'absent' ? 'absent' : 'unknown';
-    return state.clearing || state.queued.length > 0 || this.pendingQueueDrains.has(session) ? 'pending' : 'none';
+    return state.clearing ||
+      state.queued.length > 0 ||
+      this.pendingQueueDrains.has(session) ||
+      this.submissionsInFlight?.has(session) ||
+      this.readerDeliveries?.has(session)
+      ? 'pending'
+      : 'none';
   }
 
   // Admit literal text without acquiring reader ownership or consuming prompt-box state.
@@ -6571,6 +6580,7 @@ export class PanelProvider implements vscode.Disposable {
       // The reader removed the comments while they waited. Do not turn that cancellation
       // into an empty prompt, and continue to the next real submission if there is one.
       this.queues[state.sessionId] = queueAfterAcceptedRecovery(rest, next);
+      this.onReaderUnsent?.(state.sessionId);
       void this.writeDrafts();
       this.flushQueue(session);
       return;
@@ -7267,6 +7277,7 @@ export class PanelProvider implements vscode.Disposable {
         this.flushAgentQueue(session);
       }
     } finally {
+      this.onReaderUnsent?.(session);
       if (sending) this.health?.settle(sending, result);
     }
   }
@@ -7634,6 +7645,8 @@ export class PanelProvider implements vscode.Disposable {
           going,
           onSubmitted,
         );
+    this.readerDeliveries ??= new Map();
+    this.readerDeliveries.set(state.sessionId, (this.readerDeliveries.get(state.sessionId) ?? 0) + 1);
     // Delivery status controls live-card settlement and removal of submitted comments.
     void Promise.resolve(went)
       .then((answer) => {
@@ -7721,6 +7734,10 @@ export class PanelProvider implements vscode.Disposable {
         if (queued) {
           this.queueHandoffs.delete(queued.id);
         }
+        const remaining = (this.readerDeliveries.get(state.sessionId) ?? 1) - 1;
+        if (remaining) this.readerDeliveries.set(state.sessionId, remaining);
+        else this.readerDeliveries.delete(state.sessionId);
+        this.onReaderUnsent?.(state.sessionId);
         this.flushAgentQueue(state.sessionId);
       });
     void this.post({ type: 'usage', usage: this.usagePayload() });
@@ -8068,6 +8085,7 @@ export class PanelProvider implements vscode.Disposable {
       delete this.queues[state.sessionId];
     }
     if (!(this.queues[state.sessionId] ?? []).some(queueCanDrain)) this.pendingQueueDrains.delete(state.sessionId);
+    this.onReaderUnsent?.(state.sessionId);
     void this.writeDrafts().then(() => {
       this.flushQueue(state.sessionId);
       if (!this.attachmentStorageDir || !removed.assets.length) {
@@ -8246,6 +8264,7 @@ export class PanelProvider implements vscode.Disposable {
       delete this.queues[state.sessionId];
     }
     if (!swap.queued.some(queueCanDrain)) this.pendingQueueDrains.delete(state.sessionId);
+    this.onReaderUnsent?.(state.sessionId);
     if (wanted.assets.length) {
       this.assets[state.sessionId] = wanted.assets.map((asset) => ({ ...asset }));
     } else {
