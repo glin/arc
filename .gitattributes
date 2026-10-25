@@ -5,9 +5,8 @@
 *.sh text eol=lf
 *.js text eol=lf
 
-# The panel's stylesheet, for a different reason: the guards over it find a rule by searching
-# for its selector after a newline, and none of them matches once the file holds carriage
-# returns. See the line-endings gotcha in docs/architecture.md.
+# Keep panel stylesheets on LF line endings.
+# See the stylesheet checks in docs/development.md#verification.
 *.css text eol=lf
 
 # Extensionless hook entrypoints (Node scripts with shebangs).
