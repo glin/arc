@@ -1,6 +1,11 @@
 # Arc CLI
 
-Arc CLI lets agents start Claude Code and Codex sessions, dispatch work, and read results. Agents can message each other across providers. The CLI labels, pins, and archives sessions across Arc windows and estimates API costs from recorded usage.
+Let agents use Arc from the command line:
+
+- Start Claude Code and Codex sessions, dispatch work, and read results.
+- Send messages between agents, including between Claude Code and Codex.
+- Label, pin, and archive sessions across Arc windows.
+- Calculate estimated API costs from recorded session usage.
 
 ## Install
 
@@ -8,7 +13,7 @@ The Arc extension includes `arc` for sessions it starts and new integrated termi
 
 ## Session skill
 
-Give agents Arc's CLI instructions with the `arc-sessions` skill. [Automatic availability](../docs/arc-sessions.md#automatic-native-availability) covers Arc-launched sessions and native invocation names.
+Use the `arc-sessions` skill to give your agents Arc's CLI instructions. [Automatic availability](../docs/arc-sessions.md#automatic-native-availability) covers Arc-launched sessions and native invocation names.
 
 The source installer installs the skill for detected Claude Code and Codex agents. Pass `--no-skills` to skip skill setup.
 
@@ -33,7 +38,7 @@ Claude Code reads `~/.claude/skills` and Codex reads `~/.agents/skills`. Arc pre
 
 ### Manual links
 
-Link the packaged `skills/arc-sessions` directory into your agent's skill folder for a custom installation.
+For a custom installation, link the packaged `skills/arc-sessions` directory into your agent's skill folder.
 
 For a global Windows installation, run in PowerShell:
 
@@ -79,7 +84,7 @@ Start a Codex session with a task from `task.txt`:
 arc start --provider codex --prompt-file task.txt --name Review --arc-dispatch --window WINDOW_ID --json
 ```
 
-Use `--provider claude` for Claude Code.
+Use `--provider claude` to start Claude Code instead. Either agent can launch the other.
 
 Send a message from `message.txt` to an existing live session:
 
@@ -111,7 +116,7 @@ Read a saved session's estimated API costs without an Arc window:
 arc cost SESSION_ID --by-model
 ```
 
-Cost reports accept a Claude Code or Codex session ID, transcript path, or rollout path. See [cost figures](../docs/agent-cost-guide.md#read-the-estimate) for supported usage and partial estimates.
+Use a Claude Code or Codex session ID. Cost reports also accept a transcript or rollout file path. See [cost figures](../docs/agent-cost-guide.md#read-the-estimate) for supported usage and partial estimates.
 
 The [CLI guide](https://github.com/glin/arc/blob/main/docs/cli.md) covers examples and troubleshooting. The [CLI reference](https://github.com/glin/arc/blob/main/docs/cli-reference.md) defines JSON fields and command limits.
 
@@ -139,7 +144,7 @@ npm install ./glin-arc-<version>.tgz
 npm exec --offline --no -- arc --version
 ```
 
-The offline command uses the installed package.
+The offline command uses the installed package without a registry download.
 
 ## Uninstallation
 
@@ -173,7 +178,7 @@ Remove the `arc` marketplace only when no installed plugin uses it.
 
 ### Source and extension commands
 
-Remove the source setup script's Arc-owned `arc`, `arc.cmd`, and `run.cjs` launchers from the selected Arc home's `bin` directory. If you added that directory to your shell configuration or Windows user PATH, remove that entry.
+The source setup script installs launchers under the selected Arc home's `bin` directory. Remove its Arc-owned `arc`, `arc.cmd`, and `run.cjs` files. If you added that directory to your shell configuration or Windows user PATH, remove that entry.
 
 Downloaded source and VSIX setup keep copies under the Arc home's `tools` directory. The Arc home defaults to `~/.arc` unless `ARC_HOME` is set. Local source marketplaces refer to their checkout.
 
@@ -206,7 +211,7 @@ The status line shows available model, workspace, context, cache, cost, duration
 
 Do not combine `--next-turn` and `--json`. Width defaults to the `COLUMNS` environment variable. Required figures can exceed the requested width.
 
-The next-turn starting price estimates the minimum cost to resend existing context, including the latest answer. It excludes your next prompt and the model's next answer. Unknown cache state uses the uncached estimate. See [status-line output](../docs/cli-reference.md#status-line) for unavailable figures and rounding.
+The next-turn starting price estimates the minimum cost of resending existing context, including the latest answer. It excludes your next prompt and the model's next answer. Unknown cache state uses the uncached estimate. See [status-line output](../docs/cli-reference.md#status-line) for unavailable figures and rounding.
 
 ### When Claude Code cannot find arc
 

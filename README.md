@@ -1,11 +1,14 @@
 # Arc
 
-Arc is a VS Code extension for running Claude Code and Codex agents in parallel. (_Personal software, experimental_)
+Arc is a VS Code extension for running many Claude Code and Codex agents in parallel. It adds what I find missing from both, with one interface for both agents. (_Personal software, experimental_)
 
 [Try the web demo](https://glin.github.io/arc/)
 
-- Track agents with vertical tabs, labels, saved views, filters, and subagent session links.
-- Use Arc with or without worktrees, or to view Claude/Codex CLI and desktop sessions.
+- Keep track of all the agents! Vertical tabs, labels, saved views, filters, and links to subagent sessions.
+- Read results, not chat. Each session is a timeline of turns, each showing the final response, file edits, commits, subagents, and cost.
+- See what every turn costs, including subagents. Save costs with prompt cache expiry and next-turn starting price hints.
+- Stay in VS Code, no prescribed workflow. Use Arc with or without worktrees, or as a viewer for Claude/Codex CLI and desktop sessions.
+- Let agents use Arc. Claude can start a Codex session, or the reverse, and the parent turn shows it with its cost. Agents can also label, pin, and archive sessions, and queue their own compaction.
 
 <a href="docs/images/readme-main.webp"><img src="docs/images/readme-main.webp" alt="Arc open in a VS Code editor tab, with Claude Code and Codex sessions beside a completed turn" width="1186"></a>
 
@@ -44,7 +47,7 @@ Remove Arc from the VS Code Extensions view. The Claude hooks, the `arc` command
 
 ## Turns, not chat
 
-Each session shows turn cards, newest first, with the final response beside its files, diffs, commits, subagents, and cost.
+Each session is a timeline of turn cards, newest first. A card shows the final response next to the files, diffs, commits, subagents, and cost from that turn. Long sessions stay easy to scan.
 
 Select text in a response to comment on it. Arc sends comments to the agent with the next prompt.
 
@@ -52,7 +55,7 @@ Select text in a response to comment on it. Arc sends comments to the agent with
 
 ### Files and commits
 
-Open file diffs in VS Code before the agent commits. Commits open in VS Code with their branch and worktree when known, and the subagent that made them. Arc lists fast-forward merges separately from authored commits.
+Review file diffs before the agent commits, and open them in VS Code. Commits open in VS Code and show their branch and worktree when known, and which subagent made them. Arc lists fast-forward merges separately from authored commits.
 
 Full file diffs for Claude need the optional [Claude hooks](#claude-hooks).
 
@@ -98,7 +101,7 @@ Session links in agent responses open in Arc. Export a session and its linked se
 
 ## Let agents use Arc
 
-Either agent can start Claude Code or Codex sessions from a shell command. The session appears in Arc's session list and on its parent turn with its cost. Select its name on the parent turn to open it.
+Either agent can start Claude Code or Codex sessions from a shell command. The dispatched session appears in Arc's session list, and its parent turn shows it with its cost. The name on the parent turn opens that session.
 
 The [`arc-sessions` skill](docs/arc-sessions.md) lets agents start sessions in Arc, read their results, and send follow-ups. Agents can also label, pin, and archive sessions, queue a compaction of their own session for after the turn, and estimate costs with `arc cost`.
 
@@ -125,6 +128,8 @@ request compaction of this session after your response.
 
 ### Hand off to a fresh session
 
+An agent can pass a saved handoff to a fresh Claude Code or Codex session.
+
 ```text
 Save the task, decisions, and remaining work in a handoff.
 Use Arc to start a fresh Codex session with that handoff.
@@ -134,6 +139,6 @@ Your prompts and skills control when to hand off. Arc does not automatically sta
 
 ## Limitations
 
-Arc supports only Claude Code and Codex. Some features are unavailable. In a running Claude session, `/remote-control` and `/rc` turn Claude Remote Control on or off. Arc does not support prompts or permission answers from a connected browser or phone client.
+Arc only supports Claude Code and Codex for now, and doesn't support every feature of either. In a running Claude session, `/remote-control` and `/rc` turn Claude Remote Control on or off. Arc does not support prompts or permission answers from a connected browser or phone client.
 
 Pricing for other providers, such as OpenRouter and Google Vertex AI, is not supported.
