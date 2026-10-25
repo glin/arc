@@ -1,6 +1,6 @@
 # Accounting
 
-Use this guide when changing usage, context, compaction, delegated attribution, or Project cost. [Arc cost figures](agent-cost-guide.md) owns the reader's explanation and supported pricing routes. [CLI cost reports](cli-reference.md#cost-reports) owns report fields and command behavior.
+[Arc cost figures](agent-cost-guide.md) owns the reader's explanation and supported pricing routes. [CLI cost reports](cli-reference.md#cost-reports) owns report fields and command behavior.
 
 ## Accounting contracts
 
@@ -18,7 +18,7 @@ Count a Claude response once across repeated content blocks. A growing child res
 
 Panel session and turn estimates retain safely attributable priced usage when other usage is unavailable. `+` marks a lower bound. Ownership-uncertain usage contributes no dollars. Missing-only usage leaves cost unavailable. Recorded zero remains zero. Incomplete source coverage and unavailable pricing remain separate facts. Lifetime projections exclude incomplete buckets whose counters cannot establish safe usage. Main-agent and delegated coverage qualify their respective scopes and suppress affected cache-write warnings.
 
-Session headings read lifetime spend independently of parsed timeline windows. `turnCost` prices a parsed turn. `turnCardCost` adds counted dispatched contributions. Summing card faces therefore differs from summing parsed turns. Opening lifetime cost detail reads the retained projection without reopening transcripts. Keep billing detail in cost. Subagent execution figures and Activity tool counts do not establish billing request counts.
+Session headings read lifetime spend independently of parsed timeline windows. `turnCost` prices a parsed turn. `turnCardCost` adds counted dispatched contributions. Opening lifetime cost detail reads the retained projection without reopening transcripts. Keep billing detail in cost. Subagent execution figures and Activity tool counts do not establish billing request counts.
 
 ### Warning scopes
 
@@ -54,11 +54,11 @@ Count returned text only when a later request reads it. A result after a turn's 
 
 Codex compactions use exact recorded request usage when response identity and billing identity resolve. Cumulative counters alone cannot price a compaction request. Ordinary bills, token snapshots, compaction records, and saved checkpoints must join the response once. Missing response identity adds no separate priced request and leaves coverage incomplete. Following settings fill only the named compaction before its turn closes. Later settings describe another request.
 
-Claude writes no compaction request usage. An estimate requires a paired boundary with summary size and an earlier main request naming a model. [`compactionEstimate`](../extension/src/pricing.ts) owns the request calculation. It sizes input from the last main request, falling back to recorded preceding context. Warm estimates retain cache reads, repeat writes at five-minute rates, and add 2,000 uncached instruction tokens. Summary output uses stored text, preamble included, at 2.2 characters per token. Recorded summary size supplies the fallback.
+Claude writes no compaction request usage. An estimate requires a paired boundary with summary size and an earlier main request naming a model. [`compactionEstimate`](../extension/src/pricing.ts) owns the request calculation. It sizes input from the last main request, falling back to recorded preceding context. Warm estimates retain cache reads, repeat writes at five-minute rates, and add 2,000 uncached instruction tokens. Summary output uses stored text, including its preamble, at 2.2 characters per token. Recorded summary size supplies the fallback.
 
 Cold estimates apply only when the preceding recorded lifetime expires before compaction starts. Missing lifetime alone establishes no cold cache. A cold estimate sends history uncached and writes the shared prefix. The first following positive cache read sizes that prefix. A zero read establishes an empty prefix only before five minutes pass with a recorded preceding lifetime. Otherwise use the transcript's first cache read plus write, capped at preceding input. The prefix write follows the preceding lifetime as an estimate, with a one-hour fallback. Compaction's own lifetime remains unrecorded. Older Claude models use recorded preceding context as a cache read.
 
-Session lifetime cost includes every supported Claude estimate, including estimates outside retained compaction detail. Main-session estimates also enter a turn only when compaction falls between that turn's responses and its next response arrives with summary size known. Estimates outside those responses belong to no turn. Child and dispatched estimates use their own last main request, excluding inline subagent requests. Project cost excludes Claude estimates and includes identified Codex requests once. Cached-input shares and write warnings exclude compactions. `Included above` reports overhead already counted, with partial money when fewer compactions have prices than the lifetime count.
+Session lifetime cost includes every supported Claude estimate, including estimates outside retained compaction detail. Main-session estimates also enter a turn only when compaction falls between that turn's responses and its next response arrives with summary size known. Estimates outside those responses belong to no turn. Child and dispatched estimates use their own last main request, excluding inline subagent requests. Project cost excludes Claude estimates and includes identified Codex requests once. Cached-input shares and write warnings exclude compactions. `Included above` reports overhead already counted. Its cost is partial when fewer compactions have prices than the lifetime count.
 
 ## Cache expiry
 
@@ -94,7 +94,7 @@ Background indexing preserves the complete Project cost display while scans resu
 
 `arc.projectCost.historyDays` skips sources by their own modification time, including children. Default zero reads all history. Saved skipped usage still contributes. Windows beginning before the cutoff remain lower bounds even when retained sources contain their usage. Windows inside it retain exactness subject to other coverage defects. A skipped missing source preserves other known lifetime usage with incomplete coverage. Settings changes reoffer sources. Confirmed missing files retain derived figures while they contribute to retained windows.
 
-Save scheduling waits thirty seconds from the first unsaved change. Failed saves remain owed, log `projectSpendSaveFailed`, and retry from two seconds with doubling waits for five tries. Further changes or flushes restart eligibility. Workspace changes and disposal flush owed saves. Failed flushes do not retry after that lifetime ends. Crashes and reloads lose reads since the last successful save. Startup rereads saved offsets. A source deleted before its first successful save loses those figures.
+Saves wait thirty seconds from the first unsaved change. Failed saves remain owed, log `projectSpendSaveFailed`, and retry from two seconds with doubling waits for five tries. Further changes or flushes restart eligibility. Workspace changes and disposal flush owed saves. Failed flushes do not retry after that lifetime ends. Crashes and reloads lose reads since the last successful save. Startup rereads saved offsets. A source deleted before its first successful save loses those figures.
 
 ### Supplemental Claude usage
 
