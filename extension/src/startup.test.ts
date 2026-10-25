@@ -32,7 +32,7 @@ import { compatibleDiscovery, discoveryCompatibility } from './progressiveworker
 import { claudeDispatchTranscript } from './turnfixtures';
 import { sessionCoverageMember, sessionPresence, reconcileSessionCollisions } from './sessioncoverage';
 import { sessionSourceKey, sessionPageSources, guardedSourceRevision } from './sessionreads';
-import { beforeAll, test, vi } from 'vitest';
+import { afterEach, beforeAll, test, vi } from 'vitest';
 import { pendingResponseSessionAdmitted, resolveResponseSession } from './domain/session-link';
 import { createPanelVisibility } from './panelvisibility';
 import { outcomesFor } from './timelinestate';
@@ -1199,6 +1199,100 @@ test('isolated startup removes pending agent actions and rejects external frozen
   assert.equal(fs.existsSync(external), true);
 });
 
+let panelProviderMembers: Set<string> | undefined;
+let harnessFaults: Error[] = [];
+// Each guarded harness has a signal that resolves with its fault. The signal lives here, outside the proxy, so reading it
+// never counts as a PanelProvider member read.
+const harnessFaultSignals = new WeakMap<object, Promise<Error>>();
+
+afterEach(() => {
+  const faults = harnessFaults;
+  harnessFaults = [];
+  if (faults.length) throw faults[0];
+});
+
+// A harness copies only some PanelProvider methods. A path that retries after catching the TypeError from a missing method
+// turns that miss into a microtask loop. The loop never yields to the event loop, so no test timer fires. The worker then
+// spins until it runs out of memory. Tests tolerate a few missing methods, and each harness class declares them as the stubs
+// below. The wrapper fails on the first read of any other PanelProvider method that the harness lacks. The error names that
+// method. The proxy keeps the fault, so every later read throws and the retry loop ends. The afterEach hook rethrows the
+// fault in the test that caused it. Other tests build fresh harnesses and are unaffected. A test that waits for work the
+// fault stopped fails at once when it awaits through raceHarnessFault. Discovery reads the instance methods of the class by identifier or string name.
+// Getters and properties that hold a function are not covered. A computed method name fails the discovery.
+const OPTIONAL_PANEL_PROVIDER_STUBS = `
+      updateProjectSpendIntegrity() {}
+      publishProjectSpendCoverage() {}
+      defaultContext() { return undefined; }
+      acceptExplicitMetadataRead() {}
+      launcherDefaults() { return undefined; }
+      agentSpendKey() { return 'spend'; }
+      refreshAgentFacts() {}
+      usagePayloadForSession(session, webview) { return this.usagePayload(webview); }
+`;
+
+function panelProviderMemberNames(): Set<string> {
+  const file = ts.createSourceFile(
+    'panelhost.ts',
+    fs.readFileSync(path.join(__dirname, 'panelhost.ts'), 'utf8'),
+    ts.ScriptTarget.Latest,
+    true,
+  );
+  const owner = file.statements.find(
+    (statement): statement is ts.ClassDeclaration =>
+      ts.isClassDeclaration(statement) && statement.name?.text === 'PanelProvider',
+  );
+  assert.ok(owner);
+  const names = new Set<string>();
+  for (const member of owner.members) {
+    if (!ts.isMethodDeclaration(member) || ts.isPrivateIdentifier(member.name)) continue;
+    if (ts.getCombinedModifierFlags(member) & ts.ModifierFlags.Static) continue;
+    assert.ok(
+      ts.isIdentifier(member.name) || ts.isStringLiteral(member.name),
+      `The startup harness guard cannot read the PanelProvider method name ${member.name.getText(file)}.`,
+    );
+    names.add(member.name.text);
+  }
+  return names;
+}
+
+// Rejects with the harness fault when the harness records one before the wait settles. The signal resolves with the error and
+// this wait rejects, so a fault that nobody waits on leaves no unhandled rejection.
+function raceHarnessFault<T>(provider: object, wait: Promise<T>): Promise<T> {
+  const signal = harnessFaultSignals.get(provider);
+  assert.ok(signal, 'The provider is not a guarded harness.');
+  return Promise.race([
+    wait,
+    signal.then((error): never => {
+      throw error;
+    }),
+  ]);
+}
+
+function guardedHarness<T extends object>(provider: T): T {
+  const members = (panelProviderMembers ??= panelProviderMemberNames());
+  let fault: Error | null = null;
+  let notify!: (error: Error) => void;
+  const signal = new Promise<Error>((resolve) => {
+    notify = resolve;
+  });
+  const guarded = new Proxy(provider, {
+    get(target, key, receiver) {
+      if (typeof key !== 'string' || key === 'then') return Reflect.get(target, key, receiver);
+      if (!fault && members.has(key) && !(key in target)) {
+        fault = new Error(
+          `The startup harness lacks the PanelProvider member ${key}, which the code under test used. Add ${key} to the method list of the harness that built this provider.`,
+        );
+        harnessFaults.push(fault);
+        notify(fault);
+      }
+      if (fault) throw fault;
+      return Reflect.get(target, key, receiver);
+    },
+  });
+  harnessFaultSignals.set(guarded, signal);
+  return guarded;
+}
+
 function harness(pendingRefresh = false, registerRefreshHandler = true, extraMethods: string[] = []): any {
   const file = ts.createSourceFile(
     'panelhost.ts',
@@ -1251,6 +1345,7 @@ function harness(pendingRefresh = false, registerRefreshHandler = true, extraMet
     const shortenTo = (line, limit, ellipsis) => line.length <= limit ? line : line.slice(0, Math.max(0, limit - ellipsis.length)) + ellipsis;
     const RAIL_NAME_LIMIT = 200;
     export class Harness {
+      ${OPTIONAL_PANEL_PROVIDER_STUBS}
       membershipOf(session) { return this.sessions?.some((source) => source.sessionId === session) ? 'present' : 'absent'; }
       acceptSessionCoverage(current) { this.membershipCoverage = { status: 'complete' }; return current; }
       sessionQueryContext() { return undefined; }
@@ -1309,7 +1404,7 @@ function harness(pendingRefresh = false, registerRefreshHandler = true, extraMet
     CATALOG_REFRESH_DEADLINE_MS,
     SessionLoadingLine,
   );
-  const provider = new module.exports.Harness();
+  const provider = guardedHarness(new module.exports.Harness());
   if (registerRefreshHandler) {
     provider.setRefreshUsageHandler((agent: string | null, force: boolean) => {
       provider.usageRequests.push([agent, force]);
@@ -1502,6 +1597,7 @@ function completeDiscoveryHarness(
     const prunePlaces = (trail) => trail; const visitPlace = (trail) => trail;
     let railPayload = () => ({ rail: [], labels: [], views: [], railFilters: [], stats: {} });
     export class Harness {
+      ${OPTIONAL_PANEL_PROVIDER_STUBS}
       sessionQueryContext() { return undefined; }
       publishSessionQueryContext() {}
       failSessionLoading() {}
@@ -1707,7 +1803,7 @@ function completeDiscoveryHarness(
     sessionDiscoveryMembership,
     ...Object.values(scope),
   );
-  const provider = new module.exports.Harness();
+  const provider = guardedHarness(new module.exports.Harness());
   if (!extraMethods.includes('allSessions')) {
     const accept = provider.acceptSessionCoverage.bind(provider);
     provider.acceptSessionCoverage = (current: any[], scope: string) => {
@@ -1740,6 +1836,7 @@ function railEnrichmentHarness(
   const compiled = transformSync(
     `
     export class Harness {
+      ${OPTIONAL_PANEL_PROVIDER_STUBS}
       sessionQueryContext() { return undefined; }
       publishSessionQueryContext() {}
       failSessionLoading() {}
@@ -1793,7 +1890,7 @@ function railEnrichmentHarness(
     scanForRailEnrichment,
     withMetadataCoverage,
   );
-  return new module.exports.Harness(run);
+  return guardedHarness(new module.exports.Harness(run));
 }
 
 // Extracts prepareMetadata and optional naming methods from PanelProvider.
@@ -1842,6 +1939,7 @@ function metadataHarness(
   const compiled = transformSync(
     `
     export class Harness {
+      ${OPTIONAL_PANEL_PROVIDER_STUBS}
       sessionQueryContext() { return undefined; }
       publishSessionQueryContext() {}
       failSessionLoading() {}
@@ -1884,7 +1982,7 @@ function metadataHarness(
     codexTitleFor,
   };
   new Function('module', 'exports', ...Object.keys(scope), compiled)(module, module.exports, ...Object.values(scope));
-  return new module.exports.Harness(run, sessionNames, derivedCacheFile);
+  return guardedHarness(new module.exports.Harness(run, sessionNames, derivedCacheFile));
 }
 
 function selectedWindowHarness(
@@ -1945,6 +2043,7 @@ function selectedWindowHarness(
     `
     const TRANSCRIPT_TURN_LIMIT = 40; const TRANSCRIPT_TAIL_BYTES = 1024;
     export class Harness {
+      ${OPTIONAL_PANEL_PROVIDER_STUBS}
       membershipOf(session) { return this.authoritativeCatalog.some((source) => source.sessionId === session) ? 'present' : 'absent'; }
       physicalMembershipOf(file) { return this.authoritativeCatalog.some((source) => source.file === file) ? 'present' : 'absent'; }
       sessionQueryContext() { return undefined; }
@@ -2051,7 +2150,7 @@ function selectedWindowHarness(
     CommitRepositories,
     RepositoryCommits,
   );
-  return new module.exports.Harness(run);
+  return guardedHarness(new module.exports.Harness(run));
 }
 
 function windowResult(
@@ -2477,7 +2576,9 @@ async function selectedPublicationFixture(
     session,
     commit,
     bytes,
-    hydrationStarted,
+    get hydrationStarted() {
+      return raceHarnessFault(provider, hydrationStarted);
+    },
     finish: () => finish(),
     hydrationRequests: () => hydrationRequests,
   };
