@@ -7,7 +7,7 @@
   "cli/test/run.test.ts": {
     "reason": "Standalone workers must retain real output, exit, cancellation, receipt ownership, and recovery across process boundaries.",
     "cases": 107,
-    "matricesSha256": "a3aedfabeb17157a8ef0414df70d7f7512a2c41fc687cf6f1d742a94acb70340"
+    "matricesSha256": "f78f079b5fbbe73ae1b3e56d6e212271604db3ed107f9fea0df1c73adea7cff5"
   },
   "cli/test/smoke.bundled-a.test.mjs": {
     "reason": "Compiled CLI commands must reach session reads, comments, and saved defaults through an authenticated window channel.",
