@@ -4,7 +4,7 @@
 
 ### Checks and lanes
 
-Root `npm install` registers `.githooks/pre-commit` only at the Git repository root. The hook checks formatting and lint for added or changed files. It skips partly staged files with a warning and skips symbolic links. Required tools come from this checkout or the main worktree. Missing tools stop the commit. Fully staged production CSS also receives Stylelint checks.
+Root installation registers `.githooks/pre-commit` only at the Git repository root. The hook skips partly staged files and symbolic links. Check those files separately. Required tools come from this checkout or the main worktree. Missing tools stop the commit.
 
 Run formatting and lint checks from the repository root:
 
@@ -13,9 +13,13 @@ npm run format:check
 npm run lint
 ```
 
-`npm run lint` runs `lint:js` with Oxlint, then `lint:css` with Stylelint. `npm run lint:fix` applies Oxlint fixes. Oxfmt handles CSS formatting.
+Apply Oxlint fixes with:
 
-Stylelint checks only `extension/src/webview/*.css`, with zero warnings. Keep property and value checks enabled. `.stylelintrc.cjs` owns selector, clipping, and build-placeholder exceptions. Host VS Code custom properties require no local definitions.
+```bash
+npm run lint:fix
+```
+
+Keep Stylelint property and value checks enabled. `.stylelintrc.cjs` owns selector, clipping, and build-placeholder exceptions. Host VS Code custom properties require no local definitions.
 
 Use `.oxfmtrc.mjs` and `.oxlintrc.jsonc` for scan scope. Both tools disable nested configurations. Type-aware lint covers every package project. Store run evidence under the owning plan's `runs/` directory, or `.claude/plans/runs/` without a plan.
 
@@ -25,11 +29,16 @@ Run the full test suite:
 npm run test:all
 ```
 
-`npm test` runs formatting, lint, typecheck, and direct units in order. `test:unit` runs root, extension, and CLI units sequentially. It excludes `subprocess` cases and defers their worker builds. `npm run test:all` adds every integration and browser category. Follow [Handoff checks](#handoff-checks) before handoff or landing.
+`package.json` names the commands. `scripts/test-default.mjs`, `scripts/test-unit.mjs`, and `scripts/test-integration.mjs` own lane composition and order. Follow [Handoff checks](#handoff-checks) before handoff or landing. For extension-only checks, run:
 
-`npm run test:integration` runs root subprocess tests, extension integration tests, panel-mockup tests, and hook and CLI smoke tests sequentially. `npm run test:browser` runs every extension browser file. The CLI smoke command builds its bundle before running tagged CLI cases. `npm --prefix extension run test:node` runs every extension Node case. `node extension/test.mjs full` runs every extension Node and browser case. Named-file commands retain tagged and untagged cases unless the caller supplies a tag filter.
+```bash
+npm --prefix extension run test:node
+node extension/test.mjs full
+```
 
-Root tests that start real processes carry the Vitest tag `subprocess`. The root tag supplies a 120 second test budget. Tagged hooks retain their own budget. A whole file uses `// @module-tag subprocess`. Other files tag individual tests or suites with `{ tags: ['subprocess'] }`. Each package enables strict tags. `test:root` and `test:subprocess` partition the root tests and exclude the hook smoke file. `test:smoke` owns that file. Each root subprocess runner starts independently and runs one file at a time, with at most two concurrent cases.
+Named-file commands retain tagged and untagged cases unless the caller supplies a tag filter.
+
+Root tests that start real processes carry the Vitest tag `subprocess`. The root tag supplies a 120 second test budget. Tagged hooks retain their own budget. A whole file uses `// @module-tag subprocess`. Other files tag individual tests or suites with `{ tags: ['subprocess'] }`. `scripts/test-subprocess.mjs` owns runner isolation and concurrency.
 
 Update `scripts/test-admission.json` when adding expensive cases or expanding a matrix. It names failure boundaries, case budgets, and repetition identities. `scripts/test-lanes.test.js` checks admission and lane coverage. Keep corruption, installation, extraction, process identity, platform, accessibility, and browser interaction coverage. Put input variations in direct tests when they reach the same failure.
 
@@ -44,13 +53,9 @@ npm exec -- vitest run scripts/extension-test-runner.test.js
 npm --prefix extension run test:browser
 ```
 
-Each browser process that waits for a shared slot prints `Browser test slot wait: <milliseconds> ms.` after it acquires one. The figure uses a monotonic clock and covers only time waiting for a slot. An immediate acquisition prints no wait line.
-
 The launcher tries bundled Chromium, Edge, then Chrome. Each launch attempt times out after ten seconds, within the panel-mockup scale test's sixty-second deadline. On Windows, unmitigated Edge and Chrome launches record failed sign-ins. A lane reaches a ten-failure lockout threshold. Bundled Chromium omits that browser layer. Fallback launches disable the responsible feature. Preserve the combined `--disable-features` list in `extension/test/browserchannels.mjs`. Chromium keeps only the last switch, so replacing Playwright's list drops its settings. That file links the browser defect reports.
 
-A waiting browser lane prints its holder's PID, extension directory, and start time once when waiting begins. It reports elapsed wait on resumption. Immediate acquisitions print neither line.
-
-The browser tests build the panel and measure it in bundled Chromium, Edge, or Chrome. The browser runner names the executable before the lane runs. If no supported browser launches, browser mode and full mode fail. Node mode remains available for iteration without a browser. Direct Vitest runs bypass this check and skip individual tests when no browser launches.
+`extension/test/browserchannels.mjs` and `extension/test/browserlock.mjs` own slot and lane-wait notices. If no supported browser launches, browser mode and full mode fail. Node mode remains available for iteration without a browser. Direct Vitest runs bypass this check and skip individual tests when no browser launches.
 
 ### VSIX candidate
 
@@ -62,7 +67,7 @@ npm --prefix extension run package
 node extension/scripts/check-vsix.mjs
 ```
 
-The check compares packaged files, identity, version, and bundle with the current build. For manual installation, use **Extensions: Install from VSIX** with `extension/arc.vsix`. A manual `VSIX candidate` workflow runs the full suite and retains a versioned VSIX and SHA-256 checksum as temporary artifacts. Manual runs never publish, including runs on tags. [Release](installation.md#release) owns tag publication.
+`extension/scripts/check-vsix.mjs` owns package checks. For manual installation, use **Extensions: Install from VSIX** with `extension/arc.vsix`. The `VSIX candidate` workflow retains a versioned VSIX and SHA-256 checksum as temporary artifacts. Manual runs never publish, including runs on tags. [Release](installation.md#release) owns tag publication.
 
 The standalone tagged-release downloader needs no Node or source checkout:
 
@@ -70,7 +75,7 @@ The standalone tagged-release downloader needs no Node or source checkout:
 bash scripts/install-release.sh 0.1.0 code
 ```
 
-Without an editor argument, it selects the sole detected editor or asks the reader to choose. Tag `v<version>` must contain `glin.arc-<version>.vsix` and `glin.arc-<version>.vsix.sha256`. Publish this installation path only when those assets exist.
+Tag `v<version>` must contain `glin.arc-<version>.vsix` and `glin.arc-<version>.vsix.sha256`. Publish this installation path only when those assets exist.
 
 ### Test timing
 
@@ -93,7 +98,7 @@ Each file permits 1024 events and one MiB, including reserved terminal space. Ov
 - Return from extension registration before walking or comparing the snapshot store. Run cleanup later.
 
 - Keep build imports loadable under plain Node. Packaging tests spawn `node esbuild.mjs` directly. Load `panelbundle.ts` through scoped `tsx/cjs/api`. A global TypeScript loader risks an ESM cycle on Node 22.
-- Browser files use `panel.layout*.test.ts` or `*.browser.test.ts`. Node mode excludes them. Browser and full modes use the built panel and `extension/test/browser.ts`. Each test gets a fresh context. Tests share browser startup until disconnection or a failed launch, then the next request launches another browser. Browser recovery does not retry a failed page operation. Each context's fixture clock starts in the local day's early afternoon and advances normally. Use browser-local calendar dates when checking day groups. The fixture includes older days, and cache bands still expire.
+- `extension/test.mjs` selects browser files. `extension/test/browser.ts` owns contexts and browser reuse. Browser recovery does not retry a failed page operation. The fixture clock advances normally, so cache bands still expire. Use browser-local calendar dates when checking day groups.
 - Browser lanes share `arc-browser-tests.lock` in the system temporary directory. The lock is acquired before browser detection. Do not bypass it to compare execution times. Stale-lock takeover has a rare three-way race. Hard-link publication prevents partial reads. Its exclusive-create fallback permits them. `extension/test/browserlock.mjs` owns heartbeat, monotonic stale-age checks, retirement, restoration, and the wait deadline.
 - Include `extension/test/temp-run.ts` as global setup in every Vitest configuration. `temproot.test.ts` checks this requirement. Run-local temporary files are removed at teardown. Machine coordination uses `ARC_TEST_MACHINE_TEMP`. Interrupted runs remain under `arc-test-runs` until a later run finds their owner exited.
 

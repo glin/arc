@@ -2,7 +2,12 @@
 
 ## Fast iteration
 
-Run `npm run test:iterate` while you iterate. It runs the direct unit lanes. Run `npm test` to include static checks.
+Run direct units while you iterate, or include static checks:
+
+```bash
+npm run test:iterate
+npm test
+```
 
 Check a change with the cheapest method that reaches it, in the order `CLAUDE.md` gives. A change that needs a real VS Code window goes to the [isolated editor](isolated-editor.md#isolated-extension-host).
 
@@ -46,7 +51,7 @@ npm --prefix extension exec -- playwright-core install chromium-headless-shell
 
 The browser install writes to the per-user Playwright cache outside the repository. [Browser selection](testing.md#browser-selection) explains the channel order.
 
-`npm install` reuses existing dependencies and updates the lockfile when needed. Replacing an in-use package still conflicts with running tests on Windows.
+Replacing an in-use package conflicts with running tests on Windows.
 
 `esbuild` is native. Install dependencies on the operating system that runs the commands. A `node_modules` tree copied from another operating system will not run it.
 
@@ -133,20 +138,24 @@ npm --prefix extension run dev
 
 This workflow runs in the owner's own VS Code window. An agent uses the [isolated editor](isolated-editor.md#isolated-extension-host) instead.
 
-Wait for the ready message, then open this checkout in VS Code. Press F5 and select `Run Arc Extension`. Open Arc in the new Extension Development Host. CSS saves patch the panel in place. Component saves, Vite reloads, and reconnects replace the webview document. Replacement restores the selected session, unsent prompt, and scroll position after initial layout. `webview/bootstrap.ts` owns browser-lifetime cleanup.
+Wait for the ready message, then open this checkout in VS Code. Press F5 and select `Run Arc Extension`. Open Arc in the new Extension Development Host. `extension/src/paneldevelopment.ts` owns updates and recovery. `extension/src/webview/bootstrap.ts` owns browser-lifetime cleanup.
 
 The launch passes the checkout as a positional folder argument on Windows. Do not use `${workspaceFolder}` with `--folder-uri`, because VS Code keeps the Windows path instead of creating a file URI. If F5 reuses a development host without a folder, stop debugging and close that host before starting again.
 
-The server binds strictly to `127.0.0.1:5173`. Stop a conflicting process before retrying. A panel opened while the server is down shows its recovery command and reloads when the server returns. Syntax errors retain the last working panel during updates. Fix and save to recover. Check reconnects with a reopened panel and a restored tab.
+The server binds strictly to `127.0.0.1:5173`. Stop a conflicting process before retrying. Fix syntax errors and save to recover. Check reconnects with a reopened panel and a restored tab.
 
-Development command selection follows the [bundled tools contract](installation.md#bundled-tools). CLI source saves update `dist/cli.cjs`. Extension-host source saves rebuild `extension/dist/extension.js`. Reload the Extension Development Host to apply them. The panel does not present extension-host changes as hot updates.
+Development command selection follows the [bundled tools contract](installation.md#bundled-tools). Reload the Extension Development Host after CLI or extension-host source saves. `extension/esbuild.mjs` owns both watchers.
 
 This workflow supports a local Windows Extension Development Host. Remote extension hosts and port-forwarded development servers are unsupported. The webview loads its loopback address on the local VS Code machine, while a remote command binds on the remote machine.
 
-Run `npm --prefix extension run build` after development. The production build restores the inline script, inline stylesheet, strict content policy, and offline operation. It contains no Vite client or development network request.
+Restore the production panel after development:
+
+```bash
+npm --prefix extension run build
+```
 
 ## Configuration watches
 
-`configwatch.ts` watches queried folders and every ancestor for `.claude` and `.codex`. Existing directories receive direct-child watches for `settings*.json` or `config.toml`. Create events and successful later checks add missing watches. Windows and macOS match directory-event names without case. Linux preserves case. Keep patterns non-recursive. VS Code treats `/` or `**` as recursive. Agent user homes have separate file watches.
+`extension/src/configwatch.ts` owns folder watches. `extension/src/extension.ts` connects them to defaults invalidation and watches agent user homes. Windows and macOS match directory-event names without case. Linux preserves case. Keep patterns non-recursive. VS Code treats `/` or `**` as recursive.
 
-On macOS, VS Code silently skips non-recursive watches under `/Volumes/`. A second-volume working directory outside every workspace folder receives no configuration invalidation. Dispose unused folder and inner watches. Only Arc executable path settings invalidate defaults through editor configuration events.
+On macOS, VS Code silently skips non-recursive watches under `/Volumes/`. A second-volume working directory outside every workspace folder receives no configuration invalidation. Only Arc executable path settings invalidate defaults through editor configuration events.
