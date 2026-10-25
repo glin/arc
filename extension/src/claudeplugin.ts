@@ -435,7 +435,7 @@ export class ClaudePluginSetup {
         `${sameCheckout ? 'The arc marketplace uses this checkout. Local installation requires managed plugin storage.' : 'The arc marketplace uses another source.'} ` +
           `Actual source: ${actual}. Expected source: ${expected}. Claude home: ${target.home}. ` +
           'Existing hooks are preserved. Use --no-hooks to update the extension without refreshing or checking hook compatibility. ' +
-          'For one-time migration choices, see docs/development.md#legacy-checkout-plugin-recovery.',
+          'For one-time migration choices, see docs/installation.md#legacy-checkout-plugin-recovery.',
       );
     }
     return true;

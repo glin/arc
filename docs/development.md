@@ -150,7 +150,3 @@ Run `npm --prefix extension run build` after development. The production build r
 `configwatch.ts` watches queried folders and every ancestor for `.claude` and `.codex`. Existing directories receive direct-child watches for `settings*.json` or `config.toml`. Create events and successful later checks add missing watches. Windows and macOS match directory-event names without case. Linux preserves case. Keep patterns non-recursive. VS Code treats `/` or `**` as recursive. Agent user homes have separate file watches.
 
 On macOS, VS Code silently skips non-recursive watches under `/Volumes/`. A second-volume working directory outside every workspace folder receives no configuration invalidation. Dispose unused folder and inner watches. Only Arc executable path settings invalidate defaults through editor configuration events.
-
-## Legacy checkout plugin recovery
-
-Follow [Legacy checkout plugin recovery](installation.md#legacy-checkout-plugin-recovery) for the migration procedure.
