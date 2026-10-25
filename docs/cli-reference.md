@@ -345,3 +345,9 @@ Cost rejects unknown options, missing values, multiple targets, invalid times or
 Status-line input rejects empty stdin, malformed JSON, and non-object values. `--json` and `--next-turn` cannot combine. Other unknown status-line arguments are ignored.
 
 `skills install`, `skills update`, and `skills remove` require repeatable `--agent claude` or `--agent codex`. They need no Arc window, network, hooks, or authentication. JSON reports each destination separately. Invalid selectors exit 2 before writes. Failed or incomplete destinations exit 1. Handled HUP, INT, and TERM exit 129, 130, and 143 after filesystem settlement. Repeated signals preserve the first cancellation. [Skill installation and recovery](arc-sessions.md#install-the-parts-you-need) defines destination and preservation rules.
+
+## Command and collection implementation
+
+`cli/src/collect.ts` follows production listing pages and optionally reads turns through the selected window channel. It retains raw observations separately from usable row references and turn outcomes. [Collection output](cli-reference.md#collection) owns recovery, admission limits, and the absence of physical source continuity guarantees.
+
+`cli/src/commands.ts` owns admitted command identities and required help data. `sessions.ts` renders readable listings and turns, and passes explicit JSON replies through. `cost.ts` renders readable cost summaries and omits invariant explanatory notes from CLI JSON. `main.ts` dispatches those identities and renders help before stdin or window access. Missing help data refuses command admission.
