@@ -32,7 +32,7 @@ Claude permission and `AskUserQuestion` requests require stdio permission routin
 
 Classify completed assistant messages, not partial deltas. A tool-use stop becomes Activity narration. Other stops retain response text. JPEG, PNG, GIF, and WebP become base64 image blocks. PDFs become document blocks, and text media types become UTF-8 documents. Reject other binary types before acceptance. Base64 stays inside the wire envelope, outside saved prompt box state and webview messages.
 
-Local command results carry `num_turns: 0` and null `stop_reason`. A local command result arrives in well under a second. Model work reports positive turns. Keep local command settlement separate from model completion. [Timeline parsing](timeline.md#shared-turn-model) owns whether recorded command scaffolding opens or withdraws a turn.
+Local command results carry `num_turns: 0` and null `stop_reason`. Model work reports positive turns. Keep local command settlement separate from model completion. [Timeline parsing](timeline.md#shared-turn-model) owns whether recorded command scaffolding opens or withdraws a turn.
 
 ### Clear identity
 
