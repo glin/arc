@@ -16,7 +16,7 @@ Preserve written text and original choice labels exactly. Claude joins answers i
 
 Question bodies use block Markdown and timeline link navigation. Choices use inline Markdown without interactive content or images. Requests exceeding 64 KiB of combined question text, headers, option labels, and descriptions use escaped text instead. HTML remains escaped except for [validated disclosures](turn-cards.md#markdown-disclosures).
 
-Secrets use password inputs. Question tabs expose completion without exposing values. Beyond two tab rows, tabs omit answer values visually but retain complete non-secret answers in accessible names.
+Secrets use password inputs. Question tabs expose completion without exposing secret values. Beyond two tab rows, tabs omit answer values visually but retain complete non-secret answers in accessible names.
 
 Decline prevents unreadable questions from blocking the child. Sending a prompt answers live open requests first, so the prompt does not wait behind them. Saved recovered questions are excluded. Send's visible explanation, accessible name, and announcement disclose this behavior.
 

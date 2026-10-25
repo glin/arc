@@ -30,4 +30,6 @@ Send waits during staging, except for Codex `/rename` and Claude `/remote-contro
 
 An incompatible attachment blocks a draft's agent change without removing the file. Send and session-opening continuations recheck compatibility and staged contents.
 
+Live cards build attachment chips from submission assets. Recorded cards show no attachment chips, because the transcript readers keep no vendor attachment records. Chips disappear when a recorded card replaces its live card.
+
 Only one attachment-bearing prompt per session can await acceptance. Overlapping sends restore text only if no newer edit replaced it. Completed reads follow provisional adoption and recheck the selected agent before merging descriptors. Stop cancels Claude attachment preparation before the user message reaches the wire.
