@@ -153,13 +153,20 @@ Prompt files must be regular and at most 48 KiB. Empty prompts and slash command
 
 | Result | Meaning |
 | --- | --- |
-| Start `accepted` or `accepted-with-errors` | Launch accepted. Includes session ID, provider, requested setup, classification, attribution, and save errors. |
+| Start `accepted` or `accepted-with-errors` | Launch accepted. Includes session ID, provider, requested setup, classification, attribution, `link`, and save errors. |
 | Curation `applied` | Metadata change accepted. Rejected saves produce errors. |
 | Curation `dry-run` | Admission checked without writes. |
 | `refused` | Request refused, with its reason. |
 | `unknown` | Delivery is uncertain. Retain the request ID and original activation. |
 
 Start JSON includes additive `metadata.labels` and `metadata.pinned` results. Their `state` is `saved` only after persistence succeeds, otherwise `uncertain`. Labels include normalized `values`, and pin state includes `value`. Requested names include `metadata.name.requested` and a `state` of `pending`, `saved`, `failed`, `cancelled`, or `uncertain`. A known naming error also includes `error`. Durable pending naming permits `accepted`. Known metadata failure produces `accepted-with-errors`. Detailed session JSON exposes retained name state after ordinary catalog admission. Catalog visibility remains eventual. The start result supplies no catalog membership or observed model evidence.
+
+An accepted start with a session ID includes `link`, with or without `--json`. Its value is a Markdown session link labeled with the requested name, or `null`. The value is a link only when all of these hold:
+
+- The selected window equals `ARC_WINDOW` in the CLI's environment. A start that selects a window with `--window` from a shell without `ARC_WINDOW` returns `null`.
+- `--name` is given, and the name contains visible text without a line break or control character. A name of only whitespace or invisible characters returns `null`.
+- The name state is not `failed`, `uncertain`, or `cancelled`, and carries no error. A `pending` name still gets a link.
+- The session ID is a valid link target.
 
 Write JSON includes `requestId` and `status`. Unknown delivery omits accepted-result and curation details. Fresh IDs use the selected `hostId` followed by a colon and caller ID. Identical-payload retries return the retained result. Conflicting payloads refuse. Reloads invalidate the activation. The CLI never retries writes automatically.
 

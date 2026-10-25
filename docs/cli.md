@@ -105,12 +105,7 @@ Use `--setup KEY` instead of explicit provider settings to select a returned set
 
 Starts retain reader ownership by default. Use `--agent-run` for delegated work. `--arc-dispatch` records the requesting session for guarded follow-ups and returns a `launchId` for [dispatch results](#dispatch-results).
 
-An accepted start with a session ID includes `link`, with or without `--json`. Its value is a Markdown session link labeled with the requested name, or `null`. The value is a link only when all of these hold:
-
-- The selected window equals `ARC_WINDOW` in the CLI's environment. A start that selects a window with `--window` from a shell without `ARC_WINDOW` returns `null`.
-- `--name` is given, and the name shows visible text on one line. A name of only whitespace or invisible characters returns `null`.
-- The name state is not `failed`, `uncertain`, or `cancelled`, and carries no error. A `pending` name still gets a link.
-- The session ID is a valid link target.
+The [start output reference](cli-reference.md#session-writes) defines `link` for reporting an accepted session.
 
 Add `--cache-lifetime 1h` to give a Claude coordinator that waits on workers a 1 hour prompt cache. `--cache-lifetime 5m` selects 5 minutes. [Session writes](cli-reference.md#session-writes) defines the default and refusals.
 
