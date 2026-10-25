@@ -6,7 +6,7 @@
 
 `transcript.ts` and `codex.ts` return shared `SessionFile`, `Turn`, and `Compaction` values. Keep provider-specific interpretation inside the source readers. Discovery, pricing fallback, and named provider limitations retain their own branches.
 
-`SessionFile` identifies the session and source. `Turn` holds its prompts, responses, activity, edits, usage, and clocks. A `Compaction` is a context boundary, separate from a turn and its response.
+A `Compaction` is a context boundary, separate from a turn and its response.
 
 One-shot reads, append checkpoints, and semantic pages use the same forward reducers. Forward checkpoints own associations through their applied byte. Backward page state owns incomplete older edges separately. [Session history](session-history.md#selected-session-history) owns page admission and retention.
 
@@ -32,7 +32,7 @@ Claude records a queued prompt when the agent picks it up. Delivery owners must 
 
 Codex records task starts and terminals directly. Copied parent history supplies no own turn, completion, or request. Delayed `turn_context` evidence can retract a turn after its apparent completion. Preserve that classification through append checkpoints and older-page reads.
 
-Codex final answers can arrive through `item_completed`, phased `response_item` messages, or root `agent_message` events. `recordAnswer` joins matching identities first. Its fallback joins identical text from the latest answer within two seconds, only when no later prompt intervenes. An aborted turn retains its recorded final answer as its summary. [Questions and recovery](question-recovery.md#codex-asynchronous-questions) owns asynchronous delivery, which supplies no final answer.
+`recordAnswer` in [`codex.ts`](../extension/src/codex.ts) joins final-answer envelopes. [Questions and recovery](question-recovery.md#codex-asynchronous-questions) owns asynchronous delivery, which supplies no final answer.
 
 ## Card sources
 
@@ -66,13 +66,13 @@ Classify vendor records from structured fields before returning the shared model
 
 Narration and clear reasoning summaries are ordered Activity messages, separate from tool steps. Claude contributes assistant text stopped for tool use. Codex contributes commentary-phase messages and clear reasoning summaries. Final answers remain responses.
 
-Codex commentary reaches the parser through event and response envelopes. `recordUpdate` joins matching ids or matching timestamps and text. Its fallback pairs an idless root event with an identified response item. It joins normalized text within two seconds, once, without an intervening prompt, tool step, or other Activity message. Keep the first row's position and clock while accepting the response identity.
+`recordUpdate` in [`codex.ts`](../extension/src/codex.ts) joins commentary envelopes while retaining the first row's position and clock.
 
 Claude background completion notices arrive as queued attachments while the parent works and as `task-notification` user records while it waits. Both must reach `applyClaudeTaskNotification`. Unknown launch ids create no row. A nested foreground result needs its own `agentId:` line followed by `<usage>` before it supplies child identity. An id quoted in the report cannot identify the child. A background result remains open until its completion notice.
 
 Peer handbacks and coordinator messages wake existing turns. Keep handback ids across typed prompts because a completion notice can repeat an earlier turn's handback. A notice after a closed reply, without intervening tool work, marks a later reply as a repeated receipt. It does so only when that turn already has a response. Thinking and text with one message id remain one reply.
 
-`SubagentHandback.message` supplies the child response. Compare it only with the newest eligible closing reply since the latest prompt, peer message, coordinator message, or earlier handback. Containing texts retain one longer answer after trimming outer whitespace. The handback wins equal text. Different texts remain separate answers. Empty or nontext messages supply no response.
+`SubagentHandback.message` supplies the child response. [`reduceClaudeSessionLine`](../extension/src/transcript.ts) owns handback and closing-reply deduplication.
 
 Replies after the handback remain `notResponse: after-handback` until a prompt, peer message, or coordinator message wakes the child. Its own background completion notices and no-text harness nudges do not clear that state. Child reads skip sidechain peer and completion attachments. A reply containing only `No response requested.` never becomes the response. Marked replies stay in Activity. Preserve quote fallback when those marks change saved comment reply numbers.
 
@@ -80,9 +80,9 @@ Replies after the handback remain `notResponse: after-handback` until a prompt, 
 
 Skill records and their true count survive the bounded step list. They retain source identity, time, path, description when available, and evidence strength. Do not infer skill use or who selected it from prose.
 
-Claude records native `Skill` calls. Pair their directory records through `sourceToolUseID`, never adjacency. A failed call removes its skill use while retaining the failed invocation. A typed skill command requires the next admitted meta user record to supply its base-directory line on an open turn. Any other successor, or EOF, establishes no load. Harness commands establish none. A typed use suppresses a same-name native call on that turn. Repeated native calls remain distinct uses.
+Claude pairs native `Skill` directory records through `sourceToolUseID`, never adjacency. A typed command requires the next admitted meta user record's base-directory line on an open turn. [`transcript.ts`](../extension/src/transcript.ts) owns skill-use admission and failed-call withdrawal.
 
-Codex records best-effort catalog-path reads in successful completed commands. Catalog entries alone, prompt mentions, output paths, searches, hashes, and failures establish no load. `codexSkillCatalog` supports absolute paths and root-table aliases. `recordCodexSkillUses` combines parsed read paths with recognized file-printing commands. Preserve Windows path comparison and executable-name normalization when changing that fallback.
+Codex skill evidence is best-effort successful catalog-path reading, not a prompt mention or catalog entry. [`recordCodexSkillUses`](../extension/src/codex.ts) owns command recognition. Preserve Windows path comparison and executable-name normalization when changing that fallback.
 
 A Claude skill call has no tool category but retains its invocation and Activity row. A Codex skill read retains its run category because the command is both a run and a skill use. The skills explanation appears only when the list includes best-effort evidence.
 

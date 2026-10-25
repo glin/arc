@@ -6,37 +6,35 @@
 
 `turncard.ts` prepares the browser-facing card. `webview/card.ts` draws it without repeating decisions about wording, status, marks, cost, context, or file meaning. Keep presentation decisions in the host projection when adding a field.
 
-The chip row orders cost, context, files, tokens, commits, subagents, then dispatched work. `chipsOf` builds every figure except dispatched work. The host resolves dispatched children through its catalog and appends that figure. Missing figures stay absent. [Snapshots and diffs](snapshots.md#diff-selection) owns recorded file evidence.
+`chipsOf` in [`turncard.ts`](../extension/src/turncard.ts) builds figures. The host resolves dispatched children through its catalog and appends their figure.
 
-The Card layout setting selects Compact, One column, or Two columns. The column layouts draw Subagents, Dispatched, Commits, then Files when those collections exist. Cost stays above the body. Both layouts and chip popovers draw the same `DetailRowList`. The host names the record collection. `withRecordRows` attaches the card's existing array before drawing a chip. The popover receives a row-rendering callback instead of importing row components.
+Card layouts and chip popovers share `DetailRowList` in [`webview/card-rows.ts`](../extension/src/webview/card-rows.ts). The host names the record collection. Popovers receive a row-rendering callback instead of importing row components.
 
-Prompts start clamped. Above the response, the opening prompt uses two lines and later prompts have a separate toggle. Saved comments reveal later prompts until the reader changes that toggle. Below the response, the prompt follows its heading. Both positions use `You asked` for reader prompts and `Assigned task` for Codex assignments. An assignment with no readable payload reports unavailable full instructions. `PromptLead`, `PromptSection`, and `PromptBlock` own these disclosures. Preserve their comment anchors when changing placement.
+`PromptLead`, `PromptSection`, and `PromptBlock` in [`webview/card.ts`](../extension/src/webview/card.ts) own prompt disclosures. Preserve their comment anchors when changing placement.
 
-Card facts originate in transcripts or rollouts. [Card sources](timeline.md#card-sources) owns live activity reconciliation with recorded work. Snapshot content supplies current-file diffs only. [Snapshots and diffs](snapshots.md#diff-selection) owns that boundary. [Data sources](data-sources.md#source-catalog) owns recorded-source locations and provenance. Do not infer missing state from a figure's absence or from an incomplete child record.
+[Card sources](timeline.md#card-sources) owns live activity reconciliation. [Snapshots and diffs](snapshots.md#diff-selection) owns file evidence. Do not infer missing state from a figure's absence or an incomplete child record.
 
 ## Activity
 
-Activity starts open. A done turn initially shows recorded agent messages, including earlier replies. Other statuses show the chronology of narration, replies, later prompts, reasoning, and tool-call runs. A reader's filter and disclosure choices survive card repainting. Filters last until reload. When completion changes the default filter, a focused non-message row remains until focus leaves Activity.
+`Activity` in [`webview/card.ts`](../extension/src/webview/card.ts) owns filters, disclosure choices, and focus retention across completion and repainting.
 
-The Activity head orders message and reply counts before the tool mix, then the skill count. Message and reply counts toggle their filters and open a closed log. Messages keeps agent messages. Replies keeps replies alone. Tool-category counts open raw invocation detail. Skills opens the loaded skills. A skill load never becomes a tool category. A done turn with other activity and no agent message states that no messages were recorded and retains the full-activity action.
+`logOf` in [`turncard.ts`](../extension/src/turncard.ts) projects chronology and bounded tool runs. Trimming calls must preserve message positions, original totals, tool mix, and failures.
 
-`logOf` keeps message chronology while the step cap removes calls only. An emptied run keeps its original total and tool mix. A partially retained run identifies missing calls above retained calls. Runs fold when their calls finish. Explicit choices survive repainting, and focus inside a run delays its automatic fold until focus leaves.
-
-Messages offer Show all beyond their rendered bounds. Shift on Activity toggles every visible message's bound. Shortened command rows open their complete text on a press. Arrow keys move among run and command controls. Escape closes an open row. A message carries its time on its bubble. Never put a native title on its Markdown row, because that title replaces link-address hovers.
+Never put a native title on an Activity Markdown row, because that title replaces link-address hovers.
 
 `snapCut` measures the last complete line box, table row, or image inside the message's height limit. The limit comes from its font size. Using the resized box as the limit creates a ResizeObserver feedback loop. Clipping updates interactive descendants' tab stops and measures again after expansion. CSS line clamping does not clip blocks containing `pre` correctly.
 
-Marks summarize existing turn fields or the closing summary. They supply navigation, not another state source. Failed calls stay in Activity without header marks or chips. A settled tool-call group uses a neutral disclosure marker. Failed calls retain their markers and the group retains its failed-call count. Literal text separates that count from the tool total. Those failures establish neither recovery nor a failed group outcome.
+Marks summarize existing turn fields or the closing summary. They supply navigation, not another state source. Failed calls establish neither recovery nor a failed group outcome.
 
 ## Markdown disclosures
 
-Responses and Activity messages accept balanced bare `<details>` sections with one nonempty `<summary>` first. Tags accept case differences and whitespace. Source attributes stay escaped, including `open`, `name`, styles, and event handlers. Summaries render inline Markdown without interactive descendants. Bodies render block Markdown, including tables, lists, fences, and routed links. Tight bodies and blank lines work. Nesting stops at 32 levels.
+[`richtext.ts`](../extension/src/richtext.ts) owns disclosure grammar. It accepts balanced bare `<details>` with one nonempty `<summary>` first, to 32 levels. Attributes and other raw HTML stay escaped.
 
-Code, escaped tags, and HTML comments never establish boundaries. Incomplete, orphaned, duplicate-summary, malformed, or deeper sections stay escaped without truncation. Other raw HTML stays escaped. Pass Markdown to the renderer without pre-escaping it. Preserve recorded line breaks.
+Pass Markdown to the renderer without pre-escaping it. Preserve recorded line breaks. Code, escaped tags, comments, and malformed disclosures must remain literal without truncation.
 
 `richtext.ts` scans structure before Marked lexing, which otherwise consumes tight bodies as HTML. Marked supplies list and blockquote boundaries. Leading tabs expand before container recognition. Position maps return stripped lines and expanded tabs to original positions before literal masking. Fragments share reference definitions before inline lexing. Each render keeps its own configuration.
 
-Native summaries retain Tab, Enter, and Space behavior. Mounted Summary components capture disclosure state before replacing HTML. Unchanged headings and ancestry preserve open state and focus. Changed headings and ambiguous repeated headings receive no inherited state. Create descendant controls before restoring retained focus. Disclosure headings accept comments. Closing a section preserves stored text offsets. Selected Markdown preserves disclosure structure, lists, fences, and tables. Full response copy preserves original source.
+`Summary` in [`webview/card.ts`](../extension/src/webview/card.ts) retains disclosure state through [`webview/summary.ts`](../extension/src/webview/summary.ts). Create descendant controls before restoring focus. Preserve comment offsets and original source when selecting or copying disclosures.
 
 ## Card and disclosure contracts
 
@@ -44,13 +42,11 @@ Native summaries retain Tab, Enter, and Space behavior. Mounted Summary componen
 
 `attributedFiles` combines parent and child files by recorded identity or normalized path and sums recorded counts. A single child receives attribution only when no other child or parent changed that path. Browser membership uses recorded identity when available, otherwise the card's path spelling. Child commit membership accepts abbreviated and full hashes by prefix. Its commit record excludes landings.
 
-File totals retain counted lines alongside unknown-count evidence. Their visible face and accessible name carry no partial mark. The record footer explains each cause and whether counts are unknown or partial. `diffHalves` omits zero-valued added or removed halves. When both halves are zero, callers omit empty wrappers and separators. Keep visible and spoken figures consistent.
+File totals retain counted lines alongside unknown-count evidence. The footer explains each cause and whether counts are unknown or partial. Keep visible and spoken figures consistent. [`diffHalves`](../extension/src/view/stat-detail.ts) and [`webview/stat-chip.ts`](../extension/src/webview/stat-chip.ts) own zero-half rendering.
 
-The card body's Files section reveals `FILES_SECTION_CAP` (20) rows per press. The label names the next batch and the accessible name adds all remaining hidden files. `aria-expanded` becomes true after the first extra batch. `aria-controls` names a stable, card-specific rows container through `cardPartId`. The button stays mounted through full expansion, then collapses to the first batch without losing focus.
+`FilesRows` in [`webview/card-rows.ts`](../extension/src/webview/card-rows.ts) owns file batching and expansion. Keep capped card sections and uncapped popovers on the same row component. The expansion button stays mounted to retain focus.
 
-Expansion survives live redraws. Fully revealed lists stay revealed when they grow. A list that shrinks to the cap resets expansion, so later growth starts at the first batch. Chip popovers use no row cap and scroll within their own bounds. Keep capped and uncapped views on the same row component.
-
-Each commit record uses `groupCommitRows` to group rows by branch within repository. Group headings appear only when rows span groups. The wire array remains flat. `commitGrouping` caches by array identity, so the body, popovers, and clock share the grouping. Host headings carry branch facts without merge times. The browser supplies merged-word hovers and accessible times through `writeCardClock`.
+`groupCommitRows` groups commits by branch within repository. The wire array remains flat. Host headings carry branch facts. The browser supplies times through `writeCardClock`.
 
 ## Subagent and dispatched rows
 
@@ -58,11 +54,11 @@ A current Codex collaboration spawn supplies its recorded thread id and nickname
 
 [Card sources](timeline.md#card-sources) owns structural review attachment and parent-row precedence. The newest child outcome supplies state, and its transcript supplies model and usage. Descendants never flatten onto the root turn.
 
-Running children show cost so far, or tokens when no price applies, as a lower bound. An unfinished child without live evidence uses the idle tone and reports no recorded ending. It shows no commits, files, or duration figure until it ends. Its hover retains elapsed time and tool count while open. Finished figures carry duration, cost, commits, and paths in separate records. Priced usage closes the cost record. Unpriced rows retain a separate usage figure.
+`agentFigures` and `agentDisplay` in [`turncard.ts`](../extension/src/turncard.ts) own child figure allocation and wording. An unfinished child without live evidence reports no recorded ending rather than claiming continued work.
 
-`agentFigures` and `agentDisplay` own record allocation and wording. Claude foreground counts come from Agent results. Background counts come from completion notices' `<tool_uses>`. Finished children without either count total their own calls. Codex children total their own calls. A Claude CLI row under a Codex parent supplies no tool count through that attachment path. Failed calls with unknown tools increase the failure total without adding a tool line. Duration records split tools by name without repeating the hover's total. Multi-turn Codex and dispatched children put Turns before Started and Ended. Claude subagents retain one turn. Local start and end times close the record.
+Claude foreground tool counts come from Agent results. Background counts come from completion notices' `<tool_uses>`. Finished children without either count total their own calls. Codex children total their own calls. A Claude CLI row under a Codex parent supplies no tool count through that attachment path.
 
-`AgentRow` gives linked names the run hint and session action. A row without a session keeps its own run-detail stop. Its figures share one Tab stop. Left and Right move among record figures, closing the old record and opening the next unpinned. Record figures suppress the row hint. `StaticStatChip` supplies an accessible role and name together. Interactive figures take the button role and answer Enter and Space. Named figures without records take the group role.
+`AgentRow` in [`webview/card-rows.ts`](../extension/src/webview/card-rows.ts) owns child navigation and figure keyboard controls.
 
 Background children can outlive a completed, failed, or interrupted newest turn. The newest card includes carried subagents in the same live-child count used by the session list and popover heading. A running or stopped newest turn counts none through `childrenOutliveTurn`. Open-child and background-command expiry belong to the session outcome sources in `turnrail.ts`, rather than browser timers. Keep row state, card counts, and session status on those shared answers.
 
@@ -82,8 +78,6 @@ Fast-forward landings require `merge <ref>: Fast-forward` head-log entries insid
 
 Capture the merged branch with the landing. Use the named ref, or the first branch from `git for-each-ref --points-at` excluding the branch moved. A later lookup loses that answer after branches move or disappear. `attributedCommits` merges child commits by `sameCommitSha`. The child's row wins a duplicate, preserving its maker. Turn figures, accessible names, and session totals use that merged list.
 
-Pressing a commit or landing hash opens the commit in the repository Arc identifies at that moment. A commit with a saved repository proof opens only after the proof passes its check. Another commit or landing opens at the top of its recorded directory's tree once Git has named that directory's repository. When the recorded directory no longer exists, Arc takes its nearest existing ancestor directory. The commit opens in the repository that contains that ancestor only when that repository holds exactly one commit for the hash. The card keeps the recorded directory, so the hash stays a button. When no repository qualifies, or the editor's Git extension has not registered that exact repository root, Arc shows `Arc: The repository for this commit could not be identified.` and opens nothing.
-
 Codex child navigation also requires verified direct-parent evidence. `codexhistory.ts` classifies both raw streams and rejects conflicting ownership operations through the commit and evidence commands. Creation must finish before the matched commit starts. Missing or inconsistent intervals refuse navigation. Each source retains at most 256 operation facts and 33 combined relationships, commit identities, and output pairs. The worker retains one parent cursor and at most eight child cursors, evicting the least recently used. Resume requires the last pending token on the same child revision.
 
 The host reserves at most 1 MiB per request and 64 MiB per physical source revision before dispatch. Accepted pending, complete, or exhausted replies replace reservations with actual bytes read. Stale, cancelled, rejected, and lost replies retain full reservations. Shared parent or child revisions reserve sequentially. Aborting releases both revision admissions while retaining its full reservation. Unfunded head and anchor checks end exhausted. Complete replies require both revisions and complete classified coverage. Parent-only changes invalidate navigation independently of spend.
@@ -92,7 +86,9 @@ The host reserves at most 1 MiB per request and 64 MiB per physical source revis
 
 Rows retain repository grouping while validation runs and while the source only grows. Their directory stays unavailable until validation passes. A failed check removes grouping until a later successful check, including across revisions. Opening waits for expired or grown proof to pass. Quiet recovery requires a usable directory. Fresh capture requires the original command directory and saved identities to survive. Coverage-qualified pruning removes only sources proved absent. The optional derived cache owns persistence. Deleting it discards these observations.
 
-The host picks a commit's repository when the reader presses its hash, apart from the directory the card records. A commit with a saved proof opens only in its proven root. Otherwise `RepositoryCommits.navigable` returns the top of an existing directory's tree only after its own identity read resolved that directory. For a removed directory it walks at most 64 levels up to the nearest existing ancestor and reads that ancestor's Git identity. It then requires exactly one commit object for the hash through `rev-parse --disambiguate` and returns the full hash. The hash is the full one when the record holds it. `recordCommits` takes it from a `commit <sha>` line in the same tool output when the bracketed header printed only a prefix and exactly one such line extends that prefix. It reads no other repository, and the recorded directory stays unchanged. `git.viewCommit` picks another open repository when the folder it receives is not registered with the built-in Git extension, and it consumes the lookup error. A resolved `git.openRepository` does not prove registration. Before `git.viewCommit`, the host activates `vscode.git`, reads `getAPI(1).repositories`, and requires a root that names the same directory as the target. `sameRepositoryRoot` resolves both paths with `realpathSync`, so a registered symbolic link or junction alias matches, and it compares the paths as given when either read fails. It compares without case only on Windows and for drive paths, which follows `normalizeFsPath`. A containing parent repository does not match. A missing extension, a missing API, or no matching root refuses the commit. The host opens the commit through the matched root's URI.
+Commit opening rechecks the repository through `commitTarget` and `openCommit` in [`panelhost.ts`](../extension/src/panelhost.ts). Saved proofs restrict opening to their proven root. Otherwise [`RepositoryCommits.navigable`](../extension/src/gitcommits.ts) uses the recorded directory or its nearest existing ancestor, within 64 levels. A removed directory requires exactly one matching commit object in that ancestor's repository. The card retains its recorded directory.
+
+`git.viewCommit` can select another open repository when its target is unregistered and consumes the lookup error. `git.openRepository` completion does not prove registration. The host must confirm the exact root through `vscode.git` before opening. A containing repository does not qualify. `sameRepositoryRoot` resolves symbolic links and junctions, falling back to literal paths when resolution fails. Windows and drive paths compare without case. Other paths retain case on macOS and Linux.
 
 ## Webview rendering constraints
 
@@ -100,10 +96,10 @@ Keep clock fields outside card content fingerprints. The shared clock updates mo
 
 The `activity` message's single-card form updates mounted content. Its list form replaces matching cards and draws the timeline once, retaining focus and selected text. A list draw supersedes held single-card updates. Full timeline draws own structural and layout changes. Repaint deferral must preserve comment editing, comment-list interaction, and active selection through the interaction owner.
 
-Chip popovers mount on `body`. Record popovers accept pointer input before pinning and retain a grace period across the anchor gap. Other popovers accept pointer input after pinning. Tab includes record-row figure stops and disclosures. Arrows visit action controls. Leaving the last stop closes the popover and resumes from its anchor. Closing a focused record returns focus to its figure.
+[`webview/stat-detail.ts`](../extension/src/webview/stat-detail.ts) owns popover pinning, dismissal, and keyboard routes. Popovers mount on `body`, outside the document Tab walk used to leave a record.
 
-The outer and nested record popovers share styling but keep separate anchors. The outer instance treats the nested instance as internal for pointer, press, and focus departure. Closing the outer closes the nested instance. Escape reaches the nested record first. Both remain outside the document Tab walk used to leave a record. Keep the shared body observer and suspend focus-departure handling while replacing popover rows.
+Outer and nested record popovers keep separate anchors. The outer instance treats the nested instance as internal for departure checks. Suspend focus-departure handling while replacing rows, because removing focused rows does not represent reader navigation.
 
-Interpretation-changing lines stay in the visible record footer. Standing explanations stay under About these figures. Hover starts that disclosure closed. Pinning restores its document-wide in-memory state. Notes select the dialog role and a heading or figure name. The figure's description names the breakdown rather than those notes. Redrawing preserves focus on the disclosure summary.
+Interpretation-changing lines stay in the visible footer. Standing explanations stay under About these figures. Notes select the dialog role. The figure's description names the breakdown rather than those notes.
 
 Panel resource addresses belong to their receiving host. Do not reuse another host's addressed card. Parse every host and browser message at the protocol boundary. A new message needs its union variant, parser branch, and handler. Browser code receives narrow ports rather than the object returned by `acquireVsCodeApi`.
