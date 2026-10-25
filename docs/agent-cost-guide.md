@@ -127,7 +127,7 @@ The warning stays absent until the scope is complete and every required cache-wr
 
 ### Respond to a high wait share
 
-`Waiting on subagents took 27% of the main agent's cost` means requests reading `wait_agent` returns cost at least a fifth of its estimated cost. At least five such requests must cost at least $1 in total. Delegated work does not enter the share. The line gives wait cost, main-agent cost, wait count, and timeout count. A turn's line reads `this turn's main agent cost` and applies the same numbers to that turn alone. The turn, session heading, and Session list cost figures carry the warning sign.
+`Waiting on subagents took $0.42, 27% of the main agent's cost` means requests reading wait returns cost at least a fifth of the main agent's estimated cost. A wait return comes from `wait_agent`, `wait`, or `write_stdin`. At least five such requests must cost at least $1 in total. Delegated work does not enter the share. The line gives the wait cost and the share. Hovering the line shows the main-agent cost, the wait count, and the timeout count. The Session list names the share alone. A turn's line reads `this turn's main agent cost` and applies the same numbers to that turn alone. The turn, session heading, and Session list cost figures carry the warning sign.
 
 A timed-out wait is a request that brought back no news. [Lower agent costs](lowering-agent-costs.md#wait-without-repeated-model-requests) explains native wait configuration and its limits. A request after a subagent message or completion also carries the parent's reasoning and reply, so the share overstates pure waiting.
 

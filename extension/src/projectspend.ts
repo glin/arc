@@ -48,11 +48,12 @@ import type {
   TurnUsage,
   UsageInferenceClass,
   UsageOrigin,
+  UsageTools,
   UsageWaits,
 } from './transcript';
 import { normalizeFsPath } from './transcript';
 import { ExportLimitError } from './exportlimits';
-import { addUsage as addPricedUsage, addUsageWaits } from './agentspend';
+import { addUsage as addPricedUsage, addUsageTools, addUsageWaits } from './agentspend';
 
 export interface UsageCounts {
   requests?: number;
@@ -110,8 +111,9 @@ export interface UsageEvent {
   compactionSignal?: CompactionSignal;
   // A Claude advisor consultation. It counts in cost and requests and stays out of cache adjacency.
   usageOrigin?: 'claude-advisor';
-  // Set when this request read a `wait_agent` return. Its usage equals the request's usage.
+  // Set when this request read a `wait_agent`, `wait` or `write_stdin` return. Its usage equals the request's usage.
   waits?: UsageWaits;
+  tools?: UsageTools;
   usage: TurnUsage;
   requestKey: string | null;
   responseId?: string;
@@ -139,8 +141,9 @@ export interface ProjectUsageBucket {
   // These buckets estimate compaction requests without recorded request usage.
   compactionEstimate?: true;
   compactionUsage?: true;
-  // The bucket's requests that read a `wait_agent` return.
+  // The bucket's requests that read a `wait_agent`, `wait` or `write_stdin` return.
   waits?: UsageWaits;
+  tools?: UsageTools;
   usage: TurnUsage;
   requests: number;
 }
@@ -494,7 +497,7 @@ export function projectSpendSaveRetryDelay(retries: number): number | null {
 }
 // Saved source records require a rebuild when their parser generation differs.
 // Increase this when a stored field changes the conclusions consumers draw from it.
-export const PROJECT_SPEND_PARSER_GENERATION = 63;
+export const PROJECT_SPEND_PARSER_GENERATION = 64;
 
 export function projectSpendSourceOfferDue(listingMoved: boolean, now: number, lastOfferAt: number): boolean {
   return listingMoved || now - lastOfferAt >= PROJECT_SPEND_INTEGRITY_MILLISECONDS;
@@ -882,7 +885,8 @@ export function projectSpendWindows(
 function usageBandEvents(event: UsageEvent): UsageEvent[] {
   const bands = event.usage.byContextBand;
   if (!bands || event.reportedCost !== null) return [event];
-  // Wait requests stay on the first band's slice, so a split event counts them once.
+  // Wait requests stay on the first band's slice, so a split event counts them once. Every slice
+  // keeps its tool results, and only the slice holding the request's count counts the request.
   return (['short', 'long'] as const)
     .flatMap((contextBand) => {
       const usage = bands[contextBand];
@@ -961,6 +965,7 @@ export function aggregateUsageEvents(
       delete bucket.unclassifiedCacheWrite;
     }
     addUsageWaits(bucket, event.waits);
+    addUsageTools(bucket, event);
     bucket.requests += event.usage.requests ?? 1;
     if (event.reportedCost !== null) {
       bucket.reportedCost = (bucket.reportedCost ?? 0) + event.reportedCost;
@@ -1808,6 +1813,7 @@ function readIncremental(
         delete bucket.unclassifiedCacheWrite;
       }
       addUsageWaits(bucket, event.waits);
+      addUsageTools(bucket, event);
       bucket.requests += event.usage.requests ?? 1;
       if (event.reportedCost !== null) {
         bucket.reportedCost = (bucket.reportedCost ?? 0) + event.reportedCost;
@@ -2723,6 +2729,15 @@ export interface SessionSpendPart {
   bucket: ProjectUsageBucket;
   role: 'main' | 'delegated';
   scopeId?: string;
+  // A delegated Codex child's agent path without its `/root/` prefix.
+  agentName?: string;
+}
+
+// The agent path a Codex child's opening record names, from its saved reader state.
+function spendAgentName(record: SpendFileIndex | undefined): string | null {
+  const state = record?.parserKind === 'codex' ? record.parserState : null;
+  const path = state && typeof state === 'object' ? (state as { agentPath?: unknown }).agentPath : null;
+  return typeof path === 'string' && path ? path.replace(/^\/root\//, '') || null : null;
 }
 
 export interface SessionSpendCoverage {
@@ -3401,9 +3416,11 @@ function spendPartsOf(found: readonly GroupedSpendFile[]): SessionSpendPart[] {
   return found.flatMap(({ record, primary }) =>
     (record?.lifetimeBuckets ?? []).map((bucket) => {
       const role = primary && !bucket.linkedSessionId && !bucket.linkedInvocationId ? 'main' : 'delegated';
+      const agentName = role === 'delegated' && !primary ? spendAgentName(record) : null;
       return {
         bucket,
         role,
+        ...(agentName ? { agentName } : {}),
         ...(role === 'delegated'
           ? {
               scopeId: bucket.linkedInvocationId

@@ -56,8 +56,8 @@
   },
   "extension/src/codex.test.ts": {
     "reason": "Real Git worktree ownership and descendant source resolution must agree with recorded Codex session relationships.",
-    "cases": 481,
-    "matricesSha256": "38af7847386f6ae41ae79981fabaa1c162b02fa6c80e665c9d46ad4cb87b7e33"
+    "cases": 482,
+    "matricesSha256": "66c572bbd032ae597ba5d20aebf85ec80f6fb1754259785a12dfcc38629a0a91"
   },
   "extension/src/derivedcache.test.ts": {
     "reason": "Independent writers and host death must preserve shared cache rows and release stale filesystem locks.",
@@ -126,8 +126,8 @@
   },
   "extension/src/panel.webview.test.ts": {
     "reason": "Real progressive workers must deliver bounded recovery and metadata through the production panel host. Start metadata must survive storage delays, hidden panels, preference resets, and reloads. File presses must preserve recorded changes after their worktree disappears. Commit presses must never open an unrelated repository after their worktree disappears. Reader sends must release held compaction after drops without overtaking surviving input. Each Prompt box must retain its supplying child definition across sibling catalogs, idle updates, and child replacement. The Remote Control item must follow connection results and never reach saved drafts. Row posts and watcher decisions must reach the performance counters with their causes through the production host methods. A catalog refresh must name why it could not reuse the held catalog.",
-    "cases": 645,
-    "matricesSha256": "2e552b2693631589f9dc18de5625c225b3d71bac2c259f2197672c4f07aeb6b0"
+    "cases": 646,
+    "matricesSha256": "4027ce5f5ccda7cb56bb6d145091c2ffa124068cb95dc0666829e0563e3d76fb"
   },
   "extension/src/panelbundle.test.ts": {
     "reason": "The panel bundle and fixture must contain the production entry, source identity, and substituted text.",
@@ -206,8 +206,8 @@
   },
   "extension/src/timeline-renderer.browser.test.ts": {
     "reason": "Production timeline rendering must preserve native disclosure, selection, navigation, and accessible interaction.",
-    "cases": 71,
-    "matricesSha256": "b1d7e7cb807a1996eccc824efb2ba21f33361d468ce71399d3f133247f9c2fd7"
+    "cases": 72,
+    "matricesSha256": "3a43ae2a4f454fc3bbd63c8d1e247569b143d7095fecdac5c8ed6adaccc14680"
   },
   "extension/src/timelinecheck.test.ts": {
     "reason": "Npm and extension-directory invocations must inspect the caller project through the real command environment.",

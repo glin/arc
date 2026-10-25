@@ -108,6 +108,7 @@ import type {
   SessionStatChip,
   StatDetailLine,
   StatDetailList,
+  WaitShareWarning,
   TurnCard,
 } from './turncard.ts';
 import type { TurnStep } from './transcript.ts';
@@ -972,6 +973,71 @@ test('a Codex turn whose main agent spent a fifth of its cost on waits warns in 
   assert.deepEqual(
     both.warnings?.map((warning) => warning.scope),
     ['cache-expiry', 'wait'],
+  );
+});
+
+// The Tools tab and the wait warning read one wait definition, so the Waits row names the
+// warning's request count. The tab merges the CLI's kinds into the board's five rows.
+test('the cost popovers lead with the wait warning, and their Waits rows count the warning requests', () => {
+  const payload = waitWarningPayload() as {
+    cards: TurnCard[];
+    stats: Record<string, SessionStatChip[]>;
+  };
+  const session = payload.stats.s1.find((chip) => chip.metric === 'cost')!;
+  const turn = payload.cards[0].chips.find((chip) => chip.metric === 'cost')!;
+  for (const [figure, tabs, of] of [
+    [session, ['Usage', 'Tools', 'Subagents'], "the main agent's cost"],
+    [turn, ['Usage', 'Tools'], 'this turn'],
+  ] as const) {
+    const warning = figure.warnings?.find((held) => held.scope === 'wait') as WaitShareWarning;
+    const cost = figure.detailList!.cost!;
+    assert.match(cost.warnings[0].text, /^Waiting on subagents took \$1\.51, 21% of /);
+    assert.equal(
+      cost.warnings[0].title,
+      `$1.51 of $7.20 went to ${warning.requests} waits, ${warning.timedOut} of them timed out`,
+    );
+    assert.deepEqual(
+      cost.tabs.map((tab) => tab.name),
+      tabs,
+    );
+    const tools = cost.tabs[1];
+    assert.match(tools.base, /^Main agent cost by the tool result each request read\. Shares of /);
+    assert.deepEqual(
+      tools.rows.map((row) => [row.label, row.percent]),
+      [
+        ['No tool result', '32%'],
+        ['Waits', '21%'],
+        ['Other tool results', '18%'],
+        ['File read', '17%'],
+        ['Test or build', '13%'],
+      ],
+    );
+    const waits = tools.rows.find((row) => row.label === 'Waits')!;
+    assert.equal(waits.title, `$1.51, ${warning.requests} requests, 21% of ${of} (wait_agent 36, write_stdin 6)`);
+    assert.equal(waits.percent, `${Math.round(warning.share * 100)}%`);
+    assert.match(tools.rows[2].title, /, 28 requests, 18% of .* \(other 12, git 10, search 6\)$/);
+  }
+  // The session hero sets the main agent against delegated work. The turn delegated nothing.
+  const hero = session.detailList!.cost!;
+  assert.deepEqual(
+    [hero.main.label, hero.delegated?.label, hero.delegated?.model],
+    ['Main agent', 'Delegated', '2 × sol, 1 × astra'],
+  );
+  assert.equal(turn.detailList!.cost!.delegated, undefined);
+  assert.equal(turn.detailList!.cost!.main.value, undefined);
+  // Each child reads as its agent path, breaking only after an underscore, with its model under it.
+  const children = hero.tabs[2].rows;
+  assert.deepEqual(
+    children.map((row) => [row.label.replaceAll('\u200b', '|'), row.detail]),
+    [
+      ['code_|implement_|1_|npm_|tests_|sol', 'gpt-6.1-sol'],
+      ['code_|fix_|1_|npm_|tests_|sol_|deadlines', 'gpt-6.1-sol'],
+      ['code_|review_|1_|npm_|tests_|astra', 'gpt-6-astra'],
+    ],
+  );
+  assert.match(
+    children[2].title,
+    /^code_review_1_npm_tests_astra, gpt-6-astra, session 01a1535a-e7c6-7cc3-a9aa-9552803efb51\. \$[0-9.]+, \d+% of delegated work\.$/,
   );
 });
 
@@ -5590,6 +5656,13 @@ test('what a subagent spent is reported beside the cost, never inside it', () =>
   assert.equal(costChip(card), '$0.17+', 'a partial dollar figure claims to cover the whole turn');
 });
 
+// A cost popover's flat entries, without the tabbed form the popover draws from them.
+const flatForm = (list: StatDetailList | undefined): Omit<StatDetailList, 'cost'> | undefined => {
+  if (!list) return list;
+  const { cost: _cost, ...flat } = list;
+  return flat;
+};
+
 test('the cost chip includes child transcripts and its hover breaks the total down by agent', () => {
   const t = turn({
     usage: { input: 1_000_000, cacheWrite1h: 0, cacheWrite5m: 0, cacheRead: 0, output: 0, thinking: 0 },
@@ -5621,7 +5694,7 @@ test('the cost chip includes child transcripts and its hover breaks the total do
   ];
   assert.deepEqual(costDetail(t), expectedDetail);
   const cost = card.chips.find((chip) => chip.label.startsWith('$'));
-  assert.deepEqual(cost?.detailList, {
+  assert.deepEqual(flatForm(cost?.detailList), {
     heading: { label: 'Estimated total', value: '$6.00' },
     entries: [
       {
@@ -5653,7 +5726,7 @@ test('the cost chip includes child transcripts and its hover breaks the total do
     '  Uncached input: 1M tokens',
   ]);
   const agents = card.chips.find((chip) => chip.label === '1 subagent');
-  assert.deepEqual(agents?.detailList, {
+  assert.deepEqual(flatForm(agents?.detailList), {
     layout: 'agents',
     actions: true,
     heading: { label: '1 subagent in this turn' },
@@ -8509,7 +8582,7 @@ test('indexed lifetime cost rolls every priced bucket into one ordered usage bre
     '30-minute cache writes: $0.50',
   ];
   assert.equal(chip.compactLabel, '$6.13');
-  assert.deepEqual(chip.detailList, {
+  assert.deepEqual(flatForm(chip.detailList), {
     heading: { label: 'Estimated total', value: '$6.13' },
     entries: [{ label: 'Cost by usage · gpt-5.5, opus-5, gpt-5.6', lines: costLines(...lineTexts) }],
     footer: [],
@@ -8585,7 +8658,7 @@ test('indexed lifetime cost separates the main agent from rolled-up delegated wo
   ])[0];
 
   assert.equal(chip.compactLabel, '$3.50+');
-  assert.deepEqual(chip.detailList, {
+  assert.deepEqual(flatForm(chip.detailList), {
     heading: { label: 'Estimated total', value: '$3.50+' },
     entries: [
       {
@@ -9334,7 +9407,7 @@ test('the turn figure lists its counts as label and value rows and folds its not
   const first = Date.UTC(2026, 0, 1, 9, 0, 0);
   const last = first + (9 * 24 + 3) * 60 * 60_000; // 9d 3h later
   const [chip] = sessionTurnStats(turnStats(22, { compactionCount: 3, firstTurnAt: first, lastTurnAt: last }));
-  assert.deepEqual(chip.detailList, {
+  assert.deepEqual(flatForm(chip.detailList), {
     layout: 'economics',
     entries: [
       { label: 'Turns in the main session', value: '22' },

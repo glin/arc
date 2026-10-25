@@ -18,6 +18,8 @@ import path from 'node:path';
 import { createRequire, syncBuiltinESMExports } from 'node:module';
 import { afterEach, beforeEach, test, vi } from 'vitest';
 import { tempDir } from './temproot';
+import { createClaudeUsageLineReducer } from './transcript';
+import { sessionCostProjection, sessionCostUsageOf } from './turncard';
 import { quoteUsage } from './pricing';
 import * as pricing from './pricing';
 import * as projectSpend from './projectspend';
@@ -6019,4 +6021,154 @@ test('an unknown Claude usage iteration leaves the session cost partial', () => 
   assert.equal(summary.requests, 2);
   assert.equal(summary.unpricedRequests, 1);
   assert.equal(summary.costUsd, null);
+});
+
+// The panel reads tool results through its own transcript readers, the spend ledger and the
+// session cost popover. Each Tools row must give the share and request count that the matching
+// `arc cost --by-tool` kinds give.
+function panelToolRows(file: string, reducer: Parameters<typeof projectSpend.indexSpendFile>[3]) {
+  const { record } = projectSpend.indexSpendFile(
+    undefined,
+    file,
+    'workspace',
+    reducer,
+    Date.parse('2026-09-27T00:00:00Z'),
+  );
+  const parts = (record.lifetimeBuckets ?? []).map((bucket) => sessionCostUsageOf({ bucket, role: 'main' }));
+  const chip = sessionCostProjection(parts).stats.find((stat) => stat.metric === 'cost')!;
+  return chip
+    .detailList!.cost!.tabs.find((tab) => tab.name === 'Tools')!
+    .rows.map((row) => [
+      row.label,
+      row.percent,
+      Number(/, ([0-9,]+) requests?, /.exec(row.title)![1].replace(/,/g, '')),
+    ]);
+}
+
+// Rows by share, then by label, so two rows with one share compare in one order.
+const byShare = (rows: (string | number)[][]) =>
+  [...rows].sort(
+    (left, right) =>
+      parseInt(String(right[1])) - parseInt(String(left[1])) || String(left[0]).localeCompare(String(right[0])),
+  );
+
+function cliToolRows(file: string, merged: readonly string[]) {
+  const rows = sessionCostReport(file, { byTool: true, sourceOnly: true }).byTool!.rows;
+  const label: Record<string, string> = { wait: 'Waits', 'file read': 'File read', search: 'Search', git: 'Git' };
+  const shown = rows.filter((row) => !merged.includes(row.kind));
+  const rest = rows.filter((row) => merged.includes(row.kind));
+  return [
+    ...shown.map((row) => ({
+      label: row.kind === 'no tool result' ? 'No tool result' : label[row.kind],
+      share: row.shareOfCost!,
+      requests: row.requests,
+    })),
+    {
+      label: 'Other tool results',
+      share: rest.reduce((sum, row) => sum + row.shareOfCost!, 0),
+      requests: rest.reduce((sum, row) => sum + row.requests, 0),
+    },
+  ]
+    .sort((left, right) => right.share - left.share)
+    .map((row) => [row.label, `${Math.round(row.share * 100)}%`, row.requests]);
+}
+
+test('the panel Tools rows agree with arc cost --by-tool on a Codex and a Claude transcript', () => {
+  const f = cumulativeCostFixture();
+  const { call, output } = codexToolRecords(f);
+  const codex = f.save([
+    ...f.start,
+    f.bill('r1', 3, 1),
+    call(4, 'w', 'wait_agent', { timeout_ms: 1000 }),
+    output(5, 'w', JSON.stringify({ timed_out: true })),
+    f.snapshot(6, 1),
+    f.bill('r2', 7, 2),
+    call(8, 'a', 'exec_command', { cmd: 'cat a.ts' }),
+    call(9, 'b', 'exec_command', { cmd: 'cat b.ts' }),
+    call(10, 'g', 'exec_command', { cmd: 'git status' }),
+    output(11, 'a', 'a'),
+    output(12, 'b', 'b'),
+    output(13, 'g', 'clean'),
+    f.snapshot(14, 2),
+    f.bill('r3', 15, 3),
+    call(16, 's', 'exec_command', { cmd: 'rg -n foo src' }),
+    output(17, 's', 'src/a.ts:1:foo'),
+    f.snapshot(18, 3),
+    f.bill('r4', 19, 4),
+    f.snapshot(20, 4),
+    f.bill('r5', 21, 5),
+    f.snapshot(22, 5),
+  ]);
+  const codexRows = panelToolRows(codex, codexReader.createCodexUsageLineReducer as never);
+  assert.deepEqual(byShare(codexRows), byShare(cliToolRows(codex, ['git'])));
+  assert.deepEqual(byShare(codexRows), [
+    ['No tool result', '40%', 2],
+    ['Search', '20%', 1],
+    ['Waits', '20%', 1],
+    ['File read', '13%', 1],
+    ['Other tool results', '7%', 1],
+  ]);
+  // A repeated billing record for a response adds the results read after its first record.
+  const r = cumulativeCostFixture();
+  const repeated = r.save([
+    ...r.start,
+    r.bill('r1', 3, 1),
+    call(4, 'w', 'wait_agent', { timeout_ms: 1000 }),
+    output(5, 'w', JSON.stringify({ timed_out: false })),
+    r.snapshot(6, 1),
+    r.bill('r2', 7, 2),
+    r.snapshot(8, 2),
+    call(9, 'p', 'apply_patch', { input: '*** Begin Patch' }),
+    output(10, 'p', 'Done'),
+    r.bill('r2', 11, 2),
+    call(12, 'g', 'exec_command', { cmd: 'git status' }),
+    output(13, 'g', 'clean'),
+    r.bill('r3', 14, 3),
+    r.snapshot(15, 3),
+    call(16, 's', 'exec_command', { cmd: 'rg -n foo src' }),
+    output(17, 's', 'src/a.ts:1:foo'),
+    r.bill('r4', 18, 4),
+    r.snapshot(19, 4),
+  ]);
+  const repeatedRows = panelToolRows(repeated, codexReader.createCodexUsageLineReducer as never);
+  assert.deepEqual(byShare(repeatedRows), byShare(cliToolRows(repeated, ['file edit'])));
+  assert.deepEqual(byShare(repeatedRows), [
+    ['Git', '25%', 1],
+    ['No tool result', '25%', 1],
+    ['Search', '25%', 1],
+    ['Other tool results', '13%', 1],
+    ['Waits', '13%', 1],
+  ]);
+  const usage = { input_tokens: 1000, output_tokens: 100, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 };
+  const response = (id: string, second: number, content: object[] = []) => ({
+    type: 'assistant',
+    timestamp: `2026-09-26T00:00:0${second}Z`,
+    message: { id, role: 'assistant', model: 'claude-opus-5', usage, content },
+  });
+  const results = (ids: string[]) => ({
+    type: 'user',
+    message: { role: 'user', content: ids.map((id) => ({ type: 'tool_result', tool_use_id: id, content: 'ok' })) },
+  });
+  const claude = write(path.join(directory(), 'tools.jsonl'), [
+    response('m1', 1, [
+      { type: 'tool_use', id: 'r1', name: 'Read', input: { file_path: 'a.ts' } },
+      { type: 'tool_use', id: 'r2', name: 'Read', input: { file_path: 'b.ts' } },
+      { type: 'tool_use', id: 'g1', name: 'Bash', input: { command: 'git log -1' } },
+    ]),
+    results(['r1', 'r2', 'g1']),
+    response('m2', 2, [{ type: 'tool_use', id: 's1', name: 'Grep', input: { pattern: 'foo' } }]),
+    results(['s1']),
+    // A repeated result line adds no result, as the CLI counts each result once.
+    results(['s1']),
+    response('m3', 3),
+    response('m4', 4),
+  ]);
+  const claudeRows = panelToolRows(claude, (state) => createClaudeUsageLineReducer(state as never));
+  assert.deepEqual(claudeRows, cliToolRows(claude, ['git']));
+  assert.deepEqual(claudeRows, [
+    ['No tool result', '50%', 2],
+    ['Search', '25%', 1],
+    ['File read', '17%', 1],
+    ['Other tool results', '8%', 1],
+  ]);
 });

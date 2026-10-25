@@ -6405,6 +6405,167 @@ button.railfilterlabel:focus-visible {
   text-align: right;
   white-space: nowrap;
 }
+/* The cost popover's tabbed form. The warning lines lead under the head. The hero sets the main
+   agent against delegated work: each side is a line of role and dollars over its models, with
+   the split bar between them. The delegated dollars end on the head's dollar edge. */
+.chippop .line {
+  margin: 0.7em 0 0;
+}
+.chippop .split {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.9em;
+  margin-top: 1em;
+}
+.chippop .splitside {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  white-space: nowrap;
+}
+.chippop .splitside.right {
+  align-items: flex-end;
+  text-align: right;
+}
+.chippop .splitlabel .chippopvalue {
+  font-weight: 600;
+}
+.chippop .splitmodel {
+  color: var(--idle);
+  line-height: 1.3;
+}
+/* Two fills on a clear track, parted by a 2px gap: the meter tone for the main agent and the
+   same tone at 65 percent for delegated work. */
+.chippop .sbbar.splitbar {
+  flex: 1 1 auto;
+  display: flex;
+  gap: 2px;
+  width: auto;
+  height: 6px;
+  margin-top: calc(0.725em - 3px);
+  background: transparent;
+}
+.chippop .splitbar i {
+  flex: none;
+}
+.chippop .splitbar .delegated {
+  background: color-mix(in srgb, var(--idle) 65%, transparent);
+}
+.chippop .caption {
+  margin: 0.5em 0 0;
+}
+/* Every figure that qualifies another reads one step smaller: the hero models, the caption,
+   the row details and percents, and the footnote. */
+.chippop :is(.splitmodel, .caption, .costrow .detail, .costrow .pct, .included) {
+  font-size: var(--t-small);
+}
+/* The tab strip shows only in a pinned popover. A hover draws the first tab alone. */
+.chippop .casktabs.poptabs {
+  margin-top: 1.1em;
+}
+.chippop:not(.pinned) .poptabs {
+  display: none;
+}
+.chippop .split ~ div:not(.included) > .context-included {
+  margin-top: 0.9em;
+}
+/* Each row is label, percent, bar and dollars. The list owns the columns and each row is a
+   subgrid, so the percents, bars and dollars line up down the list. */
+.chippop .context-categories.costrows {
+  grid-template-columns: minmax(0, 1.3fr) auto minmax(5em, 1fr) auto;
+  column-gap: 1em;
+  row-gap: 0.85em;
+  margin-top: 0.6em;
+}
+.chippop .context-categories.costrows.subagentrows {
+  grid-template-columns: minmax(0, 2fr) auto minmax(5em, 1fr) auto;
+}
+.chippop .costrows > .costrow {
+  display: grid;
+  grid-column: 1 / -1;
+  grid-template-columns: subgrid;
+  align-items: center;
+}
+.chippop .costrow .sbbar {
+  grid-column: auto;
+}
+.chippop .costrow .label {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.chippop .costrow .detail {
+  line-height: 1.3;
+}
+.chippop .costrow .pct {
+  min-width: 3ch;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+/* The dollars close every row and every footnote line on the head's right edge. */
+.chippop .dollars {
+  min-width: 4.5ch;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+/* The "Included above" footnote: a muted heading, then one line per overhead. */
+.chippop .included {
+  margin-top: 1.1em;
+  padding-top: 0.9em;
+  border-top: 1px solid var(--edge);
+  color: var(--idle);
+}
+.chippop .includedhead {
+  margin: 0;
+}
+.chippop .includedrows {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5em;
+  margin: 0.5em 0 0;
+  padding: 0;
+  list-style: none;
+}
+.chippop .includedrows li {
+  display: flex;
+  justify-content: space-between;
+  gap: 1em;
+}
+.chippop .included ~ .chippopnotes {
+  margin-top: 0.8em;
+}
+/* A narrow popover keeps the hero labels on one line and drops the bar under them. Each row
+   keeps label, percent and dollars on one line and drops its bar under them. The popover is
+   min(520px, 100vw - 12px) wide, so the viewport width selects this layout. */
+@media (max-width: 420px) {
+  .chippop .split {
+    flex-wrap: wrap;
+    row-gap: 0.45em;
+  }
+  .chippop .splitside.right {
+    margin-left: auto;
+  }
+  .chippop .sbbar.splitbar {
+    order: 3;
+    flex-basis: 100%;
+    margin-top: 0;
+  }
+  .chippop .context-categories.costrows,
+  .chippop .context-categories.costrows.subagentrows {
+    grid-template-columns: minmax(0, 1fr) auto auto;
+    row-gap: 0.9em;
+  }
+  .chippop .costrows > .costrow {
+    align-items: baseline;
+    row-gap: 0.2em;
+  }
+  .chippop .costrow .sbbar {
+    grid-column: 1 / -1;
+    order: 1;
+  }
+}
 .context-table {
   width: 100%;
   border-collapse: collapse;

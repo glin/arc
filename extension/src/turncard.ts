@@ -76,6 +76,7 @@ import {
   sameCommitSha,
   shortenTo,
   type UsageOrigin,
+  type UsageTools,
   type UsageWaits,
 } from './transcript';
 import { formatClock, formatDuration, formatRelative, formatTokens, formatWhen, shortModel } from './turnformat';
@@ -143,6 +144,50 @@ export interface StatDetailList {
   footer?: string[];
   // Standing explanations, drawn under a closed "About these figures" disclosure.
   notes?: string[];
+  // The tabbed form the two cost popovers draw in place of the entries. The entries still
+  // supply the plain-text detail.
+  cost?: CostDetailView;
+}
+
+// A row of a cost tab: label, whole percent, bar and dollars. The title carries the token,
+// request or session figures the row does not print.
+export interface CostDetailRow {
+  label: string;
+  // A second line under the label, such as a child session's model.
+  detail?: string;
+  percent: string;
+  // The bar's fill, from 0 to 1.
+  share: number;
+  value: string;
+  title: string;
+}
+
+export interface CostDetailTab {
+  name: 'Usage' | 'Tools' | 'Subagents';
+  // The line under the tab strip that names what the shares divide.
+  base: string;
+  rows: CostDetailRow[];
+}
+
+export interface CostDetailSide {
+  label: string;
+  value?: string;
+  model: string;
+  title: string;
+}
+
+// Warning lines first, then the hero: the main agent against delegated work on a split bar,
+// with each side's models under its dollars. The caption names the main agent's requests.
+// The pinned popover switches between the tabs. A hover draws the first tab.
+export interface CostDetailView {
+  warnings: { text: string; title?: string }[];
+  main: CostDetailSide;
+  // Absent when nothing was delegated. `mainShare` is the main agent's part of the bar.
+  delegated?: CostDetailSide & { mainShare: number };
+  caption?: { text: string; title: string };
+  tabs: CostDetailTab[];
+  // The "Included above" footnote, one line per overhead the total already counts.
+  included: { label: string; value: string; title?: string }[];
 }
 
 export interface StatChip {
@@ -2056,7 +2101,7 @@ function cardCostOf(turn: Turn, shares: readonly DispatchedShare[]): SessionCost
 }
 
 // A ledger part in the form the cost projections price.
-export function sessionCostUsageOf({ bucket, role, scopeId }: SessionSpendPart): SessionCostUsage {
+export function sessionCostUsageOf({ bucket, role, scopeId, agentName }: SessionSpendPart): SessionCostUsage {
   return {
     ...(bucket.usageOrigin ? { usageOrigin: bucket.usageOrigin } : {}),
     agent: bucket.agent,
@@ -2078,6 +2123,8 @@ export function sessionCostUsageOf({ bucket, role, scopeId }: SessionSpendPart):
     ...(bucket.compactionEstimate ? { compactionEstimate: true as const } : {}),
     ...(bucket.compactionUsage ? { compactionUsage: true as const } : {}),
     ...(bucket.waits ? { waits: bucket.waits } : {}),
+    ...(bucket.tools ? { tools: bucket.tools } : {}),
+    ...(agentName ? { agentName } : {}),
     usage: bucket.usage,
   };
 }
@@ -2773,10 +2820,95 @@ function costDetailList(
     ...(expiryText ? [{ label: expiryText, warning: true }] : []),
     ...waitWarnings.map((warning) => ({ label: waitShareText(warning, 'turn'), warning: true })),
   ];
+  const totalValue = totalLabel ? `${totalLabel}${total.partial ? '+' : ''}` : 'cost unavailable';
+  // A turn without usage parts prices its categories once here. The flat entries already
+  // priced its total, and the categories sum to it.
+  const turnCategories = mainParts.length
+    ? []
+    : pricedUsageCategories(turn.usage, turn.model, turn.provider ?? null, turn.contextWindow);
+  const mainPriced: PricedSessionCost[] = mainParts.length
+    ? mainCosts
+    : [
+        {
+          part: {
+            agent: turn.agent,
+            role: 'main',
+            model: turn.model,
+            provider: turn.provider ?? null,
+            contextWindow: turn.contextWindow,
+            usage: turn.usage,
+          },
+          dollars: turnCategories.length ? turnCategories.reduce((sum, category) => sum + category.dollars, 0) : null,
+          partial: false,
+          categories: turnCategories,
+          unallocatedRecordedCost: false,
+          publiclyPriced: true,
+        },
+      ];
+  const delegates = turn.agents.length > 0 || shares.length > 0;
+  const mainDollars = dollarsOf(mainPriced);
+  const mainValue = formatCost(mainDollars) ?? '$0';
+  const usageRows = costUsageRows(mainPriced, mainDollars, delegates ? "the main agent's cost" : 'this turn');
+  const toolRows = costToolRows(mainPriced, delegates ? "the main agent's cost" : 'this turn');
+  const delegatedDollars = Math.max(0, (total.dollars ?? 0) - mainDollars);
+  const children: (string | null)[][] = [
+    ...turn.agents.map((agent) => agent.spend.map((part) => part.model)),
+    ...shares.map((share) => share.costs.map((cost) => cost.part.model)),
+  ];
+  const cost: CostDetailView | undefined = usageRows.length
+    ? {
+        warnings: [
+          ...(expiryText ? [{ text: expiryText, title: CACHE_EXPIRY_COST_ADDED_HINT }] : []),
+          ...waitWarnings.map((warning) => waitShareLead(warning, 'turn')),
+          ...warnings.map((warning) => ({ text: cacheWriteWarningText(warning) })),
+        ],
+        main: {
+          label: 'Main agent',
+          ...(delegates ? { value: mainValue } : {}),
+          model: modelNames(mainPriced.map((held) => held.part.model)),
+          title: `${[
+            centsCost(mainDollars),
+            ...(turn.usage.requests !== undefined
+              ? [`${turn.usage.requests} request${turn.usage.requests === 1 ? '' : 's'}`]
+              : []),
+          ].join(', ')}.${delegates ? '' : ' This turn delegated nothing.'}`,
+        },
+        ...(delegates
+          ? {
+              delegated: {
+                label: 'Delegated',
+                value: formatCost(delegatedDollars) ?? '$0',
+                model: childModelCounts(children),
+                title: `${centsCost(delegatedDollars)}, ${children.length} child session${children.length === 1 ? '' : 's'}`,
+                mainShare: costShare(mainDollars, mainDollars + delegatedDollars),
+              },
+            }
+          : {}),
+        caption: costCaption(mainPriced),
+        tabs: [
+          {
+            name: 'Usage',
+            base: delegates ? `Shares of the main agent's ${mainValue}.` : `Shares of this turn's ${totalValue}.`,
+            rows: usageRows,
+          },
+          ...(toolRows.length
+            ? [
+                {
+                  name: 'Tools' as const,
+                  base: `Main agent cost by the tool result each request read. Shares of ${delegates ? "the main agent's" : "this turn's"} ${mainValue}.`,
+                  rows: toolRows,
+                },
+              ]
+            : []),
+        ],
+        included: costIncluded(included),
+      }
+    : undefined;
   return {
+    ...(cost ? { cost } : {}),
     heading: {
       label: 'Estimated total',
-      value: totalLabel ? `${totalLabel}${total.partial ? '+' : ''}` : 'cost unavailable',
+      value: totalValue,
     },
     entries: [...leading, ...entries, ...included],
     // The compaction notes say part of the cost is a modelled estimate, so they stay visible.
@@ -2790,6 +2922,7 @@ function costDetailList(
         }
       : {}),
     notes: [
+      ...(toolRows.length ? [TOOL_RESULT_NOTE] : []),
       ...(hasCacheRead ? [CACHED_INPUT_READ_EXPLANATION] : []),
       ...(hasPublicAutoReview ? [AUTO_REVIEW_RATE_NOTE] : []),
       COST_ESTIMATE_NOTE,
@@ -2799,11 +2932,12 @@ function costDetailList(
 
 export { cacheWriteWarningCondition };
 
+function cacheWriteWarningText(warning: CacheWriteWarning): string {
+  return `${cacheWriteWarningCondition(warning)}: ${formatCost(warning.cacheWriteCost)} of ${formatCost(warning.scopeCost)} went to cache writes`;
+}
+
 function warningLine(warning: CacheWriteWarning): StatDetailLine {
-  return {
-    text: `${cacheWriteWarningCondition(warning)}: ${formatCost(warning.cacheWriteCost)} of ${formatCost(warning.scopeCost)} went to cache writes`,
-    warning: true,
-  };
+  return { text: cacheWriteWarningText(warning), warning: true };
 }
 
 // "Waiting on subagents took 27% of the main agent's cost", which the session list also reads.
@@ -4918,6 +5052,9 @@ export interface SessionCostUsage {
   compactionEstimate?: true;
   compactionUsage?: true;
   waits?: UsageWaits;
+  tools?: UsageTools;
+  // A delegated child's agent name, which names its Subagents row.
+  agentName?: string;
   usage: Turn['usage'];
 }
 
@@ -5018,34 +5155,11 @@ export const WAIT_WARNING_MIN_SHARE = 0.2;
 // The main agent's requests that read a subagent wait return, against the main agent's own cost.
 // Only Codex wait returns record waits. The main scope must be complete and priced.
 export function waitShareWarnings(main: CacheWriteScope): WaitShareWarning[] {
-  if (main.incomplete) {
+  const figures = main.incomplete ? null : mainWaitFigures(main.parts.map(priceSessionCost));
+  if (!figures || !(figures.mainCost > 0)) {
     return [];
   }
-  let requests = 0;
-  let timedOut = 0;
-  let waitCost = 0;
-  let mainCost = 0;
-  for (const part of main.parts) {
-    const priced = priceSessionCost(part);
-    if (priced.partial || priced.dollars === null) {
-      return [];
-    }
-    mainCost += priced.dollars;
-    if (!part.waits) {
-      continue;
-    }
-    const { recordedCost: _recordedCost, costBasis: _costBasis, ...unrecorded } = part;
-    const wait = priceSessionCost({ ...unrecorded, usage: part.waits.usage });
-    if (wait.partial || wait.dollars === null) {
-      return [];
-    }
-    requests += part.waits.requests;
-    timedOut += part.waits.timedOut;
-    waitCost += wait.dollars;
-  }
-  if (!(mainCost > 0)) {
-    return [];
-  }
+  const { requests, timedOut, waitCost, mainCost } = figures;
   const share = waitCost / mainCost;
   if (requests < WAIT_WARNING_MIN_REQUESTS || waitCost < WAIT_WARNING_MIN_DOLLARS || share < WAIT_WARNING_MIN_SHARE) {
     return [];
@@ -5616,6 +5730,359 @@ function includedAboveEntries(
   return rows.length ? [{ label: 'Included above', group: true, separateBefore: true }, ...rows] : [];
 }
 
+// Figures for the tabbed cost popover.
+
+const costShare = (part: number, whole: number): number => (whole > 0 ? Math.min(1, Math.max(0, part / whole)) : 0);
+// Rows round to the nearest whole percent, so a turn's 96.7%, 2.0% and 1.3% read 97%, 2% and 1%.
+const sharePercent = (share: number): string => `${Math.round(share * 100)}%`;
+const centsCost = (dollars: number): string => `$${dollars.toFixed(2)}`;
+
+// A row whose title leads with the exact dollars and ends with the share of its base.
+function costDetailRow(
+  label: string,
+  dollars: number,
+  whole: number,
+  of: string,
+  facts: string[],
+  detail?: string,
+  after: { facts?: string[]; note?: string } = {},
+): CostDetailRow & { dollars: number } {
+  const share = costShare(dollars, whole);
+  const title = [centsCost(dollars), ...facts, `${sharePercent(share)} of ${of}`, ...(after.facts ?? [])].join(', ');
+  return {
+    label,
+    ...(detail ? { detail } : {}),
+    percent: sharePercent(share),
+    share,
+    value: formatCost(dollars) ?? '$0',
+    title: after.note ? `${title} (${after.note})` : title,
+    dollars,
+  };
+}
+
+const byDollars = (rows: (CostDetailRow & { dollars: number })[]): CostDetailRow[] =>
+  rows.sort((a, b) => b.dollars - a.dollars).map(({ dollars: _dollars, ...row }) => row);
+
+// One row per priced usage category, largest first. Cached input reads stay at $0 when the
+// usage read input, as the flat lines do.
+function costUsageRows(costs: readonly PricedSessionCost[], whole: number, of: string): CostDetailRow[] {
+  const dollars = new Map<PricedUsageKey, number>();
+  const usage = emptyUsage();
+  for (const cost of costs) {
+    for (const category of cost.categories) {
+      dollars.set(category.key, (dollars.get(category.key) ?? 0) + category.dollars);
+    }
+    addUsage(usage, cost.part.usage);
+  }
+  return byDollars(
+    USAGE_COST_CATEGORIES.flatMap(({ key, label }) => {
+      const spent = dollars.get(key) ?? 0;
+      if (!(spent > 0) && !(key === 'cacheRead' && dollars.size && cacheHitPercent(usage) !== null)) {
+        return [];
+      }
+      const tokens = (usage as unknown as Record<string, number | undefined>)[key] ?? 0;
+      const cached = key === 'cacheRead' ? cacheHitPercent(usage) : null;
+      return [
+        costDetailRow(
+          label,
+          spent,
+          whole,
+          of,
+          [`${tokens.toLocaleString('en-US')} tokens${key === 'cacheRead' ? ' at the cache-read rate' : ''}`],
+          undefined,
+          cached === null ? {} : { facts: [`${cached}% of input tokens served from the cache`] },
+        ),
+      ];
+    }),
+  );
+}
+
+// The main agent's requests that read a wait return, and the cost of those requests. The wait
+// warning and the Tools tab both read this, so they name the same requests.
+function mainWaitFigures(
+  costs: readonly PricedSessionCost[],
+): { requests: number; timedOut: number; waitCost: number; mainCost: number } | null {
+  let requests = 0;
+  let timedOut = 0;
+  let waitCost = 0;
+  let mainCost = 0;
+  for (const priced of costs) {
+    const part = priced.part;
+    if (priced.partial || priced.dollars === null) {
+      return null;
+    }
+    mainCost += priced.dollars;
+    if (!part.waits) {
+      continue;
+    }
+    const { recordedCost: _recordedCost, costBasis: _costBasis, ...unrecorded } = part;
+    const wait = priceSessionCost({ ...unrecorded, usage: part.waits.usage });
+    if (wait.partial || wait.dollars === null) {
+      return null;
+    }
+    requests += part.waits.requests;
+    timedOut += part.waits.timedOut;
+    waitCost += wait.dollars;
+  }
+  return { requests, timedOut, waitCost, mainCost };
+}
+
+const TOOL_RESULT_NOTE =
+  "A request's cost goes to the tool results it read, split evenly when it read more than one. This is attribution, not tool run time.";
+
+// The tab names of the kinds `arc cost --by-tool` reports.
+const TOOL_KIND_LABELS: Record<string, string> = {
+  git: 'Git',
+  'file read': 'File read',
+  'file edit': 'File edit',
+  search: 'Search',
+  'test or build': 'Test or build',
+  'subagent launch': 'Subagent launch',
+  wait: 'Waits',
+  other: 'other',
+};
+
+// A tool kind's part of a priced part, band by band, so a fractional part never fails a band total.
+function toolKindDollars(part: SessionCostUsage, usage: Turn['usage']): number {
+  const { recordedCost: _recordedCost, costBasis: _costBasis, ...unrecorded } = part;
+  const bands = usage.byContextBand;
+  if (!bands || part.contextBand) return priceSessionCost({ ...unrecorded, usage }).dollars ?? 0;
+  return (['short', 'long'] as const).reduce(
+    (sum, band) =>
+      sum +
+      (bands[band]
+        ? (priceSessionCost({ ...unrecorded, contextBand: band, usage: { ...bands[band] } }).dollars ?? 0)
+        : 0),
+    0,
+  );
+}
+
+// The Tools tab: the main agent's cost by the tool result each request read, split evenly between
+// the results one request read, as `arc cost --by-tool` splits it. Waits, the two largest other
+// named kinds, Other tool results for the rest, and No tool result. A merged row's title names
+// the kinds it holds, and the Waits row's title names the wait tools.
+function costToolRows(costs: readonly PricedSessionCost[], of: string): CostDetailRow[] {
+  if (!costs.some((cost) => cost.part.tools)) {
+    return [];
+  }
+  const kinds = new Map<string, { dollars: number; requests: number }>();
+  const waitTools = new Map<string, number>();
+  let mainCost = 0;
+  let requests = 0;
+  let toolRequests = 0;
+  for (const priced of costs) {
+    if (priced.dollars === null) {
+      continue;
+    }
+    mainCost += priced.dollars;
+    requests += priced.part.usage.requests ?? 0;
+    toolRequests += priced.part.tools?.requests ?? 0;
+    for (const [kind, held] of Object.entries(priced.part.tools?.kinds ?? {})) {
+      const row = kinds.get(kind) ?? { dollars: 0, requests: 0 };
+      row.dollars += toolKindDollars(priced.part, held.usage);
+      row.requests += held.requests;
+      kinds.set(kind, row);
+    }
+    for (const [tool, count] of Object.entries(priced.part.waits?.tools ?? {})) {
+      waitTools.set(tool, (waitTools.get(tool) ?? 0) + count);
+    }
+  }
+  if (!(mainCost > 0)) {
+    return [];
+  }
+  const requestCount = (count: number) => `${count.toLocaleString('en-US')} request${count === 1 ? '' : 's'}`;
+  const named = [...kinds]
+    .filter(([kind]) => kind !== 'wait' && kind !== 'other')
+    .sort((left, right) => right[1].dollars - left[1].dollars);
+  const other = kinds.get('other');
+  const merged = [...named.slice(2), ...(other ? [['other', other] as const] : [])].sort(
+    (left, right) => right[1].dollars - left[1].dollars,
+  );
+  const spent = [...kinds.values()].reduce((sum, row) => sum + row.dollars, 0);
+  const wait = kinds.get('wait');
+  const rows = [
+    ...(wait
+      ? [
+          costDetailRow('Waits', wait.dollars, mainCost, of, [requestCount(wait.requests)], undefined, {
+            note: [...waitTools]
+              .sort((left, right) => right[1] - left[1])
+              .map(([tool, count]) => `${tool} ${count}`)
+              .join(', '),
+          }),
+        ]
+      : []),
+    ...named
+      .slice(0, 2)
+      .map(([kind, row]) =>
+        costDetailRow(TOOL_KIND_LABELS[kind] ?? kind, row.dollars, mainCost, of, [requestCount(row.requests)]),
+      ),
+    ...(merged.length
+      ? [
+          costDetailRow(
+            'Other tool results',
+            merged.reduce((sum, [, row]) => sum + row.dollars, 0),
+            mainCost,
+            of,
+            [requestCount(merged.reduce((sum, [, row]) => sum + row.requests, 0))],
+            undefined,
+            {
+              note: merged
+                .map(([kind, row]) => `${TOOL_KIND_LABELS[kind]?.toLowerCase() ?? kind} ${row.requests}`)
+                .join(', '),
+            },
+          ),
+        ]
+      : []),
+    ...(requests > toolRequests || mainCost - spent >= 0.005
+      ? [
+          costDetailRow('No tool result', Math.max(0, mainCost - spent), mainCost, of, [
+            requestCount(Math.max(0, requests - toolRequests)),
+          ]),
+        ]
+      : []),
+  ];
+  return byDollars(rows);
+}
+
+// Each model's last word, counted once per child: "13 × sol, 1 × astra".
+function childModelCounts(children: readonly (readonly (string | null)[])[]): string {
+  const counts = new Map<string, number>();
+  for (const models of children) {
+    for (const word of new Set(models.map((model) => shortModel(model)?.split('-').at(-1) ?? 'model not recorded'))) {
+      counts.set(word, (counts.get(word) ?? 0) + 1);
+    }
+  }
+  return [...counts]
+    .sort((a, b) => b[1] - a[1])
+    .map(([word, count]) => `${count} × ${word}`)
+    .join(', ');
+}
+
+// "13 gpt-6.1-sol children $19.31, 1 gpt-6-astra child $6.35", after the delegated title's figures.
+function childModelDollars(children: readonly (readonly SessionCostUsage[])[]): string {
+  const byModel = new Map<string, { count: number; dollars: number }>();
+  for (const parts of children) {
+    const model = modelNames(parts.map((part) => part.model));
+    const held = byModel.get(model) ?? { count: 0, dollars: 0 };
+    held.count++;
+    held.dollars += dollarsOf(parts.map(priceSessionCost));
+    byModel.set(model, held);
+  }
+  const text = [...byModel]
+    .sort((left, right) => right[1].dollars - left[1].dollars)
+    .map(
+      ([model, held]) => `${held.count} ${model} ${held.count === 1 ? 'child' : 'children'} ${centsCost(held.dollars)}`,
+    )
+    .join(', ');
+  return text ? `. ${text}` : '';
+}
+
+const modelNames = (models: readonly (string | null)[]): string =>
+  [...new Set(models.map((model) => shortModel(model) ?? 'model not recorded'))].join(', ');
+
+// The caption under the hero: request count, cached share of input, and average input.
+function costCaption(costs: readonly PricedSessionCost[]): CostDetailView['caption'] {
+  const usage = emptyUsage();
+  for (const cost of recordedCosts(costs)) {
+    addUsage(usage, cost.part.usage);
+  }
+  const requests = usage.requests ?? 0;
+  const exact = costs.every((cost) => cost.part.requestCountExact !== false && cost.part.usage.requests !== undefined);
+  const cached = cacheHitPercent(usage);
+  const average = requests > 0 ? averageContextPerRequest(usage) : null;
+  const text = [
+    ...(exact && requests > 0 ? [`${requests.toLocaleString('en-US')} request${requests === 1 ? '' : 's'}`] : []),
+    ...(cached !== null ? [`${cached}% cached input`] : []),
+    ...(average ? [`${formatTokens(Math.round(average))} average input`] : []),
+  ];
+  if (!text.length) {
+    return undefined;
+  }
+  const input =
+    usage.input + usage.cacheRead + (usage.cacheWrite1h ?? 0) + (usage.cacheWrite5m ?? 0) + (usage.cacheWrite30m ?? 0);
+  return {
+    text: text.join(' · '),
+    title: [
+      `${usage.cacheRead.toLocaleString('en-US')} of ${input.toLocaleString('en-US')} input tokens served from the cache.`,
+      ...(average
+        ? [
+            requests === 1
+              ? `${Math.round(average).toLocaleString('en-US')} input tokens in the one request.`
+              : `${Math.round(average).toLocaleString('en-US')} input tokens per request on average.`,
+          ]
+        : []),
+    ].join(' '),
+  };
+}
+
+// The session id inside a child scope, which is a transcript path or an invocation id.
+function scopeSession(id: string): string | null {
+  return /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i.exec(id)?.[0] ?? null;
+}
+
+// A child session's name: its agent path, or its number as the flat entries number it.
+const subagentName = (held: readonly SessionCostUsage[], index: number): string =>
+  held.find((part) => part.agentName)?.agentName ?? `Subagent ${index + 1}`;
+
+// The Subagents tab: one row per child session, sorted by cost. Delegated work without a child
+// scope is one row. A row without a priced request reads `cost unavailable` with no share, and a
+// row with incomplete usage reads its dollars as a lower bound, as the flat entries do.
+function costSubagentRows(
+  scopes: readonly [string, readonly SessionCostUsage[]][],
+  unscoped: readonly PricedSessionCost[],
+  whole: number,
+  scopeShort: (id: string) => boolean,
+  unscopedShort: boolean,
+): CostDetailRow[] {
+  const row = (name: string, costs: readonly PricedSessionCost[], session: string | null, short: boolean) => {
+    const models = modelNames(costs.map((cost) => cost.part.model));
+    const dollars = dollarsOf(costs);
+    const value = sessionCostValue(costs, short);
+    // A zero-width space after each underscore lets a long name break there and never mid-word.
+    const built = costDetailRow(name.replace(/_/g, '_\u200b'), dollars, whole, 'delegated work', [], models);
+    const head = [name, models, ...(session ? [`session ${session}`] : [])].join(', ');
+    if (value === 'cost unavailable') {
+      return { ...built, value, percent: '', share: 0, title: `${head}. Cost unavailable.` };
+    }
+    const atLeast = value.endsWith('+');
+    return {
+      ...built,
+      ...(atLeast ? { value } : {}),
+      title: `${head}. ${atLeast ? 'At least ' : ''}${centsCost(dollars)}, ${built.percent} of delegated work.`,
+    };
+  };
+  return byDollars([
+    ...scopes.map(([id, held], index) =>
+      row(subagentName(held, index), held.map(priceSessionCost), scopeSession(id), scopeShort(id)),
+    ),
+    ...(unscoped.length ? [row('Other delegated work', unscoped, null, unscopedShort)] : []),
+  ]);
+}
+
+// The "Included above" rows as footnote lines.
+function costIncluded(entries: readonly StatDetailEntry[]): CostDetailView['included'] {
+  const expiry = (entry: StatDetailEntry) => entry.valueTitle === CACHE_EXPIRY_COST_ADDED_HINT;
+  return entries
+    .filter((entry) => !entry.group)
+    .sort((left, right) => Number(expiry(right)) - Number(expiry(left)))
+    .map((entry) => ({
+      label: expiry(entry) ? `${entry.label} added` : entry.label,
+      value: typeof entry.value === 'string' ? entry.value : '',
+      ...(entry.valueTitle ? { title: entry.valueTitle } : {}),
+    }));
+}
+
+// The short wait line a cost popover leads with. Its title holds the counts.
+function waitShareLead(warning: WaitShareWarning, basis: 'session' | 'turn'): { text: string; title: string } {
+  return {
+    text: `Waiting on subagents took ${formatCost(warning.waitCost)}, ${Math.round(warning.share * 100)}% of ${basis === 'turn' ? "this turn's main agent cost" : "the main agent's cost"}`,
+    title: `${formatCost(warning.waitCost)} of ${formatCost(warning.mainCost)} went to ${warning.requests} waits, ${warning.timedOut} of them timed out`,
+  };
+}
+
+const dollarsOf = (costs: readonly PricedSessionCost[]): number =>
+  costs.reduce((sum, cost) => sum + (cost.dollars ?? 0), 0);
+
 // The overheads a session cost popover names under "Included above".
 export interface SessionOverheads {
   // The exact lifetime count of completed primary-session compactions.
@@ -5813,6 +6280,82 @@ export function sessionCostProjection(
       COST_ESTIMATE_NOTE,
     ],
   };
+  const mainValue = sessionCostValue(captured ? [captured.main] : main, captured ? false : mainShort);
+  const mainUsage = costUsageRows(main, dollarsOf(main), "the main agent's cost");
+  if (mainUsage.length) {
+    const delegatedValue = sessionCostValue(captured ? [captured.delegated] : delegated, captured ? false : short);
+    const mainDollars = captured?.main.dollars ?? dollarsOf(main);
+    const delegatedDollars = captured?.delegated.dollars ?? dollarsOf(delegated);
+    const combined = mainDollars + delegatedDollars;
+    const unscoped = delegated.filter((cost) => cost.part.scopeId === undefined);
+    const children: (string | null)[][] = [
+      ...[...delegatedScopes.values()].map((held) => held.map((part) => part.model)),
+      ...(unscoped.length ? [unscoped.map((cost) => cost.part.model)] : []),
+    ];
+    const tools = costToolRows(main, "the main agent's cost");
+    const subagents = costSubagentRows([...delegatedScopes], unscoped, delegatedDollars, scopeShort, short);
+    const scopeNames = new Map([...delegatedScopes].map(([id, held], index) => [id, subagentName(held, index)]));
+    if (tools.length) detailList.notes = [TOOL_RESULT_NOTE, ...(detailList.notes ?? [])];
+    detailList.cost = {
+      warnings: [
+        ...warnings.map((warning) => ({
+          text: `${warning.scope === 'main' ? '' : `${scopeNames.get(warning.id ?? '') ?? 'Delegated work'}: `}${cacheWriteWarningText(warning)}`,
+        })),
+        ...waitWarnings.map((warning) => waitShareLead(warning, 'session')),
+      ],
+      main: {
+        label: 'Main agent',
+        value: mainValue,
+        model: modelNames(main.map((cost) => cost.part.model)),
+        title: [
+          centsCost(mainDollars),
+          ...(main.every((cost) => cost.part.usage.requests !== undefined)
+            ? [
+                `${main.reduce((sum, cost) => sum + (cost.part.usage.requests ?? 0), 0).toLocaleString('en-US')} requests`,
+              ]
+            : []),
+          `${sharePercent(costShare(mainDollars, combined))} of the total`,
+        ].join(', '),
+      },
+      ...(delegated.length || short
+        ? {
+            delegated: {
+              label: 'Delegated',
+              value: delegatedValue,
+              model: childModelCounts(children),
+              title: `${[
+                centsCost(delegatedDollars),
+                `${children.length} child session${children.length === 1 ? '' : 's'}`,
+                ...(delegated.every((cost) => cost.part.usage.requests !== undefined)
+                  ? [
+                      `${delegated.reduce((sum, cost) => sum + (cost.part.usage.requests ?? 0), 0).toLocaleString('en-US')} requests`,
+                    ]
+                  : []),
+                `${sharePercent(costShare(delegatedDollars, combined))} of the total`,
+              ].join(', ')}${childModelDollars([...delegatedScopes.values()])}`,
+              mainShare: costShare(mainDollars, combined),
+            },
+          }
+        : {}),
+      caption: costCaption(main),
+      tabs: [
+        { name: 'Usage', base: `Shares of the main agent's ${mainValue}.`, rows: mainUsage },
+        ...(tools.length
+          ? [
+              {
+                name: 'Tools' as const,
+                base: `Main agent cost by the tool result each request read. Shares of the main agent's ${mainValue}.`,
+                rows: tools,
+              },
+            ]
+          : []),
+        ...(subagents.length
+          ? [{ name: 'Subagents' as const, base: `Shares of the ${delegatedValue} delegated work.`, rows: subagents }]
+          : []),
+      ],
+      included: costIncluded(included),
+    };
+  }
   chip.detailList = detailList;
   chip.detail = flatDetailList(detailList).join('\n');
   if (warnings.length || waitWarnings.length) {

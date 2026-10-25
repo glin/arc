@@ -3,7 +3,7 @@ import { cacheHitText, diffHalves, type CacheHitDetail } from '../view/stat-deta
 import { ARRIVAL_WORD } from '../view/card-presentation.ts';
 import type { DetailRows } from './card-rows.ts';
 import { drawContextDetail, type ContextDetailView } from './context-detail.ts';
-import { appendNameText } from './inline-text.ts';
+import { appendNameText, inlineText } from './inline-text.ts';
 
 // Delay after the pointer leaves a chip or popover. This lets the pointer cross the gap without pinning.
 export const HOVER_GRACE_MS = 150;
@@ -70,9 +70,32 @@ const KIND_CLASS: Record<'description' | 'path' | 'muted', string> = {
   muted: 'chippopmuted',
 };
 
+interface CostSideView {
+  label: string;
+  value?: string;
+  model: string;
+  title: string;
+}
+
+// The tabbed form of the two cost popovers, as `turncard.ts` builds it.
+export interface CostDetailView {
+  warnings: { text: string; title?: string }[];
+  main: CostSideView;
+  delegated?: CostSideView & { mainShare: number };
+  caption?: { text: string; title: string };
+  tabs: {
+    name: string;
+    base: string;
+    rows: { label: string; detail?: string; percent: string; share: number; value: string; title: string }[];
+  }[];
+  included: { label: string; value: string; title?: string }[];
+}
+
 export interface StatDetailList {
   nameWorktree?: { label: string; name: string; path: string; open(): void };
   context?: ContextDetailView;
+  // Draws the cost form in place of the entries.
+  cost?: CostDetailView;
   // Choose the record layout. Omission uses the compact label-and-value grid.
   layout?: 'stacked' | 'tool-breakdown' | 'skills' | 'economics' | 'files' | 'agents' | 'dispatched' | 'commits';
   // Declare entry actions. Draw their buttons whenever the popover is shown.
@@ -237,6 +260,8 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
   const pointerAnchors = new WeakMap<PointerEvent, HTMLElement>();
   let anchor: HTMLElement | null = null;
   let pinned = false;
+  // The cost tab the reader chose. It holds while the popover stays pinned. Empty selects the first tab.
+  let costTab = '';
   let pointerOnAnchor = false;
   let pointerOnDetail = false;
   let rowsHost: HTMLElement | null = null;
@@ -444,7 +469,7 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
   const POP_PRESSES = '.chippopnamelink, .chippoprows button, .context-bound button, .sessionworktreelink';
   // The Tab walk holds presses, row figure stops, rows without links, the Context
   // disclosures and the notes disclosure. The arrow keys walk presses alone.
-  const POP_TAB_STOPS = `${POP_PRESSES}, .chippoprows [tabindex="0"], .context-messages summary, .context-measurement summary, .chippopnotes summary`;
+  const POP_TAB_STOPS = `${POP_PRESSES}, .chippoprows [tabindex="0"], .poptabs [tabindex="0"], .context-messages summary, .context-measurement summary, .chippopnotes summary`;
   // Every action the reader can reach inside the popover, in reading order.
   const actionButtons = () => Array.from(pop.querySelectorAll<HTMLElement>(POP_PRESSES));
   // Every stop Tab takes inside the popover, in reading order.
@@ -463,12 +488,20 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
   // browser reads the figure's spoken text and skips its drawn text.
   const figureNameId = (node: HTMLElement): string => node.id || (node.id = `${pop.id}figure-${++figureIds}`);
   // The notes close the popover under the breakdown, so everything drawn before them is the breakdown.
-  // Its parts get ids, and the figure's description names them.
+  // Its shown parts get ids, and the figure's description names them. A cost tab strip and the
+  // hidden tab panels stay out of it.
+  const describeBreakdown = () => {
+    breakdownIds = Array.from(pop.children).flatMap((part, at) =>
+      (part as HTMLElement).hidden || part.matches('.poptabs, .chippopnotes')
+        ? []
+        : [part.id || (part.id = `${pop.id}part-${at}`)],
+    );
+  };
   const appendNotes = (notes: string[] | undefined) => {
     if (!notes?.length) {
       return;
     }
-    breakdownIds = Array.from(pop.children).map((part, at) => part.id || (part.id = `${pop.id}part-${at}`));
+    describeBreakdown();
     const disclosure = el('details', 'projectspendpricing chippopnotes');
     // A hover shows the closed summary. A pinned popover restores the panel's open state.
     disclosure.open = pinned && (notesOpen.get(document) ?? false);
@@ -479,6 +512,176 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
     }
     disclosure.appendChild(list);
     pop.appendChild(disclosure);
+  };
+  // The cost form: warnings, the split hero, the caption, the tab strip and every tab's rows, and
+  // the "Included above" footnote. Only the selected tab's rows show. The strip shows only in a
+  // pinned popover, so a hover reads the first tab.
+  const drawCost = (cost: CostDetailView) => {
+    for (const warning of cost.warnings) {
+      const line = el('p', 'line chippopwarning');
+      const sign = el('span', 'statwarningsign', '\u26A0\uFE0E');
+      sign.setAttribute('aria-hidden', 'true');
+      line.append(sign, warning.text);
+      if (warning.title) line.title = warning.title;
+      pop.appendChild(line);
+    }
+    const side = (view: CostSideView, right: boolean) => {
+      const node = el('span', right ? 'splitside right' : 'splitside');
+      node.title = view.title;
+      const label = el('span', 'splitlabel');
+      if (view.value) {
+        label.append(...inlineText([el('span', '', view.label), el('span', 'chippopvalue', view.value)]));
+        node.append(...inlineText([label, el('span', 'splitmodel', view.model)]));
+      } else {
+        label.append(...inlineText([el('span', '', view.label), el('span', 'splitmodel', `\u00B7 ${view.model}`)]));
+        node.append(label);
+      }
+      return node;
+    };
+    const split = el('div', 'split');
+    split.append(side(cost.main, false));
+    if (cost.delegated) {
+      const bar = el('div', 'sbbar context-meter splitbar');
+      bar.setAttribute('aria-hidden', 'true');
+      const main = el('i', 'main');
+      main.style.width = `${cost.delegated.mainShare * 100}%`;
+      const delegated = el('i', 'delegated');
+      delegated.style.width = `${(1 - cost.delegated.mainShare) * 100}%`;
+      bar.append(main, delegated);
+      split.append(...inlineText([bar, side(cost.delegated, true)]));
+    }
+    pop.appendChild(split);
+    if (cost.caption) {
+      const caption = el('p', 'caption chippopscale', cost.caption.text);
+      caption.title = cost.caption.title;
+      pop.appendChild(caption);
+    }
+    const buttons: HTMLButtonElement[] = [];
+    const panels: HTMLElement[] = [];
+    const select = (at: number, focus: boolean) => {
+      costTab = cost.tabs[at]?.name ?? '';
+      buttons.forEach((button, index) => {
+        button.setAttribute('aria-selected', String(index === at));
+        button.tabIndex = index === at ? 0 : -1;
+      });
+      panels.forEach((panel, index) => {
+        panel.hidden = index !== at;
+      });
+      // A chosen tab changes the breakdown and the popover's height, so the figure's description
+      // follows the shown panel and the popover is placed again, as a disclosure toggle does.
+      if (focus && anchor && !pop.hidden) {
+        if (breakdownIds.length) {
+          describeBreakdown();
+          anchor.setAttribute('aria-describedby', breakdownIds.join(' '));
+        }
+        options.placeFloat(pop, anchor, view.innerHeight - 6);
+      }
+      if (focus) buttons[at]?.focus();
+    };
+    const tabbed = cost.tabs.length > 1;
+    if (tabbed) {
+      const strip = el('div', 'casktabs poptabs');
+      strip.setAttribute('role', 'tablist');
+      strip.setAttribute('aria-label', 'Cost breakdown');
+      cost.tabs.forEach((tab, at) => {
+        const button = el('button', 'casktab');
+        button.type = 'button';
+        button.id = `${pop.id}costtab-${at}`;
+        button.setAttribute('role', 'tab');
+        button.setAttribute('aria-controls', `${pop.id}costpanel-${at}`);
+        button.append(el('span', 'casktabname', tab.name));
+        button.addEventListener('click', (event) => {
+          event.stopPropagation();
+          select(at, true);
+        });
+        buttons.push(button);
+        strip.append(button);
+      });
+      // Arrow keys, Home and End move between tabs. Every other key reaches the popover's own handlers.
+      strip.addEventListener('keydown', (event) => {
+        const at = buttons.indexOf(event.target as HTMLButtonElement);
+        const last = buttons.length - 1;
+        const next =
+          at < 0
+            ? -1
+            : event.key === 'ArrowRight'
+              ? (at + 1) % buttons.length
+              : event.key === 'ArrowLeft'
+                ? (at + last) % buttons.length
+                : event.key === 'Home'
+                  ? 0
+                  : event.key === 'End'
+                    ? last
+                    : -1;
+        if (next < 0) {
+          return;
+        }
+        event.preventDefault();
+        event.stopPropagation();
+        select(next, true);
+      });
+      pop.appendChild(strip);
+    }
+    cost.tabs.forEach((tab, at) => {
+      const panel = el('div');
+      if (tabbed) {
+        panel.id = `${pop.id}costpanel-${at}`;
+        panel.setAttribute('role', 'tabpanel');
+        panel.setAttribute('aria-labelledby', `${pop.id}costtab-${at}`);
+      }
+      panel.append(el('p', 'context-included chippopscale', tab.base));
+      const list = el(
+        'ul',
+        tab.name === 'Subagents' ? 'context-categories costrows subagentrows' : 'context-categories costrows',
+      );
+      list.setAttribute('role', 'list');
+      for (const row of tab.rows) {
+        const item = el('li', 'costrow');
+        item.title = row.title;
+        const label = el('span', 'label');
+        const name = el('span', 'context-category-label', row.label);
+        label.append(...(row.detail ? inlineText([name, el('span', 'detail chippopscale', row.detail)]) : [name]));
+        const bar = el('div', 'sbbar context-meter');
+        bar.setAttribute('aria-hidden', 'true');
+        const fill = el('i');
+        fill.style.width = `${row.share * 100}%`;
+        bar.append(fill);
+        // The dollars close every row, on the head's right edge.
+        item.append(
+          ...inlineText([
+            label,
+            el('span', 'chippopscale pct', row.percent),
+            bar,
+            el('span', 'chippopvalue dollars', row.value),
+          ]),
+        );
+        list.append(item);
+      }
+      panel.append(list);
+      panels.push(panel);
+      pop.appendChild(panel);
+    });
+    select(
+      Math.max(
+        0,
+        cost.tabs.findIndex((tab) => tab.name === costTab),
+      ),
+      false,
+    );
+    if (cost.included.length) {
+      const box = el('div', 'included');
+      box.append(el('p', 'context-included chippopscale includedhead', 'Included above'));
+      const list = el('ul', 'includedrows');
+      list.setAttribute('role', 'list');
+      for (const fact of cost.included) {
+        const item = el('li');
+        if (fact.title) item.title = fact.title;
+        item.append(...inlineText([el('span', '', fact.label), el('span', 'dollars', fact.value)]));
+        list.append(item);
+      }
+      box.append(list);
+      pop.appendChild(box);
+    }
   };
   const drawInto = (value: ResolvedDetailValue, withActions: boolean) => {
     const { detail, detailList: listValue } = value;
@@ -562,6 +765,12 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
     if (listValue && !listValue.nameWorktree) {
       if (listValue.heading) {
         pop.appendChild(detailHead(listValue.heading, 'chippophead'));
+      }
+      if (listValue.cost) {
+        drawCost(listValue.cost);
+        (listValue.footer || []).forEach((line, at) => appendFoot(line, at, 'chippopfoot'));
+        appendNotes(listValue.notes);
+        return;
       }
       // Lead lines wear the name form, so a press or a first line keeps the regular weight.
       for (const line of listValue.lead ?? []) {
@@ -657,6 +866,7 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
     if (notes && drawnPrint !== null && pop.classList.contains('pinned')) notesOpen.set(document, notes.open);
     const focused = [
       '.sessionworktreelink',
+      '.poptabs [tabindex="0"]',
       '.context-bound button',
       '.context-messages summary',
       '.context-measurement summary',
@@ -696,6 +906,7 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
       drawnPrint = null;
       contextMeasurementOpen = false;
       contextMessagesOpen = false;
+      costTab = '';
     }
     anchor = node;
     // Draw available actions on hover as well as when pinned.
@@ -753,6 +964,7 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
     const target = focusBack?.isConnected ? focusBack : prior?.isConnected ? prior : null;
     anchor = null;
     pinned = false;
+    costTab = '';
     focusBack = null;
     drawnPrint = null;
     drawnActions = false;

@@ -9,8 +9,10 @@ import type {
   TurnUsagePart,
   UsageContextBand,
   UsageCounts,
+  UsageTools,
   UsageWaits,
 } from './transcript';
+import { toolResultWeights } from './domain/tool-kinds';
 
 // One agent's billed usage under one model. Model changes retain separate counts for each model.
 export interface ModelSpend {
@@ -141,8 +143,106 @@ export function addUsageWaits(target: { waits?: UsageWaits }, add: UsageWaits | 
   held.requests += add.requests;
   held.timedOut += add.timedOut;
   addUsageCounts(held.usage, add.usage);
+  if (add.tools) {
+    const tools = { ...held.tools };
+    for (const [tool, requests] of Object.entries(add.tools)) {
+      const count = (tools[tool] ?? 0) + requests;
+      if (count > 0) tools[tool] = count;
+      else delete tools[tool];
+    }
+    held.tools = tools;
+  }
   if (held.requests > 0) target.waits = held;
   else delete target.waits;
+}
+
+// Usage multiplied by a weight, band by band.
+function weightedUsage(usage: TurnUsage, weight: number): TurnUsage {
+  const scale = (counts: UsageCounts): UsageCounts => ({
+    ...(counts.requests === undefined ? {} : { requests: counts.requests * weight }),
+    input: counts.input * weight,
+    cacheWrite1h: counts.cacheWrite1h * weight,
+    cacheWrite5m: counts.cacheWrite5m * weight,
+    ...(counts.cacheWrite30m === undefined ? {} : { cacheWrite30m: counts.cacheWrite30m * weight }),
+    cacheRead: counts.cacheRead * weight,
+    output: counts.output * weight,
+    thinking: counts.thinking * weight,
+  });
+  const scaled: TurnUsage = scale(usage);
+  if (usage.byContextBand) {
+    scaled.byContextBand = Object.fromEntries(
+      Object.entries(usage.byContextBand).map(([band, counts]) => [band, scale(counts)]),
+    );
+  }
+  return scaled;
+}
+
+const USAGE_FIGURES = [
+  'requests',
+  'input',
+  'cacheWrite1h',
+  'cacheWrite5m',
+  'cacheWrite30m',
+  'cacheRead',
+  'output',
+  'thinking',
+] as const;
+
+// Sets each figure within rounding of zero to zero, so a removal that subtracts an earlier even
+// part leaves no negative residue. Returns whether every figure is now zero.
+function settleUsage(usage: TurnUsage): boolean {
+  const settle = (counts: UsageCounts) => {
+    let settled = true;
+    for (const figure of USAGE_FIGURES) {
+      const value = counts[figure];
+      if (value === undefined) continue;
+      if (Math.abs(value) < 1e-6) counts[figure] = 0;
+      else settled = false;
+    }
+    return settled;
+  };
+  const bands = Object.values(usage.byContextBand ?? {}).map(settle);
+  return settle(usage) && bands.every(Boolean);
+}
+
+// Adds tool kinds into a holder without changing the holder's earlier objects, which a copied
+// bucket can still share. A negative addition removes requests. A kind leaves once its requests
+// and usage reach zero. A band slice of a request that is not its last pass adds usage alone.
+export function mergeUsageTools(target: { tools?: UsageTools }, add: UsageTools | undefined): void {
+  if (!add) return;
+  const held: UsageTools = {
+    requests: (target.tools?.requests ?? 0) + add.requests,
+    kinds: { ...target.tools?.kinds },
+  };
+  for (const [kind, part] of Object.entries(add.kinds)) {
+    const prior = held.kinds[kind];
+    const usage = prior ? structuredClone(prior.usage) : emptyUsage();
+    addUsage(usage, part.usage);
+    const requests = (prior?.requests ?? 0) + part.requests;
+    if (!settleUsage(usage) || requests > 0) held.kinds[kind] = { requests: Math.max(0, requests), usage };
+    else delete held.kinds[kind];
+  }
+  held.requests = Math.max(0, held.requests);
+  if (held.requests > 0 || Object.keys(held.kinds).length) target.tools = held;
+  else delete target.tools;
+}
+
+// Adds one request's tool results. Each kind takes its even part of the request's usage, as
+// `arc cost --by-tool` splits a request's cost. A removal's negative request count takes them out.
+export function addUsageTools(
+  target: { tools?: UsageTools },
+  event: { toolResults?: readonly string[]; usage: TurnUsage },
+  contextBand: UsageContextBand | null = null,
+): void {
+  if (!event.toolResults?.length) return;
+  const requests = Math.sign(event.usage.requests ?? 1) || 0;
+  const kinds: UsageTools['kinds'] = {};
+  for (const [kind, weight] of toolResultWeights(event.toolResults)) {
+    const usage = emptyUsage();
+    addUsage(usage, weightedUsage(event.usage, weight), contextBand);
+    kinds[kind] = { requests, usage };
+  }
+  mergeUsageTools(target, { requests, kinds });
 }
 
 export function usageTokens(usage: TurnUsage): number {

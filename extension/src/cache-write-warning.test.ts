@@ -190,6 +190,23 @@ test('whole-session cost metadata nests warnings under their owning scopes even 
     entries.some((entry) => entry.warning),
     false,
   );
+  // The tabbed popover draws no child entry, so a delegated warning names the child as its row does.
+  const named = sessionCostProjection([
+    part({ role: 'main', usage: writeHeavy }),
+    part({ role: 'delegated', scopeId: 'child-a', usage: writeHeavy, agentName: 'explorer' }),
+    part({ role: 'delegated', scopeId: 'child-b', usage: counts({ requests: 4, cacheWrite1h: 2_000_000 }) }),
+  ]).stats[0].detailList!.cost!;
+  assert.deepEqual(
+    named.warnings.map((warning) => warning.text),
+    [
+      'Low cache reuse in this session: $8.00 of $8.02 went to cache writes',
+      'explorer: Low cache reuse in delegated work: $8.00 of $8.02 went to cache writes',
+    ],
+  );
+  assert.deepEqual(
+    named.tabs.find((tab) => tab.name === 'Subagents')!.rows.map((row) => row.label),
+    ['explorer', 'Subagent 2'],
+  );
 });
 
 test('short delegated scopes do not become eligible when their indexed costs share a model', () => {
@@ -377,6 +394,22 @@ test('unpriced or incomplete delegated work keeps the wait-share warning on a pa
     );
     assert.deepEqual(chip.detailList!.entries[0].lines?.[0], { text: sentence, warning: true });
   }
+  // Each Subagents row keeps the state the delegated hero shows: unavailable, or a lower bound.
+  const rows = (projection: ReturnType<typeof sessionCostProjection>) => {
+    const cost = projection.stats[0].detailList!.cost!;
+    const child = cost.tabs.find((tab) => tab.name === 'Subagents')!.rows;
+    return [cost.delegated?.value, ...child.map((row) => [row.value, row.percent, row.share, row.title])];
+  };
+  assert.deepEqual(rows(sessionCostProjection([owner, { ...child, model: 'unknown' }])), [
+    'cost unavailable',
+    ['cost unavailable', '', 0, 'Subagent 1, unknown. Cost unavailable.'],
+  ]);
+  assert.deepEqual(
+    rows(
+      sessionCostProjection([owner, child], { main: false, delegated: true, delegatedScopeIds: new Set(['child']) }),
+    ),
+    ['$2.00+', ['$2.00+', '100%', 1, 'Subagent 1, sonnet-5. At least $2.00, 100% of delegated work.']],
+  );
 });
 
 test('the wait-share line sits under the main agent entry after the cache line and signs the figure', () => {
@@ -453,12 +486,16 @@ test('without a cache warning, the wait-share line is the only change to the ses
     const waited = sessionCostProjection([{ ...owner, waits }, ...others]).stats[0].detailList!;
     assert.equal(waited.entries.flatMap((entry) => allLines(entry.lines ?? [])).filter(isWaitLine).length, 1);
     assert.ok(waited.entries[0].lines?.some(isWaitLine));
+    // The tabbed form adds the warning line and a Tools tab. The flat entries change only by the line.
+    const { cost: waitedCost, ...waitedFlat } = waited;
+    const { cost: _plainCost, ...plainFlat } = plain;
+    assert.ok(waitedCost?.warnings.some((warning) => warning.text.startsWith('Waiting on subagents')));
     const stripped = {
-      ...waited,
-      entries: waited.entries.map((entry) =>
+      ...waitedFlat,
+      entries: waitedFlat.entries.map((entry) =>
         entry.lines ? { ...entry, lines: entry.lines.filter((line) => !isWaitLine(line)) } : entry,
       ),
     };
-    assert.deepEqual(stripped, plain);
+    assert.deepEqual(stripped, plainFlat);
   }
 });

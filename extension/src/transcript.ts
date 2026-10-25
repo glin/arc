@@ -1,3 +1,4 @@
+import { toolKind } from './domain/tool-kinds';
 import { revisionOf } from './filerevision';
 export { revisionOf } from './filerevision';
 import type { SourceEnumeration } from './sessioncoverage';
@@ -25,7 +26,9 @@ import {
   ModelSpend,
   addModelUsage,
   addUsage,
+  addUsageTools,
   addUsageWaits,
+  mergeUsageTools,
   emptyUsage,
   agentSpendIsOpen,
   heaviestModel,
@@ -339,15 +342,26 @@ export interface TurnUsagePart {
   compactionUsage?: true;
   usageOrigin?: UsageOrigin;
   waits?: UsageWaits;
+  tools?: UsageTools;
   usage: TurnUsage;
 }
 
-// The requests that read a `wait_agent` return, which is a subagent wait, and their summed usage.
-// `timedOut` counts the requests whose every wait return was a timeout.
+// The requests that read a Codex wait return, and their summed usage. `timedOut` counts the
+// requests whose every wait return was a timeout. `tools` counts the requests that read each
+// wait tool's return, once per tool.
 export interface UsageWaits {
   requests: number;
   timedOut: number;
+  tools?: Record<string, number>;
   usage: TurnUsage;
+}
+
+// The requests that read tool results, by the kind `arc cost --by-tool` gives each result.
+// `requests` counts the requests that read any result. Each kind counts the requests that read
+// one of its results, and holds its even part of their usage, so its figures can be fractional.
+export interface UsageTools {
+  requests: number;
+  kinds: Record<string, { requests: number; usage: TurnUsage }>;
 }
 
 // Usage that is not one ordinary recorded request. `claude-cost-state` is Claude supplemental
@@ -379,6 +393,7 @@ function addPricedUsagePart(parts: TurnUsagePart[], add: TurnUsagePart): void {
   if (same) {
     addUsage(same.usage, add.usage);
     addUsageWaits(same, add.waits);
+    mergeUsageTools(same, add.tools);
     return;
   }
   const usage = { ...add.usage };
@@ -387,7 +402,12 @@ function addPricedUsagePart(parts: TurnUsagePart[], add: TurnUsagePart): void {
       Object.entries(add.usage.byContextBand).map(([band, held]) => [band, { ...held }]),
     );
   }
-  parts.push({ ...add, ...(add.waits ? { waits: { ...add.waits, usage: { ...add.waits.usage } } } : {}), usage });
+  parts.push({
+    ...add,
+    ...(add.waits ? { waits: structuredClone(add.waits) } : {}),
+    ...(add.tools ? { tools: structuredClone(add.tools) } : {}),
+    usage,
+  });
 }
 
 export function addTurnUsagePart(turn: Pick<Turn, 'usageParts'>, event: UsageEvent): void {
@@ -396,6 +416,7 @@ export function addTurnUsagePart(turn: Pick<Turn, 'usageParts'>, event: UsageEve
   if (same) {
     addUsage(same.usage, event.usage, event.contextBand);
     addUsageWaits(same, event.waits);
+    addUsageTools(same, event, event.contextBand);
     if (Object.values(same.usage).every((value) => typeof value !== 'number' || value === 0))
       parts.splice(parts.indexOf(same), 1);
     return;
@@ -420,9 +441,10 @@ export function addTurnUsagePart(turn: Pick<Turn, 'usageParts'>, event: UsageEve
     ...(event.compactionEstimate ? { compactionEstimate: true as const } : {}),
     ...(event.compactionUsage ? { compactionUsage: true as const } : {}),
     ...(event.usageOrigin ? { usageOrigin: event.usageOrigin } : {}),
-    ...(event.waits ? { waits: { ...event.waits, usage: { ...event.waits.usage } } } : {}),
+    ...(event.waits ? { waits: structuredClone(event.waits) } : {}),
     usage,
   });
+  addUsageTools(parts[parts.length - 1], event, event.contextBand);
 }
 
 // Recorded prompt-cache lifetime spellings. Pricing resolves their rates separately.
@@ -509,8 +531,11 @@ export interface UsageEvent {
   // bills as its own request of the advisor model and can record cache reads and writes.
   // It counts in cost and request totals, outside executor context, cache-expiry adjacency, and compaction figures.
   usageOrigin?: 'claude-advisor';
-  // Set when this request read a `wait_agent` return. Its usage equals the request's usage.
+  // Set when this request read a wait return. Its usage equals the request's usage.
   waits?: UsageWaits;
+  // The kind of each tool result this request read, in reading order, as `arc cost --by-tool`
+  // names it. A request that read no result has none.
+  toolResults?: string[];
 }
 
 // One compaction in request order, for the cache-expiry scan.
@@ -7635,6 +7660,49 @@ export interface ClaudeUsageReducerState {
   requestEvents?: Record<string, UsageEvent>;
   // Model id from the newest model attachment. Bedrock request pricing reads its inference profile prefix.
   modelProfile?: string | null;
+  // Open tool calls, newest last, each with the kind `arc cost --by-tool` gives its result.
+  // `CLAUDE_TOOL_CALL_LIMIT` bounds the list.
+  toolCalls?: { id: string; kind: string }[];
+  // The kinds of the tool results recorded since the last request. The next request read them.
+  pendingToolResults?: string[];
+  // The call ids of recorded tool results, newest last. A repeated result line adds nothing, as
+  // `arc cost --by-tool` counts each result once. `CLAUDE_TOOL_CALL_LIMIT` bounds the list.
+  seenToolResults?: string[];
+}
+
+// The most open tool calls, and the most results one request keeps.
+export const CLAUDE_TOOL_CALL_LIMIT = 256;
+
+// A tool result's call id. A key inside a quoted string has an escaped quote before it, so text
+// that quotes a transcript never matches.
+const CLAUDE_TOOL_RESULT_ID = /(?<!\\)"tool_use_id"\s*:\s*"([^"\\]+)"/g;
+
+// Records the tool calls of one assistant response, with the kind of each result.
+function noteClaudeToolCalls(state: ClaudeUsageReducerState, message: { content?: unknown } | undefined): void {
+  if (!Array.isArray(message?.content)) return;
+  for (const block of message.content as { type?: unknown; id?: unknown; name?: unknown; input?: unknown }[]) {
+    if (block?.type !== 'tool_use' || typeof block.id !== 'string' || !block.id) continue;
+    const held = (state.toolCalls ??= []);
+    if (held.some((call) => call.id === block.id)) continue;
+    held.push({ id: block.id, kind: toolKind(typeof block.name === 'string' ? block.name : '', block.input).kind });
+    held.splice(0, Math.max(0, held.length - CLAUDE_TOOL_CALL_LIMIT));
+  }
+}
+
+// Records the tool results of one user line without parsing it. A result whose call this
+// reader never saw is `other`, as `arc cost --by-tool` counts it.
+export function noteClaudeToolResultLine(state: ClaudeUsageReducerState, line: string): void {
+  if (line.indexOf('"tool_result"') < 0 || !/"type"\s*:\s*"user"/.test(line)) return;
+  for (const match of line.matchAll(CLAUDE_TOOL_RESULT_ID)) {
+    const seen = (state.seenToolResults ??= []);
+    if (seen.includes(match[1])) continue;
+    seen.push(match[1]);
+    seen.splice(0, Math.max(0, seen.length - CLAUDE_TOOL_CALL_LIMIT));
+    const index = state.toolCalls?.findIndex((call) => call.id === match[1]) ?? -1;
+    const kind = index >= 0 ? state.toolCalls!.splice(index, 1)[0].kind : 'other';
+    const held = (state.pendingToolResults ??= []);
+    if (held.length < CLAUDE_TOOL_CALL_LIMIT) held.push(kind);
+  }
 }
 
 export type ClaudeLastRequest = CompactionPreviousRequest & { model: string | null };
@@ -8558,6 +8626,14 @@ export function reduceClaudeUsageRecordEvents(
   const messageId = typeof message.id === 'string' && message.id ? message.id : null;
   const timestamp = Date.parse(String(record.timestamp ?? ''));
   const requestKey = claudeRequestKey(record, message);
+  noteClaudeToolCalls(state, record.message as { content?: unknown } | undefined);
+  // The first record of a response takes the results read since the last one. A repeat keeps
+  // what its first record took.
+  let toolResults: string[] | undefined;
+  if (!seenRequestIndex(state).has(requestKey)) {
+    toolResults = state.pendingToolResults?.length ? state.pendingToolResults : undefined;
+    state.pendingToolResults = [];
+  } else toolResults = state.requestEvents?.[requestKey]?.toolResults;
   if (opts.emitRepeats !== true) {
     // Parent reads retain every billed request key because content-block repeats can follow many unrelated requests.
     const seen = seenRequestIndex(state);
@@ -8632,6 +8708,7 @@ export function reduceClaudeUsageRecordEvents(
       : {}),
     usage: counted,
     requestKey,
+    ...(toolResults ? { toolResults: [...toolResults] } : {}),
   };
   // Each consultation bills at its own model's rates. Its key extends the response's key with the
   // iteration's position, so a child read's growing record replaces each one under the same key.
@@ -8649,6 +8726,7 @@ export function reduceClaudeUsageRecordEvents(
     usage: advisor.usage,
     requestKey: `${requestKey}:advisor:${advisor.index}`,
     usageOrigin: 'claude-advisor',
+    toolResults: undefined,
   }));
   // An iteration type this reader does not price leaves the executor's cost partial.
   if (response.unknownIterations) executor.incomplete = true;
@@ -8793,6 +8871,7 @@ function reduceClaudeUsageLineEvents(
   line: string,
   opts: ClaudeUsageReadOptions = {},
 ): UsageEvent[] {
+  noteClaudeToolResultLine(state, line);
   if (!acceptsClaudeUsageLine(line)) {
     return [];
   }
@@ -8937,6 +9016,9 @@ export function createClaudeUsageLineReducer(
               ? cloneParserState(restored.pendingCompactionEstimate)
               : null,
             ...(restored.modelProfile ? { modelProfile: restored.modelProfile } : {}),
+            ...(restored.toolCalls?.length ? { toolCalls: restored.toolCalls.map((call) => ({ ...call })) } : {}),
+            ...(restored.pendingToolResults?.length ? { pendingToolResults: [...restored.pendingToolResults] } : {}),
+            ...(restored.seenToolResults?.length ? { seenToolResults: [...restored.seenToolResults] } : {}),
             visibleTurns: restored.visibleTurns ?? 0,
             firstTurnAt: restored.firstTurnAt ?? null,
             currentTurnStartedAt: restored.currentTurnStartedAt ?? null,
@@ -9026,6 +9108,9 @@ export function createClaudeUsageLineReducer(
               ? cloneParserState(state.pendingCompactionEstimate)
               : null,
             ...(state.modelProfile ? { modelProfile: state.modelProfile } : {}),
+            ...(state.toolCalls?.length ? { toolCalls: state.toolCalls.map((call) => ({ ...call })) } : {}),
+            ...(state.pendingToolResults?.length ? { pendingToolResults: [...state.pendingToolResults] } : {}),
+            ...(state.seenToolResults?.length ? { seenToolResults: [...state.seenToolResults] } : {}),
             visibleTurns: state.visibleTurns,
             firstTurnAt: state.firstTurnAt,
             currentTurnStartedAt: state.currentTurnStartedAt,
@@ -10669,6 +10754,7 @@ function reduceClaudeSessionLine(
     noteClaudeRequest(state, request);
     return;
   }
+  noteClaudeToolResultLine(state.usageState, line);
   if (line.indexOf(MODEL_ATTACHMENT_MARK) >= 0 || (line.includes('"attachment"') && line.includes('"model"'))) {
     try {
       const o = JSON.parse(line) as Record<string, unknown>;

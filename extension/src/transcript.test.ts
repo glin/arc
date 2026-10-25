@@ -17132,3 +17132,43 @@ test('a Remote Control bridge record changes no turn, title, or metadata', () =>
     read(plain).replace(/"(start|end|size|offset|bytes)":\d+/g, ''),
   );
 });
+
+// A Claude turn reads its tool results as `arc cost --by-tool` does, so its cost popover draws Tools rows.
+test('a Claude turn cost popover draws Tools rows from the results each request read', () => {
+  const usage = { input_tokens: 100_000, output_tokens: 1_000 };
+  const calls = (second: number, id: string, tools: [string, string, Record<string, unknown>][]) => ({
+    type: 'assistant',
+    timestamp: at(second),
+    message: {
+      role: 'assistant',
+      id,
+      model: 'claude-opus-5',
+      content: tools.map(([toolId, name, input]) => ({ type: 'tool_use', id: toolId, name, input })),
+      usage,
+    },
+  });
+  const records = [
+    userPrompt('Find the bug', 0),
+    calls(1, 'm-read', [
+      ['r1', 'Read', { file_path: 'a.ts' }],
+      ['g1', 'Grep', { pattern: 'bug' }],
+    ]),
+    toolResult('r1', 2),
+    toolResult('g1', 3),
+    assistantText('Fixed it', 4, usage, undefined, 'end_turn'),
+  ];
+  const [turn] = readSession(writeTranscript(records), 'sess').turns;
+  const cost = toCard(turn, false, Date.parse(at(60))).chips.find((chip) => chip.metric === 'cost')!.detailList!.cost!;
+  assert.deepEqual(
+    cost.tabs.map((tab) => tab.name),
+    ['Usage', 'Tools'],
+  );
+  assert.deepEqual(
+    cost.tabs[1].rows.map((row) => [row.label, row.percent, row.title.split(', ')[1]]),
+    [
+      ['No tool result', '50%', '1 request'],
+      ['File read', '25%', '1 request'],
+      ['Search', '25%', '1 request'],
+    ],
+  );
+});

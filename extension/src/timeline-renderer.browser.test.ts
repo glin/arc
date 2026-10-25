@@ -72,6 +72,7 @@ import { CARD_ACTIONS } from './view/card-words.ts';
 import { ROVING_SELECTOR } from './webview/navigation.ts';
 import {
   cacheWriteWarningPayload,
+  waitWarningPayload,
   compactionSummaryPayload,
   LONG_TURN_INDEX,
   nextTurnPayload,
@@ -4750,6 +4751,152 @@ test('heading read and membership context survive reversals while a comment hold
   }
 });
 
+test('the pinned session cost popover leads with its warning, ends rows on the dollars, and moves between tabs by arrow key', async (t) => {
+  const browser = await browserOrNone();
+  if (!browser) {
+    t.skip('Edge or Chrome is required');
+    return;
+  }
+  const page = await browser.newPage();
+  try {
+    await page.setContent(pageHtml());
+    for (const width of [1350, 340]) {
+      await page.setViewportSize({ width, height: 900 });
+      await post(page, waitWarningPayload());
+      await page.locator('.sessionstats [data-metric="cost"]').click();
+      const pop = page.locator('.chippop.pinned');
+      await pop.waitFor();
+      const shape = await pop.evaluate((node) => ({
+        lead: Array.from(node.children)
+          .slice(0, 3)
+          .map((child) => child.className),
+        rowEnds: Array.from(node.querySelectorAll('.costrow')).map((row) => row.lastElementChild?.className),
+      }));
+      assert.deepEqual(shape.lead, ['chippophead', 'line chippopwarning', 'split'], `${width}`);
+      assert.ok(shape.rowEnds.length > 0);
+      for (const end of shape.rowEnds) assert.equal(end, 'chippopvalue dollars');
+      // Each tab draws one row per figure: three usage categories, the five merged tool rows, and
+      // one row per named child.
+      assert.deepEqual(
+        await pop.evaluate((node) =>
+          Array.from(node.querySelectorAll('[role="tabpanel"]')).map(
+            (panel) => panel.querySelectorAll('.costrow').length,
+          ),
+        ),
+        [3, 5, 3],
+        `${width}`,
+      );
+      const selected = () =>
+        pop.evaluate((node) => ({
+          tab: node.querySelector('[role="tab"][aria-selected="true"]')?.textContent,
+          focused: document.activeElement?.getAttribute('aria-selected') === 'true',
+          shown: Array.from(node.querySelectorAll<HTMLElement>('[role="tabpanel"]'))
+            .filter((panel) => !panel.hidden)
+            .map((panel) => panel.getAttribute('aria-labelledby')),
+        }));
+      // Each part the figure's description names: a tab panel by its tab, or another shown part.
+      const described = () =>
+        page.locator('.sessionstats [data-metric="cost"]').evaluate((figure) =>
+          (figure.getAttribute('aria-describedby') ?? '')
+            .split(' ')
+            .filter(Boolean)
+            .map((id) => {
+              const part = document.getElementById(id);
+              if (!part) return 'missing';
+              if (part.hidden) return 'hidden';
+              if (part.matches('.poptabs')) return 'strip';
+              return part.getAttribute('role') === 'tabpanel' ? part.getAttribute('aria-labelledby') : 'part';
+            }),
+        );
+      assert.deepEqual(
+        (await described()).filter((part) => part !== 'part'),
+        [`${await pop.getAttribute('id')}costtab-0`],
+        `${width}`,
+      );
+      // Tab from the pinned figure enters the strip at the selected tab.
+      await page.locator('.sessionstats [data-metric="cost"]').focus();
+      await page.keyboard.press('Tab');
+      assert.deepEqual(await selected(), {
+        tab: 'Usage',
+        focused: true,
+        shown: [`${await pop.getAttribute('id')}costtab-0`],
+      });
+      for (const [key, tab] of [
+        ['ArrowRight', 'Tools'],
+        ['ArrowRight', 'Subagents'],
+        ['ArrowRight', 'Usage'],
+        ['ArrowLeft', 'Subagents'],
+        ['Home', 'Usage'],
+        ['End', 'Subagents'],
+      ]) {
+        await page.keyboard.press(key);
+        const now = await selected();
+        assert.equal(now.tab, tab, key);
+        assert.equal(now.focused, true, key);
+        assert.equal(now.shown.length, 1, key);
+      }
+      // A press on a tab selects it and keeps the popover pinned.
+      await pop.locator('[role="tab"]', { hasText: 'Tools' }).click();
+      assert.equal(await page.locator('.chippop.pinned').count(), 1, 'a press on a tab closed the popover');
+      assert.equal((await selected()).tab, 'Tools');
+      // The figure's description names the shown panel, never the strip or a hidden panel.
+      assert.deepEqual(
+        (await described()).filter((part) => part !== 'part'),
+        [`${await pop.getAttribute('id')}costtab-1`],
+        `${width}`,
+      );
+      // Escape closes the pinned popover as before, and the next pin starts on Usage.
+      await page.keyboard.press('Escape');
+      await page.waitForFunction(() => !document.querySelector('.chippop.pinned'));
+      await page.locator('.sessionstats [data-metric="cost"]').click();
+      await pop.waitFor();
+      assert.equal((await selected()).tab, 'Usage');
+      // A press on a tab while the figure holds focus keeps the popover pinned.
+      await pop.locator('[role="tab"]', { hasText: 'Subagents' }).click();
+      assert.equal(await page.locator('.chippop.pinned').count(), 1, 'a press from the figure closed the popover');
+      assert.equal((await selected()).tab, 'Subagents');
+      await page.keyboard.press('Escape');
+      await page.waitForFunction(() => !document.querySelector('.chippop.pinned'));
+    }
+    // A taller tab places the popover again. A turn popover whose Usage tab fits below its figure
+    // stays inside the viewport when its Tools tab needs the room above.
+    const figure = page.locator('article.turn button.statchip[data-metric="cost"]').first();
+    const pop = page.locator('.chippop.pinned');
+    const box = () =>
+      pop.evaluate((node) => {
+        const rect = node.getBoundingClientRect();
+        return { top: rect.top, bottom: rect.bottom, height: rect.height, inner: window.innerHeight };
+      });
+    const figureBottom = () => figure.evaluate((node) => node.getBoundingClientRect().bottom);
+    await page.setViewportSize({ width: 1350, height: 900 });
+    await figure.click();
+    await pop.waitFor();
+    const usage = await box();
+    await pop.locator('[role="tab"]', { hasText: 'Tools' }).click();
+    const tools = await box();
+    assert.ok(tools.height > usage.height + 12, `the Tools tab is ${tools.height}px against Usage ${usage.height}px`);
+    await page.keyboard.press('Escape');
+    await page.waitForFunction(() => !document.querySelector('.chippop.pinned'));
+    // The viewport leaves the Usage tab just enough room below the figure.
+    await page.setViewportSize({ width: 1350, height: Math.ceil((await figureBottom()) + 12 + usage.height) + 2 });
+    await figure.click();
+    await pop.waitFor();
+    const fitted = await box();
+    assert.ok(
+      fitted.top > (await figureBottom()) && fitted.bottom <= fitted.inner,
+      'Usage no longer fits below the figure',
+    );
+    await pop.locator('[role="tab"]', { hasText: 'Tools' }).click();
+    const placed = await box();
+    assert.ok(
+      placed.bottom <= placed.inner,
+      `the Tools tab ends at ${placed.bottom}px in a ${placed.inner}px viewport`,
+    );
+  } finally {
+    await page.close();
+  }
+});
+
 test('cache-write warnings share cost faces and retain pinned detail through updates', async (t) => {
   const browser = await browserOrNone();
   if (!browser) {
@@ -4807,23 +4954,17 @@ test('cache-write warnings share cost faces and retain pinned detail through upd
       await chip.focus();
       await page.keyboard.press('Enter');
       assert.equal(await chip.getAttribute('aria-pressed'), 'true');
-      const first = page.locator('#chippop .chippopitem').first();
+      // The warning leads the cost popover under its head, with one sign of its own.
+      const first = page.locator('#chippop > .chippopwarning').first();
       assert.match(
         (await first.textContent()) || '',
-        /Low cache reuse in this session.*\$503 of \$508 went to cache writes.*3% cached/s,
+        /Low cache reuse in this session.*\$503 of \$508 went to cache writes/s,
       );
-      assert.equal(await first.locator(':scope > .chippopitemhead .statwarningsign').count(), 0);
-      assert.equal(await first.locator(':scope > .chippopsublist > .chippopwarning .statwarningsign').count(), 1);
-      assert.equal(await first.locator('.chippopwarning > .chippopsublist').count(), 0);
-      const scale = first.locator('.chippopscale');
-      const cacheHit = scale.locator('.chippopcachehit.is-warning');
-      assert.equal(await scale.textContent(), ' (3% cached · 594 requests · 159k avg input)');
-      assert.equal(await cacheHit.textContent(), '3% cached');
-      const tones = await scale.evaluate((node) => ({
-        scale: getComputedStyle(node).color,
-        cacheHit: getComputedStyle(node.querySelector('.chippopcachehit')!).color,
-      }));
-      assert.notEqual(tones.scale, tones.cacheHit, 'the warning colors the request scale and parentheses');
+      assert.equal(await first.locator('.statwarningsign').count(), 1);
+      assert.equal(
+        await page.locator('#chippop > .caption').textContent(),
+        '594 requests · 3% cached input · 159k average input',
+      );
       const overflow = await page.locator('#chippop').evaluate((pop) => pop.scrollWidth - pop.clientWidth);
       assert.ok(overflow <= 1, `warning detail overflows at ${width}px`);
       await post(page, payload);
@@ -4844,6 +4985,7 @@ test('cache-write warnings share cost faces and retain pinned detail through upd
     cost.detail = 'Updated cost detail.';
     cost.detailList = {
       ...original,
+      cost: { ...(original as unknown as { cost: object }).cost, warnings: [] },
       entries: original.entries.map((entry) => ({
         ...entry,
         lines: (entry.lines as Array<Record<string, unknown>>).filter((line) => !line.warning),

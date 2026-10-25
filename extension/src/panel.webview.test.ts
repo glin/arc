@@ -22147,6 +22147,8 @@ const FIGURE_SIZES = [
   '.noteclose { font-size: 1.05em }',
   '.notearea { font: inherit }',
   '.notearea { font-size: 0.92em }',
+  '.casktab { font: inherit }',
+  '.casktab { font-size: var(--t-small) }',
   '#prompt { font: inherit }',
   '#prompt { font-size: 0.95em }',
   '.cfile { font-size: var(--t-small) }',
@@ -22167,6 +22169,9 @@ const FIGURE_SIZES = [
   '.sessionlabelact { font: inherit }',
   '.sessionlabelact { font-size: var(--t-small) }',
   '.context-columns > span { font-size: var(--t-small) }',
+  '.context-categories { font-size: inherit }',
+  '.context-included { font-size: var(--t-small) }',
+  '.chippop :is(.splitmodel, .caption, .costrow .detail, .costrow .pct, .included) { font-size: var(--t-small) }',
   '.context-table thead th { font-size: var(--t-small) }',
 ];
 
@@ -32246,6 +32251,21 @@ test('one rule truncates a commit row subject, and one rule truncates its maker 
     ).length;
   assert.equal(setting('.commitrow .name'), 1, 'a second rule sets how a commit subject truncates');
   assert.equal(setting('.commitrow .commitmakerlink'), 1, 'a second rule sets how a maker name truncates');
+});
+
+// Every cost row and footnote line ends on the dollars, right-aligned on the head's dollar edge.
+test('the cost popover dollars right-align as the last column of every row', () => {
+  const css = styleSource.replace(/\/\*[\s\S]*?\*\//g, '');
+  // The body of the first top-level rule with exactly this selector.
+  const ruleOf = (selector: string) => css.split(`\n${selector} {`)[1]?.split('}')[0];
+  const dollars = ruleOf('.chippop .dollars');
+  assert.ok(dollars, 'panel.css has no rule for the cost dollars');
+  assert.match(dollars, /text-align:\s*right/);
+  for (const list of ['.chippop .context-categories.costrows', '.chippop .context-categories.costrows.subagentrows']) {
+    const rule = ruleOf(list);
+    assert.ok(rule, `panel.css has no rule for ${list}`);
+    assert.match(rule, /grid-template-columns:[^;]* auto;/, `${list} does not end on a column sized to the dollars`);
+  }
 });
 
 // A session name hint fits a narrow panel, reads at regular weight, and stops at a line count so a

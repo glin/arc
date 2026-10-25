@@ -427,7 +427,7 @@ interface StoredCache {
 // The initial metadata budget, `INITIAL_RAIL_READ_BYTES`, spreads large workspace rebuilds across refreshes.
 // Targeted invalidation avoids a full rebuild when affected entries are identifiable at load.
 // Codex opening rows use `CODEX_META_VERSION` from codexopenings.ts and survive this version change.
-export const VERSION = 67;
+export const VERSION = 69;
 
 export class DerivedCacheCheckpointState {
   private generation = 0;
@@ -704,6 +704,27 @@ function usage(value: unknown): value is TurnUsage {
   );
 }
 
+// Tool kinds of a usage part. A kind's usage is its even part of its requests, so it can be fractional.
+function usageTools(value: unknown): boolean {
+  return (
+    record(value) &&
+    Number.isInteger(value.requests) &&
+    Number(value.requests) >= 0 &&
+    record(value.kinds) &&
+    Object.values(value.kinds).every(
+      (kind) =>
+        record(kind) &&
+        Number.isInteger(kind.requests) &&
+        Number(kind.requests) >= 0 &&
+        Number(kind.requests) <= Number(value.requests) &&
+        usageCounts(kind.usage) &&
+        ((kind.usage as TurnUsage).byContextBand === undefined ||
+          (record((kind.usage as TurnUsage).byContextBand) &&
+            Object.values((kind.usage as TurnUsage).byContextBand!).every(usageCounts))),
+    )
+  );
+}
+
 function usageParts(value: unknown): boolean {
   if (value === undefined) {
     return true;
@@ -736,7 +757,11 @@ function usageParts(value: unknown): boolean {
             Number.isInteger(part.waits.timedOut) &&
             Number(part.waits.timedOut) >= 0 &&
             Number(part.waits.timedOut) <= Number(part.waits.requests) &&
+            (part.waits.tools === undefined ||
+              (record(part.waits.tools) &&
+                Object.values(part.waits.tools).every((count) => Number.isInteger(count) && Number(count) > 0))) &&
             usage(part.waits.usage))) &&
+        (part.tools === undefined || usageTools(part.tools)) &&
         usage(part.usage),
     )
   );

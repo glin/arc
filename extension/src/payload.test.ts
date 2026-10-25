@@ -53,7 +53,7 @@ const CEILINGS = {
   // The card ceiling includes commit branches, repository paths, and author sessions.
 
   renderCards: 113_000,
-  selectionTotal: 8_066,
+  selectionTotal: 9_400,
   railMessageTotal: 2_676_966,
   railRow: 1_255,
   duplicateWaste: 243_665,

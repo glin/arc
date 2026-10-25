@@ -12243,7 +12243,7 @@ test('a prior Codex parser state rebuilds child identity and exact compaction us
 
   const reset = readCodexSessionIncremental(file, 'sess', initial.checkpoint, options);
   assert.equal(reset.kind, 'reset');
-  assert.equal(reset.checkpoint?.parserState.version, 25);
+  assert.equal(reset.checkpoint?.parserState.version, 27);
   assert.deepEqual(
     reset.read?.turns[0].agents.map((row) => [row.id, row.description]),
     [[child.threadId, 'astra_implementer']],
@@ -18061,6 +18061,56 @@ test('Codex usage events carry wait_agent returns to the request that read them 
   for (const event of events.filter((event) => event.waits)) assert.deepEqual(event.waits!.usage, event.usage);
   const [bucket] = aggregateUsageEvents(events);
   assert.deepEqual([bucket.waits?.requests, bucket.waits?.timedOut, bucket.waits?.usage.input], [2, 1, 5000]);
+});
+
+test('Codex usage events count wait and write_stdin returns as waits, and only wait_agent returns as timeouts', () => {
+  const thread = '01a032c9-1a92-7931-845c-723117d24dbe';
+  const bill = (second: number, response: string, input: number) => ({
+    timestamp: at(second),
+    type: 'token_usage_record',
+    payload: {
+      thread_id: thread,
+      turn_id: 'polls',
+      response_id: response,
+      usage: usage({ input_tokens: input, output_tokens: input / 100 }),
+    },
+  });
+  const records = [
+    meta(),
+    event('task_started', 1, { turn_id: 'polls' }),
+    turnContext(2, 'polls', 'gpt-6-sol', 'high'),
+    bill(3, 'issuer', 1000),
+    item('function_call', 4, {
+      name: 'write_stdin',
+      call_id: 'poll',
+      arguments: '{"session_id":1,"chars":""}',
+    }),
+    item('function_call_output', 5, {
+      call_id: 'poll',
+      output: '{"timed_out":true}',
+    }),
+    tokens(6, { input_tokens: 1000, output_tokens: 10 }),
+    bill(7, 'poll-reader', 2000),
+    item('function_call', 8, {
+      name: 'wait',
+      call_id: 'cell',
+      arguments: '{}',
+    }),
+    item('function_call_output', 9, { call_id: 'cell', output: 'done' }),
+    tokens(10, { input_tokens: 2000, output_tokens: 20 }),
+    bill(11, 'cell-reader', 3000),
+    tokens(12, { input_tokens: 3000, output_tokens: 30 }),
+  ];
+  const reducer = createCodexUsageLineReducer();
+  const events = records.flatMap((record) => reducer.pushLine(JSON.stringify(record)));
+  assert.deepEqual(
+    events.map((event) => [event.responseId, event.waits?.requests, event.waits?.timedOut]),
+    [
+      ['issuer', undefined, undefined],
+      ['poll-reader', 1, 0],
+      ['cell-reader', 1, 0],
+    ],
+  );
 });
 
 test('a Codex snapshot that arrives before its billing record keeps the wait_agent returns it read', () => {

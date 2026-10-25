@@ -67,6 +67,7 @@ export interface Shot {
   railFilterPicker?: 'open' | 'closed'; // View menu state before capture.
   escape?: boolean | number; // Number of Escape presses before other actions. `true` presses once.
   click?: string; // Control selector to press.
+  costTab?: 'Tools' | 'Subagents'; // Cost popover tab to select after the click pins it.
   hover?: string; // Control selector to hover until its hint opens.
   after?: string; // Control selector to press after capture.
   state?: 'first-project-empty' | 'first-project-draft';
@@ -721,12 +722,28 @@ export const SHOTS: Shot[] = [
         click: '.chips [data-metric="cost"]',
       },
       {
+        name: `${size}-cost-overheads-turn-tools`,
+        width,
+        escape: true,
+        costOverheads: true,
+        click: '.chips [data-metric="cost"]',
+        costTab: 'Tools' as const,
+      },
+      {
         name: `${size}-wait-warning-session`,
         width,
         escape: true,
         waitWarning: true,
         click: '.sessionstats [data-metric="cost"]',
       },
+      ...(['Tools', 'Subagents'] as const).map((costTab) => ({
+        name: `${size}-wait-warning-session-${costTab.toLowerCase()}`,
+        width,
+        escape: true,
+        waitWarning: true,
+        click: '.sessionstats [data-metric="cost"]',
+        costTab,
+      })),
       {
         name: `${size}-wait-warning-turn`,
         width,
@@ -1353,6 +1370,15 @@ export async function shoot(
       console.log(`${shot.name}.webp not written: ${shot.click}: ${String(error)}`);
       return;
     }
+    await page.evaluate(SETTLED);
+  }
+  if (shot.costTab) {
+    // Select the tab from the keyboard, as a reader moves along the strip.
+    const tabs = ['Usage', 'Tools', 'Subagents'];
+    await page.locator('.chippop.pinned .poptabs [aria-selected="true"]').focus({ timeout: 5_000 });
+    for (let at = 0; at < tabs.indexOf(shot.costTab); at++) await page.keyboard.press('ArrowRight');
+    // Return focus to the pinned figure, where the other cost captures hold it. The tab stays selected.
+    if (shot.click) await page.locator(shot.click).first().focus();
     await page.evaluate(SETTLED);
   }
   if (shot.hover) {

@@ -13,6 +13,8 @@ import type { SavedRailFilter } from './domain/rail-filters.ts';
 import type { RailStatus } from './turnrail.ts';
 import type {
   Turn,
+  UsageCounts,
+  UsageTools,
   TurnAgent,
   TurnAsk,
   TurnCommit,
@@ -1390,6 +1392,27 @@ export function cacheExpiryReturnTurn(): { turn: Turn; expiry: CacheExpiryFacts 
   return { turn, expiry };
 }
 
+// A part of some usage, with its context bands, as a tool kind's even part of its requests holds it.
+function usageShare(usage: Turn['usage'], share: number): Turn['usage'] {
+  const scale = (counts: UsageCounts): UsageCounts =>
+    Object.fromEntries(Object.entries(counts).map(([key, value]) => [key, value * share])) as unknown as UsageCounts;
+  const { byContextBand, ...counts } = usage;
+  return {
+    ...scale(counts),
+    ...(byContextBand
+      ? { byContextBand: Object.fromEntries(Object.entries(byContextBand).map(([band, held]) => [band, scale(held)])) }
+      : {}),
+  };
+}
+
+// Tool kinds from each kind's request count and its part of the usage.
+function fixtureTools(requests: number, kinds: [string, number, Turn['usage']][]): UsageTools {
+  return {
+    requests,
+    kinds: Object.fromEntries(kinds.map(([kind, count, usage]) => [kind, { requests: count, usage }])),
+  };
+}
+
 function costOverheadsParts() {
   const usage = (over: Partial<Turn['usage']>): Turn['usage'] => ({
     requests: 1,
@@ -1444,7 +1467,17 @@ function costOverheadsParts() {
     sessionTitle: 'Cost overheads',
     contextWindow: null,
     usage: returned,
-    usageParts: [{ ...part, usage: returned }],
+    // The one request read a file and a search result, so each holds half its cost.
+    usageParts: [
+      {
+        ...part,
+        usage: returned,
+        tools: fixtureTools(1, [
+          ['file read', 1, usageShare(returned, 0.5)],
+          ['search', 1, usageShare(returned, 0.5)],
+        ]),
+      },
+    ],
     responseIds: ['msg-return'],
     openingResponseId: 'msg-return',
     agents: [],
@@ -1496,7 +1529,21 @@ export function costOverheadsPayload(): Record<string, unknown> {
     s1: [
       ...sessionCostProjection(
         [
-          { agent: 'claude', role: 'main', ...part, usage: session },
+          {
+            agent: 'claude',
+            role: 'main',
+            ...part,
+            usage: session,
+            tools: fixtureTools(300, [
+              ['file read', 120, usageShare(session, 0.24)],
+              ['file edit', 60, usageShare(session, 0.17)],
+              ['test or build', 40, usageShare(session, 0.14)],
+              ['search', 50, usageShare(session, 0.08)],
+              ['git', 20, usageShare(session, 0.04)],
+              ['subagent launch', 4, usageShare(session, 0.02)],
+              ['other', 30, usageShare(session, 0.09)],
+            ]),
+          },
           { agent: 'claude', role: 'main', ...part, compactionEstimate: true, usage: compactions },
         ],
         false,
@@ -1621,8 +1668,18 @@ export function waitWarningPayload(): Record<string, unknown> {
   const waits = {
     requests: 42,
     timedOut: 30,
+    tools: { wait_agent: 36, write_stdin: 6 },
     usage: usage({ requests: 42, input: 60_000, cacheRead: 13_000_000, output: 9_000 }),
   };
+  // The wait requests read wait returns alone. Other requests read files, tests, Git and searches.
+  const tools = fixtureTools(120, [
+    ['wait', 42, waits.usage],
+    ['file read', 30, usage({ requests: 30, input: 150_000, cacheRead: 5_000_000, output: 40_000 })],
+    ['test or build', 20, usage({ requests: 20, input: 120_000, cacheRead: 4_000_000, output: 30_000 })],
+    ['git', 10, usage({ requests: 10, input: 50_000, cacheRead: 1_500_000, output: 10_000 })],
+    ['search', 6, usage({ requests: 6, input: 30_000, cacheRead: 1_000_000, output: 8_000 })],
+    ['other', 12, usage({ requests: 12, input: 90_000, cacheRead: 2_500_000, output: 25_000 })],
+  ]);
   const turn: Turn = {
     ...FIXTURE_TURNS[1],
     agent: 'codex',
@@ -1631,16 +1688,27 @@ export function waitWarningPayload(): Record<string, unknown> {
     sessionTitle: 'Subagent waits',
     contextWindow: part.contextWindow,
     usage: ran,
-    usageParts: [{ ...part, usage: ran, waits }],
+    usageParts: [{ ...part, usage: ran, waits, tools }],
     agents: [],
     files: [],
   };
-  const delegated = usage({ requests: 220, input: 1_400_000, cacheRead: 40_000_000, output: 380_000 });
+  // Three named children share the delegated work.
+  const child = (agentName: string, model: string, session: string, share: number) => ({
+    agent: 'codex',
+    role: 'delegated' as const,
+    scopeId: `source:/codex/sessions/rollout-2026-10-09T10-00-00-${session}.jsonl`,
+    agentName,
+    ...part,
+    model,
+    usage: usageShare(usage({ requests: 220, input: 1_400_000, cacheRead: 40_000_000, output: 380_000 }), share),
+  });
   const stats = {
     s1: [
       ...sessionCostProjection([
-        { agent: 'codex', role: 'main', ...part, usage: ran, waits },
-        { agent: null, role: 'delegated', scopeId: 'worker', ...part, usage: delegated },
+        { agent: 'codex', role: 'main', ...part, usage: ran, waits, tools },
+        child('code_review_1_npm_tests_astra', 'gpt-6-astra', '01a1535a-e7c6-7cc3-a9aa-9552803efb51', 0.03),
+        child('code_implement_1_npm_tests_sol', 'gpt-6.1-sol', '01a1503b-b2f2-7be2-a08f-fde25f58b552', 0.55),
+        child('code_fix_1_npm_tests_sol_deadlines', 'gpt-6.1-sol', '01a15289-b637-7f71-bce5-143c96986ad2', 0.42),
       ]).stats,
       ...sessionTurnStats({ turnCount: 1, firstTurnAt: turn.startedAt, lastTurnAt: turn.endedAt, compactionCount: 0 }),
     ],

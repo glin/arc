@@ -21,13 +21,15 @@ import type {
   SpendLedger,
   UsageCounts,
 } from './projectspend';
-import type { ReducerCompaction, UsageWaits } from './transcript';
+import type { ReducerCompaction, UsageTools, UsageWaits } from './transcript';
+import { TOOL_KINDS } from './domain/tool-kinds';
 import {
   RETAINED_CACHE_EXPIRY_RETURNS,
   RETAINED_COMPACTION_PARENTS,
   RETAINED_COMPACTIONS,
   RETAINED_REQUESTS,
 } from './parserstate';
+import { CLAUDE_TOOL_CALL_LIMIT } from './transcript';
 import type {
   ClaudePreviousTurn,
   ClaudeUsageReducerState,
@@ -71,6 +73,9 @@ const CLAUDE_STATE_KEYS = {
   currentTurnOutcome: true,
   requestEvents: true,
   modelProfile: true,
+  toolCalls: true,
+  pendingToolResults: true,
+  seenToolResults: true,
 } satisfies Record<keyof PersistedClaudeUsageReducerState, true>;
 
 const CODEX_STATE_KEYS = {
@@ -120,8 +125,8 @@ const CODEX_STATE_KEYS = {
   pendingCompactionBilling: true,
   recentResponseUsage: true,
   recentRequestEvents: true,
-  waitCallIds: true,
-  pendingWaitReturns: true,
+  toolCalls: true,
+  pendingToolReturns: true,
   compactionResponseIds: true,
   firstTurnAt: true,
   lastTurnAt: true,
@@ -222,7 +227,75 @@ function usageWaits(value: unknown): value is UsageWaits {
     value.requests > 0 &&
     nonNegativeInteger(value.timedOut) &&
     value.timedOut <= value.requests &&
+    (value.tools === undefined ||
+      dictionary(value.tools, (count) => nonNegativeInteger(count) && count > 0 && count <= Number(value.requests))) &&
     turnUsage(value.usage)
+  );
+}
+
+const TOOL_KIND_NAMES = new Set(TOOL_KINDS);
+
+// The kinds of the tool results one request read.
+function toolResultKinds(value: unknown): value is string[] {
+  return (
+    Array.isArray(value) && value.length > 0 && value.length <= 256 && value.every((kind) => TOOL_KIND_NAMES.has(kind))
+  );
+}
+
+// Fractional usage, as a tool kind's even part of its requests holds.
+function fractionalCounts(value: unknown): boolean {
+  return (
+    record(value) &&
+    (value.requests === undefined || nonNegative(value.requests)) &&
+    nonNegative(value.input) &&
+    nonNegative(value.cacheWrite1h) &&
+    nonNegative(value.cacheWrite5m) &&
+    (value.cacheWrite30m === undefined || nonNegative(value.cacheWrite30m)) &&
+    nonNegative(value.cacheRead) &&
+    nonNegative(value.output) &&
+    nonNegative(value.thinking)
+  );
+}
+
+function fractionalUsage(value: unknown): boolean {
+  if (!fractionalCounts(value)) return false;
+  const bands = (value as Record<string, unknown>).byContextBand;
+  return (
+    bands === undefined ||
+    (record(bands) &&
+      Object.entries(bands).every(
+        ([band, counts]) => (band === 'short' || band === 'long') && fractionalCounts(counts),
+      ))
+  );
+}
+
+function usageTools(value: unknown): value is UsageTools {
+  return (
+    record(value) &&
+    nonNegativeInteger(value.requests) &&
+    dictionary(
+      value.kinds,
+      (part, kind) =>
+        TOOL_KIND_NAMES.has(kind) &&
+        record(part) &&
+        nonNegativeInteger(part.requests) &&
+        part.requests <= Number(value.requests) &&
+        fractionalUsage(part.usage),
+    )
+  );
+}
+
+// The tool results one billed Codex request read.
+function codexReads(value: unknown): boolean {
+  return (
+    record(value) &&
+    Array.isArray(value.kinds) &&
+    value.kinds.length <= 256 &&
+    value.kinds.every((kind) => TOOL_KIND_NAMES.has(kind)) &&
+    Array.isArray(value.waitTools) &&
+    value.waitTools.length <= value.kinds.length &&
+    value.waitTools.every(nonEmptyText) &&
+    typeof value.timedOut === 'boolean'
   );
 }
 
@@ -268,6 +341,7 @@ function transcriptUsageEvent(value: unknown, expectedAgent: 'claude' | 'codex')
     (value.compactionsBefore === undefined || nonNegativeInteger(value.compactionsBefore)) &&
     (value.usageOrigin === undefined || value.usageOrigin === 'claude-advisor') &&
     (value.waits === undefined || usageWaits(value.waits)) &&
+    (value.toolResults === undefined || toolResultKinds(value.toolResults)) &&
     turnUsage(value.usage) &&
     nonEmptyText(value.requestKey)
   );
@@ -401,6 +475,26 @@ function claudeState(value: unknown, retain = RETAINED_REQUESTS): value is Claud
     ) ||
     !(value.toolListVersion === undefined || nonNegativeInteger(value.toolListVersion)) ||
     !(value.modelProfile === undefined || nullableText(value.modelProfile)) ||
+    !(
+      value.toolCalls === undefined ||
+      (Array.isArray(value.toolCalls) &&
+        value.toolCalls.length <= CLAUDE_TOOL_CALL_LIMIT &&
+        value.toolCalls.every(
+          (call) => record(call) && nonEmptyText(call.id) && TOOL_KIND_NAMES.has(call.kind as string),
+        ))
+    ) ||
+    !(
+      value.pendingToolResults === undefined ||
+      (Array.isArray(value.pendingToolResults) &&
+        value.pendingToolResults.length <= CLAUDE_TOOL_CALL_LIMIT &&
+        value.pendingToolResults.every((kind) => TOOL_KIND_NAMES.has(kind)))
+    ) ||
+    !(
+      value.seenToolResults === undefined ||
+      (Array.isArray(value.seenToolResults) &&
+        value.seenToolResults.length <= CLAUDE_TOOL_CALL_LIMIT &&
+        value.seenToolResults.every(nonEmptyText))
+    ) ||
     !nonNegativeInteger(value.closedTurns) ||
     typeof value.openTurn !== 'boolean' ||
     typeof value.openTurnAnswered !== 'boolean' ||
@@ -552,17 +646,29 @@ function codexState(value: unknown): value is CodexUsageReducerState {
         (item.matched === undefined || item.matched === true) &&
         (item.explicitSnapshot === undefined || item.explicitSnapshot === true) &&
         (item.suppressedSnapshot === undefined || transcriptUsageEvent(item.suppressedSnapshot, 'codex')) &&
-        (item.waitTimedOut === undefined || typeof item.waitTimedOut === 'boolean'),
+        (item.reads === undefined || codexReads(item.reads)),
     ) ||
-    !(value.waitCallIds === undefined || boundedIdentityList(value.waitCallIds)) ||
     !(
-      value.pendingWaitReturns === undefined ||
-      value.pendingWaitReturns === null ||
-      (record(value.pendingWaitReturns) &&
-        nonEmptyText(value.pendingWaitReturns.turnId) &&
-        nonNegativeInteger(value.pendingWaitReturns.count) &&
-        nonNegativeInteger(value.pendingWaitReturns.timedOut) &&
-        value.pendingWaitReturns.timedOut <= value.pendingWaitReturns.count)
+      value.toolCalls === undefined ||
+      (Array.isArray(value.toolCalls) &&
+        value.toolCalls.length <= CODEX_USAGE_ASSOCIATION_LIMIT &&
+        value.toolCalls.every(
+          (call) =>
+            record(call) &&
+            nonEmptyText(call.id) &&
+            TOOL_KIND_NAMES.has(call.kind as string) &&
+            nonEmptyText(call.tool),
+        ) &&
+        new Set(value.toolCalls.map((call) => (call as { id: string }).id)).size === value.toolCalls.length)
+    ) ||
+    !(
+      value.pendingToolReturns === undefined ||
+      value.pendingToolReturns === null ||
+      (record(value.pendingToolReturns) &&
+        nonEmptyText(value.pendingToolReturns.turnId) &&
+        codexReads({ ...value.pendingToolReturns, timedOut: false }) &&
+        nonNegativeInteger(value.pendingToolReturns.timedOut) &&
+        value.pendingToolReturns.timedOut <= (value.pendingToolReturns.waitTools as unknown[]).length)
     ) ||
     !Array.isArray(value.recentRequestEvents) ||
     value.recentRequestEvents.length > CODEX_USAGE_ASSOCIATION_LIMIT ||
@@ -747,6 +853,7 @@ function bucket(value: unknown): ProjectUsageBucket | null {
         value.usage.requests !== 0 ||
         value.compactionEstimate !== undefined)) ||
     (value.waits !== undefined && !usageWaits(value.waits)) ||
+    (value.tools !== undefined && !usageTools(value.tools)) ||
     !turnUsage(value.usage) ||
     !nonNegativeInteger(value.requests)
   ) {
@@ -775,6 +882,7 @@ function bucket(value: unknown): ProjectUsageBucket | null {
       ? { usageOrigin: value.usageOrigin }
       : {}),
     ...(value.waits === undefined ? {} : { waits: structuredClone(value.waits) }),
+    ...(value.tools === undefined ? {} : { tools: structuredClone(value.tools) }),
     usage: {
       requests: value.usage.requests,
       ...(value.usage.byContextBand === undefined ? {} : { byContextBand: structuredClone(value.usage.byContextBand) }),

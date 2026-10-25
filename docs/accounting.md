@@ -24,9 +24,13 @@ Session headings read lifetime spend independently of parsed timeline windows. `
 
 [`cacheWriteWarnings`](../extension/src/turncard.ts) owns cache-write thresholds and eligibility. Main and identified delegated scopes qualify separately. Never pool delegated identities. Compactions, supplemental usage, and advisor consultations stay outside this calculation.
 
-[`waitShareWarnings`](../extension/src/turncard.ts) owns wait-warning thresholds and requires complete, fully priced main usage. Delegated usage stays outside the denominator. Claude records no waits. A return with news also carries the parent's reply, so its request cost overstates pure waiting. Wait cost and cache-expiry cost remain separate.
+[`waitShareWarnings`](../extension/src/turncard.ts) owns wait-warning thresholds and requires Codex `wait_agent`, `wait`, or `write_stdin` returns, the `wait` kind of `arc cost --by-tool`. Only a `wait_agent` return can count as timed out. It requires complete, fully priced main usage. Delegated usage stays outside the denominator. Claude records no waits. A return with news also carries the parent's reply, so its request cost overstates pure waiting. Wait cost and cache-expiry cost remain separate.
 
 [`cacheRateDetail`](../extension/src/turncard.ts) owns cached-input warning thresholds. Percentages use input volume, including writes. Each identified delegated agent qualifies independently. These thresholds do not establish avoidable waste. [Arc cost figures](agent-cost-guide.md#reading-the-cache-percentage) owns the display explanation.
+
+### Tool attribution
+
+The Tools tab of a cost popover and `arc cost --by-tool` share the kind rules and the even split in [`domain/tool-kinds.ts`](../extension/src/domain/tool-kinds.ts). A Claude request reads the results recorded since the previous request. A Claude result whose call the reader never saw counts as `other`. A Codex request reads the outputs of its turn recorded before its billing record. Each reader keeps a bounded list of open calls and at most 256 results a request. A usage part holds each kind's even part of its requests' usage, so a kind's token figures can be fractional. Price a kind's usage band by band. The Waits row prices a request's even part, and the wait warning prices the whole request, so their dollars differ when one request read a wait return beside another result. Exported sessions carry no tool results, so an exported popover has no Tools tab.
 
 ## Context evidence
 

@@ -93,11 +93,13 @@ A **read-only launch policy** retains launch restrictions through session contin
 | **Warm cache** | A cache that recent request timing suggests remains reusable. | This is an inference, not a promise that the next request will hit the cache. |
 | **Cold cache** | A cache that request timing suggests needs another write. | This is an inference, not proof that the provider discarded it. |
 | **Cost added** (cache expiry) | What returns to an expired cache paid to resend context that a warm cache would have read, above the cache-read price for the same tokens. | New prompt text is not counted. It is smaller than the input cost of the return requests, which includes that text. |
-| **Wait share** | The share of the main agent's cost that went to requests reading a Codex subagent wait return. | It is attributed request cost, not pure waiting, because a return with a message or completion also carries the parent's reply. Claude records no waits. It never adds to a cache expiry's **Cost added**. |
+| **Wait share** | The share of the main agent's cost that went to requests reading a Codex wait return: `wait_agent`, `wait`, or `write_stdin`. | It is attributed request cost, not pure waiting, because a return with a message or completion also carries the parent's reply. Claude records no waits. It never adds to a cache expiry's **Cost added**. |
 | **Included above** | The cost-detail group for compactions and cache expiries already counted in the total. | Its rows are part of the total and are never added to it again. Each row leads with its count, and its value is money. |
 | **Cached-input share** | The share of recorded input tokens served from the prompt cache. | State the denominator in UI copy, for example **input tokens from cache**. Do not confuse it with the share of cost attributed to cached reads. |
 | **Next-turn starting price** | The estimated minimum price of the next request's existing context before new prompt text or output. | Its cached and uncached bounds depend on what the record can establish about cache reuse. Never say **floor** to the reader. |
 | **Estimated total** | A list-price estimate for supported recorded usage, Claude compaction estimates, identified Codex compaction usage, and supported supplemental Claude usage. | It is not an invoice. A partial total is a lower bound. |
+| **Cost hero** | The split bar under the warnings of a cost popover. It sets the main agent's cost against delegated work, each side with its models. | A turn that delegated nothing shows the main agent's model with no bar. |
+| **Usage**, **Tools**, **Subagents** (cost tabs) | The tabs of a pinned cost popover: the main agent's cost by usage category, by the tool result each request read, and delegated work by child session. | A hover shows Usage alone. The turn popover has no Subagents tab. A popover whose records hold no tool results has no Tools tab. |
 
 ## Code alignment
 

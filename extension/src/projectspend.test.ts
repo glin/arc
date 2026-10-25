@@ -113,7 +113,7 @@ import {
   type Compaction,
   type SessionRead,
 } from './transcript.ts';
-import { emptyUsage } from './agentspend.ts';
+import { addUsageTools, emptyUsage } from './agentspend.ts';
 import { CODEX_USAGE_ASSOCIATION_LIMIT, createCodexUsageLineReducer, emptyCodexUsageReducerState } from './codex.ts';
 import { tempDir } from './temproot.ts';
 
@@ -346,13 +346,72 @@ test('saved spend buckets keep subagent wait requests across a reload', () => {
   fs.writeFileSync(file, records.map((record) => JSON.stringify(record)).join('\n') + '\n');
   const current = indexSpendFile(undefined, file, 'workspace', createCodexUsageLineReducer, Date.parse(at(9))).record;
   const waits = (buckets: readonly ProjectUsageBucket[] | undefined) => buckets?.map((bucket) => bucket.waits);
-  const expected = [{ requests: 1, timedOut: 1, usage: { ...current.buckets[0].waits!.usage } }];
+  const expected = [
+    { requests: 1, timedOut: 1, tools: { wait_agent: 1 }, usage: { ...current.buckets[0].waits!.usage } },
+  ];
   assert.deepEqual(waits(current.buckets), expected);
   assert.equal(expected[0].usage.input, 2000);
+  // The request that read the wait return holds it as its one tool result.
+  const tools = (buckets: readonly ProjectUsageBucket[] | undefined) => buckets?.map((bucket) => bucket.tools);
+  assert.deepEqual(tools(current.buckets), [
+    { requests: 1, kinds: { wait: { requests: 1, usage: { ...current.buckets[0].waits!.usage } } } },
+  ]);
   saveSpendLedger(folder, 'workspace', [current]);
   const [loaded] = loadSpendLedger(folder, 'workspace').files;
   assert.deepEqual(waits(loaded.buckets), expected);
   assert.deepEqual(waits(loaded.lifetimeBuckets), expected);
+  assert.deepEqual(tools(loaded.buckets), tools(current.buckets));
+  assert.deepEqual(tools(loaded.lifetimeBuckets), tools(current.buckets));
+});
+
+test('saved spend buckets load after a correction retracts fractional tool usage', () => {
+  const folder = dir();
+  const file = path.join(folder, 'rollout-2026-09-26T00-00-00-retract.jsonl');
+  const at = (second: number) => new Date(Date.UTC(2026, 8, 26, 0, 0, second)).toISOString();
+  const records = [
+    { type: 'session_meta', timestamp: at(0), payload: { id: 'retract', source: 'cli', model_provider: 'openai' } },
+    { type: 'event_msg', timestamp: at(1), payload: { type: 'task_started', turn_id: 'turn' } },
+    { type: 'turn_context', timestamp: at(2), payload: { turn_id: 'turn', model: 'gpt-6-sol' } },
+    {
+      type: 'token_usage_record',
+      timestamp: at(3),
+      payload: {
+        thread_id: 'retract',
+        turn_id: 'turn',
+        response_id: 'only',
+        usage: { input_tokens: 100, cached_input_tokens: 0, output_tokens: 10 },
+      },
+    },
+    {
+      type: 'event_msg',
+      timestamp: at(4),
+      payload: {
+        type: 'token_count',
+        info: {
+          last_token_usage: { input_tokens: 100, cached_input_tokens: 0, output_tokens: 10 },
+          total_token_usage: { input_tokens: 100, cached_input_tokens: 0, output_tokens: 10 },
+        },
+      },
+    },
+  ];
+  fs.writeFileSync(file, records.map((record) => JSON.stringify(record)).join('\n') + '\n');
+  const current = indexSpendFile(undefined, file, 'workspace', createCodexUsageLineReducer, Date.parse(at(9))).record;
+  const toolResults = ['file read', 'search', 'git'];
+  const request = (requests: number, input: number, cacheRead: number) => ({
+    toolResults,
+    usage: { requests, input, cacheWrite1h: 0, cacheWrite5m: 0, cacheRead, output: 0, thinking: 0 },
+  });
+  for (const bucket of [current.buckets[0], current.lifetimeBuckets![0]]) {
+    for (let index = 0; index < 12; index++) addUsageTools(bucket, request(1, 0, 1));
+    addUsageTools(bucket, request(1, 30, 0));
+    for (let index = 0; index < 12; index++) addUsageTools(bucket, request(-1, 0, -1));
+  }
+  const kinds = current.buckets[0].tools!.kinds;
+  assert.deepEqual(Object.keys(kinds).sort(), ['file read', 'git', 'search']);
+  for (const part of Object.values(kinds)) assert.equal(part.usage.cacheRead, 0);
+  saveSpendLedger(folder, 'workspace', [current]);
+  const [loaded] = loadSpendLedger(folder, 'workspace').files;
+  assert.deepEqual(loaded?.buckets[0].tools, current.buckets[0].tools);
 });
 
 test('unconfirmed native spend keeps project totals unknown through a saved checkpoint', () => {

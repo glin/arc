@@ -1,4 +1,5 @@
 import type { SourceEnumeration } from './sessioncoverage';
+import { codexToolKind, nestedToolName, wrappedCommand } from './domain/tool-kinds';
 import type { InitialNameSubscription } from './sessionrename';
 import * as fs from 'node:fs';
 import { ExportLimitError, type ExportRelationshipLimits } from './exportlimits';
@@ -1513,15 +1514,17 @@ export interface CodexUsageReducerState {
     matched?: true;
     explicitSnapshot?: true;
     suppressedSnapshot?: UsageEvent;
-    // Set when this response read a `wait_agent` return. Its usage event carries it.
-    waitTimedOut?: boolean;
+    // The tool results this response read. Its usage event carries them.
+    reads?: CodexRequestReads;
   }>;
   recentRequestEvents: UsageEvent[];
-  // Open `wait_agent` call ids, newest last.
-  waitCallIds?: string[];
-  // The `wait_agent` returns since the last billing record, with the turn that recorded them. The
-  // next billing record of that turn read them.
-  pendingWaitReturns?: { turnId: string; count: number; timedOut: number } | null;
+  // Open tool calls, newest last, each with the kind `arc cost --by-tool` gives its result and
+  // the tool's name.
+  toolCalls?: { id: string; kind: string; tool: string }[];
+  // The tool results since the last billing record, with the turn that recorded them. The next
+  // billing record of that turn read them. `waitTools` names the tool of each wait return, and
+  // `timedOut` counts the `wait_agent` returns that timed out.
+  pendingToolReturns?: { turnId: string; kinds: string[]; waitTools: string[]; timedOut: number } | null;
   compactionResponseIds: string[];
   // The very first non-copied turn's startedAt, epoch milliseconds. Set once and never moved.
   firstTurnAt: number | null;
@@ -1993,9 +1996,49 @@ function sameCodexRequestUsage(left: TurnUsage, right: TurnUsage): boolean {
   );
 }
 
-// The wait share of one request that read `wait_agent` returns. `timedOut` is true when every return it read timed out.
-function codexRequestWaits(timedOut: boolean, usage: TurnUsage): NonNullable<UsageEvent['waits']> {
-  return { requests: 1, timedOut: timedOut ? 1 : 0, usage: { ...usage } };
+// The tool results one billed request read: the kind of each, the wait tool behind each wait
+// return, and whether every wait return it read timed out.
+export interface CodexRequestReads {
+  kinds: string[];
+  waitTools: string[];
+  timedOut: boolean;
+}
+
+// The usage event fields of one request's reads. A request that read a wait return carries its
+// whole usage as a wait.
+function codexReadFields(reads: CodexRequestReads, usage: TurnUsage): Pick<UsageEvent, 'waits' | 'toolResults'> {
+  return {
+    ...(reads.kinds.length ? { toolResults: [...reads.kinds] } : {}),
+    ...(reads.waitTools.length
+      ? {
+          waits: {
+            requests: 1,
+            timedOut: reads.timedOut ? 1 : 0,
+            tools: Object.fromEntries(reads.waitTools.map((tool) => [tool, 1])),
+            usage: { ...usage },
+          },
+        }
+      : {}),
+  };
+}
+
+// The reads an emitted request event carries.
+function eventReads(event: UsageEvent): CodexRequestReads {
+  return {
+    kinds: event.toolResults ?? [],
+    waitTools: Object.keys(event.waits?.tools ?? {}),
+    timedOut: event.waits?.timedOut === 1,
+  };
+}
+
+// One request's reads followed by the reads a repeated billing record adds, as
+// `arc cost --by-tool` appends them. The request timed out when every wait it read timed out.
+function mergeCodexReads(first: CodexRequestReads, added: CodexRequestReads): CodexRequestReads {
+  return {
+    kinds: [...first.kinds, ...added.kinds].slice(0, CODEX_REQUEST_RESULT_LIMIT),
+    waitTools: [...first.waitTools, ...added.waitTools].slice(0, CODEX_REQUEST_RESULT_LIMIT),
+    timedOut: (!first.waitTools.length || first.timedOut) && (!added.waitTools.length || added.timedOut),
+  };
 }
 
 function removeCodexRequest(event: UsageEvent): UsageEvent {
@@ -2008,6 +2051,9 @@ function removeCodexRequest(event: UsageEvent): UsageEvent {
           waits: {
             requests: -event.waits.requests,
             timedOut: -event.waits.timedOut,
+            ...(event.waits.tools
+              ? { tools: Object.fromEntries(Object.entries(event.waits.tools).map(([tool, count]) => [tool, -count])) }
+              : {}),
             usage: negated(event.waits.usage),
           },
         }
@@ -2016,8 +2062,8 @@ function removeCodexRequest(event: UsageEvent): UsageEvent {
   };
 }
 
-// The tool that waits for subagents. The `wait` tool waits for a code cell, not a subagent.
-const CODEX_WAIT_TOOL = 'wait_agent';
+// The most tool results one request's figures keep. A request reading more is unrealistic.
+const CODEX_REQUEST_RESULT_LIMIT = 256;
 
 // Whether a `wait_agent` return reports a timeout. A JSON output answers with its top-level
 // `timed_out`, so a subagent message that quotes the field does not count. Other output falls
@@ -2031,12 +2077,13 @@ function codexWaitTimedOut(text: string): boolean {
   }
 }
 
-// Tracks `wait_agent` calls and their returns in turns this session may own. A copied turn
-// records none. A return waits for the next billing record of its turn, which is the request
-// that read it. A turn whose ownership is unresolved keeps its returns until its own billing
-// record settles it. The `token_count` event just after a return belongs to the request that
-// made the call.
-function noteCodexWaitRecord(state: CodexUsageReducerState, kind: string, payload: Record<string, unknown>): void {
+// Tracks tool calls and their returns in turns this session may own, with the kind
+// `arc cost --by-tool` gives each result. A wait return is a `wait` result, and only a
+// `wait_agent` return can report a timeout. A copied turn records none. A return waits for the
+// next billing record of its turn, which is the request that read it. A turn whose ownership is
+// unresolved keeps its returns until its own billing record settles it. The `token_count` event
+// just after a return belongs to the request that made the call.
+function noteCodexToolRecord(state: CodexUsageReducerState, kind: string, payload: Record<string, unknown>): void {
   const turnId = state.currentTurnId;
   if (
     !turnId ||
@@ -2046,24 +2093,28 @@ function noteCodexWaitRecord(state: CodexUsageReducerState, kind: string, payloa
   )
     return;
   if (kind === 'function_call' || kind === 'custom_tool_call') {
-    const recordedName = str(payload.name) ?? '';
-    const name = recordedName === 'exec' ? (nestedToolName(payload.input) ?? recordedName) : recordedName;
     const id = str(payload.call_id);
-    if (name !== CODEX_WAIT_TOOL || !id) return;
-    const held = (state.waitCallIds ??= []);
-    if (held.includes(id)) return;
-    held.push(id);
+    if (!id) return;
+    const held = (state.toolCalls ??= []);
+    if (held.some((call) => call.id === id)) return;
+    const result = codexToolKind(str(payload.name) ?? '', payload.arguments ?? payload.input ?? null);
+    held.push({ id, kind: result.kind, tool: result.label });
     held.splice(0, Math.max(0, held.length - CODEX_USAGE_ASSOCIATION_LIMIT));
     return;
   }
   if (kind !== 'function_call_output' && kind !== 'custom_tool_call_output') return;
-  const index = state.waitCallIds?.indexOf(str(payload.call_id) ?? '') ?? -1;
+  const id = str(payload.call_id) ?? '';
+  const index = id ? (state.toolCalls?.findIndex((call) => call.id === id) ?? -1) : -1;
   if (index < 0) return;
-  state.waitCallIds!.splice(index, 1);
-  if (state.pendingWaitReturns?.turnId !== turnId) state.pendingWaitReturns = { turnId, count: 0, timedOut: 0 };
-  const held = state.pendingWaitReturns;
-  held.count++;
-  if (codexWaitTimedOut(outputText(payload.output))) held.timedOut++;
+  const [call] = state.toolCalls!.splice(index, 1);
+  if (state.pendingToolReturns?.turnId !== turnId)
+    state.pendingToolReturns = { turnId, kinds: [], waitTools: [], timedOut: 0 };
+  const held = state.pendingToolReturns;
+  if (held.kinds.length >= CODEX_REQUEST_RESULT_LIMIT) return;
+  held.kinds.push(call.kind);
+  if (call.kind !== 'wait') return;
+  held.waitTools.push(call.tool);
+  if (call.tool === 'wait_agent' && codexWaitTimedOut(outputText(payload.output))) held.timedOut++;
 }
 
 export function reduceCodexUsageEvents(state: CodexUsageReducerState, record: CodexUsageRecord): readonly UsageEvent[] {
@@ -2103,12 +2154,15 @@ function reduceCodexUsageEventsInner(state: CodexUsageReducerState, record: Code
     state.provider = str(payload.model_provider) ?? state.provider;
     return [];
   }
-  noteCodexWaitRecord(state, kind, payload);
+  noteCodexToolRecord(state, kind, payload);
   if (kind === 'token_usage_record') {
     const corrections: UsageEvent[] = [];
     const turnId = str(payload.turn_id);
-    const waitReturns = state.pendingWaitReturns?.turnId === turnId ? state.pendingWaitReturns : null;
-    state.pendingWaitReturns = null;
+    const returns = state.pendingToolReturns?.turnId === turnId ? state.pendingToolReturns : null;
+    state.pendingToolReturns = null;
+    const reads: CodexRequestReads | null = returns
+      ? { kinds: returns.kinds, waitTools: returns.waitTools, timedOut: returns.timedOut === returns.waitTools.length }
+      : null;
     const responseId = str(payload.response_id);
     const usage = codexRequestUsage(payload.usage);
     if (
@@ -2124,9 +2178,11 @@ function reduceCodexUsageEventsInner(state: CodexUsageReducerState, record: Code
         responseId,
         turnId,
         usage,
-        ...(waitReturns ? { waitTimedOut: waitReturns.timedOut === waitReturns.count } : {}),
+        ...(reads ? { reads } : {}),
       };
       if (!prior) state.recentResponseUsage.push(association);
+      // A repeated billing record adds its reads to those an unmatched association still holds.
+      else if (reads && !prior.matched) prior.reads = prior.reads ? mergeCodexReads(prior.reads, reads) : reads;
       state.recentResponseUsage.splice(
         0,
         Math.max(0, state.recentResponseUsage.length - CODEX_USAGE_ASSOCIATION_LIMIT),
@@ -2166,10 +2222,8 @@ function reduceCodexUsageEventsInner(state: CodexUsageReducerState, record: Code
             responseId,
             requestKey: `codex-response:${responseId}`,
             requestCountExact: false as const,
-            // The association keeps `waitTimedOut` so a later snapshot that replaces this event carries it too.
-            ...(association.waitTimedOut !== undefined
-              ? { waits: codexRequestWaits(association.waitTimedOut, held.suppressedSnapshot.usage) }
-              : {}),
+            // The association keeps `reads` so a later snapshot that replaces this event carries them too.
+            ...(association.reads ? codexReadFields(association.reads, held.suppressedSnapshot.usage) : {}),
           };
           restored.model ??= state.turnModels[turnId] ?? null;
           restored.contextBand = contextBandForRequest(
@@ -2190,18 +2244,23 @@ function reduceCodexUsageEventsInner(state: CodexUsageReducerState, record: Code
           } else corrections.push(restored);
         }
       }
-      // A snapshot that arrived before this billing record carries no wait data. A held event takes
-      // it in place. A released event is replaced under the same request key.
-      if (waitReturns && !state.compactionResponseIds.includes(responseId)) {
+      // A snapshot that arrived before this billing record carries no tool results. A repeated
+      // billing record adds its reads to those the request already carries. A held event takes
+      // them in place. A released event is replaced under the same request key.
+      if (reads && !state.compactionResponseIds.includes(responseId)) {
         const held = state.pendingRequests[turnId]?.find((event) => event.responseId === responseId);
         const snapshot =
           held ?? [...state.recentRequestEvents].reverse().find((event) => event.responseId === responseId);
-        if (snapshot && !snapshot.waits) {
-          const waits = codexRequestWaits(waitReturns.timedOut === waitReturns.count, snapshot.usage);
-          if (held) held.waits = waits;
-          else corrections.push(removeCodexRequest(snapshot), { ...snapshot, waits });
-          // An unmatched association keeps `waitTimedOut` for a later snapshot of this request.
-          if (association.matched) delete association.waitTimedOut;
+        const attributed = Boolean(snapshot?.waits || snapshot?.toolResults);
+        if (snapshot && (prior || !attributed)) {
+          const fields = codexReadFields(
+            attributed ? mergeCodexReads(eventReads(snapshot), reads) : reads,
+            snapshot.usage,
+          );
+          if (held) Object.assign(held, fields);
+          else corrections.push(removeCodexRequest(snapshot), { ...snapshot, ...fields });
+          // An unmatched association keeps `reads` for a later snapshot of this request.
+          if (association.matched) delete association.reads;
         }
       }
     }
@@ -2355,6 +2414,8 @@ function reduceCodexUsageEventsInner(state: CodexUsageReducerState, record: Code
       // Identified responses and recorded usage retain the following billing settings.
       state.pendingCompactionBilling = requestUsage || responseId ? state.compactionCount : null;
       if (requestUsage && responseId) {
+        // The tool results the compaction request read, from its billing record or the snapshot it replaces.
+        let reads: CodexRequestReads | undefined;
         if (responseId) {
           let association = state.recentResponseUsage.find((item) => item.responseId === responseId);
           if (!association) {
@@ -2398,6 +2459,8 @@ function reduceCodexUsageEventsInner(state: CodexUsageReducerState, record: Code
             if (!association.explicitSnapshot) association.suppressedSnapshot = pending;
             association.matched = true;
           }
+          const replaced = prior ?? pending;
+          reads = association.reads ?? (replaced?.toolResults ? eventReads(replaced) : undefined);
         }
         const event: UsageEvent = {
           timestamp: record.timestamp,
@@ -2424,6 +2487,7 @@ function reduceCodexUsageEventsInner(state: CodexUsageReducerState, record: Code
           usage: requestUsage,
           requestKey: responseId ? `codex-response:${responseId}` : `codex-compaction:${state.compactionCount}`,
           ...(responseId ? { responseId } : {}),
+          ...(reads ? codexReadFields(reads, requestUsage) : {}),
         };
         if (turnId && state.pendingOwnership[turnId]) (state.pendingRequests[turnId] ??= []).push(event);
         else corrections.push(event);
@@ -2742,12 +2806,12 @@ function reduceCodexUsageEventsInner(state: CodexUsageReducerState, record: Code
       ))
       ? { requestCountExact: false as const }
       : {}),
-    ...(identified?.waitTimedOut !== undefined ? { waits: codexRequestWaits(identified.waitTimedOut, usage) } : {}),
+    ...(identified?.reads ? codexReadFields(identified.reads, usage) : {}),
     usage,
     requestKey: provisional?.requestKey ?? `codex:${turnId}:${record.timestamp ?? ''}:${state.requestNumber}`,
     ...(responseId ? { responseId } : {}),
   };
-  if (identified) delete identified.waitTimedOut;
+  if (identified) delete identified.reads;
   if (responseId && state.compactionResponseIds.includes(responseId)) {
     if (association && !explicitResponseId) association.suppressedSnapshot = event;
     return [];
@@ -5845,7 +5909,7 @@ export function discoverCodexNewestTurn(
 }
 
 export interface CodexSessionParserState {
-  version: 25;
+  version: 27;
   // Text that subagents returned into this session's context.
   subagents: SubagentContextState;
   responseClock: CodexResponseClock;
@@ -5936,7 +6000,7 @@ function emptyCodexSessionParserState(meta: CodexSessionMeta | null): CodexSessi
   const replayBoundaryAt = meta?.replayBoundaryAt ?? null;
   const openingSessionId = meta?.sessionId ?? null;
   return {
-    version: 25,
+    version: 27,
     subagents: emptySubagentContext(),
     responseClock: emptyCodexResponseClock(),
     turns: [],
@@ -7735,7 +7799,7 @@ export function createCodexSessionReducer(
   restored?: CodexSessionParserState,
 ): CodexSessionReducer {
   const state = restored ? cloneParserState(restored) : emptyCodexSessionParserState(meta);
-  if (state.version !== 25) {
+  if (state.version !== 27) {
     throw new Error('Incompatible Codex parser state');
   }
   applyHiddenParserState(codexHiddenSlots(state), state.hidden, CODEX_HIDDEN_POLICY);
@@ -8279,45 +8343,6 @@ function wrappedToolInput(name: string, raw: string): Record<string, unknown> {
     }
   }
   return input;
-}
-
-// Extract a nested tool name when a custom exec wrapper names exactly one tool kind.
-// Completed items supply command and edit details. Calls without completed items retain this wrapper-derived name.
-export function nestedToolName(raw: unknown): string | null {
-  if (typeof raw !== 'string') {
-    return null;
-  }
-  const names = new Set<string>();
-  for (const match of raw.matchAll(/\btools\.([A-Za-z_][A-Za-z0-9_]*)\s*\(/g)) {
-    names.add(match[1]);
-  }
-  if (names.size !== 1) {
-    return null;
-  }
-  const [name] = names;
-  return name === 'exec_command' || name === 'shell_command' ? null : name;
-}
-
-// Some client command wrappers have no completed CommandExecution item. Their first
-// argument is still a JSON-compatible object, so read a directly written double-quoted
-// command without evaluating the surrounding JavaScript.
-export function wrappedCommand(raw: unknown): string | null {
-  if (typeof raw !== 'string') {
-    return null;
-  }
-  const match =
-    /\btools\.(?:exec_command|shell_command)\s*\(\s*\{\s*(?:"(?:cmd|command)"|cmd|command)\s*:\s*("(?:\\.|[^"\\])*")/.exec(
-      raw,
-    );
-  if (!match) {
-    return null;
-  }
-  try {
-    const command = JSON.parse(match[1]) as unknown;
-    return typeof command === 'string' && command.trim() ? command : null;
-  } catch {
-    return null;
-  }
 }
 
 // Record a subagent launch from the parent's tool-call arguments. Child work is read separately from its rollout.
