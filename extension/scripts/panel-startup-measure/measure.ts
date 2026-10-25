@@ -468,16 +468,19 @@ export function protectBaseline(tree: string): void {
     fs.writeFileSync(file, text.replace(needle, replacement));
   };
   const spawner = fs.readFileSync(path.join(tree, 'extension', 'src', 'agenthost.ts'), 'utf8');
-  const spawnDeclaration = spawner.match(
-    /export const spawnCli: Spawner = \(command, args, cwd, env(?:, agent(?:, cli)?)?\) => \{/,
-  );
-  if (!spawnDeclaration) throw new Error('The baseline lacks its agent launch boundary.');
-  edit(
-    'agenthost.ts',
-    spawnDeclaration[0],
-    spawnDeclaration[0] +
-      " if (process.env.ARC_MEASURE_BLOCK_AGENTS === '1') throw new Error('Agent connections are disabled in this measurement window.');",
-  );
+  // A baseline that already blocks agents keeps its own spawn signature.
+  if (!spawner.includes('ARC_MEASURE_BLOCK_AGENTS') && !spawner.includes('MEASUREMENT_ENVIRONMENT')) {
+    const spawnDeclaration = spawner.match(
+      /export const spawnCli: Spawner = \(command, args, cwd, env(?:, agent(?:, cli)?)?\) => \{/,
+    );
+    if (!spawnDeclaration) throw new Error('The baseline lacks its agent launch boundary.');
+    edit(
+      'agenthost.ts',
+      spawnDeclaration[0],
+      spawnDeclaration[0] +
+        " if (process.env.ARC_MEASURE_BLOCK_AGENTS === '1') throw new Error('Agent connections are disabled in this measurement window.');",
+    );
+  }
   edit(
     'panelhost.ts',
     'const stored = this.memento?.get(STATE_KEY);',

@@ -1015,6 +1015,25 @@ test('isolated startup protects baseline registrations without replacing their c
   }
 });
 
+test('isolated startup accepts a baseline that already blocks agents behind a newer spawn signature', () => {
+  const tree = tempDir('startup-baseline');
+  const source = path.join(tree, 'extension', 'src');
+  fs.mkdirSync(source, { recursive: true });
+  const original = {
+    'agenthost.ts':
+      "export const spawnCli: Spawner = (command, args, cwd, env, agent, cli, inherited) => { if (process.env[MEASUREMENT_ENVIRONMENT.blockAgents] === '1') throw new Error('blocked'); };",
+    'panelhost.ts':
+      'const stored = MEASUREMENT_ENVIRONMENT.state ? frozen() : this.memento?.get(STATE_KEY);\nconst identity = { measurementRun: run, };',
+    'extension.ts':
+      'const panel = registerPanel(context, root, workspaceCache); if (MEASUREMENT_ENVIRONMENT.state) panel.openInEditor();',
+    'diagnosticslog.ts': 'interface Options { measurementRun?: string; }',
+  };
+  for (const [name, text] of Object.entries(original)) fs.writeFileSync(path.join(source, name), text);
+  protectBaseline(tree);
+  for (const [name, text] of Object.entries(original))
+    assert.equal(fs.readFileSync(path.join(source, name), 'utf8'), text);
+});
+
 test('measurement cleanup limits build paths on Windows, macOS, and Linux', () => {
   for (const platform of ['win32', 'darwin', 'linux'] as const) {
     const paths = platform === 'win32' ? path.win32 : path.posix;
