@@ -19,6 +19,8 @@ The last command installs Playwright's bundled Chromium in the per-user Playwrig
 
 `npm install` reuses existing dependencies and updates the lockfile when needed. Replacing an in-use package still conflicts with running tests on Windows.
 
+The extension overrides the MSAL Node dependency under VSCE's `@azure/identity` to `7.1.1`. This version fixes [GHSA-xcx6-jx8p-x3h5](https://github.com/advisories/GHSA-xcx6-jx8p-x3h5).
+
 `esbuild` is native. Install dependencies on the operating system that runs the commands. A `node_modules` tree copied from another operating system will not run it.
 
 The source installer builds and installs the editor extension from local or temporary downloaded source. Its Claude plugin setup and legacy hook cleanup are described in [Snapshot installation](#snapshot-installation). [Isolated installer tests](#isolated-installer-tests) supplies the checkout plugin workflow. Validate the plugin and marketplace with `claude plugin validate --strict ./plugins/arc-hooks` and `claude plugin validate --strict .`.

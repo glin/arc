@@ -783,12 +783,19 @@
     "playwright-core": "^1.62.1",
     "tsx": "^4.0.0",
     "typescript": "^5.4.0",
-    "vite": "7.3.6",
-    "vitest": "4.1.11",
+    "vite": "7.3.7",
+    "vitest": "4.1.12",
     "yauzl": "^3.4.0"
   },
   "dependencies": {
     "marked": "^4.3.0",
     "preact": "^10.29.8"
+  },
+  "overrides": {
+    "@vscode/vsce": {
+      "@azure/identity": {
+        "@azure/msal-node": "7.1.1"
+      }
+    }
   }
 }
