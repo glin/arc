@@ -7,7 +7,7 @@
   "cli/test/run.test.ts": {
     "reason": "Standalone workers must retain real output, exit, cancellation, receipt ownership, and recovery across process boundaries. Held readers must preserve one worker and one outcome after recovery. Exhausted replacement retries must retain the worker's terminal observation.",
     "cases": 108,
-    "matricesSha256": "666f538ae238ed305fcae064e3ef97a5c1d5c9202dcc31c35402c2c0ae01ac01"
+    "matricesSha256": "f55b39ce7e9f0ca1a37f0f26cf6f9bda758b7d2e363036571596f2103339e44a"
   },
   "cli/test/smoke.bundled-a.test.mjs": {
     "reason": "Compiled CLI commands must reach session reads, comments, and saved defaults through an authenticated window channel.",
@@ -101,8 +101,8 @@
   },
   "extension/src/panel.layout.comments.test.ts": {
     "reason": "Comment controls must preserve native selection, focus, and saved comment interaction.",
-    "cases": 32,
-    "matricesSha256": "88b0863e001ffed443e57cd57ab9c4558af117ec26ab7fd5b666b905956bf3e1"
+    "cases": 33,
+    "matricesSha256": "b59aebee1fe44a267eeadd96f6882a6485074e0af9fdcde5d7ef7bb6b3e1175d"
   },
   "extension/src/panel.layout.heading.test.ts": {
     "reason": "Session headings must retain accessible controls and browser interaction across responsive states.",

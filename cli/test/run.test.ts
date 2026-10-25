@@ -4621,10 +4621,15 @@ test.each([
       message: { role: 'user', content: parsed.prompt },
     }) + '\n';
   let stdout = -1;
+  let started!: () => void;
+  const starting = new Promise<void>((resolve) => {
+    started = resolve;
+  });
   vi.mocked(childProcess.spawn).mockImplementationOnce((_command, _args, settings) => {
     stdout = (settings.stdio as number[])[1];
     fs.writeFileSync(file, original);
     fs.utimesSync(file, 1_000_000_000, 1_000_000_000);
+    started();
     return child;
   });
   const append = state.includes('append');
@@ -4638,7 +4643,10 @@ test.each([
   let clock = Date.now();
   const runtime = { now: () => clock, identity: async () => null, yield: async () => duringYield() };
   const supervised = superviseStandalone(receipts, launch.launchId, false, bounds, runtime);
-  await vi.waitFor(() => assert.equal(receipts.standaloneSession(launch.launchId), options.sessionHint));
+  await starting;
+  // Startup reads one bounded slice on each 100 ms identity tick.
+  await vi.advanceTimersByTimeAsync(Math.ceil(Buffer.byteLength(original) / bounds.readBytes) * 100);
+  assert.equal(receipts.standaloneSession(launch.launchId), options.sessionHint);
   const initial = state.startsWith('initial');
   if (!initial) {
     await vi.advanceTimersByTimeAsync(options.deadlineMs);
@@ -5482,16 +5490,36 @@ test.each(['done', 'missing'] as const)(
       return child;
     });
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    const timeout = globalThis.setTimeout;
+    let paused!: () => void;
+    const nextPause = () =>
+      new Promise<void>((resolve) => {
+        paused = resolve;
+      });
+    let polling = nextPause();
+    vi.spyOn(globalThis, 'setTimeout').mockImplementation(((
+      callback: () => void,
+      milliseconds?: number,
+      ...args: unknown[]
+    ) => {
+      const timer = timeout(callback, milliseconds, ...args);
+      // The producer arms its registry poll only after draining the current log snapshot.
+      if (milliseconds === 2_000) paused();
+      return timer;
+    }) as typeof setTimeout);
     let finished = false;
     const pending = produceStandaloneOutput(receipts, launch.launchId).then(() => {
       finished = true;
     });
     try {
-      await vi.waitFor(() => assert.equal(fs.readFileSync(options.logAlias!).equals(first), true));
+      await Promise.race([polling, pending]);
+      assert.equal(fs.readFileSync(options.logAlias!).equals(first), true);
       assert.equal(owner().state, 'capturing');
       rows = ending === 'done' ? [{ ...row, state: 'done' }] : [];
+      polling = nextPause();
       await vi.advanceTimersByTimeAsync(2_000);
-      await vi.waitFor(() => assert.equal(fs.readFileSync(options.logAlias!).equals(final), true));
+      await Promise.race([polling, pending]);
+      assert.equal(fs.readFileSync(options.logAlias!).equals(final), true);
       if (ending === 'done') {
         assert.equal(owner().state, 'finished', 'Capture must finish after the done snapshot and final drain.');
         await pending;
@@ -5500,8 +5528,10 @@ test.each(['done', 'missing'] as const)(
       } else {
         assert.equal(owner().state, 'capturing', 'Missing registry rows must retain capture.');
         for (let iteration = 0; iteration < 2; iteration++) {
+          polling = nextPause();
           await vi.advanceTimersByTimeAsync(2_000);
-          await vi.waitFor(() => assert.equal(snapshots.length, iteration + 3));
+          await Promise.race([polling, pending]);
+          assert.equal(snapshots.length, iteration + 3);
           assert.equal(owner().state, 'capturing', 'Missing registry rows must retain capture.');
           assert.equal(finished, false);
         }
@@ -5523,12 +5553,10 @@ test.each(['done', 'missing'] as const)(
       assert.equal((receipts.result(launch.launchId, frozen.eventId) as any).text, 'Frozen response');
     } finally {
       rows = [{ ...row, state: 'stopped' }];
-      for (let iteration = 0; iteration < 6; iteration++) {
-        if (finished) break;
+      await Promise.race([polling, pending]);
+      if (!finished) {
         await vi.advanceTimersByTimeAsync(2_000);
-        await vi.waitFor(() => assert.ok(finished || snapshots.length > iteration));
       }
-      assert.equal(finished, true, 'Producer cleanup exceeded six clock advances.');
       await pending;
     }
   },

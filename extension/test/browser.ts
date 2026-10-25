@@ -30,7 +30,25 @@ let browserLaunch: Promise<Browser | null> | null = null;
 
 // Each test has a fresh context, while the process shares browser startup work.
 export async function browserOrNone(): Promise<TestBrowser | null> {
-  browserLaunch ??= launchBrowserOrNone();
+  if (!browserLaunch) {
+    const launch = launchBrowserOrNone();
+    browserLaunch = launch;
+    void launch.then(
+      (browser) => {
+        const disconnected = () => {
+          if (browserLaunch !== launch) return;
+          browserLaunch = null;
+          // Closing a disconnected browser releases its shared launch slot.
+          void browser?.close().catch(() => {});
+        };
+        browser?.once('disconnected', disconnected);
+        if (!browser || !browser.isConnected()) disconnected();
+      },
+      () => {
+        if (browserLaunch === launch) browserLaunch = null;
+      },
+    );
+  }
   const browser = await browserLaunch;
   if (!browser) {
     return null;

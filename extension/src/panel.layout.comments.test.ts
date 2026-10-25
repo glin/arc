@@ -1,8 +1,10 @@
 // Browser checks for comment marks, quote highlights, and editing.
 // Shared measurement helpers live in `../test/layout.ts`.
 
-import { test } from 'vitest';
+import { test, vi } from 'vitest';
 import assert from 'node:assert';
+import { EventEmitter } from 'node:events';
+import type { Browser } from 'playwright-core';
 import { browserOrNone, SETTLED } from '../test/browser.ts';
 import { RAIL_MIN_WIDTH } from './turnview.ts';
 import { renderRichMarkdown } from './richtext.ts';
@@ -47,6 +49,54 @@ import {
   MENU_BOX,
   MenuBox,
 } from '../test/layout.ts';
+
+test('browser fixture replaces a disconnected browser without retrying the failed page', async () => {
+  const channels = await import('../test/browserchannels.mjs');
+  const browsers = [0, 1].map(() => {
+    let connected = true;
+    const page = { clock: { install: vi.fn<() => void>(), resume: vi.fn<() => void>() } };
+    const browser = Object.assign(new EventEmitter(), {
+      isConnected: () => connected,
+      disconnect: (): void => {
+        connected = false;
+        browser.emit('disconnected');
+      },
+      close: vi.fn<() => Promise<void>>(async () => {
+        browser.disconnect();
+      }),
+      newContext: vi.fn<() => Promise<object>>(async () => {
+        if (!connected) throw new Error('browser has been closed');
+        return { newPage: async () => page, close: vi.fn<() => void>() };
+      }),
+    });
+    return browser;
+  });
+  const launch = vi.spyOn(channels, 'launchAnyBrowser');
+  launch.mockResolvedValueOnce({ browser: browsers[0] as unknown as Browser, channel: undefined });
+  launch.mockResolvedValueOnce(null);
+  launch.mockResolvedValueOnce({ browser: browsers[1] as unknown as Browser, channel: undefined });
+  try {
+    const first = (await browserOrNone())!;
+    await first.newPage();
+    browsers[0].disconnect();
+    await assert.rejects(first.newPage(), /browser has been closed/);
+    await first.close();
+    assert.equal(await browserOrNone(), null);
+    const next = await Promise.all([browserOrNone(), browserOrNone()]);
+    try {
+      assert.equal(launch.mock.calls.length, 3, 'The helper retained the failed launch or launched twice.');
+      await Promise.all(next.map((browser) => browser!.newPage()));
+      assert.equal(browsers[0].newContext.mock.calls.length, 2, 'The helper retried the failed page.');
+      assert.equal(browsers[1].newContext.mock.calls.length, 2);
+      assert.equal(browsers[0].close.mock.calls.length, 1, 'The disconnected browser retained its launch slot.');
+    } finally {
+      await Promise.all(next.map(async (browser) => browser?.close()));
+    }
+  } finally {
+    await Promise.all(browsers.map((browser) => browser.close()));
+    launch.mockRestore();
+  }
+});
 
 test(
   'disclosure selection handoff retains structure and heading comments survive closing and refresh',
