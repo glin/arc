@@ -30,7 +30,7 @@ Decline prevents unreadable questions from blocking the child. Unrelated updates
 
 Sending a prompt answers live open requests first, so the prompt does not wait behind them. It reports that the reader answered in the next message, separately from refusal. Saved recovered questions are excluded. Send’s visible explanation, accessible name, and announcement disclose this behavior.
 
-Native radio and checkbox colors depend on VS Code’s body theme class. Check them in the [isolated editor](development.md#isolated-extension-host). A standalone browser lacks that class.
+Native radio and checkbox colors depend on VS Code’s body theme class. Check them in the [isolated editor](isolated-editor.md#isolated-extension-host). A standalone browser lacks that class.
 
 Arriving requests never take focus or scroll the page. Successful answers, agent-side resolution, stopped turns, or child exit remove live cards. Captured unanswered questions remain recoverable.
 

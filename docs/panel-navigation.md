@@ -94,7 +94,7 @@ Show session details resolves its named session from every session the panel kno
 
 The Arc tab is an editor tab backed by a webview panel. Shared extension state lets another or restored tab open the same session. Obsolete restored options require a replacement in the same column.
 
-Hosting changes require checks of new and restored tabs in the [isolated editor](development.md#isolated-extension-host). Browser tests check requested groups but cannot read options stored for an existing tab.
+Hosting changes require checks of new and restored tabs in the [isolated editor](isolated-editor.md#isolated-extension-host). Browser tests check requested groups but cannot read options stored for an existing tab.
 
 ## Response link and citation contracts
 

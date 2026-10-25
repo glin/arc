@@ -8,7 +8,7 @@ Arc-owned children receive their immutable private CLI launcher directory before
 
 Both private launchers set `ELECTRON_RUN_AS_NODE=1` and run their release's `cli/arc.cjs` with that binary. Extensionless `arc` serves POSIX shells and Git Bash. `arc.cmd` serves Windows command shells. Fresh, resumed, draft, idle, recovery, CLI-routed, and rename-only children share this environment.
 
-Unavailable private tools refuse launch. Trusted remote children use commands on their execution host. Untrusted windows refuse launch. Watch builds supply development launchers without immutable package identity. [Bundled tools](development.md#bundled-tools) defines complete development builds.
+Unavailable private tools refuse launch. Trusted remote children use commands on their execution host. Untrusted windows refuse launch. Watch builds supply development launchers without immutable package identity. [Bundled tools](installation.md#bundled-tools) defines complete development builds.
 
 ## Launch selection
 

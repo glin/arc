@@ -1,6 +1,6 @@
 # Settings
 
-Search for **Arc** in VS Code settings. [`development.md`](development.md) documents environment overrides and performance capture.
+Search for **Arc** in VS Code settings. [Development](development.md#environment-overrides) documents environment overrides. [Performance diagnostics](performance.md#performance-capture) documents performance capture.
 
 | Setting | Default | Effect |
 | --- | --- | --- |
