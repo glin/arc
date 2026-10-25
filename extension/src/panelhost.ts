@@ -9,7 +9,7 @@ import {
   type SourceEnumeration,
 } from './sessioncoverage';
 import { cacheLifetimeRefusal, launchPolicy } from './launchpolicy';
-import { scopedLaunchCwd } from './repositoryscope';
+import { scopedLaunchCwd, startingWorktree } from './repositoryscope';
 import { SessionFilterRequests, FILTER_LIMITS, type FilterOperation } from './sessionfilter';
 import {
   listingQueryError,
@@ -779,8 +779,22 @@ function pendingIn(manifest: Manifest | null, filePath: string): ManifestEntry |
 
 // Ordinary response links open local paths with optional line ranges.
 // Explicit file citations retain literal absolute paths and open only after a press.
-async function openLink(href: string, column: vscode.ViewColumn, literal = false): Promise<void> {
-  if (literal && !nativeCitationPath(href, process.platform)) return;
+async function openLink(
+  href: string,
+  column: vscode.ViewColumn,
+  literal: boolean | 'directory' = false,
+): Promise<void> {
+  if (
+    literal &&
+    !nativeCitationPath(href, process.platform) &&
+    !(
+      literal === 'directory' &&
+      process.platform === 'win32' &&
+      !/[\u0000-\u001f\u007f]/.test(href) &&
+      /^(?:\\\\|\/\/)[^\\/]+[\\/][^\\/]+(?:[\\/]|$)/.test(href)
+    )
+  )
+    return;
   if (!literal && /^https?:\/\//i.test(href)) {
     await vscode.env.openExternal(vscode.Uri.parse(href));
     return;
@@ -817,11 +831,15 @@ async function openLink(href: string, column: vscode.ViewColumn, literal = false
     }
     try {
       if (stat.type & vscode.FileType.Directory) {
-        if (literal) {
+        if (literal === true) {
           void vscode.window.showInformationMessage(`Arc: ${target} is a folder.`);
           return;
         }
         await vscode.commands.executeCommand('revealInExplorer', uri);
+        return;
+      }
+      if (literal === 'directory') {
+        void vscode.window.showInformationMessage(`Arc: ${target} is not a folder.`);
         return;
       }
       if (literal && !(stat.type & vscode.FileType.File)) {
@@ -865,7 +883,9 @@ async function openLink(href: string, column: vscode.ViewColumn, literal = false
       failure ??= `Arc: did not open ${uri.fsPath}. ${detail}`;
     }
   }
-  void vscode.window.showInformationMessage(failure ?? `Arc: no file at ${target}.`);
+  void vscode.window.showInformationMessage(
+    failure ?? (literal === 'directory' ? `Arc: no folder at ${target}.` : `Arc: no file at ${target}.`),
+  );
 }
 
 // Open a response image in the editor's viewer. imagePathFor checks the path
@@ -3940,6 +3960,9 @@ export class PanelProvider implements vscode.Disposable {
       () => this.repositoryScopeChanged(),
       Date.now,
       (decision) => this.loadingLine.scopeDecision(decision),
+      () => {
+        void this.refresh(true, true, false, true);
+      },
     );
   }
 
@@ -9426,8 +9449,13 @@ export class PanelProvider implements vscode.Disposable {
         const hostSession = this.hostSessions?.get(host) ?? this.showing;
         const hostPreviousSession = this.hostPreviousSessions?.get(host) ?? previousSelection;
         const hostDrawn = drawnSessionCards(this.cards, hostSession);
-        // Only the selected row carries its full name and parent relationship.
+        // Only the selected row carries its full name, parent relationship, and starting worktree.
         const hostParent = this.parentOfShown(hostSession);
+        const startWorktree = startingWorktree(
+          sessions.find((session) => session.sessionId === hostSession)?.cwd,
+          this.folders()[0],
+          this.repositoryScope?.checkoutSnapshot?.() ?? [],
+        );
         // Omit `railName` from general session rows. Session-list cards read it through the separate session-list payload.
         const hostRows = this.sessionRows.map(({ railName: _railName, ...row }) => {
           const full = row.id === hostSession ? (fullLabels.get(row.id) ?? row.label) : row.label;
@@ -9435,6 +9463,7 @@ export class PanelProvider implements vscode.Disposable {
             ...row,
             ...(full === row.label ? {} : { fullLabel: full }),
             ...(row.id === hostSession && hostParent ? { parent: hostParent } : {}),
+            ...(row.id === hostSession && startWorktree ? { startWorktree } : {}),
             shown: row.id === hostSession,
           };
         });
@@ -15172,6 +15201,9 @@ export class PanelProvider implements vscode.Disposable {
             return;
           }
           void this.loadOlderHistory(showing);
+        },
+        openDirectory: async (msg) => {
+          await openLink(msg.path, this.column(), 'directory');
         },
         openLink: async (msg) => {
           if ('destination' in msg) {

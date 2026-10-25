@@ -1737,6 +1737,74 @@ const LONG_NAME =
   'get a sol high review too then /ship it if it makes sense. also see claude sesion 10d8aebf-803c-465d-b2ed-365386af7d7c ' +
   '/close-session and archive it if everyhthing there is done, you were taking over (urgent)';
 
+test('starting worktree links stay passive in hints and activate exact pinned destinations through updates', async (t) => {
+  const browser = await browserOrNone();
+  if (!browser) {
+    t.skip('A browser is required');
+    return;
+  }
+  const page = await browser.newPage();
+  try {
+    await page.setContent(themed(pageHtml()));
+    const payload = renderPayload() as Payload;
+    const path = 'C:/Trees/é space#L10';
+    payload.sessions[0].fullLabel = 'Name '.repeat(820);
+    payload.sessions[0].startWorktree = { name: 'é space#L10', path };
+    await post(page, payload);
+    const heading = page.locator('#list button.session').first();
+    const pop = page.locator('#chippop');
+    await heading.focus();
+    await page.locator('#hintpop').waitFor({ state: 'visible' });
+    assert.match((await page.locator('#hintpop .hintdetail').textContent())!, /Started in é space#L10/);
+    assert.equal(await page.locator('#hintpop a').count(), 0);
+    await page.keyboard.press('Enter');
+    await pop.waitFor({ state: 'visible' });
+    const link = pop.locator('a.sessionworktreelink');
+    assert.equal(await pop.getAttribute('role'), 'dialog');
+    assert.equal(await pop.locator('.sessionworktreedestination').textContent(), path);
+    await page.keyboard.press('Tab');
+    await page.waitForFunction(() => document.activeElement?.classList.contains('sessionworktreelink'));
+    await page.waitForFunction(() => document.querySelector<HTMLElement>('#chippop')!.scrollTop > 0);
+    await page.evaluate('window.__posted.length = 0');
+    await page.keyboard.press('Enter');
+    await link.click();
+    assert.deepEqual(await page.evaluate('window.__posted.filter(m => m.type === "openDirectory")'), [
+      { type: 'openDirectory', path },
+      { type: 'openDirectory', path },
+    ]);
+    payload.sessions[0].fullLabel = 'Renamed session';
+    await post(page, payload);
+    assert.equal(await link.evaluate((node) => node === document.activeElement), true);
+    assert.equal(await pop.locator('.chippopname').textContent(), 'Renamed session');
+    await page.evaluate(() => {
+      const node = document.querySelector('.sessionworktreedestination')!;
+      const range = document.createRange();
+      range.selectNodeContents(node);
+      const selection = getSelection()!;
+      selection.removeAllRanges();
+      selection.addRange(range);
+    });
+    assert.equal(await page.evaluate(() => getSelection()!.toString()), path);
+    await page.evaluate(() => getSelection()!.removeAllRanges());
+    await link.focus();
+    delete payload.sessions[0].startWorktree;
+    await post(page, payload);
+    assert.equal(await pop.locator('.sessionworktree').count(), 0);
+    assert.equal(await pop.evaluate((node) => node.contains(document.activeElement)), true);
+    await page.keyboard.press('Escape');
+    await pop.waitFor({ state: 'hidden' });
+    assert.equal(await heading.evaluate((node) => node === document.activeElement), true);
+    await post(page, payload);
+    await heading.click();
+    await pop.waitFor({ state: 'visible' });
+    assert.equal(await pop.locator('.sessionworktree').count(), 0);
+    await page.locator('#prompt').click();
+    await pop.waitFor({ state: 'hidden' });
+  } finally {
+    await browser.close();
+  }
+});
+
 test('a press on the session heading pins its whole name open, and the chip close rules shut it', async (t) => {
   const browser = await browserOrNone();
   if (!browser) {

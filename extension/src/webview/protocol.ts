@@ -174,6 +174,7 @@ export interface PanelSessionRow {
   id: string;
   label: string;
   fullLabel?: string;
+  startWorktree?: { name: string; path: string };
   persisted?: boolean;
   agent: string;
   // The agent key and session id determine the resume command wording.
@@ -473,6 +474,7 @@ export type PanelToHost =
   | { type: 'search'; text: string; retained?: boolean }
   | { type: 'loadOlder'; session: string; token: string }
   | { type: 'openLink'; href: string; beside: boolean }
+  | { type: 'openDirectory'; path: string }
   | { type: 'openLink'; destination: FileCitationDestination; beside: boolean }
   | { type: 'openVisualization'; path: string }
   | { type: 'openImage'; path: string; beside: boolean }
@@ -1355,6 +1357,8 @@ export function parsePanelToHost(raw: unknown): PanelToHost | null {
       return { type: 'search', text: textOr(m.text, ''), ...(m.retained === true ? { retained: true } : {}) };
     case 'loadOlder':
       return isString(m.session) ? { type: 'loadOlder', session: m.session, token: textOr(m.token, '') } : null;
+    case 'openDirectory':
+      return isString(m.path) ? { type: 'openDirectory', path: m.path } : null;
     case 'openLink':
       if (m.destination !== undefined) {
         const destination = record(m.destination);
@@ -1633,6 +1637,8 @@ export function dispatchPanelToHost<R>(message: PanelToHost, handlers: PanelToHo
       return handlers.search(message);
     case 'loadOlder':
       return handlers.loadOlder(message);
+    case 'openDirectory':
+      return handlers.openDirectory(message);
     case 'openLink':
       return handlers.openLink(message);
     case 'openVisualization':

@@ -112,6 +112,28 @@ function rootsEqual(left: string[], right: string[]): boolean {
   );
 }
 
+// Opening folders identify checkouts independently of later shell destinations.
+export function startingWorktree(
+  cwd: string | undefined,
+  defaultFolder: string | undefined,
+  checkouts: readonly string[],
+): { name: string; path: string } | undefined {
+  const owner = (folder: string | undefined) =>
+    folder
+      ? checkouts.reduce<string | undefined>(
+          (best, root) =>
+            isInside(folder, [root]) && (!best || rootKey(root).length > rootKey(best).length) ? root : best,
+          undefined,
+        )
+      : undefined;
+  const opening = owner(cwd);
+  const home = owner(defaultFolder);
+  if (!opening || !home || rootKey(opening) === rootKey(home)) return undefined;
+  const separators = process.platform === 'win32' ? /[\\/]+/ : /\/+/;
+  const name = opening.split(separators).filter(Boolean).pop() || opening;
+  return { name, path: opening };
+}
+
 // Resolves the registered worktrees of the repositories containing the open folders.
 // Listing stays synchronous: it uses the last successful answer for each folder while Git
 // refreshes in the background. Each folder keeps its raw Git answer, and the published roots leave out a registered worktree nested
@@ -127,6 +149,8 @@ export class RepositoryScope {
   // ancestor hid still needs two answers that omit it.
   private retained: string[] = [];
   private rootsByFolder = new Map<string, string[]>();
+  private checkoutsByFolder = new Map<string, string[]>();
+  private checkouts: string[] = [];
   private ready = false;
   private revision = 0;
   private generation = 0;
@@ -144,7 +168,12 @@ export class RepositoryScope {
     private readonly onChanged: () => void,
     private readonly now: () => number = Date.now,
     private readonly report: (decision: RepositoryScopeDecision) => void = () => {},
+    private readonly onCheckoutsChanged: () => void = () => {},
   ) {}
+
+  checkoutSnapshot(): readonly string[] {
+    return this.checkouts;
+  }
 
   snapshot(folders: string[]): RepositoryScopeSnapshot {
     const nextFolders = uniqueRoots(folders);
@@ -155,6 +184,10 @@ export class RepositoryScope {
       this.folders = nextFolders;
       this.roots = nextFolders;
       this.retained = nextFolders;
+      this.checkouts = [];
+      for (const key of this.checkoutsByFolder.keys()) {
+        if (!nextFolderKeys.has(key)) this.checkoutsByFolder.delete(key);
+      }
       for (const key of this.rootsByFolder.keys()) {
         if (!nextFolderKeys.has(key)) {
           this.rootsByFolder.delete(key);
@@ -294,6 +327,18 @@ export class RepositoryScope {
             held ? uniqueRoots([...roots, ...prior.filter((root) => held.has(rootKey(root)))]) : roots,
           );
         }
+        for (const answer of answers) {
+          if (answer.stdout === null) continue;
+          const key = rootKey(answer.folder);
+          const prior = this.checkoutsByFolder.get(key) ?? [];
+          this.checkoutsByFolder.set(
+            key,
+            uniqueRoots([...parseWorktreeRoots(answer.stdout), ...prior.filter((root) => held?.has(rootKey(root)))]),
+          );
+        }
+        const checkouts = uniqueRoots([...this.checkoutsByFolder.values()].flat());
+        const identitiesMoved = !rootsEqual(checkouts, this.checkouts);
+        this.checkouts = checkouts;
         // Removal confirmation and failed-read retention above read the raw answers and the retained roots. Only the published roots
         // leave out nested ones.
         this.retained = next;
@@ -324,6 +369,8 @@ export class RepositoryScope {
         }
         if (!priorReady || moved) {
           this.onChanged();
+        } else if (identitiesMoved) {
+          this.onCheckoutsChanged();
         }
       },
       () => {

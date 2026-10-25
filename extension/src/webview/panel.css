@@ -3932,6 +3932,25 @@ button.cctx:hover {
   line-height: 1.4;
   pointer-events: none;
 }
+.hintprose .hintdetail,
+.sessionworktree {
+  overflow-wrap: anywhere;
+}
+.sessionworktreelabel {
+  white-space: nowrap;
+}
+.sessionworktreelink {
+  color: var(--vscode-textLink-foreground);
+  text-decoration: none;
+  cursor: pointer;
+}
+.sessionworktreelink:hover {
+  text-decoration: underline;
+}
+.sessionworktreedestination {
+  color: var(--idle);
+  overflow-wrap: anywhere;
+}
 .hinttitle {
   overflow-wrap: anywhere;
   font-weight: 600;

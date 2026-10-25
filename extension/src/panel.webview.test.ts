@@ -1,4 +1,10 @@
 import { commitSourceStamp } from './transcript';
+import {
+  startingWorktree,
+  RepositoryScope,
+  REPOSITORY_SCOPE_REFRESH_MS,
+  REPOSITORY_SCOPE_CONFIRM_MS,
+} from './repositoryscope';
 import { RepositoryCommits } from './gitcommits';
 import { commitCard, landingCard } from './turncard';
 import { groupCommitRows } from './view/card-presentation';
@@ -166,8 +172,26 @@ test('response citation presses open external literal files without workspace or
   await open(`${outside}/folder`, 2, true);
   assert.match(notices.pop()!, /is a folder/);
   assert.equal(commands.length, 0);
+  for (const name of ['tree#L10', 'tree é space', ...(process.platform === 'win32' ? [] : ['tree:42'])]) {
+    const folder = `${outside}/${name}`;
+    await open(folder, 1, 'directory');
+    assert.equal(checked.at(-1), folder);
+    const reveal = commands.pop()!;
+    assert.equal(reveal[0], 'revealInExplorer');
+    assert.equal((reveal[1] as { fsPath: string }).fsPath, folder);
+  }
+  const routedDirectory: unknown[][] = [];
+  const directoryHandler = new Function(
+    'openLink',
+    `return async function(msg){${handlerBody(panelHostSource, 'openDirectory')}}`,
+  )((...args: unknown[]) => routedDirectory.push(args));
+  await directoryHandler.call({ column: () => 1 }, { path: `${outside}/tree#L10` });
+  assert.deepEqual(routedDirectory, [[`${outside}/tree#L10`, 1, 'directory']]);
   kind = 1;
   missing = true;
+  await open(`${outside}/missing#L10`, 1, 'directory');
+  assert.equal(notices.pop(), `Arc: no folder at ${outside}/missing#L10.`);
+  assert.equal(checked.at(-1), `${outside}/missing#L10`);
   await open(`${outside}/missing.csv`, 2, true);
   assert.equal(notices.pop(), `Arc: no file at ${outside}/missing.csv.`);
   missing = false;
@@ -195,6 +219,95 @@ test('response citation presses open external literal files without workspace or
     { destination: { kind: 'fileCitation', path: `${outside}/one%20.csv#L10` }, beside: true },
   );
   assert.deepEqual(routed, [[`${outside}/one%20.csv#L10`, 2, true]]);
+});
+
+test('heading worktree metadata follows each panel opening source and clears when selection changes', () => {
+  const begin = panelHostSource.indexOf('const startWorktree = startingWorktree(');
+  const end = panelHostSource.indexOf('const hostRail =', begin);
+  assert.ok(begin > 0 && end > begin);
+  const code = ts.transpileModule(
+    `function rows(sessions, hostSession, fullLabels, hostParent) { ${panelHostSource.slice(begin, end)} return hostRows; }`,
+    { compilerOptions: { target: ts.ScriptTarget.ES2022 } },
+  ).outputText;
+  const project = new Function('startingWorktree', `${code}; return rows;`)(startingWorktree);
+  const home = '/repo';
+  const nested = '/repo/.claude/worktrees/é #L10';
+  const sessions = [
+    { sessionId: 'parent', cwd: `${home}/extension`, shellDestinations: [nested, '/another'] },
+    { sessionId: 'child', cwd: `${nested}/src`, shellDestinations: [home, '/another'] },
+    { sessionId: 'missing' },
+    { sessionId: 'unknown', cwd: '/unknown' },
+  ];
+  const provider = {
+    sessionRows: sessions.map((s) => ({ id: s.sessionId, label: s.sessionId })),
+    folders: () => [home],
+    repositoryScope: { checkoutSnapshot: () => [home, nested] },
+  };
+  for (const selected of ['child', 'parent', 'missing', 'unknown', 'child']) {
+    const rows = project.call(provider, sessions, selected, new Map(), null);
+    for (const row of rows)
+      assert.deepEqual(
+        row.startWorktree,
+        selected === 'child' && row.id === selected ? { name: 'é #L10', path: nested } : undefined,
+      );
+  }
+  provider.repositoryScope.checkoutSnapshot = () => [home];
+  assert.equal(
+    project.call(provider, sessions, 'child', new Map(), null).find((row: { id: string }) => row.id === 'child')
+      .startWorktree,
+    undefined,
+  );
+});
+
+test('registered checkout identity changes reach the host metadata refresh callback', async () => {
+  vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+  const factory = memberFrom(panelHostSource, panelHostSource.indexOf('private createRepositoryScope('));
+  const compiled = ts.transpileModule(`class Subject { ${factory} }`, {
+    compilerOptions: { target: ts.ScriptTarget.ES2022 },
+  }).outputText;
+  const Subject = new Function('RepositoryScope', `${compiled}\nreturn Subject;`)(RepositoryScope);
+  const refreshes: unknown[][] = [];
+  let discoveryChanges = 0;
+  let output = 'worktree /repo\0';
+  const provider = Object.assign(new Subject(), {
+    loadingLine: { scopeDecision() {} },
+    repositoryScopeChanged() {
+      discoveryChanges++;
+    },
+    refresh(...args: unknown[]) {
+      refreshes.push(args);
+    },
+  });
+  const scope: RepositoryScope = provider.createRepositoryScope({ run: async () => output });
+  const settle = () => new Promise((resolve) => setImmediate(resolve));
+  try {
+    scope.snapshot(['/repo']);
+    await settle();
+    const baseline = scope.snapshot(['/repo']);
+    output += 'worktree /repo/.claude/worktrees/topic\0';
+    await vi.advanceTimersByTimeAsync(REPOSITORY_SCOPE_REFRESH_MS);
+    scope.snapshot(['/repo']);
+    await settle();
+    assert.deepEqual(refreshes, [[true, true, false, true]]);
+    assert.deepEqual(scope.snapshot(['/repo']), baseline);
+    output = 'worktree /repo\0';
+    await vi.advanceTimersByTimeAsync(REPOSITORY_SCOPE_REFRESH_MS);
+    scope.snapshot(['/repo']);
+    await settle();
+    assert.equal(refreshes.length, 1);
+    await vi.advanceTimersByTimeAsync(REPOSITORY_SCOPE_CONFIRM_MS);
+    await settle();
+    assert.deepEqual(refreshes, [
+      [true, true, false, true],
+      [true, true, false, true],
+    ]);
+    assert.deepEqual(scope.checkoutSnapshot(), ['/repo']);
+    assert.deepEqual(scope.snapshot(['/repo']), baseline);
+    assert.equal(discoveryChanges, 1);
+  } finally {
+    scope.dispose();
+    vi.useRealTimers();
+  }
 });
 
 test('clicked local links open outside workspace folders through their existing editor routes', async () => {
@@ -291,6 +404,7 @@ test('clicked local links open outside workspace folders through their existing 
       },
     };
     const open = new Function(
+      'process',
       'vscode',
       'path',
       'normalizeFsPath',
@@ -302,6 +416,7 @@ test('clicked local links open outside workspace folders through their existing 
       'linkTargetIsVideo',
       `${source}\nreturn openLink;`,
     )(
+      { platform },
       host,
       paths,
       (file: string) => file.replace(/\\/g, '/').toLowerCase(),
@@ -312,6 +427,23 @@ test('clicked local links open outside workspace folders through their existing 
       (file: string) => /\.(md|markdown)$/i.test(file),
       linkTargetIsVideo,
     );
+    for (const folder of [
+      ...['tree#L10', 'tree é space', ...(platform === 'win32' ? [] : ['tree:42'])].map((name) =>
+        paths.join(paths.dirname(text), name),
+      ),
+      ...(platform === 'win32'
+        ? [['', '', 'Server', 'Share', 'tree#L10'].join(String.fromCharCode(92)), 'C:/']
+        : ['/']),
+    ]) {
+      existing.set(folder, 2);
+      const before = opened.length;
+      await open(folder, 1, 'directory');
+      assert.equal(checked.at(-1), folder);
+      const reveal = commands.pop()!;
+      assert.equal(reveal[0], 'revealInExplorer');
+      assert.equal((reveal[1] as { fsPath: string }).fsPath, folder);
+      assert.equal(opened.length, before);
+    }
     const video = paths.join(paths.dirname(text), 'Story 100%.MP4');
     existing.set(video, 1);
     const beforeVideo = opened.length;
@@ -17283,6 +17415,7 @@ test('the live Codex subagent route keeps each panel on the place its shared tra
     'readSetting',
     'selectionPayload',
     'renderPayload',
+    'startingWorktree',
     loopCode,
   )(
     loopModule,
@@ -17297,6 +17430,7 @@ test('the live Codex subagent route keeps each panel on the place its shared tra
     (name: string) => (name === 'maxSessions' ? 50 : 'compact'),
     selectionPayload,
     renderPayload,
+    startingWorktree,
   );
   const postPayloads = () => {
     sent.length = 0;
@@ -29633,7 +29767,7 @@ test('selection and accepted worker results avoid unnecessary catalog walks', ()
   const reusing = [...panelHostSource.matchAll(/this\.refresh\([^)]*\b(?:true|false)\s*,\s*true\)/g)];
   assert.equal(
     reusing.length,
-    15,
+    16,
     `${reusing.length} refresh callers reuse the held catalog. Selection, older-page loading, ` +
       'the accepted selected-worker follow-up and row delta recovery must not repeat catalog enumeration.',
   );

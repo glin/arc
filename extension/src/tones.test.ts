@@ -875,6 +875,8 @@ const SUBAGENT_ROW_OTHER_COLOURS = [
   '.session:hover { color: var(--vscode-textLink-foreground) }',
   '.sessiondetails dt { color: var(--idle) }',
   '.sessionstats .warn { color: var(--warn) }',
+  '.sessionworktreedestination { color: var(--idle) }',
+  '.sessionworktreelink { color: var(--vscode-textLink-foreground) }',
   '.sha { color: var(--vscode-textLink-foreground) }',
   '.statbusy { color: var(--busy) }',
   '.statwarningsign { color: var(--warn) }',

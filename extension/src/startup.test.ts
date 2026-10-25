@@ -1,3 +1,4 @@
+import { startingWorktree } from './repositoryscope';
 import * as spendConsumers from './projectspend';
 import * as cardConsumers from './turncard';
 import { normalizePromptAssetBook } from './promptassets';
@@ -1469,6 +1470,7 @@ function completeDiscoveryHarness(
   railCacheMark: typeof railCacheMarkOf = () => null,
   cacheStats: typeof derivedTitleCacheStats = derivedTitleCacheStats,
 ): any {
+  scope = { startingWorktree, ...scope };
   const file = ts.createSourceFile(
     'panelhost.ts',
     fs.readFileSync(path.join(__dirname, 'panelhost.ts'), 'utf8'),

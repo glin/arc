@@ -90,7 +90,7 @@ Paths are relative to `extension/src/`. [Architecture](architecture.md) owns pac
 | `gitcommits.ts` | Reads a turn's commits and fast-forward landings back from the repository, with the repository each is in and the branch each landing merged | no |
 | `commitrepositories.ts` | Retains verified commit occurrences, validates their original sources and physical repositories, and supplies repository identity after worktree removal | no |
 | `sessioncoverage.ts` | Binds physical enumeration and admitted membership evidence to scope and revision, and decides source presence | no |
-| `repositoryscope.ts` | Refreshes registered Git worktree roots for session discovery and checks the real destination of explicit launch folders | no |
+| `repositoryscope.ts` | Refreshes discovery roots and registered checkout identities, classifies starting worktrees, and checks explicit launch folder destinations | no |
 | `parserstate.ts` | Clones resumable parser state without losing hidden associations, counts live retained payload, captures and restores hidden activity fields for checkpoints and worker transport, and supplies shared scan budgets | no |
 | `history.ts` | Exact-revision history cursors, semantic pages, transactional forward checkpoints, and opt-in metadata recovery slices with live source reduction and resumable payload accounting | no |
 | `exportlimits.ts` | Admission limits and typed failures for explicit saved-session captures | no |

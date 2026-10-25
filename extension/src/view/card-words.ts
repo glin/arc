@@ -101,6 +101,7 @@ export const CARD_ACTIONS = {
   // Leads the heading hint's second line with the full local time of the session's last
   // activity, since the heading draws no age.
   lastActive: 'Last active',
+  startedIn: 'Started in',
   // The session heading's menu offers pin, archive, labels, rename and details actions.
   sessionActions: 'Session actions',
   sessionActionsDetail: 'Pin, archive, labels, rename, and details',

@@ -26,6 +26,7 @@ export interface SessionRow {
   id: string;
   label?: string;
   fullLabel?: string;
+  startWorktree?: { name: string; path: string };
   // Saved-record status controls whether the heading offers Rename.
   persisted?: boolean;
   agent?: string;
@@ -178,13 +179,19 @@ function headingContext(session: SessionView, options: TimelineRendererOptions):
   return options.rowContext(session.id, session.row?.persisted === true, shownTurns(session.cards, options.open));
 }
 
-function headingLabel(session: SessionView): { label: string; hint: string; detail: string } {
-  // The heading's hint detail is the last activity's full local time, since the heading draws no age.
+function headingLabel(session: SessionView): { label: string; hint: string; detail: string; nameDetail: string } {
+  // The heading names its last activity and another starting checkout when available.
   const when = session.row?.when;
   const detail = when ? `${cardWords().lastActive} ${when}` : '';
   const hint = session.row?.fullLabel || session.row?.label || session.title;
   const context = contextWord(session.stats);
-  return { hint, detail, label: `${cardWords().session} ${hint}` + (context ? `, ${context}` : '') };
+  const worktree = session.row?.startWorktree;
+  return {
+    hint,
+    detail: [detail, worktree ? `${cardWords().startedIn} ${worktree.name}` : ''].filter(Boolean).join('\n'),
+    nameDetail: [hint, detail].filter(Boolean).join('\n'),
+    label: `${cardWords().session} ${hint}` + (context ? `, ${context}` : ''),
+  };
 }
 
 // Opens or closes every shown turn with a body. Opening marks the drawn cards read.
@@ -672,13 +679,26 @@ function SessionHeading({
     syncShownLines(current.current.cards, hosts, options.open);
   });
   // A press on the name pins the whole name open in the figure popover, where it scrolls and selects.
-  const nameDetail = [state.hint, state.detail].filter(Boolean).join('\n');
+  const worktree = session.row?.startWorktree;
+  const nameList: StatDetailList | null = worktree
+    ? {
+        actions: true,
+        entries: [],
+        nameWorktree: {
+          ...worktree,
+          label: cardWords().startedIn,
+          open() {
+            options.cardOptions.post({ type: 'openDirectory', path: worktree.path });
+          },
+        },
+      }
+    : null;
   useLayoutEffect(() => {
     const node = button.current;
     return node ? options.cardOptions.statDetails.mount(node, true, true) : undefined;
   }, [options]);
   useLayoutEffect(() => {
-    if (button.current) options.cardOptions.statDetails.update(button.current, nameDetail, null);
+    if (button.current) options.cardOptions.statDetails.update(button.current, state.nameDetail, nameList);
   });
   return h(
     'div',
@@ -697,6 +717,7 @@ function SessionHeading({
             ref: button,
             'data-hint': state.hint,
             'data-hint-detail': state.detail || undefined,
+            'data-hint-lines': worktree ? '' : undefined,
             'data-hint-kind': 'name',
             'data-control': `session:${session.id}`,
             'aria-label': state.label,

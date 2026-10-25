@@ -636,6 +636,10 @@ const PANEL: Array<{ raw: Record<string, unknown>; parsed: PanelToHost }> = [
     parsed: { type: 'openLink', href: './notes.md', beside: true },
   },
   {
+    raw: { type: 'openDirectory', path: '/Trees/é space#L10:42' },
+    parsed: { type: 'openDirectory', path: '/Trees/é space#L10:42' },
+  },
+  {
     raw: { type: 'openVisualization', path: 'chart.html' },
     parsed: { type: 'openVisualization', path: 'chart.html' },
   },
@@ -781,6 +785,7 @@ function panelRecorder(seen: string[]): PanelToHostHandlers<void> {
     search: take('search'),
     loadOlder: take('loadOlder'),
     openLink: take('openLink'),
+    openDirectory: take('openDirectory'),
     openVisualization: take('openVisualization'),
     openImage: take('openImage'),
     openTurnDiff: take('openTurnDiff'),

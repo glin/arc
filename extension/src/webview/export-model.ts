@@ -79,6 +79,7 @@ export const EXPORT_HOST_POLICY = {
   search: 'blocked',
   loadOlder: 'local',
   openLink: 'blocked',
+  openDirectory: 'blocked',
   openVisualization: 'blocked',
   openImage: 'blocked',
   openTurnDiff: 'blocked',

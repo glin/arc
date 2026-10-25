@@ -56,6 +56,7 @@ export interface CardWords {
   promptMore: string;
   laterAsksShow: string;
   lastActive: string;
+  startedIn: string;
   laterAsksHide: string;
   turnDiff: string;
   openCommit: string;

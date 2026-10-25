@@ -63,6 +63,7 @@ export const DEMO_HOST_POLICY = {
   search: 'noop',
   loadOlder: 'noop',
   openLink: 'noop',
+  openDirectory: 'noop',
   openVisualization: 'noop',
   openImage: 'noop',
   openTurnDiff: 'noop',

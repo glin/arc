@@ -7,6 +7,7 @@ import { tempDir } from './temproot';
 import {
   parseWorktreeRoots,
   scopedLaunchCwd,
+  startingWorktree,
   RepositoryScope,
   REPOSITORY_SCOPE_CONFIRM_MS,
   REPOSITORY_SCOPE_FAILED_RECHECKS,
@@ -69,6 +70,143 @@ function deferred<T>() {
 }
 
 const settle = () => new Promise((resolve) => setImmediate(resolve));
+
+for (const platform of ['win32', 'darwin', 'linux'] as const) {
+  test(`starting worktree uses opening checkout identity on ${platform}`, () => {
+    vi.stubGlobal('process', { ...process, platform });
+    try {
+      const home = platform === 'win32' ? 'C:/Work/Repo' : '/Work/Repo';
+      const nested = `${home}/.claude/worktrees/other #L10`;
+      const external = platform === 'win32' ? 'D:/Trees/other #L10' : '/Trees/other #L10';
+      const checkouts = [home, nested, external];
+      const sessions = [
+        { cwd: `${home}/extension`, commands: [nested, external], expected: undefined },
+        { cwd: `${nested}/src`, commands: [home, external], expected: { name: 'other #L10', path: nested } },
+        { cwd: external, commands: [home, nested], expected: { name: 'other #L10', path: external } },
+      ];
+      for (const session of sessions)
+        assert.deepEqual(startingWorktree(session.cwd, home, checkouts), session.expected);
+      assert.equal(startingWorktree(home, home, checkouts), undefined);
+      assert.equal(startingWorktree(`${home}/extension`, `${home}/extension`, checkouts), undefined);
+      assert.equal(startingWorktree(`${nested}/src`, `${nested}/other`, checkouts), undefined);
+      assert.equal(startingWorktree('/Unknown', home, checkouts), undefined);
+      assert.equal(startingWorktree(nested, '/Unknown', checkouts), undefined);
+      assert.equal(startingWorktree(undefined, home, checkouts), undefined);
+      assert.equal(startingWorktree(nested, home, []), undefined);
+      assert.deepEqual(startingWorktree(`${nested}/`, `${home}/`, checkouts), { name: 'other #L10', path: nested });
+      assert.deepEqual(
+        startingWorktree(nested.toUpperCase(), home, checkouts),
+        platform === 'win32' ? { name: 'other #L10', path: nested } : undefined,
+      );
+      assert.deepEqual(
+        startingWorktree('c:/WORK/repo/tree/src', 'C:/Work/Repo', ['C:/Work/Repo', 'C:/Work/Repo/tree']),
+        { name: 'tree', path: 'C:/Work/Repo/tree' },
+      );
+      if (platform === 'win32') {
+        assert.deepEqual(startingWorktree('C:\\Trees\\topic\\src', home, [home, 'C:\\Trees\\topic\\']), {
+          name: 'topic',
+          path: 'C:\\Trees\\topic\\',
+        });
+        assert.deepEqual(startingWorktree('\\\\SERVER\\Share\\tree\\src', 'C:/', ['C:/', '\\\\Server\\Share\\tree']), {
+          name: 'tree',
+          path: '\\\\Server\\Share\\tree',
+        });
+      } else {
+        const literal = '/Trees/topic\\detail\\';
+        assert.deepEqual(startingWorktree(`${literal}/src`, home, [home, literal]), {
+          name: 'topic\\detail\\',
+          path: literal,
+        });
+        assert.deepEqual(startingWorktree('/tree/src', '/', ['/', '/tree']), { name: 'tree', path: '/tree' });
+        assert.deepEqual(startingWorktree('/other é:42/src', home, [home, '/other é:42']), {
+          name: 'other é:42',
+          path: '/other é:42',
+        });
+      }
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+}
+
+test('nested checkout identity publishes without moving discovery and retains failed or held removals', async () => {
+  vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+  let output: string | null = 'worktree /repo\0';
+  let reads = 0;
+  let discovery = 0;
+  let identities = 0;
+  const scope = new RepositoryScope(
+    {
+      run: async () => {
+        reads++;
+        return output;
+      },
+    },
+    () => discovery++,
+    Date.now,
+    () => {},
+    () => identities++,
+  );
+  try {
+    scope.snapshot(['/repo']);
+    await settle();
+    const baseline = scope.snapshot(['/repo']);
+    output += 'worktree /repo/.claude/worktrees/topic\0';
+    await vi.advanceTimersByTimeAsync(REPOSITORY_SCOPE_REFRESH_MS);
+    scope.snapshot(['/repo']);
+    await settle();
+    assert.deepEqual(scope.snapshot(['/repo']), baseline);
+    assert.equal(discovery, 1);
+    assert.equal(identities, 1);
+    const selected = startingWorktree('/repo/.claude/worktrees/topic/src', '/repo/extension', scope.checkoutSnapshot());
+    assert.deepEqual(selected, { name: 'topic', path: '/repo/.claude/worktrees/topic' });
+    for (let i = 0; i < 1000; i++)
+      startingWorktree(
+        i % 2 ? '/repo/extension' : '/repo/.claude/worktrees/topic/src',
+        '/repo',
+        scope.checkoutSnapshot(),
+      );
+    assert.equal(reads, 2);
+    output = 'worktree /repo\0';
+    await vi.advanceTimersByTimeAsync(REPOSITORY_SCOPE_REFRESH_MS);
+    scope.snapshot(['/repo']);
+    await settle();
+    assert.equal(identities, 1);
+    output = null;
+    await vi.advanceTimersByTimeAsync(REPOSITORY_SCOPE_CONFIRM_MS);
+    await settle();
+    assert.equal(identities, 1);
+    assert.equal(scope.checkoutSnapshot().length, 2);
+    output = 'worktree /repo\0';
+    await vi.advanceTimersByTimeAsync(REPOSITORY_SCOPE_CONFIRM_MS);
+    await settle();
+    assert.equal(identities, 2);
+    assert.deepEqual(scope.checkoutSnapshot(), ['/repo']);
+    assert.deepEqual(scope.snapshot(['/repo']), baseline);
+    assert.equal(discovery, 1);
+  } finally {
+    scope.dispose();
+    vi.useRealTimers();
+  }
+});
+
+test('cancelled scope reads publish no checkout identities', async () => {
+  const answer = deferred<string | null>();
+  let changed = 0;
+  const scope = new RepositoryScope(
+    { run: () => answer.promise },
+    () => changed++,
+    Date.now,
+    () => {},
+    () => changed++,
+  );
+  scope.snapshot(['/repo']);
+  scope.dispose();
+  answer.resolve('worktree /repo\0worktree /repo/child\0');
+  await settle();
+  assert.deepEqual(scope.checkoutSnapshot(), []);
+  assert.equal(changed, 0);
+});
 
 test('worktree porcelain keeps paths verbatim across platforms', () => {
   const output = [

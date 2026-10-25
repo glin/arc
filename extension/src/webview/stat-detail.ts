@@ -71,6 +71,7 @@ const KIND_CLASS: Record<'description' | 'path' | 'muted', string> = {
 };
 
 export interface StatDetailList {
+  nameWorktree?: { label: string; name: string; path: string; open(): void };
   context?: ContextDetailView;
   // Choose the record layout. Omission uses the compact label-and-value grid.
   layout?: 'stacked' | 'tool-breakdown' | 'skills' | 'economics' | 'files' | 'agents' | 'dispatched' | 'commits';
@@ -262,7 +263,9 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
     return {
       detail: resolvedDetail,
       detailList: resolvedList,
-      print: JSON.stringify(resolvedList ?? resolvedDetail ?? ''),
+      print: JSON.stringify(
+        resolvedList?.nameWorktree ? [resolvedDetail, resolvedList] : (resolvedList ?? resolvedDetail ?? ''),
+      ),
     };
   };
 
@@ -431,13 +434,13 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
     row.appendChild(relative(line));
     return row;
   };
-  // Arrow-key targets include label actions, record-row buttons, and the Context action.
-  const POP_PRESSES = '.chippopnamelink, .chippoprows button, .context-bound button';
+  // Arrow keys reach label actions, record-row buttons, the Context action, and the worktree link.
+  const POP_PRESSES = '.chippopnamelink, .chippoprows button, .context-bound button, .sessionworktreelink';
   // The Tab walk holds presses, row figure stops, rows without links, the Context
   // disclosures and the notes disclosure. The arrow keys walk presses alone.
   const POP_TAB_STOPS = `${POP_PRESSES}, .chippoprows [tabindex="0"], .context-messages summary, .context-measurement summary, .chippopnotes summary`;
-  // Every button the reader can reach inside the popover, in reading order.
-  const actionButtons = () => Array.from(pop.querySelectorAll<HTMLButtonElement>(POP_PRESSES));
+  // Every action the reader can reach inside the popover, in reading order.
+  const actionButtons = () => Array.from(pop.querySelectorAll<HTMLElement>(POP_PRESSES));
   // Every stop Tab takes inside the popover, in reading order.
   const tabStops = () => Array.from(pop.querySelectorAll<HTMLElement>(POP_TAB_STOPS));
   const appendLines = (parent: HTMLElement, lines: DetailLine[] | undefined, withActions: boolean): void => {
@@ -493,7 +496,7 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
       if (messages) messages.open = contextMessagesOpen;
       return;
     }
-    // Only the Context detail is a focus target of its own. Every other drawing starts unfocusable.
+    // Other drawings become focus targets when keyboard navigation needs the box itself.
     pop.removeAttribute('tabindex');
     pop.classList.toggle('chippop-stacked', listValue?.layout === 'stacked');
     pop.classList.toggle('chippop-tools', listValue?.layout === 'tool-breakdown');
@@ -550,7 +553,7 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
       }
       pop.appendChild(node);
     };
-    if (listValue) {
+    if (listValue && !listValue.nameWorktree) {
       if (listValue.heading) {
         pop.appendChild(detailHead(listValue.heading, 'chippophead'));
       }
@@ -607,6 +610,25 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
       }
       pop.appendChild(el('div', line ? 'chippopline' : 'chippopline gap', line || ' '));
     });
+    const worktree = listValue?.nameWorktree;
+    if (worktree) {
+      const row = el('div', 'chippopline sessionworktree');
+      row.appendChild(el('span', 'sessionworktreelabel', worktree.label));
+      row.appendChild(document.createTextNode(' '));
+      const link = el('a', 'sessionworktreelink');
+      link.href = worktree.path;
+      link.setAttribute('aria-label', `Open worktree folder ${worktree.name}`);
+      appendNameText(document, link, worktree.name);
+      link.addEventListener('click', (event) => {
+        event.preventDefault();
+        worktree.open();
+      });
+      row.appendChild(link);
+      const destination = el('div', 'sessionworktreedestination');
+      appendNameText(document, destination, worktree.path);
+      row.appendChild(destination);
+      pop.appendChild(row);
+    }
   };
   // Ignore focus departure during redraws. Removing focused rows does not represent reader navigation.
   let redrawing = false;
@@ -619,6 +641,7 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
     // Only a pinned drawing holds the reader's choice. A hover drawing is always closed.
     if (notes && drawnPrint !== null && pop.classList.contains('pinned')) notesOpen.set(document, notes.open);
     const focused = [
+      '.sessionworktreelink',
       '.context-bound button',
       '.context-messages summary',
       '.context-measurement summary',
@@ -627,12 +650,12 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
     redrawing = true;
     try {
       drawInto(value, withActions);
-      if (focused)
-        (
-          pop.querySelector<HTMLElement>(focused) ??
-          pop.querySelector<HTMLElement>('.context-bound button') ??
-          pop
-        ).focus({ preventScroll: true });
+      if (focused) {
+        const target =
+          pop.querySelector<HTMLElement>(focused) ?? pop.querySelector<HTMLElement>('.context-bound button') ?? pop;
+        if (target === pop) pop.tabIndex = -1;
+        target.focus({ preventScroll: true });
+      }
     } finally {
       redrawing = false;
     }
