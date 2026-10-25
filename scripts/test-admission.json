@@ -5,9 +5,9 @@
     "matricesSha256": "4e022b5fee407c764a58ab1e0ef83ee0471bb3cd96b4e1e4b6704a098c122dd7"
   },
   "cli/test/run.test.ts": {
-    "reason": "Standalone workers must retain real output, exit, cancellation, receipt ownership, and recovery across process boundaries.",
-    "cases": 107,
-    "matricesSha256": "37e825c4bcd6903ecc275b57ddeb60adcb3cee5bad53beeb60588c6885dbbe73"
+    "reason": "Standalone workers must retain real output, exit, cancellation, receipt ownership, and recovery across process boundaries. Held readers must preserve one worker and one outcome after recovery. Exhausted replacement retries must retain the worker's terminal observation.",
+    "cases": 108,
+    "matricesSha256": "666f538ae238ed305fcae064e3ef97a5c1d5c9202dcc31c35402c2c0ae01ac01"
   },
   "cli/test/smoke.bundled-a.test.mjs": {
     "reason": "Compiled CLI commands must reach session reads, comments, and saved defaults through an authenticated window channel.",

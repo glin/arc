@@ -1588,6 +1588,81 @@ test.each([false, true])(
   },
 );
 
+test('held reader retries one publication and refuses unrelated rename failures without a pause', () => {
+  for (const code of ['EPERM', 'EACCES', 'EBUSY', 'ENOENT']) {
+    const home = scratch('arc-held-reader-');
+    let now = 0;
+    let held = true;
+    const pauses: number[] = [];
+    const receipts = new DispatchReceipts(home, process.platform, {
+      now: () => now,
+      pause: (milliseconds: number) => {
+        pauses.push(milliseconds);
+        now += milliseconds;
+        held = false;
+      },
+    });
+    const launch = receipts.reserve({
+      origin,
+      requester: null,
+      policy: null,
+      promptSha256: payloadSha256('review'),
+      completion: 'wait',
+      alias: null,
+    });
+    const directory = path.join(receipts.root, launch.launchId);
+    const target = path.join(directory, 'state.json');
+    const rename = fs.renameSync;
+    let attempts = 0;
+    const replacement = vi.spyOn(fs, 'renameSync').mockImplementation((from, to) => {
+      if (String(to) !== target || !held) return rename(from, to);
+      attempts++;
+      if (process.platform === 'win32' && code === 'EPERM') {
+        const descriptor = fs.openSync(target, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+        try {
+          rename(from, to);
+          assert.fail('The held reader must prevent replacement.');
+        } catch (error) {
+          assert.equal((error as NodeJS.ErrnoException).code, 'EPERM');
+          throw error;
+        } finally {
+          fs.closeSync(descriptor);
+        }
+      }
+      throw Object.assign(new Error(`${code}: operation not permitted, rename '${from}' -> '${to}'`), { code });
+    });
+    syncBuiltinESMExports();
+    try {
+      if (code === 'ENOENT') {
+        assert.throws(() => report(receipts, launch.launchId), { code });
+        assert.deepEqual(pauses, []);
+        assert.equal(attempts, 1);
+      } else {
+        const event = report(receipts, launch.launchId);
+        assert.deepEqual(receipts.latest(launch.launchId), event);
+        assert.equal(JSON.parse(fs.readFileSync(target, 'utf8')).events.length, 1);
+        for (const suffix of ['json', 'md', 'anchor.json']) {
+          assert.deepEqual(
+            fs
+              .readdirSync(directory)
+              .filter((name) => new RegExp(`^[a-f0-9-]{36}[.]${suffix.replace('.', '[.]')}$`).test(name)),
+            [`${event.eventId}.${suffix}`],
+          );
+        }
+        assert.deepEqual(pauses, [10]);
+        assert.equal(attempts, 1);
+      }
+      assert.equal(
+        fs.readdirSync(directory).some((name) => /^state[.]json[.].*[.]tmp$/.test(name)),
+        false,
+      );
+    } finally {
+      replacement.mockRestore();
+      syncBuiltinESMExports();
+    }
+  }
+});
+
 test('interrupted claims retain their token and acknowledgments retain exactly one disposition', () => {
   const { receipts, launch } = fixture();
   const event = report(receipts, launch.launchId);

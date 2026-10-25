@@ -1918,6 +1918,16 @@ export async function superviseStandalone(
       }
     }
   };
+  const publishOutcome = async (input: Parameters<DispatchReceipts['publish']>[1], text: string | null) => {
+    try {
+      return receipts.publish(id, input, text);
+    } catch (error) {
+      observation.monitor = 'unavailable';
+      observation.reason = "Arc could not save the worker's outcome in state.json.";
+      await publishObservation();
+      throw error;
+    }
+  };
   let capture: ReturnType<typeof liveLogCapture> | undefined;
   let pendingWitness: (() => Promise<unknown>) | undefined;
   let witnessTail = false;
@@ -2183,8 +2193,7 @@ export async function superviseStandalone(
           last?.askId !== null ||
           (last?.report?.sha256 ?? null) !== (recovered.text === null ? null : payloadSha256(recovered.text)))
       )
-        receipts.publish(
-          id,
+        await publishOutcome(
           {
             outcome: recovered.outcome,
             availability: recovered.availability,
@@ -2264,8 +2273,7 @@ export async function superviseStandalone(
           observation.reason = 'The attended provider did not start.';
         }
         receipts.observation(id, observation);
-        receipts.publish(
-          id,
+        await publishOutcome(
           { outcome: 'unknown', availability: 'unavailable', nativeEnding: null, askId: null },
           null,
         );
@@ -2372,8 +2380,7 @@ export async function superviseStandalone(
             ? 'The worker output connection closed. Worker exit remains unknown.'
             : 'The provider did not start.';
           await publishObservation();
-          receipts.publish(
-            id,
+          await publishOutcome(
             {
               outcome: started ? 'unknown' : 'failed',
               availability: started ? 'pending' : 'unavailable',
@@ -2498,8 +2505,7 @@ export async function superviseStandalone(
       last.askId !== null ||
       last.report?.sha256 !== (final.text === null ? undefined : payloadSha256(final.text))
     )
-      receipts.publish(
-        id,
+      await publishOutcome(
         { outcome: final.outcome, availability: final.availability, nativeEnding: final.evidence, askId: null },
         final.text,
       );

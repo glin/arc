@@ -49,7 +49,7 @@ Saved response reads reuse provider reducers and bounded forward recovery throug
 
 Hosted waits end at channel deadline or disconnect without changing workers. Event indexes have bounded segments without a total launch or event-count limit. Status projects launch identity without rereading configuration. It omits disposition text and native ending evidence. Exact-event reads retain both. Status metadata reserves space for one maximally admitted event and consumption digests.
 
-Immutable write-lock successors serialize writes and dead-owner recovery. Successor and release files preserve ownership history. Live or uncertain owners retain locks. Identity checks detect observed replacement and redirection, without protecting concurrent metadata-preserving rewrites.
+Immutable write-lock successors serialize writes and dead-owner recovery. Successor and release files preserve ownership history. Live or uncertain owners retain locks. Windows refuses to replace a launch file while a reader holds it open. Launch-folder writes retry transient rename failures. Outcome publication retries under its acquired write lock. Identity checks detect observed replacement and redirection, without protecting concurrent metadata-preserving rewrites.
 
 ### Output capture
 

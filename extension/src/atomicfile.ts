@@ -58,6 +58,37 @@ function removeStaleTemporaries(target: string): void {
   }
 }
 
+export interface ReplacementPolicy {
+  windowMs?: number;
+  now?: () => number;
+  pause?: (milliseconds: number) => void;
+}
+
+// Retry only replacement and reuse the same temporary file between attempts.
+// Callers that hold a write lock retain it during retries.
+export function retryingReplace({
+  windowMs = 2000,
+  now = () => performance.now(),
+  pause = (milliseconds) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds),
+}: ReplacementPolicy = {}): (temporary: string, target: string) => void {
+  return (temporary, target) => {
+    const deadline = now() + windowMs;
+    let delay = 10;
+    while (true) {
+      try {
+        fs.renameSync(temporary, target);
+        return;
+      } catch (error) {
+        if (!['EPERM', 'EACCES', 'EBUSY'].includes((error as NodeJS.ErrnoException)?.code ?? '')) throw error;
+        const remaining = deadline - now();
+        if (remaining <= 0) throw error;
+        pause(Math.min(delay, remaining));
+        delay = Math.min(100, delay * 2);
+      }
+    }
+  };
+}
+
 // Writes synchronously through the rename so writes in this process cannot interleave.
 // Other editor windows use separate temporaries. Cleanup retains their temporaries while their processes run.
 // `replace` lets a caller supply the rename operation.

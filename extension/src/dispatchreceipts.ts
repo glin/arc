@@ -2,7 +2,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
-import { writeFileAtomically } from './atomicfile';
+import { retryingReplace, writeFileAtomically, type ReplacementPolicy } from './atomicfile';
 import { arcHome } from './store';
 import { payloadSha256, type RequesterIdentity } from './sessionwrites';
 import type { LaunchPolicy } from './launchpolicy';
@@ -340,12 +340,15 @@ class RelationshipReader {
 // Native records supply response and usage evidence. These files retain launch and consumption identity only.
 export class DispatchReceipts {
   readonly root: string;
+  private readonly replace: (temporary: string, target: string) => void;
   constructor(
     home = arcHome(),
     readonly platform = process.platform,
+    replacement: ReplacementPolicy = {},
   ) {
     const paths = platform === 'win32' ? path.win32 : path.posix;
     this.root = paths.join(paths.resolve(home), 'dispatch');
+    this.replace = retryingReplace(replacement);
   }
   // The first next call yields without reading. Each later call needs a remaining work allowance.
   *relationship(
@@ -716,7 +719,7 @@ export class DispatchReceipts {
                 aliasIdentity = identity(alias);
               }
               const initial: CaptureState = { raw: identity(rawFile), alias: aliasIdentity, bytes: 0, sources: {} };
-              writeFileAtomically(checkpoint, JSON.stringify(initial), undefined, 0o600, false);
+              writeFileAtomically(checkpoint, JSON.stringify(initial), this.replace, 0o600, false);
               return initial;
             } catch (error) {
               // Initialization can retain private output before its alias witness is saved.
@@ -848,7 +851,7 @@ export class DispatchReceipts {
           const delivered = state.aliasBytes;
           publishAlias();
           if (state.aliasBytes !== delivered)
-            writeFileAtomically(checkpoint, JSON.stringify(state), undefined, 0o600, false);
+            writeFileAtomically(checkpoint, JSON.stringify(state), this.replace, 0o600, false);
           const end = aliasEnd();
           if (!state.alias || (state.aliasBytes ?? 0) >= end) return false;
           try {
@@ -914,7 +917,7 @@ export class DispatchReceipts {
               bytes: state.bytes + bytes.length,
               sources: { ...state.sources, ...(name && cursor ? { [name]: { ...cursor } } : {}) },
             };
-            writeFileAtomically(checkpoint, JSON.stringify(next), undefined, 0o600, false);
+            writeFileAtomically(checkpoint, JSON.stringify(next), this.replace, 0o600, false);
             state = next;
           },
           'capture-write',
@@ -959,7 +962,7 @@ export class DispatchReceipts {
               ...state,
               sources: { ...state.sources, ...(cursor ? { 'native-source.log': { ...cursor } } : {}) },
             };
-            writeFileAtomically(checkpoint, JSON.stringify(next), undefined, 0o600, false);
+            writeFileAtomically(checkpoint, JSON.stringify(next), this.replace, 0o600, false);
             state = next;
           },
           'capture-write',
@@ -976,7 +979,7 @@ export class DispatchReceipts {
       const text = JSON.stringify(value);
       if (Buffer.byteLength(text) > JSON_BYTES) throw new Error('The worker observation exceeds its saved allowance.');
       this.checkStatusEnvelope(launch, value);
-      this.lock(id, () => writeFileAtomically(file, text, undefined, 0o600, false));
+      this.lock(id, () => writeFileAtomically(file, text, this.replace, 0o600, false));
     }
     return fs.existsSync(file) ? JSON.parse(read(file)) : null;
   }
@@ -989,7 +992,7 @@ export class DispatchReceipts {
     if (value !== undefined) {
       const text = JSON.stringify(value);
       if (Buffer.byteLength(text) > limit) throw new Error('The saved output position exceeds its allowance.');
-      this.lock(id, () => writeFileAtomically(file, text, undefined, 0o600, false));
+      this.lock(id, () => writeFileAtomically(file, text, this.replace, 0o600, false));
     }
     return fs.existsSync(file) ? JSON.parse(read(file, limit, true)) : null;
   }
@@ -1140,7 +1143,7 @@ export class DispatchReceipts {
             if (!dead) throw new Error('Another process is observing this dispatch launch.');
           }
         }
-        writeFileAtomically(file, JSON.stringify({ pid: process.pid, token }), undefined, 0o600, false);
+        writeFileAtomically(file, JSON.stringify({ pid: process.pid, token }), this.replace, 0o600, false);
       },
       lock,
     );
@@ -1156,7 +1159,7 @@ export class DispatchReceipts {
           writeFileAtomically(
             file,
             JSON.stringify({ ...native, released: true, ...(pending ? { phase: 'witness-pending' } : {}) }),
-            undefined,
+            this.replace,
             0o600,
             false,
           );
@@ -1367,7 +1370,7 @@ export class DispatchReceipts {
             const witness = JSON.parse(read(this.file(id, 'source.json')));
             if (!equalIdentity(witness, identity(source))) throw new Error('The dispatch report source was replaced.');
           }
-          writeFileAtomically(source, text, undefined, 0o600, false);
+          writeFileAtomically(source, text, this.replace, 0o600, false);
           this.saveSource(id, identity(source));
         } catch {
           /* The immutable event remains available. */
@@ -1383,7 +1386,7 @@ export class DispatchReceipts {
           )
             throw new Error('The report alias folder was replaced.');
           if (fs.existsSync(launch.alias)) safePath(launch.alias);
-          writeFileAtomically(launch.alias, text, undefined, 0o600, false);
+          writeFileAtomically(launch.alias, text, this.replace, 0o600, false);
         } catch {
           /* The private report remains readable. */
         }
@@ -1586,7 +1589,7 @@ export class DispatchReceipts {
     return path.join(this.root, id, name);
   }
   private saveSource(id: string, witness: FileIdentity): void {
-    writeFileAtomically(this.file(id, 'source.json'), JSON.stringify(witness), undefined, 0o600, false);
+    writeFileAtomically(this.file(id, 'source.json'), JSON.stringify(witness), this.replace, 0o600, false);
   }
   private state(
     id: string,
@@ -1604,14 +1607,20 @@ export class DispatchReceipts {
     return state;
   }
   private save(id: string, state: unknown): void {
-    writeFileAtomically(this.file(id, 'state.json'), JSON.stringify(state), undefined, 0o600, false);
+    writeFileAtomically(this.file(id, 'state.json'), JSON.stringify(state), this.replace, 0o600, false);
   }
   private consumption(id: string, eventId: string): EventState {
     const file = this.file(id, `${eventId}.consumption.json`);
     return fs.existsSync(file) ? JSON.parse(read(file)) : {};
   }
   private saveConsumption(id: string, eventId: string, state: EventState): void {
-    writeFileAtomically(this.file(id, `${eventId}.consumption.json`), JSON.stringify(state), undefined, 0o600, false);
+    writeFileAtomically(
+      this.file(id, `${eventId}.consumption.json`),
+      JSON.stringify(state),
+      this.replace,
+      0o600,
+      false,
+    );
   }
   private lock<T>(id: string, work: () => T, name = 'write'): T {
     this.launch(id);
@@ -1633,7 +1642,7 @@ export class DispatchReceipts {
             throw new Error('The dispatch write owner is unavailable.');
           if (steps >= 32) {
             // Retained successors keep stale readers safe when the bounded walk advances its head.
-            writeFileAtomically(file, heldText, undefined, 0o600, false);
+            writeFileAtomically(file, heldText, this.replace, 0o600, false);
             throw new Error('The dispatch write changed during recovery. Try again.');
           }
           const successor = this.file(id, `${name}.${held.token}.next.lock`);
@@ -1660,7 +1669,7 @@ export class DispatchReceipts {
       // Each immutable predecessor admits one successor, including concurrent dead-owner recovery.
       fs.linkSync(temporary, target);
       acquired = true;
-      if (target !== file) writeFileAtomically(file, owner, undefined, 0o600, false);
+      if (target !== file) writeFileAtomically(file, owner, this.replace, 0o600, false);
       result = work();
     } catch (error) {
       failure = { error };

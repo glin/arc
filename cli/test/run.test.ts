@@ -1156,7 +1156,14 @@ test.each([
   { tags: ['subprocess'] },
   async (phase) => {
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
-    const { receipts, launch } = workerFixture('', 100, false, true);
+    const { receipts: originalReceipts, launch } = workerFixture('', 100, false, true);
+    let replacementNow = 0;
+    const receipts = new DispatchReceipts(path.dirname(originalReceipts.root), process.platform, {
+      now: () => replacementNow,
+      pause: (milliseconds) => {
+        replacementNow += milliseconds;
+      },
+    });
     const id = launch.launchId;
     const stdout = Buffer.from(outputFrames());
     const stderr = Buffer.alloc(700, 255);
@@ -1176,7 +1183,7 @@ test.each([
     let cleanupInjected = false;
     if (initialization) {
       const renameWithFailure: typeof rename = (from, to) => {
-        if (!injected && String(to) === publication) {
+        if ((phase === 'init-checkpoint' || !injected) && String(to) === publication) {
           injected = true;
           throw publicationError;
         }
@@ -2536,6 +2543,190 @@ test(
     assert.equal(receipts.latest(launch.launchId)!.outcome, 'unknown');
     assert.equal(receipts.latest(launch.launchId)!.availability, 'pending');
     assert.equal(receipts.observation(launch.launchId)!.exitCode, null);
+  },
+);
+
+test.each([
+  { exhausted: false, longStorage: false },
+  { exhausted: true, longStorage: false },
+  { exhausted: true, longStorage: true },
+])(
+  'held reader $exhausted with long storage $longStorage preserves one worker and settles the outcome',
+  async ({ exhausted, longStorage }) => {
+    if (exhausted) vi.useFakeTimers({ toFake: ['setTimeout'] });
+    const fixture = workerFixture('', 10_000, false, true);
+    let id = fixture.launch.launchId;
+    let now = 0;
+    let held = true;
+    const pauses: number[] = [];
+    const home = fixture.launch.standalone!.cwd;
+    const storage = longStorage
+      ? path.join(home, ...Array(41).fill('MiXeD-'.repeat(37)))
+      : path.dirname(fixture.receipts.root);
+    const receipts = new DispatchReceipts(storage, process.platform, {
+      now: () => now,
+      pause: (milliseconds: number) => {
+        pauses.push(milliseconds);
+        now += milliseconds;
+        if (!exhausted) held = false;
+      },
+    });
+    const originalFs = (await vi.importActual<{ default: typeof import('node:fs') }>('node:fs')).default;
+    let rename = originalFs.renameSync;
+    const unmapped: string[] = [];
+    if (longStorage) {
+      const physical = path.join(home, 'long-storage', 'dispatch');
+      const key = (value: string) =>
+        process.platform === 'win32' ? path.resolve(value).toLowerCase() : path.resolve(value);
+      const ancestors = new Set<string>();
+      for (let current = path.dirname(receipts.root); ; current = path.dirname(current)) {
+        ancestors.add(key(current));
+        if (path.dirname(current) === current) break;
+      }
+      const mapped = (value: fs.PathLike | number) => {
+        if (typeof value === 'number') return value;
+        const text = String(value);
+        const relative = path.relative(key(receipts.root), key(text));
+        if (
+          relative === '' ||
+          (!relative.startsWith('..' + path.sep) && relative !== '..' && !path.isAbsolute(relative))
+        )
+          return path.join(physical, relative);
+        if (ancestors.has(key(text))) return home;
+        const owned = path.relative(key(home), key(text));
+        if (owned === '' || (!owned.startsWith('..' + path.sep) && owned !== '..' && !path.isAbsolute(owned)))
+          return text;
+        unmapped.push(text);
+        throw new Error(`Unmapped fixture path: ${text}`);
+      };
+      for (const name of [
+        'mkdirSync',
+        'lstatSync',
+        'statSync',
+        'openSync',
+        'existsSync',
+        'writeFileSync',
+        'readFileSync',
+        'unlinkSync',
+        'readdirSync',
+      ] as const) {
+        const original = originalFs[name];
+        const implementation = (...args: unknown[]) =>
+          Reflect.apply(original, originalFs, [mapped(args[0] as fs.PathLike | number), ...args.slice(1)]);
+        vi.spyOn(fs, name).mockImplementation(implementation as any);
+        vi.spyOn(originalFs, name).mockImplementation(implementation as any);
+      }
+      const originalRename = rename;
+      rename = (from, to) => Reflect.apply(originalRename, originalFs, [mapped(from), mapped(to)]);
+      const link = originalFs.linkSync;
+      const linkMapped = (from: fs.PathLike, to: fs.PathLike) =>
+        Reflect.apply(link, originalFs, [mapped(from), mapped(to)]);
+      vi.spyOn(fs, 'linkSync').mockImplementation(linkMapped);
+      vi.spyOn(originalFs, 'linkSync').mockImplementation(linkMapped);
+      const realpath = originalFs.realpathSync.native;
+      vi.spyOn(fs.realpathSync, 'native').mockImplementation((value, ...args) =>
+        Reflect.apply(realpath, originalFs.realpathSync, [mapped(value), ...args]),
+      );
+      id = admit(receipts, {
+        ...fixture.launch.standalone!,
+        env: { ...fixture.launch.standalone!.env, ARC_CODEX_ROOT: path.join(home, 'sessions') },
+      }).launchId;
+      assert.ok(receipts.root.length > 9000);
+      if (process.platform === 'win32') assert.ok(path.win32.isAbsolute(receipts.root));
+    }
+    const target = path.join(receipts.root, id, 'state.json');
+    let attempts = 0;
+    let failure: NodeJS.ErrnoException | undefined;
+    const replace: typeof rename = (from, to) => {
+      if (String(to) !== target || !held) return rename(from, to);
+      attempts++;
+      if (process.platform === 'win32') {
+        const descriptor = fs.openSync(target, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+        try {
+          rename(from, to);
+          assert.fail('The held reader must prevent replacement.');
+        } catch (error) {
+          failure = error as NodeJS.ErrnoException;
+          throw error;
+        } finally {
+          fs.closeSync(descriptor);
+        }
+      }
+      failure = Object.assign(new Error(`EPERM: operation not permitted, rename '${from}' -> '${to}'`), {
+        code: 'EPERM',
+      });
+      throw failure;
+    };
+    vi.spyOn(fs, 'renameSync').mockImplementation(replace);
+    vi.spyOn(originalFs, 'renameSync').mockImplementation(replace);
+    const saveObservation = receipts.observation.bind(receipts);
+    let unavailableWrites = 0;
+    let signalBusy!: () => void;
+    const observationBusy = new Promise<void>((resolve) => {
+      signalBusy = resolve;
+    });
+    vi.spyOn(receipts, 'observation').mockImplementation((launchId, value) => {
+      if (value?.monitor === 'unavailable' && ++unavailableWrites === 1) {
+        signalBusy();
+        throw new Error('Another process holds this dispatch write.');
+      }
+      return saveObservation(launchId, value);
+    });
+    const child = providerChild();
+    vi.mocked(childProcess.spawn).mockImplementation(() => {
+      queueMicrotask(() => {
+        fs.writeFileSync(receipts.artifact(id, 'stdout.log'), outputFrames());
+        fs.writeFileSync(receipts.artifact(id, 'native.md'), 'Report');
+        child.emit('close', 0, null);
+      });
+      return child;
+    });
+    const supervised = superviseStandalone(receipts, id, false, undefined, frozenRuntime()).then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+    if (exhausted) {
+      await Promise.race([observationBusy, supervised]);
+      await vi.advanceTimersByTimeAsync(50);
+    }
+    const rejected = await supervised;
+    assert.deepEqual(unmapped, []);
+    if (!failure && rejected) throw rejected;
+    assert.equal(failure?.code, 'EPERM');
+    if (exhausted) {
+      const observation = receipts.observation(id)!;
+      assert.equal(observation.monitor, 'unavailable', String(rejected));
+      assert.equal(rejected, failure);
+      assert.equal(observation.reason, "Arc could not save the worker's outcome in state.json.");
+      assert.equal(observation.exitCode, 0);
+      assert.equal(observation.signal, null);
+      assert.equal(unavailableWrites, 2);
+      assert.equal(now, 2000);
+      assert.deepEqual(pauses.slice(0, 5), [10, 20, 40, 80, 100]);
+      assert.ok(pauses.every((milliseconds) => milliseconds <= 100));
+      assert.ok(attempts > 1);
+    } else {
+      if (rejected) {
+        assert.equal(receipts.latest(id), null);
+        assert.equal(receipts.observation(id)?.monitor, 'observing');
+        throw rejected;
+      }
+      const event = receipts.latest(id)!;
+      assert.equal(event.outcome, 'succeeded');
+      assert.equal(event.availability, 'available');
+      assert.equal((receipts.result(id, event.eventId) as { text: string }).text, 'Report');
+      assert.equal(JSON.parse(fs.readFileSync(target, 'utf8')).events.length, 1);
+      assert.equal(receipts.observation(id)?.monitor, 'finished');
+      assert.equal(receipts.observation(id)?.exitCode, 0);
+      assert.deepEqual(pauses, [10]);
+      assert.equal(attempts, 1);
+    }
+    assert.equal(
+      fs.readdirSync(path.dirname(target)).some((name) => /^state[.]json[.].*[.]tmp$/.test(name)),
+      false,
+    );
+    assert.equal(vi.mocked(childProcess.spawn).mock.calls.length, 1);
+    assert.deepEqual(unmapped, []);
   },
 );
 
