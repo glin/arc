@@ -21363,7 +21363,7 @@ test('every tone panel.css draws as text reads at 4.5 to 1, or is a named except
     { id: 'light', kind: 'light', table: LIGHT_MODERN_THEME },
   ] as const;
 
-  // Exception ratios must remain within the asserted rounding tolerance.
+  // Each exception records the lowest accepted ratio. A reading may rise above it, but not fall below it by more than the rounding tolerance.
   const KNOWN_FAILING: Partial<Record<string, Partial<Record<'dark' | 'light', number>>>> = {
     // The full context band's background mix reduces contrast below 4.5 in both theme fixtures.
     full: { dark: 2.65, light: 2.04 },
@@ -21390,9 +21390,14 @@ test('every tone panel.css draws as text reads at 4.5 to 1, or is a named except
       );
     } else {
       assert.ok(
-        Math.abs(worst - pinned) < 0.03,
-        `--${tone} now reads at ${worst.toFixed(2)} to 1 on a ${kind} panel, not the pinned ${pinned}; ` +
-          `update KNOWN_FAILING to match, whichever way it moved`,
+        worst < 4.5,
+        `--${tone} now reads at ${worst.toFixed(2)} to 1 on a ${kind} panel, which clears 4.5; ` +
+          `remove its entry from KNOWN_FAILING`,
+      );
+      assert.ok(
+        worst > pinned - 0.03,
+        `--${tone} now reads at ${worst.toFixed(2)} to 1 on a ${kind} panel, below the recorded ${pinned}; ` +
+          `restore its contrast rather than lowering the recorded value`,
       );
     }
   }
