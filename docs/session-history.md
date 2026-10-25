@@ -1,6 +1,6 @@
 # Session history
 
-Use this guide when changing selected reads, older history, metadata recovery, cache generations, refresh, or content search. [Session discovery](session-discovery.md) owns admission, repository scope, and relationships. [Data sources](data-sources.md#source-catalog) owns storage locations. [Retained rendering](rail-and-navigation.md#retained-rendering-contracts) owns browser node updates.
+[Session discovery](session-discovery.md) owns admission, repository scope, and relationships. [Data sources](data-sources.md#source-catalog) owns storage locations. [Retained rendering](rail-and-navigation.md#retained-rendering-contracts) owns browser node updates.
 
 ## Selected session history
 
@@ -76,7 +76,7 @@ Stopped Codex display recovery scans backward from its accepted forward boundary
 
 Codex retained-context reads admit copied metadata only through declared fork ancestry. Tool pairs retain distinct function, custom-tool, and client-search identities. Local shell uses function outputs. Server search outputs require no local call.
 
-Dispatched Codex spend uses worker-owned forward cursors and 256 KiB person-scan slices. An owned final completion or abort admits spend after complete EOF coverage at one revision. Copied turns, identity mismatch, trailing activity, and incomplete records retain the one-hour quiet deadline. Deadline expiry schedules discovery without source growth. Cursor progress schedules continuation without card posts. Changed figures schedule collection and posting independently, including retained launching turns. Accepted posts consume their captured figure revision. Failed or obsolete posts retain pending figures. These cursors and figure revisions remain process-local.
+Dispatched Codex spend uses worker-owned forward cursors and 256 KiB slices that scan for reader prompts. An owned final completion or abort admits spend after complete EOF coverage at one revision. Copied turns, identity mismatch, trailing activity, and incomplete records retain the one-hour quiet deadline. Deadline expiry schedules discovery without source growth. Cursor progress schedules continuation without card posts. Changed figures schedule collection and posting independently, including retained launching turns. Accepted posts consume their captured figure revision. Failed or obsolete posts retain pending figures. These cursors and figure revisions remain process-local.
 
 Closed Claude children reopen only after user or assistant work exceeds their close timestamp by more than one second. File writes and bookkeeping do not establish resumed work. Changed sources scan disjoint 256 KiB chunks backward and reconstruct split records. Unchanged revisions, including absent work timestamps, require no reread. Ordinary-result filtering must preserve `toolEndsTurn`, or completed child sessions never become done.
 
@@ -124,4 +124,4 @@ The session-list box ordinarily filters titles. Content queries search prompt an
 
 Every search word must match within the same prompt or response half. Search includes later prompts and completed responses in reading order. Its independent 16 MiB tail can omit visible older pages. Scoped results report whether the read reached the first turn. Explicit search alone populates the corpus. Cached names update without reparsing unchanged text. Labels, archive state, and agent-run classification apply at query time.
 
-Numeric cost and cache-expiry filters do not narrow content results. Entries carry none of those facts. Unsupported state predicates have no supporting entry facts. Prefix resolution uses accepted scoped identities before other filters narrow the pool. Incomplete discovery suspends unresolved prefixes. Identity-context changes re-evaluate retained entries. [Session list](rail-and-navigation.md#session-list) owns the query language.
+Numeric cost and cache-expiry filters do not narrow content results because entries contain neither fact. Entries also lack facts for unsupported state predicates. Prefix resolution uses accepted scoped identities before other filters narrow the pool. Incomplete discovery suspends unresolved prefixes. Identity-context changes re-evaluate retained entries. [Session list](rail-and-navigation.md#session-list) owns the query language.

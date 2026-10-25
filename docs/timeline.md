@@ -1,6 +1,6 @@
 # Timeline turn model
 
-Use this guide when changing turn boundaries, outcomes, recorded messages, or native child identity. [Components](components.md) identifies source owners.
+[Components](components.md) identifies source owners.
 
 ## Shared turn model
 
@@ -14,7 +14,7 @@ Keep each call's `ordinal` and each message's `stepsBefore` position when trimmi
 
 ### Claude turn boundaries
 
-A tool-use response does not close a Claude turn. A result marked `toolEndsTurn: true` does, including a `SubagentHandback` result. Preserve that result through line filters, including child tails without a prompt. Later model work or a coordinator or peer message resumes the turn. A later stop reason closes it again.
+A tool-use response does not close a Claude turn. A result marked `toolEndsTurn: true` closes it, including a `SubagentHandback` result. Preserve that result through line filters, including child tails without a prompt. Later model work or a coordinator or peer message resumes the turn. A later stop reason closes it again.
 
 A plain `/compact` command closes without a turn when its manual boundary records finite positive input and summary sizes. The boundary's clock must equal or follow the command's clock and belong to the main chain. Model work after that boundary makes the command a turn again. Queued prompts remain independently reviewable, and the preceding turn keeps its outcome.
 
@@ -32,7 +32,7 @@ Claude records a queued prompt when the agent picks it up. Delivery owners must 
 
 Codex records task starts and terminals directly. Copied parent history supplies no own turn, completion, or request. Delayed `turn_context` evidence can retract a turn after its apparent completion. Preserve that classification through append checkpoints and older-page reads.
 
-Codex final answers can arrive through `item_completed`, phased `response_item` messages, or root `agent_message` events. `recordAnswer` joins matching identities first. Its fallback joins equal latest-answer text within two seconds only when no later prompt intervenes. An aborted turn retains its recorded final answer as its summary. [Agent protocols](agent-protocols.md) owns asynchronous delivery, which supplies no final answer.
+Codex final answers can arrive through `item_completed`, phased `response_item` messages, or root `agent_message` events. `recordAnswer` joins matching identities first. Its fallback joins identical text from the latest answer within two seconds, only when no later prompt intervenes. An aborted turn retains its recorded final answer as its summary. [Agent protocols](agent-protocols.md) owns asynchronous delivery, which supplies no final answer.
 
 ## Card sources
 
@@ -74,7 +74,7 @@ Peer handbacks and coordinator messages wake existing turns. Keep handback ids a
 
 `SubagentHandback.message` supplies the child response. Compare it only with the newest eligible closing reply since the latest prompt, peer message, coordinator message, or earlier handback. Containing texts retain one longer answer after trimming outer whitespace. The handback wins equal text. Different texts remain separate answers. Empty or nontext messages supply no response.
 
-Replies after the handback remain `notResponse: after-handback` until a prompt, peer message, or coordinator message wakes the child. Its own background completion notices and no-text harness nudges do not clear that state. Child reads skip sidechain peer and completion attachments. A whole reply of `No response requested.` never becomes the response. Marked replies stay in Activity. Preserve quote fallback when those marks change saved comment reply numbers.
+Replies after the handback remain `notResponse: after-handback` until a prompt, peer message, or coordinator message wakes the child. Its own background completion notices and no-text harness nudges do not clear that state. Child reads skip sidechain peer and completion attachments. A reply containing only `No response requested.` never becomes the response. Marked replies stay in Activity. Preserve quote fallback when those marks change saved comment reply numbers.
 
 ### Skills
 

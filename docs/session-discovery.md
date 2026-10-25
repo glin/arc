@@ -1,6 +1,6 @@
 # Discovering sessions
 
-Use this guide when changing session admission, repository scope, or parent relationships. [Session history](session-history.md) owns selected reads, metadata recovery, and cache migration. [Accepted catalog reads](window-channel.md#accepted-catalog-reads) owns channel qualification and delivery authority.
+[Session history](session-history.md) owns selected reads, metadata recovery, and cache migration. [Accepted catalog reads](window-channel.md#accepted-catalog-reads) owns channel qualification and delivery authority.
 
 ## Session discovery
 
@@ -14,7 +14,7 @@ Agent runs remain discoverable but fold away unless pinned or selected. Classifi
 
 ## Repository scope
 
-A recorded working directory belongs when it lies inside an open folder or a registered worktree of that folder's repository. Claude directory slugs and Codex date directories supply hints, not membership. Without a readable Claude working directory, only an exact open-folder fallback applies. Added worktree roots receive no fallback.
+Repository scope includes recorded working directories inside open folders or registered worktrees of those folders' repositories. Claude directory slugs and Codex date directories supply hints, not membership. Without a readable Claude working directory, only an exact open-folder fallback applies. Added worktree roots receive no fallback.
 
 `RepositoryScope` reads `git worktree list --porcelain -z` in the background. The first listing waits for its answer before changing reader state. Failed initial reads settle on the open folders. Later failures retain each folder's last successful roots.
 
@@ -24,7 +24,7 @@ Open folders always remain. Published roots omit registered worktrees inside ano
 
 Registered checkout identities retain nested worktrees independently of discovery roots. Identity changes alone refresh heading metadata without moving discovery revision or cancelling selection. Each panel compares its selected session's opening folder with its first workspace folder through the most specific registered checkout. Unknown identities omit the starting worktree.
 
-Containment requires a path boundary. Windows drive paths compare without case on every host. Other paths compare without case on Windows and retain case on macOS and Linux. Removed worktree registration and a removed worktree leave an old working directory without repository evidence.
+Containment requires a path boundary. Windows drive paths compare without case on every host. Other paths ignore case on Windows and retain case on macOS and Linux. Removed worktree registration and a removed worktree leave an old working directory without repository evidence.
 
 Continuing a session, compacting it, and handing off responses or selected text use its recorded working directory. The ordinary New launcher uses the editor's open folder. Queued submissions and pending rows wait outside scope and resume when scope returns. Workspace changes revoke scope even with every panel closed.
 
@@ -60,7 +60,7 @@ A dispatch-bearing tree also refuses unknown receipt competition without a quali
 
 ### Progress and limits
 
-One parent retains its first 4096 references. The derived cache retains a deterministic subset of at most 10,000 parent files. Appends preserve existing links. Launch call IDs survive the Activity step bound. Relationship generation changes invalidate both providers, including unchanged positive and negative entries. Metadata and Codex opening generations remain independent.
+Each parent retains its first 4096 references. The derived cache retains a deterministic subset of at most 10,000 parent files. Appends preserve existing links. Launch call IDs survive the Activity step bound. Relationship generation changes invalidate both providers, including unchanged positive and negative entries. Metadata and Codex opening generations remain independent.
 
 Discovery freezes source targets within an epoch. Charged quanta acknowledge source progress and completion changes. Restart admission rechecks saved completions. Finished sources keep their captured cuts until the next epoch. Unfinished Claude sources withhold complete catalog replies. Codex sources permit complete replies with their own coverage false and continuation requested. Cursor retention uses a soft 64 MiB allowance. It preserves one protected Claude source, oversized fragments, unmatched launches, and finished evidence headers. Partial replies alone release no worker memory. Skipped oversized Codex records keep coverage incomplete through later appends and EOF.
 
