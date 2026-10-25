@@ -359,7 +359,7 @@ export class DispatchReceipts {
     const paths = this.platform === 'win32' ? path.win32 : path.posix;
     return paths.join(paths.dirname(this.root), 'cache', 'dispatch-relationships', `${id}.json`);
   }
-  // Callers publish completed verification separately from the read-only scan.
+  // Callers publish completed verification separately from receipt discovery.
   checkpointRelationships(): void {
     const paths = this.platform === 'win32' ? path.win32 : path.posix;
     for (const [id, digest] of this.verifiedRelationships) {
@@ -419,6 +419,7 @@ export class DispatchReceipts {
     signal?: AbortSignal,
   ): RelationshipScan<void> {
     const reader = new RelationshipReader(signal, this.platform);
+    const launches = new Set<string>();
     let directory: fs.Dir | undefined;
     const close = () => {
       if (directory) {
@@ -444,6 +445,7 @@ export class DispatchReceipts {
         reader.progress = emptyRelationshipStep();
         if (!entry) break;
         if (!entry.isDirectory() || !DISPATCH_ID.test(entry.name)) continue;
+        launches.add(entry.name);
         yield* this.relationship(entry.name, catalog, signal);
       }
       yield reader.progress;
@@ -457,6 +459,49 @@ export class DispatchReceipts {
       close();
       reader.dispose();
     }
+    if (!reader.refusal && !signal?.aborted) yield* this.pruneRelationshipCache(launches, signal);
+  }
+  private *pruneRelationshipCache(launches: ReadonlySet<string>, signal?: AbortSignal): RelationshipScan<void> {
+    const paths = this.platform === 'win32' ? path.win32 : path.posix;
+    const cache = paths.dirname(this.relationshipCacheFile(''));
+    const reader = new RelationshipReader(signal, this.platform);
+    let directory: fs.Dir | undefined;
+    const close = () => {
+      if (directory) {
+        directory.closeSync();
+        directory = undefined;
+      }
+    };
+    signal?.addEventListener('abort', close, { once: true });
+    try {
+      yield* reader.path(this.root, true);
+      yield* reader.path(cache);
+      directory = yield* reader.operation('checks', () => {
+        const opened = fs.opendirSync(cache, { bufferSize: 1 });
+        directory = opened;
+        if (signal?.aborted) {
+          close();
+          throw new Error('The dispatch relationship scan stopped.');
+        }
+        return opened;
+      });
+      for (;;) {
+        const entry = yield* reader.operation('entries', () => directory!.readSync());
+        if (!entry) break;
+        const id = entry.name.slice(0, -5);
+        if (!entry.isFile() || !entry.name.endsWith('.json') || !DISPATCH_ID.test(id) || launches.has(id)) continue;
+        if (yield* reader.stat(paths.join(this.root, id))) continue;
+        yield* reader.operation('checks', () => fs.unlinkSync(paths.join(cache, entry.name)));
+        this.verifiedRelationships.delete(id);
+      }
+    } catch {
+      // Later discovery retries unavailable cache cleanup without refusing receipt evidence.
+    } finally {
+      signal?.removeEventListener('abort', close);
+      close();
+      reader.dispose();
+    }
+    yield reader.progress;
   }
   private *readRelationship(
     id: string,

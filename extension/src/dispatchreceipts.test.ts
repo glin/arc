@@ -297,6 +297,57 @@ function competingRelationshipFixture(parent: 'claude' | 'codex', child: 'claude
   return { ...fx, competitor };
 }
 
+test.each(['launch-folder', 'dispatch-root'] as const)(
+  'receipt discovery prunes verification entries after removing the %s',
+  (removed) => {
+    const fx = competingRelationshipFixture('claude', 'codex');
+    assert.equal(drainRelationships(fx.receipts.relationships(fx.catalog)).length, 2);
+    fx.receipts.checkpointRelationships();
+    const cache = path.join(fx.home, 'cache', 'dispatch-relationships');
+    const expired = path.join(cache, `${fx.launch.launchId}.json`);
+    const retained = path.join(cache, `${fx.competitor.launchId}.json`);
+    const retainedBytes = fs.readFileSync(retained);
+    const retainedIdentity = fs.statSync(retained, { bigint: true }).ino;
+    const unrelated = path.join(cache, 'unrelated.json');
+    fs.writeFileSync(unrelated, 'keep');
+    const folder = removed === 'dispatch-root' ? fx.receipts.root : path.join(fx.receipts.root, fx.launch.launchId);
+    fs.renameSync(folder, folder + '.removed');
+    const unlink = fs.unlinkSync;
+    let deletions = 0;
+    vi.spyOn(fs, 'unlinkSync').mockImplementation((file) => {
+      deletions++;
+      unlink(file);
+    });
+    syncBuiltinESMExports();
+    const scan = new DispatchReceipts(fx.home).relationships(fx.catalog);
+    let complete = false;
+    try {
+      for (let steps = 0; steps < 100_000; steps++) {
+        const checks = steps % 2;
+        const before = deletions;
+        const next = scan.next({ entries: 1, checks, bytes: 37 });
+        assert.ok(deletions - before <= checks);
+        if (next.done) {
+          complete = true;
+          break;
+        }
+        assert.ok(next.value.checks <= checks && next.value.entries <= 1 && next.value.bytes <= 37);
+      }
+      assert.equal(complete, true);
+      assert.equal(fs.existsSync(expired), false);
+      if (removed === 'dispatch-root') assert.equal(fs.existsSync(retained), false);
+      else {
+        assert.deepEqual(fs.readFileSync(retained), retainedBytes);
+        assert.equal(fs.statSync(retained, { bigint: true }).ino, retainedIdentity);
+      }
+      assert.equal(fs.readFileSync(unrelated, 'utf8'), 'keep');
+      assert.equal(deletions, removed === 'dispatch-root' ? 2 : 1);
+    } finally {
+      scan.return();
+    }
+  },
+);
+
 test.each(['startup', 'witness', 'bytes'] as const)('receipt refusals retain competing %s evidence', (stage) => {
   for (const parent of ['claude', 'codex'] as const)
     for (const child of ['claude', 'codex'] as const)
