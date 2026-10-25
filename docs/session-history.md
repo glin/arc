@@ -10,7 +10,7 @@ Selection starts with a bounded tail. Its loading payload precedes metadata work
 
 A completed prefix can publish when the same file grows during reading, then resume at the new revision. Append reuse validates physical identity and a bounded content anchor. Replacement, shrinkage, same-size rewrites, and incompatible identity discard affected work. Read failures retain drawable cards and show failed history status. Without cards, they show a diagnosis. Refresh or selection retries.
 
-Older history reads semantic pages without enlarging the ordinary tail or reparsing it. One request runs at a time, with one cursor per session. The sentinel requests history within one viewport. Its button supports explicit and keyboard requests. Loading and accepted pages repaint selection while catalog refresh runs.
+Older history uses semantic pages without enlarging or reparsing the ordinary tail. One request runs at a time, with one cursor per session. [`webview/history-control.ts`](../extension/src/webview/history-control.ts) owns automatic and explicit requests.
 
 A page must establish both semantic edges before admission. A request containing only represented turns continues within a bound derived from loaded turns. Pages merge by stable turn identity. Each page retains target turns, an older guard, and required boundary records. Relevant turns can exceed a chunk. Irrelevant sparse lines do not accumulate.
 
@@ -20,9 +20,9 @@ A tail starting after byte zero excludes records touching its floor. Prompt or t
 
 An accepted append retains displaced completed turns in one bounded recent page. Its limit is the ordinary turn limit minus turns remaining in the tail. Explicit older pages stay separate. The selected cache budget bounds recent-page content except for one newest turn. A fresh panel starts from its bounded tail.
 
-Accepted turns, source checkpoints, and older pages share `arc.sessionCacheMiB`. Selection protects the current session. Unselected sessions remain while the total fits, then leave in least-recently-viewed order. An oversized selected value evicts every optional session and stays retained. Returning restores retained pages without reading. Rendering updates recency in place. Eviction leaves unread metadata and completed lifetime facts available.
+Accepted turns, source checkpoints, and older pages share `arc.sessionCacheMiB`. Selection protects the current session, including an oversized value. Optional sessions leave in least-recently-viewed order. Eviction preserves unread metadata and completed lifetime facts. [`historypages.ts`](../extension/src/historypages.ts) owns retention and eviction.
 
-Session figures cover the tail plus loaded pages and name that count. Search uses a separate window and can cover less than the visible timeline. Empty states describe selection, not the background parse set. `historypages.ts` owns page admission, displaced windows, coverage, and eviction.
+Session figures cover the tail plus loaded pages. Empty states describe selection, not the background parse set.
 
 ## Cache ownership
 
@@ -86,25 +86,25 @@ Accepted windows publish current turn facts before commit-repository discovery w
 
 ## Saved state and refresh
 
-`turnview.ts` normalizes bounded saved collections, validates session keys, and ignores unknown fields. Extension state supplies shared selection and read state across restored tabs. Derived metadata checkpoints follow the first posted render. New entries checkpoint immediately. Later revisions are rate-limited. Shutdown flushes pending writes, but reload persistence cannot depend on disposal.
+[`turnview.ts`](../extension/src/turnview.ts) owns saved-state normalization. VS Code state shares selection and read state across restored tabs. Derived metadata checkpoints follow the first posted render. Later writes use [`DerivedCacheCheckpointState`](../extension/src/derivedcache.ts). Reload persistence cannot depend on disposal.
 
 Initial metadata admission uses a 64 MiB budget, including Codex's separate title head. Catalog size determines admission charges, so concurrent growth can exceed physical read charges. Post-render turn-start enrichment also uses a nominal 64 MiB admission allowance. Its first oversized classification request remains admissible. Unread counts stay unknown until metadata or complete lifetime facts qualify them.
 
 Expanded metadata records complete coverage, including empty results, separately from partial windows. Failed and short reads establish no coverage. Partial windows suppress identical tails while unresolved context and outcomes remain eligible for forward recovery. Successful partial and complete negative coverage survive restart. Runtime progress rebuilds under admission. Failed reads retry on ordinary visible refreshes, including refreshes that skip rendering.
 
-Metadata recovery retains one live reducer and segmented fragments. Waiting sources retain identities alone. Slices read at most 16 MiB from byte zero or validated continuation. Facts materialize only at stable EOF. Compatible appends require identity and a bounded content anchor.
+Metadata recovery publishes facts only at stable EOF. Its worker retains one live reducer and reads at most 16 MiB per slice. Compatible appends require identity and a bounded content anchor. [`progressiveworker-entry.ts`](../extension/src/progressiveworker-entry.ts) owns recovery scheduling.
 
-Records exceeding 1 MiB reduce while reading. Strings retain at most their first and last 64 KiB. Long `data:` strings retain their header through the first comma. `replacement_history` becomes `[]`. Invalid reduced JSON is dropped. Reduced unfinished records have a 16 MiB limit. Retained payload has a 64 MiB limit. Reservations cover new records. Pressure counts live payload in batches yielding after 512 values. Ignored chunks skip recounting.
+Recovery reduces records above 1 MiB through [`OversizedRecordReducer`](../extension/src/oversizedrecord.ts). Reduced unfinished records have a 16 MiB limit. Retained payload has a 64 MiB limit, including reservations for new records. [`history.ts`](../extension/src/history.ts) owns payload admission and accounting.
 
 Exhaustion preserves accepted facts and incomplete coverage, persists its recovery rule, and stops identical attempts. An older exhausted rule retries once. Source changes, accepted selection, or explicit older-history requests reopen one attempt. Automatic selected refresh and attachment continuation preserve exhaustion. Older pages never supply current metadata. `heldStats` preserves earlier context across tails missing the prompt or first usage. Context evidence, complete negative coverage, shrinkage, or replacement releases it.
 
-Refresh observes transcript metadata, snapshot triggers, Codex names, and live child state. Every cache key must include external facts that change its answer. Metadata recovery runs one eligible session at a time and persists recovered facts. Repaint and Project cost signatures remain separate. Selection and Codex names affect repaint. Selected and targeted sources receive promoted integrity checks. [Project cost integrity scheduling](accounting.md#project-cost-integrity-scheduling) owns deadlines.
+Cache keys must include external facts that change their answers. Repaint and Project cost signatures remain separate. Selection and Codex names affect repaint. Selected and targeted sources receive promoted integrity checks. [Project cost integrity scheduling](accounting.md#project-cost-integrity-scheduling) owns deadlines.
 
-Watcher events use a trailing scheduler with a maximum wait of one second during continuous writes. Known change paths receive targeted validation. Renames, missing names, unknown paths, changed identities, watcher failures, and integrity polls use broad discovery. Polls run every five seconds while visible. Broad walks discover new Codex children and Claude child spend sources. Watcher loss clears retained rollout stats. Hidden walks stat every rollout. `CodexStatCache` and `SubagentDirectoryCache` own active-window, settle-window, and revalidation rules.
+Watcher events batch for at most one second during continuous writes. Visible panels poll every five seconds. [`watcherRefreshDecision`](../extension/src/scheduler.ts) selects targeted validation or broad discovery. Watcher loss clears retained rollout stats. Hidden walks stat every rollout. [`CodexStatCache`](../extension/src/codex.ts) and `SubagentDirectoryCache` in [`transcript.ts`](../extension/src/transcript.ts) own revision reuse.
 
-One catalog refresh runs at a time. Waiting triggers merge repaint intent and broad-walk demand, or union named files when every trigger is targeted. A waiting trigger replaces a refresh past its 30-second deadline. Last-host disposal, workspace changes, and repository-scope replacement abandon refresh and waiting work. Hiding a host stops polling without abandoning its current refresh.
+One catalog refresh runs at a time. [`mergeRefreshRequests`](../extension/src/scheduler.ts) combines waiting triggers. A waiting trigger replaces a refresh past its 30-second deadline. Last-host disposal, workspace changes, and repository-scope replacement abandon refresh and waiting work. Hiding a host stops polling without abandoning its current refresh.
 
-Selected-only updates bypass catalog refresh and reuse the held catalog. They stat selection alone and draw held content synchronously. Worker completion refreshes selected facts and older pages. Accepted changes without a worker round trip still require publication. Selection's watermark and row wording use the same read state. A suppressed standalone row post falls back to the refresh's final publication.
+Selected-only updates reuse the held catalog without catalog refresh. Accepted changes still require publication. Selection's watermark and row wording use the same read state. A suppressed standalone row post falls back to the refresh's final publication.
 
 Cold Codex discovery asynchronously primes missing openings with eight concurrent reads and walks in cooperative four-millisecond slices. Directory reads remain synchronous and uninterruptible. Cancellation stops further reads and a later refresh starts again. Search keeps only its latest waiting query. Older-history requests also wait for the replacement cold pass. Initial publication uses a complete listing. Later synchronous opening reads handle new rollouts, refused reads, and grown empty sources. Refusals retry after one second, then every 30 seconds. Each refresh owns and discards its enumeration when scope or visible-ready admission fails.
 
@@ -114,14 +114,14 @@ Startup, loading wording, stable browser nodes, list deltas, focus preservation,
 
 ## Session name
 
-Saved sessions rename through their heading or session-list context menu. Provisional sessions offer neither route. Confirmation redraws both names together. [Context menus](panel-navigation.md#context-menus-and-copy) owns the controls. [Agent protocols](agent-protocols.md#session-rename) owns persistence.
+[Context menus](panel-navigation.md#context-menus-and-copy) owns rename controls. [Agent protocols](agent-protocols.md#session-rename) owns persistence. [`sessionnames.ts`](../extension/src/sessionnames.ts) owns shared name precedence across read windows.
 
-Claude custom titles outrank generated titles. The newest title wins within each kind. Eligible typed-prompt fallback reads the first 128 KiB. Locally answered commands give way to the next typed or reader-queued prompt. Whole-file reads reach later prompts. Codex fallback reads the first 1 MiB, excludes incomplete trailing records, injected context, and images, and cannot name an oversized first prompt. `VERSION` invalidates title rules independently from opening generation. Initial-name subscriptions share one Codex index per path and revision. Filename-free events rescan retained admitted directories alone.
+Claude fallback names read the first 128 KiB. Locally answered commands give way to the next typed or reader-queued prompt. Whole-file reads reach later prompts. Codex fallback reads the first 1 MiB and cannot name an oversized first prompt. [`transcript.ts`](../extension/src/transcript.ts) and [`codex.ts`](../extension/src/codex.ts) own prompt eligibility. `VERSION` invalidates title rules independently from opening generation. Initial-name subscriptions share one Codex index per path and revision. Filename-free events rescan retained admitted directories alone.
 
 ## Search
 
-The session-list box ordinarily filters titles. Content queries search prompt and response text and return turn snippets with match positions. `turnsearch.ts` and `domain/session-query.ts` own parsing and matching. Browser `search.ts` consumes results without reinterpreting query syntax.
+[`turnsearch.ts`](../extension/src/turnsearch.ts) and [`domain/session-query.ts`](../extension/src/domain/session-query.ts) own content matching and snippets. Browser `search.ts` consumes results without reinterpreting query syntax.
 
-Every search word must match within the same prompt or response half. Search includes later prompts and completed responses in reading order. Its independent 16 MiB tail can omit visible older pages. Scoped results report whether the read reached the first turn. Explicit search alone populates the corpus. Cached names update without reparsing unchanged text. Labels, archive state, and agent-run classification apply at query time.
+Search reads an independent 16 MiB tail and can omit visible older pages. Scoped results report whether it reached the first turn. Explicit search alone populates the corpus. Labels, archive state, agent-run classification, and cached names update without reparsing unchanged text.
 
 Numeric cost and cache-expiry filters do not narrow content results because entries contain neither fact. Entries also lack facts for unsupported state predicates. Prefix resolution uses accepted scoped identities before other filters narrow the pool. Incomplete discovery suspends unresolved prefixes. Identity-context changes re-evaluate retained entries. [Session list](session-queries.md#session-query-syntax) owns the query language.

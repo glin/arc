@@ -4,7 +4,7 @@
 
 ## Session discovery
 
-`allSessions` combines Claude transcripts and Codex rollouts in activity order. Listing establishes membership separately from parsing selected turns. Persisted bounded metadata and turn starts supply unread, status, and context facts independently of selection. Completed primary spend sources recover the newest start and outcome when bounded reads miss them. The incremental spend index supplies session lifetime cost. Pins change placement alone.
+[`allSessions`](../extension/src/panelhost.ts) owns catalog assembly. Membership remains separate from selected-turn parsing. Bounded metadata, turn starts, and completed primary spend sources supply session facts independently of selection. The incremental spend index supplies lifetime cost.
 
 Claude admission requires an eligible typed human prompt. A command answered locally by the CLI supplies no evidence, even when model work follows. Model work after manual compaction makes `/compact` eligible again. A command without a recorded CLI answer remains eligible. Refresh rechecks pending command evidence and preserves reader state when admission changes.
 
@@ -16,13 +16,13 @@ Agent runs remain discoverable but fold away unless pinned or selected. Classifi
 
 Repository scope includes recorded working directories inside open folders or registered worktrees of those folders' repositories. Claude directory slugs and Codex date directories supply hints, not membership. Without a readable Claude working directory, only an exact open-folder fallback applies. Added worktree roots receive no fallback.
 
-`RepositoryScope` reads `git worktree list --porcelain -z` in the background. The first listing waits for its answer before changing reader state. Failed initial reads settle on the open folders. Later failures retain each folder's last successful roots.
+[`RepositoryScope`](../extension/src/repositoryscope.ts) owns Git worktree reads. The first listing waits for scope before changing reader state. Failed initial reads use open folders. Later failures retain prior roots, because temporary Git failures must not remove sessions or reader state.
 
-Scope reads ask Git again after 15 seconds. Additions apply immediately. A removal waits for another answer after 5 seconds. Each root leaves only when both answers omit it. A failed answer neither confirms nor discards that folder's held removals. Failed confirmation reads retry after 5 seconds at most three times, then use the 15-second interval.
+Scope reads ask Git again after 15 seconds. Removals require a second answer after 5 seconds, because Git can briefly omit registered worktrees. Failed answers preserve held removals. Confirmation retries at 5 seconds stop after three failures and return to the regular interval.
 
-Open folders always remain. Published roots omit registered worktrees inside another root, while removal confirmation uses unfiltered per-folder answers. A hidden nested root becomes published when its containing root leaves. Opening a subfolder retains its enclosing repository root. Nested-only changes move no scope revision and cancel no selection.
+Open folders always remain. Removal confirmation uses unfiltered per-folder answers, including nested roots hidden by published roots. Nested-only changes move no scope revision and cancel no selection.
 
-Registered checkout identities retain nested worktrees independently of discovery roots. Identity changes alone refresh heading metadata without moving discovery revision or cancelling selection. Each panel compares its selected session's opening folder with its first workspace folder through the most specific registered checkout. Unknown identities omit the starting worktree.
+Registered checkout identities remain independent of discovery roots. Identity-only changes refresh headings without moving discovery revision or cancelling selection. [`startingWorktree`](../extension/src/repositoryscope.ts) owns heading worktree selection.
 
 Containment requires a path boundary. Windows drive paths compare without case on every host. Other paths ignore case on Windows and retain case on macOS and Linux. Removed worktree registration and a removed worktree leave an old working directory without repository evidence.
 
