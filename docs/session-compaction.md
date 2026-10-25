@@ -1,6 +1,6 @@
 # Session compaction
 
-Use this guide for native ownership, manual compaction, agent-requested compaction, and continuations. [`compactrequest.ts`](../extension/src/compactrequest.ts) owns admission and delivery. [`compactstore.ts`](../extension/src/compactstore.ts) owns saved receipts.
+[`compactrequest.ts`](../extension/src/compactrequest.ts) owns admission and delivery. [`compactstore.ts`](../extension/src/compactstore.ts) owns saved receipts.
 
 ## Provider operations
 
@@ -26,7 +26,7 @@ Native evidence retains session, tool, literal command, and successful settlemen
 
 Claude live prompts join shared model work rather than receiving independent results. Native `session_state_changed` events establish running, requires-action, and idle state. Model completion and idle settle joined submissions, release settled attachments, and drain the queue. Preparing prompts stay open. Background tasks do not hold `/compact`. Accepted Stop establishes idle before its aborted result. That result supplies no model completion for a subsequently sent command. Without state reports, results remain the turn-ending evidence.
 
-Preserve agent-started ownership when no Arc prompt is open or preparing. Root tool, launch, or result evidence after a result can open it. Result, accepted Stop, and exit close it. Earlier idle reports cannot close newer agent-started work. Ordinary reader input replaces that owner. Subagent text never creates it. Pending slash inputs leave it available until qualified root model evidence transfers ownership. Native local results never restore completed model owners. Negative results settle inputs still preparing and suppress later reader-authority callbacks. [Claude receipts](agent-protocols.md#guarded-receipts) defines replay settlement.
+Earlier idle reports cannot close newer agent-started work. Subagent text never creates a root owner. `AgentSession` in [`agenthost.ts`](../extension/src/agenthost.ts) owns creation, transfer, and settlement of agent-started work. [Claude receipts](agent-protocols.md#guarded-receipts) defines replay settlement.
 
 Codex root evidence without a pending submission creates a provider-originated owner under its exact thread and turn. Preserve early events in arrival order until pending starts settle. Accepted starts retain their reader owner. Unrelated turns retain their reader revision and child generation. Dispatch ownership remains separate from panel response ownership.
 
@@ -44,7 +44,7 @@ Require successful tool settlement, exact-turn success, and a retained final res
 
 ### Reader actions and delivery
 
-Stop, compact, answers, setting picks, and slash commands cancel unsubmitted work and suppress continuation. All except answers advance reader revision. Reader sends and queued delivery carry pending work instead. Wait until native answering evidence rebinds it to that turn and revision. Require that turn's own success and retained response. Queue changes retain the turn under the new revision.
+Stop, compact, answers, setting picks, and slash commands cancel unsubmitted work and suppress continuation. Reader sends and queued delivery carry pending work instead. Answers keep the reader revision because they can approve the initiating tool. `readerAction` in [`compactrequest.ts`](../extension/src/compactrequest.ts) owns revision changes and carry rebinding.
 
 Retained and delivered reader sends hold compaction. Unknown membership defers release until row refresh. Dropping the final undelivered send releases its hold and schedules delivery checks. Claude prompt writes advance native generation, including prompts joining running work. `readerPrompt()` appends the request-identifying carry line to delivered text only. Saved drafts and queues retain original text.
 
@@ -54,11 +54,11 @@ Continuation waits for positive idle evidence and no unresolved native compactio
 
 ### Recorded response recovery
 
-Hold final responses in a card or recorded turn. Provider-originated turns have no reader card. `RecordedReplies` in [`sessionreads.ts`](../extension/src/sessionreads.ts) retains wanted responses and replaces superseded responses within their owned turn. Match exact native turn and assistant source ID. Rotate waiting sessions through one resumable source job, independent of callback lifetime.
+Provider-originated turns have no reader card. `RecordedReplies` in [`sessionreads.ts`](../extension/src/sessionreads.ts) waits for their responses to appear in recorded turns. It matches exact native turn and assistant source ID independently of callback lifetime.
 
-Freeze each source extent. Share a one MiB read quantum across forward reads, anchors, and Claude duplicate lookup. One generator step adds at most two 64 KiB reads. Permit at most 512 steps per pass. Retain an eight MiB parser-payload charge and one MiB reduced-record limit. Framing buffers, pending duplicate lookup, identity matches, and final parser copies add bounded storage. Duplicate lookup keeps one target identity and a streamed line, trading repeated prefix reads for bounded storage.
+Freeze each source extent. Forward reads, anchors, and Claude duplicate lookup share one read allowance. Duplicate lookup trades repeated prefix reads for bounded storage. `RECORDED_REPLY_LIMITS` and `RecordedReplies.read` own read quanta and parser limits.
 
-Keep provider answer reducers' eligibility rules, including Claude handbacks and repeated notices. Codex explicit reads retain final text and assistant IDs. Only current wanted-generation and catalog-revision jobs establish complete coverage. Completed cycles wait for source changes or new wanted responses. New requests preserve active finite jobs. Payload-limit failures leave callbacks pending for that revision. Missing and stale reads remain retryable. Absent, replaced, or ineligible sources release recovery. Disposal releases scans and callbacks. Source and scope still guard delivery. Successful turns wait for responses while their retained child stays live.
+Recovery uses provider answer reducers, including their Claude handback and repeated-notice rules. Codex explicit reads retain final text and assistant IDs. Only current wanted-generation and catalog-revision jobs establish complete coverage. Payload-limit failures leave callbacks pending for that revision. Source and scope still guard delivery. Successful turns wait for responses while their retained child stays live.
 
 ## Continuation storage
 

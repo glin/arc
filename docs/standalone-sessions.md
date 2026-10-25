@@ -1,6 +1,6 @@
 # Standalone sessions
 
-Use this guide for dispatch links, standalone native identity, process observation, receipts, and output capture. [CLI launch options](cli.md#standalone-launches) owns command usage.
+[CLI launch options](cli.md#standalone-launches) owns command usage. [`cli/src/standalone.ts`](../cli/src/standalone.ts) owns process observation and capture. [`dispatchreceipts.ts`](../extension/src/dispatchreceipts.ts) owns receipt validation and publication.
 
 ## Link a launched session
 
@@ -25,7 +25,7 @@ Reject malformed, oversized, repeated, and ambiguous receipts. Direct Codex link
 
 ## Standalone observation contracts
 
-[`cli/src/standalone.ts`](../cli/src/standalone.ts) reads provider frames or launch-bound Claude registry entries. [`dispatchreceipts.ts`](../extension/src/dispatchreceipts.ts) validates accepted identity and replacement. Claude print also accepts a new native user record matching its session hint, physical directory, and submitted prompt.
+Identity comes from provider frames or launch-bound Claude registry entries. Claude print also accepts a new native user record matching its session hint, physical directory, and submitted prompt.
 
 Keep native identity separate from relationship readiness. Receipts retain accepted source identity, pinned directory, physical cwd, opening length, and digest. Unknown paths require a launch-private binary pathname-digest set and immutable bounded manifest. Preparation failure preserves ordinary launch and output observation, with relationship evidence unavailable. Recovery never reconstructs the prelaunch set or replenishes its source allowance. A separate binding retains root witness identity.
 
@@ -43,11 +43,11 @@ Foreground process identity uses Windows creation and command data, Linux boot i
 
 Reserve private directories under `${ARC_HOME:-~/.arc}/dispatch` before spawning. Bound complete serialized receipts before reservation. Retain activation, requester, policy, prompt digest, completion route, and native argument/command-line digests. Bind prepared file identity before publishing accepted native turn identity. Missing root witnesses recover only matching binding bytes and identity. Observation admission checks complete saved bytes and status metadata. Retry transient publication replacement errors only within the finite deadline.
 
-Immutable events retain private Markdown report paths and digests. Aliases copy reports and supply no authoritative bytes. Refresh reads launch-private reports through retained physical identity. Claims and dispositions bind exact events. Receipts supply no usage or billing evidence. Existing relationship discovery retains reader ownership and original-source cost attribution. `run.ts` prints requested dispatch markers after launch JSON, separately from worker output.
+Immutable events retain private Markdown report paths and digests. Aliases supply no authoritative bytes. Refresh reads launch-private reports through retained physical identity. Claims and dispositions bind exact events. Receipts supply no usage or billing evidence. Relationship discovery retains reader ownership and original-source cost attribution. [`run.ts`](../cli/src/run.ts) owns dispatch-marker output, separate from worker output.
 
 Saved response reads reuse provider reducers and bounded forward recovery through the accepted scoped catalog. Keep complete raw JSON text through 49 MiB before metadata reduction. Each source retains at most 512 MiB of conservative payload charge. Retain at most 32 sources. Frozen UTF-8 reports have an independent eight MiB limit. Claude agreement requires complete final text and message identity. Codex requires exact native turn identity. Missing evidence stays pending. Receipt errors preserve observations for retry without changing accepted delivery.
 
-Hosted waits end at channel deadline or disconnect without changing workers. Event indexes have bounded segments without a total launch or event-count limit. Status projects launch identity without rereading configuration. It omits disposition text and native ending evidence. Exact-event reads retain both. Status metadata reserves space for one maximally admitted event and consumption digests.
+Hosted waits end at channel deadline or disconnect without changing workers. Event indexes have bounded segments without a total launch or event-count limit. Status omits disposition text and native ending evidence. Exact-event reads retain both. `DispatchReceipts.status` owns projection and page sizing.
 
 Immutable write-lock successors serialize writes and dead-owner recovery. Successor and release files preserve ownership history. Live or uncertain owners retain locks. Windows refuses to replace a launch file while a reader holds it open. Launch-folder writes retry transient rename failures. Outcome publication retries under its acquired write lock. Identity checks detect observed replacement and redirection, without protecting concurrent metadata-preserving rewrites.
 
@@ -57,15 +57,15 @@ Detached providers write inherited files independently of supervisors and editor
 
 Claude native capture holds an exclusive output claim and drains bounded slices from durable positions. Native terminal evidence ends capture after remaining bytes drain. Exhausted drains retain positions and private output for recovery. Capture checkpoints keep private positions and alias physical identities. A separate receipt lock reloads committed positions before append. Preserve another launch's alias. Without an alias witness, resume private output only.
 
-Requested print logs use a separate capture process, forwarding provider PID and close events to the finite supervisor. `output-owner.json` retains ownership, state, and source failures. Before close, contention uses time since the last successful flush and a finite wait allowance. After close, alias and receipt-lock contention share a fixed drain deadline and finite allowance. Final retries charge each channel's original read allowance before writing bytes. Source failure ends capture while inherited provider files remain.
+Requested print logs use a separate capture process, forwarding provider PID and close events to the finite supervisor. `output-owner.json` retains ownership, state, and source failures. Alias and receipt-lock contention share a fixed drain deadline after close. `produceStandaloneOutput` owns flush retries and drain allowances. Source failure ends capture while inherited provider files remain.
 
-Log reads retain one bounded frame and chunk without bounding aggregate output. Foreground scans bound bytes, yield between chunks, and retain cumulative deadlines. Versioned checkpoints keep completed frames, bounded pending bytes, and file identity. Recognized versions check device, inode, and minimum size before restoring positions. Missing, replaced, or truncated output supplies no new report. These checks prove neither prefix integrity nor historical truncate-and-regrow detection. Older versions remain readable. Unknown versions restart from original output.
+`FrameStream` and `logChunks` own frame and read-chunk limits. Versioned checkpoints keep completed frames, bounded pending bytes, and file identity. Recognized versions check device, inode, and minimum size before restoring positions. Missing, replaced, or truncated output supplies no new report. These checks prove neither prefix integrity nor historical truncate-and-regrow detection. Older versions remain readable. Unknown versions restart from original output.
 
 Checkpoints encode at most one 49 MiB pending frame as base64. JSON allowance also covers an eight MiB report and retained native message identities. Serialization and parsing have no hard latency bound. Appends share one cumulative allowance and deadline. Snapshot EOF alone does not establish work exhaustion.
 
 ### Attended launches and refusal
 
-`run.ts` checks attended terminal support before reserving receipts or spawning. Attended Codex uses interactive arguments and inherited terminal I/O. Its exit supplies no final response evidence. Writable attended Claude attaches only after background binding. Terminal failure retains the launch and result. Terminal scripts carry the selected receipt root and nonsecret selectors into existing terminal environments.
+Attended Codex uses interactive arguments and inherited terminal I/O. Its exit supplies no final response evidence. Writable attended Claude attaches only after background binding. Terminal failure retains the launch and result. Terminal scripts carry the selected receipt root and nonsecret selectors into existing terminal environments.
 
 Claude background launch refuses untrusted working folders, including new folders within trusted ones. Codex exec refuses untrusted folders outside Git. Publish recognized refusal as failed only with nonzero exit, no signal, blank stdout, and complete reads of both logs. Growth during reading makes a log incomplete. Resume retains recognized refusals without rereading logs, and preserves saved provider messages when logs become unreadable. Other endings without acknowledgment or native turn keep their outcome and add the first stderr line to the reason.
 
