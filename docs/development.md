@@ -137,7 +137,7 @@ Wait for the ready message, then open this checkout in VS Code. Press F5 and sel
 
 The launch passes the checkout as a positional folder argument on Windows. Do not use `${workspaceFolder}` with `--folder-uri`, because VS Code keeps the Windows path instead of creating a file URI. If F5 reuses a development host without a folder, stop debugging and close that host before starting again.
 
-The server binds strictly to `127.0.0.1:5173`. Stop a conflicting process before retrying. An open panel shows its recovery command while the server is down and reloads when it returns. Syntax errors retain the last working panel during updates. Fix and save to recover. Check reconnects with a reopened panel and a restored tab.
+The server binds strictly to `127.0.0.1:5173`. Stop a conflicting process before retrying. A panel opened while the server is down shows its recovery command and reloads when the server returns. Syntax errors retain the last working panel during updates. Fix and save to recover. Check reconnects with a reopened panel and a restored tab.
 
 Development command selection follows the [bundled tools contract](installation.md#bundled-tools). CLI source saves update `dist/cli.cjs`. Extension-host source saves rebuild `extension/dist/extension.js`. Reload the Extension Development Host to apply them. The panel does not present extension-host changes as hot updates.
 
