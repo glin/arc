@@ -5,7 +5,7 @@ description: Check Arc in a real VS Code window without computer use. Drives the
 
 # Isolated editor
 
-The commands, options, and cleanup rules live in [Isolated extension host](../../../docs/development.md#isolated-extension-host). Read that section before the first run.
+The commands, options, and cleanup rules live in [Isolated extension host](../../../docs/isolated-editor.md#isolated-extension-host). Read that section before the first run.
 
 1. Confirm that no cheaper check answers the question. The order is the testing ladder in `CLAUDE.md`, under Development workflow. Its rules for the owner's window and for computer use apply here.
 2. Build the checkout under test.

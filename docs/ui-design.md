@@ -57,7 +57,7 @@ Distinguish focus, selection, unread state, and agent state. Pair color with vis
 
 For implementation, follow [Development](development.md#fast-iteration) and its build and screenshot workflow. For a proposal or panel review, use [panel-mockup](../.claude/skills/panel-mockup/SKILL.md), including its production markup and data cases.
 
-Compare the changed component with its rendered peers at wide and narrow widths in both default themes. For color changes, include dark and light high-contrast themes and a representative installed custom theme. The [isolated editor](development.md#isolated-extension-host) offers only the built-in themes, so the owner checks the custom theme in their own window. Do not treat a missing theme check as a pass.
+Compare the changed component with its rendered peers at wide and narrow widths in both default themes. For color changes, include dark and light high-contrast themes and a representative installed custom theme. The [isolated editor](isolated-editor.md#isolated-extension-host) offers only the built-in themes, so the owner checks the custom theme in their own window. Do not treat a missing theme check as a pass.
 
 The [screenshot driver](../extension/scripts/panel-shots.ts) clears focus and marks cards read. Check focus and unread states separately when a change affects them. Static captures do not establish keyboard or screen-reader behavior.
 

@@ -8,7 +8,7 @@ Root selection follows [Environment overrides](development.md#environment-overri
 
 | Source | Location | What it establishes |
 | --- | --- | --- |
-| Static Arc demo and main README image | `extension/scripts/readme-fixture.ts` through `web-demo.ts` | Invented records. [Demo source contracts](development.md#demo-source-contracts) own decoding, catalogs, static rendering, and interaction limits |
+| Static Arc demo and main README image | `extension/scripts/readme-fixture.ts` through `web-demo.ts` | Invented records. [Demo source contracts](demo-assets.md#demo-source-contracts) own decoding, catalogs, static rendering, and interaction limits |
 | Offline review evidence | `evals/agent-review/cases/` and a separate bare evidence cache | Source commits, partial review keys, and exported review conditions for the development tool only |
 | Saved session capture | Configured Claude project directories, Codex rollout directories, and caller-supplied reader-started links and saved reader-parent identities | Verified identities across working directories and the outgoing relationships of the selected saved session. Unreachable text bodies stay outside the capture |
 | Portable review fixtures | `evals/agent-review/portable/cases/`, `evals/agent-review/fixtures/`, `evals/agent-review/cohorts/`, and captured checkout instructions | Candidate source, qualification checks, frozen keys, coverage targets, and instruction hashes for local exploratory comparisons |

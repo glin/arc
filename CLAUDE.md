@@ -47,7 +47,7 @@ Before committing, check changed documentation, comments, and product messages a
 
 Read `docs/development.md` before installing dependencies, repairing the panel-mockup link, linking worktree dependencies, or profiling.
 
-Use the diagnostic capture script in [Performance capture](docs/development.md#performance-capture) for performance investigations and diagnostic requests.
+Use the diagnostic capture script in [Performance capture](docs/performance.md#performance-capture) for performance investigations and diagnostic requests.
 
 Follow the Fast iteration section of `docs/development.md` to test a change while you work and before handoff.
 
@@ -62,7 +62,7 @@ Check a change with the cheapest method that reaches it, in this order:
 
 A launcher, attach, or selector failure in the isolated editor is a defect. Fix it or report it. It never justifies computer use.
 
-Agents never drive the owner's own VS Code window, with computer use or any other tool. When a check needs state that only the owner's window holds, give the owner the exact steps. The commands are in [Fast iteration](docs/development.md#fast-iteration) and [Isolated extension host](docs/development.md#isolated-extension-host).
+Agents never drive the owner's own VS Code window, with computer use or any other tool. When a check needs state that only the owner's window holds, give the owner the exact steps. The commands are in [Fast iteration](docs/development.md#fast-iteration) and [Isolated extension host](docs/isolated-editor.md#isolated-extension-host).
 
 ## Tests
 

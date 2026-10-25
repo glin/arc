@@ -30,7 +30,7 @@ codex login
 
 ### Claude hooks
 
-Both default source installs use matching hooks in managed storage. Existing checkout marketplaces require [one-time recovery](docs/development.md#legacy-checkout-plugin-recovery).
+Both default source installs use matching hooks in managed storage. Existing checkout marketplaces require [one-time recovery](docs/installation.md#legacy-checkout-plugin-recovery).
 
 The optional Claude hooks let Arc show full file diffs. Restart Claude to load them. To install them later, run **Arc: Set up Claude hooks** from the Command Palette. To skip them, add `--no-hooks`:
 

@@ -25,9 +25,9 @@ Known static conflicts allow ordinary startup and manual native discovery. An un
 
 ## Install the parts you need
 
-`install.sh` builds and installs the editor extension. It also sets up the optional Claude plugin unless passed `--no-hooks`. Both default source installations copy matching plugin bytes into managed storage. Local source selects the checkout bytes. Remote source resolves its ref before downloading. Existing checkout marketplaces require [one-time recovery](development.md#legacy-checkout-plugin-recovery).
+`install.sh` builds and installs the editor extension. It also sets up the optional Claude plugin unless passed `--no-hooks`. Both default source installations copy matching plugin bytes into managed storage. Local source selects the checkout bytes. Remote source resolves its ref before downloading. Existing checkout marketplaces require [one-time recovery](installation.md#legacy-checkout-plugin-recovery).
 
-A VSIX installs the extension. Claude marketplace installation installs only `arc-hooks`. [Installer testing](development.md#isolated-installer-tests) owns local plugin commands. Session commands use Arc's local window channel without requiring Claude hooks. Codex records come from its rollouts.
+A VSIX installs the extension. Claude marketplace installation installs only `arc-hooks`. [Installer testing](installation.md#isolated-installer-tests) owns local plugin commands. Session commands use Arc's local window channel without requiring Claude hooks. Codex records come from its rollouts.
 
 Arc has no **Arc: Install CLI** editor command. Update the standalone CLI by building a current source checkout and installing its tarball. [CLI installation](../cli/README.md#install) owns the commands and Node requirements. npm publication is deferred, so a registry `latest` install is not an available release path.
 

@@ -110,7 +110,7 @@ Cold Codex discovery asynchronously primes missing openings with eight concurren
 
 Held catalog identities receive at most 32 concurrent asynchronous stats. Missing or replaced sources require a walk and relationship discovery before publication. Listing requests separately check served-row freshness. Coverage requires matching membership and physical identities. Scope-root or workspace changes clear working-directory membership reuse.
 
-Startup, loading wording, stable browser nodes, list deltas, focus preservation, and time tickers belong to [Session list loading](panel-rendering.md#session-list-loading-contracts) and [Retained rendering](panel-rendering.md#retained-rendering-contracts). Diagnostic capture, startup milestones, and their clocks belong to [Development](development.md#diagnostic-implementation). Project-spend checkpoints preserve the last complete ledger separately from unfinished progress.
+Startup, loading wording, stable browser nodes, list deltas, focus preservation, and time tickers belong to [Session list loading](panel-rendering.md#session-list-loading-contracts) and [Retained rendering](panel-rendering.md#retained-rendering-contracts). Diagnostic capture, startup milestones, and their clocks belong to [Development](performance.md#diagnostic-implementation). Project-spend checkpoints preserve the last complete ledger separately from unfinished progress.
 
 ## Session name
 
