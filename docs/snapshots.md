@@ -1,14 +1,14 @@
 # Snapshots and diffs
 
-Read this guide when changing first-touch capture, snapshot publication, or recorded diff selection. [Data sources](data-sources.md#snapshot-storage) owns storage paths and retention. [Development](development.md#snapshot-installation) owns hook installation. [Session list and navigation](rail-and-navigation.md#files-commits-and-editor-groups) owns editor placement and ordinary file links.
+[Data sources](data-sources.md#snapshot-storage) owns storage paths and retention. [Development](development.md#snapshot-installation) owns hook installation. [Session list and navigation](rail-and-navigation.md#files-commits-and-editor-groups) owns editor placement and ordinary file links.
 
 ## Diff selection
 
-Turn attribution comes from the transcript or rollout. A snapshot holds the file before the session's first edit and never advances between turns. It therefore covers later turns' changes too. `manifest.json` is overwritten cumulative state and cannot attribute a file to a turn.
+Turn attribution comes from the transcript or rollout. A snapshot holds the file before the session's first edit and never advances between turns. Diffs against it therefore include later turns' changes too. `manifest.json` is overwritten cumulative state and cannot attribute a file to a turn.
 
 `pendingIn` matches normalized paths and checks that the live file still differs from its snapshot. A matching file row opens the snapshot against the live file. An existing file without that match opens as a file. The turn-diff action builds recorded diffs separately. Missing live files use that turn's recorded changes when one unambiguous diff exists. The title says `recorded turn changes` and identifies hunk-only content. Missing or ambiguous recorded text produces an unavailable-file message. Dispatched rows identify a session without a turn, so they cannot supply this fallback. Arc never substitutes another checkout's live file.
 
-`patchview.ts` builds both per-turn sides from recorded text. It prefers whole files and otherwise shows changed regions. Titles identify hunk-only limits. It never reads the live file as a per-turn after side. Claude Edit results supply `originalFile` for small files. Write results supply `content`. The parser keeps the first recorded edit's `originalFile` per file per turn and every edit's `content`. `sidesFor` replays ordered edits when the diff opens. Recorded whole-file text stays with parsed turns in memory. Neither spend nor derived-session caches store it.
+`patchview.ts` builds both per-turn sides from recorded text. It prefers whole files and otherwise shows changed regions. Titles identify hunk-only limits. It never uses live file content for a per-turn diff. Claude Edit results supply `originalFile` for small files. Write results supply `content`. The parser keeps the first recorded edit's `originalFile` per file per turn and every edit's `content`. `sidesFor` replays ordered edits when the diff opens. Recorded whole-file text stays with parsed turns in memory. Neither spend nor derived-session caches store it.
 
 Normalize snapshot and transcript paths before matching. Windows drive paths compare without case or separator differences on every host. Other paths compare without case differences on Windows and retain case on macOS and Linux. Hook and reader scratch-root handling share `ephemeral-paths` fixtures. The hook normalizer removes a trailing slash and folds whole paths on Windows. Do not assume identical normalization implementations on every host.
 

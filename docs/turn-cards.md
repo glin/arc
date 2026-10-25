@@ -1,6 +1,6 @@
 # Turn cards
 
-Read this guide when changing turn presentation, Activity, record rows, Markdown disclosures, or commit attribution. [Session list and navigation](rail-and-navigation.md) owns session headings, session list rendering, response links, and panel navigation. [UI design](ui-design.md) owns shared visual patterns. [Comments](comments.md) owns selection offsets and comment recovery. [Prompt box](composer.md) owns prompt delivery and attachment state.
+[Session list and navigation](rail-and-navigation.md) owns session headings, session list rendering, response links, and panel navigation. [UI design](ui-design.md) owns shared visual patterns. [Comments](comments.md) owns selection offsets and comment recovery. [Prompt box](composer.md) owns prompt delivery and attachment state.
 
 ## Card sources
 
@@ -24,7 +24,7 @@ The Activity head orders message and reply counts before the tool mix, then the 
 
 Messages offer Show all beyond their rendered bounds. Shift on Activity toggles every visible message's bound. Shortened command rows open their complete text on a press. Arrow keys move among run and command controls. Escape closes an open row. A message carries its time on its bubble. Never put a native title on its Markdown row, because that title replaces link-address hovers.
 
-`snapCut` measures the last complete line box, table row, or image inside the message's height limit. The limit comes from its font size. Reading the resized box as the limit creates a ResizeObserver feedback loop. Clipping updates interactive descendants' tab stops and measures again after expansion. CSS line clamping does not clip blocks containing `pre` correctly.
+`snapCut` measures the last complete line box, table row, or image inside the message's height limit. The limit comes from its font size. Using the resized box as the limit creates a ResizeObserver feedback loop. Clipping updates interactive descendants' tab stops and measures again after expansion. CSS line clamping does not clip blocks containing `pre` correctly.
 
 Marks summarize existing turn fields or the closing summary. They supply navigation, not another state source. Failed calls stay in Activity without header marks or chips. A settled tool-call group uses a neutral disclosure marker. Failed calls retain their markers and the group retains its failed-call count. Literal text separates that count from the tool total. Those failures establish neither recovery nor a failed group outcome.
 
@@ -46,11 +46,11 @@ Native summaries retain Tab, Enter, and Space behavior. Mounted Summary componen
 
 File totals retain counted lines alongside unknown-count evidence. Their visible face and accessible name carry no partial mark. The record footer explains each cause and whether counts are unknown or partial. `diffHalves` omits zero-valued added or removed halves. When both halves are zero, callers omit empty wrappers and separators. Keep visible and spoken figures consistent.
 
-The card body's Files section reveals `FILES_SECTION_CAP` rows per press. The cap is 20. The label names the next batch and the accessible name adds all remaining hidden files. `aria-expanded` becomes true after the first extra batch. `aria-controls` names a stable, card-specific rows container through `cardPartId`. The button stays mounted through full expansion, then collapses to the first batch without losing focus.
+The card body's Files section reveals `FILES_SECTION_CAP` (20) rows per press. The label names the next batch and the accessible name adds all remaining hidden files. `aria-expanded` becomes true after the first extra batch. `aria-controls` names a stable, card-specific rows container through `cardPartId`. The button stays mounted through full expansion, then collapses to the first batch without losing focus.
 
 Expansion survives live redraws. Fully revealed lists stay revealed when they grow. A list that shrinks to the cap resets expansion, so later growth starts at the first batch. Chip popovers use no row cap and scroll within their own bounds. Keep capped and uncapped views on the same row component.
 
-Each commit record groups rows by branch within repository through `groupCommitRows`. Group headings appear only when rows span groups. The wire array remains flat. `commitGrouping` caches by array identity, so the body, popovers, and clock share the grouping. Host headings carry branch facts without merge times. The browser supplies merged-word hovers and accessible times through `writeCardClock`.
+Each commit record uses `groupCommitRows` to group rows by branch within repository. Group headings appear only when rows span groups. The wire array remains flat. `commitGrouping` caches by array identity, so the body, popovers, and clock share the grouping. Host headings carry branch facts without merge times. The browser supplies merged-word hovers and accessible times through `writeCardClock`.
 
 ## Subagent and dispatched rows
 
