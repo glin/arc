@@ -1658,7 +1658,7 @@ async function handleMessage(message: {
         result: {
           generation: message.generation,
           revision: before,
-          value: { kind: 'stale' },
+          value: { kind: 'stale', unread: true },
         },
         windowRead: windowReadReport(message.id),
       });
@@ -1684,7 +1684,7 @@ async function handleMessage(message: {
         result: {
           generation: message.generation,
           revision: before,
-          value: { kind: 'stale' },
+          value: { kind: 'stale', unread: true },
         },
         windowRead: windowReadReport(message.id),
       });

@@ -8550,6 +8550,122 @@ test("a growing first session cannot strand a later session's row facts", async 
   );
 });
 
+// A large session without a scan cursor charges more than the whole pass budget.
+// The worker refuses its read before opening the grown file, so the charge must not stop the sessions after it.
+test("a refused read of a session larger than the pass budget cannot strand a later session's row facts", async () => {
+  const heldRequestAt = Date.parse('2026-10-25T19:25:34Z');
+  const newestRequestAt = Date.parse('2026-10-25T20:15:58Z');
+  const now = Date.parse('2026-10-25T20:16:30Z');
+  const turnStartedAt = Date.parse('2026-10-25T18:29:00Z');
+  const factsAt = (requestAt: number) =>
+    ({
+      turns: [
+        {
+          startedAt: turnStartedAt,
+          endedAt: requestAt,
+          finished: false,
+          error: false,
+          model: 'claude-opus-5',
+          provider: null,
+          usage: { input: 1, cacheWrite1h: 2_000, cacheWrite5m: 0, cacheRead: 140_000, output: 40, thinking: 0 },
+          contextTokens: 150_000,
+          contextWindow: 1_000_000,
+          contextRequest: {
+            at: requestAt,
+            lifetime: '1h' as const,
+            inferenceClass: null,
+            serviceTier: null,
+            readBack: false,
+            outputTokens: 40,
+          },
+          childSpendPartial: false,
+        },
+      ],
+      compactions: [],
+    }) as SessionStatFacts;
+  const large = {
+    file: 'Large.jsonl',
+    sessionId: 'large',
+    agent: 'claude' as const,
+    size: 50 * 1024 * 1024,
+    mtimeMs: 100,
+  };
+  const waiting = {
+    file: 'Waiting.jsonl',
+    sessionId: 'waiting',
+    agent: 'claude' as const,
+    size: 1_280_000,
+    mtimeMs: 200,
+  };
+  assert.ok(
+    Math.min(large.size, RAIL_ENRICHMENT_READ_BYTES) + agentRunScanUnread(large, undefined) > INITIAL_RAIL_READ_BYTES,
+    'the large session no longer charges more than the pass budget',
+  );
+  const unread = (session: typeof large) => ({
+    size: session.size,
+    mtimeMs: session.mtimeMs,
+    label: session.sessionId,
+    fullLabel: session.sessionId,
+    foldedLabel: session.sessionId,
+    activityMs: null,
+    agentRun: false,
+    outcome: null,
+    stats: null,
+  });
+  const largeEntry = unread(large);
+  const waitingEntry = {
+    ...unread(waiting),
+    heldStats: factsAt(heldRequestAt),
+    heldRevision: { mtimeMs: 150, size: 1_000_000 },
+  };
+  const requests: string[] = [];
+  const provider = railEnrichmentHarness(async (request, generation) => {
+    const session = (request as { session: typeof large }).session;
+    requests.push(`${request.kind}:${session.sessionId}`);
+    if (session === large) {
+      // The worker's stat finds the file larger than requested and refuses the read before opening it.
+      return {
+        generation,
+        revision: { size: large.size + 4_096, mtimeMs: large.mtimeMs + 1, dev: 1, ino: 2 },
+        value: { kind: 'stale', unread: true },
+      };
+    }
+    const revision = provider.revisionOf(waiting);
+    if (request.kind === 'starts') {
+      return { generation, revision, value: { kind: 'starts', starts: { starts: [turnStartedAt], whole: true } } };
+    }
+    return {
+      generation,
+      revision,
+      value: {
+        kind: 'metadata',
+        coverage: { whole: true, windowBytes: 16 * 1024 * 1024 },
+        entry: { ...unread(waiting), activityMs: newestRequestAt, stats: factsAt(newestRequestAt) },
+      },
+    };
+  });
+  provider.titles.set(large.file, largeEntry);
+  provider.titles.set(waiting.file, waitingEntry);
+  const held = railCacheMarkOf(derivedTitleCacheStats(waitingEntry), now);
+  assert.ok(
+    held?.nearlyGoneAt != null && now >= held.nearlyGoneAt,
+    'the held request does not draw a nearly gone bolt',
+  );
+
+  await provider.prepareRailEnrichment([large, waiting], 1, new AbortController().signal);
+
+  assert.deepEqual(requests, ['starts:large', 'starts:waiting', 'metadata:waiting']);
+  const entry = provider.titles.get(waiting.file);
+  assert.equal(entry.heldStats, undefined, 'the enrichment read did not replace the held stats');
+  assert.deepEqual(entry.stats, factsAt(newestRequestAt));
+  const mark = railCacheMarkOf(derivedTitleCacheStats(entry), now);
+  assert.ok(
+    mark?.nearlyGoneAt != null && now < mark.nearlyGoneAt,
+    `the waiting session's row bolt still times the held request: ${JSON.stringify(mark)}`,
+  );
+  assert.deepEqual(provider.titles.get(large.file), largeEntry, 'the refused read changed the large session');
+});
+
 test('failed turn start and recovery reads of one session are each logged once until that kind of read succeeds', async () => {
   const session = {
     file: 'Mixed/Session.jsonl',

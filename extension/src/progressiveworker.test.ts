@@ -2447,6 +2447,7 @@ test('saved Codex categories cross the worker boundary only for the captured fil
     fs.appendFileSync(file, '{"type":"event_msg","payload":{"type":"task_complete"}}\n');
     const stale = await worker.run({ kind: 'codex-context', session }, 8, new AbortController().signal);
     assert.equal(stale?.value.kind, 'stale');
+    assert.equal(stale.value.unread, true, 'the worker did not report that it refused the changed file before reading');
     assert.equal(await worker.run({ kind: 'codex-context', session }, 9, AbortSignal.abort()), null);
     const records = codexContextRecords('saved', true);
     records.push({

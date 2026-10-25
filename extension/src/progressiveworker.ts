@@ -389,7 +389,8 @@ export type ProgressiveValue =
     }
   | { kind: 'page'; page: HistoryPageOutcome<ProgressiveCursor>; recoveryBytes?: number }
   | { kind: 'retained'; pages: HistoryPage[] }
-  | { kind: 'stale'; agentRunScan?: AgentRunScan; recoveryBytes?: number };
+  // `unread` marks a request the worker refused before it opened the source.
+  | { kind: 'stale'; agentRunScan?: AgentRunScan; recoveryBytes?: number; unread?: true };
 export interface ProgressiveResult {
   generation: number;
   revision: FileRevision | null;

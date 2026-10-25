@@ -12496,6 +12496,8 @@ export class PanelProvider implements vscode.Disposable {
           if (signal.aborted || generation !== this.refreshGeneration) break;
           continue;
         }
+        // A read the worker refused before opening the source spent nothing, so its charge returns to the pass.
+        if (result.value.kind === 'stale' && result.value.unread) remaining += bytes;
         if (!acceptsProgressiveResult(result, this.refreshGeneration, this.revisionOf(session))) {
           catalogCurrent = false;
           const current = this.titles.get(session.file);
