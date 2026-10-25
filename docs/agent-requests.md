@@ -14,7 +14,7 @@ Permissions offer immediate Allow and Deny. Shell commands use code blocks. Othe
 
 ## Question answers
 
-Single-choice answers advance to the next unanswered question and announce the move. Multi-select answers never advance automatically. The [keyboard contract](rail-and-navigation.md#keyboard-and-screen-reader-contract) owns tab-strip navigation.
+Single-choice answers advance to the next unanswered question and announce the move. Multi-select answers never advance automatically. The [keyboard contract](panel-accessibility.md#keyboard-and-screen-reader-contract) owns tab-strip navigation.
 
 Question tabs wrap without horizontal scrolling. Beyond two rows, tabs omit answer values visually but retain complete answers in accessible names.
 

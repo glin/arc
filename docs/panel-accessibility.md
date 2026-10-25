@@ -74,4 +74,4 @@ Agent, Model, Effort, and Permissions use shared select-only comboboxes. Each fi
 
 ### Agent request focus
 
-The question tab strip stays outside the timeline walk. Tabs and the fold precede request actions. Focus movement after resolution excludes both. [Agent requests](composer.md#agent-requests) owns question tabs and announcements. [Text editing](composer.md#text-editing) owns prompt recall.
+The question tab strip stays outside the timeline walk. Tabs and the fold precede request actions. Focus movement after resolution excludes both. [Agent requests](agent-requests.md) owns question tabs and announcements. [Text editing](composer.md#text-editing) owns prompt recall.

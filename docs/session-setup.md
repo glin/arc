@@ -22,11 +22,11 @@ Edit loads a setup into the custom fields, including unavailable stored values. 
 
 Pins and recents belong to the launch project, using the first folder in a multi-root workspace. Handoffs keep their source folder. Successful draft submission updates that destination’s recents even after project selection changes. Changing launch projects closes the menu and clears retained custom fields. Running-session settings remain independent.
 
-A response-link handoff creates an editable draft containing the rendered local address and one blank line. [Navigation](rail-and-navigation.md#context-menus-and-copy) owns inherited setup, folder, labels, and source navigation. Missing source responses, unlisted sessions, unavailable setups, or missing recorded folders refuse creation.
+A response-link handoff creates an editable draft containing the rendered local address and one blank line. [Navigation](panel-navigation.md#context-menus-and-copy) owns inherited setup, folder, labels, and source navigation. Missing source responses, unlisted sessions, unavailable setups, or missing recorded folders refuse creation.
 
 ## Session controls
 
-Setup fields use the shared [select-only combobox contract](rail-and-navigation.md#keyboard-and-screen-reader-contract). Loading and unavailable metadata remain field statuses, never choices. Only open option rows mark CLI-reported defaults. Closed fields and setup summaries use concrete names.
+Setup fields use the shared [select-only combobox contract](panel-accessibility.md#keyboard-and-screen-reader-contract). Loading and unavailable metadata remain field statuses, never choices. Only open option rows mark CLI-reported defaults. Closed fields and setup summaries use concrete names.
 
 Opening, cancelling, or accepting the selected row preserves saved launch values. Choosing a different default Model omits model and effort overrides. Choosing a different default Effort omits only effort. Live sessions send supported switch values.
 
