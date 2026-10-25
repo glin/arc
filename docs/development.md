@@ -51,7 +51,7 @@ npm --prefix extension exec -- playwright-core install chromium-headless-shell
 
 The browser install writes to the per-user Playwright cache outside the repository. [Browser selection](testing.md#browser-selection) explains the channel order.
 
-Replacing an in-use package conflicts with running tests on Windows.
+`npm install` reuses existing dependencies and updates the lockfile when needed. Replacing an in-use package conflicts with running tests on Windows.
 
 `esbuild` is native. Install dependencies on the operating system that runs the commands. A `node_modules` tree copied from another operating system will not run it.
 
@@ -138,7 +138,7 @@ npm --prefix extension run dev
 
 This workflow runs in the owner's own VS Code window. An agent uses the [isolated editor](isolated-editor.md#isolated-extension-host) instead.
 
-Wait for the ready message, then open this checkout in VS Code. Press F5 and select `Run Arc Extension`. Open Arc in the new Extension Development Host. `extension/src/paneldevelopment.ts` owns updates and recovery. `extension/src/webview/bootstrap.ts` owns browser-lifetime cleanup.
+Wait for the ready message, then open this checkout in VS Code. Press F5 and select `Run Arc Extension`. Open Arc in the new Extension Development Host. Document replacement restores the selected session, unsent prompt, and scroll position after initial layout. `extension/src/paneldevelopment.ts` owns updates and recovery. `extension/src/webview/bootstrap.ts` owns browser-lifetime cleanup.
 
 The launch passes the checkout as a positional folder argument on Windows. Do not use `${workspaceFolder}` with `--folder-uri`, because VS Code keeps the Windows path instead of creating a file URI. If F5 reuses a development host without a folder, stop debugging and close that host before starting again.
 
