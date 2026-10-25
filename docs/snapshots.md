@@ -1,6 +1,6 @@
 # Snapshots and diffs
 
-[Data sources](data-sources.md#snapshot-storage) owns storage paths and retention. [Development](development.md#snapshot-installation) owns hook installation. [Session list and navigation](rail-and-navigation.md#files-commits-and-editor-groups) owns editor placement and ordinary file links.
+[Data sources](data-sources.md#snapshot-storage) owns storage paths and retention. [Development](development.md#snapshot-installation) owns hook installation. [Session list and navigation](panel-navigation.md#files-commits-and-editor-groups) owns editor placement and ordinary file links.
 
 ## Diff selection
 

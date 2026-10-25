@@ -1,6 +1,6 @@
 # Turn cards
 
-[Session list and navigation](rail-and-navigation.md) owns session headings, session list rendering, response links, and panel navigation. [UI design](ui-design.md) owns shared visual patterns. [Comments](comments.md) owns selection offsets and comment recovery. [Prompt delivery](prompt-delivery.md) and [attachments](prompt-attachments.md) own submission state.
+[Session list](rail-and-navigation.md) owns session headings and list behavior. [Panel rendering](panel-rendering.md) owns browser updates. [Panel navigation](panel-navigation.md) owns response links and navigation. [UI design](ui-design.md) owns shared visual patterns. [Comments](comments.md) owns selection offsets and comment recovery. [Prompt delivery](prompt-delivery.md) and [attachments](prompt-attachments.md) own submission state.
 
 ## Card sources
 
@@ -92,7 +92,7 @@ Rows retain repository grouping while validation runs and while the source only 
 
 ## Webview rendering constraints
 
-Keep clock fields outside card content fingerprints. The shared clock updates mounted text only when its wording changes, preserving selection. `writeCardClock` owns card-specific clock fields. Session list clocks and their separate cache rules belong to [retained rendering](rail-and-navigation.md#retained-rendering-contracts).
+Keep clock fields outside card content fingerprints. The shared clock updates mounted text only when its wording changes, preserving selection. `writeCardClock` owns card-specific clock fields. Session list clocks and their separate cache rules belong to [retained rendering](panel-rendering.md#retained-rendering-contracts).
 
 The `activity` message's single-card form updates mounted content. Its list form replaces matching cards and draws the timeline once, retaining focus and selected text. A list draw supersedes held single-card updates. Full timeline draws own structural and layout changes. Repaint deferral must preserve comment editing, comment-list interaction, and active selection through the interaction owner.
 

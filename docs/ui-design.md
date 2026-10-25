@@ -33,9 +33,9 @@ Follow the [project UI rules](../extension/CLAUDE.md#ui-work) for text ownership
 
 Links serve navigation. Compact in context detail uses `cpick`, without link colors or underlines.
 
-A read-only session list figure must not acquire an independent press target inside its row's button. A figure with available detail must retain its keyboard behavior and accessible state. [Session list and navigation](rail-and-navigation.md#keyboard-and-screen-reader-contract) owns those contracts.
+A read-only session list figure must not acquire an independent press target inside its row's button. A figure with available detail must retain its keyboard behavior and accessible state. [Session list and navigation](panel-accessibility.md#keyboard-and-screen-reader-contract) owns those contracts.
 
-Use recognizable icons for common actions: X for Close, a magnifying glass for Search, and a gear for settings. Use words for unfamiliar actions and named choices, including periods and settings values. Give icon buttons accessible names and panel hints through the [keyboard and screen-reader contract](rail-and-navigation.md#keyboard-and-screen-reader-contract). Hide decorative icon content from the accessible name.
+Use recognizable icons for common actions: X for Close, a magnifying glass for Search, and a gear for settings. Use words for unfamiliar actions and named choices, including periods and settings values. Give icon buttons accessible names and panel hints through the [keyboard and screen-reader contract](panel-accessibility.md#keyboard-and-screen-reader-contract). Hide decorative icon content from the accessible name.
 
 The prompt box's downward caret opens a menu. The session list's twisting caret folds a group. Do not add a caret as decoration.
 
@@ -49,9 +49,9 @@ Omit a redundant Close button when these dismissal routes suffice. When an expli
 
 ## State and language
 
-Use [Glossary](glossary.md) terms for regions, actions, records, and states. [Session list and navigation](rail-and-navigation.md#context-menus-and-copy) owns menu ordering and copy. The [project UI rules](../extension/CLAUDE.md#ui-work) own hints, timestamps, compound text, and platform labels.
+Use [Glossary](glossary.md) terms for regions, actions, records, and states. [Panel navigation](panel-navigation.md#context-menus-and-copy) owns menu ordering and copy. The [project UI rules](../extension/CLAUDE.md#ui-work) own hints, timestamps, compound text, and platform labels.
 
-Distinguish focus, selection, unread state, and agent state. Pair color with visible text or another recognizable cue, plus its accessible name and state. Follow [Session list and navigation](rail-and-navigation.md#keyboard-and-screen-reader-contract) for keyboard reachability and focus behavior.
+Distinguish focus, selection, unread state, and agent state. Pair color with visible text or another recognizable cue, plus its accessible name and state. Follow [Session list and navigation](panel-accessibility.md#keyboard-and-screen-reader-contract) for keyboard reachability and focus behavior.
 
 ## Review and enforcement
 

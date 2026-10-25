@@ -1,6 +1,6 @@
 # Session history
 
-[Session discovery](session-discovery.md) owns admission, repository scope, and relationships. [Data sources](data-sources.md#source-catalog) owns storage locations. [Retained rendering](rail-and-navigation.md#retained-rendering-contracts) owns browser node updates.
+[Session discovery](session-discovery.md) owns admission, repository scope, and relationships. [Data sources](data-sources.md#source-catalog) owns storage locations. [Retained rendering](panel-rendering.md#retained-rendering-contracts) owns browser node updates.
 
 ## Selected session history
 
@@ -110,11 +110,11 @@ Cold Codex discovery asynchronously primes missing openings with eight concurren
 
 Held catalog identities receive at most 32 concurrent asynchronous stats. Missing or replaced sources require a walk and relationship discovery before publication. Listing requests separately check served-row freshness. Coverage requires matching membership and physical identities. Scope-root or workspace changes clear working-directory membership reuse.
 
-Startup, loading wording, stable browser nodes, list deltas, focus preservation, and time tickers belong to [Session list loading](rail-and-navigation.md#session-list-loading-contracts) and [Retained rendering](rail-and-navigation.md#retained-rendering-contracts). Diagnostic capture, startup milestones, and their clocks belong to [Development](development.md#diagnostic-implementation). Project-spend checkpoints preserve the last complete ledger separately from unfinished progress.
+Startup, loading wording, stable browser nodes, list deltas, focus preservation, and time tickers belong to [Session list loading](panel-rendering.md#session-list-loading-contracts) and [Retained rendering](panel-rendering.md#retained-rendering-contracts). Diagnostic capture, startup milestones, and their clocks belong to [Development](development.md#diagnostic-implementation). Project-spend checkpoints preserve the last complete ledger separately from unfinished progress.
 
 ## Session name
 
-Saved sessions rename through their heading or session-list context menu. Provisional sessions offer neither route. Confirmation redraws both names together. [Context menus](rail-and-navigation.md#context-menus-and-copy) owns the controls. [Agent protocols](agent-protocols.md#session-rename) owns persistence.
+Saved sessions rename through their heading or session-list context menu. Provisional sessions offer neither route. Confirmation redraws both names together. [Context menus](panel-navigation.md#context-menus-and-copy) owns the controls. [Agent protocols](agent-protocols.md#session-rename) owns persistence.
 
 Claude custom titles outrank generated titles. The newest title wins within each kind. Eligible typed-prompt fallback reads the first 128 KiB. Locally answered commands give way to the next typed or reader-queued prompt. Whole-file reads reach later prompts. Codex fallback reads the first 1 MiB, excludes incomplete trailing records, injected context, and images, and cannot name an oversized first prompt. `VERSION` invalidates title rules independently from opening generation. Initial-name subscriptions share one Codex index per path and revision. Filename-free events rescan retained admitted directories alone.
 
@@ -124,4 +124,4 @@ The session-list box ordinarily filters titles. Content queries search prompt an
 
 Every search word must match within the same prompt or response half. Search includes later prompts and completed responses in reading order. Its independent 16 MiB tail can omit visible older pages. Scoped results report whether the read reached the first turn. Explicit search alone populates the corpus. Cached names update without reparsing unchanged text. Labels, archive state, and agent-run classification apply at query time.
 
-Numeric cost and cache-expiry filters do not narrow content results because entries contain neither fact. Entries also lack facts for unsupported state predicates. Prefix resolution uses accepted scoped identities before other filters narrow the pool. Incomplete discovery suspends unresolved prefixes. Identity-context changes re-evaluate retained entries. [Session list](rail-and-navigation.md#session-list) owns the query language.
+Numeric cost and cache-expiry filters do not narrow content results because entries contain neither fact. Entries also lack facts for unsupported state predicates. Prefix resolution uses accepted scoped identities before other filters narrow the pool. Incomplete discovery suspends unresolved prefixes. Identity-context changes re-evaluate retained entries. [Session list](session-queries.md#session-query-syntax) owns the query language.

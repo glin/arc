@@ -49,7 +49,7 @@ arc sessions --query 'label:Review -is:archived' --cursor CURSOR --window WINDOW
 
 `next: null` ends traversal. It does not establish complete discovery. Check `coverage`, `freshness`, and each row's `facts`. Duplicate session IDs have distinct `source` keys and report `ambiguous: true`. `session` refuses ambiguous IDs and never selects by file path.
 
-Listing queries accept `id:`, `session:`, `agent:`, `title:`, `label:`, `is:archived`, and `is:agentrun`. A listing includes archived sessions unless the query adds `-is:archived`. [Session query syntax](rail-and-navigation.md#session-list) defines identities and OR groups. Use [the panel filter](#panel-filter) for live statuses and other search areas.
+Listing queries accept `id:`, `session:`, `agent:`, `title:`, `label:`, `is:archived`, and `is:agentrun`. A listing includes archived sessions unless the query adds `-is:archived`. [Session query syntax](session-queries.md#session-query-syntax) defines identities and OR groups. Use [the panel filter](#panel-filter) for live statuses and other search areas.
 
 `session` reads five recent turns by default. `--turns` accepts 1-20. Check `partial`, `state`, and `notes` before treating the reply as complete. Stale replies contain no turns. An unparsed reply does not establish an empty session. Reads never mark turns read.
 

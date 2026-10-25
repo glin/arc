@@ -42,7 +42,7 @@ Put logic in a module that does not import `vscode`. Keep `vscode` glue small an
 
 Read [UI design](../docs/ui-design.md) before adding or changing panel UI.
 
-Make every visible control keyboard reachable and screen-reader readable. Use real buttons, visible focus, and accessible names that include visible information. Follow the panel reachability patterns in `docs/rail-and-navigation.md`.
+Make every visible control keyboard reachable and screen-reader readable. Use real buttons, visible focus, and accessible names that include visible information. Follow the panel reachability patterns in `docs/panel-accessibility.md`.
 
 Follow host conventions for platform labels and shortcuts.
 
@@ -58,7 +58,7 @@ Use the `panel-mockup` skill for a mockup or panel review. It starts with headle
 
 Use the shared relative-age formatter. Show full local time in a native tooltip and accessible name. Show time for today and a short date for earlier days when calendar context matters.
 
-Order and word a context menu entry by the convention in `docs/rail-and-navigation.md`'s "Context menus and copy" section.
+Order and word a context menu entry by the convention in `docs/panel-navigation.md`'s "Context menus and copy" section.
 
 Use `data-hint` and `data-hint-detail` for controls. Use native `title` for read-only text and rows in open popovers. Do not put native `title` on a button. Drop a hint that repeats visible control text.
 
