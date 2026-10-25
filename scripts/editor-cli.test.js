@@ -1294,7 +1294,7 @@ function installerFixture() {
     async run(
       args = ['code'],
       env = {},
-      { stdin = false, cwd = unrelated, terminalInput, scriptFile, skills = false, json = true } = {},
+      { stdin = false, cwd = unrelated, terminalInput, scriptFile, skills = false, json = true, allowGit = false } = {},
     ) {
       fs.writeFileSync(log, '');
       let input;
@@ -1307,7 +1307,8 @@ function installerFixture() {
         }
         input += '\nprintf "ARC_INSTALL_SCRIPT_TAIL\\n"\n';
       }
-      const script = 'export PATH="$1"; shift; command -v git >/dev/null && exit 98; exec "$1" "${@:2}"';
+      const script =
+        'export PATH="$1"; shift; ' + (allowGit ? '' : 'command -v git >/dev/null && exit 98; ') + 'exec "$1" "${@:2}"';
       const command = [
         '-c',
         script,
@@ -1358,6 +1359,94 @@ function installerFixture() {
     },
   };
 }
+
+// These runs check revision selection and checkout preservation through the installer.
+// Stubbed builds keep their cost below a real dependency install and editor launch.
+test.concurrent.each([false, true])(
+  'commit installation exports the selected revision and preserves the checkout (stdin %s)',
+  { ...SUBPROCESS, timeout: runBudget(3) },
+  async (stdin) => {
+    const f = installerFixture();
+    try {
+      const git = (...args) => {
+        const result = spawnSync(
+          'git',
+          [
+            '-c',
+            'core.hooksPath=' + path.join(f.dir, 'no-hooks'),
+            '-c',
+            'commit.gpgSign=false',
+            '-c',
+            'user.name=Installer fixture',
+            '-c',
+            'user.email=installer@example.com',
+            '-C',
+            f.source,
+            ...args,
+          ],
+          { encoding: 'utf8' },
+        );
+        assert.equal(result.status, 0, result.stderr);
+        return result.stdout.trim();
+      };
+      git('init');
+      git('add', '.');
+      git('commit', '-m', 'fixture source');
+      const selected = git('rev-parse', 'HEAD');
+      git('tag', 'saved-install');
+      const manifest = path.join(f.source, 'extension/package.json');
+      fs.writeFileSync(manifest, '{"version":"0.1.1"}');
+      git('add', 'extension/package.json');
+      git('commit', '-m', 'newer fixture source');
+      fs.writeFileSync(manifest, '{"version":"0.1.2"}');
+      git('add', 'extension/package.json');
+      fs.writeFileSync(manifest, '{"version":"0.1.3"}');
+      fs.writeFileSync(path.join(f.source, 'untracked.txt'), 'preserve me');
+      const head = git('rev-parse', 'HEAD');
+      const status = git('status', '--porcelain');
+      const index = git('diff', '--cached');
+      fs.writeFileSync(path.join(f.bin, 'git'), `#!${absoluteBash()}\nexec "${bash('command -v git')}" "$@"\n`, {
+        mode: 0o755,
+      });
+      const options = { stdin, cwd: stdin ? f.source : f.dir, allowGit: true };
+      const result = await f.run(
+        ['--commit', stdin ? 'saved-install' : selected.slice(0, 9), '--no-hooks', 'code'],
+        { ARC_SOURCE_COMMIT: 'inherited-revision', ARC_SOURCE_DIRTY: '1' },
+        options,
+      );
+      assert.equal(result.status, 0, result.stdout + result.stderr);
+      assert.match(result.stdout, /Built extension version: 0\.0\.9/);
+      assert.ok(result.commands.includes('source revision ' + selected));
+      assert.match(result.commands, /npm install[\s\S]*editor code --install-extension/);
+      assert.doesNotMatch(result.commands, /curl |claude |legacy-migration/);
+      assert.equal(git('rev-parse', 'HEAD'), head);
+      assert.equal(git('status', '--porcelain'), status);
+      assert.equal(git('diff', '--cached'), index);
+      assert.equal(fs.readFileSync(manifest, 'utf8'), '{"version":"0.1.3"}');
+      assert.equal(fs.readFileSync(path.join(f.source, 'untracked.txt'), 'utf8'), 'preserve me');
+      assert.equal(fs.readFileSync(f.settings, 'utf8'), f.legacy);
+      assert.deepEqual(fs.readdirSync(f.temporary), []);
+      if (!stdin) {
+        const missing = await f.run(['--commit', 'missing-revision', '--no-hooks', 'code'], {}, options);
+        assert.equal(missing.status, 2, missing.stderr);
+        assert.match(missing.stderr, /commit not found/);
+        assert.doesNotMatch(missing.commands, /npm |editor |curl /);
+        const skill = path.join(f.source, 'cli/skills/arc-sessions/SKILL.md');
+        const skillBytes = fs.readFileSync(skill);
+        git('rm', 'cli/skills/arc-sessions/SKILL.md');
+        git('commit', '-m', 'incomplete fixture source');
+        fs.writeFileSync(skill, skillBytes);
+        const incomplete = await f.run(['--local', '--commit', 'HEAD', '--no-hooks', 'code'], {}, options);
+        assert.equal(incomplete.status, 2, incomplete.stderr);
+        assert.match(incomplete.stderr, /selected commit lacks required Arc source files/);
+        assert.doesNotMatch(incomplete.commands, /npm |editor |curl /);
+        assert.deepEqual(fs.readdirSync(f.temporary), []);
+      }
+    } finally {
+      f.cleanup();
+    }
+  },
+);
 
 test.concurrent.each([false, true])(
   'local source installation retains existing dependencies and reconciles an unsynchronized manifest (%s)',
@@ -2413,6 +2502,11 @@ test.concurrent.each([
   [['--unknown']],
   [['--local', '--remote']],
   [['--ref']],
+  [['--commit']],
+  [['--commit', 'HEAD', '--remote']],
+  [['--commit', 'HEAD', '--repo', 'glin/arc']],
+  [['--ref', 'main', '--commit', 'HEAD']],
+  [['--commit', 'HEAD']],
   [['--repo', 'bad']],
   [['--marketplace-url', 'http://example.com/arc.json']],
   [['missing-editor']],

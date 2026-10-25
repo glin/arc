@@ -100,7 +100,7 @@ NODE
 main() {
   local invocation_cwd="$PWD"
   local setup_hooks=1 setup_skills=1 hooks_ready=1 mode=auto source_repo=glin/arc source_ref=main
-  local marketplace_url=''
+  local marketplace_url='' source_commit='' remote_selector=0
   ARC_INSTALL_OUTPUT=human
   local argument candidate seen choice i cli claude_cli version sha ref_encoded failed=0 installed=0
   local REPO='' local_source=0 marketplace_override=0 hook_source='' hook_source_type=url
@@ -200,22 +200,24 @@ RECEIPT
           echo 'error: --local and --remote cannot be combined.' >&2; exit 2
         fi
         mode="${argument#--}" ;;
-      --repo|--ref|--marketplace-url)
+      --repo|--ref|--commit|--marketplace-url)
         if [ "$#" -eq 0 ] || [ -z "$1" ] || [[ "$1" == --* ]]; then
           echo "error: $argument requires a value." >&2; exit 2
         fi
         case "$argument" in
-          --repo) source_repo="$1" ;;
-          --ref) source_ref="$1" ;;
+          --repo) source_repo="$1"; remote_selector=1 ;;
+          --ref) source_ref="$1"; remote_selector=1 ;;
+          --commit) source_commit="$1" ;;
           --marketplace-url) marketplace_url="$1"; marketplace_override=1 ;;
         esac
         shift ;;
       --help|-h)
-        echo 'Usage: bash install.sh [--local|--remote] [--repo OWNER/REPO] [--ref REF] [--marketplace-url HTTPS_URL] [--no-hooks] [--no-skills] [--skill-agent claude|codex] [--json] [editor-cli ...]'
+        echo 'Usage: bash install.sh [--local|--remote] [--commit REV] [--repo OWNER/REPO] [--ref REF] [--marketplace-url HTTPS_URL] [--no-hooks] [--no-skills] [--skill-agent claude|codex] [--json] [editor-cli ...]'
         echo 'Build Arc from local or temporary downloaded source and install its Claude plugin.'
         echo 'Auto mode uses a complete local checkout, otherwise downloads glin/arc main.'
         echo '--remote forces source download for development testing.'
-        echo 'Local and downloaded source copy matching hooks into durable Arc storage.'
+        echo '--commit REV builds a committed revision from the local Arc Git checkout in a temporary folder.'
+        echo 'All source routes copy matching hooks into durable Arc storage.'
         echo '--marketplace-url explicitly selects an independently published catalog.'
         echo '--no-hooks preserves all Claude plugin and legacy hook settings.'
         echo 'Skills default to detected Claude and Codex executables. Repeat --skill-agent to select explicitly.'
@@ -228,6 +230,9 @@ RECEIPT
       *) CLIS+=("$argument") ;;
     esac
   done
+  if [ -n "$source_commit" ] && { [ "$mode" = remote ] || [ "$remote_selector" -eq 1 ]; }; then
+    echo 'error: --commit cannot be combined with --remote, --repo, or --ref.' >&2; exit 2
+  fi
   if [ "$setup_skills" -eq 0 ] && [ "${#SKILL_AGENTS[@]}" -gt 0 ]; then
     echo 'error: --no-skills conflicts with --skill-agent.' >&2; exit 2
   fi
@@ -315,7 +320,17 @@ EOF
       REPO="$PWD"
     fi
   fi
-  if [ -n "$REPO" ]; then local_source=1
+  if [ -n "$source_commit" ]; then
+    [ -n "$REPO" ] || { echo 'error: --commit requires an Arc Git checkout.' >&2; exit 2; }
+    for candidate in git tar; do
+      command -v "$candidate" >/dev/null 2>&1 || { echo "error: $candidate is required for --commit." >&2; exit 2; }
+    done
+    candidate="$(git -C "$REPO" rev-parse --show-prefix)" || { echo 'error: --commit requires an Arc Git checkout.' >&2; exit 2; }
+    [ -z "$candidate" ] || { echo 'error: --commit requires the Arc source at the Git checkout root.' >&2; exit 2; }
+    sha="$(git -C "$REPO" rev-parse --verify --end-of-options "$source_commit^{commit}")" || {
+      echo "error: commit not found in the Arc checkout: $source_commit" >&2; exit 2
+    }
+  elif [ -n "$REPO" ]; then local_source=1
   elif [ "$mode" = local ]; then
     echo 'error: --local requires a complete Arc source directory.' >&2; exit 2
   else
@@ -339,7 +354,22 @@ EOF
   if [ "$ARC_INSTALL_CANCEL" -ne 0 ]; then exit "$ARC_INSTALL_CANCEL"; fi
   # Only this allocation belongs to the installer, including a local build's temporary VSIX.
   ARC_INSTALL_TEMP="$(mktemp -d)"
-  if [ "$local_source" -eq 0 ]; then
+  if [ -n "$source_commit" ]; then
+    echo "==> Source commit: $sha"
+    if ! run_child git -C "$REPO" archive --format=tar --output="$ARC_INSTALL_TEMP/source.tar" "$sha"; then
+      if [ "$ARC_INSTALL_CANCEL" -ne 0 ]; then exit "$ARC_INSTALL_CANCEL"; fi
+      echo 'error: commit export failed. No editor installation was attempted.' >&2; exit 2
+    fi
+    if [ "$ARC_INSTALL_CANCEL" -ne 0 ]; then exit "$ARC_INSTALL_CANCEL"; fi
+    mkdir "$ARC_INSTALL_TEMP/source"
+    if ! run_child tar -xf "$ARC_INSTALL_TEMP/source.tar" -C "$ARC_INSTALL_TEMP/source"; then
+      if [ "$ARC_INSTALL_CANCEL" -ne 0 ]; then exit "$ARC_INSTALL_CANCEL"; fi
+      echo 'error: commit extraction failed. No editor installation was attempted.' >&2; exit 2
+    fi
+    if [ "$ARC_INSTALL_CANCEL" -ne 0 ]; then exit "$ARC_INSTALL_CANCEL"; fi
+    REPO="$ARC_INSTALL_TEMP/source"
+    complete_source "$REPO" || { echo 'error: selected commit lacks required Arc source files.' >&2; exit 2; }
+  elif [ "$local_source" -eq 0 ]; then
     ref_encoded="$(node -e 'process.stdout.write(encodeURIComponent(process.argv[1]))' "$source_ref")"
     if ! run_child curl --fail --location --silent --show-error --connect-timeout 15 --max-time 900 "https://api.github.com/repos/$source_repo/commits/$ref_encoded" --output "$ARC_INSTALL_TEMP/commit.json"; then
       if [ "$ARC_INSTALL_CANCEL" -ne 0 ]; then exit "$ARC_INSTALL_CANCEL"; fi

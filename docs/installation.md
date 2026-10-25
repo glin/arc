@@ -11,15 +11,21 @@ node extension/dist/setup.cjs --snapshots
 
 Installed local builds use frozen plugin bytes. Rebuild and reinstall to select changed files. `install.sh` owns source selectors. `--marketplace-url` selects a hosted HTTPS catalog independently of the extension revision. Skill selection uses the matching built CLI. [Skill installation](arc-sessions.md#install-the-parts-you-need) owns its selectors and destinations.
 
+Install a local commit from an Arc Git checkout while preserving hooks and skills:
+
+```bash
+bash install.sh --commit REV --no-hooks --no-skills code
+```
+
 When the installer reports component outcomes, it uses readable text by default. `--json` renders those outcomes as the final structured output line. Help and early argument or prerequisite refusals omit that result. Hook-only preflight failures preserve admitted editor and skill work. Exit 0 means selected work succeeded or preserved an exact stable external skill. Exit 2 means global argument or prerequisite refusal before installation. Exit 1 means incomplete requested work. Delivered HUP, INT, and TERM preserve statuses 129, 130, and 143. The shell records cancellation and awaits its unreaped skill child before deleting temporary source. No platform/runtime forwarding branch has native graceful-delivery acceptance, so handlers wait without forwarding. Automated disposable-home checks do not establish authenticated native skill discovery.
 
 ## Snapshot installation
 
-Both default source routes invoke bundled snapshot setup after editor installation. Its ownership, disabled-plugin refusal, runtime requirements, and immutable storage follow [Bundled tools](#bundled-tools). A checkout or temporary download never becomes a registered marketplace. [Legacy recovery](#legacy-checkout-plugin-recovery) owns migration authority and choices.
+By default, all source routes invoke bundled snapshot setup after editor installation. Its ownership, disabled-plugin refusal, runtime requirements, and immutable storage follow [Bundled tools](#bundled-tools). A checkout or temporary source copy never becomes a registered marketplace. [Legacy recovery](#legacy-checkout-plugin-recovery) owns migration authority and choices.
 
 Hosted catalogs require Claude Code 2.1.224 or later. Claude owns archive downloads and its installed plugin cache. `install.sh` checks marketplace ownership before it builds. `scripts/install-claude-hooks.sh` owns hosted registration and checks ownership again before it changes plugins. The first check does not replace the second. `plugins/arc-hooks/hooks/hooks.json` defines hook commands through `${CLAUDE_PLUGIN_ROOT}`.
 
-Plugin failure preserves legacy hooks and leaves a successful editor installation usable, with a nonzero installer result. After plugin success, local installation removes direct Arc entries naming that checkout's legacy hook paths. Remote installation does not infer legacy paths from temporary source. `scripts/register-hooks.js` owns migration. It leaves unrelated, uncertain, malformed, or symlinked settings unchanged. The installer does not install a Codex plugin.
+Plugin failure preserves legacy hooks and leaves a successful editor installation usable, with a nonzero installer result. After plugin success, local installation removes direct Arc entries naming that checkout's legacy hook paths. Installation from temporary source does not infer legacy paths. `scripts/register-hooks.js` owns migration. It leaves unrelated, uncertain, malformed, or symlinked settings unchanged. The installer does not install a Codex plugin.
 
 On Windows, a Codex CLI session on the shared background server keeps its loaded hook definitions after the hook file changes. Reopening the CLI on that session does not reload them. Exit the affected CLI and resume with `codex resume --no-daemon <session-id>`, or restart the background server after other sessions stop.
 
@@ -158,7 +164,7 @@ Only a tag push publishes a release. `.github/workflows/vsix-candidate.yml` owns
 
 Use [Isolated installer tests](#isolated-installer-tests) for source staging, receipts, sandbox cleanup, and native acceptance.
 
-`install.sh` owns source selection and installation order. Remote source, dependencies, and VSIX occupy an owned temporary directory. Both source routes install dependencies. Snapshot setup runs from the caller's folder so project configuration and plugin scope apply.
+`install.sh` owns source selection and installation order. Downloaded and committed source, their dependencies, and the VSIX occupy an owned temporary directory. `--commit REV` exports the selected local Git revision and excludes uncommitted files. It accepts `--local` and refuses `--remote`, `--repo`, and `--ref`. Every source route installs dependencies. Snapshot setup runs from the caller's folder so project configuration and plugin scope apply.
 
 Current-editor detection requires product metadata, not `TERM_PROGRAM=vscode` alone. `VSCODE_GIT_ASKPASS_MAIN` identifies bundled metadata. On Windows, content-addressed askpass copies also require readable `VSCODE_GIT_ASKPASS_NODE` in the same installation. Flat resources and immediate ten-hexadecimal version folders must agree on product identity. Missing, conflicting, or unsupported metadata leaves detection unavailable. The supplied executable is read, never run. The selected CLI belongs to that installation, including macOS products with a `code` launcher.
 
