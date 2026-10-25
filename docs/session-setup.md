@@ -54,7 +54,7 @@ Pending or successful first submissions block setup changes. Failed first submis
 
 MCP controls appear only for reported configured servers. Opening a draft or returning to the panel retries a missing initial idle answer.
 
-Opening Servers starts or reuses a Claude draft’s child and retains it while pending servers settle and through first-prompt delivery. Drafts and recorded sessions keep separate readings. MCP rows retain action and checkbox roles. Arrows, Home, End, and typed names move focus. Tab closes and continues through controls. Escape returns focus to Servers.
+Opening Servers reuses a running Claude draft child and retains that child while pending servers settle and through first-prompt delivery. Drafts and recorded sessions keep separate readings. MCP rows retain action and checkbox roles. Arrows, Home, End, and typed names move focus. Tab closes and continues through controls. Escape returns focus to Servers.
 
 Claude supports status, toggle, and reconnect. Codex supplies status only. Only `disabled` means off. Preserve unfamiliar states without treating them as disabled.
 

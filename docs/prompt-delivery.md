@@ -20,11 +20,11 @@ Prompt assembly places typed text before comments. Codex retains surrounding whi
 
 Native compaction bypasses prompt assembly, comments, and ordinary prompt callbacks. Context detail’s Compact leaves the draft unchanged. Exact `/compact` invokes compaction immediately when idle and clears the submitted characters. Busy sessions queue either request. A queued `/compact` with comment claims or files uses ordinary prompt delivery to retain that payload. Without either, it invokes compaction. Codex rejects `turn/start` during native compaction, so new prompts wait locally too.
 
-Clear starts no turn and draws no temporary card. Codex `/new` uses the same hidden transition and passes its optional name to the successor. Before resetting, the queue owns the command’s files and comment claims, including a queued exact `/clear` payload. Unclaimed source comments are captured immediately before the control request. These commands never become model input.
+Clear starts no turn. A successful reset draws no temporary card. Codex `/new` uses the same hidden transition and passes its optional name to the successor. Before resetting, the queue owns the command’s files and comment claims, including a queued exact `/clear` payload. Unclaimed source comments are captured immediately before the control request. These commands never become model input.
 
 The transition needs acceptance and a successor identity. Claude reports acceptance first. Codex reports the successor first. Success moves the payload and dependent prompts before draining the successor queue. The source retains its transcript, comments, labels, and session list row.
 
-Failure or refusal retains source recovery and blocks dependent prompts until Edit or Drop resolves it. Reload converts an in-flight reset to unknown and starts no work. A recorded successor retains ownership through refusal, failure, Edit, Drop, and reload. Stale panel submissions follow that successor until the panel paints it. Afterward the source is independently selectable.
+Failure or refusal draws a failure card. Codex `/new`, and a reset that carries comments or files, keeps its payload as source recovery and blocks dependent prompts until Edit or Drop resolves it. A bare `/clear` that fails releases the source queue. Reload converts an in-flight reset to unknown and starts no work. A recorded successor retains ownership through refusal, failure, Edit, Drop, and reload. Stale panel submissions follow that successor until the panel paints it. Afterward the source is independently selectable.
 
 Codex-compaction queueing requires durable capacity for the whole submission, including attachment-only prompts, without truncation or eviction. Waiting entries retain staged files through repaint, selection changes, and reload. Reload restores the queue before draining it.
 
@@ -54,7 +54,7 @@ An unfailed compaction card leaves at its recorded boundary, after started work 
 
 ## Local controls
 
-Exact `/compact` and `/clear` ignore case and surrounding whitespace. Codex `/new` also accepts an optional same-line name. Arguments after `/clear`, mentions inside sentences, and `/safe-compact` remain ordinary input. Codex controls use native app-server requests, never literal slash-command `turn/start` input.
+Exact `/compact` and `/clear` ignore case and surrounding whitespace. Codex `/new` also accepts an optional same-line name. Arguments after `/clear`, mentions inside sentences, and `/safe-compact` remain ordinary input. Codex controls use native app-server requests, never literal slash-command `turn/start` input. The exception is a queued `/compact` that carries comment claims or files.
 
 Codex `/rename` uses the rest of its line as the name. It starts no turn, answers no request, and bypasses running work and staging. Files and comments stay in the prompt box. Failure or an empty name reports an editor error and restores the line only if no newer text edit occurred. Claude sends `/rename` to its CLI. Commands that Claude answers without turns draw no timeline card or prompt-box reply.
 

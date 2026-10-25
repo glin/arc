@@ -44,7 +44,7 @@ Use `promptParts` for recorded recall. A turn can join a prompt without a respon
 
 Recall changes displayed text separately from the retained draft. Displayed text controls Send. The retained draft survives session changes and reloads.
 
-Recall hides completion until the walk ends, unless Escape dismissed it.
+Recall hides completion until the walk ends. Ending recall restores the menu unless the reader dismissed it with Escape.
 
 At offset zero, recall takes priority over command completion. Elsewhere an open command menu retains both arrow keys.
 
