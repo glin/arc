@@ -14,7 +14,7 @@ One positional destination retains the full matrix outside plan directories:
 npm --prefix extension run shots -- /path/to/shots
 ```
 
-Positional destinations reject adjacent `.claude/plans` components regardless of letter case on Windows, macOS, and Linux. Existing redirected or unreadable ancestors also refuse before browser launch or file writes. Exported `shoot` with its default writer and direct `writeLosslessWebp` calls check the actual target's parent and refuse existing file links before capture. Shot names that reach plan directories also refuse before replacement or page setup. These checks provide no filesystem sandbox or protection against concurrent path replacement.
+Destinations reject adjacent `.claude/plans` components without case on Windows, macOS, and Linux. Redirected or unreadable ancestors refuse before browser launch or writes. Default `shoot` and `writeLosslessWebp` also check the target's parent and reject existing file links. Shot names reaching plan directories refuse before replacement or page setup. These checks provide no sandbox against concurrent path replacement.
 
 Explicit owner options select bounded capture through the checkout-local adapter:
 
@@ -24,9 +24,9 @@ npm --prefix extension run shots -- --owner PLAN --run RUN --reservation BYTES -
 
 Owner, run, and reservation options are required together. Omit `--shots` for `wide,narrow`. Unknown, duplicate, missing, or mixed positional options fail. The adapter requires an existing In progress owner and a fresh run identifier. Select at most eight unique names from the existing shot list. Each selected state produces dark and light images. The byte reservation must exceed 8192 and stay within 10000000, including terminal receipt headroom. Whole-owner budgets and metadata reservations also apply. The command awaits terminal completion and preserves partial images on failure or cancellation. A checkout without the private adapter refuses owner captures without starting the legacy matrix. Default and safe positional captures need no private adapter.
 
-The shots run fails with EPERM when its output directory sits inside a folder that a file sync client watches, and passes with an output directory outside the working tree.
+For EPERM in a synced screenshot folder, repeat the capture outside the worktree.
 
-Panel capture scripts reuse the state setup in `extension/scripts/panel-shots.ts`. Its default writer checks file admission before clearing the target or setting up the page, then writes lossless WebP. A supplied writer receives the target unchanged and controls file admission and replacement. The screenshot command selects the full fixture matrix or the checkout-local bounded capture adapter. [Panel screenshots](#panel-screenshots) owns command syntax, destination admission, and adapter availability.
+A supplied screenshot writer receives the target unchanged and controls file admission and replacement. Default-writer checks do not apply to it.
 
 ## README screenshots
 
@@ -36,11 +36,11 @@ From `extension/`, run the README capture command:
 npx tsx scripts/readme-shots.ts
 ```
 
-The command builds the panel and writes the README images to `docs/images/`. Pass an output directory to keep comparison captures outside the repository. Bundled Chromium, Edge, or Chrome and ImageMagick 7 must be available. Captures use a fixed clock, `en-US` locale, `America/Chicago` timezone, and two device pixels per CSS pixel. GPU rasterization is off.
+The command builds the panel and writes `docs/images/`. Pass an output directory for external comparisons. Install bundled Chromium, Edge, or Chrome and ImageMagick 7. Captures fix the clock, `en-US` locale, `America/Chicago` timezone, and two device pixels per CSS pixel. GPU rasterization is off. `extension/scripts/readme-shots.ts` owns scene dimensions and crops. Browser version, operating system, and fonts still affect rendering.
 
-The main image captures the exported web demo with its session list narrowed to 270 CSS pixels. Its capture data omits sample comments, including the Prompt box count. The panel viewport is 1120 by 740 CSS pixels. The exported demo supplies the decorative VS Code title bar, activity strip, and Arc tab. The frame adds 16 CSS pixels of transparent spacing and a soft shadow. Its final image is 2372 by 1652 pixels. The capture hides the header through the shared shell stylesheet. The exported demo keeps its header and session list width.
+The main scene captures the exported demo without sample comments or the Prompt box comment count. It hides the shared shell header. The exported demo retains its header and normal session list width.
 
-The other captures use the production panel with synthetic Arc sessions and One Dark Pro Darker colors. Comment captures show the selection editor and the saved comment list beside response text. Their session list is 380 CSS pixels wide. The review and files viewports are 1100 by 1000 CSS pixels and use One column card layout. The files image crops the Commits and Files sections and adds 18 CSS pixels of surrounding panel background. Session-menu, response-menu, and cache-expiry viewports are 1430 CSS pixels wide. Other viewports are 1350 CSS pixels wide. All are 700 CSS pixels tall except review and files. Cost and usage figures come from synthetic request records and limit readings. Menu captures use the stand-in from `extension/scripts/web-demo-menu.ts`, which reads the extension manifest and panel context. Browser version, operating system, and fonts affect rendering.
+Other scenes use production panel markup, synthetic sessions and usage, and One Dark Pro Darker colors. Comment scenes show the selection editor and saved comment list. Review and files use One column. Menus use `extension/scripts/web-demo-menu.ts`, the extension manifest, and panel context.
 
 ## Static web demo
 
@@ -50,7 +50,21 @@ Build the sample demo from the repository root:
 npx tsx extension/scripts/web-demo.ts
 ```
 
-Serve `.scratch-web-demo/site` as a static directory. Its relative assets work at the server root and under a project path such as `/arc/`. The page uses the packaged panel renderer, invented session data, and a fixed clock. `view/static-shell.ts` and `webview/static-shell.css` supply its decorative editor frame. Narrow screens hide the activity strip and window title bar. The shell adds no keyboard stops. The panel and its fixed elements share the page viewport, so the demo stylesheet offsets the session list, sticky headings, prompt box, and usage bar. It has no agent connection. `Export session as HTML...` in the saved-session menu downloads the selected invented session and its reachable agent and reader-started sessions. Each download opens offline as one HTML file. The download uses the saved-session export restrictions. Selecting response text opens the production comment action. Comments support saving, editing, and deletion in page memory across session navigation. Back and Forward use the mouse navigation buttons. Keyboard navigation uses Alt+Left and Alt+Right on Windows, Ctrl+- and Ctrl+Shift+- on macOS, and Ctrl+Alt+- and Ctrl+Shift+- on Linux. These shortcuts leave editable fields unchanged. Reloading the page restores the sample comments. A right-click opens the same context menu stand-in with the entries the demo can answer in page memory. New session with the same labels and both Send entries perform no action. Run the browser boundary check with `node extension/test.mjs browser src/web-demo.browser.test.ts`.
+Serve `.scratch-web-demo/site` as a static directory. Relative assets work at `/` and project paths such as `/arc/`. The demo uses the packaged panel, invented sessions, and a fixed clock. It has no agent connection. Saved-session export downloads one offline HTML file with reachable agent and reader-started sessions under the [saved-session restrictions](export-session.md). Comments support creation, editing, and deletion in page memory across session navigation. Reload restores sample comments. Response links navigate only to recognized sample sessions. File and external links remain inert.
+
+Mouse Back and Forward navigate sessions. Keyboard shortcuts leave editable fields unchanged:
+
+| Platform | Back       | Forward      |
+| -------- | ---------- | ------------ |
+| Windows  | Alt+Left   | Alt+Right    |
+| macOS    | Ctrl+-     | Ctrl+Shift+- |
+| Linux    | Ctrl+Alt+- | Ctrl+Shift+- |
+
+Right-click opens the context menu stand-in. New session with the same labels and both Send entries do nothing. Run the boundary check:
+
+```bash
+node extension/test.mjs browser src/web-demo.browser.test.ts
+```
 
 ### Updating the demo
 
@@ -79,4 +93,8 @@ Inspect both providers' context detail, cache expiry, turn history, dispatched-s
 
 ## Demo source contracts
 
-`view/static-shell.ts` and `webview/static-shell.css` own the decorative editor frame shared by the exported site and main README capture. The panel remains in the page document because its session list and popovers mount directly under the body and use viewport coordinates. Invented session records for a sample site that uses the panel bundle without starting the extension host or reading agent records. Production decoders read provider-response snapshots in `extension/scripts/demo-catalog/`. `demo-catalog-check.ts` compares installed CLI catalogs and base and model-specific defaults without sending prompts. Its `--refresh` option replaces those snapshots. Codex snapshots preserve omitted and null model and effort settings through `codexwire.ts`, so each model retains its configured default. Other configuration fields are excluded. Its `--cwd` option selects the launch folder, whose Claude project and local settings affect catalog aliases and applied defaults. The check launches Claude without the user settings file or model and effort variables, so those personal choices stay out of the snapshots. The check launches Codex in a private temporary home that holds only a copy of the signed-in account file. The account still selects the catalog, and personal settings stay out of the snapshots. The home has no trust entry, so Codex ignores the project settings of the launch folder. `ARC_CLAUDE_PATH` and `ARC_CODEX_PATH` select CLI executables. Offline export does not establish snapshot freshness. `web-demo-host.ts` classifies every panel request and normalizes sample context detail through production contracts. `web-demo-adapter.js` answers supported requests in page memory. `web-demo-export.ts` builds each invented outgoing session graph with the production export projection and renderer. The saved-session menu downloads its prebuilt HTML with the production stylesheet embedded. `exports.json` names the admitted downloads. The static-site checker checks their decoded data blocks and reachable session graphs. The adapter's comment store uses the production normalizer and mutation rules across session navigation. The adapter's navigation trail uses `turnplaces.ts` for session visits and Back and Forward. The demo admits response links only when `domain/session-link.ts` recognizes a sample session. File and external links remain inert. Demo and export keyboard shortcuts use `webview/navigation.ts`. `webview/static-menu.ts` stands in for the editor's context menu there and in the README captures
+Keep the panel in the page document. Its session list and popovers mount under the body and use viewport coordinates. `view/static-shell.ts` and `webview/static-shell.css` own the shared editor frame.
+
+Provider snapshots under `extension/scripts/demo-catalog/` are decoded through production contracts. The catalog check compares installed model catalogs plus base and model-specific defaults without prompts. `--cwd` selects the launch folder. Claude project and local settings apply. Personal user settings and model or effort variables do not. Codex uses a temporary home with only the signed-in account file. That account still selects its catalog. Without a trust entry, launch-folder project settings do not apply. `ARC_CLAUDE_PATH` and `ARC_CODEX_PATH` select executables.
+
+Preserve omitted and null Codex model and effort settings through `codexwire.ts`. Exclude other configuration fields. The adapter uses production context, comment, navigation, and response-link contracts. Export downloads use production projection and rendering with the stylesheet embedded. `exports.json` names admitted downloads, whose decoded data and reachable graphs the static-site checker checks. Demo and export keyboard behavior share `webview/navigation.ts`.

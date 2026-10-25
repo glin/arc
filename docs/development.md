@@ -1,14 +1,18 @@
 # Development workflow
 
-Use this guide for local setup, worktree safety, checks, and performance capture.
-
 ## Fast iteration
 
 Run `npm run test:iterate` while you iterate. It runs the direct unit lanes. Run `npm test` to include static checks.
 
 Check a change with the cheapest method that reaches it, in the order `CLAUDE.md` gives. A change that needs a real VS Code window goes to the [isolated editor](isolated-editor.md#isolated-extension-host).
 
-Name the browser test files for the area you changed and run them directly with `node extension/test.mjs browser <files>`. Each named file narrows the lane to just that file, relative to `extension/` or to the repository root. A name that is not a browser test file fails with a clear message instead of running the whole lane.
+Run named browser files directly:
+
+```bash
+node extension/test.mjs browser <files>
+```
+
+Paths are relative to `extension/` or the repository root. An invalid browser filename fails instead of expanding the lane.
 
 After all edits, format your changes and run the tests once before handoff. In an isolated worktree, format every covered file and run the full suite:
 
@@ -17,7 +21,7 @@ npm run format
 npm run test:all
 ```
 
-## Dependencies
+## Subject guides
 
 Use [Installation and packaging](installation.md) for installer checks and bundled tools. Use [Performance diagnostics](performance.md#performance-capture) before profiling.
 
@@ -27,7 +31,9 @@ Use [the isolated editor](isolated-editor.md#isolated-extension-host) for `scrip
 
 Use [Handoff checks](testing.md#handoff-checks) for shared checkout and landing checks. Use [Timeline checks](testing.md#timeline-checks) for the read-only Claude sweep.
 
-Use Node.js 22.12+. The extension targets the editor's Node runtime, while the source build uses newer packaging dependencies.
+## Dependencies
+
+Use Node.js 22.12+ for source builds.
 
 Install extension and CLI dependencies before building or testing:
 
@@ -38,13 +44,18 @@ npm --prefix cli install
 npm --prefix extension exec -- playwright-core install chromium-headless-shell
 ```
 
-The last command installs Playwright's bundled Chromium in the per-user Playwright cache, outside the repository. The browser tests and screenshot scripts use it first. [Verification](testing.md#verification) gives the reason.
+The browser install writes to the per-user Playwright cache outside the repository. [Browser selection](testing.md#browser-selection) explains the channel order.
 
 `npm install` reuses existing dependencies and updates the lockfile when needed. Replacing an in-use package still conflicts with running tests on Windows.
 
 `esbuild` is native. Install dependencies on the operating system that runs the commands. A `node_modules` tree copied from another operating system will not run it.
 
-The source installer builds and installs the editor extension from local or temporary downloaded source. Its Claude plugin setup and legacy hook cleanup are described in [Snapshot installation](installation.md#snapshot-installation). [Isolated installer tests](installation.md#isolated-installer-tests) supplies the checkout plugin workflow. Validate the plugin and marketplace with `claude plugin validate --strict ./plugins/arc-hooks` and `claude plugin validate --strict .`.
+Validate the Claude plugin and marketplace before changing their packaging:
+
+```bash
+claude plugin validate --strict ./plugins/arc-hooks
+claude plugin validate --strict .
+```
 
 The panel shots and their test write WebP files with the ImageMagick 7 `magick` command. Put `magick` on the `PATH` before running the full test suite.
 
@@ -62,21 +73,21 @@ Git writes a text file instead of the link when it cannot create links. Repair t
 
 ## Worktree dependencies
 
-`npm run test:all` from a worktree root needs three dependency trees: `node_modules`, `extension/node_modules`, and `cli/node_modules`. A worktree that has only `extension/node_modules` cannot run the gate.
+Root checks need `node_modules`, `extension/node_modules`, and `cli/node_modules`.
 
-A worktree gets the three trees in one of two ways. It links each tree to the same tree in the main worktree after the main worktree has installed them. Or it runs the install commands in [Dependencies](#dependencies) inside the worktree.
+Link each dependency tree to its installed counterpart in the main worktree, or run [Dependencies](#dependencies) here.
 
-A link changes what an install does. An install through a link changes the dependencies of the main worktree. A branch that changes `extension/package.json` or its lockfile therefore needs its own install. Remove the links in that worktree and install there.
+Installing through a dependency link changes the main worktree. A branch changing `extension/package.json` or its lockfile needs its own installation. Remove its links first.
 
 Remove a link without following it. Use a command that deletes only the link. Never delete recursively through a link, because that empties the dependencies of the main worktree. Count the files under the link target before and after the removal, and confirm that the link is gone before removing the worktree.
 
 The owner's VS Code loads the main worktree. A check in the owner's window therefore needs the change landed and built there, and the owner performs it. When the owner's window loads another checkout, the owner confirms the loaded worktree and bundle first. An agent checks a worktree build in the [isolated editor](isolated-editor.md#isolated-extension-host), which loads the checkout it names.
 
-To compare test results between two commits, run both in checkouts set up the same way, for example two worktrees with the same dependency links. A worktree and the main checkout differ in more than the commit, such as build output and dependency links, so a difference between them does not show that the commit caused it.
+Compare commits in equally configured checkouts, including build output and dependency links. Differences between a worktree and the main checkout alone do not establish a commit effect.
 
 ## Model pricing
 
-`extension/src/pricing.ts` owns exact model definitions and explicit provider support. Its shared formulas serve the panel, Project cost, and status CLI.
+Change model and provider pricing in `extension/src/pricing.ts`.
 
 1. Read primary pricing and cache-policy sources before adding a model or provider route. Check effort-change retention for each exact model identity and provider route. For Claude Code, consult [Changing effort level](https://code.claude.com/docs/en/prompt-caching#changing-effort-level).
 2. Define the exact model identity, base rates, request threshold, fallback context window, and explicit sourced cache policy once.
@@ -96,11 +107,10 @@ To compare test results between two commits, run both in checkouts set up the sa
 16. Remove the new provider support temporarily and run the symptom regressions. Also remove its cache policy, price, and independent route expectation separately. Remove the new effort-change retention policy and its independent expectation separately. Also widen each exact-identity retention pattern. Require each guard to fail, then restore from plain backups.
 17. Update exact model coverage in [Supported pricing](agent-cost-guide.md#supported-pricing). Update README provider summaries when provider coverage changes.
 18. Check personal billing consumers against the same request evidence and Arc build. Record independent pricing behavior until each consumer uses Arc billing.
-19. Run the focused tests and the verification commands in [Fast iteration](#fast-iteration).
 
 ## Environment overrides
 
-Six variables move roots that Arc otherwise derives from the home directory. Arc-specific overrides take precedence over vendor homes. An empty vendor home counts as unset.
+Empty vendor homes count as unset.
 
 | Variable | Moves | Default |
 | --- | --- | --- |
@@ -111,7 +121,7 @@ Six variables move roots that Arc otherwise derives from the home directory. Arc
 | `CLAUDE_CONFIG_DIR` | The Claude Code home. Arc reads transcripts from `projects` below it and ignores agent-owned files below it | `~/.claude` |
 | `CODEX_HOME` | The Codex home. Arc reads rollouts from `sessions` below it and ignores agent-owned files below it | `~/.codex` |
 
-`ARC_PROJECTS_ROOT`, `ARC_CODEX_ROOT`, and `ARC_IGNORE_ROOTS` win when their related vendor home is also set. Arc reads these values from the editor process environment.
+`ARC_PROJECTS_ROOT`, `ARC_CODEX_ROOT`, and `ARC_IGNORE_ROOTS` override their related vendor homes. The extension reads these values from the editor process environment.
 
 ## Live panel development
 
@@ -123,11 +133,11 @@ npm --prefix extension run dev
 
 This workflow runs in the owner's own VS Code window. An agent uses the [isolated editor](isolated-editor.md#isolated-extension-host) instead.
 
-Wait for the ready message. Open this checkout in VS Code. Press F5 and select `Run Arc Extension`. The launch opens this checkout in an Extension Development Host and loads the nested `extension` package. Open Arc in that window. A CSS save patches the open panel in place. A Preact component save asks the extension host to replace only the webview document. A full Vite reload and a server reconnect use the same replacement path. The reload restores the selected session, unsent prompt, and scroll position after the initial render lays out. It also replaces the complete browser lifetime, so old handlers, timers, observers, subscriptions, roots, and message listeners do not remain active.
+Wait for the ready message, then open this checkout in VS Code. Press F5 and select `Run Arc Extension`. Open Arc in the new Extension Development Host. CSS saves patch the panel in place. Component saves, Vite reloads, and reconnects replace the webview document. Replacement restores the selected session, unsent prompt, and scroll position after initial layout. `webview/bootstrap.ts` owns browser-lifetime cleanup.
 
 The launch passes the checkout as a positional folder argument on Windows. Do not use `${workspaceFolder}` with `--folder-uri`, because VS Code keeps the Windows path instead of creating a file URI. If F5 reuses a development host without a folder, stop debugging and close that host before starting again.
 
-The development server binds to `127.0.0.1:5173` with a strict port. A port conflict stops the command. Stop the conflicting process, then run the command again. A panel opened while the server is down shows the command that restores it and reloads when the server returns. A syntax error leaves the last working panel active during an update. Fix and save the source to recover. Close and reopen the panel or restore an editor tab to confirm both paths reconnect.
+The server binds strictly to `127.0.0.1:5173`. Stop a conflicting process before retrying. An open panel shows its recovery command while the server is down and reloads when it returns. Syntax errors retain the last working panel during updates. Fix and save to recover. Check reconnects with a reopened panel and a restored tab.
 
 Development command selection follows the [bundled tools contract](installation.md#bundled-tools). CLI source saves update `dist/cli.cjs`. Extension-host source saves rebuild `extension/dist/extension.js`. Reload the Extension Development Host to apply them. The panel does not present extension-host changes as hot updates.
 
@@ -137,7 +147,9 @@ Run `npm --prefix extension run build` after development. The production build r
 
 ## Configuration watches
 
-`configwatch.ts` watches each queried folder and each of its ancestors for its `.claude` and `.codex` directories. Inside each of those directories that exists, an inner watch covers `settings*.json` or `config.toml`. A directory that appears later gets its inner watch from the create event on its folder, or from a change event when a new check finds the directory. On Windows and macOS, the editor matches these directory names without case, so an event spelled `.Claude` also adds the inner watch. The agent user directories have their own watches on the same files. VS Code watches the base of a pattern recursively when the pattern holds `/` or `**`. Each of these patterns names direct children of its base, so every watch covers one folder. On macOS, VS Code skips a non-recursive watch under `/Volumes/` and reports no failure. A working directory on a second volume outside every workspace folder therefore gets no configuration invalidation. Unused folder watches and their inner watches are disposed, and only Arc executable path settings invalidate defaults through editor configuration events.
+`configwatch.ts` watches queried folders and every ancestor for `.claude` and `.codex`. Existing directories receive direct-child watches for `settings*.json` or `config.toml`. Create events and successful later checks add missing watches. Windows and macOS match directory-event names without case. Linux preserves case. Keep patterns non-recursive. VS Code treats `/` or `**` as recursive. Agent user homes have separate file watches.
+
+On macOS, VS Code silently skips non-recursive watches under `/Volumes/`. A second-volume working directory outside every workspace folder receives no configuration invalidation. Dispose unused folder and inner watches. Only Arc executable path settings invalidate defaults through editor configuration events.
 
 ## Legacy checkout plugin recovery
 
