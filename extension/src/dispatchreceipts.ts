@@ -373,13 +373,20 @@ export class DispatchReceipts {
         } catch {
           // Missing cache evidence requires a complete verification before publication.
         }
-        const home = paths.dirname(this.root);
-        safePath(home);
-        for (const directory of [paths.join(home, 'cache'), paths.dirname(file)]) {
-          if (!fs.existsSync(directory)) fs.mkdirSync(directory, { mode: 0o700 });
-          safePath(directory);
-        }
-        writeFileAtomically(file, JSON.stringify(digest), this.replace, 0o600, false);
+        this.lock(id, () => {
+          try {
+            if (JSON.parse(read(file)) === digest) return;
+          } catch {
+            // Publication requires a fresh equality check under the launch write lock.
+          }
+          const home = paths.dirname(this.root);
+          safePath(home);
+          for (const directory of [paths.join(home, 'cache'), paths.dirname(file)]) {
+            if (!fs.existsSync(directory)) fs.mkdirSync(directory, { mode: 0o700 });
+            safePath(directory);
+          }
+          writeFileAtomically(file, JSON.stringify(digest), this.replace, 0o600, false);
+        });
       } catch {
         // Unavailable cache storage leaves the verified relationship in memory.
         continue;

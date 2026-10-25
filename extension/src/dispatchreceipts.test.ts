@@ -158,6 +158,57 @@ test.each(['claude', 'codex'] as const)('verified %s receipt links survive remov
   assert.deepEqual(drainRelationships(restarted.relationships(fx.catalog)), linked);
 });
 
+test('concurrent verification publications preserve a retained receipt link during validation', () => {
+  const cwd = scratch('arc-dispatch-worker-');
+  const fx = relationshipFixture('claude', 'codex', false, cwd);
+  const other = new DispatchReceipts(fx.home);
+  const linked = drainRelationships(fx.receipts.relationships(fx.catalog));
+  assert.equal(linked.length, 1);
+  assert.deepEqual(drainRelationships(other.relationships(fx.catalog)), linked);
+  const cache = path.join(fx.home, 'cache', 'dispatch-relationships', `${fx.launch.launchId}.json`);
+  const scan = new DispatchReceipts(fx.home).relationship(fx.launch.launchId, fx.catalog);
+  const write = fs.writeFileSync;
+  const rename = fs.renameSync;
+  const open = fs.openSync;
+  let interleaved = false;
+  let sourceOpened = false;
+  let publications = 0;
+  let timestamp = 1_700_000_000_000;
+  vi.spyOn(Date, 'now').mockImplementation(() => timestamp++);
+  vi.spyOn(fs, 'openSync').mockImplementation(((file: fs.PathLike, ...args: any[]) => {
+    if (String(file) === fx.file) sourceOpened = true;
+    return Reflect.apply(open, fs, [file, ...args]);
+  }) as typeof fs.openSync);
+  vi.spyOn(fs, 'writeFileSync').mockImplementation(((file: fs.PathOrFileDescriptor, ...args: any[]) => {
+    Reflect.apply(write, fs, [file, ...args]);
+    if (!interleaved && String(file).startsWith(cache + '.') && String(file).endsWith('.tmp')) {
+      interleaved = true;
+      other.checkpointRelationships();
+    }
+  }) as typeof fs.writeFileSync);
+  vi.spyOn(fs, 'renameSync').mockImplementation((from, to) => {
+    rename(from, to);
+    if (String(to) !== cache || ++publications !== 1) return;
+    fs.rmdirSync(cwd);
+    for (let steps = 0; steps < 100_000; steps++) {
+      if (sourceOpened) break;
+      const next = scan.next({ entries: 1, checks: 1, bytes: 37 });
+      assert.equal(next.done, false);
+    }
+    assert.equal(sourceOpened, true);
+  });
+  syncBuiltinESMExports();
+  try {
+    fx.receipts.checkpointRelationships();
+    other.checkpointRelationships();
+    assert.equal(interleaved, true);
+    assert.deepEqual(drainRelationships(scan), linked);
+    assert.equal(publications, 1);
+  } finally {
+    scan.return(null);
+  }
+});
+
 test.each(['claude', 'codex'] as const)(
   'unverified %s receipt links refuse an already missing launch cwd',
   (provider) => {
