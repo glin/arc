@@ -143,6 +143,7 @@ Paths are relative to `extension/src/`. [Architecture](architecture.md) owns pac
 | `atomicfile.ts` | Replaces a stored file through a named temporary, and sweeps the temporaries an abandoned writer left | no |
 | `scheduler.ts` | Bounded trailing scheduling, aggregation of pending watcher events and of the transcripts a live-activity fallback names, and the targeted or broad wake decision | no |
 | `performancediagnostics.ts` | Redacted performance-snapshot projection, the file a capture is written to, message budgets, and monotonic host and panel counters | no |
+| `railpublication-measure.ts` | Session list publication measurement over a generated list: input gate passes, snapshot and delta posts with their bytes, rows carried, and bytes per simulated minute | no |
 | `diagnosticslog.ts` | Per-host JSON-line diagnostics, startup thresholds, asynchronous startup history, and bounded durable host health, lifecycle and action evidence independent of detailed logging | no |
 | `sessionloadingline.ts` | Decides what the session-list loading line publishes, holds it hidden for the scope roots that completed the list, and writes each change of the line to the diagnostics log under fixed line budgets | no |
 | `agentspend.ts` | Reads and caches child-transcript usage and direct-source measurements with measured model identity, shares aggregate refresh bands, and defines the verified child-session target lookup boundary | no |
