@@ -18,6 +18,12 @@
     "docs/comments.md",
     "docs/rail-and-navigation.md",
     "docs/composer.md",
+    "docs/session-setup.md",
+    "docs/prompt-delivery.md",
+    "docs/prompt-attachments.md",
+    "docs/agent-requests.md",
+    "docs/prompt-entries.md",
+    "docs/account-usage.md",
     "docs/agent-protocols.md",
     "docs/ui-design.md"
   ]

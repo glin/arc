@@ -1,6 +1,6 @@
 # Turn cards
 
-[Session list and navigation](rail-and-navigation.md) owns session headings, session list rendering, response links, and panel navigation. [UI design](ui-design.md) owns shared visual patterns. [Comments](comments.md) owns selection offsets and comment recovery. [Prompt box](composer.md) owns prompt delivery and attachment state.
+[Session list and navigation](rail-and-navigation.md) owns session headings, session list rendering, response links, and panel navigation. [UI design](ui-design.md) owns shared visual patterns. [Comments](comments.md) owns selection offsets and comment recovery. [Prompt delivery](prompt-delivery.md) and [attachments](prompt-attachments.md) own submission state.
 
 ## Card sources
 
