@@ -8,7 +8,7 @@ Use Conventional Commits with a type and scope.
 
 Do not line wrap Markdown. One paragraph is one line, and one list item is one line. The editor wraps for reading.
 
-`docs/components.md` owns component responsibilities. `docs/architecture.md` owns the system map, data sources, and non-obvious gotchas. Update the owning guide in the same commit when a change alters a component job, adds a data source, or introduces a gotcha. Keep other feature detail in code, tests, or `docs/design-goals.md`. Do not put repository inventories or counts in prose unless a test enforces them.
+`docs/components.md` owns component responsibilities. `docs/architecture.md` owns the system map and package boundaries. `docs/data-sources.md` owns source locations and provenance. `docs/window-channel.md` owns local cross-process contracts. Topic guides own their consequential constraints. Update the owning guide in the same commit when a change alters a component job, adds a data source, or introduces a gotcha. Keep other feature detail in code, tests, or `docs/design-goals.md`. Do not put repository inventories or counts in prose unless a test enforces them.
 
 Read [CLI instructions](cli/CLAUDE.md) for CLI changes, including command help and CLI documentation outside `cli/`. Read [extension instructions](extension/CLAUDE.md) for extension changes and tests.
 

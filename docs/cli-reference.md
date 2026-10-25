@@ -16,7 +16,7 @@ Human output names panel visibility and scope readiness. Incomplete discovery re
 
 Diagnostics report observed `ENOENT`, `EACCES`, or `EPERM`, the `registry` or `connection` stage, and an optional `hostId`. Human output names the same failures. Diagnostics exclude raw errors and authentication data. Cleaned-up registrations and closed windows leave no diagnostic. An empty incomplete listing alone establishes no permission failure. Windows bridge setup failures and pipe closures remain generic.
 
-`ARC_HOME` selects the registry root, defaulting to `~/.arc`. [Architecture](architecture.md#module-boundaries) owns channel discovery and cleanup. Requester attribution uses `CLAUDE_CODE_SESSION_ID`, then `CODEX_THREAD_ID`, otherwise `null`. Attribution grants no authority.
+`ARC_HOME` selects the registry root, defaulting to `~/.arc`. [Transport and registration](window-channel.md#transport-and-registration) owns channel discovery and cleanup. Requester attribution uses `CLAUDE_CODE_SESSION_ID`, then `CODEX_THREAD_ID`, otherwise `null`. Attribution grants no authority.
 
 The [guide's window selection rules](cli.md#windows) apply to window commands. A missing selected registration reports an unregistered window. Observed `EACCES` or `EPERM` reports local access failure. Other unavailable causes remain generic.
 
