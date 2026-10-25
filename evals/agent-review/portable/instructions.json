@@ -3,6 +3,9 @@
   "required": [
     "CLAUDE.md",
     "docs/architecture.md",
+    "docs/components.md",
+    "docs/data-sources.md",
+    "docs/window-channel.md",
     "docs/development.md",
     "docs/glossary.md",
     "docs/design-goals.md",
