@@ -4,22 +4,34 @@ Use this map to find the owner of a change. The topic guides hold behavior, and 
 
 ## Reading guide
 
-| Change | Guide |
+Read the routes for every subsystem a change reaches. Source paths below are relative to `extension/src/`, except paths beginning with `cli/`, `scripts/`, `plugins/`, or `extension/`. [Components](components.md) lists each source component's responsibility. [Glossary](glossary.md) defines product and domain names.
+
+| Change | Owning guide and source |
 | --- | --- |
-| Panel visual treatments and interaction patterns | [`ui-design.md`](ui-design.md) |
-| Source locations and provenance | [Source catalog](data-sources.md#source-catalog) |
-| Local requests, terminal routing, read acknowledgment, and guarded writes | [Window channel](window-channel.md) |
-| Transcripts, cards, diffs, context, cost, and refresh | [`timeline.md`](timeline.md) |
-| Accepted outcomes, live subagents, and session-list status | [`timeline.md`](timeline.md#card-sources) and `timelinestate.ts` |
-| Comments and text selection | [`comments.md`](comments.md) |
-| Session list, search, menus, and editor navigation | [`rail-and-navigation.md`](rail-and-navigation.md) |
-| Prompts, queue, controls, and account usage | [`composer.md`](composer.md) |
-| Child processes, resume, and agent protocols | [`agent-protocols.md`](agent-protocols.md) |
-| CLI commands and examples | [`cli.md`](cli.md) |
-| CLI output contracts and limits | [`cli-reference.md`](cli-reference.md) |
-| Agent session-management guidance and skill installation | [`arc-sessions.md`](arc-sessions.md) and [`arc-sessions` skill](../cli/skills/arc-sessions/SKILL.md) |
-| Portable saved-session viewer and static assets | [`export-session.md`](export-session.md) |
-| Setup, tests, and performance capture | [`development.md`](development.md) |
+| Source locations, root overrides, storage provenance, or retention | [Data sources table](data-sources.md#source-catalog), [usage history](data-sources.md#bounded-usage-history), and [environment overrides](development.md#environment-overrides). `store.ts`, `transcript.ts`, `codex.ts` |
+| Transcript admission, repository scope, source collisions, or relationship discovery | [Session discovery](timeline.md#session-discovery) and [relationship contracts](timeline.md#relationship-discovery-contracts). `transcript.ts`, `sessioncoverage.ts`, `repositoryscope.ts`, `progressiveworker.ts` |
+| Selected history, append recovery, parser transport, or cache migration | [Selected history](timeline.md#selected-session-history) and [source contracts](timeline.md#source-and-cache-contracts). `selectedsource.ts`, `parserstate.ts`, `derivedcache.ts` |
+| Turn boundaries, outcomes, live subagents, or background activity | [Shared turn model](timeline.md#shared-turn-model), [card sources](timeline.md#card-sources), and [parsing constraints](timeline.md#parsing-and-attribution-constraints). `transcript.ts`, `codex.ts`, `timelinestate.ts` |
+| Cost, context, pricing identity, or delegated attribution | [Accounting contracts](timeline.md#accounting-contracts) and [cost and context](timeline.md#cost-and-context). `sessioncost.ts`, `projectspend.ts`, `pricing.ts` |
+| Project cost refresh, integrity checks, or successful coverage age | [Integrity scheduling](timeline.md#project-cost-integrity-scheduling) and [Project cost](timeline.md#project-cost). `scheduler.ts`, `panelhost.ts`, `projectspend.ts` |
+| Snapshot hooks, transactions, baseline diffs, or cleanup | [Snapshot and diff contracts](timeline.md#snapshot-and-diff-contracts), [storage](data-sources.md#snapshot-storage), and [installation](development.md#snapshot-installation). `plugins/arc-hooks/`, `store.ts`, `uris.ts` |
+| Draft acceptance, submitted prompts, queue ownership, models, or account usage | [Delivery and recovery](composer.md#delivery-and-recovery-contracts) and [prompt controls](composer.md#sending-queueing-and-stopping). `composerview.ts`, `panelhost.ts`, `view/model-picks.ts` |
+| Native turn ownership, compaction, restricted successors, or child retirement | [Native turn contracts](agent-protocols.md#native-turn-and-compaction-contracts), [restricted successors](agent-protocols.md#restricted-successor-contracts), and [shutdown](agent-protocols.md#child-ownership-and-shutdown). `agenthost.ts`, `compactrequest.ts`, `launchpolicy.ts` |
+| Recovered questions or standalone process observation | [Question recovery](agent-protocols.md#question-recovery-contracts) and [standalone observation](agent-protocols.md#standalone-observation-contracts). `questionrecovery.ts`, `questionrecords.ts`, `cli/src/standalone.ts`, `dispatchreceipts.ts` |
+| Local authentication, terminal routing, transport recovery, or registry cleanup | [Terminal routing](window-channel.md#terminal-routing) and [transport ownership](window-channel.md#transport-and-registration). `sessionrequests.ts`, `terminalownership.ts`, `windowpipe.ts` |
+| Session listing, source qualification, read acknowledgment, starts, or guarded writes | [Accepted reads](window-channel.md#accepted-catalog-reads), [write and acknowledgment contracts](window-channel.md#session-writes-and-read-acknowledgment), and [CLI limits](cli-reference.md#sessions). `sessionreads.ts`, `sessionwrites.ts`, `domain/read.ts` |
+| Session list rendering, headings, loading, menus, file citations, or navigation | [Retained rendering](rail-and-navigation.md#retained-rendering-contracts), [loading](rail-and-navigation.md#session-list-loading-contracts), and [response links](rail-and-navigation.md#response-link-and-citation-contracts). `webview/rail.ts`, `webview/summary.ts`, `extension.ts` |
+| Comments, selection, or panel visual and keyboard patterns | [Comments](comments.md), [UI design](ui-design.md), and [keyboard contract](rail-and-navigation.md#keyboard-and-screen-reader-contract). `webview/comments.ts`, `webview/navigation.ts`, `webview/panel.css` |
+| CLI commands, collection, agent guidance, or skill installation | [CLI guide](cli.md), [command contracts](cli-reference.md#command-and-collection-implementation), and [session guidance](arc-sessions.md). `cli/src/commands.ts`, `cli/src/collect.ts`, `cli/src/skills.ts` |
+| Portable saved-session capture, projection, or publication | [Export contracts](export-session.md#capture-and-projection-contracts). `exportdata.ts`, `exportsite.ts`, `exportwriter.ts`, `webview/export-host.ts` |
+| Installation, immutable tools, packaging, build identity, or configuration watches | [Installer](development.md#installer-implementation), [bundled tools](development.md#bundled-tools), [build identity](development.md#build-identity-and-packaging), and [configuration watches](development.md#configuration-watches). `bundledtools.ts`, `toolpath.ts`, `configwatch.ts` |
+| Tests, diagnostics, startup measurement, demo assets, or platform limitations | [Verification](development.md#verification), [diagnostic implementation](development.md#diagnostic-implementation), and [demo sources](development.md#demo-source-contracts). `diagnosticslog.ts`, `scripts/`, `extension/scripts/` |
+
+Delivery changes cross prompt ownership, native child identity, source qualification, and channel receipts. Read those routes together. Discovery changes also reach query resolution, delegated accounting, cache generations, and export capture. Persistence changes require the owning state's recovery and storage contract.
+
+Follow parser changes through their consumers. Parsed facts travel through worker messages, forward checkpoints, derived metadata, spend ledgers, retained history, and export projection. [Source contracts](timeline.md#source-and-cache-contracts) identify their independent versions and acceptance rules. Changing a parser does not automatically invalidate every saved representation of its facts.
+
+Treat source presence, repository membership, physical identity, and accepted revision as separate evidence. [Discovery contracts](timeline.md#relationship-discovery-contracts) distinguish absence from an incomplete or refused read. [Channel reads](window-channel.md#accepted-catalog-reads) define what listing coverage and freshness establish. A displayed row alone supplies no authority to acknowledge review or deliver input.
 
 ## System shape
 
@@ -33,24 +45,24 @@ flowchart LR
     hooks[Claude hooks]
   end
 
-  subgraph records[User data]
+subgraph records[User data]
     transcripts[Claude transcripts]
     rollouts[Codex rollouts]
     snapshots[First-touch snapshots]
     trigger[Manifest and trigger]
   end
 
-  subgraph host[VS Code extension host]
+subgraph host[VS Code extension host]
     watcher[Watchers and poller]
     panelhost[Panel provider]
     child[Live agent child]
   end
 
-  panel[Panel webview]
+panel[Panel webview]
   status[Claude status-line JSON]
   cli[Arc CLI]
 
-  claude --> transcripts
+claude --> transcripts
   codex --> rollouts
   hooks --> snapshots
   hooks --> trigger
@@ -73,10 +85,32 @@ flowchart LR
 
 The extension never writes a file the agent changed. Hooks write only under the snapshot store. The panel opens files and diffs through VS Code. The CLI reads Claude status-line JSON from stdin or one session's Claude or Codex records from disk. Window discovery asks running extension hosts through their local channels.
 
-The exhaustive [component table](components.md) names each extension source component and its job.
+Recorded work and host-owned live processes have separate authority. [Card sources](timeline.md#card-sources) defines their reconciliation. Reader-owned state survives independently of rebuildable parsing and spend caches. [Cache ownership](timeline.md#cache-ownership) defines those lifetimes. Receipt relationship scans supply neither billing evidence nor delivery authority. [Relationship discovery](timeline.md#relationship-discovery-contracts) defines their admission.
+
+The local channel addresses one extension-host activation. Authentication and terminal ancestry do not transfer the reader's authority to a caller. [Window contracts](window-channel.md) define the distinct read, write, and observation capabilities. [Standalone observation](agent-protocols.md#standalone-observation-contracts) defines launch management separately from transcript identity.
+
+Filesystem validation establishes observed agreement within each reader's contract. It does not establish an atomic snapshot or protect against every concurrent replacement. Preserve the qualifications in [relationship validation](timeline.md#relationship-discovery-contracts), [catalog reads](window-channel.md#accepted-catalog-reads), and [export publication](export-session.md#capture-and-projection-contracts) when changing those paths.
 
 ## Module boundaries
 
 `payload.ts` shapes host-to-panel render messages. The panel runs in another process, so a host import cannot supply browser code. Shared rules live in browser-safe `domain/` and `view/` modules. Host-only decisions travel as data over `webview/protocol.ts`.
 
 The root `turn*.ts` modules own the host projections by subject. New imports name that owner rather than the compatibility re-export in `turnview.ts`.
+
+Every extension source package permits imports within itself. The additional local directions below apply to runtime and type imports, except the stated protocol exception.
+
+| Importing package | Additional allowed destinations |
+| --- | --- |
+| Root files, the explicit `legacy` package | Every recognized package |
+| `domain/` | None |
+| `readers/shared/` | `domain/` |
+| `readers/claude/`, `readers/codex/` | `domain/` and `readers/shared/`. Neither imports the other provider |
+| `runtime/shared/` | `domain/` |
+| `runtime/claude/`, `runtime/codex/` | `domain/` and `runtime/shared/`. Neither imports the other provider |
+| `view/` | `domain/` and every `readers/` package |
+| `webview/` | `domain/` and `view/` |
+| `host/` | Every recognized package, with browser access limited to `webview/protocol.ts` |
+
+`domain/`, `view/`, and `webview/` cannot import Node built-ins. `webview/protocol.ts` has one permitted type-only edge into a root module. Its enforced ceiling equals its actual edge count. New source folders require an explicit package rule.
+
+[`imports.test.ts`](../extension/src/imports.test.ts) checks package directions, exact editor API exemptions, production fixture exclusions, and runtime cycles. Decisions outside editor glue remain directly importable by Node tests. [`source-tree.test.ts`](../extension/src/source-tree.test.ts) checks the shared [dependency rules](../extension/test/source-tree.ts), recursive inventory, and protocol exception ceiling. [`architecture.test.ts`](../extension/src/architecture.test.ts) checks the [component table](components.md) against source paths and rejects duplicate entries.
