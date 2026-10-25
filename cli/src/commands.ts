@@ -206,6 +206,10 @@ export const COMMANDS: readonly Command[] = [
           'Retain explicit launch classification. Delegated Claude defaults its cache TTL to 5m.',
         ],
         [
+          '--cache-lifetime 5m|1h',
+          'Set the Claude prompt cache lifetime. Overrides the caller environment. Default: 5m for Run by agents, provider default otherwise.',
+        ],
+        [
           '--completion manual|wait',
           'Select one completion route. Default: manual. Wait ends after 110000 milliseconds.',
         ],
@@ -224,10 +228,11 @@ export const COMMANDS: readonly Command[] = [
       output: [
         'JSON identifies the launch receipt. Result and status remain readable after editor shutdown.',
         'Claude read-only uses print mode. Writable Claude uses --bg. Codex uses exec or an attended interactive session.',
-        'CLAUDE_BIN and CODEX_BIN override executable selection. Caller cache TTL overrides remain intact.',
+        'CLAUDE_BIN and CODEX_BIN override executable selection. Without --cache-lifetime, a caller cache TTL remains intact.',
       ],
       refusals: [
         'Missing explicit settings, worktree flags, invalid prompts, and unavailable launch directories refuse before spawning.',
+        '--cache-lifetime refuses other values and Codex launches.',
         'Callback delivery requires proven original parent authority on a supported daemon and is unavailable. Manual and waited completion remain available.',
       ],
       example:
@@ -508,6 +513,10 @@ export const COMMANDS: readonly Command[] = [
           '--agent-run[=true|false]',
           'Omitted or false keeps reader ownership and Prompt box continuation. Bare or true files delegated work under Run by agents.',
         ],
+        [
+          '--cache-lifetime 5m|1h',
+          'Set the Claude prompt cache lifetime. Default: 5m for Run by agents, provider default otherwise.',
+        ],
         ['--name NAME', 'Name the new session.'],
         ['--label NAME', 'Apply an initial reader label. Repeat for more labels.'],
         ['--pinned', 'Pin the new session.'],
@@ -537,6 +546,7 @@ export const COMMANDS: readonly Command[] = [
         'Empty prompts, slash commands, oversized files or encoded requests, and unsupported setups refuse launch.',
         'A guarded start refuses ambiguous native requester identity.',
         'Read-only starts refuse permission overrides. MCP read tools require Claude read-only and exact names.',
+        '--cache-lifetime refuses other values and Codex setups.',
         windowRefusal,
       ],
       example: 'arc start --setup SETUP_KEY --prompt-file prompt.txt --name Review --arc-dispatch --window WINDOW_ID',

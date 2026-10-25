@@ -1,4 +1,10 @@
-import { refusePolicyChange, claudeAutoMode, type LaunchPolicy } from './launchpolicy';
+import {
+  refusePolicyChange,
+  claudeAutoMode,
+  claudeCacheLifetime,
+  CACHE_TTL_ENV,
+  type LaunchPolicy,
+} from './launchpolicy';
 import { MEASUREMENT_ENVIRONMENT } from './identity';
 import { unavailableDefaults, type AppliedDefaults } from './view/model-picks';
 import { CONTEXT_FRAME_BYTES, CONTEXT_PREFIX_BYTES, type ContextFrameGate } from './contextframe';
@@ -350,6 +356,16 @@ export function codexAskMode(mode: AskMode): {
   return mode.codex;
 }
 
+// The CLI reports when it goes idle only when asked. That report ends prompts that joined a running turn.
+// A requested cache lifetime replaces a launch value under any letter case.
+function claudePlanEnv(env: Record<string, string>, options: SpawnOptions): Record<string, string> {
+  const lifetime = claudeCacheLifetime({ ...process.env, ...env }, options.cacheLifetime, options.agentRun === true);
+  const kept = lifetime
+    ? Object.fromEntries(Object.entries(env).filter(([key]) => key.toUpperCase() !== CACHE_TTL_ENV))
+    : env;
+  return { ...kept, CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: '1', ...(lifetime ? { [CACHE_TTL_ENV]: lifetime } : {}) };
+}
+
 // Claude Code: one child per session, speaking its stream-json protocol.
 export function claudePlan(launch: Launch, options: SpawnOptions): AgentPlan {
   options = { ...options, replayUserMessages: true };
@@ -360,17 +376,7 @@ export function claudePlan(launch: Launch, options: SpawnOptions): AgentPlan {
     command: launch.command,
     args: [...launch.leadingArgs, ...spawnArgs(options, { ...process.env, ...launch.env })],
     cwd: options.cwd,
-    // The CLI reports when it goes idle only when asked. That report ends prompts that joined a running turn.
-    env: {
-      ...launch.env,
-      CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: '1',
-      ...(options.agentRun &&
-      !Object.keys({ ...process.env, ...launch.env }).some(
-        (key) => key.toUpperCase() === 'CLAUDE_CODE_PROMPT_CACHE_TTL',
-      )
-        ? { CLAUDE_CODE_PROMPT_CACHE_TTL: '5m' }
-        : {}),
-    },
+    env: claudePlanEnv(launch.env, options),
     driver(send, emit) {
       // Seed Claude's session identity before the first prompt. A resumed CLI can defer reporting it until output begins.
       const wire = new ClaudeWire({ send, emit, sessionId: options.resume ?? options.sessionId });

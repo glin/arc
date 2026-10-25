@@ -12065,3 +12065,23 @@ test('Remote Control reaches only the live child of its own session, before and 
   assert.deepEqual(await toggle('missing', () => {}), { outcome: 'stopped' });
   assert.equal(children.length, 2, 'a Remote Control toggle started a process');
 });
+
+test('Claude plans set a requested cache lifetime over launch values and keep the delegated default', () => {
+  const inherited = Object.entries(process.env).filter(([key]) => key.toUpperCase() === 'CLAUDE_CODE_PROMPT_CACHE_TTL');
+  for (const [key] of inherited) delete process.env[key];
+  onTestFinished(() => {
+    for (const [key, value] of inherited) process.env[key] = value;
+  });
+  const planned = (options: { agentRun?: boolean; cacheLifetime?: '5m' | '1h' }, env: Record<string, string> = {}) =>
+    claudePlan({ ...CLAUDE, env }, { cwd: WS, sessionId: 'session', ...options }).env;
+  for (const cacheLifetime of ['5m', '1h'] as const)
+    for (const agentRun of [false, true]) {
+      const env = planned({ cacheLifetime, agentRun }, { claude_code_prompt_cache_ttl: '10m', CUSTOM: 'kept' });
+      assert.equal(env.CLAUDE_CODE_PROMPT_CACHE_TTL, cacheLifetime);
+      assert.equal(env.claude_code_prompt_cache_ttl, undefined);
+      assert.equal(env.CUSTOM, 'kept');
+    }
+  assert.equal(planned({ agentRun: true }).CLAUDE_CODE_PROMPT_CACHE_TTL, '5m');
+  assert.equal(planned({ agentRun: false }).CLAUDE_CODE_PROMPT_CACHE_TTL, undefined);
+  assert.equal(planned({ agentRun: true }, { CLAUDE_CODE_PROMPT_CACHE_TTL: '1h' }).CLAUDE_CODE_PROMPT_CACHE_TTL, '1h');
+});

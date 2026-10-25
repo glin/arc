@@ -118,11 +118,12 @@ import { sessionRenameTitle } from './sessionrename';
 // Check the accepted values when updating the CLI. An unsupported mode prevents child startup.
 export type PermissionMode = 'default' | 'acceptEdits' | 'auto' | 'bypassPermissions' | 'manual' | 'dontAsk' | 'plan';
 
-import { claudeReadOnlyArgs, claudeReadOnlyMcp, type LaunchPolicy } from './launchpolicy';
+import { claudeReadOnlyArgs, claudeReadOnlyMcp, type LaunchPolicy, type RequestedCacheLifetime } from './launchpolicy';
 
 export interface SpawnOptions {
   policy?: LaunchPolicy;
   agentRun?: boolean;
+  cacheLifetime?: RequestedCacheLifetime;
   cwd: string;
   model?: string;
   // The initial effort level comes from the model's `list_models` entry.

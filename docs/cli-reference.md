@@ -147,6 +147,8 @@ Prompt files must be regular and at most 48 KiB. Empty prompts and slash command
 
 `--agent-run` and `--agent-run=true` classify delegated work. Omission or `--agent-run=false` retains reader ownership and Prompt box continuation. Classification accepts only literal `true` or `false` and cannot repeat. Only `--arc-dispatch` prints the dispatch receipt. Reader-owned receipts include `owned: true`.
 
+`--cache-lifetime 5m` and `--cache-lifetime 1h` set `CLAUDE_CODE_PROMPT_CACHE_TTL` for a Claude launch from `start` or `run`. The flag replaces a value in the caller's environment for `run` and in the window's environment for `start`. Other values refuse. Codex launches refuse the flag, including a `--setup` key that selects Codex. Without the flag, a Claude launch under Run by agents gets `5m` unless the environment sets the variable, and a reader-owned launch keeps the environment value or the provider default. A standalone receipt records the requested value in its launch context. A hosted receipt does not record it. The requested value applies to the processes that a hosted start launches. A later resume of that session, after Arc retires its process, uses the default. `cost` reports the lifetime that the transcript records.
+
 `--read-only` retains an immutable launch policy through follow-ups, clear, resume, fork, and permission setting changes. It refuses permission overrides. Repeat `--read-tool EXACT_MCP_TOOL` for Claude read-only MCP tools. [Hosted read-only launches](agent-protocols.md#hosted-read-only-launches) define provider restrictions and filesystem guarantees.
 
 | Result | Meaning |

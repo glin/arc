@@ -8,7 +8,7 @@ import {
   type SessionCoverage,
   type SourceEnumeration,
 } from './sessioncoverage';
-import { launchPolicy } from './launchpolicy';
+import { cacheLifetimeRefusal, launchPolicy } from './launchpolicy';
 import { scopedLaunchCwd } from './repositoryscope';
 import { SessionFilterRequests, FILTER_LIMITS, type FilterOperation } from './sessionfilter';
 import {
@@ -2481,6 +2481,8 @@ export class PanelProvider implements vscode.Disposable {
       throw new Error("Arc is still loading that provider's models. Run arc setups until it lists them, then retry.");
     if (!this.onSendDraftPrompt || !this.memento) throw new Error('Session delivery or saving is unavailable.');
     const policy = launchPolicy(profile.agent, params.readOnly === true, params.readTools, profile.permissionMode);
+    const lifetimeRefusal = params.cacheLifetime ? cacheLifetimeRefusal(params.cacheLifetime, profile.agent) : null;
+    if (lifetimeRefusal) throw new Error(lifetimeRefusal);
     const draft = {
       ...newSessionDraft(
         `${DRAFT_SESSION_PREFIX}${crypto.randomUUID()}`,
@@ -2491,6 +2493,7 @@ export class PanelProvider implements vscode.Disposable {
       ),
       policy,
       agentRun: params.agentRun,
+      ...(params.cacheLifetime ? { cacheLifetime: params.cacheLifetime } : {}),
     };
     const start = guardedStartContext(request);
     if (params.dispatch) {

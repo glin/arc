@@ -348,7 +348,7 @@ process.stdin.on('end',()=>{
   const file=path.join(process.env.ARC_PROJECTS_ROOT,${JSON.stringify(projectSlug(home))},id+'.jsonl');
   fs.mkdirSync(path.dirname(file),{recursive:true});
   fs.writeFileSync(file,JSON.stringify({type:'user',uuid:'original-native-user',sessionId:id,cwd,message:{role:'user',content:prompt}})+'\\n');
-  fs.writeFileSync(${JSON.stringify(started)},JSON.stringify({id,cwd,prompt,pid:process.pid,args:process.argv.slice(2)}));
+  fs.writeFileSync(${JSON.stringify(started)},JSON.stringify({id,cwd,prompt,pid:process.pid,args:process.argv.slice(2),ttl:process.env.CLAUDE_CODE_PROMPT_CACHE_TTL}));
   console.error('Original worker is running.');
   const finish=()=>{if(!fs.existsSync(${JSON.stringify(release)}))return;watcher.close();
     console.log(JSON.stringify({type:'result',subtype:'success',is_error:false,session_id:id,result:'Original report'}));};
@@ -388,6 +388,8 @@ process.stdin.on('end',()=>{
         '--output',
         alias,
         '--arc-dispatch',
+        '--cache-lifetime',
+        '1h',
       ],
       { env, encoding: 'utf8', timeout: 10_000 },
     );
@@ -404,6 +406,8 @@ process.stdin.on('end',()=>{
     assert.equal(native.args.filter((arg) => arg === '--session-id').length, 1);
     assert.equal(native.args.includes('-p'), true);
     assert.equal(native.args[native.args.indexOf('--output-format') + 1], 'json');
+    assert.equal(native.ttl, '1h');
+    assert.equal(receipts.launch(launchId).standalone.env.CLAUDE_CODE_PROMPT_CACHE_TTL, '1h');
     assert.deepEqual(JSON.parse(lines[1].slice('ARC_DISPATCH_SESSION='.length)), {
       agent: 'claude',
       session_id: native.id,
@@ -553,7 +557,7 @@ for(const row of [{type:'thread.started',thread_id:'${id}'},{type:'turn.started'
   }
 });
 
-test('bundled guarded starts refuse ambiguous requesters', async () => {
+test('bundled starts refuse ambiguous guarded requesters and send only accepted cache lifetimes', async () => {
   const home = mkdtempSync(join(realpathSync(tmpdir()), 'arc guarded start smoke '));
   const channel = new WindowChannel(home);
   const run = promisify(execFile);
@@ -575,6 +579,16 @@ test('bundled guarded starts refuse ambiguous requesters', async () => {
     writeFileSync(prompt, 'Prepare the worktree.');
     const start = [cli, 'start', '--provider', 'claude', '--prompt-file', prompt];
     await assert.rejects(
+      run(process.execPath, [...start, '--cache-lifetime', '2h'], { env }),
+      /Choose --cache-lifetime 5m or 1h\./,
+    );
+    await assert.rejects(
+      run(process.execPath, [cli, 'start', '--provider', 'codex', '--prompt-file', prompt, '--cache-lifetime', '1h'], {
+        env,
+      }),
+      /--cache-lifetime applies only to Claude launches\./,
+    );
+    await assert.rejects(
       run(process.execPath, [...start, '--arc-dispatch'], { env }),
       /Both CLAUDE_CODE_SESSION_ID and CODEX_THREAD_ID/,
     );
@@ -582,6 +596,9 @@ test('bundled guarded starts refuse ambiguous requesters', async () => {
     await run(process.execPath, start, { env, encoding: 'utf8' });
     assert.equal(requests.length, 1, 'a start without --arc-dispatch keeps working and records no owner');
     assert.equal('requesterProvider' in requests[0], false);
+    assert.equal('cacheLifetime' in requests[0].params, false);
+    await run(process.execPath, [...start, '--cache-lifetime', '1h'], { env, encoding: 'utf8' });
+    assert.equal(requests[1].params.cacheLifetime, '1h');
   } finally {
     await channel.dispose();
     rmSync(home, { recursive: true, force: true });

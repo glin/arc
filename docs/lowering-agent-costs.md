@@ -54,12 +54,15 @@ Reusing cached context costs 1/10 the normal input price or less. Once the cache
 
 ### Default cache TTLs
 
-| Agent and billing                                          | Cache lifetime                                    |
-| ---------------------------------------------------------- | ------------------------------------------------- |
-| Claude Code main session on a subscription/enterprise plan | 1h                                                |
-| OpenAI models in Codex                                     | At least 30m usually, often over 1h. No fixed TTL |
-| Claude Code on usage credits, API key, or cloud provider   | 5m                                                |
-| Claude Code subagents                                      | 5m                                                |
+| Agent and billing | Cache lifetime |
+| --- | --- |
+| Claude Code main session on a subscription/enterprise plan | 1h |
+| OpenAI models in Codex | At least 30m usually, often over 1h. No fixed TTL |
+| Claude Code on usage credits, API key, or cloud provider | 5m |
+| Claude Code subagents | 5m |
+| Claude coordinator that waits on workers, started by Arc | 1h with `--cache-lifetime 1h` on `arc run` or `arc start` |
+
+A subagent cannot get the 1 hour lifetime from its caller. Without `--cache-lifetime`, a reader-owned session that Arc starts keeps `CLAUDE_CODE_PROMPT_CACHE_TTL` from its environment, which can name 5 minutes. When the environment does not set it, the session gets the lifetime of its billing row above. Use `--cache-lifetime 1h` when the session needs 1 hour.
 
 Claude Code's [prompt-caching guide](https://code.claude.com/docs/en/prompt-caching#which-ttl-each-request-gets) lists which requests get which lifetime and how to change it.
 

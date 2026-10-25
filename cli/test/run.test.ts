@@ -1895,6 +1895,32 @@ test('standalone delegated Claude cache defaults preserve caller overrides and r
   }
 });
 
+test('standalone cache lifetime sets 5m or 1h for any Claude ownership and refuses other values and Codex', () => {
+  const { args } = fixture();
+  const input = withProvider(args, 'claude');
+  const inherited = { CLAUDE_BIN: 'owned-claude', claude_code_prompt_cache_ttl: '10m' };
+  for (const lifetime of ['5m', '1h'])
+    for (const ownership of [[], ['--agent-run'], ['--agent-run=false']]) {
+      const parsed = parseRun([...input, ...ownership, '--cache-lifetime', lifetime], inherited);
+      assert.equal(parsed.env.CLAUDE_CODE_PROMPT_CACHE_TTL, lifetime);
+      assert.equal(parsed.env.claude_code_prompt_cache_ttl, undefined);
+      assert.equal(parsed.options.env!.CLAUDE_CODE_PROMPT_CACHE_TTL, lifetime);
+    }
+  for (const value of ['30m', '1H', ''])
+    assert.throws(
+      () => parseRun([...input, '--cache-lifetime', value], inherited),
+      /^Error: Choose --cache-lifetime 5m or 1h\.$/,
+    );
+  assert.throws(
+    () => parseRun([...input, '--cache-lifetime', '1h', '--cache-lifetime', '5m'], inherited),
+    /Repeated argument: --cache-lifetime/,
+  );
+  assert.throws(
+    () => parseRun([...withProvider(args, 'codex'), '--cache-lifetime', '1h'], inherited),
+    /--cache-lifetime applies only to Claude launches\./,
+  );
+});
+
 test('unsupported completion, widened policy, worktree flags and malformed UTF-8 refuse admission', () => {
   const { args, prompt } = fixture();
   for (const tail of [

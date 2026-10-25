@@ -16,6 +16,32 @@ const codexModelShorthands: Readonly<Record<string, string>> = {
   astra: 'gpt-6-astra',
 };
 
+// Claude Code reads its prompt cache lifetime from this variable. A Claude launch can request one of these values.
+export const CACHE_TTL_ENV = 'CLAUDE_CODE_PROMPT_CACHE_TTL';
+export const CACHE_LIFETIMES = ['5m', '1h'] as const;
+export type RequestedCacheLifetime = (typeof CACHE_LIFETIMES)[number];
+
+export function isCacheLifetime(value: unknown): value is RequestedCacheLifetime {
+  return (CACHE_LIFETIMES as readonly unknown[]).includes(value);
+}
+
+// Returns the refusal for a requested cache lifetime, or null when the launch accepts it.
+export function cacheLifetimeRefusal(value: string, agent: string): string | null {
+  if (!isCacheLifetime(value)) return 'Choose --cache-lifetime 5m or 1h.';
+  return agent === 'claude' ? null : '--cache-lifetime applies only to Claude launches.';
+}
+
+// Returns the cache lifetime a Claude launch sets, or null to keep the inherited environment and provider default.
+// A requested lifetime replaces an inherited value. Without one, delegated work gets 5m unless the environment names a lifetime.
+export function claudeCacheLifetime(
+  inherited: Record<string, string | undefined>,
+  requested: RequestedCacheLifetime | undefined,
+  agentRun: boolean,
+): RequestedCacheLifetime | null {
+  if (requested) return requested;
+  return agentRun && !Object.keys(inherited).some((key) => key.toUpperCase() === CACHE_TTL_ENV) ? '5m' : null;
+}
+
 export function standaloneModel(agent: 'claude' | 'codex', model: string, env: NodeJS.ProcessEnv): string {
   if (agent === 'claude') return model === 'haiku' ? 'claude-haiku-5-5' : model;
   const resolved = Object.hasOwn(codexModelShorthands, model) ? codexModelShorthands[model] : model;

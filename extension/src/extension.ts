@@ -2326,6 +2326,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             cwd: draft.cwd,
             policy: draft.policy,
             agentRun: draft.agentRun,
+            cacheLifetime: draft.cacheLifetime,
             sessionId: sessionId!,
             ...(mode ? { permissionMode: claudeAskMode(mode) } : {}),
             model: draft.profile.model,
@@ -2360,6 +2361,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             policy: draft.policy ?? policies.read(sessionId),
             ...(mode ? { permissionMode: claudeAskMode(mode) } : {}),
             agentRun: draft.agentRun ?? panel.isAgentRunLaunch?.(sessionId) ?? false,
+            cacheLifetime: draft.cacheLifetime,
             model: draft.profile.model,
             effort: draft.profile.effort,
           })

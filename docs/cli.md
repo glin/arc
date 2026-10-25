@@ -112,6 +112,8 @@ An accepted start with a session ID includes `link`, with or without `--json`. I
 - The name state is not `failed`, `uncertain`, or `cancelled`, and carries no error. A `pending` name still gets a link.
 - The session ID is a valid link target.
 
+Add `--cache-lifetime 1h` to give a Claude coordinator that waits on workers a 1 hour prompt cache. `--cache-lifetime 5m` selects 5 minutes. [Session writes](cli-reference.md#session-writes) defines the default and refusals.
+
 Read [hosted read-only launches](agent-protocols.md#hosted-read-only-launches) before using `--read-only`. Codex denies filesystem writes. Claude restricts tools and git commands but can approve shell writes.
 
 Apply labels, pins, or archive changes with `--dry-run` first:
@@ -175,7 +177,7 @@ Reports remain readable after host shutdown and when full cost is unknown. [Disp
 
 ## Standalone launches
 
-`arc run` starts one explicitly selected provider without a window. Run `arc run --help` for required settings and output options. Claude read-only launches use print mode. Writable Claude uses background mode. Codex uses `exec` or an attended interactive session. Existing directories, repeated extra directories, executable overrides, and literal argument boundaries remain part of each receipt. Arc creates no branch or worktree.
+`arc run` starts one explicitly selected provider without a window. Run `arc run --help` for required settings and output options. Claude read-only launches use print mode. Writable Claude uses background mode. Codex uses `exec` or an attended interactive session. Existing directories, repeated extra directories, executable overrides, and literal argument boundaries remain part of each receipt. Arc creates no branch or worktree. `--cache-lifetime` works as it does for [starts](#session-management).
 
 `--log PATH` exposes live print output or writable Claude native logs. Print launches retain separate private stdout and stderr files. The log preserves byte order within each channel. Relative stdout/stderr ordering is unspecified. Resumed observation continues captured bytes without restarting the worker or taking over a reused log alias. Writable Claude logs use its accepted background ID and retain native bytes separately from launch output. Codex uses the log file stem followed by `.last.md` beside the log for its frozen final response. `--report-file` or `--output` selects another report alias. Reused aliases never supply receipt report bytes.
 

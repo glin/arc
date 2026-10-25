@@ -11,6 +11,10 @@ import {
   claudeReadOnlyArgs,
   claudeReadOnlyMcp,
   standaloneModel,
+  cacheLifetimeRefusal,
+  claudeCacheLifetime,
+  CACHE_TTL_ENV,
+  type RequestedCacheLifetime,
 } from '../../extension/src/launchpolicy.ts';
 import { claudeLaunch, codexLaunch, type Machine } from '../../extension/src/composerview.ts';
 import { DispatchReceipts, type StandaloneOptions } from '../../extension/src/dispatchreceipts.ts';
@@ -45,6 +49,7 @@ export function parseRun(args: string[], env = process.env, platform = process.p
     '--output',
     '--log',
     '--notify-thread',
+    '--cache-lifetime',
   ];
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
@@ -74,6 +79,9 @@ export function parseRun(args: string[], env = process.env, platform = process.p
   };
   const provider = required('--provider');
   if (provider !== 'claude' && provider !== 'codex') throw new Error('Choose --provider claude or codex.');
+  const cacheLifetime = values.get('--cache-lifetime') as RequestedCacheLifetime | undefined;
+  const lifetimeRefusal = cacheLifetime === undefined ? null : cacheLifetimeRefusal(cacheLifetime, provider);
+  if (lifetimeRefusal) throw new Error(lifetimeRefusal);
   const cwd = path.resolve(required('--cwd'));
   const context = standaloneContext(env, cwd);
   const selectedEnv = { ...env };
@@ -229,12 +237,11 @@ export function parseRun(args: string[], env = process.env, platform = process.p
   }
   for (const key of Object.keys(launchEnv))
     if (['ARC_WINDOW', 'ARC_EDITOR_EXECUTABLE'].includes(key.toUpperCase())) delete launchEnv[key];
-  if (
-    provider === 'claude' &&
-    options.agentRun &&
-    !Object.keys(launchEnv).some((key) => key.toUpperCase() === 'CLAUDE_CODE_PROMPT_CACHE_TTL')
-  )
-    launchEnv.CLAUDE_CODE_PROMPT_CACHE_TTL = '5m';
+  const lifetime = provider === 'claude' ? claudeCacheLifetime(launchEnv, cacheLifetime, options.agentRun) : null;
+  if (lifetime) {
+    for (const key of Object.keys(launchEnv)) if (key.toUpperCase() === CACHE_TTL_ENV) delete launchEnv[key];
+    launchEnv[CACHE_TTL_ENV] = lifetime;
+  }
   options.env = standaloneContext(launchEnv, cwd);
   return {
     options,

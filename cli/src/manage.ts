@@ -1,7 +1,7 @@
 import { runBackgroundManagement } from './standalone.ts';
 import { resolve } from 'node:path';
 import { validContinuation, validContinuationPath, CONTINUATION_LIMITS } from '../../extension/src/compactrequest.ts';
-import { launchPolicy } from '../../extension/src/launchpolicy.ts';
+import { cacheLifetimeRefusal, launchPolicy, type RequestedCacheLifetime } from '../../extension/src/launchpolicy.ts';
 import type { SetupListing } from '../../extension/src/view/launcher.ts';
 import * as fs from 'node:fs';
 import { requestWindow, requesterIdentity } from '../../extension/src/sessionrequests.ts';
@@ -131,6 +131,7 @@ export async function runManagement(command: string, args: string[]): Promise<st
     '--observation',
     '--completion',
     '--report-file',
+    '--cache-lifetime',
   ]);
   const switches = new Set([
     '--read-only',
@@ -192,6 +193,7 @@ export async function runManagement(command: string, args: string[]): Promise<st
                 '--arc-dispatch',
                 '--completion',
                 '--report-file',
+                '--cache-lifetime',
               ]
             : [
                 '--window',
@@ -281,6 +283,11 @@ export async function runManagement(command: string, args: string[]): Promise<st
       throw new Error('A setup key cannot combine with explicit setup values.');
     if (!key && !['claude', 'codex'].includes(options.get('--provider') ?? ''))
       throw new Error('Choose --provider claude or codex, or --setup KEY.');
+    const cacheLifetime = options.get('--cache-lifetime');
+    // A setup key names its provider only in the window, so the window refuses a Codex setup.
+    const lifetimeRefusal =
+      cacheLifetime === undefined ? null : cacheLifetimeRefusal(cacheLifetime, options.get('--provider') ?? 'claude');
+    if (lifetimeRefusal) throw new Error(lifetimeRefusal);
     launchPolicy(
       options.get('--provider') ?? 'claude',
       flags.has('--read-only'),
@@ -311,6 +318,7 @@ export async function runManagement(command: string, args: string[]): Promise<st
           },
       prompt,
       agentRun,
+      ...(cacheLifetime ? { cacheLifetime: cacheLifetime as RequestedCacheLifetime } : {}),
       ...(guarded
         ? {
             dispatch: true,

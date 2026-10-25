@@ -6,8 +6,8 @@
   },
   "cli/test/run.test.ts": {
     "reason": "Standalone workers must retain real output, exit, cancellation, receipt ownership, and recovery across process boundaries.",
-    "cases": 106,
-    "matricesSha256": "b743fa5df5d0ea8931962666a20ef7cb62724b10184d48701c964c2e58fc4279"
+    "cases": 107,
+    "matricesSha256": "a3aedfabeb17157a8ef0414df70d7f7512a2c41fc687cf6f1d742a94acb70340"
   },
   "cli/test/smoke.bundled-a.test.mjs": {
     "reason": "Compiled CLI commands must reach session reads, comments, and saved defaults through an authenticated window channel.",
@@ -36,8 +36,8 @@
   },
   "extension/src/agenthost.test.ts": {
     "reason": "A spawned agent must receive the activation window, editor executable, and command search path. Self-compaction crosses native background settlement, response retention for provider turns, and workspace scope recovery. Initial naming must recheck ownership after host waits and serialize after reader renames.",
-    "cases": 309,
-    "matricesSha256": "3bc9dad06b3cdee0911b04176aaa669d8c380a8ca67c85833fd97f5c5af72c80"
+    "cases": 310,
+    "matricesSha256": "bc3f74038da9ef55b926853bb8fb2f78e9932990d98a7c9b928d63fb910a4757"
   },
   "extension/src/chrome.browser.test.ts": {
     "reason": "Panel controls must preserve native focus, keyboard handling, and browser event delivery.",
@@ -126,8 +126,8 @@
   },
   "extension/src/panel.webview.test.ts": {
     "reason": "Real progressive workers must deliver bounded recovery and metadata through the production panel host. Start metadata must survive storage delays, hidden panels, preference resets, and reloads.",
-    "cases": 619,
-    "matricesSha256": "f9932de645a7de270227d09875c1b8c4464fea2b3fff25f6c2c78976af3ccc8b"
+    "cases": 620,
+    "matricesSha256": "547698f5d4a797432ae31f61aa4ee5f6f2f382c5d4fe53f14a0d1180ec2ccf8a"
   },
   "extension/src/panelbundle.test.ts": {
     "reason": "The panel bundle and fixture must contain the production entry, source identity, and substituted text.",
@@ -177,7 +177,7 @@
   "extension/src/sessionrequests.test.ts": {
     "reason": "Native window channels must preserve authentication, activation identity, recovery, and write admission without replaying accepted writes.",
     "cases": 45,
-    "matricesSha256": "107c8670380756c889cdc0d9106644b9122e99bf7e7533f559526b9d1011dc9d"
+    "matricesSha256": "4d2ce89c34ac18ef9c052a93ef7bf4320ae6283148b1b6e7c3ef43f7d62b5a57"
   },
   "extension/src/sessionwrites.test.ts": {
     "reason": "Authenticated window channels must preserve accepted reads, ordered writes, and ownership across native IPC.",

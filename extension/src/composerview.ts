@@ -1444,11 +1444,13 @@ export function handoffRefusalMessage(refusal: HandoffRefusal, sending: boolean)
   return messages[refusal];
 }
 
-import type { LaunchPolicy } from './launchpolicy';
+import type { LaunchPolicy, RequestedCacheLifetime } from './launchpolicy';
 
 export interface NewSessionDraft {
   policy?: LaunchPolicy;
   agentRun?: boolean;
+  // A lifetime requested by a window start. Claude launches of this draft set it.
+  cacheLifetime?: RequestedCacheLifetime;
   draftId: string;
   cwd: string;
   sourceSession: string | null;

@@ -2,6 +2,7 @@ import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypt
 import type { LauncherRequest } from './view/launcher';
 import type { SessionListingRow } from './sessionreads';
 import type { GuardedAttempt, GuardedReceipt } from './agentwire';
+import { isCacheLifetime, type RequestedCacheLifetime } from './launchpolicy';
 import {
   currentAgentRead,
   normalizeAgentRead,
@@ -22,6 +23,7 @@ export interface SessionWriteParams {
   labels?: string[];
   pinned?: boolean;
   agentRun?: boolean;
+  cacheLifetime?: RequestedCacheLifetime;
   cwd?: string;
   readOnly?: boolean;
   readTools?: string[];
@@ -83,6 +85,7 @@ export function validSessionWrite(method: string, params: Record<string, unknown
       'labels',
       'pinned',
       'agentRun',
+      'cacheLifetime',
       'cwd',
       'readOnly',
       'readTools',
@@ -94,6 +97,7 @@ export function validSessionWrite(method: string, params: Record<string, unknown
       Object.keys(params).every((key) => fields.includes(key)) &&
       text(params.prompt, 48 * 1024) &&
       typeof params.agentRun === 'boolean' &&
+      (params.cacheLifetime === undefined || isCacheLifetime(params.cacheLifetime)) &&
       (params.dispatch === undefined || params.dispatch === true) &&
       (params.completion === undefined ||
         (params.dispatch === true && ['manual', 'wait'].includes(params.completion as string))) &&

@@ -153,6 +153,17 @@ test('request schema rejects unsupported versions, methods, identifiers, and par
     const paged = { ...valid, method: 'sessions', params };
     assert.deepEqual(parseSessionRequest(paged), paged);
   }
+  const start = {
+    setup: { kind: 'custom', agent: 'claude', model: '', effort: '', permissionMode: '' },
+    prompt: 'coordinate',
+    agentRun: true,
+  };
+  for (const params of [start, { ...start, cacheLifetime: '5m' }, { ...start, cacheLifetime: '1h' }]) {
+    const accepted = { ...valid, method: 'start', params };
+    assert.deepEqual(parseSessionRequest(accepted), accepted);
+  }
+  for (const cacheLifetime of ['2h', '1H', '', null, 3600, ['1h']])
+    assert.equal(parseSessionRequest({ ...valid, method: 'start', params: { ...start, cacheLifetime } }), null);
 });
 
 test(

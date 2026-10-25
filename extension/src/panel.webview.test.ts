@@ -4447,6 +4447,45 @@ test('window dispatch starts reserve a launch receipt before worker delivery and
   assert.deepEqual(order, ['reserved', 'delivery']);
 });
 
+test('window starts carry a requested cache lifetime onto Claude drafts and refuse Codex setups before delivery', async () => {
+  for (const agent of ['claude', 'codex'] as const)
+    for (const kind of ['custom', 'row'] as const) {
+      const provider: any = liveProviderFixture(livePress({ sessionId: 'reader', agent })).provider;
+      const profile: SessionProfile = { agent, model: '', effort: '', permissionMode: '', source: 'recent' };
+      const view = sessionLauncherView(null, [profile], {});
+      const setup = kind === 'row' ? { kind, key: view.primary!.key } : { kind, ...profile };
+      const drafts: NewSessionDraft[] = [];
+      Object.assign(provider, {
+        setupProject: 'project',
+        pendingModels: [],
+        folders: () => ['C:/workspace'],
+        repositoryScope: { snapshot: () => ({ ready: true, roots: ['C:/workspace'] }) },
+        launcherFor: () => ({ view }),
+        onSendDraftPrompt: async (draft: NewSessionDraft) => {
+          drafts.push(draft);
+          return { delivered: false, reason: 'delivery stopped by fixture' };
+        },
+      });
+      const start = (params: Record<string, unknown>) =>
+        provider.handleSessionRequest({
+          method: 'start',
+          requester: null,
+          params: { prompt: 'review', setup, agentRun: true, ...params },
+        });
+      if (agent === 'codex') {
+        await assert.rejects(start({ cacheLifetime: '1h' }), /--cache-lifetime applies only to Claude launches/);
+        assert.equal(drafts.length, 0);
+        continue;
+      }
+      for (const cacheLifetime of ['5m', '1h']) assert.equal((await start({ cacheLifetime })).status, 'refused');
+      await start({});
+      assert.deepEqual(
+        drafts.map((draft) => draft.cacheLifetime),
+        ['5m', '1h', undefined],
+      );
+    }
+});
+
 test('window read-only starts refuse named setup read tools and permission overrides before delivery', async () => {
   for (const [agent, permissionMode, readTools, refusal] of [
     ['codex', '', ['mcp__notes__read'], /requires Claude/],
