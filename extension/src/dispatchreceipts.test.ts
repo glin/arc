@@ -656,9 +656,11 @@ test('receipt scans revisit delayed bindings, new store tails and changed scope'
   assert.equal(drainRelationships(fx.receipts.relationships(fx.catalog))[0].owned, false);
   const binding = path.join(fx.receipts.root, fx.launch.launchId, 'accepted.json');
   const original = fs.readFileSync(binding);
-  fs.unlinkSync(binding);
+  fs.renameSync(binding, binding + '.old');
   assert.deepEqual(drainRelationships(fx.receipts.relationships(fx.catalog)), []);
   fs.writeFileSync(binding, original);
+  assert.notEqual(fs.statSync(binding, { bigint: true }).ino, fs.statSync(binding + '.old', { bigint: true }).ino);
+  assert.deepEqual(drainRelationships(fx.receipts.relationships(fx.catalog)), []);
   // Replacement cannot recover an accepted witness. A fresh launch remains discoverable.
   const tail = fx.receipts.reserve({ ...fx.launch });
   const { launchId: _launchId, ...startup } = JSON.parse(
