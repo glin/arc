@@ -165,7 +165,7 @@ Paths are relative to `extension/src/`. [Architecture](architecture.md) owns pac
 | `view/static-themes.ts` | Dark Modern, Light Modern and One Dark Pro Darker colors shared by static pages and browser fixtures | no |
 | `webview/context-detail.ts` | Semantic context categories, decorative chart, optional Messages disclosure, mismatch table, measurement disclosure, and Compact action. `webview/stat-detail.ts` retains disclosure state through refreshes and places the popover after disclosure toggles | no |
 | `claudewire.ts` | Claude stream-json and control-channel adapter, including the per-child Remote Control state | no |
-| `compactrequest.ts` | Digest-bound self-compaction commands, native operation bindings, separate continuation observations, durable admission ports, exact-child guarded delivery, and native completion evidence | no |
+| `compactrequest.ts` | Digest-bound self-compaction request and cancel commands, native operation bindings, separate continuation observations, durable admission ports, exact-child guarded delivery, and native completion evidence | no |
 | `compactstore.ts` | Workspace continuation receipts, exclusive immutable recovery leases, bounded storage, pure status reads, and ended-owner evidence | no |
 | `codexwire.ts` | Codex app-server JSON-RPC adapter, ordered cancellable prompt preparation, and child-local skill discovery authority for native prompt attachments | no |
 | `codexreply.ts` | Codex async-question ids and the reply envelope that answers them | no |
