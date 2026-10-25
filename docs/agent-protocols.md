@@ -173,7 +173,7 @@ The panel publishes its restored archive set when the host connects. It also pub
 
 Prompt and control operations hold an activity lease. The lease cancels timed retirement before work starts. Its release starts a new full idle window when the child remains eligible. Retirement removes only the child. The saved session id and accepted session settings let the next prompt resume the session from disk with the same configuration.
 
-A targeted retirement closes one provisional draft child after any opening or control activity settles. Abandoning a draft retires its retained MCP child. Closing the last panel retires all retained MCP children. Draft profile changes follow the acceptance rule in [Architecture](architecture.md#module-boundaries). Extension disposal closes every remaining child.
+A targeted retirement closes one provisional draft child after any opening or control activity settles. Abandoning a draft retires its retained MCP child. Closing the last panel retires all retained MCP children. Draft profile changes follow the acceptance rule in [Delivery and recovery contracts](composer.md#delivery-and-recovery-contracts). Extension disposal closes every remaining child.
 
 Agent-wide permission and MCP changes lease every live target before they await the first control response. An MCP lease lasts through the final status read. A replacement builds its launch settings after the previous child finishes shutting down. Persisted settings publication preserves provisional draft entries held only by the panel. A Codex fork stores its accepted launch profile under the returned session identity.
 

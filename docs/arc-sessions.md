@@ -144,7 +144,7 @@ An agent reports a known session with a named Markdown link:
 
 `arc start` returns this link as `link` in an accepted result. [Start output](cli-reference.md#session-writes) defines when its value is `null`. Links open only inside the live extension panel that contains the invoking session. The [skill's reporting rules](../cli/skills/arc-sessions/links.md) define identity sources, label escaping, destination encoding, scope, and plain-text fallbacks.
 
-The response link complements the Dispatched link. Its receipt, attribution, and delegated cost accounting remain part of that relationship. [Architecture](architecture.md#module-boundaries) owns response-link resolution and navigation.
+The response link complements the Dispatched link. Its receipt, attribution, and delegated cost accounting remain part of that relationship. [Response links](rail-and-navigation.md#response-link-and-citation-contracts) own resolution and navigation.
 
 ## Manual check
 
