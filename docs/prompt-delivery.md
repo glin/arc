@@ -1,66 +1,58 @@
 # Prompt delivery and recovery
 
-Read this guide for Send, Stop, queued submissions, reset, or live-card recovery. [`panelhost.ts`](../extension/src/panelhost.ts) owns admission and persistence. [`composerview.ts`](../extension/src/composerview.ts) projects delivery state. [Agent protocols](agent-protocols.md) owns native wire contracts.
+[`panelhost.ts`](../extension/src/panelhost.ts) owns admission and persistence. [`composerview.ts`](../extension/src/composerview.ts) projects delivery state. [Agent protocols](agent-protocols.md) owns native wire contracts.
 
 ## Sending, queueing, and stopping
 
-Enter sends and Shift+Enter inserts a line break. Command+Enter on macOS, or Ctrl+Enter on Windows and Linux, sends from anywhere in the panel. Other editable controls and open comment editors retain their keys. Enter in a comment editor saves its comment. Blank text sends only with unsent comments or attachments.
+[`webview/composer.ts`](../extension/src/webview/composer.ts) handles Send and Stop keys. The panel-wide send chord uses Command+Enter on macOS and Ctrl+Enter on Windows and Linux. Other editable controls and open comment editors retain their keys. Every Stop targets the message's session.
 
-Idle delivery starts or reuses the child. Busy delivery bypasses local queueing only when the queue is empty. A Claude answer to an open request instead joins the running turn before queued work.
+Busy delivery bypasses local queueing only when the queue is empty, preserving order. A Claude answer to an open request instead joins the running turn before queued work.
 
-Each local waiting entry owns its identity, text, comment claims, files, creation time, and delivery state. Its Edit action swaps the complete entry with the complete active draft. Text, comments, and files remain separate on each side. Reset-recovery edits leave a hidden durable barrier until the edited draft is accepted.
+A waiting entry owns its text, comment claims, files, and delivery state. Edit swaps the complete entry with the complete active draft. The host reserves the entry before the browser replaces text. A newer browser edit rejects delayed success and releases the reservation. Returned comment claims stay persisted until the edited prompt is queued or accepted.
 
-The host reserves an entry before the browser replaces text. A newer browser edit rejects delayed success and releases the reservation. Returned comment claims stay persisted until the edited prompt is queued or accepted.
-
-The main button sends ready content and stops active work when the prompt text field is empty. Escape stops the selected active session after transient menus, dialogs, hints, and popovers close. Other editable fields retain Escape. Every Stop targets the message’s session.
-
-Prompt assembly places typed text before comments. Codex retains surrounding whitespace through queueing and delivery. Claude receives trimmed text. Settings travel through controls, never inside prompt text. Rejection retains comments and the failed pending card.
+Prompt assembly places typed text before comments. Codex retains surrounding whitespace through queueing and delivery. Claude receives trimmed text. Settings travel through controls, never inside prompt text.
 
 ## Compaction and reset
 
-Native compaction bypasses prompt assembly, comments, and ordinary prompt callbacks. Context detail’s Compact leaves the draft unchanged. Exact `/compact` invokes compaction immediately when idle and clears the submitted characters. Busy sessions queue either request. A queued `/compact` with comment claims or files uses ordinary prompt delivery to retain that payload. Without either, it invokes compaction. Codex rejects `turn/start` during native compaction, so new prompts wait locally too.
+Native compaction bypasses prompt assembly, comments, and ordinary prompt callbacks. Context detail's Compact leaves the draft unchanged. A queued `/compact` with comment claims or files uses ordinary prompt delivery to retain that payload. Codex rejects `turn/start` during native compaction, so new prompts wait locally too.
 
-Clear starts no turn. A successful reset draws no temporary card. Codex `/new` uses the same hidden transition and passes its optional name to the successor. Before resetting, the queue owns the command’s files and comment claims, including a queued exact `/clear` payload. Unclaimed source comments are captured immediately before the control request. These commands never become model input.
+Clear starts no turn and draws no temporary card on success. Codex `/new` uses the same transition and passes its optional name to the successor. Before resetting, the queue owns the command's files and comment claims. Unclaimed source comments are captured immediately before the control request. These commands never become model input.
 
 The transition needs acceptance and a successor identity. Claude reports acceptance first. Codex reports the successor first. Success moves the payload and dependent prompts before draining the successor queue. The source retains its transcript, comments, labels, and session list row.
 
-Failure or refusal draws a failure card. A queued Codex `/new`, or a queued reset that carries comments or files, keeps its payload as source recovery and blocks dependent prompts until Edit or Drop resolves it. Any other failed reset releases the source queue. Reload converts an in-flight reset to unknown and starts no work. A recorded successor retains ownership through refusal, failure, Edit, Drop, and reload. Stale panel submissions follow that successor until the panel paints it. Afterward the source is independently selectable.
+A queued Codex `/new` failure keeps its payload as source recovery. A failed queued reset carrying comments or files does likewise. Both block dependent prompts until Edit or Drop resolves recovery. Other failed resets release the source queue.
 
-Codex-compaction queueing requires durable capacity for the whole submission, including attachment-only prompts, without truncation or eviction. Waiting entries retain staged files through repaint, selection changes, and reload. Reload restores the queue before draining it.
+Reload converts an in-flight reset to unknown and starts no work. A recorded successor retains ownership through refusal, failure, Edit, Drop, and reload. Stale panel submissions follow that successor until the panel paints it. Afterward the source is independently selectable.
 
-Persist an attempt before crossing the agent boundary. Reload converts active attempts to recovery and never resubmits them automatically. Edit explicitly retries. Refusal retains the entry, owner, files, and reason. Drop removes staged data only after drafts, queue entries, and handoffs release every reference. Accepted turns release their own files at completion.
+Codex-compaction queueing requires durable capacity for the whole submission, including attachment-only prompts, without truncation or eviction. Reload restores the queue before draining it.
+
+Persist an attempt before crossing the agent boundary. Reload converts active attempts to recovery and never resubmits them automatically because the agent can already have received them. Edit explicitly retries. Reset-recovery edits retain a hidden durable barrier until the edited draft is accepted. [Attachments](prompt-attachments.md#storage-and-acceptance) owns staged-file lifetime.
 
 ## Agent messages
 
-Deferred agent messages share the queue and preserve exact text. They carry no comments or files and change neither drafts nor prompt history. Edit returns their text to the reader draft. Drop removes them. Stop retains waiting entries. Reset and reload retain agent messages in recovery on the original session.
+Deferred agent messages share the queue but carry no comments or files and change neither drafts nor prompt history. Reset and reload retain them in recovery on the original session.
 
 ## Pending cards
 
-Temporary cards show submission state before recorded turns arrive. They carry the assembled prompt, or an attachment summary for attachment-only submissions, and session.
+[`webview/queue-live.ts`](../extension/src/webview/queue-live.ts) renders waiting and live cards. [`composerview.ts`](../extension/src/composerview.ts)'s `livePressOver` owns removal.
 
-New submissions start collapsed. Streaming responses remain readable through stale, aborted, and superseded reads. Prompt cards leave only when an accepted selected window contains their recorded turn or the CLI answers `/model` or `/context` without a turn. Without either event, they remain visible.
+Prompt cards leave only when an accepted selected window contains their recorded turn or the CLI answers a command without a turn. Stale, aborted, and superseded reads must retain streamed responses. Unknown-delivery explanations must not suggest retrying because receipt remains uncertain.
 
-Failed prompts remain until dismissed or restored. Local entries use waiting cards until agent acceptance replaces them with protocol live cards. Unknown-delivery recovery states must not suggest retrying because the agent can already have received the prompt. Accessible names retain the complete explanation.
+Manual compaction is running work. Only prompts accepted behind it say they are waiting for earlier work. Failed compaction retains its cause until Dismiss. Unfailed compaction cards expire after five minutes only while idle. Running controls retain their cards past that limit.
 
-Manual compaction is running work. Only prompts accepted behind it say they are waiting for earlier work.
+Accepting Codex writer-lock recovery moves the continuation prompt to the server's forked session. Declining retains the source failure.
 
-Failed compaction retains its outcome and cause until Dismiss. The editor notice repeats the cause. Refused prompts additionally offer Restore.
-
-Accepting Codex writer-lock recovery moves the continuation prompt to the server’s forked session. Declining retains the source failure.
-
-Later prompts draw independently while earlier recorded turns are absent. Direct agent activity remains on the newest recorded turn during parsing. Continuation handoffs move the submission to the new session. Queued handoff failures return it to its waiting card.
-
-An unfailed compaction card leaves at its recorded boundary, after started work stops, or after a CLI answer without a record. The five-minute expiry applies only while idle. Running controls retain their cards past that limit.
+Continuation handoffs move submissions to the new session. Queued handoff failures return them to waiting cards.
 
 ## Local controls
 
-Exact `/compact` and `/clear` ignore case and surrounding whitespace. Codex `/new` also accepts an optional same-line name. Arguments after `/clear`, mentions inside sentences, and `/safe-compact` remain ordinary input. Codex controls use native app-server requests, never literal slash-command `turn/start` input. The exception is a queued `/compact` that carries comment claims or files.
+[`composerview.ts`](../extension/src/composerview.ts) classifies `/compact`, `/clear`, and Codex `/new`. Exact controls ignore case and surrounding whitespace. Only `/new` accepts a same-line name. Mentions inside sentences and `/safe-compact` remain ordinary input. Codex controls use native app-server requests, except queued `/compact` submissions carrying comments or files.
 
-Codex `/rename` uses the rest of its line as the name. It starts no turn, answers no request, and bypasses running work and staging. Files and comments stay in the prompt box. Failure or an empty name reports an editor error and restores the line only if no newer text edit occurred. Claude sends `/rename` to its CLI. Commands that Claude answers without turns draw no timeline card or prompt-box reply.
+[`domain/composer-editing.ts`](../extension/src/domain/composer-editing.ts) shares Codex `/rename` and Claude `/remote-control` or `/rc` recognition between browser and host. They bypass running work and staging without answering requests or carrying files and comments. Claude sends `/rename` to its CLI.
 
-Claude `/remote-control` and `/rc` toggle Remote Control, ignoring case and surrounding whitespace. They bypass running work, queueing, and staging without answering requests or carrying files and comments. Notifications report outcomes. When Remote Control turns on, the notification shows the session link as a link that opens in a browser when pressed. Arc links only an `https:` URL with no whitespace, brackets, parentheses, or angle brackets. It shows any other value as plain text with its square brackets percent-encoded, so the notification draws no link from it, and draws the Remote Control item without a link. [Remote Control](agent-protocols.md#claude-remote-control) owns eligibility refusals.
+Remote Control refuses trailing text, including newlines. Fresh refusal restores the line. Queued refusal retains the entry and blocks later entries until Edit or Drop. Queued toggles return comments and files to the prompt box. Files that do not fit leave the entry queued and block later entries.
 
-Queued or restored toggles run when reached and return comments and files to the prompt box. Files that do not fit leave the entry queued and block later entries until Edit or Drop. Text after either command, including newlines, is refused. Fresh refusal restores the line. Queued refusal retains the entry and blocks later entries until Edit or Drop.
+[`composerview.ts`](../extension/src/composerview.ts)'s `remoteControlLink` admits only HTTPS links without whitespace or Markdown link delimiters. Notifications percent-encode square brackets in rejected URLs because VS Code ignores Markdown escapes. [Remote Control](agent-protocols.md#claude-remote-control) owns eligibility refusals.
 
 ## Delivery and recovery contracts
 
