@@ -5814,27 +5814,35 @@ test.each(['source arrives', 'receipt removed'] as const)(
   },
 );
 
-test.each(['missing drive', 'redirected ancestor', 'unavailable cwd'] as const)(
+test.each(['missing root', 'redirected ancestor', 'unavailable cwd'] as const)(
   'preparation retains unavailable evidence for %s and launches one ordinary worker',
   async (mode) => {
     const { home, args } = fixture();
-    const root = mode === 'missing drive' ? 'Z:\\ArcUnavailable' : path.join(home, 'native');
-    if (mode !== 'missing drive') fs.mkdirSync(root);
+    const missingRoot = process.platform === 'win32' ? 'Z:\\ArcUnavailable' : '/ArcUnavailable';
+    const root = mode === 'missing root' ? missingRoot : path.join(home, 'native');
+    if (mode !== 'missing root') fs.mkdirSync(root);
     const parsed = parseRun(args, { CODEX_BIN: process.execPath, ARC_CODEX_ROOT: root });
     const receipts = new DispatchReceipts(home);
     const { launchId: id } = admitParsed(receipts, parsed);
     let missingChecks = 0;
-    if (mode === 'missing drive') {
+    let failureReached = false;
+    if (mode === 'missing root') {
       const exists = fs.existsSync;
       vi.spyOn(fs, 'existsSync').mockImplementation((target) => {
-        if (String(target).toLowerCase().startsWith('z:')) return ++missingChecks > 3;
+        if (String(target) === root || String(target) === path.parse(root).root) {
+          failureReached = true;
+          return ++missingChecks > 3;
+        }
         return exists(target);
       });
     } else if (mode === 'redirected ancestor') {
       const lstat = fs.lstatSync;
       vi.spyOn(fs, 'lstatSync').mockImplementation((target, ...rest) => {
         const result = Reflect.apply(lstat, fs, [target, ...rest]);
-        if (String(target) === root) return Object.assign(Object.create(result!), { isSymbolicLink: () => true });
+        if (String(target) === root) {
+          failureReached = true;
+          return Object.assign(Object.create(result!), { isSymbolicLink: () => true });
+        }
         return result;
       });
     } else {
@@ -5842,6 +5850,7 @@ test.each(['missing drive', 'redirected ancestor', 'unavailable cwd'] as const)(
       let unavailable = true;
       vi.spyOn(fs.realpathSync, 'native').mockImplementation((target, ...rest) => {
         if (String(target) === home && unavailable) {
+          failureReached = true;
           unavailable = false;
           throw Object.assign(new Error('Working directory is unavailable.'), { code: 'ENOENT' });
         }
@@ -5868,11 +5877,12 @@ test.each(['missing drive', 'redirected ancestor', 'unavailable cwd'] as const)(
       id,
       false,
       { frameBytes: 1024, readBytes: 128, workBytes: 65536 },
-      { ...frozenRuntime(), platform: 'win32' },
+      frozenRuntime(),
     );
     assert.equal(receipts.sourceBaseline(id)?.state, 'unavailable');
-    if (mode === 'missing drive')
-      assert.equal(missingChecks, 2, 'The missing drive root must stop at its fixed point.');
+    assert.equal(failureReached, true, 'Preparation must reach the filesystem failure selected by this case.');
+    if (mode === 'missing root')
+      assert.equal(missingChecks, 2, 'The missing filesystem root must stop at its fixed point.');
     assert.equal(receipts.latest(id)?.availability, 'available');
     assert.equal(receipts.latest(id)?.outcome, 'succeeded');
     assert.equal(receipts.startup(id), null);
