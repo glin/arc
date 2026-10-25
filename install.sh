@@ -19,6 +19,11 @@ complete_source() {
   return 0
 }
 
+# A commit build needs a Git work tree. A working-tree build needs complete source files.
+source_candidate() {
+  if [ -n "$2" ]; then git -C "$1" rev-parse --show-prefix >/dev/null 2>&1; else complete_source "$1"; fi
+}
+
 current_editor_cli() {
   node <<'NODE'
 const fs = require('node:fs');
@@ -311,20 +316,22 @@ EOF
   for cli in "${CLIS[@]}"; do
     command -v "$cli" >/dev/null 2>&1 || { echo "error: editor CLI not found: $cli" >&2; exit 2; }
   done
+  if [ -n "$source_commit" ]; then
+    for candidate in git tar; do
+      command -v "$candidate" >/dev/null 2>&1 || { echo "error: $candidate is required for --commit." >&2; exit 2; }
+    done
+  fi
   if [ "$mode" != remote ]; then
     if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
       candidate="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-      if [ -n "$source_commit" ] || complete_source "$candidate"; then REPO="$candidate"; fi
+      if source_candidate "$candidate" "$source_commit"; then REPO="$candidate"; fi
     fi
-    if [ -z "$REPO" ] && { [ -n "$source_commit" ] || complete_source "$PWD"; }; then
+    if [ -z "$REPO" ] && source_candidate "$PWD" "$source_commit"; then
       REPO="$PWD"
     fi
   fi
   if [ -n "$source_commit" ]; then
     [ -n "$REPO" ] || { echo 'error: --commit requires an Arc Git checkout.' >&2; exit 2; }
-    for candidate in git tar; do
-      command -v "$candidate" >/dev/null 2>&1 || { echo "error: $candidate is required for --commit." >&2; exit 2; }
-    done
     candidate="$(git -C "$REPO" rev-parse --show-prefix)" || { echo 'error: --commit requires an Arc Git checkout.' >&2; exit 2; }
     [ -z "$candidate" ] || { echo 'error: --commit requires the Arc source at the Git checkout root.' >&2; exit 2; }
     sha="$(git -C "$REPO" rev-parse --verify --end-of-options "$source_commit^{commit}")" || {

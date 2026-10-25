@@ -1428,6 +1428,20 @@ test.concurrent.each([false, true])(
       assert.equal(fs.readFileSync(f.settings, 'utf8'), f.legacy);
       assert.deepEqual(fs.readdirSync(f.temporary), []);
       if (!stdin) {
+        // A saved installer outside Git builds from the checkout it runs in.
+        fs.copyFileSync(path.join(f.source, 'install.sh'), path.join(f.dir, 'saved-install.sh'));
+        const saved = await f.run(
+          ['--commit', 'saved-install', '--no-hooks', 'code'],
+          {},
+          {
+            ...options,
+            cwd: f.source,
+            scriptFile: fixtureBashPath(f.dir) + '/saved-install.sh',
+          },
+        );
+        assert.equal(saved.status, 0, saved.stdout + saved.stderr);
+        assert.ok(saved.commands.includes('source revision ' + selected));
+        assert.deepEqual(fs.readdirSync(f.temporary), []);
         const missing = await f.run(['--commit', 'missing-revision', '--no-hooks', 'code'], {}, options);
         assert.equal(missing.status, 2, missing.stderr);
         assert.match(missing.stderr, /commit not found/);
