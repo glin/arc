@@ -1,6 +1,6 @@
 # Settings
 
-Search for **Arc** in VS Code settings. These values change how Arc reads and presents sessions. [`development.md`](development.md) documents environment overrides and performance capture.
+Search for **Arc** in VS Code settings. [`development.md`](development.md) documents environment overrides and performance capture.
 
 | Setting | Default | Effect |
 | --- | --- | --- |
