@@ -152,9 +152,10 @@ A hosted main agent can request its own compaction after the current turn:
 ```sh
 arc compact request --self --after-turn --request-id WINDOW_ID:UUID --window WINDOW_ID --json
 arc compact status --request-id WINDOW_ID:UUID --window CURRENT_WINDOW_ID --json
+arc compact cancel --self --request-id WINDOW_ID:UUID --window WINDOW_ID --json
 ```
 
-Replace `UUID` with a lowercase UUID. After `uncertain` admission, observe the original ID. Never retry admission or switch transports. `completed` describes compaction alone. An optional saved continuation has a separate outcome. [Compaction contracts](cli-reference.md#compaction) define continuation files and status retention.
+Replace `UUID` with a lowercase UUID. After `uncertain` admission, observe the original ID. Never retry admission or switch transports. `completed` describes compaction alone. An optional saved continuation has a separate outcome. `compact cancel` drops the session's own request before Arc sends it. [Compaction contracts](cli-reference.md#compaction) define continuation files and status retention.
 
 ## Dispatch results
 

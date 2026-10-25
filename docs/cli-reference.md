@@ -194,11 +194,13 @@ Results include `status`, `requestId`, `payloadSha256`, `nativeTurnId`, and `rea
 
 ## Compaction
 
-The observed root command supplies compaction intent. Reader delegation, submission ancestry, and foreground execution are not admission requirements. Notification and continuation turns can request repeated compaction without renewing task or spending authority. New reader activity after observation cancels unsubmitted work and suppresses continuation.
+The observed root command supplies compaction intent. Reader delegation, submission ancestry, and foreground execution are not admission requirements. Notification and continuation turns can request repeated compaction without renewing task or spending authority. New reader activity after observation withdraws the call. After admission, a reader prompt carries unsubmitted work to the turn that answers it, and a queue change keeps it. Stop, setting picks, reader compaction, slash commands, and answers cancel unsubmitted work and suppress continuation. Reader text that Arc delivers while it holds a carried request ends with one line that names the request and `arc compact cancel`.
 
 Request IDs use `WINDOW:UUID` with a lowercase UUID. Request window values must match the same activation. Requests begin up to four readiness reads across two seconds, then attempt admission once. Each read waits at most five seconds. Missing compaction support returns `refused`.
 
-Results include `requestId` and `state`: `queued`, `started`, `completed`, `cancelled`, `refused`, `failed`, `uncertain`, or `unavailable`. Lost admission replies return `uncertain`. Observe the original ID without retrying or switching transports. `compact status` submits no work. Missing records and unanswered status requests return `unavailable`.
+Results include `requestId` and `state`: `queued`, `started`, `completed`, `cancelled`, `refused`, `failed`, `uncertain`, or `unavailable`. Lost admission replies return `uncertain`. Observe the original ID without retrying or switching transports. `compact status` submits no work. Missing records and unanswered status requests return `unavailable`. A `cancelled` reason names the change that ended the request: reader activity, scope loss, a changed session source or setup, a replaced agent process, an agent process that exited or moved to another session, window closure, or a cancel command.
+
+`compact cancel --self` cancels an admitted request before Arc sends it. Arc accepts the cancel only while it observes the exact literal command as a live root tool call in the session that made the request. It reads up to four times across two seconds while the window has not seen the command. A cancelled request returns its record with `state` `cancelled`. A request that already stopped returns its record unchanged. A lost reply returns `unavailable`, and the cancel can still have applied, so read `compact status` then. Refusals return `state` `refused` with a `code`: `not-observed`, `unknown`, `other-session`, or `delivered`.
 
 ### Continuation files
 

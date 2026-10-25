@@ -20,8 +20,12 @@ import {
 import {
   CompactHost,
   CompactRequests,
+  compactCancelPayload,
+  compactCarryLine,
   compactCommandPayload,
   COMPACT_LIMITS,
+  readerCarry,
+  readerPrompt,
   validContinuation,
   validContinuationPath,
   type CompactPersistence,
@@ -89,6 +93,8 @@ function compactHostFixture(agent: 'claude' | 'codex' = 'codex', persistence?: C
     compactions: 1,
     work: 'none' as 'none' | 'pending' | 'absent' | 'unknown',
     beforeWrite: () => {},
+    // Holds delivery at the activity lease while a case acts on the waiting request.
+    lease: null as Promise<void> | null,
     state,
     child: null as unknown as CompactChild,
     current: null as CompactChild | null,
@@ -152,6 +158,7 @@ function compactHostFixture(agent: 'claude' | 'codex' = 'codex', persistence?: C
       find: (provider, sessionId) =>
         provider === agent && fixture.current?.state().sessionId === sessionId ? fixture.current : null,
       withActivity: async (child, work) => {
+        if (fixture.lease) await fixture.lease;
         if (child !== fixture.current || child.state().exited) return null;
         await work(child);
         return undefined;
@@ -275,7 +282,11 @@ const continuationState = (fixture: ReturnType<typeof compactHostFixture>['fixtu
 test('self compaction joins one live literal root call and acknowledges before the tool and exact turn finish', async () => {
   let clock = 0;
   const book = new CompactRequests(compactWindow, () => clock);
-  assert.throws(() => book.admit(compactPayload, () => true), /has not seen this command/);
+  // The refusal names the command form Arc can observe, without naming a provider tool.
+  assert.throws(
+    () => book.admit(compactPayload, () => true),
+    /has not seen this command.*Run arc compact request as its own command, with no chain, pipe or substitution\.$/,
+  );
   book.observe(compactBinding, compactEvent('toolStart', { sessionId: 'foreign' }));
   assert.equal(book.ready(compactPayload), false);
   book.observe(compactBinding, compactEvent('toolStart', { initiating: false }));
@@ -1300,6 +1311,347 @@ test('host compaction cancels unsubmitted work on reader action, child change, s
   fixture.host.readerAction('self');
   const refused = fixture.host.handle({ method: 'compact-request', params: compactPayload }) as { state: string };
   assert.equal(refused.state, 'refused');
+});
+
+// Catches a cancelled request that blames the agent process when the reader, the scope or the setup changed.
+test.each([
+  ['scope', "The session left this window's scope before compaction started."],
+  ['authority', "The session's source, folder or setup changed before compaction started."],
+  ['replaced', 'The agent process was replaced before compaction started.'],
+  ['exited', 'The agent process exited or moved to another session before compaction started.'],
+  ['moved', 'The agent process exited or moved to another session before compaction started.'],
+] as const)('host compaction names the change that cancelled a deferred request: %s', async (change, reason) => {
+  const { fixture, makeChild } = compactHostFixture();
+  const { host, child, state } = fixture;
+  admittedCompaction(fixture);
+  host.replyRetained(child, 7);
+  host.native(child, compactEvent('rootEnd'), 7);
+  state.busy = false;
+  if (change === 'scope') fixture.work = 'absent';
+  if (change === 'authority') fixture.authority = 'another source';
+  if (change === 'replaced') fixture.current = makeChild('child');
+  if (change === 'exited') state.exited = true;
+  if (change === 'moved') state.sessionId = 'other';
+  await host.drain('self');
+  assert.equal(fixture.writes, 0);
+  const status = host.handle({ method: 'compact-status', params: { requestId: compactPayload.requestId } }) as {
+    state: string;
+    reason: string;
+  };
+  assert.deepEqual([status.state, status.reason], ['cancelled', reason]);
+});
+
+const cancelParams = { requestId: compactPayload.requestId, window: compactWindow, self: true };
+const cancelLiteral = (requestId = compactPayload.requestId) =>
+  `arc compact cancel --self --request-id ${requestId} --window ${compactWindow} --json`;
+const runCancel = (host: CompactHost<CompactChild>, params: object = cancelParams) => {
+  const answer = host.handle({ method: 'compact-cancel', params }) as { state: string; code?: string; reason: string };
+  return [answer.state, answer.code ?? '', answer.reason];
+};
+
+// Catches a cancel that another session can run, that an unseen command can run, or that leaves the request deliverable.
+test('the requesting session cancels its own deferred request only while its cancel command runs', async () => {
+  const { fixture, makeChild } = compactHostFixture();
+  const { host, child, state } = fixture;
+  admittedCompaction(fixture);
+  const other: CompactChild = { ...makeChild('other'), state: () => ({ ...state, sessionId: 'other' }) };
+  const unseen =
+    'Arc has not seen this command run in a session yet. Nothing was cancelled. Run arc compact cancel as its own command, with no chain, pipe or substitution.';
+  assert.deepEqual(runCancel(host), ['refused', 'not-observed', unseen]);
+  host.native(other, compactEvent('toolStart', { sessionId: 'other', toolId: 'cancel', command: cancelLiteral() }), 9);
+  fixture.current = other;
+  assert.deepEqual(runCancel(host), [
+    'refused',
+    'other-session',
+    'Another session made this compaction request. Nothing was cancelled.',
+  ]);
+  fixture.current = child;
+  const unknownId = `${compactWindow}:bbbbbbbb-1111-2222-3333-444444444444`;
+  host.native(child, compactEvent('toolStart', { toolId: 'unknown', command: cancelLiteral(unknownId) }), 7);
+  assert.deepEqual(runCancel(host, { ...cancelParams, requestId: unknownId }), [
+    'refused',
+    'unknown',
+    'This Arc window holds no compaction request with this ID. Nothing was cancelled.',
+  ]);
+  assert.equal(compactState(host), 'queued');
+  host.native(child, compactEvent('toolStart', { toolId: 'cancel', command: cancelLiteral() }), 7);
+  const cancelled = ['cancelled', '', 'The requesting agent cancelled this request before compaction started.'];
+  assert.deepEqual(runCancel(host), cancelled);
+  assert.deepEqual(runCancel(host), cancelled, 'a repeated cancel reports the same record');
+  host.native(child, compactEvent('toolEnd', { toolId: 'cancel' }), 7);
+  host.native(other, compactEvent('toolEnd', { sessionId: 'other', toolId: 'cancel' }), 9);
+  assert.deepEqual(runCancel(host), ['refused', 'not-observed', unseen], 'settled calls cancel nothing more');
+  host.replyRetained(child, 7);
+  host.native(child, compactEvent('rootEnd'), 7);
+  state.busy = false;
+  await host.drain('self');
+  assert.equal(fixture.writes, 0);
+  assert.equal(compactState(host), 'cancelled');
+});
+
+// Catches a cancel that reports success after Arc already sent the compaction to the agent.
+test('a cancel command refuses a deferred request that Arc already sent', async () => {
+  const { fixture } = compactHostFixture();
+  const { host, child, state } = fixture;
+  admittedCompaction(fixture);
+  host.replyRetained(child, 7);
+  host.native(child, compactEvent('rootEnd'), 7);
+  state.busy = false;
+  await host.drain('self');
+  assert.equal(fixture.writes, 1);
+  host.native(child, compactEvent('toolStart', { turnId: 'next', toolId: 'cancel', command: cancelLiteral() }), 8);
+  assert.deepEqual(runCancel(host), [
+    'refused',
+    'delivered',
+    'Arc already sent this compaction to the agent. Nothing was cancelled.',
+  ]);
+  assert.equal(compactState(host), 'uncertain');
+});
+
+// Catches a cancel command that a subagent, a composed command or another window runs.
+test('a cancel command counts only as the exact literal root call for this window', () => {
+  const { fixture } = compactHostFixture();
+  const { host, child } = fixture;
+  admittedCompaction(fixture);
+  for (const [toolId, extra] of [
+    ['subagent', { initiating: false }],
+    ['chain', { command: `cd /tmp && ${cancelLiteral()}` }],
+    ['pipe', { command: `${cancelLiteral()} | cat` }],
+    ['window', { command: cancelLiteral().replace(`--window ${compactWindow}`, `--window ${'c'.repeat(24)}`) }],
+  ] as const) {
+    host.native(child, compactEvent('toolStart', { toolId, command: cancelLiteral(), ...extra }), 7);
+    assert.equal(runCancel(host)[1], 'not-observed', toolId);
+  }
+  host.native(child, compactEvent('toolStart', { toolId: 'wrapped', command: `/bin/sh -c '${cancelLiteral()}'` }), 7);
+  assert.equal(runCancel(host)[0], 'cancelled');
+});
+
+// Catches a cancel command that the Codex Windows wrapper hides, or a composed command inside that wrapper.
+test('a cancel command counts inside the PowerShell wrappers Codex reports and nothing composed around them', () => {
+  const executable = String.raw`"C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"`;
+  for (const command of [
+    `${executable} -Command '${cancelLiteral()}'`,
+    `${executable} -NoProfile -Command '${cancelLiteral()}'`,
+  ])
+    assert.deepEqual(compactCancelPayload(command), cancelParams, command);
+  for (const command of [
+    `${executable} -Command '${cancelLiteral()}; echo x'`,
+    `${executable} -Command '$(${cancelLiteral()})'`,
+  ])
+    assert.equal(compactCancelPayload(command), null, command);
+});
+
+// Catches a cancel that lands while delivery waits on the activity lease or at the provider write boundary and still writes.
+test.each(['lease', 'write boundary'] as const)(
+  'a cancel while delivery waits at the %s writes no compaction',
+  async (wait) => {
+    const { fixture } = compactHostFixture();
+    const { host, child, state } = fixture;
+    admittedCompaction(fixture);
+    host.native(child, compactEvent('toolStart', { toolId: 'cancel', command: cancelLiteral() }), 7);
+    host.replyRetained(child, 7);
+    host.native(child, compactEvent('rootEnd'), 7);
+    state.busy = false;
+    let release = () => {};
+    if (wait === 'lease') fixture.lease = new Promise<void>((resolve) => (release = resolve));
+    else fixture.beforeWrite = () => assert.equal(runCancel(host)[0], 'cancelled');
+    const delivery = host.drain('self');
+    if (wait === 'lease') assert.equal(runCancel(host)[0], 'cancelled');
+    release();
+    await delivery;
+    assert.deepEqual([fixture.calls, fixture.writes], [wait === 'lease' ? 0 : 1, 0]);
+    assert.equal(compactState(host), 'cancelled');
+  },
+);
+
+// Catches a cancel that drops the request but leaves its saved continuation able to run.
+test('a cancel of a request with a saved continuation cancels the continuation before any write', async () => {
+  const { store } = memoryCompactionStore();
+  const { fixture } = compactHostFixture('codex', store);
+  const { host, child } = fixture;
+  assert.equal((await admitContinuation(fixture)).state, 'queued');
+  host.native(child, compactEvent('toolEnd'), 7);
+  host.native(
+    child,
+    compactEvent('toolStart', { toolId: 'cancel', command: cancelLiteral(continuationPayload.requestId) }),
+    7,
+  );
+  assert.equal(runCancel(host, { ...cancelParams, requestId: continuationPayload.requestId })[0], 'cancelled');
+  const status = continuationState(fixture);
+  assert.deepEqual(
+    [status.state, status.continuation?.state, status.continuation?.write],
+    ['cancelled', 'cancelled', 'not-written'],
+  );
+  assert.deepEqual(fixture.continuationWrites, []);
+});
+
+// Catches a cancel that works only inside the requesting turn.
+test('a cancel command from a later turn of the requesting session cancels its request', async () => {
+  const { fixture } = compactHostFixture();
+  const { host, child, state } = fixture;
+  admittedCompaction(fixture);
+  host.replyRetained(child, 7);
+  host.native(child, compactEvent('rootEnd'), 7);
+  host.submitted(child, 8);
+  host.native(child, compactEvent('toolStart', { turnId: 'next', toolId: 'cancel', command: cancelLiteral() }), 8);
+  assert.deepEqual(runCancel(host), [
+    'cancelled',
+    '',
+    'The requesting agent cancelled this request before compaction started.',
+  ]);
+  state.busy = false;
+  await host.drain('self');
+  assert.equal(fixture.writes, 0);
+});
+
+// Catches a cancel observation that outlives the process or session that ran it and authorizes a later request.
+test.each(['exit', 'move'] as const)('a cancel observation ends at child %s', (change) => {
+  const { fixture, makeChild } = compactHostFixture();
+  const { host, state } = fixture;
+  host.native(fixture.child, compactEvent('toolStart', { toolId: 'cancel', command: cancelLiteral() }), 7);
+  assert.equal(runCancel(host)[1], 'unknown');
+  if (change === 'exit') {
+    state.exited = true;
+    host.childGone('child');
+    state.exited = false;
+    fixture.child = fixture.current = makeChild('child');
+  } else host.sessionMoved('self');
+  admittedCompaction(fixture);
+  assert.deepEqual(runCancel(host)[1], 'not-observed');
+  assert.equal(compactState(host), 'queued');
+});
+
+// Catches one stale request whose loss cancels another request of the same child and session.
+test('a stale request cancels only itself and another request of its session still runs', async () => {
+  const { fixture } = compactHostFixture();
+  const { host, child, state } = fixture;
+  admittedCompaction(fixture);
+  fixture.authority = 'another source';
+  const second = { ...compactPayload, requestId: `${compactWindow}:bbbbbbbb-1111-2222-3333-444444444444` };
+  const secondLiteral = compactLiteral.replace(compactPayload.requestId, second.requestId);
+  host.submitted(child, 8);
+  host.native(child, compactEvent('toolStart', { turnId: 'second', toolId: 'second', command: secondLiteral }), 8);
+  assert.equal((host.handle({ method: 'compact-request', params: second }) as { state: string }).state, 'queued');
+  host.native(child, compactEvent('toolEnd', { turnId: 'second', toolId: 'second' }), 8);
+  host.replyRetained(child, 7);
+  host.native(child, compactEvent('rootEnd'), 7);
+  host.replyRetained(child, 8);
+  host.native(child, compactEvent('rootEnd', { turnId: 'second' }), 8);
+  state.busy = false;
+  await host.drain('self');
+  const status = (requestId: string) =>
+    host.handle({ method: 'compact-status', params: { requestId } }) as { state: string; reason: string };
+  assert.deepEqual(
+    [status(compactPayload.requestId).state, status(compactPayload.requestId).reason],
+    ['cancelled', "The session's source, folder or setup changed before compaction started."],
+  );
+  assert.equal(status(second.requestId).state, 'uncertain');
+  assert.equal(fixture.writes, 1);
+});
+
+// Catches the turn 9 loss: reader messages that join the running Claude turn advance its prompt generation,
+// so the request must follow that generation and still run after the turn that answers them.
+test('reader messages that join the running Claude turn carry the request and compaction runs after that turn', async () => {
+  const { fixture } = compactHostFixture('claude');
+  const { host, child, state } = fixture;
+  Object.assign(child, { readerTurnOwner: () => 7 });
+  const claude = { provider: 'claude', generation: 1 };
+  host.submitted(child, 7);
+  host.native(child, compactEvent('toolStart', claude), 7);
+  assert.equal(
+    (host.handle({ method: 'compact-request', params: compactPayload }) as { state: string }).state,
+    'queued',
+  );
+  host.native(child, compactEvent('toolEnd', claude), 7);
+  for (let message = 0; message < 5; message++) {
+    const generation = 2 + message;
+    host.readerAction('self', false, readerCarry('sendPrompt', 'Also check the mockup.'));
+    assert.equal(
+      readerPrompt(host, 'self', { text: 'Also check the mockup.' }).text,
+      `Also check the mockup.\n\n${compactCarryLine(compactPayload.requestId)}`,
+    );
+    host.submitted(child, 20 + message);
+    host.read(child, 20 + message);
+    const work = { provider: 'claude', generation, toolId: `work-${message}`, command: 'npm test' };
+    host.native(child, compactEvent('toolStart', work), 7);
+    host.native(child, compactEvent('toolEnd', work), 7);
+    assert.equal(compactState(host), 'queued');
+  }
+  fixture.compactions = 6;
+  host.replyRetained(child, 7);
+  host.native(child, compactEvent('rootEnd', { provider: 'claude', generation: 6 }), 7);
+  state.busy = false;
+  await host.drain('self');
+  assert.equal(fixture.writes, 1);
+  const status = host.handle({ method: 'compact-status', params: { requestId: compactPayload.requestId } }) as {
+    state: string;
+    turn: string;
+  };
+  assert.deepEqual([status.state, status.turn], ['uncertain', '6']);
+});
+
+// Catches a reader message, sent or flushed from the queue after the requesting turn ended, that cancels the request
+// or lets it run before the turn that answers the message.
+test.each(['sent', 'queued'] as const)(
+  'a %s reader message that starts a new turn carries the request and compaction runs after that turn',
+  async (route) => {
+    const { fixture } = compactHostFixture();
+    const { host, child, state } = fixture;
+    admittedCompaction(fixture);
+    host.replyRetained(child, 7);
+    host.native(child, compactEvent('rootEnd'), 7);
+    if (route === 'queued') {
+      // The queued prompt holds delivery at turn end, then the queue flush delivers it.
+      fixture.work = 'pending';
+      state.busy = false;
+      await host.drain('self');
+      assert.equal(fixture.writes, 0);
+      fixture.work = 'none';
+    }
+    host.readerAction('self', false, readerCarry('sendPrompt', 'Next, the tests.'));
+    const prompt = { text: 'Next, the tests.', assets: [] };
+    const delivered = readerPrompt(host, 'self', prompt);
+    assert.equal(delivered.text.split(compactCarryLine(compactPayload.requestId)).length, 2);
+    assert.deepEqual(prompt, { text: 'Next, the tests.', assets: [] }, 'the reader keeps the text they wrote');
+    host.submitted(child, 8);
+    // The reader branch of resolve() holds delivery until the new turn rebinds the request.
+    await host.drain('self');
+    assert.deepEqual([fixture.writes, compactState(host)], [0, 'queued']);
+    state.busy = true;
+    host.native(child, compactEvent('toolStart', { turnId: 'next', toolId: 'work', command: 'npm test' }), 8);
+    assert.equal(readerPrompt(host, 'self', prompt), prompt, 'the line goes only with the message that carried it');
+    host.native(child, compactEvent('toolEnd', { turnId: 'next', toolId: 'work', command: 'npm test' }), 8);
+    host.replyRetained(child, 8);
+    host.native(child, compactEvent('rootEnd', { turnId: 'next' }), 8);
+    state.busy = false;
+    await host.drain('self');
+    assert.equal(fixture.writes, 1);
+    const status = host.handle({ method: 'compact-status', params: { requestId: compactPayload.requestId } }) as {
+      turn: string;
+      submissionId: string;
+    };
+    assert.deepEqual([status.turn, status.submissionId], ['next', '8']);
+  },
+);
+
+// Catches a Stop, a setting pick, a slash command or an answer that carries a request instead of cancelling it.
+test.each([
+  ['stopTurn', undefined, false],
+  ['pick', undefined, false],
+  ['compact', undefined, false],
+  ['sendPrompt', '/model sonnet', false],
+  ['answerAsk', undefined, true],
+] as const)('a reader %s cancels a deferred request', async (type, text, answer) => {
+  const { fixture } = compactHostFixture();
+  const { host, child, state } = fixture;
+  admittedCompaction(fixture);
+  host.readerAction('self', answer, readerCarry(type, text));
+  host.replyRetained(child, 7);
+  host.native(child, compactEvent('rootEnd'), 7);
+  state.busy = false;
+  await host.drain('self');
+  assert.deepEqual([fixture.writes, compactState(host)], [0, 'cancelled']);
+  assert.equal(readerPrompt(host, 'self', { text: 'x' }).text, 'x');
 });
 
 // Catches a worktree change or a failed Git read cancelling a request whose session never left the window's scope.

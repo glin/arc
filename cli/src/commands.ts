@@ -88,8 +88,37 @@ function label(action: 'add' | 'remove'): Command {
   };
 }
 
-function compact(action: 'request' | 'status'): Command {
+function compact(action: 'request' | 'status' | 'cancel'): Command {
   const request = action === 'request';
+  const cancel = action === 'cancel';
+  if (cancel)
+    return {
+      name: 'compact cancel',
+      section: 'Compaction',
+      route: 'compact',
+      help: {
+        summary: 'Cancel a compaction request this session made before Arc sends it.',
+        synopsis: 'arc compact cancel --self --request-id WINDOW:UUID --window WINDOW --json',
+        flags: [
+          ['--self', 'Cancel only a request of the session that runs this command.'],
+          ['--request-id WINDOW:UUID', 'Required. Use the ID of the admitted request.'],
+          ['--window WINDOW', 'Required. Must match the request ID window activation.'],
+          ['--json', 'Required. Print the cancel outcome.'],
+        ],
+        output: [
+          'JSON: the request record with state cancelled and its reason, or state refused with code and reason.',
+          'A request that already stopped returns its record unchanged.',
+          'A lost reply reports unavailable. Read compact status for the request then.',
+        ],
+        refusals: [
+          'All synopsis flags are required. Window and UUID syntax must match.',
+          'Arc must see this command run as a live native tool call in the requesting session.',
+          'A request of another session, a request Arc already sent, and an unknown ID refuse.',
+        ],
+        example:
+          'arc compact cancel --self --request-id WINDOW_ID:aaaaaaaa-1111-2222-3333-444444444444 --window WINDOW_ID --json',
+      },
+    };
   return {
     name: `compact ${action}`,
     section: 'Compaction',
@@ -139,7 +168,8 @@ function compact(action: 'request' | 'status'): Command {
           ? [
               'Admission requires this live native tool call in the hosted main session, with no open asks or queued reader input.',
               'Each turn holds one pending request. Repeated requests use fresh IDs and preserve existing task limits.',
-              'Missing readiness or reader intervention refuses or cancels compaction.',
+              'Missing readiness refuses compaction. A reader prompt carries an admitted request to the turn that answers it, and other reader intervention cancels it.',
+              'compact cancel drops an admitted request.',
             ]
           : ['A missing request or unavailable window reports unavailable.']),
       ],
@@ -641,16 +671,19 @@ export const COMMANDS: readonly Command[] = [
     section: 'Compaction',
     route: 'compact',
     help: {
-      summary: 'Request or observe self-compaction.',
-      synopsis: 'arc compact request|status [OPTIONS]',
+      summary: 'Request, observe or cancel self-compaction.',
+      synopsis: 'arc compact request|status|cancel [OPTIONS]',
       flags: [],
-      output: ['Use compact request --help or compact status --help for required flags and JSON fields.'],
-      refusals: ['A compaction action must be request or status.'],
+      output: [
+        'Use compact request --help, compact status --help or compact cancel --help for required flags and JSON fields.',
+      ],
+      refusals: ['A compaction action must be request, status or cancel.'],
       example: 'arc compact status --help',
     },
   },
   compact('request'),
   compact('status'),
+  compact('cancel'),
   {
     name: 'cost',
     section: 'Cost',

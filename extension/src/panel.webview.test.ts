@@ -2201,7 +2201,7 @@ import { sameCommitSha, listSessionFiles, readTurns } from './transcript.ts';
 import { handoffRefusalMessage, pressIsMidTurn, pressesAfter } from './composerview.ts';
 import { compaction, livePress, powershellDispatchExecution, subagentCommitTurn, turn } from './turnfixtures.ts';
 import { ClaudeWire } from './claudewire.ts';
-import { CompactHost, CompactRequests, promptAsReader, type CompactChild } from './compactrequest.ts';
+import { CompactHost, CompactRequests, promptAsReader, readerCarry, type CompactChild } from './compactrequest.ts';
 import { currentRecordsBySession, turnKey } from './turnread.ts';
 import { ProgressiveWorker, acceptsProgressiveResult, type ProgressiveInput } from './progressiveworker.ts';
 import { handleNavigationPress, navigationButton, ROVING_SELECTOR } from './webview/navigation.ts';
@@ -9469,7 +9469,7 @@ test('every reader instruction names a panel message and reports before the pane
   const union = protocolSource.slice(from, protocolSource.indexOf('\nexport ', from + 1));
   for (const name of names) assert.ok(union.includes(`type: '${name}'`), `PanelToHost has no '${name}' message`);
   const start = panelHostSource.indexOf('private async onMessage(');
-  const report = panelHostSource.indexOf('this.onReaderAction?.(message.session', start);
+  const report = panelHostSource.indexOf('this.onReaderAction?.(', start);
   assert.ok(start !== -1 && report !== -1, 'the panel message handler no longer reports reader actions');
   const awaits: ts.AwaitExpression[] = [];
   sourceNodes(panelHostSource, (node) => {
@@ -9499,23 +9499,31 @@ test('every reader instruction names a panel message and reports before the pane
   const compiled = ts.transpileModule(`async function reportReader(raw, host) {${prefix}}`, {
     compilerOptions: { target: ts.ScriptTarget.ES2022 },
   }).outputText;
-  const reportReader = new Function('parsePanelToHost', 'READER_INSTRUCTIONS', `${compiled}\nreturn reportReader;`)(
-    (message: unknown) => message,
-    new Set(names),
-  );
+  const reportReader = new Function(
+    'parsePanelToHost',
+    'READER_INSTRUCTIONS',
+    'readerCarry',
+    `${compiled}\nreturn reportReader;`,
+  )((message: unknown) => message, new Set(names), readerCarry);
   const f = orderedHostReadFixture();
   f.provider.panelSession = (session: string) => session;
   for (const type of names) {
     const reports: unknown[] = [];
-    f.provider.onReaderAction = (session: string, answer: boolean) => reports.push([session, answer]);
-    const operation = reportReader.call(f.provider, { type, session: 'worker' }, f.host);
-    assert.deepEqual(reports, [['worker', type === 'answerAsk']], `${type} reports after yielding`);
+    f.provider.onReaderAction = (session: string, answer: boolean, carry?: string | null) =>
+      reports.push([session, answer, carry]);
+    const operation = reportReader.call(f.provider, { type, session: 'worker', text: 'Next.' }, f.host);
+    const carry = type === 'sendPrompt' ? 'send' : type === 'dequeue' || type === 'acceptQueuedEdit' ? 'queue' : null;
+    assert.deepEqual(reports, [['worker', type === 'answerAsk', carry]], `${type} reports after yielding`);
     await operation;
   }
   const flush = panelHostSource.indexOf('public flushQueue(');
   const delivered = panelHostSource.indexOf('this.onReaderAction?.(state.sessionId', flush);
   assert.ok(flush !== -1 && delivered !== -1, 'queued delivery no longer reports a reader action');
   assert.ok(delivered < panelHostSource.indexOf('this.send(ready', flush), 'queued delivery reports before it sends');
+  assert.ok(
+    panelHostSource.slice(delivered, delivered + 100).includes("readerCarry('sendPrompt', text)"),
+    'queued delivery carries deferred compaction like a sent message',
+  );
 });
 
 // Catches a scope change or a rows refresh that no longer reaches deferred compaction. A lost report lets compaction
@@ -14343,7 +14351,7 @@ test('live process operations hold an AgentHost activity lease', () => {
   const send = extensionSource.slice(sendAt, extensionSource.indexOf('// Compaction is', sendAt));
   sourceMatch(
     send,
-    /withExistingSessionActivity\([\s\S]*session\.prompt\(prompt,/,
+    /withExistingSessionActivity\([\s\S]*session\.prompt\(readerPrompt\(compaction, sessionId, prompt\),/,
     'opening a prompt does not reserve the child through its activity lease',
   );
   const compactAt = extensionSource.indexOf('panel.onCompact = async');
@@ -24133,7 +24141,7 @@ test('pasted and dropped files use the staged byte bridge without changing text 
   const panelPrompt = extensionSource.slice(panelPromptAt, extensionSource.indexOf('// Compaction is', panelPromptAt));
   sourceMatch(
     panelPrompt,
-    /withExistingSessionActivity\([\s\S]*session\.prompt\(prompt,/,
+    /withExistingSessionActivity\([\s\S]*session\.prompt\(readerPrompt\(compaction, sessionId, prompt\),/,
     'a prompt sent through the Panel bypasses the session activity owner',
   );
   sourceMatch(
@@ -26415,7 +26423,7 @@ test('only a failed card offers a way out of it, and the press names its session
   );
   sourceMatch(
     handoff,
-    /withExistingSessionActivity\([\s\S]*session\.prompt\(prompt,/,
+    /withExistingSessionActivity\([\s\S]*session\.prompt\(readerPrompt\(compaction, sessionId, prompt\),/,
     'a later prompt does not hold the child through delivery',
   );
   sourceMatch(

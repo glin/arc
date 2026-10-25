@@ -28,7 +28,7 @@ import {
 } from './sessionwrites.ts';
 import { RAIL_FILTER_QUERY_LIMIT } from './domain/rail-filters.ts';
 import { listingQueryError, sessionQueryError } from './domain/session-query.ts';
-import { validCompactPayload } from './compactrequest.ts';
+import { validCompactCancel, validCompactPayload } from './compactrequest.ts';
 import { DISPATCH_ID } from './dispatchreceipts';
 import {
   TERMINAL_OWNERSHIP_CAPABILITY,
@@ -119,6 +119,7 @@ export interface SessionRequest {
     | 'compact-ready'
     | 'compact-request'
     | 'compact-status'
+    | 'compact-cancel'
     | 'dispatch';
   terminalOrigin?: TerminalOrigin;
   requester: string | null;
@@ -196,9 +197,15 @@ export function parseSessionRequest(value: unknown): SessionRequest | null {
     record(value) &&
     value.terminalOrigin !== undefined &&
     (!validTerminalOrigin(value.terminalOrigin) ||
-      ['ping', 'terminal-owner', 'dispatch', 'compact-ready', 'compact-request', 'compact-status'].includes(
-        value.method as string,
-      ))
+      [
+        'ping',
+        'terminal-owner',
+        'dispatch',
+        'compact-ready',
+        'compact-request',
+        'compact-status',
+        'compact-cancel',
+      ].includes(value.method as string))
   )
     return null;
   if (
@@ -235,6 +242,7 @@ export function parseSessionRequest(value: unknown): SessionRequest | null {
       'compact-ready',
       'compact-request',
       'compact-status',
+      'compact-cancel',
       'dispatch',
     ].includes(value.method as string) ||
     !(
@@ -287,6 +295,8 @@ export function parseSessionRequest(value: unknown): SessionRequest | null {
       (value.method === 'compact-request' && value.id !== value.params.requestId)
     )
       return null;
+  } else if (value.method === 'compact-cancel') {
+    if (!validCompactCancel(value.params)) return null;
   } else if (value.method === 'compact-status') {
     if (
       Object.keys(value.params).join(',') !== 'requestId' ||

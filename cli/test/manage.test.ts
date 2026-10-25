@@ -5,6 +5,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, test, vi } from 'vitest';
 import { WindowChannel, type SessionRequest } from '../../extension/src/sessionrequests.ts';
+import { COMPACT_CANCELLED, CompactHost, type CompactChild } from '../../extension/src/compactrequest.ts';
+import type { NativeEvent } from '../../extension/src/agentwire.ts';
 import * as sessionRequests from '../../extension/src/sessionrequests.ts';
 import { runManagement } from '../src/manage.ts';
 import { runCompact } from '../src/compact.ts';
@@ -127,6 +129,102 @@ test('compact readiness accepts a positive in-flight reply after the read-start 
     request.mock.calls.map(([method]) => method),
     ['compact-ready', 'compact-request'],
   );
+});
+
+const cancelArgs = [
+  'cancel',
+  '--self',
+  '--request-id',
+  compactWindow + ':aaaaaaaa-1111-2222-3333-444444444444',
+  '--window',
+  compactWindow,
+  '--json',
+];
+
+// Catches a cancel that gives up before the window sees its tool call, or that retries after a final answer.
+test('compact cancel repeats only while the window has not seen the command and prints its answer', async () => {
+  vi.useFakeTimers();
+  const request = vi
+    .spyOn(sessionRequests, 'requestWindow')
+    .mockResolvedValueOnce({ state: 'refused', code: 'not-observed', reason: 'Not seen yet.' })
+    .mockResolvedValueOnce({ state: 'cancelled', reason: 'Cancelled.' });
+  const pending = runCompact(cancelArgs);
+  await vi.advanceTimersByTimeAsync(500);
+  assert.deepEqual(JSON.parse(await pending), { state: 'cancelled', reason: 'Cancelled.' });
+  assert.deepEqual(
+    request.mock.calls.map(([method, params]) => [method, params]),
+    [
+      ['compact-cancel', { requestId: cancelArgs[3], window: compactWindow, self: true }],
+      ['compact-cancel', { requestId: cancelArgs[3], window: compactWindow, self: true }],
+    ],
+  );
+  request.mockReset();
+  request.mockResolvedValue({ state: 'refused', code: 'other-session', reason: 'Another session.' });
+  const refused = runCompact(cancelArgs);
+  await vi.runAllTimersAsync();
+  assert.equal(JSON.parse(await refused).code, 'other-session');
+  assert.equal(request.mock.calls.length, 1);
+});
+
+// Catches a routing or parse mismatch between the CLI cancel and the window's compaction host.
+test('compact cancel crosses a real window channel and cancels the request in the compaction host', async () => {
+  const fixture = await host();
+  try {
+    const window = fixture.channel.hostId;
+    const requestId = `${window}:aaaaaaaa-1111-2222-3333-444444444444`;
+    const state = { sessionId: 'self', busy: true, asks: [], ready: true, exited: false };
+    const child: CompactChild = {
+      key: 'child',
+      agent: 'codex',
+      state: () => state,
+      compactionUnresolved: () => false,
+      compact: async () => {},
+    };
+    const compaction = new CompactHost<CompactChild>(window, {
+      find: () => child,
+      withActivity: async () => undefined,
+      readerWork: () => 'none',
+    });
+    fixture.channel.setCompactRequestHandler((request) => compaction.handle(request));
+    const toolStart = (toolId: string, command: string) =>
+      ({
+        kind: 'toolStart',
+        provider: 'codex',
+        sessionId: 'self',
+        turnId: 'root',
+        generation: null,
+        evidence: {},
+        toolId,
+        command,
+        initiating: true,
+        success: true,
+      }) as NativeEvent;
+    compaction.submitted(child, 7);
+    compaction.native(
+      child,
+      toolStart(
+        'request',
+        `arc compact request --self --after-turn --request-id ${requestId} --window ${window} --json`,
+      ),
+      7,
+    );
+    const admitted = compaction.handle({
+      method: 'compact-request',
+      params: { requestId, window, self: true, afterTurn: true },
+    });
+    assert.equal((admitted as { state: string }).state, 'queued');
+    compaction.native(
+      child,
+      toolStart('cancel', `arc compact cancel --self --request-id ${requestId} --window ${window} --json`),
+      7,
+    );
+    const answer = JSON.parse(
+      await runCompact(['cancel', '--self', '--request-id', requestId, '--window', window, '--json']),
+    );
+    assert.deepEqual([answer.requestId, answer.state, answer.reason], [requestId, 'cancelled', COMPACT_CANCELLED]);
+  } finally {
+    await fixture.close();
+  }
 });
 
 async function host() {
@@ -532,6 +630,10 @@ test('compact refuses invalid flags before the host receives a request', async (
       await assert.rejects(runCompact([...args, extra]), /Unknown or repeated argument/);
       assert.equal(fixture.requests.length, 0);
     }
+    const cancel = ['cancel', ...args.filter((arg) => arg !== 'request' && arg !== '--after-turn')];
+    await assert.rejects(runCompact([...cancel, '--after-turn']), /Unknown or repeated argument/);
+    await assert.rejects(runCompact(cancel.filter((arg) => arg !== '--self')), /Cancel also requires --self/);
+    assert.equal(fixture.requests.length, 0);
   } finally {
     await fixture.close();
   }

@@ -446,6 +446,7 @@ import {
   PromptEntry,
   WireActivity,
 } from './agentwire';
+import { readerCarry } from './compactrequest';
 import {
   PromptAssetCompletionBook,
   StoredPromptAsset,
@@ -1778,7 +1779,7 @@ export class PanelProvider implements vscode.Disposable {
   public onStopTurn: ((agent: string, session: string) => void) | null = null;
   // Runs synchronously when the reader sends, queues, edits a queued prompt, stops, compacts, answers or picks a setting,
   // and when the panel delivers a queued prompt. `answer` marks an answer to an ask.
-  public onReaderAction: ((session: string, answer: boolean) => void) | null = null;
+  public onReaderAction: ((session: string, answer: boolean, carry?: 'send' | 'queue' | null) => void) | null = null;
   // Guarded follow-up ports, which `extension.ts` assigns from the window's follow-up policy.
   // Signs the facts of a current session read for the requester that started the session.
   public guardedObservation: ((request: AttributedRequest, facts: GuardedObservationFacts) => string | null) | null =
@@ -6552,7 +6553,7 @@ export class PanelProvider implements vscode.Disposable {
       return;
     }
     // Delivering queued input is a reader action, and it happens before the prompt is submitted.
-    this.onReaderAction?.(state.sessionId, false);
+    this.onReaderAction?.(state.sessionId, false, readerCarry('sendPrompt', text));
     this.onReaderDirected?.(state.sessionId);
     // Record the attempt before crossing the protocol boundary. If this process stops after
     // the agent accepts but before its answer is stored, the next process must not submit the
@@ -14742,9 +14743,13 @@ export class PanelProvider implements vscode.Disposable {
       this.health?.event('unready', this.healthPanel(host).id);
       return;
     }
-    // A reader instruction cancels deferred compaction before any await in its own handler.
+    // A reader instruction carries or cancels deferred compaction before any await in its own handler.
     if ('session' in message && (READER_INSTRUCTIONS.has(message.type) || message.type === 'answerAsk'))
-      this.onReaderAction?.(message.session, message.type === 'answerAsk');
+      this.onReaderAction?.(
+        message.session,
+        message.type === 'answerAsk',
+        readerCarry(message.type, message.type === 'sendPrompt' ? message.text : undefined),
+      );
     // Resolve current cards by key. Missing cards cannot supply action targets.
     const cardFor = (key: string): { card: RenderCard; sessionId: string } | null => {
       const card = this.cards.find((c) => c.key === key);

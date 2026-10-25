@@ -1647,10 +1647,8 @@ test('continuation file opening refuses nonregular descriptors with platform non
 });
 
 // Catches the CLI's copy of the not-observed refusal drifting from the window's text.
-test('the CLI not-observed refusal matches the window text', () => {
+test('the CLI not-observed refusal reuses the window text', () => {
   const cli = readFileSync(new URL('../src/compact.ts', import.meta.url), 'utf8');
-  const window = readFileSync(new URL('../../extension/src/compactrequest.ts', import.meta.url), 'utf8');
-  const text = /'not-observed': '([^']+)'/.exec(window)?.[1];
-  assert.ok(text, 'the window names a not-observed refusal');
-  assert.ok(cli.includes(`'${text}'`), 'the CLI reports the same text');
+  assert.ok(cli.includes("COMPACT_REJECTIONS['not-observed']"), 'the CLI reports the window text');
+  assert.ok(!cli.includes('has not seen this command'), 'the CLI holds no copy of the window text');
 });

@@ -198,7 +198,7 @@ test(
   },
 );
 
-test.each(['sessions', 'session', 'setups', 'compact-ready', 'compact-status'] as const)(
+test.each(['sessions', 'session', 'setups', 'compact-ready', 'compact-status', 'compact-cancel'] as const)(
   'a busy ready window answers %s reads after the discovery deadline',
   { tags: ['subprocess'] },
   async (method) => {
@@ -217,13 +217,19 @@ test.each(['sessions', 'session', 'setups', 'compact-ready', 'compact-status'] a
         ? { sessionId: 'known', turns: 1 }
         : method === 'compact-status'
           ? { requestId: channel.hostId + ':aaaaaaaa-1111-2222-3333-444444444444' }
-          : method === 'compact-ready'
+          : method === 'compact-cancel'
             ? {
-                ...compactPayload,
-                window: channel.hostId,
                 requestId: channel.hostId + ':aaaaaaaa-1111-2222-3333-444444444444',
+                window: channel.hostId,
+                self: true as const,
               }
-            : {};
+            : method === 'compact-ready'
+              ? {
+                  ...compactPayload,
+                  window: channel.hostId,
+                  requestId: channel.hostId + ':aaaaaaaa-1111-2222-3333-444444444444',
+                }
+              : {};
     const result = requestWindow(method, params, channel.hostId, home);
     const completed = result.then(
       (value) => ({ value }),

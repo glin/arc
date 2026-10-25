@@ -1,8 +1,8 @@
 {
   "cli/test/manage.test.ts": {
-    "reason": "CLI management must preserve classification, validation, and read delivery through a real authenticated window channel.",
-    "cases": 15,
-    "matricesSha256": "6ef3df980cf57dc7abf0fc39ac4a35e005dd7e7fff10940fa2b2cd066a9d90fa"
+    "reason": "CLI management must preserve classification, validation, read delivery, and compaction cancels through a real authenticated window channel.",
+    "cases": 17,
+    "matricesSha256": "4e022b5fee407c764a58ab1e0ef83ee0471bb3cd96b4e1e4b6704a098c122dd7"
   },
   "cli/test/run.test.ts": {
     "reason": "Standalone workers must retain real output, exit, cancellation, receipt ownership, and recovery across process boundaries.",
@@ -27,7 +27,7 @@
   "cli/test/smoke.test.mjs": {
     "reason": "Installed skill directories must preserve foreign files and ownership across executable command and filesystem boundaries. Bundled commands must update personal copies from every supported artifact layout.",
     "cases": 38,
-    "matricesSha256": "a54083ee57c02594e6b555edbd0002cf003d8b8f598cdb041a23470381c4af38"
+    "matricesSha256": "f27d5f4f83187d51b0252d809c9d2900d69f42ea9bbf52b28285d50fb121d1ce"
   },
   "cli/test/stream-fixtures.test.mjs": {
     "reason": "The audit executable must print stream mismatches and return a failing process status.",
@@ -177,7 +177,7 @@
   "extension/src/sessionrequests.test.ts": {
     "reason": "Native window channels must preserve authentication, activation identity, recovery, and write admission without replaying accepted writes.",
     "cases": 45,
-    "matricesSha256": "4d2ce89c34ac18ef9c052a93ef7bf4320ae6283148b1b6e7c3ef43f7d62b5a57"
+    "matricesSha256": "29a5d76b9d172b951888c1224f9e66d18594c7a46d9c33d275a5fc601cd888f1"
   },
   "extension/src/sessionwrites.test.ts": {
     "reason": "Authenticated window channels must preserve accepted reads, ordered writes, and ownership across native IPC.",

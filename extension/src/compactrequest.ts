@@ -62,12 +62,47 @@ export function validContinuationPath(file: string, platform = process.platform)
 // Why `compact-ready` holds no live call for a payload. Only `not-observed` can still change.
 export type CompactRejection = 'not-observed' | 'reader-acted' | 'request-used' | 'capacity' | 'withdrawn';
 export const COMPACT_REJECTIONS: Record<CompactRejection, string> = {
-  'not-observed': 'Arc has not seen this command run in the session yet. No compaction was queued.',
+  'not-observed':
+    'Arc has not seen this command run in the session yet. No compaction was queued. Run arc compact request as its own command, with no chain, pipe or substitution.',
   'reader-acted': 'The reader acted in this session after the command. No compaction was queued.',
   'request-used': 'This request ID was already used in this Arc window. No compaction was queued.',
   capacity: 'Too many compaction requests are active in this Arc window. No compaction was queued.',
   withdrawn: 'The session changed or closed before Arc could accept the request. No compaction was queued.',
 };
+// Why an admitted request stopped before Arc sent it. Each change that ends a request names itself.
+export type CompactLoss = 'reader' | 'scope' | 'authority' | 'replaced' | 'exited';
+export const COMPACT_LOSSES: Record<CompactLoss, string> = {
+  reader: 'The reader acted in this session before compaction started.',
+  scope: "The session left this window's scope before compaction started.",
+  authority: "The session's source, folder or setup changed before compaction started.",
+  replaced: 'The agent process was replaced before compaction started.',
+  exited: 'The agent process exited or moved to another session before compaction started.',
+};
+// Why `compact-cancel` cancelled nothing. Only `not-observed` can still change.
+export type CompactCancelRefusal = 'not-observed' | 'unknown' | 'other-session' | 'delivered';
+export const COMPACT_CANCEL_REFUSALS: Record<CompactCancelRefusal, string> = {
+  'not-observed':
+    'Arc has not seen this command run in a session yet. Nothing was cancelled. Run arc compact cancel as its own command, with no chain, pipe or substitution.',
+  unknown: 'This Arc window holds no compaction request with this ID. Nothing was cancelled.',
+  'other-session': 'Another session made this compaction request. Nothing was cancelled.',
+  delivered: 'Arc already sent this compaction to the agent. Nothing was cancelled.',
+};
+export const COMPACT_CANCELLED = 'The requesting agent cancelled this request before compaction started.';
+// The line Arc appends to reader text it delivers while the session holds a carried request.
+export function compactCarryLine(requestId: string): string {
+  return `Arc: compaction request ${requestId} runs after this turn. Run arc compact cancel to drop it.`;
+}
+// How a reader instruction treats an admitted request. A plain message or queued prompt carries it to the turn
+// that answers it, and a queue change keeps it. Stop, setting picks, compact, a slash command and answers cancel it.
+export function readerCarry(type: string, text?: string): 'send' | 'queue' | null {
+  if (type === 'sendPrompt') return text?.trimStart().startsWith('/') ? null : 'send';
+  return type === 'dequeue' || type === 'acceptQueuedEdit' ? 'queue' : null;
+}
+export interface CompactCancelPayload {
+  requestId: string;
+  window: string;
+  self: true;
+}
 export type CompactReadiness = { ready: true } | { ready: false; code: CompactRejection; reason: string };
 export type CompactState = 'queued' | 'started' | 'completed' | 'cancelled' | 'refused' | 'failed' | 'uncertain';
 export interface CompactBinding {
@@ -116,6 +151,8 @@ interface Assignment {
   persisted: boolean;
   possibleWrite?: boolean;
   retired?: boolean;
+  // Set while a reader message waits for the turn that answers it. Holds the host turns that message started or joined.
+  carry?: Set<string>;
 }
 interface Call {
   turnSucceeded: boolean;
@@ -150,6 +187,19 @@ export function validCompactPayload(input: unknown): input is CompactPayload {
   );
 }
 
+export function validCompactCancel(input: unknown): input is CompactCancelPayload {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return false;
+  const value = input as Record<string, unknown>;
+  return (
+    Object.keys(value).sort().join(',') === 'requestId,self,window' &&
+    value.self === true &&
+    typeof value.window === 'string' &&
+    /^[a-f0-9]{24}$/.test(value.window) &&
+    typeof value.requestId === 'string' &&
+    new RegExp('^' + value.window + ':[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$').test(value.requestId)
+  );
+}
+
 // Codex on Windows reports a shell command inside its own PowerShell wrapper. The executable is
 // quoted with an optional drive path, or bare. The path holds only letters, digits, spaces, backslashes
 // and `_.()-`, so it cannot carry a substitution, a quote or a command separator. `-NoProfile` is
@@ -174,6 +224,20 @@ export function compactCommandPayload(command: string): CompactCommand | null {
   const payload = { requestId: match[3], window: match[4], self: true as const, afterTurn: true as const };
   if (!validCompactPayload(payload) || (match[1] && !validContinuationPath(match[1]))) return null;
   return match[1] ? { ...payload, continuation: { sha256: match[2] } } : payload;
+}
+
+// The cancel command takes the same wrappers as the request command, and the same exact literal form.
+export function compactCancelPayload(command: string): CompactCancelPayload | null {
+  if (/[\r\n\u2028\u2029]/.test(command)) return null;
+  const wrapped = POWERSHELL_WRAPPER.exec(command) ?? POSIX_WRAPPER.exec(command);
+  const literal = wrapped ? (wrapped[1] ?? wrapped[2]) : command;
+  const match =
+    /^arc compact cancel --self --request-id ([a-f0-9]{24}:[a-f0-9-]{36}) --window ([a-f0-9]{24}) --json$/.exec(
+      literal,
+    );
+  if (!match) return null;
+  const payload = { requestId: match[1], window: match[2], self: true as const };
+  return validCompactCancel(payload) ? payload : null;
 }
 
 function sameBinding(a: CompactBinding, b: CompactBinding): boolean {
@@ -688,6 +752,7 @@ export class CompactRequests {
     keepCalls = false,
     code?: CompactRejection,
     retire = false,
+    keep: ReadonlySet<string> = new Set(),
   ): void {
     if (!keepCalls)
       for (const [key, call] of this.calls)
@@ -695,8 +760,8 @@ export class CompactRequests {
           this.calls.delete(key);
           this.rejectPayload(call.payload, code ?? 'withdrawn');
         }
-    for (const assignment of this.assignments.values()) {
-      if (!predicate(assignment.binding)) continue;
+    for (const [id, assignment] of this.assignments) {
+      if (keep.has(id) || !predicate(assignment.binding)) continue;
       const previous = assignment.observation;
       if (retire && assignment.submitted) assignment.retired = true;
       if (retire && assignment.submitted && ['started', 'uncertain'].includes(assignment.observation.state)) {
@@ -712,6 +777,88 @@ export class CompactRequests {
       else if (assignment.persisted && assignment.observation !== previous)
         void this.persist(assignment).catch(() => {});
     }
+  }
+
+  // Lists the unsubmitted queued assignments of a session. A reader message carries each one.
+  carriable(sessionId: string): { id: string; binding: Readonly<CompactBinding>; carry: Set<string> | null }[] {
+    return [...this.assignments]
+      .filter(([, a]) => a.binding.sessionId === sessionId && !a.submitted && a.observation.state === 'queued')
+      .map(([id, a]) => ({ id, binding: a.binding, carry: a.carry ?? null }));
+  }
+
+  // Holds an assignment until Arc observes the turn that answers the reader message.
+  hold(id: string): void {
+    const assignment = this.assignments.get(id);
+    if (assignment) assignment.carry ??= new Set();
+  }
+
+  // Records a host turn that a held reader message started or joined.
+  noteTurn(sessionId: string, turn: string): void {
+    for (const assignment of this.assignments.values())
+      if (assignment.binding.sessionId === sessionId && assignment.carry) assignment.carry.add(turn);
+  }
+
+  // Moves an unsubmitted assignment to a new binding and ends its hold. A new turn must succeed and save its own response.
+  rebind(id: string, binding: Readonly<CompactBinding>): void {
+    const assignment = this.assignments.get(id);
+    if (!assignment || assignment.submitted || assignment.observation.state !== 'queued') return;
+    if (assignment.binding.turn !== binding.turn || assignment.binding.submissionId !== binding.submissionId) {
+      assignment.turnSucceeded = false;
+      assignment.finalRetained = false;
+    }
+    assignment.binding = Object.freeze({ ...binding });
+    assignment.carry = undefined;
+    assignment.observation = {
+      ...assignment.observation,
+      turn: binding.turn,
+      submissionId: binding.submissionId,
+      readerRevision: binding.readerRevision,
+    };
+    if (assignment.persisted && assignment.observation.continuation) void this.persist(assignment).catch(() => {});
+  }
+
+  // Names the newest held request of a session, for the line Arc appends to the reader text it delivers.
+  carried(sessionId: string): string | null {
+    let held: Assignment | null = null;
+    for (const assignment of this.assignments.values())
+      if (
+        assignment.binding.sessionId === sessionId &&
+        assignment.carry &&
+        !assignment.submitted &&
+        assignment.observation.state === 'queued' &&
+        (!held || assignment.admittedAt >= held.admittedAt)
+      )
+        held = assignment;
+    return held?.payload.requestId ?? null;
+  }
+
+  // Cancels an unsubmitted request for the session that made it. Callers are the sessions whose live
+  // tool calls run the exact cancel command for this request ID.
+  cancel(
+    requestId: string,
+    callers: readonly { provider: 'claude' | 'codex'; sessionId: string }[],
+  ): CompactObservation | { requestId: string; state: 'refused'; code: CompactCancelRefusal; reason: string } {
+    const refuse = (code: CompactCancelRefusal) => ({
+      requestId,
+      state: 'refused' as const,
+      code,
+      reason: COMPACT_CANCEL_REFUSALS[code],
+    });
+    if (!callers.length) return refuse('not-observed');
+    this.prune();
+    const assignment = this.assignments.get(requestId);
+    if (!assignment) return refuse('unknown');
+    if (
+      !callers.some(
+        (caller) =>
+          caller.provider === assignment.binding.provider && caller.sessionId === assignment.binding.sessionId,
+      )
+    )
+      return refuse('other-session');
+    if (assignment.submitted) return refuse('delivered');
+    // A delivery that waits on the activity lease rechecks the state at its write boundary and writes nothing.
+    if (assignment.observation.state === 'queued') this.change(assignment, 'cancelled', COMPACT_CANCELLED);
+    return structuredClone(assignment.observation);
   }
 
   dispose(): void {
@@ -957,7 +1104,8 @@ interface Submission {
 const SUBMISSIONS_PER_CHILD = 32;
 
 // Joins host observations to deferred assignments for one window activation.
-// The reader revision advances synchronously at each reader action and cancels unsubmitted work.
+// The reader revision advances synchronously at each reader action. A reader message carries unsubmitted work
+// to the turn that answers it, and every other reader action cancels it.
 export class CompactHost<C extends CompactChild> {
   readonly requests: CompactRequests;
   private readonly revisions = new Map<string, number>();
@@ -972,6 +1120,11 @@ export class CompactHost<C extends CompactChild> {
     Pick<CompactBinding, 'childGeneration' | 'readerRevision' | 'authority' | 'sourceIdentity'>
   >();
   private generation = 0;
+  // Live cancel command calls, keyed by child, session and tool call, with the child that runs each one.
+  private readonly cancels = new Map<
+    string,
+    { requestId: string; provider: 'claude' | 'codex'; sessionId: string; child: C }
+  >();
   // True from a scope change until the panel's session rows reflect the new scope.
   private settling = false;
   private disposed = false;
@@ -987,14 +1140,39 @@ export class CompactHost<C extends CompactChild> {
 
   // An answer can approve the requesting command inside its own turn, so it keeps the reader
   // revision and live calls. It still cancels admitted work that has not been submitted.
-  readerAction(sessionId: string, answer = false): void {
+  // A reader message holds admitted work until its answering turn rebinds it. A queue change keeps
+  // the work on its turn under the new revision. Live request calls lose their authority either way.
+  readerAction(sessionId: string, answer = false, carry: 'send' | 'queue' | null = null): void {
     if (!answer) this.revisions.set(sessionId, this.revision(sessionId) + 1);
+    const kept = new Set<string>();
+    if (carry && !answer)
+      for (const held of this.requests.carriable(sessionId)) {
+        kept.add(held.id);
+        if (carry === 'send') this.requests.hold(held.id);
+        else if (!held.carry) this.rebind(held.id, held.binding, { readerRevision: this.revision(sessionId) });
+      }
     this.requests.invalidate(
       (binding) => binding.sessionId === sessionId,
-      'The reader acted in this session before compaction started.',
+      COMPACT_LOSSES.reader,
       answer,
       'reader-acted',
+      false,
+      kept,
     );
+  }
+
+  // A reader message that never reached the agent leaves held work on its own turn under the new revision.
+  unsent(child: C): void {
+    const sessionId = child.state().sessionId;
+    if (!sessionId || this.disposed) return;
+    for (const held of this.requests.carriable(sessionId))
+      if (held.carry) this.rebind(held.id, held.binding, { readerRevision: this.revision(sessionId) });
+  }
+
+  // Names the request Arc reports in reader text delivered to the session, while one is held.
+  carriedLine(sessionId: string): string | null {
+    const id = this.disposed ? null : this.requests.carried(sessionId);
+    return id ? compactCarryLine(id) : null;
   }
 
   archived(sessionIds: ReadonlySet<string>): void {
@@ -1008,10 +1186,7 @@ export class CompactHost<C extends CompactChild> {
   // Delivery still waits until the session rows reflect the scope.
   scopeChanged(outOfScope: ReadonlySet<string> = new Set()): void {
     this.settling = true;
-    this.requests.invalidate(
-      (binding) => outOfScope.has(binding.sessionId),
-      "The session left this window's scope before compaction started.",
-    );
+    this.requests.invalidate((binding) => outOfScope.has(binding.sessionId), COMPACT_LOSSES.scope);
   }
 
   // Runs after each full rows refresh. A session that left the panel's scope cancels its unsubmitted
@@ -1019,10 +1194,7 @@ export class CompactHost<C extends CompactChild> {
   sessionsRefreshed(): void {
     if (this.disposed) return;
     this.settling = false;
-    this.requests.invalidate(
-      (binding) => this.port.readerWork(binding.sessionId) === 'absent',
-      "The session left this window's scope before compaction started.",
-    );
+    this.requests.invalidate((binding) => this.port.readerWork(binding.sessionId) === 'absent', COMPACT_LOSSES.scope);
     for (const sessionId of this.requests.waitingSessions()) void this.drain(sessionId);
   }
 
@@ -1030,7 +1202,7 @@ export class CompactHost<C extends CompactChild> {
   submitted(
     child: C,
     turnId: number,
-    _origin: 'reader' | 'followup' | 'continuation' = 'reader',
+    origin: 'reader' | 'followup' | 'continuation' = 'reader',
     _operationId?: string,
   ): void {
     if (this.disposed) return;
@@ -1039,6 +1211,8 @@ export class CompactHost<C extends CompactChild> {
     book.set(turnId, { sessionId: child.state().sessionId });
     if (book.size > SUBMISSIONS_PER_CHILD) book.delete(book.keys().next().value!);
     this.generationOf(child);
+    const sessionId = child.state().sessionId;
+    if (origin === 'reader' && sessionId) this.requests.noteTurn(sessionId, String(turnId));
   }
 
   // Joined reader input uses the same live response owner.
@@ -1046,6 +1220,8 @@ export class CompactHost<C extends CompactChild> {
     const submission = this.submissions.get(child)?.get(turnId);
     const owner = child.readerTurnOwner?.(turnId);
     if (submission && owner !== undefined) this.submissions.get(child)!.set(owner, submission);
+    const sessionId = child.state().sessionId;
+    if (owner !== undefined && sessionId && !this.disposed) this.requests.noteTurn(sessionId, String(owner));
   }
 
   // Freezes command context at arrival, before an early native turn has a response owner.
@@ -1071,6 +1247,8 @@ export class CompactHost<C extends CompactChild> {
       return;
     }
     if (event.kind === 'wake' || event.kind === 'launch' || event.kind === 'background') return;
+    if (event.kind === 'toolStart' || event.kind === 'toolEnd') this.observeCancel(child, event);
+    if (turnId !== undefined) this.carryTo(child, event, turnId);
     const binding = this.binding(child, event, turnId);
     if (event.kind === 'toolStart' && (!binding || !event.initiating)) this.requests.reject(event.command, 'withdrawn');
     if (!binding || turnId === undefined) return;
@@ -1089,6 +1267,72 @@ export class CompactHost<C extends CompactChild> {
     // Only a response saved after the last tool settled counts as the final response.
     replies.delete(turnId);
     this.requests.observe(binding, event);
+  }
+
+  // Rebinds held work to the first event of the turn that answers its reader message. That turn is a host
+  // turn the message started or joined, or the held turn under a newer Claude prompt generation.
+  private carryTo(child: C, event: NativeEvent, turnId: number): void {
+    if (event.kind !== 'toolStart' && event.kind !== 'toolEnd' && event.kind !== 'rootEnd') return;
+    const generation = this.generations.get(child);
+    const turn =
+      child.agent === 'claude' ? (event.generation === null ? null : String(event.generation)) : event.turnId;
+    const state = child.state();
+    if (generation === undefined || !turn || state.exited || state.sessionId !== event.sessionId) return;
+    const submission = String(turnId);
+    for (const held of this.requests.carriable(event.sessionId)) {
+      const binding = held.binding;
+      if (
+        !held.carry ||
+        binding.childGeneration !== generation ||
+        binding.provider !== event.provider ||
+        (binding.turn === turn && binding.submissionId === submission) ||
+        (!held.carry.has(submission) && binding.submissionId !== submission)
+      )
+        continue;
+      this.rebind(held.id, binding, { turn, submissionId: submission, readerRevision: this.revision(event.sessionId) });
+    }
+  }
+
+  // Moves held work and the child's turn book to a changed binding, so later events of that turn find it.
+  private rebind(id: string, binding: Readonly<CompactBinding>, change: Partial<CompactBinding>): void {
+    const next: CompactBinding = { ...binding, ...change };
+    if (binding.assignmentId) next.assignmentId = `${next.childGeneration}:${next.turn}:${next.submissionId}`;
+    for (const child of this.children.values()) {
+      if (this.generations.get(child) !== binding.childGeneration) continue;
+      const book = this.bindings.get(child) ?? new Map<string, CompactBinding>();
+      this.bindings.set(child, book);
+      for (const [key, known] of book) if (sameBinding(known, binding)) book.set(key, { ...next });
+      book.set(`${next.submissionId}:${next.turn}`, { ...next });
+    }
+    this.requests.rebind(id, next);
+  }
+
+  // Holds each live root tool call that runs the exact cancel command, with the session that runs it.
+  private observeCancel(child: C, event: NativeEvent & { kind: 'toolStart' | 'toolEnd' }): void {
+    const key = `${child.key}\0${event.provider}\0${event.sessionId}\0${event.toolId}`;
+    if (event.kind === 'toolEnd') {
+      this.cancels.delete(key);
+      return;
+    }
+    const payload = compactCancelPayload(event.command);
+    const state = child.state();
+    if (
+      !payload ||
+      !event.initiating ||
+      payload.window !== this.activation ||
+      child.agent !== event.provider ||
+      state.exited ||
+      state.sessionId !== event.sessionId
+    )
+      return;
+    this.cancels.delete(key);
+    this.cancels.set(key, {
+      requestId: payload.requestId,
+      provider: event.provider,
+      sessionId: event.sessionId,
+      child,
+    });
+    if (this.cancels.size > COMPACT_LIMITS.records) this.cancels.delete(this.cancels.keys().next().value!);
   }
 
   replyRetained(child: C, turnId: number): void {
@@ -1130,6 +1374,8 @@ export class CompactHost<C extends CompactChild> {
 
   childGone(key: string): void {
     const child = this.children.get(key);
+    for (const [id, call] of this.cancels)
+      if (call.child.key === key && (!child || call.child === child)) this.cancels.delete(id);
     if (!child) return;
     this.children.delete(key);
     const generation = this.generations.get(child);
@@ -1143,6 +1389,7 @@ export class CompactHost<C extends CompactChild> {
   }
 
   sessionMoved(previous: string): void {
+    for (const [id, call] of this.cancels) if (call.sessionId === previous) this.cancels.delete(id);
     this.requests.invalidate(
       (binding) => binding.sessionId === previous,
       'The session changed before compaction started.',
@@ -1152,12 +1399,12 @@ export class CompactHost<C extends CompactChild> {
   async drain(sessionId: string): Promise<void> {
     if (this.settling) return;
     for (const { id, binding } of this.requests.deliverable(sessionId)) {
-      const child = this.current(binding);
-      if (!child) {
-        this.requests.invalidate(
-          (current) => current.childGeneration === binding.childGeneration && current.sessionId === binding.sessionId,
-          'The session or its agent process changed before compaction started.',
-        );
+      const child = this.resolve(binding);
+      // A newer reader revision means a carried request waits for the turn that answers the reader's message.
+      // Every other reader action already cancelled it.
+      if (child === 'reader') continue;
+      if (typeof child === 'string') {
+        this.requests.invalidate((current) => current === binding, COMPACT_LOSSES[child]);
         continue;
       }
       if (!this.eligible(binding, 'deliver')) continue;
@@ -1231,6 +1478,27 @@ export class CompactHost<C extends CompactChild> {
         state: 'unavailable',
       };
     }
+    if (request.method === 'compact-cancel') {
+      if (!validCompactCancel(params) || params.window !== this.activation)
+        return {
+          requestId: params.requestId,
+          state: 'refused',
+          code: 'unknown',
+          reason: COMPACT_CANCEL_REFUSALS.unknown,
+        };
+      return this.requests.cancel(
+        params.requestId,
+        [...this.cancels.values()].filter((call) => {
+          if (call.requestId !== params.requestId) return false;
+          const state = call.child.state();
+          return (
+            this.port.find(call.provider, call.sessionId) === call.child &&
+            !state.exited &&
+            state.sessionId === call.sessionId
+          );
+        }),
+      );
+    }
     if (request.method === 'compact-ready')
       return validCompactPayload(params)
         ? this.requests.readiness(params)
@@ -1258,6 +1526,7 @@ export class CompactHost<C extends CompactChild> {
 
   dispose(): void {
     this.disposed = true;
+    this.cancels.clear();
     this.requests.dispose();
     this.persistence?.release();
   }
@@ -1334,14 +1603,22 @@ export class CompactHost<C extends CompactChild> {
 
   // Resolves the exact retained child while the binding can still become deliverable.
   private current(binding: Readonly<CompactBinding>): C | null {
-    if (this.disposed || this.revision(binding.sessionId) !== binding.readerRevision) return null;
-    if (this.port.readerWork(binding.sessionId) === 'absent') return null;
+    const resolved = this.resolve(binding);
+    return typeof resolved === 'string' ? null : resolved;
+  }
+
+  // Resolves the exact retained child, or names the first change that ended the binding.
+  private resolve(binding: Readonly<CompactBinding>): C | CompactLoss {
+    if (this.disposed) return 'exited';
+    if (this.revision(binding.sessionId) !== binding.readerRevision) return 'reader';
+    if (this.port.readerWork(binding.sessionId) === 'absent') return 'scope';
     const authority = this.port.authority?.(binding.provider, binding.sessionId);
-    if (binding.authority && authority && authority !== binding.authority) return null;
+    if (binding.authority && authority && authority !== binding.authority) return 'authority';
     const child = this.port.find(binding.provider, binding.sessionId);
-    if (!child || this.generations.get(child) !== binding.childGeneration) return null;
+    if (!child) return 'exited';
+    if (this.generations.get(child) !== binding.childGeneration) return 'replaced';
     const state = child.state();
-    return state.exited || state.sessionId !== binding.sessionId ? null : child;
+    return state.exited || state.sessionId !== binding.sessionId ? 'exited' : child;
   }
 }
 
@@ -1372,7 +1649,21 @@ export function promptAsReader<C extends CompactChild>(
       onSubmitted?.(turnId);
     },
     (turnId) => compaction?.read(child, turnId),
-  );
+  ).catch((error: unknown) => {
+    compaction?.unsent(child);
+    throw error;
+  });
+}
+
+// Returns the prompt the agent receives. While the session holds a carried request, its text ends with Arc's line.
+// The reader's draft and queue keep the original prompt.
+export function readerPrompt<P extends { text: string }>(
+  compaction: { carriedLine(sessionId: string): string | null } | null | undefined,
+  sessionId: string,
+  prompt: P,
+): P {
+  const line = compaction?.carriedLine(sessionId);
+  return line ? { ...prompt, text: prompt.text ? `${prompt.text}\n\n${line}` : line } : prompt;
 }
 
 // Routes the child events that self-compaction reads. Returns true when the event needs no other

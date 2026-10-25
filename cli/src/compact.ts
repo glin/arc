@@ -1,15 +1,39 @@
 import { requestWindow } from '../../extension/src/sessionrequests.ts';
-import { validCompactPayload } from '../../extension/src/compactrequest.ts';
+import {
+  COMPACT_CANCEL_REFUSALS,
+  COMPACT_REJECTIONS,
+  validCompactCancel,
+  validCompactPayload,
+} from '../../extension/src/compactrequest.ts';
 import { readContinuationFile } from './manage.ts';
 
 // Readiness spreads its reads across this window, so a tool start that reaches the host late can still be admitted.
 const READINESS = { attempts: 4, intervalMs: 500, deadlineMs: 2_000 } as const;
 
+// Repeats a window read until `done` accepts an answer or the readiness window ends. Returns the last
+// answer, or null when no read started before the deadline.
+async function untilObserved<T>(read: () => Promise<T>, done: (answer: T) => boolean): Promise<T | null> {
+  let last: T | null = null;
+  const deadline = Date.now() + READINESS.deadlineMs;
+  for (let attempt = 0; attempt < READINESS.attempts && Date.now() < deadline; attempt++) {
+    if (attempt > 0) await new Promise((resolve) => setTimeout(resolve, READINESS.intervalMs));
+    if (Date.now() >= deadline) break;
+    last = await read();
+    if (done(last)) break;
+  }
+  return last;
+}
+
 export async function runCompact(args: string[]): Promise<string> {
   const command = args[0];
-  if (command !== 'request' && command !== 'status') throw new Error('Use compact request or compact status.');
+  if (command !== 'request' && command !== 'status' && command !== 'cancel')
+    throw new Error('Use compact request, compact status or compact cancel.');
   const values = new Map<string, string>();
   const flags = new Set<string>();
+  const allowed = [
+    '--json',
+    ...(command === 'request' ? ['--self', '--after-turn'] : command === 'cancel' ? ['--self'] : []),
+  ];
   for (let index = 1; index < args.length; index++) {
     const arg = args[index];
     if (
@@ -20,11 +44,7 @@ export async function runCompact(args: string[]): Promise<string> {
       const value = args[++index];
       if (!value || value.startsWith('-') || values.has(arg)) throw new Error(`Invalid or repeated argument: ${arg}`);
       values.set(arg, value);
-    } else if (
-      ['--json', ...(command === 'request' ? ['--self', '--after-turn'] : [])].includes(arg) &&
-      !flags.has(arg)
-    )
-      flags.add(arg);
+    } else if (allowed.includes(arg) && !flags.has(arg)) flags.add(arg);
     else throw new Error(`Unknown or repeated argument: ${arg}`);
   }
   const payload = {
@@ -41,16 +61,18 @@ export async function runCompact(args: string[]): Promise<string> {
         }
       : {}),
   };
+  const cancel = { requestId: payload.requestId, window: payload.window, self: true as const };
   if (
     !(command === 'status'
       ? /^[a-f0-9]{24}$/.test(payload.window) &&
         /^[a-f0-9]{24}:[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(payload.requestId)
-      : validCompactPayload(payload)) ||
-    !flags.has('--json') ||
-    (command === 'request' && (!flags.has('--self') || !flags.has('--after-turn')))
+      : command === 'cancel'
+        ? validCompactCancel(cancel)
+        : validCompactPayload(payload)) ||
+    allowed.some((flag) => !flags.has(flag))
   )
     throw new Error(
-      'Supply --request-id WINDOW:UUID, --window WINDOW and --json. Request also requires --self --after-turn.',
+      'Supply --request-id WINDOW:UUID, --window WINDOW and --json. Request also requires --self --after-turn. Cancel also requires --self.',
     );
   // Local outcomes use the window's `state` field, so an agent reads one field for every outcome.
   const result = (state: string, reason: string) =>
@@ -62,27 +84,34 @@ export async function runCompact(args: string[]): Promise<string> {
       return result('unavailable', error instanceof Error ? error.message : 'The Arc window is unavailable.');
     }
   }
-  try {
-    let ready = false;
-    let reason = 'Arc has not seen this command run in the session yet. No compaction was queued.';
-    const deadline = Date.now() + READINESS.deadlineMs;
-    for (let attempt = 0; attempt < READINESS.attempts && Date.now() < deadline; attempt++) {
-      if (attempt > 0) await new Promise((resolve) => setTimeout(resolve, READINESS.intervalMs));
-      if (Date.now() >= deadline) break;
-      const observation = (await requestWindow('compact-ready', payload, payload.window)) as {
-        ready?: boolean;
-        code?: string;
-        reason?: string;
-      };
-      if (observation.ready === true) {
-        ready = true;
-        break;
-      }
-      if (typeof observation.reason === 'string' && observation.reason) reason = observation.reason;
-      // Only a command the window has not seen yet can still become ready.
-      if (observation.code !== undefined && observation.code !== 'not-observed') break;
+  if (command === 'cancel') {
+    try {
+      const answer = await untilObserved(
+        async () => (await requestWindow('compact-cancel', cancel, payload.window)) as { code?: string },
+        // Only a command the window has not seen yet can still change.
+        (answer) => answer.code !== 'not-observed',
+      );
+      return answer ? JSON.stringify(answer) : result('refused', COMPACT_CANCEL_REFUSALS['not-observed']);
+    } catch (error) {
+      return result('unavailable', error instanceof Error ? error.message : 'The Arc window is unavailable.');
     }
-    if (!ready) return result('refused', reason);
+  }
+  try {
+    let reason = COMPACT_REJECTIONS['not-observed'];
+    const observation = await untilObserved(
+      async () => {
+        const answer = (await requestWindow('compact-ready', payload, payload.window)) as {
+          ready?: boolean;
+          code?: string;
+          reason?: string;
+        };
+        if (typeof answer.reason === 'string' && answer.reason) reason = answer.reason;
+        return answer;
+      },
+      // Only a command the window has not seen yet can still become ready.
+      (answer) => answer.ready === true || (answer.code !== undefined && answer.code !== 'not-observed'),
+    );
+    if (observation?.ready !== true) return result('refused', reason);
   } catch (error) {
     return result('refused', error instanceof Error ? error.message : 'The Arc window is unavailable.');
   }

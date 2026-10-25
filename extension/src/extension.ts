@@ -112,7 +112,7 @@ import { comparableFolder, ConfigWatches, defaultsKey, defaultsKeyParts } from '
 import { WindowChannel } from './sessionrequests';
 import { terminalOwnership, localTerminalPlacement } from './terminalownership';
 import { reportWindowTransport, windowTransportErrorCode, type WindowTransportSink } from './windowpipe';
-import { CompactHost, promptAsReader, routeCompactionEvent } from './compactrequest';
+import { CompactHost, promptAsReader, readerPrompt, routeCompactionEvent } from './compactrequest';
 import { CompactStore } from './compactstore';
 import {
   GuardedSends,
@@ -696,7 +696,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         : undefined,
     );
     compaction = owner;
-    panel.onReaderAction = (session, answer) => owner.readerAction(session, answer);
+    panel.onReaderAction = (session, answer, carry) => owner.readerAction(session, answer, carry);
     panel.onScopeChange = (outOfScope) => owner.scopeChanged(outOfScope);
     panel.onSessionRowsRefreshed = () => owner.sessionsRefreshed();
     channel.setCompactRequestHandler((request) => owner.handle(request));
@@ -1747,7 +1747,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         return await promptAsReader(
           compaction,
           session,
-          (submitted, received) => session.prompt(prompt, submitted, recoveryPrompts.get(prompt), received),
+          (submitted, received) =>
+            session.prompt(
+              readerPrompt(compaction, sessionId, prompt),
+              submitted,
+              recoveryPrompts.get(prompt),
+              received,
+            ),
           (turnId) => onSubmitted?.(session.state().sessionId ?? sessionId, turnId),
         );
       });
