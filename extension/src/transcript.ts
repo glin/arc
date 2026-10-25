@@ -221,6 +221,8 @@ export interface TurnCommit {
   source?: CommitSource;
   sha: string;
   printedSha?: string;
+  // The full hash a `commit <sha>` line in the same tool output printed, when the header printed only a prefix of it.
+  fullSha?: string;
   // Awaiting is set while the host waits for the evidence reply of a changed revision. The commit keeps its group until the reply arrives.
   candidates?: { dirs: string[]; complete: boolean; awaiting?: boolean };
   repositoryEvidence?: { dirs: string[]; at: number; turnId: string; complete: boolean };
@@ -7236,6 +7238,9 @@ const STAT_LINE = /^(\d+) files? changed(?:, (\d+) insertions?\(\+\))?(?:, (\d+)
 // `Date:` line in between, so three leaves room without reaching the next commit.
 const STAT_LOOKAHEAD = 3;
 
+// The header `git show` and `git log` print for each commit, with any ref decoration after the hash.
+const FULL_COMMIT_LINE = /^commit ([0-9a-fA-F]{40})(?:\s|$)/;
+
 // The figures under a commit line, and the same figures under `git log --shortstat`. One
 // reader for both, because they are the same line written by the same program.
 export function parseStatLine(line: string): { files: number; added: number; removed: number } | null {
@@ -7289,9 +7294,11 @@ export function recordCommits(
       place = commitPlaceOf(ran, folders);
     }
     const sha = m[2].slice(0, 8);
+    const full = fullShaOf(lines, m[2]);
     const duplicate = turn.commits.find((c) => sameCommitSha(c.printedSha ?? c.sha, m[2]));
     if (duplicate) {
       if (m[2].length > (duplicate.printedSha ?? duplicate.sha).length) duplicate.printedSha = m[2];
+      if (full && !duplicate.fullSha) duplicate.fullSha = full;
       if (candidates) {
         const dirs = [...new Set([...(duplicate.candidates?.dirs ?? []), ...candidates.dirs])];
         duplicate.candidates = {
@@ -7317,6 +7324,7 @@ export function recordCommits(
     turn.commits.push({
       sha,
       ...(m[2].length > 8 ? { printedSha: m[2] } : {}),
+      ...(full ? { fullSha: full } : {}),
       ...(candidates ? { candidates } : {}),
       subject: m[3].trim(),
       head: m[1] === 'detached HEAD' ? { kind: 'detached' } : m[1] ? { kind: 'branch', name: m[1] } : null,
@@ -7330,6 +7338,18 @@ export function recordCommits(
   }
   recordCommitIntent(turn, ran, dir, printed, window, at, stdout);
   recordLandingIntent(turn, ran, mergeDirOf(ran, folders), window, at);
+}
+
+// The one full hash that `commit <sha>` lines in the same output print for a shorter header hash. Null for a full header hash, no match, or several matches.
+function fullShaOf(lines: readonly string[], printed: string): string | null {
+  if (printed.length >= 40) return null;
+  const prefix = printed.toLowerCase();
+  const found = new Set<string>();
+  for (const line of lines) {
+    const m = FULL_COMMIT_LINE.exec(line.trim());
+    if (m && m[1].toLowerCase().startsWith(prefix)) found.add(m[1].toLowerCase());
+  }
+  return found.size === 1 ? [...found][0] : null;
 }
 
 // Records quiet-commit recovery only with a successful window and one resolved repository.

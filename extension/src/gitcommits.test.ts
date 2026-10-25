@@ -40,6 +40,7 @@ import {
   subjectArgs,
   mergedBranchOf,
   pointsAtArgs,
+  sameRepositoryRoot,
 } from './gitcommits.ts';
 import { candidateGitRunner as candidateRunner, turn } from './turnfixtures.ts';
 import { commitCard, commitRowsOf, landingCard } from './turncard.ts';
@@ -2876,4 +2877,146 @@ test('retained candidate rows clear navigation when current evidence has no exac
       assert.deepEqual(navigation(one), navigation(fresh), `${state} retained and fresh`);
     }
   }
+});
+
+test('a removed commit directory opens in its containing repository only when that repository holds exactly one commit for the hash', async () => {
+  const full = 'bc0f4d30127f4f5f5b04db0a128bc1d5654fbb8c';
+  const root = tempDir('arc-navigable-');
+  const notes = join(root, 'notes');
+  const clone = join(root, 'clone');
+  const live = join(root, 'live');
+  for (const dir of [notes, clone, live]) mkdirSync(dir);
+  const removed = join(notes, 'worktrees', 'finished');
+  const plain = join(root, 'plain', 'gone');
+  mkdirSync(join(root, 'plain'));
+  const reads: string[] = [];
+  let matches: Record<string, { sha: string } | null> = {
+    [normalizeFsPath(notes)]: { sha: full },
+    [normalizeFsPath(clone)]: { sha: full },
+  };
+  let collision = false;
+  const base = (): GitRunner => candidateRunner(matches, reads);
+  const commits = reader(
+    {
+      run: (dir, args) =>
+        collision && args[1]?.startsWith('--disambiguate=')
+          ? Promise.resolve(`${full}\n${full.slice(0, 8)}${'0'.repeat(32)}\n`)
+          : base().run(dir, args),
+    },
+    () => {},
+  );
+  // The nearest existing ancestor resolves to the containing repository, and a short hash returns its full identity.
+  assert.deepEqual(await commits.navigable(removed, full.slice(0, 8)), { dir: notes, sha: full });
+  assert.deepEqual(await commits.navigable(removed, full), { dir: notes, sha: full });
+  // A short hash that names more than one object opens nothing.
+  collision = true;
+  assert.equal(await commits.navigable(removed, full.slice(0, 8)), null);
+  collision = false;
+  // A containing repository without the commit opens nothing.
+  matches = { [normalizeFsPath(notes)]: { sha: 'e'.repeat(40) }, [normalizeFsPath(clone)]: { sha: full } };
+  assert.equal(await commits.navigable(removed, full.slice(0, 8)), null);
+  // An ancestor outside any repository opens nothing, and the clone that holds the commit is never asked.
+  reads.length = 0;
+  assert.equal(await commits.navigable(plain, full.slice(0, 8)), null);
+  assert.ok(
+    reads.every((read) => !read.startsWith(normalizeFsPath(clone))),
+    reads.join('\n'),
+  );
+  // An existing directory waits for this reader's identity read, and an exhausted read opens nothing.
+  matches = { [normalizeFsPath(live)]: { sha: full } };
+  const printed: TurnCommit = {
+    sha: full.slice(0, 8),
+    subject: 's',
+    head: null,
+    files: null,
+    added: null,
+    removed: null,
+    at: 1,
+    place: null,
+    dir: live,
+  };
+  const one = turn({ commits: [printed] });
+  assert.equal(await commits.navigable(live, full.slice(0, 8)), null);
+  commits.apply([one], []);
+  await settle();
+  assert.deepEqual(await commits.navigable(live, full.slice(0, 8)), { dir: live, sha: full.slice(0, 8) });
+  const silent = reader(candidateRunner({}), () => {});
+  for (let i = 0; i < 4; i++) {
+    silent.apply([one], []);
+    await settle();
+  }
+  assert.equal(await silent.navigable(live, full.slice(0, 8)), null);
+  assert.equal(printed.dir, live);
+});
+
+test('a registered repository root matches the verified folder exactly, with each platform case rule', () => {
+  const unread = (): string => {
+    throw new Error('ENOENT');
+  };
+  for (const [platform, registered, verified, same] of [
+    ['win32', 'C:\\Users\\Dev\\Repo', 'c:/users/dev/repo', true],
+    ['darwin', 'C:\\Users\\Dev\\Repo', 'c:/users/dev/repo', true],
+    ['linux', 'C:\\Users\\Dev\\Repo', 'c:/users/dev/repo', true],
+    ['win32', '/Users/Dev/Repo', '/users/dev/repo', true],
+    ['darwin', '/Users/Dev/Repo', '/users/dev/repo', false],
+    ['linux', '/Users/Dev/Repo', '/users/dev/repo', false],
+    ['linux', '/Users/Dev/Repo/', '/Users/Dev/Repo', true],
+    ['linux', '/', '/', true],
+    ['win32', 'C:\\Users\\Dev', 'C:/Users/Dev/Repo', false],
+    ['darwin', '/Users/Dev', '/Users/Dev/Repo', false],
+    ['linux', '/Users/Dev', '/Users/Dev/Repo', false],
+  ] as const)
+    assert.equal(
+      sameRepositoryRoot(registered, verified, platform, unread),
+      same,
+      `${platform} ${registered} ${verified}`,
+    );
+});
+
+test('a registered repository root matches by physical directory, and distinct directories that differ only in case refuse', () => {
+  const physical: Record<string, string> = {
+    '/Repos/Notes': '/Repos/Notes',
+    '/Repos/notes': '/Repos/notes',
+    '/Links/Notes': '/Repos/Notes',
+    '/Links/Repos': '/Repos',
+    'C:/Links/Notes': 'C:/Repos/Notes',
+    'C:/Repos/Notes': 'C:/Repos/Notes',
+    'c:/repos/notes': 'c:/repos/notes',
+  };
+  const realpath = (target: string): string => {
+    if (!(target in physical)) throw new Error('ENOENT');
+    return physical[target];
+  };
+  for (const [platform, registered, verified, same] of [
+    ['darwin', '/Repos/Notes', '/Repos/notes', false],
+    ['linux', '/Repos/Notes', '/Repos/notes', false],
+    ['darwin', '/Links/Notes', '/Repos/Notes', true],
+    ['linux', '/Links/Notes', '/Repos/Notes', true],
+    ['darwin', '/Links/Repos', '/Repos/Notes', false],
+    ['win32', 'C:/Links/Notes', 'c:/repos/notes', true],
+    ['win32', 'C:/Links/Notes', 'C:/Repos/Notes', true],
+    ['win32', 'c:/links/notes', 'C:/Repos/Notes', false],
+  ] as const)
+    assert.equal(
+      sameRepositoryRoot(registered, verified, platform, realpath),
+      same,
+      `${platform} ${registered} ${verified}`,
+    );
+});
+
+test('a short commit header takes the one full hash a commit line in the same output prints for it', () => {
+  const full = 'bc0f4d30127f4f5f5b04db0a128bc1d5654fbb8c';
+  const header = `[review/x ${full.slice(0, 8)}] subject\n 1 file changed, 1 insertion(+)\n`;
+  const recorded = (stdout: string) => {
+    const one = turn({ commits: [] });
+    recordCommits(one, stdout, 1, 'unreadable', [], 'C:/repo');
+    return one.commits;
+  };
+  assert.equal(recorded(`${header}commit ${full} (HEAD -> review/x)\nAuthor: Dev\n`)[0].fullSha, full);
+  assert.equal(recorded(`${header}commit ${'c'.repeat(40)}\n`)[0].fullSha, undefined);
+  assert.equal(
+    recorded(`${header}commit ${full}\ncommit ${full.slice(0, 8)}${'0'.repeat(32)}\n`)[0].fullSha,
+    undefined,
+  );
+  assert.equal(recorded(header)[0].fullSha, undefined);
 });

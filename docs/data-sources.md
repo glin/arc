@@ -36,6 +36,7 @@ Root selection follows [Environment overrides](development.md#environment-overri
 | Panel launch record | VS Code workspace state, beside the saved panel state | Which sessions the reader started from this panel |
 | Codex session index | `session_index.jsonl` beside the resolved Codex sessions root, defaulting to `~/.codex/session_index.jsonl` | Thread names, which may arrive after a rollout stops changing |
 | Local git repository | The folder a command changed, and each open workspace folder | Registered worktree roots, commit details whose output printed none, and fast-forward landings from the head log |
+| Built-in Git extension API | `vscode.extensions.getExtension('vscode.git')`, API version 1 | The repository roots the editor registered, read before Arc opens a commit |
 | Browser saved panel state | VS Code webview state | The latest five exact workspace prompt submissions, saved synchronously before dispatch and reconciled with workspace recovery |
 | VS Code workspace state | Extension-managed storage | Exact submitted prompt recovery, saved panel state, reader-started parent relationships and session list filters, queued submissions with delivery ownership and reset barriers, file descriptors, normalized account usage and live reset windows, and the last-reported Claude skill list for each working directory |
 | Saved continuations | Workspace storage `continuations` | Exact agent-authored next-turn instructions, original source and assignment authority, native compaction generations, and separate delivery outcomes under one recovery lease |

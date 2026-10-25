@@ -3,6 +3,8 @@
 // Cache repository identities by directory. Read branch names again for each batch.
 // Apply retained answers synchronously. Fetch missing answers in the background and request a render when the batch finishes.
 import { execFile } from 'node:child_process';
+import { realpathSync, statSync } from 'node:fs';
+import * as path from 'node:path';
 import { withRecoveredCommits } from './childartifacts';
 import {
   CommitHead,
@@ -280,6 +282,69 @@ export function parseIdentity(stdout: string | null): RepositoryPlace {
 }
 
 const UNKNOWN_PLACE: RepositoryPlace = { commonDir: null, linked: false, root: null };
+
+// Limit the walk from a removed commit directory to its nearest existing ancestor.
+const ANCESTOR_STEPS = 64;
+
+// The repository a commit opens in now, and the hash to open. `dir` is the top of the repository's tree.
+export interface CommitTarget {
+  dir: string;
+  sha: string;
+}
+
+// A path key with the separator, drive, and case rules of `normalizeFsPath` for the given platform. Only Windows paths compare without case.
+function rootKey(target: string, platform: NodeJS.Platform): string {
+  const unified = target.split(path.win32.sep).join('/');
+  const trimmed = /^(?:[a-zA-Z]:)?[/]$/.test(unified) ? unified : unified.replace(/[/]+$/, '');
+  return platform === 'win32' || /^[a-zA-Z]:[/]/.test(trimmed) ? trimmed.toLowerCase() : trimmed;
+}
+
+// True when a repository root registered with the editor is the verified folder. A containing parent repository is a different root.
+// Both paths resolve symbolic links and junctions first, so a registered alias of the verified checkout matches.
+// When either real-path read fails, the comparison uses the paths as given.
+export function sameRepositoryRoot(
+  registered: string,
+  verified: string,
+  platform: NodeJS.Platform = process.platform,
+  realpath: (target: string) => string = realpathSync,
+): boolean {
+  const physical = (target: string): string | null => {
+    try {
+      return realpath(target);
+    } catch {
+      return null;
+    }
+  };
+  const left = physical(registered);
+  const right = physical(verified);
+  return left !== null && right !== null
+    ? rootKey(left, platform) === rootKey(right, platform)
+    : rootKey(registered, platform) === rootKey(verified, platform);
+}
+
+function directoryState(dir: string): 'directory' | 'missing' | 'other' {
+  try {
+    return statSync(dir).isDirectory() ? 'directory' : 'other';
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    return code === 'ENOENT' || code === 'ENOTDIR' ? 'missing' : 'other';
+  }
+}
+
+// The nearest existing directory above a removed absolute path, or null when none exists within the walk limit.
+function nearestExistingAncestor(dir: string): string | null {
+  if (!path.isAbsolute(dir)) return null;
+  let current = path.resolve(dir);
+  for (let step = 0; step < ANCESTOR_STEPS; step += 1) {
+    const parent = path.dirname(current);
+    if (parent === current) return null;
+    const state = directoryState(parent);
+    if (state === 'directory') return parent;
+    if (state === 'other') return null;
+    current = parent;
+  }
+  return null;
+}
 
 // Match repository ownership by common Git directory. Linked worktrees share ownership with open folders. Nested independent repositories do not.
 export function repositoryOf(dir: string, place: RepositoryPlace, folderIdentities: string[]): CommitRepository | null {
@@ -718,6 +783,45 @@ export class RepositoryCommits {
     }
   }
 
+  // The repository a commit or landing recorded in `dir` opens in now. Null when no repository is identified.
+  // An existing directory opens at the top of its tree once a read of this reader resolved its identity. A pending or failed identity opens nothing.
+  // A removed directory opens in the repository containing its nearest existing ancestor, only when that repository holds exactly one commit for the hash.
+  // The answer then carries the full hash. The walk never scans another repository, and the recorded directory stays unchanged.
+  async navigable(dir: string, sha: string): Promise<CommitTarget | null> {
+    if (!HEX_SHA.test(sha.toLowerCase())) return null;
+    const state = directoryState(dir);
+    if (state === 'directory') {
+      const place = this.identities.get(normalizeFsPath(dir));
+      return place?.commonDir && place.root ? { dir: place.root, sha } : null;
+    }
+    if (state === 'other') return null;
+    const ancestor = nearestExistingAncestor(dir);
+    if (ancestor === null) return null;
+    const key = normalizeFsPath(ancestor);
+    let place = this.identities.get(key);
+    if (place === undefined) {
+      const out = await this.read(ancestor, IDENTITY_ARGS);
+      if (out === null) return null;
+      place = parseIdentity(out);
+      this.identities.set(key, place);
+    }
+    if (!place.commonDir || !place.root) return null;
+    const object = await this.uniqueCommit(place.root, sha);
+    return typeof object === 'object' ? { dir: place.root, sha: object.sha } : null;
+  }
+
+  // The one commit object a hash names in `folder`. Empty output proves absence. A failed read, several objects, or a non-commit object is inconclusive.
+  private async uniqueCommit(folder: string, sha: string): Promise<RepositoryCommit | 'absent' | 'inconclusive'> {
+    const objects = await this.read(folder, ['rev-parse', `--disambiguate=${sha}`]);
+    if (objects === null) return 'inconclusive';
+    const hashes = objects.split(/\s+/).filter(Boolean);
+    if (hashes.length === 0) return 'absent';
+    if (hashes.length !== 1 || !sameCommitSha(hashes[0], sha)) return 'inconclusive';
+    const out = await this.read(folder, exactCommitArgs(hashes[0]));
+    const found = out === null ? [] : parseCommitLog(out);
+    return found.length === 1 && found[0].sha.toLowerCase() === hashes[0].toLowerCase() ? found[0] : 'inconclusive';
+  }
+
   // Treat runner rejections as failed reads so they count toward the retry limit.
   private read(dir: string, args: readonly string[]): Promise<string | null> {
     return this.runner.run(dir, [...args]).catch(() => null);
@@ -782,28 +886,16 @@ export class RepositoryCommits {
             inconclusive = true;
             continue;
           }
-          // Empty output proves absence. A failed read proves nothing about another candidate.
-          const objects = await this.read(folder, ['rev-parse', `--disambiguate=${query.sha}`]);
-          if (objects === null) {
+          const object = await this.uniqueCommit(folder, query.sha);
+          if (object === 'absent') continue;
+          if (object === 'inconclusive') {
             inconclusive = true;
             continue;
           }
-          const hashes = objects.split(/\s+/).filter(Boolean);
-          if (hashes.length === 0) continue;
-          if (hashes.length !== 1 || !sameCommitSha(hashes[0], query.sha)) {
-            inconclusive = true;
-            continue;
-          }
-          const out = await this.read(folder, exactCommitArgs(hashes[0]));
-          const found = out === null ? [] : parseCommitLog(out);
-          if (found.length !== 1 || found[0].sha.toLowerCase() !== hashes[0].toLowerCase()) {
-            inconclusive = true;
-            continue;
-          }
-          if (answer && (answer.commit.sha !== found[0].sha || identity !== place.commonDir)) {
+          if (answer && (answer.commit.sha !== object.sha || identity !== place.commonDir)) {
             inconclusive = true;
           } else {
-            answer ??= { commit: found[0], dir: folder };
+            answer ??= { commit: object, dir: folder };
             identity ??= place.commonDir;
           }
         }

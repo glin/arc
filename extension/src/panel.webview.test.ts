@@ -1,5 +1,5 @@
 import { CommandCatalogs } from './commandcatalog';
-import { commitSourceStamp } from './transcript';
+import { commitSourceStamp, recordCommits as recordTranscriptCommits } from './transcript';
 import {
   startingWorktree,
   RepositoryScope,
@@ -6673,6 +6673,7 @@ test('an open-commit request opens the commit only in the directory the host hol
   const provider: any = Object.create(PanelProvider.prototype);
   let openable: Promise<string | null | undefined> | null = null;
   provider.commitRepositories = { openable: () => openable };
+  provider.repositoryCommits = { navigable: async (dir: string, hash: string) => ({ dir, sha: hash }) };
   const held = commit({ dir: 'C:/work/repo' });
   const child = commit({ dir: 'C:/work/child', sha: 'b'.repeat(8), printedSha: undefined });
   provider.turnsByKey = new Map([
@@ -6694,6 +6695,7 @@ test('an open-commit request opens the commit only in the directory the host hol
     [vscode.commands, 'executeCommand'],
     [vscode.window, 'showInformationMessage'],
     [vscode.Uri, 'file'],
+    [vscode.extensions, 'getExtension'],
   ];
   const originals = stubbed.map(([target, key]) => [key in target, target[key]] as const);
   try {
@@ -6705,6 +6707,7 @@ test('an open-commit request opens the commit only in the directory the host hol
     });
     Object.assign(vscode.window, { showInformationMessage: (message: string) => notices.push(message) });
     Object.assign(vscode.Uri, { file: (dir: string) => ({ fsPath: dir }) });
+    gitExtension(['C:/work/repo', 'C:/work/child', 'C:/work/landed']);
     const open = async (key: string | null, hash: string, dir: string | null) => {
       commands.length = 0;
       notices.length = 0;
@@ -6751,6 +6754,258 @@ test('an open-commit request opens the commit only in the directory the host hol
       if (had) target[key] = value;
       else delete target[key];
     });
+  }
+});
+
+// Stubs the built-in Git extension. A list names its registered repository roots. `missing` leaves no extension, `no-api` activates without the API, and `throws` fails activation.
+function gitExtension(registered: string[] | 'missing' | 'no-api' | 'throws'): void {
+  Object.assign(vscode.extensions, {
+    getExtension: (id: string) =>
+      id !== 'vscode.git' || registered === 'missing'
+        ? undefined
+        : {
+            activate: async () => {
+              if (registered === 'throws') throw new Error('activation failed');
+              if (registered === 'no-api') return {};
+              return {
+                getAPI: (version: number) => ({
+                  repositories: version === 1 ? registered.map((fsPath) => ({ rootUri: { fsPath } })) : [],
+                }),
+              };
+            },
+          },
+  });
+}
+
+// Stubs the editor members an open-commit request reads. `viewed` lists each `git.viewCommit` call as its normalized folder and hash.
+function commitEditor(provider: any) {
+  const commands: unknown[][] = [];
+  const notices: string[] = [];
+  const stubbed: Array<[Record<string, any>, string]> = [
+    [vscode.commands, 'getCommands'],
+    [vscode.commands, 'executeCommand'],
+    [vscode.window, 'showInformationMessage'],
+    [vscode.Uri, 'file'],
+    [vscode.extensions, 'getExtension'],
+  ];
+  const originals = stubbed.map(([target, key]) => [key in target, target[key]] as const);
+  Object.assign(vscode.commands, {
+    getCommands: async () => ['git.viewCommit'],
+    executeCommand: async (...args: unknown[]) => {
+      commands.push(args);
+    },
+  });
+  Object.assign(vscode.window, { showInformationMessage: (message: string) => notices.push(message) });
+  Object.assign(vscode.Uri, { file: (dir: string) => ({ fsPath: dir }) });
+  provider.canOpenCommit = null;
+  return {
+    notices,
+    async viewed(key: string, hash: string, dir: string) {
+      commands.length = 0;
+      notices.length = 0;
+      await provider.openCommit(key, hash, dir);
+      return commands
+        .filter((command) => command[0] === 'git.viewCommit')
+        .map((command) => [normalizeFsPath((command[1] as { fsPath: string }).fsPath), command[2]]);
+    },
+    restore() {
+      stubbed.forEach(([target, key], index) => {
+        const [had, value] = originals[index];
+        if (had) target[key] = value;
+        else delete target[key];
+      });
+    },
+  };
+}
+
+test('a commit whose recorded directory was removed opens only in the containing repository that holds it', async () => {
+  const full = 'bc0f4d30127f4f5f5b04db0a128bc1d5654fbb8c';
+  const short = full.slice(0, 8);
+  const root = tempDir('arc-removed-commit-');
+  const notes = path.join(root, 'Notes');
+  const live = path.join(root, 'live');
+  fs.mkdirSync(notes);
+  fs.mkdirSync(live);
+  const removed = path.join(notes, '.claude', 'worktrees', 'finished');
+  const unrelated = path.join(root, 'arc');
+  let matches: Record<string, { sha: string } | null> = {};
+  let ambiguous = false;
+  const reader = new RepositoryCommits(
+    {
+      run: (dir, args) =>
+        ambiguous && args[1]?.startsWith('--disambiguate=')
+          ? Promise.resolve(`${full}\n${short}${'0'.repeat(32)}\n`)
+          : candidateGitRunner(matches).run(dir, args),
+    },
+    () => {},
+  );
+  const provider: any = Object.create(PanelProvider.prototype);
+  let proof: string | null | undefined = undefined;
+  provider.commitRepositories = { openable: async () => proof };
+  provider.repositoryCommits = reader;
+  const commit = { sha: short, subject: 's', at: 1, place: null, dir: removed };
+  const liveCommit = { sha: 'd'.repeat(8), subject: 's', at: 2, place: null, dir: live };
+  const written = turn({ commits: [commit, liveCommit] as any });
+  provider.turnsByKey = new Map([
+    ['session:1', written],
+    ['session:2', turn({ landings: [{ id: 'l', sha: short, dir: removed }] as any })],
+  ]);
+  const editor = commitEditor(provider);
+  const unidentified = 'Arc: The repository for this commit could not be identified.';
+  try {
+    gitExtension([unrelated]);
+    // No repository contains the removed directory.
+    assert.deepEqual(await editor.viewed('session:1', short, removed), []);
+    assert.equal(editor.notices.at(-1), unidentified);
+    // The containing repository lacks the commit.
+    matches = { [normalizeFsPath(notes)]: { sha: 'e'.repeat(40) } };
+    assert.deepEqual(await editor.viewed('session:1', short, removed), []);
+    assert.equal(editor.notices.at(-1), unidentified);
+    // The containing repository holds the commit, and the editor registered only the unrelated repository.
+    matches = { [normalizeFsPath(notes)]: { sha: full } };
+    assert.deepEqual(await editor.viewed('session:1', short, removed), []);
+    assert.equal(editor.notices.at(-1), unidentified);
+    // Once the editor registers the containing repository, the commit and the landing open there with the full hash.
+    gitExtension([unrelated, notes]);
+    assert.deepEqual(await editor.viewed('session:1', short, removed), [[normalizeFsPath(notes), full]]);
+    assert.deepEqual(await editor.viewed('session:2', short, removed), [[normalizeFsPath(notes), full]]);
+    assert.equal(commit.dir, removed);
+    // A short hash that names more than one object opens nothing.
+    ambiguous = true;
+    assert.deepEqual(await editor.viewed('session:1', short, removed), []);
+    assert.deepEqual(await editor.viewed('session:2', short, removed), []);
+    assert.equal(editor.notices.at(-1), unidentified);
+    ambiguous = false;
+    // A registered parent of the repository is a different root.
+    gitExtension([unrelated, root]);
+    assert.deepEqual(await editor.viewed('session:1', short, removed), []);
+    assert.equal(editor.notices.at(-1), unidentified);
+    // Without the Git extension or its API, nothing opens.
+    for (const state of ['missing', 'no-api', 'throws'] as const) {
+      gitExtension(state);
+      assert.deepEqual(await editor.viewed('session:1', short, removed), [], state);
+      assert.equal(editor.notices.at(-1), unidentified);
+    }
+    // A failed repository proof never falls back to the containing repository.
+    gitExtension([notes]);
+    proof = null;
+    assert.deepEqual(await editor.viewed('session:1', short, removed), []);
+    proof = undefined;
+    // A live checkout without a proof opens once its identity is read.
+    matches[normalizeFsPath(live)] = { sha: 'd'.repeat(40) };
+    gitExtension([unrelated, notes, live]);
+    assert.deepEqual(await editor.viewed('session:1', 'd'.repeat(8), live), []);
+    reader.apply([written], []);
+    await vi.waitFor(async () =>
+      assert.deepEqual(await editor.viewed('session:1', 'd'.repeat(8), live), [[normalizeFsPath(live), 'd'.repeat(8)]]),
+    );
+    assert.equal(commit.dir, removed);
+  } finally {
+    editor.restore();
+  }
+});
+
+test('a removed commit directory opens the full hash its own output printed, never an ancestor object sharing the short prefix', async () => {
+  const full = 'bc0f4d30127f4f5f5b04db0a128bc1d5654fbb8c';
+  const short = full.slice(0, 8);
+  const other = `${short}${'0'.repeat(32)}`;
+  const root = tempDir('arc-removed-full-commit-');
+  const notes = path.join(root, 'Notes');
+  fs.mkdirSync(notes);
+  const removed = path.join(notes, '.claude', 'worktrees', 'finished');
+  const written = turn({ commits: [] });
+  recordTranscriptCommits(
+    written,
+    `[review/x ${short}] subject\n 1 file changed, 1 insertion(+)\ncommit ${full}\nAuthor: Dev <dev@example.com>\n`,
+    1,
+    'unreadable',
+    [],
+    removed,
+  );
+  let matches: Record<string, { sha: string } | null> = { [normalizeFsPath(notes)]: { sha: other } };
+  const provider: any = Object.create(PanelProvider.prototype);
+  provider.commitRepositories = { openable: async () => undefined };
+  provider.repositoryCommits = new RepositoryCommits(
+    { run: (dir, args) => candidateGitRunner(matches).run(dir, args) },
+    () => {},
+  );
+  provider.turnsByKey = new Map([['session:1', written]]);
+  const editor = commitEditor(provider);
+  try {
+    gitExtension([notes]);
+    // The ancestor holds only a different object with the same short prefix.
+    assert.deepEqual(await editor.viewed('session:1', short, removed), []);
+    assert.equal(editor.notices.at(-1), 'Arc: The repository for this commit could not be identified.');
+    // The ancestor holds the commit the output printed.
+    matches = { [normalizeFsPath(notes)]: { sha: full } };
+    assert.deepEqual(await editor.viewed('session:1', short, removed), [[normalizeFsPath(notes), full]]);
+  } finally {
+    editor.restore();
+  }
+});
+
+test('an open-commit request opens a registered alias of the verified repository through the registered root', async () => {
+  const sha = 'a'.repeat(40);
+  const root = tempDir('arc-commit-alias-');
+  const real = path.join(root, 'repo');
+  const alias = path.join(root, 'alias');
+  const parent = path.join(root, 'parent-alias');
+  fs.mkdirSync(real);
+  fs.symlinkSync(real, alias, 'junction');
+  fs.symlinkSync(root, parent, 'junction');
+  const provider: any = Object.create(PanelProvider.prototype);
+  provider.commitRepositories = { openable: async () => undefined };
+  provider.repositoryCommits = { navigable: async () => ({ dir: real, sha }) };
+  provider.turnsByKey = new Map([
+    ['session:1', turn({ commits: [{ sha: sha.slice(0, 8), subject: 's', at: 1, place: null, dir: real }] as any })],
+  ]);
+  const editor = commitEditor(provider);
+  try {
+    gitExtension([alias]);
+    assert.deepEqual(await editor.viewed('session:1', sha, real), [[normalizeFsPath(alias), sha]]);
+    // An alias of the containing directory is a parent root.
+    gitExtension([parent]);
+    assert.deepEqual(await editor.viewed('session:1', sha, real), []);
+  } finally {
+    editor.restore();
+  }
+});
+
+test('an open-commit request matches the registered repository root by each platform case rule', async () => {
+  const sha = 'a'.repeat(40);
+  const provider: any = Object.create(PanelProvider.prototype);
+  let target = '';
+  provider.commitRepositories = { openable: async () => undefined };
+  provider.repositoryCommits = { navigable: async () => ({ dir: target, sha }) };
+  provider.turnsByKey = new Map([
+    [
+      'session:1',
+      turn({ commits: [{ sha: sha.slice(0, 8), subject: 's', at: 1, place: null, dir: 'C:/recorded' }] as any }),
+    ],
+  ]);
+  const editor = commitEditor(provider);
+  const platform = Object.getOwnPropertyDescriptor(process, 'platform')!;
+  try {
+    for (const [os, verified, registered, opens] of [
+      ['win32', '/Work/Repo', '/work/repo', true],
+      ['darwin', '/Work/Repo', '/work/repo', false],
+      ['linux', '/Work/Repo', '/work/repo', false],
+      ['linux', '/Work/Repo', '/Work/Repo/', true],
+      ['win32', 'C:/Work/Repo', 'c:\\work\\repo', true],
+      ['darwin', 'C:/Work/Repo', 'c:\\work\\repo', true],
+      ['linux', 'C:/Work/Repo', 'c:\\work\\repo', true],
+      ['win32', 'C:/Work/Repo', 'c:\\work', false],
+      ['linux', '/Work/Repo', '/Work', false],
+    ] as const) {
+      Object.defineProperty(process, 'platform', { ...platform, value: os });
+      target = verified;
+      gitExtension([registered]);
+      const viewed = await editor.viewed('session:1', sha, 'C:/recorded');
+      assert.equal(viewed.length, opens ? 1 : 0, `${os} ${verified} ${registered}`);
+    }
+  } finally {
+    Object.defineProperty(process, 'platform', platform);
+    editor.restore();
   }
 });
 

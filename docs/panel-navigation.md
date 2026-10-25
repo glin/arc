@@ -41,7 +41,7 @@ Only `FileNotFound` establishes absence. Other file-check errors and Explorer, p
 
 ### Commit destinations
 
-A commit hash becomes a button only with a known repository directory. An unresolved repository leaves text. Opening runs `git.openRepository` before `git.viewCommit`. An unavailable command or missing commit produces an information message. Commits outside the workspace name their repository.
+A commit hash becomes a button only with a known repository directory. An unresolved repository leaves text. Opening uses the repository that [Recorded command and commit contracts](turn-cards.md#recorded-command-and-commit-contracts) describes. An unavailable command or missing commit produces an information message. Commits outside the workspace name their repository.
 
 Commit rows retain their recorded branch or detached HEAD. Rows with the same subject and statistics remain distinct. A worktree named for its branch shows the branch without a place. Commit hovers retain the subject, file count when known, and commit time.
 

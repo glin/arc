@@ -179,7 +179,7 @@ import {
   createCodexUsageLineReducer,
 } from './codex';
 import { AgentSpendRef, spendFileVersion, type AgentSpend } from './agentspend';
-import { RepositoryCommits, nodeGitRunner, type GitRunner } from './gitcommits';
+import { RepositoryCommits, nodeGitRunner, sameRepositoryRoot, type CommitTarget, type GitRunner } from './gitcommits';
 import { CommitRepositories } from './commitrepositories';
 import { CommitRepositoryReservations, commitRepositorySourceKey } from './progressiveworker';
 import {
@@ -677,6 +677,11 @@ import { panelShell } from './paneldevelopment';
 
 // The panel presents the session list and timeline. File views read recorded edits
 // and first-touch snapshots. The webview supports variable-height turn cards.
+
+// The members of the built-in Git extension's API, version 1, that Arc reads.
+interface GitExtensionExports {
+  getAPI?(version: 1): { readonly repositories: ReadonlyArray<{ readonly rootUri: vscode.Uri }> };
+}
 
 interface CacheEntry {
   key: string;
@@ -13040,22 +13045,48 @@ export class PanelProvider implements vscode.Disposable {
     });
   }
 
-  // The directory a card's commit or landing opens in right now, or null. A commit with a repository proof waits for a passing check.
-  private async openableCommitDir(cardKey: string, sha: string, requested: string | null): Promise<string | null> {
+  // The repository a card's commit or landing opens in right now, or null. The view's directory names the recorded commit, and the repository opened can differ from it.
+  // A commit with a repository proof waits for a passing check and never falls back. Other commits and landings take the target `RepositoryCommits` verifies now.
+  private async commitTarget(cardKey: string, sha: string, requested: string | null): Promise<CommitTarget | null> {
     const turn = this.turnsByKey.get(cardKey);
     if (!turn || !requested) return null;
+    const asked = normalizeFsPath(requested);
     const commits = [...(turn.commits ?? []), ...(turn.agents ?? []).flatMap((agent) => agent.commits ?? [])];
     for (const commit of commits) {
       if (!sameCommitSha(commit.printedSha ?? commit.sha, sha) && !sameCommitSha(commit.sha, sha)) continue;
+      const full = [commit.printedSha, commit.sha, commit.fullSha].find(
+        (one) => one?.length === 40 && sameCommitSha(one, sha),
+      );
       const proven = await this.commitRepositories.openable(commit);
-      const dir = proven === undefined ? commit.dir : proven;
-      if (dir && normalizeFsPath(dir) === normalizeFsPath(requested)) return requested;
+      if (proven === null) continue;
+      if (proven !== undefined) {
+        if (normalizeFsPath(proven) === asked) return { dir: proven, sha: full ?? sha };
+        continue;
+      }
+      if (commit.dir && normalizeFsPath(commit.dir) === asked)
+        return this.repositoryCommits.navigable(commit.dir, full ?? sha);
     }
     for (const landing of turn.landings ?? []) {
-      if (sameCommitSha(landing.sha, sha) && landing.dir && normalizeFsPath(landing.dir) === normalizeFsPath(requested))
-        return requested;
+      if (sameCommitSha(landing.sha, sha) && landing.dir && normalizeFsPath(landing.dir) === asked)
+        return this.repositoryCommits.navigable(landing.dir, sha);
     }
     return null;
+  }
+
+  // The root the built-in Git extension registered for the directory `folder` names, or null.
+  // `git.viewCommit` picks another open repository when the folder it receives is not registered, so a missing or different root refuses the commit.
+  private async registeredRepository(folder: string): Promise<vscode.Uri | null> {
+    try {
+      const extension = vscode.extensions.getExtension<GitExtensionExports>('vscode.git');
+      if (!extension) return null;
+      const exports = await extension.activate();
+      const api = exports?.getAPI?.(1);
+      return (
+        api?.repositories.find((repository) => sameRepositoryRoot(repository.rootUri.fsPath, folder))?.rootUri ?? null
+      );
+    } catch {
+      return null;
+    }
   }
 
   // Opens a commit in the repository the host holds for it now. The message can predate a repository check, so the host waits for the check.
@@ -13072,15 +13103,22 @@ export class PanelProvider implements vscode.Disposable {
       void vscode.window.showInformationMessage('Arc: This version of VS Code cannot open commits.');
       return;
     }
-    const folder = await this.openableCommitDir(cardKey, sha, requested);
-    if (!folder) {
+    const unidentified = () =>
       void vscode.window.showInformationMessage('Arc: The repository for this commit could not be identified.');
+    const target = await this.commitTarget(cardKey, sha, requested);
+    if (!target) {
+      unidentified();
       return;
     }
     try {
-      // Register the resolved repository before `git.viewCommit`, which uses repositories known to the built-in Git extension.
-      await vscode.commands.executeCommand('git.openRepository', folder);
-      await vscode.commands.executeCommand('git.viewCommit', vscode.Uri.file(folder), sha);
+      // Register the resolved repository, then confirm the registration before `git.viewCommit`, which uses repositories known to the built-in Git extension.
+      await vscode.commands.executeCommand('git.openRepository', target.dir);
+      const root = await this.registeredRepository(target.dir);
+      if (!root) {
+        unidentified();
+        return;
+      }
+      await vscode.commands.executeCommand('git.viewCommit', root, target.sha);
     } catch {
       void vscode.window.showInformationMessage('Arc: This commit is no longer in the repository.');
     }
