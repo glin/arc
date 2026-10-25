@@ -1,6 +1,6 @@
 # Arc sessions for agents
 
-The `arc-sessions` skill lets a Claude Code or Codex agent start, inspect, and organize requested work through a running Arc window. The reader reviews those sessions in the panel and continues them through the Prompt box.
+The `arc-sessions` skill lets Claude Code and Codex agents start, inspect, and organize requested work through a running Arc window. Readers review sessions in the panel and continue them through the prompt box.
 
 ## The four components
 
@@ -11,9 +11,9 @@ The `arc-sessions` skill lets a Claude Code or Codex agent start, inspect, and o
 | `arc-sessions` skill | Gives an agent instructions for bounded session work through the CLI. | Automatic native delivery in supported Arc children, source installer, explicit CLI setup, or a manual copy or link. |
 | `arc-hooks` Claude plugin | Captures first-touch file snapshots for Claude file diffs. | Source installer or Claude plugin marketplace. |
 
-The skill source is [`cli/skills/arc-sessions/SKILL.md`](../cli/skills/arc-sessions/SKILL.md). `SKILL.md` links to reference files beside it, and every artifact and installation carries them. The source installer, the bundler, and the skill payload loader refuse a skill that lacks a file `SKILL.md` links. The standalone CLI package includes the directory under `skills/arc-sessions`. The VSIX includes the canonical skill directory under `dist/tools/skills/arc-sessions`, with its paths and digests in the tool identity. The separate `arc-hooks` plugin carries snapshots.
+The skill source is [`cli/skills/arc-sessions/SKILL.md`](../cli/skills/arc-sessions/SKILL.md). Every artifact and installation includes its linked reference files. The source installer, bundler, and payload loader refuse a skill missing a linked file. The standalone CLI package includes the directory under `skills/arc-sessions`. The VSIX includes the canonical skill directory under `dist/tools/skills/arc-sessions`, with its paths and digests in the tool identity.
 
-Bundled files are part of an artifact. An installed skill exists in an agent's skill directory. A release requires publication of the corresponding artifact. None of these states establishes the others.
+Bundling includes files in an artifact. Installation puts a skill in an agent's skill directory. A release requires artifact publication. Each state is independent.
 
 ## Automatic native availability
 
@@ -21,21 +21,29 @@ Supported Arc-launched sessions receive the matching session skill through nativ
 
 Claude delivery preserves matching manual definitions, including readable links. A customized definition, another `arc-session-tools` plugin, explicit disablement, or unsupported configuration prevents automatic delivery. Codex delivery refuses another `arc-sessions` definition, including an identical or disabled copy. Disabling an admitted earlier Arc release also prevents delivery at a newer path. Arc never enables a disabled definition.
 
-Known static conflicts retain ordinary startup and manual native discovery. An unexpected native refusal stops startup or further delivery without another child or prompt replay. [Runtime admission](agent-protocols.md#native-session-skill-admission) defines provider compatibility and refresh behavior. Catalog discovery establishes availability, not that a model read the instructions. Standalone sessions use the personal installation below.
+Known static conflicts allow ordinary startup and manual native discovery. An unexpected native refusal stops startup or further delivery without launching another child or replaying prompts. [Runtime admission](agent-protocols.md#native-session-skill-admission) defines provider compatibility and refresh behavior. Catalog discovery establishes availability, not that a model read the instructions. Standalone sessions use the personal installation below.
 
 ## Install the parts you need
 
 `install.sh` builds and installs the editor extension. It also sets up the optional Claude plugin unless passed `--no-hooks`. Both default source installations copy matching plugin bytes into managed storage. Local source selects the checkout bytes. Remote source resolves its ref before downloading. Existing checkout marketplaces require [one-time recovery](development.md#legacy-checkout-plugin-recovery).
 
-A VSIX installs the extension. Claude marketplace installation selects `arc-hooks`, not the CLI or session skill. [Installer testing](development.md#isolated-installer-tests) owns local plugin commands. Session commands use Arc's local window channel without requiring Claude hooks. Codex records come from its rollouts.
+A VSIX installs the extension. Claude marketplace installation installs only `arc-hooks`. [Installer testing](development.md#isolated-installer-tests) owns local plugin commands. Session commands use Arc's local window channel without requiring Claude hooks. Codex records come from its rollouts.
 
-Arc has no editor command named **Arc: Install CLI**. To update the standalone CLI, build a current source checkout and install its tarball. [CLI installation](../cli/README.md#install) owns the commands and Node requirements. npm publication is deferred, so a registry `latest` install is not an available release path.
+Arc has no **Arc: Install CLI** editor command. Update the standalone CLI by building a current source checkout and installing its tarball. [CLI installation](../cli/README.md#install) owns the commands and Node requirements. npm publication is deferred, so a registry `latest` install is not an available release path.
 
-The source installer selects detected Claude and Codex executables by default. Explicit `--skill-agent claude` and `--skill-agent codex` select personal copies without requiring those executables. `--no-skills` skips this invocation's skill setup. `--no-hooks` excludes only hooks. The explicit `arc skills install`, `arc skills update`, and `arc skills remove` commands accept repeatable `--agent claude` or `--agent codex`. Claude Code uses `~/.claude/skills/arc-sessions`. Codex uses `~/.agents/skills/arc-sessions`, independently of `CODEX_HOME`. A nondefault `CLAUDE_CONFIG_DIR` refuses Claude skill setup. Managed and custom discovery setups require a separately maintained manual installation. Installation never changes provider policy or enables disabled skills. Restart the agent session after installation.
+The source installer selects detected Claude and Codex executables by default. Explicit `--skill-agent claude` and `--skill-agent codex` select personal copies without requiring those executables. `--no-skills` skips this invocation's skill setup. `--no-hooks` excludes only hooks. The explicit `arc skills install`, `arc skills update`, and `arc skills remove` commands accept repeatable `--agent claude` or `--agent codex`. Claude Code uses `~/.claude/skills/arc-sessions`. Codex uses `~/.agents/skills/arc-sessions`, independently of `CODEX_HOME`. Claude skill setup refuses a nondefault `CLAUDE_CONFIG_DIR`. Managed and custom discovery setups require a separately maintained manual installation. Installation never changes provider policy or enables disabled skills. Restart the agent session after installation.
 
-Arc copies regular files and publishes `SKILL.md` after resources finish. Existing manual copies and links remain user-owned. Install preserves an exact stable external copy with `external-match-preserved`. Matching links, redirected folders above the home folder, temporary copies, copies inside the executing payload, and unresolved temporary roots produce an incomplete result without takeover. A personal skills folder that is a link, or that sits under a linked `~/.claude` or `~/.agents`, is never written through. Setup reports `linked` when the skill at the link's target has exactly the bundled files. When the target is the other agent's skills folder, the result says that this agent reads that folder. A `linked` result there also covers a readable skill that a person made or edited, and says that no action is needed. The command exits 0. An `incomplete` result there names the other agent's install command when the skill is missing. It names the other agent's update command when Arc owns a copy that differs from the bundled files. When invalid ownership bindings or retained setup files in the other agent's setup storage would make those commands refuse, the result gives manual recovery directions in their place. An entry with no readable `SKILL.md` also gives `incomplete`, such as an empty folder, an ordinary file, or a link that leads nowhere. That result says what is there and that Arc will not replace it, and it asks the person to move or delete it and then run the other agent's install command. That install command replaces an install record whose copy a person moved or deleted. When the target is any other folder, setup reports `incomplete` for a missing or different skill and names the packaged skill folder and the destination to copy or link it to. Setup writes the folders that are not linked first, so one run that selects both agents installs the skill and then reports the link. Removal leaves a linked folder unchanged. When the target is the other agent's skills folder, the result says that no action is needed and names no command, even when that setup storage is blocked. It says the skill is not there when that folder holds no readable `SKILL.md`. When the target is any other folder, the result says to remove the copy at the target by hand. Removing the skill from a folder that a link also serves says that the other agent loses it too. Update and removal require unchanged Arc-owned files. Added files, edited files, unfamiliar ownership, and retained interrupted operations refuse destructive changes. [Manual skill installation](../cli/README.md#session-skill) provides Windows junction and macOS/Linux link commands.
+Arc copies regular files and publishes `SKILL.md` after resources finish. Manual copies and links remain user-owned. Install preserves exact stable external copies with `external-match-preserved`. Matching links, redirected folders above the home folder, temporary copies, copies inside the executing payload, and unresolved temporary roots return `incomplete` without takeover.
 
-The third-party [Vercel skills CLI](https://github.com/vercel-labs/skills#readme) also supports local paths, named skills, and both agents. From an Arc checkout, these commands list the skill, then install it:
+Arc never writes through linked personal skills folders, including those under linked `~/.claude` or `~/.agents` folders. Setup reports `linked` when the target skill exactly matches the bundled files. If the target is the other agent's skills folder, the result says this agent reads that folder. A readable skill made or edited by a person also returns `linked` there, with no action needed and exit 0.
+
+For the other agent's skills folder, `incomplete` names its install command for a missing skill. It names its update command for an Arc-owned copy that differs from the bundle. Invalid ownership bindings or retained setup files that prevent those commands produce manual recovery directions instead. An entry without readable `SKILL.md`, including an empty folder, ordinary file, or broken link, also returns `incomplete`. The result identifies the entry, refuses replacement, and requests moving or deleting it before running the other agent's install command. That command replaces the install record of a moved or deleted copy. For any other target folder, a missing or different skill returns `incomplete`, naming the packaged skill folder and copy or link destination.
+
+Setup writes unlinked folders first. Selecting both agents therefore installs the skill before reporting the link. Removal leaves linked folders unchanged. For the other agent's skills folder, removal reports no action needed without naming a command, even when its setup storage is blocked. It reports the skill missing when no readable `SKILL.md` exists there. For any other target, removal directs the person to remove the target copy manually. Removing a skill from a folder shared through a link reports that the other agent loses it too.
+
+Update and removal require unchanged Arc-owned files. Added files, edited files, unfamiliar ownership, and retained interrupted operations refuse destructive changes. [Manual skill installation](../cli/README.md#session-skill) provides Windows junction and macOS/Linux link commands.
+
+The third-party [Vercel skills CLI](https://github.com/vercel-labs/skills#readme) supports local paths, named skills, and both agents. From an Arc checkout, list and install the skill:
 
 ```sh
 npx skills add ./cli/skills --list
@@ -44,13 +52,13 @@ npx skills add ./cli/skills --skill arc-sessions --global --agent claude-code --
 
 Use the explicit `cli/skills` directory because the repository nests the skill beneath `cli`. Repository-root discovery requires `--full-depth`. `npx skills` installs skill files. It does not install the Arc CLI, extension, or Claude plugin.
 
-Arc does not inject skill instructions into agent prompts. The agent discovers supplied or installed skills through its native skill directories. Both providers list skill metadata and load the full instructions when the skill activates. Personal installations use `/arc-sessions` in Claude Code or `$arc-sessions` in Codex. The agent also selects relevant skills from their descriptions, subject to provider configuration. [Claude skill guidance](https://code.claude.com/docs/en/skills) and [Codex skill guidance](https://learn.chatgpt.com/docs/build-skills) own discovery, selection, and context-loading behavior.
+The agent discovers supplied or installed skills through native skill directories. Both providers list metadata and load full instructions when the skill activates. Personal installations use `/arc-sessions` in Claude Code or `$arc-sessions` in Codex. The agent also selects relevant skills from their descriptions, subject to provider configuration. [Claude skill guidance](https://code.claude.com/docs/en/skills) and [Codex skill guidance](https://learn.chatgpt.com/docs/build-skills) own discovery, selection, and context-loading behavior.
 
 ## Manual recovery
 
 A skill result with `publication` names the completed installation, update, or removal. An `incomplete` status still requires cleanup when files or locks remain. Cancellation preserves that publication result and the first signal's exit status.
 
-An interrupted operation retains uncertain files and locks. Arc never takes ownership through a timeout, PID check, or heartbeat. Establish that every participating installer and descendant has stopped before changing retained files. Stop when any participant remains unknown.
+Interrupted operations retain uncertain files and locks. A timeout, PID check, or heartbeat never grants Arc ownership. Establish that every participating installer and descendant has stopped before changing retained files. Stop when any participant remains unknown.
 
 Use the canonical `control` and `operation` paths in the CLI result. The Claude control folder is `~/.claude/skills.arc-skill-control`. The Codex control folder is `~/.agents/skills.arc-skill-control`. Each contains `ownership.json`, optional `installed.json`, and matching `software.lock` and `destination.lock` files. An operation folder is `operation-TOKEN`. Its `journal.json` names the exact `destination`, `stage`, `backup`, source digest, complete file digests, and previous directory identity. `claim.json` identifies a replacement directory when present. `seal.json` marks settled work.
 
@@ -90,11 +98,11 @@ A compaction request does not establish completed compaction. [CLI compaction re
 
 ## Collect data for a report
 
-Use `arc collect` for scoped pagination and optional recent turns. The caller selects the query and interprets the returned observations. [Collection output](cli-reference.md#collection) defines references, outcomes, recovery, and limits. The command requires an explicit window selection and changes no session state.
+Use `arc collect` to page through scoped sessions and optionally read recent turns. Select the query and interpret the returned observations. [Collection output](cli-reference.md#collection) defines references, outcomes, recovery, and limits. The command requires an explicit window selection and changes no session state.
 
 ## A bounded coordinator run
 
-A coordinator is an ordinary agent session given an explicit session-management task. The skill supplies instructions rather than a scheduler or separate coordinator process.
+A coordinator is an ordinary agent session with an explicit session-management task. The skill supplies instructions, without a scheduler or separate coordinator process.
 
 ```text
 Reader authorizes a bounded task
@@ -128,23 +136,23 @@ arc CLI <--- local channel ---> Selected ready Arc window
 2. Read `arc windows --json`. Select the intended repository's window and check `scopeReady` and `panelReady`.
 3. Read `arc setups` for that window. Choose offered settings for each provider using the [Manual check](#manual-check) commands.
 4. Start each session through `arc start`. Save accepted session IDs and preserve uncertain request IDs without launching replacements.
-5. Arc's adapters run the native CLIs. Arc reads Claude transcripts and Codex rollouts for recorded turns. The panel shows live process activity, and session listings show live run status.
+5. Arc runs the native CLIs and reads recorded turns from Claude transcripts and Codex rollouts. The panel shows live process activity. Session listings show live run status.
 6. Read recorded turns through `arc session`. Report each session's result and recorded settings without changing reader attention.
 7. To continue a session the coordinator started, follow the skill's [follow-up rules](../cli/skills/arc-sessions/followup.md).
 8. Apply only authorized labels and pins, using `--dry-run` first. Archive only sessions that the skill's [archive authority](../cli/skills/arc-sessions/SKILL.md#manage-a-bounded-set) covers. [Session management](cli.md#session-management) owns what a forced archive admits and keeps.
 9. Leave the requested continuation session available. The reader opens it and sends the next prompt through its Prompt box.
 
-`arc start --arc-dispatch` emits the parent-link receipt for `accepted` and `accepted-with-errors` results that include a session ID. Basic starts require no personal dispatch script. Personal dispatch workflow receipts link sessions. Personal dispatch workflows own durable callback claim/ack outside Arc to track callback ownership and acknowledgement. The receipt does not provide that state. Arc supplies neither detached callbacks nor a cross-provider peer inbox.
+`arc start --arc-dispatch` emits the parent-link receipt for `accepted` and `accepted-with-errors` results that include a session ID. Basic starts need no personal dispatch script. Personal dispatch receipts link sessions. Personal workflows track durable callback ownership and acknowledgment through claim/ack outside Arc. The receipt supplies no callback state. Arc supplies neither detached callbacks nor a cross-provider peer inbox.
 
-Python and shell coordinators both invoke the same CLI. The skill's [command rules](../cli/skills/arc-sessions/SKILL.md#select-the-command) own reader ownership and `--agent-run`. Run `arc --help` and `arc COMMAND --help` for command syntax. [CLI contracts](cli-reference.md) define delivery outcomes and session data. [Session management](cli.md#session-management) explains archive rules and uncertain launches.
+Python and shell coordinators use the same CLI. The skill's [command rules](../cli/skills/arc-sessions/SKILL.md#select-the-command) own reader ownership and `--agent-run`. Run `arc --help` and `arc COMMAND --help` for command syntax. [CLI contracts](cli-reference.md) define delivery outcomes and session data. [Session management](cli.md#session-management) explains archive rules and uncertain launches.
 
-The skill's [delivery rules](../cli/skills/arc-sessions/SKILL.md#interpret-delivery) define what a result establishes. Keep a session available for reader continuation when that is part of the task.
+The skill's [delivery rules](../cli/skills/arc-sessions/SKILL.md#interpret-delivery) define what a result establishes.
 
-Personal `ship` and `dispatch` skills define their own implementation and review workflows. Arc does not package them. The session skill does not automatically review changes, send corrections, rotate coordinator context, or supervise workers continuously. `arc send` delivers an explicit reader-requested message or an observed follow-up to a session the requester started. [Session management](cli.md#session-management) owns when Arc accepts it.
+Personal `ship` and `dispatch` skills define implementation and review workflows that Arc does not package. The session skill does not automatically review changes, send corrections, rotate coordinator context, or supervise workers continuously. `arc send` delivers an explicit reader-requested message or an observed follow-up to a session the requester started. [Session management](cli.md#session-management) owns when Arc accepts it.
 
 ## Named session links
 
-An agent reports a known session with a named Markdown link:
+Report a known session with a named Markdown link:
 
 ```markdown
 [name](arc-session:<id>)
@@ -156,7 +164,7 @@ The response link complements the Dispatched link. Its receipt, attribution, and
 
 ## Manual check
 
-Start with read-only commands. Open Arc in the intended repository and keep the panel visible.
+Open Arc in the intended repository and keep the panel visible. Start with read-only commands.
 
 ```sh
 arc --version
@@ -171,11 +179,11 @@ Replace `WINDOW_ID` with the selected window's `hostId`. Confirm `scopeReady` an
 
 [Window discovery](cli-reference.md#windows) defines capability output and observed access diagnostics. [Window selection](cli.md#windows) defines stale activation handling. The [skill](../cli/skills/arc-sessions/SKILL.md#select-a-ready-window) applies these limits before agent actions.
 
-An optional launch check sends paid agent requests and requires reader authorization. Choose the cheapest suitable offered settings for one Claude session and one Codex session. `arc setups` prints readable choices. For structured choices, use `arc setups --window WINDOW_ID --json`. Reusable rows appear in `setups`, with `key` and `provider`. Use a row for the intended provider, and exclude rows with `missingValue`.
+The optional launch check sends paid agent requests and requires reader authorization. Choose the cheapest suitable offered settings for one Claude session and one Codex session. `arc setups` prints readable choices. For structured choices, use `arc setups --window WINDOW_ID --json`. Reusable rows appear in `setups`, with `key` and `provider`. Use a row for the intended provider, and exclude rows with `missingValue`.
 
 A provider without a reusable row still has explicit choices in `agents`. Select its `provider`, then a model's `models[].value`, that model's string-array `efforts`, and the provider's string-array `permissions`. Model choices are values, not setup keys. A fresh project has no guaranteed reusable row for either provider. If `modelsPending` is true or no model is offered, wait for catalog loading and read setups again. [Setups](cli-reference.md#setups) defines empty values and the output fields.
 
-Create the prompt file below in PowerShell. Replace `WINDOW_ID` with the selected window's `hostId`. This writes regular UTF-8 without a byte-order mark, including on PowerShell 5.1.
+Create the prompt file in PowerShell. Replace `WINDOW_ID` with the selected window's `hostId`. This writes regular UTF-8 without a byte-order mark, including on PowerShell 5.1.
 
 ```powershell
 $arcWindow = 'WINDOW_ID'
@@ -184,7 +192,7 @@ $arcEncoding = New-Object System.Text.UTF8Encoding($false)
 [System.IO.File]::WriteAllText($arcPrompt, 'Reply with Ready. Do not use tools or change files.', $arcEncoding)
 ```
 
-For each provider, use one launch route. With returned keys, replace the key placeholders below:
+Use one launch route per provider. Replace the placeholders with returned keys:
 
 ```powershell
 arc start --window $arcWindow --setup 'CLAUDE_SETUP_KEY' --prompt-file $arcPrompt --name 'Claude session check' --arc-dispatch
@@ -200,7 +208,7 @@ arc start --window $arcWindow --provider codex --model 'CODEX_MODEL_VALUE' --eff
 
 Record both accepted session IDs. Inspect each session with the read commands above and confirm its response and recorded provider settings. If delivery is unknown, stop that launch check and preserve its request ID. Do not start a replacement.
 
-To check curation, use the commands below only on the check sessions. Replace `SESSION_ID` with the chosen check session.
+Run these curation commands only on the check sessions. Replace `SESSION_ID` with the chosen session.
 
 ```sh
 arc label add SESSION_ID --label Session-check --dry-run --window WINDOW_ID
@@ -219,11 +227,11 @@ Hidden or unavailable attention refuses archive without `--force`. Leave the Cod
 
 ## Session cost reports
 
-Arc supplies raw session and cost data. The agent assembles any report by label, parent, or time. Arc has no report dashboard, label accounting, or report schedule. The skill's [cost rules](../cli/skills/arc-sessions/costs.md) define pagination, child costs, intervals, and label accounting.
+Arc supplies raw session and cost data for agents to report by label, parent, or time. Arc has no report dashboard, label accounting, or report schedule. The skill's [cost rules](../cli/skills/arc-sessions/costs.md) define pagination, child costs, intervals, and label accounting.
 
 ## Cache expiry and handoff
 
-Arc reports context and prompt-cache evidence. The skill does not manage cache expiry, send keepalive prompts, compact sessions, or create durable handoffs automatically. [Lowering agent costs](lowering-agent-costs.md) owns continuation and handoff decisions.
+Arc reports context and prompt-cache evidence. The skill never automatically manages cache expiry, sends keepalive prompts, compacts sessions, or creates durable handoffs. [Lowering agent costs](lowering-agent-costs.md) owns continuation and handoff decisions.
 
 A coordinator's handoff must retain the selected window, accepted session IDs, results, uncertain request IDs, and remaining reader decisions. Window reload changes the activation, so re-discover the window before new work. Saved session records and CLI reads do not restore a coordinator's own context.
 

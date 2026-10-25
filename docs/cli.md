@@ -1,6 +1,6 @@
 # Arc CLI
 
-The Arc CLI reads saved session costs, renders a Claude Code status line, and manages sessions through a running Arc window. It is experimental. npm publication is deferred.
+The experimental Arc CLI reads saved session costs, renders a Claude Code status line, and manages sessions through a running Arc window. npm publication is deferred.
 
 [Install the CLI](../cli/README.md#install) or use the matching commands supplied by the Arc extension. Agents started by Arc can run `arc` from their shell commands. [Session guidance](arc-sessions.md) describes automatic native skill availability and personal installation.
 
@@ -10,7 +10,7 @@ arc cost --help
 arc start --help
 ```
 
-Command help lists syntax, options, output fields, refusals, and an example. The [CLI reference](cli-reference.md) defines response fields, limits, and automation contracts.
+The [CLI reference](cli-reference.md) defines response fields, limits, and automation contracts.
 
 ## Windows
 
@@ -21,13 +21,13 @@ arc windows
 arc windows --json
 ```
 
-Check the folders and readiness, then replace `WINDOW_ID` in the examples with the intended window's `hostId`. Commands operate within that window's repository scope.
+Check folders and readiness. Replace `WINDOW_ID` with the intended window's `hostId`. Commands use that window's repository scope.
 
 `--window` overrides `ARC_WINDOW`. Without either, integrated terminals select their owning window. External shells require exactly one live window. Automatic selection requires complete discovery. Integrated terminals also require conclusive ownership replies from every window.
 
 Remote integrated terminals and incompatible process namespaces require explicit selection. If ownership is unavailable, reload older Arc windows or pass `--window`.
 
-After a reload or reconnection, list windows again and reselect the intended folders. Saved window IDs retain the old activation. A running process keeps the `ARC_WINDOW` value it started with. Each session that an Arc window launches receives that window's current ID when the window has a channel, as [Agent protocols](agent-protocols.md) describes. Preserve uncertain writes and their original request IDs before starting another operation.
+After reload or reconnection, list windows again and select the intended folders. Saved IDs name the old activation. Running processes retain their initial `ARC_WINDOW`. When a window has a channel, launched sessions receive its current ID, as [Agent protocols](agent-protocols.md) describes. Preserve uncertain writes and their original request IDs before starting another operation.
 
 An empty window list means no verified live window. `complete: false` means discovery is incomplete, even when reachable windows appear. [Window output](cli-reference.md#windows) explains diagnostics and `ARC_HOME`.
 
@@ -41,7 +41,7 @@ arc sessions --query 'label:Review -is:archived' --window WINDOW_ID --json
 arc session SESSION_ID --turns 5 --window WINDOW_ID --json
 ```
 
-`sessions` prints readable rows by default. `session` prints delivered prompts and responses. Use `--json` for fields and receipts. `sessions` returns one page. Follow `next` with `--cursor`, retaining the window, query, and limit:
+`sessions` prints one page of readable rows by default. `session` prints delivered prompts and responses. Use `--json` for fields and receipts. Follow `next` with `--cursor`, retaining the window, query, and limit:
 
 ```sh
 arc sessions --query 'label:Review -is:archived' --cursor CURSOR --window WINDOW_ID --json
@@ -51,7 +51,7 @@ arc sessions --query 'label:Review -is:archived' --cursor CURSOR --window WINDOW
 
 Listing queries accept `id:`, `session:`, `agent:`, `title:`, `label:`, `is:archived`, and `is:agentrun`. A listing includes archived sessions unless the query adds `-is:archived`. [Session query syntax](rail-and-navigation.md#session-list) defines identities and OR groups. Use [the panel filter](#panel-filter) for live statuses and other search areas.
 
-`session` reads five recent turns by default, with `--turns 1-20` available. Check `partial`, `state`, and `notes` before treating the reply as complete. Stale replies contain no turns. An unparsed reply does not establish an empty session. Reads never mark turns read.
+`session` reads five recent turns by default. `--turns` accepts 1-20. Check `partial`, `state`, and `notes` before treating the reply as complete. Stale replies contain no turns. An unparsed reply does not establish an empty session. Reads never mark turns read.
 
 [Session output](cli-reference.md#sessions) defines row fields, run statuses, pagination, and bounded reads.
 
@@ -64,7 +64,7 @@ arc collect --window WINDOW_ID --query '-is:archived' --json
 arc collect --window WINDOW_ID --query 'label:Review' --turns 2 --max-reads 2 --json
 ```
 
-This command requires `--window` or `ARC_WINDOW`. It never discovers or switches windows. Omit `--turns` to collect listings alone.
+`collect` requires `--window` or `ARC_WINDOW` and never discovers or switches windows. Omit `--turns` to collect listings alone.
 
 | Option | Meaning |
 | --- | --- |
@@ -73,7 +73,7 @@ This command requires `--window` or `ARC_WINDOW`. It never discovers or switches
 | `--max-reads 0-32` | Turn requests, including retries. Requires `--turns`. Default: 32. |
 | `--deadline-ms 1-60000` | Stop starting requests after this interval. Default: 60000. Started requests can finish later. |
 
-The JSON preserves raw replies, usable row references, and turn outcomes. Check traversal, coverage, freshness, and outcomes separately. An unavailable empty first page does not establish an empty repository. Turn replies do not establish physical source continuity with earlier listings. Collection changes no session state and includes no cost aggregation.
+JSON preserves raw replies, usable row references, and turn outcomes. Check traversal, coverage, freshness, and outcomes separately. An unavailable empty first page does not establish an empty repository. Turn replies do not establish physical source continuity with earlier listings. Collection changes no session state and includes no cost aggregation.
 
 [Collection output](cli-reference.md#collection) defines recovery, references, and limits.
 
@@ -99,7 +99,7 @@ arc setups --window WINDOW_ID --json
 arc start --provider codex --prompt-file './review prompt.txt' --name 'Review branch' --label Review --pinned --window WINDOW_ID
 ```
 
-Use `--setup KEY` instead of explicit provider settings to select a returned setup. Prompt files accept at most 48 KiB. Empty prompts and slash commands refuse launch. Requested settings do not establish observed provider execution.
+Use a returned `--setup KEY` instead of explicit provider settings. Prompt files accept at most 48 KiB. Empty prompts and slash commands refuse launch. Requested settings do not establish observed provider execution.
 
 `--cwd DIR` selects an existing folder in the window's open project or registered worktrees. Omission uses its first folder. Arc creates no folder or worktree.
 
@@ -107,7 +107,7 @@ Starts retain reader ownership by default. Use `--agent-run` for delegated work.
 
 The [start output reference](cli-reference.md#session-writes) defines `link` for reporting an accepted session.
 
-Add `--cache-lifetime 1h` to give a Claude coordinator that waits on workers a 1 hour prompt cache. `--cache-lifetime 5m` selects 5 minutes. [Session writes](cli-reference.md#session-writes) defines the default and refusals.
+For a Claude coordinator waiting on workers, `--cache-lifetime 1h` selects a 1 hour prompt cache. `--cache-lifetime 5m` selects 5 minutes. [Session writes](cli-reference.md#session-writes) defines the default and refusals.
 
 Read [hosted read-only launches](agent-protocols.md#hosted-read-only-launches) before using `--read-only`. Codex denies filesystem writes. Claude restricts tools and git commands but can approve shell writes.
 
@@ -124,19 +124,19 @@ Archive removes the pin. Unarchive leaves the session unpinned. `--force` admits
 
 ### Uncertain writes
 
-A disconnected or timed-out write returns `unknown` with its request ID when delivery is uncertain. Retry only the identical payload with that ID in the original window activation. Never change the ID to retry an uncertain launch. Reloading creates a new activation and leaves the old outcome unknown.
+A disconnected or timed-out write with uncertain delivery returns `unknown` and its request ID. Retry only the identical payload with that ID in the original window activation. Never change the ID to retry an uncertain launch. Reloading creates a new activation and leaves the old outcome unknown.
 
 [Write contracts](cli-reference.md#session-writes) define statuses, request IDs, and capacity limits.
 
 ### Follow-ups
 
-`send` delivers literal reader-requested text when `--observation` is absent. The destination must have an existing live child in the selected scope. Eligible idle sessions start a prompt. Eligible running sessions receive live input. Add `--queue` or `-q` for intentional next-turn delivery. Older queued messages retain FIFO precedence. Open requests, pending work, and unsupported live delivery defer the message. `queued` confirms admission, not delivery.
+`send` delivers literal reader-requested text when `--observation` is absent. The destination requires a live child in the selected scope. Eligible idle sessions start a prompt. Eligible running sessions receive live input. Add `--queue` or `-q` for intentional next-turn delivery. Older queued messages retain FIFO precedence. Open requests, pending work, and unsupported live delivery defer the message. `queued` confirms admission, not delivery.
 
 ```bash
 arc send SESSION_ID --prompt-file message.txt --request-id WINDOW_ID:message --window WINDOW_ID --json
 ```
 
-With `--observation`, `send` delivers one prompt to an idle session the requester started with `start --arc-dispatch`. Read it first:
+With `--observation`, `send` delivers one prompt to an idle session started by the requester with `start --arc-dispatch`. Read the session first:
 
 ```sh
 arc session SESSION_ID --window WINDOW_ID --json
@@ -167,7 +167,7 @@ arc dispatch result LAUNCH_ID --event EVENT_ID --json
 arc dispatch wait LAUNCH_ID --window WINDOW_ID --json
 ```
 
-Copy `launchId` from the accepted start and `EVENT_ID` from status. Follow status pages through `next`. Standalone `wait` accepts manual or waited completion. Hosted `wait` requires waited completion. Disconnect returns `uncertain`. Deadline expiry returns `deadline`. Read status or recover afterward. Recovery never starts, resumes, stops, or replaces a worker.
+Copy `launchId` from the accepted start and `EVENT_ID` from status. Follow `next` through status pages. Standalone `wait` accepts manual or waited completion. Hosted `wait` requires waited completion. Disconnect returns `uncertain`. Deadline expiry returns `deadline`. Read status or recover afterward. Recovery never starts, resumes, stops, or replaces a worker.
 
 Reports remain readable after host shutdown and when full cost is unknown. [Dispatch contracts](cli-reference.md#dispatch-results) define report availability, claims, acknowledgments, and limits.
 
@@ -175,15 +175,15 @@ Reports remain readable after host shutdown and when full cost is unknown. [Disp
 
 `arc run` starts one explicitly selected provider without a window. Run `arc run --help` for required settings and output options. Claude read-only launches use print mode. Writable Claude uses background mode. Codex uses `exec` or an attended interactive session. Existing directories, repeated extra directories, executable overrides, and literal argument boundaries remain part of each receipt. Arc creates no branch or worktree. `--cache-lifetime` works as it does for [starts](#session-management).
 
-`--log PATH` exposes live print output or writable Claude native logs. Print launches retain separate private stdout and stderr files. The log preserves byte order within each channel. Relative stdout/stderr ordering is unspecified. Resumed observation continues captured bytes without restarting the worker or taking over a reused log alias. Writable Claude logs use its accepted background ID and retain native bytes separately from launch output. Codex uses the log file stem followed by `.last.md` beside the log for its frozen final response. `--report-file` or `--output` selects another report alias. Reused aliases never supply receipt report bytes.
+`--log PATH` exposes live print output or writable Claude native logs. Print launches retain private stdout and stderr files, preserving byte order within each channel. Ordering between channels is unspecified. Resumed observation continues captured bytes without restarting the worker or taking over a reused log alias. Writable Claude logs use its accepted background ID and retain native bytes separately from launch output. Codex freezes its final response beside the log, using the log stem followed by `.last.md`. `--report-file` or `--output` selects another report alias. Reused aliases never supply receipt report bytes.
 
-Manual completion returns the launch ID. Waited completion returns an observation or deadline. Each launch owns one finite supervisor. Requested log capture continues after observation ends. Print capture drains remaining output after provider exit. Writable Claude capture follows its accepted background job until native terminal evidence and drains its remaining log. Status separates session identity, worker exit, observation state, report availability, and consumption. Background launcher exit never establishes worker exit. A stopped supervisor permits explicit resumed observation without restarting its worker. Unknown final evidence remains pending. Callback delivery refuses before launch because original daemon parent authority is unavailable.
+Manual completion returns the launch ID. Waited completion returns an observation or deadline. Each launch has one finite supervisor. Log capture continues after observation ends when requested. Print capture drains remaining output after provider exit. Writable Claude capture follows its accepted background job until native terminal evidence and drains its remaining log. Status separates session identity, worker exit, observation state, report availability, and consumption. Background launcher exit never establishes worker exit. A stopped supervisor permits explicit resumed observation without restarting its worker. Unknown final evidence remains pending. Callback delivery refuses before launch without original daemon parent authority.
 
-`--arc-dispatch` waits up to 110,000 milliseconds for accepted native identity, within the waited completion deadline when selected. It prints the existing dispatch marker after the launch JSON. Missing identity leaves the launch JSON without a marker and starts no replacement. The marker names the original transcript session, separately from the Arc launch ID and Claude background job ID. Omitted `--agent-run` and explicit false produce `owned: true`. Explicit true produces delegated work. `--attach` retains reader ownership. Attended Codex provides no captured transcript identity and prints no marker. Worker report text never supplies a marker. [Link a launched session](agent-protocols.md#link-a-launched-session) owns receipt parsing and relationship discovery.
+`--arc-dispatch` waits up to 110,000 milliseconds for accepted native identity, within the waited completion deadline when selected. It prints the existing dispatch marker after the launch JSON. Missing identity produces no marker or replacement launch. The marker names the original transcript session, separate from Arc launch and Claude background job IDs. Absent or false `--agent-run` produces `owned: true`. Explicit true produces delegated work. `--attach` retains reader ownership. Attended Codex captures no transcript identity and prints no marker. Worker report text never supplies a marker. [Link a launched session](agent-protocols.md#link-a-launched-session) owns receipt parsing and relationship discovery.
 
 `--attach` opens a reader-owned session after terminal admission. It refuses Claude read-only and waited completion. Windows uses Windows Terminal with Git Bash from `DISPATCH_CLI_BASH` or Git's install ancestors. macOS uses Terminal. Other platforms use tmux when `TMUX` is set. Otherwise, they try x-terminal-emulator, then gnome-terminal. Codex runs interactively with a positional prompt and retains its real exit without a captured final response. Attended Codex refuses explicit log and report paths. Writable Claude starts in background mode, then opens its launch-bound native attach command. Failed terminal attachment preserves the original launch and result.
 
-`arc dispatch logs LAUNCH_ID`, `arc dispatch attach LAUNCH_ID`, and `arc dispatch stop LAUNCH_ID` use the accepted Claude background identity of a standalone writable launch. Native output streams to the current terminal. A successful command returns JSON. Stop preserves the session and does not establish worker exit. Missing or ambiguous launch acknowledgments refuse management. Native background IDs are not accepted as command targets. `arc dispatch rm LAUNCH_ID` requires the same identity and refuses removal because native session and directory preservation remain unqualified. Extra arguments refuse before native execution. Arc removes no supplied directory, branch, transcript, or receipt.
+`arc dispatch logs LAUNCH_ID`, `arc dispatch attach LAUNCH_ID`, and `arc dispatch stop LAUNCH_ID` use the accepted Claude background identity of a standalone writable launch. Native output streams to the current terminal. A successful command returns JSON. Stop preserves the session and does not establish worker exit. Management refuses missing or ambiguous launch acknowledgments and native background IDs as command targets. `arc dispatch rm LAUNCH_ID` requires the same identity and refuses removal because native session and directory preservation remain unqualified. Extra arguments refuse before native execution. Arc removes no supplied directory, branch, transcript, or receipt.
 
 ## Read acknowledgments
 
@@ -193,7 +193,7 @@ Acknowledge delivered completed turns only at the reader's request:
 arc read SESSION_ID --observation READ_OBSERVATION --request-id WINDOW_ID:read-check --window WINDOW_ID --dry-run --json
 ```
 
-Copy `readObservation` from `arc session`, separate from the follow-up `observation`. Use a fresh request ID without `--dry-run` to save the acknowledgment. Partial replies acknowledge only their included completed turns. Source changes invalidate agent marks, including append growth. Preserve the request ID after `unknown`. [Read acknowledgment contracts](cli-reference.md#read-acknowledgments) define receipts and outcomes.
+Copy `readObservation` from `arc session`, distinct from follow-up `observation`. Use a fresh request ID without `--dry-run` to save the acknowledgment. Partial replies acknowledge only their included completed turns. Source changes invalidate agent marks, including append growth. Preserve the request ID after `unknown`. [Read acknowledgment contracts](cli-reference.md#read-acknowledgments) define receipts and outcomes.
 
 ## Read a cost report
 
@@ -207,7 +207,7 @@ arc cost SESSION_ID --since 2026-10-01T00:00:00Z --until 2026-10-02T00:00:00Z
 
 Use a saved Claude Code or Codex ID, or an existing transcript or rollout path. An exact path resolves ambiguous ID discovery. `--source-only` requires a path and excludes children. Times require `Z` or an explicit offset. The report includes `--since` and excludes `--until`.
 
-`cost` prints readable summaries by default. Add `--json` for the fields below, tokens, context, and cache details.
+`cost` prints readable summaries by default. `--json` adds the fields below, tokens, context, and cache details.
 
 | Field              | Meaning                                                                |
 | ------------------ | ---------------------------------------------------------------------- |

@@ -4,7 +4,7 @@ Use the [CLI guide](cli.md) for runnable examples. Run `arc COMMAND --help` for 
 
 ## Invocation
 
-`--version` prints the package version and a twelve-character source commit, for example `0.1.0 (abcdef123456)`. Changed source adds `-dirty` inside the parentheses. Unavailable identity prints `unknown`. Unknown dirty state has no marker and does not establish a clean checkout. The command uses embedded build metadata without Git or the source folder.
+`--version` prints the package version and twelve-character source commit, such as `0.1.0 (abcdef123456)`, from embedded metadata. It needs neither Git nor the source folder. Changed source adds `-dirty` inside the parentheses. Unavailable identity prints `unknown`. Unknown dirty state adds no marker and does not establish a clean checkout.
 
 `--version` takes precedence over every argument. No arguments, `help`, and `--help` print the overview. Command help supports nested commands. Help reads no stdin and performs no window discovery, network access, or filesystem mutations.
 
@@ -40,7 +40,7 @@ Session reads use the selected window's accepted catalog and repository scope. T
 | `facts` | `current`, `stale`, or `unparsed` metadata. |
 | `truncated` | Fields shortened or emptied to fit output limits. |
 
-A page holds at most 128 rows by default and stays below 48 KiB and the window's full reply allowance. `--limit` accepts 1 through 128. Transcript appends do not reorder rows. Each page samples facts when served. New sources after the cursor can appear on later pages.
+Pages default to at most 128 rows and stay below 48 KiB and the window's full reply allowance. `--limit` accepts 1 through 128. Transcript appends do not reorder rows. Each page samples facts when served. New sources after the cursor can appear on later pages.
 
 Pass `next` unchanged to `--cursor` with the same window, query, and limit. Modified or expired cursors refuse. Window reloads and scope changes require restarting without a cursor. An unavailable catalog or channel timeout leaves the cursor valid for retry. Only a first page returns an empty listing for an unavailable catalog.
 
@@ -53,7 +53,7 @@ Pass `next` unchanged to `--cursor` with the same window, query, and limit. Modi
 | `freshness: stale` | At least one freshness condition fails. |
 | `complete: true` | This is the last page, coverage is complete, and freshness is current. |
 
-A row has `facts: current` when its accepted revision matches its transcript and metadata. Stale cumulative freshness does not invalidate that row. Complete traversal does not establish parsed row metadata. Notes contain no session IDs.
+`facts: current` means the row's accepted revision matches its transcript and metadata. Cumulative stale freshness does not invalidate it. Complete traversal does not establish parsed row metadata. Notes contain no session IDs.
 
 `id`, `path`, `setup.model`, `setup.effort`, `parent.id`, and `labels` each have a 4 KiB serialized cap. Names share that cap but shorten instead of becoming `null`. Other oversized fields become `null`. Oversized rows retain only `source`, `provider`, and fixed-size facts. Window metadata that prevents even a minimal row produces an explicit error.
 
@@ -99,7 +99,7 @@ The version 1 `collect` envelope contains `window`, `selection`, `limits`, `list
 | `listing` | Separate `stop`, traversal `ended`, `coverage`, `freshness`, `pageRequests`, and `generation`. |
 | `outcomes` | One result per usable source when turns are requested. Each references its `rows` index and raw `reads` observations. |
 
-Coverage and freshness remain null until a usable page exists. Cursor or scope refusal restarts once and excludes abandoned rows from usable results. Timeout or unavailable reads retry once with the same cursor. Repeated cursors, malformed replies, and unknown errors stop the affected path while preserving earlier observations.
+Coverage and freshness remain null until the first usable page. Cursor or scope refusal restarts once, excluding abandoned rows from usable results. Timeout or unavailable reads retry once with the same cursor. Repeated cursors, malformed replies, and unknown errors stop the affected path while preserving earlier observations.
 
 Turn outcomes use `completed`, `skipped`, or `failed` with bounded reasons. Completed collection preserves partial, stale, and unparsed replies. Null, empty, truncated, ambiguous, colliding, and over-256-character identities receive skipped outcomes. Distinct providers and paths retain distinct listing rows. Source order establishes no priority.
 
@@ -107,7 +107,7 @@ Turn replies retain their returned identity separately from the requested row. M
 
 [Collection options](cli.md#collect-session-data) bound request admission. Retries and abandoned requests consume those limits. At most two turn requests run concurrently. Deadline expiry permits started requests to settle. Transport and Windows helper preparation prevent a fixed completion-time promise. Request limits establish no total host-I/O bound.
 
-Output stays within eight MiB. Capacity exhaustion retains explicit outcomes and complete JSON. Collection supplies no ranking or summary.
+Output stays within eight MiB, with explicit outcomes and complete JSON on capacity exhaustion. Collection supplies no ranking or summary.
 
 ## Panel filter
 
@@ -143,7 +143,7 @@ Each provider's `models` lists exact catalog values as `{value, efforts}`, with 
 
 Starts require a ready panel, project setup storage, and a loaded provider catalog. Unsupported settings refuse launch.
 
-Prompt files must be regular and at most 48 KiB. Empty prompts and slash commands refuse. Encoded requests above the 64 KiB channel limit refuse before connection. Explicit working directories resolve from the caller's directory and use their real filesystem destination.
+Prompt files must be regular, nonempty, and at most 48 KiB. Slash commands refuse. Encoded requests above the 64 KiB channel limit refuse before connection. Explicit working directories resolve from the caller's directory and use their real filesystem destination.
 
 `--agent-run` and `--agent-run=true` classify delegated work. Omission or `--agent-run=false` retains reader ownership and Prompt box continuation. Classification accepts only literal `true` or `false` and cannot repeat. Only `--arc-dispatch` prints the dispatch receipt. Reader-owned receipts include `owned: true`.
 
@@ -206,7 +206,7 @@ Results include `requestId` and `state`: `queued`, `started`, `completed`, `canc
 
 Add `--continuation-file 'ABSOLUTE_PATH' --continuation-sha256 SHA256` immediately after `--after-turn`. Include both literal values in the native shell command.
 
-Files require 1 through 8192 exact UTF-8 bytes. BOM, NUL, invalid UTF-8, whitespace-only input, and leading slash commands refuse. The digest is lowercase SHA-256 for those bytes. Arc reads the regular file once without deleting or rereading it.
+Files must contain 1 through 8192 exact UTF-8 bytes. BOM, NUL, invalid UTF-8, whitespace-only input, and leading slash commands refuse. Supply the bytes' lowercase SHA-256 digest. Arc reads the regular file once and keeps it.
 
 Windows paths must be drive-absolute. POSIX paths must begin `/`. Use forward slashes and single quotes. Filenames accept ASCII letters, digits, spaces, underscore, period, hyphen, parentheses, and slash. Empty or dot segments, repeated slashes, shell expansion, and paths above 1024 characters refuse.
 
@@ -249,7 +249,7 @@ Unavailable source facts project no marks. Reader boundaries remain separate, an
 
 ## Cost reports
 
-Cost prints readable summaries by default. `--json` prints one structured object. Neither format reads stdin. `schemaVersion: 3` identifies the contract. `buildCommit` identifies the bundled commit, or `unknown` without build identity. `rateNote` describes pricing.
+`cost` prints readable summaries, or one structured object with `--json`. Neither reads stdin. `schemaVersion: 3` identifies the contract. `buildCommit` identifies the bundled commit, or `unknown` without build identity. `rateNote` describes pricing.
 
 ### Source selection
 
@@ -275,9 +275,15 @@ The [guide](cli.md#read-a-cost-report) defines top-level summaries and dollar fi
 
 Unique Codex response IDs establish recorded billing requests. Identified compaction usage enters the total once, including when its native bill also exists. Combined coverage ranks gaps above unknown coverage, then reconciled usage.
 
-A compaction keeps reconciliation intact when its `compacted` record names a response, that response has a complete bill from the source thread, and the next snapshot repeats the total before that bill with zero request counters. When the `compacted` record carries a copy of that bill, each response, thread, usage, and cumulative field in the copy must equal the native bill. Each later snapshot must then equal its bill's thread total minus the usage of every earlier compaction bill that meets these conditions since the last snapshot reset, in every counter. Any other difference leaves coverage unresolved from that point.
+A compaction preserves reconciliation under these conditions:
 
-A source summary whose coverage is neither absent nor `recorded-reconciled` carries `coverageDefect`. Its `kind` repeats the coverage value. `since` is the start of the earliest intersecting unresolved interval of any kind, which can precede `--since`. It is null for `legacy-snapshots`, which has no interval. `cause` names what left that interval unresolved. Combined summaries and `modelCosts` rows omit `coverageDefect`. Unsupported prices appear in `unpricedModels` instead.
+- Its `compacted` record names a response with a complete bill from the source thread.
+- The next snapshot repeats the total before that bill with zero request counters.
+- If `compacted` copies the bill, each response, thread, usage, and cumulative field must equal the native bill.
+
+Each later snapshot must equal its bill's thread total minus qualifying earlier compaction bills' usage since the last snapshot reset. Every counter must match. Any other difference leaves coverage unresolved from that point.
+
+Source summaries carry `coverageDefect` unless coverage is absent or `recorded-reconciled`. Its `kind` repeats coverage. `since` starts the earliest intersecting unresolved interval of any kind, which can precede `--since`. It is null for `legacy-snapshots`, which has no interval. `cause` names why the interval remains unresolved. Combined summaries and `modelCosts` rows omit `coverageDefect`. Unsupported prices appear in `unpricedModels` instead.
 
 | Cause | Meaning |
 | --- | --- |
@@ -300,13 +306,13 @@ Source summaries include supported request counts, tokens, context, averages, to
 
 `cacheExpiry.inputCostAfterExpiryUsd` prices uncached input and cache writes on return requests. It excludes cached reads and output. `extraCostAfterExpiryUsd` prices returning first-pass input that resends prior final-pass context, above the cached-read price. It excludes new prompt text. Unpriced returns leave either amount null.
 
-`cacheExpiry.byBoundary` counts each return by the visible turns of its two requests. `afterAUserTurn` counts returns where the request belongs to a later turn than the request before it. `insideOneTurn` counts returns where both requests belong to one turn. `turnUnknown` counts returns where either request has no visible turn. The split is by turn and never by cause. Claude opens a turn at a typed prompt only. A tool result and a completion notice from a background subagent open no turn. A long tool call, or a return after such a notice, lands in `insideOneTurn` when no typed prompt came between the two requests. With a typed prompt between them, it lands in `afterAUserTurn`. Claude requests before the first typed prompt land in `turnUnknown`, and so do Claude child requests, which have no visible turn boundary. A Codex request counted from a `token_count` event carries the turn that the latest `task_started` event opened. A Codex request counted from a billing record carries no turn and lands in `turnUnknown`. A rollout with billing records counts its requests from them, except compaction requests that carry a response id.
+`cacheExpiry.byBoundary` groups returns by their two requests' visible turns. `afterAUserTurn` counts returns in a later turn. `insideOneTurn` counts returns within one turn. `turnUnknown` counts returns with either turn unknown. The split is by turn and never by cause. Claude opens a turn at a typed prompt only. A tool result and a completion notice from a background subagent open no turn. Claude requests before the first typed prompt land in `turnUnknown`, and so do Claude child requests, which have no visible turn boundary. A Codex request counted from a `token_count` event carries the turn that the latest `task_started` event opened. A Codex request counted from a billing record carries no turn and lands in `turnUnknown`. A rollout with billing records counts its requests from them, except compaction requests that carry a response id.
 
 Compaction between requests crossing cache lifetime increments `cacheExpiry.excludedAmbiguous`. The command never measures that pair from compaction. Codex cache-write counters establish volume, not lifetime. Codex pairs remain observations. Their amounts stay null without independent adjacency evidence.
 
 ### Model detail
 
-`--by-model` adds `modelCosts` to parent and child summaries. Each row retains its recorded model name, or null when missing. Rows contain billing request counts, coverage, dollar amounts, and normalized token quantities. Prices include recorded amounts, provider routes, context bands, and service tiers.
+`--by-model` adds parent and child `modelCosts` rows with recorded model names, billing request counts, coverage, dollar amounts, and normalized token quantities. Missing model names are null. Prices include recorded amounts, provider routes, context bands, and service tiers.
 
 Tokens are observed subtotals. A normalized zero does not prove the source recorded that counter. Source coverage uncertainty applies to every row, including fully priced rows. Unattributable snapshots and tools remain on source summaries. Model rows omit context, averages, failures, and cache-expiry figures.
 
@@ -316,9 +322,9 @@ Model quantities reconcile with source billing before rounding. Full costs requi
 
 `--by-tool` splits each parent request's price evenly across the tool results it reads. A Claude request reads the results recorded before it. A Codex request reads the outputs recorded before its billing record, which is the first `token_usage_record` after each output. A Codex rollout without billing records reports every request as `no tool result`. Codex `wait_agent`, `wait`, and `write_stdin` calls form the `wait` kind.
 
-Each `byTool.rows[]` row names a kind and lists its `tools[]`. A tool is the tool name, or the tool and its program for a shell command, such as `Bash git` or `exec_command rg`. Tool shares use the same total as kind shares, so the tools of a kind sum to that kind. Text output indents each tool under its kind. A request counts once for every kind and every tool it touches, so row request counts can exceed the parent total. Top-level `byTool` uses the main parent window. `--by-tool-kind` is an alias of `--by-tool`.
+Each `byTool.rows[]` row names a kind and lists its `tools[]`. A tool is the tool name, or the tool and its program for a shell command, such as `Bash git` or `exec_command rg`. Tool shares sum to their kind's share of the same total. Text output indents each tool under its kind. A request counts once for every kind and every tool it touches, so row request counts can exceed the parent total. Top-level `byTool` uses the main parent window. `--by-tool-kind` is an alias of `--by-tool`.
 
-`--until-text REGEX` requires `--by-tool`. Its separate `untilText.byTool` excludes the first matching parent request and all later requests within the main window. No match includes every parent request in that window. `untilText.matched` reports whether one exists. This result changes no other summary.
+`--until-text REGEX` requires `--by-tool`. Its separate `untilText.byTool` excludes the first matching parent request and later requests within the main window. Without a match, it includes every parent request there. `untilText.matched` records whether a match exists. Other summaries stay unchanged.
 
 Matching searches Claude assistant text and tool input. Codex supplies empty text. Patterns requiring characters never match Codex. Empty-text patterns also match Codex and empty Claude requests. Multiline `^$` also matches blank Claude lines, including the separator before tool input without assistant text. A literal empty argument refuses.
 
@@ -332,13 +338,13 @@ Regex matching is multiline. Leading `(?i)`, `(?m)`, and `(?s)` select case-inse
 
 Unavailable or invalid figures use null. Text shows unknown context as `--`, unknown cache as `unknown`, and unpriced next-turn input as `next turn unknown`. Optional unavailable figures disappear.
 
-Width uses `--width` before `COLUMNS`. Missing or invalid values mean unlimited width. Width changes text detail alone. Required context, cache, and next-turn segments can exceed it.
+`--width` overrides `COLUMNS` for text detail. Missing or invalid values mean unlimited width. Required context, cache, and next-turn segments can exceed it.
 
 Text rounds positive next-turn starting prices below $10 upward to cents. Prices at least $10 round upward to whole dollars. JSON retains the underlying amount. [Status-line setup](../cli/README.md#status-line-setup) defines next-turn estimates and settings.
 
 ## Errors
 
-Successful commands exit 0. Unless stated otherwise below, errors print one `arc:`-prefixed line to stderr, exit 1, and produce no stdout report. Returned outcomes such as `refused` and `unknown` are command output, distinct from CLI errors.
+Successful commands exit 0. Unless specified below, errors print one `arc:`-prefixed stderr line, exit 1, and produce no stdout report. Returned outcomes such as `refused` and `unknown` are command output.
 
 Cost rejects unknown options, missing values, multiple targets, invalid times or regexes, unreadable transcripts, and unresolved Agent launches. JSON arrays, identifiable Claude stream logs, empty files, and files without native transcript records fail. Metadata-only native sessions and empty request windows remain valid. Repeated cost options use their last value. When cost handles `SIGINT` or `SIGTERM` cancellation, it exits 130 or 143, respectively, and produces no stdout report.
 
