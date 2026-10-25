@@ -24,7 +24,7 @@ Clear starts no turn. A successful reset draws no temporary card. Codex `/new` u
 
 The transition needs acceptance and a successor identity. Claude reports acceptance first. Codex reports the successor first. Success moves the payload and dependent prompts before draining the successor queue. The source retains its transcript, comments, labels, and session list row.
 
-Failure or refusal draws a failure card. Codex `/new`, and a reset that carries comments or files, keeps its payload as source recovery and blocks dependent prompts until Edit or Drop resolves it. A bare `/clear` that fails releases the source queue. Reload converts an in-flight reset to unknown and starts no work. A recorded successor retains ownership through refusal, failure, Edit, Drop, and reload. Stale panel submissions follow that successor until the panel paints it. Afterward the source is independently selectable.
+Failure or refusal draws a failure card. A queued Codex `/new`, or a queued reset that carries comments or files, keeps its payload as source recovery and blocks dependent prompts until Edit or Drop resolves it. Any other failed reset releases the source queue. Reload converts an in-flight reset to unknown and starts no work. A recorded successor retains ownership through refusal, failure, Edit, Drop, and reload. Stale panel submissions follow that successor until the panel paints it. Afterward the source is independently selectable.
 
 Codex-compaction queueing requires durable capacity for the whole submission, including attachment-only prompts, without truncation or eviction. Waiting entries retain staged files through repaint, selection changes, and reload. Reload restores the queue before draining it.
 
