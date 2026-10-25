@@ -1,32 +1,32 @@
 # Turn comments
 
-Use this guide when changing comment storage, text anchoring, editing, or prompt delivery. [Timeline](timeline.md) owns turn identity. [Turn cards](turn-cards.md) owns rendering.
+[Timeline](timeline.md) owns turn identity. [Turn cards](turn-cards.md) owns rendering.
 
 ## Data model
 
-`turncomments.ts` owns the durable comment model. A comment records the session, turn key, card part, selected quote, offset, note text, and creation order. Saved values are normalized before use, and invalid or oversized values are dropped.
+`turncomments.ts` stores each comment's session, turn key, card part, quote, offset, text, and creation order. Normalization drops invalid comments, truncates oversized strings, and keeps the newest comments within the list limit.
 
-The card parts are prompt, summary, individual answer blocks, and individual messages the agent wrote while the turn ran. A message part carries the message's own id. Their names are stored data. Renaming one requires a compatibility path for comments already in workspace state. The opening-input heading over input drawn before the response is no part, so it never shifts a stored response offset. A comment saved on the `You asked` or `Assigned task` heading drawn after the response is stored under summary. When the input moves before the response, that comment draws on the input the heading names. On a card with no first prompt, it draws on the first ask and unfolds the asks. A summary comment whose quote a summary line or an answer block holds draws on that line and never on the heading. A card with no first prompt draws its first ask as its first prompt block, so a comment on that ask is stored under prompt.
+Card parts identify the opening prompt, later prompts, summary, answer blocks, and agent messages during the turn. Message parts use message ids. Renaming stored parts requires compatibility with existing workspace comments. The opening-input heading before the response is not a part and never shifts stored response offsets. Comments on the `You asked` or `Assigned task` heading after the response use summary. Moving the input before the response draws those comments on the corresponding input. Without a first prompt, they draw on the first ask and unfold the asks. Quotes matching summary or answer text draw there instead of on the heading. Without a first prompt, the first ask becomes the prompt block and stores its comments under prompt.
 
-Comments live with the shared panel state rather than inside a webview tab. A repaint, hidden panel, or restored tab therefore sees the same comments. Removing a comment changes only that stored comment.
+Shared panel state keeps comments through repaints, hidden panels, and restored tabs. Removing a comment leaves other comments unchanged.
 
 ## Anchoring a selection
 
-The browser starts with a DOM selection. It identifies the card and part, walks the rendered nodes into the plain text the reader saw, and records the selected quote and its start. Selection cannot cross into controls or another comment.
+The browser identifies the selected card and part, walks rendered nodes into visible plain text, and saves the quote and starting offset. Selection cannot cross controls or another comment.
 
-Rendering markdown changes the DOM shape, so the stored offset is a hint rather than a permanent address. On repaint, `turncomments.ts` searches the same card part for the quote. The saved offset breaks ties between repeated text. It counts the lines of the card heading ahead of the body, and saving and drawing count the same lines. Matches respect word boundaries when the quote begins or ends with a word character.
+On repaint, the browser searches the original card part for the quote. The saved offset breaks ties between repeated text, including card-heading lines counted during saving and drawing. Matches respect word boundaries when the quote begins or ends with a word character.
 
-Prompt, summary, answer blocks, and each message are separate search pools. The Activity log removes rows when the reader changes its filter, so a message is searched by its own id and not by its place in the log. Text repeated in the closing summary must not relocate a comment anchored to an earlier answer. If the quote can no longer be found, the comment remains on the turn and is available in the comment list, but no text range is tinted.
+Prompt, summary, answer blocks, and messages have separate initial search pools. Activity log comments use message ids because filtering changes row positions. If the original part has no match, summary and answer parts search each other, and message parts search other message parts. A comment anchored to an earlier answer stays there while its quote matches, even when the summary repeats it. Unmatched comments remain in the turn's comment list without a text tint.
 
-Overlapping comments produce flat highlight runs. They are not nested because nested marks change the text walk and make later offsets depend on drawing order.
+Overlapping comments use flat highlights to keep text offsets independent of drawing order.
 
 ## Editing and navigation
 
 The selection action opens a labelled comment box beside the selected text. The box stays between the sticky heading and the fixed prompt box, choosing the side of the selected text that has room for it. Save writes a non-empty note. Cancel and Escape close the box and return focus to the control or text that opened it.
 
-The comment box edits comments. Session setup stays in the Prompt box.
+Session setup stays in the Prompt box.
 
-A mark on a line opens the comments anchored there. The list supports editing and deletion without changing neighboring comments. Pointer hover may preview the list, but keyboard focus and a press provide the same access.
+A line mark opens its comments for editing or deletion without changing neighboring comments. Pointer hover can preview the list. Keyboard focus and a press provide the same access.
 
 Card repainting waits while the reader writes a comment, presses inside its open comment list, or selects card text. A list opened by a press reopens on the redrawn mark. Focus returns to the same list control. Selecting another session closes the previous session's comment list.
 
@@ -52,7 +52,7 @@ A clicked line without a selection keeps Add a comment and shows neither redirec
 
 Copying a turn or a selected range reconstructs readable markdown from the rendered content. Lists, code fences, quotes, and line breaks survive. Browser-only controls and existing comment text do not enter the copy.
 
-The same plain-text walk supports quote location and copy. A change to rendered markup must verify both paths because a visually unchanged wrapper can alter the node walk.
+Quote location and copy share the plain-text walk. Check both after markup changes, including visually unchanged wrappers.
 
 ## Verification
 
