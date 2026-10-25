@@ -78,7 +78,7 @@ Read at most 4 KiB of that sidecar. Initial naming also accepts the newest compl
 
 Codex uses `thread/name/set`, including typed `/rename`, and returns provider refusals. Initial naming persists an activation-owned operation before launch acknowledgment. Only an exact-session empty-rollout refusal permits recovery. Qualified metadata changes wake at most 40 requests, independently of panel visibility and catalog admission. Each keeps its provider control deadline. Other naming failures retain launch acceptance.
 
-Persist requested and confirmed initial-name states separately, outside browser state. Save a possible-write marker before provider submission. Reload cancels proven-unsent operations and retains possible writes as uncertain, without replay. Reader renames synchronously supersede pending initial names. `InitialNameOperation` in [`sessionrename.ts`](../extension/src/sessionrename.ts) owns title comparisons and cancellation. [`AgentHost`](../extension/src/agenthost.ts) orders initial and explicit renames.
+Persist requested and confirmed initial-name states separately, outside browser state. Save a possible-write marker before provider submission. Reload cancels proven-unsent operations and retains possible writes as uncertain, without replay. Reader renames synchronously supersede pending initial names. `InitialNameOperation` in [`sessionrename.ts`](../extension/src/sessionrename.ts) owns title comparisons. [`PanelHost`](../extension/src/panelhost.ts) cancels an initial name when the session is archived, leaves the panel scope, or the panel is disposed. [`AgentHost`](../extension/src/agenthost.ts) orders initial and explicit renames.
 
 Without a live child, Claude resumes in the recorded directory and sends only the rename control. Codex handshakes and sends only `thread/name/set`, without opening the thread. Both rename-only children close afterward, including on failure.
 
@@ -86,7 +86,7 @@ Without a live child, Claude resumes in the recorded directory and sends only th
 
 [`AgentHost`](../extension/src/agenthost.ts) serializes openings by host key and provider session ID. Replacement and rename-only writers wait for confirmed prior exit, including IDs adopted under fresh keys. Termination requests do not release that barrier. Disposal refuses pending and later openings.
 
-Idle and archive retirement wait for the latest turn-end usage and MCP reads from [`extension.ts`](../extension/src/extension.ts). Prompt and control activity must hold a lease before work. [`AgentHost`](../extension/src/agenthost.ts) owns eligibility, generations, and the `arc.agentIdleMinutes` timer.
+Arc publishes restored archive membership at startup, every later change, and an empty set after a workspace clears. `AgentHost` acts only on complete sets. Idle and archive retirement wait for the latest turn-end usage and MCP reads from [`extension.ts`](../extension/src/extension.ts). Prompt and control activity must hold a lease before work. [`AgentHost`](../extension/src/agenthost.ts) owns eligibility, generations, and the `arc.agentIdleMinutes` timer.
 
 Identified background launches hold idle, archive, and targeted retirement until identified terminal completion. Missing reads, source replacement, later turns, display expiry, Stop, and unknown notices never release those holds. Unresolved work retains its child indefinitely.
 
