@@ -138,7 +138,7 @@ test('one edit stream sent as row deltas to two panels leaves each the rows, fig
     const target = scripted ? panels[0] : pick(panels);
     if (step === 300) {
       // The panel holds a snapshot when the scripted sequence starts.
-      target.sender.reset();
+      target.sender.reset('ready');
       target.gapIn = null;
       target.showing = listed[0].id;
     }
@@ -172,7 +172,7 @@ test('one edit stream sent as row deltas to two panels leaves each the rows, fig
       // The host forgets a panel's rows when that panel's `rowsGap` arrives. A new sender stands in for the reset half the time.
       if (one.gapIn !== null && one.gapIn-- <= 0) {
         one.gapIn = null;
-        if (random() < 0.5) one.sender.reset();
+        if (random() < 0.5) one.sender.reset('ready');
         else one.sender = new RowDeltaSender();
       }
     }
@@ -200,12 +200,12 @@ test('one edit stream sent as row deltas to two panels leaves each the rows, fig
     }
     if (typeof fate === 'number' && fate < 0.05) {
       // VS Code reports the post as not delivered, so the host forgets the panel's rows.
-      if (whole.type !== 'selection') target.sender.reset();
+      if (whole.type !== 'selection') target.sender.reset('ready');
       continue;
     }
     if (typeof fate === 'number' && fate < 0.06) {
       // The page reloads. The host forgets the panel's rows on `ready`, and the new page draws nothing yet.
-      target.sender.reset();
+      target.sender.reset('ready');
       target.receiver = new RowDeltaReceiver(() => {
         target.gaps++;
         target.gapIn = Math.floor(random() * 3);
@@ -283,10 +283,60 @@ test('a panel asks once for a snapshot after a loss and draws nothing until one 
     );
   }
   assert.equal(gaps, 1, 'one lost message asked for more than one snapshot');
-  sender.reset();
+  sender.reset('ready');
   assert.deepEqual(receiver.expand(sender.encode(rows('F'), {}))?.rail, [{ id: 'a', label: 'F' }]);
   assert.deepEqual(receiver.expand(sender.encode(rows('G'), {}))?.rail, [{ id: 'a', label: 'G' }]);
   assert.equal(gaps, 1, 'the panel asked for a snapshot after one arrived');
+});
+
+// The encoding record is the only evidence of why a panel received a snapshot instead of a delta.
+
+test('the sender names why each message was a snapshot and counts the rows it carried', () => {
+  const sender = new RowDeltaSender();
+  const rows = (version: number) => [
+    { id: 'a', version },
+    { id: 'b', version: 0 },
+    { id: 'c', version: 0 },
+  ];
+  const message = (version: number) => ({ type: 'rail' as const, rail: rows(version), stats: { a: [version] } });
+  const globals = { day: 'Mon', scope: ['root'] };
+
+  sender.encode(message(1), globals);
+  assert.deepEqual(sender.lastEncoding, { whole: true, reason: 'first', rowsHeld: 3, rowsSent: 3 });
+
+  sender.encode(message(1), globals);
+  assert.deepEqual(sender.lastEncoding, { whole: false, reason: null, rowsHeld: 3, rowsSent: 0 });
+
+  sender.encode(message(2), globals);
+  assert.deepEqual(sender.lastEncoding, { whole: false, reason: null, rowsHeld: 3, rowsSent: 1 });
+
+  sender.encode(message(2), { ...globals, scope: ['root', 'added'] });
+  assert.deepEqual(sender.lastEncoding, { whole: true, reason: 'globalMoved:scope', rowsHeld: 3, rowsSent: 3 });
+
+  sender.reset('gap');
+  sender.encode(message(2), { ...globals, scope: ['root', 'added'] });
+  assert.deepEqual(sender.lastEncoding, { whole: true, reason: 'reset:gap', rowsHeld: 3, rowsSent: 3 });
+
+  sender.encode(
+    { type: 'rail' as const, rail: [...rows(2), { id: 'a', version: 9 }], stats: {} },
+    {
+      ...globals,
+      scope: ['root', 'added'],
+    },
+  );
+  assert.equal(sender.lastEncoding?.reason, 'repeatedIds');
+  sender.encode(message(2), { ...globals, scope: ['root', 'added'] });
+  assert.equal(sender.lastEncoding?.reason, 'reset:repeatedIds');
+
+  sender.encode(
+    { type: 'rail' as const, rail: [{ id: 'a' }, { noId: true } as unknown as { id: string }], stats: {} },
+    globals,
+  );
+  assert.deepEqual(sender.lastEncoding, { whole: true, reason: 'unkeyedRows', rowsHeld: 0, rowsSent: 0 });
+
+  const withSessions = new RowDeltaSender();
+  withSessions.encode({ type: 'render' as const, sessions: [{ id: 's' }], rail: rows(1), stats: {} }, globals);
+  assert.deepEqual(withSessions.lastEncoding, { whole: true, reason: 'first', rowsHeld: 4, rowsSent: 4 });
 });
 
 test('a delta carries only rows whose content changed', () => {

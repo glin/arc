@@ -258,11 +258,12 @@ test('four known watcher files produce one targeted batch with four paths', () =
     {
       kind: 'targeted',
       changedPaths: batches[0].changedPaths,
+      broadReasons: [],
     },
   );
 });
 
-test('unknown filenames and rename events retain the broad watcher path', () => {
+test('unknown filenames and rename events retain the broad watcher path and name their cause', () => {
   const missing = new PendingWatcherWake();
   missing.noteFileEvent('records', null, 'change');
   assert.deepEqual(
@@ -270,16 +271,37 @@ test('unknown filenames and rename events retain the broad watcher path', () => 
     {
       kind: 'broad',
       changedPaths: [],
+      broadReasons: ['missingFilename'],
     },
   );
 
   const renamed = new PendingWatcherWake();
   renamed.noteFileEvent('records', 'new.jsonl', 'rename');
-  assert.equal(watcherRefreshDecision(renamed.take(), () => true).kind, 'broad');
+  assert.deepEqual(watcherRefreshDecision(renamed.take(), () => true).broadReasons, ['createOrRename']);
 
   const unknown = new PendingWatcherWake();
   unknown.noteFileEvent('records', 'unknown.jsonl', 'change');
-  assert.equal(watcherRefreshDecision(unknown.take(), () => false).kind, 'broad');
+  assert.deepEqual(watcherRefreshDecision(unknown.take(), () => false).broadReasons, ['unknownPath']);
+
+  const requested = new PendingWatcherWake();
+  requested.requireBroad('transcript');
+  assert.deepEqual(watcherRefreshDecision(requested.take(), () => true).broadReasons, ['requested']);
+
+  const empty = new PendingWatcherWake();
+  assert.deepEqual(
+    watcherRefreshDecision(empty.take(), () => true),
+    {
+      kind: 'broad',
+      changedPaths: [],
+      broadReasons: ['noPaths'],
+    },
+  );
+
+  const both = new PendingWatcherWake();
+  both.noteFileEvent('records', null, 'change');
+  both.noteFileEvent('records', 'new.jsonl', 'rename');
+  assert.deepEqual(watcherRefreshDecision(both.take(), () => true).broadReasons, ['createOrRename', 'missingFilename']);
+  assert.deepEqual(both.take().broadReasons, [], 'a taken batch kept its broad causes');
 });
 
 test('live activity with no card names listed transcripts and draws only for a shown session', () => {
@@ -293,7 +315,7 @@ test('live activity with no card names listed transcripts and draws only for a s
   const quiet = listed.take();
   assert.deepEqual(
     watcherRefreshDecision(quiet, () => true),
-    { kind: 'targeted', changedPaths: ['listed-continued.jsonl', 'listed.jsonl'] },
+    { kind: 'targeted', changedPaths: ['listed-continued.jsonl', 'listed.jsonl'], broadReasons: [] },
     'a session with two listed transcripts did not name both',
   );
   assert.equal(quiet.drawRequired, false);
@@ -308,7 +330,14 @@ test('live activity with no card names listed transcripts and draws only for a s
 
   const unlisted = new PendingWatcherWake();
   unlisted.noteActivityFallback(listedFilesFor(['listed', 'new'], catalog), false);
-  assert.equal(watcherRefreshDecision(unlisted.take(), () => true).kind, 'broad');
+  assert.deepEqual(
+    watcherRefreshDecision(unlisted.take(), () => true),
+    {
+      kind: 'broad',
+      changedPaths: [],
+      broadReasons: ['activityFallbackNoFile'],
+    },
+  );
 });
 
 test('a large burst of known transcript changes revalidates every file by name', () => {

@@ -29,6 +29,18 @@ interface Row {
   id: string;
 }
 
+// Why the sender forgot the rows a panel holds. The next message after a reset is a snapshot.
+export type RowResetReason = 'ready' | 'unready' | 'gap' | 'unaccepted' | 'failed' | 'unkeyedRows' | 'repeatedIds';
+
+// What one encoded message carried. `reason` names why a snapshot went out, or null for a delta.
+export interface RowEncoding {
+  whole: boolean;
+  reason: string | null;
+  // Rows the message describes, and rows it had to carry.
+  rowsHeld: number;
+  rowsSent: number;
+}
+
 export interface RowLists {
   sessions?: readonly Row[];
   rail: readonly Row[];
@@ -117,29 +129,46 @@ export class RowDeltaSender {
   private stats: Map<string, string> | null = null;
   // Prints of the inputs every row depends on, by name. A change sends a snapshot.
   private readonly globals = new Map<string, string>();
+  private resetReason: RowResetReason | null = null;
+  // What the last call to `encode` carried.
+  lastEncoding: RowEncoding | null = null;
 
-  reset(): void {
+  reset(reason: RowResetReason): void {
     this.revision = null;
     this.sessions = null;
     this.rail = null;
     this.stats = null;
     this.globals.clear();
+    this.resetReason = reason;
   }
 
   // A message whose lists are not keyed rows posts unchanged, and the next message is a snapshot.
   encode<M extends RowLists>(message: M, globals: Readonly<Record<string, unknown>>): M & { rows?: RowDeltaHeader } {
     if (!encodable(message)) {
-      this.reset();
+      this.reset('unkeyedRows');
+      this.lastEncoding = { whole: true, reason: 'unkeyedRows', rowsHeld: 0, rowsSent: 0 };
       return message;
     }
-    let moved = false;
+    let movedGlobal: string | null = null;
     for (const [name, value] of Object.entries(globals)) {
       const print = JSON.stringify(value) ?? '';
-      if (this.globals.get(name) !== print) moved = true;
+      if (this.globals.get(name) !== print) movedGlobal ??= name;
       this.globals.set(name, print);
     }
+    const moved = movedGlobal !== null;
     const repeated = repeatsIds(message.sessions) || repeatsIds(message.rail);
-    const whole = moved || repeated || this.revision === null || !this.rail || !this.stats;
+    const fresh = this.revision === null || !this.rail || !this.stats;
+    const whole = moved || repeated || fresh;
+    const wholeReason = fresh
+      ? this.resetReason
+        ? `reset:${this.resetReason}`
+        : 'first'
+      : moved
+        ? `globalMoved:${movedGlobal}`
+        : repeated
+          ? 'repeatedIds'
+          : null;
+    this.resetReason = null;
     const revision = ++lastRevision;
     const header: RowDeltaHeader = {
       revision,
@@ -149,6 +178,8 @@ export class RowDeltaSender {
       ...(message as object),
       rows: header,
     };
+    let rowsHeld = message.rail.length;
+    let rowsSent = 0;
     if (message.sessions) {
       // A session list message leaves `sessions` out, so `sessions` extend the last message that carried them.
       const held = whole ? null : this.sessions;
@@ -157,9 +188,12 @@ export class RowDeltaSender {
       header.sessionsBase = held ? held.revision : null;
       if (sessions.order) header.sessionOrder = sessions.order;
       this.sessions = { ...sessions.next, revision };
+      rowsHeld += message.sessions.length;
+      rowsSent += sessions.changed.length;
     }
     const rail = sendList(message.rail, this.rail, whole);
     out.rail = rail.changed;
+    rowsSent += rail.changed.length;
     if (rail.order) header.railOrder = rail.order;
     this.rail = rail.next;
     const prints = new Map<string, string>();
@@ -174,8 +208,9 @@ export class RowDeltaSender {
     out.stats = stats;
     this.stats = prints;
     this.revision = revision;
+    this.lastEncoding = { whole, reason: wholeReason, rowsHeld, rowsSent };
     // Rows with a repeated id cannot be addressed by id, so the next message is a snapshot too.
-    if (repeated) this.reset();
+    if (repeated) this.reset('repeatedIds');
     return out as unknown as M & { rows: RowDeltaHeader };
   }
 }

@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 
 import { ARC_IDENTITY } from './identity';
 
-export const PERFORMANCE_DIAGNOSTICS_SCHEMA_VERSION = 5;
+export const PERFORMANCE_DIAGNOSTICS_SCHEMA_VERSION = 6;
 
 const MESSAGE_BYTE_BUDGETS: Readonly<Record<string, number>> = {
   render: 250_000,
@@ -32,7 +32,34 @@ export interface WatcherOperation {
   waitMs: number;
   maximumWaitFired: boolean;
   decision: 'broad' | 'targeted';
+  // Why a broad decision walked. Empty for a targeted decision.
+  broadReasons: string[];
   durationMs: number;
+}
+
+// Decisions since activation. A broad decision with two causes counts under both causes and once as broad.
+export interface WatcherDecisionCounts {
+  targeted: number;
+  broad: number;
+  broadReasons: Record<string, number>;
+}
+
+// Row-carrying posts of one message kind, split by whether the panel received a snapshot or a delta.
+export interface RowPostCounts {
+  whole: MessageCounts;
+  delta: MessageCounts;
+  wholeReasons: Record<string, number>;
+  // Rows described by the last post, and rows carried across every post.
+  rowsHeld: number;
+  rowsSent: number;
+}
+
+// What one row-carrying post encoded. The sender supplies it, so the counter measures nothing itself.
+export interface RowPostEncoding {
+  whole: boolean;
+  reason: string | null;
+  rowsHeld: number;
+  rowsSent: number;
 }
 
 export interface LedgerSaveOperation {
@@ -54,6 +81,11 @@ export interface PerformanceCounterSnapshot {
   panelMessages: Record<string, OperationCounts>;
   panelReplies: Record<string, Record<string, OperationCounts>>;
   watcherOperationCount: number;
+  watcherDecisions: WatcherDecisionCounts;
+  rowPosts: Record<string, RowPostCounts>;
+  rowsGapCount: number;
+  // Named host operations since activation, by count. Each name is one derivation or file check the host repeats.
+  work: Record<string, number>;
   ledgerSaveCount: number;
   lastWatcherOperation: WatcherOperation | null;
   lastLedgerSave: LedgerSaveOperation | null;
@@ -81,6 +113,26 @@ function recordMessageCount(counts: MessageCounts, serializedBytes: number | nul
     counts.serializedBytes += serializedBytes;
     counts.maximumSerializedBytes = Math.max(counts.maximumSerializedBytes, serializedBytes);
   }
+}
+
+function rowPostCounts(): RowPostCounts {
+  return { whole: messageCounts(), delta: messageCounts(), wholeReasons: {}, rowsHeld: 0, rowsSent: 0 };
+}
+
+function sortedRecord<T>(entries: Iterable<[string, T]>, copy: (value: T) => T): Record<string, T> {
+  return Object.fromEntries(
+    [...entries].sort(([a], [b]) => a.localeCompare(b)).map(([key, value]) => [key, copy(value)]),
+  );
+}
+
+function rowPostSnapshot(counts: RowPostCounts): RowPostCounts {
+  return {
+    whole: { ...counts.whole },
+    delta: { ...counts.delta },
+    wholeReasons: { ...counts.wholeReasons },
+    rowsHeld: counts.rowsHeld,
+    rowsSent: counts.rowsSent,
+  };
 }
 
 function messageCountSnapshot(counts: Map<string, MessageCounts>): Record<string, MessageCounts> {
@@ -192,6 +244,10 @@ export class PanelPerformanceCounters {
     this.discovery[reply.complete && !reply.continuation ? 'publications' : 'continuations']++;
   }
   private watcherOperationCount = 0;
+  private readonly watcherDecisions: WatcherDecisionCounts = { targeted: 0, broad: 0, broadReasons: {} };
+  private readonly rowPosts = new Map<string, RowPostCounts>();
+  private rowsGapCount = 0;
+  private readonly work = new Map<string, number>();
   private ledgerSaveCount = 0;
   private readonly refreshes = new Map<string, OperationCounts>();
   private readonly refreshStages: Record<RefreshStage, number> = {
@@ -306,8 +362,37 @@ export class PanelPerformanceCounters {
     replies.set(type, reply);
   }
 
+  // A row-carrying post, after the sender encoded it. Bytes are the posted message's serialized size.
+  recordRowPost(type: string, encoding: RowPostEncoding, serializedBytes: number | null): void {
+    const current = this.rowPosts.get(type) ?? rowPostCounts();
+    recordMessageCount(encoding.whole ? current.whole : current.delta, serializedBytes);
+    if (encoding.reason !== null) {
+      current.wholeReasons[encoding.reason] = (current.wholeReasons[encoding.reason] ?? 0) + 1;
+    }
+    current.rowsHeld = encoding.rowsHeld;
+    current.rowsSent += encoding.rowsSent;
+    this.rowPosts.set(type, current);
+    if (this.sink.enabled()) {
+      this.sink.emit('rowPost', { kind: type, ...encoding, bytes: serializedBytes });
+    }
+  }
+
+  // The panel lost a delta and asked for a snapshot.
+  recordRowsGap(): void {
+    this.rowsGapCount++;
+  }
+
+  // One named host operation ran. The count is the measurement, so no clock is read.
+  recordWork(name: string, count = 1): void {
+    this.work.set(name, (this.work.get(name) ?? 0) + count);
+  }
+
   recordWatcherOperation(operation: Omit<WatcherOperation, 'id'>): void {
     this.watcherOperationCount++;
+    this.watcherDecisions[operation.decision]++;
+    for (const reason of operation.broadReasons) {
+      this.watcherDecisions.broadReasons[reason] = (this.watcherDecisions.broadReasons[reason] ?? 0) + 1;
+    }
     this.lastWatcherOperation = { id: this.watcherOperationCount, ...operation };
     if (this.sink.enabled()) {
       this.sink.emit('watcher', { ...this.lastWatcherOperation, durationMs: Math.round(operation.durationMs) });
@@ -349,8 +434,18 @@ export class PanelPerformanceCounters {
           ]),
       ),
       watcherOperationCount: this.watcherOperationCount,
+      watcherDecisions: {
+        targeted: this.watcherDecisions.targeted,
+        broad: this.watcherDecisions.broad,
+        broadReasons: { ...this.watcherDecisions.broadReasons },
+      },
+      rowPosts: sortedRecord(this.rowPosts, rowPostSnapshot),
+      rowsGapCount: this.rowsGapCount,
+      work: sortedRecord(this.work, (count) => count),
       ledgerSaveCount: this.ledgerSaveCount,
-      lastWatcherOperation: this.lastWatcherOperation ? { ...this.lastWatcherOperation } : null,
+      lastWatcherOperation: this.lastWatcherOperation
+        ? { ...this.lastWatcherOperation, broadReasons: [...this.lastWatcherOperation.broadReasons] }
+        : null,
       lastLedgerSave: this.lastLedgerSave ? { ...this.lastLedgerSave } : null,
       ...(this.startup ? { startup: { id: this.startup.id, milestones: { ...this.startup.milestones } } } : {}),
     };
@@ -474,6 +569,8 @@ export function projectPerformanceDiagnostics(state: PerformanceDiagnosticState,
       refreshes: Object.fromEntries(
         Object.entries(state.counters.refreshes).map(([reason, counts]) => [reason, { ...counts }]),
       ),
+      refreshStages: { ...state.counters.refreshStages },
+      discovery: { ...state.counters.discovery },
       messages: Object.fromEntries(
         Object.entries(state.counters.messages).map(([type, counts]) => [type, { ...counts }]),
       ),
@@ -493,8 +590,23 @@ export function projectPerformanceDiagnostics(state: PerformanceDiagnosticState,
         ]),
       ),
       watcherOperationCount: state.counters.watcherOperationCount,
+      watcherDecisions: {
+        targeted: state.counters.watcherDecisions.targeted,
+        broad: state.counters.watcherDecisions.broad,
+        broadReasons: { ...state.counters.watcherDecisions.broadReasons },
+      },
+      rowPosts: Object.fromEntries(
+        Object.entries(state.counters.rowPosts).map(([type, counts]) => [type, rowPostSnapshot(counts)]),
+      ),
+      rowsGapCount: state.counters.rowsGapCount,
+      work: { ...state.counters.work },
       ledgerSaveCount: state.counters.ledgerSaveCount,
-      lastWatcherOperation: state.counters.lastWatcherOperation ? { ...state.counters.lastWatcherOperation } : null,
+      lastWatcherOperation: state.counters.lastWatcherOperation
+        ? {
+            ...state.counters.lastWatcherOperation,
+            broadReasons: [...state.counters.lastWatcherOperation.broadReasons],
+          }
+        : null,
       lastLedgerSave: state.counters.lastLedgerSave ? { ...state.counters.lastLedgerSave } : null,
       ...(state.counters.startup
         ? { startup: { id: state.counters.startup.id, milestones: { ...state.counters.startup.milestones } } }

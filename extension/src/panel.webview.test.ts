@@ -1955,7 +1955,14 @@ function metadataEnrichmentFixture(sessions: any[], source = getProgressiveWorke
     authoritativeCatalog: sessions,
     prepareClaudeChildren: async () => true,
     activityFor: (session: any) => session.mtimeMs,
-    performanceCounters: { recordRefreshStage() {}, recordRefresh() {}, recordStartup() {} },
+    performanceCounters: {
+      recordWork() {},
+      recordRowPost() {},
+      recordRowsGap() {},
+      recordRefreshStage() {},
+      recordRefresh() {},
+      recordStartup() {},
+    },
     ensureProjectSpendWorkspace() {},
     scheduleProjectSpendHydration() {},
     repositoryScopeRoots: [],
@@ -2460,7 +2467,7 @@ function orderedHostReadFixture(productionSender = false) {
       disposed: false,
       panelVisibility: { current: () => ({ type: 'visibility', visible: false }) },
       healthPanel: () => ({ id: 'test-panel', posting: false }),
-      performanceCounters: { recordMessage() {} },
+      performanceCounters: { recordWork() {}, recordRowPost() {}, recordRowsGap() {}, recordMessage() {} },
       publishWindowState() {},
       restoreAgentReads() {},
     });
@@ -7720,7 +7727,7 @@ test.each(['identity', 'storage'])(
       readyHosts: new Set(),
       panelVisibility: createPanelVisibility(),
       sendToHost: async () => true,
-      performanceCounters: { recordStartup: () => undefined },
+      performanceCounters: { recordWork() {}, recordRowPost() {}, recordRowsGap() {}, recordStartup: () => undefined },
       startPolling: () => undefined,
       requestInitialCatalogRefresh: () => undefined,
       refresh: vi.fn<() => void>(),
@@ -8849,6 +8856,9 @@ test(
       provider.checkpointDerivedCache = () => {};
       provider.ensureProjectSpendWorkspace = () => {};
       provider.performanceCounters = {
+        recordRowPost() {},
+        recordRowsGap() {},
+        recordWork() {},
         registerPanel() {},
         releasePanel() {},
         recordRefreshStage() {},
@@ -9107,6 +9117,9 @@ test.each([
       provider.checkpointDerivedCache = () => {};
       provider.ensureProjectSpendWorkspace = () => {};
       provider.performanceCounters = {
+        recordRowPost() {},
+        recordRowsGap() {},
+        recordWork() {},
         registerPanel() {},
         releasePanel() {},
         recordRefreshStage() {},
@@ -9326,6 +9339,9 @@ function dispatchedRefreshFixture(sessions: any[], worker: ProgressiveWorker, tu
     checkpointDerivedCache() {},
     parentOfShown: () => null,
     performanceCounters: {
+      recordWork() {},
+      recordRowPost() {},
+      recordRowsGap() {},
       registerPanel() {},
       releasePanel() {},
       recordRefreshStage() {},
@@ -12798,7 +12814,7 @@ test('a capture that writes nothing puts its reason where a run with no reader c
   const provider = Object.create(PanelProvider.prototype) as Record<string, unknown>;
   Object.assign(provider, {
     diagnostics,
-    performanceCounters: { recordCapture: () => undefined },
+    performanceCounters: { recordWork() {}, recordRowPost() {}, recordRowsGap() {}, recordCapture: () => undefined },
     performanceDiagnostics: () => ({ schemaVersion: 1 }),
   });
   const editorWindow = vscode.window as unknown as Record<string, unknown>;
@@ -17472,6 +17488,9 @@ test('the live Codex subagent route keeps each panel on the place its shared tra
       return Promise.resolve();
     },
     performanceCounters: {
+      recordWork() {},
+      recordRowPost() {},
+      recordRowsGap() {},
       registerPanel() {},
       releasePanel() {},
       recordRefreshStage() {},
@@ -26472,6 +26491,9 @@ export function browserPainted(host: any, generation: number, stage: any, usable
     readyHosts: new Set([browser]),
     refreshGeneration: 7,
     performanceCounters: {
+      recordWork() {},
+      recordRowPost() {},
+      recordRowsGap() {},
       recordStartup() {},
     },
   };
@@ -27591,7 +27613,13 @@ function liveProviderFixture(press: LivePress, newest = turn({ startedAt: press.
     postRail: () => undefined,
     refresh: () => Promise.resolve(),
     themedFor: (cards: unknown[]) => cards,
-    performanceCounters: { registerPanel() {}, releasePanel() {} },
+    performanceCounters: {
+      recordWork() {},
+      recordRowPost() {},
+      recordRowsGap() {},
+      registerPanel() {},
+      releasePanel() {},
+    },
     sendToHost: (_host: unknown, message: Record<string, unknown>) => {
       posted.push(message);
       return Promise.resolve(true);
@@ -29861,7 +29889,7 @@ test.each([
     ),
     health: { observe: (...args: unknown[]) => observed.push(args) },
     progressiveWorker: { snapshot: () => null },
-    performanceCounters: { discoverySnapshot: () => null },
+    performanceCounters: { recordWork() {}, recordRowPost() {}, recordRowsGap() {}, discoverySnapshot: () => null },
     hidden: new Set(),
     pinnedTop: new Set(),
     showing: null,
@@ -32895,7 +32923,14 @@ test.each([false, true])('the first reader child selection includes its parent (
     readWindows: new Map(),
     hidden: new Set(),
     pinnedTop: new Set(),
-    performanceCounters: { recordRefreshStage() {}, recordRefresh() {}, recordStartup() {} },
+    performanceCounters: {
+      recordWork() {},
+      recordRowPost() {},
+      recordRowsGap() {},
+      recordRefreshStage() {},
+      recordRefresh() {},
+      recordStartup() {},
+    },
     shownSessions: () => [],
     activityFor: () => 1,
     outcomesFor: () => new Map(),

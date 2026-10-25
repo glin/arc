@@ -231,10 +231,26 @@ export class IntegrityScheduler {
 
 export type WatcherWakeReason = 'transcript' | 'activity-fallback';
 
+// Why a wake cannot name its files and walks the whole catalog instead.
+// `missingFilename`: the watcher delivered an event without a filename.
+// `createOrRename`: a file appeared, moved or disappeared.
+// `requested`: the host asked for a walk.
+// `activityFallbackNoFile`: a live session has no listed transcript.
+// `noPaths`: the batch named no file.
+// `unknownPath`: a named file is outside the held catalog.
+export type WatcherBroadReason =
+  | 'missingFilename'
+  | 'createOrRename'
+  | 'requested'
+  | 'activityFallbackNoFile'
+  | 'noPaths'
+  | 'unknownPath';
+
 export interface WatcherWakeBatch {
   eventCount: number;
   changedPaths: string[];
   broadRequired: boolean;
+  broadReasons: WatcherBroadReason[];
   // A shown session gained live activity that no drawn card carries, so the wake draws even
   // when no file moved.
   drawRequired: boolean;
@@ -261,6 +277,7 @@ export class PendingWatcherWake {
   private eventCount = 0;
   private readonly changedPaths = new Set<string>();
   private broadRequired = false;
+  private readonly broadReasons = new Set<WatcherBroadReason>();
   private drawRequired = false;
   private readonly reasons = new Set<WatcherWakeReason>();
 
@@ -277,17 +294,20 @@ export class PendingWatcherWake {
     this.reasons.add('transcript');
     if (typeof filename !== 'string') {
       this.broadRequired = true;
+      this.broadReasons.add('missingFilename');
       return true;
     }
     this.changedPaths.add(normalize(path.join(directory, filename)));
     if (kind !== 'change') {
       this.broadRequired = true;
+      this.broadReasons.add('createOrRename');
     }
     return true;
   }
 
   requireBroad(reason: WatcherWakeReason): void {
     this.broadRequired = true;
+    this.broadReasons.add('requested');
     this.reasons.add(reason);
   }
 
@@ -305,6 +325,7 @@ export class PendingWatcherWake {
     }
     if (files === null) {
       this.broadRequired = true;
+      this.broadReasons.add('activityFallbackNoFile');
       return;
     }
     for (const file of files) {
@@ -317,6 +338,7 @@ export class PendingWatcherWake {
       eventCount: this.eventCount,
       changedPaths: [...this.changedPaths].sort(),
       broadRequired: this.broadRequired,
+      broadReasons: [...this.broadReasons].sort(),
       drawRequired: this.drawRequired,
       reasons: [...this.reasons].sort(),
     };
@@ -327,6 +349,7 @@ export class PendingWatcherWake {
     this.eventCount = 0;
     this.changedPaths.clear();
     this.broadRequired = false;
+    this.broadReasons.clear();
     this.drawRequired = false;
     this.reasons.clear();
     return batch;
@@ -337,14 +360,22 @@ export class PendingWatcherWake {
   }
 }
 
+// The decision names why it walks, so a counter can say which cause keeps the catalog walking.
 export function watcherRefreshDecision(
   batch: WatcherWakeBatch,
   knownPath: (file: string) => boolean,
-): { kind: 'broad' | 'targeted'; changedPaths: string[] } {
-  if (batch.broadRequired || batch.changedPaths.length === 0 || batch.changedPaths.some((file) => !knownPath(file))) {
-    return { kind: 'broad', changedPaths: [] };
+): { kind: 'broad' | 'targeted'; changedPaths: string[]; broadReasons: WatcherBroadReason[] } {
+  if (batch.broadRequired) {
+    const broadReasons = batch.broadReasons.length ? batch.broadReasons : ['requested' as const];
+    return { kind: 'broad', changedPaths: [], broadReasons };
   }
-  return { kind: 'targeted', changedPaths: batch.changedPaths };
+  if (batch.changedPaths.length === 0) {
+    return { kind: 'broad', changedPaths: [], broadReasons: ['noPaths'] };
+  }
+  if (batch.changedPaths.some((file) => !knownPath(file))) {
+    return { kind: 'broad', changedPaths: [], broadReasons: ['unknownPath'] };
+  }
+  return { kind: 'targeted', changedPaths: batch.changedPaths, broadReasons: [] };
 }
 
 // How long a catalog refresh holds the triggers that wait behind it. After this, the next waiting

@@ -122,7 +122,19 @@ Add `--response` to capture one synthetic live response becoming a recorded rich
 
 `--keep` retains the build checkout. Other run resources remain available for inspection. A cleanup refusal ends the run without a retry. `ARC_MEASURE_EDITOR` selects a VS Code install directory. Compare repeated runs with identical inputs, settings, selection, and imports. Shared machine workload and operating-system disk cache remain measurement limits.
 
+### Session list publication measurement
+
+Measure the session list publication path without an editor:
+
+```bash
+npx tsx scripts/rail-publication-measure.ts [rows] [running] [ticks] [tickMs]
+```
+
+Run it from `extension`. It builds a session list of `rows` sessions with `running` running sessions, then runs `ticks` host update cycles `tickMs` simulated milliseconds apart. Each cycle changes one running session, runs the input gate, builds the payload, encodes the row delta for one panel, and measures the serialized bytes. The report counts gate passes, snapshot and delta posts with their bytes, rows carried, and bytes per simulated minute. Counts and bytes are exact. Wall times per step depend on the machine and order the steps only.
+
 ## Diagnostic implementation
+
+The saved snapshot keeps these counters beside the message and refresh tables. `watcherDecisions` counts targeted and broad watcher decisions, and `broadReasons` counts why each broad decision walked: `missingFilename`, `createOrRename`, `requested`, `activityFallbackNoFile`, `noPaths`, or `unknownPath`. `rowPosts` splits render and session list posts into `whole` and `delta`, with bytes for each, and `wholeReasons` counts why a panel received a snapshot: `first`, a `reset:` cause such as `ready`, `gap`, `unaccepted` or `failed`, a `globalMoved:` field name, `repeatedIds`, or `unkeyedRows`. `rowsGapCount` counts panel requests for a snapshot after a lost delta. `work` counts named host operations: `childVersionStat` and `humanPromptStat` are file checks, `dispatchedCostsPost`, `childExpiryCosts` and `liveOpenChildren` are cost derivations, and `railSkippedRevision`, `railSkippedInputs` and `railPayloadBuilt` record how each session list post ended.
 
 `discoveryObservation` keeps the last accepted request's cumulative charges and receipt age through failure. Its charges overlap settled totals after completion. Never add them. Invalid or obsolete acknowledgements replace neither the checkpoint nor this observation. Worker memory comes from completed quantum boundaries with thread, request, and host-receipt age. New workers have no memory observation. Worker failures retain bounded identities and pending work. Deliberate cancellation and disposal report no crash. These snapshots identify no allocation sites.
 

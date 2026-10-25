@@ -3630,7 +3630,8 @@ export class PanelProvider implements vscode.Disposable {
       distinctPathCount: batch.changedPaths.length,
       waitMs: Math.max(0, event.firedAt - event.firstAt),
       maximumWaitFired: event.cause === 'maximum',
-      decision: this.catalogWalked ? 'broad' : decision.kind,
+      decision: decision.kind,
+      broadReasons: decision.broadReasons,
       durationMs: performance.now() - started,
     });
   }
@@ -9998,6 +9999,7 @@ export class PanelProvider implements vscode.Disposable {
     outcomes = this.sessionOutcomes,
     rows = this.sessionRows,
   ): Map<string, string[]> {
+    this.performanceCounters?.recordWork('liveOpenChildren');
     return liveTimelineChildren(
       outcomes,
       outcomes === this.sessionOutcomes
@@ -10180,6 +10182,7 @@ export class PanelProvider implements vscode.Disposable {
 
   // Redraws turn cards whose dispatched cost or cache-expiry warning moved since they were drawn.
   private postDispatchedCostsIfMoved(): void {
+    this.performanceCounters?.recordWork('dispatchedCostsPost');
     if (!this.cards?.length) return;
     const drawnKeys = new Set(this.cards.map((card) => card.key));
     const dispatchedPrints = (this.dispatchedCardPrints ??= new Map());
@@ -10285,6 +10288,7 @@ export class PanelProvider implements vscode.Disposable {
     facts: LifetimeFigures['cacheExpiryFacts'],
     now: number,
   ): Map<string, ChildExpiryCost> {
+    this.performanceCounters?.recordWork('childExpiryCosts');
     if (!Object.values(facts).some((fact) => fact.childSources?.length)) return new Map();
     const unique = new Map(turns.map((turn) => [turnKey(turn), turn]));
     const ongoing = new Set(this.runningSessions());
@@ -10404,6 +10408,7 @@ export class PanelProvider implements vscode.Disposable {
       this.lastRailDay === day &&
       this.lastRailQueryContext === queryContext
     ) {
+      this.performanceCounters?.recordWork('railSkippedRevision');
       return;
     }
     if (this.catalog && refreshCatalogFacts) {
@@ -10428,8 +10433,10 @@ export class PanelProvider implements vscode.Disposable {
       this.lastRailRevision = this.railRevision;
       this.lastRailDay = day;
       this.lastRailCountsJson = countsJson;
+      this.performanceCounters?.recordWork('railSkippedInputs');
       return;
     }
+    this.performanceCounters?.recordWork('railPayloadBuilt');
     const sharedRail = railPayload(input);
     let largestRailBytes: number | null = null;
     for (const host of this.hosts) {
@@ -10496,7 +10503,7 @@ export class PanelProvider implements vscode.Disposable {
     const cardPost = cards ? (sender.cardPost = (sender.cardPost ?? 0) + 1) : 0;
     // An unready panel drops the post, so it prints no rows. The panel may hold other rows when it becomes ready.
     if (!this.readyHosts.has(host)) {
-      sender.reset();
+      sender.reset('unready');
       return this.sendToHost(host, message, measured);
     }
     // A change in one of these inputs touches most rows, so it sends a snapshot. Prints cover every other input.
@@ -10506,21 +10513,25 @@ export class PanelProvider implements vscode.Disposable {
       scope: this.repositoryScopeRoots ?? null,
       folders: this.catalog?.folders ?? null,
     };
-    const posted = this.sendToHost(
-      host,
-      message.type === 'selection' ? message : sender.encode(message as Record<string, unknown> & RowLists, globals),
-      measured,
-    );
+    const kind = message.type;
+    const outgoing =
+      kind === 'selection' ? message : sender.encode(message as Record<string, unknown> & RowLists, globals);
+    // The sender described what it encoded. Record it beside the bytes the post measured.
+    const encoding = kind === 'selection' ? null : sender.lastEncoding;
+    const posted = this.sendToHost(host, outgoing, (serializedBytes) => {
+      if (encoding) this.performanceCounters.recordRowPost(kind, encoding, serializedBytes);
+      measured?.(serializedBytes);
+    });
     void Promise.resolve(posted).then(
       (accepted) => {
-        if (!accepted) sender.reset();
+        if (!accepted) sender.reset('unaccepted');
         if (accepted && cards && cardPost > (sender.acceptedCardPost ?? 0)) {
           sender.acceptedCards = cards;
           sender.acceptedWindow = selectedWindow;
           sender.acceptedCardPost = cardPost;
         }
       },
-      () => sender.reset(),
+      () => sender.reset('failed'),
     );
     return posted;
   }
@@ -12222,6 +12233,7 @@ export class PanelProvider implements vscode.Disposable {
       work.sources++;
       let previous = this.humanScans.get(session.file);
       let revision;
+      this.performanceCounters?.recordWork('humanPromptStat');
       try {
         revision = fileRevisionOf(fs.statSync(session.file, { bigint: true }));
       } catch {
@@ -12269,6 +12281,7 @@ export class PanelProvider implements vscode.Disposable {
           if (!currentRefresh()) return [];
         }
         work.sources++;
+        this.performanceCounters?.recordWork('humanPromptStat');
         const current = fileRevisionOf(fs.statSync(session.file, { bigint: true }));
         if (!currentRefresh()) return [];
         if (
@@ -14051,6 +14064,7 @@ export class PanelProvider implements vscode.Disposable {
 
   // One child's revision, keeping its write time for `liveOpenChildren`.
   private claudeChildVersion(file: string): string {
+    this.performanceCounters?.recordWork('childVersionStat');
     const version = spendFileVersion(file);
     const at = writeTimeOfVersion(version);
     if (at === null) {
@@ -14905,7 +14919,7 @@ export class PanelProvider implements vscode.Disposable {
           // A loaded page holds no session rows.
           const sender = this.rowSenders?.get(host);
           if (sender) {
-            sender.reset();
+            sender.reset('ready');
             sender.acceptedCards = undefined;
             sender.acceptedWindow = undefined;
             sender.acceptedCardPost = sender.cardPost = (sender.cardPost ?? 0) + 1;
@@ -14914,7 +14928,8 @@ export class PanelProvider implements vscode.Disposable {
         },
         // The panel lost a delta. Post its rows again from the catalog the host holds, without a new catalog walk.
         rowsGap: () => {
-          this.rowSenders?.get(host)?.reset();
+          this.performanceCounters.recordRowsGap();
+          this.rowSenders?.get(host)?.reset('gap');
           void this.refresh(true, true);
         },
         painted: (msg) => {

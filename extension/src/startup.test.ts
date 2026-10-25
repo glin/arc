@@ -1380,7 +1380,7 @@ function harness(pendingRefresh = false, registerRefreshHandler = true, extraMet
       railOrder = []; boxText = {}; sessionRows = [{ id: 'selected', agentKey: 'claude' }]; refreshGeneration = 0; refreshController = null;
       refreshUsageHandler = null; initialCatalogRefreshPending = false; initialCatalogRefreshRequested = false;
       progressiveWorker = { stop() {} };
-      performanceCounters = { registerPanel() {}, releasePanel() {}, recordStartup() {}, recordMessage() {}, recordRefresh() {}, recordRefreshStage() {} };
+      performanceCounters = { recordRowPost() {}, recordRowsGap() {}, recordWork() {}, recordWatcherOperation() {}, registerPanel() {}, releasePanel() {}, recordStartup() {}, recordMessage() {}, recordRefresh() {}, recordRefreshStage() {} };
       poll = null; watching = true; codexStats = null; pendingWatch = new Map(); watchScheduler = { cancel() {} };
       watchDirectories() {}
       pendingRefresh = null; showing = 'selected'; repositoryScopeReady = true; repositoryScopeRoots = ['project']; awaitingSessionRecords = {}; newDrafts = {}; selectionGeneration = 0; selectionWork = null; selectionFailure = null;
@@ -1659,7 +1659,7 @@ function completeDiscoveryHarness(
       posts = []; markStartedPresses() {} postAcceptedResponses() {}
       post(message) { this.posts.push(message); return Promise.resolve(); }
       progressiveWorker = { run() { return Promise.resolve(null); } };
-      performanceCounters = { recordMessage() {}, recordRefresh() {}, recordRefreshStage() {}, recordStartup() {} };
+      performanceCounters = { recordRowPost() {}, recordRowsGap() {}, recordWork() {}, recordWatcherOperation() {}, recordMessage() {}, recordRefresh() {}, recordRefreshStage() {}, recordStartup() {} };
       warnedMessageBudgets = new Set(); performanceOutput = null; icons = { fontFaces() { return []; } };
       diagnostics = { log() {}, warn() {}, file() { return null; }, enabled() { return false; } };
       get showing() { return this._showing; }

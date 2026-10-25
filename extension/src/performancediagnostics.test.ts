@@ -87,8 +87,26 @@ test('performance counters correlate posts and replies for every open panel', ()
     waitMs: 200,
     maximumWaitFired: false,
     decision: 'targeted',
+    broadReasons: [],
     durationMs: 12,
   });
+  counters.recordWatcherOperation({
+    reason: 'transcript',
+    eventCount: 1,
+    distinctPathCount: 0,
+    waitMs: 100,
+    maximumWaitFired: false,
+    decision: 'broad',
+    broadReasons: ['createOrRename', 'missingFilename'],
+    durationMs: 2,
+  });
+  counters.recordRowPost('rail', { whole: true, reason: 'first', rowsHeld: 3, rowsSent: 3 }, 300);
+  counters.recordRowPost('rail', { whole: false, reason: null, rowsHeld: 3, rowsSent: 1 }, 40);
+  counters.recordRowPost('rail', { whole: true, reason: 'reset:gap', rowsHeld: 4, rowsSent: 4 }, null);
+  counters.recordRowsGap();
+  counters.recordWork('childVersionStat');
+  counters.recordWork('childVersionStat', 4);
+  counters.recordWork('railPayloadBuilt');
   counters.recordLedgerSave({ reason: 'maximum', durationMs: 20, succeeded: true });
 
   assert.deepEqual(counters.snapshot(), {
@@ -159,20 +177,73 @@ test('performance counters correlate posts and replies for every open panel', ()
       },
       'panel-3': {},
     },
-    watcherOperationCount: 1,
+    watcherOperationCount: 2,
+    watcherDecisions: { targeted: 1, broad: 1, broadReasons: { createOrRename: 1, missingFilename: 1 } },
+    rowPosts: {
+      rail: {
+        whole: { count: 2, serializedBytes: 300, maximumSerializedBytes: 300, unavailableByteCount: 1 },
+        delta: { count: 1, serializedBytes: 40, maximumSerializedBytes: 40, unavailableByteCount: 0 },
+        wholeReasons: { first: 1, 'reset:gap': 1 },
+        rowsHeld: 4,
+        rowsSent: 8,
+      },
+    },
+    rowsGapCount: 1,
+    work: { childVersionStat: 5, railPayloadBuilt: 1 },
     ledgerSaveCount: 1,
     lastWatcherOperation: {
-      id: 1,
+      id: 2,
       reason: 'transcript',
-      eventCount: 4,
-      distinctPathCount: 4,
-      waitMs: 200,
+      eventCount: 1,
+      distinctPathCount: 0,
+      waitMs: 100,
       maximumWaitFired: false,
-      decision: 'targeted',
-      durationMs: 12,
+      decision: 'broad',
+      broadReasons: ['createOrRename', 'missingFilename'],
+      durationMs: 2,
     },
     lastLedgerSave: { id: 1, reason: 'maximum', durationMs: 20, succeeded: true },
   });
+});
+
+// The saved file is the owner's measurement. Every retained counter must reach it, or the capture cannot answer the question it was taken for.
+
+test('the saved snapshot carries refresh stages, discovery, decisions, row posts and work', () => {
+  const counters = new PanelPerformanceCounters(1_000, 'window-a');
+  counters.recordRefreshStage('unchanged');
+  counters.recordWatcherOperation({
+    reason: 'transcript',
+    eventCount: 1,
+    distinctPathCount: 1,
+    waitMs: 1,
+    maximumWaitFired: false,
+    decision: 'broad',
+    broadReasons: ['unknownPath'],
+    durationMs: 1,
+  });
+  counters.recordRowPost('render', { whole: true, reason: 'globalMoved:scope', rowsHeld: 2, rowsSent: 2 }, 100);
+  counters.recordRowsGap();
+  counters.recordWork('dispatchedCostsPost', 3);
+  const projected = projectPerformanceDiagnostics(state(counters.snapshot()), 2_000) as {
+    counters: Record<string, unknown>;
+  };
+  assert.deepEqual(projected.counters.refreshStages, {
+    started: 0,
+    coalesced: 0,
+    unchanged: 1,
+    rendered: 0,
+    abandoned: 0,
+  });
+  assert.equal((projected.counters.discovery as { continuations: number }).continuations, 0);
+  assert.deepEqual(projected.counters.watcherDecisions, { targeted: 0, broad: 1, broadReasons: { unknownPath: 1 } });
+  assert.deepEqual((projected.counters.rowPosts as Record<string, { wholeReasons: unknown }>).render.wholeReasons, {
+    'globalMoved:scope': 1,
+  });
+  assert.equal(projected.counters.rowsGapCount, 1);
+  assert.deepEqual(projected.counters.work, { dispatchedCostsPost: 3 });
+  assert.deepEqual((projected.counters.lastWatcherOperation as { broadReasons: string[] }).broadReasons, [
+    'unknownPath',
+  ]);
 });
 
 test('released panels leave no diagnostic entry after repeated disposal', () => {
@@ -295,6 +366,7 @@ test('every counted operation reaches the sink once, with what it cost', () => {
     waitMs: 5,
     maximumWaitFired: false,
     decision: 'targeted',
+    broadReasons: [],
     durationMs: 7.4,
   });
   counters.recordRefreshStage('rendered');
@@ -340,6 +412,7 @@ test('a counted operation builds no record while nothing reads the sink', () => 
     waitMs: 5,
     maximumWaitFired: false,
     decision: 'targeted',
+    broadReasons: [],
     durationMs: 7,
   });
 
