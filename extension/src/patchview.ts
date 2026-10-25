@@ -1,5 +1,5 @@
 import { applyPatch } from 'diff';
-import { patchMarkersAreValid, type EditRecord } from './transcript';
+import { normalizeFsPath, patchMarkersAreValid, type EditRecord, type TurnFileChange } from './transcript';
 
 // Build both sides of a per-turn file diff from recorded text.
 // Never read the after side from the live file. Later edits belong to other turns.
@@ -154,4 +154,12 @@ export function sidesFor(edits: EditRecord[]): FileSides {
     return { before: '', after: '', source: 'hunks' };
   }
   return wholeFiles(edits) ?? changedRegions(edits);
+}
+
+// Select one recorded file without borrowing edits from another path or turn.
+export function recordedFileSides(files: readonly TurnFileChange[], filePath: string): FileSides | null {
+  const matches = files.filter((file) => normalizeFsPath(file.path) === normalizeFsPath(filePath));
+  if (matches.length !== 1) return null;
+  const sides = sidesFor(matches[0].edits);
+  return sides.source === 'recorded' || sides.before || sides.after ? sides : null;
 }

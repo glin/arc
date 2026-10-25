@@ -362,7 +362,7 @@ The first column is checked against the shipped extension directory by `architec
 | `turnfixtures.ts` | Shared test fixtures. Shipped code must not import it | no |
 | `panelfixture.ts` | The real page and a full render payload for browser tests and the screenshot script | no |
 | `temproot.ts` | Scratch directories beneath a suite root, plus private socket directories with explicit ownership and local cleanup. Shipped code must not import it | no |
-| `patchview.ts` | Builds both sides of a per-turn file diff from recorded edits | no |
+| `patchview.ts` | Selects a turn's unambiguous recorded file change and builds both diff sides from recorded edits | no |
 | `fileicons.ts` | Chooses a fallback file-type badge | no |
 | `icontheme.ts` | Resolves the active file-icon theme and its font or image resources | no |
 | `pricing.ts` | Shared model and provider resolution, recorded route classes, retained request-band quotes, promotion metadata, fallback windows, required sourced cache policies, and cost estimates | no |

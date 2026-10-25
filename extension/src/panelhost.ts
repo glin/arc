@@ -101,7 +101,7 @@ import type { ExportIdentity } from './domain/export-model';
 import { RAIL_FOLDS } from './view/rail';
 import { settingName } from './settings';
 import { ARC_IDENTITY, MULTI_ROOT_SPEND_WORKSPACE_PREFIX } from './identity';
-import { sidesFor } from './patchview';
+import { recordedFileSides, sidesFor } from './patchview';
 import {
   Turn,
   Compaction,
@@ -15213,6 +15213,43 @@ export class PanelProvider implements vscode.Disposable {
           const pending = this.pendingEntry(sourceSessionId ?? found.sessionId, msg.path);
           // Open in the chosen editor column. The beside modifier requests a separate group.
           const column = msg.beside ? vscode.ViewColumn.Beside : this.column();
+          let live = false;
+          try {
+            live = fs.statSync(pending?.path ?? msg.path).isFile();
+          } catch (error) {
+            const code = (error as NodeJS.ErrnoException).code;
+            if (code !== 'ENOENT' && code !== 'ENOTDIR') {
+              void vscode.window.showInformationMessage(
+                `Arc: This file cannot be opened: ${msg.path}. ${String(error)}`,
+              );
+              return;
+            }
+          }
+          if (!live) {
+            // A dispatched row names a session, not a specific turn in that session.
+            const turn = sourceSessionId ? undefined : this.turnsByKey.get(found.card.key);
+            const sides = recordedFileSides(turn?.files ?? [], msg.path);
+            if (!sides) {
+              void vscode.window.showInformationMessage(
+                `Arc: This file is no longer available, and this turn has no saved diff for it: ${msg.path}`,
+              );
+              return;
+            }
+            const before = this.sideUri(msg.path, 'before', sides.before);
+            const after = this.sideUri(msg.path, 'after', sides.after);
+            this.keepSides([
+              { key: before.toString(), text: sides.before },
+              { key: after.toString(), text: sides.after },
+            ]);
+            await vscode.commands.executeCommand(
+              'vscode.diff',
+              before,
+              after,
+              `${path.basename(msg.path)} - recorded turn changes${sides.source === 'hunks' ? ' (hunks only)' : ''}`,
+              { viewColumn: column, preserveFocus: false },
+            );
+            return;
+          }
           if (pending) {
             await vscode.commands.executeCommand(
               'vscode.diff',

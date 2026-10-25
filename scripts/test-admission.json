@@ -125,9 +125,9 @@
     "matricesSha256": "5b04d61cb9d18e1eb073a37369de0c1da0cb67facf539e573deea905a1aa5f59"
   },
   "extension/src/panel.webview.test.ts": {
-    "reason": "Real progressive workers must deliver bounded recovery and metadata through the production panel host. Start metadata must survive storage delays, hidden panels, preference resets, and reloads.",
-    "cases": 620,
-    "matricesSha256": "547698f5d4a797432ae31f61aa4ee5f6f2f382c5d4fe53f14a0d1180ec2ccf8a"
+    "reason": "Real progressive workers must deliver bounded recovery and metadata through the production panel host. Start metadata must survive storage delays, hidden panels, preference resets, and reloads. File presses must preserve recorded changes after their worktree disappears.",
+    "cases": 621,
+    "matricesSha256": "e6cdc61fd9c25180918b632a8ab8ae22cde8b9190d14d5bbc0f1d9313cf55298"
   },
   "extension/src/panelbundle.test.ts": {
     "reason": "The panel bundle and fixture must contain the production entry, source identity, and substituted text.",
