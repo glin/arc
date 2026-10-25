@@ -72,13 +72,13 @@ Images use `localImage`. Other files use `mention` with display name and staged 
 
 ### Guarded input
 
-Live input uses `turn/steer` with exactly one eligible running root and its expected turn ID. Acceptance requires the same returned ID. It creates no submission or completion owner. Manual or unresolved compaction and ambiguous roots block it. Uncertain writes stay unknown and never enter the queue automatically.
+Live input uses `turn/steer` with exactly one eligible running root and its expected turn ID. Acceptance requires the same returned ID. It creates no submission or completion owner. Ambiguous roots block it, and so do the compaction states in [Session compaction](session-compaction.md). Uncertain writes stay unknown and never enter the queue automatically.
 
 A guarded follow-up requires its own `turn/start` acceptance. A returned ID known before writing, or held by another pending start, identifies shared work. Its outcome stays unknown and its assignment becomes stale. Post-write errors also stay unknown. Unanswered compaction withholds idle evidence until its late turn ends.
 
 ## Session rename
 
-Each provider persists names. Arc never edits transcript records, title files, or indexes. Clean names once, reject empty results, and serialize renames per session. Reuse a live child, including after its opening completes. Renames start no model turn and work while a turn runs.
+Each provider persists names. Arc never edits transcript records, title files, or indexes. Clean names once, reject empty results, and serialize renames per session. Reuse a live child, including after its opening completes. Renames start no model turn. A Claude rename through the control channel applies while a turn runs. A typed `/rename` waits, because the CLI reads typed input when the running turn ends.
 
 Claude uses `rename_session` with the resolved session ID and `source: host`. A different current session, unanswered control, or provider refusal fails the rename. Late replies settle nothing. An existing rename also requires the whole saved `<transcript directory>/<session id>/custom-title.json` value to match. Claude can report success without saving it.
 

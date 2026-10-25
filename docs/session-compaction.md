@@ -6,7 +6,7 @@ Use this guide for native ownership, manual compaction, agent-requested compacti
 
 Claude uses its initialized `/compact` command. Book a local command turn before writing, without attached comments or prompt text. [Prompt delivery](prompt-delivery.md#compaction-and-reset) owns queued submissions with comments or files. `/effort` also owns a local result. A command result must not close unrelated model work.
 
-Codex uses `thread/compact/start` on the established thread. Literal `/compact` through `turn/start` reaches the model or a similarly named skill. The empty RPC response acknowledges acceptance alone. Remain busy until native turn completion or failure. Manual compaction is not steerable. Hold prompts and further compaction until termination.
+Codex uses `thread/compact/start` on the established thread. Literal `/compact` through `turn/start` reaches the model or a similarly named skill. The empty RPC response acknowledges acceptance alone. Remain busy until native turn completion or failure. Hold prompts and further compaction until termination.
 
 Track active compaction items separately from roots containing them. Completed automatic compaction preserves ordinary root-ending attribution and permits live input in that root. Manual and unresolved compaction block live input.
 
