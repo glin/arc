@@ -1402,6 +1402,7 @@ test.concurrent.each([false, true])(
       git('add', 'extension/package.json');
       fs.writeFileSync(manifest, '{"version":"0.1.3"}');
       fs.writeFileSync(path.join(f.source, 'untracked.txt'), 'preserve me');
+      fs.unlinkSync(path.join(f.source, 'extension/package-lock.json'));
       const head = git('rev-parse', 'HEAD');
       const status = git('status', '--porcelain');
       const index = git('diff', '--cached');

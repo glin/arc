@@ -314,9 +314,9 @@ EOF
   if [ "$mode" != remote ]; then
     if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
       candidate="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-      if complete_source "$candidate"; then REPO="$candidate"; fi
+      if [ -n "$source_commit" ] || complete_source "$candidate"; then REPO="$candidate"; fi
     fi
-    if [ -z "$REPO" ] && complete_source "$PWD"; then
+    if [ -z "$REPO" ] && { [ -n "$source_commit" ] || complete_source "$PWD"; }; then
       REPO="$PWD"
     fi
   fi
