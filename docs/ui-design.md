@@ -20,7 +20,7 @@ Target at least 4.5:1 for text against every ground it occupies. Do not color bo
 
 Use tabular numbers and right alignment for comparable numerical figures. Never ellipsize a figure. Give its label the available space without losing the value.
 
-Follow the [project UI rules](../CLAUDE.md#ui-work) for text ownership, relative sizing, and shared treatments. Apply scaling at the element that owns the text, rather than compensating through surrounding wrappers. Read the corresponding production markup before reusing a CSS class.
+Follow the [project UI rules](../extension/CLAUDE.md#ui-work) for text ownership, relative sizing, and shared treatments. Apply scaling at the element that owns the text, rather than compensating through surrounding wrappers. Read the corresponding production markup before reusing a CSS class.
 
 ## Choose the pattern by its job
 
@@ -51,7 +51,7 @@ Omit a redundant Close button when these dismissal routes suffice. When an expli
 
 ## State and language
 
-Use [Glossary](glossary.md) terms for regions, actions, records, and states. [Session list and navigation](rail-and-navigation.md#context-menus-and-copy) owns menu ordering and copy. The [project UI rules](../CLAUDE.md#ui-work) own hints, timestamps, compound text, and platform labels.
+Use [Glossary](glossary.md) terms for regions, actions, records, and states. [Session list and navigation](rail-and-navigation.md#context-menus-and-copy) owns menu ordering and copy. The [project UI rules](../extension/CLAUDE.md#ui-work) own hints, timestamps, compound text, and platform labels.
 
 Keep focus, selection, unread state, and agent state distinguishable. A color alone must not communicate a new state or action. Preserve the visible text or other recognizable cue, together with its accessible name and state. Follow [Session list and navigation](rail-and-navigation.md#keyboard-and-screen-reader-contract) for keyboard reachability and focus behavior.
 
