@@ -97,16 +97,17 @@ function relationshipFixture(
   parentProvider: 'claude' | 'codex' = 'codex',
   childProvider: 'claude' | 'codex' = 'codex',
   agentRun = false,
+  cwd?: string,
 ) {
   const fx = fixture();
   const launch = fx.receipts.reserve({
     ...fx.launch,
     transport: 'standalone',
     requester: { provider: parentProvider, id: session },
-    standalone: settings(fx.home, { provider: childProvider, agentRun }),
+    standalone: settings(fx.home, { provider: childProvider, agentRun, ...(cwd ? { cwd } : {}) }),
   });
   const file = path.join(fx.home, 'native.jsonl');
-  const opening = Buffer.from(JSON.stringify({ sessionId: turn, cwd: fx.home }) + '\n' + 'x'.repeat(2048));
+  const opening = Buffer.from(JSON.stringify({ sessionId: turn, cwd: cwd ?? fx.home }) + '\n' + 'x'.repeat(2048));
   fs.writeFileSync(file, opening);
   const stat = fs.statSync(file, { bigint: true });
   const directory = fs.statSync(fx.home, { bigint: true });
@@ -115,7 +116,7 @@ function relationshipFixture(
     identity: `${stat.dev}:${stat.ino}`,
     ancestor: fx.home,
     directory: `${directory.dev}:${directory.ino}`,
-    cwd: fs.realpathSync.native(fx.home),
+    cwd: fs.realpathSync.native(cwd ?? fx.home),
     bytes: opening.length,
     sha256: payloadSha256(opening.toString()),
   });
@@ -144,6 +145,93 @@ function drainRelationships(
   scan.return(undefined);
   return assert.fail('The bounded receipt scan did not finish.');
 }
+
+test.each(['claude', 'codex'] as const)('verified %s receipt links survive removal of launch cwd', (provider) => {
+  const cwd = scratch('arc-dispatch-worker-');
+  const fx = relationshipFixture('claude', provider, false, cwd);
+  const linked = drainRelationships(fx.receipts.relationships(fx.catalog));
+  assert.equal(linked.length, 1);
+  fx.receipts.checkpointRelationships();
+  fs.rmdirSync(cwd);
+  assert.deepEqual(drainRelationships(fx.receipts.relationships(fx.catalog)), linked);
+  const restarted = new DispatchReceipts(fx.home);
+  assert.deepEqual(drainRelationships(restarted.relationships(fx.catalog)), linked);
+});
+
+test.each(['claude', 'codex'] as const)(
+  'unverified %s receipt links refuse an already missing launch cwd',
+  (provider) => {
+    const cwd = scratch('arc-dispatch-worker-');
+    const fx = relationshipFixture('claude', provider, false, cwd);
+    fs.rmdirSync(cwd);
+    assert.deepEqual(drainRelationships(fx.receipts.relationships(fx.catalog)), []);
+    fx.receipts.checkpointRelationships();
+    assert.deepEqual(drainRelationships(new DispatchReceipts(fx.home).relationships(fx.catalog)), []);
+  },
+);
+
+test.each(['receipt', 'anchor', 'accepted', 'startup', 'source', 'refused', 'collision', 'redirected-cwd'] as const)(
+  'retained receipt links refuse changed %s evidence',
+  (mode) => {
+    const cwd = scratch('arc-dispatch-worker-');
+    const fx = relationshipFixture('claude', 'codex', false, cwd);
+    assert.equal(drainRelationships(fx.receipts.relationships(fx.catalog)).length, 1);
+    fx.receipts.checkpointRelationships();
+    fs.rmdirSync(cwd);
+    const directory = path.join(fx.receipts.root, fx.launch.launchId);
+    if (mode === 'receipt') {
+      const file = path.join(directory, 'receipt.json');
+      const receipt = JSON.parse(fs.readFileSync(file, 'utf8'));
+      receipt.standalone.name = 'different';
+      fs.renameSync(file, file + '.old');
+      fs.writeFileSync(file, JSON.stringify(receipt));
+      const stat = fs.statSync(file, { bigint: true });
+      const anchorFile = path.join(fx.receipts.root, `${fx.launch.launchId}.json`);
+      const anchor = JSON.parse(fs.readFileSync(anchorFile, 'utf8'));
+      anchor.receipt = { dev: String(stat.dev), ino: String(stat.ino) };
+      anchor.sha256 = payloadSha256(JSON.stringify(receipt));
+      fs.writeFileSync(anchorFile, JSON.stringify(anchor));
+    }
+    if (mode === 'anchor' || mode === 'accepted' || mode === 'startup') {
+      const file = path.join(fx.receipts.root, `${fx.launch.launchId}${mode === 'anchor' ? '' : `.${mode}`}.json`);
+      const bytes = fs.readFileSync(file);
+      fs.renameSync(file, file + '.old');
+      fs.writeFileSync(file, bytes);
+    }
+    if (mode === 'source') fs.writeFileSync(fx.file, Buffer.alloc(fx.opening.length, 120));
+    if (mode === 'refused') fx.receipts.startupRefused(fx.launch.launchId, true);
+    if (mode === 'collision') fx.catalog.push({ ...fx.catalog[1], file: fx.file + '.other' });
+    if (mode === 'redirected-cwd') fs.symlinkSync(fx.home, cwd, process.platform === 'win32' ? 'junction' : 'dir');
+    assert.deepEqual(drainRelationships(new DispatchReceipts(fx.home).relationships(fx.catalog)), []);
+    if (mode === 'redirected-cwd') fs.rmdirSync(cwd);
+  },
+);
+
+test('retained verification rejects a forged requester even when file revisions appear unchanged', () => {
+  const cwd = scratch('arc-dispatch-worker-');
+  const fx = relationshipFixture('claude', 'codex', false, cwd);
+  assert.equal(drainRelationships(fx.receipts.relationships(fx.catalog)).length, 1);
+  fx.receipts.checkpointRelationships();
+  fs.rmdirSync(cwd);
+  const receiptFile = path.join(fx.receipts.root, fx.launch.launchId, 'receipt.json');
+  const anchorFile = path.join(fx.receipts.root, `${fx.launch.launchId}.json`);
+  const revisions = new Map([receiptFile, anchorFile].map((file) => [file, fs.lstatSync(file, { bigint: true })]));
+  const forged = 'cccccccc-1111-2222-3333-444444444444';
+  const receipt = JSON.parse(fs.readFileSync(receiptFile, 'utf8'));
+  receipt.requester.id = forged;
+  const text = JSON.stringify(receipt);
+  fs.writeFileSync(receiptFile, text);
+  const anchor = JSON.parse(fs.readFileSync(anchorFile, 'utf8'));
+  anchor.sha256 = payloadSha256(text);
+  fs.writeFileSync(anchorFile, JSON.stringify(anchor));
+  fx.catalog[0].sessionId = forged;
+  const stat = fs.lstatSync;
+  vi.spyOn(fs, 'lstatSync').mockImplementation(
+    ((file: fs.PathLike, options: any) => revisions.get(String(file)) ?? stat(file, options)) as typeof fs.lstatSync,
+  );
+  syncBuiltinESMExports();
+  assert.deepEqual(drainRelationships(new DispatchReceipts(fx.home).relationships(fx.catalog)), []);
+});
 
 function competingRelationshipFixture(parent: 'claude' | 'codex', child: 'claude' | 'codex') {
   const fx = relationshipFixture(parent, child);
@@ -372,9 +460,15 @@ test.each([
       platform === 'win32' ? (temporary ? 'C:/tmp/ArcHome' : 'C:/ArcHome') : temporary ? '/tmp/ArcHome' : '/ArcHome';
     const virtualRoot = paths.join(virtualHome, 'dispatch');
     const virtualSource = paths.join(virtualHome, platform === 'win32' && mixed ? 'NATIVE.jsonl' : 'native.jsonl');
+    const virtualCwd = paths.join(virtualHome, 'Worktrees', 'WorkerTree');
+    const physicalCwd = path.join(
+      fx.home,
+      ...(platform === 'win32' ? ['worktrees', 'workertree'] : ['Worktrees', 'WorkerTree']),
+    );
+    fs.mkdirSync(physicalCwd, { recursive: true });
     const receiptFile = path.join(fx.receipts.root, fx.launch.launchId, 'receipt.json');
     const receipt = JSON.parse(fs.readFileSync(receiptFile, 'utf8'));
-    receipt.standalone.cwd = virtualHome;
+    receipt.standalone.cwd = virtualCwd;
     fs.writeFileSync(receiptFile, JSON.stringify(receipt));
     const anchorFile = path.join(fx.receipts.root, `${fx.launch.launchId}.json`);
     const anchor = JSON.parse(fs.readFileSync(anchorFile, 'utf8'));
@@ -382,7 +476,7 @@ test.each([
     fs.writeFileSync(anchorFile, JSON.stringify(anchor));
     const startupFile = path.join(fx.receipts.root, fx.launch.launchId, 'startup.json');
     const startup = JSON.parse(fs.readFileSync(startupFile, 'utf8'));
-    Object.assign(startup, { file: virtualSource, ancestor: virtualHome, cwd: virtualHome });
+    Object.assign(startup, { file: virtualSource, ancestor: virtualHome, cwd: virtualCwd });
     fs.writeFileSync(startupFile, JSON.stringify(startup));
     const witnessFile = path.join(fx.receipts.root, `${fx.launch.launchId}.startup.json`);
     const witness = JSON.parse(fs.readFileSync(witnessFile, 'utf8'));
@@ -425,12 +519,15 @@ test.each([
     const openDirectory = fs.opendirSync;
     const temporaryRoot = platform === 'win32' ? paths.normalize('C:/tmp') : '/tmp';
     let aliasChecks = 0;
+    let redirectedCwdParent = false;
     vi.spyOn(os, 'homedir').mockReturnValue(platform === 'win32' ? 'C:/Reader' : '/reader');
     vi.spyOn(os, 'tmpdir').mockReturnValue(platform === 'win32' ? 'C:/ConfiguredTemp' : '/configured/temp');
     vi.spyOn(fs, 'lstatSync').mockImplementation(((file: fs.PathLike, options: any) => {
       const target = String(file) === temporaryRoot ? fx.home : translate(file);
       physicalTargets.push(target);
       const held = stat(target, options);
+      if (redirectedCwdParent && key(String(file)) === key(paths.dirname(virtualCwd)))
+        return Object.assign(Object.create(Object.getPrototypeOf(held)), held, { isSymbolicLink: () => true });
       if (String(file) === temporaryRoot) {
         aliasChecks++;
         return Object.assign(Object.create(Object.getPrototypeOf(held)), held, { isSymbolicLink: () => true });
@@ -458,6 +555,7 @@ test.each([
         return canonical ? '/private/tmp' : '/redirected/tmp';
       }
       if (key(String(file)) === key(virtualHome)) return virtualHome;
+      if (key(String(file)) === key(virtualCwd)) return virtualCwd;
       unmapped.push(String(file));
       throw new Error(`Unmapped real path: ${String(file)}`);
     });
@@ -468,6 +566,16 @@ test.each([
     let references: ReturnType<typeof drainRelationships> = [];
     try {
       references = drainRelationships(receipts.relationships(catalog), 31, refusals);
+      if (expected) {
+        fs.rmdirSync(physicalCwd);
+        assert.deepEqual(drainRelationships(receipts.relationships(catalog), 31, refusals), references);
+        assert.deepEqual(drainRelationships(new DispatchReceipts(virtualHome, platform).relationships(catalog)), []);
+        redirectedCwdParent = true;
+        assert.deepEqual(drainRelationships(receipts.relationships(catalog)), []);
+        redirectedCwdParent = false;
+        fs.rmdirSync(path.dirname(physicalCwd));
+        assert.deepEqual(drainRelationships(receipts.relationships(catalog), 31, refusals), references);
+      }
     } finally {
       assert.deepEqual(unmapped, []);
       for (const target of physicalTargets) {

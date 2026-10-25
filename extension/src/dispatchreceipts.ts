@@ -210,6 +210,7 @@ class RelationshipReader {
   progress = emptyRelationshipStep();
   refusal: { error: unknown } | null = null;
   readonly revisions = new Map<string, string | null>();
+  readonly digests = new Map<string, string>();
   private readonly descriptors = new Set<number>();
   constructor(
     readonly signal?: AbortSignal,
@@ -260,7 +261,7 @@ class RelationshipReader {
     this.revisions.set(file, revision);
     return stat;
   }
-  *path(file: string): RelationshipScan<void> {
+  *path(file: string, allowMissing = false): RelationshipScan<void> {
     // safeDispatchPath owns the synchronous counterpart of this resumable path contract.
     const paths = this.platform === 'win32' ? path.win32 : path.posix;
     const normalized = (value: string) =>
@@ -271,7 +272,8 @@ class RelationshipReader {
         const physical = yield* this.operation('checks', () => fs.realpathSync.native(current));
         if (physical === '/private/tmp') break;
       }
-      if (!(yield* this.stat(current))) throw new Error('The dispatch relationship path is unavailable.');
+      if (!(yield* this.stat(current)) && !allowMissing)
+        throw new Error('The dispatch relationship path is unavailable.');
       if (current === paths.dirname(current)) break;
     }
   }
@@ -325,8 +327,10 @@ class RelationshipReader {
         stat.ctimeNs !== after.ctimeNs
       )
         throw new Error('The dispatch relationship file changed during validation.');
-      if (prefix && digest.digest('hex') !== prefix.sha256) throw new Error('The original dispatch source changed.');
+      const sha256 = digest.digest('hex');
+      if (prefix && sha256 !== prefix.sha256) throw new Error('The original dispatch source changed.');
       yield* this.stat(file);
+      this.digests.set(file, sha256);
       return prefix ? '' : new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(Buffer.concat(chunks));
     } finally {
       if (this.descriptors.delete(fd)) fs.closeSync(fd);
@@ -340,6 +344,7 @@ class RelationshipReader {
 // Native records supply response and usage evidence. These files retain launch and consumption identity only.
 export class DispatchReceipts {
   readonly root: string;
+  private readonly verifiedRelationships = new Map<string, string>();
   private readonly replace: (temporary: string, target: string) => void;
   constructor(
     home = arcHome(),
@@ -349,6 +354,38 @@ export class DispatchReceipts {
     const paths = platform === 'win32' ? path.win32 : path.posix;
     this.root = paths.join(paths.resolve(home), 'dispatch');
     this.replace = retryingReplace(replacement);
+  }
+  private relationshipCacheFile(id: string): string {
+    const paths = this.platform === 'win32' ? path.win32 : path.posix;
+    return paths.join(paths.dirname(this.root), 'cache', 'dispatch-relationships', `${id}.json`);
+  }
+  // Callers publish completed verification separately from the read-only scan.
+  checkpointRelationships(): void {
+    const paths = this.platform === 'win32' ? path.win32 : path.posix;
+    for (const [id, digest] of this.verifiedRelationships) {
+      try {
+        const file = this.relationshipCacheFile(id);
+        try {
+          if (JSON.parse(read(file)) === digest) {
+            this.verifiedRelationships.delete(id);
+            continue;
+          }
+        } catch {
+          // Missing cache evidence requires a complete verification before publication.
+        }
+        const home = paths.dirname(this.root);
+        safePath(home);
+        for (const directory of [paths.join(home, 'cache'), paths.dirname(file)]) {
+          if (!fs.existsSync(directory)) fs.mkdirSync(directory, { mode: 0o700 });
+          safePath(directory);
+        }
+        writeFileAtomically(file, JSON.stringify(digest), this.replace, 0o600, false);
+      } catch {
+        // Unavailable cache storage leaves the verified relationship in memory.
+        continue;
+      }
+      this.verifiedRelationships.delete(id);
+    }
   }
   // The first next call yields without reading. Each later call needs a remaining work allowance.
   *relationship(
@@ -512,10 +549,18 @@ export class DispatchReceipts {
     if (normalize(startup.file) !== normalize(scoped.child.file)) return null;
     yield* reader.path(startup.ancestor);
     const ancestor = yield* reader.stat(startup.ancestor);
-    yield* reader.path(options.cwd);
-    const cwd = yield* reader.operation('checks', () => fs.realpathSync.native(options.cwd));
-    if (!ancestor?.isDirectory() || `${ancestor.dev}:${ancestor.ino}` !== startup.directory || cwd !== startup.cwd)
-      return null;
+    if (!ancestor?.isDirectory() || `${ancestor.dev}:${ancestor.ino}` !== startup.directory) return null;
+    // Bind retained cwd agreement to the exact receipt, witnesses, bindings and their physical identities.
+    const verification = payloadSha256(JSON.stringify([this.platform, [...reader.revisions], [...reader.digests]]));
+    const cwdPresent = yield* reader.stat(options.cwd);
+    yield* reader.path(options.cwd, !cwdPresent);
+    if (cwdPresent) {
+      const cwd = yield* reader.operation('checks', () => fs.realpathSync.native(options.cwd));
+      if (cwd !== startup.cwd) return null;
+    } else if (this.verifiedRelationships.get(id) !== verification) {
+      const retained = JSON.parse(yield* reader.read(this.relationshipCacheFile(id)));
+      if (retained !== verification) return null;
+    }
     yield* reader.read(startup.file, startup);
     yield* reader.recheck();
     const current = lookup();
@@ -526,6 +571,7 @@ export class DispatchReceipts {
       normalize(current.child.file) !== normalize(scoped.child.file)
     )
       return null;
+    if (cwdPresent) this.verifiedRelationships.set(id, verification);
     return {
       kind: 'dispatch',
       agent: options.provider,

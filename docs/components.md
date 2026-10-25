@@ -129,7 +129,7 @@ Paths are relative to `extension/src/`. [Architecture](architecture.md) owns pac
 | `sessionrequests.ts` | Per-activation window identity, private registry publication, authenticated bounded JSON-lines requests, live window discovery, observed access diagnostics, target selection, query capability, connection cancellation, and channel cleanup | no |
 | `sessionreads.ts` | Paged programmatic session listings with signed cursors, independent transcript reads, and bounded exact source identity mappings | no |
 | `sessionwrites.ts` | Session-write schema with scoped launch folders and read-only options, activation-bound request retention, archive refusal decisions, and guarded follow-up ownership, admission, and panel wiring | no |
-| `dispatchreceipts.ts` | Launch-private receipts, immutable report events, authoritative file identity checks, read-only relationship scans, retained claims, durable consumption dispositions, standalone capture checkpoints, and log alias publication | no |
+| `dispatchreceipts.ts` | Launch-private receipts, immutable report events, authoritative file identity checks, read-only relationship scans, shared verification checkpoints, retained claims, durable consumption dispositions, standalone capture checkpoints, and log alias publication | no |
 | `dispatchhost.ts` | Exact hosted submission observation, native ending and saved-response agreement, and finite lifecycle waits | no |
 | `terminalownership.ts` | Bounded process ancestry, current terminal membership comparison, and independent process identity checks | no |
 | `windowpipe.ts` | Host-lifetime Windows pipe bridge, shared native executable resolution, connected-server identity checks, and bounded stdio | no |

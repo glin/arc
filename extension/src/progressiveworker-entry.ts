@@ -148,6 +148,7 @@ export const CODEX_DISPATCH_REQUEST_BYTES = 8 * 1024 * 1024;
 let discoveryEpoch: DiscoveryCheckpoint | null = null;
 let receiptScan: {
   epoch: string | undefined;
+  store: DispatchReceipts;
   steps: ReturnType<DispatchReceipts['relationships']>;
   references: import('./transcript').ClaudeDispatchSessionReference[];
   competitionRefused: boolean;
@@ -858,10 +859,12 @@ async function execute(
     continuation ||= parentKeys(epoch.parents) !== parentKeys(request.parents);
     if (!receiptScan) {
       const controller = new AbortController();
+      const store = new DispatchReceipts();
       receiptScan = {
         epoch: epoch.epoch,
+        store,
         controller,
-        steps: new DispatchReceipts().relationships(epoch.catalog, controller.signal),
+        steps: store.relationships(epoch.catalog, controller.signal),
         references: [],
         competitionRefused: false,
       };
@@ -878,7 +881,10 @@ async function execute(
       charges.receiptChecks! += step.value.checks;
       charges.receiptBytes! += step.value.bytes;
       charges.readBytes += step.value.bytes;
-      if (step.value.reference) activeReceipts.references.push(step.value.reference);
+      if (step.value.reference) {
+        activeReceipts.references.push(step.value.reference);
+        activeReceipts.store.checkpointRelationships();
+      }
       if (step.value.refusal && ('launchId' in step.value.refusal || step.value.refusal.storeOpened))
         activeReceipts.competitionRefused = true;
       receiptSteps++;

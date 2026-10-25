@@ -3181,7 +3181,10 @@ function* sessionSourceSteps(
         signal?.throwIfAborted();
         const next = steps.next({ entries: 1, checks: 1, bytes: 64 * 1024 });
         if (next.done) break;
-        if (next.value.reference) references.push(next.value.reference);
+        if (next.value.reference) {
+          references.push(next.value.reference);
+          receiptStore.checkpointRelationships();
+        }
         if (next.value.refusal) {
           receiptRefusal ??= next.value.refusal;
           if ('launchId' in next.value.refusal || next.value.refusal.storeOpened)
