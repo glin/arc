@@ -3,6 +3,8 @@ import type { ArcCliEnvironment } from './agenthost';
 import { execFile } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { sessionSkillRelease } from './bundledtools';
+import type { SessionSkillRelease } from './sessionskills';
 
 export async function terminalCommandDirectory(
   directory: string,
@@ -158,6 +160,16 @@ export class TerminalTools {
       );
     }
     throw new Error('Arc commands are unavailable in this window.');
+  }
+  sessionSkills(): SessionSkillRelease | undefined {
+    try {
+      if (this.disposed || !this.selected || this.selected.admission !== JSON.stringify(this.admission()))
+        return undefined;
+      return sessionSkillRelease(path.dirname(this.selected.directory));
+    } catch {
+      // Unvalidated development output and refused releases retain manual native discovery.
+      return undefined;
+    }
   }
   dispose(): void {
     this.disposed = true;

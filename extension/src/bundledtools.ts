@@ -4,6 +4,7 @@ import * as os from 'node:os';
 import { createHash, randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { ARC_IDENTITY } from './identity';
+import type { SessionSkillRelease } from './sessionskills';
 import { writeFileAtomically } from './atomicfile';
 import {
   acquireToolLock,
@@ -103,6 +104,50 @@ export function readToolPackage(dist: string, platform = process.platform): Tool
   return { directory, payload };
 }
 
+// A release's recorded identity covers both native copies and every referenced resource.
+export function sessionSkillRelease(directory: string): SessionSkillRelease {
+  const release = canonicalToolPath(directory);
+  const payload = jsonFile(path.join(release, 'release.json')) as ToolPayload & { extensionVersion?: string };
+  const { contentId, ...content } = payload;
+  if (!/^[a-f0-9]{64}$/.test(contentId) || contentId !== digest(JSON.stringify(content)))
+    throw new Error('The Arc session tools have an unreadable identity.');
+  validateToolFiles(release, payload.files, ['release.json']);
+  const prefix = 'skills/arc-sessions/';
+  const copies = Object.keys(payload.files)
+    .filter((file) => file.startsWith(prefix))
+    .sort();
+  if (!copies.includes(prefix + 'SKILL.md')) throw new Error('The Arc session skill is missing.');
+  const pluginFiles = Object.keys(payload.files)
+    .filter((file) => file.startsWith('session-plugin/'))
+    .sort();
+  const manifestFile = 'session-plugin/.claude-plugin/plugin.json';
+  if (
+    JSON.stringify(pluginFiles) !==
+    JSON.stringify([manifestFile, ...copies.map((file) => 'session-plugin/' + file)].sort())
+  )
+    throw new Error('The Arc session plugin contains unsupported files.');
+  const manifest = JSON.parse(fs.readFileSync(path.join(release, manifestFile), 'utf8'));
+  if (
+    !payload.extensionVersion ||
+    JSON.stringify(manifest) !== JSON.stringify({ name: 'arc-session-tools', version: payload.extensionVersion })
+  )
+    throw new Error('The Arc session plugin has an unreadable identity.');
+  for (const file of copies)
+    if (payload.files[file].sha256 !== payload.files['session-plugin/' + file].sha256)
+      throw new Error('The Arc session skill copies differ.');
+  const definition = fs.readFileSync(path.join(release, prefix, 'SKILL.md'), 'utf8');
+  for (const [, reference] of definition.matchAll(/\]\(([\w-]+\.md)(?:#[^)]*)?\)/g))
+    if (!copies.includes(prefix + reference)) throw new Error('The Arc session skill has a missing reference.');
+  return Object.freeze({
+    contentId,
+    directory: release,
+    claudePlugin: path.join(release, 'session-plugin'),
+    codexRoot: path.join(release, 'skills'),
+    claudeDefinition: path.join(release, 'session-plugin/skills/arc-sessions/SKILL.md'),
+    codexDefinition: path.join(release, 'skills/arc-sessions/SKILL.md'),
+  });
+}
+
 export async function prepareEditorCommands(
   dist: string,
   root: string,
@@ -111,6 +156,12 @@ export async function prepareEditorCommands(
 ): Promise<string> {
   if (signal.aborted) throw new Error('Arc setup was canceled.');
   if (!development) return new BundledTools(readToolPackage(dist), root).preparePrivateCommands(signal);
+  try {
+    const bundle = readToolPackage(dist);
+    return await new BundledTools(bundle, root).preparePrivateCommands(signal);
+  } catch {
+    // Watch builds remove their identity and retain their development launchers.
+  }
   const directory = path.join(dist, 'bin');
   admitToolPath(directory);
   for (const file of ['bin/arc', 'bin/arc.cmd', 'cli.cjs', 'windowpipe.exe']) {

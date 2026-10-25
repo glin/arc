@@ -64,7 +64,8 @@ test('measurement windows refuse agent processes before launch', { tags: ['subpr
     else process.env.ARC_MEASURE_BLOCK_AGENTS = previous;
   }
 });
-import { ClaudeWire, CONTROL_DEADLINE_MS, type PermissionMode } from './claudewire.ts';
+import { ClaudeWire, CONTROL_DEADLINE_MS, spawnArgs, type PermissionMode } from './claudewire.ts';
+import { admitClaudeSessionSkill } from './sessionskills';
 import {
   CompactHost,
   promptAsReader,
@@ -423,6 +424,7 @@ test.each(
       ]);
       live.children[0].reply({ turn: { id: 'answer-turn' } });
     }
+    const uncertainWrite = kind === 'codex-async' && outcome === 'failed';
     const terminal =
       outcome === 'answer'
         ? kind === 'codex-async'
@@ -430,24 +432,27 @@ test.each(
           : 'unknown'
         : outcome === 'decline'
           ? 'declined'
-          : outcome;
+          : uncertainWrite
+            ? 'unknown'
+            : outcome;
     await vi.waitFor(() =>
       assert.ok(
         live.events.some(({ event }) => event.kind === 'askResolved' && event.id === id && event.outcome === terminal),
       ),
     );
-    if (outcome === 'failed') {
+    if (outcome === 'failed' && !uncertainWrite) {
       assert.equal(live.host.waiting().length, 1, 'a failed native answer removed its live question');
       assert.equal(live.host.waiting()[0].recovered, undefined);
       live.children[0].exit(1);
       assert.equal(live.host.waiting().length, 1, 'a failed native answer hid the saved question after child exit');
       assert.ok(live.host.waiting()[0].recovered);
     } else assert.equal(live.host.waiting().length, 0, 'the completed live answer reappeared as a recovery card');
+    if (uncertainWrite) assert.equal(live.host.get(key)?.state().busy, false, 'uncertain delivery retained busy state');
     const settled =
       persistence === 'none' &&
       (outcome === 'decline' || outcome === 'cancelled' || (kind === 'codex-async' && outcome === 'answer'));
     const disposition =
-      persistence === 'begin and terminal' || (outcome === 'failed' && persistence === 'none')
+      persistence === 'begin and terminal' || (outcome === 'failed' && !uncertainWrite && persistence === 'none')
         ? 'unresolved'
         : 'unknown';
     if (settled) assert.deepEqual(store.entries(), []);
@@ -2946,7 +2951,7 @@ test('the extension forwards stopped dispatch ownership separately from panel ow
   const host = statementFrom(activate, activate.indexOf('const host = new AgentHost('));
   sourceMatch(
     host,
-    /onEvent: \(\{ key, event, turnId, dispatchTurnId \}\) => \{\s*panel\.onDispatchEvent\?\.\(key, event, dispatchTurnId \?\? turnId\);/,
+    /onEvent: \(\{ key, event, turnId, dispatchTurnId, usageSource \}\) => \{\s*panel\.onDispatchEvent\?\.\(key, event, dispatchTurnId \?\? turnId\);/,
     'the stopped dispatch owner must reach the panel dispatch observer',
   );
 });
@@ -12084,4 +12089,181 @@ test('Claude plans set a requested cache lifetime over launch values and keep th
   assert.equal(planned({ agentRun: true }).CLAUDE_CODE_PROMPT_CACHE_TTL, '5m');
   assert.equal(planned({ agentRun: false }).CLAUDE_CODE_PROMPT_CACHE_TTL, undefined);
   assert.equal(planned({ agentRun: true }, { CLAUDE_CODE_PROMPT_CACHE_TTL: '1h' }).CLAUDE_CODE_PROMPT_CACHE_TTL, '1h');
+});
+
+test.each(['ordinary', 'restricted', 'inline'] as const)(
+  'Claude plan preparation admits the complete frozen %s arguments',
+  (kind) => {
+    const source = fs.readFileSync(path.join(__dirname, 'agenthost.ts'), 'utf8');
+    const start = source.indexOf('export function claudePlan(');
+    const end = source.indexOf('// A child started only to rename', start);
+    const compiled = esbuild.transformSync(
+      source.slice(start, end).replace('export function', 'function') + '\nreturn claudePlan;',
+      { loader: 'ts' },
+    ).code;
+    const root = tempDir('claude-plan-admission-');
+    const home = path.join(root, 'home');
+    const release = {
+      contentId: 'a'.repeat(64),
+      directory: root,
+      claudePlugin: path.join(root, 'session-plugin'),
+      claudeDefinition: path.join(root, 'SKILL.md'),
+      codexRoot: path.join(root, 'skills'),
+      codexDefinition: path.join(root, 'skills/arc-sessions/SKILL.md'),
+    };
+    const admittedArgs: string[][] = [];
+    const build = runInNewContext(`(() => { ${compiled} })()`, {
+      process: { env: { CUSTOM: 'frozen' } },
+      childEnv,
+      claudePlanEnv: (env: Record<string, string>) => ({ ...env }),
+      claudeSkillHome: () => home,
+      retainedSessionSkill: () => true,
+      spawnArgs,
+      admitClaudeSessionSkill: (input: Parameters<typeof admitClaudeSessionSkill>[0]) => {
+        admittedArgs.push([...input.args]);
+        return admitClaudeSessionSkill({
+          ...input,
+          read: (file) => (file === release.claudeDefinition ? 'matching skill' : undefined),
+          list: () => [],
+          canonical: (file) => file,
+        });
+      },
+    }) as typeof claudePlan;
+    const options = {
+      cwd: root,
+      ...(kind === 'restricted' ? { policy: { readOnly: true as const, readTools: [] } } : {}),
+      ...(kind === 'inline' ? { settings: '{"disableSideloadFlags":true}' } : {}),
+    };
+    const plan = build(
+      { ...CLAUDE, leadingArgs: ['--model', 'sonnet'], env: {}, sessionSkills: { current: () => release } },
+      options,
+    );
+    const prepared = plan.prepare!();
+    const expected = [
+      '--model',
+      'sonnet',
+      ...spawnArgs({ ...options, replayUserMessages: true }, { CUSTOM: 'frozen', CLAUDE_CONFIG_DIR: home }),
+    ];
+    assert.deepEqual(admittedArgs, [expected]);
+    assert.deepEqual(Array.from(prepared.args), [
+      ...expected,
+      ...(kind === 'ordinary' ? ['--plugin-dir', release.claudePlugin] : []),
+    ]);
+    assert.equal(prepared.inheritedEnvironment?.CUSTOM, 'frozen');
+  },
+);
+
+// One preparation read per actual construction protects idle paths without provider subprocesses.
+test('every live and idle construction prepares its own plan before its single spawn', async () => {
+  let preparations = 0;
+  let spawns = 0;
+  const base = claudeIdlePlan(CLAUDE, WS);
+  const plan: AgentPlan = {
+    ...base,
+    prepare: () => {
+      preparations++;
+      return {
+        ...base,
+        args: [...base.args, '--prepared-fixture'],
+        driver: (send, emit) => ({
+          ...base.driver(send, emit),
+          open: async () => [],
+          rateLimits: undefined,
+          models: undefined,
+          appliedDefaults: undefined,
+          mcpStatus: async () => [],
+        }),
+      };
+    },
+  };
+  const spawner: import('./agenthost').Spawner = (_command, args) => {
+    spawns++;
+    assert.equal(preparations, spawns);
+    assert.ok(args.includes('--prepared-fixture'));
+    const child = new FakeChild();
+    child.stdin.end = () => {
+      child.exit(0);
+      child.close();
+    };
+    return child;
+  };
+  await askIdle(plan, spawner);
+  await askIdleMcp(plan, spawner);
+  await askIdleMcpChange(plan, spawner, []);
+  await askIdleDefaults(plan, spawner);
+  const host = new AgentHost({ spawner, idleDurationMs: 60_000, onEvent: () => {}, onStateChange: () => {} });
+  const live = await host.session('live', plan);
+  assert.equal(live.state().ready, true);
+  assert.equal(preparations, 5);
+  assert.equal(spawns, 5);
+  await live.dispose();
+  host.dispose();
+  assert.equal(
+    claudeRenamePlan(
+      {
+        ...CLAUDE,
+        sessionSkills: {
+          current: () => {
+            throw new Error('rename must stay skill-free');
+          },
+        },
+      },
+      { cwd: WS, resume: 'session', title: 'Name' },
+    ).prepare,
+    undefined,
+  );
+});
+
+// Actual optional-admission refusal must close the same child without sending or replaying input.
+test('failed actual Claude skill admission starts no replacement and sends no user frame', async () => {
+  const fixture = fakeHost();
+  const plan = claudePlan(CLAUDE, { cwd: WS, sessionId: 'session' });
+  const release = {
+    contentId: 'a'.repeat(64),
+    directory: '/release',
+    claudePlugin: '/release/session-plugin',
+    codexRoot: '/release/skills',
+    claudeDefinition: '/release/session-plugin/skills/arc-sessions/SKILL.md',
+    codexDefinition: '/release/skills/arc-sessions/SKILL.md',
+  };
+  const original = plan.driver;
+  plan.driver = (send, emit) => {
+    const driver = original(send, emit);
+    const wire = new ClaudeWire({ send, emit, sessionSkills: { release, refresh: () => false } });
+    return {
+      ...driver,
+      receive: (line) => wire.receive(line),
+      open: () => wire.initialize(),
+      close: (reason) => wire.close(reason),
+    };
+  };
+  const opening = fixture.host.session('optional', plan);
+  const child = fixture.children[0];
+  child.answerControl('initialize', {
+    claude_code_version: '2.1.310',
+    commands: [{ name: 'arc-session-tools:arc-sessions' }],
+  });
+  await vi.waitFor(() =>
+    assert.ok(child.sent().some((message) => (message.request as any)?.subtype === 'get_settings')),
+  );
+  child.answerControl('get_settings', {
+    effective: {},
+    sources: [{ source: 'policySettings', settings: {} }],
+    applied: {},
+  });
+  const session = await opening;
+  assert.equal(session.state().ready, false);
+  assert.match(session.state().lastError ?? '', /settings/);
+  assert.equal(fixture.children.length, 1);
+  assert.equal(
+    child.sent().some((message) => message.type === 'user'),
+    false,
+  );
+  child.exit(0);
+  child.close();
+  await session.dispose();
+  fixture.host.dispose();
+  const suppliedCatalogEvent = fixture.events.find((item) => item.event.kind === 'commands');
+  assert.equal(suppliedCatalogEvent?.usageSource, session.usageSource);
+  assert.equal(suppliedCatalogEvent?.event.kind === 'commands' && suppliedCatalogEvent.event.optionalOnly, true);
 });

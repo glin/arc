@@ -35,6 +35,13 @@ export function bundledTools(dist, sourceRoot, build) {
     visit(plugin, folder, 'plugin', '../plugins/arc-hooks', true);
   const skills = path.join(sourceRoot, 'cli/skills/arc-sessions');
   visit(skills, '', 'skills/arc-sessions', '../cli/skills/arc-sessions');
+  visit(skills, '', 'session-plugin/skills/arc-sessions', '../cli/skills/arc-sessions');
+  const sessionManifest = 'session-plugin/.claude-plugin/plugin.json';
+  const sessionBytes = JSON.stringify({ name: 'arc-session-tools', version: build.extensionVersion });
+  fs.mkdirSync(path.join(destination, 'session-plugin/.claude-plugin'), { recursive: true });
+  fs.writeFileSync(path.join(destination, sessionManifest), sessionBytes);
+  fs.chmodSync(path.join(destination, sessionManifest), 0o644);
+  files[sessionManifest] = { sha256: createHash('sha256').update(sessionBytes).digest('hex'), mode: 0o644 };
   const definition = fs.readFileSync(path.join(skills, 'SKILL.md'), 'utf8');
   for (const [, reference] of definition.matchAll(/\]\(([\w-]+\.md)(?:#[^)]*)?\)/g))
     if (!fs.lstatSync(path.join(skills, reference), { throwIfNoEntry: false })?.isFile())

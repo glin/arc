@@ -24,6 +24,163 @@ import { createHash } from 'node:crypto';
 
 const SESSION = 'c0129cee-9323-4aea-a448-ec90642971ea';
 
+const suppliedSessionSkill = {
+  contentId: 'a'.repeat(64),
+  directory: '/release',
+  claudePlugin: '/release/session-plugin',
+  codexRoot: '/release/skills',
+  claudeDefinition: '/release/session-plugin/skills/arc-sessions/SKILL.md',
+  codexDefinition: '/release/skills/arc-sessions/SKILL.md',
+};
+
+// These protocol guards catch early publication, stale first-write authority, and duplicate delivery without native processes.
+test.each(['text', 'assets', 'guarded', 'effort', 'compact', 'clear'])(
+  'Claude %s delivery repeats actual native admission immediately before its first user frame',
+  async (kind) => {
+    let contentReady!: (bytes: Uint8Array) => void;
+    const content = new Promise<Uint8Array>((resolve) => {
+      contentReady = resolve;
+    });
+    let admitted = true;
+    const h = harness(undefined, SESSION, () => content, { release: suppliedSessionSkill, refresh: () => admitted });
+    const answer = (response: unknown) => {
+      const request = h
+        .parsed()
+        .filter((message) => message.type === 'control_request')
+        .at(-1);
+      h.wire.receive(
+        JSON.stringify({
+          type: 'control_response',
+          response: { subtype: 'success', request_id: request.request_id, response },
+        }),
+      );
+    };
+    const opening = h.wire.initialize();
+    answer({ claude_code_version: '2.1.310', commands: [{ name: 'arc-session-tools:arc-sessions' }] });
+    await vi.waitFor(() => assert.equal(h.parsed().at(-1).request.subtype, 'get_settings'));
+    assert.equal(
+      h.events.some((event) => event.kind === 'ready'),
+      false,
+    );
+    answer({ effective: {}, sources: [], applied: {} });
+    const commands = await opening;
+    assert.equal(commands[0].path, suppliedSessionSkill.claudeDefinition);
+    assert.equal(commands[0].sessionSkillRelease, suppliedSessionSkill.contentId);
+    let guardedChecks = 0;
+    const delivery =
+      kind === 'effort'
+        ? h.wire.effortCommand('high')
+        : h.wire.prompt(
+            kind === 'assets'
+              ? {
+                  text: 'Inspect this image',
+                  assets: [
+                    {
+                      id: 'asset',
+                      name: 'image.png',
+                      mime: 'image/png',
+                      path: '/asset.png',
+                      size: 1,
+                      digest: createHash('sha256')
+                        .update(new Uint8Array([1]))
+                        .digest('hex'),
+                    },
+                  ],
+                }
+              : kind === 'compact'
+                ? '/compact'
+                : kind === 'clear'
+                  ? '/clear'
+                  : 'Run the task',
+            kind === 'guarded'
+              ? new GuardedAttempt('attempt', () => {
+                  guardedChecks++;
+                })
+              : undefined,
+          );
+    const failed = assert.rejects(delivery, /settings/);
+    if (kind === 'assets') {
+      assert.equal(h.parsed().filter((message) => message.request?.subtype === 'get_settings').length, 1);
+      contentReady(new Uint8Array([1]));
+    }
+    await vi.waitFor(() =>
+      assert.equal(h.parsed().filter((message) => message.request?.subtype === 'get_settings').length, 2),
+    );
+    admitted = false;
+    answer({ effective: {}, sources: [], applied: {} });
+    await failed;
+    assert.equal(h.parsed().filter((message) => message.type === 'user').length, 0);
+    assert.equal(guardedChecks, 0);
+    h.wire.close('closed');
+  },
+);
+
+test('Claude cancelled competing first writes cannot donate admission and successful delivery writes once', async () => {
+  const h = harness(undefined, SESSION, undefined, { release: suppliedSessionSkill, refresh: () => true });
+  const answer = (response: unknown, subtype = 'get_settings') => {
+    const request = h
+      .parsed()
+      .filter((message) => message.request?.subtype === subtype)
+      .at(-1);
+    h.wire.receive(
+      JSON.stringify({
+        type: 'control_response',
+        response: { subtype: 'success', request_id: request.request_id, response },
+      }),
+    );
+  };
+  const first = h.wire.prompt('Cancelled candidate');
+  const cancelled = assert.rejects(first, /stopped/);
+  await vi.waitFor(() =>
+    assert.equal(h.parsed().filter((message) => message.request?.subtype === 'get_settings').length, 1),
+  );
+  const stop = h.wire.interrupt(true);
+  answer({}, 'interrupt');
+  await stop;
+  const second = h.wire.prompt('Accepted candidate');
+  answer({ effective: {}, sources: [], applied: {} });
+  await cancelled;
+  await vi.waitFor(() =>
+    assert.equal(h.parsed().filter((message) => message.request?.subtype === 'get_settings').length, 2),
+  );
+  answer({ effective: {}, sources: [], applied: {} });
+  await second;
+  assert.deepEqual(
+    h
+      .parsed()
+      .filter((message) => message.type === 'user')
+      .map((message) => message.message.content[0].text),
+    ['Accepted candidate'],
+  );
+  h.wire.close('closed');
+});
+
+test.each(['2.1.309', '3.0.0', undefined])(
+  'Claude incompatible native version %s publishes no optional command',
+  async (version) => {
+    const h = harness(undefined, SESSION, undefined, { release: suppliedSessionSkill, refresh: () => true });
+    const opening = h.wire.initialize();
+    const failed = assert.rejects(opening, /version/);
+    h.wire.receive(
+      JSON.stringify({
+        type: 'control_response',
+        response: {
+          subtype: 'success',
+          request_id: h.parsed()[0].request_id,
+          response: { claude_code_version: version, commands: [{ name: 'arc-session-tools:arc-sessions' }] },
+        },
+      }),
+    );
+    await failed;
+    assert.equal(
+      h.events.some((event) => event.kind === 'ready'),
+      false,
+    );
+    assert.equal(h.parsed().filter((message) => message.type === 'user').length, 0);
+    h.wire.close('closed');
+  },
+);
+
 test('Claude native evidence retains root envelopes, successful tool settlement and distinct manual compaction', async () => {
   const events: WireEvent[] = [];
   const writes: string[] = [];
@@ -531,7 +688,12 @@ const INTERRUPTED_RESULT = JSON.stringify({
   permission_denials: [],
 });
 
-function harness(deadlineMs?: number, sessionId?: string, readFile?: (filePath: string) => Promise<Uint8Array>) {
+function harness(
+  deadlineMs?: number,
+  sessionId?: string,
+  readFile?: (filePath: string) => Promise<Uint8Array>,
+  sessionSkills?: ConstructorParameters<typeof ClaudeWire>[0]['sessionSkills'],
+) {
   const sent: string[] = [];
   const events: WireEvent[] = [];
   const wire = new ClaudeWire({
@@ -540,6 +702,7 @@ function harness(deadlineMs?: number, sessionId?: string, readFile?: (filePath: 
     deadlineMs,
     sessionId,
     readFile,
+    sessionSkills,
   });
   return { wire, sent, events, parsed: () => sent.map((l) => JSON.parse(l)) };
 }

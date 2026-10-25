@@ -7,6 +7,7 @@ import { unavailableDefaults, type AppliedDefaults } from './view/model-picks';
 
 import * as fs from 'node:fs';
 import { randomUUID } from 'node:crypto';
+import { claudeNativeSkillSettings, type SessionSkillRelease } from './sessionskills';
 
 // Re-export the shared `agentwire.ts` types for Claude protocol callers.
 export {
@@ -519,6 +520,7 @@ function replayedText(m: Json, text: string): boolean {
 }
 
 export interface WireOptions {
+  sessionSkills?: { release: SessionSkillRelease; refresh(): boolean };
   now?(): number;
   // Receives each outbound JSON line with its terminating newline.
   send(line: string): void;
@@ -576,6 +578,10 @@ export class ClaudeWire {
   private nativeGeneration = 0;
   private readonly backgroundCommands = new Map<string, { generation: number; taskId?: string }>();
   private closed = false;
+  private readonly sessionSkills: WireOptions['sessionSkills'];
+  private firstSkillFrame = false;
+  private skillWriteTail: Promise<unknown> = Promise.resolve();
+  private skillFailure: Error | undefined;
   private readonly contextRequests = new Set<string>();
   // `remote_control_available` from the initialize reply. Null when the CLI did not report it.
   private remoteAvailable: boolean | null = null;
@@ -628,6 +634,7 @@ export class ClaudeWire {
   private session: string | null = null;
 
   constructor(options: WireOptions) {
+    this.sessionSkills = options.sessionSkills;
     this.now = options.now ?? (() => performance.now());
     this.send = options.send;
     this.emit = options.emit;
@@ -649,8 +656,52 @@ export class ClaudeWire {
     const available = response.remote_control_available;
     this.remoteAvailable = typeof available === 'boolean' ? available : null;
     const commands = readCommands(response.commands);
+    if (this.sessionSkills) {
+      const version = /^(\d+)\.(\d+)\.(\d+)$/.exec(String(response.claude_code_version));
+      if (
+        !version ||
+        Number(version[1]) !== 2 ||
+        Number(version[2]) < 1 ||
+        (Number(version[2]) === 1 && Number(version[3]) < 310)
+      )
+        throw new Error('This Claude Code version cannot supply the Arc session skill.');
+      await this.admitSessionSkill();
+      const matches = commands.filter((command) => command.name === 'arc-session-tools:arc-sessions');
+      if (matches.length !== 1) throw new Error('Claude Code did not supply the Arc session skill.');
+      matches[0].path = this.sessionSkills.release.claudeDefinition;
+      matches[0].sessionSkillRelease = this.sessionSkills.release.contentId;
+    }
     this.emit({ kind: 'ready', commands });
     return commands;
+  }
+
+  private async admitSessionSkill(): Promise<void> {
+    if (this.skillFailure) throw this.skillFailure;
+    try {
+      const settings = await this.request({ subtype: 'get_settings' });
+      if (!claudeNativeSkillSettings(settings) || !this.sessionSkills?.refresh())
+        throw new Error('Claude Code cannot use the Arc session skill with these settings.');
+    } catch (error) {
+      this.skillFailure = error instanceof Error ? error : new Error(String(error));
+      this.emit({ kind: 'commands', commands: [], optionalOnly: true });
+      throw this.skillFailure;
+    }
+  }
+
+  private skillFrame(write: () => void | Promise<void>, generation: number): Promise<void> {
+    if (!this.sessionSkills) return Promise.resolve(write());
+    const pending = this.skillWriteTail
+      .catch(() => undefined)
+      .then(async () => {
+        if (this.skillFailure) throw this.skillFailure;
+        if (!this.firstSkillFrame) await this.admitSessionSkill();
+        if (this.closed) throw new Error('the agent is no longer running');
+        if (generation !== this.promptGeneration) throw new Error('the prompt was stopped before it reached the agent');
+        const result = write();
+        return result;
+      });
+    this.skillWriteTail = pending;
+    return pending;
   }
 
   // Sends a prompt and rejects delivery if the wire closes or Stop cancels prompts during attachment preparation.
@@ -671,42 +722,48 @@ export class ClaudeWire {
       throw new Error('the agent is no longer running');
     }
     const prompt = normalizeAgentPrompt(input);
+    const generation = this.promptGeneration;
     if (guard)
-      return this.guardedPrompt(prompt.text, prompt.assets.length > 0, guard, received, modelAccepted, written);
+      return this.skillFrame(
+        () => this.guardedPrompt(prompt.text, prompt.assets.length > 0, guard, received, modelAccepted, written),
+        generation,
+      );
     this.reportedState = null;
     if (!prompt.assets.length && prompt.text) {
-      beforeWrite?.();
-      this.nativeSubmission(prompt.text, written);
-      this.write(
-        {
-          type: 'user',
-          message: { role: 'user', content: [{ type: 'text', text: prompt.text }] },
-          origin: HUMAN_ORIGIN,
-          ...this.awaitReceipt(received, modelAccepted, prompt.text),
-        },
-        writeAttempted,
-      );
-      return Promise.resolve();
+      return this.skillFrame(() => {
+        beforeWrite?.();
+        this.nativeSubmission(prompt.text, written);
+        this.write(
+          {
+            type: 'user',
+            message: { role: 'user', content: [{ type: 'text', text: prompt.text }] },
+            origin: HUMAN_ORIGIN,
+            ...this.awaitReceipt(received, modelAccepted, prompt.text),
+          },
+          writeAttempted,
+        );
+      }, generation);
     }
-    const generation = this.promptGeneration;
     return claudePromptContent(prompt, this.readFile).then((content) => {
-      if (this.closed) {
-        throw new Error('the agent is no longer running');
-      }
-      if (generation !== this.promptGeneration) {
-        throw new Error('the prompt was stopped before it reached the agent');
-      }
-      beforeWrite?.();
-      this.nativeSubmission(prompt.text, written);
-      this.write(
-        {
-          type: 'user',
-          message: { role: 'user', content },
-          origin: HUMAN_ORIGIN,
-          ...this.awaitReceipt(received, modelAccepted, prompt.text),
-        },
-        writeAttempted,
-      );
+      return this.skillFrame(() => {
+        if (this.closed) {
+          throw new Error('the agent is no longer running');
+        }
+        if (generation !== this.promptGeneration) {
+          throw new Error('the prompt was stopped before it reached the agent');
+        }
+        beforeWrite?.();
+        this.nativeSubmission(prompt.text, written);
+        this.write(
+          {
+            type: 'user',
+            message: { role: 'user', content },
+            origin: HUMAN_ORIGIN,
+            ...this.awaitReceipt(received, modelAccepted, prompt.text),
+          },
+          writeAttempted,
+        );
+      }, generation);
     });
   }
 
@@ -875,11 +932,15 @@ export class ClaudeWire {
     if (!effort) {
       throw new Error('the effort command needs a level to set');
     }
-    this.write({
-      type: 'user',
-      message: { role: 'user', content: [{ type: 'text', text: `/effort ${effort}` }] },
-      origin: HUMAN_ORIGIN,
-    });
+    await this.skillFrame(
+      () =>
+        this.write({
+          type: 'user',
+          message: { role: 'user', content: [{ type: 'text', text: `/effort ${effort}` }] },
+          origin: HUMAN_ORIGIN,
+        }),
+      this.promptGeneration,
+    );
   }
 
   // Stops the active turn. `cancelQueued` also cancels queued prompts and prevents pending attachments from reaching the child.
@@ -1680,13 +1741,15 @@ export class ClaudeWire {
   private write(message: Json, writeAttempted?: () => void): void {
     if (message.type === 'user') this.reportedState = null;
     if (this.closed) {
-      if (writeAttempted) throw new Error('the agent is no longer running');
+      if (writeAttempted || (this.sessionSkills && message.type === 'user'))
+        throw new Error('the agent is no longer running');
       return;
     }
 
     const line = JSON.stringify(message) + '\n';
     writeAttempted?.();
     this.send(line);
+    if (this.sessionSkills && message.type === 'user') this.firstSkillFrame = true;
   }
 }
 

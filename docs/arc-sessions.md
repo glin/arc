@@ -8,12 +8,20 @@ The `arc-sessions` skill lets a Claude Code or Codex agent start, inspect, and o
 | --- | --- | --- |
 | Arc extension | Displays sessions and connects to agent CLIs. Includes `arc` launchers for Arc sessions and new integrated terminals. | Source installer or an available VSIX. |
 | Standalone Arc CLI | Makes `arc` available to ordinary shell commands. | Local npm tarball from the [CLI build instructions](../cli/README.md#build-from-source). |
-| `arc-sessions` skill | Gives an agent instructions for bounded session work through the CLI. | Source installer, explicit CLI setup, or a manual copy or link. |
+| `arc-sessions` skill | Gives an agent instructions for bounded session work through the CLI. | Automatic native delivery in supported Arc children, source installer, explicit CLI setup, or a manual copy or link. |
 | `arc-hooks` Claude plugin | Captures first-touch file snapshots for Claude file diffs. | Source installer or Claude plugin marketplace. |
 
-The skill source is [`cli/skills/arc-sessions/SKILL.md`](../cli/skills/arc-sessions/SKILL.md). `SKILL.md` links to reference files beside it, and every artifact and installation carries them. The source installer, the bundler, and the skill payload loader refuse a skill that lacks a file `SKILL.md` links. The standalone CLI package includes the directory under `skills/arc-sessions`. The VSIX includes the canonical skill directory under `dist/tools/skills/arc-sessions`, with its paths and digests in the tool identity. The Claude plugin does not include the skill.
+The skill source is [`cli/skills/arc-sessions/SKILL.md`](../cli/skills/arc-sessions/SKILL.md). `SKILL.md` links to reference files beside it, and every artifact and installation carries them. The source installer, the bundler, and the skill payload loader refuse a skill that lacks a file `SKILL.md` links. The standalone CLI package includes the directory under `skills/arc-sessions`. The VSIX includes the canonical skill directory under `dist/tools/skills/arc-sessions`, with its paths and digests in the tool identity. The separate `arc-hooks` plugin carries snapshots.
 
 Bundled files are part of an artifact. An installed skill exists in an agent's skill directory. A release requires publication of the corresponding artifact. None of these states establishes the others.
+
+## Automatic native availability
+
+Supported Arc-launched sessions receive the matching session skill through native discovery. Claude exposes `/arc-session-tools:arc-sessions`. Codex exposes `$arc-sessions` and accepts `/arc-sessions`. Arc supplies instructions without adding them to prompts or installing personal files. The reader still authorizes the work an agent starts.
+
+Claude delivery preserves matching manual definitions, including readable links. A customized definition, another `arc-session-tools` plugin, explicit disablement, or unsupported configuration prevents automatic delivery. Codex delivery refuses another `arc-sessions` definition, including an identical or disabled copy. Disabling an admitted earlier Arc release also prevents delivery at a newer path. Arc never enables a disabled definition.
+
+Known static conflicts retain ordinary startup and manual native discovery. An unexpected native refusal stops startup or further delivery without another child or prompt replay. [Runtime admission](agent-protocols.md#native-session-skill-admission) defines provider compatibility and refresh behavior. Catalog discovery establishes availability, not that a model read the instructions. Standalone sessions use the personal installation below.
 
 ## Install the parts you need
 
@@ -36,7 +44,7 @@ npx skills add ./cli/skills --skill arc-sessions --global --agent claude-code --
 
 Use the explicit `cli/skills` directory because the repository nests the skill beneath `cli`. Repository-root discovery requires `--full-depth`. `npx skills` installs skill files. It does not install the Arc CLI, extension, or Claude plugin.
 
-Arc does not inject skill instructions into agent prompts. The agent discovers installed skills through its native skill directories. Both providers list skill metadata and load the full instructions when the skill activates. Explicit invocation uses `/arc-sessions` in Claude Code or `$arc-sessions` in Codex. The agent also selects relevant skills from their descriptions, subject to provider configuration. [Claude skill guidance](https://code.claude.com/docs/en/skills) and [Codex skill guidance](https://learn.chatgpt.com/docs/build-skills) own discovery, selection, and context-loading behavior.
+Arc does not inject skill instructions into agent prompts. The agent discovers supplied or installed skills through its native skill directories. Both providers list skill metadata and load the full instructions when the skill activates. Personal installations use `/arc-sessions` in Claude Code or `$arc-sessions` in Codex. The agent also selects relevant skills from their descriptions, subject to provider configuration. [Claude skill guidance](https://code.claude.com/docs/en/skills) and [Codex skill guidance](https://learn.chatgpt.com/docs/build-skills) own discovery, selection, and context-loading behavior.
 
 ## Manual recovery
 

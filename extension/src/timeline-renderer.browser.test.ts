@@ -413,7 +413,7 @@ test('compaction summaries stay closed until the reader opens their source Markd
     assert.equal(await manual.locator('.body').isHidden(), false);
     assert.equal(await manual.getByRole('heading', { level: 4, name: 'What carried over' }).count(), 1);
     assert.equal(await manual.getByRole('heading', { level: 1, name: 'Delivery state' }).count(), 1);
-    assert.equal(await manual.getByRole('link', { name: 'Read the timeline guide' }).count(), 1);
+    assert.equal(await manual.getByRole('link', { name: 'Read the turn card guide' }).count(), 1);
     assert.equal(await manual.locator('table').count(), 1);
     const commands = (await manual.locator('pre code').textContent()) ?? '';
     assert.match(commands, /npm --prefix extension run build/);

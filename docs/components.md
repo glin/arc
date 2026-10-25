@@ -9,7 +9,8 @@ Paths are relative to `extension/src/`. [Architecture](architecture.md) owns pac
 | `bundledtools.ts` | Package validation, admitted software roots, immutable release publication, configuration catalogs, completion and installed command activation | no |
 | `bundledsetup.ts` | Source-build entry for the shared command and snapshot installer | no |
 | `toolownership.ts` | Canonical paths, redirected ancestor admission, exclusive setup ownership and wrapped uncertainty | no |
-| `toolpath.ts` | Private terminal environment lifetime, PATH admission and current child CLI selection | no |
+| `toolpath.ts` | Private terminal environment lifetime, PATH admission, current child CLI selection, and canonical session skill release selection | no |
+| `sessionskills.ts` | Read-only native skill admission, personal configuration and collision checks, retained release identity, and raw Codex skill validation | no |
 | `claudeplugin.ts` | Consented Claude plugin detection, local source admission, bounded subprocess lifetime, scope and byte checks, and configuration ownership | no |
 | `extension.ts` | Activation, local window channel lifetime, watcher registration, commands, editor integration, and the agent host | yes |
 | `configwatch.ts` | Non-recursive applied-defaults configuration watches for queried folders and their ancestors, with directory checks and watch lifecycle | no |
@@ -149,7 +150,7 @@ Paths are relative to `extension/src/`. [Architecture](architecture.md) owns pac
 | `settings.ts` | Setting names, defaults, and compatibility aliases | no |
 | `activitydetail.ts` | Shared activity subject policies and safe tool-input presentation | no |
 | `agentwire.ts` | Shared asks, answers, events, settings, and turn outcomes | no |
-| `commandcatalog.ts` | Merges complete agent command catalogs, rejects superseded idle reads, and skips unchanged Prompt box payloads | no |
+| `commandcatalog.ts` | Retains ordinary provider catalogs and child-specific supplied commands, rejects superseded idle reads, and skips unchanged Prompt box payloads | no |
 | `promptassets.ts` | Prompt asset limits, descriptor normalization, media-type decisions including the plain-text check for unlisted extensions, staging paths, integrity validation, and staged-copy lifecycle | no |
 | `droppeduris.ts` | Drag type reading, `file:` URI to path conversion, path text in the path-completion format, image routing, and the `Add to Arc` argument shape | no |
 | `domain/context-detail.ts` | Separate native Claude and local Codex context normalization, provider-specific unavailable reason validation, bounded category and optional Claude message partition checks, category shares, aggregate-compatible demand reuse, and stale-demand release | no |

@@ -3,10 +3,15 @@ import { PromptEntry } from './agentwire';
 export interface CommandCatalogSource {
   agent: string;
   commands: readonly PromptEntry[];
+  key?: string;
+  usageSource?: number;
+  sessionId?: string | null;
+  exited?: boolean;
 }
 
 export interface CommandCatalogUpdate extends CommandCatalogSource {
   complete: boolean;
+  optionalOnly?: boolean;
 }
 
 function sameEntry(left: PromptEntry, right: PromptEntry): boolean {
@@ -15,7 +20,8 @@ function sameEntry(left: PromptEntry, right: PromptEntry): boolean {
     left.name === right.name &&
     left.description === right.description &&
     left.argumentHint === right.argumentHint &&
-    left.path === right.path
+    left.path === right.path &&
+    left.sessionSkillRelease === right.sessionSkillRelease
   );
 }
 
@@ -37,12 +43,28 @@ function sameCatalogs(
   );
 }
 
-// Holds agent command lists. Complete updates or nonempty partial updates replace a list.
+// Ordinary provider lists survive child retirement. Supplied entries retain their child generation.
 // A captured revision lets a live update invalidate an older idle read.
-// The Prompt box payload remains independent of process lifetime.
 export class CommandCatalogs {
   private lists: Record<string, PromptEntry[]> = {};
   private readonly revisions = new Map<string, number>();
+  private readonly children = new Map<string, { generation: number; commands: PromptEntry[] }>();
+  private childIdentities = '';
+
+  childCommands(
+    sources: readonly CommandCatalogSource[],
+    drafts: ReadonlyMap<string, string> = new Map(),
+  ): Record<string, PromptEntry[]> {
+    const commands: Record<string, PromptEntry[]> = {};
+    for (const source of sources) {
+      if (!source.key || source.exited) continue;
+      const child = this.children.get(source.key);
+      if (!child || child.generation !== source.usageSource) continue;
+      if (source.sessionId) commands[source.sessionId] = child.commands;
+      for (const [id, key] of drafts) if (key === source.key) commands[id] = child.commands;
+    }
+    return commands;
+  }
 
   revision(agent: string): number {
     return this.revisions.get(agent) ?? 0;
@@ -62,16 +84,42 @@ export class CommandCatalogs {
     }
 
     const next = { ...this.lists };
-    if (update && (update.complete || update.commands.length > 0)) {
-      next[update.agent] = update.commands.map((entry) => ({ ...entry }));
+    const identities = JSON.stringify(
+      sources
+        .filter((source) => source.key)
+        .map((source) => [source.key, source.usageSource, source.sessionId, source.exited]),
+    );
+    let childChanged = identities !== this.childIdentities;
+    this.childIdentities = identities;
+    for (const [key, child] of this.children)
+      if (!sources.some((source) => source.key === key && source.usageSource === child.generation && !source.exited)) {
+        this.children.delete(key);
+        childChanged = true;
+      }
+    if (
+      update?.key &&
+      update.usageSource !== undefined &&
+      sources.some((source) => source.key === update.key && source.usageSource === update.usageSource && !source.exited)
+    ) {
+      const commands = update.commands.filter((entry) => entry.sessionSkillRelease).map((entry) => ({ ...entry }));
+      const previous = this.children.get(update.key);
+      if (previous?.generation !== update.usageSource || !sameEntries(previous.commands, commands)) {
+        this.children.set(update.key, { generation: update.usageSource, commands });
+        childChanged = true;
+      }
+    }
+    if (update && !update.optionalOnly && (update.complete || update.commands.length > 0)) {
+      next[update.agent] = update.commands.filter((entry) => !entry.sessionSkillRelease).map((entry) => ({ ...entry }));
       this.revisions.set(update.agent, this.revision(update.agent) + 1);
     }
     for (const source of sources) {
       if (!(source.agent in next) && source.commands.length > 0) {
-        next[source.agent] = source.commands.map((entry) => ({ ...entry }));
+        next[source.agent] = source.commands
+          .filter((entry) => !entry.sessionSkillRelease)
+          .map((entry) => ({ ...entry }));
       }
     }
-    if (sameCatalogs(this.lists, next)) {
+    if (!childChanged && sameCatalogs(this.lists, next)) {
       return null;
     }
     this.lists = next;

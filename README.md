@@ -105,6 +105,8 @@ Either agent can start Claude Code or Codex sessions from a shell command. The d
 
 The [`arc-sessions` skill](docs/arc-sessions.md) lets agents start sessions in Arc, read their results, and send follow-ups. Agents can also label, pin, and archive sessions, queue a compaction of their own session for after the turn, and estimate costs with `arc cost`.
 
+Arc supplies native session skill discovery for supported sessions it starts. [Automatic availability](docs/arc-sessions.md#automatic-native-availability) describes compatibility and manual installation.
+
 ```text
 Use Arc to summarize the sessions labelled Review in this window.
 Read their completed turns.

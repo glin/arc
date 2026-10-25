@@ -93,7 +93,16 @@ for (const file of skillFiles) {
     await readFile(join(skillSource, file)),
     `VSIX session skill bytes differ from canonical source: ${file}`,
   );
+  assert.deepEqual(
+    entries.get(`extension/dist/tools/session-plugin/skills/arc-sessions/${file}`),
+    await readFile(join(skillSource, file)),
+    `VSIX Claude session skill bytes differ from canonical source: ${file}`,
+  );
 }
+assert.deepEqual(JSON.parse(entries.get('extension/dist/tools/session-plugin/.claude-plugin/plugin.json').toString()), {
+  name: 'arc-session-tools',
+  version: manifest.version,
+});
 assert.deepEqual([...entries.keys()].sort(), expectedFiles.sort(), 'VSIX contents differ from the release allowlist');
 for (const [file, metadata] of Object.entries(identity.tools.files)) {
   assert.equal(

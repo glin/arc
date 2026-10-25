@@ -2,7 +2,7 @@
 
 The Arc CLI reads saved session costs, renders a Claude Code status line, and manages sessions through a running Arc window. It is experimental. npm publication is deferred.
 
-[Install the CLI](../cli/README.md#install) or use the matching commands supplied by the Arc extension. Agents started by Arc can run `arc` from their shell commands.
+[Install the CLI](../cli/README.md#install) or use the matching commands supplied by the Arc extension. Agents started by Arc can run `arc` from their shell commands. [Session guidance](arc-sessions.md) describes automatic native skill availability and personal installation.
 
 ```sh
 arc --help

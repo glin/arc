@@ -1,3 +1,4 @@
+import { CommandCatalogs } from './commandcatalog';
 import { commitSourceStamp } from './transcript';
 import {
   startingWorktree,
@@ -13511,7 +13512,14 @@ function memoryState() {
 
 function wireDefaultMetadata(context: any, panel: any, environment: Record<string, unknown>) {
   context.globalState ??= memoryState();
-  environment = { SavedDefaults, comparableFolder, defaultsKey, defaultsKeyParts, ...environment };
+  environment = {
+    SavedDefaults,
+    comparableFolder,
+    defaultsKey,
+    defaultsKeyParts,
+    sessionSkillSelection: { current: () => undefined },
+    ...environment,
+  };
   const source = fs.readFileSync(path.join(__dirname, 'extension.ts'), 'utf8');
   const begin = source.indexOf('let defaultsRevision = 0;');
   const end = source.indexOf('const readFrom = async', begin);
@@ -13711,6 +13719,7 @@ function activationDefaultsFixture(options: { trusted?: boolean; rejectedRequest
   );
   const readyPlan = (plan: AgentPlan): AgentPlan => ({
     ...plan,
+    prepare: plan.prepare ? () => readyPlan(plan.prepare!()) : undefined,
     driver: (send, emit) => ({
       ...plan.driver(send, emit),
       open: async () => [],
@@ -20220,6 +20229,7 @@ function stateForRow(
     folders?: () => string[];
     skillLists?: Record<string, readonly string[]>;
     commandLists?: Record<string, PromptEntry[]>;
+    sessionCommandLists?: Record<string, PromptEntry[]>;
     picks?: SessionSettingBook;
     askLevels?: Record<string, string>;
     codexEffectiveModes?: Record<string, unknown>;
@@ -20255,7 +20265,7 @@ function stateForRow(
   )() as (this: unknown, agent: string, sessionId: string) => string | null;
   const claudeCommandsFor = new Function(
     'claudeSkillPath',
-    `return function (cwd) {\n${methodBody('private claudeCommandsFor(')}\n};`,
+    `return function (cwd, session) {\n${methodBody('private claudeCommandsFor(')}\n};`,
   )(claudeSkillPath) as (this: unknown, cwd: string | null) => PromptEntry[];
   const host = {
     newestBySession: selected.newest ?? new Map(),
@@ -20278,6 +20288,7 @@ function stateForRow(
     saved: { comments: [] },
     models: {},
     commandLists: overrides.commandLists ?? {},
+    sessionCommandLists: overrides.sessionCommandLists ?? {},
     claudeSkillPaths: new Map<string, string | null>(),
     skillLists: overrides.skillLists ?? {},
     catalog: overrides.catalog ?? null,
@@ -40475,4 +40486,66 @@ test('Remote Control refuses a draft and an agent-run session without reaching a
   for (const session of ['draft', 'run', 'live']) await remoteControlFromComposer.call(provider, session);
   assert.deepEqual(reached, ['live'], 'a draft or agent-run session reached the Claude process callback');
   assert.deepEqual(notices, [{ outcome: 'draft' }, { outcome: 'agentRun' }, { outcome: 'disconnected', late: false }]);
+});
+
+// The final Prompt box state must preserve each supplying process's immutable definition.
+test('Prompt boxes keep child-specific session skill paths after idle reads and replacement', () => {
+  const catalogs = new CommandCatalogs();
+  const supplied = (release: string): PromptEntry => ({
+    kind: 'command',
+    name: 'arc-session-tools:arc-sessions',
+    description: '',
+    argumentHint: '',
+    sessionSkillRelease: release,
+    path: '/' + release + '/SKILL.md',
+  });
+  const rows = ['first', 'second', 'plain'].map((id) => ({ id, label: id, agentKey: 'claude' }));
+  let sources = rows.map((row, index) => ({
+    agent: 'claude',
+    key: row.id,
+    sessionId: row.id,
+    usageSource: index + 1,
+    commands: index < 2 ? [supplied(row.id)] : [],
+  }));
+  for (const source of sources) catalogs.publish(sources, { ...source, complete: true });
+  const draw = (id: string) =>
+    stateForRow(
+      rows,
+      {},
+      id,
+      {},
+      {
+        commandLists: { ...catalogs.current() } as Record<string, PromptEntry[]>,
+        sessionCommandLists: catalogs.childCommands(sources),
+      },
+    ).commands;
+  catalogs.publish(sources, { agent: 'claude', commands: [supplied('idle')], complete: true });
+  assert.deepEqual(
+    draw('first').map((entry) => entry.path),
+    ['/first/SKILL.md'],
+  );
+  assert.deepEqual(
+    draw('second').map((entry) => entry.path),
+    ['/second/SKILL.md'],
+  );
+  assert.deepEqual(draw('plain'), []);
+  sources = sources.map((source) =>
+    source.key === 'first' ? { ...source, usageSource: 10, commands: [supplied('replacement')] } : source,
+  );
+  catalogs.publish(sources, { ...sources[0], complete: true });
+  catalogs.publish(sources, {
+    agent: 'claude',
+    key: 'first',
+    usageSource: 1,
+    commands: [supplied('retired')],
+    complete: true,
+  });
+  assert.deepEqual(
+    draw('first').map((entry) => entry.path),
+    ['/replacement/SKILL.md'],
+  );
+  assert.deepEqual(
+    draw('second').map((entry) => entry.path),
+    ['/second/SKILL.md'],
+  );
 });

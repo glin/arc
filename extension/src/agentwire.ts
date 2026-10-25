@@ -35,6 +35,7 @@ export interface PromptEntry {
   description: string;
   argumentHint: string;
   path?: string;
+  sessionSkillRelease?: string;
 }
 
 // A tool call awaiting reader permission. Claude permission asks and Codex approval requests both block the turn.
@@ -224,7 +225,7 @@ export type WireEvent =
   | { kind: 'responseStarted'; sourceId: string }
   | { kind: 'responseRate'; sourceId: string; rate: import('./outputrate').ResponseRate }
   | { kind: 'ready'; commands: PromptEntry[] }
-  | { kind: 'commands'; commands: PromptEntry[] }
+  | { kind: 'commands'; commands: PromptEntry[]; optionalOnly?: boolean }
   | { kind: 'sessionInitialized'; sessionId: string; changed: boolean }
   // `previous` identifies the session the child left. It is null when the child first reports its identity.
   // A reset can change the session while retaining the process.

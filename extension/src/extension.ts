@@ -184,6 +184,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   );
   context.subscriptions.push(privateTools);
   let privatePreparation = privateTools.refresh();
+  const sessionSkillSelection = {
+    admitted: () => vscode.workspace.isTrusted && !vscode.env.remoteName,
+    current: () => (vscode.workspace.isTrusted && !vscode.env.remoteName ? privateTools.sessionSkills() : undefined),
+  };
   let invalidatePreparedDefaults: (() => void) | undefined;
   const spawner = arcCliSpawner(() => privateTools.current(channel?.windowId ?? null));
   if (channel)
@@ -465,7 +469,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       const child = host.get(key);
       if (child) compaction?.observeNative(child, event);
     },
-    onEvent: ({ key, event, turnId, dispatchTurnId }) => {
+    onEvent: ({ key, event, turnId, dispatchTurnId, usageSource }) => {
       panel.onDispatchEvent?.(key, event, dispatchTurnId ?? turnId);
       if (event.kind === 'responseRate') {
         const where = host.get(key)?.state().sessionId;
@@ -496,7 +500,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       if (event.kind === 'commands') {
         commandStateChanges.add(key);
         if (agent) {
-          publishCommands({ agent, commands: event.commands, complete: true });
+          publishCommands({
+            agent,
+            key,
+            usageSource,
+            commands: event.commands,
+            complete: true,
+            optionalOnly: event.optionalOnly,
+          });
         }
         return;
       }
@@ -526,10 +537,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           : Promise.resolve();
         void Promise.allSettled([usageRead, readMcpFrom(key)]).then(() => host.settled(housekeeping));
       }
-      // A complete command catalog from one child replaces older catalogs from sibling
-      // children of that agent. Catalogs from other agents remain available.
+      // Ordinary catalogs retain provider fallback. Supplied commands belong to this child generation.
       if (agent && event.kind === 'ready') {
-        publishCommands({ agent, commands: event.commands, complete: false });
+        publishCommands({
+          agent,
+          key,
+          usageSource,
+          commands: event.commands,
+          complete: false,
+        });
       }
       // Persist Claude's reported skills under its working directory. Sessions in that directory share the list, and identical lists cause no state write.
       if (event.kind === 'skills') {
@@ -656,6 +672,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           ?.catch(() => {});
       }
       publishHostedSessions();
+      if (state.exited || state.sessionId) publishCommands();
       if (state.exited) {
         if (state.sessionId) panel.invalidateContext(state.sessionId);
         if (state.sessionId) {
@@ -980,7 +997,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const publishCommands = (said?: CommandCatalogUpdate, expectedRevision?: number) => {
     const next = commandLists.publish(host.states(), said, expectedRevision);
     if (next) {
-      panel.setCommands(next);
+      panel.setCommands(next, commandLists.childCommands(host.states(), draftMcpKeys));
     }
   };
 
@@ -1188,8 +1205,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const idlePlanFor = (agent: AgentName, cwd: string): AgentPlan | null => {
     const launch =
       agent === 'claude'
-        ? claudeLaunch(readSetting('claudePath'), thisMachine())
-        : codexLaunch(readSetting('codexPath'), thisMachine());
+        ? { ...claudeLaunch(readSetting('claudePath'), thisMachine()), sessionSkills: sessionSkillSelection }
+        : { ...codexLaunch(readSetting('codexPath'), thisMachine()), sessionSkills: sessionSkillSelection };
     if (launch.problem) {
       return null;
     }
@@ -1256,8 +1273,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           return unavailableDefaults('The agent could not report its settings.');
         const launch =
           agent === 'claude'
-            ? claudeLaunch(readSetting('claudePath'), thisMachine())
-            : codexLaunch(readSetting('codexPath'), thisMachine());
+            ? { ...claudeLaunch(readSetting('claudePath'), thisMachine()), sessionSkills: sessionSkillSelection }
+            : { ...codexLaunch(readSetting('codexPath'), thisMachine()), sessionSkills: sessionSkillSelection };
         const plan =
           agent === 'claude'
             ? claudeIdlePlan(launch, cwd, model)
@@ -1631,7 +1648,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           );
           // Publish the idle child's commands when its remaining controls settle.
           commandsAsked.add(agent);
-          publishCommands({ agent, commands: answers.commands, complete: false }, commandRevision);
+          publishCommands({ agent, ...answers.child, commands: answers.commands, complete: false }, commandRevision);
           if (answers.models) {
             models.note(agent, answers.models, readPath);
             publishPicks();
@@ -2089,8 +2106,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   let forkSequence = 0;
   const launchFor = (which: AgentName) =>
     which === 'claude'
-      ? claudeLaunch(readSetting('claudePath'), thisMachine())
-      : codexLaunch(readSetting('codexPath'), thisMachine());
+      ? { ...claudeLaunch(readSetting('claudePath'), thisMachine()), sessionSkills: sessionSkillSelection }
+      : { ...codexLaunch(readSetting('codexPath'), thisMachine()), sessionSkills: sessionSkillSelection };
   const ensureSession = async (key: string, plan: AgentPlanSource) => {
     const session = await host.session(key, plan);
     const failure = session.state().lastError;

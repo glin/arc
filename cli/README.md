@@ -13,11 +13,11 @@ The Arc extension includes `arc` for sessions it starts and new integrated termi
 
 ## Session skill
 
-Use the `arc-sessions` skill to give your agents Arc's CLI instructions. Ask your agent to use Arc, or invoke `/arc-sessions` in Claude Code or `$arc-sessions` in Codex.
+Use the `arc-sessions` skill to give your agents Arc's CLI instructions. [Automatic availability](../docs/arc-sessions.md#automatic-native-availability) covers Arc-launched sessions and native invocation names.
 
 The source installer installs the skill for detected Claude Code and Codex agents. Pass `--no-skills` to skip skill setup.
 
-If you installed only the VSIX or standalone CLI package, install the bundled skill:
+For sessions outside Arc, install the bundled skill:
 
 ```sh
 arc skills install --agent claude --agent codex

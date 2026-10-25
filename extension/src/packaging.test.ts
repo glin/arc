@@ -17,7 +17,7 @@ import { inflateRawSync } from 'node:zlib';
 import * as vm from 'node:vm';
 import ts from 'typescript';
 import { browserBundle, exportBrowserAssets } from './panelbundle.ts';
-import { BundledTools, readToolPackage } from './bundledtools.ts';
+import { BundledTools, readToolPackage, sessionSkillRelease, prepareEditorCommands } from './bundledtools.ts';
 import { TerminalTools, terminalToolPath, type ToolAdmission } from './toolpath.ts';
 import { childEnv } from './agenthost.ts';
 import { acquireToolLock, waitForToolLock } from './toolownership.ts';
@@ -159,11 +159,85 @@ test('the canonical session skill ships as regular exact files with independent 
     assert.equal(fs.lstatSync(file).isSymbolicLink(), false);
     const bytes = fs.readFileSync(path.join(source, relative));
     assert.deepEqual(fs.readFileSync(file), bytes);
+    assert.deepEqual(fs.readFileSync(path.join(dist, 'tools/session-plugin/skills/arc-sessions', relative)), bytes);
     assert.equal(
       payload.files['skills/arc-sessions/' + relative].sha256,
       createHash('sha256').update(bytes).digest('hex'),
     );
   }
+  assert.deepEqual(
+    JSON.parse(fs.readFileSync(path.join(dist, 'tools/session-plugin/.claude-plugin/plugin.json'), 'utf8')),
+    {
+      name: 'arc-session-tools',
+      version: JSON.parse(fs.readFileSync(path.join(extensionRoot, 'package.json'), 'utf8')).version,
+    },
+  );
+});
+
+// Full release validation catches damaged native copies before a child receives either provider's path.
+test('session skill selection rejects divergent copies, missing references and executable plugin components', async () => {
+  const root = tempDir('arc-session-skill-release-');
+  const tools = new BundledTools(readToolPackage(path.join(extensionRoot, 'dist')), path.join(root, 'software'));
+  const launchers = await tools.preparePrivateCommands(new AbortController().signal);
+  const directory = path.dirname(launchers);
+  const descriptor = sessionSkillRelease(directory);
+  assert.equal(descriptor.contentId, tools.bundle.payload.contentId);
+  assert.equal(Object.isFrozen(descriptor), true);
+  const identityPath = path.join(directory, 'release.json');
+  const identityBytes = fs.readFileSync(identityPath);
+  const rewrite = (payload: any) => {
+    const { contentId: _contentId, ...content } = payload;
+    payload.contentId = createHash('sha256').update(JSON.stringify(content)).digest('hex');
+    fs.writeFileSync(identityPath, JSON.stringify(payload));
+  };
+  for (const defect of ['divergent', 'missing-reference', 'executable', 'manifest']) {
+    const payload = JSON.parse(identityBytes.toString());
+    const file =
+      defect === 'divergent'
+        ? 'session-plugin/skills/arc-sessions/SKILL.md'
+        : defect === 'manifest'
+          ? 'session-plugin/.claude-plugin/plugin.json'
+          : defect === 'executable'
+            ? 'session-plugin/hooks/hooks.json'
+            : 'skills/arc-sessions/compaction.md';
+    const target = path.join(directory, file);
+    const previous = fs.existsSync(target) ? fs.readFileSync(target) : undefined;
+    const counterpart = path.join(directory, 'session-plugin/' + file);
+    const counterpartBytes = defect === 'missing-reference' ? fs.readFileSync(counterpart) : undefined;
+    try {
+      if (defect === 'missing-reference') {
+        fs.unlinkSync(target);
+        fs.unlinkSync(counterpart);
+        delete payload.files[file];
+        delete payload.files['session-plugin/' + file];
+      } else {
+        fs.mkdirSync(path.dirname(target), { recursive: true });
+        const bytes =
+          defect === 'manifest' ? JSON.stringify({ name: 'arc-session-tools', version: 'other', hooks: {} }) : '{}';
+        fs.writeFileSync(target, bytes);
+        payload.files[file] = { sha256: createHash('sha256').update(bytes).digest('hex'), mode: 0o644 };
+      }
+      rewrite(payload);
+      assert.throws(
+        () => sessionSkillRelease(directory),
+        /copies differ|missing reference|unsupported files|unreadable identity/,
+        defect,
+      );
+    } finally {
+      if (previous) fs.writeFileSync(target, previous);
+      else {
+        fs.unlinkSync(target);
+        fs.rmdirSync(path.dirname(target));
+      }
+      if (counterpartBytes) fs.writeFileSync(counterpart, counterpartBytes);
+      fs.writeFileSync(identityPath, identityBytes);
+    }
+  }
+  assert.equal(sessionSkillRelease(directory).contentId, descriptor.contentId);
+  assert.equal(
+    await prepareEditorCommands(path.join(extensionRoot, 'dist'), tools.root, new AbortController().signal, true),
+    launchers,
+  );
 });
 
 test('the extension package contains exactly the intended files', () => {

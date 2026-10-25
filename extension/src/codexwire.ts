@@ -2,6 +2,8 @@ import { unavailableDefaults, type AppliedDefaults } from './view/model-picks';
 import { SessionNameUncertain } from './sessionrename';
 import { promptToken } from './domain/composer-editing';
 import { compareVersion, parseVersion } from './domain/version';
+import { canonicalToolPath } from './toolownership';
+import { codexRawSkills, codexSkillConfiguration, type NativeSkill, type SessionSkillRelease } from './sessionskills';
 // Adapts Codex app-server messages to the shared agent wire events.
 // JSON-RPC messages travel over stdio as one object per line without the jsonrpc field.
 // Responses have id only, notifications have method only, and server requests have both.
@@ -94,6 +96,7 @@ export interface ClientInfo {
 }
 
 export interface CodexWireOptions {
+  sessionSkills?: { release: SessionSkillRelease; refresh(): boolean };
   send(line: string): void;
   emit(event: WireEvent): void;
   clientInfo: ClientInfo;
@@ -133,6 +136,7 @@ interface AsyncAsk {
 }
 
 interface Waiting {
+  strictResult?: boolean;
   resolve(value: Json): void;
   reject(error: Error): void;
   // Cleared wherever the entry leaves the map, so a settled request leaves no timer behind.
@@ -414,8 +418,14 @@ export class CodexWire {
   private skillRefresh: Promise<void> | null = null;
   private skillRefreshAgain = false;
   private skills = new Map<string, { name: string; path: string } | null>();
+  private readonly sessionSkills: CodexWireOptions['sessionSkills'];
+  private optionalRoots = false;
+  private optionalUnsupported = false;
+  private optionalAdmitted = false;
+  private optionalFailure: Error | undefined;
 
   constructor(options: CodexWireOptions) {
+    this.sessionSkills = options.sessionSkills;
     this.send = options.send;
     this.emit = options.emit;
     this.clientInfo = options.clientInfo;
@@ -489,32 +499,41 @@ export class CodexWire {
   }
 
   private async openCommands(): Promise<PromptEntry[]> {
+    const deadline = performance.now() + 15_000;
     this.commandsOpening = true;
     this.skills.clear();
     try {
-      const commands = await this.commandCatalog(false);
+      let commands: PromptEntry[];
+      do {
+        if (this.sessionSkills) this.skillRefreshAgain = false;
+        commands = await this.commandCatalog(false, deadline);
+      } while (this.sessionSkills && this.skillRefreshAgain && !this.closed);
       this.emit({ kind: 'ready', commands });
       return commands;
-    } catch {
+    } catch (error) {
+      if (this.sessionSkills && this.optionalFailure) throw error;
       const commands = CODEX_COMMANDS.map((command) => ({ ...command }));
       this.emit({ kind: 'ready', commands });
       return commands;
     } finally {
       this.commandsOpening = false;
       this.commandsOpened = true;
-      if (this.skillRefreshAgain && !this.closed) {
+      if (this.skillRefreshAgain && !this.closed && !this.optionalFailure) {
         this.skillRefreshAgain = false;
         this.refreshCommandCatalog();
       }
     }
   }
 
-  private async commandCatalog(forceReload: boolean): Promise<PromptEntry[]> {
+  private async commandCatalog(forceReload: boolean, deadline: number): Promise<PromptEntry[]> {
     const commands = CODEX_COMMANDS.map((command) => ({ ...command }));
-    const result = await this.request('skills/list', {
-      cwds: [this.cwd],
-      ...(forceReload ? { forceReload: true } : {}),
-    });
+    const result =
+      this.sessionSkills && !this.optionalUnsupported
+        ? await this.sessionSkillCatalog(deadline)
+        : await this.request('skills/list', {
+            cwds: [this.cwd],
+            ...(forceReload ? { forceReload: true } : {}),
+          });
     const names = new Set(commands.map((command) => command.name.toLowerCase()));
     const skills = new Map<string, { name: string; path: string } | null>();
     for (const group of arr(result.data)) {
@@ -522,6 +541,13 @@ export class CodexWire {
         const skill = obj(entry);
         const name = skill && str(skill.name);
         const path = skill && str(skill.path);
+        if (
+          this.sessionSkills &&
+          path &&
+          !this.optionalAdmitted &&
+          canonicalToolPath(path) === canonicalToolPath(this.sessionSkills.release.codexDefinition)
+        )
+          continue;
         if (name && obj(group)?.cwd === this.cwd) {
           const key = name.toLowerCase();
           skills.set(
@@ -538,6 +564,9 @@ export class CodexWire {
             description: (skill && str(skill.description)) ?? '',
             argumentHint: '',
             path: str(skill.path) ?? undefined,
+            ...(this.optionalAdmitted && name.toLowerCase() === 'arc-sessions'
+              ? { sessionSkillRelease: this.sessionSkills!.release.contentId }
+              : {}),
           });
           names.add(name.toLowerCase());
         }
@@ -547,8 +576,81 @@ export class CodexWire {
     return commands;
   }
 
+  private async sessionSkillCatalog(deadline: number): Promise<Json> {
+    if (this.optionalFailure) throw this.optionalFailure;
+    this.optionalAdmitted = false;
+    const optionalRequest = async (method: string, params: Json) => {
+      const remaining = deadline - performance.now();
+      if (remaining <= 0) return Promise.reject(new NoAnswer('Codex did not finish loading its skills in time.'));
+      const result = await this.request(method, params, undefined, undefined, remaining, true);
+      if (performance.now() >= deadline) throw new NoAnswer('Codex did not finish loading its skills in time.');
+      return result;
+    };
+    const listing = async () => {
+      const result = await optionalRequest('skills/list', { cwds: [this.cwd], forceReload: true });
+      codexRawSkills(result, this.cwd);
+      return result;
+    };
+    const selected = this.sessionSkills!;
+    const matches = (skills: NativeSkill[]) => skills.filter((skill) => skill.name.toLowerCase() === 'arc-sessions');
+    const exact = (skill: NativeSkill) =>
+      canonicalToolPath(skill.path) === canonicalToolPath(selected.release.codexDefinition);
+    const settings = async () => {
+      const config = await optionalRequest('config/read', { cwd: this.cwd, includeLayers: true });
+      const requirements = await optionalRequest('configRequirements/read', {});
+      return selected.refresh() && codexSkillConfiguration(config, requirements, selected.release);
+    };
+    const withdraw = async () => {
+      if (!this.optionalRoots) return;
+      const response = await optionalRequest('skills/extraRoots/set', { extraRoots: [] });
+      if (Object.keys(response).length) throw new Error('Codex did not confirm removal of the Arc session skill.');
+      this.optionalRoots = false;
+    };
+    try {
+      let result = await listing();
+      let raw = codexRawSkills(result, this.cwd);
+      const conflicts = matches(raw).some((skill) => !exact(skill) || !skill.enabled);
+      if (conflicts || !(await settings())) {
+        await withdraw();
+        return this.optionalRoots ? result : await listing();
+      }
+      if (!this.optionalRoots) {
+        // From this write onward, failed acknowledgement leaves root ownership uncertain.
+        this.optionalRoots = true;
+        let response: Json;
+        try {
+          response = await optionalRequest('skills/extraRoots/set', { extraRoots: [selected.release.codexRoot] });
+        } catch (error) {
+          if (error instanceof RequestRefused && error.code === -32601) this.optionalRoots = false;
+          throw error;
+        }
+        if (Object.keys(response).length) throw new Error('Codex did not confirm the Arc session skill.');
+      }
+      result = await listing();
+      raw = codexRawSkills(result, this.cwd);
+      const supplied = matches(raw);
+      if (supplied.length !== 1 || !exact(supplied[0]) || !supplied[0].enabled || !(await settings())) {
+        await withdraw();
+        return await listing();
+      }
+      this.optionalAdmitted = true;
+      return result;
+    } catch (error) {
+      if (error instanceof RequestRefused && error.code === -32601 && !this.optionalRoots) {
+        this.optionalUnsupported = true;
+        return this.request('skills/list', { cwds: [this.cwd], forceReload: true });
+      }
+      this.optionalFailure = error instanceof Error ? error : new Error(String(error));
+      this.skills.clear();
+      this.emit({ kind: 'commands', commands: [], optionalOnly: true });
+      throw this.optionalFailure;
+    }
+  }
+
   private refreshCommandCatalog(): void {
     this.skills.clear();
+    this.optionalAdmitted = false;
+    if (this.sessionSkills) this.emit({ kind: 'commands', commands: [], optionalOnly: true });
     if (this.closed) {
       return;
     }
@@ -557,17 +659,18 @@ export class CodexWire {
       return;
     }
     const refresh = async () => {
+      const deadline = performance.now() + 15_000;
       do {
         this.skillRefreshAgain = false;
         try {
-          const commands = await this.commandCatalog(true);
-          if (!this.closed) {
+          const commands = await this.commandCatalog(true, deadline);
+          if (!this.closed && (!this.sessionSkills || !this.skillRefreshAgain)) {
             this.emit({ kind: 'commands', commands });
           }
         } catch {
           // Autocomplete retains its last complete catalog. Attachments require a successful current read.
         }
-      } while (this.skillRefreshAgain && !this.closed);
+      } while (this.skillRefreshAgain && !this.closed && !this.optionalFailure);
     };
     const pending = refresh().finally(() => {
       if (this.skillRefresh === pending) {
@@ -577,12 +680,19 @@ export class CodexWire {
     this.skillRefresh = pending;
   }
 
+  private async skillWorkReady(): Promise<void> {
+    while (this.commandsPending || this.skillRefresh) await (this.commandsPending ?? this.skillRefresh);
+    if (this.optionalFailure) throw this.optionalFailure;
+    if (this.closed) throw new Error('the agent is no longer running');
+  }
+
   async startThread(
     options: CodexSpawnOptions,
     name: string = '',
     beforeWrite?: () => void,
     writeAttempted?: () => void,
   ): Promise<string> {
+    if (this.sessionSkills) await this.skillWorkReady();
     const result = await this.request(
       'thread/start',
       {
@@ -614,6 +724,7 @@ export class CodexWire {
     threadId: string,
     options?: Pick<CodexSpawnOptions, 'approvalPolicy' | 'approvalsReviewer' | 'sandbox'>,
   ): Promise<string> {
+    if (this.sessionSkills) await this.skillWorkReady();
     return this.adoptThread(
       await this.request('thread/resume', {
         threadId,
@@ -632,6 +743,7 @@ export class CodexWire {
     beforeWrite?: () => void,
     writeAttempted?: () => void,
   ): Promise<string> {
+    if (this.sessionSkills) await this.skillWorkReady();
     return this.adoptThread(
       await this.request(
         'thread/fork',
@@ -659,6 +771,7 @@ export class CodexWire {
   // The pending operation keeps the session busy until completion.
   // Only deferred delivery passes beforeWrite, so its presence marks the request's receipt as deferred.
   async compact(beforeWrite?: () => void): Promise<void> {
+    if (this.sessionSkills) await this.skillWorkReady();
     if (!this.thread) {
       throw new Error('no Codex session has been started yet');
     }
@@ -750,7 +863,12 @@ export class CodexWire {
 
   // Returns the turn id after the server accepts the prompt.
   // Notifications report the turn's subsequent progress and completion.
-  async prompt(input: AgentPromptInput, guard?: GuardedAttempt): Promise<string> {
+  async prompt(
+    input: AgentPromptInput,
+    guard?: GuardedAttempt,
+    beforeWrite?: () => void,
+    writeAttempted?: () => void,
+  ): Promise<string> {
     if (!this.thread) {
       throw new Error('no Codex session has been started yet');
     }
@@ -777,15 +895,16 @@ export class CodexWire {
     this.pendingPrompts.add(cancel);
     try {
       if (previous) await Promise.race([previous, cancelled]);
-      if (token) {
+      if (token || this.sessionSkills) {
         while (this.commandsPending || this.skillRefresh) {
           if (stopped) break;
           await Promise.race([this.commandsPending ?? this.skillRefresh, cancelled]);
         }
       }
       if (stopped) throw new Error('the prompt was stopped before it reached the agent');
+      if (this.optionalFailure) throw this.optionalFailure;
       if (this.closed || threadId !== this.thread) throw new Error('the Codex session changed before delivery');
-      return this.startPrompt(prompt, token, threadId, guard);
+      return this.startPrompt(prompt, token, threadId, guard, beforeWrite, writeAttempted);
     } finally {
       this.pendingPrompts.delete(cancel);
       if (this.preparing === prepared) this.preparing = null;
@@ -798,6 +917,8 @@ export class CodexWire {
     token: ReturnType<typeof promptToken>,
     threadId: string,
     guard?: GuardedAttempt,
+    beforeWrite?: () => void,
+    writeAttempted?: () => void,
   ): Promise<string> {
     const content: Record<string, unknown>[] = [];
     if (prompt.text) {
@@ -819,20 +940,26 @@ export class CodexWire {
     }
     // A guarded start records how many turns were known when it wrote its input. A response naming one of them is a shared turn.
     const known = guard ? this.seenTurns.size : 0;
+    beforeWrite?.();
     guard?.prepareWrite();
-    const response = this.request('turn/start', {
-      threadId,
-      input: content,
-      ...(this.approval
-        ? {
-            approvalPolicy: this.approval.policy,
-            approvalsReviewer: this.approval.reviewer,
-            sandboxPolicy: sandboxPolicy(this.approval.sandbox),
-          }
-        : {}),
-      ...(this.model !== null ? { model: this.model } : {}),
-      ...(this.effort !== null ? { effort: this.effort } : {}),
-    });
+    const response = this.request(
+      'turn/start',
+      {
+        threadId,
+        input: content,
+        ...(this.approval
+          ? {
+              approvalPolicy: this.approval.policy,
+              approvalsReviewer: this.approval.reviewer,
+              sandboxPolicy: sandboxPolicy(this.approval.sandbox),
+            }
+          : {}),
+        ...(this.model !== null ? { model: this.model } : {}),
+        ...(this.effort !== null ? { effort: this.effort } : {}),
+      },
+      undefined,
+      writeAttempted,
+    );
     guard?.markWritten();
     let active: ActiveTurn;
     const start = response.then((result) => {
@@ -903,6 +1030,7 @@ export class CodexWire {
 
   // Live input never creates a turn or retries an uncertain request.
   async steer(text: string, attempt: GuardedAttempt): Promise<void> {
+    if (this.sessionSkills) await this.skillWorkReady();
     try {
       if (!this.steerable()) throw new Error('The session has no eligible running turn.');
       const turnId = [...this.runningRootTurns][0];
@@ -1374,50 +1502,81 @@ export class CodexWire {
   // After the turn ends or the server refuses steering, send the same text as a prompt to the originating thread.
   // An unanswered request is never retried because its answer can already have arrived.
   private async sendAsyncReply(id: string, asked: AsyncAsk, text: string): Promise<void> {
-    if (asked.turnId && asked.threadId) {
-      try {
-        await this.request('turn/steer', {
-          threadId: asked.threadId,
-          input: [{ type: 'text', text }],
-          expectedTurnId: asked.turnId,
-        });
-        this.emit({ kind: 'askResolved', id, outcome: 'answered' });
-        return;
-      } catch (error) {
-        if (!(error instanceof RequestRefused)) {
-          this.abandonAsyncReply(id);
+    let stopped = false;
+    let cancel!: () => void;
+    const cancelled = new Promise<void>((resolve) => {
+      cancel = () => {
+        stopped = true;
+        resolve();
+      };
+    });
+    const beforeWrite = () => {
+      if (stopped) throw new Error('the answer was stopped before it reached the agent');
+    };
+    let fallback = false;
+    let possibleDelivery = false;
+    const writeAttempted = () => {
+      possibleDelivery = true;
+    };
+    this.pendingPrompts.add(cancel);
+    try {
+      if (this.sessionSkills) await Promise.race([this.skillWorkReady(), cancelled]);
+      beforeWrite();
+      if (asked.turnId && asked.threadId) {
+        try {
+          await this.request(
+            'turn/steer',
+            {
+              threadId: asked.threadId,
+              input: [{ type: 'text', text }],
+              expectedTurnId: asked.turnId,
+            },
+            beforeWrite,
+            writeAttempted,
+          );
+          this.pendingPrompts.delete(cancel);
+          this.emit({ kind: 'askResolved', id, outcome: 'answered' });
           return;
+        } catch (error) {
+          if (!(error instanceof RequestRefused)) throw error;
+          possibleDelivery = false;
+          if (stopped) throw error;
         }
       }
-    }
-    if (asked.threadId !== null && asked.threadId !== this.thread) {
-      this.emit({
-        kind: 'error',
-        message: 'the session changed before the answer was sent, so it was not sent',
-      });
-      this.emit({ kind: 'askResolved', id, outcome: 'cancelled' });
-      return;
-    }
-    try {
-      await this.prompt(text);
+      if (asked.threadId !== null && asked.threadId !== this.thread) {
+        this.pendingPrompts.delete(cancel);
+        this.emit({
+          kind: 'error',
+          message: 'the session changed before the answer was sent, so it was not sent',
+        });
+        this.emit({ kind: 'askResolved', id, outcome: 'cancelled' });
+        return;
+      }
+      beforeWrite();
+      fallback = true;
+      await this.prompt(text, undefined, beforeWrite, writeAttempted);
+      // Acceptance opens the turn before the host settles answer delivery.
+      this.pendingPrompts.delete(cancel);
+      this.emit({ kind: 'askResolved', id, outcome: 'answered' });
     } catch (error) {
-      if (error instanceof NoAnswer || this.closed) {
+      this.pendingPrompts.delete(cancel);
+      if (error instanceof RequestRefused) possibleDelivery = false;
+      if (possibleDelivery || this.closed) {
         this.abandonAsyncReply(id);
         return;
       }
       // Nothing reached the agent, so the question is offered again while its thread is open.
       this.emit({ kind: 'error', message: `the answer did not reach the agent: ${(error as Error).message}` });
       if (asked.threadId === null || asked.threadId === this.thread) {
-        this.asyncAsks.set(id, { ...asked, turnId: null });
+        this.asyncAsks.set(id, { ...asked, turnId: stopped || fallback ? null : asked.turnId });
         this.emit({ kind: 'askResolved', id, outcome: 'failed' });
         this.emit({ kind: 'ask', ask: asked.ask });
       } else {
         this.emit({ kind: 'askResolved', id, outcome: 'cancelled' });
       }
-      return;
+    } finally {
+      this.pendingPrompts.delete(cancel);
     }
-    // After the prompt is accepted, so a session that reads this event sees the new turn open.
-    this.emit({ kind: 'askResolved', id, outcome: 'answered' });
   }
 
   // A closed wire says nothing more, so the reason it closed stays the session's last error.
@@ -2086,7 +2245,9 @@ export class CodexWire {
       waiting.reject(
         new RequestRefused(str(failure.message) ?? 'the agent refused the request', failure.code, failure.data),
       );
-    } else waiting.resolve(obj(message.result) ?? {});
+    } else if (waiting.strictResult && !obj(message.result))
+      waiting.reject(new Error('Codex returned an unreadable response.'));
+    else waiting.resolve(obj(message.result) ?? {});
   }
 
   private request(
@@ -2094,6 +2255,8 @@ export class CodexWire {
     params: Json,
     beforeWrite?: (id: number) => void,
     writeAttempted?: () => void,
+    deadlineMs = this.deadlineMs,
+    strictResult = false,
   ): Promise<Json> {
     if (this.closed) {
       return Promise.reject(new Error('the agent is no longer running'));
@@ -2105,12 +2268,12 @@ export class CodexWire {
         if (late) {
           late.reject(new NoAnswer('the agent did not answer'));
         }
-      }, this.deadlineMs);
+      }, deadlineMs);
       // A pending request timer must not keep the extension host process alive.
       if (typeof timer === 'object' && typeof timer.unref === 'function') {
         timer.unref();
       }
-      this.waiting.set(id, { resolve, reject, timer });
+      this.waiting.set(id, { resolve, reject, timer, strictResult });
       try {
         beforeWrite?.(id);
         if (this.closed) throw new Error('the agent is no longer running');

@@ -15274,6 +15274,7 @@ test('hosted child exit leaves an ordinary reader queue entry waiting without a 
     policies: { forgetClear: () => {} },
     compaction: undefined,
     commandStateChanges: new Set(),
+    publishCommands: () => {},
     updateAgentAffordance: () => {},
     usageReads: { failDeferred: () => {} },
     publishHostedSessions: () => {

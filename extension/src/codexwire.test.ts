@@ -16,11 +16,253 @@ import {
 } from './codexwire.ts';
 import { WireEvent, Ask, RateLimit, GuardedAttempt } from './agentwire.ts';
 import { SessionNameUncertain } from './sessionrename.ts';
+import * as path from 'node:path';
 
 // App-server fixtures retain protocol fields, including request ID 0. A truthiness check must not discard that ID.
 
 const THREAD = '01a04792-145f-7c01-9dd6-f3234c381e7e';
 const TURN = '01a04792-152f-72f1-b738-f4b20621e59a';
+
+// Dedicated in-memory servers exercise registration order, raw collisions, and withdrawal without model turns.
+function sessionSkillServer() {
+  const root = path.resolve('session-skill-release');
+  const release = {
+    contentId: 'a'.repeat(64),
+    directory: root,
+    claudePlugin: path.join(root, 'session-plugin'),
+    codexRoot: path.join(root, 'skills'),
+    claudeDefinition: path.join(root, 'session-plugin/skills/arc-sessions/SKILL.md'),
+    codexDefinition: path.join(root, 'skills/arc-sessions/SKILL.md'),
+  };
+  const state = {
+    registered: false,
+    collision: false,
+    disabled: false,
+    managed: false,
+    withdrawFailure: false,
+    invalidAck: false,
+    unsupported: false,
+    postCollision: false,
+    holdList: false,
+    holdSteer: false,
+    holdStart: false,
+    failStart: false,
+    refuseSteer: false,
+    beforeReply: undefined as ((message: any) => void) | undefined,
+  };
+  const held: (() => void)[] = [];
+  const sent: any[] = [];
+  const events: WireEvent[] = [];
+  const cwd = process.cwd();
+  const definition = (file: string, enabled = true) => ({
+    name: 'arc-sessions',
+    path: file,
+    enabled,
+    scope: 'user',
+    pluginId: null,
+    description: 'Arc sessions',
+  });
+  const wire = new CodexWire({
+    cwd,
+    clientInfo: { name: 'arc', title: 'Arc', version: '0.1.0' },
+    sessionSkills: { release, refresh: () => true },
+    emit: (event) => events.push(event),
+    send: (line) => {
+      const message = JSON.parse(line);
+      sent.push(message);
+      if (state.failStart && message.method === 'turn/start') throw new Error('native input transport failed');
+      if (message.id === undefined) return;
+      const respond = () => {
+        state.beforeReply?.(message);
+        let result: unknown = {};
+        let error: unknown;
+        switch (message.method) {
+          case 'skills/list':
+            result = {
+              data: [
+                {
+                  cwd,
+                  errors: [],
+                  skills: [
+                    ...(state.registered ? [definition(release.codexDefinition, !state.disabled)] : []),
+                    ...(state.collision || (state.postCollision && state.registered)
+                      ? [definition(path.resolve('personal/SKILL.md'), false)]
+                      : []),
+                  ],
+                },
+              ],
+            };
+            break;
+          case 'config/read':
+            result = {
+              config: state.disabled ? { skills: { config: [{ path: release.codexDefinition, enabled: false }] } } : {},
+              origins: {},
+              layers: [],
+            };
+            break;
+          case 'configRequirements/read':
+            result = { requirements: state.managed ? {} : null };
+            break;
+          case 'skills/extraRoots/set':
+            if (state.unsupported) error = { code: -32601, message: 'unsupported' };
+            else if (!message.params.extraRoots.length && state.withdrawFailure)
+              error = { code: -32602, message: 'withdrawal refused' };
+            else {
+              state.registered = message.params.extraRoots.length > 0;
+              result = state.invalidAck ? null : {};
+            }
+            break;
+          case 'thread/start':
+            result = { thread: { id: THREAD } };
+            break;
+          case 'turn/start':
+            result = { turn: { id: TURN } };
+            break;
+          case 'turn/steer':
+            if (state.refuseSteer) error = { code: -32600, message: 'expected turn is not active' };
+            break;
+        }
+        wire.receive(JSON.stringify({ id: message.id, ...(error ? { error } : { result }) }));
+      };
+      queueMicrotask(() => {
+        if (
+          (state.holdList && message.method === 'skills/list') ||
+          (state.holdSteer && message.method === 'turn/steer') ||
+          (state.holdStart && message.method === 'turn/start')
+        )
+          held.push(respond);
+        else respond();
+      });
+    },
+  });
+  return { wire, state, sent, events, release, held };
+}
+
+test('Codex registers process-local roots only after raw admission and attaches the admitted exact definition once', async () => {
+  const h = sessionSkillServer();
+  await h.wire.initialize();
+  const commands = await h.wire.commands();
+  await h.wire.startThread({ cwd: process.cwd() });
+  await h.wire.prompt('$arc-sessions list sessions');
+  const methods = h.sent.map((message) => message.method);
+  assert.deepEqual(methods.slice(0, 10), [
+    'initialize',
+    'initialized',
+    'skills/list',
+    'config/read',
+    'configRequirements/read',
+    'skills/extraRoots/set',
+    'skills/list',
+    'config/read',
+    'configRequirements/read',
+    'thread/start',
+  ]);
+  assert.equal(commands.find((command) => command.name === 'arc-sessions')?.sessionSkillRelease, h.release.contentId);
+  assert.deepEqual(h.sent.find((message) => message.method === 'skills/extraRoots/set').params, {
+    extraRoots: [h.release.codexRoot],
+  });
+  const turns = h.sent.filter((message) => message.method === 'turn/start');
+  assert.equal(turns.length, 1);
+  assert.deepEqual(turns[0].params.input[1], { type: 'skill', name: 'arc-sessions', path: h.release.codexDefinition });
+  h.wire.close('closed');
+});
+
+test.each(['collision', 'disabled', 'managed', 'unsupported'] as const)(
+  'Codex %s refuses optional delivery in its existing dedicated child',
+  async (kind) => {
+    const h = sessionSkillServer();
+    h.state[kind] = true;
+    await h.wire.initialize();
+    const commands = await h.wire.commands();
+    await h.wire.startThread({ cwd: process.cwd() });
+    await h.wire.prompt('ordinary work');
+    assert.equal(
+      commands.some((command) => command.sessionSkillRelease),
+      false,
+    );
+    assert.equal(h.state.registered, false);
+    assert.equal(h.sent.filter((message) => message.method === 'turn/start').length, 1);
+    if (kind !== 'unsupported')
+      assert.equal(
+        h.sent.some((message) => message.method === 'skills/extraRoots/set'),
+        false,
+      );
+    h.wire.close('closed');
+  },
+);
+
+test('Codex post-registration collisions withdraw its roots before opening a session', async () => {
+  const h = sessionSkillServer();
+  h.state.postCollision = true;
+  await h.wire.initialize();
+  const commands = await h.wire.commands();
+  await h.wire.startThread({ cwd: process.cwd() });
+  assert.equal(h.state.registered, false);
+  assert.equal(
+    commands.some((command) => command.sessionSkillRelease),
+    false,
+  );
+  const replacements = h.sent.filter((message) => message.method === 'skills/extraRoots/set');
+  assert.deepEqual(
+    replacements.map((message) => message.params.extraRoots),
+    [[h.release.codexRoot], []],
+  );
+  assert.ok(h.sent.indexOf(replacements[1]) < h.sent.findIndex((message) => message.method === 'thread/start'));
+  h.wire.close('closed');
+});
+
+test.each([false, true])(
+  'Codex refresh withdraws disabled roots and blocks delivery when withdrawal is uncertain: %s',
+  async (uncertain) => {
+    const h = sessionSkillServer();
+    await h.wire.initialize();
+    await h.wire.commands();
+    await h.wire.startThread({ cwd: process.cwd() });
+    await h.wire.prompt('first work');
+    h.state.disabled = true;
+    h.state.withdrawFailure = uncertain;
+    h.wire.receive(JSON.stringify({ method: 'skills/changed', params: {} }));
+    const second = h.wire.prompt('$arc-sessions later work');
+    if (uncertain) await assert.rejects(second, /withdrawal/);
+    else await second;
+    if (uncertain) {
+      await assert.rejects(h.wire.startThread({ cwd: process.cwd() }), /withdrawal/);
+      await assert.rejects(h.wire.compact(), /withdrawal/);
+      assert.equal(h.sent.filter((message) => message.method === 'thread/start').length, 1);
+    }
+    const turns = h.sent.filter((message) => message.method === 'turn/start');
+    assert.equal(turns.length, uncertain ? 1 : 2);
+    if (!uncertain)
+      assert.equal(
+        turns[1].params.input.some((entry: any) => entry.type === 'skill'),
+        false,
+      );
+    assert.equal(
+      h.events
+        .filter((event) => event.kind === 'commands')
+        .at(-1)
+        ?.commands.some((command: any) => command.sessionSkillRelease),
+      false,
+    );
+    h.wire.close('closed');
+  },
+);
+
+test('Codex malformed registration acknowledgement prevents optional readiness and session creation', async () => {
+  const h = sessionSkillServer();
+  h.state.invalidAck = true;
+  await h.wire.initialize();
+  await assert.rejects(h.wire.commands(), /unreadable/);
+  assert.equal(
+    h.events.some((event) => event.kind === 'ready'),
+    false,
+  );
+  assert.equal(
+    h.sent.some((message) => message.method === 'thread/start' || message.method === 'turn/start'),
+    false,
+  );
+  h.wire.close('closed');
+});
 
 const APPROVAL_REQUEST = JSON.stringify({
   id: 0,
@@ -3049,6 +3291,239 @@ const PICKED_ENVELOPE =
 function resolved(h: ReturnType<typeof harness>): boolean {
   return h.events.some((e) => e.kind === 'askResolved' && e.outcome !== 'failed' && e.id === ASYNC_QUESTION_ITEM.id);
 }
+
+test.each([
+  [false, false],
+  [false, true],
+  [true, false],
+  [true, true],
+])(
+  'async answers wait for pending skill admission and retain refused questions: uncertain=%s ended=%s',
+  async (uncertain, ended) => {
+    const h = sessionSkillServer();
+    try {
+      await h.wire.initialize();
+      await h.wire.commands();
+      await h.wire.startThread({ cwd: process.cwd() });
+      await h.wire.prompt('ask a question');
+      for (const method of ['item/started', 'item/completed'])
+        h.wire.receive(
+          JSON.stringify({ method, params: { item: ASYNC_QUESTION_ITEM, threadId: THREAD, turnId: TURN } }),
+        );
+      if (ended) h.wire.receive(TURN_COMPLETED);
+      h.state.holdList = !uncertain;
+      h.state.disabled = uncertain;
+      h.state.withdrawFailure = uncertain;
+      h.wire.receive(JSON.stringify({ method: 'skills/changed', params: {} }));
+      if (uncertain) await assert.rejects(h.wire.prompt('must stay unsent'), /withdrawal/);
+      const inputs = () => h.sent.filter((message) => ['turn/start', 'turn/steer'].includes(message.method));
+      const before = inputs().length;
+      assert.equal(h.wire.answer(ASYNC_QUESTION_ITEM.id, PICKED_ANSWER), true);
+      if (!uncertain) {
+        await vi.waitFor(() => assert.equal(h.held.length, 1));
+        assert.equal(inputs().length, before, 'a pending refresh must send no answer input');
+        h.state.holdList = false;
+        h.held.shift()!();
+      }
+      if (uncertain) {
+        await vi.waitFor(() =>
+          assert.ok(h.events.some((event) => event.kind === 'askResolved' && event.outcome === 'failed')),
+        );
+        assert.equal(h.wire.outlivesTurn(ASYNC_QUESTION_ITEM.id), true);
+        assert.equal(inputs().length, before, 'failed withdrawal must send no answer input');
+        assert.equal(h.wire.answer(ASYNC_QUESTION_ITEM.id, PICKED_ANSWER), true);
+        await vi.waitFor(() =>
+          assert.equal(
+            h.events.filter((event) => event.kind === 'askResolved' && event.outcome === 'failed').length,
+            2,
+          ),
+        );
+        assert.equal(inputs().length, before);
+      } else {
+        await vi.waitFor(() =>
+          assert.ok(h.events.some((event) => event.kind === 'askResolved' && event.outcome === 'answered')),
+        );
+        assert.equal(inputs().length, before + 1);
+        assert.equal(inputs().at(-1).method, ended ? 'turn/start' : 'turn/steer');
+      }
+    } finally {
+      h.wire.close('finished');
+    }
+  },
+);
+
+test.each([
+  ['admission', false],
+  ['admission', true],
+  ['steer', false],
+  ['fallback', false],
+] as const)('Stop cancels an async answer during %s with ended turn=%s', async (phase, ended) => {
+  const h = sessionSkillServer();
+  try {
+    await h.wire.initialize();
+    await h.wire.commands();
+    await h.wire.startThread({ cwd: process.cwd() });
+    await h.wire.prompt('ask a question');
+    for (const method of ['item/started', 'item/completed'])
+      h.wire.receive(JSON.stringify({ method, params: { item: ASYNC_QUESTION_ITEM, threadId: THREAD, turnId: TURN } }));
+    if (ended) h.wire.receive(TURN_COMPLETED);
+    h.state.refuseSteer = true;
+    h.state.holdList = phase === 'admission';
+    h.state.holdSteer = phase !== 'admission';
+    if (phase === 'admission') h.wire.receive(JSON.stringify({ method: 'skills/changed', params: {} }));
+    assert.equal(h.wire.answer(ASYNC_QUESTION_ITEM.id, PICKED_ANSWER), true);
+    await vi.waitFor(() => assert.equal(h.held.length, 1));
+    if (phase === 'fallback') {
+      h.state.beforeReply = (message) => {
+        if (message.method !== 'turn/steer') return;
+        h.state.holdList = true;
+        h.wire.receive(JSON.stringify({ method: 'skills/changed', params: {} }));
+      };
+      h.state.holdSteer = false;
+      h.held.shift()!();
+      await vi.waitFor(() => assert.equal(h.held.length, 1));
+    }
+    await h.wire.interrupt();
+    h.wire.receive(TURN_COMPLETED);
+    const inputs = () => h.sent.filter((message) => ['turn/start', 'turn/steer'].includes(message.method));
+    const before = inputs().length;
+    h.state.holdList = false;
+    h.state.holdSteer = false;
+    h.held.shift()!();
+    await vi.waitFor(() => assert.ok(h.events.some((event) => event.kind === 'askResolved')));
+    assert.equal(inputs().length, before, 'Stop must prevent native answer input after the held response');
+    assert.ok(
+      h.events.some((event) => event.kind === 'askResolved' && event.outcome === 'failed'),
+      'the host must release answer delivery',
+    );
+    assert.equal(
+      h.wire.outlivesTurn(ASYNC_QUESTION_ITEM.id),
+      true,
+      'an unsent answer must leave its question available',
+    );
+    assert.equal(h.events.filter((event) => event.kind === 'ask').length, 2);
+    assert.equal(h.wire.hasOpenTurns(), false, 'a cancelled answer must release pending delivery');
+  } finally {
+    h.wire.close('finished');
+  }
+});
+
+test.each(['admission timeout', 'accepted', 'native timeout', 'missing turn', 'transport failure'] as const)(
+  'async answer fallback settles from native delivery evidence after %s',
+  async (outcome) => {
+    const h = sessionSkillServer();
+    try {
+      await h.wire.initialize();
+      await h.wire.commands();
+      await h.wire.startThread({ cwd: process.cwd() });
+      await h.wire.prompt('ask a question');
+      h.wire.receive(
+        JSON.stringify({
+          method: 'item/completed',
+          params: { item: ASYNC_QUESTION_ITEM, threadId: THREAD, turnId: TURN },
+        }),
+      );
+      h.state.refuseSteer = true;
+      h.state.holdSteer = true;
+      assert.equal(h.wire.answer(ASYNC_QUESTION_ITEM.id, PICKED_ANSWER), true);
+      await vi.waitFor(() => assert.equal(h.held.length, 1));
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+      h.state.holdList = true;
+      h.wire.receive(JSON.stringify({ method: 'skills/changed', params: {} }));
+      h.state.holdSteer = false;
+      h.held.shift()!();
+      await vi.waitFor(() => assert.equal(h.held.length, 1));
+      const inputs = () => h.sent.filter((message) => ['turn/start', 'turn/steer'].includes(message.method));
+      assert.equal(inputs().length, 2, 'only the original prompt and refused steer have attempted input');
+      if (outcome === 'admission timeout') {
+        await vi.advanceTimersByTimeAsync(15_000);
+      } else {
+        h.state.holdStart = outcome === 'native timeout';
+        h.state.failStart = outcome === 'transport failure';
+        h.state.beforeReply = (message) => {
+          if (outcome === 'missing turn' && message.method === 'turn/start')
+            h.wire.receive(JSON.stringify({ id: message.id, result: {} }));
+        };
+        h.state.holdList = false;
+        h.held.shift()!();
+        if (outcome === 'native timeout') {
+          await vi.waitFor(() => assert.equal(h.held.length, 1));
+          await vi.advanceTimersByTimeAsync(60_000);
+        }
+      }
+      await vi.waitFor(() => assert.ok(h.events.some((event) => event.kind === 'askResolved')));
+      const expected = outcome === 'admission timeout' ? 'failed' : outcome === 'accepted' ? 'answered' : 'unknown';
+      assert.deepEqual(
+        h.events.filter((event) => event.kind === 'askResolved'),
+        [{ kind: 'askResolved', id: ASYNC_QUESTION_ITEM.id, outcome: expected }],
+      );
+      assert.equal(inputs().length, outcome === 'admission timeout' ? 2 : 3, 'fallback input must not be retried');
+      assert.equal(h.wire.outlivesTurn(ASYNC_QUESTION_ITEM.id), outcome === 'admission timeout');
+      assert.equal(h.events.filter((event) => event.kind === 'ask').length, outcome === 'admission timeout' ? 2 : 1);
+      assert.equal(h.wire.hasOpenTurns(), true, 'the original running turn retains its busy ownership');
+      h.wire.receive(TURN_COMPLETED);
+      assert.equal(h.wire.hasOpenTurns(), false, 'settled answer delivery must not retain busy state');
+      if (outcome === 'admission timeout' || outcome === 'native timeout') {
+        h.held.shift()!();
+        await vi.waitFor(() => assert.equal(vi.getTimerCount(), 0));
+        assert.equal(
+          inputs().length,
+          outcome === 'admission timeout' ? 2 : 3,
+          'late discovery must not resend an answer',
+        );
+        assert.equal(h.events.filter((event) => event.kind === 'askResolved').length, 1);
+      }
+    } finally {
+      h.wire.close('finished');
+      vi.useRealTimers();
+    }
+  },
+);
+
+test.each(['opening', 'refresh'] as const)(
+  'trailing skill notifications share the %s admission deadline',
+  async (operation) => {
+    const h = sessionSkillServer();
+    let now = 0;
+    const clock = vi.spyOn(performance, 'now').mockImplementation(() => now);
+    try {
+      await h.wire.initialize();
+      if (operation === 'refresh') {
+        await h.wire.commands();
+        await h.wire.startThread({ cwd: process.cwd() });
+      }
+      let requirements = 0;
+      h.state.beforeReply = (message) => {
+        now += 2_000;
+        if (message.method === 'configRequirements/read' && ++requirements === 2)
+          h.wire.receive(JSON.stringify({ method: 'skills/changed', params: {} }));
+      };
+      if (operation === 'opening') {
+        await assert.rejects(h.wire.commands(), /loading its skills in time/);
+        await assert.rejects(h.wire.startThread({ cwd: process.cwd() }), /loading its skills in time/);
+        assert.equal(
+          h.events.some((event) => event.kind === 'ready'),
+          false,
+        );
+      } else {
+        h.wire.receive(JSON.stringify({ method: 'skills/changed', params: {} }));
+        await assert.rejects(h.wire.prompt('must stay unsent'), /loading its skills in time/);
+      }
+      assert.equal(
+        h.sent.filter((message) => message.method === 'thread/start').length,
+        operation === 'opening' ? 0 : 1,
+      );
+      assert.equal(
+        h.sent.some((message) => ['turn/start', 'turn/steer'].includes(message.method)),
+        false,
+      );
+      assert.ok(now >= 15_000);
+    } finally {
+      h.wire.close('finished');
+      clock.mockRestore();
+    }
+  },
+);
 
 test('dismissing an async question sends Codex nothing and resolves the ask', async () => {
   const h = await askAsyncQuestionInTurn();

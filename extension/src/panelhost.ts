@@ -1563,6 +1563,7 @@ export class PanelProvider implements vscode.Disposable {
   private picks: SessionSettingBook = {};
   // Published prompt commands by agent. Sessions using one agent share its catalog in this folder.
   private commandLists: Record<string, PromptEntry[]> = {};
+  private sessionCommandLists: Record<string, PromptEntry[]> = {};
   // The last-seen Claude skill list for each working directory, as a normalized path key.
   // `extension.ts` owns loading, persisting, and replacing it.
   private skillLists: Record<string, readonly string[]> = {};
@@ -4566,8 +4567,11 @@ export class PanelProvider implements vscode.Disposable {
   // Preserve published command paths and add available Claude skill definition paths.
   // Search project skills before Claude's configured home when a command has no published path.
   // Cache lookup results by session directory and command name, including missing definitions.
-  private claudeCommandsFor(cwd: string | null): PromptEntry[] {
-    const commands = this.commandLists.claude ?? [];
+  private claudeCommandsFor(cwd: string | null, session?: string): PromptEntry[] {
+    const commands = [
+      ...(this.commandLists.claude ?? []),
+      ...(session ? (this.sessionCommandLists?.[session] ?? []) : []),
+    ];
     if (commands.length === 0) {
       return commands;
     }
@@ -4625,12 +4629,17 @@ export class PanelProvider implements vscode.Disposable {
         profile?.model ?? pick.selectedModel,
       ),
       // Claude commands include skill paths resolved for this working directory. Codex supplies paths in its catalog.
-      commands: row.agentKey === 'claude' ? this.claudeCommandsFor(claudeCwd) : (this.commandLists[row.agentKey] ?? []),
+      commands:
+        row.agentKey === 'claude'
+          ? this.claudeCommandsFor(claudeCwd, row.id)
+          : [...(this.commandLists[row.agentKey] ?? []), ...(this.sessionCommandLists?.[row.id] ?? [])],
       // Null means no Claude skill list has arrived. A reported empty list remains distinct from that fallback.
       claudeSkills:
         row.agentKey === 'claude'
           ? claudeCwd
-            ? (this.skillLists[normalizeWorkspace(claudeCwd)] ?? null)
+            ? (this.skillLists[normalizeWorkspace(claudeCwd)]?.concat(
+                (this.sessionCommandLists?.[row.id] ?? []).map((command) => command.name),
+              ) ?? null)
             : null
           : null,
       mcpServers: this.mcpServers[row.id] ?? [],
@@ -5410,8 +5419,9 @@ export class PanelProvider implements vscode.Disposable {
   }
 
   // Replace published prompt commands for the slash menu.
-  public setCommands(commands: Record<string, PromptEntry[]>): void {
+  public setCommands(commands: Record<string, PromptEntry[]>, sessions: Record<string, PromptEntry[]> = {}): void {
     this.commandLists = commands;
+    this.sessionCommandLists = sessions;
     void this.post({ type: 'usage', usage: this.usagePayload() });
   }
 

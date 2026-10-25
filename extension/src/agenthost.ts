@@ -68,6 +68,13 @@ import {
 } from './transcript';
 import { ARC_IDENTITY } from './identity';
 import { QuestionRecovery, questionIdentity, type RecoveredQuestion } from './questionrecovery';
+import {
+  admitClaudeSessionSkill,
+  claudeSkillHome,
+  retainedSessionSkill,
+  type SessionSkillSelection,
+  type SessionSkillRelease,
+} from './sessionskills';
 
 // The child-process methods used by the host. Tests supply these methods without starting a CLI.
 export interface ChildLike {
@@ -87,6 +94,7 @@ export type Spawner = (
   env: Record<string, string>,
   agent?: AgentName,
   cli?: ArcCliEnvironment,
+  inherited?: NodeJS.ProcessEnv,
 ) => ChildLike;
 
 // Returns a refusal for Windows batch shims, which cannot be spawned directly without a shell.
@@ -134,7 +142,13 @@ export function childEnv(
   agent?: AgentName,
   cwd?: string,
   cli?: ArcCliEnvironment,
+  platform = cli?.platform ?? process.platform,
 ): Record<string, string | undefined> {
+  const windows = platform === 'win32';
+  const environmentKeys = (source: Record<string, string | undefined>, name: string) =>
+    Object.keys(source)
+      .filter((key) => (windows ? key.toUpperCase() === name : key === name))
+      .sort();
   const env: Record<string, string | undefined> = { ...inherited, ELECTRON_RUN_AS_NODE: '1' };
   for (const key of Object.keys(env)) {
     if (HOST_IDENTITY_ENV_NAMES.includes(key.toUpperCase())) {
@@ -142,14 +156,17 @@ export function childEnv(
     }
   }
   Object.assign(env, wanted);
+  if (windows) {
+    const inheritedKey = environmentKeys(inherited, 'CLAUDE_CONFIG_DIR')[0];
+    const wantedKey = environmentKeys(wanted, 'CLAUDE_CONFIG_DIR')[0];
+    const value = wantedKey ? wanted[wantedKey] : inheritedKey ? inherited[inheritedKey] : undefined;
+    for (const key of environmentKeys(env, 'CLAUDE_CONFIG_DIR')) delete env[key];
+    if (value !== undefined) env.CLAUDE_CONFIG_DIR = value;
+  }
   if (cli) {
     const windowKey = `${ARC_IDENTITY.environmentPrefix}WINDOW`;
     const editorKey = `${ARC_IDENTITY.environmentPrefix}EDITOR_EXECUTABLE`;
-    const windows = (cli.platform ?? process.platform) === 'win32';
-    const pathKeys = (source: Record<string, string | undefined>) =>
-      Object.keys(source)
-        .filter((key) => (windows ? key.toUpperCase() === 'PATH' : key === 'PATH'))
-        .sort();
+    const pathKeys = (source: Record<string, string | undefined>) => environmentKeys(source, 'PATH');
     const inheritedKey = pathKeys(inherited)[0];
     const wantedKey = pathKeys(wanted)[0];
     const value = wantedKey ? wanted[wantedKey] : inheritedKey ? inherited[inheritedKey] : undefined;
@@ -190,7 +207,7 @@ export function childEnv(
   return env;
 }
 
-export const spawnCli: Spawner = (command, args, cwd, env, agent, cli) => {
+export const spawnCli: Spawner = (command, args, cwd, env, agent, cli, inherited) => {
   if (process.env[MEASUREMENT_ENVIRONMENT.blockAgents] === '1')
     throw new Error('Agent connections are disabled in this measurement window.');
   const refusal = unstartable(command, process.platform);
@@ -199,14 +216,15 @@ export const spawnCli: Spawner = (command, args, cwd, env, agent, cli) => {
   }
   return nodeSpawn(command, args, {
     cwd,
-    env: childEnv(process.env, env, agent, cwd, cli),
+    env: childEnv(inherited ?? process.env, env, agent, cwd, cli),
     stdio: ['pipe', 'pipe', 'pipe'],
     windowsHide: true,
   });
 };
 
 export function arcCliSpawner(environment: () => ArcCliEnvironment, spawner: Spawner = spawnCli): Spawner {
-  return (command, args, cwd, env, agent) => spawner(command, args, cwd, env, agent, environment());
+  return (command, args, cwd, env, agent, _cli, inherited) =>
+    spawner(command, args, cwd, env, agent, environment(), inherited);
 }
 
 export type AgentName = 'claude' | 'codex';
@@ -215,6 +233,7 @@ export type AgentName = 'claude' | 'codex';
 // The panel displays pending requests from `asks`.
 export interface SessionState {
   key: string;
+  usageSource?: number;
   agent: AgentName;
   cwd: string;
   sessionId: string | null;
@@ -229,6 +248,7 @@ export interface SessionState {
 
 export interface SessionEvent {
   key: string;
+  usageSource?: number;
   event: WireEvent;
   // Names the accepted submission that owns this response or ending.
   turnId?: number;
@@ -314,6 +334,8 @@ export interface Driver {
 
 // What to start, and how to talk to it once it is running.
 export interface AgentPlan {
+  prepare?(): AgentPlan;
+  inheritedEnvironment?: NodeJS.ProcessEnv;
   policy?: LaunchPolicy;
   agent: AgentName;
   // The provider session identity supplied by the launch plan. A fresh Codex child receives its identity during opening.
@@ -328,9 +350,14 @@ export interface AgentPlan {
 
 export type AgentPlanSource = AgentPlan | (() => AgentPlan);
 
+export function prepareAgentPlan(plan: AgentPlan): AgentPlan {
+  return plan.prepare?.() ?? plan;
+}
+
 // The executable, leading arguments, and environment resolved by `composerview.ts`.
 // Leading arguments identify a package script when the launcher uses Node.
 export interface Launch {
+  sessionSkills?: SessionSkillSelection;
   command: string;
   leadingArgs: string[];
   env: Record<string, string>;
@@ -367,19 +394,60 @@ function claudePlanEnv(env: Record<string, string>, options: SpawnOptions): Reco
 }
 
 // Claude Code: one child per session, speaking its stream-json protocol.
-export function claudePlan(launch: Launch, options: SpawnOptions): AgentPlan {
+export function claudePlan(
+  launch: Launch,
+  options: SpawnOptions,
+  prepared?: {
+    release?: SessionSkillRelease;
+    refresh?: () => boolean;
+    environment: NodeJS.ProcessEnv;
+    args: string[];
+  },
+): AgentPlan {
   options = { ...options, replayUserMessages: true };
   return {
+    ...(!prepared && launch.sessionSkills
+      ? {
+          prepare: () => {
+            const environment = { ...process.env };
+            const env = childEnv(environment, claudePlanEnv(launch.env, options), 'claude', options.cwd);
+            const home = claudeSkillHome(env, options.cwd);
+            env.CLAUDE_CONFIG_DIR = home;
+            const args = [...launch.leadingArgs, ...spawnArgs(options, env)];
+            const selected = launch.sessionSkills!.current();
+            const refresh = () =>
+              !!selected &&
+              retainedSessionSkill(selected, launch.sessionSkills!) &&
+              admitClaudeSessionSkill({ release: selected, cwd: options.cwd, home, env, args });
+            const release = refresh() ? selected : undefined;
+            return claudePlan({ ...launch, env: { ...launch.env, CLAUDE_CONFIG_DIR: home } }, options, {
+              release,
+              refresh,
+              environment,
+              args,
+            });
+          },
+        }
+      : {}),
+    inheritedEnvironment: prepared?.environment,
     policy: options.policy,
     agent: 'claude',
     sessionId: options.resume ?? options.sessionId ?? null,
     command: launch.command,
-    args: [...launch.leadingArgs, ...spawnArgs(options, { ...process.env, ...launch.env })],
+    args: [
+      ...(prepared?.args ?? [...launch.leadingArgs, ...spawnArgs(options, { ...process.env, ...launch.env })]),
+      ...(prepared?.release ? ['--plugin-dir', prepared.release.claudePlugin] : []),
+    ],
     cwd: options.cwd,
     env: claudePlanEnv(launch.env, options),
     driver(send, emit) {
       // Seed Claude's session identity before the first prompt. A resumed CLI can defer reporting it until output begins.
-      const wire = new ClaudeWire({ send, emit, sessionId: options.resume ?? options.sessionId });
+      const wire = new ClaudeWire({
+        send,
+        emit,
+        sessionId: options.resume ?? options.sessionId,
+        sessionSkills: prepared?.release ? { release: prepared.release, refresh: prepared.refresh! } : undefined,
+      });
       return {
         receive: (line) => wire.receive(line),
         contextUsage: () => wire.contextUsage(),
@@ -436,7 +504,7 @@ export function claudePlan(launch: Launch, options: SpawnOptions): AgentPlan {
 // session so the request reaches the right transcript, sends the rename once it has opened,
 // and takes no prompt.
 export function claudeRenamePlan(launch: Launch, options: SpawnOptions & { resume: string; title: string }): AgentPlan {
-  const ordinary = claudePlan(launch, options);
+  const ordinary = claudePlan({ ...launch, sessionSkills: undefined }, options);
   return {
     ...ordinary,
     driver(send, emit) {
@@ -474,12 +542,26 @@ export interface CodexPlanOptions {
 
 // Starts one Codex app-server child per session through the resolved launch executable and arguments.
 // Per-session children keep thread ownership in the host's session map.
-export function codexPlan(launch: Launch, options: CodexPlanOptions): AgentPlan {
+export function codexPlan(
+  launch: Launch,
+  options: CodexPlanOptions,
+  prepared?: { release?: SessionSkillRelease; environment: NodeJS.ProcessEnv },
+): AgentPlan {
   options = {
     ...options,
     ...(options.policy ? ({ approvalPolicy: 'never', approvalsReviewer: 'user', sandbox: 'read-only' } as const) : {}),
   };
   return {
+    ...(!prepared && launch.sessionSkills
+      ? {
+          prepare: () =>
+            codexPlan(launch, options, {
+              release: launch.sessionSkills!.current(),
+              environment: { ...process.env },
+            }),
+        }
+      : {}),
+    inheritedEnvironment: prepared?.environment,
     policy: options.policy,
     agent: 'codex',
     sessionId: options.resume ?? null,
@@ -488,7 +570,15 @@ export function codexPlan(launch: Launch, options: CodexPlanOptions): AgentPlan 
     cwd: options.cwd,
     env: launch.env,
     driver(send, emit) {
-      const wire = new CodexWire({ send, emit, clientInfo: options.clientInfo, cwd: options.cwd });
+      const wire = new CodexWire({
+        send,
+        emit,
+        clientInfo: options.clientInfo,
+        cwd: options.cwd,
+        sessionSkills: prepared?.release
+          ? { release: prepared.release, refresh: () => retainedSessionSkill(prepared.release!, launch.sessionSkills!) }
+          : undefined,
+      });
       return {
         receive: (line) => wire.receive(line),
         async open() {
@@ -558,8 +648,19 @@ export function claudeIdlePlan(launch: Launch, cwd: string, model = ''): AgentPl
 export function codexIdlePlan(
   launch: Launch,
   options: { cwd: string; clientInfo: ClientInfo; model?: string },
+  prepared?: { release?: SessionSkillRelease; environment: NodeJS.ProcessEnv },
 ): AgentPlan {
   return {
+    ...(!prepared && launch.sessionSkills
+      ? {
+          prepare: () =>
+            codexIdlePlan(launch, options, {
+              release: launch.sessionSkills!.current(),
+              environment: { ...process.env },
+            }),
+        }
+      : {}),
+    inheritedEnvironment: prepared?.environment,
     agent: 'codex',
     sessionId: null,
     command: launch.command,
@@ -567,7 +668,15 @@ export function codexIdlePlan(
     cwd: options.cwd,
     env: launch.env,
     driver(send, emit) {
-      const wire = new CodexWire({ send, emit, clientInfo: options.clientInfo, cwd: options.cwd });
+      const wire = new CodexWire({
+        send,
+        emit,
+        clientInfo: options.clientInfo,
+        cwd: options.cwd,
+        sessionSkills: prepared?.release
+          ? { release: prepared.release, refresh: () => retainedSessionSkill(prepared.release!, launch.sessionSkills!) }
+          : undefined,
+      });
       return {
         receive: (line) => wire.receive(line),
         async open() {
@@ -919,7 +1028,7 @@ export class AgentSession {
       (line) => this.child.stdin.write(line),
       (event) => this.handle(event),
     );
-    this.child = spawner(plan.command, plan.args, plan.cwd, plan.env, plan.agent);
+    this.child = spawner(plan.command, plan.args, plan.cwd, plan.env, plan.agent, undefined, plan.inheritedEnvironment);
 
     const out = new LineReader(
       (line) => this.driver.receive(line),
@@ -956,6 +1065,7 @@ export class AgentSession {
   state(): SessionState {
     return {
       key: this.key,
+      usageSource: this.usageSource,
       agent: this.agent,
       cwd: this.cwd,
       sessionId: this.driver.sessionId(),
@@ -1985,7 +2095,7 @@ export async function askIdleMcp(
 ): Promise<McpServer[] | null> {
   const session = new AgentSession(
     'idle-mcp',
-    plan,
+    prepareAgentPlan(plan),
     spawner,
     () => {},
     () => {},
@@ -2031,7 +2141,7 @@ export async function askIdleMcpChange(
 ): Promise<McpChangeResult> {
   const session = new AgentSession(
     'idle-mcp-set',
-    plan,
+    prepareAgentPlan(plan),
     spawner,
     () => {},
     () => {},
@@ -2068,6 +2178,7 @@ export async function askIdleMcpChange(
 
 // Everything one idle child was asked for in the exchange it was started for.
 export interface IdleAnswers {
+  child?: { key: string; usageSource: number };
   usage: UsageReadResult;
   usageFailure: string;
   models: ModelList | null;
@@ -2089,7 +2200,7 @@ export async function askIdle(
 ): Promise<IdleAnswers> {
   const session = new AgentSession(
     'idle',
-    plan,
+    prepareAgentPlan(plan),
     spawner,
     () => {},
     () => {},
@@ -2142,7 +2253,15 @@ export async function askIdle(
         }),
       session.models().catch(() => null),
     ]);
-    return { usage, usageFailure, models, commands };
+    return {
+      usage,
+      usageFailure,
+      models,
+      commands,
+      ...(commands.some((command) => command.sessionSkillRelease)
+        ? { child: { key: session.key, usageSource: session.usageSource } }
+        : {}),
+    };
   } finally {
     void session.dispose();
   }
@@ -2978,7 +3097,7 @@ export class AgentHost {
       await Promise.all(shutdowns);
     }
     this.assertActive();
-    const plan = refreshPlan ? refreshPlan() : initialPlan;
+    const plan = prepareAgentPlan(refreshPlan ? refreshPlan() : initialPlan);
     const refreshedIdentity = plan.sessionId ? this.sessionIdentity(plan.agent, plan.sessionId) : null;
     if (plan.agent !== initialPlan.agent || refreshedIdentity !== identity) {
       throw new Error('the agent session changed while its previous process closed');
@@ -3044,6 +3163,7 @@ export class AgentHost {
         this.options.onEvent({
           key,
           event,
+          ...(['ready', 'commands'].includes(event.kind) ? { usageSource: session.usageSource } : {}),
           ...(turnId === undefined ? {} : { turnId }),
           ...(dispatchTurnId === undefined ? {} : { dispatchTurnId }),
         });
@@ -3928,7 +4048,7 @@ export async function askIdleDefaults(plan: AgentPlan, spawner: Spawner): Promis
   try {
     session = new AgentSession(
       'defaults',
-      plan,
+      prepareAgentPlan(plan),
       spawner,
       () => {},
       () => {},
