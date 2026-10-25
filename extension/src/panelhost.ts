@@ -13404,12 +13404,18 @@ export class PanelProvider implements vscode.Disposable {
     const versions = new Map<string, string>();
     const now = Date.now();
     const agentKey = this.agentSpendKey(session, entry.read, undefined, versions, now);
+    // A Claude window refreshes after its retained pages, so the subagent split reads every turn the cards show.
+    const history = session.agent === 'claude' ? this.history.get(session.sessionId) : undefined;
+    const pages = history?.pages ?? [];
+    const historyVersions = new Map<string, string>();
+    if (pages.length) this.historyAgentKey(session, pages, undefined, historyVersions, now);
     const updated = await this.progressiveWorker.run(
       {
         kind: 'retained',
         input: this.progressiveInput(session, now),
-        pages: [{ turns: entry.read.turns, compactions: [], bytes: 0 }],
+        pages: [...pages, { turns: entry.read.turns, compactions: [], bytes: 0 }],
         structuralAgentIds: entry.structuralAgentIds,
+        endsAtNewest: true,
       },
       generation,
       signal,
@@ -13418,18 +13424,44 @@ export class PanelProvider implements vscode.Disposable {
       return false;
     }
     entry.agentKey = agentKey;
-    if (
-      !updated ||
-      updated.value.kind !== 'retained' ||
-      !updated.value.pages[0] ||
-      !acceptsProgressiveResult(updated, generation, this.revisionOf(session))
-    ) {
+    const window = updated?.value.kind === 'retained' ? updated.value.pages[pages.length] : undefined;
+    if (!updated || !window || !acceptsProgressiveResult(updated, generation, this.revisionOf(session))) {
       return false;
     }
-    entry.read = { ...entry.read, turns: updated.value.pages[0].turns };
+    entry.read = { ...entry.read, turns: window.turns };
     // Recompute the key over stored turns using the same captured child revisions and clock.
     entry.agentKey = this.agentSpendKey(session, entry.read, undefined, versions, now);
+    if (history && updated.value.kind === 'retained' && this.history.get(session.sessionId) === history) {
+      const kept = updated.value.pages.slice(0, pages.length);
+      this.history.set(session.sessionId, { ...history, pages: kept });
+      this.historyStructuralKeys.set(
+        session.sessionId,
+        this.historyAgentKey(session, kept, undefined, historyVersions, now),
+      );
+    }
     return true;
+  }
+
+  // The current Claude window that a retained refresh reads after the pages, so the subagent split reads every turn
+  // the cards show. The window's child revisions go into `versions` before the request.
+  private jointSplitWindow(session: SessionFile, versions: Map<string, string>, now: number): CacheEntry | undefined {
+    const entry =
+      session.agent === 'claude' && this.progressiveCurrent(session) ? this.cache.get(session.file) : undefined;
+    if (entry) this.agentSpendKey(session, entry.read, undefined, versions, now);
+    return entry;
+  }
+
+  // Stores the window turns that a joint retained refresh returned, keyed by the revisions captured before the request.
+  private acceptJointSplitWindow(
+    session: SessionFile,
+    entry: CacheEntry | undefined,
+    page: { turns: Turn[] } | undefined,
+    versions: Map<string, string>,
+    now: number,
+  ): void {
+    if (!entry || !page || this.cache.get(session.file) !== entry) return;
+    entry.read = { ...entry.read, turns: page.turns };
+    entry.agentKey = this.agentSpendKey(session, entry.read, undefined, versions, now);
   }
 
   private currentSelectedSession(work: {
@@ -13494,11 +13526,14 @@ export class PanelProvider implements vscode.Disposable {
       if (history?.pages.length && this.historyStructuralKeys.get(sessionId) !== historyKey) {
         const retainedRevision = this.revisionOf(session);
         roundTrip = true;
+        const windowVersions = new Map<string, string>();
+        const window = this.jointSplitWindow(session, windowVersions, historyNow);
         const updated = await this.progressiveWorker.run(
           {
             kind: 'retained',
             input: this.progressiveInput(session, historyNow),
-            pages: history.pages,
+            pages: window ? [...history.pages, { turns: window.read.turns, compactions: [], bytes: 0 }] : history.pages,
+            ...(window ? { endsAtNewest: true } : {}),
           },
           generation,
           controller.signal,
@@ -13527,11 +13562,19 @@ export class PanelProvider implements vscode.Disposable {
             this.dropOlderHistory(sessionId);
           }
         } else if (this.history.get(sessionId) === history) {
-          this.history.set(sessionId, { ...history, pages: updated.value.pages });
+          const pages = updated.value.pages.slice(0, history.pages.length);
+          this.history.set(sessionId, { ...history, pages });
           // Key the accepted pages with the captured child revisions, rather than the pages sent to the worker.
           this.historyStructuralKeys.set(
             sessionId,
-            this.historyAgentKey(current, updated.value.pages, undefined, historyVersions, historyNow),
+            this.historyAgentKey(current, pages, undefined, historyVersions, historyNow),
+          );
+          this.acceptJointSplitWindow(
+            current,
+            window,
+            updated.value.pages[history.pages.length],
+            windowVersions,
+            historyNow,
           );
         }
         session = current;
@@ -13654,6 +13697,9 @@ export class PanelProvider implements vscode.Disposable {
       });
       this.selectionFailure = null;
       retryLatestRevision ||= result.value.recoveryPending === true;
+      // A new Claude window changes the turns the subagent split reads, so the next pass refreshes the retained
+      // pages with it.
+      retryLatestRevision ||= current.agent === 'claude' && Boolean(this.history.get(sessionId)?.pages.length);
       // Publish accepted turns with incomplete repository navigation cleared before commit discovery waits.
       this.applyCommitRepositoryEvidence(current, result.value.read.turns);
       void this.refresh(true, true, true, true);
@@ -13747,11 +13793,14 @@ export class PanelProvider implements vscode.Disposable {
         ? this.historyAgentKey(session, history.pages, undefined, undefined, historyNow)
         : '';
       if (history?.pages.length && this.historyStructuralKeys.get(session.sessionId) !== historyKey) {
+        const windowVersions = new Map<string, string>();
+        const window = this.jointSplitWindow(session, windowVersions, historyNow);
         const updated = await this.progressiveWorker.run(
           {
             kind: 'retained',
             input: this.progressiveInput(session, historyNow),
-            pages: history.pages,
+            pages: window ? [...history.pages, { turns: window.read.turns, compactions: [], bytes: 0 }] : history.pages,
+            ...(window ? { endsAtNewest: true } : {}),
           },
           generation,
           signal,
@@ -13764,8 +13813,18 @@ export class PanelProvider implements vscode.Disposable {
           return false;
         }
         if (updated.value.kind === 'retained' && this.history.get(session.sessionId) === history) {
-          this.history.set(session.sessionId, { ...history, pages: updated.value.pages });
+          this.history.set(session.sessionId, {
+            ...history,
+            pages: updated.value.pages.slice(0, history.pages.length),
+          });
           this.historyStructuralKeys.set(session.sessionId, historyKey);
+          this.acceptJointSplitWindow(
+            session,
+            window,
+            updated.value.pages[history.pages.length],
+            windowVersions,
+            historyNow,
+          );
           changed = true;
         }
       }
@@ -13825,6 +13884,12 @@ export class PanelProvider implements vscode.Disposable {
         checkpointBytes: result.value.checkpointBytes,
       });
       changed = true;
+      // A new Claude window changes the turns the subagent split reads, so the retained pages refresh with it.
+      const accepted = this.cache.get(session.file);
+      if (accepted && session.agent === 'claude' && this.history.get(session.sessionId)?.pages.length) {
+        await this.refreshAgentFacts(session, accepted, generation, signal);
+        if (signal.aborted) return false;
+      }
       if (session.sessionId === this.showing) {
         break;
       }
@@ -14253,7 +14318,8 @@ export class PanelProvider implements vscode.Disposable {
     }
     if (held || updated.pages.length) {
       this.history.set(sessionId, updated);
-      if (updated.pages !== held?.pages) {
+      // A new Claude window changes the turns the subagent split reads with the retained pages.
+      if (updated.pages !== held?.pages || (updated.pages.length && result.value.read.turns[0]?.agent === 'claude')) {
         this.historyStructuralKeys.delete(sessionId);
       }
     }

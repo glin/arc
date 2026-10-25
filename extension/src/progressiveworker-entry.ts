@@ -72,7 +72,7 @@ import {
   claudeSessionLineMayAffectRead,
   claudeRetainedLine,
   readSessionTurnStarts,
-  refreshClaudeAgentFacts,
+  refreshRetainedClaudeAgentFacts,
   scanForAgentRun,
   scanForPerson,
   tailOf,
@@ -1285,9 +1285,11 @@ async function execute(
     structuralChildren: children,
   };
   if (request.kind === 'retained') {
-    request.pages
-      .flatMap((page) => page.turns)
-      .forEach((turn, index) => applyHiddenTurnFields(turn, request.hidden?.[index], session.agent === 'codex'));
+    const retained = request.pages.flatMap((page) => page.turns);
+    retained.forEach((turn, index) => applyHiddenTurnFields(turn, request.hidden?.[index], session.agent === 'codex'));
+    // Retained pages refresh together, and with the newest window when the host sends it last.
+    if (session.agent !== 'codex')
+      refreshRetainedClaudeAgentFacts(request.pages, agentSpendOf, agentSessionTargetOf, request.endsAtNewest === true);
     return {
       kind: 'retained',
       pages: request.pages.map((page) => {
@@ -1299,8 +1301,6 @@ async function execute(
             agentSpendOf,
             request.structuralAgentIds,
           );
-        } else {
-          refreshClaudeAgentFacts(page.turns, agentSpendOf, agentSessionTargetOf);
         }
         return { ...page, bytes: historyPageBytes(page) };
       }),

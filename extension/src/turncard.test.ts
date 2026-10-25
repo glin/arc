@@ -3,7 +3,12 @@
 import { test, vi } from 'vitest';
 import { ChildCacheExpiryAttribution } from './childcacheexpiry.ts';
 import { turnKey } from './domain/read.ts';
-import { emptyCacheExpiryFacts, publicProjectSpendPrice, type NativeChildCacheFacts } from './projectspend.ts';
+import {
+  CacheExpiryScan,
+  emptyCacheExpiryFacts,
+  publicProjectSpendPrice,
+  type NativeChildCacheFacts,
+} from './projectspend.ts';
 import { turnCacheExpiryWarning, type CacheExpiryWarning } from './turncard.ts';
 import assert from 'node:assert';
 import * as path from 'node:path';
@@ -26,6 +31,7 @@ import {
   readClaudeAgentSpend,
   readSession,
   refreshClaudeAgentFacts,
+  refreshRetainedClaudeAgentFacts,
   sessionStatFactsOf,
   stepDetail,
 } from './transcript.ts';
@@ -3581,15 +3587,25 @@ test('each subagent figure carries its own record and the row keeps the run line
 
 // Retained worker reads clone turns before refreshing child facts and clone the refreshed result before returning it.
 
+// The host sends the retained pages first and the newest window last, the way `refreshAgentFacts` sends them.
+function retainedWorkerPages(held: Turn[][], spend: Parameters<typeof refreshClaudeAgentFacts>[1]): Turn[][] {
+  const pages = held.map((turns) => {
+    const hidden = turns.map(hiddenTurnFields);
+    const page = structuredClone(turns);
+    page.forEach((turn, index) => applyHiddenTurnFields(turn, hidden[index], false));
+    return { turns: page };
+  });
+  refreshRetainedClaudeAgentFacts(pages, spend, undefined, true);
+  return pages.map(({ turns }) => {
+    const refreshed = turns.map(hiddenTurnFields);
+    const result = structuredClone(turns);
+    result.forEach((turn, index) => applyHiddenTurnFields(turn, refreshed[index], false));
+    return result;
+  });
+}
+
 function retainedWorkerRead(held: Turn[], spend: Parameters<typeof refreshClaudeAgentFacts>[1]): Turn[] {
-  const hidden = held.map(hiddenTurnFields);
-  const page = structuredClone(held);
-  page.forEach((turn, index) => applyHiddenTurnFields(turn, hidden[index], false));
-  refreshClaudeAgentFacts(page, spend, undefined);
-  const refreshed = page.map(hiddenTurnFields);
-  const result = structuredClone(page);
-  result.forEach((turn, index) => applyHiddenTurnFields(turn, refreshed[index], false));
-  return result;
+  return retainedWorkerPages([held], spend)[0];
 }
 
 // A growing finished child's transcript replaces its earlier fallback tool count.
@@ -6217,6 +6233,228 @@ test('a nested launch with no meta file or no transcript keeps the turn cost a f
     assert.equal(costChip(toCard(t, false, NOW)), priced, JSON.stringify(omit));
     assert.match(costDetail(t).join('\n'), /Some nested subagents are still running or left no record/);
   }
+});
+
+// Turn 1 launches a Haiku subagent, whose first request writes 1.6 million tokens to the
+// five-minute cache. Turn 2 is a short main-agent turn. Turn 3 starts ten minutes after the launch
+// and resumes the subagent. Its cache has expired, so its next request writes two million tokens
+// to the cache. One more subagent request runs after turn 3 ends and before turn 4 starts. The
+// main agent bills nothing.
+function resumedAgentSession(resume: 'SendMessage' | 'Agent' = 'SendMessage', launchRequest = true, laterTurn = true) {
+  const at = (second: number) => new Date(Date.UTC(2026, 0, 1, 0, 0, second)).toISOString();
+  const folder = tempDir('resumed-agent-');
+  const subagents = path.join(folder, 'sess', 'subagents');
+  fs.mkdirSync(subagents, { recursive: true });
+  const write = (file: string, records: object[]) =>
+    fs.writeFileSync(file, records.map((record) => JSON.stringify(record)).join('\n') + '\n');
+  const say = (id: string, second: number, stop: string, content: object[], usage: object, sidechain = false) => ({
+    type: 'assistant',
+    timestamp: at(second),
+    isSidechain: sidechain,
+    message: { role: 'assistant', id, model: 'claude-haiku-4-5', stop_reason: stop, content, usage },
+  });
+  const ask = (promptId: string, second: number, text: string, sidechain = false) => ({
+    type: 'user',
+    promptId,
+    timestamp: at(second),
+    isSidechain: sidechain,
+    message: { role: 'user', content: [{ type: 'text', text }] },
+  });
+  const result = (id: string, second: number, extra: object = {}) => ({
+    type: 'user',
+    timestamp: at(second),
+    message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: id, content: 'done' }] },
+    ...extra,
+  });
+  const reply = (id: string, second: number, text: string) =>
+    say(id, second, 'end_turn', [{ type: 'text', text }], none);
+  const none = { input_tokens: 0, output_tokens: 0 };
+  const cacheWrite = (tokens: number) => ({
+    input_tokens: 0,
+    cache_creation_input_tokens: tokens,
+    cache_creation: { ephemeral_5m_input_tokens: tokens, ephemeral_1h_input_tokens: 0 },
+    output_tokens: 0,
+  });
+  const resumeCall =
+    resume === 'SendMessage'
+      ? { type: 'tool_use', id: 'resume-1', name: 'SendMessage', input: { to: 'a1', message: 'Apply the review.' } }
+      : { type: 'tool_use', id: 'resume-1', name: 'Agent', input: { description: 'Planner' } };
+  write(path.join(folder, 'sess.jsonl'), [
+    ask('p1', 0, 'Draft the plan.'),
+    say(
+      'm1',
+      1,
+      'tool_use',
+      [{ type: 'tool_use', id: 'launch-1', name: 'Agent', input: { description: 'Planner' } }],
+      none,
+    ),
+    result('launch-1', 20, {
+      toolUseResult: { agentId: 'a1', status: 'completed', totalToolUseCount: 1, totalTokens: 3_200_000 },
+    }),
+    reply('m1-end', 21, 'Drafted.'),
+    ask('p2', 60, 'Name the file.'),
+    reply('m2-end', 61, 'Named.'),
+    ask('p3', 600, 'Apply the review.'),
+    say('m3', 601, 'tool_use', [resumeCall], none),
+    result('resume-1', 700, resume === 'Agent' ? { toolUseResult: { agentId: 'a1', status: 'completed' } } : {}),
+    reply('m3-end', 701, 'Applied.'),
+    ...(laterTurn ? [ask('p4', 900, 'Thanks.'), reply('m4-end', 901, 'Done.')] : []),
+  ]);
+  const child = path.join(subagents, 'agent-a1.jsonl');
+  write(child, [
+    ...(launchRequest
+      ? [ask('c1', 2, 'Draft the plan.', true), say('c1-reply', 10, 'end_turn', [], cacheWrite(1_600_000), true)]
+      : []),
+    ask('c2', 602, 'Apply the review.', true),
+    say('c2-reply', 610, 'tool_use', [], cacheWrite(2_000_000), true),
+    say('c3-reply', 750, 'end_turn', [], { input_tokens: 400_000, output_tokens: 0 }, true),
+  ]);
+  fs.writeFileSync(
+    path.join(subagents, 'agent-a1.meta.json'),
+    JSON.stringify({ agentType: 'general-purpose', description: 'Planner', toolUseId: 'launch-1' }),
+  );
+  const lookup = (launched: { id: string | null }) =>
+    readClaudeAgentSpend(path.join(subagents, `agent-${launched.id}.jsonl`));
+  const turns = readSession(path.join(folder, 'sess.jsonl'), 'sess', { agentSpendOf: lookup }).turns;
+  // The cache-expiry facts come from the subagent's own requests, the way the spend ledger scans them.
+  const scan = new CacheExpiryScan(undefined, () => true);
+  for (const request of readClaudeAgentSpend(child).requests ?? []) scan.push(request);
+  const childFacts = scan.ledger([]).facts;
+  const facts = {
+    sess: {
+      ...emptyCacheExpiryFacts(),
+      childSources: [
+        {
+          source: child,
+          childId: 'a1',
+          revision: {} as NativeChildCacheFacts['revision'],
+          facts: childFacts,
+          endedAt: null,
+          outcome: null,
+        },
+      ],
+    },
+  };
+  const warned = (all: Turn[]) => {
+    const costs = new ChildCacheExpiryAttribution().read(all, facts, NOW);
+    return all.map((turn) =>
+      Boolean(
+        toCard(
+          turn,
+          false,
+          NOW,
+          [],
+          null,
+          false,
+          new Set(),
+          [],
+          turnCacheExpiryWarning(turn, facts.sess, costs.get(turnKey(turn))),
+        )
+          .chips.find((chip) => chip.metric === 'cost')
+          ?.warnings?.some((item) => item.scope === 'cache-expiry'),
+      ),
+    );
+  };
+  return { turns, lookup, childFacts, warned };
+}
+
+const subagentLines = (turn: Turn) => costDetail(turn).filter((line) => line.startsWith('agent · '));
+
+test('a subagent resumed in a later turn shows in both turn cards, each priced by its own requests', () => {
+  const { turns, lookup, childFacts, warned } = resumedAgentSession();
+  assert.equal(childFacts.counts['5m'], 1, 'the fixture records one expired five-minute cache');
+  const check = () => {
+    const [first, second, third, fourth] = turns;
+    assert.deepEqual(warned(turns), [false, false, true, false], 'the warning sits on the turn that rebuilt the cache');
+    assert.equal(costChip(toCard(first, false, NOW)), '$2.00', 'the launching turn kept the resumed requests');
+    assert.deepEqual(subagentLines(first), ['agent · haiku-4-5: $2.00']);
+    assert.deepEqual(
+      [second.agents.length, fourth.agents.length],
+      [0, 0],
+      'a turn without subagent requests lists none',
+    );
+    assert.equal(third.agents.length, 1, 'the resuming turn lists the subagent once');
+    assert.equal(costChip(toCard(third, false, NOW)), '$2.90', 'the resuming turn total left out the subagent');
+    assert.deepEqual(
+      subagentLines(third),
+      ['agent · haiku-4-5: $2.90'],
+      'the resuming turn cost list left out a request',
+    );
+  };
+  check();
+  refreshClaudeAgentFacts(turns, lookup, undefined);
+  check();
+});
+
+test('retained history pages refreshed apart never price a subagent onto a turn without its requests', () => {
+  const { turns, lookup } = resumedAgentSession();
+  const [first, second, third, fourth] = turns;
+  refreshClaudeAgentFacts([first, second], lookup, undefined, false);
+  refreshClaudeAgentFacts([third, fourth], lookup, undefined, false);
+  assert.equal(second.agents.length, 0, 'the last turn of the older page took requests from a newer page');
+  assert.equal(third.agents.length, 0);
+  assert.deepEqual(
+    subagentLines(first),
+    ['agent · haiku-4-5: $4.90'],
+    'requests outside the page stay on the launching row',
+  );
+  refreshClaudeAgentFacts(turns, lookup, undefined, false);
+  assert.deepEqual(
+    [first, second, third, fourth].map(subagentLines),
+    [['agent · haiku-4-5: $2.00'], [], ['agent · haiku-4-5: $2.90'], []],
+    'pages refreshed together place each request in its own turn',
+  );
+});
+
+test('a child write refreshing the newest window keeps a request after the resuming turn ends on that turn', () => {
+  // Turn 3 is the newest turn, and the last subagent request runs after it ends.
+  const { turns: read, lookup, warned } = resumedAgentSession('SendMessage', true, false);
+  const turns = retainedWorkerRead(read, lookup);
+  const [first, second, third] = turns;
+  assert.deepEqual(warned(turns), [false, false, true], 'the warning sits on the turn that rebuilt the cache');
+  assert.deepEqual(subagentLines(second), []);
+  assert.deepEqual(subagentLines(first), ['agent · haiku-4-5: $2.00'], 'the launching row took the later request');
+  assert.deepEqual(subagentLines(third), ['agent · haiku-4-5: $2.90'], 'the resuming row lost the later request');
+  assert.equal(costChip(toCard(third, false, NOW)), '$2.90', 'the resuming turn total left out the later request');
+});
+
+test('a subagent launched on a retained page and resumed in the newest window prices each turn by its requests', () => {
+  const { turns, lookup, warned } = resumedAgentSession();
+  const [first, second, third, fourth] = turns;
+  // A history page and the newest window each read apart first.
+  refreshClaudeAgentFacts([first, second], lookup, undefined, false);
+  refreshClaudeAgentFacts([third, fourth], lookup, undefined);
+  assert.equal(third.agents.length, 0, 'the window read alone has no row for a subagent an older page launched');
+  // The page also holds a copy of the window's first turn. The cards show the window copy.
+  const [page, window] = retainedWorkerPages(
+    [
+      [first, second, structuredClone(third)],
+      [third, fourth],
+    ],
+    lookup,
+  );
+  const shown = [...page.slice(0, 2), ...window];
+  assert.deepEqual(warned(shown), [false, false, true, false], 'the warning sits on the turn that rebuilt the cache');
+  assert.deepEqual(
+    shown.map(subagentLines),
+    [['agent · haiku-4-5: $2.00'], [], ['agent · haiku-4-5: $2.90'], []],
+    'the resuming card lost the requests the warning places on it',
+  );
+  assert.equal(costChip(toCard(window[0], false, NOW)), '$2.90', 'the resuming turn total left out the subagent');
+  assert.equal(costChip(toCard(page[0], false, NOW)), '$2.00', 'the launching turn kept the resumed requests');
+});
+
+test('a subagent resumed by a second Agent call counts each of its requests once', () => {
+  const [first, , third] = resumedAgentSession('Agent').turns;
+  assert.equal(third.agents.length, 1);
+  assert.deepEqual([first, third].map(agentTokensOf), [1_600_000, 2_400_000]);
+});
+
+test('a launching turn whose subagent made no request in it shows no billed usage for that row', () => {
+  const [first, , third] = resumedAgentSession('SendMessage', false).turns;
+  assert.equal(agentTokensOf(first), 0, 'the launching row fell back to the subagent result token count');
+  assert.ok(costDetail(first).includes('agent: no billed usage'), 'the launching row lost its zero share');
+  assert.deepEqual(subagentLines(third), ['agent · haiku-4-5: $2.90']);
 });
 
 // A timed response: a request record, then two content blocks of one response. The first block

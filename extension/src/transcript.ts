@@ -1,5 +1,6 @@
 import { toolKind } from './domain/tool-kinds';
 import { revisionOf } from './filerevision';
+import { turnKey } from './domain/read';
 export { revisionOf } from './filerevision';
 import type { SourceEnumeration } from './sessioncoverage';
 import * as fs from 'node:fs';
@@ -34,9 +35,15 @@ import {
   heaviestModel,
   childSpendRevisionKey,
   modelSpends,
+  requestClock,
+  requestSpans,
   scanLines,
+  spanHolding,
   spendFileVersion,
+  usageTokens,
+  type AgentSpend,
   type AgentSpendRef,
+  type RequestSpan,
 } from './agentspend';
 import {
   ChildArtifacts,
@@ -202,6 +209,9 @@ export interface TurnAgent {
   // The parent record time that closed this child. It stays enumerable because the host
   // derives session outcome after the worker sends the parsed turn across structured clone.
   closedAt?: number;
+  // A row for a child that an earlier turn launched, such as one resumed with `SendMessage`.
+  // Its spend holds only the child requests this turn holds. `refreshClaudeAgentFacts` rebuilds it.
+  launchedEarlier?: true;
 }
 
 // Commit location relative to the open folders.
@@ -1248,7 +1258,8 @@ export function sessionOutcomeOf(read: SessionRead): TurnOutcome | null {
   // A recorded process end clears the tracked children.
   for (const turn of [...read.turns].sort((a, b) => a.startedAt - b.startedAt)) {
     for (const agent of turn.agents) {
-      if (!agent.id) {
+      // A row for a child an earlier turn launched carries only that turn's share of its cost.
+      if (!agent.id || agent.launchedEarlier) {
         continue;
       }
       if (agentIsRunning(agent)) {
@@ -9340,6 +9351,8 @@ interface ClaudeOwnSpend {
   // The summed request timing of this transcript's own turns. A subagent read and a dispatched read carry it. A nested read does not.
   outputRate?: OutputRate;
   outputRateModel?: string;
+  // Every request behind `byModel` and `usageParts`, kept only for a child transcript.
+  requests?: UsageEvent[];
 }
 
 // Own spend by file and parse inputs, checked against the file's own revision. A write to one
@@ -9533,6 +9546,7 @@ function readClaudeOwnSpend(
     finished: childTurns.at(-1)?.finished === true,
     record,
     ...measured,
+    ...(childTranscript ? { requests: [...byRequest, ...estimates] } : {}),
   };
   claudeOwnSpends.delete(key);
   claudeOwnSpends.set(key, own);
@@ -9562,6 +9576,7 @@ function readClaudeSpendTree(
   let partial = own.partial;
   const byModel = new Map(structuredClone(own.byModel));
   const usageParts = structuredClone(own.usageParts);
+  const requests = [...(own.requests ?? [])];
   if (own.launches.length) {
     const children = claudeDirectSubagents(file, childTranscript, metas);
     if (own.launches.some((id) => !children.some((meta) => meta.toolUseId === id))) {
@@ -9583,6 +9598,7 @@ function readClaudeSpendTree(
           addPricedUsagePart(usageParts, part);
         }
       }
+      for (const request of nested.spend.requests ?? []) requests.push(request);
     }
   }
   const models = modelSpends(byModel).map((spend) => ({
@@ -9599,7 +9615,16 @@ function readClaudeSpendTree(
       ? { outputRate: { ...own.outputRate }, outputRateModel: own.outputRateModel }
       : {};
   return {
-    spend: { models, ownModel, found: true, partial, effort: own.effort, ...rate, ...record },
+    spend: {
+      models,
+      ownModel,
+      found: true,
+      partial,
+      effort: own.effort,
+      ...rate,
+      ...record,
+      ...(childTranscript ? { requests } : {}),
+    },
     finished: own.finished,
   };
 }
@@ -12295,7 +12320,8 @@ export function createClaudeSessionReducer(
       for (const turn of completed.turns) {
         stampSessionTitle(turn, completed);
       }
-      refreshClaudeAgentFacts(completed.turns, opts.agentSpendOf, opts.agentSessionTargetOf);
+      // A history page's last completed turn has a later turn after it, outside this read.
+      refreshClaudeAgentFacts(completed.turns, opts.agentSpendOf, opts.agentSessionTargetOf, false);
       return completed.turns.map((turn, index) => ({
         turn,
         start: completed.turnRanges[index]?.start ?? 0,
@@ -12321,11 +12347,39 @@ export function createClaudeSessionReducer(
   };
 }
 
+// Refreshes the Claude subagent facts of retained pages in one split, so a child request on one page
+// can price onto a turn on another page. When `endsAtNewest` is true, the last page is the newest
+// window, and its last turn stays open the way the child cache-expiry warning keeps it open. A
+// turn that both a page and the window hold is split from its window copy, the copy the cards
+// show. The other copy keeps a split of its own.
+export function refreshRetainedClaudeAgentFacts(
+  pages: readonly { turns: Turn[] }[],
+  lookup: AgentSpendLookup | undefined,
+  targetOf: AgentSessionTargetLookup | undefined,
+  endsAtNewest: boolean,
+): void {
+  const shown = new Map<string, Turn>();
+  for (const page of pages) for (const turn of page.turns) shown.set(turnKey(turn), turn);
+  const copies = pages.flatMap((page) => page.turns.filter((turn) => shown.get(turnKey(turn)) !== turn));
+  refreshClaudeAgentFacts([...shown.values()], lookup, targetOf, endsAtNewest);
+  if (copies.length) refreshClaudeAgentFacts(copies, lookup, targetOf, false);
+}
+
+// `endsAtNewest` says that no later turn of the session follows the last of `turns`.
 export function refreshClaudeAgentFacts(
   turns: Turn[],
   lookup: AgentSpendLookup | undefined,
   targetOf: AgentSessionTargetLookup | undefined,
+  endsAtNewest = true,
 ): void {
+  if (lookup) {
+    for (const turn of turns) {
+      for (let at = turn.agents.length - 1; at >= 0; at--) {
+        if (turn.agents[at].launchedEarlier) turn.agents.splice(at, 1);
+      }
+    }
+  }
+  const timed: ChildRequests[] = [];
   for (const turn of turns) {
     for (const agent of turn.agents) {
       if (!agent.id) {
@@ -12398,8 +12452,127 @@ export function refreshClaudeAgentFacts(
       } else {
         delete agent.spendIncomplete;
       }
+      if (spend.requests?.length) {
+        timed.push({ turn, agent, spend });
+      }
     }
   }
+  shareChildSpendByTurn(turns, timed, endsAtNewest);
+}
+
+interface ChildRequests {
+  turn: Turn;
+  agent: TurnAgent;
+  spend: AgentSpend;
+}
+
+// Splits each child's spend across the turns that hold its requests, so a turn card prices a
+// child only by the requests in that turn. `requestSpans` and `spanHolding` place each request by
+// the rule that places child cache-expiry returns. When a later turn can follow the last of
+// `turns`, that last turn holds requests only until it ends. A request from outside this read then
+// never lands on a card that does not hold it. A child can have more than one parsed row, one for
+// each Agent call that resumes it. Its earliest row is the launching row, and that row keeps every
+// request that no turn from its own onward holds. Each turn's share goes to the first parsed row in
+// that turn, and the turn's other rows for the child get an empty share. A turn that holds
+// requests and has no parsed row for the child gets a new row.
+function shareChildSpendByTurn(turns: readonly Turn[], timed: readonly ChildRequests[], endsAtNewest: boolean): void {
+  if (!timed.length) return;
+  const spansBySession = new Map<string, RequestSpan<Turn>[]>();
+  const spansOf = (sessionId: string) => {
+    let spans = spansBySession.get(sessionId);
+    if (!spans) {
+      // The worker read has no session outcome, so each turn's cap is its own recorded process end.
+      spans = requestSpans(turns.filter((turn) => turn.sessionId === sessionId));
+      const last = spans.at(-1);
+      if (last && !endsAtNewest) {
+        last.cap = Math.min(last.cap, Math.max(last.start, last.turn.endedAt ?? last.start));
+      }
+      spansBySession.set(sessionId, spans);
+    }
+    return spans;
+  };
+  const byChild = new Map<string, ChildRequests[]>();
+  for (const entry of timed) {
+    const key = `${entry.turn.sessionId}:${entry.agent.id}`;
+    const rows = byChild.get(key);
+    if (rows) rows.push(entry);
+    else byChild.set(key, [entry]);
+  }
+  for (const rows of byChild.values()) {
+    rows.sort((a, b) => a.turn.startedAt - b.turn.startedAt);
+    const home = rows[0].turn;
+    const whole = rows[0].spend;
+    const spans = spansOf(home.sessionId);
+    const byTurn = new Map<Turn, UsageEvent[]>();
+    for (const request of whole.requests ?? []) {
+      const held = requestClock(request.timestamp) ? spanHolding(spans, request.timestamp)?.turn : undefined;
+      const holder = held && held.startedAt >= home.startedAt ? held : home;
+      const list = byTurn.get(holder);
+      if (list) list.push(request);
+      else byTurn.set(holder, [request]);
+    }
+    if (rows.length === 1 && byTurn.size === 1 && byTurn.has(home)) continue;
+    const priced = new Set<Turn>();
+    for (const { turn, agent } of rows) {
+      priceChildShare(agent, priced.has(turn) ? [] : (byTurn.get(turn) ?? []), whole);
+      priced.add(turn);
+    }
+    for (const [turn, held] of byTurn) {
+      if (priced.has(turn)) continue;
+      let source = rows[0].agent;
+      for (const row of rows) if (row.turn.startedAt < turn.startedAt) source = row.agent;
+      let startedAt = Infinity;
+      for (const request of held) startedAt = Math.min(startedAt, request.timestamp);
+      const row: TurnAgent = {
+        id: source.id,
+        ...(source.childSessionId ? { childSessionId: source.childSessionId } : {}),
+        description: source.description,
+        agentType: source.agentType,
+        model: source.model,
+        ...(source.ownModel ? { ownModel: source.ownModel } : {}),
+        effort: source.effort,
+        spend: [],
+        spendFound: true,
+        spendPartial: source.spendPartial,
+        startedAt,
+        durationMs: null,
+        tokens: null,
+        toolUses: null,
+        status: source.status,
+        launchedEarlier: true,
+      };
+      priceChildShare(row, held, whole);
+      turn.agents.push(row);
+    }
+  }
+}
+
+// Prices one row by its share of a child's requests. Every share takes its incomplete mark the
+// same way, from the whole read and from its own requests. An empty share also drops the token
+// count from the child's result. The row then reads as no billed usage in this turn, and the card
+// never counts the child's whole token total.
+function priceChildShare(agent: TurnAgent, requests: readonly UsageEvent[], whole: AgentSpend): void {
+  agent.spend = requestSpend(requests);
+  if (!requests.length) agent.tokens = null;
+  if (whole.usageIncomplete || requests.some((request) => request.incomplete)) agent.spendIncomplete = true;
+  else delete agent.spendIncomplete;
+}
+
+// Model spend for some of a child's requests, built the way `readClaudeSpendTree` builds the
+// whole figure. Model totals leave out estimated compactions, and usage parts include them. A
+// model that only an estimate used keeps a zero total, so the estimate's usage parts still price.
+function requestSpend(requests: readonly UsageEvent[]): ModelSpend[] {
+  const byModel = new Map<string | null, TurnUsage>();
+  const exact = { usageParts: [] as TurnUsagePart[] };
+  for (const request of requests) {
+    if (!request.compactionEstimate) addModelUsage(byModel, request.model, request.usage, request.contextBand);
+    else if (!byModel.has(request.model)) byModel.set(request.model, emptyUsage());
+    addTurnUsagePart(exact, request);
+  }
+  return [...byModel].flatMap(([model, usage]) => {
+    const usageParts = exact.usageParts.filter((part) => part.model === model);
+    return usageTokens(usage) > 0 || usageParts.length ? [{ model, usage, usageParts }] : [];
+  });
 }
 
 // Lines read from a known offset go in with their byte range, so a title record keeps its
