@@ -2,31 +2,31 @@
 
 ## Live session costs
 
-Seeing live session costs has been the one most effective thing for understanding agent costs. Very useful for understanding model differences, how caching works, effective orchestration patterns, and identifying runaway sessions early.
+Use live costs to compare models, understand caching, assess coordination patterns, and spot runaway sessions early.
 
-Unfortunately most tools either make costs hard to see or aren't granular enough to show breakdown by turn/subagent/etc.
+Most tools make costs hard to find or lack turn and subagent breakdowns.
 
 ### Claude Code CLI
 
-[ccstatusline](https://github.com/sirmalloc/ccstatusline) adds a live cost display and other stats to the status line. It doesn't show individual turn costs or everything from `/cost`, but it still helps a lot.
+[ccstatusline](https://github.com/sirmalloc/ccstatusline) adds live costs and other stats to the status line. It omits individual turn costs and some `/cost` details.
 
 ```sh
 npx -y ccstatusline@latest
 ```
 
-Useful fields to add: Model, Context Length, Cache Read, Cache Timer, and Session Cost.
+Add Model, Context Length, Cache Read, Cache Timer, and Session Cost.
 
 ```text
 Model: Sonnet 5 | Ctx: 69.1k | Cache Read: 63.5k (91.9%) | Cache: 54:48 | Cost: $0.28
 ```
 
-ccstatusline's cache timer defaults to 5 minutes, so make sure to bump it to one hour (select the Cache Timer widget in the ccstatusline editor and press `t`) to match the default cache timer on Claude subscriptions / Enterprise plans.
+ccstatusline's cache timer defaults to 5 minutes. For Claude subscriptions / Enterprise plans, match their one-hour default. Select Cache Timer in the ccstatusline editor and press `t`.
 
 ### Codex CLI
 
-Codex has a very limited status line with only a few preset fields, no custom status lines. On Bedrock, it's not possible to see costs in either `/status` or the status line. Use Posit Assistant or a separate tool like AgentsView instead. `agentsview session usage <session-id> --json` prices one Claude or Codex session, subagents included.
+Codex offers a few preset fields and no custom status lines. On Bedrock, it's not possible to see costs in either `/status` or the status line. Use Posit Assistant or a separate tool like AgentsView instead. `agentsview session usage <session-id> --json` prices one Claude or Codex session, subagents included.
 
-The status line still has useful stats though, so run `/statusline` and select useful fields like: model, context used, context window, used tokens, and rate limits. Or set them in `~/.codex/config.toml`:
+Run `/statusline` to select model, context used, context window, used tokens, and rate limits. Or set them in `~/.codex/config.toml`:
 
 ```toml
 [tui]
@@ -35,7 +35,7 @@ status_line = ["model-with-reasoning", "context-used", "context-window-size", "u
 
 ### Posit Assistant in Positron
 
-[Posit Assistant](https://positron.posit.co/assistant.html) shows live costs with turn-level breakdowns and very detailed tables/charts. I also recommend enabling always-shown turn costs in `~/.posit/assistant/settings.json`:
+[Posit Assistant](https://positron.posit.co/assistant.html) shows live costs, turn-level breakdowns, tables, and charts. Enable always-visible turn costs in `~/.posit/assistant/settings.json`:
 
 ```json
 {
@@ -46,11 +46,11 @@ status_line = ["model-with-reasoning", "context-used", "context-window-size", "u
 }
 ```
 
-We can't use Claude Enterprise plan with Posit Assistant, but OpenAI models work just fine with Bedrock.
+The Claude Enterprise plan cannot be used with Posit Assistant. OpenAI models work with Bedrock.
 
 ## Keep the cache warm
 
-Reusing cached context costs 1/10 the normal input price or less. Once the cache expires, the next request pays more than full price to cache the whole context again. The bigger the context, the more that costs.
+Reusing cached context costs 1/10 the normal input price or less. After cache expiry, the next request processes retained context at the input or cache-write rate. Larger context costs more.
 
 ### Default cache TTLs
 
@@ -62,7 +62,7 @@ Reusing cached context costs 1/10 the normal input price or less. Once the cache
 | Claude Code subagents | 5m |
 | Claude coordinator that waits on workers, started by Arc | 1h with `--cache-lifetime 1h` on `arc run` or `arc start` |
 
-A subagent cannot get the 1 hour lifetime from its caller. Without `--cache-lifetime`, a reader-owned session that Arc starts keeps `CLAUDE_CODE_PROMPT_CACHE_TTL` from its environment, which can name 5 minutes. When the environment does not set it, the session gets the lifetime of its billing row above. Use `--cache-lifetime 1h` when the session needs 1 hour.
+A subagent cannot get the 1 hour lifetime from its caller. Without `--cache-lifetime`, reader-owned Arc sessions inherit `CLAUDE_CODE_PROMPT_CACHE_TTL`, including a 5-minute value. Without that variable, the billing row above applies. Use `--cache-lifetime 1h` for a 1 hour lifetime.
 
 Claude Code's [prompt-caching guide](https://code.claude.com/docs/en/prompt-caching#which-ttl-each-request-gets) lists which requests get which lifetime and how to change it.
 
@@ -83,9 +83,9 @@ See Anthropic's [prompt-caching guide](https://code.claude.com/docs/en/prompt-ca
 
 ## Wait without repeated model requests
 
-Codex's built-in guidance limits blocking waits and asks for frequent commentary. A parent can follow that guidance by repeatedly sleeping while its subagent runs. Each return creates another model request with the retained context.
+Codex's built-in guidance limits blocking waits and requests frequent commentary. Repeated sleeps can satisfy that guidance but create a model request with retained context after each return.
 
-For Codex's v2 subagents, combine a native timeout floor with additional developer instructions. Put the root setting before table headings in `~/.codex/config.toml`. Merge existing developer text into that setting, because configuration precedence selects one value.
+For Codex v2 subagents, combine a native timeout floor with developer instructions. Put the root setting before table headings in `~/.codex/config.toml`. Merge existing developer text because configuration precedence selects one value.
 
 ```toml
 # Select native waiting and exempt it from periodic commentary.
@@ -100,9 +100,9 @@ max_wait_timeout_ms = 3600000
 
 Keep the floor below your model's documented cache lifetime to reduce expiry risk. Set the default at or above the minimum.
 
-The instruction adds guidance without replacing the built-in prompt. It depends on model compliance and reaches descendants. It leaves a child explicitly asked to sleep free to do so. Completion, messages, and steering still end a v2 wait early. The floor controls the requested timeout, not the minimum elapsed wait. It does not reach a parent that chooses a sleep or shell command.
+The instruction supplements the built-in prompt. It depends on model compliance and reaches descendants. Children explicitly asked to sleep remain free to do so. Completion, messages, and steering end a v2 wait early. The floor sets the requested timeout, not a minimum elapsed wait. It does not affect a parent's sleep or shell commands.
 
-Check a fresh process and session after installation. Confirm that its developer message contains the text and that its parent uses native waiting.
+In a fresh process and session, check that the developer message contains the text and the parent uses native waiting.
 
 The table configures the v2 protocol only. [The versioned v1 handler](https://github.com/openai/codex/blob/rust-v0.163.0/codex-rs/core/src/tools/handlers/multi_agents/wait.rs) uses fixed timeout constants. [The v2 handler](https://github.com/openai/codex/blob/rust-v0.163.0/codex-rs/core/src/tools/handlers/multi_agents_v2/wait.rs) reads the configured floor.
 
@@ -117,11 +117,11 @@ For native subagents, use multi_agent_v1.wait_agent with their targets. Request 
 """
 ```
 
-Merge existing developer text into the same value. This instruction depends on model compliance and reaches descendants. It does not create an enforced v1 timeout floor. Check default loading in a fresh process and session, without per-run instruction overrides.
+Merge existing developer text into the same value. The instruction depends on model compliance and reaches descendants. It enforces no v1 timeout floor. Check default loading in a fresh process and session without per-run overrides.
 
 Check the effective model catalog and exposed tools before choosing either recipe. Provider identity and `features.multi_agent_v2=false` alone do not establish the active protocol. For Bedrock setups requiring v1, confirm that the selected model's effective `multi_agent_version` is `v1`.
 
-When that catalog entry selects the wrong protocol, preserve the effective catalog and change only the required entry. Configure its absolute path through the root setting `model_catalog_json`. Preserve existing catalog overrides. A snapshot freezes provider metadata and bundled base instructions, so regenerate it and recheck the protocol after CLI upgrades. No catalog override is needed when the effective entry already selects the required protocol.
+If the catalog selects the wrong protocol, preserve it and change only the required entry. Set its absolute path with root setting `model_catalog_json`. Preserve existing catalog overrides. A snapshot freezes provider metadata and bundled base instructions, so regenerate it and recheck the protocol after CLI upgrades. No catalog override is needed when the effective entry already selects the required protocol.
 
 These instructions do not establish steering, cancellation, or resumed-session behavior for v1. Check those paths separately when your workflow needs them.
 
@@ -138,7 +138,7 @@ To `/compact` or hand off?
 | The task or phase changed                        | Write a handoff, then start a fresh session       |
 | The context is nearly full                       | Finish the current step, then compact or hand off |
 
-You can also have the agent suggest when to compact or hand off. Example `CLAUDE.md` snippet:
+To let the agent suggest boundaries, add this to `CLAUDE.md`:
 
 ```text
 Recommend compacting or a fresh session only at a real boundary: a finished piece of work, a large new task ahead, or a nearly full context. Never in the middle of an investigation.
@@ -155,7 +155,7 @@ Should we continue, compact, or hand off?
 
 ### Hand off
 
-To hand off to a fresh session, you can ask the agent to write a handoff doc or plan file for the next phase of work:
+Ask the agent to write a handoff doc or plan for the next phase:
 
 ```text
 Write a handoff doc for a fresh session to <project-handoff-file>.
@@ -164,15 +164,13 @@ Link to existing project files instead of copying them.
 Tell me the path, then stop.
 ```
 
-(maybe write a `/handoff` skill for this)
-
-Then start a new session or `/clear` the old one, and ask the agent to read the handoff doc/plan and continue working.
+Start a new session or `/clear` the old one. Ask the agent to read the handoff doc or plan and continue.
 
 ## Audit your agent sessions
 
 AgentsView has session stats and some session health metrics: https://www.agentsview.io/docs/session-intelligence/
 
-Agents are also good at analyzing their own transcripts and telling you about cost inefficient behaviors. Get your session ID with `/status` or similar, then (probably in a fresh session):
+Get the session ID with `/status` or an equivalent command. Ask an agent, preferably in a fresh session, to audit it:
 
 ```text
 Audit session <claude|codex>:<session-id> from its transcript.
@@ -195,7 +193,7 @@ Claude Code deletes local transcripts after 30 days. To compare spend across lon
 }
 ```
 
-There is no way to disable cleanup and `0` doesn't work, so you just have to set a really high value to keep transcripts around forever.
+Cleanup cannot be disabled. `0` does not disable it. A high value extends retention.
 
 Codex transcripts have no default expiry.
 
@@ -205,7 +203,7 @@ Anthropic's [Manage costs effectively](https://code.claude.com/docs/en/costs) co
 
 ### What makes a turn expensive
 
-A single prompt often leads to many model requests, one after each round of tool calls. Each request sends the whole context again: instructions, earlier messages, tool results, and attachments. Prompt caching lowers the price of that context, not its size.
+One prompt often triggers many model requests, one after each tool-call round. Each resends the whole context: instructions, earlier messages, tool results, and attachments. Prompt caching lowers its price, not its size.
 
 Ten requests that start at 100,000 tokens and grow by 10,000 each process 1.45 million input tokens. Each subagent adds its own context, requests, and cache.
 
@@ -221,10 +219,10 @@ Exact prices depend on the model. See [Anthropic pricing](https://platform.claud
 
 ### Other ways to cut cost
 
-- Use a less expensive model that can still complete the task. Delegate mechanical tasks to cheaper models if using subagents. Run A/B tests to learn what models are good at what task.
+- Use a cheaper model that can complete the task. Delegate mechanical tasks to cheaper subagents. Use A/B tests to match models to tasks.
 - Stop the agent or steer when it heads down the wrong path
 - Claude `/doctor`, audit unnecessary `CLAUDE.md`, MCP servers, repeated tool call failures
-- Ask subagents to keep their reports short. Everything a subagent returns stays in the main session's context, and every later request pays for it again.
+- Ask subagents for short reports. Their returns stay in the main context and add input cost to later requests.
 - If the main session does not need a task's details, run the task in a separate session instead of a subagent (or you can have agents launch headless `claude -p` or `codex exec` runs). Give it a self-contained prompt and have it write its result to a file or a commit.
 - Split a huge task into chunks instead of running it all in one session. A coordinating session hands each chunk to a subagent or a separate session and checks the results. Chunks can run in parallel, and each works in a small context. Tightly coupled work splits badly, because each chunk has to rebuild the shared context. Independent reading, separate files, and review work split well. The coordination still costs requests, so watch the coordinator's request count.
 - Cap spend on unattended runs. Claude Code print mode takes `--max-budget-usd` and `--max-turns`. A Codex `/goal` token budget is soft: it asks the model to wrap up but doesn't stop the run.
