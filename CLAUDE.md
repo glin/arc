@@ -8,7 +8,7 @@ Use Conventional Commits with a type and scope.
 
 Do not line wrap Markdown. One paragraph is one line, and one list item is one line. The editor wraps for reading.
 
-`docs/architecture.md` owns the component map, data sources, and non-obvious gotchas. Update it in the same commit when a change alters a component job, adds a data source, or introduces a gotcha. Keep other feature detail in code, tests, or `docs/design-goals.md`. Do not put repository inventories or counts in prose unless a test enforces them.
+`docs/components.md` owns component responsibilities. `docs/architecture.md` owns the system map, data sources, and non-obvious gotchas. Update the owning guide in the same commit when a change alters a component job, adds a data source, or introduces a gotcha. Keep other feature detail in code, tests, or `docs/design-goals.md`. Do not put repository inventories or counts in prose unless a test enforces them.
 
 Read [CLI instructions](cli/CLAUDE.md) for CLI changes, including command help and CLI documentation outside `cli/`. Read [extension instructions](extension/CLAUDE.md) for extension changes and tests.
 
@@ -78,6 +78,6 @@ Review each changed timing test's trigger, time-dependent fixture setup, and con
 
 ## Code boundaries
 
-Use the component map and ownership graph in `docs/architecture.md` when adding or moving a component. Do not maintain a separate component inventory here.
+Use `docs/components.md` and the package boundaries in `docs/architecture.md` when adding or moving a component. Do not maintain a separate component inventory here.
 
 Support Windows, macOS, and Linux. Test every platform branch.

@@ -27,7 +27,7 @@ If neither vendor published a version after its ledger version, report that noth
 Start one research subagent per vendor that moved, in the same message. Give each one:
 
 - The range: every version after the ledger version, through the latest stable.
-- The instruction to read `docs/architecture.md` in full, then check each candidate in the file that owns the surface. The Data sources table and the component map name the owners. Include the status line reader `cli/src/status.ts`, the hook registration in `scripts/register-hooks.js`, the launch flags, and `extension/src/pricing.ts`.
+- The instruction to read `docs/architecture.md` in full, then check each candidate in the file that owns the surface. The Data sources table and `docs/components.md` name the owners. Include the status line reader `cli/src/status.ts`, the hook registration in `scripts/register-hooks.js`, the launch flags, and `extension/src/pricing.ts`.
 - The open findings for that vendor from the ledger, so it reports a release that resolves or changes one.
 - The report shape below, under 900 words.
 

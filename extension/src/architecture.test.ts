@@ -4,7 +4,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { inventorySourceTree } from '../test/source-tree.ts';
 
-const DOC = path.join(__dirname, '..', '..', 'docs', 'architecture.md');
+const DOC = path.join(__dirname, '..', '..', 'docs', 'components.md');
 
 function tableNames(doc: string): string[] {
   const found: string[] = [];
