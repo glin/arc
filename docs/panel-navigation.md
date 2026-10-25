@@ -1,71 +1,115 @@
-# Panel navigation and links
+# Panel navigation
 
-Read this guide when changing navigation history, native context menus, file opening, response links, or panel hosting. [Panel accessibility](panel-accessibility.md) owns focus and keyboard contracts.
+Use this guide when changing navigation history, destination opening, native menus, or response links. [Panel accessibility](panel-accessibility.md) owns keyboard and screen-reader behavior.
 
 ## Back and forward
 
-`turnplaces.ts` holds the trail of places the reader visited. A place is a session. Content search runs from the session list box and draws its results in the timeline, so it opens no second kind of view and a place carries no query.
+A history place is a session, without a search query. Content search uses the timeline rather than a separate view.
 
-The provider stores navigation history across panel tabs. A window reload starts a new history at the restored session. Each panel retains its own visible session. Back and Forward move only the invoking panel. Every navigation route records its destination after `pickShowing` resolves the selected session. Session selection and history navigation share the same draft-abandonment rules.
+The provider shares history across panel tabs, but each panel keeps its own visible session. Back and Forward move only the invoking panel. A window reload starts history at the restored session. Record destinations after `pickShowing` resolves selection. History navigation follows selection's draft-abandonment rules.
 
-A session that disappears is pruned from the trail, and neighbours that become the same session fold into one press. A draft keeps its place across the rename from its invented id to the one the agent reports.
+`domain/places.ts` prunes missing sessions, collapses adjacent duplicates, and preserves a draft's place when its ID changes.
 
-Back and forward reach the reader by the mouse's fourth and fifth buttons, by the chords the editor binds to Go Back and Go Forward, and by two arrows in the Arc tab's own toolbar. Each route follows one rule. The panel's trail answers first. At its boundary, Back hands the press to the editor's Go Back and Forward hands it to Go Forward. Either command does nothing when the editor also reaches its boundary.
+Mouse buttons four and five, the editor's Go Back and Go Forward chords, and the Arc tab toolbar use the panel trail first. At a boundary, Back delegates to the editor's Go Back and Forward delegates to Go Forward. Either command does nothing when the editor also reaches its boundary.
 
-The panel handles the fourth and fifth mouse buttons inside its webview frame. Workbench mouse listeners do not receive those events. The panel cancels both press and release events. It respects the editor setting that disables mouse back and forward navigation.
-
-A navigation press is still an ordinary press to everything else on the page, so an open menu or a pinned float shuts under it the way it shuts under any other press.
+The webview cancels both mouse press and release events because workbench listeners do not receive them. Honor `workbench.editor.mouseBackForwardToNavigate`. Navigation presses also close open menus and pinned floats.
 
 ## Files, commits, and editor groups
 
-`turncard.ts` prepares file and commit rows. The panel displays normalized forward-slash paths but sends the recorded path back to the extension.
+### File destinations
 
-File rows open through the extension. Diff rows use the read-only URI providers in `uris.ts`. Ordinary opening prefers the active text-editor group outside the panel, then the leftmost visible text-editor group outside it. With neither, it reuses the panel group, or group one without a panel. Explicit split actions request another group. Whole-turn diff split actions reuse their previous group while it remains open and differs from the panel.
+Display paths use forward slashes. Actions send the recorded path. File rows open through the extension, and diff rows use read-only URI providers in `uris.ts`.
 
-Links in rendered responses follow their destination, and the extension tests each target in one order. A directory is revealed in the Explorer. A picture opens through `vscode.open`, which reaches the editor's own viewer. A local `.html` or `.htm` file opens in VS Code's integrated browser. A local `.mp4`, `.m4v`, `.mov`, `.webm`, `.avi`, or `.mkv` file opens through the operating system's default application. Video files use this route on Windows, macOS, and Linux. Video extensions match regardless of letter case. Video opening requires a default application and uses no editor group. Successful opening does not establish playback or codec support. A local `.md` or `.markdown` file opens in Markdown Preview in the requested editor group. Every other local file opens in the text editor. HTTP and HTTPS links open in the configured external browser.
+Normal opening prefers the active text-editor group outside the panel, then the leftmost visible text-editor group outside it. With neither, it reuses the panel group, or group one without a panel. Explicit split actions request another group. Whole-turn diff split actions reuse their previous group while it remains open and differs from the panel.
 
-Integrated-browser placement follows `workbench.browser.newTabPlacement`. VS Code applies workspace trust to local HTML navigation.
+Response links check local destinations in this order:
 
-Failed file checks report absence only for `FileNotFound`. Other file-check errors retain the target and error. Failures from the Explorer, image viewer, default application, or text editor retain the target and error. Relative paths try later workspace folders after those failures. A successful candidate ends opening without a failure notice. If the search exhausts its candidates, the notice retains the first access or opening failure instead of reporting absence. HTML and Markdown opening failures end the search with their dedicated notice, without opening raw text.
+1. Directories open in Explorer.
+2. Pictures open through `vscode.open` in the editor's viewer.
+3. `.html` and `.htm` files open in the integrated browser.
+4. `.mp4`, `.m4v`, `.mov`, `.webm`, `.avi`, and `.mkv` files open through the operating system's default application.
+5. `.md` and `.markdown` files open in Markdown Preview in the requested group.
+6. Other local files open in the text editor.
 
-Clicked local links can open files outside every workspace folder. Absolute paths need no open folder. Relative paths use open folders in order, including parent paths through `..`. Relative paths have no base in a folderless window. `#L42-L51` and `:42` select lines in text files. A trailing column in `:42:7` does not change that selection. Local links interpret non-HTTP/HTTPS addresses as filesystem paths, without executing other URI schemes.
+Video extensions match regardless of case on Windows, macOS, and Linux. Video opening needs a default application and uses no editor group. Successful opening does not establish playback or codec support. Integrated-browser placement follows `workbench.browser.newTabPlacement`, and VS Code applies workspace trust to local HTML. HTTP and HTTPS links open in the configured external browser.
 
-A commit row in a turn card's Commits section or commits chip popover shows the hash as a button only with a known repository directory. An unresolvable repository leaves the hash as text rather than opening the wrong tree. Pressing the button runs `git.openRepository` for that directory and then `git.viewCommit` for the commit. Arc shows an information message when VS Code has no `git.viewCommit` command or when the commit is no longer in the repository. A commit made outside the open workspace carries its repository name.
+Clicked local links can leave workspace folders. Absolute paths need no open folder. Relative paths try open folders in order, including `..`, and have no base in a folderless window. `#L42-L51` and `:42` select text-file lines. `:42:7` ignores the column. Other URI schemes become filesystem paths and never execute as schemes.
 
-A commit row keeps the branch read beside its commit details, or reports a detached HEAD. This distinguishes a temporary isolated-checkout commit from a later branch commit without merging rows that merely share a subject and statistics. A commit made in a worktree whose directory is named for that branch shows the branch and no place. Its hover names the subject, file count when known, and commit time.
+### Opening failures
 
-The file icon comes from the active icon theme when it can be resolved safely. `fileicons.ts` supplies a text badge fallback. The icon is decorative. The accessible name comes from the file row text.
+Only `FileNotFound` establishes absence. Other file-check errors and Explorer, picture, default-application, or text-editor failures retain the target and error. Relative paths continue through later workspace folders. A successful candidate ends opening without a failure notice. Exhausted candidates report the first access or opening failure before absence. HTML and Markdown failures stop with their dedicated notice and never open raw text.
+
+### Commit destinations
+
+A commit hash becomes a button only with a known repository directory. An unresolved repository leaves text. Opening runs `git.openRepository` before `git.viewCommit`. An unavailable command or missing commit produces an information message. Commits outside the workspace name their repository.
+
+Commit rows retain their recorded branch or detached HEAD. Rows with the same subject and statistics remain distinct. A worktree named for its branch shows the branch without a place. Commit hovers retain the subject, file count when known, and commit time.
+
+`fileicons.ts` supplies safe theme icons and fallback text badges. Icons remain decorative, and file-row text supplies accessible names.
 
 ## Context menus and copy
 
-Turn cards, session headings, session list rows, file links, and summary links identify themselves through context values. Menu enablement reads that context. The current selection elsewhere in the editor does not decide it.
+### Native context and menu order
 
-Ordinary turn and response summary links carry their rendered address, source session, and source turn in native context. Their menu offers Send to a new session with the same labels before Send to a new session. The first action snapshots every source label from the extension record. The second action copies no labels. Both actions keep the source setup and recorded working directory. Named session links suppress inherited turn, selection, comment, and copy actions. Compaction links retain Copy Path without source identity. HTTP and HTTPS links outside rendered Markdown tables keep the browser menu. Inside tables, they use Arc's native menu with Copy Link.
+Menu enablement reads the invoking turn card, session heading, session list row, file link, or summary link's context. Editor selection elsewhere supplies no target. Route commands to the panel that opened the menu.
 
-Selected response text offers the same two native menu actions in the same order. Both actions create an editable draft from the selected markdown, preserve source-turn navigation, and inherit the source setup and recorded working directory. Only the first action snapshots the source labels. A line opened without selected text offers neither action.
+Session menus order their groups as follows:
 
-A turn card, a compaction card, a session heading, and a session list card offer New session with the same labels with or without source labels. It needs no selected text. On a finished turn card it hides while the selection offers the Send entries. Send to a new session with the same labels then starts the new session with the selected text. A compaction card, a session heading, and a session list card carry no selectable response text, so selection never hides it there. A changed-file row and a rendered link inside a card keep their own menus and never offer it. It creates an empty draft with the source setup, the recorded working directory, and a snapshot of every source label. A draft has no recorded working directory, so a draft source gives the new draft its own. The new draft carries no source turn. Its reader-started parent is the source session. The card carries body-style native context, so its folded headline and figures name the source session without hiding default Copy. The head suppresses default items, and descendant file and link contexts keep their own menus. A right-click on a turn card arms the same host record as one on a session heading, so the draft opens only in the panel that opened the menu. During `/clear`, the native command resolves its source through the panel that opened the menu. It copies that panel's successor until the successor render is painted. A source with no working directory or no current setup creates nothing and shows a message instead.
+1. Pin, read, and archive toggles.
+2. Expand every shown turn and Collapse every shown turn, on headings only.
+3. Rename and Edit labels, with trailing ellipses.
+4. New session with the same labels.
+5. Copy session ID and Show session details.
+6. Export session as HTML, on saved headings only, with a trailing ellipsis.
 
-Session headings and session list cards share the triage, editing, session creation and details groups. Triage toggles come first. A session heading adds Expand every shown turn and Collapse every shown turn in a group of their own after triage. Entries that open an editor follow, titled with a trailing ellipsis. New session with the same labels comes next. Copy session ID and Show session details share the following group. A saved session heading adds Export session as HTML... in its final group. Inside a group, the most-used entry leads. Titles are short verb phrases that omit "this session".
+Use short verb phrases without “this session”. Put the most-used entry first within a group. Copy session ID copies the exact ID without opening details.
 
-The session heading's menu and the session list card's menu each carry pinning, the read state, archiving, Rename…, Edit labels…, New session with the same labels, Copy session ID, and Show session details, in that order. Copy session ID puts the row's exact session ID on the clipboard without opening Session details. Each entry reads the section its row names: the session list's three sections carry its read state and the heading's two sections carry its archived state. Rename… also reads the row's `sessionPersisted` value. The pin, read, and archive entries each show one direction, never both. The pin entries read the row's `sessionPinned` value to choose it. The heading's read entries read `sessionRead`, a word rather than a boolean so an entry offered on nothing markable is a key that is absent rather than one an editor's when clause reads the same as false. It is computed from the session's own turns and refreshed on every read change. The session list's read entries read its own section instead, and neither direction is offered on a row filed under the plain `arcRail` section, which names a session with no parsed turn to judge as read or unread. The session list's pin and archive entries also read `sessionArchived`, which the heading answers from its two sections instead. A pin, read, or archive command sends the named session and direction to the provider. The session list card's own hover controls send a pin or archive command the same way. The session heading's pin sends a pin command the same way with one press. It sets `aria-pressed` and draws in the notice tone while the session is pinned, and that tone is the heading's only pinned mark. Its accessible name stays the same in both states. An archived session's heading draws no pin. The heading's pin follows every route that changes the pin: its own press, the session list card's pin, `p` on a session list card, and the Pin and Unpin menu entries. The read state has no hover control of its own. Expand every shown turn reads `sessionTurnsShut` and Collapse every shown turn reads `sessionTurnsOpen`. Each key is present only while some shown turn with a body is shut or open. An entry that would change nothing is not offered. Both entries do what a Shift press on a turn head does in that direction, including marking the turns they open as read. The extension sends either entry only to the panel that opened the menu, because each panel keeps its own open turns.
+Offer only the applicable toggle direction. Heading `sessionRead` uses explicit words and stays absent when nothing is markable. Session list sections determine their read entries. Plain `arcRail` rows offer neither read direction. Rename requires `sessionPersisted`. Bulk turn entries require a shown turn with a body that their direction changes. Opening turns marks them read. Each panel owns its own open turns.
 
-Three routes open the heading's menu: right-click on a session heading, `Shift+F10` on a focused heading, and a press on the always-visible three-dots button beside the heading. A session list card opens its session menu from a right-click or `Shift+F10` on the card itself. The heading's button exists because the first two heading routes both depend on a pointer gesture or a chord many Mac readers have no key for. The button holds no state. A press dispatches a synthetic `contextmenu` event on the button. The event bubbles to the `.sessionrow` used by the other heading routes. Every heading route opens the same native menu entries. `Show session details` is one of them, and it opens from a session list card even for a session the timeline is not showing. The dialog it opens resolves the row by session id from every session the panel knows, keeps its copy actions during redraws, and returns focus to the control that opened it when it closes. It closes safely when that session leaves the panel. The extension routes the selected command only to the panel that opened the native menu.
+Read, pin, and archive actions update shared extension state and the affected surfaces together. Every menu action needs a keyboard route.
 
-Every menu action has a keyboard route. Actions that change read, pin, or archive state update the shared extension state and repaint the affected surfaces together.
+### New sessions from existing work
 
-Copy-path actions use one spelling prepared by the extension. Ordinary Markdown links receive native Copy Path context without target resolution or a workspace-containment check. [Literal file citations](#response-link-and-citation-contracts) retain their separate native actions.
+Ordinary turn and response summary file links offer Send to a new session with the same labels before Send to a new session. Selected response text offers the same entries. Both create editable drafts, retain source-turn navigation, and inherit the source setup and recorded working directory. Only the first snapshots every source label from extension state. Without selected text, a line offers neither selected-text action.
+
+Turn cards, compaction cards, headings, and session list cards offer New session with the same labels, even without source labels. It needs no selection. Selection hides it only on finished turn cards while Send entries apply. Changed-file rows and rendered links retain their own menus.
+
+This action creates an empty draft with the source setup, recorded directory, and all source labels. A draft source supplies its own directory. The new draft has no source turn and names the source session as its reader-started parent. A missing directory or current setup creates nothing and shows a message.
+
+During `/clear`, resolve the source through the invoking panel. Copy that panel's successor until its render is painted. Turn-card right-clicks must arm the same host ownership as heading right-clicks.
+
+### Link menus and copy paths
+
+Named session links suppress inherited turn, selection, comment, and copy actions. Compaction links retain Copy Path without source identity. HTTP and HTTPS links keep the browser menu outside Markdown tables. Inside tables, Arc supplies Copy Link.
+
+Copy-path actions use one extension-prepared spelling. Ordinary Markdown links receive native Copy Path context without target resolution or a workspace-containment check. [Literal citations](#response-link-and-citation-contracts) keep separate native actions.
+
+### Session details
+
+Headings open the same native menu through right-click, `Shift+F10`, or the always-visible three-dots button. Session list cards use right-click or `Shift+F10`. The button supplies a route for Mac readers without that chord.
+
+Show session details resolves its named session from every session the panel knows, including sessions outside the timeline. The dialog preserves copy actions during redraws, returns focus to its opener, and closes safely when its session leaves.
 
 ## Hosting the panel
 
-The Arc tab is an editor tab backed by a webview panel. Its shared extension state lets another tab or a restored tab open on the same session. A tab restored with obsolete panel options is replaced in the same editor column.
+The Arc tab is an editor tab backed by a webview panel. Shared extension state lets another or restored tab open the same session. Obsolete restored options require a replacement in the same column.
 
-Tests can verify the requested group but cannot verify what an existing VS Code window stored for an old tab. Changes to panel hosting need checks of new and restored tabs in the isolated editor.
+Hosting changes require checks of new and restored tabs in the [isolated editor](development.md#isolated-extension-host). Browser tests check requested groups but cannot read options stored for an existing tab.
 
 ## Response link and citation contracts
 
-File citations use a typed literal destination through response links and native copy actions. Native absolute files open after a reader press, including outside workspace folders. Ordinary Markdown links use local path candidates and optional line selection. Citation filenames retain percent signs and location-like suffixes. The directive scanner shares a four-code-unit allowance per source code unit across candidates and quotation modes. A source-order walk uses Marked tokenizers and mapped container positions to consume existing protection before eligible directives. Closing delimiters inside protected candidate text retain their Markdown meaning. HTML tokenizer state survives paragraph and container boundaries. Eligible directives consume their complete enclosing extent before Markdown splits tables or matches emphasis. Each admitted candidate uses one scanner call under the shared allowance. Container traversal follows summed container lengths outside that allowance. Malformed and incomplete enclosing candidates keep nested citations literal. The inline tokenizer adds the mask delimiter to Marked's text boundaries, preserving its URL and email rules. This rule depends on Marked's exposed breaks grammar. The reference tokenizer accepts its runtime link registry despite an array declaration. Source ranges exclude protected code, links, images, definitions, tags, and comments from masking. Disclosure parsing uses its narrower block and code ranges. Nonactionable masks restore escaped original source after rendering. Inert export identifies citations with full paths and no local actions. Transcript text stays unchanged.
+### Literal file citations
 
-Named response links use `arc-session:` and navigate inside the invoking panel. Resolution uses the current scoped authoritative catalog and hosted pending starts. Provider collisions refuse navigation. Missing catalog publication reports loading unless a unique scoped pending start resolves. Successful navigation releases only that panel's clear redirect for the destination. Invalid links leave selection and redirects unchanged. Pending starts remain hosted until the current scoped authoritative catalog admits their provider and raw session ID. Exported response links render inert labels.
+File citations carry typed literal destinations through response links and native copy actions. Reader presses open native absolute files, including files outside workspace folders. Preserve percent signs and location-like filename suffixes. Ordinary Markdown links retain path candidates and optional line selection.
 
-Collapsed headlines opt into session anchors through the inline renderer. Ordinary links and disclosure headings retain only link text. Headline extraction uses the Markdown literal parser to retain code-block context inside lists and blockquotes. Code-block examples remain literal. Headline HTML uses the response enhancement lifecycle for session navigation and native context masking.
+`domain/file-citation.ts` gives directive scanning one shared allowance of four code units per source code unit across candidates and quotation modes. `richtext.ts` consumes Markdown protection in source order before masking eligible directives. Preserve literal code, links, images, definitions, tags, and comments. Malformed or incomplete enclosing candidates keep nested citations literal. Container traversal lies outside the scanner allowance.
+
+Masked interiors must precede table splitting and emphasis matching. Marked's exposed breaks grammar supplies mask boundaries without changing URL or email rules. Nonactionable masks restore escaped original source. Export renders full citation paths without local actions. Transcript text stays unchanged.
+
+### Named session links
+
+`arc-session:` links navigate inside the invoking panel. Resolve against the current scoped authoritative catalog and hosted pending starts. Provider collisions refuse navigation. Missing catalog publication reports loading unless a unique scoped pending start resolves.
+
+Successful navigation releases only the invoking panel's clear redirect for the destination. Invalid links preserve selection and redirects. Pending starts stay hosted until the current scoped catalog admits their provider and raw session ID. Exports retain inert labels.
+
+Collapsed headlines explicitly enable session anchors. Ordinary headline links and disclosure headings retain link text alone. Headline extraction preserves literal code-block examples inside lists and blockquotes. Headline HTML uses response enhancement for navigation and native context masking.
