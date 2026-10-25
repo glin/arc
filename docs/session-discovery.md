@@ -22,6 +22,8 @@ Scope reads ask Git again after 15 seconds. Additions apply immediately. A remov
 
 Open folders always remain. Published roots omit registered worktrees inside another root, while removal confirmation uses unfiltered per-folder answers. A hidden nested root becomes published when its containing root leaves. Opening a subfolder retains its enclosing repository root. Nested-only changes move no scope revision and cancel no selection.
 
+Registered checkout identities retain nested worktrees independently of discovery roots. Identity changes alone refresh heading metadata without moving discovery revision or cancelling selection. Each panel compares its selected session's opening folder with its first workspace folder through the most specific registered checkout. Unknown identities omit the starting worktree.
+
 Containment requires a path boundary. Windows drive paths compare without case on every host. Other paths compare without case on Windows and retain case on macOS and Linux. Removed worktree registration and a removed worktree leave an old working directory without repository evidence.
 
 Continuing a session, compacting it, and handing off responses or selected text use its recorded working directory. The ordinary New launcher uses the editor's open folder. Queued submissions and pending rows wait outside scope and resume when scope returns. Workspace changes revoke scope even with every panel closed.
