@@ -287,7 +287,7 @@
   "scripts/editor-cli.test.js": {
     "reason": "Editor launch and installer shell commands must preserve quoting, cancellation, native entry selection, existing dependencies, lockfile reconciliation, and component outcomes. Commit installs must select frozen source and preserve the checkout and index.",
     "cases": 60,
-    "matricesSha256": "a4e2d91efad1351e68e7897a50410c6cd51c47e74cfceb4160d3da45ff52248d"
+    "matricesSha256": "f98d8d54c54d907cb8a5453747a1e00ac47ce39470aba884935cd6c44d291a47"
   },
   "scripts/extension-test-runner.test.js": {
     "reason": "Real runner commands must classify files, reject invalid selection, and preserve browser readiness status.",
