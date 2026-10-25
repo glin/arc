@@ -428,9 +428,11 @@ test('oversized complete and fragmented UTF-8 lines close before parsing', { tag
   const fragmented = JSON.stringify(request(entry, { requester: 'é'.repeat(128) })) + '\n';
   for (const chunks of [[complete], [fragmented.slice(0, 180), fragmented.slice(180)]]) {
     assert.equal(Buffer.byteLength(chunks.join('')) > 256, true);
-    const socket = await connect(entry.address);
+    const target =
+      chunks[0] === complete ? entry : (await fixture({ ...SESSION_REQUEST_LIMITS, lineBytes: 256 }, handler)).entry;
+    const socket = await connect(target.address);
     const ended = closed(socket);
-    for (const chunk of chunks) socket.write(chunk);
+    for (const chunk of chunks) socket.write(chunk.replace(entry.token, target.token));
     await ended;
   }
   assert.equal(handler.mock.calls.length, 0);

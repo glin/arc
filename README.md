@@ -101,7 +101,7 @@ Session links in agent responses open in Arc. Export a session and its linked se
 
 ## Let agents use Arc
 
-Either agent can start Claude Code or Codex sessions from a shell command. The parent turn lists each dispatched session with its cost, and its name opens that session.
+Either agent can start Claude Code or Codex sessions from a shell command. The dispatched session appears in Arc's session list, and its parent turn shows it with its cost. The name on the parent turn opens that session.
 
 The [`arc-sessions` skill](docs/arc-sessions.md) lets agents start sessions in Arc, read their results, and send follow-ups. Agents can also label, pin, and archive sessions, queue a compaction of their own session for after the turn, and estimate costs with `arc cost`.
 
@@ -112,10 +112,12 @@ Report results, blockers, and decisions needing my input.
 ```
 
 ```text
-Use Arc to start a Codex session reviewing this branch.
+Claude, use Arc to start a Codex session reviewing this branch.
 Name it Branch review, apply Review, and pin it.
 Read its result and summarize its findings.
 ```
+
+See [Dispatch and message agents](cli/README.md#dispatch-and-message-agents) for the command.
 
 ```text
 After saving the handoff,

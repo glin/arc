@@ -32,7 +32,7 @@ import { compatibleDiscovery, discoveryCompatibility } from './progressiveworker
 import { claudeDispatchTranscript } from './turnfixtures';
 import { sessionCoverageMember, sessionPresence, reconcileSessionCollisions } from './sessioncoverage';
 import { sessionSourceKey, sessionPageSources, guardedSourceRevision } from './sessionreads';
-import { afterEach, beforeAll, test, vi } from 'vitest';
+import { afterAll, afterEach, beforeAll, test, vi } from 'vitest';
 import { pendingResponseSessionAdmitted, resolveResponseSession } from './domain/session-link';
 import { createPanelVisibility } from './panelvisibility';
 import { outcomesFor } from './timelinestate';
@@ -4954,7 +4954,10 @@ function titleRollout(directory: string, id: string, title: string, bytes = 0): 
 }
 
 let titleWorkerSource: string;
+let previousArcHome: string | undefined;
 beforeAll(() => {
+  previousArcHome = process.env.ARC_HOME;
+  process.env.ARC_HOME = tempDir('startup-fixture-home-');
   titleWorkerSource = buildSync({
     entryPoints: [path.join(__dirname, 'progressiveworker-entry.ts')],
     bundle: true,
@@ -4968,6 +4971,11 @@ beforeAll(() => {
 function titleWorker(extraSource = '') {
   return new ProgressiveWorker(titleWorkerSource + extraSource);
 }
+
+afterAll(() => {
+  if (previousArcHome === undefined) delete process.env.ARC_HOME;
+  else process.env.ARC_HOME = previousArcHome;
+});
 
 test('a recovered Codex title reaches the rail when later enrichment fails', async () => {
   const directory = tempDir('title-publication-');
@@ -9741,6 +9749,7 @@ test('warm demotion racing a late append recovers through host checking and reop
 
 test('unwatched transcript appends beyond the cap recover in one warm or cold pass', async () => {
   vi.useFakeTimers();
+  vi.setSystemTime(new Date('2026-10-01T12:00:00Z'));
   let openWatches = 0;
   let maximumWatches = 0;
   const nativeWatch = vi.spyOn(mutableFs, 'watch').mockImplementation((() => {
@@ -9755,7 +9764,22 @@ test('unwatched transcript appends beyond the cap recover in one warm or cold pa
     };
   }) as any);
   syncBuiltinESMExports();
-  const provider = integrityHostHarness();
+  const ownedFiles = new Set<string>();
+  const unmappedFiles: string[] = [];
+  const stat = (file: string, options: { bigint: true }) => {
+    if (!ownedFiles.has(normalizeFsPath(file))) {
+      unmappedFiles.push(file);
+      throw new Error(`Integrity stat escaped the fixture: ${file}`);
+    }
+    return fs.statSync(file, options);
+  };
+  const provider = integrityHostHarness({
+    fs: {
+      watch: mutableFs.watch,
+      statSync: stat,
+      promises: { stat: async (file: string, options: { bigint: true }) => stat(file, options) },
+    },
+  });
   try {
     const root = tempDir('spend-watch-cap-');
     const files = Array.from({ length: 258 }, (_, index) => {
@@ -9763,6 +9787,8 @@ test('unwatched transcript appends beyond the cap recover in one warm or cold pa
       fs.mkdirSync(folder);
       const file = normalizeSpendFile(path.join(folder, 'session.jsonl'));
       fs.writeFileSync(file, '{}\n');
+      fs.utimesSync(file, Date.now() / 1000, Date.now() / 1000);
+      ownedFiles.add(normalizeFsPath(file));
       return file;
     });
     const records = files.map((file) => indexSpendFile(undefined, file, 'project', createCodexUsageLineReducer).record);
@@ -9793,6 +9819,8 @@ test('unwatched transcript appends beyond the cap recover in one warm or cold pa
     assert.equal(provider.watchers.has(path.dirname(cold)), false);
     fs.appendFileSync(warm, '{}\n');
     fs.appendFileSync(cold, '{}\n');
+    fs.utimesSync(warm, Date.now() / 1000, Date.now() / 1000);
+    fs.utimesSync(cold, Date.now() / 1000, Date.now() / 1000);
     provider.refreshFrom = () => {};
     await vi.advanceTimersByTimeAsync(30_000);
     await vi.waitFor(() =>
@@ -9817,6 +9845,7 @@ test('unwatched transcript appends beyond the cap recover in one warm or cold pa
     assert.equal(openWatches, 0);
     assert.equal(maximumWatches, 256, 'replacement opened watchers before releasing their allocation');
     assert.ok(nativeWatch.mock.results.every((result) => result.value.close.mock.calls.length === 1));
+    assert.deepEqual(unmappedFiles, [], 'Integrity stat escaped the fixture.');
   } finally {
     provider.stopPolling();
     nativeWatch.mockRestore();

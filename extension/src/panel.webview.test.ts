@@ -1338,7 +1338,7 @@ import { readCodexContext } from './codexcontext';
 import { normalizeContext, unavailableContext } from './domain/context-detail';
 import { drawContextDetail } from './webview/context-detail';
 
-import { beforeAll, test, vi } from 'vitest';
+import { afterAll, beforeAll, test, vi } from 'vitest';
 import { SessionNames } from './sessionnames.ts';
 import {
   carryDerivedTitleFacts,
@@ -2261,8 +2261,16 @@ let PanelProvider: typeof import('./panelhost.ts').PanelProvider;
 import { SessionReadObservations } from './sessionwrites.ts';
 import { AgentReadSources } from './sessionreads.ts';
 import { createReadState } from './webview/read-state.ts';
+let previousArcHome: string | undefined;
 beforeAll(async () => {
+  previousArcHome = process.env.ARC_HOME;
+  process.env.ARC_HOME = tempDir('panel-fixture-home-');
   ({ PanelProvider } = await import('./panelhost.ts'));
+});
+
+afterAll(() => {
+  if (previousArcHome === undefined) delete process.env.ARC_HOME;
+  else process.env.ARC_HOME = previousArcHome;
 });
 
 function orderedHostReadFixture(productionSender = false) {

@@ -4404,7 +4404,8 @@ test('stable partial Codex parents yield to a later dispatch and resume after an
     return { agent: 'codex' as const, file, sessionId: `parent-${index}`, size: stat.size, mtimeMs: stat.mtimeMs };
   });
   const childStat = revisionOf(fs.statSync(child, { bigint: true }));
-  const worker = new ProgressiveWorker(dispatchWorkerSource(36));
+  // Byte allowances bound discovery while the parent resumes after an append.
+  const worker = new ProgressiveWorker('performance.now=()=>0;' + dispatchWorkerSource(36));
   try {
     const request = {
       kind: 'claude-children' as const,
@@ -4502,7 +4503,9 @@ test('a completed Codex parent defers later growth until the next refresh reads 
   const parts = source.split('found = walk();');
   assert.equal(parts.length, 3, 'the worker no longer walks once before and once after its parent scans');
   const grow = `if (require('node:fs').existsSync(${JSON.stringify(mutate)})) { require('node:fs').appendFileSync(${JSON.stringify(file)}, ${JSON.stringify(launch)}); require('node:fs').unlinkSync(${JSON.stringify(mutate)}); }`;
-  const worker = new ProgressiveWorker(parts[0] + 'found = walk();' + parts[1] + grow + 'found = walk();' + parts[2]);
+  const worker = new ProgressiveWorker(
+    'performance.now=()=>0;' + parts[0] + 'found = walk();' + parts[1] + grow + 'found = walk();' + parts[2],
+  );
   const childStat = revisionOf(fs.statSync(child, { bigint: true }));
   const request = (referenceEntries?: unknown) => {
     const stat = revisionOf(fs.statSync(file, { bigint: true }));
@@ -5389,7 +5392,7 @@ test('a restart rediscovers PowerShell receipts from old complete and visited-EO
     for (const referenceEntries of [[[file, entry]], [...restored]] as Array<
       Array<[string, import('./derivedcache').ClaudeChildReferenceCacheEntry]>
     >) {
-      const worker = new ProgressiveWorker(source);
+      const worker = new ProgressiveWorker('performance.now=()=>0;' + source);
       try {
         const found = await discoveryState(worker, { ...request, referenceEntries }, 1, new AbortController().signal);
         assert.equal(found?.value.kind, 'claude-children');

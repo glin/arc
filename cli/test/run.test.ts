@@ -282,11 +282,13 @@ function smallBounds() {
 function frozenRuntime() {
   return { now: () => 0, identity: async () => null, yield: () => Promise.resolve() };
 }
-function claudePrintFixture() {
+function claudePrintFixture(ownedConfig = false) {
   const { home, args } = fixture();
+  if (ownedConfig) fs.mkdirSync(path.join(home, '.git'));
   const parsed = parseRun([...withProvider(args, 'claude'), '--read-only'], {
     CLAUDE_BIN: process.execPath,
     ARC_PROJECTS_ROOT: path.join(home, 'projects'),
+    ...(ownedConfig ? { CLAUDE_CONFIG_DIR: path.join(home, 'claude') } : {}),
   });
   const options = parsed.options;
   const file = path.join(options.env!.ARC_PROJECTS_ROOT!, projectSlug(home), `${options.sessionHint}.jsonl`);
@@ -4417,7 +4419,7 @@ test.each([
   'binding unavailable',
 ] as const)('Claude print continuity validates reports with %s', async (state) => {
   vi.useFakeTimers();
-  const { home, parsed, options, file, receipts, launch, child } = claudePrintFixture();
+  const { home, parsed, options, file, receipts, launch, child } = claudePrintFixture(true);
   const original =
     JSON.stringify({
       type: 'user',
@@ -4639,6 +4641,12 @@ test.each([
   } finally {
     child.emit('close', 0, null);
     await supervised;
+    assert.ok(
+      vi
+        .mocked(fs.statSync)
+        .mock.calls.every(([target]) => String(target) === home || String(target).startsWith(home + path.sep)),
+      'Claude source stat escaped the fixture.',
+    );
   }
 });
 
@@ -4780,7 +4788,17 @@ test.each([
 ] as const)('explicit %s log is live before completion with %s final evidence', async (provider, nativeState) => {
   const { home, args } = fixture();
   const log = path.join(home, 'output.log');
-  const parsed = parseRun([...withProvider(args, provider), '--read-only', '--log', log]);
+  const parsed = parseRun([...withProvider(args, provider), '--read-only', '--log', log], {
+    CODEX_BIN: process.execPath,
+    CLAUDE_BIN: process.execPath,
+    ARC_CODEX_ROOT: path.join(home, 'codex'),
+    ARC_PROJECTS_ROOT: path.join(home, 'projects'),
+  });
+  const openDirectory = fs.promises.opendir;
+  const liveLogSourceDirectories = vi.spyOn(fs.promises, 'opendir').mockImplementation((directory, ...args) => {
+    assert.ok(String(directory).startsWith(home + path.sep), `Session source escaped the fixture: ${directory}`);
+    return Reflect.apply(openDirectory, fs.promises, [directory, ...args]);
+  });
   const receipts = new DispatchReceipts(home);
   const launch = admitParsed(receipts, parsed, parsed.alias);
   const child = providerChild();
@@ -4827,6 +4845,10 @@ test.each([
     if (nativeState === 'malformed') fs.writeSync(descriptors[1], Buffer.from('malformed source\n'));
     child.emit('close', 0, null);
     await pending;
+    assert.ok(
+      liveLogSourceDirectories.mock.calls.every(([directory]) => String(directory).startsWith(home + path.sep)),
+      'Session source escaped the fixture.',
+    );
     assert.deepEqual(
       fs.readFileSync(receipts.artifact(launch.launchId, 'stdout.log')),
       Buffer.concat([opening, ending, ...(nativeState === 'malformed' ? [Buffer.from('malformed source\n')] : [])]),
