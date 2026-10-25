@@ -1341,6 +1341,7 @@ function policyCallbacks(host: AgentHost, policies: LaunchPolicyStore) {
     initialNamesChanged() {},
     refresh() {},
     noteSessionMoved: (source: string, next: string) => moves.push([source, next]),
+    noteRemoteControlOff() {},
     setCodexEffectiveMode: (...args: unknown[]) => modes.push(args),
   };
   const at = source.indexOf("      if (event.kind === 'session') {\n        const policy =");
@@ -11937,7 +11938,9 @@ function extensionRemoteControl(host: AgentHost) {
   const at = source.indexOf('  panel.onRemoteControl = async (session, observer) => {');
   assert.notEqual(at, -1, 'extension.ts no longer wires Remote Control where this test reads it');
   const end = source.indexOf('\n  };\n', at) + '\n  };\n'.length;
-  const panel: { onRemoteControl?: (session: string, observer: () => void) => Promise<unknown> } = {};
+  const panel: {
+    onRemoteControl?: (session: string, observer: (...delivered: unknown[]) => void) => Promise<unknown>;
+  } = {};
   runInNewContext(source.slice(at, end), { host, panel });
   return panel.onRemoteControl!;
 }
@@ -12045,18 +12048,21 @@ test('Remote Control reaches only the live child of its own session, before and 
   const toggle = extensionRemoteControl(host);
   const on = toggle('sess-2', () => {});
   await answerRemoteControl(second, 1, { session_url: 'https://example.test/two', bridge_epoch: 2 });
-  assert.deepEqual(await on, { outcome: 'connected', url: 'https://example.test/two', late: false });
+  assert.deepEqual(await on, {
+    result: { outcome: 'connected', url: 'https://example.test/two', late: false },
+    session: 'sess-2',
+  });
   assert.equal(remoteControlRequests(first).length, 0, "another session's child received the toggle");
   const firstOn = toggle('sess-1', () => {});
   await answerRemoteControl(first, 1, { bridge_epoch: 1 });
-  assert.deepEqual(await firstOn, { outcome: 'connected', url: null, late: false });
+  assert.deepEqual(await firstOn, { result: { outcome: 'connected', url: null, late: false }, session: 'sess-1' });
   const firstOff = toggle('sess-1', () => {});
   await answerRemoteControl(first, 2);
-  assert.deepEqual(await firstOff, { outcome: 'disconnected', late: false });
+  assert.deepEqual(await firstOff, { result: { outcome: 'disconnected', late: false }, session: 'sess-1' });
   assert.equal(remoteControlRequests(second).length, 1, "another session's child received the toggle");
   // Claude /clear gives the connected child a new local session id.
   second.say(JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sess-2b' }) + '\n');
-  assert.deepEqual(await toggle('sess-2', () => {}), { outcome: 'stopped' });
+  assert.deepEqual(await toggle('sess-2', () => {}), { result: { outcome: 'stopped' }, session: null });
   settle(host, 'one');
   settle(host, 'two');
   await tick();
@@ -12065,10 +12071,118 @@ test('Remote Control reaches only the live child of its own session, before and 
   assert.notEqual(host.get('two'), null, 'the session id change lost the connection hold');
   const off = toggle('sess-2b', () => {});
   await answerRemoteControl(second, 2);
-  assert.deepEqual(await off, { outcome: 'disconnected', late: false });
-  assert.deepEqual(await toggle('sess-1', () => {}), { outcome: 'stopped' });
-  assert.deepEqual(await toggle('missing', () => {}), { outcome: 'stopped' });
+  assert.deepEqual(await off, { result: { outcome: 'disconnected', late: false }, session: 'sess-2b' });
+  assert.deepEqual(await toggle('sess-1', () => {}), { result: { outcome: 'stopped' }, session: null });
+  assert.deepEqual(await toggle('missing', () => {}), { result: { outcome: 'stopped' }, session: null });
   assert.equal(children.length, 2, 'a Remote Control toggle started a process');
+});
+
+// One `if` statement from the extension's host callbacks, the one that makes the named panel call.
+function extensionStatement(call: string, ...names: string[]): (...values: unknown[]) => void {
+  const source = fs.readFileSync(path.join(__dirname, 'extension.ts'), 'utf8');
+  const at = source.indexOf(call);
+  assert.notEqual(at, -1, `extension.ts no longer calls ${call} where this test reads it`);
+  const start = source.lastIndexOf('if (', at);
+  const end = source.indexOf(';\n', at) + 1;
+  const statement = source.slice(start, end);
+  return (...values: unknown[]) =>
+    runInNewContext(statement, Object.fromEntries(names.map((name, index) => [name, values[index]])));
+}
+
+test('a late Remote Control result names the session the child holds after a Claude clear', async () => {
+  const fixture = fakeHost(undefined, undefined, { idleDurationMs: 120, timer: new FakeAgentHostTimer() });
+  const child = await openRemoteControlChild(fixture, 'one', 'sess-1');
+  const toggle = extensionRemoteControl(fixture.host);
+  const later: unknown[][] = [];
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+  try {
+    const pending = toggle('sess-1', (...delivered: unknown[]) => later.push(delivered));
+    await vi.waitFor(() => assert.equal(remoteControlRequests(child).length, 1));
+    await vi.advanceTimersByTimeAsync(CONTROL_DEADLINE_MS);
+    assert.deepEqual(await pending, { result: { outcome: 'uncertain' }, session: 'sess-1' });
+  } finally {
+    vi.useRealTimers();
+  }
+  child.say(JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sess-1b' }) + '\n');
+  await answerRemoteControl(child, 1, { session_url: 'https://example.test/one', bridge_epoch: 1 });
+  await vi.waitFor(() =>
+    assert.deepEqual(later, [[{ outcome: 'connected', url: 'https://example.test/one', late: true }, 'sess-1b']]),
+  );
+});
+
+test('a Remote Control reply that arrives after a Claude clear names the new session id, on and off', async () => {
+  const fixture = fakeHost(undefined, undefined, { idleDurationMs: 120, timer: new FakeAgentHostTimer() });
+  const child = await openRemoteControlChild(fixture, 'one', 'sess-1');
+  const toggle = extensionRemoteControl(fixture.host);
+  const on = toggle('sess-1', () => {});
+  await vi.waitFor(() => assert.equal(remoteControlRequests(child).length, 1));
+  child.say(JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sess-1b' }) + '\n');
+  await answerRemoteControl(child, 1, { session_url: 'https://example.test/one', bridge_epoch: 1 });
+  assert.deepEqual(await on, {
+    result: { outcome: 'connected', url: 'https://example.test/one', late: false },
+    session: 'sess-1b',
+  });
+  const off = toggle('sess-1b', () => {});
+  await vi.waitFor(() => assert.equal(remoteControlRequests(child).length, 2));
+  child.say(JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sess-1c' }) + '\n');
+  await answerRemoteControl(child, 2);
+  assert.deepEqual(await off, { result: { outcome: 'disconnected', late: false }, session: 'sess-1c' });
+});
+
+test('a connected reply for a child that retired while it waited names no session', async () => {
+  const calls: unknown[][] = [];
+  const panel = { noteRemoteControlOff: (...args: unknown[]) => calls.push(['off', ...args]) };
+  const exited = extensionStatement('panel.noteRemoteControlOff(', 'panel', 'state');
+  const fixture = fakeHost(undefined, undefined, {
+    idleDurationMs: 120,
+    timer: new FakeAgentHostTimer(),
+    onStateChange: (state) => exited(panel, state),
+  });
+  const child = await openRemoteControlChild(fixture, 'one', 'sess-1');
+  const toggle = extensionRemoteControl(fixture.host);
+  settle(fixture.host, 'one');
+  const on = toggle('sess-1', () => {});
+  await vi.waitFor(() => assert.equal(remoteControlRequests(child).length, 1));
+  const retiring = fixture.host.retireSession('one');
+  await answerRemoteControl(child, 1, { session_url: 'https://example.test/one', bridge_epoch: 1 });
+  assert.deepEqual(await on, {
+    result: { outcome: 'connected', url: 'https://example.test/one', late: false },
+    session: null,
+  });
+  assert.deepEqual(calls, [['off', 'sess-1']], 'retirement did not take the connection away');
+  assert.equal(child.ended, true, 'retirement left the child running');
+  child.exit(0);
+  await retiring;
+});
+
+test('the Remote Control item follows a Claude clear and leaves with an exited or retired child', async () => {
+  const calls: unknown[][] = [];
+  const panel = {
+    moveRemoteControl: (...args: unknown[]) => calls.push(['move', ...args]),
+    noteRemoteControlOff: (...args: unknown[]) => calls.push(['off', ...args]),
+  };
+  const moved = extensionStatement('panel.moveRemoteControl(', 'panel', 'event');
+  const exited = extensionStatement('panel.noteRemoteControlOff(', 'panel', 'state');
+  const fixture = fakeHost(undefined, undefined, {
+    idleDurationMs: 120,
+    timer: new FakeAgentHostTimer(),
+    onEvent: ({ event }) => moved(panel, event),
+    onStateChange: (state) => exited(panel, state),
+  });
+  const first = await openRemoteControlChild(fixture, 'one', 'sess-1');
+  const second = await openRemoteControlChild(fixture, 'two', 'sess-2');
+  assert.deepEqual(calls, [], 'a first session report moved or cleared the item');
+  first.say(JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sess-1b' }) + '\n');
+  assert.deepEqual(calls, [['move', 'sess-1', 'sess-1b']]);
+  first.exit(0);
+  await vi.waitFor(() => assert.deepEqual(calls.slice(1), [['off', 'sess-1b']]));
+  settle(fixture.host, 'two');
+  const retiring = fixture.host.retireSession('two');
+  await vi.waitFor(() => assert.deepEqual(calls.slice(2), [['off', 'sess-2']]));
+  assert.equal(second.ended, true, 'retirement left the child running');
+  second.exit(0);
+  await retiring;
+  assert.deepEqual(calls.slice(2), [['off', 'sess-2']]);
 });
 
 test('Claude plans set a requested cache lifetime over launch values and keep the delegated default', () => {

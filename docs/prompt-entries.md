@@ -10,7 +10,7 @@ Skill opening uses `openSkill`, separately from card file opening. It accepts on
 
 Initialization publishes commands. Idle Codex children can supply skills. Connected Codex children refresh after local skill-file notifications, including additions, edits, and removals. Codex catalogs distinguish commands from skills.
 
-Claude commands lack ownership metadata. Classify them with the working directory’s latest skill-name list, persisted across reloads. Listed skills are inspectable except panel controls such as `/mcp`. `/compact` and `/model` never receive skill highlighting. Before the first list, all other commands are highlighted, including `/context`, `/help`, and `/review`.
+Claude commands lack ownership metadata. Classify them with the working directory’s latest skill-name list, persisted across reloads. Listed skills are inspectable except panel controls such as `/mcp`. `/compact` and `/model` never receive skill highlighting. Autocomplete offers `/remote-control` and `/rc` in every Claude session because Claude's published catalog omits them. Neither is ever highlighted. Before the first list, all other commands are highlighted, including `/context`, `/help`, and `/review`.
 
 Keep supplied Claude definition paths. Otherwise search project skills before the reader’s Claude skills folder. Without a definition, omit the path.
 

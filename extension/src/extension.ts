@@ -528,6 +528,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         if (affected) panel.invalidateContext(affected);
         if (event.kind === 'session' && event.previous && event.previous !== affected)
           panel.invalidateContext(event.previous);
+        // A Claude `/clear` keeps a Remote Control connection, so its prompt box item follows the new id.
+        if (event.kind === 'session' && event.previous && event.previous !== event.sessionId)
+          panel.moveRemoteControl(event.previous, event.sessionId);
       }
       if (event.kind === 'turnEnd') {
         const housekeeping = host.beginHousekeeping(key);
@@ -660,6 +663,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         policyMoves.delete(state.key);
         policies.forgetClear(state.key);
       }
+      // Exit, retirement, archive retirement, and shutdown all end the child and its Remote Control.
+      if (state.exited && state.sessionId) panel.noteRemoteControlOff(state.sessionId);
       if (state.exited) compaction?.childGone(state.key);
       else if (!state.busy && state.sessionId) void compaction?.drain(state.sessionId);
       if (commandStateChanges.delete(state.key)) {
@@ -2016,8 +2021,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // Remote Control acts only on this window's running, reader-started Claude process for the session. It starts no child.
   panel.onRemoteControl = async (session, observer) => {
     const live = host.find('claude', session);
-    if (!live) return { outcome: 'stopped' };
-    return (await host.remoteControl(live.key, observer)) ?? { outcome: 'stopped' };
+    if (!live) return { result: { outcome: 'stopped' }, session: null };
+    // Name the session the child holds when each result arrives, because a Claude `/clear` changes it.
+    // A child that exited or lost its key names none: its exit already took the connection away.
+    const holder = () => (host.get(live.key) === live && !live.state().exited ? live.state().sessionId : null);
+    const settled = await host.remoteControl(live.key, (result) => observer(result, holder()));
+    return { result: settled ?? { outcome: 'stopped' }, session: holder() };
   };
   const openPanelControl = panel.onPanelCommand;
   panel.onPanelCommand = (owner, agent, control, draft, cwd) => {

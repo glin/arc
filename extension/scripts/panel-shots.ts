@@ -46,6 +46,7 @@ import {
   statPopoverPayload,
   type SubagentContextCase,
   themed,
+  withRemoteControl,
 } from '../src/panelfixture.ts';
 import type { RailStatus } from '../src/turnrail.ts';
 import type { RailDensity } from '../src/view/rail.ts';
@@ -100,6 +101,7 @@ export interface Shot {
   costOverheads?: boolean;
   waitWarning?: boolean;
   composerSkill?: boolean;
+  remoteControl?: boolean; // Draw the prompt box of a session whose Remote Control is connected with a link.
   raisedComposer?: boolean;
   launcherPins?: number | 'unavailable'; // Pinned setups for the New session menu fixture, beside ten recent setups.
 }
@@ -450,6 +452,8 @@ export const SHOTS: Shot[] = [
   { name: 'narrow-long-card', width: 340, height: 2450, escape: true, openCard: LONG_CARD_HEAD, after: LONG_CARD_HEAD },
   { name: 'wide-composer-skill', width: 1350, escape: true, composerSkill: true, click: '.cskilltoken' },
   { name: 'narrow-composer-skill', width: 340, escape: true, composerSkill: true, click: '.cskilltoken' },
+  { name: 'wide-composer-remote-control', width: 1350, escape: true, remoteControl: true },
+  { name: 'narrow-composer-remote-control', width: 340, escape: true, remoteControl: true },
   { name: 'wide-compaction-summary', width: 1350, escape: true, compactionSummary: 'collapsed' },
   {
     name: 'wide-compaction-summary-open',
@@ -1227,6 +1231,10 @@ export async function shoot(
     await page.evaluate(`window.postMessage(${JSON.stringify(waitWarningPayload())}, '*')`);
     await page.evaluate(SETTLED);
   }
+  if (shot.remoteControl) {
+    await page.evaluate(`window.postMessage(${JSON.stringify(withRemoteControl(renderPayload()))}, '*')`);
+    await page.evaluate(SETTLED);
+  }
   if (shot.composerSkill) {
     const payload = renderPayload();
     const composer = (payload.usage as { composer: Record<string, unknown> }).composer;
@@ -1502,7 +1510,8 @@ export async function shoot(
     shot.longName ||
     shot.railLens ||
     shot.launcherPins !== undefined ||
-    shot.contextDetail
+    shot.contextDetail ||
+    shot.remoteControl
   ) {
     await page.evaluate(`window.postMessage(${JSON.stringify(renderPayload())}, '*')`);
     await page.evaluate(SETTLED);

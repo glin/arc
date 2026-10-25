@@ -12,7 +12,17 @@ import { tempDir } from '../temproot.ts';
 import * as vscode from 'vscode';
 import type { Locator, Page } from 'playwright-core';
 import { browserOrNone, SETTLED } from '../../test/browser.ts';
-import { COMPOSER, LIVE_PRESS, pageHtml, renderPayload, statPopoverPayload, themed } from '../panelfixture.ts';
+import {
+  COMPOSER,
+  LIVE_PRESS,
+  MCP_SERVERS,
+  pageHtml,
+  REMOTE_CONTROL_LINK,
+  renderPayload,
+  statPopoverPayload,
+  themed,
+  withRemoteControl,
+} from '../panelfixture.ts';
 import { composerView, pickMenu, newSessionDraft, type ComposerState } from '../composerview.ts';
 import type { SessionLauncherView } from '../view/launcher.ts';
 import { SUBMITTED_PROMPT_CHARS } from './state.ts';
@@ -1475,6 +1485,198 @@ test('Escape dismisses stat detail before stopping a running session', { timeout
   }
 });
 
+// The controls row's laid-out boxes share one line when no box starts at or below another's bottom.
+// The extras holder draws no box, so its children stand in for it.
+const REMOTE_ROW = `(() => {
+  const chip = document.getElementById('composer-remote');
+  const boxes = [...document.querySelector('.cpicks').children]
+    .flatMap((child) => (getComputedStyle(child).display === 'contents' ? [...child.children] : [child]))
+    .map((child) => child.getBoundingClientRect())
+    .filter((box) => box.width > 0 && box.height > 0);
+  return {
+    glyph: chip?.classList.contains('is-glyph') ?? null,
+    label: chip ? getComputedStyle(chip.querySelector('.cremotelabel')).display !== 'none' : null,
+    boxes: boxes.length,
+    oneLine: Math.max(...boxes.map((box) => box.top)) < Math.min(...boxes.map((box) => box.bottom)),
+  };
+})()`;
+
+test('the Remote Control item opens its link popover on a press and leaves with the connection', async (t) => {
+  const browser = await browserOrNone();
+  if (!browser) {
+    t.skip('no browser installed');
+    return;
+  }
+  try {
+    const page = await browser.newPage();
+    const failures: string[] = [];
+    page.on('pageerror', (error) => failures.push(String(error)));
+    await page.setViewportSize({ width: 1350, height: 900 });
+    await page.setContent(themed(pageHtml()));
+    await post(page, renderPayload());
+    const chip = page.locator('#composer-remote');
+    const pop = page.locator('#composer-remote-detail');
+    assert.equal(await chip.count(), 0, 'a session with Remote Control off drew the item');
+
+    await post(page, withRemoteControl(renderPayload()));
+    assert.equal(await chip.count(), 1);
+    assert.deepEqual(
+      await chip.evaluate((node) => ({
+        before: (node.previousElementSibling as HTMLElement | null)?.id,
+        after: (node.nextElementSibling?.firstElementChild as HTMLElement | null)?.dataset.control,
+        expanded: node.getAttribute('aria-expanded'),
+        popup: node.getAttribute('aria-haspopup'),
+      })),
+      { before: 'composer-askmode', after: 'context', expanded: 'false', popup: 'dialog' },
+      'the item is not between the permission control and the context meter',
+    );
+    await chip.hover();
+    await page.evaluate(SETTLED);
+    assert.equal(await pop.isVisible(), false, 'a hover opened the Remote Control popover');
+
+    await chip.click();
+    assert.equal(await pop.isVisible(), true);
+    assert.deepEqual(
+      await pop.evaluate((node) => ({
+        pinned: node.classList.contains('pinned'),
+        role: node.getAttribute('role'),
+        labelled: node.getAttribute('aria-labelledby'),
+        parts: [...node.children].map((part) => part.className),
+      })),
+      {
+        pinned: true,
+        role: 'dialog',
+        labelled: 'composer-remote',
+        parts: ['chippopline chippopname', 'chippopfoot chippopfoot-flush'],
+      },
+    );
+    assert.equal(await chip.getAttribute('aria-expanded'), 'true');
+    assert.equal(await chip.evaluate((node) => node === document.activeElement), true, 'the press moved focus');
+    await page.keyboard.press('Tab');
+    const link = pop.locator('button.chippopnamelink');
+    assert.equal(await link.evaluate((node) => node === document.activeElement), true, 'Tab did not enter at the link');
+    assert.equal(await link.textContent(), REMOTE_CONTROL_LINK);
+    await link.click();
+    assert.deepEqual(await page.evaluate('window.__posted.filter((m) => m.type === "openLink").at(-1)'), {
+      type: 'openLink',
+      href: REMOTE_CONTROL_LINK,
+      beside: false,
+    });
+    await page.keyboard.press('Escape');
+    assert.equal(await pop.isVisible(), false);
+    assert.equal(await chip.evaluate((node) => node === document.activeElement), true, 'Escape lost the item');
+    assert.equal(await chip.getAttribute('aria-expanded'), 'false');
+    await chip.click();
+    assert.equal(await pop.isVisible(), true);
+    await chip.click();
+    assert.equal(await pop.isVisible(), false, 'a second press left the popover open');
+
+    // Without a link the popover holds the footer alone and has nothing to Tab into.
+    await post(page, withRemoteControl(renderPayload(), null));
+    await chip.click();
+    assert.deepEqual(await pop.evaluate((node) => [...node.children].map((part) => part.className)), [
+      'chippopfoot chippopfoot-flush',
+    ]);
+    assert.equal(await pop.locator('button').count(), 0);
+    // The connection ends while the popover is open.
+    await post(page, renderPayload());
+    assert.equal(await chip.count(), 0);
+    assert.equal(await pop.isVisible(), false, 'the popover outlived the connection');
+
+    // With Servers drawn, the item follows the Servers control.
+    await post(page, withRemoteControl(renderPayload([], [], [], MCP_SERVERS)));
+    assert.equal(
+      await chip.evaluate((node) => (node.previousElementSibling as HTMLElement | null)?.dataset.control),
+      'mcp',
+    );
+    assert.deepEqual(failures, []);
+  } finally {
+    await browser.close();
+  }
+});
+
+test('the Remote Control item drops its words only when the controls row would wrap', async (t) => {
+  const browser = await browserOrNone();
+  if (!browser) {
+    t.skip('no browser installed');
+    return;
+  }
+  try {
+    const page = await browser.newPage();
+    const failures: string[] = [];
+    page.on('pageerror', (error) => failures.push(String(error)));
+    await page.setViewportSize({ width: 340, height: 900 });
+    await page.setContent(themed(pageHtml()));
+    await post(page, withRemoteControl(renderPayload()));
+    await page.waitForFunction(`document.getElementById('composer-remote')?.classList.contains('is-glyph')`);
+    assert.deepEqual(await page.evaluate(REMOTE_ROW), { glyph: true, label: false, boxes: 6, oneLine: true });
+
+    // A long model label wraps the row even with the glyph alone. The item stays.
+    const long = withRemoteControl(renderPayload());
+    const composer = (long.usage as { composer: { picks: { label: string }[] } }).composer;
+    composer.picks[0].label = 'Claude Opus 4.1 with a long name';
+    await post(page, long);
+    assert.deepEqual(await page.evaluate(REMOTE_ROW), { glyph: true, label: false, boxes: 6, oneLine: false });
+
+    await page.setViewportSize({ width: 1350, height: 900 });
+    await post(page, withRemoteControl(renderPayload()));
+    await page.waitForFunction(`!document.getElementById('composer-remote').classList.contains('is-glyph')`);
+    assert.deepEqual(await page.evaluate(REMOTE_ROW), { glyph: false, label: true, boxes: 6, oneLine: true });
+
+    // The session list sash narrows the prompt box with no window resize.
+    const sash = (await page.evaluate(`(() => {
+      const box = document.getElementById('railsash').getBoundingClientRect();
+      const composer = document.getElementById('composer').getBoundingClientRect();
+      return { x: box.left + box.width / 2, y: box.top + box.height / 2, room: composer.width };
+    })()`)) as { x: number; y: number; room: number };
+    await page.locator('#railsash').evaluate(
+      (node: HTMLElement, { point, by }) => {
+        node.setPointerCapture = () => undefined;
+        const at = (type: string, x: number) =>
+          node.dispatchEvent(new PointerEvent(type, { pointerId: 52, clientX: x, clientY: point.y, cancelable: true }));
+        at('pointerdown', point.x);
+        at('pointermove', point.x + by);
+        at('pointerup', point.x + by);
+      },
+      { point: sash, by: sash.room - 340 },
+    );
+    await page.waitForFunction(`document.getElementById('composer-remote').classList.contains('is-glyph')`);
+    assert.deepEqual(await page.evaluate(REMOTE_ROW), { glyph: true, label: false, boxes: 6, oneLine: true });
+    assert.equal(page.viewportSize()?.width, 1350);
+    assert.deepEqual(failures, []);
+  } finally {
+    await browser.close();
+  }
+});
+
+test('typed /rc and /remote-control never draw a skill token in a Claude session', async (t) => {
+  const browser = await browserOrNone();
+  if (!browser) {
+    t.skip('no browser installed');
+    return;
+  }
+  try {
+    const page = await browser.newPage();
+    await page.setContent(themed(pageHtml()));
+    await post(page, renderPayload());
+    const prompt = page.locator('#prompt');
+    await prompt.fill('Run /commit first');
+    assert.equal(
+      await page.locator('.cskilltoken').count(),
+      1,
+      'a Claude command drew no token, so this checks nothing',
+    );
+    await prompt.fill('/rc');
+    await page.evaluate(SETTLED);
+    assert.equal(await page.locator('.cskilltoken').count(), 0, '/rc drew a skill token');
+    await prompt.fill('Then /remote-control and /RC');
+    await page.evaluate(SETTLED);
+    assert.equal(await page.locator('.cskilltoken').count(), 0, '/remote-control drew a skill token');
+  } finally {
+    await browser.close();
+  }
+});
+
 test('composer controls keep hints while context inspection opens one detail', { timeout: 60_000 }, async (t) => {
   const browser = await browserOrNone();
   if (!browser) {
@@ -1486,7 +1688,7 @@ test('composer controls keep hints while context inspection opens one detail', {
     const failures: string[] = [];
     page.on('pageerror', (error) => failures.push(String(error)));
     await page.setContent(themed(pageHtml()));
-    const payload = renderPayload();
+    const payload = withRemoteControl(renderPayload());
     const composer = ((payload.usage as Record<string, unknown>).composer ?? {}) as Record<string, unknown>;
     await post(page, { type: 'usage', usage: usageWith(payload, composer) });
 
@@ -1508,7 +1710,14 @@ test('composer controls keep hints while context inspection opens one detail', {
     }>;
 
     assert.deepEqual(failures, []);
-    assert.ok(pressable.length >= 4, 'the model, effort, ask mode and context chips were not all drawn');
+    assert.ok(
+      pressable.length >= 5,
+      'the model, effort, ask mode, Remote Control and context chips were not all drawn',
+    );
+    assert.ok(
+      pressable.some((chip) => chip.control === 'remote-control'),
+      'the Remote Control item was not drawn',
+    );
     for (const chip of pressable) {
       assert.equal(chip.tag, 'BUTTON', `the ${chip.control ?? 'context'} chip is not a real button`);
       assert.equal(chip.title, null, `the ${chip.control ?? 'context'} chip button carries a native title`);

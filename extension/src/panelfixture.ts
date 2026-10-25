@@ -1136,6 +1136,22 @@ export const PERMISSION_ASK: PermissionAsk = {
 // The archived IDs populate hidden and the session list's archived flags.
 // Optional statuses reach railSessions for row styling and accessible names.
 // An empty status map exercises rows without a status.
+// The placeholder Remote Control session link. A fixture never carries a real one.
+export const REMOTE_CONTROL_LINK = 'https://claude.ai/code/session_01ABCDEFGHJKMNPQRSTVWXYZ';
+
+// Draw the Remote Control item in a payload's prompt box, as a connected session whose link is `url`.
+export function withRemoteControl(
+  payload: Record<string, unknown>,
+  url: string | null = REMOTE_CONTROL_LINK,
+): Record<string, unknown> {
+  const usage = payload.usage as { composer: Record<string, unknown> };
+  usage.composer = {
+    ...usage.composer,
+    remoteControl: composerView({ ...COMPOSER, remoteControl: { url } }, FIXTURE_CLOCK)!.remoteControl,
+  };
+  return payload;
+}
+
 export function renderPayload(
   archived: string[] = [],
   live: (typeof LIVE_PRESS)[] = [],

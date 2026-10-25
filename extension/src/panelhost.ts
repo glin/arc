@@ -338,6 +338,7 @@ import {
   panelCommand,
   renameRequest,
   REMOTE_CONTROL_ARGUMENTS,
+  remoteControlLink,
   remoteControlNotice,
   remoteControlRequest,
   type RemoteControlOutcome,
@@ -1279,6 +1280,9 @@ export class PanelProvider implements vscode.Disposable {
     { revision: number; commentIds: readonly string[]; assets: readonly StoredPromptAsset[] }
   >();
   private draftRevisions = new Map<string, number>();
+  // Connected Remote Control by session id, with the link that passed `remoteControlLink` or null.
+  // Memory only: the link never enters saved drafts or workspace state.
+  private remoteControl = new Map<string, { url: string | null }>();
   private clearingDraftRevision: { session: string; revision: number } | null = null;
   private panelRecoveryWaiters = new Map<string, { resolve(): void; reject(error: unknown): void }>();
   private disposed = false;
@@ -1588,8 +1592,13 @@ export class PanelProvider implements vscode.Disposable {
     | null = null;
   public onDraftRemoved: ((draft: NewSessionDraft) => void) | null = null;
   // Toggles Remote Control on the session's running Claude process. `observer` receives later results.
+  // Every result comes with the session id the process holds when it arrives, which a Claude `/clear`
+  // changes, or null when that process has exited or retired.
   public onRemoteControl:
-    | ((session: string, observer: (result: RemoteControlOutcome) => void) => Promise<RemoteControlOutcome>)
+    | ((
+        session: string,
+        observer: (result: RemoteControlOutcome, session: string | null) => void,
+      ) => Promise<{ result: RemoteControlOutcome; session: string | null }>)
     | null = null;
   public onDraftProfileChanged: ((draft: NewSessionDraft) => void) | null = null;
   public onDraftAdopted: ((provisional: string, actual: string) => void) | null = null;
@@ -4660,6 +4669,7 @@ export class PanelProvider implements vscode.Disposable {
       // Draw context only when the accepted runtime includes a model window size.
       contextGeneration: this.contextGenerations?.get(row.id) ?? 0,
       context: runtime?.context?.window ? { used: runtime.context.tokens, max: runtime.context.window } : null,
+      remoteControl: this.remoteControl?.get(row.id) ?? null,
       // The accepted runtime supplies estimated next-turn cost, retaining compaction precedence.
       nextTurn: runtime?.nextTurn ?? null,
       // Pending live activity for this session, projected into cards by `composerview.ts`.
@@ -8418,16 +8428,48 @@ export class PanelProvider implements vscode.Disposable {
 
   private async remoteControlFromComposer(sessionId: string): Promise<void> {
     let result: RemoteControlOutcome;
+    let holder: string | null = sessionId;
     if (Object.prototype.hasOwnProperty.call(this.newDrafts, sessionId)) result = { outcome: 'draft' };
     else if (this.isAgentRunLaunch(sessionId)) result = { outcome: 'agentRun' };
     else if (!this.onRemoteControl) result = { outcome: 'stopped' };
     else
       try {
-        result = await this.onRemoteControl(sessionId, (later) => this.showRemoteControlNotice(later));
+        ({ result, session: holder } = await this.onRemoteControl(sessionId, (later, current) => {
+          this.noteRemoteControl(current, later);
+          this.showRemoteControlNotice(later);
+        }));
       } catch (error) {
         result = { outcome: 'refused', reason: (error as Error).message || 'unknown error', late: false };
       }
+    this.noteRemoteControl(holder, result);
     this.showRemoteControlNotice(result);
+  }
+
+  // Keep the session's Remote Control state for the prompt box item. Only `connected` draws the item.
+  // `disconnected`, `ended`, and `closed` remove it. Every other result, including a `refused`
+  // disconnect, leaves the connection as it was. A result from a process that has exited or retired
+  // names no session and changes nothing, because `noteRemoteControlOff` already removed its item.
+  private noteRemoteControl(session: string | null, result: RemoteControlOutcome): void {
+    if (session === null) return;
+    if (result.outcome === 'connected') this.remoteControl.set(session, { url: remoteControlLink(result.url) });
+    else if (['disconnected', 'ended', 'closed'].includes(result.outcome)) {
+      if (!this.remoteControl.delete(session)) return;
+    } else return;
+    void this.post({ type: 'usage', usage: this.usagePayload() });
+  }
+
+  // A Claude process that exits, retires, or shuts down takes its Remote Control connection with it.
+  public noteRemoteControlOff(session: string): void {
+    if (this.remoteControl.delete(session)) void this.post({ type: 'usage', usage: this.usagePayload() });
+  }
+
+  // A Claude `/clear` gives the connected process a new session id and keeps the connection.
+  public moveRemoteControl(previous: string, next: string): void {
+    const held = this.remoteControl.get(previous);
+    if (!held || previous === next) return;
+    this.remoteControl.delete(previous);
+    this.remoteControl.set(next, held);
+    void this.post({ type: 'usage', usage: this.usagePayload() });
   }
 
   private showRemoteControlNotice(result: RemoteControlOutcome): void {

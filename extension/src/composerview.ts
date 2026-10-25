@@ -673,6 +673,9 @@ export interface ComposerState {
   // from the model's window rather than a fixed value.
   context: { used: number; max: number } | null;
   contextGeneration?: number;
+  // The session's connected Remote Control and its checked link, kept in host memory only.
+  // Absent or null while Remote Control is off, connecting, or unknown.
+  remoteControl?: { url: string | null } | null;
   // Inputs for the next-turn cost estimate. Null when context or pricing is unavailable.
   nextTurn?: NextTurnBasis | null;
   // What the reader has typed into the box, exactly as they typed it.
@@ -863,6 +866,20 @@ export interface ComposerBox {
   actionEnabled: boolean;
 }
 
+// The prompt box item shown while the session's Remote Control is connected. It is not a pick: it
+// has no menu, and a press opens a popover with the session link and how to turn it off.
+export interface ComposerRemoteControl {
+  label: string;
+  // The accessible name.
+  name: string;
+  hint: string;
+  hintDetail: string;
+  // Null when Claude reported no link or the link failed `remoteControlLink`.
+  link: { url: string; name: string; hint: string } | null;
+  // The popover footer line.
+  off: string;
+}
+
 // A local draft's status figure. Visible text names the draft state rather than
 // repeating the setup controls.
 export interface ComposerDraftTag {
@@ -894,6 +911,8 @@ export interface ComposerView {
   // Model, effort, and permission controls in that order, followed by Servers
   // when the session reports configured servers.
   picks: ComposerPick[];
+  // The Remote Control item after the picks. Null unless Claude reported a connected state.
+  remoteControl: ComposerRemoteControl | null;
   // Prepared prompt entries. The browser matches current text locally so completion
   // uses the latest keystroke without a host round trip. Catalog changes update
   // the entries independently of typing.
@@ -2469,6 +2488,22 @@ function askModePick(state: ComposerState): ComposerPick {
   };
 }
 
+// The Remote Control item for a connected session. Its words state the connection, so its
+// presence is the state and it carries no tone.
+function remoteControlControl(state: ComposerState): ComposerRemoteControl | null {
+  if (!state.remoteControl) return null;
+  const url = remoteControlLink(state.remoteControl.url);
+  const press = url ? 'Press for the session link.' : 'Press for how to turn it off.';
+  return {
+    label: 'Remote Control',
+    name: url ? `Remote Control is on. ${press}` : `Remote Control is on. Claude did not report its link. ${press}`,
+    hint: 'Remote Control is on',
+    hintDetail: `A phone or a browser can drive this session. ${press}`,
+    link: url ? { url, name: 'Open the session link in a browser', hint: 'Open in a browser' } : null,
+    off: 'Run /remote-control or /rc to turn it off.',
+  };
+}
+
 // Convert the shared servers pick into a prompt box control. Omit it when no pick exists. A displayed servers control is enabled.
 function mcpControl(state: ComposerState, name: string): ComposerPick | null {
   const pick = mcpPick(state.mcpServers, name);
@@ -3761,7 +3796,7 @@ function composerBox(state: ComposerState, name: string): ComposerBox {
       state.agent,
       name,
       running,
-      availableCommands(state.commands).length > 0,
+      availableCommands(state.commands, state.agent).length > 0,
       state.commands.some((entry) => entry.kind === 'skill'),
     ),
     dropPlaceholder: 'Drop to attach',
@@ -3912,7 +3947,9 @@ export function composerView(state: ComposerState | null, now: number = Date.now
     // Drafts display no next-turn estimate from their source session.
     nextTurn: state.profile ? null : nextTurnFigure(prospectiveNextTurn(state)),
     picks,
-    commands: promptEntries(state.agent, availableCommands(state.commands)),
+    // Drafts and agent runs never hold a connection, so the host map has no entry for them.
+    remoteControl: remoteControlControl(state),
+    commands: promptEntries(state.agent, availableCommands(state.commands, state.agent)),
     claudeSkills: state.claudeSkills,
     completionName: `Completions available for ${name}`,
     box: composerBox(state, name),
@@ -4662,15 +4699,27 @@ const PANEL_COMMANDS: Record<string, { control: string; description: string }> =
   mcp: { control: 'mcp', description: 'View MCP server status' },
 };
 
-// Append missing panel commands to the agent catalog. Compare non-skill names without case to avoid duplicate commands.
-export function availableCommands(commands: readonly ComposerPromptEntry[]): ComposerPromptEntry[] {
+// Claude commands Arc runs itself that Claude's published catalog omits. They are not panel
+// commands: `sendPrompt` routes them through `remoteControlRequest`.
+const CLAUDE_TOGGLE_COMMANDS: Record<string, string> = {
+  'remote-control': 'Turn Claude Remote Control on or off',
+  rc: 'Turn Claude Remote Control on or off',
+};
+
+// Append missing panel commands, and for Claude the commands Arc runs itself, to the agent catalog.
+// Compare non-skill names without case to avoid duplicate commands.
+export function availableCommands(commands: readonly ComposerPromptEntry[], agent?: string): ComposerPromptEntry[] {
   const available = [...commands];
   const names = new Set(
     commands.filter((command) => command.kind !== 'skill').map((command) => command.name.toLowerCase()),
   );
-  for (const [name, command] of Object.entries(PANEL_COMMANDS)) {
+  const added = [
+    ...Object.entries(PANEL_COMMANDS).map(([name, command]) => [name, command.description] as const),
+    ...(agent === 'claude' ? Object.entries(CLAUDE_TOGGLE_COMMANDS) : []),
+  ];
+  for (const [name, description] of added) {
     if (!names.has(name)) {
-      available.push({ kind: 'command', name, description: command.description, argumentHint: '' });
+      available.push({ kind: 'command', name, description, argumentHint: '' });
     }
   }
   return available;
@@ -4689,20 +4738,33 @@ export type RemoteControlOutcome =
   | { outcome: 'agentRun' }
   | { outcome: 'stopped' };
 
-// The notification for a Remote Control result. The session link appears in the text.
-// Arc opens no browser and leaves the clipboard unchanged.
+// The Remote Control session link Arc may store, draw, link, and open. Only an `https:` URL with no
+// whitespace and no character that can open or close a Markdown link passes. Any other value is null.
+export function remoteControlLink(url: string | null): string | null {
+  if (!url || !/^https:\/\//i.test(url) || /[\s[\]()<>]/.test(url)) return null;
+  return url;
+}
+
+// The notification for a Remote Control result. A session link that passes `remoteControlLink` is a
+// Markdown link whose text is the whole URL, so it opens in a browser when pressed and Copy still
+// carries the URL. Any other link stays plain text. Arc opens nothing by itself and leaves the
+// clipboard unchanged. VS Code notifications draw only `[text](target)` links and honor no escape
+// character, so a rejected value has its square brackets percent-encoded and can form no link.
 export function remoteControlNotice(result: RemoteControlOutcome): { level: 'info' | 'warning'; text: string } {
   const again = 'Run /remote-control again to turn it off.';
   const reload =
     "To end the connection for certain, run Developer: Reload Window, which stops this window's Claude processes.";
   switch (result.outcome) {
-    case 'connected':
+    case 'connected': {
+      const link = remoteControlLink(result.url);
+      const shown = link ? `[${link}](${link})` : result.url?.replace(/\[/g, '%5B').replace(/\]/g, '%5D');
       return {
         level: 'info',
-        text: result.url
-          ? `Arc: Claude Remote Control is on for this session. Open ${result.url} in a browser or the Claude app. ${again}`
+        text: shown
+          ? `Arc: Claude Remote Control is on for this session. Open ${shown} in a browser or the Claude app. ${again}`
           : `Arc: Claude Remote Control is on for this session, but Claude did not report its link. ${again}`,
       };
+    }
     case 'disconnected':
       return { level: 'info', text: 'Arc: Claude Remote Control is off for this session.' };
     case 'ended':

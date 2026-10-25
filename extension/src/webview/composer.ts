@@ -31,7 +31,7 @@ const RESTORATION_ALIAS_LIMIT = 64;
 // The prompt box supplies separate controls for `/compact` and `/model`.
 // Before a working directory reports its skill list, other Claude commands receive highlights.
 // Afterward, only listed names receive highlights.
-const CLAUDE_NATIVE_COMMANDS = new Set(['compact', 'model']);
+const CLAUDE_NATIVE_COMMANDS = new Set(['compact', 'model', 'remote-control', 'rc']);
 
 interface HistoryWalk {
   list: { text: string; submission?: string }[];

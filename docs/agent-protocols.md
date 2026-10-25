@@ -50,7 +50,7 @@ Positive model turns establish participating model completion. A zero-model resu
 
 `remote_control` sends an `enabled` boolean and starts no turn. Require `remote_control_available: true` in initialize. Ignore auto-enable fields. The toggle uses only this window's live Claude child. Refuse drafts, agent runs, absent children, and fixed read-only policies. Start no child for a toggle.
 
-Enable replies carry `session_url`, `connect_url`, `bridge_epoch`, and `bridge_session_id`. Keep the epoch and report the session link. Bridge identity never replaces local identity. Disable replies carry no fields. Errors retain prior state.
+Enable replies carry `session_url`, `connect_url`, `bridge_epoch`, and `bridge_session_id`. Keep the epoch and report the session link. The panel keeps the link in memory for the prompt box item while the session stays connected and never saves it. Bridge identity never replaces local identity. Disable replies carry no fields. Errors retain prior state.
 
 States are off, connecting, connected, disconnecting, and uncertain. A control timeout retains the request ID and becomes uncertain. A late reply settles it and notifies the reader. Refuse further toggles while pending or uncertain. Never retry automatically.
 

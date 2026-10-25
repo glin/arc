@@ -2233,6 +2233,7 @@ import {
   compactSubmission,
   renameRequest,
   remoteControlRequest,
+  remoteControlLink,
   REMOTE_CONTROL_ARGUMENTS,
   sendAction,
   sentPromptsToSave,
@@ -40732,11 +40733,12 @@ test('Remote Control refuses a draft and an agent-run session without reaching a
     isAgentRunLaunch: compiledProviderMethod('function (session)', 'public isAgentRunLaunch('),
     async onRemoteControl(session: string) {
       reached.push(session);
-      return { outcome: 'disconnected', late: false };
+      return { result: { outcome: 'disconnected', late: false }, session };
     },
     showRemoteControlNotice(result: unknown) {
       notices.push(result);
     },
+    noteRemoteControl() {},
   };
   for (const session of ['draft', 'run', 'live']) await remoteControlFromComposer.call(provider, session);
   assert.deepEqual(reached, ['live'], 'a draft or agent-run session reached the Claude process callback');
@@ -40803,4 +40805,153 @@ test('Prompt boxes keep child-specific session skill paths after idle reads and 
     draw('second').map((entry) => entry.path),
     ['/second/SKILL.md'],
   );
+});
+
+const REMOTE_LINK = 'https://claude.ai/code/session_01ABCDEFGHJKMNPQRSTVWXYZ';
+
+// The provider half that keeps each session's Remote Control for the prompt box item.
+function remoteControlState() {
+  const later: Array<(result: unknown, session: string | null) => void> = [];
+  const provider = {
+    newDrafts: {},
+    saved: { agentRuns: [] as string[] } as Record<string, unknown>,
+    remoteControl: new Map<string, { url: string | null }>(),
+    posted: [] as unknown[],
+    replies: [] as unknown[],
+    isAgentRunLaunch: compiledProviderMethod('function (session)', 'public isAgentRunLaunch('),
+    async onRemoteControl(_session: string, observer: (result: unknown, session: string | null) => void) {
+      later.push(observer);
+      return this.replies.shift();
+    },
+    showRemoteControlNotice() {},
+    post(message: unknown) {
+      this.posted.push(message);
+      return Promise.resolve();
+    },
+    usagePayload() {
+      return { remote: Object.fromEntries(this.remoteControl) };
+    },
+    noteRemoteControl: compiledProviderMethod('function (session, result)', 'private noteRemoteControl(', {
+      remoteControlLink,
+    }),
+    noteRemoteControlOff: compiledProviderMethod('function (session)', 'public noteRemoteControlOff('),
+    moveRemoteControl: compiledProviderMethod('function (previous, next)', 'public moveRemoteControl('),
+    remoteControlFromComposer: compiledProviderMethod(
+      'async function (sessionId)',
+      'private async remoteControlFromComposer(',
+    ),
+  } as any;
+  // `holder` is the session id the child holds when the reply arrives, or null after it retired.
+  const toggle = async (session: string, result: unknown, holder: string | null = session) => {
+    provider.replies.push({ result, session: holder });
+    await provider.remoteControlFromComposer(session);
+  };
+  return { provider, later, toggle, held: () => Object.fromEntries(provider.remoteControl) };
+}
+
+test('the prompt box keeps Remote Control from a connected result until the connection ends', async () => {
+  const { provider, toggle, held } = remoteControlState();
+  await toggle('s1', { outcome: 'connected', url: REMOTE_LINK, late: false });
+  assert.deepEqual(held(), { s1: { url: REMOTE_LINK } });
+  assert.deepEqual(provider.posted, [{ type: 'usage', usage: { remote: { s1: { url: REMOTE_LINK } } } }]);
+  for (const result of [
+    { outcome: 'refused', reason: 'no', late: false },
+    { outcome: 'busy', state: 'disconnecting' },
+    { outcome: 'uncertain' },
+    { outcome: 'unsupported', available: false },
+    { outcome: 'policy' },
+  ]) {
+    await toggle('s1', result);
+    assert.deepEqual(held(), { s1: { url: REMOTE_LINK } }, `${result.outcome} changed the connection`);
+  }
+  assert.equal(provider.posted.length, 1, 'a result that changed nothing posted the prompt box');
+  for (const result of [
+    { outcome: 'disconnected', late: false },
+    { outcome: 'ended', reason: 'Network lost.' },
+    { outcome: 'closed' },
+  ]) {
+    await toggle('s1', { outcome: 'connected', url: null, late: false });
+    assert.deepEqual(held(), { s1: { url: null } });
+    await toggle('s1', result);
+    assert.deepEqual(held(), {}, `${result.outcome} kept the connection`);
+    assert.deepEqual(provider.posted.at(-1), { type: 'usage', usage: { remote: {} } });
+  }
+  // A link that fails the check is stored as no link.
+  await toggle('s2', { outcome: 'connected', url: 'https://claude.ai/[x](y)', late: false });
+  assert.deepEqual(held(), { s2: { url: null } });
+  // Refusals the panel decides itself change nothing.
+  provider.newDrafts = { draft: {} };
+  provider.saved.agentRuns = ['run'];
+  await provider.remoteControlFromComposer('draft');
+  await provider.remoteControlFromComposer('run');
+  assert.deepEqual(held(), { s2: { url: null } });
+});
+
+test('a late Remote Control result lands under the session id the child holds when it arrives', async () => {
+  const { later, toggle, held } = remoteControlState();
+  await toggle('s1', { outcome: 'uncertain' });
+  assert.deepEqual(held(), {});
+  later[0]({ outcome: 'connected', url: REMOTE_LINK, late: true }, 's1-cleared');
+  assert.deepEqual(held(), { 's1-cleared': { url: REMOTE_LINK } });
+  await toggle('s1-cleared', { outcome: 'uncertain' });
+  later[1]({ outcome: 'disconnected', late: true }, 's1-cleared');
+  assert.deepEqual(held(), {});
+});
+
+test('a toggle reply lands under the session id the child holds when it arrives, and nowhere for a retired child', async () => {
+  const { provider, toggle, held } = remoteControlState();
+  // A Claude clear while the enable waits moves no item, because none is drawn yet.
+  await toggle('s1', { outcome: 'connected', url: REMOTE_LINK, late: false }, 's1b');
+  assert.deepEqual(held(), { s1b: { url: REMOTE_LINK } }, 'the item stayed under the id from before the clear');
+  // A Claude clear while the disable waits moves the item first.
+  provider.moveRemoteControl('s1b', 's1c');
+  await toggle('s1b', { outcome: 'disconnected', late: false }, 's1c');
+  assert.deepEqual(held(), {}, 'the moved item stayed after Remote Control turned off');
+  // Retirement removed the item before the reply arrived.
+  await toggle('s2', { outcome: 'connected', url: REMOTE_LINK, late: false }, null);
+  assert.deepEqual(held(), {}, 'a reply for a retired child drew the item again');
+});
+
+test('a Claude clear moves the Remote Control item, and an exited child removes it', async () => {
+  const { provider, toggle, held } = remoteControlState();
+  await toggle('s1', { outcome: 'connected', url: REMOTE_LINK, late: false });
+  await toggle('s2', { outcome: 'connected', url: null, late: false });
+  provider.moveRemoteControl('s1', 's1b');
+  assert.deepEqual(held(), { s2: { url: null }, s1b: { url: REMOTE_LINK } });
+  const posts = provider.posted.length;
+  provider.moveRemoteControl('missing', 'elsewhere');
+  provider.noteRemoteControlOff('missing');
+  assert.equal(provider.posted.length, posts, 'a session with no connection posted the prompt box');
+  provider.noteRemoteControlOff('s1b');
+  assert.deepEqual(held(), { s2: { url: null } });
+  assert.deepEqual(provider.posted.at(-1), { type: 'usage', usage: { remote: { s2: { url: null } } } });
+});
+
+test('saved drafts never carry a Remote Control link', async () => {
+  const { provider, toggle } = remoteControlState();
+  await toggle('s1', { outcome: 'connected', url: REMOTE_LINK, late: false });
+  const same = (value: unknown) => value;
+  const writeDrafts = compiledProviderMethod('function ()', 'private writeDrafts(', {
+    normalizeDrafts: same,
+    sentPromptsToSave: same,
+    normalizePromptAssetBook: same,
+    normalizeQueuedSubmissions: same,
+    normalizeDraftCommentIds: same,
+  });
+  const written: string[] = [];
+  Object.assign(provider, {
+    drafts: { s1: '/rc' },
+    sentPrompts: {},
+    promptsBySession: new Map(),
+    assets: {},
+    queues: {},
+    draftCommentIds: {},
+    persistHostState(this: { saved: unknown }) {
+      written.push(JSON.stringify(this.saved, (_key, value) => (value instanceof Map ? [...value] : value)));
+      return Promise.resolve();
+    },
+  });
+  await writeDrafts.call(provider);
+  assert.equal(written.length, 1);
+  assert.doesNotMatch(written[0], /claude\.ai/, 'the Remote Control link reached saved drafts');
 });

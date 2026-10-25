@@ -18,6 +18,9 @@ interface ControlsOptions {
   contextDetails?: StatDetailRenderer;
   contextList?(): StatDetailList;
   releaseContext?(): void;
+  // The Remote Control item's popover. The renderer supplies these.
+  remoteDetails?: StatDetailRenderer;
+  remoteList?(view: ComposerView): StatDetailList;
   mount: HTMLElement;
   composer: HTMLElement;
   events: {
@@ -196,6 +199,38 @@ function PickRow(props: {
   );
 }
 
+// A phone outline, the device a Remote Control session is driven from. Hidden from the accessible name.
+function RemoteGlyph(): ComponentChildren {
+  return h('svg', { class: 'cremoteglyph', viewBox: '0 0 16 16', 'aria-hidden': 'true' }, [
+    h('rect', { x: '4.75', y: '1.75', width: '6.5', height: '12.5', rx: '1.6' }),
+    h('path', { d: 'M7.1 12.2h1.8' }),
+  ]);
+}
+
+// The laid-out boxes of the controls row. The extras holder has no box of its own, so its children
+// stand in for it, and a box with no width or height is not laid out.
+function rowBoxes(row: HTMLElement): DOMRect[] {
+  return [...row.children]
+    .flatMap((child) => (getComputedStyle(child).display === 'contents' ? [...child.children] : [child]))
+    .map((child) => child.getBoundingClientRect())
+    .filter((box) => box.width > 0 && box.height > 0);
+}
+
+// The row wraps when a box starts at or below the bottom of another. Send is taller than the picks
+// and centred, so comparing tops alone would read a one-line row as wrapped.
+export function rowWraps(boxes: readonly DOMRect[]): boolean {
+  if (boxes.length < 2) return false;
+  return Math.max(...boxes.map((box) => box.top)) >= Math.min(...boxes.map((box) => box.bottom));
+}
+
+// Show the Remote Control words when the row fits on one line with them, and the glyph alone
+// otherwise. Measuring with the words shown every time keeps the rule free of hysteresis.
+function fitRemote(row: HTMLElement | null, remote: HTMLElement | null): void {
+  if (!row || !remote || !row.contains(remote)) return;
+  remote.classList.remove('is-glyph');
+  if (rowWraps(rowBoxes(row))) remote.classList.add('is-glyph');
+}
+
 function ControlsView(props: {
   bar: UsageBar | null;
   view: ComposerView | null;
@@ -221,6 +256,47 @@ function ControlsView(props: {
   } | null>(null);
   const actionOwner = useRef<{ session: string; kind: string; node: HTMLElement } | null>(null);
   const sendOver = useRef<HTMLSpanElement | null>(null);
+  const row = useRef<HTMLDivElement>(null);
+  const remote = useRef<HTMLButtonElement>(null);
+  const rowWatch = useRef<{ observer: ResizeObserver; row: HTMLElement | null; frame: number } | null>(null);
+  useLayoutEffect(
+    () => () => {
+      rowWatch.current?.observer.disconnect();
+      if (rowWatch.current?.frame) props.options.document.defaultView?.cancelAnimationFrame(rowWatch.current.frame);
+    },
+    [],
+  );
+  useLayoutEffect(() => {
+    // The session list sash resizes the prompt box without a window resize, so the row is observed.
+    // The fit waits for the next frame: a class change inside the callback would resize the observed
+    // row during delivery, which the browser reports as a loop error.
+    const host = props.options.document.defaultView;
+    if (!rowWatch.current && host?.ResizeObserver) {
+      const watch: { observer: ResizeObserver; row: HTMLElement | null; frame: number } = {
+        observer: new host.ResizeObserver(() => {
+          if (watch.frame) return;
+          watch.frame = host.requestAnimationFrame(() => {
+            watch.frame = 0;
+            fitRemote(row.current, remote.current);
+          });
+        }),
+        row: null,
+        frame: 0,
+      };
+      rowWatch.current = watch;
+    }
+    const watch = rowWatch.current;
+    const next = remote.current ? row.current : null;
+    if (watch && watch.row !== next) {
+      if (watch.row) watch.observer.unobserve(watch.row);
+      if (next) watch.observer.observe(next);
+      watch.row = next;
+    }
+    if (remote.current && props.view?.remoteControl) {
+      props.options.remoteDetails?.mount(remote.current, true, true);
+      props.options.remoteDetails?.update(remote.current, '', props.options.remoteList?.(props.view) ?? null);
+    }
+  });
   useLayoutEffect(() => {
     const slot = extras.current;
     if (!slot || !props.view) {
@@ -319,6 +395,7 @@ function ControlsView(props: {
       cursor.remove();
       cursor = next;
     }
+    fitRemote(row.current, remote.current);
     props.options.afterDraw();
   });
   const menu = props.openPick === 'mcp' ? (props.menus.mcp ?? null) : null;
@@ -402,7 +479,7 @@ function ControlsView(props: {
   if (!props.view) {
     return null;
   }
-  return h('div', { class: 'cpicks' }, [
+  return h('div', { class: 'cpicks', ref: row }, [
     ...props.view.picks.map((pick) =>
       pick.control !== 'mcp'
         ? h(ChoicePicker, {
@@ -488,6 +565,28 @@ function ControlsView(props: {
             [pick.label, pick.disabled ? null : h('span', { class: 'cchev' }, TWIST.open)],
           ),
     ),
+    // Not a pick: it has no menu, and a press opens its popover through the stat-detail renderer.
+    // The stable key keeps one element while connected, so the popover's mount survives redraws.
+    props.view.remoteControl
+      ? h(
+          'button',
+          {
+            key: 'remote-control',
+            ref: remote,
+            id: 'composer-remote',
+            class: 'cpick cremote',
+            type: 'button',
+            'data-control': 'remote-control',
+            'aria-haspopup': 'dialog',
+            'aria-controls': 'composer-remote-detail',
+            'aria-expanded': 'false',
+            'aria-label': props.view.remoteControl.name,
+            'data-hint': props.view.remoteControl.hint,
+            'data-hint-detail': props.view.remoteControl.hintDetail,
+          },
+          [h(RemoteGlyph, {}), h('span', { class: 'cremotelabel' }, props.view.remoteControl.label)],
+        )
+      : null,
     h('span', { style: { display: 'contents' }, ref: extras }),
   ]);
 }
@@ -575,6 +674,48 @@ export function createComposerControlsRenderer(options: ControlsOptions): Compos
     },
   };
   options.contextList = contextList;
+  // The Remote Control popover. Its list is complete from the view, so opening it asks the host nothing.
+  const remoteDetails = createStatDetailRenderer({
+    document: options.document,
+    id: 'composer-remote-detail',
+    events: options.events,
+    actionAnchor: true,
+    selectionWithin: options.selectionWithin,
+    placeFloat(pop, anchor, bottom) {
+      placeFloat(options.document.defaultView!, pop, anchor, bottom, 6);
+    },
+  });
+  let remoteAnchor: HTMLElement | null = null;
+  options.remoteDetails = {
+    ...remoteDetails,
+    mount(node, ownStop, pressOnly) {
+      remoteAnchor = node;
+      return remoteDetails.mount(node, ownStop, pressOnly);
+    },
+  };
+  // The session link as a press that the host opens in a browser, then how to turn the connection off.
+  options.remoteList = (current) => {
+    const link = current.remoteControl?.link ?? null;
+    return {
+      actions: true,
+      lead: link
+        ? [
+            {
+              text: link.url,
+              action: {
+                name: link.name,
+                hint: link.hint,
+                run() {
+                  options.sendToHost({ type: 'openLink', href: link.url, beside: false });
+                },
+              },
+            },
+          ]
+        : undefined,
+      entries: [],
+      footer: current.remoteControl ? [current.remoteControl.off] : [],
+    };
+  };
   options.releaseContext = () => {
     contextCleanup?.();
     contextCleanup = null;
@@ -602,6 +743,8 @@ export function createComposerControlsRenderer(options: ControlsOptions): Compos
   const place = () => {
     if (contextOpen && contextAnchor && !contextDetails.element.hidden)
       placeFloat(window, contextDetails.element, contextAnchor, window.innerHeight - 6, 6);
+    if (remoteAnchor?.isConnected && !remoteDetails.element.hidden)
+      placeFloat(window, remoteDetails.element, remoteAnchor, window.innerHeight - 6, 6);
     if (pickPopover.hidden || !openPick || options.composer.hidden) {
       return;
     }
@@ -800,6 +943,7 @@ export function createComposerControlsRenderer(options: ControlsOptions): Compos
     setHidden(value) {
       hidden = value;
       if (hidden) contextDetails.dismiss();
+      if (hidden) remoteDetails.dismiss();
       if (hidden) openPick = null;
       draw();
     },
@@ -838,6 +982,13 @@ export function createComposerControlsRenderer(options: ControlsOptions): Compos
             options.composer.querySelector<HTMLElement>('#prompt')?.focus();
           contextDetails.dismiss();
         }
+      }
+      // Another session's prompt box, or a connection that ended, closes the Remote Control popover.
+      if (replaced || !nextView?.remoteControl) {
+        const focused = options.document.activeElement;
+        if (remoteDetails.element.contains(focused) || (remoteAnchor && remoteAnchor === focused))
+          options.composer.querySelector<HTMLElement>('#prompt')?.focus();
+        remoteDetails.dismiss();
       }
       view = nextView;
       if (!replaced && refreshed && contextOpen && view?.context) {

@@ -96,6 +96,8 @@ import {
   clearSubmission,
   renameRequest,
   remoteControlRequest,
+  remoteControlLink,
+  remoteControlNotice,
   clearAction,
   compactCommand,
   compactSubmission,
@@ -1181,15 +1183,15 @@ test('the composer hands the panel every command in the agent own order', () => 
   const view = drawn();
   assert.deepEqual(
     view.commands.map((c) => c.command),
-    [...COMMANDS.map((c) => c.name), 'mcp'],
+    [...COMMANDS.map((c) => c.name), 'mcp', 'remote-control', 'rc'],
     'the panel narrows the list itself, so it is handed the agent list and its own command, unsorted',
   );
   assert.equal(view.completionName, 'Completions available for Claude');
-  // The panel provides `/mcp` even when the agent publishes no commands.
+  // The panel provides `/mcp`, and for Claude its Remote Control commands, even when the agent publishes no commands.
   const none = drawn({ commands: [] });
   assert.deepEqual(
     none.commands.map((command) => command.command),
-    ['mcp'],
+    ['mcp', 'remote-control', 'rc'],
   );
   assert.equal(none.box.placeholder, 'Ask Claude anything, or type / for its commands');
   assert.equal(view.box.placeholder, 'Ask Claude anything, or type / for its commands');
@@ -1214,6 +1216,48 @@ test('the panel-owned MCP command is offered once to Codex and to an agent that 
       ['skill', 'mcp'],
       ['command', 'mcp'],
     ],
+  );
+});
+
+test('Claude sessions offer /remote-control and /rc once, and Codex sessions never do', () => {
+  const said = 'Turn Claude Remote Control on or off';
+  const polish = { kind: 'command' as const, name: 'polish', description: 'Clean the writing', argumentHint: '' };
+  assert.deepEqual(availableCommands([polish], 'claude'), [
+    polish,
+    { kind: 'command', name: 'mcp', description: 'View MCP server status', argumentHint: '' },
+    { kind: 'command', name: 'remote-control', description: said, argumentHint: '' },
+    { kind: 'command', name: 'rc', description: said, argumentHint: '' },
+  ]);
+  assert.deepEqual(
+    availableCommands([polish], 'codex').map((command) => command.name),
+    ['polish', 'mcp'],
+  );
+  const published = { kind: 'command' as const, name: 'RC', description: 'Claude wording', argumentHint: '' };
+  assert.deepEqual(
+    availableCommands([published], 'claude').map((command) => command.name),
+    ['RC', 'mcp', 'remote-control'],
+    'a published entry was doubled',
+  );
+  const entries = composerView(composerState({ commands: [] }))!.commands;
+  assert.deepEqual(
+    matchCommands(
+      entries.map((entry) => ({
+        kind: entry.kind,
+        name: entry.command,
+        description: entry.description,
+        argumentHint: '',
+      })),
+      'r',
+    ).map((entry) => entry.name),
+    ['remote-control', 'rc'],
+  );
+  for (const entry of entries.filter((one) => ['remote-control', 'rc'].includes(one.command))) {
+    assert.equal(entry.panelControl, undefined, `/${entry.command} became a panel command`);
+    assert.equal(entry.kind, 'command');
+  }
+  assert.deepEqual(
+    composerView(composerState({ agent: 'codex', commands: [] }))!.commands.map((entry) => entry.command),
+    ['mcp'],
   );
 });
 
@@ -8349,6 +8393,84 @@ test('Claude Remote Control commands are recognized only as bare Claude commands
   for (const text of ['/remote control', '/rcx', '/rc/file', '/plugin:rc', 'run /rc', '/remote-controls'])
     assert.equal(remoteControlRequest('claude', text), null, text);
   assert.equal(remoteControlRequest('codex', '/rc'), null);
+});
+
+const REMOTE_LINK = 'https://claude.ai/code/session_01ABCDEFGHJKMNPQRSTVWXYZ';
+const REJECTED_LINKS = [
+  'http://claude.ai/x',
+  'command:arc.open',
+  'file:///C:/x',
+  'https://claude.ai/a b',
+  'https://claude.ai/a\nb',
+  'https://claude.ai/[x](y)',
+  'https://a<b>',
+];
+
+test('the Remote Control item draws only for a connected session, with its link when it passes the check', () => {
+  assert.equal(composerView(composerState())!.remoteControl, null);
+  assert.equal(composerView(composerState({ remoteControl: null }))!.remoteControl, null);
+  assert.deepEqual(composerView(composerState({ remoteControl: { url: REMOTE_LINK } }))!.remoteControl, {
+    label: 'Remote Control',
+    name: 'Remote Control is on. Press for the session link.',
+    hint: 'Remote Control is on',
+    hintDetail: 'A phone or a browser can drive this session. Press for the session link.',
+    link: { url: REMOTE_LINK, name: 'Open the session link in a browser', hint: 'Open in a browser' },
+    off: 'Run /remote-control or /rc to turn it off.',
+  });
+  const without = {
+    label: 'Remote Control',
+    name: 'Remote Control is on. Claude did not report its link. Press for how to turn it off.',
+    hint: 'Remote Control is on',
+    hintDetail: 'A phone or a browser can drive this session. Press for how to turn it off.',
+    link: null,
+    off: 'Run /remote-control or /rc to turn it off.',
+  };
+  assert.deepEqual(composerView(composerState({ remoteControl: { url: null } }))!.remoteControl, without);
+  for (const url of REJECTED_LINKS)
+    assert.deepEqual(composerView(composerState({ remoteControl: { url } }))!.remoteControl, without, url);
+});
+
+test('a Remote Control link passes only as an https URL that cannot break a Markdown link', () => {
+  assert.equal(remoteControlLink(REMOTE_LINK), REMOTE_LINK);
+  assert.equal(remoteControlLink('HTTPS://claude.ai/code/x'), 'HTTPS://claude.ai/code/x');
+  assert.equal(remoteControlLink(null), null);
+  assert.equal(remoteControlLink(''), null);
+  for (const url of REJECTED_LINKS) assert.equal(remoteControlLink(url), null, url);
+});
+
+test('the connected notification links a checked session link by its whole URL and leaves any other as text', () => {
+  const again = 'Run /remote-control again to turn it off.';
+  assert.equal(
+    remoteControlNotice({ outcome: 'connected', url: REMOTE_LINK, late: false }).text,
+    `Arc: Claude Remote Control is on for this session. Open [${REMOTE_LINK}](${REMOTE_LINK}) in a browser or the Claude app. ${again}`,
+  );
+  const rendered = marked.parseInline(remoteControlNotice({ outcome: 'connected', url: REMOTE_LINK, late: true }).text);
+  assert.match(rendered, new RegExp(`<a href="${REMOTE_LINK}">${REMOTE_LINK}</a>`));
+  for (const url of REJECTED_LINKS.filter((value) => !/[[\]]/.test(value)))
+    assert.equal(
+      remoteControlNotice({ outcome: 'connected', url, late: false }).text,
+      `Arc: Claude Remote Control is on for this session. Open ${url} in a browser or the Claude app. ${again}`,
+      url,
+    );
+  assert.match(
+    remoteControlNotice({ outcome: 'connected', url: 'https://claude.ai/[x](y)', late: false }).text,
+    / Open https:\/\/claude\.ai\/%5Bx%5D\(y\) in a browser/,
+  );
+  // VS Code's notification link pattern, `parseLinkedText` in `src/vs/base/common/linkedText.ts`. It is the only
+  // syntax a notification draws, and it has no escape character.
+  const notificationLink = /\[([^\]]+)\]\(((?:https?:\/\/|command:|file:)[^)\s]+)(?: (["'])(.+?)(\3))?\)/i;
+  assert.match(remoteControlNotice({ outcome: 'connected', url: REMOTE_LINK, late: false }).text, notificationLink);
+  for (const url of [
+    ...REJECTED_LINKS,
+    '[https://example.test/other](https://example.test/other)',
+    'https://claude.ai/a [open](http://example.test/)',
+    'https://claude.ai/a [open](command:arc.open "Open")',
+  ])
+    assert.doesNotMatch(remoteControlNotice({ outcome: 'connected', url, late: false }).text, notificationLink, url);
+  assert.equal(
+    remoteControlNotice({ outcome: 'connected', url: null, late: false }).text,
+    `Arc: Claude Remote Control is on for this session, but Claude did not report its link. ${again}`,
+  );
 });
 
 test('a Remote Control toggle sends at once and answers no pending request', () => {

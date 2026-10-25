@@ -79,6 +79,8 @@ export interface StatDetailList {
   // Actions select the dialog role and disclosure attributes for the anchor.
   actions?: boolean;
   heading?: DetailHead;
+  // Lines drawn before the entries, each in its own line. A line with an action draws as a press.
+  lead?: DetailLine[];
   entries: DetailHead[];
   // Turn record arrays shared with the card body. Entries provide the chip's plain-text detail.
   rows?: DetailRows;
@@ -369,6 +371,19 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
     }
     return head;
   };
+  // The press a line with an action draws, shared by sub-items and lead lines.
+  const pressLine = (text: string, press: DetailNameAction): HTMLButtonElement => {
+    const label = el('button', 'chippopnamelink');
+    label.type = 'button';
+    label.setAttribute('aria-label', press.name);
+    label.setAttribute('data-hint', press.hint);
+    label.addEventListener('click', (event) => {
+      event.stopPropagation();
+      press.run(event);
+    });
+    label.textContent = text;
+    return label;
+  };
   const subitem = (line: DetailLine, withActions: boolean): HTMLLIElement => {
     const row = el('li', 'chippopsubitem');
     if (typeof line === 'string') {
@@ -390,16 +405,7 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
       }
       const press = withActions ? line.action : undefined;
       if (press) {
-        const label = el('button', 'chippopnamelink');
-        label.type = 'button';
-        label.setAttribute('aria-label', press.name);
-        label.setAttribute('data-hint', press.hint);
-        label.addEventListener('click', (event) => {
-          event.stopPropagation();
-          press.run(event);
-        });
-        label.textContent = line.text;
-        row.appendChild(label);
+        row.appendChild(pressLine(line.text, press));
       } else {
         row.appendChild(document.createTextNode(line.text));
       }
@@ -556,6 +562,15 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
     if (listValue && !listValue.nameWorktree) {
       if (listValue.heading) {
         pop.appendChild(detailHead(listValue.heading, 'chippophead'));
+      }
+      // Lead lines wear the name form, so a press or a first line keeps the regular weight.
+      for (const line of listValue.lead ?? []) {
+        const row = el('div', 'chippopline chippopname');
+        if (typeof line === 'string') row.textContent = line;
+        else if (!('text' in line)) row.appendChild(relative(line));
+        else if (withActions && line.action) row.appendChild(pressLine(line.text, line.action));
+        else row.textContent = line.text;
+        pop.appendChild(row);
       }
       if (listValue.rows && options.renderRows) {
         const host = el('div', 'chippoprows');
