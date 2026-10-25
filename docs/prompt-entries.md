@@ -18,7 +18,7 @@ Ordinary catalogs live in agent-keyed memory. Optional supplied entries belong t
 
 Claude and Codex commands use `/`. Codex skills use `$` or `/`. Completion preserves the typed prefix. Dollar text opens completion only when it matches a listed Codex skill.
 
-Only complete leading Codex skill invocations select native skills, allowing preceding whitespace and following arguments. Typed and completed invocations match equally. Unknown, disabled, ambiguous, or removed skills remain text. Quoted examples, escaped tokens, fences, URLs, partial names, and incidental mentions select nothing. [Native attachment and freshness](agent-protocols.md#codex-app-server) govern delivery.
+Only complete leading Codex skill invocations select native skills, allowing preceding whitespace and following arguments. Typed and completed invocations match equally. Unknown, disabled, ambiguous, or removed skills remain text. Quoted examples, escaped tokens, fences, URLs, partial names, and incidental mentions select nothing. [Native attachment and freshness](native-skills.md#codex-skill-attachment) govern delivery.
 
 Skill marks must retain the native text field. Drags and modified clicks select text without opening details. Inspection preserves prompt text, selection, and undo history.
 

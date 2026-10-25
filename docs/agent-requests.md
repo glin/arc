@@ -1,10 +1,10 @@
 # Agent requests
 
-Read this guide for permission and question cards, answer validation, or saved-question presentation. [`requests.ts`](../extension/src/webview/requests.ts) renders cards. [`composerview.ts`](../extension/src/composerview.ts) validates answers. [Agent protocols](agent-protocols.md#question-recovery-contracts) owns durable question recovery.
+Read this guide for permission and question cards, answer validation, or saved-question presentation. [`requests.ts`](../extension/src/webview/requests.ts) renders cards. [`composerview.ts`](../extension/src/composerview.ts) validates answers. [Question recovery](question-recovery.md#question-recovery-contracts) owns durable question recovery.
 
 ## Live requests
 
-Permission requests and questions belong to their session’s prompt box. Live requests remain until answered or the turn ends. Codex async questions follow [async delivery](agent-protocols.md#codex-app-server), including survival after turn completion.
+Permission requests and questions belong to their session’s prompt box. Live requests remain until answered or the turn ends. Codex async questions follow [async delivery](question-recovery.md#codex-asynchronous-questions), including survival after turn completion.
 
 Submitted controls disable and show `sending your answer` until the host resolves them.
 

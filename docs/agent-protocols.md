@@ -104,7 +104,7 @@ Remote Control states except off prevent unarchived idle retirement. Returning o
 
 Targeted draft retirement waits for opening and control activity. Abandoning a draft or closing the last panel retires retained draft MCP children. Disposal closes all children and settles pending asks, requests, and completions. Retirement preserves saved identity and accepted settings for resume.
 
-Agent-wide permission and MCP changes lease every target before the first await. MCP leases last through the final status read. Build replacement settings after prior exit. Preserve provisional draft settings during publication. A fork stores its accepted profile under the returned identity. [Composer delivery](composer.md#delivery-and-recovery-contracts) owns draft profile acceptance.
+Agent-wide permission and MCP changes lease every target before the first await. MCP leases last through the final status read. Build replacement settings after prior exit. Preserve provisional draft settings during publication. A fork stores its accepted profile under the returned identity. [Catalogs and applied defaults](session-setup.md#catalogs-and-applied-defaults) owns draft profile acceptance.
 
 ## Settings and control reads
 
