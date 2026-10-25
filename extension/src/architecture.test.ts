@@ -41,6 +41,21 @@ test('the component table has one row for every recursive component path', () =>
   );
 });
 
+// Root CLAUDE.md sends every agent to architecture.md before a change, so its length is paid on every session.
+const ARCHITECTURE_WORD_CEILING = 1500;
+
+test('architecture.md stays short enough to read before every change', () => {
+  const words = fs
+    .readFileSync(path.join(__dirname, '..', '..', 'docs', 'architecture.md'), 'utf8')
+    .split(/\s+/)
+    .filter(Boolean).length;
+  assert.ok(
+    words <= ARCHITECTURE_WORD_CEILING,
+    `docs/architecture.md has ${words} words, over ${ARCHITECTURE_WORD_CEILING}. ` +
+      'Move behavior to the topic guide that owns it and keep a route to that guide in the reading guide.',
+  );
+});
+
 test('removed snapshot mutation APIs stay out of production source', () => {
   const removed = /\b(?:keepFile|rejectFile|keepHunk|rejectHunk|removeFromManifest)\b/;
   const offenders = source().components.filter((file) => {
