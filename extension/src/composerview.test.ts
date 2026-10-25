@@ -1890,10 +1890,7 @@ test('the composer says which session the prompt goes to without spending a line
 
   assert.equal('to' in view, false, 'the target line is drawn again, over a name the rail already carries');
   assert.equal('target' in view, false);
-  // Its accessible target name identifies both the session and agent.
-
-  assert.ok(view.targetName.includes('Embedded agent input'));
-  assert.ok(view.targetName.includes('Claude'));
+  assert.equal(view.targetName, 'Embedded agent input');
 });
 
 test('how full the window is is a share of that model own window, not of a constant', () => {

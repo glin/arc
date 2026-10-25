@@ -2149,7 +2149,7 @@ test('a synthetic draft row names a session before it has a transcript', () => {
   const row = syntheticDraftRows([{ draftId: 'draft-a', createdAt: 10, agent: 'Claude', agentKey: 'claude' }])[0];
   assert.equal(row.id, 'draft-a');
   assert.equal(row.persisted, false);
-  assert.equal(row.label, 'New session');
+  assert.equal(row.label, 'New Claude session');
   assert.equal(row.agentRun, false);
 });
 

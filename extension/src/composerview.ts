@@ -882,8 +882,7 @@ export interface ComposerView {
   // adopts it once per session. Repeated adoption during typing would replace
   // current text with a delayed host value.
   draft: string;
-  // The Prompt box's accessible name includes its target session. The session list
-  // already displays that session's name.
+  // The session name also titles the timeline before recorded turns arrive.
   targetName: string;
   origin: ComposerOrigin | null;
   // Null when the session has no local draft profile.
@@ -3893,7 +3892,7 @@ export function composerView(state: ComposerState | null, now: number = Date.now
     sessionId: state.sessionId,
     ...(state.profile ? { recoverySetup: state.profile } : {}),
     draft: state.draft,
-    targetName: `The prompt goes to ${session}, a ${name} session`,
+    targetName: session,
     origin: state.origin
       ? {
           sessionId: state.origin.sessionId,
