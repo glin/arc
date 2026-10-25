@@ -32,7 +32,7 @@ Arc owns per-session undo and redo because moving or assigning the text field in
 
 Word typing groups into one undo step. Paste, completion, and larger edits form separate steps. Steps retain text and caret positions.
 
-Up recalls saved workspace submissions before the selected session’s recorded prompts. Down returns toward the draft. Recall starts only at text offset zero with no selection. During recall, both arrows continue the walk anywhere in the field. Otherwise they move the caret.
+Up recalls saved submissions from the selected session before its recorded prompts. Down returns toward the draft. Recall starts only at text offset zero with no selection. During recall, both arrows continue the walk anywhere in the field. Otherwise they move the caret.
 
 Recall saves the draft it starts from. Down past the newest prompt restores it with the caret at zero. The walk never wraps. Choose a session or draft before recalling. Enter explicitly submits the displayed text.
 
