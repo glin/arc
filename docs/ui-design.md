@@ -18,7 +18,7 @@ Target at least 4.5:1 for text against every ground it occupies. Do not color bo
 
 Use tabular numbers and right alignment for comparable figures. Never ellipsize a figure or let its label displace its value.
 
-Follow the [project UI rules](../extension/CLAUDE.md#ui-work) for text ownership, relative sizing, and shared treatments. Scale the text-owning element, without compensating through wrappers. Read the corresponding production markup before reusing a CSS class.
+Follow the [project UI rules](../extension/CLAUDE.md#ui-work) for text ownership, relative sizing, and shared treatments. Read production markup before reusing a CSS class.
 
 ## Choose the pattern by its job
 
@@ -31,7 +31,7 @@ Follow the [project UI rules](../extension/CLAUDE.md#ui-work) for text ownership
 | Filter or select a view | Follow the session list patterns in [rail.ts](../extension/src/webview/rail.ts) and [Session list and navigation](rail-and-navigation.md). |
 | Change related settings | Follow the grouped controls in [layout-dialog.ts](../extension/src/webview/layout-dialog.ts). |
 
-Links serve navigation. Compact in context detail uses `cpick`, without link colors or underlines.
+Links serve navigation.
 
 A read-only session list figure must not acquire an independent press target inside its row's button. A figure with available detail must retain its keyboard behavior and accessible state. [Session list and navigation](panel-accessibility.md#keyboard-and-screen-reader-contract) owns those contracts.
 
@@ -63,6 +63,6 @@ The [screenshot driver](../extension/scripts/panel-shots.ts) clears focus and ma
 
 The [tone-sheet generator](../.claude/skills/panel-mockup/tone-sheet.ts) and contrast tests share [tones.ts](../extension/src/tones.ts), so their agreement is not independent evidence. The contrast test in [panel.webview.test.ts](../extension/src/panel.webview.test.ts) models default themes and names known failures. `EXCLUDED_TONES` in `tones.ts` defines additional exclusions. Neither establishes contrast across every theme or rendered state.
 
-Follow the [test rules](../CLAUDE.md#tests) for automated guards. Do not add browser tests that freeze spacing, color, font, width, or wording.
+Follow the [test rules](../CLAUDE.md#tests) and [browser test limits](../extension/CLAUDE.md#browser-tests) for automated guards.
 
 Name the reader need when proposing an exception. Do not turn a known implementation deviation into a design rule. An approved mockup carries the fidelity and approval requirements in the mockup workflow.

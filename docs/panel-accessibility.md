@@ -30,7 +30,7 @@ The focusable vertical separator controls width. Left and Right change it by 10 
 
 ### Timeline navigation
 
-The timeline has one independent roving Tab stop. Controls outside its navigation scope keep ordinary Tab stops. The navigation owner marks matching controls with `data-roving`, caches its walk until page changes, and disconnects its observer on disposal.
+The timeline has one independent roving Tab stop. Controls outside its navigation scope keep ordinary Tab stops. `webview/navigation.ts` owns the control walk.
 
 Draw width-dependent actions as controls only where they work. Session heading labels are buttons while the session list fits. At narrower widths they are spans with native titles. Button labels use panel hints. The roving selector names the button tag so read-only labels never enter its walk. Session list labels stay inside their selector button and cannot contain buttons. Responsive replacement transfers focus and the navigation stop.
 

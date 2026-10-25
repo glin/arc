@@ -4,17 +4,17 @@
 
 ## Data model
 
-`turncomments.ts` stores each comment's session, turn key, card part, quote, offset, text, and creation order. Normalization drops invalid comments, truncates oversized strings, and keeps the newest comments within the list limit.
+`view/comments.ts` defines stored parts and comment fields. `turncomments.ts` owns normalization and limits.
 
 Card parts identify the opening prompt, later prompts, summary, answer blocks, and agent messages during the turn. Message parts use message ids. Renaming stored parts requires compatibility with existing workspace comments. The opening-input heading before the response is not a part and never shifts stored response offsets. Comments on the `You asked` or `Assigned task` heading after the response use summary. Moving the input before the response draws those comments on the corresponding input. Without a first prompt, they draw on the first ask and unfold the asks. Quotes matching summary or answer text draw there instead of on the heading. Without a first prompt, the first ask becomes the prompt block and stores its comments under prompt.
 
-Shared panel state keeps comments through repaints, hidden panels, and restored tabs. Removing a comment leaves other comments unchanged.
+Shared panel state keeps comments through repaints, hidden panels, and restored tabs.
 
 ## Anchoring a selection
 
-The browser identifies the selected card and part, walks rendered nodes into visible plain text, and saves the quote and starting offset. Selection cannot cross controls or another comment.
+`quoteOf` in `webview/comments.ts` serializes selection quotes as Markdown, with fenced code and a plain-text fallback. `offsetOf` supplies the saved offset. `selectionHere` checks endpoints, not intervening nodes. It rejects endpoints in comments, opening-input headings, and ineligible Activity rows.
 
-On repaint, the browser searches the original card part for the quote. The saved offset breaks ties between repeated text, including card-heading lines counted during saving and drawing. Matches respect word boundaries when the quote begins or ends with a word character.
+Quote matching lives in `view/comments.ts`. Saved offsets break ties between repeated text. Saving and drawing must count the same card-heading lines. Matches respect word boundaries when a quote starts or ends with a word character.
 
 Prompt, summary, answer blocks, and messages have separate initial search pools. Activity log comments use message ids because filtering changes row positions. If the original part has no match, summary and answer parts search each other, and message parts search other message parts. A comment anchored to an earlier answer stays there while its quote matches, even when the summary repeats it. Unmatched comments remain in the turn's comment list without a text tint.
 
@@ -30,7 +30,7 @@ A line mark opens its comments for editing or deletion without changing neighbor
 
 Card repainting waits while the reader writes a comment, presses inside its open comment list, or selects card text. A list opened by a press reopens on the redrawn mark. Focus returns to the same list control. Selecting another session closes the previous session's comment list.
 
-Comment marks redraw when placement inputs change. Inputs include counted text lines, card parts, prompt labels, each comment's quote, offset, and text, and the drawn mark and tint counts. A redraw deferred by the comment list runs after the interaction ends. Active card text selection continues that deferral. Escape, Save, Cancel, and Delete update the card's marks before returning focus. Focus returns to a visible mark on the same line, then the nearest visible mark, then the nearest visible control. Focus restoration never scrolls the panel.
+`sweepSource` and `drawnMarks` in `webview/comments.ts` own annotation invalidation. List interactions defer redraws until they end. Active card text selection continues that deferral. Escape, Save, Cancel, and Delete update marks before returning focus. Focus returns to a visible mark on the same line, then the nearest visible mark, then the nearest visible control. Focus restoration never scrolls the panel.
 
 ## Sending comments
 
@@ -44,15 +44,15 @@ Compaction does not use prompt assembly and cannot consume comments. Any new non
 
 ## Redirecting selected text
 
-A valid response selection adds two actions to the native context menu. The first starts an editable draft with the source session's labels. The second starts an editable draft without labels. Both actions preserve the selected markdown, add one blank line, inherit the source setup and recorded working directory, and retain source-turn navigation as draft metadata.
+[New sessions from existing work](panel-navigation.md#new-sessions-from-existing-work) owns draft setup, labels, and source-turn navigation. The draft adds one blank line after the selection.
 
 A clicked line without a selection keeps Add a comment and shows neither redirect action. A stale, changed, or already-used selection cannot create a draft.
 
 ## Copying and markdown
 
-Copying a turn or a selected range reconstructs readable markdown from the rendered content. Lists, code fences, quotes, and line breaks survive. Browser-only controls and existing comment text do not enter the copy.
+`copySummary` in `panelhost.ts` copies the card's stored Markdown.
 
-Quote location and copy share the plain-text walk. Check both after markup changes, including visually unchanged wrappers.
+Quote extraction and offset calculation must agree after markup changes, including visually unchanged wrappers.
 
 ## Verification
 
