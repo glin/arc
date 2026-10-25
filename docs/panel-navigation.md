@@ -8,7 +8,7 @@ A history place is a session, without a search query. Content search uses the ti
 
 The provider shares history across panel tabs, but each panel keeps its own visible session. Back and Forward move only the invoking panel. A window reload starts history at the restored session. Record destinations after `pickShowing` resolves selection. History navigation follows selection's draft-abandonment rules.
 
-`domain/places.ts` prunes missing sessions, collapses adjacent duplicates, and preserves a draft's place when its ID changes.
+`domain/places.ts` owns trail pruning and provisional-ID replacement.
 
 Mouse buttons four and five, the editor's Go Back and Go Forward chords, and the Arc tab toolbar use the panel trail first. At a boundary, Back delegates to the editor's Go Back and Forward delegates to Go Forward. Either command does nothing when the editor also reaches its boundary.
 
@@ -22,14 +22,7 @@ Display paths use forward slashes. Actions send the recorded path. File rows ope
 
 Normal opening prefers the active text-editor group outside the panel, then the leftmost visible text-editor group outside it. With neither, it reuses the panel group, or group one without a panel. Explicit split actions request another group. Whole-turn diff split actions reuse their previous group while it remains open and differs from the panel.
 
-Response links check local destinations in this order:
-
-1. Directories open in Explorer.
-2. Pictures open through `vscode.open` in the editor's viewer.
-3. `.html` and `.htm` files open in the integrated browser.
-4. `.mp4`, `.m4v`, `.mov`, `.webm`, `.avi`, and `.mkv` files open through the operating system's default application.
-5. `.md` and `.markdown` files open in Markdown Preview in the requested group.
-6. Other local files open in the text editor.
+`openLink` in `panelhost.ts` owns local response-link routing. `linkTargetIsHtml`, `linkTargetIsMarkdown`, and `linkTargetIsVideo` in `transcript.ts` own extension matching.
 
 Video extensions match regardless of case on Windows, macOS, and Linux. Video opening needs a default application and uses no editor group. Successful opening does not establish playback or codec support. Integrated-browser placement follows `workbench.browser.newTabPlacement`, and VS Code applies workspace trust to local HTML. HTTP and HTTPS links open in the configured external browser.
 
@@ -43,9 +36,9 @@ Only `FileNotFound` establishes absence. Other file-check errors and Explorer, p
 
 A commit hash becomes a button only with a known repository directory. An unresolved repository leaves text. Opening uses the repository that [Recorded command and commit contracts](turn-cards.md#recorded-command-and-commit-contracts) describes. An unavailable command or missing commit produces an information message. Commits outside the workspace name their repository.
 
-Commit rows retain their recorded branch or detached HEAD. Rows with the same subject and statistics remain distinct. A worktree named for its branch shows the branch without a place. Commit hovers retain the subject, file count when known, and commit time.
+Commit rows retain their recorded branch or detached HEAD. Equal subjects and statistics do not identify the same commit. `CommitRow` and `commitRowTitle` in `webview/card-rows.ts` own row content and hovers.
 
-`fileicons.ts` supplies safe theme icons and fallback text badges. Icons remain decorative, and file-row text supplies accessible names.
+`icontheme.ts` resolves theme icons. `fileicons.ts` supplies fallback text badges. Icons remain decorative, and file-row text supplies accessible names.
 
 ## Context menus and copy
 
@@ -62,7 +55,7 @@ Session menus order their groups as follows:
 5. Copy session ID and Show session details.
 6. Export session as HTML, on saved headings only, with a trailing ellipsis.
 
-Use short verb phrases without “this session”. Put the most-used entry first within a group. Copy session ID copies the exact ID without opening details.
+Use short verb phrases without “this session”. Put the most-used entry first within a group.
 
 Offer only the applicable toggle direction. Heading `sessionRead` uses explicit words and stays absent when nothing is markable. Session list sections determine their read entries. Plain `arcRail` rows offer neither read direction. Rename requires `sessionPersisted`. Bulk turn entries require a shown turn with a body that their direction changes. Opening turns marks them read. Each panel owns its own open turns.
 

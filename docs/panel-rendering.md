@@ -8,7 +8,7 @@ Use this guide when changing retained rows, timeline publication, row transport,
 
 The startup shell has no saved-filter catalog. Preserve restored view folds until the host supplies saved filters and views.
 
-`webview/rail.ts` retains mounted occurrences while serialized row values, callback outputs, editor state, environment, and displayed clock values match. Removed occurrences release their props. Every draw still compares every mounted row. Less row construction alone establishes no CPU or latency improvement.
+`RetainedRailRow` in `webview/rail.ts` owns row reuse. Every draw still compares every mounted row. Less row construction alone establishes no CPU or latency improvement.
 
 Metadata, membership, and label-editor changes update mounted headings without full timeline draws or card fingerprints. The session list owns the responsive boundary. Report filterability separately from payload-dependent visibility, including before payload adoption and heading construction. Boundary changes update heading Labels.
 
@@ -24,11 +24,11 @@ Selection holds the newest card snapshot until release. Retrying held cards must
 
 ### Row deltas and recovery
 
-Render and session list messages send changed rows, but the host still builds and prints every row. Each panel's `RowDeltaSender` holds 64-bit prints for `sessions`, `rail`, and `stats`. Other fields travel complete.
+`webview/row-deltas.ts` owns row encoding and reconstruction. Each panel's sender holds 64-bit prints for `sessions`, `rail`, and `stats`. The host still builds and prints every row. Other fields travel complete.
 
 Delta headers identify their revision and base. Snapshots extend no revision and carry complete lists. Renders also identify the last `sessions` revision because session list messages omit `sessions`. One host counter prevents reused revisions.
 
-`RowDeltaReceiver` rebuilds complete lists before dispatch. It rejects mismatched bases, mismatched session bases, impossible retained order lengths, and ordered IDs without changed or held rows. Changed rows outside the rebuilt order disappear. A gap posts `rowsGap` once, preserves drawn rows, and rejects further deltas until a snapshot. The host resets that panel's sender and renders its held catalog again.
+`RowDeltaReceiver` rejects invalid bases and orders before dispatching complete lists. A gap posts `rowsGap` once and preserves drawn rows. Further deltas fail until a snapshot. The host resets that panel's sender and renders its held catalog again.
 
 Send snapshots on page readiness, gaps, failed or unready posts, and changes to local day, repository scope roots, or catalog folders. Repeated row IDs require snapshots for that message and the next. Unkeyed row lists or non-record `stats` post complete and force the next snapshot. Age wording changes resend affected rows.
 
@@ -36,7 +36,7 @@ Selection messages replace drawn rows without changing delta bases. The next ren
 
 ### Visibility and catalog availability
 
-Ready panels receive revisioned visibility, including their initial visibility. Hidden retained pages stay transparent until current viewport observation and paint complete. Geometry changes invalidate prior observations and callbacks. Release requires full intersection and a matching positive rectangle, without a larger minimum viewport size. Each observation generation owns a fresh observer. Without IntersectionObserver, paint alone releases the page.
+Ready panels receive revisioned visibility, including initial visibility. `webview/retained-visibility.ts` owns paint and geometry checks. Hidden pages stay transparent until paint and a current full-intersection observation agree on a positive rectangle. Geometry changes invalidate prior observations and callbacks. Each generation uses a fresh observer. No larger minimum viewport applies. Without IntersectionObserver, paint alone releases the page.
 
 Preserve the document, reading state, and original inline opacity. Restore eligible focus only while the document has focus and its active element remains the body or document root. Newer focus, pointer, click, or keyboard actions cancel restoration. Activity inside the focused control remembers it for the next host blur. Activity elsewhere clears it. Restore text-selection direction and input selection. Disposal disconnects observation and removes focus listeners and the inert viewport element.
 
