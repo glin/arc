@@ -1,351 +1,159 @@
-﻿# Agent protocols and runtime
+# Agent protocols and runtime
 
-Use this guide for wire translation, child lifetime, session names, and settings. Use the subject guide for [launches](agent-launches.md), [skills](native-skills.md), [questions](question-recovery.md), [compaction](session-compaction.md), or [standalone sessions](standalone-sessions.md).
+Use this guide for wire translation, child lifetime, naming, settings, and read-only continuation. Read only the sections a change reaches.
+
+| Subject                                          | Guide                                          |
+| ------------------------------------------------ | ---------------------------------------------- |
+| Executables, environment, arguments, attribution | [Agent launches](agent-launches.md)            |
+| Skill admission, catalogs, attachments           | [Native skills](native-skills.md)              |
+| Questions, answer delivery, recovery             | [Questions and recovery](question-recovery.md) |
+| Native turn ownership, compaction, continuations | [Session compaction](session-compaction.md)    |
+| Dispatch links, standalone observation, capture  | [Standalone sessions](standalone-sessions.md)  |
 
 ## Runtime shape
 
-Each active session owns a child process in the window that started it. Children communicate over stdio and die with the extension host. Another window follows their work through the transcript on disk rather than by attaching to the child.
+Each session's child belongs to its launching window and communicates over stdio. Other windows read its disk record. Session identity survives child exit. The next prompt resumes that identity from disk.
 
-Session identity outlives the process. The Panel sends each prompt to its named session, and the extension starts a fresh child with that id when no current child owns it. The transcript remains the record used by the timeline.
+Idle control children read usage, catalogs, skills, or MCP state without starting a session. The host reuses an eligible idle child and closes temporary children after controls settle. Opening Servers on a Claude draft retains its provisional child through status refreshes and the first prompt.
 
-Idle control reads use a child that starts no session. They supply account usage, model catalogs, skills, or MCP state without writing a prompt. `agenthost.ts` reuses a live idle child when it can and closes it after the requested controls settle. A Claude draft is the exception. Opening Servers retains its provisional child for pending status refreshes and the first prompt.
+Resumes, compactions, and handoffs use the session's recorded working directory, including sessions discovered in another worktree. Unrelated new work uses the editor's open folder. A new child can announce identity before its disk record exists. Retain the selected synthetic row until discovery replaces it.
 
 ## Shared vocabulary
 
-`agentwire.ts` defines asks, answers, session events, settings, and turn outcomes. `claudewire.ts` and `codexwire.ts` reduce their vendor messages to those values. `activitydetail.ts` assigns known operations an explicit detail policy and reads only safe subject fields from unknown tool inputs. Prompt box and host code must use these shared values.
+Use the values in [`agentwire.ts`](../extension/src/agentwire.ts) for host and prompt box communication. Wire adapters translate provider-specific prompts, asks, activity, outcomes, and control readings. Prompts contain text and staged file descriptors. String callers normalize to that value without files.
 
-Prompts use a shared value containing text and staged file descriptors. Vendor-specific content blocks stay inside the wire adapters. String callers are normalized to the same value with no files.
-
-The shared stream includes:
-
-- readiness and settled session identity
-
-- busy state and streamed response text
-
-- visible work activity with stable source ids, including narration, clear reasoning summaries, tools, plans, and collaboration
-
-- permission or question asks
-
-- completed, interrupted, and failed turn outcomes
-
-- model catalogs, usage, rate limits, commands, and MCP reports
-
-The adapters retain source-specific fields only where a later decision needs them. Unknown messages are ignored or reported without blocking the line reader.
+Retain stable source identities so recorded activity replaces live activity. Unknown tool inputs contribute only safe subject fields through `activitydetail.ts`. Unknown protocol messages must not block the line reader.
 
 ## Claude stream-json
 
-Claude starts in stream-json input and output mode with verbose records and partial assistant messages. The permission prompt tool is set to stdio so tool permissions and `AskUserQuestion` arrive as control requests. The flag is required even though it is not shown in the CLI help.
+[`claudewire.ts`](../extension/src/claudewire.ts) uses the [launch flags](agent-launches.md#agent-launch-commands). Control replies share stdout with turn events. Match replies by request ID and expire unanswered controls. Seed resumed session identity before output arrives.
 
-A permission question arrives as a tool-use request. An answer allows that request with an answers map keyed by the question text. Denial includes the reader's reason.
+Claude permission and `AskUserQuestion` requests require stdio permission routing. Question answers allow the tool request with an answers map keyed by question text. Denials include the reader's reason.
 
-A resumed child may not announce its session id until it produces output. The launch plan seeds the expected id so the host can associate the first prompt and any compaction with the correct session.
+Classify completed assistant messages, not partial deltas. A tool-use stop becomes Activity narration. Other stops retain response text. JPEG, PNG, GIF, and WebP become base64 image blocks. PDFs become document blocks, and text media types become UTF-8 documents. Reject other binary types before acceptance. Base64 stays inside the wire envelope, outside saved prompt box state and webview messages.
 
-Native Claude compaction uses the `/compact` command published by its initialization response. It uses a distinct control operation. [Prompt delivery](prompt-delivery.md#compaction-and-reset) owns queued submissions with comments or files.
+Local command results carry `num_turns: 0` and null `stop_reason`. A local command result arrives in well under a second. Model work reports positive turns. Keep local command settlement separate from model completion. [Timeline parsing](timeline.md#shared-turn-model) owns whether recorded command scaffolding opens or withdraws a turn.
 
-Claude control responses share stdout with turn events. Request ids pair responses with callers, and unanswered controls expire so one missing response cannot hold the host open.
+### Clear identity
 
-Claude's text cannot be classified from a partial delta alone. A completed assistant message that stops for tool use becomes Activity narration. A message that stops for any other reason remains response text. Tool-use ids and message ids let the transcript copy replace the temporary live copy.
+`/clear` keeps the child and switches to a new transcript. The old transcript stays resumable. The CLI emits `conversation_reset`, followed by `system/init`. Read successor identity from that init. The reset's `new_conversation_id` does not name the transcript. `system/init` repeats for local commands, so only a changed session ID establishes a successor.
 
-JPEG, PNG, GIF, and WebP files become base64 image blocks. PDFs become base64 document blocks. Text media types become UTF-8 text document blocks. Other binary media types are rejected before the prompt is accepted. Base64 exists only in the Claude wire envelope and never in saved prompt box state or webview messages.
+### Guarded receipts
 
-A command the CLI answers by itself still reports a result. The result carries the command output as `result`, `num_turns` of zero, and a null `stop_reason`, and it arrives in well under a second. A real turn reports at least one turn and a cost. That count is how the panel tells a command the agent ran from a turn that produced nothing. A harness control such as `/model` or `/context` writes no turn the transcript reader can find. Neither does a command the CLI records only as a `system` record. A command the CLI records as a typed user record, such as `/rename` or `/usage`, opens a turn, and its recorded answer withdraws that turn. [`timeline.md`](timeline.md) describes that rule.
+Every hosted child uses `--replay-user-messages`. Guarded follow-ups and continuations carry a client UUID and start native submissions. Acceptance requires a root replay with that UUID, the same session, and exact text. Replay frames never enter display.
 
-`/clear` keeps the child and starts a new session inside it. The transcript it was writing stays on disk, complete and resumable, and everything after that moment is written to a new file. The CLI announces the change with a `conversation_reset` message, then repeats `system/init` under the new id.
+An idle follow-up without its replay remains unknown after a result or idle report. Live input retains its receipt window across both. Exit or 120 seconds without a matching replay leaves delivery unknown. A slash replay transfers model ownership only after root model output names that input UUID.
 
-**Read the successor id from that `system/init`, never from the reset message.** The reset carries `new_conversation_id`, which is not the session id that names the transcript file. A panel that follows `new_conversation_id` watches a file that is never written.
-
-`system/init` repeats before every local command result, so its arrival means nothing on its own. Only a change of session id does.
-
-Every hosted Claude session starts with `--replay-user-messages`, because guarded follow-ups and continuations use the replay as their receipt. The follow-up write starts a native submission, as an ordinary prompt does. The follow-up carries a client UUID. Only a replay frame with that UUID, the same session, root scope, and exact text accepts it. For idle follow-ups, a result or idle report without that frame leaves the outcome unknown. Live input retains its receipt window across the original result and idle report. Child exit or 120 seconds without a matching frame leaves either outcome unknown. Replay frames never reach display. A slash replay permits model ownership transfer only when subsequent root model output names that input UUID. A participating result requires positive model turns. When participant UUIDs resolve to usable retained input receipt generations, a zero-model result settles only those inputs. This correlated settlement preserves unnamed inputs and unrelated model work. Settled inputs lose pending reader authority. A result without a local command or usable matching receipt generations follows generic completion, including its model cohort ending rules. A native local result instead settles its matching command and preserves a valid delayed replay.
+Positive model turns establish participating model completion. A zero-model result with usable retained participant generations settles only those inputs. Preserve unnamed inputs and unrelated model work. Without usable correlation or local command identity, apply generic completion. Local results settle their matching command and preserve a valid delayed replay. [Native ownership](session-compaction.md#native-turn-and-compaction-contracts) defines host attribution.
 
 ## Claude Remote Control
 
-A Claude child toggles Remote Control through a `remote_control` control request with `enabled` set to true or false. The request writes no user message, so it starts no turn. Arc sends it only when the child's initialize reply reports `remote_control_available: true`. An absent or false value refuses the toggle before any request. The initialize reply also carries auto-enable fields. Arc ignores them and never connects without the reader's command.
+`remote_control` sends an `enabled` boolean and starts no turn. Require `remote_control_available: true` in initialize. Ignore auto-enable fields. The toggle uses only this window's live Claude child. Refuse drafts, agent runs, absent children, and fixed read-only policies. Start no child for a toggle.
 
-A successful enable reply carries `session_url`, `connect_url`, `bridge_epoch`, and `bridge_session_id`. Arc keeps the epoch and passes the session link to the notification. The bridge identity never replaces the local session id. A disable reply carries no fields. An error reply leaves the previous state.
+Enable replies carry `session_url`, `connect_url`, `bridge_epoch`, and `bridge_session_id`. Keep the epoch and report the session link. Bridge identity never replaces local identity. Disable replies carry no fields. Errors retain prior state.
 
-`ClaudeWire` keeps one Remote Control state per child: off, connecting, connected, disconnecting, or uncertain. A toggle request that passes the control deadline leaves the state uncertain. Its request id stays registered, so a late reply settles the state and produces a notification. While the state is uncertain or a toggle is pending, further toggles are refused without a request. Arc never retries a toggle.
+States are off, connecting, connected, disconnecting, and uncertain. A control timeout retains the request ID and becomes uncertain. A late reply settles it and notifies the reader. Refuse further toggles while pending or uncertain. Never retry automatically.
 
-A `system` message with subtype `bridge_state` and state `failed` or `policy_disabled` ends a connected state. It changes nothing when the message and the stored state both name a `bridge_epoch` and the two differ. `ClaudeWire` keeps a failure that arrives while a toggle waits for its reply or while the state is uncertain. When that reply would leave the state connected, the epoch rule compares the kept failure with the reply's epoch. A match sets the state to off. Other bridge states change nothing. A closed child sets the state to off, and a reply after close changes nothing.
-
-Remote Control acts only on a running Claude child that this window owns. Drafts, agent-run sessions, sessions without such a child, and children with a fixed read-only launch policy are refused. The toggle starts no child. Prompts and permission answers that come from a remote client have no Arc handling beyond the ordinary stream-json events.
+`bridge_state` failures `failed` and `policy_disabled` disconnect unless both epochs exist and differ. Retain failures received during pending or uncertain toggles. Apply that epoch check against a later successful enable reply. Ignore other bridge states. Close sets off and ignores late replies. Remote prompts and permission answers use ordinary stream events.
 
 ## Codex app-server
 
-Codex speaks JSON-RPC through `codex app-server`. Server requests carry both a method and an `id`. Request id `0` is valid and must not be tested for truthiness. Notifications carry no request id.
+[`codexwire.ts`](../extension/src/codexwire.ts) translates JSON-RPC over stdio. Server requests contain a method and `id`. ID `0` is valid. Notifications have no request ID.
 
-Self-compaction admits live agent commands with no PTY process identity and live unified-exec startup commands with a process identity. Execution mode does not establish caller identity. User-shell commands, unified-exec interactions, unknown sources, and settled commands supply no initiating authority. The literal command and exact session and turn must also match.
+Start or resume establishes the thread. `turn/start` acceptance establishes prompt delivery and supplies the authoritative active turn ID. Stop waits for a pending start response, then interrupts the owning thread and oldest unfinished turn. Submissions with one server turn ID finish together. Late completions cannot disarm newer turns.
 
-Thread start or resume establishes the session. A prompt is accepted only after `turn/start` succeeds. The host does not show a prompt as delivered while the server can still reject it.
+Clear and `/new` start a thread with current settings. `/new` passes its optional same-line name to `thread/name/set`. The session event carries the predecessor ID for reset ownership. Another client's exclusive rollout writer requires continuation through a fork. Send subsequent input to the returned thread.
 
-Compaction uses `thread/compact/start` with the established thread id. `turn/start` does not parse the CLI's slash commands. Sending `/compact` there gives the text to the model, which can answer it or select a similarly named skill. The empty native response only acknowledges the request. The host remains busy until the compaction turn reported by `turn/started` reaches `turn/completed` or `turn/failed`.
+File approvals name an item ID, without paths. Join the active `fileChange` item and republish an ask when details arrive later. Answer with the original server request ID. Live changes are arrays, while saved rollout changes are object maps.
 
-Clear and `/new` use `thread/start` with the current session settings. `/new` accepts the rest of its line as the new session name and applies it through `thread/name/set`. The new thread emits a session event with the previous thread id, so the panel records the reset edge and follows the successor.
+Commentary becomes Activity, and final-answer text becomes the response. Display only clear reasoning summaries. Empty, signed, encrypted, and raw reasoning supply no visible text. [Asynchronous messages](question-recovery.md#codex-asynchronous-questions) follow separate answer rules.
 
-Recent rollout `compacted` records include `latest_token_usage_record.usage` for the completed compaction request. The following `thread_settings_applied` record can supply its model and billing route. The parser reads that request only. It does not infer a compaction charge from the record's cumulative counters. Codex records no trigger. The parser uses the containing non-replayed turn: normal work before the boundary is automatic, and a known empty dedicated turn is manual. An incomplete turn start remains unknown. Context size does not identify the trigger.
+Images use `localImage`. Other files use `mention` with display name and staged path. Requests contain paths and metadata, never file bytes. Check the saved SHA-256 digest before delivery. Retain staged files until the turn ends.
 
-The `turn/start` response is the authoritative source for the active turn id because it is paired with the request that began that turn. Stop waits for a pending start response, then sends `turn/interrupt` with both the owning thread id and that turn id. Prompts accepted while work is in flight can share the same server turn id and complete together. Stop targets the oldest unfinished server turn. A matching completion clears every submission grouped under that id, while a late notification cannot disarm a newer turn.
+### Guarded input
 
-Codex gives a rollout an exclusive writer. When another client owns the source thread, the panel offers continuation. Acceptance forks the stored thread, sends the prompt to the returned thread id, and uses that session for later messages.
+Live input uses `turn/steer` with exactly one eligible running root and its expected turn ID. Acceptance requires the same returned ID. It creates no submission or completion owner. Manual or unresolved compaction and ambiguous roots block it. Uncertain writes stay unknown and never enter the queue automatically.
 
-Approvals are server requests. Interrupt is a client request, and the resulting non-completed turn is translated to `interrupted` rather than a user-visible failure.
-
-A file approval carries no changed path. Its item id joins it to the active `fileChange` item, and the wire republishes the normalized ask when the item arrives after the request. The original server request id remains the identity used for the answer.
-
-Codex agent messages carry a phase. Commentary is visible Activity and final-answer text is the response. Reasoning contributes a row only when the server supplies a clear summary. Empty and encrypted reasoning content is not displayed. Command, plan, and collaboration items keep their item ids so starts, completions, and transcript records reconcile.
-
-Codex image files become `localImage` inputs. Other files become `mention` inputs with their display name and staged path. The JSON request contains paths and metadata only. It never contains the file bytes. The staged file is checked against its saved SHA-256 digest before delivery and remains available until the Codex turn ends.
-
-Guarded live input uses turn/steer with exactly one eligible running root and its expected turn ID. Acceptance requires that same ID in the response. It creates no submission or completion owner. Compaction and ambiguous roots prevent live input. Every uncertain post-write result stays unknown and never enters the queue automatically.
-
-A guarded follow-up is accepted on its own `turn/start` response. A returned turn ID that the wire saw before the write, or that another pending start holds, means the input joined a shared turn. That outcome is unknown, and the follow-up's assignment goes stale. Every error response after the write also leaves the outcome unknown. A compaction request that got no answer withholds idle evidence and refuses a guarded follow-up until its late turn ends, because that turn can still start.
+A guarded follow-up requires its own `turn/start` acceptance. A returned ID known before writing, or held by another pending start, identifies shared work. Its outcome stays unknown and its assignment becomes stale. Post-write errors also stay unknown. Unanswered compaction withholds idle evidence until its late turn ends.
 
 ## Session rename
 
-Each agent writes a session's new name itself. Arc never writes a transcript record, a title file, or an index entry.
+Each provider persists names. Arc never edits transcript records, title files, or indexes. Clean names once, reject empty results, and serialize renames per session. Reuse a live child, including after its opening completes. Renames start no model turn and work while a turn runs.
 
-Claude renames through the CLI's `rename_session` control request. It carries the name, the session id Arc resolved for the session, and `source` set to `host`, which tells the CLI that a person renamed the session in the application hosting it. Claude Code persists the name in a transcript `custom-title` record or `<transcript directory>/<session id>/custom-title.json`. It answers on the control channel and writes no result, so the rename runs no turn and costs nothing.
+Claude uses `rename_session` with the resolved session ID and `source: host`. A different current session, unanswered control, or provider refusal fails the rename. Late replies settle nothing. An existing rename also requires the whole saved `<transcript directory>/<session id>/custom-title.json` value to match. Claude can report success without saving it.
 
-The CLI refuses a session id that is not the one its process is in, with `session_id is not the current session`. That refusal fails the rename, and so does a request the CLI does not answer within the control deadline. A child that runs the session keeps running through both. A rename-only child is disposed, because it was started for the one request. The answer is matched by its request id, so a late one settles nothing.
+Read at most 4 KiB of that sidecar. Initial naming also accepts the newest complete matching `custom-title` in a 16 KiB transcript tail, ahead of the sidecar. Check at most six times, 50 ms apart, only during renaming. Initial confirmation requires the accepted transcript. Its cwd establishes membership, or an exact project slug when cwd is missing. Multiple matches refuse confirmation.
 
-The control channel is read beside the turns rather than inside one, so a rename applies while a turn is running. A typed command line does not: the CLI reads it when the running turn ends.
+Codex uses `thread/name/set`, including typed `/rename`, and returns provider refusals. Initial naming persists an activation-owned operation before launch acknowledgment. Only an exact-session empty-rollout refusal permits recovery. Qualified metadata changes wake at most 40 requests, independently of panel visibility and catalog admission. Each keeps its provider control deadline. Other naming failures retain launch acceptance.
 
-Claude Code reports success for a rename it could not save. An existing session rename counts only when the saved title file holds the requested name. Initial naming also accepts the newest complete `custom-title` for the accepted session in a bounded 16 KiB transcript tail. That transcript title takes precedence over the sidecar for initial naming. Arc reads at most 4 KiB of `custom-title.json` and compares the whole saved value. It checks up to six times, 50 ms apart. These reads happen only inside a rename, never on the listing path. Initial confirmation resolves only the accepted transcript. Recorded cwd determines membership. Missing cwd requires an exact project slug. Multiple matching transcripts refuse confirmation.
+Persist requested and confirmed initial-name states separately, outside browser state. Save a possible-write marker before provider submission. Reload cancels proven-unsent operations and retains possible writes as uncertain, without replay. Reader renames synchronously supersede pending initial names. After opening and earlier-rename waits, recheck ownership and observed titles. A matching title settles without another write. A different title cancels unsent initial naming. Explicit renames follow submitted initial writes. Source or child replacement, scope loss, archive, and disposal cancel unsubmitted work.
 
-Arc cleans the name once, before either agent call, and sends nothing when the cleaning leaves nothing. The Claude wire sends the cleaned name as given.
-
-Arc runs one rename of a session at a time. Two renames sent together read the same transcript end, and the session keeps only the record the agent wrote last.
-
-Codex renames through `thread/name/set` with the thread id and the name. A typed `/rename` in a Codex session takes this path too, because `turn/start` gives the text to the model. The server writes the name to the index every Codex client reads, and a refusal rejects with the server's message. Initial naming retains an activation-owned operation in saved panel state before launch acknowledgment. Only an exact-session empty-rollout refusal permits recovery. Qualified metadata changes wake at most 40 requests, independently of panel visibility and catalog admission. Each request retains the provider control deadline. Other refusals fail naming without changing launch acceptance. It reads no turn, so this rename also applies while a turn is running.
-
-Initial-name operations retain requested and confirmed states separately. The host preserves them across preference saves and resets and excludes them from browser state. Each request requires a saved possible-write marker before provider submission. Reload cancels proven unsent operations and retains unresolved possible writes as uncertain, without replay. Reader renames supersede pending initial names synchronously. Provider submission checks ownership and observed titles after opening and earlier-rename waits. A matching title settles naming without another write. A different title cancels the unsent initial name. An explicit rename follows any submitted initial write. Source replacement, child replacement, scope loss, archive, and disposal cancel unsubmitted work.
-
-A session with a running child renames through that child, whatever that child is doing. A session that is still opening renames through its child once the opening ends. Any other session starts a rename-only child. The Claude child resumes the session in the folder the session recorded, and sends only the rename request. The Codex child finishes the handshake and sends only `thread/name/set`, without resuming or starting the thread. Either child then closes.
+Without a live child, Claude resumes in the recorded directory and sends only the rename control. Codex handshakes and sends only `thread/name/set`, without opening the thread. Both rename-only children close afterward, including on failure.
 
 ## Child ownership and shutdown
 
-`AgentHost` serializes session opening by host key and provider session id. A resumed writer waits for confirmed process exit, including when the old child adopted its id under a fresh key. A termination request does not release that barrier. Host disposal rejects pending and later openings. A rename-only child is a writer too. An opening of the same session waits for its exit, and it waits for a retiring writer's exit before it starts. Host disposal ends it.
+[`AgentHost`](../extension/src/agenthost.ts) serializes openings by host key and provider session ID. Replacement and rename-only writers wait for confirmed prior exit, including IDs adopted under fresh keys. Termination requests do not release that barrier. Disposal refuses pending and later openings.
 
-`AgentHost` treats a successful opening as settled until the first turn ends. That starts the first idle window. Each turn-end housekeeping batch then receives a new generation. Only the latest generation can start retirement after its usage and MCP reads settle. `arc.agentIdleMinutes` sets the warm window. Changing it restarts timers only for sessions whose current housekeeping generation settled.
+Successful opening settles the initial housekeeping generation and starts retirement eligibility. Each turn-end batch creates another generation. Only the latest usage and MCP completion settles it. `arc.agentIdleMinutes` sets the idle window. A setting change restarts timers only for settled generations.
 
-The timer rechecks that the child is live, idle, has no open ask, and retains no unresolved background work.
+Retirement requires a live idle child, no asks, no unresolved background work, no activity lease, and no opening reservation. Idle and archive retirement also require settled housekeeping. Timer callbacks recheck eligibility. Prompt and control leases cancel retirement before work. Release starts a full idle window when eligible.
 
-The panel publishes its restored archive set when the host connects. It also publishes archive changes and an empty set when the reader clears workspace state. Archiving retires an eligible child immediately. A child is eligible when it has no busy turn, open asks, unresolved background work, held lease or opening reservation. Its housekeeping must also be settled. Otherwise the host waits for those retirement conditions. Unarchiving cancels deferred archive retirement. Identified background launches block idle, archive, and targeted retirement until an identified terminal completion arrives. Clearing the final hold reevaluates retirement without another turn. An eligible unarchived child starts an idle window unless targeted retirement was requested. Missing reads, source replacement, later turns, and display expiry never release these holds. Stop requests and unknown notifications leave the work unresolved. Unresolved work keeps the child indefinitely. Remote Control in any state except off keeps an unarchived child out of its idle window, and its return to off starts a new idle window. Archive, targeted retirement, and shutdown retire a child whatever its Remote Control state. Retirement closes the child's input and requests termination of the child process when it outlives a grace period. Arc sends no signal to processes the child started.
+The panel publishes restored and changed archive sets, and an empty set after workspace clearing. Archive retires an eligible child immediately and otherwise waits. Unarchive cancels deferred archive retirement. Identified background launches hold idle, archive, and targeted retirement until identified terminal completion. Missing reads, source replacement, later turns, display expiry, Stop, and unknown notices never release those holds. Unresolved work retains its child indefinitely.
 
-Prompt and control operations hold an activity lease. The lease cancels timed retirement before work starts. Its release starts a new full idle window when the child remains eligible. Retirement removes only the child. The saved session id and accepted session settings let the next prompt resume the session from disk with the same configuration.
+Remote Control states except off prevent unarchived idle retirement. Returning off starts a fresh idle window. Archive, targeted retirement, and shutdown ignore that Remote Control hold. Closing input precedes termination after the grace period. Replacement waits for exit. Arc never signals processes the child started.
 
-A targeted retirement closes one provisional draft child after any opening or control activity settles. Abandoning a draft retires its retained MCP child. Closing the last panel retires all retained MCP children. Draft profile changes follow the acceptance rule in [Catalogs and applied defaults](session-setup.md#catalogs-and-applied-defaults). Extension disposal closes every remaining child.
+Targeted draft retirement waits for opening and control activity. Abandoning a draft or closing the last panel retires retained draft MCP children. Disposal closes all children and settles pending asks, requests, and completions. Retirement preserves saved identity and accepted settings for resume.
 
-Agent-wide permission and MCP changes lease every live target before they await the first control response. An MCP lease lasts through the final status read. A replacement builds its launch settings after the previous child finishes shutting down. Persisted settings publication preserves provisional draft entries held only by the panel. A Codex fork stores its accepted launch profile under the returned session identity.
-
-Closing input is the first shutdown step. Claude can persist control changes during orderly exit. A process that does not stop after input closes receives a termination request. Replacement waits until the process reports exit.
-
-Each pending ask, open request, and completion promise is settled when the child closes. A dead pipe returns an error to the initiating action instead of leaving the prompt box in a running state.
+Agent-wide permission and MCP changes lease every target before the first await. MCP leases last through the final status read. Build replacement settings after prior exit. Preserve provisional draft settings during publication. A fork stores its accepted profile under the returned identity. [Composer delivery](composer.md#delivery-and-recovery-contracts) owns draft profile acceptance.
 
 ## Settings and control reads
 
-Claude can change the current child's model through its control channel. The control channel carries no request for an effort level. Arc changes a live Claude level by writing the CLI's own `/effort <level>` command on the stream-json input. The CLI handles that command itself and answers with a `result` event. The applied level is read back from the `effort` field on the next assistant record. Codex applies model and effort to the next turn and confirms them through the transcript.
+Claude changes models through controls, but effort uses `/effort <level>`. Book its local command turn before writing. Hold effort picks during work and deliver the latest pick before the next reader prompt, including after accepted Stop. Drop unavailable levels and clear the child's held pick. The previous applied level stays until another command applies. Read applied effort from the next assistant record. Codex sends model and effort with the next turn and confirms them through its rollout.
 
-Codex approval policy, approval reviewer, and sandbox policy are separate protocol fields presented as one reader choice. The `on-request` policy still asks the reader unless `approvalsReviewer` selects auto-review. Thread-start and turn-start sandbox values use different spellings, and `codexwire.ts` translates between them.
+Codex approval policy, reviewer, and sandbox are separate fields. `on-request` still asks the reader without the automatic reviewer. Match all three fields before displaying a preset. Translate thread-start and turn-start sandbox spellings. Custom combinations retain both approval behavior and access boundary.
 
-Rate limits and model catalogs are read from each CLI. Claude answers control requests and can send rate-limit events during a turn. Codex answers JSON-RPC reads and sends update notifications. `usageview.ts` receives normalized snapshots from either route.
+An empty permission value means no Arc override. A live selection retires every child for that agent before subsequent input. Claude then omits `--permission-mode`. Codex omits `approvalPolicy`, `approvalsReviewer`, and `sandbox` on starts and turns. Each provider applies its configuration and policy. Configuration reads for [skill admission](native-skills.md#native-session-skill-admission) and [metadata discovery](composer.md#delivery-and-recovery-contracts) remain separate from permission overrides.
 
-Account reads serialize per agent. Two reads share one request only when they target the same session or draft for MCP discovery. A selected owner's read starts in that owner's recorded working directory.
+Live controls display reported effective permissions, but menu selection follows Arc's stored override. Draft controls display their profile. Same setup as current copies that override, including empty, rather than the child's effective mode. Without a stored override, new setups and handoff drafts use the new-setup permission choice.
 
-Codex caches account eligibility for each app-server process. Read again independently rediscovers eligibility before renewing managed authentication for supported usage reads. Fresh idle children also renew authentication on explicit supported reads. A long-lived process keeps the credentials it opened with. An eligible idle sibling supplies the account reading when another child remains busy. A fresh control child reads Codex accounts when only obsolete siblings are idle. When all live children are busy, both agents wait without interrupting work or changing active authentication.
+### Account reads
 
-Read again selects the newest eligible idle Codex source unless MCP discovery selects its idle owner. A surviving older child becomes eligible after the authoritative source exits or retires. Discovery revisions reject obsolete replies, and source identities reject obsolete notifications. Rejected usage admission leaves model catalogs independent.
+Usage and rate limits are provider snapshots, separate from local turn totals. Claude account resets use ISO timestamps. Live rate-limit resets use Unix seconds. The monthly money cap has no reset. Idle children cannot read another process's response headers. Claude reports Max without its multiplier, because Arc does not read the local auth profile. Persist live reset windows in workspace state until their reset times pass. Codex model-bucket names remain part of limit identity, separate from account aggregates.
 
-Each explicit attempt has a 120-second deadline from its accepted press, including queue and busy waits. Expired requests cannot dispatch unsent reads. A sent read retains its ownership until it settles. Retry joins that read without a second authentication renewal. Late supported readings update figures without changing an expired attempt's outcome.
+Serialize account reads per agent. Share requests only for the same session or draft MCP owner. Start selected-owner reads in its recorded directory. Codex caches account eligibility per process. Explicit Read again rediscovers eligibility before supported managed-auth renewal. Fresh idle children also renew on supported explicit reads. Long-lived children retain their opening credentials.
 
-Unsupported account discovery releases account ownership, joined attempts, deferred waits, and the refresh deadline before catalogs finish. Model catalogs, commands, and MCP discovery remain independent. Account completion releases automatic and explicit read ownership before model catalogs or MCP status finish. Each operation has its own identity, so an older catalog completion cannot release a newer account read. Failed and empty answers retain the previous readings. Explicit failures appear in usage detail, while automatic failures remain quiet. Discovery stays hidden until the account supports subscription reads. Queued, waiting, reading, and terminal status stay in memory and never enter account history or workspace state.
+Select the newest eligible idle Codex source unless MCP selects its idle owner. An older survivor becomes eligible after the authoritative source exits. Use an eligible idle sibling while another works, or a fresh control child when only obsolete siblings are idle. When all children work, both providers wait without interrupting them or changing active authentication. Discovery revisions reject obsolete replies. Source identities reject obsolete notifications. Rejected usage admission does not invalidate model catalogs.
 
-## Failure interpretation
+Explicit attempts have a 120-second deadline from acceptance, including queue and busy waits. Expired attempts cannot dispatch unsent reads. Sent reads retain ownership until settlement. Retry joins them without another authentication renewal. Late supported readings update figures without changing expired outcomes.
 
-Both CLIs use failure-shaped records when the reader interrupts a turn. The adapters recognize each protocol's interrupt marker before they classify a failure.
-
-A command with a nonzero exit is failed activity, not necessarily a failed turn. A turn failure comes from the agent protocol's turn outcome. The card can show the activity row without claiming the whole turn failed.
-
-Launch, handshake, control, and prompt deadlines are separate. Their messages name the action that failed so the prompt box can offer an appropriate next step.
+Release account ownership, joined attempts, deferred waits, and deadlines independently of catalogs, commands, and MCP reads. Unsupported discovery also releases them. Older catalog completions cannot release newer reads. Failed or empty replies retain previous figures. Explicit failures appear in usage detail. Automatic failures stay quiet. Hide discovery until subscription reads are supported. Attempt status stays in memory, outside account history and workspace state. Model catalogs must follow every `nextCursor` under `data`.
 
 ## Hosted read-only launches
 
-`launchpolicy.ts` supplies immutable launch restrictions. `launchpolicystore.ts` retains one policy per session in shared Arc storage, independently of workspace settings. Editor windows using the same Arc home share restrictions. Lookup and atomic writes address one hashed session path without scanning other policies. Restrictions have no eviction rule. Unreadable saved restrictions block continuation. Live child restrictions apply during opening, before persistence. Successor identity events save the policy before moving panel ownership. Clear and fork retain it. Replacement children receive it before input. Agent-wide permission picks refuse before changing defaults or retiring a restricted child, and identify the child that blocks the change.
+[`launchpolicy.ts`](../extension/src/launchpolicy.ts) defines restrictions. [`launchpolicystore.ts`](../extension/src/launchpolicystore.ts) persists them per session in shared Arc storage, without eviction. Editor windows sharing an Arc home share policies. Unreadable restrictions block continuation. Apply live restrictions during opening and persist successor restrictions before moving panel ownership. Clear, fork, replacement, follow-ups, and permission changes must retain them. Agent-wide permission picks refuse before changing defaults or retiring a restricted child.
 
-Codex opens, resumes, and forks threads with approval policy `never`, reviewer `user`, and sandbox `read-only`. Every turn carries the same approval fields and a `readOnly` sandbox policy. Clear opens another restricted thread. Provider rejection prevents input. The sandbox denies filesystem writes. It does not establish denial of external MCP effects.
+Codex starts, resumes, forks, and turns with approval `never`, reviewer `user`, and a read-only sandbox. Threads use `read-only`, while turns use `readOnly`. Provider rejection prevents input. The sandbox denies filesystem writes and establishes no denial of external MCP effects.
 
-Claude disables permission prompts and clears user, project, and local setting sources. Launch settings set `disableAllHooks`. MCP configuration stays isolated. Read, Grep, and Glob receive allow rules. Both modes deny these tools:
+Claude disables permission prompts, user/project/local setting sources, and hooks. It isolates MCP configuration and allows Read, Grep, and Glob. [`claudeReadOnlyArgs`](../extension/src/launchpolicy.ts) owns the complete denied tool and git-command lists. Plain read-only launches deny PowerShell. Bash uses auto mode on supported models and `dontAsk` otherwise. Auto mode can approve shell writes, so Claude provides no filesystem immutability guarantee.
 
-```text
-Edit
-Write
-NotebookEdit
-MultiEdit
-WebFetch
-WebSearch
-Task
-Agent
-CronCreate
-CronDelete
-DesignSync
-EnterWorktree
-ExitWorktree
-PushNotification
-RemoteTrigger
-ScheduleWakeup
-SendMessage
-ShareOnboardingGuide
-TaskStop
-```
+Git denials cover exact verbs and arguments, optional `-C` directories, argument-bearing branch/notes/remote/tag operations, and `--output`. Keep the generated rules with their source lists. [Policy tests](../extension/src/launchpolicy.test.ts) cover isolated permissions and exact MCP reads.
 
-Plain read-only launches also deny PowerShell. Bash uses auto mode for supported models and `dontAsk` for older models. The auto classifier can approve shell writes, so these restrictions do not guarantee filesystem immutability. Bash denies each git verb below, with and without arguments. Each rule also covers an optional `-C` directory.
-
-```text
-add
-am
-apply
-archive
-bisect
-bundle
-checkout
-checkout-index
-cherry-pick
-clean
-clone
-commit
-commit-tree
-config
-credential
-fast-import
-fetch
-filter-branch
-format-patch
-gc
-hash-object
-init
-maintenance
-merge
-merge-file
-mergetool
-mktag
-mktree
-mv
-pack-refs
-prune
-pull
-push
-read-tree
-rebase
-reflog delete
-reflog expire
-repack
-replace
-rerere
-reset
-restore
-revert
-rm
-sparse-checkout
-stash
-submodule
-switch
-symbolic-ref
-update-index
-update-ref
-worktree add
-worktree lock
-worktree move
-worktree prune
-worktree remove
-worktree repair
-worktree unlock
-write-tree
-```
-
-Rules also deny branch, notes, remote, and tag with arguments, including an optional `-C` directory. They deny git commands containing `--output`.
-
-Exact MCP launches use `dontAsk` and deny Bash and PowerShell. Each requested name identifies one tool without wildcards. Arc copies requested server definitions from Claude's user, project, and local MCP configurations into an isolated launch configuration. Local definitions take precedence over project definitions, then user definitions. Arc reads project `.mcp.json` at the enclosing Git root or the launch directory outside Git. User and local definitions come from `~/.claude.json`, or `.claude.json` under `CLAUDE_CONFIG_DIR`. Each selected configuration file has a four MiB limit. An oversized project `.mcp.json` or user/local `.claude.json` prevents launch. Missing requested definitions prevent launch. Inherited user, project, and local permission grants and hooks do not enter this configuration. Plugin servers and claude.ai connectors do not enter it.
-
-Delegated Claude launches default to a five-minute prompt-cache lifetime. Explicit environment values retain precedence. Ordinary reader launches retain the provider cache default.
-
-## Runtime constraints
-
-- Session identity comes from the saved session id and disk record, not from process lifetime. Closing the window ends children. The next prompt resumes from disk.
-
-- `AgentHost` owns idle and archive retirement. A successful opening starts the first idle window. The panel sends restored, changed, and cleared archive sets to the host. Turn-end housekeeping uses session generations so an older completion cannot settle a newer turn. Process operations reserve opening keys and hold retirement leases. They restart a full idle window when they finish. A resumed writer waits for confirmed exit or terminal closure from the prior child with the same provider session id. Every timer callback rechecks busy state, open asks, and unresolved background work before it closes a child. Host disposal prevents pending openings from starting another process.
-
-- A draft's setting controls change only that draft. Its accepted model, effort, and permission mode move to the real session id and become that session's resume settings. The panel publishes those settings only after identity adoption succeeds. The same path publishes settings copied to a `/clear` successor. A draft press routed through the live pick path would change existing sessions.
-
-- A fresh child starts from the draft's own frozen copy of its setup. A pick that updates the stored profile alone starts the child on the setup the reader replaced.
-
-- Opening Servers on a new Claude draft starts the child under the draft's first-prompt host key. Pending states refresh against that child. The first prompt reuses it. Draft removal or panel closure retires it without creating a started-session record.
-
-- A fresh child can report its session id before the transcript or rollout is discoverable. Keep the selected synthetic row under that actual id until the disk record replaces it.
-
-- The panel sends every Claude prompt with a human origin, and the CLI copies that origin onto the prompt record. The Claude agent-run rule reads a human origin as a person, so a session driven from the panel reads as a person's in every window.
-
-- Claude Code writes some system records with no person present: `stop_hook_summary`, `compact_boundary`, `turn_duration`, `api_error`, `informational`, and `away_summary`, its recap for a session left unattended. The agent-run rule skips those subtypes in a transcript whose records carry an SDK entrypoint, such as `sdk-cli`. It also skips them once `sessionKind: 'bg'`, the field `claude --bg` writes, has arrived by the time the whole file is read. Older editor and terminal builds write no human origin. Under every other entrypoint, with no `sessionKind: 'bg'` in the file, each of those records reads as a person. Every other system record, `local_command` among them, reads as a person under every entrypoint. A slash command with no origin is the run's own prompt in an SDK-only transcript. An SDK-only transcript never counts a typed prompt with no origin toward a second prompt. That is what a resumed `claude -p --resume` review leaves behind. In a background session, the launch prompt carries a human origin, and the rule excuses it whether it is typed or a slash command. A second prompt of either form with a human origin reads as a person. In a background session, a follow-up prompt with `promptSource: 'sdk'` and no human origin is the dispatching agent's own. It is not counted at all, so a background session whose only prompt is shaped that way reads as the owner's, not a run.
-
-- The Claude agent-run rule answers run only after a turn finishes, because a person's first turn shows no sign of a person yet. An SDK-only transcript with no `sessionKind: 'bg'` is the exception. Its prompt with no human origin did not come from the panel, so a reviewer or worker that another agent started files under Run by agents while its first turn runs. Every later sign of a person still ends the run answer. The exception assumes that the panel is the SDK host with a person at the keyboard, and that it sends a human origin on every prompt. A person in another Agent SDK host that sends no human origin files under Run by agents during the first turn, and after that turn finishes. A background session keeps the finish requirement, because its first prompt carries a human origin.
-
-- A panel session whose prompts carry no human origin reads as an agent run in its own transcript. The Claude rule reads the absence of a person, and a first turn shows none. The panel's launch record (`startedHere`) overrides that guess for the sessions it started. A dispatched session answers run whenever it and its parent both have a session row, because the parent's shell command is a positive fact. The reader owning the session is the one fact that outranks it. The reader owns a dispatched session when its receipt is owned, or when its transcript holds a sign that only a person leaves: a prompt or a slash command with a human origin, a follow-up queued while the agent worked that `isReaderQueued` reads as the reader's, an editor tag on a prompt after the launch prompt, or a tool call the reader refused. A background session's launch prompt is no sign, whether typed or a slash command, because `claude --bg` sends it with a human origin itself. `scanForPerson` in `transcript.ts` reads those signs apart from the transcript's guess, because a guess of a person also covers a first turn that has not finished. The catalog worker scans a running child from the size it first sees, so a running child costs little more than its metadata. That scan counts no typed prompt and reads no editor tag, because it cannot see the prompts written before it. It reads a slash command with a human origin as a sign. The one exception is the first prompt the scan reads, when that prompt is a slash command, in a background session whose bytes before the scan's start hold no user record, because that command is the launch prompt. A slash command that follows an earlier prompt in the same scan counts as a person's. The worker reads those bytes whenever a fresh scan starts above byte zero: when it first sees the child, after the file shrinks, and when a quiet child with no held scan becomes active again. Each of those reads stops at the first user record. Once the child is quiet, the spend read of its whole file reads every sign, so the fact costs no read of its own. A session the reader owns keeps its dispatch edge for its heading and its parent's cost. The launch record wins over a dispatch edge, because an opted-in wrapper's receipt can name a session this window started. The record outlives the window, because the transcript never becomes any more readable. The panel applies the override where the answer is read. The cached transcript reading stays true for a window that did not start the session.
-
-- The metadata tail answers the Claude agent-run rule only when it reaches the start of the file. Session list enrichment scans a larger top-level session whole in the progressive worker, beside its turn starts, and stores the answer and its byte cursor in the derived session cache. Both the metadata tail and the whole-file scan skip a half-written last record, a last line with no newline that does not parse, and answer from the lines before it. Both read a complete line that does not parse as a person. The metadata tail reads a last line that parses but has no newline yet, and the scan answers a person until that newline arrives. The scan answers run for an SDK entrypoint, or for `sessionKind: 'bg'` arriving on or before any record naming another entrypoint. A non-SDK entrypoint seen with no `sessionKind: 'bg'` yet locks the scan to a person at once. A `bg` record later in the file cannot undo that. A person answer is final. A run answer rereads only appended bytes, and a file that shrank is read from the start. A metadata reread of a file that only grew keeps a run answer two ways, because the metadata tail answers nothing past its window. An entry with no scan yet, answered run from the tail read alone, carries that answer forward until the first scan runs. An entry with a scan carries a run answer whenever the scan itself answers run for the bytes it covers, never from the entry's own `agentRun` field, because a scan result that lands through a stale worker read moves the cursor without touching that field, except that a person answer also writes `agentRun: false` there, since a person answer is final and must not show as a run beside it. A scan whose transcript only grew while it ran keeps its cursor, even though its other results are stale. A child transcript never takes this scan: the parent's `Agent` call is the positive fact, and every record in a child transcript is a sidechain record the scan would count as nobody's prompt. The metadata read and the panel's session list row both answer a child transcript as an agent run directly, so a stale cached answer never reaches the reader. A metadata reread also stops carrying a stale scan forward, so a cached entry that disagrees settles to the right answer without a cache clear.
-
-- A reader stop is reported as a failure-shaped outcome by both CLIs. Each wire adapter converts that case to `interrupted`.
-
-- Claude reports one turn ending for the prompt an accepted Stop abandoned, and none for the prompts it canceled. A Stop of a turn the CLI started by itself, such as one for a task notification, gets one ending too. That ending is told apart by the word the CLI puts on it. An abandoned turn ends with `aborted_streaming`, or with `aborted_tools` when the Stop came during a tool. A prompt sent after the Stop ends with `completed`. Counting endings instead strands whichever turn guessed wrong, and that turn then keeps the session busy for the life of the child. `STOP_ENDING_GRACE_MS` bounds how long the ending stays owed, so an unrelated interrupt long afterward cannot claim it. The session list bounds the same claim a second time. A busy child stops answering for a card once the record closes a turn that ended after the child became busy.
-
-- A Claude setting the CLI takes as a command costs a turn. `/effort` and `/compact` both end with a `result` event, which the wire reads as a turn ending. `agenthost.ts` books an open turn before either goes out. Without that booking the ending closes a turn the reader is waiting on. A level picked while the session is working is held rather than sent, and goes out when the session next has nothing running. A prompt the reader sends meanwhile waits for the held level and reaches the child after it, so its turn runs at the picked level. An accepted Stop leaves the session idle without ending a turn, and the held level goes out there too. A level the chosen model does not offer is dropped instead, because the command has no level to name. The drop still reaches the child, which throws away a pick waiting to go out under the old level. The child keeps running at the last level it heard, and the panel ticks no level until the reader picks one the new model offers. `modelChange` in `agenthost.ts` decides all of this.
-
-- A Claude prompt that arrives while a turn runs joins that turn and gets no `result` of its own. One model `result` ends that shared work. Arc launches Claude with `CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS`, so the CLI writes `system` events with subtype `session_state_changed`. The CLI reports `running` when it takes work while idle, and `idle` right after the `result` that leaves it nothing to run. `/compact` and `/effort` follow the same order. [Native turn and compaction contracts](session-compaction.md#native-turn-and-compaction-contracts) define shared live ownership, local command settlement, and joined prompt settlement after model completion. An `idle` report releases attachments for settled submissions and drains the panel queue. A prompt still being prepared stays open. A `running` report, or `requires_action` while a permission ask waits, keeps the session busy until the next `idle`. That covers a turn the CLI starts by itself for a task notification. The CLI reports `idle` while background tasks still run, so a background task never holds `/compact`. An accepted Stop leaves the session idle before the CLI reports it. The CLI answers the Stop, then writes the aborted `result`, then `idle`. The aborted `result` does not count as model completion for idle settlement, so a command sent after the accepted Stop waits for its own `result`. A CLI that never reports its state leaves `result` events as the only turn endings.
-
-- Claude asks depend on `--permission-prompt-tool stdio`.
-
-- Claude reset times have two sources. Account usage carries ISO timestamps on named windows, while live rate-limit events carry Unix seconds from model-response headers. The monthly money cap carries no reset, and an idle child cannot read headers held by another process.
-
-- Claude account usage names the subscription but not its Max multiplier, so a Max account reads as `Max plan` with no tier beside it. The multiplier exists only in the local auth profile, which is not a source the panel reads.
-
-- Live reset windows persist in VS Code workspace state. Reload restores them until their reported reset time passes.
-
-- A Codex `account/rateLimits/updated` notification can carry a named model bucket instead of the account aggregate. The model name is part of the limit identity. Dropping it lets that update overwrite an account window on the same clock.
-
-- Codex server requests are identified by the presence of `id`. Request id `0` is valid.
-
-- A Codex file approval names only its item id. The paths come from the related `fileChange` item, whose changes are an array on the live app-server wire and an object map in saved rollouts.
-
-- Codex `approvalPolicy` decides which requests may surface, while `approvalsReviewer` decides whether those requests stop for the reader or go through auto-review. "Approve for me" needs both settings.
-
-- The empty permission value means Arc has no override for a launcher, draft, or live permission pick. Selecting it for a live session retires every live child for that agent before the next prompt. Claude then launches without `--permission-mode`. Codex starts and turns omit `approvalPolicy`, `approvalsReviewer`, and `sandbox`. Each agent applies its configuration and policy. Arc does not read or edit vendor configuration files. It reads transcript and rollout files without editing them.
-
-- A live permission control names the effective mode the child reports. Its menu checks the agent-default row when Arc has no stored override, even when the effective behavior matches an explicit preset. A draft has no child response, so its control names its profile's permission, and names the agent default only for the empty value.
-
-- `Same setup as current` copies Arc's stored override, including the empty value. A session with no stored override offers the permission a new setup preselects. A handoff draft from that session starts on the same permission. The row does not copy the effective mode reported by a live child.
-
-- The Codex permissions control shows an explicit preset only when approval, reviewer, and sandbox all match. A custom combination names its approval behavior and access boundary. A reader override stays in Arc's VS Code state and travels on the app-server wire.
-
-- Codex slash commands are client behavior, not `turn/start` behavior. Session compaction uses `thread/compact/start`. A literal `/compact` sent as turn input can reach the model or a similarly named skill instead. The manual compaction turn is not steerable, so prompts and another compaction wait until its terminal notification.
-
-- Codex failure causes arrive as a notification string, an object with a `message`, or a turn error. The wire reads each form. Failed turns write no final answer. Lower layers must preserve the cause instead of supplying generic failure text.
-
-- Codex model catalogs put their rows under `data` and continue through `nextCursor`. Stopping while a cursor remains can leave available models out of the picker.
-
-- Accepted capability belongs to the newest discovered child process. Read revisions reject obsolete completions. Older children cannot restore excluded limits through direct notifications.
-
-- Usage and rate-limit values are snapshots reported by the CLIs. They are not reconstructed from local turn totals.
-
-- A Codex rollout has an exclusive writer. If another client holds it, continuation forks the saved thread and sends the prompt to the returned session id.
-
-- A session discovered in another worktree resumes, compacts, and hands off from the cwd recorded in its transcript. Starting unrelated new work still uses the editor's open folder.
-
-- Commentary and clear reasoning summaries are displayable activity. Empty, signed, encrypted, or raw reasoning content is not a source of visible text.
-
-## Verification
-
-`claudewire.test.ts` and `codexwire.test.ts` cover protocol framing and translation. `agenthost.test.ts` uses injected fake children to cover ownership, races, deadlines, shutdown, idle reads, asks, settings, and recovery. `codex.test.ts` and `transcript.test.ts` cover the disk records produced by those protocols.
+Exact MCP launches use `dontAsk`, deny both shells, and accept exact tool names without wildcards. Copy selected definitions from user, project, and local configurations, with local then project then user precedence. Project `.mcp.json` comes from the enclosing Git root, or launch directory outside Git. User/local `.claude.json` comes from `CLAUDE_CONFIG_DIR`, or the home directory. Each file has a four MiB limit. Oversized files or missing definitions prevent launch. Exclude inherited grants, hooks, plugin servers, and claude.ai connectors.
 
 ## Restricted successor contracts
 
-Restricted clear and Codex fork create `launch-policies/pending-clear.json` at the transport's pre-write boundary. Exclusive creation admits one restricted successor operation per Arc home. Positive refusal before attempted input cancels only that attempt's matching reservation while its child remains current and live. Attempted input with an unknown outcome retains the marker. A generic Codex RPC error retains refusal because it supplies no proof of noncreation. While the marker exists, continuation without saved permissions refuses across windows and restarts. Ordinary live events and permission inspection read saved policies without applying continuation admission. Held children retain their immutable policy. Saved-policy sessions and fresh launches retain their own permissions. Confirmation requires the owning child's token and instance, a successor distinct from the source, and identical saved policies. Claude's `init` confirms the successor. Codex's session event confirms after saving the successor policy. An intermediate Claude reset identity does not release admission. Policy-save or confirmation failure retains the marker without expiry. A later Claude `init` from the same child retries saving and confirmation. Successful Claude recovery replays that child's deferred ownership move through the panel's existing session transition. Child exit discards the deferred move and local confirmation authority while preserving durable refusal. Ended children cannot confirm through stale output or a replacement using the same host key.
+Restricted clear and Codex fork exclusively create `launch-policies/pending-clear.json` at the transport's pre-write boundary. Admit one operation per Arc home. Only positive refusal before attempted input cancels a matching reservation while its child stays current and live. Unknown attempted input retains the marker. Generic Codex RPC errors retain it because they do not prove noncreation.
 
-After child loss, resume the saved source with its exact immutable policy through existing input behavior, or start a fresh session. Saving the source's exact policy under a successor's identity permits that successor's own continuation. It does not release refusal for unrelated identities without saved policies. The retained marker blocks those continuations and further restricted clears or Codex forks without a timeout takeover. Child exit removes the live token, so later identity or non-delivery evidence cannot confirm that operation. Transcript absence and file timestamps do not establish non-delivery. Ordinary saved-policy lookup reads one bounded file. Continuation admission checks the marker only when no saved policy exists, without scanning other sessions.
+The marker blocks continuation without saved policies across windows and restarts. It also blocks further restricted clears and Codex forks. Saved-policy sessions, fresh launches, held children, ordinary live events, and permission inspection retain their existing policies or behavior.
+
+Confirmation requires the owning child's token and instance, a distinct successor, and identical saved policies. Claude confirms through `init`, excluding intermediate reset identity. Codex confirms its session event after policy persistence. Save or confirmation failure retains the marker without expiry. A later Claude `init` from the same child retries. Successful recovery replays its deferred panel transition.
+
+Child exit removes local confirmation authority and the deferred transition, preserving durable refusal. Stale output and replacement children cannot confirm. Resume the saved source with its exact policy, or start fresh. Saving that policy under a successor permits only that successor's continuation. It does not unblock unrelated identities. Transcript absence and timestamps never establish non-delivery. Policy lookup reads one bounded file. Continuation checks the marker only without a saved policy and scans no other sessions.
+
+## Failure interpretation
+
+Both adapters recognize interruption before classifying provider failure records. A nonzero command exit is failed activity, without necessarily failing its turn. Preserve Codex causes supplied as strings, message objects, or turn errors. Launch, handshake, control, and prompt deadlines remain separate so failures identify the relevant action.
+
+## Verification
+
+Use `claudewire.test.ts` and `codexwire.test.ts` for translation, and `agenthost.test.ts` for child ownership and races. Use `transcript.test.ts` and `codex.test.ts` for disk interpretation.
