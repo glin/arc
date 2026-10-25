@@ -11,6 +11,8 @@ Read the routes for every subsystem a change reaches. Source paths below are rel
 | Source locations, root overrides, storage provenance, or retention | [Data sources table](data-sources.md#source-catalog), [usage history](data-sources.md#bounded-usage-history), and [environment overrides](development.md#environment-overrides). `store.ts`, `transcript.ts`, `codex.ts` |
 | Transcript admission, repository scope, source collisions, or relationship discovery | [Session discovery](timeline.md#session-discovery) and [relationship contracts](timeline.md#relationship-discovery-contracts). `transcript.ts`, `sessioncoverage.ts`, `repositoryscope.ts`, `progressiveworker.ts` |
 | Selected history, append recovery, parser transport, or cache migration | [Selected history](timeline.md#selected-session-history) and [source contracts](timeline.md#source-and-cache-contracts). `selectedsource.ts`, `parserstate.ts`, `derivedcache.ts` |
+| Saved panel state, metadata checkpoints, or refresh inputs | [Saved state and refresh](timeline.md#saved-state-and-refresh) and [prompt box state](composer.md#state-boundary). `turnview.ts`, `panelhost.ts`, `store.ts` |
+| Turn cards, disclosures, recorded commands, or commit navigation | [Card and disclosure contracts](timeline.md#card-and-disclosure-contracts) and [recorded command and commit contracts](timeline.md#recorded-command-and-commit-contracts). `turncard.ts`, `turnformat.ts`, `commitrepositories.ts`, `gitcommits.ts` |
 | Turn boundaries, outcomes, live subagents, or background activity | [Shared turn model](timeline.md#shared-turn-model), [card sources](timeline.md#card-sources), and [parsing constraints](timeline.md#parsing-and-attribution-constraints). `transcript.ts`, `codex.ts`, `timelinestate.ts` |
 | Cost, context, pricing identity, or delegated attribution | [Accounting contracts](timeline.md#accounting-contracts) and [cost and context](timeline.md#cost-and-context). `sessioncost.ts`, `projectspend.ts`, `pricing.ts` |
 | Project cost refresh, integrity checks, or successful coverage age | [Integrity scheduling](timeline.md#project-cost-integrity-scheduling) and [Project cost](timeline.md#project-cost). `scheduler.ts`, `panelhost.ts`, `projectspend.ts` |
@@ -45,24 +47,24 @@ flowchart LR
     hooks[Claude hooks]
   end
 
-subgraph records[User data]
+  subgraph records[User data]
     transcripts[Claude transcripts]
     rollouts[Codex rollouts]
     snapshots[First-touch snapshots]
     trigger[Manifest and trigger]
   end
 
-subgraph host[VS Code extension host]
+  subgraph host[VS Code extension host]
     watcher[Watchers and poller]
     panelhost[Panel provider]
     child[Live agent child]
   end
 
-panel[Panel webview]
+  panel[Panel webview]
   status[Claude status-line JSON]
   cli[Arc CLI]
 
-claude --> transcripts
+  claude --> transcripts
   codex --> rollouts
   hooks --> snapshots
   hooks --> trigger
@@ -101,7 +103,7 @@ Every extension source package permits imports within itself. The additional loc
 
 | Importing package | Additional allowed destinations |
 | --- | --- |
-| Root files, the explicit `legacy` package | Every recognized package |
+| Root files, the explicit `legacy` package | Any package |
 | `domain/` | None |
 | `readers/shared/` | `domain/` |
 | `readers/claude/`, `readers/codex/` | `domain/` and `readers/shared/`. Neither imports the other provider |
@@ -109,8 +111,8 @@ Every extension source package permits imports within itself. The additional loc
 | `runtime/claude/`, `runtime/codex/` | `domain/` and `runtime/shared/`. Neither imports the other provider |
 | `view/` | `domain/` and every `readers/` package |
 | `webview/` | `domain/` and `view/` |
-| `host/` | Every recognized package, with browser access limited to `webview/protocol.ts` |
+| `host/` | Every recognized package. Its only `webview/` destination is `webview/protocol.ts` |
 
-`domain/`, `view/`, and `webview/` cannot import Node built-ins. `webview/protocol.ts` has one permitted type-only edge into a root module. Its enforced ceiling equals its actual edge count. New source folders require an explicit package rule.
+`readers/`, `runtime/`, and `host/` are planned packages, and their folders do not exist yet. `domain/`, `view/`, and `webview/` cannot import Node built-ins. `webview/protocol.ts` has one permitted type-only edge into a root module. Its enforced ceiling equals its actual edge count. New source folders require an explicit package rule.
 
 [`imports.test.ts`](../extension/src/imports.test.ts) checks package directions, exact editor API exemptions, production fixture exclusions, and runtime cycles. Decisions outside editor glue remain directly importable by Node tests. [`source-tree.test.ts`](../extension/src/source-tree.test.ts) checks the shared [dependency rules](../extension/test/source-tree.ts), recursive inventory, and protocol exception ceiling. [`architecture.test.ts`](../extension/src/architecture.test.ts) checks the [component table](components.md) against source paths and rejects duplicate entries.

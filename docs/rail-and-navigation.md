@@ -210,7 +210,7 @@ Three routes open the heading's menu: right-click on a session heading, `Shift+F
 
 Every menu action has a keyboard route. Actions that change read, pin, or archive state update the shared extension state and repaint the affected surfaces together.
 
-Copy-path actions use one spelling prepared by the extension. Ordinary Markdown file links receive the file menu only after their targets resolve inside an open workspace folder. [Literal file citations](#response-link-and-citation-contracts) retain their separate native actions.
+Copy-path actions use one spelling prepared by the extension. Ordinary Markdown file links receive the file menu only after their targets resolve and pass a check inside an open workspace folder. [Literal file citations](#response-link-and-citation-contracts) retain their separate native actions.
 
 ## Hosting the panel
 

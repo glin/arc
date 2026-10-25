@@ -5,8 +5,8 @@
 *.sh text eol=lf
 *.js text eol=lf
 
-# Keep panel stylesheets on LF line endings.
-# See the stylesheet checks in docs/development.md#verification.
+# Keep panel stylesheets on LF line endings. The stylesheet checks find a rule by searching
+# for its selector after a newline, and none of them matches once the file holds carriage returns.
 *.css text eol=lf
 
 # Extensionless hook entrypoints (Node scripts with shebangs).

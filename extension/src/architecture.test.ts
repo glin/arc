@@ -23,7 +23,7 @@ function source(): ReturnType<typeof inventorySourceTree> {
   return inventorySourceTree(__dirname);
 }
 
-test('the architecture table has one row for every recursive component path', () => {
+test('the component table has one row for every recursive component path', () => {
   const documented = documentedNames();
   const duplicate = [...new Set(documented.filter((name, index) => documented.indexOf(name) !== index))].sort();
   assert.deepEqual(duplicate, [], `the component table repeats ${duplicate.join(', ')}`);
@@ -37,7 +37,7 @@ test('the architecture table has one row for every recursive component path', ()
   assert.deepEqual(
     [...documented].sort(),
     [...discovered.components].sort(),
-    'the architecture table and recursive source inventory describe different component paths',
+    'the component table and recursive source inventory describe different component paths',
   );
 });
 
