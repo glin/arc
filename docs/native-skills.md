@@ -1,6 +1,6 @@
 # Native session skills
 
-Use this guide for automatic skill admission, catalog freshness, and delivery attachments. [Session guidance](arc-sessions.md#automatic-native-availability) owns invocation, collisions, and disablement.
+[Session guidance](arc-sessions.md#automatic-native-availability) owns invocation, collisions, and disablement.
 
 ## Native session skill admission
 
@@ -18,12 +18,12 @@ Windows native qualification covers prompt-free discovery and registration. Nati
 
 ## Codex skill attachment
 
-Read `skills/list` in the child's working directory. Connected `skills/changed` notifications force reload in that directory. Opening defers notifications until its read finishes. Refresh bursts coalesce into one trailing refresh. Success replaces the catalog. Failure retains autocomplete display, without restoring stale attachment paths. A replacement child discovers its own catalog.
+Read `skills/list` in the child's working directory. Connected `skills/changed` notifications force reload in that directory. Failed refreshes retain autocomplete display without restoring attachment authority. [`codexwire.ts`](../extension/src/codexwire.ts) owns refresh scheduling and attachment preparation.
 
-Resolve explicit invocations from the raw child catalog before autocomplete drops enabled state and directory identity. Attach `{ type: 'skill', name, path }` beside text and files only for one enabled, unambiguous working-directory entry. The browser supplies neither canonical name nor path. Wait for discovery and trailing refreshes, preserving input order through writing. Invalidation removes attachment authority immediately. Stop cancels preparation before input. Native controls take precedence. Attachment requests instructions without guaranteeing model compliance.
+Resolve invocations from the raw child catalog before autocomplete drops enabled state and directory identity. Attach `{ type: 'skill', name, path }` only for one enabled, unambiguous working-directory entry. The browser supplies neither canonical name nor path. Wait for discovery and trailing refreshes, preserving input order through writing. Invalidation removes attachment authority immediately. Stop cancels preparation before input. Native controls take precedence. Attachment requests instructions without guaranteeing model compliance.
 
 ## Claude catalog availability
 
-Claude's `system/init` skill list arrives after its first prompt, never on a control-only idle child. Until then, use the stored working-directory list. A new list replaces that directory's stored list.
+Claude's `system/init` skill list arrives after its first prompt, never on a control-only idle child. [`panelhost.ts`](../extension/src/panelhost.ts) owns working-directory catalog fallback.
 
 Use `sessionskills.test.ts`, `claudewire.test.ts`, `codexwire.test.ts`, and `agenthost.test.ts` for admission, refresh, and first-write races.
