@@ -520,7 +520,7 @@ function replayedText(m: Json, text: string): boolean {
 }
 
 export interface WireOptions {
-  sessionSkills?: { release: SessionSkillRelease; refresh(): boolean };
+  sessionSkills?: { release: SessionSkillRelease; refresh(): boolean; skill?: boolean; hooks?: boolean };
   now?(): number;
   // Receives each outbound JSON line with its terminating newline.
   send(line: string): void;
@@ -664,12 +664,14 @@ export class ClaudeWire {
         Number(version[2]) < 1 ||
         (Number(version[2]) === 1 && Number(version[3]) < 310)
       )
-        throw new Error('This Claude Code version cannot supply the Arc session skill.');
+        throw new Error("This Claude Code version cannot load Arc's skill or file snapshots.");
       await this.admitSessionSkill();
       const matches = commands.filter((command) => command.name === 'arc-session-tools:arc-sessions');
-      if (matches.length !== 1) throw new Error('Claude Code did not supply the Arc session skill.');
-      matches[0].path = this.sessionSkills.release.claudeDefinition;
-      matches[0].sessionSkillRelease = this.sessionSkills.release.contentId;
+      if (this.sessionSkills.skill !== false) {
+        if (matches.length !== 1) throw new Error('Claude Code did not supply the Arc session skill.');
+        matches[0].path = this.sessionSkills.release.claudeDefinition;
+        matches[0].sessionSkillRelease = this.sessionSkills.release.contentId;
+      }
     }
     this.emit({ kind: 'ready', commands });
     return commands;
@@ -679,8 +681,12 @@ export class ClaudeWire {
     if (this.skillFailure) throw this.skillFailure;
     try {
       const settings = await this.request({ subtype: 'get_settings' });
-      if (!claudeNativeSkillSettings(settings) || !this.sessionSkills?.refresh())
-        throw new Error('Claude Code cannot use the Arc session skill with these settings.');
+      if (
+        (this.sessionSkills?.skill !== false && !claudeNativeSkillSettings(settings)) ||
+        (this.sessionSkills?.hooks && !claudeNativeSkillSettings(settings, 'hooks')) ||
+        !this.sessionSkills?.refresh()
+      )
+        throw new Error("Claude Code cannot load Arc's skill or file snapshots with these settings.");
     } catch (error) {
       this.skillFailure = error instanceof Error ? error : new Error(String(error));
       this.emit({ kind: 'commands', commands: [], optionalOnly: true });

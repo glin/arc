@@ -302,20 +302,20 @@ test('the sender names why each message was a snapshot and counts the rows it ca
   const globals = { day: 'Mon', scope: ['root'] };
 
   sender.encode(message(1), globals);
-  assert.deepEqual(sender.lastEncoding, { whole: true, reason: 'first', rowsHeld: 3, rowsSent: 3 });
+  assert.deepEqual({ ...sender.lastEncoding }, { whole: true, reason: 'first', rowsHeld: 3, rowsSent: 3 });
 
   sender.encode(message(1), globals);
-  assert.deepEqual(sender.lastEncoding, { whole: false, reason: null, rowsHeld: 3, rowsSent: 0 });
+  assert.deepEqual({ ...sender.lastEncoding }, { whole: false, reason: null, rowsHeld: 3, rowsSent: 0 });
 
   sender.encode(message(2), globals);
-  assert.deepEqual(sender.lastEncoding, { whole: false, reason: null, rowsHeld: 3, rowsSent: 1 });
+  assert.deepEqual({ ...sender.lastEncoding }, { whole: false, reason: null, rowsHeld: 3, rowsSent: 1 });
 
   sender.encode(message(2), { ...globals, scope: ['root', 'added'] });
-  assert.deepEqual(sender.lastEncoding, { whole: true, reason: 'globalMoved:scope', rowsHeld: 3, rowsSent: 3 });
+  assert.deepEqual({ ...sender.lastEncoding }, { whole: true, reason: 'globalMoved:scope', rowsHeld: 3, rowsSent: 3 });
 
   sender.reset('gap');
   sender.encode(message(2), { ...globals, scope: ['root', 'added'] });
-  assert.deepEqual(sender.lastEncoding, { whole: true, reason: 'reset:gap', rowsHeld: 3, rowsSent: 3 });
+  assert.deepEqual({ ...sender.lastEncoding }, { whole: true, reason: 'reset:gap', rowsHeld: 3, rowsSent: 3 });
 
   sender.encode(
     { type: 'rail' as const, rail: [...rows(2), { id: 'a', version: 9 }], stats: {} },
@@ -332,7 +332,7 @@ test('the sender names why each message was a snapshot and counts the rows it ca
     { type: 'rail' as const, rail: [{ id: 'a' }, { noId: true } as unknown as { id: string }], stats: {} },
     globals,
   );
-  assert.deepEqual(sender.lastEncoding, { whole: true, reason: 'unkeyedRows', rowsHeld: 0, rowsSent: 0 });
+  assert.deepEqual({ ...sender.lastEncoding }, { whole: true, reason: 'unkeyedRows', rowsHeld: 0, rowsSent: 0 });
 
   const withSessions = new RowDeltaSender();
   withSessions.encode({ type: 'render' as const, sessions: [{ id: 's' }], rail: rows(1), stats: {} }, globals);

@@ -20,7 +20,7 @@ Requires Node.js 22+ and npm. On Windows, use Git Bash. Install [Claude Code](ht
 curl -fsSL https://raw.githubusercontent.com/glin/arc/main/install.sh | bash
 ```
 
-The installer adds Arc to VS Code, sets up the Claude hooks, and installs the [`arc-sessions` skill](#let-agents-use-arc) for the agents it finds. It works with VS Code, VS Code Insiders, Cursor, Positron, and VSCodium. See [CLI installation](cli/README.md#install) for its options and for using `arc` outside VS Code.
+The installer adds Arc to VS Code. Personal skills and global hooks require [explicit selection](docs/arc-sessions.md#install-the-parts-you-need). It works with VS Code, VS Code Insiders, Cursor, Positron, and VSCodium. See [CLI installation](cli/README.md#install) for its options and for using `arc` outside VS Code.
 
 Reload VS Code. Use the Arc icon in the editor toolbar or **Arc: Open Arc in Editor** in the Command Palette.
 
@@ -33,13 +33,15 @@ codex login
 
 ### Claude hooks
 
-Both default source installs use matching hooks in managed storage. Existing checkout marketplaces require [one-time recovery](docs/installation.md#legacy-checkout-plugin-recovery).
+Eligible Arc-launched Claude sessions receive snapshot hooks automatically. [Native admission](docs/native-skills.md#native-session-skill-admission) defines runtime requirements and existing-hook precedence.
 
-The optional Claude hooks let Arc show full file diffs. Restart Claude to load them. To install them later, run **Arc: Set up Claude hooks** from the Command Palette. To skip them, add `--no-hooks`:
+For sessions started outside Arc, run **Arc: Set up Claude hooks** from the Command Palette or select global setup explicitly:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/glin/arc/main/install.sh | bash -s -- --no-hooks
+curl -fsSL https://raw.githubusercontent.com/glin/arc/main/install.sh | bash -s -- --hooks
 ```
+
+Existing checkout marketplaces require [one-time recovery](docs/installation.md#legacy-checkout-plugin-recovery).
 
 ### Uninstall
 

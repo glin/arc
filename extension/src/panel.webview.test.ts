@@ -41119,3 +41119,40 @@ test('saved drafts never carry a Remote Control link', async () => {
   assert.equal(written.length, 1);
   assert.doesNotMatch(written[0], /claude\.ai/, 'the Remote Control link reached saved drafts');
 });
+
+// Opening recorded sessions cannot opt the reader into a global configuration change.
+test('panel opening and configuration refresh never offer global hooks while explicit setup remains available', async () => {
+  const source = fs.readFileSync(path.join(__dirname, 'extension.ts'), 'utf8');
+  const state = statementFrom(source, source.indexOf('panel.setWindowStateHandler('));
+  const refresh = statementFrom(source, source.indexOf('const refreshSnapshots ='));
+  const compiled = esbuild.transformSync(
+    `let privatePreparation, invalidatePreparedDefaults, snapshotPanelOpened = true;
+    ${state}
+    ${refresh}
+    return refreshSnapshots;`,
+    { loader: 'ts' },
+  ).code;
+  let windowState!: (state: unknown) => void;
+  let offers = 0;
+  const refreshSnapshots = new Function('panel', 'channel', 'snapshotOffer', 'privateTools', compiled)(
+    {
+      setWindowStateHandler: (callback: typeof windowState) => {
+        windowState = callback;
+      },
+    },
+    { update: () => Promise.resolve(), dispose: () => Promise.resolve() },
+    {
+      check: () => {
+        offers++;
+      },
+      invalidate: () => {},
+    },
+    { refresh: () => Promise.resolve() },
+  );
+  windowState({ panelReady: true, panelVisible: true });
+  refreshSnapshots();
+  await Promise.resolve();
+  assert.equal(offers, 0);
+  sourceMatch(source, /registerCommand\('arc\.setupClaudeSnapshots'/, 'explicit global setup command is missing');
+  sourceMatch(source, /return snapshotOffer\?\.check\(true\)/, 'explicit setup no longer confirms its operation');
+});

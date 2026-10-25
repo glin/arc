@@ -422,6 +422,8 @@ export class CodexWire {
   private optionalRoots = false;
   private optionalUnsupported = false;
   private optionalAdmitted = false;
+  private optionalNativeExact = false;
+  private optionalRootsAttempted = false;
   private optionalFailure: Error | undefined;
 
   constructor(options: CodexWireOptions) {
@@ -545,6 +547,7 @@ export class CodexWire {
           this.sessionSkills &&
           path &&
           !this.optionalAdmitted &&
+          !this.optionalNativeExact &&
           canonicalToolPath(path) === canonicalToolPath(this.sessionSkills.release.codexDefinition)
         )
           continue;
@@ -609,13 +612,16 @@ export class CodexWire {
     try {
       let result = await listing();
       let raw = codexRawSkills(result, this.cwd);
-      const conflicts = matches(raw).some((skill) => !exact(skill) || !skill.enabled);
+      this.optionalNativeExact =
+        !this.optionalRootsAttempted && matches(raw).some((skill) => exact(skill) && skill.enabled);
+      const conflicts = matches(raw).some((skill) => !this.optionalRoots || !exact(skill) || !skill.enabled);
       if (conflicts || !(await settings())) {
         await withdraw();
         return this.optionalRoots ? result : await listing();
       }
       if (!this.optionalRoots) {
         // From this write onward, failed acknowledgement leaves root ownership uncertain.
+        this.optionalRootsAttempted = true;
         this.optionalRoots = true;
         let response: Json;
         try {

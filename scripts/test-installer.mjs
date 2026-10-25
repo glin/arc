@@ -468,7 +468,7 @@ export async function checkPlugin(run) {
   return identity;
 }
 
-async function install(run, source, options, extra = [], expect = 0) {
+export async function install(run, source, options, extra = [], expect = 0) {
   const bootstrap = path.join(run.root, 'source', 'install.sh');
   if (!fs.existsSync(bootstrap)) stageSource(run, options.checkout ?? repository, { include: options.include });
   await npmWrapper(run);
@@ -477,11 +477,14 @@ async function install(run, source, options, extra = [], expect = 0) {
     if (!options.repo || !options.ref) throw Error('Remote installation requires --repo and --ref.');
     args.push('--repo', options.repo, '--ref', options.ref);
   }
-  if (options['marketplace-url']) {
+  if (options['marketplace-url'] && !extra.includes('--no-hooks')) {
     args.push('--marketplace-url', options['marketplace-url']);
     run.hosted = true;
   }
   args.push(...extra, run.editor.wrapper.replaceAll('\\', '/'));
+  const hooksRequested = args.includes('--hooks') || args.includes('--marketplace-url');
+  const personalFolders = ['.claude', '.agents', '.codex'].map((folder) => path.join(run.root, 'home', folder));
+  const before = hooksRequested ? undefined : personalFolders.map(snapshotTree);
   const digest = sha256(fs.readFileSync(bootstrap));
   let text;
   try {
@@ -517,7 +520,15 @@ async function install(run, source, options, extra = [], expect = 0) {
     download: source === 'remote' ? 'GitHub' : null,
   };
   save(run);
-  if (expect === 0 && !extra.includes('--no-hooks')) await checkPlugin(run);
+  if (expect === 0 && hooksRequested) await checkPlugin(run);
+  else if (expect === 0) {
+    const receipt = JSON.parse(text.trim().split('\n').at(-1));
+    if (
+      receipt.components.hooks !== 'skipped' ||
+      JSON.stringify(before) !== JSON.stringify(personalFolders.map(snapshotTree))
+    )
+      throw Error('Skipped hook setup changed personal state or its result.');
+  }
   return text;
 }
 
@@ -675,12 +686,17 @@ export async function legacyUpgrade(run, options) {
       '--local',
       '--json',
       '--no-skills',
+      '--hooks',
       run.editor.wrapper.replaceAll('\\', '/'),
     ];
     const text = await execute(run, bashExecutable(), args, { expect: 1 });
     if (!disabled && !text.includes('uses this checkout'))
       throw Error('The same-checkout transition explanation is missing.');
-    await execute(run, bashExecutable(), [...args.slice(0, -1), '--no-hooks', args.at(-1)]);
+    await execute(run, bashExecutable(), [
+      ...args.slice(0, -1).filter((arg) => arg !== '--hooks'),
+      '--no-hooks',
+      args.at(-1),
+    ]);
     if (JSON.stringify(before) !== JSON.stringify(snapshotTree(path.join(home, '.claude'))))
       throw Error('Legacy refusal or --no-hooks changed Claude files.');
     const backup = path.join(run.root, 'evidence', `legacy-backup-${disabled ? 'disabled' : 'enabled'}`);
@@ -713,6 +729,7 @@ export async function legacyUpgrade(run, options) {
     '--local',
     '--json',
     '--no-skills',
+    '--hooks',
     run.editor.wrapper.replaceAll('\\', '/'),
   ]);
   await checkPlugin(run);
@@ -863,7 +880,7 @@ function parse(args) {
   ];
   for (let index = 0; index < rest.length; index++) {
     const name = rest[index].replace(/^--/, '');
-    if (rest[index] === '--via-link') options[name] = true;
+    if (['--via-link', '--no-hooks'].includes(rest[index])) options[name] = true;
     else if (
       rest[index].startsWith('--') &&
       values.includes(name) &&
@@ -884,8 +901,8 @@ export async function main(args) {
   if (!args.length || args.includes('--help')) {
     console.log(
       'Usage: node scripts/test-installer.mjs <install|sequence|legacy-upgrade|checkout-plugin|check-plugin|cleanup> [options]\n' +
-        'install --source local|remote --checkout PATH --editor INSTALL [--repo OWNER/REPO --ref REF] [--marketplace-url HTTPS_URL]\n' +
-        'sequence --first local|remote --checkout PATH --repo OWNER/REPO --ref REF --editor INSTALL\n' +
+        'install --source local|remote --checkout PATH --editor INSTALL [--repo OWNER/REPO --ref REF] [--marketplace-url HTTPS_URL] [--no-hooks]\n' +
+        'sequence --first local|remote --checkout PATH --repo OWNER/REPO --ref REF --editor INSTALL [--no-hooks]\n' +
         'legacy-upgrade --baseline COMMIT --checkout PATH --editor INSTALL [--via-link]\n' +
         'checkout-plugin --checkout PATH\n' +
         'check-plugin|cleanup --run-root ABSOLUTE_PATH\n' +
@@ -930,7 +947,7 @@ export async function main(args) {
             ? [options.source]
             : [options.first, options.first === 'local' ? 'remote' : 'local', options.first];
         for (const source of sources) {
-          await install(run, source, options);
+          await install(run, source, options, options['no-hooks'] ? ['--no-hooks'] : ['--hooks']);
           console.log(JSON.stringify({ source, plugin: run.plugin }));
         }
       }

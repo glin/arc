@@ -115,45 +115,98 @@ test.each(['text', 'assets', 'guarded', 'effort', 'compact', 'clear'])(
   },
 );
 
-test('Claude cancelled competing first writes cannot donate admission and successful delivery writes once', async () => {
-  const h = harness(undefined, SESSION, undefined, { release: suppliedSessionSkill, refresh: () => true });
-  const answer = (response: unknown, subtype = 'get_settings') => {
-    const request = h
-      .parsed()
-      .filter((message) => message.request?.subtype === subtype)
-      .at(-1);
-    h.wire.receive(
-      JSON.stringify({
-        type: 'control_response',
-        response: { subtype: 'success', request_id: request.request_id, response },
-      }),
+test.each([false, true])(
+  'Claude cancelled competing first writes cannot donate admission with hooks %s',
+  async (hooks) => {
+    const h = harness(undefined, SESSION, undefined, {
+      release: suppliedSessionSkill,
+      refresh: () => true,
+      hooks,
+      skill: !hooks,
+    });
+    const answer = (response: unknown, subtype = 'get_settings') => {
+      const request = h
+        .parsed()
+        .filter((message) => message.request?.subtype === subtype)
+        .at(-1);
+      h.wire.receive(
+        JSON.stringify({
+          type: 'control_response',
+          response: { subtype: 'success', request_id: request.request_id, response },
+        }),
+      );
+    };
+    const first = h.wire.prompt('Cancelled candidate');
+    const cancelled = assert.rejects(first, /stopped/);
+    await vi.waitFor(() =>
+      assert.equal(h.parsed().filter((message) => message.request?.subtype === 'get_settings').length, 1),
     );
-  };
-  const first = h.wire.prompt('Cancelled candidate');
-  const cancelled = assert.rejects(first, /stopped/);
-  await vi.waitFor(() =>
-    assert.equal(h.parsed().filter((message) => message.request?.subtype === 'get_settings').length, 1),
-  );
-  const stop = h.wire.interrupt(true);
-  answer({}, 'interrupt');
-  await stop;
-  const second = h.wire.prompt('Accepted candidate');
-  answer({ effective: {}, sources: [], applied: {} });
-  await cancelled;
-  await vi.waitFor(() =>
-    assert.equal(h.parsed().filter((message) => message.request?.subtype === 'get_settings').length, 2),
-  );
-  answer({ effective: {}, sources: [], applied: {} });
-  await second;
-  assert.deepEqual(
-    h
-      .parsed()
-      .filter((message) => message.type === 'user')
-      .map((message) => message.message.content[0].text),
-    ['Accepted candidate'],
-  );
-  h.wire.close('closed');
-});
+    const stop = h.wire.interrupt(true);
+    answer({}, 'interrupt');
+    await stop;
+    const second = h.wire.prompt('Accepted candidate');
+    answer({ effective: {}, sources: [], applied: {} });
+    await cancelled;
+    await vi.waitFor(() =>
+      assert.equal(h.parsed().filter((message) => message.request?.subtype === 'get_settings').length, 2),
+    );
+    answer({ effective: {}, sources: [], applied: {} });
+    await second;
+    assert.deepEqual(
+      h
+        .parsed()
+        .filter((message) => message.type === 'user')
+        .map((message) => message.message.content[0].text),
+      ['Accepted candidate'],
+    );
+    h.wire.close('closed');
+  },
+);
+
+test.each([
+  { skill: false, hooks: true },
+  { skill: true, hooks: true },
+  { skill: true, hooks: false },
+])(
+  'Claude independently admits optional components %j and rejects hook policy before the first write',
+  async (components) => {
+    const h = harness(undefined, SESSION, undefined, {
+      release: suppliedSessionSkill,
+      refresh: () => true,
+      ...components,
+    });
+    const answer = (response: unknown) => {
+      const request = h
+        .parsed()
+        .filter((message) => message.type === 'control_request')
+        .at(-1);
+      h.wire.receive(
+        JSON.stringify({
+          type: 'control_response',
+          response: { subtype: 'success', request_id: request.request_id, response },
+        }),
+      );
+    };
+    const opening = h.wire.initialize();
+    answer({
+      claude_code_version: '2.1.310',
+      commands: components.skill ? [{ name: 'arc-session-tools:arc-sessions' }] : [],
+    });
+    await vi.waitFor(() => assert.equal(h.parsed().at(-1).request.subtype, 'get_settings'));
+    answer({ effective: {}, sources: [], applied: {} });
+    const commands = await opening;
+    assert.equal(commands.length, components.skill ? 1 : 0);
+    const delivery = h.wire.prompt('ordinary work');
+    const outcome = components.hooks ? assert.rejects(delivery, /settings/) : delivery;
+    await vi.waitFor(() =>
+      assert.equal(h.parsed().filter((message) => message.request?.subtype === 'get_settings').length, 2),
+    );
+    answer({ effective: {}, sources: [{ source: 'userSettings', settings: { disableAllHooks: true } }], applied: {} });
+    await outcome;
+    assert.equal(h.parsed().filter((message) => message.type === 'user').length, components.hooks ? 0 : 1);
+    h.wire.close('closed');
+  },
+);
 
 test.each(['2.1.309', '3.0.0', undefined])(
   'Claude incompatible native version %s publishes no optional command',

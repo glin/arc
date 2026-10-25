@@ -6,6 +6,8 @@
 
 Arc-owned children receive their immutable private CLI launcher directory before inherited PATH. Windows preserves the inherited PATH key's casing. `ARC_WINDOW` names the current activation when its channel exists. Otherwise remove it. `ARC_EDITOR_EXECUTABLE` names the editor binary.
 
+Claude preparation independently selects its session skill and snapshot hooks. Each admitted component adds one plugin directory to the direct provider command. [Native admission](native-skills.md#native-session-skill-admission) owns component checks and first-input authority.
+
 Both private launchers set `ELECTRON_RUN_AS_NODE=1` and run their release's `cli/arc.cjs` with that binary. Extensionless `arc` serves POSIX shells and Git Bash. `arc.cmd` serves Windows command shells. Every Arc-owned child uses this environment through `childEnv` in [`agenthost.ts`](../extension/src/agenthost.ts).
 
 Unavailable private tools refuse launch. Trusted remote children use commands on their execution host. Untrusted windows refuse launch. Watch builds supply development launchers without immutable package identity. [Bundled tools](installation.md#bundled-tools) defines complete development builds.

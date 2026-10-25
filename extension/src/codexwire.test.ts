@@ -36,6 +36,7 @@ function sessionSkillServer() {
   };
   const state = {
     registered: false,
+    preexistingExact: false,
     collision: false,
     disabled: false,
     managed: false,
@@ -43,6 +44,7 @@ function sessionSkillServer() {
     invalidAck: false,
     unsupported: false,
     postCollision: false,
+    lingeringExact: false,
     holdList: false,
     holdSteer: false,
     holdStart: false,
@@ -84,7 +86,9 @@ function sessionSkillServer() {
                   cwd,
                   errors: [],
                   skills: [
-                    ...(state.registered ? [definition(release.codexDefinition, !state.disabled)] : []),
+                    ...(state.registered || state.preexistingExact || state.lingeringExact
+                      ? [definition(release.codexDefinition, !state.disabled)]
+                      : []),
                     ...(state.collision || (state.postCollision && state.registered)
                       ? [definition(path.resolve('personal/SKILL.md'), false)]
                       : []),
@@ -167,6 +171,27 @@ test('Codex registers process-local roots only after raw admission and attaches 
   h.wire.close('closed');
 });
 
+test('Codex preserves a pre-existing enabled link to its exact immutable definition without registering roots', async () => {
+  const h = sessionSkillServer();
+  h.state.preexistingExact = true;
+  await h.wire.initialize();
+  const commands = await h.wire.commands();
+  await h.wire.startThread({ cwd: process.cwd() });
+  await h.wire.prompt('$arc-sessions list sessions');
+  assert.equal(commands.find((command) => command.name === 'arc-sessions')?.path, h.release.codexDefinition);
+  assert.deepEqual(h.sent.find((message) => message.method === 'turn/start').params.input[1], {
+    type: 'skill',
+    name: 'arc-sessions',
+    path: h.release.codexDefinition,
+  });
+  assert.equal(h.sent.filter((message) => message.method === 'skills/extraRoots/set').length, 0);
+  assert.equal(
+    commands.some((command) => command.sessionSkillRelease),
+    false,
+  );
+  h.wire.close('closed');
+});
+
 test.each(['collision', 'disabled', 'managed', 'unsupported'] as const)(
   'Codex %s refuses optional delivery in its existing dedicated child',
   async (kind) => {
@@ -194,6 +219,9 @@ test.each(['collision', 'disabled', 'managed', 'unsupported'] as const)(
 test('Codex post-registration collisions withdraw its roots before opening a session', async () => {
   const h = sessionSkillServer();
   h.state.postCollision = true;
+  h.state.beforeReply = (message) => {
+    if (message.method === 'skills/extraRoots/set' && !message.params.extraRoots.length) h.state.lingeringExact = true;
+  };
   await h.wire.initialize();
   const commands = await h.wire.commands();
   await h.wire.startThread({ cwd: process.cwd() });
@@ -208,6 +236,20 @@ test('Codex post-registration collisions withdraw its roots before opening a ses
     [[h.release.codexRoot], []],
   );
   assert.ok(h.sent.indexOf(replacements[1]) < h.sent.findIndex((message) => message.method === 'thread/start'));
+  assert.equal(
+    commands.some((command) => command.path === h.release.codexDefinition),
+    false,
+  );
+  const refreshed = await h.wire.commands();
+  assert.equal(
+    refreshed.some((command) => command.path === h.release.codexDefinition),
+    false,
+  );
+  await h.wire.prompt('$arc-sessions list sessions');
+  assert.equal(
+    h.sent.find((message) => message.method === 'turn/start').params.input.some((input: any) => input.type === 'skill'),
+    false,
+  );
   h.wire.close('closed');
 });
 

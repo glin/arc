@@ -2,6 +2,8 @@
 
 [Data sources](data-sources.md#snapshot-storage) owns storage paths and retention. [Development](installation.md#snapshot-installation) owns hook installation. [Session list and navigation](panel-navigation.md#files-commits-and-editor-groups) owns editor placement and ordinary file links.
 
+[Native admission](native-skills.md#native-session-skill-admission) owns automatic snapshot hooks for eligible Arc-launched Claude children. Viewing an external session installs nothing. Continuing it through a new Arc child applies normal admission. Earlier uncaptured edits receive no retrospective baseline.
+
 ## Diff selection
 
 Turn attribution comes from the transcript or rollout. A snapshot holds the file before the session's first edit and never advances between turns. Diffs against it therefore include later turns' changes too. `manifest.json` is overwritten cumulative state and cannot attribute a file to a turn.

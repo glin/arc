@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { BundledTools, resolveToolRuntime, type ToolPackage } from './bundledtools';
+import { BundledTools, resolveToolRuntime, sessionHookRuntime, type ToolPackage } from './bundledtools';
 import { acquireToolLock } from './toolownership';
 import { onTestFinished, test, vi } from 'vitest';
 import assert from 'node:assert/strict';
@@ -1487,12 +1487,21 @@ test.each(['win32', 'linux', 'darwin'] as const)(
     const executable = platform === 'win32' ? 'node.exe' : 'node';
     const candidates = new Set([paths.join(workspaceBin, executable), paths.join(externalBin, executable)]);
     const probes: string[] = [];
+    const probeEnvironments: unknown[] = [];
     const source = fs.readFileSync(path.join(__dirname, 'bundledtools.ts'), 'utf8');
     const body = source
-      .slice(source.indexOf('export function resolveToolRuntime'))
-      .replace('export function', 'function');
-    const compiled = transformSync(body + '\nmodule.exports = resolveToolRuntime;', { loader: 'ts' }).code;
-    const module = { exports: undefined as unknown as typeof resolveToolRuntime };
+      .slice(source.indexOf('export function sessionHookRuntime'))
+      .replaceAll('export function', 'function');
+    const compiled = transformSync(body + '\nmodule.exports = { resolveToolRuntime, sessionHookRuntime };', {
+      loader: 'ts',
+    }).code;
+    const module = {
+      exports: undefined as unknown as {
+        resolveToolRuntime: typeof resolveToolRuntime;
+        sessionHookRuntime: typeof sessionHookRuntime;
+      },
+    };
+    let identity = 1n;
     vm.runInNewContext(compiled, {
       module,
       path: paths,
@@ -1503,29 +1512,54 @@ test.each(['win32', 'linux', 'darwin'] as const)(
         accessSync: (file: string) => {
           if (!candidates.has(file)) throw new Error('Absent');
         },
-        statSync: () => ({ isFile: () => true }),
+        statSync: () => ({
+          isFile: () => true,
+          dev: 1n,
+          ino: identity,
+          mode: 0o755n,
+          size: 10n,
+          mtimeNs: 1n,
+          ctimeNs: 1n,
+        }),
       },
       canonicalToolPath: (file: string) => paths.normalize(file),
-      probeToolRuntime: (file: string) => {
+      probeToolRuntime: (file: string, env?: NodeJS.ProcessEnv) => {
+        probeEnvironments.push(env);
         probes.push(file);
         return file;
       },
     });
-    assert.equal(module.exports({ PATH: externalBin }, project, platform), paths.join(externalBin, executable));
+    const resolve = module.exports.resolveToolRuntime;
+    assert.equal(resolve({ PATH: externalBin }, project, platform), paths.join(externalBin, executable));
     const delimiter = platform === 'win32' ? ';' : ':';
     assert.throws(
-      () => module.exports({ PATH: workspaceBin + delimiter + externalBin }, project, platform),
+      () => resolve({ PATH: workspaceBin + delimiter + externalBin }, project, platform),
       /from this project/,
     );
     assert.deepEqual(probes, [paths.join(externalBin, executable)]);
+    const hookEnv = { PATH: externalBin, ELECTRON_RUN_AS_NODE: '1' };
+    resolve(hookEnv, project, platform, true);
+    const changedEnv = { ...hookEnv, LANG: 'different' };
+    resolve(changedEnv, project, platform, true);
+    assert.deepEqual(probeEnvironments, [undefined, hookEnv, changedEnv]);
+    probes.length = 0;
+    probeEnvironments.length = 0;
+    const qualify = module.exports.sessionHookRuntime();
+    const runtime = paths.join(externalBin, executable);
+    assert.equal(qualify(hookEnv, project, platform), runtime);
+    assert.equal(qualify({ ...hookEnv }, project, platform), runtime);
+    assert.deepEqual(probes, [runtime]);
+    identity++;
+    qualify(hookEnv, project, platform);
+    qualify(changedEnv, project, platform);
+    qualify(changedEnv, project + '-other', platform);
+    assert.deepEqual(probes, [runtime, runtime, runtime, runtime]);
+    assert.deepEqual(probeEnvironments, [hookEnv, hookEnv, changedEnv, changedEnv]);
     if (platform === 'win32') {
       candidates.add(paths.join(externalBin, 'node.cmd'));
-      assert.throws(
-        () => module.exports({ PATH: externalBin, PATHEXT: '.CMD;.EXE' }, project, platform),
-        /executable first/,
-      );
+      assert.throws(() => resolve({ PATH: externalBin, PATHEXT: '.CMD;.EXE' }, project, platform), /executable first/);
       candidates.add(paths.join(project, 'node.exe'));
-      assert.throws(() => module.exports({ PATH: externalBin }, project, platform), /from this project/);
+      assert.throws(() => resolve({ PATH: externalBin }, project, platform), /from this project/);
     }
   },
 );

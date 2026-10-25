@@ -182,6 +182,7 @@ test('session skill selection rejects divergent copies, missing references and e
   const directory = path.dirname(launchers);
   const descriptor = sessionSkillRelease(directory);
   assert.equal(descriptor.contentId, tools.bundle.payload.contentId);
+  assert.equal(descriptor.claudeHooksPlugin, path.join(directory, 'plugin'));
   assert.equal(Object.isFrozen(descriptor), true);
   const identityPath = path.join(directory, 'release.json');
   const identityBytes = fs.readFileSync(identityPath);
@@ -190,16 +191,30 @@ test('session skill selection rejects divergent copies, missing references and e
     payload.contentId = createHash('sha256').update(JSON.stringify(content)).digest('hex');
     fs.writeFileSync(identityPath, JSON.stringify(payload));
   };
-  for (const defect of ['divergent', 'missing-reference', 'executable', 'manifest']) {
+  for (const defect of [
+    'divergent',
+    'missing-reference',
+    'executable',
+    'manifest',
+    'hook-extra',
+    'hook-pair',
+    'hook-manifest',
+  ]) {
     const payload = JSON.parse(identityBytes.toString());
     const file =
-      defect === 'divergent'
-        ? 'session-plugin/skills/arc-sessions/SKILL.md'
-        : defect === 'manifest'
-          ? 'session-plugin/.claude-plugin/plugin.json'
-          : defect === 'executable'
-            ? 'session-plugin/hooks/hooks.json'
-            : 'skills/arc-sessions/compaction.md';
+      defect === 'hook-extra'
+        ? 'plugin/commands/extra.md'
+        : defect === 'hook-pair'
+          ? 'plugin/hooks/hooks.json'
+          : defect === 'hook-manifest'
+            ? 'plugin/.claude-plugin/plugin.json'
+            : defect === 'divergent'
+              ? 'session-plugin/skills/arc-sessions/SKILL.md'
+              : defect === 'manifest'
+                ? 'session-plugin/.claude-plugin/plugin.json'
+                : defect === 'executable'
+                  ? 'session-plugin/hooks/hooks.json'
+                  : 'skills/arc-sessions/compaction.md';
     const target = path.join(directory, file);
     const previous = fs.existsSync(target) ? fs.readFileSync(target) : undefined;
     const counterpart = path.join(directory, 'session-plugin/' + file);
@@ -213,14 +228,18 @@ test('session skill selection rejects divergent copies, missing references and e
       } else {
         fs.mkdirSync(path.dirname(target), { recursive: true });
         const bytes =
-          defect === 'manifest' ? JSON.stringify({ name: 'arc-session-tools', version: 'other', hooks: {} }) : '{}';
+          defect === 'manifest'
+            ? JSON.stringify({ name: 'arc-session-tools', version: 'other', hooks: {} })
+            : defect === 'hook-manifest'
+              ? JSON.stringify({ name: 'arc-hooks', version: '0.1.0', commands: './commands' })
+              : '{}';
         fs.writeFileSync(target, bytes);
         payload.files[file] = { sha256: createHash('sha256').update(bytes).digest('hex'), mode: 0o644 };
       }
       rewrite(payload);
       assert.throws(
         () => sessionSkillRelease(directory),
-        /copies differ|missing reference|unsupported files|unreadable identity/,
+        /copies differ|missing reference|unsupported files|unreadable identity|unsupported hooks/,
         defect,
       );
     } finally {

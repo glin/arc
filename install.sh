@@ -104,7 +104,7 @@ NODE
 
 main() {
   local invocation_cwd="$PWD"
-  local setup_hooks=1 setup_skills=1 hooks_ready=1 mode=auto source_repo=glin/arc source_ref=main
+  local setup_hooks=0 setup_skills=0 no_hooks=0 no_skills=0 hooks_ready=1 mode=auto source_repo=glin/arc source_ref=main
   local marketplace_url='' source_commit='' remote_selector=0
   ARC_INSTALL_OUTPUT=human
   local argument candidate seen choice i cli claude_cli version sha ref_encoded failed=0 installed=0
@@ -115,8 +115,8 @@ main() {
   ARC_INSTALL_CANCEL=0
   ARC_INSTALL_SIGNALS=0
   ARC_INSTALL_EDITORS=unattempted
-  ARC_INSTALL_SKILLS=unattempted
-  ARC_INSTALL_HOOKS=unattempted
+  ARC_INSTALL_SKILLS=skipped
+  ARC_INSTALL_HOOKS=skipped
   ARC_INSTALL_CHILD=''
   cancel_install() {
     ARC_INSTALL_SIGNALS=$((ARC_INSTALL_SIGNALS + 1))
@@ -192,12 +192,14 @@ RECEIPT
     argument="$1"; shift
     case "$argument" in
       --json) ARC_INSTALL_OUTPUT=json ;;
-      --no-hooks) setup_hooks=0; ARC_INSTALL_HOOKS=skipped ;;
-      --no-skills) setup_skills=0; ARC_INSTALL_SKILLS=skipped ;;
+      --no-hooks) no_hooks=1 ;;
+      --hooks) setup_hooks=1; ARC_INSTALL_HOOKS=unattempted ;;
+      --no-skills) no_skills=1 ;;
       --skill-agent)
         if [ "$#" -eq 0 ] || { [ "$1" != claude ] && [ "$1" != codex ]; }; then
           echo 'error: --skill-agent requires claude or codex.' >&2; exit 2
         fi
+        setup_skills=1; ARC_INSTALL_SKILLS=unattempted
         case " ${SKILL_AGENTS[*]:-} " in *" $1 "*) ;; *) SKILL_AGENTS+=("$1") ;; esac
         shift ;;
       --local|--remote)
@@ -213,19 +215,19 @@ RECEIPT
           --repo) source_repo="$1"; remote_selector=1 ;;
           --ref) source_ref="$1"; remote_selector=1 ;;
           --commit) source_commit="$1" ;;
-          --marketplace-url) marketplace_url="$1"; marketplace_override=1 ;;
+          --marketplace-url) marketplace_url="$1"; marketplace_override=1; setup_hooks=1; ARC_INSTALL_HOOKS=unattempted ;;
         esac
         shift ;;
       --help|-h)
-        echo 'Usage: bash install.sh [--local|--remote] [--commit REV] [--repo OWNER/REPO] [--ref REF] [--marketplace-url HTTPS_URL] [--no-hooks] [--no-skills] [--skill-agent claude|codex] [--json] [editor-cli ...]'
-        echo 'Build Arc from local or temporary downloaded source and install its Claude plugin.'
+        echo 'Usage: bash install.sh [--local|--remote] [--commit REV] [--repo OWNER/REPO] [--ref REF] [--marketplace-url HTTPS_URL] [--hooks|--no-hooks] [--no-skills] [--skill-agent claude|codex] [--json] [editor-cli ...]'
+        echo 'Build Arc from local or temporary downloaded source and install its extension.'
         echo 'Auto mode uses a complete local checkout, otherwise downloads glin/arc main.'
         echo '--remote forces source download for development testing.'
         echo '--commit REV builds a committed revision from the local Arc Git checkout in a temporary folder.'
-        echo 'All source routes copy matching hooks into durable Arc storage.'
+        echo '--hooks explicitly installs matching global Claude hooks into durable Arc storage.'
         echo '--marketplace-url explicitly selects an independently published catalog.'
         echo '--no-hooks preserves all Claude plugin and legacy hook settings.'
-        echo 'Skills default to detected Claude and Codex executables. Repeat --skill-agent to select explicitly.'
+        echo 'Repeat --skill-agent claude|codex to install personal skills. The default preserves personal skills.'
         echo '--no-skills skips personal skill installation independently of hooks.'
         echo '--json uses structured output for installation results, when available.'
         echo 'Help and early refusals do not print an installation result.'
@@ -238,17 +240,11 @@ RECEIPT
   if [ -n "$source_commit" ] && { [ "$mode" = remote ] || [ "$remote_selector" -eq 1 ]; }; then
     echo 'error: --commit cannot be combined with --remote, --repo, or --ref.' >&2; exit 2
   fi
-  if [ "$setup_skills" -eq 0 ] && [ "${#SKILL_AGENTS[@]}" -gt 0 ]; then
+  if [ "$no_skills" -eq 1 ] && [ "$setup_skills" -eq 1 ]; then
     echo 'error: --no-skills conflicts with --skill-agent.' >&2; exit 2
   fi
-  if [ "$setup_skills" -eq 1 ] && [ "${#SKILL_AGENTS[@]}" -eq 0 ]; then
-    for candidate in claude codex; do
-      if command -v "$candidate" >/dev/null 2>&1 || command -v "$candidate.exe" >/dev/null 2>&1; then SKILL_AGENTS+=("$candidate"); fi
-    done
-  fi
-  if [ "$setup_skills" -eq 1 ] && [ "${#SKILL_AGENTS[@]}" -eq 0 ]; then
-    ARC_INSTALL_SKILLS=skipped-no-detected-provider
-    echo '==> Skills skipped: no supported Claude or Codex executable was detected on PATH.'
+  if [ "$no_hooks" -eq 1 ] && [ "$setup_hooks" -eq 1 ]; then
+    echo 'error: --no-hooks conflicts with --hooks and --marketplace-url.' >&2; exit 2
   fi
   [[ "$source_repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || { echo 'error: --repo requires OWNER/REPO.' >&2; exit 2; }
   for candidate in node npm mktemp; do

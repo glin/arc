@@ -9,7 +9,7 @@ node extension/dist/setup.cjs --commands
 node extension/dist/setup.cjs --snapshots
 ```
 
-Installed local builds use frozen plugin bytes. Rebuild and reinstall to select changed files. `install.sh` owns source selectors. `--marketplace-url` selects a hosted HTTPS catalog independently of the extension revision. Skill selection uses the matching built CLI. [Skill installation](arc-sessions.md#install-the-parts-you-need) owns its selectors and destinations.
+All source routes preserve personal skills and global hooks by default. `--hooks` selects global hook installation. `--no-hooks` skips Claude plugin checks, setup and legacy cleanup. It conflicts with `--hooks` and `--marketplace-url` in either argument order. Installed local builds use frozen plugin bytes. Rebuild and reinstall to select changed files. `install.sh` owns source selectors. `--marketplace-url` selects global hook installation from a hosted HTTPS catalog independently of the extension revision. Skill selection uses the matching built CLI. [Skill installation](arc-sessions.md#install-the-parts-you-need) owns its selectors and destinations.
 
 Install a local commit from an Arc Git checkout while preserving hooks and skills:
 
@@ -21,7 +21,7 @@ When the installer reports component outcomes, it uses readable text by default.
 
 ## Snapshot installation
 
-By default, all source routes invoke bundled snapshot setup after editor installation. Its ownership, disabled-plugin refusal, runtime requirements, and immutable storage follow [Bundled tools](#bundled-tools). A checkout or temporary source copy never becomes a registered marketplace. [Legacy recovery](#legacy-checkout-plugin-recovery) owns migration authority and choices.
+Explicit source hook installation invokes bundled snapshot setup after editor installation. [Native admission](native-skills.md#native-session-skill-admission) owns automatic hooks for eligible Arc children. **Arc: Set up Claude hooks** and `setup.cjs --snapshots` install global hooks for sessions started outside Arc. Its ownership, disabled-plugin refusal, runtime requirements, and immutable storage follow [Bundled tools](#bundled-tools). A checkout or temporary source copy never becomes a registered marketplace. [Legacy recovery](#legacy-checkout-plugin-recovery) owns migration authority and choices.
 
 Hosted catalogs require Claude Code 2.1.224 or later. Claude owns archive downloads and its installed plugin cache. `install.sh` checks marketplace ownership before it builds. `scripts/install-claude-hooks.sh` owns hosted registration and checks ownership again before it changes plugins. The first check does not replace the second. `plugins/arc-hooks/hooks/hooks.json` defines hook commands through `${CLAUDE_PLUGIN_ROOT}`.
 
@@ -40,7 +40,7 @@ node scripts/test-installer.mjs sequence --first local --checkout /absolute/arc 
 node scripts/test-installer.mjs sequence --first remote --checkout /absolute/arc --repo glin/arc --ref PUBLISHED_SHA --editor /absolute/editor-install
 ```
 
-A sequence installs its first source, the other source, then the first again in one sandbox. Separate install commands create separate sandboxes. Remote refs must exist on GitHub. Substituted downloads establish simulated source switching only. Review `installer-run.json` and private `evidence` logs for source, network, archive, build, and plugin failures. Bootstrap digest and downloaded revision remain separate.
+Install and sequence rehearsals explicitly request global hooks. Pass `--no-hooks` to rehearse skipped setup and personal-state preservation. A sequence installs its first source, the other source, then the first again in one sandbox. Separate install commands create separate sandboxes. Remote refs must exist on GitHub. Substituted downloads establish simulated source switching only. Review `installer-run.json` and private `evidence` logs for source, network, archive, build, and plugin failures. Bootstrap digest and downloaded revision remain separate.
 
 Installed checks stage tracked working source without Git metadata, dependencies, or private agent folders. Repeat `--include RELATIVE_FILE` for untracked source. Builds retain source identity separately from the extension version. Installed checks require one Arc identity and matching bundled and managed-plugin digests.
 
@@ -77,7 +77,7 @@ Native acceptance requires real Claude on Windows, macOS, and Linux. Run both se
 
 ## Legacy checkout plugin recovery
 
-An existing checkout marketplace remains user-owned. A local reinstall preserves it and reports incomplete hook setup until migration. The diagnostic names the checkout, expected managed source, and Claude home. `--no-hooks` permits extension updates while skipping hook refresh and compatibility checks. This does not establish compatibility between arbitrary older hooks and the new extension. Matching managed payloads are the supported source-switching path.
+An existing checkout marketplace remains user-owned. A local reinstall with `--hooks` preserves it and reports incomplete hook setup until migration. The diagnostic names the checkout, expected managed source, and Claude home. `--no-hooks` permits extension updates while skipping hook refresh and compatibility checks. This does not establish compatibility between arbitrary older hooks and the new extension. Matching managed payloads are the supported source-switching path.
 
 Rehearse the same-path upgrade in disposable state before changing a daily installation:
 
@@ -102,7 +102,7 @@ After ownership, backup, and restoration checks succeed, remove only the known u
 ```bash
 claude plugin uninstall arc-hooks@arc --scope user --keep-data --json
 claude plugin marketplace remove arc --scope user --json
-bash install.sh --local
+bash install.sh --local --hooks
 ```
 
 If the plugin was disabled, preserve that choice. Complete managed installation under explicit migration authority, then disable `arc-hooks@arc` at user scope before restarting sessions. Check selected bytes, scope, and enabled state after installation. A failed migration requires restoring the private backup of the original owned configuration before daily sessions restart. Preserve the backup until a fresh Claude session passes functional acceptance. Subsequent local and downloaded builds reuse the same managed root.
@@ -119,7 +119,7 @@ Each canonical Claude home selects its own immutable plugin under `tools/claude/
 
 `toolownership.ts` acquires the software lock before the Claude home lock. Plugin setup holds both through native mutations and completion. Wrapped errors retain both locks when descendant settlement remains uncertain. CLI-only setup acquires only software ownership. No timeout transfers a lock. These locks coordinate Arc writers and do not exclude unrelated filesystem editors.
 
-Hook setup freezes project, configuration home, and environment for each consented operation. Explicit setup checks owned scope, path, and bytes before enabled-state exits. Remote hosts refuse Claude hook setup. Trusted admission fixes the host software root and workspace identity. `extension/src/claudeplugin.ts` owns offers and consent. `extension/src/toolpath.ts` owns terminal preparation and recovery.
+Hook setup freezes project, configuration home, and environment for each consented operation. Global hook setup runs only through an explicit request. Explicit setup checks owned scope, path, and bytes before enabled-state exits. Remote hosts refuse Claude hook setup. Trusted admission fixes the host software root and workspace identity. `extension/src/claudeplugin.ts` owns offers and consent. `extension/src/toolpath.ts` owns terminal preparation and recovery.
 
 Preparation must settle before another attempt acquires ownership. Private preparation reads matching published releases without software write ownership. Publication waits without blocking activation. Contention ends after thirty seconds without taking over retained locks. New terminals receive PATH and editor runtime without `ARC_WINDOW`. Child selection supplies the current window separately. Defaults reads wait for preparation without blocking activation. Completed preparation invalidates cached defaults in `extension.ts`. An obsolete or disposed defaults request stops before Arc creates a child. Admission or preparation failures require resolution and window reload.
 

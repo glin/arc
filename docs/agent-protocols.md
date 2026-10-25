@@ -1,6 +1,6 @@
 # Agent protocols and runtime
 
-[`agentwire.ts`](../extension/src/agentwire.ts) defines the shared host and prompt box types. [`claudewire.ts`](../extension/src/claudewire.ts) and [`codexwire.ts`](../extension/src/codexwire.ts) translate provider protocols. The [reading guide](architecture.md#reading-guide) routes changes across launch, skill, question, compaction, and standalone contracts.
+[`agentwire.ts`](../extension/src/agentwire.ts) defines the shared host and prompt box types. [`claudewire.ts`](../extension/src/claudewire.ts) and [`codexwire.ts`](../extension/src/codexwire.ts) translate provider protocols. The [reading guide](architecture.md#reading-guide) routes changes across launch, skill and snapshot hook, question, compaction, and standalone contracts.
 
 ## Runtime shape
 

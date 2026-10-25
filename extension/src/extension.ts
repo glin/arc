@@ -234,7 +234,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   // Register the panel that displays recorded turns.
   let snapshotOffer: ClaudePluginOffer | undefined;
-  let snapshotPanelOpened = false;
   const panel = registerPanel(context, root, workspaceCache, activationAt, (diagnostics) => {
     const sink: WindowTransportSink = (event, record) => diagnostics.warn(event, record);
     channel?.setDiagnostics(sink);
@@ -244,10 +243,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const questionEvidence = new QuestionEvidenceReader();
   channel?.setRequestHandler((request) => panel.handleSessionRequest(request));
   panel.setWindowStateHandler((state) => {
-    if (state.panelReady && state.panelVisible) {
-      snapshotPanelOpened = true;
-      void snapshotOffer?.check();
-    }
     void channel?.update(state).catch(() => {
       void channel?.dispose();
     });
@@ -852,7 +847,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       },
       offer: async () =>
         vscode.window.showInformationMessage(
-          'Install the optional Claude hooks (plugin) to show file diffs in Arc?',
+          'Install Claude hooks globally to capture file diffs for sessions started outside Arc?',
           'Install',
           'Not now',
         ),
@@ -870,7 +865,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       if (preparation === privatePreparation) invalidatePreparedDefaults?.();
     });
     snapshotOffer?.invalidate();
-    if (snapshotPanelOpened) void snapshotOffer?.check();
   };
   context.subscriptions.push(
     vscode.commands.registerCommand('arc.setupClaudeSnapshots', () => {
@@ -888,7 +882,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       },
     },
   );
-  if (snapshotPanelOpened) void snapshotOffer.check();
 
   // Permission mode keeps an agent-wide launch default and an accepted value per session.
   // Model and effort choices name one session and must not alter a sibling.

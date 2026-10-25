@@ -67,9 +67,10 @@ import {
   type BackgroundCommand,
 } from './transcript';
 import { ARC_IDENTITY } from './identity';
+import { sessionHookEnvironment, sessionHookRuntime } from './bundledtools';
 import { QuestionRecovery, questionIdentity, type RecoveredQuestion } from './questionrecovery';
 import {
-  admitClaudeSessionSkill,
+  admitClaudeSessionComponents,
   claudeSkillHome,
   retainedSessionSkill,
   type SessionSkillSelection,
@@ -399,6 +400,7 @@ export function claudePlan(
   options: SpawnOptions,
   prepared?: {
     release?: SessionSkillRelease;
+    components?: { skill: boolean; hooks: boolean };
     refresh?: () => boolean;
     environment: NodeJS.ProcessEnv;
     args: string[];
@@ -415,13 +417,39 @@ export function claudePlan(
             env.CLAUDE_CONFIG_DIR = home;
             const args = [...launch.leadingArgs, ...spawnArgs(options, env)];
             const selected = launch.sessionSkills!.current();
-            const refresh = () =>
-              !!selected &&
-              retainedSessionSkill(selected, launch.sessionSkills!) &&
-              admitClaudeSessionSkill({ release: selected, cwd: options.cwd, home, env, args });
-            const release = refresh() ? selected : undefined;
+            const runtime = sessionHookRuntime();
+            const admission = (hooks = true) => {
+              if (!selected || !retainedSessionSkill(selected, launch.sessionSkills!))
+                return { skill: false, hooks: false };
+              const admitted = admitClaudeSessionComponents(
+                { release: selected, cwd: options.cwd, home, env, args },
+                hooks,
+              );
+              if (admitted.hooks) {
+                const hookEnvironment = sessionHookEnvironment(env);
+                try {
+                  if (!selected.claudeHooksPlugin || !hookEnvironment) {
+                    admitted.hooks = false;
+                    admitted.reasons.hooks = selected.claudeHooksPlugin
+                      ? 'unsupported-node-environment'
+                      : 'unavailable-hook-plugin';
+                  } else runtime(hookEnvironment, options.cwd, process.platform);
+                } catch {
+                  admitted.hooks = false;
+                  admitted.reasons.hooks = 'unsupported-node-runtime';
+                }
+              }
+              return admitted;
+            };
+            const components = admission();
+            const refresh = () => {
+              const current = admission(components.hooks);
+              return (!components.skill || current.skill) && (!components.hooks || current.hooks);
+            };
+            const release = components.skill || components.hooks ? selected : undefined;
             return claudePlan({ ...launch, env: { ...launch.env, CLAUDE_CONFIG_DIR: home } }, options, {
               release,
+              components,
               refresh,
               environment,
               args,
@@ -436,7 +464,8 @@ export function claudePlan(
     command: launch.command,
     args: [
       ...(prepared?.args ?? [...launch.leadingArgs, ...spawnArgs(options, { ...process.env, ...launch.env })]),
-      ...(prepared?.release ? ['--plugin-dir', prepared.release.claudePlugin] : []),
+      ...(prepared?.release && prepared.components?.skill ? ['--plugin-dir', prepared.release.claudePlugin] : []),
+      ...(prepared?.release && prepared.components?.hooks ? ['--plugin-dir', prepared.release.claudeHooksPlugin!] : []),
     ],
     cwd: options.cwd,
     env: claudePlanEnv(launch.env, options),
@@ -446,7 +475,9 @@ export function claudePlan(
         send,
         emit,
         sessionId: options.resume ?? options.sessionId,
-        sessionSkills: prepared?.release ? { release: prepared.release, refresh: prepared.refresh! } : undefined,
+        sessionSkills: prepared?.release
+          ? { release: prepared.release, refresh: prepared.refresh!, ...prepared.components }
+          : undefined,
       });
       return {
         receive: (line) => wire.receive(line),

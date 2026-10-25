@@ -138,10 +138,58 @@ export function sessionSkillRelease(directory: string): SessionSkillRelease {
   const definition = fs.readFileSync(path.join(release, prefix, 'SKILL.md'), 'utf8');
   for (const [, reference] of definition.matchAll(/\]\(([\w-]+\.md)(?:#[^)]*)?\)/g))
     if (!copies.includes(prefix + reference)) throw new Error('The Arc session skill has a missing reference.');
+  const hookFiles = [
+    '.claude-plugin/plugin.json',
+    'LICENSE',
+    'hooks/hooks.json',
+    'scripts/lib.js',
+    'scripts/persistence.js',
+    'scripts/pretooluse-snapshot.cjs',
+    'scripts/stop-manifest.cjs',
+  ]
+    .map((file) => 'plugin/' + file)
+    .sort();
+  if (
+    JSON.stringify(
+      Object.keys(payload.files)
+        .filter((file) => file.startsWith('plugin/'))
+        .sort(),
+    ) !== JSON.stringify(hookFiles)
+  )
+    throw new Error('The Arc snapshot plugin contains unsupported files.');
+  const hookManifest = jsonFile(path.join(release, 'plugin/.claude-plugin/plugin.json')) as Record<string, unknown>;
+  if (
+    hookManifest.name !== 'arc-hooks' ||
+    payload.plugin?.name !== 'arc-hooks' ||
+    typeof hookManifest.version !== 'string' ||
+    !hookManifest.version ||
+    hookManifest.version !== payload.plugin.version ||
+    Object.keys(hookManifest).some(
+      (key) => !['name', 'displayName', 'version', 'description', 'author', 'license'].includes(key),
+    )
+  )
+    throw new Error('The Arc snapshot plugin has an unreadable identity.');
+  const hooks = jsonFile(path.join(release, 'plugin/hooks/hooks.json'));
+  const capture = (script: string) => ({
+    type: 'command',
+    command: 'node',
+    args: ['${CLAUDE_PLUGIN_ROOT}/scripts/' + script],
+  });
+  if (
+    JSON.stringify(hooks) !==
+    JSON.stringify({
+      hooks: {
+        PreToolUse: [{ matcher: 'Edit|Write|MultiEdit|NotebookEdit', hooks: [capture('pretooluse-snapshot.cjs')] }],
+        Stop: [{ hooks: [capture('stop-manifest.cjs')] }],
+      },
+    })
+  )
+    throw new Error('The Arc snapshot plugin has unsupported hooks.');
   return Object.freeze({
     contentId,
     directory: release,
     claudePlugin: path.join(release, 'session-plugin'),
+    claudeHooksPlugin: path.join(release, 'plugin'),
     codexRoot: path.join(release, 'skills'),
     claudeDefinition: path.join(release, 'session-plugin/skills/arc-sessions/SKILL.md'),
     codexDefinition: path.join(release, 'skills/arc-sessions/SKILL.md'),
@@ -615,7 +663,7 @@ export class BundledTools {
   }
 }
 
-export function probeToolRuntime(runtime: string): string {
+export function probeToolRuntime(runtime: string, environment?: NodeJS.ProcessEnv): string {
   if (!path.isAbsolute(runtime) || !fs.existsSync(runtime) || !fs.statSync(runtime).isFile())
     throw new Error('Arc setup needs an absolute Node.js executable.');
   const output = execFileSync(runtime, ['--version'], {
@@ -623,7 +671,12 @@ export function probeToolRuntime(runtime: string): string {
     timeout: 15_000,
     maxBuffer: 4096,
     windowsHide: true,
-    env: { ...process.env, ELECTRON_RUN_AS_NODE: undefined, NODE_OPTIONS: undefined, NODE_PATH: undefined },
+    env: environment ?? {
+      ...process.env,
+      ELECTRON_RUN_AS_NODE: undefined,
+      NODE_OPTIONS: undefined,
+      NODE_PATH: undefined,
+    },
   });
   const match = /^v(\d+)\.\d+\.\d+\s*$/.exec(output);
   if (!match || Number(match[1]) < 18)
@@ -631,10 +684,48 @@ export function probeToolRuntime(runtime: string): string {
   return fs.realpathSync.native(runtime);
 }
 
+export function sessionHookEnvironment(
+  env: NodeJS.ProcessEnv,
+  platform = process.platform,
+): NodeJS.ProcessEnv | undefined {
+  const selected: NodeJS.ProcessEnv = {};
+  for (const [name, value] of Object.entries(env)) {
+    const key = platform === 'win32' ? name.toUpperCase() : name;
+    if (platform === 'win32' && Object.hasOwn(selected, key) && selected[key] !== value) return undefined;
+    if (key.startsWith('NODE_') && value) return undefined;
+    selected[key] = value;
+  }
+  return selected;
+}
+
+// One prepared child retains qualification while filesystem selection still runs at every boundary.
+export function sessionHookRuntime(): (env: NodeJS.ProcessEnv, cwd: string, platform: NodeJS.Platform) => string {
+  let qualified: { key: string; runtime: string } | undefined;
+  return (env, cwd, platform) =>
+    resolveToolRuntime(env, cwd, platform, true, (runtime, environment) => {
+      const stamp = fs.statSync(runtime, { bigint: true });
+      const key = JSON.stringify([
+        canonicalToolPath(runtime, platform),
+        cwd,
+        platform,
+        Object.entries(environment!).sort(([a], [b]) => a.localeCompare(b)),
+        ...[stamp.dev, stamp.ino, stamp.mode, stamp.size, stamp.mtimeNs, stamp.ctimeNs].map(String),
+      ]);
+      if (qualified?.key !== key) {
+        qualified = undefined;
+        const selected = probeToolRuntime(runtime, environment);
+        qualified = { key, runtime: selected };
+      }
+      return qualified.runtime;
+    });
+}
+
 export function resolveToolRuntime(
   env: NodeJS.ProcessEnv = process.env,
   cwd = process.cwd(),
   platform = process.platform,
+  exactEnvironment = false,
+  qualify = probeToolRuntime,
 ): string {
   const delimiter = platform === 'win32' ? ';' : ':';
   const executable = platform === 'win32' ? 'node.exe' : 'node';
@@ -680,7 +771,7 @@ export function resolveToolRuntime(
         throw new Error(
           'Arc snapshot setup cannot use Node.js from this project. Use an external Node.js runtime first on PATH.',
         );
-      return probeToolRuntime(candidate);
+      return qualify(candidate, exactEnvironment ? env : undefined);
     }
   }
   throw new Error('Arc setup needs Node.js 18 or later on PATH. Install Node.js, restart the editor, then retry.');

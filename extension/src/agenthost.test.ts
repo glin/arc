@@ -3,6 +3,8 @@ import assert from 'node:assert';
 import { CONTEXT_FRAME_BYTES, contextFrameId } from './contextframe';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import childProcessBuiltin from 'node:child_process';
+import { syncBuiltinESMExports } from 'node:module';
 import { runInNewContext } from 'node:vm';
 import {
   AgentHost,
@@ -65,7 +67,8 @@ test('measurement windows refuse agent processes before launch', { tags: ['subpr
   }
 });
 import { ClaudeWire, CONTROL_DEADLINE_MS, spawnArgs, type PermissionMode } from './claudewire.ts';
-import { admitClaudeSessionSkill } from './sessionskills';
+import { admitClaudeSessionComponents, admitClaudeSessionSkill } from './sessionskills';
+import { sessionHookEnvironment, sessionHookRuntime } from './bundledtools';
 import {
   CompactHost,
   promptAsReader,
@@ -12205,67 +12208,150 @@ test('Claude plans set a requested cache lifetime over launch values and keep th
   assert.equal(planned({ agentRun: true }, { CLAUDE_CODE_PROMPT_CACHE_TTL: '1h' }).CLAUDE_CODE_PROMPT_CACHE_TTL, '1h');
 });
 
-test.each(['ordinary', 'restricted', 'inline'] as const)(
-  'Claude plan preparation admits the complete frozen %s arguments',
-  (kind) => {
-    const source = fs.readFileSync(path.join(__dirname, 'agenthost.ts'), 'utf8');
-    const start = source.indexOf('export function claudePlan(');
-    const end = source.indexOf('// A child started only to rename', start);
-    const compiled = esbuild.transformSync(
-      source.slice(start, end).replace('export function', 'function') + '\nreturn claudePlan;',
-      { loader: 'ts' },
-    ).code;
-    const root = tempDir('claude-plan-admission-');
-    const home = path.join(root, 'home');
-    const release = {
-      contentId: 'a'.repeat(64),
-      directory: root,
-      claudePlugin: path.join(root, 'session-plugin'),
-      claudeDefinition: path.join(root, 'SKILL.md'),
-      codexRoot: path.join(root, 'skills'),
-      codexDefinition: path.join(root, 'skills/arc-sessions/SKILL.md'),
-    };
-    const admittedArgs: string[][] = [];
-    const build = runInNewContext(`(() => { ${compiled} })()`, {
-      process: { env: { CUSTOM: 'frozen' } },
-      childEnv,
-      claudePlanEnv: (env: Record<string, string>) => ({ ...env }),
-      claudeSkillHome: () => home,
-      retainedSessionSkill: () => true,
-      spawnArgs,
-      admitClaudeSessionSkill: (input: Parameters<typeof admitClaudeSessionSkill>[0]) => {
-        admittedArgs.push([...input.args]);
-        return admitClaudeSessionSkill({
+test.each([
+  'ordinary',
+  'restricted',
+  'inline',
+  'personal',
+  'hook-policy',
+  'node-redirection',
+  'runtime-failure',
+  'runtime-change',
+] as const)('Claude plan preparation admits the complete frozen %s arguments', async (kind) => {
+  const source = fs.readFileSync(path.join(__dirname, 'agenthost.ts'), 'utf8');
+  const start = source.indexOf('export function claudePlan(');
+  const end = source.indexOf('// A child started only to rename', start);
+  const compiled = esbuild.transformSync(
+    source.slice(start, end).replace('export function', 'function') + '\nreturn claudePlan;',
+    { loader: 'ts' },
+  ).code;
+  const root = tempDir('claude-plan-admission-');
+  const home = path.join(root, 'home');
+  const workspace = path.join(root, 'workspace');
+  const bin = path.join(root, 'external');
+  fs.mkdirSync(workspace);
+  fs.mkdirSync(bin);
+  const executable = path.join(bin, process.platform === 'win32' ? 'node.exe' : 'node');
+  fs.writeFileSync(executable, 'runtime', { mode: 0o755 });
+  const version = vi.spyOn(childProcessBuiltin, 'execFileSync').mockImplementation(() => {
+    if (kind === 'runtime-failure') throw new Error('unsupported runtime');
+    return 'v22.12.0';
+  });
+  syncBuiltinESMExports();
+  onTestFinished(() => {
+    version.mockRestore();
+    syncBuiltinESMExports();
+  });
+  const release = {
+    contentId: 'a'.repeat(64),
+    directory: root,
+    claudePlugin: path.join(root, 'session-plugin'),
+    claudeHooksPlugin: path.join(root, 'plugin'),
+    claudeDefinition: path.join(root, 'SKILL.md'),
+    codexRoot: path.join(root, 'skills'),
+    codexDefinition: path.join(root, 'skills/arc-sessions/SKILL.md'),
+  };
+  const admittedArgs: string[][] = [];
+  const build = runInNewContext(`(() => { ${compiled} })()`, {
+    process: {
+      env: {
+        PATH: bin,
+        CUSTOM: 'frozen',
+        ...(kind === 'node-redirection' ? { NODE_OPTIONS: '--require /custom.cjs' } : {}),
+      },
+      platform: process.platform,
+    },
+    childEnv,
+    claudePlanEnv: (env: Record<string, string>) => ({ ...env }),
+    claudeSkillHome: () => home,
+    retainedSessionSkill: () => true,
+    sessionHookEnvironment,
+    sessionHookRuntime,
+    ClaudeWire,
+    spawnArgs,
+    admitClaudeSessionComponents: (input: Parameters<typeof admitClaudeSessionSkill>[0], hooks: boolean) => {
+      admittedArgs.push([...input.args]);
+      return admitClaudeSessionComponents(
+        {
           ...input,
-          read: (file) => (file === release.claudeDefinition ? 'matching skill' : undefined),
+          read: (file) =>
+            kind === 'personal' && file === path.join(home, 'skills/arc-sessions/SKILL.md')
+              ? 'matching skill'
+              : undefined,
           list: () => [],
           canonical: (file) => file,
-        });
-      },
-    }) as typeof claudePlan;
-    const options = {
-      cwd: root,
-      ...(kind === 'restricted' ? { policy: { readOnly: true as const, readTools: [] } } : {}),
-      ...(kind === 'inline' ? { settings: '{"disableSideloadFlags":true}' } : {}),
-    };
-    const plan = build(
-      { ...CLAUDE, leadingArgs: ['--model', 'sonnet'], env: {}, sessionSkills: { current: () => release } },
-      options,
-    );
-    const prepared = plan.prepare!();
-    const expected = [
-      '--model',
-      'sonnet',
-      ...spawnArgs({ ...options, replayUserMessages: true }, { CUSTOM: 'frozen', CLAUDE_CONFIG_DIR: home }),
-    ];
-    assert.deepEqual(admittedArgs, [expected]);
-    assert.deepEqual(Array.from(prepared.args), [
-      ...expected,
-      ...(kind === 'ordinary' ? ['--plugin-dir', release.claudePlugin] : []),
-    ]);
-    assert.equal(prepared.inheritedEnvironment?.CUSTOM, 'frozen');
-  },
-);
+        },
+        hooks,
+      );
+    },
+  }) as typeof claudePlan;
+  const options = {
+    cwd: workspace,
+    ...(kind === 'restricted' ? { policy: { readOnly: true as const, readTools: [] } } : {}),
+    ...(kind === 'inline' ? { settings: '{"disableSideloadFlags":true}' } : {}),
+    ...(kind === 'hook-policy' ? { settings: '{"disableAllHooks":true}' } : {}),
+  };
+  const plan = build(
+    { ...CLAUDE, leadingArgs: ['--model', 'sonnet'], env: {}, sessionSkills: { current: () => release } },
+    options,
+  );
+  const prepared = plan.prepare!();
+  const expected = [
+    '--model',
+    'sonnet',
+    ...spawnArgs({ ...options, replayUserMessages: true }, { CUSTOM: 'frozen', CLAUDE_CONFIG_DIR: home }),
+  ];
+  assert.deepEqual(admittedArgs, [expected]);
+  assert.deepEqual(Array.from(prepared.args), [
+    ...expected,
+    ...(['ordinary', 'hook-policy', 'node-redirection', 'runtime-failure', 'runtime-change'].includes(kind)
+      ? ['--plugin-dir', release.claudePlugin]
+      : []),
+    ...(['ordinary', 'personal', 'runtime-change'].includes(kind) ? ['--plugin-dir', release.claudeHooksPlugin] : []),
+  ]);
+  assert.equal(prepared.inheritedEnvironment?.CUSTOM, 'frozen');
+  const initialChecks = ['ordinary', 'personal', 'runtime-failure', 'runtime-change'].includes(kind) ? 1 : 0;
+  assert.equal(version.mock.calls.length, initialChecks);
+  const sent: any[] = [];
+  const driver = prepared.driver(
+    (line) => {
+      const message = JSON.parse(line);
+      sent.push(message);
+      if (message.type !== 'control_request') return;
+      const response =
+        message.request.subtype === 'initialize'
+          ? {
+              claude_code_version: '2.1.310',
+              commands: [{ name: 'arc-session-tools:arc-sessions', description: 'Sessions', argumentHint: '' }],
+            }
+          : { effective: {}, applied: {}, sources: [] };
+      queueMicrotask(() =>
+        driver.receive(
+          JSON.stringify({
+            type: 'control_response',
+            response: {
+              subtype: 'success',
+              request_id: message.request_id,
+              response,
+            },
+          }),
+        ),
+      );
+    },
+    () => {},
+  );
+  await driver.open();
+  assert.equal(version.mock.calls.length, initialChecks);
+  if (kind === 'runtime-change') fs.utimesSync(executable, new Date('2020-01-01'), new Date('2020-01-02'));
+  await driver.prompt('ordinary work');
+  assert.equal(version.mock.calls.length, initialChecks + (kind === 'runtime-change' ? 1 : 0));
+  assert.equal(sent.filter((message) => message.type === 'user').length, 1);
+  assert.equal(
+    sent.filter((message) => message.request?.subtype === 'get_settings').length,
+    ['restricted', 'inline'].includes(kind) ? 0 : 2,
+  );
+  driver.close('closed');
+});
 
 // One preparation read per actual construction protects idle paths without provider subprocesses.
 test('every live and idle construction prepares its own plan before its single spawn', async () => {

@@ -5,6 +5,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { spawn, spawnSync } = require('node:child_process');
 const { createHash } = require('node:crypto');
+const { runInNewContext } = require('node:vm');
 
 let driver;
 let run;
@@ -25,6 +26,54 @@ const writeJson = (file, value) => {
   fs.writeFileSync(file, JSON.stringify(value));
 };
 const quote = (value) => "'" + value.replaceAll("'", "'\\''") + "'";
+
+// The production entry point must request hooks whenever its operation checks plugin installation.
+test.each(['install', 'sequence'])(
+  'production %s rehearsal selects hooks and keeps explicit skip independent',
+  async (operation) => {
+    const source = fs.readFileSync(path.join(__dirname, 'test-installer.mjs'), 'utf8');
+    const body = source
+      .slice(source.indexOf('function parse(args)'), source.indexOf('if (process.argv[1]'))
+      .replace('export async function main', 'async function main');
+    const calls = [];
+    const environment = {
+      createSandbox: () => ({ root: '/owned-fixture' }),
+      save: () => {},
+      preflight: async () => {},
+      wrapper: () => {},
+      stageSource: () => {},
+      install: async (_run, source, options, extra) => {
+        calls.push({ source, options, extra });
+      },
+      console: { log: () => {} },
+      repository: '/source',
+      process: { pid: 1 },
+    };
+    const main = runInNewContext('(() => { ' + body + '\nreturn main; })()', environment);
+    const args = [
+      operation,
+      operation === 'install' ? '--source' : '--first',
+      'local',
+      '--checkout',
+      '/source',
+      '--editor',
+      '/editor',
+      '--repo',
+      'owner/repo',
+      '--ref',
+      'revision',
+    ];
+    await main(args);
+    assert.deepEqual(
+      calls.map((call) => call.source),
+      operation === 'install' ? ['local'] : ['local', 'remote', 'local'],
+    );
+    assert.ok(calls.every((call) => JSON.stringify(call.extra) === JSON.stringify(['--hooks'])));
+    calls.length = 0;
+    await main([...args, '--no-hooks', '--marketplace-url', 'https://example.invalid/catalog.json']);
+    assert.ok(calls.every((call) => JSON.stringify(call.extra) === JSON.stringify(['--no-hooks'])));
+  },
+);
 
 // This child catches deletion beneath a live session without editor startup, installation, or a model call.
 test.each([false, true])(
@@ -147,7 +196,8 @@ if (args[0] === '--plugin-dir') {
   console.log(JSON.stringify({cwd:process.cwd(), home:process.env.HOME, claude:process.env.CLAUDE_CONFIG_DIR,
     arc:process.env.ARC_HOME, codex:process.env.CODEX_HOME, plugin:args[1], text:fs.readFileSync(path.join(args[1], 'live.txt'), 'utf8')}));
 } else if (args[0] === 'install') {
-  if (args.includes('--no-hooks')) process.exit(0);
+  if (args.includes('--no-hooks')) { if (args.includes('--hooks') || args.includes('--marketplace-url')) process.exit(12); process.exit(0); }
+  if (args.includes('--json') && !args.includes('--hooks')) process.exit(13);
   if (state.market) {console.log('uses this checkout'); process.exit(1);}
   state.market = path.join(root, 'arc', 'marketplace'); state.installed=true; state.enabled=true;
   delete state.readFromFolder;

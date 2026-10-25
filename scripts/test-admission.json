@@ -35,9 +35,9 @@
     "matricesSha256": "ee41bd99bc78c90d9caa53af20ec903968f2860939812170f9d5a393eede6a0c"
   },
   "extension/src/agenthost.test.ts": {
-    "reason": "A spawned agent must receive the activation window, editor executable, and command search path. Self-compaction crosses native background settlement, response retention for provider turns, and workspace scope recovery. Initial naming must recheck ownership after host waits and serialize after reader renames. Native session skill admission must run before every live and idle construction and refuse actual policy without replacement or input. Live question recovery must block uncertain native writes. Remote Control results must follow a Claude clear, and an exited or retired child must take its connection with it.",
+    "reason": "A spawned agent must receive the activation window, editor executable, and command search path. Self-compaction crosses native background settlement, response retention for provider turns, and workspace scope recovery. Initial naming must recheck ownership after host waits and serialize after reader renames. Native session skill admission must run before every live and idle construction and refuse actual policy without replacement or input. Live question recovery must block uncertain native writes. Remote Control results must follow a Claude clear, and an exited or retired child must take its connection with it. Independent session hooks must retain the selected environment and bypass neither personal skills nor native hook policy.",
     "cases": 317,
-    "matricesSha256": "042bdc9a72b5105bbf4ba2b2f6facae8710cf2eeed3a2aff8d7e485dd2b8fea5"
+    "matricesSha256": "285969c4891e6a54bdd4b7a429527e9261e32fcd776dab447b24529f14d003bd"
   },
   "extension/src/chrome.browser.test.ts": {
     "reason": "Panel controls must preserve native focus, keyboard handling, and browser event delivery.",
@@ -47,7 +47,7 @@
   "extension/src/claudeplugin.test.ts": {
     "reason": "Bundled command installation must validate real Node executables and preserve owned launchers through partial filesystem failures.",
     "cases": 63,
-    "matricesSha256": "eebfd5b0f246f1007c3d82af7b7ce202dd3ebca01295157a77977b35ee9075b8"
+    "matricesSha256": "f00f570297dfb3b17847a065e090d8167a909454dfe0bf64786e587b1ded27f8"
   },
   "extension/src/clauderepeated.test.ts": {
     "reason": "The real worker must read repeated-record maps and invalidate them after source revision changes.",
@@ -85,9 +85,9 @@
     "matricesSha256": "c1fbc77a742732e8bd4685e6d0ae588a026bb07ab6ae295ec073bc6ea3cfe505"
   },
   "extension/src/packaging.test.ts": {
-    "reason": "Actual VSIX packaging must preserve archive contents, platform executables, output options, and extracted runtime entry points. Both native skill payloads and the inert plugin manifest must retain complete immutable release identity.",
+    "reason": "Actual VSIX packaging must preserve archive contents, platform executables, output options, and extracted runtime entry points. Both native skill payloads and the inert plugin manifest must retain complete immutable release identity. The independent snapshot plugin must contain only the canonical capture pair and allowed files.",
     "cases": 28,
-    "matricesSha256": "5c485720e1038988de1de05cec93f1fe86500ef292cd9a264a48aa9c997a74e1"
+    "matricesSha256": "2da07124e48e9d368f05b9429b11d668858d07316fe6ef6beae0db39eabb82bb"
   },
   "extension/src/panel-shots.test.ts": {
     "reason": "Screenshot output must pass through the actual image encoder and lossless comparison while preserving its crop.",
@@ -126,8 +126,8 @@
   },
   "extension/src/panel.webview.test.ts": {
     "reason": "Real progressive workers must deliver bounded recovery and metadata through the production panel host. Start metadata must survive storage delays, hidden panels, preference resets, and reloads. File presses must preserve recorded changes after their worktree disappears. Commit presses must never open an unrelated repository after their worktree disappears. Reader sends must release held compaction after drops without overtaking surviving input. Each Prompt box must retain its supplying child definition across sibling catalogs, idle updates, and child replacement. The Remote Control item must follow connection results and never reach saved drafts. Row posts and watcher decisions must reach the performance counters with their causes through the production host methods. A catalog refresh must name why it could not reuse the held catalog.",
-    "cases": 644,
-    "matricesSha256": "b7f081c563b18c74df5168499753cc878d658a71992f4efc6eefea21c64acb4e"
+    "cases": 645,
+    "matricesSha256": "2e552b2693631589f9dc18de5625c225b3d71bac2c259f2197672c4f07aeb6b0"
   },
   "extension/src/panelbundle.test.ts": {
     "reason": "The panel bundle and fixture must contain the production entry, source identity, and substituted text.",
@@ -285,9 +285,9 @@
     "matricesSha256": "ab124092ca0c860179f1a2382da66c9f1c6588f6f3dda1f4598f2f2f981c6427"
   },
   "scripts/editor-cli.test.js": {
-    "reason": "Editor launch and installer shell commands must preserve quoting, cancellation, native entry selection, existing dependencies, lockfile reconciliation, and component outcomes. Commit installs must select frozen source and preserve the checkout and index.",
-    "cases": 60,
-    "matricesSha256": "f98d8d54c54d907cb8a5453747a1e00ac47ce39470aba884935cd6c44d291a47"
+    "reason": "Editor launch and installer shell commands must preserve quoting, cancellation, native entry selection, existing dependencies, lockfile reconciliation, and component outcomes. Default installation must preserve personal skills and global hook configuration. Explicit selectors must retain cancellation and conflict behavior. Commit installs must select frozen source and preserve the checkout and index.",
+    "cases": 61,
+    "matricesSha256": "06f87938e6990f83238d6f7e8cf10b0a1b5ed3b43083b0454bbf85e50d5b1eea"
   },
   "scripts/extension-test-runner.test.js": {
     "reason": "Real runner commands must classify files, reject invalid selection, and preserve browser readiness status.",
@@ -316,8 +316,8 @@
   },
   "scripts/test-installer.test.js": {
     "reason": "Printed checkout launchers must preserve active external Claude sessions, terminal receipts, detached descendants, and PID reuse alongside installer identity and alias boundaries.",
-    "cases": 10,
-    "matricesSha256": "c45cd0f994ca1400a09e483d3ee8f9a481b2e700743e54003ef4da9b4f77ad41"
+    "cases": 11,
+    "matricesSha256": "d8f469b1be1e7ce2e1a3fa46468f1703be6c94abdb205d67bbfa9d4ce480dc4a"
   },
   "scripts/test-lanes.test.js": {
     "reason": "Public commands must report independent failures, preserve cancellation, and reject stale or incomplete landing evidence. Direct cases guard category and admission drift.",

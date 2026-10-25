@@ -3,16 +3,23 @@ import assert from 'node:assert';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { tempDir } from './temproot';
+import { sessionHookEnvironment } from './bundledtools';
 import { canonicalToolPath } from './toolownership';
 import { childEnv } from './agenthost';
 import {
   admitClaudeSessionSkill,
+  admitClaudeSessionComponents,
   claudeNativeSkillSettings,
   claudeSkillHome,
   codexRawSkills,
   codexSkillConfiguration,
   type SessionSkillRelease,
 } from './sessionskills';
+
+function componentFlags(input: Parameters<typeof admitClaudeSessionComponents>[0]) {
+  const { skill, hooks } = admitClaudeSessionComponents(input);
+  return { skill, hooks };
+}
 
 test.each(['win32', 'darwin', 'linux'] as const)(
   'the frozen %s child environment retains its selected Claude configuration home',
@@ -54,7 +61,7 @@ const release: SessionSkillRelease = {
   codexDefinition: '/release/skills/arc-sessions/SKILL.md',
 };
 
-test('Claude reads matching manual directory links and refuses changed linked resources', () => {
+test('Claude omits its automatic skill for matching and customized manual directory links', () => {
   const root = tempDir('session-skill-link-');
   const home = path.join(root, 'home');
   const cwd = path.join(root, 'workspace');
@@ -94,7 +101,7 @@ test('Claude reads matching manual directory links and refuses changed linked re
     },
     canonical: (file: string) => canonicalToolPath(mapped(file)),
   };
-  assert.equal(admitClaudeSessionSkill(input), true);
+  assert.equal(admitClaudeSessionSkill(input), false);
   fs.writeFileSync(path.join(target, 'details.md'), 'custom instructions');
   assert.equal(admitClaudeSessionSkill(input), false);
 });
@@ -130,7 +137,13 @@ test.each(['win32', 'darwin', 'linux'] as const)(
       if (paths.dirname(folder) === folder) break;
     }
     for (const folder of folders)
-      for (const tail of ['settings.json', 'settings.local.json', 'skills/arc-sessions/SKILL.md', 'skills'])
+      for (const tail of [
+        'settings.json',
+        'settings.local.json',
+        'skills/arc-sessions/SKILL.md',
+        'commands/arc-sessions.md',
+        'skills',
+      ])
         admit(paths.join(folder, tail));
     for (const tail of ['installed_plugins.json', 'known_marketplaces.json', 'known_marketplaces_claudeai.json'])
       admit(paths.join(home, 'plugins', tail));
@@ -179,6 +192,49 @@ test.each(['win32', 'darwin', 'linux'] as const)(
     };
     write(supplied, 'matching skill');
     assert.equal(admitClaudeSessionSkill(input), true);
+    for (const env of [
+      { NODE_EXTRA_CA_CERTS: '/custom/certificates.pem' },
+      { NODE_CHANNEL_FD: '3' },
+      { nOdE_eXtRa_Ca_CeRtS: '/custom' },
+      { NODE_EXTRA_CA_CERTS: '', node_extra_ca_certs: '/custom' },
+      { NODE_CHANNEL_FD: 3 },
+      { CUSTOM: null },
+      { CUSTOM: 'first', custom: 'second' },
+      { NODE_EXTRA_CA_CERTS: '' },
+    ]) {
+      const hooks =
+        Object.values(env).every((value) => typeof value === 'string') &&
+        !!sessionHookEnvironment(env as NodeJS.ProcessEnv, platform);
+      for (const file of [
+        paths.join(home, 'settings.json'),
+        paths.join(cwd, '.claude/settings.json'),
+        paths.join(cwd, '.claude/settings.local.json'),
+      ]) {
+        write(file, JSON.stringify({ env }));
+        assert.deepEqual(componentFlags(input), { skill: true, hooks }, `${platform} ${file} ${JSON.stringify(env)}`);
+        write(file, '{}');
+      }
+      assert.deepEqual(componentFlags({ ...input, args: ['--settings', JSON.stringify({ env })] }), {
+        skill: true,
+        hooks,
+      });
+      const settingsFile = paths.join(home, 'settings.json');
+      write(settingsFile, JSON.stringify({ env }));
+      assert.deepEqual(componentFlags({ ...input, args: ['--settings', settingsFile] }), { skill: true, hooks });
+      write(settingsFile, '{}');
+      for (const source of ['userSettings', 'projectSettings', 'localSettings', 'flagSettings']) {
+        for (const effective of [true, false]) {
+          const response = {
+            effective: effective ? { env } : {},
+            applied: {},
+            sources: [{ source, settings: effective ? {} : { env } }],
+          };
+          assert.equal(claudeNativeSkillSettings(response, 'hooks', platform), hooks);
+          assert.equal(claudeNativeSkillSettings(response, 'skill', platform), true);
+        }
+      }
+    }
+    assert.deepEqual(unmapped, []);
     fs.mkdirSync(owned(managed));
     const mixedManaged = path.join(owned(managed), 'Managed-Settings.d');
     fs.mkdirSync(mixedManaged);
@@ -188,7 +244,7 @@ test.each(['win32', 'darwin', 'linux'] as const)(
     fs.rmdirSync(mixedManaged);
     assert.deepEqual(unmapped, []);
     write(definition, 'matching skill');
-    assert.equal(admitClaudeSessionSkill(input), true);
+    assert.deepEqual(componentFlags(input), { skill: false, hooks: true });
     write(definition, 'custom skill');
     assert.equal(admitClaudeSessionSkill(input), false);
     write(definition, 'matching skill');
@@ -202,6 +258,7 @@ test.each(['win32', 'darwin', 'linux'] as const)(
       write(paths.join(home, 'settings.json'), JSON.stringify(settings));
       assert.equal(admitClaudeSessionSkill(input), false, JSON.stringify(settings));
     }
+    fs.unlinkSync(owned(definition));
     write(paths.join(home, 'settings.json'), '{}');
     assert.equal(
       admitClaudeSessionSkill({
@@ -222,6 +279,8 @@ test.each(['win32', 'darwin', 'linux'] as const)(
       paths.join(marketplace, '.claude-plugin/marketplace.json'),
       paths.join(sourceRoot, '.claude-plugin/plugin.json'),
       paths.join(sourceRoot, 'skills/arc-sessions/SKILL.md'),
+      paths.join(sourceRoot, 'commands/arc-sessions.md'),
+      paths.join(sourceRoot, 'hooks/hooks.json'),
       paths.join(cachedRoot, '.claude-plugin/plugin.json'),
       marketplace,
       sourceRoot,
@@ -248,6 +307,124 @@ test.each(['win32', 'darwin', 'linux'] as const)(
     write(paths.join(sourceRoot, '.claude-plugin/plugin.json'), JSON.stringify({ name: 'arc-session-tools' }));
     assert.equal(admitClaudeSessionSkill(input), false, 'cached bytes cannot hide a selected source collision');
     write(paths.join(sourceRoot, '.claude-plugin/plugin.json'), JSON.stringify({ name: 'arc-hooks' }));
+    assert.deepEqual(componentFlags(input), { skill: true, hooks: false });
+    // Renaming a plugin cannot authorize a second capture command.
+    write(
+      paths.join(home, 'plugins/installed_plugins.json'),
+      JSON.stringify({
+        version: 2,
+        plugins: { 'renamed@arc': [{ scope: 'user', version: '0.1.0', installPath: cachedRoot }] },
+      }),
+    );
+    write(
+      paths.join(marketplace, '.claude-plugin/marketplace.json'),
+      JSON.stringify({ plugins: [{ name: 'renamed', source: './plugin' }] }),
+    );
+    const capture = { Stop: [{ hooks: [{ type: 'command', command: 'node "manual/stop-manifest.cjs" --flag' }] }] };
+    const unrelated = { Stop: [{ hooks: [{ type: 'command', command: 'echo unrelated' }] }] };
+    const customHooks = paths.join(sourceRoot, 'custom-hooks.json');
+    admit(customHooks);
+    for (const declaration of ['default', 'selected', 'inline']) {
+      write(
+        paths.join(sourceRoot, '.claude-plugin/plugin.json'),
+        JSON.stringify({
+          name: 'renamed',
+          ...(declaration === 'selected'
+            ? { hooks: './custom-hooks.json' }
+            : declaration === 'inline'
+              ? { hooks: capture }
+              : {}),
+        }),
+      );
+      if (declaration === 'default')
+        write(paths.join(sourceRoot, 'hooks/hooks.json'), JSON.stringify({ hooks: capture }));
+      else fs.rmSync(owned(paths.join(sourceRoot, 'hooks/hooks.json')), { force: true });
+      if (declaration === 'selected') write(customHooks, JSON.stringify({ hooks: capture }));
+      assert.deepEqual(componentFlags(input), { skill: true, hooks: false }, declaration);
+    }
+    write(paths.join(sourceRoot, '.claude-plugin/plugin.json'), JSON.stringify({ name: 'renamed' }));
+    write(paths.join(sourceRoot, 'hooks/hooks.json'), JSON.stringify({ hooks: unrelated }));
+    assert.deepEqual(componentFlags(input), { skill: true, hooks: true });
+    const defaultHookPath = paths.join(sourceRoot, 'hooks/hooks.json');
+    let omittedReads = 0;
+    const omitted = admitClaudeSessionComponents(
+      {
+        ...input,
+        read: (file) => {
+          if (key(file) === key(defaultHookPath)) omittedReads++;
+          return read(file);
+        },
+      },
+      false,
+    );
+    assert.equal(omittedReads, 0, 'omitted hooks read their declaration');
+    assert.deepEqual({ skill: omitted.skill, hooks: omitted.hooks }, { skill: true, hooks: false });
+    assert.deepEqual(
+      componentFlags({
+        ...input,
+        canonical: (file) =>
+          key(file) === key(defaultHookPath)
+            ? paths.join(paths.parse(cwd).root, 'outside-plugin', 'hooks.json')
+            : input.canonical(file),
+      }),
+      { skill: true, hooks: false },
+    );
+    for (const settings of [
+      { disableAllHooks: true },
+      { allowManagedHooksOnly: true },
+      { disableAllHooks: 'false' },
+      { enabledPlugins: { 'arc-hooks@inline': false } },
+      { hooks: capture },
+      { hooks: { Stop: 'invalid' } },
+      { hooks: { Stop: [{ matcher: 3, hooks: [] }] } },
+      { hooks: { Stop: [{ hooks: [{ type: 'command', command: '' }] }] } },
+    ]) {
+      write(paths.join(home, 'settings.json'), JSON.stringify(settings));
+      assert.deepEqual(componentFlags(input), { skill: true, hooks: false }, JSON.stringify(settings));
+    }
+    write(paths.join(home, 'settings.json'), '{}');
+    assert.deepEqual(componentFlags({ ...input, args: ['--disable-slash-commands'] }), {
+      skill: false,
+      hooks: true,
+    });
+    for (const inputOverride of [
+      {
+        read: (file: string) =>
+          key(file) === key(paths.join(home, 'settings.json')) ? ' '.repeat(128 * 1024 + 1) : read(file),
+      },
+      { list: () => Array.from({ length: 257 }, (_, index) => String(index)) },
+    ])
+      assert.deepEqual(componentFlags({ ...input, ...inputOverride }), { skill: false, hooks: false });
+    // An unrelated project registration cannot suppress this child's components.
+    const otherProject = paths.join(paths.parse(cwd).root, 'OtherProject');
+    admit(otherProject);
+    admit(cwd);
+    write(
+      paths.join(home, 'plugins/installed_plugins.json'),
+      JSON.stringify({
+        version: 2,
+        plugins: {
+          'renamed@arc': [{ scope: 'project', projectPath: otherProject, version: '0.1.0', installPath: cachedRoot }],
+        },
+      }),
+    );
+    write(paths.join(sourceRoot, 'hooks/hooks.json'), JSON.stringify({ hooks: capture }));
+    assert.deepEqual(componentFlags(input), { skill: true, hooks: true });
+    for (const scope of ['managed', 'unknown']) {
+      write(
+        paths.join(home, 'plugins/installed_plugins.json'),
+        JSON.stringify({
+          version: 2,
+          plugins: {
+            'renamed@arc': [{ scope, version: '0.1.0', installPath: cachedRoot }],
+          },
+        }),
+      );
+      assert.deepEqual(componentFlags(input), { skill: false, hooks: false });
+    }
+    write(paths.join(home, 'plugins/installed_plugins.json'), JSON.stringify({ version: 2, plugins: {} }));
+    write(paths.join(home, 'commands/arc-sessions.md'), 'matching skill');
+    assert.deepEqual(componentFlags(input), { skill: false, hooks: true });
     write(paths.join(managed, 'managed-settings.json'), '{}');
     assert.equal(admitClaudeSessionSkill(input), false);
     assert.deepEqual(unmapped, []);
@@ -443,5 +620,26 @@ test.each(['win32', 'darwin', 'linux'] as const)(
       platform !== 'win32',
     );
     assert.deepEqual(unmapped, []);
+  },
+);
+
+// Inherited Node redirection changes hook execution without changing skill availability.
+test.each(['win32', 'darwin', 'linux'] as const)(
+  'hook environment admission retains %s native names and refuses Node redirection',
+  (platform) => {
+    const ordinary = { PATH: '/external', ELECTRON_RUN_AS_NODE: '1' };
+    assert.deepEqual(sessionHookEnvironment(ordinary, platform), ordinary);
+    for (const value of ['--require /preload.cjs', '--invalid-option']) {
+      assert.equal(sessionHookEnvironment({ ...ordinary, NODE_OPTIONS: value }, platform), undefined);
+      assert.equal(sessionHookEnvironment({ ...ordinary, NODE_PATH: '/modules' }, platform), undefined);
+    }
+    assert.equal(sessionHookEnvironment({ ...ordinary, NODE_EXTRA_CA_CERTS: '/custom' }, platform), undefined);
+    const mixed = { ...ordinary, nOdE_oPtIoNs: '--require /preload.cjs' };
+    assert.equal(!!sessionHookEnvironment(mixed, platform), platform !== 'win32');
+    assert.equal(!!sessionHookEnvironment({ ...ordinary, Path: '/other' }, platform), platform !== 'win32');
+    assert.equal(
+      !!sessionHookEnvironment({ ...ordinary, NODE_OPTIONS: '', node_options: '--preload' }, platform),
+      platform !== 'win32',
+    );
   },
 );
