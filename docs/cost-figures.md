@@ -2,7 +2,7 @@
 
 Arc estimates costs in the panel, CLI, and Claude status line from recorded usage and supported list prices.
 
-[Lower agent costs](lowering-agent-costs.md) owns the decisions about work boundaries and cache reuse. Its [What makes a turn expensive](lowering-agent-costs.md#what-makes-a-turn-expensive) section explains requests and the prompt cache.
+[Lower agent costs](lowering-agent-costs.md) owns the decisions about work boundaries, cache reuse, and waiting on subagents. Its [What makes a turn expensive](lowering-agent-costs.md#what-makes-a-turn-expensive) section explains requests and the prompt cache.
 
 ## Supported pricing
 
@@ -133,17 +133,13 @@ A timed-out wait is a request that brought back no news. [Lower agent costs](low
 
 The line stays absent until the main agent's usage is complete and every main-agent request has a supported price. Claude records no waits, so a Claude session never shows the line.
 
-## Lower the cost of waiting on subagents
+## Read the cost of waiting on subagents
 
-Each parent wake during subagent work costs one model request.
-
-Claude Code's `Agent` tool launches a subagent in the foreground or the background. A foreground launch blocks until the subagent returns. A background launch returns immediately, then a completion notice wakes the parent. In both modes the parent makes no request while it waits, and its prompt cache lifetime runs from its last request. A wait longer than the prompt cache lifetime costs one cache write on the next request, which the next-turn starting price shows as the cold price.
-
-A Claude parent that waits on an Arc dispatch makes no request until its wait command returns. A coordinator that waits on long workers needs a cache lifetime longer than each wait. Pass `--cache-lifetime 1h` to `arc run` or `arc start` when it needs 1 hour. [Default cache TTLs](lowering-agent-costs.md#default-cache-ttls) lists the lifetime of a launch without the flag.
-
-Codex has no foreground launch. `spawn_agent` returns at once, and the parent waits through `wait_agent`, where each return is a model request. Codex native waits return on child completion or timeout. Its v2 wait also returns on child messages. The parent also receives pending results through other tool returns, including timer returns. Repeated short waits or sleeps create extra model requests. [Lower agent costs](lowering-agent-costs.md#wait-without-repeated-model-requests) owns the configuration guidance.
+A parent wait longer than the prompt cache lifetime shows as the cold price in the next-turn starting price.
 
 `arc cost <path> --by-tool` shows requests that read each tool's results. Its `wait` row includes `wait_agent`, `wait`, and `write_stdin` returns. A `clock.sleep` call belongs to `other`. Check that category and the transcript when the parent uses timers.
+
+[Wait without repeated model requests](lowering-agent-costs.md#wait-without-repeated-model-requests) explains how Claude Code and Codex parents wait and how to lower the cost.
 
 ## Arc message delivery
 

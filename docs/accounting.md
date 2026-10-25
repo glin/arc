@@ -1,6 +1,6 @@
 # Accounting
 
-[Arc cost figures](agent-cost-guide.md) owns the reader's explanation and supported pricing routes. [CLI cost reports](cli-reference.md#cost-reports) owns report fields and command behavior.
+[Arc cost figures](cost-figures.md) owns the reader's explanation and supported pricing routes. [CLI cost reports](cli-reference.md#cost-reports) owns report fields and command behavior.
 
 ## Accounting contracts
 
@@ -26,7 +26,7 @@ Session headings read lifetime spend independently of parsed timeline windows. `
 
 [`waitShareWarnings`](../extension/src/turncard.ts) owns wait-warning thresholds and requires Codex `wait_agent`, `wait`, or `write_stdin` returns, the `wait` kind of `arc cost --by-tool`. Only a `wait_agent` return can count as timed out. It requires complete, fully priced main usage. Delegated usage stays outside the denominator. Claude records no waits. A return with news also carries the parent's reply, so its request cost overstates pure waiting. Wait cost and cache-expiry cost remain separate.
 
-[`cacheRateDetail`](../extension/src/turncard.ts) owns cached-input warning thresholds. Percentages use input volume, including writes. Each identified delegated agent qualifies independently. These thresholds do not establish avoidable waste. [Arc cost figures](agent-cost-guide.md#reading-the-cache-percentage) owns the display explanation.
+[`cacheRateDetail`](../extension/src/turncard.ts) owns cached-input warning thresholds. Percentages use input volume, including writes. Each identified delegated agent qualifies independently. These thresholds do not establish avoidable waste. [Arc cost figures](cost-figures.md#reading-the-cache-percentage) owns the display explanation.
 
 ### Tool attribution
 

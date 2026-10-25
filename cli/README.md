@@ -116,7 +116,7 @@ Read a saved session's estimated API costs without an Arc window:
 arc cost SESSION_ID --by-model
 ```
 
-Use a Claude Code or Codex session ID. Cost reports also accept a transcript or rollout file path. See [cost figures](../docs/agent-cost-guide.md#read-the-estimate) for supported usage and partial estimates.
+Use a Claude Code or Codex session ID. Cost reports also accept a transcript or rollout file path. See [cost figures](../docs/cost-figures.md#read-the-estimate) for supported usage and partial estimates.
 
 The [CLI guide](https://github.com/glin/arc/blob/main/docs/cli.md) covers examples and troubleshooting. The [CLI reference](https://github.com/glin/arc/blob/main/docs/cli-reference.md) defines JSON fields and command limits.
 

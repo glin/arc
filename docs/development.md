@@ -122,7 +122,7 @@ Change model and provider pricing in `extension/src/pricing.ts`.
 14. Bump `PROJECT_SPEND_PARSER_GENERATION` in `projectspend.ts` when model support changes saved request bands or derived usage facts.
 15. Bump `VERSION` in `derivedcache.ts` when model support changes saved session cost or context facts.
 16. Remove the new provider support temporarily and run the symptom regressions. Also remove its cache policy, price, and independent route expectation separately. Remove the new effort-change retention policy and its independent expectation separately. Also widen each exact-identity retention pattern. Require each guard to fail, then restore from plain backups.
-17. Update exact model coverage in [Supported pricing](agent-cost-guide.md#supported-pricing). Update README provider summaries when provider coverage changes.
+17. Update exact model coverage in [Supported pricing](cost-figures.md#supported-pricing). Update README provider summaries when provider coverage changes.
 18. Check personal billing consumers against the same request evidence and Arc build. Record independent pricing behavior until each consumer uses Arc billing.
 
 ## Environment overrides

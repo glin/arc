@@ -62,7 +62,7 @@ Reusing cached context costs 1/10 the normal input price or less. After cache ex
 | Claude Code subagents | 5m |
 | Claude coordinator that waits on workers, started by Arc | 1h with `--cache-lifetime 1h` on `arc run` or `arc start` |
 
-A subagent cannot get the 1 hour lifetime from its caller. Without `--cache-lifetime`, reader-owned Arc sessions inherit `CLAUDE_CODE_PROMPT_CACHE_TTL`, including a 5-minute value. Without that variable, the billing row above applies. Use `--cache-lifetime 1h` for a 1 hour lifetime.
+A coordinator that waits on long workers needs a cache lifetime longer than each wait. A subagent cannot get the 1 hour lifetime from its caller. Without `--cache-lifetime`, reader-owned Arc sessions inherit `CLAUDE_CODE_PROMPT_CACHE_TTL`, including a 5-minute value. Without that variable, the billing row above applies. Use `--cache-lifetime 1h` for a 1 hour lifetime.
 
 Claude Code's [prompt-caching guide](https://code.claude.com/docs/en/prompt-caching#which-ttl-each-request-gets) lists which requests get which lifetime and how to change it.
 
@@ -83,7 +83,13 @@ See Anthropic's [prompt-caching guide](https://code.claude.com/docs/en/prompt-ca
 
 ## Wait without repeated model requests
 
-Codex's built-in guidance limits blocking waits and requests frequent commentary. Repeated sleeps can satisfy that guidance but create a model request with retained context after each return.
+Each parent wake during subagent work costs one model request.
+
+Claude Code's `Agent` tool launches a subagent in the foreground or the background. A foreground launch blocks until the subagent returns. A background launch returns immediately, then a completion notice wakes the parent. In both modes the parent makes no request while it waits. A Claude parent that waits on an Arc dispatch makes no request until its wait command returns. The parent's prompt cache lifetime runs from its last request. A wait longer than that lifetime costs one cache write on the next request. [Default cache TTLs](#default-cache-ttls) lists each lifetime and how to extend it.
+
+Codex has no foreground launch. `spawn_agent` returns at once, and the parent waits through `wait_agent`, where each return is a model request. Codex native waits return on child completion or timeout. The parent also receives pending results through other tool returns, including timer returns.
+
+Codex's built-in guidance limits blocking waits and requests frequent commentary. Repeated short waits or sleeps can satisfy that guidance but create a model request with retained context after each return.
 
 For Codex v2 subagents, combine a native timeout floor with developer instructions. Put the root setting before table headings in `~/.codex/config.toml`. Merge existing developer text because configuration precedence selects one value.
 
@@ -227,4 +233,4 @@ Exact prices depend on the model. See [Anthropic pricing](https://platform.claud
 - Split a huge task into chunks instead of running it all in one session. A coordinating session hands each chunk to a subagent or a separate session and checks the results. Chunks can run in parallel, and each works in a small context. Tightly coupled work splits badly, because each chunk has to rebuild the shared context. Independent reading, separate files, and review work split well. The coordination still costs requests, so watch the coordinator's request count.
 - Cap spend on unattended runs. Claude Code print mode takes `--max-budget-usd` and `--max-turns`. A Codex `/goal` token budget is soft: it asks the model to wrap up but doesn't stop the run.
 
-For the cost figures Arc shows, see [Arc cost figures](agent-cost-guide.md).
+For the cost figures Arc shows, see [Arc cost figures](cost-figures.md).

@@ -1559,10 +1559,10 @@ test('reported cost and configured rates retain their own provenance', () => {
   );
 });
 
-// The cost guide states cache multiples by provider and model.
+// The cost figures guide states cache multiples by provider and model.
 
-test('the cost guide states the provider-specific cache multiples the pricer charges', () => {
-  const guide = readFileSync(path.join(__dirname, '..', '..', 'docs', 'agent-cost-guide.md'), 'utf8');
+test('the cost figures guide states the provider-specific cache multiples the pricer charges', () => {
+  const guide = readFileSync(path.join(__dirname, '..', '..', 'docs', 'cost-figures.md'), 'utf8');
   const cellsFor = (model: string): string[] => {
     const row = guide.split('\n').find((line) => line.startsWith(`| [${model}]`));
     assert.ok(row, `the ${model} row must exist`);

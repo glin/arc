@@ -79,7 +79,7 @@ A **read-only launch policy** retains launch restrictions through session contin
 
 ## Cost, context, and caching
 
-[`agent-cost-guide.md`](agent-cost-guide.md) owns Arc's supported pricing and the meaning of its cost figures. [`lowering-agent-costs.md`](lowering-agent-costs.md) owns the decision guidance and the client-neutral explanation of how requests and the prompt cache set the bill.
+[`cost-figures.md`](cost-figures.md) owns Arc's supported pricing and the meaning of its cost figures. [`lowering-agent-costs.md`](lowering-agent-costs.md) owns the decision guidance and the client-neutral explanation of how requests and the prompt cache set the bill.
 
 | Term | Meaning | Usage notes |
 | --- | --- | --- |
