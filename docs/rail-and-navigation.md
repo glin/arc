@@ -88,7 +88,7 @@ The funnel's accessible name and hint identify filter and order. Edits differing
 
 The extension owns the workspace saved-filter list. The panel saves only its selected ID, query, and sort. Host state saves exclude the list. Missing selected IDs fall back to All sessions. `migrateStoredRailLens` preserves stored query words while adding missing supported lens terms. It maps retired Needs you IDs to All sessions, drops retired Needs you lens fields, and converts Warm words under All sessions to Active. Stored built-in names gain an available `(saved)` suffix. Keep these migrations in `domain/rail-filters.ts`.
 
-`railMenuLabelChips` in `view/session-query.ts` owns View menu label selection and folding. It draws twelve before expansion. Negated labels offer no chip because adding their positive term would empty the list.
+`railMenuLabelChips` in `view/session-query.ts` owns View menu label selection and folding. It draws twelve before expansion. Find text draws all matches without folding. Negated labels offer no chip because adding their positive term would empty the list.
 
 ## Saved views
 
