@@ -12490,10 +12490,14 @@ export class PanelProvider implements vscode.Disposable {
           .run({ kind: 'starts', session, agentRunScan: previous.agentRunScan }, generation, signal)
           .catch(() => null);
         this.noteSessionRead(session, 'starts', result !== null, generation, signal);
+        // A failed or rejected read of one source moves on to the next session.
+        // A session that grows during every pass then never holds back the sessions after it.
         if (!result || signal.aborted) {
-          break;
+          if (signal.aborted || generation !== this.refreshGeneration) break;
+          continue;
         }
         if (!acceptsProgressiveResult(result, this.refreshGeneration, this.revisionOf(session))) {
+          catalogCurrent = false;
           const current = this.titles.get(session.file);
           const kept =
             current &&
@@ -12506,7 +12510,8 @@ export class PanelProvider implements vscode.Disposable {
             this.storeTitleEntry(session.file, kept);
             this.derivedCacheCheckpointState.markChanged();
           }
-          break;
+          if (generation !== this.refreshGeneration) break;
+          continue;
         }
         if (result.value.kind !== 'starts') {
           continue;

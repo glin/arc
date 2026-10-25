@@ -8422,6 +8422,134 @@ test('rejected expanded metadata keeps accepted rail progress for one bounded re
   assert.equal(requests.length, 3, 'settled metadata scheduled another enrichment pass');
 });
 
+// A long turn starts before the bounded metadata tail, so the row bolt runs on held stats until enrichment reads the whole file.
+// A session listed first that grows between the worker's stat and the host's catalog must not stop the reads of later sessions.
+test("a growing first session cannot strand a later session's row facts", async () => {
+  const heldRequestAt = Date.parse('2026-10-25T19:25:34Z');
+  const newestRequestAt = Date.parse('2026-10-25T20:15:58Z');
+  const now = Date.parse('2026-10-25T20:16:30Z');
+  const turnStartedAt = Date.parse('2026-10-25T18:29:00Z');
+  const factsAt = (requestAt: number) =>
+    ({
+      turns: [
+        {
+          startedAt: turnStartedAt,
+          endedAt: requestAt,
+          finished: false,
+          error: false,
+          model: 'claude-opus-5',
+          provider: null,
+          usage: { input: 1, cacheWrite1h: 2_000, cacheWrite5m: 0, cacheRead: 140_000, output: 40, thinking: 0 },
+          contextTokens: 150_000,
+          contextWindow: 1_000_000,
+          contextRequest: {
+            at: requestAt,
+            lifetime: '1h' as const,
+            inferenceClass: null,
+            serviceTier: null,
+            readBack: false,
+            outputTokens: 40,
+          },
+          childSpendPartial: false,
+        },
+      ],
+      compactions: [],
+    }) as SessionStatFacts;
+  const growing = {
+    file: 'Growing.jsonl',
+    sessionId: 'growing',
+    agent: 'claude' as const,
+    size: 3_400_000,
+    mtimeMs: 100,
+  };
+  const waiting = {
+    file: 'Waiting.jsonl',
+    sessionId: 'waiting',
+    agent: 'claude' as const,
+    size: 1_280_000,
+    mtimeMs: 200,
+  };
+  // The bounded tail found no turn in either session, and the waiting session holds stats from an older read.
+  const unread = (session: typeof growing) => ({
+    size: session.size,
+    mtimeMs: session.mtimeMs,
+    label: session.sessionId,
+    fullLabel: session.sessionId,
+    foldedLabel: session.sessionId,
+    activityMs: null,
+    agentRun: false,
+    outcome: null,
+    stats: null,
+  });
+  const growingEntry = unread(growing);
+  const waitingEntry = {
+    ...unread(waiting),
+    heldStats: factsAt(heldRequestAt),
+    heldRevision: { mtimeMs: 150, size: 1_000_000 },
+  };
+  const outcome = {
+    finished: false,
+    error: false,
+    interrupted: false,
+    endedAt: newestRequestAt,
+    startedAt: turnStartedAt,
+  };
+  const requests: string[] = [];
+  const provider = railEnrichmentHarness(async (request, generation) => {
+    const session = (request as { session: typeof growing }).session;
+    requests.push(`${request.kind}:${session.sessionId}`);
+    if (session === growing) {
+      // The worker finds the file larger than the catalog listed it, so the host rejects the read.
+      return {
+        generation,
+        revision: { size: growing.size + 4_096, mtimeMs: growing.mtimeMs + 1, dev: 1, ino: 2 },
+        value: { kind: 'stale' },
+      };
+    }
+    const revision = provider.revisionOf(waiting);
+    if (request.kind === 'starts') {
+      return { generation, revision, value: { kind: 'starts', starts: { starts: [turnStartedAt], whole: true } } };
+    }
+    assert.equal(request.kind, 'metadata');
+    return {
+      generation,
+      revision,
+      value: {
+        kind: 'metadata',
+        coverage: { whole: true, windowBytes: 16 * 1024 * 1024 },
+        entry: { ...unread(waiting), activityMs: newestRequestAt, outcome, stats: factsAt(newestRequestAt) },
+      },
+    };
+  });
+  provider.titles.set(growing.file, growingEntry);
+  provider.titles.set(waiting.file, waitingEntry);
+  const held = railCacheMarkOf(derivedTitleCacheStats(waitingEntry), now);
+  assert.ok(
+    held?.nearlyGoneAt != null && now >= held.nearlyGoneAt,
+    'the held request does not draw a nearly gone bolt',
+  );
+
+  const result = await provider.prepareRailEnrichment([growing, waiting], 1, new AbortController().signal);
+
+  const entry = provider.titles.get(waiting.file);
+  const mark = railCacheMarkOf(derivedTitleCacheStats(entry), now);
+  assert.ok(
+    mark?.nearlyGoneAt != null && now < mark.nearlyGoneAt,
+    `the waiting session's row bolt still times the held request: ${JSON.stringify(mark)}`,
+  );
+  assert.deepEqual(mark, railCacheMarkOf(factsAt(newestRequestAt), now));
+  assert.equal(entry.heldStats, undefined, 'the enrichment read did not replace the held stats');
+  assert.deepEqual(entry.stats, factsAt(newestRequestAt));
+  assert.deepEqual(entry.outcome, outcome, 'the running turn did not reach the row');
+  assert.deepEqual(requests, ['starts:growing', 'starts:waiting', 'metadata:waiting']);
+  assert.deepEqual(provider.titles.get(growing.file), growingEntry, 'the rejected read changed the growing session');
+  assert.deepEqual(
+    result,
+    { changed: true, catalogCurrent: false, progress: false },
+    'the follow-up pass reuses the catalog that the growing session outran',
+  );
+});
+
 test('failed turn start and recovery reads of one session are each logged once until that kind of read succeeds', async () => {
   const session = {
     file: 'Mixed/Session.jsonl',

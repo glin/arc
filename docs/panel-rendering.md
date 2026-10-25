@@ -52,7 +52,7 @@ Completion requires a published catalog built from a complete discovery reply un
 
 Reusing a catalog after incomplete discovery retains its prior completion. Scope changes clear completion, so returning roots require another complete reply. A row awaiting its name shows a short ID and can move when its name arrives.
 
-Failed metadata, turn-start, enrichment, and recovery reads retain prior facts. `sessionReadFailed` logs once per file and read kind until that kind succeeds or workspace folders change. Canceled refresh reads log nothing.
+Failed metadata, turn-start, enrichment, and recovery reads retain prior facts. A failed or rejected read of one session does not stop the reads of later sessions in the same pass. `sessionReadFailed` logs once per file and read kind until that kind succeeds or workspace folders change. Canceled refresh reads log nothing.
 
 Only discovery or catalog-refresh failures fail work. Failure hides the line for that generation and clears the placeholder before first render. Every subsequent status in that generation remains failed. Before first completion, the next refresh generation can show loading again.
 
