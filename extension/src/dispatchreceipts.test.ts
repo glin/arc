@@ -130,6 +130,7 @@ function relationshipFixture(
 function drainRelationships(
   scan: Generator<DispatchRelationshipStep, unknown, DispatchRelationshipAllowance>,
   bytes = 37,
+  refusals: NonNullable<DispatchRelationshipStep['refusal']>[] = [],
 ) {
   const references: NonNullable<DispatchRelationshipStep['reference']>[] = [];
   const allowance = { bytes, entries: 1, checks: 1 };
@@ -138,10 +139,192 @@ function drainRelationships(
     if (next.done) return references;
     assert.ok(next.value.bytes <= bytes && next.value.entries <= 1 && next.value.checks <= 1);
     if (next.value.reference) references.push(next.value.reference);
+    if (next.value.refusal) refusals.push(next.value.refusal);
   }
   scan.return(undefined);
   return assert.fail('The bounded receipt scan did not finish.');
 }
+
+function competingRelationshipFixture(parent: 'claude' | 'codex', child: 'claude' | 'codex') {
+  const fx = relationshipFixture(parent, child);
+  const other = 'cccccccc-1111-2222-3333-444444444444';
+  const competitor = fx.receipts.reserve({ ...fx.launch, requester: { provider: parent, id: other } });
+  const { launchId: _launchId, ...startup } = JSON.parse(
+    fs.readFileSync(path.join(fx.receipts.root, fx.launch.launchId, 'startup.json'), 'utf8'),
+  );
+  fx.receipts.startup(competitor.launchId, startup);
+  fx.receipts.standaloneSession(competitor.launchId, turn);
+  fx.catalog.push({ ...fx.catalog[0], sessionId: other });
+  return { ...fx, competitor };
+}
+
+test.each(['startup', 'witness', 'bytes'] as const)('receipt refusals retain competing %s evidence', (stage) => {
+  for (const parent of ['claude', 'codex'] as const)
+    for (const child of ['claude', 'codex'] as const)
+      for (const code of ['EACCES', 'EPERM'] as const) {
+        const fx = competingRelationshipFixture(parent, child);
+        assert.equal(drainRelationships(fx.receipts.relationships(fx.catalog)).length, 2);
+        const startup = path.join(fx.receipts.root, fx.competitor.launchId, 'startup.json');
+        const target =
+          stage === 'witness' ? path.join(fx.receipts.root, `${fx.competitor.launchId}.startup.json`) : startup;
+        const before = fs.readFileSync(startup);
+        const failure = Object.assign(new Error('Receipt evidence is unavailable.'), { code });
+        const originalOpen = fs.openSync;
+        const originalRead = fs.readSync;
+        const originalClose = fs.closeSync;
+        const opened = new Map<number, string>();
+        let denied = false;
+        const writers = ['writeFileSync', 'linkSync', 'renameSync', 'mkdirSync', 'unlinkSync'] as const;
+        const spies = writers.map((name) =>
+          vi.spyOn(fs, name).mockImplementation(() => {
+            throw new Error('Receipt reads must not write.');
+          }),
+        );
+        const open = vi.spyOn(fs, 'openSync').mockImplementation((file, ...args) => {
+          if (stage !== 'bytes' && String(file) === target) {
+            denied = true;
+            throw failure;
+          }
+          const fd = Reflect.apply(originalOpen, fs, [file, ...args]);
+          opened.set(fd, String(file));
+          return fd;
+        });
+        const read = vi.spyOn(fs, 'readSync').mockImplementation(((fd, ...args) => {
+          if (stage === 'bytes' && opened.get(fd) === target) {
+            denied = true;
+            throw failure;
+          }
+          return Reflect.apply(originalRead, fs, [fd, ...args]);
+        }) as typeof fs.readSync);
+        const close = vi.spyOn(fs, 'closeSync').mockImplementation((fd) => {
+          opened.delete(fd);
+          originalClose(fd);
+        });
+        syncBuiltinESMExports();
+        try {
+          const refusals: NonNullable<DispatchRelationshipStep['refusal']>[] = [];
+          const references = drainRelationships(fx.receipts.relationships(fx.catalog), 37, refusals);
+          assert.equal(denied, true);
+          assert.deepEqual(
+            references.map((reference) => reference.parentSessionId),
+            [session],
+          );
+          assert.deepEqual(refusals, [{ error: failure, launchId: fx.competitor.launchId }]);
+          assert.equal(opened.size, 0);
+          assert.equal(drainRelationships(fx.receipts.relationships(fx.catalog)).length, 1);
+          assert.deepEqual(drainRelationships(fx.receipts.relationship(fx.competitor.launchId, fx.catalog)), []);
+          assert.equal(opened.size, 0);
+        } finally {
+          close.mockRestore();
+          read.mockRestore();
+          open.mockRestore();
+          for (const spy of spies) spy.mockRestore();
+          syncBuiltinESMExports();
+        }
+        assert.deepEqual(fs.readFileSync(startup), before);
+        assert.equal(fs.existsSync(fx.file), true);
+      }
+});
+
+test.each(['EACCES', 'EPERM'] as const)(
+  'receipt store truncation retains its %s refusal after a qualified claim',
+  (code) => {
+    for (const parent of ['claude', 'codex'] as const) {
+      const fx = competingRelationshipFixture(parent, 'codex');
+      assert.equal(drainRelationships(fx.receipts.relationships(fx.catalog)).length, 2);
+      const entries = fs.readdirSync(fx.receipts.root, { withFileTypes: true });
+      const first = entries.find((entry) => entry.name === fx.launch.launchId)!;
+      const original = fs.opendirSync;
+      const failure = Object.assign(new Error('Receipt directory is unavailable.'), { code });
+      let attempted = 0;
+      let closed = false;
+      const open = vi.spyOn(fs, 'opendirSync').mockImplementation((file, ...args) => {
+        const directory = Reflect.apply(original, fs, [file, ...args]);
+        if (String(file) !== fx.receipts.root) return directory;
+        vi.spyOn(directory, 'readSync').mockImplementation(() => {
+          if (attempted++ === 0) return first;
+          throw failure;
+        });
+        const close = directory.closeSync.bind(directory);
+        vi.spyOn(directory, 'closeSync').mockImplementation(() => {
+          closed = true;
+          close();
+        });
+        return directory;
+      });
+      syncBuiltinESMExports();
+      try {
+        const refusals: NonNullable<DispatchRelationshipStep['refusal']>[] = [];
+        const references = drainRelationships(fx.receipts.relationships(fx.catalog), 11, refusals);
+        assert.equal(attempted, 2);
+        assert.deepEqual(
+          references.map((reference) => reference.parentSessionId),
+          [session],
+        );
+        assert.deepEqual(refusals, [{ error: failure, storeOpened: true }]);
+        assert.equal(closed, true);
+        assert.equal(fs.existsSync(path.join(fx.receipts.root, fx.competitor.launchId, 'startup.json')), true);
+      } finally {
+        open.mockRestore();
+        syncBuiltinESMExports();
+      }
+    }
+  },
+);
+
+test('receipt store opening exposes refusal while ordinary readers retain an empty result', () => {
+  const fx = relationshipFixture();
+  const original = fs.opendirSync;
+  const failure = Object.assign(new Error('Receipt storage is unavailable.'), { code: 'EACCES' });
+  vi.spyOn(fs, 'opendirSync').mockImplementation((file, ...args) => {
+    if (String(file) === fx.receipts.root) throw failure;
+    return Reflect.apply(original, fs, [file, ...args]);
+  });
+  syncBuiltinESMExports();
+  const refusals: NonNullable<DispatchRelationshipStep['refusal']>[] = [];
+  assert.deepEqual(drainRelationships(fx.receipts.relationships(fx.catalog), 11, refusals), []);
+  assert.deepEqual(refusals, [{ error: failure, storeOpened: false }]);
+  assert.deepEqual(drainRelationships(fx.receipts.relationships(fx.catalog)), []);
+});
+
+test.each(['ENOENT', 'ENOTDIR'] as const)('receipt disappearance stays pending for %s', (code) => {
+  const fx = competingRelationshipFixture('claude', 'codex');
+  assert.equal(drainRelationships(fx.receipts.relationships(fx.catalog)).length, 2);
+  const target = path.join(fx.receipts.root, fx.competitor.launchId, 'startup.json');
+  const held = target + '.held';
+  const original = fs.openSync;
+  let removed = false;
+  vi.spyOn(fs, 'openSync').mockImplementation((file, ...args) => {
+    if (String(file) === target && !removed) {
+      fs.renameSync(target, held);
+      removed = true;
+      throw Object.assign(new Error('Receipt evidence disappeared.'), { code });
+    }
+    return Reflect.apply(original, fs, [file, ...args]);
+  });
+  syncBuiltinESMExports();
+  const refusals: NonNullable<DispatchRelationshipStep['refusal']>[] = [];
+  const references = drainRelationships(fx.receipts.relationships(fx.catalog), 11, refusals);
+  assert.equal(removed, true);
+  assert.deepEqual(
+    references.map((reference) => reference.parentSessionId),
+    [session],
+  );
+  assert.deepEqual(refusals, []);
+  assert.equal(fs.existsSync(held), true);
+  assert.equal(fs.existsSync(fx.file), true);
+});
+
+test.each(['missing', 'non-directory'] as const)('receipt storage supplies no refusal when %s', (mode) => {
+  const fx = competingRelationshipFixture('claude', 'codex');
+  assert.equal(drainRelationships(fx.receipts.relationships(fx.catalog)).length, 2);
+  fs.renameSync(fx.receipts.root, fx.receipts.root + '.held');
+  if (mode === 'non-directory') fs.writeFileSync(fx.receipts.root, 'unavailable');
+  const refusals: NonNullable<DispatchRelationshipStep['refusal']>[] = [];
+  assert.deepEqual(drainRelationships(fx.receipts.relationships(fx.catalog), 11, refusals), []);
+  assert.deepEqual(refusals, []);
+  assert.equal(fs.existsSync(fx.file), true);
+});
 
 test.each(['claude', 'codex'] as const)('receipt relationships retain reader ownership for %s parents', (parent) => {
   for (const child of ['claude', 'codex'] as const) {
@@ -212,20 +395,30 @@ test.each([
         file: paths.join(virtualHome, mixed && platform !== 'win32' ? 'NATIVE.jsonl' : 'native.jsonl'),
       },
     ];
+    const key = (value: string) => {
+      const absolute = paths.resolve(value);
+      return platform === 'win32' ? absolute.toLowerCase() : absolute;
+    };
+    const ancestors = new Map<string, string>();
+    for (let current = paths.dirname(virtualHome); ; current = paths.dirname(current)) {
+      const owned = path.join(fx.home, 'virtual-ancestors', String(ancestors.size));
+      fs.mkdirSync(owned, { recursive: true });
+      ancestors.set(key(current), owned);
+      if (current === paths.dirname(current)) break;
+    }
     const unmapped: string[] = [];
     const physicalTargets: string[] = [];
     const sourceOpens: string[] = [];
     const logicalSourceOpens: string[] = [];
     const translate = (file: fs.PathLike) => {
       const value = String(file);
-      if (paths.resolve(value) === paths.parse(paths.resolve(virtualHome)).root) return path.dirname(fx.home);
-      const relative = paths.relative(virtualHome, value);
-      if (relative.startsWith('..') || paths.isAbsolute(relative)) unmapped.push(value);
-      assert.ok(relative === '' || (!relative.startsWith('..') && !paths.isAbsolute(relative)), value);
-      return path.join(
-        fx.home,
-        ...relative.split(paths.sep).map((part) => (platform === 'win32' ? part.toLowerCase() : part)),
-      );
+      const relative = paths.relative(key(virtualHome), key(value));
+      if (relative === '' || (!relative.startsWith('..') && !paths.isAbsolute(relative)))
+        return path.join(fx.home, ...relative.split(paths.sep));
+      const ancestor = ancestors.get(key(value));
+      if (ancestor) return ancestor;
+      unmapped.push(value);
+      throw new Error(`Unmapped filesystem path: ${value}`);
     };
     const stat = fs.lstatSync;
     const open = fs.openSync;
@@ -264,22 +457,30 @@ test.each([
         aliasChecks++;
         return canonical ? '/private/tmp' : '/redirected/tmp';
       }
-      return String(file);
+      if (key(String(file)) === key(virtualHome)) return virtualHome;
+      unmapped.push(String(file));
+      throw new Error(`Unmapped real path: ${String(file)}`);
     });
     syncBuiltinESMExports();
     const receipts = new DispatchReceipts(virtualHome, platform);
     assert.equal(receipts.root, virtualRoot);
-    const references = drainRelationships(receipts.relationships(catalog), 31);
-    assert.deepEqual(unmapped, []);
-    for (const target of physicalTargets) {
-      const relative = path.relative(fx.home, target);
-      assert.ok(
-        target === path.dirname(fx.home) ||
-          relative === '' ||
-          (!relative.startsWith('..') && !path.isAbsolute(relative)),
-        `Receipt fixture accessed an unowned path: ${target}`,
-      );
+    const refusals: NonNullable<DispatchRelationshipStep['refusal']>[] = [];
+    let references: ReturnType<typeof drainRelationships> = [];
+    try {
+      references = drainRelationships(receipts.relationships(catalog), 31, refusals);
+    } finally {
+      assert.deepEqual(unmapped, []);
+      for (const target of physicalTargets) {
+        const relative = path.relative(fx.home, target);
+        assert.ok(
+          target === path.dirname(fx.home) ||
+            relative === '' ||
+            (!relative.startsWith('..') && !path.isAbsolute(relative)),
+          `Receipt fixture accessed an unowned path: ${target}`,
+        );
+      }
     }
+    assert.deepEqual(refusals, []);
     assert.equal(references.length, expected);
     if (expected) {
       assert.equal(references[0].file, catalog[1].file);
@@ -434,7 +635,9 @@ test.each(['source', 'ancestor', 'malformed', 'refused', 'legacy', 'collision'] 
       fs.unlinkSync(path.join(fx.receipts.root, `${fx.launch.launchId}.startup.json`));
     }
     if (failure === 'collision') fx.catalog.push({ ...fx.catalog[1], file: fx.file + '.other' });
-    assert.deepEqual(drainRelationships(fx.receipts.relationships(fx.catalog)), []);
+    const refusals: NonNullable<DispatchRelationshipStep['refusal']>[] = [];
+    assert.deepEqual(drainRelationships(fx.receipts.relationships(fx.catalog), 37, refusals), []);
+    assert.deepEqual(refusals, []);
   },
 );
 
@@ -582,7 +785,9 @@ test.each(['changing', 'other-launch', 'later-quiet'] as const)('source deferral
     return count;
   }) as typeof fs.readSync);
   syncBuiltinESMExports();
-  const references = drainRelationships(growing.receipts.relationships(catalog), 11);
+  const refusals: NonNullable<DispatchRelationshipStep['refusal']>[] = [];
+  const references = drainRelationships(growing.receipts.relationships(catalog), 11, refusals);
+  assert.deepEqual(refusals, []);
   assert.ok(appends > 0);
   if (assertion === 'changing')
     assert.equal(
@@ -727,8 +932,12 @@ test.each(['directory', 'receipt'] as const)(
     });
     syncBuiltinESMExports();
     const scan = fx.receipts.relationships(fx.catalog, controller.signal);
-    for (let step = 0; step < 10_000 && !controller.signal.aborted; step++)
-      scan.next({ entries: 1, bytes: 11, checks: 1 });
+    const refusals: NonNullable<DispatchRelationshipStep['refusal']>[] = [];
+    for (let step = 0; step < 10_000 && !controller.signal.aborted; step++) {
+      const next = scan.next({ entries: 1, bytes: 11, checks: 1 });
+      if (!next.done && next.value.refusal) refusals.push(next.value.refusal);
+    }
+    assert.deepEqual(refusals, []);
     const closedWhenCanceled = resource === 'directory' ? directoryClosed : receiptClosed;
     scan.return();
     assert.equal(controller.signal.aborted, true);
@@ -743,7 +952,9 @@ test('an already canceled scan performs no bounded filesystem step', () => {
   syncBuiltinESMExports();
   const scan = fx.receipts.relationships(fx.catalog, controller.signal);
   controller.abort();
-  assert.deepEqual(drainRelationships(scan, 11), []);
+  const refusals: NonNullable<DispatchRelationshipStep['refusal']>[] = [];
+  assert.deepEqual(drainRelationships(scan, 11, refusals), []);
+  assert.deepEqual(refusals, []);
   assert.equal(stat.mock.calls.length, 0);
 });
 

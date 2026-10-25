@@ -32,7 +32,7 @@ import {
 } from './transcript';
 import { readCodexSession } from './codex';
 import { scanCodexDispatchReferences } from './codex';
-import { railCacheMarkOf } from './turnrail';
+import { railCacheMarkOf, sessionParentIndex, agentRunAnswer } from './turnrail';
 import { logOf, toCard, turnCost } from './turncard';
 import { codexAgentSpendVersion, codexSpendIndex, type CodexSubagentFile } from './codex';
 import { agentSpendDependencyKey } from './transcript';
@@ -56,7 +56,400 @@ import {
   powershellDispatchExecution,
   throughStructuredClone,
   worktreeCreationCommand,
+  receiptDispatchFixture,
 } from './turnfixtures';
+
+test.each(['claude', 'codex'] as const)(
+  'receipt-only %s discovery reaches the store tail and retains immediate parents across restart',
+  async (parentAgent) => {
+    for (const childAgent of ['claude', 'codex'] as const) {
+      const root = tempDir('receipt-worker-');
+      const fx = receiptDispatchFixture(root, parentAgent, childAgent);
+      fs.mkdirSync(fx.receipts.root, { recursive: true });
+      for (let index = 0; index < 300; index++)
+        fs.mkdirSync(path.join(fx.receipts.root, `${index.toString(16).padStart(8, '0')}-1111-2222-3333-444444444444`));
+      fx.launch(fx.parent, fx.child, true, true, 36 * 1024);
+      fx.launch(fx.child, fx.grandchild, true, true, 36 * 1024);
+      const workerSource = `process.env.ARC_HOME=${JSON.stringify(fx.home)};` + source;
+      const check = async (throughHost: boolean) => {
+        const worker = new ProgressiveWorker(workerSource);
+        let host: Record<string, any> | undefined;
+        let hostResult: ProgressiveResult | null = null;
+        if (throughHost) {
+          vi.stubGlobal('PANEL_CSS', '');
+          vi.stubGlobal('PANEL_JS', '');
+          vi.stubGlobal('PANEL_DEV_SERVER_URL', null);
+          const { PanelProvider } = await import('./panelhost.js');
+          host = Object.create(PanelProvider.prototype) as Record<string, any>;
+          Object.defineProperty(host, 'loadingLine', { value: { held: () => true, withhold() {} } });
+          Object.assign(host, {
+            progressiveWorker: worker,
+            refreshGeneration: 0,
+            repositoryScopeRoots: [root],
+            claudeParents: fx.catalog,
+            claudeChildReferenceEntries: new Map(),
+            claudeChildStatWrites: new Map(),
+            claudeChildren: [],
+            codexSubagents: [],
+            dispatchFacts: new Map(),
+            catalog: { sessions: fx.catalog },
+            authoritativeCatalog: fx.catalog,
+            derivedCacheCheckpointState: { markChanged() {} },
+            publishSessionQueryContext() {},
+            unresolvedLoadingFailure: () => false,
+            dispatchedDiscoveryWaiting: () => false,
+            postDispatchedCostsIfMoved() {},
+            checkpointDerivedCache() {},
+            prepareHumanPrompts: async (sessions: unknown) => sessions,
+            activityFor: (session: { mtimeMs: number }) => session.mtimeMs,
+            updateSessionSpendSources() {},
+            pruneDerivedTitles: () => false,
+          });
+          const run = worker.run.bind(worker);
+          worker.run = async (...args) => {
+            hostResult = await run(...args);
+            return hostResult;
+          };
+        }
+        try {
+          let passes = 0;
+          let entries = 0;
+          for (; passes < 100; passes++) {
+            const generation = passes + 1;
+            if (host) {
+              host.refreshGeneration = generation;
+              assert.equal(await host.prepareClaudeChildren(generation, new AbortController().signal), true);
+            }
+            const result: ProgressiveResult | null = host
+              ? hostResult
+              : await worker.run(
+                  {
+                    kind: 'claude-children',
+                    parents: fx.catalog,
+                    catalog: fx.catalog,
+                    repositoryRoots: [root],
+                    discoveryBytes: 32 * 1024,
+                  },
+                  generation,
+                  new AbortController().signal,
+                );
+            assert.ok(result);
+            assert.equal(result.generation, generation);
+            assert.ok(result.value.kind === 'claude-children' || result.value.kind === 'claude-children-progress');
+            if ('charges' in result.value && result.value.charges) {
+              assert.ok(
+                result.value.charges.readBytes <= (host ? 8 * 1024 * 1024 : 32 * 1024),
+                'Receipt reads exceeded the remaining request allowance',
+              );
+              assert.ok((result.value.charges.receiptBytes ?? 0) <= result.value.charges.readBytes);
+            }
+            if (result.value.kind === 'claude-children-progress' || host?.dispatchDiscoveryPending) {
+              entries += result.value.charges?.receiptEntries ?? 0;
+              continue;
+            }
+            assert.equal(result.value.kind, 'claude-children');
+            if (result.value.kind !== 'claude-children') throw new Error('Discovery did not complete');
+            const parents = sessionParentIndex(result.value.references);
+            assert.equal(
+              parents.get(fx.child.sessionId)?.parent,
+              fx.parent.sessionId,
+              JSON.stringify(result.value.references),
+            );
+            assert.equal(
+              agentRunAnswer(false, fx.child.sessionId, new Set(), false, true, parents.get(fx.child.sessionId)?.owned),
+              true,
+            );
+            assert.equal(parents.get(fx.grandchild.sessionId)?.parent, fx.child.sessionId);
+            assert.equal(
+              result.value.references.find((reference) => reference.sessionId === fx.child.sessionId)?.toolUseIds
+                .length,
+              0,
+            );
+            assert.ok(passes > 0, 'the store did not exceed one slice');
+            assert.ok(entries >= 256);
+            if (host) {
+              assert.equal(host.dispatchDiscoveryPending, false);
+              assert.equal(host.discoveryCheckpoint, undefined);
+              assert.equal(
+                sessionParentIndex(host.claudeChildReferences).get(fx.child.sessionId)?.parent,
+                fx.parent.sessionId,
+              );
+              const accepted = host.claudeChildReferences;
+              host.refreshGeneration++;
+              worker.run = async () => result;
+              assert.equal(
+                await host.prepareClaudeChildren(host.refreshGeneration, new AbortController().signal),
+                false,
+              );
+              assert.equal(host.claudeChildReferences, accepted);
+            }
+            return;
+          }
+          assert.fail('Receipt discovery never reached the store tail');
+        } finally {
+          worker.stop();
+        }
+      };
+      await check(true);
+      await check(false);
+    }
+  },
+);
+
+test('receipt discovery revisits pending identity and discards cancelled scope generations', async () => {
+  const root = tempDir('receipt-worker-pending-');
+  const fx = receiptDispatchFixture(root, 'claude', 'codex');
+  const launch = fx.launch(fx.parent, fx.child, false, false);
+  const worker = new ProgressiveWorker(`process.env.ARC_HOME=${JSON.stringify(fx.home)};` + source);
+  const request = {
+    kind: 'claude-children' as const,
+    parents: fx.catalog,
+    catalog: fx.catalog,
+    repositoryRoots: [root],
+  };
+  const finish = async (scope = request) => {
+    for (let pass = 0; pass < 50; pass++) {
+      const result = await worker.run(scope, 2, new AbortController().signal);
+      if (result?.value.kind === 'claude-children') return result.value;
+    }
+    throw new Error('Receipt discovery did not settle');
+  };
+  try {
+    assert.equal((await finish()).references.length, 0);
+    fx.accept(launch.launchId);
+    const found = await finish();
+    assert.equal(sessionParentIndex(found.references).get(fx.child.sessionId)?.owned, true);
+    const controller = new AbortController();
+    controller.abort();
+    assert.equal(await worker.run(request, 1, controller.signal), null);
+    const outside = await finish({
+      ...request,
+      catalog: [fx.child],
+      parents: [fx.child],
+      repositoryRoots: [path.join(root, 'other')],
+    });
+    assert.equal(outside.references.length, 0);
+  } finally {
+    worker.stop();
+  }
+});
+
+test('receipt worker admission preserves ownership, competing claims and native source identity', async () => {
+  for (const mode of [
+    'reader',
+    'conflict',
+    'ambiguous',
+    'replacement',
+    'fallback',
+    'refused',
+    'truncated',
+    'transcript',
+    'opening',
+    'native',
+  ] as const) {
+    const root = tempDir('receipt-worker-policy-');
+    const fx = receiptDispatchFixture(root, 'claude', 'codex');
+    const fault = path.join(root, 'receipt-fault');
+    const reached = path.join(root, 'receipt-fault-reached');
+    let prefix = '';
+    if (mode === 'fallback') {
+      fs.mkdirSync(fx.home);
+      fs.writeFileSync(path.join(fx.home, 'dispatch'), 'unavailable');
+      fs.appendFileSync(
+        fx.parent.file,
+        claudeDispatchTranscript(
+          'python dispatch.py --arc-dispatch',
+          `ARC_DISPATCH_SESSION={"agent":"codex","session_id":"${fx.child.sessionId}"}`,
+        )
+          .map((row) => JSON.stringify(row) + '\n')
+          .join(''),
+      );
+    } else {
+      const first = fx.launch(fx.parent, fx.child, true, mode !== 'native' && mode !== 'transcript');
+      if (mode === 'reader') fx.launch(fx.parent, fx.child, false);
+      if (mode === 'conflict') fx.launch(fx.grandchild, fx.child);
+      if (
+        mode === 'refused' ||
+        mode === 'truncated' ||
+        mode === 'transcript' ||
+        mode === 'opening' ||
+        mode === 'native'
+      ) {
+        const second = fx.launch(fx.grandchild, fx.child, true, mode !== 'native');
+        fs.writeFileSync(fault, mode);
+        const target = path.join(fx.receipts.root, second.launchId, 'startup.json');
+        prefix = `const refusalFs=require('node:fs'),refusalOpen=refusalFs.openSync,refusalDirectory=refusalFs.opendirSync;
+          const refusalActive=()=>refusalFs.existsSync(${JSON.stringify(fault)});
+          const refusalError=()=>{refusalFs.writeFileSync(${JSON.stringify(reached)},'reached');return Object.assign(new Error('Receipt evidence is unavailable.'),{code:'EACCES'});};
+          refusalFs.openSync=function(p,...args){if((${JSON.stringify(mode)}==='refused'||${JSON.stringify(mode)}==='transcript')&&refusalActive()&&String(p)===${JSON.stringify(target)})throw refusalError();return refusalOpen.call(this,p,...args);};
+          refusalFs.opendirSync=function(p,...args){if(String(p)===${JSON.stringify(fx.receipts.root)}&&refusalActive()){
+            if(${JSON.stringify(mode)}==='opening')throw refusalError();
+            if(${JSON.stringify(mode)}==='truncated'||${JSON.stringify(mode)}==='native'){
+              const dir=refusalDirectory.call(this,p,...args),entries=refusalFs.readdirSync(p,{withFileTypes:true});let visited=false;
+              dir.readSync=function(){if(!visited){visited=true;return entries.find(e=>e.name===${JSON.stringify(first.launchId)});}throw refusalError();};return dir;
+            }
+          }return refusalDirectory.call(this,p,...args);};`;
+        if (mode === 'opening' || mode === 'transcript')
+          fs.appendFileSync(
+            fx.parent.file,
+            claudeDispatchTranscript(
+              'python dispatch.py --arc-dispatch',
+              `ARC_DISPATCH_SESSION={"agent":"codex","session_id":"${fx.child.sessionId}"}`,
+            )
+              .map((row) => JSON.stringify(row) + '\n')
+              .join(''),
+          );
+      }
+      if (mode === 'ambiguous') fx.catalog.push({ ...fx.child, file: fx.child.file + '.other' });
+      if (mode === 'replacement') {
+        fs.renameSync(fx.child.file, fx.child.file + '.accepted');
+        fs.copyFileSync(fx.child.file + '.accepted', fx.child.file);
+      }
+    }
+    if (mode === 'refused' || mode === 'truncated' || mode === 'transcript') {
+      const control = new ProgressiveWorker(`process.env.ARC_HOME=${JSON.stringify(fx.home)};` + source);
+      try {
+        const result = await completeDiscovery(
+          control,
+          { kind: 'claude-children', parents: fx.catalog, catalog: fx.catalog, repositoryRoots: [root] },
+          1,
+          new AbortController().signal,
+        );
+        assert.ok(result?.value.kind === 'claude-children');
+        assert.equal(sessionParentIndex(result.value.references).get(fx.child.sessionId), undefined);
+        assert.equal(
+          result.value.references.filter((reference) => reference.sessionId === fx.child.sessionId).length,
+          2,
+        );
+      } finally {
+        control.stop();
+      }
+    }
+    const worker = new ProgressiveWorker(`process.env.ARC_HOME=${JSON.stringify(fx.home)};` + prefix + source);
+    try {
+      const request = {
+        kind: 'claude-children' as const,
+        parents: fx.catalog,
+        catalog: fx.catalog,
+        repositoryRoots: [root],
+      };
+      if (mode === 'refused' || mode === 'truncated' || mode === 'transcript') {
+        let held = false;
+        for (let pass = 0; pass < 50; pass++) {
+          const pending = await worker.run(request, 1, new AbortController().signal);
+          assert.notEqual(
+            pending?.value.kind,
+            'claude-children',
+            'Incomplete receipt competition published a complete result',
+          );
+          if (pending?.value.kind === 'claude-children-progress' && fs.existsSync(reached)) {
+            held = true;
+            break;
+          }
+        }
+        assert.equal(held, true, 'The competing receipt never reached its refused read');
+        const cancelled = new AbortController();
+        cancelled.abort();
+        assert.equal(await worker.run(request, 2, cancelled.signal), null);
+        fs.unlinkSync(fault);
+      }
+      const result = await completeDiscovery(worker, request, 3, new AbortController().signal);
+      assert.ok(result?.value.kind === 'claude-children');
+      const edge = sessionParentIndex(result.value.references).get(fx.child.sessionId);
+      if (mode === 'reader' || mode === 'fallback' || mode === 'opening') {
+        assert.equal(edge?.parent, fx.parent.sessionId);
+        assert.equal(edge?.owned === true, mode === 'reader');
+        assert.equal(result.value.dispatchFacts.filter((facts) => facts.sessionId === fx.child.sessionId).length, 1);
+        assert.equal(agentRunAnswer(false, fx.child.sessionId, new Set(), false, true, edge?.owned), mode !== 'reader');
+      } else {
+        assert.equal(edge, undefined, mode);
+        assert.ok(!result.value.dispatchFacts.some((facts) => facts.sessionId === fx.child.sessionId), mode);
+        if (mode === 'conflict' || mode === 'refused' || mode === 'truncated' || mode === 'transcript')
+          assert.equal(
+            result.value.references.filter((reference) => reference.sessionId === fx.child.sessionId).length,
+            2,
+          );
+      }
+      if (mode === 'opening' || mode === 'native') assert.equal(fs.existsSync(reached), true);
+    } finally {
+      worker.stop();
+    }
+  }
+});
+
+test('receipt discovery defers a changing accepted source until a quiet epoch', async () => {
+  const root = tempDir('receipt-worker-growing-');
+  const fx = receiptDispatchFixture(root, 'claude', 'codex');
+  fx.launch();
+  const prefix = `const receiptFs=require('node:fs');const receiptOpen=receiptFs.openSync,receiptRead=receiptFs.readSync;const receiptFiles=new Map();let receiptStartup=false,receiptChanged=false;receiptFs.openSync=function(p,...a){const fd=receiptOpen.call(this,p,...a);receiptFiles.set(fd,String(p));if(String(p).endsWith('startup.json'))receiptStartup=true;return fd;};receiptFs.readSync=function(fd,...a){const n=receiptRead.call(this,fd,...a);if(receiptStartup&&!receiptChanged&&receiptFiles.get(fd)===${JSON.stringify(fx.child.file)}){receiptChanged=true;receiptFs.appendFileSync(${JSON.stringify(fx.child.file)},String.fromCharCode(10));}return n;};`;
+  const worker = new ProgressiveWorker(`process.env.ARC_HOME=${JSON.stringify(fx.home)};` + prefix + source);
+  const request = {
+    kind: 'claude-children' as const,
+    parents: fx.catalog,
+    catalog: fx.catalog,
+    repositoryRoots: [root],
+  };
+  try {
+    let first: ProgressiveResult | null = null;
+    for (let pass = 0; pass < 100; pass++) {
+      first = await worker.run(request, 1, new AbortController().signal);
+      if (first?.value.kind === 'claude-children') break;
+    }
+    assert.ok(first?.value.kind === 'claude-children');
+    assert.ok(!first.value.references.some((reference) => reference.sessionId === fx.child.sessionId));
+    const quiet = await completeDiscovery(worker, request, 1, new AbortController().signal);
+    assert.ok(quiet?.value.kind === 'claude-children');
+    assert.equal(sessionParentIndex(quiet.value.references).get(fx.child.sessionId)?.parent, fx.parent.sessionId);
+  } finally {
+    worker.stop();
+  }
+});
+
+test('cancelled receipt discovery closes its directory before a later generation publishes', async () => {
+  const root = tempDir('receipt-worker-cancel-');
+  const fx = receiptDispatchFixture(root, 'claude', 'codex');
+  fx.launch();
+  const closed = path.join(root, 'closed');
+  const prefix = `const epochFs=require('node:fs'),epochPort=require('node:worker_threads').parentPort,epochOpen=epochFs.opendirSync;let epochSent=false;epochFs.opendirSync=function(p,...a){const dir=epochOpen.call(this,p,...a);if(String(p)===${JSON.stringify(fx.receipts.root)}&&!epochSent){epochSent=true;const close=dir.closeSync;dir.closeSync=function(){const result=close.call(this);epochFs.writeFileSync(${JSON.stringify(closed)},'closed');return result;};epochPort.postMessage({repeatedCoverage:'receipt-open'});epochPort.emit('message',{cancel:1});}return dir;};`;
+  const controller = new AbortController();
+  let selected: Promise<ProgressiveResult | null> | undefined;
+  const worker = new ProgressiveWorker(
+    `process.env.ARC_HOME=${JSON.stringify(fx.home)};` + prefix + source,
+    undefined,
+    (file) => {
+      if (file !== 'receipt-open') return;
+      selected = worker.run({ kind: 'metadata', session: fx.child }, 2, new AbortController().signal);
+      controller.abort();
+    },
+  );
+  try {
+    const cancelled = worker.run(
+      { kind: 'claude-children', parents: fx.catalog, catalog: fx.catalog, repositoryRoots: [root] },
+      1,
+      controller.signal,
+    );
+    assert.equal(await cancelled, null);
+    assert.ok(selected);
+    assert.ok(await selected);
+    await vi.waitFor(() => assert.ok(fs.existsSync(closed), 'Cancellation retained the receipt directory'));
+    const result = await completeDiscovery(
+      worker,
+      {
+        kind: 'claude-children',
+        parents: [fx.child],
+        catalog: [fx.child],
+        repositoryRoots: [path.join(root, 'outside')],
+      },
+      3,
+      new AbortController().signal,
+    );
+    assert.ok(result?.value.kind === 'claude-children');
+    assert.deepEqual(result.value.references, []);
+  } finally {
+    controller.abort();
+    worker.stop();
+  }
+});
 
 test('commit ownership reservations survive changed relationships and parser generations without refunds', () => {
   const parent = { file: 'parent', sessionId: 'parent', revision: { dev: 1, ino: 1, size: 100, mtimeMs: 1 } };
@@ -1598,6 +1991,7 @@ test.each(['missing', 'changed', 'refused', 'pruned', 'cancelled', 'stopped'] as
 
 let source: string;
 beforeAll(() => {
+  vi.stubEnv('ARC_HOME', tempDir('worker-empty-arc-'));
   source = buildSync({
     entryPoints: [path.join(__dirname, 'progressiveworker-entry.ts')],
     bundle: true,
@@ -9753,9 +10147,9 @@ test('rejected dispatch terminals keep whole spend unread until quiet and source
     source.slice(0, body + 1) +
     `\nwholeSpend++; if (f.existsSync(${JSON.stringify(mutate)}) && f.readFileSync(${JSON.stringify(mutate)}, 'utf8') === 'hydrate') f.appendFileSync(${JSON.stringify(childFile)}, ' ');\n` +
     source.slice(body + 1);
-  const prefix = `const f = require('node:fs'); let wholeSpend = 0; const read = f.readSync, open = f.openSync; const files = new Map();
-    f.openSync = function(p,...a) { const fd = open.call(this,p,...a); files.set(fd,String(p)); return fd; };
-    f.readSync = function(fd,...a) { const n = read.call(this,fd,...a); if (files.get(fd) === ${JSON.stringify(childFile)} && a[2] === 262144 && f.existsSync(${JSON.stringify(mutate)})) f.appendFileSync(${JSON.stringify(childFile)}, ' '); return n; };
+  const prefix = `const f = require('node:fs'); let wholeSpend = 0; const terminalNativeRead = f.readSync, terminalNativeOpen = f.openSync; const files = new Map();
+    f.openSync = function(p,...a) { const fd = terminalNativeOpen.call(this,p,...a); files.set(fd,String(p)); return fd; };
+    f.readSync = function(fd,...a) { const n = terminalNativeRead.call(this,fd,...a); if (files.get(fd) === ${JSON.stringify(childFile)} && a[2] === 262144 && f.existsSync(${JSON.stringify(mutate)})) f.appendFileSync(${JSON.stringify(childFile)}, ' '); return n; };
     const port = require('node:worker_threads').parentPort, post = port.postMessage;
     port.postMessage = function(m) { if(m.result) m.result.wholeSpend = wholeSpend; return post.call(this,m); };`;
   const workerSource =

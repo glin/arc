@@ -1,16 +1,21 @@
 import fs from 'node:fs';
 import { combineCacheExpirySummaries, combineCacheExpiryAmounts } from './cacheexpirysummary';
 import path from 'node:path';
+import { DispatchReceipts } from './dispatchreceipts';
+import { admittedDispatchReferences } from './turnrail';
 import { scanLinesIncremental } from './agentspend';
 import { createClaudeRepeatedFilter } from './clauderepeated';
 import {
   codexRequestUsage,
   codexSessionsRoot,
   enumerateRolloutFilesAsync,
+  enumerateRolloutFiles,
   createCodexUsageLineReducer,
   nestedToolName,
   openingRecordOf,
+  isHiddenThread,
   readCodexSessionMeta,
+  readCodexOpening,
   recordedDatePredatesOpening,
   rolloutFiles,
   scanCodexDispatchReferences,
@@ -74,15 +79,21 @@ async function drainCostStepsAsync<T>(steps: CostSteps<T>, signal?: AbortSignal)
   }
 }
 
-function* costScanLines(file: string, visit: (line: string) => unknown): CostSteps<boolean> {
+function* costScanLines(
+  file: string,
+  visit: (line: string) => unknown,
+  requireCapturedEnd = false,
+): CostSteps<boolean> {
   const steps = scanLinesIncremental(file, visit);
+  let capturedEnd = false;
   try {
     let next = steps.next();
     while (!next.done) {
+      capturedEnd ||= next.value.end;
       yield;
       next = steps.next();
     }
-    return next.value;
+    return next.value && (!requireCapturedEnd || capturedEnd);
   } finally {
     steps.return(false);
   }
@@ -2871,11 +2882,15 @@ export async function sessionSourcesAsync(
 }
 
 // Match enumerateSessionFiles in transcript.ts for eligibility, revisions and newest-first ordering.
-function* costSessionFiles(directory: string): CostSteps<import('./transcript').SessionFile[]> {
+function* costSessionFiles(
+  directory: string,
+  refuse: (error: unknown) => void,
+): CostSteps<import('./transcript').SessionFile[]> {
   let names: string[];
   try {
     names = fs.readdirSync(directory);
-  } catch {
+  } catch (error) {
+    refuse(error);
     return [];
   }
   const sessions: import('./transcript').SessionFile[] = [];
@@ -2887,8 +2902,8 @@ function* costSessionFiles(directory: string): CostSteps<import('./transcript').
       const stat = fs.statSync(file, { bigint: true });
       if (!stat.isFile() || stat.size === 0n || stat.size > BigInt(Number.MAX_SAFE_INTEGER)) continue;
       sessions.push({ agent: 'claude', file, sessionId: name.slice(0, -'.jsonl'.length), ...revisionOf(stat) });
-    } catch {
-      /* An unavailable transcript contributes no catalog entry. */
+    } catch (error) {
+      refuse(error);
     }
   }
   return sessions.sort((left, right) => right.mtimeMs - left.mtimeMs);
@@ -2901,6 +2916,12 @@ function* sessionSourceSteps(
   signal?: AbortSignal,
 ): CostSteps<SessionSource[]> {
   const absolute = path.resolve(file);
+  const catalogRefusals = new Map<'claude' | 'codex', { error: unknown }>();
+  const refuseCatalog = (agent: 'claude' | 'codex', error: unknown) => {
+    signal?.throwIfAborted();
+    const code = (error as NodeJS.ErrnoException | null)?.code;
+    if (code !== 'ENOENT' && code !== 'ENOTDIR' && !catalogRefusals.has(agent)) catalogRefusals.set(agent, { error });
+  };
   let codexFiles: Array<
     import('./transcript').SessionFile & { meta: NonNullable<ReturnType<typeof readCodexSessionMeta>> }
   > | null = null;
@@ -2911,9 +2932,36 @@ function* sessionSourceSteps(
   function* codexCatalog(): CostSteps<NonNullable<typeof codexFiles>> {
     if (codexFiles) return codexFiles;
     codexFiles = [];
-    for (const file of yield* rolloutPaths(codexStore(roots), signal)) {
+    const root = codexStore(roots);
+    const listing = yield* costRead(
+      () => enumerateRolloutFiles(root),
+      async () => {
+        const result = await enumerateRolloutFilesAsync(root, signal);
+        signal?.throwIfAborted();
+        return result;
+      },
+    );
+    if (!listing) refuseCatalog('codex', new Error(`Cannot read transcript directory: ${root}`));
+    for (const uncertain of listing?.uncertain ?? []) {
       yield;
-      const meta = readCodexSessionMeta(file);
+      try {
+        if (fs.statSync(uncertain).isDirectory())
+          refuseCatalog('codex', new Error(`Cannot read transcript directory: ${uncertain}`));
+      } catch (error) {
+        refuseCatalog('codex', error);
+      }
+    }
+    for (const file of listing?.files ?? []) {
+      yield;
+      const meta = readCodexOpening(file);
+      if (meta === undefined) {
+        try {
+          fs.statSync(file);
+          refuseCatalog('codex', new Error(`Cannot read transcript: ${file}`));
+        } catch (error) {
+          refuseCatalog('codex', error);
+        }
+      }
       if (!meta?.sessionId) continue;
       const stat = fs.statSync(file);
       codexFiles.push({
@@ -2945,8 +2993,8 @@ function* sessionSourceSteps(
         yield;
         if (entry.isDirectory()) directories.push(path.join(projectStore(roots), entry.name));
       }
-    } catch {
-      /* A supplied file can sit outside the configured stores. */
+    } catch (error) {
+      refuseCatalog('claude', error);
     }
     if (!isCodex(absolute)) {
       const local = spendFileIsClaudeChild(absolute)
@@ -2961,7 +3009,7 @@ function* sessionSourceSteps(
     }
     catalog = [];
     for (const directory of directories) {
-      for (const file of yield* costSessionFiles(directory)) {
+      for (const file of yield* costSessionFiles(directory, (error) => refuseCatalog('claude', error))) {
         yield;
         catalog.push(file);
       }
@@ -2970,14 +3018,17 @@ function* sessionSourceSteps(
   }
   const sources: SessionSource[] = [];
   const seen = new Set<string>();
-  const add = (source: SessionSource) => {
-    let canonical = source.file;
+  const sourceKey = (file: string) => {
+    let canonical = file;
     try {
-      canonical = fs.realpathSync(source.file);
+      canonical = fs.realpathSync(file);
     } catch {
       /* Retain the supplied path when realpath resolution fails. */
     }
-    const key = normalizeFsPath(canonical);
+    return normalizeFsPath(canonical);
+  };
+  const add = (source: SessionSource) => {
+    const key = sourceKey(source.file);
     if (seen.has(key)) return;
     seen.add(key);
     sources.push(source);
@@ -2985,6 +3036,19 @@ function* sessionSourceSteps(
   const codex = isCodex(absolute);
   const meta = codex ? readCodexSessionMeta(absolute) : null;
   if (codex && !meta?.sessionId) throw new Error(`No Codex session id in ${absolute}`);
+  const nativeCodexParents = () => {
+    const entries = codexFiles ?? [];
+    return [
+      ...entries,
+      ...(meta?.sessionId && !entries.some((entry) => entry.sessionId === meta.sessionId)
+        ? [{ sessionId: meta.sessionId, meta }]
+        : []),
+    ].map((entry) => ({
+      threadId: entry.sessionId,
+      parentThreadId: entry.meta.parentThreadId ?? null,
+      backgroundReview: isHiddenThread(entry.meta),
+    }));
+  };
   add({
     kind: codex ? 'codex' : spendFileIsClaudeChild(absolute) ? 'claude-subagent' : 'claude',
     file: absolute,
@@ -3001,110 +3065,347 @@ function* sessionSourceSteps(
     if (codex) yield* codexRequests(sources[0]);
     return sources;
   }
-  for (let index = 0; index < sources.length; index++) {
-    const source = sources[index];
-    if (source.kind === 'claude-print') continue;
-    const isCodexSource = source.kind === 'codex' || source.kind === 'codex-thread';
-    if (isCodexSource) {
-      yield* codexCatalog();
-      for (const child of nativeByParent.get(source.sessionId) ?? []) {
-        yield;
-        const childMeta = child.meta;
-        add({
-          kind: 'codex-thread',
-          file: child.file,
-          sessionId: childMeta?.sessionId ?? source.sessionId,
-          ...(childMeta?.agentPath || childMeta?.subagentKind
-            ? { agent: childMeta.agentPath ?? childMeta.subagentKind ?? undefined }
-            : {}),
-        });
-      }
-    } else {
-      // Match projectspend.ts subagentDirectoryOf and readSubagentFiles for the native child directory and file rules.
-      const directory = path.join(path.dirname(source.file), source.sessionId, 'subagents');
-      const files: string[] = [];
-      let entries: fs.Dirent[] = [];
+  function* nativeClaudeSources(source: SessionSource): CostSteps<SessionSource[]> {
+    const directory = path.join(path.dirname(source.file), source.sessionId, 'subagents');
+    let entries: fs.Dirent[] = [];
+    try {
+      entries = fs.readdirSync(directory, { withFileTypes: true });
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== 'ENOENT' && code !== 'ENOTDIR') throw error;
+    }
+    const children: SessionSource[] = [];
+    for (const entry of entries) {
+      yield;
+      if (!entry.isFile() || !entry.name.endsWith('.jsonl')) continue;
+      const file = path.join(directory, entry.name);
       try {
-        entries = fs.readdirSync(directory, { withFileTypes: true });
-      } catch {
-        /* A session without a subagent directory has no native children. */
+        if (!fs.statSync(file).isFile()) continue;
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code !== 'ENOENT' && code !== 'ENOTDIR') throw error;
+        continue;
       }
-      for (const entry of entries) {
-        yield;
-        if (entry.isFile() && entry.name.endsWith('.jsonl')) files.push(path.join(directory, entry.name));
+      for (const child of discoverClaudeSessionSpendSources([{ file: source.file, sessionId: source.sessionId }], {
+        files: (candidate) => (candidate === directory ? [file] : []),
+      })) {
+        if (!child.primary)
+          children.push({ kind: 'claude-subagent', file: child.file, sessionId: claudeSourceId(child.file) });
       }
-      for (const file of files) {
+    }
+    return children;
+  }
+  function* referencesOf(
+    source: SessionSource,
+    requireComplete = false,
+  ): CostSteps<import('./transcript').ClaudeChildSessionReference[]> {
+    if (source.kind === 'codex' || source.kind === 'codex-thread') {
+      const failedBody = (error: unknown): null => {
+        signal?.throwIfAborted();
+        const code = (error as NodeJS.ErrnoException).code;
+        if (!requireComplete || (code !== 'ENOENT' && code !== 'ENOTDIR')) throw error;
+        try {
+          fs.statSync(source.file);
+        } catch (missing) {
+          const absent = (missing as NodeJS.ErrnoException).code;
+          if (absent !== 'ENOENT' && absent !== 'ENOTDIR') throw missing;
+          return null;
+        }
+        throw error;
+      };
+      const scan = yield* costRead(
+        () => {
+          try {
+            return scanCodexDispatchReferences(source.file, source.sessionId);
+          } catch (error) {
+            return failedBody(error);
+          }
+        },
+        async () => {
+          try {
+            return await scanCodexDispatchReferencesAsync(
+              source.file,
+              source.sessionId,
+              null,
+              Number.POSITIVE_INFINITY,
+              () => signal?.aborted === true,
+            );
+          } catch (error) {
+            return failedBody(error);
+          }
+        },
+      );
+      if (!scan) return [];
+      if (requireComplete && scan.cursor.offset !== scan.cursor.target) {
+        try {
+          fs.statSync(source.file);
+        } catch (error) {
+          const code = (error as NodeJS.ErrnoException).code;
+          if (code !== 'ENOENT' && code !== 'ENOTDIR') throw error;
+          return [];
+        }
+        throw new Error(`Cannot read transcript: ${source.file}`);
+      }
+      return scan.references;
+    }
+    const reducer = createClaudeRelationshipReducer({
+      file: source.file,
+      sessionId: source.sessionId,
+      childTranscript: source.kind === 'claude-subagent',
+    });
+    const complete = yield* costScanLines(source.file, reducer.apply, requireComplete);
+    if (!complete && requireComplete) {
+      try {
+        if (fs.statSync(source.file).size === 0) return [];
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code !== 'ENOENT' && code !== 'ENOTDIR') throw error;
+        return [];
+      }
+      throw new Error(`Cannot read transcript: ${source.file}`);
+    }
+    return reducer.references();
+  }
+  let receiptParents: Map<string, import('./transcript').ClaudeChildSessionReference[]> | null = null;
+  const receiptStore = new DispatchReceipts();
+  let receiptRefusal: { error: unknown } | null = null;
+  const receiptCompetition: { refusal: { error: unknown } | null } = { refusal: null };
+  function* receiptReferencesFor(
+    scoped: import('./transcript').SessionFile[],
+  ): CostSteps<{ references: import('./transcript').ClaudeChildSessionReference[]; unopened: boolean }> {
+    const references: import('./transcript').ClaudeChildSessionReference[] = [];
+    let unopened = false;
+    const steps = receiptStore.relationships(scoped, signal);
+    try {
+      for (;;) {
+        signal?.throwIfAborted();
+        const next = steps.next({ entries: 1, checks: 1, bytes: 64 * 1024 });
+        if (next.done) break;
+        if (next.value.reference) references.push(next.value.reference);
+        if (next.value.refusal) {
+          receiptRefusal ??= next.value.refusal;
+          if ('launchId' in next.value.refusal || next.value.refusal.storeOpened)
+            receiptCompetition.refusal ??= next.value.refusal;
+          else unopened = true;
+        }
         yield;
-        for (const child of discoverClaudeSessionSpendSources([{ file: source.file, sessionId: source.sessionId }], {
-          files: (candidate) => (candidate === directory ? [file] : []),
-        })) {
-          if (!child.primary) add({ kind: 'claude-subagent', file: child.file, sessionId: claudeSourceId(child.file) });
+      }
+    } finally {
+      steps.return(undefined);
+    }
+    return { references, unopened };
+  }
+  function* unresolvedReceiptRequester(scoped: import('./transcript').SessionFile[]): CostSteps<boolean> {
+    const parents = new Set(scoped.map((source) => `${source.agent}\0${source.sessionId}`));
+    let directory: fs.Dir | undefined;
+    try {
+      directory = fs.opendirSync(receiptStore.root, { bufferSize: 1 });
+      for (;;) {
+        yield;
+        signal?.throwIfAborted();
+        const entry = directory.readSync();
+        if (!entry) return false;
+        if (!entry.isDirectory()) continue;
+        try {
+          const launch = receiptStore.launch(entry.name);
+          if (
+            launch.transport === 'standalone' &&
+            launch.requester &&
+            !parents.has(`${launch.requester.provider}\0${launch.requester.id}`)
+          )
+            return true;
+        } catch {
+          /* An unavailable launch supplies no qualified requester. */
+        }
+      }
+    } catch {
+      return true;
+    } finally {
+      directory?.closeSync();
+    }
+  }
+  // The first walk locates applicable receipt edges. The second walk uses their complete competing claims.
+  let dispatchAdmitted = false;
+  for (let pass = 0; pass < 2; pass++) {
+    for (let index = 0; index < sources.length; index++) {
+      const source = sources[index];
+      if (source.kind === 'claude-print') continue;
+      const isCodexSource = source.kind === 'codex' || source.kind === 'codex-thread';
+      if (isCodexSource) {
+        yield* codexCatalog();
+        for (const child of nativeByParent.get(source.sessionId) ?? []) {
+          yield;
+          const childMeta = child.meta;
+          add({
+            kind: 'codex-thread',
+            file: child.file,
+            sessionId: childMeta?.sessionId ?? source.sessionId,
+            ...(childMeta?.agentPath || childMeta?.subagentKind
+              ? { agent: childMeta.agentPath ?? childMeta.subagentKind ?? undefined }
+              : {}),
+          });
+        }
+      } else {
+        for (const child of yield* nativeClaudeSources(source)) add(child);
+      }
+      const references = receiptParents ? [] : yield* referencesOf(source);
+      const dispatchFiles: import('./transcript').SessionFile[] = [];
+      for (const agent of new Set(
+        references.flatMap((reference) => (reference.kind === 'dispatch' ? [reference.agent] : [])),
+      )) {
+        for (const file of yield* dispatchCatalog(agent)) {
+          yield;
+          dispatchFiles.push(file);
+        }
+      }
+      const native = nativeCodexParents();
+      const admitted =
+        receiptParents?.get(source.sessionId) ??
+        (receiptParents
+          ? []
+          : admittedDispatchReferences(resolveClaudeDispatchReferences(references, dispatchFiles), [], native));
+      for (const reference of admitted) {
+        yield;
+        if (!reference.file || !fs.existsSync(reference.file)) continue;
+        const previousSize = sources.length;
+        add({
+          kind:
+            reference.kind !== 'dispatch'
+              ? 'claude-subagent'
+              : reference.agent === 'codex'
+                ? 'codex-thread'
+                : 'claude-session',
+          file: reference.file,
+          sessionId: reference.sessionId,
+        });
+        if (reference.kind === 'dispatch' && sources.length > previousSize) dispatchAdmitted = true;
+      }
+      if (!isCodexSource) continue;
+      const requests = yield* codexRequests(source);
+      const prints = new Map<string, SessionRequest[]>();
+      for (const request of requests) {
+        if (!request.linkedInvocationId) continue;
+        const held = prints.get(request.linkedInvocationId) ?? [];
+        held.push(request);
+        prints.set(request.linkedInvocationId, held);
+      }
+      for (const [invocationId, linked] of prints)
+        sources.push({
+          kind: 'claude-print',
+          file: source.file,
+          sessionId: linked[0].linkedSessionId ?? source.sessionId,
+          invocationId,
+          requests: linked,
+        });
+    }
+    if (pass) break;
+    try {
+      if (!fs.statSync(receiptStore.root).isDirectory()) break;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === 'ENOENT' || code === 'ENOTDIR') break;
+      receiptRefusal ??= { error };
+    }
+    const scoped = [...(yield* dispatchCatalog('claude')), ...(yield* codexCatalog())];
+    const scopedKeys = new Set(scoped.map((entry) => sourceKey(entry.file)));
+    for (const source of sources) {
+      if (source.kind === 'claude-print' || scopedKeys.has(sourceKey(source.file))) continue;
+      try {
+        const stat = fs.statSync(source.file, { bigint: true });
+        scoped.push({
+          agent: source.kind === 'codex' || source.kind === 'codex-thread' ? 'codex' : 'claude',
+          file: source.file,
+          sessionId: source.sessionId,
+          childTranscript: source.kind === 'claude-subagent',
+          ...revisionOf(stat),
+        });
+        scopedKeys.add(sourceKey(source.file));
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code !== 'ENOENT' && code !== 'ENOTDIR') throw error;
+      }
+    }
+    let receiptResult = yield* receiptReferencesFor(scoped);
+    let receiptReferences = receiptResult.references;
+    const selected = new Set(sources.map((source) => source.sessionId));
+    const touchesSelected = (reference: import('./transcript').ClaudeChildSessionReference) =>
+      selected.has(reference.parentSessionId) || selected.has(reference.sessionId);
+    const knownTouch = receiptReferences.some(touchesSelected);
+    if (receiptResult.unopened && !receiptReferences.length && !receiptCompetition.refusal) break;
+    const requireCompetition = () => {
+      const catalogRefusal = catalogRefusals.values().next().value;
+      if (catalogRefusal) throw catalogRefusal.error;
+      if (receiptRefusal) throw receiptRefusal.error;
+    };
+    if (knownTouch) requireCompetition();
+    else {
+      if (dispatchAdmitted && receiptCompetition.refusal) throw receiptCompetition.refusal.error;
+      if (!(yield* unresolvedReceiptRequester(scoped))) break;
+    }
+    const nativeClaude: { sessionId: string; parentSessionId: string }[] = [];
+    const nativeSources = scoped
+      .filter((entry) => entry.agent === 'claude')
+      .map((entry) => ({ kind: 'claude' as SessionSourceKind, file: entry.file, sessionId: entry.sessionId }));
+    const nativeSeen = new Set(nativeSources.map((entry) => sourceKey(entry.file)));
+    for (let index = 0; index < nativeSources.length; index++) {
+      const parent = nativeSources[index];
+      for (const child of yield* nativeClaudeSources(parent)) {
+        yield;
+        try {
+          const stat = fs.statSync(child.file, { bigint: true });
+          nativeClaude.push({ sessionId: child.sessionId, parentSessionId: parent.sessionId });
+          const key = sourceKey(child.file);
+          if (nativeSeen.has(key)) continue;
+          nativeSeen.add(key);
+          nativeSources.push(child);
+          scoped.push({
+            agent: 'claude',
+            childTranscript: true,
+            file: child.file,
+            sessionId: child.sessionId,
+            ...revisionOf(stat),
+          });
+        } catch (error) {
+          const code = (error as NodeJS.ErrnoException).code;
+          if (code !== 'ENOENT' && code !== 'ENOTDIR') throw error;
         }
       }
     }
-    let references: import('./transcript').ClaudeChildSessionReference[];
-    if (isCodexSource) {
-      const scan = yield* costRead(
-        () => scanCodexDispatchReferences(source.file, source.sessionId),
-        () =>
-          scanCodexDispatchReferencesAsync(
-            source.file,
-            source.sessionId,
-            null,
-            Number.POSITIVE_INFINITY,
-            () => signal?.aborted === true,
-          ),
-      );
-      references = scan.references;
-    } else {
-      const reducer = createClaudeRelationshipReducer({
-        file: source.file,
-        sessionId: source.sessionId,
-        childTranscript: source.kind === 'claude-subagent',
-      });
-      yield* costScanLines(source.file, reducer.apply);
-      references = reducer.references();
+    receiptResult = yield* receiptReferencesFor(scoped);
+    receiptReferences = receiptResult.references;
+    const touches = receiptReferences.some(touchesSelected);
+    if (knownTouch || touches) requireCompetition();
+    if (!touches) {
+      if (dispatchAdmitted && receiptCompetition.refusal) throw receiptCompetition.refusal.error;
+      if (dispatchAdmitted && catalogRefusals.size && (yield* unresolvedReceiptRequester(scoped)))
+        throw catalogRefusals.values().next().value!.error;
+      break;
     }
-    const dispatchFiles: import('./transcript').SessionFile[] = [];
-    for (const agent of new Set(
-      references.flatMap((reference) => (reference.kind === 'dispatch' ? [reference.agent] : [])),
-    )) {
-      for (const file of yield* dispatchCatalog(agent)) {
-        yield;
-        dispatchFiles.push(file);
-      }
-    }
-    for (const reference of resolveClaudeDispatchReferences(references, dispatchFiles)) {
+    const competing: import('./transcript').ClaudeChildSessionReference[] = [];
+    for (const parent of scoped) {
       yield;
-      if (!reference.file || !fs.existsSync(reference.file)) continue;
-      add({
-        kind:
-          reference.kind !== 'dispatch'
-            ? 'claude-subagent'
-            : reference.agent === 'codex'
-              ? 'codex-thread'
-              : 'claude-session',
-        file: reference.file,
-        sessionId: reference.sessionId,
-      });
+      competing.push(
+        ...(yield* referencesOf(
+          {
+            kind: parent.agent === 'codex' ? 'codex' : parent.childTranscript ? 'claude-subagent' : 'claude',
+            file: parent.file,
+            sessionId: parent.sessionId,
+          },
+          true,
+        )),
+      );
     }
-    if (!isCodexSource) continue;
-    const requests = yield* codexRequests(source);
-    const prints = new Map<string, SessionRequest[]>();
-    for (const request of requests) {
-      if (!request.linkedInvocationId) continue;
-      const held = prints.get(request.linkedInvocationId) ?? [];
-      held.push(request);
-      prints.set(request.linkedInvocationId, held);
+    const native = nativeCodexParents();
+    receiptParents = new Map();
+    const evidence = resolveClaudeDispatchReferences([...receiptReferences, ...competing], scoped);
+    for (const reference of admittedDispatchReferences(evidence, nativeClaude, native)) {
+      const held = receiptParents.get(reference.parentSessionId) ?? [];
+      held.push(reference);
+      receiptParents.set(reference.parentSessionId, held);
     }
-    for (const [invocationId, linked] of prints)
-      sources.push({
-        kind: 'claude-print',
-        file: source.file,
-        sessionId: linked[0].linkedSessionId ?? source.sessionId,
-        invocationId,
-        requests: linked,
-      });
+    sources.splice(1);
+    seen.clear();
+    seen.add(sourceKey(absolute));
   }
   return sources;
 }

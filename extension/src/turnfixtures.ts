@@ -1,5 +1,7 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { DispatchReceipts } from './dispatchreceipts';
+import { payloadSha256 } from './sessionwrites';
 import type { SiteManifest } from './webview/export-model';
 // Shared turn and session fixtures for tests. Production code must not import this module.
 // Keep a builder in its test file until another test file or shared builder needs it.
@@ -13,8 +15,146 @@ import {
   TurnSkillUse,
   HEX_SHA,
   normalizeFsPath,
+  projectSlug,
 } from './transcript.ts';
 import { type GitRunner, IDENTITY_ARGS, exactCommitArgs } from './gitcommits.ts';
+
+export function receiptDispatchFixture(root: string, parentAgent: 'claude' | 'codex', childAgent: 'claude' | 'codex') {
+  const home = path.join(root, 'arc');
+  const projects = path.join(root, 'projects');
+  const codexSessions = path.join(root, 'sessions');
+  const ids = ['aaaaaaaa', 'bbbbbbbb', 'cccccccc'].map((part) => `${part}-1111-2222-3333-444444444444`);
+  const write = (agent: 'claude' | 'codex', id: string, launch = false) => {
+    const file =
+      agent === 'claude'
+        ? path.join(projects, projectSlug(root), `${id}.jsonl`)
+        : path.join(codexSessions, `rollout-2026-01-01T00-00-00-${id}.jsonl`);
+    const timestamp = '2026-01-01T00:00:00Z';
+    const rows =
+      agent === 'claude'
+        ? [
+            {
+              type: 'user',
+              uuid: id,
+              sessionId: id,
+              cwd: root,
+              timestamp,
+              message: { role: 'user', content: 'Review the assigned work.' },
+            },
+            ...(launch
+              ? claudeDispatchTranscript('python dispatch.py --arc-dispatch --wait', '', 'dispatch-1', true)
+              : []),
+            {
+              type: 'assistant',
+              timestamp: '2026-01-01T00:00:02Z',
+              message: {
+                id,
+                role: 'assistant',
+                model: 'claude-sonnet-4-6',
+                content: 'Complete.',
+                stop_reason: 'end_turn',
+                usage: { input_tokens: 10000, output_tokens: 2000 },
+              },
+            },
+          ]
+        : [
+            { type: 'session_meta', timestamp, payload: { id, cwd: root, source: 'exec', model_provider: 'openai' } },
+            { type: 'event_msg', timestamp, payload: { type: 'task_started', turn_id: id } },
+            { type: 'turn_context', timestamp, payload: { turn_id: id, model: 'gpt-6-sol' } },
+            {
+              type: 'event_msg',
+              timestamp: '2026-01-01T00:00:02Z',
+              payload: {
+                type: 'token_count',
+                info: {
+                  last_token_usage: { input_tokens: 10000, output_tokens: 2000, total_tokens: 12000 },
+                  total_token_usage: { input_tokens: 10000, output_tokens: 2000, total_tokens: 12000 },
+                },
+              },
+            },
+            { type: 'event_msg', timestamp: '2026-01-01T00:00:03Z', payload: { type: 'task_complete', turn_id: id } },
+          ];
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, rows.map((row) => JSON.stringify(row)).join('\n') + '\n');
+    const stat = fs.statSync(file);
+    return {
+      file,
+      sessionId: id,
+      agent,
+      cwd: root,
+      mtimeMs: stat.mtimeMs,
+      size: stat.size,
+      dev: stat.dev,
+      ino: stat.ino,
+    };
+  };
+  const parent = write(parentAgent, ids[0], true);
+  const child = write(childAgent, ids[1]);
+  const grandchild = write(parentAgent, ids[2]);
+  const receipts = new DispatchReceipts(home);
+  const accept = (id: string, target = child) => {
+    const bytes = fs.readFileSync(target.file);
+    const opening = bytes.subarray(0, bytes.indexOf(10) + 1);
+    const stat = fs.statSync(target.file, { bigint: true });
+    const ancestor = path.dirname(target.file);
+    const directory = fs.statSync(ancestor, { bigint: true });
+    receipts.startup(id, {
+      file: target.file,
+      identity: `${stat.dev}:${stat.ino}`,
+      ancestor,
+      directory: `${directory.dev}:${directory.ino}`,
+      cwd: fs.realpathSync.native(root),
+      bytes: opening.length,
+      sha256: payloadSha256(opening.toString()),
+    });
+    return receipts.standaloneSession(id, target.sessionId);
+  };
+  const launch = (requester = parent, target = child, agentRun = true, accepted = true, padding = 0) => {
+    const result = receipts.reserve({
+      origin: 'a'.repeat(24),
+      requester: { provider: requester.agent, id: requester.sessionId },
+      policy: null,
+      promptSha256: payloadSha256('Review the assigned work.'),
+      completion: 'manual',
+      alias: null,
+      transport: 'standalone',
+      standalone: {
+        provider: target.agent,
+        command: target.agent,
+        args: padding ? ['x'.repeat(padding)] : [],
+        cwd: root,
+        model: 'test',
+        effort: 'high',
+        name: 'Review',
+        agentRun,
+        background: target.agent === 'claude',
+        env: {
+          [`${ARC_IDENTITY.environmentPrefix}PROJECTS_ROOT`]: projects,
+          [`${ARC_IDENTITY.environmentPrefix}CODEX_ROOT`]: codexSessions,
+        },
+        sessionHint: null,
+        logAlias: null,
+        deadlineMs: 1000,
+      },
+    });
+    if (accepted) accept(result.launchId, target);
+    return result;
+  };
+  return {
+    home,
+    projects,
+    codexSessions,
+    ids,
+    parent,
+    child,
+    grandchild,
+    receipts,
+    launch,
+    accept,
+    write,
+    catalog: [parent, child, grandchild],
+  };
+}
 
 export function candidateGitRunner(
   matches: Record<string, { sha: string; common?: string } | null | undefined>,
@@ -1298,7 +1438,12 @@ export const powershellDispatchExecution = {
   exit_code: 0,
 };
 
-export function claudeDispatchTranscript(command: string, output: string, toolUseId = 'dispatch-1'): object[] {
+export function claudeDispatchTranscript(
+  command: string,
+  output: string,
+  toolUseId = 'dispatch-1',
+  background = false,
+): object[] {
   const at = (n: number) => new Date(Date.UTC(2026, 0, 1, 0, 0, n)).toISOString();
   return [
     {
@@ -1313,7 +1458,14 @@ export function claudeDispatchTranscript(command: string, output: string, toolUs
       message: {
         role: 'assistant',
         model: 'claude-opus-5',
-        content: [{ type: 'tool_use', id: toolUseId, name: 'Bash', input: { command } }],
+        content: [
+          {
+            type: 'tool_use',
+            id: toolUseId,
+            name: 'Bash',
+            input: { command, ...(background ? { run_in_background: true } : {}) },
+          },
+        ],
       },
     },
     {

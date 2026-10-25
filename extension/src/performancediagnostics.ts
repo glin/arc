@@ -120,8 +120,11 @@ const UNWATCHED: PerformanceEventSink = { enabled: () => false, emit: () => {} }
 type DiscoveryCharges = import('./progressiveworker').DiscoveryCharges;
 
 // A record over every charge field fails typecheck when a field is missing, so no charge goes unsummed.
-const DISCOVERY_CHARGE_FIELDS: { readonly [K in keyof DiscoveryCharges]: true } = {
+const DISCOVERY_CHARGE_FIELDS: { readonly [K in keyof DiscoveryCharges]-?: true } = {
   readBytes: true,
+  receiptEntries: true,
+  receiptChecks: true,
+  receiptBytes: true,
   hits: true,
   resets: true,
   quanta: true,
@@ -153,6 +156,9 @@ export class PanelPerformanceCounters {
   private captureCount = 0;
   private discovery = {
     readBytes: 0,
+    receiptEntries: 0,
+    receiptChecks: 0,
+    receiptBytes: 0,
     hits: 0,
     resets: 0,
     quanta: 0,
@@ -182,7 +188,7 @@ export class PanelPerformanceCounters {
     charges: import('./progressiveworker').DiscoveryCharges | undefined,
     reply: { complete: boolean; continuation: boolean },
   ): void {
-    if (charges) for (const key of DISCOVERY_CHARGE_KEYS) this.discovery[key] += charges[key];
+    if (charges) for (const key of DISCOVERY_CHARGE_KEYS) this.discovery[key] += charges[key] ?? 0;
     this.discovery[reply.complete && !reply.continuation ? 'publications' : 'continuations']++;
   }
   private watcherOperationCount = 0;

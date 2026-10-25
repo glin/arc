@@ -4,6 +4,7 @@ import {
   advisorResponseRecords,
   PER_PASS_ITERATIONS,
   claudeDispatchTranscript,
+  receiptDispatchFixture,
 } from '../../extension/src/turnfixtures.ts';
 import { tempDir } from '../../extension/src/temproot.ts';
 import assert from 'node:assert/strict';
@@ -13,9 +14,70 @@ import path from 'node:path';
 import { createRequire, syncBuiltinESMExports } from 'node:module';
 import { afterEach, beforeEach, test, vi } from 'vitest';
 import { runCost as costOutput } from '../src/cost.ts';
+import { nativeSourceWitness, ObservationWork } from '../src/standalone.ts';
 
 const runCost = async (args: string[]) => await costOutput([...args, '--json']);
 const round = (value: number) => Math.round(value * 10_000) / 10_000;
+
+test.each(['claude', 'codex'] as const)(
+  'cost includes producer-bound writable Claude children of %s parents after empty acknowledgment',
+  async (parent) => {
+    const fx = receiptDispatchFixture(tempDir('cli-receipt-background-'), parent, 'claude');
+    vi.stubEnv('ARC_HOME', fx.home);
+    const launch = fx.launch(fx.parent, fx.child, true, false);
+    const options = fx.receipts.launch(launch.launchId).standalone!;
+    assert.equal(options.background, true);
+    const held = fx.child.file + '.before-start';
+    fs.renameSync(fx.child.file, held);
+    const runtime = { platform: process.platform, now: () => 0, identity: async () => null, yield: async () => {} };
+    const bounds = { frameBytes: 128 * 1024, readBytes: 8192, workBytes: 1024 * 1024 };
+    try {
+      const witness = await nativeSourceWitness(
+        fx.receipts,
+        launch.launchId,
+        options,
+        'Review the assigned work.',
+        bounds,
+        runtime,
+        1000,
+        false,
+        new ObservationWork(1000, runtime, bounds.workBytes),
+      );
+      assert.equal(fx.receipts.sourceBaseline(launch.launchId)?.state, 'ready');
+      fs.renameSync(held, fx.child.file);
+      assert.equal(await witness(fx.child.sessionId), 'ready');
+      assert.ok(fx.receipts.startup(launch.launchId));
+      fx.receipts.standaloneSession(launch.launchId, fx.child.sessionId);
+      const flags = [
+        '--projects',
+        fx.projects,
+        '--codex-sessions',
+        fx.codexSessions,
+        '--since',
+        '2026-01-01T00:00:00Z',
+        '--until',
+        '2026-01-02T00:00:00Z',
+      ];
+      const report = JSON.parse(await runCost([fx.parent.sessionId, ...flags]));
+      assert.deepEqual(
+        report.children.map((child: { sessionId: string }) => child.sessionId),
+        [fx.child.sessionId],
+      );
+      assert.equal(report.children[0].requests, 1);
+      assert.equal(report.children[0].uncachedInputTokens, 10000);
+      assert.equal(report.children[0].outputTokens, 2000);
+      assert.ok(report.children[0].costUsd > 0);
+      const alone = JSON.parse(await runCost([fx.parent.file, ...flags, '--source-only']));
+      assert.deepEqual(alone.children, []);
+      fs.renameSync(fx.child.file, held);
+      fs.copyFileSync(held, fx.child.file);
+      const replaced = JSON.parse(await runCost([fx.parent.sessionId, ...flags]));
+      assert.deepEqual(replaced.children, []);
+    } finally {
+      if (!fs.existsSync(fx.child.file) && fs.existsSync(held)) fs.renameSync(held, fx.child.file);
+    }
+  },
+);
 
 test.each([
   'codex catalog',
@@ -376,6 +438,7 @@ test('human cost preserves unknown totals and requested detail while JSON drops 
 const defaultRoots = { codex: tempDir('cli-cost-codex-'), projects: tempDir('cli-cost-projects-') };
 
 beforeEach(() => {
+  vi.stubEnv('ARC_HOME', tempDir('cli-cost-arc-'));
   vi.stubEnv('ARC_CODEX_ROOT', defaultRoots.codex);
   vi.stubEnv('ARC_PROJECTS_ROOT', defaultRoots.projects);
 });

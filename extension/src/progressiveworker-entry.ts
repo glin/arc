@@ -120,6 +120,8 @@ import {
   validDiscoveryCheckpoint,
 } from './progressiveworker';
 import { TURN_QUIET_MS, statusOf } from './turncard';
+import { DispatchReceipts } from './dispatchreceipts';
+import { admittedDispatchReferences } from './turnrail';
 
 const agentSpends = new AgentSpendCache();
 const claudeChildSessions = new ClaudeChildSessionCache();
@@ -144,6 +146,18 @@ const dispatchFacts = new Map<
 const DISPATCH_METADATA_BYTES = 256 * 1024;
 export const CODEX_DISPATCH_REQUEST_BYTES = 8 * 1024 * 1024;
 let discoveryEpoch: DiscoveryCheckpoint | null = null;
+let receiptScan: {
+  epoch: string | undefined;
+  steps: ReturnType<DispatchReceipts['relationships']>;
+  references: import('./transcript').ClaudeDispatchSessionReference[];
+  competitionRefused: boolean;
+  controller: AbortController;
+} | null = null;
+function closeReceiptScan(): void {
+  receiptScan?.controller.abort();
+  receiptScan?.steps.return(undefined);
+  receiptScan = null;
+}
 const admittedCompletions = new Set<string>();
 const epochChildSessions = new Map<string, import('./transcript').ClaudeChildSessionFile | null>();
 let discoveryPosition = 0;
@@ -378,6 +392,7 @@ async function execute(
       };
     }
     const epoch = discoveryEpoch;
+    if (receiptScan && receiptScan.epoch !== epoch.epoch) closeReceiptScan();
     // A new worker checks saved completions as their sources become reachable.
     const seeding = heldEpoch?.epoch !== epoch.epoch;
     if (seeding) {
@@ -388,6 +403,9 @@ async function execute(
     const completionChanges = new Map<string, boolean>();
     const charges: DiscoveryCharges = {
       readBytes: 0,
+      receiptEntries: 0,
+      receiptChecks: 0,
+      receiptBytes: 0,
       hits: 0,
       resets: 0,
       quanta: 0,
@@ -838,10 +856,52 @@ async function execute(
         parents.map(({ file, sessionId, agent, childTranscript }) => ({ file, sessionId, agent, childTranscript })),
       );
     continuation ||= parentKeys(epoch.parents) !== parentKeys(request.parents);
+    if (!receiptScan) {
+      const controller = new AbortController();
+      receiptScan = {
+        epoch: epoch.epoch,
+        controller,
+        steps: new DispatchReceipts().relationships(epoch.catalog, controller.signal),
+        references: [],
+        competitionRefused: false,
+      };
+    }
+    const activeReceipts = receiptScan;
+    const receiptDeadline = performance.now() + RELATIONSHIP_SLICE_MS;
+    let receiptSteps = 0;
+    while (!signal.aborted) {
+      if (requestBytes <= charges.readBytes || receiptSteps >= 256 || performance.now() >= receiptDeadline)
+        return pending();
+      const step = activeReceipts.steps.next({ entries: 1, checks: 1, bytes: requestBytes - charges.readBytes });
+      if (step.done) break;
+      charges.receiptEntries! += step.value.entries;
+      charges.receiptChecks! += step.value.checks;
+      charges.receiptBytes! += step.value.bytes;
+      charges.readBytes += step.value.bytes;
+      if (step.value.reference) activeReceipts.references.push(step.value.reference);
+      if (step.value.refusal && ('launchId' in step.value.refusal || step.value.refusal.storeOpened))
+        activeReceipts.competitionRefused = true;
+      receiptSteps++;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+    if (signal.aborted) return { kind: 'stale' };
+    const transcriptReferences = resolveClaudeDispatchReferences(found.references, epoch.catalog);
+    if (
+      activeReceipts.competitionRefused &&
+      (activeReceipts.references.length ||
+        transcriptReferences.some((reference) => reference.kind === 'dispatch' && reference.file))
+    ) {
+      closeReceiptScan();
+      return pending();
+    }
     discoveryPosition = epoch.position;
     discoveryEpoch = null;
-    const references = resolveClaudeDispatchReferences(found.references, epoch.catalog);
-    retainCodexDispatchSpendRoots(new Set(references.flatMap((reference) => (reference.file ? [reference.file] : []))));
+    receiptScan = null;
+    const references = [...transcriptReferences, ...activeReceipts.references];
+    const admittedReferences = admittedDispatchReferences(references, found.children, request.codexChildren);
+    retainCodexDispatchSpendRoots(
+      new Set(admittedReferences.flatMap((reference) => (reference.file ? [reference.file] : []))),
+    );
     const dispatched: DispatchSessionFacts[] = [];
     const seen = new Set<string>();
     // Each request caps Codex spend reads independently of relationship discovery.
@@ -849,7 +909,7 @@ async function execute(
     const dispatchReads = openReadWindow();
     try {
       const subagentMetas = claudeSubagentMetaReader();
-      for (const reference of references) {
+      for (const reference of admittedReferences) {
         if (reference.kind !== 'dispatch' || !reference.file || seen.has(reference.sessionId)) {
           continue;
         }
@@ -1558,15 +1618,20 @@ async function handleMessage(message: {
       return;
     }
     if (request.kind === 'claude-children') {
-      const value = await execute(request, controller.signal, (value) => {
-        noteBackground('discoveryProgress');
-        if (!controller.signal.aborted)
-          parentPort?.postMessage({
-            id: message.id,
-            progress: true,
-            result: { generation: message.generation, revision: null, value, workerMemory: workerMemory() },
-          });
-      });
+      let value: ProgressiveValue;
+      try {
+        value = await execute(request, controller.signal, (value) => {
+          noteBackground('discoveryProgress');
+          if (!controller.signal.aborted)
+            parentPort?.postMessage({
+              id: message.id,
+              progress: true,
+              result: { generation: message.generation, revision: null, value, workerMemory: workerMemory() },
+            });
+        });
+      } finally {
+        if (controller.signal.aborted) closeReceiptScan();
+      }
       if (!controller.signal.aborted) {
         parentPort?.postMessage({
           id: message.id,

@@ -9,6 +9,8 @@ import {
   MIXED_PASS_ITERATIONS,
   PER_PASS_ITERATIONS,
   bedrockAstraRecords,
+  receiptDispatchFixture,
+  claudeDispatchTranscript,
 } from './turnfixtures';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -38,8 +40,1490 @@ function directory(): string {
 const defaultRoots = { codexSessions: directory(), projects: directory() };
 
 beforeEach(() => {
+  vi.stubEnv('ARC_HOME', directory());
   vi.stubEnv('ARC_CODEX_ROOT', defaultRoots.codexSessions);
   vi.stubEnv('ARC_PROJECTS_ROOT', defaultRoots.projects);
+});
+
+test.each(['claude', 'codex'] as const)(
+  'receipt-only %s parents include each child and immediate grandchild usage once',
+  async (parentAgent) => {
+    for (const childAgent of ['claude', 'codex'] as const) {
+      const fx = receiptDispatchFixture(directory(), parentAgent, childAgent);
+      vi.stubEnv('ARC_HOME', fx.home);
+      fx.launch();
+      fx.launch();
+      fx.launch(fx.child, fx.grandchild);
+      fx.launch(fx.child, fx.child);
+      const roots = { projects: fx.projects, codexSessions: fx.codexSessions };
+      assert.deepEqual(
+        sessionSources(fx.parent.file, roots).map((source) => source.sessionId),
+        fx.ids,
+      );
+      assert.deepEqual(
+        (await sessionSourcesAsync(fx.parent.file, roots)).map((source) => source.sessionId),
+        fx.ids,
+      );
+      const report = sessionCostReport(fx.parent.file, { roots });
+      assert.deepEqual(
+        report.children.map((child) => child.sessionId),
+        fx.ids.slice(1),
+      );
+      assert.ok(report.children.every((child) => (child.costUsd ?? child.estimatedCostUsd ?? 0) > 0));
+      assert.ok(report.children.every((child) => child.uncachedInputTokens === 10000 && child.outputTokens === 2000));
+      fx.launch(fx.grandchild, fx.child);
+      assert.deepEqual(
+        sessionSources(fx.parent.file, roots).map((source) => source.sessionId),
+        [fx.parent.sessionId],
+      );
+    }
+  },
+);
+
+test('cost receipt discovery revisits pending identity and cooperatively cancels a large store', async () => {
+  const fx = receiptDispatchFixture(directory(), 'claude', 'codex');
+  vi.stubEnv('ARC_HOME', fx.home);
+  const launch = fx.launch(fx.parent, fx.child, false, false);
+  const roots = { projects: fx.projects, codexSessions: fx.codexSessions };
+  assert.equal(sessionSources(fx.parent.file, roots).length, 1);
+  fx.accept(launch.launchId);
+  assert.equal(sessionSources(fx.parent.file, roots).length, 2);
+  for (let index = 0; index < 300; index++)
+    fs.mkdirSync(path.join(fx.receipts.root, `${index.toString(16).padStart(8, '0')}-1111-2222-3333-444444444444`));
+  const controller = new AbortController();
+  const pending = sessionSourcesAsync(fx.parent.file, roots, false, controller.signal);
+  setImmediate(() => controller.abort());
+  await assert.rejects(pending, { name: 'AbortError' });
+  assert.equal(sessionSources(fx.parent.file, roots).length, 2);
+});
+
+test('receipt cost collects competing transcript claims before descent and preserves native child precedence', async () => {
+  const fx = receiptDispatchFixture(directory(), 'claude', 'codex');
+  vi.stubEnv('ARC_HOME', fx.home);
+  fx.launch();
+  const roots = { projects: fx.projects, codexSessions: fx.codexSessions };
+  const marker = `ARC_DISPATCH_SESSION={"agent":"codex","session_id":"${fx.child.sessionId}"}`;
+  fs.appendFileSync(
+    fx.grandchild.file,
+    claudeDispatchTranscript('python dispatch.py --arc-dispatch', marker)
+      .map((row) => JSON.stringify(row) + '\n')
+      .join(''),
+  );
+  assert.deepEqual(
+    sessionSources(fx.parent.file, roots).map((source) => source.sessionId),
+    [fx.parent.sessionId],
+  );
+  assert.deepEqual(
+    (await sessionSourcesAsync(fx.parent.file, roots)).map((source) => source.sessionId),
+    [fx.parent.sessionId],
+  );
+  const native = receiptDispatchFixture(directory(), 'codex', 'codex');
+  vi.stubEnv('ARC_HOME', native.home);
+  const content = fs
+    .readFileSync(native.child.file, 'utf8')
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+  content[0].payload.parent_thread_id = native.parent.sessionId;
+  fs.writeFileSync(native.child.file, content.map((row) => JSON.stringify(row) + '\n').join(''));
+  native.launch(native.grandchild, native.child);
+  const nativeRoots = { projects: native.projects, codexSessions: native.codexSessions };
+  assert.deepEqual(
+    sessionSources(native.parent.file, nativeRoots).map((source) => source.sessionId),
+    [native.parent.sessionId, native.child.sessionId],
+  );
+  assert.deepEqual(
+    sessionSources(native.grandchild.file, nativeRoots).map((source) => source.sessionId),
+    [native.grandchild.sessionId],
+  );
+
+  const foreign = receiptDispatchFixture(directory(), 'claude', 'codex');
+  vi.stubEnv('ARC_HOME', foreign.home);
+  foreign.launch();
+  const foreignChild = path.join(
+    path.dirname(foreign.grandchild.file),
+    foreign.grandchild.sessionId,
+    'subagents',
+    'agent-foreign.jsonl',
+  );
+  write(
+    foreignChild,
+    claudeDispatchTranscript(
+      'python dispatch.py --arc-dispatch',
+      `ARC_DISPATCH_SESSION={"agent":"codex","session_id":"${foreign.child.sessionId}"}`,
+    ),
+  );
+  const foreignRoots = { projects: foreign.projects, codexSessions: foreign.codexSessions };
+  assert.deepEqual(
+    sessionSources(foreign.parent.file, foreignRoots).map((source) => source.sessionId),
+    [foreign.parent.sessionId],
+  );
+  assert.deepEqual(
+    (await sessionSourcesAsync(foreign.parent.file, foreignRoots)).map((source) => source.sessionId),
+    [foreign.parent.sessionId],
+  );
+});
+
+test('unavailable receipt storage preserves foreground transcript cost fallback', async () => {
+  const fx = receiptDispatchFixture(directory(), 'claude', 'claude');
+  vi.stubEnv('ARC_HOME', fx.home);
+  fs.mkdirSync(fx.home);
+  fs.writeFileSync(path.join(fx.home, 'dispatch'), 'unavailable');
+  const marker = `ARC_DISPATCH_SESSION={"agent":"claude","session_id":"${fx.child.sessionId}"}`;
+  fs.appendFileSync(
+    fx.parent.file,
+    claudeDispatchTranscript('python dispatch.py --arc-dispatch', marker)
+      .map((row) => JSON.stringify(row) + '\n')
+      .join(''),
+  );
+  const roots = { projects: fx.projects, codexSessions: fx.codexSessions };
+  assert.deepEqual(
+    sessionSources(fx.parent.file, roots).map((source) => source.sessionId),
+    fx.ids.slice(0, 2),
+  );
+  assert.deepEqual(
+    (await sessionSourcesAsync(fx.parent.file, roots)).map((source) => source.sessionId),
+    fx.ids.slice(0, 2),
+  );
+});
+
+test('an unrelated receipt leaves unrelated transcript bodies and native child directories unread', async () => {
+  const fx = receiptDispatchFixture(directory(), 'claude', 'claude');
+  vi.stubEnv('ARC_HOME', fx.home);
+  fx.launch();
+  const target = fx.write('claude', 'dddddddd-1111-2222-3333-444444444444');
+  const unrelated = new Set<string>();
+  const nativeFs = createRequire(__filename)('node:fs') as typeof fs;
+  const nativeRead = nativeFs.readSync;
+  const nativeOpen = nativeFs.openSync;
+  const descriptors = new Map<number, string>();
+  let unrelatedBytes = 0;
+  const open = vi.spyOn(nativeFs, 'openSync').mockImplementation((file, ...args) => {
+    const fd = nativeOpen(file, ...args);
+    descriptors.set(fd, String(file));
+    return fd;
+  });
+  const read = vi.spyOn(nativeFs, 'readSync').mockImplementation(((fd, ...args) => {
+    const bytes = Reflect.apply(nativeRead, nativeFs, [fd, ...args]) as number;
+    if (unrelated.has(descriptors.get(fd) ?? '')) unrelatedBytes += bytes;
+    return bytes;
+  }) as typeof fs.readSync);
+  const enumerate = vi.spyOn(nativeFs, 'readdirSync');
+  syncBuiltinESMExports();
+  try {
+    const observations: number[] = [];
+    const directoryReads: boolean[] = [];
+    for (const count of [1, 12]) {
+      for (let index = unrelated.size; index < count; index++) {
+        const unused = fx.write('claude', `${index.toString(16).padStart(8, '0')}-aaaa-bbbb-cccc-dddddddddddd`);
+        fs.appendFileSync(unused.file, JSON.stringify({ type: 'ignored', padding: 'x'.repeat(96 * 1024) }) + '\n');
+        unrelated.add(unused.file);
+      }
+      unrelatedBytes = 0;
+      enumerate.mockClear();
+      const roots = { projects: fx.projects, codexSessions: fx.codexSessions };
+      for (const sources of [sessionSources(target.file, roots), await sessionSourcesAsync(target.file, roots)])
+        assert.deepEqual(
+          sources.map((source) => source.sessionId),
+          [target.sessionId],
+        );
+      observations.push(unrelatedBytes);
+      const unrelatedDirectories = new Set(
+        [...unrelated, fx.parent.file, fx.child.file, fx.grandchild.file].map((file) =>
+          path.join(path.dirname(file), path.basename(file, '.jsonl'), 'subagents'),
+        ),
+      );
+      directoryReads.push(enumerate.mock.calls.some(([file]) => unrelatedDirectories.has(String(file))));
+    }
+    assert.deepEqual(observations, [0, 0], 'Unrelated native bytes with one and twelve unrelated sources');
+    assert.deepEqual(directoryReads, [false, false]);
+    const foreignRoot = fx.write('claude', 'eeeeeeee-1111-2222-3333-444444444444');
+    const requester = fx.write('claude', 'ffffffff-1111-2222-3333-444444444444');
+    const requesterFile = path.join(
+      path.dirname(foreignRoot.file),
+      foreignRoot.sessionId,
+      'subagents',
+      `agent-${requester.sessionId}.jsonl`,
+    );
+    fs.mkdirSync(path.dirname(requesterFile), { recursive: true });
+    fs.renameSync(requester.file, requesterFile);
+    fx.launch({ ...requester, file: requesterFile }, fx.child);
+    unrelatedBytes = 0;
+    const roots = { projects: fx.projects, codexSessions: fx.codexSessions };
+    for (const sources of [sessionSources(target.file, roots), await sessionSourcesAsync(target.file, roots)])
+      assert.deepEqual(
+        sources.map((source) => source.sessionId),
+        [target.sessionId],
+      );
+    assert.equal(unrelatedBytes, 0, 'An unrelated native requester triggered catalog body reads');
+  } finally {
+    open.mockRestore();
+    read.mockRestore();
+    enumerate.mockRestore();
+    syncBuiltinESMExports();
+  }
+});
+
+test('receipt cost skips a native child removed after enumeration and retains surviving usage', async () => {
+  for (const [cooperative, code] of [
+    [false, 'ENOENT'],
+    [true, 'ENOENT'],
+    [false, 'ENOTDIR'],
+    [true, 'ENOTDIR'],
+  ] as const) {
+    const fx = receiptDispatchFixture(directory(), 'claude', 'codex');
+    vi.stubEnv('ARC_HOME', fx.home);
+    fx.launch();
+    const childDirectory = path.join(path.dirname(fx.parent.file), fx.parent.sessionId, 'subagents');
+    const missing = write(path.join(childDirectory, 'agent-missing.jsonl'), [claudeRequest('missing', 20)]);
+    const surviving = write(path.join(childDirectory, 'agent-surviving.jsonl'), [claudeRequest('surviving', 30)]);
+    const nativeFs = createRequire(__filename)('node:fs') as typeof fs;
+    const nativeStat = nativeFs.statSync;
+    let removed = false;
+    const stat = vi.spyOn(nativeFs, 'statSync').mockImplementation((file, ...args) => {
+      if (String(file) === missing && !removed) {
+        removed = true;
+        fs.unlinkSync(missing);
+        if (code === 'ENOTDIR') throw Object.assign(new Error('Native child directory disappeared.'), { code });
+      }
+      return Reflect.apply(nativeStat, nativeFs, [file, ...args]);
+    });
+    syncBuiltinESMExports();
+    try {
+      const options = { roots: { projects: fx.projects, codexSessions: fx.codexSessions } };
+      const report = cooperative
+        ? await sessionCostReportAsync(fx.parent.file, options)
+        : sessionCostReport(fx.parent.file, options);
+      assert.equal(removed, true, 'The enumerated native child never reached its stat');
+      assert.ok(report.children.some((child) => child.file === surviving && child.outputTokens === 30));
+      assert.ok(report.children.some((child) => child.sessionId === fx.child.sessionId && child.requests > 0));
+      assert.ok(!report.children.some((child) => child.file === missing));
+    } finally {
+      stat.mockRestore();
+      syncBuiltinESMExports();
+    }
+  }
+});
+
+test.each([
+  ['native discovery', false],
+  ['native discovery', true],
+  ['native catalog', false],
+  ['native catalog', true],
+  ['selected endpoint', false],
+  ['selected endpoint', true],
+] as const)('receipt cost preserves permission failures during %s (cooperative %s)', async (stage, cooperative) => {
+  const fx = receiptDispatchFixture(directory(), 'claude', 'claude');
+  vi.stubEnv('ARC_HOME', fx.home);
+  let unavailable: string;
+  if (stage === 'selected endpoint') {
+    unavailable = path.join(
+      path.dirname(fx.parent.file),
+      fx.parent.sessionId,
+      'subagents',
+      `agent-${fx.grandchild.sessionId}.jsonl`,
+    );
+    fs.mkdirSync(path.dirname(unavailable), { recursive: true });
+    fs.renameSync(fx.grandchild.file, unavailable);
+    fx.launch({ ...fx.grandchild, file: unavailable }, fx.child);
+  } else {
+    fx.launch();
+    unavailable = path.join(
+      path.dirname(fx.grandchild.file),
+      fx.grandchild.sessionId,
+      'subagents',
+      `agent-${fx.child.sessionId}.jsonl`,
+    );
+    fs.mkdirSync(path.dirname(unavailable), { recursive: true });
+    fs.copyFileSync(fx.child.file, unavailable);
+  }
+  const options = { roots: { projects: fx.projects, codexSessions: fx.codexSessions } };
+  const normal = cooperative
+    ? await sessionCostReportAsync(fx.parent.file, options)
+    : sessionCostReport(fx.parent.file, options);
+  assert.deepEqual(
+    normal.children.map((child) => child.sessionId),
+    stage === 'selected endpoint' ? [fx.grandchild.sessionId, fx.child.sessionId] : [],
+  );
+  const nativeFs = createRequire(__filename)('node:fs') as typeof fs;
+  const nativeStat = nativeFs.statSync;
+  let denied = false;
+  const stat = vi.spyOn(nativeFs, 'statSync').mockImplementation((file, ...args) => {
+    const bigint = args[0]?.bigint === true;
+    if (String(file) === unavailable && !denied && bigint === (stage !== 'native discovery')) {
+      denied = true;
+      throw Object.assign(new Error('Native source is unavailable.'), { code: 'EACCES' });
+    }
+    return Reflect.apply(nativeStat, nativeFs, [file, ...args]);
+  });
+  syncBuiltinESMExports();
+  try {
+    if (cooperative) await assert.rejects(sessionCostReportAsync(fx.parent.file, options), { code: 'EACCES' });
+    else assert.throws(() => sessionCostReport(fx.parent.file, options), { code: 'EACCES' });
+    assert.equal(denied, true, 'The native source never reached the selected stat boundary');
+  } finally {
+    stat.mockRestore();
+    syncBuiltinESMExports();
+  }
+});
+
+test.each([
+  ['directory', false],
+  ['directory', true],
+  ['body', false],
+  ['body', true],
+] as const)('receipt cost refuses incomplete competing %s evidence (cooperative %s)', async (stage, cooperative) => {
+  const fx = receiptDispatchFixture(directory(), 'claude', 'claude');
+  vi.stubEnv('ARC_HOME', fx.home);
+  fx.launch();
+  const competingDirectory = path.join(path.dirname(fx.grandchild.file), fx.grandchild.sessionId, 'subagents');
+  if (stage === 'directory') {
+    fs.mkdirSync(competingDirectory, { recursive: true });
+    fs.copyFileSync(fx.child.file, path.join(competingDirectory, `agent-${fx.child.sessionId}.jsonl`));
+  } else {
+    fs.appendFileSync(
+      fx.grandchild.file,
+      claudeDispatchTranscript(
+        'python dispatch.py --arc-dispatch',
+        `ARC_DISPATCH_SESSION={"agent":"claude","session_id":"${fx.child.sessionId}"}`,
+      )
+        .map((row) => JSON.stringify(row) + '\n')
+        .join(''),
+    );
+  }
+  const options = { roots: { projects: fx.projects, codexSessions: fx.codexSessions } };
+  const read = (file: string, sourceOnly = false) =>
+    cooperative
+      ? sessionCostReportAsync(file, { ...options, sourceOnly })
+      : sessionCostReport(file, { ...options, sourceOnly });
+  assert.deepEqual((await read(fx.parent.file)).children, []);
+  const unrelated = fx.write('claude', 'dddddddd-1111-2222-3333-444444444444');
+  const nativeFs = createRequire(__filename)('node:fs') as typeof fs;
+  const nativeDirectory = nativeFs.readdirSync;
+  const nativeOpen = nativeFs.openSync;
+  let denied = 0;
+  const enumerate = vi.spyOn(nativeFs, 'readdirSync').mockImplementation((file, ...args) => {
+    if (stage === 'directory' && String(file) === competingDirectory) {
+      denied++;
+      throw Object.assign(new Error('Competing source is unavailable.'), { code: 'EACCES' });
+    }
+    return Reflect.apply(nativeDirectory, nativeFs, [file, ...args]);
+  });
+  const open = vi.spyOn(nativeFs, 'openSync').mockImplementation((file, ...args) => {
+    if (stage === 'body' && String(file) === fx.grandchild.file) {
+      denied++;
+      throw Object.assign(new Error('Competing source is unavailable.'), { code: 'EACCES' });
+    }
+    return nativeOpen(file, ...args);
+  });
+  syncBuiltinESMExports();
+  try {
+    assert.deepEqual((await read(unrelated.file)).children, []);
+    assert.deepEqual((await read(fx.parent.file, true)).children, []);
+    assert.equal(denied, 0, 'Unrelated and source-only reports read competing evidence');
+    const expected =
+      stage === 'directory' ? { code: 'EACCES' } : { message: `Cannot read transcript: ${fx.grandchild.file}` };
+    if (cooperative) await assert.rejects(read(fx.parent.file) as Promise<unknown>, expected);
+    else assert.throws(() => read(fx.parent.file), expected);
+    assert.ok(denied > 0, 'The competing source never reached the failed read');
+  } finally {
+    enumerate.mockRestore();
+    open.mockRestore();
+    syncBuiltinESMExports();
+  }
+  assert.deepEqual((await read(fx.parent.file)).children, []);
+});
+
+test.each([
+  ['directory', false],
+  ['directory', true],
+  ['body', false],
+  ['body', true],
+] as const)(
+  'receipt cost retains surviving usage after competing %s disappearance (cooperative %s)',
+  async (stage, cooperative) => {
+    for (const code of ['ENOENT', 'ENOTDIR'] as const) {
+      const fx = receiptDispatchFixture(directory(), 'claude', 'claude');
+      vi.stubEnv('ARC_HOME', fx.home);
+      fx.launch();
+      const competingDirectory = path.join(path.dirname(fx.grandchild.file), fx.grandchild.sessionId, 'subagents');
+      if (stage === 'directory') {
+        fs.mkdirSync(competingDirectory, { recursive: true });
+        fs.copyFileSync(fx.child.file, path.join(competingDirectory, `agent-${fx.child.sessionId}.jsonl`));
+      } else {
+        fs.appendFileSync(
+          fx.grandchild.file,
+          claudeDispatchTranscript(
+            'python dispatch.py --arc-dispatch',
+            `ARC_DISPATCH_SESSION={"agent":"claude","session_id":"${fx.child.sessionId}"}`,
+          )
+            .map((row) => JSON.stringify(row) + '\n')
+            .join(''),
+        );
+      }
+      const surviving = write(
+        path.join(path.dirname(fx.parent.file), fx.parent.sessionId, 'subagents', 'agent-surviving.jsonl'),
+        [claudeRequest('surviving', 30)],
+      );
+      const options = { roots: { projects: fx.projects, codexSessions: fx.codexSessions } };
+      const read = () =>
+        cooperative ? sessionCostReportAsync(fx.parent.file, options) : sessionCostReport(fx.parent.file, options);
+      assert.deepEqual(
+        (await read()).children.map((child) => child.file),
+        [surviving],
+      );
+      const nativeFs = createRequire(__filename)('node:fs') as typeof fs;
+      const nativeDirectory = nativeFs.readdirSync;
+      const nativeOpen = nativeFs.openSync;
+      const nativeStat = nativeFs.statSync;
+      const unavailable = stage === 'directory' ? competingDirectory : fx.grandchild.file;
+      let removed = false;
+      const disappear = () => {
+        assert.equal(removed, false, 'The disappeared competitor was read again');
+        fs.renameSync(unavailable, `${unavailable}.removed`);
+        removed = true;
+        throw Object.assign(new Error('Competing source disappeared.'), { code });
+      };
+      const enumerate = vi.spyOn(nativeFs, 'readdirSync').mockImplementation((file, ...args) => {
+        if (stage === 'directory' && String(file) === unavailable && !removed) disappear();
+        return Reflect.apply(nativeDirectory, nativeFs, [file, ...args]);
+      });
+      const open = vi.spyOn(nativeFs, 'openSync').mockImplementation((file, ...args) => {
+        if (stage === 'body' && String(file) === unavailable && !removed) disappear();
+        return nativeOpen(file, ...args);
+      });
+      const stat = vi.spyOn(nativeFs, 'statSync').mockImplementation((file, ...args) => {
+        if (stage === 'body' && removed && String(file) === unavailable)
+          throw Object.assign(new Error('Competing source disappeared.'), { code });
+        return Reflect.apply(nativeStat, nativeFs, [file, ...args]);
+      });
+      syncBuiltinESMExports();
+      try {
+        const report = await read();
+        assert.equal(removed, true, 'The competing source never reached the disappearance boundary');
+        assert.ok(report.children.some((child) => child.file === surviving && child.outputTokens === 30));
+        assert.equal(report.children.filter((child) => child.sessionId === fx.child.sessionId).length, 1);
+        assert.ok(
+          report.children.some((child) => child.sessionId === fx.child.sessionId && child.outputTokens === 2000),
+        );
+      } finally {
+        enumerate.mockRestore();
+        open.mockRestore();
+        stat.mockRestore();
+        syncBuiltinESMExports();
+      }
+    }
+  },
+);
+
+test('an unrelated receipt preserves an explicit outside-store parent and its foreground dispatch', async () => {
+  const root = directory();
+  const fx = receiptDispatchFixture(root, 'claude', 'claude');
+  vi.stubEnv('ARC_HOME', fx.home);
+  fx.launch();
+  const outside = fx.write('codex', 'dddddddd-1111-2222-3333-444444444444');
+  const file = path.join(root, 'rollout-outside.jsonl');
+  fs.renameSync(outside.file, file);
+  const records = fs
+    .readFileSync(file, 'utf8')
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+  records.splice(3, 0, {
+    type: 'event_msg',
+    timestamp: '2026-01-01T00:00:01Z',
+    payload: {
+      type: 'item_completed',
+      item: {
+        type: 'CommandExecution',
+        id: 'outside-launch',
+        parsed_cmd: [{ cmd: 'python dispatch.py --arc-dispatch' }],
+        stdout: `ARC_DISPATCH_SESSION={"agent":"claude","session_id":"${fx.grandchild.sessionId}"}`,
+        status: 'completed',
+        exit_code: 0,
+      },
+    },
+  });
+  fs.writeFileSync(file, records.map((row) => JSON.stringify(row) + '\n').join(''));
+  assert.equal(codexReader.scanCodexDispatchReferences(file, outside.sessionId).references.length, 1);
+  const roots = { projects: fx.projects, codexSessions: fx.codexSessions };
+  const synchronous = sessionSources(file, roots).map((source) => source.sessionId);
+  const cooperative = (await sessionSourcesAsync(file, roots)).map((source) => source.sessionId);
+  assert.deepEqual(synchronous, [outside.sessionId, fx.grandchild.sessionId]);
+  assert.deepEqual(cooperative, synchronous);
+  records.splice(3, 1);
+  fs.writeFileSync(file, records.map((row) => JSON.stringify(row) + '\n').join(''));
+  fx.launch({ ...outside, file }, fx.grandchild);
+  assert.deepEqual(codexReader.scanCodexDispatchReferences(file, outside.sessionId).references, []);
+  assert.deepEqual(
+    sessionSources(file, roots).map((source) => source.sessionId),
+    [outside.sessionId, fx.grandchild.sessionId],
+  );
+  assert.deepEqual(
+    (await sessionSourcesAsync(file, roots)).map((source) => source.sessionId),
+    [outside.sessionId, fx.grandchild.sessionId],
+  );
+});
+
+test('receipt cost follows a selected native subagent requester and rejects an incoming foreign receipt claim', async () => {
+  const fx = receiptDispatchFixture(directory(), 'claude', 'codex');
+  vi.stubEnv('ARC_HOME', fx.home);
+  const nativeFile = path.join(
+    path.dirname(fx.parent.file),
+    fx.parent.sessionId,
+    'subagents',
+    `agent-${fx.grandchild.sessionId}.jsonl`,
+  );
+  fs.mkdirSync(path.dirname(nativeFile), { recursive: true });
+  fs.renameSync(fx.grandchild.file, nativeFile);
+  fx.launch({ ...fx.grandchild, file: nativeFile }, fx.child);
+  const roots = { projects: fx.projects, codexSessions: fx.codexSessions };
+  for (const sources of [sessionSources(fx.parent.file, roots), await sessionSourcesAsync(fx.parent.file, roots)])
+    assert.deepEqual(
+      sources.map((source) => source.sessionId),
+      [fx.parent.sessionId, fx.grandchild.sessionId, fx.child.sessionId],
+    );
+
+  const conflict = receiptDispatchFixture(directory(), 'claude', 'codex');
+  vi.stubEnv('ARC_HOME', conflict.home);
+  fs.appendFileSync(
+    conflict.parent.file,
+    claudeDispatchTranscript(
+      'python dispatch.py --arc-dispatch',
+      `ARC_DISPATCH_SESSION={"agent":"codex","session_id":"${conflict.child.sessionId}"}`,
+    )
+      .map((row) => JSON.stringify(row) + '\n')
+      .join(''),
+  );
+  conflict.launch(conflict.grandchild, conflict.child);
+  const conflictRoots = { projects: conflict.projects, codexSessions: conflict.codexSessions };
+  for (const sources of [
+    sessionSources(conflict.parent.file, conflictRoots),
+    await sessionSourcesAsync(conflict.parent.file, conflictRoots),
+  ])
+    assert.deepEqual(
+      sources.map((source) => source.sessionId),
+      [conflict.parent.sessionId],
+    );
+
+  const foreign = receiptDispatchFixture(directory(), 'claude', 'codex');
+  vi.stubEnv('ARC_HOME', foreign.home);
+  const foreignRoot = foreign.write('claude', 'eeeeeeee-1111-2222-3333-444444444444');
+  const foreignFile = path.join(
+    path.dirname(foreignRoot.file),
+    foreignRoot.sessionId,
+    'subagents',
+    `agent-${foreign.grandchild.sessionId}.jsonl`,
+  );
+  fs.mkdirSync(path.dirname(foreignFile), { recursive: true });
+  fs.renameSync(foreign.grandchild.file, foreignFile);
+  fs.appendFileSync(
+    foreign.parent.file,
+    claudeDispatchTranscript(
+      'python dispatch.py --arc-dispatch',
+      `ARC_DISPATCH_SESSION={"agent":"codex","session_id":"${foreign.child.sessionId}"}`,
+    )
+      .map((row) => JSON.stringify(row) + '\n')
+      .join(''),
+  );
+  foreign.launch({ ...foreign.grandchild, file: foreignFile }, foreign.child);
+  const foreignRoots = { projects: foreign.projects, codexSessions: foreign.codexSessions };
+  for (const sources of [
+    sessionSources(foreign.parent.file, foreignRoots),
+    await sessionSourcesAsync(foreign.parent.file, foreignRoots),
+  ])
+    assert.deepEqual(
+      sources.map((source) => source.sessionId),
+      [foreign.parent.sessionId],
+    );
+});
+
+function competingCostFixture(
+  agent: 'claude' | 'codex',
+  childAgent: 'claude' | 'codex' = agent === 'codex' ? 'claude' : 'codex',
+) {
+  const fx = receiptDispatchFixture(directory(), 'claude', childAgent);
+  vi.stubEnv('ARC_HOME', fx.home);
+  fx.launch();
+  const candidate = agent === 'claude' ? fx.grandchild : fx.write('codex', fx.grandchild.sessionId);
+  const project =
+    agent === 'claude' ? path.join(fx.projects, 'foreign-project') : path.join(fx.codexSessions, '2026', '01', '01');
+  fs.mkdirSync(project, { recursive: true });
+  const file = path.join(project, path.basename(candidate.file));
+  fs.renameSync(candidate.file, file);
+  const marker = `ARC_DISPATCH_SESSION={"agent":"${fx.child.agent}","session_id":"${fx.child.sessionId}"}`;
+  if (agent === 'claude')
+    fs.appendFileSync(
+      file,
+      claudeDispatchTranscript('python dispatch.py --arc-dispatch', marker)
+        .map((row) => JSON.stringify(row) + '\n')
+        .join(''),
+    );
+  else {
+    const rows = fs
+      .readFileSync(file, 'utf8')
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line));
+    rows.splice(3, 0, {
+      type: 'event_msg',
+      timestamp: '2026-01-01T00:00:01Z',
+      payload: {
+        type: 'item_completed',
+        item: {
+          type: 'CommandExecution',
+          id: 'foreign-launch',
+          parsed_cmd: [{ cmd: 'python dispatch.py --arc-dispatch' }],
+          stdout: marker,
+          status: 'completed',
+          exit_code: 0,
+        },
+      },
+    });
+    fs.writeFileSync(file, rows.map((row) => JSON.stringify(row) + '\n').join(''));
+  }
+  const options = { roots: { projects: fx.projects, codexSessions: fx.codexSessions } };
+  return { ...fx, competitor: file, project, options };
+}
+
+test.each(['claude', 'codex'] as const)('receipt competition refuses a premature %s body end', async (agent) => {
+  for (const cooperative of [true, false]) {
+    const fx = competingCostFixture(agent);
+    const report = () =>
+      cooperative ? sessionCostReportAsync(fx.parent.file, fx.options) : sessionCostReport(fx.parent.file, fx.options);
+    assert.deepEqual((await report()).children, []);
+    const nativeFs = createRequire(__filename)('node:fs') as typeof fs;
+    const originalOpen = nativeFs.openSync,
+      originalRead = nativeFs.readSync,
+      originalClose = nativeFs.closeSync;
+    const descriptors = new Map<number, boolean>();
+    let catalogOpened = false,
+      stopped = false;
+    const open = vi.spyOn(nativeFs, 'openSync').mockImplementation((file, ...args) => {
+      const fd = originalOpen(file, ...args);
+      if (String(file) === fx.competitor) {
+        descriptors.set(fd, agent === 'claude' || catalogOpened);
+        catalogOpened = true;
+      }
+      return fd;
+    });
+    const read = vi.spyOn(nativeFs, 'readSync').mockImplementation(((fd, ...args) => {
+      if (descriptors.get(fd)) {
+        stopped = true;
+        return 0;
+      }
+      return Reflect.apply(originalRead, nativeFs, [fd, ...args]);
+    }) as typeof fs.readSync);
+    const close = vi.spyOn(nativeFs, 'closeSync').mockImplementation((fd) => {
+      descriptors.delete(fd);
+      originalClose(fd);
+    });
+    syncBuiltinESMExports();
+    try {
+      const expected = { message: `Cannot read transcript: ${fx.competitor}` };
+      if (cooperative) await assert.rejects(report() as Promise<unknown>, expected);
+      else assert.throws(report, expected);
+      assert.equal(stopped, true);
+      assert.equal(descriptors.size, 0);
+      assert.equal(fs.existsSync(fx.competitor), true);
+    } finally {
+      close.mockRestore();
+      read.mockRestore();
+      open.mockRestore();
+      syncBuiltinESMExports();
+    }
+  }
+});
+
+test.each(['project', 'root', 'stat', 'local'] as const)(
+  'receipt competition refuses the Claude catalog %s omission',
+  async (stage) => {
+    for (const cooperative of [true, false])
+      for (const code of ['EACCES', 'EPERM']) {
+        const fx = competingCostFixture('claude');
+        if (stage === 'local') {
+          const outside = path.join(path.dirname(fx.projects), 'outside');
+          fs.mkdirSync(outside);
+          for (const source of [fx.parent, { file: fx.competitor }]) {
+            const target = path.join(outside, path.basename(source.file));
+            fs.renameSync(source.file, target);
+            if (source === fx.parent) fx.parent.file = target;
+            else fx.competitor = target;
+          }
+          fx.project = outside;
+        }
+        const report = (file = fx.parent.file, sourceOnly = false) =>
+          cooperative
+            ? sessionCostReportAsync(file, { ...fx.options, sourceOnly })
+            : sessionCostReport(file, { ...fx.options, sourceOnly });
+        assert.deepEqual((await report()).children, []);
+        const nativeFs = createRequire(__filename)('node:fs') as typeof fs;
+        const originalDirectory = nativeFs.readdirSync,
+          originalStat = nativeFs.statSync;
+        const failure = Object.assign(new Error('Competing catalog is unavailable.'), { code });
+        let denied = 0,
+          nativeVisits = 0;
+        const selectedDirectory = path.join(path.dirname(fx.parent.file), fx.parent.sessionId, 'subagents');
+        const enumerate = vi.spyOn(nativeFs, 'readdirSync').mockImplementation((file, ...args) => {
+          if (String(file) === selectedDirectory) nativeVisits++;
+          if (stage !== 'stat' && String(file) === (stage === 'root' ? fx.projects : fx.project)) {
+            denied++;
+            throw failure;
+          }
+          return Reflect.apply(originalDirectory, nativeFs, [file, ...args]);
+        });
+        const stat = vi.spyOn(nativeFs, 'statSync').mockImplementation((file, ...args) => {
+          if (stage === 'stat' && String(file) === fx.competitor) {
+            denied++;
+            throw failure;
+          }
+          return Reflect.apply(originalStat, nativeFs, [file, ...args]);
+        });
+        syncBuiltinESMExports();
+        try {
+          assert.deepEqual((await report(fx.parent.file, true)).children, []);
+          assert.equal(denied, 0);
+          if (cooperative) await assert.rejects(report() as Promise<unknown>, { code });
+          else assert.throws(report, { code });
+          assert.ok(denied > 0);
+          assert.equal(nativeVisits, 1, 'A known applicable refusal reached the global native census');
+        } finally {
+          stat.mockRestore();
+          enumerate.mockRestore();
+          syncBuiltinESMExports();
+        }
+      }
+  },
+);
+
+test.each(['startup', 'witness', 'bytes', 'iteration'] as const)(
+  'receipt competition refuses missing %s evidence',
+  async (stage) => {
+    for (const child of ['claude', 'codex'] as const)
+      for (const cooperative of [true, false]) {
+        const fx = receiptDispatchFixture(directory(), 'claude', child);
+        vi.stubEnv('ARC_HOME', fx.home);
+        const first = fx.launch(),
+          second = fx.launch(fx.grandchild, fx.child);
+        const options = { roots: { projects: fx.projects, codexSessions: fx.codexSessions } };
+        const report = () =>
+          cooperative ? sessionCostReportAsync(fx.parent.file, options) : sessionCostReport(fx.parent.file, options);
+        assert.deepEqual((await report()).children, []);
+        const nativeFs = createRequire(__filename)('node:fs') as typeof fs;
+        const originalOpen = nativeFs.openSync,
+          originalRead = nativeFs.readSync,
+          originalClose = nativeFs.closeSync,
+          originalDirectory = nativeFs.opendirSync;
+        const startup = path.join(fx.receipts.root, second.launchId, 'startup.json');
+        const before = fs.readFileSync(startup);
+        const target = stage === 'witness' ? path.join(fx.receipts.root, `${second.launchId}.startup.json`) : startup;
+        const firstEntry = fs
+          .readdirSync(fx.receipts.root, { withFileTypes: true })
+          .find((entry) => entry.name === first.launchId)!;
+        const failure = Object.assign(new Error('Competing receipt is unavailable.'), { code: 'EACCES' });
+        const descriptors = new Map<number, string>();
+        let denied = 0,
+          closed = 0;
+        const open = vi.spyOn(nativeFs, 'openSync').mockImplementation((file, ...args) => {
+          if ((stage === 'startup' || stage === 'witness') && String(file) === target) {
+            denied++;
+            throw failure;
+          }
+          const fd = originalOpen(file, ...args);
+          descriptors.set(fd, String(file));
+          return fd;
+        });
+        const read = vi.spyOn(nativeFs, 'readSync').mockImplementation(((fd, ...args) => {
+          if (stage === 'bytes' && descriptors.get(fd) === target) {
+            denied++;
+            throw failure;
+          }
+          return Reflect.apply(originalRead, nativeFs, [fd, ...args]);
+        }) as typeof fs.readSync);
+        const close = vi.spyOn(nativeFs, 'closeSync').mockImplementation((fd) => {
+          descriptors.delete(fd);
+          originalClose(fd);
+        });
+        const enumerate = vi.spyOn(nativeFs, 'opendirSync').mockImplementation((file, ...args) => {
+          const dir = Reflect.apply(originalDirectory, nativeFs, [file, ...args]);
+          if (stage === 'iteration' && String(file) === fx.receipts.root) {
+            let visited = false;
+            vi.spyOn(dir, 'readSync').mockImplementation(() => {
+              if (!visited) {
+                visited = true;
+                return firstEntry;
+              }
+              denied++;
+              throw failure;
+            });
+            const close = dir.closeSync.bind(dir);
+            vi.spyOn(dir, 'closeSync').mockImplementation(() => {
+              closed++;
+              close();
+            });
+          }
+          return dir;
+        });
+        syncBuiltinESMExports();
+        try {
+          if (cooperative) await assert.rejects(report() as Promise<unknown>, { code: 'EACCES' });
+          else assert.throws(report, { code: 'EACCES' });
+          assert.ok(denied > 0);
+          if (stage === 'iteration') assert.ok(closed > 0);
+          assert.equal(descriptors.size, 0);
+        } finally {
+          enumerate.mockRestore();
+          close.mockRestore();
+          read.mockRestore();
+          open.mockRestore();
+          syncBuiltinESMExports();
+        }
+        assert.deepEqual(fs.readFileSync(startup), before);
+        assert.equal(fs.existsSync(fx.child.file), true);
+        assert.deepEqual((await report()).children, []);
+      }
+  },
+);
+
+test.each(['directory', 'root', 'opening'] as const)(
+  'receipt competition classifies the Codex %s refusal',
+  async (stage) => {
+    for (const cooperative of [false, true])
+      for (const outcome of ['present', 'EACCES', 'EPERM', 'ENOENT', 'ENOTDIR', 'non-directory'] as const) {
+        const fx = competingCostFixture('codex');
+        const report = () =>
+          cooperative
+            ? sessionCostReportAsync(fx.parent.file, fx.options)
+            : sessionCostReport(fx.parent.file, fx.options);
+        assert.deepEqual((await report()).children, []);
+        const nativeFs = createRequire(__filename)('node:fs') as typeof fs;
+        const originalDirectory = nativeFs.readdirSync,
+          originalOpen = nativeFs.openSync,
+          originalStat = nativeFs.statSync;
+        const target =
+          stage === 'opening'
+            ? fx.competitor
+            : stage === 'root'
+              ? fx.codexSessions
+              : path.join(fx.codexSessions, '2026');
+        const held = path.join(path.dirname(fx.projects), 'held-competitor');
+        const before = fs.readFileSync(fx.competitor);
+        let denied = 0,
+          checked = 0;
+        const deny = () => {
+          denied++;
+          if ((outcome === 'ENOENT' || outcome === 'ENOTDIR' || outcome === 'non-directory') && denied === 1) {
+            fs.renameSync(target, held);
+            if (outcome === 'non-directory') fs.writeFileSync(target, 'unavailable');
+          }
+          throw Object.assign(new Error('Competing catalog is unavailable.'), {
+            code: outcome === 'ENOENT' || outcome === 'ENOTDIR' || outcome === 'EPERM' ? outcome : 'EACCES',
+          });
+        };
+        const enumerate = vi.spyOn(nativeFs, 'readdirSync').mockImplementation((file, ...args) => {
+          if (stage !== 'opening' && String(file) === target) deny();
+          return Reflect.apply(originalDirectory, nativeFs, [file, ...args]);
+        });
+        const open = vi.spyOn(nativeFs, 'openSync').mockImplementation((file, ...args) => {
+          if (stage === 'opening' && String(file) === target) deny();
+          return originalOpen(file, ...args);
+        });
+        const stat = vi.spyOn(nativeFs, 'statSync').mockImplementation((file, ...args) => {
+          if (String(file) === target && denied) {
+            checked++;
+            if (outcome === 'EACCES' || outcome === 'EPERM' || outcome === 'ENOENT' || outcome === 'ENOTDIR')
+              throw Object.assign(new Error('Competing pathname is unavailable.'), { code: outcome });
+          }
+          return Reflect.apply(originalStat, nativeFs, [file, ...args]);
+        });
+        syncBuiltinESMExports();
+        try {
+          const absent =
+            outcome === 'ENOENT' || outcome === 'ENOTDIR' || (outcome === 'non-directory' && stage !== 'opening');
+          if (absent) {
+            const result = await report();
+            assert.equal(
+              result.children.filter((child) => child.sessionId === fx.child.sessionId && child.outputTokens === 2000)
+                .length,
+              1,
+            );
+          } else {
+            const expected =
+              outcome === 'EACCES' || outcome === 'EPERM'
+                ? { code: outcome }
+                : { message: `Cannot read transcript${stage === 'opening' ? '' : ' directory'}: ${target}` };
+            if (cooperative) await assert.rejects(report() as Promise<unknown>, expected);
+            else assert.throws(report, expected);
+          }
+          assert.ok(denied > 0);
+          if (!(stage === 'root' && outcome === 'ENOENT'))
+            assert.ok(checked > 0, 'The reader did not classify its actual uncertain pathname');
+        } finally {
+          stat.mockRestore();
+          open.mockRestore();
+          enumerate.mockRestore();
+          syncBuiltinESMExports();
+        }
+        if (fs.existsSync(held)) {
+          if (outcome === 'non-directory') fs.unlinkSync(target);
+          fs.renameSync(held, target);
+        }
+        assert.deepEqual(fs.readFileSync(fx.competitor), before);
+      }
+  },
+);
+
+test.each(['project', 'stat'] as const)(
+  'receipt competition preserves Claude catalog %s disappearance',
+  async (stage) => {
+    for (const cooperative of [false, true])
+      for (const code of ['ENOENT', 'ENOTDIR']) {
+        const fx = competingCostFixture('claude');
+        const surviving = write(
+          path.join(path.dirname(fx.parent.file), fx.parent.sessionId, 'subagents', 'agent-surviving.jsonl'),
+          [claudeRequest('surviving', 30)],
+        );
+        const report = () =>
+          cooperative
+            ? sessionCostReportAsync(fx.parent.file, fx.options)
+            : sessionCostReport(fx.parent.file, fx.options);
+        assert.deepEqual(
+          (await report()).children.map((child) => child.file),
+          [surviving],
+        );
+        const nativeFs = createRequire(__filename)('node:fs') as typeof fs;
+        const originalDirectory = nativeFs.readdirSync,
+          originalStat = nativeFs.statSync;
+        const target = stage === 'project' ? fx.project : fx.competitor,
+          held = target + '.held';
+        const before = fs.readFileSync(fx.competitor);
+        let removed = false;
+        const disappear = () => {
+          fs.renameSync(target, held);
+          removed = true;
+          throw Object.assign(new Error('Competing catalog disappeared.'), { code });
+        };
+        const enumerate = vi.spyOn(nativeFs, 'readdirSync').mockImplementation((file, ...args) => {
+          if (stage === 'project' && String(file) === target && !removed) disappear();
+          return Reflect.apply(originalDirectory, nativeFs, [file, ...args]);
+        });
+        const stat = vi.spyOn(nativeFs, 'statSync').mockImplementation((file, ...args) => {
+          if (stage === 'stat' && String(file) === target && !removed) disappear();
+          return Reflect.apply(originalStat, nativeFs, [file, ...args]);
+        });
+        syncBuiltinESMExports();
+        try {
+          const result = await report();
+          assert.equal(removed, true);
+          assert.ok(result.children.some((child) => child.file === surviving && child.outputTokens === 30));
+          assert.equal(
+            result.children.filter((child) => child.sessionId === fx.child.sessionId && child.outputTokens === 2000)
+              .length,
+            1,
+          );
+        } finally {
+          stat.mockRestore();
+          enumerate.mockRestore();
+          syncBuiltinESMExports();
+        }
+        fs.renameSync(held, target);
+        assert.deepEqual(fs.readFileSync(fx.competitor), before);
+      }
+  },
+);
+
+test.each(['claude', 'codex'] as const)(
+  'receipt competition classifies %s body failures inside each read closure',
+  async (agent) => {
+    for (const cooperative of [false, true])
+      for (const code of ['ENOENT', 'ENOTDIR', 'EACCES', 'EPERM']) {
+        const fx = competingCostFixture(agent);
+        const report = () =>
+          cooperative
+            ? sessionCostReportAsync(fx.parent.file, fx.options)
+            : sessionCostReport(fx.parent.file, fx.options);
+        assert.deepEqual((await report()).children, []);
+        const nativeFs = createRequire(__filename)('node:fs') as typeof fs;
+        const originalOpen = nativeFs.openSync,
+          originalClose = nativeFs.closeSync,
+          originalStat = nativeFs.statSync;
+        const held = fx.competitor + '.held',
+          before = fs.readFileSync(fx.competitor);
+        let catalogOpened = false,
+          denied = false,
+          checked = false;
+        const descriptors = new Set<number>();
+        const open = vi.spyOn(nativeFs, 'openSync').mockImplementation((file, ...args) => {
+          if (String(file) === fx.competitor) {
+            if (agent === 'claude' || catalogOpened) {
+              denied = true;
+              if (code === 'ENOENT' || code === 'ENOTDIR') fs.renameSync(fx.competitor, held);
+              throw Object.assign(new Error('Competing body is unavailable.'), { code });
+            }
+            catalogOpened = true;
+          }
+          const fd = originalOpen(file, ...args);
+          descriptors.add(fd);
+          return fd;
+        });
+        const close = vi.spyOn(nativeFs, 'closeSync').mockImplementation((fd) => {
+          descriptors.delete(fd);
+          originalClose(fd);
+        });
+        const stat = vi.spyOn(nativeFs, 'statSync').mockImplementation((file, ...args) => {
+          if (denied && String(file) === fx.competitor && (code === 'ENOENT' || code === 'ENOTDIR')) {
+            checked = true;
+            throw Object.assign(new Error('Competing body disappeared.'), { code });
+          }
+          return Reflect.apply(originalStat, nativeFs, [file, ...args]);
+        });
+        syncBuiltinESMExports();
+        try {
+          if (code === 'ENOENT' || code === 'ENOTDIR') {
+            const result = await report();
+            assert.equal(checked, true);
+            assert.equal(
+              result.children.filter((child) => child.sessionId === fx.child.sessionId && child.outputTokens === 2000)
+                .length,
+              1,
+            );
+          } else {
+            const expected = agent === 'claude' ? { message: `Cannot read transcript: ${fx.competitor}` } : { code };
+            if (cooperative) await assert.rejects(report() as Promise<unknown>, expected);
+            else assert.throws(report, expected);
+          }
+          assert.equal(denied, true);
+          assert.equal(descriptors.size, 0);
+        } finally {
+          stat.mockRestore();
+          close.mockRestore();
+          open.mockRestore();
+          syncBuiltinESMExports();
+        }
+        if (fs.existsSync(held)) fs.renameSync(held, fx.competitor);
+        assert.deepEqual(fs.readFileSync(fx.competitor), before);
+      }
+  },
+);
+
+test.each(['receipt', 'catalog', 'late-receipt'] as const)(
+  'dispatch-bearing cost refuses hidden %s competition without a qualified touch',
+  async (boundary) => {
+    for (const cooperative of [false, true]) {
+      const root = directory(),
+        fx = receiptDispatchFixture(root, 'claude', 'codex');
+      vi.stubEnv('ARC_HOME', fx.home);
+      const marker = claudeDispatchTranscript(
+        'python dispatch.py --arc-dispatch',
+        `ARC_DISPATCH_SESSION={"agent":"codex","session_id":"${fx.child.sessionId}"}`,
+      )
+        .map((row) => JSON.stringify(row) + '\n')
+        .join('');
+      fs.appendFileSync(fx.parent.file, marker);
+      const foreignDirectory = path.join(fx.projects, 'foreign-project');
+      let requester = fx.grandchild;
+      if (boundary === 'catalog' || boundary === 'late-receipt') {
+        const foreign = fx.write('claude', 'eeeeeeee-1111-2222-3333-444444444444');
+        const subtree = path.join(path.dirname(foreign.file), foreign.sessionId, 'subagents');
+        fs.mkdirSync(subtree, { recursive: true });
+        const requesterFile = path.join(subtree, `agent-${requester.sessionId}.jsonl`);
+        fs.renameSync(requester.file, requesterFile);
+        fs.mkdirSync(foreignDirectory, { recursive: true });
+        fs.renameSync(foreign.file, path.join(foreignDirectory, path.basename(foreign.file)));
+        fs.renameSync(path.dirname(subtree), path.join(foreignDirectory, foreign.sessionId));
+        requester = {
+          ...requester,
+          file: path.join(foreignDirectory, foreign.sessionId, 'subagents', path.basename(requesterFile)),
+        };
+      }
+      const launch = fx.launch(requester, fx.child);
+      const options = { roots: { projects: fx.projects, codexSessions: fx.codexSessions } };
+      const report = (sourceOnly = false) =>
+        cooperative
+          ? sessionCostReportAsync(fx.parent.file, { ...options, sourceOnly })
+          : sessionCostReport(fx.parent.file, { ...options, sourceOnly });
+      assert.deepEqual((await report()).children, []);
+      const nativeFs = createRequire(__filename)('node:fs') as typeof fs;
+      const originalDirectory = nativeFs.readdirSync,
+        originalOpen = nativeFs.openSync;
+      let denied = 0,
+        startupSeen = false;
+      const target = path.join(fx.receipts.root, launch.launchId, 'startup.json');
+      const failure = Object.assign(new Error('Competing source is unavailable.'), { code: 'EACCES' });
+      const enumerate = vi.spyOn(nativeFs, 'readdirSync').mockImplementation((file, ...args) => {
+        if (boundary === 'catalog' && String(file) === foreignDirectory) {
+          denied++;
+          throw failure;
+        }
+        return Reflect.apply(originalDirectory, nativeFs, [file, ...args]);
+      });
+      const open = vi.spyOn(nativeFs, 'openSync').mockImplementation((file, ...args) => {
+        if (String(file) === target) {
+          if (boundary === 'receipt' || (boundary === 'late-receipt' && startupSeen)) {
+            denied++;
+            throw failure;
+          }
+          startupSeen = true;
+        }
+        return originalOpen(file, ...args);
+      });
+      syncBuiltinESMExports();
+      try {
+        assert.deepEqual((await report(true)).children, []);
+        assert.equal(denied, 0);
+        for (let retry = 0; retry < 2; retry++) {
+          if (cooperative) await assert.rejects(report() as Promise<unknown>, { code: 'EACCES' });
+          else assert.throws(report, { code: 'EACCES' });
+        }
+        assert.ok(denied > 0);
+        // A native-only selection has no admitted dispatch child for this uncertainty to invalidate.
+        fs.writeFileSync(fx.parent.file, fs.readFileSync(fx.parent.file, 'utf8').replace(marker, ''));
+        assert.deepEqual((await report()).children, []);
+      } finally {
+        open.mockRestore();
+        enumerate.mockRestore();
+        syncBuiltinESMExports();
+      }
+    }
+  },
+);
+
+test.each(['missing', 'non-directory', 'opening', 'later-opening'] as const)(
+  'receipt competition preserves %s storage policy with a catalog refusal',
+  async (mode) => {
+    for (const cooperative of [false, true]) {
+      const fx = competingCostFixture('claude', 'claude');
+      // The selected transcript supplies its ordinary fallback edge.
+      fs.appendFileSync(
+        fx.parent.file,
+        claudeDispatchTranscript(
+          'python dispatch.py --arc-dispatch',
+          `ARC_DISPATCH_SESSION={"agent":"${fx.child.agent}","session_id":"${fx.child.sessionId}"}`,
+        )
+          .map((row) => JSON.stringify(row) + '\n')
+          .join(''),
+      );
+      if (mode === 'missing' || mode === 'non-directory') {
+        fs.renameSync(fx.receipts.root, fx.receipts.root + '.held');
+        if (mode === 'non-directory') fs.writeFileSync(fx.receipts.root, 'unavailable');
+      }
+      const nativeFs = createRequire(__filename)('node:fs') as typeof fs;
+      const originalDirectory = nativeFs.readdirSync,
+        originalOpen = nativeFs.opendirSync;
+      const failure = Object.assign(new Error('Receipt storage is unavailable.'), { code: 'EPERM' });
+      let opened = false,
+        denied = 0,
+        catalogDenied = 0;
+      const enumerate = vi.spyOn(nativeFs, 'readdirSync').mockImplementation((file, ...args) => {
+        if (mode !== 'later-opening' && String(file) === fx.project) {
+          catalogDenied++;
+          throw Object.assign(new Error('Foreign project is unavailable.'), { code: 'EACCES' });
+        }
+        return Reflect.apply(originalDirectory, nativeFs, [file, ...args]);
+      });
+      const open = vi.spyOn(nativeFs, 'opendirSync').mockImplementation((file, ...args) => {
+        if (String(file) === fx.receipts.root) {
+          if (mode === 'opening' || (mode === 'later-opening' && opened)) {
+            denied++;
+            throw failure;
+          }
+          opened = true;
+        }
+        return Reflect.apply(originalOpen, nativeFs, [file, ...args]);
+      });
+      syncBuiltinESMExports();
+      const report = () =>
+        cooperative
+          ? sessionCostReportAsync(fx.parent.file, fx.options)
+          : sessionCostReport(fx.parent.file, fx.options);
+      try {
+        if (mode === 'later-opening') {
+          if (cooperative) await assert.rejects(report() as Promise<unknown>, { code: 'EPERM' });
+          else assert.throws(report, { code: 'EPERM' });
+        } else {
+          const result = await report();
+          assert.equal(
+            result.children.filter((child) => child.sessionId === fx.child.sessionId && child.outputTokens === 2000)
+              .length,
+            1,
+          );
+        }
+        if (mode === 'opening' || mode === 'later-opening') assert.ok(denied > 0);
+      } finally {
+        open.mockRestore();
+        enumerate.mockRestore();
+        syncBuiltinESMExports();
+      }
+      if (mode !== 'later-opening') assert.ok(catalogDenied > 0);
+    }
+  },
+);
+
+test('unrelated and source-only cost retain their boundaries with refused catalog and receipt evidence', async () => {
+  for (const cooperative of [false, true]) {
+    const fx = competingCostFixture('claude');
+    const target = fx.write('claude', 'dddddddd-1111-2222-3333-444444444444');
+    const second = fx.launch(fx.grandchild, fx.child);
+    const startup = path.join(fx.receipts.root, second.launchId, 'startup.json');
+    const nativeFs = createRequire(__filename)('node:fs') as typeof fs;
+    const originalDirectory = nativeFs.readdirSync,
+      originalOpen = nativeFs.openSync;
+    let denied = 0,
+      bodies = 0;
+    const enumerate = vi.spyOn(nativeFs, 'readdirSync').mockImplementation((file, ...args) => {
+      if (String(file) === fx.project) {
+        denied++;
+        throw Object.assign(new Error('Foreign project is unavailable.'), { code: 'EACCES' });
+      }
+      return Reflect.apply(originalDirectory, nativeFs, [file, ...args]);
+    });
+    const open = vi.spyOn(nativeFs, 'openSync').mockImplementation((file, ...args) => {
+      if (String(file) === startup) {
+        denied++;
+        throw Object.assign(new Error('Competing receipt is unavailable.'), { code: 'EPERM' });
+      }
+      if (String(file) === fx.competitor) bodies++;
+      return originalOpen(file, ...args);
+    });
+    syncBuiltinESMExports();
+    try {
+      const report = (sourceOnly: boolean) =>
+        cooperative
+          ? sessionCostReportAsync(target.file, { ...fx.options, sourceOnly })
+          : sessionCostReport(target.file, { ...fx.options, sourceOnly });
+      assert.deepEqual((await report(true)).children, []);
+      assert.equal(denied, 0);
+      assert.deepEqual((await report(false)).children, []);
+      assert.ok(denied > 0);
+      assert.equal(bodies, 0);
+    } finally {
+      open.mockRestore();
+      enumerate.mockRestore();
+      syncBuiltinESMExports();
+    }
+  }
+});
+
+test('applicable cost refuses a null cooperative catalog without cancellation', async () => {
+  const fx = competingCostFixture('codex');
+  assert.deepEqual((await sessionCostReportAsync(fx.parent.file, fx.options)).children, []);
+  const enumeration = vi.spyOn(codexReader, 'enumerateRolloutFilesAsync').mockResolvedValue(null);
+  try {
+    await assert.rejects(sessionCostReportAsync(fx.parent.file, fx.options), {
+      message: `Cannot read transcript directory: ${fx.codexSessions}`,
+    });
+    assert.ok(enumeration.mock.calls.length > 0);
+  } finally {
+    enumeration.mockRestore();
+  }
+});
+
+test.each(['claude', 'codex'] as const)('required %s bodies classify a premature-end pathname check', async (agent) => {
+  for (const cooperative of [false, true])
+    for (const code of ['ENOENT', 'ENOTDIR', 'EACCES', 'EPERM']) {
+      const fx = competingCostFixture(agent);
+      const report = () =>
+        cooperative
+          ? sessionCostReportAsync(fx.parent.file, fx.options)
+          : sessionCostReport(fx.parent.file, fx.options);
+      assert.deepEqual((await report()).children, []);
+      const nativeFs = createRequire(__filename)('node:fs') as typeof fs;
+      const originalOpen = nativeFs.openSync,
+        originalRead = nativeFs.readSync,
+        originalClose = nativeFs.closeSync,
+        originalStat = nativeFs.statSync;
+      const descriptors = new Map<number, boolean>();
+      const before = fs.readFileSync(fx.competitor),
+        held = fx.competitor + '.held';
+      let catalogOpened = false,
+        stopped = false,
+        checked = false;
+      const open = vi.spyOn(nativeFs, 'openSync').mockImplementation((file, ...args) => {
+        const fd = originalOpen(file, ...args);
+        if (String(file) === fx.competitor) {
+          descriptors.set(fd, agent === 'claude' || catalogOpened);
+          catalogOpened = true;
+        }
+        return fd;
+      });
+      const read = vi.spyOn(nativeFs, 'readSync').mockImplementation(((fd, ...args) => {
+        if (descriptors.get(fd)) {
+          if (!stopped && (code === 'ENOENT' || code === 'ENOTDIR')) fs.renameSync(fx.competitor, held);
+          stopped = true;
+          return 0;
+        }
+        return Reflect.apply(originalRead, nativeFs, [fd, ...args]);
+      }) as typeof fs.readSync);
+      const close = vi.spyOn(nativeFs, 'closeSync').mockImplementation((fd) => {
+        descriptors.delete(fd);
+        originalClose(fd);
+      });
+      const stat = vi.spyOn(nativeFs, 'statSync').mockImplementation((file, ...args) => {
+        if (stopped && String(file) === fx.competitor) {
+          checked = true;
+          throw Object.assign(new Error('Competing body pathname is unavailable.'), { code });
+        }
+        return Reflect.apply(originalStat, nativeFs, [file, ...args]);
+      });
+      syncBuiltinESMExports();
+      try {
+        if (code === 'ENOENT' || code === 'ENOTDIR') {
+          const result = await report();
+          assert.equal(
+            result.children.filter((child) => child.sessionId === fx.child.sessionId && child.outputTokens === 2000)
+              .length,
+            1,
+          );
+        } else if (cooperative) await assert.rejects(report() as Promise<unknown>, { code });
+        else assert.throws(report, { code });
+        assert.equal(stopped, true);
+        assert.equal(checked, true);
+        assert.equal(descriptors.size, 0);
+      } finally {
+        stat.mockRestore();
+        close.mockRestore();
+        read.mockRestore();
+        open.mockRestore();
+        syncBuiltinESMExports();
+      }
+      if (fs.existsSync(held)) fs.renameSync(held, fx.competitor);
+      assert.deepEqual(fs.readFileSync(fx.competitor), before);
+    }
+});
+
+test('required Codex bodies preserve their captured append target and bounded null openings', async () => {
+  for (const cooperative of [false, true]) {
+    const fx = competingCostFixture('codex');
+    const noOpening = fx.write('codex', 'dddddddd-1111-2222-3333-444444444444');
+    fs.writeFileSync(noOpening.file, JSON.stringify({ type: 'ignored', padding: 'x'.repeat(96 * 1024) }) + '\n');
+    assert.equal(codexReader.readCodexOpening(noOpening.file), null);
+    const report = () =>
+      cooperative ? sessionCostReportAsync(fx.parent.file, fx.options) : sessionCostReport(fx.parent.file, fx.options);
+    assert.deepEqual((await report()).children, []);
+    const nativeFs = createRequire(__filename)('node:fs') as typeof fs;
+    const originalOpen = nativeFs.openSync,
+      originalRead = nativeFs.readSync,
+      originalClose = nativeFs.closeSync;
+    const descriptors = new Map<number, boolean>();
+    let catalogOpened = false,
+      appended = false;
+    const open = vi.spyOn(nativeFs, 'openSync').mockImplementation((file, ...args) => {
+      const fd = originalOpen(file, ...args);
+      if (String(file) === fx.competitor) {
+        descriptors.set(fd, catalogOpened);
+        catalogOpened = true;
+      }
+      return fd;
+    });
+    const read = vi.spyOn(nativeFs, 'readSync').mockImplementation(((fd, ...args) => {
+      const count = Reflect.apply(originalRead, nativeFs, [fd, ...args]);
+      if (descriptors.get(fd) && !appended) {
+        appended = true;
+        fs.appendFileSync(fx.competitor, JSON.stringify({ type: 'ignored', padding: 'x'.repeat(96 * 1024) }) + '\n');
+      }
+      return count;
+    }) as typeof fs.readSync);
+    const close = vi.spyOn(nativeFs, 'closeSync').mockImplementation((fd) => {
+      descriptors.delete(fd);
+      originalClose(fd);
+    });
+    syncBuiltinESMExports();
+    try {
+      assert.deepEqual((await report()).children, []);
+      assert.equal(appended, true);
+      assert.equal(descriptors.size, 0);
+    } finally {
+      close.mockRestore();
+      read.mockRestore();
+      open.mockRestore();
+      syncBuiltinESMExports();
+    }
+  }
+});
+
+test('Codex body disappearance requires an absent failed pathname', async () => {
+  for (const cooperative of [false, true])
+    for (const code of ['ENOENT', 'ENOTDIR']) {
+      const fx = competingCostFixture('codex');
+      const report = () =>
+        cooperative
+          ? sessionCostReportAsync(fx.parent.file, fx.options)
+          : sessionCostReport(fx.parent.file, fx.options);
+      assert.deepEqual((await report()).children, []);
+      const nativeFs = createRequire(__filename)('node:fs') as typeof fs;
+      const originalOpen = nativeFs.openSync;
+      let catalogOpened = false,
+        denied = false;
+      const open = vi.spyOn(nativeFs, 'openSync').mockImplementation((file, ...args) => {
+        if (String(file) === fx.competitor) {
+          if (catalogOpened) {
+            denied = true;
+            throw Object.assign(new Error('Competing body is unavailable.'), { code });
+          }
+          catalogOpened = true;
+        }
+        return originalOpen(file, ...args);
+      });
+      syncBuiltinESMExports();
+      try {
+        if (cooperative) await assert.rejects(report() as Promise<unknown>, { code });
+        else assert.throws(report, { code });
+        assert.equal(denied, true);
+        assert.equal(fs.existsSync(fx.competitor), true);
+      } finally {
+        open.mockRestore();
+        syncBuiltinESMExports();
+      }
+    }
+});
+
+test('a known unrelated receipt preserves a dispatch-bearing tree with an unrelated catalog refusal', async () => {
+  for (const cooperative of [false, true]) {
+    const fx = receiptDispatchFixture(directory(), 'claude', 'claude');
+    vi.stubEnv('ARC_HOME', fx.home);
+    const unrelated = fx.write('claude', 'dddddddd-1111-2222-3333-444444444444');
+    fx.launch(fx.grandchild, unrelated);
+    fs.appendFileSync(
+      fx.parent.file,
+      claudeDispatchTranscript(
+        'python dispatch.py --arc-dispatch',
+        `ARC_DISPATCH_SESSION={"agent":"claude","session_id":"${fx.child.sessionId}"}`,
+      )
+        .map((row) => JSON.stringify(row) + '\n')
+        .join(''),
+    );
+    const foreign = path.join(fx.projects, 'foreign-project');
+    fs.mkdirSync(foreign);
+    const nativeFs = createRequire(__filename)('node:fs') as typeof fs;
+    const originalDirectory = nativeFs.readdirSync;
+    const selectedDirectory = path.join(path.dirname(fx.parent.file), fx.parent.sessionId, 'subagents');
+    let denied = 0,
+      nativeVisits = 0;
+    const enumerate = vi.spyOn(nativeFs, 'readdirSync').mockImplementation((file, ...args) => {
+      if (String(file) === foreign) {
+        denied++;
+        throw Object.assign(new Error('Foreign project is unavailable.'), { code: 'EPERM' });
+      }
+      if (String(file) === selectedDirectory) nativeVisits++;
+      return Reflect.apply(originalDirectory, nativeFs, [file, ...args]);
+    });
+    syncBuiltinESMExports();
+    try {
+      const options = { roots: { projects: fx.projects, codexSessions: fx.codexSessions } };
+      const result = cooperative
+        ? await sessionCostReportAsync(fx.parent.file, options)
+        : sessionCostReport(fx.parent.file, options);
+      assert.equal(
+        result.children.filter((child) => child.sessionId === fx.child.sessionId && child.outputTokens === 2000).length,
+        1,
+      );
+      assert.ok(denied > 0);
+      assert.equal(nativeVisits, 1);
+    } finally {
+      enumerate.mockRestore();
+      syncBuiltinESMExports();
+    }
+  }
 });
 
 afterEach(() => vi.unstubAllEnvs());

@@ -200,6 +200,7 @@ export interface DispatchRelationshipAllowance {
 }
 export interface DispatchRelationshipStep extends DispatchRelationshipAllowance {
   reference?: ClaudeDispatchSessionReference;
+  refusal?: { error: unknown } & ({ launchId: string } | { storeOpened: boolean });
 }
 type RelationshipScan<T> = Generator<DispatchRelationshipStep, T, DispatchRelationshipAllowance>;
 const emptyRelationshipStep = (): DispatchRelationshipStep => ({ entries: 0, bytes: 0, checks: 0 });
@@ -207,6 +208,7 @@ const emptyRelationshipStep = (): DispatchRelationshipStep => ({ entries: 0, byt
 // Each next call grants one filesystem operation. Zero grants preserve its position.
 class RelationshipReader {
   progress = emptyRelationshipStep();
+  refusal: { error: unknown } | null = null;
   readonly revisions = new Map<string, string | null>();
   private readonly descriptors = new Set<number>();
   constructor(
@@ -230,7 +232,13 @@ class RelationshipReader {
       allowance = yield emptyRelationshipStep();
     if (this.signal?.aborted) throw new Error('The dispatch relationship scan stopped.');
     if (kind !== 'bytes') this.progress[kind] = 1;
-    return work(allowance[kind]);
+    try {
+      return work(allowance[kind]);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException | null)?.code;
+      if (!this.signal?.aborted && code !== 'ENOENT' && code !== 'ENOTDIR') this.refusal ??= { error };
+      throw error;
+    }
   }
   *stat(file: string): RelationshipScan<fs.BigIntStats | null> {
     const stat = yield* this.operation('checks', () => {
@@ -352,7 +360,7 @@ export class DispatchReceipts {
       reader.progress = emptyRelationshipStep();
       return reference;
     } catch {
-      yield reader.progress;
+      yield { ...reader.progress, ...(reader.refusal ? { refusal: { ...reader.refusal, launchId: id } } : {}) };
       return null;
     } finally {
       reader.dispose();
@@ -393,7 +401,10 @@ export class DispatchReceipts {
       }
       yield reader.progress;
     } catch {
-      yield reader.progress;
+      yield {
+        ...reader.progress,
+        ...(reader.refusal ? { refusal: { ...reader.refusal, storeOpened: !!directory } } : {}),
+      };
     } finally {
       signal?.removeEventListener('abort', close);
       close();

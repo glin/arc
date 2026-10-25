@@ -94,6 +94,9 @@ test('performance counters correlate posts and replies for every open panel', ()
   assert.deepEqual(counters.snapshot(), {
     discovery: {
       readBytes: 0,
+      receiptEntries: 0,
+      receiptChecks: 0,
+      receiptBytes: 0,
       hits: 0,
       resets: 0,
       quanta: 0,
@@ -616,7 +619,10 @@ test('a path that cannot be written is reported, and answers with no file', asyn
 test('discovery counters sum relationship read charges across worker replies', () => {
   const counters = new PanelPerformanceCounters(1000, 'window-a');
   const charges = {
-    readBytes: 0,
+    readBytes: 5,
+    receiptEntries: 3,
+    receiptChecks: 4,
+    receiptBytes: 5,
     hits: 3,
     resets: 0,
     quanta: 0,
@@ -642,7 +648,10 @@ test('discovery counters sum relationship read charges across worker replies', (
   counters.recordDiscovery(charges, { complete: false, continuation: true });
   counters.recordDiscovery(charges, { complete: true, continuation: false });
   assert.deepEqual(counters.snapshot().discovery, {
-    readBytes: 0,
+    readBytes: 10,
+    receiptEntries: 6,
+    receiptChecks: 8,
+    receiptBytes: 10,
     hits: 6,
     resets: 0,
     quanta: 0,

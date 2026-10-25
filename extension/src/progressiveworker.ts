@@ -185,7 +185,7 @@ export interface DiscoveryCheckpoint {
 
 const DISCOVERY_ENVELOPE_VERSION = 1;
 // Bump when persisted membership or spend-source admission changes.
-const DISCOVERY_ADMISSION_VERSION = 1;
+const DISCOVERY_ADMISSION_VERSION = 2;
 
 export function discoveryCompatibility(relationshipVersion: number): string {
   return JSON.stringify([
@@ -266,12 +266,15 @@ export function validDiscoveryCheckpoint(value: unknown): value is DiscoveryChec
   );
 }
 
-// `readBytes` counts relationship scan bytes and bounds each request, so the other relationship file work has its own fields.
+// `readBytes` counts transcript and receipt relationship bytes. Receipt bytes also have a separate subtotal.
 // A parent check counts every stat of a candidate source. A file count names each file once per measured pass.
 // The dispatch visit count includes sessions whose held facts read nothing. The reread count excludes them.
 // Times are wall milliseconds.
 export interface DiscoveryCharges extends Record<import('./codex').CodexDispatchSpendProgress, number> {
   readBytes: number;
+  receiptEntries?: number;
+  receiptChecks?: number;
+  receiptBytes?: number;
   hits: number;
   resets: number;
   quanta: number;
