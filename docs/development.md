@@ -144,7 +144,7 @@ The launch passes the checkout as a positional folder argument on Windows. Do no
 
 The server binds strictly to `127.0.0.1:5173`. Stop a conflicting process before retrying. Fix syntax errors and save to recover. Check reconnects with a reopened panel and a restored tab.
 
-Development command selection follows the [bundled tools contract](installation.md#bundled-tools). Reload the Extension Development Host after CLI or extension-host source saves. `extension/esbuild.mjs` owns both watchers.
+Development command selection follows the [bundled tools contract](installation.md#bundled-tools). Reload the Extension Development Host after extension-host source saves. Watch-mode CLI commands run the rebuilt bundle on their next invocation. `extension/esbuild.mjs` owns both watchers.
 
 This workflow supports a local Windows Extension Development Host. Remote extension hosts and port-forwarded development servers are unsupported. The webview loads its loopback address on the local VS Code machine, while a remote command binds on the remote machine.
 
