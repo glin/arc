@@ -1,6 +1,6 @@
 # Questions and recovery
 
-Use this guide for live asynchronous questions, saved questions, and answers after child loss. [`questionrecovery.ts`](../extension/src/questionrecovery.ts) owns persistence. Wire adapters own current requests.
+[`questionrecovery.ts`](../extension/src/questionrecovery.ts) owns persistence. [`agenthost.ts`](../extension/src/agenthost.ts) joins saved and live questions. [`questionrecords.ts`](../extension/src/questionrecords.ts) reads answer evidence independently of ordinary transcript cursors.
 
 ## Recovery and delivery
 
@@ -16,7 +16,7 @@ Persist recovered attempts before provider input. Confirmed acceptance settles d
 
 ## Codex asynchronous questions
 
-`delivery: async` identifies messages returned without ending the model's turn, including items with `phase: final_answer`. Exclude them from response text and turn outcomes. At least one titled `questions` entry creates an ask and completes the streamed Activity row. Without titled questions, create one Activity row. Retain that row while the turn's live Activity remains.
+`delivery: async` identifies messages returned without ending the model's turn, including items with `phase: final_answer`. Exclude them from response text and turn outcomes. Only titled `questions` entries create asks. [`codexwire.ts`](../extension/src/codexwire.ts) owns Activity projection.
 
 Question IDs are JSON text of `["request_user_input_async", itemId, index]`. Keep original indexes when answering only part of an ask. Async questions survive turn completion because no server request waits for their answer. [`codexreply.ts`](../extension/src/codexreply.ts) owns the reply envelope:
 
@@ -30,7 +30,7 @@ Each answer joins picked labels and written text with commas. Send through `turn
 
 A new thread closes earlier-thread questions. Dismissal sends nothing. An envelope-only user message answers named questions, including replies from another client. Close an ask only when all its questions settle. Surrounding text makes a message ordinary prompt text.
 
-Saved async items use `event_msg` / `item_completed` with `AgentMessage`, `delivery: "async"`, `phase: "final_answer"`, and `questions`. The adjacent `function_call` is not a repeated response. No `response_item` repeats the text, and `task_complete.last_agent_message` excludes it. `codex.ts` projects the item as Activity under its item ID. Envelope-only user records display question/answer text in prompts, later prompts, and titles.
+Saved async items use `event_msg` / `item_completed` with `AgentMessage`, `delivery: "async"`, `phase: "final_answer"`, and `questions`. The adjacent `function_call` is not a repeated response. No `response_item` repeats the text, and `task_complete.last_agent_message` excludes it. [`codex.ts`](../extension/src/codex.ts) owns saved-item projection.
 
 ## Synchronous questions
 
@@ -40,12 +40,12 @@ Codex questions carry `isSecret` and `isOther`. Read `isSecret` to hide secret a
 
 ## Question recovery contracts
 
-Store captured payloads, dispositions, settled identity barriers, and activation leases beneath the workspace partition. Claims stay exclusive across windows. Unresolved and unknown entries never enter age or history eviction. Separate evidence cursors from ordinary transcript reads.
+Store captured payloads, dispositions, settled identity barriers, and activation leases beneath the workspace partition. Claims stay exclusive across windows. Unresolved and unknown entries never enter age or history eviction.
 
-Each waiting publication checks ownership once and indexes captured tool identities. Reuse provider/exact-raw-session source lookups, including misses, only within one synchronous publication. Resolve them again for later publications and answer-time checks. Keep store snapshots and ownership checks independent of this reuse.
+Source-lookup reuse lasts only for one synchronous waiting publication. [`extension.ts`](../extension/src/extension.ts) owns that cache. Later publications and answer-time checks resolve sources again. Store snapshots and ownership checks remain independent.
 
 Identified Claude context replies have a 2 MiB frame limit and five-second deadline. Check complete reordered envelopes before parsing. Framing buffers and unrelated stdout remain unbounded.
 
-Question Markdown preparation caps combined request text at 64 KiB before parsing. Larger requests retain complete escaped text. Its process-local cache retains at most 16 entries and 1 MiB of keys and rendered content. Keep answer identity outside that cache.
+Question Markdown preparation caps combined request text at 64 KiB before parsing. Larger requests retain complete escaped text. [`composerview.ts`](../extension/src/composerview.ts) owns rendering and its cache. Keep answer identity outside that cache.
 
 Use `agenthost.test.ts` for saved identity, leases, unknown delivery, secrets, and reset closure. Use `codexwire.test.ts` and `codex.test.ts` for async wire and disk behavior.
