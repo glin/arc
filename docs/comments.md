@@ -1,6 +1,6 @@
 # Turn comments
 
-Use this guide when changing comment storage, text anchoring, editing, or prompt delivery. [`timeline.md`](timeline.md) owns turn identity and rendering.
+Use this guide when changing comment storage, text anchoring, editing, or prompt delivery. [Timeline](timeline.md) owns turn identity. [Turn cards](turn-cards.md) owns rendering.
 
 ## Data model
 

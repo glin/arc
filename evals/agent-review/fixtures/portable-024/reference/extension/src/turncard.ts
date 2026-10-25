@@ -1283,7 +1283,7 @@ function agentDisplay(
   // cost, the commits, the paths and the token totals belong to the figures that total them,
   // so the row repeats no block a figure already answers for. The duration figure's record
   // splits the calls by tool name and draws no total, so this count is the only one. The count's
-  // source depends on the row kind. docs/timeline.md names each source in the subagent
+  // source depends on the row kind. docs/turn-cards.md names each source in the subagent
   // row's hover paragraph, which also says why a running child's hint keeps the time it has
   // run for.
   const figures = [open ? time : null, tools].filter(Boolean).join(' · ');

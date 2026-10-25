@@ -301,7 +301,7 @@ export const STATUS_TONES = ['ok', 'bad', 'warn', 'busy', 'need'] as const;
 
 /* Collects tones directly used by session list status selectors. `STATUS_TONES` must include them.
    This scan does not follow custom-property aliases. For example, assigning `--busy: var(--paused)` still reports `busy`.
-   `docs/timeline.md` excludes status-color aliases for this reason. */
+   `docs/turn-cards.md` excludes status-color aliases for this reason. */
 export function statusSelectorTones(styleSource: string): string[] {
   const usages = toneUsages(styleSource);
   return Object.keys(usages)

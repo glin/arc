@@ -1,6 +1,6 @@
 # Data sources
 
-Use this catalog for source locations, provenance, and storage ownership. [Timeline](timeline.md) owns parsing and derived facts. [Window channel](window-channel.md) owns local cross-process contracts.
+Use this catalog for source locations, provenance, and storage ownership. [Timeline](timeline.md) owns the shared turn model. [Session history](session-history.md) owns derived caches. [Window channel](window-channel.md) owns local cross-process contracts.
 
 ## Source catalog
 

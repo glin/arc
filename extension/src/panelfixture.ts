@@ -399,7 +399,7 @@ export const COMPACTION_SUMMARY = `# Delivery state
 
 - Keep the card collapsed until the reader opens it.
 - Preserve the existing \`What carried over\` section title.
-- [Read the timeline guide](docs/timeline.md) before changing the browser fixture.
+- [Read the turn card guide](docs/turn-cards.md) before changing the browser fixture.
 
 ## Completed work
 
@@ -1079,7 +1079,7 @@ export const SIX_QUESTION_ASK: QuestionAsk = {
       multiSelect: false,
       secret: false,
       options: [
-        { label: 'timeline.md', description: 'The document that owns card rendering.' },
+        { label: 'turn-cards.md', description: 'The document that owns card rendering.' },
         { label: 'None', description: 'The stylesheet comment carries it.' },
       ],
     },
