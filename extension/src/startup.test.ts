@@ -74,6 +74,7 @@ import {
 } from './codex';
 import { CodexOpeningsWriter, loadCodexOpenings } from './codexopenings';
 import { tempDir } from './temproot.ts';
+import { claudeBackgroundHint, claudeBackgroundTranscript } from './agenthost';
 import { buildSync, transformSync } from 'esbuild';
 import { messageByteBudget, PanelPerformanceCounters, serializedMessageBytes } from './performancediagnostics';
 import { SessionLoadingLine } from './sessionloadingline';
@@ -14888,6 +14889,7 @@ function agentMessageHost(agent: 'claude' | 'codex') {
   const names = [
     'sendAgentMessage',
     'queueAgentMessage',
+    'backgroundRefusal',
     'flushAgentMessage',
     'recoverAgentMessage',
     'flushQueue',
@@ -14940,6 +14942,8 @@ function agentMessageHost(agent: 'claude' | 'codex') {
     commentsForQueuedSubmission,
     queueWithout: (entries: any[], id: string) => entries.filter((one) => one.id !== id),
     queueAfterClearRecovery: (_agent: string, entries: any[]) => entries,
+    claudeBackgroundHint,
+    claudeBackgroundTranscript,
   };
   const compiled = transformSync(`class Host { ${body} }; return Host`, { loader: 'ts', format: 'cjs' }).code;
   const Host = new Function(...Object.keys(scope), compiled)(...Object.values(scope));
@@ -15015,6 +15019,7 @@ function agentMessageHost(agent: 'claude' | 'codex') {
     draftCommentIds: {},
     queuedEditOffers: new Map(),
     panelSession: (session: string) => session,
+    questionSource: () => null,
     holdDraft: (session: string, text: string) => {
       host.drafts[session] = text;
     },
@@ -15266,6 +15271,76 @@ for (const agent of ['claude', 'codex'] as const) {
       socket.destroy();
       await channel.dispose();
     }
+  });
+  test(`${agent} arc send and its queue name the recovery commands as a condition only for a Claude background transcript`, async () => {
+    const f = agentMessageHost(agent);
+    const home = tempDir('background-send-');
+    const background = path.join(home, 'background.jsonl');
+    const ordinary = path.join(home, 'ordinary.jsonl');
+    const record = { type: 'system', subtype: 'informational', sessionId: 'target' };
+    fs.writeFileSync(background, JSON.stringify({ ...record, sessionKind: 'bg' }) + '\n');
+    fs.writeFileSync(ordinary, JSON.stringify(record) + '\n');
+    const { WindowChannel } = await import('./sessionrequests.ts');
+    const { runManagement } = await import('../../cli/src/manage.ts');
+    const channel = new WindowChannel(home);
+    // `activate` passes no binding when the target has no Arc child.
+    channel.setGuardedSendHandler((incoming) => f.host.sendAgentMessage(incoming, null));
+    await channel.update({ folders: [home], scopeReady: true, panelReady: true, panelVisible: true });
+    const prompt = path.join(home, 'message.txt');
+    fs.writeFileSync(prompt, f.text);
+    const names = ['ARC_HOME', 'CLAUDE_CODE_SESSION_ID', 'CODEX_THREAD_ID'];
+    const prior = names.map((name) => process.env[name]);
+    let requests = 0;
+    const reasons = async (transcript: string) => {
+      f.host.questionSource = (which: string, session: string) =>
+        which === agent && session === 'target' ? transcript : null;
+      const said: string[] = [];
+      for (const queue of [[], ['--queue']]) {
+        const reply = JSON.parse(
+          await runManagement('send', [
+            'target',
+            '--prompt-file',
+            prompt,
+            ...queue,
+            '--request-id',
+            `${channel.hostId}:background-${requests++}`,
+            '--window',
+            channel.hostId,
+            '--json',
+          ]),
+        );
+        assert.equal(reply.status, 'refused');
+        said.push(reply.reason);
+      }
+      return said;
+    };
+    const unavailable = 'The destination session is unavailable.';
+    const hint =
+      'If Claude Code runs this session in the background, claude attach target opens it in a terminal, ' +
+      'and claude stop target lets Arc continue it.';
+    try {
+      process.env.ARC_HOME = home;
+      process.env.CLAUDE_CODE_SESSION_ID = 'reader-agent';
+      delete process.env.CODEX_THREAD_ID;
+      assert.deepEqual(
+        await reasons(background),
+        agent === 'claude'
+          ? [`${unavailable} ${hint} No message was sent.`, `${unavailable} ${hint} No message was queued.`]
+          : [`${unavailable} No message was sent.`, `${unavailable} No message was queued.`],
+      );
+      assert.deepEqual(await reasons(ordinary), [
+        `${unavailable} No message was sent.`,
+        `${unavailable} No message was queued.`,
+      ]);
+    } finally {
+      names.forEach((name, index) => {
+        if (prior[index] === undefined) delete process.env[name];
+        else process.env[name] = prior[index];
+      });
+      await channel.dispose();
+    }
+    assert.deepEqual(f.reads, []);
+    assert.equal(f.host.queues.target, undefined);
   });
   test(`${agent} blocks unknown ordinary delivery without queue fallback`, async () => {
     const f = agentMessageHost(agent);

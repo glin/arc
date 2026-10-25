@@ -13,7 +13,7 @@ import { CONTEXT_FRAME_BYTES, CONTEXT_PREFIX_BYTES, type ContextFrameGate } from
 // A live child serves successive turns until retirement, shutdown, or a session reset.
 
 import { spawn as nodeSpawn } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { readFileSync, statSync } from 'node:fs';
 import { join, type PlatformPath } from 'node:path';
 import { createHash } from 'node:crypto';
 import { defaultsKey } from './configwatch';
@@ -63,11 +63,13 @@ import { confirmClaudeRename, InitialNameCancelled } from './sessionrename';
 import {
   readCustomTitleSidecar,
   readInitialCustomTitle,
+  readCompleteLines,
   ClaudeBackgroundWork,
   type BackgroundCommand,
 } from './transcript';
 import { ARC_IDENTITY } from './identity';
 import { sessionHookEnvironment, sessionHookRuntime } from './bundledtools';
+import { sentence } from './sessionwrites';
 import { QuestionRecovery, questionIdentity, type RecoveredQuestion } from './questionrecovery';
 import {
   admitClaudeSessionComponents,
@@ -929,6 +931,58 @@ export class LineReader {
 // The opening-exchange deadline. A cold CLI reads settings, plugins, and memory files before it answers.
 export const OPENING_DEADLINE_MS = 60_000;
 
+// Whether a Claude transcript records `sessionKind: 'bg'` on a top-level record. Claude Code
+// writes it on the first records of a session its background host runs, and not on every
+// record. The read covers only the first BACKGROUND_MARK_BYTES, so a refusal never scans a
+// long transcript whole. It parses only the lines that name the field.
+const BACKGROUND_MARK_BYTES = 1024 * 1024;
+export function claudeBackgroundTranscript(file: string | null): boolean {
+  if (!file) return false;
+  let size: number;
+  try {
+    size = Math.min(statSync(file).size, BACKGROUND_MARK_BYTES);
+  } catch {
+    return false;
+  }
+  let found = false;
+  readCompleteLines(file, 0, size, (text) => {
+    for (const line of text.split('\n')) {
+      if (!line.includes('"sessionKind"')) continue;
+      try {
+        if ((JSON.parse(line) as { sessionKind?: unknown } | null)?.sessionKind === 'bg') return (found = true);
+      } catch {
+        // Not a whole record.
+      }
+    }
+    return false;
+  });
+  return found;
+}
+
+// What Claude Code writes on stderr when its background host holds the session a second process resumes.
+const CLAUDE_BACKGROUND_HELD = /\bsession is running in the background\b/i;
+
+// The refusal for a Claude session that Claude Code runs in the background now. Its background
+// commands take the 8-character short id that `claude --bg` prints.
+export function claudeBackgroundRefusal(sessionId: string): string {
+  const id = sessionId.slice(0, 8);
+  return (
+    'Claude Code runs this session in the background, so Arc cannot reach it. ' +
+    `To type to it, run claude attach ${id} in a terminal. ` +
+    `To continue it in Arc, run claude stop ${id}.`
+  );
+}
+
+// The recovery for a Claude session whose transcript records background mode. The transcript
+// keeps that record after `claude stop`, so the commands stay conditional.
+export function claudeBackgroundHint(sessionId: string): string {
+  const id = sessionId.slice(0, 8);
+  return (
+    `If Claude Code runs this session in the background, claude attach ${id} opens it in a terminal, ` +
+    `and claude stop ${id} lets Arc continue it.`
+  );
+}
+
 // How long a child being let go has to end on its own before termination is requested.
 // This gives the CLI time to write its settings before a replacement waits for confirmed exit.
 export const EXIT_GRACE_MS = 2_000;
@@ -1036,6 +1090,8 @@ export class AgentSession {
   private childTerminated = false;
   private disposePromise: Promise<void> | null = null;
   private stderrTail = '';
+  // The code of a child that exited with one before Arc ended it, for an operation the exit cut off.
+  private exitCode: number | null = null;
 
   constructor(
     key: string,
@@ -1084,6 +1140,7 @@ export class AgentSession {
       this.childTerminated = true;
       out.flush();
       const how = signal ? `signal ${signal}` : `code ${code}`;
+      if (!signal && !this.exited) this.exitCode = code;
       this.finish(code === 0 || signal ? null : `the agent stopped with ${how}. ${this.stderrTail.trim()}`.trim());
     });
     // A failed spawn emits `error` then `close`, without `exit`.
@@ -1091,6 +1148,14 @@ export class AgentSession {
     this.child.on('close', () => {
       this.childTerminated = true;
     });
+  }
+
+  // How the child exited, with what it wrote on stderr, when it exited with a code before Arc
+  // ended it. Null otherwise. Built when asked, because stderr can arrive after the exit event.
+  closedDetail(): string | null {
+    if (this.exitCode === null) return null;
+    const said = this.stderrTail.trim().replace(/\s+/g, ' ');
+    return said ? `It exited with code ${this.exitCode}: ${said}` : `It exited with code ${this.exitCode}.`;
   }
 
   state(): SessionState {
@@ -3525,12 +3590,32 @@ export class AgentHost {
       }
       const result = await this.withActivity(session.key, work);
       if (result === null) {
-        throw new Error('the agent session closed before the operation started');
+        throw new Error(this.closedReason(session));
       }
       return result;
     } finally {
       this.releaseOpening(key, session);
     }
+  }
+
+  // Why a child closed before the operation that opened it. Claude's own stderr says when its
+  // background host holds the session now. A transcript that records background mode only
+  // adds the recovery as a condition, because that record outlives `claude stop`.
+  private closedReason(session: AgentSession): string {
+    const state = session.state();
+    const detail = session.closedDetail();
+    const name = session.agent === 'claude' ? 'Claude Code' : 'Codex';
+    // A child that did not exit with a code of its own keeps the error Arc recorded, such as
+    // an opening that missed its deadline.
+    const cause =
+      detail === null && state.lastError
+        ? sentence(state.lastError)
+        : `${name} closed the session before Arc could reach it.${detail ? ` ${detail}` : ''}`;
+    if (session.agent !== 'claude' || !state.exited || !state.sessionId) return cause;
+    if (detail && CLAUDE_BACKGROUND_HELD.test(detail)) return claudeBackgroundRefusal(state.sessionId);
+    return claudeBackgroundTranscript(this.options.recoverySource?.('claude', state.sessionId) ?? null)
+      ? `${sentence(cause)} ${claudeBackgroundHint(state.sessionId)}`
+      : cause;
   }
 
   // Marks the housekeeping batch for the latest turn before either control read starts.

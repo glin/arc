@@ -278,6 +278,7 @@ import {
   visitPlace,
 } from './turnplaces';
 import type { DraftOrigin } from './composerview';
+import { claudeBackgroundHint, claudeBackgroundTranscript } from './agenthost';
 import { ClaudeChildWorkCache, liveTimelineChildren, outcomesFor, timelineRailState } from './timelinestate';
 import { ChildCacheExpiryAttribution, type ChildExpiryCost } from './childcacheexpiry';
 import {
@@ -6254,7 +6255,11 @@ export class PanelProvider implements vscode.Disposable {
     const requester = requesterOf(request);
     if (!requester || requester.id === session || guardedPromptRefusal(text))
       return refuse('Supply a message from another native session.');
-    if (!binding?.current()) return refuse('The destination session is unavailable. No message was sent.');
+    if (!binding?.current())
+      return refuse(
+        this.backgroundRefusal(session, 'No message was sent.') ??
+          'The destination session is unavailable. No message was sent.',
+      );
     const release = binding.reserve?.();
     if (binding.reserve && !release) return refuse('Another message is still being delivered. No message was sent.');
     const check = () => {
@@ -6336,6 +6341,15 @@ export class PanelProvider implements vscode.Disposable {
     }
   }
 
+  // The refusal for a session without an Arc child whose Claude transcript records background
+  // mode. Arc cannot open a child for a session while Claude Code's background host runs it.
+  // Arc holds no current fact about that host here, so the recovery stays conditional.
+  private backgroundRefusal(session: string, outcome: string): string | null {
+    return claudeBackgroundTranscript(this.questionSource('claude', session))
+      ? `The destination session is unavailable. ${claudeBackgroundHint(session)} ${outcome}`
+      : null;
+  }
+
   public async queueAgentMessage(
     request: AttributedRequest,
     binding: AgentMessageBinding | null,
@@ -6372,7 +6386,10 @@ export class PanelProvider implements vscode.Disposable {
       binding.agent !== state.agent ||
       binding.sessionId !== session
     )
-      return refuse('The destination session is unavailable. No message was queued.');
+      return refuse(
+        (!binding?.current() && this.backgroundRefusal(session, 'No message was queued.')) ||
+          'The destination session is unavailable. No message was queued.',
+      );
     const blocked = binding.refusal();
     if (blocked) return refuse(blocked);
     const id = crypto.randomUUID();

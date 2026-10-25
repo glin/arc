@@ -36,8 +36,8 @@
   },
   "extension/src/agenthost.test.ts": {
     "reason": "A spawned agent must receive the activation window, editor executable, and command search path. Self-compaction crosses native background settlement, response retention for provider turns, and workspace scope recovery. Initial naming must recheck ownership after host waits and serialize after reader renames. Native session skill admission must run before every live and idle construction and refuse actual policy without replacement or input. Live question recovery must block uncertain native writes. Remote Control results must follow a Claude clear, and an exited or retired child must take its connection with it. Independent session hooks must retain the selected environment and bypass neither personal skills nor native hook policy.",
-    "cases": 317,
-    "matricesSha256": "285969c4891e6a54bdd4b7a429527e9261e32fcd776dab447b24529f14d003bd"
+    "cases": 321,
+    "matricesSha256": "4f25c542d329f02be5898bd76e0125f19215544cf274c353c7bf8dc07ce241cd"
   },
   "extension/src/chrome.browser.test.ts": {
     "reason": "Panel controls must preserve native focus, keyboard handling, and browser event delivery.",
@@ -191,8 +191,8 @@
   },
   "extension/src/startup.test.ts": {
     "reason": "Real title workers must publish recovered metadata through startup ownership and cancellation boundaries. Project cost snapshots must preserve workspace, revision, and calendar ownership during background slices. Agent messages must preserve durable admission, settlement wakeups, native delivery authority, and retained retries. Host integrity checks must preserve complete cost, discovery membership, exact revisions, and bounded coverage across failures and panel lifecycle changes. Ordinary corrections must cross CLI parsing and the authenticated channel before busy target work finishes, preserving native receipts, reservations, and final admission. Pending ordinary receipts retain target exclusion across caller disconnect and wake eligible queued heads only after settlement. Startup measurements must accept baselines that already block agents. A discovery progress reply before an accepted catalog must keep the walked rows for the next reuse.",
-    "cases": 253,
-    "matricesSha256": "48667700e3b6500c118990836670d0fcce0cc8cc5d8d5de4fb7c085f35d40e0b"
+    "cases": 254,
+    "matricesSha256": "1311f18d1f48e1e3fccdff260a29d488d855b74fff1b28851c2f7fd40fd9e797"
   },
   "extension/src/store.test.ts": {
     "reason": "The real Stop hook must renew retention for useful snapshot stores without changing workspace files.",

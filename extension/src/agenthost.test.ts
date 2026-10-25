@@ -49,6 +49,7 @@ import {
   spawnCli,
   unstartable,
   withDeadline,
+  OPENING_DEADLINE_MS,
   existingHostKey,
   freshHostKey,
   retireDraftProfile,
@@ -1288,6 +1289,7 @@ function fakeHost(
     onEvent?: (event: SessionEvent) => void;
     onNativeObservation?: import('./agenthost').HostOptions['onNativeObservation'];
     onStateChange?: (state: SessionState) => void;
+    recoverySource?: import('./agenthost').HostOptions['recoverySource'];
   } = {},
 ): {
   host: AgentHost;
@@ -1311,6 +1313,7 @@ function fakeHost(
     idleDurationMs: lifecycle.idleDurationMs ?? 60_000,
     timer: lifecycle.timer,
     exitGraceMs: lifecycle.exitGraceMs,
+    recoverySource: lifecycle.recoverySource,
     spawner: (_command, args, _cwd, env) => {
       commands.push(args);
       envs.push(env);
@@ -3617,6 +3620,125 @@ test('a child that dies badly leaves its reason on the session', async () => {
   assert.equal(state.exited, true);
   assert.match(state.lastError ?? '', /code 1/);
   assert.match(state.lastError ?? '', /Not logged in/, 'the CLI said why on stderr, so the panel says it too');
+});
+
+// Claude Code's own refusal when its background host holds the session Arc resumes.
+const BACKGROUND_HELD =
+  'Error: That session is running in the background (5c85f5b0). Run `claude attach 5c85f5b0` to open it, ' +
+  'or `claude stop 5c85f5b0` first to resume it here. Add --fork-session to branch off a copy instead.\n';
+const BACKGROUND_SESSION = '5c85f5b0-393d-410b-abd6-cbb829d71214';
+const BACKGROUND_HINT =
+  'If Claude Code runs this session in the background, claude attach 5c85f5b0 opens it in a terminal, ' +
+  'and claude stop 5c85f5b0 lets Arc continue it.';
+
+// A prompt box send to a session whose child exits with code 1 before its opening exchange answers.
+async function promptToClosingChild(
+  records: Record<string, unknown>[] | null,
+  stderr: string,
+): Promise<{ message: string; reads: number }> {
+  let transcript: string | null = null;
+  if (records) {
+    transcript = path.join(tempDir('closed-before-send-'), `${BACKGROUND_SESSION}.jsonl`);
+    fs.writeFileSync(transcript, records.map((record) => JSON.stringify(record) + '\n').join(''));
+  }
+  let reads = 0;
+  const { host, children } = fakeHost(undefined, undefined, {
+    recoverySource: (agent, sessionId) => {
+      reads++;
+      return agent === 'claude' && sessionId === BACKGROUND_SESSION ? transcript : null;
+    },
+  });
+  const sending = host.withSessionActivity(
+    'one',
+    claudePlan(CLAUDE, { cwd: WS, resume: BACKGROUND_SESSION }),
+    (session) => session.prompt('continue'),
+  );
+  await vi.waitFor(() => assert.equal(children.length, 1));
+  children[0].complain(stderr);
+  children[0].exit(1);
+  const error = await sending.then(
+    () => assert.fail('the send resolved after its child closed'),
+    (error: unknown) => error,
+  );
+  return { message: (error as Error).message, reads };
+}
+
+const STARTED = { type: 'user', sessionId: BACKGROUND_SESSION, message: { role: 'user', content: 'start' } };
+const BACKGROUND_RECORD = {
+  type: 'system',
+  subtype: 'informational',
+  sessionKind: 'bg',
+  sessionId: BACKGROUND_SESSION,
+};
+
+test('a send to a session Claude Code runs in the background names the commands that recover it', async () => {
+  assert.deepEqual(await promptToClosingChild(null, BACKGROUND_HELD), {
+    message:
+      'Claude Code runs this session in the background, so Arc cannot reach it. ' +
+      'To type to it, run claude attach 5c85f5b0 in a terminal. ' +
+      'To continue it in Arc, run claude stop 5c85f5b0.',
+    reads: 0,
+  });
+});
+
+test('a send to a session whose transcript records background mode keeps the exit and names the commands as a condition', async () => {
+  const { message } = await promptToClosingChild([STARTED, BACKGROUND_RECORD], 'Error: Not logged in\n');
+  assert.equal(
+    message,
+    `Claude Code closed the session before Arc could reach it. It exited with code 1: Error: Not logged in. ${BACKGROUND_HINT}`,
+  );
+  // The prompt box notice reads the transcript the panel catalog finds.
+  const activate = declarationSource(fs.readFileSync(path.join(__dirname, 'extension.ts'), 'utf8'), 'activate');
+  sourceMatch(
+    statementFrom(activate, activate.indexOf('const host = new AgentHost(')),
+    /recoverySource: \(agent, session\) => panel\.questionSource\(agent, session\),/,
+  );
+});
+
+test('a send to a session whose child closes for another reason names the exit and what Claude Code said', async () => {
+  // A tool input that carries the field, and a top-level record past the bounded head, are not background mode.
+  const nested = {
+    type: 'assistant',
+    sessionId: BACKGROUND_SESSION,
+    message: {
+      role: 'assistant',
+      content: [{ type: 'tool_use', id: 't1', name: 'Bash', input: { sessionKind: 'bg' } }],
+    },
+  };
+  const filler = {
+    type: 'user',
+    sessionId: BACKGROUND_SESSION,
+    message: { role: 'user', content: 'x'.repeat(1024 * 1024) },
+  };
+  const { message } = await promptToClosingChild(
+    [STARTED, nested, filler, BACKGROUND_RECORD],
+    'Error: Not logged in\n',
+  );
+  assert.equal(
+    message,
+    'Claude Code closed the session before Arc could reach it. It exited with code 1: Error: Not logged in',
+  );
+});
+
+test('a send whose opening never answers says that the opening failed', async () => {
+  vi.useFakeTimers();
+  try {
+    const { host, children } = fakeHost();
+    const sending = host
+      .withSessionActivity('one', claudePlan(CLAUDE, { cwd: WS, resume: BACKGROUND_SESSION }), (session) =>
+        session.prompt('continue'),
+      )
+      .then(
+        () => assert.fail('the send resolved after its opening failed'),
+        (error: unknown) => (error as Error).message,
+      );
+    await vi.advanceTimersByTimeAsync(OPENING_DEADLINE_MS);
+    assert.equal(children.length, 1);
+    // Arc ends the child, so the reason is the opening's own and not an exit Claude Code chose.
+    assert.equal(await sending, 'The agent could not finish opening the session: the agent did not answer.');
+  } finally {
+    vi.useRealTimers();
+  }
 });
 
 test('a child that exits cleanly is not reported as an error', async () => {

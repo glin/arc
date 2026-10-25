@@ -144,6 +144,8 @@ Child exit removes local confirmation authority and the deferred transition, pre
 
 Both adapters recognize interruption before classifying provider failure records. A nonzero command exit is failed activity, without necessarily failing its turn. Preserve Codex causes supplied as strings, message objects, or turn errors. Launch, handshake, control, and prompt deadlines remain separate so failures identify the relevant action.
 
+Claude Code's background host runs each `claude --bg` session. A second Claude process that resumes one of those sessions exits with code 1 before it answers the opening exchange. Its stderr says that the session is running in the background. Arc therefore cannot open its own child for such a session. When Arc's Claude child closes before the operation that opened it, `AgentHost.withSessionActivity` names `claude attach` and `claude stop` if that stderr says so. Otherwise it reads the first 1 MiB of the session's transcript through the `recoverySource` port. A top-level `sessionKind: 'bg'` record there adds the same commands as a condition. `PanelProvider.sendAgentMessage` and `PanelProvider.queueAgentMessage` add the conditional commands to their refusal when such a session has no Arc child. The commands take the 8-character short id that `claude --bg` prints, and `claude stop` refuses the full session id. A session stopped with `claude stop` keeps `sessionKind: 'bg'` in its transcript, so that record alone does not show that the background host holds the session.
+
 ## Verification
 
 Use `claudewire.test.ts` and `codexwire.test.ts` for translation, and `agenthost.test.ts` for child ownership and races. Use `transcript.test.ts` and `codex.test.ts` for disk interpretation.
