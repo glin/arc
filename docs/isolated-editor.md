@@ -20,7 +20,7 @@ export default async ({ createDraft }) => {
 };
 ```
 
-The last output line is one JSON object. Its fields are `ok`, `run`, `mainPid`, `value`, `screenshot`, `errors`, and `cleanup`. Exit 0 requires successful execution and cleanup. Failed runs still write requested screenshots when a window exists.
+The last output line is one JSON object. `runCommand` in `scripts/isolated-editor.mjs` owns its fields. Exit 0 requires successful execution and cleanup. Failed runs still attempt requested screenshots when a window exists.
 
 | Option | Effect |
 | --- | --- |
@@ -34,7 +34,7 @@ The last output line is one JSON object. Its fields are `ok`, `run`, `mainPid`, 
 | `--live-data` | Keeps the owner's transcript roots and lets Arc start agents |
 | `--allow-focus` | Keeps the editor's own window focus behavior |
 
-Each run owns an isolated profile, extensions, Arc home, transcript roots, and workspace. Its run and sibling evidence directory stay at the pinned scratch location. Installed candidates retain separate `vsix-install.json` and `probe-vsix-install.json` receipts, copied archives, digests, registration manifests, editor logs, and `run.json`. Cleanup preserves those artifacts in the sibling evidence directory and reports their hashes. Failed retention keeps the run. Probe packaging and evidence retention refuse linked source or destination ancestors, including temporary aliases. Supply physical paths. Profile settings disable trust, telemetry, updates, startup editor, and AI prompts.
+Each run owns an isolated profile, extensions, Arc home, transcript roots, and workspace. Its run and sibling evidence directory stay at the pinned scratch location. `retainRunEvidence` in `scripts/isolated-editor.mjs` owns candidate receipts and retained artifacts. Failed retention keeps the run. Probe packaging and evidence retention refuse linked source or destination ancestors, including temporary aliases. Supply physical paths. `PROFILE_SETTINGS` in that file owns first-run suppression.
 
 macOS creates default runs under `/private/tmp/arc-ie-<uid>`, with the user ID in hexadecimal. Default creation and automatic cleanup discovery refuse links, linked ancestors, foreign owners, and modes other than `0700` at that location. Run identifiers use twelve random hexadecimal characters on macOS and a UUID on Windows and Linux. The complete macOS profile socket path must fit within 103 UTF-8 bytes, including its filename. An oversized explicit scratch path stops before the run directory or editor starts. Windows and Linux default to the system temporary directory. Without `--scratch`, macOS cleanup searches both its private default and the system temporary directory. Explicit scratch selection searches only the selected directory.
 
@@ -62,9 +62,9 @@ node scripts/isolated-editor.mjs restore --baseline-commit <revision>
 
 The command exports the baseline revision into its run, links this checkout's dependencies, and builds there. It excludes `evals`, `docs`, and agent folders. Use `--baseline <checkout>` for an existing build, including baselines needing different dependencies. Baselines must open Arc at activation through `ARC_MEASURE_BLOCK_AGENTS` and `ARC_MEASURE_STATE`.
 
-The command starts the editor with the baseline build and waits for the panel. It then closes that editor and waits until no process of the profile remains, so VS Code saves the tab. It starts a second editor on the same profile, extensions directory, and workspace with the checkout under test. The second editor gets no `ARC_MEASURE_STATE`, so Arc opens no panel of its own at activation. A panel that is already open would hide a restored tab with stale options, because Arc disposes that tab with no replacement. Agents stay blocked.
+The baseline editor must close and settle before the candidate reuses its profile, extensions directory, and workspace. This lets VS Code save the tab. The candidate gets no `ARC_MEASURE_STATE`, so Arc opens no panel of its own at activation. An already-open panel would hide a stale restored tab because Arc disposes that tab without replacement. Agents stay blocked. `restoreWork` in `scripts/isolated-editor.mjs` owns the sequence.
 
-The second editor must log `panelAdopted` with origin `serializer` or `serializer-replaced`. The restored panel must retain typed prompt text after New session and Create draft. The command enables `arc.diagnostics.log`. Its JSON `value` reports baseline, adopted origin, and log path. It accepts `--timeout`, `--repository`, `--editor`, `--workspace`, `--scratch`, `--screenshot`, and `--allow-focus`. It holds the browser lane lock across both editors and uses normal run cleanup. The baseline export goes with the run. Owner-window restoration remains an owner check.
+The candidate must log `panelAdopted` with origin `serializer` or `serializer-replaced` and retain prompt text after draft creation. The command enables `arc.diagnostics.log`. `checkRestoredPanel` and `parseArguments` in the driver own assertions and accepted options. It holds the browser lane lock across both editors and uses normal run cleanup. The baseline export goes with the run. Owner-window restoration remains an owner check.
 
 The owner opens a window for manual testing with this command from the repository root:
 
@@ -72,4 +72,4 @@ The owner opens a window for manual testing with this command from the repositor
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\launch-isolated-extension.ps1 -Repository .
 ```
 
-The script builds Arc and opens this checkout through `scripts/isolated-editor.mjs open`. That command allows focus, takes no lock, and sets no time limit. It returns when the window closes, and it removes the run directory then. A failed launch gets the same cleanup. The last line of output is one JSON object with `ok`, the `run` directory, `errors`, and the `cleanup` report. The command exits with 0 only when the window opened and closed and its cleanup succeeded. `-LiveData` passes `--live-data`. `-Editor` names the VS Code install directory. Pass `-SkipBuild` only when `extension/dist` already contains the build under test.
+The script builds Arc and opens this checkout through `scripts/isolated-editor.mjs open`. That command allows focus and takes no lock. Launch waits use 90-second timeouts. After launch, it waits until the window closes, then cleans up. Failed launches also receive cleanup. `openCommand` in the driver owns output and exit status. `-LiveData` passes `--live-data`. `-Editor` names the VS Code install directory. Pass `-SkipBuild` only when `extension/dist` already contains the build under test.
