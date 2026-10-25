@@ -1,21 +1,35 @@
 # Prompt attachments
 
-## Staging and delivery
+Read this guide for paste, drop, attachment validation, or staged-file lifetime. [`promptassets.ts`](../extension/src/promptassets.ts) owns staged copies. [`attachments.ts`](../extension/src/webview/attachments.ts) captures browser files. [Prompt delivery](prompt-delivery.md) owns queue and reset transitions.
 
-File attachments are staged under extension global storage and scoped by session id. Saved panel state contains normalized descriptors with a SHA-256 digest. The reader's source file is never changed or deleted. A missing, changed, or non-regular staged copy stays visible by filename and blocks the whole prompt until the reader removes or replaces it. The staging root is shared by workspace state records, so the extension does not sweep unreferenced files globally. A staged copy whose descriptor is lost can remain until extension storage is cleared.
+## Storage and acceptance
 
-An attachment-only prompt is sendable. A send snapshots the files currently attached. Rejection keeps them with the draft, while acceptance removes their descriptors. Each accepted copy remains staged until its own turn ends so later pending prompts retain their thumbnails. Completion can arrive while Codex is still returning prompt acceptance. The active handoff holds that completion and removes the staged copy as soon as acceptance finishes. A new session moves attachment state when its provisional id becomes the agent's session id.
+Attachments use session-scoped staged copies under extension global storage. Saved descriptors include a SHA-256 digest. Arc never changes or deletes the source file. A missing, changed, or non-regular staged copy remains visible by filename and blocks the whole prompt until removed or replaced.
 
-Paste and drop attach files to the prompt box. The prompt box has no Attach files control. The whole prompt box foot accepts a drop and gives the prompt text field a dashed outline while it is ready. Pasted and dropped browser files are captured during their event, read with `File.arrayBuffer()`, and sent to the host as metadata plus `ArrayBuffer` values. Known filename extensions determine the media type so browser MIME differences do not change agent compatibility. Ordinary text paste is unchanged. VS Code delivers a drop into a webview only while Shift is held, and the editor can consume a drag before the webview sees it. Drop support is an additional path for that reason.
+The shared staging root has no global unreferenced-file sweep. Copies with lost descriptors can remain until extension storage is cleared.
 
-A file or folder dragged from the Explorer or an editor tab inserts its path into the prompt text field at the caret. The drop event reads every drag value before any wait, because the data is gone afterward. A drag that lists file URIs takes this route even when it also lists Files. An OS file manager drag lists Files only and keeps the staged-bytes route. A drag of a web link, which lists no `file:` URI, keeps the normal text drop. Only `file:` URIs count, and the inline notice says how many other items Arc skipped. Path text has the form that path completion writes. It is relative to the session working directory when the item sits inside it and absolute otherwise. It takes double quotes when it contains whitespace, and a folder ends with a path separator. Several paths join with a space, and Arc adds no `@` prefix. An image file (JPEG, PNG, GIF, or WebP) becomes an attachment instead. The host checks the file count and the file sizes against the attachment limits before it reads any image from disk, then stages the images the way it stages pasted images. When logging is on, the diagnostics log records the drag types each such drop reported.
+Attachment-only prompts are sendable. Sending snapshots the current files. Refusal retains descriptors in the draft. Acceptance removes them and retains staged bytes until their accepted turn ends. If Codex completes before acceptance returns, cleanup runs as acceptance finishes. Provisional-to-durable adoption moves attachment state.
 
-Add to Arc appears in the Explorer menu and in the editor tab menu. It applies the same rules to the clicked item, or to the whole Explorer selection when the clicked item belongs to it. It writes into the prompt box that the panel shows and reveals the panel. It has no keybinding and no command palette entry.
+## Paste, drop, and Add to Arc
 
-A staged file whose extension has no known media type counts as plain text when its bytes are valid UTF-8 and hold no NUL byte. Claude therefore accepts source files such as `.py` that an OS file manager drop or the clipboard supplies. Known extensions keep their media type.
+Paste and drop attach files without an Attach files control. Capture browser files during the event before reading them with `File.arrayBuffer()`. Known filename extensions determine media type. Ordinary text paste remains unchanged.
 
-While a file is being read or staged, Send and Enter wait, and a dashed chip says how many files are attaching. The exceptions are a Codex `/rename` draft and a Claude `/remote-control` or `/rc` draft, which the Prompt box sends at once because they carry no attachment. A second paste or drop is rejected with an inline notice. Each staged file chip shows a thumbnail for an image or a kind word for another file, its name with a preserved extension, its size, and a keyboard-reachable Remove button. A refusal names the file beside the prompt box and clears with the next edit, attach, or removal. Pending and failed prompt cards retain the same chips without Remove. Recorded transcript cards remain text-only because the transcript readers do not currently retain vendor attachment records.
+VS Code delivers webview drops only while Shift is held and can consume drags first. Drop is therefore an additional attachment route.
 
-A new-session draft cannot switch to an agent that does not accept one of its attached files. The file remains attached, the agent stays unchanged, and the inline notice explains which file must be removed. Compatibility and staged contents are checked again when Send is pressed and after any session-opening wait.
+Explorer and editor-tab drags insert paths at the caret. Read all drag values before waiting because event data disappears afterward. File-URI drags take priority even when Files is also present. OS file-manager drags containing only Files stage bytes. Web links without file URIs retain normal text-drop behavior. Only `file:` URIs count. The inline notice counts skipped items.
 
-Only one attachment-bearing prompt per session can wait for agent acceptance. An overlapping send is refused and its browser draft is restored only if no newer edit has replaced it. Active staging keeps an otherwise untouched new-session draft on the session list. A file read that finishes after a new session receives its agent id follows that identity change before it merges descriptors. The selected agent is checked again at that merge point. Stop also cancels a Claude attachment prompt whose files are still being prepared, before its user message reaches the wire.
+Paths are relative inside the session working directory and absolute outside it. Whitespace requires double quotes. Folders end with a separator. Multiple paths join with spaces and no `@` prefix. JPEG, PNG, GIF, and WebP files become attachments instead. The host checks count and size limits before reading any image.
+
+Add to Arc uses these rules from Explorer and editor-tab menus. It uses the whole Explorer selection when the clicked item belongs to it. It targets the visible prompt box and reveals the panel. It has no keybinding or command-palette entry.
+
+An unknown extension uses normalized browser MIME or `application/octet-stream`. Only `application/octet-stream` falls back to plain text when bytes are valid UTF-8 without NUL.
+
+## Staging races and refusals
+
+Send and Enter wait during staging, except for Codex `/rename` and Claude `/remote-control` or `/rc`. Those controls carry no attachment. A second paste or drop receives an inline refusal. Attachment notices clear on the next edit, attach, or removal.
+
+Draft files offer keyboard-reachable Remove buttons. Pending and failed cards retain file chips without Remove. Recorded cards remain text-only because transcript readers retain no vendor attachment records.
+
+An incompatible attachment blocks a draft’s agent change without removing the file. Send and session-opening continuations recheck compatibility and staged contents.
+
+Only one attachment-bearing prompt per session can await acceptance. Overlapping sends restore text only if no newer edit replaced it. Staging retains an otherwise untouched draft in the session list. Completed reads follow provisional adoption and recheck the selected agent before merging descriptors. Stop cancels Claude attachment preparation before the user message reaches the wire.

@@ -85,7 +85,7 @@ A permission question arrives as a tool-use request. An answer allows that reque
 
 A resumed child may not announce its session id until it produces output. The launch plan seeds the expected id so the host can associate the first prompt and any compaction with the correct session.
 
-Claude compaction uses the `/compact` command published by its initialization response. The session treats it as a distinct operation so the prompt box cannot attach comments or other prompt text.
+Native Claude compaction uses the `/compact` command published by its initialization response. It uses a distinct control operation. [Prompt delivery](prompt-delivery.md#compaction-and-reset) owns queued submissions with comments or files.
 
 Claude control responses share stdout with turn events. Request ids pair responses with callers, and unanswered controls expire so one missing response cannot hold the host open.
 

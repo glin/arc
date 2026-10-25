@@ -1,33 +1,39 @@
 # Agent requests
 
-## Agent requests
+Read this guide for permission and question cards, answer validation, or saved-question presentation. [`requests.ts`](../extension/src/webview/requests.ts) renders cards. [`composerview.ts`](../extension/src/composerview.ts) validates answers. [Agent protocols](agent-protocols.md#question-recovery-contracts) owns durable question recovery.
 
-A live Claude or Codex child can stop on a permission request or a question. The host keeps the normalized request until the reader answers it or the turn ends. A Codex async question stays after its turn ends and closes as the `delivery: async` paragraph in `docs/agent-protocols.md` describes. The selected session draws those requests above its prompt text field. The reader answers a request from that session's prompt box.
+## Live requests
 
-A request card uses the turn card's frame, background, and corners. Its left border uses the session list's Needs input tone. The heading shows the title and `needs you`. After submission, controls disable and the state reads `sending your answer` until the host removes the card.
+Permission requests and questions belong to their session’s prompt box. Live requests remain until answered or the turn ends. Codex async questions follow [async delivery](agent-protocols.md#codex-app-server), including survival after turn completion.
 
-The request heading controls disclosure and names its action. A collapsed request shows only that heading. Question headings also show answered-question counts. Permission headings omit counts. The collapsed body is `hidden`, so its controls leave the Tab order. Requests start expanded and retain independent folds only for the browser lifetime.
+Submitted controls disable and show `sending your answer` until the host resolves them.
 
-Permission cards offer immediate Allow and Deny actions. A shell command is shown in a code block, while other request details remain prose.
+Requests start expanded. Browser-lifetime folds remain independent. Collapsed bodies use `hidden` so their controls leave Tab order. Question headings retain answered counts. Permission headings omit them.
 
-A question card displays one question at a time. Each tab uses the agent's short label or the question number. Answered tabs show the chosen answer. A single-choice answer advances to the next unanswered question and announces the move in a polite region. Multi-select answers never advance automatically. Pressing a tab selects its question. Arrow keys move between tabs. Home and End reach the strip boundaries. The strip has one Tab stop.
+Permissions offer immediate Allow and Deny. Shell commands use code blocks. Other details remain prose.
 
-The strip wraps and never scrolls sideways, because a horizontal scroller inside a scrolling panel hides what it holds. Past two rows every tab drops its value and marks only whether its question is answered. The mark never carries the meaning alone: the tab's accessible name still reads the whole answer, including a value the strip cut short or dropped.
+## Question answers
 
-The action button says `Next` until every question has an answer, and `Answer` after that. The line beside it says which question the reader is on. The reason the button is off is written beside it in the same words its accessible name carries.
+Single-choice answers advance to the next unanswered question and announce the move. Multi-select answers never advance automatically. The [keyboard contract](rail-and-navigation.md#keyboard-and-screen-reader-contract) owns tab-strip navigation.
 
-Every question offers `Other` last. Taking it opens a multiline field under the row, and the action button stays off until the reader types. Shift+Enter inserts a line break. Enter activates the visible primary action, which advances to the next unanswered question or sends the completed answer. A question takes offered labels or a written answer, never both, so taking `Other` clears the checked boxes and checking a box clears `Other`. A written answer reaches the agent as the reader typed it. Claude joins it to the labels in one string, and Codex sends it in the same list. Codex asks the client to add the choice: its own tool schema tells the model to leave `Other` out, because the client adds it.
+Question tabs wrap without horizontal scrolling. Beyond two rows, tabs omit answer values visually but retain complete answers in accessible names.
 
-A question that asks for a secret takes its answer in a single-line password box, and its tab reports that it is answered without reporting what it says. Enter sends a complete secret answer.
+Next advances through unanswered questions. Answer sends only a complete answer. Incomplete action names explain what remains unanswered.
 
-Question text renders block Markdown in the fieldset's named content area. Reference links use the timeline's navigation routes. Choice labels and descriptions render inline Markdown without links, images, or buttons. Answers retain the agent's original choice labels. Raw HTML stays escaped except for validated disclosures, whose rules belong to [Timeline rendering](turn-cards.md#markdown-disclosures). Permission explanations retain their text or command treatment.
+Other is always last and requires nonblank written text. Written answers and offered labels exclude each other. Shift+Enter inserts a line break. Enter advances or sends the completed answer. Preserve written text exactly. Claude joins it to labels in one string. Codex sends it in the same list.
 
-The agent's short question label also appears before the question when the card has no tabs. A line below the question says whether the reader can take one choice or several. A taken choice row keeps a ground of its own. Question cards also offer Decline, so an unreadable request does not leave the child blocked. The browser retains unfinished selections, written answers, the question on screen, the fold, and nested scroll position across unrelated updates. A changed session or ordered request identity resets only the nested scroll position. The browser sends nothing until the reader presses an action. The extension validates every submitted label against the current request and refuses a label nobody offered.
+Secrets use single-line password inputs. Their tabs expose completion without exposing values. Enter sends a complete answer.
 
-Send answers the open requests before it delivers the prompt. A reader who wants none of the offered choices types their own answer and presses Send. Without this the request stays open, the child stays blocked on it, and the prompt waits behind a question that nobody answered. The requests are told that the reader took none of the choices and answered in their next message, which is a different thing from a refusal. A sentence beside Send says so before the press, it joins the send control's own name, and its arrival is announced in a polite region of its own.
+Question bodies render block Markdown and use timeline navigation for links. Choices render inline Markdown without interactive content or images. Preserve original choice labels in answers. HTML remains escaped except for [validated disclosures](turn-cards.md#markdown-disclosures).
 
-Radios and checkboxes are the browser's own controls. The panel keys their colour scheme off the theme class the editor puts on the body, because the editor publishes no colour for them. Only a panel inside VS Code carries that class, so these colours can be confirmed only there. An agent confirms them in the [isolated editor](development.md#isolated-extension-host).
+Decline prevents unreadable questions from blocking the child. Unrelated updates retain unfinished answers, selection, folds, and nested scrolling. Session or ordered request-identity changes reset only nested scrolling. The browser submits only on an action. The host validates labels against the current request.
 
-An arriving request is announced in a polite region and does not take focus or scroll the page. Three polite regions stay apart, one for an arriving request, one for the move to the next question, and one for the sentence beside Send, because a region that mixed two subjects would read as one. The controls disable after submission while the host resolves the answer. A successful answer, an agent-side resolution, a stopped turn, or a child exit removes the card from live state. Captured unanswered questions remain available through recovery.
+Sending a prompt answers live open requests first, so the prompt does not wait behind them. It reports that the reader answered in the next message, separately from refusal. Saved recovered questions are excluded. Send’s visible explanation, accessible name, and announcement disclose this behavior.
 
-Saved question cards retain their complete questions and choices after a restored panel replaces the original host. Their detail explains continuation, unavailable delivery, or secret re-entry. Answer remains disabled for unknown delivery, unavailable ownership or session source, and an unmatched current request. A secret also keeps Answer disabled without a fresh native request. Decline dismisses an ended saved question locally and starts no provider.
+Native radio and checkbox colors depend on VS Code’s body theme class. Check them in the [isolated editor](development.md#isolated-extension-host). A standalone browser lacks that class.
+
+Arriving requests never take focus or scroll the page. Successful answers, agent-side resolution, stopped turns, or child exit remove live cards. Captured unanswered questions remain recoverable.
+
+## Saved questions
+
+Saved questions retain complete text and choices across host replacement. Unknown delivery, unavailable ownership or source, and unmatched current requests disable Answer. Secrets also require a fresh native request. Decline dismisses ended saved questions locally without starting a provider.

@@ -1,33 +1,35 @@
 # Account usage
 
+Read this guide for account eligibility, displayed limits, or refresh behavior. [`usageview.ts`](../extension/src/usageview.ts) normalizes readings. [`composer-controls.ts`](../extension/src/webview/composer-controls.ts) renders usage detail. [Context evidence](accounting.md#context-evidence) owns session context and pricing.
+
 ## Usage status bar
 
-`usageview.ts` normalizes the limits and money caps reported by each CLI. The panel does not derive an account limit from transcript token totals.
+Account limits come from CLI account readings and live events, never transcript token totals.
 
-The collapsed bar shows current figures. Hover or focus opens a temporary detail view. A press pins it until another press or Escape. The detail view is a popover so opening it does not move the timeline.
+Hover or focus opens usage detail. A press pins it. Another press or Escape dismisses it. The popover never moves the timeline.
 
-The shared age describes the oldest displayed reading. The popover shows this age in its bottom refresh button when refresh is available. Each agent's detail includes its full local reading time in its accessible name. Unchanged utilization still receives a new age when the agent admits a new reading.
+The shared age belongs to the oldest displayed reading. Refresh detail carries that age and each agent’s full local reading time in its accessible name. An admitted reading refreshes age even when utilization is unchanged.
 
-Read again discovers Codex account eligibility and requests supported usage from both agents. Only the bottom refresh area shows changing progress. Each detail group reports failed or empty outcomes. Missing and expired figures retain these groups and the retry control without inventing percentages or reading times. The collapsed bar says Account usage when no figures remain. A newer admitted reading removes that agent's terminal feedback without changing the expired attempt's outcome. Hidden Codex discovery keeps refresh pending until eligibility resolves or the attempt expires. Active progress appears as noninteractive status text. Focus moves from the removed refresh button to the popover. The refresh button returns when the attempt settles. The status and button names include their visible label and supported agents' states. One announcement summarizes newly observed terminal outcomes. Reopening the panel does not announce retained completed attempts.
+Read again discovers Codex eligibility and reads supported agents. Only the bottom refresh area changes progress. Discovery keeps refresh pending until eligibility resolves or the attempt expires. Busy text is noninteractive. Focus moves from the removed refresh button to the popover. The button returns at settlement.
 
-Bedrock Codex accounts contribute no subscription figures, plan, detail group, refresh outcome, or announcement, including after a busy-wait timeout. Discovery removes retained Codex limits from workspace state and leaves Claude readings and historical usage files intact. A later supported account reading restores Codex usage. Unknown accounts, signed-out accounts, and discovery failures retain retryable errors.
+Failures and empty results retain detail groups and retry without invented percentages or reading times. With no figures, the bar says Account usage. A newer admitted reading clears that agent’s feedback without changing the expired attempt’s outcome. Names include visible labels and supported-agent states. Announce newly observed terminal outcomes once. Reopening never announces retained completions.
 
-Fresh values can arrive from live wire events, a read after a child finishes, a transcript refresh that detects finished work, or an idle child started only to answer controls. Failed or fresh reads are not repeated until the reader explicitly refreshes or the freshness rule allows another read.
+Bedrock Codex accounts contribute no subscription figures, plans, groups, refresh outcomes, or announcements, including after busy-wait expiry. Discovery removes retained Codex limits from workspace state. Claude readings and historical usage files remain. Supported later readings restore Codex usage. Unknown accounts, signed-out accounts, and discovery failures retain retryable errors.
 
-Explicit unavailable Claude limits retain saved figures and their original reading age without a warning. Read again retries, and an admitted reading restores automatic refresh.
+Fresh values arrive through live events, child completion, transcript discovery of finished work, or idle control reads. Failed or fresh reads wait for explicit refresh or the freshness rule before repeating.
 
-An expired limit is omitted. Complete readings replace account state, while partial live events update only the limit they name. A complete answer with no rate windows retains live windows because a money-cap answer says nothing about their clocks.
+Explicitly unavailable Claude limits retain saved figures and their original age without warning. Read again retries. An admitted reading restores automatic refresh.
 
-The account answer gives the credit cap no reset clock. Its row uses the next month boundary at midnight UTC and marks that moment as expected. A reported credit clock from a live rate-limit event replaces the expected moment.
+Expired windows disappear. Complete readings replace account state. Partial events update only named windows. Complete answers without rate windows retain live windows because money caps supply no window clocks.
 
-A Codex live update can describe a named model bucket instead of the account aggregate. Its model name remains the bucket's scope, so it cannot replace an account figure. The usage bar omits named Codex buckets from both faces. The complete per-limit inventory remains unread until a bucket is actively published.
+Without a reported credit reset, the cap uses the next month boundary at midnight UTC and marks it expected. A valid live-event credit clock replaces that estimate.
 
-Claude's `seven_day_overage_included` window is a weekly bucket for one model, and live events carry no model name for it. The panel omits it. Claude Code omits it too, and draws the account answer's model-scoped weekly limits instead.
+Named Codex model buckets never replace account figures. Both usage faces omit them. The complete per-limit inventory remains unread until a bucket is actively published.
 
-Claude Max is presented as `Max plan`. The account answer names no tier modifier, so none is drawn. Codex `pro` is presented as `Pro plan`. Every other reported name keeps its own spelling with `plan` after it, so `prolite` reads `prolite plan`. The rate-limit payload supplies no multiplier or display name.
+Claude’s unnamed `seven_day_overage_included` model bucket is omitted. Named account-response model limits remain available.
+
+Plan labels use `Max plan` for Claude Max and `Pro plan` for Codex `pro`. Other names retain their spelling followed by `plan`, including `prolite plan`. No tier modifier or multiplier is inferred.
 
 ## Refresh contracts
 
-Claude's `rate_limits_available: false` becomes an unavailable result, separate from an empty or failed answer. Fresh and hosted children preserve this result through account-read completion.
-
-Preact removes the focused usage refresh button when busy status replaces it. The removal emits focusout with no destination during rendering. Redrawing inside that event can retain stale busy content. The usage popover ignores null focus destinations and redundant focus entry. An outside press clears both hovered and pinned state, independently of focus events.
+The usage popover ignores null focus destinations and redundant focus entry. Preact can remove the focused refresh button during rendering. Redrawing in that focusout handler can retain stale busy content. Outside presses clear both hovered and pinned state.

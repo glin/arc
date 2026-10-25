@@ -1,41 +1,45 @@
 # Prompt entries and path completion
 
-## Skill and file opening
+Read this guide for command and skill completion, inline inspection, or local path completion. [`composer.ts`](../extension/src/webview/composer.ts) owns browser editing. [`commandcatalog.ts`](../extension/src/commandcatalog.ts) owns catalogs. [Local controls](prompt-delivery.md#local-controls) owns commands intercepted before delivery.
 
-Opening a skill file is its own host route, not the card's file route. `openFile` uses the card's session for its own file rows and the dispatched child's session for that child's file rows. A dispatched file action names the child and a path listed under its row before the host reads its snapshot. `openSkill` accepts a path only when the card's recorded skill list holds it, then confirms that the path is still a regular file. A path that fails either check opens nothing and reports nothing.
+## Opening recorded skills
+
+Skill opening uses `openSkill`, separately from card file opening. It accepts only paths published in that card’s recorded skill list and still naming regular files. Failed checks open nothing and report nothing.
 
 ## Prompt entries
 
-Command catalogs arrive during agent initialization. Quiet Codex state can also request its skill list through an idle child. A connected Codex child refreshes its catalog after a local skill-file change notification. Added, edited, and removed skills reach the Prompt box without a reload. Codex identifies commands and skills in its catalog.
+Initialization publishes commands. Idle Codex children can supply skills. Connected Codex children refresh after local skill-file notifications, including additions, edits, and removals. Codex catalogs distinguish commands from skills.
 
-Claude publishes one command list without ownership metadata. Arc classifies ordinary Claude skills through the last skill-name list for the session's working directory. The panel highlights and makes inspectable listed skills other than panel controls such as `/mcp`. `/compact` and `/model` never receive skill highlighting because the Prompt box has controls for them. Before a directory reports its first list, every other Claude command receives highlighting, including built-ins such as `/context`, `/help`, and `/review`. The Claude skill-name list persists by working directory across window reloads.
+Claude commands lack ownership metadata. Classify them with the working directory’s latest skill-name list, persisted across reloads. Listed skills are inspectable except panel controls such as `/mcp`. `/compact` and `/model` never receive skill highlighting. Before the first list, all other commands are highlighted, including `/context`, `/help`, and `/review`.
 
-A Claude entry retains a supplied definition path. Otherwise, Arc looks for its `SKILL.md` in the session's project skills folder, then the reader's Claude skills folder. If neither folder has the definition, the popover shows no path.
+Keep supplied Claude definition paths. Otherwise search project skills before the reader’s Claude skills folder. Without a definition, omit the path.
 
-Ordinary command catalogs live in memory by agent and remain available during optional admission changes. Optional supplied entries belong to the supplying child generation and immutable release. Idle catalogs and sibling children supply no optional entry to a session. Replacement and retirement remove only the affected child entries. A provisional draft uses its own retained child. A window reload starts autocomplete empty until a session answers again.
+Ordinary catalogs live in agent-keyed memory. Optional supplied entries belong to one child generation and immutable release. Idle or sibling children supply no optional entry to another session. Retirement or replacement removes only affected child entries. Provisional drafts use their retained child. Reload starts completion empty until a session answers.
 
-Claude commands use `/`. Codex commands use `/`. Codex skills use `$` and also accept `/`. The completion menu preserves the prefix the reader typed. Dollar text opens a menu only when it matches a listed Codex skill.
+Claude and Codex commands use `/`. Codex skills use `$` or `/`. Completion preserves the typed prefix. Dollar text opens completion only when it matches a listed Codex skill.
 
-A complete leading Codex skill invocation selects that skill, with optional whitespace before it and optional arguments after it. Typed and completed invocations behave alike. Unknown, disabled, ambiguous, or removed skills remain ordinary text. Quoted examples, escaped tokens, fenced code, URLs, partial names, and incidental mentions select no skill. [Agent protocols](agent-protocols.md#codex-app-server) owns native attachment and catalog freshness.
+Only complete leading Codex skill invocations select native skills, allowing preceding whitespace and following arguments. Typed and completed invocations match equally. Unknown, disabled, ambiguous, or removed skills remain text. Quoted examples, escaped tokens, fences, URLs, partial names, and incidental mentions select nothing. [Native attachment and freshness](agent-protocols.md#codex-app-server) govern delivery.
 
-The prompt text field marks a complete slash-form Codex skill or a highlighted Claude command without replacing its native control. Pointer drags and modified clicks select through the mark without opening details. A click or keyboard press opens a read-only detail popover. The popover follows a visible mark when text scrolls or the session list moves. A hovered or pinned popover hides while its mark is clipped and returns when the mark comes back. A pinned popover keeps the same logical token across edits. It closes when that token disappears. The popover shows the catalog description. It also shows the definition path when the Codex catalog supplies one or Arc finds the Claude skill's file on disk, and shows no path line and no blank space in its place when neither does. Closing the popover returns focus without changing the prompt, selection, or editing history. Removing the focused mark returns focus to the prompt text field.
+Skill marks must retain the native text field. Drags and modified clicks select text without opening details. Inspection preserves prompt text, selection, and undo history.
 
-`composerview.ts` owns prompt-entry wording and completion text. Browser-safe token detection and matching live under `domain/`, where the Prompt box and host import the same rules. The next keypress acts on the text currently in the prompt text field without waiting for a host response.
+Hovered and pinned popovers hide while their marks are clipped and return when visible. Pinned marks follow logical tokens through edits and close when those tokens disappear. Paths appear only when supplied or resolved. Closing restores focus. Removing a focused mark focuses the text field.
+
+Host and browser share token and matching rules under `domain/`. Keypresses use live text without waiting for host replies.
 
 ## Local path completion
 
-The Prompt box completes a path at a collapsed caret that ends a path token. A token can start with `~/`, `./`, `../`, `/`, a Windows drive, a UNC root, or contain a separator. Matching quotes keep spaces in one token. The Prompt box preserves the root, quotes, and separator style.
+Path completion requires a collapsed caret at the token’s end. Tokens accept `~/`, `./`, `../`, `/`, Windows drives, UNC roots, or embedded separators. Matching quotes retain spaces. Preserve roots, quotes, and separator style.
 
-The provider uses the selected session's recorded working directory. A new session uses the directory frozen in its draft. The webview never supplies a directory. The provider reads one named parent directory and returns no row when it cannot read that directory.
+The provider chooses the recorded working directory or the directory frozen in a draft. The browser never supplies it. Completion reads the named parent directory and returns no rows when unreadable.
 
-The shared completion list gives a matching prompt entry priority. Otherwise it shows matching files and directories. Directories appear first and add the typed separator. Hidden entries appear only after the unfinished name starts with a period.
+Matching prompt entries take priority. Otherwise directories precede files and add the typed separator. Hidden entries appear only after a leading period.
 
-The Prompt box keeps focus in the prompt text field. Arrow keys move the active row. Tab accepts a path row. Enter keeps its send behavior. Escape closes path completion until the token changes. A pointer press accepts its row without moving focus.
+Arrow keys move the active row. Tab accepts paths. Enter retains Send. Escape closes path completion until the token changes. Pointer acceptance never moves focus.
 
-The prompt text field exposes the active row through `aria-activedescendant`. Each row states whether it names a file or directory. A path completion writes one undo step, updates the draft, grows the field, and ends a prompt-history walk.
+Use a listbox with text-field focus and `aria-activedescendant`. Each row names its file or directory kind. Path acceptance writes one undo step, updates the draft, grows the field, and ends recall.
 
-The browser delays a request and rejects a result when its session, token, caret, or request identifier changed. A late reply never changes the draft.
+Debounced replies must match session, token, caret, and request identity. Obsolete replies never change the draft.
 
-The menu is a listbox controlled by the prompt text field. Focus stays in the prompt text field, the active option is exposed through `aria-activedescendant`, and pointer presses do not steal focus. Completion ends the command name, so the following Enter sends.
+Command acceptance completes the name. The following Enter sends.
 
-Background prompt box refreshes preserve the reader's scroll position in an open command menu. Typing, moving the caret, and changing the active option still bring that option into view.
+Background refreshes preserve command-menu scrolling. Typing, caret moves, and active-option changes still reveal the active option.
