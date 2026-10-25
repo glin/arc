@@ -121,7 +121,7 @@ Merge existing developer text into the same value. This instruction depends on m
 
 Check the effective model catalog and exposed tools before choosing either recipe. Provider identity and `features.multi_agent_v2=false` alone do not establish the active protocol. For Bedrock setups requiring v1, confirm that the selected model's effective `multi_agent_version` is `v1`.
 
-When that catalog entry selects the wrong protocol, preserve the effective catalog and change only the required entry. Configure its absolute path through the root setting `model_catalog_json`. Preserve existing catalog overrides. A snapshot freezes provider metadata, so regenerate it and recheck the protocol after CLI upgrades. No catalog override is needed when the effective entry already selects the required protocol.
+When that catalog entry selects the wrong protocol, preserve the effective catalog and change only the required entry. Configure its absolute path through the root setting `model_catalog_json`. Preserve existing catalog overrides. A snapshot freezes provider metadata and bundled base instructions, so regenerate it and recheck the protocol after CLI upgrades. No catalog override is needed when the effective entry already selects the required protocol.
 
 These instructions do not establish steering, cancellation, or resumed-session behavior for v1. Check those paths separately when your workflow needs them.
 
