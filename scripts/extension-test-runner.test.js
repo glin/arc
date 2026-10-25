@@ -1419,7 +1419,7 @@ test('signal forwarding without a lock retains child shutdown and mapped exits',
           killed.push(receivedSignal);
         },
         scheduleFallback: (callback, milliseconds) => {
-          assert.equal(milliseconds, 5_000);
+          assert.equal(milliseconds, 1_000);
           scheduled = callback;
           return 'fallback';
         },
@@ -1436,6 +1436,9 @@ test('signal forwarding without a lock retains child shutdown and mapped exits',
           scheduled();
           assert.deepEqual(events[1], ['cleanup', 'shutdown-fallback', { signal, childClosed: false }]);
           assert.deepEqual(cancelled, []);
+          assert.deepEqual(killed, [signal, 'SIGKILL']);
+          assert.deepEqual(exited, []);
+          child.emit('close');
         } else {
           child.emit('close');
           assert.deepEqual(cancelled, ['fallback']);
@@ -1446,6 +1449,103 @@ test('signal forwarding without a lock retains child shutdown and mapped exits',
       }
       assert.equal(processEmitter.listenerCount(signal), 0);
     }
+  }
+});
+
+test('nested cancellation escalates owned Windows trees and Unix groups before releasing resources', () => {
+  for (const platform of ['win32', 'darwin', 'linux']) {
+    const emitter = new EventEmitter();
+    const child = new EventEmitter();
+    child.pid = 73;
+    child.arcProcessGroup = platform !== 'win32';
+    const order = [];
+    let deadline;
+    emitter.exit = (code) => order.push(['exit', code]);
+    const detach = browserLock.forwardSignalToChildAndRelease(
+      child,
+      { release: () => order.push(['release']) },
+      {
+        processEmitter: emitter,
+        killTree: (target, signal) =>
+          browserLock.forTesting.killProcessTree(target, signal, {
+            platform,
+            killGroup: (pid, sent) => order.push(['group', pid, sent]),
+            killWindowsTree: (pid) => {
+              order.push(['tree', pid]);
+              return true;
+            },
+          }),
+        scheduleFallback: (fn) => {
+          deadline = fn;
+          return 'deadline';
+        },
+        cancelFallback: () => {},
+      },
+    );
+    try {
+      emitter.emit('SIGTERM');
+      deadline();
+      assert.ok(order.every(([event]) => event !== 'release' && event !== 'exit'));
+      child.emit('close');
+      assert.deepEqual(
+        order,
+        platform === 'win32'
+          ? [['tree', 73], ['tree', 73], ['release'], ['exit', 143]]
+          : [['group', -73, 'SIGTERM'], ['group', -73, 'SIGKILL'], ['release'], ['exit', 143]],
+      );
+    } finally {
+      detach();
+    }
+  }
+});
+
+test('a closed Unix group leader cannot leave nested workers behind', () => {
+  for (const platform of ['darwin', 'linux']) {
+    const emitter = new EventEmitter();
+    const child = new EventEmitter();
+    child.pid = 74;
+    child.arcProcessGroup = true;
+    const order = [];
+    emitter.exit = (code) => order.push(['exit', code]);
+    const detach = browserLock.forwardSignalToChildAndRelease(
+      child,
+      { release: () => order.push(['release']) },
+      {
+        processEmitter: emitter,
+        killTree: (target, signal) =>
+          browserLock.forTesting.killProcessTree(target, signal, {
+            platform,
+            killGroup: (pid, sent) => order.push([pid, sent]),
+          }),
+        scheduleFallback: () => 1,
+        cancelFallback: () => {},
+      },
+    );
+    try {
+      emitter.emit('SIGTERM');
+      child.emit('close');
+      assert.deepEqual(order, [[-74, 'SIGTERM'], [-74, 'SIGKILL'], ['release'], ['exit', 143]]);
+    } finally {
+      detach();
+    }
+  }
+});
+
+test('asynchronous Node timing accounts for every required phase', async () => {
+  const root = fixture();
+  const timing = timingFixture();
+  try {
+    assert.equal(
+      await runner.runNodeLane([], {
+        testRoot: root,
+        observationFactory: () => timing.observation,
+        spawn: () => ({ status: 0 }),
+      }),
+      0,
+    );
+    assert.equal(timing.events.at(-1).complete, true);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
   }
 });
 
@@ -2103,4 +2203,28 @@ test('VALUE_FLAGS matches every required-value flag in the installed Vitest CLI 
     { missing: [], extra: [] },
     `VALUE_FLAGS in extension/test.mjs drifted from ${chunkPath}. Missing: ${JSON.stringify(missing)}. Extra: ${JSON.stringify(extra)}.`,
   );
+});
+
+test('full mode stops after a signalled Node child in whole and named selections', async () => {
+  const root = fixture();
+  try {
+    for (const files of [[], ['src/store.test.ts', 'src/chrome.browser.test.ts']]) {
+      let browserCalls = 0;
+      const child = new EventEmitter();
+      const pending = runner.runFull(files, {
+        testRoot: root,
+        asyncNode: true,
+        spawn: () => child,
+        detectBrowser: async () => {
+          browserCalls++;
+          assert.fail('Signalled Node child must not start browser detection.');
+        },
+      });
+      child.emit('close', null, 'SIGTERM');
+      assert.equal(await pending, 1);
+      assert.equal(browserCalls, 0);
+    }
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });

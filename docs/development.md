@@ -34,7 +34,7 @@ Use [Testing](testing.md#verification) for test categories and [Demo assets](dem
 
 Use [the isolated editor](isolated-editor.md#isolated-extension-host) for `scripts/isolated-editor.mjs run` checks. The owner opens a manual window with [`launch-isolated-extension.ps1`](isolated-editor.md#restored-tab-check).
 
-Use [Handoff checks](testing.md#handoff-checks) for shared checkout and landing checks. Use [Timeline checks](testing.md#timeline-checks) for the read-only Claude sweep.
+Use [Handoff checks](testing.md#handoff-checks) for shared checkout and landing checks. [Landing acceptance](testing.md#checks-and-lanes) retains complete failure reports and explicit unrelated-failure dispositions. Use [Timeline checks](testing.md#timeline-checks) for the read-only Claude sweep.
 
 ## Dependencies
 

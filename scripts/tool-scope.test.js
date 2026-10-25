@@ -35,6 +35,33 @@ function copyStylelintConfig(root) {
   assert.equal(formatted.status, 0, formatted.stderr);
 }
 
+function copyCollector(root) {
+  for (const file of [
+    'scripts/test-suite.mjs',
+    'scripts/test-subprocess.mjs',
+    'scripts/test-lanes.mjs',
+    'scripts/typecheck-parallel.js',
+    'extension/test/browserlock.mjs',
+    'extension/test/browserchannels.mjs',
+    'extension/test/observations.mjs',
+  ]) {
+    const target = path.join(root, file);
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.copyFileSync(path.join(repositoryRoot, file), target);
+  }
+  fs.symlinkSync(
+    path.join(repositoryRoot, 'node_modules'),
+    path.join(root, 'node_modules'),
+    process.platform === 'win32' ? 'junction' : 'dir',
+  );
+}
+
+function removeFixture(root) {
+  const dependencies = path.join(root, 'node_modules');
+  if (fs.existsSync(dependencies) && fs.lstatSync(dependencies).isSymbolicLink()) fs.unlinkSync(dependencies);
+  fs.rmSync(root, { recursive: true, force: true });
+}
+
 function runScript(script, cwd) {
   return runTool('npm', ['run', script], cwd);
 }
@@ -55,6 +82,7 @@ function scopeFixture() {
   try {
     fs.mkdirSync(path.dirname(maintainedSource), { recursive: true });
     fs.copyFileSync(path.join(repositoryRoot, 'package.json'), path.join(root, 'package.json'));
+    copyCollector(root);
     for (const name of ['.oxfmtrc.mjs', '.oxlintrc.jsonc']) {
       fs.copyFileSync(path.join(repositoryRoot, name), path.join(root, name));
       for (const savedRoot of savedRoots) {
@@ -74,7 +102,7 @@ function scopeFixture() {
 
     return { root, savedSources, maintainedSource, brokenSource };
   } catch (error) {
-    fs.rmSync(root, { recursive: true, force: true });
+    removeFixture(root);
     throw error;
   }
 }
@@ -91,7 +119,7 @@ for (const script of ['format:check', 'lint', 'format']) {
           assert.equal(fs.readFileSync(savedSource, 'utf8'), brokenSource, `${script} rewrote saved evidence`);
         }
       } finally {
-        fs.rmSync(root, { recursive: true, force: true });
+        removeFixture(root);
       }
     },
     script === 'lint' ? integrationTimeout : undefined,
@@ -111,7 +139,7 @@ test.each([
     assert.match(output, /vitest\.config\.mts/);
     for (const savedSource of savedSources) assert.ok(!output.includes(path.basename(savedSource)), output);
   } finally {
-    fs.rmSync(root, { recursive: true, force: true });
+    removeFixture(root);
   }
 });
 
@@ -126,7 +154,7 @@ for (const script of ['format:check', 'lint']) {
         assert.notEqual(result.status, 0, `${script} skipped maintained source`);
         assert.ok((result.stdout + result.stderr).includes('stop-manifest.cjs'));
       } finally {
-        fs.rmSync(root, { recursive: true, force: true });
+        removeFixture(root);
       }
     },
     script === 'lint' ? integrationTimeout : undefined,
@@ -152,6 +180,7 @@ describe('CSS entrypoints', () => {
     css = path.join(root, 'extension', 'src', 'webview', 'panel.css');
     fs.mkdirSync(path.dirname(css), { recursive: true });
     fs.copyFileSync(path.join(repositoryRoot, 'package.json'), path.join(root, 'package.json'));
+    copyCollector(root);
     fs.copyFileSync(path.join(repositoryRoot, '.oxlintrc.jsonc'), path.join(root, '.oxlintrc.jsonc'));
     copyStylelintConfig(root);
     fs.writeFileSync(
@@ -171,7 +200,7 @@ describe('CSS entrypoints', () => {
           assert.equal(fs.readFileSync(path.join(root, file), 'utf8'), 'a { colro: red; }\n');
       }
     } finally {
-      if (root) fs.rmSync(root, { recursive: true, force: true });
+      if (root) removeFixture(root);
     }
   });
 
@@ -242,7 +271,7 @@ test('CSS token exceptions retain validation of neighboring declarations and med
       assert.ok((failed.stdout + failed.stderr).includes(rule));
     }
   } finally {
-    fs.rmSync(root, { recursive: true, force: true });
+    removeFixture(root);
   }
 });
 
@@ -298,7 +327,7 @@ test(
       assert.match(failed.stdout + failed.stderr, /property-no-unknown/);
       assert.doesNotMatch(failed.stderr, /git rev-parse --git-common-dir/);
     } finally {
-      fs.rmSync(root, { recursive: true, force: true });
+      removeFixture(root);
     }
   },
   integrationTimeout,
@@ -319,7 +348,7 @@ test(
       assert.match(partial.stderr, /partly staged/);
       assert.match(git(root, 'show', ':' + css).stdout, /colro/);
     } finally {
-      fs.rmSync(root, { recursive: true, force: true });
+      removeFixture(root);
     }
   },
   integrationTimeout,
@@ -345,7 +374,7 @@ test(
       const passed = fixture.run();
       assert.equal(passed.status, 0, passed.stdout + passed.stderr);
     } finally {
-      fs.rmSync(root, { recursive: true, force: true });
+      removeFixture(root);
     }
   },
   integrationTimeout,
@@ -369,7 +398,7 @@ test(
       const excludedOnly = fixture.run();
       assert.equal(excludedOnly.status, 0, excludedOnly.stdout + excludedOnly.stderr);
     } finally {
-      fs.rmSync(root, { recursive: true, force: true });
+      removeFixture(root);
     }
   },
   integrationTimeout,
@@ -397,7 +426,7 @@ test(
       const result = fixture.run();
       assert.equal(result.status, 0, result.stdout + result.stderr);
     } finally {
-      fs.rmSync(root, { recursive: true, force: true });
+      removeFixture(root);
     }
   },
   integrationTimeout,
@@ -477,6 +506,6 @@ test('the maintained hook filenames are discovered by Oxfmt and Oxlint', () => {
       assert.ok((lint.stdout + lint.stderr).includes(hook));
     }
   } finally {
-    fs.rmSync(root, { recursive: true, force: true });
+    removeFixture(root);
   }
 });

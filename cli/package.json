@@ -34,8 +34,8 @@
     "prepack": "npm run build",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "test:unit": "vitest run --tags-filter=!subprocess --exclude \"test/smoke.bundled-*.test.mjs\"",
-    "test:smoke": "npm run build && vitest run --tags-filter=subprocess",
-    "test": "npm run typecheck && npm run test:unit && npm run test:smoke"
+    "test:smoke": "node ../scripts/test-suite.mjs cli-smoke",
+    "test": "node ../scripts/test-suite.mjs cli-test"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",

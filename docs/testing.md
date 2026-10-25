@@ -29,7 +29,25 @@ Run the full test suite:
 npm run test:all
 ```
 
-`package.json` names the commands. `scripts/test-default.mjs`, `scripts/test-unit.mjs`, and `scripts/test-integration.mjs` own lane composition and order. Follow [Handoff checks](#handoff-checks) before handoff or landing. For extension-only checks, run:
+`package.json` names the commands. `scripts/test-default.mjs`, `scripts/test-unit.mjs`, and `scripts/test-integration.mjs` own lane composition and order. Follow [Handoff checks](#handoff-checks) before handoff or landing.
+
+`scripts/test-suite.mjs` writes category states, exit statuses, failed test identities, original logs, and execution identities to a report directory. `ARC_TEST_REPORT_DIR` selects that directory. Otherwise, each invocation creates a directory under `~/.arc/test-results/`. Reports bind the source commit, tracked contents, checkout, command, platform, dependency installations, and relevant configuration. Tracked changes during collection invalidate acceptance. A blocked or cancelled category remains incomplete coverage. The Vitest reporter retains assertion, module, nested suite, and unhandled errors. Exception acceptance requires this complete diagnostic format.
+
+For topic delivery, collect the complete suite and check landing acceptance with an external report directory:
+
+```bash
+node scripts/verify-landing.mjs --base <full-integration-base-SHA> --report-dir <external-directory> --policy <external-policy.json>
+```
+
+The command collects once and retains `suite.json` separately from `acceptance.json`. Collection requires an empty directory. The collection receipt retains the original report digest. Existing reports require that digest and the expected category commands before acceptance. Reports from dirty tracked files cannot authorize landing. Changed candidate content, integration base, reports, logs, dependencies, or configuration invalidate acceptance. The caller must supply the current integration base. The shared landing preflight checks that base against the target before delivery.
+
+A passing complete suite requires no policy file. Remaining failures require an external policy with `authority` set to `owner-authorized-unrelated-failures`. The policy binds exact `candidate`, `base`, and `reportHash` values. It names passed `affectedChecks` and a `dispositions` entry for every failure ID. Each disposition names `failure`, `classification`, `explanation`, `reviewedBy`, and hashed `evidence` with an absolute `path` and `sha256`. An affected check names a category ID or a `{category, file, name}` test identity. Every assertion matching a named test must pass in that category's retained Vitest results.
+
+`base-existing` evidence is a comparison report from the clean integration base with matching dependencies, configuration, and failure details. `unrelated-infrastructure` evidence names the candidate, base, report hash, failure ID, concrete `cause`, affected-check `independence`, and hashed `artifacts`. Reviewers must check these dispositions before delivery. A different filename or exit code alone establishes no independence. Static comparisons require matching normalized diagnostics. Unknown, omitted, related, uncertain, or cancelled failures refuse acceptance. Every selected category requires a terminal result. Blocked categories and commands without concrete diagnostics require infrastructure evidence. Every affected check must pass.
+
+A permitted unrelated failure leaves the suite status nonzero while the acceptance command returns zero. Use this acceptance command as the unchanged shared `run-gate.py` verification command. For rebased delivery, pass the enclosing `run-gate.py` invocation through `carry-review.sh --verify`. This writes the candidate receipt that landing preflight requires.
+
+For extension-only checks, run:
 
 ```bash
 npm --prefix extension run test:node
@@ -41,6 +59,8 @@ Named-file commands retain tagged and untagged cases unless the caller supplies 
 Root tests that start real processes carry the Vitest tag `subprocess`. The root tag supplies a 120 second test budget. Tagged hooks retain their own budget. A whole file uses `// @module-tag subprocess`. Other files tag individual tests or suites with `{ tags: ['subprocess'] }`. `scripts/test-subprocess.mjs` owns runner isolation and concurrency.
 
 Update `scripts/test-admission.json` when adding expensive cases or expanding a matrix. It names failure boundaries, case budgets, and repetition identities. `scripts/test-lanes.test.js` checks admission and lane coverage. Keep corruption, installation, extraction, process identity, platform, accessibility, and browser interaction coverage. Put input variations in direct tests when they reach the same failure.
+
+Independent CI checks continue when their setup permits execution. Browser setup failures block browser categories. Jobs retain failed status, publish summaries, and upload available reports. Packaging requires successful checks.
 
 ### Browser selection
 
@@ -127,6 +147,14 @@ npm run test:browser
 ```
 
 Run the full check after the final rebase or merge. Record the tested full commit SHA, checkout path, command, and exit status. A check of an earlier commit does not cover the landing candidate. After landing, run `npm run format:check` and `npm run lint` in the main checkout to check its local files.
+
+## Test command implementation
+
+Independent categories continue after failures. CLI smoke tests require a successful CLI build. Cancellation stops further launches and terminates the active child tree. Nested Vitest owners escalate after one second and retain their resources until child closure. On macOS and Linux, the collector escalates its own process group after five seconds. Windows terminates the owned tree with taskkill. Failed or incomplete coverage returns nonzero.
+
+`scripts/test-suite.mjs` owns category selection and report collection. `scripts/test-lanes.mjs` runs serial children. `scripts/verify-landing.mjs` checks report identity and failure dispositions. `scripts/test-reporter.mjs` retains Vitest assertion, suite, run, closure, and process-timeout errors. `scripts/test-subprocess.mjs` owns subprocess admission arguments.
+
+The reporter writes final diagnostics when its process exits. It observes Vitest's cached close promise and retains closure errors from Vitest's logger. A timeout or unsettled closure prevents complete diagnostics from authorizing landing. Unix child cancellation retires the owned process group at leader exit. Collection settles after output pipes close.
 
 ## Portable review
 

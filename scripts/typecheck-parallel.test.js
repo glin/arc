@@ -95,3 +95,110 @@ test('a run with no failing checks reports none', SUBPROCESS, async () => {
 
   assert.deepEqual(failed, []);
 });
+
+test('cancellation escalates owned children and removes its timer after close', async () => {
+  vi.useFakeTimers();
+  const controller = new AbortController();
+  const signals = [];
+  const child = new EventEmitter();
+  child.stdout = new EventEmitter();
+  child.stderr = new EventEmitter();
+  child.kill = (signal) => {
+    signals.push(signal);
+    if (signal === 'SIGKILL') child.emit('close', null, signal);
+  };
+  try {
+    const pending = runChecks([fakeCheck('cancelled', 0)], {
+      spawnFn: () => child,
+      signal: controller.signal,
+      log: () => {},
+      logError: () => {},
+    });
+    controller.abort();
+    assert.deepEqual(signals, ['SIGTERM']);
+    await vi.advanceTimersByTimeAsync(5000);
+    assert.deepEqual(await pending, ['cancelled']);
+    assert.deepEqual(signals, ['SIGTERM', 'SIGKILL']);
+    assert.equal(vi.getTimerCount(), 0);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('cancellation terminates owned process trees on Windows, macOS, and Linux', async () => {
+  for (const platform of ['win32', 'darwin', 'linux']) {
+    const controller = new AbortController();
+    const calls = [];
+    const child = new EventEmitter();
+    child.pid = 77;
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    const pending = runChecks([fakeCheck('owned tree', 0)], {
+      platform,
+      signal: controller.signal,
+      log: () => {},
+      logError: () => {},
+      spawnFn: (_command, _args, options) => {
+        assert.equal(options.detached, platform !== 'win32');
+        return child;
+      },
+      killWindowsTree: (pid) => {
+        calls.push(['windows', pid]);
+        child.emit('close', null, 'SIGTERM');
+        return true;
+      },
+      killGroup: (pid, signal) => {
+        calls.push(['group', pid, signal]);
+        child.emit('close', null, signal);
+      },
+    });
+    controller.abort();
+    assert.deepEqual(await pending, ['owned tree']);
+    assert.deepEqual(
+      calls,
+      platform === 'win32'
+        ? [['windows', 77]]
+        : [
+            ['group', -77, 'SIGTERM'],
+            ['group', -77, 'SIGKILL'],
+          ],
+    );
+  }
+});
+
+test('child cancellation retires Unix descendants before inherited output pipes close', async () => {
+  for (const platform of ['darwin', 'linux']) {
+    for (const [code, signal] of [
+      [null, 'SIGTERM'],
+      [130, null],
+    ]) {
+      const calls = [];
+      const child = new EventEmitter();
+      child.pid = 77;
+      child.stdout = new EventEmitter();
+      child.stderr = new EventEmitter();
+      let settled = false;
+      let result;
+      const pending = runChecks([fakeCheck('cancelled', 0)], {
+        platform,
+        spawnFn: () => child,
+        log: () => {},
+        logError: () => {},
+        killGroup: (pid, sent) => calls.push([pid, sent]),
+        onResult: (value) => {
+          result = value;
+          settled = true;
+        },
+      });
+      child.emit('exit', code, signal);
+      assert.deepEqual(calls, [[-77, 'SIGKILL']]);
+      await Promise.resolve();
+      assert.equal(settled, false);
+      child.stdout.emit('data', Buffer.from('retained descendant output'));
+      child.emit('close', code, signal);
+      assert.deepEqual(await pending, ['cancelled']);
+      assert.equal(result.output, 'retained descendant output');
+      assert.deepEqual(calls, [[-77, 'SIGKILL']]);
+    }
+  }
+});

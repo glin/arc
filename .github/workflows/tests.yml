@@ -18,17 +18,35 @@ jobs:
             package-lock.json
             extension/package-lock.json
             cli/package-lock.json
-      - name: Install dependencies
-        run: |
-          npm install
-          npm --prefix extension install
-          npm --prefix cli install
-      - name: Check formatting
-        run: npm run format:check
-      - name: Lint
-        run: npm run lint
-      - name: Typecheck
-        run: npm run typecheck
+      - name: Install root dependencies
+        id: root-setup
+        if: ${{ !cancelled() }}
+        run: npm ci
+      - name: Install extension dependencies
+        id: extension-setup
+        if: ${{ !cancelled() }}
+        run: npm --prefix extension ci
+      - name: Install CLI dependencies
+        id: cli-setup
+        if: ${{ !cancelled() }}
+        run: npm --prefix cli ci
+      - name: Static checks
+        if: ${{ !cancelled() }}
+        env:
+          ARC_TEST_ROOT_SETUP_FAILED: ${{ steps.root-setup.outcome != 'success' && '1' || '' }}
+          ARC_TEST_EXTENSION_SETUP_FAILED: ${{ steps.extension-setup.outcome != 'success' && '1' || '' }}
+          ARC_TEST_CLI_SETUP_FAILED: ${{ steps.cli-setup.outcome != 'success' && '1' || '' }}
+        run: node scripts/test-suite.mjs checks --report-dir ${{ runner.temp }}/arc-checks
+
+      - name: Publish test summary
+        if: always()
+        run: node scripts/test-summary.mjs ${{ runner.temp }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results-${{ github.job }}-${{ strategy.job-index || 0 }}
+          path: ${{ runner.temp }}/arc-*
+          if-no-files-found: ignore
 
   node:
     runs-on: ubuntu-latest
@@ -43,6 +61,7 @@ jobs:
             extension/package-lock.json
             cli/package-lock.json
       - name: Install zsh and ImageMagick
+        id: system-setup
         run: |
           sudo apt-get update
           sudo apt-get install --yes zsh imagemagick
@@ -52,17 +71,50 @@ jobs:
             | sudo tee /usr/local/bin/magick > /dev/null
           sudo chmod +x /usr/local/bin/magick
           magick -list format | grep -i webp
-      - name: Install dependencies
-        run: |
-          npm install
-          npm --prefix extension install
-          npm --prefix cli install
+      - name: Install root dependencies
+        id: root-setup
+        if: ${{ !cancelled() }}
+        run: npm ci
+      - name: Install extension dependencies
+        id: extension-setup
+        if: ${{ !cancelled() }}
+        run: npm --prefix extension ci
+      - name: Install CLI dependencies
+        id: cli-setup
+        if: ${{ !cancelled() }}
+        run: npm --prefix cli ci
       - name: Install bundled Chromium and system dependencies
+        id: browser-setup
+        if: ${{ !cancelled() && steps.extension-setup.outcome == 'success' }}
         run: node extension/node_modules/playwright-core/cli.js install --with-deps chromium-headless-shell
       - name: Direct unit tests
+        if: ${{ !cancelled() }}
+        env:
+          ARC_TEST_REPORT_DIR: ${{ runner.temp }}/arc-units
+          ARC_TEST_ROOT_SETUP_FAILED: ${{ steps.root-setup.outcome != 'success' && '1' || '' }}
+          ARC_TEST_EXTENSION_SETUP_FAILED: ${{ steps.extension-setup.outcome != 'success' && '1' || '' }}
+          ARC_TEST_CLI_SETUP_FAILED: ${{ steps.cli-setup.outcome != 'success' && '1' || '' }}
         run: npm run test:unit
       - name: Integration and smoke tests
+        if: ${{ !cancelled() }}
+        env:
+          ARC_TEST_REPORT_DIR: ${{ runner.temp }}/arc-integration
+          ARC_TEST_ROOT_SETUP_FAILED: ${{ steps.root-setup.outcome != 'success' && '1' || '' }}
+          ARC_TEST_EXTENSION_SETUP_FAILED: ${{ steps.extension-setup.outcome != 'success' && '1' || '' }}
+          ARC_TEST_CLI_SETUP_FAILED: ${{ steps.cli-setup.outcome != 'success' && '1' || '' }}
+          ARC_TEST_BROWSER_SETUP_FAILED: ${{ steps.browser-setup.outcome != 'success' && '1' || '' }}
+          ARC_TEST_SYSTEM_SETUP_FAILED: ${{ steps.system-setup.outcome != 'success' && '1' || '' }}
         run: npm run test:integration
+
+      - name: Publish test summary
+        if: always()
+        run: node scripts/test-summary.mjs ${{ runner.temp }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results-${{ github.job }}-${{ strategy.job-index || 0 }}
+          path: ${{ runner.temp }}/arc-*
+          if-no-files-found: ignore
 
   browser:
     runs-on: ubuntu-latest
@@ -80,11 +132,32 @@ jobs:
             package-lock.json
             extension/package-lock.json
             cli/package-lock.json
-      - name: Install dependencies
-        run: |
-          npm install
-          npm --prefix extension install
+      - name: Install root dependencies
+        id: root-setup
+        run: npm ci
+      - name: Install extension dependencies
+        id: extension-setup
+        if: ${{ !cancelled() }}
+        run: npm --prefix extension ci
       - name: Install bundled Chromium and system dependencies
+        id: browser-setup
+        if: ${{ !cancelled() && steps.extension-setup.outcome == 'success' }}
         run: node extension/node_modules/playwright-core/cli.js install --with-deps chromium-headless-shell
       - name: Extension browser lane, part ${{ matrix.shard }} of 3
-        run: npm --prefix extension run test:browser -- --shard=${{ matrix.shard }}/3
+        if: ${{ !cancelled() }}
+        env:
+          ARC_TEST_REPORT_DIR: ${{ runner.temp }}/arc-browser
+          ARC_TEST_EXTENSION_SETUP_FAILED: ${{ steps.extension-setup.outcome != 'success' && '1' || '' }}
+          ARC_TEST_BROWSER_SETUP_FAILED: ${{ steps.browser-setup.outcome != 'success' && '1' || '' }}
+          ARC_TEST_BROWSER_ARGS: --shard=${{ matrix.shard }}/3
+        run: node scripts/test-suite.mjs browser --report-dir ${{ runner.temp }}/arc-browser
+
+      - name: Publish test summary
+        if: always()
+        run: node scripts/test-summary.mjs ${{ runner.temp }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results-${{ github.job }}-${{ strategy.job-index || 0 }}
+          path: ${{ runner.temp }}/arc-*
+          if-no-files-found: ignore

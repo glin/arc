@@ -336,24 +336,42 @@ export async function acquireBrowserLock({
 
 // Windows taskkill /T terminates the child process tree, including headless browsers.
 // If taskkill cannot launch, or on other platforms, send the signal to the child process.
-function killProcessTree(child, signal) {
-  if (process.platform === 'win32' && child.pid) {
-    const result = spawnSync('taskkill', ['/pid', String(child.pid), '/T', '/F']);
-    if (!result.error) return;
+function killProcessTree(
+  child,
+  signal,
+  {
+    platform = process.platform,
+    killGroup = process.kill,
+    killWindowsTree = (pid) => {
+      const result = spawnSync('taskkill', ['/pid', String(pid), '/T', '/F']);
+      return !result.error && result.status === 0;
+    },
+  } = {},
+) {
+  if (platform === 'win32' && child.pid) {
+    if (killWindowsTree(child.pid)) return;
+  }
+  if (child.arcProcessGroup && child.pid) {
+    try {
+      killGroup(-child.pid, signal);
+      return;
+    } catch {
+      /* The process group has already closed or is unavailable. */
+    }
   }
   child.kill(signal);
 }
 
 // Both parent and child receive Ctrl+C on Windows.
 // Forward the signal and retain any lock until the child closes.
-// A deadline exits if shutdown hangs.
+// Escalate before the outer collector's deadline and await child closure before release.
 export function forwardSignalToChildAndRelease(
   child,
   lock = null,
   {
     processEmitter = process,
     killTree = killProcessTree,
-    hardFallbackMs = 5_000,
+    hardFallbackMs = 1_000,
     scheduleFallback = (fn, milliseconds) => {
       const timer = setTimeout(() => fn(), milliseconds);
       timer.unref?.();
@@ -365,6 +383,14 @@ export function forwardSignalToChildAndRelease(
 ) {
   // Signal listeners receive no signal argument. Capture each signal name in its handler.
   let handled = false;
+  let groupRetired = false;
+  const retireGroup = () => {
+    if (child.arcProcessGroup && child.pid && !groupRetired) {
+      groupRetired = true;
+      killTree(child, 'SIGKILL');
+    }
+  };
+  child.once('close', retireGroup);
   const bound = Object.keys(SIGNAL_EXIT_CODES).map((signal) => {
     const handler = () => {
       if (handled) return;
@@ -372,11 +398,12 @@ export function forwardSignalToChildAndRelease(
       observation?.event('run', 'cancellation', { signal });
       const fallbackTimer = scheduleFallback(() => {
         observation?.event('cleanup', 'shutdown-fallback', { signal, childClosed: false });
-        lock?.release();
-        processEmitter.exit(SIGNAL_EXIT_CODES[signal]);
+        groupRetired = true;
+        killTree(child, 'SIGKILL');
       }, hardFallbackMs);
       child.once('close', () => {
         cancelFallback(fallbackTimer);
+        retireGroup();
         lock?.release();
         processEmitter.exit(SIGNAL_EXIT_CODES[signal]);
       });
@@ -386,9 +413,10 @@ export function forwardSignalToChildAndRelease(
   });
   for (const [signal, handler] of bound) processEmitter.on(signal, handler);
   return function detach() {
+    child.removeListener('close', retireGroup);
     for (const [signal, handler] of bound) processEmitter.off(signal, handler);
   };
 }
 
 // Expose takeover and stale-age helpers for deterministic tests.
-export const forTesting = { retireStaleLock, stepStaleObservation };
+export const forTesting = { retireStaleLock, stepStaleObservation, killProcessTree };

@@ -3,7 +3,7 @@ const { EventEmitter } = require('node:events');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { spawnSync } = require('node:child_process');
+const { spawn, spawnSync } = require('node:child_process');
 const { pathToFileURL } = require('node:url');
 const { testFiles, classification, caseBudget } = require('./test-classification.js');
 const { runChecks } = require('./typecheck-parallel.js');
@@ -19,11 +19,15 @@ let lane;
 let defaults;
 let units;
 let integration;
+let suite;
+let acceptance;
 beforeAll(async () => {
   lane = await import(pathToFileURL(path.join(__dirname, 'test-subprocess.mjs')).href);
   defaults = await import(pathToFileURL(path.join(__dirname, 'test-default.mjs')).href);
   units = await import(pathToFileURL(path.join(__dirname, 'test-unit.mjs')).href);
   integration = await import(pathToFileURL(path.join(__dirname, 'test-integration.mjs')).href);
+  suite = await import('./test-suite.mjs');
+  acceptance = await import('./verify-landing.mjs');
 });
 
 function rootTestFiles(directory = '') {
@@ -91,7 +95,7 @@ test('every root test file that reaches child_process carries the subprocess tag
   );
 });
 
-test('command entry points run through a linked checkout', { tags: ['subprocess'] }, () => {
+test('command entry points run through a linked checkout', { tags: ['subprocess'] }, async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'arc-entry-'));
   const linked = path.join(root, 'linked');
   const physical = path.join(root, 'physical');
@@ -104,6 +108,10 @@ test('command entry points run through a linked checkout', { tags: ['subprocess'
     for (const file of [
       'scripts/test-subprocess.mjs',
       'scripts/test-default.mjs',
+      'scripts/test-suite.mjs',
+      'scripts/test-reporter.mjs',
+      'scripts/test-lanes.mjs',
+      'scripts/verify-landing.mjs',
       'scripts/test-unit.mjs',
       'scripts/test-integration.mjs',
       'extension/test.mjs',
@@ -119,14 +127,36 @@ test('command entry points run through a linked checkout', { tags: ['subprocess'
     );
     write(
       'extension/test/browserchannels.mjs',
-      'export async function launchAnyBrowser(){throw Error("unexpected browser")} export async function acquireBrowserSlot(){throw Error("unexpected slot")}',
+      'export function processExists(){return true} export async function launchAnyBrowser(){throw Error("unexpected browser")} export async function acquireBrowserSlot(){throw Error("unexpected slot")}',
     );
     write('extension/src/example.test.ts', '');
+    write('extension/src/example.browser.test.ts', '');
+    write('extension/node_modules/vitest/vitest.mjs', 'console.log("Node child selected");process.stdin.resume();');
+    for (const file of [
+      'node_modules/oxfmt/bin/oxfmt',
+      'node_modules/oxlint/bin/oxlint',
+      'node_modules/stylelint/bin/stylelint.mjs',
+      'extension/node_modules/typescript/bin/tsc',
+      'cli/node_modules/typescript/bin/tsc',
+      'cli/node_modules/vitest/vitest.mjs',
+      'cli/build.mjs',
+    ])
+      write(file, '');
     write('node_modules/vitest/vitest.mjs', 'console.log("subprocess entry reached");process.exitCode=7;');
     write(
       'scripts/typecheck-parallel.js',
-      'module.exports = {runChecks: async ([lane]) => { console.log(lane.label); return [lane.label]; }};',
+      'module.exports = {runChecks: async ([lane], options) => { console.log(lane.label); const status = ["format", "root-units", "root-subprocess", "browser"].includes(lane.label) ? 1 : 0; options?.onResult?.({status}); return status ? [lane.label] : []; }};',
     );
+    write(
+      'scripts/import-only.cjs',
+      fs.readFileSync(path.join(repositoryRoot, 'scripts/typecheck-parallel.js'), 'utf8'),
+    );
+    const importOnly = spawnSync(
+      process.execPath,
+      ['-e', `require(${JSON.stringify(path.join(physical, 'scripts/import-only.cjs'))})`],
+      { encoding: 'utf8' },
+    );
+    assert.equal(importOnly.status, 0, importOnly.stderr);
     write(
       'catalog/fixture-case.json',
       JSON.stringify({
@@ -164,18 +194,31 @@ test('command entry points run through a linked checkout', { tags: ['subprocess'
     fs.symlinkSync(physical, linked, 'junction');
     for (const { file, args, status, output } of [
       { file: 'scripts/test-subprocess.mjs', args: [], status: 7, output: /subprocess entry reached/ },
-      { file: 'scripts/test-default.mjs', args: [], status: 1, output: /format:check/ },
-      { file: 'scripts/test-unit.mjs', args: [], status: 1, output: /root units/ },
-      { file: 'scripts/test-integration.mjs', args: [], status: 1, output: /root subprocess/ },
+      { file: 'scripts/test-default.mjs', args: [], status: 1, output: /format/ },
+      { file: 'scripts/test-unit.mjs', args: [], status: 1, output: /root-units/ },
+      { file: 'scripts/test-integration.mjs', args: [], status: 1, output: /root-subprocess/ },
+      { file: 'scripts/test-suite.mjs', args: ['all'], status: 1, output: /browser: failed/ },
       { file: 'extension/test.mjs', args: ['invalid-mode'], status: 1, output: /Unknown test mode/ },
       { file: 'scripts/isolated-editor.mjs', args: ['invalid-command'], status: 2, output: /Choose a command/ },
     ]) {
       const timings = path.join(root, 'timings', path.basename(file));
-      const env = { ...process.env, ARC_TEST_OBSERVATIONS_DIR: timings, ARC_TEST_OBSERVATION_RUN_ID: 'linked-parent' };
+      const env = {
+        ...process.env,
+        ARC_TEST_REPORT_DIR: path.join(root, 'reports', path.basename(file)),
+        ARC_TEST_OBSERVATIONS_DIR: timings,
+        ARC_TEST_OBSERVATION_RUN_ID: 'linked-parent',
+      };
       const result = spawnSync(process.execPath, [path.join(linked, file), ...args], { encoding: 'utf8', env });
       assert.ifError(result.error);
       assert.equal(result.status, status, `${file}\n${result.stdout}${result.stderr}`);
       assert.match(result.stdout + result.stderr, output);
+      if (file === 'scripts/test-suite.mjs') {
+        const report = JSON.parse(fs.readFileSync(path.join(env.ARC_TEST_REPORT_DIR, 'suite.json')));
+        assert.equal(report.categories[0].status, 'failed');
+        assert.equal(report.categories[1].status, 'passed');
+        assert.equal(report.categories.at(-1).status, 'failed');
+        assert.equal(report.exitCode, 1);
+      }
       const recorded = fs.existsSync(timings) ? fs.readdirSync(timings) : [];
       if (file === 'scripts/test-subprocess.mjs') {
         assert.equal(recorded.length, 1);
@@ -209,6 +252,105 @@ test('command entry points run through a linked checkout', { tags: ['subprocess'
         'Importing a linked command must create no timing run.',
       );
     }
+    write(
+      'extension/test/browserlock.mjs',
+      fs.readFileSync(path.join(repositoryRoot, 'extension/test/browserlock.mjs'), 'utf8'),
+    );
+    const full = spawn(process.execPath, [path.join(linked, 'extension/test.mjs'), 'full'], {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      timeout: 10_000,
+    });
+    let fullOutput = '';
+    const fullResult = await new Promise((resolve, reject) => {
+      full.once('error', reject);
+      full.stdout.on('data', (chunk) => {
+        fullOutput += chunk;
+        if (fullOutput.includes('Node child selected')) full.kill('SIGTERM');
+      });
+      full.stderr.on('data', (chunk) => {
+        fullOutput += chunk;
+      });
+      full.once('close', (code, signal) => resolve({ code, signal }));
+    });
+    assert.ok(fullResult.code !== 0 || fullResult.signal);
+    assert.match(fullOutput, /Node child selected/);
+    assert.doesNotMatch(fullOutput, /Browser lane|unexpected browser/);
+    write('extension/node_modules/vitest/vitest.mjs', 'process.exit(143);');
+    const nestedCancellation = spawnSync(process.execPath, [path.join(linked, 'extension/test.mjs'), 'full'], {
+      encoding: 'utf8',
+    });
+    assert.equal(nestedCancellation.status, 143);
+    assert.doesNotMatch(nestedCancellation.stdout + nestedCancellation.stderr, /Browser lane|unexpected browser/);
+    write(
+      'scripts/typecheck-parallel.js',
+      `const fs=require('node:fs');module.exports={runChecks:async ([lane],options)=>{
+      const output=lane.args.find(arg=>arg.startsWith('--outputFile='));
+      if(output)fs.writeFileSync(output.slice('--outputFile='.length),JSON.stringify({arcFailureAccounting:2,closureComplete:true,testResults:[],unhandledErrors:[]}));
+      options.onResult({status:0});return [];
+    }};`,
+    );
+    const gitEnv = Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^GIT_/i.test(key)));
+    const git = (...args) => {
+      const result = spawnSync('git', ['-C', physical, ...args], { encoding: 'utf8', env: gitEnv });
+      assert.equal(result.status, 0, result.stderr);
+      return result.stdout.trim();
+    };
+    git('init');
+    git('add', '.');
+    git(
+      '-c',
+      'user.name=Fixture',
+      '-c',
+      'user.email=fixture@example.invalid',
+      '-c',
+      'core.hooksPath=',
+      '-c',
+      'commit.gpgsign=false',
+      'commit',
+      '-m',
+      'fixture',
+    );
+    const base = git('rev-parse', 'HEAD');
+    const landingDirectory = path.join(root, 'landing-report');
+    const verifyArgs = [
+      path.join(physical, 'scripts/verify-landing.mjs'),
+      '--base',
+      base,
+      '--report-dir',
+      landingDirectory,
+    ];
+    const accepted = spawnSync(process.execPath, verifyArgs, { encoding: 'utf8' });
+    assert.equal(accepted.status, 0, accepted.stdout + accepted.stderr);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(landingDirectory, 'suite.json'))).exitCode, 0);
+    const reused = spawnSync(process.execPath, verifyArgs, { encoding: 'utf8' });
+    assert.equal(reused.status, 0, reused.stderr);
+    assert.doesNotMatch(reused.stdout, /Test report:/);
+    const suiteFile = path.join(landingDirectory, 'suite.json');
+    const originalReport = fs.readFileSync(suiteFile);
+    const editedReport = JSON.parse(originalReport);
+    editedReport.command.push('--altered');
+    fs.writeFileSync(suiteFile, JSON.stringify(editedReport));
+    const altered = spawnSync(process.execPath, verifyArgs, { encoding: 'utf8' });
+    fs.writeFileSync(suiteFile, originalReport);
+    assert.equal(altered.status, 1, 'Changed passing reports must refuse reuse.');
+    assert.match(altered.stdout, /Collection receipt/);
+    const receiptFile = path.join(landingDirectory, 'collection-receipt.json');
+    const originalReceipt = fs.readFileSync(receiptFile);
+    editedReport.categories[0].command.push('--altered');
+    fs.writeFileSync(suiteFile, JSON.stringify(editedReport));
+    fs.writeFileSync(receiptFile, JSON.stringify({ schema: 1, reportHash: suite.hash(fs.readFileSync(suiteFile)) }));
+    const wrongCommand = spawnSync(process.execPath, verifyArgs, { encoding: 'utf8' });
+    fs.writeFileSync(suiteFile, originalReport);
+    fs.writeFileSync(receiptFile, originalReceipt);
+    assert.equal(wrongCommand.status, 1);
+    assert.match(wrongCommand.stdout, /Category command identity/);
+    const trackedSource = path.join(physical, 'extension/src/example.test.ts');
+    const sourceBefore = fs.readFileSync(trackedSource);
+    fs.writeFileSync(trackedSource, 'dirty candidate');
+    const refused = spawnSync(process.execPath, verifyArgs, { encoding: 'utf8' });
+    fs.writeFileSync(trackedSource, sourceBefore);
+    assert.equal(refused.status, 1);
+    assert.match(refused.stdout, /clean tracked candidate/);
     const review = spawnSync(
       process.execPath,
       [
@@ -279,7 +421,7 @@ test('test:root and test:subprocess together select every root test file', () =>
     laneArgs.flatMap((arg, index) => (laneArgs[index - 1] === '--exclude' ? [arg] : [])),
     excluded,
   );
-  assert.match(scripts['test:smoke'], new RegExp(`vitest run ${lane.SMOKE_TEST_FILE.replace(/\./g, '\\.')}`));
+  assert.equal(scripts['test:smoke'], 'node scripts/test-suite.mjs smoke');
   assert.equal(scripts['test:unit'], 'node scripts/test-unit.mjs');
 });
 
@@ -288,7 +430,7 @@ test('both GitHub workflows retain complete categories', () => {
   const commands = [...workflow.matchAll(/^\s*run:\s*(\S.*)$/gm)].map((match) => match[1].trim());
   assert.ok(commands.includes('npm run test:unit'), 'The workflow must run test:unit.');
   assert.ok(commands.includes('npm run test:integration'), 'The workflow must run test:integration.');
-  assert.match(workflow, /npm --prefix extension run test:browser/);
+  assert.match(workflow, /node scripts\/test-suite.mjs browser/);
   const candidate = fs.readFileSync(path.join(repositoryRoot, '.github/workflows/vsix-candidate.yml'), 'utf8');
   assert.match(candidate, /^\s*- run: npm run test:all\s*$/m);
 });
@@ -297,12 +439,18 @@ test('the default runs direct units and the complete command adds every integrat
   const scripts = readScripts();
   assert.equal(scripts.test, 'node scripts/test-default.mjs');
   assert.deepEqual(
-    defaults.defaultLanes(repositoryRoot, 'npm-cli.js').map((entry) => entry.args),
+    defaults.defaultLanes(repositoryRoot).map((entry) => entry.id),
     [
-      ['npm-cli.js', 'run', 'format:check'],
-      ['npm-cli.js', 'run', 'lint'],
-      ['npm-cli.js', 'run', 'typecheck'],
-      ['npm-cli.js', 'run', 'test:unit'],
+      'format',
+      'lint-js',
+      'lint-css',
+      'webview-globals',
+      'extension-tsc',
+      'webview-tsc',
+      'cli-tsc',
+      'root-units',
+      'extension-units',
+      'cli-units',
     ],
   );
   const lanes = units.unitLanes(repositoryRoot);
@@ -314,27 +462,21 @@ test('the default runs direct units and the complete command adds every integrat
   assert.deepEqual(lanes[2].args.slice(2), ['--tags-filter=!subprocess', '--exclude', 'test/smoke.bundled-*.test.mjs']);
   assert.equal(scripts['test:integration'], 'node scripts/test-integration.mjs');
   assert.equal(scripts['test:browser'], 'node extension/test.mjs browser');
-  assert.equal(scripts['test:all'], 'npm test && node scripts/test-integration.mjs --browser');
+  assert.equal(scripts['test:all'], 'node scripts/test-suite.mjs all');
   const groups = integration.integrationLanes(repositoryRoot, true, 'npm-cli.js');
   assert.deepEqual(
-    groups.map((entry) => entry.args),
-    [
-      ['npm-cli.js', 'run', 'test:subprocess'],
-      ['npm-cli.js', '--prefix', 'extension', 'run', 'test:integration'],
-      ['npm-cli.js', 'run', 'test:panel-mockup'],
-      ['npm-cli.js', 'run', 'test:smoke'],
-      ['npm-cli.js', 'run', 'test:browser'],
-    ],
+    groups.map((entry) => entry.id),
+    ['root-subprocess', 'extension-integration', 'panel-mockup', 'hook-smoke', 'cli-build', 'cli-smoke', 'browser'],
   );
   assert.deepEqual(integration.integrationLanes(repositoryRoot, false, 'npm-cli.js'), groups.slice(0, -1));
   const extension = JSON.parse(fs.readFileSync(path.join(repositoryRoot, 'extension/package.json'))).scripts;
   assert.equal(extension['test:integration'], 'node test.mjs node --tags-filter=subprocess');
   const cli = JSON.parse(fs.readFileSync(path.join(repositoryRoot, 'cli/package.json'))).scripts;
   assert.equal(cli['test:unit'], 'vitest run --tags-filter=!subprocess --exclude "test/smoke.bundled-*.test.mjs"');
-  assert.equal(cli['test:smoke'], 'npm run build && vitest run --tags-filter=subprocess');
+  assert.equal(cli['test:smoke'], 'node ../scripts/test-suite.mjs cli-smoke');
 });
 
-test('stages run sequentially and stop after a failure', async () => {
+test('stages run sequentially and retain failures around a passing stage', async () => {
   const started = [];
   let finish;
   const first = new Promise((resolve) => {
@@ -343,12 +485,12 @@ test('stages run sequentially and stop after a failure', async () => {
   const pending = defaults.runLanes([{ label: 'first' }, { label: 'second' }, { label: 'third' }], async ([entry]) => {
     started.push(entry.label);
     if (entry.label === 'first') await first;
-    return entry.label === 'second' ? ['second'] : [];
+    return entry.label === 'second' ? [] : [entry.label];
   });
   assert.deepEqual(started, ['first']);
   finish();
-  assert.deepEqual(await pending, ['second']);
-  assert.deepEqual(started, ['first', 'second']);
+  assert.deepEqual(await pending, ['first', 'third']);
+  assert.deepEqual(started, ['first', 'second', 'third']);
 });
 
 test.each(['default', 'unit', 'integration'])('%s lanes publish child output before close', async (wrapper) => {
@@ -358,7 +500,7 @@ test.each(['default', 'unit', 'integration'])('%s lanes publish child output bef
   const started = [];
   const selected =
     wrapper === 'default'
-      ? defaults.defaultLanes(repositoryRoot, 'npm-cli.js').slice(-1)
+      ? defaults.defaultLanes(repositoryRoot)
       : wrapper === 'unit'
         ? units.unitLanes(repositoryRoot)
         : integration.integrationLanes(repositoryRoot, true, 'npm-cli.js');
@@ -370,18 +512,7 @@ test.each(['default', 'unit', 'integration'])('%s lanes publish child output bef
         const child = new EventEmitter();
         child.stdout = new EventEmitter();
         child.stderr = new EventEmitter();
-        if (args.includes('test:unit')) {
-          defaults
-            .runLanes(units.unitLanes(repositoryRoot), (nested, nestedOptions) =>
-              run(
-                nested,
-                nestedOptions,
-                (chunk) => child.stdout.emit('data', chunk),
-                (chunk) => child.stderr.emit('data', chunk),
-              ),
-            )
-            .then((failed) => child.emit('close', failed.length ? 1 : 0));
-        } else children.push(child);
+        children.push(child);
         return child;
       },
       write,
@@ -405,8 +536,12 @@ test.each(['default', 'unit', 'integration'])('%s lanes publish child output bef
   assert.equal(Buffer.concat(errors).toString(), 'child progress\n');
   assert.equal(started.length, active);
   children[0].emit('close', 7);
+  for (let index = 1; index < selected.length; index++) {
+    await vi.waitFor(() => assert.ok(children[index]));
+    children[index].emit('close', 0);
+  }
   assert.deepEqual(await pending, [selected[0].label]);
-  assert.equal(started.length, active);
+  assert.ok(started.length >= active);
   assert.equal(Buffer.concat(output).toString(), 'waiting for subprocess lock\n');
   assert.equal(Buffer.concat(errors).toString(), 'child progress\n');
 });
@@ -536,4 +671,920 @@ test('independent subprocess launches start while earlier children remain pendin
     statuses = await Promise.all(requests);
   }
   assert.deepEqual(statuses, [7, 0]);
+});
+
+function collectionFixture() {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'arc-collection-'));
+  const emitter = new EventEmitter();
+  const identity = { candidate: 'b'.repeat(40), treeHash: 'c'.repeat(64), clean: true };
+  const environment = { hash: 'd'.repeat(64) };
+  const options = {
+    cwd: directory,
+    base: 'a'.repeat(40),
+    reportDir: path.join(directory, 'report'),
+    identify: () => ({ ...identity }),
+    environmentFor: () => environment,
+    observationFactory: () => null,
+    processEmitter: emitter,
+  };
+  const lanes = ['first', 'middle', 'last'].map((id) => ({
+    id,
+    label: id,
+    cwd: directory,
+    args: ['-e', id],
+    package: 'root',
+  }));
+  return { directory, emitter, identity, environment, options, lanes };
+}
+
+// These cases exercise failure collection and admission boundaries without starting test workers.
+test('collection reports independent failures, setup blocking, cancellation, and original output', async () => {
+  const fixture = collectionFixture();
+  const { directory, emitter, options, lanes } = fixture;
+  const launched = [];
+  const output = [];
+  try {
+    const report = await suite.collectSuite({
+      ...options,
+      lanes,
+      runChecks: (entries, settings) =>
+        runChecks(entries, {
+          ...settings,
+          log: () => {},
+          logError: () => {},
+          write: (chunk) => output.push(String(chunk)),
+          writeError: (chunk) => output.push(String(chunk)),
+          spawnFn: (_command, args) => {
+            launched.push(args[1]);
+            const child = new EventEmitter();
+            child.stdout = new EventEmitter();
+            child.stderr = new EventEmitter();
+            queueMicrotask(() => {
+              child.stdout.emit('data', Buffer.from(args[1] + ' progress'));
+              assert.ok(output.includes(args[1] + ' progress'), 'Output must stream before close.');
+              child.emit('close', args[1] === 'middle' ? 0 : 7);
+            });
+            return child;
+          },
+        }),
+    });
+    assert.equal(report.exitCode, 1);
+    assert.deepEqual(launched, ['first', 'middle', 'last']);
+    assert.deepEqual(
+      report.categories.map((row) => row.status),
+      ['failed', 'passed', 'failed'],
+    );
+    assert.equal(report.categories.flatMap((row) => row.failures).length, 2);
+    assert.equal(fs.readFileSync(report.categories[2].log, 'utf8'), 'last progress');
+    assert.equal(emitter.listenerCount('SIGTERM'), 0);
+
+    const blocked = await suite.collectSuite({
+      ...options,
+      reportDir: path.join(directory, 'blocked'),
+      lanes: [{ ...lanes[0], id: 'cli-build' }, { ...lanes[1], requiresBuild: true }, lanes[2]],
+      runChecks: async ([entry], settings) => {
+        settings.onResult({ status: entry.id === 'cli-build' ? 1 : 0 });
+        return entry.id === 'cli-build' ? [entry.id] : [];
+      },
+    });
+    assert.deepEqual(
+      blocked.categories.map((row) => row.status),
+      ['failed', 'blocked', 'passed'],
+    );
+
+    const cancelled = await suite.collectSuite({
+      ...options,
+      reportDir: path.join(directory, 'cancelled'),
+      lanes,
+      runChecks: (entries, settings) =>
+        runChecks(entries, {
+          ...settings,
+          log: () => {},
+          logError: () => {},
+          spawnFn: () => {
+            const child = new EventEmitter();
+            child.stdout = new EventEmitter();
+            child.stderr = new EventEmitter();
+            child.kill = () => {
+              child.emit('close', null, 'SIGTERM');
+            };
+            queueMicrotask(() => emitter.emit('SIGTERM'));
+            return child;
+          },
+        }),
+    });
+    assert.equal(cancelled.exitCode, 1);
+    assert.deepEqual(
+      cancelled.categories.map((row) => row.status),
+      ['cancelled', 'cancelled', 'cancelled'],
+    );
+    assert.equal(emitter.listenerCount('SIGTERM'), 0);
+
+    const missing = await suite.collectSuite({
+      ...options,
+      reportDir: path.join(directory, 'missing'),
+      lanes,
+      runChecks: (entries, settings) =>
+        runChecks(entries, {
+          ...settings,
+          log: () => {},
+          logError: () => {},
+          spawnFn: () => {
+            throw Error('missing executable');
+          },
+        }),
+    });
+    assert.deepEqual(
+      missing.categories.map((row) => row.status),
+      ['blocked', 'blocked', 'blocked'],
+    );
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+function acceptanceFixture() {
+  const fixture = collectionFixture();
+  const { directory, identity, environment } = fixture;
+  const categories = ['first', 'middle', 'last'].map((id) => {
+    const log = path.join(directory, id + '.log');
+    fs.writeFileSync(log, id);
+    return {
+      id,
+      command: [process.execPath, '-e', id],
+      cwd: directory,
+      sourceStart: { ...identity },
+      sourceEnd: { ...identity },
+      status: id === 'middle' ? 'passed' : 'failed',
+      exitCode: id === 'middle' ? 0 : 1,
+      log,
+      logHash: suite.hash(fs.readFileSync(log)),
+      testsHash: null,
+      failures: id === 'middle' ? [] : [suite.categoryFailure({ id, log, exitCode: 1 }, directory)],
+    };
+  });
+  const report = {
+    schema: 1,
+    mode: 'all',
+    base: 'a'.repeat(40),
+    checkout: directory,
+    start: { ...identity },
+    end: { ...identity },
+    environment,
+    environmentEnd: environment,
+    selected: categories.map((row) => row.id),
+    categories,
+    exitCode: 1,
+  };
+  const reportHash = suite.hash(JSON.stringify(report));
+  const base = {
+    ...report,
+    categories: structuredClone(report.categories),
+    start: { ...identity, candidate: report.base },
+    end: { ...identity, candidate: report.base },
+  };
+  for (const row of base.categories) {
+    row.sourceStart = { ...row.sourceStart, candidate: report.base };
+    row.sourceEnd = { ...row.sourceEnd, candidate: report.base };
+  }
+  const baseFile = path.join(directory, 'base.json');
+  fs.writeFileSync(baseFile, JSON.stringify(base));
+  const policy = {
+    authority: 'owner-authorized-unrelated-failures',
+    candidate: identity.candidate,
+    base: report.base,
+    reportHash,
+    affectedChecks: ['middle'],
+    dispositions: categories.flatMap((row) =>
+      row.failures.map((failure) => ({
+        failure: failure.id,
+        classification: 'base-existing',
+        explanation: 'Matching named comparison reproduces the same failure.',
+        reviewedBy: 'fixture-reviewer',
+        evidence: { path: baseFile, sha256: suite.hash(fs.readFileSync(baseFile)) },
+      })),
+    ),
+  };
+  const input = {
+    report,
+    reportHash,
+    policy,
+    current: identity,
+    base: report.base,
+    expectedCategories: report.selected,
+    expectedLanes: fixture.lanes,
+    environment,
+  };
+  return { ...fixture, input, baseFile };
+}
+
+test('acceptance retains failed truth for matching unrelated failures and explicit blocked categories', () => {
+  const fixture = acceptanceFixture();
+  try {
+    const decision = acceptance.validateAcceptance(fixture.input);
+    assert.equal(decision.accepted, true);
+    assert.equal(decision.suiteExitCode, 1);
+    const { report, policy } = fixture.input;
+    report.categories[0].status = 'blocked';
+    const base = JSON.parse(fs.readFileSync(fixture.baseFile));
+    base.categories[0].status = 'blocked';
+    fs.writeFileSync(fixture.baseFile, JSON.stringify(base));
+    for (const row of policy.dispositions) row.evidence.sha256 = suite.hash(fs.readFileSync(fixture.baseFile));
+    assert.throws(() => acceptance.validateAcceptance(fixture.input), /concrete test or static diagnostics/);
+    report.categories = report.categories.filter((row) => row.id === 'middle');
+    report.selected = ['middle'];
+    report.exitCode = 0;
+    fixture.input.expectedCategories = ['middle'];
+    fixture.input.expectedLanes = [fixture.lanes[1]];
+    fixture.input.policy = null;
+    assert.equal(acceptance.validateAcceptance(fixture.input).accepted, true);
+  } finally {
+    fs.rmSync(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test.each([
+  [
+    'related failure',
+    (input) => {
+      input.policy.dispositions[0].classification = 'related';
+    },
+    /unrelated disposition/,
+  ],
+  [
+    'uncertain failure',
+    (input) => {
+      input.policy.dispositions[0].classification = 'uncertain';
+    },
+    /unrelated disposition/,
+  ],
+  [
+    'omitted failure',
+    (input) => {
+      input.policy.dispositions.pop();
+    },
+    /exactly one disposition/,
+  ],
+  [
+    'unknown failure',
+    (input) => {
+      input.policy.dispositions[0].failure = 'unknown';
+    },
+    /unrelated disposition/,
+  ],
+  [
+    'missing category',
+    (input) => {
+      input.report.categories.pop();
+    },
+    /category results/,
+  ],
+  [
+    'failed affected check',
+    (input) => {
+      input.policy.affectedChecks = ['first'];
+    },
+    /Affected check did not pass/,
+  ],
+  [
+    'blocked affected check',
+    (input) => {
+      input.report.categories[0].status = 'blocked';
+      input.policy.affectedChecks = ['first'];
+    },
+    /Affected check did not pass/,
+  ],
+  [
+    'dirty sources',
+    (input) => {
+      input.current.clean = false;
+    },
+    /clean tracked candidate/,
+  ],
+  [
+    'dirty execution',
+    (input) => {
+      input.report.start.clean = false;
+    },
+    /clean tracked candidate/,
+  ],
+  [
+    'changed tracked content',
+    (input) => {
+      input.current.treeHash = 'e'.repeat(64);
+    },
+    /tracked content changed/,
+  ],
+  [
+    'stale candidate',
+    (input) => {
+      input.current.candidate = 'e'.repeat(40);
+    },
+    /Candidate or tracked content/,
+  ],
+  [
+    'changed base',
+    (input) => {
+      input.base = 'e'.repeat(40);
+    },
+    /Integration base changed/,
+  ],
+  [
+    'altered report',
+    (input) => {
+      input.reportHash = 'e'.repeat(64);
+    },
+    /Policy does not match/,
+  ],
+  [
+    'altered evidence',
+    (input) => {
+      input.policy.dispositions[0].evidence.sha256 = 'e'.repeat(64);
+    },
+    /Evidence changed/,
+  ],
+  [
+    'altered log',
+    (input) => {
+      fs.appendFileSync(input.report.categories[0].log, 'changed');
+    },
+    /Category log changed/,
+  ],
+  [
+    'cancelled coverage',
+    (input) => {
+      input.report.categories[0].status = 'cancelled';
+    },
+    /Cancelled coverage/,
+  ],
+  [
+    'changed environment',
+    (input) => {
+      input.environment = { hash: 'e'.repeat(64) };
+    },
+    /environment changed/,
+  ],
+  [
+    'missing policy',
+    (input) => {
+      input.policy = null;
+    },
+    /explicit owner-authorized/,
+  ],
+  [
+    'missing affected checks',
+    (input) => {
+      input.policy.affectedChecks = [];
+    },
+    /requires affected checks/,
+  ],
+])('acceptance refuses %s', (_name, change, expected) => {
+  const fixture = acceptanceFixture();
+  try {
+    change(fixture.input);
+    assert.throws(() => acceptance.validateAcceptance(fixture.input), expected);
+  } finally {
+    fs.rmSync(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test('CI continues independent categories after unit and browser setup failures and stops after cancellation', async () => {
+  const workflow = fs.readFileSync(path.join(repositoryRoot, '.github/workflows/tests.yml'), 'utf8');
+  const steps = workflow.split(/^      - /m).slice(1);
+  const unitsStep = steps.find((step) => step.startsWith('name: Direct unit tests'));
+  const integrationStep = steps.find((step) => step.startsWith('name: Integration and smoke tests'));
+  const admits = (step, cancelled) => {
+    const condition = step.match(/if: (.*)/)[1].trim();
+    assert.equal(condition, '${{ !cancelled() }}');
+    return !cancelled;
+  };
+  assert.ok(admits(unitsStep, false));
+  assert.ok(admits(integrationStep, false));
+  assert.equal(admits(unitsStep, true), false);
+  assert.equal(admits(integrationStep, true), false);
+  assert.ok(
+    integrationStep.includes(
+      "ARC_TEST_BROWSER_SETUP_FAILED: ${{ steps.browser-setup.outcome != 'success' && '1' || '' }}",
+    ),
+  );
+  const fixture = collectionFixture();
+  try {
+    vi.stubEnv('ARC_TEST_BROWSER_SETUP_FAILED', '1');
+    const launched = [];
+    const lanes = [
+      ...suite.suiteLanes(fixture.directory, 'unit'),
+      ...suite.suiteLanes(fixture.directory, 'integration'),
+    ];
+    for (const lane of lanes) {
+      if (lane.args[0].startsWith('-')) continue;
+      fs.mkdirSync(path.dirname(lane.args[0]), { recursive: true });
+      fs.writeFileSync(lane.args[0], '');
+    }
+    const report = await suite.collectSuite({
+      ...fixture.options,
+      lanes,
+      runChecks: async ([lane], settings) => {
+        launched.push(lane.id);
+        const output = lane.args.find((arg) => arg.startsWith('--outputFile='));
+        if (output)
+          fs.writeFileSync(
+            output.slice('--outputFile='.length),
+            JSON.stringify({ arcFailureAccounting: 2, closureComplete: true, testResults: [], unhandledErrors: [] }),
+          );
+        settings.onResult({ status: lane.id === 'root-units' ? 1 : 0 });
+        return lane.id === 'root-units' ? [lane.id] : [];
+      },
+    });
+    assert.equal(report.exitCode, 1);
+    assert.equal(report.categories.find((row) => row.id === 'panel-mockup').status, 'blocked');
+    assert.ok(launched.includes('extension-units'));
+    assert.ok(launched.includes('root-subprocess'));
+    assert.ok(launched.includes('cli-smoke'));
+    assert.equal(launched.includes('panel-mockup'), false);
+    const candidate = fs.readFileSync(path.join(repositoryRoot, '.github/workflows/vsix-candidate.yml'), 'utf8');
+    assert.doesNotMatch(candidate, /continue-on-error/);
+    assert.match(candidate, /needs: package/);
+    const packageStep = candidate
+      .split(/^      - /m)
+      .find((step) => step.startsWith('run: npm --prefix extension run package'));
+    assert.doesNotMatch(packageStep, /if:/);
+  } finally {
+    vi.unstubAllEnvs();
+    fs.rmSync(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test('acceptance requires named affected tests to pass within a category with unrelated failures', () => {
+  const fixture = acceptanceFixture();
+  try {
+    const { report, policy } = fixture.input;
+    const category = report.categories[0];
+    category.tests = path.join(fixture.directory, 'named.tests.json');
+    fs.writeFileSync(
+      category.tests,
+      JSON.stringify({
+        arcFailureAccounting: 2,
+        closureComplete: true,
+        testResults: [
+          {
+            name: path.join(fixture.directory, 'sample.test.js'),
+            status: 'failed',
+            assertionResults: [
+              { fullName: 'affected contract', status: 'passed', failureMessages: [] },
+              { fullName: 'existing unrelated failure', status: 'failed', failureMessages: ['same failure'] },
+            ],
+          },
+        ],
+      }),
+    );
+    category.testsHash = suite.hash(fs.readFileSync(category.tests));
+    category.failures = suite.failedTests(category.tests, category.id, fixture.directory);
+    const base = JSON.parse(fs.readFileSync(fixture.baseFile));
+    base.categories[0] = {
+      ...category,
+      sourceStart: { ...category.sourceStart, candidate: report.base },
+      sourceEnd: { ...category.sourceEnd, candidate: report.base },
+    };
+    fs.writeFileSync(fixture.baseFile, JSON.stringify(base));
+    policy.dispositions[0].failure = category.failures[0].id;
+    for (const row of policy.dispositions) row.evidence.sha256 = suite.hash(fs.readFileSync(fixture.baseFile));
+    policy.affectedChecks = [{ category: category.id, file: 'sample.test.js', name: 'affected contract' }];
+    assert.equal(acceptance.validateAcceptance(fixture.input).suiteExitCode, 1);
+    policy.affectedChecks[0].name = 'existing unrelated failure';
+    assert.throws(() => acceptance.validateAcceptance(fixture.input), /Affected check did not pass/);
+    policy.affectedChecks[0].name = 'unexecuted affected test';
+    assert.throws(() => acceptance.validateAcceptance(fixture.input), /Affected check did not pass/);
+  } finally {
+    fs.rmSync(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test('infrastructure dispositions require concrete unchanged evidence and affected-check independence', () => {
+  const fixture = acceptanceFixture();
+  try {
+    const { input } = fixture;
+    for (const row of input.policy.dispositions) {
+      const category = input.report.categories.find((category) =>
+        category.failures.some((failure) => failure.id === row.failure),
+      );
+      const evidence = {
+        candidate: input.current.candidate,
+        base: input.base,
+        reportHash: input.reportHash,
+        failure: row.failure,
+        cause: 'The owned fixture lacks an external executable.',
+        independence: 'The passed affected check starts no external executable.',
+        artifacts: [{ path: category.log, sha256: category.logHash }],
+      };
+      const file = path.join(fixture.directory, category.id + '.infrastructure.json');
+      fs.writeFileSync(file, JSON.stringify(evidence));
+      row.classification = 'unrelated-infrastructure';
+      row.evidence = { path: file, sha256: suite.hash(fs.readFileSync(file)) };
+    }
+    assert.equal(acceptance.validateAcceptance(input).suiteExitCode, 1);
+    input.report.categories[0].status = 'blocked';
+    assert.equal(acceptance.validateAcceptance(input).accepted, true);
+    const row = input.policy.dispositions[0];
+    const evidence = JSON.parse(fs.readFileSync(row.evidence.path));
+    evidence.independence = '';
+    fs.writeFileSync(row.evidence.path, JSON.stringify(evidence));
+    row.evidence.sha256 = suite.hash(fs.readFileSync(row.evidence.path));
+    assert.throws(() => acceptance.validateAcceptance(input), /affected-check independence/);
+  } finally {
+    fs.rmSync(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+// These fixtures exercise independent acceptance failures without starting workers.
+test('interrupted collection refuses stale category results before launching', async () => {
+  const fixture = collectionFixture();
+  try {
+    fs.mkdirSync(fixture.options.reportDir);
+    fs.writeFileSync(path.join(fixture.options.reportDir, 'first.tests.json'), '{"testResults":[]}');
+    let launched = false;
+    await assert.rejects(
+      suite.collectSuite({
+        ...fixture.options,
+        lanes: fixture.lanes,
+        runChecks: async () => {
+          launched = true;
+          return ['first'];
+        },
+      }),
+      /fresh|empty/,
+    );
+    assert.equal(launched, false);
+  } finally {
+    fs.rmSync(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test('failed assertions retain independent file errors and unhandled errors', () => {
+  const fixture = collectionFixture();
+  try {
+    const file = path.join(fixture.directory, 'tests.json');
+    fs.writeFileSync(
+      file,
+      JSON.stringify({
+        arcFailureAccounting: 2,
+        closureComplete: true,
+        unhandledErrors: ['new unhandled rejection'],
+        testResults: [
+          {
+            name: 'sample.test.js',
+            status: 'failed',
+            message: 'new teardown failure',
+            fileErrors: [
+              { name: '<module>', detail: 'new teardown failure' },
+              { name: 'nested suite', detail: 'another hook failure' },
+            ],
+            assertionResults: [
+              { fullName: 'existing assertion', status: 'failed', failureMessages: ['existing failure'] },
+            ],
+          },
+        ],
+      }),
+    );
+    assert.deepEqual(
+      suite.failedTests(file, 'first', fixture.directory).map((row) => row.detail),
+      ['existing failure', 'new teardown failure', 'another hook failure', 'new unhandled rejection'],
+    );
+  } finally {
+    fs.rmSync(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test('equal static exit codes do not reproduce different diagnostics', async () => {
+  const fixture = collectionFixture();
+  try {
+    const reports = [];
+    for (const diagnostic of ['old.ts(1): error TS1: old failure', 'new.ts(2): error TS2: new failure']) {
+      reports.push(
+        await suite.collectSuite({
+          ...fixture.options,
+          reportDir: path.join(fixture.directory, String(reports.length)),
+          lanes: [fixture.lanes[0]],
+          runChecks: async ([entry], options) => {
+            options.onOutput(entry, diagnostic);
+            options.onResult({ status: 2 });
+            return [entry.id];
+          },
+        }),
+      );
+    }
+    assert.notEqual(reports[0].categories[0].failures[0].id, reports[1].categories[0].failures[0].id);
+  } finally {
+    fs.rmSync(fixture.directory, { recursive: true, force: true });
+  }
+  const acceptanceCase = acceptanceFixture();
+  try {
+    const category = acceptanceCase.input.report.categories[0];
+    category.log = path.join(acceptanceCase.directory, 'candidate-first.log');
+    fs.writeFileSync(category.log, 'new.ts(2): error TS2: new failure');
+    category.logHash = suite.hash(fs.readFileSync(category.log));
+    category.failures = [suite.categoryFailure(category, acceptanceCase.directory)];
+    acceptanceCase.input.policy.dispositions[0].failure = category.failures[0].id;
+    assert.throws(() => acceptance.validateAcceptance(acceptanceCase.input), /Base comparison does not reproduce/);
+  } finally {
+    fs.rmSync(acceptanceCase.directory, { recursive: true, force: true });
+  }
+});
+
+test('child-origin cancellation stops later collector categories', async () => {
+  const fixture = collectionFixture();
+  try {
+    const launched = [];
+    const report = await suite.collectSuite({
+      ...fixture.options,
+      lanes: fixture.lanes,
+      runChecks: async ([entry], options) => {
+        launched.push(entry.id);
+        options.onResult({ status: 1, signal: 'SIGTERM' });
+        return [entry.id];
+      },
+    });
+    assert.deepEqual(launched, ['first']);
+    assert.deepEqual(
+      report.categories.map((row) => row.status),
+      ['cancelled', 'cancelled', 'cancelled'],
+    );
+  } finally {
+    fs.rmSync(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test('opposite results with the same affected test name cannot pass acceptance', () => {
+  const fixture = acceptanceFixture();
+  try {
+    const category = fixture.input.report.categories[1];
+    category.tests = path.join(fixture.directory, 'duplicate.json');
+    fs.writeFileSync(
+      category.tests,
+      JSON.stringify({
+        arcFailureAccounting: 2,
+        closureComplete: true,
+        testResults: [
+          {
+            name: path.join(fixture.directory, 'duplicate.test.js'),
+            assertionResults: [
+              { fullName: 'affected', status: 'passed' },
+              { fullName: 'affected', status: 'failed', failureMessages: ['regression'] },
+            ],
+          },
+        ],
+      }),
+    );
+    category.testsHash = suite.hash(fs.readFileSync(category.tests));
+    category.failures = suite.failedTests(category.tests, category.id, fixture.directory);
+    category.status = 'failed';
+    category.exitCode = 1;
+    const base = JSON.parse(fs.readFileSync(fixture.baseFile));
+    base.categories[1] = {
+      ...category,
+      sourceStart: { ...category.sourceStart, candidate: fixture.input.base },
+      sourceEnd: { ...category.sourceEnd, candidate: fixture.input.base },
+    };
+    fs.writeFileSync(fixture.baseFile, JSON.stringify(base));
+    fixture.input.policy.dispositions.push({
+      ...fixture.input.policy.dispositions[0],
+      failure: category.failures[0].id,
+    });
+    for (const disposition of fixture.input.policy.dispositions)
+      disposition.evidence.sha256 = suite.hash(fs.readFileSync(fixture.baseFile));
+    fixture.input.policy.affectedChecks = [{ category: category.id, file: 'duplicate.test.js', name: 'affected' }];
+    assert.throws(() => acceptance.validateAcceptance(fixture.input), /Affected check did not pass/);
+  } finally {
+    fs.rmSync(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test('collector timing accounts for every required phase', async () => {
+  const fixture = collectionFixture();
+  const observations = await import('../extension/test/observations.mjs');
+  const events = [];
+  try {
+    await suite.collectSuite({
+      ...fixture.options,
+      lanes: fixture.lanes,
+      observationFactory: () =>
+        observations.createTestObservation({
+          cwd: fixture.directory,
+          identity: {},
+          env: {},
+          append: (line) => events.push(JSON.parse(line)),
+          announce: () => {},
+          processEmitter: fixture.emitter,
+        }),
+      runChecks: async (_entries, options) => {
+        options.onResult({ status: 0 });
+        return [];
+      },
+    });
+    assert.equal(events.at(-1).complete, true);
+  } finally {
+    fs.rmSync(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test('complete subprocess selection uses the admission argument owner', () => {
+  const entry = suite.suiteLanes(repositoryRoot).find((row) => row.id === 'root-subprocess');
+  assert.deepEqual(entry.args, lane.subprocessVitestArgs(repositoryRoot));
+});
+
+test(
+  'installed Vitest retains assertions, multiple hook errors, and unhandled errors together',
+  { tags: ['subprocess'] },
+  () => {
+    const fixture = collectionFixture();
+    try {
+      fs.writeFileSync(
+        path.join(fixture.directory, 'vitest.config.mjs'),
+        'export default {test:{globals:true,include:["symptom.test.js"],globalSetup:["./setup.mjs"]}};',
+      );
+      fs.writeFileSync(
+        path.join(fixture.directory, 'setup.mjs'),
+        'export default function(project){const close=project.close.bind(project);project.close=async()=>{await close();throw Error("independent project closure failure")}}',
+      );
+      fs.writeFileSync(
+        path.join(fixture.directory, 'symptom.test.js'),
+        `
+      test('existing assertion',()=>{throw Error('existing assertion failure')});
+      afterAll(()=>{throw Error('new teardown failure')});
+      describe('second',()=>{afterAll(()=>{throw Error('second teardown failure')});test('passes',()=>{})});
+      describe('nested',()=>{afterAll(()=>{throw Error('nested teardown failure')});test('passes',()=>{})});
+      test('unhandled',()=>{process.emit('unhandledRejection',new Error('new unhandled failure'),Promise.resolve())});
+    `,
+      );
+      const tests = path.join(fixture.directory, 'results.json');
+      const result = spawnSync(
+        process.execPath,
+        [
+          path.join(repositoryRoot, 'node_modules/vitest/vitest.mjs'),
+          'run',
+          '--root',
+          fixture.directory,
+          '--config',
+          path.join(fixture.directory, 'vitest.config.mjs'),
+          '--reporter',
+          path.join(repositoryRoot, 'scripts/test-reporter.mjs'),
+        ],
+        { encoding: 'utf8', env: { ...process.env, ARC_TEST_RESULTS_FILE: tests }, timeout: 20000 },
+      );
+      assert.ifError(result.error);
+      assert.notEqual(result.status, 0);
+      const failures = suite.failedTests(tests, 'first', fixture.directory);
+      for (const detail of [
+        'existing assertion failure',
+        'new teardown failure',
+        'second teardown failure',
+        'nested teardown failure',
+        'new unhandled failure',
+        'independent project closure failure',
+      ])
+        assert.ok(
+          failures.some((row) => row.detail.includes(detail)),
+          detail + '\n' + JSON.stringify(failures, null, 2) + '\n' + result.stdout + result.stderr,
+        );
+      assert.equal(JSON.parse(fs.readFileSync(tests)).arcFailureAccounting, 2);
+    } finally {
+      fs.rmSync(fixture.directory, { recursive: true, force: true });
+    }
+  },
+);
+
+// Two native runs distinguish a passing test run from an already failing test run at global teardown.
+test('global teardown failures require their own landing dispositions', { tags: ['subprocess'] }, async () => {
+  for (const assertionFails of [false, true]) {
+    const fixture = collectionFixture();
+    try {
+      fs.writeFileSync(
+        path.join(fixture.directory, 'vitest.config.mjs'),
+        'export default {test:{globals:true,include:["symptom.test.js"],globalSetup:["./setup.mjs"]}};',
+      );
+      fs.writeFileSync(
+        path.join(fixture.directory, 'setup.mjs'),
+        'export default function(){return ()=>{throw Error("independent global teardown failure")}}',
+      );
+      fs.writeFileSync(
+        path.join(fixture.directory, 'symptom.test.js'),
+        assertionFails
+          ? 'test("passes",()=>{});test("existing assertion",()=>{throw Error("existing assertion failure")})'
+          : 'test("passes",()=>{})',
+      );
+      const lanes = [
+        {
+          ...fixture.lanes[0],
+          vitest: true,
+          args: [
+            path.join(repositoryRoot, 'node_modules/vitest/vitest.mjs'),
+            'run',
+            '--config',
+            path.join(fixture.directory, 'vitest.config.mjs'),
+          ],
+        },
+      ];
+      const report = await suite.collectSuite({ ...fixture.options, lanes });
+      const category = report.categories[0];
+      assert.equal(category.status, 'failed', fs.readFileSync(category.log, 'utf8'));
+      assert.equal(category.diagnosticsComplete, true);
+      const teardown = category.failures.filter((row) => row.detail.includes('independent global teardown failure'));
+      assert.equal(teardown.length, 1);
+      assert.equal(category.failures.length, assertionFails ? 2 : 1);
+      const input = {
+        report,
+        reportHash: suite.hash(JSON.stringify(report)),
+        current: fixture.identity,
+        base: fixture.options.base,
+        expectedCategories: ['first'],
+        expectedLanes: lanes,
+        environment: fixture.environment,
+      };
+      assert.throws(() => acceptance.validateAcceptance(input), /explicit owner-authorized dispositions/);
+      if (assertionFails) {
+        const original = category.failures.find((row) => row !== teardown[0]);
+        input.policy = {
+          authority: 'owner-authorized-unrelated-failures',
+          candidate: fixture.identity.candidate,
+          base: input.base,
+          reportHash: input.reportHash,
+          affectedChecks: [{ category: 'first', file: 'symptom.test.js', name: 'passes' }],
+          dispositions: [{ failure: original.id }],
+        };
+        assert.throws(() => acceptance.validateAcceptance(input), /exactly one disposition/);
+      }
+    } finally {
+      fs.rmSync(fixture.directory, { recursive: true, force: true });
+    }
+  }
+});
+
+// A lingering handle reaches Vitest's process timeout after all assertions and close promises settle.
+test('process closure timeouts retain failures and refuse landing', { tags: ['subprocess'] }, async () => {
+  const fixture = collectionFixture();
+  try {
+    fs.writeFileSync(
+      path.join(fixture.directory, 'vitest.config.mjs'),
+      'export default {test:{globals:true,teardownTimeout:10,include:["symptom.test.js"],globalSetup:["./setup.mjs"]}};',
+    );
+    fs.writeFileSync(
+      path.join(fixture.directory, 'setup.mjs'),
+      'export default function(){setInterval(()=>{},100000)}',
+    );
+    fs.writeFileSync(path.join(fixture.directory, 'symptom.test.js'), 'test("passes",()=>{})');
+    const lanes = [
+      {
+        ...fixture.lanes[0],
+        vitest: true,
+        args: [
+          path.join(repositoryRoot, 'node_modules/vitest/vitest.mjs'),
+          'run',
+          '--config',
+          path.join(fixture.directory, 'vitest.config.mjs'),
+        ],
+      },
+    ];
+    const report = await suite.collectSuite({ ...fixture.options, lanes });
+    assert.equal(report.categories[0].status, 'failed');
+    assert.equal(report.categories[0].diagnosticsComplete, false);
+    assert.match(report.categories[0].failures[0].detail, /process closure timed out/);
+    assert.throws(
+      () =>
+        acceptance.validateAcceptance({
+          report,
+          current: fixture.identity,
+          base: fixture.options.base,
+          expectedCategories: ['first'],
+          expectedLanes: lanes,
+          environment: fixture.environment,
+        }),
+      /complete test diagnostics/,
+    );
+  } finally {
+    fs.rmSync(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test('landing refuses reports finalized before process closure even when assertions passed', () => {
+  const fixture = acceptanceFixture();
+  try {
+    const { input } = fixture;
+    input.report.categories = [input.report.categories[1]];
+    input.report.selected = ['middle'];
+    input.report.exitCode = 0;
+    input.expectedCategories = ['middle'];
+    input.expectedLanes = [fixture.lanes[1]];
+    input.policy = null;
+    const category = input.report.categories[0];
+    category.tests = path.join(fixture.directory, 'middle.tests.json');
+    for (const diagnostics of [
+      { arcFailureAccounting: 1, testResults: [] },
+      { arcFailureAccounting: 2, closureComplete: false, testResults: [] },
+    ]) {
+      fs.writeFileSync(category.tests, JSON.stringify(diagnostics));
+      category.testsHash = suite.hash(fs.readFileSync(category.tests));
+      assert.throws(() => acceptance.validateAcceptance(input), /complete test diagnostics/);
+    }
+  } finally {
+    fs.rmSync(fixture.directory, { recursive: true, force: true });
+  }
 });

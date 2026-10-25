@@ -161,7 +161,7 @@ function vitestArgs(mode, extraArgs, selected, testRoot) {
   ];
 }
 
-function spawnLane(mode, selected, extraArgs, testRoot, spawn, observation) {
+function spawnLane(mode, selected, extraArgs, testRoot, spawn, observation, onCancelled) {
   observation?.begin('execution', { boundary: 'Vitest child lifetime, including collection, builds and teardown' });
   const result = spawn(process.execPath, vitestArgs(mode, extraArgs, selected, testRoot), {
     cwd: testRoot,
@@ -174,6 +174,8 @@ function spawnLane(mode, selected, extraArgs, testRoot, spawn, observation) {
     signal: result.signal ?? null,
     error: result.error?.message ?? null,
   });
+  if (result.signal || [129, 130, 143].includes(result.status))
+    onCancelled?.(result.signal ?? { 129: 'SIGHUP', 130: 'SIGINT', 143: 'SIGTERM' }[result.status]);
   if (result.error) {
     console.error(`Could not start Vitest: ${result.error.message}`);
     return 1;
@@ -181,15 +183,28 @@ function spawnLane(mode, selected, extraArgs, testRoot, spawn, observation) {
   return result.status ?? 1;
 }
 
-async function spawnBrowserLane(selected, extraArgs, testRoot, spawnChild, lock, observation) {
+async function spawnBrowserLane(
+  selected,
+  extraArgs,
+  testRoot,
+  spawnChild,
+  lock,
+  observation,
+  mode = 'browser',
+  onCancelled,
+) {
   observation?.begin('execution', { boundary: 'Vitest child lifetime, including collection, builds and teardown' });
-  const result = spawnChild(process.execPath, vitestArgs('browser', extraArgs, selected, testRoot), {
+  const result = spawnChild(process.execPath, vitestArgs(mode, extraArgs, selected, testRoot), {
     cwd: testRoot,
     stdio: 'inherit',
+    detached: process.platform !== 'win32',
     ...(observation ? { env: observation.childEnvironment() } : {}),
   });
+  result.arcProcessGroup = process.platform !== 'win32';
   observation?.event('execution', 'child-start', { childPid: result.pid ?? null });
   if (typeof result?.once !== 'function') {
+    if (result.signal || [129, 130, 143].includes(result.status))
+      onCancelled?.(result.signal ?? { 129: 'SIGHUP', 130: 'SIGINT', 143: 'SIGTERM' }[result.status]);
     observation?.end('execution', {
       exitCode: result.status ?? null,
       signal: result.signal ?? null,
@@ -217,6 +232,8 @@ async function spawnBrowserLane(selected, extraArgs, testRoot, spawnChild, lock,
         if (settled) return;
         settled = true;
         observation?.end('execution', { exitCode: status, signal: signal ?? null });
+        if (signal || [129, 130, 143].includes(status))
+          onCancelled?.(signal ?? { 129: 'SIGHUP', 130: 'SIGINT', 143: 'SIGTERM' }[status]);
         resolveStatus(status ?? 1);
       });
     });
@@ -225,7 +242,45 @@ async function spawnBrowserLane(selected, extraArgs, testRoot, spawnChild, lock,
   }
 }
 
-export function runTestMode(mode, extraArgs, { testRoot = root, spawn = spawnSync, observationFactory } = {}) {
+export async function runNodeLane(
+  extraArgs,
+  { testRoot = root, spawn: spawnChild = spawn, observationFactory, onCancelled } = {},
+) {
+  const observation = observationFactory?.('node', testRoot, extraArgs);
+  observation?.unavailable('queue', 'The Node lane takes no machine resource.');
+  observation?.unavailable('build', 'Builds inside Vitest are not separate launcher intervals.');
+  observation?.unavailable('cleanup', 'Vitest teardown is included in its child lifetime.');
+  let status = null;
+  try {
+    const { passthrough, files } = partitionArgs(extraArgs);
+    let selected = selectForLane('node', testRoot);
+    if (files.length) selected = narrowSelection(files, selected, testRoot, 'node');
+    reportSelection('node', selected);
+    if (!selected.length) throw Error('No test files selected for node mode.');
+    status = await spawnBrowserLane(
+      selected,
+      passthrough,
+      testRoot,
+      spawnChild,
+      null,
+      observation,
+      'node',
+      onCancelled,
+    );
+    return status;
+  } catch (error) {
+    console.error(error.message);
+    return (status = 1);
+  } finally {
+    observation?.finish({ exitCode: status, outcome: status === 0 ? 'success' : 'failure' });
+  }
+}
+
+export function runTestMode(
+  mode,
+  extraArgs,
+  { testRoot = root, spawn = spawnSync, observationFactory, onCancelled } = {},
+) {
   const observation = observationFactory?.(mode, testRoot, extraArgs);
   observation?.unavailable('queue', 'The Node lane takes no machine resource.');
   observation?.unavailable('build', 'Builds inside Vitest are not separate launcher intervals.');
@@ -253,7 +308,7 @@ export function runTestMode(mode, extraArgs, { testRoot = root, spawn = spawnSyn
       console.error(`No test files selected for ${mode} mode.`);
       return (status = 1);
     }
-    return (status = spawnLane(mode, selected, passthrough, testRoot, spawn, observation));
+    return (status = spawnLane(mode, selected, passthrough, testRoot, spawn, observation, onCancelled));
   } finally {
     observation?.finish({
       exitCode: status,
@@ -280,6 +335,7 @@ export async function runBrowserLane(
     detectBrowser: detect = detectBrowser,
     acquireLock = noopAcquireLock,
     observationFactory,
+    onCancelled,
   } = {},
 ) {
   const observation = observationFactory?.('browser', testRoot, extraArgs);
@@ -322,7 +378,16 @@ export async function runBrowserLane(
         return (status = 1);
       }
       console.log(`Browser executable: ${browserName}`);
-      return (status = await spawnBrowserLane(selected, passthrough, testRoot, spawnChild, lock, observation));
+      return (status = await spawnBrowserLane(
+        selected,
+        passthrough,
+        testRoot,
+        spawnChild,
+        lock,
+        observation,
+        'browser',
+        onCancelled,
+      ));
     } finally {
       observation?.begin('cleanup');
       const released = lock.release();
@@ -359,10 +424,22 @@ function splitFilesByLane(fileArgs, testRoot) {
 }
 
 export async function runFull(extraArgs, opts = {}) {
+  let cancelled = false;
+  const onCancelled = opts.onCancelled;
+  opts = {
+    ...opts,
+    onCancelled: (signal) => {
+      cancelled = true;
+      opts.onSignal?.(signal);
+      onCancelled?.(signal);
+    },
+  };
   const testRoot = opts.testRoot ?? root;
+  const runNode = opts.asyncNode ? (args) => runNodeLane(args, opts) : (args) => runTestMode('node', args, opts);
   const { passthrough, files } = partitionArgs(extraArgs);
   if (files.length === 0) {
-    const nodeStatus = runTestMode('node', extraArgs, opts);
+    const nodeStatus = await runNode(extraArgs);
+    if (cancelled) return nodeStatus || 1;
     const browserStatus = await runBrowserLane(extraArgs, opts);
     return nodeStatus !== 0 ? nodeStatus : browserStatus;
   }
@@ -375,7 +452,8 @@ export async function runFull(extraArgs, opts = {}) {
   }
   let nodeStatus = 0;
   if (byLane.node.length > 0) {
-    nodeStatus = runTestMode('node', [...passthrough, ...byLane.node], opts);
+    nodeStatus = await runNode([...passthrough, ...byLane.node]);
+    if (cancelled) return nodeStatus || 1;
   } else {
     console.log('Node lane skipped: no named file belongs to it.');
   }
@@ -391,6 +469,10 @@ export async function runFull(extraArgs, opts = {}) {
 export async function main(argv = process.argv.slice(2)) {
   const [mode = 'full', ...extraArgs] = argv;
   const opts = {
+    asyncNode: true,
+    onCancelled: (signal) => {
+      process.exitCode = { SIGHUP: 129, SIGINT: 130, SIGTERM: 143 }[signal] ?? 1;
+    },
     acquireLock: acquireBrowserLock,
     observationFactory: (lane, cwd, args) =>
       createTestObservation({
@@ -407,7 +489,7 @@ export async function main(argv = process.argv.slice(2)) {
   if (mode === 'browser') {
     return runBrowserLane(extraArgs, opts);
   }
-  return runTestMode(mode, extraArgs, opts);
+  return mode === 'node' ? runNodeLane(extraArgs, opts) : runTestMode(mode, extraArgs, opts);
 }
 
 if (
@@ -417,7 +499,7 @@ if (
 ) {
   main()
     .then((code) => {
-      process.exitCode = code;
+      process.exitCode ||= code;
     })
     .catch((error) => {
       console.error(error);

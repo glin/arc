@@ -760,7 +760,7 @@
   "scripts": {
     "check:timeline": "tsx scripts/check-timeline.ts",
     "build": "node esbuild.mjs",
-    "typecheck": "node --import tsx scripts/check-webview-globals.ts && tsc --noEmit -p tsconfig.json && tsc --noEmit -p src/webview/tsconfig.json",
+    "typecheck": "node ../scripts/test-suite.mjs extension-typecheck",
     "watch": "node esbuild.mjs --watch",
     "dev": "node dev.mjs",
     "test": "node test.mjs full",

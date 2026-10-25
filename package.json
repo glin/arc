@@ -7,7 +7,7 @@
     "prepare": "node scripts/install-git-hooks.js",
     "format": "oxfmt --config .oxfmtrc.mjs --disable-nested-config",
     "format:check": "npm run format -- --check",
-    "lint": "npm run lint:js && npm run lint:css",
+    "lint": "node scripts/test-suite.mjs lint",
     "lint:js": "oxlint --disable-nested-config --deny-warnings",
     "lint:css": "stylelint --config .stylelintrc.cjs --max-warnings 0 \"extension/src/webview/*.css\"",
     "lint:fix": "npm run lint:js -- --fix",
@@ -15,14 +15,14 @@
     "test": "node scripts/test-default.mjs",
     "test:iterate": "npm run test:unit",
     "test:panel-mockup": "vitest run --config .claude/skills/panel-mockup/vitest.config.mts",
-    "typecheck": "node scripts/typecheck-parallel.js",
+    "typecheck": "node scripts/test-suite.mjs typecheck",
     "test:root": "vitest run --exclude test/hooks-smoke.test.js --tags-filter=\"!subprocess\"",
     "test:subprocess": "node scripts/test-subprocess.mjs",
     "test:unit": "node scripts/test-unit.mjs",
-    "test:smoke": "vitest run test/hooks-smoke.test.js && npm --prefix cli run test:smoke",
+    "test:smoke": "node scripts/test-suite.mjs smoke",
     "test:integration": "node scripts/test-integration.mjs",
     "test:browser": "node extension/test.mjs browser",
-    "test:all": "npm test && node scripts/test-integration.mjs --browser"
+    "test:all": "node scripts/test-suite.mjs all"
   },
   "devDependencies": {
     "oxfmt": "0.67.0",

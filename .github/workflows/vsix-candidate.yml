@@ -33,6 +33,7 @@ jobs:
           fi
           node scripts/release-version.js --notes "$version" > /dev/null
       - name: Install zsh and ImageMagick
+        id: system-setup
         run: |
           sudo apt-get update
           sudo apt-get install --yes zsh imagemagick
@@ -42,12 +43,37 @@ jobs:
             | sudo tee /usr/local/bin/magick > /dev/null
           sudo chmod +x /usr/local/bin/magick
           magick -list format | grep -i webp
-      - run: npm install
-      - run: npm --prefix extension install
-      - run: npm --prefix cli install
+      - run: npm ci
+        id: root-setup
+        if: ${{ !cancelled() }}
+      - run: npm --prefix extension ci
+        id: extension-setup
+        if: ${{ !cancelled() }}
+      - run: npm --prefix cli ci
+        id: cli-setup
+        if: ${{ !cancelled() }}
       - name: Install bundled Chromium and system dependencies
+        id: browser-setup
+        if: ${{ !cancelled() && steps.extension-setup.outcome == 'success' }}
         run: node extension/node_modules/playwright-core/cli.js install --with-deps chromium-headless-shell
       - run: npm run test:all
+        if: ${{ !cancelled() }}
+        env:
+          ARC_TEST_REPORT_DIR: ${{ runner.temp }}/arc-all
+          ARC_TEST_ROOT_SETUP_FAILED: ${{ steps.root-setup.outcome != 'success' && '1' || '' }}
+          ARC_TEST_EXTENSION_SETUP_FAILED: ${{ steps.extension-setup.outcome != 'success' && '1' || '' }}
+          ARC_TEST_CLI_SETUP_FAILED: ${{ steps.cli-setup.outcome != 'success' && '1' || '' }}
+          ARC_TEST_BROWSER_SETUP_FAILED: ${{ steps.browser-setup.outcome != 'success' && '1' || '' }}
+          ARC_TEST_SYSTEM_SETUP_FAILED: ${{ steps.system-setup.outcome != 'success' && '1' || '' }}
+      - name: Publish test summary
+        if: always()
+        run: node scripts/test-summary.mjs ${{ runner.temp }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: candidate-test-results
+          path: ${{ runner.temp }}/arc-all
+          if-no-files-found: ignore
       - run: npm --prefix extension run build
       - run: npm --prefix extension run package
       - run: node extension/scripts/check-vsix.mjs

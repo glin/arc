@@ -286,8 +286,8 @@
   },
   "scripts/extension-test-runner.test.js": {
     "reason": "Real runner commands must classify files, reject invalid selection, and preserve browser readiness status.",
-    "cases": 68,
-    "matricesSha256": "0b198ae340bfe94c7701b26ffe6e624b39e81f6e14a1327f75ffef3f2c33a982"
+    "cases": 72,
+    "matricesSha256": "df8bde18fafde463b13fc81ffb9d04f137957421b1d52bbdcc79b11d0e29eb87"
   },
   "scripts/install-release.test.js": {
     "reason": "Release installation must extract actual archives and preserve isolated-home hooks, skills, and partial failures.",
@@ -315,19 +315,19 @@
     "matricesSha256": "c45cd0f994ca1400a09e483d3ee8f9a481b2e700743e54003ef4da9b4f77ad41"
   },
   "scripts/test-lanes.test.js": {
-    "reason": "Linked command entry points must execute and retain process status. Direct checks guard category and admission drift.",
-    "cases": 14,
-    "matricesSha256": "1534f730defe590f469b50f85242e0a4e41a5ec178fd4444d132614ebd47346d"
+    "reason": "Public commands must report independent failures, preserve cancellation, and reject stale or incomplete landing evidence. Direct cases guard category and admission drift.",
+    "cases": 31,
+    "matricesSha256": "c1dc2b37bc9e5d3f30fd36bcfc14138d0d04cb5f791fb6ddb75f0baeef75c0e3"
   },
   "scripts/tool-scope.test.js": {
     "reason": "Real tool commands must respect repository scope and reject external configuration or stale packaged content.",
     "cases": 13,
-    "matricesSha256": "02e69de3c4fa59862b898fef42bee9b9ae2f4d36001555c465323a979c466b24"
+    "matricesSha256": "63b29be46f045f36a9c9a6d5acb30bc473eebf58a51da26952a2533ca4f18fd6"
   },
   "scripts/typecheck-parallel.test.js": {
     "reason": "Concurrent check child processes must preserve exit status, spawn errors, and grouped output.",
-    "cases": 5,
-    "matricesSha256": "1a518c6e40f9ad0c5ecef8620c1b9973123855dcf141057081b4c5915565852d"
+    "cases": 8,
+    "matricesSha256": "709dd244405fe9263b4754aeb0cf5fc6757aa8c6ac879b3794ac88f86113231a"
   },
   "test/hooks-smoke.test.js": {
     "reason": "The installed hook command must capture real first-touch snapshots through the shell entry point.",

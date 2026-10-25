@@ -18,47 +18,126 @@ function tscArgs(baseDir, tsconfig) {
   return [toolBin('typescript', 'tsc', baseDir), '--noEmit', '-p', tsconfig];
 }
 
-const checks = [
-  {
-    label: 'extension webview globals',
-    args: ['--import', 'tsx', 'scripts/check-webview-globals.ts'],
-    cwd: extensionDir,
-  },
-  {
-    label: 'extension tsc',
-    args: tscArgs(extensionDir, 'tsconfig.json'),
-    cwd: extensionDir,
-  },
-  {
-    label: 'extension webview tsc',
-    args: tscArgs(extensionDir, 'src/webview/tsconfig.json'),
-    cwd: extensionDir,
-  },
-  {
-    label: 'cli tsc',
-    args: tscArgs(cliDir, 'tsconfig.json'),
-    cwd: cliDir,
-  },
-];
+function compilerChecks() {
+  return [
+    {
+      label: 'extension webview globals',
+      args: ['--import', 'tsx', 'scripts/check-webview-globals.ts'],
+      cwd: extensionDir,
+    },
+    {
+      label: 'extension tsc',
+      args: tscArgs(extensionDir, 'tsconfig.json'),
+      cwd: extensionDir,
+    },
+    {
+      label: 'extension webview tsc',
+      args: tscArgs(extensionDir, 'src/webview/tsconfig.json'),
+      cwd: extensionDir,
+    },
+    {
+      label: 'cli tsc',
+      args: tscArgs(cliDir, 'tsconfig.json'),
+      cwd: cliDir,
+    },
+  ];
+}
 
-function runCheck(check, { spawnFn, stream, write, writeError }) {
+function runCheck(
+  check,
+  { spawnFn, stream, write, writeError, signal, onResult, onOutput, platform, killGroup, killWindowsTree },
+) {
   return new Promise((resolve) => {
     const chunks = [];
-    const child = spawnFn(check.command ?? process.execPath, check.args, {
-      cwd: check.cwd,
-      stdio: ['ignore', 'pipe', 'pipe'],
-      ...(check.env ? { env: check.env } : {}),
-    });
+    let child;
+    let settled = false;
+    let fallback;
+    let aborting = false;
+    let groupRetired = false;
+    const finish = (status, childSignal = null, error = null) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(fallback);
+      signal?.removeEventListener('abort', abort);
+      const result = {
+        label: check.label,
+        status: status ?? 1,
+        signal: childSignal,
+        error,
+        output: Buffer.concat(chunks).toString('utf8'),
+      };
+      check.observe?.({ exitCode: status, signal: childSignal, error });
+      onResult?.(result);
+      resolve(result);
+    };
+    const abort = () => {
+      if (!child) return;
+      aborting = true;
+      if (platform === 'win32' && child.pid) {
+        if (!killWindowsTree(child.pid)) child.kill('SIGTERM');
+      } else if (child.pid) {
+        try {
+          killGroup(-child.pid, 'SIGTERM');
+        } catch {
+          child.kill('SIGTERM');
+        }
+      } else child.kill?.('SIGTERM');
+      if (!settled) {
+        fallback = setTimeout(() => {
+          if (child.pid && platform !== 'win32') {
+            try {
+              killGroup(-child.pid, 'SIGKILL');
+            } catch {
+              child.kill('SIGKILL');
+            }
+          } else child.kill?.('SIGKILL');
+        }, 5_000);
+        fallback.unref?.();
+      }
+    };
+    if (signal?.aborted) return finish(null, 'SIGTERM');
+    try {
+      child = spawnFn(check.command ?? process.execPath, check.args, {
+        cwd: check.cwd,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        detached: platform !== 'win32',
+        ...(check.env ? { env: check.env } : {}),
+      });
+    } catch (error) {
+      return finish(null, null, error.message);
+    }
     check.observe?.({ childPid: child.pid ?? null, started: true });
-    child.stdout.on('data', (chunk) => (stream ? write(chunk) : chunks.push(chunk)));
-    child.stderr.on('data', (chunk) => (stream ? writeError(chunk) : chunks.push(chunk)));
+    signal?.addEventListener('abort', abort, { once: true });
+    const output = (chunk, stderr) => {
+      onOutput?.(check, chunk, stderr);
+      if (stream) (stderr ? writeError : write)(chunk);
+      else chunks.push(chunk);
+    };
+    child.stdout.on('data', (chunk) => output(chunk, false));
+    child.stderr.on('data', (chunk) => output(chunk, true));
     child.on('error', (error) => {
-      check.observe?.({ exitCode: null, error: error.message });
-      resolve({ label: check.label, status: 1, output: `${error.message}\n` });
+      output(Buffer.from(`${error.message}\n`), true);
+      finish(null, null, error.message);
     });
+    const retireGroup = (code, signal) => {
+      if (
+        !groupRetired &&
+        child.pid &&
+        platform !== 'win32' &&
+        (aborting || signal || [129, 130, 143].includes(code))
+      ) {
+        groupRetired = true;
+        try {
+          killGroup(-child.pid, 'SIGKILL');
+        } catch {
+          /* The owned group has already closed. */
+        }
+      }
+    };
+    child.on('exit', retireGroup);
     child.on('close', (code, signal) => {
-      check.observe?.({ exitCode: code, signal: signal ?? null });
-      resolve({ label: check.label, status: code ?? 1, output: Buffer.concat(chunks).toString('utf8') });
+      retireGroup(code, signal);
+      finish(code, signal ?? null);
     });
   });
 }
@@ -73,10 +152,32 @@ async function runChecks(
     stream = false,
     write = (chunk) => process.stdout.write(chunk),
     writeError = (chunk) => process.stderr.write(chunk),
+    signal,
+    onResult,
+    onOutput,
+    platform = process.platform,
+    killGroup = process.kill,
+    killWindowsTree = (pid) => {
+      const result = require('node:child_process').spawnSync('taskkill', ['/pid', String(pid), '/T', '/F']);
+      return !result.error && result.status === 0;
+    },
   } = {},
 ) {
   const results = await Promise.all(
-    checksToRun.map((check) => runCheck(check, { spawnFn, stream, write, writeError })),
+    checksToRun.map((check) =>
+      runCheck(check, {
+        spawnFn,
+        stream,
+        write,
+        writeError,
+        signal,
+        onResult,
+        onOutput,
+        platform,
+        killGroup,
+        killWindowsTree,
+      }),
+    ),
   );
   const failed = [];
   for (const result of results) {
@@ -96,13 +197,19 @@ async function runChecks(
 }
 
 async function main() {
-  const failed = await runChecks(checks);
+  const failed = await runChecks(compilerChecks());
   if (failed.length > 0) {
     process.exitCode = 1;
   }
 }
 
-module.exports = { runChecks, checks };
+module.exports = {
+  runChecks,
+  compilerChecks,
+  get checks() {
+    return compilerChecks();
+  },
+};
 
 if (require.main === module) {
   main().catch((error) => {
