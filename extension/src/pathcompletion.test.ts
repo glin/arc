@@ -143,16 +143,19 @@ test('path completion reveals hidden entries only for a hidden leaf and bounds r
 });
 
 test('path completion returns no rows when an immediate directory cannot be read', async () => {
+  const denied: string[] = [];
   const result = await completePath({
     token: '/missing/a',
     workingDirectory: '/work',
     homeDirectory: '/home/reader',
     platform: 'posix',
     reader: {
-      async readDirectory() {
+      async readDirectory(directory) {
+        denied.push(directory);
         throw new Error('denied');
       },
     },
   });
   assert.deepEqual(result.entries, []);
+  assert.deepEqual(denied, ['/missing/']);
 });

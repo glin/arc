@@ -417,8 +417,10 @@ test.each(['win32', 'darwin', 'linux'] as const)(
       const nativeId = session.replace('aaaaaaaa', 'AbCdEfAb');
       const selector = platform === 'win32' ? '.\\MiXeD-Native' : './MiXeD-Native';
       const nativeRoot = paths.join(nativeCwd, 'MiXeD-Native', projectSlug(nativeCwd));
-      const physicalRoot = path.join(home, 'MiXeD-Native', projectSlug(nativeCwd));
-      const other = path.join(home, 'Other-Cwd');
+      const namespace = path.join(home, 'native-filesystem');
+      const physicalCwd = path.join(namespace, 'WoRk');
+      const physicalRoot = path.join(physicalCwd, 'MiXeD-Native', projectSlug(nativeCwd));
+      const other = path.join(physicalCwd, 'Other-Cwd');
       fs.mkdirSync(physicalRoot, { recursive: true });
       fs.mkdirSync(other);
       const options: StandaloneOptions = {
@@ -436,10 +438,44 @@ test.each(['win32', 'darwin', 'linux'] as const)(
           ? text.toLowerCase().startsWith('z:')
           : text === '/WoRk' || text.startsWith('/WoRk/');
       };
+      const key = (value: string) =>
+        platform === 'win32' ? paths.normalize(value).toLowerCase() : paths.normalize(value);
+      const virtualFiles = new Map<string, string>();
+      for (let ancestor = nativeRoot; ; ancestor = paths.dirname(ancestor)) {
+        const relative = paths.relative(paths.parse(nativeCwd).root, ancestor);
+        virtualFiles.set(key(ancestor), path.join(namespace, ...relative.split(paths.sep)));
+        if (paths.dirname(ancestor) === ancestor) break;
+      }
+      virtualFiles.set(key(file), physicalFile);
+      virtualFiles.set(
+        key(paths.join(nativeRoot, `${nativeId.toLowerCase()}.jsonl`)),
+        platform === 'win32' ? physicalFile : path.join(physicalRoot, `${nativeId.toLowerCase()}.jsonl`),
+      );
+      virtualFiles.set(key(paths.join(nativeCwd, 'Other-Cwd')), other);
+      const unmapped: string[] = [];
+      const physicalTargets: string[] = [];
+      const directories: string[] = [];
       const mapped = (value: fs.PathLike) => {
-        if (!nativePath(value)) return value;
-        const relative = paths.relative(nativeCwd, String(value));
-        return path.join(home, ...relative.split(paths.sep));
+        const text = String(value);
+        const virtual = virtualFiles.get(key(text));
+        const relative = actualPath.relative(receipts.root, text);
+        const owned =
+          text === home ||
+          relative === '' ||
+          (!relative.startsWith('..' + path.sep) && relative !== '..' && !absolute(relative));
+        if (!virtual && !owned) {
+          unmapped.push(text);
+          throw new Error(`Unmapped fixture path: ${text}`);
+        }
+        const target = virtual ?? text;
+        physicalTargets.push(target);
+        const physicalRelative = actualPath.relative(home, target);
+        assert.ok(
+          physicalRelative === '' ||
+            (physicalRelative !== '..' && !physicalRelative.startsWith('..' + path.sep) && !absolute(physicalRelative)),
+          target,
+        );
+        return target;
       };
       const exists = actualFs.existsSync;
       const stat = actualFs.statSync;
@@ -471,21 +507,23 @@ test.each(['win32', 'darwin', 'linux'] as const)(
         vi
           .spyOn(path, 'isAbsolute')
           .mockImplementation((target) => (nativePath(target) ? paths.isAbsolute(target) : absolute(target))),
-        vi.spyOn(fs.promises, 'opendir').mockImplementation(
-          async () =>
-            ({
-              async *[Symbol.asyncIterator]() {
-                if (!before || state === 'case exclusion')
-                  yield {
-                    name: before ? `${nativeId.toLowerCase()}.jsonl` : `${nativeId}.jsonl`,
-                    isFile: () => true,
-                    isDirectory: () => false,
-                    isSymbolicLink: () => false,
-                  };
-              },
-              close: async () => {},
-            }) as unknown as fs.Dir,
-        ),
+        vi.spyOn(fs.promises, 'opendir').mockImplementation(async (target) => {
+          directories.push(String(target));
+          mapped(target);
+          if (key(String(target)) !== key(nativeRoot)) throw new Error(`Unexpected fixture directory: ${target}`);
+          return {
+            async *[Symbol.asyncIterator]() {
+              if (!before || state === 'case exclusion')
+                yield {
+                  name: before ? `${nativeId.toLowerCase()}.jsonl` : `${nativeId}.jsonl`,
+                  isFile: () => true,
+                  isDirectory: () => false,
+                  isSymbolicLink: () => false,
+                };
+            },
+            close: async () => {},
+          } as unknown as fs.Dir;
+        }),
       ];
       const bounds = { frameBytes: 128 * 1024, readBytes: 8192, workBytes: 1024 * 1024 };
       const runtime = { ...frozenRuntime(), platform };
@@ -528,6 +566,16 @@ test.each(['win32', 'darwin', 'linux'] as const)(
         assert.equal(vi.mocked(childProcess.spawn).mock.calls.length, 0);
       } finally {
         for (const substitution of substitutions.reverse()) substitution.mockRestore();
+        assert.deepEqual(unmapped, [], `${platform}: ${state}`);
+        assert.ok(directories.length > 0);
+        assert.deepEqual([...new Set(directories.map(key))], [key(nativeRoot)]);
+        for (const target of physicalTargets) {
+          const relative = actualPath.relative(home, target);
+          assert.ok(
+            relative === '' || (relative !== '..' && !relative.startsWith('..' + path.sep) && !absolute(relative)),
+            target,
+          );
+        }
       }
     }
   },

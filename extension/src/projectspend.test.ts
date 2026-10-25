@@ -6010,6 +6010,19 @@ describe('Claude background cost accounting', () => {
       let replacement = false;
       let replaceAtClose = false;
       const descriptorFiles = new Map<number, string>();
+      const unmapped: string[] = [];
+      const physicalTargets: string[] = [];
+      const ownedRoot = path.dirname(fixture.file);
+      const mapped = (file: fs.PathLike) => {
+        const target = file === acceptedPath ? originalPath : String(file);
+        const relative = path.relative(ownedRoot, target);
+        if (relative === '..' || relative.startsWith('..' + path.sep) || path.isAbsolute(relative)) {
+          unmapped.push(String(file));
+          throw new Error(`Unmapped spend fixture path: ${file}`);
+        }
+        physicalTargets.push(target);
+        return target;
+      };
       const revision = (_file: string) => ({
         size: acceptedPhysical.size,
         mtimeMs: acceptedPhysical.mtimeMs,
@@ -6018,8 +6031,9 @@ describe('Claude background cost accounting', () => {
         ino: BigInt(replacement ? identityB : identityA),
         isFile: () => true,
       });
-      const stat = vi.spyOn(fs, 'statSync').mockImplementation(((file: any, options: any) =>
-        file === acceptedPath
+      const stat = vi.spyOn(fs, 'statSync').mockImplementation(((file: any, options: any) => {
+        const target = mapped(file);
+        return file === acceptedPath
           ? options?.bigint
             ? revision(originalPath)
             : {
@@ -6028,9 +6042,10 @@ describe('Claude background cost accounting', () => {
                 dev: 1,
                 ino: Number(replacement ? identityB : identityA),
               }
-          : originalStat(file, options)) as typeof fs.statSync);
+          : originalStat(target, options);
+      }) as typeof fs.statSync);
       const open = vi.spyOn(fs, 'openSync').mockImplementation(((file: any, flags: any) => {
-        const fd = originalOpen(file === acceptedPath ? originalPath : file, flags);
+        const fd = originalOpen(mapped(file), flags);
         descriptorFiles.set(fd, String(file));
         return fd;
       }) as typeof fs.openSync);
@@ -6077,6 +6092,12 @@ describe('Claude background cost accounting', () => {
         fstat.mockRestore();
         close.mockRestore();
         syncBuiltinESMExports();
+        assert.deepEqual(unmapped, [], platform);
+        assert.ok(physicalTargets.includes(originalPath));
+        for (const target of physicalTargets) {
+          const relative = path.relative(ownedRoot, target);
+          assert.ok(relative !== '..' && !relative.startsWith('..' + path.sep) && !path.isAbsolute(relative), target);
+        }
       }
     },
   );

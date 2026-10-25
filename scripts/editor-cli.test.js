@@ -2056,13 +2056,17 @@ test.concurrent('the current editor rejects denied executable access', SUBPROCES
   try {
     const editor = f.editor('cursor', 'linux');
     const preload = path.join(f.dir, 'deny-access.cjs');
+    const denial = path.join(f.dir, 'denied-access.jsonl');
+    const launcher = fs.realpathSync(editor.launcher);
     fs.writeFileSync(
       preload,
       `const fs = require('node:fs');
 const access = fs.accessSync;
 fs.accessSync = function(file, mode) {
-  if (file === process.env.ARC_TEST_DENIED_LAUNCHER && mode === fs.constants.X_OK)
+  if (file === process.env.ARC_TEST_DENIED_LAUNCHER && mode === fs.constants.X_OK) {
+    fs.appendFileSync(process.env.ARC_TEST_DENIAL, JSON.stringify({ file, mode }) + '\\n');
     throw Object.assign(new Error('Executable access denied'), { code: 'EACCES' });
+  }
   return Reflect.apply(access, this, [file, mode]);
 };
 `,
@@ -2070,10 +2074,19 @@ fs.accessSync = function(file, mode) {
     assert.equal(
       await currentEditor({
         ...editor.env,
-        ARC_TEST_DENIED_LAUNCHER: fs.realpathSync(editor.launcher),
+        ARC_TEST_DENIED_LAUNCHER: launcher,
+        ARC_TEST_DENIAL: denial,
         NODE_OPTIONS: [process.env.NODE_OPTIONS, '--require=' + JSON.stringify(preload)].filter(Boolean).join(' '),
       }),
       '',
+    );
+    assert.deepEqual(
+      fs
+        .readFileSync(denial, 'utf8')
+        .trim()
+        .split('\n')
+        .map((line) => JSON.parse(line)),
+      [{ file: launcher, mode: fs.constants.X_OK }],
     );
   } finally {
     f.cleanup();

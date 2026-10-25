@@ -7,7 +7,7 @@
   "cli/test/run.test.ts": {
     "reason": "Standalone workers must retain real output, exit, cancellation, receipt ownership, and recovery across process boundaries.",
     "cases": 107,
-    "matricesSha256": "f78f079b5fbbe73ae1b3e56d6e212271604db3ed107f9fea0df1c73adea7cff5"
+    "matricesSha256": "37e825c4bcd6903ecc275b57ddeb60adcb3cee5bad53beeb60588c6885dbbe73"
   },
   "cli/test/smoke.bundled-a.test.mjs": {
     "reason": "Compiled CLI commands must reach session reads, comments, and saved defaults through an authenticated window channel.",
@@ -47,7 +47,7 @@
   "extension/src/claudeplugin.test.ts": {
     "reason": "Bundled command installation must validate real Node executables and preserve owned launchers through partial filesystem failures.",
     "cases": 63,
-    "matricesSha256": "6280e27ebc1a95a28d441619155e0ee591612ce82f8634f1c7f683d714fa1269"
+    "matricesSha256": "eebfd5b0f246f1007c3d82af7b7ce202dd3ebca01295157a77977b35ee9075b8"
   },
   "extension/src/clauderepeated.test.ts": {
     "reason": "The real worker must read repeated-record maps and invalidate them after source revision changes.",
@@ -282,7 +282,7 @@
   "scripts/editor-cli.test.js": {
     "reason": "Editor launch and installer shell commands must preserve quoting, cancellation, native entry selection, existing dependencies, lockfile reconciliation, and component outcomes.",
     "cases": 59,
-    "matricesSha256": "a7ea5c3eae9eeced267906cac051a2325dbc73e1e2fbe23d249765b203a4f0b0"
+    "matricesSha256": "89017f8329153eaa7c77811b9709e05c5e4328de45db84096e3c4075f6bd94cc"
   },
   "scripts/extension-test-runner.test.js": {
     "reason": "Real runner commands must classify files, reject invalid selection, and preserve browser readiness status.",

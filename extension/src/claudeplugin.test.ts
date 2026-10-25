@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { BundledTools, resolveToolRuntime, type ToolPackage } from './bundledtools';
 import { acquireToolLock } from './toolownership';
-import { test, vi } from 'vitest';
+import { onTestFinished, test, vi } from 'vitest';
 import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
 import fsBuiltin from 'node:fs';
@@ -31,8 +31,9 @@ import {
   type PluginReadJson,
 } from './claudeplugin';
 
-function fixture() {
-  const root = tempDir('claude-plugin-');
+function fixture(root = tempDir('claude-plugin-')) {
+  fs.mkdirSync(root, { recursive: true });
+  root = fs.realpathSync.native(root);
   const cwd = path.join(root, 'project');
   const home = path.join(root, 'config');
   const plugin = path.join(root, 'plugin');
@@ -43,14 +44,27 @@ function fixture() {
     { command: 'fixture-claude', leadingArgs: ['entry.js'], env: { FIXTURE: 'owned' }, problem: null },
     'fixture-host',
   );
-  // Fixture reads expose only files under this fixture's root.
+  // Ancestor settings outside the fixture are explicitly absent.
   for (const key of Object.keys(target.env))
     if (key.toUpperCase() === 'CLAUDE_CODE_PLUGIN_CACHE_DIR') delete target.env[key];
   const reads: string[] = [];
+  const configurationKey = (file: string) => (process.platform === 'win32' ? file.toLowerCase() : file);
+  const missingAncestors = new Set<string>();
+  for (let folder = path.dirname(root); ; folder = path.dirname(folder)) {
+    missingAncestors.add(configurationKey(path.join(folder, '.claude', 'settings.json')));
+    missingAncestors.add(configurationKey(path.join(folder, '.claude', 'settings.local.json')));
+    if (path.dirname(folder) === folder) break;
+  }
+  const unexpectedReads: string[] = [];
+  onTestFinished(() => assert.deepEqual(unexpectedReads, []));
   const read: PluginReadJson = (file) => {
-    const relative = path.relative(root, file);
-    if (relative === '..' || relative.startsWith('..' + path.sep) || path.isAbsolute(relative)) return undefined;
     reads.push(file);
+    if (missingAncestors.has(configurationKey(file))) return undefined;
+    const relative = path.relative(root, file);
+    if (relative === '..' || relative.startsWith('..' + path.sep) || path.isAbsolute(relative)) {
+      unexpectedReads.push(file);
+      throw new Error(`Unexpected fixture configuration: ${file}`);
+    }
     try {
       const bytes = fs.readFileSync(file);
       if (bytes.length > PLUGIN_OUTPUT_BYTES) throw new Error('Fixture settings exceed the read budget.');
@@ -98,6 +112,7 @@ function fixture() {
     root,
     read,
     reads,
+    missingAncestors,
     entry,
     setup,
     commands,
@@ -172,7 +187,11 @@ test('missing-plugin fixtures never read real ancestor configuration', async () 
   try {
     assert.equal((await f.setup.detect(f.target, f.signal)).state, 'missing');
     assert.ok(reads.length > 0);
-    assert.ok(f.reads.every(owned));
+    assert.deepEqual(
+      f.reads.filter((file) => !owned(file)),
+      [...f.missingAncestors],
+    );
+    assert.ok(reads.every(owned));
   } finally {
     spy.mockRestore();
     syncBuiltinESMExports();
@@ -688,7 +707,7 @@ test('stale notification clicks cannot install into the old folder', async () =>
   f.answer('pending');
   const checking = f.owner.check();
   await vi.waitFor(() => assert.equal(f.offers(), 1));
-  const next = fixture();
+  const next = fixture(path.join(f.f.root, 'next'));
   f.target(next.target);
   f.owner.invalidate();
   await f.owner.check();
