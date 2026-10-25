@@ -191,7 +191,7 @@
   },
   "extension/src/startup.test.ts": {
     "reason": "Real title workers must publish recovered metadata through startup ownership and cancellation boundaries. Project cost snapshots must preserve workspace, revision, and calendar ownership during background slices. Agent messages must preserve durable admission, settlement wakeups, native delivery authority, and retained retries. Host integrity checks must preserve complete cost, discovery membership, exact revisions, and bounded coverage across failures and panel lifecycle changes. Ordinary corrections must cross CLI parsing and the authenticated channel before busy target work finishes, preserving native receipts, reservations, and final admission. Pending ordinary receipts retain target exclusion across caller disconnect and wake eligible queued heads only after settlement. Startup measurements must accept baselines that already block agents.",
-    "cases": 250,
+    "cases": 251,
     "matricesSha256": "48667700e3b6500c118990836670d0fcce0cc8cc5d8d5de4fb7c085f35d40e0b"
   },
   "extension/src/store.test.ts": {
