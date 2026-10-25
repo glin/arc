@@ -1,6 +1,6 @@
 # Data sources
 
-Use this catalog for source locations, provenance, and storage ownership. [Timeline](timeline.md) owns the shared turn model. [Session history](session-history.md) owns derived caches. [Window channel](window-channel.md) owns local cross-process contracts.
+[Timeline](timeline.md) owns the shared turn model. [Session history](session-history.md) owns derived caches. [Window channel](window-channel.md) owns local cross-process contracts.
 
 ## Source catalog
 
@@ -63,7 +63,7 @@ Exclusive slot ownership spans payload writes, sync, close, and committed-prefix
 
 Terminal host shutdown closes recording admission synchronously and waits for active work to settle. Unowned preparation starts no further filesystem operation after closure, except closing acquired handles. Owned slot operations finish while retaining their lock. Closing a panel tab leaves recording active. Hosts running the legacy recorder append legacy history until they stop. The bounded recorder leaves that file unchanged. Historical analysis has no shipped command or panel surface.
 
-The usage payloads name the plan but no account or organization. Readings from different accounts can therefore mix when those accounts use the same machine.
+Usage payloads name the plan without identifying the account or organization. Readings from accounts on the same machine can therefore mix.
 
 ## Snapshot storage
 

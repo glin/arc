@@ -16,7 +16,7 @@ Paths are relative to `extension/src/`. [Architecture](architecture.md) owns pac
 | `configwatch.ts` | Non-recursive applied-defaults configuration watches for queried folders and their ancestors, with directory checks and watch lifecycle | no |
 | `identity.ts` | Re-exports product identifiers and owns measurement environment names, saved-state keys, and the multi-root spend workspace path | no |
 | `projectsetups.ts` | Canonical setup project identity, project-entry normalization, one-time legacy pin import, and serialized pin and accepted-profile persistence | no |
-| `sessiondetails.ts` | Narrows a card list to the session the panel is showing | no |
+| `sessiondetails.ts` | Filters cards to the displayed session | no |
 | `panelhost.ts` | Extension-host side of the panel webview, window state publication, per-host readiness, durable initial catalog demand, staged loading, accepted progressive reader state, startup counters and sparse history, reader metadata read intent, and reader-started parent ownership, and context-detail acceptance, plus host-owned initial-name persistence and lifecycle cancellation | yes |
 | `timelinestate.ts` | Combines accepted tail, lifetime, and parsed outcomes, assembles child write and work times and live child IDs, caches child work by file version, projects session-list status and counts, and exposes the card's carried-subagent count | no |
 | `timelinecheck.ts` | Reads raw Claude work and close evidence independently, checks timeline consistency, and assembles read-only project sweeps through the shared timeline state and card projections | no |
@@ -88,7 +88,7 @@ Paths are relative to `extension/src/`. [Architecture](architecture.md) owns pac
 | `outputrate.ts` | Qualified response clocks, bounded content-free response measurements, per-turn measurements and qualified model identity, and native Codex response boundaries with blocking local tool outputs | no |
 | `codexcontext.ts` | Bounded revisioned retained-context reads, text attribution, request reconciliation, and unsupported-history refusal for Codex | no |
 | `subagentcontext.ts` | Byte-based token estimates, four bytes a token shared with the Codex Context detail and a Claude-only subagent rate, and the running estimate of text that subagents returned into a session's context, with its per-subagent lines, compaction clearing, and partial marker | no |
-| `gitcommits.ts` | Reads a turn's commits and fast-forward landings back from the repository, with the repository each is in and the branch each landing merged | no |
+| `gitcommits.ts` | Reads a turn's commits and fast-forward landings, their repositories, and each landing's merged branch | no |
 | `commitrepositories.ts` | Retains verified commit occurrences, validates their original sources and physical repositories, and supplies repository identity after worktree removal | no |
 | `sessioncoverage.ts` | Binds physical enumeration and admitted membership evidence to scope and revision, and decides source presence | no |
 | `repositoryscope.ts` | Refreshes discovery roots and registered checkout identities, classifies starting worktrees, and checks explicit launch folder destinations | no |
@@ -112,7 +112,7 @@ Paths are relative to `extension/src/`. [Architecture](architecture.md) owns pac
 | `turnsearch.ts` | Host turn-content search and snippets using full scoped catalog identity resolution and re-exports shared session-query rules and projections | no |
 | `turnformat.ts` | Formats host-only time, duration, size, tokens, and model names and re-exports shared relative-time rules | no |
 | `turnlabels.ts` | Session-label storage, membership, counts, abandoned-draft cleanup, and editor rows and re-exports shared label rules | no |
-| `turnplaces.ts` | The trail of sessions the reader visited, and the walk back and forward along it | no |
+| `turnplaces.ts` | Tracks visited sessions for Back and Forward navigation | no |
 | `turnfixtures.ts` | Shared test fixtures. Shipped code must not import it | no |
 | `panelfixture.ts` | The real page and a full render payload for browser tests and the screenshot script | no |
 | `temproot.ts` | Scratch directories beneath a suite root, plus private socket directories with explicit ownership and local cleanup. Shipped code must not import it | no |

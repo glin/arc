@@ -1,6 +1,6 @@
 # Architecture
 
-Use this map to find the owner of a change. The topic guides hold behavior, and [`design-goals.md`](design-goals.md) holds product intent.
+The topic guides hold behavior, and [`design-goals.md`](design-goals.md) holds product intent.
 
 ## Reading guide
 
@@ -33,7 +33,7 @@ Read the routes for every subsystem a change reaches. Source paths below are rel
 
 Delivery changes cross prompt ownership, native child identity, source qualification, and channel receipts. Read those routes together. Discovery changes also reach query resolution, delegated accounting, cache generations, and export capture. Persistence changes require the owning state's recovery and storage contract.
 
-Follow parser changes through their consumers. Parsed facts travel through worker messages, forward checkpoints, derived metadata, spend ledgers, retained history, and export projection. [Source contracts](session-history.md#source-and-cache-contracts) identify their independent versions and acceptance rules. Changing a parser does not automatically invalidate every saved representation of its facts.
+Parsed facts travel through worker messages, forward checkpoints, derived metadata, spend ledgers, retained history, and export projection. [Source contracts](session-history.md#source-and-cache-contracts) identify their independent versions and acceptance rules. Changing a parser does not automatically invalidate every saved representation of its facts.
 
 Treat source presence, repository membership, physical identity, and accepted revision as separate evidence. [Discovery contracts](session-discovery.md#relationship-discovery-contracts) distinguish absence from an incomplete or refused read. [Channel reads](window-channel.md#accepted-catalog-reads) define what listing coverage and freshness establish. A displayed row alone supplies no authority to acknowledge review or deliver input.
 
@@ -99,7 +99,7 @@ Filesystem validation establishes observed agreement within each reader's contra
 
 `payload.ts` shapes host-to-panel render messages. The panel runs in another process, so a host import cannot supply browser code. Shared rules live in browser-safe `domain/` and `view/` modules. Host-only decisions travel as data over `webview/protocol.ts`.
 
-The root `turn*.ts` modules own the host projections by subject. New imports name that owner rather than the compatibility re-export in `turnview.ts`.
+Import host projections from their root `turn*.ts` owner rather than the compatibility re-export in `turnview.ts`.
 
 Every extension source package permits imports within itself. The additional local directions below apply to runtime and type imports, except the stated protocol exception.
 
