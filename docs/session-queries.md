@@ -6,13 +6,13 @@ Use this guide when changing query grammar, identity selection, or matching. [Sa
 
 `domain/session-query.ts` owns parsing, caret tokens, and matching. `view/session-query.ts` owns notes and label suggestions.
 
-The axes are `id:`, `session:`, `agent:`, `title:`, `label:`, `cost:`, `cache-expiry:`, and `is:`. Bare words match title substrings. Labels match complete names under shared case folding, including labels folded out of a card. Double quotes enclose values with spaces. Two quotes inside a quoted value represent one quote.
+Read `SESSION_AXES`, `queryWords`, and `parseSessionQuery` in `domain/session-query.ts` for axes, quoting, negation, and term combination. Labels match the complete stored list, including names folded out of a card.
 
-A leading `-` negates a supported term. Outside identity alternatives, all positive terms must match and negative terms exclude matches. For example, `label:ui label:bug is:active` requires both labels and Active. Lone `-` and unquoted words starting `--` add no term. A quote before `-` keeps it literal. `"-fix"` matches title text, and `find: "-name"` matches content. Quoting the start of `id:` or `session:` keeps it as title text, or content after `find:`. Quoting only the value retains identity selection, as in `session:"one"`. Other recognized prefixes still apply inside quotes.
+A quote before a leading `-`, `id:`, or `session:` keeps it literal. Quoting only an identity value retains selection, as in `session:"one"`. Other recognized prefixes still apply inside quotes. Lone `-` and unquoted words starting `--` add no term.
 
 ### Status
 
-`is:` completes input, unread, read, running, warm, active, needsyou, archived, and agentrun. Unknown or incomplete values add no term. No complete value prefixes another. `is:input` matches Needs input. `is:running` includes Running, Subagents, and Background. Read and unread match reader-owned attention state.
+`IS_VALUES` and `plainTermHolds` in `domain/session-query.ts` own status terms and matching. Unknown or incomplete values add no term.
 
 `is:archived` and `is:agentrun` read their underlying facts independently of visible buckets. `is:warm` uses prompt-cache lifetime against the browser clock, including archived sessions and agent runs. `is:active` matches a warm cache or activity within the last hour. `is:needsyou` requires Active and either unread or Needs input. [Status projection](rail-and-navigation.md#read-and-status-state) owns how rows obtain these facts.
 
@@ -32,7 +32,7 @@ Empty or malformed selectors empty results, including negated selectors. Danglin
 
 ### Numeric comparisons
 
-`cost:>5.43` keeps recorded USD costs above 5.43. `cost:<5.43` keeps exact recorded costs below it. `cache-expiry:>0` keeps lifetime primary-session cache-expiry counts above zero. `cache-expiry:<3` keeps exact counts below three. Both axes require one strict `<` or `>` followed by a non-negative whole or decimal number. Quoted comparisons are invalid.
+`NUMERIC_COMPARISON_VALUE` in `domain/session-query.ts` owns strict numeric grammar for recorded USD cost and lifetime primary-session cache-expiry counts. Quoted comparisons are invalid.
 
 Exact values match their strict comparison. Missing cost and unavailable or unindexed cache facts match neither. Lower bounds match `>` only when their known amount exceeds the threshold. They never match `<`, because unknown amounts or unclassified request pairs can increase the value. Negation keeps everything the positive comparison drops, including missing values and lower bounds. Invalid numeric terms remain visible, empty results, and receive correction guidance.
 

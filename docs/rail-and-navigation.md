@@ -14,19 +14,19 @@ The shared responsive breakpoint selects the wide session list or compact naviga
 
 ### Figures and density
 
-Full rows show cost, whole-session turn count, then current context. The session heading shares the same cost and turn count. Cost includes associated delegated work. Turn count covers the main session alone. Both require complete sources in the persisted incremental spend index. Selection must not change them.
+Session list and heading figures use the persisted incremental spend index for cost and whole-session turn count. Cost includes delegated work. Turn count covers the main session alone. Both require complete sources and must not change with selection. `view/rail.ts` owns figure order.
 
 Context uses parsed facts or the bounded metadata tail that also supplies title and status. A tail without the newest turn supplies no context. Do not add a transcript read for a session list figure. Omit missing figures, including their gaps.
 
 Every added metric needs a selection-independent source covering its caption's scope. Store current or tail source facts in the derived entry, then calculate display values when building rows. The ordinary parser replaces metadata facts. Whole-session aggregates belong in the persisted incremental index. Omit values when neither source covers their scope.
 
-A running row adds elapsed time after its first minute. Use the earliest active recorded turn start or busy-child start. Without either, omit duration. The hover gives start and last activity times. Needs input has no running duration.
+`sessionRunningSince` in `turnrail.ts` supplies the earliest active recorded turn or busy-child start. Without either, omit duration.
 
 The heading's turns hover includes session span, available compaction counts, and the number drawn when fewer than the whole-session count. Its bulk action opens or closes only drawn cards. Its wording must name that scope.
 
-The View menu's Rows choice applies Full or Compact to every row. Save `railDensity` beside `railWidth`, outside saved filters and views. Full is the default. Compact removes visible figures, labels, and agent wording, while retaining state, unread, selection, and archive styling. Its controls cover metadata without moving the name.
+Save `railDensity` beside `railWidth`, outside saved filters and views. `webview/rail.ts` owns the Rows controls. `view/rail.ts` owns density-specific ages and hover content.
 
-[Session list focus](panel-accessibility.md#session-list-focus) owns accessible names and read-only figures and labels. Compact uses short visible ages without `ago`. Its hover restores the full name, metadata, figures, and labels. It shows at most eight labels before `+N more`. [Hints](panel-accessibility.md#hints) defines platform hover delays. Accessible descriptions must not repeat the name's metadata, but retain subagent or background-command explanations. `view/rail.ts` owns status slots, ages, hover contents, and figure order.
+[Session list focus](panel-accessibility.md#session-list-focus) owns accessible names and read-only figures and labels. Compact hovers show at most eight labels before `+N more`. [Hints](panel-accessibility.md#hints) defines platform delays. Accessible descriptions omit metadata already in the name but retain subagent or background-command explanations.
 
 ### Labels
 
@@ -54,7 +54,7 @@ Match rename answers by session and request ID. A reloaded panel must not reuse 
 
 ### Header and scrolling
 
-The header orders action controls before filter buttons. Sessions disappears below 14.8em. Above 22.5em, the filter box shares a line with New. Below that width, it occupies another line. Restored panels start with the box closed.
+`webview/panel.css` owns header placement. Sessions disappears at widths up to 14.8em. The filter box takes a separate line at widths up to 22.5em. Restored panels start with the box closed.
 
 The magnifying glass opens the box. Its cross clears and closes it, returning focus to the magnifying glass. Escape first dismisses completion, then clears a nonempty query, then closes an empty box. Escape on a filter button changes neither query nor box. A filter press preserves box visibility.
 
@@ -68,49 +68,45 @@ Project cost appears after wide-list controls and before sessions. Its agent bre
 
 ### Filter completion
 
-Complete only the token under the caret. Partial axis names offer their colon form. `label:` offers exact matches, then prefixes, then substrings. Within each tier, preserve catalog order. Quote names containing spaces and preserve surrounding query words. An empty box offers nothing. Negated tokens offer the same choices with the mark restored and Filter out wording. A lone negation mark offers every axis.
+`filterOffers` in `webview/rail.ts` owns caret-token completion. `labelSuggestions` in `view/session-query.ts` owns match ranking and quoting. Preserve surrounding query words when accepting a completion.
 
 Keep focus in the combobox. Expose `aria-expanded`, `aria-controls`, and `aria-activedescendant`, with `aria-selected` on options. Up and Down move the active option. Enter and Tab accept. Escape dismisses suggestions for that token without editing it. Another token or reopening restores suggestions. Leave input-method composition keys alone. Tooltips expose complete names when text is shortened.
 
-Filtering narrows the session list alone. Content search has separate timeline results. Empty results must describe a nonmatching filter without implying missing transcripts. Coalesce input reconciliation to an animation frame.
+Filtering narrows the session list alone. Content search has separate timeline results. Empty results must describe a nonmatching filter without implying missing transcripts.
 
 ## Saved filters
 
 `domain/rail-filters.ts` owns named query and sort snapshots. Apply filters before `railSections` assigns views and groups. They create no section and change no saved view, section order, or remembered fold. All sessions is built in. It clears the query and restores the current default order.
 
-The Filter row offers All, Running, Active, Unread, and Needs input even without matches. Each named lens writes its positive status term plus `-is:archived -is:agentrun`. The terms are `is:running`, `is:active`, `is:unread`, and `is:input`, respectively. The reader can edit them in the query box.
-
-A button is pressed when the query contains that complete lens and no other complete lens, in any word order. Extra words do not unpress it. Removing a lens word does. Pressing the selected button removes its words. Another lens adds its words and removes words exclusive to competing complete lenses. Preserve unrelated words and sort order. A press over a saved filter selects Custom.
-
-All removes every complete lens but preserves other query words, sort, and selected filter identity. A query with two complete lenses retains its typed meaning and checks All. The funnel names a query containing only one complete lens for that lens. Extra words name it Custom. Bare typed or saved `is:running` also names it Custom.
+`domain/rail-filters.ts` owns lens terms, recognition, presses, and stored-query migrations. `RailFilterPicker` in `webview/rail.ts` owns the View menu controls.
 
 Unread and Needs input retain sessions after the reader reads or answers them. Retained sessions must satisfy other terms and remain neither archived nor agent runs. Query changes and panel reload clear retention. Group by Status uses their current state. Running and Active retain no departed sessions.
 
 Quick filters configures header buttons without changing the query. Defaults are Running, Active, and Needs input. Save the choice as `railQuickFilters`. Loading `railHeadLenses` adds Running. Unchecking removes a button immediately, even when selected. Forget State restores defaults. A retained button keeps focus through clock and payload updates. After removal or a lens press, focus the selected button, first available button, then funnel.
 
-The funnel's name and hint identify filter and order. It fills for named lenses, saved filters, and Custom. All sessions at the default order uses an outline. The View menu contains find, Filter, Quick filters, Group by, Sort by, Rows, Show, Labels, Saved filters, and actions. The magnifying glass separately owns opening the query box. Sort by changes the default on All sessions and the live order otherwise. Edits differing from a saved snapshot select Custom. Save changes explicitly replaces the snapshot.
+The funnel's accessible name and hint identify filter and order. Edits differing from a saved snapshot select Custom. Save changes explicitly replaces the snapshot.
 
 The extension owns the workspace saved-filter list. The panel saves only its selected ID, query, and sort. Host state saves exclude the list. Missing selected IDs fall back to All sessions. `migrateStoredRailLens` preserves stored query words while adding missing supported lens terms. It maps retired Needs you IDs to All sessions, drops retired Needs you lens fields, and converts Warm words under All sessions to Active. Stored built-in names gain an available `(saved)` suffix. Keep these migrations in `domain/rail-filters.ts`.
 
-Find narrows labels and saved filters. Label counts exclude sessions hidden by Show. Order chips by descending count, then name. Draw twelve before the expansion chip. Find text draws all matches without folding. Closing resets expansion. A chip toggles its quoted query term. Omit chips whose labels the query negates. `view/session-query.ts` owns chip selection and folding.
+`railMenuLabelChips` in `view/session-query.ts` owns View menu label selection and folding. It draws twelve before expansion. Negated labels offer no chip because adding their positive term would empty the list.
 
 ## Saved views
 
 `domain/views.ts` owns named queries that create sections. Views include their archive choice and optional order override. Status, cost, and cache-expiry terms update membership as facts change. Views never determine transcript parsing.
 
-`railSections` orders Pinned, saved views in saved order, unclaimed groups, Run by agents, then Archived. Every view matches independently. Matching several views repeats a session in each. A pinned match also appears in its view. A view with archived inclusion sees archived sessions only when Show archived permits them. Archived retains its own copy.
+`railSections` in `view/rail.ts` owns section membership. Views match independently, so a session can appear in several views and Pinned. Archived inclusion also requires Show archived.
 
-Group by saves `railGroupBy`. Time uses Today, Yesterday, Last 7 days, and Older. Label uses newest-session order, then folded Unlabelled. Agent uses agent-name order. Status uses Needs input, Running, Unread, Read. Waiting wins over unread. Subagents and Background join Running. None uses Sessions. Unclaimed, unpinned agent runs retain their separate bucket. Pinned agent runs stay in Pinned and matching views, without joining ordinary groups. Under Label, Agent, and Status, pinned ordinary sessions also appear in groups. Under Time and None they appear only in Pinned. Multiple labels repeat a session. Agent groups omit repeated agent wording on cards.
+Save Group by as `railGroupBy`. `railGroups` in `view/rail.ts` owns group names, ordering, and repeated membership. Pinned agent runs stay outside ordinary groups. Under Label, Agent, and Status, pinned ordinary sessions also appear in groups. Under Time and None they appear only in Pinned. Multiple labels repeat a session.
 
 Filtering happens before sections claim sessions. Preserve matching section order, counts, sorting, and repeated copies. Effective queries hide empty sections and start matches open, including restored queries. Disclosure changes apply temporarily to that query. Query changes reset those folds. Payload and clock updates retain them. Clearing restores ordinary folds. Pinning opens temporary Pinned without changing its saved fold. Deleting a view removes both fold records. Search-only `find:` and `in:` words create no session list term.
 
 Sections initially draw 200 rows. Pinned draws all. Draw through the current session, rounded up to the next multiple of 200 and capped at the available rows. Show more adds 200, or the remaining count on its last press. [Session list focus](panel-accessibility.md#session-list-focus) owns its accessible name and focus after expansion. Headings count drawn and undrawn cards. New queries start at 200, while returning queries retain expansion. Changing a view query resets its expansion. `RAIL_ROW_STEP` owns the bound.
 
-The default order is Latest update, Cost highest first, Cost lowest first, or Needs you first. Sort after membership. Views inherit or override it. Name explicit overrides in heading tooltips and accessible names, including overrides equal to the default. Unpriced sessions sort last in both cost orders. Needs you first ranks waiting, unread, running work, then other sessions. Running, Subagents, and Background share a rank. Within tied ranks, use newest activity, then ID.
+`sortRailCards` in `view/rail.ts` owns ordering within sections. Unpriced sessions sort last in both cost orders. Sort after membership. Views inherit or override the default. Heading tooltips and accessible names identify explicit overrides, including those equal to the default.
 
 Empty views without an effective filter retain folded headings for editing and deletion. Fold keys use view IDs so renaming preserves them. `normalizeRailFolds` accepts time-bucket names and `railgroup:` keys.
 
-Saving requires an effective term. Search-only queries offer no Save as view. A sole positive label suggests its catalog name or parsed spelling. Other restrictions remain in the query. Multiple positive labels or none leave the name empty. Select suggested text so typing replaces it. Enter saves. Escape cancels. Duplicate names require another name.
+Saving requires an effective term. Search-only queries offer no Save as view. `domain/views.ts` owns suggested names and validation. Select suggested text so typing replaces it. Enter saves. Escape cancels.
 
 The extension owns views and preserves them when accepting panel state saves. Save, rename, and delete publish complete normalized lists to every panel. View changes participate in list-update comparison even when no card moves. Saved headings offer Edit view and Delete this view through right-click, keyboard context menus, and their three-dot button. Time buckets offer neither. Save and Cancel return focus to the live opening control after redraw.
 
