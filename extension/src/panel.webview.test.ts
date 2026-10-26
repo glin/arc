@@ -32710,6 +32710,125 @@ test('a running session row draws running while its lifetime record still holds 
   }
 });
 
+test('a session row drops the failed word when a later turn succeeds before its metadata follows', () => {
+  const at = (time: string) => `2026-10-26T${time}Z`;
+  const file = path.join(tempDir('retried-failure-'), 'sess.jsonl');
+  const limit = (time: string) => ({
+    type: 'assistant',
+    isApiErrorMessage: true,
+    timestamp: at(time),
+    message: {
+      role: 'assistant',
+      model: '<synthetic>',
+      stop_reason: 'stop_sequence',
+      content: [{ type: 'text', text: "You've hit your weekly limit" }],
+    },
+  });
+  const queued = (time: string, content: string) =>
+    ['enqueue', 'dequeue'].map((operation) => ({ type: 'queue-operation', operation, timestamp: at(time), content }));
+  const failedTurn = [
+    {
+      type: 'user',
+      promptId: 'p1',
+      timestamp: at('06:42:24.809'),
+      origin: { kind: 'human' },
+      message: { role: 'user', content: [{ type: 'text', text: 'Diagnose the row' }] },
+    },
+    {
+      type: 'assistant',
+      timestamp: at('06:43:02.559'),
+      message: {
+        role: 'assistant',
+        model: 'claude-opus-5',
+        stop_reason: 'tool_use',
+        content: [{ type: 'tool_use', id: 'cmd1', name: 'Bash', input: { command: 'git log' } }],
+      },
+    },
+    {
+      type: 'user',
+      timestamp: at('06:45:03.806'),
+      message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'cmd1', content: 'ok' }] },
+    },
+    limit('06:45:04.328'),
+    ...queued('06:47:47.582', '<task-notification><task-id>t1</task-id></task-notification>'),
+    {
+      type: 'user',
+      promptId: 'p2',
+      timestamp: at('06:47:47.631'),
+      origin: { kind: 'task-notification' },
+      message: { role: 'user', content: '<task-notification><task-id>t1</task-id></task-notification>' },
+    },
+    limit('06:47:48.004'),
+  ];
+  const retryTurn = [
+    ...queued('07:03:38.541', 'retry'),
+    {
+      type: 'user',
+      promptId: 'p3',
+      timestamp: at('07:03:38.572'),
+      origin: { kind: 'human' },
+      userType: 'external',
+      message: { role: 'user', content: [{ type: 'text', text: 'retry' }] },
+    },
+    {
+      type: 'assistant',
+      timestamp: at('07:04:24.648'),
+      message: {
+        role: 'assistant',
+        id: 'm2',
+        model: 'claude-opus-5',
+        stop_reason: 'end_turn',
+        content: [{ type: 'text', text: 'Yes, this session is done.' }],
+      },
+    },
+    { type: 'system', subtype: 'stop_hook_summary', timestamp: at('07:04:24.760') },
+  ];
+  const lines = (records: object[]) => records.map((record) => JSON.stringify(record) + '\n').join('');
+  fs.writeFileSync(file, lines(failedTurn));
+  // The row metadata still holds the read of the revision that ended in the failure.
+  const tail = readSessionMeta(file, 256 * 1024, 'sess');
+  assert.equal(tail.outcome?.error, true);
+  fs.appendFileSync(file, lines(retryTurn));
+  const read = readSession(file, 'sess');
+  const retried = sessionOutcomeOf(read);
+  assert.equal(retried?.finished, true);
+  const now = Date.parse(at('07:05:24'));
+  vi.useFakeTimers();
+  vi.setSystemTime(now);
+  try {
+    const { provider } = liveProviderFixture(livePress({ sessionId: 'sess' }));
+    Object.assign(provider, {
+      live: {},
+      cache: new Map(),
+      titles: new Map([[file, tail]]),
+      // The lifetime record reached the successful retry.
+      lifetimeRailFacts: () => ({ sess: { newestTurnStartedAt: retried?.startedAt, outcome: retried } }),
+      claudeChildren: [],
+      claudeChildReferences: [],
+      claudeChildStatWrites: new Map(),
+      sessionRows: [{ id: 'sess', agentKey: 'claude' }],
+      running: new Set(),
+      runningSinceKeys: new Map(),
+      exitedSinceKeys: new Map(),
+    });
+    const host = provider as unknown as {
+      cache: Map<string, unknown>;
+      sessionOutcomes: unknown;
+      outcomesFor(sessions: { sessionId: string; file: string; agent: string }[]): unknown;
+      railStatuses(now: number): { statuses: Map<string, string>; openChildren: Map<string, number> };
+    };
+    const rowStatus = () => {
+      host.sessionOutcomes = host.outcomesFor([{ sessionId: 'sess', file, agent: 'claude' }]);
+      return host.railStatuses(now).statuses.get('sess');
+    };
+    assert.equal(rowStatus(), 'done', 'a row that is not open kept the failed turn');
+    host.cache.set(file, { read, revision: { mtimeMs: 10, size: 10 } });
+    assert.equal(rowStatus(), 'done', 'an open row kept the failed turn');
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
 // Supply production performance counters and threshold checks with captured diagnostic outputs.
 function startupFixture() {
   const logged: Array<[string, Record<string, unknown>]> = [];

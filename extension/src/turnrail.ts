@@ -664,6 +664,7 @@ export function openChildrenKey(
 // The tail can omit earlier launches. Lifetime facts read the whole file, while the parsed window covers timeline turns.
 // Without a tail outcome, such as when the tail misses the newest turn's opening prompt, the later of the lifetime and parsed outcomes takes its place.
 // It then follows the tail rules, so open children that only an older lifetime outcome holds do not carry over.
+// A lifetime or parsed outcome of a newer turn than the tail outcome takes its place by the same rules.
 // Accept children only from outcomes describing the same newest turn through the same last record. Older reads cannot reopen closed children.
 // A child closed by any read remains closed. Completion matching differs between readers, so their closed sets can differ.
 // `tailCommands` come from tail reads without a typed prompt. Wider outcomes retain those commands for the same turn because other readers omit commands.
@@ -700,6 +701,11 @@ function mergedWiderChildren(
   if (!tail) {
     const base = laterOutcome(lifetime, parsed);
     return base && base !== lifetime ? mergedWiderChildren(base, lifetime, parsed) : lifetime;
+  }
+  // A tail read of an earlier revision can hold a turn that a later turn replaced.
+  const newer = laterOutcome(lifetime, parsed);
+  if (newer && (newer.startedAt ?? 0) > (tail.startedAt ?? 0)) {
+    return mergedWiderChildren(newer, lifetime, parsed);
   }
   if (tail.processEndedAt !== undefined) {
     return tail;
