@@ -293,6 +293,8 @@ test('a panel asks once for a snapshot after a loss and draws nothing until one 
 
 test('the sender names why each message was a snapshot and counts the rows it carried', () => {
   const sender = new RowDeltaSender();
+  // A copy per read, so an assertion narrows no later read of the sender's record.
+  const encoding = () => ({ ...sender.lastEncoding });
   const rows = (version: number) => [
     { id: 'a', version },
     { id: 'b', version: 0 },
@@ -302,20 +304,20 @@ test('the sender names why each message was a snapshot and counts the rows it ca
   const globals = { day: 'Mon', scope: ['root'] };
 
   sender.encode(message(1), globals);
-  assert.deepEqual({ ...sender.lastEncoding }, { whole: true, reason: 'first', rowsHeld: 3, rowsSent: 3 });
+  assert.deepEqual(encoding(), { whole: true, reason: 'first', rowsHeld: 3, rowsSent: 3 });
 
   sender.encode(message(1), globals);
-  assert.deepEqual({ ...sender.lastEncoding }, { whole: false, reason: null, rowsHeld: 3, rowsSent: 0 });
+  assert.deepEqual(encoding(), { whole: false, reason: null, rowsHeld: 3, rowsSent: 0 });
 
   sender.encode(message(2), globals);
-  assert.deepEqual({ ...sender.lastEncoding }, { whole: false, reason: null, rowsHeld: 3, rowsSent: 1 });
+  assert.deepEqual(encoding(), { whole: false, reason: null, rowsHeld: 3, rowsSent: 1 });
 
   sender.encode(message(2), { ...globals, scope: ['root', 'added'] });
-  assert.deepEqual({ ...sender.lastEncoding }, { whole: true, reason: 'globalMoved:scope', rowsHeld: 3, rowsSent: 3 });
+  assert.deepEqual(encoding(), { whole: true, reason: 'globalMoved:scope', rowsHeld: 3, rowsSent: 3 });
 
   sender.reset('gap');
   sender.encode(message(2), { ...globals, scope: ['root', 'added'] });
-  assert.deepEqual({ ...sender.lastEncoding }, { whole: true, reason: 'reset:gap', rowsHeld: 3, rowsSent: 3 });
+  assert.deepEqual(encoding(), { whole: true, reason: 'reset:gap', rowsHeld: 3, rowsSent: 3 });
 
   sender.encode(
     { type: 'rail' as const, rail: [...rows(2), { id: 'a', version: 9 }], stats: {} },
@@ -324,19 +326,19 @@ test('the sender names why each message was a snapshot and counts the rows it ca
       scope: ['root', 'added'],
     },
   );
-  assert.equal(sender.lastEncoding?.reason, 'repeatedIds');
+  assert.equal(encoding().reason, 'repeatedIds');
   sender.encode(message(2), { ...globals, scope: ['root', 'added'] });
-  assert.equal(sender.lastEncoding?.reason, 'reset:repeatedIds');
+  assert.equal(encoding().reason, 'reset:repeatedIds');
 
   sender.encode(
     { type: 'rail' as const, rail: [{ id: 'a' }, { noId: true } as unknown as { id: string }], stats: {} },
     globals,
   );
-  assert.deepEqual({ ...sender.lastEncoding }, { whole: true, reason: 'unkeyedRows', rowsHeld: 0, rowsSent: 0 });
+  assert.deepEqual(encoding(), { whole: true, reason: 'unkeyedRows', rowsHeld: 0, rowsSent: 0 });
 
   const withSessions = new RowDeltaSender();
   withSessions.encode({ type: 'render' as const, sessions: [{ id: 's' }], rail: rows(1), stats: {} }, globals);
-  assert.deepEqual(withSessions.lastEncoding, { whole: true, reason: 'first', rowsHeld: 4, rowsSent: 4 });
+  assert.deepEqual({ ...withSessions.lastEncoding }, { whole: true, reason: 'first', rowsHeld: 4, rowsSent: 4 });
 });
 
 test('a delta carries only rows whose content changed', () => {
