@@ -5372,23 +5372,28 @@ export function retainCodexDispatchSpend(file: string, entry: CodexDispatchSpend
 }
 
 export function retainCodexDispatchSpendRoots(files: ReadonlySet<string>): void {
-  if (pendingDispatchAggregate && !files.has(pendingDispatchAggregate.root)) discardDispatchAggregate();
+  for (const root of [...pendingDispatchAggregates.keys()]) if (!files.has(root)) discardDispatchAggregate(root);
 }
 
-// One aggregate retains its traversal independently of reusable source-cache eviction.
-let pendingDispatchAggregate: {
-  root: string;
-  relationships: string | null;
-  revisions: Map<string, Pick<CodexDispatchSpendEntry, 'key' | 'band'> & { value: Pick<CodexOwnSpend, 'finished'> }>;
-  scan: Generator<string, AgentSpend, CodexOwnSpend>;
-  next: IteratorResult<string, AgentSpend>;
-} | null = null;
+// Each admitted root retains its own traversal independently of reusable source-cache eviction.
+// A root that the worker stops reading, such as one that started a new turn, holds only its own aggregate.
+const pendingDispatchAggregates = new Map<
+  string,
+  {
+    relationships: string | null;
+    revisions: Map<string, Pick<CodexDispatchSpendEntry, 'key' | 'band'> & { value: Pick<CodexOwnSpend, 'finished'> }>;
+    scan: Generator<string, AgentSpend, CodexOwnSpend>;
+    next: IteratorResult<string, AgentSpend>;
+  }
+>();
 
-function discardDispatchAggregate(): void {
-  pendingDispatchSpend?.scan.return(undefined as never);
-  pendingDispatchSpend = null;
-  pendingDispatchAggregate?.scan.return(undefined as never);
-  pendingDispatchAggregate = null;
+function discardDispatchAggregate(root: string): void {
+  if (pendingDispatchSpend?.root === root) {
+    pendingDispatchSpend.scan.return(undefined as never);
+    pendingDispatchSpend = null;
+  }
+  pendingDispatchAggregates.get(root)?.scan.return(undefined as never);
+  pendingDispatchAggregates.delete(root);
 }
 
 export type CodexDispatchSpendProgress =
@@ -5410,33 +5415,28 @@ export function readCodexDispatchedSpendQuantum(
   progress?: (event: CodexDispatchSpendProgress) => void,
 ): { spend: AgentSpend; pending: boolean } {
   const index = codexSpendIndex(children);
-  if (pendingDispatchAggregate?.root === file) {
-    if (pendingDispatchAggregate.relationships !== index.relationshipVersion) {
+  const held = pendingDispatchAggregates.get(file);
+  if (held) {
+    if (held.relationships !== index.relationshipVersion) {
       progress?.('dispatchSpendRelationshipInvalidations');
-      discardDispatchAggregate();
-    } else if (
-      [...pendingDispatchAggregate.revisions].some(([source, entry]) => !compatibleDispatchSpend(source, entry, now))
-    ) {
+      discardDispatchAggregate(file);
+    } else if ([...held.revisions].some(([source, entry]) => !compatibleDispatchSpend(source, entry, now))) {
       progress?.('dispatchSpendConsumedSourceInvalidations');
-      discardDispatchAggregate();
+      discardDispatchAggregate(file);
     }
   }
-  if (pendingDispatchAggregate && pendingDispatchAggregate.root !== file) {
+  let aggregate = pendingDispatchAggregates.get(file);
+  // A root wait is a visit that finds the pass budget already spent. A pending aggregate keeps its position.
+  if (budget.bytes <= 0 || (budget.advanced && budget.ms <= 0)) {
     progress?.('dispatchSpendRootWaits');
     return { spend: { models: [], found: false, partial: true, effort: null }, pending: true };
   }
-  if (!pendingDispatchAggregate) {
+  if (!aggregate) {
     progress?.('dispatchSpendAggregateStarts');
     const scan = codexDispatchedSpendScan(file, index);
-    pendingDispatchAggregate = {
-      root: file,
-      relationships: index.relationshipVersion,
-      revisions: new Map(),
-      scan,
-      next: scan.next(),
-    };
+    aggregate = { relationships: index.relationshipVersion, revisions: new Map(), scan, next: scan.next() };
+    pendingDispatchAggregates.set(file, aggregate);
   }
-  const aggregate = pendingDispatchAggregate;
   // The budget's time counts only this reader's work, so earlier reads in the caller's pass leave it intact.
   const startedAt = performance.now();
   while (!aggregate.next.done && budget.bytes > 0 && (!budget.advanced || performance.now() - startedAt < budget.ms)) {
@@ -5455,6 +5455,7 @@ export function readCodexDispatchedSpendQuantum(
         pendingDispatchSpend = null;
       }
       pendingDispatchSpend ??= { root: file, file: source, key, scan: readCodexOwnSpendIncremental(source) };
+      pendingDispatchSpend.root = file;
       let next = pendingDispatchSpend.scan.next();
       progress?.('dispatchSpendParserAdvancements');
       budget.advanced = true;
@@ -5489,7 +5490,7 @@ export function readCodexDispatchedSpendQuantum(
   if (aggregate.next.done) {
     progress?.('dispatchSpendAggregateCompletions');
     const spend = aggregate.next.value;
-    pendingDispatchAggregate = null;
+    pendingDispatchAggregates.delete(file);
     return { spend, pending: false };
   }
   return { spend: { models: [], found: false, partial: true, effort: null }, pending: true };

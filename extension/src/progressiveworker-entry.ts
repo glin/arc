@@ -1013,7 +1013,8 @@ async function execute(
           dispatched.push(held.facts);
           continue;
         }
-        charges.dispatchSpendRereads++;
+        // A visit that resumes a pending spend read at the same revision reads no byte again.
+        if (!held?.spendPending || !sameRevision(held.revision, revision)) charges.dispatchSpendRereads++;
         const previousPerson =
           held &&
           held.revision.dev === revision.dev &&

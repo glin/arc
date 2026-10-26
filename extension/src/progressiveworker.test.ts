@@ -11742,6 +11742,142 @@ test('a dispatched spend aggregate settles in bounded passes after earlier dispa
   }
 });
 
+test('dispatched spend aggregates settle across passes beside a running Codex root and read each file once', async () => {
+  const directory = tempDir('spend-aggregate-passes-');
+  const parentFile = path.join(directory, 'parent.jsonl');
+  const now = Date.now() + 7_200_000;
+  const runningId = 'eeeeeeee-1111-1111-1111-111111111111';
+  const quietIds = Array.from({ length: 5 }, (_, index) => `${index}aaaaaaa-1111-1111-1111-111111111111`);
+  const rootIds = [runningId, ...quietIds];
+  const childIds = new Map(
+    rootIds.map((rootId, index) => [
+      rootId,
+      [1, 2].map((child) => `${index}${child}bbbbbb-2222-2222-2222-222222222222`),
+    ]),
+  );
+  // The running root comes first, so it holds the first aggregate before it starts writing again.
+  fs.writeFileSync(
+    parentFile,
+    rootIds
+      .flatMap((sessionId, index) =>
+        claudeDispatchTranscript(
+          'python child.py --arc-dispatch',
+          `ARC_DISPATCH_SESSION={"agent":"codex","session_id":"${sessionId}","owned":true}`,
+          `dispatch-${index}`,
+        ),
+      )
+      .map((record) => JSON.stringify(record) + '\n')
+      .join(''),
+  );
+  const record = (type: string, payload: object) => JSON.stringify({ type, timestamp: timestamp(1), payload }) + '\n';
+  const rollout = (sessionId: string, blocks: number, finished: boolean, parentThreadId?: string) =>
+    fs.writeFileSync(
+      path.join(directory, sessionId + '.jsonl'),
+      record('session_meta', {
+        id: sessionId,
+        cwd: directory,
+        source: 'exec',
+        ...(parentThreadId ? { parent_thread_id: parentThreadId } : {}),
+      }) +
+        record('event_msg', { type: 'task_started', turn_id: 'work' }) +
+        record('turn_context', { turn_id: 'work', model: 'gpt-6.1-sol' }) +
+        record('event_msg', { type: 'user_message', message: 'work' }) +
+        Array.from({ length: blocks }, () => record('ignored', { text: 'x'.repeat(65500) })).join('') +
+        record('event_msg', {
+          type: 'token_count',
+          info: {
+            last_token_usage: { input_tokens: 10, output_tokens: 3, total_tokens: 13 },
+            total_token_usage: { input_tokens: 10, output_tokens: 3, total_tokens: 13 },
+          },
+        }) +
+        (finished ? record('event_msg', { type: 'task_complete', turn_id: 'work' }) : ''),
+    );
+  for (const rootId of rootIds) {
+    rollout(rootId, 1, rootId !== runningId);
+    for (const childId of childIds.get(rootId)!) rollout(childId, 16, true, rootId);
+  }
+  const files = [...rootIds, ...[...childIds.values()].flat()].map((sessionId) =>
+    path.join(directory, sessionId + '.jsonl'),
+  );
+  const fileBytes = files.reduce((sum, file) => sum + fs.statSync(file).size, 0);
+  const session = (sessionId: string, agent: 'claude' | 'codex') => {
+    const file = path.join(directory, sessionId + '.jsonl');
+    return { file, sessionId, agent, ...revisionOf(fs.statSync(file, { bigint: true })) };
+  };
+  const request = () => ({
+    kind: 'claude-children' as const,
+    parents: [session('parent', 'claude')],
+    catalog: [session('parent', 'claude'), ...rootIds.map((sessionId) => session(sessionId, 'codex'))],
+    codexChildren: [...childIds].flatMap(([rootId, ids]) =>
+      ids.map((threadId) => ({
+        file: path.join(directory, threadId + '.jsonl'),
+        threadId,
+        parentThreadId: rootId,
+        agentPath: null,
+        openedAt: null,
+        startedAt: null,
+        threadSource: null,
+        backgroundReview: false,
+      })),
+    ),
+    repositoryRoots: [directory],
+  });
+  // Each read costs one millisecond of the worker clock, so one pass reads about one child.
+  const worker = new ProgressiveWorker(
+    `const clockFs = require('node:fs'); let readClock = 0; performance.now = () => readClock;
+    const clockRead = clockFs.readSync; const clockReadFile = clockFs.readFileSync;
+    clockFs.readSync = function (...args) { readClock++; return clockRead.apply(this, args); };
+    clockFs.readFileSync = function (...args) { readClock++; return clockReadFile.apply(this, args); };
+    Date.now = () => ${now};` + source,
+  );
+  try {
+    const totals = { passes: 0, rereads: 0, bytes: 0, starts: 0, completions: 0, waits: 0 };
+    let running = false;
+    let settled: ProgressiveResult | null = null;
+    for (let pass = 0; pass < 60 && !settled; pass++) {
+      const result = await worker.run(request(), 1, new AbortController().signal);
+      assert.ok(result?.value.kind === 'claude-children' || result?.value.kind === 'claude-children-progress');
+      if (result.value.kind !== 'claude-children') continue;
+      const charges = result.value.charges!;
+      totals.passes++;
+      totals.rereads += charges.dispatchSpendRereads;
+      totals.bytes += charges.dispatchSpendBytes;
+      totals.starts += charges.dispatchSpendAggregateStarts;
+      totals.completions += charges.dispatchSpendAggregateCompletions;
+      totals.waits += charges.dispatchSpendRootWaits;
+      if (!running && charges.dispatchSpendAggregateStarts) {
+        // The first root starts writing a new turn while its aggregate is pending, and it stays running.
+        const file = path.join(directory, runningId + '.jsonl');
+        fs.appendFileSync(file, record('event_msg', { type: 'task_started', turn_id: 'again' }));
+        fs.utimesSync(file, new Date(now - 60_000), new Date(now - 60_000));
+        running = true;
+        continue;
+      }
+      if (running && !result.value.continuation) settled = result;
+    }
+    assert.ok(
+      settled?.value.kind === 'claude-children',
+      `the quiet roots never settled beside the running root: ${JSON.stringify(totals)}`,
+    );
+    const facts = new Map(settled.value.dispatchFacts.map((fact) => [fact.sessionId, fact]));
+    for (const sessionId of quietIds) {
+      assert.equal(facts.get(sessionId)?.spend.partial, false, sessionId);
+      assert.equal(facts.get(sessionId)?.spend.models[0]?.usage.output, 9, 'the root and its two children each add 3');
+    }
+    assert.equal(totals.completions, quietIds.length, JSON.stringify(totals));
+    assert.ok(totals.passes <= 20, `settling took ${totals.passes} passes`);
+    assert.ok(totals.rereads <= files.length, `${totals.rereads} rereads over ${files.length} files`);
+    assert.ok(totals.bytes <= fileBytes, `${totals.bytes} spend bytes read over ${fileBytes} file bytes`);
+    const after = await worker.run(request(), 1, new AbortController().signal);
+    assert.ok(after?.value.kind === 'claude-children');
+    assert.equal(after.value.charges!.dispatchSpendRereads, 0);
+    assert.equal(after.value.charges!.dispatchSpendBytes, 0);
+  } finally {
+    worker.stop();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test('a child edit read returns only the requested files of a Claude or Codex child at the requested revision', async () => {
   const root = tempDir('child-file-edits-');
   const claudeFile = path.join(root, 'claude-child.jsonl');

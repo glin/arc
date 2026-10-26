@@ -17640,12 +17640,12 @@ test('dispatched Codex progress distinguishes advancement, source restarts, inva
     dispatchSpendRootWaits: 0,
   };
   const completed: string[] = [];
-  const read = (file = files[0]) =>
+  const read = (file = files[0], budget = { bytes: 65536, ms: Infinity }) =>
     readCodexDispatchedSpendQuantum(
       file,
       children,
       Date.UTC(2030, 0, 1),
-      { bytes: 65536, ms: Infinity },
+      budget,
       () => {},
       (source) => completed.push(source),
       (event) => counts[event]++,
@@ -17675,8 +17675,11 @@ test('dispatched Codex progress distinguishes advancement, source restarts, inva
     assert.equal(counts.dispatchSpendConsumedSourceInvalidations, 1);
     assert.equal(counts.dispatchSpendAggregateStarts, 3);
     const beforeWait = { ...counts };
-    assert.equal(read(files[2]).pending, true);
+    assert.equal(read(files[2], { bytes: 0, ms: Infinity }).pending, true);
     assert.deepEqual(counts, { ...beforeWait, dispatchSpendRootWaits: 1 });
+    // Another root with budget left starts its own aggregate, and the pending one keeps its position.
+    assert.equal(read(files[2]).pending, true);
+    assert.equal(counts.dispatchSpendAggregateStarts, beforeWait.dispatchSpendAggregateStarts + 1);
     let result = read();
     for (let attempt = 0; result.pending && attempt < 20; attempt++) result = read();
     assert.equal(result.pending, false);
@@ -17684,6 +17687,11 @@ test('dispatched Codex progress distinguishes advancement, source restarts, inva
     assert.equal(result.spend.partial, false);
     assert.equal(counts.dispatchSpendAggregateCompletions, 1);
     assert.equal(counts.dispatchSpendSourceRestarts, 1);
+    let other = read(files[2]);
+    for (let attempt = 0; other.pending && attempt < 20; attempt++) other = read(files[2]);
+    assert.equal(other.pending, false);
+    assert.equal(counts.dispatchSpendAggregateStarts, beforeWait.dispatchSpendAggregateStarts + 1);
+    assert.equal(counts.dispatchSpendAggregateCompletions, 2);
   } finally {
     clock.mockRestore();
     retainCodexDispatchSpendRoots(new Set());
