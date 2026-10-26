@@ -20,9 +20,9 @@ Requires Node.js 22+ and npm. On Windows, use Git Bash. Install [Claude Code](ht
 curl -fsSL https://raw.githubusercontent.com/glin/arc/main/install.sh | bash
 ```
 
-The installer adds Arc to VS Code. Personal skills and global hooks require [explicit selection](docs/arc-sessions.md#install-the-parts-you-need). It works with VS Code, VS Code Insiders, Cursor, Positron, and VSCodium. See [CLI installation](cli/README.md#install) for its options and for using `arc` outside VS Code.
+The installer adds Arc to VS Code, VS Code Insiders, Cursor, Positron, or VSCodium. It leaves your personal skills and global Claude hooks unchanged. See [CLI installation](cli/README.md#install) for using `arc` outside VS Code.
 
-Reload VS Code. Use the Arc icon in the editor toolbar or **Arc: Open Arc in Editor** in the Command Palette.
+After installing or updating Arc, reload VS Code and start fresh agent sessions. Use the Arc icon in the editor toolbar or **Arc: Open Arc in Editor** in the Command Palette.
 
 Arc runs the installed `claude` and `codex` with their existing sign-in: a Claude or ChatGPT subscription, or an API key. To sign in:
 
@@ -33,15 +33,13 @@ codex login
 
 ### Claude hooks
 
-Eligible Arc-launched Claude sessions receive snapshot hooks automatically. [Native admission](docs/native-skills.md#native-session-skill-admission) defines runtime requirements and existing-hook precedence.
+The Claude hooks let Arc show full file diffs. Arc loads them for Claude sessions it starts, when your settings and Node.js installation allow it. Existing hooks take priority. See [hook requirements](docs/native-skills.md#snapshot-hook-requirements) if hooks do not load.
 
-For sessions started outside Arc, run **Arc: Set up Claude hooks** from the Command Palette or select global setup explicitly:
+For Claude sessions started outside Arc, run **Arc: Set up Claude hooks** from the Command Palette or install with `--hooks`:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/glin/arc/main/install.sh | bash -s -- --hooks
 ```
-
-Existing checkout marketplaces require [one-time recovery](docs/installation.md#legacy-checkout-plugin-recovery).
 
 ### Uninstall
 
@@ -107,7 +105,7 @@ Either agent can start Claude Code or Codex sessions from a shell command. The d
 
 The [`arc-sessions` skill](docs/arc-sessions.md) lets agents start sessions in Arc, read their results, and send follow-ups. Agents can also label, pin, and archive sessions, queue a compaction of their own session for after the turn, and estimate costs with `arc cost`.
 
-Arc supplies native session skill discovery for supported sessions it starts. [Automatic availability](docs/arc-sessions.md#automatic-native-availability) describes compatibility and manual installation.
+Arc makes the skill available in sessions it starts. It leaves any existing `arc-sessions` skill in place. See [session skill setup](docs/arc-sessions.md#use-the-skill-in-arc) for command names and installation outside Arc.
 
 ```text
 Use Arc to summarize the sessions labelled Review in this window.

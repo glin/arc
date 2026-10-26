@@ -102,7 +102,7 @@ Claude changes models through controls, but effort uses `/effort <level>`. Book 
 
 Codex approval policy, reviewer, and sandbox are separate fields. `on-request` still asks the reader without the automatic reviewer. Match all three fields before displaying a preset. Translate thread-start and turn-start sandbox spellings. Custom combinations retain both approval behavior and access boundary.
 
-An empty permission value means no Arc override. A live selection retires every child for that agent before subsequent input. Claude then omits `--permission-mode`. Codex omits `approvalPolicy`, `approvalsReviewer`, and `sandbox` on starts and turns. Each provider applies its configuration and policy. Configuration reads for [skill admission](native-skills.md#native-session-skill-admission) and [metadata discovery](session-setup.md#catalogs-and-applied-defaults) remain separate from permission overrides.
+An empty permission value means no Arc override. A live selection retires every child for that agent before subsequent input. Claude then omits `--permission-mode`. Codex omits `approvalPolicy`, `approvalsReviewer`, and `sandbox` on starts and turns. Each provider applies its configuration and policy. Configuration reads for [session tools](native-skills.md#checks-before-startup-and-input) and [metadata discovery](session-setup.md#catalogs-and-applied-defaults) remain separate from permission overrides.
 
 [`composerview.ts`](../extension/src/composerview.ts) owns permission-control projection and setup inheritance.
 

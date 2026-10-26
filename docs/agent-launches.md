@@ -6,7 +6,7 @@
 
 Arc-owned children receive their immutable private CLI launcher directory before inherited PATH. Windows preserves the inherited PATH key's casing. `ARC_WINDOW` names the current activation when its channel exists. Otherwise remove it. `ARC_EDITOR_EXECUTABLE` names the editor binary.
 
-Claude preparation independently selects its session skill and snapshot hooks. Each admitted component adds one plugin directory to the direct provider command. [Native admission](native-skills.md#native-session-skill-admission) owns component checks and first-input authority.
+Arc checks Claude's session skill and snapshot hooks separately. Each accepted plugin adds one `--plugin-dir` argument to the Claude command. Arc still launches the provider directly. [Session tools](native-skills.md#checks-before-startup-and-input) describes the checks before startup and input.
 
 Both private launchers set `ELECTRON_RUN_AS_NODE=1` and run their release's `cli/arc.cjs` with that binary. Extensionless `arc` serves POSIX shells and Git Bash. `arc.cmd` serves Windows command shells. Every Arc-owned child uses this environment through `childEnv` in [`agenthost.ts`](../extension/src/agenthost.ts).
 

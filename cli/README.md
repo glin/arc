@@ -13,9 +13,9 @@ The Arc extension includes `arc` for sessions it starts and new integrated termi
 
 ## Session skill
 
-Use the `arc-sessions` skill to give your agents Arc's CLI instructions. [Automatic availability](../docs/arc-sessions.md#automatic-native-availability) covers Arc-launched sessions and native invocation names.
+The `arc-sessions` skill gives agents Arc's CLI instructions. Arc makes it available in sessions it starts. See [using the skill in Arc](../docs/arc-sessions.md#use-the-skill-in-arc) for command names and settings that prevent it from loading.
 
-The source installer preserves personal skills by default. Repeat `--skill-agent claude` and `--skill-agent codex` to install selected personal copies.
+The source installer leaves personal skills unchanged unless you pass `--skill-agent claude`, `--skill-agent codex`, or both.
 
 For sessions outside Arc, install the bundled skill:
 

@@ -21,7 +21,7 @@ When the installer reports component outcomes, it uses readable text by default.
 
 ## Snapshot installation
 
-Explicit source hook installation invokes bundled snapshot setup after editor installation. [Native admission](native-skills.md#native-session-skill-admission) owns automatic hooks for eligible Arc children. **Arc: Set up Claude hooks** and `setup.cjs --snapshots` install global hooks for sessions started outside Arc. Its ownership, disabled-plugin refusal, runtime requirements, and immutable storage follow [Bundled tools](#bundled-tools). A checkout or temporary source copy never becomes a registered marketplace. [Legacy recovery](#legacy-checkout-plugin-recovery) owns migration authority and choices.
+The source installer runs bundled snapshot setup after editor installation when you pass `--hooks`. **Arc: Set up Claude hooks** and `setup.cjs --snapshots` also install global hooks for sessions started outside Arc. [Bundled tools](#bundled-tools) describes storage, ownership checks, and runtime requirements. Setup preserves disabled plugins. It never registers a checkout or temporary source copy as a marketplace. [Hook requirements](native-skills.md#snapshot-hook-requirements) covers hooks loaded automatically for Arc sessions.
 
 Hosted catalogs require Claude Code 2.1.224 or later. Claude owns archive downloads and its installed plugin cache. `install.sh` checks marketplace ownership before it builds. `scripts/install-claude-hooks.sh` owns hosted registration and checks ownership again before it changes plugins. The first check does not replace the second. `plugins/arc-hooks/hooks/hooks.json` defines hook commands through `${CLAUDE_PLUGIN_ROOT}`.
 
@@ -75,9 +75,9 @@ Filesystem isolation does not isolate Keychain, credential-manager, keyring, or 
 
 Native acceptance requires real Claude on Windows, macOS, and Linux. Run both sequences with two payloads whose plugin versions remain `0.1.0`. Check reported paths and selected file digests after every step. In a fresh scratch repository, exercise PreToolUse with an existing file and Stop after an edit. Check original baseline bytes, the manifest, and the trigger for installed local, installed downloaded, and checkout-plugin sessions. Registration alone does not establish snapshot capture.
 
-## Legacy checkout plugin recovery
+## Hook setup reports a checkout marketplace
 
-An existing checkout marketplace remains user-owned. A local reinstall with `--hooks` preserves it and reports incomplete hook setup until migration. The diagnostic names the checkout, expected managed source, and Claude home. `--no-hooks` permits extension updates while skipping hook refresh and compatibility checks. This does not establish compatibility between arbitrary older hooks and the new extension. Matching managed payloads are the supported source-switching path.
+If hook setup reports an existing checkout marketplace, Arc leaves that registration unchanged. The message names the checkout, expected managed source, and Claude home. To update only the extension, omit `--hooks`. This leaves the existing hooks unchanged and does not check their compatibility. To replace the checkout registration, follow the recovery steps below. Matching managed payloads are the supported source-switching path.
 
 Rehearse the same-path upgrade in disposable state before changing a daily installation:
 

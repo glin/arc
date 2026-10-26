@@ -2,7 +2,7 @@
 
 [Data sources](data-sources.md#snapshot-storage) owns storage paths and retention. [Development](installation.md#snapshot-installation) owns hook installation. [Session list and navigation](panel-navigation.md#files-commits-and-editor-groups) owns editor placement and ordinary file links.
 
-[Native admission](native-skills.md#native-session-skill-admission) owns automatic snapshot hooks for eligible Arc-launched Claude children. Viewing an external session installs nothing. Continuing it through a new Arc child applies normal admission. Earlier uncaptured edits receive no retrospective baseline.
+[Hook requirements](native-skills.md#snapshot-hook-requirements) describes automatic snapshot hooks for Claude sessions started through Arc. Viewing a session started elsewhere installs nothing. Continuing it through Arc checks those requirements before starting Claude. Hooks cannot recover snapshots of earlier edits.
 
 ## Diff selection
 
