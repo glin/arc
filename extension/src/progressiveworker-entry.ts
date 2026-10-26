@@ -150,6 +150,15 @@ const dispatchFacts = new Map<
     spendPending?: boolean;
   }
 >();
+// A reply row carries the head its file named, so the next activation resolves an unchanged child with one stat.
+function withChildHead([file, entry]: [string, ClaudeChildReferenceCacheEntry]): [
+  string,
+  ClaudeChildReferenceCacheEntry,
+] {
+  const head = claudeChildSessions.heads().get(file);
+  if (!head || head === entry.head) return [file, entry];
+  return [file, { ...entry, head }];
+}
 const DISPATCH_METADATA_BYTES = 256 * 1024;
 export const CODEX_DISPATCH_REQUEST_BYTES = 8 * 1024 * 1024;
 let discoveryEpoch: DiscoveryCheckpoint | null = null;
@@ -376,6 +385,7 @@ async function execute(
       if (!claudeChildReferences.has(key)) {
         claudeChildReferences.set(key, entry);
       }
+      if (entry.head) claudeChildSessions.seed(key, entry.head);
     }
     const scope = JSON.stringify(request.repositoryRoots);
     const heldEpoch = discoveryEpoch;
@@ -544,9 +554,7 @@ async function execute(
       if (delta) {
         const value = {
           kind: 'claude-children-delta' as const,
-          referenceEntries: source
-            ? [[source, claudeChildReferences.get(source)!] as [string, ClaudeChildReferenceCacheEntry]]
-            : [],
+          referenceEntries: source ? [withChildHead([source, claudeChildReferences.get(source)!])] : [],
           checkpoint: header,
           epoch: epoch.epoch!,
           parserVersion: CLAUDE_CHILD_REFERENCE_PARSER_VERSION,
@@ -568,7 +576,7 @@ async function execute(
       epoch.completed = [...completed];
       return {
         kind: 'claude-children-progress' as const,
-        referenceEntries: entries,
+        referenceEntries: entries.map(withChildHead),
         checkpoint: epoch,
         continuation: true as const,
         charges,
@@ -1130,7 +1138,7 @@ async function execute(
       ...found,
       references,
       dispatchFacts: dispatched,
-      referenceEntries: [...claudeChildReferences],
+      referenceEntries: [...claudeChildReferences].map(withChildHead),
       complete: true,
       continuation,
       charges,

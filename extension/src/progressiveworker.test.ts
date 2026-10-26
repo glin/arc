@@ -11013,7 +11013,11 @@ test.each(['claude', 'codex'] as const)(
           observed: result as typeof result & { observedBytes: number },
         };
       };
-      const cold = await run(found.value.referenceEntries, 1);
+      // Rows saved without a child head read the head once more.
+      const cold = await run(
+        found.value.referenceEntries.map(([file, { head: _head, ...entry }]) => [file, entry]),
+        1,
+      );
       assert.equal(cold.charges.readBytes, 0, 'cached relationships charged relationship scan bytes');
       assert.equal(cold.charges.hits, candidates);
       assert.equal(
@@ -11063,6 +11067,89 @@ test.each(['claude', 'codex'] as const)(
     }
   },
 );
+
+test('a new worker resolves unchanged Claude children from saved heads and rereads only a grown child', async () => {
+  const directory = tempDir('saved-child-heads-');
+  const cache = path.join(directory, 'derived-cache.json');
+  const parentFile = path.join(directory, 'parent.jsonl');
+  const childDirectory = path.join(directory, 'parent', 'subagents');
+  const ids = ['first', 'second'];
+  const childFiles = ids.map((id) => path.join(childDirectory, `agent-${id}.jsonl`));
+  const write = (file: string, rows: unknown[]) =>
+    fs.writeFileSync(file, rows.map((row) => JSON.stringify(row)).join('\n') + '\n');
+  fs.mkdirSync(childDirectory, { recursive: true });
+  write(
+    parentFile,
+    ids.flatMap((id) => [
+      { type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Agent', id: `launch-${id}` }] } },
+      {
+        type: 'user',
+        message: { content: [{ type: 'tool_result', tool_use_id: `launch-${id}` }] },
+        toolUseResult: { agentId: id },
+      },
+    ]),
+  );
+  childFiles.forEach((file, index) =>
+    write(file, [{ type: 'user', cwd: directory, message: { content: 'child work'.repeat(index + 1) } }]),
+  );
+  const request = () => ({
+    kind: 'claude-children' as const,
+    parents: [
+      {
+        file: parentFile,
+        sessionId: 'parent',
+        agent: 'claude' as const,
+        ...revisionOf(fs.statSync(parentFile, { bigint: true })),
+      },
+    ],
+    repositoryRoots: [directory],
+  });
+  // Each activation starts a new worker from the saved store and saves its final rows back.
+  const activate = async (generation: number) => {
+    const worker = new ProgressiveWorker(source);
+    const heads = { files: 0, bytes: 0 };
+    try {
+      const restored = loadDerivedCache(cache);
+      let entries = [...restored.claudeChildReferences];
+      let discovery = restored.discovery;
+      for (let pass = 0; pass < 100; pass++) {
+        const result = await worker.run(
+          { ...request(), referenceEntries: entries, discovery },
+          generation,
+          new AbortController().signal,
+        );
+        assert.ok(result?.value.kind === 'claude-children' || result?.value.kind === 'claude-children-progress');
+        assert.ok(result.value.charges, 'the reply carried no discovery charges');
+        heads.files += result.value.charges.childHeadFiles;
+        heads.bytes += result.value.charges.childHeadBytes;
+        entries = result.value.referenceEntries;
+        discovery = result.value.checkpoint;
+        if (result.value.kind === 'claude-children' && !result.value.continuation) {
+          assert.deepEqual(result.value.children.map((child) => child.sessionId).sort(), ids);
+          saveDerivedCache(cache, [], entries, [], undefined, discovery);
+          return heads;
+        }
+      }
+      throw new Error('discovery never completed its captured inputs');
+    } finally {
+      worker.stop();
+    }
+  };
+  try {
+    const size = (file: string) => fs.statSync(file).size;
+    assert.deepEqual(await activate(1), { files: 2, bytes: size(childFiles[0]) + size(childFiles[1]) });
+    assert.deepEqual(await activate(2), { files: 0, bytes: 0 }, 'an unchanged child read its head again');
+    fs.appendFileSync(childFiles[1], JSON.stringify({ type: 'ignored' }) + '\n');
+    assert.deepEqual(
+      await activate(3),
+      { files: 1, bytes: size(childFiles[1]) },
+      'only the grown child reads its head again',
+    );
+    assert.deepEqual(await activate(4), { files: 0, bytes: 0 }, 'the reread head was not saved');
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
 
 test('discovery publishes bounded delegated spend and reuses completed sources after worker replacement', async () => {
   const directory = tempDir('bounded-dispatch-spend-');

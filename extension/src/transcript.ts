@@ -4858,15 +4858,25 @@ export function claudeChildSessionFiles(
   return [...byId.values()].filter((child): child is ClaudeChildSessionFile => child !== null);
 }
 
-interface CachedClaudeChildSession {
+// The working directory a child transcript's head named at one file revision.
+export interface ClaudeChildHead {
   revision: FileRevision;
   cwd: string | null;
 }
 
 export class ClaudeChildSessionCache implements ClaudeChildSessionResolver {
-  private entries = new Map<string, CachedClaudeChildSession>();
+  private entries = new Map<string, ClaudeChildHead>();
 
   constructor(private readonly cwdOf: (file: string) => string | null = readSessionCwd) {}
+
+  // Keys are `normalizeFsPath` results. A seeded head answers only while the file keeps its revision.
+  heads(): ReadonlyMap<string, ClaudeChildHead> {
+    return this.entries;
+  }
+
+  seed(key: string, head: ClaudeChildHead): void {
+    if (!this.entries.has(key)) this.entries.set(key, head);
+  }
 
   read(reference: ClaudeSubagentSessionReference, repositoryRoots: readonly string[]): ClaudeChildSessionFile | null {
     const key = normalizeFsPath(reference.file);
@@ -4885,20 +4895,21 @@ export class ClaudeChildSessionCache implements ClaudeChildSessionResolver {
     const revision = revisionOf(stat);
     const held = this.entries.get(key);
     let unreadable = false;
-    const cwd =
+    const current =
       held &&
       held.revision.size === revision.size &&
       held.revision.mtimeMs === revision.mtimeMs &&
       held.revision.dev === revision.dev &&
-      held.revision.ino === revision.ino
-        ? held.cwd
-        : this.cwdOf === readSessionCwd
-          ? scanSessionCwd(reference.file, () => {
-              unreadable = true;
-            })
-          : this.cwdOf(reference.file);
+      held.revision.ino === revision.ino;
+    const cwd = current
+      ? held.cwd
+      : this.cwdOf === readSessionCwd
+        ? scanSessionCwd(reference.file, () => {
+            unreadable = true;
+          })
+        : this.cwdOf(reference.file);
     if (unreadable) throw new Error(`Cannot read session: ${reference.file}`);
-    this.entries.set(key, { revision, cwd });
+    if (!current) this.entries.set(key, { revision, cwd });
     if (!cwd || !isInside(cwd, [...repositoryRoots])) {
       return null;
     }

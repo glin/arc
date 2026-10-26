@@ -391,6 +391,8 @@ export interface ClaudeChildReferenceCacheEntry {
   relationshipComplete?: boolean;
   appliedCut?: number;
   validatedRevision?: import('./transcript').FileRevision;
+  // The head this source's file named when discovery resolved it as a Claude child, kept so a new worker skips the read.
+  head?: import('./transcript').ClaudeChildHead;
   mtimeMs: number;
   size: number;
   dev: number | string;
@@ -981,6 +983,15 @@ function codexDispatchCursor(value: unknown, parentSessionId: string, size: numb
   );
 }
 
+function fileRevision(value: unknown): boolean {
+  return (
+    record(value) &&
+    [value.size, value.mtimeMs].every(nonNegative) &&
+    fileIdentityValue(value.dev) &&
+    fileIdentityValue(value.ino)
+  );
+}
+
 function childReferenceEntry(value: unknown): value is ClaudeChildReferenceCacheEntry {
   if (!record(value) || !nonEmptyText(value.sessionId)) {
     return false;
@@ -994,11 +1005,11 @@ function childReferenceEntry(value: unknown): value is ClaudeChildReferenceCache
     (value.complete === undefined || typeof value.complete === 'boolean') &&
     (value.relationshipComplete === undefined || typeof value.relationshipComplete === 'boolean') &&
     (value.appliedCut === undefined || (nonNegative(value.appliedCut) && value.appliedCut <= (value.size as number))) &&
-    (value.validatedRevision === undefined ||
-      (record(value.validatedRevision) &&
-        [value.validatedRevision.size, value.validatedRevision.mtimeMs].every(nonNegative) &&
-        fileIdentityValue(value.validatedRevision.dev) &&
-        fileIdentityValue(value.validatedRevision.ino))) &&
+    (value.validatedRevision === undefined || fileRevision(value.validatedRevision)) &&
+    (value.head === undefined ||
+      (record(value.head) &&
+        fileRevision(value.head.revision) &&
+        (value.head.cwd === null || nonEmptyText(value.head.cwd)))) &&
     (value.pendingReferences === undefined ||
       (Array.isArray(value.pendingReferences) &&
         value.pendingReferences.length <= MAX_CLAUDE_CHILD_REFERENCES_PER_FILE &&
