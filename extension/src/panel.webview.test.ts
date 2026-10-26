@@ -3787,6 +3787,7 @@ test('a catalog refresh admits settled sessions without a file check after a wal
   let reused = false;
   let listed: any[] = [];
   const wired: any = {
+    claimCatalogRefresh: (PanelProvider.prototype as any).claimCatalogRefresh,
     humanScans: new Map(),
     refreshGeneration: 0,
     authoritativeCatalog: null,
@@ -3981,6 +3982,7 @@ test('refresh human admission shares read and source allowances and resumes canc
     `${compiled}\nreturn Prepared.prototype.prepareHumanPrompts;`,
   )(...Object.values(dependencies));
   const provider: any = {
+    claimCatalogRefresh: (PanelProvider.prototype as any).claimCatalogRefresh,
     humanScans: new Map(),
     refreshGeneration: 0,
     authoritativeCatalog: null,
@@ -9695,7 +9697,15 @@ function dispatchedRefreshFixture(sessions: any[], worker: ProgressiveWorker, tu
     refreshes.push(refresh);
     return refresh;
   };
-  return { ...fixture, provider, refreshes, collections: () => collections };
+  // A discovery continuation sends the next request without a refresh, and a refresh follows when a reply completes.
+  const continuations: Promise<void>[] = [];
+  const continueDiscovery = provider.continueDiscovery;
+  provider.continueDiscovery = () => {
+    const continuation = continueDiscovery.call(provider);
+    continuations.push(continuation);
+    return continuation;
+  };
+  return { ...fixture, provider, refreshes, continuations, collections: () => collections };
 }
 
 test(
@@ -9787,9 +9797,10 @@ test(
       assert.equal(fixture.collections(), 0);
       assert.equal(fixture.posted.filter((message) => message.type === 'render').length, 0);
       for (let i = 0; i < 8 && provider.dispatchDiscoveryPending; i++) {
-        const before = fixture.refreshes.length;
+        const before = fixture.continuations.length + fixture.refreshes.length;
         await vi.advanceTimersToNextTimerAsync();
-        assert.ok(fixture.refreshes.length > before);
+        assert.ok(fixture.continuations.length + fixture.refreshes.length > before);
+        await fixture.continuations.at(-1);
         await fixture.refreshes.at(-1);
       }
       assert.equal(fixture.collections(), 1);
@@ -30882,7 +30893,7 @@ test('selection and accepted worker results avoid unnecessary catalog walks', ()
   const reusing = [...panelHostSource.matchAll(/this\.refresh(?:From|As)\('[^']+', (?:true|false), true\b/g)];
   assert.equal(
     reusing.length,
-    16,
+    17,
     `${reusing.length} refresh callers reuse the held catalog. Selection, older-page loading, ` +
       'the accepted selected-worker follow-up and row delta recovery must not repeat catalog enumeration.',
   );
