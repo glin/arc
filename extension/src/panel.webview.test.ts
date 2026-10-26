@@ -3509,7 +3509,7 @@ test('command-only admission removes pending rows through every catalog path and
       childrenBody.indexOf('const held = this.catalog?.sessions'),
       childrenBody.indexOf('this.discoveryComplete = {'),
     ) + '\nreturn sessions;',
-    'progress, spendSources = null, signal = new AbortController().signal, humanPromptWork = undefined, generation = this.refreshGeneration',
+    'progress, spendSources = null, signal = new AbortController().signal, humanPromptWork = undefined, generation = this.refreshGeneration, parents = []',
   );
   for (const route of ['walk', 'targeted', 'reuse', 'selected', 'worker']) {
     fs.writeFileSync(file, [caveat, command].map((row) => JSON.stringify(row)).join('\n') + '\n');

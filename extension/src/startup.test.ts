@@ -12504,6 +12504,7 @@ test('the startup record counts a complete discovery reply that asks for another
   const { provider } = bumpedCatalogHarness();
   const counters = new PanelPerformanceCounters(1000);
   provider.performanceCounters = counters;
+  provider.claudeParents = [];
   const run = provider.progressiveWorker.run;
   let continuation = true;
   provider.progressiveWorker.run = async (request: ProgressiveRequest, generation: number) => {
