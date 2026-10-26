@@ -39616,7 +39616,7 @@ test('catalog prefix resolution suspends through discovery progress failure canc
   const savedBefore = JSON.stringify(provider.saved);
   const check = (pending: boolean) => {
     assert.equal(provider.sessionQueryContext().identities, identities);
-    const context = posted.findLast((message) => message.type === 'queryContext').queryContext;
+    const context = posted.filter((message) => message.type === 'queryContext').at(-1).queryContext;
     assert.equal(context.coverage, pending ? 'incomplete' : 'complete');
     if (pending) {
       for (const query of [
@@ -39790,6 +39790,51 @@ test('session list and render messages apply the last query context, and a conte
   );
   dispatch.render(render);
   assert.equal(calls.railUpdates.at(-1), changed, 'a later render did not apply the last context');
+});
+
+test('the host posts the query context to a ready panel only when that panel lacks the current one', async () => {
+  const { provider } = pagedListingFixture(30);
+  const shown = {};
+  const hidden = {};
+  const loading = {};
+  const sent: { host: unknown; message: any }[] = [];
+  let accepts = true;
+  Object.assign(provider, {
+    hosts: [shown, hidden, loading],
+    readyHosts: new Set([shown, hidden]),
+    browserReady() {},
+    sendToHost: async (host: unknown, message: any) => {
+      sent.push({ host, message });
+      return accepts;
+    },
+  });
+  const posted = () => sent.filter(({ message }) => message.type === 'queryContext').map(({ host }) => host);
+  const settled = () => new Promise((done) => setImmediate(done));
+  provider.publishSessionQueryContext();
+  assert.deepEqual(posted(), [shown, hidden], 'an unready panel received the context, or a ready one did not');
+  provider.publishSessionQueryContext();
+  // A refresh publishes a new catalog array with the same sessions, so the host builds an equal context.
+  const before = provider.sessionQueryContext();
+  provider.authoritativeCatalog = [...provider.authoritativeCatalog];
+  assert.notEqual(provider.sessionQueryContext(), before);
+  provider.publishSessionQueryContext();
+  assert.equal(posted().length, 2, 'an unchanged context was posted again');
+  // A loaded page holds no context.
+  new Function('host', `return ({ ${hostHandler('ready')} }).ready;`).call(provider, shown)();
+  provider.publishSessionQueryContext();
+  assert.deepEqual(posted().slice(2), [shown], 'a reloaded page did not receive the context again');
+  provider.sessionQueryDiscoveryPending = true;
+  accepts = false;
+  provider.publishSessionQueryContext();
+  assert.equal(sent.at(-1)!.message.queryContext.coverage, 'incomplete');
+  await settled();
+  accepts = true;
+  provider.publishSessionQueryContext();
+  assert.deepEqual(
+    posted().slice(3),
+    [shown, hidden, shown, hidden],
+    'a context the panel refused was not posted again',
+  );
 });
 
 for (const count of [100, 1000]) {
