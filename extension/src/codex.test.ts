@@ -17677,8 +17677,15 @@ test('dispatched Codex progress distinguishes advancement, source restarts, inva
     const beforeWait = { ...counts };
     assert.equal(read(files[2], { bytes: 0, ms: Infinity }).pending, true);
     assert.deepEqual(counts, { ...beforeWait, dispatchSpendRootWaits: 1 });
-    // Another root with budget left starts its own aggregate, and the pending one keeps its position.
-    assert.equal(read(files[2]).pending, true);
+    // Another root with budget left starts its own aggregate, and each root keeps its unfinished parse.
+    let otherBytes = 0;
+    const readOther = () => {
+      const budget = { bytes: 65536, ms: Infinity };
+      const result = read(files[2], budget);
+      otherBytes += 65536 - budget.bytes;
+      return result;
+    };
+    assert.equal(readOther().pending, true);
     assert.equal(counts.dispatchSpendAggregateStarts, beforeWait.dispatchSpendAggregateStarts + 1);
     let result = read();
     for (let attempt = 0; result.pending && attempt < 20; attempt++) result = read();
@@ -17687,9 +17694,10 @@ test('dispatched Codex progress distinguishes advancement, source restarts, inva
     assert.equal(result.spend.partial, false);
     assert.equal(counts.dispatchSpendAggregateCompletions, 1);
     assert.equal(counts.dispatchSpendSourceRestarts, 1);
-    let other = read(files[2]);
-    for (let attempt = 0; other.pending && attempt < 20; attempt++) other = read(files[2]);
+    let other = readOther();
+    for (let attempt = 0; other.pending && attempt < 20; attempt++) other = readOther();
     assert.equal(other.pending, false);
+    assert.ok(otherBytes <= fs.statSync(files[2]).size, `the other root parsed ${otherBytes} bytes`);
     assert.equal(counts.dispatchSpendAggregateStarts, beforeWait.dispatchSpendAggregateStarts + 1);
     assert.equal(counts.dispatchSpendAggregateCompletions, 2);
   } finally {

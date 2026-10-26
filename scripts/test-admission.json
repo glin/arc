@@ -57,7 +57,7 @@
   "extension/src/codex.test.ts": {
     "reason": "Real Git worktree ownership and descendant source resolution must agree with recorded Codex session relationships.",
     "cases": 482,
-    "matricesSha256": "35d015ecfabb8e5ad8e64430db4e8e51106acbda75afbc70d772df1d23ccbb96"
+    "matricesSha256": "ba9dfbd31781d220a8fa409c93a6c9e7fe87af114f6f46b82c07358e5d379cda"
   },
   "extension/src/derivedcache.test.ts": {
     "reason": "Independent writers and host death must preserve shared cache rows and release stale filesystem locks.",
@@ -137,7 +137,7 @@
   "extension/src/progressiveworker.test.ts": {
     "reason": "Worker protocol, cancellation, host death, bounded transcript reads, and scoped subagent edit reads must survive the actual worker boundary.",
     "cases": 144,
-    "matricesSha256": "b3443d3f000d0436186e7e58ded0b8184c29b93864362c1610600877b0638a0a"
+    "matricesSha256": "c4c7d857178450094e785c5422ad8fb88a3220f62c4915c493730e565699e6f8"
   },
   "extension/src/projectsetups.test.ts": {
     "reason": "Real Git worktrees and canonical filesystem aliases must share project identity while clones stay distinct.",

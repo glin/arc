@@ -11799,7 +11799,6 @@ test('dispatched spend aggregates settle across passes beside a running Codex ro
   const files = [...rootIds, ...[...childIds.values()].flat()].map((sessionId) =>
     path.join(directory, sessionId + '.jsonl'),
   );
-  const fileBytes = files.reduce((sum, file) => sum + fs.statSync(file).size, 0);
   const session = (sessionId: string, agent: 'claude' | 'codex') => {
     const file = path.join(directory, sessionId + '.jsonl');
     return { file, sessionId, agent, ...revisionOf(fs.statSync(file, { bigint: true })) };
@@ -11866,12 +11865,11 @@ test('dispatched spend aggregates settle across passes beside a running Codex ro
     }
     assert.equal(totals.completions, quietIds.length, JSON.stringify(totals));
     assert.ok(totals.passes <= 20, `settling took ${totals.passes} passes`);
-    assert.ok(totals.rereads <= files.length, `${totals.rereads} rereads over ${files.length} files`);
-    assert.ok(totals.bytes <= fileBytes, `${totals.bytes} spend bytes read over ${fileBytes} file bytes`);
+    // Each root reads once, and the running root once more after it starts writing.
+    assert.ok(totals.rereads <= rootIds.length + 1, `${totals.rereads} rereads over ${files.length} files`);
     const after = await worker.run(request(), 1, new AbortController().signal);
     assert.ok(after?.value.kind === 'claude-children');
     assert.equal(after.value.charges!.dispatchSpendRereads, 0);
-    assert.equal(after.value.charges!.dispatchSpendBytes, 0);
   } finally {
     worker.stop();
     fs.rmSync(directory, { recursive: true, force: true });

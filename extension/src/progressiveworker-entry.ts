@@ -32,6 +32,7 @@ import {
   codexAgentSpendVersion,
   codexSpendIndex,
   readCodexDispatchedSpendQuantum,
+  releaseCodexDispatchSpend,
   retainCodexDispatchSpend,
   retainCodexDispatchSpendRoots,
   type CodexDispatchSpendEntry,
@@ -1013,7 +1014,7 @@ async function execute(
           dispatched.push(held.facts);
           continue;
         }
-        // A visit that resumes a pending spend read at the same revision reads no byte again.
+        // A visit that resumes a pending spend aggregate at the same revision does not count as a reread.
         if (!held?.spendPending || !sameRevision(held.revision, revision)) charges.dispatchSpendRereads++;
         const previousPerson =
           held &&
@@ -1063,6 +1064,7 @@ async function execute(
             : dispatchActivity(reference.file, reference.sessionId, revision, now, reference.agent);
         const refreshAt = activity.activeUntil;
         const active = now < refreshAt;
+        if (active && reference.agent === 'codex') releaseCodexDispatchSpend(reference.file);
         let spendPending = false;
         const spend: AgentSpend = active
           ? { models: [], found: false, partial: false, effort: null }
