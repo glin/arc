@@ -37486,6 +37486,41 @@ test('one spend update checks each child file once and publishes dispatched cost
     NOW + 5_000,
     'the replaced child kept its old write time',
   );
+
+  // The integrity checker checks warm sources in batches every 30 seconds. A batch that finds its sources unchanged
+  // queues nothing and publishes no costs. A batch that queues a source still publishes.
+  const { normalizeSpendFile, SpendCoverage } = await import('./projectspend.ts');
+  const gone = normalizeSpendFile(path.join(directory, 'gone.jsonl'));
+  Object.assign(host, {
+    projectSpendFiles: [{ file: gone, workspace: 'workspace', size: 0, mtimeMs: 1, missingAt: NOW - 60_000 }],
+    spendRecordsByFile: new Map([[gone, 0]]),
+    spendSourcesByFile: new Map([
+      [gone, { file: gone, agent: 'codex' }],
+      [children[1].file, { file: children[1].file, agent: 'claude', primary: false }],
+    ]),
+    spendChecks: new SpendCoverage(),
+    postProjectSpend: () => {},
+    scheduleNextProjectSpendFile: () => {},
+  });
+  const check = async (file: string) => {
+    host.performanceCounters = new PanelPerformanceCounters(1_000, 'window-a');
+    await host.checkProjectSpendSources([file], () => true);
+    return host.performanceCounters.snapshot().work;
+  };
+  const unchanged = await check(gone);
+  assert.equal(host.projectSpendQueue.length, 0, 'the unchanged source was queued');
+  assert.equal(
+    unchanged['dispatchedCostsPost:integrityCheck'],
+    undefined,
+    'an integrity check that queued nothing published dispatched costs',
+  );
+  const queued = await check(children[1].file);
+  assert.equal(host.projectSpendQueue.length, 1, 'the unindexed source was not queued');
+  assert.equal(
+    queued['dispatchedCostsPost:integrityCheck'],
+    1,
+    'an integrity check that queued a source did not publish',
+  );
   fs.rmSync(directory, { recursive: true, force: true });
 });
 

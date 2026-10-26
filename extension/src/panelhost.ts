@@ -10396,15 +10396,16 @@ export class PanelProvider implements vscode.Disposable {
   }
 
   // Refresh session-list figures when dispatched-source pending state changes, including changes since the last list payload.
-  private postRailIfSpendPendingMoved(caller: 'spendOffer' | 'integrityCheck' | 'indexIdle'): void {
+  private postRailIfSpendPendingMoved(
+    caller: 'spendOffer' | 'integrityCheck' | 'indexIdle',
+    costInputsMoved = true,
+  ): void {
     const holds: SpendSourcePending = (file, record) => this.projectSpendHolds(file, record);
-    if (
+    const pendingMoved =
       this.lifetimeFigures.pendingMoved(holds) ||
-      (this.railPendingAnswers !== null && this.lifetimeFigures.pendingMoved(holds, this.railPendingAnswers))
-    ) {
-      this.postRail(true);
-    }
-    this.postDispatchedCostsIfMoved(caller);
+      (this.railPendingAnswers !== null && this.lifetimeFigures.pendingMoved(holds, this.railPendingAnswers));
+    if (pendingMoved) this.postRail(true);
+    if (costInputsMoved || pendingMoved) this.postDispatchedCostsIfMoved(caller);
   }
 
   // Supply statuses and child counts from one clock reading so their displayed states agree.
@@ -11214,6 +11215,7 @@ export class PanelProvider implements vscode.Disposable {
       return;
     }
     const sources = listedSources.filter((source) => !onlyFiles || onlyFiles.has(normalizeFsPath(source.file)));
+    const queued = this.projectSpendQueue.length;
     const found = new Set<string>();
     this.spendRecordsByFile ??= new Map(this.projectSpendFiles.map((file, index) => [file.file, index]));
     const cutoff = this.projectSpendHistoryCutoff();
@@ -11260,8 +11262,9 @@ export class PanelProvider implements vscode.Disposable {
         offer(record.file, spendRecordAgent(record), !spendFileIsClaudeChild(record.file));
       }
     }
-    // This also publishes moved turn card costs, so a drain that queued nothing ends here.
-    this.postRailIfSpendPendingMoved(caller);
+    // This also publishes moved turn card costs, so a drain that queued nothing ends here. An integrity check that
+    // queued no source changed no ledger record, so it publishes costs only when the pending state moved.
+    this.postRailIfSpendPendingMoved(caller, caller !== 'integrityCheck' || this.projectSpendQueue.length > queued);
     if (!this.projectSpendQueue.length && !this.projectSpendIndexing) {
       return;
     }
