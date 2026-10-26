@@ -3465,8 +3465,8 @@ test('pending Claude discovery acknowledges progress without replacing catalog r
   assert.equal(provider.posts.at(-1)?.known, rows.length);
 });
 
-// A progress reply before any accepted catalog used to empty the held catalog, so the refresh that sent the next
-// continuation found no selected row, walked every session again, and repeated that once per continuation.
+// A progress reply before any accepted catalog keeps the held catalog, so the refresh that sends the next
+// continuation reuses it instead of walking every session again.
 
 test('pending Claude discovery before an accepted catalog keeps the walked rows for the next reuse', async () => {
   const { provider, claude, codex } = bumpedCatalogHarness();
