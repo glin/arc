@@ -12317,24 +12317,26 @@ export class PanelProvider implements vscode.Disposable {
         admitted.push(session);
         continue;
       }
+      // The file check's cause: a walk rechecks every file, and a reused catalog checks a file whose held revision
+      // moved, whose complete scan found no prompt, or that has no complete scan of the held revision.
+      let cause: 'walk' | 'moved' | 'noPrompt' | 'unscanned' = 'walk';
       if (settled === 'skip') {
         const scan = this.humanScans.get(session.file);
-        if (
-          scan?.found &&
-          scan.complete &&
-          scan.source &&
+        const held =
+          !!scan?.source &&
           sameSessionRevision(scan.source, session) &&
           (scan.source.dev === undefined ||
             session.dev === undefined ||
             String(scan.source.dev) === String(session.dev)) &&
           (scan.source.ino === undefined ||
             session.ino === undefined ||
-            String(scan.source.ino) === String(session.ino))
-        ) {
+            String(scan.source.ino) === String(session.ino));
+        if (held && scan?.found && scan.complete) {
           this.performanceCounters?.recordWork('humanPromptSettled');
           admitted.push(session);
           continue;
         }
+        cause = !held ? (scan?.source ? 'moved' : 'unscanned') : scan?.complete ? 'noPrompt' : 'unscanned';
       }
       if (work.sources >= 32 || work.reads >= 32 || work.bytes >= 256 * 1024) {
         await new Promise<void>((resolve) => setImmediate(resolve));
@@ -12346,7 +12348,7 @@ export class PanelProvider implements vscode.Disposable {
       work.sources++;
       let previous = this.humanScans.get(session.file);
       let revision;
-      this.performanceCounters?.recordWork('humanPromptStat');
+      this.performanceCounters?.recordWork(`humanPromptStat:${cause}`);
       try {
         revision = fileRevisionOf(fs.statSync(session.file, { bigint: true }));
       } catch {
@@ -12394,7 +12396,7 @@ export class PanelProvider implements vscode.Disposable {
           if (!currentRefresh()) return [];
         }
         work.sources++;
-        this.performanceCounters?.recordWork('humanPromptStat');
+        this.performanceCounters?.recordWork(`humanPromptStat:${cause}`);
         const current = fileRevisionOf(fs.statSync(session.file, { bigint: true }));
         if (!currentRefresh()) return [];
         if (
