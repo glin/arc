@@ -1564,7 +1564,12 @@ test.each([65536, 1024 * 1024])(
     );
     // A same-size change compares the whole prefix, finds the rewrite, and rescans.
     fs.utimesSync(file, new Date(0), new Date(grown.scan.cursor.mtimeMs + 2000));
-    const resumed = finish(grown.scan.cursor);
+    const comparing = scanCodexDispatchReferences(file, 'parent', grown.scan.cursor, 32768);
+    assert.equal(comparing.reset, false);
+    assert.ok(comparing.cursor.evidence?.validation, 'the same-size comparison finished in one quantum');
+    // Growth during the comparison continues it, so the rewrite still resets.
+    fs.appendFileSync(file, '{"type":"ignored"}\n');
+    const resumed = finish(JSON.parse(JSON.stringify(comparing.cursor)));
     assert.ok(resumed.scan.complete);
     assert.equal(resumed.reset, true);
     assert.deepEqual(
@@ -1575,21 +1580,21 @@ test.each([65536, 1024 * 1024])(
   },
 );
 
-test('Codex same-size validation retains parsing position and replaces a superseded comparison', () => {
+test('Codex same-size validation retains parsing position and growth replaces the superseded comparison', () => {
   const file = writeRollout(Array.from({ length: 300 }, () => ({ type: 'ignored', payload: 'x'.repeat(1024) })));
   let scan = scanCodexDispatchReferences(file, 'parent', null, 65536);
   const offset = scan.cursor.offset;
   // A same-size change makes validation compare the whole prefix.
   const accepted = fs.statSync(file).mtimeMs;
-  const touch = (seconds: number) => fs.utimesSync(file, new Date(0), new Date(accepted + seconds * 1000));
-  touch(2);
+  fs.utimesSync(file, new Date(0), new Date(accepted + 2000));
   scan = scanCodexDispatchReferences(file, 'parent', scan.cursor, 32768);
   assert.equal(scan.reset, false);
   assert.equal(scan.complete, false);
   assert.equal(scan.cursor.offset, offset);
   assert.ok(scan.cursor.evidence?.validation?.digest.offset);
   const candidate = scan.cursor.evidence.validation.stamp;
-  touch(4);
+  // Growth replaces the pending comparison with a new whole-prefix comparison.
+  fs.appendFileSync(file, '{"type":"ignored"}\n');
   scan = scanCodexDispatchReferences(file, 'parent', scan.cursor, 32768);
   assert.equal(scan.cursor.offset, offset);
   assert.notDeepEqual(scan.cursor.evidence?.validation?.stamp, candidate);

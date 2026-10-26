@@ -90,8 +90,12 @@ test.each([65536, 1024 * 1024])(
     };
     fs.writeFileSync(file, old.replace('child-a', 'child-b') + '{"type":"ignored"}\n');
     fs.utimesSync(file, new Date(0), new Date(first.cursor.revision.mtimeMs + 2000));
+    // A quantum too small for the anchor read leaves the anchor for the next quantum.
+    const short = await scanClaudeRelationshipQuantum(parent, first.cursor, 16384 + 1024);
+    assert.equal(short.reset, false);
+    assert.equal(short.cursor.evidence?.validation, undefined, 'a short anchor read started a whole-prefix comparison');
     // The rewrite lies before the final block, so growth keeps the accepted relationships.
-    const grown = await finish(first.cursor);
+    const grown = await finish(JSON.parse(JSON.stringify(short.cursor)));
     assert.ok(grown.scan.complete);
     assert.equal(grown.reset, false);
     assert.deepEqual(
@@ -100,7 +104,12 @@ test.each([65536, 1024 * 1024])(
     );
     // A same-size change compares the whole prefix, finds the rewrite, and rescans.
     fs.utimesSync(file, new Date(0), new Date(grown.scan.cursor.revision.mtimeMs + 2000));
-    const resumed = await finish(grown.scan.cursor);
+    const comparing = await scanClaudeRelationshipQuantum(parent, grown.scan.cursor, 32768);
+    assert.equal(comparing.reset, false);
+    assert.ok(comparing.cursor.evidence?.validation, 'the same-size comparison finished in one quantum');
+    // Growth during the comparison continues it, so the rewrite still resets.
+    fs.appendFileSync(file, '{"type":"ignored"}\n');
+    const resumed = await finish(JSON.parse(JSON.stringify(comparing.cursor)));
     assert.ok(resumed.scan.complete);
     assert.equal(resumed.reset, true);
     assert.deepEqual(
@@ -156,22 +165,22 @@ test('Claude scans, rewrite comparisons and terminal continuations read forward 
   assert.deepEqual(continued.references, scanClaudeChildSessionReferences(parent).references);
 });
 
-test('Claude same-size validation retains parsing position and replaces a superseded comparison', async () => {
+test('Claude same-size validation retains parsing position and growth replaces the superseded comparison', async () => {
   const file = writeTranscript(Array.from({ length: 300 }, () => ({ type: 'ignored', payload: 'x'.repeat(1024) })));
   const parent = { file, sessionId: 'parent' };
   let scan = await scanClaudeRelationshipQuantum(parent, undefined, 65536);
   const offset = scan.cursor.offset;
   // A same-size change makes validation compare the whole prefix.
   const accepted = fs.statSync(file).mtimeMs;
-  const touch = (seconds: number) => fs.utimesSync(file, new Date(0), new Date(accepted + seconds * 1000));
-  touch(2);
+  fs.utimesSync(file, new Date(0), new Date(accepted + 2000));
   scan = await scanClaudeRelationshipQuantum(parent, scan.cursor, 32768);
   assert.equal(scan.reset, false);
   assert.equal(scan.complete, false);
   assert.equal(scan.cursor.offset, offset);
   assert.ok(scan.cursor.evidence?.validation?.digest.offset);
   const candidate = scan.cursor.evidence.validation.stamp;
-  touch(4);
+  // Growth replaces the pending comparison with a new whole-prefix comparison.
+  fs.appendFileSync(file, '{"type":"ignored"}\n');
   scan = await scanClaudeRelationshipQuantum(parent, scan.cursor, 32768);
   assert.equal(scan.cursor.offset, offset);
   assert.notDeepEqual(scan.cursor.evidence?.validation?.stamp, candidate);

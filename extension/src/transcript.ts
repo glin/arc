@@ -4242,9 +4242,14 @@ export class RelationshipReader {
     )
       return 'reset';
     if (!evidence.validation || !sameRelationshipStamp(evidence.validation.stamp, this.stamp)) {
-      // Only growth trusts the anchor. A same-size change compares the whole prefix, so an interior rewrite resets.
+      // Only growth with no comparison in progress checks the anchor. A same-size change compares the whole prefix.
+      // Growth during that comparison continues it, so a same-size interior rewrite still resets.
       // A grown file rewritten before its final block keeps its accepted facts until a same-size change, a shrink, or a replacement.
-      if (this.stamp.size > prior.size && this.anchored(evidence)) return this.accept(evidence);
+      if (!evidence.validation && this.stamp.size > prior.size) {
+        const anchored = this.anchored(evidence);
+        if (anchored === 'match') return this.accept(evidence);
+        if (anchored === 'pending') return 'pending';
+      }
       evidence.validation = { stamp: this.stamp, required: evidence.offset, digest: emptyRelationshipDigest() };
     }
     const comparison = evidence.validation;
@@ -4269,16 +4274,16 @@ export class RelationshipReader {
     evidence.anchor = comparison.digest.anchor;
     return this.accept(evidence);
   }
-  // Reads the final full block and the tail, at most two blocks. A mismatch or a short read leaves the decision to the whole prefix.
-  private anchored(evidence: RelationshipEvidence): boolean {
-    if (evidence.anchor === undefined || evidence.offset < RELATIONSHIP_BLOCK_BYTES) return false;
+  // Reads the final full block and the tail, at most two blocks. A cancelled, short, or unstable read leaves the anchor for the next quantum. A missing or mismatched anchor needs the whole prefix.
+  private anchored(evidence: RelationshipEvidence): 'match' | 'pending' | 'compare' {
+    if (evidence.anchor === undefined || evidence.offset < RELATIONSHIP_BLOCK_BYTES) return 'compare';
     const start = evidence.offset - Buffer.byteLength(evidence.tail, 'base64') - RELATIONSHIP_BLOCK_BYTES;
     const bytes = this.read(start, evidence.offset - start);
     if (this.meter) this.meter.revalidationBytes = (this.meter.revalidationBytes ?? 0) + bytes.length;
-    if (bytes.length !== evidence.offset - start || !this.check()) return false;
+    if (bytes.length !== evidence.offset - start || !this.check() || this.cancelled()) return 'pending';
     const check: RelationshipDigest = { offset: start, chain: evidence.anchor, tail: '' };
     extendRelationshipEvidence(check, bytes);
-    return check.chain === evidence.chain && check.tail === evidence.tail;
+    return check.chain === evidence.chain && check.tail === evidence.tail ? 'match' : 'compare';
   }
   private accept(evidence: RelationshipEvidence): 'match' {
     evidence.accepted = this.stamp;
