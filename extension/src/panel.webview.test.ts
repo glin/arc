@@ -37462,6 +37462,9 @@ test('one spend update checks each child file once and publishes dispatched cost
     1,
     `one spend update published dispatched costs ${moved.dispatchedCostsPost} times`,
   );
+  // The capture names the caller of each publication and counts the publications that redrew a card.
+  assert.equal(moved['dispatchedCostsPost:spendOffer'], 1, 'the spend offer publication was not counted by its caller');
+  assert.equal(moved.dispatchedCostsPostMoved, 1, 'the publication that redrew the card was not counted as moved');
   assert.equal(
     moved.childVersionStat,
     children.length,
@@ -37475,6 +37478,8 @@ test('one spend update checks each child file once and publishes dispatched cost
   fs.utimesSync(children[0].file, new Date(NOW + 5_000), new Date(NOW + 5_000));
   const next = update();
   assert.equal(next.dispatchedCostsPost, 1);
+  assert.equal(next['dispatchedCostsPost:spendOffer'], 1);
+  assert.equal(next.dispatchedCostsPostMoved, undefined, 'a publication that redrew no card was counted as moved');
   assert.equal(next.childVersionStat, children.length, 'a later run reused the file checks of an earlier run');
   assert.equal(
     host.claudeChildStatWrites.get(children[0].file),

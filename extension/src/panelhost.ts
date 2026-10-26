@@ -734,6 +734,19 @@ type HistoryCursor = ClaudeHistoryCursor | CodexHistoryCursor;
 // Turns and compactions share the timeline. Both render their summary as Markdown.
 type RenderCard = (TurnCard | CompactionCard) & { summaryHtml: string };
 
+// The host code that asked to publish dispatched turn card costs, named in the performance counters.
+type DispatchedCostsCaller =
+  | 'refreshDiscovery'
+  | 'spendOffer'
+  | 'indexIdle'
+  | 'hydrate'
+  | 'checkpoint'
+  | 'coverageNoLedger'
+  | 'indexFinished'
+  | 'spendSources'
+  | 'childrenProgress'
+  | 'childrenComplete';
+
 // Escape less-than signs in JSON embedded in a script element. An unescaped
 // closing script tag ends the element even when it occurs inside a JSON string.
 function scriptJson(value: unknown): string {
@@ -9289,7 +9302,8 @@ export class PanelProvider implements vscode.Disposable {
           const discoveryWaiting = this.dispatchedDiscoveryWaiting();
           this.dispatchDiscoveryPending = true;
           this.publishSessionQueryContext();
-          if (this.dispatchedDiscoveryWaiting() !== discoveryWaiting) this.postDispatchedCostsIfMoved();
+          if (this.dispatchedDiscoveryWaiting() !== discoveryWaiting)
+            this.postDispatchedCostsIfMoved('refreshDiscovery');
         }
         this.discoveryComplete = undefined;
         this.publishSessionQueryContext();
@@ -10223,9 +10237,11 @@ export class PanelProvider implements vscode.Disposable {
     return out;
   }
 
-  // Redraws turn cards whose dispatched cost or cache-expiry warning moved since they were drawn.
-  private postDispatchedCostsIfMoved(): void {
+  // Redraws turn cards whose dispatched cost or cache-expiry warning moved since they were drawn. The caller names the
+  // publication in the counters, so a capture says which caller publishes and how often a publication moved nothing.
+  private postDispatchedCostsIfMoved(caller: DispatchedCostsCaller): void {
     this.performanceCounters?.recordWork('dispatchedCostsPost');
+    this.performanceCounters?.recordWork(`dispatchedCostsPost:${caller}`);
     if (!this.cards?.length) return;
     const drawnKeys = new Set(this.cards.map((card) => card.key));
     const dispatchedPrints = (this.dispatchedCardPrints ??= new Map());
@@ -10269,6 +10285,7 @@ export class PanelProvider implements vscode.Disposable {
       ...movedDispatchedCards(expiryPrints, currentExpiry),
     ]);
     if (!moved.size) return;
+    this.performanceCounters?.recordWork('dispatchedCostsPostMoved');
     const folders = this.folders();
     const running = this.runningSessions();
     const children = this.liveOpenChildren(now);
@@ -10378,7 +10395,7 @@ export class PanelProvider implements vscode.Disposable {
   }
 
   // Refresh session-list figures when dispatched-source pending state changes, including changes since the last list payload.
-  private postRailIfSpendPendingMoved(): void {
+  private postRailIfSpendPendingMoved(caller: 'spendOffer' | 'indexIdle'): void {
     const holds: SpendSourcePending = (file, record) => this.projectSpendHolds(file, record);
     if (
       this.lifetimeFigures.pendingMoved(holds) ||
@@ -10386,7 +10403,7 @@ export class PanelProvider implements vscode.Disposable {
     ) {
       this.postRail(true);
     }
-    this.postDispatchedCostsIfMoved();
+    this.postDispatchedCostsIfMoved(caller);
   }
 
   // Supply statuses and child counts from one clock reading so their displayed states agree.
@@ -10684,7 +10701,7 @@ export class PanelProvider implements vscode.Disposable {
     this.postProjectSpend();
     // Hydration adds lifetime figures without replacing catalog-derived order or status.
     this.postRail(true, undefined, false);
-    this.postDispatchedCostsIfMoved();
+    this.postDispatchedCostsIfMoved('hydrate');
   }
 
   private displayedProjectSpendFiles(): readonly SpendFileIndex[] {
@@ -10920,7 +10937,7 @@ export class PanelProvider implements vscode.Disposable {
     if (this.projectSpendRailOwed && !this.projectSpendIndexing) {
       this.projectSpendRailOwed = false;
       this.postRail(true);
-      this.postDispatchedCostsIfMoved();
+      this.postDispatchedCostsIfMoved('checkpoint');
     }
   }
 
@@ -11141,7 +11158,8 @@ export class PanelProvider implements vscode.Disposable {
       // unless it had no ledger to offer to.
       if (!this.projectSpendBusy()) {
         this.postProjectSpend();
-        if (!this.projectSpendWorkspace || !this.projectSpendStorageDir) this.postDispatchedCostsIfMoved();
+        if (!this.projectSpendWorkspace || !this.projectSpendStorageDir)
+          this.postDispatchedCostsIfMoved('coverageNoLedger');
       }
     };
     const tick = setTimeout(() => {
@@ -11236,7 +11254,7 @@ export class PanelProvider implements vscode.Disposable {
       }
     }
     // This also publishes moved turn card costs, so a drain that queued nothing ends here.
-    this.postRailIfSpendPendingMoved();
+    this.postRailIfSpendPendingMoved('spendOffer');
     if (!this.projectSpendQueue.length && !this.projectSpendIndexing) {
       return;
     }
@@ -11480,9 +11498,9 @@ export class PanelProvider implements vscode.Disposable {
       this.projectSpendRailOwed = false;
       if (railOwed) {
         this.postRail(true);
-        this.postDispatchedCostsIfMoved();
+        this.postDispatchedCostsIfMoved('indexFinished');
       } else {
-        this.postRailIfSpendPendingMoved();
+        this.postRailIfSpendPendingMoved('indexIdle');
       }
       this.publishProjectSpendCoverage?.();
       // Publish Project cost, session-list, and card updates without a catalog refresh that would offer sources again.
@@ -11858,7 +11876,7 @@ export class PanelProvider implements vscode.Disposable {
     if (this.sessionSpendSourceIndex.revision !== revision) {
       this.projectSpendRevision++;
       this.invalidateProjectSpendSnapshot();
-      this.postDispatchedCostsIfMoved();
+      this.postDispatchedCostsIfMoved('spendSources');
     }
   }
 
@@ -12086,7 +12104,7 @@ export class PanelProvider implements vscode.Disposable {
           sessions: started.length ? [...accepted!, ...started] : (accepted ?? this.catalog.sessions),
         };
       }
-      if (this.dispatchedDiscoveryWaiting() !== discoveryWaiting) this.postDispatchedCostsIfMoved();
+      if (this.dispatchedDiscoveryWaiting() !== discoveryWaiting) this.postDispatchedCostsIfMoved('childrenProgress');
       return this.authoritativeCatalog !== null;
     }
     this.claudeChildReferences = progress.references;
@@ -12142,7 +12160,7 @@ export class PanelProvider implements vscode.Disposable {
     if (this.catalog) {
       this.catalog = { ...this.catalog, sessions };
     }
-    if (this.dispatchedDiscoveryWaiting() !== discoveryWaiting) this.postDispatchedCostsIfMoved();
+    if (this.dispatchedDiscoveryWaiting() !== discoveryWaiting) this.postDispatchedCostsIfMoved('childrenComplete');
     const walked = new Set(sessions.map((session) => session.file));
     if (this.pruneDerivedTitles(walked)) {
       this.derivedCacheCheckpointState.markChanged();
