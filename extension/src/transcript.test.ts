@@ -58,7 +58,7 @@ test('Claude export refuses relationship overflow instead of reporting a shorten
 });
 
 test.each([65536, 1024 * 1024])(
-  'Claude interior rewrite plus growth resumes to the fresh relationships at %i bytes',
+  'Claude interior rewrite plus growth resumes to the fresh relationships at %i bytes, and keeps a rewrite before the anchor until a same-size change',
   async (budget) => {
     vi.spyOn(performance, 'now').mockReturnValue(0);
     const file = writeTranscript([
@@ -79,13 +79,35 @@ test.each([65536, 1024 * 1024])(
     );
     const old = fs.readFileSync(file, 'utf8');
     assert.ok(old.indexOf('child-a') > 256 && old.indexOf('child-a') < first.cursor.offset - 4096);
+    const finish = async (cursor: ClaudeRelationshipCursor) => {
+      let scan = await scanClaudeRelationshipQuantum(parent, cursor, budget);
+      let reset = scan.reset;
+      for (let pass = 0; !scan.complete && pass < 100; pass++) {
+        scan = await scanClaudeRelationshipQuantum(parent, JSON.parse(JSON.stringify(scan.cursor)), budget);
+        reset ||= scan.reset;
+      }
+      return { scan, reset };
+    };
     fs.writeFileSync(file, old.replace('child-a', 'child-b') + '{"type":"ignored"}\n');
     fs.utimesSync(file, new Date(0), new Date(first.cursor.revision.mtimeMs + 2000));
-    let resumed = await scanClaudeRelationshipQuantum(parent, first.cursor, budget);
-    for (let pass = 0; !resumed.complete && pass < 100; pass++)
-      resumed = await scanClaudeRelationshipQuantum(parent, JSON.parse(JSON.stringify(resumed.cursor)), budget);
-    assert.ok(resumed.complete);
-    assert.deepEqual(resumed.references, scanClaudeChildSessionReferences(parent).references);
+    // The rewrite lies before the final block, so growth keeps the accepted relationships.
+    const grown = await finish(first.cursor);
+    assert.ok(grown.scan.complete);
+    assert.equal(grown.reset, false);
+    assert.deepEqual(
+      grown.scan.references.map((reference) => reference.sessionId),
+      ['child-a'],
+    );
+    // A same-size change compares the whole prefix, finds the rewrite, and rescans.
+    fs.utimesSync(file, new Date(0), new Date(grown.scan.cursor.revision.mtimeMs + 2000));
+    const resumed = await finish(grown.scan.cursor);
+    assert.ok(resumed.scan.complete);
+    assert.equal(resumed.reset, true);
+    assert.deepEqual(
+      resumed.scan.references.map((reference) => reference.sessionId),
+      ['child-b'],
+    );
+    assert.deepEqual(resumed.scan.references, scanClaudeChildSessionReferences(parent).references);
   },
 );
 
@@ -120,7 +142,11 @@ test('Claude scans, rewrite comparisons and terminal continuations read forward 
   // The rewrite ends without a newline, so the rescan applies its last record as a terminal record.
   fs.writeFileSync(file, old.replace('child-a', 'child-b') + '{"type":"ignored"}');
   fs.utimesSync(file, new Date(0), new Date(first.cursor.revision.mtimeMs + 2000));
-  const resumed = await finish(first.cursor);
+  const grown = await finish(first.cursor);
+  assert.ok(grown.complete, 'the grown parent finished its anchor check and read');
+  // A same-size change makes the scan compare the whole prefix and find the rewrite.
+  fs.utimesSync(file, new Date(0), new Date(grown.cursor.revision.mtimeMs + 2000));
+  const resumed = await finish(grown.cursor);
   assert.ok(resumed.complete, 'the rewritten parent finished its comparison and rescan');
   assert.equal(resumed.cursor.terminalApplied, true);
   assert.deepEqual(resumed.references, scanClaudeChildSessionReferences(parent).references);
@@ -130,19 +156,22 @@ test('Claude scans, rewrite comparisons and terminal continuations read forward 
   assert.deepEqual(continued.references, scanClaudeChildSessionReferences(parent).references);
 });
 
-test('Claude append validation retains parsing position and replaces a superseded comparison', async () => {
+test('Claude same-size validation retains parsing position and replaces a superseded comparison', async () => {
   const file = writeTranscript(Array.from({ length: 300 }, () => ({ type: 'ignored', payload: 'x'.repeat(1024) })));
   const parent = { file, sessionId: 'parent' };
   let scan = await scanClaudeRelationshipQuantum(parent, undefined, 65536);
   const offset = scan.cursor.offset;
-  fs.appendFileSync(file, '{"type":"ignored"}\n');
+  // A same-size change makes validation compare the whole prefix.
+  const accepted = fs.statSync(file).mtimeMs;
+  const touch = (seconds: number) => fs.utimesSync(file, new Date(0), new Date(accepted + seconds * 1000));
+  touch(2);
   scan = await scanClaudeRelationshipQuantum(parent, scan.cursor, 32768);
   assert.equal(scan.reset, false);
   assert.equal(scan.complete, false);
   assert.equal(scan.cursor.offset, offset);
   assert.ok(scan.cursor.evidence?.validation?.digest.offset);
   const candidate = scan.cursor.evidence.validation.stamp;
-  fs.appendFileSync(file, '{"type":"ignored"}\n');
+  touch(4);
   scan = await scanClaudeRelationshipQuantum(parent, scan.cursor, 32768);
   assert.equal(scan.cursor.offset, offset);
   assert.notDeepEqual(scan.cursor.evidence?.validation?.stamp, candidate);

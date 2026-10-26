@@ -270,7 +270,9 @@ test('durable prefix validation rejects inconsistent stamps offsets framing and 
   );
   const parent = { file, sessionId: 'parent' };
   const first = await scanClaudeRelationshipQuantum(parent, undefined);
-  fs.appendFileSync(file, '{"type":"ignored"}\n');
+  // A same-size change starts a whole-prefix comparison.
+  const touched = new Date(first.cursor.revision.mtimeMs + 2000);
+  fs.utimesSync(file, touched, touched);
   const pending = await scanClaudeRelationshipQuantum(parent, first.cursor, 32768);
   assert.ok(pending.cursor.evidence?.validation);
   const entry: ClaudeChildReferenceCacheEntry = {

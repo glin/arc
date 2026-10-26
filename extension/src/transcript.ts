@@ -4067,6 +4067,8 @@ export interface RelationshipDigest {
   offset: number;
   chain: string;
   tail: string;
+  // The chain before the final full block. That block and the tail then check a grown prefix without rereading it.
+  anchor?: string;
 }
 
 export interface RelationshipEvidence extends RelationshipDigest {
@@ -4114,6 +4116,7 @@ export function validRelationshipEvidence(value: unknown, offset: number): value
     (item.offset as number) >= 0 &&
     typeof item.chain === 'string' &&
     /^[0-9a-f]{64}$/.test(item.chain) &&
+    (item.anchor === undefined || (typeof item.anchor === 'string' && /^[0-9a-f]{64}$/.test(item.anchor))) &&
     typeof item.tail === 'string' &&
     Buffer.from(item.tail, 'base64').toString('base64') === item.tail &&
     Buffer.byteLength(item.tail, 'base64') === (item.offset as number) % RELATIONSHIP_BLOCK_BYTES;
@@ -4155,6 +4158,7 @@ export function extendRelationshipEvidence(evidence: RelationshipDigest, bytes: 
   let index = (evidence.offset - Buffer.byteLength(evidence.tail, 'base64')) / RELATIONSHIP_BLOCK_BYTES;
   let at = 0;
   for (; at + RELATIONSHIP_BLOCK_BYTES <= joined.length; at += RELATIONSHIP_BLOCK_BYTES) {
+    evidence.anchor = evidence.chain;
     evidence.chain = createHash('sha256')
       .update(`arc-relationship-block-v1:${index++}:`)
       .update(evidence.chain)
@@ -4237,8 +4241,12 @@ export class RelationshipReader {
       this.stamp.size < evidence.offset
     )
       return 'reset';
-    if (!evidence.validation || !sameRelationshipStamp(evidence.validation.stamp, this.stamp))
+    if (!evidence.validation || !sameRelationshipStamp(evidence.validation.stamp, this.stamp)) {
+      // Only growth trusts the anchor. A same-size change compares the whole prefix, so an interior rewrite resets.
+      // A grown file rewritten before its final block keeps its accepted facts until a same-size change, a shrink, or a replacement.
+      if (this.stamp.size > prior.size && this.anchored(evidence)) return this.accept(evidence);
       evidence.validation = { stamp: this.stamp, required: evidence.offset, digest: emptyRelationshipDigest() };
+    }
     const comparison = evidence.validation;
     while (comparison.digest.offset < comparison.required && this.available() > 0) {
       const remaining = comparison.required - comparison.digest.offset;
@@ -4258,6 +4266,21 @@ export class RelationshipReader {
     }
     if (comparison.digest.offset !== comparison.required || !this.check() || this.cancelled()) return 'pending';
     if (comparison.digest.chain !== evidence.chain || comparison.digest.tail !== evidence.tail) return 'reset';
+    evidence.anchor = comparison.digest.anchor;
+    return this.accept(evidence);
+  }
+  // Reads the final full block and the tail, at most two blocks. A mismatch or a short read leaves the decision to the whole prefix.
+  private anchored(evidence: RelationshipEvidence): boolean {
+    if (evidence.anchor === undefined || evidence.offset < RELATIONSHIP_BLOCK_BYTES) return false;
+    const start = evidence.offset - Buffer.byteLength(evidence.tail, 'base64') - RELATIONSHIP_BLOCK_BYTES;
+    const bytes = this.read(start, evidence.offset - start);
+    if (this.meter) this.meter.revalidationBytes = (this.meter.revalidationBytes ?? 0) + bytes.length;
+    if (bytes.length !== evidence.offset - start || !this.check()) return false;
+    const check: RelationshipDigest = { offset: start, chain: evidence.anchor, tail: '' };
+    extendRelationshipEvidence(check, bytes);
+    return check.chain === evidence.chain && check.tail === evidence.tail;
+  }
+  private accept(evidence: RelationshipEvidence): 'match' {
     evidence.accepted = this.stamp;
     evidence.provisional = this.stamp;
     delete evidence.validation;

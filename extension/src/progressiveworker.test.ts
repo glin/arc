@@ -981,7 +981,11 @@ test('a new Claude session reaches a complete cut beside parent growth with boun
     assert.ok(result?.value.kind === 'claude-children');
     assert.ok(appendQuanta > 1);
     const after = (result as typeof result & { bytes: Record<string, number> }).bytes;
-    assert.ok(after[file] - before[file] >= firstOffset, 'append qualification omitted consumed bytes');
+    // Growth reads the final full block, the partial block after it, and the new bytes.
+    // The armed append lands during the first anchor read, so the reader checks the anchor twice.
+    const anchorBytes = 4096 + (firstOffset % 4096);
+    const grownBytes = fs.statSync(file).size - firstOffset;
+    assert.equal(after[file] - before[file], 2 * anchorBytes + grownBytes, 'append qualification read past its anchor');
     assert.equal(after[quiet], before[quiet], 'the quiet parent reread content');
     assert.ok(after[fresh] > 0, 'the new session never entered the captured inputs');
   } finally {
@@ -990,37 +994,27 @@ test('a new Claude session reaches a complete cut beside parent growth with boun
   }
 });
 
-test('a reloaded worker charges a grown transcript prefix to revalidation and its new tail to reads', async () => {
+test('a reloaded worker checks a grown transcript by its final blocks, a touched one by its prefix, and resets a rewritten anchor', async () => {
   const directory = tempDir('claude-revalidation-bytes-');
   const file = path.join(directory, 'parent.jsonl');
-  // The prefix spans more than one 256 KiB read, so every read must add to the charge.
+  // The prefix spans more than one 256 KiB read, so a whole-prefix check reads more than once.
   fs.writeFileSync(file, '{"type":"ignored","padding":"' + 'x'.repeat(300000) + '"}\n');
   const session = () => {
     const stat = revisionOf(fs.statSync(file, { bigint: true }));
     return { file, agent: 'claude' as const, sessionId: 'parent', size: stat.size, mtimeMs: stat.mtimeMs };
   };
+  // The final full block and the partial block after it.
+  const anchorBytes = (offset: number) => 4096 + (offset % 4096);
   const first = new ProgressiveWorker(source);
-  // A fixed clock keeps every pass inside its time slice, so the byte totals do not depend on machine speed.
-  const reloaded = new ProgressiveWorker('performance.now = () => 0;' + source);
-  try {
-    const found = await completeDiscovery(
-      first,
-      { kind: 'claude-children', parents: [session()], repositoryRoots: [directory] },
-      1,
-      new AbortController().signal,
-    );
-    assert.ok(found?.value.kind === 'claude-children');
-    assert.equal(found.value.charges!.revalidationBytes, 0, 'a first scan charged revalidation');
-    const accepted = found.value.referenceEntries[0][1].claudeCursor!.offset;
-    assert.equal(accepted, fs.statSync(file).size);
-    const tail = '{"type":"ignored","tail":true}\n';
-    fs.appendFileSync(file, tail);
-    let entries = found.value.referenceEntries;
+  const workers = [first];
+  // Each phase starts a new worker from the saved entries. A fixed clock keeps every pass inside its time slice.
+  const reload = async (entries: Array<[string, import('./derivedcache').ClaudeChildReferenceCacheEntry]>) => {
+    const worker = new ProgressiveWorker('performance.now = () => 0;' + source);
+    workers.push(worker);
     let checkpoint: import('./progressiveworker').DiscoveryCheckpoint | undefined;
-    let readBytes = 0;
-    let revalidationBytes = 0;
+    const totals = { readBytes: 0, revalidationBytes: 0, resets: 0 };
     for (let pass = 0; pass < 30; pass++) {
-      const result = await reloaded.run(
+      const result = await worker.run(
         {
           kind: 'claude-children',
           parents: [session()],
@@ -1034,18 +1028,73 @@ test('a reloaded worker charges a grown transcript prefix to revalidation and it
       assert.ok(
         result && (result.value.kind === 'claude-children-progress' || result.value.kind === 'claude-children'),
       );
-      readBytes += result.value.charges!.readBytes;
-      revalidationBytes += result.value.charges!.revalidationBytes!;
+      totals.readBytes += result.value.charges!.readBytes;
+      totals.revalidationBytes += result.value.charges!.revalidationBytes!;
+      totals.resets += result.value.charges!.resets;
       entries = result.value.referenceEntries;
       if (result.value.kind === 'claude-children' && !result.value.continuation) break;
       if (result.value.kind === 'claude-children-progress') checkpoint = result.value.checkpoint;
     }
-    assert.equal(entries[0][1].claudeCursor!.offset, accepted + tail.length, 'the grown transcript never completed');
-    assert.equal(revalidationBytes, accepted, 'the accepted prefix was not charged to revalidation');
-    assert.equal(readBytes - revalidationBytes, tail.length, 'the new tail was not charged to reads');
+    assert.equal(entries[0][1].claudeCursor!.offset, fs.statSync(file).size, 'the transcript never completed');
+    return { entries, ...totals };
+  };
+  try {
+    const found = await completeDiscovery(
+      first,
+      { kind: 'claude-children', parents: [session()], repositoryRoots: [directory] },
+      1,
+      new AbortController().signal,
+    );
+    assert.ok(found?.value.kind === 'claude-children');
+    assert.equal(found.value.charges!.revalidationBytes, 0, 'a first scan charged revalidation');
+    const accepted = found.value.referenceEntries[0][1].claudeCursor!.offset;
+    assert.equal(accepted, fs.statSync(file).size);
+
+    const tail = '{"type":"ignored","tail":true}\n';
+    fs.appendFileSync(file, tail);
+    const grown = await reload(found.value.referenceEntries);
+    assert.equal(grown.revalidationBytes, anchorBytes(accepted), 'a grown transcript reread more than its anchor');
+    assert.equal(grown.readBytes - grown.revalidationBytes, tail.length, 'the new tail was not charged to reads');
+    assert.equal(grown.resets, 0);
+
+    // A metadata change keeps the size, so the whole prefix is compared and an interior rewrite would reset.
+    const prefix = accepted + tail.length;
+    const at = new Date(Date.now() + 60_000);
+    fs.utimesSync(file, at, at);
+    const touched = await reload(grown.entries);
+    assert.equal(touched.revalidationBytes, prefix, 'a touched transcript skipped the prefix check');
+    assert.equal(touched.readBytes, touched.revalidationBytes, 'a touched transcript read past its prefix');
+    assert.equal(touched.resets, 0);
+
+    // Evidence saved without an anchor checks the whole prefix once and keeps the anchor that check computes.
+    const unanchored = structuredClone(touched.entries);
+    delete unanchored[0][1].claudeCursor!.evidence!.anchor;
+    fs.appendFileSync(file, tail);
+    const upgraded = await reload(unanchored);
+    assert.equal(upgraded.revalidationBytes, prefix, 'evidence without an anchor skipped the prefix check');
+    assert.equal(upgraded.readBytes - upgraded.revalidationBytes, tail.length);
+    assert.equal(upgraded.resets, 0);
+
+    // One byte inside the final full block changes, and the file grows.
+    const anchored = prefix + tail.length;
+    const fd = fs.openSync(file, 'r+');
+    fs.writeSync(fd, 'y', anchored - (anchored % 4096) - 4096 + 100);
+    fs.closeSync(fd);
+    fs.appendFileSync(file, tail);
+    const rewritten = await reload(upgraded.entries);
+    assert.equal(rewritten.resets, 1, 'a rewrite under the anchor kept the accepted prefix');
+    assert.equal(
+      rewritten.revalidationBytes,
+      anchorBytes(anchored) + anchored,
+      'the mismatch skipped the prefix check',
+    );
+    assert.equal(
+      rewritten.readBytes - rewritten.revalidationBytes,
+      anchored + tail.length,
+      'the reset did not reparse',
+    );
   } finally {
-    first.stop();
-    reloaded.stop();
+    for (const worker of workers) worker.stop();
     fs.rmSync(directory, { recursive: true, force: true });
   }
 });
@@ -2555,7 +2604,7 @@ async function completeDiscovery(
 // Frozen-clock requests set this discovery byte budget, which equals the production cap.
 const DISCOVERY_BYTES = 8 * 1024 * 1024;
 
-test('worker interior rewrite plus growth matches fresh discovery and retires the generation', async () => {
+test('worker interior rewrite plus growth keeps a rewrite before the anchor until a same-size change, then matches fresh discovery and retires the generation', async () => {
   const directory = tempDir('relationship-interior-growth-');
   const file = path.join(directory, 'parent.jsonl');
   fs.writeFileSync(
@@ -2592,8 +2641,21 @@ test('worker interior rewrite plus growth matches fresh discovery and retires th
     const old = fs.readFileSync(file, 'utf8');
     fs.writeFileSync(file, old.replace('aaaaaaaa', 'bbbbbbbb') + '{"type":"ignored"}\n');
     fs.utimesSync(file, new Date(0), new Date(first.value.referenceEntries[0][1].mtimeMs + 2000));
-    const resumed = await completeDiscovery(worker, request(), 2, signal);
-    const fresh = await completeDiscovery(freshWorker, request(), 2, signal);
+    // The rewrite lies before the final block, so growth keeps the accepted relationships and the generation.
+    const grown = await completeDiscovery(worker, request(), 2, signal);
+    assert.ok(grown?.value.kind === 'claude-children');
+    assert.deepEqual(
+      grown.value.referenceEntries[0][1].references.map((reference) => reference.sessionId),
+      ['aaaaaaaa'],
+    );
+    assert.equal(
+      grown.value.referenceEntries[0][1].sourceGeneration,
+      first.value.referenceEntries[0][1].sourceGeneration,
+    );
+    // A same-size change compares the whole prefix and finds the rewrite.
+    fs.utimesSync(file, new Date(0), new Date(grown.value.referenceEntries[0][1].mtimeMs + 2000));
+    const resumed = await completeDiscovery(worker, request(), 3, signal);
+    const fresh = await completeDiscovery(freshWorker, request(), 3, signal);
     assert.ok(resumed?.value.kind === 'claude-children' && fresh?.value.kind === 'claude-children');
     assert.deepEqual(resumed.value.references, fresh.value.references);
     assert.deepEqual(resumed.value.referenceEntries[0][1].references, fresh.value.referenceEntries[0][1].references);
@@ -2666,21 +2728,27 @@ test.each(['claude', 'codex'] as const)(
       assert.ok(first?.value.kind === 'claude-children');
       assert.equal(first.value.referenceEntries[0][1].relationshipComplete, true);
       assert.deepEqual(first.value.referenceEntries[0][1].references, []);
-      const old = first.value.referenceEntries[0][1];
       fs.writeFileSync(
         file,
         fs.readFileSync(file, 'utf8').replaceAll('ARC_DISPATCH_IGNORED', 'ARC_DISPATCH_SESSION') +
           '{"type":"ignored"}\n',
       );
+      fs.utimesSync(file, new Date(0), new Date(first.value.referenceEntries[0][1].mtimeMs + 2000));
+      // The rewrite lies before the final block, so growth keeps the accepted answer.
+      const grown = await completeDiscovery(worker, request(), 2, new AbortController().signal);
+      assert.ok(grown?.value.kind === 'claude-children');
+      assert.deepEqual(grown.value.referenceEntries[0][1].references, []);
+      const old = grown.value.referenceEntries[0][1];
+      // A same-size change makes validation compare the whole prefix and find the rewrite.
       fs.utimesSync(file, new Date(0), new Date(old.mtimeMs + 2000));
       const controller = new AbortController();
       let checkpoint: import('./progressiveworker').DiscoveryCheckpoint | undefined;
       let entries: typeof first.value.referenceEntries = [];
-      let observedBytes = (first as typeof first & { validationBytes: number }).validationBytes;
+      let observedBytes = (grown as typeof grown & { validationBytes: number }).validationBytes;
       let acknowledgedPosition = 0;
       const pending = await worker.run(
-        { ...request(), referenceEntries: first.value.referenceEntries },
-        2,
+        { ...request(), referenceEntries: grown.value.referenceEntries },
+        3,
         controller.signal,
         (result) => {
           if (result.value.kind !== 'claude-children-delta') return;
@@ -2786,7 +2854,9 @@ test.each(['claude', 'codex'] as const)(
     try {
       const first = await completeDiscovery(firstWorker, request(), 1, new AbortController().signal);
       assert.ok(first?.value.kind === 'claude-children');
-      fs.appendFileSync(file, '{"type":"ignored"}\n');
+      // A same-size change makes validation compare the whole prefix.
+      const touched = new Date(first.value.referenceEntries[0][1].mtimeMs + 2000);
+      fs.utimesSync(file, touched, touched);
       const timed = `let validationClock=0;performance.now=()=>validationClock;const df=require('node:fs'),dr=df.readSync;df.readSync=function(...args){const count=dr.apply(this,args);validationClock+=15;return count;};`;
       worker = new ProgressiveWorker(timed + source);
       const firstSlice = await worker.run(
@@ -2838,7 +2908,9 @@ test.each(['claude', 'codex'] as const)(
       assert.ok(first?.value.kind === 'claude-children');
       const offset = (first.value.referenceEntries[0][1].claudeCursor ?? first.value.referenceEntries[0][1].cursor)!
         .offset;
-      fs.appendFileSync(file, '{"type":"ignored"}\n');
+      // A same-size change makes validation compare the whole prefix.
+      const touched = new Date(first.value.referenceEntries[0][1].mtimeMs + 2000);
+      fs.utimesSync(file, touched, touched);
       const validation = await worker.run(request(), 2, new AbortController().signal);
       assert.ok(validation?.value.kind === (agent === 'claude' ? 'claude-children-progress' : 'claude-children'));
       const allowance = (agent === 'claude' ? 1 : 8) * 1024 * 1024 - 16 * 1024;
@@ -3143,7 +3215,9 @@ test('pending Codex comparison retains dispatched sessions and spend through com
     assert.equal(first.value.dispatchFacts[0]?.spend.models[0]?.usage.output, 3);
     const old = new Map(first.value.referenceEntries).get(normalizeFsPath(file))!;
     assert.ok(old.cursor!.offset > 8 * 1024 * 1024);
-    fs.appendFileSync(file, line({ type: 'ignored' }));
+    // A same-size change makes validation compare the whole prefix.
+    const touched = new Date(old.mtimeMs + 2000);
+    fs.utimesSync(file, touched, touched);
     const pending = await worker.run(request(), 2, new AbortController().signal);
     assert.ok(pending?.value.kind === 'claude-children');
     assert.equal(pending.value.complete, true);
@@ -3603,7 +3677,9 @@ test.each(['claude', 'codex'] as const)('%s validation services selected work be
   try {
     const first = await completeDiscovery(worker, request(), 1, new AbortController().signal);
     assert.ok(first?.value.kind === 'claude-children');
-    fs.appendFileSync(file, '{"type":"ignored"}\n');
+    // A same-size change makes validation compare the whole prefix.
+    const touched = new Date(first.value.referenceEntries[0][1].mtimeMs + 2000);
+    fs.utimesSync(file, touched, touched);
     fs.writeFileSync(armed, 'ready');
     let selectedBeforeAcknowledgment: boolean | undefined;
     const result = await worker.run(request(), 2, new AbortController().signal, (reply) => {
@@ -3647,7 +3723,9 @@ test('restored protected validation precedes a competing source and releases it 
     const waiting = parents.find((parent) => parent !== protectedParent)!;
     const before = new Map(saved.referenceEntries);
     const waitingOffset = before.get(normalizeFsPath(waiting.file))?.claudeCursor?.offset ?? 0;
-    fs.appendFileSync(protectedParent.file, '{"type":"ignored"}\n');
+    // A same-size change makes validation compare the whole prefix.
+    const touched = new Date(protectedParent.mtimeMs + 2000);
+    fs.utimesSync(protectedParent.file, touched, touched);
     const checkpoint = {
       ...saved.checkpoint,
       parents: [waiting, protectedParent],

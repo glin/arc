@@ -1521,7 +1521,7 @@ test('a same-prefix rollout rewrite drops its stale dispatch cursor', () => {
 });
 
 test.each([65536, 1024 * 1024])(
-  'Codex interior rewrite plus growth resumes to the fresh relationships at %i bytes',
+  'Codex interior rewrite plus growth resumes to the fresh relationships at %i bytes, and keeps a rewrite before the anchor until a same-size change',
   (budget) => {
     vi.spyOn(performance, 'now').mockReturnValue(0);
     const firstId = '11111111-1111-4111-8111-111111111111';
@@ -1543,28 +1543,53 @@ test.each([65536, 1024 * 1024])(
     );
     const old = fs.readFileSync(file, 'utf8');
     assert.ok(old.indexOf(firstId) > 256 && old.indexOf(firstId) < first.cursor.offset - 4096);
+    const finish = (cursor: typeof first.cursor) => {
+      let scan = scanCodexDispatchReferences(file, 'parent', cursor, budget);
+      let reset = scan.reset;
+      for (let pass = 0; !scan.complete && pass < 100; pass++) {
+        scan = scanCodexDispatchReferences(file, 'parent', JSON.parse(JSON.stringify(scan.cursor)), budget);
+        reset ||= scan.reset;
+      }
+      return { scan, reset };
+    };
     fs.writeFileSync(file, old.replace(firstId, secondId) + '{"type":"ignored"}\n');
     fs.utimesSync(file, new Date(0), new Date(first.cursor.mtimeMs + 2000));
-    let resumed = scanCodexDispatchReferences(file, 'parent', first.cursor, budget);
-    for (let pass = 0; !resumed.complete && pass < 100; pass++)
-      resumed = scanCodexDispatchReferences(file, 'parent', JSON.parse(JSON.stringify(resumed.cursor)), budget);
-    assert.ok(resumed.complete);
-    assert.deepEqual(resumed.references, scanCodexDispatchReferences(file, 'parent').references);
+    // The rewrite lies before the final block, so growth keeps the accepted relationships.
+    const grown = finish(first.cursor);
+    assert.ok(grown.scan.complete);
+    assert.equal(grown.reset, false);
+    assert.deepEqual(
+      grown.scan.references.map((reference) => reference.sessionId),
+      [firstId],
+    );
+    // A same-size change compares the whole prefix, finds the rewrite, and rescans.
+    fs.utimesSync(file, new Date(0), new Date(grown.scan.cursor.mtimeMs + 2000));
+    const resumed = finish(grown.scan.cursor);
+    assert.ok(resumed.scan.complete);
+    assert.equal(resumed.reset, true);
+    assert.deepEqual(
+      resumed.scan.references.map((reference) => reference.sessionId),
+      [secondId],
+    );
+    assert.deepEqual(resumed.scan.references, scanCodexDispatchReferences(file, 'parent').references);
   },
 );
 
-test('Codex append validation retains parsing position and replaces a superseded comparison', () => {
+test('Codex same-size validation retains parsing position and replaces a superseded comparison', () => {
   const file = writeRollout(Array.from({ length: 300 }, () => ({ type: 'ignored', payload: 'x'.repeat(1024) })));
   let scan = scanCodexDispatchReferences(file, 'parent', null, 65536);
   const offset = scan.cursor.offset;
-  fs.appendFileSync(file, '{"type":"ignored"}\n');
+  // A same-size change makes validation compare the whole prefix.
+  const accepted = fs.statSync(file).mtimeMs;
+  const touch = (seconds: number) => fs.utimesSync(file, new Date(0), new Date(accepted + seconds * 1000));
+  touch(2);
   scan = scanCodexDispatchReferences(file, 'parent', scan.cursor, 32768);
   assert.equal(scan.reset, false);
   assert.equal(scan.complete, false);
   assert.equal(scan.cursor.offset, offset);
   assert.ok(scan.cursor.evidence?.validation?.digest.offset);
   const candidate = scan.cursor.evidence.validation.stamp;
-  fs.appendFileSync(file, '{"type":"ignored"}\n');
+  touch(4);
   scan = scanCodexDispatchReferences(file, 'parent', scan.cursor, 32768);
   assert.equal(scan.cursor.offset, offset);
   assert.notDeepEqual(scan.cursor.evidence?.validation?.stamp, candidate);
