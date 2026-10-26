@@ -12037,7 +12037,11 @@ export class PanelProvider implements vscode.Disposable {
       this.publishSessionQueryContext();
       this.discoveryComplete = undefined;
       this.checkpointDerivedCache();
-      if (this.catalog) this.catalog = { ...this.catalog, sessions: this.authoritativeCatalog ?? [] };
+      // Published rows stay the accepted ones while discovery continues. Before a first accepted catalog, the
+      // walked rows stay held, so the refresh that sends the next continuation reuses them instead of walking again.
+      if (this.catalog) {
+        this.catalog = { ...this.catalog, sessions: this.authoritativeCatalog ?? this.catalog.sessions };
+      }
       if (this.dispatchedDiscoveryWaiting() !== discoveryWaiting) this.postDispatchedCostsIfMoved();
       return this.authoritativeCatalog !== null;
     }

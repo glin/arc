@@ -3465,6 +3465,41 @@ test('pending Claude discovery acknowledges progress without replacing catalog r
   assert.equal(provider.posts.at(-1)?.known, rows.length);
 });
 
+// A progress reply before any accepted catalog used to empty the held catalog, so the refresh that sent the next
+// continuation found no selected row, walked every session again, and repeated that once per continuation.
+
+test('pending Claude discovery before an accepted catalog keeps the walked rows for the next reuse', async () => {
+  const { provider, claude, codex } = bumpedCatalogHarness();
+  const walked = [claude, codex];
+  provider.authoritativeCatalog = null;
+  provider.catalog = { folders: 'project', sessions: walked };
+  provider.refreshGeneration = 4;
+  provider.showing = codex.sessionId;
+  provider.checkpointDerivedCache = () => {};
+  const checkpoint = {
+    compatibility: discoveryCompatibility(CLAUDE_CHILD_REFERENCE_PARSER_VERSION),
+    parserVersion: CLAUDE_CHILD_REFERENCE_PARSER_VERSION,
+    parents: walked,
+    catalog: walked,
+    repositoryRoots: ['project'],
+    completed: [],
+    position: 1,
+    sequence: 2,
+  };
+  provider.progressiveWorker.run = () =>
+    Promise.resolve({
+      generation: 4,
+      value: { kind: 'claude-children-progress', checkpoint, referenceEntries: [], continuation: true },
+    });
+  assert.equal(await provider.prepareClaudeChildren(4, new AbortController().signal), false);
+  assert.equal(provider.dispatchDiscoveryPending, true);
+  assert.equal(provider.catalog.sessions, walked, 'the progress reply dropped the walked rows from the held catalog');
+  assert.ok(
+    provider.catalog.sessions.some((session: SessionFile) => session.sessionId === codex.sessionId),
+    'the selected row left the held catalog, so the next reuse must walk',
+  );
+});
+
 test.each(['win32', 'darwin', 'linux'])('startup progress counts completed Windows sources on %s', async (platform) => {
   vi.stubGlobal('process', { ...process, platform });
   const clock = vi.spyOn(Date, 'now').mockReturnValue(1000);
