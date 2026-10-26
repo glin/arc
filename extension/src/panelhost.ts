@@ -12234,8 +12234,8 @@ export class PanelProvider implements vscode.Disposable {
 
   // Admission finishes before publication. Read and source allowances span the entire refresh.
   // `settled` says what to do with a session whose complete scan found a prompt at the revision the catalog
-  // holds now. A refresh that walked or revalidated its rows rechecks every file. A refresh that reused the
-  // held catalog skips them, because nothing it knows about those files changed.
+  // holds now. A refresh that walked rechecks every file. A refresh that reused the held catalog, with or
+  // without revalidating named rows, skips the sessions whose held revision did not move.
   private async prepareHumanPrompts(
     sessions: SessionFile[],
     sizeCurrent: boolean,
