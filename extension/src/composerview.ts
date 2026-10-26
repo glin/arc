@@ -1125,10 +1125,13 @@ const DEFAULT_EFFORT_LABEL = 'Effort not reported';
 const NO_EFFORT_LABEL = 'No effort setting';
 
 // Find the selected catalog value, its resolved model, then the value without an added window. Return null when none matches.
+// A model id that the default row shares with a named row resolves to the named row, which names the model.
 export function chosenModel(models: readonly ModelChoice[], model: string | undefined): ModelChoice | null {
+  const resolved = model ? models.filter((m) => m.resolvedModel === model) : [];
   return (
     models.find((m) => m.value === model) ??
-    (model ? models.find((m) => m.resolvedModel === model) : undefined) ??
+    resolved.find((m) => m.value !== 'default') ??
+    resolved[0] ??
     windowedChoice(models, model)
   );
 }

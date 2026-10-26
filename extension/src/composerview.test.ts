@@ -7936,6 +7936,22 @@ test('a saved default model value names the model it resolves to whatever the ap
   const next = waiting.picks.find((item) => item.control === 'model')!;
   assert.equal(next.label, 'Opus 5.5');
   assert.ok(next.name.startsWith('Model: Opus 5.5, selected for the next turn.'), next.name);
+  // A saved model id that the default row shares with a named row reads as the named row.
+  const pinned = composerView(
+    composerState({
+      models,
+      settings: {
+        selectedModel: 'claude-opus-5-5',
+        selectedEffort: 'high',
+        effortModel: 'claude-opus-5-5',
+        pendingModel: null,
+        pendingEffort: null,
+        confirmedModel: 'claude-opus-5-5',
+        confirmedEffort: 'high',
+      },
+    }),
+  )!;
+  assert.equal(pinned.picks.find((item) => item.control === 'model')!.label, 'Opus 5.5');
 });
 
 const NATIVE_WINDOW_MODELS: ModelChoice[] = [
