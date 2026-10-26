@@ -2552,6 +2552,9 @@ async function completeDiscovery(
   throw new Error('discovery never completed its captured inputs');
 }
 
+// Frozen-clock requests set this discovery byte budget, which equals the production cap.
+const DISCOVERY_BYTES = 8 * 1024 * 1024;
+
 test('worker interior rewrite plus growth matches fresh discovery and retires the generation', async () => {
   const directory = tempDir('relationship-interior-growth-');
   const file = path.join(directory, 'parent.jsonl');
@@ -2969,6 +2972,7 @@ test.each(['claude', 'codex'] as const)(
       kind: 'claude-children' as const,
       parents: [{ file, sessionId: 'parent', agent, ...revisionOf(fs.statSync(file, { bigint: true })) }],
       repositoryRoots: [directory],
+      discoveryBytes: DISCOVERY_BYTES,
     });
     let worker = new ProgressiveWorker('performance.now=()=>0;' + source);
     try {
@@ -2982,7 +2986,7 @@ test.each(['claude', 'codex'] as const)(
       const entries = [...loadDerivedCache(cache).claudeChildReferences];
       worker.stop();
       const readless = `const ef=require('node:fs');ef.readSync=()=>{throw new Error('unchanged evicted source was read');};`;
-      worker = new ProgressiveWorker(readless + source);
+      worker = new ProgressiveWorker('performance.now=()=>0;' + readless + source);
       const next = await worker.run({ ...request(), referenceEntries: entries }, 2, new AbortController().signal);
       assert.ok(next?.value.kind === 'claude-children');
       assert.equal(next.value.charges!.readBytes, 0);
@@ -5517,7 +5521,9 @@ test('Codex dispatch discovery resumes beyond its request byte budget', async ()
   const catalog = [
     { agent: 'claude' as const, file: child, sessionId: id, mtimeMs: childStat.mtimeMs, size: childStat.size },
   ];
-  let worker = new ProgressiveWorker(source);
+  // A frozen clock leaves the request byte budget as the only bound on each pass.
+  const frozenClock = 'performance.now=()=>0;';
+  let worker = new ProgressiveWorker(frozenClock + source);
   try {
     let entries: Array<[string, import('./derivedcache').ClaudeChildReferenceCacheEntry]> = [];
     let completed = false;
@@ -5530,6 +5536,7 @@ test('Codex dispatch discovery resumes beyond its request byte budget', async ()
           parents: [parent],
           catalog,
           repositoryRoots: [directory],
+          discoveryBytes: DISCOVERY_BYTES,
           referenceEntries: entries,
         },
         ++passes,
@@ -5540,9 +5547,9 @@ test('Codex dispatch discovery resumes beyond its request byte budget', async ()
       entries = result.value.referenceEntries;
       if (passes === 1) {
         const cursor = entries[0]?.[1].cursor;
-        assert.ok(cursor && cursor.offset <= 8 * 1024 * 1024);
+        assert.ok(cursor && cursor.offset <= DISCOVERY_BYTES);
         worker.stop();
-        worker = new ProgressiveWorker(source);
+        worker = new ProgressiveWorker(frozenClock + source);
       }
       completed = result.value.complete;
       if (!completed) assert.equal(result.value.references.length, 0);
@@ -10085,6 +10092,7 @@ test.each(['claude', 'codex'] as const)(
     f.readSync = function(fd,b,off,len,pos) { if(files.get(fd) === ${JSON.stringify(childFile)}) { if(len > 262144) whole++; if(len === 262144) forward++; } return r.call(this,fd,b,off,len,pos); };
     const port = require('node:worker_threads').parentPort, post = port.postMessage; port.postMessage = function(m) { if(m.result) Object.assign(m.result,{whole,forward}); return post.call(this,m); };`;
     const workerSource =
+      'performance.now=()=>0;' +
       counted +
       source +
       `\nDate.now = () => Number(require('node:fs').readFileSync(${JSON.stringify(clock)}, 'utf8'));`;
@@ -10101,6 +10109,7 @@ test.each(['claude', 'codex'] as const)(
       parents: [session(parentFile, 'parent', agent)],
       catalog: [session(parentFile, 'parent', agent), session(childFile, id, 'codex')],
       repositoryRoots: [directory],
+      discoveryBytes: DISCOVERY_BYTES,
     });
     const read = async () => {
       const result = await worker.run(request(), 1, new AbortController().signal);
@@ -10218,7 +10227,10 @@ test('rejected dispatch terminals keep whole spend unread until quiet and source
     const port = require('node:worker_threads').parentPort, post = port.postMessage;
     port.postMessage = function(m) { if(m.result) m.result.wholeSpend = wholeSpend; return post.call(this,m); };`;
   const workerSource =
-    prefix + instrumented + `\nDate.now = () => Number(f.readFileSync(${JSON.stringify(clock)}, 'utf8'));`;
+    'performance.now=()=>0;' +
+    prefix +
+    instrumented +
+    `\nDate.now = () => Number(f.readFileSync(${JSON.stringify(clock)}, 'utf8'));`;
   const session = (file: string, sessionId: string) => ({
     file,
     sessionId,
@@ -10257,6 +10269,7 @@ test('rejected dispatch terminals keep whole spend unread until quiet and source
         parents: [session(parentFile, 'parent')],
         catalog: [session(parentFile, 'parent'), session(childFile, id)],
         repositoryRoots: [directory],
+        discoveryBytes: DISCOVERY_BYTES,
       });
       try {
         let result;
@@ -10290,6 +10303,7 @@ test('rejected dispatch terminals keep whole spend unread until quiet and source
             parents: [session(parentFile, 'parent')],
             catalog: [session(parentFile, 'parent'), session(childFile, id)],
             repositoryRoots: [directory],
+            discoveryBytes: DISCOVERY_BYTES,
           },
           1,
           new AbortController().signal,

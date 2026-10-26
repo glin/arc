@@ -1,5 +1,6 @@
 // Vitest global setup gives each run a temporary directory before workers start.
 // TEMP, TMP, and TMPDIR point to it until teardown restores them and removes the directory.
+// ARC_HOME points to a new Arc home inside it, so no test reads the developer's own Arc store.
 // The next run retries cleanup of abandoned directories whose owner processes have exited.
 import * as fs from 'node:fs';
 import * as os from 'node:os';
@@ -10,7 +11,9 @@ export const MACHINE_TEMP = 'ARC_TEST_MACHINE_TEMP';
 // Environment key for this run's temporary directory.
 export const RUN_TEMP = 'ARC_TEST_RUN_TEMP';
 const RUNS = 'arc-test-runs';
-const MOVED = ['TEMP', 'TMP', 'TMPDIR', MACHINE_TEMP, RUN_TEMP];
+// Environment key for the Arc home. Tests that need Arc data set their own.
+const ARC_HOME = 'ARC_HOME';
+const MOVED = ['TEMP', 'TMP', 'TMPDIR', MACHINE_TEMP, RUN_TEMP, ARC_HOME];
 
 function missing(error: unknown): boolean {
   return (error as NodeJS.ErrnoException).code === 'ENOENT';
@@ -79,12 +82,15 @@ export default async function setup(): Promise<() => void> {
     fs.mkdirSync(runs, { recursive: true });
     await removeAbandoned(runs);
     const runTemp = fs.mkdtempSync(path.join(runs, `${process.pid}-`));
+    const arcHome = path.join(runTemp, 'arc-home');
+    fs.mkdirSync(arcHome);
     Object.assign(process.env, {
       TEMP: runTemp,
       TMP: runTemp,
       TMPDIR: runTemp,
       [MACHINE_TEMP]: machineTemp,
       [RUN_TEMP]: runTemp,
+      [ARC_HOME]: arcHome,
     });
     observation?.end('prepare', { machineTemp, runTemp, coordination: observations?.coordinationEnvironment() });
     return () => {

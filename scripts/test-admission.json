@@ -201,8 +201,8 @@
   },
   "extension/src/temproot.test.ts": {
     "reason": "Git-discovered Vitest configurations must install the per-run temporary-directory setup.",
-    "cases": 4,
-    "matricesSha256": "a57840a3b4ee247ae373a65dd819c58c06cb65c68838cc772d9e5493f0487317"
+    "cases": 5,
+    "matricesSha256": "7b791b039599324c620c810b586922d381efd9b58c7e24facb36e7dab4e2e2f0"
   },
   "extension/src/timeline-renderer.browser.test.ts": {
     "reason": "Production timeline rendering must preserve native disclosure, selection, navigation, and accessible interaction.",

@@ -7,6 +7,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { inventorySourceTree } from '../test/source-tree.ts';
 import setup, { MACHINE_TEMP, RUN_TEMP } from '../test/temp-run.ts';
+import { arcHome } from './store.ts';
 import { tempDir } from './temproot.ts';
 
 const REPOSITORY = path.join(__dirname, '..', '..');
@@ -40,11 +41,20 @@ test('a test worker writes its temporary files inside the run directory', () => 
   assert.equal(os.tmpdir(), runTemp);
 });
 
+test('a test worker reads the Arc home inside the run directory, never the developer store', () => {
+  const runTemp = process.env[RUN_TEMP];
+  assert.ok(runTemp, `${RUN_TEMP} is not set`);
+  assert.equal(arcHome(), path.join(runTemp, 'arc-home'));
+  assert.ok(fs.statSync(arcHome()).isDirectory(), `${arcHome()} is not a directory`);
+  assert.notEqual(path.resolve(arcHome()), path.resolve(os.homedir(), '.arc'));
+});
+
 test('temporary-directory timing retains environment redirection and restoration', async () => {
   const root = tempDir('timing-environment-');
   const keys = [
     'ARC_TEST_OBSERVATIONS_DIR',
     'ARC_TEST_OBSERVATION_RUN_ID',
+    'ARC_HOME',
     MACHINE_TEMP,
     RUN_TEMP,
     'TEMP',
@@ -80,6 +90,17 @@ test('temporary-directory timing retains environment redirection and restoration
     assert.equal(events[0].parentRunId, 'outer');
     assert.equal(events.at(-1).outcome, 'success');
     assert.equal(fs.existsSync(redirected), false);
+    // Teardown restores an absent, empty, or populated Arc home.
+    for (const prior of [undefined, '', path.join(root, 'developer-arc')]) {
+      if (prior === undefined) delete process.env.ARC_HOME;
+      else process.env.ARC_HOME = prior;
+      teardown = await setup();
+      assert.equal(process.env.ARC_HOME, path.join(process.env[RUN_TEMP]!, 'arc-home'));
+      teardown();
+      teardown = undefined;
+      assert.equal('ARC_HOME' in process.env, prior !== undefined);
+      assert.equal(process.env.ARC_HOME, prior);
+    }
   } finally {
     teardown?.();
     for (const [key, value] of saved) {
