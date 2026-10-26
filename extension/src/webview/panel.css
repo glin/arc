@@ -6455,17 +6455,18 @@ button.railfilterlabel:focus-visible {
 .chippop .caption {
   margin: 0.5em 0 0;
 }
-/* Every figure that qualifies another reads one step smaller: the hero models, the caption,
-   the row details and percents, and the footnote. */
-.chippop :is(.splitmodel, .caption, .costrow .detail, .costrow .pct, .included) {
-  font-size: var(--t-small);
-}
-/* The tab strip shows only in a pinned popover. A hover draws the first tab alone. */
+/* Every line of the cost form reads at the body size, the tab names and base lines with it. */
 .chippop .casktabs.poptabs {
   margin-top: 1.1em;
 }
-.chippop:not(.pinned) .poptabs {
-  display: none;
+/* The cost tab strip takes pointer input in a hover popover too, and a press there pins the
+   popover. The rest of a hover popover takes none. */
+.chippop .poptabs {
+  pointer-events: auto;
+}
+.chippop .poptabs .casktab,
+.chippop :is(.split ~ div, .included) > .context-included {
+  font-size: inherit;
 }
 .chippop .split ~ div:not(.included) > .context-included {
   margin-top: 0.9em;
@@ -6475,7 +6476,7 @@ button.railfilterlabel:focus-visible {
 .chippop .context-categories.costrows {
   grid-template-columns: minmax(0, 1.3fr) auto minmax(5em, 1fr) auto;
   column-gap: 1em;
-  row-gap: 0.85em;
+  row-gap: 0.425em;
   margin-top: 0.6em;
 }
 .chippop .context-categories.costrows.subagentrows {
@@ -6487,8 +6488,10 @@ button.railfilterlabel:focus-visible {
   grid-template-columns: subgrid;
   align-items: center;
 }
+/* A row bar is as thick as the hero's split bar. */
 .chippop .costrow .sbbar {
   grid-column: auto;
+  height: 6px;
 }
 .chippop .costrow .label {
   display: flex;
@@ -6544,8 +6547,13 @@ button.railfilterlabel:focus-visible {
     flex-wrap: wrap;
     row-gap: 0.45em;
   }
+  /* The delegated side fills the row beside the main agent, and its model line wraps there. */
   .chippop .splitside.right {
+    flex: 1 1 0;
     margin-left: auto;
+  }
+  .chippop .splitside.right .splitmodel {
+    white-space: normal;
   }
   .chippop .sbbar.splitbar {
     order: 3;
@@ -6555,7 +6563,7 @@ button.railfilterlabel:focus-visible {
   .chippop .context-categories.costrows,
   .chippop .context-categories.costrows.subagentrows {
     grid-template-columns: minmax(0, 1fr) auto auto;
-    row-gap: 0.9em;
+    row-gap: 0.45em;
   }
   .chippop .costrows > .costrow {
     align-items: baseline;

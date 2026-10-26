@@ -164,7 +164,7 @@ export interface CostDetailRow {
 }
 
 export interface CostDetailTab {
-  name: 'Usage' | 'Tools' | 'Subagents';
+  name: 'Usage' | 'Tools' | 'Delegated';
   // The line under the tab strip that names what the shares divide.
   base: string;
   rows: CostDetailRow[];
@@ -179,7 +179,7 @@ export interface CostDetailSide {
 
 // Warning lines first, then the hero: the main agent against delegated work on a split bar,
 // with each side's models under its dollars. The caption names the main agent's requests.
-// The pinned popover switches between the tabs. A hover draws the first tab.
+// The tab strip switches between the tabs. Choosing a tab in a hover popover pins it.
 export interface CostDetailView {
   warnings: { text: string; title?: string }[];
   main: CostDetailSide;
@@ -1953,7 +1953,11 @@ export interface SessionCostTotal {
   partial: boolean;
 }
 
-function spendCost(agent: TurnAgent): SessionCostTotal {
+// A subagent's price, with each spend part's own dollars so its model groups rank by what they cost.
+type AgentCost = SessionCostTotal & { parts: { model: string | null; dollars: number }[] };
+
+function spendCost(agent: TurnAgent): AgentCost {
+  const parts: AgentCost['parts'] = [];
   let dollars = 0;
   let priced = false;
   let partial =
@@ -1974,6 +1978,7 @@ function spendCost(agent: TurnAgent): SessionCostTotal {
           }),
         ),
       );
+      parts.push({ model: part.model, dollars: exact.dollars ?? 0 });
       if (exact.dollars !== null) {
         dollars += exact.dollars;
         priced = true;
@@ -1984,6 +1989,7 @@ function spendCost(agent: TurnAgent): SessionCostTotal {
     const recordedListCost = recordedCostBasis(part.costBasis) ? part.recordedCost : undefined;
     const cost =
       recordedListCost ?? estimateCost(part.usage, part.model, part.provider ?? null, part.contextWindow ?? null);
+    parts.push({ model: part.model, dollars: cost ?? 0 });
     if (cost === null) {
       partial = true;
       continue;
@@ -1994,11 +2000,12 @@ function spendCost(agent: TurnAgent): SessionCostTotal {
       partial = true;
     }
   }
-  return { dollars: priced ? dollars : null, partial };
+  return { dollars: priced ? dollars : null, partial, parts };
 }
 
 // Prices the turn and its subagents. Unknown coverage makes the priced subtotal a lower bound.
-export function turnCost(turn: Turn): SessionCostTotal {
+// `agents` receives each subagent's own price, so a caller never prices a subagent twice.
+export function turnCost(turn: Turn, agents?: Map<TurnAgent, AgentCost>): SessionCostTotal {
   const hasExactOwn = Boolean(turn.usageParts?.length);
   const exactOwn = hasExactOwn
     ? sessionCostTotalOf(turn.usageParts!.map((part) => priceSessionCost({ agent: turn.agent, role: 'main', ...part })))
@@ -2011,6 +2018,7 @@ export function turnCost(turn: Turn): SessionCostTotal {
   let partial = exactOwn?.partial ?? (own === null && spentTokens(turn.usage));
   for (const agent of turn.agents) {
     const cost = spendCost(agent);
+    agents?.set(agent, cost);
     if (cost.dollars !== null) {
       dollars += cost.dollars;
       priced = true;
@@ -2121,9 +2129,13 @@ export function turnCardCost(turn: Turn, dispatched: readonly DispatchedTurnCost
   );
 }
 
-function cardCostOf(turn: Turn, shares: readonly DispatchedShare[]): SessionCostTotal {
+function cardCostOf(
+  turn: Turn,
+  shares: readonly DispatchedShare[],
+  agents?: Map<TurnAgent, AgentCost>,
+): SessionCostTotal {
   return sessionCostTotalOf([
-    turnCost(turn),
+    turnCost(turn, agents),
     ...shares.map((share) => ({ dollars: share.dollars, partial: share.partial })),
   ]);
 }
@@ -2742,7 +2754,8 @@ function costDetailList(
   expiry: CacheExpiryWarning | null = null,
   waitWarnings: readonly WaitShareWarning[] = [],
 ): StatDetailList {
-  const total = cardCostOf(turn, shares);
+  const agentCosts = new Map<TurnAgent, AgentCost>();
+  const total = cardCostOf(turn, shares, agentCosts);
   const sharedCosts = shares.flatMap((share) => share.costs);
   const childCompactionNotes: string[] = [];
   const totalLabel = formatCost(total.dollars) ?? (shares.length ? ZERO_COST : null);
@@ -2881,22 +2894,18 @@ function costDetailList(
   const toolRows = costToolRows(mainPriced, delegates ? "the main agent's cost" : 'this turn');
   const delegatedDollars = Math.max(0, (total.dollars ?? 0) - mainDollars);
   // A launch row and a resume row of one child are one child session, so rows with a shared id merge.
-  const childrenById = new Map<string, (string | null)[]>();
-  const holdChild = (key: string, models: (string | null)[]) =>
-    childrenById.set(key, [...(childrenById.get(key) ?? []), ...models]);
+  const childrenById = new Map<string, { model: string | null; dollars: number }[]>();
+  const holdChild = (key: string, parts: readonly { model: string | null; dollars: number }[]) =>
+    childrenById.set(key, [...(childrenById.get(key) ?? []), ...parts]);
   turn.agents.forEach((agent, index) =>
     holdChild(
       agent.id ? `child:${agent.id}` : `row:${index}`,
-      agent.spend.map((part) => part.model),
+      agentCosts.get(agent)?.parts ?? agent.spend.map((part) => ({ model: part.model, dollars: 0 })),
     ),
   );
-  shares.forEach((share) =>
-    holdChild(
-      `child:${share.cost.sessionId}`,
-      share.costs.map((cost) => cost.part.model),
-    ),
-  );
+  shares.forEach((share) => holdChild(`child:${share.cost.sessionId}`, pricedModelParts(share.costs)));
   const children = [...childrenById.values()];
+  const groups = childModelCounts(children.map((parts) => ({ parts, counted: true })));
   const cost: CostDetailView | undefined = usageRows.length
     ? {
         warnings: [
@@ -2920,8 +2929,8 @@ function costDetailList(
               delegated: {
                 label: 'Delegated',
                 value: formatCost(delegatedDollars) ?? '$0',
-                model: childModelCounts(children),
-                title: `${centsCost(delegatedDollars)}, ${children.length} child session${children.length === 1 ? '' : 's'}`,
+                model: groups.line,
+                title: `${centsCost(delegatedDollars)}, ${children.length} child session${children.length === 1 ? '' : 's'}${groups.folded ? `. ${groups.all}` : ''}`,
                 mainShare: costShare(mainDollars, mainDollars + delegatedDollars),
               },
             }
@@ -2930,14 +2939,14 @@ function costDetailList(
         tabs: [
           {
             name: 'Usage',
-            base: delegates ? `Shares of the main agent's ${mainValue}.` : `Shares of this turn's ${totalValue}.`,
+            base: 'Main agent',
             rows: usageRows,
           },
           ...(toolRows.length
             ? [
                 {
                   name: 'Tools' as const,
-                  base: `Main agent cost by the tool result each request read. Shares of ${delegates ? "the main agent's" : "this turn's"} ${mainValue}.`,
+                  base: 'Main agent, by tool result',
                   rows: toolRows,
                 },
               ]
@@ -5097,7 +5106,7 @@ export interface SessionCostUsage {
   compactionUsage?: true;
   waits?: UsageWaits;
   tools?: UsageTools;
-  // A delegated child's agent name, which names its Subagents row.
+  // A delegated child's agent name, which names its Delegated row.
   agentName?: string;
   usage: Turn['usage'];
 }
@@ -5988,19 +5997,48 @@ function costToolRows(costs: readonly PricedSessionCost[], of: string): CostDeta
   return byDollars(rows);
 }
 
-// Each model's last word, counted once per child: "13 × sol, 1 × astra".
-function childModelCounts(children: readonly (readonly (string | null)[])[]): string {
-  const counts = new Map<string, number>();
-  for (const models of children) {
-    for (const word of new Set(models.map((model) => shortModel(model)?.split('-').at(-1) ?? 'model not recorded'))) {
-      counts.set(word, (counts.get(word) ?? 0) + 1);
-    }
-  }
-  return [...counts]
-    .sort((a, b) => b[1] - a[1])
-    .map(([word, count]) => `${count} × ${word}`)
-    .join(', ');
+// A model's group word: the last hyphen-separated word of its short name that is not a number,
+// so `sonnet-5-5` reads `sonnet` and `gpt-6.1-sol` reads `sol`.
+function modelGroupWord(model: string | null): string {
+  const short = shortModel(model);
+  const words = short?.split('-').filter((word) => !/^[\d.]+$/.test(word)) ?? [];
+  return words.at(-1) ?? short ?? 'model not recorded';
 }
+
+// Each model group with its child count, most expensive first: "13 × sol, 1 × astra". Each priced
+// part's dollars go to its own model's group. A child counts once in each group it holds. Work that
+// is no child session (`counted` false) adds dollars but no count, so a group only it holds reads
+// as the bare word. The line names the two most expensive groups and counts the rest. `all` names
+// every group, and `uncounted` says whether any group holds no child.
+function childModelCounts(
+  children: readonly { parts: readonly { model: string | null; dollars: number }[]; counted: boolean }[],
+): { line: string; all: string; folded: number; uncounted: boolean } {
+  const groups = new Map<string, { count: number; dollars: number }>();
+  for (const child of children) {
+    for (const part of child.parts) {
+      const word = modelGroupWord(part.model);
+      const held = groups.get(word) ?? { count: 0, dollars: 0 };
+      held.dollars += part.dollars;
+      groups.set(word, held);
+    }
+    if (!child.counted) continue;
+    for (const word of new Set(child.parts.map((part) => modelGroupWord(part.model)))) groups.get(word)!.count++;
+  }
+  const named = [...groups]
+    .sort((left, right) => right[1].dollars - left[1].dollars || right[1].count - left[1].count)
+    .map(([word, held]) => (held.count ? `${held.count} × ${word}` : word));
+  const folded = Math.max(0, named.length - 2);
+  return {
+    line: [...named.slice(0, 2), ...(folded ? [`+${folded} model${folded === 1 ? '' : 's'}`] : [])].join(', '),
+    all: named.join(', '),
+    folded,
+    uncounted: [...groups.values()].some((held) => !held.count),
+  };
+}
+
+// Each priced part's model with its dollars, for the delegated model groups.
+const pricedModelParts = (costs: readonly PricedSessionCost[]) =>
+  costs.map((cost) => ({ model: cost.part.model, dollars: cost.dollars ?? 0 }));
 
 // "13 gpt-6.1-sol children $19.31, 1 gpt-6-astra child $6.35", after the delegated title's figures.
 function childModelDollars(children: readonly (readonly SessionCostUsage[])[]): string {
@@ -6068,7 +6106,7 @@ function scopeSession(id: string): string | null {
 const subagentName = (held: readonly SessionCostUsage[], index: number): string =>
   held.find((part) => part.agentName)?.agentName ?? `Subagent ${index + 1}`;
 
-// The Subagents tab: one row per child session, sorted by cost. Delegated work without a child
+// The Delegated tab: one row per child session, sorted by cost. Delegated work without a child
 // scope is one row. A row without a priced request reads `cost unavailable` with no share, and a
 // row with incomplete usage reads its dollars as a lower bound, as the flat entries do.
 function costSubagentRows(
@@ -6334,16 +6372,30 @@ export function sessionCostProjection(
     const unscoped = delegated.filter((cost) => cost.part.scopeId === undefined);
     // Each invocation has its own scope, so a child session resumed by a later invocation holds
     // several scopes. The hero counts that session once.
+    const childOfScope = new Map<string, string>();
     const childParts = new Map<string, SessionCostUsage[]>();
     for (const [id, held] of delegatedScopes) {
       const session = held.find((part) => part.linkedSessionId)?.linkedSessionId;
       const key = session ? `session:${session}` : id;
+      childOfScope.set(id, key);
       childParts.set(key, [...(childParts.get(key) ?? []), ...held]);
     }
-    const children: (string | null)[][] = [
-      ...[...childParts.values()].map((held) => held.map((part) => part.model)),
-      ...(unscoped.length ? [unscoped.map((cost) => cost.part.model)] : []),
-    ];
+    // Each child's priced parts, read from the priced delegated work rather than priced again.
+    const pricedChildren = new Map<string, PricedSessionCost[]>();
+    for (const cost of delegated) {
+      const id = cost.part.scopeId;
+      if (id === undefined) continue;
+      const key = childOfScope.get(id) ?? id;
+      const held = pricedChildren.get(key) ?? [];
+      held.push(cost);
+      pricedChildren.set(key, held);
+    }
+    const groups = childModelCounts([
+      ...[...pricedChildren.values()].map((held) => ({ parts: pricedModelParts(held), counted: true })),
+      { parts: pricedModelParts(unscoped), counted: false },
+    ]);
+    // Delegated work without a child scope names no child session, so it is never counted as one.
+    const sessions = `${childParts.size} child session${childParts.size === 1 ? '' : 's'}`;
     const tools = costToolRows(main, "the main agent's cost");
     const subagents = costSubagentRows([...delegatedScopes], unscoped, delegatedDollars, scopeShort, short);
     const scopeNames = new Map([...delegatedScopes].map(([id, held], index) => [id, subagentName(held, index)]));
@@ -6374,36 +6426,42 @@ export function sessionCostProjection(
             delegated: {
               label: 'Delegated',
               value: delegatedValue,
-              model: childModelCounts(children),
+              model: groups.line,
+              // The per-child model list names every scoped group. The group list joins it only
+              // for a folded line with a group that no child session holds.
               title: `${[
                 centsCost(delegatedDollars),
-                `${children.length} child session${children.length === 1 ? '' : 's'}`,
+                unscoped.length
+                  ? childParts.size
+                    ? `${sessions} and other delegated work`
+                    : 'no child session recorded'
+                  : sessions,
                 ...(delegated.every((cost) => cost.part.usage.requests !== undefined)
                   ? [
                       `${delegated.reduce((sum, cost) => sum + (cost.part.usage.requests ?? 0), 0).toLocaleString('en-US')} requests`,
                     ]
                   : []),
                 `${sharePercent(costShare(delegatedDollars, combined))} of the total`,
-              ].join(', ')}${childModelDollars([...childParts.values()])}`,
+              ].join(
+                ', ',
+              )}${groups.folded && groups.uncounted ? `. ${groups.all}` : ''}${childModelDollars([...childParts.values()])}`,
               mainShare: costShare(mainDollars, combined),
             },
           }
         : {}),
       caption: costCaption(main),
       tabs: [
-        { name: 'Usage', base: `Shares of the main agent's ${mainValue}.`, rows: mainUsage },
+        { name: 'Usage', base: 'Main agent', rows: mainUsage },
         ...(tools.length
           ? [
               {
                 name: 'Tools' as const,
-                base: `Main agent cost by the tool result each request read. Shares of the main agent's ${mainValue}.`,
+                base: 'Main agent, by tool result',
                 rows: tools,
               },
             ]
           : []),
-        ...(subagents.length
-          ? [{ name: 'Subagents' as const, base: `Shares of the ${delegatedValue} delegated work.`, rows: subagents }]
-          : []),
+        ...(subagents.length ? [{ name: 'Delegated' as const, base: 'Delegated, by session', rows: subagents }] : []),
       ],
       included: costIncluded(included),
     };

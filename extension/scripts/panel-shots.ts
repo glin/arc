@@ -67,7 +67,8 @@ export interface Shot {
   railFilterPicker?: 'open' | 'closed'; // View menu state before capture.
   escape?: boolean | number; // Number of Escape presses before other actions. `true` presses once.
   click?: string; // Control selector to press.
-  costTab?: 'Tools' | 'Subagents'; // Cost popover tab to select after the click pins it.
+  costTab?: 'Tools' | 'Delegated'; // Cost popover tab to select after the click pins it.
+  costHover?: string; // Cost figure to hover until its unpinned popover opens.
   hover?: string; // Control selector to hover until its hint opens.
   after?: string; // Control selector to press after capture.
   state?: 'first-project-empty' | 'first-project-draft';
@@ -100,7 +101,7 @@ export interface Shot {
   compactionSummary?: 'collapsed' | 'expanded';
   cacheWriteWarning?: boolean;
   costOverheads?: boolean;
-  waitWarning?: boolean;
+  waitWarning?: boolean | 'five'; // `five` gives the delegated work five model groups.
   composerSkill?: boolean;
   remoteControl?: boolean; // Draw the prompt box of a session whose Remote Control is connected with a link.
   raisedComposer?: boolean;
@@ -736,7 +737,21 @@ export const SHOTS: Shot[] = [
         waitWarning: true,
         click: '.sessionstats [data-metric="cost"]',
       },
-      ...(['Tools', 'Subagents'] as const).map((costTab) => ({
+      {
+        name: `${size}-wait-warning-session-five-models`,
+        width,
+        escape: true,
+        waitWarning: 'five' as const,
+        click: '.sessionstats [data-metric="cost"]',
+      },
+      {
+        name: `${size}-wait-warning-session-hover`,
+        width,
+        escape: true,
+        waitWarning: true,
+        costHover: '.sessionstats [data-metric="cost"]',
+      },
+      ...(['Tools', 'Delegated'] as const).map((costTab) => ({
         name: `${size}-wait-warning-session-${costTab.toLowerCase()}`,
         width,
         escape: true,
@@ -1245,7 +1260,8 @@ export async function shoot(
     await page.evaluate(SETTLED);
   }
   if (shot.waitWarning) {
-    await page.evaluate(`window.postMessage(${JSON.stringify(waitWarningPayload())}, '*')`);
+    const delegated = shot.waitWarning === 'five' ? 'five' : 'three';
+    await page.evaluate(`window.postMessage(${JSON.stringify(waitWarningPayload(delegated))}, '*')`);
     await page.evaluate(SETTLED);
   }
   if (shot.remoteControl) {
@@ -1374,11 +1390,24 @@ export async function shoot(
   }
   if (shot.costTab) {
     // Select the tab from the keyboard, as a reader moves along the strip.
-    const tabs = ['Usage', 'Tools', 'Subagents'];
+    const tabs = ['Usage', 'Tools', 'Delegated'];
     await page.locator('.chippop.pinned .poptabs [aria-selected="true"]').focus({ timeout: 5_000 });
     for (let at = 0; at < tabs.indexOf(shot.costTab); at++) await page.keyboard.press('ArrowRight');
     // Return focus to the pinned figure, where the other cost captures hold it. The tab stays selected.
     if (shot.click) await page.locator(shot.click).first().focus();
+    await page.evaluate(SETTLED);
+  }
+  if (shot.costHover) {
+    // Release the focus an earlier capture left on the figure first. The blur before capture would
+    // otherwise close the popover that focus opened.
+    await page.evaluate('document.activeElement instanceof HTMLElement && document.activeElement.blur()');
+    try {
+      await page.locator(shot.costHover).first().hover({ timeout: 5_000 });
+      await page.locator('.chippop:not([hidden]) .split').first().waitFor({ timeout: 5_000 });
+    } catch (error) {
+      console.log(`${shot.name}.webp not written: ${shot.costHover}: ${String(error)}`);
+      return;
+    }
     await page.evaluate(SETTLED);
   }
   if (shot.hover) {
@@ -1486,7 +1515,7 @@ export async function shoot(
   }
   await page.waitForTimeout(100);
   await page.evaluate(SETTLED);
-  if (!shot.hover) {
+  if (!shot.hover && !shot.costHover) {
     await page.mouse.move(0, 0);
   }
   await page.evaluate(`
@@ -1497,6 +1526,10 @@ export async function shoot(
   if (shot.focus) {
     await page.locator(shot.focus).first().focus();
     await page.evaluate(SETTLED);
+  }
+  if (shot.costHover && !(await page.locator('.chippop:not([hidden]):not(.pinned) .split').first().isVisible())) {
+    console.log(`${shot.name}.webp not written: the hover popover over ${shot.costHover} closed before capture`);
+    return;
   }
   const viewport = page.viewportSize();
   const element = shot.clip ? await page.locator(shot.clip).first().boundingBox() : null;
@@ -1517,7 +1550,7 @@ export async function shoot(
     await page.locator('#footsash').press('Home');
     await page.evaluate(SETTLED);
   }
-  if (shot.labels || shot.hover) {
+  if (shot.labels || shot.hover || shot.costHover) {
     // Move the pointer away so later captures omit session list row hover controls.
     await page.mouse.move(0, 0);
     await page.evaluate(SETTLED);

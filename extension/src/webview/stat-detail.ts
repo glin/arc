@@ -514,8 +514,8 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
     pop.appendChild(disclosure);
   };
   // The cost form: warnings, the split hero, the caption, the tab strip and every tab's rows, and
-  // the "Included above" footnote. Only the selected tab's rows show. The strip shows only in a
-  // pinned popover, so a hover reads the first tab.
+  // the "Included above" footnote. Only the selected tab's rows show. A hover opens on the first
+  // tab, and choosing a tab in a hover pins the popover on that tab.
   const drawCost = (cost: CostDetailView) => {
     for (const warning of cost.warnings) {
       const line = el('p', 'line chippopwarning');
@@ -559,6 +559,7 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
     const buttons: HTMLButtonElement[] = [];
     const panels: HTMLElement[] = [];
     const select = (at: number, focus: boolean) => {
+      if (focus && !pinned && anchor) pin(anchor);
       costTab = cost.tabs[at]?.name ?? '';
       buttons.forEach((button, index) => {
         button.setAttribute('aria-selected', String(index === at));
@@ -632,7 +633,7 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
       panel.append(el('p', 'context-included chippopscale', tab.base));
       const list = el(
         'ul',
-        tab.name === 'Subagents' ? 'context-categories costrows subagentrows' : 'context-categories costrows',
+        tab.name === 'Delegated' ? 'context-categories costrows subagentrows' : 'context-categories costrows',
       );
       list.setAttribute('role', 'list');
       for (const row of tab.rows) {
@@ -1009,7 +1010,14 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
     dismissedAnchor = null;
     const active = document.activeElement;
     // Nested records return focus to their anchor, not to a control behind the outer popover.
-    focusBack = options.actionAnchor ? node : options.nested || !(active instanceof HTMLElement) ? null : active;
+    // A pin from inside the popover, such as a press on a cost tab, returns focus to the anchor.
+    focusBack = options.actionAnchor
+      ? node
+      : options.nested || !(active instanceof HTMLElement)
+        ? null
+        : pop.contains(active)
+          ? node
+          : active;
     pinned = true;
     show(node);
     markPinned(node);

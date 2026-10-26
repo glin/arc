@@ -99,7 +99,7 @@ A **read-only launch policy** retains launch restrictions through session contin
 | **Next-turn starting price** | The estimated minimum price of the next request's existing context before new prompt text or output. | Its cached and uncached bounds depend on what the record can establish about cache reuse. Never say **floor** to the reader. |
 | **Estimated total** | A list-price estimate for supported recorded usage, Claude compaction estimates, identified Codex compaction usage, and supported supplemental Claude usage. | It is not an invoice. A partial total is a lower bound. |
 | **Cost hero** | The split bar under the warnings of a cost popover. It sets the main agent's cost against delegated work, each side with its models. | A turn that delegated nothing shows the main agent's model with no bar. |
-| **Usage**, **Tools**, **Subagents** (cost tabs) | The tabs of a pinned cost popover: the main agent's cost by usage category, by the tool result each request read, and delegated work by child session. | A hover shows Usage alone. The turn popover has no Subagents tab. A popover whose records hold no tool results has no Tools tab. |
+| **Usage**, **Tools**, **Delegated** (cost tabs) | The tabs of a cost popover: the main agent's cost by usage category, by the tool result each request read, and delegated work by child session. | A hover opens on Usage. Choosing a tab in a hover pins the popover on that tab. The turn popover has no Delegated tab. A popover whose records hold no tool results has no Tools tab. |
 
 ## Code alignment
 

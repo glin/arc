@@ -993,7 +993,7 @@ test('the cost popovers lead with the wait warning, and their Waits rows count t
   const session = payload.stats.s1.find((chip) => chip.metric === 'cost')!;
   const turn = payload.cards[0].chips.find((chip) => chip.metric === 'cost')!;
   for (const [figure, tabs, of] of [
-    [session, ['Usage', 'Tools', 'Subagents'], "the main agent's cost"],
+    [session, ['Usage', 'Tools', 'Delegated'], "the main agent's cost"],
     [turn, ['Usage', 'Tools'], 'this turn'],
   ] as const) {
     const warning = figure.warnings?.find((held) => held.scope === 'wait') as WaitShareWarning;
@@ -1008,7 +1008,10 @@ test('the cost popovers lead with the wait warning, and their Waits rows count t
       tabs,
     );
     const tools = cost.tabs[1];
-    assert.match(tools.base, /^Main agent cost by the tool result each request read\. Shares of /);
+    assert.deepEqual(
+      cost.tabs.map((tab) => tab.base),
+      ['Main agent', 'Main agent, by tool result', ...(tabs.length > 2 ? ['Delegated, by session'] : [])],
+    );
     assert.deepEqual(
       tools.rows.map((row) => [row.label, row.percent]),
       [
@@ -1046,6 +1049,104 @@ test('the cost popovers lead with the wait warning, and their Waits rows count t
     children[2].title,
     /^code_review_1_npm_tests_astra, gpt-6-astra, session 01a1535a-e7c6-7cc3-a9aa-9552803efb51\. \$[0-9.]+, \d+% of delegated work\.$/,
   );
+});
+
+// Each delegated model group reads as the last word of its model name that is not a number,
+// most expensive first. Past two groups the line counts the rest, and the title names them all.
+test('the session and turn heroes name the model of each delegated group', () => {
+  const main = { ...sonnetPart, model: 'claude-opus-5-5', usage: tokenUsage({ requests: 4, input: 40_000 }) };
+  const child = (scopeId: string | undefined, model: string, output: number) => ({
+    ...sonnetPart,
+    role: 'delegated' as const,
+    ...(scopeId ? { scopeId } : {}),
+    model,
+    ...(model.startsWith('gpt') ? { agent: 'codex' as const, provider: 'openai' } : {}),
+    usage: tokenUsage({ requests: 2, input: 10_000, output }),
+  });
+  const hero = (parts: SessionCostUsage[]) => sessionCostProjection(parts).stats[0].detailList!.cost!.delegated!;
+  const sonnets = hero([
+    main,
+    child('agent-1', 'claude-sonnet-5-5', 5_000),
+    child('agent-2', 'claude-sonnet-5-5-20261001', 6_000),
+  ]);
+  assert.equal(sonnets.model, '2 × sonnet');
+  const five = hero([
+    main,
+    child('agent-1', 'claude-sonnet-5-5', 900_000),
+    child('agent-2', 'claude-sonnet-5-5', 900_000),
+    child('agent-3', 'claude-opus-5-5', 600_000),
+    child('agent-4', 'claude-haiku-5-5', 1_000),
+    child('agent-5', 'gpt-6.1-sol', 2_000),
+    child('agent-6', 'gpt-6-astra', 3_000),
+  ]);
+  assert.equal(five.model, '2 × sonnet, 1 × opus, +3 models');
+  // The per-child model list names every group once.
+  for (const model of ['2 sonnet-5-5 children', '1 opus-5-5 child', '1 haiku-5-5 child', 'sol child', 'astra child']) {
+    assert.ok(five.title.includes(model), `the title leaves out ${model}: ${five.title}`);
+  }
+  assert.doesNotMatch(five.title, / × /, 'the title names the children twice');
+  // A child with two models adds each model's dollars to its own group.
+  const mixed = hero([
+    main,
+    child('agent-1', 'claude-sonnet-5-5', 900_000),
+    child('agent-1', 'claude-haiku-5-5', 1_000),
+    child('agent-2', 'claude-opus-5-5', 200_000),
+  ]);
+  assert.equal(mixed.model, '1 × sonnet, 1 × opus, +1 model');
+  // Delegated work without a child scope is no child session of its own.
+  assert.match(five.title, /, 6 child sessions, /);
+  const unscoped = hero([
+    main,
+    child('agent-1', 'claude-sonnet-5-5', 5_000),
+    child(undefined, 'claude-sonnet-5-5', 5_000),
+    child(undefined, 'claude-haiku-5-5', 5_000),
+  ]);
+  assert.match(unscoped.title, /, 1 child session and other delegated work, /);
+  assert.equal(unscoped.model, '1 × sonnet, haiku');
+  // A folded line names a group that only unscoped work holds in the title's group list.
+  const folded = hero([
+    main,
+    child('agent-1', 'claude-sonnet-5-5', 900_000),
+    child('agent-2', 'claude-opus-5-5', 200_000),
+    child(undefined, 'claude-haiku-5-5', 1_000),
+  ]);
+  assert.equal(folded.model, '1 × sonnet, 1 × opus, +1 model');
+  assert.match(folded.title, /\. 1 × sonnet, 1 × opus, haiku\. /);
+  const none = hero([main, child(undefined, 'claude-sonnet-5-5', 5_000)]);
+  assert.match(none.title, /, no child session recorded, /);
+  assert.equal(none.model, 'sonnet');
+  // Two invocations that resume one child session hold two scopes, and the child counts once.
+  const resumed = hero([
+    main,
+    { ...child('invocation:c1:S', 'claude-sonnet-5-5', 900_000), linkedSessionId: 'S' },
+    { ...child('invocation:c2:S', 'claude-sonnet-5-5', 900_000), linkedSessionId: 'S' },
+    child('agent-2', 'claude-opus-5-5', 200_000),
+    child(undefined, 'claude-haiku-5-5', 1_000),
+  ]);
+  assert.equal(resumed.model, '1 × sonnet, 1 × opus, +1 model');
+  assert.match(resumed.title, /, 2 child sessions and other delegated work, /);
+  assert.match(resumed.title, /\. 1 × sonnet, 1 × opus, haiku\. 1 sonnet-5-5 child \$[0-9.]+, 1 opus-5-5 child /);
+  // The turn hero ranks its groups by each subagent's price, not by how many children they hold.
+  const priced = (model: string, recordedCost: number) =>
+    agent({ model, spendFound: true, spend: [{ model, recordedCost, costBasis: 'list', usage: tokenUsage({}) }] });
+  const turnHero = toCard(
+    turn({
+      model: 'claude-opus-5-5',
+      usage: main.usage,
+      usageParts: [main],
+      agents: [
+        priced('claude-sonnet-5-5', 1),
+        priced('claude-sonnet-5-5', 1),
+        priced('claude-haiku-5-5', 0.5),
+        priced('claude-haiku-5-5', 0.5),
+        priced('claude-opus-5-5', 9),
+      ],
+    }),
+    false,
+    NOW,
+  ).chips.find((chip) => chip.metric === 'cost')!.detailList!.cost!.delegated!;
+  assert.equal(turnHero.model, '1 × opus, 2 × sonnet, +1 model');
+  assert.match(turnHero.title, /, 5 child sessions\. 1 × opus, 2 × sonnet, 2 × haiku$/);
 });
 
 test('wait warning fixture signs the turn and session cost figures under a quarter of the session total', () => {
@@ -6415,7 +6516,7 @@ test('the turn hero counts a child once when one turn holds its launch row and i
     ],
   });
   assert.match(heroOf(resumed).delegated!.title, /, 1 child session$/);
-  assert.equal(heroOf(resumed).delegated!.model, '1 × 5', 'the count agrees with the model counts');
+  assert.equal(heroOf(resumed).delegated!.model, '1 × haiku', 'the count agrees with the model counts');
   const two = turn({
     ...main,
     agents: [
@@ -6432,7 +6533,7 @@ test('the turn hero counts a dispatched session once when a row or another share
   const named = turn({ ...main, agents: [agent({ id: 'child', description: 'Planner', spendFound: true, spend })] });
   const hero = heroOf(named, [dispatchedCost()]);
   assert.match(hero.delegated!.title, /, 1 child session$/, 'a row and a share of one session read as two');
-  assert.equal(hero.delegated!.model, '1 × 5');
+  assert.equal(hero.delegated!.model, '1 × haiku');
   assert.match(heroOf(turn(main), [dispatchedCost(), dispatchedCost()]).delegated!.title, /, 1 child session$/);
   assert.match(
     heroOf(named, [dispatchedCost({ sessionId: 'other' })]).delegated!.title,
