@@ -9161,20 +9161,7 @@ export class PanelProvider implements vscode.Disposable {
       generation = selectedOnly ? this.refreshGeneration : ++this.refreshGeneration;
       controller = new AbortController();
       if (!selectedOnly) {
-        const inFlight = controller;
-        this.refreshController = inFlight;
-        this.refreshOverdue = false;
-        if (this.refreshDeadline) {
-          clearTimeout(this.refreshDeadline);
-        }
-        this.refreshDeadline = setTimeout(() => {
-          this.refreshDeadline = null;
-          if (this.refreshController !== inFlight) {
-            return;
-          }
-          this.refreshOverdue = true;
-          this.runPendingRefresh();
-        }, CATALOG_REFRESH_DEADLINE_MS);
+        this.claimCatalogRefresh(controller);
       }
       const catalogStarted = performance.now();
       const deferredWalk = { needed: false };
@@ -9292,7 +9279,10 @@ export class PanelProvider implements vscode.Disposable {
               (held.refreshAt !== null && held.refreshAt <= Date.now()))
           );
         });
-      if ((!reuseCatalog || dispatchChanged || this.dispatchDiscoveryPending) && !selectedOnly) {
+      // A complete reply that a discovery continuation applied waits for this refresh to accept it. A refresh that reuses the
+      // catalog accepts it before it sends another request, as the refresh that received the reply would have.
+      const replyHeld = reuseCatalog && this.discoveryComplete?.scope === JSON.stringify(this.repositoryScopeRoots);
+      if (!selectedOnly && (!reuseCatalog || (!replyHeld && (dispatchChanged || this.dispatchDiscoveryPending)))) {
         this.startupHistory?.stage('relationshipsStarted');
         const discovered = await this.prepareClaudeChildren(generation, controller.signal, humanPromptWork);
         if (!discovered || controller.signal.aborted || generation !== this.refreshGeneration) {
@@ -9828,27 +9818,108 @@ export class PanelProvider implements vscode.Disposable {
       }
       console.warn('Arc: session reading failed.', error);
     } finally {
-      const owned = !selectedOnly && controller !== null && this.refreshController === controller;
-      if (owned) {
-        this.refreshController = null;
-        if (this.refreshDeadline) {
-          clearTimeout(this.refreshDeadline);
-          this.refreshDeadline = null;
-        }
-      }
+      const owned = !selectedOnly && controller !== null && this.releaseCatalogRefresh(controller);
       this.performanceCounters.recordRefresh(refreshReason, performance.now() - refreshStarted);
       this.health?.observe('refresh', performance.now() - refreshStarted);
       // Run triggers retained during opening reads even when refresh ended before acquiring its controller.
       if (owned || (primed && !this.refreshController)) {
         this.runPendingRefresh();
-        if (
-          owned &&
-          this.dispatchDiscoveryPending &&
-          this.startupFailureGeneration !== this.refreshGeneration &&
-          this.anyVisible()
-        ) {
-          setTimeout(() => this.refreshFrom('dispatch-discovery', false, true), 0);
-        }
+        if (owned) this.scheduleDiscoveryContinuation();
+      }
+    }
+  }
+
+  // The catalog refresh slot. A catalog refresh requested while the slot is held waits behind its holder, and a holder
+  // past the deadline is abandoned for the waiting request.
+  private claimCatalogRefresh(controller: AbortController): void {
+    this.refreshController = controller;
+    this.refreshOverdue = false;
+    if (this.refreshDeadline) {
+      clearTimeout(this.refreshDeadline);
+    }
+    this.refreshDeadline = setTimeout(() => {
+      this.refreshDeadline = null;
+      if (this.refreshController !== controller) {
+        return;
+      }
+      this.refreshOverdue = true;
+      this.runPendingRefresh();
+    }, CATALOG_REFRESH_DEADLINE_MS);
+  }
+
+  // True when the controller still held the slot, which an abandoned holder no longer does.
+  private releaseCatalogRefresh(controller: AbortController): boolean {
+    if (this.refreshController !== controller) return false;
+    this.refreshController = null;
+    if (this.refreshDeadline) {
+      clearTimeout(this.refreshDeadline);
+      this.refreshDeadline = null;
+    }
+    return true;
+  }
+
+  private scheduleDiscoveryContinuation(): void {
+    if (
+      this.dispatchDiscoveryPending &&
+      this.startupFailureGeneration !== this.refreshGeneration &&
+      this.anyVisible()
+    ) {
+      setTimeout(() => void this.continueDiscovery(), 0);
+    }
+  }
+
+  // Sends the next discovery slice from the held catalog and the previous reply's cursor, without a catalog refresh. The
+  // slice holds the catalog refresh slot, so a refresh requested meanwhile waits behind it. A catalog refresh follows only
+  // when the reply completed discovery or changed the listed sessions, and it keeps the `dispatch-discovery` reason.
+  private async continueDiscovery(): Promise<void> {
+    if (
+      !this.dispatchDiscoveryPending ||
+      this.startupFailureGeneration === this.refreshGeneration ||
+      !this.anyVisible()
+    )
+      return;
+    // The holder of the slot sends discovery itself or schedules the next continuation when it ends. A request queued
+    // behind it would run as one more catalog refresh after every slice.
+    if (this.refreshController) return;
+    if (this.codexPriming || !this.catalog || !this.repositoryScopeReady) {
+      this.refreshFrom('dispatch-discovery', false, true);
+      return;
+    }
+    const started = performance.now();
+    // The slice keeps the refresh generation, so a selection refresh in flight stays current. A catalog refresh that
+    // replaces the slice moves the generation, and the slice's reply is then obsolete.
+    const generation = this.refreshGeneration;
+    const controller = new AbortController();
+    this.claimCatalogRefresh(controller);
+    let refresh = false;
+    try {
+      const discovered = await this.prepareClaudeChildren(generation, controller.signal);
+      // An incomplete reply lists the accepted sessions, and adds a session this panel started once its source qualifies.
+      const accepted = new Set((this.authoritativeCatalog ?? []).map((session) => session.file));
+      const listed = this.catalog?.sessions ?? [];
+      refresh =
+        discovered &&
+        !controller.signal.aborted &&
+        generation === this.refreshGeneration &&
+        (this.discoveryComplete !== undefined ||
+          listed.length !== accepted.size ||
+          listed.some((session) => !accepted.has(session.file)));
+    } catch (error) {
+      // An abandoned slice's controller is aborted.
+      if (!controller.signal.aborted) {
+        this.failSessionLoading(generation, controller.signal);
+      }
+      console.warn('Arc: session reading failed.', error);
+    } finally {
+      const owned = this.releaseCatalogRefresh(controller);
+      this.performanceCounters.recordRefresh('discovery-continuation', performance.now() - started);
+      if (owned && refresh) {
+        // The follow-up refresh accepts the reply before a waiting request can send another, and the waiting request runs
+        // when it ends.
+        this.refreshFrom('dispatch-discovery', false, true);
+      } else if (owned) {
+        this.runPendingRefresh();
+        this.scheduleDiscoveryContinuation();
       }
     }
   }

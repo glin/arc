@@ -1349,7 +1349,18 @@ function harness(pendingRefresh = false, registerRefreshHandler = true, extraMet
   if (pendingRefresh) {
     methods.push('refresh');
   }
-  methods.push('refreshFrom', 'refreshAs');
+  methods.push(
+    'refreshFrom',
+    'refreshAs',
+    'claimCatalogRefresh',
+    'releaseCatalogRefresh',
+    'scheduleDiscoveryContinuation',
+    'continueDiscovery',
+    'claimCatalogRefresh',
+    'releaseCatalogRefresh',
+    'scheduleDiscoveryContinuation',
+    'continueDiscovery',
+  );
   methods.push(...extraMethods);
   const body = owner.members
     .filter((member) => member.name && methods.includes(member.name.getText(file)))
@@ -1543,6 +1554,10 @@ function completeDiscoveryHarness(
     'rowSender',
     'refreshFrom',
     'refreshAs',
+    'claimCatalogRefresh',
+    'releaseCatalogRefresh',
+    'scheduleDiscoveryContinuation',
+    'continueDiscovery',
     'runPendingRefresh',
     'abandonCatalogRefresh',
     'drainInitialCatalogRefresh',
@@ -2052,6 +2067,10 @@ function selectedWindowHarness(
     'acceptJointSplitWindow',
     'refreshFrom',
     'refreshAs',
+    'claimCatalogRefresh',
+    'releaseCatalogRefresh',
+    'scheduleDiscoveryContinuation',
+    'continueDiscovery',
     ...extra,
     // evictCache calls pruneDerivedTitles.
     ...(extra.includes('evictCache') ? ['pruneDerivedTitles'] : []),
@@ -3630,9 +3649,13 @@ test('a started Codex session publishes its name and recorded responses while re
     },
     stop: () => worker.stop(),
   };
+  // The selected window read posts the selected row and its cards in a selection message, and a catalog refresh in a render.
   const drawn = (count: number) =>
     provider.messages.findLast(
-      (message: any) => message.type === 'render' && message.showing === id && message.cards?.length === count,
+      (message: any) =>
+        (message.type === 'render' || message.type === 'selection') &&
+        message.showing === id &&
+        message.cards?.length === count,
     );
   const first =
     '<p>First <strong>answer</strong> with a <a href="#" data-link="https://example.com">link</a></p>\n<ul>\n<li>one item</li>\n</ul>\n';
@@ -12587,6 +12610,87 @@ test('the startup record counts a complete discovery reply that asks for another
   }
   const { continuations, publications } = counters.snapshot().discovery;
   assert.deepEqual({ continuations, publications }, { continuations: 2, publications: 1 });
+});
+
+test('incomplete discovery replies continue without a catalog refresh, and the complete reply refreshes once', async () => {
+  vi.useFakeTimers();
+  try {
+    const { provider, discovery } = exhaustedLoadingHarness();
+    const counters = new PanelPerformanceCounters(1000);
+    provider.performanceCounters = counters;
+    const run = provider.progressiveWorker.run;
+    let replies = 0;
+    provider.progressiveWorker.run = async (request: ProgressiveRequest, generation: number, signal: AbortSignal) => {
+      if (request.kind !== 'claude-children') return run(request, generation, signal);
+      discovery.pending = ++replies <= 10;
+      // A poll waits behind the first refresh and runs when it ends, so a continuation falls due while the poll holds the slot.
+      if (replies === 1) provider.refreshFrom('poll', false, true);
+      const reply = await run(request, generation, signal);
+      // A worker reply arrives as a task of its own, after the continuations already due.
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      return reply;
+    };
+    provider.refreshFrom('startup', true);
+    const settled = () =>
+      counters.snapshot().discovery.publications === 1 &&
+      provider.refreshController === null &&
+      provider.discoveryComplete === undefined;
+    // Each step runs the timers due and the work they release. The step bound is the test's deadline.
+    for (let step = 0; step < 500 && !settled(); step++) await vi.advanceTimersByTimeAsync(1);
+    assert.ok(settled(), 'discovery never completed, or no refresh accepted the complete reply');
+    const { discovery: counted, refreshes, refreshStages } = counters.snapshot();
+    assert.equal(refreshStages.abandoned, 0, 'a refresh reached its deadline');
+    assert.equal(counted.continuations, 10);
+    assert.equal(
+      refreshes['dispatch-discovery']?.count,
+      1,
+      'incomplete replies refreshed the whole catalog, or the complete reply did not refresh it',
+    );
+    // The follow-up refresh accepts the complete reply without asking discovery again.
+    assert.equal(replies, 11);
+    assert.equal(provider.dispatchDiscoveryPending, false);
+  } finally {
+    vi.clearAllTimers();
+    vi.useRealTimers();
+  }
+});
+
+test('a continuation that receives a complete reply asking for another pass lists its sessions before the next pass', async () => {
+  vi.useFakeTimers();
+  try {
+    const { provider, discovery, settled } = exhaustedLoadingHarness();
+    const found = {
+      file: 'codex-found.jsonl',
+      sessionId: 'codex-found',
+      agent: 'codex',
+      activity: 70,
+      size: 1,
+      mtimeMs: 1,
+    };
+    provider.titles.set(found.file, settled(found));
+    // A refresh that reuses the catalog lists the held rows, which a complete reply replaced with its own.
+    provider.allSessions = () => provider.catalog.sessions;
+    const run = provider.progressiveWorker.run;
+    let replies = 0;
+    provider.progressiveWorker.run = async (request: ProgressiveRequest, generation: number, signal: AbortSignal) => {
+      // The second reply completes and asks for another pass. Every later pass stays incomplete.
+      discovery.pending = ++replies !== 2;
+      discovery.continuation = true;
+      // A walk requested meanwhile waits behind the slice.
+      if (replies === 2) provider.refreshFrom('poll');
+      const reply = await run(request, generation, signal);
+      return replies === 2 ? { ...reply, value: { ...reply.value, roots: [...provider.partial, found] } } : reply;
+    };
+    provider.refreshFrom('startup', true);
+    const listed = () => provider.authoritativeCatalog?.some((session: SessionFile) => session.file === found.file);
+    const passedOn = () => replies > 3 && listed();
+    for (let step = 0; step < 500 && !passedOn(); step++) await vi.advanceTimersByTimeAsync(1);
+    assert.ok(replies > 3, 'discovery stopped after the complete reply');
+    assert.ok(listed(), 'the complete reply was replaced by the next pass before the catalog listed its sessions');
+  } finally {
+    vi.clearAllTimers();
+    vi.useRealTimers();
+  }
 });
 
 test('current discovery failures are explicit before and after catalog publication while obsolete work stays silent', async () => {
