@@ -42,6 +42,8 @@ Commit rows retain their recorded branch or detached HEAD. Equal subjects and st
 
 ## Context menus and copy
 
+Keyboard copy of selected timeline text runs in the panel before VS Code restores its last focused control. The browser supplies native clipboard formats. Editable controls and empty selections retain native command routing. A refused panel copy also retains native command routing.
+
 ### Native context and menu order
 
 Menu enablement reads the invoking turn card, session heading, session list row, file link, or summary link's context. Editor selection elsewhere supplies no target. Route commands to the panel that opened the menu.

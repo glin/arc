@@ -1,6 +1,6 @@
 // The panel page owner. It runs in the webview with browser ports supplied by bootstrap.ts.
 // The packaged entry bundles this module into the inline script served by panelhost.ts.
-import { markdownOf, nextId, placeFloat as placeFloatInView } from './dom.ts';
+import { editableTarget, markdownOf, nextId, placeFloat as placeFloatInView } from './dom.ts';
 import type { PanelDom } from './dom.ts';
 import { createHints } from './hints.ts';
 import { createNavigation } from './navigation.ts';
@@ -100,6 +100,45 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
   const vscode = Object.freeze({ postMessage: kernel.sendToHost });
   const onDocument = kernel.events.document;
   const onWindow = kernel.events.window;
+  onDocument('keydown', (raw) => {
+    const event = raw as KeyboardEvent;
+    const copyModifier = /^Mac/.test(navigator.platform)
+      ? event.metaKey && !event.ctrlKey
+      : event.ctrlKey && !event.metaKey;
+    if (
+      event.defaultPrevented ||
+      event.isComposing ||
+      event.keyCode === 229 ||
+      event.key.toLowerCase() !== 'c' ||
+      !copyModifier ||
+      event.altKey ||
+      event.shiftKey ||
+      editableTarget(event.target) ||
+      editableTarget(document.activeElement)
+    )
+      return;
+    const selection = document.getSelection();
+    if (
+      !selection ||
+      selection.isCollapsed ||
+      !selection.toString() ||
+      !list.contains(selection.anchorNode) ||
+      !list.contains(selection.focusNode)
+    )
+      return;
+    // Copy before VS Code restores the previously focused control and clears the timeline selection.
+    // The browser supplies native clipboard formats. A refused copy retains the host's command route.
+    let copied = false;
+    try {
+      copied = document.execCommand('copy');
+    } catch {
+      return;
+    }
+    if (copied) {
+      event.preventDefault();
+      event.stopPropagation();
+    }
+  });
   // All subscribed ages and durations share one panel clock.
   const clock = createClock({ document });
   // Shares the content-search owner between host-message dispatch and timeline rendering.

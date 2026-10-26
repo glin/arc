@@ -206,8 +206,8 @@
   },
   "extension/src/timeline-renderer.browser.test.ts": {
     "reason": "Production timeline rendering must preserve native disclosure, selection, navigation, and accessible interaction.",
-    "cases": 72,
-    "matricesSha256": "9225fb7a7d8d853d62fa37091f02d5fa0db425ed2f9cc20bcaa8bab5ea129d9b"
+    "cases": 73,
+    "matricesSha256": "3f6311cd47f65c684787f721f9a21e2c11ff0c7e9492cb0fa8d5ac9c46db38d0"
   },
   "extension/src/timelinecheck.test.ts": {
     "reason": "Npm and extension-directory invocations must inspect the caller project through the real command environment.",

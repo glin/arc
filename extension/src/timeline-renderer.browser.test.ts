@@ -14,6 +14,186 @@ import { createCodexSessionReducer } from './codex.ts';
 import { renderRichMarkdown } from './richtext.ts';
 import { SESSION_LINK_RESPONSE, turn } from './turnfixtures.ts';
 
+test('timeline copy retains selected text after prompt focus through native copy routing', async (t) => {
+  const browser = await browserOrNone();
+  if (!browser) {
+    t.skip('A browser is required');
+    return;
+  }
+  const page = await browser.newPage();
+  try {
+    await page.setContent(themed(pageHtml()));
+    const payload = renderPayload() as Payload;
+    payload.cards = [payload.cards[0]];
+    payload.cards[0].summaryHtml = '<p>Selected response text for copying.</p>';
+    await post(page, payload);
+    await page.locator('.turn .head').click();
+    await page.evaluate(() => {
+      let lastFocused: HTMLElement | null = null;
+      document.addEventListener('focusin', () => {
+        const active = document.activeElement;
+        if (active instanceof HTMLElement && active !== document.body && active !== document.documentElement) {
+          lastFocused = active;
+        }
+      });
+      // VS Code restores its last focused control before delivering a native editing command.
+      window.addEventListener('keydown', (event) => {
+        if (event.key !== 'c' || !(event.ctrlKey || event.metaKey)) return;
+        document.body.dataset.hostCopies = String(Number(document.body.dataset.hostCopies ?? 0) + 1);
+        if (document.activeElement === document.body && lastFocused?.isConnected) {
+          lastFocused.focus({ preventScroll: true });
+        }
+        document.execCommand('copy');
+        event.preventDefault();
+      });
+      document.addEventListener('copy', (event) => {
+        const active = document.activeElement;
+        const text =
+          active instanceof HTMLTextAreaElement
+            ? active.value.slice(active.selectionStart, active.selectionEnd)
+            : getSelection()?.toString();
+        document.body.dataset.copied = text ?? '';
+        event.preventDefault();
+      });
+    });
+    for (const [platform, modifier] of [
+      ['Win32', 'Control'],
+      ['Linux x86_64', 'Control'],
+      ['MacIntel', 'Meta'],
+    ]) {
+      await page.evaluate(
+        (platform) => Object.defineProperty(navigator, 'platform', { configurable: true, value: platform }),
+        platform,
+      );
+      await page.locator('#prompt').fill('Editable prompt text');
+      await page.locator('#prompt').click();
+      await page.locator('.turn .summary p').evaluate((node) => {
+        (document.activeElement as HTMLElement).blur();
+        const range = document.createRange();
+        range.selectNodeContents(node);
+        getSelection()!.removeAllRanges();
+        getSelection()!.addRange(range);
+        delete document.body.dataset.copied;
+        delete document.body.dataset.hostCopies;
+      });
+      await page.keyboard.press(`${modifier}+c`);
+      assert.equal(await page.locator('body').getAttribute('data-copied'), 'Selected response text for copying.');
+      assert.equal(await page.evaluate(() => getSelection()?.toString()), 'Selected response text for copying.');
+      assert.equal(await page.evaluate(() => document.activeElement === document.body), true);
+      assert.equal(await page.locator('body').getAttribute('data-host-copies'), null);
+      await page.locator('#prompt').focus();
+      await page.locator('#prompt').evaluate((node: HTMLTextAreaElement) => node.setSelectionRange(0, 8));
+      await page.keyboard.press(`${modifier}+c`);
+      assert.equal(await page.locator('body').getAttribute('data-copied'), 'Editable');
+    }
+    const excluded = [
+      { name: 'Windows Command', platform: 'Win32', metaKey: true },
+      { name: 'Linux Command', platform: 'Linux x86_64', metaKey: true },
+      { name: 'macOS Control', platform: 'MacIntel', ctrlKey: true },
+      { name: 'both modifiers', ctrlKey: true, metaKey: true },
+      { name: 'Shift', shiftKey: true },
+      { name: 'Alt', altKey: true },
+      { name: 'composition', isComposing: true },
+      { name: 'composition key code', keyCode: 229 },
+      { name: 'handled', handled: true },
+      { name: 'empty', selection: 'empty' },
+      { name: 'collapsed', selection: 'collapsed' },
+      { name: 'textless', selection: 'textless' },
+      { name: 'outside anchor', selection: 'outside-anchor' },
+      { name: 'outside focus', selection: 'outside-focus' },
+      { name: 'editable focus', editableFocus: true },
+      { name: 'editable target', editableTarget: true },
+    ];
+    for (const row of excluded) {
+      const result = await page.evaluate((row) => {
+        Object.defineProperty(navigator, 'platform', { configurable: true, value: row.platform ?? 'Win32' });
+        const prompt = document.querySelector<HTMLTextAreaElement>('#prompt')!;
+        prompt.focus();
+        if (!row.editableFocus) prompt.blur();
+        const text = document.querySelector('.turn .summary p')!;
+        const selection = getSelection()!;
+        selection.removeAllRanges();
+        const range = document.createRange();
+        range.selectNodeContents(text);
+        if (row.selection === 'collapsed') range.collapse(true);
+        if (row.selection === 'textless') {
+          const empty = document.createElement('span');
+          text.append(empty);
+          range.selectNode(empty);
+        }
+        if (row.selection !== 'empty') selection.addRange(range);
+        if (row.selection === 'outside-focus') selection.extend(document.querySelector('#rail')!, 0);
+        if (row.selection === 'outside-anchor') {
+          selection.setBaseAndExtent(document.querySelector('#rail')!, 0, text, 1);
+        }
+        delete document.body.dataset.hostCopies;
+        let copies = 0;
+        const original = document.execCommand;
+        document.execCommand = () => {
+          copies++;
+          return true;
+        };
+        try {
+          const event = new KeyboardEvent('keydown', {
+            key: 'c',
+            ctrlKey: !row.metaKey,
+            bubbles: true,
+            cancelable: true,
+            ...row,
+          });
+          if (row.handled) event.preventDefault();
+          (row.editableTarget ? prompt : text).dispatchEvent(event);
+          return { copies, hostCopies: document.body.dataset.hostCopies };
+        } finally {
+          document.execCommand = original;
+        }
+      }, row);
+      assert.deepEqual(result, { copies: 1, hostCopies: '1' }, row.name);
+    }
+    await page.evaluate(() => Object.defineProperty(navigator, 'platform', { configurable: true, value: 'MacIntel' }));
+    await page.locator('.turn .summary p').evaluate((node) => {
+      (document.activeElement as HTMLElement).blur();
+      const range = document.createRange();
+      range.selectNodeContents(node);
+      getSelection()!.removeAllRanges();
+      getSelection()!.addRange(range);
+      delete document.body.dataset.hostCopies;
+      const copy = document.execCommand.bind(document);
+      let refused = false;
+      document.execCommand = (...args) => {
+        if (!refused) {
+          refused = true;
+          return false;
+        }
+        return copy(...args);
+      };
+    });
+    await page.keyboard.press('Meta+c');
+    assert.equal(await page.locator('body').getAttribute('data-host-copies'), '1');
+    await page.locator('.turn .summary p').evaluate((node) => {
+      (document.activeElement as HTMLElement).blur();
+      const range = document.createRange();
+      range.selectNodeContents(node);
+      getSelection()!.removeAllRanges();
+      getSelection()!.addRange(range);
+      delete document.body.dataset.hostCopies;
+      const copy = document.execCommand.bind(document);
+      let failed = false;
+      document.execCommand = (...args) => {
+        if (!failed) {
+          failed = true;
+          throw new Error('Copy unavailable');
+        }
+        return copy(...args);
+      };
+    });
+    await page.keyboard.press('Meta+c');
+    assert.equal(await page.locator('body').getAttribute('data-host-copies'), '1');
+  } finally {
+    await browser.close();
+  }
+});
+
 test('response citations retain literal destinations through mouse, keyboard and streamed card updates', async (t) => {
   const browser = await browserOrNone();
   if (!browser) {
