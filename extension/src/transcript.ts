@@ -4165,8 +4165,10 @@ export function extendRelationshipEvidence(evidence: RelationshipDigest, bytes: 
 }
 
 // Every returned filesystem byte enters the request meter before any later operation can fail.
+// `revalidationBytes` is the part of `readBytes` that re-hashes an accepted prefix.
 export interface RelationshipReadMeter {
   readBytes: number;
+  revalidationBytes?: number;
   size?: number;
   onRead?: (bytes: Buffer, offset: number) => void;
 }
@@ -4245,6 +4247,7 @@ export class RelationshipReader {
           ? remaining
           : Math.floor(available / RELATIONSHIP_BLOCK_BYTES) * RELATIONSHIP_BLOCK_BYTES;
       const bytes = this.read(comparison.digest.offset, Math.min(RELATIONSHIP_READ_BYTES, remaining, allowance));
+      if (this.meter) this.meter.revalidationBytes = (this.meter.revalidationBytes ?? 0) + bytes.length;
       if (!bytes.length) break;
       for (let at = 0; at < bytes.length; at += RELATIONSHIP_BLOCK_BYTES) {
         if (at > 0 && (this.cancelled() || performance.now() >= this.deadline)) break;

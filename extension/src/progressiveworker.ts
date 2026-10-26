@@ -267,6 +267,7 @@ export function validDiscoveryCheckpoint(value: unknown): value is DiscoveryChec
 }
 
 // `readBytes` counts transcript and receipt relationship bytes. Receipt bytes also have a separate subtotal.
+// `revalidationBytes` is the subtotal that re-hashes a transcript prefix a previous scan accepted.
 // A parent check counts every stat of a candidate source. A file count names each file once per measured pass.
 // The dispatch visit count includes sessions whose held facts read nothing. The reread count excludes them.
 // Times are wall milliseconds.
@@ -275,6 +276,7 @@ export interface DiscoveryCharges extends Record<import('./codex').CodexDispatch
   receiptEntries?: number;
   receiptChecks?: number;
   receiptBytes?: number;
+  revalidationBytes?: number;
   hits: number;
   resets: number;
   quanta: number;

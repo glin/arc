@@ -990,6 +990,65 @@ test('a new Claude session reaches a complete cut beside parent growth with boun
   }
 });
 
+test('a reloaded worker charges a grown transcript prefix to revalidation and its new tail to reads', async () => {
+  const directory = tempDir('claude-revalidation-bytes-');
+  const file = path.join(directory, 'parent.jsonl');
+  fs.writeFileSync(file, '{"type":"ignored","padding":"' + 'x'.repeat(20000) + '"}\n');
+  const session = () => {
+    const stat = revisionOf(fs.statSync(file, { bigint: true }));
+    return { file, agent: 'claude' as const, sessionId: 'parent', size: stat.size, mtimeMs: stat.mtimeMs };
+  };
+  const first = new ProgressiveWorker(source);
+  // A fixed clock keeps every pass inside its time slice, so the byte totals do not depend on machine speed.
+  const reloaded = new ProgressiveWorker('performance.now = () => 0;' + source);
+  try {
+    const found = await completeDiscovery(
+      first,
+      { kind: 'claude-children', parents: [session()], repositoryRoots: [directory] },
+      1,
+      new AbortController().signal,
+    );
+    assert.ok(found?.value.kind === 'claude-children');
+    assert.equal(found.value.charges!.revalidationBytes, 0, 'a first scan charged revalidation');
+    const accepted = found.value.referenceEntries[0][1].claudeCursor!.offset;
+    assert.equal(accepted, fs.statSync(file).size);
+    const tail = '{"type":"ignored","tail":true}\n';
+    fs.appendFileSync(file, tail);
+    let entries = found.value.referenceEntries;
+    let checkpoint: import('./progressiveworker').DiscoveryCheckpoint | undefined;
+    let readBytes = 0;
+    let revalidationBytes = 0;
+    for (let pass = 0; pass < 30; pass++) {
+      const result = await reloaded.run(
+        {
+          kind: 'claude-children',
+          parents: [session()],
+          repositoryRoots: [directory],
+          referenceEntries: entries,
+          discovery: checkpoint,
+        },
+        pass + 2,
+        new AbortController().signal,
+      );
+      assert.ok(
+        result && (result.value.kind === 'claude-children-progress' || result.value.kind === 'claude-children'),
+      );
+      readBytes += result.value.charges!.readBytes;
+      revalidationBytes += result.value.charges!.revalidationBytes!;
+      entries = result.value.referenceEntries;
+      if (result.value.kind === 'claude-children' && !result.value.continuation) break;
+      if (result.value.kind === 'claude-children-progress') checkpoint = result.value.checkpoint;
+    }
+    assert.equal(entries[0][1].claudeCursor!.offset, accepted + tail.length, 'the grown transcript never completed');
+    assert.equal(revalidationBytes, accepted, 'the accepted prefix was not charged to revalidation');
+    assert.equal(readBytes - revalidationBytes, tail.length, 'the new tail was not charged to reads');
+  } finally {
+    first.stop();
+    reloaded.stop();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 // Recovery must preserve unmatched launches, not just rediscover an empty source.
 test('acknowledged Claude discovery resumes after worker restart while metadata remains serviceable', async () => {
   const directory = tempDir('claude-discovery-restart-');

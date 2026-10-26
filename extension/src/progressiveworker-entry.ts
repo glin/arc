@@ -415,6 +415,7 @@ async function execute(
       receiptEntries: 0,
       receiptChecks: 0,
       receiptBytes: 0,
+      revalidationBytes: 0,
       hits: 0,
       resets: 0,
       quanta: 0,
