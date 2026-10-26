@@ -39956,6 +39956,7 @@ test('the query context revision is short and follows the discovery and catalog 
   provider.sessionReadDiscoveryRevision = sessionCatalogMembership(scope, sources.slice(1));
   assert.notEqual(revision(), complete, 'a different discovery membership kept the revision');
   provider.sessionReadDiscoveryRevision = proven;
+  assert.equal(revision(), complete);
   provider.authoritativeCatalog = sources.slice(1);
   const smaller = revision();
   assert.notEqual(smaller, complete, 'a different catalog membership kept the revision');
