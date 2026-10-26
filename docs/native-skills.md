@@ -1,4 +1,4 @@
-﻿# Session skills and snapshot hooks
+# Session skills and snapshot hooks
 
 [Session guidance](arc-sessions.md#use-the-skill-in-arc) explains command names, existing skills, and disabled settings.
 

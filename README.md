@@ -33,7 +33,7 @@ codex login
 
 ### Claude hooks
 
-The Claude hooks let Arc show full file diffs. Arc loads them for Claude sessions it starts, when your settings and Node.js installation allow it. Existing hooks take priority. See [hook requirements](docs/native-skills.md#snapshot-hook-requirements) if hooks do not load.
+The Claude hooks let Arc show full file diffs. Arc loads them for Claude sessions it starts, when your settings and Node.js installation allow it. Arc does not add a second copy of its snapshot hooks. See [hook requirements](docs/native-skills.md#snapshot-hook-requirements) if hooks do not load.
 
 For Claude sessions started outside Arc, run **Arc: Set up Claude hooks** from the Command Palette or install with `--hooks`:
 
