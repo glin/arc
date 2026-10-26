@@ -36845,6 +36845,72 @@ test('row posts and watcher decisions reach the performance counters with their 
   assert.deepEqual(last?.broadReasons, ['createOrRename']);
 });
 
+// A refresh that reuses the held catalog must not walk. When it walks anyway, the counter must say why.
+
+test('a catalog refresh names why it could not reuse the held catalog', async () => {
+  const { PanelPerformanceCounters } = await import('./performancediagnostics.ts');
+  const { revisionOf } = await import('./transcript.ts');
+  const directory = tempDir('walk-reasons-');
+  const file = path.join(directory, 'listed.jsonl');
+  fs.writeFileSync(file, '{}\n');
+  const row = {
+    sessionId: 'listed',
+    file,
+    agent: 'codex',
+    activity: 1,
+    ...revisionOf(fs.statSync(file, { bigint: true })),
+  };
+  const held = () => ({ folders: 'root\u0000r1', sessions: [row] });
+  const provider = Object.create(PanelProvider.prototype) as Record<string, any>;
+  let revision = 'r1';
+  Object.assign(provider, {
+    performanceCounters: new PanelPerformanceCounters(1_000, 'window-a'),
+    repositoryScope: { snapshot: () => ({ ready: true, roots: ['root'], revision }) },
+    folders: () => ['root'],
+    publishWindowState() {},
+    activityFor: (session: { activity: number }) => session.activity,
+    catalog: held(),
+    showing: 'listed',
+  });
+  const work = () => provider.performanceCounters.snapshot().work;
+  const attempt = () => {
+    const deferWalk = { needed: false };
+    provider.allSessions(true, true, undefined, deferWalk);
+    return deferWalk.needed;
+  };
+
+  assert.equal(attempt(), false, `a selected, unchanged catalog walked: ${JSON.stringify(work())}`);
+  assert.deepEqual(work(), {});
+
+  provider.showing = null;
+  assert.equal(attempt(), true);
+  provider.showing = 'absent';
+  assert.equal(attempt(), true);
+  provider.showing = 'listed';
+  revision = 'r2';
+  assert.equal(attempt(), true);
+  revision = 'r1';
+  provider.catalog = null;
+  assert.equal(attempt(), true);
+  provider.catalog = held();
+  fs.rmSync(file);
+  assert.equal(attempt(), true);
+  fs.writeFileSync(file, '{}\n');
+  provider.catalog = held();
+  const deferWalk = { needed: false };
+  provider.allSessions(false, true, undefined, deferWalk);
+  assert.equal(deferWalk.needed, true);
+
+  assert.deepEqual(work(), {
+    'walk:noCatalog': 1,
+    'walk:noSelection': 1,
+    'walk:requested': 1,
+    'walk:scopeMoved': 1,
+    'walk:selectionMissing': 1,
+    'walk:selectionReplaced': 1,
+  });
+});
+
 test('a lost row delta, a reloaded page and an undelivered post each make the next render and session list message a snapshot', async () => {
   const triggers: Record<string, (held: Awaited<ReturnType<typeof rowDeltaProvider>>) => Promise<void>> = {
     rowsGap: async ({ provider, fixture }) => provider.onMessage({ type: 'rowsGap' }, fixture.host),

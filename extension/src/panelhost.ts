@@ -11537,6 +11537,22 @@ export class PanelProvider implements vscode.Disposable {
         return sorted;
       }
     }
+    // The held catalog could not serve this refresh. Name why, so a capture can say which cause walks.
+    this.performanceCounters?.recordWork(
+      `walk:${
+        !reuseCatalog
+          ? 'requested'
+          : !this.catalog
+            ? 'noCatalog'
+            : this.catalog.folders !== folderPrint
+              ? 'scopeMoved'
+              : !this.showing
+                ? 'noSelection'
+                : this.catalog.sessions.some((session) => session.sessionId === this.showing)
+                  ? 'selectionReplaced'
+                  : 'selectionMissing'
+      }`,
+    );
     if (deferWalk && !codexEnumeration) {
       deferWalk.needed = true;
       return [];
