@@ -36845,9 +36845,9 @@ test('row posts and watcher decisions reach the performance counters with their 
   assert.deepEqual(last?.broadReasons, ['createOrRename']);
 });
 
-// A refresh that reuses the held catalog must not walk. When it walks anyway, the counter must say why.
+// A refresh that reuses the held catalog does not walk. When it walks anyway, the counter names the cause.
 
-test('a catalog refresh names why it could not reuse the held catalog', async () => {
+test('a catalog refresh names why it does not reuse the held catalog', async () => {
   const { PanelPerformanceCounters } = await import('./performancediagnostics.ts');
   const { revisionOf } = await import('./transcript.ts');
   const directory = tempDir('walk-reasons-');
@@ -36860,7 +36860,7 @@ test('a catalog refresh names why it could not reuse the held catalog', async ()
     activity: 1,
     ...revisionOf(fs.statSync(file, { bigint: true })),
   };
-  const held = () => ({ folders: 'root\u0000r1', sessions: [row] });
+  const held = (session: Record<string, unknown> = row) => ({ folders: 'root\u0000r1', sessions: [session] });
   const provider = Object.create(PanelProvider.prototype) as Record<string, any>;
   let revision = 'r1';
   Object.assign(provider, {
@@ -36892,6 +36892,9 @@ test('a catalog refresh names why it could not reuse the held catalog', async ()
   revision = 'r1';
   provider.catalog = null;
   assert.equal(attempt(), true);
+  // The same path with another inode is a replaced file. A deleted file is a missing file.
+  provider.catalog = held({ ...row, ino: 'replaced' });
+  assert.equal(attempt(), true);
   provider.catalog = held();
   fs.rmSync(file);
   assert.equal(attempt(), true);
@@ -36906,6 +36909,7 @@ test('a catalog refresh names why it could not reuse the held catalog', async ()
     'walk:noSelection': 1,
     'walk:requested': 1,
     'walk:scopeMoved': 1,
+    'walk:selectionFileMissing': 1,
     'walk:selectionMissing': 1,
     'walk:selectionReplaced': 1,
   });

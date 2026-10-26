@@ -11514,11 +11514,13 @@ export class PanelProvider implements vscode.Disposable {
         return sorted;
       }
     }
+    let selectedFileGone = false;
     if (reuseCatalog && this.catalog && this.catalog.folders === folderPrint) {
       const held = revalidatedCatalog(this.catalog.sessions, this.showing, (file) => {
         try {
           return fileRevisionOf(fs.statSync(file, { bigint: true }));
         } catch {
+          selectedFileGone = true;
           return null;
         }
       });
@@ -11537,22 +11539,27 @@ export class PanelProvider implements vscode.Disposable {
         return sorted;
       }
     }
-    // The held catalog could not serve this refresh. Name why, so a capture can say which cause walks.
-    this.performanceCounters?.recordWork(
-      `walk:${
-        !reuseCatalog
-          ? 'requested'
-          : !this.catalog
-            ? 'noCatalog'
-            : this.catalog.folders !== folderPrint
-              ? 'scopeMoved'
-              : !this.showing
-                ? 'noSelection'
-                : this.catalog.sessions.some((session) => session.sessionId === this.showing)
-                  ? 'selectionReplaced'
-                  : 'selectionMissing'
-      }`,
-    );
+    // The held catalog does not serve this refresh. Name the cause, so a capture says which cause walks.
+    // The walk itself lists again with its enumeration and no deferral, and that re-entry is the same walk.
+    if (deferWalk || !codexEnumeration) {
+      this.performanceCounters?.recordWork(
+        `walk:${
+          !reuseCatalog
+            ? 'requested'
+            : !this.catalog
+              ? 'noCatalog'
+              : this.catalog.folders !== folderPrint
+                ? 'scopeMoved'
+                : !this.showing
+                  ? 'noSelection'
+                  : !this.catalog.sessions.some((session) => session.sessionId === this.showing)
+                    ? 'selectionMissing'
+                    : selectedFileGone
+                      ? 'selectionFileMissing'
+                      : 'selectionReplaced'
+        }`,
+      );
+    }
     if (deferWalk && !codexEnumeration) {
       deferWalk.needed = true;
       return [];
