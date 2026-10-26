@@ -1109,7 +1109,11 @@ async function execute(
           sourceGeneration,
           spendPending,
           revision,
-          tree: reference.agent === 'codex' ? childSpendRevisionKey('completed', codexVersion(), now) : tree,
+          // A tree that moved during the read keeps the tree the read started from, so the next pass reads again.
+          tree:
+            reference.agent === 'codex' && collectedTree === tree
+              ? childSpendRevisionKey('completed', codexVersion(), now)
+              : tree,
           codexDependencies,
           facts,
           refreshAt: active ? refreshAt : Number.POSITIVE_INFINITY,
