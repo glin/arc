@@ -20,7 +20,7 @@ Requires Node.js 22+ and npm. On Windows, use Git Bash. Install [Claude Code](ht
 curl -fsSL https://raw.githubusercontent.com/glin/arc/main/install.sh | bash
 ```
 
-The installer adds Arc to VS Code, VS Code Insiders, Cursor, Positron, or VSCodium. It leaves your personal skills and global Claude hooks unchanged. See [CLI installation](cli/README.md#install) for using `arc` outside VS Code.
+The installer adds Arc to VS Code, VS Code Insiders, Cursor, Positron, or VSCodium. See [CLI installation](cli/README.md#install) for using `arc` outside VS Code.
 
 After installing or updating Arc, reload VS Code and start fresh agent sessions. Use the Arc icon in the editor toolbar or **Arc: Open Arc in Editor** in the Command Palette.
 
@@ -33,7 +33,7 @@ codex login
 
 ### Claude hooks
 
-The Claude hooks let Arc show full file diffs. Arc loads them for Claude sessions it starts, when your settings and Node.js installation allow it. Arc does not add a second copy of its snapshot hooks. See [hook requirements](docs/native-skills.md#snapshot-hook-requirements) if hooks do not load.
+The Claude hooks let Arc show full file diffs. Arc loads them automatically for Claude sessions it starts.
 
 For Claude sessions started outside Arc, run **Arc: Set up Claude hooks** from the Command Palette or install with `--hooks`:
 

@@ -2,7 +2,7 @@
 
 This optional Claude Code plugin captures a file before its first edit in a session. It updates Arc's snapshot manifest when Claude stops.
 
-Arc loads this plugin for Claude sessions it starts, when your settings and Node.js installation allow it. Arc does not add a second copy of its snapshot hooks. See [hook requirements](../../docs/native-skills.md#snapshot-hook-requirements) for details. Install globally to use the hooks in Claude sessions started outside Arc.
+Arc loads this plugin automatically for Claude sessions it starts. Install globally to use the hooks in Claude sessions started outside Arc.
 
 The hooks need Node.js on the `PATH`. They write snapshots under `~/.arc/snapshots/` or `$ARC_HOME/snapshots/` when `ARC_HOME` is set. Arc still reads Claude transcripts when this plugin is absent.
 
