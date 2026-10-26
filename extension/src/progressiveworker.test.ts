@@ -11796,9 +11796,6 @@ test('dispatched spend aggregates settle across passes beside a running Codex ro
     rollout(rootId, 1, rootId !== runningId);
     for (const childId of childIds.get(rootId)!) rollout(childId, 16, true, rootId);
   }
-  const files = [...rootIds, ...[...childIds.values()].flat()].map((sessionId) =>
-    path.join(directory, sessionId + '.jsonl'),
-  );
   const session = (sessionId: string, agent: 'claude' | 'codex') => {
     const file = path.join(directory, sessionId + '.jsonl');
     return { file, sessionId, agent, ...revisionOf(fs.statSync(file, { bigint: true })) };
@@ -11866,7 +11863,7 @@ test('dispatched spend aggregates settle across passes beside a running Codex ro
     assert.equal(totals.completions, quietIds.length, JSON.stringify(totals));
     assert.ok(totals.passes <= 20, `settling took ${totals.passes} passes`);
     // Each root reads once, and the running root once more after it starts writing.
-    assert.ok(totals.rereads <= rootIds.length + 1, `${totals.rereads} rereads over ${files.length} files`);
+    assert.ok(totals.rereads <= rootIds.length + 1, `${totals.rereads} rereads over ${rootIds.length} roots`);
     const after = await worker.run(request(), 1, new AbortController().signal);
     assert.ok(after?.value.kind === 'claude-children');
     assert.equal(after.value.charges!.dispatchSpendRereads, 0);
