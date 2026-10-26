@@ -3823,6 +3823,33 @@ test('a catalog refresh admits settled sessions without a file check after a wal
     return files(await run.call(wired)).sort();
   };
   const fileChecks = () => work.filter((name) => name.startsWith('humanPromptStat:'));
+  // Discovery roots settle the same way when the discovery request sent the same rows. A complete reply returns the
+  // parents of its epoch, so a root that the request did not send at that revision is rechecked.
+  const children = methodBody('async prepareClaudeChildren(');
+  const rootsSegment = children.slice(
+    children.indexOf('const held = this.catalog?.sessions'),
+    children.indexOf('const codex = roots.filter'),
+  );
+  const admitSource = ts.transpileModule(
+    `async function admitRoots(parents, replied) {
+    const progress = { roots: replied }; const spendSources = undefined; const signal = new AbortController().signal; const generation = this.refreshGeneration;
+    const humanPromptWork = { bytes: 0, sources: 0, reads: 0, unknown: new Set() };
+    ${rootsSegment}
+    return roots;
+  }`,
+    { compilerOptions: { target: ts.ScriptTarget.ES2022 } },
+  ).outputText;
+  const admitRoots = new Function(
+    'sameSessionRevision',
+    `${admitSource}
+return admitRoots;`,
+  )(sameSessionRevision);
+  const discover = async (parents: any[], replied: any[]) => {
+    stats = 0;
+    checked.length = 0;
+    work.length = 0;
+    return files(await admitRoots.call(wired, parents, structuredClone(replied))).sort();
+  };
 
   assert.deepEqual(await poll(), [growing, kept, replaced].sort(), 'the first walk did not admit every prompt');
   assert.deepEqual(
@@ -3834,6 +3861,9 @@ test('a catalog refresh admits settled sessions without a file check after a wal
   assert.deepEqual(await poll(), [growing, kept, replaced].sort());
   assert.deepEqual(fileChecks(), [], 'a poll walk at an unchanged catalog checked a settled session');
   assert.equal(stats, 0, 'a poll walk at an unchanged catalog checked a file');
+  assert.deepEqual(await discover(listed, listed), [growing, kept, replaced].sort());
+  assert.deepEqual(fileChecks(), [], 'discovery roots at an unchanged catalog checked a settled session');
+  assert.equal(stats, 0, 'discovery roots at an unchanged catalog checked a file');
   reused = true;
   assert.deepEqual(await poll(), [growing, kept, replaced].sort());
   assert.equal(stats, 0, 'a catalog-reusing refresh checked a settled session');
@@ -3846,8 +3876,18 @@ test('a catalog refresh admits settled sessions without a file check after a wal
   assert.deepEqual([...new Set(checked)], [growing], 'a walk checked a file other than the grown one');
   assert.deepEqual(fileChecks(), Array(stats).fill('humanPromptStat:moved'), 'a grown file counted another cause');
   assert.equal(wired.humanScans.get(growing)?.source?.size, grownSize, 'the grown file kept its old revision');
+  assert.deepEqual(await discover(listed, listed), [growing, kept, replaced].sort());
+  assert.equal(stats, 0, 'discovery roots checked the grown file again after the walk that checked it');
   await poll();
   assert.equal(stats, 0, 'the walk after a grown file checked it again');
+
+  // A root from an earlier request whose file is gone stays out, although its last complete scan found a prompt.
+  const gone = row(write('gone'), 'gone');
+  assert.deepEqual(await discover([gone], [gone]), [gone.file]);
+  fs.rmSync(gone.file);
+  assert.deepEqual(await discover(listed, [...listed, gone]), [growing, kept, replaced].sort(), 'a gone root stayed');
+  assert.deepEqual([...new Set(checked)], [gone.file], 'discovery roots checked a root the request sent unchanged');
+  assert.deepEqual(fileChecks(), ['humanPromptStat:walk'], 'a root the request did not send counted another cause');
 
   // A replacement at the same path, size and time shows only in its device and inode.
   const before = revisionOf(fs.statSync(replaced, { bigint: true }));

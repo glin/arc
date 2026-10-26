@@ -12079,13 +12079,14 @@ export class PanelProvider implements vscode.Disposable {
       }
       return true;
     };
+    const parents = this.claudeParents;
     const result = await this.progressiveWorker
       .run(
         {
           kind: 'claude-children',
           codexChildren: spendSources?.children ?? this.codexSubagents,
-          parents: this.claudeParents,
-          catalog: this.claudeParents,
+          parents,
+          catalog: parents,
           repositoryRoots: this.repositoryScopeRoots,
           referenceEntries: [...this.claudeChildReferenceEntries],
           discovery: this.discoveryCheckpoint,
@@ -12168,8 +12169,40 @@ export class PanelProvider implements vscode.Disposable {
     const held = this.catalog?.sessions ?? [];
     const discoveryRoots =
       progress.roots ?? held.filter((session) => session.agent !== 'claude' || session.childTranscript !== true);
-    const roots = await this.prepareHumanPrompts(discoveryRoots, !!progress.roots, signal, humanPromptWork, generation);
+    // A complete reply returns the parents of its epoch, which an earlier request or a saved checkpoint can have sent.
+    // A root that this request sent at the same size, time, device and inode is the row the refresh listed, so its
+    // complete scan settles it. Every other root is rechecked.
+    const sent = new Map(parents.map((row) => [row.file, row]));
+    const listed = (root: SessionFile): boolean => {
+      const row = sent.get(root.file);
+      return (
+        !!row &&
+        sameSessionRevision(row, root) &&
+        String(row.dev) === String(root.dev) &&
+        String(row.ino) === String(root.ino)
+      );
+    };
+    const sizeCurrent = !!progress.roots;
+    const admittedRoots = new Set([
+      ...(await this.prepareHumanPrompts(
+        discoveryRoots.filter(listed),
+        sizeCurrent,
+        signal,
+        humanPromptWork,
+        generation,
+        undefined,
+        'skip',
+      )),
+      ...(await this.prepareHumanPrompts(
+        discoveryRoots.filter((root) => !listed(root)),
+        sizeCurrent,
+        signal,
+        humanPromptWork,
+        generation,
+      )),
+    ]);
     if (signal.aborted || generation !== this.refreshGeneration) return false;
+    const roots = discoveryRoots.filter((root) => admittedRoots.has(root));
     if (spendSources) {
       this.claudeSpendSources = spendSources.claude;
       this.codexSpendSources = spendSources.codex;
@@ -12345,7 +12378,8 @@ export class PanelProvider implements vscode.Disposable {
   // `settled` says what to do with a session whose complete scan found a prompt at the revision the catalog
   // holds now. A catalog refresh skips the sessions whose listed revision did not move, after a walk or with
   // the held catalog. A walked row carries the size, time, device and inode of the stat that listed it.
-  // A selected-only refresh, the relist after a replaced file, and discovery roots recheck every file.
+  // Discovery roots skip the same way when the discovery request sent the same row. A selected-only refresh, the
+  // relist after a replaced file, and every other discovery root recheck every file.
   private async prepareHumanPrompts(
     sessions: SessionFile[],
     sizeCurrent: boolean,
