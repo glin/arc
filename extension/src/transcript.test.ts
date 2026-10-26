@@ -107,7 +107,7 @@ test.each([65536, 1024 * 1024])(
     const comparing = await scanClaudeRelationshipQuantum(parent, grown.scan.cursor, 32768);
     assert.equal(comparing.reset, false);
     assert.ok(comparing.cursor.evidence?.validation, 'the same-size comparison finished in one quantum');
-    // Growth during the comparison continues it, so the rewrite still resets.
+    // Growth during the comparison restarts it over the whole prefix, so the rewrite still resets.
     fs.appendFileSync(file, '{"type":"ignored"}\n');
     const resumed = await finish(JSON.parse(JSON.stringify(comparing.cursor)));
     assert.ok(resumed.scan.complete);

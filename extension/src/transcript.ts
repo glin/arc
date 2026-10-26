@@ -4243,7 +4243,7 @@ export class RelationshipReader {
       return 'reset';
     if (!evidence.validation || !sameRelationshipStamp(evidence.validation.stamp, this.stamp)) {
       // Only growth with no comparison in progress checks the anchor. A same-size change compares the whole prefix.
-      // Growth during that comparison continues it, so a same-size interior rewrite still resets.
+      // Growth during that comparison restarts it over the whole prefix, so a same-size interior rewrite still resets.
       // A grown file rewritten before its final block keeps its accepted facts until a same-size change, a shrink, or a replacement.
       if (!evidence.validation && this.stamp.size > prior.size) {
         const anchored = this.anchored(evidence);
