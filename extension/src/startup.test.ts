@@ -1350,7 +1350,7 @@ function harness(pendingRefresh = false, registerRefreshHandler = true, extraMet
     methods.push('refresh');
   }
   if (pendingRefresh) {
-    methods.push('refreshFrom');
+    methods.push('refreshFrom', 'refreshAs');
   }
   methods.push(...extraMethods);
   const body = owner.members
@@ -1544,6 +1544,7 @@ function completeDiscoveryHarness(
     'postRows',
     'rowSender',
     'refreshFrom',
+    'refreshAs',
     'runPendingRefresh',
     'abandonCatalogRefresh',
     'drainInitialCatalogRefresh',
@@ -6608,7 +6609,7 @@ test('each catalog walk names its requester, and the re-list after a replaced fi
     { replacedCatalogFiles: async () => replaced, watcherRefreshDecision },
     ['runPendingWatch'],
   );
-  const counters = new PanelPerformanceCounters();
+  let counters = new PanelPerformanceCounters();
   provider.performanceCounters = counters;
   provider.pendingWatch = new PendingWatcherWake();
   const file = writeRollout('held');
@@ -6645,6 +6646,69 @@ test('each catalog walk names its requester, and the re-list after a replaced fi
     'walk:requested:startup': 1,
     'walk:requested:transcript': 1,
   });
+  // Requests that wait behind a running refresh each count under their own name.
+  provider.performanceCounters = counters = new PanelPerformanceCounters();
+  replaced = [];
+  const refresh = provider.refresh;
+  const started: Promise<void>[] = [];
+  provider.refresh = (...args: unknown[]) => {
+    const run = refresh.apply(provider, args);
+    started.push(run);
+    return run;
+  };
+  try {
+    provider.refreshFrom('trigger');
+    await vi.waitFor(() => assert.equal(walks.length, 5, 'the first refresh did not reach its walk'));
+    provider.refreshFrom('poll');
+    provider.refreshFrom('child:tool');
+    await releaseAll(started[0]);
+    assert.equal(started.length, 4, 'the waiting requests did not run once as one merged refresh');
+    await releaseAll(started[3]);
+  } finally {
+    provider.refresh = refresh;
+  }
+  assert.deepEqual(
+    Object.fromEntries(
+      Object.entries(counters.snapshot().work).filter(
+        ([name]) => name.startsWith('walk:') || name.startsWith('coalesced:'),
+      ),
+    ),
+    {
+      'coalesced:child:tool': 1,
+      'coalesced:poll': 1,
+      'walk:requested:coalesced': 1,
+      'walk:requested:trigger': 1,
+    },
+  );
+});
+
+test('every refresh caller names its reason', () => {
+  const bare: string[] = [];
+  for (const [name, receiver] of [
+    ['panelhost.ts', 'this'],
+    ['extension.ts', 'panel'],
+  ]) {
+    const file = ts.createSourceFile(
+      name,
+      fs.readFileSync(path.join(__dirname, name), 'utf8'),
+      ts.ScriptTarget.Latest,
+      true,
+    );
+    const visit = (node: ts.Node, method: string | undefined): void => {
+      const owner = ts.isMethodDeclaration(node) ? node.name.getText(file) : method;
+      if (
+        ts.isPropertyAccessExpression(node) &&
+        node.name.text === 'refresh' &&
+        node.expression.getText(file) === receiver &&
+        owner !== 'refreshAs'
+      ) {
+        bare.push(`${name}:${file.getLineAndCharacterOfPosition(node.getStart(file)).line + 1}`);
+      }
+      ts.forEachChild(node, (child) => visit(child, owner));
+    };
+    visit(file, undefined);
+  }
+  assert.deepEqual(bare, [], 'a refresh starts without a requester name, so captures count it as direct');
 });
 
 test('an unresolved repository scope starts no walk, and the resolved refresh walks once', async () => {

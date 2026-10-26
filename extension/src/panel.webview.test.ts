@@ -12472,7 +12472,7 @@ test('a workspace change blocks the old session until repository discovery compl
   const listener = declarationSource(panelHostSource, 'workspaceFoldersChanged');
   const invalidate = layoutIndexOf(listener, 'this.repositoryScopeReady = false;');
   const discover = layoutIndexOf(listener, 'this.repositoryScope.snapshot(this.folders());');
-  const refresh = layoutIndexOf(listener, 'this.refresh(true);');
+  const refresh = layoutIndexOf(listener, "this.refreshFrom('workspace-folders', true);");
   const usage = layoutIndexOf(listener, "this.post({ type: 'usage', usage: this.usagePayload() })");
   assert.ok(
     invalidate >= 0 && discover > invalidate && refresh > discover && usage > refresh,
@@ -27747,7 +27747,10 @@ test('fresh and forked prompt delivery retry on a replacement child after permis
   ]);
 
   const forkSendAt = extensionSource.indexOf('const forkedSession = await forkCodexSession');
-  const forkSend = extensionSource.slice(forkSendAt, extensionSource.indexOf('void panel.refresh()', forkSendAt));
+  const forkSend = extensionSource.slice(
+    forkSendAt,
+    extensionSource.indexOf("panel.refreshFrom('fork-sent')", forkSendAt),
+  );
   sourceMatch(
     forkSend,
     /withStartedSessionActivity\(\s*forkedSession/,
@@ -31350,7 +31353,7 @@ test('attachment compatibility and contents are checked at every handoff boundar
     'an existing, forked, or fresh session can send files changed while that session was opening',
   );
   const directAt = extensionSource.indexOf('const turnId = await withExistingSessionActivity');
-  const direct = extensionSource.slice(directAt, extensionSource.indexOf('panel.refresh()', directAt));
+  const direct = extensionSource.slice(directAt, extensionSource.indexOf("panel.refreshFrom('prompt-sent')", directAt));
   sourceMatch(
     direct,
     /withExistingSessionActivity[\s\S]*validateResolvedPromptAssets[\s\S]*session\.prompt/,

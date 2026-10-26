@@ -4003,11 +4003,11 @@ export class PanelProvider implements vscode.Disposable {
         for (const open of this.hosts) {
           this.allowThemeFiles(open.webview);
         }
-        void this.refresh(true);
+        this.refreshFrom('icon-theme', true);
       }),
     );
     // Refresh icon variants when the editor switches between light and dark themes.
-    this.disposables.push(vscode.window.onDidChangeActiveColorTheme(() => void this.refresh(true)));
+    this.disposables.push(vscode.window.onDidChangeActiveColorTheme(() => this.refreshFrom('color-theme', true)));
     const stopCoverage = onClaudeRepeatedCoverage((file) => this.repeatedCoverage(file));
     this.disposables.push({ dispose: stopCoverage });
     // Update permitted webview resource roots when workspace folders change.
@@ -4033,7 +4033,7 @@ export class PanelProvider implements vscode.Disposable {
       Date.now,
       (decision) => this.loadingLine.scopeDecision(decision),
       () => {
-        void this.refresh(true, true, false, true);
+        this.refreshFrom('checkouts', true, true, null, false, true);
       },
     );
   }
@@ -4120,7 +4120,7 @@ export class PanelProvider implements vscode.Disposable {
     for (const open of this.hosts) {
       this.allowThemeFiles(open.webview);
     }
-    void this.refresh(true);
+    this.refreshFrom('workspace-folders', true);
     void this.post({ type: 'usage', usage: this.usagePayload() });
   }
 
@@ -4234,7 +4234,7 @@ export class PanelProvider implements vscode.Disposable {
         void this.sendToHost(host, this.panelVisibility.current(host, host.visible()));
         // Keep polling while any ready host remains visible. Stop polling when no ready host is visible.
         if (this.anyVisible()) {
-          void this.refresh(true);
+          this.refreshFrom('visible', true);
           this.startPolling();
           // Request account and catalog updates when a ready host becomes visible.
           if (!this.requestInitialCatalogRefresh()) {
@@ -4344,7 +4344,7 @@ export class PanelProvider implements vscode.Disposable {
       return;
     }
     this.performanceCounters.recordStartup('shellReady', performance.now());
-    void this.refresh(true);
+    this.refreshFrom('shell-ready', true);
     this.startPolling();
     this.requestInitialCatalogRefresh();
   }
@@ -4782,7 +4782,7 @@ export class PanelProvider implements vscode.Disposable {
   public setModels(models: Record<string, ModelChoice[]>, pending: readonly string[] = []): void {
     this.models = models;
     this.pendingModels = pending;
-    void this.refresh();
+    this.refreshFrom('models');
   }
 
   // Update MCP server readings for each draft or session.
@@ -5217,7 +5217,7 @@ export class PanelProvider implements vscode.Disposable {
     this.onSelectionChanged?.(draftId, profile.agent, draft.cwd);
     // Retry eligible account and server reads for the draft's agent.
     this.refreshUsageHandler?.(profile.agent, false, draftId, profile.agent, draft.cwd);
-    void this.refresh(true, true, true, true);
+    this.refreshFrom('draft-created', true, true, null, true, true);
     return draft;
   }
 
@@ -5271,7 +5271,7 @@ export class PanelProvider implements vscode.Disposable {
     }
     void this.writeDrafts();
     if (repaint) {
-      void this.refresh(true);
+      this.refreshFrom('draft-removed', true);
     }
     return true;
   }
@@ -5481,7 +5481,7 @@ export class PanelProvider implements vscode.Disposable {
         row.id === session ? { ...row, agentKey: next.agent, agent: AGENT_NAMES[next.agent] } : row,
       );
       void this.post({ type: 'usage', usage: this.usagePayload() });
-      void this.refresh(true);
+      this.refreshFrom('draft-agent', true);
       return;
     }
     void this.post({ type: 'usage', usage: this.usagePayload() });
@@ -8934,7 +8934,7 @@ export class PanelProvider implements vscode.Disposable {
       this.lastRailDay = '';
       this.lastRailCountsJson = '';
       await this.post({ type: 'forgetState', since: this.saved.since });
-      void this.refresh(true);
+      this.refreshFrom('forget-state', true);
     });
   }
 
@@ -8996,7 +8996,7 @@ export class PanelProvider implements vscode.Disposable {
     const seeded = this.selectionGeneration;
     this.railSeedOwedFor = seeded;
     this.railSeedSkipped = false;
-    void this.refresh(true, true, true, true).then(
+    void this.refreshAs('selection', true, true, null, true, true).then(
       () => this.settleRailSeed(seeded),
       () => this.settleRailSeed(seeded),
     );
@@ -9053,13 +9053,27 @@ export class PanelProvider implements vscode.Disposable {
     reuseCatalog = false,
     changedPaths: string[] | null = null,
     metadataAfterRender = false,
+    selectedOnly = false,
   ): void {
+    void this.refreshAs(reason, force, reuseCatalog, changedPaths, metadataAfterRender, selectedOnly);
+  }
+
+  // Every refresh starts here under its requester's name, which the refresh and walk counters report.
+  // `refresh` reads the name before its first wait, so the name is restored when the call returns.
+  private refreshAs(
+    reason: string,
+    force: boolean,
+    reuseCatalog: boolean,
+    changedPaths: string[] | null,
+    metadataAfterRender: boolean,
+    selectedOnly: boolean,
+  ): Promise<void> {
     const previousReason = this.refreshReason;
     const previousPaths = this.targetedRefreshPaths;
     this.refreshReason = reason;
     this.targetedRefreshPaths = changedPaths;
     try {
-      void this.refresh(force, reuseCatalog, metadataAfterRender);
+      return this.refresh(force, reuseCatalog, metadataAfterRender, selectedOnly);
     } finally {
       this.refreshReason = previousReason;
       this.targetedRefreshPaths = previousPaths;
@@ -9077,6 +9091,8 @@ export class PanelProvider implements vscode.Disposable {
         changedPaths: this.targetedRefreshPaths,
       });
       this.performanceCounters.recordRefreshStage('coalesced');
+      // A merge of different requesters runs as `coalesced`, so each waiting request also counts under its own name.
+      this.performanceCounters.recordWork(`coalesced:${this.refreshReason}`);
       if (this.refreshOverdue) {
         this.runPendingRefresh();
       }
@@ -9787,14 +9803,14 @@ export class PanelProvider implements vscode.Disposable {
         return;
       }
       if (metadataAfterRender && this.metadataRevision > metadataRevision) {
-        void this.refresh(false, true);
+        this.refreshFrom('metadata', false, true);
       }
       if (
         (await this.prepareProgressive(sessions, generation, controller.signal)) &&
         !controller.signal.aborted &&
         generation === this.refreshGeneration
       ) {
-        void this.refresh(true, true, true);
+        this.refreshFrom('progressive', true, true, null, true);
       } else {
         const enrichment = await this.prepareRailEnrichment(all, generation, controller.signal);
         this.postSessionLoading(generation, controller.signal);
@@ -9831,7 +9847,7 @@ export class PanelProvider implements vscode.Disposable {
           this.startupFailureGeneration !== this.refreshGeneration &&
           this.anyVisible()
         ) {
-          setTimeout(() => void this.refresh(false, true), 0);
+          setTimeout(() => this.refreshFrom('dispatch-discovery', false, true), 0);
         }
       }
     }
@@ -13806,7 +13822,7 @@ export class PanelProvider implements vscode.Disposable {
         const failureDrawn = this.selectionFailure !== null;
         this.selectionFailure = null;
         if (roundTrip || failureDrawn) {
-          void this.refresh(true, true, true, true);
+          this.refreshFrom('selected-window', true, true, null, true, true);
         }
         return;
       }
@@ -13847,7 +13863,7 @@ export class PanelProvider implements vscode.Disposable {
           return;
         }
         this.selectionFailure = { sessionId, generation, revision: currentRevision };
-        void this.refresh(true, true, true, true);
+        this.refreshFrom('selected-failure', true, true, null, true, true);
         return;
       }
       this.updateHistoryAfterAcceptedWindow(sessionId, previous, result, true);
@@ -13872,7 +13888,7 @@ export class PanelProvider implements vscode.Disposable {
       retryLatestRevision ||= current.agent === 'claude' && Boolean(this.history.get(sessionId)?.pages.length);
       // Publish accepted turns with incomplete repository navigation cleared before commit discovery waits.
       this.applyCommitRepositoryEvidence(current, result.value.read.turns);
-      void this.refresh(true, true, true, true);
+      this.refreshFrom('selected-window', true, true, null, true, true);
       if (retryLatestRevision || !this.commitRepositoryContexts(current, result.value.read.turns).length) return;
       retryLatestRevision ||= await this.hydrateCommitRepositories(
         current,
@@ -13904,12 +13920,12 @@ export class PanelProvider implements vscode.Disposable {
             !isDeepStrictEqual(accepted?.get(key), commitRowsOf(turn, this.collectedAt, folders).rows)
           );
         });
-      if (changed) void this.refresh(true, true, true, true);
+      if (changed) this.refreshFrom('selected-commits', true, true, null, true, true);
     } catch {
       const current = this.currentSelectedSession(work);
       if (current) {
         this.selectionFailure = { sessionId, generation, revision: this.revisionOf(current) };
-        void this.refresh(true, true, true, true);
+        this.refreshFrom('selected-failure', true, true, null, true, true);
       }
     } finally {
       if (this.selectionWorks?.get(sessionId) === work) this.selectionWorks.delete(sessionId);
@@ -14082,7 +14098,7 @@ export class PanelProvider implements vscode.Disposable {
       }
       const waiting = { sessionId, controller: new AbortController(), generation: ++this.historyGeneration };
       this.historyRequest = waiting;
-      void this.refresh(true, true, true, true);
+      this.refreshFrom('history', true, true, null, true, true);
       // A canceled pass hands over to the pass that replaces it.
       let current = this.codexPriming;
       while (current) {
@@ -14105,7 +14121,7 @@ export class PanelProvider implements vscode.Disposable {
     ) {
       // A press that waited takes back the loading status it sent.
       if (priming) {
-        void this.refresh(true, true, true, true);
+        this.refreshFrom('history', true, true, null, true, true);
       }
       return;
     }
@@ -14113,7 +14129,7 @@ export class PanelProvider implements vscode.Disposable {
     const generation = ++this.historyGeneration;
     this.historyRequest = { sessionId, controller, generation };
     // Publish loading before the page read, reusing the catalog.
-    void this.refresh(true, true, true, true);
+    this.refreshFrom('history', true, true, null, true, true);
     const before = this.history.get(sessionId) ?? startSessionHistory<HistoryCursor>(session, Date.now());
     let metadataReadAccepted = false;
     try {
@@ -14169,7 +14185,7 @@ export class PanelProvider implements vscode.Disposable {
       this.history.set(sessionId, afterHistoryRequest(settled, before));
     }
     void this.completeSelectedWindow(sessionId, this.selectionGeneration);
-    void this.refresh(true, true, true, true);
+    this.refreshFrom('history', true, true, null, true, true);
   }
 
   // Read current file identity and revision for stale-result and cursor checks.
@@ -14962,7 +14978,7 @@ export class PanelProvider implements vscode.Disposable {
     }));
     const hits = searchTurns(labelled, query, Date.now(), this.sessionQueryContext());
     void this.post({ type: 'results', query, hits, scope: searchScopeName(scope) });
-    if (!retained && this.membershipCoverage?.status !== 'complete') void this.refresh();
+    if (!retained && this.membershipCoverage?.status !== 'complete') this.refreshFrom('search');
   }
 
   // Populate the bounded search corpus only for an explicit content search, outside polling and rendering.
@@ -15365,14 +15381,14 @@ export class PanelProvider implements vscode.Disposable {
         rowsGap: () => {
           this.performanceCounters?.recordRowsGap();
           this.rowSenders?.get(host)?.reset('gap');
-          void this.refresh(true, true);
+          this.refreshFrom('rows-gap', true, true);
         },
         painted: (msg) => {
           this.browserPainted(host, msg.generation, msg.stage, msg.usableRows);
         },
         initialize: () => {
           this.onSetupRefresh?.();
-          void this.refresh(true);
+          this.refreshFrom('initialize', true);
         },
         developmentReload: () => {
           if (PANEL_DEV_SERVER_URL) {
@@ -15388,7 +15404,7 @@ export class PanelProvider implements vscode.Disposable {
         },
         refresh: () => {
           this.onSetupRefresh?.();
-          void this.refresh();
+          this.refreshFrom('panel-refresh');
         },
         perf: (msg) => {
           this.performanceCounters.recordPanelMessage(msg.kind, msg.ms, host);

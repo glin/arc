@@ -262,7 +262,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   // Trigger changes request a refresh. Polling also discovers completed turns when a trigger event is missed.
   const onTrigger = () => {
-    void panel.refresh();
+    panel.refreshFrom('trigger');
   };
   context.subscriptions.push(watcher.onDidChange(onTrigger), watcher.onDidCreate(onTrigger));
 
@@ -649,7 +649,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         }
         return;
       }
-      void panel.refresh();
+      panel.refreshFrom(`child:${event.kind}`);
     },
     onStateChange: (state) => {
       panel.initialNamesChanged();
@@ -1751,8 +1751,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       // Guarded delivery mode. It requires the recorded child and never reopens, resumes, forks, or shows a dialog.
       // It writes only the requested text, with no attachments, comments, or prompt history.
       // Structured results replace failure classification and recovery dialogs after attempted input.
-      const result = await runGuardedSend(guardedSends, { ...guarded, prompt: prompt.text }, guardedPort).finally(
-        () => void panel.refresh(),
+      const result = await runGuardedSend(guardedSends, { ...guarded, prompt: prompt.text }, guardedPort).finally(() =>
+        panel.refreshFrom('guarded-send'),
       );
       return { delivered: result.status === 'accepted', reason: result.reason, guarded: result };
     }
@@ -1776,7 +1776,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       if (turnId === null) {
         return failedPromptDelivery(agent, new Error('no agent session could be opened'));
       }
-      void panel.refresh();
+      panel.refreshFrom('prompt-sent');
       return { delivered: true, reason: '', turnId };
     } catch (error) {
       if (activeWriterFailure(error)) guardedSends.noteWriterConflict(sessionId);
@@ -1810,7 +1810,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
                 ),
               existingSessionPlan('codex', continued, cwd!),
             );
-            void panel.refresh();
+            panel.refreshFrom('fork-sent');
             return { delivered: true, reason: '', session: continued, turnId };
           } catch (forkError) {
             void vscode.window.showErrorMessage(`Arc: ${(forkError as Error).message}`);
@@ -1832,7 +1832,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       if (turnId === null) {
         return { delivered: false, reason: 'No agent session could be opened for compaction.' };
       }
-      void panel.refresh();
+      panel.refreshFrom('compact');
       return { delivered: true, reason: '', turnId };
     } catch (error) {
       // Use the same delivery reason in the retained card and the editor error notice.
@@ -1873,7 +1873,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         return { delivered: false, reason: 'No agent session could be opened for clearing.' };
       }
       await savePolicy(result.session, result.policy);
-      void panel.refresh();
+      panel.refreshFrom('clear');
       return { delivered: true, reason: '', turnId: result.turnId, session: result.session };
     } catch (error) {
       const delivery = failedClearDelivery(agent, error);
@@ -1929,7 +1929,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       const project = await acceptedProject;
       const entry = await setupStore.accept(project, draft.profile);
       if (project === panel.setupProject) panel.setRecentProfiles(entry.recents);
-      void panel.refresh();
+      panel.refreshFrom('session-started');
       return { delivered: true, reason: '', session: sessionId, turnId };
     } catch (error) {
       if (accepted)
