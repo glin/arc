@@ -662,6 +662,7 @@ export function openChildrenKey(
 
 // Combine the tail outcome with open children from lifetime facts and the parsed window.
 // The tail can omit earlier launches. Lifetime facts read the whole file, while the parsed window covers timeline turns.
+// A tail that misses the newest turn's opening prompt has no outcome. The later of the lifetime and parsed outcomes then takes its place.
 // Accept children only from outcomes describing the same newest turn through the same last record. Older reads cannot reopen closed children.
 // A child closed by any read remains closed. Completion matching differs between readers, so their closed sets can differ.
 // `tailCommands` come from tail reads without a typed prompt. Wider outcomes retain those commands for the same turn because other readers omit commands.
@@ -677,13 +678,27 @@ export function outcomeWithWiderChildren(
     : merged;
 }
 
+// The outcome that describes later work: a newer turn, or the same turn through a later record.
+// A tie keeps the lifetime outcome, so a parsed window of older history cannot reopen a closed turn.
+function laterOutcome(lifetime: TurnOutcome | null, parsed: TurnOutcome | null): TurnOutcome | null {
+  if (!parsed || !lifetime) {
+    return lifetime ?? parsed;
+  }
+  const lifetimeStart = lifetime.startedAt ?? 0;
+  const parsedStart = parsed.startedAt ?? 0;
+  return parsedStart > lifetimeStart || (parsedStart === lifetimeStart && parsed.endedAt > lifetime.endedAt)
+    ? parsed
+    : lifetime;
+}
+
 function mergedWiderChildren(
   tail: TurnOutcome | null,
   lifetime: TurnOutcome | null,
   parsed: TurnOutcome | null,
 ): TurnOutcome | null {
   if (!tail) {
-    return lifetime;
+    const base = laterOutcome(lifetime, parsed);
+    return base && base !== lifetime ? mergedWiderChildren(base, lifetime, parsed) : lifetime;
   }
   if (tail.processEndedAt !== undefined) {
     return tail;

@@ -32108,6 +32108,136 @@ test('the host counts a background command whose typed prompt lies before the ta
   }
 });
 
+// A long coordinator turn starts before the bounded tail, so the row reads its outcome from the lifetime record.
+// That record still holds the turn's earlier close. The open session parsed the newer work that resumed it.
+test('a running session row draws running while its lifetime record still holds an earlier close', () => {
+  const at = (time: string) => `2026-10-25T${time}Z`;
+  const file = path.join(tempDir('resumed-running-'), 'sess.jsonl');
+  fs.writeFileSync(
+    file,
+    [
+      {
+        type: 'user',
+        promptId: 'p1',
+        timestamp: at('18:28:51'),
+        message: { role: 'user', content: [{ type: 'text', text: 'Run the ship skill' }] },
+      },
+      {
+        type: 'assistant',
+        timestamp: at('19:25:29'),
+        message: {
+          role: 'assistant',
+          model: 'claude-opus-5',
+          stop_reason: 'tool_use',
+          content: [
+            {
+              type: 'tool_use',
+              id: 'bg1',
+              name: 'Agent',
+              input: { description: 'Review x1', run_in_background: true },
+            },
+          ],
+        },
+      },
+      {
+        type: 'user',
+        timestamp: at('19:25:30'),
+        message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'bg1', content: 'launched' }] },
+        toolUseResult: { isAsync: true, status: 'async_launched', agentId: 'x1', description: 'Review x1' },
+      },
+      {
+        type: 'assistant',
+        timestamp: at('19:25:34'),
+        message: {
+          role: 'assistant',
+          id: 'm1',
+          model: 'claude-opus-5',
+          stop_reason: 'end_turn',
+          content: [{ type: 'text', text: `The review runs in the background. ${'x'.repeat(8_000)}` }],
+        },
+      },
+      {
+        type: 'user',
+        promptId: 'p2',
+        isMeta: true,
+        timestamp: at('20:12:37'),
+        origin: { kind: 'peer', from: 'x1' },
+        message: {
+          role: 'user',
+          content: 'Another Claude session sent a message:\n<agent-message from="x1">done</agent-message>',
+        },
+      },
+      {
+        type: 'assistant',
+        timestamp: at('20:15:48'),
+        message: {
+          role: 'assistant',
+          model: 'claude-opus-5',
+          stop_reason: 'tool_use',
+          content: [{ type: 'tool_use', id: 'cmd1', name: 'Bash', input: { command: 'git log' } }],
+        },
+      },
+    ]
+      .map((record) => JSON.stringify(record))
+      .join('\n') + '\n',
+  );
+  const tail = readSessionMeta(file, 2_048, 'sess');
+  assert.equal(tail.outcome, null, 'the tail read does not reach the opening prompt');
+  const read = readSession(file, 'sess');
+  const turnStartedAt = Date.parse(at('18:28:51'));
+  const now = Date.parse(at('20:16:05'));
+  let lifetimeClose = 0;
+  vi.useFakeTimers();
+  vi.setSystemTime(now);
+  try {
+    const { provider } = liveProviderFixture(livePress({ sessionId: 'sess' }));
+    Object.assign(provider, {
+      live: {},
+      cache: new Map([[file, { read, revision: { mtimeMs: 10, size: 10 } }]]),
+      titles: new Map([[file, tail]]),
+      lifetimeRailFacts: () => ({
+        sess: {
+          newestTurnStartedAt: turnStartedAt,
+          outcome: {
+            finished: true,
+            error: false,
+            interrupted: false,
+            startedAt: turnStartedAt,
+            endedAt: lifetimeClose,
+            openChildren: ['x1'],
+          },
+        },
+      }),
+      // No child write reached the catalog after the review's launch.
+      claudeChildren: [],
+      claudeChildReferences: [],
+      claudeChildStatWrites: new Map(),
+      sessionRows: [{ id: 'sess', agentKey: 'claude' }],
+      // The hosted session has stayed busy since the turn began.
+      running: new Set(['claude:sess']),
+      runningSinceKeys: new Map([['claude:sess', turnStartedAt]]),
+      exitedSinceKeys: new Map(),
+    });
+    const host = provider as unknown as {
+      sessionOutcomes: unknown;
+      outcomesFor(sessions: { sessionId: string; file: string; agent: string }[]): unknown;
+      railStatuses(now: number): { statuses: Map<string, string>; openChildren: Map<string, number> };
+    };
+    const rowWord = (close: string) => {
+      lifetimeClose = Date.parse(at(close));
+      host.sessionOutcomes = host.outcomesFor([{ sessionId: 'sess', file, agent: 'claude' }]);
+      const status = host.railStatuses(now).statuses.get('sess') ?? null;
+      return railTimeSlot(status as Parameters<typeof railTimeSlot>[0]).word;
+    };
+    // The last complete lifetime record ends at the 19:25:34 close, with the review still open.
+    assert.equal(rowWord('19:25:34'), 'running');
+    // A lifetime record that reaches a close after the parsed work keeps that close.
+    assert.equal(rowWord('20:15:58'), null, 'an older parsed read reopened a newer close');
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
 // Supply production performance counters and threshold checks with captured diagnostic outputs.
 function startupFixture() {
   const logged: Array<[string, Record<string, unknown>]> = [];
