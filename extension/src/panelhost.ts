@@ -9279,8 +9279,8 @@ export class PanelProvider implements vscode.Disposable {
               (held.refreshAt !== null && held.refreshAt <= Date.now()))
           );
         });
-      // A complete reply that a discovery continuation applied waits for this refresh to accept it. A refresh that reuses the
-      // catalog accepts it before it sends another request, as the refresh that received the reply would have.
+      // A held complete reply, such as one a discovery continuation applied, waits for a refresh to accept it. A refresh that
+      // reuses the catalog accepts it before it sends another request.
       const replyHeld = reuseCatalog && this.discoveryComplete?.scope === JSON.stringify(this.repositoryScopeRoots);
       if (!selectedOnly && (!reuseCatalog || (!replyHeld && (dispatchChanged || this.dispatchDiscoveryPending)))) {
         this.startupHistory?.stage('relationshipsStarted');
@@ -9868,8 +9868,8 @@ export class PanelProvider implements vscode.Disposable {
     }
   }
 
-  // Sends the next discovery slice from the held catalog and the previous reply's cursor, without a catalog refresh. The
-  // slice holds the catalog refresh slot, so a refresh requested meanwhile waits behind it. A catalog refresh follows only
+  // Sends the next discovery request from the held catalog and the previous reply's cursor, without a catalog refresh. The
+  // continuation holds the catalog refresh slot, so a refresh requested meanwhile waits behind it. A catalog refresh follows only
   // when the reply completed discovery or changed the listed sessions, and it keeps the `dispatch-discovery` reason.
   private async continueDiscovery(): Promise<void> {
     if (
@@ -9879,15 +9879,15 @@ export class PanelProvider implements vscode.Disposable {
     )
       return;
     // The holder of the slot sends discovery itself or schedules the next continuation when it ends. A request queued
-    // behind it would run as one more catalog refresh after every slice.
+    // behind it would run as one more catalog refresh after every continuation.
     if (this.refreshController) return;
     if (this.codexPriming || !this.catalog || !this.repositoryScopeReady) {
       this.refreshFrom('dispatch-discovery', false, true);
       return;
     }
     const started = performance.now();
-    // The slice keeps the refresh generation, so a selection refresh in flight stays current. A catalog refresh that
-    // replaces the slice moves the generation, and the slice's reply is then obsolete.
+    // The continuation keeps the refresh generation, so a selection refresh in flight stays current. A catalog refresh that
+    // replaces the continuation moves the generation. A reply then still saves its checkpoint, but it changes no catalog.
     const generation = this.refreshGeneration;
     const controller = new AbortController();
     this.claimCatalogRefresh(controller);
@@ -9905,7 +9905,7 @@ export class PanelProvider implements vscode.Disposable {
           listed.length !== accepted.size ||
           listed.some((session) => !accepted.has(session.file)));
     } catch (error) {
-      // An abandoned slice's controller is aborted.
+      // An abandoned continuation's controller is aborted.
       if (!controller.signal.aborted) {
         this.failSessionLoading(generation, controller.signal);
       }
@@ -9914,8 +9914,8 @@ export class PanelProvider implements vscode.Disposable {
       const owned = this.releaseCatalogRefresh(controller);
       this.performanceCounters.recordRefresh('discovery-continuation', performance.now() - started);
       if (owned && refresh) {
-        // The follow-up refresh accepts the reply before a waiting request can send another, and the waiting request runs
-        // when it ends.
+        // The follow-up refresh runs before a waiting request. It accepts a complete reply before any further request, and it
+        // sends the next request itself after a reply that added a started session.
         this.refreshFrom('dispatch-discovery', false, true);
       } else if (owned) {
         this.runPendingRefresh();

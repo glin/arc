@@ -1356,10 +1356,6 @@ function harness(pendingRefresh = false, registerRefreshHandler = true, extraMet
     'releaseCatalogRefresh',
     'scheduleDiscoveryContinuation',
     'continueDiscovery',
-    'claimCatalogRefresh',
-    'releaseCatalogRefresh',
-    'scheduleDiscoveryContinuation',
-    'continueDiscovery',
   );
   methods.push(...extraMethods);
   const body = owner.members
@@ -12620,15 +12616,22 @@ test('incomplete discovery replies continue without a catalog refresh, and the c
     provider.performanceCounters = counters;
     const run = provider.progressiveWorker.run;
     let replies = 0;
+    let inFlight = 0;
+    let mostInFlight = 0;
     provider.progressiveWorker.run = async (request: ProgressiveRequest, generation: number, signal: AbortSignal) => {
       if (request.kind !== 'claude-children') return run(request, generation, signal);
       discovery.pending = ++replies <= 10;
+      mostInFlight = Math.max(mostInFlight, ++inFlight);
       // A poll waits behind the first refresh and runs when it ends, so a continuation falls due while the poll holds the slot.
       if (replies === 1) provider.refreshFrom('poll', false, true);
-      const reply = await run(request, generation, signal);
-      // A worker reply arrives as a task of its own, after the continuations already due.
-      await new Promise((resolve) => setTimeout(resolve, 0));
-      return reply;
+      try {
+        const reply = await run(request, generation, signal);
+        // A worker reply arrives as a task of its own, after the continuations already due.
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        return reply;
+      } finally {
+        inFlight--;
+      }
     };
     provider.refreshFrom('startup', true);
     const settled = () =>
@@ -12641,6 +12644,7 @@ test('incomplete discovery replies continue without a catalog refresh, and the c
     const { discovery: counted, refreshes, refreshStages } = counters.snapshot();
     assert.equal(refreshStages.abandoned, 0, 'a refresh reached its deadline');
     assert.equal(counted.continuations, 10);
+    assert.equal(mostInFlight, 1, 'a continuation sent a request while a refresh held the slot');
     assert.equal(
       refreshes['dispatch-discovery']?.count,
       1,
