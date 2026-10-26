@@ -238,13 +238,15 @@ export type WatcherWakeReason = 'transcript' | 'activity-fallback';
 // `activityFallbackNoFile`: a live session has no listed transcript.
 // `noPaths`: the batch named no file.
 // `unknownPath`: a named file is outside the held catalog.
+// `unspecified`: the batch required a walk without naming a cause.
 export type WatcherBroadReason =
   | 'missingFilename'
   | 'createOrRename'
   | 'requested'
   | 'activityFallbackNoFile'
   | 'noPaths'
-  | 'unknownPath';
+  | 'unknownPath'
+  | 'unspecified';
 
 export interface WatcherWakeBatch {
   eventCount: number;
@@ -366,7 +368,7 @@ export function watcherRefreshDecision(
   knownPath: (file: string) => boolean,
 ): { kind: 'broad' | 'targeted'; changedPaths: string[]; broadReasons: WatcherBroadReason[] } {
   if (batch.broadRequired) {
-    const broadReasons = batch.broadReasons.length ? batch.broadReasons : ['requested' as const];
+    const broadReasons = batch.broadReasons.length ? batch.broadReasons : ['unspecified' as const];
     return { kind: 'broad', changedPaths: [], broadReasons };
   }
   if (batch.changedPaths.length === 0) {

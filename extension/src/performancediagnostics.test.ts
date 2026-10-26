@@ -236,8 +236,12 @@ test('the saved snapshot carries refresh stages, discovery, decisions, row posts
   });
   assert.equal((projected.counters.discovery as { continuations: number }).continuations, 0);
   assert.deepEqual(projected.counters.watcherDecisions, { targeted: 0, broad: 1, broadReasons: { unknownPath: 1 } });
-  assert.deepEqual((projected.counters.rowPosts as Record<string, { wholeReasons: unknown }>).render.wholeReasons, {
-    'globalMoved:scope': 1,
+  assert.deepEqual((projected.counters.rowPosts as Record<string, unknown>).render, {
+    whole: { count: 1, serializedBytes: 100, maximumSerializedBytes: 100, unavailableByteCount: 0 },
+    delta: { count: 0, serializedBytes: 0, maximumSerializedBytes: 0, unavailableByteCount: 0 },
+    wholeReasons: { 'globalMoved:scope': 1 },
+    rowsHeld: 2,
+    rowsSent: 2,
   });
   assert.equal(projected.counters.rowsGapCount, 1);
   assert.deepEqual(projected.counters.work, { dispatchedCostsPost: 3 });

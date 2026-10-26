@@ -36786,6 +36786,65 @@ async function rowDeltaProvider() {
   return { fixture, provider, sessions, render, postRail, first };
 }
 
+// The counters are the only evidence of how a post reached a panel and why a wake walked, so the host must feed them.
+
+test('row posts and watcher decisions reach the performance counters with their causes', async () => {
+  const { PanelPerformanceCounters } = await import('./performancediagnostics.ts');
+  const provider = Object.create(PanelProvider.prototype) as Record<string, any>;
+  const host = { webview: {} };
+  const sent: unknown[] = [];
+  Object.assign(provider, {
+    performanceCounters: new PanelPerformanceCounters(1_000, 'window-a'),
+    readyHosts: new Set([host]),
+    repositoryScopeRoots: ['root'],
+    catalog: { folders: 'root', sessions: [] },
+    sendToHost(_host: unknown, message: unknown, measured?: (bytes: number | null) => void) {
+      sent.push(message);
+      measured?.(JSON.stringify(message).length);
+      return Promise.resolve(true);
+    },
+  });
+  // Rows large enough that row bytes, not the delta header, decide the size comparison below.
+  const rail = (version: number) => ({
+    type: 'rail',
+    rail: [
+      { id: 'a', version, label: 'a'.repeat(400) },
+      { id: 'b', version: 0, label: 'b'.repeat(400) },
+    ],
+    stats: {},
+  });
+
+  await provider.postRows(host, rail(1));
+  await provider.postRows(host, rail(1));
+  await provider.postRows(host, rail(2));
+  const posts = provider.performanceCounters.snapshot().rowPosts.rail;
+  assert.equal(posts.whole.count, 1);
+  assert.equal(posts.delta.count, 2);
+  assert.deepEqual(posts.wholeReasons, { first: 1 });
+  assert.equal(posts.rowsHeld, 2);
+  assert.equal(posts.rowsSent, 3, 'the first post carries both rows and the third carries the changed one');
+  assert.ok(
+    posts.whole.maximumSerializedBytes > posts.delta.maximumSerializedBytes,
+    'a one-row delta weighed as much as the whole list',
+  );
+  assert.equal(sent.length, 3);
+
+  const pending = new PendingWatcherWake();
+  pending.noteFileEvent('records', 'new.jsonl', 'rename');
+  const refreshed: unknown[] = [];
+  Object.assign(provider, {
+    pendingWatch: pending,
+    refreshFrom: (...args: unknown[]) => refreshed.push(args),
+  });
+  provider.runPendingWatch({ firedAt: 10, firstAt: 4, cause: 'quiet' });
+  const decisions = provider.performanceCounters.snapshot().watcherDecisions;
+  assert.deepEqual(decisions, { targeted: 0, broad: 1, broadReasons: { createOrRename: 1 } });
+  assert.equal(refreshed.length, 1);
+  const last = provider.performanceCounters.snapshot().lastWatcherOperation;
+  assert.equal(last?.decision, 'broad');
+  assert.deepEqual(last?.broadReasons, ['createOrRename']);
+});
+
 test('a lost row delta, a reloaded page and an undelivered post each make the next render and session list message a snapshot', async () => {
   const triggers: Record<string, (held: Awaited<ReturnType<typeof rowDeltaProvider>>) => Promise<void>> = {
     rowsGap: async ({ provider, fixture }) => provider.onMessage({ type: 'rowsGap' }, fixture.host),

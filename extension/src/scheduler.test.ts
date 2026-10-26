@@ -287,6 +287,9 @@ test('unknown filenames and rename events retain the broad watcher path and name
   requested.requireBroad('transcript');
   assert.deepEqual(watcherRefreshDecision(requested.take(), () => true).broadReasons, ['requested']);
 
+  const unnamed = { ...requested.take(), broadRequired: true, broadReasons: [] };
+  assert.deepEqual(watcherRefreshDecision(unnamed, () => true).broadReasons, ['unspecified']);
+
   const empty = new PendingWatcherWake();
   assert.deepEqual(
     watcherRefreshDecision(empty.take(), () => true),

@@ -1,8 +1,10 @@
 // Measures the session list publication path over a large list without a host, an editor or a clock.
 // One tick is one host update cycle: the input gate, the payload build, the row delta encoding and the
 // serialized size of what a panel would receive. The fixture changes one running session per tick, the
-// way a transcript append changes one session in the owner's window.
-// Counts and bytes are exact. Wall times include whatever else the machine runs and are reported, never compared.
+// way a transcript append changes one session in a reader's window.
+// Counts and bytes are exact for the generated fixture, whose rows carry one short label and two figures,
+// so a real list of the same length serializes larger. Wall times include whatever else the machine runs
+// and are reported, never compared.
 
 import { railInputKey, railPayload, sameRailInputs, type PayloadSessionRow, type RailPayloadInput } from './payload';
 import { serializedMessageBytes } from './performancediagnostics';
@@ -48,6 +50,7 @@ export interface RailPublicationReport {
   wallMs: { key: number; payload: number; encode: number; serialize: number };
 }
 
+// A chosen large list: thousands of listed sessions, a few running, and a tick every few seconds.
 const DEFAULTS: Required<RailPublicationOptions> = {
   rows: 3675,
   running: 6,

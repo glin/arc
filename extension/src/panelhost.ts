@@ -10519,7 +10519,7 @@ export class PanelProvider implements vscode.Disposable {
     // The sender described what it encoded. Record it beside the bytes the post measured.
     const encoding = kind === 'selection' ? null : sender.lastEncoding;
     const posted = this.sendToHost(host, outgoing, (serializedBytes) => {
-      if (encoding) this.performanceCounters.recordRowPost(kind, encoding, serializedBytes);
+      if (encoding) this.performanceCounters?.recordRowPost(kind, encoding, serializedBytes);
       measured?.(serializedBytes);
     });
     void Promise.resolve(posted).then(
@@ -11755,6 +11755,7 @@ export class PanelProvider implements vscode.Disposable {
     }
     this.catalog = { folders: folderPrint, sessions: walkedSessions };
     this.catalogWalked = true;
+    this.performanceCounters?.recordWork('catalogWalk');
     return walkedSessions;
   }
 
@@ -14928,7 +14929,7 @@ export class PanelProvider implements vscode.Disposable {
         },
         // The panel lost a delta. Post its rows again from the catalog the host holds, without a new catalog walk.
         rowsGap: () => {
-          this.performanceCounters.recordRowsGap();
+          this.performanceCounters?.recordRowsGap();
           this.rowSenders?.get(host)?.reset('gap');
           void this.refresh(true, true);
         },

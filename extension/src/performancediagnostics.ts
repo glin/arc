@@ -49,7 +49,7 @@ export interface RowPostCounts {
   whole: MessageCounts;
   delta: MessageCounts;
   wholeReasons: Record<string, number>;
-  // Rows described by the last post, and rows carried across every post.
+  // Rows described by the last post to any panel, and rows carried across every post.
   rowsHeld: number;
   rowsSent: number;
 }
