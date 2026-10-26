@@ -11229,6 +11229,194 @@ test('a new worker resolves unchanged Claude children from saved heads and rerea
   }
 });
 
+test('a new worker reuses saved spend facts of unchanged dispatched sessions and rereads only a grown one', async () => {
+  const directory = tempDir('saved-dispatch-facts-');
+  const cache = path.join(directory, 'derived-cache.json');
+  const claudeId = '4f4bf298-958f-4751-8782-d8688ff808a6';
+  const codexId = 'aaaaaaaa-1111-1111-1111-111111111111';
+  const parentFile = path.join(directory, 'parent.jsonl');
+  const claudeFile = path.join(directory, claudeId + '.jsonl');
+  const codexFile = path.join(directory, codexId + '.jsonl');
+  const nativeFile = path.join(directory, 'native.jsonl');
+  const write = (file: string, rows: unknown[]) =>
+    fs.writeFileSync(file, rows.map((row) => JSON.stringify(row)).join('\n') + '\n');
+  const grow = (file: string, mtime: number) => {
+    fs.appendFileSync(file, JSON.stringify({ type: 'ignored' }) + '\n');
+    fs.utimesSync(file, mtime, mtime);
+  };
+  write(parentFile, [
+    ...claudeDispatchTranscript('claude --bg review', 'backgrounded · 4f4bf298 · Review', 'dispatch-claude'),
+    ...claudeDispatchTranscript(
+      'python launch.py --arc-dispatch',
+      `ARC_DISPATCH_SESSION={"agent":"codex","session_id":"${codexId}"}`,
+      'dispatch-codex',
+    ),
+  ]);
+  write(claudeFile, [
+    { type: 'user', cwd: directory, timestamp: timestamp(0), message: { role: 'user', content: 'Review' } },
+    {
+      type: 'assistant',
+      timestamp: timestamp(2),
+      message: {
+        role: 'assistant',
+        stop_reason: 'end_turn',
+        content: 'Finished',
+        model: 'claude-sonnet-4-20250514',
+        usage: { input_tokens: 7, output_tokens: 1 },
+      },
+    },
+  ]);
+  const rollout = (threadId: string, output: number, parentThreadId?: string) => [
+    {
+      type: 'session_meta',
+      timestamp: timestamp(0),
+      payload: {
+        id: threadId,
+        cwd: directory,
+        source: 'exec',
+        model_provider: 'openai',
+        ...(parentThreadId ? { parent_thread_id: parentThreadId } : {}),
+      },
+    },
+    { type: 'event_msg', timestamp: timestamp(1), payload: { type: 'task_started', turn_id: threadId } },
+    { type: 'turn_context', timestamp: timestamp(2), payload: { turn_id: threadId, model: 'gpt-6-sol' } },
+    { type: 'event_msg', timestamp: timestamp(2), payload: { type: 'user_message', message: 'work' } },
+    {
+      type: 'event_msg',
+      timestamp: timestamp(3),
+      payload: {
+        type: 'token_count',
+        info: {
+          last_token_usage: { input_tokens: 10, output_tokens: output, total_tokens: 10 + output },
+          total_token_usage: { input_tokens: 10, output_tokens: output, total_tokens: 10 + output },
+          model_context_window: 258400,
+        },
+      },
+    },
+    { type: 'event_msg', timestamp: timestamp(4), payload: { type: 'task_complete', turn_id: threadId } },
+  ];
+  write(codexFile, rollout(codexId, 3));
+  write(nativeFile, rollout('native', 5, codexId));
+  // Quiet files, so every dispatched session settles in its first read.
+  for (const file of [claudeFile, codexFile, nativeFile]) fs.utimesSync(file, 100, 100);
+  const session = (file: string, sessionId: string, agent: 'claude' | 'codex') => ({
+    file,
+    sessionId,
+    agent,
+    ...revisionOf(fs.statSync(file, { bigint: true })),
+  });
+  const request = () => ({
+    kind: 'claude-children' as const,
+    // The host makes every listed session a discovery parent, so each dispatched session has a row of its own.
+    parents: [
+      session(parentFile, 'parent', 'claude'),
+      session(claudeFile, claudeId, 'claude'),
+      session(codexFile, codexId, 'codex'),
+    ],
+    catalog: [
+      session(parentFile, 'parent', 'claude'),
+      session(claudeFile, claudeId, 'claude'),
+      session(codexFile, codexId, 'codex'),
+    ],
+    codexChildren: [
+      {
+        file: nativeFile,
+        threadId: 'native',
+        parentThreadId: codexId,
+        agentPath: '/native',
+        openedAt: 0,
+        startedAt: 0,
+        threadSource: 'subagent',
+        backgroundReview: false,
+      },
+    ],
+    repositoryRoots: [directory],
+  });
+  // Each activation starts a new worker from the saved store and saves its final rows back.
+  const activate = async (generation: number) => {
+    const worker = new ProgressiveWorker(source);
+    const spend = { visits: 0, rereads: 0, bytes: 0 };
+    try {
+      const restored = loadDerivedCache(cache);
+      let entries = [...restored.claudeChildReferences];
+      let discovery = restored.discovery;
+      for (let pass = 0; pass < 100; pass++) {
+        const result = await worker.run(
+          { ...request(), referenceEntries: entries, discovery },
+          generation,
+          new AbortController().signal,
+        );
+        assert.ok(result?.value.kind === 'claude-children' || result?.value.kind === 'claude-children-progress');
+        assert.ok(result.value.charges, 'the reply carried no discovery charges');
+        spend.visits += result.value.charges.dispatchSpendVisits;
+        spend.rereads += result.value.charges.dispatchSpendRereads;
+        spend.bytes += result.value.charges.dispatchSpendBytes;
+        entries = result.value.referenceEntries;
+        discovery = result.value.checkpoint;
+        if (result.value.kind === 'claude-children' && !result.value.continuation) {
+          const facts = new Map(result.value.dispatchFacts.map((fact) => [fact.sessionId, fact]));
+          console.log(
+            generation,
+            pass,
+            JSON.stringify(
+              [...facts.values()].map((f) => [
+                f.sessionId.slice(0, 4),
+                f.spend.partial,
+                f.spend.models[0]?.usage.output,
+                f.refreshAt,
+              ]),
+            ),
+          );
+          assert.equal(facts.get(claudeId)?.spend.models[0]?.usage.output, 1, 'the Claude dispatched spend changed');
+          assert.equal(facts.get(codexId)?.spend.models[0]?.usage.output, 8, 'the Codex dispatched spend changed');
+          assert.equal(facts.get(codexId)?.spend.partial, false, 'settled Codex dispatched spend stayed partial');
+          saveDerivedCache(cache, [], entries, [], undefined, discovery);
+          return spend;
+        }
+      }
+      throw new Error('discovery never completed its captured inputs');
+    } finally {
+      worker.stop();
+    }
+  };
+  try {
+    const cold = await activate(1);
+    // The Codex session reads again in the second pass, because its first read found its native child.
+    assert.equal(cold.rereads, 3, 'the first activation did not read both dispatched sessions');
+    assert.ok(cold.bytes > 0);
+    console.log(
+      JSON.stringify(
+        JSON.parse(fs.readFileSync(cache, 'utf8')).claudeChildReferences.map((r: any) => [
+          r.file,
+          r.entry.source,
+          r.entry.sessionId,
+          r.entry.dispatch
+            ? {
+                rev: r.entry.dispatch.revision,
+                tree: r.entry.dispatch.tree,
+                gen: r.entry.dispatch.sourceGeneration,
+                rowgen: r.entry.sourceGeneration,
+                deps: r.entry.dispatch.codexDependencies,
+              }
+            : null,
+        ]),
+      ),
+    );
+    assert.deepEqual(await activate(2), { visits: 2, rereads: 0, bytes: 0 }, 'an unchanged dispatched session reread');
+    grow(claudeFile, 200);
+    const grown = await activate(3);
+    assert.equal(grown.rereads, 1, 'only the grown dispatched session rereads');
+    assert.ok(grown.bytes >= fs.statSync(claudeFile).size);
+    assert.deepEqual(await activate(4), { visits: 2, rereads: 0, bytes: 0 }, 'the reread facts were not saved');
+    // A grown Codex child moves its root's spend tree.
+    grow(nativeFile, 200);
+    assert.equal((await activate(5)).rereads, 1, 'only the Codex root of the grown child rereads');
+    assert.deepEqual(await activate(6), { visits: 2, rereads: 0, bytes: 0 }, 'the reread Codex facts were not saved');
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test('discovery publishes bounded delegated spend and reuses completed sources after worker replacement', async () => {
   const directory = tempDir('bounded-dispatch-spend-');
   const id = 'aaaaaaaa-1111-1111-1111-111111111111';

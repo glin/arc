@@ -235,6 +235,7 @@ test('Claude pending cursors survive soft cache pressure and reject corrupt dura
 import {
   VERSION,
   CLAUDE_CHILD_REFERENCE_PARSER_VERSION,
+  DISPATCH_FACTS_VERSION,
   MAX_CLAUDE_CHILD_REFERENCE_FILES,
   CLAUDE_METADATA_TAIL_BYTES,
   MAX_CLAUDE_CHILD_REFERENCES_PER_FILE,
@@ -247,6 +248,7 @@ import {
   enrichDerivedTitleEntry,
   loadDerivedCache,
   limitCodexDispatchCursors,
+  limitSavedDispatchFacts,
   needsAgentRunScan,
   railEnrichmentNeeds,
   METADATA_EXHAUSTED_RULE,
@@ -981,6 +983,60 @@ test('derived cache rejects child references from another parser generation', ()
     }),
   );
   assert.equal(loadDerivedCache(file).claudeChildReferences.size, 0);
+});
+
+test('derived cache drops saved dispatched facts of another facts version and keeps their rows', () => {
+  const file = path.join(folder(), 'cache.json');
+  const revision = { size: 20, mtimeMs: 10, dev: 1, ino: 2 };
+  const dispatch = (sessionId: string, toolUses: number) => ({
+    version: DISPATCH_FACTS_VERSION,
+    revision,
+    tree: '20:10',
+    facts: {
+      sessionId,
+      refreshAt: null,
+      revision,
+      spend: { models: [], found: true, partial: false, effort: null },
+      startedAt: null,
+      endedAt: null,
+      toolUses,
+      person: false,
+    },
+  });
+  const entry = (sessionId: string, toolUses: number): ClaudeChildReferenceCacheEntry => ({
+    parserVersion: CLAUDE_CHILD_REFERENCE_PARSER_VERSION,
+    ...revision,
+    sessionId,
+    childTranscript: false,
+    references: [],
+    dispatch: dispatch(sessionId, toolUses),
+  });
+  saveDerivedCache(file, [], [['/dispatched.jsonl', entry('dispatched', 1)]]);
+  assert.deepEqual(
+    loadDerivedCache(file).claudeChildReferences.get('/dispatched.jsonl')?.dispatch,
+    dispatch('dispatched', 1),
+  );
+  const stored = JSON.parse(fs.readFileSync(file, 'utf8'));
+  stored.claudeChildReferences[0].entry.dispatch.version = DISPATCH_FACTS_VERSION + 1;
+  fs.writeFileSync(file, JSON.stringify(stored));
+  const loaded = loadDerivedCache(file);
+  assert.equal(loaded.reuse?.rejectedRelationships, 0);
+  assert.equal(loaded.claudeChildReferences.get('/dispatched.jsonl')?.dispatch, undefined);
+  assert.equal(loaded.claudeChildReferences.get('/dispatched.jsonl')?.sessionId, 'dispatched');
+  // The byte cap keeps the smaller facts and the row of the larger.
+  const rows = [
+    { file: '/large.jsonl', entry: entry('large', 1_000_000) },
+    { file: '/small.jsonl', entry: entry('small', 1) },
+  ];
+  const limit = Buffer.byteLength(JSON.stringify(rows[1].entry.dispatch));
+  const limited = limitSavedDispatchFacts(rows, limit);
+  assert.deepEqual(
+    limited.map((row) => [row.file, row.entry.dispatch?.facts.sessionId]),
+    [
+      ['/large.jsonl', undefined],
+      ['/small.jsonl', 'small'],
+    ],
+  );
 });
 
 // References from older parser generations require an unchanged parent to be rescanned.

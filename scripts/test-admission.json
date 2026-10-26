@@ -61,7 +61,7 @@
   },
   "extension/src/derivedcache.test.ts": {
     "reason": "Independent writers and host death must preserve shared cache rows and release stale filesystem locks.",
-    "cases": 90,
+    "cases": 91,
     "matricesSha256": "55da9f9b63e6e59531ede691941eea3b7eaaed01debbccc5b7174a6d01e191af"
   },
   "extension/src/exportsite.browser.test.ts": {
@@ -136,7 +136,7 @@
   },
   "extension/src/progressiveworker.test.ts": {
     "reason": "Worker protocol, cancellation, host death, bounded transcript reads, and scoped subagent edit reads must survive the actual worker boundary.",
-    "cases": 141,
+    "cases": 142,
     "matricesSha256": "4876e74f27640bd9f53f6f5063c4d74f0bab640e16c4e4a85f1ec9c32b62d6a4"
   },
   "extension/src/projectsetups.test.ts": {

@@ -375,6 +375,20 @@ export const CLAUDE_CHILD_REFERENCE_PARSER_VERSION = 26;
 export const MAX_CLAUDE_CHILD_REFERENCE_FILES = 10_000;
 export const MAX_CODEX_DISPATCH_CURSOR_BYTES = 64 * 1024 * 1024;
 export { MAX_CLAUDE_CHILD_REFERENCES_PER_FILE };
+// Bump when Claude or Codex dispatched spend reading changes what it derives. A mismatch drops the saved
+// facts and keeps their rows.
+export const DISPATCH_FACTS_VERSION = 1;
+export const MAX_SAVED_DISPATCH_FACTS_BYTES = 16 * 1024 * 1024;
+
+// A dispatched session's settled spend facts at one file revision and spend tree.
+export interface SavedDispatchFacts {
+  version: number;
+  revision: import('./transcript').FileRevision;
+  tree: string;
+  sourceGeneration?: number;
+  codexDependencies?: string[];
+  facts: import('./progressiveworker').DispatchSessionFacts;
+}
 
 export interface ClaudeChildReferenceCacheEntry {
   sourceGeneration?: number;
@@ -393,6 +407,8 @@ export interface ClaudeChildReferenceCacheEntry {
   validatedRevision?: import('./transcript').FileRevision;
   // The head this source's file named when discovery resolved it as a Claude child, kept so a new worker skips the read.
   head?: import('./transcript').ClaudeChildHead;
+  // The spend facts of this source's file when it was a settled dispatched session, kept so a new worker skips the read.
+  dispatch?: SavedDispatchFacts;
   mtimeMs: number;
   size: number;
   dev: number | string;
@@ -992,6 +1008,63 @@ function fileRevision(value: unknown): boolean {
   );
 }
 
+function savedDispatchFacts(value: unknown): value is SavedDispatchFacts {
+  if (!record(value) || !record(value.facts)) return false;
+  const facts = value.facts;
+  const spend = facts.spend;
+  if (!record(spend)) return false;
+  return (
+    value.version === DISPATCH_FACTS_VERSION &&
+    fileRevision(value.revision) &&
+    text(value.tree) &&
+    (value.sourceGeneration === undefined || nonNegative(value.sourceGeneration)) &&
+    (value.codexDependencies === undefined ||
+      (Array.isArray(value.codexDependencies) && value.codexDependencies.every(nonEmptyText))) &&
+    nonEmptyText(facts.sessionId) &&
+    facts.refreshAt === null &&
+    fileRevision(facts.revision) &&
+    nullableFinite(facts.startedAt) &&
+    nullableFinite(facts.endedAt) &&
+    nonNegative(facts.toolUses) &&
+    typeof facts.person === 'boolean' &&
+    Array.isArray(spend.models) &&
+    typeof spend.found === 'boolean' &&
+    typeof spend.partial === 'boolean'
+  );
+}
+
+// Drops saved dispatched facts of another facts version, or any that fail their check, and keeps the row.
+function withCurrentDispatch(value: unknown): unknown {
+  if (!record(value) || value.dispatch === undefined || savedDispatchFacts(value.dispatch)) return value;
+  const { dispatch: _dispatch, ...entry } = value;
+  return entry;
+}
+
+// Keeps the smallest saved dispatched facts within `byteLimit` and drops the rest from their rows.
+export function limitSavedDispatchFacts(
+  rows: Array<{ file: string; entry: ClaudeChildReferenceCacheEntry }>,
+  byteLimit = MAX_SAVED_DISPATCH_FACTS_BYTES,
+): Array<{ file: string; entry: ClaudeChildReferenceCacheEntry }> {
+  const sized = rows
+    .flatMap((row, index) =>
+      row.entry.dispatch
+        ? [{ index, file: row.file, bytes: Buffer.byteLength(JSON.stringify(row.entry.dispatch)) }]
+        : [],
+    )
+    .sort((a, b) => a.bytes - b.bytes || a.file.localeCompare(b.file));
+  let total = 0;
+  const limited = [...rows];
+  for (const row of sized) {
+    if (total + row.bytes <= byteLimit) {
+      total += row.bytes;
+      continue;
+    }
+    const { dispatch: _dispatch, ...entry } = limited[row.index].entry;
+    limited[row.index] = { file: row.file, entry };
+  }
+  return limited;
+}
+
 function childReferenceEntry(value: unknown): value is ClaudeChildReferenceCacheEntry {
   if (!record(value) || !nonEmptyText(value.sessionId)) {
     return false;
@@ -1010,6 +1083,7 @@ function childReferenceEntry(value: unknown): value is ClaudeChildReferenceCache
       (record(value.head) &&
         fileRevision(value.head.revision) &&
         (value.head.cwd === null || nonEmptyText(value.head.cwd)))) &&
+    (value.dispatch === undefined || savedDispatchFacts(value.dispatch)) &&
     (value.pendingReferences === undefined ||
       (Array.isArray(value.pendingReferences) &&
         value.pendingReferences.length <= MAX_CLAUDE_CHILD_REFERENCES_PER_FILE &&
@@ -1168,13 +1242,9 @@ export function loadDerivedCache(file: string, legacyFile?: string): DerivedCach
     }
     const relationshipRows = Array.isArray(parsed.claudeChildReferences) ? parsed.claudeChildReferences : [];
     for (const row of legacy && !knownLegacy ? [] : relationshipRows) {
-      if (
-        record(row) &&
-        fileName(row.file) &&
-        childReferenceEntry(row.entry) &&
-        (!legacy || row.entry.parserVersion === 26)
-      ) {
-        loaded.claudeChildReferences.set(normalizeFsPath(row.file), row.entry);
+      const entry = record(row) ? withCurrentDispatch(row.entry) : undefined;
+      if (record(row) && fileName(row.file) && childReferenceEntry(entry) && (!legacy || entry.parserVersion === 26)) {
+        loaded.claudeChildReferences.set(normalizeFsPath(row.file), entry);
       }
     }
     const admitted = loaded.claudeChildReferences;
@@ -1284,7 +1354,7 @@ export function saveDerivedCache(
         ? discovery
         : undefined,
     titles: titleRows,
-    claudeChildReferences: childRows.slice(0, MAX_CLAUDE_CHILD_REFERENCE_FILES),
+    claudeChildReferences: limitSavedDispatchFacts(childRows.slice(0, MAX_CLAUDE_CHILD_REFERENCE_FILES)),
     // Persists carried names until a title entry replaces them, including across restarts.
     carriedNames: [...carriedNames]
       .filter(([entryFile]) => !titled.has(entryFile))

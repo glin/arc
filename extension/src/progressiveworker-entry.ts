@@ -92,11 +92,13 @@ import {
 } from './transcript';
 import {
   CLAUDE_CHILD_REFERENCE_PARSER_VERSION,
+  DISPATCH_FACTS_VERSION,
   limitCodexDispatchCursors,
   needsAgentRunScan,
   onlyGrew,
   scanKeptThroughGrowth,
   type ClaudeChildReferenceCacheEntry,
+  type SavedDispatchFacts,
 } from './derivedcache';
 import {
   AgentSpendCache,
@@ -136,28 +138,63 @@ const claudeChildReferences = new Map<string, ClaudeChildReferenceCacheEntry>();
 // Cached subagent revisions invalidate the dispatched session's spend.
 // Claude retains its append scan for reader input.
 // Codex retains its prompt cursor across quiet reads to correct copied-turn classification.
-const dispatchFacts = new Map<
-  string,
-  {
-    revision: FileRevision;
-    tree: string;
-    facts: DispatchSessionFacts;
-    refreshAt: number;
-    person?: PersonScan;
-    codexPerson?: CodexPersonScan;
-    codexDependencies?: string[];
-    sourceGeneration?: number;
-    spendPending?: boolean;
-  }
->();
-// A reply row carries the head its file named, so the next activation resolves an unchanged child with one stat.
-function withChildHead([file, entry]: [string, ClaudeChildReferenceCacheEntry]): [
+interface HeldDispatchFacts {
+  revision: FileRevision;
+  tree: string;
+  facts: DispatchSessionFacts;
+  refreshAt: number;
+  person?: PersonScan;
+  codexPerson?: CodexPersonScan;
+  codexDependencies?: string[];
+  sourceGeneration?: number;
+  spendPending?: boolean;
+  // Whether a later activation can reuse these facts for the same revision and tree.
+  settled?: boolean;
+  saved?: SavedDispatchFacts;
+}
+const dispatchFacts = new Map<string, HeldDispatchFacts>();
+// Row keys whose saved dispatched facts this worker already took, so an entry the worker dropped stays dropped.
+const seededDispatchFacts = new Set<string>();
+// The settled facts each dispatched file saves with its reference row, by row key, from the last dispatch pass.
+// Null before this worker's first pass, so reply rows keep the facts they arrived with.
+let savedDispatchFacts: Map<string, SavedDispatchFacts> | null = null;
+// A new worker takes a dispatched file's facts from its saved reference row once.
+function seededDispatch(file: string): HeldDispatchFacts | undefined {
+  const key = normalizeFsPath(file);
+  if (seededDispatchFacts.has(key)) return undefined;
+  seededDispatchFacts.add(key);
+  const saved = claudeChildReferences.get(key)?.dispatch;
+  if (saved?.version !== DISPATCH_FACTS_VERSION) return undefined;
+  const held: HeldDispatchFacts = {
+    revision: saved.revision,
+    tree: saved.tree,
+    facts: saved.facts,
+    refreshAt: Number.POSITIVE_INFINITY,
+    codexDependencies: saved.codexDependencies,
+    sourceGeneration: saved.sourceGeneration,
+    settled: true,
+    saved,
+  };
+  dispatchFacts.set(file, held);
+  return held;
+}
+// A reply row carries the head its file named and its settled dispatched facts, so the next activation
+// resolves an unchanged child with one stat and reuses unchanged dispatched spend.
+function withSavedFacts([file, entry]: [string, ClaudeChildReferenceCacheEntry]): [
   string,
   ClaudeChildReferenceCacheEntry,
 ] {
   const head = claudeChildSessions.heads().get(file);
-  if (!head || head === entry.head) return [file, entry];
-  return [file, { ...entry, head }];
+  let row = !head || head === entry.head ? entry : { ...entry, head };
+  if (savedDispatchFacts) {
+    const dispatch = savedDispatchFacts.get(file);
+    if (dispatch) row = dispatch === row.dispatch ? row : { ...row, dispatch };
+    else if (row.dispatch) {
+      const { dispatch: _dispatch, ...rest } = row;
+      row = rest;
+    }
+  }
+  return [file, row];
 }
 const DISPATCH_METADATA_BYTES = 256 * 1024;
 export const CODEX_DISPATCH_REQUEST_BYTES = 8 * 1024 * 1024;
@@ -554,7 +591,7 @@ async function execute(
       if (delta) {
         const value = {
           kind: 'claude-children-delta' as const,
-          referenceEntries: source ? [withChildHead([source, claudeChildReferences.get(source)!])] : [],
+          referenceEntries: source ? [withSavedFacts([source, claudeChildReferences.get(source)!])] : [],
           checkpoint: header,
           epoch: epoch.epoch!,
           parserVersion: CLAUDE_CHILD_REFERENCE_PARSER_VERSION,
@@ -576,7 +613,7 @@ async function execute(
       epoch.completed = [...completed];
       return {
         kind: 'claude-children-progress' as const,
-        referenceEntries: entries.map(withChildHead),
+        referenceEntries: entries.map(withSavedFacts),
         checkpoint: epoch,
         continuation: true as const,
         charges,
@@ -942,7 +979,7 @@ async function execute(
         if (!revision) {
           continue;
         }
-        const heldValue = dispatchFacts.get(reference.file);
+        const heldValue = dispatchFacts.get(reference.file) ?? seededDispatch(reference.file);
         const sourceGeneration = claudeChildReferences.get(normalizeFsPath(reference.file))?.sourceGeneration;
         const held =
           heldValue &&
@@ -1119,6 +1156,8 @@ async function execute(
           refreshAt: active ? refreshAt : Number.POSITIVE_INFINITY,
           person: scan,
           codexPerson,
+          settled:
+            !active && !spendPending && collectedTree === tree && (!codexPerson || codexPerson.bytes >= revision.size),
         });
         dispatched.push(facts);
       }
@@ -1136,13 +1175,26 @@ async function execute(
         dispatchFacts.delete(file);
       }
     }
+    savedDispatchFacts = new Map();
+    for (const [file, held] of dispatchFacts) {
+      if (!held.settled) continue;
+      held.saved ??= {
+        version: DISPATCH_FACTS_VERSION,
+        revision: held.revision,
+        tree: held.tree,
+        sourceGeneration: held.sourceGeneration,
+        codexDependencies: held.codexDependencies,
+        facts: held.facts,
+      };
+      savedDispatchFacts.set(normalizeFsPath(file), held.saved);
+    }
     return {
       kind: 'claude-children',
       checkpoint: { ...epoch, completed: [...completed], sequence: epoch.sequence + 1 },
       ...found,
       references,
       dispatchFacts: dispatched,
-      referenceEntries: [...claudeChildReferences].map(withChildHead),
+      referenceEntries: [...claudeChildReferences].map(withSavedFacts),
       complete: true,
       continuation,
       charges,
