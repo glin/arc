@@ -9200,7 +9200,7 @@ export class PanelProvider implements vscode.Disposable {
           humanPromptWork,
           generation,
           admissionSelection,
-          !this.catalogWalked && !selectedOnly ? 'skip' : 'recheck',
+          selectedOnly ? 'recheck' : 'skip',
         );
         if (
           controller.signal.aborted ||
@@ -12343,8 +12343,9 @@ export class PanelProvider implements vscode.Disposable {
 
   // Admission finishes before publication. Read and source allowances span the entire refresh.
   // `settled` says what to do with a session whose complete scan found a prompt at the revision the catalog
-  // holds now. A refresh that walked rechecks every file. A refresh that reused the held catalog, with or
-  // without revalidating named rows, skips the sessions whose held revision did not move.
+  // holds now. A catalog refresh skips the sessions whose listed revision did not move, after a walk or with
+  // the held catalog. A walked row carries the size, time, device and inode of the stat that listed it.
+  // A selected-only refresh and the relist after a replaced file recheck every file.
   private async prepareHumanPrompts(
     sessions: SessionFile[],
     sizeCurrent: boolean,

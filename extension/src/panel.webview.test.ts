@@ -3628,7 +3628,7 @@ test('command-only admission removes pending rows through every catalog path and
 // A refresh that reused the held catalog knows nothing new about a file whose complete scan found a prompt at the
 // revision the catalog holds, so admission takes that session without a file check. Each file check names its cause.
 
-test('a catalog-reusing refresh admits settled sessions without a file check and rechecks moved ones', async () => {
+test('a catalog refresh admits settled sessions without a file check after a walk or reuse and rechecks moved or replaced ones', async () => {
   const { humanPromptScanSteps, promptScanLists, sameSessionRevision, scanForHumanPrompt } =
     await import('./transcript.ts');
   const directory = tempDir('human-admission-settled-');
@@ -3649,10 +3649,12 @@ test('a catalog-reusing refresh admits settled sessions without a file check and
   const second = row(write('second'), 'second');
   const silent = row(write('silent', [peer]), 'silent');
   let stats = 0;
+  const checked: string[] = [];
   const dependencies = {
     fs: {
       statSync: (...args: any[]) => {
         stats++;
+        checked.push(args[0]);
         return (fs.statSync as any)(...args);
       },
     },
@@ -3760,19 +3762,43 @@ test('a catalog-reusing refresh admits settled sessions without a file check and
     'a session without a scan counted another cause',
   );
 
-  // The refresh passes skip only after a listing that reused the held catalog.
-  const modes: unknown[] = [];
+  // A refresh settles the same sessions after a walk as after reusing the held catalog, because a walked row
+  // carries the revision and identity that the settled check compares.
+  const { enumerateSessionFiles } = await import('./transcript.ts');
+  const walkDirectory = tempDir('human-admission-walk-');
+  const peerLine = JSON.stringify(peer);
+  const humanBase = JSON.stringify({ type: 'user', message: { role: 'user', content: '' } });
+  const sameSizeHuman = JSON.stringify({
+    type: 'user',
+    message: { role: 'user', content: 'actual task'.padEnd(peerLine.length - humanBase.length, '.') },
+  });
+  assert.equal(sameSizeHuman.length, peerLine.length, 'the replacement fixture changed its size');
+  const walkFile = (name: string, text: string) => {
+    const file = path.join(walkDirectory, `${name}.jsonl`);
+    fs.writeFileSync(file, text + '\n');
+    return file;
+  };
+  const kept = walkFile('kept', [JSON.stringify(human), peerLine].join('\n'));
+  const growing = walkFile('growing', [JSON.stringify(human), peerLine].join('\n'));
+  const replaced = walkFile('replaced', sameSizeHuman);
+  const fixedTime = new Date('2026-01-01T00:00:00Z');
+  fs.utimesSync(replaced, fixedTime, fixedTime);
+  let reused = false;
+  let listed: any[] = [];
   const wired: any = {
     humanScans: new Map(),
     refreshGeneration: 0,
     authoritativeCatalog: null,
     repositoryScopeReady: true,
-    prepareHumanPrompts: (sessions: unknown[], ...rest: unknown[]) => {
-      modes.push(rest[5]);
-      return sessions;
+    performanceCounters: { recordWork: (name: string) => work.push(name) },
+    prepareHumanPrompts: prepare,
+    // A walk lists every row from a fresh stat. A reused catalog returns the rows it holds.
+    allSessions(this: any) {
+      this.catalogWalked = !reused;
+      if (!reused) listed = enumerateSessionFiles(walkDirectory).sessions;
+      return listed;
     },
-    allSessions: () => [first, second],
-    catalogWalked: false,
+    catalogWalked: true,
   };
   const refresh = methodBody('async refresh(');
   const segment = refresh.slice(
@@ -3789,10 +3815,52 @@ test('a catalog-reusing refresh admits settled sessions without a file check and
     { compilerOptions: { target: ts.ScriptTarget.ES2022 } },
   ).outputText;
   const run = new Function('CATALOG_REFRESH_DEADLINE_MS', `${runSource}\nreturn run;`)(60_000);
-  await run.call(wired);
-  wired.catalogWalked = true;
-  await run.call(wired);
-  assert.deepEqual(modes, ['skip', 'recheck']);
+  const poll = async () => {
+    stats = 0;
+    checked.length = 0;
+    work.length = 0;
+    return files(await run.call(wired)).sort();
+  };
+  const fileChecks = () => work.filter((name) => name.startsWith('humanPromptStat:'));
+
+  assert.deepEqual(await poll(), [growing, kept, replaced].sort(), 'the first walk did not admit every prompt');
+  assert.deepEqual(
+    [...new Set(checked)].sort(),
+    [growing, kept, replaced].sort(),
+    'the first walk did not check every file',
+  );
+
+  assert.deepEqual(await poll(), [growing, kept, replaced].sort());
+  assert.deepEqual(fileChecks(), [], 'a poll walk at an unchanged catalog checked a settled session');
+  assert.equal(stats, 0, 'a poll walk at an unchanged catalog checked a file');
+  reused = true;
+  assert.deepEqual(await poll(), [growing, kept, replaced].sort());
+  assert.equal(stats, 0, 'a catalog-reusing refresh checked a settled session');
+  reused = false;
+
+  fs.appendFileSync(growing, peerLine + '\n');
+  const grownSize = fs.statSync(growing).size;
+  assert.deepEqual(await poll(), [growing, kept, replaced].sort());
+  assert.ok(stats >= 1, 'a walk did not check a grown file');
+  assert.deepEqual([...new Set(checked)], [growing], 'a walk checked a file other than the grown one');
+  assert.deepEqual(fileChecks(), Array(stats).fill('humanPromptStat:moved'), 'a grown file counted another cause');
+  assert.equal(wired.humanScans.get(growing)?.source?.size, grownSize, 'the grown file kept its old revision');
+  await poll();
+  assert.equal(stats, 0, 'the walk after a grown file checked it again');
+
+  // A replacement at the same path, size and time shows only in its device and inode.
+  const before = revisionOf(fs.statSync(replaced, { bigint: true }));
+  const swap = path.join(walkDirectory, 'swap.tmp');
+  fs.writeFileSync(swap, peerLine + '\n');
+  fs.utimesSync(swap, fixedTime, fixedTime);
+  fs.renameSync(swap, replaced);
+  const after = revisionOf(fs.statSync(replaced, { bigint: true }));
+  assert.ok(sameSessionRevision(before, after), 'the replacement moved its size or time');
+  assert.notEqual(String(after.ino), String(before.ino), 'the replacement kept its inode');
+  assert.deepEqual(await poll(), [growing, kept].sort(), 'a replacement without a prompt stayed listed');
+  assert.deepEqual([...new Set(checked)], [replaced], 'a walk checked a file other than the replaced one');
+  assert.deepEqual(fileChecks(), Array(stats).fill('humanPromptStat:moved'), 'a replaced file counted another cause');
+  assert.equal(String(wired.humanScans.get(replaced)?.source?.ino), String(after.ino));
 });
 
 test('refresh human admission shares read and source allowances and resumes cancelled scans', async () => {
