@@ -9305,8 +9305,12 @@ test('a Claude child transcript keeps model rates apart, reports nested work, an
       },
     },
   ]);
-  const { artifacts, ...spend } = readClaudeAgentSpend(file);
+  const { artifacts, requests, ...spend } = readClaudeAgentSpend(file);
   assert.deepEqual([artifacts?.files, artifacts?.commits, artifacts?.complete], [[], [], true]);
+  assert.deepEqual(
+    requests?.map((request) => request.model),
+    ['claude-opus-5', 'claude-sonnet-5'],
+  );
   assert.deepEqual(
     { ...spend, models: spend.models.map(({ usageParts: _usageParts, ...model }) => model) },
     {

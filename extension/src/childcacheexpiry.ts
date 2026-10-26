@@ -1,3 +1,4 @@
+import { requestClock as clock, requestSpans, spanHolding } from './agentspend';
 import { turnKey } from './domain/read';
 import {
   pricedNativeCacheReturns,
@@ -20,13 +21,9 @@ interface Span {
   turn: Turn;
   start: number;
   end: number;
-  next: number;
   cap: number;
-  ambiguous: boolean;
   closures: Map<string, number>;
 }
-const clock = (at: number | null | undefined): at is number =>
-  at !== undefined && at !== null && Number.isFinite(at) && at > 0;
 
 // Prices survive a different card batch while their accepted source revision stays unchanged.
 export class ChildCacheExpiryAttribution {
@@ -64,22 +61,17 @@ export class ChildCacheExpiryAttribution {
         if (typeof child === 'string') untimed.add(child);
         else if (clock(child.closedAt)) closures.set(child.id, child.closedAt);
       }
-      const sorted = group.filter((turn) => clock(turn.startedAt)).sort((a, b) => a.startedAt - b.startedAt);
-      const spans: Span[] = sorted.map((turn, at) => {
-        const next = sorted[at + 1]?.startedAt ?? Infinity;
-        const outcome = outcomes.get(sessionId);
+      const outcome = outcomes.get(sessionId);
+      // The same spans place each child request in a turn for the subagent rows.
+      const spans: Span[] = requestSpans(group, outcome).map(({ turn, start, cap }, at, all) => {
         const matching = outcome?.startedAt === turn.startedAt ? outcome : null;
-        const processEnd = turn.processEndedAt ?? matching?.processEndedAt;
         const recordedEnd = Math.max(turn.endedAt ?? turn.startedAt, matching?.endedAt ?? 0);
-        const liveEnd = at === sorted.length - 1 && ongoing.has(sessionId) ? now : recordedEnd;
-        const cap = clock(processEnd) ? processEnd : Infinity;
+        const liveEnd = at === all.length - 1 && ongoing.has(sessionId) ? now : recordedEnd;
         return {
           turn,
-          start: turn.startedAt,
+          start,
           end: Math.min(Math.max(recordedEnd, liveEnd), cap),
-          next,
           cap,
-          ambiguous: sorted[at - 1]?.startedAt === turn.startedAt || next === turn.startedAt,
           closures: new Map(
             (turn.agents ?? []).flatMap((agent) =>
               clock(agent.closedAt) ? [[agent.childSessionId ?? agent.id ?? '', agent.closedAt] as const] : [],
@@ -115,22 +107,8 @@ export class ChildCacheExpiryAttribution {
         for (const { item, cost } of priced.returns) {
           inspect(item);
           if (!clock(item.timestamp)) continue;
-          let low = 0,
-            high = spans.length;
-          while (low < high) {
-            const mid = (low + high) >>> 1;
-            if (spans[mid].start <= item.timestamp) low = mid + 1;
-            else high = mid;
-          }
-          const span = spans[low - 1];
-          if (
-            !span ||
-            span.ambiguous ||
-            span.end < span.start ||
-            item.timestamp >= span.next ||
-            item.timestamp > span.cap
-          )
-            continue;
+          const span = spanHolding(spans, item.timestamp);
+          if (!span || span.end < span.start) continue;
           const closedAt = Math.max(closures.get(childId) ?? 0, span.closures.get(childId) ?? 0) || undefined;
           const legacyClosed = untimed.has(childId);
           // Recorded work beyond the shared closure margin reopens that child's work episode.

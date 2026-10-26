@@ -61,6 +61,56 @@ export interface AgentSpend {
   // True when a session's own transcript holds a sign that only a person leaves, from
   // `personSpokeIn` in transcript.ts. Absent otherwise, and on a subagent's transcript.
   person?: boolean;
+  // Every request of the child, with its clock, including nested subagents and estimated
+  // compactions. `models` totals leave the estimates out, and their usage parts include them. A
+  // parent card prices each turn's share of the child from this list. Only a Claude subagent
+  // read sets it.
+  requests?: readonly import('./transcript').UsageEvent[];
+}
+
+// True for a recorded epoch-millisecond time. Child request attribution ignores any other value.
+export const requestClock = (at: number | null | undefined): at is number =>
+  at !== undefined && at !== null && Number.isFinite(at) && at > 0;
+
+// One turn's place in time for child request attribution. `cap` is the turn's accepted process
+// end, or Infinity when none is recorded.
+export interface RequestSpan<T> {
+  turn: T;
+  start: number;
+  cap: number;
+}
+
+// The spans of one session's turns for child request attribution, sorted by start. A turn's cap
+// is its own recorded process end. When `outcome` describes the turn, its process end also counts.
+// A turn without a recorded start takes no part.
+export function requestSpans<T extends { startedAt: number; processEndedAt?: number }>(
+  turns: readonly T[],
+  outcome?: { startedAt?: number; processEndedAt?: number } | null,
+): RequestSpan<T>[] {
+  return turns
+    .filter((turn) => requestClock(turn.startedAt))
+    .sort((a, b) => a.startedAt - b.startedAt)
+    .map((turn) => {
+      const processEnd =
+        turn.processEndedAt ?? (outcome?.startedAt === turn.startedAt ? outcome.processEndedAt : undefined);
+      return { turn, start: turn.startedAt, cap: requestClock(processEnd) ? processEnd : Infinity };
+    });
+}
+
+// The span that holds a request sent at `at`, from spans sorted by start. A span holds requests
+// from its start until the next span starts. A request after one turn ends and before the next
+// turn starts therefore belongs to the earlier turn. A request after its span's cap, or in a span
+// that shares its start with another span, belongs to no span.
+export function spanHolding<S extends { start: number; cap: number }>(spans: readonly S[], at: number): S | null {
+  let low = 0;
+  let high = spans.length;
+  while (low < high) {
+    const mid = (low + high) >>> 1;
+    if (spans[mid].start <= at) low = mid + 1;
+    else high = mid;
+  }
+  const span = spans[low - 1];
+  return !span || at > span.cap || spans[low - 2]?.start === span.start ? null : span;
 }
 
 // What a parent transcript recorded well enough to identify one child transcript.
@@ -382,6 +432,7 @@ export function readChildSpend(
     partial: spend.partial,
     effort: spend.effort,
     ...(spend.usageIncomplete ? { usageIncomplete: true } : {}),
+    ...(spend.requests ? { requests: spend.requests } : {}),
   };
 }
 

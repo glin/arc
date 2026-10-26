@@ -2039,6 +2039,8 @@ function selectedWindowHarness(
     'acceptSelectedMetadataRead',
     'spendVersion',
     'updateHistoryAfterAcceptedWindow',
+    'jointSplitWindow',
+    'acceptJointSplitWindow',
     ...extra,
     // evictCache calls pruneDerivedTitles.
     ...(extra.includes('evictCache') ? ['pruneDerivedTitles'] : []),
@@ -3022,6 +3024,7 @@ test('a completed Codex response stays on the selected timeline after later turn
     };
     return result;
   });
+  provider.session = { ...provider.session, agent: 'codex' };
   provider.cache.set('selected.jsonl', {
     key: 'previous',
     agentKey: '',
@@ -7399,7 +7402,7 @@ test('growth during selected retained-history enrichment preserves pages and adv
   );
   await vi.waitFor(() => assert.equal(provider.selectionWork, null));
 
-  assert.equal(provider.history.get('selected').pages, pages, 'growth discarded accepted older pages');
+  assert.deepEqual(provider.history.get('selected').pages, pages, 'growth discarded accepted older pages');
   assert.equal(provider.dropped, 0, 'growth dropped retained history');
   assert.deepEqual(provider.cache.get('selected.jsonl').revision, { size: 12, mtimeMs: 12, dev: 1, ino: 2 });
 });
@@ -7638,6 +7641,8 @@ test.each([99999, 100000])(
           'agentFactsCurrent',
           'historyAgentKey',
           'refreshAgentFacts',
+          'jointSplitWindow',
+          'acceptJointSplitWindow',
         ],
       );
       provider.claudeChildReferences = [
@@ -7776,7 +7781,14 @@ test('a nested subagent that appears or grows after its launcher finished moves 
       );
       return result;
     },
-    ['agentSpendKey', 'agentFile', 'codexStructuralChildren', 'refreshAgentFacts'],
+    [
+      'agentSpendKey',
+      'agentFile',
+      'codexStructuralChildren',
+      'refreshAgentFacts',
+      'jointSplitWindow',
+      'acceptJointSplitWindow',
+    ],
   );
   provider.claudeChildReferences = [
     { parentSessionId: 'selected', sessionId: 'a1', toolUseIds: ['launch-1'], file: launcher },
@@ -7894,7 +7906,14 @@ test('a subagent that discovery has not listed keys its cost through its meta fi
       );
       return result;
     },
-    ['agentSpendKey', 'agentFile', 'codexStructuralChildren', 'refreshAgentFacts'],
+    [
+      'agentSpendKey',
+      'agentFile',
+      'codexStructuralChildren',
+      'refreshAgentFacts',
+      'jointSplitWindow',
+      'acceptJointSplitWindow',
+    ],
   );
   provider.session = { ...provider.session, file: session };
   provider.claudeChildReferences = [];
@@ -7955,6 +7974,8 @@ test('a running Codex subagent writing its rollout keeps the selected read and s
       'agentFactsCurrent',
       'historyAgentKey',
       'refreshAgentFacts',
+      'jointSplitWindow',
+      'acceptJointSplitWindow',
     ],
   );
   provider.session = { ...provider.session, agent: 'codex' };
@@ -8066,6 +8087,8 @@ test('a parent write during a subagent cost refresh reaches the selected card', 
       'agentFactsCurrent',
       'historyAgentKey',
       'refreshAgentFacts',
+      'jointSplitWindow',
+      'acceptJointSplitWindow',
     ],
   );
   provider.claudeChildReferences = [
@@ -8171,6 +8194,8 @@ function resumedSubagentProvider(tailShowsChild: boolean, extra: string[] = []) 
       'agentFactsCurrent',
       'historyAgentKey',
       'refreshAgentFacts',
+      'jointSplitWindow',
+      'acceptJointSplitWindow',
       ...extra,
     ],
   );

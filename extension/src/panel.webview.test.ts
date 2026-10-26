@@ -12083,8 +12083,35 @@ test('Claude relationships refresh current and retained parent rows without a pa
   const retained = workerEntry.slice(retainedAt, workerEntry.indexOf("if (request.kind === 'page')", retainedAt));
   sourceMatch(
     retained,
-    /refreshClaudeAgentFacts\(page\.turns, agentSpendOf, agentSessionTargetOf\)/,
+    /refreshRetainedClaudeAgentFacts\(\s*request\.pages,\s*agentSpendOf,\s*agentSessionTargetOf,\s*request\.endsAtNewest === true,?\s*\)/,
     'retained Claude rows keep child targets and spend from their original page read',
+  );
+  // A child write refreshes the newest window after the retained pages, with its newest turn open.
+  sourceMatch(
+    facts,
+    /const history = session\.agent === 'claude' \? this\.history\.get\(session\.sessionId\) : undefined;/,
+    'a child resumed in the newest window keeps its later cost on the card an older page launched it from',
+  );
+  sourceMatch(
+    facts,
+    /pages: \[\.\.\.pages, \{ turns: entry\.read\.turns, compactions: \[\], bytes: 0 \}\],\s*structuralAgentIds: entry\.structuralAgentIds,\s*endsAtNewest: true,/,
+    'a child write splits the newest window apart from the retained pages, or with its newest turn closed',
+  );
+  // Retained page refreshes read the current window too, and a new window refreshes the pages with it.
+  const twice = (line: string) => panelHostSource.split(line).length - 1 === 2;
+  assert.ok(
+    twice('const window = this.jointSplitWindow(session, windowVersions, historyNow);') &&
+      twice(
+        'pages: window ? [...history.pages, { turns: window.read.turns, compactions: [], bytes: 0 }] : history.pages,',
+      ) &&
+      twice('...(window ? { endsAtNewest: true } : {}),'),
+    'a retained page refresh places child requests without the newest window',
+  );
+  assert.ok(
+    panelHostSource.includes(
+      "retryLatestRevision ||= current.agent === 'claude' && Boolean(this.history.get(sessionId)?.pages.length);",
+    ) && panelHostSource.includes('await this.refreshAgentFacts(session, accepted, generation, signal);'),
+    'a new window leaves the retained pages split against the window before it',
   );
   const prepareAt = panelHostSource.indexOf('private async prepareProgressive(');
   const prepare = panelHostSource.slice(prepareAt, panelHostSource.indexOf('// Answer the sentinel', prepareAt));
@@ -21608,7 +21635,7 @@ test('older pages survive an append, and go when the file or the budget says so'
   const progressive = memberFrom(panelHostSource, panelHostSource.indexOf('private async prepareProgressive('));
   sourceMatch(
     progressive,
-    /kind: 'retained', input: this\.progressiveInput\(session, historyNow\), pages: history\.pages[\s\S]*?this\.history\.set\(session\.sessionId, \{ \.\.\.history, pages: updated\.value\.pages \}\);/,
+    /kind: 'retained',\s*input: this\.progressiveInput\(session, historyNow\),\s*pages: window \? \[\.\.\.history\.pages, \{ turns: window\.read\.turns, compactions: \[\], bytes: 0 \}\] : history\.pages,[\s\S]*?this\.history\.set\(session\.sessionId, \{\s*\.\.\.history,\s*pages: updated\.value\.pages\.slice\(0, history\.pages\.length\),?\s*\}\);/,
     'a child-only change does not refresh retained Codex pages through the worker',
   );
   const workerEntry = fs.readFileSync(path.join(__dirname, 'progressiveworker-entry.ts'), 'utf8');

@@ -323,6 +323,8 @@ export type ProgressiveRequest =
       pages: HistoryPage[];
       structuralAgentIds?: readonly string[];
       hidden?: HiddenTurnFields[];
+      // True when the last page is the newest window, so no later turn follows its last turn.
+      endsAtNewest?: boolean;
     }
   | { kind: 'page'; input: ProgressiveInput; cursor: ProgressiveCursor | null };
 export type ProgressiveValue =

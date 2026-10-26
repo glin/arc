@@ -146,7 +146,7 @@ Paths are relative to `extension/src/`. [Architecture](architecture.md) owns pac
 | `railpublication-measure.ts` | Session list publication measurement over a generated list: input gate passes, snapshot and delta posts with their bytes, rows carried, and bytes per simulated minute | no |
 | `diagnosticslog.ts` | Per-host JSON-line diagnostics, startup thresholds, asynchronous startup history, and bounded durable host health, lifecycle and action evidence independent of detailed logging | no |
 | `sessionloadingline.ts` | Decides what the session-list loading line publishes, holds it hidden for the scope roots that completed the list, and writes each change of the line to the diagnostics log under fixed line budgets | no |
-| `agentspend.ts` | Reads and caches child-transcript usage and direct-source measurements with measured model identity, shares aggregate refresh bands, and defines the verified child-session target lookup boundary | no |
+| `agentspend.ts` | Reads and caches child-transcript usage and direct-source measurements with measured model identity, shares aggregate refresh bands, defines the verified child-session target lookup boundary, and holds the rule that places a child request in one turn | no |
 | `childartifacts.ts` | Reduces a child's recorded files and commits to one record per file, with its line counts, and to distinct commit ids, with completeness and the child revision. Counts the child's tool calls and failed calls by tool name, keeps when its turns started and ended, and counts its turns where it ran more than one | no |
 | `settings.ts` | Setting names, defaults, and compatibility aliases | no |
 | `activitydetail.ts` | Shared activity subject policies and safe tool-input presentation | no |
