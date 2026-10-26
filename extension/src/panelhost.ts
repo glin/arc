@@ -738,10 +738,11 @@ type RenderCard = (TurnCard | CompactionCard) & { summaryHtml: string };
 type DispatchedCostsCaller =
   | 'refreshDiscovery'
   | 'spendOffer'
+  | 'integrityCheck'
   | 'indexIdle'
   | 'hydrate'
   | 'checkpoint'
-  | 'coverageNoLedger'
+  | 'offerNoLedger'
   | 'indexFinished'
   | 'spendSources'
   | 'childrenProgress'
@@ -10395,7 +10396,7 @@ export class PanelProvider implements vscode.Disposable {
   }
 
   // Refresh session-list figures when dispatched-source pending state changes, including changes since the last list payload.
-  private postRailIfSpendPendingMoved(caller: 'spendOffer' | 'indexIdle'): void {
+  private postRailIfSpendPendingMoved(caller: 'spendOffer' | 'integrityCheck' | 'indexIdle'): void {
     const holds: SpendSourcePending = (file, record) => this.projectSpendHolds(file, record);
     if (
       this.lifetimeFigures.pendingMoved(holds) ||
@@ -11094,7 +11095,12 @@ export class PanelProvider implements vscode.Disposable {
       );
       ready.push(source);
     }
-    this.queueProjectSpendIndex(revisions, new Set(ready.map((source) => normalizeFsPath(source.file))), ready);
+    this.queueProjectSpendIndex(
+      revisions,
+      new Set(ready.map((source) => normalizeFsPath(source.file))),
+      ready,
+      'integrityCheck',
+    );
     this.publishProjectSpendCoverage();
   }
 
@@ -11159,7 +11165,7 @@ export class PanelProvider implements vscode.Disposable {
       if (!this.projectSpendBusy()) {
         this.postProjectSpend();
         if (!this.projectSpendWorkspace || !this.projectSpendStorageDir)
-          this.postDispatchedCostsIfMoved('coverageNoLedger');
+          this.postDispatchedCostsIfMoved('offerNoLedger');
       }
     };
     const tick = setTimeout(() => {
@@ -11201,6 +11207,7 @@ export class PanelProvider implements vscode.Disposable {
     listedRevisions: ReadonlyMap<string, SpendSourceRevision | null> = new Map(),
     onlyFiles: ReadonlySet<string> | null = null,
     listedSources: readonly { file: string; agent: AgentKind; primary?: boolean }[] = this.projectSpendSources(),
+    caller: 'spendOffer' | 'integrityCheck' = 'spendOffer',
   ): void {
     const workspace = this.projectSpendWorkspace;
     if (!workspace || !this.projectSpendStorageDir) {
@@ -11254,7 +11261,7 @@ export class PanelProvider implements vscode.Disposable {
       }
     }
     // This also publishes moved turn card costs, so a drain that queued nothing ends here.
-    this.postRailIfSpendPendingMoved('spendOffer');
+    this.postRailIfSpendPendingMoved(caller);
     if (!this.projectSpendQueue.length && !this.projectSpendIndexing) {
       return;
     }
