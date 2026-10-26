@@ -3781,7 +3781,7 @@ test('a catalog-reusing refresh admits settled sessions without a file check and
   );
   const runSource = ts.transpileModule(
     `async function run(selectedOnly = false) {
-    const reuseCatalog = true; let generation, controller, primedEnumeration;
+    const reuseCatalog = true; let generation, controller, primedEnumeration, refreshReason;
     ${segment}
     clearTimeout(this.refreshDeadline);
     return all;
@@ -3879,7 +3879,7 @@ test('refresh human admission shares read and source allowances and resumes canc
   );
   const runSource = ts.transpileModule(
     `async function run(selectedOnly = false) {
-    const reuseCatalog = false; let generation, controller, primedEnumeration;
+    const reuseCatalog = false; let generation, controller, primedEnumeration, refreshReason;
     ${segment}
     clearTimeout(this.refreshDeadline);
     return all;
@@ -18576,7 +18576,7 @@ test('a fresh session stays selected until its disk record is discoverable', () 
   const sendAt = panelHostSource.indexOf('private send(');
   const send = panelHostSource.slice(sendAt, panelHostSource.indexOf('private dropCarriedComments(', sendAt));
   const answerAt = send.indexOf('this.livePressAnswered(');
-  const repaintAt = layoutIndexOf(send, 'if (adopted) { void this.refresh(true); }');
+  const repaintAt = layoutIndexOf(send, "if (adopted) { this.refreshFrom('open-asks', true); }");
   assert.ok(
     answerAt >= 0 && repaintAt > answerAt,
     'identity adoption is not repainted after the accepted press moves to the actual id',
@@ -20207,6 +20207,9 @@ test.each([false, true])('/clear publishes the copied setup and preserves delega
     refresh() {
       /* Inspect persisted state without rendering. */
     },
+    refreshFrom() {
+      /* Inspect persisted state without rendering. */
+    },
     post(msg: { type: string; session: string }) {
       posted.push(msg);
       return Promise.resolve();
@@ -20329,6 +20332,9 @@ test("/clear does not evict the source session's own labels at a full label reco
     },
     rememberStarted() {},
     refresh() {
+      /* Inspect state without rendering. */
+    },
+    refreshFrom() {
       /* Inspect state without rendering. */
     },
     post(msg: { type: string; session: string }) {
@@ -20588,6 +20594,7 @@ test('a failed fresh-session launch keeps its reader parent for a successful ret
     flushQueue() {},
     flushAgentQueue() {},
     refresh: () => Promise.resolve(),
+    refreshFrom: () => {},
     sessionOrigins: {} as Record<string, unknown>,
     onSendDraftPrompt() {
       return Promise.resolve({ delivered: accepted, session: accepted ? 'actual' : 'ghost', reason: 'launch failed' });
@@ -20746,6 +20753,7 @@ test('opening another draft retries an unanswered MCP read for its agent', () =>
     refresh() {
       return Promise.resolve();
     },
+    refreshFrom() {},
   };
   createDraft.call(host, 'd1', DRAFT_CWD, 's1', DRAFT_MADE_AT, DRAFT_SETUP);
   assert.deepEqual(
@@ -23019,11 +23027,11 @@ test('the rail is reworded when work starts or stops, and not on every event', (
   );
   sourceMatch(
     body,
-    /if \(moved\) \{ void this\.refresh\(true\); \}/,
+    /if \(moved\) \{ this\.refreshFrom\('running', true\); \}/,
     'setRunning no longer redraws cards and the rail when process liveness changes',
   );
   sourceDoesNotMatch(
-    body.replace(/if \(moved\) \{\s*void this\.refresh\(true\);\s*\}/, ''),
+    body.replace(/if \(moved\) \{\s*this\.refreshFrom\('running', true\);\s*\}/, ''),
     /this\.refresh\(/,
     'the panel refresh runs outside the guard, so every streamed event rebuilds it',
   );
@@ -29576,7 +29584,7 @@ test('a press is confirmed by its own handoff answer, not by the host becoming b
   );
   sourceMatch(
     answered,
-    /this\.showing = destination;[\s\S]*this\.refresh\(true\)/,
+    /this\.showing = destination;[\s\S]*this\.refreshFrom\('press-answered', true\)/,
     'the prompt reached a new session but the panel leaves the reader on the old one',
   );
   // Prompt-box state reads live presses for its session row.
@@ -29660,7 +29668,7 @@ test('watcher refreshes and project checkpoints share only the bounded scheduler
   sourceMatch(runningBody, /this\.post\(\{ type: 'usage'/, 'running state no longer reaches the composer immediately');
   sourceMatch(
     runningBody,
-    /if \(moved\) \{ void this\.refresh\(true\); \}/,
+    /if \(moved\) \{ this\.refreshFrom\('running', true\); \}/,
     'running state no longer reaches cards and the rail immediately',
   );
   sourceDoesNotMatch(
@@ -30772,7 +30780,8 @@ test('selection and accepted worker results avoid unnecessary catalog walks', ()
     'an accepted selected result does not defer metadata until after its first-card post',
   );
   assert.equal(
-    (refresh.match(/void this\.refresh\(enrichment\.changed, enrichment\.catalogCurrent\);/g) ?? []).length,
+    (refresh.match(/this\.refreshFrom\('enrichment', enrichment\.changed, enrichment\.catalogCurrent\);/g) ?? [])
+      .length,
     2,
     'rail enrichment cannot reuse a current catalog or replace one invalidated by stale metadata',
   );
@@ -37954,13 +37963,13 @@ test('a catalog refresh names why it does not reuse the held catalog', async () 
   fs.writeFileSync(file, '{}\n');
   provider.catalog = held();
   const deferWalk = { needed: false };
-  provider.allSessions(false, true, undefined, deferWalk);
+  provider.allSessions(false, true, undefined, deferWalk, 'requested:poll');
   assert.equal(deferWalk.needed, true);
 
   assert.deepEqual(work(), {
     'walk:noCatalog': 1,
     'walk:noSelection': 1,
-    'walk:requested': 1,
+    'walk:requested:poll': 1,
     'walk:scopeMoved': 1,
     'walk:selectionFileMissing': 1,
     'walk:selectionMissing': 1,
