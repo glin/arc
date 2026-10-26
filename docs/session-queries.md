@@ -6,7 +6,28 @@ Use this guide when changing query grammar, identity selection, or matching. [Sa
 
 `domain/session-query.ts` owns parsing, caret tokens, and matching. `view/session-query.ts` owns notes and label suggestions.
 
-Read `SESSION_AXES`, `queryWords`, and `parseSessionQuery` in `domain/session-query.ts` for axes, quoting, negation, and term combination. Labels match the complete stored list, including names folded out of a card.
+Enter queries in the session list's filter box. Outside content search, bare words match title substrings.
+
+| Term             | Matches                                        |
+| ---------------- | ---------------------------------------------- |
+| `agent:codex`    | Sessions whose agent name contains `codex`     |
+| `title:timeline` | Sessions whose title contains `timeline`       |
+| `label:release`  | Sessions carrying the complete label `release` |
+
+Title and agent matching ignore case. Label matching ignores case using the reader's locale. Labels match the complete stored list, including names folded out of a card. Empty `agent:`, `title:`, and `label:` values add no term.
+
+Combine ordinary terms with spaces to require every term. Prefix a term with `-` to exclude its matches. This query keeps Codex sessions containing `timeline` in their title without the `release` label:
+
+```text
+agent:codex timeline -label:release
+```
+
+Enclose values containing spaces in double quotes. Double a quote inside a quoted value to match a literal quote:
+
+```text
+label:"release 0.4"
+title:"say ""hi"""
+```
 
 A quote before a leading `-`, `id:`, or `session:` keeps it literal. Quoting only an identity value retains selection, as in `session:"one"`. Other recognized prefixes still apply inside quotes. Lone `-` and unquoted words starting `--` add no term.
 
@@ -14,7 +35,16 @@ A quote before a leading `-`, `id:`, or `session:` keeps it literal. Quoting onl
 
 `IS_VALUES` and `plainTermHolds` in `domain/session-query.ts` own status terms and matching. Unknown or incomplete values add no term.
 
-`is:archived` and `is:agentrun` read their underlying facts independently of visible buckets. `is:warm` uses prompt-cache lifetime against the browser clock, including archived sessions and agent runs. `is:active` matches a warm cache or activity within the last hour. `is:needsyou` requires Active and either unread or Needs input. [Status projection](rail-and-navigation.md#read-and-status-state) owns how rows obtain these facts.
+| Term         | Matches                                                              |
+| ------------ | -------------------------------------------------------------------- |
+| `is:input`   | Sessions that need input. `is:waiting` and `is:blocked` are aliases. |
+| `is:unread`  | Sessions with unread activity                                        |
+| `is:read`    | Sessions marked read                                                 |
+| `is:running` | Sessions running main agent work, subagents, or a background command |
+
+Unknown read state matches neither `is:read` nor `is:unread`, including negations.
+
+`is:archived` selects archived sessions. `is:agentrun` selects agent runs. Both read their underlying facts independently of visible buckets. `is:warm` uses prompt-cache lifetime against the browser clock, including archived sessions and agent runs. `is:active` matches a warm cache or activity within the last hour. `is:needsyou` requires Active and either unread or Needs input. [Status projection](rail-and-navigation.md#read-and-status-state) owns how rows obtain these facts.
 
 ### Session identity
 
@@ -32,7 +62,15 @@ Empty or malformed selectors empty results, including negated selectors. Danglin
 
 ### Numeric comparisons
 
-`NUMERIC_COMPARISON_VALUE` in `domain/session-query.ts` owns strict numeric grammar for recorded USD cost and lifetime primary-session cache-expiry counts. Quoted comparisons are invalid.
+Use `cost:>5.43` or `cost:<5.43` to compare recorded USD cost. Use `cache-expiry:>0` or `cache-expiry:<3` to compare lifetime primary-session cache-expiry counts.
+
+Write `>` or `<` immediately before a non-negative whole or decimal number, without spaces. Comparisons exclude equality. Currency symbols, signed numbers, exponents, and quoted comparisons are invalid. `NUMERIC_COMPARISON_VALUE` in `domain/session-query.ts` owns this grammar.
+
+This query keeps sessions labelled `release` with cost above $5.43 and fewer than three cache expiries:
+
+```text
+label:release cost:>5.43 cache-expiry:<3
+```
 
 Exact values match their strict comparison. Missing cost and unavailable or unindexed cache facts match neither. Lower bounds match `>` only when their known amount exceeds the threshold. They never match `<`, because unknown amounts or unclassified request pairs can increase the value. Negation keeps everything the positive comparison drops, including missing values and lower bounds. Invalid numeric terms remain visible, empty results, and receive correction guidance.
 

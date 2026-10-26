@@ -1,5 +1,17 @@
 # Saved-session HTML
 
+Export a saved Claude or Codex session from its heading in the session view. Live and archived sessions qualify. Unsent new sessions have no export action. An unavailable or ambiguous saved source prevents export.
+
+1. Open **Session actions** beside the session heading, or right-click the heading.
+2. Choose **Export session as HTML...**.
+3. Read the privacy warning, then choose **Export** to continue.
+4. Choose a destination folder in **Choose an export folder**, then select **Export here**.
+5. Wait for completion, then choose **Open** in the notification to open the saved page in your browser.
+
+Dismiss the warning or folder picker to stop before capture. Use **Cancel** in the progress notification to stop capture. Cancellation publishes no partial export.
+
+Arc creates an `arc-session-<random ID>/site` directory inside the chosen folder. Open its `index.html` directly to view the page later.
+
 [`sessionexport.ts`](../extension/src/sessionexport.ts) owns confirmation, destination selection, progress, and cancellation. Selecting another session leaves export targeted at the session whose heading opened the menu.
 
 The page embeds scripts and captured data but loads an adjacent stylesheet. Publish the whole `site` directory. Local files, HTTP roots, and nested HTTP directories use the same relative assets.
