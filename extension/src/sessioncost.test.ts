@@ -6026,7 +6026,8 @@ test('an unknown Claude usage iteration leaves the session cost partial', () => 
 // The panel reads tool results through its own transcript readers, the spend ledger and the
 // session cost popover. Each Tools row must give the share and request count that the matching
 // `arc cost --by-tool` kinds give.
-function panelToolRows(file: string, reducer: Parameters<typeof projectSpend.indexSpendFile>[3]) {
+// The session cost parts the panel reads from a transcript's lifetime buckets.
+function panelParts(file: string, reducer: Parameters<typeof projectSpend.indexSpendFile>[3]) {
   const { record } = projectSpend.indexSpendFile(
     undefined,
     file,
@@ -6034,15 +6035,25 @@ function panelToolRows(file: string, reducer: Parameters<typeof projectSpend.ind
     reducer,
     Date.parse('2026-09-27T00:00:00Z'),
   );
-  const parts = (record.lifetimeBuckets ?? []).map((bucket) => sessionCostUsageOf({ bucket, role: 'main' }));
+  return (record.lifetimeBuckets ?? []).map((bucket) => sessionCostUsageOf({ bucket, role: 'main' }));
+}
+
+// The Tools tab rows as label, share, and request count.
+function panelTools(parts: Parameters<typeof sessionCostProjection>[0]) {
   const chip = sessionCostProjection(parts).stats.find((stat) => stat.metric === 'cost')!;
+  // Every part is main agent work, so a row's share of the main agent's cost gives its dollars.
   return chip
     .detailList!.cost!.tabs.find((tab) => tab.name === 'Tools')!
-    .rows.map((row) => [
-      row.label,
-      row.percent,
-      Number(/, ([0-9,]+) requests?, /.exec(row.title)![1].replace(/,/g, '')),
-    ]);
+    .rows.map((row) => ({
+      label: row.label,
+      percent: row.percent,
+      dollars: row.share * Number(chip.dollars),
+      requests: Number(/, ([0-9,]+) requests?, /.exec(row.title)![1].replace(/,/g, '')),
+    }));
+}
+
+function panelToolRows(file: string, reducer: Parameters<typeof projectSpend.indexSpendFile>[3]) {
+  return panelTools(panelParts(file, reducer)).map((row) => [row.label, row.percent, row.requests]);
 }
 
 // Rows by share, then by label, so two rows with one share compare in one order.
@@ -6171,4 +6182,70 @@ test('the panel Tools rows agree with arc cost --by-tool on a Codex and a Claude
     ['File read', '17%', 1],
     ['Other tool results', '8%', 1],
   ]);
+  // A compaction estimate counts under No tool result in the panel. The CLI counts recorded usage
+  // only, so every other row matches, and No tool result differs by the estimate alone.
+  const compacted = write(path.join(directory(), 'compacted.jsonl'), [
+    response('c1', 1, [
+      { type: 'tool_use', id: 'r1', name: 'Read', input: { file_path: 'a.ts' } },
+      { type: 'tool_use', id: 'g1', name: 'Bash', input: { command: 'git log -1' } },
+    ]),
+    results(['r1', 'g1']),
+    {
+      type: 'system',
+      subtype: 'compact_boundary',
+      timestamp: '2026-09-26T00:00:02Z',
+      compactMetadata: { trigger: 'manual', preTokens: 62_077, postTokens: 4_336, durationMs: 12_409 },
+    },
+    {
+      type: 'user',
+      isCompactSummary: true,
+      timestamp: '2026-09-26T00:00:02Z',
+      message: { role: 'user', content: 'Retained summary' },
+    },
+    response('c2', 3),
+  ]);
+  const parts = panelParts(compacted, (state) => createClaudeUsageLineReducer(state as never));
+  const estimates = parts.filter((part) => part.compactionEstimate);
+  assert.equal(estimates.length, 1);
+  const estimated = Number(sessionCostProjection(estimates).stats.find((stat) => stat.metric === 'cost')!.dollars);
+  assert.ok(estimated > 0);
+  const label: Record<string, string> = { 'no tool result': 'No tool result', 'file read': 'File read', git: 'Git' };
+  const cli = sessionCostReport(compacted, { byTool: true, sourceOnly: true }).byTool!.rows.map((row) => ({
+    label: label[row.kind],
+    dollars: row.costUsd,
+    requests: row.requests,
+  }));
+  const panel = panelTools(parts);
+  // The CLI rounds dollars to four places, so the panel's dollars compare at that precision.
+  const cents = (rows: { label: string; dollars: number; requests: number }[]) =>
+    rows
+      .map((row) => [row.label, Math.round(row.dollars * 10_000 + 1e-9), row.requests])
+      .sort((a, b) => String(a[0]).localeCompare(String(b[0])));
+  const others = (rows: { label: string; dollars: number; requests: number }[]) =>
+    cents(rows.filter((row) => row.label !== 'No tool result'));
+  assert.deepEqual(others(panel), others(cli));
+  assert.deepEqual(
+    others(panel).map((row) => row[0]),
+    ['File read', 'Git'],
+  );
+  const none = (rows: { label: string; dollars: number; requests: number }[]) =>
+    rows.find((row) => row.label === 'No tool result')!;
+  assert.equal(none(panel).requests, none(cli).requests + estimates[0].usage.requests!);
+  assert.equal(estimates[0].usage.requests, 1);
+  assert.ok(Math.abs(none(panel).dollars - none(cli).dollars - estimated) < 0.0001);
+  // Supplemental usage and a recorded cost carry no tool results, so the panel counts both under
+  // No tool result and leaves every other row as it was. The CLI reads neither.
+  const recorded = parts.find((part) => !part.compactionEstimate)!;
+  const supplemental = { ...recorded, usage: { ...recorded.usage, requests: 2 } };
+  delete supplemental.tools;
+  delete supplemental.waits;
+  const listed = { ...supplemental, usage: { ...supplemental.usage, requests: 3 }, recordedCost: 4, costBasis: 'list' };
+  const added = Number(
+    sessionCostProjection([supplemental, listed]).stats.find((stat) => stat.metric === 'cost')!.dollars,
+  );
+  const widened = panelTools([...parts, supplemental, listed]);
+  assert.deepEqual(others(widened), others(panel));
+  assert.equal(none(widened).requests, none(panel).requests + 5);
+  assert.ok(Math.abs(none(widened).dollars - none(panel).dollars - added) < 1e-9);
+  assert.ok(added > 4);
 });

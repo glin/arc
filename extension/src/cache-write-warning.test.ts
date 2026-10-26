@@ -204,7 +204,7 @@ test('whole-session cost metadata nests warnings under their owning scopes even 
     ],
   );
   assert.deepEqual(
-    named.tabs.find((tab) => tab.name === 'Subagents')!.rows.map((row) => row.label),
+    named.tabs.find((tab) => tab.name === 'Delegated')!.rows.map((row) => row.label),
     ['explorer', 'Subagent 2'],
   );
 });
@@ -394,10 +394,10 @@ test('unpriced or incomplete delegated work keeps the wait-share warning on a pa
     );
     assert.deepEqual(chip.detailList!.entries[0].lines?.[0], { text: sentence, warning: true });
   }
-  // Each Subagents row keeps the state the delegated hero shows: unavailable, or a lower bound.
+  // Each Delegated row keeps the state the delegated hero shows: unavailable, or a lower bound.
   const rows = (projection: ReturnType<typeof sessionCostProjection>) => {
     const cost = projection.stats[0].detailList!.cost!;
-    const child = cost.tabs.find((tab) => tab.name === 'Subagents')!.rows;
+    const child = cost.tabs.find((tab) => tab.name === 'Delegated')!.rows;
     return [cost.delegated?.value, ...child.map((row) => [row.value, row.percent, row.share, row.title])];
   };
   assert.deepEqual(rows(sessionCostProjection([owner, { ...child, model: 'unknown' }])), [

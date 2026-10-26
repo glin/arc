@@ -4751,7 +4751,7 @@ test('heading read and membership context survive reversals while a comment hold
   }
 });
 
-test('the pinned session cost popover leads with its warning, ends rows on the dollars, and moves between tabs by arrow key', async (t) => {
+test('the session cost popover leads with its warning, ends rows on the dollars, shows its tabs on hover, and moves between tabs by arrow key', async (t) => {
   const browser = await browserOrNone();
   if (!browser) {
     t.skip('Edge or Chrome is required');
@@ -4823,11 +4823,11 @@ test('the pinned session cost popover leads with its warning, ends rows on the d
       });
       for (const [key, tab] of [
         ['ArrowRight', 'Tools'],
-        ['ArrowRight', 'Subagents'],
+        ['ArrowRight', 'Delegated'],
         ['ArrowRight', 'Usage'],
-        ['ArrowLeft', 'Subagents'],
+        ['ArrowLeft', 'Delegated'],
         ['Home', 'Usage'],
-        ['End', 'Subagents'],
+        ['End', 'Delegated'],
       ]) {
         await page.keyboard.press(key);
         const now = await selected();
@@ -4852,11 +4852,38 @@ test('the pinned session cost popover leads with its warning, ends rows on the d
       await pop.waitFor();
       assert.equal((await selected()).tab, 'Usage');
       // A press on a tab while the figure holds focus keeps the popover pinned.
-      await pop.locator('[role="tab"]', { hasText: 'Subagents' }).click();
+      await pop.locator('[role="tab"]', { hasText: 'Delegated' }).click();
       assert.equal(await page.locator('.chippop.pinned').count(), 1, 'a press from the figure closed the popover');
-      assert.equal((await selected()).tab, 'Subagents');
+      assert.equal((await selected()).tab, 'Delegated');
       await page.keyboard.press('Escape');
       await page.waitForFunction(() => !document.querySelector('.chippop.pinned'));
+      // A hover shows the strip on Usage. A press on a tab pins the popover on that tab.
+      await page.mouse.move(0, 0);
+      await page.locator('.sessionstats [data-metric="cost"]').hover();
+      const hovered = page.locator('.chippop:not([hidden]):not(.pinned)');
+      const hoverTools = hovered.locator('.poptabs [role="tab"]', { hasText: 'Tools' });
+      await hoverTools.waitFor();
+      assert.equal(await hovered.locator('[role="tab"][aria-selected="true"]').textContent(), 'Usage', `${width}`);
+      // Only the tab strip takes pointer input in a hover popover. The notes stay closed to a press.
+      assert.deepEqual(
+        await hovered.evaluate((node) => {
+          const input = (part: Element | null) => part && getComputedStyle(part).pointerEvents;
+          return [
+            input(node),
+            input(node.querySelector('.poptabs')),
+            input(node.querySelector('.chippopnotes summary')),
+          ];
+        }),
+        ['none', 'auto', 'none'],
+        `${width}`,
+      );
+      await hoverTools.click();
+      await pop.waitFor();
+      assert.equal((await selected()).tab, 'Tools', `${width}`);
+      assert.equal((await selected()).shown.length, 1, `${width}`);
+      await page.keyboard.press('Escape');
+      await page.waitForFunction(() => !document.querySelector('.chippop.pinned'));
+      await page.mouse.move(0, 0);
     }
     // A taller tab places the popover again. A turn popover whose Usage tab fits below its figure
     // stays inside the viewport when its Tools tab needs the room above.

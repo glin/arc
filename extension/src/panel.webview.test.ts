@@ -22837,7 +22837,7 @@ const FIGURE_SIZES = [
   '.context-columns > span { font-size: var(--t-small) }',
   '.context-categories { font-size: inherit }',
   '.context-included { font-size: var(--t-small) }',
-  '.chippop :is(.splitmodel, .caption, .costrow .detail, .costrow .pct, .included) { font-size: var(--t-small) }',
+  '.chippop .poptabs .casktab, .chippop :is(.split ~ div, .included) > .context-included { font-size: inherit }',
   '.context-table thead th { font-size: var(--t-small) }',
 ];
 

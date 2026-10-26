@@ -1639,8 +1639,9 @@ export function cacheWriteWarningPayload(): Record<string, unknown> {
 }
 
 // A Codex coordinator whose main agent spent over a fifth of its cost reading subagent wait returns.
-// Delegated work keeps the waits under a quarter of the whole session's cost.
-export function waitWarningPayload(): Record<string, unknown> {
+// Delegated work keeps the waits under a quarter of the whole session's cost. `five` adds children
+// with recorded costs, so the delegated work holds five model groups, two without a recorded model.
+export function waitWarningPayload(delegated: 'three' | 'five' = 'three'): Record<string, unknown> {
   const payload = renderPayload();
   const usage = (over: Partial<Turn['usage']>): Turn['usage'] => {
     const counts = {
@@ -1709,6 +1710,21 @@ export function waitWarningPayload(): Record<string, unknown> {
         child('code_review_1_npm_tests_astra', 'gpt-6-astra', '01a1535a-e7c6-7cc3-a9aa-9552803efb51', 0.03),
         child('code_implement_1_npm_tests_sol', 'gpt-6.1-sol', '01a1503b-b2f2-7be2-a08f-fde25f58b552', 0.55),
         child('code_fix_1_npm_tests_sol_deadlines', 'gpt-6.1-sol', '01a15289-b637-7f71-bce5-143c96986ad2', 0.42),
+        ...(delegated === 'five'
+          ? (
+              [
+                ['code_audit_1_logs', null, '01a15301-0000-7000-8000-000000000001', 6],
+                ['code_audit_2_logs', null, '01a15301-0000-7000-8000-000000000002', 5],
+                ['code_plan_1_schema_opus', 'claude-opus-5-5', '01a15301-0000-7000-8000-000000000003', 4],
+                ['code_lint_1_haiku', 'claude-haiku-5-5', '01a15301-0000-7000-8000-000000000004', 0.2],
+              ] as const
+            ).map(([name, model, session, recordedCost]) => ({
+              ...child(name, 'gpt-6.1-sol', session, 0.01),
+              model,
+              recordedCost,
+              costBasis: 'list',
+            }))
+          : []),
       ]).stats,
       ...sessionTurnStats({ turnCount: 1, firstTurnAt: turn.startedAt, lastTurnAt: turn.endedAt, compactionCount: 0 }),
     ],
