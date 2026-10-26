@@ -9601,10 +9601,17 @@ function readClaudeSpendTree(
       for (const request of nested.spend.requests ?? []) requests.push(request);
     }
   }
-  const models = modelSpends(byModel).map((spend) => ({
-    ...spend,
-    usageParts: usageParts.filter((part) => part.model === spend.model),
-  }));
+  // Model totals leave out estimated compactions, so a model that only an estimate used keeps a
+  // zero total and its usage parts still price.
+  for (const part of usageParts) {
+    if (part.compactionEstimate && !byModel.has(part.model)) byModel.set(part.model, emptyUsage());
+  }
+  const models = [...byModel].flatMap(([model, usage]) => {
+    const held = usageParts.filter((part) => part.model === model);
+    return usageTokens(usage) > 0 || held.some((part) => part.compactionEstimate)
+      ? [{ model, usage, usageParts: held }]
+      : [];
+  });
   const record = own.record ? structuredClone(own.record) : {};
   // Descendant spend remains partial until its own record supplies a closed last turn.
   // The row names the model this transcript ran, so a nested subagent's heavier model never answers.
@@ -12558,9 +12565,10 @@ function priceChildShare(agent: TurnAgent, requests: readonly UsageEvent[], whol
   else delete agent.spendIncomplete;
 }
 
-// Model spend for some of a child's requests, built the way `readClaudeSpendTree` builds the
-// whole figure. Model totals leave out estimated compactions, and usage parts include them. A
-// model that only an estimate used keeps a zero total, so the estimate's usage parts still price.
+// Model spend for some of a child's requests. Model totals leave out estimated compactions, and
+// usage parts include them. A model with a zero total stays when it has any usage part, so an
+// estimate's usage parts still price. `readClaudeSpendTree` prices the whole child the same way,
+// except that it keeps a zero-total model only when an estimated compaction used it.
 function requestSpend(requests: readonly UsageEvent[]): ModelSpend[] {
   const byModel = new Map<string | null, TurnUsage>();
   const exact = { usageParts: [] as TurnUsagePart[] };

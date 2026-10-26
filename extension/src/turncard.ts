@@ -2132,6 +2132,7 @@ function cardCostOf(turn: Turn, shares: readonly DispatchedShare[]): SessionCost
 export function sessionCostUsageOf({ bucket, role, scopeId, agentName }: SessionSpendPart): SessionCostUsage {
   return {
     ...(bucket.usageOrigin ? { usageOrigin: bucket.usageOrigin } : {}),
+    ...(bucket.linkedSessionId ? { linkedSessionId: bucket.linkedSessionId } : {}),
     agent: bucket.agent,
     role,
     scopeId,
@@ -2879,10 +2880,23 @@ function costDetailList(
   const usageRows = costUsageRows(mainPriced, mainDollars, delegates ? "the main agent's cost" : 'this turn');
   const toolRows = costToolRows(mainPriced, delegates ? "the main agent's cost" : 'this turn');
   const delegatedDollars = Math.max(0, (total.dollars ?? 0) - mainDollars);
-  const children: (string | null)[][] = [
-    ...turn.agents.map((agent) => agent.spend.map((part) => part.model)),
-    ...shares.map((share) => share.costs.map((cost) => cost.part.model)),
-  ];
+  // A launch row and a resume row of one child are one child session, so rows with a shared id merge.
+  const childrenById = new Map<string, (string | null)[]>();
+  const holdChild = (key: string, models: (string | null)[]) =>
+    childrenById.set(key, [...(childrenById.get(key) ?? []), ...models]);
+  turn.agents.forEach((agent, index) =>
+    holdChild(
+      agent.id ? `child:${agent.id}` : `row:${index}`,
+      agent.spend.map((part) => part.model),
+    ),
+  );
+  shares.forEach((share) =>
+    holdChild(
+      `child:${share.cost.sessionId}`,
+      share.costs.map((cost) => cost.part.model),
+    ),
+  );
+  const children = [...childrenById.values()];
   const cost: CostDetailView | undefined = usageRows.length
     ? {
         warnings: [
@@ -5062,6 +5076,8 @@ function costStat(
 export interface SessionCostUsage {
   usageOrigin?: UsageOrigin;
   linkedInvocationId?: string | null;
+  // The child session this usage ran in. Two invocations that resume one child name the same session.
+  linkedSessionId?: string | null;
   agent?: string | null;
   role?: 'main' | 'delegated';
   scopeId?: string;
@@ -6316,8 +6332,16 @@ export function sessionCostProjection(
     const delegatedDollars = captured?.delegated.dollars ?? dollarsOf(delegated);
     const combined = mainDollars + delegatedDollars;
     const unscoped = delegated.filter((cost) => cost.part.scopeId === undefined);
+    // Each invocation has its own scope, so a child session resumed by a later invocation holds
+    // several scopes. The hero counts that session once.
+    const childParts = new Map<string, SessionCostUsage[]>();
+    for (const [id, held] of delegatedScopes) {
+      const session = held.find((part) => part.linkedSessionId)?.linkedSessionId;
+      const key = session ? `session:${session}` : id;
+      childParts.set(key, [...(childParts.get(key) ?? []), ...held]);
+    }
     const children: (string | null)[][] = [
-      ...[...delegatedScopes.values()].map((held) => held.map((part) => part.model)),
+      ...[...childParts.values()].map((held) => held.map((part) => part.model)),
       ...(unscoped.length ? [unscoped.map((cost) => cost.part.model)] : []),
     ];
     const tools = costToolRows(main, "the main agent's cost");
@@ -6360,7 +6384,7 @@ export function sessionCostProjection(
                     ]
                   : []),
                 `${sharePercent(costShare(delegatedDollars, combined))} of the total`,
-              ].join(', ')}${childModelDollars([...delegatedScopes.values()])}`,
+              ].join(', ')}${childModelDollars([...childParts.values()])}`,
               mainShare: costShare(mainDollars, combined),
             },
           }

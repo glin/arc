@@ -76,6 +76,7 @@ import {
   CACHE_EXPIRY_COST_ADDED_HINT,
   sessionCompactionContextDetail,
   sessionCostProjection,
+  sessionCostUsageOf,
   sessionCostStats,
   turnCacheExpiryReturn,
   cacheExpiryWarningText,
@@ -6240,7 +6241,15 @@ test('a nested launch with no meta file or no transcript keeps the turn cost a f
 // and resumes the subagent. Its cache has expired, so its next request writes two million tokens
 // to the cache. One more subagent request runs after turn 3 ends and before turn 4 starts. The
 // main agent bills nothing.
-function resumedAgentSession(resume: 'SendMessage' | 'Agent' = 'SendMessage', launchRequest = true, laterTurn = true) {
+function resumedAgentSession(
+  resume: 'SendMessage' | 'Agent' = 'SendMessage',
+  launchRequest = true,
+  laterTurn = true,
+  // A compaction at second `at` replaces the child's two requests in the resuming turn. The
+  // first request bills `launchUsage`, so a zero request leaves the compaction estimate as the
+  // child's only use of the model.
+  compacted?: { launchUsage: 'billed' | 'zero'; at: number },
+) {
   const at = (second: number) => new Date(Date.UTC(2026, 0, 1, 0, 0, second)).toISOString();
   const folder = tempDir('resumed-agent-');
   const subagents = path.join(folder, 'sess', 'subagents');
@@ -6303,11 +6312,36 @@ function resumedAgentSession(resume: 'SendMessage' | 'Agent' = 'SendMessage', la
   const child = path.join(subagents, 'agent-a1.jsonl');
   write(child, [
     ...(launchRequest
-      ? [ask('c1', 2, 'Draft the plan.', true), say('c1-reply', 10, 'end_turn', [], cacheWrite(1_600_000), true)]
+      ? [
+          ask('c1', 2, 'Draft the plan.', true),
+          say('c1-reply', 10, 'end_turn', [], compacted?.launchUsage === 'zero' ? none : cacheWrite(1_600_000), true),
+        ]
       : []),
     ask('c2', 602, 'Apply the review.', true),
-    say('c2-reply', 610, 'tool_use', [], cacheWrite(2_000_000), true),
-    say('c3-reply', 750, 'end_turn', [], { input_tokens: 400_000, output_tokens: 0 }, true),
+    ...(compacted
+      ? [
+          {
+            type: 'system',
+            subtype: 'compact_boundary',
+            timestamp: at(compacted.at),
+            isSidechain: true,
+            compactMetadata: { trigger: 'auto', preTokens: 150_000, postTokens: 8_000, durationMs: 30_000 },
+          },
+          {
+            type: 'user',
+            timestamp: at(compacted.at + 1),
+            isCompactSummary: true,
+            isSidechain: true,
+            message: {
+              role: 'user',
+              content: 'This session is being continued from a previous conversation.'.padEnd(2_000, '.'),
+            },
+          },
+        ]
+      : [
+          say('c2-reply', 610, 'tool_use', [], cacheWrite(2_000_000), true),
+          say('c3-reply', 750, 'end_turn', [], { input_tokens: 400_000, output_tokens: 0 }, true),
+        ]),
   ]);
   fs.writeFileSync(
     path.join(subagents, 'agent-a1.meta.json'),
@@ -6360,6 +6394,74 @@ function resumedAgentSession(resume: 'SendMessage' | 'Agent' = 'SendMessage', la
 
 const subagentLines = (turn: Turn) => costDetail(turn).filter((line) => line.startsWith('agent · '));
 
+const heroOf = (turn: Turn, dispatched: DispatchedTurnCost[] = []) =>
+  toCard(turn, false, NOW, [], null, false, new Set(), dispatched).chips.find((chip) => chip.metric === 'cost')!
+    .detailList!.cost!;
+
+test('the turn hero counts a child once when one turn holds its launch row and its resume row', () => {
+  const spend = [
+    {
+      model: 'claude-haiku-4-5',
+      usage: tokenUsage({ requests: 1, input: 100_000, output: 1000 }),
+    },
+  ];
+  const main = { model: 'claude-sonnet-5', usage: tokenUsage({ requests: 2, input: 50_000, output: 2000 }) };
+  // The reader gives a resume row in the launching turn an empty share, since the launch row holds the requests.
+  const resumed = turn({
+    ...main,
+    agents: [
+      agent({ id: 'a1', description: 'Planner', spendFound: true, spend }),
+      agent({ id: 'a1', description: 'Planner', spendFound: true, spend: [] }),
+    ],
+  });
+  assert.match(heroOf(resumed).delegated!.title, /, 1 child session$/);
+  assert.equal(heroOf(resumed).delegated!.model, '1 × 5', 'the count agrees with the model counts');
+  const two = turn({
+    ...main,
+    agents: [
+      agent({ id: 'a1', description: 'Planner', spendFound: true, spend }),
+      agent({ id: 'a2', description: 'Reviewer', spendFound: true, spend }),
+    ],
+  });
+  assert.match(heroOf(two).delegated!.title, /, 2 child sessions$/);
+});
+
+test('the turn hero counts a dispatched session once when a row or another share names the same session', () => {
+  const spend = [{ model: 'claude-haiku-4-5', usage: tokenUsage({ requests: 1, input: 100_000, output: 1000 }) }];
+  const main = { model: 'claude-sonnet-5', usage: tokenUsage({ requests: 2, input: 50_000, output: 2000 }) };
+  const named = turn({ ...main, agents: [agent({ id: 'child', description: 'Planner', spendFound: true, spend })] });
+  const hero = heroOf(named, [dispatchedCost()]);
+  assert.match(hero.delegated!.title, /, 1 child session$/, 'a row and a share of one session read as two');
+  assert.equal(hero.delegated!.model, '1 × 5');
+  assert.match(heroOf(turn(main), [dispatchedCost(), dispatchedCost()]).delegated!.title, /, 1 child session$/);
+  assert.match(
+    heroOf(named, [dispatchedCost({ sessionId: 'other' })]).delegated!.title,
+    /, 2 child sessions$/,
+    'a share of another session stays a second child',
+  );
+});
+
+test('the session hero counts a child session once when two invocations resume it', () => {
+  // A Codex turn that runs `claude -p` and then `claude -p --resume` gives each command its own scope.
+  const bucket = (session: string, command: string) =>
+    economicRequest({ linkedSessionId: session, linkedInvocationId: `${command}:${session}` });
+  const part = (session: string, command: string) =>
+    sessionCostUsageOf({
+      bucket: bucket(session, command),
+      role: 'delegated',
+      scopeId: `invocation:${command}:${session}`,
+    });
+  const main = sessionCostUsageOf({ bucket: economicRequest(), role: 'main' });
+  const delegated = (parts: ReturnType<typeof part>[]) =>
+    sessionCostProjection([main, ...parts]).stats[0].detailList!.cost!.delegated!;
+  const resumed = delegated([part('S', 'c1'), part('S', 'c2'), part('T', 'c3')]);
+  assert.match(resumed.title, /, 2 child sessions, /);
+  assert.equal(resumed.model, '2 × sol', 'the count agrees with the model counts');
+  const distinct = delegated([part('S', 'c1'), part('U', 'c2'), part('T', 'c3')]);
+  assert.match(distinct.title, /, 3 child sessions, /);
+  assert.equal(resumed.value, distinct.value, 'merging scopes changes no dollars');
+});
+
 test('a subagent resumed in a later turn shows in both turn cards, each priced by its own requests', () => {
   const { turns, lookup, childFacts, warned } = resumedAgentSession();
   assert.equal(childFacts.counts['5m'], 1, 'the fixture records one expired five-minute cache');
@@ -6380,6 +6482,30 @@ test('a subagent resumed in a later turn shows in both turn cards, each priced b
       ['agent · haiku-4-5: $2.90'],
       'the resuming turn cost list left out a request',
     );
+  };
+  check();
+  refreshClaudeAgentFacts(turns, lookup, undefined);
+  check();
+});
+
+test('a child that compacts on a model it billed nothing on still prices the estimate in its turn', () => {
+  // The whole child stays in the launching turn, so no split prices it.
+  const { turns } = resumedAgentSession('SendMessage', true, true, { launchUsage: 'zero', at: 15 });
+  const [first, , third] = turns;
+  assert.equal(costChip(toCard(first, false, NOW)), '$0.02', 'the estimate left the card total');
+  assert.deepEqual(subagentLines(first).slice(0, 1), ['agent · haiku-4-5: $0.02']);
+  assert.equal(third.agents.length, 0, 'the child made no request in the resuming turn');
+});
+
+test('a resuming turn whose only subagent request is a compaction estimate keeps its dollars', () => {
+  // The first request billed the model in turn 1. Turn 3 holds only the estimated compaction.
+  const { turns, lookup } = resumedAgentSession('SendMessage', true, true, { launchUsage: 'billed', at: 620 });
+  const check = () => {
+    const [first, , third] = turns;
+    assert.equal(costChip(toCard(first, false, NOW)), '$2.00');
+    assert.equal(third.agents.length, 1, 'the resuming turn lists the subagent once');
+    assert.equal(costChip(toCard(third, false, NOW)), '$2.01', 'the share lost the estimate');
+    assert.deepEqual(subagentLines(third).slice(0, 1), ['agent · haiku-4-5: $2.01']);
   };
   check();
   refreshClaudeAgentFacts(turns, lookup, undefined);
