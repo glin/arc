@@ -11135,10 +11135,11 @@ export class PanelProvider implements vscode.Disposable {
         onlyFiles,
         sources.filter((source) => revisions.has(source.file)),
       );
-      // Publish settled Project cost when an offer queues no work.
+      // Publish settled Project cost when an offer queues no work. The offer already published turn card costs
+      // unless it had no ledger to offer to.
       if (!this.projectSpendBusy()) {
         this.postProjectSpend();
-        this.postDispatchedCostsIfMoved();
+        if (!this.projectSpendWorkspace || !this.projectSpendStorageDir) this.postDispatchedCostsIfMoved();
       }
     };
     const tick = setTimeout(() => {
