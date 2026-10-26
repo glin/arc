@@ -126,8 +126,8 @@
   },
   "extension/src/panel.webview.test.ts": {
     "reason": "Real progressive workers must deliver bounded recovery and metadata through the production panel host. Start metadata must survive storage delays, hidden panels, preference resets, and reloads. File presses must preserve recorded changes after their worktree disappears. Commit presses must never open an unrelated repository after their worktree disappears. Reader sends must release held compaction after drops without overtaking surviving input. Each Prompt box must retain its supplying child definition across sibling catalogs, idle updates, and child replacement. The Remote Control item must follow connection results and never reach saved drafts. Row posts and watcher decisions must reach the performance counters with their causes through the production host methods. A catalog refresh must name why it could not reuse the held catalog. A catalog-reusing refresh must admit settled sessions without a file check and recheck moved ones.",
-    "cases": 647,
-    "matricesSha256": "219bbba661000f4e1777e6a9f6247038175e0d96c3897a15e3c540f22f6a29e3"
+    "cases": 648,
+    "matricesSha256": "cb1fd68fff448f93d87ade97f19923e36529285ef6f35f0ec31c050cc7e50034"
   },
   "extension/src/panelbundle.test.ts": {
     "reason": "The panel bundle and fixture must contain the production entry, source identity, and substituted text.",
