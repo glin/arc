@@ -9131,6 +9131,7 @@ export class PanelProvider implements vscode.Disposable {
           humanPromptWork,
           generation,
           admissionSelection,
+          !this.catalogWalked && !selectedOnly ? 'skip' : 'recheck',
         );
         if (
           controller.signal.aborted ||
@@ -12232,6 +12233,9 @@ export class PanelProvider implements vscode.Disposable {
   }
 
   // Admission finishes before publication. Read and source allowances span the entire refresh.
+  // `settled` says what to do with a session whose complete scan found a prompt at the revision the catalog
+  // holds now. A refresh that walked or revalidated its rows rechecks every file. A refresh that reused the
+  // held catalog skips them, because nothing it knows about those files changed.
   private async prepareHumanPrompts(
     sessions: SessionFile[],
     sizeCurrent: boolean,
@@ -12239,6 +12243,7 @@ export class PanelProvider implements vscode.Disposable {
     work = { bytes: 0, sources: 0, reads: 0, unknown: new Set<string>() },
     generation = this.refreshGeneration,
     selectionGeneration?: number,
+    settled: 'recheck' | 'skip' = 'recheck',
   ): Promise<SessionFile[]> {
     const currentRefresh = () =>
       !signal.aborted &&
@@ -12250,6 +12255,25 @@ export class PanelProvider implements vscode.Disposable {
       if (session.agent !== 'claude' || session.childTranscript === true) {
         admitted.push(session);
         continue;
+      }
+      if (settled === 'skip') {
+        const scan = this.humanScans.get(session.file);
+        if (
+          scan?.found &&
+          scan.complete &&
+          scan.source &&
+          sameSessionRevision(scan.source, session) &&
+          (scan.source.dev === undefined ||
+            session.dev === undefined ||
+            String(scan.source.dev) === String(session.dev)) &&
+          (scan.source.ino === undefined ||
+            session.ino === undefined ||
+            String(scan.source.ino) === String(session.ino))
+        ) {
+          this.performanceCounters?.recordWork('humanPromptSettled');
+          admitted.push(session);
+          continue;
+        }
       }
       if (work.sources >= 32 || work.reads >= 32 || work.bytes >= 256 * 1024) {
         await new Promise<void>((resolve) => setImmediate(resolve));

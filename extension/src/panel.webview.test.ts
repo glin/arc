@@ -3616,6 +3616,129 @@ test('command-only admission removes pending rows through every catalog path and
   }
 });
 
+// A refresh that reused the held catalog knows nothing new about a file whose complete scan found a prompt at the
+// revision the catalog holds, so admission takes that session without a file check.
+
+test('a catalog-reusing refresh admits settled sessions without a file check and rechecks moved ones', async () => {
+  const { humanPromptScanSteps, promptScanLists, sameSessionRevision, scanForHumanPrompt } =
+    await import('./transcript.ts');
+  const directory = tempDir('human-admission-settled-');
+  const human = { type: 'user', message: { role: 'user', content: 'actual task' } };
+  const peer = { type: 'user', origin: { kind: 'peer' }, message: { content: 'x'.repeat(1024) } };
+  const write = (name: string) => {
+    const file = path.join(directory, `${name}.jsonl`);
+    fs.writeFileSync(file, [human, peer].map((row) => JSON.stringify(row)).join('\n') + '\n');
+    return file;
+  };
+  const row = (file: string, sessionId: string) => ({
+    agent: 'claude' as const,
+    sessionId,
+    file,
+    ...revisionOf(fs.statSync(file, { bigint: true })),
+  });
+  const first = row(write('first'), 'first');
+  const second = row(write('second'), 'second');
+  let stats = 0;
+  const dependencies = {
+    fs: {
+      statSync: (...args: any[]) => {
+        stats++;
+        return (fs.statSync as any)(...args);
+      },
+    },
+    fileRevisionOf: revisionOf,
+    sameSessionRevision,
+    humanPromptScanSteps,
+    scanForHumanPrompt,
+    promptScanLists,
+    setImmediate,
+  };
+  const compiled = ts.transpileModule(
+    `class Prepared { ${declarationSource(panelHostSource, 'prepareHumanPrompts')} }`,
+    { compilerOptions: { target: ts.ScriptTarget.ES2022 } },
+  ).outputText;
+  const prepare = new Function(
+    ...Object.keys(dependencies),
+    `${compiled}\nreturn Prepared.prototype.prepareHumanPrompts;`,
+  )(...Object.values(dependencies));
+  const work: string[] = [];
+  const provider: any = {
+    humanScans: new Map(),
+    refreshGeneration: 0,
+    performanceCounters: { recordWork: (name: string) => work.push(name) },
+  };
+  const signal = () => new AbortController().signal;
+  const files = (admitted: { file: string }[]) => admitted.map((source) => source.file);
+
+  assert.deepEqual(files(await prepare.call(provider, [first, second], false, signal())), [first.file, second.file]);
+  assert.ok(stats > 0, 'the first admission checked no file');
+
+  stats = 0;
+  work.length = 0;
+  assert.deepEqual(
+    files(await prepare.call(provider, [first, second], false, signal(), undefined, 0, undefined, 'skip')),
+    [first.file, second.file],
+  );
+  assert.equal(stats, 0, 'a settled session was checked again on a catalog-reusing refresh');
+  assert.deepEqual(work, ['humanPromptSettled', 'humanPromptSettled']);
+
+  stats = 0;
+  assert.deepEqual(
+    files(await prepare.call(provider, [first, second], false, signal(), undefined, 0, undefined, 'recheck')),
+    [first.file, second.file],
+  );
+  assert.ok(stats >= 2, 'a walking refresh skipped its file checks');
+
+  fs.appendFileSync(second.file, JSON.stringify(peer) + '\n');
+  const moved = row(second.file, 'second');
+  stats = 0;
+  work.length = 0;
+  assert.deepEqual(
+    files(await prepare.call(provider, [first, moved], false, signal(), undefined, 0, undefined, 'skip')),
+    [first.file, second.file],
+  );
+  assert.ok(stats >= 1, 'a session whose held revision moved was not checked');
+  assert.deepEqual(
+    work.filter((name) => name === 'humanPromptSettled'),
+    ['humanPromptSettled'],
+    'the unchanged session was checked or the moved one was skipped',
+  );
+
+  // The refresh passes skip only after a listing that reused the held catalog.
+  const modes: unknown[] = [];
+  const wired: any = {
+    humanScans: new Map(),
+    refreshGeneration: 0,
+    authoritativeCatalog: null,
+    repositoryScopeReady: true,
+    prepareHumanPrompts: (sessions: unknown[], ...rest: unknown[]) => {
+      modes.push(rest[5]);
+      return sessions;
+    },
+    allSessions: () => [first, second],
+    catalogWalked: false,
+  };
+  const refresh = methodBody('async refresh(');
+  const segment = refresh.slice(
+    refresh.indexOf('generation = selectedOnly'),
+    refresh.indexOf("this.performanceCounters.recordRefresh('catalog-enumeration'"),
+  );
+  const runSource = ts.transpileModule(
+    `async function run(selectedOnly = false) {
+    const reuseCatalog = true; let generation, controller, primedEnumeration;
+    ${segment}
+    clearTimeout(this.refreshDeadline);
+    return all;
+  }`,
+    { compilerOptions: { target: ts.ScriptTarget.ES2022 } },
+  ).outputText;
+  const run = new Function('CATALOG_REFRESH_DEADLINE_MS', `${runSource}\nreturn run;`)(60_000);
+  await run.call(wired);
+  wired.catalogWalked = true;
+  await run.call(wired);
+  assert.deepEqual(modes, ['skip', 'recheck']);
+});
+
 test('refresh human admission shares read and source allowances and resumes cancelled scans', async () => {
   const { humanPromptScanSteps, promptScanLists, sameSessionRevision, scanForHumanPrompt } =
     await import('./transcript.ts');
