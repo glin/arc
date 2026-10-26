@@ -7883,6 +7883,61 @@ test('concrete default rows preserve saved bytes and restore inheritance only af
   );
 });
 
+test('a saved default model value names the model it resolves to whatever the applied defaults read', () => {
+  const efforts = ['medium', 'high'].map((value) => ({ value, label: value, description: '' }));
+  const models: ModelChoice[] = [
+    { value: 'default', resolvedModel: 'claude-opus-5-5', label: 'Default (recommended)', description: '', efforts },
+    { value: 'opus', resolvedModel: 'claude-opus-5-5', label: 'Opus 5.5', description: '', efforts },
+    { value: 'sonnet', resolvedModel: 'claude-sonnet-5-5', label: 'Sonnet 5.5', description: '', efforts },
+  ];
+  const ready = (model: string) => ({ base: { status: 'ready' as const, model, effort: 'high', reason: '' } });
+  const reads: [string, ComposerState['defaults']][] = [
+    ['ready on the same model', ready('claude-opus-5-5')],
+    ['ready on another model', ready('claude-sonnet-5-5')],
+    ['loading', { base: { status: 'loading', model: null, effort: null, reason: '' } }],
+    ['unavailable', { base: { status: 'unavailable', model: null, effort: null, reason: 'no read' } }],
+    ['absent', undefined],
+  ];
+  for (const [name, defaults] of reads) {
+    const state = composerState({
+      models,
+      model: 'default',
+      effort: 'high',
+      ran: { model: 'claude-opus-5-5', effort: 'high' },
+      ...(defaults ? { defaults } : {}),
+    });
+    const pick = composerView(state)!.picks.find((item) => item.control === 'model')!;
+    assert.equal(pick.label, 'Opus 5.5', `defaults ${name}`);
+    assert.ok(pick.name.startsWith('Model: Opus 5.5'), `defaults ${name}: ${pick.name}`);
+  }
+  // A default row that resolves to no model has no name to show.
+  const unresolved = models.map((item) => (item.value === 'default' ? { ...item, resolvedModel: undefined } : item));
+  const bare = composerView(composerState({ models: unresolved, model: 'default', effort: 'high' }))!;
+  assert.equal(bare.picks.find((item) => item.control === 'model')!.label, 'Default (recommended)');
+  // A default row that no other row shares names its resolved model id.
+  const sole = models.filter((item) => item.value !== 'opus');
+  const alone = composerView(composerState({ models: sole, model: 'default', effort: 'high' }))!;
+  assert.equal(alone.picks.find((item) => item.control === 'model')!.label, 'claude-opus-5-5');
+  // A default selection waiting for the next turn names the model and keeps the pending wording.
+  const waiting = composerView(
+    composerState({
+      models,
+      settings: {
+        selectedModel: 'default',
+        selectedEffort: 'high',
+        effortModel: 'default',
+        pendingModel: 'default',
+        pendingEffort: null,
+        confirmedModel: null,
+        confirmedEffort: null,
+      },
+    }),
+  )!;
+  const next = waiting.picks.find((item) => item.control === 'model')!;
+  assert.equal(next.label, 'Opus 5.5');
+  assert.ok(next.name.startsWith('Model: Opus 5.5, selected for the next turn.'), next.name);
+});
+
 const NATIVE_WINDOW_MODELS: ModelChoice[] = [
   {
     value: 'default',

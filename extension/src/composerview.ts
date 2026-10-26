@@ -2403,7 +2403,9 @@ function modelPick(state: ComposerState, name: string): ComposerPick {
   const projected = modelPicks(state.models, state.defaults, true).find(
     (item) => item.aliases.includes(selected) || item.identity === (running?.resolvedModel || running?.value),
   );
-  const label = projected?.configuredDefault ? projected.readingLabel : baseLabel;
+  // While the field shows the saved selection, a `default` value reads as its menu row. That row names the combined model, the resolved model id, or keeps the `default` label.
+  const foldedDefault = !readConfirmed && chosen?.value === 'default' && projected?.aliases.includes(selected);
+  const label = projected && (projected.configuredDefault || foldedDefault) ? projected.readingLabel : baseLabel;
   const menu = modelMenu(state, name);
   const waiting = menu.items.length === 0;
   // Describe a recorded model only when the label uses confirmed state.
