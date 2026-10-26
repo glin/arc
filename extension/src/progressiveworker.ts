@@ -290,8 +290,28 @@ export interface DiscoveryCharges extends Record<import('./codex').CodexDispatch
   dispatchSpendBytes: number;
   dispatchSpendMs: number;
 }
+// One verified child transcript whose recorded edits a file action needs.
+// The revision is the child's spend file version, the same revision its summary figures carry.
+// A Codex source also names the thread and parent thread its catalog entry proved, which the opening record read must repeat.
+export type ChildEditSource =
+  | { agent: 'claude'; file: string; revision: string }
+  | { agent: 'codex'; file: string; revision: string; threadId: string; parentThreadId: string | null };
+
+// One requested file's recorded edits in a child transcript, in record order, keyed as the child summary keys its files.
+// The span covers the child turns that edited the file.
+export interface ChildFileEdits {
+  key: string;
+  edits: import('./transcript').EditRecord[];
+  startedAt?: number;
+  endedAt?: number;
+}
+
+// The largest child transcript a file action reads, the same bound as one whole-file rail read.
+export const CHILD_EDIT_READ_BYTES = INITIAL_RAIL_READ_BYTES;
+
 export type ProgressiveRequest =
   | { kind: 'codex-context'; session: SessionFile }
+  | { kind: 'child-file-edits'; source: ChildEditSource; keys: string[]; folders: string[] }
   | ({ kind: 'commit-repositories' } & CommitRepositoryRequest)
   | {
       kind: 'claude-children';
@@ -329,6 +349,14 @@ export type ProgressiveRequest =
   | { kind: 'page'; input: ProgressiveInput; cursor: ProgressiveCursor | null };
 export type ProgressiveValue =
   | { kind: 'codex-context'; estimate: import('./codexcontext').CodexContextResult | null }
+  | {
+      kind: 'child-file-edits';
+      // `stale` means the child transcript changed from the requested revision before or during the read,
+      // or a Codex record names a thread or parent other than the requested ones. `unreadable` means the read failed partway.
+      status: 'complete' | 'stale' | 'too-large' | 'unreadable' | 'cancelled';
+      source: ChildEditSource;
+      files: ChildFileEdits[];
+    }
   | ({ kind: 'commit-repositories' } & CommitRepositoryReply)
   | {
       kind: 'claude-children';

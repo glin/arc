@@ -22,7 +22,7 @@ Paths are relative to `extension/src/`. [Architecture](architecture.md) owns pac
 | `timelinecheck.ts` | Reads raw Claude work and close evidence independently, checks timeline consistency, and assembles read-only project sweeps through the shared timeline state and card projections | no |
 | `progressiveworker.ts` | Typed worker requests, cancellation, bounded pending-work, window read lifecycle and failure observations, discovery checkpoints and quantum deltas, transport counters, revision and generation acceptance, and host-lifetime commit evidence reservations. Completed Codex dispatched-source parses survive worker replacement in a host cache capped at 200 entries and 32 MiB of serialized payload. | no |
 | `selectedsource.ts` | Selected descendant transport | no |
-| `progressiveworker-entry.ts` | Worker execution of metadata, one protected live metadata recovery, bounded provider relationship quanta and worker heap observations, serialized discovery admission, recursive catalog closure, Codex dispatch discovery, and source-local dispatched figures, incremental readers, semantic page adapters, and window read start signals with bounded lifecycle and overlap measurements | no |
+| `progressiveworker-entry.ts` | Worker execution of metadata, one protected live metadata recovery, bounded provider relationship quanta and worker heap observations, serialized discovery admission, recursive catalog closure, Codex dispatch discovery, and source-local dispatched figures, incremental readers, semantic page adapters, scoped subagent edit reads for file actions, and window read start signals with bounded lifecycle and overlap measurements | no |
 | `tones.ts` | Measures text contrast against backgrounds and color differences between status tones in panel.css | no |
 | `webview/panel.css` | Panel styles served into the webview | not TypeScript |
 | `webview/panel.ts` | Typed page-lifetime owner composition, cross-owner coordination, exhaustive host-message dispatch, and production message boundary | no |
@@ -116,7 +116,7 @@ Paths are relative to `extension/src/`. [Architecture](architecture.md) owns pac
 | `turnfixtures.ts` | Shared test fixtures. Shipped code must not import it | no |
 | `panelfixture.ts` | The real page and a full render payload for browser tests and the screenshot script | no |
 | `temproot.ts` | Scratch directories beneath a suite root, plus private socket directories with explicit ownership and local cleanup. Shipped code must not import it | no |
-| `patchview.ts` | Selects a turn's unambiguous recorded file change and builds both diff sides from recorded edits | no |
+| `patchview.ts` | Builds both diff sides from recorded edits, and composes several contributors' edits only in a proven order | no |
 | `fileicons.ts` | Chooses a fallback file-type badge | no |
 | `icontheme.ts` | Resolves the active file-icon theme and its font or image resources | no |
 | `pricing.ts` | Shared model and provider resolution, recorded route classes, retained request-band quotes, promotion metadata, fallback windows, required sourced cache policies, and cost estimates | no |

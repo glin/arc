@@ -9,7 +9,7 @@ import {
   publicProjectSpendPrice,
   type NativeChildCacheFacts,
 } from './projectspend.ts';
-import { turnCacheExpiryWarning, type CacheExpiryWarning } from './turncard.ts';
+import { turnCacheExpiryWarning, turnFileContributors, type CacheExpiryWarning } from './turncard.ts';
 import assert from 'node:assert';
 import * as path from 'node:path';
 import * as fs from 'node:fs';
@@ -11936,4 +11936,51 @@ test('the session list hover text leaves out the subagent results', () => {
   assert.ok(!context?.detail?.includes('Subagent results'), context?.detail);
   assert.ok(!context?.detail?.includes('Reviewer'), context?.detail);
   assert.ok(!context?.detail?.includes('Estimated from text size.'), context?.detail);
+});
+
+test('the file actions select the same rows the card displays, and the card carries no edit text', () => {
+  const childFile = (path: string) => ({ path, added: 1, removed: 0, isNew: false });
+  const artifacts = (paths: string[], revision: string) => ({
+    files: paths.map(childFile),
+    commits: [],
+    complete: true,
+    revision,
+  });
+  const creator = agent({
+    description: 'Create the notes',
+    artifacts: artifacts(['c:/repo/shared.ts', 'C:/Repo/Child.md', '/repo/posix.md'], 'a'),
+  });
+  const editor = agent({ description: 'Edit the notes', artifacts: artifacts(['C:/Repo/Child.md'], 'b') });
+  const subject = turn({
+    files: [
+      {
+        path: 'C:/Repo/Shared.ts',
+        added: 1,
+        removed: 0,
+        isNew: false,
+        edits: [{ hunks: [], originalFile: 'parent text before', content: 'parent text after', isCreate: false }],
+      },
+      { path: '/Repo/Posix.md', added: 1, removed: 0, isNew: false, edits: [] },
+    ],
+    agents: [creator, editor],
+  });
+  const card = toCard(subject, false, NOW);
+  const rows = turnFileContributors(subject);
+  assert.deepEqual(
+    rows.map((row) => row.path),
+    card.files.map((file) => file.path),
+  );
+  // A drive path compares without case on every platform. A rooted POSIX path compares without case only on Windows.
+  const posixRows = { win32: 1, darwin: 2, linux: 2 }[process.platform as 'win32' | 'darwin' | 'linux'];
+  assert.equal(rows.filter((row) => row.path.toLowerCase() === '/repo/posix.md').length, posixRows);
+  assert.deepEqual(
+    rows.map((row) => [row.parent !== null, row.agents.map((one) => one.description)]),
+    [
+      [true, ['Create the notes']],
+      [true, posixRows === 1 ? ['Create the notes'] : []],
+      [false, ['Create the notes', 'Edit the notes']],
+      ...(posixRows === 1 ? [] : [[false, ['Create the notes']]]),
+    ],
+  );
+  assert.ok(!JSON.stringify(card).includes('parent text'), 'the card payload carries recorded edit text');
 });

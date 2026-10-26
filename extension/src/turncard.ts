@@ -52,6 +52,7 @@ import {
   ToolCounts,
   Turn,
   TurnAgent,
+  TurnFileChange,
   TurnAnswer,
   TurnAsk,
   TurnCommit,
@@ -1634,9 +1635,34 @@ interface AttributedFile extends ChildFileChange {
   madeBy?: string;
 }
 
+// A displayed file row and the records behind it: the parent turn's own change and each child that changed the file.
+// The card's Files rows and the host's file actions read this one selection.
+export interface TurnFileContributors {
+  // The row's path identity: the recorded identity, or the normalized path.
+  key: string;
+  path: string;
+  parent: TurnFileChange | null;
+  agents: TurnAgent[];
+}
+
+// The contributors behind each file row the card displays, in row order.
+export function turnFileContributors(turn: Turn): TurnFileContributors[] {
+  return attributedRows(turn).contributors;
+}
+
 // Combines parent and child file edits by normalized path and sums counted lines.
 // A file keeps child attribution only when one child owns all recorded changes.
 function attributedFiles(turn: Turn): AttributedFile[] {
+  return attributedRows(turn).rows;
+}
+
+function attributedRows(turn: Turn): { rows: AttributedFile[]; contributors: TurnFileContributors[] } {
+  const contributors: TurnFileContributors[] = turn.files.map((file) => ({
+    key: file.identity ?? normalizeFsPath(file.path),
+    path: file.path,
+    parent: file,
+    agents: [],
+  }));
   const rows: AttributedFile[] = turn.files.map((file) => {
     const row: AttributedFile = {
       path: file.path,
@@ -1661,11 +1687,13 @@ function attributedFiles(turn: Turn): AttributedFile[] {
       const index = at.get(key);
       if (index === undefined) {
         at.set(key, rows.length);
+        contributors.push({ key, path: file.path, parent: null, agents: [agent] });
         rows.push({ ...file, ...(agent.description ? { madeBy: agent.description } : {}) });
         settleCounts(rows[rows.length - 1]);
         continue;
       }
       const held = rows[index];
+      if (!contributors[index].agents.includes(agent)) contributors[index].agents.push(agent);
       held.added += file.added;
       held.removed += file.removed;
       if (file.isNew) {
@@ -1687,7 +1715,7 @@ function attributedFiles(turn: Turn): AttributedFile[] {
       settleCounts(held);
     }
   }
-  return rows;
+  return { rows, contributors };
 }
 
 function fileCardsOf(files: readonly AttributedFile[], folders: string[]): FileCard[] {
@@ -6633,9 +6661,10 @@ function spentTokens(usage: Turn['usage']): boolean {
 // Maximum headline length in a diff tab title.
 export const TITLE_HEADLINE_LIMIT = 60;
 
-// Diff tab title with counts for snapshot comparisons and hunk-only files.
+// Diff tab title with counts for snapshot comparisons, hunk-only files, and files left out.
 // Snapshot comparisons can include earlier edits. Hunk-only comparisons lack complete file text.
-export function diffTitle(headline: string, againstBaseline: number, asHunks: number): string {
+// A file without saved changes has no snapshot and no recorded edits to show.
+export function diffTitle(headline: string, againstBaseline: number, asHunks: number, unsaved = 0): string {
   const head = shortenTo(headline, TITLE_HEADLINE_LIMIT, '…');
   const notes: string[] = [];
   if (againstBaseline) {
@@ -6643,6 +6672,9 @@ export function diffTitle(headline: string, againstBaseline: number, asHunks: nu
   }
   if (asHunks) {
     notes.push(`${asHunks} as hunks only`);
+  }
+  if (unsaved) {
+    notes.push(`${unsaved} without saved changes`);
   }
   return `Changes · ${head}` + (notes.length ? ` · ${notes.join(', ')}` : '');
 }

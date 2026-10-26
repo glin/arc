@@ -125,9 +125,9 @@
     "matricesSha256": "5b04d61cb9d18e1eb073a37369de0c1da0cb67facf539e573deea905a1aa5f59"
   },
   "extension/src/panel.webview.test.ts": {
-    "reason": "Real progressive workers must deliver bounded recovery and metadata through the production panel host. Start metadata must survive storage delays, hidden panels, preference resets, and reloads. File presses must preserve recorded changes after their worktree disappears. Commit presses must never open an unrelated repository after their worktree disappears. Reader sends must release held compaction after drops without overtaking surviving input. Each Prompt box must retain its supplying child definition across sibling catalogs, idle updates, and child replacement. The Remote Control item must follow connection results and never reach saved drafts. Row posts and watcher decisions must reach the performance counters with their causes through the production host methods. A catalog refresh must name why it could not reuse the held catalog. A catalog-reusing refresh must admit settled sessions without a file check and recheck moved ones.",
-    "cases": 648,
-    "matricesSha256": "cb1fd68fff448f93d87ade97f19923e36529285ef6f35f0ec31c050cc7e50034"
+    "reason": "Real progressive workers must deliver bounded recovery and metadata through the production panel host. Start metadata must survive storage delays, hidden panels, preference resets, and reloads. File presses and Open the changes must preserve recorded parent and subagent changes after their worktree disappears. Commit presses must never open an unrelated repository after their worktree disappears. Reader sends must release held compaction after drops without overtaking surviving input. Each Prompt box must retain its supplying child definition across sibling catalogs, idle updates, and child replacement. The Remote Control item must follow connection results and never reach saved drafts. Row posts and watcher decisions must reach the performance counters with their causes through the production host methods. A catalog refresh must name why it could not reuse the held catalog. A catalog-reusing refresh must admit settled sessions without a file check and recheck moved ones.",
+    "cases": 651,
+    "matricesSha256": "8313073ca52c38187e08946b38e03f5954d436708d2afb9b754a2cd540fbca51"
   },
   "extension/src/panelbundle.test.ts": {
     "reason": "The panel bundle and fixture must contain the production entry, source identity, and substituted text.",
@@ -135,9 +135,9 @@
     "matricesSha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
   },
   "extension/src/progressiveworker.test.ts": {
-    "reason": "Worker protocol, cancellation, host death, and bounded transcript reads must survive the actual worker boundary.",
-    "cases": 136,
-    "matricesSha256": "36ba029073e7f1b933922ad35f1e9d18aed699773d9ff7f77ac0fa0cdc22aecf"
+    "reason": "Worker protocol, cancellation, host death, bounded transcript reads, and scoped subagent edit reads must survive the actual worker boundary.",
+    "cases": 138,
+    "matricesSha256": "950b340021bd1ecab3e3e2baef17b7349c2ce39a970f5c2294643d435e56a7fb"
   },
   "extension/src/projectsetups.test.ts": {
     "reason": "Real Git worktrees and canonical filesystem aliases must share project identity while clones stay distinct.",

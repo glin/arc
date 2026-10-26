@@ -1,5 +1,5 @@
 import { applyPatch } from 'diff';
-import { normalizeFsPath, patchMarkersAreValid, type EditRecord, type TurnFileChange } from './transcript';
+import { patchMarkersAreValid, type EditRecord } from './transcript';
 
 // Build both sides of a per-turn file diff from recorded text.
 // Never read the after side from the live file. Later edits belong to other turns.
@@ -92,7 +92,13 @@ function wholeFiles(edits: EditRecord[]): FileSides | null {
   } else {
     return null;
   }
-  const before = text;
+  const after = replayedText(text, edits);
+  return after === null ? null : { before: text, after, source: 'recorded' };
+}
+
+// Apply recorded edits to known text. Return null when an edit does not fit the text exactly.
+function replayedText(start: string, edits: EditRecord[]): string | null {
+  let text = start;
   for (const record of edits) {
     // A Write records the complete after side and replaces the accumulated text.
     if (typeof record.content === 'string') {
@@ -118,7 +124,7 @@ function wholeFiles(edits: EditRecord[]): FileSides | null {
     }
     text = applied;
   }
-  return { before, after: text, source: 'recorded' };
+  return text;
 }
 
 // Build each changed region under its line-range header.
@@ -156,10 +162,47 @@ export function sidesFor(edits: EditRecord[]): FileSides {
   return wholeFiles(edits) ?? changedRegions(edits);
 }
 
-// Select one recorded file without borrowing edits from another path or turn.
-export function recordedFileSides(files: readonly TurnFileChange[], filePath: string): FileSides | null {
-  const matches = files.filter((file) => normalizeFsPath(file.path) === normalizeFsPath(filePath));
-  if (matches.length !== 1) return null;
-  const sides = sidesFor(matches[0].edits);
+function usableSides(sides: FileSides): FileSides | null {
   return sides.source === 'recorded' || sides.before || sides.after ? sides : null;
+}
+
+// One contributor's recorded edits to one file, in its own record order.
+// The span covers the contributor's turns that edited the file, in epoch milliseconds.
+export interface FileContribution {
+  edits: EditRecord[];
+  startedAt?: number;
+  endedAt?: number;
+}
+
+// Build one file's sides from the edits of every contributor behind it. Return null when no recorded text exists.
+// Several contributors replay as one sequence only when their spans do not overlap and each contributor's first edit fits the text the earlier ones produced.
+// Otherwise the sides hold changed regions in start order, because the record does not prove one whole-file sequence.
+export function contributedFileSides(contributions: readonly FileContribution[]): FileSides | null {
+  const present = contributions.filter((one) => one.edits.length);
+  if (present.length <= 1) return usableSides(sidesFor(present[0]?.edits ?? []));
+  const ordered = [...present].sort((left, right) => (left.startedAt ?? 0) - (right.startedAt ?? 0));
+  const regions = (): FileSides | null => usableSides(changedRegions(ordered.flatMap((one) => one.edits)));
+  const proven = ordered.every(
+    (one, index) =>
+      one.startedAt !== undefined &&
+      one.endedAt !== undefined &&
+      (index === 0 || (ordered[index - 1].endedAt ?? Infinity) <= one.startedAt),
+  );
+  const first = proven ? wholeFiles(ordered[0].edits) : null;
+  if (!first) return regions();
+  let text = first.after;
+  for (const one of ordered.slice(1)) {
+    const opening = one.edits[0];
+    // A later contributor's first edit must name the text it started from, or change it with hunks that fit that text.
+    // A complete write without the earlier text, or a creation over existing text, proves no continuity.
+    if (typeof opening.originalFile === 'string') {
+      if (opening.originalFile !== text) return regions();
+    } else if (opening.isCreate ? text !== '' : typeof opening.content === 'string' || !opening.hunks.length) {
+      return regions();
+    }
+    const next = replayedText(text, one.edits);
+    if (next === null) return regions();
+    text = next;
+  }
+  return { before: first.before, after: text, source: 'recorded' };
 }

@@ -1,4 +1,5 @@
 import * as fs from 'node:fs';
+import * as path from 'node:path';
 import { readCodexContext } from './codexcontext';
 import { randomUUID } from 'node:crypto';
 import {
@@ -38,6 +39,8 @@ import {
   type CodexPersonScan,
   readCodexSessionActivity,
   createCodexSessionReducer,
+  readCodexSessionMeta,
+  openingRecordOf,
   codexSessionLineMayAffectRead,
   readCodexSessionTitlePair,
   readCodexTurnStarts,
@@ -47,6 +50,7 @@ import {
 import {
   adoptClaudeRepeatedMap,
   blankClaudeRepeated,
+  createClaudeRepeatedFilter,
   onClaudeRepeatedCoverage,
   type ClaudeRepeatedHeldMap,
 } from './clauderepeated';
@@ -98,6 +102,8 @@ import {
   AgentSpendCache,
   readChildSpend,
   childSpendRevisionKey,
+  scanLinesIncremental,
+  spendFileVersion,
   type AgentSpend,
   type AgentSessionTargetLookup,
   type AgentSpendLookup,
@@ -113,6 +119,7 @@ import type {
 } from './progressiveworker';
 import type { DispatchSessionFacts, WorkerWindowRead } from './progressiveworker';
 import {
+  CHILD_EDIT_READ_BYTES,
   progressiveTurns,
   workerErrorIdentity,
   discoveryCompatibility,
@@ -280,6 +287,7 @@ async function execute(
     };
   }
   if (request.kind === 'commit-repositories') return executeCommitRepositories(request, signal);
+  if (request.kind === 'child-file-edits') return executeChildFileEdits(request, signal);
   if (request.kind === 'metadata-recovery') {
     if (metadataRecovery && !request.eligible.includes(metadataRecovery.sessionId)) metadataRecovery = null;
     if (metadataRecovery && metadataRecovery.sessionId !== request.session.sessionId) {
@@ -1585,6 +1593,83 @@ async function executeCommitRepositories(
     targets,
   };
 }
+// Read the recorded edits of the requested files from one child transcript, with the reader its summary figures use.
+// Only the requested files' edits leave the worker. A changed revision before or after the read answers stale.
+// Size and modification time cannot tell a replaced Codex record apart, so its opening record must name the requested thread,
+// and any parent it names must be the requested parent, as `codexAgentSpendScan` requires of a catalog entry.
+async function executeChildFileEdits(
+  request: Extract<ProgressiveRequest, { kind: 'child-file-edits' }>,
+  signal: AbortSignal,
+): Promise<ProgressiveValue> {
+  const { source } = request;
+  const reply = (status: 'stale' | 'too-large' | 'unreadable' | 'cancelled') =>
+    ({ kind: 'child-file-edits', status, source, files: [] }) as ProgressiveValue;
+  const owned = (meta: import('./codex').CodexSessionMeta | null) =>
+    source.agent !== 'codex' ||
+    (!!meta &&
+      meta.sessionId === source.threadId &&
+      (meta.parentThreadId === null || meta.parentThreadId === source.parentThreadId));
+  const before = revisionOf(source.file);
+  if (!before || spendFileVersion(source.file) !== source.revision) return reply('stale');
+  if (before.size > CHILD_EDIT_READ_BYTES) return reply('too-large');
+  const meta = source.agent === 'codex' ? readCodexSessionMeta(source.file) : null;
+  const claude =
+    source.agent === 'claude'
+      ? createClaudeSessionReducer(path.basename(source.file, path.extname(source.file)), {
+          childTranscript: true,
+          folders: request.folders,
+          maxTurns: Number.MAX_SAFE_INTEGER,
+        })
+      : null;
+  const codex =
+    source.agent === 'codex'
+      ? createCodexSessionReducer(
+          meta?.sessionId ?? path.basename(source.file, path.extname(source.file)),
+          { maxTurns: Number.MAX_SAFE_INTEGER },
+          meta,
+        )
+      : null;
+  const repeated = createClaudeRepeatedFilter();
+  // The opening record of the bytes this read reduced, which proves whose edits they are.
+  let opening: string | null = null;
+  const scan = scanLinesIncremental(source.file, (line) => {
+    opening ??= line;
+    if (claude) {
+      if (!repeated(line)) claude.pushLine(line);
+    } else codex?.pushLine(line);
+  });
+  // Yield between chunks so a cancel message can arrive during a long read.
+  let next = scan.next();
+  for (; !next.done; next = scan.next()) {
+    await new Promise((resolve) => setImmediate(resolve));
+    if (signal.aborted) {
+      scan.return(false);
+      return reply('cancelled');
+    }
+  }
+  // The scan reports a failed read only through its completion value. Partial edits would pass for the whole record.
+  if (!next.value) return reply('unreadable');
+  if (!sameRevision(before, revisionOf(source.file)) || spendFileVersion(source.file) !== source.revision)
+    return reply('stale');
+  if (codex && !owned(openingRecordOf(opening))) return reply('stale');
+  const turns = claude ? claude.finish().turns : codex!.finish(0).turns;
+  const wanted = new Set(request.keys);
+  const found = new Map<string, import('./progressiveworker').ChildFileEdits>();
+  for (const turn of turns) {
+    for (const file of turn.files) {
+      const key = file.identity ?? normalizeFsPath(file.path);
+      if (!wanted.has(key)) continue;
+      const held = found.get(key) ?? { key, edits: [] };
+      held.edits.push(...file.edits);
+      if (turn.startedAt) held.startedAt = Math.min(held.startedAt ?? turn.startedAt, turn.startedAt);
+      const end = turn.processEndedAt ?? turn.endedAt;
+      if (end) held.endedAt = Math.max(held.endedAt ?? end, end);
+      found.set(key, held);
+    }
+  }
+  return { kind: 'child-file-edits', status: 'complete', source, files: [...found.values()] };
+}
+
 async function handleMessage(message: {
   id: number;
   generation: number;
@@ -1614,6 +1699,12 @@ async function handleMessage(message: {
   countKind(activeKinds, kind);
   try {
     const request = message.request;
+    if (request.kind === 'child-file-edits') {
+      const value = await executeChildFileEdits(request, controller.signal);
+      if (!controller.signal.aborted)
+        parentPort?.postMessage({ id: message.id, result: { generation: message.generation, revision: null, value } });
+      return;
+    }
     if (request.kind === 'commit-repositories') {
       const value = await executeCommitRepositories(request, controller.signal);
       if (!controller.signal.aborted)

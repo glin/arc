@@ -7,7 +7,7 @@ import {
   REPOSITORY_SCOPE_CONFIRM_MS,
 } from './repositoryscope';
 import { RepositoryCommits } from './gitcommits';
-import { commitCard, landingCard } from './turncard';
+import { commitCard, diffTitle, landingCard, turnFileContributors } from './turncard';
 import { groupCommitRows } from './view/card-presentation';
 import { candidateGitRunner } from './turnfixtures';
 import { CommitRepositories } from './commitrepositories';
@@ -23,7 +23,9 @@ import { createSavedState } from './webview/state.ts';
 import type { QueuedSubmission, TurnComment } from './turnview.ts';
 import { resolveResponseSession, pendingResponseSessionAdmitted, sessionLinkContext } from './domain/session-link';
 import { nativeCitationPath } from './domain/file-citation';
-import { recordedFileSides } from './patchview';
+import { contributedFileSides } from './patchview';
+import * as crypto from 'node:crypto';
+import { codexSubagentFor, type CodexSubagentFile } from './codex';
 import { fileDiffersOnDisk } from './store';
 
 test('native Copy Path and Copy Relative Path retain citation filename suffixes', async () => {
@@ -16799,10 +16801,10 @@ test('a diff opened from the panel names the group it lands in', () => {
     /workbench\.action\.splitEditorRight/,
     'the multi-file diff ignores the modifier, since focus is the only way to tell it where to open',
   );
-  // Focus the target column before opening a multi-file diff.
+  // Focus the target column before opening a multi-file diff. A press cancelled while focus moves opens nothing.
   sourceMatch(
     panelHostSource,
-    /await this\.focusColumn\(beside\);\s*(?:\/\/[^\n]*\s*)*await vscode\.commands\.executeCommand\('vscode\.changes'/,
+    /await this\.focusColumn\(beside\);\s*(?:if \(action\.signal\.aborted\) return;\s*)?(?:\/\/[^\n]*\s*)*await vscode\.commands\.executeCommand\('vscode\.changes'/,
     'the multi-file diff does not focus the group it should open in, so it lands wherever focus was',
   );
   // The host passes column-selection inputs to editorColumn.
@@ -16827,6 +16829,8 @@ test('dispatched file presses open the child snapshot, including a path the pare
   const snapshots: string[] = [];
   const provider = {
     column: () => 7,
+    beginFileAction: () => new AbortController(),
+    endFileAction: () => {},
     pendingEntry(sessionId: string, file: string) {
       snapshots.push(sessionId);
       return { snapshot: `${sessionId}/${file}`, path: file };
@@ -16880,6 +16884,148 @@ test('dispatched file presses open the child snapshot, including a path the pare
   assert.equal(calls.length, before);
 });
 
+// Lift a provider method from panelhost.ts with its module names supplied by the test.
+function liftedMethod(marker: string, params: string, names: Record<string, unknown>, sync = false) {
+  const code = esbuild.transformSync(`${sync ? '' : 'async '}function lifted(${params}) {${methodBody(marker)}}`, {
+    loader: 'ts',
+  }).code;
+  return new Function(...Object.keys(names), `${code}; return lifted;`)(...Object.values(names));
+}
+
+// A progressive worker for child edit reads of fixture records.
+async function childEditWorker() {
+  const { ProgressiveWorker } = await import('./progressiveworker.js');
+  return new ProgressiveWorker(
+    // The fixture's edited files sit below the temporary directory, which the reader otherwise treats as scratch space.
+    `process.env.ARC_HOME=${JSON.stringify(tempDir('child-file-actions-home-'))};process.env.ARC_IGNORE_ROOTS='';` +
+      esbuild.buildSync({
+        entryPoints: [path.join(__dirname, 'progressiveworker-entry.ts')],
+        bundle: true,
+        platform: 'node',
+        format: 'cjs',
+        target: 'node18',
+        write: false,
+      }).outputFiles[0].text,
+  );
+}
+
+// A provider whose file press, Open the changes press, and contributor resolution run the panel host's own code.
+// Each test agent names its verified child record in `source`, or carries none when its ownership is unproven.
+// With `codexSubagents`, the session is a Codex session and the host's own resolver proves each child from that catalog.
+function fileActionHost(
+  turnsByKey: Map<string, unknown>,
+  worker: { run: (...args: any[]) => Promise<unknown> },
+  dispatched: unknown[] = [],
+  codexSubagents?: CodexSubagentFile[],
+) {
+  const calls: unknown[][] = [];
+  const notices: string[] = [];
+  const texts = new Map<string, string>();
+  const vscode = {
+    ViewColumn: { Beside: 99 },
+    Uri: { file: (target: string) => `file:${target}` },
+    commands: {
+      executeCommand: async (...args: unknown[]) => {
+        calls.push(args);
+      },
+    },
+    window: {
+      showInformationMessage: (notice: string) => {
+        notices.push(notice);
+      },
+    },
+  };
+  let statError: Error | null = null;
+  const provider: Record<string, any> = {
+    column: () => 7,
+    turnsByKey,
+    fileAction: null,
+    codexSubagents,
+    allSessions: () => [
+      { sessionId: 'session', agent: codexSubagents ? 'codex' : 'claude', file: 'C:/Records/Session.jsonl' },
+    ],
+    childEditSource: codexSubagents
+      ? liftedMethod('private childEditSource(', 'session, agent, metas', { codexSubagentFor }, true)
+      : (_session: unknown, agent: { source?: object; artifacts: { revision: string } }) =>
+          agent.source ? { ...agent.source, revision: agent.artifacts.revision } : null,
+    progressiveWorker: worker,
+    folders: () => [],
+    pending: null as null | ((file: string) => unknown),
+    pendingEntry(_session: string, file: string) {
+      return this.pending?.(file) ?? null;
+    },
+    manifestFor() {
+      return this.pending;
+    },
+    focusColumn: async () => {},
+    sideUri: (target: string, side: string, text: string) => `recorded:${target}?${side}=${encodeURIComponent(text)}`,
+    keepSides: (sides: { key: string; text: string }[]) => sides.forEach(({ key, text }) => texts.set(key, text)),
+  };
+  provider.beginFileAction = liftedMethod('private beginFileAction(', '', {}, true);
+  provider.endFileAction = liftedMethod('private endFileAction(', 'action', {}, true);
+  provider.contributedSides = liftedMethod(
+    'private async contributedSides(',
+    'sessionId, cardKey, wanted, controller',
+    {
+      turnFileContributors,
+      claudeSubagentMetaReader: () => () => [],
+      contributedFileSides,
+      crypto,
+      ACTION_READ_DEADLINE_MS: 5_000,
+    },
+  );
+  provider.openTurnDiff = liftedMethod(
+    'private async openTurnDiff(',
+    'sessionId, cardKey, headline, beside = false',
+    {},
+  );
+  provider.openContributedDiff = liftedMethod(
+    'private async openContributedDiff(',
+    'sessionId, cardKey, headline, beside, action',
+    {
+      pendingIn: (manifest: ((file: string) => unknown) | null, file: string) => manifest?.(file) ?? null,
+      vscode,
+      baselineUri: () => 'baseline',
+      diffTitle,
+    },
+  );
+  const compiled = esbuild.transformSync(`async function lifted(msg) {${handlerBody(panelHostSource, 'openFile')}}`, {
+    loader: 'ts',
+  }).code;
+  const openFile = new Function(
+    'cardFor',
+    'vscode',
+    'fs',
+    'path',
+    'baselineUri',
+    'normalizeFsPath',
+    `${compiled}; return lifted;`,
+  )(
+    (key: string) => (turnsByKey.has(key) ? { card: { key, kind: 'turn', dispatched }, sessionId: 'session' } : null),
+    vscode,
+    {
+      statSync: (target: string) => {
+        if (statError) throw statError;
+        return fs.statSync(target);
+      },
+    },
+    path,
+    () => 'baseline',
+    normalizeFsPath,
+  ) as (this: unknown, msg: unknown) => Promise<void>;
+  return {
+    provider,
+    calls,
+    notices,
+    texts,
+    failStat: (error: Error | null) => {
+      statError = error;
+    },
+    pressFile: (key: string, file: string, extra = {}) => openFile.call(provider, { key, path: file, ...extra }),
+    pressChanges: (key: string) => provider.openTurnDiff('session', key, 'Headline', false) as Promise<void>,
+  };
+}
+
 test('a file press retains the recorded change after its worktree directory is removed', async () => {
   const root = tempDir('removed-file-worktree-');
   const worktree = path.join(root, 'worktree');
@@ -16898,57 +17044,12 @@ test('a file press retains the recorded change after its worktree directory is r
     hunks: [{ oldStart: 1, oldLines: 1, newStart: 1, newLines: 1, lines: ['-before', '+after'] }],
   };
   const files = [{ path: file, added: 1, removed: 1, isNew: false, edits: [edit] }];
-  const card = { key: 'session:1', kind: 'turn', dispatched: [{ sessionId: 'child', files: [{ path: file }] }] };
-  const calls: unknown[][] = [];
-  const notices: string[] = [];
-  const texts = new Map<string, string>();
-  let accessError = false;
-  const provider = {
-    column: () => 7,
-    turnsByKey: new Map([[card.key, { files }]]),
-    pendingEntry: () => (fileDiffersOnDisk(entry) ? entry : null),
-    sideUri: (target: string, side: string, text: string) => `recorded:${target}?${side}=${encodeURIComponent(text)}`,
-    keepSides: (sides: { key: string; text: string }[]) => sides.forEach(({ key, text }) => texts.set(key, text)),
-  };
-  const vscode = {
-    ViewColumn: { Beside: 99 },
-    Uri: { file: (target: string) => `file:${target}` },
-    commands: {
-      executeCommand: async (...args: unknown[]) => {
-        calls.push(args);
-      },
-    },
-    window: {
-      showInformationMessage: (notice: string) => {
-        notices.push(notice);
-      },
-    },
-  };
-  const compiled = esbuild.transformSync(`async function lifted(msg) {${handlerBody(panelHostSource, 'openFile')}}`, {
-    loader: 'ts',
-  }).code;
-  const run = new Function(
-    'cardFor',
-    'vscode',
-    'fs',
-    'path',
-    'baselineUri',
-    'recordedFileSides',
-    `${compiled}; return lifted;`,
-  )(
-    () => ({ card, sessionId: 'session' }),
-    vscode,
-    {
-      statSync: (target: string) => {
-        if (accessError) throw Object.assign(new Error('access refused'), { code: 'EACCES' });
-        return fs.statSync(target);
-      },
-    },
-    path,
-    () => 'baseline',
-    recordedFileSides,
-  ) as (this: unknown, msg: unknown) => Promise<void>;
-  const press = (extra = {}) => run.call(provider, { key: card.key, path: file, ...extra });
+  const key = 'session:1';
+  const turnsByKey = new Map<string, unknown>([[key, { files, agents: [] }]]);
+  const host = fileActionHost(turnsByKey, { run: async () => null }, [{ sessionId: 'child', files: [{ path: file }] }]);
+  const { calls, notices, texts } = host;
+  host.provider.pending = () => (fileDiffersOnDisk(entry) ? entry : null);
+  const press = (extra = {}) => host.pressFile(key, file, extra);
 
   fs.writeFileSync(file, 'before\n');
   await press();
@@ -16989,17 +17090,377 @@ test('a file press retains the recorded change after its worktree directory is r
     { files: [{ ...files[0], edits: [] }], extra: {} },
     { files, extra: { sourceSessionId: 'child' } },
   ]) {
-    provider.turnsByKey.set(card.key, { files: rejected.files });
+    turnsByKey.set(key, { files: rejected.files, agents: [] });
     await press(rejected.extra);
     assert.equal(calls.length, 0, 'an unavailable or ambiguous change opened another file');
     assert.ok(notices.pop()?.includes(file));
   }
   assert.equal(fs.readFileSync(current, 'utf8'), 'unrelated current checkout\n');
   assert.equal(fs.readFileSync(snapshot, 'utf8'), 'before\n');
-  accessError = true;
+  host.failStat(Object.assign(new Error('access refused'), { code: 'EACCES' }));
   await press();
   assert.equal(calls.length, 0, 'an access error must not substitute a recorded change');
   assert.ok(notices.pop()?.includes('access refused'));
+});
+
+test('Files and Open the changes show child edits behind a parent card with no file edits of its own', async () => {
+  const root = tempDir('child-file-actions-');
+  const worktree = path.join(root, 'Worktree');
+  const notes = path.join(worktree, 'Notes');
+  fs.mkdirSync(notes, { recursive: true });
+  const publication = path.join(notes, 'Review-Publication.md');
+  const evidence = path.join(notes, 'Evidence.md');
+  const gone = path.join(notes, 'Gone.md');
+  const created = 'title\nfirst\nlast\n';
+  const changed = 'title\nfirst\nmiddle\nlast\n';
+  fs.writeFileSync(publication, changed);
+  fs.writeFileSync(evidence, 'evidence\n');
+  const at = (second: number) => new Date(Date.UTC(2026, 0, 1, 0, 0, second)).toISOString();
+  // A Claude child record whose tool results carry the given edits, one second apart from `start`.
+  const writeChild = (file: string, start: number, results: object[]) =>
+    fs.writeFileSync(
+      file,
+      [
+        { type: 'user', isSidechain: true, timestamp: at(start), message: { role: 'user', content: 'work' } },
+        ...results.map((toolUseResult, index) => ({
+          type: 'user',
+          isSidechain: true,
+          timestamp: at(start + 1 + index),
+          message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: `t${index}`, content: 'ok' }] },
+          toolUseResult,
+        })),
+        {
+          type: 'assistant',
+          isSidechain: true,
+          timestamp: at(start + 1 + results.length),
+          message: {
+            role: 'assistant',
+            model: 'claude-opus-5',
+            stop_reason: 'end_turn',
+            content: [{ type: 'text', text: 'Done.' }],
+          },
+        },
+      ]
+        .map((record) => JSON.stringify(record))
+        .join('\n') + '\n',
+    );
+  const creator = path.join(root, 'creator.jsonl');
+  const editor = path.join(root, 'editor.jsonl');
+  const laterEdit = {
+    filePath: publication,
+    structuredPatch: [{ oldStart: 2, oldLines: 2, newStart: 2, newLines: 3, lines: [' first', '+middle', ' last'] }],
+  };
+  writeChild(creator, 1, [
+    { filePath: publication, type: 'create', content: created, structuredPatch: [] },
+    { filePath: evidence, type: 'create', content: 'evidence\n', structuredPatch: [] },
+  ]);
+  writeChild(editor, 10, [laterEdit]);
+  const { spendFileVersion } = await import('./agentspend.js');
+  const agent = (id: string, file: string | null, paths: string[]) => ({
+    id,
+    description: id,
+    artifacts: {
+      files: paths.map((one) => ({ path: one, added: 1, removed: 0, isNew: true })),
+      commits: [],
+      complete: true,
+      revision: file ? spendFileVersion(file) : 'unread',
+    },
+    ...(file ? { source: { agent: 'claude', file, revision: spendFileVersion(file) } } : {}),
+  });
+  const refresh = (one: ReturnType<typeof agent>, file: string) => {
+    one.artifacts.revision = spendFileVersion(file);
+    one.source = { agent: 'claude', file, revision: one.artifacts.revision };
+  };
+  const first = agent('creator', creator, [publication, evidence]);
+  const second = agent('editor', editor, [publication]);
+  const turn = { files: [], agents: [first, second], startedAt: Date.UTC(2026, 0, 1), endedAt: Date.UTC(2026, 0, 2) };
+  const turnsByKey = new Map<string, unknown>([['session:1', turn]]);
+  const worker = await childEditWorker();
+  let during: (() => void) | null = null;
+  let gate: Promise<void> | null = null;
+  const reads: unknown[] = [];
+  const host = fileActionHost(turnsByKey, {
+    run: async (...args: unknown[]) => {
+      reads.push(args[0]);
+      if (gate) await gate;
+      const result = await worker.run(...(args as Parameters<typeof worker.run>));
+      during?.();
+      return result;
+    },
+  });
+  const { calls, notices, texts } = host;
+  const sidesOf = (call: unknown[]) => [texts.get(String(call[1])), texts.get(String(call[2]))];
+  try {
+    // Before removal, a press opens the live file and Open the changes shows each child's recorded change.
+    await host.pressFile('session:1', publication);
+    assert.deepEqual(calls.pop(), ['vscode.open', `file:${publication}`, { viewColumn: 7 }]);
+    await host.pressChanges('session:1');
+    let changes = calls.pop()!;
+    assert.equal(changes[1], 'Changes · Headline');
+    assert.deepEqual(
+      (changes[2] as string[][]).map((resource) => [resource[0], texts.get(resource[1]), texts.get(resource[2])]),
+      [
+        [`file:${publication}`, '', changed],
+        [`file:${evidence}`, '', 'evidence\n'],
+      ],
+    );
+
+    fs.rmSync(worktree, { recursive: true });
+    // After removal, each child-only row opens its recorded change, composed across both children.
+    await host.pressFile('session:1', publication);
+    let opened = calls.pop()!;
+    assert.equal(opened[3], 'Review-Publication.md - recorded turn changes');
+    assert.deepEqual(sidesOf(opened), ['', changed]);
+    await host.pressFile('session:1', evidence);
+    assert.deepEqual(sidesOf(calls.pop()!), ['', 'evidence\n']);
+    await host.pressChanges('session:1');
+    changes = calls.pop()!;
+    assert.equal(changes[1], 'Changes · Headline');
+    assert.equal((changes[2] as unknown[]).length, 2);
+
+    // Path identity follows the platform's case rules.
+    await host.pressFile('session:1', publication.toUpperCase());
+    const caseless = { win32: true, darwin: false, linux: false }[process.platform as 'win32' | 'darwin' | 'linux'];
+    assert.equal(calls.pop()?.[0], caseless ? 'vscode.diff' : undefined);
+    assert.equal(notices.length ? notices.pop()!.includes('no saved diff') : false, !caseless);
+
+    // Overlapping child spans prove no order, so the row falls back to recorded hunks.
+    writeChild(editor, 2, [laterEdit]);
+    refresh(second, editor);
+    await host.pressFile('session:1', publication);
+    opened = calls.pop()!;
+    assert.equal(opened[3], 'Review-Publication.md - recorded turn changes (hunks only)');
+    assert.ok(String(sidesOf(opened)[1]).includes('middle'));
+    writeChild(editor, 10, [laterEdit]);
+    refresh(second, editor);
+
+    // A child without a verified record leaves its row without saved changes, and the other rows still open.
+    turn.agents.push(agent('unverified', null, [gone]));
+    await host.pressChanges('session:1');
+    changes = calls.pop()!;
+    assert.equal(changes[1], 'Changes · Headline · 1 without saved changes');
+    assert.equal((changes[2] as unknown[]).length, 2);
+    await host.pressFile('session:1', gone);
+    assert.equal(calls.length, 0);
+    assert.ok(notices.pop()?.includes(gone));
+
+    // When no row has saved changes, no empty editor opens.
+    turnsByKey.set('session:2', { files: [], agents: [agent('unverified', null, [gone])], startedAt: 0, endedAt: 0 });
+    await host.pressChanges('session:2');
+    assert.equal(calls.length, 0);
+    assert.ok(notices.pop()?.includes('no saved diff'));
+
+    // A child record that changes while the press reads it publishes nothing.
+    during = () => {
+      second.artifacts.revision = 'replaced';
+    };
+    await host.pressFile('session:1', publication);
+    await host.pressChanges('session:1');
+    during = null;
+    assert.deepEqual([calls.length, notices.length], [0, 0]);
+    refresh(second, editor);
+
+    // A newer press cancels the one still reading, and only the newer press opens.
+    let release!: () => void;
+    gate = new Promise((resolve) => {
+      release = resolve;
+    });
+    const abandoned = host.pressFile('session:1', evidence);
+    gate = null;
+    await host.pressFile('session:1', publication);
+    release();
+    await abandoned;
+    assert.equal(calls.length, 1);
+    assert.equal(calls.pop()?.[3], 'Review-Publication.md - recorded turn changes');
+    assert.equal(notices.length, 0);
+
+    // A live-file press cancels an older recorded-file press, so only the live file opens.
+    const live = path.join(root, 'Live.md');
+    fs.writeFileSync(live, 'live\n');
+    gate = new Promise((resolve) => {
+      release = resolve;
+    });
+    const recorded = host.pressFile('session:1', publication);
+    gate = null;
+    await host.pressFile('session:1', live);
+    release();
+    await recorded;
+    assert.deepEqual(calls.splice(0), [['vscode.open', `file:${live}`, { viewColumn: 7 }]]);
+    assert.equal(notices.length, 0);
+
+    // A refresh that replaces the parent's edit content during a child read, with the same count, publishes nothing.
+    const parentFile = path.join(notes, 'Parent.md');
+    const parentTurn = (content: string) => ({
+      ...turn,
+      agents: [first],
+      files: [
+        {
+          path: parentFile,
+          added: 1,
+          removed: 0,
+          isNew: true,
+          edits: [{ originalFile: null, content, isCreate: true, hunks: [] }],
+        },
+      ],
+    });
+    turnsByKey.set('session:3', parentTurn('first draft\n'));
+    await host.pressChanges('session:3');
+    changes = calls.pop()!;
+    assert.deepEqual(
+      (changes[2] as string[][]).map((resource) => [resource[0], texts.get(resource[2])]),
+      [
+        [`file:${parentFile}`, 'first draft\n'],
+        [`file:${publication}`, created],
+        [`file:${evidence}`, 'evidence\n'],
+      ],
+    );
+    during = () => {
+      turnsByKey.set('session:3', parentTurn('second draft\n'));
+    };
+    await host.pressChanges('session:3');
+    during = null;
+    assert.deepEqual([calls.length, notices.length], [0, 0]);
+    // Reads ask only for the requested files and never carry edit text to the panel.
+    assert.ok(reads.every((read) => (read as { kind: string }).kind === 'child-file-edits'));
+  } finally {
+    worker.stop();
+  }
+});
+
+test('a removed Codex child identified only by its recorded launch ID opens its recorded diff', async () => {
+  const root = tempDir('codex-child-file-actions-');
+  // The worktree was removed, so the edited file no longer exists.
+  const target = path.join(root, 'Worktree', 'Notes', 'Review-Publication.md');
+  const record = path.join(root, 'codex-child.jsonl');
+  const at = (second: number) => new Date(Date.UTC(2026, 0, 1, 0, 0, second)).toISOString();
+  // The child's own opening record names no parent thread.
+  fs.writeFileSync(
+    record,
+    [
+      { timestamp: at(1), type: 'session_meta', payload: { id: 'codex-child', cwd: root, originator: 'codex_vscode' } },
+      { timestamp: at(2), type: 'event_msg', payload: { type: 'task_started', turn_id: 'turn-1' } },
+      {
+        timestamp: at(3),
+        type: 'event_msg',
+        payload: {
+          type: 'patch_apply_end',
+          turn_id: 'turn-1',
+          success: true,
+          changes: { [target]: { type: 'update', unified_diff: '@@ -1 +1,2 @@\n one\n+two\n', move_path: null } },
+        },
+      },
+      {
+        timestamp: at(4),
+        type: 'event_msg',
+        payload: { type: 'task_complete', turn_id: 'turn-1', last_agent_message: 'Done.' },
+      },
+    ]
+      .map((line) => JSON.stringify(line))
+      .join('\n') + '\n',
+  );
+  const { spendFileVersion } = await import('./agentspend.js');
+  const child = {
+    id: 'codex-child',
+    description: 'reviewer',
+    artifacts: {
+      files: [{ path: target, added: 1, removed: 0, isNew: false }],
+      commits: [],
+      complete: true,
+      revision: spendFileVersion(record),
+    },
+  };
+  const turnsByKey = new Map<string, unknown>([
+    ['session:1', { files: [], agents: [child], startedAt: Date.UTC(2026, 0, 1), endedAt: Date.UTC(2026, 0, 2) }],
+  ]);
+  const worker = await childEditWorker();
+  const catalog = (parentThreadId: string | null): CodexSubagentFile[] => [
+    {
+      file: record,
+      threadId: 'codex-child',
+      parentThreadId,
+      agentPath: null,
+      openedAt: null,
+      startedAt: null,
+      threadSource: 'subagent',
+      backgroundReview: false,
+    },
+  ];
+  try {
+    const host = fileActionHost(turnsByKey, worker, [], catalog(null));
+    await host.pressFile('session:1', target);
+    const opened = host.calls.pop()!;
+    assert.equal(opened?.[3], 'Review-Publication.md - recorded turn changes (hunks only)');
+    assert.ok(String(host.texts.get(String(opened[2]))).includes('two'));
+    assert.equal(host.notices.length, 0);
+    // A catalog entry that names another parent is not this session's child.
+    const foreign = fileActionHost(turnsByKey, worker, [], catalog('other'));
+    await foreign.pressFile('session:1', target);
+    assert.equal(foreign.calls.length, 0);
+    assert.ok(foreign.notices.pop()?.includes('no saved diff'));
+  } finally {
+    worker.stop();
+  }
+});
+
+test('a child record counts only when the child is proven to belong to the session', () => {
+  const childEditSource = liftedMethod('private childEditSource(', 'session, agent, metas', { codexSubagentFor }, true);
+  const child = (threadId: string, parentThreadId: string | null, file: string): CodexSubagentFile => ({
+    file,
+    threadId,
+    parentThreadId,
+    agentPath: null,
+    openedAt: null,
+    startedAt: null,
+    threadSource: 'subagent',
+    backgroundReview: false,
+  });
+  const provider = {
+    agentFile: (_session: unknown, ref: { id: string }) => (ref.id === 'known' ? 'C:/Records/Known.jsonl' : null),
+    codexSubagents: [
+      child('own', 'parent', 'C:/Records/Own.jsonl'),
+      child('foreign', 'other', 'C:/Records/Foreign.jsonl'),
+      // One thread recorded in two files proves neither.
+      child('twice', 'parent', 'C:/Records/Twice-A.jsonl'),
+      child('twice', 'parent', 'C:/Records/Twice-B.jsonl'),
+      // A child whose own record names no parent belongs to the parent that recorded its launch ID.
+      child('orphan', null, 'C:/Records/Orphan.jsonl'),
+    ],
+  };
+  const artifacts = { files: [], commits: [], complete: true, revision: '7:1' };
+  const sourceOf = (agent: 'claude' | 'codex', id: string, withArtifacts = true) =>
+    childEditSource.call(
+      provider,
+      { agent, sessionId: 'parent' },
+      { id, ...(withArtifacts ? { artifacts } : {}) },
+      null,
+    );
+  const codex = (threadId: string, parentThreadId: string | null) => ({
+    agent: 'codex',
+    file: `C:/Records/${threadId[0].toUpperCase()}${threadId.slice(1)}.jsonl`,
+    revision: '7:1',
+    threadId,
+    parentThreadId,
+  });
+  assert.deepEqual(
+    [
+      sourceOf('claude', 'known'),
+      sourceOf('claude', 'unknown'),
+      sourceOf('claude', 'known', false),
+      sourceOf('codex', 'own'),
+      sourceOf('codex', 'foreign'),
+      sourceOf('codex', 'twice'),
+      sourceOf('codex', 'orphan'),
+    ],
+    [
+      { agent: 'claude', file: 'C:/Records/Known.jsonl', revision: '7:1' },
+      null,
+      null,
+      codex('own', 'parent'),
+      null,
+      null,
+      codex('orphan', null),
+    ],
+  );
 });
 
 test('the page fixture carries every skill row a picture has to show', () => {
@@ -23654,12 +24115,23 @@ test('a ctrl-opened turn diff reuses the group the last press split off', () => 
   );
 });
 
-test('a turn diff never opens an empty pair for a file the shell record could not detail', () => {
-  // Skip files with unknown counts before building turn-diff resources.
-  const body = methodBody('private async openTurnDiff(');
-  sourceMatch(
-    body,
-    /for \(const file of turn\.files\) \{\s*\/\/[^\n]*\s*\/\/[^\n]*\s*if \(file\.countsUnknown\) \{\s*continue;\s*\}/,
+test('a turn diff never opens an empty pair for a file the shell record could not detail', async () => {
+  const edit: EditRecord = { originalFile: 'a\n', content: 'b\n', isCreate: false, hunks: [] };
+  const turn = {
+    files: [
+      { path: 'C:/Repo/Shell.ts', added: 0, removed: 0, isNew: false, countsUnknown: true, edits: [] },
+      { path: 'C:/Repo/Real.ts', added: 1, removed: 1, isNew: false, edits: [edit] },
+    ],
+    agents: [],
+  };
+  const host = fileActionHost(new Map([['session:1', turn]]), { run: async () => null });
+  await host.pressChanges('session:1');
+  const [command, title, resources] = host.calls.pop()!;
+  assert.equal(command, 'vscode.changes');
+  assert.equal(title, 'Changes · Headline · 1 without saved changes');
+  assert.deepEqual(
+    (resources as string[][]).map((resource) => resource[0]),
+    ['file:C:/Repo/Real.ts'],
     'a shell-named file with no hunks still reaches vscode.changes as an empty diff',
   );
 });

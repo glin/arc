@@ -11099,3 +11099,217 @@ test('discovery publishes bounded delegated spend and reuses completed sources a
     fs.rmSync(directory, { recursive: true, force: true });
   }
 });
+
+test('a child edit read returns only the requested files of a Claude or Codex child at the requested revision', async () => {
+  const root = tempDir('child-file-edits-');
+  const claudeFile = path.join(root, 'claude-child.jsonl');
+  const target = 'C:/Repo/Notes/Review-Publication.md';
+  const posix = '/Repo/Notes/Review-Publication.md';
+  const claudeRecord = (at: number, toolUseResult: object) => ({
+    type: 'user',
+    isSidechain: true,
+    timestamp: timestamp(at),
+    message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: `t${at}`, content: 'ok' }] },
+    toolUseResult,
+  });
+  fs.writeFileSync(
+    claudeFile,
+    [
+      {
+        type: 'user',
+        isSidechain: true,
+        timestamp: timestamp(1),
+        message: { role: 'user', content: [{ type: 'text', text: 'write the notes' }] },
+      },
+      claudeRecord(2, { filePath: target, type: 'create', content: 'one\n', structuredPatch: [] }),
+      claudeRecord(3, { filePath: posix, type: 'create', content: 'posix\n', structuredPatch: [] }),
+      claudeRecord(4, { filePath: 'C:/Repo/other.md', type: 'create', content: 'other\n', structuredPatch: [] }),
+      {
+        type: 'assistant',
+        isSidechain: true,
+        timestamp: timestamp(5),
+        message: {
+          role: 'assistant',
+          model: 'claude-opus-5',
+          stop_reason: 'end_turn',
+          content: [{ type: 'text', text: 'Done.' }],
+        },
+      },
+    ]
+      .map((record) => JSON.stringify(record))
+      .join('\n') + '\n',
+  );
+  const codexFile = path.join(root, 'codex-child.jsonl');
+  fs.writeFileSync(
+    codexFile,
+    [
+      {
+        timestamp: timestamp(10),
+        type: 'session_meta',
+        payload: {
+          id: 'codex-child',
+          session_id: 'codex-child',
+          parent_thread_id: 'parent-a',
+          cwd: 'C:/Repo',
+          originator: 'codex_vscode',
+        },
+      },
+      { timestamp: timestamp(11), type: 'event_msg', payload: { type: 'task_started', turn_id: 'turn-1' } },
+      {
+        timestamp: timestamp(12),
+        type: 'event_msg',
+        payload: {
+          type: 'patch_apply_end',
+          turn_id: 'turn-1',
+          success: true,
+          changes: { [target]: { type: 'update', unified_diff: '@@ -1 +1,2 @@\n one\n+two\n', move_path: null } },
+        },
+      },
+      {
+        timestamp: timestamp(13),
+        type: 'event_msg',
+        payload: { type: 'task_complete', turn_id: 'turn-1', last_agent_message: 'Done.' },
+      },
+    ]
+      .map((record) => JSON.stringify(record))
+      .join('\n') + '\n',
+  );
+  const { spendFileVersion } = await import('./agentspend.js');
+  const worker = new ProgressiveWorker(source);
+  const read = async (agent: 'claude' | 'codex', file: string, keys: string[], revision = spendFileVersion(file)) => {
+    const source: import('./progressiveworker').ChildEditSource =
+      agent === 'claude'
+        ? { agent, file, revision }
+        : { agent, file, revision, threadId: 'codex-child', parentThreadId: 'parent-a' };
+    const result = await worker.run(
+      { kind: 'child-file-edits', source, keys, folders: [] },
+      0,
+      new AbortController().signal,
+    );
+    if (result?.value.kind !== 'child-file-edits') throw new Error('the worker sent no child edit reply');
+    return result.value;
+  };
+  try {
+    const claude = await read('claude', claudeFile, [normalizeFsPath('c:/repo/notes/review-publication.md')]);
+    assert.equal(claude.status, 'complete');
+    assert.deepEqual(
+      claude.files.map((one) => [one.key, one.edits.map((edit) => edit.content), one.startedAt! > 0]),
+      [[normalizeFsPath(target), ['one\n'], true]],
+    );
+    // A drive path compares without case on every platform. A rooted POSIX path compares without case only on Windows.
+    const posixMatches = (await read('claude', claudeFile, [normalizeFsPath('/repo/notes/review-publication.md')]))
+      .files.length;
+    assert.equal(posixMatches, { win32: 1, darwin: 0, linux: 0 }[process.platform as 'win32' | 'darwin' | 'linux']);
+    const codex = await read('codex', codexFile, [normalizeFsPath(target)]);
+    assert.equal(codex.status, 'complete');
+    assert.deepEqual(
+      codex.files.map((one) => one.edits.map((edit) => edit.hunks.map((hunk) => hunk.lines))),
+      [[[[' one', '+two']]]],
+    );
+    assert.equal((await read('claude', claudeFile, [normalizeFsPath(target)], 'replaced')).status, 'stale');
+    // A replaced Codex record with the same size and modification time, naming another thread or parent, publishes nothing.
+    const original = fs.readFileSync(codexFile, 'utf8');
+    const { mtime } = fs.statSync(codexFile);
+    for (const [from, to] of [
+      ['"id":"codex-child"', '"id":"codex-other"'],
+      ['"parent_thread_id":"parent-a"', '"parent_thread_id":"parent-b"'],
+    ]) {
+      fs.writeFileSync(codexFile, original.replace(from, to));
+      fs.utimesSync(codexFile, mtime, mtime);
+      const replaced = await read('codex', codexFile, [normalizeFsPath(target)]);
+      assert.deepEqual([replaced.status, replaced.files], ['stale', []], `${to} passed as the requested child`);
+    }
+    fs.writeFileSync(codexFile, original);
+    assert.deepEqual((await read('claude', claudeFile, [normalizeFsPath(target)], 'replaced')).files, []);
+    // A record above the read bound answers without reading it.
+    const large = path.join(root, 'large.jsonl');
+    fs.writeFileSync(large, '');
+    fs.truncateSync(large, (await import('./progressiveworker.js')).CHILD_EDIT_READ_BYTES + 1);
+    assert.equal((await read('claude', large, [normalizeFsPath(target)])).status, 'too-large');
+    // A cancelled read answers nothing, and the worker keeps answering later reads.
+    const controller = new AbortController();
+    const cancelled = worker.run(
+      {
+        kind: 'child-file-edits',
+        source: { agent: 'claude', file: claudeFile, revision: spendFileVersion(claudeFile) },
+        keys: [normalizeFsPath(target)],
+        folders: [],
+      },
+      0,
+      controller.signal,
+    );
+    controller.abort();
+    assert.equal(await cancelled, null);
+    assert.equal((await read('claude', claudeFile, [normalizeFsPath(target)])).status, 'complete');
+  } finally {
+    worker.stop();
+  }
+});
+
+test('a child edit read that fails after its first chunk publishes no edits', async () => {
+  const root = tempDir('child-file-edits-failing-');
+  const file = path.join(root, 'failing.jsonl');
+  const target = 'C:/Repo/Notes/Review-Publication.md';
+  const record = (at: number, extra: object) =>
+    JSON.stringify({ isSidechain: true, timestamp: timestamp(at), ...extra });
+  fs.writeFileSync(
+    file,
+    [
+      record(1, { type: 'user', message: { role: 'user', content: [{ type: 'text', text: 'write the notes' }] } }),
+      record(2, {
+        type: 'user',
+        message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't2', content: 'ok' }] },
+        toolUseResult: { filePath: target, type: 'create', content: 'one\n', structuredPatch: [] },
+      }),
+      // Padding past the first 64 KiB chunk, so the read fails after the edit above was reduced.
+      record(3, { type: 'user', message: { role: 'user', content: [{ type: 'text', text: 'x'.repeat(200 * 1024) }] } }),
+      record(4, {
+        type: 'assistant',
+        message: {
+          role: 'assistant',
+          model: 'claude-opus-5',
+          stop_reason: 'end_turn',
+          content: [{ type: 'text', text: 'Done.' }],
+        },
+      }),
+    ].join('\n') + '\n',
+  );
+  // The worker's second read of the child record throws, as a disk or network share error would.
+  const failing = `(() => {
+    const fs = require('node:fs');
+    const open = fs.openSync;
+    const read = fs.readSync;
+    let failFd = -1;
+    let reads = 0;
+    fs.openSync = function (target, ...rest) {
+      const fd = open.call(this, target, ...rest);
+      if (String(target) === ${JSON.stringify(file)}) {
+        failFd = fd;
+        reads = 0;
+      } else if (fd === failFd) failFd = -1;
+      return fd;
+    };
+    fs.readSync = function (fd, ...rest) {
+      if (fd === failFd && ++reads > 1) throw Object.assign(new Error('read failed'), { code: 'EIO' });
+      return read.call(this, fd, ...rest);
+    };
+  })();`;
+  const { spendFileVersion } = await import('./agentspend.js');
+  const worker = new ProgressiveWorker(failing + source);
+  try {
+    const result = await worker.run(
+      {
+        kind: 'child-file-edits',
+        source: { agent: 'claude', file, revision: spendFileVersion(file) },
+        keys: [normalizeFsPath(target)],
+        folders: [],
+      },
+      0,
+      new AbortController().signal,
+    );
+    if (result?.value.kind !== 'child-file-edits') throw new Error('the worker sent no child edit reply');
+    assert.deepEqual([result.value.status, result.value.files], ['unreadable', []]);
+  } finally {
+    worker.stop();
+  }
+});

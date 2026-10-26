@@ -2,7 +2,7 @@
 import { test } from 'vitest';
 import assert from 'node:assert';
 import { structuredPatch } from 'diff';
-import { sidesFor } from './patchview.ts';
+import { contributedFileSides, sidesFor } from './patchview.ts';
 import { EditRecord } from './transcript.ts';
 
 // Generate hunks from before and after text with the diff package.
@@ -264,4 +264,45 @@ test('a file recorded as empty while its hunks are deep inside it is not believe
     '2. Open a ticket with the same report.',
   ]);
   assert.deepEqual(sides.after.split('\n'), ['@@ -74,3 +74,3 @@', '## Steps', '2. Send the follow-up instead.']);
+});
+
+// One child created the file and a later child changed it with hunks only.
+const created = 'title\nfirst\nlast\n';
+const changed = 'title\nfirst\nmiddle\nlast\n';
+const creation = (): EditRecord => ({ ...edit('', created), originalFile: null, content: created, isCreate: true });
+const laterHunks = (): EditRecord => ({ ...edit(created, changed), originalFile: null });
+
+test('contributors in a proven order whose text agrees replay as whole files', () => {
+  assert.deepEqual(
+    contributedFileSides([
+      { edits: [laterHunks()], startedAt: 30, endedAt: 40 },
+      { edits: [creation()], startedAt: 10, endedAt: 20 },
+    ]),
+    { before: '', after: changed, source: 'recorded' },
+  );
+});
+
+test('contributors without a proven order or with disagreeing text show changed regions only', () => {
+  const overlapping = contributedFileSides([
+    { edits: [creation()], startedAt: 10, endedAt: 35 },
+    { edits: [laterHunks()], startedAt: 30, endedAt: 40 },
+  ]);
+  const unclocked = contributedFileSides([
+    { edits: [creation()] },
+    { edits: [laterHunks()], startedAt: 30, endedAt: 40 },
+  ]);
+  const disagreeing = contributedFileSides([
+    { edits: [creation()], startedAt: 10, endedAt: 20 },
+    { edits: [{ ...edit('other\n', 'other text\n'), originalFile: null }], startedAt: 30, endedAt: 40 },
+  ]);
+  // A complete later write names no starting text, so it cannot prove what the earlier contributor left.
+  const blindWrite = contributedFileSides([
+    { edits: [creation()], startedAt: 10, endedAt: 20 },
+    { edits: [{ hunks: [], originalFile: null, content: changed, isCreate: false }], startedAt: 30, endedAt: 40 },
+  ]);
+  for (const sides of [overlapping, unclocked, disagreeing, blindWrite]) {
+    assert.equal(sides?.source, 'hunks');
+  }
+  assert.ok(overlapping?.after.includes('middle'));
+  assert.equal(contributedFileSides([{ edits: [] }, { edits: [] }]), null);
 });

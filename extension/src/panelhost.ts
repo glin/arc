@@ -101,7 +101,7 @@ import type { ExportIdentity } from './domain/export-model';
 import { RAIL_FOLDS } from './view/rail';
 import { settingName } from './settings';
 import { ARC_IDENTITY, MULTI_ROOT_SPEND_WORKSPACE_PREFIX } from './identity';
-import { recordedFileSides, sidesFor } from './patchview';
+import { contributedFileSides, type FileContribution, type FileSides } from './patchview';
 import {
   Turn,
   Compaction,
@@ -181,7 +181,12 @@ import {
 import { AgentSpendRef, spendFileVersion, type AgentSpend } from './agentspend';
 import { RepositoryCommits, nodeGitRunner, sameRepositoryRoot, type CommitTarget, type GitRunner } from './gitcommits';
 import { CommitRepositories } from './commitrepositories';
-import { CommitRepositoryReservations, commitRepositorySourceKey } from './progressiveworker';
+import {
+  CommitRepositoryReservations,
+  commitRepositorySourceKey,
+  type ChildEditSource,
+  type ChildFileEdits,
+} from './progressiveworker';
 import {
   COMMIT_REPOSITORY_PARSER_VERSION,
   commitRepositoryOccurrence,
@@ -215,6 +220,8 @@ import {
   pickShowing,
   orderSessionCatalog,
   turnKey,
+  turnFileContributors,
+  type TurnFileContributors,
   formatWhen,
   formatRelative,
   diffTitle,
@@ -746,6 +753,8 @@ function messageBytes(value: unknown): Uint8Array | null {
 // Retained diff text budget across the window. keepSides preserves every side of
 // the current diff, so a single diff can exceed this budget.
 const PATCH_BUDGET_BYTES = 8 * 1024 * 1024;
+// How long a panel action waits for a worker read before it gives up.
+const ACTION_READ_DEADLINE_MS = 5_000;
 const TRANSCRIPT_WAKE_MAX_MS = 1_000;
 const DERIVED_CACHE_CHECKPOINT_MS = 5 * 60 * 1000;
 
@@ -1359,6 +1368,8 @@ export class PanelProvider implements vscode.Disposable {
   private repositoryScopeRoots: string[] = [];
   // Codex child links from discovery. Cached child usage survives parent transcript growth.
   private codexSubagents: CodexSubagentFile[] = [];
+  // The Files or Open the changes press that has not opened its editor yet. A newer press cancels it.
+  private fileAction: AbortController | null = null;
   private claudeSpendSources: SessionSpendSource[] = [];
   private codexSpendSources: { file: string }[] = [];
   private sessionSpendSources: readonly SessionSpendSource[] = [];
@@ -1655,7 +1666,7 @@ export class PanelProvider implements vscode.Disposable {
           this.contextReadControllers.set(sessionId, controllers);
         }
         controllers.add(controller);
-        const deadline = setTimeout(() => controller.abort(), 5000);
+        const deadline = setTimeout(() => controller.abort(), ACTION_READ_DEADLINE_MS);
         try {
           const result = await this.progressiveWorker.run(
             { kind: 'codex-context', session: { ...listed, ...captured } },
@@ -3410,6 +3421,7 @@ export class PanelProvider implements vscode.Disposable {
   }
 
   dispose(): void {
+    this.fileAction?.abort();
     this.recordedReplies?.clear();
     if (this.disposed) return;
     this.readerPages = undefined;
@@ -14916,24 +14928,164 @@ export class PanelProvider implements vscode.Disposable {
     }
   }
 
-  // Open a multi-file diff using pending snapshots, recorded whole-file content, or recorded edit regions. The title identifies less exact sources.
-  private async openTurnDiff(sessionId: string, turn: Turn, headline: string, beside = false): Promise<void> {
-    if (!turn.files.length) {
-      return;
+  // The verified child transcript behind a child's summary, or null when Arc cannot prove the child belongs to this session.
+  private childEditSource(
+    session: SessionFile,
+    agent: import('./transcript').TurnAgent,
+    metas: ClaudeSubagentMetaReader,
+  ): ChildEditSource | null {
+    if (!agent.artifacts) return null;
+    const ref = {
+      id: agent.id,
+      toolUseId: agent.toolUseId,
+      name: agent.description,
+      path: agent.agentType,
+      status: agent.status,
+    };
+    if (session.agent === 'claude') {
+      const file = this.agentFile(session, ref, metas);
+      return file ? { agent: 'claude', file, revision: agent.artifacts.revision } : null;
     }
+    // The resolver that attributes child spend proves ownership, including a child whose launch ID the parent recorded but whose own record names no parent.
+    const child = codexSubagentFor(this.codexSubagents, session.sessionId, ref);
+    return child
+      ? {
+          agent: 'codex',
+          file: child.file,
+          revision: agent.artifacts.revision,
+          threadId: child.threadId,
+          parentThreadId: child.parentThreadId,
+        }
+      : null;
+  }
+
+  // Start a Files or Open the changes press. A newer press cancels this one until its editor opens.
+  private beginFileAction(): AbortController {
+    this.fileAction?.abort();
+    const action = new AbortController();
+    this.fileAction = action;
+    return action;
+  }
+
+  private endFileAction(action: AbortController): void {
+    if (this.fileAction === action) this.fileAction = null;
+  }
+
+  // Build the recorded sides of a card's file rows from every verified contributor behind each row: the parent turn and its children.
+  // Rows that `wanted` rejects get no sides and cause no read. A row lacks sides when a contributor is unverified or its record is too large.
+  // Returns null when the press is cancelled, a read misses its deadline, or a child record, the turn, or its contributors change before publishing.
+  private async contributedSides(
+    sessionId: string,
+    cardKey: string,
+    wanted: (row: TurnFileContributors) => boolean,
+    controller: AbortController,
+  ): Promise<Array<{ row: TurnFileContributors; sides?: FileSides | null }> | null> {
+    const deadline = setTimeout(() => controller.abort(), ACTION_READ_DEADLINE_MS);
+    // One signature covers the turn's identity, each row with a digest of its parent edits, and each wanted contributor's verified source and revision.
+    // The digest holds the edit content, because a refresh can replace a parent's edits without changing their paths or count.
+    const select = () => {
+      const turn = this.turnsByKey.get(cardKey);
+      const session = this.allSessions(true).find((one) => one.sessionId === sessionId);
+      if (!turn || !session) return null;
+      const metas = claudeSubagentMetaReader();
+      const rows = turnFileContributors(turn).map((row) => {
+        const asked = wanted(row);
+        return {
+          row,
+          asked,
+          sources: asked ? row.agents.map((agent) => this.childEditSource(session, agent, metas)) : [],
+        };
+      });
+      const parentEdits = (row: TurnFileContributors) =>
+        row.parent ? crypto.createHash('sha1').update(JSON.stringify(row.parent.edits)).digest('hex') : null;
+      const signature = JSON.stringify([
+        session.file,
+        turn.sessionId,
+        turn.promptId,
+        turn.startedAt,
+        turn.endedAt,
+        rows.map(({ row, asked, sources }) => [row.key, asked, parentEdits(row), sources]),
+      ]);
+      return { turn, rows, signature };
+    };
+    try {
+      const selected = select();
+      if (!selected) return null;
+      const requests = new Map<string, { source: ChildEditSource; keys: Set<string> }>();
+      for (const { row, sources } of selected.rows) {
+        for (const source of sources) {
+          if (!source) continue;
+          const held = requests.get(source.file) ?? { source, keys: new Set<string>() };
+          held.keys.add(row.key);
+          requests.set(source.file, held);
+        }
+      }
+      const replies = new Map<string, Map<string, ChildFileEdits> | null>();
+      for (const [file, { source, keys }] of requests) {
+        const result = await this.progressiveWorker.run(
+          { kind: 'child-file-edits', source, keys: [...keys], folders: this.folders() },
+          0,
+          controller.signal,
+        );
+        if (controller.signal.aborted || result?.value.kind !== 'child-file-edits') return null;
+        const reply = result.value;
+        if (reply.source.file !== file || reply.source.revision !== source.revision) return null;
+        if (reply.status === 'stale' || reply.status === 'cancelled') return null;
+        replies.set(file, reply.status === 'complete' ? new Map(reply.files.map((one) => [one.key, one])) : null);
+      }
+      // Publish only for the same turn, contributors, and child revisions the reads used.
+      if (controller.signal.aborted || select()?.signature !== selected.signature) return null;
+      const turn = selected.turn;
+      return selected.rows.map(({ row, asked, sources }) => {
+        if (!asked) return { row };
+        const contributions: FileContribution[] = [];
+        if (row.parent?.edits.length) {
+          contributions.push({ edits: row.parent.edits, startedAt: turn.startedAt, endedAt: turn.endedAt });
+        }
+        for (const source of sources) {
+          const edits = source ? replies.get(source.file) : null;
+          if (!edits) return { row, sides: null };
+          const found = edits.get(row.key);
+          if (found) contributions.push(found);
+        }
+        return { row, sides: contributedFileSides(contributions) };
+      });
+    } finally {
+      clearTimeout(deadline);
+    }
+  }
+
+  // Open a multi-file diff of the card's Files rows using pending snapshots, recorded whole-file content, or recorded edit regions.
+  // The title identifies less exact sources and counts rows without saved changes.
+  private async openTurnDiff(sessionId: string, cardKey: string, headline: string, beside = false): Promise<void> {
+    const action = this.beginFileAction();
+    try {
+      await this.openContributedDiff(sessionId, cardKey, headline, beside, action);
+    } finally {
+      this.endFileAction(action);
+    }
+  }
+
+  private async openContributedDiff(
+    sessionId: string,
+    cardKey: string,
+    headline: string,
+    beside: boolean,
+    action: AbortController,
+  ): Promise<void> {
     // Read the manifest once for the complete multi-file diff.
     const manifest = this.manifestFor(sessionId);
+    const rows = await this.contributedSides(sessionId, cardKey, (row) => !pendingIn(manifest, row.path), action);
+    if (!rows?.length) {
+      return;
+    }
     const resources: [vscode.Uri, vscode.Uri, vscode.Uri][] = [];
     const sidesToKeep: { key: string; text: string }[] = [];
     let againstBaseline = 0;
     let asHunks = 0;
-    for (const file of turn.files) {
-      // A row the shell named without hunks has no recorded change to show: opening it would
-      // put an empty diff in the list rather than the one this turn actually has none of.
-      if (file.countsUnknown) {
-        continue;
-      }
-      const pending = pendingIn(manifest, file.path);
+    let unsaved = 0;
+    for (const { row, sides } of rows) {
+      const pending = pendingIn(manifest, row.path);
       if (pending) {
         againstBaseline++;
         // Use the snapshot entry's canonical file path for resource labels and both diff sides.
@@ -14941,22 +15093,34 @@ export class PanelProvider implements vscode.Disposable {
         resources.push([live, baselineUri(pending.snapshot, pending.path), live]);
         continue;
       }
-      const sides = sidesFor(file.edits);
+      // A row with no recorded change, such as a file the shell named without hunks, would open as an empty pair.
+      if (!sides) {
+        unsaved++;
+        continue;
+      }
       if (sides.source === 'hunks') {
         asHunks++;
       }
-      const before = this.sideUri(file.path, 'before', sides.before);
-      const after = this.sideUri(file.path, 'after', sides.after);
+      const before = this.sideUri(row.path, 'before', sides.before);
+      const after = this.sideUri(row.path, 'after', sides.after);
       sidesToKeep.push({ key: before.toString(), text: sides.before });
       sidesToKeep.push({ key: after.toString(), text: sides.after });
       // The resource is the live file, so the entry is labelled with the real filename.
-      resources.push([vscode.Uri.file(file.path), before, after]);
+      resources.push([vscode.Uri.file(row.path), before, after]);
+    }
+    if (!resources.length) {
+      void vscode.window.showInformationMessage(
+        'Arc: The files of this turn are no longer available, and this turn has no saved diff for them.',
+      );
+      return;
     }
     this.keepSides(sidesToKeep);
+    const title = diffTitle(headline, againstBaseline, asHunks, unsaved);
     // `vscode.changes` opens in the focused group and accepts no column option. Focus the destination first.
     await this.focusColumn(beside);
+    if (action.signal.aborted) return;
     // Each multi-file diff opens a new editor because its document identity is generated by VS Code.
-    await vscode.commands.executeCommand('vscode.changes', diffTitle(headline, againstBaseline, asHunks), resources);
+    await vscode.commands.executeCommand('vscode.changes', title, resources);
   }
 
   // Parse messages before dispatch. Exhaustive variant handlers keep the host aligned with the panel protocol.
@@ -15483,10 +15647,7 @@ export class PanelProvider implements vscode.Disposable {
           if (!found) {
             return;
           }
-          const turn = this.turnsByKey.get(found.card.key);
-          if (turn) {
-            await this.openTurnDiff(found.sessionId, turn, found.card.headline, msg.beside);
-          }
+          await this.openTurnDiff(found.sessionId, found.card.key, found.card.headline, msg.beside);
         },
         openCommit: async (msg) => {
           const found = cardFor(msg.key);
@@ -15507,56 +15668,74 @@ export class PanelProvider implements vscode.Disposable {
           ) {
             return;
           }
-          const pending = this.pendingEntry(sourceSessionId ?? found.sessionId, msg.path);
-          // Open in the chosen editor column. The beside modifier requests a separate group.
-          const column = msg.beside ? vscode.ViewColumn.Beside : this.column();
-          let live = false;
+          // Every accepted press cancels an older one that is still reading, whichever route either takes.
+          const action = this.beginFileAction();
           try {
-            live = fs.statSync(pending?.path ?? msg.path).isFile();
-          } catch (error) {
-            const code = (error as NodeJS.ErrnoException).code;
-            if (code !== 'ENOENT' && code !== 'ENOTDIR') {
-              void vscode.window.showInformationMessage(
-                `Arc: This file cannot be opened: ${msg.path}. ${String(error)}`,
+            const pending = this.pendingEntry(sourceSessionId ?? found.sessionId, msg.path);
+            // Open in the chosen editor column. The beside modifier requests a separate group.
+            const column = msg.beside ? vscode.ViewColumn.Beside : this.column();
+            let live = false;
+            try {
+              live = fs.statSync(pending?.path ?? msg.path).isFile();
+            } catch (error) {
+              const code = (error as NodeJS.ErrnoException).code;
+              if (code !== 'ENOENT' && code !== 'ENOTDIR') {
+                void vscode.window.showInformationMessage(
+                  `Arc: This file cannot be opened: ${msg.path}. ${String(error)}`,
+                );
+                return;
+              }
+            }
+            if (!live) {
+              // A dispatched row names a session, not a specific turn in that session.
+              const rows = sourceSessionId
+                ? []
+                : await this.contributedSides(
+                    found.sessionId,
+                    found.card.key,
+                    (row) => normalizeFsPath(row.path) === normalizeFsPath(msg.path),
+                    action,
+                  );
+              // A cancelled press, or one whose record changed while it was read, opens nothing.
+              if (!rows || action.signal.aborted) {
+                return;
+              }
+              const matches = rows.filter((one) => one.sides !== undefined);
+              const sides = matches.length === 1 ? matches[0].sides : null;
+              if (!sides) {
+                void vscode.window.showInformationMessage(
+                  `Arc: This file is no longer available, and this turn has no saved diff for it: ${msg.path}`,
+                );
+                return;
+              }
+              const before = this.sideUri(msg.path, 'before', sides.before);
+              const after = this.sideUri(msg.path, 'after', sides.after);
+              this.keepSides([
+                { key: before.toString(), text: sides.before },
+                { key: after.toString(), text: sides.after },
+              ]);
+              await vscode.commands.executeCommand(
+                'vscode.diff',
+                before,
+                after,
+                `${path.basename(msg.path)} - recorded turn changes${sides.source === 'hunks' ? ' (hunks only)' : ''}`,
+                { viewColumn: column, preserveFocus: false },
               );
               return;
             }
-          }
-          if (!live) {
-            // A dispatched row names a session, not a specific turn in that session.
-            const turn = sourceSessionId ? undefined : this.turnsByKey.get(found.card.key);
-            const sides = recordedFileSides(turn?.files ?? [], msg.path);
-            if (!sides) {
-              void vscode.window.showInformationMessage(
-                `Arc: This file is no longer available, and this turn has no saved diff for it: ${msg.path}`,
+            if (pending) {
+              await vscode.commands.executeCommand(
+                'vscode.diff',
+                baselineUri(pending.snapshot, pending.path),
+                vscode.Uri.file(pending.path),
+                path.basename(pending.path),
+                { viewColumn: column, preserveFocus: false },
               );
-              return;
+            } else {
+              await vscode.commands.executeCommand('vscode.open', vscode.Uri.file(msg.path), { viewColumn: column });
             }
-            const before = this.sideUri(msg.path, 'before', sides.before);
-            const after = this.sideUri(msg.path, 'after', sides.after);
-            this.keepSides([
-              { key: before.toString(), text: sides.before },
-              { key: after.toString(), text: sides.after },
-            ]);
-            await vscode.commands.executeCommand(
-              'vscode.diff',
-              before,
-              after,
-              `${path.basename(msg.path)} - recorded turn changes${sides.source === 'hunks' ? ' (hunks only)' : ''}`,
-              { viewColumn: column, preserveFocus: false },
-            );
-            return;
-          }
-          if (pending) {
-            await vscode.commands.executeCommand(
-              'vscode.diff',
-              baselineUri(pending.snapshot, pending.path),
-              vscode.Uri.file(pending.path),
-              path.basename(pending.path),
-              { viewColumn: column, preserveFocus: false },
-            );
-          } else {
-            await vscode.commands.executeCommand('vscode.open', vscode.Uri.file(msg.path), { viewColumn: column });
+          } finally {
+            this.endFileAction(action);
           }
         },
         openSkill: async (msg) => {
