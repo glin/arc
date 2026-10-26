@@ -724,6 +724,7 @@ test(
       tryLink(join(home, '.claude/skills'), join(home, '.agents/skills'), linkKinds[0]);
       const installed = await operateSkill('install', 'claude', older, {
         home,
+        env: { ...process.env, CLAUDE_CONFIG_DIR: '' },
         signal: new AbortController().signal,
       });
       assert.equal(installed.status, 'installed', JSON.stringify(installed));
@@ -753,6 +754,7 @@ test(
       tryLink(join(home, '.claude/skills'), join(home, '.agents/skills'), linkKinds[0]);
       const installed = await operateSkill('install', 'claude', readSkillPayload(cli), {
         home,
+        env: { ...process.env, CLAUDE_CONFIG_DIR: '' },
         signal: new AbortController().signal,
       });
       assert.equal(installed.status, 'installed', JSON.stringify(installed));
@@ -789,6 +791,7 @@ test.for(['an invalid ownership binding', 'an unfinished retained operation'])(
       tryLink(join(home, '.claude/skills'), join(home, '.agents/skills'), linkKinds[0]);
       const installed = await operateSkill('install', 'claude', previous, {
         home,
+        env: { ...process.env, CLAUDE_CONFIG_DIR: '' },
         signal: new AbortController().signal,
       });
       assert.equal(installed.status, 'installed', JSON.stringify(installed));
