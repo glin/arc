@@ -39934,6 +39934,34 @@ test('the host posts the query context to a ready panel only when that panel lac
   );
 });
 
+// Each membership names every session file, so the posted revision is a digest of the two. A changed membership on either
+// side changes it, and the same memberships give the same revision again after a different one.
+test('the query context revision is short and follows the discovery and catalog memberships', () => {
+  const { provider, sources } = pagedListingFixture(30);
+  const scope = JSON.stringify(provider.folders());
+  const proven = provider.sessionReadDiscoveryRevision;
+  const revision = () => provider.sessionQueryContext().revision;
+  const complete = revision();
+  assert.equal(provider.sessionQueryContext().coverage, 'complete');
+  assert.ok(complete.length <= 64, `the revision carried ${complete.length} characters for 31 sessions`);
+  // A refresh proves the same membership again in a new string and publishes a new catalog array.
+  provider.sessionReadDiscoveryRevision = ` ${proven}`.slice(1);
+  provider.authoritativeCatalog = [...sources];
+  assert.equal(revision(), complete, 'equal memberships gave a different revision');
+  provider.sessionReadDiscoveryRevision = undefined;
+  const unproven = revision();
+  assert.notEqual(unproven, complete, 'losing the discovery membership kept the revision');
+  provider.sessionReadDiscoveryRevision = proven;
+  assert.equal(revision(), complete, 'the same memberships gave a different revision after a change');
+  provider.sessionReadDiscoveryRevision = sessionCatalogMembership(scope, sources.slice(1));
+  assert.notEqual(revision(), complete, 'a different discovery membership kept the revision');
+  provider.sessionReadDiscoveryRevision = proven;
+  provider.authoritativeCatalog = sources.slice(1);
+  const smaller = revision();
+  assert.notEqual(smaller, complete, 'a different catalog membership kept the revision');
+  assert.notEqual(smaller, unproven);
+});
+
 for (const count of [100, 1000]) {
   test(`unchanged query contexts keep content search and avoid session list updates at ${count} identities`, () => {
     const { dispatch, calls } = queryContextPanel();

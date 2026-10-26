@@ -52,6 +52,7 @@ import {
   sessionDiscoveryMembership,
   sessionListingPage,
   sessionPageSources,
+  sessionQueryRevision,
   sessionScopeDigest,
   sessionSourceKey,
   sessionAttention,
@@ -3269,6 +3270,17 @@ export class PanelProvider implements vscode.Disposable {
 
   private sessionQueryDiscoveryPending = false;
 
+  private sessionQueryRevisionHeld?: { discovery?: string; catalog?: string; revision: string };
+
+  // Digests the two memberships only when one of them changed since the last context.
+  private sessionQueryRevisionFor(discovery: string | undefined, catalog: string | undefined): string {
+    const held = this.sessionQueryRevisionHeld;
+    if (held && held.discovery === discovery && held.catalog === catalog) return held.revision;
+    const revision = sessionQueryRevision(discovery, catalog);
+    this.sessionQueryRevisionHeld = { discovery, catalog, revision };
+    return revision;
+  }
+
   private sessionQueryContext(): SessionQueryContext {
     const scope = this.repositoryScope?.snapshot(this.folders());
     const roots = JSON.stringify(scope?.roots ?? []);
@@ -3283,7 +3295,7 @@ export class PanelProvider implements vscode.Disposable {
           this.sessionReadDiscoveryRevision === index.discovery
         ? 'complete'
         : 'incomplete';
-    const revision = JSON.stringify([this.sessionReadDiscoveryRevision, index?.discovery]);
+    const revision = this.sessionQueryRevisionFor(this.sessionReadDiscoveryRevision, index?.discovery);
     const held = this.resolvedQueryContext;
     if (
       held?.catalog === accepted &&

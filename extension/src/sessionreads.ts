@@ -472,6 +472,13 @@ export function sessionDiscoveryMembership(
   return proven ? sessionCatalogMembership(scope, catalog) : undefined;
 }
 
+// The query context revision: a digest of the membership discovery proved and the catalog membership. Equal memberships give
+// an equal revision, and a change to either gives a different one. Each membership names every file, so the posted context
+// carries the digest instead.
+export function sessionQueryRevision(discovery: string | undefined, catalog: string | undefined): string {
+  return digest(JSON.stringify([discovery, catalog]));
+}
+
 // Keys order the sources by ordinal comparison. A repeated provider, ID, and file is one source.
 // A source has physical identity only when supportedFileIdentity holds, which requires a positive inode.
 export function sessionPageSources<T extends SessionFile>(sessions: readonly T[]): SessionPageSource<T>[] {

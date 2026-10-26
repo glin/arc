@@ -2,9 +2,11 @@
 // One tick is one host update cycle: the input gate, the payload build, the row delta encoding and the
 // serialized size of what a panel would receive. The fixture changes one running session per tick, the
 // way a transcript append changes one session in a reader's window.
-// Each post is weighed whole and by top-level field. The query context lists every session's identity and,
-// in its revision, every session file with its device and inode, the way the host builds it. It travels in its own
+// Each post is weighed whole and by top-level field. The query context lists every session's identity and carries
+// a revision digested from every session file with its device and inode, the way the host builds it. It travels in its own
 // message when the panel's last context differs, and its bytes count toward the tick that posts it.
+// After the ticks, a refresh that walks the catalog marks coverage incomplete while discovery runs and complete again
+// when it finishes. Those two context posts count apart from the ticks.
 // Counts and bytes are exact for the generated fixture, whose rows carry one short label and two figures,
 // so a real list of the same length serializes larger. Wall times include whatever else the machine runs
 // and are reported, never compared.
@@ -20,7 +22,7 @@ import {
   type RailPayloadInput,
 } from './payload';
 import { serializedMessageBytes } from './performancediagnostics';
-import { sessionCatalogMembership } from './sessionreads';
+import { sessionCatalogMembership, sessionQueryRevision } from './sessionreads';
 import type { SessionCostTotal, SessionStatChip } from './turncard';
 import type { RailCacheMark, UnsentInput } from './turnrail';
 import type { NewCount } from './turnread';
@@ -55,6 +57,8 @@ export interface RailPublicationReport {
   delta: RailPublicationPostCounts;
   // Query context messages, posted beside the session list messages.
   queryContext: RailPublicationPostCounts;
+  // Query context messages posted for one coverage change from complete to incomplete and back.
+  coverageFlip: RailPublicationPostCounts;
   wholeReasons: Record<string, number>;
   // Rows carried across every post, and the bytes of the first complete list.
   rowsSent: number;
@@ -135,7 +139,7 @@ function queryContext(sessions: readonly PayloadSessionRow[]): SessionQueryConte
     identities: sessions.map(({ id, agent }) => ({ sessionId: id, agent })),
     coverage: 'complete',
     scope: SCOPE,
-    revision: JSON.stringify([membership, membership]),
+    revision: sessionQueryRevision(membership, membership),
   };
 }
 
@@ -262,6 +266,7 @@ export function measureRailPublication(given: Partial<RailPublicationOptions> = 
     whole: { count: 0, bytes: 0, maximumBytes: 0 },
     delta: { count: 0, bytes: 0, maximumBytes: 0 },
     queryContext: { count: 0, bytes: 0, maximumBytes: 0 },
+    coverageFlip: { count: 0, bytes: 0, maximumBytes: 0 },
     wholeReasons: {},
     rowsSent: 0,
     snapshotBytes: 0,
@@ -318,6 +323,12 @@ export function measureRailPublication(given: Partial<RailPublicationOptions> = 
       if (tick === 0) entry.snapshot = fieldBytes;
       else if (!encoding.whole) entry.delta = Math.max(entry.delta, fieldBytes);
     }
+  }
+  for (const coverage of ['incomplete', 'complete'] as const) {
+    const context: SessionQueryContext = { ...held.queryContext, coverage };
+    if (contextSent && sameSessionQueryContext(contextSent, context)) continue;
+    contextSent = context;
+    post(report.coverageFlip, serializedMessageBytes({ type: 'queryContext', queryContext: context }) ?? 0);
   }
   report.tickShare = report.snapshotBytes > 0 ? largestTick / report.snapshotBytes : 0;
   const minutes = (options.ticks * options.tickMs) / 60_000;

@@ -38,6 +38,22 @@ test('a tick that changes one running session posts under 2 percent of the compl
   );
 });
 
+// A refresh that walks the catalog posts the context twice, once as discovery starts and once as it completes.
+test('the query context stays under 400,000 bytes at 3,675 sessions, and a coverage flip posts it twice', () => {
+  const report = measureRailPublication({ rows: 3675, running: 1, ticks: 2, tickMs: 3_000 });
+
+  assert.equal(report.queryContext.count, 1);
+  assert.ok(
+    report.queryContext.maximumBytes < 400_000,
+    `the query context cost ${report.queryContext.maximumBytes} bytes for 3,675 sessions`,
+  );
+  assert.equal(report.coverageFlip.count, 2, 'a coverage change did not post the context');
+  assert.ok(
+    report.coverageFlip.bytes < 800_000,
+    `one coverage flip posted ${report.coverageFlip.bytes} bytes for 3,675 sessions`,
+  );
+});
+
 test('an unchanged tick is skipped by the gate before any payload is built', () => {
   const report = measureRailPublication({ rows: 40, running: 1, ticks: 1, tickMs: 1_000 });
   assert.equal(report.gatePassed, 1);
