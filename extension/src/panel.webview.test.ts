@@ -32819,11 +32819,12 @@ test('a session row drops the failed word when a later turn succeeds before its 
     };
     const rowStatus = () => {
       host.sessionOutcomes = host.outcomesFor([{ sessionId: 'sess', file, agent: 'claude' }]);
-      return host.railStatuses(now).statuses.get('sess');
+      const status = host.railStatuses(now).statuses.get('sess') ?? null;
+      return { status, word: railTimeSlot(status as Parameters<typeof railTimeSlot>[0]).word };
     };
-    assert.equal(rowStatus(), 'done', 'a row that is not open kept the failed turn');
+    assert.deepEqual(rowStatus(), { status: 'done', word: null }, 'a row that is not open kept the failed turn');
     host.cache.set(file, { read, revision: { mtimeMs: 10, size: 10 } });
-    assert.equal(rowStatus(), 'done', 'an open row kept the failed turn');
+    assert.deepEqual(rowStatus(), { status: 'done', word: null }, 'an open row kept the failed turn');
   } finally {
     vi.useRealTimers();
   }

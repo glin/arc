@@ -702,7 +702,7 @@ function mergedWiderChildren(
     const base = laterOutcome(lifetime, parsed);
     return base && base !== lifetime ? mergedWiderChildren(base, lifetime, parsed) : lifetime;
   }
-  // A tail read of an earlier revision can hold a turn that a later turn replaced.
+  // A tail read of an earlier revision can hold an older turn than the lifetime or parsed read.
   const newer = laterOutcome(lifetime, parsed);
   if (newer && (newer.startedAt ?? 0) > (tail.startedAt ?? 0)) {
     return mergedWiderChildren(newer, lifetime, parsed);
