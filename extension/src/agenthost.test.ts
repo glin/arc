@@ -1345,7 +1345,7 @@ function policyCallbacks(host: AgentHost, policies: LaunchPolicyStore) {
   const errors: string[] = [];
   const panel: any = {
     initialNamesChanged() {},
-    refresh() {},
+    refreshFrom() {},
     noteSessionMoved: (source: string, next: string) => moves.push([source, next]),
     noteRemoteControlOff() {},
     setCodexEffectiveMode: (...args: unknown[]) => modes.push(args),

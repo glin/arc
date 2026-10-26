@@ -277,7 +277,7 @@ test('registered checkout identity changes reach the host metadata refresh callb
     repositoryScopeChanged() {
       discoveryChanges++;
     },
-    refresh(...args: unknown[]) {
+    refreshFrom(...args: unknown[]) {
       refreshes.push(args);
     },
   });
@@ -291,7 +291,7 @@ test('registered checkout identity changes reach the host metadata refresh callb
     await vi.advanceTimersByTimeAsync(REPOSITORY_SCOPE_REFRESH_MS);
     scope.snapshot(['/repo']);
     await settle();
-    assert.deepEqual(refreshes, [[true, true, false, true]]);
+    assert.deepEqual(refreshes, [['checkouts', true, true, null, false, true]]);
     assert.deepEqual(scope.snapshot(['/repo']), baseline);
     output = 'worktree /repo\0';
     await vi.advanceTimersByTimeAsync(REPOSITORY_SCOPE_REFRESH_MS);
@@ -301,8 +301,8 @@ test('registered checkout identity changes reach the host metadata refresh callb
     await vi.advanceTimersByTimeAsync(REPOSITORY_SCOPE_CONFIRM_MS);
     await settle();
     assert.deepEqual(refreshes, [
-      [true, true, false, true],
-      [true, true, false, true],
+      ['checkouts', true, true, null, false, true],
+      ['checkouts', true, true, null, false, true],
     ]);
     assert.deepEqual(scope.checkoutSnapshot(), ['/repo']);
     assert.deepEqual(scope.snapshot(['/repo']), baseline);
@@ -11349,7 +11349,7 @@ test('the first authoritative render precedes Project cost restoration and prici
   );
   sourceDoesNotMatch(
     hydration,
-    /allSessions|prepareProgressive|this\.refresh\(/,
+    /allSessions|prepareProgressive|this\.refresh(?:From|As)?\(/,
     'hydration enumerates or parses sessions again before it publishes the ledger figures',
   );
   sourceMatch(
@@ -12756,7 +12756,7 @@ test('every host reaches the panel through one attach, and the editor tab is the
   // Continue polling while any host remains visible.
   sourceMatch(
     panelHostSource,
-    /if \(this\.anyVisible\(\)\) \{\s*void this\.refresh\(true\);\s*this\.startPolling\(\);/,
+    /if \(this\.anyVisible\(\)\) \{\s*this\.refreshFrom\('visible', true\);\s*this\.startPolling\(\);/,
     'visibility is decided from one host rather than from all of them',
   );
 });
@@ -14988,7 +14988,7 @@ test('archive and turn-end wiring reaches the process lifecycle owner', () => {
   const forget = memberFrom(panelHostSource, forgetAt);
   sourceMatch(
     forget,
-    /this\.hidden\.clear\(\);[\s\S]*onArchivedSessionsChange\?\.\(this\.hidden\);[\s\S]*this\.refresh\(true\);/,
+    /this\.hidden\.clear\(\);[\s\S]*onArchivedSessionsChange\?\.\(this\.hidden\);[\s\S]*this\.refreshFrom\('forget-state', true\);/,
     'forgetting the archive set leaves the lifecycle owner holding its old copy',
   );
 
@@ -16102,7 +16102,7 @@ test('draft acceptance survives profile-save and adoption failures until removal
       setRecentProfiles() {
         assert.fail('A recent history reached B');
       },
-      refresh() {},
+      refreshFrom() {},
     };
     const live = { key: 'codex:fresh:accepted', prompt: async () => 7, state: () => ({ sessionId: 'actual' }) };
     const scope = {
@@ -16344,7 +16344,7 @@ test('saved read-only policy survives replacement, draft resume, fork and clear 
   const policyRoot = tempDir('arc-saved-policies-');
   const durable = new LaunchPolicyStore(path.join(policyRoot, 'launch-policies'));
   durable.write('original', policy);
-  const panel: any = { refresh() {}, isAgentRunLaunch: () => true };
+  const panel: any = { refreshFrom() {}, isAgentRunLaunch: () => true };
   const make = () => {
     const scope = {
       LaunchPolicyStore,
@@ -16453,7 +16453,7 @@ test.each(['saved', 'lost-child', 'retry'])('delayed Claude clear retains permis
     let retired = false;
     const moves: Array<[string, string]> = [];
     const panel: any = {
-      refresh() {},
+      refreshFrom() {},
       noteSessionMoved: (source: string, successor: string) => moves.push([source, successor]),
     };
     let wire: ClaudeWire;
@@ -20958,7 +20958,7 @@ interface DraftPanel {
   mcpServers: Record<string, unknown[]>;
   onDraftProfileChanged(draft: NewSessionDraft): void;
   refreshUsageHandler(agent: string, force: boolean, owner: string): void;
-  refresh(force: boolean): void;
+  refreshFrom(reason: string, force: boolean): void;
   post(message: unknown): Promise<void>;
   usagePayload(): unknown;
   setAttachmentNotice(session: string, notice: string): void;
@@ -21005,7 +21005,7 @@ function draftPanel(
     profileChanges: [],
     catalogRequests: [],
     mcpServers: {},
-    refresh(force: boolean) {
+    refreshFrom(_reason: string, force: boolean) {
       panel.refreshed.push(force);
     },
     post(message: unknown) {
@@ -21170,7 +21170,7 @@ test('a draft leaves on a rail press unless the reader changed it on its own con
     writeDrafts() {
       /* Inspect draft state without persisting. */
     },
-    refresh() {
+    refreshFrom() {
       /* Inspect draft state without redrawing the session list. */
     },
   });
@@ -23151,7 +23151,7 @@ test('the rail is reworded when work starts or stops, and not on every event', (
   );
   sourceDoesNotMatch(
     body.replace(/if \(moved\) \{\s*this\.refreshFrom\('running', true\);\s*\}/, ''),
-    /this\.refresh\(/,
+    /this\.refresh(?:From|As)?\(/,
     'the panel refresh runs outside the guard, so every streamed event rebuilds it',
   );
 });
@@ -24234,7 +24234,7 @@ test('the rail card and the session heading both offer pinning, and none of it i
   );
   sourceMatch(
     panelHostSource,
-    /const target = this\.panelSession\(session\);[\s\S]*this\.saved\.pinnedTop = \[\.\.\.this\.pinnedTop\];[\s\S]*this\.refresh\(true\);/,
+    /const target = this\.panelSession\(session\);[\s\S]*this\.saved\.pinnedTop = \[\.\.\.this\.pinnedTop\];[\s\S]*this\.postRail\(true\);/,
     'the pin commands do not update and publish the provider-owned durable set',
   );
   sourceMatch(
@@ -30879,7 +30879,7 @@ test('selection and accepted worker results avoid unnecessary catalog walks', ()
     'wide startup decides compact controls from a nullable rail payload instead of the responsive rail state',
   );
   // Count refresh callers that request catalog reuse.
-  const reusing = [...panelHostSource.matchAll(/this\.refresh\([^)]*\b(?:true|false)\s*,\s*true\)/g)];
+  const reusing = [...panelHostSource.matchAll(/this\.refresh(?:From|As)\('[^']+', (?:true|false), true\b/g)];
   assert.equal(
     reusing.length,
     16,
@@ -30897,7 +30897,7 @@ test('selection and accepted worker results avoid unnecessary catalog walks', ()
     'a selected-session update still sends fields that choosing another session cannot change',
   );
   assert.equal(
-    (refresh.match(/void this\.refresh\(true, true, true\);/g) ?? []).length,
+    (refresh.match(/this\.refreshFrom\('progressive', true, true, null, true\);/g) ?? []).length,
     1,
     'an accepted selected result does not defer metadata until after its first-card post',
   );
@@ -30913,7 +30913,7 @@ test('selection and accepted worker results avoid unnecessary catalog walks', ()
   const older = memberFrom(panelHostSource, olderAt);
   sourceMatch(
     older,
-    /this\.refresh\(true, true, true, true\);/,
+    /this\.refreshFrom\('history', true, true, null, true, true\);/,
     'the sentinel stands still under the reader while its page is read',
   );
   // Selection and history navigation share show and its selected-only refresh.
@@ -30922,7 +30922,7 @@ test('selection and accepted worker results avoid unnecessary catalog walks', ()
   const show = memberFrom(panelHostSource, showAt);
   sourceMatch(
     show,
-    /this\.refresh\(true, true, true, true\)[\s\S]*completeSelectedWindow\(session, this\.selectionGeneration\)/,
+    /this\.refreshAs\('selection', true, true, null, true, true\)[\s\S]*completeSelectedWindow\(session, this\.selectionGeneration\)/,
     'selecting a session does not use the selection-only render before its window read',
   );
   sourceMatch(
@@ -31001,13 +31001,13 @@ test('a ready host stages worker-backed session data without clearing accepted c
     'a duplicate ready message starts a second initial load',
   );
   assert.equal(
-    (ready.match(/this\.refresh\(true\)/g) ?? []).length,
+    (ready.match(/this\.refreshFrom\('shell-ready', true\)/g) ?? []).length,
     1,
     'one ready transition starts more than one initial load',
   );
   sourceMatch(
     ready,
-    /this\.readyHosts\.add\(host\);[\s\S]*this\.refresh\(true\);[\s\S]*this\.startPolling\(\);[\s\S]*this\.requestInitialCatalogRefresh\(\);/,
+    /this\.readyHosts\.add\(host\);[\s\S]*this\.refreshFrom\('shell-ready', true\);[\s\S]*this\.startPolling\(\);[\s\S]*this\.requestInitialCatalogRefresh\(\);/,
     'the first load or polling starts before the host becomes ready',
   );
   sourceMatch(
@@ -31131,7 +31131,7 @@ test('a ready host stages worker-backed session data without clearing accepted c
   );
   sourceMatch(
     selected,
-    /const controller = new AbortController\(\);[\s\S]*this\.selectionWork = work;[\s\S]*this\.progressiveWorker\.run\([\s\S]*generation, controller\.signal[\s\S]*void this\.refresh\(true, true, true, true\);/,
+    /const controller = new AbortController\(\);[\s\S]*this\.selectionWork = work;[\s\S]*this\.progressiveWorker\.run\([\s\S]*generation, controller\.signal[\s\S]*this\.refreshFrom\('selected-window', true, true, null, true, true\);/,
     'selected-window work shares the catalog refresh controller or does not publish when it finishes',
   );
   sourceDoesNotMatch(
@@ -38183,7 +38183,11 @@ test('a lost row delta, a reloaded page and an undelivered post each make the ne
       assert.ok(message, `no ${next} message followed ${name}`);
       assert.equal(message.rows?.base, null, `the ${next} message after ${name} was a delta`);
       if (name === 'rowsGap' && next === 'rail') {
-        assert.deepEqual(reposts, [[true, true]], 'a lost row delta did not repost from the held catalog');
+        assert.deepEqual(
+          reposts,
+          [[true, true, false, false]],
+          'a lost row delta did not repost from the held catalog',
+        );
       }
     }
   }

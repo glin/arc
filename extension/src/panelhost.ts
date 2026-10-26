@@ -9059,7 +9059,7 @@ export class PanelProvider implements vscode.Disposable {
   }
 
   // Every refresh starts here under its requester's name, which the refresh and walk counters report.
-  // `refresh` reads the name before its first wait, so the name is restored when the call returns.
+  // `refresh` reads the name before its first wait, so `refreshAs` can restore the name when the call returns.
   private refreshAs(
     reason: string,
     force: boolean,

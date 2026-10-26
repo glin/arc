@@ -1349,9 +1349,7 @@ function harness(pendingRefresh = false, registerRefreshHandler = true, extraMet
   if (pendingRefresh) {
     methods.push('refresh');
   }
-  if (pendingRefresh) {
-    methods.push('refreshFrom', 'refreshAs');
-  }
+  methods.push('refreshFrom', 'refreshAs');
   methods.push(...extraMethods);
   const body = owner.members
     .filter((member) => member.name && methods.includes(member.name.getText(file)))
@@ -2052,6 +2050,8 @@ function selectedWindowHarness(
     'updateHistoryAfterAcceptedWindow',
     'jointSplitWindow',
     'acceptJointSplitWindow',
+    'refreshFrom',
+    'refreshAs',
     ...extra,
     // evictCache calls pruneDerivedTitles.
     ...(extra.includes('evictCache') ? ['pruneDerivedTitles'] : []),
@@ -6661,9 +6661,10 @@ test('each catalog walk names its requester, and the re-list after a replaced fi
     await vi.waitFor(() => assert.equal(walks.length, 5, 'the first refresh did not reach its walk'));
     provider.refreshFrom('poll');
     provider.refreshFrom('child:tool');
+    provider.refreshFrom('poll');
     await releaseAll(started[0]);
-    assert.equal(started.length, 4, 'the waiting requests did not run once as one merged refresh');
-    await releaseAll(started[3]);
+    assert.equal(started.length, 5, 'the waiting requests did not run once as one merged refresh');
+    await releaseAll(started[4]);
   } finally {
     provider.refresh = refresh;
   }
@@ -6675,7 +6676,7 @@ test('each catalog walk names its requester, and the re-list after a replaced fi
     ),
     {
       'coalesced:child:tool': 1,
-      'coalesced:poll': 1,
+      'coalesced:poll': 2,
       'walk:requested:coalesced': 1,
       'walk:requested:trigger': 1,
     },
@@ -12152,7 +12153,10 @@ function gitScopedLoadingHarness() {
   // A scope change starts a full refresh, which each test runs itself so it can count it.
   const fullRefreshes: string[] = [];
   provider.selectionWorks = new Map();
-  provider.refreshFrom = (reason: string) => fullRefreshes.push(reason);
+  // A selected-only refresh is not a full refresh, so it runs through the real method.
+  const refreshFrom = provider.refreshFrom;
+  provider.refreshFrom = (reason: string, ...rest: unknown[]) =>
+    rest[4] ? refreshFrom.call(provider, reason, ...rest) : fullRefreshes.push(reason);
   const lines: { event: string; record: any }[] = [];
   provider.diagnostics = {
     ...provider.diagnostics,

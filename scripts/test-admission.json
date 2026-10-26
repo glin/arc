@@ -127,7 +127,7 @@
   "extension/src/panel.webview.test.ts": {
     "reason": "Real progressive workers must deliver bounded recovery and metadata through the production panel host. Start metadata must survive storage delays, hidden panels, preference resets, and reloads. File presses and Open the changes must preserve recorded parent and subagent changes after their worktree disappears. Commit presses must never open an unrelated repository after their worktree disappears. Reader sends must release held compaction after drops without overtaking surviving input. Each Prompt box must retain its supplying child definition across sibling catalogs, idle updates, and child replacement. The Remote Control item must follow connection results and never reach saved drafts. Row posts and watcher decisions must reach the performance counters with their causes through the production host methods. A catalog refresh must name why it could not reuse the held catalog. A catalog refresh must admit settled sessions without a file check after a walk or with the held catalog, and recheck moved or replaced ones. Each prompt admission file check must name its cause. One spend update must check each child file once and publish dispatched costs once, and an integrity check that queues nothing must not publish them. The query context revision must follow both memberships as a short digest.",
     "cases": 656,
-    "matricesSha256": "2f52980282a050a04ace8c0b05ad6fc1ca3fd1a823f1e238e24469dec232b5db"
+    "matricesSha256": "4eacc3994d1b53bf5cb3ecdf31c41eb93a6ecd37c7f4adfeb84b3b52d24815e0"
   },
   "extension/src/panelbundle.test.ts": {
     "reason": "The panel bundle and fixture must contain the production entry, source identity, and substituted text.",
@@ -192,7 +192,7 @@
   "extension/src/startup.test.ts": {
     "reason": "Real title workers must publish recovered metadata through startup ownership and cancellation boundaries. Project cost snapshots must preserve workspace, revision, and calendar ownership during background slices. Agent messages must preserve durable admission, settlement wakeups, native delivery authority, and retained retries. Host integrity checks must preserve complete cost, discovery membership, exact revisions, and bounded coverage across failures and panel lifecycle changes. Ordinary corrections must cross CLI parsing and the authenticated channel before busy target work finishes, preserving native receipts, reservations, and final admission. Pending ordinary receipts retain target exclusion across caller disconnect and wake eligible queued heads only after settlement. Startup measurements must accept baselines that already block agents. A discovery progress reply before an accepted catalog must keep the walked rows for the next reuse. A session this panel started must publish its name and recorded responses from a real worker read while relationship discovery stays pending.",
     "cases": 258,
-    "matricesSha256": "a362d70678c38c327b83f459859750ede79f3f2fffbb8250bd4c3d8e522909d2"
+    "matricesSha256": "2c7ca3d1dd8cf68fabd549306dab9990746a8150a3a74fbfb63f6f833b72427a"
   },
   "extension/src/store.test.ts": {
     "reason": "The real Stop hook must renew retention for useful snapshot stores without changing workspace files.",
