@@ -5404,7 +5404,7 @@ export function readCodexDispatchedSpendQuantum(
   file: string,
   children: readonly CodexSubagentFile[],
   now: number,
-  budget: { bytes: number; deadline: number; advanced?: boolean },
+  budget: { bytes: number; ms: number; advanced?: boolean },
   dependencies: (files: string[]) => void,
   completed: (file: string, entry: CodexDispatchSpendEntry) => void,
   progress?: (event: CodexDispatchSpendProgress) => void,
@@ -5437,7 +5437,9 @@ export function readCodexDispatchedSpendQuantum(
     };
   }
   const aggregate = pendingDispatchAggregate;
-  while (!aggregate.next.done && budget.bytes > 0 && (!budget.advanced || performance.now() < budget.deadline)) {
+  // The budget's time counts only this reader's work, so earlier reads in the caller's pass leave it intact.
+  const startedAt = performance.now();
+  while (!aggregate.next.done && budget.bytes > 0 && (!budget.advanced || performance.now() - startedAt < budget.ms)) {
     const source = aggregate.next.value;
     const key = dispatchSpendKey(source);
     const band = openSpendBand(spendFileVersion(source), now);
@@ -5482,6 +5484,7 @@ export function readCodexDispatchedSpendQuantum(
     budget.advanced = true;
     aggregate.next = aggregate.scan.next(parsed);
   }
+  budget.ms -= performance.now() - startedAt;
   dependencies([...aggregate.revisions.keys(), ...(!aggregate.next.done ? [aggregate.next.value] : [])]);
   if (aggregate.next.done) {
     progress?.('dispatchSpendAggregateCompletions');

@@ -17549,7 +17549,7 @@ test('finite dispatched Codex totals complete beyond the reusable source cache a
       files[0],
       children,
       now,
-      { bytes: 65536, deadline: Infinity },
+      { bytes: 65536, ms: Infinity },
       (files) => dependencies.push(files),
       (file) => completed.push(file),
     );
@@ -17615,7 +17615,7 @@ test('dispatched Codex progress distinguishes advancement, source restarts, inva
       file,
       children,
       Date.UTC(2030, 0, 1),
-      { bytes: 65536, deadline: Infinity },
+      { bytes: 65536, ms: Infinity },
       () => {},
       (source) => completed.push(source),
       (event) => counts[event]++,
@@ -17681,7 +17681,7 @@ test('dispatched Codex progress counts a revision rejected after source finaliza
       file,
       [],
       Date.UTC(2030, 0, 1),
-      { bytes: 65536, deadline: Infinity },
+      { bytes: 65536, ms: Infinity },
       () => {},
       (source) => completed.push(source),
       (event) => events.push(event),
@@ -17701,7 +17701,7 @@ test('dispatched Codex progress counts a revision rejected after source finaliza
   }
 });
 
-test('expired dispatched Codex deadlines grant one useful advancement across short sources and roots', () => {
+test('spent dispatched Codex time budgets grant one useful advancement across short sources and roots', () => {
   const files = Array.from({ length: 4 }, (_, index) => {
     const records = turnWithToolCalls(1);
     (records[0] as any).payload.id = `short-${index}`;
@@ -17723,7 +17723,7 @@ test('expired dispatched Codex deadlines grant one useful advancement across sho
   const completed: string[] = [];
   const allowance = 8 * 1024 * 1024;
   let advancements = 0;
-  const read = (file: string, budget: { bytes: number; deadline: number }) =>
+  const read = (file: string, budget: { bytes: number; ms: number }) =>
     readCodexDispatchedSpendQuantum(
       file,
       children,
@@ -17738,19 +17738,19 @@ test('expired dispatched Codex deadlines grant one useful advancement across sho
   const clock = vi.spyOn(performance, 'now').mockReturnValue(100);
   retainCodexDispatchSpendRoots(new Set());
   try {
-    const first = { bytes: allowance, deadline: 0 };
+    const first = { bytes: allowance, ms: 0 };
     assert.equal(read(files[0], first).pending, true);
     assert.deepEqual(completed, [files[0]]);
     assert.equal(advancements, 2, 'source reading and finalization each advance the parser');
     assert.equal(first.bytes, allowance - fs.statSync(files[0]).size);
-    const second = { bytes: allowance, deadline: 0 };
+    const second = { bytes: allowance, ms: 0 };
     const result = read(files[0], second);
     assert.equal(result.pending, false);
     assert.equal(result.spend.models[0].usage.output, 100);
     assert.equal(second.bytes, allowance - fs.statSync(files[1]).size);
     assert.equal(read(files[2], second).pending, true);
     assert.deepEqual(completed, files.slice(0, 2));
-    const third = { bytes: allowance, deadline: 0 };
+    const third = { bytes: allowance, ms: 0 };
     assert.equal(read(files[2], third).pending, false);
     assert.equal(third.bytes, allowance - fs.statSync(files[2]).size);
   } finally {

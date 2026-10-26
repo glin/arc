@@ -919,8 +919,8 @@ async function execute(
     );
     const dispatched: DispatchSessionFacts[] = [];
     const seen = new Set<string>();
-    // Each request caps Codex spend reads independently of relationship discovery.
-    const dispatchBudget = { bytes: CODEX_DISPATCH_REQUEST_BYTES, deadline: performance.now() + RELATIONSHIP_SLICE_MS };
+    // Each request caps Codex spend reads independently of relationship discovery and of the other dispatch visits.
+    const dispatchBudget = { bytes: CODEX_DISPATCH_REQUEST_BYTES, ms: RELATIONSHIP_SLICE_MS };
     const dispatchReads = openReadWindow();
     try {
       const subagentMetas = claudeSubagentMetaReader();

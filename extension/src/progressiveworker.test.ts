@@ -11161,6 +11161,139 @@ test('discovery publishes bounded delegated spend and reuses completed sources a
   }
 });
 
+test('a dispatched spend aggregate settles in bounded passes after earlier dispatched sessions spend the pass clock', async () => {
+  const directory = tempDir('starved-dispatch-spend-');
+  const parentFile = path.join(directory, 'parent.jsonl');
+  const claudeIds = Array.from({ length: 8 }, (_, index) => `${index}ccccccc-1111-1111-1111-111111111111`);
+  const rootId = 'aaaaaaaa-1111-1111-1111-111111111111';
+  const childIds = ['a1', 'a2', 'a3'].map((prefix) => `${prefix}aaaaaa-2222-2222-2222-222222222222`);
+  const waitingIds = ['bbbbbbbb-1111-1111-1111-111111111111', 'dddddddd-1111-1111-1111-111111111111'];
+  const launch = (agent: string, sessionId: string, index: number) =>
+    claudeDispatchTranscript(
+      'python child.py --arc-dispatch',
+      `ARC_DISPATCH_SESSION={"agent":"${agent}","session_id":"${sessionId}","owned":true}`,
+      `dispatch-${index}`,
+    );
+  // Claude dispatched sessions come first, so their reads reach the pass before the Codex root does.
+  const launches = [
+    ...claudeIds.map((sessionId) => ['claude', sessionId] as const),
+    ['codex', rootId] as const,
+    ...waitingIds.map((sessionId) => ['codex', sessionId] as const),
+  ];
+  fs.writeFileSync(
+    parentFile,
+    launches
+      .flatMap(([agent, sessionId], index) => launch(agent, sessionId, index))
+      .map((record) => JSON.stringify(record) + '\n')
+      .join(''),
+  );
+  const filler = (blocks: number, record: (text: string) => string) =>
+    Array.from({ length: blocks }, () => record('x'.repeat(65500))).join('');
+  for (const sessionId of claudeIds)
+    fs.writeFileSync(
+      path.join(directory, sessionId + '.jsonl'),
+      JSON.stringify({ type: 'user', cwd: directory, timestamp: timestamp(0), message: { content: 'work' } }) +
+        '\n' +
+        filler(4, (text) => JSON.stringify({ type: 'ignored', text }) + '\n') +
+        JSON.stringify({
+          type: 'assistant',
+          timestamp: timestamp(1),
+          message: {
+            model: 'claude-sonnet-4-6',
+            stop_reason: 'end_turn',
+            content: [{ type: 'text', text: 'done' }],
+            usage: { input_tokens: 10, output_tokens: 1 },
+          },
+        }) +
+        '\n',
+    );
+  const rollout = (sessionId: string, blocks: number, parentThreadId?: string) => {
+    const record = (type: string, payload: object) => JSON.stringify({ type, timestamp: timestamp(1), payload }) + '\n';
+    fs.writeFileSync(
+      path.join(directory, sessionId + '.jsonl'),
+      record('session_meta', {
+        id: sessionId,
+        cwd: directory,
+        source: 'exec',
+        ...(parentThreadId ? { parent_thread_id: parentThreadId } : {}),
+      }) +
+        record('event_msg', { type: 'task_started', turn_id: 'work' }) +
+        record('turn_context', { turn_id: 'work', model: 'gpt-6.1-sol' }) +
+        record('event_msg', { type: 'user_message', message: 'work' }) +
+        filler(blocks, (text) => record('ignored', { text })) +
+        record('event_msg', {
+          type: 'token_count',
+          info: {
+            last_token_usage: { input_tokens: 10, output_tokens: 3, total_tokens: 13 },
+            total_token_usage: { input_tokens: 10, output_tokens: 3, total_tokens: 13 },
+          },
+        }) +
+        record('event_msg', { type: 'task_complete', turn_id: 'work' }),
+    );
+  };
+  rollout(rootId, 1);
+  for (const childId of childIds) rollout(childId, 16, rootId);
+  for (const sessionId of waitingIds) rollout(sessionId, 1);
+  const session = (sessionId: string, agent: 'claude' | 'codex') => {
+    const file = path.join(directory, sessionId + '.jsonl');
+    return { file, sessionId, agent, ...revisionOf(fs.statSync(file, { bigint: true })) };
+  };
+  const request = () => ({
+    kind: 'claude-children' as const,
+    parents: [session('parent', 'claude')],
+    catalog: [
+      session('parent', 'claude'),
+      ...claudeIds.map((sessionId) => session(sessionId, 'claude')),
+      ...[rootId, ...waitingIds].map((sessionId) => session(sessionId, 'codex')),
+    ],
+    codexChildren: childIds.map((threadId) => ({
+      file: path.join(directory, threadId + '.jsonl'),
+      threadId,
+      parentThreadId: rootId,
+      agentPath: null,
+      openedAt: null,
+      startedAt: null,
+      threadSource: null,
+      backgroundReview: false,
+    })),
+    repositoryRoots: [directory],
+  });
+  // Each read costs one millisecond of the worker clock, so the Claude rereads spend more than one slice per pass.
+  const worker = new ProgressiveWorker(
+    `const clockFs = require('node:fs'); let readClock = 0; performance.now = () => readClock;
+    const clockRead = clockFs.readSync; const clockReadFile = clockFs.readFileSync;
+    clockFs.readSync = function (...args) { readClock++; return clockRead.apply(this, args); };
+    clockFs.readFileSync = function (...args) { readClock++; return clockReadFile.apply(this, args); };
+    Date.now = () => ${Date.now() + 7_200_000};` + source,
+  );
+  try {
+    const advancements: number[] = [];
+    let settled: ProgressiveResult | null = null;
+    for (let pass = 0; pass < 12 && !settled; pass++) {
+      const result = await worker.run(request(), 1, new AbortController().signal);
+      assert.ok(result?.value.kind === 'claude-children' || result?.value.kind === 'claude-children-progress');
+      // Live Claude dispatched sessions grow between passes, so every pass rereads them before the Codex root.
+      for (const sessionId of claudeIds)
+        fs.appendFileSync(path.join(directory, sessionId + '.jsonl'), JSON.stringify({ type: 'ignored', pass }) + '\n');
+      if (result.value.kind !== 'claude-children') continue;
+      advancements.push(result.value.charges!.dispatchSpendParserAdvancements);
+      if (!result.value.continuation) settled = result;
+    }
+    assert.ok(
+      settled?.value.kind === 'claude-children',
+      `dispatched spend never settled. Parser advancements per pass: ${advancements.join(', ')}`,
+    );
+    const facts = new Map(settled.value.dispatchFacts.map((fact) => [fact.sessionId, fact]));
+    assert.equal(facts.get(rootId)?.spend.found, true);
+    assert.equal(facts.get(rootId)?.spend.partial, false);
+    assert.equal(facts.get(rootId)?.spend.models[0]?.usage.output, 12, 'the root and its three children each add 3');
+    for (const sessionId of waitingIds) assert.equal(facts.get(sessionId)?.spend.found, true);
+  } finally {
+    worker.stop();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test('a child edit read returns only the requested files of a Claude or Codex child at the requested revision', async () => {
   const root = tempDir('child-file-edits-');
   const claudeFile = path.join(root, 'claude-child.jsonl');
