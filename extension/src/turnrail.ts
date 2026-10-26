@@ -662,7 +662,8 @@ export function openChildrenKey(
 
 // Combine the tail outcome with open children from lifetime facts and the parsed window.
 // The tail can omit earlier launches. Lifetime facts read the whole file, while the parsed window covers timeline turns.
-// A tail that misses the newest turn's opening prompt has no outcome. The later of the lifetime and parsed outcomes then takes its place.
+// Without a tail outcome, such as when the tail misses the newest turn's opening prompt, the later of the lifetime and parsed outcomes takes its place.
+// It then follows the tail rules, so open children that only an older lifetime outcome holds do not carry over.
 // Accept children only from outcomes describing the same newest turn through the same last record. Older reads cannot reopen closed children.
 // A child closed by any read remains closed. Completion matching differs between readers, so their closed sets can differ.
 // `tailCommands` come from tail reads without a typed prompt. Wider outcomes retain those commands for the same turn because other readers omit commands.
