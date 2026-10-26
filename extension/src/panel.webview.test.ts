@@ -3626,7 +3626,7 @@ test('command-only admission removes pending rows through every catalog path and
 });
 
 // A refresh that reused the held catalog knows nothing new about a file whose complete scan found a prompt at the
-// revision the catalog holds, so admission takes that session without a file check.
+// revision the catalog holds, so admission takes that session without a file check. Each file check names its cause.
 
 test('a catalog-reusing refresh admits settled sessions without a file check and rechecks moved ones', async () => {
   const { humanPromptScanSteps, promptScanLists, sameSessionRevision, scanForHumanPrompt } =
@@ -3634,9 +3634,9 @@ test('a catalog-reusing refresh admits settled sessions without a file check and
   const directory = tempDir('human-admission-settled-');
   const human = { type: 'user', message: { role: 'user', content: 'actual task' } };
   const peer = { type: 'user', origin: { kind: 'peer' }, message: { content: 'x'.repeat(1024) } };
-  const write = (name: string) => {
+  const write = (name: string, rows: unknown[] = [human, peer]) => {
     const file = path.join(directory, `${name}.jsonl`);
-    fs.writeFileSync(file, [human, peer].map((row) => JSON.stringify(row)).join('\n') + '\n');
+    fs.writeFileSync(file, rows.map((row) => JSON.stringify(row)).join('\n') + '\n');
     return file;
   };
   const row = (file: string, sessionId: string) => ({
@@ -3647,6 +3647,7 @@ test('a catalog-reusing refresh admits settled sessions without a file check and
   });
   const first = row(write('first'), 'first');
   const second = row(write('second'), 'second');
+  const silent = row(write('silent', [peer]), 'silent');
   let stats = 0;
   const dependencies = {
     fs: {
@@ -3679,24 +3680,35 @@ test('a catalog-reusing refresh admits settled sessions without a file check and
   const signal = () => new AbortController().signal;
   const files = (admitted: { file: string }[]) => admitted.map((source) => source.file);
 
-  assert.deepEqual(files(await prepare.call(provider, [first, second], false, signal())), [first.file, second.file]);
+  assert.deepEqual(files(await prepare.call(provider, [first, second, silent], false, signal())), [
+    first.file,
+    second.file,
+  ]);
   assert.ok(stats > 0, 'the first admission checked no file');
+  assert.equal(provider.humanScans.get(silent.file)?.complete, true, 'the session without a prompt was not scanned');
 
   stats = 0;
   work.length = 0;
   assert.deepEqual(
-    files(await prepare.call(provider, [first, second], false, signal(), undefined, 0, undefined, 'skip')),
+    files(await prepare.call(provider, [first, second, silent], false, signal(), undefined, 0, undefined, 'skip')),
     [first.file, second.file],
+    'a session whose complete scan found no prompt was listed',
   );
-  assert.equal(stats, 0, 'a settled session was checked again on a catalog-reusing refresh');
-  assert.deepEqual(work, ['humanPromptSettled', 'humanPromptSettled']);
+  assert.ok(stats >= 1, 'the session without a prompt was not checked');
+  assert.deepEqual(
+    work,
+    ['humanPromptSettled', 'humanPromptSettled', ...Array(stats).fill('humanPromptStat:noPrompt')],
+    'a settled session was checked again, or a check without a prompt was counted under another cause',
+  );
 
   stats = 0;
+  work.length = 0;
   assert.deepEqual(
-    files(await prepare.call(provider, [first, second], false, signal(), undefined, 0, undefined, 'recheck')),
+    files(await prepare.call(provider, [first, second, silent], false, signal(), undefined, 0, undefined, 'recheck')),
     [first.file, second.file],
   );
-  assert.ok(stats >= 2, 'a walking refresh skipped its file checks');
+  assert.ok(stats >= 3, 'a walking refresh skipped its file checks');
+  assert.deepEqual(work, Array(stats).fill('humanPromptStat:walk'), 'a walking refresh counted another cause');
 
   fs.appendFileSync(second.file, JSON.stringify(peer) + '\n');
   const moved = row(second.file, 'second');
@@ -3708,9 +3720,31 @@ test('a catalog-reusing refresh admits settled sessions without a file check and
   );
   assert.ok(stats >= 1, 'a session whose held revision moved was not checked');
   assert.deepEqual(
-    work.filter((name) => name === 'humanPromptSettled'),
-    ['humanPromptSettled'],
-    'the unchanged session was checked or the moved one was skipped',
+    work,
+    ['humanPromptSettled', ...Array(stats).fill('humanPromptStat:moved')],
+    'the unchanged session was checked, or the moved one was skipped or counted under another cause',
+  );
+
+  // A session without a prompt whose file grew is checked as moved, scanned to its new end, and stays out.
+  fs.appendFileSync(silent.file, JSON.stringify(peer) + '\n');
+  const grown = row(silent.file, 'silent');
+  stats = 0;
+  work.length = 0;
+  assert.deepEqual(
+    files(await prepare.call(provider, [first, moved, grown], false, signal(), undefined, 0, undefined, 'skip')),
+    [first.file, second.file],
+    'a grown session without a prompt was listed',
+  );
+  assert.ok(stats >= 1, 'a session without a prompt whose file grew was not checked');
+  assert.deepEqual(
+    work,
+    ['humanPromptSettled', 'humanPromptSettled', ...Array(stats).fill('humanPromptStat:moved')],
+    'a settled session was checked, or the grown one was skipped or counted under another cause',
+  );
+  assert.equal(
+    provider.humanScans.get(silent.file)?.bytes,
+    grown.size,
+    'the grown session was not scanned to its new end',
   );
 
   // The refresh passes skip only after a listing that reused the held catalog.
