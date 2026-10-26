@@ -9135,12 +9135,13 @@ export class PanelProvider implements vscode.Disposable {
       }
       const catalogStarted = performance.now();
       const deferredWalk = { needed: false };
+      const requestedWalk = `requested:${refreshReason}`;
       let all = selectedOnly
         ? (this.authoritativeCatalog ?? [])
-        : this.allSessions(reuseCatalog, true, primedEnumeration, deferredWalk, `requested:${refreshReason}`);
+        : this.allSessions(reuseCatalog, true, primedEnumeration, deferredWalk, requestedWalk);
       // A held catalog or a supplied enumeration listed above without an await.
       if (!selectedOnly && deferredWalk.needed) {
-        const walked = await this.walkCatalog(controller.signal, generation);
+        const walked = await this.walkCatalog(controller.signal, generation, requestedWalk);
         if (!walked) return;
         all = walked;
       }
@@ -9222,7 +9223,7 @@ export class PanelProvider implements vscode.Disposable {
           for (const file of changed) this.codexStats.markChanged(path.dirname(file), path.basename(file));
           const deferred = { needed: false };
           let relisted: SessionFile[] | null = this.allSessions(false, true, undefined, deferred, 'replacedFiles');
-          if (deferred.needed) relisted = await this.walkCatalog(controller.signal, generation);
+          if (deferred.needed) relisted = await this.walkCatalog(controller.signal, generation, 'replacedFiles');
           if (!relisted) return;
           all = await this.prepareHumanPrompts(relisted, true, controller.signal, humanPromptWork, generation);
           if (controller.signal.aborted || generation !== this.refreshGeneration) return;
@@ -9451,7 +9452,7 @@ export class PanelProvider implements vscode.Disposable {
             !controller.signal.aborted &&
             generation === this.refreshGeneration
           ) {
-            void this.refresh(enrichment.changed, enrichment.catalogCurrent);
+            this.refreshFrom('enrichment', enrichment.changed, enrichment.catalogCurrent);
           }
         }
         return;
@@ -9775,7 +9776,7 @@ export class PanelProvider implements vscode.Disposable {
           !controller.signal.aborted &&
           generation === this.refreshGeneration
         ) {
-          void this.refresh(enrichment.changed, enrichment.catalogCurrent);
+          this.refreshFrom('enrichment', enrichment.changed, enrichment.catalogCurrent);
         }
       }
     } catch (error) {
@@ -11492,7 +11493,7 @@ export class PanelProvider implements vscode.Disposable {
   // List the catalog from an asynchronous walk of the Codex rollout tree, after held and targeted reuse missed.
   // Selection and other messages run during the walk. The answer is null when the refresh became obsolete
   // during the walk: canceled, superseded, hidden, or moved to another rollout root.
-  private async walkCatalog(signal: AbortSignal, generation: number): Promise<SessionFile[] | null> {
+  private async walkCatalog(signal: AbortSignal, generation: number, walkCause: string): Promise<SessionFile[] | null> {
     const root = codexSessionsRoot();
     const enumeration = await enumerateRolloutFilesAsync(root, signal);
     if (
@@ -11505,19 +11506,27 @@ export class PanelProvider implements vscode.Disposable {
       return null;
     }
     // Scope resolves again after the walk. A scope that became unresolved lists nothing and discards the walk.
-    return this.allSessions(false, true, enumeration);
+    return this.allSessions(false, true, enumeration, undefined, walkCause);
   }
 
   // Enumerate Claude and Codex sessions in repository scope. Accepted metadata supplies the catalog's recorded-activity order.
   // With `deferWalk`, a missed reuse that has no supplied Codex enumeration sets `deferWalk.needed` and lists
   // nothing, so the caller can walk the rollout tree asynchronously.
-  // `walkCause` names a walk that runs because the caller did not ask for reuse.
+  // `walkCause` names a walk that runs because the caller did not ask for reuse. A caller that may walk must name it.
+  private allSessions(reuseCatalog: true): SessionFile[];
   private allSessions(
-    reuseCatalog = false,
+    reuseCatalog: boolean,
+    deferHumanPrompts: boolean,
+    codexEnumeration: SourceEnumeration | undefined,
+    deferWalk: { needed: boolean } | undefined,
+    walkCause: string,
+  ): SessionFile[];
+  private allSessions(
+    reuseCatalog: boolean,
     deferHumanPrompts = false,
     codexEnumeration?: SourceEnumeration,
     deferWalk?: { needed: boolean },
-    walkCause = `requested:${this.refreshReason}`,
+    walkCause = 'unnamed',
   ): SessionFile[] {
     const workspaceFolders = this.folders();
     const scope = this.repositoryScope.snapshot(workspaceFolders);
