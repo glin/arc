@@ -12345,7 +12345,7 @@ export class PanelProvider implements vscode.Disposable {
   // `settled` says what to do with a session whose complete scan found a prompt at the revision the catalog
   // holds now. A catalog refresh skips the sessions whose listed revision did not move, after a walk or with
   // the held catalog. A walked row carries the size, time, device and inode of the stat that listed it.
-  // A selected-only refresh and the relist after a replaced file recheck every file.
+  // A selected-only refresh, the relist after a replaced file, and discovery roots recheck every file.
   private async prepareHumanPrompts(
     sessions: SessionFile[],
     sizeCurrent: boolean,
@@ -12366,8 +12366,8 @@ export class PanelProvider implements vscode.Disposable {
         admitted.push(session);
         continue;
       }
-      // The file check's cause: a recheck checks every candidate, and a reused catalog checks a file whose held revision
-      // moved, whose complete scan found no prompt, or that has no complete scan of the held revision.
+      // The file check's cause: a recheck checks every candidate, and a catalog refresh checks a file whose listed revision
+      // moved, whose complete scan found no prompt, or that has no complete scan of the listed revision.
       let cause: 'walk' | 'moved' | 'noPrompt' | 'unscanned' = 'walk';
       if (settled === 'skip') {
         const scan = this.humanScans.get(session.file);

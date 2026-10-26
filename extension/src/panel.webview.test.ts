@@ -3625,8 +3625,9 @@ test('command-only admission removes pending rows through every catalog path and
   }
 });
 
-// A refresh that reused the held catalog knows nothing new about a file whose complete scan found a prompt at the
-// revision the catalog holds, so admission takes that session without a file check. Each file check names its cause.
+// A catalog refresh knows nothing new about a file whose complete scan found a prompt at the revision the refresh
+// listed, after a walk or with the held catalog, so admission takes that session without a file check. Each file
+// check names its cause.
 
 test('a catalog refresh admits settled sessions without a file check after a walk or reuse and rechecks moved or replaced ones', async () => {
   const { humanPromptScanSteps, promptScanLists, sameSessionRevision, scanForHumanPrompt } =
