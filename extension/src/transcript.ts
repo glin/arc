@@ -1306,6 +1306,7 @@ function projectDirectoryMatches(name: string, slug: string): boolean {
 }
 
 // Recorded working directory from the first 64 KiB of the transcript.
+// Saved child reference rows keep this result, so a change to it needs a `CLAUDE_CHILD_REFERENCE_PARSER_VERSION` bump.
 export function readSessionCwd(file: string): string | null {
   return scanSessionCwd(file);
 }
