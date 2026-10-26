@@ -248,7 +248,6 @@ import {
   enrichDerivedTitleEntry,
   loadDerivedCache,
   limitCodexDispatchCursors,
-  limitSavedDispatchFacts,
   needsAgentRunScan,
   railEnrichmentNeeds,
   METADATA_EXHAUSTED_RULE,
@@ -1023,20 +1022,21 @@ test('derived cache drops saved dispatched facts of another facts version and ke
   assert.equal(loaded.reuse?.rejectedRelationships, 0);
   assert.equal(loaded.claudeChildReferences.get('/dispatched.jsonl')?.dispatch, undefined);
   assert.equal(loaded.claudeChildReferences.get('/dispatched.jsonl')?.sessionId, 'dispatched');
-  // The byte cap keeps the smaller facts and the row of the larger.
-  const rows = [
-    { file: '/large.jsonl', entry: entry('large', 1_000_000) },
-    { file: '/small.jsonl', entry: entry('small', 1) },
-  ];
-  const limit = Buffer.byteLength(JSON.stringify(rows[1].entry.dispatch));
-  const limited = limitSavedDispatchFacts(rows, limit);
-  assert.deepEqual(
-    limited.map((row) => [row.file, row.entry.dispatch?.facts.sessionId]),
+  // The byte cap keeps the smaller saved facts and the row of the larger.
+  const large = { ...entry('large', 1), dispatch: { ...dispatch('large', 1), tree: 'x'.repeat(9 * 1024 * 1024) } };
+  const small = { ...entry('small', 1), dispatch: { ...dispatch('small', 1), tree: 'x'.repeat(9 * 1024 * 1024 - 1) } };
+  saveDerivedCache(
+    file,
+    [],
     [
-      ['/large.jsonl', undefined],
-      ['/small.jsonl', 'small'],
+      ['/large.jsonl', large],
+      ['/small.jsonl', small],
     ],
   );
+  const capped = loadDerivedCache(file).claudeChildReferences;
+  assert.equal(capped.get('/large.jsonl')?.dispatch, undefined);
+  assert.equal(capped.get('/large.jsonl')?.sessionId, 'large');
+  assert.equal(capped.get('/small.jsonl')?.dispatch?.facts.sessionId, 'small');
 });
 
 // References from older parser generations require an unchanged parent to be rescanned.

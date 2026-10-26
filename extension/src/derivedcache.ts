@@ -1028,6 +1028,7 @@ function savedDispatchFacts(value: unknown): value is SavedDispatchFacts {
     nonNegative(facts.toolUses) &&
     typeof facts.person === 'boolean' &&
     Array.isArray(spend.models) &&
+    spend.models.every(record) &&
     typeof spend.found === 'boolean' &&
     typeof spend.partial === 'boolean'
   );
@@ -1041,7 +1042,7 @@ function withCurrentDispatch(value: unknown): unknown {
 }
 
 // Keeps the smallest saved dispatched facts within `byteLimit` and drops the rest from their rows.
-export function limitSavedDispatchFacts(
+function limitSavedDispatchFacts(
   rows: Array<{ file: string; entry: ClaudeChildReferenceCacheEntry }>,
   byteLimit = MAX_SAVED_DISPATCH_FACTS_BYTES,
 ): Array<{ file: string; entry: ClaudeChildReferenceCacheEntry }> {

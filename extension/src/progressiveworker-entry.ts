@@ -153,7 +153,7 @@ interface HeldDispatchFacts {
   saved?: SavedDispatchFacts;
 }
 const dispatchFacts = new Map<string, HeldDispatchFacts>();
-// Row keys whose saved dispatched facts this worker already took, so an entry the worker dropped stays dropped.
+// Row keys this worker already looked up for saved dispatched facts, so an entry the worker dropped stays dropped.
 const seededDispatchFacts = new Set<string>();
 // The settled facts each dispatched file saves with its reference row, by row key, from the last dispatch pass.
 // Null before this worker's first pass, so reply rows keep the facts they arrived with.
@@ -1146,11 +1146,8 @@ async function execute(
           sourceGeneration,
           spendPending,
           revision,
-          // A tree that moved during the read keeps the tree the read started from, so the next pass reads again.
-          tree:
-            reference.agent === 'codex' && collectedTree === tree
-              ? childSpendRevisionKey('completed', codexVersion(), now)
-              : tree,
+          // The tree the read started from. When the tree moved during the read, the next pass reads again.
+          tree,
           codexDependencies,
           facts,
           refreshAt: active ? refreshAt : Number.POSITIVE_INFINITY,
