@@ -12147,8 +12147,8 @@ export class PanelProvider implements vscode.Disposable {
   }
 
   // Walked sources of sessions this panel started and still awaits. Each is the only walked source of its session ID, a member
-  // of the walk without a collision, and inside repository scope. A complete discovery reply lists walked top-level sources as its
-  // roots, so discovery decides only their relationships.
+  // of the walk without a collision, with a supported file identity, and inside repository scope. A later complete discovery
+  // reply either lists such a source among its roots or asks for another pass.
   private startedSources(walked: readonly SessionFile[], accepted: readonly SessionFile[]): SessionFile[] {
     const started: SessionFile[] = [];
     for (const pending of Object.values(this.awaitingSessionRecords)) {
@@ -12156,6 +12156,7 @@ export class PanelProvider implements vscode.Disposable {
       if (
         source &&
         source.childTranscript !== true &&
+        supportedFileIdentity(source) &&
         (!source.cwd || isInside(source.cwd, this.repositoryScopeRoots)) &&
         !this.enumeratedAmbiguousIds?.has(source.sessionId) &&
         this.enumeratedMembers?.has(sessionCoverageMember(source)) &&

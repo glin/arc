@@ -28,7 +28,7 @@ import {
 } from './turnview';
 // @module-tag subprocess
 import { sessionStatsFromFacts } from './turncard';
-import { runningKey } from './composerview';
+import { runningKey, sessionRunning, type LivePress } from './composerview';
 import { compatibleDiscovery, discoveryCompatibility } from './progressiveworker';
 import { claudeDispatchTranscript } from './turnfixtures';
 import { sessionCoverageMember, sessionPresence, reconcileSessionCollisions } from './sessioncoverage';
@@ -41,6 +41,7 @@ import { selectedDependencies } from './selectedsource';
 import {
   projectSlug,
   isInside,
+  supportedFileIdentity,
   replacedCatalogFiles,
   ClaudeChildSessionCache,
   enumerateClaudeChildSources,
@@ -1518,6 +1519,7 @@ function completeDiscoveryHarness(
     sessionPageSources,
     sessionPresence,
     sessionSourceKey,
+    supportedFileIdentity,
     fs,
     fileRevisionOf,
     SpendCoverage,
@@ -3526,8 +3528,7 @@ test('a started Codex session publishes its name and recorded responses while re
         'one',
         'Explain the admission plan',
         'First **answer** with a [link](https://example.com)\n\n- one item',
-      ) +
-      answered(10, 'two', 'Continue', 'Second answer with `inline code`'),
+      ),
   );
   const started = {
     file,
@@ -3537,17 +3538,43 @@ test('a started Codex session publishes its name and recorded responses while re
     ...revisionOf(fs.statSync(file, { bigint: true })),
     activity: 2,
   };
-  const { provider, codex: older, claude, codexWalk } = bumpedCatalogHarness({}, true, ['readFor']);
+  const {
+    provider,
+    codex: older,
+    claude,
+    codexWalk,
+  } = bumpedCatalogHarness({ selectedWindowContainsRecordedTurn, livePressOver, sessionRunning }, true, [
+    'readFor',
+    'dropSpentPresses',
+  ]);
   const accepted = [claude, older];
   (codexWalk as SessionFile[]).push(started);
   const worker = titleWorker();
   let discoveryReplies = 0;
+  // The temporary cards of two consecutive prompts, each submitted before its recorded turn started.
+  const press = (second: number, text: string, turnId: number): LivePress => ({
+    sessionId: id,
+    agent: 'codex',
+    kind: 'prompt',
+    text,
+    at: Date.parse(`2026-10-26T00:00:0${second}.500Z`),
+    reply: `${text} streamed as text`,
+    completed: true,
+    turnId,
+    midTurn: false,
+    ran: true,
+    started: true,
+    failed: false,
+    reason: '',
+  });
   Object.assign(provider, {
     authoritativeCatalog: accepted,
     authoritativeCatalogScope: JSON.stringify(provider.repositoryScopeRoots),
     catalog: { sessions: accepted },
     dispatchDiscoveryPending: true,
     awaitingSessionRecords: { [id]: { sessionId: id, agent: 'codex', cwd: directory, createdAt: 1 } },
+    live: { [id]: [press(0, 'Explain the admission plan', 1), press(9, 'Continue', 2)] },
+    running: new Set(),
     checkpointDerivedCache() {},
   });
   provider.showing = id;
@@ -3560,13 +3587,17 @@ test('a started Codex session publishes its name and recorded responses while re
     tailBytes: 64 * 1024,
   });
   provider.progressiveCurrent = (source: SessionFile) => provider.cache.get(source.file)?.revision.size === source.size;
-  provider.collect = (sources: SessionFile[]) =>
-    sources.flatMap((source) =>
-      provider.readFor(source, 40, 1024).read.turns.map((value: any) => {
-        const card = toCard(value, true, Date.now(), provider.folders());
-        return { ...card, summaryHtml: renderRichMarkdown(card.summary) };
-      }),
-    );
+  provider.sessionCacheBudgetBytes = () => 64 * 1024 * 1024;
+  // Cards come from the accepted selected read through the production renderer, and the newest recorded turn per session is
+  // derived the way the panel's own collection derives it, so the real sweep decides which temporary card retires.
+  provider.collect = (sources: SessionFile[]) => {
+    const turns = sources.flatMap((source) => provider.readFor(source, 40, 1024).read.turns);
+    provider.newestBySession = currentRecordsBySession(turns, []).newestTurns;
+    return turns.map((value: any) => {
+      const card = toCard(value, true, Date.now(), provider.folders());
+      return { ...card, summaryHtml: renderRichMarkdown(card.summary) };
+    });
+  };
   provider.progressiveWorker = {
     run: (request: ProgressiveRequest, generation: number, signal: AbortSignal) => {
       if (request.kind !== 'claude-children') return worker.run(request, generation, signal);
@@ -3593,31 +3624,43 @@ test('a started Codex session publishes its name and recorded responses while re
     },
     stop: () => worker.stop(),
   };
-  const drawn = () =>
+  const drawn = (count: number) =>
     provider.messages.findLast(
-      (message: any) => message.type === 'render' && message.showing === id && message.cards?.length,
+      (message: any) => message.type === 'render' && message.showing === id && message.cards?.length === count,
     );
+  const first =
+    '<p>First <strong>answer</strong> with a <a href="#" data-link="https://example.com">link</a></p>\n<ul>\n<li>one item</li>\n</ul>\n';
   try {
     await provider.refresh();
     assert.ok(discoveryReplies > 0, 'the refresh never reached relationship discovery');
     await vi.waitFor(
-      () => assert.ok(drawn(), 'the started session kept its temporary state, so no recorded response was drawn'),
+      () => assert.ok(drawn(1), 'the started session kept its temporary state, so no recorded response was drawn'),
       { timeout: 5000 },
     );
-    const render = drawn();
-    assert.equal(render.sessions.find((row: any) => row.id === id)?.label, 'Admission plan');
+    assert.equal(drawn(1).sessions.find((row: any) => row.id === id)?.label, 'Admission plan');
     assert.deepEqual(
-      render.cards.map((card: any) => card.summaryHtml),
-      [
-        '<p>First <strong>answer</strong> with a <a href="#" data-link="https://example.com">link</a></p>\n<ul>\n<li>one item</li>\n</ul>\n',
-        '<p>Second answer with <code>inline code</code></p>\n',
-      ],
+      drawn(1).cards.map((card: any) => card.summaryHtml),
+      [first],
     );
     assert.equal(
       provider.awaitingSessionRecords[id],
       undefined,
       'the recorded session never replaced the temporary one',
     );
+    assert.deepEqual(
+      provider.live[id]?.map((held: LivePress) => held.text),
+      ['Continue'],
+      'the first recorded answer did not retire only its own temporary card',
+    );
+    fs.appendFileSync(file, answered(10, 'two', 'Continue', 'Second answer with `inline code`'));
+    Object.assign(started, revisionOf(fs.statSync(file, { bigint: true })));
+    await provider.refresh();
+    await vi.waitFor(() => assert.ok(drawn(2), 'the second recorded answer was never drawn'), { timeout: 5000 });
+    assert.deepEqual(
+      drawn(2).cards.map((card: any) => card.summaryHtml),
+      [first, '<p>Second answer with <code>inline code</code></p>\n'],
+    );
+    assert.equal(provider.live[id], undefined, 'the second recorded answer left its temporary card');
     assert.equal(provider.dispatchDiscoveryPending, true, 'relationship discovery completed');
     assert.equal(provider.sessionQueryDiscoveryPending, true, 'search coverage claimed complete discovery');
   } finally {
@@ -3636,18 +3679,24 @@ test.each([
   'already accepted',
   'outside repository scope',
   'child transcript',
-  'missing from the walk',
+  'not an enumerated member',
+  'missing file identity',
+  'inode zero',
+  'without a recorded cwd',
+  'qualified Claude',
 ] as const)('a pending discovery reply admits only a qualified started source: %s', async (change) => {
   const { provider, claude, codex } = bumpedCatalogHarness({ scopeInside: isInside });
   const root = path.resolve('project');
   const started: SessionFile = {
     file: 'fixture/started.jsonl',
     sessionId: 'started-session',
-    agent: 'codex',
-    cwd: path.join(root, change === 'outside repository scope' ? '../elsewhere' : 'Nested'),
+    agent: change === 'qualified Claude' ? 'claude' : 'codex',
+    ...(change === 'without a recorded cwd'
+      ? {}
+      : { cwd: path.join(root, change === 'outside repository scope' ? '../elsewhere' : 'Nested') }),
     size: 10,
     mtimeMs: 10,
-    ino: 3,
+    ...(change === 'missing file identity' ? {} : { dev: 7, ino: change === 'inode zero' ? 0 : 3 }),
     ...(change === 'child transcript' ? { childTranscript: true } : {}),
   };
   const accepted: SessionFile[] =
@@ -3669,13 +3718,13 @@ test.each([
         : {
             [started.sessionId]: {
               sessionId: started.sessionId,
-              agent: change === 'other provider' ? 'claude' : 'codex',
+              agent: change === 'other provider' ? 'claude' : started.agent,
               cwd: root,
               createdAt: 1,
             },
           },
     enumeratedMembers: new Set(
-      walked.filter((source) => change !== 'missing from the walk' || source !== started).map(sessionCoverageMember),
+      walked.filter((source) => change !== 'not an enumerated member' || source !== started).map(sessionCoverageMember),
     ),
     enumeratedAmbiguousIds: new Set(change === 'colliding session ID' ? [started.sessionId] : []),
     checkpointDerivedCache() {},
@@ -3697,7 +3746,8 @@ test.each([
     });
   assert.equal(await provider.prepareClaudeChildren(4, new AbortController().signal), true);
   assert.equal(provider.dispatchDiscoveryPending, true);
-  if (change === 'qualified') assert.deepEqual(provider.catalog.sessions, [...accepted, started]);
+  if (change === 'qualified' || change === 'without a recorded cwd' || change === 'qualified Claude')
+    assert.deepEqual(provider.catalog.sessions, [...accepted, started]);
   else assert.equal(provider.catalog.sessions, accepted, 'a refused source joined the accepted rows');
 });
 
