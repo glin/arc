@@ -12073,7 +12073,14 @@ export class PanelProvider implements vscode.Disposable {
       // Published rows stay the accepted ones while discovery continues. Before a first accepted catalog, the
       // walked rows stay held, so the refresh that sends the next continuation reuses them instead of walking again.
       if (this.catalog) {
-        this.catalog = { ...this.catalog, sessions: this.authoritativeCatalog ?? this.catalog.sessions };
+        const accepted = this.authoritativeCatalog;
+        // A session this panel started joins the accepted rows once its own source qualifies, so its name and recorded
+        // responses replace the temporary ones without waiting for unrelated discovery.
+        const started = accepted ? this.startedSources(this.catalog.sessions, accepted) : [];
+        this.catalog = {
+          ...this.catalog,
+          sessions: started.length ? [...accepted!, ...started] : (accepted ?? this.catalog.sessions),
+        };
       }
       if (this.dispatchedDiscoveryWaiting() !== discoveryWaiting) this.postDispatchedCostsIfMoved();
       return this.authoritativeCatalog !== null;
@@ -12137,6 +12144,27 @@ export class PanelProvider implements vscode.Disposable {
       this.derivedCacheCheckpointState.markChanged();
     }
     return true;
+  }
+
+  // Walked sources of sessions this panel started and still awaits. Each is the only walked source of its session ID, a member
+  // of the walk without a collision, and inside repository scope. A complete discovery reply lists walked top-level sources as its
+  // roots, so discovery decides only their relationships.
+  private startedSources(walked: readonly SessionFile[], accepted: readonly SessionFile[]): SessionFile[] {
+    const started: SessionFile[] = [];
+    for (const pending of Object.values(this.awaitingSessionRecords)) {
+      const source = walked.find((one) => one.sessionId === pending.sessionId);
+      if (
+        source &&
+        source.childTranscript !== true &&
+        (!source.cwd || isInside(source.cwd, this.repositoryScopeRoots)) &&
+        !this.enumeratedAmbiguousIds?.has(source.sessionId) &&
+        this.enumeratedMembers?.has(sessionCoverageMember(source)) &&
+        pendingResponseSessionAdmitted(pending, walked) &&
+        !accepted.some((one) => one.sessionId === source.sessionId)
+      )
+        started.push(source);
+    }
+    return started;
   }
 
   private acceptSessionCoverage(current: SessionFile[], scope: string): SessionFile[] {

@@ -12056,6 +12056,7 @@ test("the host counts a dispatched session in its parent's cost once and files i
       dispatchDiscoveryPending: true,
       authoritativeCatalog: [session('parent')],
       catalog: { sessions: [session('parent')] },
+      awaitingSessionRecords: {},
       refreshGeneration: 1,
       repositoryScopeRoots: [],
       claudeParents: [session('parent')],

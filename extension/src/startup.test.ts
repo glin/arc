@@ -270,6 +270,7 @@ import {
 } from '../scripts/panel-startup-measure/selection';
 import type { ClaudeUsageReducerState } from './transcript';
 import { costStateDependency, costStateIdentity, reconcileClaudeCostState } from './claudecoststate';
+import { renderRichMarkdown } from './richtext';
 import { measurementBuildPath, removeMeasurementTree } from '../scripts/panel-startup-measure/cleanup';
 import {
   frozenPath,
@@ -1582,6 +1583,7 @@ function completeDiscoveryHarness(
     );
   }
   if (names.includes('allSessions')) names.push('walkedSessions');
+  if (names.includes('prepareClaudeChildren')) names.push('startedSources');
   names.push('walkCatalog');
   const body = owner.members
     .filter((member) => member.name && names.includes(member.name.getText(file)))
@@ -3502,6 +3504,201 @@ test('pending Claude discovery before an accepted catalog keeps the walked rows 
     provider.catalog.sessions.some((session: SessionFile) => session.sessionId === codex.sessionId),
     'the selected row left the held catalog, so the next reuse must walk',
   );
+});
+
+// A Codex session this panel started takes its name and recorded responses while unrelated discovery stays pending.
+test('a started Codex session publishes its name and recorded responses while relationship discovery stays pending', async () => {
+  const directory = tempDir('pending-discovery-admission-');
+  const id = '01a176ec-7cfb-7d62-9b62-ad564e398274';
+  const record = (second: number, type: string, payload: object) =>
+    JSON.stringify({ type, timestamp: `2026-10-26T00:00:${String(second).padStart(2, '0')}Z`, payload }) + '\n';
+  const answered = (second: number, turnId: string, prompt: string, answer: string) =>
+    record(second, 'event_msg', { type: 'task_started', turn_id: turnId }) +
+    record(second + 1, 'event_msg', { type: 'user_message', message: prompt }) +
+    record(second + 2, 'event_msg', { type: 'agent_message', message: answer }) +
+    record(second + 3, 'event_msg', { type: 'task_complete', turn_id: turnId, last_agent_message: answer });
+  const file = path.join(directory, `rollout-2026-10-26T00-00-00-${id}.jsonl`);
+  fs.writeFileSync(
+    file,
+    record(0, 'session_meta', { id, cwd: directory, source: 'vscode' }) +
+      answered(
+        1,
+        'one',
+        'Explain the admission plan',
+        'First **answer** with a [link](https://example.com)\n\n- one item',
+      ) +
+      answered(10, 'two', 'Continue', 'Second answer with `inline code`'),
+  );
+  const started = {
+    file,
+    sessionId: id,
+    agent: 'codex' as const,
+    cwd: directory,
+    ...revisionOf(fs.statSync(file, { bigint: true })),
+    activity: 2,
+  };
+  const { provider, codex: older, claude, codexWalk } = bumpedCatalogHarness({}, true, ['readFor']);
+  const accepted = [claude, older];
+  (codexWalk as SessionFile[]).push(started);
+  const worker = titleWorker();
+  let discoveryReplies = 0;
+  Object.assign(provider, {
+    authoritativeCatalog: accepted,
+    authoritativeCatalogScope: JSON.stringify(provider.repositoryScopeRoots),
+    catalog: { sessions: accepted },
+    dispatchDiscoveryPending: true,
+    awaitingSessionRecords: { [id]: { sessionId: id, agent: 'codex', cwd: directory, createdAt: 1 } },
+    checkpointDerivedCache() {},
+  });
+  provider.showing = id;
+  provider.threadNames = { names: new Map([[id, 'Admission plan']]), fullNames: new Map(), stamp: 'named' };
+  provider.progressiveInput = (session: SessionFile) => ({
+    session,
+    folders: [],
+    children: [],
+    maxTurns: 40,
+    tailBytes: 64 * 1024,
+  });
+  provider.progressiveCurrent = (source: SessionFile) => provider.cache.get(source.file)?.revision.size === source.size;
+  provider.collect = (sources: SessionFile[]) =>
+    sources.flatMap((source) =>
+      provider.readFor(source, 40, 1024).read.turns.map((value: any) => {
+        const card = toCard(value, true, Date.now(), provider.folders());
+        return { ...card, summaryHtml: renderRichMarkdown(card.summary) };
+      }),
+    );
+  provider.progressiveWorker = {
+    run: (request: ProgressiveRequest, generation: number, signal: AbortSignal) => {
+      if (request.kind !== 'claude-children') return worker.run(request, generation, signal);
+      discoveryReplies++;
+      // Relationship discovery for unrelated sessions never completes.
+      return Promise.resolve({
+        generation,
+        value: {
+          kind: 'claude-children-progress',
+          checkpoint: {
+            compatibility: discoveryCompatibility(CLAUDE_CHILD_REFERENCE_PARSER_VERSION),
+            parserVersion: CLAUDE_CHILD_REFERENCE_PARSER_VERSION,
+            parents: request.parents,
+            catalog: request.parents,
+            repositoryRoots: request.repositoryRoots,
+            completed: [],
+            position: 0,
+            sequence: discoveryReplies,
+          },
+          referenceEntries: [],
+          continuation: true,
+        },
+      });
+    },
+    stop: () => worker.stop(),
+  };
+  const drawn = () =>
+    provider.messages.findLast(
+      (message: any) => message.type === 'render' && message.showing === id && message.cards?.length,
+    );
+  try {
+    await provider.refresh();
+    assert.ok(discoveryReplies > 0, 'the refresh never reached relationship discovery');
+    await vi.waitFor(
+      () => assert.ok(drawn(), 'the started session kept its temporary state, so no recorded response was drawn'),
+      { timeout: 5000 },
+    );
+    const render = drawn();
+    assert.equal(render.sessions.find((row: any) => row.id === id)?.label, 'Admission plan');
+    assert.deepEqual(
+      render.cards.map((card: any) => card.summaryHtml),
+      [
+        '<p>First <strong>answer</strong> with a <a href="#" data-link="https://example.com">link</a></p>\n<ul>\n<li>one item</li>\n</ul>\n',
+        '<p>Second answer with <code>inline code</code></p>\n',
+      ],
+    );
+    assert.equal(
+      provider.awaitingSessionRecords[id],
+      undefined,
+      'the recorded session never replaced the temporary one',
+    );
+    assert.equal(provider.dispatchDiscoveryPending, true, 'relationship discovery completed');
+    assert.equal(provider.sessionQueryDiscoveryPending, true, 'search coverage claimed complete discovery');
+  } finally {
+    worker.stop();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+// Only a walked source that alone answers a session this panel started joins the accepted rows before discovery completes.
+test.each([
+  'qualified',
+  'not started here',
+  'colliding session ID',
+  'second walked source',
+  'other provider',
+  'already accepted',
+  'outside repository scope',
+  'child transcript',
+  'missing from the walk',
+] as const)('a pending discovery reply admits only a qualified started source: %s', async (change) => {
+  const { provider, claude, codex } = bumpedCatalogHarness({ scopeInside: isInside });
+  const root = path.resolve('project');
+  const started: SessionFile = {
+    file: 'fixture/started.jsonl',
+    sessionId: 'started-session',
+    agent: 'codex',
+    cwd: path.join(root, change === 'outside repository scope' ? '../elsewhere' : 'Nested'),
+    size: 10,
+    mtimeMs: 10,
+    ino: 3,
+    ...(change === 'child transcript' ? { childTranscript: true } : {}),
+  };
+  const accepted: SessionFile[] =
+    change === 'already accepted' ? [claude, codex, { ...started, file: 'fixture/older.jsonl' }] : [claude, codex];
+  const walked: SessionFile[] = [
+    claude,
+    codex,
+    started,
+    ...(change === 'second walked source' ? [{ ...started, file: 'fixture/copy.jsonl', ino: 4 }] : []),
+  ];
+  Object.assign(provider, {
+    repositoryScopeRoots: [root],
+    authoritativeCatalog: accepted,
+    catalog: { sessions: walked },
+    refreshGeneration: 4,
+    awaitingSessionRecords:
+      change === 'not started here'
+        ? {}
+        : {
+            [started.sessionId]: {
+              sessionId: started.sessionId,
+              agent: change === 'other provider' ? 'claude' : 'codex',
+              cwd: root,
+              createdAt: 1,
+            },
+          },
+    enumeratedMembers: new Set(
+      walked.filter((source) => change !== 'missing from the walk' || source !== started).map(sessionCoverageMember),
+    ),
+    enumeratedAmbiguousIds: new Set(change === 'colliding session ID' ? [started.sessionId] : []),
+    checkpointDerivedCache() {},
+  });
+  const checkpoint = {
+    compatibility: discoveryCompatibility(CLAUDE_CHILD_REFERENCE_PARSER_VERSION),
+    parserVersion: CLAUDE_CHILD_REFERENCE_PARSER_VERSION,
+    parents: walked,
+    catalog: walked,
+    repositoryRoots: [root],
+    completed: [],
+    position: 1,
+    sequence: 2,
+  };
+  provider.progressiveWorker.run = () =>
+    Promise.resolve({
+      generation: 4,
+      value: { kind: 'claude-children-progress', checkpoint, referenceEntries: [], continuation: true },
+    });
+  assert.equal(await provider.prepareClaudeChildren(4, new AbortController().signal), true);
+  assert.equal(provider.dispatchDiscoveryPending, true);
+  if (change === 'qualified') assert.deepEqual(provider.catalog.sessions, [...accepted, started]);
+  else assert.equal(provider.catalog.sessions, accepted, 'a refused source joined the accepted rows');
 });
 
 test.each(['win32', 'darwin', 'linux'])('startup progress counts completed Windows sources on %s', async (platform) => {
@@ -5868,14 +6065,27 @@ test('a bounded pass after a derived cache version bump keeps the stored names o
 
 // Restores a derived-cache fixture through catalog discovery and naming methods.
 // The metadata harness reads no source bytes. codexWalk controls the returned Codex listing.
-function bumpedCatalogHarness(scope: Record<string, unknown> = {}) {
+function bumpedCatalogHarness(
+  scope: Record<string, unknown> = {},
+  realSelectedWindow = false,
+  extraMethods: string[] = [],
+) {
   const { cacheFile, codex, claude, child } = bumpedDerivedCache();
   const codexWalk = [codex];
   const claudeWalk = [claude];
   const provider = completeDiscoveryHarness(
     undefined,
-    false,
-    ['allSessions', 'prepareClaudeChildren', 'pruneDerivedTitles', 'sessionLabel', 'claudeName', 'titleFor', 'metaFor'],
+    realSelectedWindow,
+    [
+      'allSessions',
+      'prepareClaudeChildren',
+      'pruneDerivedTitles',
+      'sessionLabel',
+      'claudeName',
+      'titleFor',
+      'metaFor',
+      ...extraMethods,
+    ],
     {
       projectsRoot: () => 'projects',
       productionNormalizeFsPath: normalizeFsPath,
@@ -10611,7 +10821,9 @@ test.each([false, true])(
       assert.equal(provider.messages.length, renders, 'terminal status retransmitted the unchanged catalog');
       assert.equal(provider.posts.at(-1).complete, true, 'a complete reply never published completion');
       provider.titles.set(session.file, entry);
-      provider.prepareClaudeChildren = bumpedCatalogHarness().provider.prepareClaudeChildren;
+      const discoveryHost = bumpedCatalogHarness().provider;
+      provider.prepareClaudeChildren = discoveryHost.prepareClaudeChildren;
+      provider.startedSources = discoveryHost.startedSources;
       Object.assign(provider, {
         claudeParents: [session],
         claudeChildren: [],
@@ -10726,7 +10938,9 @@ function exhaustedLoadingHarness(extraMethods: string[] = [], scope: Record<stri
   provider.titles.set(first.file, exhausted(first));
   provider.titles.set(second.file, exhausted(second));
   provider.metaFor = (session: { file: string }) => provider.titles.get(session.file);
-  provider.prepareClaudeChildren = bumpedCatalogHarness().provider.prepareClaudeChildren;
+  const discoveryHost = bumpedCatalogHarness().provider;
+  provider.prepareClaudeChildren = discoveryHost.prepareClaudeChildren;
+  provider.startedSources = discoveryHost.startedSources;
   Object.assign(provider, {
     claudeParents: [healthy],
     claudeChildren: [],

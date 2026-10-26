@@ -90,6 +90,7 @@ test.each(['claude', 'codex'] as const)(
             claudeChildReferenceEntries: new Map(),
             claudeChildStatWrites: new Map(),
             claudeChildren: [],
+            awaitingSessionRecords: {},
             codexSubagents: [],
             dispatchFacts: new Map(),
             catalog: { sessions: fx.catalog },
