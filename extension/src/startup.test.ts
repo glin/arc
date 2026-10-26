@@ -259,6 +259,8 @@ import {
   IntegrityScheduler,
   CATALOG_REFRESH_DEADLINE_MS,
   mergeRefreshRequests,
+  PendingWatcherWake,
+  watcherRefreshDecision,
 } from './scheduler';
 import { compaction, turn, subagent, claudeCostState } from './turnfixtures';
 import {
@@ -6329,7 +6331,7 @@ test('a cold handoff accepts the catalog without enumerating the rollout directo
 });
 
 // A real Codex listing over a temporary rollout root, with every asynchronous walk held until the test releases it.
-function heldWalkHarness(scope: Record<string, unknown> = {}) {
+function heldWalkHarness(scope: Record<string, unknown> = {}, extraMethods: string[] = []) {
   const root = tempDir('enumeration-async-');
   const workspace = path.join(root, 'project');
   fs.mkdirSync(workspace);
@@ -6347,25 +6349,29 @@ function heldWalkHarness(scope: Record<string, unknown> = {}) {
   };
   const walks: { root: string; release: () => void }[] = [];
   let currentRoot = root;
-  const { provider, claudeWalk } = bumpedCatalogHarness({
-    codexSessionsRoot: () => currentRoot,
-    codexSessionFiles,
-    readRolloutStat,
-    fs,
-    fileRevisionOf,
-    revalidatedCatalogPaths,
-    path,
-    enumerateRolloutFilesAsync: (walkRoot: string, signal?: AbortSignal) =>
-      new Promise((resolve) => {
-        // An asynchronous reader, so a synchronous read of the tree can only come from the synchronous driver.
-        const reader = (dir: string) => mutableFs.promises.readdir(dir, { withFileTypes: true });
-        walks.push({
-          root: walkRoot,
-          release: () => void enumerateRolloutFilesAsync(walkRoot, signal, reader).then(resolve),
-        });
-      }),
-    ...scope,
-  });
+  const { provider, claudeWalk } = bumpedCatalogHarness(
+    {
+      codexSessionsRoot: () => currentRoot,
+      codexSessionFiles,
+      readRolloutStat,
+      fs,
+      fileRevisionOf,
+      revalidatedCatalogPaths,
+      path,
+      enumerateRolloutFilesAsync: (walkRoot: string, signal?: AbortSignal) =>
+        new Promise((resolve) => {
+          // An asynchronous reader, so a synchronous read of the tree can only come from the synchronous driver.
+          const reader = (dir: string) => mutableFs.promises.readdir(dir, { withFileTypes: true });
+          walks.push({
+            root: walkRoot,
+            release: () => void enumerateRolloutFilesAsync(walkRoot, signal, reader).then(resolve),
+          });
+        }),
+      ...scope,
+    },
+    false,
+    extraMethods,
+  );
   claudeWalk.splice(0);
   provider.claudeChildren = [];
   provider.codexMetas = new CodexMetaCache();
@@ -6594,6 +6600,51 @@ test('targeted reuse avoids the broad walk, and a failed reuse performs exactly 
   await releaseAll(provider.refresh(true));
   assert.equal(walks.length, 2, 'a failed targeted refresh did not walk exactly once');
   assert.deepEqual(files(), [added, held].sort());
+});
+
+test('each catalog walk names its requester, and the re-list after a replaced file names itself', async () => {
+  let replaced: string[] = [];
+  const { provider, walks, writeRollout, releaseAll } = heldWalkHarness(
+    { replacedCatalogFiles: async () => replaced, watcherRefreshDecision },
+    ['runPendingWatch'],
+  );
+  const counters = new PanelPerformanceCounters();
+  provider.performanceCounters = counters;
+  provider.pendingWatch = new PendingWatcherWake();
+  const file = writeRollout('held');
+  // The production call sites start the refresh without returning it, so hold the promise they start.
+  const requested = (start: () => void) => {
+    const refresh = provider.refresh;
+    let started: Promise<void> | undefined;
+    provider.refresh = (...args: unknown[]) => (started = refresh.apply(provider, args));
+    try {
+      start();
+    } finally {
+      provider.refresh = refresh;
+    }
+    assert.ok(started, 'the requester started no refresh');
+    return releaseAll(started);
+  };
+  const walkCounts = () =>
+    Object.fromEntries(Object.entries(counters.snapshot().work).filter(([name]) => name.startsWith('walk:')));
+  await requested(() => provider.refreshFrom('startup', true));
+  await requested(() => provider.refreshFrom('poll'));
+  // A known path that changed identity fails targeted revalidation and walks.
+  const copy = `${file}.copy`;
+  fs.copyFileSync(file, copy);
+  fs.renameSync(copy, file);
+  provider.pendingWatch.noteFileEvent(path.dirname(file), path.basename(file), 'change', normalizeFsPath);
+  await requested(() => provider.runPendingWatch({ cause: 'quiet', firstAt: 0, lastAt: 0, firedAt: 0 }));
+  assert.equal(counters.snapshot().watcherDecisions.targeted, 1, 'the watcher batch was not targeted');
+  replaced = [file];
+  await releaseAll(provider.refresh(true, true));
+  assert.equal(walks.length, 4);
+  assert.deepEqual(walkCounts(), {
+    'walk:replacedFiles': 1,
+    'walk:requested:poll': 1,
+    'walk:requested:startup': 1,
+    'walk:requested:transcript': 1,
+  });
 });
 
 test('an unresolved repository scope starts no walk, and the resolved refresh walks once', async () => {

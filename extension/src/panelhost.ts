@@ -1360,11 +1360,13 @@ export class PanelProvider implements vscode.Disposable {
   private canOpenCommit: boolean | null = null;
   private cache = new Map<string, CacheEntry>();
   // Background commit reads refresh affected turns without delaying the initial render.
-  private repositoryCommits = new RepositoryCommits(nodeGitRunner(), () => void this.refresh(true));
+  private repositoryCommits = new RepositoryCommits(nodeGitRunner(), () =>
+    this.refreshFrom('repository-commits', true),
+  );
   private commitRepositories = new CommitRepositories(nodeGitRunner(), () => {
     this.derivedCacheCheckpointState.markChanged();
     this.checkpointDerivedCache();
-    void this.refresh(true);
+    this.refreshFrom('commit-repositories', true);
   });
   private readonly repositoryScope: RepositoryScope;
   private repositoryScopeReady = false;
@@ -2658,7 +2660,7 @@ export class PanelProvider implements vscode.Disposable {
     }
     void this.post({ type: 'labelsChanged', session });
     this.postRail(true);
-    void this.refresh(true);
+    this.refreshFrom('session-request', true);
     return {
       version: 1,
       status: errors.length ? 'accepted-with-errors' : 'accepted',
@@ -5499,7 +5501,7 @@ export class PanelProvider implements vscode.Disposable {
     void this.post({ type: 'usage', usage: this.usagePayload() });
     // Refresh cards and the session list only when running membership changes.
     if (moved) {
-      void this.refresh(true);
+      this.refreshFrom('running', true);
     }
   }
 
@@ -5554,7 +5556,7 @@ export class PanelProvider implements vscode.Disposable {
       }
     }
     if (moved || observedExit) {
-      void this.refresh(true);
+      this.refreshFrom('exited', true);
     }
   }
 
@@ -5656,7 +5658,7 @@ export class PanelProvider implements vscode.Disposable {
     } else {
       delete this.live[session];
     }
-    void this.refresh(true);
+    this.refreshFrom('local-answer', true);
   }
 
   // Transfer unfinished state to the session created by `/clear`. Completed responses remain with the source, while the successor receives an awaiting-record row.
@@ -5703,7 +5705,7 @@ export class PanelProvider implements vscode.Disposable {
         this.finishClearSettlement(clearing);
       }
       if (clearing) {
-        void this.refresh(true);
+        this.refreshFrom('session-moved', true);
       }
       return;
     }
@@ -5786,7 +5788,7 @@ export class PanelProvider implements vscode.Disposable {
       this.finishClearSettlement(clearing);
     }
     // Refresh the filesystem catalog so the new successor can be discovered.
-    void this.refresh(true);
+    this.refreshFrom('session-moved', true);
   }
 
   // Create live activity before delivery. Its timestamp identifies the submission when asynchronous answers arrive.
@@ -6155,7 +6157,7 @@ export class PanelProvider implements vscode.Disposable {
         if (attachedHost) {
           this.hostSessions.set(attachedHost, destination);
         }
-        void this.refresh(true);
+        this.refreshFrom('press-answered', true);
       }
       return;
     }
@@ -6173,7 +6175,7 @@ export class PanelProvider implements vscode.Disposable {
       if (attachedHost) {
         this.hostSessions.set(attachedHost, destination);
       }
-      void this.refresh(true);
+      this.refreshFrom('press-answered', true);
       return;
     }
     this.live[session] = pressesAfterHandoff(held, at, delivery);
@@ -7791,7 +7793,7 @@ export class PanelProvider implements vscode.Disposable {
           );
         }
         if (adopted) {
-          void this.refresh(true);
+          this.refreshFrom('open-asks', true);
         }
       })
       .finally(() => {
@@ -9135,7 +9137,7 @@ export class PanelProvider implements vscode.Disposable {
       const deferredWalk = { needed: false };
       let all = selectedOnly
         ? (this.authoritativeCatalog ?? [])
-        : this.allSessions(reuseCatalog, true, primedEnumeration, deferredWalk);
+        : this.allSessions(reuseCatalog, true, primedEnumeration, deferredWalk, `requested:${refreshReason}`);
       // A held catalog or a supplied enumeration listed above without an await.
       if (!selectedOnly && deferredWalk.needed) {
         const walked = await this.walkCatalog(controller.signal, generation);
@@ -9219,7 +9221,7 @@ export class PanelProvider implements vscode.Disposable {
         if (changed.length) {
           for (const file of changed) this.codexStats.markChanged(path.dirname(file), path.basename(file));
           const deferred = { needed: false };
-          let relisted: SessionFile[] | null = this.allSessions(false, true, undefined, deferred);
+          let relisted: SessionFile[] | null = this.allSessions(false, true, undefined, deferred, 'replacedFiles');
           if (deferred.needed) relisted = await this.walkCatalog(controller.signal, generation);
           if (!relisted) return;
           all = await this.prepareHumanPrompts(relisted, true, controller.signal, humanPromptWork, generation);
@@ -11509,11 +11511,13 @@ export class PanelProvider implements vscode.Disposable {
   // Enumerate Claude and Codex sessions in repository scope. Accepted metadata supplies the catalog's recorded-activity order.
   // With `deferWalk`, a missed reuse that has no supplied Codex enumeration sets `deferWalk.needed` and lists
   // nothing, so the caller can walk the rollout tree asynchronously.
+  // `walkCause` names a walk that runs because the caller did not ask for reuse.
   private allSessions(
     reuseCatalog = false,
     deferHumanPrompts = false,
     codexEnumeration?: SourceEnumeration,
     deferWalk?: { needed: boolean },
+    walkCause = `requested:${this.refreshReason}`,
   ): SessionFile[] {
     const workspaceFolders = this.folders();
     const scope = this.repositoryScope.snapshot(workspaceFolders);
@@ -11578,7 +11582,7 @@ export class PanelProvider implements vscode.Disposable {
       this.performanceCounters?.recordWork(
         `walk:${
           !reuseCatalog
-            ? 'requested'
+            ? walkCause
             : !this.catalog
               ? 'noCatalog'
               : this.catalog.folders !== folderPrint
@@ -14884,7 +14888,7 @@ export class PanelProvider implements vscode.Disposable {
 
   // Populate the bounded search corpus only for an explicit content search, outside polling and rendering.
   private searchCorpus(only: string | null = null): SearchEntry[] {
-    const all = this.allSessions();
+    const all = this.allSessions(false, false, undefined, undefined, 'requested:search');
     // Refresh Codex names before filing search results.
     this.threadNames = readThreadNames(codexSessionIndexPath(), this.threadNames);
     const live = new Set(all.map((f) => f.file));
