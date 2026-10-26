@@ -5747,7 +5747,7 @@ test('Claude child discovery runs in the worker and reuses unchanged transcript 
         0,
         'a fresh worker fully scanned unchanged parent transcripts despite persisted references',
       );
-      assert.ok(observed.observedChildReads > 0, 'the restart fixture did not exercise required child head validation');
+      assert.equal(observed.observedChildReads, 0, 'a fresh worker reread unchanged child heads despite saved heads');
     } finally {
       restarted.stop();
     }
