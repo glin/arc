@@ -37509,6 +37509,7 @@ test('one spend update checks each child file once and publishes dispatched cost
   };
   const unchanged = await check(gone);
   assert.equal(host.projectSpendQueue.length, 0, 'the unchanged source was queued');
+  assert.equal(unchanged.dispatchedCostsPost, undefined, 'an integrity check that queued nothing published');
   assert.equal(
     unchanged['dispatchedCostsPost:integrityCheck'],
     undefined,

@@ -746,7 +746,8 @@ type DispatchedCostsCaller =
   | 'indexFinished'
   | 'spendSources'
   | 'childrenProgress'
-  | 'childrenComplete';
+  | 'childrenComplete'
+  | 'historyCutoff';
 
 // Escape less-than signs in JSON embedded in a script element. An unescaped
 // closing script tag ends the element even when it occurs inside a JSON string.
@@ -10983,6 +10984,8 @@ export class PanelProvider implements vscode.Disposable {
         }
         this.invalidateProjectSpendSnapshot();
         this.postProjectSpend();
+        // The moved cutoff can settle or hold a dispatched source without queueing it.
+        this.postDispatchedCostsIfMoved('historyCutoff');
         this.scheduleProjectSpendMidnight();
       },
       Math.max(1, next.getTime() - Date.now()),
@@ -11289,6 +11292,7 @@ export class PanelProvider implements vscode.Disposable {
     if (this.spendIntegrity) this.spendIntegrity.promote(this.spendSourcesByFile.keys());
     else this.scheduleProjectSpendIndex(new Map(), null);
     this.postProjectSpend();
+    this.postDispatchedCostsIfMoved('historyCutoff');
   }
 
   private scheduleNextProjectSpendFile(): void {
