@@ -12317,7 +12317,7 @@ export class PanelProvider implements vscode.Disposable {
         admitted.push(session);
         continue;
       }
-      // The file check's cause: a walk rechecks every file, and a reused catalog checks a file whose held revision
+      // The file check's cause: a recheck checks every candidate, and a reused catalog checks a file whose held revision
       // moved, whose complete scan found no prompt, or that has no complete scan of the held revision.
       let cause: 'walk' | 'moved' | 'noPrompt' | 'unscanned' = 'walk';
       if (settled === 'skip') {

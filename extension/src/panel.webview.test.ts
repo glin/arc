@@ -3747,6 +3747,19 @@ test('a catalog-reusing refresh admits settled sessions without a file check and
     'the grown session was not scanned to its new end',
   );
 
+  const unscanned = row(write('unscanned'), 'unscanned');
+  stats = 0;
+  work.length = 0;
+  assert.deepEqual(files(await prepare.call(provider, [unscanned], false, signal(), undefined, 0, undefined, 'skip')), [
+    unscanned.file,
+  ]);
+  assert.ok(stats >= 1, 'a session without a scan was not checked');
+  assert.deepEqual(
+    work,
+    Array(stats).fill('humanPromptStat:unscanned'),
+    'a session without a scan counted another cause',
+  );
+
   // The refresh passes skip only after a listing that reused the held catalog.
   const modes: unknown[] = [];
   const wired: any = {
