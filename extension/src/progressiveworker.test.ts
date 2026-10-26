@@ -993,7 +993,8 @@ test('a new Claude session reaches a complete cut beside parent growth with boun
 test('a reloaded worker charges a grown transcript prefix to revalidation and its new tail to reads', async () => {
   const directory = tempDir('claude-revalidation-bytes-');
   const file = path.join(directory, 'parent.jsonl');
-  fs.writeFileSync(file, '{"type":"ignored","padding":"' + 'x'.repeat(20000) + '"}\n');
+  // The prefix spans more than one 256 KiB read, so every read must add to the charge.
+  fs.writeFileSync(file, '{"type":"ignored","padding":"' + 'x'.repeat(300000) + '"}\n');
   const session = () => {
     const stat = revisionOf(fs.statSync(file, { bigint: true }));
     return { file, agent: 'claude' as const, sessionId: 'parent', size: stat.size, mtimeMs: stat.mtimeMs };

@@ -267,7 +267,7 @@ export function validDiscoveryCheckpoint(value: unknown): value is DiscoveryChec
 }
 
 // `readBytes` counts transcript and receipt relationship bytes. Receipt bytes also have a separate subtotal.
-// `revalidationBytes` is the subtotal that re-hashes a transcript prefix a previous scan accepted.
+// `revalidationBytes` is the subtotal that re-hashes a transcript prefix an earlier scan read.
 // A parent check counts every stat of a candidate source. A file count names each file once per measured pass.
 // The dispatch visit count includes sessions whose held facts read nothing. The reread count excludes them.
 // Times are wall milliseconds.

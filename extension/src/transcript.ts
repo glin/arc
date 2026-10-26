@@ -4165,7 +4165,7 @@ export function extendRelationshipEvidence(evidence: RelationshipDigest, bytes: 
 }
 
 // Every returned filesystem byte enters the request meter before any later operation can fail.
-// `revalidationBytes` is the part of `readBytes` that re-hashes an accepted prefix.
+// `revalidationBytes` is the part of `readBytes` that re-hashes a prefix an earlier scan read.
 export interface RelationshipReadMeter {
   readBytes: number;
   revalidationBytes?: number;
