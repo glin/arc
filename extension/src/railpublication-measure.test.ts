@@ -20,7 +20,22 @@ test('one running session change per tick passes the gate and posts a delta of t
   );
   // The first post carries every row. Each later post carries the changed session's row.
   assert.equal(report.rowsSent, 300 + 24);
-  assert.equal(report.bytesPerMinute, Math.round((report.whole.bytes + report.delta.bytes) / 1.25));
+  assert.equal(
+    report.bytesPerMinute,
+    Math.round((report.whole.bytes + report.delta.bytes + report.queryContext.bytes) / 1.25),
+  );
+});
+
+// The query context holds every scoped identity and file, so it outweighs the rows of a delta many times over.
+test('a tick that changes one running session posts under 2 percent of the complete list, every message included', () => {
+  const report = measureRailPublication({ rows: 1000, running: 3, ticks: 10, tickMs: 3_000 });
+
+  assert.equal(report.queryContext.count, 1, 'an unchanged query context was posted again');
+  assert.equal(report.fields.queryContext, undefined, 'a session list message carried the query context');
+  assert.ok(
+    report.tickShare < 0.02,
+    `one changed session posted ${(report.tickShare * 100).toFixed(1)} percent of a ${report.snapshotBytes}-byte list`,
+  );
 });
 
 test('an unchanged tick is skipped by the gate before any payload is built', () => {

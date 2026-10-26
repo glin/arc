@@ -197,6 +197,25 @@ export function railPayload(input: RailPayloadInput): RailPayload {
   };
 }
 
+// Fields of one panel's session list message outside the shared session list payload. The query context travels in its own
+// message, so a session list message never carries it.
+export interface RailMessageFields {
+  sessionAdoptions: readonly { provisional: string; durable: string }[];
+  hidden: string[];
+  pinnedTop: string[];
+}
+
+// One panel's session list message before row delta encoding.
+export function railMessage(payload: RailPayload, fields: RailMessageFields) {
+  return {
+    type: 'rail' as const,
+    ...payload,
+    sessionAdoptions: fields.sessionAdoptions,
+    hidden: fields.hidden,
+    pinnedTop: fields.pinnedTop,
+  };
+}
+
 export interface RenderPayloadInput {
   rail: RailPayload;
   // Hidden sessions shared across hosts.

@@ -420,6 +420,30 @@ export interface SessionQueryContext {
   revision: string;
 }
 
+// Equal identities in the same order. The host reuses an identity list whose contents did not change.
+export function sameSessionQueryIdentities(
+  before: readonly SessionQueryIdentity[],
+  after: readonly SessionQueryIdentity[],
+): boolean {
+  return (
+    before === after ||
+    (before.length === after.length &&
+      after.every(
+        (identity, index) => identity.sessionId === before[index].sessionId && identity.agent === before[index].agent,
+      ))
+  );
+}
+
+export function sameSessionQueryContext(before: SessionQueryContext, after: SessionQueryContext): boolean {
+  return (
+    before === after ||
+    (before.scope === after.scope &&
+      before.coverage === after.coverage &&
+      before.revision === after.revision &&
+      sameSessionQueryIdentities(before.identities, after.identities))
+  );
+}
+
 const FULL_SESSION_ID = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
 const prefixValue = (id: string): boolean => id.length >= 8 && !FULL_SESSION_ID.test(id);
 

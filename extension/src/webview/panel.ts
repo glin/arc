@@ -51,6 +51,7 @@ import {
 } from './protocol.ts';
 import { commentsFor } from '../view/comments.ts';
 import { CARD_GLYPHS, contextClass } from '../view/card-presentation.ts';
+import { sameSessionQueryContext, type SessionQueryContext } from '../domain/session-query.ts';
 import { MAX_PROMPT_ASSETS, MAX_PROMPT_ASSET_BYTES, MAX_PROMPT_ASSET_TOTAL_BYTES } from '../domain/prompt-assets.ts';
 import { CARD_ACTIONS } from '../view/card-words.ts';
 import type { SavedStateService } from './state.ts';
@@ -121,6 +122,8 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
   let history: ReturnType<typeof createHistoryOwner>;
   let labelsFilterable: boolean | undefined;
   let latest: RenderMessage | null = null;
+  // The last query context message. Session list and render messages carry none, so every draw applies this one.
+  let queryContext: SessionQueryContext | undefined;
   // Session rows the host's last render and session list messages left in this panel.
   // A delta that cannot apply asks the host for a snapshot once, and the drawn rows stay until the snapshot arrives.
   const rowDeltas = new RowDeltaReceiver(() => vscode.postMessage({ type: 'rowsGap' }));
@@ -1071,7 +1074,7 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
       latest.railFilters,
       latest.stats,
       workspaceCatalogAvailable,
-      latest.queryContext,
+      queryContext,
     );
     // Place session list popovers after both owners draw because their timeline-heading anchors can move.
     railRenderer.place();
@@ -1160,35 +1163,24 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
       },
       health: (msg) => vscode.postMessage({ type: 'health', sequence: msg.sequence }),
       visibility: (msg) => visibility.receive(msg),
+      // A changed context redraws only the session list and refreshes content search, because both resolve queries against it.
+      queryContext: function (msg) {
+        // An equal context keeps the held object, so queries compiled against it stay reusable.
+        if (queryContext && sameSessionQueryContext(queryContext, msg.queryContext)) return;
+        queryContext = msg.queryContext;
+        searchRenderer.refresh();
+        if (latest)
+          railRenderer.update(
+            latest.rail,
+            latest.labels,
+            latest.views,
+            latest.railFilters,
+            latest.stats,
+            workspaceCatalogAvailable,
+            queryContext,
+          );
+      },
       startupProgress: function (msg) {
-        if (latest && msg.queryContext) {
-          const previous = latest.queryContext;
-          const changed =
-            !previous ||
-            previous.scope !== msg.queryContext.scope ||
-            previous.revision !== msg.queryContext.revision ||
-            previous.coverage !== msg.queryContext.coverage ||
-            previous.identities.length !== msg.queryContext.identities.length ||
-            msg.queryContext.identities.some(
-              (identity, index) =>
-                identity.sessionId !== previous.identities[index].sessionId ||
-                identity.agent !== previous.identities[index].agent,
-            );
-          latest.queryContext = msg.queryContext;
-          if (changed) {
-            searchRenderer.refresh();
-            railRenderer.update(
-              latest.rail,
-              latest.labels,
-              latest.views,
-              latest.railFilters,
-              latest.stats,
-              workspaceCatalogAvailable,
-              msg.queryContext,
-            );
-          }
-        }
-        if (msg.queryOnly) return;
         if (
           msg.generation < loadingGeneration ||
           (msg.generation === loadingGeneration && loadingComplete) ||
@@ -1309,18 +1301,10 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
       },
       // Retain session list updates on latest so later repaints keep the current workspace state.
       rail: function (msg) {
-        if (
-          msg.queryContext &&
-          (latest?.queryContext?.scope !== msg.queryContext.scope ||
-            latest?.queryContext?.revision !== msg.queryContext.revision ||
-            latest?.queryContext?.coverage !== msg.queryContext.coverage)
-        )
-          searchRenderer.refresh();
         sessionState.adopt(msg.hidden, msg.pinnedTop, sessionState.showing(), msg.sessionAdoptions);
         const projected = railAcrossSessionAdoption(msg.rail, msg.stats, msg.sessionAdoptions);
         const labeledBefore = latest ? labeledSessions() : null;
         if (latest) {
-          latest.queryContext = msg.queryContext;
           latest.rail = projected.rail;
           latest.stats = projected.stats;
           latest.labels = msg.labels;
@@ -1336,7 +1320,7 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
           msg.railFilters,
           projected.stats,
           workspaceCatalogAvailable,
-          msg.queryContext,
+          queryContext,
         );
         // Refresh timeline headings from the same labels and figures as the session list.
         timelineRenderer.refreshHeadings(projected.stats);

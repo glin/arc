@@ -15,6 +15,7 @@ import {
   listingQueryError,
   listingTermHolds,
   resolveSessionQuery,
+  sameSessionQueryContext,
   sessionQueryResolutionError,
   sessionQueryError,
   type SessionQueryContext,
@@ -661,6 +662,7 @@ import {
   RailPayloadInput,
   messageFieldBytes,
   railInputKey,
+  railMessage,
   railPayload,
   railWordingDay,
   renderPayload,
@@ -3223,21 +3225,28 @@ export class PanelProvider implements vscode.Disposable {
     return this.sessionPageIndex;
   }
 
+  // Post the query context to each ready panel whose last received context differs. The panel applies the last context it
+  // received to later session list and render messages, so those messages leave it out.
   private publishSessionQueryContext(): void {
-    if (!this.hosts?.length || !this.windowStateHandler) return;
-    void this.post({
-      type: 'startupProgress',
-      queryOnly: true,
-      ...(this.sessionQueryContext() ? { queryContext: this.sessionQueryContext() } : {}),
-      generation: this.refreshGeneration ?? 0,
-      epoch: String(this.refreshGeneration ?? 0),
-      sequence: (this.startupProgressSequence = (this.startupProgressSequence ?? 0) + 1),
-      completed: 0,
-      known: 0,
-    }).catch(() => {});
+    if (!this.hosts?.length) return;
+    const context = this.sessionQueryContext();
+    const sent = (this.queryContextSent ??= new WeakMap());
+    for (const host of this.hosts) {
+      if (!this.readyHosts?.has(host)) continue;
+      const held = sent.get(host);
+      if (held && sameSessionQueryContext(held, context)) continue;
+      sent.set(host, context);
+      const forget = () => {
+        if (sent.get(host) === context) sent.delete(host);
+      };
+      void Promise.resolve(this.sendToHost(host, { type: 'queryContext', queryContext: context })).then((accepted) => {
+        if (!accepted) forget();
+      }, forget);
+    }
   }
 
-  private lastRailQueryContext?: SessionQueryContext;
+  // The query context each panel last accepted. A loaded page holds none.
+  private queryContextSent?: WeakMap<PanelHost, SessionQueryContext>;
 
   private resolvedQueryContext?: { catalog: SessionFile[] | null; context: SessionQueryContext };
 
@@ -9659,11 +9668,11 @@ export class PanelProvider implements vscode.Disposable {
         this.startupLoadingSent = JSON.stringify(
           this.loadingLine.held(loadingScope) && !listLoading.complete ? { ...listLoading, held: true } : listLoading,
         );
+        this.publishSessionQueryContext();
         void this.postRows(
           host,
           {
             ...payload,
-            ...(this.sessionQueryContext() ? { queryContext: this.sessionQueryContext() } : {}),
             // A held line marks a pending stamp held. A newest-turn read then keeps the stamp incomplete, so the panel's completion
             // acknowledgement waits for it, but the line stays hidden and the read reaches only the log.
             startup:
@@ -10433,13 +10442,9 @@ export class PanelProvider implements vscode.Disposable {
     if (inputsChanged) {
       this.railRevision++;
     }
+    this.publishSessionQueryContext();
     const day = railWordingDay(Date.now());
-    const queryContext = this.sessionQueryContext();
-    if (
-      this.lastRailRevision === this.railRevision &&
-      this.lastRailDay === day &&
-      this.lastRailQueryContext === queryContext
-    ) {
+    if (this.lastRailRevision === this.railRevision && this.lastRailDay === day) {
       this.performanceCounters?.recordWork('railSkippedRevision');
       return;
     }
@@ -10456,11 +10461,7 @@ export class PanelProvider implements vscode.Disposable {
     const pendingAnswers = this.lifetimeFigures.answers();
     const railAdoptions = sessionAdoptions(this.sessionAliases);
     const adoptionsJson = JSON.stringify(railAdoptions);
-    if (
-      sameRailInputs(this.lastRailKey, key) &&
-      adoptionsJson === this.lastRailAdoptionsJson &&
-      this.lastRailQueryContext === queryContext
-    ) {
+    if (sameRailInputs(this.lastRailKey, key) && adoptionsJson === this.lastRailAdoptionsJson) {
       this.railPendingAnswers = pendingAnswers;
       this.lastRailRevision = this.railRevision;
       this.lastRailDay = day;
@@ -10472,25 +10473,24 @@ export class PanelProvider implements vscode.Disposable {
     const sharedRail = railPayload(input);
     let largestRailBytes: number | null = null;
     for (const host of this.hosts) {
-      const message = {
-        type: 'rail' as const,
-        ...(this.sessionQueryContext() ? { queryContext: this.sessionQueryContext() } : {}),
-        ...((this.hostSessions?.get(host) ?? this.showing) === this.showing
+      const message = railMessage(
+        (this.hostSessions?.get(host) ?? this.showing) === this.showing
           ? sharedRail
           : railPayload(
               this.railInputFor(counts, statuses, openChildren, railNow, this.hostSessions?.get(host) ?? this.showing),
-            )),
-        sessionAdoptions: railAdoptions,
-        hidden: [...this.hidden],
-        pinnedTop: [...this.pinnedTop],
-      };
+            ),
+        {
+          sessionAdoptions: railAdoptions,
+          hidden: [...this.hidden],
+          pinnedTop: [...this.pinnedTop],
+        },
+      );
       void this.postRows(host, message, (serializedBytes) => {
         if (serializedBytes !== null) {
           largestRailBytes = Math.max(largestRailBytes ?? 0, serializedBytes);
         }
       });
     }
-    this.lastRailQueryContext = queryContext;
     this.lastRailKey = key;
     this.railPendingAnswers = pendingAnswers;
     this.lastRailMessageType = largestRailBytes === null ? null : 'rail';
@@ -12017,9 +12017,9 @@ export class PanelProvider implements vscode.Disposable {
             scope,
             blocker,
           );
+          this.publishSessionQueryContext();
           void this.post({
             type: 'startupProgress',
-            ...(this.sessionQueryContext() ? { queryContext: this.sessionQueryContext() } : {}),
             generation: result.generation,
             epoch: String(generation),
             sequence: (this.startupProgressSequence = (this.startupProgressSequence ?? 0) + 1),
@@ -12825,9 +12825,9 @@ export class PanelProvider implements vscode.Disposable {
     }
     this.startupLoadingSent = key;
     const published = this.loadingLine.present(path, state, scope, blocker);
+    this.publishSessionQueryContext();
     void this.post({
       type: 'startupProgress',
-      ...(this.sessionQueryContext() ? { queryContext: this.sessionQueryContext() } : {}),
       ...published,
       epoch: String(state.generation),
       sequence: (this.startupProgressSequence = (this.startupProgressSequence ?? 0) + 1),
@@ -15265,7 +15265,8 @@ export class PanelProvider implements vscode.Disposable {
         health: () => {},
         readerRead: (msg) => this.readerRead({ ...msg.operation, namespace: 'browser' }, host),
         ready: () => {
-          // A loaded page holds no session rows.
+          // A loaded page holds no session rows and no query context.
+          this.queryContextSent?.delete(host);
           const sender = this.rowSenders?.get(host);
           if (sender) {
             sender.reset('ready');

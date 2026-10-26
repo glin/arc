@@ -8,6 +8,8 @@ export const PERFORMANCE_DIAGNOSTICS_SCHEMA_VERSION = 6;
 const MESSAGE_BYTE_BUDGETS: Readonly<Record<string, number>> = {
   render: 250_000,
   rail: 1_100_000,
+  // A query context lists every scoped session, like a complete session list.
+  queryContext: 1_100_000,
 };
 
 export interface OperationCounts {

@@ -242,6 +242,26 @@ const HOST: Array<{ raw: unknown; parsed: HostToPanel }> = [
     parsed: { type: 'visibility', visible: false, revision: 1 },
   },
   {
+    raw: {
+      type: 'queryContext',
+      queryContext: {
+        identities: [{ sessionId: 's1', agent: 'claude' }],
+        coverage: 'complete',
+        scope: '[]',
+        revision: 'r',
+      },
+    },
+    parsed: {
+      type: 'queryContext',
+      queryContext: {
+        identities: [{ sessionId: 's1', agent: 'claude' }],
+        coverage: 'complete',
+        scope: '[]',
+        revision: 'r',
+      },
+    },
+  },
+  {
     raw: { type: 'startupProgress', generation: 1, epoch: 'epoch', sequence: 2, completed: 3, known: 4 },
     parsed: { type: 'startupProgress', generation: 1, epoch: 'epoch', sequence: 2, completed: 3, known: 4 },
   },
@@ -718,6 +738,7 @@ function hostRecorder(seen: string[]): HostToPanelHandlers {
     results: take('results'),
     selection: take('selection'),
     render: take('render'),
+    queryContext: take('queryContext'),
     startupProgress: take('startupProgress'),
   };
 }
@@ -1125,6 +1146,8 @@ test('a malformed message from the extension is refused', () => {
     { type: 'sendSelectedText', key: 's1:1', copyLabels: 'yes' },
     { type: 'results', query: 'one', hits: [], scope: 7 },
     { type: 'openPick', control: null },
+    { type: 'queryContext' },
+    { type: 'queryContext', queryContext: { identities: [], coverage: 'partial', scope: '[]', revision: 'r' } },
   ];
   for (const raw of refused) {
     assert.equal(parseHostToPanel(raw), null, JSON.stringify(raw) ?? String(raw));

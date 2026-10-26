@@ -2260,7 +2260,14 @@ import {
 } from './turnlabels.ts';
 import { isSearch, searchScope, searchScopeName, searchTurns } from './turnsearch.ts';
 import { LABEL_NAME_LIMIT, labelTypedNotes } from './domain/labels.ts';
-import { canStartSearch, matchSessions, parseSessionQuery, queryToken, withWhere } from './domain/session-query.ts';
+import {
+  canStartSearch,
+  matchSessions,
+  parseSessionQuery,
+  queryToken,
+  sameSessionQueryContext,
+  withWhere,
+} from './domain/session-query.ts';
 import { labelSuggestions, whereNote } from './view/session-query.ts';
 import { RAIL_FOLDS, railBuckets, railCountButtons, railCounts, railTimeSlot, sessionCount } from './view/rail.ts';
 import { formatRelative } from './view/time.ts';
@@ -30602,6 +30609,7 @@ test('startup selection preserves configured filters until the workspace catalog
   const source = [
     `let ${declarationSource(script, 'latest')};`,
     `let ${declarationSource(script, 'workspaceCatalogAvailable')};`,
+    `let ${declarationSource(script, 'queryContext')};`,
     'let usageState = null, layout = null;',
     ...['firstSelection', 'repaint'].map((name) => declarationSource(script, name)),
     `return { selection(msg) {${handlerBody(script, 'selection')}}, rail(msg) {${handlerBody(script, 'rail')}}, render(msg) {${handlerBody(script, 'render')}} };`,
@@ -39560,11 +39568,17 @@ test('catalog prefix resolution suspends through discovery progress failure canc
   let resolve!: (value: any) => void;
   let progress!: (value: any) => boolean;
   const roots = JSON.parse(provider.authoritativeCatalogScope);
+  const host = {};
   Object.assign(provider, {
-    hosts: [{}],
+    hosts: [host],
+    readyHosts: new Set([host]),
     windowStateHandler() {},
     post: async (message: any) => {
       posted.push(message);
+    },
+    sendToHost: async (_host: unknown, message: any) => {
+      posted.push(message);
+      return true;
     },
     refreshGeneration: 1,
     repositoryScopeRoots: roots,
@@ -39602,7 +39616,7 @@ test('catalog prefix resolution suspends through discovery progress failure canc
   const savedBefore = JSON.stringify(provider.saved);
   const check = (pending: boolean) => {
     assert.equal(provider.sessionQueryContext().identities, identities);
-    const context = posted.at(-1).queryContext;
+    const context = posted.findLast((message) => message.type === 'queryContext').queryContext;
     assert.equal(context.coverage, pending ? 'incomplete' : 'complete');
     if (pending) {
       for (const query of [
@@ -39709,78 +39723,113 @@ test('catalog prefix resolution suspends through discovery progress failure canc
   assert.equal(read('').coverage, 'unavailable');
 });
 
+// Runs the panel's own query context, session list, and render handlers and its repaint in one scope, with every other
+// panel owner replaced by a recorder. Session list and render messages carry no query context.
+function queryContextPanel() {
+  const calls = { railUpdates: [] as unknown[], searchRefreshes: 0, timelineDraws: 0 };
+  const ignore: any = new Proxy(function () {}, { get: () => ignore, apply: () => undefined });
+  const owners: Record<string, unknown> = {
+    railRenderer: { update: (...args: unknown[]) => calls.railUpdates.push(args[6]), place() {} },
+    searchRenderer: { refresh: () => calls.searchRefreshes++ },
+    render: () => calls.timelineDraws++,
+    railAcrossSessionAdoption: (rail: unknown, stats: unknown) => ({ rail, stats }),
+    labeledSessions: () => null,
+    sameSessionQueryContext,
+  };
+  const scope = new Proxy(owners, {
+    has: (_owners, name) => typeof name === 'string' && !(name in globalThis),
+    // A symbol read is the scope's unscopables lookup, which must find nothing.
+    get: (held, name) => (typeof name !== 'string' ? undefined : name in held ? held[name] : ignore),
+  });
+  const repaint = sourceNodes(script, (node) => ts.isFunctionDeclaration(node) && node.name?.text === 'repaint')[0];
+  const handlers = ['queryContext', 'rail', 'render'].map(panelHandler).join(',\n');
+  const source = ts.transpileModule(
+    `let queryContext, latest = null, layout, usageState, workspaceCatalogAvailable = false;
+    ${repaint}
+    return { ${handlers} };`,
+    { compilerOptions: { target: ts.ScriptTarget.ES2022 } },
+  ).outputText;
+  const dispatch = new Function('scope', `with (scope) { return (function () { ${source} })(); }`)(scope);
+  return { dispatch, calls };
+}
+
+function queryContextOf(count: number) {
+  return {
+    scope: 'scope',
+    revision: 'revision',
+    coverage: 'complete' as const,
+    identities: Array.from({ length: count }, (_, index) => ({
+      sessionId: `session-${index}`,
+      agent: index % 2 ? 'codex' : 'claude',
+    })),
+  };
+}
+
+test('session list and render messages apply the last query context, and a context alone redraws only the session list', () => {
+  const { dispatch, calls } = queryContextPanel();
+  const first = queryContextOf(3);
+  dispatch.queryContext({ type: 'queryContext', queryContext: first });
+  assert.deepEqual(calls.railUpdates, [], 'a context before the first render drew the session list');
+  assert.equal(calls.timelineDraws, 0, 'a query context drew the timeline');
+  const render = { type: 'render', cards: [], sessions: [], rail: [], stats: {}, labels: [], sessionAdoptions: [] };
+  dispatch.render(render);
+  assert.equal(calls.timelineDraws, 1);
+  assert.equal(calls.railUpdates.at(-1), first, 'a render without a context did not apply the last context');
+  const changed = { ...queryContextOf(3), revision: 'changed' };
+  dispatch.queryContext({ type: 'queryContext', queryContext: changed });
+  assert.equal(calls.railUpdates.at(-1), changed, 'a changed context did not redraw the session list');
+  assert.equal(calls.timelineDraws, 1, 'a query context redrew the timeline');
+  const updates = calls.railUpdates.length;
+  dispatch.queryContext({ type: 'queryContext', queryContext: structuredClone(changed) });
+  assert.equal(calls.railUpdates.length, updates, 'an equal context redrew the session list');
+  dispatch.rail({ ...render, type: 'rail', views: [], railFilters: [], hidden: [], pinnedTop: [] });
+  assert.equal(
+    calls.railUpdates.at(-1),
+    changed,
+    'a session list message without a context did not apply the last one',
+  );
+  dispatch.render(render);
+  assert.equal(calls.railUpdates.at(-1), changed, 'a later render did not apply the last context');
+});
+
 for (const count of [100, 1000]) {
-  test(`unchanged refresh generations keep content search and avoid session list updates at ${count} identities`, async () => {
-    const { createSearchRenderer } = await import('./webview/search.ts');
-    const { provider } = pagedListingFixture(30);
-    const retained = provider.sessionQueryContext();
-    const context = {
-      ...retained,
-      identities: Array.from({ length: count }, (_, index) => ({
-        sessionId: `session-${index}`,
-        agent: index % 2 ? 'codex' : 'claude',
-      })),
-    };
-    const requests: any[] = [];
-    const body = handlerBody(script, 'startupProgress');
-    const end = body.indexOf('if (msg.queryOnly) return;');
-    const apply = new Function(
-      'msg',
-      'latest',
-      'searchRenderer',
-      'railRenderer',
-      'workspaceCatalogAvailable',
-      body.slice(0, end),
-    );
-    const latest: any = { queryContext: context };
-    const renderer = createSearchRenderer({
-      document: { createElement: () => ({}) } as any,
-      sendToHost: (message) => requests.push(message),
-    });
-    renderer.start('needle');
-    renderer.accept('find: needle', 'workspace', []);
-    let updates = 0;
-    let refreshes = 0;
-    const railRenderer = {
-      update() {
-        updates++;
-      },
-    };
-    const searchRenderer = {
-      refresh() {
-        refreshes++;
-        renderer.refresh();
-      },
-    };
-    for (let generation = 2; generation < 6; generation++) {
-      provider.refreshGeneration = generation;
-      assert.equal(provider.sessionQueryContext(), retained);
+  test(`unchanged query contexts keep content search and avoid session list updates at ${count} identities`, () => {
+    const { dispatch, calls } = queryContextPanel();
+    const context = queryContextOf(count);
+    dispatch.queryContext({ type: 'queryContext', queryContext: context });
+    dispatch.render({ type: 'render', cards: [], sessions: [], rail: [], stats: {}, sessionAdoptions: [] });
+    const updates = calls.railUpdates.length;
+    const refreshes = calls.searchRefreshes;
+    for (let repeat = 0; repeat < 4; repeat++) {
       const incoming = structuredClone(context);
-      assert.notEqual(incoming, latest.queryContext);
-      assert.notEqual(incoming.identities[0], latest.queryContext.identities[0]);
-      apply({ generation, queryContext: incoming }, latest, searchRenderer, railRenderer, true);
-      assert.equal(updates, 0, 'unchanged startup context updated the session list');
-      assert.equal(refreshes, 0, 'unchanged startup context refreshed search');
-      assert.equal(latest.queryContext, incoming, 'incoming context was not retained');
+      assert.notEqual(incoming.identities[0], context.identities[0]);
+      dispatch.queryContext({ type: 'queryContext', queryContext: incoming });
     }
-    assert.deepEqual(requests, [{ type: 'search', text: 'find: needle' }]);
-    for (const field of ['scope', 'revision', 'coverage', 'count', 'sessionId', 'agent', 'order', 'first']) {
-      latest.queryContext = field === 'first' ? undefined : context;
-      const incoming = structuredClone(context);
+    assert.equal(calls.railUpdates.length, updates, 'an unchanged context updated the session list');
+    assert.equal(calls.searchRefreshes, refreshes, 'an unchanged context refreshed search');
+    let held = context;
+    for (const field of ['scope', 'revision', 'coverage', 'count', 'sessionId', 'agent', 'order']) {
+      const incoming: any = structuredClone(held);
       if (field === 'scope') incoming.scope += '-changed';
       if (field === 'revision') incoming.revision += '-changed';
-      if (field === 'coverage') incoming.coverage = 'incomplete';
+      if (field === 'coverage') incoming.coverage = incoming.coverage === 'complete' ? 'incomplete' : 'complete';
       if (field === 'count') incoming.identities.pop();
       if (field === 'sessionId') incoming.identities[0].sessionId += '-changed';
-      if (field === 'agent') incoming.identities[0].agent = 'codex';
+      if (field === 'agent')
+        incoming.identities[0].agent = incoming.identities[0].agent === 'codex' ? 'claude' : 'codex';
       if (field === 'order')
         [incoming.identities[0], incoming.identities[1]] = [incoming.identities[1], incoming.identities[0]];
-      const beforeUpdates = updates;
-      const beforeRefreshes = refreshes;
-      apply({ generation: 1, queryOnly: true, queryContext: incoming }, latest, searchRenderer, railRenderer, true);
-      assert.equal(updates, beforeUpdates + 1, `${field} changed context did not update the session list once`);
-      assert.equal(refreshes, beforeRefreshes + 1, `${field} changed context did not refresh search once`);
-      assert.equal(latest.queryContext, incoming, `${field} changed context was not retained`);
+      const beforeUpdates = calls.railUpdates.length;
+      const beforeRefreshes = calls.searchRefreshes;
+      dispatch.queryContext({ type: 'queryContext', queryContext: incoming });
+      assert.equal(
+        calls.railUpdates.length,
+        beforeUpdates + 1,
+        `${field} changed context did not update the session list once`,
+      );
+      assert.equal(calls.railUpdates.at(-1), incoming, `${field} changed context was not retained`);
+      assert.equal(calls.searchRefreshes, beforeRefreshes + 1, `${field} changed context did not refresh search once`);
+      held = incoming;
     }
   });
 }

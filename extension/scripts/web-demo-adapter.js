@@ -102,7 +102,6 @@
     const original = sample.payloads[selected];
     deliver({
       type: 'rail',
-      queryContext: original.queryContext,
       rail: railRows(),
       labels: labelRules.labelCounts(labels),
       views,
@@ -114,7 +113,8 @@
     });
   }
   function render() {
-    const original = sample.payloads[selected];
+    const { queryContext, ...original } = sample.payloads[selected];
+    deliver({ type: 'queryContext', queryContext });
     deliver({
       ...original,
       comments,

@@ -347,6 +347,7 @@ test('serialized message bytes use UTF-8 and unavailable values stay explicit in
 test('render and rail messages have explicit production byte budgets', () => {
   assert.equal(messageByteBudget('render'), 250_000);
   assert.equal(messageByteBudget('rail'), 1_100_000);
+  assert.equal(messageByteBudget('queryContext'), 1_100_000);
   assert.equal(messageByteBudget('usage'), null);
 });
 

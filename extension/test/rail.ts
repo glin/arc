@@ -56,7 +56,6 @@ export function railMessage(base: PanelPayload, rail: RailCard[]): Record<string
     labels: base.labels,
     views: base.views,
     railFilters: base.railFilters,
-    queryContext: base.queryContext,
     stats: base.stats,
     hidden: Array.isArray(base.hidden) ? base.hidden : [],
     pinnedTop: Array.isArray(base.pinnedTop) ? base.pinnedTop : [],
@@ -81,7 +80,11 @@ export async function openPage(
   await page.setContent(
     themed(pageHtml().replace('const SAVED_STATE = {};', `const SAVED_STATE = ${JSON.stringify(seeded)};`)),
   );
-  await page.evaluate(`window.postMessage(${JSON.stringify(initial)}, '*')`);
+  // The host posts a query context in its own message before the render that needs it.
+  const { queryContext, ...render } = initial;
+  if (queryContext)
+    await page.evaluate(`window.postMessage(${JSON.stringify({ type: 'queryContext', queryContext })}, '*')`);
+  await page.evaluate(`window.postMessage(${JSON.stringify(render)}, '*')`);
   await page.evaluate(SETTLED);
   if (seeded !== savedState) {
     await page.locator('[data-control="railsearch"]').click();

@@ -148,6 +148,7 @@ import {
 import {
   messageFieldBytes,
   railInputKey,
+  railMessage,
   railPayload,
   railWordingDay,
   sameRailInputs,
@@ -1762,6 +1763,7 @@ function completeDiscoveryHarness(
     'RowDeltaReceiver',
     'RowDeltaSender',
     'sameRailInputs',
+    'railMessage',
     'sessionAdoptions',
     'selectionPayload',
     'messageByteBudget',
@@ -1808,6 +1810,7 @@ function completeDiscoveryHarness(
     RowDeltaReceiver,
     RowDeltaSender,
     sameRailInputs,
+    railMessage,
     sessionAdoptions,
     selectionPayload,
     messageByteBudget,

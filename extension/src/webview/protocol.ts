@@ -219,9 +219,9 @@ type LabelEditorRow = LabelRow & { applied: boolean };
 
 // The parser preserves this complete payload, including fields owned by card, session list, and prompt box modules.
 // The panel retains and updates the same object.
+// The query context arrives in its own message, and the panel applies the last one to every render.
 export interface RenderMessage extends Record<string, unknown> {
   type: 'render';
-  queryContext?: SessionQueryContext;
   cards: PanelCard[];
   sessions: PanelSessionRow[];
   rail: PanelRailCard[];
@@ -285,10 +285,10 @@ export type HostToPanel =
   | { type: 'applySessionFilter'; request: string; query: string; deadline: number }
   | { type: 'health'; sequence: number }
   | { type: 'visibility'; visible: boolean; revision: number }
+  // The scoped catalog identities that session queries resolve against. The host posts it only when it changes.
+  | { type: 'queryContext'; queryContext: SessionQueryContext }
   | {
       type: 'startupProgress';
-      queryOnly?: boolean;
-      queryContext?: SessionQueryContext;
       generation: number;
       epoch: string;
       sequence: number;
@@ -323,7 +323,6 @@ export type HostToPanel =
   | SelectionMessage
   | {
       type: 'rail';
-      queryContext?: SessionQueryContext;
       rail: PanelRailCard[];
       stats: Record<string, PanelStat[]>;
       labels: LabelRow[];
@@ -360,6 +359,7 @@ const HOST_TO_PANEL_KINDS: Record<HostToPanel['type'], true> = {
   applySessionFilter: true,
   health: true,
   visibility: true,
+  queryContext: true,
   startupProgress: true,
   contextDetail: true,
   focusProjectSpend: true,
@@ -747,10 +747,12 @@ export function parseHostToPanel(raw: unknown): HostToPanel | null {
       return typeof m.visible === 'boolean' && Number.isSafeInteger(m.revision) && (m.revision as number) >= 0
         ? { type: 'visibility', visible: m.visible, revision: m.revision as number }
         : null;
+    case 'queryContext':
+      return m.queryContext !== undefined && validQueryContext(m.queryContext)
+        ? { type: 'queryContext', queryContext: m.queryContext as SessionQueryContext }
+        : null;
     case 'startupProgress':
-      return validQueryContext(m.queryContext) &&
-        (m.queryOnly === undefined || typeof m.queryOnly === 'boolean') &&
-        (m.complete === undefined || typeof m.complete === 'boolean') &&
+      return (m.complete === undefined || typeof m.complete === 'boolean') &&
         (m.failed === undefined || typeof m.failed === 'boolean') &&
         (m.held === undefined || typeof m.held === 'boolean') &&
         Number.isSafeInteger(m.generation) &&
@@ -884,8 +886,7 @@ export function parseHostToPanel(raw: unknown): HostToPanel | null {
           ? { type: 'activity', session: m.session, card: m.card as PanelCard }
           : null;
     case 'selection':
-      return validQueryContext(m.queryContext) &&
-        records(m.cards) &&
+      return records(m.cards) &&
         records(m.sessions) &&
         records(m.rail) &&
         record(m.stats) !== null &&
@@ -895,8 +896,7 @@ export function parseHostToPanel(raw: unknown): HostToPanel | null {
     case 'rail': {
       const stats = record(m.stats);
       const sessionAdoptions = m.sessionAdoptions === undefined ? [] : m.sessionAdoptions;
-      return validQueryContext(m.queryContext) &&
-        records(m.rail) &&
+      return records(m.rail) &&
         stats !== null &&
         Array.isArray(m.labels) &&
         m.labels.every(labelCount) &&
@@ -909,7 +909,6 @@ export function parseHostToPanel(raw: unknown): HostToPanel | null {
         rowDeltaHeaderValid(m.rows)
         ? {
             type: 'rail',
-            ...(m.queryContext === undefined ? {} : { queryContext: m.queryContext as SessionQueryContext }),
             rail: m.rail as PanelRailCard[],
             stats: stats as Record<string, PanelStat[]>,
             labels: m.labels,
@@ -1002,8 +1001,7 @@ export function parseHostToPanel(raw: unknown): HostToPanel | null {
     case 'render': {
       // Preserve the complete render object described by RenderMessage.
       const adoptions = m.sessionAdoptions;
-      return validQueryContext(m.queryContext) &&
-        records(m.cards) &&
+      return records(m.cards) &&
         records(m.sessions) &&
         records(m.rail) &&
         record(m.stats) !== null &&
@@ -1430,6 +1428,8 @@ export function dispatchHostToPanel(message: HostToPanel, handlers: HostToPanelH
       return handlers.health(message);
     case 'visibility':
       return handlers.visibility(message);
+    case 'queryContext':
+      return handlers.queryContext(message);
     case 'startupProgress':
       return handlers.startupProgress(message);
     case 'focusProjectSpend':
