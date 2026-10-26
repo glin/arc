@@ -3888,6 +3888,16 @@ return admitRoots;`,
   assert.deepEqual(await discover(listed, [...listed, gone]), [growing, kept, replaced].sort(), 'a gone root stayed');
   assert.deepEqual([...new Set(checked)], [gone.file], 'discovery roots checked a root the request sent unchanged');
   assert.deepEqual(fileChecks(), ['humanPromptStat:walk'], 'a root the request did not send counted another cause');
+  assert.deepEqual(
+    await discover([{ ...gone, size: gone.size + 1 }], [gone]),
+    [],
+    'a root sent at another revision settled',
+  );
+  assert.deepEqual(
+    await discover([{ ...gone, ino: `${gone.ino}0` }], [gone]),
+    [],
+    'a root sent with another inode settled',
+  );
 
   // A replacement at the same path, size and time shows only in its device and inode.
   const before = revisionOf(fs.statSync(replaced, { bigint: true }));

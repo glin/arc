@@ -12170,8 +12170,8 @@ export class PanelProvider implements vscode.Disposable {
     const discoveryRoots =
       progress.roots ?? held.filter((session) => session.agent !== 'claude' || session.childTranscript !== true);
     // A complete reply returns the parents of its epoch, which an earlier request or a saved checkpoint can have sent.
-    // A root that this request sent at the same size, time, device and inode is the row the refresh listed, so its
-    // complete scan settles it. Every other root is rechecked.
+    // A root that matches a row this request sent at the same size, time, device and inode settles on its complete
+    // scan, as that row does in the refresh. Every other root is rechecked.
     const sent = new Map(parents.map((row) => [row.file, row]));
     const listed = (root: SessionFile): boolean => {
       const row = sent.get(root.file);
