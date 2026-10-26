@@ -193,9 +193,11 @@ test.each([
       commands: components.skill ? [{ name: 'arc-session-tools:arc-sessions' }] : [],
     });
     await vi.waitFor(() => assert.equal(h.parsed().at(-1).request.subtype, 'get_settings'));
-    answer({ effective: {}, sources: [], applied: {} });
+    const settings = { extraKnownMarketplaces: { writing: { source: { source: 'github', repo: 'example/writing' } } } };
+    answer({ effective: settings, sources: [{ source: 'userSettings', settings }], applied: {} });
     const commands = await opening;
     assert.equal(commands.length, components.skill ? 1 : 0);
+    if (components.skill) assert.equal(commands[0].name, 'arc-session-tools:arc-sessions');
     const delivery = h.wire.prompt('ordinary work');
     const outcome = components.hooks ? assert.rejects(delivery, /settings/) : delivery;
     await vi.waitFor(() =>

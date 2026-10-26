@@ -10,6 +10,8 @@ Claude loads the skill plugin and snapshot plugin separately through repeated `-
 
 Claude's `get_settings` response must contain readable `effective` and `applied` objects and an array of source objects. Arc accepts only `userSettings`, `projectSettings`, `localSettings`, and `flagSettings`. Managed or unknown settings sources prevent both optional plugins from loading. Arc never changes native settings or enables disabled components at launch.
 
+Claude marketplace declarations in `extraKnownMarketplaces` accept GitHub, Git, URL, and directory sources. Arc checks installed plugins separately for existing skills and snapshot commands. Inline or unknown marketplace sources prevent automatic loading.
+
 After preparing attachments, Arc repeats settings and file-identity checks before sending the first input. Competing first writes run one at a time. Cancelled attempts cannot authorize later prompts. Arc checks generation, cancellation, guards, and reservations synchronously beside the write. This applies to text, files, guarded input, local commands, and effort commands. Processes with hooks alone receive the same checks as processes with the skill.
 
 Arc repeats these checks when refreshing the displayed skill list, including notifications received during a refresh. Confirmed removal of Arc's Codex skill root allows the same process to continue normally. Uncertain registration or removal blocks further input. An unsupported method reported before registration leaves ordinary startup available in that process.
@@ -35,6 +37,8 @@ When Arc omits hooks, it skips later Node checks and hook-configuration scans. C
 ## Codex skill registration
 
 Codex initializes before Arc requests fresh raw skill discovery and effective settings. Arc reads `config/read` with layers and `configRequirements/read`. Personal settings and an empty system layer qualify. Managed layers, non-null requirements, malformed entries, and ambiguous skill paths prevent automatic skill loading.
+
+Arc treats absent `skills` and `skills: null` as no skill configuration. It still checks discovered skills before registration.
 
 Any existing matching raw skill entry prevents registration, including an enabled link to the selected definition. After registration, Arc retains only the exact enabled Arc-owned entry. Arc registers only its immutable root through `skills/extraRoots/set` and requires an empty object acknowledgment.
 

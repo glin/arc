@@ -192,6 +192,34 @@ test.each(['win32', 'darwin', 'linux'] as const)(
     };
     write(supplied, 'matching skill');
     assert.equal(admitClaudeSessionSkill(input), true);
+    const marketplaces = {
+      extraKnownMarketplaces: {
+        writing: { source: { source: 'github', repo: 'example/writing' } },
+        local: { source: { source: 'directory', path: paths.join(home, 'marketplace') } },
+      },
+    };
+    for (const file of [paths.join(home, 'settings.json'), paths.join(cwd, '.claude/settings.json')]) {
+      write(file, JSON.stringify(marketplaces));
+      assert.deepEqual(componentFlags(input), { skill: true, hooks: true });
+      write(definition, 'personal skill');
+      assert.equal(admitClaudeSessionSkill(input), false);
+      fs.unlinkSync(owned(definition));
+      write(file, '{}');
+    }
+    for (const source of ['userSettings', 'projectSettings', 'localSettings', 'flagSettings'])
+      assert.equal(
+        claudeNativeSkillSettings({
+          effective: marketplaces,
+          sources: [{ source, settings: marketplaces }],
+          applied: {},
+        }),
+        true,
+      );
+    for (const extraKnownMarketplaces of [null, [], { inline: { source: { source: 'settings', plugins: [] } } }]) {
+      write(paths.join(home, 'settings.json'), JSON.stringify({ extraKnownMarketplaces }));
+      assert.equal(admitClaudeSessionSkill(input), false);
+    }
+    write(paths.join(home, 'settings.json'), '{}');
     for (const env of [
       { NODE_EXTRA_CA_CERTS: '/custom/certificates.pem' },
       { NODE_CHANNEL_FD: '3' },
@@ -504,6 +532,7 @@ test('Codex admission keeps raw duplicate identities and configured disabled pat
     ],
   };
   assert.equal(codexSkillConfiguration(config, { requirements: null }, release), true);
+  assert.equal(codexSkillConfiguration({ ...config, config: { skills: null } }, { requirements: null }, release), true);
   assert.equal(codexSkillConfiguration(config, { requirements: {} }, release), false);
   for (const type of ['mdm', 'enterpriseManaged', 'legacyManaged', 'unknown'])
     assert.equal(

@@ -94,13 +94,18 @@ export function claudeSkillSettings(
 ): boolean {
   if (!skillObject(value)) return false;
   if (value.disableSideloadFlags !== undefined && value.disableSideloadFlags !== false) return false;
-  for (const key of [
-    'strictKnownMarketplaces',
-    'extraKnownMarketplaces',
-    'pluginTrustMessage',
-    'enabledPluginsFromClaudeAi',
-  ])
+  for (const key of ['strictKnownMarketplaces', 'pluginTrustMessage', 'enabledPluginsFromClaudeAi'])
     if (value[key] !== undefined) return false;
+  if (value.extraKnownMarketplaces !== undefined) {
+    if (!skillObject(value.extraKnownMarketplaces)) return false;
+    for (const marketplace of Object.values(value.extraKnownMarketplaces))
+      if (
+        !skillObject(marketplace) ||
+        !skillObject(marketplace.source) ||
+        !['github', 'git', 'url', 'directory'].includes(String(marketplace.source.source))
+      )
+        return false;
+  }
   if (
     value.env !== undefined &&
     (!skillObject(value.env) || Object.keys(value.env).some((key) => redirectedEnvironment.has(key.toUpperCase())))
@@ -464,7 +469,7 @@ export function codexSkillConfiguration(
     )
       return false;
     const configured = (config: Record<string, unknown>) => {
-      if (config.skills === undefined) return [];
+      if (config.skills === undefined || config.skills === null) return [];
       if (!skillObject(config.skills) || !Array.isArray(config.skills.config))
         throw new Error('Unreadable skill configuration.');
       const entries = config.skills.config;

@@ -40,6 +40,7 @@ function sessionSkillServer() {
     collision: false,
     disabled: false,
     managed: false,
+    nullSkills: false,
     withdrawFailure: false,
     invalidAck: false,
     unsupported: false,
@@ -99,7 +100,11 @@ function sessionSkillServer() {
             break;
           case 'config/read':
             result = {
-              config: state.disabled ? { skills: { config: [{ path: release.codexDefinition, enabled: false }] } } : {},
+              config: state.disabled
+                ? { skills: { config: [{ path: release.codexDefinition, enabled: false }] } }
+                : state.nullSkills
+                  ? { skills: null }
+                  : {},
               origins: {},
               layers: [],
             };
@@ -142,34 +147,42 @@ function sessionSkillServer() {
   return { wire, state, sent, events, release, held };
 }
 
-test('Codex registers process-local roots only after raw admission and attaches the admitted exact definition once', async () => {
-  const h = sessionSkillServer();
-  await h.wire.initialize();
-  const commands = await h.wire.commands();
-  await h.wire.startThread({ cwd: process.cwd() });
-  await h.wire.prompt('$arc-sessions list sessions');
-  const methods = h.sent.map((message) => message.method);
-  assert.deepEqual(methods.slice(0, 10), [
-    'initialize',
-    'initialized',
-    'skills/list',
-    'config/read',
-    'configRequirements/read',
-    'skills/extraRoots/set',
-    'skills/list',
-    'config/read',
-    'configRequirements/read',
-    'thread/start',
-  ]);
-  assert.equal(commands.find((command) => command.name === 'arc-sessions')?.sessionSkillRelease, h.release.contentId);
-  assert.deepEqual(h.sent.find((message) => message.method === 'skills/extraRoots/set').params, {
-    extraRoots: [h.release.codexRoot],
-  });
-  const turns = h.sent.filter((message) => message.method === 'turn/start');
-  assert.equal(turns.length, 1);
-  assert.deepEqual(turns[0].params.input[1], { type: 'skill', name: 'arc-sessions', path: h.release.codexDefinition });
-  h.wire.close('closed');
-});
+test.each([false, true])(
+  'Codex registers its skill and offers completion with nullable skills %s',
+  async (nullSkills) => {
+    const h = sessionSkillServer();
+    h.state.nullSkills = nullSkills;
+    await h.wire.initialize();
+    const commands = await h.wire.commands();
+    await h.wire.startThread({ cwd: process.cwd() });
+    await h.wire.prompt('$arc-sessions list sessions');
+    const methods = h.sent.map((message) => message.method);
+    assert.deepEqual(methods.slice(0, 10), [
+      'initialize',
+      'initialized',
+      'skills/list',
+      'config/read',
+      'configRequirements/read',
+      'skills/extraRoots/set',
+      'skills/list',
+      'config/read',
+      'configRequirements/read',
+      'thread/start',
+    ]);
+    assert.equal(commands.find((command) => command.name === 'arc-sessions')?.sessionSkillRelease, h.release.contentId);
+    assert.deepEqual(h.sent.find((message) => message.method === 'skills/extraRoots/set').params, {
+      extraRoots: [h.release.codexRoot],
+    });
+    const turns = h.sent.filter((message) => message.method === 'turn/start');
+    assert.equal(turns.length, 1);
+    assert.deepEqual(turns[0].params.input[1], {
+      type: 'skill',
+      name: 'arc-sessions',
+      path: h.release.codexDefinition,
+    });
+    h.wire.close('closed');
+  },
+);
 
 test('Codex preserves a pre-existing enabled link to its exact immutable definition without registering roots', async () => {
   const h = sessionSkillServer();
