@@ -37314,6 +37314,111 @@ test('a drawn Claude card redraws with its cache-expiry warning when the session
   assert.equal(restored?.warnings?.length, 1, 'crossing back above $1 did not restore the sign');
 });
 
+// A spend queue drain ends every refresh and every indexed file. It publishes moved turn card costs once, and every
+// reader of a child transcript in that run shares one file check. The next run checks each file again.
+test('one spend update checks each child file once and publishes dispatched costs once', async () => {
+  const { PanelPerformanceCounters } = await import('./performancediagnostics.ts');
+  const { turn, expiry } = cacheExpiryReturnTurn();
+  const directory = tempDir('child-version-run-');
+  const children = ['child-a', 'child-b'].map((sessionId) => {
+    const file = path.join(directory, `${sessionId}.jsonl`);
+    fs.writeFileSync(file, '{}\n');
+    return { parentSessionId: turn.sessionId, sessionId, file, mtimeMs: NOW };
+  });
+  const childSource = {
+    source: 'agent-child-a.jsonl',
+    revision: {},
+    outcome: null,
+    endedAt: NOW - 10 * 60_000,
+    facts: { ...expiry, truncated: false, returns: [] },
+  };
+  let facts: Record<string, unknown> = {};
+  const sent: unknown[] = [];
+  const host = Object.assign(Object.create(PanelProvider.prototype), {
+    live: {},
+    liveActivity: {},
+    turnsByKey: new Map([[turnKey(turn), turn]]),
+    newestBySession: new Map(),
+    sessionNames: new SessionNames(),
+    sessionOutcomes: new Map([
+      [
+        turn.sessionId,
+        {
+          finished: true,
+          error: false,
+          interrupted: false,
+          endedAt: NOW - 60_000,
+          closedChildren: children.map((child) => ({ id: child.sessionId, closedAt: NOW - 60_000 })),
+        },
+      ],
+    ]),
+    claudeChildren: children,
+    claudeChildReferences: [],
+    claudeChildStatWrites: new Map(),
+    exitedSinceKeys: new Map(),
+    sessionRows: [],
+    hosts: [{ webview: {} }],
+    projectSpendHydrated: true,
+    projectSpendWorkspace: 'workspace',
+    projectSpendStorageDir: directory,
+    projectSpendFiles: [],
+    projectSpendQueue: [],
+    projectSpendQueued: new Set(),
+    projectSpendIndexing: false,
+    railPendingAnswers: null,
+    lifetimeFigures: { pendingMoved: () => false },
+    lifetimeFiguresBySession: () => ({ cacheExpiryFacts: facts }),
+    dispatchedTurnCosts: () => ({}),
+    dispatchedCostsForTurn: () => [],
+    folders: () => [],
+    runningSessions: () => new Set(),
+    // The session list reads live children through the same host method as the cards.
+    railStatuses(this: { liveOpenChildren(now: number): Map<string, string[]> }, now: number) {
+      this.liveOpenChildren(now);
+      return { statuses: new Map(), openChildren: new Map() };
+    },
+    themedFor: (cards: unknown[]) => cards,
+    sendToHost: (_host: unknown, message: unknown) => sent.push(message),
+  });
+  host.cards = [{ ...host.renderTurnCard(turn, false, 'Child versions', NOW), kind: 'turn', key: turnKey(turn) }];
+  await Promise.resolve();
+  const update = () => {
+    host.performanceCounters = new PanelPerformanceCounters(1_000, 'window-a');
+    host.queueProjectSpendIndex(new Map(), null, []);
+    return host.performanceCounters.snapshot().work;
+  };
+
+  // The child facts give the drawn card a warning, so the update redraws it and reads live children three times.
+  facts = { [turn.sessionId]: { ...expiry, childSources: [childSource] } };
+  const moved = update();
+  assert.equal(sent.length, 1, 'the moved card was not redrawn');
+  assert.equal(
+    moved.dispatchedCostsPost,
+    1,
+    `one spend update published dispatched costs ${moved.dispatchedCostsPost} times`,
+  );
+  assert.equal(
+    moved.childVersionStat,
+    children.length,
+    `one spend update checked child files ${moved.childVersionStat} times`,
+  );
+
+  // The next run checks each file again, so it sees a replaced child transcript.
+  await Promise.resolve();
+  fs.rmSync(children[0].file);
+  fs.writeFileSync(children[0].file, '{"replaced":true}\n');
+  fs.utimesSync(children[0].file, new Date(NOW + 5_000), new Date(NOW + 5_000));
+  const next = update();
+  assert.equal(next.dispatchedCostsPost, 1);
+  assert.equal(next.childVersionStat, children.length, 'a later run reused the file checks of an earlier run');
+  assert.equal(
+    host.claudeChildStatWrites.get(children[0].file),
+    NOW + 5_000,
+    'the replaced child kept its old write time',
+  );
+  fs.rmSync(directory, { recursive: true, force: true });
+});
+
 test('native child coverage moves an existing warning between drawn parents after source reassignment', () => {
   const { turn: fixtureTurn, expiry } = cacheExpiryReturnTurn();
   const turns = ['first-parent', 'second-parent'].map((sessionId) => ({

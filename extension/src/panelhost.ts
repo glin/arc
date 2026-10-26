@@ -1941,6 +1941,8 @@ export class PanelProvider implements vscode.Disposable {
   private sessionRunWitnesses = new Map<string, SessionRunWitness>();
   // Claude child transcript write times used to determine live child status. Discovery trims unreferenced files.
   private claudeChildStatWrites = new Map<string, number>();
+  // Child transcript versions read in the current synchronous run. A microtask clears it when the run ends.
+  private claudeChildVersionsThisRun: Map<string, string> | null = null;
   private claudeChildWork = new ClaudeChildWorkCache();
   // Live child state used by the last card render. Clock-driven expiry can change it without a file revision.
   private drawnOpenChildren = '';
@@ -11230,9 +11232,9 @@ export class PanelProvider implements vscode.Disposable {
         offer(record.file, spendRecordAgent(record), !spendFileIsClaudeChild(record.file));
       }
     }
+    // This also publishes moved turn card costs, so a drain that queued nothing ends here.
     this.postRailIfSpendPendingMoved();
     if (!this.projectSpendQueue.length && !this.projectSpendIndexing) {
-      this.postDispatchedCostsIfMoved();
       return;
     }
     if (this.projectSpendTick) {
@@ -11475,10 +11477,10 @@ export class PanelProvider implements vscode.Disposable {
       this.projectSpendRailOwed = false;
       if (railOwed) {
         this.postRail(true);
+        this.postDispatchedCostsIfMoved();
       } else {
         this.postRailIfSpendPendingMoved();
       }
-      this.postDispatchedCostsIfMoved();
       this.publishProjectSpendCoverage?.();
       // Publish Project cost, session-list, and card updates without a catalog refresh that would offer sources again.
     }
@@ -14215,10 +14217,21 @@ export class PanelProvider implements vscode.Disposable {
       : '';
   }
 
-  // One child's revision, keeping its write time for `liveOpenChildren`.
+  // One child's revision, keeping its write time for `liveOpenChildren`. Readers in one synchronous run share one
+  // file check, and the next run checks the file again, so replacements and expiry follow the file.
   private claudeChildVersion(file: string): string {
+    const held = this.claudeChildVersionsThisRun?.get(file);
+    if (held !== undefined) return held;
+    if (!this.claudeChildVersionsThisRun) {
+      const run = new Map<string, string>();
+      this.claudeChildVersionsThisRun = run;
+      queueMicrotask(() => {
+        if (this.claudeChildVersionsThisRun === run) this.claudeChildVersionsThisRun = null;
+      });
+    }
     this.performanceCounters?.recordWork('childVersionStat');
     const version = spendFileVersion(file);
+    this.claudeChildVersionsThisRun.set(file, version);
     const at = writeTimeOfVersion(version);
     if (at === null) {
       this.claudeChildStatWrites.delete(file);
