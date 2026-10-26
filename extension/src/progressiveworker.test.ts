@@ -11091,9 +11091,9 @@ test.each(['claude', 'codex'] as const)(
           observed: result as typeof result & { observedBytes: number },
         };
       };
-      // Rows saved without a child head read the head once more.
+      // Rows saved without a child head or dispatched facts read both once more.
       const cold = await run(
-        found.value.referenceEntries.map(([file, { head: _head, ...entry }]) => [file, entry]),
+        found.value.referenceEntries.map(([file, { head: _head, dispatch: _dispatch, ...entry }]) => [file, entry]),
         1,
       );
       assert.equal(cold.charges.readBytes, 0, 'cached relationships charged relationship scan bytes');
@@ -11127,8 +11127,11 @@ test.each(['claude', 'codex'] as const)(
         cold.observed.observedBytes,
         'a relationship read escaped the counters',
       );
-      const warm = await run(cold.entries, 2);
-      assert.equal(warm.observed.observedBytes, cold.observed.observedBytes, 'held relationship facts read again');
+      // A Codex session's first read finds its native child, so the next pass reads it again with the whole tree.
+      const settled = agent === 'codex' ? await run(cold.entries, 2) : cold;
+      assert.equal(settled.charges.dispatchSpendRereads, 1);
+      const warm = await run(settled.entries, 3);
+      assert.equal(warm.observed.observedBytes, settled.observed.observedBytes, 'held relationship facts read again');
       assert.equal(warm.charges.childHeadFiles, 0);
       assert.equal(warm.charges.childHeadBytes, 0);
       assert.equal(warm.charges.dispatchSpendVisits, 1);
