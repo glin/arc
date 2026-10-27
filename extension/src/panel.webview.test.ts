@@ -38656,11 +38656,48 @@ test('row posts and watcher decisions reach the performance counters with their 
   });
   provider.runPendingWatch({ firedAt: 10, firstAt: 4, cause: 'quiet' });
   const decisions = provider.performanceCounters.snapshot().watcherDecisions;
-  assert.deepEqual(decisions, { targeted: 0, broad: 1, broadReasons: { createOrRename: 1 } });
+  assert.deepEqual(decisions, {
+    targeted: 0,
+    broad: 1,
+    broadReasons: { createOrRename: 1 },
+    unknownPathShapes: {},
+    unknownPathExtensions: {},
+  });
   assert.equal(refreshed.length, 1);
   const last = provider.performanceCounters.snapshot().lastWatcherOperation;
   assert.equal(last?.decision, 'broad');
   assert.deepEqual(last?.broadReasons, ['createOrRename']);
+
+  // Appends to a file the last walk saw and left unlisted, and to a new file beside a listed transcript, walk. The
+  // capture names the shape and extension of each such path, and never the path.
+  const project = '/sources/claude/project';
+  Object.assign(provider, {
+    catalog: { folders: 'root', sessions: [{ agent: 'claude', file: `${project}/listed.jsonl`, sessionId: 'listed' }] },
+    sourceEnumerations: {
+      claude: {
+        status: 'complete',
+        root: '/sources/claude',
+        files: [`${project}/listed.jsonl`, `${project}/excluded.jsonl`],
+        uncertain: [],
+      },
+      codex: { status: 'complete', root: '/sources/codex', files: [], uncertain: [] },
+    },
+  });
+  pending.noteFileEvent(project, 'excluded.jsonl', 'change', normalizeFsPath);
+  pending.noteFileEvent(project, 'fresh.jsonl', 'change', normalizeFsPath);
+  provider.runPendingWatch({ firedAt: 20, firstAt: 14, cause: 'quiet' });
+  const snapshot = provider.performanceCounters.snapshot();
+  assert.deepEqual(snapshot.watcherDecisions, {
+    targeted: 0,
+    broad: 2,
+    broadReasons: { createOrRename: 1, unknownPath: 1 },
+    unknownPathShapes: { walkedUnlistedClaude: 1, newBesideClaudeTranscript: 1 },
+    unknownPathExtensions: { '.jsonl': 2 },
+  });
+  assert.ok(
+    !/excluded\.jsonl|fresh\.jsonl|\/sources\//.test(JSON.stringify(snapshot)),
+    'the capture carries a changed path',
+  );
 });
 
 // A refresh that reuses the held catalog does not walk. When it walks anyway, the counter names the cause.

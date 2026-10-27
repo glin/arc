@@ -393,17 +393,87 @@ export function sessionDirectoryOwners(
   };
 }
 
+// Where a path outside the held catalog sits, so a counter can say which files keep the catalog walking.
+// `walkedUnlistedClaude` and `walkedUnlistedCodex`: the last walk saw the file and left it out of the catalog.
+// `newBesideClaudeTranscript`, `newBesideChildTranscript` and `newBesideCodexRollout`: the last walk did not see the
+// file, and its directory holds a listed transcript, child transcript or rollout.
+// `unlistedDirectory`: the file is inside a source root, and its directory holds no listed file.
+// `outsideRoots`: the file is outside every source root.
+// `unclassified`: no walk recorded its files, so nothing above can be told.
+export type UnknownPathShape =
+  | 'walkedUnlistedClaude'
+  | 'walkedUnlistedCodex'
+  | 'newBesideClaudeTranscript'
+  | 'newBesideChildTranscript'
+  | 'newBesideCodexRollout'
+  | 'unlistedDirectory'
+  | 'outsideRoots'
+  | 'unclassified';
+
+// The shape of each path outside the held catalog, from the catalog and the files the last walk enumerated. `normalize`
+// applies the platform's path rules to the catalog, the walk and the path alike.
+export function unknownPathShapes(
+  catalog: readonly { agent: string; file: string; childTranscript?: boolean }[],
+  walked: {
+    claude: { root?: string; files: readonly string[] };
+    codex: { root?: string; files: readonly string[] };
+  } | null,
+  normalize: (file: string) => string,
+): (file: string) => UnknownPathShape {
+  let index: {
+    claude: Set<string>;
+    codex: Set<string>;
+    listed: Map<string, Set<'claude' | 'child' | 'codex'>>;
+    roots: string[];
+  } | null = null;
+  const parent = (file: string) => file.slice(0, Math.max(0, file.lastIndexOf('/')));
+  return (file) => {
+    if (!walked) return 'unclassified';
+    if (!index) {
+      const listed = new Map<string, Set<'claude' | 'child' | 'codex'>>();
+      for (const row of catalog) {
+        const directory = parent(normalize(row.file));
+        const kinds = listed.get(directory) ?? new Set();
+        kinds.add(row.agent === 'codex' ? 'codex' : row.childTranscript === true ? 'child' : 'claude');
+        listed.set(directory, kinds);
+      }
+      index = {
+        claude: new Set(walked.claude.files.map(normalize)),
+        codex: new Set(walked.codex.files.map(normalize)),
+        listed,
+        roots: [walked.claude.root, walked.codex.root].flatMap((root) =>
+          root ? [normalize(root).replace(/\/$/, '')] : [],
+        ),
+      };
+    }
+    const target = normalize(file);
+    if (index.claude.has(target)) return 'walkedUnlistedClaude';
+    if (index.codex.has(target)) return 'walkedUnlistedCodex';
+    const kinds = index.listed.get(parent(target));
+    if (kinds?.has('claude')) return 'newBesideClaudeTranscript';
+    if (kinds?.has('child')) return 'newBesideChildTranscript';
+    if (kinds?.has('codex')) return 'newBesideCodexRollout';
+    return index.roots.some((root) => target.startsWith(`${root}/`)) ? 'unlistedDirectory' : 'outsideRoots';
+  };
+}
+
 // The decision names why it walks, so a counter can say which cause keeps the catalog walking. A path outside the held
 // catalog that a listed session's directory holds, such as a new child transcript, revalidates that session's files
 // instead. The refresh that follows still sends child discovery, which lists a child that its parent records.
-// `ownedPaths` counts those paths.
+// `ownedPaths` counts those paths. `unknownPaths` names the paths that decided `unknownPath`.
 // A created or moved path that no listed session owns walks, and so does a listed path that moved, because a walk is
 // the read that finds additions, removals and replacements.
 export function watcherRefreshDecision(
   batch: WatcherWakeBatch,
   knownPath: (file: string) => boolean,
   ownersOf: (file: string) => string[] | null = () => null,
-): { kind: 'broad' | 'targeted'; changedPaths: string[]; broadReasons: WatcherBroadReason[]; ownedPaths: number } {
+): {
+  kind: 'broad' | 'targeted';
+  changedPaths: string[];
+  broadReasons: WatcherBroadReason[];
+  ownedPaths: number;
+  unknownPaths: string[];
+} {
   const created = new Set(batch.createdPaths);
   const owned = new Map<string, string[] | null>();
   const ownerFiles = (file: string) => {
@@ -422,13 +492,15 @@ export function watcherRefreshDecision(
       changedPaths: [],
       broadReasons: broadReasons.length ? broadReasons : ['unspecified'],
       ownedPaths: 0,
+      unknownPaths: [],
     };
   }
   if (batch.changedPaths.length === 0) {
-    return { kind: 'broad', changedPaths: [], broadReasons: ['noPaths'], ownedPaths: 0 };
+    return { kind: 'broad', changedPaths: [], broadReasons: ['noPaths'], ownedPaths: 0, unknownPaths: [] };
   }
   const broadReasons = new Set<WatcherBroadReason>();
   const changedPaths = new Set<string>();
+  const unknownPaths: string[] = [];
   let ownedPaths = 0;
   for (const file of batch.changedPaths) {
     const owners = ownerFiles(file);
@@ -441,12 +513,13 @@ export function watcherRefreshDecision(
       changedPaths.add(file);
     } else {
       broadReasons.add('unknownPath');
+      unknownPaths.push(file);
     }
   }
   if (broadReasons.size) {
-    return { kind: 'broad', changedPaths: [], broadReasons: [...broadReasons].sort(), ownedPaths: 0 };
+    return { kind: 'broad', changedPaths: [], broadReasons: [...broadReasons].sort(), ownedPaths: 0, unknownPaths };
   }
-  return { kind: 'targeted', changedPaths: [...changedPaths].sort(), broadReasons: [], ownedPaths };
+  return { kind: 'targeted', changedPaths: [...changedPaths].sort(), broadReasons: [], ownedPaths, unknownPaths: [] };
 }
 
 // How long a catalog refresh holds the triggers that wait behind it. After this, the next waiting

@@ -40,10 +40,14 @@ export interface WatcherOperation {
 }
 
 // Decisions since activation. A broad decision with two causes counts under both causes and once as broad.
+// `unknownPathShapes` and `unknownPathExtensions` count each path that decided `unknownPath`, so a decision with two
+// such paths counts twice in each. Neither keeps the path.
 export interface WatcherDecisionCounts {
   targeted: number;
   broad: number;
   broadReasons: Record<string, number>;
+  unknownPathShapes: Record<string, number>;
+  unknownPathExtensions: Record<string, number>;
 }
 
 // Row-carrying posts of one message kind, split by whether the panel received a snapshot or a delta.
@@ -272,7 +276,13 @@ export class PanelPerformanceCounters {
     this.discovery[reply.complete && !reply.continuation ? 'publications' : 'continuations']++;
   }
   private watcherOperationCount = 0;
-  private readonly watcherDecisions: WatcherDecisionCounts = { targeted: 0, broad: 0, broadReasons: {} };
+  private readonly watcherDecisions: WatcherDecisionCounts = {
+    targeted: 0,
+    broad: 0,
+    broadReasons: {},
+    unknownPathShapes: {},
+    unknownPathExtensions: {},
+  };
   private readonly rowPosts = new Map<string, RowPostCounts>();
   private rowsGapCount = 0;
   private readonly work = new Map<string, number>();
@@ -415,11 +425,20 @@ export class PanelPerformanceCounters {
     this.work.set(name, (this.work.get(name) ?? 0) + count);
   }
 
-  recordWatcherOperation(operation: Omit<WatcherOperation, 'id'>): void {
+  // `unknownPaths` holds the shape and extension of each path that decided `unknownPath`.
+  recordWatcherOperation(
+    operation: Omit<WatcherOperation, 'id'>,
+    unknownPaths: readonly { shape: string; extension: string }[] = [],
+  ): void {
     this.watcherOperationCount++;
     this.watcherDecisions[operation.decision]++;
     for (const reason of operation.broadReasons) {
       this.watcherDecisions.broadReasons[reason] = (this.watcherDecisions.broadReasons[reason] ?? 0) + 1;
+    }
+    const { unknownPathShapes: shapes, unknownPathExtensions: extensions } = this.watcherDecisions;
+    for (const { shape, extension } of unknownPaths) {
+      shapes[shape] = (shapes[shape] ?? 0) + 1;
+      extensions[extension] = (extensions[extension] ?? 0) + 1;
     }
     this.lastWatcherOperation = { id: this.watcherOperationCount, ...operation };
     if (this.sink.enabled()) {
@@ -466,6 +485,8 @@ export class PanelPerformanceCounters {
         targeted: this.watcherDecisions.targeted,
         broad: this.watcherDecisions.broad,
         broadReasons: { ...this.watcherDecisions.broadReasons },
+        unknownPathShapes: { ...this.watcherDecisions.unknownPathShapes },
+        unknownPathExtensions: { ...this.watcherDecisions.unknownPathExtensions },
       },
       rowPosts: sortedRecord(this.rowPosts, rowPostSnapshot),
       rowsGapCount: this.rowsGapCount,
@@ -622,6 +643,8 @@ export function projectPerformanceDiagnostics(state: PerformanceDiagnosticState,
         targeted: state.counters.watcherDecisions.targeted,
         broad: state.counters.watcherDecisions.broad,
         broadReasons: { ...state.counters.watcherDecisions.broadReasons },
+        unknownPathShapes: { ...state.counters.watcherDecisions.unknownPathShapes },
+        unknownPathExtensions: { ...state.counters.watcherDecisions.unknownPathExtensions },
       },
       rowPosts: Object.fromEntries(
         Object.entries(state.counters.rowPosts).map(([type, counts]) => [type, rowPostSnapshot(counts)]),

@@ -11,6 +11,7 @@ import {
   RefreshRequest,
   SchedulerClock,
   sessionDirectoryOwners,
+  unknownPathShapes,
   watcherRefreshDecision,
 } from './scheduler.ts';
 
@@ -263,6 +264,7 @@ test('four known watcher files produce one targeted batch with four paths', () =
       changedPaths: batches[0].changedPaths,
       broadReasons: [],
       ownedPaths: 0,
+      unknownPaths: [],
     },
   );
 });
@@ -277,6 +279,7 @@ test('unknown filenames and rename events retain the broad watcher path and name
       changedPaths: [],
       broadReasons: ['missingFilename'],
       ownedPaths: 0,
+      unknownPaths: [],
     },
   );
 
@@ -303,6 +306,7 @@ test('unknown filenames and rename events retain the broad watcher path and name
       changedPaths: [],
       broadReasons: ['noPaths'],
       ownedPaths: 0,
+      unknownPaths: [],
     },
   );
 
@@ -324,7 +328,13 @@ test('live activity with no card names listed transcripts and draws only for a s
   const quiet = listed.take();
   assert.deepEqual(
     watcherRefreshDecision(quiet, () => true),
-    { kind: 'targeted', changedPaths: ['listed-continued.jsonl', 'listed.jsonl'], broadReasons: [], ownedPaths: 0 },
+    {
+      kind: 'targeted',
+      changedPaths: ['listed-continued.jsonl', 'listed.jsonl'],
+      broadReasons: [],
+      ownedPaths: 0,
+      unknownPaths: [],
+    },
     'a session with two listed transcripts did not name both',
   );
   assert.equal(quiet.drawRequired, false);
@@ -346,6 +356,7 @@ test('live activity with no card names listed transcripts and draws only for a s
       changedPaths: [],
       broadReasons: ['activityFallbackNoFile'],
       ownedPaths: 0,
+      unknownPaths: [],
     },
   );
 });
@@ -492,6 +503,7 @@ test('a Windows rename event for a new child transcript under a listed session r
     changedPaths: [parent],
     broadReasons: [],
     ownedPaths: 1,
+    unknownPaths: [],
   });
 
   // A new top-level transcript beside it still walks, and so does a listed transcript that moved.
@@ -507,6 +519,123 @@ test('a Windows rename event for a new child transcript under a listed session r
   stray.noteFileEvent('C:\\elsewhere', 'other.jsonl', 'change', normalize);
   assert.deepEqual(watcherRefreshDecision(stray.take(), known, owners).broadReasons, ['unknownPath']);
 });
+
+// One source layout per platform. The changed paths spell the walked files in another case, so the walked-file shapes
+// depend on each platform's case rules.
+const shapeLayouts = {
+  windows: {
+    normalize: platformPaths.windows.normalize,
+    sep: '\\',
+    claudeRoot: 'C:\\Users\\Greg\\.claude\\projects',
+    codexRoot: 'C:\\Users\\Greg\\.codex\\sessions',
+    project: 'C--Repo',
+    changedClaude: 'c:\\users\\greg\\.claude\\PROJECTS\\c--repo',
+    changedCodex: 'c:\\users\\greg\\.codex\\SESSIONS\\2026\\10\\27',
+    elsewhere: 'D:\\Elsewhere',
+    caseFolded: true,
+  },
+  macos: {
+    normalize: platformPaths.macos.normalize,
+    sep: '/',
+    claudeRoot: '/Users/Greg/.claude/projects',
+    codexRoot: '/Users/Greg/.codex/sessions',
+    project: '-Users-Greg-Repo',
+    changedClaude: '/Users/Greg/.claude/projects/-Users-Greg-Repo',
+    changedCodex: '/Users/Greg/.codex/sessions/2026/10/27',
+    elsewhere: '/Volumes/Elsewhere',
+    caseFolded: false,
+  },
+  linux: {
+    normalize: platformPaths.linux.normalize,
+    sep: '/',
+    claudeRoot: '/home/greg/.claude/projects',
+    codexRoot: '/home/greg/.codex/sessions',
+    project: '-home-greg-Repo',
+    changedClaude: '/home/greg/.claude/projects/-home-greg-Repo',
+    changedCodex: '/home/greg/.codex/sessions/2026/10/27',
+    elsewhere: '/srv/Elsewhere',
+    caseFolded: false,
+  },
+};
+
+// Each shape with the file that produces it. A walked file's name differs in case from the walk's record of it, so
+// only Windows finds it among the walked files, and the other platforms find a new file beside a listed one.
+const shapeCases: {
+  shape: string;
+  directory: 'claude' | 'child' | 'codex' | 'otherProject' | 'elsewhere';
+  name: string;
+  caseSensitive?: string;
+}[] = [
+  {
+    shape: 'walkedUnlistedClaude',
+    directory: 'claude',
+    name: 'EXCLUDED.jsonl',
+    caseSensitive: 'newBesideClaudeTranscript',
+  },
+  {
+    shape: 'walkedUnlistedCodex',
+    directory: 'codex',
+    name: 'ROLLOUT-OTHER.jsonl',
+    caseSensitive: 'newBesideCodexRollout',
+  },
+  { shape: 'newBesideClaudeTranscript', directory: 'claude', name: 'New-Session.jsonl' },
+  { shape: 'newBesideChildTranscript', directory: 'child', name: 'agent-a1.jsonl' },
+  { shape: 'newBesideCodexRollout', directory: 'codex', name: 'rollout-new.jsonl' },
+  { shape: 'unlistedDirectory', directory: 'otherProject', name: 'Other-Session.jsonl' },
+  { shape: 'outsideRoots', directory: 'elsewhere', name: 'Stray.jsonl' },
+];
+
+test.each(
+  Object.entries(shapeLayouts).flatMap(([platform, layout]) =>
+    shapeCases.map((one) => ({
+      platform,
+      layout,
+      ...one,
+      expected: one.caseSensitive && !layout.caseFolded ? one.caseSensitive : one.shape,
+    })),
+  ),
+)(
+  'an unknown path counts as $expected for the $shape fixture on $platform',
+  ({ layout, directory, name, expected }) => {
+    const { normalize, sep, claudeRoot, codexRoot, changedClaude, changedCodex, elsewhere } = layout;
+    const project = `${claudeRoot}${sep}${layout.project}`;
+    const date = `${codexRoot}${sep}2026${sep}10${sep}27`;
+    const orphanChildren = `${project}${sep}Orphan-Session${sep}subagents`;
+    const catalog = [
+      { agent: 'claude', file: `${project}${sep}Listed-Session.jsonl`, sessionId: 'Listed-Session' },
+      { agent: 'claude', file: `${orphanChildren}${sep}agent-a0.jsonl`, sessionId: 'a0', childTranscript: true },
+      { agent: 'codex', file: `${date}${sep}rollout-listed.jsonl`, sessionId: 'listed' },
+    ];
+    const walked = {
+      claude: { root: claudeRoot, files: [catalog[0].file, catalog[1].file, `${project}${sep}Excluded.jsonl`] },
+      codex: { root: codexRoot, files: [catalog[2].file, `${date}${sep}rollout-other.jsonl`] },
+    };
+    const changedDirectory = {
+      claude: changedClaude,
+      child: orphanChildren,
+      codex: changedCodex,
+      otherProject: `${claudeRoot}${sep}Other-Project`,
+      elsewhere,
+    }[directory];
+    const known = new Set(catalog.map((row) => normalize(row.file)));
+    // The batch spells the path as the watcher does on the platform, which `path.join` on the test host cannot.
+    const batch = {
+      ...new PendingWatcherWake().take(),
+      eventCount: 1,
+      changedPaths: [normalize(`${changedDirectory}${sep}${name}`)],
+      reasons: ['transcript' as const],
+    };
+    const decision = watcherRefreshDecision(
+      batch,
+      (file) => known.has(normalize(file)),
+      sessionDirectoryOwners(catalog, normalize),
+    );
+    assert.deepEqual(decision.broadReasons, ['unknownPath']);
+    assert.deepEqual(decision.unknownPaths.map(unknownPathShapes(catalog, walked, normalize)), [expected]);
+    // Before any walk records its files, no shape can be told.
+    assert.deepEqual(decision.unknownPaths.map(unknownPathShapes(catalog, null, normalize)), ['unclassified']);
+  },
+);
 
 // Directory stats keyed by path, with each directory's modification time set by the test.
 function directoryTimes(entries: [string, number | null][]) {

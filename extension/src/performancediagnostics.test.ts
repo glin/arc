@@ -191,7 +191,13 @@ test('performance counters correlate posts and replies for every open panel', ()
       'panel-3': {},
     },
     watcherOperationCount: 2,
-    watcherDecisions: { targeted: 1, broad: 1, broadReasons: { createOrRename: 1, missingFilename: 1 } },
+    watcherDecisions: {
+      targeted: 1,
+      broad: 1,
+      broadReasons: { createOrRename: 1, missingFilename: 1 },
+      unknownPathShapes: {},
+      unknownPathExtensions: {},
+    },
     rowPosts: {
       rail: {
         whole: { count: 2, serializedBytes: 300, maximumSerializedBytes: 300, unavailableByteCount: 1 },
@@ -224,16 +230,22 @@ test('performance counters correlate posts and replies for every open panel', ()
 test('the saved snapshot carries refresh stages, discovery, decisions, row posts and work', () => {
   const counters = new PanelPerformanceCounters(1_000, 'window-a');
   counters.recordRefreshStage('unchanged');
-  counters.recordWatcherOperation({
-    reason: 'transcript',
-    eventCount: 1,
-    distinctPathCount: 1,
-    waitMs: 1,
-    maximumWaitFired: false,
-    decision: 'broad',
-    broadReasons: ['unknownPath'],
-    durationMs: 1,
-  });
+  counters.recordWatcherOperation(
+    {
+      reason: 'transcript',
+      eventCount: 2,
+      distinctPathCount: 2,
+      waitMs: 1,
+      maximumWaitFired: false,
+      decision: 'broad',
+      broadReasons: ['unknownPath'],
+      durationMs: 1,
+    },
+    [
+      { shape: 'walkedUnlistedCodex', extension: '.jsonl' },
+      { shape: 'newBesideClaudeTranscript', extension: '.jsonl' },
+    ],
+  );
   counters.recordRowPost('render', { whole: true, reason: 'globalMoved:scope', rowsHeld: 2, rowsSent: 2 }, 100);
   counters.recordRowsGap();
   counters.recordWork('dispatchedCostsPost', 3);
@@ -248,7 +260,14 @@ test('the saved snapshot carries refresh stages, discovery, decisions, row posts
     abandoned: 0,
   });
   assert.equal((projected.counters.discovery as { continuations: number }).continuations, 0);
-  assert.deepEqual(projected.counters.watcherDecisions, { targeted: 0, broad: 1, broadReasons: { unknownPath: 1 } });
+  // The decision counts once, and each of its two unknown paths counts under its shape and extension.
+  assert.deepEqual(projected.counters.watcherDecisions, {
+    targeted: 0,
+    broad: 1,
+    broadReasons: { unknownPath: 1 },
+    unknownPathShapes: { walkedUnlistedCodex: 1, newBesideClaudeTranscript: 1 },
+    unknownPathExtensions: { '.jsonl': 2 },
+  });
   assert.deepEqual((projected.counters.rowPosts as Record<string, unknown>).render, {
     whole: { count: 1, serializedBytes: 100, maximumSerializedBytes: 100, unavailableByteCount: 0 },
     delta: { count: 0, serializedBytes: 0, maximumSerializedBytes: 0, unavailableByteCount: 0 },

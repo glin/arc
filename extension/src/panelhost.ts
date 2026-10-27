@@ -642,6 +642,7 @@ import {
   ScheduledRun,
   childEventNamesFiles,
   sessionDirectoryOwners,
+  unknownPathShapes,
   watcherRefreshDecision,
   POLL_BACKSTOP_WALK_MS,
   type CatalogWalkTimes,
@@ -3755,19 +3756,27 @@ export class PanelProvider implements vscode.Disposable {
       sessionDirectoryOwners(catalog, normalizeFsPath),
     );
     const reason = batch.reasons.length ? batch.reasons.join('+') : 'watcher';
+    const shapeOf = unknownPathShapes(catalog, this.sourceEnumerations ?? null, normalizeFsPath);
+    const unknownPaths = decision.unknownPaths.map((file) => ({
+      shape: shapeOf(file),
+      extension: path.extname(file).toLowerCase() || 'none',
+    }));
     const started = performance.now();
     if (decision.ownedPaths) this.performanceCounters.recordWork('watcher:sessionDirectory', decision.ownedPaths);
     this.refreshFrom(reason, batch.drawRequired, false, decision.kind === 'targeted' ? decision.changedPaths : null);
-    this.performanceCounters.recordWatcherOperation({
-      reason,
-      eventCount: batch.eventCount,
-      distinctPathCount: batch.changedPaths.length,
-      waitMs: Math.max(0, event.firedAt - event.firstAt),
-      maximumWaitFired: event.cause === 'maximum',
-      decision: decision.kind,
-      broadReasons: decision.broadReasons,
-      durationMs: performance.now() - started,
-    });
+    this.performanceCounters.recordWatcherOperation(
+      {
+        reason,
+        eventCount: batch.eventCount,
+        distinctPathCount: batch.changedPaths.length,
+        waitMs: Math.max(0, event.firedAt - event.firstAt),
+        maximumWaitFired: event.cause === 'maximum',
+        decision: decision.kind,
+        broadReasons: decision.broadReasons,
+        durationMs: performance.now() - started,
+      },
+      unknownPaths,
+    );
   }
 
   // Reveal the existing editor tab, or create and adopt one when none is held.
