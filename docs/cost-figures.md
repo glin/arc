@@ -65,7 +65,7 @@ Uncached input, cache reads, and cache writes are input categories. A request as
 
 `input_tokens` excludes cache reads and writes. Claude Code shortens the labels in its Session block.
 
-Cost details keep the cache facts on one line: `Cached input reads: $3 (94% cached · 8 requests · 200k avg input)`. Turn and session details use the same format. They omit the request facts when the record cannot establish an exact count.
+Cost details keep the cache facts on one line: `Cached input reads: $3 (94% cached · 8 requests · 200k avg input)`. Turn and session details use the same format. They omit the request facts when the record cannot establish an exact count. The cost popover gives each of its sections a fact line instead: `728 requests · 98% cached · 120k average input`. There `cached` is the share of input tokens served from the cache, and the line omits the request count under the same rule.
 
 Repeated input processing can cost more than output when retained context is large.
 
@@ -128,7 +128,7 @@ The warning stays absent until the scope is complete and every required cache-wr
 
 ### Respond to a high wait share
 
-`Waiting on subagents took $0.42, 27% of the main agent's cost` means requests reading wait returns cost at least a fifth of the main agent's estimated cost. A wait return comes from `wait_agent`, `wait`, or `write_stdin`. At least five such requests must cost at least $1 in total. Delegated work does not enter the share. The line gives the wait cost and the share. Hovering the line shows the main-agent cost, the wait count, and the timeout count. The Session list names the share alone. A turn's line reads `this turn's main agent cost` and applies the same numbers to that turn alone. The turn, session heading, and Session list cost figures carry the warning sign.
+`Waiting on subagents took $0.42 · 27% of the main agent's cost` means requests reading wait returns cost at least a fifth of the main agent's estimated cost. A wait return comes from `wait_agent`, `wait`, or `write_stdin`. At least five such requests must cost at least $1 in total. Delegated work does not enter the share. The line gives the wait cost, then the share in a quieter tone. Hovering the line shows the main-agent cost, the wait count, and the timeout count. The Session list names the share alone. A turn's line reads `this turn's main agent cost` and applies the same numbers to that turn alone. The turn, session heading, and Session list cost figures carry the warning sign.
 
 A timed-out wait is a request that brought back no news. [Lower agent costs](lowering-agent-costs.md#wait-without-repeated-model-requests) explains native wait configuration and its limits. A request after a subagent message or completion also carries the parent's reasoning and reply, so the share overstates pure waiting.
 

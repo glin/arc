@@ -190,7 +190,7 @@ test('whole-session cost metadata nests warnings under their owning scopes even 
     entries.some((entry) => entry.warning),
     false,
   );
-  // The tabbed popover draws no child entry, so a delegated warning names the child as its row does.
+  // The tabbed popover names no child, so a delegated warning names its own child.
   const named = sessionCostProjection([
     part({ role: 'main', usage: writeHeavy }),
     part({ role: 'delegated', scopeId: 'child-a', usage: writeHeavy, agentName: 'explorer' }),
@@ -204,8 +204,8 @@ test('whole-session cost metadata nests warnings under their owning scopes even 
     ],
   );
   assert.deepEqual(
-    named.tabs.find((tab) => tab.name === 'Delegated')!.rows.map((row) => row.label),
-    ['explorer', 'Subagent 2'],
+    named.tabs[0].parts[1].rows.map((row) => [row.label, row.count]),
+    [['Sonnet 5', '2 agents']],
   );
 });
 
@@ -394,21 +394,21 @@ test('unpriced or incomplete delegated work keeps the wait-share warning on a pa
     );
     assert.deepEqual(chip.detailList!.entries[0].lines?.[0], { text: sentence, warning: true });
   }
-  // Each Delegated row keeps the state the delegated hero shows: unavailable, or a lower bound.
+  // Each delegated model row keeps the state the Delegated heading shows: unavailable, or a lower bound.
   const rows = (projection: ReturnType<typeof sessionCostProjection>) => {
     const cost = projection.stats[0].detailList!.cost!;
-    const child = cost.tabs.find((tab) => tab.name === 'Delegated')!.rows;
-    return [cost.delegated?.value, ...child.map((row) => [row.value, row.percent, row.share, row.title])];
+    const models = cost.tabs[0].parts[1].rows;
+    return [cost.sections[1]?.value, ...models.map((row) => [row.value, row.percent, row.share, row.title])];
   };
   assert.deepEqual(rows(sessionCostProjection([owner, { ...child, model: 'unknown' }])), [
     'cost unavailable',
-    ['cost unavailable', '', 0, 'Subagent 1, unknown. Cost unavailable.'],
+    ['cost unavailable', '', 0, 'unknown, 1 agent. Cost unavailable.'],
   ]);
   assert.deepEqual(
     rows(
       sessionCostProjection([owner, child], { main: false, delegated: true, delegatedScopeIds: new Set(['child']) }),
     ),
-    ['$2.00+', ['$2.00+', '100%', 1, 'Subagent 1, sonnet-5. At least $2.00, 100% of delegated work.']],
+    ['$2.00+', ['$2.00+', '100%', 1, 'claude-sonnet-5, 1 agent. At least $2.00, 100% of delegated work.']],
   );
 });
 

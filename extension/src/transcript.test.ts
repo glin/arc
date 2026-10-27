@@ -17211,7 +17211,7 @@ test('a Claude turn cost popover draws Tools rows from the results each request 
     ['Usage', 'Tools'],
   );
   assert.deepEqual(
-    cost.tabs[1].rows.map((row) => [row.label, row.percent, row.title.split(', ')[1]]),
+    cost.tabs[1].parts[0].rows.map((row) => [row.label, row.percent, row.title.split(', ')[1]]),
     [
       ['No tool result', '50%', '1 request'],
       ['File read', '25%', '1 request'],

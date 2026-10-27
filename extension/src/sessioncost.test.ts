@@ -6068,7 +6068,7 @@ function panelTools(parts: Parameters<typeof sessionCostProjection>[0]) {
   // Every part is main agent work, so a row's share of the main agent's cost gives its dollars.
   return chip
     .detailList!.cost!.tabs.find((tab) => tab.name === 'Tools')!
-    .rows.map((row) => ({
+    .parts[0].rows.map((row) => ({
       label: row.label,
       percent: row.percent,
       dollars: row.share * Number(chip.dollars),

@@ -23015,7 +23015,7 @@ const FIGURE_SIZES = [
   '.context-columns > span { font-size: var(--t-small) }',
   '.context-categories { font-size: inherit }',
   '.context-included { font-size: var(--t-small) }',
-  '.chippop .poptabs .casktab, .chippop :is(.split ~ div, .included) > .context-included { font-size: inherit }',
+  '.chippop .poptabs .casktab, .chippop .included > .context-included { font-size: inherit }',
   '.context-table thead th { font-size: var(--t-small) }',
 ];
 
@@ -33495,18 +33495,29 @@ test('one rule truncates a commit row subject, and one rule truncates its maker 
   assert.equal(setting('.commitrow .commitmakerlink'), 1, 'a second rule sets how a maker name truncates');
 });
 
-// Every cost row and footnote line ends on the dollars, right-aligned on the head's dollar edge.
-test('the cost popover dollars right-align as the last column of every row', () => {
+// Each tab of the cost popover is one grid. Its sections, their rows and the footnote lines are
+// subgrids of it, so the dollars, bars and percents line up from the Main agent section to the
+// last "Included above" line.
+test('the cost popover lines up every section and footnote line on one grid', () => {
   const css = styleSource.replace(/\/\*[\s\S]*?\*\//g, '');
   // The body of the first top-level rule with exactly this selector.
   const ruleOf = (selector: string) => css.split(`\n${selector} {`)[1]?.split('}')[0];
   const dollars = ruleOf('.chippop .dollars');
   assert.ok(dollars, 'panel.css has no rule for the cost dollars');
   assert.match(dollars, /text-align:\s*right/);
-  for (const list of ['.chippop .context-categories.costrows', '.chippop .context-categories.costrows.subagentrows']) {
-    const rule = ruleOf(list);
-    assert.ok(rule, `panel.css has no rule for ${list}`);
-    assert.match(rule, /grid-template-columns:[^;]* auto;/, `${list} does not end on a column sized to the dollars`);
+  for (const grid of ['.chippop .costgrid', '.chippop .costgrid.nocount']) {
+    assert.match(ruleOf(grid) ?? '', /grid-template-columns:/, `panel.css has no columns for ${grid}`);
+  }
+  const subgrids = [...css.matchAll(/(?:^|\n)([^{}@]+)\{([^}]*)\}/g)]
+    .filter(([, , body]) => /grid-template-columns:\s*subgrid/.test(body))
+    .flatMap(([, selectors]) => selectors.split(',').map((selector) => selector.trim()));
+  for (const part of [
+    '.chippop .costgrid > .costsection',
+    '.chippop .costgrid > .included',
+    '.chippop .costsection > .costrow',
+    '.chippop .costgrid .includedrows li',
+  ]) {
+    assert.ok(subgrids.includes(part), `${part} does not share the cost grid's columns`);
   }
 });
 

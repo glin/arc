@@ -10,6 +10,7 @@ import {
   formatRelative,
   formatTokens,
   formatWhen,
+  friendlyModel,
   shortModel,
 } from './turnformat.ts';
 import { MB, NOW } from './turnfixtures.ts';
@@ -78,6 +79,27 @@ test('the model shows the part that tells two of them apart', () => {
   assert.equal(shortModel('claude-opus-5'), 'opus-5');
   assert.equal(shortModel('claude-haiku-4-5-20251001'), 'haiku-4-5');
   assert.equal(shortModel(null), null);
+});
+
+test('a model reads its family and version, and an unknown model reads its recorded ID', () => {
+  for (const [model, name] of [
+    ['claude-opus-5-5', 'Opus 5.5'],
+    ['claude-opus-5-5-20261001', 'Opus 5.5'],
+    ['claude-opus-5-5[1m]', 'Opus 5.5'],
+    ['claude-sonnet-5', 'Sonnet 5'],
+    ['claude-haiku-4-5-20251001', 'Haiku 4.5'],
+    ['claude-3-5-haiku-20241022', 'Haiku 3.5'],
+    ['gpt-6.1-sol', 'GPT-6.1 Sol'],
+    ['gpt-6-astra', 'GPT-6 Astra'],
+    ['gpt-5.1-codex-max', 'GPT-5.1 Codex Max'],
+    ['gpt-6', 'GPT-6'],
+    ['codex-auto-review', 'codex-auto-review'],
+    ['claude-mystery-1', 'claude-mystery-1'],
+  ] as const) {
+    assert.equal(friendlyModel(model), name, model);
+  }
+  assert.equal(friendlyModel(null), 'Model not recorded');
+  assert.equal(friendlyModel(''), 'Model not recorded');
 });
 
 test('formatWhen names the day only when it is not today, and the year only when it differs', () => {

@@ -16,6 +16,7 @@ import type {
   UsageCounts,
   UsageTools,
   TurnAgent,
+  TurnUsagePart,
   TurnAsk,
   TurnCommit,
   TurnFileChange,
@@ -1638,10 +1639,48 @@ export function cacheWriteWarningPayload(): Record<string, unknown> {
   };
 }
 
+// A delegated session part as a finished subagent of the turn, its usage and tool kinds in one spend part.
+function subagentOf(
+  child: Omit<TurnUsagePart, 'inferenceClass'> & {
+    agent: string;
+    role: 'delegated';
+    agentName: string;
+    scopeId: string;
+    recordedCost?: number;
+    costBasis?: string;
+  },
+): TurnAgent {
+  const { agent: _agent, role: _role, agentName, scopeId, recordedCost, costBasis, ...usagePart } = child;
+  return {
+    id: scopeId,
+    description: agentName,
+    agentType: null,
+    model: child.model,
+    effort: null,
+    spend: [
+      {
+        model: child.model,
+        provider: child.provider,
+        contextWindow: child.contextWindow,
+        ...(recordedCost === undefined ? {} : { recordedCost, costBasis }),
+        usageParts: [{ ...usagePart, inferenceClass: null }],
+        usage: child.usage,
+      },
+    ],
+    spendFound: true,
+    spendPartial: false,
+    durationMs: null,
+    tokens: null,
+    toolUses: null,
+    status: 'completed',
+  };
+}
+
 // A Codex coordinator whose main agent spent over a fifth of its cost reading subagent wait returns.
 // Delegated work keeps the waits under a quarter of the whole session's cost. `five` adds children
 // with recorded costs, so the delegated work holds five model groups, two without a recorded model.
-export function waitWarningPayload(delegated: 'three' | 'five' = 'three'): Record<string, unknown> {
+// `turnAgents` gives the turn the same children as its subagents, so its card has delegated work.
+export function waitWarningPayload(delegated: 'three' | 'five' = 'three', turnAgents = false): Record<string, unknown> {
   const payload = renderPayload();
   const usage = (over: Partial<Turn['usage']>): Turn['usage'] => {
     const counts = {
@@ -1693,6 +1732,23 @@ export function waitWarningPayload(delegated: 'three' | 'five' = 'three'): Recor
     agents: [],
     files: [],
   };
+  // Each child's requests read files, tests, edits and other tool results. The rest read none.
+  const childTools = (share: number) =>
+    fixtureTools(
+      200 * share,
+      (
+        [
+          ['file read', 90, 600_000, 18_000_000, 150_000],
+          ['test or build', 50, 300_000, 9_000_000, 90_000],
+          ['file edit', 40, 250_000, 7_000_000, 80_000],
+          ['other', 20, 150_000, 4_000_000, 40_000],
+        ] as const
+      ).map(([kind, requests, input, cacheRead, output]) => [
+        kind,
+        requests * share,
+        usageShare(usage({ requests, input, cacheRead, output }), share),
+      ]),
+    );
   // Three named children share the delegated work.
   const child = (agentName: string, model: string, session: string, share: number) => ({
     agent: 'codex',
@@ -1702,30 +1758,32 @@ export function waitWarningPayload(delegated: 'three' | 'five' = 'three'): Recor
     ...part,
     model,
     usage: usageShare(usage({ requests: 220, input: 1_400_000, cacheRead: 40_000_000, output: 380_000 }), share),
+    tools: childTools(share),
   });
+  const children = [
+    child('code_review_1_npm_tests_astra', 'gpt-6-astra', '01a1535a-e7c6-7cc3-a9aa-9552803efb51', 0.03),
+    child('code_implement_1_npm_tests_sol', 'gpt-6.1-sol', '01a1503b-b2f2-7be2-a08f-fde25f58b552', 0.55),
+    child('code_fix_1_npm_tests_sol_deadlines', 'gpt-6.1-sol', '01a15289-b637-7f71-bce5-143c96986ad2', 0.42),
+    ...(delegated === 'five'
+      ? (
+          [
+            ['code_audit_1_logs', null, '01a15301-0000-7000-8000-000000000001', 6],
+            ['code_audit_2_logs', null, '01a15301-0000-7000-8000-000000000002', 5],
+            ['code_plan_1_schema_opus', 'claude-opus-5-5', '01a15301-0000-7000-8000-000000000003', 4],
+            ['code_lint_1_haiku', 'claude-haiku-5-5', '01a15301-0000-7000-8000-000000000004', 0.2],
+          ] as const
+        ).map(([name, model, session, recordedCost]) => ({
+          ...child(name, 'gpt-6.1-sol', session, 0.01),
+          model,
+          recordedCost,
+          costBasis: 'list',
+        }))
+      : []),
+  ];
   const stats = {
     s1: [
-      ...sessionCostProjection([
-        { agent: 'codex', role: 'main', ...part, usage: ran, waits, tools },
-        child('code_review_1_npm_tests_astra', 'gpt-6-astra', '01a1535a-e7c6-7cc3-a9aa-9552803efb51', 0.03),
-        child('code_implement_1_npm_tests_sol', 'gpt-6.1-sol', '01a1503b-b2f2-7be2-a08f-fde25f58b552', 0.55),
-        child('code_fix_1_npm_tests_sol_deadlines', 'gpt-6.1-sol', '01a15289-b637-7f71-bce5-143c96986ad2', 0.42),
-        ...(delegated === 'five'
-          ? (
-              [
-                ['code_audit_1_logs', null, '01a15301-0000-7000-8000-000000000001', 6],
-                ['code_audit_2_logs', null, '01a15301-0000-7000-8000-000000000002', 5],
-                ['code_plan_1_schema_opus', 'claude-opus-5-5', '01a15301-0000-7000-8000-000000000003', 4],
-                ['code_lint_1_haiku', 'claude-haiku-5-5', '01a15301-0000-7000-8000-000000000004', 0.2],
-              ] as const
-            ).map(([name, model, session, recordedCost]) => ({
-              ...child(name, 'gpt-6.1-sol', session, 0.01),
-              model,
-              recordedCost,
-              costBasis: 'list',
-            }))
-          : []),
-      ]).stats,
+      ...sessionCostProjection([{ agent: 'codex', role: 'main', ...part, usage: ran, waits, tools }, ...children])
+        .stats,
       ...sessionTurnStats({ turnCount: 1, firstTurnAt: turn.startedAt, lastTurnAt: turn.endedAt, compactionCount: 0 }),
     ],
   };
@@ -1737,7 +1795,12 @@ export function waitWarningPayload(delegated: 'three' | 'five' = 'three'): Recor
     sessions,
     stats,
     views: [],
-    cards: [{ ...toCard(turn, false, NOW), summaryHtml: '<p>Waited on two reviewers.</p>' }],
+    cards: [
+      {
+        ...toCard(turnAgents ? { ...turn, agents: children.map(subagentOf) } : turn, false, NOW),
+        summaryHtml: '<p>Waited on two reviewers.</p>',
+      },
+    ],
     rail: railSessions(sessions, new Map(), new Map(), new Map(), new Set(), 's1', new Set(), new Map(), stats, {}),
   };
 }

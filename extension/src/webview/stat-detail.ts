@@ -70,23 +70,33 @@ const KIND_CLASS: Record<'description' | 'path' | 'muted', string> = {
   muted: 'chippopmuted',
 };
 
-interface CostSideView {
+interface CostRowView {
   label: string;
-  value?: string;
-  model: string;
+  count?: string;
+  percent: string;
+  share: number;
+  value: string;
   title: string;
 }
 
 // The tabbed form of the two cost popovers, as `turncard.ts` builds it.
 export interface CostDetailView {
-  warnings: { text: string; title?: string }[];
-  main: CostSideView;
-  delegated?: CostSideView & { mainShare: number };
-  caption?: { text: string; title: string };
+  warnings: { text: string; quiet?: string; title?: string }[];
+  split?: {
+    main: string;
+    delegated: string;
+    mainShare: number;
+  };
+  sections: {
+    label: string;
+    detail: string;
+    value?: string;
+    title: string;
+    facts?: { text: string; title: string };
+  }[];
   tabs: {
     name: string;
-    base: string;
-    rows: { label: string; detail?: string; percent: string; share: number; value: string; title: string }[];
+    parts: { rows: CostRowView[]; more?: { shown: number; open: string; close: string } }[];
   }[];
   included: { label: string; value: string; title?: string }[];
 }
@@ -262,6 +272,8 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
   let pinned = false;
   // The cost tab the reader chose. It holds while the popover stays pinned. Empty selects the first tab.
   let costTab = '';
+  // Whether the reader opened the delegated models past the third. It holds as the cost tab does.
+  let costMore = false;
   let pointerOnAnchor = false;
   let pointerOnDetail = false;
   let rowsHost: HTMLElement | null = null;
@@ -513,48 +525,43 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
     disclosure.appendChild(list);
     pop.appendChild(disclosure);
   };
-  // The cost form: warnings, the split hero, the caption, the tab strip and every tab's rows, and
-  // the "Included above" footnote. Only the selected tab's rows show. A hover opens on the first
-  // tab, and choosing a tab in a hover pins the popover on that tab.
+  // The cost form: warnings, the split bar, the tab strip, and each tab's panel. A panel holds the
+  // Main agent and Delegated sections and the "Included above" footnote on one grid, so dollars,
+  // bars and percents line up across them. Only the selected tab's panel shows. A hover opens on
+  // the first tab, and choosing a tab or the View more expander in a hover pins the popover.
   const drawCost = (cost: CostDetailView) => {
     for (const warning of cost.warnings) {
       const line = el('p', 'line chippopwarning');
       const sign = el('span', 'statwarningsign', '\u26A0\uFE0E');
       sign.setAttribute('aria-hidden', 'true');
       line.append(sign, warning.text);
+      if (warning.quiet) line.append(el('span', 'chippopscale', ` \u00B7 ${warning.quiet}`));
       if (warning.title) line.title = warning.title;
       pop.appendChild(line);
     }
-    const side = (view: CostSideView, right: boolean) => {
-      const node = el('span', right ? 'splitside right' : 'splitside');
-      node.title = view.title;
-      const label = el('span', 'splitlabel');
-      if (view.value) {
-        label.append(...inlineText([el('span', '', view.label), el('span', 'chippopvalue', view.value)]));
-        node.append(...inlineText([label, el('span', 'splitmodel', view.model)]));
-      } else {
-        label.append(...inlineText([el('span', '', view.label), el('span', 'splitmodel', `\u00B7 ${view.model}`)]));
-        node.append(label);
-      }
-      return node;
-    };
-    const split = el('div', 'split');
-    split.append(side(cost.main, false));
-    if (cost.delegated) {
+    if (cost.split) {
+      // Each side names its section's role, so the bar and the headings share their words.
+      const side = (label: string, percent: string, right: boolean) => {
+        const node = el('span', right ? 'splitside right' : 'splitside');
+        node.append(...inlineText([el('span', '', label), el('span', 'chippopvalue', percent)]));
+        return node;
+      };
+      const split = el('div', 'split');
       const bar = el('div', 'sbbar context-meter splitbar');
       bar.setAttribute('aria-hidden', 'true');
       const main = el('i', 'main');
-      main.style.width = `${cost.delegated.mainShare * 100}%`;
+      main.style.width = `${cost.split.mainShare * 100}%`;
       const delegated = el('i', 'delegated');
-      delegated.style.width = `${(1 - cost.delegated.mainShare) * 100}%`;
+      delegated.style.width = `${(1 - cost.split.mainShare) * 100}%`;
       bar.append(main, delegated);
-      split.append(...inlineText([bar, side(cost.delegated, true)]));
-    }
-    pop.appendChild(split);
-    if (cost.caption) {
-      const caption = el('p', 'caption chippopscale', cost.caption.text);
-      caption.title = cost.caption.title;
-      pop.appendChild(caption);
+      split.append(
+        ...inlineText([
+          side(cost.sections[0]?.label ?? '', cost.split.main, false),
+          bar,
+          side(cost.sections[1]?.label ?? '', cost.split.delegated, true),
+        ]),
+      );
+      pop.appendChild(split);
     }
     const buttons: HTMLButtonElement[] = [];
     const panels: HTMLElement[] = [];
@@ -623,42 +630,100 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
       });
       pop.appendChild(strip);
     }
+    const costRow = (row: CostRowView, counted: boolean) => {
+      const item = el('li', 'costrow');
+      item.title = row.title;
+      const bar = el('div', 'sbbar context-meter');
+      bar.setAttribute('aria-hidden', 'true');
+      const fill = el('i');
+      fill.style.width = `${row.share * 100}%`;
+      bar.append(fill);
+      // Name, agent count, dollars and percent on one line, and the bar under them.
+      item.append(
+        ...inlineText([
+          el('span', 'context-category-label', row.label),
+          ...(counted ? [el('span', 'costcount chippopscale', row.count ?? '')] : []),
+          el('span', 'chippopvalue dollars', row.value),
+          el('span', 'pct', row.percent),
+          bar,
+        ]),
+      );
+      return item;
+    };
     cost.tabs.forEach((tab, at) => {
-      const panel = el('div');
+      // A count column shows only on a tab with a counted row, so a tab without one keeps its columns close.
+      const counted = tab.parts.some((part) => part.rows.some((row) => row.count));
+      const panel = el('div', counted ? 'costgrid' : 'costgrid nocount');
       if (tabbed) {
         panel.id = `${pop.id}costpanel-${at}`;
         panel.setAttribute('role', 'tabpanel');
         panel.setAttribute('aria-labelledby', `${pop.id}costtab-${at}`);
       }
-      panel.append(el('p', 'context-included chippopscale', tab.base));
-      const list = el(
-        'ul',
-        tab.name === 'Delegated' ? 'context-categories costrows subagentrows' : 'context-categories costrows',
-      );
-      list.setAttribute('role', 'list');
-      for (const row of tab.rows) {
-        const item = el('li', 'costrow');
-        item.title = row.title;
-        const label = el('span', 'label');
-        const name = el('span', 'context-category-label', row.label);
-        label.append(...(row.detail ? inlineText([name, el('span', 'detail chippopscale', row.detail)]) : [name]));
-        const bar = el('div', 'sbbar context-meter');
-        bar.setAttribute('aria-hidden', 'true');
-        const fill = el('i');
-        fill.style.width = `${row.share * 100}%`;
-        bar.append(fill);
-        // The dollars close every row, on the head's right edge.
-        item.append(
+      cost.sections.forEach((section, index) => {
+        const part = tab.parts[index] ?? { rows: [] };
+        const list = el('ul', 'context-categories costrows costsection');
+        list.setAttribute('role', 'list');
+        const head = el('li', 'costrow costhead');
+        head.title = section.title;
+        const role = el('span', 'costrole');
+        role.append(
           ...inlineText([
-            label,
-            el('span', 'chippopscale pct', row.percent),
-            bar,
-            el('span', 'chippopvalue dollars', row.value),
+            el('span', '', section.label),
+            ...(section.detail ? [el('span', 'splitmodel', section.detail)] : []),
           ]),
         );
-        list.append(item);
+        head.append(
+          ...inlineText([role, ...(section.value ? [el('span', 'chippopvalue dollars', section.value)] : [])]),
+        );
+        list.append(head);
+        if (section.facts) {
+          const facts = el('li', 'costfacts chippopscale', section.facts.text);
+          facts.title = section.facts.title;
+          list.append(facts);
+        }
+        const rows = part.rows.map((row) => costRow(row, counted));
+        list.append(...rows);
+        const more = part.more;
+        if (more) {
+          const folded = rows.slice(more.shown);
+          const item = el('li', 'costmore');
+          const disclosure = el('details', 'projectspendpricing');
+          const summary = el('summary');
+          // The open state outlives a redraw, so a live update keeps the reader's choice.
+          const show = () => {
+            disclosure.open = costMore;
+            summary.textContent = costMore ? more.close : more.open;
+            for (const row of folded) row.hidden = !costMore;
+          };
+          summary.addEventListener('click', (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            costMore = !costMore;
+            if (!pinned && anchor) pin(anchor);
+            show();
+            if (anchor && !pop.hidden) options.placeFloat(pop, anchor, view.innerHeight - 6);
+          });
+          disclosure.append(summary);
+          item.append(disclosure);
+          list.append(item);
+          show();
+        }
+        panel.append(list);
+      });
+      if (cost.included.length) {
+        const box = el('div', 'included');
+        box.append(el('p', 'context-included chippopscale includedhead', 'Included above'));
+        const list = el('ul', 'includedrows');
+        list.setAttribute('role', 'list');
+        for (const fact of cost.included) {
+          const item = el('li');
+          if (fact.title) item.title = fact.title;
+          item.append(...inlineText([el('span', '', fact.label), el('span', 'dollars', fact.value)]));
+          list.append(item);
+        }
+        box.append(list);
+        panel.append(box);
       }
-      panel.append(list);
       panels.push(panel);
       pop.appendChild(panel);
     });
@@ -669,20 +734,6 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
       ),
       false,
     );
-    if (cost.included.length) {
-      const box = el('div', 'included');
-      box.append(el('p', 'context-included chippopscale includedhead', 'Included above'));
-      const list = el('ul', 'includedrows');
-      list.setAttribute('role', 'list');
-      for (const fact of cost.included) {
-        const item = el('li');
-        if (fact.title) item.title = fact.title;
-        item.append(...inlineText([el('span', '', fact.label), el('span', 'dollars', fact.value)]));
-        list.append(item);
-      }
-      box.append(list);
-      pop.appendChild(box);
-    }
   };
   const drawInto = (value: ResolvedDetailValue, withActions: boolean) => {
     const { detail, detailList: listValue } = value;
@@ -872,6 +923,7 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
       '.context-messages summary',
       '.context-measurement summary',
       '.chippopnotes summary',
+      '.costmore summary',
     ].find((selector) => pop.querySelector(selector) === document.activeElement);
     redrawing = true;
     try {
@@ -908,6 +960,7 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
       contextMeasurementOpen = false;
       contextMessagesOpen = false;
       costTab = '';
+      costMore = false;
     }
     anchor = node;
     // Draw available actions on hover as well as when pinned.
@@ -966,6 +1019,7 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
     anchor = null;
     pinned = false;
     costTab = '';
+    costMore = false;
     focusBack = null;
     drawnPrint = null;
     drawnActions = false;

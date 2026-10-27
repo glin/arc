@@ -4931,7 +4931,7 @@ test('heading read and membership context survive reversals while a comment hold
   }
 });
 
-test('the session cost popover leads with its warning, ends rows on the dollars, shows its tabs on hover, and moves between tabs by arrow key', async (t) => {
+test('the session cost popover leads with its warning, splits into sections, shows its tabs on hover, and moves between tabs by arrow key', async (t) => {
   const browser = await browserOrNone();
   if (!browser) {
     t.skip('Edge or Chrome is required');
@@ -4950,20 +4950,31 @@ test('the session cost popover leads with its warning, ends rows on the dollars,
         lead: Array.from(node.children)
           .slice(0, 3)
           .map((child) => child.className),
-        rowEnds: Array.from(node.querySelectorAll('.costrow')).map((row) => row.lastElementChild?.className),
+        rowEnds: Array.from(node.querySelectorAll('.costrow:not(.costhead)')).map(
+          (row) => row.lastElementChild?.className,
+        ),
+        sections: Array.from(node.querySelectorAll('[role="tabpanel"]')).map((panel) =>
+          Array.from(panel.querySelectorAll('.costhead .costrole')).map((role) => role.textContent),
+        ),
       }));
       assert.deepEqual(shape.lead, ['chippophead', 'line chippopwarning', 'split'], `${width}`);
       assert.ok(shape.rowEnds.length > 0);
-      for (const end of shape.rowEnds) assert.equal(end, 'chippopvalue dollars');
-      // Each tab draws one row per figure: three usage categories, the five merged tool rows, and
-      // one row per named child.
+      // Each row's bar sits under its name, dollars and percent.
+      for (const end of shape.rowEnds) assert.equal(end, 'sbbar context-meter');
+      // Both tabs draw the Main agent and Delegated sections.
+      assert.deepEqual(shape.sections, [
+        ['Main agent GPT-6.1 Sol', 'Delegated 3 agents'],
+        ['Main agent GPT-6.1 Sol', 'Delegated 3 agents'],
+      ]);
+      // Each tab draws one row per figure: three usage categories and two delegated models, then
+      // the five merged main agent tool rows and four delegated tool rows.
       assert.deepEqual(
         await pop.evaluate((node) =>
           Array.from(node.querySelectorAll('[role="tabpanel"]')).map(
-            (panel) => panel.querySelectorAll('.costrow').length,
+            (panel) => panel.querySelectorAll('.costrow:not(.costhead)').length,
           ),
         ),
-        [3, 5, 3],
+        [5, 9],
         `${width}`,
       );
       const selected = () =>
@@ -5003,11 +5014,10 @@ test('the session cost popover leads with its warning, ends rows on the dollars,
       });
       for (const [key, tab] of [
         ['ArrowRight', 'Tools'],
-        ['ArrowRight', 'Delegated'],
         ['ArrowRight', 'Usage'],
-        ['ArrowLeft', 'Delegated'],
+        ['ArrowLeft', 'Tools'],
         ['Home', 'Usage'],
-        ['End', 'Delegated'],
+        ['End', 'Tools'],
       ]) {
         await page.keyboard.press(key);
         const now = await selected();
@@ -5032,9 +5042,9 @@ test('the session cost popover leads with its warning, ends rows on the dollars,
       await pop.waitFor();
       assert.equal((await selected()).tab, 'Usage');
       // A press on a tab while the figure holds focus keeps the popover pinned.
-      await pop.locator('[role="tab"]', { hasText: 'Delegated' }).click();
+      await pop.locator('[role="tab"]', { hasText: 'Tools' }).click();
       assert.equal(await page.locator('.chippop.pinned').count(), 1, 'a press from the figure closed the popover');
-      assert.equal((await selected()).tab, 'Delegated');
+      assert.equal((await selected()).tab, 'Tools');
       await page.keyboard.press('Escape');
       await page.waitForFunction(() => !document.querySelector('.chippop.pinned'));
       // A hover shows the strip on Usage. A press on a tab pins the popover on that tab.
@@ -5099,6 +5109,78 @@ test('the session cost popover leads with its warning, ends rows on the dollars,
       placed.bottom <= placed.inner,
       `the Tools tab ends at ${placed.bottom}px in a ${placed.inner}px viewport`,
     );
+  } finally {
+    await page.close();
+  }
+});
+
+// Past three delegated models the rest wait behind the expander. A press in a hover pins the
+// popover, and the open state holds through an update until the popover closes.
+test('the Delegated section folds models past the third behind the View more expander', async (t) => {
+  const browser = await browserOrNone();
+  if (!browser) {
+    t.skip('Edge or Chrome is required');
+    return;
+  }
+  const page = await browser.newPage();
+  try {
+    await page.setContent(pageHtml());
+    await page.setViewportSize({ width: 1350, height: 900 });
+    const payload = waitWarningPayload('five');
+    await post(page, payload);
+    const figure = page.locator('.sessionstats [data-metric="cost"]');
+    const state = () =>
+      page.evaluate(() => {
+        const pop = document.querySelector<HTMLElement>('.chippop:not([hidden])');
+        const section = pop?.querySelectorAll('.costgrid:not([hidden]) .costsection')[1];
+        return {
+          pinned: Boolean(pop?.classList.contains('pinned')),
+          shown: Array.from(section?.querySelectorAll<HTMLElement>('.costrow:not(.costhead)') ?? [])
+            .filter((row) => !row.hidden)
+            .map((row) => row.querySelector('.context-category-label')?.textContent),
+          summary: section?.querySelector('.costmore summary')?.textContent,
+          open: section?.querySelector('details')?.open,
+        };
+      });
+    await figure.hover();
+    await page.locator('.chippop:not([hidden]) .costmore summary').waitFor();
+    assert.deepEqual(await state(), {
+      pinned: false,
+      shown: ['Model not recorded', 'GPT-6.1 Sol', 'Opus 5.5'],
+      summary: 'View 2 more models',
+      open: false,
+    });
+    await page.locator('.chippop:not([hidden]) .costmore summary').click();
+    const opened = await state();
+    assert.equal(opened.pinned, true, 'a press on the expander in a hover pins the popover');
+    assert.equal(opened.shown.length, 5);
+    assert.deepEqual([opened.summary, opened.open], ['Show fewer models', true]);
+    await post(page, payload);
+    assert.equal((await state()).shown.length, 5, 'an update closed the expander');
+    // A changed payload redraws the popover, and the expander keeps the keyboard focus.
+    await page.locator('.chippop.pinned .costmore summary').focus();
+    const updated = structuredClone(payload) as {
+      stats: Record<string, { metric: string; detailList?: { cost?: { sections: { facts?: { text: string } }[] } } }[]>;
+    };
+    const facts = updated.stats.s1.find((stat) => stat.metric === 'cost')?.detailList?.cost?.sections[1]?.facts;
+    assert.ok(facts, 'the fixture has a Delegated fact line');
+    facts.text = `${facts.text} · updated`;
+    await post(page, updated);
+    await page.waitForFunction(() =>
+      Array.from(document.querySelectorAll('.chippop.pinned .costfacts')).some((line) =>
+        line.textContent?.endsWith('· updated'),
+      ),
+    );
+    assert.equal(
+      await page.evaluate(() => document.activeElement?.matches('.chippop.pinned .costmore summary') ?? false),
+      true,
+      'a redraw took the focus from the expander',
+    );
+    await page.keyboard.press('Escape');
+    await page.waitForFunction(() => !document.querySelector('.chippop.pinned'));
+    await figure.click();
+    await page.locator('.chippop.pinned .costmore summary').waitFor();
+    assert.equal((await state()).summary, 'View 2 more models', 'a new pin opens with the expander closed');
   } finally {
     await page.close();
   }
@@ -5169,8 +5251,8 @@ test('cache-write warnings share cost faces and retain pinned detail through upd
       );
       assert.equal(await first.locator('.statwarningsign').count(), 1);
       assert.equal(
-        await page.locator('#chippop > .caption').textContent(),
-        '594 requests · 3% cached input · 159k average input',
+        await page.locator('#chippop .costgrid:not([hidden]) .costfacts').first().textContent(),
+        '594 requests · 3% cached · 159k average input',
       );
       const overflow = await page.locator('#chippop').evaluate((pop) => pop.scrollWidth - pop.clientWidth);
       assert.ok(overflow <= 1, `warning detail overflows at ${width}px`);

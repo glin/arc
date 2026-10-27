@@ -992,26 +992,24 @@ test('the cost popovers lead with the wait warning, and their Waits rows count t
   };
   const session = payload.stats.s1.find((chip) => chip.metric === 'cost')!;
   const turn = payload.cards[0].chips.find((chip) => chip.metric === 'cost')!;
-  for (const [figure, tabs, of] of [
-    [session, ['Usage', 'Tools', 'Delegated'], "the main agent's cost"],
-    [turn, ['Usage', 'Tools'], 'this turn'],
+  for (const [figure, of] of [
+    [session, "the main agent's cost"],
+    [turn, 'this turn'],
   ] as const) {
     const warning = figure.warnings?.find((held) => held.scope === 'wait') as WaitShareWarning;
     const cost = figure.detailList!.cost!;
-    assert.match(cost.warnings[0].text, /^Waiting on subagents took \$1\.51, 21% of /);
+    // The dollars lead, and the share follows in the quiet tone.
+    assert.equal(cost.warnings[0].text, 'Waiting on subagents took $1.51');
+    assert.match(cost.warnings[0].quiet!, /^21% of /);
     assert.equal(
       cost.warnings[0].title,
       `$1.51 of $7.20 went to ${warning.requests} waits, ${warning.timedOut} of them timed out`,
     );
     assert.deepEqual(
       cost.tabs.map((tab) => tab.name),
-      tabs,
+      ['Usage', 'Tools'],
     );
-    const tools = cost.tabs[1];
-    assert.deepEqual(
-      cost.tabs.map((tab) => tab.base),
-      ['Main agent', 'Main agent, by tool result', ...(tabs.length > 2 ? ['Delegated, by session'] : [])],
-    );
+    const tools = cost.tabs[1].parts[0];
     assert.deepEqual(
       tools.rows.map((row) => [row.label, row.percent]),
       [
@@ -1026,51 +1024,99 @@ test('the cost popovers lead with the wait warning, and their Waits rows count t
     assert.equal(waits.title, `$1.51, ${warning.requests} requests, 21% of ${of} (wait_agent 36, write_stdin 6)`);
     assert.equal(waits.percent, `${Math.round(warning.share * 100)}%`);
     assert.match(tools.rows[2].title, /, 28 requests, 18% of .* \(other 12, git 10, search 6\)$/);
+    assert.deepEqual(cost.sections[0].facts, {
+      text: '160 requests · 97% cached · 193k average input',
+      title:
+        '30,000,000 of 30,900,000 input tokens served from the cache. 193,125 input tokens per request on average.',
+    });
   }
-  // The session hero sets the main agent against delegated work. The turn delegated nothing.
-  const hero = session.detailList!.cost!;
+  // The session splits into the main agent and its delegated work. The turn delegated nothing,
+  // so it has no split bar, no Delegated section and no dollars on its heading.
+  const split = session.detailList!.cost!;
   assert.deepEqual(
-    [hero.main.label, hero.delegated?.label, hero.delegated?.model],
-    ['Main agent', 'Delegated', '2 × sol, 1 × astra'],
-  );
-  assert.equal(turn.detailList!.cost!.delegated, undefined);
-  assert.equal(turn.detailList!.cost!.main.value, undefined);
-  // Each child reads as its agent path, breaking only after an underscore, with its model under it.
-  const children = hero.tabs[2].rows;
-  assert.deepEqual(
-    children.map((row) => [row.label.replaceAll('\u200b', '|'), row.detail]),
+    split.sections.map((section) => [section.label, section.detail]),
     [
-      ['code_|implement_|1_|npm_|tests_|sol', 'gpt-6.1-sol'],
-      ['code_|fix_|1_|npm_|tests_|sol_|deadlines', 'gpt-6.1-sol'],
-      ['code_|review_|1_|npm_|tests_|astra', 'gpt-6-astra'],
+      ['Main agent', 'GPT-6.1 Sol'],
+      ['Delegated', '3 agents'],
     ],
   );
-  assert.match(
-    children[2].title,
-    /^code_review_1_npm_tests_astra, gpt-6-astra, session 01a1535a-e7c6-7cc3-a9aa-9552803efb51\. \$[0-9.]+, \d+% of delegated work\.$/,
+  assert.equal(Number.parseInt(split.split!.main) + Number.parseInt(split.split!.delegated), 100);
+  assert.equal(turn.detailList!.cost!.split, undefined);
+  assert.equal(turn.detailList!.cost!.sections.length, 1);
+  assert.equal(turn.detailList!.cost!.sections[0].value, undefined);
+  // Delegated work reads one row per model, with its agent count in its own column.
+  const models = split.tabs[0].parts[1];
+  assert.deepEqual(
+    models.rows.map((row) => [row.label, row.count]),
+    [
+      ['GPT-6.1 Sol', '2 agents'],
+      ['GPT-6 Astra', '1 agent'],
+    ],
+  );
+  assert.equal(models.more, undefined);
+  assert.match(models.rows[1].title, /^gpt-6-astra, 1 agent\. \$[0-9.]+, \d+% of delegated work\.$/);
+  // Delegated work reads its own tool rows, as shares of delegated work.
+  const delegatedTools = split.tabs[1].parts[1].rows;
+  assert.deepEqual(
+    delegatedTools.map((row) => row.label),
+    ['File read', 'Other tool results', 'Test or build', 'No tool result'],
+  );
+  assert.ok(delegatedTools.every((row) => row.title.includes('% of delegated work')));
+});
+
+// An incomplete priced part marks its model row's dollars as a lower bound, as its section does.
+test('a session Delegated model row with an incomplete part reads its dollars as a lower bound', () => {
+  const main = { ...sonnetPart, model: 'claude-opus-5-5', usage: tokenUsage({ requests: 4, input: 40_000 }) };
+  const child = (scopeId: string, model: string, incomplete: boolean) => ({
+    ...sonnetPart,
+    role: 'delegated' as const,
+    scopeId,
+    model,
+    ...(incomplete ? { incomplete: true } : {}),
+    usage: tokenUsage({ requests: 2, input: 10_000, output: 5_000 }),
+  });
+  const cost = sessionCostProjection([
+    main,
+    child('agent-1', 'claude-sonnet-5-5', true),
+    child('agent-2', 'claude-haiku-5-5', false),
+  ]).stats[0].detailList!.cost!;
+  assert.match(cost.sections[1].value!, /[+]$/);
+  assert.deepEqual(
+    cost.tabs[0].parts[1].rows.map((row) => [row.label, row.value.endsWith('+')]),
+    [
+      ['Sonnet 5.5', true],
+      ['Haiku 5.5', false],
+    ],
   );
 });
 
-// Each delegated model group reads as the last word of its model name that is not a number,
-// most expensive first. Past two groups the line counts the rest, and the title names them all.
-test('the session and turn heroes name the model of each delegated group', () => {
+// Each delegated model reads its reading name, most expensive first, with its agent count.
+// Past three models the rest wait behind the View more expander.
+test('the Delegated section lists one row per model with its agent count', () => {
   const main = { ...sonnetPart, model: 'claude-opus-5-5', usage: tokenUsage({ requests: 4, input: 40_000 }) };
-  const child = (scopeId: string | undefined, model: string, output: number) => ({
+  const child = (scopeId: string | undefined, model: string | null, output: number) => ({
     ...sonnetPart,
     role: 'delegated' as const,
     ...(scopeId ? { scopeId } : {}),
     model,
-    ...(model.startsWith('gpt') ? { agent: 'codex' as const, provider: 'openai' } : {}),
+    ...(model?.startsWith('gpt') ? { agent: 'codex' as const, provider: 'openai' } : {}),
     usage: tokenUsage({ requests: 2, input: 10_000, output }),
   });
-  const hero = (parts: SessionCostUsage[]) => sessionCostProjection(parts).stats[0].detailList!.cost!.delegated!;
-  const sonnets = hero([
+  const delegatedOf = (parts: SessionCostUsage[]) => {
+    const cost = sessionCostProjection(parts).stats[0].detailList!.cost!;
+    return { section: cost.sections[1], part: cost.tabs[0].parts[1] };
+  };
+  const rowsOf = (part: { rows: { label: string; count?: string }[] }) =>
+    part.rows.map((row) => [row.label, row.count ?? '']);
+  // Two snapshots of one model share its row.
+  const sonnets = delegatedOf([
     main,
     child('agent-1', 'claude-sonnet-5-5', 5_000),
     child('agent-2', 'claude-sonnet-5-5-20261001', 6_000),
   ]);
-  assert.equal(sonnets.model, '2 × sonnet');
-  const five = hero([
+  assert.deepEqual(rowsOf(sonnets.part), [['Sonnet 5.5', '2 agents']]);
+  assert.match(sonnets.part.rows[0].title, /^claude-sonnet-5-5, claude-sonnet-5-5-20261001, 2 agents\. /);
+  const six = delegatedOf([
     main,
     child('agent-1', 'claude-sonnet-5-5', 900_000),
     child('agent-2', 'claude-sonnet-5-5', 900_000),
@@ -1079,57 +1125,73 @@ test('the session and turn heroes name the model of each delegated group', () =>
     child('agent-5', 'gpt-6.1-sol', 2_000),
     child('agent-6', 'gpt-6-astra', 3_000),
   ]);
-  assert.equal(five.model, '2 × sonnet, 1 × opus, +3 models');
-  // The per-child model list names every group once.
-  for (const model of ['2 sonnet-5-5 children', '1 opus-5-5 child', '1 haiku-5-5 child', 'sol child', 'astra child']) {
-    assert.ok(five.title.includes(model), `the title leaves out ${model}: ${five.title}`);
-  }
-  assert.doesNotMatch(five.title, / × /, 'the title names the children twice');
-  // A child with two models adds each model's dollars to its own group.
-  const mixed = hero([
+  assert.equal(six.section.detail, '6 agents');
+  assert.match(six.section.title, /, 6 agents, /);
+  assert.deepEqual(rowsOf(six.part).slice(0, 2), [
+    ['Sonnet 5.5', '2 agents'],
+    ['Opus 5.5', '1 agent'],
+  ]);
+  assert.equal(six.part.rows.length, 5);
+  assert.deepEqual(six.part.more, { shown: 3, open: 'View 2 more models', close: 'Show fewer models' });
+  const four = delegatedOf([
+    main,
+    child('agent-1', 'claude-sonnet-5-5', 900_000),
+    child('agent-2', 'claude-opus-5-5', 600_000),
+    child('agent-3', 'claude-haiku-5-5', 1_000),
+    child('agent-4', 'gpt-6.1-sol', 2_000),
+  ]);
+  assert.equal(four.part.more?.open, 'View 1 more model');
+  // A child with two models counts once in each model's row, and once in the heading.
+  const mixed = delegatedOf([
     main,
     child('agent-1', 'claude-sonnet-5-5', 900_000),
     child('agent-1', 'claude-haiku-5-5', 1_000),
     child('agent-2', 'claude-opus-5-5', 200_000),
   ]);
-  assert.equal(mixed.model, '1 × sonnet, 1 × opus, +1 model');
-  // Delegated work without a child scope is no child session of its own.
-  assert.match(five.title, /, 6 child sessions, /);
-  const unscoped = hero([
+  assert.equal(mixed.section.detail, '2 agents');
+  assert.deepEqual(rowsOf(mixed.part), [
+    ['Sonnet 5.5', '1 agent'],
+    ['Opus 5.5', '1 agent'],
+    ['Haiku 5.5', '1 agent'],
+  ]);
+  // Delegated work without a child scope adds dollars to its model's row and no agent.
+  const unscoped = delegatedOf([
     main,
     child('agent-1', 'claude-sonnet-5-5', 5_000),
     child(undefined, 'claude-sonnet-5-5', 5_000),
     child(undefined, 'claude-haiku-5-5', 5_000),
   ]);
-  assert.match(unscoped.title, /, 1 child session and other delegated work, /);
-  assert.equal(unscoped.model, '1 × sonnet, haiku');
-  // A folded line names a group that only unscoped work holds in the title's group list.
-  const folded = hero([
-    main,
-    child('agent-1', 'claude-sonnet-5-5', 900_000),
-    child('agent-2', 'claude-opus-5-5', 200_000),
-    child(undefined, 'claude-haiku-5-5', 1_000),
+  assert.deepEqual(rowsOf(unscoped.part), [
+    ['Sonnet 5.5', '1 agent'],
+    ['Haiku 5.5', ''],
   ]);
-  assert.equal(folded.model, '1 × sonnet, 1 × opus, +1 model');
-  assert.match(folded.title, /\. 1 × sonnet, 1 × opus, haiku\. /);
-  const none = hero([main, child(undefined, 'claude-sonnet-5-5', 5_000)]);
-  assert.match(none.title, /, no child session recorded, /);
-  assert.equal(none.model, 'sonnet');
+  assert.match(unscoped.section.title, /, 1 agent, and other delegated work, /);
+  const none = delegatedOf([main, child(undefined, 'claude-sonnet-5-5', 5_000)]);
+  assert.equal(none.section.detail, '');
+  assert.match(none.section.title, /, no agent recorded, /);
   // Two invocations that resume one child session hold two scopes, and the child counts once.
-  const resumed = hero([
+  const resumed = delegatedOf([
     main,
     { ...child('invocation:c1:S', 'claude-sonnet-5-5', 900_000), linkedSessionId: 'S' },
     { ...child('invocation:c2:S', 'claude-sonnet-5-5', 900_000), linkedSessionId: 'S' },
     child('agent-2', 'claude-opus-5-5', 200_000),
-    child(undefined, 'claude-haiku-5-5', 1_000),
   ]);
-  assert.equal(resumed.model, '1 × sonnet, 1 × opus, +1 model');
-  assert.match(resumed.title, /, 2 child sessions and other delegated work, /);
-  assert.match(resumed.title, /\. 1 × sonnet, 1 × opus, haiku\. 1 sonnet-5-5 child \$[0-9.]+, 1 opus-5-5 child /);
-  // The turn hero ranks its groups by each subagent's price, not by how many children they hold.
+  assert.equal(resumed.section.detail, '2 agents');
+  assert.deepEqual(rowsOf(resumed.part)[0], ['Sonnet 5.5', '1 agent']);
+  // A model without a price reads its recorded ID and no share. A missing model has its own row.
+  const unknown = delegatedOf([
+    main,
+    child('agent-1', 'claude-sonnet-5-5', 5_000),
+    child('agent-2', 'mystery-model-1', 5_000),
+    child('agent-3', null, 5_000),
+  ]);
+  const mystery = unknown.part.rows.find((row) => row.label === 'mystery-model-1')!;
+  assert.deepEqual([mystery.value, mystery.percent, mystery.share], ['cost unavailable', '', 0]);
+  assert.ok(unknown.part.rows.some((row) => row.label === 'Model not recorded'));
+  // The turn ranks its models by each subagent's price, not by how many children they hold.
   const priced = (model: string, recordedCost: number) =>
     agent({ model, spendFound: true, spend: [{ model, recordedCost, costBasis: 'list', usage: tokenUsage({}) }] });
-  const turnHero = toCard(
+  const turnCost = toCard(
     turn({
       model: 'claude-opus-5-5',
       usage: main.usage,
@@ -1144,9 +1206,95 @@ test('the session and turn heroes name the model of each delegated group', () =>
     }),
     false,
     NOW,
-  ).chips.find((chip) => chip.metric === 'cost')!.detailList!.cost!.delegated!;
-  assert.equal(turnHero.model, '1 × opus, 2 × sonnet, +1 model');
-  assert.match(turnHero.title, /, 5 child sessions\. 1 × opus, 2 × sonnet, 2 × haiku$/);
+  ).chips.find((chip) => chip.metric === 'cost')!.detailList!.cost!;
+  assert.equal(turnCost.sections[1].detail, '5 agents');
+  assert.ok(turnCost.split);
+  assert.deepEqual(rowsOf(turnCost.tabs[0].parts[1]), [
+    ['Opus 5.5', '1 agent'],
+    ['Sonnet 5.5', '2 agents'],
+    ['Haiku 5.5', '2 agents'],
+  ]);
+});
+
+// A turn's delegated tool rows read the tool kinds its subagents' usage parts carry, whether the
+// part's dollars come from its usage or from a recorded list cost.
+for (const recorded of [false, true]) {
+  test(`the turn Tools tab lists the delegated tool rows${recorded ? ' when the child recorded its list cost' : ''}`, () => {
+    const main = { ...sonnetPart, model: 'claude-opus-5-5', usage: tokenUsage({ requests: 4, input: 40_000 }) };
+    const read = tokenUsage({ requests: 3, input: 30_000, output: 3_000 });
+    const child = agent({
+      model: 'claude-sonnet-5-5',
+      spendFound: true,
+      spend: [
+        {
+          model: 'claude-sonnet-5-5',
+          ...(recorded ? { recordedCost: 1, costBasis: 'list' } : {}),
+          usage: tokenUsage({ requests: 5, input: 50_000, output: 5_000 }),
+          usageParts: [
+            {
+              ...sonnetPart,
+              usage: tokenUsage({ requests: 5, input: 50_000, output: 5_000 }),
+              tools: { requests: 3, kinds: { 'file read': { requests: 3, usage: read } } },
+            },
+          ],
+        },
+      ],
+    });
+    const cost = toCard(
+      turn({ model: 'claude-opus-5-5', usage: main.usage, usageParts: [main], agents: [child] }),
+      false,
+      NOW,
+    ).chips.find((chip) => chip.metric === 'cost')!.detailList!.cost!;
+    assert.deepEqual(
+      cost.tabs.map((tab) => tab.name),
+      ['Usage', 'Tools'],
+    );
+    assert.deepEqual(cost.tabs[1].parts[0].rows, []);
+    assert.deepEqual(cost.tabs[1].parts[1].rows.map((row) => row.label).sort(), ['File read', 'No tool result']);
+    if (!recorded) {
+      assert.deepEqual(
+        cost.tabs[1].parts[1].rows.map((row) => [row.label, row.percent]),
+        [
+          ['File read', '60%'],
+          ['No tool result', '40%'],
+        ],
+      );
+    }
+    assert.match(cost.sections[1].facts!.text, /^5 requests · /);
+  });
+}
+
+// A subagent that has spent nothing yet still holds a model row, so the model rows count every
+// agent the heading counts, and the heading's dollars read as a lower bound.
+test('the turn Delegated section gives an agent with no spend a cost unavailable row', () => {
+  const main = { model: 'claude-sonnet-5', usage: tokenUsage({ requests: 2, input: 50_000, output: 2000 }) };
+  const spend = [{ model: 'claude-haiku-4-5', usage: tokenUsage({ requests: 1, input: 100_000, output: 1000 }) }];
+  const hero = heroOf(
+    turn({
+      ...main,
+      agents: [
+        agent({ id: 'a1', description: 'Planner', spendFound: true, spend }),
+        agent({ id: 'a2', description: 'Reviewer', model: 'claude-opus-5-5', spend: [] }),
+      ],
+    }),
+  );
+  assert.equal(hero.sections[1].detail, '2 agents');
+  assert.match(hero.sections[1].value!, /[+]$/, 'the Delegated dollars read as exact');
+  assert.match(hero.sections[1].title, /^At least /);
+  assert.deepEqual(
+    hero.tabs[0].parts[1].rows.map((row) => [row.label, row.count]),
+    [
+      ['Haiku 4.5', '1 agent'],
+      ['Opus 5.5', '1 agent'],
+    ],
+  );
+  assert.equal(hero.tabs[0].parts[1].rows[1].value, 'cost unavailable');
+  // Delegated work with no priced dollars keeps its section and drops the split bar.
+  const unpriced = heroOf(
+    turn({ ...main, agents: [agent({ id: 'a2', description: 'Reviewer', model: 'claude-opus-5-5', spend: [] })] }),
+  );
+  assert.equal(unpriced.split, undefined, 'the split bar read Main agent 100%');
+  assert.equal(unpriced.sections[1].label, 'Delegated');
 });
 
 test('wait warning fixture signs the turn and session cost figures under a quarter of the session total', () => {
@@ -6499,7 +6647,7 @@ const heroOf = (turn: Turn, dispatched: DispatchedTurnCost[] = []) =>
   toCard(turn, false, NOW, [], null, false, new Set(), dispatched).chips.find((chip) => chip.metric === 'cost')!
     .detailList!.cost!;
 
-test('the turn hero counts a child once when one turn holds its launch row and its resume row', () => {
+test('the turn Delegated section counts a child once when one turn holds its launch row and its resume row', () => {
   const spend = [
     {
       model: 'claude-haiku-4-5',
@@ -6515,8 +6663,8 @@ test('the turn hero counts a child once when one turn holds its launch row and i
       agent({ id: 'a1', description: 'Planner', spendFound: true, spend: [] }),
     ],
   });
-  assert.match(heroOf(resumed).delegated!.title, /, 1 child session$/);
-  assert.equal(heroOf(resumed).delegated!.model, '1 × haiku', 'the count agrees with the model counts');
+  assert.equal(heroOf(resumed).sections[1].detail, '1 agent');
+  assert.equal(heroOf(resumed).tabs[0].parts[1].rows[0].count, '1 agent', 'the count agrees with the model rows');
   const two = turn({
     ...main,
     agents: [
@@ -6524,25 +6672,28 @@ test('the turn hero counts a child once when one turn holds its launch row and i
       agent({ id: 'a2', description: 'Reviewer', spendFound: true, spend }),
     ],
   });
-  assert.match(heroOf(two).delegated!.title, /, 2 child sessions$/);
+  assert.equal(heroOf(two).sections[1].detail, '2 agents');
 });
 
-test('the turn hero counts a dispatched session once when a row or another share names the same session', () => {
+test('the turn Delegated section counts a dispatched session once when a row or another share names the same session', () => {
   const spend = [{ model: 'claude-haiku-4-5', usage: tokenUsage({ requests: 1, input: 100_000, output: 1000 }) }];
   const main = { model: 'claude-sonnet-5', usage: tokenUsage({ requests: 2, input: 50_000, output: 2000 }) };
   const named = turn({ ...main, agents: [agent({ id: 'child', description: 'Planner', spendFound: true, spend })] });
   const hero = heroOf(named, [dispatchedCost()]);
-  assert.match(hero.delegated!.title, /, 1 child session$/, 'a row and a share of one session read as two');
-  assert.equal(hero.delegated!.model, '1 × haiku');
-  assert.match(heroOf(turn(main), [dispatchedCost(), dispatchedCost()]).delegated!.title, /, 1 child session$/);
-  assert.match(
-    heroOf(named, [dispatchedCost({ sessionId: 'other' })]).delegated!.title,
-    /, 2 child sessions$/,
+  assert.equal(hero.sections[1].detail, '1 agent', 'a row and a share of one session read as two');
+  assert.deepEqual(
+    hero.tabs[0].parts[1].rows.map((row) => [row.label, row.count]),
+    [['Haiku 4.5', '1 agent']],
+  );
+  assert.equal(heroOf(turn(main), [dispatchedCost(), dispatchedCost()]).sections[1].detail, '1 agent');
+  assert.equal(
+    heroOf(named, [dispatchedCost({ sessionId: 'other' })]).sections[1].detail,
+    '2 agents',
     'a share of another session stays a second child',
   );
 });
 
-test('the session hero counts a child session once when two invocations resume it', () => {
+test('the Delegated section counts a child session once when two invocations resume it', () => {
   // A Codex turn that runs `claude -p` and then `claude -p --resume` gives each command its own scope.
   const bucket = (session: string, command: string) =>
     economicRequest({ linkedSessionId: session, linkedInvocationId: `${command}:${session}` });
@@ -6554,13 +6705,13 @@ test('the session hero counts a child session once when two invocations resume i
     });
   const main = sessionCostUsageOf({ bucket: economicRequest(), role: 'main' });
   const delegated = (parts: ReturnType<typeof part>[]) =>
-    sessionCostProjection([main, ...parts]).stats[0].detailList!.cost!.delegated!;
+    sessionCostProjection([main, ...parts]).stats[0].detailList!.cost!;
   const resumed = delegated([part('S', 'c1'), part('S', 'c2'), part('T', 'c3')]);
-  assert.match(resumed.title, /, 2 child sessions, /);
-  assert.equal(resumed.model, '2 × sol', 'the count agrees with the model counts');
+  assert.match(resumed.sections[1].title, /, 2 agents, /);
+  assert.equal(resumed.tabs[0].parts[1].rows[0].count, '2 agents', 'the count agrees with the model counts');
   const distinct = delegated([part('S', 'c1'), part('U', 'c2'), part('T', 'c3')]);
-  assert.match(distinct.title, /, 3 child sessions, /);
-  assert.equal(resumed.value, distinct.value, 'merging scopes changes no dollars');
+  assert.match(distinct.sections[1].title, /, 3 agents, /);
+  assert.equal(resumed.sections[1].value, distinct.sections[1].value, 'merging scopes changes no dollars');
 });
 
 test('a subagent resumed in a later turn shows in both turn cards, each priced by its own requests', () => {
@@ -11872,6 +12023,39 @@ test('a dispatched share adds the session total notes for its compactions and au
   assert.match(
     notes({ ...dispatchedPart(1_000_000), model: 'codex-auto-review', provider: 'openai', inferenceClass: 'global' }),
     /Codex Auto Review uses the OpenAI Codex rate card/,
+  );
+});
+
+// A dispatched session whose own usage settled holds its print row, so the model rows count the
+// row's requests once and sum to the Delegated heading.
+test('the turn Delegated model rows sum to the heading when a dispatched session holds its print row', () => {
+  const t = turn({
+    model: 'claude-sonnet-5',
+    usage: tokenUsage({ requests: 2, input: 50_000, output: 2000 }),
+    agents: [
+      agent({
+        id: 'child',
+        description: 'Claude CLI',
+        agentType: 'claude-cli',
+        spendFound: true,
+        invocationId: 'a',
+        spend: [{ model: 'claude-haiku-4-5', usage: dispatchedPart(500_000).usage }],
+      }),
+    ],
+  });
+  const settled = dispatchedCost({ ownSettledAt: t.startedAt });
+  const cost = costFigure(toCard(t, false, NOW, [], null, false, new Set(), [settled])).detailList!.cost!;
+  const dollars = (value: string) => Number(value.replace(/[$+,]/g, ''));
+  const rows = cost.tabs[0].parts[1].rows;
+  assert.equal(cost.sections[1].detail, '1 agent');
+  assert.deepEqual(
+    rows.map((row) => [row.label, row.count]),
+    [['Haiku 4.5', '1 agent']],
+  );
+  assert.equal(
+    rows.reduce((sum, row) => sum + dollars(row.value), 0),
+    dollars(cost.sections[1].value!),
+    'the print row counted twice',
   );
 });
 

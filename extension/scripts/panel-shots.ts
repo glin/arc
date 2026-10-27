@@ -67,7 +67,7 @@ export interface Shot {
   railFilterPicker?: 'open' | 'closed'; // View menu state before capture.
   escape?: boolean | number; // Number of Escape presses before other actions. `true` presses once.
   click?: string; // Control selector to press.
-  costTab?: 'Tools' | 'Delegated'; // Cost popover tab to select after the click pins it.
+  costTab?: 'Tools'; // Cost popover tab to select after the click pins it.
   costHover?: string; // Cost figure to hover until its unpinned popover opens.
   hover?: string; // Control selector to hover until its hint opens.
   after?: string; // Control selector to press after capture.
@@ -102,6 +102,7 @@ export interface Shot {
   cacheWriteWarning?: boolean;
   costOverheads?: boolean;
   waitWarning?: boolean | 'five'; // `five` gives the delegated work five model groups.
+  waitWarningTurnAgents?: boolean; // The turn holds the delegated children as its subagents.
   composerSkill?: boolean;
   remoteControl?: boolean; // Draw the prompt box of a session whose Remote Control is connected with a link.
   raisedComposer?: boolean;
@@ -149,6 +150,7 @@ const SHOT_LABELS: Record<string, string[]> = {
 const LONG_CARD_HEAD = `#list [data-key="${turnKey(FIXTURE_TURNS[LONG_TURN_INDEX])}"] h3.cardheading button.head`;
 const LONG_CARD_FILES_CHIP = `#list [data-key="${turnKey(FIXTURE_TURNS[LONG_TURN_INDEX])}"] .statchip[data-metric="files"]`;
 const LONG_CARD_AGENTS_CHIP = `#list [data-key="${turnKey(FIXTURE_TURNS[LONG_TURN_INDEX])}"] .statchip[data-metric="agents"]`;
+const LONG_CARD_COST_CHIP = `#list [data-key="${turnKey(FIXTURE_TURNS[LONG_TURN_INDEX])}"] .statchip[data-metric="cost"]`;
 
 export const SHOTS: Shot[] = [
   { name: 'wide', width: 1350 },
@@ -387,6 +389,15 @@ export const SHOTS: Shot[] = [
     openCard: LONG_CARD_HEAD,
     click: LONG_CARD_AGENTS_CHIP,
   },
+  // The long turn's cost popover, with its delegated work, at both widths.
+  ...[1350, 340].map((width) => ({
+    name: `${width === 1350 ? 'wide' : 'narrow'}-long-card-cost`,
+    width,
+    height: width === 1350 ? 1650 : 2650,
+    escape: true,
+    openCard: LONG_CARD_HEAD,
+    click: LONG_CARD_COST_CHIP,
+  })),
   // Capture the long turn after its main agent finishes while two subagents run.
   {
     name: 'wide-long-card-subagents',
@@ -751,19 +762,36 @@ export const SHOTS: Shot[] = [
         waitWarning: true,
         costHover: '.sessionstats [data-metric="cost"]',
       },
-      ...(['Tools', 'Delegated'] as const).map((costTab) => ({
-        name: `${size}-wait-warning-session-${costTab.toLowerCase()}`,
+      {
+        name: `${size}-wait-warning-session-tools`,
         width,
         escape: true,
         waitWarning: true,
         click: '.sessionstats [data-metric="cost"]',
-        costTab,
-      })),
+        costTab: 'Tools' as const,
+      },
       {
         name: `${size}-wait-warning-turn`,
         width,
         escape: true,
         waitWarning: true,
+        click: '.chips [data-metric="cost"]',
+      },
+      {
+        name: `${size}-wait-warning-turn-delegated-tools`,
+        width,
+        escape: true,
+        waitWarning: true,
+        waitWarningTurnAgents: true,
+        click: '.chips [data-metric="cost"]',
+        costTab: 'Tools' as const,
+      },
+      {
+        name: `${size}-wait-warning-turn-five-models`,
+        width,
+        escape: true,
+        waitWarning: 'five' as const,
+        waitWarningTurnAgents: true,
         click: '.chips [data-metric="cost"]',
       },
     ];
@@ -1261,7 +1289,8 @@ export async function shoot(
   }
   if (shot.waitWarning) {
     const delegated = shot.waitWarning === 'five' ? 'five' : 'three';
-    await page.evaluate(`window.postMessage(${JSON.stringify(waitWarningPayload(delegated))}, '*')`);
+    const payload = waitWarningPayload(delegated, shot.waitWarningTurnAgents ?? false);
+    await page.evaluate(`window.postMessage(${JSON.stringify(payload)}, '*')`);
     await page.evaluate(SETTLED);
   }
   if (shot.remoteControl) {
@@ -1390,7 +1419,7 @@ export async function shoot(
   }
   if (shot.costTab) {
     // Select the tab from the keyboard, as a reader moves along the strip.
-    const tabs = ['Usage', 'Tools', 'Delegated'];
+    const tabs = ['Usage', 'Tools'];
     await page.locator('.chippop.pinned .poptabs [aria-selected="true"]').focus({ timeout: 5_000 });
     for (let at = 0; at < tabs.indexOf(shot.costTab); at++) await page.keyboard.press('ArrowRight');
     // Return focus to the pinned figure, where the other cost captures hold it. The tab stays selected.
