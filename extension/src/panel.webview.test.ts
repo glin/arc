@@ -35653,6 +35653,7 @@ function scopeMovedSendProvider(agent: 'claude' | 'codex') {
   Object.assign(provider, {
     authoritativeCatalog: [accepted],
     catalog: { sessions: [accepted] },
+    walkedCatalog: { scope: JSON.stringify(roots), sessions: [accepted] },
     authoritativeCatalogScope: JSON.stringify(previous),
     completeCatalogScope: JSON.stringify(previous),
     coverageRevision: 1,
@@ -35697,16 +35698,23 @@ test.each([
   ['a working directory outside the current roots', 'unavailable'],
   ['a walk that replaced the accepted source', 'loading'],
   ['a walk that no longer lists the accepted source', 'loading'],
+  ['a discovery continuation that put the accepted rows back after a walk replaced the source', 'loading'],
+  ['an added root that no walk has read yet', 'loading'],
 ] as const)('a prompt box send during a scope walk is refused for %s', async (cause, reason) => {
   const { provider, host, session, worktree, accepted, posted, delivered } = scopeMovedSendProvider('codex');
   if (cause === 'a working directory outside the current roots') {
     provider.repositoryScopeRoots = provider.repositoryScopeRoots.filter((root: string) => root !== worktree);
     provider.repositoryScope = { snapshot: () => ({ ready: true, roots: provider.repositoryScopeRoots }) };
-  } else if (cause === 'a walk that replaced the accepted source') {
-    const added = provider.repositoryScopeRoots.at(-1);
-    provider.catalog = { sessions: [{ ...accepted, file: path.join(added, 'copy.jsonl'), ino: 99, cwd: added }] };
+  } else if (cause === 'an added root that no walk has read yet') {
+    // The last walk ran under the previous roots, so a same-ID source under the added root is still unknown.
+    provider.walkedCatalog = { ...provider.walkedCatalog, scope: provider.authoritativeCatalogScope };
+  } else if (cause === 'a walk that no longer lists the accepted source') {
+    provider.walkedCatalog = { ...provider.walkedCatalog, sessions: [] };
   } else {
-    provider.catalog = { sessions: [] };
+    const added = provider.repositoryScopeRoots.at(-1);
+    const replaced = { ...accepted, file: path.join(added, 'copy.jsonl'), ino: 99, cwd: added };
+    provider.walkedCatalog = { ...provider.walkedCatalog, sessions: [replaced] };
+    provider.catalog = { sessions: cause === 'a walk that replaced the accepted source' ? [replaced] : [accepted] };
   }
   const text = 'Refused during the scope walk';
   await provider.acceptSubmission(text, session, 1, session, host, {

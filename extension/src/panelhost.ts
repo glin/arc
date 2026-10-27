@@ -2063,6 +2063,8 @@ export class PanelProvider implements vscode.Disposable {
   private spendSourceRows: readonly SessionFile[] = [];
   // Catalog and folder identity retained for selection refreshes. Filesystem refreshes replace this snapshot.
   private catalog: { folders: string; sessions: SessionFile[] } | null = null;
+  // The rows and roots of the last filesystem walk. Discovery progress can put accepted rows back into `catalog`.
+  private walkedCatalog: { scope: string; sessions: SessionFile[] } | null = null;
   // The existing-session list from the last payload that completed discovery and required
   // metadata. A working catalog can move while that work is still in flight. Local drafts
   // compose with this accepted list, or with no existing rows before the first publication.
@@ -4594,8 +4596,11 @@ export class PanelProvider implements vscode.Disposable {
     const catalog = this.authoritativeCatalog ?? [];
     const matches = catalog.filter((source) => source.sessionId === sessionId);
     if (matches.length !== 1 || !matches[0].cwd || !isInside(matches[0].cwd, this.repositoryScopeRoots)) return false;
-    // Delivery reads its working directory from the latest walk, so that walk must still hold the same source.
-    const walked = (this.catalog?.sessions ?? []).filter((source) => source.sessionId === sessionId);
+    // Delivery reads its working directory from the latest walk, so a walk under the current roots must hold the same
+    // source. Before that walk, a same-ID source under an added root is still unread.
+    const walk = this.walkedCatalog;
+    if (walk?.scope !== JSON.stringify(this.repositoryScopeRoots ?? [])) return false;
+    const walked = walk.sessions.filter((source) => source.sessionId === sessionId);
     if (walked.length !== 1 || sessionCoverageMember(walked[0]) !== sessionCoverageMember(matches[0])) return false;
     return (
       sessionPresence(
@@ -12077,6 +12082,7 @@ export class PanelProvider implements vscode.Disposable {
       };
     }
     this.catalog = { folders: folderPrint, sessions: walkedSessions };
+    this.walkedCatalog = { scope: JSON.stringify(roots), sessions: walkedSessions };
     this.catalogWalked = true;
     this.performanceCounters?.recordWork('catalogWalk');
     return walkedSessions;
