@@ -10146,7 +10146,12 @@ test('an orchestrator parent past the per-file reference limit stays cached acro
     saveDerivedCache(cacheFile, [], first.value.referenceEntries);
     const restored = loadDerivedCache(cacheFile).claudeChildReferences;
     assert.equal(restored.size, 1, 'the derived session cache dropped the orchestrator parent');
-    const again = await restarted.run({ ...request, referenceEntries: [...restored] }, 1, new AbortController().signal);
+    const again = await completeDiscovery(
+      restarted,
+      { ...request, referenceEntries: [...restored] },
+      1,
+      new AbortController().signal,
+    );
     assert.ok(again?.value.kind === 'claude-children');
     assert.equal((again as typeof again & { parentReads: number }).parentReads, 0, 'the restart read the parent again');
     assert.deepEqual(
@@ -11523,7 +11528,7 @@ test('a new worker reuses saved spend facts of unchanged dispatched sessions and
   ];
   write(codexFile, rollout(codexId, 3));
   write(nativeFile, rollout('native', 5, codexId));
-  // Quiet files, so every dispatched session settles in its first read.
+  // Fixed modification times keep the sessions quiet.
   for (const file of [claudeFile, codexFile, nativeFile]) fs.utimesSync(file, 100, 100);
   const session = (file: string, sessionId: string, agent: 'claude' | 'codex') => ({
     file,
@@ -11560,7 +11565,8 @@ test('a new worker reuses saved spend facts of unchanged dispatched sessions and
   });
   // Each activation starts a new worker from the saved store and saves its final rows back.
   const activate = async (generation: number) => {
-    const worker = new ProgressiveWorker(source);
+    // A fixed monotonic clock keeps the Codex traversal inside one spend slice.
+    const worker = new ProgressiveWorker('performance.now = () => 0; Date.now = () => Date.UTC(2026, 0, 2);' + source);
     const spend = { visits: 0, rereads: 0, bytes: 0 };
     try {
       const restored = loadDerivedCache(cache);
