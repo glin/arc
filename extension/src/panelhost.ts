@@ -144,6 +144,7 @@ import {
   linkCandidates,
   agentSpendDependencyKey,
   childSpendVersion,
+  claudeChildFile,
   claudeChildFileFor,
   claudeSubagentMetaReader,
   type ClaudeChildSessionFile,
@@ -10261,6 +10262,15 @@ export class PanelProvider implements vscode.Disposable {
       runningSessionsSince(rows, this.exitedSinceKeys),
       now,
       (file) => (this.claudeChildWork ??= new ClaudeChildWorkCache()).read(file, this.claudeChildVersion(file)),
+      (session, child) => {
+        // A child launched since the last complete discovery has a file at the path its parent names.
+        const parent = (this.catalog?.sessions ?? []).find(
+          (source) => source.agent === 'claude' && source.sessionId === session,
+        );
+        return parent
+          ? (writeTimeOfVersion(this.claudeChildVersion(claudeChildFile(parent, child))) ?? undefined)
+          : undefined;
+      },
     );
   }
 

@@ -32428,6 +32428,127 @@ test('a Claude session raised by its parsed turns before its metadata read draws
   );
 });
 
+// Claude Code records, reduced to the fields Arc reads: a background launch and the reply that ends
+// the turn while the subagent still works. The agent reports idle, and discovery has not listed the
+// child file yet. The child file at the path the parent names supplies the write time.
+test.each([
+  ['written', 'running', 'running', 1, 'subagents'],
+  ['absent', 'open', 'no ending recorded', undefined, 'done'],
+] as const)(
+  'a background Claude subagent of a finished turn whose child file is %s reads %s before discovery lists it',
+  (childFile, state, word, count, rail) => {
+    const file = path.join(tempDir('background-unlisted-'), 'sess.jsonl');
+    const launch = 'toolu_01FsH9U2fNCgy9RcUQUFhENR';
+    fs.writeFileSync(
+      file,
+      [
+        {
+          type: 'user',
+          promptId: 'p1',
+          timestamp: '2026-10-27T04:44:58.757Z',
+          message: { role: 'user', content: [{ type: 'text', text: 'Draw the bars at wide width.' }] },
+        },
+        {
+          type: 'assistant',
+          timestamp: '2026-10-27T04:45:40.378Z',
+          message: {
+            role: 'assistant',
+            id: 'm1',
+            model: 'claude-opus-5-5',
+            stop_reason: 'tool_use',
+            content: [
+              {
+                type: 'tool_use',
+                id: launch,
+                name: 'Agent',
+                input: {
+                  description: 'Fable: narrow-style bars at wide width',
+                  model: 'fable',
+                  run_in_background: true,
+                },
+              },
+            ],
+          },
+        },
+        {
+          type: 'user',
+          timestamp: '2026-10-27T04:45:40.862Z',
+          message: {
+            role: 'user',
+            content: [
+              {
+                tool_use_id: launch,
+                type: 'tool_result',
+                content: [{ type: 'text', text: 'Async agent launched successfully.\nagentId: a588ae0ab383c09c8' }],
+              },
+            ],
+          },
+          toolUseResult: {
+            isAsync: true,
+            status: 'async_launched',
+            agentId: 'a588ae0ab383c09c8',
+            description: 'Fable: narrow-style bars at wide width',
+            resolvedModel: 'claude-fable-5-1',
+          },
+        },
+        {
+          type: 'assistant',
+          timestamp: '2026-10-27T04:45:52.077Z',
+          message: {
+            role: 'assistant',
+            id: 'm2',
+            model: 'claude-opus-5-5',
+            stop_reason: 'end_turn',
+            content: [{ type: 'text', text: 'Fable is drawing the comparison.' }],
+          },
+        },
+      ]
+        .map((record) => JSON.stringify(record))
+        .join('\n') + '\n',
+    );
+    const read = readSession(file, 'Sess');
+    const now = Date.parse('2026-10-27T04:47:52.000Z');
+    if (childFile === 'written') {
+      const child = path.join(path.dirname(file), 'Sess', 'subagents', 'agent-a588ae0ab383c09c8.jsonl');
+      fs.mkdirSync(path.dirname(child), { recursive: true });
+      fs.writeFileSync(child, '{"type":"user","isSidechain":true}\n');
+      fs.utimesSync(child, (now - 5_000) / 1000, (now - 5_000) / 1000);
+    }
+    vi.useFakeTimers();
+    vi.setSystemTime(now);
+    try {
+      const { provider } = liveProviderFixture(livePress({ sessionId: 'Sess' }));
+      Object.assign(provider, {
+        live: {},
+        cache: new Map([[file, { read, revision: { mtimeMs: 10, size: 10 } }]]),
+        titles: new Map([[file, { outcome: readSessionMeta(file, 256 * 1024, 'Sess').outcome }]]),
+        lifetimeRailFacts: () => ({}),
+        catalog: { folders: '', sessions: [{ agent: 'claude', file, sessionId: 'Sess' }] },
+        claudeChildren: [],
+        claudeChildReferences: [],
+        claudeChildStatWrites: new Map(),
+      });
+      const host = provider as unknown as {
+        sessionOutcomes: unknown;
+        outcomesFor(sessions: { sessionId: string; file: string; agent: string }[]): unknown;
+        railStatuses(now: number): { statuses: Map<string, string>; openChildren: Map<string, number> };
+        drawTurnCards(listed: unknown[], titleOf: () => string, now: number, folders: string[]): CardView[];
+      };
+      host.sessionOutcomes = host.outcomesFor([{ sessionId: 'Sess', file, agent: 'claude' }]);
+      const [card] = host.drawTurnCards([...read.turns], () => 'Session', now, []);
+      assert.deepEqual(
+        card.agents?.map((agent) => [agent.description, agent.state, agent.stateWord]),
+        [['Fable: narrow-style bars at wide width', state, word]],
+      );
+      assert.equal(card.chips?.find((chip) => chip.metric === 'agents')?.running, count);
+      const statuses = host.railStatuses(now);
+      assert.deepEqual([statuses.statuses.get('Sess'), statuses.openChildren.get('Sess')], [rail, count]);
+    } finally {
+      vi.useRealTimers();
+    }
+  },
+);
+
 // Preserve a background subagent launched outside the tail window.
 // Session-list and newest-card figures count the same carried subagent.
 test('the host counts a carried subagent on the rail and the newest card alike', () => {

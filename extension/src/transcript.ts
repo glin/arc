@@ -3882,6 +3882,17 @@ export interface ClaudeRelationshipState {
   dispatches: Array<[string, ClaudeDispatchSessionReference[]]>;
 }
 
+// The transcript path Claude Code gives a subagent of this parent. A subagent's own children sit
+// beside it in the same folder.
+export function claudeChildFile(
+  parent: Pick<SessionFile, 'file' | 'sessionId' | 'childTranscript'>,
+  id: string,
+): string {
+  return parent.childTranscript
+    ? path.join(path.dirname(parent.file), `agent-${id}.jsonl`)
+    : path.join(path.dirname(parent.file), parent.sessionId, 'subagents', `agent-${id}.jsonl`);
+}
+
 export function createClaudeRelationshipReducer(
   parent: Pick<SessionFile, 'file' | 'sessionId' | 'childTranscript'>,
   state?: ClaudeRelationshipState,
@@ -4029,9 +4040,7 @@ export function createClaudeRelationshipReducer(
         kind: 'subagent' as const,
         parentSessionId: parent.sessionId,
         sessionId,
-        file: parent.childTranscript
-          ? path.join(path.dirname(parent.file), `agent-${sessionId}.jsonl`)
-          : path.join(path.dirname(parent.file), parent.sessionId, 'subagents', `agent-${sessionId}.jsonl`),
+        file: claudeChildFile(parent, sessionId),
         toolUseIds: [...toolUseIds],
       }));
       references.push(...[...dispatches.values()].flat());

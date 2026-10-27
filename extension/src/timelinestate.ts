@@ -63,6 +63,7 @@ export function outcomesFor(
 }
 
 // Resolve child writes only when an outcome needs them. Dispatched sessions use separate status evidence.
+// A child that discovery has not listed yet takes its write time from `unlistedAt`.
 export function liveTimelineChildren(
   outcomes: ReadonlyMap<string, TurnOutcome | null>,
   children: readonly ClaudeChildSessionFile[],
@@ -71,6 +72,7 @@ export function liveTimelineChildren(
   hostExitedAt: ReadonlyMap<string, number>,
   now: number,
   workAt: (file: string) => number | undefined = () => undefined,
+  unlistedAt: (session: string, child: string) => number | undefined = () => undefined,
 ): Map<string, string[]> {
   let index: Map<string, number> | null = null;
   const writtenAt = (session: string, child: string): number | undefined => {
@@ -79,7 +81,7 @@ export function liveTimelineChildren(
       references.flatMap((reference) => (reference.kind === 'dispatch' ? [] : [reference])),
       statWrites,
     );
-    return index.get(childWriteKey(session, child));
+    return index.get(childWriteKey(session, child)) ?? unlistedAt(session, child);
   };
   let files: Map<string, string> | null = null;
   const childWorkAt = (session: string, child: string): number | undefined => {
