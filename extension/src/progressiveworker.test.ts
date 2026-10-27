@@ -2027,10 +2027,18 @@ test('a Claude child whose root leaves and returns within one epoch keeps its ow
       completed = result.value.checkpoint.completed;
     }
     assert.ok(completed.includes(normalizeFsPath(grandFile)), 'the grandchild never completed');
+    // An unrelated root change keeps the completions and captured cuts of children that stay in the roots.
+    const other = path.join(directory, 'other');
+    const unrelated = await worker.run(request([home, worktree, other]), 2, new AbortController().signal);
+    assert.ok(unrelated?.value.kind === 'claude-children-progress', 'the receipt scan finished before the child left');
+    assert.ok(
+      unrelated.value.checkpoint.completed.includes(normalizeFsPath(grandFile)),
+      'a retained child was released',
+    );
     // The child leaves the roots while the epoch continues, and a pass finishes every remaining Claude source.
-    const away = await worker.run(request([home]), 2, new AbortController().signal);
+    const away = await worker.run(request([home]), 3, new AbortController().signal);
     assert.ok(away?.value.kind === 'claude-children-progress', 'the receipt scan finished while the child was away');
-    const result = await completeDiscovery(worker, request([home, worktree]), 3, new AbortController().signal);
+    const result = await completeDiscovery(worker, request([home, worktree]), 4, new AbortController().signal);
     assert.ok(result?.value.kind === 'claude-children');
     assert.deepEqual(result.value.children.map((child) => child.sessionId).sort(), ['child', 'grand']);
   } finally {

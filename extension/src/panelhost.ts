@@ -10048,7 +10048,7 @@ export class PanelProvider implements vscode.Disposable {
 
   // Cancel catalog refresh and pending triggers. Hiding a host stops polling without calling this cancellation path. A
   // repository scope change keeps a running discovery continuation. It still loses the refresh slot and generation, so its
-  // reply changes no catalog, and any later cancellation aborts it.
+  // reply changes no catalog. Every later cancellation except another scope change aborts it.
   private abandonCatalogRefresh(keepContinuation = false): void {
     this.refreshGeneration++;
     const holder = this.refreshController;

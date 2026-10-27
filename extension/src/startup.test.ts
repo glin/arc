@@ -9908,7 +9908,10 @@ test('a repository scope change leaves a discovery continuation running and send
   let finishPass!: (discovered: boolean) => void;
   provider.prepareClaudeChildren = (_generation: number, signal: AbortSignal) => {
     requests.push({ roots: [...provider.repositoryScopeRoots], signal });
-    return requests.length === 1 ? new Promise<boolean>((resolve) => (finishPass = resolve)) : Promise.resolve(true);
+    if (requests.length === 1) return new Promise<boolean>((resolve) => (finishPass = resolve));
+    // A later request finishes discovery, so the host sends no further continuation.
+    provider.dispatchDiscoveryPending = false;
+    return Promise.resolve(true);
   };
   provider.dispatchDiscoveryPending = true;
   const continuation = provider.continueDiscovery();
@@ -9918,7 +9921,7 @@ test('a repository scope change leaves a discovery continuation running and send
   // Cancelling the request would close the worker's receipt scan, and the next request would read every receipt again.
   assert.equal(requests[0].signal.aborted, false, 'the scope change cancelled the discovery continuation');
   assert.ok(provider.refreshGeneration > generation, 'the continuation kept the current generation');
-  await vi.waitFor(() => assert.ok(requests.length >= 2));
+  await vi.waitFor(() => assert.equal(requests.length, 2));
   assert.deepEqual(requests[1].roots, ['project', 'project/worker']);
   assert.equal(requests[0].signal.aborted, false);
   // A later cancellation, such as a workspace folder change, still reaches the kept continuation.

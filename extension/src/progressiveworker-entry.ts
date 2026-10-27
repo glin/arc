@@ -484,14 +484,13 @@ async function execute(
       const catalog = retained(held.catalog, request.catalog ?? request.parents);
       const kept = new Set(parents.map(sourceKey));
       const parentFiles = new Set(parents.map((row) => normalizeFsPath(row.file)));
-      // Only retained parents keep their completions. Every other source, such as a child whose root left and returns,
-      // checks its completion again, which costs one stat when its entry is unchanged.
-      const keptFiles = new Set(
-        held.parents.filter((row) => kept.has(sourceKey(row))).map((row) => normalizeFsPath(row.file)),
-      );
+      // Removed parents leave the completions. A child keeps its completion and captured cut while it keeps its reference
+      // entry. A child whose entry a pass dropped while its root was away, or a missing file, checks its completion again.
+      const heldParents = new Map(held.parents.map((row) => [normalizeFsPath(row.file), row]));
       const completedFiles = new Set<string>();
       for (const key of held.completed) {
-        if (keptFiles.has(key)) completedFiles.add(key);
+        const parent = heldParents.get(key);
+        if (parent ? kept.has(sourceKey(parent)) : claudeChildReferences.has(key)) completedFiles.add(key);
         else released.push(key);
       }
       const inRoots = (cwd: string | null | undefined) => !!cwd && isInside(cwd, [...request.repositoryRoots]);
