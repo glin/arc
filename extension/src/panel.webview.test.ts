@@ -12392,12 +12392,20 @@ test('Claude child sessions own lifetime figures while project files stay dedupl
 
 test('Claude relationships refresh current and retained parent rows without a parent transcript write', () => {
   const workerEntry = fs.readFileSync(path.join(__dirname, 'progressiveworker-entry.ts'), 'utf8');
+  const selectedSource = fs.readFileSync(path.join(__dirname, 'selectedsource.ts'), 'utf8');
   const claudeKeyAt = layoutIndexOf(
     workerEntry,
-    ': references.filter((child) => child.parentSessionId === session.sessionId)',
+    ': claudeRelationshipKey(session.sessionId, references, claudeChildren)',
   );
   assert.ok(claudeKeyAt > 0, 'the worker cache key omits Claude relationship state');
-  const claudeKey = workerEntry.slice(claudeKeyAt, workerEntry.indexOf('.sort()', claudeKeyAt));
+  sourceMatch(
+    panelHostSource,
+    /\? claudeRelationshipKey\(session\.sessionId, this\.claudeChildReferences, this\.claudeChildren\)/,
+    'the host builds its Claude relationship key apart from the worker, so the two never agree',
+  );
+  const claudeKeyFrom = selectedSource.indexOf('export function claudeRelationshipKey(');
+  assert.ok(claudeKeyFrom >= 0, 'the shared Claude relationship key is missing');
+  const claudeKey = selectedSource.slice(claudeKeyFrom, selectedSource.indexOf('\n}\n', claudeKeyFrom));
   sourceMatch(claudeKey, /toolUseIds/, 'the worker cache key omits the Claude launch ids');
   sourceDoesNotMatch(
     claudeKey,
@@ -12410,7 +12418,7 @@ test('Claude relationships refresh current and retained parent rows without a pa
   );
   assert.ok(codexKeyAt > 0, 'the worker cache key omits Codex subagent state');
   sourceDoesNotMatch(
-    workerEntry.slice(codexKeyAt, layoutIndexOf(workerEntry, ': references.filter(', codexKeyAt)),
+    workerEntry.slice(codexKeyAt, layoutIndexOf(workerEntry, ': claudeRelationshipKey(', codexKeyAt)),
     /spendFileVersion/,
     'a running Codex subagent append makes the selected parent read stale and shows the loading row',
   );

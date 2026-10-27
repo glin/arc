@@ -16650,8 +16650,8 @@ test('Edit releases agent message authority and retained retry preserves the ori
   assert.deepEqual(f.reads, []);
 });
 
-// A Claude session that dispatched another session lists the dispatch among its child references. The panel and the session
-// reader agree on the window's relationships, so the newest turn stops loading after one read and later passes reuse it.
+// A Claude session that dispatched another session lists the dispatch among its child references. The host and the worker
+// agree on the window's relationships, so the newest turn stops loading after one read and later passes reuse it.
 test('a selected session with a dispatched child reads its newest turn once', async () => {
   const directory = tempDir('selected-dispatch-');
   const file = path.join(directory, 'selected.jsonl');
@@ -16691,7 +16691,15 @@ test('a selected session with a dispatched child reads its newest turn once', as
       kinds.push(request.kind);
       return worker.run(request, generation, signal);
     },
-    ['progressiveCurrent', 'progressiveInput', 'structuralKey', 'claudeStructuralKey'],
+    [
+      'progressiveCurrent',
+      'agentFactsCurrent',
+      'progressiveInput',
+      'structuralKey',
+      'claudeStructuralKey',
+      'agentSpendKey',
+      'codexStructuralChildren',
+    ],
   );
   try {
     provider.session = {
@@ -16700,7 +16708,22 @@ test('a selected session with a dispatched child reads its newest turn once', as
       agent: 'claude',
       ...revisionOf(fs.statSync(file, { bigint: true })),
     };
-    provider.claudeChildren = [];
+    // A subagent, its own nested subagent and a resolved child keep their places in the key beside the dispatch.
+    const subagentFile = path.join(directory, 'agent-task.jsonl');
+    fs.writeFileSync(subagentFile, transcript('agent-task', 'check the tests'));
+    provider.claudeChildren = [
+      {
+        file: subagentFile,
+        sessionId: 'agent-task',
+        agent: 'claude',
+        parentSessionId: 'selected',
+        toolUseIds: ['toolu_task'],
+        childTranscript: true,
+        agentRun: true,
+        cwd: directory,
+        ...revisionOf(fs.statSync(subagentFile, { bigint: true })),
+      },
+    ];
     provider.claudeChildReferences = [
       {
         kind: 'dispatch',
@@ -16712,12 +16735,18 @@ test('a selected session with a dispatched child reads its newest turn once', as
         name: null,
         owned: true,
       },
+      { parentSessionId: 'selected', sessionId: 'agent-task', file: subagentFile, toolUseIds: ['toolu_task'] },
+      { parentSessionId: 'agent-task', sessionId: 'agent-nested', file: subagentFile, toolUseIds: ['toolu_nested'] },
     ];
-    provider.agentSpendKey = (session: SessionFile) => provider.cache.get(session.file)?.agentKey ?? '';
+    provider.codexSubagents = [];
     await provider.completeSelectedWindow('selected', 1);
     assert.equal(provider.lastError, null);
     assert.deepEqual(kinds, ['window'], 'the selection did not read its newest turn');
     assert.ok(provider.progressiveCurrent(provider.session), 'the newest turn stayed loading after its window read');
+    assert.ok(
+      provider.agentFactsCurrent(provider.session),
+      'the child figures of the newest turn stayed stale after its read',
+    );
     await provider.completeSelectedWindow('selected', 1);
     assert.deepEqual(kinds, ['window'], 'a later pass read the unchanged newest turn again');
   } finally {

@@ -27,8 +27,8 @@ export function selectedDependencies(
   };
 }
 
-// Key a Claude session's child relationships without file revisions. The host and the session reader build the same key, so a
-// window read stays current until a relationship changes. Dispatched sessions carry their own facts, so they stay out of it.
+// Key a Claude session's child relationships without file revisions. The host and the worker build this one key for a window
+// read and compare it. Dispatched sessions are not part of the key, and a window read never resolves them.
 export function claudeRelationshipKey(
   sessionId: string,
   references: readonly ClaudeChildSessionReference[],
