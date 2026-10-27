@@ -5,7 +5,7 @@ import { canonicalToolPath } from '../../extension/src/toolownership.ts';
 import { mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { test } from 'vitest';
+import { test, vi } from 'vitest';
 import { COMMANDS, checkCommandHelp, findCommand, renderCommandHelp } from '../src/commands.ts';
 import { fileURLToPath } from 'node:url';
 import * as fs from 'node:fs';
@@ -18,9 +18,20 @@ import { validContinuationPath } from '../../extension/src/compactrequest.ts';
 import { bundledTools } from '../../extension/scripts/bundled-tools.mjs';
 import { readSkillPayload, skillTemporaryRoots } from '../src/skillfiles.ts';
 import { operateSkill } from '../src/skills.ts';
+import { shellQuote } from '../src/standalone.ts';
 import { runCollect } from '../src/collect.ts';
 import { SESSION_PAGE_ERRORS } from '../../extension/src/sessionreads.ts';
-import { skillFiles, collectWindow, collectRow, collectPage, collectTurns, collectArgs, cli } from './smoke-fixture.ts';
+import {
+  skillFiles,
+  collectWindow,
+  collectRow,
+  collectPage,
+  collectTurns,
+  collectArgs,
+  cli,
+  expectedVersion,
+  smokeEnv,
+} from './smoke-fixture.ts';
 
 test('collector restart excludes abandoned rows and preserves independent observations', async () => {
   const calls = [];
@@ -1370,6 +1381,84 @@ test.each(['extension', 'bundled', 'npm', 'release'])(
         expectPayloadCopy(join(home, folder, 'skills/arc-sessions'), payload);
     } finally {
       rmSync(root, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  'a detached run started through the editor launcher runs arc from its worker',
+  { tags: ['subprocess'], timeout: 120_000 },
+  async () => {
+    const windows = process.platform === 'win32';
+    if (windows) {
+      const sh = spawnSync('sh', ['-c', 'exit 0'], { encoding: 'utf8' });
+      assert.equal(sh.status, 0, `sh must be on PATH to check the arc launcher on Windows: ${sh.error?.message ?? ''}`);
+    }
+    const root = mkdtempSync(join(realpathSync(tmpdir()), 'arc-detached-launcher-'));
+    try {
+      const { release } = releaseSkillFixture(root);
+      const home = join(root, 'home');
+      const project = join(root, 'project');
+      const bin = join(root, 'bin');
+      for (const directory of [home, project, bin]) mkdirSync(directory);
+      writeFileSync(join(project, 'prompt.md'), 'Run arc.');
+      const record = join(root, 'launcher-results.json');
+      const provider = windows ? join(bin, 'node_modules/@anthropic-ai/claude-code/cli.js') : join(bin, 'provider.cjs');
+      mkdirSync(join(provider, '..'), { recursive: true });
+      writeFileSync(
+        provider,
+        `const { spawnSync } = require('node:child_process');
+const args = process.argv.slice(2);
+const shells = [['sh', ['-c', 'arc --version']]];
+if (process.platform === 'win32') shells.push([process.env.ComSpec || 'cmd.exe', ['/d', '/c', 'arc --version']]);
+const results = shells.map(([command, argv]) => {
+  const run = spawnSync(command, argv, { encoding: 'utf8' });
+  return { command, status: run.status, error: run.error?.message, stdout: run.stdout, stderr: run.stderr };
+});
+require('node:fs').writeFileSync(${JSON.stringify(record)}, JSON.stringify(results));
+const session = args[args.indexOf('--session-id') + 1];
+process.stdout.write(JSON.stringify({ type: 'result', subtype: 'success', session_id: session, result: 'Report', is_error: false }) + '\\n');
+`,
+      );
+      let claude = join(bin, 'claude.cmd');
+      if (windows) writeFileSync(claude, '@exit /b 1\r\n');
+      else {
+        claude = join(bin, 'claude');
+        writeFileSync(claude, `#!/bin/sh\nexec ${shellQuote(process.execPath)} ${shellQuote(provider)} "$@"\n`);
+        fs.chmodSync(claude, 0o755);
+      }
+      const env = { ...smokeEnv };
+      for (const key of Object.keys(env))
+        if (['PATH', 'ARC_WINDOW', 'ARC_EDITOR_EXECUTABLE'].includes(key.toUpperCase())) delete env[key];
+      Object.assign(env, {
+        HOME: home,
+        USERPROFILE: home,
+        ARC_HOME: join(home, '.arc'),
+        CLAUDE_CONFIG_DIR: '',
+        CLAUDE_BIN: claude,
+        ARC_WINDOW: collectWindow,
+        ARC_EDITOR_EXECUTABLE: process.execPath,
+        PATH: join(release, 'launchers') + (windows ? ';' : ':') + (process.env.PATH ?? process.env.Path ?? ''),
+      });
+      const command =
+        'arc run --provider claude --cwd . --model sonnet --effort low --read-only --prompt-file prompt.md --completion wait --json';
+      const launched = spawnSync(
+        windows ? (process.env.ComSpec ?? 'cmd.exe') : '/bin/sh',
+        windows ? ['/d', '/c', command] : ['-c', command],
+        { cwd: project, env, encoding: 'utf8' },
+      );
+      assert.equal(launched.status, 0, launched.stderr || launched.stdout);
+      assert.equal(JSON.parse(launched.stdout).outcome, 'succeeded', launched.stdout);
+      const results = JSON.parse(readFileSync(record, 'utf8'));
+      assert.equal(results.length, windows ? 2 : 1);
+      assert.deepEqual(
+        results.map((result) => [result.status, result.stdout.trim()]),
+        results.map(() => [0, expectedVersion()]),
+        JSON.stringify(results),
+      );
+    } finally {
+      // The detached supervisor can hold its working directory briefly after the run reports its outcome.
+      await vi.waitFor(() => rmSync(root, { recursive: true, force: true }), { timeout: 30_000, interval: 250 });
     }
   },
 );

@@ -1,5 +1,5 @@
 import { ARC_IDENTITY } from './identity';
-import type { ArcCliEnvironment } from './agenthost';
+import { editorExecutableValue, type ArcCliEnvironment } from './agenthost';
 import { execFile } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
@@ -114,7 +114,7 @@ export class TerminalTools {
       this.collection.append(entry.variable, entry.value);
       this.collection.replace(
         `${ARC_IDENTITY.environmentPrefix}EDITOR_EXECUTABLE`,
-        this.platform === 'win32' ? this.editorExecutable.replaceAll('\\', '/') : this.editorExecutable,
+        editorExecutableValue(this.editorExecutable, this.platform),
       );
       this.selected = { admission: identity, directory, commandDirectory };
       this.preparation = undefined;

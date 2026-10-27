@@ -6,8 +6,8 @@
   },
   "cli/test/run.test.ts": {
     "reason": "Standalone workers must retain real output, exit, cancellation, receipt ownership, and recovery across process boundaries. Held readers must preserve one worker and one outcome after recovery. Exhausted replacement retries must retain the worker's terminal observation.",
-    "cases": 108,
-    "matricesSha256": "11e7639222dd2d2c9f9d52aacff50e74b49c1b2b12271fb1e490ba8b3b325c53"
+    "cases": 109,
+    "matricesSha256": "688524795a721276ddeb462cb0075594732cf43f6c84957fb3f6b1568185021f"
   },
   "cli/test/smoke.bundled-a.test.mjs": {
     "reason": "Compiled CLI commands must reach session reads, comments, and saved defaults through an authenticated window channel.",
@@ -25,9 +25,9 @@
     "matricesSha256": "0b1e0e137758ffde2242d78c9dd83f00b397409117da1d500746802dd457ad0a"
   },
   "cli/test/smoke.test.mjs": {
-    "reason": "Installed skill directories must preserve foreign files and ownership across executable command and filesystem boundaries. Bundled commands must update personal copies from every supported artifact layout.",
-    "cases": 38,
-    "matricesSha256": "f27d5f4f83187d51b0252d809c9d2900d69f42ea9bbf52b28285d50fb121d1ce"
+    "reason": "Installed skill directories must preserve foreign files and ownership across executable command and filesystem boundaries. Bundled commands must update personal copies from every supported artifact layout. A detached run started through the editor launcher must run arc from its worker.",
+    "cases": 39,
+    "matricesSha256": "32bbfd6dd3226d2b9770ce4ecc760684ffd8979327dd7eebaa1e3e085adda0fd"
   },
   "cli/test/stream-fixtures.test.mjs": {
     "reason": "The audit executable must print stream mismatches and return a failing process status.",

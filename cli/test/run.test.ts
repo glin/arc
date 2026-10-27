@@ -2478,6 +2478,30 @@ test('standalone defaults stay bound when later callers select different roots a
   assert.equal(parsed.options.cwd, home);
 });
 
+test('standalone children run an editor launcher on their own runtime, never the caller window', () => {
+  const { args } = fixture();
+  const parsed = parseRun(args, { CODEX_BIN: process.execPath });
+  const executables = {
+    win32: ['C:\\Program Files\\Editor\\Editor.exe', 'C:/Program Files/Editor/Editor.exe'],
+    darwin: ['/Applications/Editor.app/Contents/MacOS/Editor', '/Applications/Editor.app/Contents/MacOS/Editor'],
+    linux: ['/opt/editor\\build/editor', '/opt/editor\\build/editor'],
+  } as const;
+  for (const [platform, [executable, expected]] of Object.entries(executables)) {
+    const env = standaloneEnvironment(
+      parsed.options,
+      { Arc_Window: 'caller-window', Arc_Editor_Executable: 'caller-editor' },
+      executable,
+      platform as NodeJS.Platform,
+    );
+    assert.deepEqual(
+      Object.keys(env).filter((key) => ['ARC_WINDOW', 'ARC_EDITOR_EXECUTABLE'].includes(key.toUpperCase())),
+      ['ARC_EDITOR_EXECUTABLE'],
+      platform,
+    );
+    assert.equal(env.ARC_EDITOR_EXECUTABLE, expected, platform);
+  }
+});
+
 test(
   'transient post-start publication retains one original worker, live logs and its final report',
   { tags: ['subprocess'] },

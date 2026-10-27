@@ -24,7 +24,7 @@ import {
   type SessionFile,
 } from '../../extension/src/transcript.ts';
 import { savedDispatchResponse } from '../../extension/src/sessionreads.ts';
-import { LAUNCH_ENV_NAMES, childEnv } from '../../extension/src/agenthost.ts';
+import { LAUNCH_ENV_NAMES, childEnv, editorExecutableValue } from '../../extension/src/agenthost.ts';
 import { shortenTo } from '../../extension/src/domain/text.ts';
 import { enumerateRolloutFilesAsync, openingRecordOf, CODEX_OPENING_BYTES } from '../../extension/src/codex.ts';
 
@@ -90,7 +90,12 @@ export function standaloneContext(
   return context;
 }
 
-export function standaloneEnvironment(options: StandaloneOptions, inherited = process.env): NodeJS.ProcessEnv {
+export function standaloneEnvironment(
+  options: StandaloneOptions,
+  inherited = process.env,
+  executable = process.execPath,
+  platform: NodeJS.Platform = process.platform,
+): NodeJS.ProcessEnv {
   const env = childEnv(inherited, {}, options.provider, options.cwd);
   for (const key of Object.keys(env)) {
     if (LAUNCH_ENV_NAMES.includes(key.toUpperCase()) || (options.env && CONTEXT_KEYS.includes(key.toUpperCase())))
@@ -98,6 +103,9 @@ export function standaloneEnvironment(options: StandaloneOptions, inherited = pr
   }
   for (const [key, value] of Object.entries(options.env ?? {}))
     if (CONTEXT_KEYS.includes(key) && value !== null) env[key] = value;
+  // The launch PATH can hold the editor's arc launcher, which runs ARC_EDITOR_EXECUTABLE.
+  // Children receive the executable of this process for it, never the caller's value.
+  env.ARC_EDITOR_EXECUTABLE = editorExecutableValue(executable, platform);
   return env;
 }
 
@@ -2552,7 +2560,7 @@ export async function waitStandalone(receipts: DispatchReceipts, id: string, dea
   return { launchId: id, state: 'deadline' };
 }
 
-const shellQuote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
+export const shellQuote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
 export function terminalPlan(
   command: string,
   args: string[],

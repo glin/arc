@@ -123,7 +123,7 @@ export function unstartable(command: string, platform: string): string | null {
 // Every case variant is removed, including on Windows.
 // `childEnv` sets `ELECTRON_RUN_AS_NODE` so VS Code's Electron executable can run a package script.
 // Launch variables restore package-specific settings. Claude billing selection overrides attribution for Claude children.
-// The variables that an Arc CLI launch writes for the child it starts. Standalone launches drop every case variant,
+// The variables that an Arc CLI launch writes for the child it starts. Standalone launches drop every inherited case variant,
 // so a standalone worker cannot target the window or compact the session that started it.
 export const LAUNCH_ENV_NAMES: readonly string[] = ['WINDOW', 'EDITOR_EXECUTABLE', 'SESSION_NONCE'].map(
   (name) => ARC_IDENTITY.environmentPrefix + name,
@@ -145,6 +145,11 @@ export interface ArcCliEnvironment {
   windowId: string | null;
   platform?: string;
   sessionToken?: string;
+}
+
+/** Spells an editor executable as Arc's terminal launchers read it: forward slashes on Windows, unchanged elsewhere. */
+export function editorExecutableValue(executable: string, platform: string): string {
+  return platform === 'win32' ? executable.replaceAll('\\', '/') : executable;
 }
 
 export function childEnv(
@@ -187,7 +192,7 @@ export function childEnv(
     for (const key of Object.keys(env)) {
       if (LAUNCH_ENV_NAMES.includes(key.toUpperCase())) delete env[key];
     }
-    env[editorKey] = windows ? cli.editorExecutable.replaceAll('\\', '/') : cli.editorExecutable;
+    env[editorKey] = editorExecutableValue(cli.editorExecutable, platform);
     if (cli.windowId !== null) env[windowKey] = cli.windowId;
     if (cli.sessionToken !== undefined) env[tokenKey] = cli.sessionToken;
   }
