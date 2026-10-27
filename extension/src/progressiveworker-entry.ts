@@ -484,8 +484,8 @@ async function execute(
       const catalog = retained(held.catalog, request.catalog ?? request.parents);
       const kept = new Set(parents.map(sourceKey));
       const parentFiles = new Set(parents.map((row) => normalizeFsPath(row.file)));
-      // Removed parents leave the completions. A child keeps its completion and captured cut while it keeps its reference
-      // entry. A child whose entry a pass dropped while its root was away, or a missing file, checks its completion again.
+      // Removed parents leave the completions. A child with a reference entry keeps its completion and captured cut. A child
+      // that returns without an entry, or a missing file, checks its completion again.
       const heldParents = new Map(held.parents.map((row) => [normalizeFsPath(row.file), row]));
       const completedFiles = new Set<string>();
       for (const key of held.completed) {

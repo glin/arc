@@ -4084,7 +4084,8 @@ export class PanelProvider implements vscode.Disposable {
       for (const sessionId of removed) this.scopeSessionDirectories?.delete(sessionId);
     }
     this.loadingLine.rescope(scope.ready ? JSON.stringify(scope.roots) : null, 'repository scope');
-    // A discovery continuation in flight finishes its pass. The next request continues its epoch under the new roots.
+    // A discovery continuation in flight finishes its request. Unless that request completes the epoch, the next request
+    // continues the epoch under the new roots.
     this.abandonCatalogRefresh(true);
     this.refreshFrom('repository-scope', true);
   }

@@ -218,14 +218,17 @@ async function receiptDiscoveryHost(
   return { host, replies };
 }
 
-// The worker lists the receipt store's launch directories first, reports when it lists the first other entry, and reports each
-// later opening of the store, which starts a receipt scan again from its first entry.
-const launchesFirst = (store: string) =>
-  `const orderFs=require('node:fs'),orderPort=require('node:worker_threads').parentPort,orderOpen=orderFs.opendirSync;let orderOpens=0;orderFs.opendirSync=function(p,...a){const dir=orderOpen.call(this,p,...a);if(String(p)!==${JSON.stringify(store)})return dir;if(++orderOpens>1)orderPort.postMessage({repeatedCoverage:'receipt-store-reopened'});const entries=[];for(let entry;(entry=dir.readSync());)entries.push(entry);const launch=(entry)=>entry.isDirectory()&&!entry.name.endsWith('-1111-2222-3333-444444444444');entries.sort((a,b)=>Number(launch(b))-Number(launch(a)));let reported=false;return{readSync(){const entry=entries.shift()??null;if(!reported&&(!entry||!launch(entry))){reported=true;orderPort.postMessage({repeatedCoverage:'receipt-launches-read'});}return entry;},closeSync(){dir.closeSync();}};};`;
+// The worker lists the receipt store's launch directories first, or last when asked, and reports when it has listed every
+// launch directory. It also reports each later opening of the store, which starts a receipt scan again from its first entry.
+const launchesFirst = (store: string, last = false) =>
+  `const orderFs=require('node:fs'),orderPort=require('node:worker_threads').parentPort,orderOpen=orderFs.opendirSync;let orderOpens=0;orderFs.opendirSync=function(p,...a){const dir=orderOpen.call(this,p,...a);if(String(p)!==${JSON.stringify(store)})return dir;orderPort.postMessage({repeatedCoverage:++orderOpens>1?'receipt-store-reopened':'receipt-store-opened'});const entries=[];for(let entry;(entry=dir.readSync());)entries.push(entry);const launch=(entry)=>entry.isDirectory()&&!entry.name.endsWith('-1111-2222-3333-444444444444');entries.sort((a,b)=>${last ? 1 : -1}*(Number(launch(a))-Number(launch(b))));let seen=0;const launches=entries.filter(launch).length;let reported=false;return{readSync(){const entry=entries.shift()??null;if(entry&&launch(entry))seen++;if(!reported&&(!entry||seen===launches&&(${last}||!launch(entry)))){reported=true;orderPort.postMessage({repeatedCoverage:'receipt-launches-read'});}return entry;},closeSync(){dir.closeSync();}};};`;
 
-test.each(['added', 'removed', 'requester removed'] as const)(
-  'receipt discovery completes while repository roots change after its launches are read, with a session %s',
-  async (change) => {
+test.each(['added', 'removed', 'requester removed', 'added before the launches are read'] as const)(
+  'receipt discovery completes while repository roots change, with a session %s',
+  async (variant) => {
+    // The early variant changes the roots before the scan lists any launch, so each launch looks up the new catalog.
+    const early = variant === 'added before the launches are read';
+    const change = early ? 'added' : variant;
     for (const throughHost of [true, false]) {
       const root = tempDir('receipt-worker-roots-');
       const fx = receiptDispatchFixture(root, 'claude', 'codex');
@@ -250,14 +253,16 @@ test.each(['added', 'removed', 'requester removed'] as const)(
         'requester removed': [[fx.grandchild.sessionId, fx.child.sessionId]],
       }[change];
       let launchesRead = false;
+      let storeOpened = false;
       let reopened = 0;
       // A frozen clock ends every pass on its step and byte allowances, so each run reads the store in the same passes.
       const worker = new ProgressiveWorker(
         `process.env.ARC_HOME=${JSON.stringify(fx.home)};performance.now=()=>0;` +
-          launchesFirst(fx.receipts.root) +
+          launchesFirst(fx.receipts.root, early) +
           source,
         undefined,
         (file) => {
+          if (file === 'receipt-store-opened') storeOpened = true;
           if (file === 'receipt-launches-read') launchesRead = true;
           if (file === 'receipt-store-reopened') reopened++;
         },
@@ -291,7 +296,10 @@ test.each(['added', 'removed', 'requester removed'] as const)(
             );
           assert.ok(result);
           if (result.value.kind === 'claude-children' && !discovery?.host.dispatchDiscoveryPending) completed = result;
-          else if (launchesRead) changed = true;
+          else if (early ? storeOpened && !changed : launchesRead) {
+            assert.equal(launchesRead, !early, 'The roots changed after the wrong part of the receipt scan');
+            changed = true;
+          }
         }
         assert.ok(completed?.value.kind === 'claude-children', 'Receipt discovery never completed while roots changed');
         assert.ok(changed, 'Receipt discovery completed before the roots changed');
@@ -2038,6 +2046,11 @@ test('a Claude child whose root leaves and returns within one epoch keeps its ow
     // The child leaves the roots while the epoch continues, and a pass finishes every remaining Claude source.
     const away = await worker.run(request([home]), 3, new AbortController().signal);
     assert.ok(away?.value.kind === 'claude-children-progress', 'the receipt scan finished while the child was away');
+    // A child outside the roots leaves the walk, so the pass drops its entry instead of resolving it from an earlier read.
+    assert.ok(
+      !away.value.referenceEntries.some(([file]) => normalizeFsPath(file) === normalizeFsPath(childFile)),
+      'the child stayed in the walk while its root was away',
+    );
     const result = await completeDiscovery(worker, request([home, worktree]), 4, new AbortController().signal);
     assert.ok(result?.value.kind === 'claude-children');
     assert.deepEqual(result.value.children.map((child) => child.sessionId).sort(), ['child', 'grand']);
