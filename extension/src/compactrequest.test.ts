@@ -76,7 +76,11 @@ function compactEvent(kind: 'toolStart' | 'toolEnd' | 'rootEnd', extra: Record<s
 }
 
 // A retained child whose state each case changes between host observations.
-function compactHostFixture(agent: 'claude' | 'codex' = 'codex', persistence?: CompactPersistence) {
+function compactHostFixture(
+  agent: 'claude' | 'codex' = 'codex',
+  persistence?: CompactPersistence,
+  activation = compactWindow,
+) {
   const state = { sessionId: 'self' as string | null, busy: true, asks: [] as unknown[], ready: true, exited: false };
   const fixture = {
     clock: 0,
@@ -154,7 +158,7 @@ function compactHostFixture(agent: 'claude' | 'codex' = 'codex', persistence?: C
   fixture.child = makeChild('child');
   fixture.current = fixture.child;
   fixture.host = new CompactHost<CompactChild>(
-    compactWindow,
+    activation,
     {
       find: (provider, sessionId) =>
         provider === agent && fixture.current?.state().sessionId === sessionId ? fixture.current : null,
@@ -844,13 +848,17 @@ test.each(['saved text'])('continuation replacement with colliding numeric inode
     await finishRequest(fixture);
     finishCompact(fixture);
     fixture.state.busy = false;
+    const other = compactHostFixture('codex', store, 'b'.repeat(24)).fixture;
+    Object.defineProperty(other, 'authority', { get: identity });
+    assert.equal(continuationState(other).continuation?.state, 'waiting');
     const before = identity();
     inode = 56576470320201114n;
     assert.equal(Number(inode), Number(56576470320201115n));
-    assert.deepEqual(continuationState(fixture), {
+    assert.deepEqual(continuationState(other), {
       requestId: continuationPayload.requestId,
       state: 'unavailable',
     });
+    assert.equal(continuationState(fixture).continuation?.state, 'waiting', 'the owning window reads its own request');
     assert.notEqual(identity(), before);
     inode = 0n;
     assert.equal(identity(), null);
@@ -2392,9 +2400,45 @@ test('a token request after the session turn already ended is delivered without 
   host.submitted(child, 7);
   host.native(child, claudeRootEnd, 7);
   state.busy = false;
+  // The root ending's drain runs before the background task asks.
+  await Promise.resolve();
   assert.equal((host.handle({ method: 'compact-request', params: tokenPayload }) as { state: string }).state, 'queued');
-  await host.drain('self');
-  assert.equal(fixture.writes, 1);
+  await vi.waitFor(() => assert.equal(fixture.writes, 1));
+  assert.deepEqual(host.requests.waitingSessions(), []);
+});
+
+// Catches a saved continuation request on an ended turn that waits for a root ending that never comes.
+test('a token continuation request after the session turn already ended is delivered once it is saved', async () => {
+  const { store } = memoryCompactionStore();
+  const { fixture } = compactHostFixture('claude', store);
+  const { host, child, state } = fixture;
+  host.submitted(child, 7);
+  host.native(child, claudeRootEnd, 7);
+  state.busy = false;
+  await Promise.resolve();
+  const ack = (await host.handle({
+    method: 'compact-request',
+    params: { ...continuationPayload, token: 'c'.repeat(32) },
+  })) as { state: string; reason?: string };
+  assert.equal(ack.state, 'queued', ack.reason);
+  await vi.waitFor(() => assert.equal(fixture.writes, 1));
+});
+
+// Catches a late tool end of a background command that reopens a turn whose root ending Arc already saw.
+test('a token request after a late tool end of an ended turn is delivered without another root ending', async () => {
+  const { fixture } = compactHostFixture('claude');
+  const { host, child, state } = fixture;
+  host.submitted(child, 7);
+  host.native(child, claudeRootEnd, 7);
+  host.native(
+    child,
+    compactEvent('toolEnd', { provider: 'claude', generation: 1, toolId: 'background', command: 'sleep 5' }),
+    7,
+  );
+  state.busy = false;
+  await Promise.resolve();
+  assert.equal((host.handle({ method: 'compact-request', params: tokenPayload }) as { state: string }).state, 'queued');
+  await vi.waitFor(() => assert.equal(fixture.writes, 1));
   assert.deepEqual(host.requests.waitingSessions(), []);
 });
 
@@ -2445,8 +2489,9 @@ test('a rejected reader prompt releases held compaction while session membership
 
 // The owner's failing command carried a continuation while the catalog had not published the session's row.
 test('a token continuation request is saved and delivered by the window store while the session row is unpublished', async () => {
+  const root = tempDir('continuation-unpublished-');
   const store = new CompactStore(
-    tempDir('continuation-unpublished-'),
+    root,
     compactWindow,
     () => 0,
     () => false,
@@ -2468,7 +2513,23 @@ test('a token continuation request is saved and delivered by the window store wh
   state.busy = false;
   await vi.waitFor(() => assert.deepEqual(fixture.continuationWrites, [continuationText]));
   assert.equal(store.read(continuationPayload.requestId)?.binding.sourceIdentity, undefined);
-  const reader = compactHostFixture('claude', store).fixture;
+  const owned = continuationState(fixture);
+  assert.deepEqual(
+    [owned.state, owned.continuation?.state],
+    ['completed', 'accepted'],
+    'the owning window reads its own request',
+  );
+  const other = 'b'.repeat(24);
+  const reader = compactHostFixture(
+    'claude',
+    new CompactStore(
+      root,
+      other,
+      () => 0,
+      () => false,
+    ),
+    other,
+  ).fixture;
   assert.equal(compactState(reader.host), 'unavailable', 'a receipt without a source identity stays in its window');
   host.dispose();
 });

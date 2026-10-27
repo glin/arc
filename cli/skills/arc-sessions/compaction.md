@@ -12,7 +12,7 @@ Both window values are the `hostId` of the window that hosts this session, as se
 
 Arc admits a request with a launch token at once for the live session that holds the token. Without a token, Arc admits the request only while it sees the native tool call run in a session this window holds, and the command waits up to 30 seconds for that. Open asks and queued reader prompts do not block admission. Arc sends the compaction after they clear. Reader activity after command observation withdraws an unadmitted call. After admission, a reader prompt carries the request to the turn that answers it, and a queue change keeps it. Stop, a setting pick, a reader compaction, a slash command, and an answer cancel unsubmitted compaction and suppress continuation. An answer approving the requesting tool before admission preserves its call.
 
-Each exact session turn holds one pending request. Each request ID is admitted once per window activation. Root background commands, notification turns, and continuation turns use the same admission rules. Repeated compaction grants no new task, spending, model, or review authority.
+Each exact session turn holds one pending request. A request whose command Arc has not seen run yet shares that pending request with every other request of the same submitted prompt. Each request ID is admitted once per window activation. Root background commands, notification turns, and continuation turns use the same admission rules. Repeated compaction grants no new task, spending, model, or review authority.
 
 Run the request as the last tool call of the turn, after every background child and waiter has returned. A Stop or another cancelling reader action after admission ends the request, so the last tool call leaves the least room for a reader action to cancel it.
 
@@ -24,7 +24,7 @@ Arc: compaction request WINDOW_ID:UUID runs after this turn. Run arc compact can
 
 Answer the prompt. When the prompt makes the compaction or its continuation wrong, cancel the request with `arc compact cancel`. Request again later with a fresh request ID. Arc compacts after the answering turn unless Stop or another cancelling reader action ends the request.
 
-Read the `state` field of the result. The command returns at once. After `queued`, finish the turn. Report the request in the past tense: "I requested compaction after this turn." Arc checks delivery conditions after the turn. Reader intervention can cancel unsubmitted compaction after the last observation, including while you write the final response. Never promise future delivery from `queued` or a status check.
+Read the `state` field of the result. With a launch token, the command returns at once. Without one, it returns once Arc sees the command run, or after 30 seconds. After `queued`, finish the turn. Report the request in the past tense: "I requested compaction after this turn." Arc checks delivery conditions after the turn. Reader intervention can cancel unsubmitted compaction after the last observation, including while you write the final response. Never promise future delivery from `queued` or a status check.
 
 Arc's after-turn compaction accepts one explicit saved continuation. Use the continuation form below for requested same-session work. Never queue that follow-up before compaction.
 
@@ -58,7 +58,7 @@ Each completed compaction can deliver its explicit continuation once. Compaction
 
 Active requests wait for their prerequisites without an execution deadline. Terminal status remains available for up to one hour, subject to capacity eviction.
 
-After window reload, select the current window for the same workspace. Keep the original request ID for status. Status returns saved text only when the current scope admits the exact original source. Restart recovery cancels unattempted continuation and marks possible input uncertain. It never restarts work.
+After window reload, select the current window for the same workspace. Keep the original request ID for status. Status in another window returns saved text only when the current scope admits the exact original source. Restart recovery cancels unattempted continuation and marks possible input uncertain. It never restarts work.
 
 Observe a known request without submitting work:
 

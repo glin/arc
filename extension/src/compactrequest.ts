@@ -1270,13 +1270,17 @@ export class CompactHost<C extends CompactChild> {
     if (turnId !== undefined) this.carryTo(child, event, turnId);
     const turn =
       child.agent === 'claude' ? (event.generation === null ? null : String(event.generation)) : event.turnId;
-    if (turnId !== undefined && turn && event.provider === child.agent)
+    if (turnId !== undefined && turn && event.provider === child.agent) {
+      // A late tool event of a turn whose root ending Arc saw keeps that turn ended. Only a new turn reopens it.
+      const known = this.latest.get(child);
+      const same = known?.sessionId === event.sessionId && known.turn === turn && known.submissionId === String(turnId);
       this.latest.set(child, {
         sessionId: event.sessionId,
         turn,
         submissionId: String(turnId),
-        ended: event.kind === 'rootEnd',
+        ended: event.kind === 'rootEnd' || (same && known.ended),
       });
+    }
     const binding = this.binding(child, event, turnId);
     if (event.kind === 'toolStart' && (!binding || !event.initiating)) this.requests.reject(event.command, 'withdrawn');
     if (event.kind === 'rootEnd') {
@@ -1437,12 +1441,15 @@ export class CompactHost<C extends CompactChild> {
       const current = this.requests.status(String(params.requestId));
       if (current && !current.continuation) return current;
       const saved = this.persistence?.read(String(params.requestId));
+      // The owning window reads its own request. Another window needs the session's matching source identity.
+      const owned = !!current || saved?.owner === this.activation;
       const source =
-        saved && (this.port.source ?? this.port.authority)?.(saved.binding.provider, saved.binding.sessionId);
-      if (saved && source && source === saved.binding.sourceIdentity) {
-        const observation = current ?? structuredClone(saved.observation);
+        saved && !owned && (this.port.source ?? this.port.authority)?.(saved.binding.provider, saved.binding.sessionId);
+      if (current || (saved && (owned || (source && source === saved.binding.sourceIdentity)))) {
+        const observation = current ?? structuredClone(saved!.observation);
         const continuation = observation.continuation!;
         if (
+          saved &&
           this.persistence!.ended(saved.owner) &&
           ['waiting', 'preparing', 'attempting'].includes(continuation.state)
         ) {
@@ -1492,12 +1499,13 @@ export class CompactHost<C extends CompactChild> {
       if (params.continuation)
         return this.requests
           .admitSaved(params, (binding) => this.eligible(binding, 'admit'), bound, ended)
+          .then((observation) => this.admitted(observation))
           .catch((error: unknown) => ({
             requestId: params.requestId,
             state: 'refused',
             reason: error instanceof Error ? error.message : 'Compaction was refused.',
           }));
-      return this.requests.admit(params, (binding) => this.eligible(binding, 'admit'), bound, ended);
+      return this.admitted(this.requests.admit(params, (binding) => this.eligible(binding, 'admit'), bound, ended));
     } catch (error) {
       return {
         requestId: params.requestId,
@@ -1505,6 +1513,14 @@ export class CompactHost<C extends CompactChild> {
         reason: error instanceof Error ? error.message : 'Compaction was refused.',
       };
     }
+  }
+
+  // A request admitted on a turn that already ended is deliverable now, and no later root ending drains it.
+  private admitted(observation: Readonly<CompactObservation>): Readonly<CompactObservation> {
+    const { requestId, sessionId } = observation;
+    if (this.requests.deliverable(sessionId).some((work) => work.id === requestId))
+      queueMicrotask(() => void this.drain(sessionId));
+    return observation;
   }
 
   dispose(): void {
