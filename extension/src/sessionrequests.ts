@@ -818,9 +818,13 @@ export class WindowChannel {
                 }
               : request;
             const apply = () => this.requestHandler!(handled);
-            const data = write
-              ? this.writes.run(request.id, this.binding(request), apply)
-              : Promise.resolve().then(apply);
+            // A curation dry run changes nothing, so it is evaluated afresh each time and fills no retention.
+            const data =
+              request.method === 'curate' && request.params.dryRun === true
+                ? this.writes.evaluate(request.id, this.binding(request), apply)
+                : write
+                  ? this.writes.run(request.id, this.binding(request), apply)
+                  : Promise.resolve().then(apply);
             return Promise.resolve(data).then((data) => {
               if (write) data = { ...(data as object), requestId: request.id };
               const result = { window: window ?? this.info(), data };

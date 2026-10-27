@@ -30,7 +30,7 @@ import { OrderedReadOperations, type AgentReadRecord, type AgentReadSource } fro
 import { CodexWire } from './codexwire.ts';
 import { parseSessionRequest, WindowChannel } from './sessionrequests.ts';
 
-import { request, createWindowFixtures } from '../test/window-channel';
+import { reply, request, createWindowFixtures } from '../test/window-channel';
 
 import { GuardChild, guardFixture, guardedRequest } from '../test/guarded-send';
 
@@ -38,7 +38,7 @@ const sockets: Duplex[] = [];
 
 const channels: WindowChannel[] = [];
 
-const { fixture } = createWindowFixtures(channels, sockets);
+const { fixture, connect } = createWindowFixtures(channels, sockets);
 
 afterEach(async () => {
   vi.useRealTimers();
@@ -266,6 +266,27 @@ test('session writes retain one acceptance across equal concurrent retries and r
     sessionId: 'accepted',
   });
   assert.equal(calls, 1);
+});
+
+// Catches a shared budget too small for an agent day of starts, curation and sends.
+test('the shared write budget admits 4,096 distinct IDs and names the reload at the next', async () => {
+  const book = new SessionWriteRequests('window');
+  for (let n = 0; n < 4096; n++) await book.run(`window:${n}`, { n }, () => ({ status: 'applied' }));
+  await assert.rejects(
+    book.run('window:4096', {}, () => ({ status: 'applied' })),
+    { message: 'This Arc window has reached its session-write request limit. Reload the window to reset it.' },
+  );
+});
+
+// Catches a send budget that rises with the shared budget, so a runaway send loop no longer stops early.
+test('the 257th guarded send refuses while a start still admits', async () => {
+  const book = new SessionWriteRequests('window');
+  const accept = (id: string) => () => ({ ...guardedRefusal(id, 'Next.', ''), status: 'accepted' as const });
+  for (let n = 0; n < 256; n++) await book.runGuarded(`window:send-${n}`, { n }, accept(`window:send-${n}`));
+  await assert.rejects(book.runGuarded('window:send-256', {}, accept('window:send-256')), /limit/);
+  assert.deepEqual(await book.run('window:start', { method: 'start' }, () => ({ status: 'accepted' })), {
+    status: 'accepted',
+  });
 });
 
 test('archive requires force for live work, completed unread work, and unavailable state', () => {
@@ -1086,6 +1107,145 @@ test(
     }
   },
 );
+
+const curateParams = (dryRun: boolean, action: 'pin' | 'archive' = 'archive') => ({
+  sessionId: 'worker',
+  action,
+  dryRun,
+  force: false,
+});
+
+// A curation handler that answers each evaluation with a fresh count.
+function curationHandler(channel: WindowChannel) {
+  const calls: { method: string; dryRun?: boolean }[] = [];
+  channel.setRequestHandler((request) => {
+    calls.push({ method: request.method, dryRun: request.params.dryRun });
+    return {
+      status: request.params.dryRun ? 'dry-run' : request.method === 'curate' ? 'applied' : 'accepted',
+      n: calls.length,
+    };
+  });
+  return calls;
+}
+
+// Catches curation dry runs that fill the shared table and lock out every later write in the window.
+test(
+  'curation dry runs leave the shared write budget to a start, a real archive and a send',
+  { tags: ['subprocess'] },
+  async () => {
+    for (const write of ['start', 'archive', 'send'] as const) {
+      const { channel, home } = await fixture();
+      (channel as any).writes = new SessionWriteRequests(channel.hostId, 2);
+      const calls = curationHandler(channel);
+      channel.setGuardedSendHandler(async (request) => ({
+        ...guardedRefusal(request.id, 'Next.', ''),
+        status: 'accepted',
+      }));
+      for (const n of [1, 2, 3])
+        assert.equal(
+          (
+            (await requestWindow(
+              'curate',
+              curateParams(true),
+              channel.hostId,
+              home,
+              `${channel.hostId}:dry-${n}`,
+            )) as any
+          ).status,
+          'dry-run',
+          write,
+        );
+      const id = `${channel.hostId}:${write}`;
+      vi.stubEnv('CLAUDE_CODE_SESSION_ID', 'coordinator');
+      vi.stubEnv('CODEX_THREAD_ID', '');
+      try {
+        const reply = (await (write === 'start'
+          ? requestWindow(
+              'start',
+              {
+                setup: { kind: 'custom', agent: 'claude', model: '', effort: '', permissionMode: '' },
+                prompt: 'Start.',
+                agentRun: true,
+              },
+              channel.hostId,
+              home,
+              id,
+            )
+          : write === 'archive'
+            ? requestWindow('curate', curateParams(false), channel.hostId, home, id)
+            : requestWindow(
+                'send',
+                { sessionId: 'worker', prompt: 'Next.', observation: 'b'.repeat(40) + '.' + 'c'.repeat(43) },
+                channel.hostId,
+                home,
+                id,
+              ))) as any;
+        assert.equal(reply.status, write === 'archive' ? 'applied' : 'accepted', write);
+        assert.equal(reply.requestId, id, write);
+      } finally {
+        vi.unstubAllEnvs();
+      }
+      assert.equal(calls.filter((call) => call.dryRun).length, 3, write);
+    }
+  },
+);
+
+// Catches a dry run that skips the activation or conflict checks, drops its request ID, or reserves the ID.
+test(
+  'a curation dry run re-evaluates each retry, keeps the activation and conflict checks, and carries its request ID',
+  { tags: ['subprocess'] },
+  async () => {
+    const { channel, home, entry } = await fixture();
+    const calls = curationHandler(channel);
+    const dry = (id: string, action: 'pin' | 'archive' = 'archive') =>
+      requestWindow('curate', curateParams(true, action), channel.hostId, home, id) as Promise<any>;
+    const id = `${channel.hostId}:dry`;
+    const first = await dry(id);
+    const again = await dry(id);
+    assert.deepEqual([first.status, first.n, first.requestId], ['dry-run', 1, id]);
+    assert.deepEqual([again.status, again.n, again.requestId], ['dry-run', 2, id], 'a retry returned the first answer');
+    const archived = (await requestWindow('curate', curateParams(false), channel.hostId, home, id)) as any;
+    assert.equal(archived.status, 'applied', 'a dry run reserved its ID against the later write');
+    await assert.rejects(dry(id), /different request/);
+    await assert.rejects(dry(id, 'pin'), /different request/);
+    const socket = await connect(entry.address);
+    const received = reply(socket);
+    socket.write(
+      JSON.stringify(request(entry, { id: 'reloaded:dry', method: 'curate', params: curateParams(true) })) + '\n',
+    );
+    assert.match((await received).error, /another Arc activation and is unknown/);
+    assert.equal(calls.length, 3, 'a refused dry run reached the handler');
+  },
+);
+
+// Catches an exemption that spreads from curation to read acknowledgments, whose dry runs keep their retention.
+test('read acknowledgment dry runs still consume the shared write budget', { tags: ['subprocess'] }, async () => {
+  const { channel, home } = await fixture();
+  (channel as any).writes = new SessionWriteRequests(channel.hostId, 2);
+  curationHandler(channel);
+  let reads = 0;
+  channel.setGuardedReadHandler(async (request) => {
+    reads++;
+    return {
+      version: 1,
+      status: 'dry-run',
+      requestId: request.id,
+      sessionId: 'worker',
+      requester: null,
+      marked: [],
+      reason: '',
+    };
+  });
+  vi.stubEnv('CLAUDE_CODE_SESSION_ID', 'coordinator');
+  vi.stubEnv('CODEX_THREAD_ID', '');
+  const read = { sessionId: 'worker', dryRun: true, observation: 'b'.repeat(40) + '.' + 'c'.repeat(43) };
+  for (const n of [1, 2, 1]) await requestWindow('read', read, channel.hostId, home, `${channel.hostId}:read-${n}`);
+  assert.equal(reads, 2, 'a read dry run retry was evaluated again');
+  await assert.rejects(
+    requestWindow('curate', curateParams(false), channel.hostId, home, `${channel.hostId}:archive`),
+    /limit/,
+  );
+});
 
 test(
   'session reads and guarded starts carry the requester provider only to a window that lists it',

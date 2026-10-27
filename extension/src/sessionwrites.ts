@@ -147,6 +147,11 @@ export function sessionWriteBinding(
   return { activation, method, params, requester, requesterProvider };
 }
 
+// The shared result allowance for starts, curation, sends and read acknowledgments in one activation.
+export const SESSION_WRITE_LIMIT = 4096;
+// The guarded allowance bounds sends alone, so a runaway send loop stops well before the shared allowance.
+export const GUARDED_SEND_LIMIT = 256;
+
 // Retention never evicts an admitted ID. New guarded sends reserve lifetime capacity before their handlers run.
 // Refused sends move to a separate table, so they keep their bindings without filling the shared result table.
 export class SessionWriteRequests {
@@ -155,22 +160,23 @@ export class SessionWriteRequests {
   private guardedAdmissions = 0;
   constructor(
     private readonly windowId: string,
-    private readonly limit = 256,
-    private readonly guardedLimit = limit,
+    private readonly limit = SESSION_WRITE_LIMIT,
+    private readonly guardedLimit = Math.min(limit, GUARDED_SEND_LIMIT),
   ) {}
   run(id: string, payload: unknown, apply: () => unknown | Promise<unknown>): Promise<unknown> {
     return this.runBound(id, payload, apply, false);
   }
 
-  private runBound(
-    id: string,
-    payload: unknown,
-    apply: () => unknown | Promise<unknown>,
-    guarded: boolean,
-  ): Promise<unknown> {
+  // Evaluates a request that changes nothing. It keeps the activation and ID checks but retains no result,
+  // so a retry evaluates again and the ID stays free for a later write.
+  evaluate(id: string, payload: unknown, apply: () => unknown | Promise<unknown>): Promise<unknown> {
+    return this.retained(id, this.hash(payload)) ?? Promise.resolve().then(apply);
+  }
+
+  // The outcome an ID already holds in this activation, or null for an ID that is free.
+  private retained(id: string, hash: string): Promise<unknown> | null {
     if (!id.startsWith(this.windowId + ':'))
       return Promise.reject(new Error('The request outcome belongs to another Arc activation and is unknown.'));
-    const hash = this.hash(payload);
     const refused = this.refusals.get(id);
     if (refused)
       return refused.payload === hash
@@ -181,8 +187,22 @@ export class SessionWriteRequests {
       return held.payload === hash
         ? held.result
         : Promise.reject(new Error('The request ID already names a different request.'));
+    return null;
+  }
+
+  private runBound(
+    id: string,
+    payload: unknown,
+    apply: () => unknown | Promise<unknown>,
+    guarded: boolean,
+  ): Promise<unknown> {
+    const hash = this.hash(payload);
+    const retained = this.retained(id, hash);
+    if (retained) return retained;
     if (this.results.size >= this.limit || (guarded && this.guardedAdmissions >= this.guardedLimit))
-      return Promise.reject(new Error('This Arc window has reached its session-write request limit.'));
+      return Promise.reject(
+        new Error('This Arc window has reached its session-write request limit. Reload the window to reset it.'),
+      );
     if (guarded) this.guardedAdmissions += 1;
     const result = Promise.resolve().then(apply);
     this.results.set(id, { payload: hash, result });

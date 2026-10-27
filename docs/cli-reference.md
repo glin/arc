@@ -168,11 +168,11 @@ An accepted start with a session ID includes `link`, with or without `--json`. I
 - The name state is not `failed`, `uncertain`, or `cancelled`, and carries no error. A `pending` name still gets a link.
 - The session ID is a valid link target.
 
-Write JSON includes `requestId` and `status`. Unknown delivery omits accepted-result and curation details. Fresh IDs use the selected `hostId` followed by a colon and caller ID. Identical-payload retries return the retained result. Conflicting payloads refuse. Reloads invalidate the activation. The CLI never retries writes automatically.
+Write JSON includes `requestId` and `status`. Unknown delivery omits accepted-result and curation details. Fresh IDs use the selected `hostId` followed by a colon and caller ID. Identical-payload retries return the retained result. Conflicting payloads refuse. Arc retains no curation `dry-run` result. A retry of a dry run evaluates again, and its ID stays free for a later write. Reloads invalidate the activation. The CLI never retries writes automatically.
 
 Forced archive replies include `evaluatedRunStatus` before membership changes, or null without a listing row. [Archive safety](cli.md#session-management) applies independently of that observation. [Child ownership and shutdown](agent-protocols.md#child-ownership-and-shutdown) define hosted process retirement.
 
-Each activation retains at most 256 shared write results for starts, curation, and queued, accepted, or unknown sends. Guarded sends separately admit at most 256 distinct IDs, including refused outcomes. Capacity never returns. Refused guarded sends preserve shared-result capacity. Exact retained retries precede capacity checks. Starts and curation consume no guarded units.
+Each activation retains at most 4,096 shared write results for starts, curation, read acknowledgments, and queued, accepted, or unknown sends. Guarded sends separately admit at most 256 distinct IDs, including refused outcomes. Capacity never returns. Refused guarded sends preserve shared-result capacity. Exact retained retries precede capacity checks. Starts and curation consume no guarded units. Curation dry runs consume neither allowance. At either limit, Arc refuses new IDs until the window reloads.
 
 ## Follow-ups
 

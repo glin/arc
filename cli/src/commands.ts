@@ -36,6 +36,10 @@ const requestFlag: Flag = [
   'Use a fresh selected-window hostId:ID, or retry the identical payload with its retained ID.',
 ];
 const dryRunFlag: Flag = ['--dry-run', 'Check admission without changing session metadata.'];
+const curationDryRunFlag: Flag = [
+  '--dry-run',
+  'Check admission without changing session metadata. Arc retains no dry-run result, so a retry checks again.',
+];
 const windowRefusal = 'Window selection, unavailable capabilities, or repository readiness can refuse the request.';
 const curationOutput = [
   'JSON status is applied, dry-run, refused, or unknown. Keep requestId and window after unknown delivery.',
@@ -51,7 +55,7 @@ function curation(name: string, summary: string, refusal: string, flags: readonl
     help: {
       summary,
       synopsis: `arc ${name} ID [--dry-run] [--window ID] [--request-id ID] [--json]${flags.length ? ' [--force]' : ''}`,
-      flags: [dryRunFlag, windowFlag, requestFlag, jsonFlag, ...flags],
+      flags: [curationDryRunFlag, windowFlag, requestFlag, jsonFlag, ...flags],
       output:
         name === 'archive'
           ? [
@@ -76,7 +80,7 @@ function label(action: 'add' | 'remove'): Command {
       synopsis: `arc label ${action} ID --label NAME [--dry-run] [--window ID] [--request-id ID] [--json]`,
       flags: [
         ['--label NAME', 'Apply or remove this label. Repeat for more labels.'],
-        dryRunFlag,
+        curationDryRunFlag,
         windowFlag,
         requestFlag,
         jsonFlag,
