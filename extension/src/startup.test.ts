@@ -9918,11 +9918,14 @@ test('a repository scope change leaves a discovery continuation running and send
   // Cancelling the request would close the worker's receipt scan, and the next request would read every receipt again.
   assert.equal(requests[0].signal.aborted, false, 'the scope change cancelled the discovery continuation');
   assert.ok(provider.refreshGeneration > generation, 'the continuation kept the current generation');
-  finishPass(true);
-  await continuation;
-  await vi.waitFor(() => assert.equal(requests.length, 2));
+  await vi.waitFor(() => assert.ok(requests.length >= 2));
   assert.deepEqual(requests[1].roots, ['project', 'project/worker']);
   assert.equal(requests[0].signal.aborted, false);
+  // A later cancellation, such as a workspace folder change, still reaches the kept continuation.
+  provider.abandonCatalogRefresh();
+  assert.equal(requests[0].signal.aborted, true, 'the kept discovery continuation outlived a cancellation');
+  finishPass(true);
+  await continuation;
 });
 
 test('hidden workspace-folder changes retain known directories until the replacement scope cancels removed sessions', async () => {

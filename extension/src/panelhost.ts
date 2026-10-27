@@ -1348,8 +1348,10 @@ export class PanelProvider implements vscode.Disposable {
   >();
   private refreshGeneration = 0;
   private refreshController: AbortController | null = null;
-  // The controller of the discovery continuation in flight, which a repository scope change leaves running.
+  // The controller of the discovery continuation that holds the refresh slot.
   private discoveryContinuation: AbortController | null = null;
+  // Continuations that a repository scope change left running after they lost the refresh slot.
+  private keptContinuations?: Set<AbortController>;
   private pendingRefresh: RefreshRequest | null = null;
   private refreshDeadline: ReturnType<typeof setTimeout> | null = null;
   private refreshOverdue = false;
@@ -10001,7 +10003,8 @@ export class PanelProvider implements vscode.Disposable {
           listed.length !== accepted.size ||
           listed.some((session) => !accepted.has(session.file)));
     } catch (error) {
-      // An abandoned continuation's controller is aborted.
+      // A cancelled continuation's controller is aborted. A continuation kept across a scope change runs under an older
+      // generation, so failSessionLoading ignores its failure.
       if (!controller.signal.aborted) {
         this.failSessionLoading(generation, controller.signal);
       }
@@ -10009,6 +10012,7 @@ export class PanelProvider implements vscode.Disposable {
     } finally {
       const owned = this.releaseCatalogRefresh(controller);
       if (this.discoveryContinuation === controller) this.discoveryContinuation = null;
+      this.keptContinuations?.delete(controller);
       this.performanceCounters.recordRefresh('discovery-continuation', performance.now() - started);
       if (owned && refresh) {
         // The follow-up refresh runs before a waiting request. It accepts a complete reply before any further request, and it
@@ -10042,12 +10046,19 @@ export class PanelProvider implements vscode.Disposable {
     );
   }
 
-  // Cancel catalog refresh and pending triggers. Hiding a host stops polling without calling this cancellation path. A kept
-  // discovery continuation still loses the refresh slot and generation, so its reply changes no catalog.
+  // Cancel catalog refresh and pending triggers. Hiding a host stops polling without calling this cancellation path. A
+  // repository scope change keeps a running discovery continuation. It still loses the refresh slot and generation, so its
+  // reply changes no catalog, and any later cancellation aborts it.
   private abandonCatalogRefresh(keepContinuation = false): void {
     this.refreshGeneration++;
-    if (!keepContinuation || !this.refreshController || this.refreshController !== this.discoveryContinuation)
-      this.refreshController?.abort();
+    const holder = this.refreshController;
+    if (keepContinuation && holder && holder === this.discoveryContinuation)
+      (this.keptContinuations ??= new Set()).add(holder);
+    else holder?.abort();
+    if (!keepContinuation) {
+      for (const kept of this.keptContinuations ?? []) kept.abort();
+      this.keptContinuations?.clear();
+    }
     this.refreshController = null;
     // A canceled cold pass stops walking and reading openings. The next refresh starts the pass again instead of waiting.
     const cold = this.codexColdPass;

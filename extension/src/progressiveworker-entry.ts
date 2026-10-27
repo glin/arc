@@ -209,7 +209,7 @@ interface ReceiptScan {
   // Receipt lookups read this catalog, which follows the epoch when its repository roots change.
   catalog: SessionFile[];
   steps: ReturnType<DispatchReceipts['relationships']>;
-  // Each visited launch whose read reached the catalog lookup, with the catalog identities that lookup matched.
+  // Each visited launch whose read reached the catalog lookup, with the identities it looked up, found or not.
   launches: Map<string, string[]>;
   references: Map<string, import('./transcript').ClaudeDispatchSessionReference>;
   retries: string[];
@@ -484,10 +484,15 @@ async function execute(
       const catalog = retained(held.catalog, request.catalog ?? request.parents);
       const kept = new Set(parents.map(sourceKey));
       const parentFiles = new Set(parents.map((row) => normalizeFsPath(row.file)));
-      const completedFiles = new Set(held.completed);
-      for (const row of held.parents) {
-        const key = normalizeFsPath(row.file);
-        if (!kept.has(sourceKey(row)) && completedFiles.delete(key)) released.push(key);
+      // Only retained parents keep their completions. Every other source, such as a child whose root left and returns,
+      // checks its completion again, which costs one stat when its entry is unchanged.
+      const keptFiles = new Set(
+        held.parents.filter((row) => kept.has(sourceKey(row))).map((row) => normalizeFsPath(row.file)),
+      );
+      const completedFiles = new Set<string>();
+      for (const key of held.completed) {
+        if (keptFiles.has(key)) completedFiles.add(key);
+        else released.push(key);
       }
       const inRoots = (cwd: string | null | undefined) => !!cwd && isInside(cwd, [...request.repositoryRoots]);
       const protectedFile =
@@ -1039,7 +1044,7 @@ async function execute(
         charges.receiptPassEnds++;
         return pending();
       }
-      // A visited launch whose catalog identity changed is read again before the scan completes.
+      // A recorded launch whose identities changed catalog rows is read again before the scan completes.
       const retryId = activeReceipts.retry ? undefined : activeReceipts.retries.shift();
       if (retryId !== undefined)
         activeReceipts.retry = activeReceipts.store.relationship(
