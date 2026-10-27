@@ -58,7 +58,7 @@ Remote Control refuses trailing text, including newlines. Fresh refusal restores
 
 Agent input uses `sendAgentMessage` for guarded idle or live delivery and `queueAgentMessage` for explicit queueing or temporary blockers. Reservations serialize ordinary input, observed follow-ups, and queue drains through native receipts. Bindings name one activation-local child. Agent queue heads drain before reader prompt assembly.
 
-A Send that the host returns to the prompt box without delivery shows why in the prompt box notice. After a repository scope change, the accepted catalog keeps the previous roots until a walk under the new roots is accepted. During that walk, a prompt box Send still reaches a session that the previous catalog admitted when its recorded working directory is inside the current roots. Other unknown membership refuses the Send.
+A Send that the host returns to the prompt box without an editor notification shows why in the prompt box notice. Each session keeps its notice until the reader edits that session's prompt or sends again. After a repository scope change, the accepted catalog keeps the previous roots until a walk under the new roots is accepted. During that walk, a prompt box Send still reaches a session that the previous catalog admitted when its recorded working directory is inside the current roots and the latest walk holds the same source. Other unknown membership refuses the Send.
 
 Wait for temporary panel work before persisting agent attempts. Ordered deletion must follow concurrent saves before refusal is confirmed. Uncertain deletion retains recovery. Reload never restores child authority, so saved agent messages become recovery. Unknown-delivery blocks apply to both input forms.
 

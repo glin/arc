@@ -1418,8 +1418,9 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
         });
       },
       restoreDraft: function (msg) {
-        if (composerRenderer.restoreDraft(msg.session, msg.text, msg.revision) && msg.notice)
-          attachmentRenderer.submissionNotice(composerRenderer.sessionIdentity(msg.session), msg.notice);
+        composerRenderer.restoreDraft(msg.session, msg.text, msg.revision);
+        // A newer local edit keeps its text, and the notice still says that the earlier send did not go.
+        if (msg.notice) attachmentRenderer.submissionNotice(composerRenderer.sessionIdentity(msg.session), msg.notice);
       },
       // Adopts the host's comments as the complete current set.
       notes: function (msg) {

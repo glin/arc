@@ -18794,7 +18794,7 @@ test('awaiting session state and delayed panel actions use the adopted identity'
     /this\.rowForSession\(this\.showing\)/,
     'selected composer state bypasses the complete session-row resolver',
   );
-  const stateAt = panelHostSource.indexOf('private stateFor(session: string)');
+  const stateAt = panelHostSource.indexOf('private stateFor(session: string');
   const state = panelHostSource.slice(stateAt, panelHostSource.indexOf('private rowForSession(', stateAt));
   sourceMatch(
     state,
@@ -18841,7 +18841,7 @@ test('awaiting session state and delayed panel actions use the adopted identity'
   )(resolveSessionAlias);
   const composerState = new Function(`return function (webview) {\n${methodBody('private composerState(')}\n};`)();
   const stateFor = new Function(
-    `return function (session) {\n${methodBody('private stateFor(session: string)')}\n};`,
+    `return function (session, acrossScopeMove = false) {\n${methodBody('private stateFor(session: string')}\n};`,
   )();
   const setDraft = new Function(
     'hasUnsentPrompt',
@@ -35582,13 +35582,44 @@ test.each(['claude', 'codex'] as const)(
   },
 );
 
-test.each(['unknown membership', 'a send in flight'] as const)(
+test.each([
+  ['a working directory outside the current roots', 'unavailable'],
+  ['a walk that replaced the accepted source', 'loading'],
+  ['a walk that no longer lists the accepted source', 'loading'],
+] as const)('a prompt box send during a scope walk is refused for %s', async (cause, reason) => {
+  const { provider, host, session, worktree, accepted, posted, delivered } = scopeMovedSendProvider('codex');
+  if (cause === 'a working directory outside the current roots') {
+    provider.repositoryScopeRoots = provider.repositoryScopeRoots.filter((root: string) => root !== worktree);
+    provider.repositoryScope = { snapshot: () => ({ ready: true, roots: provider.repositoryScopeRoots }) };
+  } else if (cause === 'a walk that replaced the accepted source') {
+    const added = provider.repositoryScopeRoots.at(-1);
+    provider.catalog = { sessions: [{ ...accepted, file: path.join(added, 'copy.jsonl'), ino: 99, cwd: added }] };
+  } else {
+    provider.catalog = { sessions: [] };
+  }
+  const text = 'Refused during the scope walk';
+  await provider.acceptSubmission(text, session, 1, session, host, {
+    id: `refused-${reason}`,
+    order: 1,
+    source: session,
+    revision: 1,
+    text,
+  });
+  assert.deepEqual(delivered, []);
+  assert.deepEqual(
+    posted.filter((message) => message.type === 'restoreDraft'),
+    [{ type: 'restoreDraft', session, text, revision: 1, notice: sendRefusal(reason) }],
+  );
+});
+
+test.each(['unknown membership', 'a send in flight', 'a failed save'] as const)(
   'a prompt box send that the host returns with %s tells the reader it was not sent',
   async (cause) => {
     const { provider, host, session, posted, delivered } = scopeMovedSendProvider('claude');
     if (cause === 'unknown membership')
       provider.membershipCoverage = { ...provider.membershipCoverage, members: new Set() };
-    else provider.submissionsInFlight = new Set([session]);
+    else if (cause === 'a send in flight') provider.submissionsInFlight = new Set([session]);
+    else provider.memento = { update: () => Promise.reject(new Error('The disk is full.')) };
     const text = 'Returned to the box';
     await provider.acceptSubmission(text, session, 1, session, host, {
       id: `returned-${cause}`,
@@ -35606,7 +35637,9 @@ test.each(['unknown membership', 'a send in flight'] as const)(
           session,
           text,
           revision: 1,
-          notice: sendRefusal(cause === 'unknown membership' ? 'loading' : 'sending'),
+          notice: sendRefusal(
+            cause === 'unknown membership' ? 'loading' : cause === 'a send in flight' ? 'sending' : 'unsaved',
+          ),
         },
       ],
     );

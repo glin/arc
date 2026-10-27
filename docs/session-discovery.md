@@ -32,7 +32,7 @@ Continuing a session, compacting it, and handing off responses or selected text 
 
 ## Relationship discovery contracts
 
-Keep physical presence, admitted membership, scope, and accepted revision separate. `sessionPresence` answers present, absent, or unknown only within the matching domain, scope, and revision. Physical coverage reaches visited directories within the provider's supported depth. Unvisited directories, failed candidates, and unread admission remain unknown. A missing provider root establishes empty enumeration. Published rows supply no absence proof.
+Keep physical presence, admitted membership, scope, and accepted revision separate. `sessionPresence` answers present, absent, or unknown only within the matching domain, scope, and revision. A prompt box Send during a scope walk is the one exception, which [Delivery and recovery contracts](prompt-delivery.md#delivery-and-recovery-contracts) defines. Physical coverage reaches visited directories within the provider's supported depth. Unvisited directories, failed candidates, and unread admission remain unknown. A missing provider root establishes empty enumeration. Published rows supply no absence proof.
 
 Same-ID collisions revoke recorded-source delivery before publication. Competing sources remain quarantined through incomplete walks until qualified openings or relevant pathname absence resolve them. Descriptor and pathname revisions must agree. Hidden Codex openings reserve competition independently of displayed membership, including changed IDs that collide with visible sources. Cached metadata alone cannot establish replacement or scope exclusion.
 

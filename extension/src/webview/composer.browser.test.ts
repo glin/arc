@@ -3802,22 +3802,46 @@ test('a send the host returns to the prompt box says that it was not sent', { ti
   try {
     const page = await browser.newPage();
     await page.setContent(themed(pageHtml()));
-    await post(page, renderPayload());
-    await page.locator('#prompt').fill('send this');
-    await page.locator('#prompt').press('Enter');
-    const sent = (await page.evaluate(`window.__posted.filter((message) => message.type === 'sendPrompt').at(-1)`)) as {
-      revision: number;
+    const payload = renderPayload();
+    await post(page, payload);
+    const first = ((payload.usage as Record<string, unknown>).composer ?? {}) as Record<string, unknown>;
+    const second = { ...first, sessionId: 's2', draft: '', targetName: 'Codex parity sweep' };
+    const notice = page.locator('.cnotice[role="status"]');
+    const send = async (text: string): Promise<number> => {
+      await page.locator('#prompt').fill(text);
+      await page.locator('#prompt').press('Enter');
+      const sent = (await page.evaluate(
+        `window.__posted.filter((message) => message.type === 'sendPrompt').at(-1)`,
+      )) as { revision: number };
+      return sent.revision;
     };
+
+    const revision = await send('send this');
     assert.equal(await page.locator('#prompt').inputValue(), '');
+    await post(page, { type: 'usage', usage: usageWith(payload, second) });
     await post(page, {
       type: 'restoreDraft',
       session: 's1',
       text: 'send this',
-      revision: sent.revision,
+      revision,
       notice: sendRefusal('loading'),
     });
+    assert.equal(await notice.count(), 0, 'the notice for s1 showed in s2');
+    await post(page, { type: 'usage', usage: usageWith(payload, first) });
     assert.equal(await page.locator('#prompt').inputValue(), 'send this');
-    assert.equal(await page.locator('.cnotice[role="status"]').textContent(), sendRefusal('loading'));
+    assert.equal(await notice.textContent(), sendRefusal('loading'), 'returning to s1 lost its notice');
+
+    const typedOver = await send('send again');
+    await page.locator('#prompt').fill('newer local text');
+    await post(page, {
+      type: 'restoreDraft',
+      session: 's1',
+      text: 'send again',
+      revision: typedOver,
+      notice: sendRefusal('sending'),
+    });
+    assert.equal(await page.locator('#prompt').inputValue(), 'newer local text');
+    assert.equal(await notice.textContent(), sendRefusal('sending'), 'newer typing hid the notice');
   } finally {
     await browser.close();
   }

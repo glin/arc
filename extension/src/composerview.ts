@@ -2894,7 +2894,7 @@ function composerFiles(state: ComposerState): ComposerFile[] {
   );
 }
 
-export type SendRefusal = 'loading' | 'unavailable' | 'sending' | 'changed' | 'unsaved' | 'empty';
+export type SendRefusal = 'loading' | 'unavailable' | 'sending' | 'changed' | 'unsaved' | 'failed' | 'empty';
 
 // prompt box words for a send that the host returned to the box without delivering it.
 const SEND_REFUSALS: Record<SendRefusal, string> = {
@@ -2903,6 +2903,7 @@ const SEND_REFUSALS: Record<SendRefusal, string> = {
   sending: 'Not sent. Arc is still sending your last prompt to this session.',
   changed: 'Not sent. This session changed before Arc could send the prompt. Send again.',
   unsaved: 'Not sent. Arc could not save this prompt. Copy it before trying again.',
+  failed: 'Not sent. Arc could not send this prompt. Send again.',
   empty: 'Not sent. There is nothing to send.',
 };
 

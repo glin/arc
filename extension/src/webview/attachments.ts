@@ -98,7 +98,8 @@ export function createAttachmentRenderer(options: AttachmentOptions): Attachment
   let serial = 0;
   let dropDepth = 0;
   let current: ComposerView | null = null;
-  let submissionNotice: { session: string; words: string } | null = null;
+  // Each session keeps its own notice, so a returned send still explains itself after the reader switches away and back.
+  const submissionNotices = new Map<string, string>();
   let pendingRemoval: { session: string; id: string; index: number; control: HTMLButtonElement } | null = null;
 
   const isStaging = (session: string | null): boolean => !!session && (sessions.get(session)?.size ?? 0) > 0;
@@ -165,10 +166,7 @@ export function createAttachmentRenderer(options: AttachmentOptions): Attachment
     }
     render(
       h(Notice, {
-        words:
-          submissionNotice && submissionNotice.session === current?.sessionId
-            ? submissionNotice.words
-            : (current?.notice ?? null),
+        words: (current && submissionNotices.get(current.sessionId)) ?? current?.notice ?? null,
       }),
       options.noticeMount,
     );
@@ -275,8 +273,7 @@ export function createAttachmentRenderer(options: AttachmentOptions): Attachment
     }
   });
   options.prompt.addEventListener('input', () => {
-    if (submissionNotice) {
-      submissionNotice = null;
+    if (current && submissionNotices.delete(current.sessionId)) {
       redraw();
     }
   });
@@ -330,12 +327,12 @@ export function createAttachmentRenderer(options: AttachmentOptions): Attachment
 
   return {
     update(view) {
-      if (view?.sessionId !== current?.sessionId) submissionNotice = null;
       current = view;
       redraw();
     },
     submissionNotice(session, words) {
-      submissionNotice = words ? { session, words } : null;
+      if (words) submissionNotices.set(session, words);
+      else submissionNotices.delete(session);
       redraw();
     },
     isStaging,

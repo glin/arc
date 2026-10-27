@@ -4593,6 +4593,9 @@ export class PanelProvider implements vscode.Disposable {
     const catalog = this.authoritativeCatalog ?? [];
     const matches = catalog.filter((source) => source.sessionId === sessionId);
     if (matches.length !== 1 || !matches[0].cwd || !isInside(matches[0].cwd, this.repositoryScopeRoots)) return false;
+    // Delivery reads its working directory from the latest walk, so that walk must still hold the same source.
+    const walked = (this.catalog?.sessions ?? []).filter((source) => source.sessionId === sessionId);
+    if (walked.length !== 1 || sessionCoverageMember(walked[0]) !== sessionCoverageMember(matches[0])) return false;
     return (
       sessionPresence(
         this.membershipCoverage,
@@ -7350,6 +7353,7 @@ export class PanelProvider implements vscode.Disposable {
           assets,
         });
       for (const asset of assets) this.assetIdsInHandoff.add(asset.id);
+      let retained = false;
       try {
         const validated = mergeSubmittedPrompts([attempt]);
         if (
@@ -7360,7 +7364,6 @@ export class PanelProvider implements vscode.Disposable {
         )
           throw new Error('The prompt could not be retained.');
         const retention = this.health?.begin('retention', this.healthPanel(host).id);
-        let retained = false;
         try {
           await this.importPromptRecovery(validated);
           retained = true;
@@ -7368,7 +7371,8 @@ export class PanelProvider implements vscode.Disposable {
           if (retention) this.health?.settle(retention, retained ? 'returned' : 'failed');
         }
         if (!captured || !this.stateFor(session, true)) {
-          restore(this.sendRefusalFor(session));
+          // A session that became available while the prompt was saved asks the reader to send again.
+          restore(this.stateFor(session, true) ? 'changed' : this.sendRefusalFor(session));
           return;
         }
         if (
@@ -7406,7 +7410,7 @@ export class PanelProvider implements vscode.Disposable {
         }
       } catch {
         result = 'failed';
-        restore('unsaved');
+        restore(retained ? 'failed' : 'unsaved');
       } finally {
         this.submissionsInFlight.delete(session);
         this.submittingDrafts.delete(session);
