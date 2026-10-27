@@ -22,7 +22,7 @@ Use tabular numbers and right alignment for comparable figures. Never ellipsize 
 
 A reader skims a breakdown before reading it. Each figure must be findable at a glance, without reading a sentence.
 
-- Write a fact line as short fragments separated by middle dots, as in `728 requests · 98% cached input · 120k average input`. Do not join facts into a clause with commas.
+- Write a fact line as short fragments separated by middle dots, as in `728 requests · 120k average input`. Do not join facts into a clause with commas.
 - Keep two figures apart. When a line holds two figures, lead with the one the reader acts on and set the other in a quieter text role or its own column.
 - Lay out repeated rows as a table. Each field of a row, such as name, count, cost, bar, and share, sits in its own column, so the field aligns from row to row. Give a count its own column with space between it and the name.
 - Keep each row's fields close together. In a wide popover, the eye must not travel from a label at the left edge to its figures at the right edge. Cap the width of the row's columns instead of stretching them across the surface.
