@@ -74,7 +74,7 @@ test('native Copy Path and Copy Relative Path retain citation filename suffixes'
 });
 
 test('response citation presses open external literal files without workspace or snapshot routing', async () => {
-  const { linkCandidates, linkTargetIsVideo } = await import('./transcript.js');
+  const { linkCandidates, linkLocation, linkTargetIsVideo } = await import('./transcript.js');
   const opened: Array<{ path: string; options: Record<string, unknown> }> = [];
   const commands: unknown[][] = [];
   const notices: string[] = [];
@@ -130,6 +130,7 @@ test('response citation presses open external literal files without workspace or
     'path',
     'normalizeFsPath',
     'linkCandidates',
+    'linkLocation',
     'nativeCitationPath',
     'linkTargetIsImage',
     'linkTargetIsHtml',
@@ -141,21 +142,23 @@ test('response citation presses open external literal files without workspace or
     path,
     (file: string) => file.replace(/\\/g, '/').toLowerCase(),
     linkCandidates,
+    linkLocation,
     nativeCitationPath,
     (file: string) => file.endsWith('.png'),
     (file: string) => file.endsWith('.html'),
     (file: string) => file.endsWith('.md'),
     linkTargetIsVideo,
   );
-  for (const name of ['one%20.csv', 'one .csv', 'one#L10', 'one:10', 'Case.csv', 'case.csv']) {
+  for (const name of ['one%20.csv', 'one .csv', 'one#L10', 'one:10', 'Case.csv', 'case.csv', 'guide.md#appendix']) {
     const file = `${outside}/${name}`;
     await open(file, 2, true);
     assert.deepEqual(opened.at(-1), { path: file, options: { selection: undefined, preview: true, viewColumn: 2 } });
     assert.equal(checked.at(-1), file);
   }
   assert.equal(commands.length, 0);
+  const literalOpens = opened.length;
   await open(`${outside}/file.csv`, 2);
-  assert.equal(opened.length, 7);
+  assert.equal(opened.length, literalOpens + 1);
   assert.equal(opened.at(-1)!.path, path.normalize(`${outside}/file.csv`));
   assert.equal(notices.length, 0);
   await open(`${root}/file.csv#L10-L12`, 1);
@@ -314,7 +317,7 @@ test('registered checkout identity changes reach the host metadata refresh callb
 });
 
 test('clicked local links open outside workspace folders through their existing editor routes', async () => {
-  const { linkCandidates, linkTargetIsVideo } = await import('./transcript.js');
+  const { linkCandidates, linkLocation, linkTargetIsVideo } = await import('./transcript.js');
   const source = ts.transpileModule(declarationSource(panelHostSource, 'openLink'), {
     compilerOptions: { target: ts.ScriptTarget.ES2022 },
   }).outputText;
@@ -342,7 +345,18 @@ test('clicked local links open outside workspace folders through their existing 
     ],
   ] as const) {
     const paths = platform === 'win32' ? path.win32 : path.posix;
-    const uri = (file: string) => ({ scheme: 'file', fsPath: file, toString: () => `file://${file}` });
+    const uri = (file: string) => ({
+      scheme: 'file',
+      fsPath: file,
+      fragment: '',
+      with: (parts: { fragment: string }) => ({
+        scheme: 'file',
+        fsPath: file,
+        fragment: parts.fragment,
+        toString: () => `file://${file}#${parts.fragment}`,
+      }),
+      toString: () => `file://${file}`,
+    });
     const commands: unknown[][] = [];
     const opened: Array<{ file: ReturnType<typeof uri>; options: Record<string, unknown> }> = [];
     const notices: string[] = [];
@@ -412,6 +426,7 @@ test('clicked local links open outside workspace folders through their existing 
       'path',
       'normalizeFsPath',
       'linkCandidates',
+      'linkLocation',
       'nativeCitationPath',
       'linkTargetIsImage',
       'linkTargetIsHtml',
@@ -424,6 +439,7 @@ test('clicked local links open outside workspace folders through their existing 
       paths,
       (file: string) => file.replace(/\\/g, '/').toLowerCase(),
       (target: string, folders: string[]) => linkCandidates(target, folders, platform),
+      linkLocation,
       (target: string) => nativeCitationPath(target, platform),
       (file: string) => /\.png$/i.test(file),
       (file: string) => /\.html?$/i.test(file),
@@ -553,6 +569,28 @@ test('clicked local links open outside workspace folders through their existing 
     assert.deepEqual(commands.at(-1)!.slice(2), ['vscode.markdown.preview.editor', 2]);
     assert.deepEqual(checked, [skillPath]);
     assert.deepEqual(notices, []);
+    for (const target of [skill, 'docs/guide.markdown']) {
+      const file = paths.isAbsolute(target) ? paths.normalize(target) : paths.join(roots[0], target);
+      existing.set(file, 1);
+      for (const [written, fragment] of [
+        ['wait-without-repeated-model-requests', 'wait-without-repeated-model-requests'],
+        ['hello%20world', 'hello world'],
+        ['caf%C3%A9', 'caf\u00e9'],
+        ['bad%escape', 'bad%escape'],
+        ['section:42', 'section:42'],
+      ]) {
+        checked.length = 0;
+        const before = opened.length;
+        await open(`${target}#${written}`, 2);
+        assert.deepEqual(checked, [file], `${platform}: a Markdown heading became part of the filename`);
+        assert.deepEqual(notices, [], `${platform}: an existing Markdown heading link reported a missing file`);
+        assert.equal(commands.at(-1)![0], 'vscode.openWith');
+        assert.equal((commands.at(-1)![1] as ReturnType<typeof uri>).fsPath, file);
+        assert.equal((commands.at(-1)![1] as ReturnType<typeof uri>).fragment, fragment);
+        assert.deepEqual(commands.at(-1)!.slice(2), ['vscode.markdown.preview.editor', 2]);
+        assert.equal(opened.length, before);
+      }
+    }
     if (platform === 'win32') {
       await open(skill.replace(/\//g, '\\'), 1);
       assert.equal((commands.at(-1)![1] as ReturnType<typeof uri>).fsPath, skillPath);
@@ -607,7 +645,7 @@ test('clicked local links open outside workspace folders through their existing 
     }
     const beforePreview = opened.length;
     previewFails = true;
-    await open(skill, 2);
+    await open(`${skill}#appendix`, 2);
     assert.equal(opened.length, beforePreview);
     assert.equal(notices.pop(), `Arc: VS Code did not open ${skillPath} in Markdown Preview.`);
     previewFails = false;
@@ -23386,7 +23424,7 @@ test('local HTML and Markdown response links use their readers', () => {
   const markdownBranch = opener.slice(markdown, opener.indexOf('const selection', markdown));
   sourceMatch(
     markdownBranch,
-    /executeCommand\(\s*'vscode\.openWith',\s*uri,\s*'vscode\.markdown\.preview\.editor',\s*column\s*\)/,
+    /executeCommand\(\s*'vscode\.openWith',\s*previewUri,\s*'vscode\.markdown\.preview\.editor',\s*column\s*\)/,
     'a Markdown response link is not sent to Markdown Preview in its requested editor group',
   );
   sourceMatch(

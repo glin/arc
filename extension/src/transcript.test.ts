@@ -12133,6 +12133,11 @@ test('a link names its file with the anchor stripped, and a URL names nothing', 
   assert.equal(linkTarget(''), null);
   // An anchor alone names nothing to copy.
   assert.equal(linkTarget('#L42'), null);
+  for (const prefix of ['C:/Users/Reader/Notes', '/Users/Reader/Notes', '/home/reader/Notes', 'docs']) {
+    assert.equal(linkTarget(`${prefix}/guide.md#wait-without-repeated-model-requests`), `${prefix}/guide.md`);
+    assert.equal(linkTarget(`${prefix}/guide.markdown#section:42`), `${prefix}/guide.markdown`);
+  }
+  assert.equal(linkTarget('report.csv#part'), 'report.csv#part');
 });
 
 test('a linked HTML file is recognized by its resolved suffix', () => {

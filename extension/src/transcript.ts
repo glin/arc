@@ -3534,14 +3534,36 @@ export function relativePath(target: string, folders: string[]): string {
   return target;
 }
 
-// Local link target after removing `#L` or trailing line and column anchors.
+// Local link target after removing a Markdown heading or line location.
 // Schemes followed by double slashes return null. Drive-letter paths remain eligible.
 export function linkTarget(href: string): string | null {
   if (!href || /^[a-z][a-z0-9+.-]*:\/\//i.test(href)) {
     return null;
   }
+  return linkLocation(href).target || null;
+}
+
+export function linkLocation(href: string): { target: string; from: number; to: number; fragment: string | null } {
+  const hash = href.indexOf('#');
+  if (hash >= 0 && linkTargetIsMarkdown(href.slice(0, hash))) {
+    let fragment = href.slice(hash + 1);
+    if (!/^L\d+(?:-L?\d+)?$/.test(fragment)) {
+      try {
+        fragment = decodeURIComponent(fragment);
+      } catch {
+        // A malformed escape remains part of the requested heading.
+      }
+      return { target: href.slice(0, hash), from: -1, to: -1, fragment };
+    }
+  }
   const anchor = /#L(\d+)(?:-L?(\d+))?$/.exec(href) || /:(\d+)(?::\d+)?$/.exec(href);
-  return (anchor ? href.slice(0, anchor.index) : href) || null;
+  const from = anchor ? Number(anchor[1]) - 1 : -1;
+  return {
+    target: anchor ? href.slice(0, anchor.index) : href,
+    from,
+    to: anchor && anchor[2] ? Number(anchor[2]) - 1 : from,
+    fragment: null,
+  };
 }
 
 export function linkTargetIsHtml(target: string): boolean {

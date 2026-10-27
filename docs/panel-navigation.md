@@ -26,7 +26,7 @@ Normal opening prefers the active text-editor group outside the panel, then the 
 
 Video extensions match regardless of case on Windows, macOS, and Linux. Video opening needs a default application and uses no editor group. Successful opening does not establish playback or codec support. Integrated-browser placement follows `workbench.browser.newTabPlacement`, and VS Code applies workspace trust to local HTML. HTTP and HTTPS links open in the configured external browser.
 
-Clicked local links can leave workspace folders. Absolute paths need no open folder. Relative paths try open folders in order, including `..`, and have no base in a folderless window. `#L42-L51` and `:42` select text-file lines. `:42:7` ignores the column. Other URI schemes become filesystem paths and never execute as schemes.
+Clicked local links can leave workspace folders. Absolute paths need no open folder. Relative paths try open folders in order, including `..`, and have no base in a folderless window. Ordinary Markdown links separate heading fragments from file paths and pass the heading to Markdown Preview. Percent-encoded headings decode once. Malformed escapes remain unchanged. Copy Path excludes the heading. Literal file citations retain hash suffixes as part of the filename. `#L42-L51` and `:42` select text-file lines. `:42:7` ignores the column. Other URI schemes become filesystem paths and never execute as schemes.
 
 ### Opening failures
 

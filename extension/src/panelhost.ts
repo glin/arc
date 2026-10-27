@@ -137,6 +137,7 @@ import {
   type ClaudeUsageReducerState,
   isInside,
   folderMatcher,
+  linkLocation,
   linkTargetIsHtml,
   linkTargetIsMarkdown,
   linkTargetIsVideo,
@@ -833,11 +834,9 @@ async function openLink(
     await vscode.env.openExternal(vscode.Uri.parse(href));
     return;
   }
-  // "src/store.ts#L42-L51" and "src/store.ts:42" both name a line to land on.
-  const anchor = literal ? null : /#L(\d+)(?:-L?(\d+))?$/.exec(href) || /:(\d+)(?::\d+)?$/.exec(href);
-  const target = anchor ? href.slice(0, anchor.index) : href;
-  const from = anchor ? Number(anchor[1]) - 1 : -1;
-  const to = anchor && anchor[2] ? Number(anchor[2]) - 1 : from;
+  const { target, from, to, fragment } = literal
+    ? { target: href, from: -1, to: -1, fragment: null }
+    : linkLocation(href);
   if (!target) {
     return;
   }
@@ -902,8 +901,9 @@ async function openLink(
         return;
       }
       if (uri.scheme === 'file' && linkTargetIsMarkdown(uri.fsPath)) {
+        const previewUri = fragment ? uri.with({ fragment }) : uri;
         try {
-          await vscode.commands.executeCommand('vscode.openWith', uri, 'vscode.markdown.preview.editor', column);
+          await vscode.commands.executeCommand('vscode.openWith', previewUri, 'vscode.markdown.preview.editor', column);
         } catch {
           void vscode.window.showInformationMessage(`Arc: VS Code did not open ${uri.fsPath} in Markdown Preview.`);
         }
