@@ -254,7 +254,7 @@ test.each(['receipt', 'anchor', 'accepted', 'startup', 'source', 'refused', 'col
     if (mode === 'collision') fx.catalog.push({ ...fx.catalog[1], file: fx.file + '.other' });
     if (mode === 'redirected-cwd') fs.symlinkSync(fx.home, cwd, process.platform === 'win32' ? 'junction' : 'dir');
     assert.deepEqual(drainRelationships(new DispatchReceipts(fx.home).relationships(fx.catalog)), []);
-    if (mode === 'redirected-cwd') fs.rmdirSync(cwd);
+    if (mode === 'redirected-cwd') fs.unlinkSync(cwd);
   },
 );
 
