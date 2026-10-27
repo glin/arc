@@ -8,7 +8,7 @@ Opening Servers can start a provisional Claude child without creating a transcri
 
 After first-prompt acceptance, keep the provisional shell interactive until one complete render identifies its durable replacement. Delayed queue edits follow adoption. Delayed refusals restore text only when its revision remains unchanged.
 
-New inherits the selected session's setup and stored permission, including an agent-default permission. Without a stored permission, it uses `Auto` for Claude or `Approve for me` for Codex. Without a selection, it uses the latest available recent setup, even when a pin hides that row. Pins never change New's primary setup.
+New inherits the selected session's setup and stored permission, including an agent-default permission. Without a stored permission, it uses `Auto` for Claude or `Approve for me` for Codex. Without a selection, it uses the latest available recent setup, even when a pin hides that row. Pins never change New's primary setup. Recent setups keeps an unpinned setup that matches Same setup as current.
 
 Current-setup launches and handoffs wait for pending model evidence before capturing the setup. Explicit model picks, recent setups, and pinned setups start without waiting. The initiating session and panel retain ownership.
 
@@ -57,6 +57,8 @@ Project identity uses the canonical common Git directory across checkouts, regis
 Initialization saves copied legacy pins and empty recents together. Existing entries, including invalid or empty entries, never import again. Legacy storage remains unchanged.
 
 ## Model resolution
+
+Setup summaries and draft Model controls describe an omitted model as the agent's default. When a ready reading resolves a model, summaries include its label and a default marker. Loading, unavailable, or absent readings name only the agent default. Launching, editing, pinning, and saving preserve omitted model and effort overrides.
 
 Use [`view/model-picks.ts`](../extension/src/view/model-picks.ts)'s `recordedChoice` across controls, inherited setups, and price projection. It handles model windows, Bedrock prefixes, snapshots, aliases, and deployment suffixes. Keep ambiguous API identities unresolved. Several rows with one identity resolve to the visible model-menu row.
 

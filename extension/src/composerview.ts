@@ -1279,9 +1279,15 @@ function profileFacts(
   defaults: DefaultContext = {},
 ): string[] {
   const permission = profileAskMode(profile.agent, profile.permissionMode);
+  const agent = agentName(profile.agent);
+  const model = modelLabel(catalog, profile.model, defaults);
   return [
-    agentName(profile.agent),
-    modelLabel(catalog, profile.model, defaults),
+    agent,
+    profile.model
+      ? model
+      : defaults.base?.status === 'ready' && defaults.base.model
+        ? `${model} (default)`
+        : `${agent} default`,
     effortLabel(catalog, profile.model, profile.effort, defaults),
     permission.label,
   ];
@@ -1362,7 +1368,6 @@ export function sessionLauncherView(
   const shown = visibleRecents(
     recent.map((profile, index) => ({ ...profile, index })),
     pinned,
-    inherited?.profile ?? null,
     agents,
   );
   const recentRows = shown.map(({ index, ...profile }) => recentRow(profile, index));

@@ -14750,7 +14750,7 @@ test('a draft switched to Claude names the saved model and effort before discove
   fixture.provider.savedDefaults = saved;
   fixture.provider.pickOnDraft(fixture.session, 'agent', 'claude');
   assert.equal(fixture.order[0], 'usage', 'the new agent waited behind session discovery');
-  assert.deepEqual(fixture.labels(), ['Model: Haiku, for this draft', 'Effort: medium, for this draft']);
+  assert.deepEqual(fixture.labels(), ['Model: Haiku (default), for this draft', 'Effort: medium, for this draft']);
   assert.deepEqual(
     fixture.reads.filter(([agent]) => agent === 'claude'),
     [['claude', cwd, '']],
@@ -14764,7 +14764,7 @@ test('a host activated in one folder draws the saved reading of a draft in anoth
   await saved.save('claude', draftFolder, '', SAVED_HAIKU);
   fixture.provider.savedDefaults = saved;
   fixture.provider.pickOnDraft(fixture.session, 'agent', 'claude');
-  assert.deepEqual(fixture.labels(), ['Model: Haiku, for this draft', 'Effort: medium, for this draft']);
+  assert.deepEqual(fixture.labels(), ['Model: Haiku (default), for this draft', 'Effort: medium, for this draft']);
 });
 
 test('a selected alias finds the saved reading stored under its launch value', async () => {
@@ -14856,12 +14856,12 @@ test('fresh defaults replace carried ones, and a watched settings change keeps t
   });
   try {
     fixture.provider.pickOnDraft(fixture.session, 'agent', 'claude');
-    assert.deepEqual(fixture.labels(), ['Model: Haiku, for this draft', 'Effort: medium, for this draft']);
+    assert.deepEqual(fixture.labels(), ['Model: Haiku (default), for this draft', 'Effort: medium, for this draft']);
     await vi.waitFor(() => assert.ok(asks.some(({ plan }) => plan.agent === 'claude')));
     const sonnet = { status: 'ready', model: 'claude-sonnet-5', effort: 'high', reason: '' } as const;
     asks.find(({ plan }) => plan.agent === 'claude')!.resolve(sonnet);
     await vi.waitFor(() =>
-      assert.deepEqual(fixture.labels(), ['Model: Sonnet, for this draft', 'Effort: high, for this draft']),
+      assert.deepEqual(fixture.labels(), ['Model: Sonnet (default), for this draft', 'Effort: high, for this draft']),
     );
     assert.deepEqual(new SavedDefaults(globalState, path).get('claude', cwd, ''), sonnet);
     const before = asks.length;
@@ -14872,7 +14872,7 @@ test('fresh defaults replace carried ones, and a watched settings change keeps t
     // Another window evicted the saved reading. The held value still draws until the fresh answer arrives.
     globalState.values.clear();
     watchers.find(({ pattern }) => pattern.pattern === 'settings*.json').change({});
-    assert.deepEqual(fixture.labels(), ['Model: Sonnet, for this draft', 'Effort: high, for this draft']);
+    assert.deepEqual(fixture.labels(), ['Model: Sonnet (default), for this draft', 'Effort: high, for this draft']);
     await vi.waitFor(() => assert.equal(asks.length, before + held.length));
     assert.deepEqual(
       asks
@@ -14888,11 +14888,26 @@ test('fresh defaults replace carried ones, and a watched settings change keeps t
       .resolve(unavailable);
     await vi.waitFor(() =>
       assert.deepEqual(fixture.labels(), [
-        'Model: Model not reported, for this draft',
+        'Model: Claude default, for this draft',
         'Effort: Effort not reported, for this draft',
       ]),
     );
     assert.deepEqual(new SavedDefaults(globalState, path).get('claude', cwd, ''), unavailable);
+    const composer = fixture.posts.filter((message) => message.type === 'usage').at(-1).usage.composer;
+    assert.ok(composer.draftTag.detail.includes('Claude default'));
+    assert.deepEqual(
+      composer.picks.map((pick: any) => pick.disabled),
+      [false, false, true, false],
+    );
+    assert.equal(composer.picks[1].detail, unavailable.reason);
+    assert.deepEqual(
+      [fixture.provider.draftProfiles[fixture.session].model, fixture.provider.draftProfiles[fixture.session].effort],
+      ['', ''],
+    );
+    assert.deepEqual(
+      [fixture.provider.picks[fixture.session].selectedModel, fixture.provider.picks[fixture.session].selectedEffort],
+      ['', ''],
+    );
   } finally {
     for (const subscription of subscriptions) subscription.dispose();
   }

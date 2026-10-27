@@ -100,7 +100,7 @@ import {
 import { USAGE_FRESH_MS, UsageBook, usageBar } from './usageview.ts';
 import { missingSetupValues } from './domain/session-setups.ts';
 import { tempDir } from './temproot.ts';
-import { QuestionRecovery, questionContinuation } from './questionrecovery';
+import { QuestionRecovery, questionContinuation, questionIdentity } from './questionrecovery';
 import { QuestionEvidenceReader } from './questionrecords';
 import { askCard, queueSubmissionAfter } from './composerview';
 import { normalizeQueuedSubmissions } from './turnview';
@@ -960,16 +960,56 @@ test('local dismissal survives pruning of readable question history', () => {
       },
     ],
   };
-  for (let index = 0; index <= 512; index++) {
-    vi.setSystemTime(index + 1);
-    assert.equal(
-      store.capture('claude', 'session', WS, { ...ask, toolUseId: index ? `item-${index}` : 'original' }),
-      true,
-    );
-    store.settle(store.entries()[0].identity, 'declined');
-  }
+  vi.setSystemTime(1);
+  assert.equal(store.capture('claude', 'session', WS, ask), true);
+  const original = store.entries()[0].identity;
+  store.settle(original, 'declined');
   store.release();
-  const restored = recoveryAt(root, '2');
+  const file = path.join(root, recoveryOrigin, 'questions.json');
+  const saved = JSON.parse(fs.readFileSync(file, 'utf8'));
+  const history = Array.from({ length: 511 }, (_, index) => {
+    const historicalAsk = { ...ask, toolUseId: `item-${index + 1}` };
+    const identity = questionIdentity('claude', 'session', WS, historicalAsk);
+    return {
+      identity,
+      agent: 'claude',
+      session: 'session',
+      cwd: WS,
+      source: null,
+      turn: null,
+      kind: 'claude',
+      ask: { ...historicalAsk, id: `recovered:${identity}` },
+      at: index + 2,
+      activation: '1'.repeat(24),
+      disposition: 'declined',
+    };
+  });
+  fs.writeFileSync(
+    file,
+    JSON.stringify({
+      version: 1,
+      questions: [...saved.questions, ...history],
+      closed: [...saved.closed, ...history.map((entry) => entry.identity)],
+    }),
+  );
+  const full = JSON.parse(fs.readFileSync(file, 'utf8'));
+  assert.equal(full.questions.length, 512);
+  assert.equal(
+    full.questions.some((entry: { identity: string }) => entry.identity === original),
+    true,
+  );
+  const pruning = recoveryAt(root, '2');
+  vi.setSystemTime(513);
+  assert.equal(pruning.capture('claude', 'session', WS, { ...ask, toolUseId: 'item-512' }), true);
+  pruning.settle(pruning.entries()[0].identity, 'declined');
+  pruning.release();
+  const pruned = JSON.parse(fs.readFileSync(file, 'utf8'));
+  assert.equal(pruned.questions.length, 512);
+  assert.equal(
+    pruned.questions.some((entry: { identity: string }) => entry.identity === original),
+    false,
+  );
+  const restored = recoveryAt(root, '3');
   assert.equal(restored.capture('claude', 'session', WS, ask), true);
   assert.equal(restored.entries().length, 0);
   restored.release();

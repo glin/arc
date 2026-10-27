@@ -12,6 +12,7 @@ import {
 import { test, vi } from 'vitest';
 import { marked } from 'marked';
 import { launcherCustomRequest, setupListing } from './view/launcher';
+import { normalizePinnedSetups, pinValues } from './domain/session-setups';
 
 import assert from 'node:assert';
 import * as fs from 'node:fs';
@@ -5319,6 +5320,64 @@ test('recent setup rows say every visible fact and launch as recent', () => {
   );
 });
 
+test('the matching Sol xhigh recent stays visible and pinnable beside the inherited setup', () => {
+  const models = [
+    {
+      value: 'gpt-6.1-sol',
+      label: 'GPT-6.1-Sol',
+      description: '',
+      efforts: ['high', 'xhigh'].map((value) => ({ value, label: value, description: '' })),
+    },
+  ];
+  const accepted: SessionProfile = {
+    agent: 'codex',
+    model: 'gpt-6.1-sol',
+    effort: 'xhigh',
+    permissionMode: 'never',
+    source: 'recent',
+  };
+  const older = { ...accepted, effort: 'high', permissionMode: 'on-request' };
+  const recents = [accepted, older, accepted];
+  const current = composerState({
+    agent: 'codex',
+    models,
+    model: accepted.model,
+    effort: accepted.effort,
+    askMode: accepted.permissionMode,
+  });
+  const view = sessionLauncherView(current, recents, { codex: models });
+  assert.equal(view.inherited?.key, 'current');
+  assert.deepEqual(
+    view.recent.map((row) => row.key),
+    ['recent:0', 'recent:1'],
+  );
+  assert.deepEqual(view.recent[0].profile, accepted);
+  assert.match(view.recent[0].name, /Recent setups: Codex.*GPT-6.1-Sol.*xhigh.*Full Access/);
+  assert.equal(view.words.pinName, 'Pin setup');
+  assert.deepEqual(launcherProfile(view, { kind: 'row', key: 'recent:0' }), accepted);
+  const pins = pinValues([], view.recent[0].profile, 'same');
+  const pinned = sessionLauncherView(current, recents, { codex: models }, pins);
+  assert.deepEqual(
+    pinned.recent.map((row) => row.key),
+    ['recent:1'],
+  );
+  assert.deepEqual(launcherProfile(pinned, { kind: 'row', key: 'pin:same' }), accepted);
+  assert.equal(pinned.primary?.key, 'current');
+  const changed = sessionLauncherView(
+    { ...current, settings: { ...current.settings, selectedEffort: 'high' } },
+    recents,
+    { codex: models },
+  );
+  assert.deepEqual(
+    changed.recent.map((row) => row.key),
+    ['recent:0', 'recent:1'],
+  );
+  assert.deepEqual(
+    sessionLauncherView(null, recents, { codex: models }).recent.map((row) => row.key),
+    ['recent:0', 'recent:1'],
+  );
+});
+
 test('pending catalogs keep stored setups startable until a loaded catalog rejects their model', () => {
   for (const agent of ['claude', 'codex'] as const) {
     const profile: SessionProfile = {
@@ -6036,10 +6095,10 @@ test('a draft reads its own setup and never the session it was copied from', () 
 
 test('a draft control with nothing behind it cannot be pressed and says why', () => {
   const waiting = draftDrawn({ models: [] }, { model: '', effort: '' });
-  assert.equal(waiting.picks[1].label, 'Model not reported');
+  assert.equal(waiting.picks[1].label, 'Claude default');
   assert.equal(
     waiting.picks[1].name,
-    'Model: Model not reported, for this draft. Claude has not said yet which models it runs.',
+    'Model: Claude default, for this draft. Claude has not said yet which models it runs.',
   );
   const quick = draftDrawn({}, { model: 'haiku-5', effort: '' });
   assert.equal(quick.picks[2].label, 'No effort setting');
@@ -6387,7 +6446,7 @@ test('a draft with no model settled calls its effort the default rather than non
   // An absent draft model reports unavailable effort without claiming the model has no effort setting.
 
   const fresh = draftDrawn({}, { model: '', effort: '' });
-  assert.equal(fresh.draftTag?.detail, 'Claude · Model not reported · Effort not reported · Auto');
+  assert.equal(fresh.draftTag?.detail, 'Claude · Claude default · Effort not reported · Auto');
   assert.equal(fresh.picks[2].label, 'Effort not reported');
   assert.equal(
     fresh.picks[2].name,
@@ -8006,7 +8065,7 @@ test('native Claude window defaults label and select the catalog model in drafts
     menu.items.filter((item) => item.checked).map((item) => item.value),
     ['opus'],
   );
-  assert.equal(composerView(state)?.picks.find((item) => item.control === 'model')?.label, 'Opus 5.5');
+  assert.equal(composerView(state)?.picks.find((item) => item.control === 'model')?.label, 'Opus 5.5 (default)');
   const launcher = sessionLauncherView(null, [profile], { claude: NATIVE_WINDOW_MODELS }, [], {
     claude: NATIVE_WINDOW_DEFAULTS,
   });
@@ -8017,7 +8076,7 @@ test('native Claude window defaults label and select the catalog model in drafts
   assert.equal(selectedModelPick(NATIVE_WINDOW_MODELS, '', NATIVE_WINDOW_DEFAULTS)?.value, 'opus');
   assert.equal(modelLabel(NATIVE_WINDOW_MODELS, '', NATIVE_WINDOW_DEFAULTS), 'Opus 5.5');
   assert.ok(launcher.primary?.detail.includes('Opus 5.5'));
-  assert.ok(!launcher.primary?.detail.includes('(default)'));
+  assert.ok(launcher.primary?.detail.includes('Opus 5.5 (default)'));
 });
 
 test('native Claude window defaults tag and check the live catalog model without a saved pick', () => {
@@ -8140,7 +8199,7 @@ test.each(['claude-opus-4-20250514', 'claude-opus-5-20260115', 'claude-sonnet-5-
       menu.items.map((item) => [item.value, item.label, item.checked]),
       [['snapshot', 'Dated model (default)', true]],
     );
-    assert.equal(composerView(state)?.picks.find((item) => item.control === 'model')?.label, 'Dated model');
+    assert.equal(composerView(state)?.picks.find((item) => item.control === 'model')?.label, 'Dated model (default)');
     const launcher = sessionLauncherView(null, [profile], { claude: catalog }, [], { claude: defaults });
     assert.deepEqual(
       launcher.agents.find((item) => item.value === 'claude')?.models.map((item) => item.label),
@@ -8154,6 +8213,90 @@ test.each(['claude-opus-4-20250514', 'claude-opus-5-20260115', 'claude-sonnet-5-
     assert.deepEqual(modelAfterPick(catalog, '', '', 'snapshot', defaults), { model: '', effort: '' });
   },
 );
+
+test('omitted model summaries name the agent default without changing saved setup values', () => {
+  for (const agent of ['claude', 'codex'] as const) {
+    const name = agent === 'claude' ? 'Claude' : 'Codex';
+    const models = [
+      {
+        value: 'model',
+        resolvedModel: 'model-identity',
+        label: 'Model',
+        description: '',
+        efforts: [{ value: 'high', label: 'High', description: '' }],
+      },
+    ];
+    for (const status of ['ready', 'loading', 'unavailable', 'absent'] as const) {
+      const defaults =
+        status === 'absent'
+          ? {}
+          : {
+              base: {
+                status,
+                model: 'model-identity',
+                effort: 'high',
+                reason: status === 'unavailable' ? 'Settings unavailable' : '',
+              },
+              models: { model: { status: 'ready' as const, model: 'model-identity', effort: 'high', reason: '' } },
+            };
+      const label = status === 'ready' ? 'Model (default)' : `${name} default`;
+      for (const effort of ['', 'high']) {
+        const profile: SessionProfile = { agent, model: '', effort, permissionMode: '', source: 'recent' };
+        const state = composerState({ agent, models, model: '', effort, askMode: '', profile, defaults });
+        const view = sessionLauncherView(state, [profile], { [agent]: models }, [], { [agent]: defaults });
+        const neutral = sessionLauncherView(null, [profile], { [agent]: models }, [], { [agent]: defaults });
+        const pins = normalizePinnedSetups(JSON.parse(JSON.stringify(pinValues([], profile, 'saved'))));
+        const pinned = sessionLauncherView(state, [profile], { [agent]: models }, pins, { [agent]: defaults });
+        for (const row of [view.inherited!, view.recent[0], view.primary!, neutral.primary!, pinned.pinned[0]]) {
+          assert.ok(row.detail.includes(`${name} · ${label} ·`), `${status}: ${row.detail}`);
+          assert.ok(row.name.includes(label), row.name);
+          assert.deepEqual([row.profile.model, row.profile.effort], ['', effort]);
+        }
+        assert.ok(view.recent[0].label.includes(label));
+        assert.ok(pinned.pinned[0].label.includes(label));
+        assert.ok(view.words.primaryDetail.includes(label));
+        assert.ok(neutral.words.primaryDetail.includes(label));
+        const draft = composerView(state)!;
+        assert.equal(draft.picks[1].label, label);
+        assert.ok(draft.picks[1].name.startsWith(`Model: ${label}, for this draft.`));
+        assert.ok(draft.draftTag?.detail.includes(`${name} · ${label} ·`));
+        assert.deepEqual(
+          draft.picks.map((pick) => pick.disabled),
+          [false, false, status !== 'ready', false],
+        );
+        if (status === 'unavailable') assert.equal(draft.picks[1].detail, 'Settings unavailable');
+        for (const [list, key] of [
+          [view, 'recent:0'],
+          [view, 'current'],
+          [neutral, 'recent:0'],
+          [pinned, 'pin:saved'],
+        ] as const) {
+          assert.deepEqual(launcherProfile(list, { kind: 'row', key }), {
+            ...profile,
+            source: key === 'current' ? 'inherited' : 'recent',
+          });
+        }
+        const edited = launcherCustomRequest(view, profile)!;
+        assert.deepEqual(launcherProfile(view, edited), { ...profile, source: 'custom' });
+        assert.deepEqual(pins, [{ id: 'saved', agent, model: '', effort, permissionMode: '' }]);
+        const savedSettings = JSON.parse(JSON.stringify(sessionSettingsForProfile(profile, models, defaults)));
+        assert.deepEqual([savedSettings.selectedModel, savedSettings.selectedEffort], ['', effort]);
+        const explicit = { ...profile, model: 'model' };
+        const explicitView = sessionLauncherView(null, [explicit], { [agent]: models }, [], { [agent]: defaults });
+        assert.equal(explicitView.recent[0].label, `${name} · Model`);
+        assert.deepEqual(launcherProfile(explicitView, { kind: 'row', key: 'recent:0' }), explicit);
+      }
+    }
+    const unresolved = sessionLauncherView(
+      null,
+      [{ agent, model: '', effort: '', permissionMode: '', source: 'recent' }],
+      { [agent]: models },
+      [],
+      { [agent]: { base: { status: 'ready', model: null, effort: null, reason: '' } } },
+    );
+    assert.equal(unresolved.recent[0].label, `${name} · ${name} default`);
+  }
+});
 
 test('omitted models keep supported effort through metadata changes and adoption', () => {
   for (const agent of ['claude', 'codex'] as const) {

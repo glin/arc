@@ -120,10 +120,9 @@ export function missingSetupValues(values: SetupValues, agents: readonly SetupCa
 export function visibleRecents<T extends SetupValues>(
   recents: readonly T[],
   saved: readonly SetupValues[],
-  current: SetupValues | null,
   agents: readonly SetupCatalogAgent[],
 ): T[] {
-  const shown = current ? [...saved, current] : [...saved];
+  const shown = [...saved];
   return recents
     .slice(0, RECENT_SETUP_LIMIT)
     .filter((one) => missingSetupValue(one, agents) === null)

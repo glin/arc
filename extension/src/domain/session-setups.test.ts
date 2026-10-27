@@ -83,8 +83,8 @@ test('recent choices retain ten, show eight, and hide duplicate or unavailable v
   ];
   assert.equal(RECENT_SETUP_LIMIT, 10);
   assert.equal(RECENT_SETUP_VISIBLE, 8);
-  assert.deepEqual(visibleRecents(recents, [], null, catalog), recents.slice(0, 8));
-  assert.deepEqual(visibleRecents(recents, [], null, [{ ...catalog[0], models: catalog[0].models.slice(10) }]), []);
-  assert.deepEqual(visibleRecents([OPUS, SONNET, OPUS, DEFAULTS], [SONNET], OPUS, CATALOG), [DEFAULTS]);
-  assert.deepEqual(visibleRecents([OPUS, OPUS, SONNET], [], null, CATALOG), [OPUS, SONNET]);
+  assert.deepEqual(visibleRecents(recents, [], catalog), recents.slice(0, 8));
+  assert.deepEqual(visibleRecents(recents, [], [{ ...catalog[0], models: catalog[0].models.slice(10) }]), []);
+  assert.deepEqual(visibleRecents([OPUS, SONNET, OPUS, DEFAULTS], [SONNET], CATALOG), [OPUS, DEFAULTS]);
+  assert.deepEqual(visibleRecents([OPUS, OPUS, SONNET], [], CATALOG), [OPUS, SONNET]);
 });
