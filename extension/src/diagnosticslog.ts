@@ -644,7 +644,7 @@ export class StartupHistory {
   private panelStarted: number | null = null;
   private selected = false;
   private background = false;
-  // Time with no visible panel after the first panel opened. Discovery continuations and polling wait for a visible panel.
+  // Time with no visible ready panel after the first panel opened. Discovery continuations and polling wait for one.
   private hiddenSince: number | null = null;
   private hiddenCount = 0;
   private hiddenMs = 0;

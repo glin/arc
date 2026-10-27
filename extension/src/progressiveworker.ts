@@ -295,7 +295,7 @@ export interface DiscoveryCharges extends Record<import('./codex').CodexDispatch
   dispatchPersonBytes: number;
   dispatchAggregateBytes: number;
   dispatchClaudeSpendBytes: number;
-  // The pass budget left after each Codex aggregate that stopped unfinished, summed over the stops the exhaustion counts count.
+  // The pass budget left after each Codex aggregate that read and stopped unfinished, summed over the stops in the exhaustion fields.
   dispatchAggregateRemainingBytes: number;
   dispatchAggregateRemainingMs: number;
   // The worker's time for the request, and the read whose limit ended a pass before the dispatched window.

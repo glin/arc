@@ -152,6 +152,8 @@ test.each(['claude', 'codex'] as const)(
                 result.value.kind === 'claude-children-progress' ? 1 : 0,
                 JSON.stringify(result.value.charges),
               );
+              // No read fails here, so no incomplete pass counts as other.
+              assert.equal(result.value.charges.otherPassEnds, 0, JSON.stringify(result.value.charges));
               receiptEnds += result.value.charges.receiptPassEnds;
             }
             if (result.value.kind === 'claude-children-progress' || host?.dispatchDiscoveryPending) {
@@ -11613,6 +11615,48 @@ test('discovery publishes bounded delegated spend and reuses completed sources a
     assert.ok(
       total < 4 * (fs.statSync(childFile).size + fs.statSync(nestedFile).size),
       `completed work was reread: ${total}, first ${firstBytes}`,
+    );
+  } finally {
+    worker.stop();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('a Claude parent left unfinished by its quantum ends the pass on the transcript allowance', async () => {
+  const directory = tempDir('transcript-pass-end-');
+  const file = path.join(directory, 'parent.jsonl');
+  fs.writeFileSync(
+    file,
+    Array.from(
+      { length: 8 },
+      (_, index) => JSON.stringify({ type: 'ignored', index, text: 'x'.repeat(12 * 1024) }) + '\n',
+    ).join(''),
+  );
+  const parent = {
+    file,
+    sessionId: 'parent',
+    agent: 'claude' as const,
+    ...revisionOf(fs.statSync(file, { bigint: true })),
+  };
+  const worker = new ProgressiveWorker(`process.env.ARC_HOME=${JSON.stringify(directory)};` + source);
+  try {
+    const result = await worker.run(
+      {
+        kind: 'claude-children',
+        parents: [parent],
+        catalog: [parent],
+        repositoryRoots: [directory],
+        quantumBytes: 24 * 1024,
+      },
+      1,
+      new AbortController().signal,
+    );
+    assert.ok(result?.value.kind === 'claude-children-progress', result?.value.kind);
+    const charges = result.value.charges;
+    assert.deepEqual(
+      [charges.transcriptPassEnds, charges.receiptPassEnds, charges.otherPassEnds],
+      [1, 0, 0],
+      JSON.stringify(charges),
     );
   } finally {
     worker.stop();

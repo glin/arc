@@ -418,6 +418,7 @@ async function execute(
     }
   }
   if (request.kind === 'claude-children') {
+    const passStarted = performance.now();
     for (const [file, entry] of request.referenceEntries ?? []) {
       const key = normalizeFsPath(file);
       if (!claudeChildReferences.has(key)) {
@@ -498,7 +499,6 @@ async function execute(
       receiptPassEnds: 0,
       otherPassEnds: 0,
     };
-    const passStarted = performance.now();
     // A parent check is one stat of a candidate source, so it reads no bytes.
     const parentCheck = <T>(check: () => T): T => {
       const startedAt = performance.now();
@@ -899,7 +899,8 @@ async function execute(
     parentStamps.clear();
     found = walk();
     if (incomplete || [...candidates].some(([key, parent]) => parent.agent === 'claude' && !completed.has(key))) {
-      charges.otherPassEnds++;
+      // A Claude transcript left unread or unfinished ends the pass on the transcript allowance. A failed read ends it otherwise.
+      if (!signal.aborted) charges[incomplete ? 'otherPassEnds' : 'transcriptPassEnds']++;
       return pending();
     }
     for (const [file] of candidates) {

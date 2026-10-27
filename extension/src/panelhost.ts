@@ -4253,6 +4253,7 @@ export class PanelProvider implements vscode.Disposable {
         this.health?.event('disposed', this.healthPanel(host).id);
         this.healthPanels?.delete(host);
         this.readyHosts.delete(host);
+        this.startupHistory?.visibility(this.anyVisible());
         this.readerPages?.delete(host);
         for (const waiter of this.filterReady ?? []) {
           if (waiter.webview === host.webview)
@@ -4326,6 +4327,7 @@ export class PanelProvider implements vscode.Disposable {
     this.health?.event('ready', panel.id);
     if (this.readyHosts.has(host)) return;
     this.readyHosts.add(host);
+    this.startupHistory?.visibility(this.anyVisible());
     void this.sendToHost(host, this.panelVisibility.current(host, host.visible()));
     if (this.saved) {
       void this.sendToHost(host, { type: 'readState', state: this.readSynchronization() });
