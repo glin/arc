@@ -17638,6 +17638,9 @@ test('dispatched Codex progress distinguishes advancement, source restarts, inva
     dispatchSpendSourceRestarts: 0,
     dispatchSpendParserAdvancements: 0,
     dispatchSpendRootWaits: 0,
+    dispatchSpendAggregateExhaustedBytes: 0,
+    dispatchSpendAggregateExhaustedTime: 0,
+    dispatchSpendAggregateExhaustedSource: 0,
   };
   const completed: string[] = [];
   const read = (file = files[0], budget = { bytes: 65536, ms: Infinity }) =>
@@ -17654,12 +17657,15 @@ test('dispatched Codex progress distinguishes advancement, source restarts, inva
   retainCodexDispatchSpendRoots(new Set());
   try {
     assert.equal(read().pending, true);
-    assert.deepEqual(Object.values(counts), [1, 0, 0, 0, 0, 1, 0]);
+    assert.deepEqual(Object.values(counts).slice(0, 7), [1, 0, 0, 0, 0, 1, 0]);
+    // The clock stands still, so the aggregate stops on its byte budget.
+    assert.equal(counts.dispatchSpendAggregateExhaustedBytes, 1);
+    assert.equal(counts.dispatchSpendAggregateExhaustedTime, 0);
     assert.equal(read().pending, true);
-    assert.deepEqual(Object.values(counts), [1, 0, 0, 0, 0, 2, 0]);
+    assert.deepEqual(Object.values(counts).slice(0, 7), [1, 0, 0, 0, 0, 2, 0]);
     fs.appendFileSync(files[0], JSON.stringify({ type: 'ignored' }) + '\n');
     assert.equal(read().pending, true);
-    assert.deepEqual(Object.values(counts), [1, 0, 0, 0, 1, 3, 0]);
+    assert.deepEqual(Object.values(counts).slice(0, 7), [1, 0, 0, 0, 1, 3, 0]);
     for (let attempt = 0; attempt < 8 && !completed.includes(files[0]); attempt++) read();
     assert.deepEqual(completed, [files[0]], 'the root must finish while its child remains pending');
     const original = fs.readFileSync(files[0], 'utf8');
@@ -17739,6 +17745,7 @@ test('dispatched Codex progress counts a revision rejected after source finaliza
       'dispatchSpendParserAdvancements',
       'dispatchSpendParserAdvancements',
       'dispatchSpendSourceRestarts',
+      'dispatchSpendAggregateExhaustedSource',
     ]);
   } finally {
     stat.mockRestore();

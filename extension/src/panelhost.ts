@@ -3896,6 +3896,8 @@ export class PanelProvider implements vscode.Disposable {
       this.recoveryOrigin = restored;
       this.onRecoveryOrigin?.(restored);
     }
+    // Separates the editor's call to restore a tab from the panel's opening, which can wait for saved prompts.
+    this.startupHistory?.stage('panelRevived');
     const request = this.health?.begin('serializer');
     let outcome: 'returned' | 'failed' = 'returned';
     try {
@@ -4230,6 +4232,7 @@ export class PanelProvider implements vscode.Disposable {
         if (!this.readyHosts.has(host)) {
           return;
         }
+        this.startupHistory?.visibility(this.anyVisible());
         this.publishWindowState();
         void this.sendToHost(host, this.panelVisibility.current(host, host.visible()));
         // Keep polling while any ready host remains visible. Stop polling when no ready host is visible.

@@ -644,6 +644,10 @@ export class StartupHistory {
   private panelStarted: number | null = null;
   private selected = false;
   private background = false;
+  // Time with no visible panel after the first panel opened. Discovery continuations and polling wait for a visible panel.
+  private hiddenSince: number | null = null;
+  private hiddenCount = 0;
+  private hiddenMs = 0;
 
   constructor(
     private readonly directory: string,
@@ -653,6 +657,17 @@ export class StartupHistory {
   ) {
     this.started = activationAt;
     this.stage('activation', this.started);
+  }
+
+  visibility(visible: boolean, at = this.now()): void {
+    if (this.background || this.panelStarted === null) return;
+    if (!visible && this.hiddenSince === null) {
+      this.hiddenSince = at;
+      this.hiddenCount++;
+    } else if (visible && this.hiddenSince !== null) {
+      this.hiddenMs += at - this.hiddenSince;
+      this.hiddenSince = null;
+    }
   }
 
   stage(name: string, at = this.now()): void {
@@ -724,6 +739,10 @@ export class StartupHistory {
               ? null
               : this.stages.firstCard - this.panelStarted,
           stages: { ...this.stages },
+          hidden: {
+            count: this.hiddenCount,
+            ms: this.hiddenMs + (this.hiddenSince === null ? 0 : at - this.hiddenSince),
+          },
           memory: {
             scope: 'extension-host process including all extensions and worker threads',
             currentHeapScope: 'extension-host thread',

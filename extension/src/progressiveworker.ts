@@ -291,6 +291,18 @@ export interface DiscoveryCharges extends Record<import('./codex').CodexDispatch
   dispatchSpendFiles: number;
   dispatchSpendBytes: number;
   dispatchSpendMs: number;
+  // The dispatched window's bytes by reader. Its other reads, such as subagent metadata, make up the rest of dispatchSpendBytes.
+  dispatchPersonBytes: number;
+  dispatchAggregateBytes: number;
+  dispatchClaudeSpendBytes: number;
+  // The pass budget left after each Codex aggregate that stopped unfinished, summed over the stops the exhaustion counts count.
+  dispatchAggregateRemainingBytes: number;
+  dispatchAggregateRemainingMs: number;
+  // The worker's time for the request, and the read whose limit ended a pass before the dispatched window.
+  passMs: number;
+  transcriptPassEnds: number;
+  receiptPassEnds: number;
+  otherPassEnds: number;
 }
 // One verified child transcript whose recorded edits a file action needs.
 // The revision is the child's spend file version, the same revision its summary figures carry.

@@ -115,6 +115,7 @@ test.each(['claude', 'codex'] as const)(
         try {
           let passes = 0;
           let entries = 0;
+          let receiptEnds = 0;
           for (; passes < 100; passes++) {
             const generation = passes + 1;
             if (host) {
@@ -143,6 +144,15 @@ test.each(['claude', 'codex'] as const)(
                 'Receipt reads exceeded the remaining request allowance',
               );
               assert.ok((result.value.charges.receiptBytes ?? 0) <= result.value.charges.readBytes);
+              // An incomplete pass names the one read whose limit ended it, and a pass that reaches the dispatched window names none.
+              assert.equal(
+                result.value.charges.transcriptPassEnds +
+                  result.value.charges.receiptPassEnds +
+                  result.value.charges.otherPassEnds,
+                result.value.kind === 'claude-children-progress' ? 1 : 0,
+                JSON.stringify(result.value.charges),
+              );
+              receiptEnds += result.value.charges.receiptPassEnds;
             }
             if (result.value.kind === 'claude-children-progress' || host?.dispatchDiscoveryPending) {
               entries += result.value.charges?.receiptEntries ?? 0;
@@ -168,6 +178,7 @@ test.each(['claude', 'codex'] as const)(
             );
             assert.ok(passes > 0, 'the store did not exceed one slice');
             assert.ok(entries >= 256);
+            assert.ok(receiptEnds > 0, 'no pass ended in the receipt store');
             if (host) {
               assert.equal(host.dispatchDiscoveryPending, false);
               assert.equal(host.discoveryCheckpoint, undefined);
@@ -11714,17 +11725,46 @@ test('a dispatched spend aggregate settles in bounded passes after earlier dispa
     clockFs.readFileSync = function (...args) { readClock++; return clockReadFile.apply(this, args); };
     Date.now = () => ${Date.now() + 7_200_000};` + source,
   );
+  const sizes = (ids: string[]) =>
+    ids.reduce((sum, id) => sum + fs.statSync(path.join(directory, id + '.jsonl')).size, 0);
+  const codexRoots = sizes([rootId, ...waitingIds]);
+  const aggregateSources = sizes([rootId, ...childIds, ...waitingIds]);
   try {
     const advancements: number[] = [];
+    const split = { person: 0, aggregate: 0, bytes: 0, time: 0, source: 0, remainingBytes: 0, remainingMs: 0 };
     let settled: ProgressiveResult | null = null;
+    let windows = 0;
     for (let pass = 0; pass < 12 && !settled; pass++) {
+      const claudeBytes = sizes(claudeIds);
       const result = await worker.run(request(), 1, new AbortController().signal);
       assert.ok(result?.value.kind === 'claude-children' || result?.value.kind === 'claude-children-progress');
       // Live Claude dispatched sessions grow between passes, so every pass rereads them before the Codex root.
       for (const sessionId of claudeIds)
         fs.appendFileSync(path.join(directory, sessionId + '.jsonl'), JSON.stringify({ type: 'ignored', pass }) + '\n');
       if (result.value.kind !== 'claude-children') continue;
-      advancements.push(result.value.charges!.dispatchSpendParserAdvancements);
+      const charges = result.value.charges!;
+      advancements.push(charges.dispatchSpendParserAdvancements);
+      // Each reader's bytes are its own: whole Claude rereads, one person scan of each quiet Codex root, and the aggregate reads.
+      assert.equal(charges.dispatchClaudeSpendBytes, claudeBytes, `Claude spend bytes in window ${windows}`);
+      if (windows === 0)
+        assert.ok(
+          charges.dispatchPersonBytes >= codexRoots && charges.dispatchPersonBytes <= codexRoots + 3 * 64 * 1024,
+          `person scan bytes ${charges.dispatchPersonBytes} for ${codexRoots} bytes of Codex roots`,
+        );
+      else assert.equal(charges.dispatchPersonBytes, 0, `person scan bytes in window ${windows}`);
+      assert.ok(
+        charges.dispatchPersonBytes + charges.dispatchAggregateBytes + charges.dispatchClaudeSpendBytes <=
+          charges.dispatchSpendBytes,
+      );
+      assert.ok(charges.passMs >= charges.dispatchSpendMs && charges.passMs > 0, JSON.stringify(charges));
+      split.person += charges.dispatchPersonBytes;
+      split.aggregate += charges.dispatchAggregateBytes;
+      split.bytes += charges.dispatchSpendAggregateExhaustedBytes;
+      split.time += charges.dispatchSpendAggregateExhaustedTime;
+      split.source += charges.dispatchSpendAggregateExhaustedSource;
+      split.remainingBytes += charges.dispatchAggregateRemainingBytes;
+      split.remainingMs += charges.dispatchAggregateRemainingMs;
+      windows++;
       if (!result.value.continuation) settled = result;
     }
     assert.ok(
@@ -11736,6 +11776,29 @@ test('a dispatched spend aggregate settles in bounded passes after earlier dispa
     assert.equal(facts.get(rootId)?.spend.partial, false);
     assert.equal(facts.get(rootId)?.spend.models[0]?.usage.output, 12, 'the root and its three children each add 3');
     for (const sessionId of waitingIds) assert.equal(facts.get(sessionId)?.spend.found, true);
+    // The aggregates read each source once, with a bounded overlap per file, and on this clock every unfinished aggregate
+    // stops on the pass time.
+    assert.ok(
+      split.aggregate >= aggregateSources && split.aggregate <= aggregateSources + 6 * 64 * 1024,
+      `${JSON.stringify(split)} for ${aggregateSources} bytes of aggregate sources`,
+    );
+    assert.ok(split.time > 0 && split.bytes === 0 && split.source === 0, JSON.stringify(split));
+    assert.ok(split.remainingMs <= 0 && split.remainingBytes > 0, JSON.stringify(split));
+    // With the clock still and a 64 KiB pass budget, an aggregate stops on bytes and leaves no byte budget.
+    const bytesWorker = new ProgressiveWorker('performance.now=()=>0;' + dispatchWorkerSource(64));
+    try {
+      const stops = { bytes: 0, time: 0, remainingBytes: 0 };
+      for (let pass = 0; pass < 12 && !stops.bytes; pass++) {
+        const result = await bytesWorker.run(request(), 1, new AbortController().signal);
+        if (result?.value.kind !== 'claude-children') continue;
+        stops.bytes += result.value.charges!.dispatchSpendAggregateExhaustedBytes;
+        stops.time += result.value.charges!.dispatchSpendAggregateExhaustedTime;
+        stops.remainingBytes += result.value.charges!.dispatchAggregateRemainingBytes;
+      }
+      assert.ok(stops.bytes > 0 && stops.time === 0 && stops.remainingBytes <= 0, JSON.stringify(stops));
+    } finally {
+      bytesWorker.stop();
+    }
   } finally {
     worker.stop();
     fs.rmSync(directory, { recursive: true, force: true });

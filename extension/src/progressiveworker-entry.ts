@@ -485,7 +485,20 @@ async function execute(
       dispatchSpendSourceRestarts: 0,
       dispatchSpendParserAdvancements: 0,
       dispatchSpendRootWaits: 0,
+      dispatchSpendAggregateExhaustedBytes: 0,
+      dispatchSpendAggregateExhaustedTime: 0,
+      dispatchSpendAggregateExhaustedSource: 0,
+      dispatchPersonBytes: 0,
+      dispatchAggregateBytes: 0,
+      dispatchClaudeSpendBytes: 0,
+      dispatchAggregateRemainingBytes: 0,
+      dispatchAggregateRemainingMs: 0,
+      passMs: 0,
+      transcriptPassEnds: 0,
+      receiptPassEnds: 0,
+      otherPassEnds: 0,
     };
+    const passStarted = performance.now();
     // A parent check is one stat of a candidate source, so it reads no bytes.
     const parentCheck = <T>(check: () => T): T => {
       const startedAt = performance.now();
@@ -587,6 +600,7 @@ async function execute(
     };
     // A delta without a source carries completion changes alone, such as the seed's.
     const pending = (source?: string, delta = source !== undefined) => {
+      charges.passMs = performance.now() - passStarted;
       epoch.sequence++;
       // Request boundaries return whole checkpoints. Quanta reuse the host's frozen header.
       if (delta) {
@@ -725,6 +739,7 @@ async function execute(
           continuation = true;
           break;
         }
+        if (!signal.aborted) charges.transcriptPassEnds++;
         return pending();
       }
       const readsBefore = charges.readBytes;
@@ -883,8 +898,10 @@ async function execute(
     }
     parentStamps.clear();
     found = walk();
-    if (incomplete || [...candidates].some(([key, parent]) => parent.agent === 'claude' && !completed.has(key)))
+    if (incomplete || [...candidates].some(([key, parent]) => parent.agent === 'claude' && !completed.has(key))) {
+      charges.otherPassEnds++;
       return pending();
+    }
     for (const [file] of candidates) {
       if (completed.has(file)) continue;
       const entry = claudeChildReferences.get(file);
@@ -898,7 +915,10 @@ async function execute(
         completionChanges.set(file, false);
         claudeChildReferences.set(file, { ...entry, complete: false, relationshipComplete: false });
         continuation = true;
-        if (candidates.get(file)!.agent === 'claude') return pending();
+        if (candidates.get(file)!.agent === 'claude') {
+          charges.otherPassEnds++;
+          return pending();
+        }
       }
     }
 
@@ -928,8 +948,10 @@ async function execute(
     const receiptDeadline = performance.now() + RELATIONSHIP_SLICE_MS;
     let receiptSteps = 0;
     while (!signal.aborted) {
-      if (requestBytes <= charges.readBytes || receiptSteps >= 256 || performance.now() >= receiptDeadline)
+      if (requestBytes <= charges.readBytes || receiptSteps >= 256 || performance.now() >= receiptDeadline) {
+        charges.receiptPassEnds++;
         return pending();
+      }
       const step = activeReceipts.steps.next({ entries: 1, checks: 1, bytes: requestBytes - charges.readBytes });
       if (step.done) break;
       charges.receiptEntries! += step.value.entries;
@@ -953,6 +975,7 @@ async function execute(
         transcriptReferences.some((reference) => reference.kind === 'dispatch' && reference.file))
     ) {
       closeReceiptScan();
+      charges.otherPassEnds++;
       return pending();
     }
     discoveryPosition = epoch.position;
@@ -1024,10 +1047,12 @@ async function execute(
             ? held.codexPerson
             : undefined;
         const previousBytes = previousPerson?.bytes ?? 0;
+        const personBefore = dispatchReads.bytes;
         const codexPerson =
           reference.agent === 'codex'
             ? scanForCodexPerson(reference.file, revision.size, previousPerson, reference.sessionId)
             : undefined;
+        charges.dispatchPersonBytes += dispatchReads.bytes - personBefore;
         if (!sameRevision(revision, revisionOf(reference.file))) {
           charges.dispatchRetries++;
           continuation = true;
@@ -1066,6 +1091,7 @@ async function execute(
         const active = now < refreshAt;
         if (active && reference.agent === 'codex') releaseCodexDispatchSpend(reference.file);
         let spendPending = false;
+        const spendBefore = dispatchReads.bytes;
         const spend: AgentSpend = active
           ? { models: [], found: false, partial: false, effort: null }
           : reference.agent === 'codex'
@@ -1079,13 +1105,21 @@ async function execute(
                     codexDependencies = files;
                   },
                   (file, entry) => parentPort?.postMessage({ dispatchSpend: [file, entry] }),
-                  (event) => charges[event]++,
+                  (event) => {
+                    charges[event]++;
+                    if (event.startsWith('dispatchSpendAggregateExhausted')) {
+                      charges.dispatchAggregateRemainingBytes += dispatchBudget.bytes;
+                      charges.dispatchAggregateRemainingMs += dispatchBudget.ms;
+                    }
+                  },
                 );
                 spendPending = result.pending;
                 continuation ||= result.pending;
                 return result.spend;
               })()
             : readClaudeAgentSpend(reference.file, request.repositoryRoots, false, subagentMetas);
+        charges[reference.agent === 'codex' ? 'dispatchAggregateBytes' : 'dispatchClaudeSpendBytes'] +=
+          dispatchReads.bytes - spendBefore;
         if (!active && activity.unfinished) {
           spend.unfinished = true;
           if (spend.artifacts) {
@@ -1094,10 +1128,12 @@ async function execute(
         }
         // Claude scans active appends. Codex retains its bounded prompt cursor across quiet
         // reads because a cached spend can precede delayed copied-turn context.
+        const scanBefore = dispatchReads.bytes;
         const scan =
           active && reference.agent === 'claude'
             ? scanForPerson(reference.file, revision.size, held?.person, held ? held.revision.size : revision.size)
             : undefined;
+        charges.dispatchPersonBytes += dispatchReads.bytes - scanBefore;
         const person =
           reference.agent === 'codex'
             ? codexPerson && codexPerson.bytes >= revision.size
@@ -1188,6 +1224,7 @@ async function execute(
       };
       savedDispatchFacts.set(normalizeFsPath(file), held.saved);
     }
+    charges.passMs = performance.now() - passStarted;
     return {
       kind: 'claude-children',
       checkpoint: { ...epoch, completed: [...completed], sequence: epoch.sequence + 1 },

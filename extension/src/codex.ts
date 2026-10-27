@@ -5401,7 +5401,10 @@ export type CodexDispatchSpendProgress =
   | 'dispatchSpendConsumedSourceInvalidations'
   | 'dispatchSpendSourceRestarts'
   | 'dispatchSpendParserAdvancements'
-  | 'dispatchSpendRootWaits';
+  | 'dispatchSpendRootWaits'
+  | 'dispatchSpendAggregateExhaustedBytes'
+  | 'dispatchSpendAggregateExhaustedTime'
+  | 'dispatchSpendAggregateExhaustedSource';
 
 export function readCodexDispatchedSpendQuantum(
   file: string,
@@ -5443,6 +5446,7 @@ export function readCodexDispatchedSpendQuantum(
   }
   // The budget's time counts only this reader's work, so earlier reads in the caller's pass leave it intact.
   const startedAt = performance.now();
+  let sourceStop = false;
   while (!aggregate.next.done && budget.bytes > 0 && (!budget.advanced || performance.now() - startedAt < budget.ms)) {
     const source = aggregate.next.value;
     const key = dispatchSpendKey(source);
@@ -5467,11 +5471,15 @@ export function readCodexDispatchedSpendQuantum(
         if (!next.value.end) continue;
         next = aggregate.source.scan.next();
         progress?.('dispatchSpendParserAdvancements');
-        if (!next.done) break;
+        if (!next.done) {
+          sourceStop = true;
+          break;
+        }
       }
       aggregate.source = null;
       if (dispatchSpendKey(source) !== key) {
         progress?.('dispatchSpendSourceRestarts');
+        sourceStop = true;
         break;
       }
       parsed = next.value;
@@ -5496,6 +5504,14 @@ export function readCodexDispatchedSpendQuantum(
     pendingDispatchAggregates.delete(file);
     return { spend, pending: false };
   }
+  // An unfinished aggregate names what stopped it, once the budget carries this reader's time.
+  progress?.(
+    sourceStop
+      ? 'dispatchSpendAggregateExhaustedSource'
+      : budget.bytes <= 0
+        ? 'dispatchSpendAggregateExhaustedBytes'
+        : 'dispatchSpendAggregateExhaustedTime',
+  );
   return { spend: { models: [], found: false, partial: true, effort: null }, pending: true };
 }
 

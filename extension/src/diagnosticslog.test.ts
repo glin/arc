@@ -474,6 +474,18 @@ test('unfinished startup keeps fresh durable work after the pending deadline wit
     dispatchSpendSourceRestarts: 0,
     dispatchSpendParserAdvancements: 0,
     dispatchSpendRootWaits: 0,
+    dispatchSpendAggregateExhaustedBytes: 0,
+    dispatchSpendAggregateExhaustedTime: 0,
+    dispatchSpendAggregateExhaustedSource: 0,
+    dispatchPersonBytes: 0,
+    dispatchAggregateBytes: 0,
+    dispatchClaudeSpendBytes: 0,
+    dispatchAggregateRemainingBytes: 0,
+    dispatchAggregateRemainingMs: 0,
+    passMs: 0,
+    transcriptPassEnds: 0,
+    receiptPassEnds: 0,
+    otherPassEnds: 0,
     continuations: 0,
     publications: 0,
   };
@@ -560,6 +572,9 @@ test('unfinished startup keeps fresh durable work after the pending deadline wit
         ['dispatchSpendSourceRestarts', 5],
         ['dispatchSpendParserAdvancements', 6],
         ['dispatchSpendRootWaits', 7],
+        ['dispatchSpendAggregateExhaustedBytes', 0],
+        ['dispatchSpendAggregateExhaustedTime', 0],
+        ['dispatchSpendAggregateExhaustedSource', 0],
       ],
     );
     assert.equal(record.work.worker.active[0].ageMs, 180_000);
@@ -620,6 +635,42 @@ test('empty startup completion excludes a first card and samples from later acti
   } finally {
     history.dispose();
     sample.mockRestore();
+    vi.useRealTimers();
+  }
+});
+
+test('startup history counts the time with no visible panel after the first panel opened', async () => {
+  const directory = tempDir('startup-hidden-history');
+  vi.useFakeTimers();
+  let clock = 0;
+  const history = new StartupHistory(
+    directory,
+    () => ({}),
+    () => clock,
+    0,
+  );
+  try {
+    // A change before the panel opens is not startup time.
+    history.visibility(false);
+    clock = 5;
+    history.stage('panelOpened');
+    history.visibility(true);
+    clock = 10;
+    history.visibility(false);
+    clock = 25;
+    history.visibility(true);
+    clock = 30;
+    history.visibility(false);
+    history.visibility(false);
+    clock = 40;
+    history.stage('completeRender');
+    await vi.waitFor(() => {
+      const lines = fs.readdirSync(directory).flatMap((file) => readLines(path.join(directory, file)));
+      // The record counts the closed interval and the open one up to the record. A repeated hide adds nothing.
+      assert.deepEqual(lines.find((line) => line.outcome === 'background-complete')?.hidden, { count: 2, ms: 25 });
+    });
+  } finally {
+    history.dispose();
     vi.useRealTimers();
   }
 });
