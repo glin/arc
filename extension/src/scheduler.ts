@@ -393,14 +393,19 @@ export function sessionDirectoryOwners(
   };
 }
 
-// Where a path outside the held catalog sits, so a counter can say which files keep the catalog walking.
-// `walkedUnlistedClaude` and `walkedUnlistedCodex`: the last walk saw the file and left it out of the catalog.
-// `newBesideClaudeTranscript`, `newBesideChildTranscript` and `newBesideCodexRollout`: the last walk did not see the
-// file, and its directory holds a listed transcript, child transcript or rollout.
+// Where a path outside the held catalog sits, so a counter can say which files keep the catalog walking. The first
+// shape that matches decides.
+// `walkListedNotHeld`: the last walk listed the file, and the held catalog no longer lists it.
+// `walkedUnlistedChild`, `walkedUnlistedClaude` and `walkedUnlistedCodex`: the last walk's file list holds the file, a
+// child transcript in a `subagents` directory, another Claude file or a rollout, and the walk did not list it.
+// `newBesideClaudeTranscript`, `newBesideChildTranscript` and `newBesideCodexRollout`: the last walk's file list does not
+// hold the file, and its directory holds a listed transcript, child transcript or rollout.
 // `unlistedDirectory`: the file is inside a source root, and its directory holds no listed file.
 // `outsideRoots`: the file is outside every source root.
-// `unclassified`: no walk recorded its files, so nothing above can be told.
+// `unclassified`: no walk recorded its files.
 export type UnknownPathShape =
+  | 'walkListedNotHeld'
+  | 'walkedUnlistedChild'
   | 'walkedUnlistedClaude'
   | 'walkedUnlistedCodex'
   | 'newBesideClaudeTranscript'
@@ -410,17 +415,20 @@ export type UnknownPathShape =
   | 'outsideRoots'
   | 'unclassified';
 
-// The shape of each path outside the held catalog, from the catalog and the files the last walk enumerated. `normalize`
-// applies the platform's path rules to the catalog, the walk and the path alike.
+// The shape of each path outside the held catalog, from the catalog, the last walk's listed files and the files that walk
+// enumerated. `normalize` applies the platform's path rules to every input alike. The returned function builds its
+// indexes on its first call and keeps them, so a caller reuses it while the inputs stay the same.
 export function unknownPathShapes(
   catalog: readonly { agent: string; file: string; childTranscript?: boolean }[],
   walked: {
+    listed: readonly { file: string }[];
     claude: { root?: string; files: readonly string[] };
     codex: { root?: string; files: readonly string[] };
   } | null,
   normalize: (file: string) => string,
 ): (file: string) => UnknownPathShape {
   let index: {
+    walkListed: Set<string>;
     claude: Set<string>;
     codex: Set<string>;
     listed: Map<string, Set<'claude' | 'child' | 'codex'>>;
@@ -438,16 +446,20 @@ export function unknownPathShapes(
         listed.set(directory, kinds);
       }
       index = {
+        walkListed: new Set(walked.listed.map((row) => normalize(row.file))),
         claude: new Set(walked.claude.files.map(normalize)),
         codex: new Set(walked.codex.files.map(normalize)),
         listed,
         roots: [walked.claude.root, walked.codex.root].flatMap((root) =>
-          root ? [normalize(root).replace(/\/$/, '')] : [],
+          root ? [normalize(root).replace(/\/+$/, '')] : [],
         ),
       };
     }
     const target = normalize(file);
-    if (index.claude.has(target)) return 'walkedUnlistedClaude';
+    if (index.walkListed.has(target)) return 'walkListedNotHeld';
+    if (index.claude.has(target)) {
+      return parent(target).endsWith(`/${normalize('subagents')}`) ? 'walkedUnlistedChild' : 'walkedUnlistedClaude';
+    }
     if (index.codex.has(target)) return 'walkedUnlistedCodex';
     const kinds = index.listed.get(parent(target));
     if (kinds?.has('claude')) return 'newBesideClaudeTranscript';
@@ -455,6 +467,12 @@ export function unknownPathShapes(
     if (kinds?.has('codex')) return 'newBesideCodexRollout';
     return index.roots.some((root) => target.startsWith(`${root}/`)) ? 'unlistedDirectory' : 'outsideRoots';
   };
+}
+
+// The capture's name for a file extension. Only `.jsonl` names reach a watcher decision, and any other extension counts
+// as `other`, so a file name never becomes a capture key.
+export function unknownPathExtension(file: string): '.jsonl' | 'other' {
+  return path.extname(file).toLowerCase() === '.jsonl' ? '.jsonl' : 'other';
 }
 
 // The decision names why it walks, so a counter can say which cause keeps the catalog walking. A path outside the held

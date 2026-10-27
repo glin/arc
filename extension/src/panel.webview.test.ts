@@ -38668,37 +38668,50 @@ test('row posts and watcher decisions reach the performance counters with their 
   assert.equal(last?.decision, 'broad');
   assert.deepEqual(last?.broadReasons, ['createOrRename']);
 
-  // Appends to a file the last walk saw and left unlisted, and to a new file beside a listed transcript, walk. The
-  // capture names the shape and extension of each such path, and never the path.
+  // Appends to a file the last walk listed and the held catalog dropped, to a file the walk enumerated and did not
+  // list, and to a file beside a listed transcript, all walk. The capture names the shape and extension of each such
+  // path, and never the path.
   const unknownPathProject = '/sources/claude/project';
+  const listedRow = { agent: 'claude', file: `${unknownPathProject}/listed.jsonl`, sessionId: 'listed' };
+  const droppedRow = { agent: 'claude', file: `${unknownPathProject}/dropped.jsonl`, sessionId: 'dropped' };
+  const heldCatalog = { folders: 'root', sessions: [listedRow] };
+  const walkedCatalog = { scope: '[]', sessions: [listedRow, droppedRow] };
+  const sourceEnumerations = {
+    claude: {
+      status: 'complete',
+      root: '/sources/claude',
+      files: [listedRow.file, droppedRow.file, `${unknownPathProject}/excluded.jsonl`],
+      uncertain: [],
+    },
+    codex: { status: 'complete', root: '/sources/codex', files: [], uncertain: [] },
+  };
+  // The refresh replaces the catalog and the walk, so only shapes taken before it read the decision's inputs.
   Object.assign(provider, {
-    catalog: {
-      folders: 'root',
-      sessions: [{ agent: 'claude', file: `${unknownPathProject}/listed.jsonl`, sessionId: 'listed' }],
-    },
-    sourceEnumerations: {
-      claude: {
-        status: 'complete',
-        root: '/sources/claude',
-        files: [`${unknownPathProject}/listed.jsonl`, `${unknownPathProject}/excluded.jsonl`],
-        uncertain: [],
-      },
-      codex: { status: 'complete', root: '/sources/codex', files: [], uncertain: [] },
-    },
+    catalog: heldCatalog,
+    walkedCatalog,
+    sourceEnumerations,
+    refreshFrom: () => Object.assign(provider, { catalog: null, walkedCatalog: null, sourceEnumerations: undefined }),
   });
+  pending.noteFileEvent(unknownPathProject, 'dropped.jsonl', 'change', normalizeFsPath);
   pending.noteFileEvent(unknownPathProject, 'excluded.jsonl', 'change', normalizeFsPath);
   pending.noteFileEvent(unknownPathProject, 'fresh.jsonl', 'change', normalizeFsPath);
   provider.runPendingWatch({ firedAt: 20, firstAt: 14, cause: 'quiet' });
+  const classifier = provider.unknownPathClassifier.shapeOf;
+  // The same catalog and walk reuse the classifier and its indexes.
+  Object.assign(provider, { catalog: heldCatalog, walkedCatalog, sourceEnumerations });
+  pending.noteFileEvent(unknownPathProject, 'fresh.jsonl', 'change', normalizeFsPath);
+  provider.runPendingWatch({ firedAt: 30, firstAt: 24, cause: 'quiet' });
+  assert.equal(provider.unknownPathClassifier.shapeOf, classifier, 'unchanged inputs rebuilt the classifier');
   const snapshot = provider.performanceCounters.snapshot();
   assert.deepEqual(snapshot.watcherDecisions, {
     targeted: 0,
-    broad: 2,
-    broadReasons: { createOrRename: 1, unknownPath: 1 },
-    unknownPathShapes: { walkedUnlistedClaude: 1, newBesideClaudeTranscript: 1 },
-    unknownPathExtensions: { '.jsonl': 2 },
+    broad: 3,
+    broadReasons: { createOrRename: 1, unknownPath: 2 },
+    unknownPathShapes: { walkListedNotHeld: 1, walkedUnlistedClaude: 1, newBesideClaudeTranscript: 2 },
+    unknownPathExtensions: { '.jsonl': 4 },
   });
   assert.ok(
-    !/excluded\.jsonl|fresh\.jsonl|\/sources\//.test(JSON.stringify(snapshot)),
+    !/dropped\.jsonl|excluded\.jsonl|fresh\.jsonl|\/sources\//.test(JSON.stringify(snapshot)),
     'the capture carries a changed path',
   );
 });

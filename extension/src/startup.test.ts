@@ -269,6 +269,7 @@ import {
   childEventNamesFiles,
   listedFilesFor,
   sessionDirectoryOwners,
+  unknownPathExtension,
   unknownPathShapes,
   watcherRefreshDecision,
 } from './scheduler';
@@ -7034,8 +7035,14 @@ test('targeted reuse avoids the broad walk, and a failed reuse performs exactly 
 test('each catalog walk names its requester, and the re-list after a replaced file names itself', async () => {
   let replaced: string[] = [];
   const { provider, walks, writeRollout, releaseAll } = heldWalkHarness(
-    { replacedCatalogFiles: async () => replaced, watcherRefreshDecision, sessionDirectoryOwners, unknownPathShapes },
-    ['runPendingWatch'],
+    {
+      replacedCatalogFiles: async () => replaced,
+      watcherRefreshDecision,
+      sessionDirectoryOwners,
+      unknownPathShapes,
+      unknownPathExtension,
+    },
+    ['runPendingWatch', 'unknownPathShapeOf'],
   );
   let counters = new PanelPerformanceCounters();
   provider.performanceCounters = counters;
@@ -7167,9 +7174,10 @@ function pollWalkHarness() {
       listedFilesFor,
       watcherRefreshDecision,
       unknownPathShapes,
+      unknownPathExtension,
       POLL_INTERVAL_MILLISECONDS: 5_000,
     },
-    ['startPolling', 'pollCatalog', 'pollDirectories', 'runPendingWatch', 'refreshFromChild'],
+    ['startPolling', 'pollCatalog', 'pollDirectories', 'runPendingWatch', 'unknownPathShapeOf', 'refreshFromChild'],
   );
   const { provider } = harness;
   const counters = new PanelPerformanceCounters();

@@ -11,6 +11,7 @@ import {
   RefreshRequest,
   SchedulerClock,
   sessionDirectoryOwners,
+  unknownPathExtension,
   unknownPathShapes,
   watcherRefreshDecision,
 } from './scheduler.ts';
@@ -567,6 +568,18 @@ const shapeCases: {
   caseSensitive?: string;
 }[] = [
   {
+    shape: 'walkListedNotHeld',
+    directory: 'claude',
+    name: 'DROPPED-SESSION.jsonl',
+    caseSensitive: 'newBesideClaudeTranscript',
+  },
+  {
+    shape: 'walkedUnlistedChild',
+    directory: 'child',
+    name: 'AGENT-OLD.jsonl',
+    caseSensitive: 'newBesideChildTranscript',
+  },
+  {
     shape: 'walkedUnlistedClaude',
     directory: 'claude',
     name: 'EXCLUDED.jsonl',
@@ -606,9 +619,19 @@ test.each(
       { agent: 'claude', file: `${orphanChildren}${sep}agent-a0.jsonl`, sessionId: 'a0', childTranscript: true },
       { agent: 'codex', file: `${date}${sep}rollout-listed.jsonl`, sessionId: 'listed' },
     ];
+    // The last walk listed a session that the held catalog has since dropped. Both roots end in separators.
+    const dropped = { agent: 'claude', file: `${project}${sep}Dropped-Session.jsonl`, sessionId: 'Dropped-Session' };
     const walked = {
-      claude: { root: claudeRoot, files: [catalog[0].file, catalog[1].file, `${project}${sep}Excluded.jsonl`] },
-      codex: { root: codexRoot, files: [catalog[2].file, `${date}${sep}rollout-other.jsonl`] },
+      listed: [...catalog, dropped],
+      claude: {
+        root: `${claudeRoot}${sep}${sep}`,
+        files: [
+          ...[catalog[0], catalog[1], dropped].map((row) => row.file),
+          `${project}${sep}Excluded.jsonl`,
+          `${orphanChildren}${sep}agent-old.jsonl`,
+        ],
+      },
+      codex: { root: `${codexRoot}${sep}`, files: [catalog[2].file, `${date}${sep}rollout-other.jsonl`] },
     };
     const changedDirectory = {
       claude: changedClaude,
@@ -636,6 +659,12 @@ test.each(
     assert.deepEqual(decision.unknownPaths.map(unknownPathShapes(catalog, null, normalize)), ['unclassified']);
   },
 );
+
+test('an unknown path names only the transcript extension, so a file name never becomes a capture key', () => {
+  assert.equal(unknownPathExtension('C:\\Users\\Greg\\Rollout.JSONL'), '.jsonl');
+  assert.equal(unknownPathExtension('/home/greg/lock.session-123'), 'other');
+  assert.equal(unknownPathExtension('/home/greg/no-extension'), 'other');
+});
 
 // Directory stats keyed by path, with each directory's modification time set by the test.
 function directoryTimes(entries: [string, number | null][]) {

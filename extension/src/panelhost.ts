@@ -642,8 +642,10 @@ import {
   ScheduledRun,
   childEventNamesFiles,
   sessionDirectoryOwners,
+  unknownPathExtension,
   unknownPathShapes,
   watcherRefreshDecision,
+  type UnknownPathShape,
   POLL_BACKSTOP_WALK_MS,
   type CatalogWalkTimes,
   type PollDirectories,
@@ -2077,6 +2079,8 @@ export class PanelProvider implements vscode.Disposable {
   private catalog: { folders: string; sessions: SessionFile[] } | null = null;
   // The rows and roots of the last filesystem walk. Discovery progress can put accepted rows back into `catalog`.
   private walkedCatalog: { scope: string; sessions: SessionFile[] } | null = null;
+  private unknownPathClassifier: { inputs: readonly unknown[]; shapeOf: (file: string) => UnknownPathShape } | null =
+    null;
   // The existing-session list from the last payload that completed discovery and required
   // metadata. A working catalog can move while that work is still in flight. Local drafts
   // compose with this accepted list, or with no existing rows before the first publication.
@@ -3746,6 +3750,21 @@ export class PanelProvider implements vscode.Disposable {
     this.watchScheduler.offer();
   }
 
+  // The classifier for paths outside the held catalog. It keeps its indexes until the catalog or the last walk changes.
+  private unknownPathShapeOf(catalog: readonly SessionFile[]): (file: string) => UnknownPathShape {
+    const inputs = [catalog, this.sourceEnumerations, this.walkedCatalog];
+    const held = this.unknownPathClassifier;
+    if (held && held.inputs.every((input, index) => input === inputs[index])) return held.shapeOf;
+    const enumerations = this.sourceEnumerations;
+    const shapeOf = unknownPathShapes(
+      catalog,
+      enumerations ? { listed: this.walkedCatalog?.sessions ?? [], ...enumerations } : null,
+      normalizeFsPath,
+    );
+    this.unknownPathClassifier = { inputs, shapeOf };
+    return shapeOf;
+  }
+
   private runPendingWatch(event: ScheduledRun): void {
     const batch = this.pendingWatch.take();
     const catalog = this.catalog?.sessions ?? [];
@@ -3756,12 +3775,13 @@ export class PanelProvider implements vscode.Disposable {
       sessionDirectoryOwners(catalog, normalizeFsPath),
     );
     const reason = batch.reasons.length ? batch.reasons.join('+') : 'watcher';
-    const shapeOf = unknownPathShapes(catalog, this.sourceEnumerations ?? null, normalizeFsPath);
-    const unknownPaths = decision.unknownPaths.map((file) => ({
-      shape: shapeOf(file),
-      extension: path.extname(file).toLowerCase() || 'none',
-    }));
     const started = performance.now();
+    const unknownPaths = decision.unknownPaths.length
+      ? decision.unknownPaths.map((file) => ({
+          shape: this.unknownPathShapeOf(catalog)(file),
+          extension: unknownPathExtension(file),
+        }))
+      : [];
     if (decision.ownedPaths) this.performanceCounters.recordWork('watcher:sessionDirectory', decision.ownedPaths);
     this.refreshFrom(reason, batch.drawRequired, false, decision.kind === 'targeted' ? decision.changedPaths : null);
     this.performanceCounters.recordWatcherOperation(
