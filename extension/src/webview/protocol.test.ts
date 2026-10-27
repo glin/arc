@@ -373,8 +373,8 @@ const HOST: Array<{ raw: unknown; parsed: HostToPanel }> = [
     parsed: { type: 'takeQueuedDraft', session: 's1', text: 'hello', revision: 3, value: 'q1' },
   },
   {
-    raw: { type: 'restoreDraft', session: 's1', text: 'hello', revision: 3 },
-    parsed: { type: 'restoreDraft', session: 's1', text: 'hello', revision: 3 },
+    raw: { type: 'restoreDraft', session: 's1', text: 'hello', revision: 3, notice: 'Not sent.' },
+    parsed: { type: 'restoreDraft', session: 's1', text: 'hello', revision: 3, notice: 'Not sent.' },
   },
   { raw: { type: 'notes', comments: [] }, parsed: { type: 'notes', comments: [] } },
   { raw: { type: 'openComment', key: 's1:1' }, parsed: { type: 'openComment', key: 's1:1' } },

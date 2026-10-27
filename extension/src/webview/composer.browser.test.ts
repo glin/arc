@@ -23,7 +23,7 @@ import {
   themed,
   withRemoteControl,
 } from '../panelfixture.ts';
-import { composerView, pickMenu, newSessionDraft, type ComposerState } from '../composerview.ts';
+import { composerView, pickMenu, newSessionDraft, sendRefusal, type ComposerState } from '../composerview.ts';
 import type { SessionLauncherView } from '../view/launcher.ts';
 import { SUBMITTED_PROMPT_CHARS } from './state.ts';
 import { usageBar } from '../usageview.ts';
@@ -3788,6 +3788,36 @@ test('one click into the Composer survives the host window activation', { timeou
       { focus: '', start: 6, end: 11 },
       'an expired activation window pulled focus back into the Composer',
     );
+  } finally {
+    await browser.close();
+  }
+});
+
+test('a send the host returns to the prompt box says that it was not sent', { timeout: 60_000 }, async (t) => {
+  const browser = await browserOrNone();
+  if (!browser) {
+    t.skip('no Edge, Chrome or bundled Chromium on this machine, so nothing was measured');
+    return;
+  }
+  try {
+    const page = await browser.newPage();
+    await page.setContent(themed(pageHtml()));
+    await post(page, renderPayload());
+    await page.locator('#prompt').fill('send this');
+    await page.locator('#prompt').press('Enter');
+    const sent = (await page.evaluate(`window.__posted.filter((message) => message.type === 'sendPrompt').at(-1)`)) as {
+      revision: number;
+    };
+    assert.equal(await page.locator('#prompt').inputValue(), '');
+    await post(page, {
+      type: 'restoreDraft',
+      session: 's1',
+      text: 'send this',
+      revision: sent.revision,
+      notice: sendRefusal('loading'),
+    });
+    assert.equal(await page.locator('#prompt').inputValue(), 'send this');
+    assert.equal(await page.locator('.cnotice[role="status"]').textContent(), sendRefusal('loading'));
   } finally {
     await browser.close();
   }

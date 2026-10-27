@@ -338,7 +338,7 @@ export type HostToPanel =
   | { type: 'takeQueuedDraft'; session: string; text: string; revision: number; value: string }
   | { type: 'promptRecovery'; submittedPrompts: SubmittedPrompt[] }
   | { type: 'requestPromptRecovery'; request: string }
-  | { type: 'restoreDraft'; session: string; text: string; revision: number }
+  | { type: 'restoreDraft'; session: string; text: string; revision: number; notice?: string }
   | { type: 'notes'; comments: TurnComment[] }
   | { type: 'openComment'; key: string }
   | { type: 'sendSelectedText'; key: string; copyLabels: boolean }
@@ -954,6 +954,7 @@ export function parseHostToPanel(raw: unknown): HostToPanel | null {
             session: m.session,
             text: m.text,
             revision: m.revision,
+            ...(isString(m.notice) && m.notice ? { notice: m.notice } : {}),
           }
         : null;
     case 'notes':

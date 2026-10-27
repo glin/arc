@@ -2256,6 +2256,7 @@ import {
   adoptSessionIdentity,
   succeedSession,
   attachmentRefusal,
+  sendRefusal,
   handoffDraftText,
   responseLinkDraftText,
   rememberSessionAlias,
@@ -35527,6 +35528,88 @@ test.each(['claude', 'codex'] as const)(
     provider.awaitingSessionRecords[session] = { sessionId: session, createdAt: 1, agent, cwd: worktree };
     assert.equal(provider.stateFor(session)?.agent, agent);
     assert.equal(provider.ownCwdForSession(agent, session), worktree);
+  },
+);
+
+// Move the repository scope from the accepted catalog's roots to a wider set, with the walk under the new roots still running.
+function scopeMovedSendProvider(agent: 'claude' | 'codex') {
+  const fixture = catalogSendProvider(agent);
+  const { provider, worktree } = fixture;
+  const accepted = { ...provider.authoritativeCatalog[0], dev: 1, ino: 2 };
+  const previous = [...provider.repositoryScopeRoots];
+  const roots = [...previous, path.join(path.dirname(worktree), 'added')];
+  delete provider.membershipOf;
+  Object.assign(provider, {
+    authoritativeCatalog: [accepted],
+    catalog: { sessions: [accepted] },
+    authoritativeCatalogScope: JSON.stringify(previous),
+    completeCatalogScope: JSON.stringify(previous),
+    coverageRevision: 1,
+    membershipCoverage: {
+      domain: 'admitted',
+      scope: JSON.stringify(previous),
+      revision: '1',
+      status: 'complete',
+      files: [accepted.file],
+      uncertain: [],
+      members: new Set([sessionCoverageMember(accepted)]),
+    },
+    repositoryScope: { snapshot: () => ({ ready: true, roots }) },
+    repositoryScopeReady: true,
+    repositoryScopeRoots: roots,
+    refresh: () => new Promise(() => {}),
+  });
+  return { ...fixture, accepted };
+}
+
+test.each(['claude', 'codex'] as const)(
+  'a %s prompt box send reaches its session while the walk after a repository scope change is still running',
+  async (agent) => {
+    const { provider, host, session, worktree, posted, delivered } = scopeMovedSendProvider(agent);
+    const text = 'Send during the scope walk';
+    await provider.acceptSubmission(text, session, 1, session, host, {
+      id: `scope-move-${agent}`,
+      order: 1,
+      source: session,
+      revision: 1,
+      text,
+    });
+    await vi.waitFor(() => assert.deepEqual(delivered, [{ session, cwd: worktree, text }]));
+    assert.deepEqual(
+      posted.filter((message) => message.type === 'restoreDraft'),
+      [],
+    );
+  },
+);
+
+test.each(['unknown membership', 'a send in flight'] as const)(
+  'a prompt box send that the host returns with %s tells the reader it was not sent',
+  async (cause) => {
+    const { provider, host, session, posted, delivered } = scopeMovedSendProvider('claude');
+    if (cause === 'unknown membership')
+      provider.membershipCoverage = { ...provider.membershipCoverage, members: new Set() };
+    else provider.submissionsInFlight = new Set([session]);
+    const text = 'Returned to the box';
+    await provider.acceptSubmission(text, session, 1, session, host, {
+      id: `returned-${cause}`,
+      order: 1,
+      source: session,
+      revision: 1,
+      text,
+    });
+    assert.deepEqual(delivered, []);
+    assert.deepEqual(
+      posted.filter((message) => message.type === 'restoreDraft'),
+      [
+        {
+          type: 'restoreDraft',
+          session,
+          text,
+          revision: 1,
+          notice: sendRefusal(cause === 'unknown membership' ? 'loading' : 'sending'),
+        },
+      ],
+    );
   },
 );
 

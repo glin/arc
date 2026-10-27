@@ -1418,7 +1418,8 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
         });
       },
       restoreDraft: function (msg) {
-        composerRenderer.restoreDraft(msg.session, msg.text, msg.revision);
+        if (composerRenderer.restoreDraft(msg.session, msg.text, msg.revision) && msg.notice)
+          attachmentRenderer.submissionNotice(composerRenderer.sessionIdentity(msg.session), msg.notice);
       },
       // Adopts the host's comments as the complete current set.
       notes: function (msg) {

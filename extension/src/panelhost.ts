@@ -428,6 +428,8 @@ import {
   launcherProfile,
   LauncherRequest,
   attachmentRefusal,
+  sendRefusal,
+  type SendRefusal,
   attachmentFailureNotice,
   rememberSessionAlias,
   resolveSessionAlias,
@@ -4558,14 +4560,16 @@ export class PanelProvider implements vscode.Disposable {
   }
 
   // Build prompt box state for a specified session, including sessions outside the current view.
-  private stateFor(session: string): ComposerState | null {
+  // `acrossScopeMove` also admits a session that `admittedAcrossScopeMove` keeps through a repository scope change.
+  private stateFor(session: string, acrossScopeMove = false): ComposerState | null {
     if (!this.newDrafts[session] && this.enumeratedAmbiguousIds?.has(session)) return null;
     if (
       this.membershipCoverage &&
       !this.newDrafts[session] &&
       (!this.awaitingSessionRecords[session] ||
         this.authoritativeCatalog?.some((source) => source.sessionId === session)) &&
-      this.membershipOf(session) !== 'present'
+      this.membershipOf(session) !== 'present' &&
+      !(acrossScopeMove && this.admittedAcrossScopeMove(session))
     )
       return null;
     if (!this.repositoryScopeReady) {
@@ -4573,6 +4577,37 @@ export class PanelProvider implements vscode.Disposable {
     }
     const row = this.rowForSession(session);
     return row ? this.stateForRow(row) : null;
+  }
+
+  // A repository scope change keeps the accepted catalog under the previous roots until a walk under the new roots is
+  // accepted, and a busy host can take tens of seconds to finish that walk. A prompt box send still reaches a session that
+  // the previous catalog admitted, when its recorded working directory is inside the current roots.
+  private admittedAcrossScopeMove(sessionId: string): boolean {
+    const accepted = this.authoritativeCatalogScope;
+    if (
+      !this.repositoryScopeReady ||
+      accepted === undefined ||
+      accepted === JSON.stringify(this.repositoryScopeRoots ?? [])
+    )
+      return false;
+    const catalog = this.authoritativeCatalog ?? [];
+    const matches = catalog.filter((source) => source.sessionId === sessionId);
+    if (matches.length !== 1 || !matches[0].cwd || !isInside(matches[0].cwd, this.repositoryScopeRoots)) return false;
+    return (
+      sessionPresence(
+        this.membershipCoverage,
+        { domain: 'admitted', scope: accepted, revision: String(this.coverageRevision) },
+        { sessionId },
+        catalog,
+      ) === 'present'
+    );
+  }
+
+  // Name why `stateFor` refused a send. Membership that discovery has not settled asks the reader to send again.
+  private sendRefusalFor(session: string): SendRefusal {
+    if (!this.repositoryScopeReady) return 'loading';
+    if (this.enumeratedAmbiguousIds?.has(session)) return 'unavailable';
+    return this.membershipOf(session) === 'unknown' ? 'loading' : 'unavailable';
   }
 
   private rowForSession(session: string): { id: string; label: string; agentKey: AgentKind } | null {
@@ -7272,7 +7307,7 @@ export class PanelProvider implements vscode.Disposable {
     const sending = this.health?.begin('send', this.healthPanel(host).id);
     let result: 'rejected' | 'failed' | 'pending' = 'rejected';
     try {
-      const state = this.stateFor(session);
+      const state = this.stateFor(session, true);
       const draft = this.newDrafts[session];
       const cwd = state ? this.cwdForSession(state.agent, session) : null;
       const captured = state
@@ -7295,12 +7330,12 @@ export class PanelProvider implements vscode.Disposable {
         text,
         order: (this.saved.submittedPrompts?.at(-1)?.order ?? 0) + 1,
       };
-      const restore = () => {
-        void this.post({ type: 'restoreDraft', session: source, text, revision });
+      const restore = (reason: SendRefusal) => {
+        void this.post({ type: 'restoreDraft', session: source, text, revision, notice: sendRefusal(reason) });
       };
       this.submissionsInFlight ??= new Set();
       if (this.submissionsInFlight.has(session)) {
-        restore();
+        restore('sending');
         return;
       }
       this.submissionsInFlight.add(session);
@@ -7332,23 +7367,25 @@ export class PanelProvider implements vscode.Disposable {
         } finally {
           if (retention) this.health?.settle(retention, retained ? 'returned' : 'failed');
         }
+        if (!captured || !this.stateFor(session, true)) {
+          restore(this.sendRefusalFor(session));
+          return;
+        }
         if (
-          !captured ||
           !this.hosts.includes(host) ||
           this.panelSession(source, host) !== session ||
-          !this.stateFor(session) ||
           this.cwdForSession(captured.agent, session) !== cwd
         ) {
-          restore();
+          restore('changed');
           return;
         }
         const previous = this.promptOriginHost;
         this.promptOriginHost = host;
         this.clearingDraftRevision = { session, revision };
         try {
-          const current = this.stateFor(session);
+          const current = this.stateFor(session, true);
           if (!current) {
-            restore();
+            restore(this.sendRefusalFor(session));
             return;
           }
           const ready = {
@@ -7369,7 +7406,7 @@ export class PanelProvider implements vscode.Disposable {
         }
       } catch {
         result = 'failed';
-        restore();
+        restore('unsaved');
       } finally {
         this.submissionsInFlight.delete(session);
         this.submittingDrafts.delete(session);
@@ -7402,9 +7439,15 @@ export class PanelProvider implements vscode.Disposable {
     capturedDraft?: NewSessionDraft,
     recoveryId?: string,
   ): void {
-    const state = captured ?? this.stateFor(session);
+    const state = captured ?? this.stateFor(session, true);
     if (!state) {
-      void this.post({ type: 'restoreDraft', session: browserSession, text, revision });
+      void this.post({
+        type: 'restoreDraft',
+        session: browserSession,
+        text,
+        revision,
+        notice: sendRefusal(this.sendRefusalFor(session)),
+      });
       return;
     }
     // Handle typed Codex `/rename` outside prompt delivery. Leave attachments, comments, and queued recovery available for the next prompt.
@@ -7627,7 +7670,7 @@ export class PanelProvider implements vscode.Disposable {
     const meant = sendAction({ ...state, onScreen: text });
     if (meant === 'nothing') {
       // Restore the browser's cleared text with its exact submission revision when host state refuses Send.
-      void this.post({ type: 'restoreDraft', session: browserSession, text, revision });
+      void this.post({ type: 'restoreDraft', session: browserSession, text, revision, notice: sendRefusal('empty') });
       return;
     }
     if (meant === 'queue') {
