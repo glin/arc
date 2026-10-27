@@ -32,6 +32,7 @@ import {
   codexAgentSpendVersion,
   codexSpendIndex,
   readCodexDispatchedSpendQuantum,
+  rememberRestartEvidence,
   releaseCodexDispatchSpend,
   retainCodexDispatchSpend,
   retainCodexDispatchSpendRoots,
@@ -1126,17 +1127,17 @@ async function execute(
         closeRoot();
         seen.add(reference.sessionId);
         charges.dispatchSpendVisits++;
-        const root = (dispatchRoots[reference.sessionId] ??= {
+        const root: DispatchRootCharges = {
           agent: reference.agent,
-          passes: 0,
+          passes: 1,
           bytes: 0,
           rereads: 0,
           rootWaits: 0,
           restarts: 0,
           remainingBytes: 0,
-          size: 0,
-        });
-        root.passes++;
+          size: null,
+        };
+        dispatchRoots[reference.sessionId] = root;
         openRoot = { root, before: dispatchReads.bytes };
         const revision = revisionOf(reference.file);
         if (!revision) {
@@ -1269,7 +1270,7 @@ async function execute(
         charges[reference.agent === 'codex' ? 'dispatchAggregateBytes' : 'dispatchClaudeSpendBytes'] += spendBytes;
         if (reference.agent === 'claude' && spendBytes > 0) {
           spendRestarted = (claudeSpendEnds.get(reference.sessionId) ?? 0) > 0;
-          claudeSpendEnds.set(reference.sessionId, spendBytes);
+          rememberRestartEvidence(claudeSpendEnds, reference.sessionId, spendBytes);
         }
         if (spendRestarted) {
           charges.dispatchSpendRootRestarts++;
@@ -1367,7 +1368,6 @@ async function execute(
         dispatchFacts.delete(file);
       }
     }
-    for (const sessionId of claudeSpendEnds.keys()) if (!seen.has(sessionId)) claudeSpendEnds.delete(sessionId);
     savedDispatchFacts = new Map();
     for (const [file, held] of dispatchFacts) {
       if (!held.settled) continue;

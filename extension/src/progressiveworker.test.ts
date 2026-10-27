@@ -12197,119 +12197,175 @@ test('dispatched spend aggregates settle across passes beside a running Codex ro
   }
 });
 
-test('a dispatched root that grows between passes charges a restart and its full size again, and a quiet root none', async () => {
+test('dispatched roots charge a restart when a root or its descendant reopens at byte 0, and a resumed or quiet root none', async () => {
   const directory = tempDir('spend-by-root-');
   const parentFile = path.join(directory, 'parent.jsonl');
   const now = Date.now() + 7_200_000;
+  const descendantRootId = 'dddddddd-1111-1111-1111-111111111111';
+  const descendantId = 'dddddddd-2222-2222-2222-222222222222';
   const grownId = 'aaaaaaaa-1111-1111-1111-111111111111';
   const quietId = 'bbbbbbbb-1111-1111-1111-111111111111';
+  const claudeId = 'cccccccc-1111-1111-1111-111111111111';
+  const roots = [
+    ['codex', descendantRootId],
+    ['codex', grownId],
+    ['codex', quietId],
+    ['claude', claudeId],
+  ] as const;
+  // The root with a descendant comes first, so its descendant's parse is pending when the first pass ends.
   fs.writeFileSync(
     parentFile,
-    [grownId, quietId]
-      .flatMap((sessionId, index) =>
+    roots
+      .flatMap(([agent, sessionId], index) =>
         claudeDispatchTranscript(
           'python child.py --arc-dispatch',
-          `ARC_DISPATCH_SESSION={"agent":"codex","session_id":"${sessionId}","owned":true}`,
+          `ARC_DISPATCH_SESSION={"agent":"${agent}","session_id":"${sessionId}","owned":true}`,
           `dispatch-${index}`,
         ),
       )
       .map((record) => JSON.stringify(record) + '\n')
       .join(''),
   );
+  const file = (sessionId: string) => path.join(directory, sessionId + '.jsonl');
   const record = (type: string, payload: object) => JSON.stringify({ type, timestamp: timestamp(1), payload }) + '\n';
+  const filler = (blocks: number) =>
+    Array.from({ length: blocks }, () => record('ignored', { text: 'x'.repeat(65500) })).join('');
   const turn = (id: string, blocks: number) =>
     record('event_msg', { type: 'task_started', turn_id: id }) +
     record('turn_context', { turn_id: id, model: 'gpt-6.1-sol' }) +
     record('event_msg', { type: 'user_message', message: 'work' }) +
-    Array.from({ length: blocks }, () => record('ignored', { text: 'x'.repeat(65500) })).join('') +
+    filler(blocks) +
     record('event_msg', {
       type: 'token_count',
       info: {
-        last_token_usage: {
-          input_tokens: 10,
-          output_tokens: 3,
-          total_tokens: 13,
-        },
-        total_token_usage: {
-          input_tokens: 10,
-          output_tokens: 3,
-          total_tokens: 13,
-        },
+        last_token_usage: { input_tokens: 10, output_tokens: 3, total_tokens: 13 },
+        total_token_usage: { input_tokens: 10, output_tokens: 3, total_tokens: 13 },
       },
     }) +
     record('event_msg', { type: 'task_complete', turn_id: id });
-  for (const sessionId of [grownId, quietId])
+  const rollout = (sessionId: string, blocks: number, parentThreadId?: string) =>
     fs.writeFileSync(
-      path.join(directory, sessionId + '.jsonl'),
+      file(sessionId),
       record('session_meta', {
         id: sessionId,
         cwd: directory,
         source: 'exec',
-      }) + turn('work', 5),
+        ...(parentThreadId ? { parent_thread_id: parentThreadId } : {}),
+      }) + turn('work', blocks),
     );
-  const session = (sessionId: string, agent: 'claude' | 'codex') => {
-    const file = path.join(directory, sessionId + '.jsonl');
-    return {
-      file,
-      sessionId,
-      agent,
-      ...revisionOf(fs.statSync(file, { bigint: true })),
-    };
-  };
+  rollout(descendantRootId, 0);
+  rollout(descendantId, 5, descendantRootId);
+  rollout(grownId, 5);
+  rollout(quietId, 5);
+  const assistant = () =>
+    JSON.stringify({
+      type: 'assistant',
+      timestamp: timestamp(1),
+      message: {
+        model: 'claude-sonnet-4-6',
+        stop_reason: 'end_turn',
+        content: [{ type: 'text', text: 'done' }],
+        usage: { input_tokens: 10, output_tokens: 1 },
+      },
+    }) + '\n';
+  fs.writeFileSync(
+    file(claudeId),
+    JSON.stringify({ type: 'user', cwd: directory, timestamp: timestamp(0), message: { content: 'work' } }) +
+      '\n' +
+      filler(2) +
+      assistant(),
+  );
+  const session = (sessionId: string, agent: 'claude' | 'codex') => ({
+    file: file(sessionId),
+    sessionId,
+    agent,
+    ...revisionOf(fs.statSync(file(sessionId), { bigint: true })),
+  });
   const request = () => ({
     kind: 'claude-children' as const,
     parents: [session('parent', 'claude')],
-    catalog: [session('parent', 'claude'), session(grownId, 'codex'), session(quietId, 'codex')],
-    codexChildren: [],
+    catalog: [session('parent', 'claude'), ...roots.map(([agent, sessionId]) => session(sessionId, agent))],
+    codexChildren: [
+      {
+        file: file(descendantId),
+        threadId: descendantId,
+        parentThreadId: descendantRootId,
+        agentPath: null,
+        openedAt: null,
+        startedAt: null,
+        threadSource: null,
+        backgroundReview: false,
+      },
+    ],
     repositoryRoots: [directory],
   });
-  // A 128 KiB pass budget parses each root of about 330 KB over several passes, and the frozen clock never ends a pass.
+  // A 128 KiB pass budget parses each file of about 330 KB over several passes, and the frozen clock never ends a pass.
   const worker = new ProgressiveWorker(
     `performance.now = () => 0; Date.now = () => ${now};` + dispatchWorkerSource(128),
   );
-  const settle = async () => {
-    const roots = new Map<string, DispatchRootCharges>();
+  const sums = ['passes', 'bytes', 'rereads', 'rootWaits', 'restarts', 'remainingBytes'] as const;
+  const settle = async (afterFirstReply?: () => void) => {
+    const charged = new Map<string, DispatchRootCharges>();
     let restarts = 0;
-    for (let pass = 0; pass < 40; pass++) {
+    let replies = 0;
+    for (let pass = 0; pass < 60; pass++) {
       const result = await worker.run(request(), 1, new AbortController().signal);
       assert.ok(result?.value.kind === 'claude-children' || result?.value.kind === 'claude-children-progress');
       if (result.value.kind !== 'claude-children') continue;
-      restarts += result.value.charges!.dispatchSpendRootRestarts;
+      const charges = result.value.charges!;
+      const reply = Object.values(result.value.dispatchRoots ?? {});
+      // Each root's share sums to the reply's total of the same charge.
+      assert.equal(sum(reply, 'rereads'), charges.dispatchSpendRereads);
+      assert.equal(sum(reply, 'rootWaits'), charges.dispatchSpendRootWaits);
+      assert.equal(sum(reply, 'restarts'), charges.dispatchSpendRootRestarts);
+      assert.equal(sum(reply, 'remainingBytes'), charges.dispatchAggregateRemainingBytes);
+      assert.ok(sum(reply, 'bytes') <= charges.dispatchSpendBytes);
+      restarts += charges.dispatchSpendRootRestarts;
       for (const [sessionId, root] of Object.entries(result.value.dispatchRoots ?? {})) {
-        const held = roots.get(sessionId);
-        roots.set(sessionId, {
-          ...root,
-          passes: (held?.passes ?? 0) + root.passes,
-          bytes: (held?.bytes ?? 0) + root.bytes,
-          restarts: (held?.restarts ?? 0) + root.restarts,
-        });
+        const held = charged.get(sessionId);
+        charged.set(
+          sessionId,
+          held ? { ...root, ...Object.fromEntries(sums.map((key) => [key, held[key] + root[key]])) } : root,
+        );
       }
-      if (!result.value.continuation) return { roots, restarts };
+      if (replies++ === 0) afterFirstReply?.();
+      if (!result.value.continuation) return { roots: charged, restarts };
     }
-    throw new Error(`dispatch spend never settled: ${JSON.stringify([...roots])}`);
+    throw new Error(`dispatch spend never settled: ${JSON.stringify([...charged])}`);
   };
+  const sum = (records: DispatchRootCharges[], key: (typeof sums)[number]) =>
+    records.reduce((total, root) => total + root[key], 0);
   try {
-    const first = await settle();
-    const firstSize = fs.statSync(path.join(directory, grownId + '.jsonl')).size;
-    assert.equal(first.restarts, 0, 'a parse that resumed across passes counted as a restart');
+    const first = await settle(() => fs.appendFileSync(file(descendantId), record('ignored', { text: 'grown' })));
+    assert.equal(first.roots.get(descendantRootId)?.restarts, 1, 'a descendant that grew mid-parse charged no restart');
     assert.ok(first.roots.get(grownId)!.passes > 1, 'the byte budget did not split the parse across passes');
-    for (const sessionId of [grownId, quietId]) {
-      assert.equal(first.roots.get(sessionId)?.agent, 'codex');
-      assert.equal(first.roots.get(sessionId)?.restarts, 0, sessionId);
-      assert.ok(first.roots.get(sessionId)!.bytes >= firstSize, `${sessionId} read less than its size`);
+    assert.ok(first.roots.get(quietId)!.rootWaits > 0, 'no root waited for the pass budget');
+    for (const sessionId of [grownId, quietId, claudeId]) {
+      assert.equal(
+        first.roots.get(sessionId)?.restarts,
+        0,
+        `${sessionId} counted a first or resumed parse as a restart`,
+      );
+      assert.ok(
+        first.roots.get(sessionId)!.bytes >= fs.statSync(file(sessionId)).size,
+        `${sessionId} read less than its size`,
+      );
     }
-    fs.appendFileSync(path.join(directory, grownId + '.jsonl'), turn('again', 1));
-    const grownSize = fs.statSync(path.join(directory, grownId + '.jsonl')).size;
+    assert.equal(first.restarts, 1);
+    fs.appendFileSync(file(grownId), turn('again', 1));
+    fs.appendFileSync(file(claudeId), assistant());
     const second = await settle();
-    assert.equal(second.restarts, 1, JSON.stringify([...second.roots]));
-    assert.equal(second.roots.get(grownId)?.restarts, 1);
-    assert.equal(second.roots.get(grownId)?.size, grownSize);
-    assert.ok(
-      second.roots.get(grownId)!.bytes >= grownSize,
-      `the grown root read ${second.roots.get(grownId)!.bytes} bytes of ${grownSize}`,
-    );
+    for (const sessionId of [grownId, claudeId]) {
+      const root = second.roots.get(sessionId)!;
+      assert.equal(root.restarts, 1, `${sessionId}: ${JSON.stringify([...second.roots])}`);
+      assert.equal(root.size, fs.statSync(file(sessionId)).size);
+      assert.ok(root.bytes >= root.size, `${sessionId} read ${root.bytes} bytes of ${root.size}`);
+    }
+    assert.equal(second.roots.get(claudeId)?.agent, 'claude');
+    assert.equal(second.roots.get(grownId)?.agent, 'codex');
     assert.equal(second.roots.get(quietId)?.restarts, 0);
     assert.equal(second.roots.get(quietId)?.bytes, 0, 'the quiet root read again');
+    assert.equal(second.restarts, 2);
   } finally {
     worker.stop();
     fs.rmSync(directory, { recursive: true, force: true });

@@ -5367,7 +5367,6 @@ export function retainCodexDispatchSpend(file: string, entry: CodexDispatchSpend
 
 export function retainCodexDispatchSpendRoots(files: ReadonlySet<string>): void {
   for (const root of [...pendingDispatchAggregates.keys()]) if (!files.has(root)) discardDispatchAggregate(root);
-  for (const root of [...dispatchParseEnds.keys()]) if (!files.has(root)) dispatchParseEnds.delete(root);
 }
 
 // Each admitted root retains its own traversal and unfinished source parse independently of
@@ -5383,9 +5382,18 @@ const pendingDispatchAggregates = new Map<
   }
 >();
 
-// The bytes each root's last parse of a source read. It outlives the root's aggregates, so a parse that opens a
-// source at byte 0 after an earlier parse read past byte 0 counts as a restart.
+// The bytes each root's last parse of a source read. It outlives the root's aggregates and its admission, so a parse
+// that opens a source at byte 0 after an earlier parse read past byte 0 counts as a restart.
 const dispatchParseEnds = new Map<string, Map<string, number>>();
+
+// Restart evidence keeps the most recently read roots, so a root that leaves admission and returns still counts its restart.
+export const DISPATCH_RESTART_ROOTS = 4096;
+
+export function rememberRestartEvidence<T>(evidence: Map<string, T>, root: string, value: T): void {
+  evidence.delete(root);
+  evidence.set(root, value);
+  if (evidence.size > DISPATCH_RESTART_ROOTS) evidence.delete(evidence.keys().next().value!);
+}
 
 function discardDispatchAggregate(root: string): void {
   const aggregate = pendingDispatchAggregates.get(root);
@@ -5437,8 +5445,8 @@ export function readCodexDispatchedSpendQuantum(
     progress?.('dispatchSpendRootWaits');
     return { spend: { models: [], found: false, partial: true, effort: null }, pending: true, restarted: false };
   }
-  let parseEnds = dispatchParseEnds.get(file);
-  if (!parseEnds) dispatchParseEnds.set(file, (parseEnds = new Map()));
+  const parseEnds = dispatchParseEnds.get(file) ?? new Map<string, number>();
+  rememberRestartEvidence(dispatchParseEnds, file, parseEnds);
   let restarted = false;
   if (!aggregate) {
     progress?.('dispatchSpendAggregateStarts');

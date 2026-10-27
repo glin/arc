@@ -17710,15 +17710,21 @@ test('dispatched Codex progress distinguishes advancement, source restarts, inva
   const clock = vi.spyOn(performance, 'now').mockReturnValue(100);
   retainCodexDispatchSpendRoots(new Set());
   try {
-    assert.equal(read().pending, true);
+    let progress = read();
+    assert.equal(progress.pending, true);
+    assert.equal(progress.restarted, false, 'a first parse counted as a restart');
     assert.deepEqual(Object.values(counts).slice(0, 7), [1, 0, 0, 0, 0, 1, 0]);
     // The clock stands still, so the aggregate stops on its byte budget.
     assert.equal(counts.dispatchSpendAggregateExhaustedBytes, 1);
     assert.equal(counts.dispatchSpendAggregateExhaustedTime, 0);
-    assert.equal(read().pending, true);
+    progress = read();
+    assert.equal(progress.pending, true);
+    assert.equal(progress.restarted, false, 'a resumed parse counted as a restart');
     assert.deepEqual(Object.values(counts).slice(0, 7), [1, 0, 0, 0, 0, 2, 0]);
     fs.appendFileSync(files[0], JSON.stringify({ type: 'ignored' }) + '\n');
-    assert.equal(read().pending, true);
+    progress = read();
+    assert.equal(progress.pending, true);
+    assert.equal(progress.restarted, true, 'a parse reopened at byte 0 after its source grew');
     assert.deepEqual(Object.values(counts).slice(0, 7), [1, 0, 0, 0, 1, 3, 0]);
     for (let attempt = 0; attempt < 8 && !completed.includes(files[0]); attempt++) read();
     assert.deepEqual(completed, [files[0]], 'the root must finish while its child remains pending');
@@ -17760,6 +17766,10 @@ test('dispatched Codex progress distinguishes advancement, source restarts, inva
     assert.ok(otherBytes <= fs.statSync(files[2]).size, `the other root parsed ${otherBytes} bytes`);
     assert.equal(counts.dispatchSpendAggregateStarts, beforeWait.dispatchSpendAggregateStarts + 1);
     assert.equal(counts.dispatchSpendAggregateCompletions, 2);
+    // A root that leaves admission and returns keeps the evidence of its earlier parse.
+    retainCodexDispatchSpendRoots(new Set([files[2]]));
+    fs.appendFileSync(files[0], JSON.stringify({ type: 'ignored' }) + '\n');
+    assert.equal(read().restarted, true, 'a readmitted root reparsed from byte 0 without a restart');
   } finally {
     clock.mockRestore();
     retainCodexDispatchSpendRoots(new Set());

@@ -310,7 +310,7 @@ export class PanelPerformanceCounters {
       }
       for (const key of DISPATCH_ROOT_SUMS) held[key] += root[key];
       held.agent = root.agent;
-      held.size = root.size;
+      if (root.size !== null) held.size = root.size;
     }
   }
   private readonly dispatchRoots = new Map<string, DispatchRootCharges>();

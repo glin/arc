@@ -307,9 +307,10 @@ export interface DiscoveryCharges extends Record<import('./codex').CodexDispatch
   otherPassEnds: number;
 }
 // One dispatched root's share of the dispatch charges in one complete discovery reply, keyed by its session ID.
-// `bytes` covers the reads of the root's visits. `restarts`, `rootWaits` and `remainingBytes` match the totals of the same
-// names. A Claude spend read always opens at byte 0, so every Claude visit that reads spend after an earlier read restarts.
-// `size` is the root file's size at the root's last visit, not the size of a descendant the root's aggregate reads.
+// `bytes` covers the reads of the root's visits. `rereads`, `rootWaits`, `restarts` and `remainingBytes` are the root's
+// shares of `dispatchSpendRereads`, `dispatchSpendRootWaits`, `dispatchSpendRootRestarts` and `dispatchAggregateRemainingBytes`.
+// A Claude spend read always opens at byte 0, so every Claude visit that reads spend after an earlier read restarts.
+// `size` is the root file's size at the root's visit, or null when the visit could not read it. It is never a descendant's size.
 export interface DispatchRootCharges {
   agent: 'claude' | 'codex';
   passes: number;
@@ -318,7 +319,7 @@ export interface DispatchRootCharges {
   rootWaits: number;
   restarts: number;
   remainingBytes: number;
-  size: number;
+  size: number | null;
 }
 // One verified child transcript whose recorded edits a file action needs.
 // The revision is the child's spend file version, the same revision its summary figures carry.

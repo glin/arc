@@ -6,6 +6,7 @@ import * as path from 'node:path';
 import {
   PERFORMANCE_DIAGNOSTICS_DIRECTORY_VARIABLE,
   PERFORMANCE_DIAGNOSTICS_SCHEMA_VERSION,
+  DISPATCH_ROOT_RECORDS,
   PanelPerformanceCounters,
   PerformanceDiagnosticState,
   type PerformanceDiagnosticsFailure,
@@ -838,6 +839,10 @@ test('dispatched roots sum by session ID and fold every root past the twenty wit
   counters.recordDiscovery(undefined, reply, {
     grown: root(700, 'codex', 250),
   });
+  // A visit that could not read the root file keeps the last measured size.
+  counters.recordDiscovery(undefined, reply, {
+    grown: { ...root(0, 'codex'), passes: 0, rereads: 0, rootWaits: 0, restarts: 0, remainingBytes: 0, size: null },
+  });
   assert.deepEqual(counters.snapshot().dispatchRoots, {
     grown: {
       agent: 'codex',
@@ -863,7 +868,9 @@ test('dispatched roots sum by session ID and fold every root past the twenty wit
   counters.recordDiscovery(
     undefined,
     reply,
-    Object.fromEntries(Array.from({ length: 20 }, (_, index) => [`root-${index}`, root(1000 + index)])),
+    Object.fromEntries(
+      Array.from({ length: DISPATCH_ROOT_RECORDS }, (_, index) => [`root-${index}`, root(1000 + index)]),
+    ),
   );
   const roots = counters.snapshot().dispatchRoots;
   assert.equal(Object.keys(roots).length, 21);
