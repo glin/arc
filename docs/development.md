@@ -65,6 +65,8 @@ The browser install writes to the per-user Playwright cache outside the reposito
 
 `npm install` reuses existing dependencies and updates the lockfile when needed. Replacing an in-use package conflicts with running tests on Windows.
 
+Keep the extension's `@azure/msal-node` override directly under `@azure/identity`. npm 10.9.9 ignores it beneath an additional `@vscode/vsce` override.
+
 `esbuild` is native. Install dependencies on the operating system that runs the commands. A `node_modules` tree copied from another operating system will not run it.
 
 Validate the Claude plugin and marketplace before changing their packaging:

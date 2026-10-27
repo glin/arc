@@ -792,10 +792,8 @@
     "preact": "^10.29.8"
   },
   "overrides": {
-    "@vscode/vsce": {
-      "@azure/identity": {
-        "@azure/msal-node": "7.1.1"
-      }
+    "@azure/identity": {
+      "@azure/msal-node": "7.1.1"
     }
   }
 }
