@@ -9898,6 +9898,33 @@ test('a ready scope reports removed sessions while every panel is hidden and row
   assert.equal(provider.authoritativeCatalog.length, 3, 'hidden refresh must retain its catalog');
 });
 
+test('a repository scope change leaves a discovery continuation running and sends the next request under the new roots', async () => {
+  const provider = paintHarness(['repositoryScopeChanged'], { scopeInside: isInside });
+  provider.selectionWorks = new Map();
+  provider.repositoryScope = { snapshot: () => ({ ready: true, roots: ['project', 'project/worker'] }) };
+  provider.windowStateHandler = () => {};
+  provider.publishWindowState = () => {};
+  const requests: { roots: string[]; signal: AbortSignal }[] = [];
+  let finishPass!: (discovered: boolean) => void;
+  provider.prepareClaudeChildren = (_generation: number, signal: AbortSignal) => {
+    requests.push({ roots: [...provider.repositoryScopeRoots], signal });
+    return requests.length === 1 ? new Promise<boolean>((resolve) => (finishPass = resolve)) : Promise.resolve(true);
+  };
+  provider.dispatchDiscoveryPending = true;
+  const continuation = provider.continueDiscovery();
+  await vi.waitFor(() => assert.equal(requests.length, 1));
+  const generation = provider.refreshGeneration;
+  provider.repositoryScopeChanged();
+  // Cancelling the request would close the worker's receipt scan, and the next request would read every receipt again.
+  assert.equal(requests[0].signal.aborted, false, 'the scope change cancelled the discovery continuation');
+  assert.ok(provider.refreshGeneration > generation, 'the continuation kept the current generation');
+  finishPass(true);
+  await continuation;
+  await vi.waitFor(() => assert.equal(requests.length, 2));
+  assert.deepEqual(requests[1].roots, ['project', 'project/worker']);
+  assert.equal(requests[0].signal.aborted, false);
+});
+
 test('hidden workspace-folder changes retain known directories until the replacement scope cancels removed sessions', async () => {
   const provider = paintHarness(['workspaceFoldersChanged', 'repositoryScopeChanged'], { scopeInside: isInside });
   provider.anyVisible = () => false;

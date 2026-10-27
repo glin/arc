@@ -1348,6 +1348,8 @@ export class PanelProvider implements vscode.Disposable {
   >();
   private refreshGeneration = 0;
   private refreshController: AbortController | null = null;
+  // The controller of the discovery continuation in flight, which a repository scope change leaves running.
+  private discoveryContinuation: AbortController | null = null;
   private pendingRefresh: RefreshRequest | null = null;
   private refreshDeadline: ReturnType<typeof setTimeout> | null = null;
   private refreshOverdue = false;
@@ -4080,7 +4082,8 @@ export class PanelProvider implements vscode.Disposable {
       for (const sessionId of removed) this.scopeSessionDirectories?.delete(sessionId);
     }
     this.loadingLine.rescope(scope.ready ? JSON.stringify(scope.roots) : null, 'repository scope');
-    this.abandonCatalogRefresh();
+    // A discovery continuation in flight finishes its pass. The next request continues its epoch under the new roots.
+    this.abandonCatalogRefresh(true);
     this.refreshFrom('repository-scope', true);
   }
 
@@ -9983,6 +9986,7 @@ export class PanelProvider implements vscode.Disposable {
     const generation = this.refreshGeneration;
     const controller = new AbortController();
     this.claimCatalogRefresh(controller);
+    this.discoveryContinuation = controller;
     let refresh = false;
     try {
       const discovered = await this.prepareClaudeChildren(generation, controller.signal);
@@ -10004,6 +10008,7 @@ export class PanelProvider implements vscode.Disposable {
       console.warn('Arc: session reading failed.', error);
     } finally {
       const owned = this.releaseCatalogRefresh(controller);
+      if (this.discoveryContinuation === controller) this.discoveryContinuation = null;
       this.performanceCounters.recordRefresh('discovery-continuation', performance.now() - started);
       if (owned && refresh) {
         // The follow-up refresh runs before a waiting request. It accepts a complete reply before any further request, and it
@@ -10037,10 +10042,12 @@ export class PanelProvider implements vscode.Disposable {
     );
   }
 
-  // Cancel catalog refresh and pending triggers. Hiding a host stops polling without calling this cancellation path.
-  private abandonCatalogRefresh(): void {
+  // Cancel catalog refresh and pending triggers. Hiding a host stops polling without calling this cancellation path. A kept
+  // discovery continuation still loses the refresh slot and generation, so its reply changes no catalog.
+  private abandonCatalogRefresh(keepContinuation = false): void {
     this.refreshGeneration++;
-    this.refreshController?.abort();
+    if (!keepContinuation || !this.refreshController || this.refreshController !== this.discoveryContinuation)
+      this.refreshController?.abort();
     this.refreshController = null;
     // A canceled cold pass stops walking and reading openings. The next refresh starts the pass again instead of waiting.
     const cold = this.codexColdPass;
