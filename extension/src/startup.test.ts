@@ -7836,7 +7836,11 @@ const SEND_SCOPE = {
 
 async function sentPromptPosts(every: number | null): Promise<string | null> {
   vi.useFakeTimers(STREAM_TIMERS);
-  const provider = streamedCatalogHarness(false, ['send', 'noteLive', 'adoptDraft', 'livePressAnswered'], SEND_SCOPE);
+  const provider = streamedCatalogHarness(
+    false,
+    ['send', 'noteLive', 'adoptDraft', 'livePressAnswered', 'notePrompted', 'isAgentRunLaunch'],
+    SEND_SCOPE,
+  );
   Object.assign(provider, {
     newDrafts: {},
     awaitingSessionRecords: {},

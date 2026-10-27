@@ -425,6 +425,7 @@ test('uncached admitted runs retain provider classification and reader dispatch 
           ],
           startedHere: behavior === 'retained-started' ? [{ agent, sessionId: id }] : [],
           agentRuns: behavior.startsWith('retained') ? [{ agent, sessionId: id }] : [],
+          prompted: [],
         };
         const capture = await captureSessionExport(
           { ...f.options, readerState: state, limits: { sliceBytes: 32768 } },
@@ -496,6 +497,7 @@ test('reader membership is provider and parent qualified and survives a source-c
     ],
     startedHere: [],
     agentRuns: [],
+    prompted: [],
   };
   let projections = 0;
   await withExportTransaction(f.output, async (writer) => {
@@ -544,14 +546,34 @@ test('an archived native selected root retains its parent-qualified membership',
           archived: [{ agent: 'claude', sessionId: 'selected', parentSessionId: 'root' }],
           startedHere: [{ agent: 'claude', sessionId: 'selected', parentSessionId: 'root' }],
           agentRuns: [{ agent: 'claude', sessionId: 'selected', parentSessionId: 'root' }],
+          prompted: [{ agent: 'claude', sessionId: 'selected', parentSessionId: 'root' }],
         },
       },
       writer,
     );
     assert.equal(capture.model.sessions[0].key, capture.model.root);
     assert.equal(capture.model.sessions[0].archived, true);
-    assert.equal(capture.model.sessions[0].agentRun, true);
+    assert.equal(capture.model.sessions[0].agentRun, true, 'a prompted child transcript left Run by agents');
   });
+});
+
+test("an Arc agent-run launch the reader prompted exports as the reader's own session", async () => {
+  const f = fixture();
+  const run = [{ agent: 'claude' as const, sessionId: 'root' }];
+  for (const prompted of [[], run]) {
+    await withExportTransaction(f.output, async (writer) => {
+      const capture = await captureSessionExport(
+        { ...f.options, readerState: { archived: [], startedHere: [], agentRuns: run, prompted } },
+        writer,
+      );
+      assert.equal(capture.model.sessions[0].key, capture.model.root);
+      assert.equal(
+        capture.model.sessions[0].agentRun,
+        prompted.length === 0,
+        'export filed the prompted run apart from the panel',
+      );
+    });
+  }
 });
 
 test('Codex capture reads structural child lifecycle once across semantic reductions', async () => {

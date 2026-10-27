@@ -11,6 +11,8 @@ export interface ExportReaderState {
   archived: readonly ExportIdentity[];
   startedHere: readonly ExportIdentity[];
   agentRuns: readonly ExportIdentity[];
+  // Agent runs the reader prompted from the Prompt box. Membership files the session as the reader's own.
+  prompted: readonly ExportIdentity[];
 }
 export type ExportOmissionReason =
   | 'missing'

@@ -5921,6 +5921,8 @@ export class PanelProvider implements vscode.Disposable {
       this.saved.started = [...this.startedHere].slice(-SESSION_LIMIT);
       this.saved.agentRuns = [...new Set([...(this.saved.agentRuns ?? []), successor])].slice(-SESSION_LIMIT);
     }
+    if (this.saved.prompted?.includes(source))
+      this.saved.prompted = [...new Set([...this.saved.prompted, successor])].slice(-SESSION_LIMIT);
     // Copy labels to the successor. Refresh the source's insertion order first so capacity eviction does not remove it.
     const labels = labelsOf(this.saved.labels, source);
     if (labels.length) {
@@ -7342,6 +7344,26 @@ export class PanelProvider implements vscode.Disposable {
     void this.persistHostState().catch(() => {});
   }
 
+  // Record that the reader sent input from the Prompt box to a session filed as an agent run or not yet classified.
+  // `sendPrompt` records a queued submission when it enters the queue. An immediate send, `/compact`, or `/clear`
+  // records only after the agent accepts it.
+  // An Arc agent-run launch is recorded even while its pending row files it as the reader's own.
+  // Another session is recorded when its published row files it as an agent run or leaves it unclassified.
+  // A reader session whose classification is still unknown can therefore enter the list and push an older entry out of the bound.
+  // `agentRuns` keeps the session, so `isAgentRunLaunch` and the prompt-cache request of its resumes do not change.
+  private notePrompted(session: string): void {
+    if (this.saved.prompted?.includes(session)) return;
+    const row = this.sessionRows.find((entry) => entry.id === session);
+    if (!this.isAgentRunLaunch(session) && (!row || row.agentRun === false)) return;
+    this.saved.prompted = [...(this.saved.prompted ?? []), session].slice(-SESSION_LIMIT);
+    void this.persistHostState().catch(() => {});
+    // Patch the published row and post the session list, so the card changes before the next catalog refresh.
+    const source = this.catalog?.sessions.find((entry) => entry.sessionId === session);
+    const agentRun = source ? this.agentRunFor(source, this.sessionParentEdgeSet?.edges ?? new Map()) : false;
+    this.sessionRows = this.sessionRows.map((entry) => (entry.id === session ? { ...entry, agentRun } : entry));
+    this.postRail(true);
+  }
+
   private importPromptRecovery(snapshot: unknown): Promise<void> {
     const merged = mergeSubmittedPrompts(this.saved.submittedPrompts, snapshot);
     this.saved.submittedPrompts = merged;
@@ -7635,6 +7657,7 @@ export class PanelProvider implements vscode.Disposable {
         void this.post({ type: 'restoreDraft', session: browserSession, text, revision });
         return;
       }
+      this.notePrompted(state.sessionId);
       this.onReaderDirected?.(state.sessionId);
       this.queues[state.sessionId] = queued;
       this.holdDraft(state.sessionId, '');
@@ -7684,6 +7707,7 @@ export class PanelProvider implements vscode.Disposable {
           void this.post({ type: 'restoreDraft', session: browserSession, text, revision });
           return;
         }
+        this.notePrompted(state.sessionId);
         this.onReaderDirected?.(state.sessionId);
         this.holdDraft(state.sessionId, '');
         this.queues[state.sessionId] = recoveryId
@@ -7702,7 +7726,7 @@ export class PanelProvider implements vscode.Disposable {
       } else {
         this.holdDraft(state.sessionId, '');
         this.answerOpenAsks(state.sessionId, compaction);
-        this.startCompaction(state);
+        this.startCompaction(state, null, true);
       }
       return;
     }
@@ -7736,6 +7760,7 @@ export class PanelProvider implements vscode.Disposable {
           void this.post({ type: 'restoreDraft', session: browserSession, text, revision });
           return;
         }
+        this.notePrompted(state.sessionId);
         this.onReaderDirected?.(state.sessionId);
         this.holdDraft(state.sessionId, '');
         this.queues[state.sessionId] = recoveryId
@@ -7757,7 +7782,7 @@ export class PanelProvider implements vscode.Disposable {
       } else {
         this.holdDraft(state.sessionId, '');
         this.answerOpenAsks(state.sessionId, clear);
-        this.startClear(state, null, text);
+        this.startClear(state, null, text, true);
       }
       return;
     }
@@ -7786,6 +7811,7 @@ export class PanelProvider implements vscode.Disposable {
         void this.post({ type: 'restoreDraft', session: browserSession, text, revision });
         return;
       }
+      this.notePrompted(state.sessionId);
       this.onReaderDirected?.(state.sessionId);
       this.holdDraft(state.sessionId, '');
       this.queues[state.sessionId] = recoveryId
@@ -7833,11 +7859,11 @@ export class PanelProvider implements vscode.Disposable {
     if (this.contextSource) this.invalidateContext(state.sessionId);
     // Recognize control commands before assembling ordinary prompt text and comments.
     if (compactSubmission(state.agent, text) && !queued) {
-      this.startCompaction(state, queued);
+      this.startCompaction(state, queued, true);
       return;
     }
     if (clearSubmission(state.agent, text) && !queued) {
-      this.startClear(state, queued);
+      this.startClear(state, queued, undefined, true);
       return;
     }
     // Add ordinary outgoing prompts to recall history after local-command and queue handling.
@@ -7934,6 +7960,8 @@ export class PanelProvider implements vscode.Disposable {
           void this.writeDrafts();
         }
         if (!queued && delivery.delivered) {
+          // A queued submission was recorded when it entered the queue. An immediate send is recorded once the agent accepts it.
+          this.notePrompted(state.sessionId);
           if (this.draftCommentIds[assetSession]?.length) this.releaseSubmittedCommentClaims(state, assetSession);
           this.queues[state.sessionId] = queueAfterAcceptedRecovery(this.queues[state.sessionId] ?? []);
           if (!this.queues[state.sessionId].length) {
@@ -8129,7 +8157,8 @@ export class PanelProvider implements vscode.Disposable {
     this.startCompaction(state);
   }
 
-  private startCompaction(state: ComposerState, queued: QueuedSubmission | null = null): void {
+  // `prompted` marks a compaction the reader typed in the Prompt box. It is recorded once the agent accepts it.
+  private startCompaction(state: ComposerState, queued: QueuedSubmission | null = null, prompted = false): void {
     this.onReaderDirected?.(state.sessionId);
     if (this.contextSource) this.invalidateContext(state.sessionId);
     // Create an empty live compaction card before agent delivery.
@@ -8153,6 +8182,7 @@ export class PanelProvider implements vscode.Disposable {
       if (delivery.delivered && delivery.turnId !== undefined) {
         this.recordDeliveredPromptTurn(state.sessionId, delivery.turnId);
       }
+      if (prompted && delivery.delivered) this.notePrompted(state.sessionId);
       if (queued && !delivery.delivered) {
         this.forgetLivePress(state.sessionId, pressed);
         this.queueHandoffs.delete(queued.id);
@@ -8245,7 +8275,13 @@ export class PanelProvider implements vscode.Disposable {
     this.finishClearSettlement(settlement);
   }
 
-  private startClear(state: ComposerState, queued: QueuedSubmission | null = null, text: string = '/clear'): void {
+  // `prompted` marks a clear the reader typed in the Prompt box. It is recorded once the agent accepts it.
+  private startClear(
+    state: ComposerState,
+    queued: QueuedSubmission | null = null,
+    text: string = '/clear',
+    prompted = false,
+  ): void {
     if (this.contextSource) this.invalidateContext(state.sessionId);
     const request = clearRequest(state.agent, text);
     if (!request) {
@@ -8270,6 +8306,8 @@ export class PanelProvider implements vscode.Disposable {
     this.clearSettlements.set(state.sessionId, settlement);
     const settle = (delivery: PromptDelivery): void => {
       settlement.delivery = delivery;
+      // Record before the move so the successor inherits the record.
+      if (prompted && delivery.delivered) this.notePrompted(settlement.session);
       if (delivery.delivered && delivery.session && delivery.session !== settlement.session) {
         this.noteSessionMoved(
           settlement.session,
@@ -8896,6 +8934,7 @@ export class PanelProvider implements vscode.Disposable {
           archived: sources.filter((source) => this.hidden.has(source.sessionId)).map(identity),
           startedHere: sources.filter((source) => this.startedHere.has(source.sessionId)).map(identity),
           agentRuns: sources.filter((source) => this.saved.agentRuns?.includes(source.sessionId)).map(identity),
+          prompted: sources.filter((source) => this.saved.prompted?.includes(source.sessionId)).map(identity),
         },
         capturedAt: Date.now(),
         ...(this.diagnostics.enabled()
@@ -8997,6 +9036,7 @@ export class PanelProvider implements vscode.Disposable {
     const readerParents = this.saved.readerParents;
     const submittedPrompts = this.saved.submittedPrompts;
     const agentRuns = this.saved.agentRuns;
+    const prompted = this.saved.prompted;
     const initialNames = this.saved.initialNames;
     this.preferenceResetRevision = (this.preferenceResetRevision ?? 0) + 1;
     for (const waiter of this.filterReady ?? []) {
@@ -9022,6 +9062,7 @@ export class PanelProvider implements vscode.Disposable {
     // Preserve reader-started session ownership across preference resets.
     this.saved.started = [...this.startedHere].slice(-SESSION_LIMIT);
     this.saved.agentRuns = agentRuns;
+    this.saved.prompted = prompted;
     this.saved.initialNames = initialNames;
     this.saved.assets = normalizePromptAssetBook(this.assets);
     // Waiting submissions are user-authored content, like the draft and its files above.
@@ -13462,7 +13503,9 @@ export class PanelProvider implements vscode.Disposable {
   }
 
   // Apply reader-started and parent ownership to cached agent-run classification without changing the shared metadata fact.
+  // A child transcript stays an agent run. A session the reader prompted from the Prompt box is the reader's own.
   private agentRunFor(session: SessionFile, edges: ReadonlyMap<string, SessionParentEdge>): boolean | null {
+    if (session.childTranscript !== true && this.saved.prompted?.includes(session.sessionId)) return false;
     if (this.saved.agentRuns?.includes(session.sessionId)) return true;
     const edge = edges.get(session.sessionId);
     const dispatched = edge?.relation === 'dispatched';
@@ -16251,6 +16294,7 @@ export class PanelProvider implements vscode.Disposable {
       draftCommentIds: current.draftCommentIds,
       started: current.started,
       agentRuns: current.agentRuns,
+      prompted: current.prompted,
       initialNames: current.initialNames,
       labels: current.labels,
       readerParents: current.readerParents,
@@ -16282,6 +16326,7 @@ export class PanelProvider implements vscode.Disposable {
               draftCommentIds: current.draftCommentIds,
               started: current.started,
               agentRuns: current.agentRuns,
+              prompted: current.prompted,
               initialNames: current.initialNames,
               labels: current.labels,
               readerParents: current.readerParents,

@@ -98,6 +98,7 @@ test('native choices retain the initiating archive and launch membership snapsho
     archived: [{ agent: 'claude' as const, sessionId: 'saved' }],
     startedHere: [{ agent: 'codex' as const, sessionId: 'reader' }],
     agentRuns: [{ agent: 'claude' as const, sessionId: 'run' }],
+    prompted: [],
   };
   const expected = structuredClone(readerState);
   f.ports.confirm = async () => {

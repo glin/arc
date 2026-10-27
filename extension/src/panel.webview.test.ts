@@ -11119,6 +11119,35 @@ test('EOF-covered agent-run classification survives host acceptance of an unfini
   assert.equal(classify(), null);
 });
 
+test('a prompted Arc agent-run launch is the reader own session, and a prompted child transcript stays a run', () => {
+  const provider: any = Object.assign(Object.create(PanelProvider.prototype), {
+    saved: { agentRuns: ['run', 'child'], prompted: ['run', 'child'] },
+    startedHere: new Set(),
+    dispatchFacts: new Map(),
+    dispatchDiscoveryPending: false,
+    metaFor: () => ({ agentRun: true, size: 1, mtimeMs: 1 }),
+  });
+  const source = (sessionId: string, childTranscript: boolean) => ({
+    agent: 'claude' as const,
+    file: `${sessionId}.jsonl`,
+    sessionId,
+    size: 1,
+    mtimeMs: 1,
+    ...(childTranscript ? { childTranscript: true } : {}),
+  });
+  assert.equal(provider.agentRunFor(source('run', false), new Map()), false, 'the prompted launch stayed an agent run');
+  assert.equal(
+    provider.agentRunFor(source('child', true), new Map()),
+    true,
+    'a prompted child transcript left the runs',
+  );
+  assert.equal(
+    provider.isAgentRunLaunch('run'),
+    true,
+    'the prompt changed the launch record that sets the cache request',
+  );
+});
+
 test('worker metadata carries the agent-run mark to the host', () => {
   const rowsAt = panelHostSource.indexOf('this.sessionRows = all.map(');
   assert.notEqual(rowsAt, -1, 'panelhost.ts no longer builds the rail rows, so this guard reads nothing');
@@ -20370,6 +20399,7 @@ test.each([false, true])('/clear publishes the copied setup and preserves delega
   };
   const saved = normalizePanelState(null);
   if (agentRun) saved.agentRuns = ['old'];
+  if (agentRun) saved.prompted = ['old'];
   saved.labels = setSessionLabels(saved.labels, 'old', ['keep']);
   const queuedAsset: StoredPromptAsset = {
     id: '11111111-1111-4111-8111-111111111111',
@@ -20428,6 +20458,11 @@ test.each([false, true])('/clear publishes the copied setup and preserves delega
   };
   move.call(host, 'old', 'new', 'claude', 'C:\\ws');
   assert.equal(host.saved.agentRuns?.includes('new') === true, agentRun);
+  assert.equal(
+    host.saved.prompted?.includes('new') === true,
+    agentRun,
+    'the successor of a prompted agent run went back to Run by agents',
+  );
   assert.equal(host.startedHere.has('new'), !agentRun);
   assert.equal(
     host.hostSessions.get(mappedHost),
@@ -20806,6 +20841,7 @@ test('a failed fresh-session launch keeps its reader parent for a successful ret
     dropCarriedComments() {},
     dropCarriedAssets() {},
     livePressAnswered() {},
+    notePrompted() {},
     post() {
       return Promise.resolve();
     },
@@ -25991,7 +26027,7 @@ test('an exact typed compact command is intercepted before prompt assembly', () 
   );
   sourceMatch(
     body.slice(classified, assembled),
-    /this\.startCompaction\(state, queued\)/,
+    /this\.startCompaction\(state, queued, true\)/,
     'the recognized command is still handed to the prompt path',
   );
 });
@@ -26013,7 +26049,7 @@ test('an exact typed clear command is intercepted before prompt assembly', () =>
   );
   sourceMatch(
     promptBody.slice(clearAt, actionAt),
-    /this\.startClear\(state, null, text\)/,
+    /this\.startClear\(state, null, text, true\)/,
     'a clear command is not handed to the prompt path',
   );
 });
@@ -26934,7 +26970,7 @@ function clearSettlementMethods() {
 export function finishClearSettlement(settlement: any) {\n${methodBody('private finishClearSettlement(')}\n}
 export function cancelClearSettlement(session: string, reason: string) {\n${methodBody('private cancelClearSettlement(')}\n}
 export function noteLocalAnswer(session: string, clearFailure: string | null = null, turnId?: number) {\n${methodBody('public noteLocalAnswer(')}\n}
-export function startClear(state: any, queued: any = null, text: string = '/clear') {\n${methodBody('private startClear(')}\n}`,
+export function startClear(state: any, queued: any = null, text: string = '/clear', prompted = false) {\n${methodBody('private startClear(')}\n}`,
     {
       loader: 'ts',
       format: 'cjs',
@@ -27295,7 +27331,7 @@ test('a cancelled accepted clear releases its source and later prompts', async (
     `
 export function finishClearSettlement(settlement: any) {\n${methodBody('private finishClearSettlement(')}\n}
 export function cancelClearSettlement(session: string, reason: string) {\n${methodBody('private cancelClearSettlement(')}\n}
-export function startClear(state: any, queued: any = null, text: string = '/clear') {\n${methodBody('private startClear(')}\n}`,
+export function startClear(state: any, queued: any = null, text: string = '/clear', prompted = false) {\n${methodBody('private startClear(')}\n}`,
     {
       loader: 'ts',
       format: 'cjs',
@@ -29330,6 +29366,7 @@ test('resetting workspace state invalidates every panel selection and preserves 
       assert.equal(provider.startedHere.has(session), !agentRun);
     }
     provider.saved.readerParents = { child: 'parent' };
+    provider.saved.prompted = ['taken'];
     for (let index = 0; index < 256; index++)
       await provider
         .readOwner()
@@ -29338,12 +29375,14 @@ test('resetting workspace state invalidates every panel selection and preserves 
     assert.equal(provider.saved.readRevision, 257);
     assert.deepEqual(provider.saved.readerParents, { child: 'parent' });
     assert.deepEqual(provider.saved.agentRuns, ['tagged']);
+    assert.deepEqual(provider.saved.prompted, ['taken'], 'Forget State returned a prompted session to Run by agents');
     assert.deepEqual(provider.saved.started, ['untagged']);
     const restored: any = Object.assign(Object.create(PanelProvider.prototype), {
       saved: normalizePanelState(stored),
       startedHere: new Set(stored.started),
       metaFor: () => ({ agentRun: false }),
     });
+    assert.deepEqual(restored.saved.prompted, ['taken'], 'a reload returned a prompted session to Run by agents');
     for (const reader of [provider, restored]) {
       assert.equal(
         reader.agentRunFor({ sessionId: 'tagged' }, new Map()),
@@ -35626,6 +35665,231 @@ test.each(['claude', 'codex'] as const)(
     }
   },
 );
+
+// An Arc agent-run launch that a saved view or a pin shows, prompted from the Prompt box while it runs.
+// The production `postRail` posts the session list, and `rails` holds every session list message it sent.
+function promptedRunProvider(agentRun: boolean | null = true, agent: 'claude' | 'codex' = 'claude') {
+  const fixture = catalogSendProvider(agent);
+  const { provider, session } = fixture;
+  if (agentRun) provider.saved.agentRuns = [session];
+  provider.sessionRows = [{ ...provider.sessionRows[0], agentRun, when: '', at: 1, relative: '' }];
+  const rails: Array<{ rail: Parameters<typeof railCounts>[0] }> = [];
+  const reached: string[] = [];
+  const answered: string[] = [];
+  const answer = provider.livePressAnswered;
+  Object.assign(provider, {
+    postRail: (PanelProvider.prototype as unknown as { postRail: unknown }).postRail,
+    sendToHost: (_host: unknown, message: { type: string; rail: Parameters<typeof railCounts>[0] }) => {
+      if (message.type === 'rail') rails.push(message);
+      return Promise.resolve(true);
+    },
+    lifetimeFigures: new SessionFiguresCache(),
+    lifetimeFiguresBySession: () => ({ stats: {}, contextDetails: {}, costs: {}, cacheExpiryCounts: {} }),
+    railRevision: 0,
+    lastRailRevision: -1,
+    lastRailDay: '',
+    lastRailKey: null,
+    lastRailAdoptionsJson: '',
+    glanceAt: () => new Map(),
+    outcomesFor: () => new Map(),
+    unreadCounts: () => new Map(),
+    railStatuses: () => ({
+      statuses: new Map(provider.running.size ? [[session, 'running']] : []),
+      openChildren: new Map(),
+    }),
+    newestTurns: () => new Map(),
+    runningSessions: () => new Set(),
+    runningSince: () => new Map(),
+    waitingSessions: () => new Set(),
+    liveBackgroundCommands: () => new Map(),
+    sessionOutcomes: new Map(),
+    hidden: new Set(),
+    pinnedTop: new Set(),
+    metadataStatsBySession: {},
+    parsedRailCaches: {},
+    metadataRailCaches: {},
+    metadataRailRevisions: {},
+    onCompact: async () => {
+      reached.push('compact');
+      return { delivered: true, reason: '' };
+    },
+    onClear: async () => {
+      reached.push('clear');
+      return { delivered: true, reason: '', session };
+    },
+    livePressAnswered(this: unknown, ...args: unknown[]) {
+      answered.push(String(args[0]));
+      return answer.apply(this, args);
+    },
+  });
+  const submit = (text: string, id: string) =>
+    provider.acceptSubmission(text, session, 1, session, fixture.host, {
+      id,
+      order: 1,
+      source: session,
+      revision: 1,
+      text,
+    });
+  return { ...fixture, rails, reached, answered, submit };
+}
+
+test('a prompt from the Prompt box moves a running Arc agent run into the Running count without a reload', async () => {
+  const { provider, session, rails, submit } = promptedRunProvider();
+  provider.running = new Set([runningKey('claude', session)]);
+  await submit('Keep going', 'takeover');
+  await vi.waitFor(() => assert.deepEqual(provider.saved.prompted, [session]));
+  const posted = rails.at(-1)?.rail;
+  assert.ok(posted, 'the prompt posted no session list');
+  assert.equal(
+    posted.find((card) => card.id === session)?.runByAgent,
+    false,
+    'the next posted session list still files the session as an agent run',
+  );
+  const now = Date.now();
+  assert.equal(railCounts(posted, { showArchived: false, showRuns: false }, now).running, 1);
+  assert.deepEqual(provider.saved.agentRuns, [session], 'the prompt removed the launch record');
+  assert.equal(
+    provider.isAgentRunLaunch(session),
+    true,
+    'the prompt changed the prompt-cache request of later resumes',
+  );
+});
+
+test.each([
+  'a failed save',
+  'a session that moved during the save',
+  'typed Codex /rename',
+  'typed /remote-control',
+  'a delivery the agent refused',
+  'a typed /compact the agent refused',
+] as const)(
+  'a Prompt box submission refused or handled locally with %s leaves the agent run filed as one',
+  async (cause) => {
+    const { provider, session, worktree, posted, delivered, answered, submit } = promptedRunProvider(
+      true,
+      cause === 'typed Codex /rename' ? 'codex' : 'claude',
+    );
+    provider.renameFromComposer = async () => {};
+    provider.remoteControlFromComposer = async () => {};
+    if (cause === 'a failed save') provider.memento = { update: () => Promise.reject(new Error('The disk is full.')) };
+    if (cause === 'a session that moved during the save')
+      provider.memento = {
+        update() {
+          provider.catalog.sessions[0].cwd = path.join(worktree, 'moved');
+          return Promise.resolve();
+        },
+      };
+    if (cause === 'a delivery the agent refused')
+      provider.onSendPrompt = async () => ({ delivered: false, reason: 'No agent session could be opened.' });
+    if (cause === 'a typed /compact the agent refused')
+      provider.onCompact = async () => ({ delivered: false, reason: 'No agent handoff is available.' });
+    const text =
+      cause === 'typed Codex /rename'
+        ? '/rename Takeover'
+        : cause === 'typed /remote-control'
+          ? '/remote-control'
+          : cause === 'a typed /compact the agent refused'
+            ? '/compact'
+            : 'Hello';
+    await submit(text, `refused-${cause}`);
+    assert.deepEqual(delivered, []);
+    if (cause.endsWith('the agent refused'))
+      await vi.waitFor(() => assert.deepEqual(answered, [session], `${cause} never settled`));
+    else if (!cause.startsWith('typed'))
+      assert.equal(posted.filter((message) => message.type === 'restoreDraft').length, 1, `${cause} was not refused`);
+    assert.equal(provider.saved.prompted, undefined, `${cause} recorded a takeover`);
+  },
+);
+
+test.each([
+  ['a comment-only submission to an agent run', true, true],
+  ['a prompt to a session with no classification yet', null, true],
+  ['a prompt to an ordinary reader session', false, false],
+] as const)(
+  '%s records a takeover only for a session not filed as the reader own',
+  async (_case, agentRun, recorded) => {
+    const { provider, session, delivered, answered, submit } = promptedRunProvider(agentRun);
+    const text = agentRun === true ? '' : 'Hello';
+    if (agentRun === true)
+      provider.saved.comments = [
+        {
+          id: 'comment-only',
+          sessionId: session,
+          turnKey: `${session}:1`,
+          part: 'summary',
+          quote: '',
+          note: 'Look at this',
+          headline: 'Turn',
+          sessionTitle: 'Listed session',
+          turnAt: 1,
+        },
+      ];
+    await submit(text, `case-${agentRun}`);
+    await vi.waitFor(() => assert.deepEqual(answered, [session]));
+    assert.equal(delivered.length, 1);
+    assert.deepEqual(provider.saved.prompted ?? [], recorded ? [session] : []);
+  },
+);
+
+test('a prompt to an Arc agent-run launch that discovery has not listed records the takeover', async () => {
+  const { provider, session, delivered, submit } = promptedRunProvider();
+  provider.sessionRows = syntheticDraftRows([
+    { draftId: session, createdAt: 1, agent: 'Claude Code', agentKey: 'claude' },
+  ]);
+  assert.equal(provider.sessionRows[0].agentRun, false, 'the pending row no longer files the launch as the reader own');
+  await submit('Hello', 'pending-launch');
+  await vi.waitFor(() => assert.equal(delivered.length, 1));
+  await vi.waitFor(() =>
+    assert.deepEqual(provider.saved.prompted, [session], 'the first prompt to a pending launch recorded nothing'),
+  );
+});
+
+// A waiting prompt that holds the queue, so a later prompt queues behind it.
+const promptedWaiting = (session: string) => ({
+  id: 'waiting',
+  text: 'Waiting prompt',
+  commentIds: [],
+  assets: [],
+  at: 1,
+  delivery: { phase: 'queued' as const, owner: session },
+});
+
+test.each([
+  ['restores a draft recovery', 'Hello', false, 'recovery', 'queue'],
+  ['queues a typed /compact', '/compact', true, null, 'queue'],
+  ['starts a typed /compact', '/compact', false, null, 'compact'],
+  ['queues a typed /clear', '/clear', true, null, 'queue'],
+  ['starts a typed /clear', '/clear', false, null, 'clear'],
+  ['queues a prompt behind a waiting one', 'Hello', true, 'waiting', 'queue'],
+  ['sends a prompt', 'Hello', false, null, 'send'],
+] as const)('a Prompt box submission that %s records the takeover', async (_case, text, running, held, path) => {
+  const { provider, session, delivered, reached, submit } = promptedRunProvider();
+  if (running) provider.running = new Set([runningKey('claude', session)]);
+  if (held === 'waiting') provider.queues[session] = [promptedWaiting(session)];
+  if (held === 'recovery')
+    provider.queues[session] = [
+      {
+        id: 'reset',
+        text: '',
+        commentIds: [],
+        assets: [],
+        at: 1,
+        delivery: { phase: 'draft-recovery', owner: session, source: session, resetId: 'reset' },
+      },
+    ];
+  await submit(text, `call-${_case}`);
+  await vi.waitFor(() =>
+    assert.deepEqual(provider.saved.prompted, [session], `a submission that ${_case} recorded nothing`),
+  );
+  if (path === 'queue')
+    assert.ok(
+      (provider.queues[session] ?? []).some((entry: { text: string }) => entry.text === text) ||
+        delivered.some((entry) => entry.text.includes(text)),
+      `the submission did not ${_case}`,
+    );
+  if (path === 'compact' || path === 'clear') assert.deepEqual(reached, [path], `the submission did not ${_case}`);
+  if (path === 'send') assert.equal(delivered.length, 1, `the submission did not ${_case}`);
+});
 
 test.each(['claude', 'codex'] as const)(
   'catalog-backed %s submissions stay undelivered when scope readiness changes during persistence',

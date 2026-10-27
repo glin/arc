@@ -124,6 +124,7 @@ export function snapshotExportReaderState(state: import('./domain/export-model')
     archived: copy(state.archived),
     startedHere: copy(state.startedHere),
     agentRuns: copy(state.agentRuns),
+    prompted: copy(state.prompted),
   });
 }
 
@@ -1334,15 +1335,16 @@ export async function captureSessionExport(
     options.progress?.('numbers', sessions.length);
     const numericSource = await numericRecord(entry, options, limits);
     numeric.set(key, numericSource);
-    const membership = (kind: 'startedHere' | 'agentRuns') =>
+    const membership = (kind: 'startedHere' | 'agentRuns' | 'prompted') =>
       options.readerState?.[kind].some((identity) => identityKey(identity) === identityKey(entry)) ?? false;
     const parent = parentIndex.get(key);
     const dispatched = parent?.relation === 'dispatched';
     const runEvidence = membership('agentRuns') || entry.runClassifier!.agentRun();
+    // A prompt from the Prompt box makes the session the reader's own, as a start here does. A child transcript stays a run.
     session.agentRun = agentRunAnswer(
       runEvidence,
       key,
-      membership('startedHere') ? new Set([key]) : new Set(),
+      membership('startedHere') || membership('prompted') ? new Set([key]) : new Set(),
       entry.childTranscript === true,
       dispatched && runEvidence,
       dispatched && (parent.owned === true || entry.runClassifier!.person()),

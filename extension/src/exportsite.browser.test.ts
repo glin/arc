@@ -391,6 +391,7 @@ describe('portable saved-session site', () => {
             archived: [{ agent: 'claude', sessionId: 'root' }],
             startedHere: [{ agent: 'claude', sessionId: 'root' }],
             agentRuns: [{ agent: 'claude', sessionId: 'child' }],
+            prompted: [],
           },
         },
         writer,
