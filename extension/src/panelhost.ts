@@ -9199,7 +9199,7 @@ export class PanelProvider implements vscode.Disposable {
       }
       const admissionCandidates = all;
       const admissionSelection = selectedOnly ? this.selectionGeneration : undefined;
-      // A selection changes the rows of the sessions each panel leaves and enters, so it rechecks only their sources.
+      // A selection changes only the rows of each panel's current and previous session, so it rechecks only their sources.
       // Every other row keeps the admission of the catalog refresh that listed it.
       const switched = selectedOnly
         ? new Set(

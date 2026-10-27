@@ -154,7 +154,7 @@ export function sameRailInputs(before: RailInputKey | null, now: RailInputKey): 
   );
 }
 
-// The input for the named rows alone, with each per-session figure narrowed to those rows.
+// The input for the named rows alone, with each per-session stat record narrowed to those rows.
 function railInputForRows(input: RailPayloadInput, rows: ReadonlySet<string | null>): RailPayloadInput {
   const ids = [...rows].filter((id): id is string => id !== null);
   const only = <T>(record: Readonly<Record<string, T>>): Record<string, T> =>
