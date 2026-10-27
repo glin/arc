@@ -4921,7 +4921,7 @@ test('a selected-only refresh before the catalog keeps every held title, and the
 });
 
 // A selection changes the rows of the session it leaves and the session it enters. Its refresh checks the prompt sources
-// and builds the session list rows of those two sessions, whatever the size of the catalog.
+// and builds the session list payload of those two sessions alone.
 
 test('a selection in a thousand-session catalog checks prompts and builds session list rows for the two switched sessions', async () => {
   const sessions = Array.from({ length: 1000 }, (_, index) => ({

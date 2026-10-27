@@ -883,8 +883,8 @@ async function poll<T>(read: () => Promise<T | null>, deadline: number): Promise
   }
 }
 
-// Keeps the events a click or a request owns, clock records, and settled window reads. A large catalog writes
-// gigabytes of untagged startup file traces, so the files are read in chunks and an unfinished last line is skipped.
+// Keeps the events a click or a request owns, clock records, and settled window reads. Untagged startup file traces
+// can exceed the longest string Node builds, so the files are read in chunks and an unfinished last line is skipped.
 function nodeEvents(scratch: string): SelectionEvent[] {
   const events: SelectionEvent[] = [];
   const kept = (line: string) =>
