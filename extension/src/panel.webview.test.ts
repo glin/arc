@@ -12719,21 +12719,32 @@ test('the context chip is drawn as a scale, each band mixed from the token its o
   );
 });
 
-test('polling discovers a completed transcript turn without a snapshot trigger', () => {
+test('polling discovers a completed transcript turn without a snapshot trigger', async () => {
+  const { PollDirectoryGate } = await import('./scheduler.ts');
   const dir = tempDir('snapshot-free-poll-');
   const home = tempDir('snapshot-free-store-');
   const file = path.join(dir, 'session.jsonl');
   const seen: string[] = [];
-  const provider = {
+  const provider: Record<string, any> = {
     watching: false,
     poll: null,
+    // Before the first walk the poll has no directories to compare, so it walks.
+    sourceEnumerations: undefined,
+    lastCatalogWalkAt: null,
+    performanceCounters: { recordWork() {} },
+    pollDirectories: () => null,
     refreshFrom(reason: string) {
-      assert.equal(reason, 'poll');
+      assert.equal(reason, 'poll:noListing');
       for (const session of listSessionFiles(dir)) {
         seen.push(...readTurns(session.file, session.sessionId).map((turn) => turn.prompt));
       }
     },
   };
+  provider.pollCatalog = new Function(
+    'PollDirectoryGate',
+    'fs',
+    `return async function () {${methodBody('private async pollCatalog(): Promise<void> {')}}`,
+  )(PollDirectoryGate, fs);
   const start = new Function(
     'POLL_INTERVAL_MILLISECONDS',
     `return function () {${methodBody('private startPolling(): void {')}}`,
@@ -12756,7 +12767,7 @@ test('polling discovers a completed transcript turn without a snapshot trigger',
         .map((record) => JSON.stringify(record))
         .join('\n') + '\n',
     );
-    vi.advanceTimersByTime(5000);
+    await vi.advanceTimersByTimeAsync(5000);
     assert.deepEqual(seen, ['Read these files']);
     assert.equal(fs.existsSync(path.join(home, 'snapshots')), false);
   } finally {
@@ -30933,9 +30944,10 @@ test('selection and accepted worker results avoid unnecessary catalog walks', ()
   const reusing = [...panelHostSource.matchAll(/this\.refresh(?:From|As)\('[^']+', (?:true|false), true\b/g)];
   assert.equal(
     reusing.length,
-    17,
+    18,
     `${reusing.length} refresh callers reuse the held catalog. Selection, older-page loading, ` +
-      'the accepted selected-worker follow-up and row delta recovery must not repeat catalog enumeration.',
+      'the accepted selected-worker follow-up, row delta recovery and a poll at unchanged directories must not ' +
+      'repeat catalog enumeration.',
   );
   const refreshAt = panelHostSource.indexOf('async refresh(');
   const refresh = panelHostSource.slice(
@@ -38405,8 +38417,9 @@ test('a catalog refresh names why it does not reuse the held catalog', async () 
   assert.equal(attempt(), false, `a selected, unchanged catalog walked: ${JSON.stringify(work())}`);
   assert.deepEqual(work(), {});
 
+  // With no selection, the held catalog has no row to revalidate and serves the refresh.
   provider.showing = null;
-  assert.equal(attempt(), true);
+  assert.equal(attempt(), false);
   provider.showing = 'absent';
   assert.equal(attempt(), true);
   provider.showing = 'listed';
@@ -38429,7 +38442,6 @@ test('a catalog refresh names why it does not reuse the held catalog', async () 
 
   assert.deepEqual(work(), {
     'walk:noCatalog': 1,
-    'walk:noSelection': 1,
     'walk:requested:poll': 1,
     'walk:scopeMoved': 1,
     'walk:selectionFileMissing': 1,

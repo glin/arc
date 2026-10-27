@@ -212,6 +212,7 @@ import {
   SESSION_HEAD_BYTES,
   type SessionFile,
   type SessionStatFacts,
+  enumerateSessionFiles,
 } from './transcript';
 import { currentRecordsBySession, transcriptReadCacheKey } from './turnread';
 import {
@@ -262,6 +263,10 @@ import {
   CATALOG_REFRESH_DEADLINE_MS,
   mergeRefreshRequests,
   PendingWatcherWake,
+  PollDirectoryGate,
+  childEventNamesFiles,
+  listedFilesFor,
+  sessionDirectoryOwners,
   watcherRefreshDecision,
 } from './scheduler';
 import { compaction, turn, subagent, claudeCostState } from './turnfixtures';
@@ -7026,7 +7031,7 @@ test('targeted reuse avoids the broad walk, and a failed reuse performs exactly 
 test('each catalog walk names its requester, and the re-list after a replaced file names itself', async () => {
   let replaced: string[] = [];
   const { provider, walks, writeRollout, releaseAll } = heldWalkHarness(
-    { replacedCatalogFiles: async () => replaced, watcherRefreshDecision },
+    { replacedCatalogFiles: async () => replaced, watcherRefreshDecision, sessionDirectoryOwners },
     ['runPendingWatch'],
   );
   let counters = new PanelPerformanceCounters();
@@ -7101,6 +7106,243 @@ test('each catalog walk names its requester, and the re-list after a replaced fi
       'walk:requested:trigger': 1,
     },
   );
+});
+
+// Claude transcripts and Codex rollouts on disk, with the poll tick, the watcher batches and the clock driven by the
+// test. `hidden` holds project directories that the walk lists but leaves out of its directory evidence, as when the
+// poll's stat list misses a directory.
+function pollWalkHarness() {
+  const projects = tempDir('poll-walk-projects-');
+  const project = path.join(projects, 'repo');
+  const other = path.join(projects, 'other');
+  fs.mkdirSync(project);
+  fs.mkdirSync(other);
+  const hidden = new Set<string>();
+  const writeTranscript = (directory: string, id: string) => {
+    const file = path.join(directory, `${id}.jsonl`);
+    fs.writeFileSync(file, '{"type":"user"}\n');
+    return file;
+  };
+  const parent = writeTranscript(project, 'parent');
+  const subagents = path.join(project, 'parent', 'subagents');
+  fs.mkdirSync(subagents, { recursive: true });
+  fs.writeFileSync(path.join(subagents, 'agent-first.jsonl'), '{}\n');
+  const harness = heldWalkHarness(
+    {
+      projectsRoot: () => projects,
+      enumerateSessionFilesFor: () => {
+        const listings = [project, other].map((directory) => enumerateSessionFiles(directory));
+        return {
+          status: 'complete',
+          root: projects,
+          sessions: listings.flatMap((listing) => listing.sessions),
+          files: listings.flatMap((listing) => listing.files),
+          directories: [project, other].filter((directory) => !hidden.has(directory)),
+          uncertain: [],
+        };
+      },
+      enumerateClaudeChildSources: (parents: SessionFile[]) => ({
+        status: 'complete',
+        sessions: [],
+        files: [],
+        directories: parents
+          .filter((row) => row.agent === 'claude')
+          .map((row) => path.join(path.dirname(row.file), row.sessionId, 'subagents')),
+        uncertain: [],
+      }),
+      enumerateRolloutFilesAsync: (root: string, signal?: AbortSignal) => enumerateRolloutFilesAsync(root, signal),
+      PollDirectoryGate,
+      sessionDirectoryOwners,
+      childEventNamesFiles,
+      listedFilesFor,
+      watcherRefreshDecision,
+      POLL_INTERVAL_MILLISECONDS: 5_000,
+    },
+    ['startPolling', 'pollCatalog', 'pollDirectories', 'runPendingWatch', 'refreshFromChild'],
+  );
+  const { provider } = harness;
+  const counters = new PanelPerformanceCounters();
+  let discoveries = 0;
+  const discover = provider.prepareClaudeChildren;
+  Object.assign(provider, {
+    performanceCounters: counters,
+    pendingWatch: new PendingWatcherWake(),
+    watchDirectories() {},
+    prepareClaudeChildren: (...args: unknown[]) => {
+      discoveries++;
+      return discover(...args);
+    },
+  });
+  const started: Promise<void>[] = [];
+  const refresh = provider.refresh;
+  provider.refresh = (...args: unknown[]) => {
+    const run = refresh.apply(provider, args);
+    started.push(run);
+    return run;
+  };
+  // `vi.waitFor` advances a faked clock, so the wait for the directory stats yields without it.
+  const settle = async () => {
+    for (let turns = 0; provider.pollInFlight; turns++) {
+      assert.ok(turns < 10_000, 'the poll never finished its directory stats');
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    for (let index = 0; index < started.length; index++) await started[index];
+  };
+  let tick: () => void = () => assert.fail('polling never started');
+  let now = Date.parse('2026-10-27T12:00:00.000Z');
+  const at = (time: number) => vi.setSystemTime((now = time));
+  const watch = async (events: [string, 'rename' | 'change'][]) => {
+    for (const [file, kind] of events)
+      provider.pendingWatch.noteFileEvent(path.dirname(file), path.basename(file), kind, normalizeFsPath);
+    provider.runPendingWatch({ cause: 'quiet', firstAt: 0, lastAt: 0, firedAt: 0 });
+    await settle();
+  };
+  const start = async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    at(now);
+    provider.refreshFrom('startup', true);
+    await settle();
+    const interval = vi.spyOn(globalThis, 'setInterval').mockImplementation(((callback: () => void) => {
+      tick = callback;
+      return 0;
+    }) as typeof setInterval);
+    try {
+      provider.startPolling();
+    } finally {
+      interval.mockRestore();
+    }
+  };
+  // One poll interval passes and the poll fires.
+  const poll = async () => {
+    at(now + 5_000);
+    tick();
+    await settle();
+  };
+  const walks = () =>
+    Object.fromEntries(Object.entries(counters.snapshot().work).filter(([name]) => name.startsWith('walk:')));
+  const listed = (file: string) =>
+    (provider.authoritativeCatalog ?? []).some(
+      (row: SessionFile) => normalizeFsPath(row.file) === normalizeFsPath(file),
+    );
+  return {
+    ...harness,
+    projects,
+    project,
+    other,
+    hidden,
+    parent,
+    subagents,
+    counters,
+    writeTranscript,
+    discoveries: () => discoveries,
+    start,
+    poll,
+    watch,
+    walks,
+    listed,
+    settle,
+  };
+}
+
+test('six appending writers and a new child transcript each minute walk only on the poll backstop', async () => {
+  const { provider, writeRollout, subagents, start, poll, watch, walks, discoveries, counters } = pollWalkHarness();
+  const writers = Array.from({ length: 6 }, (_, index) => writeRollout(`writer-${index}`));
+  try {
+    await start();
+    const discovered = discoveries();
+    for (let minute = 0; minute < 3; minute++) {
+      for (let interval = 0; interval < 12; interval++) {
+        if (interval === 0) {
+          // Windows reports a new file as a rename, then a change once its first line lands.
+          const child = path.join(subagents, `agent-minute-${minute}.jsonl`);
+          fs.writeFileSync(child, '{}\n');
+          await watch([
+            [child, 'rename'],
+            [child, 'change'],
+          ]);
+        }
+        for (const writer of writers) fs.appendFileSync(writer, '{}\n');
+        await watch(writers.map((writer) => [writer, 'change']));
+        await poll();
+      }
+    }
+    assert.deepEqual(walks(), { 'walk:requested:startup': 1, 'walk:requested:poll:backstop': 3 });
+    assert.equal(counters.snapshot().work['watcher:sessionDirectory'], 3, 'a new child file was not owned');
+    assert.ok(
+      discoveries() - discovered >= 3,
+      'a refresh for a new child file sent no child discovery, so the child never lists',
+    );
+    assert.ok(provider.authoritativeCatalog.length >= 7);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('a new top-level transcript in a polled directory lists within one poll, without a watcher event', async () => {
+  const { project, writeTranscript, start, poll, walks, listed } = pollWalkHarness();
+  try {
+    await start();
+    await poll();
+    const added = writeTranscript(project, 'added');
+    await poll();
+    assert.ok(listed(added), 'the new transcript waited for the backstop');
+    assert.deepEqual(walks(), { 'walk:requested:startup': 1, 'walk:requested:poll:directory': 1 });
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('a new transcript in a directory the stat list misses lists at the backstop', async () => {
+  const { other, hidden, writeTranscript, start, poll, walks, listed } = pollWalkHarness();
+  hidden.add(other);
+  try {
+    await start();
+    const added = writeTranscript(other, 'unpolled');
+    let polls = 0;
+    while (!listed(added) && polls < 13) {
+      await poll();
+      polls++;
+    }
+    assert.equal(polls, 12, `the transcript did not list exactly at the 60 s backstop: ${JSON.stringify(walks())}`);
+    assert.deepEqual(walks(), { 'walk:requested:startup': 1, 'walk:requested:poll:backstop': 1 });
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('a thinking event from a live child updates its session row without a walk', async () => {
+  const { provider, parent, writeRollout, start, walks, settle } = pollWalkHarness();
+  // The handler's last statement turns every remaining child event into a refresh.
+  const source = fs.readFileSync(path.join(__dirname, 'extension.ts'), 'utf8');
+  const file = ts.createSourceFile('extension.ts', source, ts.ScriptTarget.Latest, true);
+  let refresh: string | undefined;
+  const visit = (node: ts.Node) => {
+    if (ts.isBlock(node)) {
+      const at = node.statements.findIndex(
+        (statement) =>
+          ts.isIfStatement(statement) && statement.expression.getText(file) === "event.kind === 'sessionState'",
+      );
+      if (at >= 0) refresh = node.statements[at + 1]?.getText(file);
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(file);
+  assert.ok(refresh, 'extension.ts no longer ends the child event handler after the session state report');
+  const receive = new Function('panel', 'host', 'key', 'event', refresh);
+  const shown = writeRollout('shown');
+  try {
+    await start();
+    provider.showing = 'shown';
+    assert.ok(shown);
+    fs.appendFileSync(parent, '{"type":"assistant"}\n');
+    receive(provider, { get: () => ({ state: () => ({ sessionId: 'parent' }) }) }, 'child', { kind: 'thinking' });
+    await settle();
+    const row = provider.authoritativeCatalog.find((session: SessionFile) => session.sessionId === 'parent');
+    assert.equal(row.size, fs.statSync(parent).size, 'the thinking event left the session row at its old size');
+    assert.deepEqual(walks(), { 'walk:requested:startup': 1 });
+  } finally {
+    vi.useRealTimers();
+  }
 });
 
 test('every refresh caller names its reason', () => {
@@ -10380,6 +10622,8 @@ function integrityHostHarness(scope: Record<string, unknown> = {}, extraMethods:
       'postProjectSpend',
       'projectSpendBusy',
       'startPolling',
+      'pollCatalog',
+      'pollDirectories',
       'stopPolling',
       'watchDirectories',
       'wakeFromWatch',
@@ -10402,6 +10646,8 @@ function integrityHostHarness(scope: Record<string, unknown> = {}, extraMethods:
       prepareProjectSpendViewSteps,
       publicProjectSpendPrice,
       POLL_INTERVAL_MILLISECONDS: 1000,
+      PollDirectoryGate,
+      sessionDirectoryOwners,
       ...scope,
     },
   );

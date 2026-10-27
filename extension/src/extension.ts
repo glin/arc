@@ -647,7 +647,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         }
         return;
       }
-      panel.refreshFrom(`child:${event.kind}`);
+      panel.refreshFromChild(event.kind, host.get(key)?.state().sessionId ?? null);
     },
     onStateChange: (state) => {
       panel.initialNamesChanged();

@@ -6,8 +6,11 @@ import {
   listedFilesFor,
   mergeRefreshRequests,
   PendingWatcherWake,
+  POLL_BACKSTOP_WALK_MS,
+  PollDirectoryGate,
   RefreshRequest,
   SchedulerClock,
+  sessionDirectoryOwners,
   watcherRefreshDecision,
 } from './scheduler.ts';
 
@@ -259,6 +262,7 @@ test('four known watcher files produce one targeted batch with four paths', () =
       kind: 'targeted',
       changedPaths: batches[0].changedPaths,
       broadReasons: [],
+      ownedPaths: 0,
     },
   );
 });
@@ -272,6 +276,7 @@ test('unknown filenames and rename events retain the broad watcher path and name
       kind: 'broad',
       changedPaths: [],
       broadReasons: ['missingFilename'],
+      ownedPaths: 0,
     },
   );
 
@@ -297,6 +302,7 @@ test('unknown filenames and rename events retain the broad watcher path and name
       kind: 'broad',
       changedPaths: [],
       broadReasons: ['noPaths'],
+      ownedPaths: 0,
     },
   );
 
@@ -318,7 +324,7 @@ test('live activity with no card names listed transcripts and draws only for a s
   const quiet = listed.take();
   assert.deepEqual(
     watcherRefreshDecision(quiet, () => true),
-    { kind: 'targeted', changedPaths: ['listed-continued.jsonl', 'listed.jsonl'], broadReasons: [] },
+    { kind: 'targeted', changedPaths: ['listed-continued.jsonl', 'listed.jsonl'], broadReasons: [], ownedPaths: 0 },
     'a session with two listed transcripts did not name both',
   );
   assert.equal(quiet.drawRequired, false);
@@ -339,6 +345,7 @@ test('live activity with no card names listed transcripts and draws only for a s
       kind: 'broad',
       changedPaths: [],
       broadReasons: ['activityFallbackNoFile'],
+      ownedPaths: 0,
     },
   );
 });
@@ -430,4 +437,138 @@ test('a trigger that waits behind a refresh keeps the strongest request', () => 
     request({ reason: 'direct', force: true, reuseCatalog: true }),
     'a request that wants metadata before its render was rendered before metadata',
   );
+});
+
+// Each platform's path rules, as `normalizeFsPath` applies them, independent of the host running the test.
+const platformPaths = {
+  windows: {
+    normalize: (file: string) => file.replace(/\\/g, '/').toLowerCase(),
+    parent: 'C:\\Users\\Greg\\.claude\\projects\\C--Repo\\Parent-Session.jsonl',
+    child: 'c:\\users\\greg\\.claude\\PROJECTS\\c--repo\\parent-session\\SubAgents\\agent-a1.jsonl',
+    owned: true,
+  },
+  macos: {
+    normalize: (file: string) => file,
+    parent: '/Users/Greg/.claude/projects/-Users-Greg-Repo/Parent-Session.jsonl',
+    child: '/Users/Greg/.claude/projects/-Users-Greg-Repo/Parent-Session/subagents/agent-a1.jsonl',
+    owned: true,
+  },
+  linux: {
+    normalize: (file: string) => file,
+    parent: '/home/greg/.claude/projects/-home-greg-Repo/Parent-Session.jsonl',
+    child: '/home/greg/.claude/projects/-home-greg-repo/parent-session/subagents/agent-a1.jsonl',
+    owned: false,
+  },
+};
+
+const directoryOf = (file: string) => file.slice(0, Math.max(file.lastIndexOf('\\'), file.lastIndexOf('/')));
+const nameOf = (file: string) => file.slice(Math.max(file.lastIndexOf('\\'), file.lastIndexOf('/')) + 1);
+
+test.each(Object.entries(platformPaths))(
+  'a new child transcript under a listed session directory is owned by that session on %s',
+  (_platform, { normalize, parent, child, owned }) => {
+    const catalog = [
+      { agent: 'claude', file: parent, sessionId: 'Parent-Session' },
+      { agent: 'claude', file: child.replace('a1', 'a0'), sessionId: 'a0', childTranscript: true },
+      { agent: 'codex', file: parent.replace('.jsonl', '-codex.jsonl'), sessionId: 'Parent-Session-codex' },
+    ];
+    const owners = sessionDirectoryOwners(catalog, normalize);
+    assert.deepEqual(owners(normalize(child)), owned ? [parent] : null);
+    // A file directly in the session directory belongs to it too. A file in the project directory does not.
+    assert.deepEqual(owners(`${directoryOf(directoryOf(normalize(child)))}/tool.jsonl`), owned ? [parent] : null);
+    assert.equal(owners(normalize(parent.replace('Parent-Session', 'Other'))), null);
+  },
+);
+
+test('a Windows rename event for a new child transcript under a listed session revalidates the owner', () => {
+  const { normalize, parent, child } = platformPaths.windows;
+  const owners = sessionDirectoryOwners([{ agent: 'claude', file: parent, sessionId: 'Parent-Session' }], normalize);
+  const known = (file: string) => file === normalize(parent);
+  const created = new PendingWatcherWake();
+  created.noteFileEvent(directoryOf(child), nameOf(child), 'rename', normalize);
+  created.noteFileEvent(directoryOf(child), nameOf(child), 'change', normalize);
+  assert.deepEqual(watcherRefreshDecision(created.take(), known, owners), {
+    kind: 'targeted',
+    changedPaths: [parent],
+    broadReasons: [],
+    ownedPaths: 1,
+  });
+
+  // A new top-level transcript beside it still walks, and so does a listed transcript that moved.
+  const both = new PendingWatcherWake();
+  both.noteFileEvent(directoryOf(child), nameOf(child), 'rename', normalize);
+  both.noteFileEvent(directoryOf(parent), 'New-Session.jsonl', 'rename', normalize);
+  assert.deepEqual(watcherRefreshDecision(both.take(), known, owners).broadReasons, ['createOrRename']);
+  const moved = new PendingWatcherWake();
+  moved.noteFileEvent(directoryOf(parent), nameOf(parent), 'rename', normalize);
+  assert.deepEqual(watcherRefreshDecision(moved.take(), known, owners).broadReasons, ['createOrRename']);
+  // A path under no listed session directory stays an unknown path.
+  const stray = new PendingWatcherWake();
+  stray.noteFileEvent('C:\\elsewhere', 'other.jsonl', 'change', normalize);
+  assert.deepEqual(watcherRefreshDecision(stray.take(), known, owners).broadReasons, ['unknownPath']);
+});
+
+test('the poll walks only for a moved listing directory or a due backstop, and names moved session directories', async () => {
+  const prints = new Map<string, string | null>([
+    ['projects', 'a'],
+    ['projects/repo', 'a'],
+    ['projects/repo/s1/subagents', 'a'],
+    ['projects/repo/s2/subagents', null],
+  ]);
+  const gate = new PollDirectoryGate(async (directory) => prints.get(directory) ?? null);
+  const directories = {
+    listing: ['projects', 'projects/repo'],
+    children: ['projects/repo/s1/subagents', 'projects/repo/s2/subagents'],
+  };
+  assert.deepEqual(await gate.decide(null, null), { kind: 'walk', cause: 'noListing' });
+  assert.deepEqual(await gate.decide(directories, 5_000), { kind: 'reuse' }, 'a first stat walked');
+  assert.equal(gate.stats, 4);
+  assert.deepEqual(await gate.decide(directories, 10_000), { kind: 'reuse' });
+  // A `subagents` directory that appears moves as well.
+  prints.set('projects/repo/s2/subagents', 'b');
+  assert.deepEqual(await gate.decide(directories, 15_000), {
+    kind: 'children',
+    directories: ['projects/repo/s2/subagents'],
+  });
+  prints.set('projects/repo', 'b');
+  prints.set('projects/repo/s1/subagents', 'b');
+  assert.deepEqual(await gate.decide(directories, 20_000), { kind: 'walk', cause: 'directory' });
+  assert.deepEqual(await gate.decide(directories, POLL_BACKSTOP_WALK_MS), { kind: 'walk', cause: 'backstop' });
+  gate.clear();
+  prints.set('projects', 'b');
+  assert.deepEqual(await gate.decide(directories, 5_000), { kind: 'reuse' }, 'a cleared gate kept its held times');
+});
+
+test('past the stat limit the poll stats session directories in rotation and still sees each one move', async () => {
+  const children = Array.from({ length: 25 }, (_, index) => `s${index}/subagents`);
+  const prints = new Map(children.map((directory) => [directory, 'a']));
+  const stated: string[] = [];
+  const gate = new PollDirectoryGate(async (directory) => {
+    stated.push(directory);
+    return prints.get(directory) ?? 'root';
+  }, 12);
+  const directories = { listing: ['root', 'root/repo'], children };
+  for (let poll = 0; poll < 3; poll++) assert.deepEqual(await gate.decide(directories, 5_000), { kind: 'reuse' });
+  assert.equal(gate.stats, 12, 'a poll stated more than the limit');
+  assert.equal(new Set(stated.filter((directory) => directory.endsWith('subagents'))).size, 25);
+  prints.set('s24/subagents', 'b');
+  const moved: string[] = [];
+  for (let poll = 0; poll < 3; poll++) {
+    const decision = await gate.decide(directories, 5_000);
+    if (decision.kind === 'children') moved.push(...decision.directories);
+  }
+  assert.deepEqual(moved, ['s24/subagents'], 'a rotated directory never reported its move');
+});
+
+test('merged requests keep the files that reusing requests name', () => {
+  const request = (reuseCatalog: boolean, changedPaths: string[] | null): RefreshRequest => ({
+    reason: 'r',
+    force: false,
+    reuseCatalog,
+    metadataAfterRender: false,
+    changedPaths,
+  });
+  assert.deepEqual(mergeRefreshRequests(request(true, ['a']), request(true, null)).changedPaths, ['a']);
+  assert.deepEqual(mergeRefreshRequests(request(true, ['a']), request(false, ['b'])).changedPaths, ['a', 'b']);
+  assert.equal(mergeRefreshRequests(request(true, ['a']), request(false, null)).changedPaths, null);
 });
