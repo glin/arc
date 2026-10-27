@@ -2008,7 +2008,7 @@ test('full mode fails when no browser is available even when Node tests pass', a
       detectBrowser: async () => null,
       acquireLock: async () => ({ release: () => true }),
       spawn: (_command, receivedArgs) => {
-        if (receivedArgs.includes('--maxWorkers=4')) {
+        if (!receivedArgs.includes('src/store.test.ts')) {
           throw new Error('must not run the browser lane');
         }
         return { status: 0 };

@@ -156,8 +156,8 @@ test.each(['claude', 'codex'] as const)(
               assert.equal(result.value.charges.otherPassEnds, 0, JSON.stringify(result.value.charges));
               receiptEnds += result.value.charges.receiptPassEnds;
             }
+            entries += result.value.charges?.receiptEntries ?? 0;
             if (result.value.kind === 'claude-children-progress' || host?.dispatchDiscoveryPending) {
-              entries += result.value.charges?.receiptEntries ?? 0;
               continue;
             }
             assert.equal(result.value.kind, 'claude-children');
