@@ -9284,11 +9284,26 @@ export class PanelProvider implements vscode.Disposable {
       const replyHeld = reuseCatalog && this.discoveryComplete?.scope === JSON.stringify(this.repositoryScopeRoots);
       if (!selectedOnly && (!reuseCatalog || (!replyHeld && (dispatchChanged || this.dispatchDiscoveryPending)))) {
         this.startupHistory?.stage('relationshipsStarted');
+        const listed = new Map(all.map((session) => [session.file, session]));
         const discovered = await this.prepareClaudeChildren(generation, controller.signal, humanPromptWork);
         if (!discovered || controller.signal.aborted || generation !== this.refreshGeneration) {
           return;
         }
         all = this.catalog?.sessions ?? all;
+        // While discovery continues, the list keeps the accepted sessions. An accepted source that this refresh lists with the
+        // same device and inode and no smaller size takes the listed revision, so its metadata read follows the file before
+        // discovery completes.
+        if (this.discoveryComplete === undefined) {
+          all = all.map((session) => {
+            const current = listed.get(session.file);
+            return current &&
+              String(current.dev) === String(session.dev) &&
+              String(current.ino) === String(session.ino) &&
+              current.size >= session.size
+              ? current
+              : session;
+          });
+        }
       }
       if (!selectedOnly) {
         this.performanceCounters.recordStartup('catalogReady', performance.now());

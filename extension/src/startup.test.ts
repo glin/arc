@@ -3529,6 +3529,298 @@ test('pending Claude discovery before an accepted catalog keeps the walked rows 
   );
 });
 
+// While relationship discovery continues, a refresh lists the rows of the accepted catalog. A transcript that grew since
+// that catalog keeps its accepted membership, and its row still takes the facts of the walked revision. A listed row with
+// another identity or a smaller size leaves the accepted row in place.
+test('a session row follows the turns after a hand compaction while relationship discovery continues', async () => {
+  vi.useFakeTimers({ toFake: ['Date'] });
+  const directory = tempDir('compaction-row-');
+  const sessionId = '9e33d208-0000-4000-8000-000000000003';
+  const file = path.join(directory, `${sessionId}.jsonl`);
+  const compactedAt = Date.UTC(2026, 9, 26, 17, 44, 59);
+  const resumedAt = Date.UTC(2026, 9, 27, 3, 8, 8);
+  const answeredAt = resumedAt + 146_000;
+  vi.setSystemTime(answeredAt + 160_000);
+  const iso = (ms: number) => new Date(ms).toISOString();
+  const usage = (written: number) => ({
+    input_tokens: 2,
+    cache_read_input_tokens: 100_000,
+    cache_creation_input_tokens: written,
+    cache_creation: {
+      ephemeral_5m_input_tokens: 0,
+      ephemeral_1h_input_tokens: written,
+    },
+    output_tokens: 400,
+  });
+  const answer = (id: string, at: number, stop: string, content: object[], written: number) => ({
+    type: 'assistant',
+    uuid: id,
+    timestamp: iso(at),
+    message: {
+      id,
+      role: 'assistant',
+      model: 'claude-opus-5-5',
+      stop_reason: stop,
+      content,
+      usage: usage(written),
+    },
+  });
+  const prompt = (id: string, at: number, text: string) => ({
+    type: 'user',
+    uuid: id,
+    promptId: id,
+    timestamp: iso(at),
+    origin: { kind: 'human' },
+    message: { role: 'user', content: [{ type: 'text', text }] },
+  });
+  const write = (records: object[]) =>
+    fs.appendFileSync(
+      file,
+      records.map((record) => JSON.stringify({ sessionId, entrypoint: 'sdk-cli', ...record })).join('\n') + '\n',
+    );
+  write([
+    prompt('p1', compactedAt - 120_000, 'consult sol as well, then compact yourself'),
+    answer('a1', compactedAt - 92_000, 'end_turn', [{ type: 'text', text: 'Both consults are in the plan.' }], 5000),
+    {
+      type: 'system',
+      subtype: 'stop_hook_summary',
+      uuid: 's1',
+      timestamp: iso(compactedAt - 91_800),
+    },
+    {
+      type: 'queue-operation',
+      operation: 'enqueue',
+      timestamp: iso(compactedAt - 34_700),
+    },
+    {
+      type: 'queue-operation',
+      operation: 'dequeue',
+      timestamp: iso(compactedAt - 34_700),
+    },
+    {
+      type: 'system',
+      subtype: 'compact_boundary',
+      uuid: 'b1',
+      timestamp: iso(compactedAt),
+      content: 'Conversation compacted',
+      compactMetadata: {
+        trigger: 'manual',
+        preTokens: 151554,
+        durationMs: 34707,
+      },
+    },
+    {
+      type: 'user',
+      uuid: 'c1',
+      timestamp: iso(compactedAt),
+      isCompactSummary: true,
+      isVisibleInTranscriptOnly: true,
+      message: {
+        role: 'user',
+        content: 'This session is being continued from a previous conversation.',
+      },
+    },
+    {
+      type: 'user',
+      uuid: 'c2',
+      isMeta: true,
+      timestamp: iso(compactedAt - 34_700),
+      message: {
+        role: 'user',
+        content: '<local-command-caveat>Caveat: run by the reader.</local-command-caveat>',
+      },
+    },
+    {
+      type: 'user',
+      uuid: 'c3',
+      timestamp: iso(compactedAt - 34_700),
+      message: {
+        role: 'user',
+        content:
+          '<command-name>/compact</command-name>\n<command-message>compact</command-message>\n<command-args></command-args>',
+      },
+    },
+    {
+      type: 'user',
+      uuid: 'c4',
+      timestamp: iso(compactedAt + 300),
+      message: {
+        role: 'user',
+        content: '<local-command-stdout>Compacted </local-command-stdout>',
+      },
+    },
+    {
+      type: 'last-prompt',
+      lastPrompt: 'consult sol as well, then compact yourself',
+    },
+    { type: 'mode', mode: 'normal' },
+  ]);
+  const listed = () => ({
+    file,
+    sessionId,
+    agent: 'claude' as const,
+    ...revisionOf(fs.statSync(file, { bigint: true })),
+  });
+  const accepted = listed();
+  const worker = titleWorker();
+  let discovery: 'complete' | 'pending' = 'complete';
+  const run = (request: ProgressiveRequest, generation: number, signal: AbortSignal) => {
+    if (request.kind !== 'claude-children') return worker.run(request, generation, signal);
+    if (discovery === 'complete')
+      return Promise.resolve({
+        generation,
+        revision: null,
+        value: {
+          compatibility: discoveryCompatibility(CLAUDE_CHILD_REFERENCE_PARSER_VERSION),
+          kind: 'claude-children',
+          complete: true,
+          continuation: false,
+          references: [],
+          dispatchFacts: [],
+          children: [],
+          referenceEntries: [],
+          scope: ['project'],
+        },
+      });
+    return Promise.resolve({
+      generation,
+      revision: null,
+      value: {
+        kind: 'claude-children-progress',
+        checkpoint: {
+          compatibility: discoveryCompatibility(CLAUDE_CHILD_REFERENCE_PARSER_VERSION),
+          parserVersion: CLAUDE_CHILD_REFERENCE_PARSER_VERSION,
+          parents: [accepted],
+          catalog: [accepted],
+          repositoryRoots: ['project'],
+          completed: [],
+          position: 0,
+          sequence: 1,
+        },
+        referenceEntries: [],
+        continuation: true,
+      },
+    });
+  };
+  const provider = titlePublicationHarness([accepted], run, undefined, {
+    methods: ['prepareClaudeChildren', 'activityFor'],
+    scope: { CLAUDE_CHILD_REFERENCE_PARSER_VERSION },
+    railCacheMark: railCacheMarkOf,
+  });
+  Object.assign(provider, {
+    claudeParents: [accepted],
+    claudeChildReferences: [],
+    claudeChildStatWrites: new Map(),
+    updateSessionSpendSources() {},
+    pruneDerivedTitles: () => false,
+  });
+  provider.useSessionStats(sessionStatsFromFacts);
+  const row = () => provider.sessionRows.find((candidate: any) => candidate.id === sessionId);
+  try {
+    await provider.refresh(true);
+    assert.equal(row()?.at, compactedAt + 300, 'the accepted revision did not draw the hand compaction turn');
+    assert.equal(provider.metadataRailCaches[sessionId] ?? null, null, 'the compaction kept the earlier cache mark');
+    assert.ok(provider.authoritativeCatalog?.some((source: SessionFile) => source.file === file));
+    await vi.waitFor(() => assert.equal(provider.refreshController, null));
+
+    // The reader asks again after nine hours. The turn launches a subagent and ends two minutes before the next walk.
+    const child = path.join(directory, sessionId, 'subagents', 'agent-a1520ba3c1d67dae2.jsonl');
+    fs.mkdirSync(path.dirname(child), { recursive: true });
+    fs.writeFileSync(
+      child,
+      JSON.stringify({
+        type: 'user',
+        isSidechain: true,
+        sessionId,
+        agentId: 'a1520ba3c1d67dae2',
+        timestamp: iso(resumedAt + 12_000),
+        message: { role: 'user', content: 'Read the brief and answer.' },
+      }) + '\n',
+    );
+    write([
+      prompt('p2', resumedAt, 'what about vsix based installations?'),
+      answer(
+        'a2',
+        resumedAt + 10_000,
+        'tool_use',
+        [
+          {
+            type: 'tool_use',
+            id: 'toolu_consult',
+            name: 'Agent',
+            input: {
+              description: 'Consult (fable)',
+              prompt: 'Read the brief.',
+            },
+          },
+        ],
+        48344,
+      ),
+      {
+        type: 'user',
+        uuid: 'r2',
+        timestamp: iso(answeredAt - 4_000),
+        message: {
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'toolu_consult',
+              content: 'analysis',
+            },
+          ],
+        },
+      },
+      answer('a3', answeredAt, 'end_turn', [{ type: 'text', text: 'A VSIX install keeps one release.' }], 408),
+      {
+        type: 'system',
+        subtype: 'stop_hook_summary',
+        uuid: 's2',
+        timestamp: iso(answeredAt + 250),
+      },
+    ]);
+    discovery = 'pending';
+    provider.dispatchDiscoveryPending = true;
+    provider.partial = [listed()];
+    provider.claudeParents = provider.partial;
+    await provider.refresh(true);
+
+    assert.equal(row()?.at, answeredAt + 250, 'the session row kept the age of the hand compaction turn');
+    const mark = provider.metadataRailCaches[sessionId];
+    assert.equal(mark?.tier, '1h', 'the session row kept the cache facts from before the compaction');
+    assert.ok(mark.expiresAt > resumedAt + 60 * 60_000, 'the cache mark did not time a request of the resumed turn');
+    await vi.waitFor(() =>
+      assert.ok(
+        provider.windows.get(sessionId)?.starts.includes(resumedAt),
+        'the unread count never saw the turn after the compaction',
+      ),
+    );
+
+    // A listing with another inode or a smaller size is not the accepted source, so the accepted row and its facts stay.
+    const grown = provider.authoritativeCatalog.find((source: SessionFile) => source.file === file);
+    for (const moved of [
+      { ...listed(), ino: `${String(grown.ino)}0` },
+      { ...listed(), size: grown.size - 1 },
+    ]) {
+      await vi.waitFor(() => assert.equal(provider.refreshController, null));
+      provider.partial = [moved];
+      provider.claudeParents = provider.partial;
+      await provider.refresh(true);
+      assert.deepEqual(
+        provider.authoritativeCatalog.map((source: SessionFile) => [String(source.ino), source.size]),
+        [[String(grown.ino), grown.size]],
+        'a listed row that is not the accepted source replaced the accepted row',
+      );
+      assert.equal(row()?.at, answeredAt + 250, 'a listed row that is not the accepted source moved the row facts');
+    }
+  } finally {
+    provider.anyVisible = () => false;
+    provider.abandonCatalogRefresh();
+    worker.stop();
+    vi.useRealTimers();
+  }
+});
+
 // A Codex session this panel started takes its name and recorded responses while unrelated discovery stays pending.
 test('a started Codex session publishes its name and recorded responses while relationship discovery stays pending', async () => {
   const directory = tempDir('pending-discovery-admission-');
@@ -5186,11 +5478,17 @@ test('restored startup waits for all required metadata before its first payload'
 
 // The harness controls discovery and failed worker requests. Successful requests read fixture records through the production worker.
 
-function titlePublicationHarness(sessions: any[], run: any, cacheFile?: string): any {
+function titlePublicationHarness(
+  sessions: any[],
+  run: any,
+  cacheFile?: string,
+  real: { methods?: string[]; scope?: Record<string, unknown>; railCacheMark?: typeof railCacheMarkOf } = {},
+): any {
   const provider = completeDiscoveryHarness(
     undefined,
     false,
     [
+      ...(real.methods ?? []),
       'prepareMetadata',
       'prepareRailEnrichment',
       'glanceAt',
@@ -5223,7 +5521,9 @@ function titlePublicationHarness(sessions: any[], run: any, cacheFile?: string):
       codexTitleFor,
       saveDerivedCache,
       DERIVED_CACHE_CHECKPOINT_MS: 5 * 60 * 1000,
+      ...real.scope,
     },
+    real.railCacheMark,
   );
   const cached = cacheFile ? metadataHarness(run, new SessionNames(), cacheFile) : null;
   Object.assign(provider, {
