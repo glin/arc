@@ -12081,8 +12081,8 @@ export class PanelProvider implements vscode.Disposable {
           : new Set([...(acceptedCoverage.members ?? [])].filter((member) => this.enumeratedMembers!.has(member))),
       };
     }
-    this.catalog = { folders: folderPrint, sessions: walkedSessions };
     this.walkedCatalog = { scope: JSON.stringify(roots), sessions: walkedSessions };
+    this.catalog = { folders: folderPrint, sessions: walkedSessions };
     this.catalogWalked = true;
     this.performanceCounters?.recordWork('catalogWalk');
     return walkedSessions;
