@@ -26,3 +26,22 @@ export function selectedDependencies(
     claudeChildReferences: claudeChildReferences.filter((child) => own.has(child.parentSessionId)),
   };
 }
+
+// Key a Claude session's child relationships without file revisions. The host and the session reader build the same key, so a
+// window read stays current until a relationship changes. Dispatched sessions carry their own facts, so they stay out of it.
+export function claudeRelationshipKey(
+  sessionId: string,
+  references: readonly ClaudeChildSessionReference[],
+  claudeChildren: readonly ClaudeChildSessionFile[],
+): string {
+  return references
+    .flatMap((child) => (child.kind === 'dispatch' || child.parentSessionId !== sessionId ? [] : [child]))
+    .map((child) => `${child.sessionId}:${[...child.toolUseIds].sort().join(',')}:${child.file}`)
+    .concat(
+      claudeChildren
+        .filter((child) => child.parentSessionId === sessionId)
+        .map((child) => `target:${child.sessionId}:${child.file}`),
+    )
+    .sort()
+    .join('\n');
+}

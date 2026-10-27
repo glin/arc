@@ -6,7 +6,7 @@
 
 A selected recorded session opens once the published catalog lists it. Otherwise it waits for ordinary discovery. Locally started drafts and accepted sessions retain host state until their records appear. Imported children receive no local awaiting-session ownership.
 
-Selection starts with a bounded tail. Its loading payload precedes metadata work for other sessions. When the newest turn begins earlier, the worker scans disjoint older chunks for its boundary. Provider-specific adapters reduce 256 KiB chunks, observe cancellation between chunks, and create the accepted forward checkpoint. The host keeps their parser state opaque.
+Selection starts with a bounded tail. Its loading payload precedes metadata work for other sessions. When the newest turn begins earlier, the worker scans disjoint older chunks for its boundary. Provider-specific adapters reduce 256 KiB chunks, observe cancellation between chunks, and create the accepted forward checkpoint. The host keeps their parser state opaque. A Claude window stays current while its child relationships keep the key that `claudeRelationshipKey` in `selectedsource.ts` builds for both the host and the worker. Dispatched sessions stay out of that key.
 
 A completed prefix can publish when the same file grows during reading, then resume at the new revision. Append reuse validates physical identity and a bounded content anchor. Replacement, shrinkage, same-size rewrites, and incompatible identity discard affected work. Read failures retain drawable cards and show failed history status. Without cards, they show a diagnosis. Refresh or selection retries.
 

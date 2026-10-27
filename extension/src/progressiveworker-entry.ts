@@ -56,6 +56,7 @@ import {
   type ClaudeRepeatedHeldMap,
 } from './clauderepeated';
 import { historyPageBytes } from './historypages';
+import { claudeRelationshipKey } from './selectedsource';
 import { applyHiddenTurnFields, hiddenTurnFields } from './parserstate';
 import {
   agentSpendDependencyKey,
@@ -1327,7 +1328,7 @@ async function execute(
     }
     return version;
   };
-  const structuralKey = (
+  const structuralKey =
     session.agent === 'codex'
       ? children
           .filter((child) => child.parentThreadId === session.sessionId)
@@ -1335,17 +1336,9 @@ async function execute(
             (child) =>
               `${child.threadId}:${child.openedAt ?? ''}:${child.threadSource ?? ''}:${child.backgroundReview}:${child.file}`,
           )
-      : references
-          .filter((child) => child.parentSessionId === session.sessionId)
-          .map((child) => `${child.sessionId}:${[...child.toolUseIds].sort().join(',')}:${child.file}`)
-          .concat(
-            claudeChildren
-              .filter((child) => child.parentSessionId === session.sessionId)
-              .map((child) => `target:${child.sessionId}:${child.file}`),
-          )
-  )
-    .sort()
-    .join('\n');
+          .sort()
+          .join('\n')
+      : claudeRelationshipKey(session.sessionId, references, claudeChildren);
   const claudeSpendParseKey = session.agent === 'claude' ? folders.map(normalizeFsPath).sort().join('\n') : '';
   // Use one clock reading for child spend and its dependency key.
   const spendNow = request.input.spendNow ?? Date.now();

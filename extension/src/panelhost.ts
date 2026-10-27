@@ -70,7 +70,7 @@ import {
   type SessionListingRow,
   type SessionPageSource,
 } from './sessionreads';
-import { selectedDependencies } from './selectedsource';
+import { claudeRelationshipKey, selectedDependencies } from './selectedsource';
 import { LOADING_DEFAULTS, type AppliedDefaults, type DefaultContext } from './view/model-picks';
 import type { ClaudeForwardCheckpoint } from './claudehistory';
 import * as vscode from 'vscode';
@@ -14451,17 +14451,7 @@ export class PanelProvider implements vscode.Disposable {
   // Key Claude child relationships without file revisions. Separate spend keys track completed children and active spend bands.
   private claudeStructuralKey(session: SessionFile): string {
     return session.agent === 'claude'
-      ? this.claudeChildReferences
-          .flatMap((child) => (child.kind === 'dispatch' ? [] : [child]))
-          .filter((child) => child.parentSessionId === session.sessionId)
-          .map((child) => `${child.sessionId}:${[...child.toolUseIds].sort().join(',')}:${child.file}`)
-          .concat(
-            this.claudeChildren
-              .filter((child) => child.parentSessionId === session.sessionId)
-              .map((child) => `target:${child.sessionId}:${child.file}`),
-          )
-          .sort()
-          .join('\n')
+      ? claudeRelationshipKey(session.sessionId, this.claudeChildReferences, this.claudeChildren)
       : '';
   }
 

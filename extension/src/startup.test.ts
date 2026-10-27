@@ -37,7 +37,7 @@ import { afterAll, afterEach, beforeAll, test, vi } from 'vitest';
 import { pendingResponseSessionAdmitted, resolveResponseSession } from './domain/session-link';
 import { createPanelVisibility } from './panelvisibility';
 import { outcomesFor } from './timelinestate';
-import { selectedDependencies } from './selectedsource';
+import { claudeRelationshipKey, selectedDependencies } from './selectedsource';
 import {
   projectSlug,
   isInside,
@@ -2168,6 +2168,8 @@ function selectedWindowHarness(
     'withMetadataCoverage',
     'CommitRepositories',
     'RepositoryCommits',
+    'selectedDependencies',
+    'claudeRelationshipKey',
     compiled,
   )(
     module,
@@ -2200,6 +2202,8 @@ function selectedWindowHarness(
     withMetadataCoverage,
     CommitRepositories,
     RepositoryCommits,
+    selectedDependencies,
+    claudeRelationshipKey,
   );
   return guardedHarness(new module.exports.Harness(run));
 }
@@ -16644,4 +16648,79 @@ test('Edit releases agent message authority and retained retry preserves the ori
   );
   assert.equal(f.host.queues.target, undefined);
   assert.deepEqual(f.reads, []);
+});
+
+// A Claude session that dispatched another session lists the dispatch among its child references. The panel and the session
+// reader agree on the window's relationships, so the newest turn stops loading after one read and later passes reuse it.
+test('a selected session with a dispatched child reads its newest turn once', async () => {
+  const directory = tempDir('selected-dispatch-');
+  const file = path.join(directory, 'selected.jsonl');
+  const childFile = path.join(directory, 'dispatched.jsonl');
+  const transcript = (sessionId: string, text: string) =>
+    [
+      {
+        type: 'user',
+        uuid: `${sessionId}-u`,
+        sessionId,
+        timestamp: '2026-10-27T06:00:00.000Z',
+        message: { role: 'user', content: text },
+      },
+      {
+        type: 'assistant',
+        uuid: `${sessionId}-a`,
+        sessionId,
+        timestamp: '2026-10-27T06:00:05.000Z',
+        message: {
+          id: `${sessionId}-m`,
+          role: 'assistant',
+          model: 'claude-opus-5-5',
+          stop_reason: 'end_turn',
+          content: [{ type: 'text', text: `answered ${text}` }],
+          usage: { input_tokens: 2, output_tokens: 4 },
+        },
+      },
+    ]
+      .map((record) => JSON.stringify(record))
+      .join('\n') + '\n';
+  fs.writeFileSync(file, transcript('selected', 'dispatch a review'));
+  fs.writeFileSync(childFile, transcript('dispatched', 'review the change'));
+  const worker = titleWorker();
+  const kinds: string[] = [];
+  const provider = selectedWindowHarness(
+    (request, generation, signal) => {
+      kinds.push(request.kind);
+      return worker.run(request, generation, signal);
+    },
+    ['progressiveCurrent', 'progressiveInput', 'structuralKey', 'claudeStructuralKey'],
+  );
+  try {
+    provider.session = {
+      file,
+      sessionId: 'selected',
+      agent: 'claude',
+      ...revisionOf(fs.statSync(file, { bigint: true })),
+    };
+    provider.claudeChildren = [];
+    provider.claudeChildReferences = [
+      {
+        kind: 'dispatch',
+        agent: 'claude',
+        parentSessionId: 'selected',
+        sessionId: 'dispatched',
+        file: childFile,
+        toolUseIds: ['toolu_dispatch'],
+        name: null,
+        owned: true,
+      },
+    ];
+    provider.agentSpendKey = (session: SessionFile) => provider.cache.get(session.file)?.agentKey ?? '';
+    await provider.completeSelectedWindow('selected', 1);
+    assert.equal(provider.lastError, null);
+    assert.deepEqual(kinds, ['window'], 'the selection did not read its newest turn');
+    assert.ok(provider.progressiveCurrent(provider.session), 'the newest turn stayed loading after its window read');
+    await provider.completeSelectedWindow('selected', 1);
+    assert.deepEqual(kinds, ['window'], 'a later pass read the unchanged newest turn again');
+  } finally {
+    worker.stop();
+  }
 });
