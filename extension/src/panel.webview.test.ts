@@ -38670,21 +38670,24 @@ test('row posts and watcher decisions reach the performance counters with their 
 
   // Appends to a file the last walk saw and left unlisted, and to a new file beside a listed transcript, walk. The
   // capture names the shape and extension of each such path, and never the path.
-  const project = '/sources/claude/project';
+  const unknownPathProject = '/sources/claude/project';
   Object.assign(provider, {
-    catalog: { folders: 'root', sessions: [{ agent: 'claude', file: `${project}/listed.jsonl`, sessionId: 'listed' }] },
+    catalog: {
+      folders: 'root',
+      sessions: [{ agent: 'claude', file: `${unknownPathProject}/listed.jsonl`, sessionId: 'listed' }],
+    },
     sourceEnumerations: {
       claude: {
         status: 'complete',
         root: '/sources/claude',
-        files: [`${project}/listed.jsonl`, `${project}/excluded.jsonl`],
+        files: [`${unknownPathProject}/listed.jsonl`, `${unknownPathProject}/excluded.jsonl`],
         uncertain: [],
       },
       codex: { status: 'complete', root: '/sources/codex', files: [], uncertain: [] },
     },
   });
-  pending.noteFileEvent(project, 'excluded.jsonl', 'change', normalizeFsPath);
-  pending.noteFileEvent(project, 'fresh.jsonl', 'change', normalizeFsPath);
+  pending.noteFileEvent(unknownPathProject, 'excluded.jsonl', 'change', normalizeFsPath);
+  pending.noteFileEvent(unknownPathProject, 'fresh.jsonl', 'change', normalizeFsPath);
   provider.runPendingWatch({ firedAt: 20, firstAt: 14, cause: 'quiet' });
   const snapshot = provider.performanceCounters.snapshot();
   assert.deepEqual(snapshot.watcherDecisions, {
