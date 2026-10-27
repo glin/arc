@@ -1,6 +1,7 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { performance } from 'node:perf_hooks';
+import { StringDecoder } from 'node:string_decoder';
 import { chromium, type Frame } from 'playwright-core';
 
 export interface SelectionEvent {
@@ -124,6 +125,122 @@ export function selectionCoverage(events: SelectionEvent[], click: string): { co
   if (ordered.every(Boolean) && ordered.some((event, index) => index > 0 && event!.time < ordered[index - 1]!.time))
     missing.push('browser stage order');
   return { complete: missing.length === 0, missing };
+}
+
+export interface RefreshSplit {
+  refresh: number;
+  reason: string | null;
+  selectedOnly: boolean;
+  startMs: number;
+  stages: Record<string, number>;
+  details: Record<string, unknown>;
+  promptChecks: number;
+}
+
+export interface SelectionSplit {
+  click: string;
+  clickToHostMs: number | null;
+  refreshes: RefreshSplit[];
+  windows: { id: number; hostMs: number; enteredAfterMs: number | null; outcome: string }[];
+  selectionMessageMs: number | null;
+  paintMs: number | null;
+}
+
+// One switch, from the browser click to the frame after the first draw of the completed selected content.
+// Host stage times count from the host's receipt of the click. Each stage lasts from the previous mark of the same refresh.
+// Prompt checks count the synchronous stat calls between the catalog revalidation and the end of admission.
+export function selectionSplit(events: SelectionEvent[], click: string, hostOffsetMs: number | null): SelectionSplit {
+  const own = events.filter((event) => event.click === click);
+  const at = (stage: string) => own.find((event) => event.stage === stage);
+  const clicked = at('click');
+  const received = at('host-receive');
+  const refreshes: RefreshSplit[] = own
+    .filter((event) => event.stage === 'refresh')
+    .map((start) => {
+      const id = (start.payload as { refresh?: number }).refresh ?? -1;
+      const marks = own.filter(
+        (event) => event.stage === 'refresh-stage' && sameClock(event, start) && (event.payload as any)?.refresh === id,
+      );
+      const stages: Record<string, number> = {};
+      const details: Record<string, unknown> = {};
+      let previous = start;
+      let opened: SelectionEvent | null = null;
+      let closed: SelectionEvent | null = null;
+      for (const mark of marks) {
+        const { stage, refresh: _refresh, selectedOnly: _selectedOnly, ...detail } = mark.payload as any;
+        stages[stage] = (stages[stage] ?? 0) + (mark.time - previous.time);
+        Object.assign(details, detail);
+        if (stage === 'revalidated') opened = mark;
+        if (stage === 'prompts') closed = mark;
+        previous = mark;
+      }
+      const from = opened?.time ?? Infinity;
+      const to = closed?.time ?? -Infinity;
+      const promptChecks =
+        opened && closed
+          ? own.filter(
+              (event) =>
+                event.stage === 'file' &&
+                sameClock(event, start) &&
+                (event.payload as any)?.operation === 'statSync' &&
+                event.time >= from &&
+                event.time <= to,
+            ).length
+          : 0;
+      return {
+        refresh: id,
+        reason: (start.payload as { reason?: string }).reason ?? null,
+        selectedOnly: (start.payload as { selectedOnly?: boolean }).selectedOnly === true,
+        startMs: received && sameClock(received, start) ? start.time - received.time : NaN,
+        stages,
+        details,
+        promptChecks,
+      };
+    });
+  const sent = own.filter(
+    (event) => event.stage === 'worker-send' && (event.payload as RequestPayload)?.request?.kind === 'window',
+  );
+  const windows = sent.flatMap((send) => {
+    const key = requestKey(send);
+    const settled = events.find(
+      (event) => event.stage === 'window-settled' && sameClock(event, send) && requestKey(event) === key,
+    );
+    const payload = settled?.payload as { id: number; hostMs: number; enteredAfterMs: number | null; outcome: string };
+    return payload
+      ? [{ id: payload.id, hostMs: payload.hostMs, enteredAfterMs: payload.enteredAfterMs, outcome: payload.outcome }]
+      : [];
+  });
+  const firstSelection = own.find(
+    (event) => event.stage === 'browser-receive' && (event.payload as { type?: string })?.type === 'selection',
+  );
+  const session = (clicked?.payload as { session?: string })?.session;
+  const accepted = own.find((event) => {
+    const content = event.payload as { session?: string; complete?: boolean };
+    return event.stage === 'selection-accepted' && content?.session === session && content.complete === true;
+  });
+  const frame =
+    accepted &&
+    own.find((event) => {
+      const content = event.payload as { session?: string; complete?: boolean; generation?: number };
+      return (
+        event.stage === 'frame' &&
+        sameClock(event, accepted) &&
+        event.time >= accepted.time &&
+        content?.session === session &&
+        content.complete === true &&
+        content.generation === (accepted.payload as { generation?: number }).generation
+      );
+    });
+  const since = (event: SelectionEvent | undefined | false) =>
+    clicked && event && sameClock(clicked, event) ? event.time - clicked.time : null;
+  return {
+    click,
+    clickToHostMs: clicked && received && hostOffsetMs !== null ? received.time - hostOffsetMs - clicked.time : null,
+    refreshes,
+    windows,
+    selectionMessageMs: since(firstSelection),
+    paintMs: since(frame),
+  };
 }
 
 // Host transport bounds map the browser click conservatively onto B's host request interval.
@@ -286,14 +403,54 @@ export function instrumentSelection(tree: string): void {
     'panelhost.ts',
     'const posted = host.webview.postMessage(message);',
     `const tagged = { ...(message as any), __arcMeasure: selectionContext.getStore() };
-    selectionTrace('host-post', {message:tagged, bytes:Buffer.byteLength(JSON.stringify(tagged))});
+    selectionTrace('host-post', {message:tagged.__arcMeasure === undefined ? {type:tagged.type} : tagged, bytes:Buffer.byteLength(JSON.stringify(tagged))});
     const posted = host.webview.postMessage(tagged);`,
   );
   patch(
     'panelhost.ts',
     'async refresh(force = false, reuseCatalog = false, metadataAfterRender = false, selectedOnly = false): Promise<void> {',
     `async refresh(force = false, reuseCatalog = false, metadataAfterRender = false, selectedOnly = false): Promise<void> {
-    selectionTrace('refresh', {force,reuseCatalog,metadataAfterRender,selectedOnly});`,
+    const __arcRefresh = ((globalThis as any).__arcRefreshSerial = ((globalThis as any).__arcRefreshSerial ?? 0) + 1);
+    const __arcStage = (stage: string, detail: object = {}) => selectionTrace('refresh-stage', {refresh:__arcRefresh, selectedOnly, stage, ...detail});
+    selectionTrace('refresh', {refresh:__arcRefresh, reason:this.refreshReason, force,reuseCatalog,metadataAfterRender,selectedOnly});`,
+  );
+  // Each stage mark closes the stage that the previous mark of the same refresh opened.
+  const stages: [string, string][] = [
+    ['      const admissionCandidates = all;', "__arcStage('revalidated');"],
+    [
+      '      const counts = this.unreadCounts();\n      const fullLabels',
+      "__arcStage('listing', {catalog: all.length});",
+    ],
+    [
+      '      const metadata = all.map((session) => [session.sessionId, this.metaFor(session)] as const);',
+      "__arcStage('rows', {rows: this.sessionRows.length});",
+    ],
+    ['      const metadataAcceptedHosts = new Set<PanelHost>();', "__arcStage('railInputs');"],
+    ['        const hostRail = ', "__arcStage('hostRows');"],
+    [
+      '        const selectedSession = sessions.find((session) => session.sessionId === hostSession);',
+      "__arcStage('rail', {railRows: hostRail.rail.length});",
+    ],
+    ['        this.startupLoadingSent = JSON.stringify(', "__arcStage('payload');"],
+    ['        if (hostSession) {\n          this.hostPreviousSessions?.set(host, hostSession);', "__arcStage('post');"],
+    ['      this.checkpointDerivedCache();\n      if (selectedOnly) {', "__arcStage('posted');"],
+    [
+      '      this.performanceCounters.recordRefresh(refreshReason, performance.now() - refreshStarted);',
+      "__arcStage('end');",
+    ],
+  ];
+  for (const [needle, mark] of stages) patch('panelhost.ts', needle, `${mark}\n${needle}`);
+  patch(
+    'panelhost.ts',
+    "      this.performanceCounters.recordRefresh('catalog-enumeration', performance.now() - catalogStarted);",
+    `      this.performanceCounters.recordRefresh('catalog-enumeration', performance.now() - catalogStarted);
+      __arcStage('prompts', {candidates: admissionCandidates.length, admitted: all.length});`,
+  );
+  patch(
+    'progressiveworker.ts',
+    '    if (this.recentWindows.length > RECENT_WINDOW_READS) this.recentWindows.shift();',
+    `    selectionTrace('window-settled', this.recentWindows[this.recentWindows.length - 1], undefined);
+    if (this.recentWindows.length > RECENT_WINDOW_READS) this.recentWindows.shift();`,
   );
   patch(
     'progressiveworker.ts',
@@ -349,7 +506,9 @@ export function instrumentSelection(tree: string): void {
     'const vscode = Object.freeze({ postMessage: kernel.sendToHost });',
     `const trace = (stage, payload, click) => {
     const time = performance.now();
-    ((window as any).__arcEvents ??= []).push({stage, payload:JSON.parse(JSON.stringify(payload)), click, time, origin:performance.timeOrigin, clock:'browser'});
+    // An untagged message keeps only its type, so startup traffic on a large catalog stays small.
+    const kept = click === undefined && stage === 'browser-receive' ? {type:payload?.type} : payload;
+    ((window as any).__arcEvents ??= []).push({stage, payload:JSON.parse(JSON.stringify(kept)), click, time, origin:performance.timeOrigin, clock:'browser'});
   };
   let drawSerial = 0;
   let drawOwner: any = null;
@@ -551,11 +710,7 @@ export async function measureResponse(
     receipt.cdpConnected = true;
     const transport = await browser.newBrowserCDPSession();
     receipt.cdpTargets = await transport.send('Target.getTargets');
-    // Reload the isolated workbench after attachment so Chromium reports existing webview children.
-    for (const context of browser.contexts())
-      for (const page of context.pages())
-        if (page.url().startsWith('vscode-file:'))
-          await page.reload({ waitUntil: 'domcontentloaded', timeout: Math.max(1, deadline - performance.now()) });
+    await reloadWorkbench(browser, deadline);
     receipt.discoveryReload = true;
     frame = await poll(async () => {
       receipt.frames = browser!
@@ -577,17 +732,7 @@ export async function measureResponse(
       undefined,
       { timeout: Math.max(1, deadline - performance.now()) },
     );
-    const workbench = frame.page();
-    const welcome = workbench.getByRole('dialog', { name: 'Welcome to Visual Studio Code' });
-    receipt.welcomeBefore = await welcome.count();
-    if (await welcome.count()) {
-      receipt.welcomeButtons = await welcome.getByRole('button').allTextContents();
-      const dismiss = welcome.getByRole('button', { name: /skip|close|done|start/i }).last();
-      await dismiss.click({ timeout: Math.max(1, deadline - performance.now()) });
-    }
-    await workbench.waitForFunction(() => !document.querySelector('.onboarding-a-overlay'), undefined, {
-      timeout: Math.max(1, deadline - performance.now()),
-    });
+    receipt.welcomeBefore = await dismissWelcome(frame, deadline);
     receipt.welcomeAbsent = true;
     for (let index = 0; index < 3; index++) {
       const alignment = 'response-clock-' + index;
@@ -703,6 +848,32 @@ export async function measureResponse(
   }
 }
 
+// Reload the isolated workbench after attachment so Chromium reports existing webview children.
+async function reloadWorkbench(
+  browser: Awaited<ReturnType<typeof chromium.connectOverCDP>>,
+  deadline: number,
+): Promise<void> {
+  for (const context of browser.contexts())
+    for (const page of context.pages())
+      if (page.url().startsWith('vscode-file:'))
+        await page.reload({ waitUntil: 'domcontentloaded', timeout: Math.max(1, deadline - performance.now()) });
+}
+
+// Close the editor's welcome dialog, whose overlay takes pointer input. Returns how many dialogs were open.
+async function dismissWelcome(frame: Frame, deadline: number): Promise<number> {
+  const workbench = frame.page();
+  const welcome = workbench.getByRole('dialog', { name: 'Welcome to Visual Studio Code' });
+  const open = await welcome.count();
+  if (open) {
+    const dismiss = welcome.getByRole('button', { name: /skip|close|done|start/i }).last();
+    await dismiss.click({ timeout: Math.max(1, deadline - performance.now()) });
+  }
+  await workbench.waitForFunction(() => !document.querySelector('.onboarding-a-overlay'), undefined, {
+    timeout: Math.max(1, deadline - performance.now()),
+  });
+  return open;
+}
+
 async function poll<T>(read: () => Promise<T | null>, deadline: number): Promise<T> {
   for (;;) {
     const value = await read();
@@ -712,18 +883,31 @@ async function poll<T>(read: () => Promise<T | null>, deadline: number): Promise
   }
 }
 
+// Keeps the events a click or a request owns, clock records, and settled window reads. A large catalog writes
+// gigabytes of untagged startup file traces, so the files are read in chunks and an unfinished last line is skipped.
 function nodeEvents(scratch: string): SelectionEvent[] {
-  return fs
-    .readdirSync(scratch)
-    .filter((name) => name.startsWith('selection-trace-') && name.endsWith('.jsonl'))
-    .flatMap((name) => {
-      const text = fs.readFileSync(path.join(scratch, name), 'utf8');
-      return text
-        .slice(0, text.lastIndexOf('\n'))
-        .split('\n')
-        .filter(Boolean)
-        .map((line) => JSON.parse(line));
-    });
+  const events: SelectionEvent[] = [];
+  const kept = (line: string) =>
+    line.includes('"click":') || line.includes('"stage":"window-settled"') || line.includes('"stage":"clock"');
+  for (const name of fs.readdirSync(scratch)) {
+    if (!name.startsWith('selection-trace-') || !name.endsWith('.jsonl')) continue;
+    const descriptor = fs.openSync(path.join(scratch, name), 'r');
+    try {
+      const decoder = new StringDecoder('utf8');
+      const buffer = Buffer.alloc(1 << 22);
+      let carry = '';
+      for (;;) {
+        const read = fs.readSync(descriptor, buffer, 0, buffer.length, null);
+        if (read === 0) break;
+        const lines = (carry + decoder.write(buffer.subarray(0, read))).split('\n');
+        carry = lines.pop()!;
+        for (const line of lines) if (line && kept(line)) events.push(JSON.parse(line));
+      }
+    } finally {
+      fs.closeSync(descriptor);
+    }
+  }
+  return events;
 }
 
 export async function measureSelection(
@@ -754,6 +938,8 @@ export async function measureSelection(
     receipt.cdpConnected = true;
     const transport = await browser.newBrowserCDPSession();
     receipt.cdpTargets = await transport.send('Target.getTargets');
+    await reloadWorkbench(browser, deadline);
+    receipt.discoveryReload = true;
     frame = await poll(async () => {
       receipt.frames = browser!
         .contexts()
@@ -776,6 +962,7 @@ export async function measureSelection(
     }, deadline);
     receipt.transport = 'owned editor CDP';
     receipt.frame = frame.url();
+    receipt.welcomeBefore = await dismissWelcome(frame, deadline);
     receipt.clockAlignment = [];
     for (let index = 0; index < 5; index++) {
       const id = 'alignment-' + index;
@@ -807,7 +994,9 @@ export async function measureSelection(
     const waitCompleted = (id: string, session: string) =>
       poll(async () => {
         const events = await frame!.evaluate(
-          () => (window as unknown as { __arcEvents: SelectionEvent[] }).__arcEvents,
+          (id) =>
+            (window as unknown as { __arcEvents: SelectionEvent[] }).__arcEvents.filter((event) => event.click === id),
+          id,
         );
         return selectionFinished(events, id, session) ? true : null;
       }, deadline);
@@ -945,6 +1134,14 @@ export async function measureSelection(
           valid: upperMs >= lowerMs,
         };
       });
+    const offsets = (receipt.clockAlignment as { browserToHostOffsetMs?: number }[])
+      .map((row) => row.browserToHostOffsetMs)
+      .filter((offset): offset is number => offset !== undefined)
+      .sort((left, right) => left - right);
+    const hostOffset = offsets.length ? offsets[Math.floor(offsets.length / 2)] : null;
+    receipt.split = (receipt.scenarios as { click?: string }[])
+      .filter((scenario) => scenario.click)
+      .map((scenario) => ({ ...scenario, ...selectionSplit(events, scenario.click!, hostOffset) }));
     receipt.unavailable = [
       'Asynchronous filesystem operations',
       'Compositor presentation',
