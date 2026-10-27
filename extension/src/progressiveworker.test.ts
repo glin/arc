@@ -10645,22 +10645,39 @@ test.each(['large-opening', 'copied-before', 'copied-after'])(
       mtimeMs: fs.statSync(file).mtimeMs,
     });
     const parent = session(parentFile, 'parent', 'claude');
-    const worker = new ProgressiveWorker(
-      source + `\nDate.now = () => Number(require('node:fs').readFileSync(${JSON.stringify(clock)}, 'utf8'));`,
-    );
-    const person = async () => {
-      const result = await worker.run(
-        {
-          kind: 'claude-children',
-          parents: [parent],
-          catalog: [parent, session(childFile, id, 'codex')],
-          repositoryRoots: [directory],
-        },
-        1,
-        new AbortController().signal,
+    const deadline = 'const receiptDeadline = performance.now() + RELATIONSHIP_SLICE_MS;';
+    assert.ok(source.includes(deadline));
+    // Expire the first receipt slice, then keep the performance clock fixed for continuation.
+    const workerSource =
+      'let receiptClock = 0, receiptExpired = false; performance.now = () => receiptClock;' +
+      source.replace(
+        deadline,
+        deadline + 'if (!receiptExpired) { receiptExpired = true; receiptClock += RELATIONSHIP_SLICE_MS; }',
       );
-      assert.ok(result?.value.kind === 'claude-children');
-      return result.value.dispatchFacts[0].person;
+    const worker = new ProgressiveWorker(
+      workerSource + `\nDate.now = () => Number(require('node:fs').readFileSync(${JSON.stringify(clock)}, 'utf8'));`,
+    );
+    let firstRequest = true;
+    const person = async () => {
+      const request = {
+        kind: 'claude-children' as const,
+        parents: [parent],
+        catalog: [parent, session(childFile, id, 'codex')],
+        repositoryRoots: [directory],
+      };
+      const result = await worker.run(request, 1, new AbortController().signal);
+      assert.ok(result?.value.kind === 'claude-children' || result?.value.kind === 'claude-children-progress');
+      if (firstRequest) {
+        assert.equal(result.value.kind, 'claude-children-progress', 'the receipt slice expired before publication');
+        assert.equal(result.value.charges?.receiptPassEnds, 1);
+      }
+      firstRequest = false;
+      const completed =
+        result.value.kind === 'claude-children-progress' || result.value.continuation
+          ? await completeDiscovery(worker, request, 1, new AbortController().signal)
+          : result;
+      assert.ok(completed?.value.kind === 'claude-children');
+      return completed.value.dispatchFacts[0].person;
     };
     try {
       assert.equal(await person(), false);

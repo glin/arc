@@ -1328,6 +1328,32 @@ test('derived cache discards GPT-6.1 Sol Bedrock facts saved without provider su
   assert.deepEqual(loaded.carriedNames.get('/bedrock.jsonl'), { label: title.label, fullLabel: title.fullLabel });
 });
 
+test('derived cache discards pre-support Terra figures and carries session names', () => {
+  const file = path.join(folder(), 'cache.json');
+  const unpriced: DerivedTitleEntry = {
+    ...title,
+    stats: {
+      turns: [
+        { ...stats.turns[0], model: 'gpt-6.1-terra', provider: 'openai', contextWindow: null, contextRequest: null },
+      ],
+      compactions: [],
+    },
+  };
+  fs.writeFileSync(
+    file,
+    JSON.stringify({
+      formatVersion: 1,
+      metadataVersion: 69,
+      codexMetaVersion: CODEX_META_VERSION,
+      codexMetas: [],
+      titles: [{ file: '/terra.jsonl', entry: unpriced }],
+    }),
+  );
+  const loaded = loadDerivedCache(file);
+  assert.equal(loaded.titles.size, 0);
+  assert.deepEqual(loaded.carriedNames.get('/terra.jsonl'), { label: title.label, fullLabel: title.fullLabel });
+});
+
 test('derived cache rejects malformed request pricing identities', () => {
   const file = path.join(folder(), 'cache.json');
   fs.writeFileSync(

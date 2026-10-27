@@ -8785,6 +8785,60 @@ test('Project cost rebuilds old GPT-6.1 Sol buckets for two short requests', () 
   assert.ok(Math.abs(publicProjectSpendPrice(upgraded.record.buckets[0])!.dollars - 0.8) < 1e-12);
 });
 
+test('Terra pricing rebuilds saved pre-support usage and preserves recorded context', () => {
+  const records: object[] = [meta({ model_provider: 'openai' })];
+  for (const [index, input] of [220_000, 220_000, 320_000].entries()) {
+    const second = index * 10;
+    const turnId = `terra-${index}`;
+    const requestUsage = usage({
+      input_tokens: input,
+      cached_input_tokens: index === 2 ? 150_000 : 100_000,
+      cache_write_input_tokens: 20_000,
+      output_tokens: 10_000,
+      reasoning_output_tokens: 0,
+    });
+    records.push(
+      event('task_started', second + 1, { turn_id: turnId, model_context_window: 500_000 }),
+      turnContext(second + 2, turnId, 'gpt-6.1-terra', 'high'),
+      event('user_message', second + 3, { message: 'price this request' }),
+      event('token_count', second + 4, {
+        info: { last_token_usage: requestUsage, total_token_usage: requestUsage, model_context_window: 500_000 },
+      }),
+      event('task_complete', second + 5, { turn_id: turnId, last_agent_message: 'done' }),
+    );
+  }
+  const file = writeRollout(records);
+  const parsed = readCodexSession(file, 'sess');
+  assert.equal(parsed.turns.length, 3);
+  for (const [index, turn] of parsed.turns.entries()) {
+    assert.equal(turn.contextWindow, 500_000);
+    assert.equal(turn.contextRequest?.lifetime, '30m');
+    assert.equal(turn.usageParts?.[0]?.contextBand, index === 2 ? 'long' : 'short');
+    const cost = turnCost(turn);
+    assert.ok(cost.dollars !== null);
+    assert.ok(Math.abs(cost.dollars - (index === 2 ? 0.44 : 0.18)) < 1e-12);
+  }
+  const storage = tempDir('terra-spend-');
+  const current = indexSpendFile(undefined, file, 'workspace', createCodexUsageLineReducer, 1).record;
+  const unbanded = current.buckets.map((bucket) => ({ ...bucket, contextBand: null }));
+  const old = { ...current, parserGeneration: 64, buckets: unbanded, lifetimeBuckets: unbanded };
+  assert.equal(indexSpendFile(old, file, 'workspace', createCodexUsageLineReducer, 2).rebuilt, true);
+  saveSpendLedger(storage, 'workspace', [old]);
+  const loaded = loadSpendLedger(storage, 'workspace').files[0];
+  const rebuilt = indexSpendFile(loaded, file, 'workspace', createCodexUsageLineReducer, 2);
+  assert.equal(rebuilt.rebuilt, true);
+  assert.equal(rebuilt.record.buckets.find((bucket) => bucket.contextBand === 'short')?.requests, 2);
+  assert.equal(rebuilt.record.buckets.find((bucket) => bucket.contextBand === 'long')?.requests, 1);
+  saveSpendLedger(storage, 'workspace', [rebuilt.record]);
+  const restored = loadSpendLedger(storage, 'workspace').files[0];
+  assert.ok(
+    Math.abs(restored.buckets.reduce((sum, bucket) => sum + publicProjectSpendPrice(bucket)!.dollars, 0) - 0.8) < 1e-12,
+  );
+  const resumed = indexSpendFile(restored, file, 'workspace', createCodexUsageLineReducer, 3);
+  assert.equal(resumed.rebuilt, false);
+  assert.deepEqual(resumed.record.buckets, restored.buckets);
+});
+
 test('retracting a copied Codex compaction keeps later compaction ordinals and billing identity', () => {
   const copied = 'copied';
   const current = 'current';

@@ -1534,7 +1534,7 @@ test('standalone model selection preserves legacy aliases and configured provide
   const aliases = {
     sol: 'gpt-6.1-sol',
     sol6: 'gpt-6-sol',
-    terra: 'gpt-5.6-terra',
+    terra: 'gpt-6.1-terra',
     luna: 'gpt-6-luna',
     luna6: 'gpt-6-luna',
     astra: 'gpt-6-astra',
@@ -1552,7 +1552,14 @@ test('standalone model selection preserves legacy aliases and configured provide
     );
   };
   for (const [alias, model] of Object.entries(aliases)) check(alias, model);
-  for (const model of ['gpt-5.6-sol-2026-09-01', 'openai.gpt-6-astra', 'custom.model', 'constructor'])
+  for (const model of [
+    'gpt-6.1-terra',
+    'gpt-5.6-terra',
+    'gpt-5.6-sol-2026-09-01',
+    'openai.gpt-6-astra',
+    'custom.model',
+    'constructor',
+  ])
     check(model, model);
   fs.writeFileSync(
     path.join(home, 'config.toml'),
@@ -1565,6 +1572,8 @@ test('standalone model selection preserves legacy aliases and configured provide
   );
   for (const [alias, model] of Object.entries(aliases)) check(alias, `openai.${model}`);
   check('gpt-5.6-sol-2026-09-01', 'openai.gpt-5.6-sol-2026-09-01');
+  check('gpt-6.1-terra', 'openai.gpt-6.1-terra');
+  check('gpt-5.6-terra', 'openai.gpt-5.6-terra');
   check('openai.gpt-6-astra', 'openai.gpt-6-astra');
   check('custom.model', 'custom.model');
   fs.writeFileSync(path.join(home, 'config.toml'), '[profiles.other]\nmodel_provider = "amazon-bedrock"\n');

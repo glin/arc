@@ -59,6 +59,7 @@ const MODEL_IDS = [
   'gpt-5.6-luna',
   'gpt-6-astra',
   'gpt-6.1-sol',
+  'gpt-6.1-terra',
   'gpt-6-sol',
   'gpt-6-luna',
 ];
@@ -259,6 +260,15 @@ const SUPPORT_MATRIX: { models: string[]; definition: ModelDefinition }[] = [
         sources: ['https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-openai-gpt-6-1-sol.html'],
       },
     },
+    { fast: 2, priority: 2, flex: 0.5, batch: 0.5 },
+  ),
+  openaiSupport(
+    /^gpt-6\.1-terra$/,
+    ['gpt-6.1-terra'],
+    { input: 1, cacheWrite30m: 1.25, cacheRead: 0.05, output: 5 },
+    1_050_000,
+    '30m',
+    undefined,
     { fast: 2, priority: 2, flex: 0.5, batch: 0.5 },
   ),
   openaiSupport(
@@ -516,6 +526,47 @@ test('GPT-6.1 Sol prices its exact OpenAI ID in both request bands', () => {
     );
   }
   assert.equal(quoteUsage({ usage: tokens, model, provider: 'openai', serviceTier: 'unknown-tier' }), null);
+});
+
+test('GPT-6.1 Terra prices only its exact direct identity across request bands and tiers', () => {
+  const model = 'gpt-6.1-terra';
+  const tokens = usage({ requests: 1, input: 100_000, cacheWrite30m: 20_000, cacheRead: 100_000, output: 10_000 });
+  assert.equal(contextWindowFor(model, 'openai'), 1_050_000);
+  assert.equal(cacheLifetimeFor(model, 'openai'), '30m');
+  assert.equal(effortChangeKeepsCache(model, 'openai'), false);
+  assert.equal(rateFor(model, 'openai', 1_050_000), null);
+  for (const requestTokens of [220_000, 272_000, 272_001]) {
+    const expected = requestTokens > 272_000 ? 0.335 : 0.18;
+    assert.equal(contextBandForRequest(model, 'openai', requestTokens), requestTokens > 272_000 ? 'long' : 'short');
+    for (const [serviceTier, multiplier] of [
+      [null, 1],
+      ['default', 1],
+      ['fast', 2],
+      ['priority', 2],
+      ['flex', 0.5],
+      ['batch', 0.5],
+    ] as const) {
+      const quote = quoteUsage({ usage: tokens, model, provider: 'openai', requestTokens, serviceTier });
+      assert.ok(quote && Math.abs(quote.cost - expected * multiplier) < 1e-12);
+    }
+  }
+  assert.equal(quoteUsage({ usage: tokens, model, provider: 'openai', serviceTier: 'unknown-tier' }), null);
+  for (const provider of ['amazon-bedrock', 'unknown-provider']) {
+    assert.equal(quoteUsage({ usage: tokens, model, provider }), null);
+    assert.equal(contextWindowFor(model, provider), null);
+  }
+  for (const id of [
+    'gpt-6.11-terra',
+    'gpt-6.1-terra-codex',
+    'gpt-6.1-terra-2026-10-27',
+    'gpt-6.1-terra[1m]',
+    'openai.gpt-6.1-terra',
+    'us.openai.gpt-6.1-terra',
+    'global.openai.gpt-6.1-terra',
+  ]) {
+    assert.equal(rateFor(id), null, id);
+    assert.equal(rateFor(id, 'amazon-bedrock'), null, id);
+  }
 });
 
 test('Bedrock GPT-6.1 Sol prices supported routes with its documented cache lifetime and provider-specific tiers', () => {
@@ -1607,6 +1658,10 @@ test('the cost figures guide states the provider-specific cache multiples the pr
   const openai = cellsFor('Other priced direct OpenAI GPT-5.6 and GPT-6 models');
   assert.deepEqual(multiplesIn(openai[1]), [ratio('gpt-5.6-sol', { cacheRead: 1_000_000 })]);
   assert.deepEqual(multiplesIn(openai[2]), [ratio('gpt-5.6-sol', { cacheWrite30m: 1_000_000 })]);
+
+  const terra61 = cellsFor('OpenAI GPT-6.1 Terra');
+  assert.deepEqual(multiplesIn(terra61[1]), [ratio('gpt-6.1-terra', { cacheRead: 1_000_000 })]);
+  assert.deepEqual(multiplesIn(terra61[2]), [ratio('gpt-6.1-terra', { cacheWrite30m: 1_000_000 })]);
 
   const sol61 = cellsFor('OpenAI GPT-6.1 Sol');
   assert.deepEqual(multiplesIn(sol61[1]), [ratio('gpt-6.1-sol', { cacheRead: 1_000_000 })]);

@@ -11,7 +11,7 @@ Claude Code and Codex write usage records. The billing provider and route select
 | Billing route | Supported model identities |
 | --- | --- |
 | Claude API estimates from Claude Code records | `claude-fable-5-1`, `claude-mythos-5-1`, `claude-fable-5`, `claude-mythos-5`, `claude-opus-5-5`, `claude-opus-5`, `claude-opus-4-8`, `claude-opus-4-7`, `claude-opus-4-6`, `claude-opus-4-5`, `claude-sonnet-5-5`, `claude-sonnet-5`, `claude-sonnet-4-6`, `claude-sonnet-4-5`, `claude-haiku-5-5`, `claude-haiku-4-5` |
-| Direct OpenAI estimates from Codex records | `gpt-6.1-sol`, `gpt-6-sol`, `gpt-6-luna`, `gpt-6-astra`, `gpt-5.6-sol`, `gpt-5.6`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.5`, `gpt-5.5-2026-04-23`, `gpt-5.4`, `gpt-5.4-2026-03-05` |
+| Direct OpenAI estimates from Codex records | `gpt-6.1-terra`, `gpt-6.1-sol`, `gpt-6-sol`, `gpt-6-luna`, `gpt-6-astra`, `gpt-5.6-sol`, `gpt-5.6`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.5`, `gpt-5.5-2026-04-23`, `gpt-5.4`, `gpt-5.4-2026-03-05` |
 | Claude on Amazon Bedrock | The recognized Claude identities above, with recorded Bedrock request evidence. This estimate does not establish AWS availability for each model. |
 | OpenAI on Amazon Bedrock | `openai.gpt-6-astra`, `openai.gpt-6.1-sol`, `openai.gpt-6-sol`, `openai.gpt-6-luna`, `openai.gpt-5.6-sol`, `openai.gpt-5.6-terra`, `openai.gpt-5.6-luna`, with the accepted prefixes below |
 | Codex automatic review | `codex-auto-review`, priced from the OpenAI Codex rate card |
@@ -81,6 +81,7 @@ The [Skills, Subagents, Plugins, and MCP sections](https://code.claude.com/docs/
 | [Claude Opus 5.5 and Claude Sonnet 5.5](https://platform.claude.com/docs/en/about-claude/pricing) | 0.05x the base input rate | 1.25x for five minutes or 2x for one hour | The request selects five minutes or one hour. |
 | [Claude Sonnet 5 and Claude Opus 5](https://platform.claude.com/docs/en/about-claude/pricing) | 0.1x the base input rate | 1.25x for five minutes or 2x for one hour | The request selects five minutes or one hour. |
 | [Claude on Amazon Bedrock](https://aws.amazon.com/bedrock/pricing/) | The Claude API multiple of the Bedrock base input rate, which is 1.1x list on every profile except `global.` | The Claude API multiples of the Bedrock base input rate | The request selects five minutes or one hour. |
+| [OpenAI GPT-6.1 Terra](https://developers.openai.com/api/docs/models/gpt-6.1-terra) | 0.05x the base input rate | 1.25x the base input rate | The minimum is thirty minutes. |
 | [OpenAI GPT-6.1 Sol](https://developers.openai.com/api/docs/models/gpt-6.1-sol) | 0.05x the base input rate | 1.25x the base input rate | The minimum is thirty minutes. |
 | [GPT-6.1 Sol on Amazon Bedrock](https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-openai-gpt-6-1-sol.html) | 0.05x the route's base input rate | 1.25x the route's base input rate | Thirty minutes is the default and only supported lifetime. |
 | [GPT-6 Astra on Amazon Bedrock](https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-openai-gpt-6-astra.html) | 0.1x the route's base input rate | 1.25x the route's base input rate | The rate card prices thirty-minute writes. Fallback cache duration is unknown. |

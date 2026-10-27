@@ -271,6 +271,21 @@ export const MODEL_DEFINITIONS: readonly ModelDefinition[] = [
       effectiveDate: '2026-09-29',
     },
   },
+  // https://developers.openai.com/api/docs/models/gpt-6.1-terra
+  {
+    pattern: /^gpt-6\.1-terra$/,
+    rate: { input: 1, cacheWrite30m: 1.25, cacheRead: 0.05, output: 5 },
+    window: 1_050_000,
+    cachePolicy: {
+      kind: 'documented',
+      lifetime: '30m',
+      sources: ['https://developers.openai.com/api/docs/guides/prompt-caching'],
+    },
+    providers: ['openai'],
+    maxPricedContext: 272_000,
+    longContext: { threshold: 272_000, inputMultiplier: 2, outputMultiplier: 1.5 },
+    serviceTierMultipliers: { fast: 2, priority: 2, flex: 0.5, batch: 0.5 },
+  },
   // https://developers.openai.com/api/docs/models/gpt-6-sol
   {
     pattern: /^gpt-6-sol$/,

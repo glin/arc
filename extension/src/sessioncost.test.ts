@@ -4231,6 +4231,30 @@ test('request prices use the request context band, regional rate, and service ti
   const priority = summarizeRequests([pricedRequest('gpt-5.6-terra', 1_000, { serviceTier: 'priority' })]);
   assert.equal(priority.costUsd, null);
   assert.deepEqual(priority.unpricedModels, []);
+  const terra = summarizeRequests([
+    pricedRequest('gpt-6.1-terra', 100_000, {
+      contextBand: 'short',
+      usage: {
+        cacheWrite5m: 0,
+        cacheWrite1h: 0,
+        thinking: 0,
+        requests: 1,
+        input: 100_000,
+        cacheWrite30m: 20_000,
+        cacheRead: 100_000,
+        output: 10_000,
+      },
+    }),
+  ]);
+  assert.ok(Math.abs(terra.pricedCostUsd! - 0.18) < 1e-12);
+  const terraLong = summarizeRequests([pricedRequest('gpt-6.1-terra', 272_001)]);
+  assert.equal(terraLong.costUsd, 0.544);
+  const terraFast = summarizeRequests([pricedRequest('gpt-6.1-terra', 100_000, { serviceTier: 'fast' })]);
+  assert.equal(terraFast.costUsd, 0.2);
+  for (const options of [{ serviceTier: 'unknown-tier' }, { provider: 'amazon-bedrock' }, { incomplete: true }]) {
+    const unsupported = summarizeRequests([pricedRequest('gpt-6.1-terra', 100_000, options)]);
+    assert.equal(unsupported.costUsd, null);
+  }
 });
 
 test('model costs reconcile individual request quotes across providers, tiers, and context bands', () => {

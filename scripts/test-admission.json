@@ -7,7 +7,7 @@
   "cli/test/run.test.ts": {
     "reason": "Standalone workers must retain real output, exit, cancellation, receipt ownership, and recovery across process boundaries. Held readers must preserve one worker and one outcome after recovery. Exhausted replacement retries must retain the worker's terminal observation.",
     "cases": 108,
-    "matricesSha256": "c6e76e6339ad7cee62ad87e941568db190a9ad8216c8cff5758c56e772b69c35"
+    "matricesSha256": "11e7639222dd2d2c9f9d52aacff50e74b49c1b2b12271fb1e490ba8b3b325c53"
   },
   "cli/test/smoke.bundled-a.test.mjs": {
     "reason": "Compiled CLI commands must reach session reads, comments, and saved defaults through an authenticated window channel.",
@@ -56,12 +56,12 @@
   },
   "extension/src/codex.test.ts": {
     "reason": "Real Git worktree ownership and descendant source resolution must agree with recorded Codex session relationships.",
-    "cases": 482,
-    "matricesSha256": "ba9dfbd31781d220a8fa409c93a6c9e7fe87af114f6f46b82c07358e5d379cda"
+    "cases": 483,
+    "matricesSha256": "3098cee6bd0c865d7a8344402a57dc3cf5d6b3480f042c2e5c32aaa177e04e26"
   },
   "extension/src/derivedcache.test.ts": {
     "reason": "Independent writers and host death must preserve shared cache rows and release stale filesystem locks.",
-    "cases": 91,
+    "cases": 92,
     "matricesSha256": "21c54df8d2390471ccd06ad351899b5fa506f8ab9f2d8ef74b4628740f7b585a"
   },
   "extension/src/exportsite.browser.test.ts": {
@@ -137,7 +137,7 @@
   "extension/src/progressiveworker.test.ts": {
     "reason": "Worker protocol, cancellation, host death, bounded transcript reads, and scoped subagent edit reads must survive the actual worker boundary.",
     "cases": 147,
-    "matricesSha256": "9d8f9df82aeb3a122f0dcb8c9c56b0f46e19e3d0d381f9f557fefab0a54fc9b7"
+    "matricesSha256": "a7ba0f62c6b85ae6ec5443bb170e6e1a8d795c787d08ef3fa1a3c1a450e48c85"
   },
   "extension/src/projectsetups.test.ts": {
     "reason": "Real Git worktrees and canonical filesystem aliases must share project identity while clones stay distinct.",

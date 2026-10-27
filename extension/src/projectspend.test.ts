@@ -5326,8 +5326,9 @@ test('Bedrock rate bands stay with each request before daily aggregation', () =>
   );
 });
 
-test('Bedrock GPT-6.1 Sol rebuilds saved unpriced requests without treating two short requests as long', () => {
+test('GPT-6.1 Sol and Terra rebuild saved unpriced requests without treating two short requests as long', () => {
   for (const [model, expected] of [
+    ['gpt-6.1-terra', 0.8],
     ['openai.gpt-6.1-sol', 1.76],
     ['us.openai.gpt-6.1-sol', 1.76],
     ['global.openai.gpt-6.1-sol', 1.6],
@@ -5337,7 +5338,7 @@ test('Bedrock GPT-6.1 Sol rebuilds saved unpriced requests without treating two 
     const events = [100_000, 100_000, 150_000].map((input, index) =>
       event(stamp(`2026-10-01T1${index}:00:00`), {
         agent: 'codex',
-        provider: 'amazon-bedrock',
+        provider: model === 'gpt-6.1-terra' ? 'openai' : 'amazon-bedrock',
         model,
         serviceTier: 'default',
         usage: {
@@ -5365,7 +5366,7 @@ test('Bedrock GPT-6.1 Sol rebuilds saved unpriced requests without treating two 
     saveSpendLedger(storage, 'w', [
       {
         ...current,
-        parserGeneration: 27,
+        parserGeneration: model === 'gpt-6.1-terra' ? 64 : 27,
         buckets: [unbanded],
         lifetimeBuckets: [unbanded],
       },

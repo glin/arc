@@ -2925,14 +2925,18 @@ test('a non-account update without a readable name cannot replace an account win
 const MODEL_ANSWER = {
   data: [
     {
-      id: 'gpt-5.5-codex',
-      displayName: 'gpt-5.5-codex',
+      id: 'gpt-6.1-terra',
+      displayName: 'GPT-6.1 Terra',
+      defaultReasoningEffort: 'low',
       description: 'Latest Codex model for agentic coding',
       hidden: false,
       supportedReasoningEfforts: [
         { reasoningEffort: 'low', description: 'Fastest, for simple work' },
         { reasoningEffort: 'medium', description: 'Balanced speed and depth' },
         { reasoningEffort: 'high', description: 'Slowest, for hard problems' },
+        { reasoningEffort: 'xhigh', description: 'Extra high' },
+        { reasoningEffort: 'max', description: 'Maximum' },
+        { reasoningEffort: 'ultra', description: 'Ultra' },
       ],
     },
     {
@@ -2949,8 +2953,9 @@ test('the model list arrives in the words the server uses for its own models', (
   const list = readModels(MODEL_ANSWER, 1_700_000_000_000);
   assert.ok(list);
   assert.equal(list.readAt, 1_700_000_000_000);
-  assert.equal(list.models[0].value, 'gpt-5.5-codex');
-  assert.equal(list.models[0].label, 'gpt-5.5-codex');
+  assert.equal(list.models[0].value, 'gpt-6.1-terra');
+  assert.equal(list.models[0].label, 'GPT-6.1 Terra');
+  assert.equal(list.models[0].defaultReasoningEffort, 'low');
   assert.equal(list.models[0].description, 'Latest Codex model for agentic coding');
 });
 
@@ -2966,6 +2971,9 @@ test('an effort level Codex offers keeps the sentence Codex wrote for it', () =>
     { value: 'low', label: 'low', description: 'Fastest, for simple work' },
     { value: 'medium', label: 'medium', description: 'Balanced speed and depth' },
     { value: 'high', label: 'high', description: 'Slowest, for hard problems' },
+    { value: 'xhigh', label: 'xhigh', description: 'Extra high' },
+    { value: 'max', label: 'max', description: 'Maximum' },
+    { value: 'ultra', label: 'ultra', description: 'Ultra' },
   ]);
 });
 

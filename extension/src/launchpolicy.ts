@@ -10,7 +10,7 @@ export interface LaunchPolicy {
 const codexModelShorthands: Readonly<Record<string, string>> = {
   sol: 'gpt-6.1-sol',
   sol6: 'gpt-6-sol',
-  terra: 'gpt-5.6-terra',
+  terra: 'gpt-6.1-terra',
   luna: 'gpt-6-luna',
   luna6: 'gpt-6-luna',
   astra: 'gpt-6-astra',
