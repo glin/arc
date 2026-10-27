@@ -643,6 +643,8 @@ import {
   childEventNamesFiles,
   sessionDirectoryOwners,
   watcherRefreshDecision,
+  POLL_BACKSTOP_WALK_MS,
+  type CatalogWalkTimes,
   type PollDirectories,
 } from './scheduler';
 import {
@@ -2062,8 +2064,10 @@ export class PanelProvider implements vscode.Disposable {
   private disposables: vscode.Disposable[] = [];
   private poll: ReturnType<typeof setInterval> | null = null;
   private pollGate: PollDirectoryGate | null = null;
-  private pollInFlight = false;
-  private lastCatalogWalkAt: number | null = null;
+  // When the poll in flight started its directory stats, or null.
+  private pollInFlight: number | null = null;
+  private catalogWalk: CatalogWalkTimes | null = null;
+  private catalogWalkPendingAt: number | null = null;
   private lastSignature = '';
   private lastSpendSourceSignature = '';
   // The rows lastSpendSourceSignature signed, so a targeted offer can name every row that moved since.
@@ -3599,31 +3603,40 @@ export class PanelProvider implements vscode.Disposable {
   // `subagents` directory revalidates the session that owns it, and that refresh sends child discovery. Any other poll
   // refreshes from the held catalog, which revalidates the selected session and redraws.
   private async pollCatalog(): Promise<void> {
-    if (this.pollInFlight) return;
-    this.pollInFlight = true;
+    if (this.pollInFlight) {
+      // Stats that never answer, such as on a lost network share, still leave the backstop walk.
+      const since = (time: number | null | undefined) => Date.now() - (time ?? 0) >= POLL_BACKSTOP_WALK_MS;
+      if (since(this.pollInFlight) && since(this.catalogWalk?.startedAt) && since(this.catalogWalkPendingAt))
+        this.refreshFrom('poll:backstop');
+      return;
+    }
+    const started = (this.pollInFlight = Date.now());
     try {
       const gate = (this.pollGate ??= new PollDirectoryGate(async (directory) => {
         const stat = await fs.promises.stat(directory, { bigint: true });
-        return `${stat.mtimeNs}:${stat.ino}`;
+        return { mtimeMs: Number(stat.mtimeNs / 1_000_000n), print: `${stat.mtimeNs}:${stat.ino}` };
       }));
       const decision = await gate.decide(
         this.pollDirectories(),
-        this.lastCatalogWalkAt === null ? null : Date.now() - this.lastCatalogWalkAt,
+        () => this.catalogWalk && { ...this.catalogWalk, pendingSince: this.catalogWalkPendingAt },
+        () => Date.now(),
       );
       this.performanceCounters.recordWork('pollDirectoryStats', gate.stats);
       if (!this.watching) return;
       if (decision.kind === 'walk') {
         this.refreshFrom(`poll:${decision.cause}`);
-      } else if (decision.kind === 'children') {
-        const owners = sessionDirectoryOwners(this.catalog?.sessions ?? [], normalizeFsPath);
-        const files = decision.directories.map((directory) => owners(path.join(directory, 'agent.jsonl')));
-        if (files.every((owned) => owned !== null)) this.refreshFrom('poll:children', false, false, files.flat());
-        else this.refreshFrom('poll:directory');
-      } else {
-        this.refreshFrom('poll', false, true);
+        return;
       }
+      // A child directory of a session the catalog does not list holds no child that discovery reads.
+      const owners = sessionDirectoryOwners(this.catalog?.sessions ?? [], normalizeFsPath);
+      const files =
+        decision.kind === 'children'
+          ? decision.directories.flatMap((directory) => owners(path.join(directory, 'agent.jsonl')) ?? [])
+          : [];
+      if (files.length) this.refreshFrom('poll:children', false, false, files);
+      else this.refreshFrom('poll', false, true);
     } finally {
-      this.pollInFlight = false;
+      if (this.pollInFlight === started) this.pollInFlight = null;
     }
   }
 
@@ -3637,7 +3650,7 @@ export class PanelProvider implements vscode.Disposable {
     for (const enumeration of [enumerations.claude, enumerations.codex]) {
       if (enumeration.root) listing.push(enumeration.root);
       for (const directory of enumeration.directories ?? []) {
-        (path.basename(directory).toLowerCase() === 'subagents' ? children : listing).push(directory);
+        (path.basename(directory) === 'subagents' ? children : listing).push(directory);
       }
     }
     return { listing: [...new Set(listing)], children: [...new Set(children)] };
@@ -3658,6 +3671,7 @@ export class PanelProvider implements vscode.Disposable {
     this.watchScheduler.cancel();
     this.pendingWatch.clear();
     this.pollGate?.clear();
+    this.pollInFlight = null;
   }
 
   // Watch the listed transcript directories and close watchers outside that list.
@@ -11866,6 +11880,7 @@ export class PanelProvider implements vscode.Disposable {
     }
     this.startupHistory?.stage('scopeResolved');
     const folderPrint = `${workspaceFolders.join('\n')}\0${scope.revision}`;
+    let namedFileChanged = false;
     if (this.targetedRefreshPaths?.length && this.catalog && this.catalog.folders === folderPrint) {
       // A request that reuses the held catalog also revalidates the selected session, as one that names no file does.
       const selected = reuseCatalog
@@ -11892,20 +11907,23 @@ export class PanelProvider implements vscode.Disposable {
         this.catalogWalked = false;
         return sorted;
       }
+      // A named file went missing, changed identity or was never listed, so only a walk can say what replaced it.
+      namedFileChanged = true;
     }
     let selectedFileGone = false;
-    if (reuseCatalog && this.catalog && this.catalog.folders === folderPrint) {
-      // With no selection, the held catalog has no row to revalidate.
-      const held = !this.showing
-        ? [...this.catalog.sessions]
-        : revalidatedCatalog(this.catalog.sessions, this.showing, (file) => {
-            try {
-              return fileRevisionOf(fs.statSync(file, { bigint: true }));
-            } catch {
-              selectedFileGone = true;
-              return null;
-            }
-          });
+    if (reuseCatalog && this.catalog && this.catalog.folders === folderPrint && !namedFileChanged) {
+      // With no selection, or a draft selected, the held catalog has no row to revalidate. A draft has no file to list.
+      const held =
+        !this.showing || this.newDrafts?.[this.showing]
+          ? [...this.catalog.sessions]
+          : revalidatedCatalog(this.catalog.sessions, this.showing, (file) => {
+              try {
+                return fileRevisionOf(fs.statSync(file, { bigint: true }));
+              } catch {
+                selectedFileGone = true;
+                return null;
+              }
+            });
       // Reorder reused catalog rows after updating file revisions.
       if (held) {
         const admitted = deferHumanPrompts
@@ -11928,18 +11946,22 @@ export class PanelProvider implements vscode.Disposable {
         `walk:${
           !reuseCatalog
             ? walkCause
-            : !this.catalog
-              ? 'noCatalog'
-              : this.catalog.folders !== folderPrint
-                ? 'scopeMoved'
-                : !this.catalog.sessions.some((session) => session.sessionId === this.showing)
-                  ? 'selectionMissing'
-                  : selectedFileGone
-                    ? 'selectionFileMissing'
-                    : 'selectionReplaced'
+            : namedFileChanged
+              ? 'namedFileChanged'
+              : !this.catalog
+                ? 'noCatalog'
+                : this.catalog.folders !== folderPrint
+                  ? 'scopeMoved'
+                  : !this.catalog.sessions.some((session) => session.sessionId === this.showing)
+                    ? 'selectionMissing'
+                    : selectedFileGone
+                      ? 'selectionFileMissing'
+                      : 'selectionReplaced'
         }`,
       );
     }
+    // The poll compares directory times with the start of the walk that listed them.
+    this.catalogWalkPendingAt ??= Date.now();
     if (deferWalk && !codexEnumeration) {
       deferWalk.needed = true;
       return [];
@@ -12156,7 +12178,12 @@ export class PanelProvider implements vscode.Disposable {
           : new Set([...(acceptedCoverage.members ?? [])].filter((member) => this.enumeratedMembers!.has(member))),
       };
     }
-    this.lastCatalogWalkAt = Date.now();
+    this.catalogWalk = {
+      generation: (this.catalogWalk?.generation ?? 0) + 1,
+      startedAt: this.catalogWalkPendingAt ?? Date.now(),
+      pendingSince: null,
+    };
+    this.catalogWalkPendingAt = null;
     this.walkedCatalog = { scope: JSON.stringify(roots), sessions: walkedSessions };
     this.catalog = { folders: folderPrint, sessions: walkedSessions };
     this.catalogWalked = true;

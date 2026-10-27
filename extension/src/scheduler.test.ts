@@ -508,56 +508,122 @@ test('a Windows rename event for a new child transcript under a listed session r
   assert.deepEqual(watcherRefreshDecision(stray.take(), known, owners).broadReasons, ['unknownPath']);
 });
 
-test('the poll walks only for a moved listing directory or a due backstop, and names moved session directories', async () => {
-  const prints = new Map<string, string | null>([
-    ['projects', 'a'],
-    ['projects/repo', 'a'],
-    ['projects/repo/s1/subagents', 'a'],
+// Directory stats keyed by path, with each directory's modification time set by the test.
+function directoryTimes(entries: [string, number | null][]) {
+  const times = new Map(entries);
+  const stated: string[] = [];
+  const statOf = async (directory: string) => {
+    stated.push(directory);
+    const time = times.get(directory);
+    return time === undefined || time === null ? null : { mtimeMs: time, print: String(time) };
+  };
+  return { times, stated, statOf };
+}
+
+test('the poll walks for a listing directory that moved since the last walk started, or a due backstop', async () => {
+  const { times, statOf } = directoryTimes([
+    ['projects', 900],
+    ['projects/repo', 900],
+    ['projects/repo/s1/subagents', 900],
     ['projects/repo/s2/subagents', null],
   ]);
-  const gate = new PollDirectoryGate(async (directory) => prints.get(directory) ?? null);
+  const gate = new PollDirectoryGate(statOf);
   const directories = {
     listing: ['projects', 'projects/repo'],
     children: ['projects/repo/s1/subagents', 'projects/repo/s2/subagents'],
   };
-  assert.deepEqual(await gate.decide(null, null), { kind: 'walk', cause: 'noListing' });
-  assert.deepEqual(await gate.decide(directories, 5_000), { kind: 'reuse' }, 'a first stat walked');
+  let walk = { generation: 1, startedAt: 1_000, pendingSince: null as number | null };
+  let now = 1_000;
+  const decide = () =>
+    gate.decide(
+      directories,
+      () => walk,
+      () => now,
+    );
+  assert.deepEqual(
+    await gate.decide(
+      null,
+      () => walk,
+      () => now,
+    ),
+    { kind: 'walk', cause: 'noListing' },
+  );
+  now = 5_000;
+  assert.deepEqual(await decide(), { kind: 'reuse' }, 'a directory the walk read before it changed walked again');
   assert.equal(gate.stats, 4);
-  assert.deepEqual(await gate.decide(directories, 10_000), { kind: 'reuse' });
-  // A `subagents` directory that appears moves as well.
-  prints.set('projects/repo/s2/subagents', 'b');
-  assert.deepEqual(await gate.decide(directories, 15_000), {
-    kind: 'children',
-    directories: ['projects/repo/s2/subagents'],
-  });
-  prints.set('projects/repo', 'b');
-  prints.set('projects/repo/s1/subagents', 'b');
-  assert.deepEqual(await gate.decide(directories, 20_000), { kind: 'walk', cause: 'directory' });
-  assert.deepEqual(await gate.decide(directories, POLL_BACKSTOP_WALK_MS), { kind: 'walk', cause: 'backstop' });
-  gate.clear();
-  prints.set('projects', 'b');
-  assert.deepEqual(await gate.decide(directories, 5_000), { kind: 'reuse' }, 'a cleared gate kept its held times');
+  // A directory that appears, or changes, moves.
+  times.set('projects/repo/s2/subagents', 6_000);
+  now = 10_000;
+  assert.deepEqual(await decide(), { kind: 'children', directories: ['projects/repo/s2/subagents'] });
+  times.set('projects/repo', 11_000);
+  times.set('projects/repo/s1/subagents', 11_000);
+  now = 15_000;
+  assert.deepEqual(await decide(), { kind: 'walk', cause: 'directory' });
+  // The walk that follows listed both changes, so the next poll compares with its start and does not walk again.
+  walk = { generation: 2, startedAt: 16_000, pendingSince: null };
+  now = 20_000;
+  assert.deepEqual(await decide(), { kind: 'reuse' }, 'a change the last walk listed walked again');
+  // A change after the walk started and before the gate's first stat since that walk still moves.
+  walk = { generation: 3, startedAt: 21_000, pendingSince: null };
+  times.set('projects', 22_000);
+  now = 25_000;
+  assert.deepEqual(await decide(), { kind: 'walk', cause: 'directory' }, 'a change before the first stat waited');
+  now = 21_000 + POLL_BACKSTOP_WALK_MS;
+  assert.deepEqual(await decide(), { kind: 'walk', cause: 'backstop' });
+  // A walk that is still running holds the backstop.
+  walk = { ...walk, pendingSince: now - 1_000 };
+  assert.deepEqual(await decide(), { kind: 'reuse' }, 'the backstop queued a walk behind a running walk');
 });
 
-test('past the stat limit the poll stats session directories in rotation and still sees each one move', async () => {
-  const children = Array.from({ length: 25 }, (_, index) => `s${index}/subagents`);
-  const prints = new Map(children.map((directory) => [directory, 'a']));
-  const stated: string[] = [];
-  const gate = new PollDirectoryGate(async (directory) => {
-    stated.push(directory);
-    return prints.get(directory) ?? 'root';
-  }, 12);
-  const directories = { listing: ['root', 'root/repo'], children };
-  for (let poll = 0; poll < 3; poll++) assert.deepEqual(await gate.decide(directories, 5_000), { kind: 'reuse' });
-  assert.equal(gate.stats, 12, 'a poll stated more than the limit');
-  assert.equal(new Set(stated.filter((directory) => directory.endsWith('subagents'))).size, 25);
-  prints.set('s24/subagents', 'b');
-  const moved: string[] = [];
-  for (let poll = 0; poll < 3; poll++) {
-    const decision = await gate.decide(directories, 5_000);
-    if (decision.kind === 'children') moved.push(...decision.directories);
+test('a poll whose stats outlast a walk or a stop decides nothing from them', async () => {
+  let release = () => {};
+  const held = new Promise<void>((resolve) => (release = resolve));
+  let time = 900;
+  const gate = new PollDirectoryGate(async () => {
+    await held;
+    return { mtimeMs: time, print: String(time) };
+  });
+  const directories = { listing: ['projects'], children: [] };
+  let walk = { generation: 1, startedAt: 1_000, pendingSince: null as number | null };
+  const now = () => 1_000 + POLL_BACKSTOP_WALK_MS;
+  const raced = gate.decide(directories, () => walk, now);
+  walk = { generation: 2, startedAt: now(), pendingSince: null };
+  release();
+  assert.deepEqual(await raced, { kind: 'reuse' }, 'a poll asked for a backstop walk behind a walk that just ran');
+  // Stats that arrive after a stop hold nothing, so the next poll compares with the walk again.
+  const stopped = new PollDirectoryGate(async () => ({ mtimeMs: time, print: String(time) }));
+  const pending = stopped.decide(directories, () => walk, now);
+  stopped.clear();
+  assert.deepEqual(await pending, { kind: 'reuse' });
+  time = now() + 1;
+  assert.deepEqual(await stopped.decide(directories, () => walk, now), { kind: 'walk', cause: 'directory' });
+});
+
+test('a poll stats at most the limit and reaches every directory in rotation', async () => {
+  for (const [listingCount, childCount] of [
+    [2, 25],
+    [14, 6],
+  ]) {
+    const listing = Array.from({ length: listingCount }, (_, index) => `p${index}`);
+    const children = Array.from({ length: childCount }, (_, index) => `s${index}/subagents`);
+    const { times, stated, statOf } = directoryTimes([...listing, ...children].map((directory) => [directory, 900]));
+    const gate = new PollDirectoryGate(statOf, 12);
+    const directories = { listing, children };
+    const walk = () => ({ generation: 1, startedAt: 1_000, pendingSince: null });
+    const now = () => 5_000;
+    for (let poll = 0; poll < 3; poll++) {
+      assert.deepEqual(await gate.decide(directories, walk, now), { kind: 'reuse' });
+      assert.ok(gate.stats <= 12, `a poll stated ${gate.stats} directories`);
+    }
+    assert.equal(new Set(stated).size, listingCount + childCount, 'a directory was never stated');
+    times.set(children.at(-1)!, 6_000);
+    const moved: string[] = [];
+    for (let poll = 0; poll < 3; poll++) {
+      const decision = await gate.decide(directories, walk, now);
+      if (decision.kind === 'children') moved.push(...decision.directories);
+    }
+    assert.deepEqual(moved, [children.at(-1)], 'a rotated directory never reported its move');
   }
-  assert.deepEqual(moved, ['s24/subagents'], 'a rotated directory never reported its move');
 });
 
 test('merged requests keep the files that reusing requests name', () => {

@@ -12720,7 +12720,7 @@ test('the context chip is drawn as a scale, each band mixed from the token its o
 });
 
 test('polling discovers a completed transcript turn without a snapshot trigger', async () => {
-  const { PollDirectoryGate } = await import('./scheduler.ts');
+  const { PollDirectoryGate, POLL_BACKSTOP_WALK_MS } = await import('./scheduler.ts');
   const dir = tempDir('snapshot-free-poll-');
   const home = tempDir('snapshot-free-store-');
   const file = path.join(dir, 'session.jsonl');
@@ -12730,7 +12730,8 @@ test('polling discovers a completed transcript turn without a snapshot trigger',
     poll: null,
     // Before the first walk the poll has no directories to compare, so it walks.
     sourceEnumerations: undefined,
-    lastCatalogWalkAt: null,
+    catalogWalk: null,
+    pollInFlight: null,
     performanceCounters: { recordWork() {} },
     pollDirectories: () => null,
     refreshFrom(reason: string) {
@@ -12742,9 +12743,12 @@ test('polling discovers a completed transcript turn without a snapshot trigger',
   };
   provider.pollCatalog = new Function(
     'PollDirectoryGate',
+    'POLL_BACKSTOP_WALK_MS',
     'fs',
-    `return async function () {${methodBody('private async pollCatalog(): Promise<void> {')}}`,
-  )(PollDirectoryGate, fs);
+    esbuild.transformSync(`return async function () {${methodBody('private async pollCatalog(): Promise<void> {')}}`, {
+      loader: 'ts',
+    }).code,
+  )(PollDirectoryGate, POLL_BACKSTOP_WALK_MS, fs);
   const start = new Function(
     'POLL_INTERVAL_MILLISECONDS',
     `return function () {${methodBody('private startPolling(): void {')}}`,
@@ -30999,7 +31003,7 @@ test('selection and accepted worker results avoid unnecessary catalog walks', ()
   const body = listing + memberFrom(panelHostSource, panelHostSource.indexOf('private walkedSessions('));
   sourceMatch(
     body,
-    /if \(reuseCatalog && this\.catalog && this\.catalog\.folders === folderPrint\)/,
+    /if \(reuseCatalog && this\.catalog && this\.catalog\.folders === folderPrint(?: && !namedFileChanged)?\)/,
     'the held catalog is reused without checking that it was walked for these folders',
   );
   sourceMatch(

@@ -47,6 +47,7 @@ import {
   enumerateClaudeChildSources,
   revisionOf as fileRevisionOf,
   revalidatedCatalogPaths,
+  revalidatedCatalog,
   watchDirs,
   humanPromptScanSteps,
   promptScanLists,
@@ -264,6 +265,7 @@ import {
   mergeRefreshRequests,
   PendingWatcherWake,
   PollDirectoryGate,
+  POLL_BACKSTOP_WALK_MS,
   childEventNamesFiles,
   listedFilesFor,
   sessionDirectoryOwners,
@@ -7108,9 +7110,10 @@ test('each catalog walk names its requester, and the re-list after a replaced fi
   );
 });
 
-// Claude transcripts and Codex rollouts on disk, with the poll tick, the watcher batches and the clock driven by the
-// test. `hidden` holds project directories that the walk lists but leaves out of its directory evidence, as when the
-// poll's stat list misses a directory.
+// Claude transcripts and Codex rollouts on disk, with the poll tick, the watcher batches, the clock and the directory
+// times driven by the test. `create` writes a file and moves its directory's time to the test clock, as the filesystem
+// does for a new entry. `hidden` holds project directories that the walk lists but leaves out of its directory
+// evidence, as when the poll's stat list misses a directory.
 function pollWalkHarness() {
   const projects = tempDir('poll-walk-projects-');
   const project = path.join(projects, 'repo');
@@ -7118,12 +7121,15 @@ function pollWalkHarness() {
   fs.mkdirSync(project);
   fs.mkdirSync(other);
   const hidden = new Set<string>();
-  const writeTranscript = (directory: string, id: string) => {
-    const file = path.join(directory, `${id}.jsonl`);
-    fs.writeFileSync(file, '{"type":"user"}\n');
+  let now = Date.parse('2026-10-27T12:00:00.000Z');
+  const directoryTimes = new Map<string, number>();
+  const create = (file: string, content = '{"type":"user"}\n') => {
+    fs.writeFileSync(file, content);
+    directoryTimes.set(path.dirname(file), now);
     return file;
   };
-  const parent = writeTranscript(project, 'parent');
+  const parent = path.join(project, 'parent.jsonl');
+  fs.writeFileSync(parent, '{"type":"user"}\n');
   const subagents = path.join(project, 'parent', 'subagents');
   fs.mkdirSync(subagents, { recursive: true });
   fs.writeFileSync(path.join(subagents, 'agent-first.jsonl'), '{}\n');
@@ -7151,7 +7157,10 @@ function pollWalkHarness() {
         uncertain: [],
       }),
       enumerateRolloutFilesAsync: (root: string, signal?: AbortSignal) => enumerateRolloutFilesAsync(root, signal),
+      // The real selected revalidation, so a selection that no row holds misses the held catalog as in production.
+      revalidatedCatalog,
       PollDirectoryGate,
+      POLL_BACKSTOP_WALK_MS,
       sessionDirectoryOwners,
       childEventNamesFiles,
       listedFilesFor,
@@ -7164,10 +7173,18 @@ function pollWalkHarness() {
   const counters = new PanelPerformanceCounters();
   let discoveries = 0;
   const discover = provider.prepareClaudeChildren;
+  // A directory that the test never moved keeps a time before the test clock starts.
+  const before = now - 60_000;
   Object.assign(provider, {
     performanceCounters: counters,
     pendingWatch: new PendingWatcherWake(),
+    newDrafts: {},
     watchDirectories() {},
+    pollGate: new PollDirectoryGate(async (directory: string) => {
+      if (!fs.existsSync(directory)) return null;
+      const time = directoryTimes.get(directory) ?? before;
+      return { mtimeMs: time, print: String(time) };
+    }),
     prepareClaudeChildren: (...args: unknown[]) => {
       discoveries++;
       return discover(...args);
@@ -7189,9 +7206,10 @@ function pollWalkHarness() {
     for (let index = 0; index < started.length; index++) await started[index];
   };
   let tick: () => void = () => assert.fail('polling never started');
-  let now = Date.parse('2026-10-27T12:00:00.000Z');
   const at = (time: number) => vi.setSystemTime((now = time));
+  // A watcher batch fires after its quiet interval.
   const watch = async (events: [string, 'rename' | 'change'][]) => {
+    at(now + 200);
     for (const [file, kind] of events)
       provider.pendingWatch.noteFileEvent(path.dirname(file), path.basename(file), kind, normalizeFsPath);
     provider.runPendingWatch({ cause: 'quiet', firstAt: 0, lastAt: 0, firedAt: 0 });
@@ -7226,14 +7244,13 @@ function pollWalkHarness() {
     );
   return {
     ...harness,
-    projects,
     project,
     other,
     hidden,
     parent,
     subagents,
     counters,
-    writeTranscript,
+    create,
     discoveries: () => discoveries,
     start,
     poll,
@@ -7244,75 +7261,8 @@ function pollWalkHarness() {
   };
 }
 
-test('six appending writers and a new child transcript each minute walk only on the poll backstop', async () => {
-  const { provider, writeRollout, subagents, start, poll, watch, walks, discoveries, counters } = pollWalkHarness();
-  const writers = Array.from({ length: 6 }, (_, index) => writeRollout(`writer-${index}`));
-  try {
-    await start();
-    const discovered = discoveries();
-    for (let minute = 0; minute < 3; minute++) {
-      for (let interval = 0; interval < 12; interval++) {
-        if (interval === 0) {
-          // Windows reports a new file as a rename, then a change once its first line lands.
-          const child = path.join(subagents, `agent-minute-${minute}.jsonl`);
-          fs.writeFileSync(child, '{}\n');
-          await watch([
-            [child, 'rename'],
-            [child, 'change'],
-          ]);
-        }
-        for (const writer of writers) fs.appendFileSync(writer, '{}\n');
-        await watch(writers.map((writer) => [writer, 'change']));
-        await poll();
-      }
-    }
-    assert.deepEqual(walks(), { 'walk:requested:startup': 1, 'walk:requested:poll:backstop': 3 });
-    assert.equal(counters.snapshot().work['watcher:sessionDirectory'], 3, 'a new child file was not owned');
-    assert.ok(
-      discoveries() - discovered >= 3,
-      'a refresh for a new child file sent no child discovery, so the child never lists',
-    );
-    assert.ok(provider.authoritativeCatalog.length >= 7);
-  } finally {
-    vi.useRealTimers();
-  }
-});
-
-test('a new top-level transcript in a polled directory lists within one poll, without a watcher event', async () => {
-  const { project, writeTranscript, start, poll, walks, listed } = pollWalkHarness();
-  try {
-    await start();
-    await poll();
-    const added = writeTranscript(project, 'added');
-    await poll();
-    assert.ok(listed(added), 'the new transcript waited for the backstop');
-    assert.deepEqual(walks(), { 'walk:requested:startup': 1, 'walk:requested:poll:directory': 1 });
-  } finally {
-    vi.useRealTimers();
-  }
-});
-
-test('a new transcript in a directory the stat list misses lists at the backstop', async () => {
-  const { other, hidden, writeTranscript, start, poll, walks, listed } = pollWalkHarness();
-  hidden.add(other);
-  try {
-    await start();
-    const added = writeTranscript(other, 'unpolled');
-    let polls = 0;
-    while (!listed(added) && polls < 13) {
-      await poll();
-      polls++;
-    }
-    assert.equal(polls, 12, `the transcript did not list exactly at the 60 s backstop: ${JSON.stringify(walks())}`);
-    assert.deepEqual(walks(), { 'walk:requested:startup': 1, 'walk:requested:poll:backstop': 1 });
-  } finally {
-    vi.useRealTimers();
-  }
-});
-
-test('a thinking event from a live child updates its session row without a walk', async () => {
-  const { provider, parent, writeRollout, start, walks, settle } = pollWalkHarness();
-  // The handler's last statement turns every remaining child event into a refresh.
+// The statement that ends the child event handler in `extension.ts`, which turns every remaining event into a refresh.
+function childEventRefresh(): (panel: unknown, host: unknown, key: string, event: unknown) => void {
   const source = fs.readFileSync(path.join(__dirname, 'extension.ts'), 'utf8');
   const file = ts.createSourceFile('extension.ts', source, ts.ScriptTarget.Latest, true);
   let refresh: string | undefined;
@@ -7328,18 +7278,143 @@ test('a thinking event from a live child updates its session row without a walk'
   };
   visit(file);
   assert.ok(refresh, 'extension.ts no longer ends the child event handler after the session state report');
-  const receive = new Function('panel', 'host', 'key', 'event', refresh);
-  const shown = writeRollout('shown');
+  return new Function('panel', 'host', 'key', 'event', refresh) as never;
+}
+
+test('six appending writers and a new child transcript each minute walk only on the poll backstop', async () => {
+  const { writeRollout, subagents, create, start, poll, watch, walks, discoveries, counters } = pollWalkHarness();
+  const writers = Array.from({ length: 6 }, (_, index) => writeRollout(`writer-${index}`));
+  try {
+    await start();
+    for (let minute = 0; minute < 3; minute++) {
+      for (let interval = 0; interval < 12; interval++) {
+        if (interval === 0) {
+          // Windows reports a new file as a rename, then a change once its first line lands.
+          const child = create(path.join(subagents, `agent-minute-${minute}.jsonl`), '{}\n');
+          const discovered = discoveries();
+          await watch([
+            [child, 'rename'],
+            [child, 'change'],
+          ]);
+          assert.equal(discoveries() - discovered, 1, 'the refresh for a new child file sent no child discovery');
+        }
+        for (const writer of writers) fs.appendFileSync(writer, '{}\n');
+        await watch(writers.map((writer) => [writer, 'change']));
+        await poll();
+      }
+    }
+    assert.deepEqual(walks(), { 'walk:requested:startup': 1, 'walk:requested:poll:backstop': 3 });
+    assert.equal(counters.snapshot().work['watcher:sessionDirectory'], 3, 'a new child file was not owned');
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('a new top-level transcript in a polled directory lists within one poll, without a watcher event', async () => {
+  const { project, create, start, poll, walks, listed } = pollWalkHarness();
+  try {
+    await start();
+    // The first poll after the walk has no stat of its own to compare, so it compares with the walk's start.
+    const added = create(path.join(project, 'added.jsonl'));
+    await poll();
+    assert.ok(listed(added), 'the new transcript waited for the backstop');
+    await poll();
+    assert.deepEqual(walks(), { 'walk:requested:startup': 1, 'walk:requested:poll:directory': 1 });
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('a new transcript that a watcher walk listed makes no poll walk', async () => {
+  const { project, create, start, poll, watch, walks, listed } = pollWalkHarness();
+  try {
+    await start();
+    await poll();
+    const added = create(path.join(project, 'watched.jsonl'));
+    await watch([[added, 'rename']]);
+    assert.ok(listed(added));
+    await poll();
+    await poll();
+    assert.deepEqual(walks(), { 'walk:requested:startup': 1, 'walk:requested:transcript': 1 });
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('a new transcript in a directory the stat list misses lists at the backstop', async () => {
+  const { other, hidden, create, start, poll, walks, listed } = pollWalkHarness();
+  hidden.add(other);
+  try {
+    await start();
+    const added = create(path.join(other, 'unpolled.jsonl'));
+    let polls = 0;
+    while (!listed(added) && polls < 13) {
+      await poll();
+      polls++;
+    }
+    assert.equal(polls, 12, `the transcript did not list exactly at the 60 s backstop: ${JSON.stringify(walks())}`);
+    assert.deepEqual(walks(), { 'walk:requested:startup': 1, 'walk:requested:poll:backstop': 1 });
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('a selected draft keeps the held catalog through polls and child events', async () => {
+  const { provider, start, poll, walks, settle } = pollWalkHarness();
+  const receive = childEventRefresh();
+  try {
+    await start();
+    // A draft in repository scope stays selected through each refresh.
+    provider.newDrafts = { draft: { draftId: 'draft', cwd: provider.repositoryScopeRoots[0] } };
+    provider.showing = 'draft';
+    for (let interval = 0; interval < 11; interval++) {
+      await poll();
+      receive(provider, { get: () => ({ state: () => ({ sessionId: null }) }) }, 'child', { kind: 'ready' });
+      await settle();
+    }
+    assert.equal(provider.showing, 'draft');
+    assert.deepEqual(walks(), { 'walk:requested:startup': 1 });
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('a thinking event from a live child updates its session row without a walk', async () => {
+  const { provider, parent, writeRollout, start, walks, settle } = pollWalkHarness();
+  const receive = childEventRefresh();
+  writeRollout('shown');
   try {
     await start();
     provider.showing = 'shown';
-    assert.ok(shown);
     fs.appendFileSync(parent, '{"type":"assistant"}\n');
     receive(provider, { get: () => ({ state: () => ({ sessionId: 'parent' }) }) }, 'child', { kind: 'thinking' });
     await settle();
     const row = provider.authoritativeCatalog.find((session: SessionFile) => session.sessionId === 'parent');
     assert.equal(row.size, fs.statSync(parent).size, 'the thinking event left the session row at its old size');
     assert.deepEqual(walks(), { 'walk:requested:startup': 1 });
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('a child event that names a replaced transcript walks and lists the replacement', async () => {
+  const { provider, parent, writeRollout, start, walks, settle } = pollWalkHarness();
+  const receive = childEventRefresh();
+  writeRollout('shown');
+  try {
+    await start();
+    provider.showing = 'shown';
+    const held = provider.authoritativeCatalog.find((session: SessionFile) => session.sessionId === 'parent');
+    const copy = `${parent}.copy`;
+    fs.writeFileSync(copy, '{"type":"user"}\n{"type":"assistant"}\n');
+    fs.rmSync(parent);
+    fs.renameSync(copy, parent);
+    receive(provider, { get: () => ({ state: () => ({ sessionId: 'parent' }) }) }, 'child', { kind: 'turnEnd' });
+    await settle();
+    const row = provider.authoritativeCatalog.find((session: SessionFile) => session.sessionId === 'parent');
+    assert.notEqual(String(row.ino), String(held.ino), 'the replaced transcript kept its old row');
+    assert.equal(row.size, fs.statSync(parent).size);
+    assert.deepEqual(walks(), { 'walk:requested:startup': 1, 'walk:namedFileChanged': 1 });
   } finally {
     vi.useRealTimers();
   }

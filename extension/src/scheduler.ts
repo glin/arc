@@ -388,7 +388,7 @@ export function sessionDirectoryOwners(
     const directory = parent(normalize(file));
     const name = directory.slice(directory.lastIndexOf('/') + 1);
     return (
-      owners.get(directory) ?? (name.toLowerCase() === 'subagents' ? owners.get(parent(directory)) : undefined) ?? null
+      owners.get(directory) ?? (name === normalize('subagents') ? owners.get(parent(directory)) : undefined) ?? null
     );
   };
 }
@@ -484,7 +484,8 @@ export function mergeRefreshRequests(pending: RefreshRequest | null, next: Refre
   };
 }
 
-// Live child events that change no fact a file records. Their refresh names no file and only draws.
+// Live child events that change no fact a file records. Their refresh names no file, so it revalidates only the held
+// catalog's selected session and held identities.
 const DRAW_ONLY_CHILD_EVENTS = new Set(['ready', 'skills', 'permissionMode', 'rateLimit', 'remoteControl', 'error']);
 
 // True when a live child event records into its session's transcript, so its refresh revalidates the session's files.
@@ -492,11 +493,12 @@ export function childEventNamesFiles(kind: string): boolean {
   return !DRAW_ONLY_CHILD_EVENTS.has(kind);
 }
 
-// How long the poll waits since the last catalog walk before it walks with no moved directory. The walk finds growth in
-// a directory that no watcher covers, and a new file in a directory that the stat list misses.
+// How long after the last catalog walk started the poll walks with no moved directory. The walk finds growth in a
+// directory that no watcher covers, and a new file in a directory that the stat list misses.
 export const POLL_BACKSTOP_WALK_MS = 60_000;
 
-// The most directories one poll stats. Past it, the poll stats the session directories in rotation.
+// The most directories one poll stats. Past it, the poll stats the child directories, and then every directory, in
+// rotation.
 export const POLL_DIRECTORY_STAT_LIMIT = 500;
 
 // The directories the last walk enumerated. A new entry in a `listing` directory, such as a project, rollout date or
@@ -507,55 +509,98 @@ export interface PollDirectories {
   children: readonly string[];
 }
 
+// One directory stat. `print` changes whenever the directory's modification time or identity changes.
+export interface DirectoryStat {
+  mtimeMs: number;
+  print: string;
+}
+
+// The last completed catalog walk, numbered, with the time it started. `pendingSince` is the start of a walk that has not
+// completed, or null.
+export interface CatalogWalkTimes {
+  generation: number;
+  startedAt: number;
+  pendingSince: number | null;
+}
+
 export type PollDecision =
   | { kind: 'walk'; cause: 'noListing' | 'directory' | 'backstop' }
   | { kind: 'children'; directories: string[] }
   | { kind: 'reuse' };
 
 // Decides whether a poll walks the catalog. A new entry moves its directory's modification time on Windows, macOS and
-// Linux, so each poll stats the enumerated directories and walks only when one moved, or when the backstop is due.
+// Linux, so each poll stats the directories that the last walk enumerated. A directory moved when its stat differs from
+// the one this gate held since that walk, or, at its first stat since the walk, when it changed after the walk started.
 // Appends to a listed file move no directory: watchers report them, and the backstop walk finds the rest.
 export class PollDirectoryGate {
   private readonly seen = new Map<string, string | null>();
+  private generation: number | null = null;
+  private epoch = 0;
   private cursor = 0;
   stats = 0;
 
   constructor(
-    private readonly statOf: (directory: string) => Promise<string | null>,
+    private readonly statOf: (directory: string) => Promise<DirectoryStat | null>,
     private readonly limit = POLL_DIRECTORY_STAT_LIMIT,
   ) {}
 
-  // `directories` is null before the first walk. `sinceWalkMs` is the time since the last catalog walk. A directory's
-  // first stat holds its time and moves nothing, because the backstop finds a change made before that stat.
-  async decide(directories: PollDirectories | null, sinceWalkMs: number | null): Promise<PollDecision> {
-    if (!directories || sinceWalkMs === null) return { kind: 'walk', cause: 'noListing' };
-    const children = directories.children;
-    // Session directories keep a share of each poll even when the listing directories fill the limit.
-    const room = Math.max(this.limit - directories.listing.length, Math.floor(this.limit / 10));
-    let rotated: readonly string[] = children;
-    if (children.length > room) {
-      const start = this.cursor % children.length;
-      rotated = [...children.slice(start), ...children.slice(0, start)].slice(0, room);
-      this.cursor = (start + rotated.length) % children.length;
-    }
-    const checked = [...directories.listing, ...rotated];
+  // `walk` is read again after the stats, so a walk that completed or started meanwhile decides with its own times.
+  async decide(
+    directories: PollDirectories | null,
+    walk: () => CatalogWalkTimes | null,
+    now: () => number,
+  ): Promise<PollDecision> {
+    const before = walk();
+    if (!directories || !before) return { kind: 'walk', cause: 'noListing' };
+    const checked = this.select(directories);
     this.stats = checked.length;
-    const prints = await Promise.all(checked.map((directory) => this.statOf(directory).catch(() => null)));
+    const epoch = this.epoch;
+    const stats = await Promise.all(checked.map((directory) => this.statOf(directory).catch(() => null)));
+    const after = walk();
+    // A walk that completed during the stats listed the catalog again, and a cleared gate no longer holds its stats.
+    if (epoch !== this.epoch || !after || after.generation !== before.generation) return { kind: 'reuse' };
+    if (this.generation !== after.generation) {
+      this.seen.clear();
+      this.generation = after.generation;
+    }
     const moved = checked.filter((directory, index) => {
+      const stat = stats[index];
       const held = this.seen.get(directory);
-      this.seen.set(directory, prints[index]);
-      return held !== undefined && held !== prints[index];
+      this.seen.set(directory, stat?.print ?? null);
+      return held === undefined ? stat !== null && stat.mtimeMs >= after.startedAt : held !== (stat?.print ?? null);
     });
     const listing = new Set(directories.listing);
+    const walking = after.pendingSince !== null && now() - after.pendingSince < POLL_BACKSTOP_WALK_MS;
     if (moved.some((directory) => listing.has(directory))) return { kind: 'walk', cause: 'directory' };
-    if (sinceWalkMs >= POLL_BACKSTOP_WALK_MS) return { kind: 'walk', cause: 'backstop' };
-    if (moved.length) return { kind: 'children', directories: moved };
+    if (!walking && now() - after.startedAt >= POLL_BACKSTOP_WALK_MS) return { kind: 'walk', cause: 'backstop' };
+    const children = moved.filter((directory) => !listing.has(directory));
+    if (children.length) return { kind: 'children', directories: children };
     return { kind: 'reuse' };
   }
 
-  // Polling stopped, so the held times no longer follow every change.
+  // Every directory fits, or every listing directory with child directories in rotation, or every directory in
+  // rotation when the listing directories alone fill most of the limit.
+  private select(directories: PollDirectories): string[] {
+    const { listing, children } = directories;
+    if (listing.length + children.length <= this.limit) return [...listing, ...children];
+    const reserve = Math.floor(this.limit / 10);
+    if (listing.length <= this.limit - reserve)
+      return [...listing, ...this.rotate(children, this.limit - listing.length)];
+    return this.rotate([...listing, ...children], this.limit);
+  }
+
+  private rotate(directories: readonly string[], count: number): string[] {
+    const start = this.cursor % directories.length;
+    const taken = [...directories.slice(start), ...directories.slice(0, start)].slice(0, count);
+    this.cursor = (start + taken.length) % directories.length;
+    return taken;
+  }
+
+  // Polling stopped, so the held stats no longer follow every change. A poll whose stats are still pending discards them.
   clear(): void {
     this.seen.clear();
+    this.generation = null;
+    this.epoch++;
     this.cursor = 0;
   }
 }
