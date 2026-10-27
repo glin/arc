@@ -9199,10 +9199,21 @@ export class PanelProvider implements vscode.Disposable {
       }
       const admissionCandidates = all;
       const admissionSelection = selectedOnly ? this.selectionGeneration : undefined;
+      // A selection changes the rows of the sessions each panel leaves and enters, so it rechecks only their sources.
+      // Every other row keeps the admission of the catalog refresh that listed it.
+      const switched = selectedOnly
+        ? new Set(
+            [
+              this.showing,
+              previousSelection,
+              ...this.hosts.flatMap((host) => [this.hostSessions?.get(host), this.hostPreviousSessions?.get(host)]),
+            ].filter((session): session is string => typeof session === 'string'),
+          )
+        : null;
       // Without repository scope, a catalog refresh keeps the held catalog and reaches the scope check without yielding.
       if (selectedOnly || this.repositoryScopeReady) {
-        all = await this.prepareHumanPrompts(
-          all,
+        const prepared = await this.prepareHumanPrompts(
+          switched ? all.filter((session) => switched.has(session.sessionId)) : all,
           false,
           controller.signal,
           humanPromptWork,
@@ -9216,6 +9227,12 @@ export class PanelProvider implements vscode.Disposable {
           (selectedOnly && admissionSelection !== this.selectionGeneration)
         )
           return;
+        if (switched) {
+          const rechecked = new Set(prepared);
+          all = all.filter((session) => !switched.has(session.sessionId) || rechecked.has(session));
+        } else {
+          all = prepared;
+        }
         if (this.catalog && !selectedOnly) this.catalog = { ...this.catalog, sessions: all };
       }
       if (selectedOnly) {
@@ -9630,8 +9647,12 @@ export class PanelProvider implements vscode.Disposable {
           this.folders()[0],
           this.repositoryScope?.checkoutSnapshot?.() ?? [],
         );
+        // A selection posts only the rows it changes in this panel, so it builds those rows alone.
+        const changedRows = selectedOnly ? new Set([hostSession, hostPreviousSession]) : null;
         // Omit `railName` from general session rows. Session-list cards read it through the separate session-list payload.
-        const hostRows = this.sessionRows.map(({ railName: _railName, ...row }) => {
+        const hostRows = (
+          changedRows ? this.sessionRows.filter((row) => changedRows.has(row.id)) : this.sessionRows
+        ).map(({ railName: _railName, ...row }) => {
           const full = row.id === hostSession ? (fullLabels.get(row.id) ?? row.label) : row.label;
           return {
             ...row,
@@ -9641,7 +9662,10 @@ export class PanelProvider implements vscode.Disposable {
             shown: row.id === hostSession,
           };
         });
-        const hostRail = railPayload(this.railInputFor(counts, statuses, openChildren, railNow, hostSession));
+        const hostRail = railPayload(
+          this.railInputFor(counts, statuses, openChildren, railNow, hostSession),
+          changedRows ?? undefined,
+        );
         const selectedSession = sessions.find((session) => session.sessionId === hostSession);
         const loadingNewest = selectedSession ? !this.progressiveCurrent(selectedSession) : false;
         const loadingLabel = loadingNewest

@@ -229,7 +229,7 @@ test('heading worktree metadata follows each panel opening source and clears whe
   const end = panelHostSource.indexOf('const hostRail =', begin);
   assert.ok(begin > 0 && end > begin);
   const code = ts.transpileModule(
-    `function rows(sessions, hostSession, fullLabels, hostParent) { ${panelHostSource.slice(begin, end)} return hostRows; }`,
+    `function rows(sessions, hostSession, fullLabels, hostParent, selectedOnly = false, hostPreviousSession = null) { ${panelHostSource.slice(begin, end)} return hostRows; }`,
     { compilerOptions: { target: ts.ScriptTarget.ES2022 } },
   ).outputText;
   const project = new Function('startingWorktree', `${code}; return rows;`)(startingWorktree);
@@ -3500,7 +3500,7 @@ test('command-only admission removes pending rows through every catalog path and
       refreshBody.indexOf('let all = selectedOnly'),
       refreshBody.indexOf("this.performanceCounters.recordRefresh('catalog-enumeration'"),
     ) + '\nreturn all;',
-    'selectedOnly = true, reuseCatalog = true, controller = new AbortController(), generation = this.refreshGeneration',
+    'selectedOnly = true, reuseCatalog = true, controller = new AbortController(), generation = this.refreshGeneration, previousSelection = this.previousSelection ?? null',
   );
   const childrenBody = methodBody('private async prepareClaudeChildren(');
   const discovery = compile(
@@ -3523,6 +3523,8 @@ test('command-only admission removes pending rows through every catalog path and
     sources = [source(), peer];
     const provider: any = Object.assign(Object.create(PanelProvider.prototype), {
       folders: () => [directory],
+      hosts: [],
+      previousSelection: 'command',
       repositoryScope: { snapshot: () => ({ ready: true, roots: [directory], revision: 1 }) },
       publishWindowState() {},
       activityFor: () => 1,
@@ -3574,6 +3576,7 @@ test('command-only admission removes pending rows through every catalog path and
     };
     const read = () => {
       if (route === 'worker') return discovery.call(provider, { roots: sources });
+      // The selected route is a switch from the command session to the peer, so it rechecks both.
       if (route === 'selected') return selected.call(provider);
       provider.targetedRefreshPaths = route === 'targeted' ? [peerFile] : null;
       return listing.call(provider, route === 'reuse');
@@ -4000,7 +4003,7 @@ test('refresh human admission shares read and source allowances and resumes canc
   );
   const runSource = ts.transpileModule(
     `async function run(selectedOnly = false) {
-    const reuseCatalog = false; let generation, controller, primedEnumeration, refreshReason;
+    const reuseCatalog = false; const previousSelection = this.previousSelection ?? null; let generation, controller, primedEnumeration, refreshReason;
     ${segment}
     clearTimeout(this.refreshDeadline);
     return all;
@@ -4110,7 +4113,10 @@ test('refresh human admission shares read and source allowances and resumes canc
   assert.equal(replacementWork.unknown.has(replaced.file), true);
   preservedMtime = undefined;
 
-  // A selected refresh loses ownership without its private controller receiving an abort.
+  // A selected refresh loses ownership without its private controller receiving an abort. The refresh follows a switch
+  // away from the replaced session, so it rechecks that session.
+  provider.previousSelection = 'same-id';
+  provider.hosts = [];
   for (const supersede of ['refreshGeneration', 'selectionGeneration']) {
     provider.humanScans.clear();
     provider.selectionGeneration = 1;
@@ -18169,10 +18175,7 @@ test('nothing leaves the panel with no session shown', () => {
   for (const [what, line] of [
     ['the parse cut', 'const sessions = this.shownSessions(all);'],
     ['what is drawn', 'const hostDrawn = drawnSessionCards(this.cards, hostSession);'],
-    [
-      'the rail',
-      'const hostRail = railPayload(this.railInputFor(counts, statuses, openChildren, railNow, hostSession));',
-    ],
+    ['the rail', 'this.railInputFor(counts, statuses, openChildren, railNow, hostSession),'],
   ] as const) {
     const at = panelHostSource.indexOf(line);
     assert.notEqual(at, -1, `${what} is not where this guard expects it`);
@@ -31500,7 +31503,7 @@ test('session details keeps native controls and dialog lifetime outside the redr
   // Remove railName from the session rows supplied to the session view.
   sourceMatch(
     panelHostSource,
-    /this\.sessionRows\.map\(\(\{ railName: _railName, \.\.\.row \}\) => \{/,
+    /\)\.map\(\(\{ railName: _railName, \.\.\.row \}\) => \{/,
     "the render payload's session rows still carry the rail's own wide name",
   );
 });

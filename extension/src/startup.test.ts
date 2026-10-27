@@ -48,6 +48,8 @@ import {
   revisionOf as fileRevisionOf,
   revalidatedCatalogPaths,
   watchDirs,
+  humanPromptScanSteps,
+  promptScanLists,
 } from './transcript';
 import { randomUUID } from 'node:crypto';
 import assert from 'node:assert/strict';
@@ -4916,6 +4918,101 @@ test('a selected-only refresh before the catalog keeps every held title, and the
   await scoped;
   assert.ok(provider.authoritativeCatalog, 'the new scope refresh did not set the authoritative catalog');
   assert.deepEqual(heldFiles(provider.titles), [selected.file], 'the new scope kept titles outside it');
+});
+
+// A selection changes the rows of the session it leaves and the session it enters. Its refresh checks the prompt sources
+// and builds the session list rows of those two sessions, whatever the size of the catalog.
+
+test('a selection in a thousand-session catalog checks prompts and builds session list rows for the two switched sessions', async () => {
+  const sessions = Array.from({ length: 1000 }, (_, index) => ({
+    file: `session-${index}.jsonl`,
+    sessionId: `session-${index}`,
+    agent: 'claude',
+    activity: 2000 - index,
+    size: 100,
+    mtimeMs: 1000 + index,
+    dev: 1,
+    ino: index + 1,
+  }));
+  const byFile = new Map(sessions.map((session) => [session.file, session]));
+  const checked: string[] = [];
+  const statOf = (file: string) => {
+    const session = byFile.get(file);
+    if (!session) throw new Error(`no fixture file ${file}`);
+    return { size: session.size, mtimeMs: session.mtimeMs, dev: session.dev, ino: session.ino };
+  };
+  const provider = completeDiscoveryHarness(undefined, false, ['prepareHumanPrompts'], {
+    fs: {
+      ...fs,
+      statSync: (file: string) => {
+        checked.push(file);
+        return statOf(file);
+      },
+    },
+    humanPromptScanSteps,
+    promptScanLists,
+  });
+  const work: string[] = [];
+  provider.performanceCounters.recordWork = (name: string) => work.push(name);
+  provider.humanScans = new Map(
+    sessions.map((session) => [
+      session.file,
+      { bytes: session.size, found: true, complete: true, source: fileRevisionOf(statOf(session.file) as fs.Stats) },
+    ]),
+  );
+  provider.partial = sessions;
+  provider.catalog = { sessions };
+  provider.discovery = Promise.resolve(true);
+  provider.showing = 'session-0';
+  await provider.refresh(true);
+  assert.equal(provider.sessionRows.length, 1000, 'the catalog refresh did not list every session');
+
+  const built: number[] = [];
+  provider.useRailPayload((input: Parameters<typeof railPayload>[0], rows?: ReadonlySet<string | null>) => {
+    const payload = railPayload(input, rows);
+    built.push(payload.rail.length);
+    return payload;
+  });
+  checked.length = 0;
+  work.length = 0;
+  const posted = provider.messages.length;
+  const refresh = vi.spyOn(provider, 'refresh');
+  provider.show('session-500');
+  await refresh.mock.results.at(-1)!.value;
+
+  assert.deepEqual(
+    [...new Set(checked)].sort(),
+    ['session-0.jsonl', 'session-500.jsonl'],
+    'the selection checked the prompt sources of sessions it did not change',
+  );
+  assert.ok(
+    work.filter((name) => name.startsWith('humanPromptStat:')).length <= 4,
+    `the selection made ${work.filter((name) => name.startsWith('humanPromptStat:')).length} prompt checks`,
+  );
+  assert.ok(built.length > 0, 'the selection built no session list rows');
+  assert.ok(
+    built.every((rows) => rows <= 2),
+    `the selection built ${built.join(', ')} session list rows`,
+  );
+  const selection = provider.messages.slice(posted).find((message: any) => message.type === 'selection');
+  assert.ok(selection, 'the selection posted no selection message');
+  assert.deepEqual(
+    selection.rail.map((row: any) => [row.id, row.current]).sort(),
+    [
+      ['session-0', false],
+      ['session-500', true],
+    ],
+    'the selection did not update the session list rows it left and entered',
+  );
+  assert.deepEqual(
+    selection.sessions.map((row: any) => [row.id, row.shown]).sort(),
+    [
+      ['session-0', false],
+      ['session-500', true],
+    ],
+    'the selection did not update the session rows it left and entered',
+  );
+  assert.equal(provider.authoritativeCatalog.length, 1000, 'the selection dropped catalog sessions it did not check');
 });
 
 test('a cold start walks the catalog once every opening record is read', async () => {

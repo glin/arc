@@ -154,8 +154,25 @@ export function sameRailInputs(before: RailInputKey | null, now: RailInputKey): 
   );
 }
 
+// The input for the named rows alone, with each per-session figure narrowed to those rows.
+function railInputForRows(input: RailPayloadInput, rows: ReadonlySet<string | null>): RailPayloadInput {
+  const ids = [...rows].filter((id): id is string => id !== null);
+  const only = <T>(record: Readonly<Record<string, T>>): Record<string, T> =>
+    Object.fromEntries(ids.filter((id) => Object.hasOwn(record, id)).map((id) => [id, record[id]]));
+  return {
+    ...input,
+    sessions: input.sessions.filter((row) => rows.has(row.id)),
+    parsedStats: only(input.parsedStats),
+    metadataStats: only(input.metadataStats),
+    lifetimeStats: only(input.lifetimeStats),
+    lifetimeContextDetails: input.lifetimeContextDetails && only(input.lifetimeContextDetails),
+  };
+}
+
 // Build session list fields shared by rail and render messages.
-export function railPayload(input: RailPayloadInput): RailPayload {
+// With `rows`, build only those rows and their figures, as a selection message carries them.
+export function railPayload(input: RailPayloadInput, rows?: ReadonlySet<string | null>): RailPayload {
+  if (rows) input = railInputForRows(input, rows);
   const stats = sessionStatsOf(
     input.parsedStats,
     input.metadataStats,
