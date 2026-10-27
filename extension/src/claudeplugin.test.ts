@@ -1,6 +1,16 @@
-import { createHash } from 'node:crypto';
-import { BundledTools, resolveToolRuntime, sessionHookRuntime, type ToolPackage } from './bundledtools';
-import { acquireToolLock } from './toolownership';
+import { createHash, randomUUID } from 'node:crypto';
+import {
+  BundledTools,
+  RELEASE_RETENTION,
+  ReleaseCollector,
+  releaseContentId,
+  resolveToolRuntime,
+  scheduleReleaseCollection,
+  sessionHookRuntime,
+  type ToolPackage,
+} from './bundledtools';
+import { acquireToolLock, removeAbandonedCollectionLock } from './toolownership';
+import { TerminalTools } from './toolpath';
 import { onTestFinished, test, vi } from 'vitest';
 import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
@@ -1563,3 +1573,653 @@ test.each(['win32', 'linux', 'darwin'] as const)(
     }
   },
 );
+
+const MINUTE = 60_000;
+const DAY = 24 * 60 * MINUTE;
+
+function retentionFixture(labels: string[]) {
+  const builds = [bundledFixture(labels[0])];
+  for (const label of labels.slice(1)) builds.push(bundledFixture(label, builds[0].tools.root));
+  const { root, tools } = builds[0].tools;
+  const clock = { wall: Date.now(), mono: 0, now: () => clock.wall, monotonic: () => clock.mono };
+  vi.useFakeTimers({ toFake: ['Date', 'setInterval', 'clearInterval'] });
+  vi.setSystemTime(clock.wall);
+  onTestFinished(() => {
+    vi.useRealTimers();
+  });
+  const signal = builds[0].f.signal;
+  const ids = builds.map((build) => build.bundle.payload.contentId);
+  const releases = path.join(tools, 'releases');
+  const fixture = {
+    builds,
+    root,
+    tools,
+    ids,
+    clock,
+    signal,
+    releases,
+    advance(ms: number) {
+      clock.wall += ms;
+      clock.mono += ms;
+      vi.setSystemTime(clock.wall);
+    },
+    // Runs what a window runs on activation: private preparation, then a stamp and a collection pass.
+    async activate(index: number, collector = new ReleaseCollector(clock)) {
+      await builds[index].tools.preparePrivateCommands(signal);
+      collector.run(root, ids[index]);
+      return collector;
+    },
+    // Runs a later pass in the same window after the confirmation interval.
+    confirm(collector: ReleaseCollector, index: number) {
+      fixture.advance(RELEASE_RETENTION.confirmMs);
+      collector.run(root, ids[index]);
+    },
+    // Activates the given builds one day apart, then ages every stamp past the retention period.
+    async history(indexes: number[]) {
+      for (const index of indexes) {
+        await fixture.activate(index);
+        fixture.advance(DAY);
+      }
+      fixture.advance(RELEASE_RETENTION.unusedMs + DAY);
+    },
+    present: () =>
+      fs
+        .readdirSync(releases)
+        .filter((name) => /^[a-f0-9]{64}$/.test(name))
+        .sort(),
+    kept: (...indexes: number[]) => indexes.map((index) => ids[index]).sort(),
+  };
+  return fixture;
+}
+
+test('collection after a week keeps the two newest stamps and every selection and deletes orphan stamps', async () => {
+  const r = retentionFixture(['A', 'B', 'C', 'D', 'E', 'F', 'G']);
+  await r.history([0, 1, 2, 3, 4, 5]);
+  fs.writeFileSync(path.join(r.tools, 'active.json'), JSON.stringify({ contentId: r.ids[0], runtime: 'node' }) + '\n');
+  fs.writeFileSync(
+    path.join(r.tools, 'command-operation.json'),
+    JSON.stringify({
+      selection: {
+        previous: JSON.stringify({ contentId: r.ids[1], runtime: 'node' }) + '\n',
+        next: JSON.stringify({ contentId: r.ids[2], runtime: 'node' }) + '\n',
+      },
+    }),
+  );
+  const orphan = path.join(r.tools, 'used', 'f'.repeat(64));
+  fs.writeFileSync(orphan, '');
+  assert.deepEqual(r.present(), r.kept(0, 1, 2, 3, 4, 5));
+  const window = await r.activate(6);
+  assert.deepEqual(r.present(), r.kept(0, 1, 2, 3, 4, 5, 6));
+  r.confirm(window, 6);
+  assert.deepEqual(r.present(), r.kept(0, 1, 2, 5, 6));
+  assert.deepEqual(
+    fs.readdirSync(r.releases).filter((name) => name.startsWith('.')),
+    [],
+  );
+  assert.deepEqual(fs.readdirSync(path.join(r.tools, 'used')).sort(), [
+    '.collected',
+    '.migrated',
+    ...r.kept(0, 1, 2, 5, 6),
+  ]);
+});
+
+test('a window on a build that setup published alone retires expired releases', async () => {
+  const r = retentionFixture(['A', 'B', 'C', 'D']);
+  await r.history([0, 1, 2]);
+  await r.builds[3].setup.install(r.builds[3].f.target, r.signal);
+  assert.deepEqual(r.present(), r.kept(0, 1, 2, 3));
+  const window = await r.activate(3);
+  r.confirm(window, 3);
+  assert.deepEqual(r.present(), r.kept(2, 3));
+});
+
+test('a release that its window re-stamps on the interval survives a week', async () => {
+  const r = retentionFixture(['A', 'B', 'C', 'D']);
+  const live = await r.activate(0);
+  const launchers = path.join(r.releases, r.ids[0], 'launchers');
+  const schedule = scheduleReleaseCollection(
+    () => launchers,
+    () => r.root,
+    live,
+  );
+  onTestFinished(() => schedule.dispose());
+  await r.history([1, 2]);
+  vi.advanceTimersByTime(RELEASE_RETENTION.restampMs);
+  vi.setSystemTime(r.clock.wall);
+  const window = await r.activate(3);
+  r.confirm(window, 3);
+  assert.deepEqual(r.present(), r.kept(0, 3));
+});
+
+test('a sleeping window that stamps between two passes of another window keeps its release', async () => {
+  const r = retentionFixture(['A', 'B', 'C', 'D']);
+  const sleeping = await r.activate(0);
+  await r.history([1, 2]);
+  const window = await r.activate(3);
+  r.advance(RELEASE_RETENTION.restampMs);
+  sleeping.run(r.root, r.ids[0]);
+  r.advance(RELEASE_RETENTION.confirmMs - RELEASE_RETENTION.restampMs);
+  window.run(r.root, r.ids[3]);
+  assert.deepEqual(r.present(), r.kept(0, 2, 3));
+});
+
+test('the first pass stamps every release and deletes none, also after an interrupted migration', async () => {
+  const r = retentionFixture(['A', 'B', 'C']);
+  for (const index of [0, 1]) await r.builds[index].tools.preparePrivateCommands(r.signal);
+  // Releases from builds without stamps carry only their folder times.
+  const used = path.join(r.tools, 'used');
+  fs.rmSync(used, { recursive: true });
+  const old = new Date(r.clock.wall - 30 * DAY);
+  for (const index of [0, 1]) fs.utimesSync(path.join(r.releases, r.ids[index]), old, old);
+  const window = await r.activate(2);
+  for (const index of [0, 1, 2]) assert.equal(fs.statSync(path.join(used, r.ids[index])).mtimeMs, r.clock.wall);
+  assert.ok(fs.existsSync(path.join(used, '.migrated')));
+  r.confirm(window, 2);
+  assert.deepEqual(r.present(), r.kept(0, 1, 2));
+  fs.rmSync(path.join(used, '.migrated'));
+  for (const index of [0, 1]) fs.utimesSync(path.join(used, r.ids[index]), old, old);
+  r.confirm(window, 2);
+  r.confirm(window, 2);
+  assert.deepEqual(r.present(), r.kept(0, 1, 2));
+  assert.ok(fs.existsSync(path.join(used, '.migrated')));
+});
+
+test('activation on an empty root claims storage before any stamp writes', async () => {
+  const r = retentionFixture(['A']);
+  const collector = new ReleaseCollector(r.clock);
+  collector.run(r.root, r.ids[0]);
+  assert.equal(r.builds[0].tools.stamp(), false);
+  assert.equal(fs.existsSync(r.tools), false);
+  await r.activate(0, collector);
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(r.tools, 'ownership.json'), 'utf8')), {
+    schemaVersion: 1,
+    root: r.root,
+  });
+  assert.equal(fs.statSync(path.join(r.tools, 'used', r.ids[0])).mtimeMs, r.clock.wall);
+});
+
+test('collection returns a release that a window stamps between the stamp reread and the rename', async () => {
+  const r = retentionFixture(['A', 'B', 'C', 'D']);
+  await r.history([0, 1, 2]);
+  const window = await r.activate(3);
+  const rename = fs.renameSync;
+  vi.spyOn(fsBuiltin, 'renameSync').mockImplementation((from, to) => {
+    if (path.basename(String(from)) === r.ids[0] && path.basename(String(to)).startsWith('.retired-'))
+      r.builds[0].tools.stamp();
+    rename(from, to);
+  });
+  syncBuiltinESMExports();
+  try {
+    r.confirm(window, 3);
+  } finally {
+    vi.restoreAllMocks();
+    syncBuiltinESMExports();
+  }
+  assert.deepEqual(r.present(), r.kept(0, 2, 3));
+  assert.deepEqual(
+    fs.readdirSync(r.releases).filter((name) => name.startsWith('.')),
+    [],
+  );
+});
+
+test('fast-path preparation stages a release again when collection retires it during validation', async () => {
+  const r = retentionFixture(['A']);
+  const first = await r.builds[0].tools.preparePrivateCommands(r.signal);
+  const release = path.dirname(first);
+  const stat = fs.statSync;
+  let moved = false;
+  vi.spyOn(fsBuiltin, 'statSync').mockImplementation((file: fs.PathLike, options?: fs.StatSyncOptions) => {
+    if (!moved && String(file) === path.join(release, 'release.json')) {
+      moved = true;
+      fs.renameSync(release, path.join(r.releases, `.retired-${randomUUID()}`));
+    }
+    return stat(file, options);
+  });
+  syncBuiltinESMExports();
+  try {
+    assert.equal(await r.builds[0].tools.preparePrivateCommands(r.signal), first);
+  } finally {
+    vi.restoreAllMocks();
+    syncBuiltinESMExports();
+  }
+  assert.equal(moved, true);
+  assert.equal(fs.readFileSync(path.join(release, 'cli', 'arc.cjs'), 'utf8'), 'console.log("CLI A")');
+});
+
+test('a window whose stamp fails runs no collection pass', async () => {
+  const r = retentionFixture(['A', 'B', 'C', 'D']);
+  await r.history([0, 1, 2]);
+  await r.builds[3].tools.preparePrivateCommands(r.signal);
+  const stamp = path.join(r.tools, 'used', r.ids[3]);
+  fs.rmSync(stamp);
+  fs.mkdirSync(stamp);
+  const window = new ReleaseCollector(r.clock);
+  window.run(r.root, r.ids[3]);
+  r.confirm(window, 3);
+  assert.deepEqual(r.present(), r.kept(0, 1, 2, 3));
+});
+
+test('collection keeps releases with unfamiliar names or contents', async () => {
+  const r = retentionFixture(['A', 'B', 'C', 'D']);
+  for (const index of [0, 1, 2]) {
+    await r.activate(index);
+    r.advance(DAY);
+  }
+  fs.writeFileSync(path.join(r.releases, r.ids[0], 'cli', 'unexpected.txt'), 'kept');
+  const old = new Date(r.clock.wall - 30 * DAY);
+  const unfamiliar = ['b'.repeat(64), 'C'.repeat(64), '.staging-x', '.retired-x'];
+  for (const name of unfamiliar) {
+    fs.cpSync(path.join(r.releases, r.ids[1]), path.join(r.releases, name), { recursive: true });
+    fs.utimesSync(path.join(r.releases, name), old, old);
+  }
+  r.advance(RELEASE_RETENTION.unusedMs + DAY);
+  r.advance(DAY);
+  const window = await r.activate(3);
+  r.confirm(window, 3);
+  r.confirm(window, 3);
+  assert.deepEqual(fs.readdirSync(r.releases).sort(), [...r.kept(0, 2, 3), ...unfamiliar].sort());
+});
+
+test('an unreadable journal selection stops deletion and a null previous selection keeps the next target', async () => {
+  const r = retentionFixture(['A', 'B', 'C', 'D']);
+  await r.history([0, 1, 2]);
+  const journal = path.join(r.tools, 'command-operation.json');
+  const next = JSON.stringify({ contentId: r.ids[0], runtime: 'node' }) + '\n';
+  fs.writeFileSync(journal, JSON.stringify({ selection: { previous: '{"contentId":', next } }));
+  const window = await r.activate(3);
+  r.confirm(window, 3);
+  assert.deepEqual(r.present(), r.kept(0, 1, 2, 3));
+  fs.writeFileSync(journal, JSON.stringify({ selection: { previous: null, next } }));
+  r.confirm(window, 3);
+  r.confirm(window, 3);
+  assert.deepEqual(r.present(), r.kept(0, 2, 3));
+});
+
+test(
+  'command and snapshot setup wait for a collection pass that holds the lock',
+  { tags: ['subprocess'] },
+  async () => {
+    const a = bundledFixture();
+    await a.tools.preparePrivateCommands(a.f.signal);
+    const file = path.join(a.tools.tools, '.install.lock');
+    for (const setup of [
+      () => a.tools.installCommands(process.execPath, a.f.signal),
+      () => a.setup.install(a.f.target, a.f.signal),
+    ]) {
+      const held = acquireToolLock(file, 'collection');
+      const pending = setup();
+      held.release();
+      await pending;
+    }
+    assert.equal(a.tools.registration(a.f.target.home)?.complete, true);
+    assert.equal(
+      JSON.parse(fs.readFileSync(path.join(a.tools.tools, 'active.json'), 'utf8')).contentId,
+      a.bundle.payload.contentId,
+    );
+  },
+);
+
+test(
+  'the standalone runner rereads the selection once when its release disappeared',
+  { tags: ['subprocess'] },
+  async () => {
+    const a = bundledFixture('A');
+    const c = bundledFixture('C', a.tools.root);
+    await a.tools.installCommands(process.execPath, a.f.signal);
+    await c.tools.installCommands(process.execPath, c.f.signal);
+    fs.rmSync(path.join(a.tools.tools, 'releases', a.bundle.payload.contentId), { recursive: true });
+    // The preload returns the selection that the runner read before a newer installation replaced it.
+    const preload = path.join(a.f.root, 'stale-selection.cjs');
+    fs.writeFileSync(
+      preload,
+      `const fs=require('node:fs');const read=fs.readFileSync;let stale=true;fs.readFileSync=function(file,...rest){if(stale&&String(file).endsWith('active.json')){stale=false;return ${JSON.stringify(JSON.stringify({ contentId: a.bundle.payload.contentId }))};}return read.call(this,file,...rest);};`,
+    );
+    const result = childProcessBuiltin.spawnSync(
+      process.execPath,
+      ['--require', preload, path.join(a.tools.root, 'bin', 'run.cjs')],
+      { encoding: 'utf8', env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' } },
+    );
+    assert.equal(result.stderr, '');
+    assert.equal(result.stdout.trim(), 'CLI C');
+    fs.rmSync(path.join(c.tools.tools, 'releases', c.bundle.payload.contentId), { recursive: true });
+    const missing = childProcessBuiltin.spawnSync(process.execPath, [path.join(a.tools.root, 'bin', 'run.cjs')], {
+      encoding: 'utf8',
+    });
+    assert.match(missing.stderr, /Arc command unavailable/);
+  },
+);
+
+test.runIf(process.platform === 'win32')('an open file inside a release defers its retirement on Windows', async () => {
+  const r = retentionFixture(['A', 'B', 'C', 'D']);
+  await r.history([0, 1, 2]);
+  const helper = fs.openSync(path.join(r.releases, r.ids[0], 'cli', 'windowpipe.exe'), 'r');
+  let open = true;
+  onTestFinished(() => {
+    if (open) fs.closeSync(helper);
+  });
+  const window = await r.activate(3);
+  r.confirm(window, 3);
+  assert.deepEqual(r.present(), r.kept(0, 2, 3));
+  assert.equal(fs.readFileSync(path.join(r.releases, r.ids[0], 'cli', 'arc.cjs'), 'utf8'), 'console.log("CLI A")');
+  fs.closeSync(helper);
+  open = false;
+  r.confirm(window, 3);
+  assert.deepEqual(r.present(), r.kept(2, 3));
+});
+
+test('a later pass deletes temporary folders after one hour and staging the same build creates a fresh release', async () => {
+  const r = retentionFixture(['A']);
+  const window = await r.activate(0);
+  const retired = path.join(r.releases, `.retired-${randomUUID()}`);
+  const staging = path.join(r.releases, `.staging-${randomUUID()}`);
+  fs.renameSync(path.join(r.releases, r.ids[0]), retired);
+  fs.mkdirSync(path.join(staging, 'cli'), { recursive: true });
+  fs.writeFileSync(path.join(staging, 'cli', 'arc.cjs'), 'partial');
+  await r.activate(0, window);
+  assert.deepEqual(r.present(), r.kept(0));
+  assert.equal(fs.readFileSync(path.join(r.releases, r.ids[0], 'cli', 'arc.cjs'), 'utf8'), 'console.log("CLI A")');
+  assert.deepEqual(
+    fs.readdirSync(r.releases).sort(),
+    [path.basename(retired), path.basename(staging), r.ids[0]].sort(),
+  );
+  r.advance(RELEASE_RETENTION.temporaryMs + MINUTE);
+  window.run(r.root, r.ids[0]);
+  assert.deepEqual(fs.readdirSync(r.releases), [r.ids[0]]);
+});
+
+test('collection never follows a link named like a release, a stamp or the stamp folder', async () => {
+  const r = retentionFixture(['A', 'B', 'C']);
+  await r.history([0, 1]);
+  const outside = path.join(r.builds[0].f.root, 'outside');
+  fs.mkdirSync(outside);
+  // A valid release moved outside the store stays reachable only through a link with its own name.
+  const moved = path.join(outside, r.ids[0]);
+  fs.renameSync(path.join(r.releases, r.ids[0]), moved);
+  fs.symlinkSync(moved, path.join(r.releases, r.ids[0]), process.platform === 'win32' ? 'junction' : 'dir');
+  const target = path.join(outside, 'stamp');
+  fs.writeFileSync(target, 'kept');
+  const linkedStamp = path.join(r.tools, 'used', 'e'.repeat(64));
+  let fileLinks = true;
+  try {
+    fs.symlinkSync(target, linkedStamp, 'file');
+  } catch (error) {
+    // Windows refuses file links without Developer Mode or an administrator token.
+    if (process.platform !== 'win32' || (error as NodeJS.ErrnoException).code !== 'EPERM') throw error;
+    fileLinks = false;
+  }
+  const window = await r.activate(2);
+  r.confirm(window, 2);
+  r.confirm(window, 2);
+  assert.deepEqual(r.present(), r.kept(0, 1, 2));
+  assert.ok(fs.lstatSync(path.join(r.releases, r.ids[0])).isSymbolicLink());
+  assert.ok(fs.existsSync(path.join(moved, 'release.json')));
+  assert.equal(fs.readFileSync(target, 'utf8'), 'kept');
+  if (fileLinks) assert.ok(fs.lstatSync(linkedStamp).isSymbolicLink());
+  // A linked stamp folder stops every stamp, so no pass runs.
+  const used = path.join(r.tools, 'used');
+  const usedTarget = path.join(outside, 'used');
+  fs.renameSync(used, usedTarget);
+  fs.symlinkSync(usedTarget, used, process.platform === 'win32' ? 'junction' : 'dir');
+  const before = fs.readdirSync(usedTarget).sort();
+  r.advance(RELEASE_RETENTION.unusedMs + DAY);
+  fs.cpSync(path.join(r.releases, r.ids[1]), path.join(r.releases, `.retired-${randomUUID()}`), { recursive: true });
+  const old = new Date(r.clock.wall - 2 * RELEASE_RETENTION.temporaryMs);
+  for (const name of fs.readdirSync(r.releases)) fs.utimesSync(path.join(r.releases, name), old, old);
+  r.confirm(window, 2);
+  r.confirm(window, 2);
+  assert.deepEqual(fs.readdirSync(usedTarget).sort(), before);
+  assert.equal(fs.readdirSync(r.releases).length, 4);
+});
+
+test('the registration release and its rollback target survive collection at any age', async () => {
+  const r = retentionFixture(['A', 'B', 'C', 'D', 'E']);
+  await r.builds[0].setup.install(r.builds[0].f.target, r.signal);
+  const registration = r.builds[0].tools.configuration(r.builds[0].f.target.home).registration;
+  fs.writeFileSync(
+    registration,
+    JSON.stringify({ ...JSON.parse(fs.readFileSync(registration, 'utf8')), previousContentId: r.ids[1] }),
+  );
+  await r.history([1, 2, 3]);
+  r.advance(20 * DAY);
+  const window = await r.activate(4);
+  r.confirm(window, 4);
+  assert.deepEqual(r.present(), r.kept(0, 1, 3, 4));
+});
+
+test('only a launcher folder inside the release store names a release to stamp', async () => {
+  const r = retentionFixture(['A']);
+  const launchers = await r.builds[0].tools.preparePrivateCommands(r.signal);
+  assert.equal(releaseContentId(launchers, r.root), r.ids[0]);
+  const mixed = path.join(r.root, 'Tools', 'Releases', r.ids[0], 'launchers');
+  const expected = { win32: r.ids[0], linux: undefined, darwin: fs.existsSync(mixed) ? r.ids[0] : undefined };
+  assert.equal(releaseContentId(mixed, r.root), expected[process.platform as keyof typeof expected]);
+  const upper = path.join(r.releases, r.ids[0].toUpperCase(), 'launchers');
+  assert.equal(releaseContentId(upper, r.root), undefined);
+  assert.equal(releaseContentId(path.join(r.root, 'dist', 'bin'), r.root), undefined);
+  assert.equal(releaseContentId(path.join(r.root, 'other', r.ids[0], 'launchers'), r.root), undefined);
+  assert.equal(releaseContentId(path.join(r.releases, r.ids[0], 'cli'), r.root), undefined);
+});
+
+test('a release without a stamp retires by its folder time', async () => {
+  const r = retentionFixture(['A', 'B', 'C', 'D']);
+  await r.history([0, 1, 2]);
+  fs.rmSync(path.join(r.tools, 'used', r.ids[0]));
+  const old = new Date(r.clock.wall - 30 * DAY);
+  fs.utimesSync(path.join(r.releases, r.ids[0]), old, old);
+  const window = await r.activate(3);
+  r.confirm(window, 3);
+  assert.deepEqual(r.present(), r.kept(2, 3));
+  assert.deepEqual(
+    fs.readdirSync(r.releases).filter((name) => name.startsWith('.')),
+    [],
+  );
+});
+
+test('setup waits for a lock whose owner is not written yet and then refuses an owner other than collection', async () => {
+  const a = bundledFixture();
+  await a.tools.preparePrivateCommands(a.f.signal);
+  const file = path.join(a.tools.tools, '.install.lock');
+  for (const purpose of ['collection', undefined] as const) {
+    const write = fs.writeFileSync;
+    let pending: Promise<string> | undefined;
+    vi.spyOn(fsBuiltin, 'writeFileSync').mockImplementation((target, data, options) => {
+      // Setup reads the lock after the holder creates it and before the holder writes its owner.
+      if (!pending && typeof target === 'number' && String(data).includes('"pid"')) {
+        assert.equal(fs.readFileSync(file, 'utf8'), '');
+        pending = a.tools.owned(async () => 'setup ran', a.f.signal);
+        pending.catch(() => undefined);
+      }
+      write(target, data, options);
+    });
+    syncBuiltinESMExports();
+    let held: ReturnType<typeof acquireToolLock>;
+    try {
+      held = acquireToolLock(file, purpose);
+    } finally {
+      vi.restoreAllMocks();
+      syncBuiltinESMExports();
+    }
+    assert.ok(pending);
+    if (purpose === 'collection') {
+      held.release();
+      assert.equal(await pending, 'setup ran');
+    } else {
+      await assert.rejects(pending, /Another Arc setup owns/);
+      assert.equal(fs.readFileSync(file, 'utf8'), JSON.stringify({ token: held.token, pid: process.pid }));
+      held.release();
+    }
+  }
+});
+
+test('collection, preparation and setup remove a collection lock whose process ended and keep every other lock', async () => {
+  const r = retentionFixture(['A', 'B', 'C', 'D']);
+  await r.history([0, 1, 2]);
+  const file = path.join(r.tools, '.install.lock');
+  const gone = 2147483647;
+  const lock = (owner: object) => fs.writeFileSync(file, JSON.stringify({ token: randomUUID(), ...owner }));
+  lock({ pid: gone, purpose: 'collection' });
+  const window = await r.activate(3);
+  lock({ pid: gone, purpose: 'collection' });
+  r.confirm(window, 3);
+  assert.deepEqual(r.present(), r.kept(2, 3));
+  lock({ pid: gone, purpose: 'collection' });
+  assert.equal(await r.builds[3].tools.owned(async () => 'setup ran', r.signal), 'setup ran');
+  assert.equal(fs.existsSync(file), false);
+  // Setup that ended while it retained ownership keeps the lock.
+  lock({ pid: gone });
+  const retained = fs.readFileSync(file, 'utf8');
+  await assert.rejects(
+    r.builds[3].tools.owned(async () => 'setup ran', r.signal),
+    /Another Arc setup owns/,
+  );
+  assert.equal(fs.readFileSync(file, 'utf8'), retained);
+});
+
+test('two recoveries of one ended collection lock leave the lock that follows the first recovery', () => {
+  const directory = tempDir('arc-lock-recovery-');
+  const file = path.join(directory, '.install.lock');
+  fs.writeFileSync(file, JSON.stringify({ token: randomUUID(), pid: 2147483647, purpose: 'collection' }));
+  const unlink = fs.unlinkSync;
+  let first: boolean | undefined;
+  let next: ReturnType<typeof acquireToolLock> | undefined;
+  vi.spyOn(fsBuiltin, 'unlinkSync').mockImplementation((target) => {
+    // The other recovery runs in full while this one waits to delete the lock it read, and a window then takes the lock.
+    if (first === undefined && target === file) {
+      first = removeAbandonedCollectionLock(file);
+      if (first) next = acquireToolLock(file);
+    }
+    unlink(target);
+  });
+  syncBuiltinESMExports();
+  let second: boolean;
+  try {
+    second = removeAbandonedCollectionLock(file);
+  } finally {
+    vi.restoreAllMocks();
+    syncBuiltinESMExports();
+  }
+  assert.equal(Number(first) + Number(second), 1);
+  if (next) assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).token, next.token);
+  else assert.equal(fs.existsSync(file), false);
+  assert.deepEqual(fs.readdirSync(directory), next ? ['.install.lock'] : []);
+});
+
+test('a pass validates release files only for a confirmed candidate within the per-pass limit', async () => {
+  const r = retentionFixture(['A', 'B', 'C', 'D', 'E']);
+  await r.history([0, 1, 2, 3]);
+  const candidates = r.ids.slice(0, 3);
+  const read = fs.readFileSync;
+  const validated = new Set<string>();
+  vi.spyOn(fsBuiltin, 'readFileSync').mockImplementation((file, options) => {
+    const relative = path.relative(r.releases, String(file)).split(path.sep);
+    if (candidates.includes(relative[0]) && relative[1] !== 'release.json') validated.add(relative[0]);
+    return read(file, options);
+  });
+  syncBuiltinESMExports();
+  try {
+    const window = await r.activate(4, new ReleaseCollector(r.clock, 1));
+    assert.deepEqual([...validated], []);
+    r.confirm(window, 4);
+  } finally {
+    vi.restoreAllMocks();
+    syncBuiltinESMExports();
+  }
+  assert.equal(validated.size, 1);
+  const [retired] = validated;
+  assert.deepEqual(
+    r.present(),
+    r.kept(0, 1, 2, 3, 4).filter((id) => id !== retired),
+  );
+});
+
+test('a release that cannot return to its name keeps its retired folder for one hour', async () => {
+  const r = retentionFixture(['A', 'B', 'C', 'D']);
+  await r.history([0, 1, 2]);
+  const window = await r.activate(3);
+  const rename = fs.renameSync;
+  vi.spyOn(fsBuiltin, 'renameSync').mockImplementation((from, to) => {
+    if (path.basename(String(from)) === r.ids[0] && path.basename(String(to)).startsWith('.retired-'))
+      r.builds[0].tools.stamp();
+    if (path.basename(String(from)).startsWith('.retired-') && path.basename(String(to)) === r.ids[0])
+      throw Object.assign(new Error('Busy.'), { code: 'EPERM' });
+    rename(from, to);
+  });
+  syncBuiltinESMExports();
+  try {
+    r.confirm(window, 3);
+  } finally {
+    vi.restoreAllMocks();
+    syncBuiltinESMExports();
+  }
+  const temporary = () => fs.readdirSync(r.releases).filter((name) => name.startsWith('.retired-'));
+  assert.equal(temporary().length, 1);
+  r.advance(RELEASE_RETENTION.temporaryMs - MINUTE);
+  window.run(r.root, r.ids[3]);
+  assert.equal(temporary().length, 1);
+  r.advance(2 * MINUTE);
+  window.run(r.root, r.ids[3]);
+  assert.deepEqual(temporary(), []);
+});
+
+test('preparation whose stamp fails waits for the lock instead of returning the existing release', async () => {
+  const a = bundledFixture();
+  const launchers = await a.tools.preparePrivateCommands(a.f.signal);
+  const stamp = path.join(a.tools.tools, 'used', a.bundle.payload.contentId);
+  fs.rmSync(stamp);
+  fs.mkdirSync(stamp);
+  const held = acquireToolLock(path.join(a.tools.tools, '.install.lock'));
+  const pending = a.tools.preparePrivateCommands(a.f.signal);
+  assert.equal(await Promise.race([pending, Promise.resolve('waiting')]), 'waiting');
+  held.release();
+  assert.equal(await pending, launchers);
+});
+
+test('a linked selection file stops deletion until it is removed', async () => {
+  const r = retentionFixture(['A', 'B', 'C', 'D']);
+  await r.history([0, 1, 2]);
+  const active = path.join(r.tools, 'active.json');
+  // The link target is missing, so the selection reads as absent unless collection checks the link itself.
+  fs.symlinkSync(path.join(r.root, 'missing'), active, process.platform === 'win32' ? 'junction' : 'file');
+  const window = await r.activate(3);
+  r.confirm(window, 3);
+  r.confirm(window, 3);
+  assert.deepEqual(r.present(), r.kept(0, 1, 2, 3));
+  fs.unlinkSync(active);
+  r.confirm(window, 3);
+  r.confirm(window, 3);
+  assert.deepEqual(r.present(), r.kept(2, 3));
+});
+
+test('activation runs a collection pass after private preparation', async () => {
+  const r = retentionFixture(['A']);
+  const source = fs.readFileSync(path.join(__dirname, 'extension.ts'), 'utf8');
+  const start = source.indexOf('  const privateTools = new TerminalTools(');
+  const end = source.indexOf('  const sessionSkillSelection = {');
+  assert.ok(start >= 0 && end > start);
+  const compiled = transformSync(`async function activate() {${source.slice(start, end)}\nawait privatePreparation;}`, {
+    loader: 'ts',
+  }).code;
+  const later = { now: () => r.clock.wall + MINUTE, monotonic: () => r.clock.mono };
+  const subscriptions: { dispose(): void }[] = [];
+  onTestFinished(() => subscriptions.forEach((owner) => owner.dispose()));
+  await vm.runInNewContext(compiled + '\nactivate()', {
+    TerminalTools,
+    context: {
+      environmentVariableCollection: { persistent: true, clear() {}, append() {}, replace() {} },
+      subscriptions,
+      extensionPath: r.builds[0].f.root,
+      extensionMode: 1,
+    },
+    vscode: { workspace: { isTrusted: true, workspaceFolders: [] }, ExtensionMode: { Development: 2 } },
+    toolRoot: () => r.root,
+    prepareEditorCommands: (_dist: string, _root: string, signal: AbortSignal) =>
+      r.builds[0].tools.preparePrivateCommands(signal),
+    scheduleReleaseCollection: (selected: () => string | undefined) =>
+      scheduleReleaseCollection(selected, () => r.root, new ReleaseCollector(later)),
+    path,
+    os: { hostname: () => 'fixture-host' },
+    process: { execPath: process.execPath },
+  });
+  assert.equal(fs.statSync(path.join(r.tools, 'used', r.ids[0])).mtimeMs, later.now());
+  assert.ok(fs.existsSync(path.join(r.tools, 'used', '.migrated')));
+});

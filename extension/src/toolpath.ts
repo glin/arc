@@ -161,6 +161,10 @@ export class TerminalTools {
     }
     throw new Error('Arc commands are unavailable in this window.');
   }
+  // Returns the prepared launcher directory without clearing the terminal environment.
+  selectedDirectory(): string | undefined {
+    return this.disposed ? undefined : this.selected?.directory;
+  }
   sessionSkills(): SessionSkillRelease | undefined {
     try {
       if (this.disposed || !this.selected || this.selected.admission !== JSON.stringify(this.admission()))

@@ -130,7 +130,13 @@ import {
 } from './sessionwrites';
 import { claudeConfigHome } from './agentpaths';
 import { ClaudePluginOffer, ClaudePluginSetup, pluginTarget } from './claudeplugin';
-import { BundledTools, readToolPackage, toolRoot, prepareEditorCommands } from './bundledtools';
+import {
+  BundledTools,
+  readToolPackage,
+  scheduleReleaseCollection,
+  toolRoot,
+  prepareEditorCommands,
+} from './bundledtools';
 import { TerminalTools } from './toolpath';
 
 // Codex children share this client identity. The build supplies `EXTENSION_VERSION` from the extension manifest.
@@ -183,7 +189,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     process.execPath,
   );
   context.subscriptions.push(privateTools);
+  const releaseCollection = scheduleReleaseCollection(() => privateTools.selectedDirectory());
+  context.subscriptions.push(releaseCollection);
   let privatePreparation = privateTools.refresh();
+  void privatePreparation.then(releaseCollection.collect);
   const sessionSkillSelection = {
     admitted: () => vscode.workspace.isTrusted && !vscode.env.remoteName,
     current: () => (vscode.workspace.isTrusted && !vscode.env.remoteName ? privateTools.sessionSkills() : undefined),
@@ -861,6 +870,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     const preparation = (privatePreparation = privateTools.refresh());
     void preparation.then(() => {
       if (preparation === privatePreparation) invalidatePreparedDefaults?.();
+      releaseCollection.collect();
     });
     snapshotOffer?.invalidate();
   };

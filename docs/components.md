@@ -6,7 +6,7 @@ Paths are relative to `extension/src/`. [Architecture](architecture.md) owns pac
 
 | File | Job | Imports `vscode`? |
 | --- | --- | --- |
-| `bundledtools.ts` | Package validation, admitted software roots, immutable release publication, configuration catalogs, completion and installed command activation | no |
+| `bundledtools.ts` | Package validation, admitted software roots, immutable release publication, configuration catalogs, completion, installed command activation and unused release collection | no |
 | `bundledsetup.ts` | Source-build entry for the shared command and snapshot installer | no |
 | `toolownership.ts` | Canonical paths, redirected ancestor admission, exclusive setup ownership and wrapped uncertainty | no |
 | `toolpath.ts` | Private terminal environment lifetime, PATH admission, current child CLI selection, and canonical session skill release selection | no |

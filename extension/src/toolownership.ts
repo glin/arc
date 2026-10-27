@@ -37,10 +37,13 @@ export function admitToolPath(value: string): string {
   return canonicalToolPath(value);
 }
 
-export function acquireToolLock(file: string): { file: string; token: string; release(): void } {
+export function acquireToolLock(
+  file: string,
+  purpose?: 'collection',
+): { file: string; token: string; release(): void } {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const token = randomUUID();
-  const owner = JSON.stringify({ token, pid: process.pid });
+  const owner = JSON.stringify(purpose ? { token, pid: process.pid, purpose } : { token, pid: process.pid });
   let fd: number;
   try {
     fd = fs.openSync(file, 'wx', 0o600);
@@ -105,9 +108,14 @@ export function waitForToolLock(
       try {
         const directory = ready?.();
         if (directory) return finish(undefined, directory);
+      } catch (error) {
+        return finish(error);
+      }
+      try {
         finish(undefined, acquireToolLock(file));
       } catch (error) {
-        if ((error as Error & { cause?: NodeJS.ErrnoException }).cause?.code !== 'EEXIST') finish(error);
+        if ((error as Error & { cause?: NodeJS.ErrnoException }).cause?.code !== 'EEXIST') return finish(error);
+        if (removeAbandonedCollectionLock(file)) attempt();
       }
     };
     signal.addEventListener('abort', canceled, { once: true });
@@ -131,6 +139,92 @@ export function waitForToolLock(
       // Condition checks continue when filesystem notifications are unavailable.
     }
   });
+}
+
+function processGone(pid: unknown): boolean {
+  if (typeof pid !== 'number' || !Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return false;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'ESRCH';
+  }
+}
+
+// Returns the lock owner, or undefined while the lock is absent or its owner is not yet written.
+function toolLockOwner(
+  file: string,
+): { text: string; owner: { pid?: unknown; purpose?: unknown; token?: unknown } } | undefined {
+  let text: string;
+  try {
+    text = fs.readFileSync(file, 'utf8');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+    throw error;
+  }
+  try {
+    const owner = JSON.parse(text) as unknown;
+    return owner && typeof owner === 'object' ? { text, owner } : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+const LOCK_TOKEN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+// Collection never retains ownership, so a collection lock whose process ended has no holder.
+// A marker named for the dead owner's token admits one recovery at a time. The holder rereads the lock after it creates
+// the marker, so a recovery that follows another one finds the new lock and leaves it.
+export function removeAbandonedCollectionLock(file: string): boolean {
+  let marker: string | undefined;
+  try {
+    const held = toolLockOwner(file);
+    if (held?.owner.purpose !== 'collection' || !processGone(held.owner.pid)) return false;
+    const token = held.owner.token;
+    if (typeof token !== 'string' || !LOCK_TOKEN.test(token)) return false;
+    fs.closeSync(fs.openSync(`${file}.${token}.recovering`, 'wx', 0o600));
+    marker = `${file}.${token}.recovering`;
+    if (fs.readFileSync(file, 'utf8') !== held.text) return false;
+    fs.unlinkSync(file);
+    return true;
+  } catch {
+    return false;
+  } finally {
+    try {
+      if (marker) fs.unlinkSync(marker);
+    } catch {
+      // A marker that remains admits no recovery of a lock that no longer exists.
+    }
+  }
+}
+
+// Release collection holds the lock briefly, so setup waits for it and still refuses any other owner at once.
+// A lock without a written owner is waited for, because its creator writes the owner right after it creates the file.
+export async function acquireToolLockAfterCollection(
+  file: string,
+  signal: AbortSignal,
+): Promise<ReturnType<typeof acquireToolLock>> {
+  let refusal: Error;
+  try {
+    return acquireToolLock(file);
+  } catch (error) {
+    if ((error as Error & { cause?: NodeJS.ErrnoException }).cause?.code !== 'EEXIST') throw error;
+    refusal = error as Error;
+  }
+  // A complete owner other than collection, or an unreadable lock, refuses setup at once.
+  const refuse = () => {
+    let held: ReturnType<typeof toolLockOwner>;
+    try {
+      held = toolLockOwner(file);
+    } catch {
+      throw refusal;
+    }
+    if (held !== undefined && held.owner.purpose !== 'collection') throw refusal;
+    return undefined;
+  };
+  refuse();
+  const result = await waitForToolLock(file, signal, refuse);
+  return result as ReturnType<typeof acquireToolLock>;
 }
 
 export function retainedToolOwnership(error: unknown): boolean {

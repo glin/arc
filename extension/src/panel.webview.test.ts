@@ -6655,6 +6655,7 @@ test('channel construction failure leaves panel activation and provider registra
     TerminalTools: function () {
       return { refresh: async () => {} };
     },
+    scheduleReleaseCollection: () => ({ collect() {}, dispose() {} }),
     LaunchPolicyStore,
     path,
     arcHome: () => '/Arc',
@@ -43134,6 +43135,7 @@ test('panel opening and configuration refresh never offer global hooks while exp
   const refresh = statementFrom(source, source.indexOf('const refreshSnapshots ='));
   const compiled = esbuild.transformSync(
     `let privatePreparation, invalidatePreparedDefaults, snapshotPanelOpened = true;
+    const releaseCollection = { collect() {} };
     ${state}
     ${refresh}
     return refreshSnapshots;`,

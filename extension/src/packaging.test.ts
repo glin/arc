@@ -949,6 +949,7 @@ test.for(launcherShells)(
       vscode: { workspace: { isTrusted: true, workspaceFolders: [] }, ExtensionMode: { Development: 2 } },
       toolRoot: () => path.join(root, 'software with spaces'),
       prepareEditorCommands: async () => bin,
+      scheduleReleaseCollection: () => ({ collect() {}, dispose() {} }),
       path,
       os: { hostname: () => 'fixture-host' },
       process: { execPath: editor },

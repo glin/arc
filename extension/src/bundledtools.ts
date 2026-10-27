@@ -8,8 +8,10 @@ import type { SessionSkillRelease } from './sessionskills';
 import { writeFileAtomically } from './atomicfile';
 import {
   acquireToolLock,
+  acquireToolLockAfterCollection,
   admitToolPath,
   canonicalToolPath,
+  removeAbandonedCollectionLock,
   retainedToolOwnership,
   waitForToolLock,
 } from './toolownership';
@@ -228,6 +230,315 @@ function jsonFile(file: string): unknown {
   if (fs.statSync(file).size > 128 * 1024) throw new Error(`Arc setup cannot read ${file}.`);
   return JSON.parse(fs.readFileSync(file, 'utf8'));
 }
+function checkToolOwnership(root: string): void {
+  const tools = path.join(root, 'tools');
+  const marker = path.join(tools, 'ownership.json');
+  if (!fs.existsSync(marker) || JSON.stringify(jsonFile(marker)) !== JSON.stringify({ schemaVersion: 1, root }))
+    throw new Error(`Arc setup cannot replace unfamiliar files in ${tools}.`);
+}
+
+const RELEASE_NAME = /^[a-f0-9]{64}$/;
+const TEMPORARY_NAME = /^\.(?:staging|retired)-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const MINUTE = 60_000;
+export const RELEASE_RETENTION = Object.freeze({
+  restampMs: 10 * MINUTE,
+  confirmMs: 15 * MINUTE,
+  temporaryMs: 60 * MINUTE,
+  unusedMs: 7 * 24 * 60 * MINUTE,
+  recent: 2,
+  perPass: 16,
+});
+
+// A stamp's modification time records the latest use of a release. Stamps write only into owned storage.
+function stampRelease(root: string, contentId: string, time: number): boolean {
+  try {
+    const tools = admitToolPath(path.join(root, 'tools'));
+    if (!RELEASE_NAME.test(contentId) || !fs.existsSync(tools)) return false;
+    checkToolOwnership(root);
+    const used = admitToolPath(path.join(tools, 'used'));
+    if (!fs.existsSync(used)) fs.mkdirSync(used, { recursive: true });
+    const leaf = path.join(used, contentId);
+    // An existing stamp gets only a new modification time.
+    try {
+      if (!fs.lstatSync(leaf).isFile()) return false;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') return false;
+      fs.writeFileSync(leaf, '', { flag: 'wx', mode: 0o600 });
+    }
+    fs.utimesSync(leaf, new Date(time), new Date(time));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Returns the release that a prepared launcher directory belongs to, or undefined for development commands.
+export function releaseContentId(directory: string, root: string): string | undefined {
+  const release = path.dirname(directory);
+  const contentId = path.basename(release);
+  if (path.basename(directory) !== 'launchers' || !RELEASE_NAME.test(contentId)) return undefined;
+  const releases = canonicalToolPath(path.join(admitToolPath(root), 'tools', 'releases'));
+  return canonicalToolPath(path.dirname(release)) === releases ? contentId : undefined;
+}
+
+// Each collect() stamps the window's selected release and runs a collection pass. The timer calls it every 10 minutes. Development commands get no stamp.
+export function scheduleReleaseCollection(
+  selected: () => string | undefined,
+  root: () => string = () => toolRoot(),
+  collector = new ReleaseCollector(),
+): { collect(): void; dispose(): void } {
+  const collect = () => {
+    try {
+      const directory = selected();
+      const home = root();
+      const contentId = directory && releaseContentId(directory, home);
+      if (contentId) collector.run(home, contentId);
+    } catch {
+      // Collection retries at the next interval.
+    }
+  };
+  const timer = setInterval(collect, RELEASE_RETENTION.restampMs);
+  return { collect, dispose: () => clearInterval(timer) };
+}
+
+export interface ReleaseClock {
+  now(): number;
+  monotonic(): number;
+}
+
+// One collector belongs to one editor window. Pending candidates live in memory, so a reload starts over.
+export class ReleaseCollector {
+  private readonly pending = new Map<string, { stamp: number; seen: number }>();
+  private root: string | undefined;
+  constructor(
+    private readonly clock: ReleaseClock = { now: Date.now, monotonic: () => performance.now() },
+    private readonly limit: number = RELEASE_RETENTION.perPass,
+  ) {}
+
+  // Stamps the window's release, then runs one pass. A failed stamp skips the pass.
+  run(root: string, contentId: string): void {
+    root = admitToolPath(root);
+    if (root !== this.root) this.pending.clear();
+    this.root = root;
+    if (!stampRelease(root, contentId, this.clock.now())) return;
+    const file = path.join(root, 'tools', '.install.lock');
+    let lock: ReturnType<typeof acquireToolLock>;
+    try {
+      checkToolOwnership(root);
+      try {
+        lock = acquireToolLock(file, 'collection');
+      } catch (error) {
+        if (!removeAbandonedCollectionLock(file)) throw error;
+        lock = acquireToolLock(file, 'collection');
+      }
+    } catch {
+      return;
+    }
+    const retired: string[] = [];
+    try {
+      this.collect(root, retired);
+    } catch {
+      // An unreadable folder or selection leaves storage for a later pass.
+    } finally {
+      lock.release();
+    }
+    for (const folder of retired)
+      try {
+        admitToolPath(folder);
+        fs.rmSync(folder, { recursive: true, force: true });
+      } catch {
+        // A later pass deletes the retired folder after one hour.
+      }
+  }
+
+  private collect(root: string, retired: string[]): void {
+    const tools = path.join(root, 'tools');
+    const releases = admitToolPath(path.join(tools, 'releases'));
+    const used = admitToolPath(path.join(tools, 'used'));
+    if (!fs.existsSync(releases)) return;
+    const now = this.clock.now();
+    const folder = (name: string) => {
+      const stat = fs.lstatSync(path.join(releases, name));
+      return stat.isDirectory() && !stat.isSymbolicLink() ? stat : undefined;
+    };
+    const entries = fs.readdirSync(releases);
+    const names = entries.filter((name) => RELEASE_NAME.test(name) && folder(name));
+    const migrated = path.join(used, '.migrated');
+    if (!fs.existsSync(migrated)) {
+      // Windows on builds without stamps register nothing, so every release starts a full retention period.
+      for (const name of names) if (!stampRelease(root, name, now)) return;
+      writeFileAtomically(migrated, '{}\n', fs.renameSync, 0o600);
+      this.pending.clear();
+      return;
+    }
+    // Another window can retire a release that this window still records as pending.
+    for (const name of this.pending.keys()) if (!names.includes(name)) this.pending.delete(name);
+    const temporary = entries.filter((name) => TEMPORARY_NAME.test(name));
+    const listed = path.join(used, '.collected');
+    let collected: unknown;
+    try {
+      collected = jsonFile(listed);
+    } catch {
+      // A missing or unreadable list makes the pass due, and the pass rewrites it.
+    }
+    if (
+      !this.pending.size &&
+      !temporary.length &&
+      Array.isArray(collected) &&
+      names.every((name) => collected.includes(name))
+    )
+      return;
+    const keep = selectedReleases(tools);
+    // A stamp that is not a regular file keeps its release. A release without a stamp uses its folder time.
+    const stampFile = (name: string) => {
+      try {
+        const stat = fs.lstatSync(path.join(used, name));
+        return stat.isFile() ? stat.mtimeMs : Infinity;
+      } catch (error) {
+        return (error as NodeJS.ErrnoException).code === 'ENOENT' ? undefined : Infinity;
+      }
+    };
+    const files = new Map(names.map((name) => [name, stampFile(name)]));
+    const stamps = new Map(names.map((name) => [name, files.get(name) ?? folder(name)?.mtimeMs ?? Infinity]));
+    const ordered = [...names].sort((a, b) => stamps.get(b)! - stamps.get(a)!);
+    for (const name of ordered.slice(0, RELEASE_RETENTION.recent)) keep.add(name);
+    for (const name of names) if (now - stamps.get(name)! < RELEASE_RETENTION.unusedMs) keep.add(name);
+    const seen = this.clock.monotonic();
+    const present = new Set(names);
+    let count = 0;
+    for (const name of names) {
+      const stamp = stamps.get(name)!;
+      const release = path.join(releases, name);
+      if (keep.has(name) || !namedRelease(release, name)) {
+        this.pending.delete(name);
+        continue;
+      }
+      const pending = this.pending.get(name);
+      if (!pending || pending.stamp !== stamp) {
+        this.pending.set(name, { stamp, seen });
+        continue;
+      }
+      if (seen - pending.seen < RELEASE_RETENTION.confirmMs || count >= this.limit) continue;
+      count++;
+      if (!candidateRelease(release, name)) {
+        this.pending.delete(name);
+        continue;
+      }
+      const target = path.join(releases, `.retired-${randomUUID()}`);
+      try {
+        fs.renameSync(release, target);
+      } catch {
+        // An open file inside the release refuses the rename on Windows. A later pass retries.
+        continue;
+      }
+      this.pending.delete(name);
+      try {
+        // A renamed folder keeps the release's time. The retirement time starts the one-hour rule for temporary folders.
+        fs.utimesSync(target, new Date(now), new Date(now));
+      } catch {
+        // The folder keeps the release's time, so a later pass deletes it sooner.
+      }
+      if (stampFile(name) !== files.get(name)) {
+        // A window stamped the release after the last reread, so the release returns to its name.
+        try {
+          fs.renameSync(target, release);
+        } catch {
+          // The release keeps its retired name, and a pass deletes it one hour after its retirement.
+          // A window that already prepared commands from the release does not prepare them again.
+        }
+        continue;
+      }
+      present.delete(name);
+      retired.push(target);
+    }
+    for (const name of temporary) {
+      const stat = folder(name);
+      if (stat && now - stat.mtimeMs >= RELEASE_RETENTION.temporaryMs) retired.push(path.join(releases, name));
+    }
+    if (fs.existsSync(used))
+      for (const name of fs.readdirSync(used)) {
+        const leaf = path.join(used, name);
+        if (!RELEASE_NAME.test(name) || present.has(name) || !fs.lstatSync(leaf).isFile()) continue;
+        try {
+          fs.unlinkSync(leaf);
+        } catch {
+          // A later pass retries the stamp.
+        }
+      }
+    if (!this.pending.size)
+      writeFileAtomically(listed, JSON.stringify([...present].sort()) + '\n', fs.renameSync, 0o600);
+  }
+}
+
+// Every selection names a release that stays at any age. An unreadable selection stops the pass.
+function selectedReleases(tools: string): Set<string> {
+  const keep = new Set<string>();
+  const add = (value: unknown) => {
+    if (value === null || value === undefined) return;
+    if (typeof value !== 'string' || !RELEASE_NAME.test(value)) throw new Error('Arc cannot read a release selection.');
+    keep.add(value);
+  };
+  // An entry that lstat finds counts as present, so a dangling link or an unreadable entry stops the pass.
+  const present = (file: string) => {
+    try {
+      fs.lstatSync(file);
+      return true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+      throw error;
+    }
+  };
+  const active = path.join(tools, 'active.json');
+  if (present(active)) add((jsonFile(active) as { contentId?: unknown } | null)?.contentId ?? false);
+  const journal = path.join(tools, 'command-operation.json');
+  if (present(journal)) {
+    const selection = (jsonFile(journal) as { selection?: { previous?: unknown; next?: unknown } } | null)?.selection;
+    if (!selection || (selection.previous !== null && typeof selection.previous !== 'string'))
+      throw new Error('Arc cannot read a release selection.');
+    for (const text of [selection.previous, selection.next])
+      if (text !== null) {
+        if (typeof text !== 'string') throw new Error('Arc cannot read a release selection.');
+        add((JSON.parse(text) as { contentId?: unknown } | null)?.contentId ?? false);
+      }
+  }
+  const claude = admitToolPath(path.join(tools, 'claude'));
+  if (fs.existsSync(claude))
+    for (const name of fs.readdirSync(claude)) {
+      const registration = path.join(claude, name, 'registration.json');
+      if (!present(registration)) continue;
+      const data = jsonFile(registration) as { contentId?: unknown; previousContentId?: unknown } | null;
+      add(data?.contentId ?? false);
+      add(data?.previousContentId);
+    }
+  return keep;
+}
+
+// A folder whose release.json names it can become a pending candidate. Only cheap reads run here.
+function namedRelease(release: string, name: string): ToolPayload | undefined {
+  try {
+    const stat = fs.lstatSync(release);
+    if (!stat.isDirectory() || stat.isSymbolicLink()) return undefined;
+    const payload = jsonFile(path.join(release, 'release.json')) as ToolPayload;
+    return payload?.contentId === name ? payload : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+// Only a folder with the exact identity that Arc stages counts as a release. Unfamiliar contents stay.
+function candidateRelease(release: string, name: string): boolean {
+  try {
+    const payload = namedRelease(release, name);
+    if (!payload) return false;
+    const { contentId, ...content } = payload;
+    if (contentId !== digest(JSON.stringify(content))) return false;
+    validateToolFiles(release, payload.files, ['release.json']);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function save(file: string, value: unknown): void {
   admitToolPath(path.dirname(file));
   if (fs.existsSync(file) && fs.lstatSync(file).isSymbolicLink())
@@ -290,19 +601,18 @@ export class BundledTools {
   }
 
   private checkOwnership(): void {
-    const marker = path.join(this.tools, 'ownership.json');
-    if (
-      !fs.existsSync(marker) ||
-      JSON.stringify(jsonFile(marker)) !== JSON.stringify({ schemaVersion: 1, root: this.root })
-    )
-      throw new Error(`Arc setup cannot replace unfamiliar files in ${this.tools}.`);
+    checkToolOwnership(this.root);
+  }
+
+  stamp(): boolean {
+    return stampRelease(this.root, this.bundle.payload.contentId, Date.now());
   }
 
   async owned<T>(operation: (token: string) => Promise<T>, signal: AbortSignal, wait = false): Promise<T> {
     if (signal.aborted) throw new Error('Arc setup was canceled.');
     this.claim();
     const file = path.join(this.tools, '.install.lock');
-    const lock = wait ? await waitForToolLock(file, signal) : acquireToolLock(file);
+    const lock = wait ? await waitForToolLock(file, signal) : await acquireToolLockAfterCollection(file, signal);
     let retain = false;
     try {
       this.claim();
@@ -386,6 +696,7 @@ export class BundledTools {
 
   publish(home: string, token: string): void {
     const release = this.stage();
+    this.stamp();
     const location = this.configuration(home);
     const previous = this.registration(home);
     const claim = path.join(this.tools, `configuration-${digest(canonicalToolPath(home))}.json`);
@@ -482,7 +793,15 @@ export class BundledTools {
     const ready = () => {
       admitToolPath(this.tools);
       if (fs.existsSync(this.tools)) this.checkOwnership();
-      const release = this.existingRelease();
+      // A failed stamp in existing storage takes the locked path, which stages and stamps the release again.
+      if (!this.stamp() && fs.existsSync(this.tools)) return undefined;
+      let release: string | undefined;
+      try {
+        release = this.existingRelease();
+      } catch (error) {
+        // A release that collection retires during this read counts as missing and stages again under the lock.
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      }
       return release && path.join(release, 'launchers');
     };
     const existing = ready();
@@ -495,7 +814,9 @@ export class BundledTools {
       this.claim();
       validateToolFiles(this.bundle.directory, this.bundle.payload.files);
       if (signal.aborted) throw new Error('Arc setup was canceled.');
-      return path.join(this.stage(), 'launchers');
+      const release = this.stage();
+      this.stamp();
+      return path.join(release, 'launchers');
     } catch (error) {
       retain = retainedToolOwnership(error);
       throw error;
@@ -508,6 +829,7 @@ export class BundledTools {
     const node = probeToolRuntime(runtime);
     return this.owned(async () => {
       this.stage();
+      this.stamp();
       const bin = path.join(this.root, 'bin');
       admitToolPath(bin);
       const marker = path.join(bin, '.arc-commands.json');
@@ -539,7 +861,8 @@ export class BundledTools {
         )
           throw new Error(`Arc setup found changed or unfamiliar commands in ${bin}. Preserve them before retrying.`);
       }
-      const runner = `const fs=require('node:fs'),path=require('node:path');try{const root=path.resolve(__dirname,'..');const active=JSON.parse(fs.readFileSync(path.join(root,'tools','active.json'),'utf8'));if(!/^[a-f0-9]{64}$/.test(active.contentId))throw Error('Arc command selection is unreadable.');require(path.join(root,'tools','releases',active.contentId,'cli',${JSON.stringify(ARC_IDENTITY.cliExecutable + '.cjs')}));}catch(e){console.error('Arc command unavailable. Rerun the source command installer. '+e.message);process.exitCode=1;}\n`;
+      // Collection can retire the selected release after a newer installation, so a missing release rereads the selection once.
+      const runner = `const fs=require('node:fs'),path=require('node:path');try{const root=path.resolve(__dirname,'..');const select=()=>{const active=JSON.parse(fs.readFileSync(path.join(root,'tools','active.json'),'utf8'));if(!/^[a-f0-9]{64}$/.test(active.contentId))throw Error('Arc command selection is unreadable.');return path.join(root,'tools','releases',active.contentId,'cli',${JSON.stringify(ARC_IDENTITY.cliExecutable + '.cjs')});};const first=select();try{require(first);}catch(e){if(e.code!=='MODULE_NOT_FOUND'||fs.existsSync(first))throw e;const next=select();if(next===first)throw e;require(next);}}catch(e){console.error('Arc command unavailable. Rerun the source command installer. '+e.message);process.exitCode=1;}\n`;
       const quoted = (value: string) => "'" + value.replaceAll("'", "'\\''") + "'";
       if (/[\r\n"]/u.test(node) || /[\r\n"]/u.test(bin) || (process.platform === 'win32' && /%/u.test(node + bin)))
         throw new Error(
