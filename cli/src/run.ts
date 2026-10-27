@@ -18,7 +18,7 @@ import {
 } from '../../extension/src/launchpolicy.ts';
 import { claudeLaunch, codexLaunch, type Machine } from '../../extension/src/composerview.ts';
 import { DispatchReceipts, type StandaloneOptions } from '../../extension/src/dispatchreceipts.ts';
-import { childEnv, unstartable } from '../../extension/src/agenthost.ts';
+import { LAUNCH_ENV_NAMES, childEnv, unstartable } from '../../extension/src/agenthost.ts';
 import {
   waitStandalone,
   waitStandaloneIdentity,
@@ -235,8 +235,7 @@ export function parseRun(args: string[], env = process.env, platform = process.p
       ...addDirs.flatMap((dir) => ['--add-dir', dir]),
     ];
   }
-  for (const key of Object.keys(launchEnv))
-    if (['ARC_WINDOW', 'ARC_EDITOR_EXECUTABLE'].includes(key.toUpperCase())) delete launchEnv[key];
+  for (const key of Object.keys(launchEnv)) if (LAUNCH_ENV_NAMES.includes(key.toUpperCase())) delete launchEnv[key];
   const lifetime = provider === 'claude' ? claudeCacheLifetime(launchEnv, cacheLifetime, options.agentRun) : null;
   if (lifetime) {
     for (const key of Object.keys(launchEnv)) if (key.toUpperCase() === CACHE_TTL_ENV) delete launchEnv[key];

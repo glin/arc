@@ -1634,7 +1634,14 @@ test('absent Claude selection preserves default configuration and original trans
       USERPROFILE: 'foreign-profile',
       CLAUDE_CONFIG_DIR: 'foreign-claude',
       ARC_PROJECTS_ROOT: 'foreign-projects',
+      ARC_SESSION_NONCE: 'a'.repeat(32),
+      arc_session_nonce: 'b'.repeat(32),
     });
+    assert.deepEqual(
+      Object.keys(later).filter((key) => key.toUpperCase() === 'ARC_SESSION_NONCE'),
+      [],
+      'a standalone start cannot compact the session that started it',
+    );
     assert.equal(later.CLAUDE_CONFIG_DIR, explicit ? custom : undefined);
     assert.equal(later.HOME, home);
     assert.equal(later.USERPROFILE, home);
@@ -1931,8 +1938,15 @@ test('standalone delegated Claude cache defaults preserve caller overrides and r
       CODEX_THREAD_ID: session,
       ARC_WINDOW: 'old-window',
       ARC_EDITOR_EXECUTABLE: 'old-editor',
+      ARC_SESSION_NONCE: 'a'.repeat(32),
+      Arc_Session_Nonce: 'b'.repeat(32),
     };
     const delegated = parseRun([...selected, '--agent-run'], inherited);
+    assert.deepEqual(
+      Object.keys(parseRun(selected, inherited).env).filter((key) => key.toUpperCase() === 'ARC_SESSION_NONCE'),
+      [],
+      'a standalone worker cannot compact the session that started it',
+    );
     assert.equal(delegated.env.CLAUDE_CODE_PROMPT_CACHE_TTL, '5m');
     assert.equal(delegated.env.CODEX_THREAD_ID, undefined);
     assert.equal(delegated.env.ARC_WINDOW, undefined);

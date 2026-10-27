@@ -2883,18 +2883,17 @@ export class PanelProvider implements vscode.Disposable {
     ]);
   }
 
+  // Guarded facts that show pending work hold a continuation even while the session rows cannot confirm membership.
   public continuationWork(session: string): 'none' | 'pending' | 'absent' | 'unknown' {
     const work = this.readerWork(session);
-    if (work !== 'none') return work;
+    if (work === 'pending' || work === 'absent') return work;
     const facts = this.guardedTargetFacts(session);
-    if (!facts?.current) return 'unknown';
-    return facts.archived ||
-      facts.queued > 0 ||
-      facts.pendingSubmissions > 0 ||
-      facts.pendingControls > 0 ||
+    if (
+      (facts && (facts.archived || facts.queued > 0 || facts.pendingSubmissions > 0 || facts.pendingControls > 0)) ||
       (this.stateFor(session)?.asks?.length ?? 0) > 0
-      ? 'pending'
-      : 'none';
+    )
+      return 'pending';
+    return work === 'unknown' || !facts?.current ? 'unknown' : 'none';
   }
 
   private applySessionFilter(request: import('./sessionrequests').SessionRequest): Promise<unknown> {
@@ -6312,7 +6311,7 @@ export class PanelProvider implements vscode.Disposable {
     return state.queued.some((entry) => this.queueHandoffs.has(entry.id));
   }
 
-  // Unknown membership holds deferred compaction. Reader retention, delivery, queued prompts and a clear remain pending.
+  // Unknown membership does not hold compaction. Reader retention, delivery, queued prompts and a clear remain pending.
   public readerWork(session: string): 'none' | 'pending' | 'absent' | 'unknown' {
     // Queued input and a clear in progress stay pending while the session rows cannot confirm membership.
     if (

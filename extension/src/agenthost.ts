@@ -123,6 +123,11 @@ export function unstartable(command: string, platform: string): string | null {
 // Every case variant is removed, including on Windows.
 // `childEnv` sets `ELECTRON_RUN_AS_NODE` so VS Code's Electron executable can run a package script.
 // Launch variables restore package-specific settings. Claude billing selection overrides attribution for Claude children.
+// The variables that an Arc CLI launch writes for the child it starts. Standalone launches drop every case variant,
+// so a standalone worker cannot target the window or compact the session that started it.
+export const LAUNCH_ENV_NAMES: readonly string[] = ['WINDOW', 'EDITOR_EXECUTABLE', 'SESSION_NONCE'].map(
+  (name) => ARC_IDENTITY.environmentPrefix + name,
+);
 const HOST_IDENTITY_ENV_NAMES = [
   'CLAUDE_CODE_ENTRYPOINT',
   'CLAUDE_AGENT_SDK_VERSION',
@@ -172,7 +177,7 @@ export function childEnv(
   if (cli) {
     const windowKey = `${ARC_IDENTITY.environmentPrefix}WINDOW`;
     const editorKey = `${ARC_IDENTITY.environmentPrefix}EDITOR_EXECUTABLE`;
-    const tokenKey = `${ARC_IDENTITY.environmentPrefix}SESSION_TOKEN`;
+    const tokenKey = `${ARC_IDENTITY.environmentPrefix}SESSION_NONCE`;
     const pathKeys = (source: Record<string, string | undefined>) => environmentKeys(source, 'PATH');
     const inheritedKey = pathKeys(inherited)[0];
     const wantedKey = pathKeys(wanted)[0];
@@ -180,7 +185,7 @@ export function childEnv(
     for (const key of pathKeys(env)) delete env[key];
     env[inheritedKey ?? 'PATH'] = cli.directory + (value ? (windows ? ';' : ':') + value : '');
     for (const key of Object.keys(env)) {
-      if ([windowKey, editorKey, tokenKey].includes(key.toUpperCase())) delete env[key];
+      if (LAUNCH_ENV_NAMES.includes(key.toUpperCase())) delete env[key];
     }
     env[editorKey] = windows ? cli.editorExecutable.replaceAll('\\', '/') : cli.editorExecutable;
     if (cli.windowId !== null) env[windowKey] = cli.windowId;

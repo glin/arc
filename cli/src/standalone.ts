@@ -24,7 +24,7 @@ import {
   type SessionFile,
 } from '../../extension/src/transcript.ts';
 import { savedDispatchResponse } from '../../extension/src/sessionreads.ts';
-import { childEnv } from '../../extension/src/agenthost.ts';
+import { LAUNCH_ENV_NAMES, childEnv } from '../../extension/src/agenthost.ts';
 import { shortenTo } from '../../extension/src/domain/text.ts';
 import { enumerateRolloutFilesAsync, openingRecordOf, CODEX_OPENING_BYTES } from '../../extension/src/codex.ts';
 
@@ -93,10 +93,7 @@ export function standaloneContext(
 export function standaloneEnvironment(options: StandaloneOptions, inherited = process.env): NodeJS.ProcessEnv {
   const env = childEnv(inherited, {}, options.provider, options.cwd);
   for (const key of Object.keys(env)) {
-    if (
-      ['ARC_WINDOW', 'ARC_EDITOR_EXECUTABLE'].includes(key.toUpperCase()) ||
-      (options.env && CONTEXT_KEYS.includes(key.toUpperCase()))
-    )
+    if (LAUNCH_ENV_NAMES.includes(key.toUpperCase()) || (options.env && CONTEXT_KEYS.includes(key.toUpperCase())))
       delete env[key];
   }
   for (const [key, value] of Object.entries(options.env ?? {}))

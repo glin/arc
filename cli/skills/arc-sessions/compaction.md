@@ -24,7 +24,7 @@ Arc: compaction request WINDOW_ID:UUID runs after this turn. Run arc compact can
 
 Answer the prompt. When the prompt makes the compaction or its continuation wrong, cancel the request with `arc compact cancel`. Request again later with a fresh request ID. Arc compacts after the answering turn unless Stop or another cancelling reader action ends the request.
 
-Read the `state` field of the result. The command returns at once. After `queued`, finish the successful final response. Report the request in the past tense: "I requested compaction after this turn." Arc checks delivery conditions after the turn. Reader intervention can cancel unsubmitted compaction after the last observation, including while you write the final response. Never promise future delivery from `queued` or a status check.
+Read the `state` field of the result. The command returns at once. After `queued`, finish the turn. Report the request in the past tense: "I requested compaction after this turn." Arc checks delivery conditions after the turn. Reader intervention can cancel unsubmitted compaction after the last observation, including while you write the final response. Never promise future delivery from `queued` or a status check.
 
 Arc's after-turn compaction accepts one explicit saved continuation. Use the continuation form below for requested same-session work. Never queue that follow-up before compaction.
 

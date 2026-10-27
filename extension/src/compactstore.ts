@@ -221,9 +221,10 @@ export class CompactStore implements CompactPersistence {
       receipt?.version === 1 &&
       activationValid(receipt.owner) &&
       receipt.binding?.activation === receipt.owner &&
-      typeof receipt.binding.authority === 'string' &&
+      // A session whose row the catalog has not published yet records no authority or source identity.
+      (receipt.binding.authority === undefined || typeof receipt.binding.authority === 'string') &&
       typeof receipt.binding.assignmentId === 'string' &&
-      typeof receipt.binding.sourceIdentity === 'string' &&
+      (receipt.binding.sourceIdentity === undefined || typeof receipt.binding.sourceIdentity === 'string') &&
       Number.isFinite(receipt.admittedAt) &&
       (receipt.terminalAt === null || Number.isFinite(receipt.terminalAt)) &&
       !!continuation &&

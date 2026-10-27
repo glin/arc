@@ -98,7 +98,7 @@ export async function runCompact(args: string[]): Promise<string> {
   }
   // Arc writes a launch token into each agent process it starts. The token names the session, so the window
   // admits the request without first seeing the command run.
-  const token = process.env.ARC_SESSION_TOKEN;
+  const token = process.env.ARC_SESSION_NONCE;
   const request = token && /^[a-f0-9]{32}$/.test(token) ? { ...payload, token } : payload;
   if (!('token' in request)) {
     let reason = COMPACT_REJECTIONS['not-observed'];

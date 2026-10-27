@@ -15,7 +15,7 @@ import { collectRow, collectPage, collectTurns, smokeEnv } from './smoke-fixture
 
 // An agent that Arc launched inherits its launch token. These cases choose the token themselves.
 beforeEach(() => {
-  vi.stubEnv('ARC_SESSION_TOKEN', undefined);
+  vi.stubEnv('ARC_SESSION_NONCE', undefined);
 });
 
 afterEach(() => {
@@ -143,7 +143,7 @@ test('compact readiness accepts a positive in-flight reply after the read-start 
 test('compact request with a launch token goes straight to admission and sends the token', async () => {
   vi.useFakeTimers();
   const token = 'd'.repeat(32);
-  vi.stubEnv('ARC_SESSION_TOKEN', token);
+  vi.stubEnv('ARC_SESSION_NONCE', token);
   const request = vi.spyOn(sessionRequests, 'requestWindow').mockResolvedValue({ state: 'queued' });
   assert.equal(JSON.parse(await runCompact(compactArgs)).state, 'queued');
   assert.deepEqual(
@@ -152,7 +152,7 @@ test('compact request with a launch token goes straight to admission and sends t
   );
   request.mockReset();
   request.mockResolvedValueOnce({ ready: true }).mockResolvedValueOnce({ state: 'queued' });
-  vi.stubEnv('ARC_SESSION_TOKEN', 'D'.repeat(32));
+  vi.stubEnv('ARC_SESSION_NONCE', 'D'.repeat(32));
   assert.equal(JSON.parse(await runCompact(compactArgs)).state, 'queued');
   assert.deepEqual(
     request.mock.calls.map(([method, params]) => [method, 'token' in (params as object)]),

@@ -6060,14 +6060,14 @@ test('Arc CLI environments preserve PATH casing and replace inherited window tar
 
 test('Arc CLI environments carry the session token and drop inherited token variants on each platform', () => {
   const tokenKeys = (env: Record<string, string | undefined>) =>
-    Object.keys(env).filter((name) => name.toUpperCase() === 'ARC_SESSION_TOKEN');
+    Object.keys(env).filter((name) => name.toUpperCase() === 'ARC_SESSION_NONCE');
   for (const platform of ['win32', 'darwin', 'linux']) {
-    const inherited = { PATH: 'inherited', ARC_SESSION_TOKEN: 'stale', Arc_Session_Token: 'other' };
+    const inherited = { PATH: 'inherited', ARC_SESSION_NONCE: 'stale', Arc_Session_Nonce: 'other' };
     const cli = { directory: 'bin', editorExecutable: '/editor', windowId: null, platform };
     const token = '0123456789abcdef0123456789abcdef';
     const env = childEnv(inherited, {}, undefined, undefined, { ...cli, sessionToken: token });
-    assert.deepEqual(tokenKeys(env), ['ARC_SESSION_TOKEN'], platform);
-    assert.equal(env.ARC_SESSION_TOKEN, token, platform);
+    assert.deepEqual(tokenKeys(env), ['ARC_SESSION_NONCE'], platform);
+    assert.equal(env.ARC_SESSION_NONCE, token, platform);
     assert.deepEqual(tokenKeys(childEnv(inherited, {}, undefined, undefined, cli)), [], platform);
   }
 });
@@ -6184,6 +6184,9 @@ test('Arc CLI targeting reaches fresh, resumed, draft, idle, and rename children
       const key = Object.keys(env).find((name) => name.toUpperCase() === 'PATH')!;
       assert.ok(env[key].startsWith('Arc bin' + path.delimiter));
     }
+    const nonces = seen.slice(0, plans.length).map((env) => env.ARC_SESSION_NONCE);
+    for (const nonce of nonces) assert.match(nonce, /^[a-f0-9]{32}$/, 'each spawned session carries its nonce');
+    assert.equal(new Set(nonces).size, nonces.length);
   } finally {
     host.dispose();
   }

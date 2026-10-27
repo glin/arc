@@ -2282,6 +2282,15 @@ test('active native turn bindings survive later requests in the same retained ch
 });
 
 const tokenPayload = { ...compactPayload, token: 'c'.repeat(32) };
+const claudeRootEnd: NativeEvent = {
+  provider: 'claude',
+  sessionId: 'self',
+  turnId: null,
+  generation: 1,
+  evidence: {},
+  kind: 'rootEnd',
+  success: true,
+};
 
 // The owner's report: after a window reload, with the session listing stale, the session's own request was refused.
 test('a token request after a window reload is queued and delivered while the listing is stale', async () => {
@@ -2319,8 +2328,7 @@ test('a token request after a window reload is queued and delivered while the li
     8,
   );
   state.busy = false;
-  await host.drain('self');
-  assert.equal(fixture.writes, 1);
+  await vi.waitFor(() => assert.equal(fixture.writes, 1));
   assert.equal(compactState(host), 'uncertain');
   assert.equal(refreshes, 0);
 });
@@ -2342,12 +2350,10 @@ test('an observed continuation request is admitted and delivered while discovery
   host.native(child, compactEvent('toolEnd', extra), 7);
   host.native(child, compactEvent('rootEnd', extra), 7);
   state.busy = false;
-  await host.drain('self');
-  assert.equal(fixture.writes, 1);
+  await vi.waitFor(() => assert.equal(fixture.writes, 1));
   finishCompact(fixture);
   state.busy = false;
-  await host.drain('self');
-  assert.deepEqual(fixture.continuationWrites, [continuationText]);
+  await vi.waitFor(() => assert.deepEqual(fixture.continuationWrites, [continuationText]));
   assert.equal(refreshes, 0);
 });
 
@@ -2377,4 +2383,92 @@ test('a token request takes its tool and turn from a later tool start and a toke
     state: 'refused',
     reason: 'Arc holds no live session for this token. No compaction was queued.',
   });
+});
+
+// Catches a token request from a background task of an idle session that waits for a root ending that never comes.
+test('a token request after the session turn already ended is delivered without another root ending', async () => {
+  const { fixture } = compactHostFixture('claude');
+  const { host, child, state } = fixture;
+  host.submitted(child, 7);
+  host.native(child, claudeRootEnd, 7);
+  state.busy = false;
+  assert.equal((host.handle({ method: 'compact-request', params: tokenPayload }) as { state: string }).state, 'queued');
+  await host.drain('self');
+  assert.equal(fixture.writes, 1);
+  assert.deepEqual(host.requests.waitingSessions(), []);
+});
+
+// Catches one turn that compacts twice: a token request admitted before Arc saw the turn start and a second after a tool start.
+test('a turn holds one token request across a later tool start in the same submission', async () => {
+  const { fixture } = compactHostFixture('claude');
+  const { host, child, state } = fixture;
+  const other = { provider: 'claude', generation: 1, toolId: 'other', command: 'ls' };
+  host.submitted(child, 7);
+  assert.equal((host.handle({ method: 'compact-request', params: tokenPayload }) as { state: string }).state, 'queued');
+  host.native(child, compactEvent('toolStart', other), 7);
+  const second = { ...tokenPayload, requestId: compactWindow + ':bbbbbbbb-1111-2222-3333-444444444444' };
+  assert.deepEqual(host.handle({ method: 'compact-request', params: second }), {
+    requestId: second.requestId,
+    state: 'refused',
+    reason: 'This turn already has a pending compaction request.',
+  });
+  host.native(child, compactEvent('toolEnd', other), 7);
+  host.native(child, claudeRootEnd, 7);
+  state.busy = false;
+  await host.drain('self');
+  finishCompact(fixture);
+  state.busy = false;
+  await host.drain('self');
+  assert.equal(fixture.writes, 1);
+});
+
+// Catches a carried request that waits for a rows refresh that a catalog which never publishes the session never runs.
+test('a rejected reader prompt releases held compaction while session membership is unknown', async () => {
+  const { fixture } = compactHostFixture();
+  let refreshes = 0;
+  fixture.host.sessionsRefreshed = () => {
+    refreshes++;
+  };
+  admittedCompaction(fixture);
+  fixture.host.readerAction('self', false, 'send');
+  fixture.work = 'unknown';
+  await assert.rejects(
+    promptAsReader(fixture.host, fixture.child, async () => {
+      throw new Error('refused');
+    }),
+    /refused/,
+  );
+  await finishRequest(fixture);
+  assert.equal(fixture.writes, 1);
+  assert.equal(refreshes, 0);
+});
+
+// The owner's failing command carried a continuation while the catalog had not published the session's row.
+test('a token continuation request is saved and delivered by the window store while the session row is unpublished', async () => {
+  const store = new CompactStore(
+    tempDir('continuation-unpublished-'),
+    compactWindow,
+    () => 0,
+    () => false,
+  );
+  const { fixture } = compactHostFixture('claude', store);
+  const { host, child, state } = fixture;
+  fixture.work = 'unknown';
+  fixture.authority = null;
+  host.submitted(child, 7);
+  const ack = (await host.handle({
+    method: 'compact-request',
+    params: { ...continuationPayload, token: 'c'.repeat(32) },
+  })) as { state: string; reason?: string };
+  assert.equal(ack.state, 'queued', ack.reason);
+  host.native(child, claudeRootEnd, 7);
+  state.busy = false;
+  await vi.waitFor(() => assert.equal(fixture.writes, 1));
+  finishCompact(fixture);
+  state.busy = false;
+  await vi.waitFor(() => assert.deepEqual(fixture.continuationWrites, [continuationText]));
+  assert.equal(store.read(continuationPayload.requestId)?.binding.sourceIdentity, undefined);
+  const reader = compactHostFixture('claude', store).fixture;
+  assert.equal(compactState(reader.host), 'unavailable', 'a receipt without a source identity stays in its window');
+  host.dispose();
 });

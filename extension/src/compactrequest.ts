@@ -460,11 +460,13 @@ export class CompactRequests {
   }
 
   // Admits a request on its observed live call. A request that its launch token proves comes with
-  // `bound`, the binding of the child that holds the token, and needs no observed call.
+  // `bound`, the binding of the child that holds the token, and needs no observed call. `ended` says
+  // that the bound turn already ended and the child is idle, so no later root ending is needed.
   admit(
     payload: CompactPayload,
     eligible: (binding: Readonly<CompactBinding>) => boolean,
     bound?: Readonly<CompactBinding>,
+    ended = false,
   ): Readonly<CompactObservation> {
     this.prune();
     const live = [...this.calls].find(
@@ -500,17 +502,23 @@ export class CompactRequests {
       throw new Error(readiness.ready ? COMPACT_REJECTIONS['not-observed'] : readiness.reason);
     }
     const key = live?.[0];
-    const call = live?.[1] ?? { binding: bound!, toolId: '', turnEnded: false };
+    const call = live?.[1] ?? { binding: bound!, toolId: '', turnEnded: ended };
     if (!eligible(call.binding)) throw new Error(COMPACT_REJECTIONS.withdrawn);
     if (payload.continuation && !this.persistence)
       throw new Error('This continuation cannot be saved for the session.');
+    // A request without an observed call names the child's last known turn, which can lag the turn's
+    // later events. Such a request matches every request of the same submission.
+    const sameTurn = (a: Assignment) =>
+      a.floating || !live || a.binding.turn === '' || call.binding.turn === ''
+        ? a.binding.submissionId === call.binding.submissionId
+        : a.binding.turn === call.binding.turn &&
+          (call.binding.provider === 'codex' || a.binding.submissionId === call.binding.submissionId);
     if (
       [...this.assignments.values()].some(
         (a) =>
           a.binding.sessionId === call.binding.sessionId &&
           a.binding.childGeneration === call.binding.childGeneration &&
-          a.binding.turn === call.binding.turn &&
-          (call.binding.provider === 'codex' || a.binding.submissionId === call.binding.submissionId) &&
+          sameTurn(a) &&
           ['queued', 'started', 'uncertain'].includes(a.observation.state),
       )
     )
@@ -564,6 +572,7 @@ export class CompactRequests {
     payload: CompactPayload,
     eligible: (binding: Readonly<CompactBinding>) => boolean,
     bound?: Readonly<CompactBinding>,
+    ended = false,
   ): Promise<Readonly<CompactObservation>> {
     const pending = this.admissions.get(payload.requestId);
     if (pending) {
@@ -574,7 +583,7 @@ export class CompactRequests {
     }
     let observation: Readonly<CompactObservation>;
     try {
-      observation = this.admit(payload, eligible, bound);
+      observation = this.admit(payload, eligible, bound, ended);
     } catch (error) {
       return Promise.reject(error);
     }
@@ -1100,7 +1109,7 @@ export interface CompactHostPort<C extends CompactChild> {
   // Runs work under an activity lease on this exact child. It resolves null without opening a missing child.
   withActivity(child: C, work: (live: C) => Promise<void>): Promise<unknown>;
   // Names queued reader prompts or a clear in progress as pending. Pending reader work blocks delivery.
-  // Unknown membership holds a released reader carry until the session rows refresh.
+  // Unknown membership counts as no reader work.
   readerWork(sessionId: string): 'none' | 'pending' | 'absent' | 'unknown';
   // Stable physical source, current scope, cwd and effective setup, recorded in a continuation receipt.
   authority?(provider: 'claude' | 'codex', sessionId: string): string | null;
@@ -1120,13 +1129,13 @@ const SUBMISSIONS_PER_CHILD = 32;
 export class CompactHost<C extends CompactChild> {
   readonly requests: CompactRequests;
   private readonly revisions = new Map<string, number>();
-  private readonly deferredReleases = new Set<string>();
   private readonly generations = new WeakMap<C, number>();
   private readonly children = new Map<string, C>();
   private readonly submissions = new WeakMap<C, Map<number, Submission>>();
   private readonly bindings = new WeakMap<C, Map<string, CompactBinding>>();
-  // The last root turn Arc saw from each child, which a token request binds to before its tool start arrives.
-  private readonly latest = new WeakMap<C, { sessionId: string; turn: string; submissionId: string }>();
+  // The last root turn Arc saw from each child, which a token request binds to before its tool start arrives,
+  // and whether Arc saw that turn's root ending.
+  private readonly latest = new WeakMap<C, { sessionId: string; turn: string; submissionId: string; ended: boolean }>();
   private readonly observations = new WeakMap<
     NativeEvent,
     Pick<CompactBinding, 'childGeneration' | 'readerRevision' | 'authority' | 'sourceIdentity'>
@@ -1172,20 +1181,13 @@ export class CompactHost<C extends CompactChild> {
   }
 
   // Rejected submissions lose their turn. Accepted input keeps its hold until native answering evidence arrives.
-  // Unknown scope defers the release check until session rows refresh.
+  // Unknown membership releases held work like no reader work, because a catalog that never publishes the session never confirms it.
   unsent(child: C | string, rejectedTurn?: number): void {
     const sessionId = typeof child === 'string' ? child : child.state().sessionId;
     if (!sessionId || this.disposed) return;
     const heldRequests = this.requests.carriable(sessionId);
     if (rejectedTurn !== undefined) for (const held of heldRequests) held.carry?.delete(String(rejectedTurn));
-    const work = this.port.readerWork(sessionId);
-    if (work === 'unknown') {
-      if (heldRequests.some((held) => held.carry)) this.deferredReleases.add(sessionId);
-      else this.deferredReleases.delete(sessionId);
-      return;
-    }
-    this.deferredReleases.delete(sessionId);
-    if (work === 'pending') return;
+    if (this.port.readerWork(sessionId) === 'pending') return;
     let released = false;
     for (const held of heldRequests)
       if (held.carry && !held.carry.size) {
@@ -1208,11 +1210,9 @@ export class CompactHost<C extends CompactChild> {
     );
   }
 
-  // Runs after each full rows refresh. Held work whose reader message settled while membership was unknown
-  // is released, and waiting work drains again.
+  // Runs after each full rows refresh. Waiting work drains again.
   sessionsRefreshed(): void {
     if (this.disposed) return;
-    for (const sessionId of this.deferredReleases) this.unsent(sessionId);
     for (const sessionId of this.requests.waitingSessions()) void this.drain(sessionId);
   }
 
@@ -1230,7 +1230,7 @@ export class CompactHost<C extends CompactChild> {
     if (book.size > SUBMISSIONS_PER_CHILD) book.delete(book.keys().next().value!);
     this.generationOf(child);
     const sessionId = child.state().sessionId;
-    if (sessionId) this.latest.set(child, { sessionId, turn: '', submissionId: String(turnId) });
+    if (sessionId) this.latest.set(child, { sessionId, turn: '', submissionId: String(turnId), ended: false });
     if (origin === 'reader' && sessionId) this.requests.noteTurn(sessionId, String(turnId));
   }
 
@@ -1271,7 +1271,12 @@ export class CompactHost<C extends CompactChild> {
     const turn =
       child.agent === 'claude' ? (event.generation === null ? null : String(event.generation)) : event.turnId;
     if (turnId !== undefined && turn && event.provider === child.agent)
-      this.latest.set(child, { sessionId: event.sessionId, turn, submissionId: String(turnId) });
+      this.latest.set(child, {
+        sessionId: event.sessionId,
+        turn,
+        submissionId: String(turnId),
+        ended: event.kind === 'rootEnd',
+      });
     const binding = this.binding(child, event, turnId);
     if (event.kind === 'toolStart' && (!binding || !event.initiating)) this.requests.reject(event.command, 'withdrawn');
     if (event.kind === 'rootEnd') {
@@ -1481,17 +1486,18 @@ export class CompactHost<C extends CompactChild> {
     try {
       if (request.method !== 'compact-request' || !validCompactPayload(params))
         throw new Error('This compaction request is unavailable in this Arc window.');
-      const bound = params.token === undefined ? undefined : this.tokenBinding(params.token);
-      if (bound === null) throw new Error('Arc holds no live session for this token. No compaction was queued.');
+      const token = params.token === undefined ? undefined : this.tokenBinding(params.token);
+      if (token === null) throw new Error('Arc holds no live session for this token. No compaction was queued.');
+      const [bound, ended] = [token?.binding, token?.ended ?? false];
       if (params.continuation)
         return this.requests
-          .admitSaved(params, (binding) => this.eligible(binding, 'admit'), bound)
+          .admitSaved(params, (binding) => this.eligible(binding, 'admit'), bound, ended)
           .catch((error: unknown) => ({
             requestId: params.requestId,
             state: 'refused',
             reason: error instanceof Error ? error.message : 'Compaction was refused.',
           }));
-      return this.requests.admit(params, (binding) => this.eligible(binding, 'admit'), bound);
+      return this.requests.admit(params, (binding) => this.eligible(binding, 'admit'), bound, ended);
     } catch (error) {
       return {
         requestId: params.requestId,
@@ -1504,7 +1510,6 @@ export class CompactHost<C extends CompactChild> {
   dispose(): void {
     this.disposed = true;
     this.cancels.clear();
-    this.deferredReleases.clear();
     this.requests.dispose();
     this.persistence?.release();
   }
@@ -1525,8 +1530,9 @@ export class CompactHost<C extends CompactChild> {
   }
 
   // Binds a token request to the live child that holds the token, on the last turn Arc saw from it.
-  // The request's own tool start, when Arc sees it, replaces that turn with the exact one.
-  private tokenBinding(token: string): CompactBinding | null {
+  // The request's own tool start, when Arc sees it, replaces that turn with the exact one. A request from
+  // a background task of an idle session arrives after that turn's root ending, so its turn has already ended.
+  private tokenBinding(token: string): { binding: CompactBinding; ended: boolean } | null {
     const child = this.port.findToken?.(token) ?? null;
     const provider = child?.agent;
     const state = child?.state();
@@ -1535,11 +1541,12 @@ export class CompactHost<C extends CompactChild> {
     if (this.port.find(provider, sessionId) !== child) return null;
     const generation = this.generationOf(child);
     const known = this.latest.get(child);
-    const turn = known?.sessionId === sessionId ? known.turn : '';
-    const submissionId = known?.sessionId === sessionId ? known.submissionId : '';
+    const own = known?.sessionId === sessionId ? known : undefined;
+    const turn = own?.turn ?? '';
+    const submissionId = own?.submissionId ?? '';
     const authority = this.port.authority?.(provider, sessionId) ?? undefined;
     const sourceIdentity = (this.port.source ?? this.port.authority)?.(provider, sessionId) ?? undefined;
-    return {
+    const binding: CompactBinding = {
       activation: this.activation,
       provider,
       sessionId,
@@ -1551,6 +1558,7 @@ export class CompactHost<C extends CompactChild> {
       ...(authority === undefined ? {} : { authority }),
       ...(sourceIdentity === undefined ? {} : { sourceIdentity }),
     };
+    return { binding, ended: !!own?.ended && !state.busy };
   }
 
   private binding(child: C, event: NativeEvent, turnId: number | undefined): CompactBinding | null {

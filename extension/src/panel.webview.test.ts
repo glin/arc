@@ -35279,7 +35279,8 @@ test.each(['claude', 'codex failed', 'codex succeeded'] as const)(
   },
 );
 
-test('a reader rejection during unknown scope releases compaction when present scope refreshes', async () => {
+// Catches a carried request that waits for a rows refresh that a catalog which never publishes the session never runs.
+test('a reader rejection during unknown scope releases compaction without a rows refresh', async () => {
   const h = heldCompactionProvider();
   let reject!: (error: Error) => void;
   const pending = new Promise<number>((_resolve, refused) => {
@@ -35302,10 +35303,6 @@ test('a reader rejection during unknown scope releases compaction when present s
   h.provider.membershipOf = () => 'unknown';
   reject(new Error('refused'));
   await vi.waitFor(() => assert.equal(h.provider.readerDeliveries.size, 0));
-  assert.ok(h.owner.carriedLine('source'));
-  assert.equal(h.writes(), 0);
-  h.provider.membershipOf = () => 'present';
-  h.owner.sessionsRefreshed();
   await vi.waitFor(() => assert.equal(h.writes(), 1));
   assert.equal(h.owner.carriedLine('source'), null);
 });
@@ -41073,6 +41070,22 @@ test('completed relationships retain omitted children until physical absence qua
   assert.equal(provider.membershipCoverage.status, 'complete');
   assert.deepEqual(provider.authoritativeCatalog, []);
   assert.equal(provider.membershipOf('child'), 'absent');
+});
+
+// Catches a continuation that runs ahead of guarded session work while the session rows cannot confirm membership.
+test('continuation work reports guarded pending work while session membership is unknown', () => {
+  const idle = { current: false, archived: false, queued: 0, pendingSubmissions: 0, pendingControls: 0 };
+  const work = (facts: object | null, reader = 'unknown') =>
+    PanelProvider.prototype.continuationWork.call(
+      { readerWork: () => reader, guardedTargetFacts: () => facts, stateFor: () => null } as any,
+      'worker',
+    );
+  for (const pending of [{ archived: true }, { queued: 1 }, { pendingSubmissions: 1 }, { pendingControls: 1 }])
+    assert.equal(work({ ...idle, ...pending }), 'pending', JSON.stringify(pending));
+  assert.equal(work(idle), 'unknown');
+  assert.equal(work(null), 'unknown');
+  assert.equal(work({ ...idle, current: true }, 'none'), 'none');
+  assert.equal(work(null, 'pending'), 'pending');
 });
 
 test('incomplete enumeration cannot supply complete CLI or prefix coverage', () => {
