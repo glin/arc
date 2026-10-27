@@ -898,6 +898,33 @@ test('publication rechecks changed catalog scope', () => {
   assert.equal(drainRelationships(fx.receipts.relationships(fx.catalog)).length, 1);
 });
 
+test('the final step of each launch names it and the identities its catalog lookup matched', () => {
+  const fx = relationshipFixture('claude', 'codex');
+  const ends = (catalog: SessionFile[]) => {
+    const steps: DispatchRelationshipStep[] = [];
+    const scan = fx.receipts.relationships(catalog);
+    for (let next = scan.next(); !next.done; next = scan.next({ bytes: 1 << 20, entries: 1, checks: 1 }))
+      if (next.value.launchId === fx.launch.launchId) steps.push(next.value);
+    return steps;
+  };
+  const identities = {
+    requester: { agent: 'claude', sessionId: session },
+    child: { agent: 'codex', sessionId: turn },
+  };
+  const [linked] = ends(fx.catalog);
+  assert.equal(linked.launchId, fx.launch.launchId);
+  assert.deepEqual(linked.identities, identities);
+  assert.equal(linked.reference?.sessionId, turn);
+  // A lookup that misses still names the identities, so a later catalog can read the launch again.
+  const [missed] = ends([fx.catalog[0]]);
+  assert.deepEqual(missed.identities, identities);
+  assert.equal(missed.reference, undefined);
+  fs.rmSync(path.join(fx.receipts.root, `${fx.launch.launchId}.json`));
+  const [unread] = ends(fx.catalog);
+  assert.equal(unread.launchId, fx.launch.launchId);
+  assert.equal(unread.identities, undefined);
+});
+
 test('receipt readers recheck early evidence after partial source reads', () => {
   const fx = relationshipFixture();
   const original = fs.readSync;

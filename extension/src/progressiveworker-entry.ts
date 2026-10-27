@@ -67,7 +67,9 @@ import {
   claudeSubagentMetaReader,
   discoverClaudeChildSessions,
   discoverClaudeNewestTurn,
+  isInside,
   normalizeFsPath,
+  type SessionFile,
   commitSourceStamp,
   bindCommitSources,
   readClaudeAgentSpend,
@@ -201,18 +203,44 @@ function withSavedFacts([file, entry]: [string, ClaudeChildReferenceCacheEntry])
 const DISPATCH_METADATA_BYTES = 256 * 1024;
 export const CODEX_DISPATCH_REQUEST_BYTES = 8 * 1024 * 1024;
 let discoveryEpoch: DiscoveryCheckpoint | null = null;
-let receiptScan: {
+interface ReceiptScan {
   epoch: string | undefined;
   store: DispatchReceipts;
+  // Receipt lookups read this catalog, which follows the epoch when its repository roots change.
+  catalog: SessionFile[];
   steps: ReturnType<DispatchReceipts['relationships']>;
-  references: import('./transcript').ClaudeDispatchSessionReference[];
+  // Each visited launch whose read reached the catalog lookup, with the catalog identities that lookup matched.
+  launches: Map<string, string[]>;
+  references: Map<string, import('./transcript').ClaudeDispatchSessionReference>;
+  retries: string[];
+  retry: ReturnType<DispatchReceipts['relationship']> | null;
+  storeRead: boolean;
   competitionRefused: boolean;
   controller: AbortController;
-} | null = null;
+}
+let receiptScan: ReceiptScan | null = null;
 function closeReceiptScan(): void {
   receiptScan?.controller.abort();
   receiptScan?.steps.return(undefined);
+  receiptScan?.retry?.return(null);
   receiptScan = null;
+}
+const catalogIdentity = (agent: string, sessionId: string) => JSON.stringify([agent, sessionId]);
+// Names the identities whose catalog rows differ between two catalogs, by file and child flag.
+function changedCatalogIdentities(before: readonly SessionFile[], after: readonly SessionFile[]): Set<string> {
+  const rows = (catalog: readonly SessionFile[]) => {
+    const byIdentity = new Map<string, string[]>();
+    for (const row of catalog) {
+      const key = catalogIdentity(row.agent, row.sessionId);
+      const files = byIdentity.get(key) ?? [];
+      files.push(`${normalizeFsPath(row.file)}|${row.childTranscript === true}`);
+      byIdentity.set(key, files);
+    }
+    return new Map([...byIdentity].map(([key, files]) => [key, JSON.stringify(files.sort())]));
+  };
+  const held = rows(before);
+  const next = rows(after);
+  return new Set([...held.keys(), ...next.keys()].filter((key) => held.get(key) !== next.get(key)));
 }
 const admittedCompletions = new Set<string>();
 const epochChildSessions = new Map<string, import('./transcript').ClaudeChildSessionFile | null>();
@@ -437,7 +465,58 @@ async function execute(
         (request.discovery.epoch === discoveryEpoch.epoch && request.discovery.sequence >= discoveryEpoch.sequence))
     )
       discoveryEpoch = request.discovery;
-    if (!discoveryEpoch || JSON.stringify(discoveryEpoch.repositoryRoots) !== scope) {
+    const released: string[] = [];
+    if (
+      discoveryEpoch &&
+      JSON.stringify(discoveryEpoch.repositoryRoots) !== scope &&
+      discoveryEpoch.compatibility === discoveryCompatibility(CLAUDE_CHILD_REFERENCE_PARSER_VERSION) &&
+      discoveryEpoch.parserVersion === CLAUDE_CHILD_REFERENCE_PARSER_VERSION
+    ) {
+      // A root change continues the epoch. Retained sources keep their rows and captured cuts, and new sources join it.
+      const held = discoveryEpoch;
+      const sourceKey = (row: SessionFile) =>
+        JSON.stringify([normalizeFsPath(row.file), row.sessionId, row.agent, row.childTranscript === true]);
+      const retained = (rows: readonly SessionFile[], next: readonly SessionFile[]) => {
+        const old = new Map(rows.map((row) => [sourceKey(row), row]));
+        return next.map((row) => old.get(sourceKey(row)) ?? row);
+      };
+      const parents = retained(held.parents, request.parents);
+      const catalog = retained(held.catalog, request.catalog ?? request.parents);
+      const kept = new Set(parents.map(sourceKey));
+      const parentFiles = new Set(parents.map((row) => normalizeFsPath(row.file)));
+      const completedFiles = new Set(held.completed);
+      for (const row of held.parents) {
+        const key = normalizeFsPath(row.file);
+        if (!kept.has(sourceKey(row)) && completedFiles.delete(key)) released.push(key);
+      }
+      const inRoots = (cwd: string | null | undefined) => !!cwd && isInside(cwd, [...request.repositoryRoots]);
+      const protectedFile =
+        held.protectedFile &&
+        (parentFiles.has(held.protectedFile) || inRoots(claudeChildSessions.heads().get(held.protectedFile)?.cwd))
+          ? held.protectedFile
+          : undefined;
+      // A child read answers for the roots it was read under.
+      for (const [key, child] of epochChildSessions) if (!child || !inRoots(child.cwd)) epochChildSessions.delete(key);
+      if (receiptScan && receiptScan.epoch === held.epoch) {
+        const changed = changedCatalogIdentities(receiptScan.catalog, catalog);
+        for (const [launchId, identities] of receiptScan.launches) {
+          if (!identities.some((identity) => changed.has(identity))) continue;
+          receiptScan.launches.delete(launchId);
+          receiptScan.references.delete(launchId);
+          receiptScan.retries.push(launchId);
+        }
+        receiptScan.catalog = catalog;
+      }
+      const { protectedFile: _protectedFile, ...rest } = held;
+      discoveryEpoch = {
+        ...rest,
+        parents,
+        catalog,
+        repositoryRoots: request.repositoryRoots,
+        completed: [...completedFiles],
+        ...(protectedFile ? { protectedFile } : {}),
+      };
+    } else if (!discoveryEpoch || JSON.stringify(discoveryEpoch.repositoryRoots) !== scope) {
       discoveryEpoch = {
         epoch: randomUUID(),
         compatibility: discoveryCompatibility(CLAUDE_CHILD_REFERENCE_PARSER_VERSION),
@@ -459,7 +538,7 @@ async function execute(
       epochChildSessions.clear();
     }
     const completed = new Set(epoch.completed);
-    const completionChanges = new Map<string, boolean>();
+    const completionChanges = new Map<string, boolean>(released.map((key) => [key, false]));
     const charges: DiscoveryCharges = {
       readBytes: 0,
       receiptEntries: 0,
@@ -937,14 +1016,20 @@ async function execute(
     if (!receiptScan) {
       const controller = new AbortController();
       const store = new DispatchReceipts();
-      receiptScan = {
+      const scan: ReceiptScan = {
         epoch: epoch.epoch,
         store,
         controller,
-        steps: store.relationships(epoch.catalog, controller.signal),
-        references: [],
+        catalog: epoch.catalog,
+        steps: store.relationships(() => scan.catalog, controller.signal),
+        launches: new Map(),
+        references: new Map(),
+        retries: [],
+        retry: null,
+        storeRead: false,
         competitionRefused: false,
       };
+      receiptScan = scan;
     }
     const activeReceipts = receiptScan;
     const receiptDeadline = performance.now() + RELATIONSHIP_SLICE_MS;
@@ -954,14 +1039,39 @@ async function execute(
         charges.receiptPassEnds++;
         return pending();
       }
-      const step = activeReceipts.steps.next({ entries: 1, checks: 1, bytes: requestBytes - charges.readBytes });
-      if (step.done) break;
+      // A visited launch whose catalog identity changed is read again before the scan completes.
+      const retryId = activeReceipts.retry ? undefined : activeReceipts.retries.shift();
+      if (retryId !== undefined)
+        activeReceipts.retry = activeReceipts.store.relationship(
+          retryId,
+          () => activeReceipts.catalog,
+          activeReceipts.controller.signal,
+        );
+      if (!activeReceipts.retry && activeReceipts.storeRead) break;
+      const grant = { entries: 1, checks: 1, bytes: requestBytes - charges.readBytes };
+      const step = activeReceipts.retry ? activeReceipts.retry.next(grant) : activeReceipts.steps.next(grant);
+      if (step.done) {
+        if (activeReceipts.retry) activeReceipts.retry = null;
+        else activeReceipts.storeRead = true;
+        continue;
+      }
       charges.receiptEntries! += step.value.entries;
       charges.receiptChecks! += step.value.checks;
       charges.receiptBytes! += step.value.bytes;
       charges.readBytes += step.value.bytes;
+      const launchId = step.value.launchId;
+      if (launchId !== undefined) {
+        const identities = step.value.identities;
+        activeReceipts.references.delete(launchId);
+        if (identities)
+          activeReceipts.launches.set(launchId, [
+            catalogIdentity(identities.requester.agent, identities.requester.sessionId),
+            catalogIdentity(identities.child.agent, identities.child.sessionId),
+          ]);
+        else activeReceipts.launches.delete(launchId);
+      }
       if (step.value.reference) {
-        activeReceipts.references.push(step.value.reference);
+        activeReceipts.references.set(launchId ?? `step-${activeReceipts.references.size}`, step.value.reference);
         activeReceipts.store.checkpointRelationships();
       }
       if (step.value.refusal && ('launchId' in step.value.refusal || step.value.refusal.storeOpened))
@@ -973,7 +1083,7 @@ async function execute(
     const transcriptReferences = resolveClaudeDispatchReferences(found.references, epoch.catalog);
     if (
       activeReceipts.competitionRefused &&
-      (activeReceipts.references.length ||
+      (activeReceipts.references.size ||
         transcriptReferences.some((reference) => reference.kind === 'dispatch' && reference.file))
     ) {
       closeReceiptScan();
@@ -983,7 +1093,7 @@ async function execute(
     discoveryPosition = epoch.position;
     discoveryEpoch = null;
     receiptScan = null;
-    const references = [...transcriptReferences, ...activeReceipts.references];
+    const references = [...transcriptReferences, ...activeReceipts.references.values()];
     const admittedReferences = admittedDispatchReferences(references, found.children, request.codexChildren);
     retainCodexDispatchSpendRoots(
       new Set(admittedReferences.flatMap((reference) => (reference.file ? [reference.file] : []))),

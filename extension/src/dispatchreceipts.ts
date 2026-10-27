@@ -198,9 +198,17 @@ export interface DispatchRelationshipAllowance {
   bytes: number;
   checks: number;
 }
+// The requester and dispatched session that a receipt names, which its catalog lookup matches by provider and session ID.
+export interface DispatchRelationshipIdentities {
+  requester: { agent: 'claude' | 'codex'; sessionId: string };
+  child: { agent: 'claude' | 'codex'; sessionId: string };
+}
 export interface DispatchRelationshipStep extends DispatchRelationshipAllowance {
   reference?: ClaudeDispatchSessionReference;
   refusal?: { error: unknown } & ({ launchId: string } | { storeOpened: boolean });
+  // The final step of one launch names it. Identities are present when its read reached the catalog lookup.
+  launchId?: string;
+  identities?: DispatchRelationshipIdentities;
 }
 type RelationshipScan<T> = Generator<DispatchRelationshipStep, T, DispatchRelationshipAllowance>;
 const emptyRelationshipStep = (): DispatchRelationshipStep => ({ entries: 0, bytes: 0, checks: 0 });
@@ -209,6 +217,7 @@ const emptyRelationshipStep = (): DispatchRelationshipStep => ({ entries: 0, byt
 class RelationshipReader {
   progress = emptyRelationshipStep();
   refusal: { error: unknown } | null = null;
+  identities?: DispatchRelationshipIdentities;
   readonly revisions = new Map<string, string | null>();
   readonly digests = new Map<string, string>();
   private readonly descriptors = new Set<number>();
@@ -403,11 +412,21 @@ export class DispatchReceipts {
     const reader = new RelationshipReader(signal, this.platform);
     try {
       const reference = yield* this.readRelationship(id, catalog, reader);
-      yield { ...reader.progress, ...(reference ? { reference } : {}) };
+      yield {
+        ...reader.progress,
+        launchId: id,
+        ...(reader.identities ? { identities: reader.identities } : {}),
+        ...(reference ? { reference } : {}),
+      };
       reader.progress = emptyRelationshipStep();
       return reference;
     } catch {
-      yield { ...reader.progress, ...(reader.refusal ? { refusal: { ...reader.refusal, launchId: id } } : {}) };
+      yield {
+        ...reader.progress,
+        launchId: id,
+        ...(reader.identities ? { identities: reader.identities } : {}),
+        ...(reader.refusal ? { refusal: { ...reader.refusal, launchId: id } } : {}),
+      };
       return null;
     } finally {
       reader.dispose();
@@ -584,6 +603,10 @@ export class DispatchReceipts {
       !TOKEN.test(startup.sha256)
     )
       return null;
+    reader.identities = {
+      requester: { agent: launch.requester.provider, sessionId: launch.requester.id },
+      child: { agent: options.provider, sessionId: accepted.sessionId },
+    };
     const lookup = () => {
       const sessions = typeof catalog === 'function' ? catalog() : catalog;
       const parents = sessions.filter(

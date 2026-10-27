@@ -73,45 +73,8 @@ test.each(['claude', 'codex'] as const)(
       const workerSource = `process.env.ARC_HOME=${JSON.stringify(fx.home)};` + source;
       const check = async (throughHost: boolean) => {
         const worker = new ProgressiveWorker(workerSource);
-        let host: Record<string, any> | undefined;
-        let hostResult: ProgressiveResult | null = null;
-        if (throughHost) {
-          vi.stubGlobal('PANEL_CSS', '');
-          vi.stubGlobal('PANEL_JS', '');
-          vi.stubGlobal('PANEL_DEV_SERVER_URL', null);
-          const { PanelProvider } = await import('./panelhost.js');
-          host = Object.create(PanelProvider.prototype) as Record<string, any>;
-          Object.defineProperty(host, 'loadingLine', { value: { held: () => true, withhold() {} } });
-          Object.assign(host, {
-            progressiveWorker: worker,
-            refreshGeneration: 0,
-            repositoryScopeRoots: [root],
-            claudeParents: fx.catalog,
-            claudeChildReferenceEntries: new Map(),
-            claudeChildStatWrites: new Map(),
-            claudeChildren: [],
-            awaitingSessionRecords: {},
-            codexSubagents: [],
-            dispatchFacts: new Map(),
-            catalog: { sessions: fx.catalog },
-            authoritativeCatalog: fx.catalog,
-            derivedCacheCheckpointState: { markChanged() {} },
-            publishSessionQueryContext() {},
-            unresolvedLoadingFailure: () => false,
-            dispatchedDiscoveryWaiting: () => false,
-            postDispatchedCostsIfMoved() {},
-            checkpointDerivedCache() {},
-            prepareHumanPrompts: async (sessions: unknown) => sessions,
-            activityFor: (session: { mtimeMs: number }) => session.mtimeMs,
-            updateSessionSpendSources() {},
-            pruneDerivedTitles: () => false,
-          });
-          const run = worker.run.bind(worker);
-          worker.run = async (...args) => {
-            hostResult = await run(...args);
-            return hostResult;
-          };
-        }
+        const discovery = throughHost ? await receiptDiscoveryHost(worker, [root], fx.catalog) : undefined;
+        const host = discovery?.host;
         try {
           let passes = 0;
           let entries = 0;
@@ -123,7 +86,7 @@ test.each(['claude', 'codex'] as const)(
               assert.equal(await host.prepareClaudeChildren(generation, new AbortController().signal), true);
             }
             const result: ProgressiveResult | null = host
-              ? hostResult
+              ? discovery.replies.last
               : await worker.run(
                   {
                     kind: 'claude-children',
@@ -206,6 +169,136 @@ test.each(['claude', 'codex'] as const)(
       };
       await check(true);
       await check(false);
+    }
+  },
+);
+
+// A panel host whose discovery requests reach the worker, with the last worker reply kept for the test.
+async function receiptDiscoveryHost(
+  worker: ProgressiveWorker,
+  roots: string[],
+  catalog: import('./transcript').SessionFile[],
+) {
+  vi.stubGlobal('PANEL_CSS', '');
+  vi.stubGlobal('PANEL_JS', '');
+  vi.stubGlobal('PANEL_DEV_SERVER_URL', null);
+  const { PanelProvider } = await import('./panelhost.js');
+  const host = Object.create(PanelProvider.prototype) as Record<string, any>;
+  Object.defineProperty(host, 'loadingLine', { value: { held: () => true, withhold() {} } });
+  Object.assign(host, {
+    progressiveWorker: worker,
+    refreshGeneration: 0,
+    repositoryScopeRoots: roots,
+    claudeParents: catalog,
+    claudeChildReferenceEntries: new Map(),
+    claudeChildStatWrites: new Map(),
+    claudeChildren: [],
+    awaitingSessionRecords: {},
+    codexSubagents: [],
+    dispatchFacts: new Map(),
+    catalog: { sessions: catalog },
+    authoritativeCatalog: catalog,
+    derivedCacheCheckpointState: { markChanged() {} },
+    publishSessionQueryContext() {},
+    unresolvedLoadingFailure: () => false,
+    dispatchedDiscoveryWaiting: () => false,
+    postDispatchedCostsIfMoved() {},
+    checkpointDerivedCache() {},
+    prepareHumanPrompts: async (sessions: unknown) => sessions,
+    activityFor: (session: { mtimeMs: number }) => session.mtimeMs,
+    updateSessionSpendSources() {},
+    pruneDerivedTitles: () => false,
+  });
+  const replies: { last: ProgressiveResult | null } = { last: null };
+  const run = worker.run.bind(worker);
+  worker.run = async (...args) => {
+    replies.last = await run(...args);
+    return replies.last;
+  };
+  return { host, replies };
+}
+
+// The worker lists the receipt store's launch directories first and reports when it lists the first other entry.
+const launchesFirst = (store: string) =>
+  `const orderFs=require('node:fs'),orderPort=require('node:worker_threads').parentPort,orderOpen=orderFs.opendirSync;orderFs.opendirSync=function(p,...a){const dir=orderOpen.call(this,p,...a);if(String(p)!==${JSON.stringify(store)})return dir;const entries=[];for(let entry;(entry=dir.readSync());)entries.push(entry);const launch=(entry)=>entry.isDirectory()&&!entry.name.endsWith('-1111-2222-3333-444444444444');entries.sort((a,b)=>Number(launch(b))-Number(launch(a)));let reported=false;return{readSync(){const entry=entries.shift()??null;if(!reported&&(!entry||!launch(entry))){reported=true;orderPort.postMessage({repeatedCoverage:'receipt-launches-read'});}return entry;},closeSync(){dir.closeSync();}};};`;
+
+test.each(['added', 'removed'] as const)(
+  'receipt discovery completes while repository roots change after its launches are read, with a session %s',
+  async (change) => {
+    for (const throughHost of [true, false]) {
+      const root = tempDir('receipt-worker-roots-');
+      const fx = receiptDispatchFixture(root, 'claude', 'codex');
+      fs.mkdirSync(fx.receipts.root, { recursive: true });
+      for (let index = 0; index < 300; index++)
+        fs.mkdirSync(path.join(fx.receipts.root, `${index.toString(16).padStart(8, '0')}-1111-2222-3333-444444444444`));
+      fx.launch(fx.parent, fx.child);
+      fx.launch(fx.child, fx.grandchild);
+      const storeEntries = fs.readdirSync(fx.receipts.root).length;
+      const before = change === 'added' ? [fx.parent, fx.child] : fx.catalog;
+      const after = change === 'added' ? fx.catalog : [fx.parent, fx.child];
+      let launchesRead = false;
+      const worker = new ProgressiveWorker(
+        `process.env.ARC_HOME=${JSON.stringify(fx.home)};` + launchesFirst(fx.receipts.root) + source,
+        undefined,
+        (file) => {
+          if (file === 'receipt-launches-read') launchesRead = true;
+        },
+      );
+      const discovery = throughHost ? await receiptDiscoveryHost(worker, [root], before) : undefined;
+      try {
+        let changed = false;
+        let entriesAfterChange = 0;
+        let completed: ProgressiveResult | null = null;
+        let roots = [root];
+        for (let pass = 0; pass < 100 && !completed; pass++) {
+          const generation = pass + 1;
+          // Once the launches are read, every pass names other roots, as worker worktrees come and go.
+          roots = changed ? [root, path.join(root, pass % 2 ? 'worker-a' : 'worker-b')] : [root];
+          const catalog = changed ? after : before;
+          let result: ProgressiveResult | null;
+          if (discovery) {
+            Object.assign(discovery.host, {
+              refreshGeneration: generation,
+              repositoryScopeRoots: roots,
+              claudeParents: catalog,
+              catalog: { sessions: catalog },
+              authoritativeCatalog: catalog,
+            });
+            assert.equal(await discovery.host.prepareClaudeChildren(generation, new AbortController().signal), true);
+            result = discovery.replies.last;
+          } else
+            result = await worker.run(
+              { kind: 'claude-children', parents: catalog, catalog, repositoryRoots: roots },
+              generation,
+              new AbortController().signal,
+            );
+          assert.ok(result);
+          if (changed && 'charges' in result.value) entriesAfterChange += result.value.charges?.receiptEntries ?? 0;
+          if (result.value.kind === 'claude-children' && !discovery?.host.dispatchDiscoveryPending) completed = result;
+          else if (launchesRead) changed = true;
+        }
+        assert.ok(completed?.value.kind === 'claude-children', 'Receipt discovery never completed while roots changed');
+        assert.ok(changed, 'Receipt discovery completed before the roots changed');
+        const parents = sessionParentIndex(completed.value.references);
+        assert.equal(parents.get(fx.child.sessionId)?.parent, fx.parent.sessionId);
+        // A session the new roots add gains its receipt link, and a session they drop keeps none.
+        assert.equal(
+          completed.value.references.some((reference) => reference.sessionId === fx.grandchild.sessionId),
+          change === 'added',
+          JSON.stringify(completed.value.references),
+        );
+        if (change === 'added') assert.equal(parents.get(fx.grandchild.sessionId)?.parent, fx.child.sessionId);
+        assert.ok(
+          entriesAfterChange < storeEntries,
+          `${entriesAfterChange} of ${storeEntries} store entries read again`,
+        );
+        if (discovery) {
+          assert.equal(discovery.host.discoveryComplete?.scope, JSON.stringify(roots));
+          assert.equal(discovery.host.discoveryComplete?.files.has(fx.grandchild.file), change === 'added');
+        }
+      } finally {
+        worker.stop();
+      }
     }
   },
 );
