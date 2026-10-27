@@ -4327,8 +4327,8 @@ export class PanelProvider implements vscode.Disposable {
     this.health?.event('ready', panel.id);
     if (this.readyHosts.has(host)) return;
     this.readyHosts.add(host);
-    this.startupHistory?.visibility(this.anyVisible());
     void this.sendToHost(host, this.panelVisibility.current(host, host.visible()));
+    this.startupHistory?.visibility(this.anyVisible());
     if (this.saved) {
       void this.sendToHost(host, { type: 'readState', state: this.readSynchronization() });
       this.restoreAgentReads();
