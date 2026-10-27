@@ -3,6 +3,7 @@ import { cacheHitText, diffHalves, type CacheHitDetail } from '../view/stat-deta
 import { ARRIVAL_WORD } from '../view/card-presentation.ts';
 import type { DetailRows } from './card-rows.ts';
 import { drawContextDetail, type ContextDetailView } from './context-detail.ts';
+import { FLOAT_EDGE, FLOAT_GAP } from './dom.ts';
 import { appendNameText, inlineText } from './inline-text.ts';
 
 // Delay after the pointer leaves a chip or popover. This lets the pointer cross the gap without pinning.
@@ -96,7 +97,7 @@ export interface CostDetailView {
   }[];
   tabs: {
     name: string;
-    parts: { rows: CostRowView[]; more?: { shown: number; open: string; close: string } }[];
+    parts: { rows: CostRowView[]; more?: { shown: number; open: string; close: string }; empty?: string }[];
   }[];
   included: { label: string; value: string; title?: string }[];
 }
@@ -164,6 +165,8 @@ export interface StatDetailRendererOptions {
       listener: EventListenerOrEventListenerObject,
       options?: boolean | AddEventListenerOptions,
     ): void;
+    // Window listeners. Omission adds them to the document's own window.
+    window?(type: string, listener: EventListenerOrEventListenerObject): void;
   };
   placeFloat(host: HTMLElement, anchor: HTMLElement, bottomLimit: number): void;
   selectionWithin?(node: HTMLElement): boolean;
@@ -582,7 +585,7 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
           describeBreakdown();
           anchor.setAttribute('aria-describedby', breakdownIds.join(' '));
         }
-        options.placeFloat(pop, anchor, view.innerHeight - 6);
+        place(anchor);
       }
       if (focus) buttons[at]?.focus();
     };
@@ -683,6 +686,7 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
         }
         const rows = part.rows.map((row) => costRow(row, counted));
         list.append(...rows);
+        if (!rows.length && part.empty) list.append(el('li', 'costempty chippopscale', part.empty));
         const more = part.more;
         if (more) {
           const folded = rows.slice(more.shown);
@@ -701,7 +705,7 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
             costMore = !costMore;
             if (!pinned && anchor) pin(anchor);
             show();
-            if (anchor && !pop.hidden) options.placeFloat(pop, anchor, view.innerHeight - 6);
+            if (anchor && !pop.hidden) place(anchor);
           });
           disclosure.append(summary);
           item.append(disclosure);
@@ -945,6 +949,23 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
       node.setAttribute('aria-expanded', 'false');
     }
   };
+  // The cost figure of the session heading or a turn card. Its popover reaches the panel's edge on
+  // the side of the figure with more room, so "Included above" shows without a scroll on a tall
+  // panel. The cap never drops below the stylesheet's min(70vh, 520px), which every other figure
+  // popover keeps. A nested popover and the composer's next-turn detail keep their own bounds.
+  const costFigure = (node: HTMLElement) =>
+    !options.nested && node.dataset.metric === 'cost' && !node.closest('.cnextturn');
+  const place = (node: HTMLElement) => {
+    const bottom = view.innerHeight - FLOAT_EDGE;
+    if (costFigure(node)) {
+      const rect = node.getBoundingClientRect();
+      const room = Math.max(bottom - rect.bottom - FLOAT_GAP, rect.top - FLOAT_GAP - FLOAT_EDGE);
+      pop.style.maxHeight = `${Math.max(room, Math.min(0.7 * view.innerHeight, 520))}px`;
+    } else if (!node.closest('.cnextturn')) {
+      pop.style.removeProperty('max-height');
+    }
+    options.placeFloat(pop, node, bottom);
+  };
   const show = (node: HTMLElement, requested?: ResolvedDetailValue) => {
     cancelGrace();
     const source = details.get(node);
@@ -980,10 +1001,7 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
       node.setAttribute('aria-describedby', pop.id);
     }
     pop.hidden = false;
-    if (!node.closest('.cnextturn')) {
-      pop.style.removeProperty('max-height');
-    }
-    options.placeFloat(pop, node, view.innerHeight - 6);
+    place(node);
   };
   const hide = (node: HTMLElement | null, force = false, refocus = false) => {
     if (node && anchor !== node) {
@@ -1179,7 +1197,7 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
       const value = resolve(detail, detailList);
       if (drawnPrint === value.print) {
         drawDebt = null;
-        if (options.actionAnchor) options.placeFloat(pop, node, view.innerHeight - 6);
+        if (options.actionAnchor) place(node);
         return;
       }
       if (options.selectionWithin?.(pop)) {
@@ -1225,10 +1243,16 @@ export function createStatDetailRenderer(options: StatDetailRendererOptions): St
       else if (disclosure.matches('.context-measurement')) contextMeasurementOpen = disclosure.open;
       else if (disclosure.matches('.context-messages')) contextMessagesOpen = disclosure.open;
       else return;
-      if (anchor && !pop.hidden) options.placeFloat(pop, anchor, view.innerHeight - 6);
+      if (anchor && !pop.hidden) place(anchor);
     },
     true,
   );
+  // A resize changes the room beside the cost figure, so an open cost popover takes its cap again.
+  const onResize = () => {
+    if (anchor && !pop.hidden && costFigure(anchor)) place(anchor);
+  };
+  if (options.events.window) options.events.window('resize', onResize);
+  else view.addEventListener('resize', onResize);
   const retarget: StatDetailRenderer['retarget'] = (within, node, detail, detailList, ownStop) => {
     if (!anchor || !within.contains(anchor)) {
       return false;

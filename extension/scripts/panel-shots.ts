@@ -100,9 +100,10 @@ export interface Shot {
   activity?: 'messages' | 'empty' | 'all' | 'breakdown';
   compactionSummary?: 'collapsed' | 'expanded';
   cacheWriteWarning?: boolean;
-  costOverheads?: boolean;
+  costOverheads?: boolean | 'delegated'; // `delegated` adds delegated work and a turn compaction.
   waitWarning?: boolean | 'five'; // `five` gives the delegated work five model groups.
   waitWarningTurnAgents?: boolean; // The turn holds the delegated children as its subagents.
+  waitWarningNoChildTools?: boolean; // The delegated children read no tool results.
   composerSkill?: boolean;
   remoteControl?: boolean; // Draw the prompt box of a session whose Remote Control is connected with a link.
   raisedComposer?: boolean;
@@ -734,6 +735,20 @@ export const SHOTS: Shot[] = [
         click: '.chips [data-metric="cost"]',
       },
       {
+        name: `${size}-cost-overheads-session-delegated`,
+        width,
+        escape: true,
+        costOverheads: 'delegated' as const,
+        click: '.sessionstats [data-metric="cost"]',
+      },
+      {
+        name: `${size}-cost-overheads-turn-delegated`,
+        width,
+        escape: true,
+        costOverheads: 'delegated' as const,
+        click: '.chips [data-metric="cost"]',
+      },
+      {
         name: `${size}-cost-overheads-turn-tools`,
         width,
         escape: true,
@@ -783,6 +798,16 @@ export const SHOTS: Shot[] = [
         escape: true,
         waitWarning: true,
         waitWarningTurnAgents: true,
+        click: '.chips [data-metric="cost"]',
+        costTab: 'Tools' as const,
+      },
+      {
+        name: `${size}-wait-warning-turn-main-tools-only`,
+        width,
+        escape: true,
+        waitWarning: true,
+        waitWarningTurnAgents: true,
+        waitWarningNoChildTools: true,
         click: '.chips [data-metric="cost"]',
         costTab: 'Tools' as const,
       },
@@ -1284,12 +1309,13 @@ export async function shoot(
     await page.evaluate(SETTLED);
   }
   if (shot.costOverheads) {
-    await page.evaluate(`window.postMessage(${JSON.stringify(costOverheadsPayload())}, '*')`);
+    const payload = costOverheadsPayload(shot.costOverheads === 'delegated');
+    await page.evaluate(`window.postMessage(${JSON.stringify(payload)}, '*')`);
     await page.evaluate(SETTLED);
   }
   if (shot.waitWarning) {
     const delegated = shot.waitWarning === 'five' ? 'five' : 'three';
-    const payload = waitWarningPayload(delegated, shot.waitWarningTurnAgents ?? false);
+    const payload = waitWarningPayload(delegated, shot.waitWarningTurnAgents ?? false, !shot.waitWarningNoChildTools);
     await page.evaluate(`window.postMessage(${JSON.stringify(payload)}, '*')`);
     await page.evaluate(SETTLED);
   }

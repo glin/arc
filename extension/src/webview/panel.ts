@@ -491,7 +491,7 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
 
   const statDetails = createStatDetailRenderer({
     document,
-    events: { document: onDocument },
+    events: { document: onDocument, window: onWindow },
     placeFloat(host, anchor, bottomLimit) {
       if (anchor.closest('.cnextturn')) {
         const composerLimit = Math.min(bottomLimit, statusBar.getBoundingClientRect().top - 6);
@@ -520,7 +520,7 @@ export function startPanel(kernel: PanelKernel): StartedPanel {
     document,
     id: 'chippopnested',
     nested: true,
-    events: { document: onDocument },
+    events: { document: onDocument, window: onWindow },
     placeFloat(host, anchor, bottomLimit) {
       placeFloat(host, anchor, bottomLimit);
     },

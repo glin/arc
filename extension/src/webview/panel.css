@@ -3936,7 +3936,11 @@ button.cctx:hover {
    the browser's narrow native title bubble. A detail that draws the turn's record takes the
    pointer, so the reader crosses the gap from the chip onto a row. Every other detail ignores
    the pointer until a press pins it, so the control under it stays pressable where the drawing
-   lands over its own anchor. A press pins either one and lets the reader select its text. */
+   lands over its own anchor. A press pins either one and lets the reader select its text.
+
+   The cap holds every figure popover. `stat-detail.ts` lets the cost popover of the session
+   heading and of a turn card grow past it to the panel's edge, so its "Included above" group
+   shows without a scroll. */
 .chippop {
   width: min(520px, calc(100vw - 12px));
   padding: 10px 12px;
@@ -6526,12 +6530,16 @@ button.railfilterlabel:focus-visible {
   font-weight: 600;
 }
 .chippop .costsection > .costfacts,
+.chippop .costsection > .costempty,
 .chippop .costsection > .costmore,
 .chippop .costgrid > .included > .includedhead {
   grid-column: 1 / -1;
 }
 .chippop .costsection > .costfacts {
   margin: -0.1em 0 0.25em;
+}
+.chippop .costsection > .costfacts,
+.chippop .costsection > .costempty {
   color: var(--idle);
 }
 .chippop .costmore summary {

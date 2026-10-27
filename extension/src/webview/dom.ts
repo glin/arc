@@ -89,6 +89,10 @@ export interface FloatPlacement {
   overflow?: 'flip' | 'flip-or-stay' | 'slide';
 }
 
+// The space `placeFloat` leaves between a float and its anchor, and between a float and the window's edge.
+export const FLOAT_GAP = 6;
+export const FLOAT_EDGE = 6;
+
 // Returns the top position below the anchor, with the selected overflow behavior when it does not fit.
 function floatTop(
   around: Pick<FloatRect, 'top' | 'bottom'>,
@@ -96,7 +100,7 @@ function floatTop(
   gap: number,
   bottom: number,
   overflow: FloatPlacement['overflow'] = 'flip',
-  edge = 6,
+  edge = FLOAT_EDGE,
 ): number {
   const below = around.bottom + gap;
   if (below + height <= bottom) {
@@ -137,7 +141,7 @@ export function placeFloat(
     return;
   }
   if (topLimit !== undefined && typeof bottomLimit === 'number') {
-    const gap = 6;
+    const gap = FLOAT_GAP;
     const width = host.offsetWidth || 90;
     const availableHeight = Math.max(0, bottomLimit - topLimit);
     host.style.maxHeight = `${availableHeight}px`;
@@ -162,8 +166,8 @@ export function placeFloat(
   }
   if (bottomLimit !== undefined) {
     const placement = typeof bottomLimit === 'number' ? { bottom: bottomLimit } : bottomLimit;
-    const edge = 6;
-    const gap = placement.gap ?? 6;
+    const edge = FLOAT_EDGE;
+    const gap = placement.gap ?? FLOAT_GAP;
     const box = host.getBoundingClientRect();
     const held = placement.around ? anchorRect(placement.around) : null;
     const around = held ?? rect;

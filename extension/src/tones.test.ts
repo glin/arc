@@ -813,6 +813,7 @@ const SUBAGENT_ROW_OTHER_COLOURS = [
   '.casktab:hover { color: var(--vscode-foreground) }',
   ".casktab[aria-selected='true'] { color: var(--vscode-foreground) }",
   '.chippop .chippopitem.is-group .chippoplabel { color: var(--idle) }',
+  '.chippop .costsection > .costempty { color: var(--idle) }',
   '.chippop .costsection > .costfacts { color: var(--idle) }',
   '.chippop .included { color: var(--idle) }',
   '.chippop .splitmodel { color: var(--idle) }',

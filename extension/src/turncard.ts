@@ -184,6 +184,8 @@ export interface CostDetailRow {
 export interface CostDetailPart {
   rows: CostDetailRow[];
   more?: { shown: number; open: string; close: string };
+  // The quiet line a section with no rows shows where its rows would be.
+  empty?: string;
 }
 
 export interface CostDetailTab {
@@ -1986,6 +1988,9 @@ export interface SessionCostTotal {
 type AgentCost = SessionCostTotal & {
   parts: DelegatedChild['parts'][number][];
   costs: PricedSessionCost[];
+  // Incomplete usage of the agent as a whole, such as an unread or still running transcript. No
+  // part's model can be told apart from it. A part's own partial flag covers that part alone.
+  unattributed: boolean;
 };
 
 function spendCost(agent: TurnAgent): AgentCost {
@@ -1993,13 +1998,18 @@ function spendCost(agent: TurnAgent): AgentCost {
   const costs: PricedSessionCost[] = [];
   let dollars = 0;
   let priced = false;
-  let partial =
+  // A turn's share of a child's requests keeps each incomplete request in its usage parts, so that
+  // part's model row reads the lower bound. The child's incomplete mark names no model otherwise.
+  const incomplete = Boolean(agent.spendIncomplete);
+  const attributed = incomplete && agent.spend.some((part) => part.usageParts?.some((usage) => usage.incomplete));
+  const unattributed =
     !agent.spendFound ||
     agent.spendPartial ||
     Boolean(agent.spendUnfinished) ||
-    Boolean(agent.spendIncomplete) ||
+    (incomplete && !attributed) ||
     agentSpendIsOpen(agent.status) ||
     (!agent.spend.length && (agent.tokens ?? 0) > 0);
+  let partial = unattributed || incomplete;
   for (const part of agent.spend) {
     if (part.usageParts?.length && !(recordedCostBasis(part.costBasis) && part.recordedCost !== undefined)) {
       const pricedParts = part.usageParts.map((usagePart) =>
@@ -2023,7 +2033,8 @@ function spendCost(agent: TurnAgent): AgentCost {
     const cost =
       recordedListCost ?? estimateCost(part.usage, part.model, part.provider ?? null, part.contextWindow ?? null);
     const unclassified = recordedListCost === undefined && (part.unclassifiedCacheWrite ?? 0) > 0;
-    parts.push({ model: part.model, dollars: cost, partial: unclassified });
+    const short = Boolean(part.usageParts?.some((usage) => usage.incomplete));
+    parts.push({ model: part.model, dollars: cost, partial: unclassified || short || cost === null });
     // A recorded list cost prices the whole part, and its usage parts still carry the tool and
     // wait figures and the request count's exactness.
     const recorded: { tools?: UsageTools; waits?: UsageWaits } = {};
@@ -2055,9 +2066,9 @@ function spendCost(agent: TurnAgent): AgentCost {
     }
     dollars += cost;
     priced = true;
-    partial ||= unclassified;
+    partial ||= unclassified || short;
   }
-  return { dollars: priced ? dollars : null, partial, parts, costs };
+  return { dollars: priced ? dollars : null, partial, parts, costs, unattributed };
 }
 
 // Prices the turn and its subagents. Unknown coverage makes the priced subtotal a lower bound.
@@ -2140,6 +2151,8 @@ interface DispatchedShare {
   dollars: number | null;
   partial: boolean;
   printed: boolean;
+  // A short read of the session, or its own usage left out, which no part's model can be told apart from.
+  unattributed: boolean;
 }
 
 // The amount a counted dispatched session shows when nothing it holds has a price yet.
@@ -2153,7 +2166,14 @@ function dispatchedShare(turn: Turn, cost: DispatchedTurnCost): DispatchedShare 
   const all = cost.costs;
   if (!rows.length) {
     const total = sessionCostTotalOf(all);
-    return { cost, costs: all, dollars: total.dollars, partial: cost.short || total.partial, printed: false };
+    return {
+      cost,
+      costs: all,
+      dollars: total.dollars,
+      partial: cost.short || total.partial,
+      printed: false,
+      unattributed: cost.short,
+    };
   }
   const printed = rows.reduce((sum, row) => sum + (spendCost(row).dollars ?? 0), 0);
   // Require primary-transcript cost to cover printed rows. Descendant cost cannot establish that coverage.
@@ -2171,11 +2191,12 @@ function dispatchedShare(turn: Turn, cost: DispatchedTurnCost): DispatchedShare 
       dollars: Math.max(0, total.dollars! - printed),
       partial: cost.short || total.partial,
       printed: true,
+      unattributed: cost.short,
     };
   }
   const costs = all.filter((priced) => !priced.part.own);
   const rest = sessionCostTotalOf(costs);
-  return { cost, costs, dollars: rest.dollars, partial: true, printed: true };
+  return { cost, costs, dollars: rest.dollars, partial: true, printed: true, unattributed: true };
 }
 
 // Adds counted dispatched costs to the parsed turn and its subagents.
@@ -2973,6 +2994,10 @@ function costDetailList(
   const toolRows = costToolRows(mainPriced, delegates ? "the main agent's cost" : 'this turn');
   const delegatedDollars = Math.max(0, (total.dollars ?? 0) - mainDollars);
   // A launch row and a resume row of one child are one child session, so rows with a shared id merge.
+  // A child's own partial flag holds only what no part's model can be told apart from: an unread,
+  // unfinished or running transcript, a short read, or a share whose own usage is left out. Each
+  // part carries its own flag, including its incomplete requests, so a lower bound marks only the
+  // model rows it touches.
   const childrenById = new Map<string, DelegatedChild>();
   const holdChild = (key: string, parts: DelegatedChild['parts'], partial: boolean) => {
     const held = childrenById.get(key);
@@ -2993,11 +3018,13 @@ function costDetailList(
     const priced = agentCosts.get(agent);
     const parts = priced?.parts ?? agent.spend.map((part) => ({ model: part.model, dollars: null }));
     // An agent with no spend yet still counts, under its model with no cost.
-    holdChild(key, parts.length ? parts : [{ model: agentModel(agent), dollars: null }], priced?.partial ?? true);
+    holdChild(key, parts.length ? parts : [{ model: agentModel(agent), dollars: null }], priced?.unattributed ?? true);
   });
-  shares.forEach((share) => holdChild(`child:${share.cost.sessionId}`, pricedModelParts(share.costs), share.partial));
+  shares.forEach((share) =>
+    holdChild(`child:${share.cost.sessionId}`, pricedModelParts(share.costs), share.unattributed),
+  );
   const children = [...childrenById.values()];
-  const delegatedPartial = children.some((child) => child.partial);
+  const delegatedPartial = children.some((child) => child.partial || child.parts.some((part) => part.partial));
   const delegatedCosts = delegates ? turnDelegatedCosts(turn, shares, agentCosts) : [];
   const delegatedTools = delegates ? costToolRows(delegatedCosts, 'delegated work') : [];
   const mainFacts = costFacts(mainPriced);
@@ -3042,7 +3069,7 @@ function costDetailList(
             ? [
                 {
                   name: 'Tools' as const,
-                  parts: [{ rows: toolRows }, ...(delegates ? [{ rows: delegatedTools }] : [])],
+                  parts: [toolPart(toolRows), ...(delegates ? [toolPart(delegatedTools)] : [])],
                 },
               ]
             : []),
@@ -5892,14 +5919,12 @@ function costDetailRow(
   whole: number,
   of: string,
   facts: string[],
-  detail?: string,
   after: { facts?: string[]; note?: string } = {},
 ): CostDetailRow & { dollars: number } {
   const share = costShare(dollars, whole);
   const title = [centsCost(dollars), ...facts, `${sharePercent(share)} of ${of}`, ...(after.facts ?? [])].join(', ');
   return {
     label,
-    ...(detail ? { detail } : {}),
     percent: sharePercent(share),
     share,
     value: formatCost(dollars) ?? '$0',
@@ -5937,7 +5962,6 @@ function costUsageRows(costs: readonly PricedSessionCost[], whole: number, of: s
           whole,
           of,
           [`${tokens.toLocaleString('en-US')} tokens${key === 'cacheRead' ? ' at the cache-read rate' : ''}`],
-          undefined,
           cached === null ? {} : { facts: [`${cached}% of input tokens served from the cache`] },
         ),
       ];
@@ -5974,6 +5998,10 @@ function mainWaitFigures(
   }
   return { requests, timedOut, waitCost, mainCost };
 }
+
+// A Tools tab section without tool rows keeps its heading, and says so where its rows would be.
+const toolPart = (rows: CostDetailRow[]): CostDetailPart =>
+  rows.length ? { rows } : { rows, empty: 'No tool results' };
 
 const TOOL_RESULT_NOTE =
   "A request's cost goes to the tool results it read, split evenly when it read more than one. This is attribution, not tool run time.";
@@ -6050,7 +6078,7 @@ function costToolRows(costs: readonly PricedSessionCost[], of: string): CostDeta
   const rows = [
     ...(wait
       ? [
-          costDetailRow('Waits', wait.dollars, mainCost, of, [requestCount(wait.requests)], undefined, {
+          costDetailRow('Waits', wait.dollars, mainCost, of, [requestCount(wait.requests)], {
             note: [...waitTools]
               .sort((left, right) => right[1] - left[1])
               .map(([tool, count]) => `${tool} ${count}`)
@@ -6071,7 +6099,6 @@ function costToolRows(costs: readonly PricedSessionCost[], of: string): CostDeta
             mainCost,
             of,
             [requestCount(merged.reduce((sum, [, row]) => sum + row.requests, 0))],
-            undefined,
             {
               note: merged
                 .map(([kind, row]) => `${TOOL_KIND_LABELS[kind]?.toLowerCase() ?? kind} ${row.requests}`)
@@ -6105,10 +6132,11 @@ const DELEGATED_MODELS_SHOWN = 3;
 // One child of delegated work: each part's model and dollars, null for an unpriced part, and
 // whether it counts as an agent. Delegated work without a child session adds dollars but no count.
 interface DelegatedChild {
-  // A part's partial flag marks its dollars as a lower bound.
+  // A part's partial flag marks its dollars as a lower bound, and only its own model's row reads so.
   parts: readonly { model: string | null; dollars: number | null; partial?: boolean }[];
   counted: boolean;
-  // Incomplete usage, so its dollars are a lower bound.
+  // Incomplete usage that no part's model can be told apart from, so every row of the child reads
+  // its dollars as a lower bound.
   partial?: boolean;
 }
 
@@ -6560,7 +6588,7 @@ export function sessionCostProjection(
           ],
         },
         ...(tools.length || delegatedTools.length
-          ? [{ name: 'Tools' as const, parts: [{ rows: tools }, ...(delegates ? [{ rows: delegatedTools }] : [])] }]
+          ? [{ name: 'Tools' as const, parts: [toolPart(tools), ...(delegates ? [toolPart(delegatedTools)] : [])] }]
           : []),
       ],
       included: costIncluded(included),

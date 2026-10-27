@@ -1250,6 +1250,9 @@ for (const recorded of [false, true]) {
       ['Usage', 'Tools'],
     );
     assert.deepEqual(cost.tabs[1].parts[0].rows, []);
+    // The Main agent section has no tool rows, so it says so where its rows would be.
+    assert.equal(cost.tabs[1].parts[0].empty, 'No tool results');
+    assert.equal(cost.tabs[1].parts[1].empty, undefined);
     assert.deepEqual(cost.tabs[1].parts[1].rows.map((row) => row.label).sort(), ['File read', 'No tool result']);
     if (!recorded) {
       assert.deepEqual(
@@ -1295,6 +1298,52 @@ test('the turn Delegated section gives an agent with no spend a cost unavailable
   );
   assert.equal(unpriced.split, undefined, 'the split bar read Main agent 100%');
   assert.equal(unpriced.sections[1].label, 'Delegated');
+});
+
+// A lower bound marks only the model rows whose own dollars are partial. Incomplete usage of the
+// child as a whole names no model, so it still marks every row of that child.
+test('a turn Delegated model row reads a lower bound only for the model whose part is partial', () => {
+  const main = { model: 'claude-sonnet-5', usage: tokenUsage({ requests: 2, input: 50_000, output: 2000 }) };
+  const spend = [
+    { model: 'claude-haiku-4-5', unclassifiedCacheWrite: 100, usage: tokenUsage({ requests: 1, input: 100_000 }) },
+    { model: 'claude-opus-5-5', usage: tokenUsage({ requests: 1, input: 100_000, output: 1000 }) },
+  ];
+  const marks = (over: Partial<TurnAgent>) => {
+    const hero = heroOf(turn({ ...main, agents: [agent({ id: 'a1', spendFound: true, spend, ...over })] }));
+    assert.match(hero.sections[1].value!, /[+]$/, 'the Delegated dollars do not read as a lower bound');
+    return hero.tabs[0].parts[1].rows.map((row) => [row.label, row.value.endsWith('+')]);
+  };
+  assert.deepEqual(marks({}), [
+    ['Opus 5.5', false],
+    ['Haiku 4.5', true],
+  ]);
+  assert.deepEqual(marks({ spendIncomplete: true }), [
+    ['Opus 5.5', true],
+    ['Haiku 4.5', true],
+  ]);
+});
+
+// A dispatched session's partial part marks its own model row. A short read names no model, so it
+// marks every row of that session.
+test('a turn Delegated model row of a dispatched session reads a lower bound only for its partial part', () => {
+  const main = { model: 'claude-sonnet-5', usage: tokenUsage({ requests: 2, input: 50_000, output: 2000 }) };
+  const parts = [
+    dispatchedPart(1_000_000, { own: true, incomplete: true }),
+    dispatchedPart(2_000_000, { own: true, model: 'claude-opus-5-5' }),
+  ];
+  const marks = (short: boolean) => {
+    const hero = heroOf(turn(main), [dispatchedCost({ parts, short })]);
+    assert.match(hero.sections[1].value!, /[+]$/, 'the Delegated dollars do not read as a lower bound');
+    return hero.tabs[0].parts[1].rows.map((row) => [row.label, row.value.endsWith('+')]);
+  };
+  assert.deepEqual(marks(false), [
+    ['Opus 5.5', false],
+    ['Haiku 4.5', true],
+  ]);
+  assert.deepEqual(marks(true), [
+    ['Opus 5.5', true],
+    ['Haiku 4.5', true],
+  ]);
 });
 
 test('wait warning fixture signs the turn and session cost figures under a quarter of the session total', () => {
@@ -6738,6 +6787,39 @@ test('a subagent resumed in a later turn shows in both turn cards, each priced b
   check();
   refreshClaudeAgentFacts(turns, lookup, undefined);
   check();
+});
+
+// A turn's share of a child keeps each incomplete request in its usage parts, so the share's
+// incomplete mark reaches only the model row of that request.
+test('a refreshed turn share of a child marks only the model of its incomplete request as a lower bound', () => {
+  const { turns, lookup } = resumedAgentSession();
+  const resumedAt = Date.UTC(2026, 0, 1, 0, 0, 610);
+  // The child's first request in the resuming turn ran on another model, and its usage is incomplete.
+  const split: typeof lookup = (launched) => {
+    const spend = lookup(launched);
+    return {
+      ...spend,
+      requests: spend.requests?.map((request) =>
+        request.timestamp === resumedAt ? { ...request, model: 'claude-sonnet-5', incomplete: true } : request,
+      ),
+    };
+  };
+  refreshClaudeAgentFacts(turns, split, undefined);
+  const third = turns[2];
+  assert.equal(third.agents.length, 1, 'the resuming turn lists the subagent once');
+  assert.equal(third.agents[0].spendIncomplete, true, 'the share took no incomplete mark, so nothing was measured');
+  // Priced main usage gives the popover its Main agent and Delegated sections.
+  const usage = tokenUsage({ requests: 1, input: 50_000 });
+  const main = { model: 'claude-sonnet-5', provider: null, contextWindow: null, contextBand: null, usage };
+  const hero = heroOf({ ...third, usage, usageParts: [{ ...main, inferenceClass: null, serviceTier: null }] });
+  assert.match(hero.sections[1].value!, /[+]$/, 'the Delegated dollars do not read as a lower bound');
+  assert.deepEqual(
+    hero.tabs[0].parts[1].rows.map((row) => [row.label, row.value.endsWith('+')]),
+    [
+      ['Sonnet 5', true],
+      ['Haiku 4.5', false],
+    ],
+  );
 });
 
 test('a child that compacts on a model it billed nothing on still prices the estimate in its turn', () => {

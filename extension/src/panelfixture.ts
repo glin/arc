@@ -1487,9 +1487,38 @@ function costOverheadsParts() {
   return { usage, part, turn, expiry };
 }
 
-export function costOverheadsPayload(): Record<string, unknown> {
+// `delegated` gives the first turn two subagents and an estimated compaction, and the session the
+// same delegated work. Each cost popover then holds a Delegated section and an "Included above"
+// group, and runs past the 520 px cap of other figure popovers at both widths.
+export function costOverheadsPayload(delegated = false): Record<string, unknown> {
   const payload = renderPayload();
   const { usage, part, turn, expiry } = costOverheadsParts();
+  const child = (agentName: string, model: string, requests: number) => ({
+    agent: 'claude' as const,
+    role: 'delegated' as const,
+    agentName,
+    scopeId: `agent-${agentName}`,
+    ...part,
+    model,
+    usage: usage({ requests, input: 40_000 * requests, cacheRead: 900_000 * requests, output: 9_000 * requests }),
+  });
+  const children = delegated
+    ? [child('reviewer', 'claude-sonnet-5-5', 40), child('planner', 'claude-haiku-5-5', 20)]
+    : [];
+  const shown = delegated
+    ? {
+        ...turn,
+        usageParts: [
+          ...(turn.usageParts ?? []),
+          {
+            ...part,
+            compactionEstimate: true as const,
+            usage: usage({ input: 160_000, cacheRead: 300_000, output: 36_000 }),
+          },
+        ],
+        agents: children.map(subagentOf),
+      }
+    : turn;
   const childTurn = {
     ...turn,
     startedAt: turn.startedAt + 20 * 60_000,
@@ -1546,6 +1575,7 @@ export function costOverheadsPayload(): Record<string, unknown> {
             ]),
           },
           { agent: 'claude', role: 'main', ...part, compactionEstimate: true, usage: compactions },
+          ...children.map(({ agentName: _name, ...one }) => one),
         ],
         false,
         { compactionCount: 3, expiry: aggregate },
@@ -1564,7 +1594,7 @@ export function costOverheadsPayload(): Record<string, unknown> {
     views: [],
     cards: [
       {
-        ...toCard(turn, false, NOW, [], null, false, new Set(), [], turnCacheExpiryWarning(turn, expiry)),
+        ...toCard(shown, false, NOW, [], null, false, new Set(), [], turnCacheExpiryWarning(turn, expiry)),
         summaryHtml: '<p>Resumed after lunch.</p>',
       },
       {
@@ -1680,7 +1710,13 @@ function subagentOf(
 // Delegated work keeps the waits under a quarter of the whole session's cost. `five` adds children
 // with recorded costs, so the delegated work holds five model groups, two without a recorded model.
 // `turnAgents` gives the turn the same children as its subagents, so its card has delegated work.
-export function waitWarningPayload(delegated: 'three' | 'five' = 'three', turnAgents = false): Record<string, unknown> {
+// `childTools` false leaves the children without tool results, so the Delegated section of the Tools
+// tab has no rows.
+export function waitWarningPayload(
+  delegated: 'three' | 'five' = 'three',
+  turnAgents = false,
+  childTools = true,
+): Record<string, unknown> {
   const payload = renderPayload();
   const usage = (over: Partial<Turn['usage']>): Turn['usage'] => {
     const counts = {
@@ -1733,7 +1769,7 @@ export function waitWarningPayload(delegated: 'three' | 'five' = 'three', turnAg
     files: [],
   };
   // Each child's requests read files, tests, edits and other tool results. The rest read none.
-  const childTools = (share: number) =>
+  const toolsOf = (share: number) =>
     fixtureTools(
       200 * share,
       (
@@ -1758,7 +1794,7 @@ export function waitWarningPayload(delegated: 'three' | 'five' = 'three', turnAg
     ...part,
     model,
     usage: usageShare(usage({ requests: 220, input: 1_400_000, cacheRead: 40_000_000, output: 380_000 }), share),
-    tools: childTools(share),
+    ...(childTools ? { tools: toolsOf(share) } : {}),
   });
   const children = [
     child('code_review_1_npm_tests_astra', 'gpt-6-astra', '01a1535a-e7c6-7cc3-a9aa-9552803efb51', 0.03),

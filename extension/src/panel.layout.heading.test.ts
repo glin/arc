@@ -11,6 +11,7 @@ import { CONSERVATIVE_CACHE_BOUNDARY_MS } from './pricing.ts';
 import {
   DRAFT_COMPOSER,
   FIXTURE_CLOCK,
+  costOverheadsPayload,
   nextTurnPayload,
   pageHtml,
   renderPayload,
@@ -993,6 +994,107 @@ test('a constrained next-turn working does not cap a later card detail', { timeo
     await browser.close();
   }
 });
+
+// The cost popover reaches the panel's edge, so "Included above" shows without a scroll on a tall
+// narrow panel. Its cap follows a resize, and never drops below the stylesheet's cap for a figure
+// in the middle of the panel. Every other figure popover keeps that cap, also after a cost popover opened.
+test(
+  'the cost popover grows to the panel edge and other figure popovers keep their cap',
+  { timeout: 90_000 },
+  async (t) => {
+    const browser = await browserOrNone();
+    if (!browser) {
+      t.skip('no Edge, Chrome or bundled Chromium on this machine, so nothing was measured');
+      return;
+    }
+    try {
+      const page = await browser.newPage();
+      await page.setContent(pageHtml());
+      await page.setViewportSize({ width: 340, height: 1400 });
+      const payload = costOverheadsPayload(true) as { cards: { chips: Record<string, unknown>[] }[] };
+      payload.cards[0].chips.push({
+        kind: 'plain',
+        label: '40 agents',
+        detail: 'Forty agents',
+        detailList: {
+          heading: { label: '40 subagents' },
+          entries: Array.from({ length: 40 }, (_, index) => ({
+            label: `review_agent_${index + 1}`,
+            value: `$${index + 1}`,
+            lines: [`${index + 1}00k tokens`],
+          })),
+        },
+      });
+      await page.evaluate(`window.postMessage(${JSON.stringify(payload)}, '*')`);
+      await page.evaluate(SETTLED);
+      const open = async (figure: string) => {
+        await page.locator(figure).first().click();
+        await page.waitForFunction(() => {
+          const pop = document.getElementById('chippop');
+          return !!pop && !pop.hidden && pop.classList.contains('pinned');
+        });
+        return page.locator('#chippop').evaluate((node) => {
+          const box = node.getBoundingClientRect();
+          const included = node.querySelector('.costgrid:not([hidden]) .included');
+          return {
+            content: node.scrollHeight,
+            bottom: box.bottom,
+            scrolls: node.scrollHeight > node.clientHeight,
+            includedShown: !!included && included.getBoundingClientRect().bottom <= box.bottom,
+            cap: getComputedStyle(node).maxHeight,
+          };
+        });
+      };
+      const close = async () => {
+        await page.keyboard.press('Escape');
+        await page.waitForFunction(() => document.getElementById('chippop')?.hidden);
+      };
+      for (const figure of ['.sessionstats [data-metric="cost"]', '#list .turn .chips [data-metric="cost"]']) {
+        const cost = await open(figure);
+        assert.ok(cost.content > 520, `${figure} fits the ordinary cap, so nothing was measured`);
+        assert.equal(cost.scrolls, false, `${figure} scrolls on a panel tall enough to hold it`);
+        assert.ok(cost.includedShown, `"Included above" is not inside the shown popover of ${figure}`);
+        assert.ok(cost.bottom <= 1400 - 6, `${figure} runs past the panel's bottom margin`);
+        if (figure.startsWith('.sessionstats')) {
+          // A pinned cost popover takes its cap again when the panel shrinks.
+          await page.setViewportSize({ width: 340, height: 600 });
+          await page.waitForFunction(() => {
+            const pop = document.getElementById('chippop')!;
+            return pop.getBoundingClientRect().bottom <= innerHeight - 6 && pop.scrollHeight > pop.clientHeight;
+          });
+          await page.setViewportSize({ width: 340, height: 1400 });
+        }
+        await close();
+      }
+      // A turn cost figure in the middle of the panel has less room on each side than the ordinary cap,
+      // and its popover keeps that cap.
+      await page.setViewportSize({ width: 340, height: 900 });
+      const room = await page
+        .locator('#list .turn .chips [data-metric="cost"]')
+        .first()
+        .evaluate((node) => {
+          // The first turn's top margin moves its cost figure to the middle of the panel.
+          const before = node.getBoundingClientRect();
+          const lift = innerHeight / 2 - (before.top + before.bottom) / 2;
+          if (lift > 0) (node.closest('.turn') as HTMLElement).style.marginTop = `${lift}px`;
+          else node.scrollIntoView({ block: 'center' });
+          const box = node.getBoundingClientRect();
+          return Math.max(innerHeight - 12 - box.bottom, box.top - 12);
+        });
+      assert.ok(room < 520, 'the turn cost figure has room for the ordinary cap, so nothing was measured');
+      const middle = await open('#list .turn .chips [data-metric="cost"]');
+      assert.ok(parseFloat(middle.cap) >= 520, `the turn cost popover cap ${middle.cap} fell below the ordinary cap`);
+      await page.setViewportSize({ width: 340, height: 1400 });
+      await page.keyboard.press('Escape');
+      await page.waitForFunction(() => document.getElementById('chippop')?.hidden);
+      const ordinary = await open('#list .turn .chips .has-detail:has-text("40 agents")');
+      assert.equal(ordinary.cap, '520px', 'another figure popover lost the stylesheet cap');
+      assert.ok(ordinary.scrolls, 'the forty agent rows fit the cap, so nothing was measured');
+    } finally {
+      await browser.close();
+    }
+  },
+);
 
 test('a rebuild hands the price back to the reader who was holding it', { timeout: 90_000 }, async (t) => {
   const browser = await browserOrNone();

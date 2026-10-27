@@ -106,8 +106,8 @@
   },
   "extension/src/panel.layout.heading.test.ts": {
     "reason": "Session headings must retain accessible controls and browser interaction across responsive states.",
-    "cases": 19,
-    "matricesSha256": "46966f6392dfa2120781c74db964f414b662b46d6f76544b2ac0867ac409fc28"
+    "cases": 20,
+    "matricesSha256": "e06fe9d07a4f8a0e80e7d2064b4e55859a255093c532b6adc2857c602f3402cb"
   },
   "extension/src/panel.layout.messages.test.ts": {
     "reason": "Rendered messages must preserve browser selection and interaction for rich content.",
