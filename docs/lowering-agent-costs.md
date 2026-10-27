@@ -91,12 +91,32 @@ Codex has no foreground launch. `spawn_agent` returns at once, and the parent wa
 
 Codex's built-in guidance limits blocking waits and requests frequent commentary. Repeated short waits or sleeps can satisfy that guidance but create a model request with retained context after each return.
 
-For Codex v2 subagents, combine a native timeout floor with developer instructions. Put the root setting before table headings in `~/.codex/config.toml`. Merge existing developer text because configuration precedence selects one value.
+Use additive developer instructions to preserve native waiting despite the general wait and commentary limits. Put the root setting before table headings in `~/.codex/config.toml`. Merge existing developer text because configuration precedence selects one value.
 
 ```toml
-# Select native waiting and exempt it from periodic commentary.
-developer_instructions = "When only a native subagent remains active, wait through collaboration.wait_agent using its configured default timeout. Native waits return for subagent completion and messages. Do not use clock.sleep, shell sleeps, background reads, periodic status checks, or commentary-only wakeups to wait for that subagent. This native-wait rule is an exception to the general 60-second blocking-wait and commentary guidance. It does not restrict a child explicitly instructed to sleep. Tell native children to send only their final answer or one blocker."
+# Native child waits can exceed the general wait and commentary limits.
+developer_instructions = """
+For native subagents, use the available native wait tool with its required target arguments. Request timeout_ms=1500000 only when the tool schema accepts it. Otherwise use the schema's supported maximum. Native waiting is exempt from the built-in 60-second wait limit and commentary guidance. Do not shorten or interrupt a native wait to send progress. Do not substitute timer sleeps, shell sleeps, status queries, or background reads for native waiting. Preserve any explicitly requested child sleep. If the wait returns timed_out=true and work remains, repeat the native wait.
+"""
+```
 
+The instruction supplements the built-in prompt. It depends on model compliance and reaches descendants. Children explicitly asked to sleep remain free to do so. Tell children to send only their final result or one blocker. Routine progress messages create additional parent requests.
+
+In a fresh process and session, check that the developer message contains the text and the parent uses native waiting. Existing sessions retain their loaded configuration and protocol.
+
+### Protocol selection
+
+Use the effective model catalog and actual tool schema to identify the native protocol. Provider identity and `features.multi_agent_v2=false` alone do not establish it. The instruction names the available tool rather than selecting a protocol.
+
+V1 exposes `multi_agent_v1.wait_agent` with required `targets`. The tested v2 interface exposes `collaboration.wait_agent` without a target argument. Both accept an explicit timeout within their tool limits.
+
+Native waiting does not require a custom catalog when the provider catalog supports delegation. A `model_catalog_json` override selects model metadata and protocol, not wait duration. Its snapshot also freezes bundled instructions. Keep a custom catalog only for a demonstrated compatibility requirement.
+
+### Optional v2 timeout floor
+
+A v2 timeout floor is a separate setting. It clamps a short timeout after the model selects native waiting:
+
+```toml
 # Clamp short requests after the model selects the v2 wait tool.
 [features.multi_agent_v2]
 min_wait_timeout_ms = 1500000
@@ -106,30 +126,11 @@ max_wait_timeout_ms = 3600000
 
 Keep the floor below your model's documented cache lifetime to reduce expiry risk. Set the default at or above the minimum.
 
-The instruction supplements the built-in prompt. It depends on model compliance and reaches descendants. Children explicitly asked to sleep remain free to do so. Completion, messages, and steering end a v2 wait early. The floor sets the requested timeout, not a minimum elapsed wait. It does not affect a parent's sleep or shell commands.
-
-In a fresh process and session, check that the developer message contains the text and the parent uses native waiting.
+Completion, messages, and steering end a v2 wait early. The floor sets the requested timeout, not a minimum elapsed wait. It does not affect a parent's sleep or shell commands. A parent that explicitly requests a supported long timeout needs no floor for that call.
 
 The table configures the v2 protocol only. [The versioned v1 handler](https://github.com/openai/codex/blob/rust-v0.163.0/codex-rs/core/src/tools/handlers/multi_agents/wait.rs) uses fixed timeout constants. [The v2 handler](https://github.com/openai/codex/blob/rust-v0.163.0/codex-rs/core/src/tools/handlers/multi_agents_v2/wait.rs) reads the configured floor.
 
-### Native waiting with v1
-
-A v1 session needs its exposed native wait tool and an explicit long timeout within that tool's limits. For a session exposing `multi_agent_v1.wait_agent` with required `targets`, use this root setting instead of the v2 instruction:
-
-```toml
-# Request long native waits despite the built-in minute guidance.
-developer_instructions = """
-For native subagents, use multi_agent_v1.wait_agent with their targets. Request timeout_ms=1500000 only when the tool schema accepts it. Otherwise use the schema's supported maximum. Native waiting is exempt from the built-in 60-second wait limit and commentary guidance. Do not shorten or interrupt a native wait to send progress. Do not substitute timer sleeps, shell sleeps, status queries, or background reads for native waiting. Preserve any explicitly requested child sleep. If the wait returns timed_out=true and work remains, repeat the native wait.
-"""
-```
-
-Merge existing developer text into the same value. The instruction depends on model compliance and reaches descendants. It enforces no v1 timeout floor. Check default loading in a fresh process and session without per-run overrides.
-
-Check the effective model catalog and exposed tools before choosing either recipe. Provider identity and `features.multi_agent_v2=false` alone do not establish the active protocol. For Bedrock setups requiring v1, confirm that the selected model's effective `multi_agent_version` is `v1`.
-
-If the catalog selects the wrong protocol, preserve it and change only the required entry. Set its absolute path with root setting `model_catalog_json`. Preserve existing catalog overrides. A snapshot freezes provider metadata and bundled base instructions, so regenerate it and recheck the protocol after CLI upgrades. No catalog override is needed when the effective entry already selects the required protocol.
-
-These instructions do not establish steering, cancellation, or resumed-session behavior for v1. Check those paths separately when your workflow needs them.
+The instruction alone enforces no timeout floor. Check steering, cancellation, and resumed-session behavior separately when your workflow needs them.
 
 The [configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference) defines the additive instruction setting. [A community experiment](https://github.com/openai/codex/issues/35108#issuecomment-5552457213) reports a similar developer-level exception. Check these version-sensitive wait settings after upgrading Codex.
 
