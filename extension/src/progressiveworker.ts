@@ -298,11 +298,27 @@ export interface DiscoveryCharges extends Record<import('./codex').CodexDispatch
   // The pass budget left after each Codex aggregate that read and stopped unfinished, summed over the stops in the exhaustion fields.
   dispatchAggregateRemainingBytes: number;
   dispatchAggregateRemainingMs: number;
+  // Dispatched visits whose spend read opened at byte 0 after the root's previous read ended past byte 0.
+  dispatchSpendRootRestarts: number;
   // The worker's time for the request, and the read whose limit ended a pass before the dispatched window.
   passMs: number;
   transcriptPassEnds: number;
   receiptPassEnds: number;
   otherPassEnds: number;
+}
+// One dispatched root's share of the dispatch charges in one complete discovery reply, keyed by its session ID.
+// `bytes` covers the reads of the root's visits. `restarts`, `rootWaits` and `remainingBytes` match the totals of the same
+// names. A Claude spend read always opens at byte 0, so every Claude visit that reads spend after an earlier read restarts.
+// `size` is the root file's size at the root's last visit, not the size of a descendant the root's aggregate reads.
+export interface DispatchRootCharges {
+  agent: 'claude' | 'codex';
+  passes: number;
+  bytes: number;
+  rereads: number;
+  rootWaits: number;
+  restarts: number;
+  remainingBytes: number;
+  size: number;
 }
 // One verified child transcript whose recorded edits a file action needs.
 // The revision is the child's spend file version, the same revision its summary figures carry.
@@ -382,6 +398,7 @@ export type ProgressiveValue =
       complete: boolean;
       continuation: boolean;
       charges?: DiscoveryCharges;
+      dispatchRoots?: Record<string, DispatchRootCharges>;
       roots?: SessionFile[];
       scope?: string[];
       checkpoint?: DiscoveryCheckpoint;

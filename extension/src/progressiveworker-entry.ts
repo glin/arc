@@ -123,7 +123,7 @@ import type {
   DiscoveryCheckpoint,
   DiscoveryCharges,
 } from './progressiveworker';
-import type { DispatchSessionFacts, WorkerWindowRead } from './progressiveworker';
+import type { DispatchRootCharges, DispatchSessionFacts, WorkerWindowRead } from './progressiveworker';
 import {
   CHILD_EDIT_READ_BYTES,
   progressiveTurns,
@@ -157,6 +157,8 @@ interface HeldDispatchFacts {
   saved?: SavedDispatchFacts;
 }
 const dispatchFacts = new Map<string, HeldDispatchFacts>();
+// The bytes of each dispatched Claude session's last spend read, by session ID, so a later read from byte 0 counts as a restart.
+const claudeSpendEnds = new Map<string, number>();
 // Row keys this worker already looked up for saved dispatched facts, so an entry the worker dropped stays dropped.
 const seededDispatchFacts = new Set<string>();
 // The settled facts each dispatched file saves with its reference row, by row key, from the last dispatch pass.
@@ -578,6 +580,7 @@ async function execute(
       dispatchClaudeSpendBytes: 0,
       dispatchAggregateRemainingBytes: 0,
       dispatchAggregateRemainingMs: 0,
+      dispatchSpendRootRestarts: 0,
       passMs: 0,
       transcriptPassEnds: 0,
       receiptPassEnds: 0,
@@ -1104,21 +1107,42 @@ async function execute(
     );
     const dispatched: DispatchSessionFacts[] = [];
     const seen = new Set<string>();
+    const dispatchRoots: Record<string, DispatchRootCharges> = {};
     // Each request caps Codex spend reads independently of relationship discovery and of the other dispatch visits.
     const dispatchBudget = { bytes: CODEX_DISPATCH_REQUEST_BYTES, ms: RELATIONSHIP_SLICE_MS };
     const dispatchReads = openReadWindow();
+    // The open root takes every read from the start of its visit to the start of the next root's visit.
+    let openRoot: { root: DispatchRootCharges; before: number } | null = null;
+    const closeRoot = () => {
+      if (openRoot) openRoot.root.bytes += dispatchReads.bytes - openRoot.before;
+      openRoot = null;
+    };
     try {
       const subagentMetas = claudeSubagentMetaReader();
       for (const reference of admittedReferences) {
         if (reference.kind !== 'dispatch' || !reference.file || seen.has(reference.sessionId)) {
           continue;
         }
+        closeRoot();
         seen.add(reference.sessionId);
         charges.dispatchSpendVisits++;
+        const root = (dispatchRoots[reference.sessionId] ??= {
+          agent: reference.agent,
+          passes: 0,
+          bytes: 0,
+          rereads: 0,
+          rootWaits: 0,
+          restarts: 0,
+          remainingBytes: 0,
+          size: 0,
+        });
+        root.passes++;
+        openRoot = { root, before: dispatchReads.bytes };
         const revision = revisionOf(reference.file);
         if (!revision) {
           continue;
         }
+        root.size = revision.size;
         const heldValue = dispatchFacts.get(reference.file) ?? seededDispatch(reference.file);
         const sourceGeneration = claudeChildReferences.get(normalizeFsPath(reference.file))?.sourceGeneration;
         const held =
@@ -1154,7 +1178,10 @@ async function execute(
           continue;
         }
         // A visit that resumes a pending spend aggregate at the same revision does not count as a reread.
-        if (!held?.spendPending || !sameRevision(held.revision, revision)) charges.dispatchSpendRereads++;
+        if (!held?.spendPending || !sameRevision(held.revision, revision)) {
+          charges.dispatchSpendRereads++;
+          root.rereads++;
+        }
         const previousPerson =
           held &&
           held.revision.dev === revision.dev &&
@@ -1207,6 +1234,7 @@ async function execute(
         const active = now < refreshAt;
         if (active && reference.agent === 'codex') releaseCodexDispatchSpend(reference.file);
         let spendPending = false;
+        let spendRestarted = false;
         const spendBefore = dispatchReads.bytes;
         const spend: AgentSpend = active
           ? { models: [], found: false, partial: false, effort: null }
@@ -1223,19 +1251,30 @@ async function execute(
                   (file, entry) => parentPort?.postMessage({ dispatchSpend: [file, entry] }),
                   (event) => {
                     charges[event]++;
+                    if (event === 'dispatchSpendRootWaits') root.rootWaits++;
                     if (event.startsWith('dispatchSpendAggregateExhausted')) {
                       charges.dispatchAggregateRemainingBytes += dispatchBudget.bytes;
                       charges.dispatchAggregateRemainingMs += dispatchBudget.ms;
+                      root.remainingBytes += dispatchBudget.bytes;
                     }
                   },
                 );
                 spendPending = result.pending;
+                spendRestarted = result.restarted;
                 continuation ||= result.pending;
                 return result.spend;
               })()
             : readClaudeAgentSpend(reference.file, request.repositoryRoots, false, subagentMetas);
-        charges[reference.agent === 'codex' ? 'dispatchAggregateBytes' : 'dispatchClaudeSpendBytes'] +=
-          dispatchReads.bytes - spendBefore;
+        const spendBytes = dispatchReads.bytes - spendBefore;
+        charges[reference.agent === 'codex' ? 'dispatchAggregateBytes' : 'dispatchClaudeSpendBytes'] += spendBytes;
+        if (reference.agent === 'claude' && spendBytes > 0) {
+          spendRestarted = (claudeSpendEnds.get(reference.sessionId) ?? 0) > 0;
+          claudeSpendEnds.set(reference.sessionId, spendBytes);
+        }
+        if (spendRestarted) {
+          charges.dispatchSpendRootRestarts++;
+          root.restarts++;
+        }
         if (!active && activity.unfinished) {
           spend.unfinished = true;
           if (spend.artifacts) {
@@ -1314,6 +1353,7 @@ async function execute(
         dispatched.push(facts);
       }
     } finally {
+      closeRoot();
       const dispatchTally = closeReadWindow(dispatchReads);
       charges.dispatchSpendFiles += dispatchTally.files;
       charges.dispatchSpendBytes += dispatchTally.bytes;
@@ -1327,6 +1367,7 @@ async function execute(
         dispatchFacts.delete(file);
       }
     }
+    for (const sessionId of claudeSpendEnds.keys()) if (!seen.has(sessionId)) claudeSpendEnds.delete(sessionId);
     savedDispatchFacts = new Map();
     for (const [file, held] of dispatchFacts) {
       if (!held.settled) continue;
@@ -1351,6 +1392,7 @@ async function execute(
       complete: true,
       continuation,
       charges,
+      dispatchRoots,
       roots: epoch.parents,
       scope: epoch.repositoryRoots,
     };

@@ -145,6 +145,7 @@ test('performance counters correlate posts and replies for every open panel', ()
       dispatchClaudeSpendBytes: 0,
       dispatchAggregateRemainingBytes: 0,
       dispatchAggregateRemainingMs: 0,
+      dispatchSpendRootRestarts: 0,
       passMs: 0,
       transcriptPassEnds: 0,
       receiptPassEnds: 0,
@@ -152,6 +153,7 @@ test('performance counters correlate posts and replies for every open panel', ()
       continuations: 0,
       publications: 0,
     },
+    dispatchRoots: {},
     sourceId: 'window-a',
     startedAt: '1970-01-01T00:00:01.000Z',
     captureCount: 0,
@@ -763,6 +765,7 @@ test('discovery counters sum relationship read charges across worker replies', (
     dispatchClaudeSpendBytes: 13,
     dispatchAggregateRemainingBytes: 14,
     dispatchAggregateRemainingMs: 15,
+    dispatchSpendRootRestarts: 2,
     passMs: 16,
     transcriptPassEnds: 17,
     receiptPassEnds: 18,
@@ -805,12 +808,76 @@ test('discovery counters sum relationship read charges across worker replies', (
     dispatchClaudeSpendBytes: 26,
     dispatchAggregateRemainingBytes: 28,
     dispatchAggregateRemainingMs: 30,
+    dispatchSpendRootRestarts: 4,
     passMs: 32,
     transcriptPassEnds: 34,
     receiptPassEnds: 36,
     otherPassEnds: 38,
     continuations: 1,
     publications: 1,
+  });
+});
+
+test('dispatched roots sum by session ID and fold every root past the twenty with the most bytes into other', () => {
+  const counters = new PanelPerformanceCounters(1000, 'window-a');
+  const root = (bytes: number, agent: 'claude' | 'codex' = 'codex', size = 100) => ({
+    agent,
+    passes: 1,
+    bytes,
+    rereads: 1,
+    rootWaits: 2,
+    restarts: 1,
+    remainingBytes: 3,
+    size,
+  });
+  const reply = { complete: true, continuation: true };
+  counters.recordDiscovery(undefined, reply, {
+    grown: root(500, 'codex', 100),
+    quiet: root(10, 'claude'),
+  });
+  counters.recordDiscovery(undefined, reply, {
+    grown: root(700, 'codex', 250),
+  });
+  assert.deepEqual(counters.snapshot().dispatchRoots, {
+    grown: {
+      agent: 'codex',
+      passes: 2,
+      bytes: 1200,
+      rereads: 2,
+      rootWaits: 4,
+      restarts: 2,
+      remainingBytes: 6,
+      size: 250,
+    },
+    quiet: {
+      agent: 'claude',
+      passes: 1,
+      bytes: 10,
+      rereads: 1,
+      rootWaits: 2,
+      restarts: 1,
+      remainingBytes: 3,
+      size: 100,
+    },
+  });
+  counters.recordDiscovery(
+    undefined,
+    reply,
+    Object.fromEntries(Array.from({ length: 20 }, (_, index) => [`root-${index}`, root(1000 + index)])),
+  );
+  const roots = counters.snapshot().dispatchRoots;
+  assert.equal(Object.keys(roots).length, 21);
+  assert.ok(roots.grown && roots['root-19']);
+  assert.equal(roots.quiet, undefined, 'the root with the fewest bytes kept its own record');
+  assert.equal(roots['root-0'], undefined, 'the twenty-first root by bytes kept its own record');
+  assert.deepEqual(roots.other, {
+    roots: 2,
+    passes: 2,
+    bytes: 1010,
+    rereads: 2,
+    rootWaits: 4,
+    restarts: 2,
+    remainingBytes: 6,
   });
 });
 

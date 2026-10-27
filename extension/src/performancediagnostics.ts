@@ -96,7 +96,16 @@ export interface PerformanceCounterSnapshot {
   lastWatcherOperation: WatcherOperation | null;
   lastLedgerSave: LedgerSaveOperation | null;
   startup?: { id: number; milestones: Partial<Record<StartupMilestone, number>> };
+  // Dispatched spend by root session ID, summed over complete discovery replies. The roots with the most bytes keep
+  // their own record, and `other` sums the rest with their count, so the snapshot stays within a fixed size.
+  dispatchRoots: Record<string, DispatchRootRecord>;
 }
+
+type DispatchRootCharges = import('./progressiveworker').DispatchRootCharges;
+export type DispatchRootRecord =
+  | DispatchRootCharges
+  | (Omit<DispatchRootCharges, 'agent' | 'size'> & { roots: number });
+export const DISPATCH_ROOT_RECORDS = 20;
 
 export type StartupMilestone = 'shellReady' | 'catalogReady' | 'railReady' | 'firstCard' | 'completeRender';
 
@@ -213,12 +222,29 @@ const DISCOVERY_CHARGE_FIELDS: { readonly [K in keyof DiscoveryCharges]-?: true 
   dispatchClaudeSpendBytes: true,
   dispatchAggregateRemainingBytes: true,
   dispatchAggregateRemainingMs: true,
+  dispatchSpendRootRestarts: true,
   passMs: true,
   transcriptPassEnds: true,
   receiptPassEnds: true,
   otherPassEnds: true,
 };
 const DISCOVERY_CHARGE_KEYS = Object.keys(DISCOVERY_CHARGE_FIELDS) as (keyof DiscoveryCharges)[];
+const DISPATCH_ROOT_SUMS = ['passes', 'bytes', 'rereads', 'rootWaits', 'restarts', 'remainingBytes'] as const;
+
+// The roots with the most bytes keep their records. The rest fold into `other`.
+function dispatchRootSnapshot(roots: ReadonlyMap<string, DispatchRootCharges>): Record<string, DispatchRootRecord> {
+  const ranked = [...roots].sort(([a, left], [b, right]) => right.bytes - left.bytes || a.localeCompare(b));
+  const records: Record<string, DispatchRootRecord> = Object.fromEntries(
+    ranked.slice(0, DISPATCH_ROOT_RECORDS).map(([sessionId, root]) => [sessionId, { ...root }]),
+  );
+  const rest = ranked.slice(DISPATCH_ROOT_RECORDS);
+  if (rest.length) {
+    const other = { roots: rest.length, passes: 0, bytes: 0, rereads: 0, rootWaits: 0, restarts: 0, remainingBytes: 0 };
+    for (const [, root] of rest) for (const key of DISPATCH_ROOT_SUMS) other[key] += root[key];
+    records.other = other;
+  }
+  return records;
+}
 
 export class PanelPerformanceCounters {
   readonly sourceId: string;
@@ -260,6 +286,7 @@ export class PanelPerformanceCounters {
     dispatchClaudeSpendBytes: 0,
     dispatchAggregateRemainingBytes: 0,
     dispatchAggregateRemainingMs: 0,
+    dispatchSpendRootRestarts: 0,
     passMs: 0,
     transcriptPassEnds: 0,
     receiptPassEnds: 0,
@@ -271,10 +298,22 @@ export class PanelPerformanceCounters {
   recordDiscovery(
     charges: import('./progressiveworker').DiscoveryCharges | undefined,
     reply: { complete: boolean; continuation: boolean },
+    dispatchRoots?: Record<string, DispatchRootCharges>,
   ): void {
     if (charges) for (const key of DISCOVERY_CHARGE_KEYS) this.discovery[key] += charges[key] ?? 0;
     this.discovery[reply.complete && !reply.continuation ? 'publications' : 'continuations']++;
+    for (const [sessionId, root] of Object.entries(dispatchRoots ?? {})) {
+      const held = this.dispatchRoots.get(sessionId);
+      if (!held) {
+        this.dispatchRoots.set(sessionId, { ...root });
+        continue;
+      }
+      for (const key of DISPATCH_ROOT_SUMS) held[key] += root[key];
+      held.agent = root.agent;
+      held.size = root.size;
+    }
   }
+  private readonly dispatchRoots = new Map<string, DispatchRootCharges>();
   private watcherOperationCount = 0;
   private readonly watcherDecisions: WatcherDecisionCounts = {
     targeted: 0,
@@ -497,6 +536,7 @@ export class PanelPerformanceCounters {
         : null,
       lastLedgerSave: this.lastLedgerSave ? { ...this.lastLedgerSave } : null,
       ...(this.startup ? { startup: { id: this.startup.id, milestones: { ...this.startup.milestones } } } : {}),
+      dispatchRoots: dispatchRootSnapshot(this.dispatchRoots),
     };
   }
 
@@ -662,6 +702,9 @@ export function projectPerformanceDiagnostics(state: PerformanceDiagnosticState,
       ...(state.counters.startup
         ? { startup: { id: state.counters.startup.id, milestones: { ...state.counters.startup.milestones } } }
         : {}),
+      dispatchRoots: Object.fromEntries(
+        Object.entries(state.counters.dispatchRoots).map(([sessionId, root]) => [sessionId, { ...root }]),
+      ),
     },
     redaction: {
       paths: 'omitted',

@@ -482,6 +482,7 @@ test('unfinished startup keeps fresh durable work after the pending deadline wit
     dispatchClaudeSpendBytes: 0,
     dispatchAggregateRemainingBytes: 0,
     dispatchAggregateRemainingMs: 0,
+    dispatchSpendRootRestarts: 0,
     passMs: 0,
     transcriptPassEnds: 0,
     receiptPassEnds: 0,
@@ -575,6 +576,7 @@ test('unfinished startup keeps fresh durable work after the pending deadline wit
         ['dispatchSpendAggregateExhaustedBytes', 0],
         ['dispatchSpendAggregateExhaustedTime', 0],
         ['dispatchSpendAggregateExhaustedSource', 0],
+        ['dispatchSpendRootRestarts', 0],
       ],
     );
     assert.equal(record.work.worker.active[0].ageMs, 180_000);

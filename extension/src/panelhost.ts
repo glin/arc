@@ -12506,10 +12506,11 @@ export class PanelProvider implements vscode.Disposable {
       progress.kind !== 'claude-children-delta'
     )
       return false;
-    this.performanceCounters?.recordDiscovery?.(progress.charges, {
-      complete: progress.kind === 'claude-children',
-      continuation: progress.continuation,
-    });
+    this.performanceCounters?.recordDiscovery?.(
+      progress.charges,
+      { complete: progress.kind === 'claude-children', continuation: progress.continuation },
+      progress.kind === 'claude-children' ? progress.dispatchRoots : undefined,
+    );
     if (signal.aborted || result.generation !== this.refreshGeneration) return false;
     const discoveryWaiting = this.dispatchedDiscoveryWaiting();
     if (progress.kind !== 'claude-children' || !progress.complete) {

@@ -19,6 +19,7 @@ import {
   sameProgressiveRevision,
   type ProgressiveInput,
   type ProgressiveCheckpoint,
+  type DispatchRootCharges,
   type ProgressiveResult,
 } from './progressiveworker';
 import {
@@ -12190,6 +12191,125 @@ test('dispatched spend aggregates settle across passes beside a running Codex ro
     const after = await worker.run(request(), 1, new AbortController().signal);
     assert.ok(after?.value.kind === 'claude-children');
     assert.equal(after.value.charges!.dispatchSpendRereads, 0);
+  } finally {
+    worker.stop();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('a dispatched root that grows between passes charges a restart and its full size again, and a quiet root none', async () => {
+  const directory = tempDir('spend-by-root-');
+  const parentFile = path.join(directory, 'parent.jsonl');
+  const now = Date.now() + 7_200_000;
+  const grownId = 'aaaaaaaa-1111-1111-1111-111111111111';
+  const quietId = 'bbbbbbbb-1111-1111-1111-111111111111';
+  fs.writeFileSync(
+    parentFile,
+    [grownId, quietId]
+      .flatMap((sessionId, index) =>
+        claudeDispatchTranscript(
+          'python child.py --arc-dispatch',
+          `ARC_DISPATCH_SESSION={"agent":"codex","session_id":"${sessionId}","owned":true}`,
+          `dispatch-${index}`,
+        ),
+      )
+      .map((record) => JSON.stringify(record) + '\n')
+      .join(''),
+  );
+  const record = (type: string, payload: object) => JSON.stringify({ type, timestamp: timestamp(1), payload }) + '\n';
+  const turn = (id: string, blocks: number) =>
+    record('event_msg', { type: 'task_started', turn_id: id }) +
+    record('turn_context', { turn_id: id, model: 'gpt-6.1-sol' }) +
+    record('event_msg', { type: 'user_message', message: 'work' }) +
+    Array.from({ length: blocks }, () => record('ignored', { text: 'x'.repeat(65500) })).join('') +
+    record('event_msg', {
+      type: 'token_count',
+      info: {
+        last_token_usage: {
+          input_tokens: 10,
+          output_tokens: 3,
+          total_tokens: 13,
+        },
+        total_token_usage: {
+          input_tokens: 10,
+          output_tokens: 3,
+          total_tokens: 13,
+        },
+      },
+    }) +
+    record('event_msg', { type: 'task_complete', turn_id: id });
+  for (const sessionId of [grownId, quietId])
+    fs.writeFileSync(
+      path.join(directory, sessionId + '.jsonl'),
+      record('session_meta', {
+        id: sessionId,
+        cwd: directory,
+        source: 'exec',
+      }) + turn('work', 5),
+    );
+  const session = (sessionId: string, agent: 'claude' | 'codex') => {
+    const file = path.join(directory, sessionId + '.jsonl');
+    return {
+      file,
+      sessionId,
+      agent,
+      ...revisionOf(fs.statSync(file, { bigint: true })),
+    };
+  };
+  const request = () => ({
+    kind: 'claude-children' as const,
+    parents: [session('parent', 'claude')],
+    catalog: [session('parent', 'claude'), session(grownId, 'codex'), session(quietId, 'codex')],
+    codexChildren: [],
+    repositoryRoots: [directory],
+  });
+  // A 128 KiB pass budget parses each root of about 330 KB over several passes, and the frozen clock never ends a pass.
+  const worker = new ProgressiveWorker(
+    `performance.now = () => 0; Date.now = () => ${now};` + dispatchWorkerSource(128),
+  );
+  const settle = async () => {
+    const roots = new Map<string, DispatchRootCharges>();
+    let restarts = 0;
+    for (let pass = 0; pass < 40; pass++) {
+      const result = await worker.run(request(), 1, new AbortController().signal);
+      assert.ok(result?.value.kind === 'claude-children' || result?.value.kind === 'claude-children-progress');
+      if (result.value.kind !== 'claude-children') continue;
+      restarts += result.value.charges!.dispatchSpendRootRestarts;
+      for (const [sessionId, root] of Object.entries(result.value.dispatchRoots ?? {})) {
+        const held = roots.get(sessionId);
+        roots.set(sessionId, {
+          ...root,
+          passes: (held?.passes ?? 0) + root.passes,
+          bytes: (held?.bytes ?? 0) + root.bytes,
+          restarts: (held?.restarts ?? 0) + root.restarts,
+        });
+      }
+      if (!result.value.continuation) return { roots, restarts };
+    }
+    throw new Error(`dispatch spend never settled: ${JSON.stringify([...roots])}`);
+  };
+  try {
+    const first = await settle();
+    const firstSize = fs.statSync(path.join(directory, grownId + '.jsonl')).size;
+    assert.equal(first.restarts, 0, 'a parse that resumed across passes counted as a restart');
+    assert.ok(first.roots.get(grownId)!.passes > 1, 'the byte budget did not split the parse across passes');
+    for (const sessionId of [grownId, quietId]) {
+      assert.equal(first.roots.get(sessionId)?.agent, 'codex');
+      assert.equal(first.roots.get(sessionId)?.restarts, 0, sessionId);
+      assert.ok(first.roots.get(sessionId)!.bytes >= firstSize, `${sessionId} read less than its size`);
+    }
+    fs.appendFileSync(path.join(directory, grownId + '.jsonl'), turn('again', 1));
+    const grownSize = fs.statSync(path.join(directory, grownId + '.jsonl')).size;
+    const second = await settle();
+    assert.equal(second.restarts, 1, JSON.stringify([...second.roots]));
+    assert.equal(second.roots.get(grownId)?.restarts, 1);
+    assert.equal(second.roots.get(grownId)?.size, grownSize);
+    assert.ok(
+      second.roots.get(grownId)!.bytes >= grownSize,
+      `the grown root read ${second.roots.get(grownId)!.bytes} bytes of ${grownSize}`,
+    );
+    assert.equal(second.roots.get(quietId)?.restarts, 0);
+    assert.equal(second.roots.get(quietId)?.bytes, 0, 'the quiet root read again');
   } finally {
     worker.stop();
     fs.rmSync(directory, { recursive: true, force: true });

@@ -5367,6 +5367,7 @@ export function retainCodexDispatchSpend(file: string, entry: CodexDispatchSpend
 
 export function retainCodexDispatchSpendRoots(files: ReadonlySet<string>): void {
   for (const root of [...pendingDispatchAggregates.keys()]) if (!files.has(root)) discardDispatchAggregate(root);
+  for (const root of [...dispatchParseEnds.keys()]) if (!files.has(root)) dispatchParseEnds.delete(root);
 }
 
 // Each admitted root retains its own traversal and unfinished source parse independently of
@@ -5381,6 +5382,10 @@ const pendingDispatchAggregates = new Map<
     source: { file: string; key: string; scan: Generator<{ bytes: number; end: boolean }, CodexOwnSpend> } | null;
   }
 >();
+
+// The bytes each root's last parse of a source read. It outlives the root's aggregates, so a parse that opens a
+// source at byte 0 after an earlier parse read past byte 0 counts as a restart.
+const dispatchParseEnds = new Map<string, Map<string, number>>();
 
 function discardDispatchAggregate(root: string): void {
   const aggregate = pendingDispatchAggregates.get(root);
@@ -5414,7 +5419,7 @@ export function readCodexDispatchedSpendQuantum(
   dependencies: (files: string[]) => void,
   completed: (file: string, entry: CodexDispatchSpendEntry) => void,
   progress?: (event: CodexDispatchSpendProgress) => void,
-): { spend: AgentSpend; pending: boolean } {
+): { spend: AgentSpend; pending: boolean; restarted: boolean } {
   const index = codexSpendIndex(children);
   const held = pendingDispatchAggregates.get(file);
   if (held) {
@@ -5430,8 +5435,11 @@ export function readCodexDispatchedSpendQuantum(
   // A root wait is a visit that finds the pass budget already spent. A pending aggregate keeps its traversal and parse.
   if (budget.bytes <= 0 || (budget.advanced && budget.ms <= 0)) {
     progress?.('dispatchSpendRootWaits');
-    return { spend: { models: [], found: false, partial: true, effort: null }, pending: true };
+    return { spend: { models: [], found: false, partial: true, effort: null }, pending: true, restarted: false };
   }
+  let parseEnds = dispatchParseEnds.get(file);
+  if (!parseEnds) dispatchParseEnds.set(file, (parseEnds = new Map()));
+  let restarted = false;
   if (!aggregate) {
     progress?.('dispatchSpendAggregateStarts');
     const scan = codexDispatchedSpendScan(file, index);
@@ -5462,12 +5470,17 @@ export function readCodexDispatchedSpendQuantum(
         aggregate.source.scan.return(undefined as never);
         aggregate.source = null;
       }
-      aggregate.source ??= { file: source, key, scan: readCodexOwnSpendIncremental(source) };
+      if (!aggregate.source) {
+        restarted ||= (parseEnds.get(source) ?? 0) > 0;
+        parseEnds.set(source, 0);
+        aggregate.source = { file: source, key, scan: readCodexOwnSpendIncremental(source) };
+      }
       let next = aggregate.source.scan.next();
       progress?.('dispatchSpendParserAdvancements');
       budget.advanced = true;
       if (!next.done) {
         budget.bytes -= next.value.bytes;
+        parseEnds.set(source, parseEnds.get(source)! + next.value.bytes);
         if (!next.value.end) continue;
         next = aggregate.source.scan.next();
         progress?.('dispatchSpendParserAdvancements');
@@ -5502,7 +5515,7 @@ export function readCodexDispatchedSpendQuantum(
     progress?.('dispatchSpendAggregateCompletions');
     const spend = aggregate.next.value;
     pendingDispatchAggregates.delete(file);
-    return { spend, pending: false };
+    return { spend, pending: false, restarted };
   }
   // An unfinished aggregate names what stopped it, once the budget carries this reader's time.
   progress?.(
@@ -5512,7 +5525,7 @@ export function readCodexDispatchedSpendQuantum(
         ? 'dispatchSpendAggregateExhaustedBytes'
         : 'dispatchSpendAggregateExhaustedTime',
   );
-  return { spend: { models: [], found: false, partial: true, effort: null }, pending: true };
+  return { spend: { models: [], found: false, partial: true, effort: null }, pending: true, restarted };
 }
 
 function compatibleDispatchSpend(
