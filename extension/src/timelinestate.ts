@@ -63,7 +63,7 @@ export function outcomesFor(
 }
 
 // Resolve child writes only when an outcome needs them. Dispatched sessions use separate status evidence.
-// A child that discovery has not listed yet takes its write time from `unlistedAt`.
+// A child with no write time in the discovery index takes its write time from `unlistedAt`.
 export function liveTimelineChildren(
   outcomes: ReadonlyMap<string, TurnOutcome | null>,
   children: readonly ClaudeChildSessionFile[],

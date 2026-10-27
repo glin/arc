@@ -10243,13 +10243,25 @@ export class PanelProvider implements vscode.Disposable {
     return liveBackgroundCommands(outcomes, runningSessionsSince(rows, this.exitedSinceKeys), now);
   }
 
-  // Closed children read work timestamps once per changed file version. Open children use held write times.
+  // Closed children read work timestamps once per changed file version. Open children use held write times. An open
+  // child with no held write time is checked at its expected transcript path.
   private liveOpenChildren(
     now: number,
     outcomes = this.sessionOutcomes,
     rows = this.sessionRows,
   ): Map<string, string[]> {
     this.performanceCounters?.recordWork('liveOpenChildren');
+    // A session ID that two Claude transcripts share names no single parent, so its children get no path check.
+    let parents: Map<string, SessionFile | null> | null = null;
+    const parentOf = (session: string): SessionFile | null | undefined => {
+      if (!parents) {
+        parents = new Map();
+        for (const source of this.catalog?.sessions ?? []) {
+          if (source.agent === 'claude') parents.set(source.sessionId, parents.has(source.sessionId) ? null : source);
+        }
+      }
+      return parents.get(session);
+    };
     return liveTimelineChildren(
       outcomes,
       outcomes === this.sessionOutcomes
@@ -10263,10 +10275,7 @@ export class PanelProvider implements vscode.Disposable {
       now,
       (file) => (this.claudeChildWork ??= new ClaudeChildWorkCache()).read(file, this.claudeChildVersion(file)),
       (session, child) => {
-        // A child launched since the last complete discovery has a file at the path its parent names.
-        const parent = (this.catalog?.sessions ?? []).find(
-          (source) => source.agent === 'claude' && source.sessionId === session,
-        );
+        const parent = parentOf(session);
         return parent
           ? (writeTimeOfVersion(this.claudeChildVersion(claudeChildFile(parent, child))) ?? undefined)
           : undefined;

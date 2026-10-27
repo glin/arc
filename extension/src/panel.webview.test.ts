@@ -2382,6 +2382,7 @@ import {
   pendingAskOf,
   pendingAskPosition,
   toCard,
+  TURN_QUIET_MS,
   withLiveActivity,
   type AgentCard,
 } from './turncard.ts';
@@ -32430,10 +32431,13 @@ test('a Claude session raised by its parsed turns before its metadata read draws
 
 // Claude Code records, reduced to the fields Arc reads: a background launch and the reply that ends
 // the turn while the subagent still works. The agent reports idle, and discovery has not listed the
-// child file yet. The child file at the path the parent names supplies the write time.
+// child file yet. The child file at its expected path supplies the write time. A copy of the parent
+// transcript with the same session ID makes that path ambiguous.
 test.each([
   ['written', 'running', 'running', 1, 'subagents'],
+  ['stale', 'open', 'no ending recorded', undefined, 'done'],
   ['absent', 'open', 'no ending recorded', undefined, 'done'],
+  ['written beside a copied parent', 'open', 'no ending recorded', undefined, 'done'],
 ] as const)(
   'a background Claude subagent of a finished turn whose child file is %s reads %s before discovery lists it',
   (childFile, state, word, count, rail) => {
@@ -32508,11 +32512,19 @@ test.each([
     );
     const read = readSession(file, 'Sess');
     const now = Date.parse('2026-10-27T04:47:52.000Z');
-    if (childFile === 'written') {
-      const child = path.join(path.dirname(file), 'Sess', 'subagents', 'agent-a588ae0ab383c09c8.jsonl');
+    const copy = path.join(tempDir('background-unlisted-copy-'), 'sess.jsonl');
+    fs.copyFileSync(file, copy);
+    if (childFile !== 'absent') {
+      const parent = childFile === 'written beside a copied parent' ? copy : file;
+      const child = path.join(path.dirname(parent), 'Sess', 'subagents', 'agent-a588ae0ab383c09c8.jsonl');
+      const writtenAt = (now - (childFile === 'stale' ? TURN_QUIET_MS + 1_000 : 5_000)) / 1000;
       fs.mkdirSync(path.dirname(child), { recursive: true });
       fs.writeFileSync(child, '{"type":"user","isSidechain":true}\n');
-      fs.utimesSync(child, (now - 5_000) / 1000, (now - 5_000) / 1000);
+      fs.utimesSync(child, writtenAt, writtenAt);
+    }
+    const sources = [{ agent: 'claude', file, sessionId: 'Sess' }];
+    if (childFile === 'written beside a copied parent') {
+      sources.unshift({ agent: 'claude', file: copy, sessionId: 'Sess' });
     }
     vi.useFakeTimers();
     vi.setSystemTime(now);
@@ -32523,7 +32535,7 @@ test.each([
         cache: new Map([[file, { read, revision: { mtimeMs: 10, size: 10 } }]]),
         titles: new Map([[file, { outcome: readSessionMeta(file, 256 * 1024, 'Sess').outcome }]]),
         lifetimeRailFacts: () => ({}),
-        catalog: { folders: '', sessions: [{ agent: 'claude', file, sessionId: 'Sess' }] },
+        catalog: { folders: '', sessions: sources },
         claudeChildren: [],
         claudeChildReferences: [],
         claudeChildStatWrites: new Map(),
